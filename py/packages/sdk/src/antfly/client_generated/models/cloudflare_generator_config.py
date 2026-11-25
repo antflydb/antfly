@@ -18,8 +18,9 @@ class CloudflareGeneratorConfig:
 
     Attributes:
         provider (CloudflareGeneratorConfigProvider):
-        account_id (str):
         model (str):  Default: '@cf/meta/llama-3.3-70b-instruct-fp8-fast'.
+        account_id (str | Unset): Required for a direct model. A connection-qualified model takes the account from its
+            connection.
         gateway_id (str | Unset): Optional AI Gateway ID, sent through cf-aig-gateway-id.
         api_key (str | Unset):
         url (str | Unset): Optional deployment-owned endpoint override.
@@ -31,8 +32,8 @@ class CloudflareGeneratorConfig:
     """
 
     provider: CloudflareGeneratorConfigProvider
-    account_id: str
     model: str = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+    account_id: str | Unset = UNSET
     gateway_id: str | Unset = UNSET
     api_key: str | Unset = UNSET
     url: str | Unset = UNSET
@@ -46,9 +47,9 @@ class CloudflareGeneratorConfig:
     def to_dict(self) -> dict[str, Any]:
         provider = self.provider.value
 
-        account_id = self.account_id
-
         model = self.model
+
+        account_id = self.account_id
 
         gateway_id = self.gateway_id
 
@@ -71,10 +72,11 @@ class CloudflareGeneratorConfig:
         field_dict.update(
             {
                 "provider": provider,
-                "account_id": account_id,
                 "model": model,
             }
         )
+        if account_id is not UNSET:
+            field_dict["account_id"] = account_id
         if gateway_id is not UNSET:
             field_dict["gateway_id"] = gateway_id
         if api_key is not UNSET:
@@ -99,9 +101,9 @@ class CloudflareGeneratorConfig:
         d = dict(src_dict)
         provider = CloudflareGeneratorConfigProvider(d.pop("provider"))
 
-        account_id = d.pop("account_id")
-
         model = d.pop("model")
+
+        account_id = d.pop("account_id", UNSET)
 
         gateway_id = d.pop("gateway_id", UNSET)
 
@@ -121,8 +123,8 @@ class CloudflareGeneratorConfig:
 
         cloudflare_generator_config = cls(
             provider=provider,
-            account_id=account_id,
             model=model,
+            account_id=account_id,
             gateway_id=gateway_id,
             api_key=api_key,
             url=url,

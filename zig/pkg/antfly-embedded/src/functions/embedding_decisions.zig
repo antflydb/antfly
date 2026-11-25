@@ -128,8 +128,14 @@ pub fn batchPartial(backing: A, runtime: anytype, cfg: d.DeciderConfig, requests
     if (texts.bytes > cfg.max_input_tokens -| runtime.input_tokens) return error.DecisionLimitExceeded;
     const Executor = @import("../common/inference_tasks.zig").Executor;
     const executor = Executor{
-        .view = .{ .providers = runtime.registry },
-        .source_table = if (requests[0].source_table.len > 0) requests[0].source_table else runtime.source_table,
+        .view = .{ .providers = runtime.registry, .connections = runtime.inference_connections },
+        .source_table = if (runtime.enable_index_attribution or requests[0].source_table.len == 0)
+            runtime.source_table
+        else
+            requests[0].source_table,
+        .attribution_principal = runtime.attribution_principal,
+        .attribution_metadata_json = runtime.attribution_metadata_json,
+        .enable_index_attribution = runtime.enable_index_attribution,
         .http = runtime.http,
         .context = runtime.context orelse .{ .io = runtime.io, .deadline_ns = null },
         .secret_store = runtime.secret_store,

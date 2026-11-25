@@ -24,6 +24,7 @@ const managed_embedder = @import("inference/managed_embedder.zig");
 const common_secrets = @import("common/secrets.zig");
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const readers = @import("antfly_readers");
+const inference_config = @import("common/config.zig");
 const reader_config = @import("antfly_reader_config");
 const transcribing = @import("antfly_transcribing");
 const extracting = @import("antfly_extracting");
@@ -607,6 +608,10 @@ pub const Runtime = struct {
     owned_source_table: ?[]u8 = null,
     limits: *provider_limits.Registry = &provider_limits.process_registry,
     provider_runtime: ?*managed_embedder.ProviderRuntime = null,
+    inference_connections: ?*const inference_config.Config.ConnectionsConfig = null,
+    attribution_principal: ?[]const u8 = null,
+    attribution_metadata_json: []const u8 = "",
+    enable_index_attribution: bool = false,
     document_checkpoints: ?readers.document_rpc.Factory = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     inference_api_url: ?[]const u8 = null,
@@ -631,6 +636,10 @@ pub const Runtime = struct {
     pub const Options = struct {
         limits: *provider_limits.Registry = &provider_limits.process_registry,
         provider_runtime: ?*managed_embedder.ProviderRuntime = null,
+        inference_connections: ?*const inference_config.Config.ConnectionsConfig = null,
+        attribution_principal: ?[]const u8 = null,
+        attribution_metadata_json: []const u8 = "",
+        enable_index_attribution: bool = false,
         antfly_provider: ?managed_embedder.AntflyProvider = null,
         /// Process-isolated Antfly inference endpoint. When no local provider
         /// is installed, Antfly asset configs without their own URL inherit
@@ -666,6 +675,10 @@ pub const Runtime = struct {
             },
             .limits = if (options.provider_runtime) |shared| shared.limits else options.limits,
             .provider_runtime = options.provider_runtime,
+            .inference_connections = options.inference_connections,
+            .attribution_principal = options.attribution_principal,
+            .attribution_metadata_json = options.attribution_metadata_json,
+            .enable_index_attribution = options.enable_index_attribution,
             .antfly_provider = options.antfly_provider,
             .inference_api_url = options.inference_api_url,
             .inference_api_key = options.inference_api_key,
@@ -832,7 +845,7 @@ pub const Runtime = struct {
     }
 
     fn routedReaderConfig(self: *const Runtime, cfg: readers.Config) readers.Config {
-        if (cfg.provider != .antfly) return cfg;
+        if (cfg.provider != .antfly or (if (cfg.model) |model| std.mem.startsWith(u8, model, "connections/") else false)) return cfg;
         var routed = cfg;
         routed.url = self.execution.resolveAntflyEndpoint(cfg.resolvedUrl(), self.linkedReaderAvailable());
         routed.api_url = null;
@@ -840,7 +853,7 @@ pub const Runtime = struct {
     }
 
     fn routedTranscriberConfig(self: *const Runtime, cfg: transcribing.Config) transcribing.Config {
-        if (cfg.provider != .antfly) return cfg;
+        if (cfg.provider != .antfly or (if (cfg.model) |model| std.mem.startsWith(u8, model, "connections/") else false)) return cfg;
         var routed = cfg;
         routed.url = self.execution.resolveAntflyEndpoint(cfg.resolvedUrl(), self.linkedTranscriberAvailable());
         routed.api_url = null;
@@ -861,6 +874,94 @@ pub const Runtime = struct {
         if (cfg.api_key == null) if (self.defaultInferenceCredentialReference(cfg.url)) |reference| {
             cfg.api_key = try alloc.dupe(u8, reference);
         };
+    }
+
+    const ExtractorConnectionContext = struct {
+        arena: Allocator,
+        connection: ?ResolvedInferenceConnection = null,
+    };
+
+    const ExtractorTransport = struct {
+        http: *httpx.Client,
+        cache: *remote_capabilities.Cache,
+    };
+
+    const ScopedExtractorTransport = struct {
+        client: ?httpx.Client,
+        cache: remote_capabilities.Cache,
+
+        fn init(runtime: *Runtime, arena: Allocator, connection: ?ResolvedInferenceConnection, url: []const u8) !ScopedExtractorTransport {
+            return .{
+                .client = try runtime.inferenceConnectionHttp(arena, connection, url, .extract),
+                .cache = remote_capabilities.Cache.init(std.heap.smp_allocator, runtime.http.io),
+            };
+        }
+
+        fn deinit(self: *ScopedExtractorTransport) void {
+            self.cache.deinit();
+            if (self.client) |*http| http.deinit();
+        }
+
+        fn view(self: *ScopedExtractorTransport, runtime: *Runtime) ExtractorTransport {
+            return if (self.client) |*http|
+                .{ .http = http, .cache = &self.cache }
+            else
+                .{ .http = runtime.http, .cache = runtime.capabilityCache() };
+        }
+    };
+
+    fn parseExtractorConfig(self: *const Runtime, alloc: Allocator, raw: []const u8, context: ?*ExtractorConnectionContext, route_legacy: bool) !extracting.Config {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var value = try std.json.parseFromSliceLeaky(std.json.Value, scratch, raw, .{});
+        if (value != .object) return error.InvalidExtractionConfig;
+        const requested_model = value.object.get("model") orelse .null;
+        const reference = if (requested_model == .string)
+            try inference_config.InferenceModelReference.parse(requested_model.string)
+        else
+            null;
+        if (reference) |ref| {
+            const connections = self.inference_connections orelse return error.ConnectionNotFound;
+            const connection = try inference_config.resolveInferenceConnection(connections, ref.connection, "models.extract");
+            const provider = value.object.get("provider") orelse return error.InvalidExtractionConfig;
+            if (provider != .string or !std.mem.eql(u8, provider.string, connection.provider)) return error.ModelTaskMismatch;
+            const kind = std.meta.stringToEnum(extracting.Provider, connection.provider) orelse return error.UnsupportedInferenceFeature;
+            if (kind != .antfly and kind != .cloudflare and kind != .pioneer) return error.UnsupportedInferenceFeature;
+            for ([_][]const u8{ "url", "api_url", "api_key", "bearer_token", "account_id", "gateway_id" }) |field| {
+                if (value.object.contains(field)) return error.InvalidExtractionConfig;
+            }
+            const url = connection.url orelse switch (kind) {
+                .cloudflare => try extracting.cloudflare.endpoint(scratch, connection.account_id orelse return error.InvalidExtractionConfig, ref.model),
+                .pioneer => extracting.pioneer.default_url,
+                .antfly => return error.ConnectionURLMissing,
+                else => unreachable,
+            };
+            try value.object.put(scratch, "model", .{ .string = ref.model });
+            try value.object.put(scratch, "url", .{ .string = url });
+            if (connection.account_id) |account| try value.object.put(scratch, "account_id", .{ .string = account });
+            if (connection.gateway_id) |gateway| try value.object.put(scratch, "gateway_id", .{ .string = gateway });
+            var cfg = try extracting.parseConfigFromValue(alloc, value);
+            errdefer cfg.deinit(alloc);
+            if (context) |out| {
+                if (connection.api_key) |credential| {
+                    cfg.api_key = try common_secrets.resolveReferenceOwned(alloc, self.secret_store, credential);
+                } else switch (kind) {
+                    .cloudflare => return error.CloudflareCredentialMissing,
+                    .pioneer => return error.PioneerCredentialMissing,
+                    else => {},
+                }
+                out.connection = .{
+                    .reference = .{ .connection = try out.arena.dupe(u8, ref.connection), .model = cfg.model },
+                    .config = connection,
+                };
+            }
+            return cfg;
+        }
+        var cfg = try extracting.parseConfigFromValue(alloc, value);
+        errdefer cfg.deinit(alloc);
+        if (route_legacy) try self.routeExtractorConfig(alloc, &cfg);
+        return cfg;
     }
 
     fn routeExtractorConfig(self: *const Runtime, alloc: Allocator, cfg: *extracting.Config) !void {
@@ -1150,7 +1251,12 @@ pub const Runtime = struct {
                     .ignore_unknown_fields = true,
                 });
                 defer parsed.deinit();
-                const cfg = self.routedReaderConfig(parsed.value);
+                var resolved = if (parsed.value.model != null and (try inference_config.InferenceModelReference.parse(parsed.value.model.?)) != null)
+                    try self.resolveReaderConfig(alloc, parsed.value)
+                else
+                    ResolvedReaderConfig{ .config = self.routedReaderConfig(parsed.value) };
+                defer resolved.deinit(alloc);
+                const cfg = resolved.config;
                 try cfg.validate();
                 remote = !isLocalReaderProvider(cfg.provider, cfg.resolvedUrl());
                 if (cfg.provider == .apple) {
@@ -1178,8 +1284,15 @@ pub const Runtime = struct {
                 defer parsed.deinit(alloc);
                 try self.routeGeneratorConfig(alloc, &parsed.generator);
                 if (parsed.output_schema != null and (parsed.generator.provider != .antfly or parsed.generator.url.len == 0)) {
-                    var engine = self.constrainedRuntime();
-                    const caps = try engine.capabilities(alloc, &parsed.generator);
+                    var scratch = std.heap.ArenaAllocator.init(alloc);
+                    defer scratch.deinit();
+                    const a = scratch.allocator();
+                    var generator = parsed.generator;
+                    const connection = try self.resolveGeneratorConnection(a, &generator, .generate);
+                    var scoped_http = try self.inferenceConnectionHttp(a, connection, generator.url, .generate);
+                    defer if (scoped_http) |*client| client.deinit();
+                    var engine = self.constrainedRuntimeWithHttp(if (scoped_http) |*client| client else null);
+                    const caps = try engine.capabilities(a, &generator);
                     _ = try caps.select(parsed.output, null);
                 }
                 remote = parsed.generator.provider != .apple and (parsed.generator.url.len > 0 or parsed.generator.provider != .antfly);
@@ -1205,17 +1318,22 @@ pub const Runtime = struct {
                 if (try generated_extractor.isGenerated(alloc, requests[0].config_json)) {
                     var parsed = try generated_extractor.parse(alloc, requests[0].config_json);
                     defer parsed.deinit();
-                    try self.routeGeneratorConfig(alloc, &parsed.value.generator);
-                    var engine = self.constrainedRuntime();
-                    const caps = try engine.capabilities(alloc, &parsed.value.generator);
+                    var generator = parsed.value.generator;
+                    var header_arena = std.heap.ArenaAllocator.init(alloc);
+                    defer header_arena.deinit();
+                    const connection = try self.resolveGeneratorConnection(header_arena.allocator(), &generator, .extract);
+                    try self.routeGeneratorConfig(header_arena.allocator(), &generator);
+                    var scoped_http = try self.inferenceConnectionHttp(header_arena.allocator(), connection, generator.url, .extract);
+                    defer if (scoped_http) |*client| client.deinit();
+                    var engine = self.constrainedRuntimeWithHttp(if (scoped_http) |*client| client else null);
+                    const caps = try engine.capabilities(alloc, &generator);
                     _ = try caps.select(parsed.value.output, parsed.value.probabilities);
-                    remote = parsed.value.generator.provider != .antfly or parsed.value.generator.url.len > 0;
+                    remote = generator.provider != .antfly or generator.url.len > 0;
                     if (!remote) allocator_owner = try localInvocationAllocatorOwner(self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable);
                     break :blk .borrowed_binary;
                 }
-                var parsed = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
+                var parsed = try self.parseExtractorConfig(alloc, requests[0].config_json, null, true);
                 defer parsed.deinit(alloc);
-                try self.routeExtractorConfig(alloc, &parsed);
                 remote = !isLocalExtractionProvider(parsed.provider, parsed.resolvedUrl());
                 if (!remote) {
                     const local = self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable;
@@ -1235,7 +1353,12 @@ pub const Runtime = struct {
                     .ignore_unknown_fields = true,
                 });
                 defer parsed.deinit();
-                const cfg = self.routedTranscriberConfig(parsed.value);
+                var resolved = if (parsed.value.model != null and (try inference_config.InferenceModelReference.parse(parsed.value.model.?)) != null)
+                    try self.resolveTranscriberConfig(alloc, parsed.value)
+                else
+                    ResolvedTranscriberConfig{ .config = self.routedTranscriberConfig(parsed.value) };
+                defer resolved.deinit(alloc);
+                const cfg = resolved.config;
                 try cfg.validate();
                 remote = cfg.provider != .apple and !isLocalTranscriberProvider(cfg.provider, cfg.resolvedUrl());
                 if (cfg.provider == .apple) {
@@ -1444,6 +1567,7 @@ pub const Runtime = struct {
                 // Vision cancellation is cooperative; retain the background invocation
                 // until native work returns instead of promising a hard deadline.
                 if (cfg.provider == .apple) break :blk false;
+                if (cfg.model) |model| if ((try inference_config.InferenceModelReference.parse(model)) != null) break :blk true;
                 const local = self.antfly_provider orelse break :blk true;
                 if (!isLocalReaderProvider(cfg.provider, cfg.resolvedUrl())) break :blk true;
                 break :blk if (request.media.len > 0)
@@ -1460,15 +1584,15 @@ pub const Runtime = struct {
                 defer parsed.deinit();
                 const cfg = self.routedTranscriberConfig(parsed.value);
                 if (cfg.provider == .apple) break :blk false;
+                if (cfg.model) |model| if ((try inference_config.InferenceModelReference.parse(model)) != null) break :blk true;
                 const local = self.antfly_provider orelse break :blk true;
                 if (!isLocalTranscriberProvider(cfg.provider, cfg.resolvedUrl())) break :blk true;
                 break :blk local.transcribe_audio_with_context != null;
             },
             .extractor => blk: {
                 if (try generated_extractor.isGenerated(alloc, request.config_json)) break :blk true;
-                var parsed = try extracting.parseConfigFromSlice(alloc, request.config_json);
+                var parsed = try self.parseExtractorConfig(alloc, request.config_json, null, true);
                 defer parsed.deinit(alloc);
-                try self.routeExtractorConfig(alloc, &parsed);
                 const local = self.antfly_provider orelse break :blk true;
                 if (!isLocalExtractionProvider(parsed.provider, parsed.resolvedUrl())) break :blk true;
                 break :blk local.extract_with_context != null;
@@ -1672,26 +1796,47 @@ pub const Runtime = struct {
                 defer parsed.deinit();
                 if (parsed.value.decider.decision_method != .generated) break :blk null;
                 try self.routeGeneratorConfig(alloc, &parsed.value.decider.generator.?);
-                break :blk try self.constrainedProducerCapabilities(alloc, &parsed.value.decider.generator.?, parsed.value.decider.output, parsed.value.decider.probabilities, parsed.value.decider.batch, .generate);
+                break :blk try self.constrainedProducerCapabilities(alloc, &parsed.value.decider.generator.?, parsed.value.decider.output, parsed.value.decider.probabilities, parsed.value.decider.batch, .generate, null);
             },
             .generator => blk: {
                 var parsed = try parseGeneratorProducerConfig(alloc, requests[0].config_json);
                 defer parsed.deinit(alloc);
                 try self.routeGeneratorConfig(alloc, &parsed.generator);
-                if (parsed.output_schema != null) break :blk try self.constrainedProducerCapabilities(alloc, &parsed.generator, parsed.output, null, parsed.batch, .generate);
+                if (parsed.output_schema != null) {
+                    var arena = std.heap.ArenaAllocator.init(alloc);
+                    defer arena.deinit();
+                    const a = arena.allocator();
+                    var generator = parsed.generator;
+                    const connection = try self.resolveGeneratorConnection(a, &generator, .generate);
+                    var scoped_http = try self.inferenceConnectionHttp(a, connection, generator.url, .generate);
+                    defer if (scoped_http) |*client| client.deinit();
+                    break :blk try self.constrainedProducerCapabilities(a, &generator, parsed.output, null, parsed.batch, .generate, if (scoped_http) |*client| client else null);
+                }
                 break :blk try self.generatorCapabilities(alloc, parsed.generator, requests);
             },
             .extractor => blk: {
                 if (try generated_extractor.isGenerated(alloc, requests[0].config_json)) {
                     var parsed = try generated_extractor.parse(alloc, requests[0].config_json);
                     defer parsed.deinit();
-                    try self.routeGeneratorConfig(alloc, &parsed.value.generator);
-                    break :blk try self.constrainedProducerCapabilities(alloc, &parsed.value.generator, parsed.value.output, parsed.value.probabilities, parsed.value.batch, .extract);
+                    var arena = std.heap.ArenaAllocator.init(alloc);
+                    defer arena.deinit();
+                    const a = arena.allocator();
+                    var generator = parsed.value.generator;
+                    const connection = try self.resolveGeneratorConnection(a, &generator, .extract);
+                    try self.routeGeneratorConfig(a, &generator);
+                    var scoped_http = try self.inferenceConnectionHttp(a, connection, generator.url, .extract);
+                    defer if (scoped_http) |*client| client.deinit();
+                    break :blk try self.constrainedProducerCapabilities(a, &generator, parsed.value.output, parsed.value.probabilities, parsed.value.batch, .extract, if (scoped_http) |*client| client else null);
                 }
-                var cfg = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
+                var connection_arena = std.heap.ArenaAllocator.init(alloc);
+                defer connection_arena.deinit();
+                var context: ExtractorConnectionContext = .{ .arena = connection_arena.allocator() };
+                var cfg = try self.parseExtractorConfig(alloc, requests[0].config_json, &context, true);
                 defer cfg.deinit(alloc);
-                try self.routeExtractorConfig(alloc, &cfg);
-                break :blk try self.extractorCapabilitiesForRequests(alloc, &cfg, requests);
+                var scoped = try ScopedExtractorTransport.init(self, context.arena, context.connection, cfg.url);
+                defer scoped.deinit();
+                const transport = scoped.view(self);
+                break :blk try self.extractorCapabilitiesForRequests(alloc, &cfg, requests, transport);
             },
             else => null,
         };
@@ -1797,6 +1942,7 @@ pub const Runtime = struct {
             .ignore_unknown_fields = true,
         });
         defer parsed.deinit();
+        if (parsed.value.model) |model| if ((try inference_config.InferenceModelReference.parse(model)) != null) return false;
         const cfg = self.routedReaderConfig(parsed.value);
         try cfg.validate();
         // Physical locality is checked before the descriptor. A distributed
@@ -1864,8 +2010,12 @@ pub const Runtime = struct {
     const ResolvedReaderConfig = struct {
         config: readers.Config,
         credential: ?[]u8 = null,
+        connection: ?ResolvedInferenceConnection = null,
+        endpoint: ?[]const u8 = null,
+        owned_endpoint: ?[]const u8 = null,
         fn deinit(self: *ResolvedReaderConfig, alloc: Allocator) void {
             if (self.credential) |value| alloc.free(value);
+            if (self.owned_endpoint) |value| alloc.free(value);
         }
     };
 
@@ -1873,6 +2023,44 @@ pub const Runtime = struct {
     // Keep references in catalogs; resolve only for this invocation so rotation
     // takes effect without persisting a credential value in the producer config.
     fn resolveReaderConfig(self: *Runtime, alloc: Allocator, raw: readers.Config) !ResolvedReaderConfig {
+        if (raw.model) |model| if (try inference_config.InferenceModelReference.parse(model)) |reference| {
+            const connections = self.inference_connections orelse return error.ConnectionNotFound;
+            const connection = try inference_config.resolveInferenceConnection(connections, reference.connection, "models.read");
+            if (!std.mem.eql(u8, connection.provider, @tagName(raw.provider))) return error.ModelTaskMismatch;
+            if (raw.provider == .apple) return error.UnsupportedReadProvider;
+            if (raw.base_url != null or raw.url != null or raw.api_url != null or raw.api_key != null or
+                raw.bearer_token != null or raw.account_id != null or raw.gateway_id != null or raw.project_id != null or
+                raw.location != null or raw.credentials_path != null or raw.capability_token != null or raw.capability_revision != null)
+                return error.InvalidReaderConfig;
+
+            const owned_endpoint = if (connection.url == null and raw.provider == .cloudflare)
+                try extracting.cloudflare.endpoint(alloc, connection.account_id orelse return error.InvalidReaderConfig, reference.model)
+            else
+                null;
+            errdefer if (owned_endpoint) |url| alloc.free(url);
+            const endpoint = connection.url orelse owned_endpoint orelse readers.defaultRemoteBaseUrl(raw.provider) orelse return error.ConnectionURLMissing;
+            if (connection.api_key == null) {
+                if (raw.provider == .cloudflare) return error.CloudflareCredentialMissing;
+                if (raw.provider == .openai and !std.mem.eql(u8, std.mem.trimEnd(u8, endpoint, "/"), readers.defaultRemoteBaseUrl(.openai).?))
+                    return error.MissingReaderCredentials;
+            }
+
+            var cfg = raw;
+            cfg.model = reference.model;
+            cfg.account_id = connection.account_id;
+            cfg.gateway_id = connection.gateway_id;
+            cfg.project_id = connection.project_id;
+            cfg.location = connection.location;
+            cfg.credentials_path = connection.credentials_path;
+            if (cfg.provider == .antfly) cfg.url = endpoint else cfg.base_url = endpoint;
+            try cfg.validate();
+            const credential = if (connection.api_key) |key|
+                try common_secrets.resolveReferenceOwned(alloc, self.secret_store, key)
+            else
+                null;
+            cfg.api_key = credential;
+            return .{ .config = cfg, .credential = credential, .endpoint = endpoint, .owned_endpoint = owned_endpoint, .connection = .{ .reference = reference, .config = connection } };
+        };
         var cfg = self.routedReaderConfig(raw);
         if (cfg.provider != .antfly or isLocalReaderProvider(cfg.provider, cfg.resolvedUrl()))
             return .{ .config = cfg };
@@ -1889,14 +2077,53 @@ pub const Runtime = struct {
     const ResolvedTranscriberConfig = struct {
         config: transcribing.Config,
         credential: ?[]u8 = null,
+        connection: ?ResolvedInferenceConnection = null,
+        endpoint: ?[]u8 = null,
         fn deinit(self: *ResolvedTranscriberConfig, alloc: Allocator) void {
             if (self.credential) |value| alloc.free(value);
+            if (self.endpoint) |value| alloc.free(value);
         }
     };
 
     // Durable recipes retain references. Resolve once per invocation before
     // discovery and execution, without lending a node credential to other URLs.
     fn resolveTranscriberConfig(self: *Runtime, alloc: Allocator, raw: transcribing.Config) !ResolvedTranscriberConfig {
+        if (raw.model) |model| if (try inference_config.InferenceModelReference.parse(model)) |reference| {
+            const connections = self.inference_connections orelse return error.ConnectionNotFound;
+            const connection = try inference_config.resolveInferenceConnection(connections, reference.connection, "models.transcribe");
+            if (!std.mem.eql(u8, connection.provider, @tagName(raw.provider))) return error.ModelTaskMismatch;
+            if (raw.provider == .apple) return error.UnsupportedTranscriberProvider;
+            if (raw.base_url != null or raw.url != null or raw.api_url != null or raw.api_key != null or
+                raw.bearer_token != null or raw.account_id != null or raw.gateway_id != null or raw.project_id != null or
+                raw.location != null or raw.credentials_path != null or raw.capability_token != null or raw.capability_revision != null)
+                return error.InvalidTranscribingConfig;
+
+            var cfg = raw;
+            cfg.model = reference.model;
+            cfg.base_url = connection.url;
+            cfg.account_id = connection.account_id;
+            cfg.gateway_id = connection.gateway_id;
+            cfg.project_id = connection.project_id;
+            cfg.location = connection.location;
+            cfg.credentials_path = connection.credentials_path;
+            if (cfg.provider == .antfly) {
+                cfg.url = connection.url orelse return error.ConnectionURLMissing;
+                cfg.base_url = null;
+            }
+            if (connection.api_key == null and cfg.provider == .cloudflare) return error.CloudflareCredentialMissing;
+            try cfg.validate();
+            const endpoint = (try cfg.effectiveEndpointAlloc(alloc)) orelse return error.ConnectionURLMissing;
+            errdefer alloc.free(endpoint);
+            if (cfg.provider == .openai and connection.api_key == null and
+                !std.mem.eql(u8, endpoint, "https://api.openai.com/v1"))
+                return error.MissingTranscriberCredentials;
+            const credential = if (connection.api_key) |key|
+                try common_secrets.resolveReferenceOwned(alloc, self.secret_store, key)
+            else
+                null;
+            cfg.api_key = credential;
+            return .{ .config = cfg, .credential = credential, .endpoint = endpoint, .connection = .{ .reference = reference, .config = connection } };
+        };
         var cfg = self.routedTranscriberConfig(raw);
         if (isLocalTranscriberProvider(cfg.provider, cfg.resolvedUrl())) return .{ .config = cfg };
         const reference = cfg.bearer_token orelse cfg.api_key orelse
@@ -1920,6 +2147,15 @@ pub const Runtime = struct {
     ) !?inference_work.InferenceCapabilities {
         var resolved_reader = try self.resolveReaderConfig(alloc, raw_cfg);
         defer resolved_reader.deinit(alloc);
+        var connection_arena = std.heap.ArenaAllocator.init(alloc);
+        defer connection_arena.deinit();
+        var scoped = try self.inferenceConnectionHttp(connection_arena.allocator(), resolved_reader.connection, resolved_reader.endpoint orelse "", .read);
+        defer if (scoped) |*client| client.deinit();
+        const http = if (scoped) |*client| client else self.http;
+        // Keep private capability leases and refreshes within this transport's lifetime.
+        var scoped_cache = remote_capabilities.Cache.init(std.heap.smp_allocator, http.io);
+        defer scoped_cache.deinit();
+        const capability_cache = if (scoped != null) &scoped_cache else self.capabilityCache();
         const cfg = resolved_reader.config;
         try cfg.validate();
         if (cfg.provider == .apple) return try readers.apple.capabilities();
@@ -1937,8 +2173,8 @@ pub const Runtime = struct {
             }
             header_count = try self.execution.routing.appendHeaders(&header_storage, header_count);
             const headers = header_storage[0..header_count];
-            return self.capabilityCache().getOrDiscoverWithContext(
-                self.http,
+            return capability_cache.getOrDiscoverWithContext(
+                http,
                 endpoint,
                 cfg.model orelse "",
                 .read,
@@ -1962,6 +2198,15 @@ pub const Runtime = struct {
         const cfg = resolved.config;
         try cfg.validate();
         if (cfg.provider != .antfly) return null;
+        var connection_arena = std.heap.ArenaAllocator.init(alloc);
+        defer connection_arena.deinit();
+        var scoped = try self.inferenceConnectionHttp(connection_arena.allocator(), resolved.connection, resolved.endpoint orelse "", .transcribe);
+        defer if (scoped) |*client| client.deinit();
+        const http = if (scoped) |*client| client else self.http;
+        // Keep private capability leases and refreshes within this transport's lifetime.
+        var scoped_cache = remote_capabilities.Cache.init(std.heap.smp_allocator, http.io);
+        defer scoped_cache.deinit();
+        const capability_cache = if (scoped != null) &scoped_cache else self.capabilityCache();
         const model = try requiredAntflyTranscriberModel(cfg);
         if (isLocalTranscriberProvider(cfg.provider, cfg.resolvedUrl())) {
             const local = self.antfly_provider orelse return null;
@@ -1980,7 +2225,7 @@ pub const Runtime = struct {
             count += 1;
         }
         count = try self.execution.routing.appendHeaders(&storage, count);
-        return self.capabilityCache().getOrDiscoverWithContext(self.http, cfg.resolvedUrl().?, model, .transcribe, storage[0..count], self.execution.waitContext()) catch |err| switch (err) {
+        return capability_cache.getOrDiscoverWithContext(http, cfg.resolvedUrl().?, model, .transcribe, storage[0..count], self.execution.waitContext()) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => null,
         };
@@ -2075,16 +2320,21 @@ pub const Runtime = struct {
     fn extractorBatchMode(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !inference_work.BatchMode {
         if (!requestsShareRoute(requests)) return .none;
         if (try privacyRequestsEmpty(alloc, requests)) return .none;
-        var cfg = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
+        var connection_arena = std.heap.ArenaAllocator.init(alloc);
+        defer connection_arena.deinit();
+        var context: ExtractorConnectionContext = .{ .arena = connection_arena.allocator() };
+        var cfg = try self.parseExtractorConfig(alloc, requests[0].config_json, &context, true);
         defer cfg.deinit(alloc);
-        try self.routeExtractorConfig(alloc, &cfg);
+        var scoped = try ScopedExtractorTransport.init(self, context.arena, context.connection, cfg.url);
+        defer scoped.deinit();
+        const transport = scoped.view(self);
         if (cfg.provider == .antfly and cfg.resolvedUrl() != null) {
             var mode: inference_work.BatchMode = .serial_compatibility;
             var start: usize = 0;
             while (start < requests.len) {
                 const run = try homogeneousDiscoveryShape(alloc, requests[start..]);
                 var window = run;
-                const caps = (try self.bindExtractorWindow(alloc, &cfg, &window)) orelse return .none;
+                const caps = (try self.bindExtractorWindow(alloc, &cfg, &window, transport)) orelse return .none;
                 if (caps.batch.mode != .none) {
                     validateExtractorBatchPlan(alloc, caps, extractorAttachmentTransport(cfg), requests[start .. start + run.items]) catch |err| {
                         if (err == error.OutOfMemory) return err;
@@ -2096,7 +2346,7 @@ pub const Runtime = struct {
             }
             return mode;
         }
-        const caps = (try self.extractorCapabilitiesForRequests(alloc, &cfg, requests)) orelse return .none;
+        const caps = (try self.extractorCapabilitiesForRequests(alloc, &cfg, requests, transport)) orelse return .none;
         validateExtractorBatchPlan(alloc, caps, extractorAttachmentTransport(cfg), requests) catch |err| {
             if (err == error.OutOfMemory) return err;
             return .none;
@@ -2104,18 +2354,18 @@ pub const Runtime = struct {
         return caps.batch.mode;
     }
 
-    fn extractorCapabilitiesForRequests(self: *Runtime, alloc: Allocator, cfg: *extracting.Config, requests: []const asset_producer.Request) !?inference_work.InferenceCapabilities {
+    fn extractorCapabilitiesForRequests(self: *Runtime, alloc: Allocator, cfg: *extracting.Config, requests: []const asset_producer.Request, transport: ExtractorTransport) !?inference_work.InferenceCapabilities {
         if (cfg.provider != .antfly or cfg.resolvedUrl() == null)
             return self.extractorCapabilities(alloc, cfg.*);
         var shape = try homogeneousDiscoveryShape(alloc, requests);
         // Report the backend contract. The sampled window is an invocation
         // shape, and can be a singleton prototype used to size later batches.
-        return self.bindExtractorWindow(alloc, cfg, &shape);
+        return self.bindExtractorWindow(alloc, cfg, &shape, transport);
     }
 
-    fn bindExtractorWindow(self: *Runtime, alloc: Allocator, cfg: *extracting.Config, shape: *remote_capabilities.DiscoveryShape) !?inference_work.InferenceCapabilities {
+    fn bindExtractorWindow(self: *Runtime, alloc: Allocator, cfg: *extracting.Config, shape: *remote_capabilities.DiscoveryShape, transport: ExtractorTransport) !?inference_work.InferenceCapabilities {
         while (true) {
-            return self.bindExtractorCapabilityLease(alloc, cfg, shape.*) catch |err| {
+            return self.bindExtractorCapabilityLease(alloc, cfg, shape.*, transport) catch |err| {
                 if (err != error.InferenceDiscoveryTooManyItems or shape.items <= 1) return err;
                 shape.items /= 2;
                 continue;
@@ -2173,7 +2423,7 @@ pub const Runtime = struct {
         };
     }
 
-    fn bindExtractorCapabilityLease(self: *Runtime, alloc: Allocator, cfg: *extracting.Config, shape: remote_capabilities.DiscoveryShape) !?inference_work.InferenceCapabilities {
+    fn bindExtractorCapabilityLease(self: *Runtime, alloc: Allocator, cfg: *extracting.Config, shape: remote_capabilities.DiscoveryShape, transport: ExtractorTransport) !?inference_work.InferenceCapabilities {
         if (cfg.provider != .antfly or cfg.resolvedUrl() == null) return null;
         var auth_value: ?[]u8 = null;
         defer if (auth_value) |value| alloc.free(value);
@@ -2187,8 +2437,8 @@ pub const Runtime = struct {
         header_count = try self.execution.routing.appendHeaders(&header_storage, header_count);
         var placement: remote_capabilities.DiscoveryHeaders = .{};
         const headers = try placement.withShape(header_storage[0..header_count], shape);
-        const lease = try self.capabilityCache().getOrDiscoverLeaseWithContext(
-            self.http,
+        const lease = try transport.cache.getOrDiscoverLeaseWithContext(
+            transport.http,
             cfg.resolvedUrl().?,
             cfg.model,
             .extract,
@@ -2200,7 +2450,7 @@ pub const Runtime = struct {
         return lease.capabilities;
     }
 
-    fn invalidateExtractorCapabilityLease(self: *Runtime, alloc: Allocator, cfg: extracting.Config, shape: remote_capabilities.DiscoveryShape) !void {
+    fn invalidateExtractorCapabilityLease(self: *Runtime, alloc: Allocator, cfg: extracting.Config, shape: remote_capabilities.DiscoveryShape, transport: ExtractorTransport) !void {
         if (cfg.provider != .antfly or cfg.resolvedUrl() == null) return;
         var auth_value: ?[]u8 = null;
         defer if (auth_value) |value| alloc.free(value);
@@ -2214,7 +2464,7 @@ pub const Runtime = struct {
         header_count = try self.execution.routing.appendHeaders(&header_storage, header_count);
         var placement: remote_capabilities.DiscoveryHeaders = .{};
         const headers = try placement.withShape(header_storage[0..header_count], shape);
-        try self.capabilityCache().invalidateLease(cfg.resolvedUrl().?, cfg.model, .extract, headers, try remote_capabilities.LeaseIdentity.init(cfg.capability_token, cfg.capability_revision));
+        try transport.cache.invalidateLease(cfg.resolvedUrl().?, cfg.model, .extract, headers, try remote_capabilities.LeaseIdentity.init(cfg.capability_token, cfg.capability_revision));
     }
 
     fn validateDecisionInput(alloc: Allocator, request: asset_producer.Request) !void {
@@ -2278,6 +2528,10 @@ pub const Runtime = struct {
             .antfly_provider = self.antfly_provider,
             .antfly_url = self.inference_api_url,
             .source_table = self.execution.routing.source_table,
+            .inference_connections = self.inference_connections,
+            .attribution_principal = self.attribution_principal,
+            .attribution_metadata_json = self.attribution_metadata_json,
+            .enable_index_attribution = self.enable_index_attribution,
         };
         defer execution.deinit();
         var report = inference_work.ExecutionReport{ .requested_items = requests.len, .serial_items = requests.len };
@@ -2327,6 +2581,10 @@ pub const Runtime = struct {
             .antfly_provider = self.antfly_provider,
             .antfly_url = self.inference_api_url,
             .source_table = self.execution.routing.source_table,
+            .inference_connections = self.inference_connections,
+            .attribution_principal = self.attribution_principal,
+            .attribution_metadata_json = self.attribution_metadata_json,
+            .enable_index_attribution = self.enable_index_attribution,
         };
         defer execution.deinit();
         const results = try execution.provider().evaluateBatch(arena.allocator(), &.{.{ .decider = "materialized", .questions = parsed.value.questions, .input = .{ .text = request.source_text } }});
@@ -2844,9 +3102,14 @@ pub const Runtime = struct {
             if (!std.mem.eql(u8, request.config_json, requests[0].config_json)) return error.BatchIncompatible;
         }
 
-        var cfg = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
+        var transport_arena = std.heap.ArenaAllocator.init(alloc);
+        defer transport_arena.deinit();
+        var connection_context: ExtractorConnectionContext = .{ .arena = transport_arena.allocator() };
+        var cfg = try self.parseExtractorConfig(alloc, requests[0].config_json, &connection_context, true);
         defer cfg.deinit(alloc);
-        try self.routeExtractorConfig(alloc, &cfg);
+        var scoped = try ScopedExtractorTransport.init(self, connection_context.arena, connection_context.connection, cfg.url);
+        defer scoped.deinit();
+        const transport = scoped.view(self);
         const remote = cfg.provider == .antfly and cfg.resolvedUrl() != null;
         const local_capabilities = if (remote) null else (try self.extractorCapabilities(alloc, cfg)) orelse return error.BatchIncompatible;
         if (local_capabilities) |caps| try validateExtractorBatchCompatibility(alloc, caps, extractorAttachmentTransport(cfg), requests);
@@ -2873,14 +3136,14 @@ pub const Runtime = struct {
             while (true) {
                 if (remote) {
                     shape.items = end - start;
-                    active = (try self.bindExtractorWindow(alloc, &cfg, &shape)) orelse return error.InvalidInferenceCapabilities;
+                    active = (try self.bindExtractorWindow(alloc, &cfg, &shape, transport)) orelse return error.InvalidInferenceCapabilities;
                     if (shape.items < end - start) item_limit = @min(item_limit, shape.items);
                     end = start + shape.items;
                     item_limit = @min(item_limit, active.batch.max_items);
                 } else active = local_capabilities.?;
                 if (!remote and active.batch.mode == .none) return error.BatchIncompatible;
-                const transport = extractorAttachmentTransport(cfg);
-                const fitting = try extractorBatchEnd(alloc, active, transport, requests[0..end], start);
+                const attachment_transport = extractorAttachmentTransport(cfg);
+                const fitting = try extractorBatchEnd(alloc, active, attachment_transport, requests[0..end], start);
                 if (fitting <= start) return error.InvalidInferenceCapabilities;
                 if (fitting < end and remote) {
                     end = fitting;
@@ -2888,11 +3151,11 @@ pub const Runtime = struct {
                 }
                 end = fitting;
                 if (remote and active.batch.mode != .none)
-                    try validateExtractorBatchCompatibility(alloc, active, transport, requests[start..end]);
-                try validateExtractorInvocation(alloc, active, transport, requests[start..end]);
+                    try validateExtractorBatchCompatibility(alloc, active, attachment_transport, requests[start..end]);
+                try validateExtractorInvocation(alloc, active, attachment_transport, requests[start..end]);
                 break;
             }
-            const chunk_outputs = try self.tryExtractBatchChunk(alloc, requests[start..end], cfg, shape);
+            const chunk_outputs = try self.tryExtractBatchChunk(alloc, requests[start..end], cfg, shape, transport);
             defer alloc.free(chunk_outputs);
             if (chunk_outputs.len != end - start) {
                 for (chunk_outputs) |output| if (output.len > 0) alloc.free(output);
@@ -2909,7 +3172,7 @@ pub const Runtime = struct {
         return try asset_producer.producedBatchFromOutputs(alloc, requests, outputs, execution);
     }
 
-    fn tryExtractBatchChunk(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request, cfg: extracting.Config, discovery_shape: remote_capabilities.DiscoveryShape) ![][]u8 {
+    fn tryExtractBatchChunk(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request, cfg: extracting.Config, discovery_shape: remote_capabilities.DiscoveryShape, transport: ExtractorTransport) ![][]u8 {
         const inputs = try alloc.alloc(extracting.Input, requests.len);
         var inputs_filled: usize = 0;
         defer {
@@ -2991,7 +3254,7 @@ pub const Runtime = struct {
                 )
             else
                 return error.BatchIncompatible;
-        } else extracting.extractWithConfigAndOptions(alloc, self.http, cfg, extract_request, .{
+        } else extracting.extractWithConfigAndOptions(alloc, transport.http, cfg, extract_request, .{
             .source_table = self.execution.routing.source_table,
             .timeout_ms = try self.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms),
             .cancellation = httpx.CancellationToken.fromCallback(
@@ -3000,7 +3263,7 @@ pub const Runtime = struct {
             ),
         }) catch |err| {
             if (err == error.InferenceCapabilitiesStale)
-                try self.invalidateExtractorCapabilityLease(alloc, cfg, discovery_shape);
+                try self.invalidateExtractorCapabilityLease(alloc, cfg, discovery_shape, transport);
             if (err == error.InvalidExtractionResponse) return error.InvalidExtractorResponse;
             return err;
         };
@@ -3334,6 +3597,8 @@ pub const Runtime = struct {
         cfg_parsed.value.framed_attachments = false;
         cfg_parsed.value = self.routedTranscriberConfig(cfg_parsed.value);
         if (cfg_parsed.value.provider == .apple) return self.produceBatchSequential(alloc, requests);
+        if (cfg_parsed.value.model) |model| if ((try inference_config.InferenceModelReference.parse(model)) != null)
+            return self.produceRemoteCompatibilityBatch(alloc, requests);
         if (!isLocalTranscriberProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl()))
             return self.produceRemoteCompatibilityBatch(alloc, requests);
         const model = requiredAntflyTranscriberModel(cfg_parsed.value) catch return error.BatchIncompatible;
@@ -3419,8 +3684,9 @@ pub const Runtime = struct {
         // one prompt, but produce one response for the prompt as a whole, so
         // flattening requests across those providers loses the request/result
         // boundary. Let the generic batch path execute them sequentially.
+        const qualified = if (cfg_parsed.value.model) |model| (try inference_config.InferenceModelReference.parse(model)) != null else false;
         const routed_reader = self.routedReaderConfig(cfg_parsed.value);
-        const local_reader = isLocalReaderProvider(routed_reader.provider, routed_reader.resolvedUrl());
+        const local_reader = !qualified and isLocalReaderProvider(routed_reader.provider, routed_reader.resolvedUrl());
         if (!local_reader and routed_reader.provider != .antfly) return error.BatchIncompatible;
         const capabilities = if (local_reader) (try self.readerCapabilities(alloc, cfg_parsed.value)) orelse return error.BatchIncompatible else null;
         if (capabilities) |caps| {
@@ -3622,8 +3888,8 @@ pub const Runtime = struct {
         return error.CapabilityDiscoveryUnavailable;
     }
 
-    fn constrainedProducerCapabilities(self: *Runtime, a: Allocator, generator: *generating_runtime.GeneratorConfig, output: constrained.Output, probabilities: ?constrained.Probabilities, batch: constrained.Batch, task: inference_work.Task) !inference_work.InferenceCapabilities {
-        var engine = self.constrainedRuntime();
+    fn constrainedProducerCapabilities(self: *Runtime, a: Allocator, generator: *generating_runtime.GeneratorConfig, output: constrained.Output, probabilities: ?constrained.Probabilities, batch: constrained.Batch, task: inference_work.Task, scoped_http: ?*httpx.Client) !inference_work.InferenceCapabilities {
+        var engine = self.constrainedRuntimeWithHttp(scoped_http);
         const resolved = try engine.capabilities(a, generator);
         _ = try resolved.select(output, probabilities);
         const revision: ?[32]u8 = if (resolved.model_revision) |value| blk: {
@@ -3650,12 +3916,24 @@ pub const Runtime = struct {
         } };
     }
 
+    fn constrainedRuntimeWithHttp(self: *Runtime, scoped_http: ?*httpx.Client) constrained_runtime.Runtime {
+        var engine = self.constrainedRuntime();
+        if (scoped_http) |client| {
+            engine.http = client;
+            engine.options.execution.http_client = client;
+        }
+        return engine;
+    }
+
     fn generateConstrained(self: *Runtime, alloc: Allocator, parsed: *GeneratorProducerConfig, requests: []const asset_producer.Request) !asset_producer.ProducedBatch {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
         var cfg = try parsed.generator.clone(a);
-        var engine = self.constrainedRuntime();
+        const connection = try self.resolveGeneratorConnection(a, &cfg, .generate);
+        var scoped_http = try self.inferenceConnectionHttp(a, connection, cfg.url, .generate);
+        defer if (scoped_http) |*client| client.deinit();
+        var engine = self.constrainedRuntimeWithHttp(if (scoped_http) |*client| client else null);
         const caps = try engine.capabilitiesForMedia(a, &cfg, false);
         const mode = try caps.select(parsed.output, null);
         const inputs = try a.alloc([]const u8, requests.len);
@@ -3689,6 +3967,14 @@ pub const Runtime = struct {
             return outputs[0];
         }
         var cfg = parsed_cfg.generator;
+        var connection_arena = std.heap.ArenaAllocator.init(alloc);
+        defer connection_arena.deinit();
+        const connection = try self.resolveGeneratorConnection(connection_arena.allocator(), &cfg, .generate);
+        var scoped_http = try self.inferenceConnectionHttp(connection_arena.allocator(), connection, cfg.url, .generate);
+        defer if (scoped_http) |*client| client.deinit();
+        const provider_http = if (scoped_http) |*client| client else self.http;
+        var execution = self.execution;
+        if (scoped_http != null) execution.http_client = provider_http;
         if (request.media.len > 0 and !request.inline_media_trusted) return error.UntrustedInlineMedia;
         for (request.media) |media| try validateEncodedMedia(media);
 
@@ -3781,12 +4067,12 @@ pub const Runtime = struct {
             parsed_cfg.generator.capability_revision = cfg.capability_revision;
         }
         const link = generating_runtime.ChainLink{ .generator = cfg };
-        var result = generating_runtime.executeChainWithOptions(alloc, self.http, &.{link}, .{
+        var result = generating_runtime.executeChainWithOptions(alloc, provider_http, &.{link}, .{
             .antfly_provider = self.antfly_provider,
             .secret_store = self.secret_store,
             .max_response_bytes = self.responseLimitForTask(.generator, 1),
             .source_table = self.execution.routing.source_table,
-            .execution = self.execution,
+            .execution = execution,
             .request_context = self.requestContext(),
             .provider_runtime = self.provider_runtime,
             .limits = self.limits,
@@ -3802,10 +4088,11 @@ pub const Runtime = struct {
         return try alloc.dupe(u8, result.content);
     }
 
-    fn documentCall(self: *Runtime, a: Allocator, model: []const u8, endpoint: ?[]const u8, api_key: ?[]const u8, bytes: []const u8, is_extract: bool) ![]u8 {
+    fn documentCall(self: *Runtime, a: Allocator, model: []const u8, endpoint: ?[]const u8, api_key: ?[]const u8, bytes: []const u8, is_extract: bool, scoped_http: ?*httpx.Client) ![]u8 {
+        const http = scoped_http orelse self.http;
         const binding = try self.document_checkpoints.?.bind(a, bytes, is_extract);
         defer binding.view().release();
-        var client = try readers.document_rpc.Client.initBound(a, binding.view(), self.execution.io orelse self.http.io);
+        var client = try readers.document_rpc.Client.initBound(a, binding.view(), self.execution.io orelse http.io);
         defer client.deinit();
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
@@ -3833,17 +4120,17 @@ pub const Runtime = struct {
         count = try self.execution.routing.appendHeaders(&headers, count);
         var secret = try common_secrets.SecretValue.initConfigOrEnv(a, api_key, "ANTFLY_API_KEY");
         defer secret.deinit(a);
-        const resolved_key = try secret.resolveOwned(a, self.secret_store);
+        const resolved_key = if (scoped_http == null) try secret.resolveOwned(a, self.secret_store) else null;
         defer if (resolved_key) |key| a.free(key);
-        const authorization = if (resolved_key) |key| try std.fmt.allocPrint(a, "Bearer {s}", .{key}) else null;
+        const authorization = if (resolved_key orelse (if (scoped_http != null) api_key else null)) |key| try std.fmt.allocPrint(a, "Bearer {s}", .{key}) else null;
         defer if (authorization) |value| a.free(value);
         if (authorization) |value| {
             headers[count] = .{ "Authorization", value };
             count += 1;
         }
-        var transport = try protocol.Owner.init(a, self.http.io, binding.view(), bytes);
+        var transport = try protocol.Owner.init(a, http.io, binding.view(), bytes);
         defer transport.deinit();
-        var response = self.http.requestToWriter(.POST, url, .{
+        var response = http.requestToWriter(.POST, url, .{
             .headers = headers[0..count],
             .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
             .body_stream = .{ .context = &transport.upload, .read = protocol.Queue.read },
@@ -3873,13 +4160,23 @@ pub const Runtime = struct {
     fn readDocumentDurably(self: *Runtime, a: Allocator, request: asset_producer.Request) !?[]u8 {
         var parsed = try std.json.parseFromSlice(readers.Config, a, request.config_json, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
-        const cfg = parsed.value;
-        if (cfg.provider != .antfly or request.media.len != 0) return null;
+        if (parsed.value.provider != .antfly or request.media.len != 0) return null;
+        const qualified = if (parsed.value.model) |model| (try inference_config.InferenceModelReference.parse(model)) != null else false;
+        var resolved = if (qualified)
+            try self.resolveReaderConfig(a, parsed.value)
+        else
+            ResolvedReaderConfig{ .config = parsed.value };
+        defer resolved.deinit(a);
+        const cfg = resolved.config;
+        var connection_arena = std.heap.ArenaAllocator.init(a);
+        defer connection_arena.deinit();
+        var scoped = try self.inferenceConnectionHttp(connection_arena.allocator(), resolved.connection, resolved.endpoint orelse "", .read);
+        defer if (scoped) |*remote| remote.deinit();
         // Explicit document inputs preserve format, page selection and provenance.
         // Otherwise retain the established image-source parser and wire form.
         const body = try self.documentReadBody(a, request, cfg);
         defer a.free(body);
-        const result = try self.documentCall(a, cfg.model orelse return error.InvalidReaderConfig, cfg.resolvedUrl(), cfg.api_key, body, false);
+        const result = try self.documentCall(a, cfg.model orelse return error.InvalidReaderConfig, cfg.resolvedUrl(), cfg.api_key, body, false, if (scoped) |*remote| remote else null);
         defer a.free(result);
         const items = try readers.documentResults(a, result);
         defer {
@@ -3922,12 +4219,15 @@ pub const Runtime = struct {
     }
     fn extractDocumentDurably(self: *Runtime, a: Allocator, request: asset_producer.Request) !?[]u8 {
         if (try generated_extractor.isGenerated(a, request.config_json)) return null;
-        var cfg = try extracting.parseConfigFromSlice(a, request.config_json);
-        defer cfg.deinit(a);
-        if (cfg.provider != .antfly or request.media.len != 0) return null;
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const scratch = arena.allocator();
+        var context: ExtractorConnectionContext = .{ .arena = scratch };
+        var cfg = try self.parseExtractorConfig(a, request.config_json, &context, false);
+        defer cfg.deinit(a);
+        if (cfg.provider != .antfly or request.media.len != 0) return null;
+        var scoped = try ScopedExtractorTransport.init(self, scratch, context.connection, cfg.url);
+        defer scoped.deinit();
         // A checkpoint factory is a capability of the storage owner, not a
         // request to turn ordinary text extraction into a document RPC. Text
         // already commits through the artifact publication/retry protocol.
@@ -3946,7 +4246,7 @@ pub const Runtime = struct {
         try body.object.put(scratch, "documents", documents);
         const bytes = try std.json.Stringify.valueAlloc(a, body, .{});
         defer a.free(bytes);
-        const response = try self.documentCall(a, cfg.model, cfg.resolvedUrl(), cfg.api_key, bytes, true);
+        const response = try self.documentCall(a, cfg.model, cfg.resolvedUrl(), cfg.api_key, bytes, true, if (scoped.client) |*http| http else null);
         defer a.free(response);
         return try extractionResultJsonAlloc(a, response, .{ .model = cfg.model, .item_count = 1, .schema_version = if (cfg.schema_version_explicit) cfg.schema_version else null, .max_response_bytes = self.responseLimitForTask(.extractor, 1) }, source_id, !(isJsonContentType(request.content_type) or request.content_type.len == 0));
     }
@@ -4024,7 +4324,8 @@ pub const Runtime = struct {
     fn readReaderWindow(self: *Runtime, alloc: Allocator, cfg: readers.Config, request: anytype, comptime readOnce: anytype) !readers.BatchResult {
         const identity_before = if (self.model_execution_identity) |identity| identity.* else null;
         return readOnce(self, alloc, cfg, request) catch |err| {
-            if (err != error.InferenceCapabilitiesStale or cfg.provider != .antfly or isLocalReaderProvider(cfg.provider, self.routedReaderConfig(cfg).resolvedUrl())) return err;
+            const named = if (cfg.model) |model| (try inference_config.InferenceModelReference.parse(model)) != null else false;
+            if (err != error.InferenceCapabilitiesStale or cfg.provider != .antfly or (!named and isLocalReaderProvider(cfg.provider, self.routedReaderConfig(cfg).resolvedUrl()))) return err;
             if (self.model_execution_identity) |identity| identity.* = identity_before.?;
             try self.execution.check(platform.time.monotonicNs());
             return readOnce(self, alloc, cfg, request);
@@ -4203,8 +4504,7 @@ pub const Runtime = struct {
             items <= @min(caps.remote_framed_max_attachments orelse std.math.maxInt(usize), limits.max_attachments);
     }
 
-    fn bindReaderPlacement(self: *Runtime, endpoint: []const u8, cfg: readers.Config, placement: *remote_capabilities.DiscoveryHeaders, headers: *[]const [2][]const u8, alloc: Allocator, request: anytype, measured: *?remote_capabilities.DiscoveryMediaGeometry, json_size_hint: *?usize, force_json: *bool) !remote_capabilities.CapabilityLease {
-        const cache = self.capabilityCache();
+    fn bindReaderPlacement(self: *Runtime, cache: *remote_capabilities.Cache, http: *httpx.Client, endpoint: []const u8, cfg: readers.Config, placement: *remote_capabilities.DiscoveryHeaders, headers: *[]const [2][]const u8, alloc: Allocator, request: anytype, measured: *?remote_capabilities.DiscoveryMediaGeometry, json_size_hint: *?usize, force_json: *bool) !remote_capabilities.CapabilityLease {
         const model = cfg.model orelse "";
         const wait = self.execution.waitContext();
         var complete = request.images.len != 0;
@@ -4229,7 +4529,7 @@ pub const Runtime = struct {
             headers.* = try placement.withReaderMime(headers.*, mime_shape.batch, mime_shape.first);
             if (request.require_batch_contract and request.images.len > 1) headers.* = try placement.withReaderBatchContract(headers.*);
             if (rounded) headers.* = try placement.withRoundedMediaMarker(headers.*);
-            const lease = cache.getOrDiscoverLeaseWithContext(self.http, endpoint, model, .read, headers.*, wait) catch |err| switch (err) {
+            const lease = cache.getOrDiscoverLeaseWithContext(http, endpoint, model, .read, headers.*, wait) catch |err| switch (err) {
                 error.InferenceDiscoveryRequiresJsonTransport => {
                     if (json_only) return err;
                     json_only = true;
@@ -4304,10 +4604,19 @@ pub const Runtime = struct {
     fn readImagesWithConfigReported(self: *Runtime, alloc: Allocator, cfg: readers.Config, request: readers.Request) !readers.BatchResult {
         var resolved_reader = try self.resolveReaderConfig(alloc, cfg);
         defer resolved_reader.deinit(alloc);
+        var connection_arena = std.heap.ArenaAllocator.init(alloc);
+        defer connection_arena.deinit();
+        var scoped = try self.inferenceConnectionHttp(connection_arena.allocator(), resolved_reader.connection, resolved_reader.endpoint orelse "", .read);
+        defer if (scoped) |*client| client.deinit();
+        const http = if (scoped) |*client| client else self.http;
+        // Keep private capability leases and refreshes within this transport's lifetime.
+        var scoped_cache = remote_capabilities.Cache.init(std.heap.smp_allocator, http.io);
+        defer scoped_cache.deinit();
+        const capability_cache = if (scoped != null) &scoped_cache else self.capabilityCache();
         var execution_cfg = resolved_reader.config;
         var cloudflare_token: ?[]u8 = null;
         defer if (cloudflare_token) |token| alloc.free(token);
-        if (execution_cfg.provider == .cloudflare) {
+        if (execution_cfg.provider == .cloudflare and resolved_reader.connection == null) {
             var secret = try common_secrets.SecretValue.initConfigOrEnv(alloc, execution_cfg.bearer_token orelse execution_cfg.api_key, "CLOUDFLARE_API_TOKEN");
             defer secret.deinit(alloc);
             cloudflare_token = (try secret.resolveOwned(alloc, self.secret_store)) orelse return error.CloudflareCredentialMissing;
@@ -4336,7 +4645,7 @@ pub const Runtime = struct {
         var force_json = false;
         const discovered_capabilities: ?inference_work.InferenceCapabilities = if (!local_reader and execution_cfg.provider == .antfly) blk: {
             const endpoint = execution_cfg.resolvedUrl() orelse return error.InvalidReaderConfig;
-            const lease = try self.bindReaderPlacement(endpoint, execution_cfg, &placement, &capability_auth_headers, alloc, request, &remote_geometry, &json_size_hint, &force_json);
+            const lease = try self.bindReaderPlacement(capability_cache, http, endpoint, execution_cfg, &placement, &capability_auth_headers, alloc, request, &remote_geometry, &json_size_hint, &force_json);
             capability_lease_fields = CapabilityLeaseFields.init(lease);
             capability_lease_fields.apply(&execution_cfg);
             try self.recordLeaseExecution(lease);
@@ -4369,7 +4678,7 @@ pub const Runtime = struct {
             return error.InvalidInferenceCapabilities;
         }
         if (execution_cfg.provider == .apple)
-            return readers.readWithConfigReported(alloc, self.http, execution_cfg, request, try self.appleReaderOptions());
+            return readers.readWithConfigReported(alloc, http, execution_cfg, request, try self.appleReaderOptions());
         if (local_reader) {
             const local = self.antfly_provider orelse return error.UnsupportedReaderProvider;
             if (self.model_execution_identity) |identity|
@@ -4393,11 +4702,11 @@ pub const Runtime = struct {
             return .{ .items = items, .execution = .{ .requested_items = items.len, .serial_items = items.len } };
         }
 
-        return self.dispatchReaderUris(alloc, execution_cfg, request, capability_auth_headers, discovered_capabilities, json_size_hint);
+        return self.dispatchReaderUris(capability_cache, http, alloc, execution_cfg, request, capability_auth_headers, discovered_capabilities, json_size_hint);
     }
 
-    fn dispatchReaderUris(self: *Runtime, alloc: Allocator, execution_cfg: readers.Config, request: readers.Request, capability_auth_headers: []const [2][]const u8, caps: ?inference_work.InferenceCapabilities, json_size_hint: ?usize) !readers.BatchResult {
-        return readers.readWithConfigReported(alloc, self.http, execution_cfg, request, .{
+    fn dispatchReaderUris(self: *Runtime, capability_cache: *remote_capabilities.Cache, http: *httpx.Client, alloc: Allocator, execution_cfg: readers.Config, request: readers.Request, capability_auth_headers: []const [2][]const u8, caps: ?inference_work.InferenceCapabilities, json_size_hint: ?usize) !readers.BatchResult {
+        return readers.readWithConfigReported(alloc, http, execution_cfg, request, .{
             .source_table = self.execution.routing.source_table,
             .max_request_bytes = if (caps) |value| value.remote_json_max_request_bytes else null,
             .json_size_hint = json_size_hint,
@@ -4409,7 +4718,7 @@ pub const Runtime = struct {
         }) catch |err| {
             if (err == error.InferenceCapabilitiesStale and execution_cfg.provider == .antfly) {
                 const endpoint = execution_cfg.resolvedUrl() orelse return err;
-                try self.capabilityCache().invalidateLease(endpoint, execution_cfg.model orelse "", .read, capability_auth_headers, try remote_capabilities.LeaseIdentity.init(execution_cfg.capability_token, execution_cfg.capability_revision));
+                try capability_cache.invalidateLease(endpoint, execution_cfg.model orelse "", .read, capability_auth_headers, try remote_capabilities.LeaseIdentity.init(execution_cfg.capability_token, execution_cfg.capability_revision));
             }
             return err;
         };
@@ -4453,6 +4762,15 @@ pub const Runtime = struct {
         try readers.validateEncodedRequest(request);
         var resolved_reader = try self.resolveReaderConfig(alloc, cfg);
         defer resolved_reader.deinit(alloc);
+        var connection_arena = std.heap.ArenaAllocator.init(alloc);
+        defer connection_arena.deinit();
+        var scoped = try self.inferenceConnectionHttp(connection_arena.allocator(), resolved_reader.connection, resolved_reader.endpoint orelse "", .read);
+        defer if (scoped) |*client| client.deinit();
+        const http = if (scoped) |*client| client else self.http;
+        // Keep private capability leases and refreshes within this transport's lifetime.
+        var scoped_cache = remote_capabilities.Cache.init(std.heap.smp_allocator, http.io);
+        defer scoped_cache.deinit();
+        const capability_cache = if (scoped != null) &scoped_cache else self.capabilityCache();
         var execution_cfg = resolved_reader.config;
         try execution_cfg.validate();
         const local_reader = isLocalReaderProvider(execution_cfg.provider, execution_cfg.resolvedUrl());
@@ -4483,7 +4801,7 @@ pub const Runtime = struct {
         var force_json = false;
         const capabilities: ?inference_work.InferenceCapabilities = if (!local_reader and execution_cfg.provider == .antfly) blk: {
             const endpoint = execution_cfg.resolvedUrl() orelse return error.InvalidReaderConfig;
-            const lease = try self.bindReaderPlacement(endpoint, execution_cfg, &placement, &capability_auth_headers, alloc, request, &remote_geometry, &json_size_hint, &force_json);
+            const lease = try self.bindReaderPlacement(capability_cache, http, endpoint, execution_cfg, &placement, &capability_auth_headers, alloc, request, &remote_geometry, &json_size_hint, &force_json);
             capability_lease_fields = CapabilityLeaseFields.init(lease);
             capability_lease_fields.apply(&execution_cfg);
             try self.recordLeaseExecution(lease);
@@ -4531,7 +4849,7 @@ pub const Runtime = struct {
             return error.InvalidInferenceCapabilities;
         }
         if (execution_cfg.provider == .apple)
-            return readers.readEncodedWithConfigReported(alloc, self.http, execution_cfg, request, try self.appleReaderOptions());
+            return readers.readEncodedWithConfigReported(alloc, http, execution_cfg, request, try self.appleReaderOptions());
         if (local_reader) {
             const local = self.antfly_provider orelse return error.UnsupportedReaderProvider;
             if (self.model_execution_identity) |identity|
@@ -4583,7 +4901,7 @@ pub const Runtime = struct {
         }
 
         if (use_framed_transport) {
-            return readers.readEncodedWithConfigReported(alloc, self.http, execution_cfg, request, .{
+            return readers.readEncodedWithConfigReported(alloc, http, execution_cfg, request, .{
                 .source_table = self.execution.routing.source_table,
                 .max_request_bytes = capabilities.?.remote_framed_max_request_bytes,
                 .max_attachments = capabilities.?.remote_framed_max_attachments,
@@ -4597,7 +4915,7 @@ pub const Runtime = struct {
             }) catch |err| {
                 if (err == error.InferenceCapabilitiesStale and execution_cfg.provider == .antfly) {
                     const endpoint = execution_cfg.resolvedUrl() orelse return err;
-                    try self.capabilityCache().invalidateLease(endpoint, execution_cfg.model orelse "", .read, capability_auth_headers, try remote_capabilities.LeaseIdentity.init(execution_cfg.capability_token, execution_cfg.capability_revision));
+                    try capability_cache.invalidateLease(endpoint, execution_cfg.model orelse "", .read, capability_auth_headers, try remote_capabilities.LeaseIdentity.init(execution_cfg.capability_token, execution_cfg.capability_revision));
                 }
                 return err;
             };
@@ -4632,7 +4950,7 @@ pub const Runtime = struct {
             .max_response_bytes = request.max_response_bytes,
         };
         var adapted = if (!local_reader and execution_cfg.provider == .antfly)
-            try self.dispatchReaderUris(alloc, execution_cfg, uri_request, capability_auth_headers, capabilities, json_size_hint)
+            try self.dispatchReaderUris(capability_cache, http, alloc, execution_cfg, uri_request, capability_auth_headers, capabilities, json_size_hint)
         else
             try self.readImagesWithConfigReported(alloc, execution_cfg, uri_request);
         errdefer adapted.deinit(alloc);
@@ -4734,6 +5052,15 @@ pub const Runtime = struct {
         var resolved_transcriber = try self.resolveTranscriberConfig(alloc, cfg_parsed.value);
         defer resolved_transcriber.deinit(alloc);
         cfg_parsed.value = resolved_transcriber.config;
+        var connection_arena = std.heap.ArenaAllocator.init(alloc);
+        defer connection_arena.deinit();
+        var scoped = try self.inferenceConnectionHttp(connection_arena.allocator(), resolved_transcriber.connection, resolved_transcriber.endpoint orelse "", .transcribe);
+        defer if (scoped) |*client| client.deinit();
+        const http = if (scoped) |*client| client else self.http;
+        // Keep private capability leases and refreshes within this transport's lifetime.
+        var scoped_cache = remote_capabilities.Cache.init(std.heap.smp_allocator, http.io);
+        defer scoped_cache.deinit();
+        const capability_cache = if (scoped != null) &scoped_cache else self.capabilityCache();
         if (request.media.len > 0) {
             if (!request.inline_media_trusted) return error.UntrustedInlineMedia;
             if (!cfg_parsed.value.provider.supportsResolvedAudio() or request.media.len != 1) return error.UnsupportedTranscriptionMedia;
@@ -4800,8 +5127,8 @@ pub const Runtime = struct {
         const capability_auth_headers = try placement.withShape(capability_auth_storage[0..capability_auth_count], .{ .items = 1, .media = true, .modalities = .{ .audio = true }, .output_tokens = 0 });
         if (cfg_parsed.value.provider == .antfly) {
             const endpoint = cfg_parsed.value.resolvedUrl() orelse return error.InvalidTranscribingConfig;
-            const lease = try self.capabilityCache().getOrDiscoverLeaseWithContext(
-                self.http,
+            const lease = try capability_cache.getOrDiscoverLeaseWithContext(
+                http,
                 endpoint,
                 antfly_model.?,
                 .transcribe,
@@ -4823,7 +5150,7 @@ pub const Runtime = struct {
         const execution_cfg = cfg_parsed.value;
         var result = transcribing.transcribeWithConfig(
             alloc,
-            self.http,
+            http,
             execution_cfg,
             .{
                 .url = request.source_text,
@@ -4844,7 +5171,7 @@ pub const Runtime = struct {
         ) catch |err| {
             if (err == error.InferenceCapabilitiesStale and cfg_parsed.value.provider == .antfly) {
                 const endpoint = cfg_parsed.value.resolvedUrl() orelse return err;
-                try self.capabilityCache().invalidateLease(
+                try capability_cache.invalidateLease(
                     endpoint,
                     antfly_model.?,
                     .transcribe,
@@ -4863,6 +5190,33 @@ pub const Runtime = struct {
         return try transcribing.speakerAttributedTextAlloc(alloc, &result);
     }
 
+    const connection_runtime = @import("generating/connection_runtime.zig");
+    const ResolvedInferenceConnection = connection_runtime.ResolvedInferenceConnection;
+
+    fn resolveGeneratorConnection(self: *const Runtime, arena: Allocator, generator: *generating_runtime.GeneratorConfig, task: connection_runtime.Task) !?ResolvedInferenceConnection {
+        return connection_runtime.resolveGenerator(self.inference_connections, arena, generator, task);
+    }
+
+    fn inferenceConnectionHttp(self: *Runtime, arena: Allocator, connection: ?ResolvedInferenceConnection, effective_url: []const u8, task: connection_runtime.Task) !?httpx.Client {
+        const resolved = connection orelse return null;
+        return try connection_runtime.client(arena, arena, self.http.io, resolved, effective_url, @tagName(task), .{
+            .principal = self.attribution_principal,
+            .metadata_json = self.attribution_metadata_json,
+            .workload = if (self.enable_index_attribution) .{
+                .operation = switch (task) {
+                    .generate => .index_generate,
+                    .extract => .index_extract,
+                    .decide => .index_decide,
+                    .transcribe => .index_transcribe,
+                    .read => .index_read,
+                },
+                .physical_table = self.execution.routing.source_table,
+            } else null,
+            .secret_store = self.secret_store,
+            .max_response_bytes = self.max_provider_response_bytes,
+        });
+    }
+
     fn extractGenerated(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !asset_producer.ProducedBatch {
         if (!requestsShareRoute(requests)) return error.BatchIncompatible;
         var arena = std.heap.ArenaAllocator.init(alloc);
@@ -4871,8 +5225,11 @@ pub const Runtime = struct {
         var parsed = try generated_extractor.parse(a, requests[0].config_json);
         defer parsed.deinit();
         var config = parsed.value;
+        const connection = try self.resolveGeneratorConnection(a, &config.generator, .extract);
         try self.routeGeneratorConfig(a, &config.generator);
-        var engine = self.constrainedRuntime();
+        var scoped_http = try self.inferenceConnectionHttp(a, connection, config.generator.url, .extract);
+        defer if (scoped_http) |*client| client.deinit();
+        var engine = self.constrainedRuntimeWithHttp(if (scoped_http) |*client| client else null);
         const caps = try engine.capabilitiesForMedia(a, &config.generator, false);
         const mode = try caps.select(config.output, config.probabilities);
         config.generator.logprobs = config.probabilities == .token_logprobs;
@@ -4924,16 +5281,21 @@ pub const Runtime = struct {
         }
         if (request.media.len > 0 and !request.inline_media_trusted) return error.UntrustedInlineMedia;
         for (request.media) |media| try validateEncodedMedia(media);
-        var cfg = try extracting.parseConfigFromSlice(alloc, request.config_json);
+        var transport_arena = std.heap.ArenaAllocator.init(alloc);
+        defer transport_arena.deinit();
+        var connection_context: ExtractorConnectionContext = .{ .arena = transport_arena.allocator() };
+        var cfg = try self.parseExtractorConfig(alloc, request.config_json, &connection_context, true);
         defer cfg.deinit(alloc);
-        try self.routeExtractorConfig(alloc, &cfg);
+        var scoped = try ScopedExtractorTransport.init(self, connection_context.arena, connection_context.connection, cfg.url);
+        defer scoped.deinit();
+        const transport = scoped.view(self);
 
         const local_extractor = isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl());
         const discovery_shape = try producerDiscoveryShape(alloc, &.{request});
         const capabilities = if (local_extractor)
             try self.extractorCapabilities(alloc, cfg)
         else
-            try self.bindExtractorCapabilityLease(alloc, &cfg, discovery_shape);
+            try self.bindExtractorCapabilityLease(alloc, &cfg, discovery_shape, transport);
         if (capabilities) |resolved| {
             try validateExtractorInvocation(
                 alloc,
@@ -4991,7 +5353,7 @@ pub const Runtime = struct {
                 )
             else
                 return error.UnsupportedExtractionProvider;
-        } else extracting.extractWithConfigAndOptions(alloc, self.http, cfg, extract_request, .{
+        } else extracting.extractWithConfigAndOptions(alloc, transport.http, cfg, extract_request, .{
             .source_table = self.execution.routing.source_table,
             .timeout_ms = try self.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms),
             .cancellation = httpx.CancellationToken.fromCallback(
@@ -5000,7 +5362,7 @@ pub const Runtime = struct {
             ),
         }) catch |err| {
             if (err == error.InferenceCapabilitiesStale)
-                try self.invalidateExtractorCapabilityLease(alloc, cfg, discovery_shape);
+                try self.invalidateExtractorCapabilityLease(alloc, cfg, discovery_shape, transport);
             if (err == error.InvalidExtractionResponse) return error.InvalidExtractorResponse;
             return err;
         };
@@ -5064,6 +5426,164 @@ pub const Runtime = struct {
         return effective;
     }
 };
+
+test "asset producer runtime resolves an inference connection without inline overrides" {
+    const a = std.testing.allocator;
+    var config = try inference_config.Config.parseFromSlice(a,
+        \\{"connections":{"private":{"kind":"inference","capabilities":["models.extract"],"inference":{"provider":"openai","url":"https://gateway.internal/v1","api_key":"${secret:gateway.key}","headers":{"X-Team":"documents"}}},"hosted":{"kind":"inference","capabilities":["models.generate"],"inference":{"provider":"openrouter"}},"aws":{"kind":"inference","capabilities":["models.generate"],"inference":{"provider":"bedrock","region":"eu-west-1"}},"workers":{"kind":"inference","capabilities":["models.extract"],"inference":{"provider":"cloudflare","account_id":"worker-account","gateway_id":"worker-gateway"}},"uncredentialed":{"kind":"inference","capabilities":["models.generate"],"inference":{"provider":"openai","url":"https://uncredentialed.internal/v1"}}}}
+    );
+    defer config.deinit();
+    var client = httpx.Client.init(a, std.testing.io);
+    defer client.deinit();
+    var runtime = Runtime.initWithOptions(a, &client, .{ .inference_connections = &config.connections });
+    defer runtime.deinit();
+    var requested = try @import("antfly_generating").parseConfigFromSlice(a,
+        \\{"provider":"openai","model":"connections/private/models/gpt-4.1"}
+    );
+    defer requested.deinit(a);
+    try std.testing.expectEqualStrings("", requested.url);
+    var generator = requested;
+    const connection = (try runtime.resolveGeneratorConnection(a, &generator, .extract)).?;
+    try std.testing.expectEqualStrings("gpt-4.1", generator.model);
+    try std.testing.expectEqualStrings("https://gateway.internal/v1", generator.url);
+    try std.testing.expectEqualStrings("${secret:gateway.key}", generator.api_key.?);
+    try std.testing.expectEqualStrings("documents", connection.config.headers.get("X-Team").?);
+
+    generator = requested;
+    generator.url = "https://another.internal";
+    try std.testing.expectError(error.InvalidGeneratedExtractorConfig, runtime.resolveGeneratorConnection(a, &generator, .extract));
+    generator = requested;
+    generator.provider = .anthropic;
+    try std.testing.expectError(error.ModelTaskMismatch, runtime.resolveGeneratorConnection(a, &generator, .extract));
+
+    generator = .{ .provider = .openrouter, .model = "connections/hosted/models/vendor/model", .url = "" };
+    _ = (try runtime.resolveGeneratorConnection(a, &generator, .generate)).?;
+    try std.testing.expectEqualStrings("vendor/model", generator.model);
+    try std.testing.expectEqualStrings(@import("antfly_generating").defaultUrl(.openrouter), generator.url);
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    generator = .{ .provider = .bedrock, .model = "connections/aws/models/amazon.nova-lite-v1:0", .url = "" };
+    _ = (try runtime.resolveGeneratorConnection(arena.allocator(), &generator, .generate)).?;
+    try std.testing.expectEqualStrings("eu-west-1", generator.region.?);
+    try std.testing.expectEqualStrings("https://bedrock-runtime.eu-west-1.amazonaws.com", generator.url);
+
+    var cloudflare = try @import("antfly_generating").parseConfigFromSlice(a,
+        \\{"provider":"cloudflare","model":"connections/workers/models/@cf/meta/llama-3.3-70b-instruct-fp8-fast"}
+    );
+    defer cloudflare.deinit(a);
+    generator = cloudflare;
+    _ = (try runtime.resolveGeneratorConnection(arena.allocator(), &generator, .extract)).?;
+    try generator.validate();
+    try std.testing.expectEqualStrings("https://api.cloudflare.com/client/v4/accounts/worker-account/ai/v1", generator.url);
+    try std.testing.expectEqualStrings("worker-gateway", generator.gateway_id.?);
+
+    generator = .{ .provider = .openai, .model = "connections/uncredentialed/models/gpt-4.1", .url = "" };
+    try std.testing.expectError(error.MissingGeneratorCredentials, runtime.resolveGeneratorConnection(a, &generator, .generate));
+}
+
+test "asset producer transcriber resolves a managed provider connection" {
+    const a = std.testing.allocator;
+    var config = try inference_config.Config.parseFromSlice(a,
+        \\{"connections":{"speech":{"kind":"inference","capabilities":["models.transcribe"],"inference":{"provider":"openai","url":"https://speech.internal/v1","api_key":"test-key","allow_private_ips":false,"headers":{"X-Team":"media"}}}}}
+    );
+    defer config.deinit();
+    var client = httpx.Client.init(a, std.testing.io);
+    defer client.deinit();
+    var runtime = Runtime.initWithOptions(a, &client, .{ .inference_connections = &config.connections });
+    defer runtime.deinit();
+    const requested: transcribing.Config = .{ .provider = .openai, .model = "connections/speech/models/whisper-1" };
+    var resolved = try runtime.resolveTranscriberConfig(a, requested);
+    defer resolved.deinit(a);
+    try std.testing.expectEqualStrings("whisper-1", resolved.config.model.?);
+    try std.testing.expectEqualStrings("test-key", resolved.config.api_key.?);
+    try std.testing.expectEqualStrings("https://speech.internal/v1", resolved.endpoint.?);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var scoped = (try runtime.inferenceConnectionHttp(arena.allocator(), resolved.connection, resolved.endpoint.?, .transcribe)).?;
+    defer scoped.deinit();
+    try std.testing.expect(scoped.config.address_filter != null);
+    try std.testing.expectEqualStrings("media", scoped.config.default_headers.?[0][1]);
+    var overridden = requested;
+    overridden.api_key = "inline-key";
+    try std.testing.expectError(error.InvalidTranscribingConfig, runtime.resolveTranscriberConfig(a, overridden));
+}
+
+test "asset producer runtime resolves a managed reader connection" {
+    const a = std.testing.allocator;
+    var config = try inference_config.Config.parseFromSlice(a,
+        \\{"connections":{"image":{"kind":"inference","capabilities":["models.read"],"inference":{"provider":"openai","url":"https://image.internal/v1","api_key":"fixture-key","headers":{"X-Team":"documents"}}}}}
+    );
+    defer config.deinit();
+    var client = httpx.Client.init(a, std.testing.io);
+    defer client.deinit();
+    var runtime = Runtime.initWithOptions(a, &client, .{ .inference_connections = &config.connections });
+    defer runtime.deinit();
+    const requested: readers.Config = .{ .provider = .openai, .model = "connections/image/models/gpt-4.1" };
+    var resolved = try runtime.resolveReaderConfig(a, requested);
+    defer resolved.deinit(a);
+    try std.testing.expectEqualStrings("gpt-4.1", resolved.config.model.?);
+    try std.testing.expectEqualStrings("https://image.internal/v1", resolved.config.base_url.?);
+    try std.testing.expectEqualStrings("fixture-key", resolved.config.api_key.?);
+    try std.testing.expectEqualStrings("documents", resolved.connection.?.config.headers.get("X-Team").?);
+    var overridden = requested;
+    overridden.base_url = "https://caller.internal";
+    try std.testing.expectError(error.InvalidReaderConfig, runtime.resolveReaderConfig(a, overridden));
+}
+
+test "asset producer runtime resolves native extraction through the configured inference connection" {
+    const a = std.testing.allocator;
+    var config = try inference_config.Config.parseFromSlice(a,
+        \\{"connections":{"runtime":{"kind":"inference","capabilities":["models.extract"],"inference":{"provider":"antfly","url":"https://extract.internal/ai/v1","headers":{"X-Team":"runtime-docs"}}},"workers":{"kind":"inference","capabilities":["models.extract"],"inference":{"provider":"cloudflare","account_id":"worker-account","gateway_id":"worker-gateway","url":"https://gateway.internal/extract","api_key":"fixture-token","allow_private_ips":false,"headers":{"X-Team":"documents"},"attribution":{"header":"X-Billing-Team","workloads":{"index_extract/receipts":"receipt-team"}}}}}}
+    );
+    defer config.deinit();
+    var client = httpx.Client.init(a, std.testing.io);
+    defer client.deinit();
+    var runtime = Runtime.initWithOptions(a, &client, .{ .inference_connections = &config.connections });
+    defer runtime.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var context: Runtime.ExtractorConnectionContext = .{ .arena = arena.allocator() };
+    var cfg = try runtime.parseExtractorConfig(a,
+        \\{"provider":"cloudflare","model":"connections/workers/models/@cf/cloudflare/clairic","schema_version":2}
+    , &context, true);
+    defer cfg.deinit(a);
+    try std.testing.expectEqualStrings("@cf/cloudflare/clairic", cfg.model);
+    try std.testing.expectEqualStrings("https://gateway.internal/extract", cfg.url);
+    try std.testing.expectEqualStrings("worker-account", cfg.account_id.?);
+    try std.testing.expectEqualStrings("worker-gateway", cfg.gateway_id.?);
+    try std.testing.expectEqualStrings("fixture-token", cfg.api_key.?);
+    try std.testing.expectEqual(@as(u32, 2), cfg.schema_version);
+    try std.testing.expectEqualStrings("documents", context.connection.?.config.headers.get("X-Team").?);
+    try std.testing.expectError(error.InferenceAttributionDenied, runtime.inferenceConnectionHttp(context.arena, context.connection, cfg.url, .extract));
+    runtime.enable_index_attribution = true;
+    runtime.execution.routing.source_table = "receipts";
+    var scoped = (try runtime.inferenceConnectionHttp(context.arena, context.connection, cfg.url, .extract)).?;
+    defer scoped.deinit();
+    try std.testing.expect(scoped.config.address_filter != null);
+    const headers = scoped.config.default_headers.?;
+    try std.testing.expectEqualStrings("documents", headers[0][1]);
+    try std.testing.expectEqualStrings("receipt-team", headers[1][1]);
+    try std.testing.expectError(error.InvalidExtractionConfig, runtime.parseExtractorConfig(a,
+        \\{"provider":"cloudflare","model":"connections/workers/models/@cf/cloudflare/clairic","api_url":"https://caller.internal"}
+    , null, true));
+    try std.testing.expectError(error.ModelTaskMismatch, runtime.parseExtractorConfig(a,
+        \\{"provider":"pioneer","model":"connections/workers/models/@cf/cloudflare/clairic"}
+    , null, true));
+    var antfly_context: Runtime.ExtractorConnectionContext = .{ .arena = arena.allocator() };
+    var antfly_cfg = try runtime.parseExtractorConfig(a,
+        \\{"provider":"antfly","model":"connections/runtime/models/entities"}
+    , &antfly_context, true);
+    defer antfly_cfg.deinit(a);
+    var antfly_scoped = try Runtime.ScopedExtractorTransport.init(&runtime, antfly_context.arena, antfly_context.connection, antfly_cfg.url);
+    defer antfly_scoped.deinit();
+    const antfly_transport = antfly_scoped.view(&runtime);
+    try std.testing.expect(antfly_transport.cache != runtime.capabilityCache());
+    try std.testing.expectEqualStrings("entities", antfly_cfg.model);
+    try std.testing.expectEqualStrings("https://extract.internal/ai/v1", antfly_cfg.url);
+    try std.testing.expect(antfly_cfg.api_key == null);
+    try std.testing.expectEqualStrings("runtime-docs", antfly_transport.http.config.default_headers.?[0][1]);
+}
 
 test "asset producer runtime invocation context can only tighten configured controls" {
     const alloc = std.testing.allocator;

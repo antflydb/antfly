@@ -471,6 +471,8 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
     ) !?[]const u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         var semantic_resolver = self.server.semanticStatusResolver(self.query_embedding_security_scope.domain, self.query_embedding_security_scope.value);
+        semantic_resolver.attribution_principal = self.query_embedding_security_scope.attribution_principal;
+        semantic_resolver.attribution_metadata_json = self.query_embedding_security_scope.attribution_metadata_json;
         if (self.request_context) |context| {
             try context.check();
             semantic_resolver.query_embedding_deadline_ns = context.deadline_ns;
@@ -521,6 +523,8 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
         max_work: u32,
     ) !?db_mod.RuntimePreflightSummary {
         var semantic_resolver = self.server.semanticStatusResolver(self.query_embedding_security_scope.domain, self.query_embedding_security_scope.value);
+        semantic_resolver.attribution_principal = self.query_embedding_security_scope.attribution_principal;
+        semantic_resolver.attribution_metadata_json = self.query_embedding_security_scope.attribution_metadata_json;
         if (self.request_context) |context| {
             try context.check();
             semantic_resolver.query_embedding_deadline_ns = context.deadline_ns;
@@ -2095,6 +2099,8 @@ pub const SemanticStatusResolver = struct {
     query_embedding_budget: ?*cache_budget.CacheBudget = null,
     query_embedding_security_domain: managed_embedder.QueryCacheSecurityDomain = .internal,
     query_embedding_security_scope: []const u8 = "internal",
+    attribution_principal: ?[]const u8 = null,
+    attribution_metadata_json: []const u8 = "",
     query_embedding_deadline_ns: ?u64 = null,
     query_cancellation: ?CancellationToken = null,
     request_id: []const u8 = "",
@@ -2167,12 +2173,15 @@ pub const SemanticStatusResolver = struct {
             .remote_content = self.remote_content,
             .inference_api_url = self.inference_api_url,
             .inference_api_key = self.inference_api_key,
+            .inference_connections = if (self.server) |server| if (server.cfg.node_config) |config| &config.connections else null else null,
             .secret_store = self.secret_store,
             .provider_runtime = self.provider_runtime,
             .query_embedding_cache = self.query_embedding_cache,
             .query_embedding_budget = self.query_embedding_budget,
             .query_embedding_security_domain = self.query_embedding_security_domain,
             .query_embedding_security_scope = self.query_embedding_security_scope,
+            .attribution_principal = self.attribution_principal,
+            .attribution_metadata_json = self.attribution_metadata_json,
             .query_embedding_deadline_ns = self.query_embedding_deadline_ns,
             .query_cancellation = self.query_cancellation,
             .request_id = self.request_id,
@@ -5768,7 +5777,7 @@ pub const ApiHttpServer = struct {
         deadline_ns: u64,
         stream: kernel_abi.StreamSink,
     ) !connections_api.InvokeResult {
-        return self.invokeInferenceConnectionObserved(alloc, connection_id, operation, body, cancellation, deadline_ns, stream, null);
+        return self.invokeInferenceConnectionObserved(alloc, connection_id, operation, body, cancellation, deadline_ns, stream, null, null, null, null);
     }
 
     pub fn invokeInferenceConnectionObserved(
@@ -5781,6 +5790,9 @@ pub const ApiHttpServer = struct {
         deadline_ns: u64,
         stream: kernel_abi.StreamSink,
         observer: ?httpx.AttemptObserver,
+        attribution_principal: ?[]const u8,
+        attribution_scope: ?@import("antfly_local_sources").common_config.InferenceAttributionScope,
+        request_id: ?[]const u8,
     ) !connections_api.InvokeResult {
         var client = httpx.Client.initWithConfig(alloc, self.inferenceIo(), .{ .keep_alive = false });
         defer client.deinit();
@@ -5797,7 +5809,7 @@ pub const ApiHttpServer = struct {
             deadline_ns,
             stream,
             .post,
-            .{ .attempt_observer = observer },
+            .{ .attempt_observer = observer, .attribution_principal = attribution_principal, .attribution_scope = attribution_scope, .request_id = request_id },
         );
     }
 
@@ -6852,12 +6864,13 @@ pub const ApiHttpServer = struct {
             const inference_deadline = try work.deadline.beginExecution(adapter.backend(), a, platform_time.monotonicNs(), context.now_ms, state, pending);
             const executor = if (pending) |item| item.execution_principal else state.execution_principal;
             const signature = if (pending) |item| item.execution_signature else state.execution_signature;
+            const attribution_metadata_json = if (pending) |item| item.execution_attribution_metadata_json else state.execution_attribution_metadata_json;
             context.principal = if (pending) |item| item.owner else if (state.execution_owner.len > 0) state.execution_owner else state.owner;
             const table_label = try std.fmt.allocPrint(a, "memory_{s}", .{state.space});
             const logical = if (server.source.vtable.system_catalog != null) try (system_catalog.Target{ .database = state.database, .namespace = state.namespace, .table = table_label }).resourceNameAlloc(a) else table_label;
             const bound_logical = (try server.logicalTableNamesInArena(a, .{}, &.{table}))[0];
             if (!std.mem.eql(u8, logical, bound_logical)) return error.StoredDestinationAuthorizationInvalid;
-            const payload = try std.json.Stringify.valueAlloc(a, .{ .domain = "antfly.memory.execution.v1", .table = logical, .owner = context.principal }, .{});
+            const payload = try memoryExecutionGrantPayload(a, logical, context.principal, attribution_metadata_json);
             const authority: stored_destination_authorization.Authorizer = .{ .manager = server.cfg.user_manager, .auth_enabled = server.cfg.auth_enabled };
             try authority.authorize(a, executor, &.{}, payload, signature);
             if (std.mem.eql(u8, executor, stored_destination_authorization.auth_disabled_principal)) {
@@ -6890,6 +6903,7 @@ pub const ApiHttpServer = struct {
             context.final_check_fn = MemoryPublicationAuthority.check;
             context.execution_principal = executor;
             context.execution_signature = signature;
+            context.execution_attribution_metadata_json = attribution_metadata_json;
             context.table_id = state.table_id;
             context.database = state.database;
             context.namespace = state.namespace;
@@ -6903,9 +6917,11 @@ pub const ApiHttpServer = struct {
             adapter.context = context;
             adapter.request = .{ .deadline_ns = work.deadline.end };
             const Runtime = @import("antfly_local_sources").asset_producer_runtime.Runtime;
-            const runtime = try Runtime.createOwned(a, server.inferenceIo(), .{ .provider_runtime = &server.embedding_provider_runtime, .antfly_provider = server.antfly_provider, .inference_api_url = server.configuredInferenceAPIURL(), .secret_store = server.cfg.secret_store, .source_table = table });
+            const connections = if (server.cfg.node_config) |config| &config.connections else null;
+            const attribution_principal = if (std.mem.eql(u8, executor, stored_destination_authorization.auth_disabled_principal)) null else context.principal;
+            const runtime = try Runtime.createOwned(a, server.inferenceIo(), .{ .provider_runtime = &server.embedding_provider_runtime, .inference_connections = connections, .attribution_principal = attribution_principal, .attribution_metadata_json = attribution_metadata_json, .inference_api_key = server.cfg.inference_api_key, .antfly_provider = server.antfly_provider, .inference_api_url = server.configuredInferenceAPIURL(), .secret_store = server.cfg.secret_store, .source_table = table });
             defer runtime.deinit();
-            var bridge: @import("antfly_local_sources").memory_models.Bridge = .{ .base = adapter.backend(), .producer = runtime.producer().withInvocationContext(.{ .io = server.inferenceIo(), .deadline_ns = inference_deadline, .max_response_bytes = state.config.max_input_bytes }), .alloc = a, .embedding_options = .{ .deadline_ns = inference_deadline, .bounded_http_request = true, .antfly_provider = server.antfly_provider, .io = server.inferenceIo(), .secret_store = server.cfg.secret_store, .inference_api_url = server.configuredInferenceAPIURL(), .source_table = table } };
+            var bridge: @import("antfly_local_sources").memory_models.Bridge = .{ .base = adapter.backend(), .producer = runtime.producer().withInvocationContext(.{ .io = server.inferenceIo(), .deadline_ns = inference_deadline, .max_response_bytes = state.config.max_input_bytes }), .alloc = a, .embedding_options = .{ .inference_connections = connections, .attribution_principal = attribution_principal, .attribution_metadata_json = attribution_metadata_json, .inference_api_key = server.cfg.inference_api_key, .deadline_ns = inference_deadline, .bounded_http_request = true, .antfly_provider = server.antfly_provider, .io = server.inferenceIo(), .secret_store = server.cfg.secret_store, .inference_api_url = server.configuredInferenceAPIURL(), .source_table = table } };
             const token = try std.fmt.allocPrint(a, "worker:{d}:{s}", .{ state.revision, if (pending) |item| item.id else "maintenance" });
             const service: module.memory.Service = .{ .backend = bridge.backend(), .context = context };
             _ = service.advanceAtRevision(a, if (pending) |item| item.id else "", token, state.revision) catch |err| {
@@ -10478,14 +10494,31 @@ pub const ApiHttpServer = struct {
         return permissionsAllow(identity.permissions, .@"*", "*", .admin);
     }
 
+    fn memoryExecutionGrantPayload(a: std.mem.Allocator, table: []const u8, owner: []const u8, attribution_metadata_json: []const u8) ![]u8 {
+        if (attribution_metadata_json.len == 0)
+            return std.json.Stringify.valueAlloc(a, .{ .domain = "antfly.memory.execution.v1", .table = table, .owner = owner }, .{});
+        return std.json.Stringify.valueAlloc(a, .{ .domain = "antfly.memory.execution.v2", .table = table, .owner = owner, .attribution = attribution_metadata_json }, .{});
+    }
+
     pub const QueryEmbeddingSecurityScope = struct {
         domain: managed_embedder.QueryCacheSecurityDomain,
         value: []const u8,
+        attribution_principal: ?[]const u8 = null,
+        attribution_metadata_json: []const u8 = "",
     };
 
     pub fn queryEmbeddingSecurityScope(authenticated_identity: ?AuthenticatedIdentity) QueryEmbeddingSecurityScope {
-        if (authenticated_identity) |identity| return .{ .domain = .principal, .value = identity.username };
+        if (authenticated_identity) |identity| return .{ .domain = .principal, .value = identity.username, .attribution_principal = identity.username, .attribution_metadata_json = identity.metadata_json };
         return .{ .domain = .anonymous, .value = "" };
+    }
+
+    pub fn managedGenerationConnections(self: *const ApiHttpServer, scope: QueryEmbeddingSecurityScope) ?generating_runtime.ManagedConnections {
+        const config = self.cfg.node_config orelse return null;
+        return .{
+            .connections = &config.connections,
+            .principal = scope.attribution_principal,
+            .metadata_json = scope.attribution_metadata_json,
+        };
     }
 
     fn ardOpenApiSpec(name: []const u8) ?ArdOpenApiSpec {
@@ -10714,6 +10747,7 @@ pub const ApiHttpServer = struct {
             antfly_provider: ?managed_embedder.AntflyProvider,
             secret_store: ?*common_secrets.FileStore,
             inference_api_key: ?[]const u8,
+            managed_connections: ?generating_runtime.ManagedConnections,
             io: std.Io,
             request_context: managed_embedder.RequestContext,
 
@@ -10734,6 +10768,7 @@ pub const ApiHttpServer = struct {
                     .antfly_provider = runner.antfly_provider,
                     .secret_store = runner.secret_store,
                     .inference_api_key = runner.inference_api_key,
+                    .managed_connections = runner.managed_connections,
                     .request_context = runner.request_context,
                 }, messages);
             }
@@ -10742,6 +10777,7 @@ pub const ApiHttpServer = struct {
             .antfly_provider = self.antfly_provider,
             .secret_store = self.cfg.secret_store,
             .inference_api_key = self.cfg.inference_api_key,
+            .managed_connections = self.managedGenerationConnections(queryEmbeddingSecurityScope(authenticated_identity)),
             .io = self.inferenceIo(),
             .request_context = request_context,
         };
@@ -10795,6 +10831,7 @@ pub const ApiHttpServer = struct {
             .remote_content = self.cfg.remote_content,
             .inference_api_url = self.configuredInferenceAPIURL(),
             .inference_api_key = self.cfg.inference_api_key,
+            .inference_connections = if (self.cfg.node_config) |config| &config.connections else null,
             .secret_store = self.cfg.secret_store,
             .provider_runtime = &self.embedding_provider_runtime,
             .query_embedding_cache = &self.query_embedding_cache,
@@ -11002,6 +11039,7 @@ pub const ApiHttpServer = struct {
             antfly_provider: ?managed_embedder.AntflyProvider,
             secret_store: ?*common_secrets.FileStore,
             inference_api_key: ?[]const u8,
+            managed_connections: ?generating_runtime.ManagedConnections,
             io: std.Io,
             deadline_ns: u64,
 
@@ -11027,13 +11065,14 @@ pub const ApiHttpServer = struct {
                 const runner: *@This() = @ptrCast(@alignCast(runner_ptr));
                 var client = httpx.Client.initWithConfig(inner_alloc, runner.io, .{ .keep_alive = false });
                 defer client.deinit();
-                return try generating_runtime.executeChainWithOptions(inner_alloc, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key, .request_context = .{ .io = runner.io, .deadline_ns = runner.deadline_ns } }, messages);
+                return try generating_runtime.executeChainWithOptions(inner_alloc, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key, .managed_connections = runner.managed_connections, .request_context = .{ .io = runner.io, .deadline_ns = runner.deadline_ns } }, messages);
             }
         };
         var generation_runner = RetrievalGenerationRunner{
             .antfly_provider = self.antfly_provider,
             .secret_store = self.cfg.secret_store,
             .inference_api_key = self.cfg.inference_api_key,
+            .managed_connections = self.managedGenerationConnections(query_embedding_security_scope),
             .io = self.inferenceIo(),
             .deadline_ns = platform_time.monotonicNs() +| switch (kind) {
                 .retrieval => 5 * std.time.ns_per_min,
@@ -11281,6 +11320,7 @@ pub const ApiHttpServer = struct {
             antfly_provider: ?managed_embedder.AntflyProvider,
             secret_store: ?*common_secrets.FileStore,
             inference_api_key: ?[]const u8,
+            managed_connections: ?generating_runtime.ManagedConnections,
             io: std.Io,
             deadline_ns: u64,
 
@@ -11306,13 +11346,14 @@ pub const ApiHttpServer = struct {
                 const runner: *@This() = @ptrCast(@alignCast(runner_ptr));
                 var client = httpx.Client.initWithConfig(alloc, runner.io, .{ .keep_alive = false });
                 defer client.deinit();
-                return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key, .request_context = .{ .io = runner.io, .deadline_ns = runner.deadline_ns } }, messages);
+                return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key, .managed_connections = runner.managed_connections, .request_context = .{ .io = runner.io, .deadline_ns = runner.deadline_ns } }, messages);
             }
         };
         var generation_runner = RetrievalGenerationRunner{
             .antfly_provider = self.antfly_provider,
             .secret_store = self.cfg.secret_store,
             .inference_api_key = self.cfg.inference_api_key,
+            .managed_connections = self.managedGenerationConnections(queryEmbeddingSecurityScope(null)),
             .io = self.inferenceIo(),
             .deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_min,
         };
@@ -15146,6 +15187,7 @@ pub const ApiHttpServer = struct {
                 .remote_content = self.cfg.remote_content,
                 .inference_api_url = self.configuredInferenceAPIURL(),
                 .inference_api_key = self.cfg.inference_api_key,
+                .inference_connections = if (self.cfg.node_config) |config| &config.connections else null,
             },
         ) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -16933,6 +16975,7 @@ pub const ApiHttpServer = struct {
             error.ValueSearchRequiresScan => return error.ValueSearchRequiresScan,
             error.ValueSearchLimitExceeded => return error.ValueSearchLimitExceeded,
             error.DecisionLimitExceeded => return error.DecisionLimitExceeded,
+            error.InferenceAttributionDenied => return error.InferenceAttributionDenied,
             error.RerankRateLimited => return error.RerankRateLimited,
             error.RerankTransientFailure => return error.RerankTransientFailure,
             error.RerankUpstreamFailure => return error.RerankUpstreamFailure,
@@ -18000,6 +18043,8 @@ pub const ApiHttpServer = struct {
         defer resolver.native_capture_token = null;
         try ensureRequestActive(cancellation);
         var semantic_resolver = self.semanticStatusResolver(query_embedding_security_scope.domain, query_embedding_security_scope.value);
+        semantic_resolver.attribution_principal = query_embedding_security_scope.attribution_principal;
+        semantic_resolver.attribution_metadata_json = query_embedding_security_scope.attribution_metadata_json;
         const query_started_ns = resolver.query_started_ns orelse platform_time.monotonicNs();
         resolver.query_embedding_retry_not_before_ns = 0;
         semantic_resolver.catalog_resolver = resolver;
@@ -18028,6 +18073,13 @@ pub const ApiHttpServer = struct {
         };
         defer query_req.deinit(alloc);
         query_req.req.public_query_started_ns = query_started_ns;
+        if (query_req.req.usesInferenceBinding()) {
+            if (self.cfg.node_config) |config| query_req.req.inference_binding = .{
+                .connections = &config.connections,
+                .principal = query_embedding_security_scope.attribution_principal,
+                .metadata_json = query_embedding_security_scope.attribution_metadata_json,
+            };
+        }
         self.applyGraphExecutionLimits(&query_req.req);
         if (request_deadline_ns) |deadline| {
             query_req.req.execution_deadline_ns = deadline;
@@ -19685,7 +19737,27 @@ pub const ApiHttpServer = struct {
         defer repair_state.deinit();
         const repair_publication = repair_state.value.published;
         const force_rebuild = if (repair_publication) |ready| self.lake_index_repairs.contains(table.table_id, ready) else false;
-        try @import("lake_index_coordinator.zig").reconcile(a, self.embedding_provider_runtime.io, table, &source, &store, .{ .ptr = self, .replace = Hooks.replace, .read = Hooks.read }, context, cancel, .{ .ptr = self, .now_ms = Hooks.now }, .{ .lease_ms = lease_ms, .force_rebuild = force_rebuild, .execution_source = options, .identity_spill_bytes = if (self.cfg.node_config) |node| node.lake_indexes.row_identity.max_spill_bytes else 1024 * 1024 * 1024, .embedding_options = .{ .antfly_provider = self.antfly_provider, .io = self.embedding_provider_runtime.io, .bounded_http_request = true, .deadline_ns = context.deadline_ns, .cancellation = cancel, .secret_store = self.cfg.secret_store, .remote_content = self.cfg.remote_content, .inference_api_url = self.configuredInferenceAPIURL(), .inference_api_key = self.cfg.inference_api_key, .provider_runtime = &self.embedding_provider_runtime, .source_table = table.name } });
+        try @import("lake_index_coordinator.zig").reconcile(a, self.embedding_provider_runtime.io, table, &source, &store, .{ .ptr = self, .replace = Hooks.replace, .read = Hooks.read }, context, cancel, .{ .ptr = self, .now_ms = Hooks.now }, .{
+            .lease_ms = lease_ms,
+            .force_rebuild = force_rebuild,
+            .execution_source = options,
+            .identity_spill_bytes = if (self.cfg.node_config) |node| node.lake_indexes.row_identity.max_spill_bytes else 1024 * 1024 * 1024,
+            .embedding_options = .{
+                .antfly_provider = self.antfly_provider,
+                .io = self.embedding_provider_runtime.io,
+                .bounded_http_request = true,
+                .deadline_ns = context.deadline_ns,
+                .cancellation = cancel,
+                .secret_store = self.cfg.secret_store,
+                .remote_content = self.cfg.remote_content,
+                .inference_api_url = self.configuredInferenceAPIURL(),
+                .inference_api_key = self.cfg.inference_api_key,
+                .inference_connections = if (self.cfg.node_config) |node| &node.connections else null,
+                .provider_runtime = &self.embedding_provider_runtime,
+                .source_table = table.name,
+                .enable_index_attribution = true,
+            },
+        });
         if (repair_publication) |ready| self.lake_index_repairs.forget(table.table_id, ready);
         @import("lake_owned_cut_jobs.zig").schedule(self, table);
         if (writable) self.scheduleLakeMaintenance(table.table_id);
@@ -19895,6 +19967,7 @@ pub const ApiHttpServer = struct {
                 .remote_content = self.cfg.remote_content,
                 .inference_api_url = self.configuredInferenceAPIURL(),
                 .inference_api_key = self.cfg.inference_api_key,
+                .inference_connections = if (self.cfg.node_config) |config| &config.connections else null,
             },
         ) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
@@ -19985,6 +20058,7 @@ pub const ApiHttpServer = struct {
                 .remote_content = self.cfg.remote_content,
                 .inference_api_url = self.configuredInferenceAPIURL(),
                 .inference_api_key = self.cfg.inference_api_key,
+                .inference_connections = if (self.cfg.node_config) |config| &config.connections else null,
             },
         ) catch |err| switch (err) {
             error.ModelNotFound => return error.ModelNotFound,
@@ -20011,6 +20085,9 @@ pub const ApiHttpServer = struct {
                 .remote_content = self.cfg.remote_content,
                 .inference_api_url = self.configuredInferenceAPIURL(),
                 .inference_api_key = self.cfg.inference_api_key,
+                .inference_connections = if (self.cfg.node_config) |config| &config.connections else null,
+                .source_table = table_name,
+                .enable_index_attribution = true,
             },
         ) catch |err| switch (err) {
             error.ModelNotFound => return error.ModelNotFound,
@@ -21225,6 +21302,7 @@ pub const ApiHttpServer = struct {
                 .remote_content = self.cfg.remote_content,
                 .inference_api_url = self.configuredInferenceAPIURL(),
                 .inference_api_key = self.cfg.inference_api_key,
+                .inference_connections = if (self.cfg.node_config) |config| &config.connections else null,
             },
         ) catch |err| {
             std.log.warn("artifact enrichment validation failed stage=normalize_table_embeddings table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
@@ -21254,6 +21332,9 @@ pub const ApiHttpServer = struct {
                 .remote_content = self.cfg.remote_content,
                 .inference_api_url = self.configuredInferenceAPIURL(),
                 .inference_api_key = self.cfg.inference_api_key,
+                .inference_connections = if (self.cfg.node_config) |config| &config.connections else null,
+                .source_table = table_name,
+                .enable_index_attribution = true,
             },
         ) catch |err| {
             std.log.warn("artifact enrichment validation failed stage=validate_table_runtime table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
@@ -25864,7 +25945,13 @@ pub const ApiHttpServer = struct {
         };
         const owner = if (identity) |value| value.username else "local";
         const executor = storedDestinationPrincipal(identity);
-        const grant_payload = try std.json.Stringify.valueAlloc(a, .{ .domain = "antfly.memory.execution.v1", .table = logical, .owner = owner }, .{});
+        const config_policy = @import("antfly_local_sources").common_config;
+        const scope = if (identity) |value| try config_policy.inferenceScopeFromAuthenticatedMetadata(a, value.metadata_json) else null;
+        const attribution_metadata_json = if (scope) |bound| try std.json.Stringify.valueAlloc(a, .{
+            .tenant_id = bound.tenant,
+            .project_id = bound.project,
+        }, .{ .emit_null_optional_fields = false }) else "";
+        const grant_payload = try memoryExecutionGrantPayload(a, logical, owner, attribution_metadata_json);
         const signature = if (std.mem.eql(u8, executor, stored_destination_authorization.auth_disabled_principal))
             "auth-disabled"
         else if (self.cfg.user_manager) |manager| blk: {
@@ -25884,6 +25971,7 @@ pub const ApiHttpServer = struct {
             .space = space,
             .execution_principal = executor,
             .execution_signature = signature,
+            .execution_attribution_metadata_json = attribution_metadata_json,
             .durable_execution_required = true,
             .clock_ms_fn = memoryClockMs,
             .principal = owner,
@@ -25897,9 +25985,11 @@ pub const ApiHttpServer = struct {
         var adapter: module.engine.Routed = .{ .table = table, .reads = self.table_reads orelse return error.MemoryCapabilityUnavailable, .writes = self.table_writes orelse return error.MemoryCapabilityUnavailable, .index_catalog = self.memoryIndexCatalog(), .context = context, .request = request, .resource_ptr = &resources, .resource_fn = MemoryResourceReader.read };
         const models = @import("antfly_local_sources").memory_models;
         const Runtime = @import("antfly_local_sources").asset_producer_runtime.Runtime;
-        const runtime = try Runtime.createOwned(a, self.inferenceIo(), .{ .provider_runtime = &self.embedding_provider_runtime, .antfly_provider = self.antfly_provider, .inference_api_url = self.configuredInferenceAPIURL(), .secret_store = self.cfg.secret_store, .source_table = table });
+        const connections = if (self.cfg.node_config) |config| &config.connections else null;
+        const attribution_principal = if (identity) |value| value.username else null;
+        const runtime = try Runtime.createOwned(a, self.inferenceIo(), .{ .provider_runtime = &self.embedding_provider_runtime, .inference_connections = connections, .attribution_principal = attribution_principal, .attribution_metadata_json = attribution_metadata_json, .inference_api_key = self.cfg.inference_api_key, .antfly_provider = self.antfly_provider, .inference_api_url = self.configuredInferenceAPIURL(), .secret_store = self.cfg.secret_store, .source_table = table });
         defer runtime.deinit();
-        var bridge: models.Bridge = .{ .base = adapter.backend(), .producer = runtime.producer().withInvocationContext(.{ .io = self.inferenceIo(), .deadline_ns = request.deadline_ns, .cancellation = request.cancellation }), .alloc = a, .embedding_options = .{ .antfly_provider = self.antfly_provider, .io = self.inferenceIo(), .bounded_http_request = true, .deadline_ns = request.deadline_ns, .cancellation = request.cancellation, .secret_store = self.cfg.secret_store, .inference_api_url = self.configuredInferenceAPIURL(), .source_table = table } };
+        var bridge: models.Bridge = .{ .base = adapter.backend(), .producer = runtime.producer().withInvocationContext(.{ .io = self.inferenceIo(), .deadline_ns = request.deadline_ns, .cancellation = request.cancellation }), .alloc = a, .embedding_options = .{ .inference_connections = connections, .attribution_principal = attribution_principal, .attribution_metadata_json = attribution_metadata_json, .inference_api_key = self.cfg.inference_api_key, .antfly_provider = self.antfly_provider, .io = self.inferenceIo(), .bounded_http_request = true, .deadline_ns = request.deadline_ns, .cancellation = request.cancellation, .secret_store = self.cfg.secret_store, .inference_api_url = self.configuredInferenceAPIURL(), .source_table = table } };
         const result = try (module.memory.Service{ .backend = bridge.backend(), .context = context }).execute(self.alloc, input.action, input.id, try @import("antfly-json").stringifyValueAlloc(a, input.body), input.idempotency_key);
         return contextual_operations.jsonWithStatus(if (input.action == .create) 201 else 200, result, false);
     }
@@ -26103,6 +26193,7 @@ pub const ApiHttpServer = struct {
                 .remote_content = self.cfg.remote_content,
                 .inference_api_url = self.configuredInferenceAPIURL(),
                 .inference_api_key = self.cfg.inference_api_key,
+                .inference_connections = if (self.cfg.node_config) |config| &config.connections else null,
             },
         ) catch |err| return switch (err) {
             error.ModelNotFound => try contextualJsonErrorResponse(self.alloc, 404, "model not found"),
@@ -26129,6 +26220,7 @@ pub const ApiHttpServer = struct {
                 .remote_content = self.cfg.remote_content,
                 .inference_api_url = self.configuredInferenceAPIURL(),
                 .inference_api_key = self.cfg.inference_api_key,
+                .inference_connections = if (self.cfg.node_config) |config| &config.connections else null,
             },
         ) catch |err| return switch (err) {
             error.ModelNotFound => try contextualJsonErrorResponse(self.alloc, 404, "model not found"),
@@ -27115,6 +27207,7 @@ pub const ApiHttpServer = struct {
             error.DecisionProviderUnavailable, error.MissingDecisionApiKey => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .decision_provider_unavailable),
             error.DecisionRateLimited => try contextualQueryDependencyErrorResponse(self.alloc, 429, "decision_rate_limited", "decision provider rate limited", true),
             error.DecisionUpstreamFailure, error.DecisionUnauthorized, error.InvalidDecisionOutput => try contextualQueryDependencyErrorResponse(self.alloc, 502, "decision_upstream_failure", "decision provider failed", false),
+            error.InferenceAttributionDenied => try contextualQueryDependencyErrorResponse(self.alloc, 403, "inference_attribution_denied", "inference attribution denied", false),
             error.RerankRateLimited => try contextualQueryDependencyErrorResponse(self.alloc, 429, "reranker_rate_limited", "reranker rate limited", true),
             error.RerankTransientFailure => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .reranker_temporarily_unavailable),
             error.RerankUpstreamFailure => try contextualQueryDependencyErrorResponse(self.alloc, 502, "reranker_upstream_failure", "reranker provider failed", false),
@@ -34310,6 +34403,7 @@ pub fn normalizeQueryEmbeddingOperationalError(err: anyerror) ?anyerror {
 pub fn normalizeQueryOperationalError(err: anyerror) ?anyerror {
     if (public_table_http.queryCancellationError(err)) |operation| return operation;
     if (err == error.ValueSearchRequiresScan or err == error.ValueSearchLimitExceeded or err == error.MetricNotReady or err == error.MetricStale or err == error.DecisionLimitExceeded) return err;
+    if (err == error.InferenceAttributionDenied) return err;
     if (normalizeQueryEmbeddingOperationalError(err)) |normalized| return normalized;
     return switch (reranking_runtime.normalizeOperationalError(err)) {
         error.RerankRateLimited,
@@ -65445,6 +65539,29 @@ test "external lake read refresh hints coalesce without superseding active publi
     try std.testing.expect(!server.pending_lake_publications.contains("docs"));
     try server.requestLakePublication("docs");
     try std.testing.expectEqual(@as(usize, 1), server.index_installation_queue.items.len);
+}
+
+test "native memory execution grants bind attribution and preserve legacy payloads" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const old = try ApiHttpServer.memoryExecutionGrantPayload(a, "memory_team", "alice", "");
+    try std.testing.expectEqualStrings(
+        \\{"domain":"antfly.memory.execution.v1","table":"memory_team","owner":"alice"}
+    , old);
+
+    const search =
+        \\{"tenant_id":"acme","project_id":"search"}
+    ;
+    const docs =
+        \\{"tenant_id":"acme","project_id":"docs"}
+    ;
+    const signed = try ApiHttpServer.memoryExecutionGrantPayload(a, "memory_team", "alice", search);
+    const changed = try ApiHttpServer.memoryExecutionGrantPayload(a, "memory_team", "alice", docs);
+    const claims = try std.json.parseFromSliceLeaky(std.json.Value, a, signed, .{});
+    try std.testing.expectEqualStrings("antfly.memory.execution.v2", claims.object.get("domain").?.string);
+    try std.testing.expectEqualStrings(search, claims.object.get("attribution").?.string);
+    try std.testing.expect(!std.mem.eql(u8, signed, changed));
 }
 
 test "native memory background selection isolates revoked execution bindings and runs retention cleanup" {

@@ -1168,6 +1168,7 @@ const AgentGenerationRunner = struct {
     request_context: managed_embedder.RequestContext,
     inference_api_url: ?[]const u8,
     inference_api_key: ?[]const u8,
+    managed_connections: ?generating_runtime.ManagedConnections = null,
 
     fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
         return .{
@@ -1207,6 +1208,7 @@ const AgentGenerationRunner = struct {
             .antfly_provider = runner.antfly_provider,
             .secret_store = runner.secret_store,
             .inference_api_key = runner.inference_api_key,
+            .managed_connections = runner.managed_connections,
             .execution = .{
                 // Keep the node endpoint with its credential. The backend
                 // still gives explicit URLs and linked providers precedence.
@@ -2209,6 +2211,7 @@ pub const AntflyApiHandler = struct {
         const normalized = http_server_mod.normalizeQueryOperationalError(err) orelse return null;
         var response = switch (normalized) {
             error.QueryEmbeddingInputTooLarge => try public_table_http.queryDependencyErrorOwnedResponse(ctx.allocator, 413, "query_embedding_input_too_large", "query embedding input too large", false),
+            error.InferenceAttributionDenied => try public_table_http.queryDependencyErrorOwnedResponse(ctx.allocator, 403, "inference_attribution_denied", "inference attribution denied", false),
             error.QueryEmbeddingOverloaded => try public_table_http.queryDependencyErrorOwnedResponse(ctx.allocator, 429, "query_embedding_overloaded", "query embedding overloaded", true),
             error.EmbedRateLimited => try public_table_http.queryDependencyErrorOwnedResponse(ctx.allocator, 429, "query_embedding_rate_limited", "query embedding rate limited", true),
             error.EmbedTransientFailure => try public_table_http.queryTemporarilyUnavailableOwnedResponse(ctx.allocator, .query_embedding_temporarily_unavailable),
@@ -5054,6 +5057,7 @@ pub const AntflyApiHandler = struct {
         const normalized = internal_query_operations.normalizeQueryEmbeddingOperationalError(err) orelse return err;
         return switch (normalized) {
             error.QueryEmbeddingInputTooLarge => textResponse(ctx, 413, "query embedding input too large"),
+            error.InferenceAttributionDenied => textResponse(ctx, 403, "inference attribution denied"),
             error.QueryEmbeddingOverloaded => textResponse(ctx, 429, "query embedding overloaded"),
             error.EmbedRateLimited => textResponse(ctx, 429, "query embedding rate limited"),
             error.EmbedTransientFailure => textResponse(ctx, 503, "query embedding temporarily unavailable"),
@@ -6276,7 +6280,7 @@ pub const AntflyApiHandler = struct {
         var identity: ?AuthenticatedIdentity = null;
         defer if (identity) |*value| value.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &identity)) |response| return response;
-        return @import("document_jobs.zig").handle(self.api_server, ctx, if (identity) |value| value.credential_principal else "anonymous", operation, action) catch |err| gatewayFailure(ctx, err);
+        return @import("document_jobs.zig").handle(self.api_server, ctx, if (identity) |value| value.credential_principal else "anonymous", if (identity) |value| value.username else null, if (identity) |value| value.metadata_json else "", operation, action) catch |err| gatewayFailure(ctx, err);
     }
     fn gatewayExtract(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.gatewayRequest(ctx, .extract);
@@ -6323,6 +6327,7 @@ pub const AntflyApiHandler = struct {
         if (try self.authorizeRequest(ctx, &identity)) |response| return response;
         const response = blk: {
             inference_gateway.prepare(self.api_server, ctx) catch |err| break :blk @as(anyerror!httpx.Response, err);
+            if (identity) |value| try inference_gateway.setAttributionPrincipal(ctx, value.username, value.metadata_json);
             break :blk inference_gateway.session(self.api_server, ctx, if (identity) |value| value.credential_principal else "anonymous", method, action);
         };
         return response catch |err| gatewayFailure(ctx, err);
@@ -6334,6 +6339,7 @@ pub const AntflyApiHandler = struct {
         if (try self.authorizeRequest(ctx, &identity)) |response| return response;
         const response = blk: {
             inference_gateway.prepare(self.api_server, ctx) catch |err| break :blk @as(anyerror!httpx.Response, err);
+            if (identity) |value| try inference_gateway.setAttributionPrincipal(ctx, value.username, value.metadata_json);
             var sources: GatewaySources = .{ .server = self.api_server, .ctx = ctx, .identity = identity };
             defer sources.release();
             break :blk inference_gateway.batchWithSources(self.api_server, ctx, sources.port());
@@ -6750,6 +6756,7 @@ pub const AntflyApiHandler = struct {
         if (try self.authorizeRequest(ctx, &identity)) |response| return response;
         const response = blk: {
             inference_gateway.prepare(self.api_server, ctx) catch |err| break :blk @as(anyerror!httpx.Response, err);
+            if (identity) |value| try inference_gateway.setAttributionPrincipal(ctx, value.username, value.metadata_json);
             var sources: GatewaySources = .{ .server = self.api_server, .ctx = ctx, .identity = identity };
             defer sources.release();
             break :blk if (task) |selected| inference_gateway.executeOperationWithSources(self.api_server, ctx, selected, operation, sources.port()) else if (inference_gateway.isPredictorDiscoveryPath(ctx.request.uri.path)) inference_gateway.predictors(self.api_server, ctx) else inference_gateway.models(self.api_server, ctx);
@@ -6762,15 +6769,15 @@ pub const AntflyApiHandler = struct {
         if (err == error.Timeout) return inference_gateway.timeoutResponse(ctx);
         const status: u16 = switch (err) {
             error.InferenceRequestTooLarge, error.ConstrainedInputTooLarge => 413,
-            error.ConnectionCapabilityMissing, error.PublicInferenceDisabled, error.Forbidden => 403,
+            error.InferenceAttributionDenied, error.ConnectionCapabilityMissing, error.PublicInferenceDisabled, error.Forbidden => 403,
             error.ModelNotFound, error.ConnectionNotFound, error.InferenceSessionNotFound => 404,
-            error.InferenceCapacityUnavailable, error.DecisionRateLimited, error.InferenceUpstreamRateLimited, error.RateLimit, error.AttemptLimitExceeded => 429,
-            error.InferenceUpstreamUnavailable, error.ServiceUnavailable => 503,
+            error.InferenceCapacityUnavailable, error.DecisionRateLimited, error.InferenceUpstreamRateLimited, error.ExtractionRateLimited, error.RateLimit, error.AttemptLimitExceeded => 429,
+            error.InferenceUpstreamUnavailable, error.ExtractionTransientFailure, error.ServiceUnavailable => 503,
             error.DecisionRefused => 422,
             error.Timeout => 504,
             error.EmbeddingIdentityMismatch, error.InferenceSourceMismatch => 409,
             error.InferenceSourceUnavailable => 404,
-            error.InvalidInferenceSource, error.InferenceSourceUnsupported => 400,
+            error.InvalidInferenceSource, error.InferenceSourceUnsupported, error.ExtractionInvalidRequest, error.UnsupportedExtractionSchemaVersion, error.UnsupportedCloudflareSchema, error.UnsupportedPioneerSchema, error.UnsupportedPioneerInput => 400,
             error.DocumentRunNotFound => 404,
             error.DocumentRunExpired => 410,
             error.DocumentRunBusy, error.DocumentRunLeaseLost, error.DocumentRunTerminal => 409,
@@ -6779,7 +6786,7 @@ pub const AntflyApiHandler = struct {
             error.InlineCredentialNotAllowed => 400,
             error.InvalidTranscriptionLanguage => 400,
             error.Canceled, error.Cancelled => return error.Canceled,
-            error.ProviderTokenBudgetExceeded, error.UnsupportedMediaTokenBudget, error.UnsupportedBedrockContentPart, error.UnsupportedBedrockGenerationOptions, error.UnsupportedLocalRateLimit, error.InvalidSynthesisOptions, error.UnsupportedSynthesisOptions, error.InvalidSynthesizingConfig, error.InvalidGeneratorConfig, error.UnsupportedDecisionKind, error.InvalidDecisionSpecification, error.InvalidInferenceMedia, error.InvalidReaderConfig, error.DecisionLimitExceeded, error.ModelRequired, error.InvalidModelIdentity, error.ModelTaskMismatch, error.AmbiguousModelIdentity, error.InvalidInferenceRequest, error.UnsupportedInferenceFeature, error.UnsupportedAudioReadCapability => 400,
+            error.ProviderTokenBudgetExceeded, error.UnsupportedMediaTokenBudget, error.UnsupportedBedrockContentPart, error.UnsupportedBedrockGenerationOptions, error.UnsupportedLocalRateLimit, error.InvalidSynthesisOptions, error.UnsupportedSynthesisOptions, error.InvalidSynthesizingConfig, error.InvalidGeneratorConfig, error.InvalidGeneratedExtractorConfig, error.UnsupportedGeneratedExtractionSchema, error.UnsupportedDecisionKind, error.InvalidDecisionSpecification, error.InvalidInferenceMedia, error.InvalidReaderConfig, error.DecisionLimitExceeded, error.ModelRequired, error.InvalidModelIdentity, error.ModelTaskMismatch, error.AmbiguousModelIdentity, error.InvalidInferenceRequest, error.UnsupportedInferenceFeature, error.UnsupportedAudioReadCapability => 400,
             else => 502,
         };
         _ = ctx.status(status);
@@ -6795,10 +6802,12 @@ pub const AntflyApiHandler = struct {
         if (std.mem.eql(u8, connection_id, common_config.named_inference_connection_id)) {
             const task = inference_gateway.taskForOperation(operation) orelse return gatewayFailure(ctx, error.UnsupportedInferenceFeature);
             inference_gateway.prepare(self.api_server, ctx) catch |err| return gatewayFailure(ctx, err);
+            if (authenticated_identity) |value| try inference_gateway.setAttributionPrincipal(ctx, value.username, value.metadata_json);
             var sources: GatewaySources = .{ .server = self.api_server, .ctx = ctx, .identity = authenticated_identity };
             return inference_gateway.executeOperationWithSources(self.api_server, ctx, task, operation, sources.port()) catch |err| gatewayFailure(ctx, err);
         }
         inference_gateway.prepare(self.api_server, ctx) catch |err| return gatewayFailure(ctx, err);
+        if (authenticated_identity) |value| try inference_gateway.setAttributionPrincipal(ctx, value.username, value.metadata_json);
         comptime std.debug.assert(request_admission_policy.publicOperationClass("invokeInferenceConnection").? == .inference);
         const admission_owner = self.api_server.inferenceConnectionAdmissionOwner(connection_id, operation) catch |err| switch (err) {
             error.ConnectionCapabilityMissing => return textResponse(ctx, 403, @errorName(err)),
@@ -6825,13 +6834,16 @@ pub const AntflyApiHandler = struct {
             deadline_ns,
             transport.stream(),
             inference_gateway.observeAttempt(ctx, null),
+            inference_gateway.attributionPrincipal(ctx),
+            inference_gateway.attributionScope(ctx),
+            ctx.response.headers.get("x-request-id"),
         ) catch |err| {
             // Once a stream has committed its headers, the listener must close
             // that stream on failure; attempting to synthesize a second HTTP
             // response would corrupt the transport.
             if (transport.started) return err;
             return switch (err) {
-                error.ConnectionCapabilityMissing => textResponse(ctx, 403, @errorName(err)),
+                error.InferenceAttributionDenied, error.ConnectionCapabilityMissing => textResponse(ctx, 403, @errorName(err)),
                 error.ConnectionNotFound, error.ConnectionNotInference, error.InvalidConfig, error.ConnectionURLMissing, error.InvalidConnectionURL, error.ProviderNotAntflyCompatible, error.UnsupportedInferenceOperation => textResponse(ctx, 400, @errorName(err)),
                 error.Canceled, error.Cancelled => error.Canceled,
                 error.Timeout => inference_gateway.timeoutResponse(ctx),
@@ -10012,6 +10024,7 @@ pub const AntflyApiHandler = struct {
             .request_context = self.agentRequestContext(ctx),
             .inference_api_url = self.api_server.configuredInferenceAPIURL(),
             .inference_api_key = self.api_server.cfg.inference_api_key,
+            .managed_connections = self.api_server.managedGenerationConnections(ApiHttpServer.queryEmbeddingSecurityScope(authenticated_identity)),
         };
 
         var query_runner = RetrievalQueryRunner{
@@ -10143,6 +10156,7 @@ pub const AntflyApiHandler = struct {
                 .request_context = request_context,
                 .inference_api_url = self.api_server.configuredInferenceAPIURL(),
                 .inference_api_key = self.api_server.cfg.inference_api_key,
+                .managed_connections = self.api_server.managedGenerationConnections(ApiHttpServer.queryEmbeddingSecurityScope(identity)),
             },
         };
     }
@@ -10182,6 +10196,16 @@ pub const AntflyApiHandler = struct {
 
     fn researchOwner(identity: ?AuthenticatedIdentity) []const u8 {
         return if (identity) |value| value.username else "";
+    }
+
+    fn researchAttribution(a: std.mem.Allocator, scope: ApiHttpServer.QueryEmbeddingSecurityScope) !?research_jobs.Attribution {
+        const principal = scope.attribution_principal orelse return null;
+        const attribution = try @import("antfly_local_sources").common_config.inferenceScopeFromAuthenticatedMetadata(a, scope.attribution_metadata_json);
+        return .{
+            .principal = principal,
+            .tenant = if (attribution) |value| value.tenant else null,
+            .project = if (attribution) |value| value.project else null,
+        };
     }
 
     fn researchJobResponse(ctx: *httpx.Context, status: u16, record: research_jobs.Record) !httpx.Response {
@@ -10276,7 +10300,8 @@ pub const AntflyApiHandler = struct {
         var id_buf: [36]u8 = undefined;
         const job_id = research_jobs.formatJobId(&id_buf, entropy);
         const owner = researchOwner(authenticated_identity);
-        const created = self.api_server.research_job_store.create(alloc, job_id, owner, start.request.query, request_json) catch |err| return researchErrorResponse(ctx, err);
+        const attribution = try researchAttribution(arena, runners.query.query_embedding_security_scope);
+        const created = self.api_server.research_job_store.createWithAttribution(alloc, job_id, owner, start.request.query, request_json, attribution) catch |err| return researchErrorResponse(ctx, err);
         alloc.free(created);
         const phases: usize = @intCast(std.math.clamp(start.advance orelse 0, 0, 10));
         const record = if (phases > 0)
@@ -10291,6 +10316,11 @@ pub const AntflyApiHandler = struct {
     /// live one.
     fn advanceStoredResearchJob(self: *AntflyApiHandler, ctx: *httpx.Context, arena: std.mem.Allocator, runners: *AgentRunners, job_id: []const u8, owner: []const u8, phases: usize) !research_jobs.Record {
         const store = &self.api_server.research_job_store;
+        const stored = (try store.load(arena, job_id, owner)) orelse return error.NotFound;
+        if (stored.attribution) |expected| {
+            const current = (try researchAttribution(arena, runners.query.query_embedding_security_scope)) orelse return error.InferenceAttributionDenied;
+            if (!expected.matches(current)) return error.InferenceAttributionDenied;
+        }
         const lease_ms = research_agent.max_deadline_ms + 60_000;
         const claim = (try store.begin(arena, job_id, owner, lease_ms)) orelse return error.NotFound;
         const claimed = switch (claim) {
@@ -10341,6 +10371,7 @@ pub const AntflyApiHandler = struct {
         var runners = self.agentRunners(ctx, source, authenticated_identity, null);
         const record = self.advanceStoredResearchJob(ctx, arena, &runners, job_id, owner, phases) catch |err| switch (err) {
             error.NotFound => return jsonErrorResponse(ctx, 404, "not found"),
+            error.InferenceAttributionDenied => return researchErrorResponse(ctx, err),
             else => return err,
         };
         // Lost a race with another advance that holds the lease.
@@ -11045,7 +11076,11 @@ pub const AntflyApiHandler = struct {
         };
         const bound_body = @import("sql/catalog/type_schema.zig").bindCreateBodyAlloc(self.api_server, alloc, authenticated_identity, operationContext(ctx, authenticated_identity), body_data) catch |err| return witnessDDLError(ctx, err);
         defer if (bound_body) |bytes| alloc.free(bytes);
-        var create_req = table_contract.parseCreateTableRequest(alloc, bound_body orelse body_data) catch |err| {
+        var create_req = table_contract.parseCreateTableRequestWithOptions(alloc, bound_body orelse body_data, .{
+            .antfly_provider = self.api_server.antfly_provider,
+            .inference_api_url = self.api_server.configuredInferenceAPIURL(),
+            .inference_connections = if (self.api_server.cfg.node_config) |config| &config.connections else null,
+        }) catch |err| {
             if (table_contract.classifyCreateTableRequestError(err) == .internal_failure) {
                 std.log.err("create table request parsing failed: {} body_len={d}", .{ err, body_data.len });
                 return err;
@@ -11064,17 +11099,23 @@ pub const AntflyApiHandler = struct {
         };
         if (create_req.schema_json) |old| alloc.free(old);
         create_req.schema_json = bound_schema;
+        const embedding_options: @import("antfly_local_sources").inference_managed_embedder.InitOptions = .{
+            .antfly_provider = self.api_server.antfly_provider,
+            .io = self.api_server.inferenceIo(),
+            .secret_store = self.api_server.cfg.secret_store,
+            .remote_content = self.api_server.cfg.remote_content,
+            .inference_api_url = self.api_server.configuredInferenceAPIURL(),
+            .inference_api_key = self.api_server.cfg.inference_api_key,
+            .inference_connections = if (self.api_server.cfg.node_config) |config| &config.connections else null,
+            .attribution_principal = if (authenticated_identity) |identity| identity.username else null,
+            .attribution_metadata_json = if (authenticated_identity) |identity| identity.metadata_json else "",
+            .source_table = decoded_table_name,
+            .enable_index_attribution = true,
+        };
         const normalized_indexes_json = table_index_config.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
             alloc,
             create_req.indexes_json orelse tables_api.default_indexes_json,
-            .{
-                .antfly_provider = self.api_server.antfly_provider,
-                .io = self.api_server.inferenceIo(),
-                .secret_store = self.api_server.cfg.secret_store,
-                .remote_content = self.api_server.cfg.remote_content,
-                .inference_api_url = self.api_server.configuredInferenceAPIURL(),
-                .inference_api_key = self.api_server.cfg.inference_api_key,
-            },
+            embedding_options,
         ) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest, error.ChatGPTInteractiveOnly => {
                 _ = ctx.status(400);
@@ -11112,14 +11153,7 @@ pub const AntflyApiHandler = struct {
         table_index_config.validateManagedEmbeddingRuntimeConfigJsonWithOptions(
             alloc,
             create_req.indexes_json orelse tables_api.default_indexes_json,
-            .{
-                .antfly_provider = self.api_server.antfly_provider,
-                .io = self.api_server.inferenceIo(),
-                .secret_store = self.api_server.cfg.secret_store,
-                .remote_content = self.api_server.cfg.remote_content,
-                .inference_api_url = self.api_server.configuredInferenceAPIURL(),
-                .inference_api_key = self.api_server.cfg.inference_api_key,
-            },
+            embedding_options,
         ) catch |err| switch (err) {
             error.ModelNotFound => return respondJsonErrorBody(ctx, 404, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}"),
             error.InferenceEndpointAccessDenied => {
@@ -26368,6 +26402,95 @@ test "httpx inference gateway hosted legacy embedding parts produce one result p
     if (failure) |err| return err;
 }
 
+test "httpx inference gateway derives upstream attribution from authenticated identity" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Fixture = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("team-project", req.header("x-billing-team") orelse return error.TestUnexpectedResult);
+            try std.testing.expectEqualStrings("Bearer provider-key", req.header("authorization") orelse return error.TestUnexpectedResult);
+        }
+        fn serve(peer: *httpx.TestServer, failure: *?anyerror) std.Io.Cancelable!void {
+            peer.handleOne() catch |err| {
+                failure.* = err;
+            };
+        }
+        fn invoke(test_alloc: std.mem.Allocator, test_io: std.Io, handler: *AntflyApiHandler, username: []const u8, task: @import("antfly_local_sources").common_inference_gateway.Task) !u16 {
+            var req = try httpx.Request.init(test_alloc, .POST, if (task == .embed) "http://localhost/ai/v1/embeddings" else "http://localhost/ai/v1/chat/completions");
+            defer req.deinit();
+            const authorization = try encodeBasicAuthorization(test_alloc, username, "password");
+            defer test_alloc.free(authorization);
+            try req.headers.set("authorization", authorization);
+            // The upstream value must come from the operator's authenticated project map.
+            try req.headers.set("x-billing-team", "supplied-by-caller");
+            req.body = if (task == .embed) "{\"model\":\"embedders/managed\",\"input\":\"hello\",\"dimensions\":2}" else "{\"model\":\"connections/gateway/models/gpt-4.1\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}";
+            var ctx = httpx.Context.init(test_alloc, test_io, &req);
+            defer ctx.deinit();
+            var response = try handler.gatewayRequestOperation(&ctx, task, if (task == .embed) "embeddings" else "chat/completions");
+            defer response.deinit();
+            return response.status.code;
+        }
+    };
+    var upstream = try httpx.TestServer.start(a, io, &.{
+        .{
+            .method = .POST,
+            .path = "/v1/chat/completions",
+            .assert_request = Fixture.request,
+            .respond = .{ .body = "{\"id\":\"mock-completion\",\"object\":\"chat.completion\",\"created\":1,\"model\":\"gpt-4.1\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}" },
+        },
+        .{
+            .method = .POST,
+            .path = "/v1/embeddings",
+            .assert_request = Fixture.request,
+            .respond = .{ .body = "{\"object\":\"list\",\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":[0.25,0.5]}],\"usage\":{\"prompt_tokens\":1,\"total_tokens\":1}}" },
+        },
+    });
+    defer upstream.deinit();
+    const raw = try std.fmt.allocPrint(a,
+        \\{{"public_inference":{{"enabled":true}},"embedders":{{"managed":{{"provider":"openai","model":"connections/gateway/models/text-embedding-3-small","dimensions":2}}}},"connections":{{"gateway":{{"kind":"inference","capabilities":["models.generate","models.embed"],"inference":{{"provider":"openai","url":"{s}/v1","api_key":"provider-key","attribution":{{"header":"X-Billing-Team","principals":{{"alice":"team-alice","bob":"team-bob"}},"projects":{{"acme/search":"team-project"}}}}}}}}}}}}
+    , .{upstream.baseUrl()});
+    defer a.free(raw);
+    var config = try common_config.Config.parseFromSlice(a, raw);
+    defer config.deinit();
+    var auth = try initTestAuthManager(a);
+    try bindTestAuthManager(a, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+    var permission = try usermgr.Permission.initOwned(a, .inference, "*", .write);
+    defer permission.deinit(a);
+    for ([_][]const u8{ "alice", "bob" }) |username| {
+        const metadata = if (std.mem.eql(u8, username, "alice"))
+            "{\"tenant_id\":\"acme\",\"project_id\":\"search\"}"
+        else
+            "{\"tenant_id\":\"other\",\"project_id\":\"search\"}";
+        var user = try auth.manager.createUserWithMetadata(username, "password", &.{permission}, metadata);
+        defer user.deinit(a);
+    }
+
+    var source = AuthStatusSource{};
+    var server = ApiHttpServer.init(a, .{
+        .node_config = &config,
+        .auth_enabled = true,
+        .user_manager = &auth.manager,
+        .imported_runtime_io = .{ .api = io, .api_network = io },
+    }, source.iface(), null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    for ([_]@import("antfly_local_sources").common_inference_gateway.Task{ .generate, .embed }) |task| {
+        var upstream_failure: ?anyerror = null;
+        var group = std.Io.Group.init;
+        defer group.cancel(io);
+        try group.concurrent(io, Fixture.serve, .{ &upstream, &upstream_failure });
+        try std.testing.expectEqual(@as(u16, 403), try Fixture.invoke(a, io, &handler, "bob", task));
+        try std.testing.expectEqual(@as(u16, 200), try Fixture.invoke(a, io, &handler, "alice", task));
+        try group.await(io);
+        if (upstream_failure) |err| return err;
+    }
+}
+
 test "httpx inference gateway typed vendor failures preserve transient HTTP status and retry guidance" {
     const a = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -26482,6 +26605,20 @@ test "httpx inference gateway request errors remain client errors without reclas
         var response = try AntflyApiHandler.gatewayFailure(&ctx, err);
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 502), response.status.code);
+    }
+    for ([_]struct { failure: anyerror, status: u16 }{
+        .{ .failure = error.UnsupportedPioneerSchema, .status = 400 },
+        .{ .failure = error.ExtractionRateLimited, .status = 429 },
+        .{ .failure = error.ExtractionTransientFailure, .status = 503 },
+    }) |expected| {
+        var request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/extract");
+        defer request.deinit();
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try AntflyApiHandler.gatewayFailure(&ctx, expected.failure);
+        defer response.deinit();
+        try std.testing.expectEqual(expected.status, response.status.code);
+        if (expected.status != 400) try std.testing.expectEqualStrings("1", response.headers.get("retry-after").?);
     }
     try std.testing.expectEqual(@as(usize, 0), server.inferenceAdmissionStats().in_flight);
 }

@@ -160,6 +160,7 @@ pub const StorageOwnerContext = struct {
     /// server does; the key resolves through `secret_store` per request.
     inference_api_url: ?[]u8 = null,
     inference_api_key: ?[]u8 = null,
+    inference_connections: ?*const common_config.Config.ConnectionsConfig = null,
     lite_backend: ?lite_backend.Handle = null,
     auth_backend: ?antfly.lsm_backend.BackendHandle = null,
     auth_users_store: ?antfly.storage_backend_erased.Store = null,
@@ -228,7 +229,7 @@ pub const StorageOwnerContext = struct {
     }
 
     pub fn inferenceDefaults(self: *const StorageOwnerContext) local_write.InferenceDefaults {
-        return .{ .api_url = self.inference_api_url, .api_key = self.inference_api_key, .secret_store = self.secret_store };
+        return .{ .api_url = self.inference_api_url, .api_key = self.inference_api_key, .connections = self.inference_connections, .secret_store = self.secret_store };
     }
 
     fn clearInferenceDefaults(self: *StorageOwnerContext) void {
@@ -1091,6 +1092,15 @@ pub fn storageOwnerContextConfigureInferenceDefaults(
     owner_context.clearInferenceDefaults();
     owner_context.inference_api_url = next_url;
     owner_context.inference_api_key = next_key;
+    return .ok;
+}
+
+pub fn storageOwnerContextConfigureInferenceConnections(context: ?*anyopaque, connections: ?*const anyopaque) callconv(.c) kernel_owner_abi.Status {
+    const owner = asStorageOwnerContext(context) orelse return .invalid_argument;
+    owner.lock();
+    defer owner.mutex.unlock();
+    if (owner.active_owners != 0) return .busy;
+    owner.inference_connections = if (connections) |map| @ptrCast(@alignCast(map)) else null;
     return .ok;
 }
 

@@ -168,7 +168,12 @@ typedef struct antfly_open_options {
      * replayed by this admission retry. A successful proof may admit an
      * unchanged tip after the timeout if no lease wait is needed. */
     uint64_t busy_timeout_ms;
-    uint64_t reserved[6];
+    uint64_t reserved[4];
+    /* Optional operator-owned JSON object of inference connections, copied on open. */
+    antfly_slice inference_connections_json;
+#if UINTPTR_MAX == UINT32_MAX
+    uint8_t inference_connections_padding[8];
+#endif
     /* Optional model directory for database enrichments; empty uses default. */
     antfly_slice models_dir;
 } antfly_open_options;

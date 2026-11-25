@@ -53,7 +53,7 @@ pub const Server = struct {
             .load => {
                 if (body.len != 0) return error.InvalidDocumentCheckpoint;
                 const record = try self.store.load_fn(self.store.ptr, a, self.id, self.owner);
-                const encoded = try std.json.Stringify.valueAlloc(a, record, .{});
+                const encoded = try std.json.Stringify.valueAlloc(a, record, .{ .emit_null_optional_fields = false });
                 if (encoded.len > max_metadata_bytes) return error.DocumentOutputTooLarge;
                 return .{ .body = encoded };
             },
@@ -210,7 +210,7 @@ pub const Client = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const body = try std.json.Stringify.valueAlloc(a, next, .{});
+        const body = try std.json.Stringify.valueAlloc(a, next, .{ .emit_null_optional_fields = false });
         const response = try self.call(a, .{ .operation = .cas, .id = next.run_id, .owner = next.owner, .expected = expected }, body);
         defer self.view.destroy(response);
         if (std.mem.eql(u8, response.metadata.slice(), "true")) return true;

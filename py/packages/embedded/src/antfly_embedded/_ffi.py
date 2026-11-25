@@ -151,7 +151,9 @@ class AntflyOpenOptions(ctypes.Structure):
         ("inference_kv_budget_mb", ctypes.c_uint32),
         ("inference_scratch_budget_mb", ctypes.c_uint32),
         ("busy_timeout_ms", ctypes.c_uint64),
-        ("reserved", ctypes.c_uint64 * 6),
+        ("reserved", ctypes.c_uint64 * 4),
+        ("inference_connections_json", AntflySlice),
+        ("inference_connections_padding", ctypes.c_uint8 * (16 - ctypes.sizeof(AntflySlice))),
         ("models_dir", AntflySlice),
     ]
 

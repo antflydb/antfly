@@ -98,6 +98,7 @@ test "owner catalog busy without index debt keeps provisioning retry until full 
 const http_routes = @import("http_routes.zig");
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const transaction_recovery_source = @import("transaction_recovery_source.zig");
+const InferenceConnections = @import("antfly_local_sources").common_config.Config.ConnectionsConfig;
 const table_index_config = @import("antfly_local_sources").api_table_index_config;
 const table_router = @import("table_router.zig");
 const tables_api = @import("tables.zig");
@@ -2320,6 +2321,7 @@ pub const ProvisionedTableWriteCache = struct {
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     inference_api_url: ?[]const u8 = null,
     inference_api_key: ?[]const u8 = null,
+    inference_connections: ?*const InferenceConnections = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     dense_native_migration_policy_source: ?db_mod.DenseNativeMigrationPolicySource = null,
@@ -3257,6 +3259,7 @@ pub const ProvisionedTableWriteCache = struct {
                 hot_standby_async_mirror: ?db_mod.ReplicationAsyncEffectMirror,
                 inference_api_url: ?[]const u8,
                 inference_api_key: ?[]const u8,
+                inference_connections: ?*const InferenceConnections,
                 policy_table_name: []const u8,
                 authority: ?@import("antfly_local_sources").storage_db_online_source_contract.Authority,
             ) !OpenedDb {
@@ -3282,6 +3285,8 @@ pub const ProvisionedTableWriteCache = struct {
                             .schema_json_before_index_load = schema_json,
                             .inference_api_url = inference_api_url,
                             .inference_api_key = inference_api_key,
+                            .inference_connections = inference_connections,
+                            .source_table = policy_table_name,
                             .online_source_authority = authority,
                             .replication_write_gate = replication_write_gate,
                             .replication_async_effect_mirror = effective_hot_standby_mirror,
@@ -3364,6 +3369,7 @@ pub const ProvisionedTableWriteCache = struct {
                 self.hot_standby_async_mirror,
                 self.inference_api_url,
                 self.inference_api_key,
+                self.inference_connections,
                 table_name,
                 self.online_source_authority,
             );
@@ -3422,6 +3428,7 @@ pub const ProvisionedTableWriteCache = struct {
             self.hot_standby_async_mirror,
             self.inference_api_url,
             self.inference_api_key,
+            self.inference_connections,
             table_name,
             self.online_source_authority,
         );
@@ -7176,6 +7183,7 @@ pub const ProvisionedTableWriteSource = struct {
     remote_capability_cache: ?*remote_capabilities.Cache = null,
     inference_api_url: ?[]const u8 = null,
     inference_api_key: ?[]const u8 = null,
+    inference_connections: ?*const InferenceConnections = null,
     secret_store: ?*common_secrets.FileStore = null,
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     restore_open_options: backups_api.OpenOptions = .{},
@@ -7656,6 +7664,16 @@ pub const ProvisionedTableWriteSource = struct {
         self.inference_api_key = inference_api_key;
         if (self.write_cache) |cache| cache.inference_api_key = inference_api_key;
         if (self.startup_write_cache) |cache| cache.inference_api_key = inference_api_key;
+        return self;
+    }
+
+    pub fn withInferenceConnections(
+        self: *ProvisionedTableWriteSource,
+        inference_connections: ?*const InferenceConnections,
+    ) *ProvisionedTableWriteSource {
+        self.inference_connections = inference_connections;
+        if (self.write_cache) |cache| cache.inference_connections = inference_connections;
+        if (self.startup_write_cache) |cache| cache.inference_connections = inference_connections;
         return self;
     }
 
@@ -11506,6 +11524,7 @@ pub const ProvisionedTableWriteSource = struct {
                 alloc,
                 path,
                 self.group_id,
+                self.table_name,
                 metadata,
             );
         }
@@ -12518,6 +12537,7 @@ pub const ProvisionedTableWriteSource = struct {
         cache.antfly_provider = self.antfly_provider;
         cache.inference_api_url = self.inference_api_url;
         cache.inference_api_key = self.inference_api_key;
+        cache.inference_connections = self.inference_connections;
         cache.secret_store = self.secret_store;
         cache.remote_content = self.remote_content;
         self.syncRuntimeHooksToCache(cache);
@@ -12645,6 +12665,7 @@ pub const ProvisionedTableWriteSource = struct {
         cache.antfly_provider = self.antfly_provider;
         cache.inference_api_url = self.inference_api_url;
         cache.inference_api_key = self.inference_api_key;
+        cache.inference_connections = self.inference_connections;
         cache.remote_content = self.remote_content;
         self.syncRuntimeHooksToCache(cache);
         const identity_namespace = if (managed_open_options.identity_namespace_override) |namespace|
@@ -12835,6 +12856,7 @@ pub const ProvisionedTableWriteSource = struct {
             effective_open_options.schema_json_before_index_load = prepared_open.?.schema_json;
             effective_open_options.inference_api_url = self.inference_api_url;
             effective_open_options.inference_api_key = self.inference_api_key;
+            effective_open_options.inference_connections = self.inference_connections;
             effective_open_options.dense_native_migration_policy_source = cache.dense_native_migration_policy_source;
             effective_open_options.leann_replication = self.leann_replication;
             effective_open_options.remote_capability_cache = self.remote_capability_cache;
@@ -13788,6 +13810,9 @@ pub const ProvisionedTableWriteSource = struct {
                 .embedding_options = .{
                     .antfly_provider = self.antfly_provider,
                     .inference_api_url = self.inference_api_url,
+                    .inference_connections = self.inference_connections,
+                    .inference_api_key = self.inference_api_key,
+                    .secret_store = self.secret_store,
                 },
                 .destination_authorizer = self.destination_authorizer,
             },
@@ -13800,6 +13825,7 @@ pub const ProvisionedTableWriteSource = struct {
             cache.antfly_provider = self.antfly_provider;
             cache.inference_api_url = self.inference_api_url;
             cache.inference_api_key = self.inference_api_key;
+            cache.inference_connections = self.inference_connections;
             cache.secret_store = self.secret_store;
             cache.remote_content = self.remote_content;
         }
@@ -13875,10 +13901,14 @@ pub const ProvisionedTableWriteSource = struct {
             // cannot lose its pending retry signal. This pass is idempotent;
             // if cleanup already completed it admits the replacement now.
             const index_summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, table.indexes_json, .{
+                .source_table = table.name,
                 .drain_resolver_backfill = false,
                 .embedding_options = .{
                     .antfly_provider = self.antfly_provider,
                     .inference_api_url = self.inference_api_url,
+                    .inference_connections = self.inference_connections,
+                    .inference_api_key = self.inference_api_key,
+                    .secret_store = self.secret_store,
                 },
             });
             summary.merge(.{
@@ -14190,6 +14220,7 @@ pub const ProvisionedTableWriteSource = struct {
         alloc: std.mem.Allocator,
         path: []const u8,
         group_id: u64,
+        table_name: []const u8,
         metadata: StartupCatchUpMetadata,
     ) !db_mod.DB {
         const identity_namespace = metadata.identity_namespace orelse
@@ -14219,6 +14250,8 @@ pub const ProvisionedTableWriteSource = struct {
                 .{
                     .inference_api_url = self.inference_api_url,
                     .inference_api_key = self.inference_api_key,
+                    .inference_connections = self.inference_connections,
+                    .source_table = table_name,
                     .dense_native_migration_policy_source = self.dense_native_migration_policy_source,
                     .leann_replication = self.leann_replication,
                     .schema_json_before_index_load = metadata.schema_json,
@@ -14746,6 +14779,8 @@ pub const ProvisionedTableWriteSource = struct {
                         .schema_json_before_index_load = metadata.schema_json,
                         .inference_api_url = self.inference_api_url,
                         .inference_api_key = self.inference_api_key,
+                        .inference_connections = self.inference_connections,
+                        .source_table = table_name,
                         .replication_write_gate = self.replication_write_gate,
                         .replication_async_effect_mirror = effective_hot_standby_mirror,
                         .replication_async_batch_mirror = effective_hot_standby_mirror,
@@ -17826,6 +17861,9 @@ pub const ProvisionedTableWriteSource = struct {
                     .embedding_options = .{
                         .antfly_provider = self.antfly_provider,
                         .inference_api_url = self.inference_api_url,
+                        .inference_connections = self.inference_connections,
+                        .inference_api_key = self.inference_api_key,
+                        .secret_store = self.secret_store,
                     },
                     .source_table = table_name,
                     .destination_authorizer = self.destination_authorizer,
@@ -19584,6 +19622,7 @@ pub const ProvisionedTableWriteSource = struct {
                         table_name,
                         self.secret_store,
                         self.remote_content,
+                        self.inference_connections,
                     );
                     // Keep the replacement paused through durable admission;
                     // starting it here lets sibling corpus work race the next
@@ -19609,6 +19648,9 @@ pub const ProvisionedTableWriteSource = struct {
                     .embedding_options = .{
                         .antfly_provider = self.antfly_provider,
                         .inference_api_url = self.inference_api_url,
+                        .inference_connections = self.inference_connections,
+                        .inference_api_key = self.inference_api_key,
+                        .secret_store = self.secret_store,
                     },
                     .source_table = table_name,
                     .destination_authorizer = self.destination_authorizer,
@@ -19779,6 +19821,8 @@ pub const ProvisionedTableWriteSource = struct {
                     .schema_json_before_index_load = metadata.schema_json,
                     .inference_api_url = self.inference_api_url,
                     .inference_api_key = self.inference_api_key,
+                    .inference_connections = self.inference_connections,
+                    .source_table = table_name,
                     .replication_write_gate = self.replication_write_gate,
                     .replication_async_effect_mirror = self.hot_standby_async_mirror,
                     .replication_async_batch_mirror = self.hot_standby_async_mirror,
@@ -19817,6 +19861,9 @@ pub const ProvisionedTableWriteSource = struct {
                 .embedding_options = .{
                     .antfly_provider = self.antfly_provider,
                     .inference_api_url = self.inference_api_url,
+                    .inference_connections = self.inference_connections,
+                    .inference_api_key = self.inference_api_key,
+                    .secret_store = self.secret_store,
                 },
                 .source_table = table_name,
                 .destination_authorizer = self.destination_authorizer,
@@ -21046,12 +21093,16 @@ pub const ProvisionedTableWriteSource = struct {
                             table_name,
                             self.secret_store,
                             self.remote_content,
+                            self.inference_connections,
                         );
                         _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, .{
                             .drain_resolver_backfill = false,
                             .embedding_options = .{
                                 .antfly_provider = self.antfly_provider,
                                 .inference_api_url = self.inference_api_url,
+                                .inference_connections = self.inference_connections,
+                                .inference_api_key = self.inference_api_key,
+                                .secret_store = self.secret_store,
                             },
                             .source_table = table_name,
                             .destination_authorizer = self.destination_authorizer,
@@ -21122,6 +21173,7 @@ pub const ProvisionedTableWriteSource = struct {
                 cache.antfly_provider = self.antfly_provider;
                 cache.inference_api_url = self.inference_api_url;
                 cache.inference_api_key = self.inference_api_key;
+                cache.inference_connections = self.inference_connections;
                 cache.secret_store = self.secret_store;
                 cache.remote_content = self.remote_content;
             }
@@ -21145,6 +21197,8 @@ pub const ProvisionedTableWriteSource = struct {
                 .{
                     .inference_api_url = self.inference_api_url,
                     .inference_api_key = self.inference_api_key,
+                    .inference_connections = self.inference_connections,
+                    .source_table = table_name,
                     .drain_resolver_backfill = false,
                     .schema_json_before_index_load = schema_json,
                     .replication_write_gate = self.replication_write_gate,
@@ -21233,9 +21287,13 @@ pub const ProvisionedTableWriteSource = struct {
                 try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
                 if (indexes_json) |value| {
                     _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, value, .{
+                        .source_table = table_name,
                         .embedding_options = .{
                             .antfly_provider = self.antfly_provider,
                             .inference_api_url = self.inference_api_url,
+                            .inference_connections = self.inference_connections,
+                            .inference_api_key = self.inference_api_key,
+                            .secret_store = self.secret_store,
                         },
                     });
                 }
@@ -25729,6 +25787,7 @@ pub const HostedProvisionedTableWriteSource = struct {
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     inference_api_url: ?[]const u8 = null,
     inference_api_key: ?[]const u8 = null,
+    inference_connections: ?*const InferenceConnections = null,
     group_visible_root_generation: ?@import("antfly_local_sources").api_local_query_contract.GroupVisibleRootGenerationSource = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
@@ -25828,6 +25887,19 @@ pub const HostedProvisionedTableWriteSource = struct {
         inference_api_key: ?[]const u8,
     ) *HostedProvisionedTableWriteSource {
         self.inference_api_key = inference_api_key;
+        if (hostedManagedDbCacheForRootIfPresent(self.replica_root_dir)) |cache| {
+            lockAtomic(&cache.mutex);
+            self.syncPersistentOwnerConfigLocked(cache);
+            cache.mutex.unlock();
+        }
+        return self;
+    }
+
+    pub fn withInferenceConnections(
+        self: *HostedProvisionedTableWriteSource,
+        inference_connections: ?*const InferenceConnections,
+    ) *HostedProvisionedTableWriteSource {
+        self.inference_connections = inference_connections;
         if (hostedManagedDbCacheForRootIfPresent(self.replica_root_dir)) |cache| {
             lockAtomic(&cache.mutex);
             self.syncPersistentOwnerConfigLocked(cache);
@@ -25980,6 +26052,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         );
         cache.write_cache.inference_api_url = self.inference_api_url;
         cache.write_cache.inference_api_key = self.inference_api_key;
+        cache.write_cache.inference_connections = self.inference_connections;
         cache.write_cache.secret_store = self.secret_store;
         cache.write_cache.remote_content = self.remote_content;
 
@@ -26002,6 +26075,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         );
         owner.inference_api_url = self.inference_api_url;
         owner.inference_api_key = self.inference_api_key;
+        owner.inference_connections = self.inference_connections;
         owner.group_visible_root_generation = self.group_visible_root_generation;
         owner.secret_store = self.secret_store;
         owner.remote_content = self.remote_content;
@@ -26162,6 +26236,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         );
         cache.write_cache.inference_api_url = self.inference_api_url;
         cache.write_cache.inference_api_key = self.inference_api_key;
+        cache.write_cache.inference_connections = self.inference_connections;
         cache.write_cache.secret_store = self.secret_store;
         cache.write_cache.remote_content = self.remote_content;
         const identity_namespace = try loadTableIdentityNamespaceForGroup(cache.write_cache.alloc, self.catalog, table_name, group_id);
@@ -26299,6 +26374,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                     .schema_json_before_index_load = prepared_open.?.schema_json,
                     .inference_api_url = cache.write_cache.inference_api_url,
                     .inference_api_key = cache.write_cache.inference_api_key,
+                    .inference_connections = cache.write_cache.inference_connections,
                     .remote_capability_cache = &cache.remote_capability_cache,
                     .online_source_authority = self.online_source_authority,
                     .replication_write_gate = cache.write_cache.replication_write_gate,
@@ -29218,6 +29294,7 @@ fn applyIndexCreateToCachedDb(
     source_table: []const u8,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
+    inference_connections: ?*const InferenceConnections,
     destination_authorizer: ?stored_destination_authorization.Authorizer,
 ) !void {
     try reconfigureManagedDbEnrichmentRuntimePaused(
@@ -29232,6 +29309,7 @@ fn applyIndexCreateToCachedDb(
         source_table,
         secret_store,
         remote_content,
+        inference_connections,
     );
     var enrichment_resumed = false;
     defer if (!enrichment_resumed) db.resumeEnrichmentRuntimeAfterReconfigure("failed managed index activation", index_name) catch |err| {
@@ -29244,6 +29322,9 @@ fn applyIndexCreateToCachedDb(
         .embedding_options = .{
             .antfly_provider = antfly_provider,
             .inference_api_url = inference_api_url,
+            .inference_connections = inference_connections,
+            .inference_api_key = inference_api_key,
+            .secret_store = secret_store,
             .source_table = source_table,
         },
     });
@@ -29352,7 +29433,7 @@ fn reconcileCachedLocalTableIndexCreate(
         defer if (cached_active) cached.deinit(alloc);
         cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(&cached.entry.?.runtime_hook_state.visibility_binding, cached.entry.?.table_name, group_id, cached.db));
 
-        applyIndexCreateToCachedDb(alloc, cached.db, metadata.indexes_json, index_name, self.backend_runtime, self.antfly_provider, self.remote_capability_cache, self.inference_api_url, self.inference_api_key, table_name, self.secret_store, self.remote_content, self.destination_authorizer) catch |err| {
+        applyIndexCreateToCachedDb(alloc, cached.db, metadata.indexes_json, index_name, self.backend_runtime, self.antfly_provider, self.remote_capability_cache, self.inference_api_url, self.inference_api_key, table_name, self.secret_store, self.remote_content, self.inference_connections, self.destination_authorizer) catch |err| {
             cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
             cached_active = false;
             return err;
@@ -29416,6 +29497,7 @@ fn reconcileCachedLocalTableIndexDrop(
             table_name,
             self.secret_store,
             self.remote_content,
+            self.inference_connections,
         ) catch |err| {
             cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
             cached_active = false;
@@ -29427,9 +29509,13 @@ fn reconcileCachedLocalTableIndexDrop(
             metadata.indexes_json,
             index_name,
             .{
+                .source_table = table_name,
                 .embedding_options = .{
                     .antfly_provider = self.antfly_provider,
                     .inference_api_url = self.inference_api_url,
+                    .inference_connections = self.inference_connections,
+                    .inference_api_key = self.inference_api_key,
+                    .secret_store = self.secret_store,
                 },
             },
         ) catch |err| {
@@ -29520,6 +29606,7 @@ fn putCachedLocalArtifactEnrichment(
                 table_name,
                 self.secret_store,
                 self.remote_content,
+                self.inference_connections,
             ) catch |err| break :blk err;
             publishArtifactEnrichmentRuntimeStatusBestEffort(self, alloc, table_name, artifact_name, group_id, cached.db);
             break :blk null;
@@ -29591,6 +29678,7 @@ fn dropCachedLocalArtifactEnrichment(
                 table_name,
                 self.secret_store,
                 self.remote_content,
+                self.inference_connections,
             ) catch |err| break :blk err;
             publishArtifactEnrichmentRuntimeStatusBestEffort(self, alloc, table_name, artifact_name, group_id, cached.db);
             break :blk null;
@@ -29637,9 +29725,13 @@ fn reconcileUncachedLocalTableIndexCreate(
         defer db.close();
         try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
         _ = try metadata_table_provisioner.reconcileDbIndexTargetWithOptions(alloc, &db, indexes_json, index_name, .{
+            .source_table = table_name,
             .embedding_options = .{
                 .antfly_provider = self.antfly_provider,
                 .inference_api_url = self.inference_api_url,
+                .inference_connections = self.inference_connections,
+                .inference_api_key = self.inference_api_key,
+                .secret_store = self.secret_store,
             },
         });
         recordLocalIndexCreateRepairDebt(alloc, &db, group_id, repair_group_ids);
@@ -30439,6 +30531,7 @@ fn reconfigureManagedDbEnrichments(
     source_table: []const u8,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
+    inference_connections: ?*const InferenceConnections,
 ) !void {
     try reconfigureManagedDbEnrichmentRuntime(
         alloc,
@@ -30452,10 +30545,12 @@ fn reconfigureManagedDbEnrichments(
         source_table,
         secret_store,
         remote_content,
+        inference_connections,
     );
     try reconcileDbArtifactEnrichmentsFromIndexesJson(alloc, db, indexes_json, .{
         .antfly_provider = antfly_provider,
         .inference_api_url = inference_api_url,
+        .inference_connections = inference_connections,
         .source_table = source_table,
     });
 }

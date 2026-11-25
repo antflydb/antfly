@@ -22,7 +22,13 @@ const catalog = @import("../storage/lite/embedded_catalog.zig");
 pub const catalog_key = catalog.key;
 const Record = catalog.Record;
 const Catalog = catalog.Catalog;
-pub const Table = struct { name: []u8, id: u64, namespace: []u8, db: h.db_mod.DB };
+pub const Table = struct {
+    name: []u8,
+    id: u64,
+    namespace: []u8,
+    db: h.db_mod.DB,
+    owned_query_embedder: @FieldType(h.db_mod.DB, "resolution_embedder") = null,
+};
 
 fn openTable(handle: *h.Handle, name: []const u8, id: u64) !*Table {
     const alloc = handle.alloc;
@@ -49,7 +55,10 @@ fn openTable(handle: *h.Handle, name: []const u8, id: u64) !*Table {
     if (handle.owned_lite_backend) |*backend| try backend.configureDbOpenOptionsForNamespace(&options, namespace);
     table.* = .{ .name = owned_name, .id = id, .namespace = namespace, .db = try h.db_mod.DB.open(alloc, path, options) };
     table.db.local_execution.row_policy_table_name = table.name;
-    errdefer table.db.close();
+    errdefer {
+        table.db.close();
+        if (table.owned_query_embedder) |embedder| embedder.deinit(alloc);
+    }
     if (handle.lite_scheduling_owner) |owner|
         table.db.borrowed_group_source_state = try owner.groupSourceState(&table.db);
     @import("entity_sink.zig").attach(handle, &table.db);
@@ -60,13 +69,14 @@ fn openTable(handle: *h.Handle, name: []const u8, id: u64) !*Table {
         defer alloc.free(identity);
         try @import("context_dependencies.zig").attach(handle, &table.db, identity);
     }
-    try api.refreshLiteManagedEmbeddingRuntimeForDatabase(handle, &table.db);
+    try api.refreshLiteManagedEmbeddingRuntimeForDatabase(handle, &table.db, table.name, &table.owned_query_embedder);
     if (handle.embedded_open_options.start_optional_runtime_workers) table.db.startResidentBackgroundWorkersIfNeeded();
     return table;
 }
 
 fn destroy(handle: *h.Handle, table: *Table) void {
     if (handle.lease_snapshot) table.db.closeImmutableSnapshot() else table.db.close();
+    if (table.owned_query_embedder) |embedder| embedder.deinit(handle.alloc);
     handle.alloc.free(table.name);
     handle.alloc.free(table.namespace);
     handle.alloc.destroy(table);

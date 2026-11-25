@@ -25,7 +25,7 @@ import subprocess
 from pathlib import Path
 
 from build_release_payload import verify_release_spec
-from release_channels import load_policy
+from release_channels import embedded_publication_enabled, load_policy
 from release_lines import resolve_tag
 
 CONTROLLER_PATH = ".github/workflows/antfly-release-build-controller.yml"
@@ -110,9 +110,7 @@ def verify_identity(
         "tag": tag,
         # Authenticate prerelease inputs too, but never admit them to registry
         # preparation, dispatch, or credential-bearing publication jobs.
-        "publish": str(
-            channel["tag_kind"] == "stable" and channel["publish_npm"]
-        ).lower(),
+        "publish": str(embedded_publication_enabled(channel)).lower(),
     }
 
 

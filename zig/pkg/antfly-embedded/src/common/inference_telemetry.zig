@@ -17,9 +17,111 @@
 //! Prompts, tool arguments, media, credentials and endpoint URLs are excluded.
 const std = @import("std");
 const abi = @import("antfly_runtime_abi").http_abi;
+const httpx = @import("httpx");
 const time = @import("antfly_platform").time;
 const log = std.log.scoped(.inference_gateway);
 const sse = @import("inference_sse.zig");
+
+pub const ProviderAttempts = struct {
+    request_id: []const u8 = "",
+    connection: []const u8,
+    task: []const u8,
+    model: []const u8,
+    billing_principal: ?[]const u8 = null,
+    billing_scope: ?@import("config.zig").InferenceAttributionScope = null,
+    billing_workload: ?[]const u8 = null,
+    stream_observation: ?*const Observation = null,
+    shared_sequence: ?*std.atomic.Value(u32) = null,
+    next: std.atomic.Value(u32) = .init(1),
+
+    pub fn observer(self: *ProviderAttempts) httpx.AttemptResultObserver {
+        return .{ .context = self, .record = record };
+    }
+
+    fn record(raw: *anyopaque, transport_attempt: httpx.AttemptResultObserver.Attempt, elapsed_ns: u64, response: ?*const httpx.Response, err: ?anyerror) void {
+        const self: *ProviderAttempts = @ptrCast(@alignCast(raw));
+        var request_id_buffer: [48]u8 = undefined;
+        const request_id = if (self.request_id.len != 0) self.request_id else std.fmt.bufPrint(&request_id_buffer, "provider-{x}", .{transport_attempt.request}) catch unreachable;
+        // A durable worker can resume under the same logical request ID.
+        // The transport identity distinguishes each physical submission.
+        var attempt_id_buffer: [64]u8 = undefined;
+        const attempt_id = std.fmt.bufPrint(&attempt_id_buffer, "{x}-{d}", .{ transport_attempt.request, transport_attempt.number }) catch unreachable;
+        var usage = Observation{
+            .allocator = std.heap.smp_allocator,
+            .request_id = request_id,
+            .requested = self.model,
+            .resolved = self.model,
+            .task = self.task,
+            .attempt = 1,
+            .started_ns = 0,
+        };
+        defer usage.deinit();
+        var upstream_id: ?[]const u8 = null;
+        if (response) |reply| {
+            if (reply.body) |body| usage.usage(body);
+            const provided = reply.headers.get("x-antfly-upstream-request-id") orelse reply.headers.get("x-request-id") orelse reply.headers.get("request-id");
+            if (provided) |id| {
+                if (id.len <= 128) upstream_id = id;
+            }
+        }
+        // Streaming adapters have already forwarded frames when the
+        // transport reports the result. The bounded gateway SSE parser
+        // retains provider-reported counts even if the stream later fails.
+        const streamed = if (self.stream_observation) |stream|
+            if (stream.is_sse and stream.first_output_ns != null) stream else null
+        else
+            null;
+        const principal_digest = if (self.billing_principal) |principal| blk: {
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            hash.update("antfly-inference-billing-principal-v1\x00");
+            hash.update(self.connection);
+            hash.update("\x00");
+            hash.update(principal);
+            break :blk std.fmt.bytesToHex(hash.finalResult(), .lower);
+        } else null;
+        const scope_digest = if (self.billing_scope) |scope| blk: {
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            hash.update("antfly-inference-billing-scope-v1\x00");
+            hash.update(self.connection);
+            hash.update("\x00");
+            hash.update(scope.tenant);
+            if (scope.project) |project| {
+                hash.update("\x00");
+                hash.update(project);
+            }
+            break :blk std.fmt.bytesToHex(hash.finalResult(), .lower);
+        } else null;
+        const workload_digest = if (self.billing_workload) |workload| blk: {
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            hash.update("antfly-inference-billing-workload-v1\x00");
+            hash.update(self.connection);
+            hash.update("\x00");
+            hash.update(self.task);
+            hash.update("\x00");
+            hash.update(workload);
+            break :blk std.fmt.bytesToHex(hash.finalResult(), .lower);
+        } else null;
+        log.info("upstream_attempt {f}", .{std.json.fmt(.{
+            .request_id = request_id,
+            .transport_attempt_id = attempt_id,
+            .connection = self.connection,
+            .task = self.task,
+            .backend_model = self.model,
+            .billing_principal_hash = if (principal_digest) |digest| @as([]const u8, &digest) else null,
+            .billing_scope_hash = if (scope_digest) |digest| @as([]const u8, &digest) else null,
+            .billing_workload_hash = if (workload_digest) |digest| @as([]const u8, &digest) else null,
+            .attempt = if (self.request_id.len == 0) transport_attempt.number else (self.shared_sequence orelse &self.next).fetchAdd(1, .monotonic),
+            .latency_ns = elapsed_ns,
+            .streaming = streamed != null,
+            .status = if (response) |reply| reply.status.code else null,
+            .failure = if (err) |failure| @errorName(failure) else null,
+            .upstream_request_id = upstream_id,
+            .input_tokens = usage.input_tokens orelse if (streamed) |stream| stream.input_tokens else null,
+            .output_tokens = usage.output_tokens orelse if (streamed) |stream| stream.output_tokens else null,
+            .total_tokens = usage.total_tokens orelse if (streamed) |stream| stream.total_tokens else null,
+        }, .{})});
+    }
+};
 
 pub const Observation = struct {
     allocator: std.mem.Allocator,

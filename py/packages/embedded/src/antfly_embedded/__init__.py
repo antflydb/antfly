@@ -35,13 +35,13 @@ import ctypes as _ctypes
 import enum
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 
 from . import _ffi, errors
 from ._database import Database, GraphDirection, OutcomeReceiptStatus, TxnID, TxnStatus, WriteIntent, encode_batch_wire
 from ._inference import Inference, PullProgress
-from ._json import decode_json_response, encode_text
+from ._json import decode_json_response, encode_json_input, encode_text
 from ._library import LibraryNotFoundError
 from .errors import (
     AntflyError,
@@ -206,6 +206,7 @@ class OpenOptions:
     local_runtime_configured: bool = False
     generated_enrichment_replay: bool = False
     models_dir: str | os.PathLike[str] | None = None
+    inference_connections: dict[str, object] | None = field(default=None, repr=False)
     map_size: int = 0
     ttl_cleanup: TTLCleanupOptions | None = None
     host_budget_mb: int = 0
@@ -278,6 +279,11 @@ def _build_c_options(opts: OpenOptions) -> tuple[_ffi.AntflyOpenOptions, object]
     models_keep_alive: object = None
     if opts.models_dir is not None:
         c_opts.models_dir, models_keep_alive = _ffi.make_slice(os.fsencode(opts.models_dir))
+    connections_keep_alive: object = None
+    if opts.inference_connections is not None:
+        c_opts.inference_connections_json, connections_keep_alive = _ffi.make_slice(
+            encode_json_input(opts.inference_connections)
+        )
     if opts.no_sync:
         flags |= _ffi.OPEN_FLAG_NO_SYNC
     if opts.remote_provider_configured:
@@ -298,7 +304,7 @@ def _build_c_options(opts: OpenOptions) -> tuple[_ffi.AntflyOpenOptions, object]
         owner_slice, keep_alive = _ffi.make_slice(encode_text(ttl.owner_id))
         c_opts.ttl_cleanup_owner_id = owner_slice
     c_opts.flags = flags
-    return c_opts, (keep_alive, models_keep_alive)
+    return c_opts, (keep_alive, models_keep_alive, connections_keep_alive)
 
 
 def open_with_options(path: str | os.PathLike[str], options: OpenOptions) -> Database:

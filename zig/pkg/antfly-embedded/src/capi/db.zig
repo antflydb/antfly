@@ -20,6 +20,7 @@ comptime {
     _ = @import("context_dependencies.zig");
 }
 const handles = @import("handles.zig");
+const inference_config = @import("../common/config.zig");
 const write_stage_profile = @import("../storage/write_stage_profile.zig");
 pub const testMaintenanceCaptureAdmission = @import("lite_connection.zig").testMaintenanceCaptureAdmission;
 pub const testPathReplacementAdmission = @import("lite_connection.zig").testPathReplacementAdmission;
@@ -432,7 +433,7 @@ pub fn litePhysicalIndexConfigJson(
     kind: db_mod.types.IndexKind,
     name: []const u8,
     config_json: []const u8,
-    provider: ?managed_embedder.AntflyProvider,
+    options: managed_embedder.InitOptions,
 ) ![]u8 {
     if (kind != .dense_vector and kind != .sparse_vector) return try alloc.dupe(u8, config_json);
     const bridged = try liteManagedEmbeddingIndexConfigJson(alloc, kind, config_json);
@@ -456,11 +457,18 @@ pub fn litePhysicalIndexConfigJson(
         parsed.value.object.put(arena, "field", .{ .string = "embedding" }) catch
             return try alloc.dupe(u8, config_json);
     }
-    // `provider` must be threaded through here too: an embedder with no
+    const managed_model = if (parsed.value == .object) blk: {
+        const embedder = parsed.value.object.get("embedder") orelse break :blk false;
+        if (embedder != .object) break :blk false;
+        const model = embedder.object.get("model") orelse break :blk false;
+        break :blk model == .string and std.mem.startsWith(u8, model.string, "connections/");
+    } else false;
+    // The local provider must be threaded through here too: an embedder with no
     // `api_url` translates to a durable `"antfly:embedded"` semantic
     // producer identity, and the translator rejects that identity outright
     // when no embedded provider is attached to validate it against.
-    return managed_embedder.translateEmbeddingsIndexConfigJsonWithOptions(alloc, name, parsed.value, .{ .antfly_provider = provider }) catch {
+    return managed_embedder.translateEmbeddingsIndexConfigJsonWithOptions(alloc, name, parsed.value, options) catch |err| {
+        if (managed_model) return err;
         // A translation failure (for example dimension auto-detection
         // requiring a live round trip this call cannot make) must not turn
         // into a hard AddIndex error. Fall back to the bridged config, but
@@ -613,25 +621,66 @@ pub fn liteEnrichmentCatalogEntryJsonAlloc(alloc: Allocator, cfg: db_mod.types.E
     return try buf.toOwnedSlice(alloc);
 }
 
+pub fn inferenceConnections(handle: *Handle) ?*const inference_config.Config.ConnectionsConfig {
+    const root = handle.parent_handle orelse handle;
+    return if (root.inference_connection_config) |config| &config.connections else null;
+}
+
+fn loadInferenceConnections(handle: *Handle, raw: []const u8) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, handle.alloc, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidConfig;
+    const document = try std.json.Stringify.valueAlloc(handle.alloc, .{ .connections = parsed.value }, .{});
+    defer {
+        @memset(document, 0);
+        handle.alloc.free(document);
+    }
+    const config = try handle.alloc.create(inference_config.Config);
+    errdefer handle.alloc.destroy(config);
+    config.* = try inference_config.Config.parseFromSlice(handle.alloc, document);
+    errdefer config.deinit();
+    var entries = config.connections.iterator();
+    while (entries.next()) |entry| {
+        if (entry.value_ptr.kind != .inference) return error.InvalidConfig;
+    }
+    handle.inference_connection_config = config;
+}
+
 pub fn refreshLiteManagedEmbeddingRuntime(handle: *Handle) !void {
-    return refreshLiteManagedEmbeddingRuntimeForDatabase(handle, handle.database());
+    return refreshLiteManagedEmbeddingRuntimeForDatabase(handle, handle.database(), handle.selected_table_name orelse "default", &handle.owned_query_embedder);
 }
 
 /// Reopened namespaces share the root's inference provider and replay options,
 /// but restore their own catalog's enrichment runtime before accepting writes.
-pub fn refreshLiteManagedEmbeddingRuntimeForDatabase(handle: *Handle, database: *db_mod.DB) !void {
+pub fn refreshLiteManagedEmbeddingRuntimeForDatabase(
+    handle: *Handle,
+    database: *db_mod.DB,
+    table_name: []const u8,
+    query_embedder: *@FieldType(db_mod.DB, "resolution_embedder"),
+) !void {
     const root = handle.parent_handle orelse handle;
-    if (handle.lite_profile != .native and !root.embedded_native_providers) return;
-    // A read-only/status-only handle has nothing to reconcile toward, and
-    // `db.reconfigureEnrichmentRuntime` unconditionally fails with
-    // `error.ReadOnly` on one -- before it even looks at whether there is
-    // anything to configure. Every open of an already-written native Lite
-    // database (query_readonly, status_only) would otherwise fail outright.
-    if (!liteOpenModeCanWrite(handle.open_mode)) return;
+    const connections = inferenceConnections(root);
+    if (handle.lite_profile != .native and !root.embedded_native_providers and connections == null) return;
+    if (handle.open_mode == .status_only) return;
+    if (!liteOpenModeCanWrite(handle.open_mode) and connections == null) return;
     const provider = handle.liteAntflyProvider();
     const alloc = handle.alloc;
     const merged_json = try liteMergedIndexesForDatabaseJsonAlloc(alloc, database);
     defer alloc.free(merged_json);
+
+    if (!liteOpenModeCanWrite(handle.open_mode)) {
+        const replacement = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(alloc, merged_json, .{
+            .antfly_provider = provider,
+            .io = database.backend_runtime.io(),
+            .source_table = table_name,
+            .inference_connections = connections,
+            .enable_index_attribution = true,
+        });
+        database.setResolutionEmbedder(replacement);
+        if (query_embedder.*) |previous| previous.deinit(alloc);
+        query_embedder.* = replacement;
+        return;
+    }
 
     // Not `local_write.reconfigureManagedDbEnrichmentRuntime` directly: that
     // helper derives `enable_without_producers` purely from
@@ -655,9 +704,10 @@ pub fn refreshLiteManagedEmbeddingRuntimeForDatabase(handle: *Handle, database: 
         null,
         null,
         null,
-        "",
+        if (connections != null) table_name else "",
         null,
         null,
+        connections,
     );
     defer enrichments.deinit(alloc);
     var cfg = enrichments.takeConfig();
@@ -3232,6 +3282,87 @@ pub fn antfly_open_options_init(options: ?*capi.OpenOptions) callconv(.c) capi.E
     return .ok;
 }
 
+test "capi managed inference connections apply private gateway headers to Lite embeddings" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const httpx = @import("httpx");
+    const Check = struct {
+        fn serve(server: *httpx.TestServer) !void {
+            try server.handleOne();
+            try server.handleOne();
+        }
+
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer embedded-fixture", req.header("Authorization") orelse return error.MissingFixtureAuthorization);
+            try std.testing.expectEqualStrings("embedded-index", req.header("X-Billing-Team") orelse return error.MissingFixtureAttribution);
+        }
+    };
+    const routes: []const httpx.testing_mod.Route = &.{.{
+        .method = .POST,
+        .path = "/v1/embeddings",
+        .assert_request = Check.request,
+        .respond = .{ .body = "{\"data\":[{\"index\":0,\"embedding\":[0.25,0.5]}]}" },
+    }};
+    var server = try httpx.TestServer.start(a, std.testing.io, routes);
+    defer server.deinit();
+    var serving = try std.testing.io.concurrent(Check.serve, .{&server});
+    defer serving.cancel(std.testing.io) catch {};
+    var directory = try TestDirectory.init("managed-inference-gateway");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    const connections = try std.fmt.allocPrint(a,
+        \\{{"gateway":{{"kind":"inference","capabilities":["models.embed"],"inference":{{"provider":"openai","url":"{s}/v1","api_key":"embedded-fixture","allow_private_ips":true,"attribution":{{"header":"X-Billing-Team","workloads":{{"index_embed/default":"embedded-index"}}}}}}}}}}
+    , .{server.baseUrl()});
+    defer a.free(connections);
+    var options: capi.OpenOptions = .{
+        .storage_kind = capi.storage_kind_lite,
+        .flags = capi.open_flag_no_sync,
+        .inference_connections_json = capi.Slice.fromSlice(connections),
+    };
+    var id: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &id));
+    defer antfly_db_close(id);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(id, .fromSlice(
+        \\{"name":"semantic","kind":"dense_vector","config_json":{"type":"embeddings","field":"body","dimension":2,"embedder":{"provider":"openai","model":"connections/gateway/models/text-embedding-3-small"}}}
+    )));
+    {
+        const guard = enterHandle(id, .write) orelse return error.TestUnexpectedResult;
+        defer guard.leave();
+        const embedder = guard.handle.database().resolution_embedder orelse return error.TestUnexpectedResult;
+        const vector = try embedder.embedDense(a, "semantic", "embedded sample", 2);
+        defer a.free(vector);
+        try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.5 }, vector);
+    }
+    antfly_db_close(id);
+    id = null;
+    options.open_mode = capi.open_mode_readonly;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(path, &options, &id));
+    const guard = enterHandle(id, .read) orelse return error.TestUnexpectedResult;
+    defer guard.leave();
+    const embedder = guard.handle.database().resolution_embedder orelse return error.TestUnexpectedResult;
+    const vector = try embedder.embedDense(a, "semantic", "read-only sample", 2);
+    defer a.free(vector);
+    try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.5 }, vector);
+    try serving.await(std.testing.io);
+}
+
+test "capi managed inference connections preserve the open options ABI layout" {
+    const legacy_reserved_bytes = 6 * @sizeOf(u64);
+    try std.testing.expectEqual(@offsetOf(capi.OpenOptions, "reserved") + legacy_reserved_bytes, @offsetOf(capi.OpenOptions, "models_dir"));
+    const payload = "{\"provider\":{\"kind\":\"inference\",\"inference\":{\"provider\":\"openai\"}}}";
+    var options: capi.OpenOptions = .{ .inference_connections_json = capi.Slice.fromSlice(payload) };
+    var resolved = try resolveOpenOptions(&options);
+    try std.testing.expectEqualStrings(payload, resolved.inference_connections_json);
+    try std.testing.expect(resolved.inference.remote_provider_configured);
+
+    options.abi_size = @offsetOf(capi.OpenOptions, "inference_connections_json");
+    resolved = try resolveOpenOptions(&options);
+    try std.testing.expectEqualStrings("", resolved.inference_connections_json);
+    try std.testing.expect(!resolved.inference.remote_provider_configured);
+}
+
 pub const open_known_flags = capi.open_flag_no_sync |
     capi.open_flag_ttl_cleanup |
     capi.open_flag_remote_provider_configured |
@@ -3256,6 +3387,7 @@ pub const LiteResolvedOpenOptions = struct {
     ride_along_idle_ns: ?u64 = null,
     ttl_cleanup: ?db_mod.ttl_runtime.Config = null,
     inference: lite_backend.InferenceOpenOptions = .{},
+    inference_connections_json: []const u8 = "",
     generated_enrichment_replay: bool = false,
     busy_timeout_ms: u64 = 0,
     /// Internal: the connection boundary owns the cross-process path lease.
@@ -3395,6 +3527,11 @@ pub fn resolveOpenOptions(options_ptr: ?*const capi.OpenOptions) !LiteResolvedOp
         .generated_enrichment_replay = (flags & capi.open_flag_generated_enrichment_replay) != 0,
         .busy_timeout_ms = readOptionField(capi.OpenOptions, options, abi_size, "busy_timeout_ms") orelse 0,
     };
+    if (readOptionField(capi.OpenOptions, options, abi_size, "inference_connections_json")) |value| {
+        if (value.ptr == null and value.len != 0) return error.InvalidArgument;
+        resolved.inference_connections_json = value.bytes();
+        if (value.len > 0) resolved.inference.remote_provider_configured = true;
+    }
     if ((flags & capi.open_flag_ttl_cleanup) != 0) {
         const owner_id = readOptionField(capi.OpenOptions, options, abi_size, "ttl_cleanup_owner_id") orelse capi.Slice{};
         if (owner_id.ptr == null and owner_id.len != 0) {
@@ -3649,6 +3786,7 @@ pub fn openLiteHandleAllocWithSharedInference(
     // default full-text index, so this is a no-op there). Must run after
     // `startLiteEmbeddedInference` so an embedded local provider is already
     // attached to the handle when this reads it.
+    if (resolved.inference_connections_json.len > 0) try loadInferenceConnections(handle, resolved.inference_connections_json);
     try refreshLiteManagedEmbeddingRuntime(handle);
     @import("entity_sink.zig").attach(handle, &handle.db);
     try @import("tables.zig").loadCatalog(handle);
@@ -3725,6 +3863,7 @@ pub fn openDirectoryHandleAlloc(path: []const u8, resolved: LiteResolvedOpenOpti
         handles.closeHandle(handle);
     }
     @import("entity_sink.zig").attach(handle, &handle.db);
+    if (resolved.inference_connections_json.len > 0) try loadInferenceConnections(handle, resolved.inference_connections_json);
     try refreshLiteManagedEmbeddingRuntime(handle);
     try @import("tables.zig").loadCatalog(handle);
     handle.database().*.startResidentBackgroundWorkersIfNeeded();
@@ -8505,7 +8644,7 @@ pub fn antfly_db_resolve_query_json(handle_ptr: ?*anyopaque, resolver_name: capi
             defer producer_handle.query_producer_mutex.unlock(handleLockIo());
             if (producer_handle.query_producer == null) {
                 const io = handle.database().backend_runtime.io() orelse return capi.mapErrorContext(error.SqlFeatureNotSupported, "query extraction requires a backend IO runtime");
-                producer_handle.query_producer = @import("../asset_producer_runtime.zig").Runtime.createOwned(alloc, io, .{ .antfly_provider = producer_handle.liteAntflyProvider() }) catch |err| return capi.mapErrorContext(err, "creating query extractor runtime");
+                producer_handle.query_producer = @import("../asset_producer_runtime.zig").Runtime.createOwned(alloc, io, .{ .antfly_provider = producer_handle.liteAntflyProvider(), .inference_connections = inferenceConnections(producer_handle) }) catch |err| return capi.mapErrorContext(err, "creating query extractor runtime");
             }
         }
         const extracted = if (text) |value| extracted: {
@@ -9852,8 +9991,15 @@ fn addIndexJsonRegistered(
     // public-shaped dense/sparse config; the server always translates first
     // (see `litePhysicalIndexConfigJson`). Every other handle keeps calling
     // `db.addIndex` with exactly the config it was given, unchanged.
-    const stored_config_json = if (handle.lite_profile == .native)
-        litePhysicalIndexConfigJson(handle.alloc, kind, parsed.value.name, parsed.value.config_json, handle.liteAntflyProvider()) catch |err| {
+    const connections = inferenceConnections(handle);
+    const stored_config_json = if (handle.lite_profile == .native or connections != null)
+        litePhysicalIndexConfigJson(handle.alloc, kind, parsed.value.name, parsed.value.config_json, .{
+            .antfly_provider = handle.liteAntflyProvider(),
+            .inference_connections = connections,
+            .io = if (connections != null) handle.database().backend_runtime.io() else null,
+            .source_table = handle.selected_table_name orelse "default",
+            .enable_index_attribution = connections != null,
+        }) catch |err| {
             if (rollback) |*undo| undo.restore();
             return capi.mapError(err);
         }

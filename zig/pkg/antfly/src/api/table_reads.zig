@@ -10101,6 +10101,7 @@ fn distributedSearchShardRequest(
     copy.evaluation_graph = false;
     copy.reranker = null;
     copy.reranker_query_text = "";
+    copy.inference_binding = null;
     // Graph-metric scoring remains shard-local because its published vector is
     // shard-local. Pin the already-expanded global candidate window explicitly
     // so each shard neither applies the caller offset nor expands it a second

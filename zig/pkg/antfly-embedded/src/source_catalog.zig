@@ -89,6 +89,7 @@ pub const chunking_mod = @import("chunking/mod.zig");
 pub const chunking_types = @import("chunking/types.zig");
 pub const common_byte_copy = @import("common/byte_copy.zig");
 pub const common_config = @import("common/config.zig");
+pub const inference_connection_runtime = @import("generating/connection_runtime.zig");
 pub const common_credential_safety = @import("common/credential_safety.zig");
 pub const common_credential_source_identity = @import("common/credential_source_identity.zig");
 pub const common_dense_native_storage_phase = @import("common/dense_native_storage_phase.zig");

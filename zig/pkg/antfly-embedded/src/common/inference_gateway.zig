@@ -16,6 +16,7 @@
 //! Borrowed, task-aware view of the existing named provider registries. No HTTP,
 //! model kernels, credentials or discovery I/O belongs in identity resolution.
 const std = @import("std");
+const common_config = @import("config.zig");
 const providers = @import("provider_registry.zig");
 const decisions = @import("../functions/decisions.zig");
 const readers = @import("antfly_readers");
@@ -104,10 +105,44 @@ pub const Descriptor = struct {
 
 pub const View = struct {
     providers: *const providers.Registry,
-    connections: ?*const @import("config.zig").Config.ConnectionsConfig = null,
+    connections: ?*const common_config.Config.ConnectionsConfig = null,
     readers: ?*const readers.Registry = null,
     transcribers: ?*const transcribing.Registry = null,
     synthesizers: ?*const synthesizing.Registry = null,
+
+    pub const GenerationChainTarget = struct {
+        target: Target,
+        config: @import("antfly_generating").GeneratorConfig,
+    };
+
+    pub fn generationChainTarget(self: View, name: []const u8, link: providers.ChainLinkConfig) !GenerationChainTarget {
+        if (link.generator_name) |selector| {
+            if (try common_config.InferenceModelReference.parse(selector)) |reference| {
+                const connections = self.connections orelse return error.ConnectionNotFound;
+                const cfg = try common_config.resolveInferenceConnection(connections, reference.connection, "models.generate");
+                const Provider = @import("antfly_generating").Provider;
+                const provider = std.meta.stringToEnum(Provider, cfg.provider) orelse return error.UnsupportedInferenceFeature;
+                return .{
+                    .target = .{ .connection = .{ .task = .generate, .connection = reference.connection, .model = reference.model } },
+                    .config = .{
+                        .provider = provider,
+                        .model = reference.model,
+                        .url = cfg.url orelse @import("antfly_generating").defaultUrl(provider),
+                        .api_key = cfg.api_key,
+                        .workspace_id = cfg.workspace_id,
+                        .region = cfg.region,
+                        .project_id = cfg.project_id,
+                        .location = cfg.location,
+                        .credentials_path = cfg.credentials_path,
+                    },
+                };
+            }
+        }
+        return .{
+            .target = .{ .configured = .{ .task = .generate, .name = link.generator_name orelse name, .chain = link.generator_name == null } },
+            .config = link.generator_config orelse try self.providers.getGeneratorConfig(link.generator_name.?),
+        };
+    }
 
     pub fn describe(self: View, a: std.mem.Allocator, target: Target) !Descriptor {
         const task = switch (target) {
@@ -132,11 +167,11 @@ pub const View = struct {
                     const links = try self.providers.getChain(value.name);
                     if (links.len == 0 or links.len > 8) return error.InvalidInferenceRequest;
                     var attempts: u32 = 0;
-                    const first = links[0].generator_config orelse try self.providers.getGeneratorConfig(links[0].generator_name.?);
+                    const first = (try self.generationChainTarget(value.name, links[0])).config;
                     for (links, 0..) |link, index| {
                         if (index > 0 and links[index - 1].condition == null) break;
                         if (attempts >= 8) break;
-                        const cfg = link.generator_config orelse try self.providers.getGeneratorConfig(link.generator_name.?);
+                        const cfg = (try self.generationChainTarget(value.name, link)).config;
                         if (cfg.provider != first.provider or !std.mem.eql(u8, cfg.model, first.model) or !std.mem.eql(u8, cfg.url, first.url)) out.execution_policy.cross_model_fallback = true;
                         attempts = @min(@as(u32, 8), attempts + @min(@as(u32, 8), if (link.retry) |retry| retry.max_attempts else 1));
                     }
@@ -293,12 +328,8 @@ pub const View = struct {
             if (model.len == 0) return error.InvalidModelIdentity;
             return .{ .local = .{ .task = task, .model = model, .explicit = true } };
         }
-        if (std.mem.startsWith(u8, id, "connections/")) {
-            const rest = id["connections/".len..];
-            const separator = std.mem.indexOf(u8, rest, "/models/") orelse return error.InvalidModelIdentity;
-            if (separator == 0 or separator + "/models/".len == rest.len or std.mem.indexOfScalar(u8, rest[0..separator], '/') != null)
-                return error.InvalidModelIdentity;
-            return .{ .connection = .{ .task = task, .connection = rest[0..separator], .model = rest[separator + "/models/".len ..] } };
+        if (try common_config.InferenceModelReference.parse(id)) |reference| {
+            return .{ .connection = .{ .task = task, .connection = reference.connection, .model = reference.model } };
         }
         if (std.mem.startsWith(u8, id, "chains/")) {
             if (task != .generate) return error.ModelTaskMismatch;
@@ -397,6 +428,26 @@ pub const Attempts = struct {
         self.committed = true;
     }
 };
+
+test "provider registry gateway chain links preserve their connection identity" {
+    const a = std.testing.allocator;
+    var config = try common_config.Config.parseFromSlice(a,
+        \\{"connections":{"primary":{"kind":"inference","capabilities":["models.generate"],"inference":{"provider":"openai","url":"https://one.internal","headers":{"X-Billing-Team":"one"}}},"secondary":{"kind":"inference","capabilities":["models.generate"],"inference":{"provider":"openai","url":"https://two.internal","headers":{"X-Billing-Team":"two"}}}},"chains":{"fallback":[{"generator":"connections/primary/models/gpt-4.1","condition":"on_error"},{"generator":"connections/secondary/models/gpt-4.1"}]}}
+    );
+    defer config.deinit();
+    const view: View = .{ .providers = &config.registry, .connections = &config.connections };
+    const links = try config.registry.getChain("fallback");
+    const first = try view.generationChainTarget("fallback", links[0]);
+    const next = try view.generationChainTarget("fallback", links[1]);
+    try std.testing.expectEqualStrings("primary", first.target.connection.connection);
+    try std.testing.expectEqualStrings("secondary", next.target.connection.connection);
+    try std.testing.expectEqualStrings("https://two.internal", next.config.url);
+    const target = try view.resolve(.generate, "chains/fallback", &.{});
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const discovery = try view.describe(arena.allocator(), target);
+    try std.testing.expect(discovery.execution_policy.cross_model_fallback);
+}
 
 test "provider registry gateway resolves explicit task identities and preserves raw names" {
     const a = std.testing.allocator;
@@ -886,7 +937,7 @@ test "provider registry gateway decisions intersect declarations with adapter su
 
 test "provider registry gateway hosted connection decisions require adapter support declarations and image budgets" {
     const a = std.testing.allocator;
-    var config = try @import("config.zig").Config.parseFromSlice(a,
+    var config = try common_config.Config.parseFromSlice(a,
         \\{"connections":{"vendor":{"kind":"inference","capabilities":["models.decide","models.generate"],"inference":{"provider":"openai"}}},"inference_capabilities":{"connections/vendor/models/vision":{"images":"supported","streaming":"supported"}}}
     );
     defer config.deinit();

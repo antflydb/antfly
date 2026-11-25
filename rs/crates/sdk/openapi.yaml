@@ -42481,6 +42481,8 @@ components:
         account_id:
           type: string
           minLength: 1
+          description: Required for a direct model. A connection-qualified model takes the account from
+            its connection.
         gateway_id:
           type: string
           minLength: 1
@@ -42519,7 +42521,6 @@ components:
           maximum: 2
       required:
         - provider
-        - account_id
         - model
     GoogleGeneratorConfig:
       type: object
@@ -43260,6 +43261,8 @@ components:
         account_id:
           type: string
           minLength: 1
+          description: Required for a direct model. A connection-qualified model takes the account from
+            its connection.
         gateway_id:
           type: string
           minLength: 1
@@ -43284,7 +43287,6 @@ components:
           description: Alias of dimensions.
       required:
         - provider
-        - account_id
         - model
     EmbeddingRetrievalConfig:
       type: object
@@ -44629,7 +44631,6 @@ components:
       description: Cloudflare Workers AI native speech adapter. Credentials use CLOUDFLARE_API_TOKEN.
       required:
         - provider
-        - account_id
         - model
       properties:
         provider:
@@ -44638,6 +44639,8 @@ components:
             - cloudflare
         account_id:
           type: string
+          description: Required for a direct Cloudflare model. A connection-qualified model takes the
+            account from its connection.
         gateway_id:
           type: string
         model:
@@ -46575,11 +46578,13 @@ components:
           $ref: '#/components/schemas/ConstrainedGenerationBatch'
         model:
           type: string
-          description: Required for Antfly, OpenAI, and Cloudflare; Jev defaults to jev-latest. Cloudflare
-            uses @cf/cloudflare/clef or @cf/cloudflare/clef-flash.
+          description: Required for Antfly, OpenAI, and Cloudflare; Jev defaults to jev-latest. Typed
+            deciders may select a connection-qualified model with models.decide. Cloudflare uses @cf/cloudflare/clef
+            or @cf/cloudflare/clef-flash.
         account_id:
           type: string
-          description: Required with the cloudflare provider; Workers AI account identifier.
+          description: Workers AI account identifier. Required for a direct Cloudflare model. A connection-qualified
+            model takes it from its connection.
         gateway_id:
           type: string
           description: Optional Cloudflare AI Gateway identifier.
@@ -54026,6 +54031,8 @@ components:
             - cloudflare
         account_id:
           type: string
+          description: Required for a direct Cloudflare model. A connection-qualified model takes the
+            account from its connection.
           minLength: 1
         gateway_id:
           type: string
@@ -54042,7 +54049,6 @@ components:
           description: Optional deployment-owned endpoint override.
       required:
         - provider
-        - account_id
         - model
     AntflyRerankerConfig:
       type: object

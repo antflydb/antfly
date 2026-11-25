@@ -17350,7 +17350,8 @@ export interface components {
         CloudflareGeneratorConfig: {
             /** @enum {string} */
             provider: "cloudflare";
-            account_id: string;
+            /** @description Required for a direct model. A connection-qualified model takes the account from its connection. */
+            account_id?: string;
             /** @description Optional AI Gateway ID, sent through cf-aig-gateway-id. */
             gateway_id?: string;
             /** @default @cf/meta/llama-3.3-70b-instruct-fp8-fast */
@@ -17827,7 +17828,8 @@ export interface components {
              * @enum {string}
              */
             provider: "cloudflare";
-            account_id: string;
+            /** @description Required for a direct model. A connection-qualified model takes the account from its connection. */
+            account_id?: string;
             /** @description Optional AI Gateway ID, sent through cf-aig-gateway-id. */
             gateway_id?: string;
             /** @default @cf/baai/bge-base-en-v1.5 */
@@ -18751,7 +18753,8 @@ export interface components {
         CloudflareSTTConfig: {
             /** @enum {string} */
             provider: "cloudflare";
-            account_id: string;
+            /** @description Required for a direct Cloudflare model. A connection-qualified model takes the account from its connection. */
+            account_id?: string;
             gateway_id?: string;
             /** @default @cf/openai/whisper-large-v3-turbo */
             model: string;
@@ -19751,9 +19754,9 @@ export interface components {
             output?: components["schemas"]["ConstrainedOutput"];
             probabilities?: components["schemas"]["ConstrainedProbabilities"];
             batch?: components["schemas"]["ConstrainedGenerationBatch"];
-            /** @description Required for Antfly, OpenAI, and Cloudflare; Jev defaults to jev-latest. Cloudflare uses @cf/cloudflare/clef or @cf/cloudflare/clef-flash. */
+            /** @description Required for Antfly, OpenAI, and Cloudflare; Jev defaults to jev-latest. Typed deciders may select a connection-qualified model with models.decide. Cloudflare uses @cf/cloudflare/clef or @cf/cloudflare/clef-flash. */
             model?: string;
-            /** @description Required with the cloudflare provider; Workers AI account identifier. */
+            /** @description Workers AI account identifier. Required for a direct Cloudflare model. A connection-qualified model takes it from its connection. */
             account_id?: string;
             /** @description Optional Cloudflare AI Gateway identifier. */
             gateway_id?: string;
@@ -23810,7 +23813,8 @@ export interface components {
         CloudflareRerankerConfig: {
             /** @enum {string} */
             provider: "cloudflare";
-            account_id: string;
+            /** @description Required for a direct Cloudflare model. A connection-qualified model takes the account from its connection. */
+            account_id?: string;
             /** @description Optional AI Gateway ID, sent through cf-aig-gateway-id. */
             gateway_id?: string;
             /** @default @cf/baai/bge-reranker-base */
