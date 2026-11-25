@@ -2210,22 +2210,12 @@ class CliTests(unittest.TestCase):
 
     def test_generated_differential_goldens(self):
         import differential
-        import platform
 
         manifest = json.loads(
             Path(__file__).with_name("generated_fixtures.json").read_text()
         )
-        host = platform.system().lower() + "-" + platform.machine()
         for index, case in enumerate(manifest["cases"]):
             source = base64.b64decode(case["input"])
-            # Pinned Linux x86 PCRE2 JIT visits intermediate UTF bytes on empty
-            # matches; native ARM references advance characters. Replay portable
-            # ASCII cases everywhere, and the full corpus on its oracle platform.
-            if (
-                manifest.get("platform", "linux-x86_64") != host
-                and not source.isascii()
-            ):
-                continue
             with self.subTest(index=index, args=case["args"]):
                 result = self.raw_cli(*case["args"], input=source, code=case["code"])
                 actual = (
@@ -2282,6 +2272,8 @@ class CliTests(unittest.TestCase):
         }
         self.env["HOME"] = str(self.root)
         self.env["XDG_CONFIG_HOME"] = str(self.root / "config")
+        # A host XDG override must not merge independent fixture caches.
+        self.env["XDG_CACHE_HOME"] = str(self.root / ".cache")
         self.server.asset_mode = None
         self.server.select_mode = None
         self.server.projected_asset_bytes = 0
@@ -3274,9 +3266,127 @@ class CliTests(unittest.TestCase):
         ]
         self.assertFalse(any(id.startswith("region-") for id in ids))
 
-    def test_pinned_pcre_empty_utf_platform_contract(self):
+    def test_nul_record_anchors_and_counts_across_read_paths(self):
+        # Frozen v16 expectations also run when ripgrep is not installed.
+        for engine in ("default", "pcre2", "auto"):
+            for data, pattern, count in (
+                (b"aa\r\n", "a|$", 3 if engine == "pcre2" else 2),
+                (b"aa\r\n\0", "a|$", 4 if engine == "pcre2" else 3),
+                (b"axb", "a|$", 1),
+                (b"axb", "$", 1),
+                (b"a\nb\0", "^b", 1 if engine == "pcre2" else 0),
+                (b"a\0b\0", "^b", 1),
+            ):
+                self.write("records", data)
+                for path in ("-", "records"):
+                    for mapping in ("--mmap", "--no-mmap"):
+                        with self.subTest(
+                            engine=engine, data=data, path=path, mapping=mapping
+                        ):
+                            result = self.raw_cli(
+                                "--engine",
+                                engine,
+                                "--null-data",
+                                mapping,
+                                "--count-matches",
+                                "--include-zero",
+                                pattern,
+                                path,
+                                input=data if path == "-" else None,
+                                code=0 if count else 1,
+                            )
+                            self.assertEqual(result.stdout, str(count).encode() + b"\0")
+        # A NUL record separator changes anchors, not the regex dot's LF policy.
+        self.assertEqual(
+            self.raw_cli("--null-data", "-o", ".", input=b"\n", code=1).stdout, b""
+        )
+
+    def test_nul_multiline_anchors_keep_engine_semantics(self):
+        for engine in ("default", "pcre2", "auto"):
+            for data, expected in (
+                (b"a\nb\0", 1),
+                (b"a\0b\0", 0 if engine == "pcre2" else 1),
+            ):
+                with self.subTest(engine=engine, data=data):
+                    r = self.raw_cli(
+                        "--engine",
+                        engine,
+                        "--null-data",
+                        "-U",
+                        "--count-matches",
+                        "--include-zero",
+                        "^b",
+                        input=data,
+                        code=0 if expected else 1,
+                    )
+                    self.assertEqual(r.stdout, str(expected).encode() + b"\0")
+        for data in (b"b\n", b"b\0"):
+            r = self.raw_cli("-P", "--null-data", "-o", r"b\Z", input=data)
+            self.assertEqual(r.stdout, b"b\0")
+
+    def test_nul_multiline_regular_subject_boundaries(self):
+        for engine in ("default", "auto", "pcre2"):
+            for pattern, count in (
+                ("a|$", 1),
+                ("$", 0),
+                ("^b", 0 if engine == "pcre2" else 1),
+            ):
+                with self.subTest(engine=engine, pattern=pattern):
+                    r = self.raw_cli(
+                        "--engine",
+                        engine,
+                        "--null-data",
+                        "-U",
+                        "--count-matches",
+                        "--include-zero",
+                        pattern,
+                        input=b"a\0b\0",
+                        code=0 if count else 1,
+                    )
+                    self.assertEqual(r.stdout, str(count).encode() + b"\0")
+        # Captures are translated back into the full source's byte coordinates.
+        r = self.raw_cli(
+            "--null-data",
+            "-U",
+            "-o",
+            "-r",
+            "[${id}]",
+            r"^(?P<id>b)",
+            input=b"a\0b\0b\0",
+        )
+        self.assertEqual(r.stdout, b"[b]\0[b]\0")
+        r = self.raw_cli("--null-data", "-U", "--json", r"^b", input=b"a\0b\0b\0")
+        matches = [
+            json.loads(line)["data"]
+            for line in r.stdout.splitlines()
+            if json.loads(line)["type"] == "match"
+        ]
+        self.assertEqual([m["absolute_offset"] for m in matches], [2, 4])
+        self.assertEqual([m["submatches"][0]["start"] for m in matches], [0, 0])
+
+    def test_nul_records_isolate_capture_context(self):
+        for pattern in ("^b", r"(?-m)^b", r"\Ab"):
+            for flags, expected in (
+                (["-o"], b"b\0"),
+                (["--count-matches"], b"1\0"),
+                (["-r", "[$0]"], b"[b]\0"),
+            ):
+                with self.subTest(pattern=pattern, flags=flags):
+                    r = self.raw_cli(
+                        "-P", "--null-data", *flags, pattern, input=b"a\0b\0"
+                    )
+                    self.assertEqual(r.stdout, expected)
+        for pattern in (r"(?<=\x00)b", r"(?<=a\x00)b"):
+            self.assertEqual(
+                self.raw_cli(
+                    "-P", "--null-data", "-o", pattern, input=b"a\0b\0", code=1
+                ).stdout,
+                b"",
+            )
+
+    def test_pcre_empty_utf_iteration_is_bytewise_across_platforms(self):
         self.write("pinned-utf.txt", "éΣ\naéa\n")
-        count = b"10\n" if sys.platform.startswith("linux") else b"7\n"
+        count = b"10\n"
         self.assertEqual(
             self.raw_cli("-P", "--count-matches", "", "pinned-utf.txt").stdout, count
         )

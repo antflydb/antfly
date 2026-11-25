@@ -15,7 +15,7 @@
 
 """Seeded grammar-based CLI differential exploration with bounded ddmin reduction.
 
-The oracle is test-only ripgrep 15.2.0 linked to PCRE2 10.45. Run both executables
+The oracle is test-only ripgrep 16.0.0 linked to PCRE2 10.45. Run both executables
 on the same host/container. Reports contain replayable inputs and binary hashes.
 """
 
@@ -206,8 +206,8 @@ def main():
     binary, oracle = args.binary.resolve(), args.oracle.resolve()
     version = subprocess.check_output([str(oracle), "--version"], text=True)
     pcre = subprocess.check_output([str(oracle), "--pcre2-version"], text=True)
-    if "ripgrep 15.2.0" not in version or not pcre.startswith("PCRE2 10.45"):
-        parser.error("oracle must be ripgrep 15.2.0 / runtime PCRE2 10.45")
+    if "ripgrep 16.0.0" not in version or not pcre.startswith("PCRE2 10.45"):
+        parser.error("oracle must be ripgrep 16.0.0 / runtime PCRE2 10.45")
     env = {
         k: v
         for k, v in os.environ.items()

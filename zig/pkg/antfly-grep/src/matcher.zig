@@ -29,6 +29,7 @@ const Program = struct {
     references: std.atomic.Value(usize) = .init(1),
     prefilter: ?regex.prefilter.Set = null,
     absolute_start: bool = false,
+    crosses_records: bool = false,
     direct: std.ArrayList(Literal) = .empty,
     regular: std.ArrayList(Regular) = .empty,
     advanced: std.ArrayList(Advanced) = .empty,
@@ -65,6 +66,7 @@ const Program = struct {
         }
     }
     fn buildPrefilter(self: *Program, o: *const Options) !void {
+        self.crosses_records = self.matchesAcrossRecords(o);
         for (self.regular.items) |item| self.absolute_start = self.absolute_start or regex.hasAbsoluteStart(item.pattern.states);
         for (self.advanced.items) |item| self.absolute_start = self.absolute_start or regex.hasAbsoluteStart(item.pattern.pattern.states);
         if (self.advanced.items.len > 0 or self.direct.items.len + self.regular.items.len < 4) return;
@@ -79,6 +81,15 @@ const Program = struct {
             error.PrefilterTooLarge, error.UnsupportedPrefilter => null,
             else => return err,
         };
+    }
+    fn matchesAcrossRecords(self: *const Program, o: *const Options) bool {
+        if (self.advanced.items.len > 0) return true;
+        const terminator: u6 = if (o.null_data) 0 else 10;
+        for (self.direct.items) |item| if (std.mem.indexOfScalar(u8, item.bytes, terminator) != null) return true;
+        for (self.regular.items) |item| for (item.pattern.states) |state| {
+            if ((state.tag == .consume or state.tag == .repeat_consume) and state.ascii_mask[0] & (@as(u64, 1) << terminator) != 0) return true;
+        };
+        return false;
     }
     fn compile(self: *Program, raw: []const u8, o: *const Options, order: usize) !void {
         // Bare nonempty alternatives are an exact literal union. Keep source
@@ -122,7 +133,7 @@ const Program = struct {
         // preserves its rejection of an unterminated extended-mode comment.
         const grouped = try std.fmt.allocPrint(self.a, "(?:{s})", .{pattern});
         defer self.a.free(grouped);
-        var regular = regex.Pattern.init(self.a, grouped, .{ .insensitive = insensitive, .unicode = o.unicode, .multiline = true, .dotall = o.multiline_dotall, .whole_word = o.word, .whole_line = o.whole_line, .crlf = o.crlf }) catch |err| {
+        var regular = regex.Pattern.init(self.a, grouped, .{ .insensitive = insensitive, .unicode = o.unicode, .multiline = true, .dotall = o.multiline_dotall, .whole_word = o.word, .whole_line = o.whole_line, .crlf = o.crlf, .line_terminator = if (o.null_data and !o.multiline) 0 else '\n' }) catch |err| {
             if (o.engine != .auto) return err;
             var advanced = try @import("pcre2.zig").Pattern.init(self.a, pattern, o, insensitive);
             errdefer advanced.deinit();
@@ -149,8 +160,8 @@ pub const Matcher = struct {
     runners: std.ArrayList(Scratch) = .empty,
     advanced: std.ArrayList(@import("pcre2.zig").Pattern) = .empty,
     literal_capture: [1]?Span = .{null},
+    record_captures: std.ArrayList(?Span) = .empty,
     capture_mode: regex.Runner.CaptureMode = .full,
-    advance_utf8: bool = false,
     const Scratch = struct { vm: regex.Runner, dfa: ?regex.Dfa = null, dfa_allowed: bool = true };
     pub fn init(a: Allocator, o: *const Options) !Matcher {
         return initMode(a, o, .full);
@@ -195,6 +206,7 @@ pub const Matcher = struct {
         return self;
     }
     fn freeScratch(self: *Matcher) void {
+        self.record_captures.deinit(self.a);
         for (self.runners.items) |*runner| {
             runner.vm.deinit();
             if (runner.dfa) |*dfa| dfa.deinit();
@@ -215,7 +227,6 @@ pub const Matcher = struct {
                 self.literal_capture[0] = .{ .start = span.start, .end = span.end };
                 best = .{ .span = self.literal_capture[0].?, .captures = &self.literal_capture, .names = &.{} };
                 best_order = item.order;
-                self.advance_utf8 = false;
             }
         };
         for (self.runners.items, self.program.regular.items) |*runner, *item| {
@@ -227,7 +238,6 @@ pub const Matcher = struct {
             if (found) |match| if (best == null or match.span.start < best.?.span.start or (match.span.start == best.?.span.start and item.order < best_order)) {
                 best = .{ .span = match.span, .captures = match.captures, .names = item.pattern.names };
                 best_order = item.order;
-                self.advance_utf8 = false;
             };
         }
         for (self.advanced.items, self.program.advanced.items) |*runner, item| {
@@ -238,14 +248,70 @@ pub const Matcher = struct {
             if (found) |match| if (best == null or match.span.start < best.?.span.start or (match.span.start == best.?.span.start and item.order < best_order)) {
                 best = .{ .span = match.span, .captures = match.captures, .names = item.pattern.names };
                 best_order = item.order;
-                // The pinned Linux x86_64 and ARM64 PCRE2 references permit
-                // byte-wise empty UTF advancement; the macOS ARM64 reference
-                // advances codepoints. This output policy is separate from
-                // decoding and native JIT execution.
-                self.advance_utf8 = item.pattern.pattern.flags.unicode and @import("builtin").os.tag != .linux;
             };
         }
         return best;
+    }
+    /// One immutable input scan owns its record cursor. Caching the current
+    /// window here avoids rescanning a long record for every dense match, and
+    /// cannot mistake a reused input buffer for an unchanged subject.
+    pub const Subject = struct {
+        matcher: *Matcher,
+        text: []const u8,
+        record_scoped: bool,
+        start: usize = 0,
+        end: usize = 0,
+        terminated: bool = false,
+        selected: bool = false,
+        initialized: bool = false,
+
+        pub fn find(self: *Subject, offset: usize) ?Match {
+            if (!self.record_scoped) return self.matcher.find(self.text, offset);
+            if (offset > self.text.len) return null;
+            var cursor = offset;
+            if (!self.initialized or cursor < self.start or cursor >= self.end) {
+                self.start = if (cursor == self.end and self.initialized) cursor else if (std.mem.lastIndexOfScalar(u8, self.text[0..cursor], 0)) |last| last + 1 else 0;
+                self.initialized = false;
+            }
+            while (self.start < self.text.len) {
+                if (!self.initialized) {
+                    const term = std.mem.indexOfScalarPos(u8, self.text, self.start, 0);
+                    self.terminated = term != null;
+                    self.end = if (term) |at| at + 1 else self.text.len;
+                    // Match selection retains the raw delimiter. Once selected,
+                    // captures/counts enumerate the record without that byte,
+                    // matching the regular engine's record-oriented execution.
+                    const candidate = self.matcher.find(self.text[self.start..self.end], 0);
+                    self.selected = if (candidate) |hit| !self.terminated or hit.span.start < self.end - self.start else false;
+                    self.initialized = true;
+                }
+                const subject_end = self.end - @intFromBool(self.terminated);
+                if (self.selected and cursor <= subject_end) {
+                    if (self.matcher.find(self.text[self.start..subject_end], cursor - self.start)) |found| {
+                        self.matcher.record_captures.resize(self.matcher.a, found.captures.len) catch |err| {
+                            self.matcher.failure = err;
+                            return null;
+                        };
+                        for (found.captures, self.matcher.record_captures.items) |capture, *target| {
+                            target.* = if (capture) |span| .{ .start = self.start + span.start, .end = self.start + span.end } else null;
+                        }
+                        return .{
+                            .span = .{ .start = self.start + found.span.start, .end = self.start + found.span.end },
+                            .captures = self.matcher.record_captures.items,
+                            .names = found.names,
+                        };
+                    }
+                }
+                if (self.matcher.failure != null or self.end == self.text.len) return null;
+                self.start = self.end;
+                cursor = self.start;
+                self.initialized = false;
+            }
+            return null;
+        }
+    };
+    pub fn subject(self: *Matcher, text: []const u8) Subject {
+        return .{ .matcher = self, .text = text, .record_scoped = self.options.multiline and self.options.null_data and !self.multilineUsesMatches() };
     }
     /// Mandatory literals prove absence; they never approximate relevance.
     pub fn canReject(self: *const Matcher, text: []const u8) bool {
@@ -343,6 +409,9 @@ pub const Matcher = struct {
     /// Conservative sum covers nested assertions and subprograms. Admission is
     /// explicit; an accepted pattern never silently loses rendering context.
     pub fn renderContextBytes(self: *const Matcher) !usize {
+        // NUL records are independent regex subjects. Previous-record bytes
+        // must not change anchors or lookbehind during capture rendering.
+        if (self.options.null_data) return 0;
         var bytes: usize = 0;
         for (self.program.advanced.items) |item| if (regex.hasLineAnchors(item.pattern.pattern.states)) {
             bytes = 1;
@@ -357,19 +426,7 @@ pub const Matcher = struct {
         return bytes;
     }
     pub fn multilineUsesMatches(self: *const Matcher) bool {
-        if (self.program.advanced.items.len > 0) return true;
-        const terminator: u6 = if (self.options.null_data) 0 else 10;
-        for (self.program.direct.items) |item| if (std.mem.indexOfScalar(u8, item.bytes, terminator) != null) return true;
-        for (self.program.regular.items) |item| for (item.pattern.states) |state| {
-            if ((state.tag == .consume or state.tag == .repeat_consume) and state.ascii_mask[0] & (@as(u64, 1) << terminator) != 0) return true;
-        };
-        return false;
-    }
-    pub fn joinsMultilineJson(self: *const Matcher) bool {
-        if (self.multilineUsesMatches()) return true;
-        for (self.program.regular.items) |item| if (regex.hasLineAnchors(item.pattern.states)) return true;
-        for (self.program.advanced.items) |item| if (regex.hasLineAnchors(item.pattern.pattern.states)) return true;
-        return false;
+        return self.program.crosses_records;
     }
     pub fn matches(self: *Matcher, text: []const u8) !bool {
         if (self.program.direct.items.len + self.program.regular.items.len + self.program.advanced.items.len == 0) return true;
@@ -405,6 +462,7 @@ pub const Matcher = struct {
     /// Counts retain only the current VM result, even on very dense lines.
     pub const Count = struct { total: usize, terminal_empty: bool = false };
     pub fn count(self: *Matcher, text: []const u8, limit: usize, terminated: bool) !Count {
+        if (limit == 0) return .{ .total = 0 };
         if (limit == std.math.maxInt(usize) and !self.options.word and !self.options.whole_line and self.program.direct.items.len == 1 and self.program.regular.items.len == 0 and self.program.advanced.items.len == 0) {
             const item = self.program.direct.items[0];
             if (item.bytes.len == 1) return .{ .total = regex.literal.countByte(text, item.bytes[0], item.insensitive, self.options.unicode) };
@@ -414,6 +472,15 @@ pub const Matcher = struct {
         var cursor: usize = 0;
         var previous_end: ?usize = null;
         while (self.find(text, cursor)) |hit| {
+            // An unterminated record's EOF can establish selection, but is
+            // not an additional occurrence after an earlier visible match.
+            if (!terminated and hit.span.start == text.len and hit.span.end == text.len) {
+                if (result == 0) {
+                    result = 1;
+                    terminal_empty = true;
+                }
+                break;
+            }
             if (!(hit.span.start == hit.span.end and previous_end != null and previous_end.? == hit.span.end)) {
                 result += 1;
                 terminal_empty = !terminated and hit.span.start == text.len and hit.span.end == text.len;
@@ -426,15 +493,11 @@ pub const Matcher = struct {
         if (self.failure) |err| return err;
         return .{ .total = result, .terminal_empty = terminal_empty };
     }
-    pub fn advance(self: *Matcher, text: []const u8, pos: usize) usize {
-        if (pos >= text.len) return text.len + 1;
-        if (!self.advance_utf8) return pos + 1;
-        // PCRE-style UTF matching advances a codepoint after an empty match;
-        // the default byte search engine deliberately also visits byte offsets.
-        const n = std.unicode.utf8ByteSequenceLength(text[pos]) catch return pos + 1;
-        if (n > text.len - pos) return pos + 1;
-        _ = std.unicode.utf8Decode(text[pos..][0..n]) catch return pos + 1;
-        return pos + n;
+    /// Grep's empty-match iteration is byte based on every platform. Regex
+    /// Unicode decoding remains a separate engine concern; output iteration
+    /// must not change with the host OS or skip replacement positions.
+    pub fn advance(_: *Matcher, text: []const u8, pos: usize) usize {
+        return if (pos >= text.len) text.len + 1 else pos + 1;
     }
     pub fn replacement(a: Allocator, template: []const u8, text: []const u8, m: Match) ![]u8 {
         var out: std.ArrayList(u8) = .empty;
@@ -516,4 +579,26 @@ test "worker clones retain compiled programs after their original matcher is fre
     try std.testing.expect(try worker.matches("a123b"));
     try std.testing.expect(!try worker.matches("a123c"));
     try std.testing.expectEqualStrings("a123b", "a123b"[worker.find("a123b", 0).?.span.start..worker.find("a123b", 0).?.span.end]);
+}
+
+test "record subject cursors preserve source coordinates and isolate reused buffers" {
+    const a = std.testing.allocator;
+    var o = Options{ .multiline = true, .null_data = true };
+    defer o.deinit(a);
+    try o.patterns.append(a, "^([ab])");
+    var m = try Matcher.init(a, &o);
+    defer m.deinit();
+    var bytes = [_]u8{ 'a', 0, 'b', 0 };
+    var subject = m.subject(&bytes);
+    const first = subject.find(0).?;
+    try std.testing.expectEqual(Span{ .start = 0, .end = 1 }, first.span);
+    try std.testing.expectEqual(first.span, first.captures[1].?);
+    const second = subject.find(1).?;
+    try std.testing.expectEqual(Span{ .start = 2, .end = 3 }, second.span);
+    try std.testing.expectEqual(second.span, second.captures[1].?);
+    try std.testing.expect(subject.find(3) == null);
+    bytes[0] = 'c';
+    bytes[1] = 'c';
+    var reused = m.subject(&bytes);
+    try std.testing.expect(reused.find(0) == null);
 }

@@ -8466,9 +8466,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     sql_revision_codec_run.step.dependOn(&sql_revision_codec_audit.step);
     sql_revision_compatibility_step.dependOn(&sql_revision_codec_run.step);
     const artifact_policy_storage_filters = &.{
-        "db execution policy",                                                                "db document extraction manifest inspection and reprocess API",
-        "execution budgets preserve extraction fingerprints",                                 "execution policy preserves ordered semantic identity",
-        "ordered artifact inventory producer definition identity binds every provider field", "ordered artifact inventory direct producers carry unchanged input across unrelated row changes",
+        "db artifact member navigation reads selected logical chunks",
+        "db execution policy",
+        "db document extraction manifest inspection and reprocess API",
+        "execution budgets preserve extraction fingerprints",
+        "execution policy preserves ordered semantic identity",
+        "ordered artifact inventory producer definition identity binds every provider field",
+        "ordered artifact inventory direct producers carry unchanged input across unrelated row changes",
     };
     const artifact_policy_storage_tests = b.addTest(.{
         .root_module = db_test_mod,
