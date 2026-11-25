@@ -1503,7 +1503,23 @@ pub const ScheduledStep = struct {
     publication: Executor.Publication,
     exclusive: bool = false,
 
-    pub fn run(self: ScheduledStep, work: *graph_mod.decoder_work.Prefill) !void {
+    pub fn runTokens(self: ScheduledStep, allocator: std.mem.Allocator, state: *graph_mod.decode_state_runtime.NativeDecodeState, tokens: []const i64, end: usize, final: bool, shared_kv: bool) !?[]f32 {
+        const output = try self.run(.{
+            .allocator = allocator,
+            .decode_state = state,
+            .token_ids = tokens,
+            .seq_len = end,
+            .query_seq_len = tokens.len,
+            .wants_last_logits = final,
+            .allow_shared_kv_prefill = shared_kv,
+        });
+        return output.last_logits;
+    }
+
+    fn run(self: ScheduledStep, request: graph_mod.decoder_work.Prefill) !Output {
+        var pending = request;
+        const work = &pending;
+        errdefer if (work.logits) |logits| work.allocator.free(logits);
         var decode_runtime = BorrowedDecodeStateRuntime.init(work.decode_state);
         const context = decode_runtime.makeDecodeContext(work.seq_len, work.query_seq_len);
         var options = graph_mod.decoder_work.pendingOptions(work.decode_state, work.query_seq_len);
@@ -1513,6 +1529,7 @@ pub const ScheduledStep = struct {
         var driver = Driver{ .step = self, .work = work };
         try @import("../runtime/scheduler/step_wait.zig").run(work.allocator, self.scheduler, self.lease, work, .prefill, self.io, null, &driver);
         if (work.failure) |err| return err;
+        return .{ .last_logits = work.logits, .greedy_token = if (work.greedy_token) |token| @as(usize, token) else null };
     }
 
     const Driver = struct {
@@ -1570,28 +1587,35 @@ pub const PositionedRequest = struct {
             const query = @min(chunk_rows, seq - processed);
             const end = processed + query;
             const final = end == seq;
-            var work = graph_mod.decoder_work.Prefill{ .allocator = self.item.allocator, .decode_state = state, .token_ids = &.{}, .seq_len = end, .query_seq_len = query, .wants_last_logits = final, .wants_greedy = final and wants_greedy, .prepared_prefix = self.prefix };
-            defer if (work.logits) |logits| work.allocator.free(logits);
-            try (ScheduledStep{
+            const output = try (ScheduledStep{
                 .scheduler = scheduler,
                 .lease = lease,
                 .io = io,
                 .execution_control = self.control,
                 .executor = &self.executor,
                 .publication = self.publication,
-            }).run(&work);
+            }).run(.{
+                .allocator = self.item.allocator,
+                .decode_state = state,
+                .token_ids = &.{},
+                .seq_len = end,
+                .query_seq_len = query,
+                .wants_last_logits = final,
+                .wants_greedy = final and wants_greedy,
+                .prepared_prefix = self.prefix,
+            });
+            var transfer_output = false;
+            defer if (!transfer_output) if (output.last_logits) |logits| self.item.allocator.free(logits);
             // The forward reserved exactly this prefix before mutating its KV
             // and recurrent histories. Never restart a partially consumed prefix.
             if (state.total_tokens != end) return error.InvalidBatchDecodeState;
             scheduler.notePrefillProgress(lease, end, seq);
             if (final) {
-                if (work.greedy_token) |token| {
-                    if (!wants_greedy or work.logits != null or token >= self.item.model.vocab_size) return error.InvalidBatchDecodeState;
-                    return .{ .greedy_token = token };
-                }
-                const logits = work.logits orelse return error.InvalidBatchDecodeState;
-                work.logits = null;
-                return .{ .last_logits = logits };
+                if (output.greedy_token) |token| {
+                    if (!wants_greedy or output.last_logits != null or token >= self.item.model.vocab_size) return error.InvalidBatchDecodeState;
+                } else if (output.last_logits == null) return error.InvalidBatchDecodeState;
+                transfer_output = true;
+                return output;
             }
             processed = end;
         }

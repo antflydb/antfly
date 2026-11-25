@@ -4940,7 +4940,7 @@ pub const NativeGenerationPipeline = struct {
                     if (self.scheduler_lease) |lease| {
                         if (self.io) |io| {
                             if (route.scheduler_eligible) {
-                                prefill_last_logits = self.runScheduledPrefillBatch(scheduler, lease, io, decode_state, chunk, total_chunk_end, chunk.len, total_chunk_end == seq_len, allow_shared_kv_prefill) catch |err| {
+                                prefill_last_logits = self.runScheduledPrefillBatch(scheduler, lease, io, decode_state, chunk, total_chunk_end, total_chunk_end == seq_len, allow_shared_kv_prefill) catch |err| {
                                     if (try cursor.retryMemoryBudgetExceeded(attempt, err)) continue;
                                     return err;
                                 };
@@ -4997,7 +4997,7 @@ pub const NativeGenerationPipeline = struct {
                 const scheduler = self.scheduler orelse break :scheduled false;
                 const lease = self.scheduler_lease orelse break :scheduled false;
                 const io = self.io orelse break :scheduled false;
-                prefill_last_logits = try self.runScheduledPrefillBatch(scheduler, lease, io, decode_state, prompt_ids, seq_len, seq_len, true, allow_shared_kv_prefill);
+                prefill_last_logits = try self.runScheduledPrefillBatch(scheduler, lease, io, decode_state, prompt_ids, seq_len, true, allow_shared_kv_prefill);
                 scheduler.notePrefillProgress(lease, seq_len, seq_len);
                 break :scheduled true;
             };
@@ -8178,24 +8178,13 @@ pub const NativeGenerationPipeline = struct {
         decode_state: *NativeDecodeState,
         token_ids: []const i64,
         seq_len: usize,
-        query_seq_len: usize,
         wants_last_logits: bool,
         allow_shared_kv_prefill: bool,
     ) !?[]f32 {
-        var work = PendingPrefillBatchWork{
-            .allocator = self.allocator,
-            .decode_state = decode_state,
-            .token_ids = token_ids,
-            .seq_len = seq_len,
-            .query_seq_len = query_seq_len,
-            .wants_last_logits = wants_last_logits,
-            .allow_shared_kv_prefill = allow_shared_kv_prefill,
-        };
-        defer if (work.logits) |logits| work.allocator.free(logits);
         var executor = self.stepExecutor();
         defer self.mergeStepExecutor(&executor);
         var publication = StepPublication{ .scheduler = scheduler, .lease = lease, .vocab_size = self.gpt_config.vocab_size };
-        try (decoder_prefill.ScheduledStep{
+        return (decoder_prefill.ScheduledStep{
             .scheduler = scheduler,
             .lease = lease,
             .io = io,
@@ -8204,11 +8193,7 @@ pub const NativeGenerationPipeline = struct {
             .publication = publication.interface(),
             // CUDA token prefill uses singleton scheduling.
             .exclusive = self.execution_lock != null,
-        }).run(&work);
-
-        const logits = work.logits;
-        work.logits = null;
-        return logits;
+        }).runTokens(self.allocator, decode_state, token_ids, seq_len, wants_last_logits, allow_shared_kv_prefill);
     }
 
     /// Queue a resident visual prefix alongside ordinary decode work. The
