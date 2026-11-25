@@ -893,8 +893,10 @@ released-checkpoint suite, including legacy managed manifest repair,
 passed all 81 tests. The opt-in Metal HTTP route correctly identified
 80 by 80 red and blue PNGs in separate requests. Warm responses took
 1.64–1.65 s. Streaming returned `Blue`, a stop reason, token usage, and
-`[DONE]` at 1.64 s. The matched reference image performance gate remains
-open.
+`[DONE]` at 1.64 s. The same 33-token color prompts and 80 by 80 PNGs
+returned `Red` and `Blue` on llama.cpp b12706 using its NVFP4 GGUF and
+BF16 projector. Its six warm completions took 0.405 s median with prompt
+reuse disabled.
 
 The opt-in `cache_dtype: "int4"` format stores four-bit global K/V with one
 FP16 scale per 128-element head. Sliding K/V and convolution history stay
@@ -906,7 +908,12 @@ a synthetic million-token sequence. All 83 tests passed. Running the full
 model through a million-token prompt and measuring accuracy and latency
 at that length remain open. The HTTP option returned the expected answers
 for a 28-token text prompt, a 33-token image prompt, and a mixed 6,404-token
-lookup request. The last request returned `271` in 220.80 s.
+lookup request. The last request returned `271` in 220.80 s. llama.cpp's
+all-Metal full-window configuration with Q4_0 K/V ran out of GPU memory at
+first decode with prompt batches of 64 and four. The four-row run reported
+29,928 MiB of GPU buffers against a 28,753 MiB recommended working set.
+This compares the tested memory configurations. A full-length benchmark
+still needs completed prompts on both engines.
 
 The 16-token compressed probe selected the same next token as BF16, with
 a maximum logit deviation of 1.89. In a separate run, experimental native
