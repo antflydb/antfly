@@ -27489,7 +27489,10 @@ pub const IndexManager = struct {
         const output_stats = textMergeResultOutputStats(result);
         var scope_changed = false;
         const applied = if (result.prepared_segments.len == 0 and result.segments.len == 0) blk: {
-            break :blk try entry.persistent.removeSegmentsIfActive(old_ids);
+            // Stale like a refused replacement: its inputs left the tip.
+            const removed = try entry.persistent.removeSegmentsIfActive(old_ids);
+            if (!removed) scope_changed = true;
+            break :blk removed;
         } else if (result.prepared_segments.len > 0) blk: {
             const prepared_segments = result.prepared_segments;
             result.prepared_segments = &.{};
@@ -27536,17 +27539,23 @@ pub const IndexManager = struct {
                 },
             };
         };
+        // Another process committed under this index (most often its own
+        // merge of these inputs). Planned again from this view, the merge
+        // would fail the same way while a producer waits for it: take the
+        // index as committed first. The index is held here, by this merge or
+        // by the producer lending it. While this process's own inline
+        // installs are pending the refresh is refused; the view advances
+        // when they land, and their install schedules the next merge
+        // (`noteInlineTextPublicationSegments`), so none is scheduled here.
+        var replan = true;
         if (scope_changed) {
-            // Another process committed under this index (most often its
-            // own merge of these inputs). Planned again from this view, the
-            // merge would fail the same way while a producer waits for it:
-            // take the index as committed first. The index is held here, by
-            // this merge or by the producer lending it. Pending inline
-            // installs refuse; the next pass retries.
             write_stage_profile.add(.merge_scope_changed, 0);
             entry.persistent.refreshFromTip() catch |err| switch (err) {
-                error.UnsupportedRefresh => {},
-                else => logTextMergeFailure("refresh", task.index_name, err),
+                error.UnsupportedRefresh => replan = false,
+                else => {
+                    logTextMergeFailure("refresh", task.index_name, err);
+                    replan = false;
+                },
             };
         }
         entry.merge_delta_mutex.unlock(entry.io);
@@ -27556,8 +27565,10 @@ pub const IndexManager = struct {
 
         if (applied and !try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy())) {
             TextMergeScheduler.noteComplete(entry);
-        } else {
+        } else if (replan) {
             TextMergeScheduler.schedule(entry);
+        } else {
+            TextMergeScheduler.noteComplete(entry);
         }
         if (applied) {
             self.text_merge_scheduler.noteAppliedMerge(
@@ -27687,6 +27698,7 @@ pub const IndexManager = struct {
             infos.shrinkRetainingCapacity(kept);
             if (infos.items.len < 2) return null;
         }
+        if (level0_plan) |picked| write_stage_profile.count(.merge_plan_level0, picked.len);
         const planned = level0_plan orelse (try policy.plan(self.alloc, infos.items)) orelse blk: {
             // The tiered policy found nothing to merge (for example every
             // eligible segment floors to the same effective size under
@@ -27708,6 +27720,7 @@ pub const IndexManager = struct {
         };
         defer self.alloc.free(planned);
         if (planned.len < 2) return null;
+        if (level0_plan == null) write_stage_profile.count(.merge_plan_tiered, planned.len);
 
         // The tier policy optimizes write amplification by selecting a wider
         // group, but that group may exceed the merge-buffer slice even though

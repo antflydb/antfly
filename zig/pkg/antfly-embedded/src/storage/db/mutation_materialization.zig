@@ -3457,20 +3457,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // A text publication carries no state from an earlier queued
             // member: its copies and deletes are decided at the tip.
             fn validate(_: *anyopaque) anyerror!void {}
-            /// Rolled back out of its group: its resolver's decisions never
-            /// committed.
-            fn reject(ptr: *anyopaque) void {
-                const self: *InlineTextPublication = @ptrCast(@alignCast(ptr));
-                self.resolution.revert();
-            }
+            fn reject(_: *anyopaque) void {}
 
             /// The group leader, once this member's commit is durable.
             fn complete(ptr: *anyopaque, outcome: anyerror!u64) void {
                 const self: *InlineTextPublication = @ptrCast(@alignCast(ptr));
-                _ = outcome catch {
-                    self.resolution.revert();
-                    return;
-                };
+                _ = outcome catch return;
                 // The writer's own `index_locked` is not touched here: it is
                 // false once prepared, and only the writer's thread sets it.
                 // Never wait for the guard: this leader may hold it itself,
@@ -3515,10 +3507,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const mirror_span = write_stage_profile.begin(.text_install_mirror);
                 const mutations = try self.mutationsAlloc(self.alloc);
                 defer self.alloc.free(mutations);
-                try self.entry.persistent.applyExternallyCommittedMutationsIfNativeCatalog(mutations);
                 // The decisions themselves, not a read of the file: keys a
-                // later commit decided since keep that commit's value.
-                try self.resolution.applyToMirror();
+                // later committed decision set since keep its value.
+                try self.resolution.applyToMirror(mutations);
                 mirror_span.end();
                 const segment_span = write_stage_profile.begin(.text_install_segment);
                 defer segment_span.end();
@@ -3539,7 +3530,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             /// the caller fell back, or the primary write failed before
             /// committing): nothing becomes visible.
             pub fn abort(self: *InlineTextPublication) void {
-                if (!self.completed) self.resolution.revert();
                 for (self.segments[0..self.segment_count]) |*seg| seg.abort(self.alloc);
                 self.segment_count = 0;
                 self.finish();
@@ -3623,7 +3613,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (runtime.config.enabled and cap != 0) {
                         const snap = precheck_entry.persistent.acquireSnapshot();
                         defer snap.release();
-                        if (snap.segments.len >= cap) return error.InlineTextPublicationUnsupported;
+                        write_stage_profile.count(.inline_segments_seen, snap.segments.len);
+                        if (snap.segments.len >= cap) {
+                            write_stage_profile.count(.inline_refused_cap, 1);
+                            return error.InlineTextPublicationUnsupported;
+                        }
                     }
                 }
             }
@@ -3671,7 +3665,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const estimate = prepared_publication.estimate();
             var merge_permit = if (merge_runtime) |runtime|
-                try runtime.acquireProducerPermitAssumeApply(index_ref.name, estimate.segment_count, estimate.byte_count)
+                runtime.acquireProducerPermitAssumeApply(index_ref.name, estimate.segment_count, estimate.byte_count) catch |err| {
+                    write_stage_profile.count(.inline_refused_permit, 1);
+                    return err;
+                }
             else
                 null;
             errdefer if (merge_permit) |*permit| permit.release();

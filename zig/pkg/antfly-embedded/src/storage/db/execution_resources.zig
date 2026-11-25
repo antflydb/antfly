@@ -1110,7 +1110,9 @@ pub const WriterLaneReleaseHook = struct {
     /// Takes the lane back after an indexed wait. False when it came back on
     /// a newer runtime than the write ran on, which `allow_new_runtime`
     /// permits only for a write with nothing left to do on its own runtime.
-    resume_after_indexed_wait: ?*const fn (ptr: *anyopaque, allow_new_runtime: bool) anyerror!bool = null,
+    /// `committed_sequence`: the write's own commit, for completing it on a
+    /// replacement runtime.
+    resume_after_indexed_wait: ?*const fn (ptr: *anyopaque, allow_new_runtime: bool, committed_sequence: u64) anyerror!bool = null,
 };
 
 /// One synchronous prepared attempt's irreversible disposition. It is separate

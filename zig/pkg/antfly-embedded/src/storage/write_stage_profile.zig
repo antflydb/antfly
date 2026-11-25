@@ -61,6 +61,17 @@ pub const Stage = enum(u8) {
     /// A merge refused at the tip (`IndexScopeChanged`) and the index
     /// refreshed from it before planning again.
     merge_scope_changed,
+    /// Diagnostics (counts; the "time" is a quantity, in thousandths):
+    /// an inline full-text write refused at the level-0 cap,
+    inline_refused_cap,
+    /// refused by merge producer admission,
+    inline_refused_permit,
+    /// a merge planned from level-0 records (value: inputs),
+    merge_plan_level0,
+    /// a tiered or forced merge (value: inputs).
+    merge_plan_tiered,
+    /// segments an inline full-text write found at prepare (value: count).
+    inline_segments_seen,
     /// Within `text_segment_build` (from `BuildTextProfile`): tokenizing
     /// and accumulating terms.
     text_build_analyze,
@@ -118,6 +129,11 @@ pub fn add(stage: Stage, ns: u64) void {
     const i = @backingInt(stage);
     _ = total_ns[i].fetchAdd(ns, .monotonic);
     _ = counts[i].fetchAdd(1, .monotonic);
+}
+
+/// Records a count-like `value` for a diagnostic stage.
+pub fn count(stage: Stage, value: u64) void {
+    add(stage, value *| 1000);
 }
 
 pub fn begin(stage: Stage) Span {

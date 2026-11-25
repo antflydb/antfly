@@ -839,6 +839,8 @@ pub const HandleGuard = struct {
     /// The runtime a resumed write continued on, when it was not the one it
     /// was admitted on (`resumeWriterLaneAfterIndexedWait`).
     resumed_root: ?*Handle = null,
+    /// The resumed write's own commit (`resumeWriterLaneAfterIndexedWait`).
+    committed_sequence: u64 = 0,
     /// Busy-wait budget left for this export call. The busy timeout bounds
     /// total admission waiting across every re-entry of one call (for
     /// example after inference), not each admission separately. Null means
@@ -949,8 +951,9 @@ pub const HandleGuard = struct {
         return true;
     }
 
-    fn resumeWriterLaneAfterIndexedWait(self: *HandleGuard, allow_new_runtime: bool) !bool {
+    fn resumeWriterLaneAfterIndexedWait(self: *HandleGuard, allow_new_runtime: bool, committed_sequence: u64) !bool {
         std.debug.assert(self.lane_managed and self.writer_lane_released);
+        if (committed_sequence != 0) self.committed_sequence = committed_sequence;
         const connection = self.connection.?;
         const io = handleLockIo();
         connection.mutex.lockUncancelable(io);
@@ -974,17 +977,17 @@ pub const HandleGuard = struct {
         return same_runtime;
     }
 
-    /// A committed write's visibility work was owed to the runtime it was
+    /// A committed write's remaining work was owed to the runtime it was
     /// admitted on, which was replaced while it waited
     /// (`EnrichmentSourceChanged` from the resume). The replacement opened
     /// after the outgoing store drained, so it already holds this commit:
-    /// finish the batch's sync level there instead of reporting the
-    /// committed write as stalled.
-    pub fn finishCommittedOnCurrentRuntime(self: *HandleGuard, sync_level: db_mod.types.SyncLevel) !void {
-        if (!self.lane_managed or !self.writer_lane_released) return error.EnrichmentSourceChanged;
-        _ = try self.resumeWriterLaneAfterIndexedWait(true);
+    /// it finishes the batch (its sync level at its own sequence, and its
+    /// graph endpoint cleanup) instead of the call reporting a stall.
+    pub fn finishCommittedOnCurrentRuntime(self: *HandleGuard, req: db_mod.types.BatchRequest) !void {
+        if (!self.lane_managed or !self.writer_lane_released or self.committed_sequence == 0) return error.EnrichmentSourceChanged;
+        _ = try self.resumeWriterLaneAfterIndexedWait(true, 0);
         const root = self.resumed_root orelse self.lane_pinned_root orelse return error.EnrichmentSourceChanged;
-        try root.database().waitForCurrentSyncLevelWithCancellation(sync_level, .none);
+        try root.database().finishBatchOnReplacementRuntime(req, self.committed_sequence);
     }
 
     pub fn releaseWriterLaneBeforeWait(self: *HandleGuard) void {
@@ -1253,9 +1256,9 @@ pub fn writerLaneHookFromGuard(guard: *HandleGuard) @import("../storage/db/execu
             }
         }.run,
         .resume_after_indexed_wait = struct {
-            fn run(ptr: *anyopaque, allow_new_runtime: bool) anyerror!bool {
+            fn run(ptr: *anyopaque, allow_new_runtime: bool, committed_sequence: u64) anyerror!bool {
                 const typed: *HandleGuard = @ptrCast(@alignCast(ptr));
-                return typed.resumeWriterLaneAfterIndexedWait(allow_new_runtime);
+                return typed.resumeWriterLaneAfterIndexedWait(allow_new_runtime, committed_sequence);
             }
         }.run,
     };
@@ -1726,9 +1729,9 @@ pub fn trackedBatchWithWriterLaneHook(
 /// Whether a batch that failed after its primary write committed, because
 /// its runtime was replaced while it waited, reached its sync level on the
 /// replacement. Table handles keep the stalled report.
-fn committedOnReplacedRuntime(guard: *HandleGuard, handle: *Handle, err: anyerror, primary_committed: bool, sync_level: db_mod.types.SyncLevel) bool {
+fn committedOnReplacedRuntime(guard: *HandleGuard, handle: *Handle, err: anyerror, primary_committed: bool, req: db_mod.types.BatchRequest) bool {
     if (!primary_committed or err != error.EnrichmentSourceChanged or handle.selected_db != null) return false;
-    guard.finishCommittedOnCurrentRuntime(sync_level) catch return false;
+    guard.finishCommittedOnCurrentRuntime(req) catch return false;
     return true;
 }
 
@@ -5441,7 +5444,7 @@ pub fn antfly_db_batch_json(
     var primary_committed = false;
     // A table handle commits to its table's database, which holds the marker.
     trackedBatchWithWriterLaneHook(handle.database(), db_mod.types.fromPublicMutation(owned.req), &primary_committed, handle.selected_table_name, writerLaneHookFromGuard(&guard)) catch |err| {
-        if (!committedOnReplacedRuntime(&guard, handle, err, primary_committed, db_mod.types.fromPublicMutation(owned.req).sync_level)) return batchFailureCode(err, primary_committed);
+        if (!committedOnReplacedRuntime(&guard, handle, err, primary_committed, db_mod.types.fromPublicMutation(owned.req))) return batchFailureCode(err, primary_committed);
     };
     // Committed: a response failure must not read as a failed batch.
     const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch
@@ -5485,7 +5488,7 @@ pub fn antfly_db_batch_wire(
     var primary_committed = false;
     const req = decoded.asRequest();
     trackedBatchWithWriterLaneHook(handle.database(), db_mod.types.fromPublicMutation(req), &primary_committed, handle.selected_table_name, writerLaneHookFromGuard(&guard)) catch |err| {
-        if (!committedOnReplacedRuntime(&guard, handle, err, primary_committed, db_mod.types.fromPublicMutation(req).sync_level)) return batchFailureCode(err, primary_committed);
+        if (!committedOnReplacedRuntime(&guard, handle, err, primary_committed, db_mod.types.fromPublicMutation(req))) return batchFailureCode(err, primary_committed);
     };
     const response = batch_api.encodeBatchResponse(std.heap.c_allocator, .{
         .inserted = @as(u32, @intCast(decoded.writes.len)),

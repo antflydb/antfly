@@ -189,13 +189,13 @@ pub const Resolver = struct {
     arena: std.heap.ArenaAllocator,
     outputs: std.ArrayListUnmanaged(Mutation) = .empty,
     /// The mirror this resolver's decisions land in, when installs of them
-    /// can run out of commit order: each run takes the next epoch there
-    /// (`Backend.noteResolved`), so a late install never overwrites a key a
-    /// later commit decided.
-    epoch_backend: ?*Backend = null,
-    epoch: u64 = 0,
-    /// Per output, the key's epoch before this run (`Backend.revertResolved`).
-    previous_epochs: std.ArrayListUnmanaged(u64) = .empty,
+    /// can run out of commit order. Each run takes the next decision stamp
+    /// there: resolvers run inside their commits, one group and member at a
+    /// time, so among committed decisions stamp order is commit order. A run
+    /// whose commit fails leaves no trace; only installs record stamps
+    /// (`Backend.applyDecided`).
+    stamp_backend: ?*Backend = null,
+    stamp: u64 = 0,
 
     pub fn init(allocator: Allocator, ptr: *anyopaque, resolve: *const fn (ptr: *anyopaque, tip: TipReader, resolver: *Resolver) anyerror!void) Resolver {
         return .{ .ptr = ptr, .resolve = resolve, .arena = .init(allocator) };
@@ -208,12 +208,10 @@ pub const Resolver = struct {
 
     /// Runs `resolve` from a clean output list.
     pub fn run(self: *Resolver, tip: TipReader) !void {
-        if (self.epoch_backend) |backend| backend.revertResolved(self);
         self.outputs = .empty;
-        self.previous_epochs = .empty;
         _ = self.arena.reset(.retain_capacity);
         try self.resolve(self.ptr, tip, self);
-        if (self.epoch_backend) |backend| try backend.noteResolved(self);
+        if (self.stamp_backend) |backend| self.stamp = backend.decision_stamps.fetchAdd(1, .monotonic) + 1;
     }
 
     pub fn put(self: *Resolver, namespace: ?[]const u8, key: []const u8, value: []const u8) !void {
@@ -409,11 +407,14 @@ pub const Backend = struct {
     /// of reading stale state or computing writes from it. Reopening the
     /// index rebuilds the mirror from the committed catalog.
     mirror_invalid: std.atomic.Value(bool) = .init(false),
-    /// Guarded by `mutex`: the last resolver run's epoch per output key
-    /// (`noteResolved`). Resolvers write few keys (dead-set buckets,
-    /// counters), so this stays small.
-    resolution_epoch: u64 = 0,
-    resolved_epochs: std.StringHashMapUnmanaged(u64) = .empty,
+    /// The next `Resolver.stamp` for this mirror's decisions.
+    decision_stamps: std.atomic.Value(u64) = .init(0),
+    /// Guarded by `mutex`: per key, the stamp of the decision whose value the
+    /// mirror holds, kept only while an older install may still arrive.
+    applied_stamps: std.StringHashMapUnmanaged(u64) = .empty,
+    /// Installs not yet applied (the owning index's pending level-0
+    /// publications); stamps are recorded only while nonzero.
+    pending_decisions: std.atomic.Value(u32) = .init(0),
     /// Ride-along commits (`NamespaceTxn.commit()` with `durable = false`)
     /// staged via `sink.submitDeferred` but not yet waited on (design doc
     /// §3.2a: background work rides along and is crash-recomputable, but a
@@ -561,9 +562,8 @@ pub const Backend = struct {
         self.pending_ride_along.deinit(self.allocator);
         lockBackend(self);
         releaseState(self.allocator, self.state);
-        var epochs = self.resolved_epochs.keyIterator();
-        while (epochs.next()) |key| self.allocator.free(key.*);
-        self.resolved_epochs.deinit(self.allocator);
+        self.clearStampsLocked();
+        self.applied_stamps.deinit(self.allocator);
         self.mutex.unlock();
         self.allocator.free(self.scope);
         if (self.writer_view_parent) |parent| {
@@ -884,90 +884,93 @@ pub const Backend = struct {
         self.mirror_invalid.store(true, .release);
     }
 
-    /// Resolvers run inside their commits, in commit order. Records that
-    /// `resolver` decided each of its output keys last (the next epoch).
-    pub fn noteResolved(self: *Backend, resolver: *Resolver) !void {
-        const a = resolver.arena.allocator();
-        try resolver.previous_epochs.ensureTotalCapacity(a, resolver.outputs.items.len);
-        lockBackend(self);
-        defer self.mutex.unlock();
-        self.resolution_epoch += 1;
-        resolver.epoch = self.resolution_epoch;
-        for (resolver.outputs.items) |m| {
-            if (!epochTracked(m.namespace)) {
-                resolver.previous_epochs.appendAssumeCapacity(0);
-                continue;
-            }
-            const key = try epochKeyAlloc(a, m.namespace, m.key);
-            const entry = try self.resolved_epochs.getOrPut(self.allocator, key);
-            if (!entry.found_existing) entry.key_ptr.* = try self.allocator.dupe(u8, key);
-            resolver.previous_epochs.appendAssumeCapacity(if (entry.found_existing) entry.value_ptr.* else 0);
-            entry.value_ptr.* = resolver.epoch;
-        }
-    }
-
-    /// Another process decided `mutations` after every local commit still
-    /// waiting to install: they take a new epoch, so those installs keep them.
-    pub fn noteExternallyDecided(self: *Backend, mutations: []const Mutation) !void {
+    /// Applies mutations a committed decision (`stamp`, see
+    /// `Resolver.stamp`) made, skipping keys whose mirror value came from a
+    /// later decision: installs can complete out of commit order. Stamps are
+    /// recorded only while `decisionsPending` (an older install may still
+    /// come), and every caller holds the index's apply guard, so the check
+    /// and the publication below are one step for this mirror.
+    pub fn applyDecided(self: *Backend, mutations: []const Mutation, stamp: u64) !void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        lockBackend(self);
-        defer self.mutex.unlock();
-        if (self.resolved_epochs.count() == 0) return;
-        self.resolution_epoch += 1;
-        for (mutations) |m| {
-            if (!epochTracked(m.namespace)) continue;
-            const key = try epochKeyAlloc(arena.allocator(), m.namespace, m.key);
-            if (self.resolved_epochs.getPtr(key)) |value| value.* = self.resolution_epoch;
-        }
-    }
-
-    /// `resolver`'s commit did not happen: its keys go back to the epochs
-    /// they had, unless a later run decided them since.
-    pub fn revertResolved(self: *Backend, resolver: *Resolver) void {
-        if (resolver.epoch == 0) return;
-        lockBackend(self);
-        defer self.mutex.unlock();
-        for (resolver.outputs.items, resolver.previous_epochs.items) |m, previous| {
-            if (!epochTracked(m.namespace)) continue;
-            const key = epochKeyAlloc(resolver.arena.allocator(), m.namespace, m.key) catch {
-                // Untracked from here on: every later install applies.
-                resolver.epoch = 0;
-                return;
-            };
-            const value = self.resolved_epochs.getPtr(key) orelse continue;
-            if (value.* == resolver.epoch) value.* = previous;
-        }
-        resolver.epoch = 0;
-    }
-
-    /// Whether `m` from the run at `epoch` is still its key's latest
-    /// decision. Untracked runs (epoch 0) always apply.
-    fn latestResolvedLocked(self: *const Backend, m: Mutation, epoch: u64) bool {
-        if (epoch == 0 or !epochTracked(m.namespace)) return true;
-        var buffer: [512]u8 = undefined;
-        var fba = std.heap.FixedBufferAllocator.init(&buffer);
-        const key = epochKeyAlloc(fba.allocator(), m.namespace, m.key) catch return true;
-        return (self.resolved_epochs.get(key) orelse return true) == epoch;
-    }
-
-    /// Applies `resolver`'s committed decisions to the mirror, skipping keys
-    /// a later commit has decided since: installs may complete out of
-    /// commit order, and each key keeps the latest commit's value.
-    pub fn applyCommittedResolution(self: *Backend, resolver: *const Resolver) !void {
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
+        const a = arena.allocator();
         var latest = std.ArrayListUnmanaged(Mutation).empty;
+        var keys = std.ArrayListUnmanaged([]const u8).empty;
+        const record = stamp != 0 and self.decisionsPending();
         {
             lockBackend(self);
             defer self.mutex.unlock();
-            for (resolver.outputs.items) |m| {
+            for (mutations) |m| {
                 if ((self.tipReads() and isTipNamespace(m.namespace)) or isStagedOnly(m.namespace)) continue;
-                if (!self.latestResolvedLocked(m, resolver.epoch)) continue;
-                try latest.append(arena.allocator(), m);
+                if (stamp != 0 and epochTracked(m.namespace)) {
+                    const key = try epochKeyAlloc(a, m.namespace, m.key);
+                    if ((self.applied_stamps.get(key) orelse 0) > stamp) continue;
+                    if (record) try keys.append(a, key);
+                }
+                try latest.append(a, m);
             }
         }
         try self.applyExternallyCommittedMutations(latest.items);
+        if (keys.items.len != 0) try self.recordStamps(keys.items, stamp);
+    }
+
+    /// Whether mutations from a decision at `stamp` may overwrite `m`'s key.
+    fn decidedLatestLocked(self: *const Backend, m: Mutation, stamp: u64) bool {
+        if (stamp == 0 or !epochTracked(m.namespace)) return true;
+        var buffer: [512]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&buffer);
+        const key = epochKeyAlloc(fba.allocator(), m.namespace, m.key) catch return true;
+        return (self.applied_stamps.get(key) orelse 0) <= stamp;
+    }
+
+    /// Owned keys and capacity are allocated before the map changes, so a
+    /// failure leaves it as it was.
+    fn recordStamps(self: *Backend, keys: []const []const u8, stamp: u64) !void {
+        const owned = try self.allocator.alloc([]u8, keys.len);
+        defer self.allocator.free(owned);
+        var made: usize = 0;
+        errdefer for (owned[0..made]) |key| self.allocator.free(key);
+        for (keys, owned) |key, *slot| {
+            slot.* = try self.allocator.dupe(u8, key);
+            made += 1;
+        }
+        lockBackend(self);
+        defer self.mutex.unlock();
+        try self.applied_stamps.ensureUnusedCapacity(self.allocator, @intCast(keys.len));
+        for (owned) |key| {
+            const entry = self.applied_stamps.getOrPutAssumeCapacity(key);
+            if (entry.found_existing) self.allocator.free(key) else entry.key_ptr.* = key;
+            entry.value_ptr.* = @max(entry.value_ptr.*, stamp);
+        }
+        made = 0;
+    }
+
+    /// No install can still be older than a recorded decision: drop them.
+    pub fn forgetDecisions(self: *Backend) void {
+        lockBackend(self);
+        defer self.mutex.unlock();
+        self.clearStampsLocked();
+    }
+
+    fn clearStampsLocked(self: *Backend) void {
+        var keys = self.applied_stamps.keyIterator();
+        while (keys.next()) |key| self.allocator.free(key.*);
+        self.applied_stamps.clearRetainingCapacity();
+    }
+
+    fn decisionsPending(self: *const Backend) bool {
+        return self.pending_decisions.load(.acquire) != 0;
+    }
+
+    /// An install of decisions not yet applied is now pending.
+    pub fn beginPendingDecision(self: *Backend) void {
+        _ = self.pending_decisions.fetchAdd(1, .acq_rel);
+    }
+
+    /// One pending install landed or was dropped; after the last, no older
+    /// install can arrive and the recorded stamps go.
+    pub fn finishPendingDecision(self: *Backend) void {
+        if (self.pending_decisions.fetchSub(1, .acq_rel) == 1) self.forgetDecisions();
     }
 
     fn epochTracked(namespace: ?[]const u8) bool {
@@ -1208,14 +1211,7 @@ pub const Backend = struct {
                     const pending = try self.backend.sink.submitDeferred.?(self.backend.sink.ptr, self.backend.scope, self.pending.items);
                     try self.backend.enqueuePendingRideAlong(pending);
                 } else {
-                    self.backend.sink.submit(self.backend.sink.ptr, self.backend.scope, self.pending.items, self.durable) catch |err| {
-                        // Its resolvers' decisions never committed.
-                        for (self.pending.items) |m| if (isResolution(m.namespace)) {
-                            const resolver = resolverOf(m) catch continue;
-                            if (resolver.epoch_backend) |backend| backend.revertResolved(resolver);
-                        };
-                        return err;
-                    };
+                    try self.backend.sink.submit(self.backend.sink.ptr, self.backend.scope, self.pending.items, self.durable);
                     // Opportunistic, free drain: this durable commit just
                     // led (or joined) a group-commit that -- being a
                     // foreground/durable group -- already swept up every
@@ -1272,13 +1268,19 @@ pub const Backend = struct {
         }
 
         fn mirrorResolved(self: *NamespaceTxn, resolver: *Resolver) !void {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            var keys = std.ArrayListUnmanaged([]const u8).empty;
+            const record = resolver.stamp_backend != null and resolver.stamp != 0 and self.backend.decisionsPending();
+            defer if (keys.items.len != 0) self.backend.recordStamps(keys.items, resolver.stamp) catch self.backend.invalidateMirror();
             for (resolver.outputs.items) |m| {
                 if ((self.backend.tipReads() and isTipNamespace(m.namespace)) or isStagedOnly(m.namespace)) continue;
-                if (resolver.epoch_backend != null) {
+                if (resolver.stamp_backend != null) {
                     lockBackend(self.backend);
-                    const latest = self.backend.latestResolvedLocked(m, resolver.epoch);
+                    const latest = self.backend.decidedLatestLocked(m, resolver.stamp);
                     self.backend.mutex.unlock();
                     if (!latest) continue;
+                    if (record and epochTracked(m.namespace)) try keys.append(arena.allocator(), try epochKeyAlloc(arena.allocator(), m.namespace, m.key));
                 }
                 if (self.read_since_write) try self.borrowed_trees.ensureUnusedCapacity(self.allocator, 1);
                 const namespace: backend_types.Namespace = .{ .name = m.namespace };
