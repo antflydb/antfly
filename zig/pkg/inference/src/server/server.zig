@@ -17277,17 +17277,21 @@ pub const Node = struct {
         defer ctx.allocator.free(model_path);
         const manifest_started: ?i96 = if (admission_started != null) std.Io.Clock.awake.now(ctx.io).nanoseconds else null;
         // Reuse immutable warm metadata without parsing GGUF tokenizer arrays
-        // per request. Explicit eager CUDA lookup uses execution's backend and
-        // load-policy keys; cold and compiled requests retain artifact preflight.
-        const cached_manifest = if (body.backend == null)
-            self.model_manager.copyCachedGenerationManifestWithControl(ctx.allocator, model_path, self.bindModelSelection(model_path_selection, execution_control)) catch |err|
-                return modelLoadFailureResponse(ctx, err)
-        else if (body.backend == .cuda and body.mode == null and body.compiled_target == null)
-            self.model_manager.copyCachedGenerationManifestForBackendWithControl(ctx.allocator, model_path, .cuda, self.bindModelSelection(model_path_selection, execution_control)) catch |err|
-                return modelLoadFailureResponse(ctx, err)
-        else
-            null;
-        var admission_manifest = cached_manifest orelse self.loadBoundManifest(ctx.allocator, model_path, false, self.bindModelSelection(model_path_selection, execution_control)) catch |err|
+        // per request. Explicit placement uses execution's provider policy.
+        // Cold and explicitly compiled requests retain artifact preflight.
+        const manifest_control = self.bindModelSelection(model_path_selection, execution_control);
+        const cached_manifest = (if (body.backend) |backend| blk: {
+            if (body.mode != null or body.compiled_target != null) break :blk null;
+            const placement: backends_mod.BackendType = switch (backend) {
+                .native => .native,
+                .metal => .metal,
+                .cuda => .cuda,
+                else => break :blk null,
+            };
+            break :blk self.model_manager.copyCachedGenerationManifestForBackendWithControl(ctx.allocator, model_path, placement, manifest_control);
+        } else self.model_manager.copyCachedGenerationManifestWithControl(ctx.allocator, model_path, manifest_control)) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        var admission_manifest = cached_manifest orelse self.loadBoundManifest(ctx.allocator, model_path, false, manifest_control) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer admission_manifest.deinit();
         if (manifest_started) |started| {
