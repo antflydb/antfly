@@ -9684,7 +9684,7 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.
         },
         .match_all_query => try boostedMatchAllTextQueryAlloc(alloc, query_boost),
         .match_none_query => .{ .match_none = {} },
-        .query_string_query => |query_string| try parseQueryStringTextQuery(
+        .query_string_query => |query_string| try public_query_string_mod.parseStatefulQueryAlloc(
             alloc,
             query_string.query,
             query_boost,
@@ -10124,16 +10124,6 @@ fn parseGeneratedGeoShapePolygonsAlloc(
         initialized += 1;
     }
     return polygons;
-}
-
-fn parseQueryStringTextQuery(
-    alloc: std.mem.Allocator,
-    input: []const u8,
-    boost: f32,
-) !db_mod.types.TextQuery {
-    var owned = try public_query_string_mod.parseFilterAllocWithOptions(alloc, input, .{});
-    defer owned.deinit(alloc);
-    return try public_query_string_mod.filterToStatefulTextQueryAlloc(alloc, owned.filter, boost);
 }
 
 const ParsedFuzziness = struct {
@@ -20737,6 +20727,30 @@ test "logical query generated canonical bool preserves nested clauses and boost"
     try std.testing.expectEqual(@as(usize, 1), query.bool_query.should.len);
     try std.testing.expectEqual(@as(u32, 1), query.bool_query.min_should);
     try std.testing.expectEqual(@as(f32, 2), query.bool_query.boost);
+}
+
+test "query string stopword pruning survives worker transport" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const request = try parseQueryRequest(a, null, "docs",
+        \\{"full_text_search":{"query":"(history of Korea)^2","boost":3}}
+    );
+    const encoded = try @import("query_execution_contract.zig").encodeQueryRequest(a, request.req);
+    const worker = try parseQueryRequest(a, null, "docs", encoded);
+    const query = worker.req.full_text.?;
+    const search_exec = @import("../storage/db/query/search_exec.zig");
+    const lowered = try search_exec.textQueryToSearchQuery(a, query, .{}, null);
+    try std.testing.expectEqual(@as(f32, 6), lowered.bool_query.boost);
+    try std.testing.expectEqual(@as(usize, 2), lowered.bool_query.must.len);
+    try std.testing.expectEqualStrings("history", lowered.bool_query.must[0].match.text);
+    try std.testing.expectEqualStrings("Korea", lowered.bool_query.must[1].match.text);
+    try std.testing.expectEqualStrings("korea", lowered.bool_query.must[1].match.analyzed_tokens.?[0].term);
+
+    const simple = try search_exec.textQueryToSearchQuery(a, query, .{
+        .field_analyzers = &.{.{ .field_name = "_all", .analyzer_name = "simple" }},
+    }, null);
+    try std.testing.expectEqual(@as(usize, 3), simple.bool_query.must.len);
 }
 
 test "logical query public canonical threshold survives lowering and worker transport" {
