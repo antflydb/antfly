@@ -306,8 +306,7 @@ test "Inkling Metal attention weights drive local and global visits across commi
     if (!@import("build_options").enable_metal or !metal.metalDeviceAvailable()) return error.SkipZigTest;
     const a = std.testing.allocator;
     const kv = @import("../runtime/kv/hybrid_paged.zig");
-    const storage = @import("../runtime/kv/storage.zig");
-    const MetalTensor = @import("../backends/metal_tensor.zig");
+    const State = @import("inkling2_state_metal.zig").State;
     var provider = try @import("../backends/metal_native_provider.zig").MetalNativeProvider.create();
     defer provider.deinitOwned();
     const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
@@ -347,35 +346,22 @@ test "Inkling Metal attention weights drive local and global visits across commi
         var layer = try Layer.loadTensors(a, runtime, Fixture{}, text, index);
         defer layer.deinit();
         const group: kv.Group = if (layer.local) .sliding else .full;
-        const config: @import("../runtime/kv/pool.zig").KvPoolConfig = .{
-            .backend = .metal,
-            .dtype = .bf16,
-            .page_size_tokens = 1,
-            .num_layers_packed = 1,
-            .num_kv_heads = 1,
+        var state: State = undefined;
+        try state.init(a, runtime, .{
+            .layout = .{ .page_tokens = 1, .max_tokens = 2, .window_tokens = 1, .max_append_tokens = 1 },
+            .full_slots = 1,
+            .sliding_slots = 1,
+            .kv_heads = 1,
             .head_dim = 128,
-            .store_cpu_bytes = false,
-        };
-        var full = try storage.initHost(a, config);
-        defer full.deinit(a);
-        var sliding = try storage.initHost(a, config);
-        defer sliding.deinit(a);
-        var sequence = try kv.Sequence.init(a, .{
-            .page_tokens = 1,
-            .max_tokens = 2,
-            .window_tokens = 1,
-            .max_append_tokens = 1,
-        }, &full, &sliding);
-        defer sequence.deinit();
+        });
+        defer state.deinit();
 
         var source = try allocate(a, runtime, 1);
         defer source.deinit();
-        var page_ids = try Tensor.deviceAllocateTyped(a, runtime, .i32, .shared, &.{2});
-        defer page_ids.deinit();
         var scratch = try Tensor.deviceAllocateTyped(a, runtime, .f32, .shared, &.{130});
         defer scratch.deinit();
-        const sizes = [_]usize{ 128, 1, 128, 1, 128, 128, 128, 1, 1, 128, 128, 128, 256, 256, 384, 384, 1, 4, 4, 384, 384 };
-        var buffers: [sizes.len]MetalTensor.MetalTensor = undefined;
+        const sizes = [_]usize{ 128, 1, 128, 1, 128, 128, 128, 1, 1, 128, 128, 128, 1, 4, 4 };
+        var buffers: [sizes.len]Tensor = undefined;
         var count: usize = 0;
         defer for (buffers[0..count]) |*buffer| buffer.deinit();
         for (&buffers, sizes) |*buffer, size| {
@@ -383,23 +369,13 @@ test "Inkling Metal attention weights drive local and global visits across commi
             count += 1;
         }
         for ([_]u16{ 0x3f80, 0xbf80 }, 0..) |activation, position| {
-            var append = try sequence.prepareAppend(1);
+            var append = try state.prepare(1);
             defer append.abort();
-            var ids: [2]u32 = @splat(0);
-            _ = try append.stagedPageIds(group, &ids);
-            try page_ids.uploadBytes(std.mem.asBytes(&ids));
+            const binding = try state.binding(&append, .{ .group = group, .slot = 0 });
             try source.uploadBytes(std.mem.asBytes(&activation));
             try metal.beginFrame(runtime);
             errdefer metal.cancelFrame(runtime) catch {};
-            try layer.encode(runtime, text, &append, .{ .query = &source, .key = &source, .value = &source }, &page_ids, .{
-                .key = &buffers[12],
-                .value = &buffers[13],
-            }, .{
-                .key = if (position == 0) null else &buffers[14],
-                .value = if (position == 0) null else &buffers[15],
-                .next_key = &buffers[14 + position * 5],
-                .next_value = &buffers[15 + position * 5],
-            }, .{
+            try layer.encode(runtime, text, &append, .{ .query = &source, .key = &source, .value = &source }, binding.page_ids, binding.planes, binding.history, .{
                 .projected = .{
                     .query = &buffers[0],
                     .relative = &buffers[1],
@@ -407,8 +383,8 @@ test "Inkling Metal attention weights drive local and global visits across commi
                     .sink = &buffers[3],
                     .key = &buffers[4],
                     .value = &buffers[5],
-                    .key_taps = if (layer.local) null else &buffers[17],
-                    .value_taps = if (layer.local) null else &buffers[18],
+                    .key_taps = if (layer.local) null else &buffers[13],
+                    .value_taps = if (layer.local) null else &buffers[14],
                 },
                 .normalized_query = &buffers[6],
                 .normalized_relative = &buffers[7],
@@ -417,12 +393,12 @@ test "Inkling Metal attention weights drive local and global visits across commi
                 .staged_value = &buffers[10],
                 .heads = &buffers[11],
                 .attention_scratch = &scratch,
-            }, &buffers[16]);
+            }, &buffers[12]);
             try metal.submitFrame(runtime);
-            try metal.waitFrame(runtime);
-            append.commit();
+            try state.publish(&append);
+            try std.testing.expectEqual(position + 1, state.sequence.committed_tokens);
             var result: u16 = undefined;
-            try buffers[16].downloadBytesInto(std.mem.asBytes(&result));
+            try buffers[12].downloadBytesInto(std.mem.asBytes(&result));
             // Global retains +1 and -1 values, while the one-token window sees only -1.
             const expected: u16 = if (position == 0) 0x4200 else if (layer.local) 0xc200 else 0;
             try std.testing.expectEqual(expected, result);
