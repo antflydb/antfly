@@ -17,7 +17,11 @@ Antfly's existing native provider; the app does not ship a second speech engine.
 Official releases are Apple Silicon ZIPs containing a signed, notarized app and
 its pinned Antfly runtime.
 
-[Download v0.1.0-beta.1 for Apple Silicon](https://releases.antfly.io/antfly-dictation/releases/0.1.0-beta.1/Antfly-Dictation-0.1.0-beta.1-arm64.zip).
+[Download Antfly Dictation for Apple Silicon](https://releases.antfly.io/antfly-dictation/download.html).
+
+This permanent link follows the latest successfully published beta until a stable
+app release is available, then follows stable releases. Versioned downloads remain
+available for reproducible installs.
 
 After downloading:
 
