@@ -29,25 +29,12 @@ const conv = @import("../ops/cuda/causal_depthwise4_bf16.zig");
 const relative = @import("../ops/cuda/paged_relative_attention.zig");
 const DeviceBuffer = buffer.DeviceBuffer;
 
-const Weight = enum { q, k, v, r, sink, gate, out, q_scale, r_scale, k_taps, v_taps, k_dynamic, v_dynamic, relative_basis };
-const query_weights = [_]Weight{ .q, .r, .gate, .sink };
-const projection_weights = query_weights ++ [_]Weight{ .k, .v };
-
-fn projectionWidth(text: model.TextConfig, weight: Weight) u32 {
-    return switch (weight) {
-        .q, .gate => @as(u32, text.num_attention_heads) * text.head_dim,
-        .r => @as(u32, text.num_attention_heads) * text.d_rel,
-        .sink => text.num_attention_heads,
-        .k, .v => @as(u32, text.num_key_value_heads) * text.head_dim,
-        else => unreachable,
-    };
-}
-
-fn projectionSize(text: model.TextConfig, weights: []const Weight) u32 {
-    var width: u32 = 0;
-    for (weights) |weight| width += projectionWidth(text, weight);
-    return width;
-}
+const checkpoint_weights = @import("inkling2_attention_weights.zig");
+const Weight = checkpoint_weights.Weight;
+const query_weights = checkpoint_weights.query_weights;
+const projection_weights = checkpoint_weights.projection_weights;
+const projectionWidth = checkpoint_weights.projectionWidth;
+const projectionSize = checkpoint_weights.projectionSize;
 
 fn view(parent: DeviceBuffer, offset: usize, bytes: usize) DeviceBuffer {
     return .{ .ptr = parent.ptr + offset, .len = bytes, .borrowed = true };
@@ -67,46 +54,30 @@ pub const Layer = struct {
     }
 
     pub fn load(allocator: std.mem.Allocator, ctx: *Context, source: *const model.Checkpoint, staging: *Arena, layer: usize) !Layer {
-        if (layer >= model.layer_count) return error.InvalidInkling2Layer;
         const text = source.config.value.text_config;
-        const local = std.mem.indexOfScalar(u8, &text.local_layer_ids, @intCast(layer)) != null;
+        const local = try checkpoint_weights.isLocal(text, layer);
         var result: Layer = .{ .local = local };
         errdefer result.deinit(ctx);
-        const names = [_][]const u8{ "attn.wq_du.weight", "attn.wr_du.weight", "attn.gate_attn.weight", "attn.attn_sink_proj.weight", "attn.wk_dv.weight", "attn.wv_dv.weight" };
         const packed_bytes = @as(usize, text.hidden_size) * projectionSize(text, &projection_weights) * 2;
         result.packed_projection = try DeviceBuffer.allocWithPurpose(ctx, packed_bytes, .model_cache);
         errdefer ctx.synchronize() catch {};
         var offset: usize = 0;
-        for (projection_weights, names) |key, name| {
+        for (projection_weights) |key| {
             const bytes = @as(usize, text.hidden_size) * projectionWidth(text, key) * 2;
             const destination = view(result.packed_projection, offset, bytes);
-            const tensor = try source.layerTensor(layer, name);
+            const tensor = try source.layerTensor(layer, checkpoint_weights.tensorName(key, local));
             try staging.copyWeight(ctx, destination, tensor);
             result.weights[@backingInt(key)] = destination;
             offset += bytes;
         }
-        const entries = [_]struct { Weight, []const u8 }{
-            .{ .out, "attn.wo_ud.weight" },
-            .{ .q_scale, "attn.q_l2_clip.scale" },
-            .{ .r_scale, "attn.rel_l2_clip.scale" },
-            .{ .k_taps, if (local) "attn.k_sconv.weight" else "attn.k_sconv.static_w" },
-            .{ .v_taps, if (local) "attn.v_sconv.weight" else "attn.v_sconv.static_w" },
+        for ([_]Weight{ .out, .q_scale, .r_scale, .k_taps, .v_taps }) |key|
+            result.weights[@backingInt(key)] = try staging.uploadWeight(ctx, try source.layerTensor(layer, checkpoint_weights.tensorName(key, local)));
+        if (!local) for ([_]Weight{ .k_dynamic, .v_dynamic }) |key| {
+            result.weights[@backingInt(key)] = try staging.uploadWeight(ctx, try source.layerTensor(layer, checkpoint_weights.tensorName(key, local)));
         };
-        for (entries) |entry| result.weights[@backingInt(entry[0])] = try staging.uploadWeight(ctx, try source.layerTensor(layer, entry[1]));
-        if (!local) {
-            result.weights[@backingInt(Weight.k_dynamic)] = try staging.uploadWeight(ctx, try source.layerTensor(layer, "attn.k_sconv.weight_proj"));
-            result.weights[@backingInt(Weight.v_dynamic)] = try staging.uploadWeight(ctx, try source.layerTensor(layer, "attn.v_sconv.weight_proj"));
-        }
-        const basis = try source.layerTensor(layer, "attn.rel_logits_proj.proj");
-        // Checkpoint stores [relative_dim, extent]. The retained BF16 linear
-        // consumes weights in [output, input] layout.
-        const transposed = try allocator.alloc(u8, basis.len);
+        const basis = try source.layerTensor(layer, checkpoint_weights.tensorName(.relative_basis, local));
+        const transposed = try checkpoint_weights.transposeRelative(allocator, basis, text.d_rel, text.rel_extent);
         defer allocator.free(transposed);
-        for (0..text.d_rel) |d| for (0..text.rel_extent) |relative_index| {
-            const from = (d * text.rel_extent + relative_index) * 2;
-            const to = (relative_index * text.d_rel + d) * 2;
-            @memcpy(transposed[to..][0..2], basis[from..][0..2]);
-        };
         result.weights[@backingInt(Weight.relative_basis)] = try staging.uploadWeight(ctx, transposed);
         try ctx.synchronize();
         return result;
