@@ -426,9 +426,15 @@ pub fn residentVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Ses
     const values = readback: {
         var guard = if (control) |active| try active.enterUninterruptible(decoder.interruption()) else null;
         defer if (guard) |*scope| scope.deinit();
-        const slice = outputs.backend.vtable.sliceRows2D orelse return error.UnexpectedResidentStageDecline;
-        const row = try slice(outputs.backend.ptr, logits, query_rows - 1, 1, vocab);
-        defer outputs.backend.free(row);
+        // A single suffix row is already the complete requested output.
+        // Keep the producer's ownership and read it without a temporary view.
+        const direct = query_rows == 1 and outputs.backend.vtable.tensorDType != null;
+        const row = if (direct) logits else selected: {
+            const slice = outputs.backend.vtable.sliceRows2D orelse return error.UnexpectedResidentStageDecline;
+            break :selected try slice(outputs.backend.ptr, logits, query_rows - 1, 1, vocab);
+        };
+        defer if (!direct) outputs.backend.free(row);
+        if (direct and try outputs.backend.tensorDType(logits) != .f32) return error.InvalidDecoderOutput;
         const result = try outputs.backend.toFloat32(row, allocator);
         errdefer allocator.free(result);
         if (result.len != vocab) return error.InvalidDecoderOutput;
