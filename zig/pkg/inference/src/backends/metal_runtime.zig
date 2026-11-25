@@ -21958,6 +21958,8 @@ pub extern fn termite_metal_decode_runtime_linear_view_bytes(
     runtime: ?*RawMetalDecodeRuntime,
     count: usize,
 ) u64;
+pub extern fn antfly_metal_dense_f32_slot_allocated_bytes(runtime: *RawMetalDecodeRuntime, slot: usize) usize;
+
 pub extern fn termite_metal_decode_runtime_linear_slot_dtype(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,

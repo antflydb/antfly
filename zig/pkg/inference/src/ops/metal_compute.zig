@@ -8403,21 +8403,31 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             // model owner alone can reserve and install new persistent slots.
             if (!publish or self.shared_provider_lease_io == null) return null;
             const next = self.nextFreeDynamicLinearSlot() orelse return null;
-            const elements = try std.math.add(usize, try std.math.mul(usize, in_dim, out_dim), out_dim);
-            const bytes = try std.math.mul(usize, elements, @sizeOf(f32));
-            cache.reserve(.backend, bytes) catch return null;
+            const raw = provider.raw_decode_runtime orelse return null;
+            const device = metal_tensor_mod.StandaloneDevice.retain(raw) orelse return null;
+            defer device.release();
+            const bias_bytes = try std.math.mul(usize, out_dim, @sizeOf(f32));
+            const weight_bytes = try std.math.mul(usize, in_dim, bias_bytes);
+            const weight_bound = device.allocationBytes(weight_bytes, .private) orelse return null;
+            const bias_bound = device.allocationBytes(bias_bytes, .private) orelse return null;
+            // The provider's canonical zero bias is also private, but several
+            // slots can refer to it. Charge a full bias bound per reservation.
+            const reserved = try std.math.add(usize, weight_bound, bias_bound);
+            cache.reserve(.backend, reserved) catch return null;
             var committed = false;
-            defer if (!committed) cache.noteRelease(.backend, bytes);
+            defer if (!committed) cache.noteRelease(.backend, reserved);
             const allocator = std.heap.c_allocator;
             const owned_name = try allocator.dupe(u8, name);
             defer if (!committed) allocator.free(owned_name);
             try provider.embeddinggemma2_linear_cache.ensureUnusedCapacity(allocator, 1);
-            const owner = try provider.createLinearSlotOwner(next, bytes);
-            defer if (!committed) owner.discardUnpublished();
             defer if (!committed) metal_runtime.clearRawLinearSlot(provider, next);
             if (!try self.prepareLinearWithF32Storage(&.{ .slot = next, .weight = weight, .bias = bias, .in_dim = in_dim, .out_dim = out_dim, .retain_dense_fallback = false }, .private)) return null;
-            provider.publishLinearCacheAssumeCapacity(owned_name, .{ .slot = next, .in_dim = in_dim, .out_dim = out_dim, .bytes = bytes, .owner = owner, .immutable_sources = sources });
-            provider.embeddinggemma2_linear_cache_bytes += bytes;
+            const bytes = metal_runtime.antfly_metal_dense_f32_slot_allocated_bytes(raw, next);
+            if (bytes == 0 or bytes > reserved) return null;
+            const owner = try provider.createLinearSlotOwner(next, reserved);
+            defer if (!committed) owner.discardUnpublished();
+            provider.publishLinearCacheAssumeCapacity(owned_name, .{ .slot = next, .in_dim = in_dim, .out_dim = out_dim, .bytes = reserved, .owner = owner, .immutable_sources = sources });
+            provider.embeddinggemma2_linear_cache_bytes += reserved;
             committed = true;
             break :slot next;
         };

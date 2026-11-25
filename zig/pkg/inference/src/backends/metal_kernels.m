@@ -40209,6 +40209,18 @@ int termite_metal_decode_runtime_prepare_linear_generated_f32(
         NULL, bias, in_dim, out_dim, shared_if_unified != 0, NULL, 0, NULL, context, fill);
 }
 
+// Read the actual retained F32 roots under the provider's slot-index
+// authority. Shared canonical bias is included as a conservative slot bound.
+size_t antfly_metal_dense_f32_slot_allocated_bytes(termite_metal_decode_runtime *runtime, size_t slot) {
+    if (!runtime || slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || !runtime->linear_slot_prepared[slot] ||
+        runtime->linear_weight_dtypes[slot] != TERMITE_METAL_DENSE_LINEAR_DTYPE_F32) return 0;
+    id<MTLBuffer> weight = runtime->linear_weight_buffers[slot];
+    id<MTLBuffer> bias = runtime->linear_bias_buffers[slot];
+    if (!weight || !bias) return 0;
+    size_t bytes;
+    return termite_metal_size_add(weight.allocatedSize, bias.allocatedSize, &bytes) ? bytes : 0;
+}
+
 int termite_metal_decode_runtime_linear_slot_dtype(
     termite_metal_decode_runtime *runtime,
     size_t slot
