@@ -16574,7 +16574,7 @@ fn cudaTempArenaAdmissionBudgetBytes(self: *const CudaCompute) usize {
     return periodic_workspace.admissionBudget(
         cudaConfiguredTempArenaAdmissionBudgetBytes(),
         self.run_budget,
-    );
+    ) -| pinnedWorkspaceBytes(self.projection_argmax_replay_scratch);
 }
 
 fn cudaDeferredFreeEnabled() bool {
@@ -26233,6 +26233,16 @@ fn tryLinearQ4_0Q8_1ArgmaxE2BDevice(
     return token_device;
 }
 
+fn projectionArgmaxReplayBudgetAvailable(self: *CudaCompute, required: usize) bool {
+    while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer self.temp_buffer_mutex.unlock();
+    var room = cudaTempArenaAdmissionBudgetBytes(self);
+    for (self.temp_pinned_slots.items) |slot| {
+        room -|= pinnedWorkspaceBytes(slot.buffer);
+    }
+    return required <= room;
+}
+
 fn retireProjectionArgmaxReplayScratch(self: *CudaCompute) !void {
     if (self.projection_argmax_replay_scratch.ptr == 0) return;
     _ = try self.projection_argmax_replay_scratch.freeChecked(&self.ctx);
@@ -26282,7 +26292,7 @@ const ProjectionArgmaxScratch = struct {
         {
             const owner = &self.projection_argmax_replay_scratch;
             if (owner.ptr == 0 and !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active and
-                !self.temp_arena_planner.active and layout.bytes <= cudaTempArenaAdmissionBudgetBytes(self))
+                !self.temp_arena_planner.active and projectionArgmaxReplayBudgetAvailable(self, layout.bytes))
             {
                 owner.* = buffer_mod.DeviceBuffer.allocWithPurpose(&self.ctx, layout.bytes, .command_workspace) catch |err| switch (err) {
                     error.CudaMemoryLimitExceeded => return acquire(self, layout, suppressed),
@@ -42323,6 +42333,21 @@ test "LightOnOCR3 CUDA F32 projection row chunks cover large vision batches and 
             for (host[count..]) |canary| try std.testing.expectEqual(@as(f32, 123456), canary);
         }
     }
+}
+
+test "CUDA projection argmax shares the temporary arena admission ceiling" {
+    var compute = metadataOnlyTestCompute();
+    const a = std.testing.allocator;
+    var limit = try TestEnvGuard.captureAndClear(a, "ANTFLY_INFERENCE_CUDA_TEMP_ARENA_MAX_MB");
+    defer limit.restore(a);
+    _ = setenv("ANTFLY_INFERENCE_CUDA_TEMP_ARENA_MAX_MB", "1", 1);
+    const capacity = 1024 * 1024;
+    compute.projection_argmax_replay_scratch = .{ .ptr = 0x1000, .len = 64, .allocation_bytes = 256 };
+    try std.testing.expectEqual(@as(usize, capacity - 256), cudaTempArenaAdmissionBudgetBytes(&compute));
+    defer compute.temp_pinned_slots.deinit(a);
+    try compute.temp_pinned_slots.append(a, .{ .buffer = .{ .ptr = 0x2000, .len = 64, .allocation_bytes = 512 } });
+    try std.testing.expect(projectionArgmaxReplayBudgetAvailable(&compute, capacity - 256 - 512));
+    try std.testing.expect(!projectionArgmaxReplayBudgetAvailable(&compute, capacity - 256 - 512 + 1));
 }
 
 test "CUDA projection argmax binds declared scratch without advancing rejected events" {
