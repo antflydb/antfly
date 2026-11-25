@@ -75,7 +75,7 @@ pub const Runtime = struct {
         const retained = try State.deviceBytes(plan.bank, plan.width);
         const physical = try plan.deviceBytes();
         const logit_bytes = @as(usize, self.model.text.unpadded_vocab_size) * @sizeOf(f32);
-        const vision_bytes = if (pipeline.prompt.image != null)
+        const vision_bytes: vision_model.AdmissionBytes = if (pipeline.prompt.image != null)
             vision_model.admissionBytes(pipeline.prompt.image_width, pipeline.prompt.image_height)
         else
             .{ .host = 0, .device = 0 };

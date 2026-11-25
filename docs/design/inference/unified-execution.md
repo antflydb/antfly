@@ -890,8 +890,11 @@ patterned RGB fixture used by the CUDA suite. Both produced four embedding
 rows and selected token 12. The Metal peak logit was 19.88336 and the CUDA
 peak was 19.87989. Metal encoded the image in 113.32 ms in that run. The
 released-checkpoint suite, including legacy managed manifest repair,
-passed all 81 tests. Image HTTP and matched reference performance are
-separate qualification gates.
+passed all 81 tests. The opt-in Metal HTTP route correctly identified
+80 by 80 red and blue PNGs in separate requests. Warm responses took
+1.64–1.65 s. Streaming returned `Blue`, a stop reason, token usage, and
+`[DONE]` at 1.64 s. The matched reference image performance gate remains
+open.
 
 ### Official Gemma 4 E2B QAT serving comparison
 

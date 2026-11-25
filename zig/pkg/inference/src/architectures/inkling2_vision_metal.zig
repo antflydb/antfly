@@ -54,7 +54,9 @@ fn workspaceCounts(geometry: Geometry) std.EnumArray(Temp, usize) {
     });
 }
 
-pub fn admissionBytes(x: u32, y: u32) struct { host: usize, device: usize } {
+pub const AdmissionBytes = struct { host: usize = 0, device: usize = 0 };
+
+pub fn admissionBytes(x: u32, y: u32) AdmissionBytes {
     const geometry = Geometry.fromDimensions(x, y);
     const rgb = @as(usize, x) * y * 3;
     var device = rgb + @as(usize, geometry.mergedRows()) * schema.text_width * @sizeOf(u16);

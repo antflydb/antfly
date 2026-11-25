@@ -562,6 +562,34 @@ test "Inkling Metal resident decoder runs the released text checkpoint" {
     std.debug.print("Inkling Metal image={d}x{d} projected_rows={d} next={d} peak={d:.5} vision_ms={d:.3}\n", .{
         image_width, image_height, image.rows, image_next, image_logits[image_next], @as(f64, @floatFromInt(vision_ns)) / 1e6,
     });
+
+    const model_dir = try std.Io.Dir.openDirAbsolute(std.testing.io, dir, .{});
+    defer model_dir.close(std.testing.io);
+    var tokenizer = try @import("inference_hf_tokenizer").HfTokenizer.loadFromDir(a, model_dir, std.testing.io, "tokenizer.json");
+    defer tokenizer.deinitSelf();
+    const gen = @import("../pipelines/generation.zig");
+    const config: gen.GenerationConfig = .{ .max_tokens = 4, .enable_thinking = false };
+    const image_mod = @import("antfly_image");
+    const dimensions = 80;
+    var rgba: [dimensions * dimensions * 4]u8 = undefined;
+    for (0..dimensions * dimensions) |index| {
+        rgba[index * 4 ..][0..4].* = .{ 255, 0, 0, 255 };
+    }
+    const png = try image_mod.png.encodeRgba(a, dimensions, dimensions, &rgba);
+    defer a.free(png);
+    const messages: []const gen.Message = &.{.{
+        .role = "user",
+        .content = "",
+        .image_bytes = &.{png},
+        .content_parts = &.{ .{ .text = "What color is this image? Answer with one word." }, .{ .image = 0 } },
+    }};
+    const Pipeline = @import("inkling2_session_metal.zig").TextPipeline;
+    var pipeline = try Pipeline.init(a, tokenizer.tokenizer(), .{}, messages, config, null, .{});
+    defer pipeline.deinit();
+    var result = try resident.generate(session, &pipeline, config, .{});
+    defer result.deinit();
+    try std.testing.expect(std.ascii.eqlIgnoreCase("red", std.mem.trim(u8, result.text, " .\n\t")));
+    std.debug.print("Inkling Metal image chat prompt_tokens={d} answer={s}\n", .{ result.prompt_tokens, result.text });
 }
 
 test "Inkling Metal resident decoder executes the full visit schedule on a synthetic checkpoint" {
