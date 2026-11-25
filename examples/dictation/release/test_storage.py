@@ -180,6 +180,131 @@ class R2PublicationTests(unittest.TestCase):
             f"antfly-dictation/channels/{channel}/appcast.xml"
         )
 
+    def download_version(self):
+        body = self.storage.reader.read_optional("antfly-dictation/download.html")
+        if body is None:
+            return None
+        page = r.ET.fromstring(body)
+        meta = page.find("head/meta[@name='dictation-version']")
+        short = meta.get("content")
+        url = (
+            r.POLICY["public_base_url"]
+            + "/releases/"
+            + short
+            + "/Antfly-Dictation-"
+            + short
+            + "-arm64.zip"
+        )
+        self.assertEqual(page.find("body/a").get("href"), url)
+        self.assertEqual(
+            page.find("head/meta[@http-equiv='refresh']").get("content"), "0;url=" + url
+        )
+        return short
+
+    def test_download_follows_beta_then_permanently_prefers_stable(self):
+        for tag, expected in [
+            ("dictation/v1.0.0-beta.1", "1.0.0-beta.1"),
+            ("dictation/v1.0.0-beta.3", "1.0.0-beta.3"),
+            ("dictation/v1.0.0-beta.2", "1.0.0-beta.3"),
+            ("dictation/v1.0.0", "1.0.0"),
+            ("dictation/v2.0.0-beta.1", "1.0.0"),
+            ("dictation/v1.0.1", "1.0.1"),
+        ]:
+            identity, directory = self.payload(tag)
+            self.publish(identity, directory)
+            self.assertEqual(self.download_version(), expected)
+            self.publish(identity, directory)
+            self.assertEqual(self.download_version(), expected)
+
+    def test_failed_upload_preserves_previous_download(self):
+        identity, directory = self.payload("dictation/v1.0.0-beta.1")
+        self.publish(identity, directory)
+        identity, directory = self.payload("dictation/v1.0.0-beta.2")
+        with patch.object(
+            self.storage, "upload_immutable", side_effect=ConnectionError
+        ):
+            with self.assertRaises(ConnectionError):
+                self.publish(identity, directory)
+        self.assertEqual(self.download_version(), "1.0.0-beta.1")
+
+    def test_download_retry_repairs_partial_publication(self):
+        identity, directory = self.payload()
+        original = self.storage.channel_store
+
+        def unavailable(key):
+            if key.endswith("download.html"):
+                raise ConnectionError("Download pointer unavailable")
+            return original(key)
+
+        with patch.object(self.storage, "channel_store", side_effect=unavailable):
+            with self.assertRaises(ConnectionError):
+                self.publish(identity, directory)
+        self.assertIsNotNone(self.feed("stable"))
+        self.assertIsNone(self.download_version())
+        self.publish(identity, directory)
+        self.assertEqual(self.download_version(), "1.0.0")
+
+    def test_download_lost_response_is_reconciled_on_retry(self):
+        identity, directory = self.payload()
+        store = self.storage.channel_store("antfly-dictation/download.html")
+        original_store = self.storage.channel_store
+        original_write = store.compare_and_swap_bytes
+
+        def lost(*args):
+            original_write(*args)
+            raise ConnectionError("Lost successful pointer response")
+
+        with (
+            patch.object(store, "compare_and_swap_bytes", side_effect=lost),
+            patch.object(
+                self.storage,
+                "channel_store",
+                side_effect=lambda key: (
+                    store if key.endswith("download.html") else original_store(key)
+                ),
+            ),
+        ):
+            with self.assertRaises(ConnectionError):
+                self.publish(identity, directory)
+        self.publish(identity, directory)
+        self.assertEqual(self.download_version(), "1.0.0")
+
+    def test_download_rejects_conflicting_or_unrecognized_current_page(self):
+        identity, _ = self.payload()
+        store = self.storage.channel_store("antfly-dictation/download.html")
+        for body in (
+            b"<html />",
+            r.download_page(identity).replace(b"0;url=", b"1;url="),
+        ):
+            previous = store.load_bytes()
+            store.compare_and_swap_bytes(previous, body, "text/html", "no-cache")
+            with self.assertRaises(ValueError):
+                r.promote_download(self.storage, identity)
+            self.assertEqual(store.load_bytes().body, body)
+
+    def test_download_cas_race_cannot_overwrite_newer_release(self):
+        old, _ = self.payload("dictation/v1.0.0-beta.1")
+        new, _ = self.payload("dictation/v1.0.0-beta.2")
+        key = "antfly-dictation/download.html"
+        store = self.storage.channel_store(key)
+        original = store.compare_and_swap_bytes
+        raced = False
+
+        def race(previous, body, *args):
+            nonlocal raced
+            if not raced:
+                raced = True
+                original(previous, r.download_page(new), *args)
+                raise ConditionalWriteConflict("Concurrent release won")
+            return original(previous, body, *args)
+
+        with (
+            patch.object(store, "compare_and_swap_bytes", side_effect=race),
+            patch.object(self.storage, "channel_store", return_value=store),
+        ):
+            self.assertEqual(r.promote_download(self.storage, old), "superseded")
+        self.assertEqual(self.download_version(), "1.0.0-beta.2")
+
     def test_publish_seals_exact_versions_and_content_objects_before_both_feeds(self):
         identity, directory = self.payload()
         original = self.storage.channel_store
