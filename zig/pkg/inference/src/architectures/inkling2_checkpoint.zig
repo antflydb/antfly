@@ -202,6 +202,13 @@ pub const ExpertWeights = struct {
     outer_denominator: ?[]const u8 = null,
 };
 
+pub const ControllerStream = enum { attn, k, v, mlp };
+pub const ControllerWeights = struct {
+    down: []const u8,
+    gain: []const u8,
+    forget: []const u8,
+};
+
 pub const RouterWeights = struct {
     weight: []const u8,
     bias: []const u8,
@@ -367,6 +374,17 @@ pub const Checkpoint = struct {
         return .{
             .weight = try self.reader.rawTensorBytes(try layerName(&buf, layer, "mlp.gate.weight")),
             .bias = try self.reader.rawTensorBytes(try layerName(&buf, layer, "mlp.gate.bias")),
+        };
+    }
+
+    pub fn controller(self: *const Checkpoint, layer: usize, stream: ControllerStream) !ControllerWeights {
+        const loop = self.config.value.text_config.loop_config;
+        if (layer < loop.core_start or layer >= loop.core_end) return error.InvalidInkling2Layer;
+        var name: [128]u8 = undefined;
+        return .{
+            .down = try self.layerTensor(layer, try std.fmt.bufPrint(&name, "controllers.{s}.down_weight", .{@tagName(stream)})),
+            .gain = try self.layerTensor(layer, try std.fmt.bufPrint(&name, "controllers.{s}.gain_weight", .{@tagName(stream)})),
+            .forget = try self.layerTensor(layer, try std.fmt.bufPrint(&name, "controllers.{s}.forget_weight", .{@tagName(stream)})),
         };
     }
 

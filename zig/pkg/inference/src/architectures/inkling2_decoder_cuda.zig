@@ -45,7 +45,7 @@ pub fn speculativeBlockContextSupported(text: checkpoint.TextConfig, tokens: usi
     // in the long-context log-scaling regime.
     return tokens <= text.log_scaling_n_floor;
 }
-const Stream = enum { attn, k, v, mlp };
+const Stream = checkpoint.ControllerStream;
 
 const ModelWeight = enum {
     embed,
@@ -125,23 +125,20 @@ const Layer = struct {
             errdefer ctx.synchronize() catch {};
             inline for (std.enums.values(Stream)) |stream| {
                 const controller = &result.controllers[@backingInt(stream)];
-                const down_key = try std.fmt.bufPrint(&name, "controllers.{s}.down_weight", .{@tagName(stream)});
-                const down_data = try source.layerTensor(layer, down_key);
+                const weights = try source.controller(layer, stream);
                 if (stream == .mlp) {
-                    controller[@backingInt(ControllerWeight.down)] = try arena.uploadWeight(ctx, down_data);
+                    controller[@backingInt(ControllerWeight.down)] = try arena.uploadWeight(ctx, weights.down);
                 } else {
                     const destination = row(result.attention_controller_down, @backingInt(stream), down_bytes);
-                    try arena.copyWeight(ctx, destination, down_data);
+                    try arena.copyWeight(ctx, destination, weights.down);
                     controller[@backingInt(ControllerWeight.down)] = destination;
                 }
                 const each_bytes = @as(usize, text.hidden_size) * core.gate_rank * 2;
                 const gate_weights = try DeviceBuffer.allocWithPurpose(ctx, 2 * each_bytes, .model_cache);
                 controller[@backingInt(ControllerWeight.gain_forget)] = gate_weights;
                 errdefer ctx.synchronize() catch {};
-                for ([_][]const u8{ "gain_weight", "forget_weight" }, 0..) |projection, index| {
-                    const suffix = try std.fmt.bufPrint(&name, "controllers.{s}.{s}", .{ @tagName(stream), projection });
-                    try arena.copyWeight(ctx, row(gate_weights, index, each_bytes), try source.layerTensor(layer, suffix));
-                }
+                for ([_][]const u8{ weights.gain, weights.forget }, 0..) |gate, index|
+                    try arena.copyWeight(ctx, row(gate_weights, index, each_bytes), gate);
             }
         }
         try ctx.synchronize();
