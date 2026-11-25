@@ -1049,3 +1049,31 @@ resident CUDA contexts during the comparison.
 | E4B M4 Max Metal | 567 / 436 | 987 / 517 | 332 / 211 | 818 / 620 |
 | E2B Spark GB10 CUDA | 248 / 214 | 348 / 275 | 161 / 126 | 246 / 280 |
 | E4B Spark GB10 CUDA | 352 / 324 | 540 / 462 | 260 / 215 | 386 / 464 |
+
+On Spark GB10, both official QAT GGUFs served 131,060 text prompt
+tokens with a 12-token output reservation using the default memory limits
+and F16 K/V. Both retrieved the code placed at the beginning of the prompt
+and returned HTTP 400 when the prompt plus the requested output exceeded
+131,072 tokens. The single successful near-limit request per model took
+570.17 s for E2B and 54.98 s for E4B with other GPU contexts present. The
+E2B prefill used the single-K/V-head MMA schedule. The expanded generated
+Flash schedule on GB10 covers the two-K/V-head geometry used by E4B.
+
+The sequential llama.cpp `b12706` comparison used the same model,
+131,060-token prompt and four-token response on the same shared Spark.
+It took 16.19 s for E2B and 29.85 s for E4B.
+
+On M4 Max CPU, the qualified Gemma 4 shared-KV route skips suffix rows
+that cannot affect the published token and reuses decoded K/V across the
+query tiles. A same-binary comparison used two warm control requests and
+four warm default requests per model and modality. Every response matched
+exactly within its case. Cells report disabled / default warm p50 ms.
+
+| Checkpoint | Text | Image | Audio | Silent video |
+| --- | ---: | ---: | ---: | ---: |
+| E2B | 10301 / 1829 | 6444 / 3242 | 1066 / 639 | 5735 / 2229 |
+| E4B | 20078 / 3619 | 10788 / 4758 | 1926 / 1174 | 10173 / 3573 |
+
+The short warm CPU llama.cpp reference measured 467 / 15027 / 1224 /
+24059 ms for E2B (four samples per modality) and 1126 / 15437 / 1405 /
+24679 ms for E4B (one sample per modality), in the same modality order.

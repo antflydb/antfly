@@ -2149,6 +2149,8 @@ pub fn prepare(allocator: std.mem.Allocator, model_path: []const u8, loaded_mode
         .residency = residency,
         .tier_cache = tier_cache,
         .allow_direct_quant = direct_quant_enabled,
+        .prefer_tiled_paged_prefill = preparation.intent == .execute and arch_config == .gpt and
+            @import("../execution/gemma4_native_plan.zig").cpuSharedKvPrefillDefault(arch_config.gpt),
     };
     maps_owned = false;
     store_owned = false;

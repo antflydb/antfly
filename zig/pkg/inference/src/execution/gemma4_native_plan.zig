@@ -21,6 +21,12 @@ const Config = @import("../models/gpt.zig").Config;
 
 pub const Projection = enum { packed_q4, bf16_donors };
 
+/// CPU uses the structural donor boundary and amortizes KV conversion over
+/// query tiles for the qualified shared-KV decoder geometries.
+pub fn cpuSharedKvPrefillDefault(config: Config) bool {
+    return config.usesGemma4Channels() and automaticGeometry(config);
+}
+
 /// Prefer the shared verified projector inventory for qualified channel
 /// geometry. Other layouts keep explicit opt-in and the ordinary fallback.
 pub fn metalResidentProjectorEnabled(config: ?Config) bool {

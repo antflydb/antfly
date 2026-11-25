@@ -2984,7 +2984,9 @@ fn sharedKvPrefillBoundary(config: Config, dc: DecodeContext) ?usize {
 }
 
 pub fn nativeSharedKvPrefillEnabled(config: Config) bool {
-    return platform.env.getenvBool("ANTFLY_INFERENCE_NATIVE_SHARED_KV_PREFILL") and config.sharedKvFunctionalDonorLayers() != null;
+    if (config.sharedKvFunctionalDonorLayers() == null) return false;
+    if (platform.env.getenv("ANTFLY_INFERENCE_NATIVE_SHARED_KV_PREFILL")) |value| return platform.env.truthy(value);
+    return @import("../execution/gemma4_native_plan.zig").cpuSharedKvPrefillDefault(config);
 }
 
 fn sharedKvPrefillBoundaryForBackend(cb: *const ComputeBackend, config: Config, dc: DecodeContext) ?usize {

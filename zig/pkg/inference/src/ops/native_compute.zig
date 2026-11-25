@@ -909,6 +909,7 @@ pub const WeightStore = struct {
     /// released far more frequently than pressure state needs to be sampled.
     last_file_cache_pressure_probe_ns: std.atomic.Value(u64) = .init(0),
     allow_direct_quant: bool = true,
+    prefer_tiled_paged_prefill: bool = false,
     gliner_head_dense_cache: std.StringHashMapUnmanaged(DenseDequantCacheEntry) = .{},
     gliner_head_dense_cache_bytes: usize = 0,
     gliner_head_dense_cache_prepared_map_bytes: usize = 0,
@@ -37015,8 +37016,11 @@ fn gqaPagedAttentionDirect(
     const sink_scores = try attentionSinkScores(attention.attention_sink, num_heads);
     const output = try self.allocator.alloc(f32, q_seq_len * H_q);
     errdefer self.allocator.free(output);
-    const tiled = bias == null and sink_scores == null and
-        platform.env.getenvBool("ANTFLY_INFERENCE_NATIVE_TILED_PAGED_PREFILL") and
+    const prefer_tiled = if (platform.env.getenv("ANTFLY_INFERENCE_NATIVE_TILED_PAGED_PREFILL")) |value|
+        platform.env.truthy(value)
+    else
+        self.data.prefer_tiled_paged_prefill;
+    const tiled = bias == null and sink_scores == null and prefer_tiled and
         try tryGqaTiledPagedPrefill(self, pool, block_ids, layer_index, Q, attention, num_heads, num_kv_heads, head_dim, output);
     if (!tiled) try gqaPagedAttentionDirectInto(pool, block_ids, layer_index, Q, bias, attention, num_heads, num_kv_heads, head_dim, sink_scores, output);
     return self.makeBuf(output, true);
