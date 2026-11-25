@@ -1176,6 +1176,9 @@ pub const PersistentIndex = struct {
     /// a level-0 record their install would then add again (or after
     /// another process merged it away): `refreshFromTip` refuses meanwhile.
     inline_in_flight: std.atomic.Value(u32) = .init(0),
+    /// Level-0 publications prepared and not yet installed or aborted: a
+    /// death arriving for one of their versions is parked until it lands.
+    inline_segments_pending: std.atomic.Value(u32) = .init(0),
     /// Where each version of a loaded segment sits, for installing newly dead
     /// versions in memory (`installDeadVersions`).
     version_locations: VersionLocations = .{},
@@ -2216,8 +2219,13 @@ pub const PersistentIndex = struct {
         };
     }
 
+    /// Inline writes of this process may be between commit and install: a
+    /// peer's decisions are newer than theirs (they committed before this
+    /// refresh's cut), so the keys take a new resolution epoch and those
+    /// installs keep the peer's values; deaths of their copies are parked
+    /// until their segments land (`installDeadVersionsOrError`).
     pub fn refreshPeerDelta(self: *PersistentIndex, changed: []const native_catalog_backend.Mutation) !void {
-        if (!self.versioned or self.inline_in_flight.load(.acquire) != 0) return error.UnsupportedRefresh;
+        if (!self.versioned) return error.UnsupportedRefresh;
         const backend = switch (self.main_store_owner) {
             .native_catalog => |backend| backend,
             else => return error.UnsupportedRefresh,
@@ -2340,6 +2348,7 @@ pub const PersistentIndex = struct {
             additions.clearRetainingCapacity();
         }
         if (newly_dead.items.len != 0) try self.installDeadVersionsOrError(newly_dead.items);
+        try backend.noteExternallyDecided(keys.items);
         try backend.applyExternallyCommittedMutations(keys.items);
         for (keys.items) |key| {
             if (key.is_delete or !std.mem.eql(u8, key.namespace.?, runtimeNamespace(.meta).name.?) or !std.mem.eql(u8, key.key, meta_next_seg_id)) continue;
@@ -2748,32 +2757,6 @@ pub const PersistentIndex = struct {
         }
     }
 
-    /// Completion callbacks may run in reverse commit order. Reload the
-    /// affected records from the durable tip before replacing mirror values.
-    pub fn reconcileInlineCommittedMutations(self: *PersistentIndex, mutations: []const native_catalog_backend.Mutation) !void {
-        if (mutations.len == 0) return;
-        const backend = switch (self.main_store_owner) {
-            .native_catalog => |backend| backend,
-            else => return error.NotNativeCatalogBackend,
-        };
-        errdefer backend.invalidateMirror();
-        var arena = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena.deinit();
-        const alloc = arena.allocator();
-        var keys = std.ArrayListUnmanaged(native_catalog_backend.Mutation).empty;
-        for (mutations) |mutation| {
-            if (std.mem.eql(u8, mutation.namespace orelse "", native_catalog_backend.tip_namespace)) continue;
-            try keys.append(alloc, mutation);
-        }
-        const values = try alloc.alloc(?[]const u8, keys.items.len);
-        try backend.loadCommittedValues(alloc, keys.items, values);
-        for (keys.items, values) |*mutation, value| {
-            mutation.is_delete = value == null;
-            mutation.value = value orelse "";
-        }
-        try backend.applyExternallyCommittedMutations(keys.items);
-    }
-
     /// A small ("inline") segment publication prepared for a
     /// `.native_catalog` index, built OUTSIDE any lock and without
     /// committing anything: `prepareInlineSegmentPublication` below
@@ -2795,10 +2778,13 @@ pub const PersistentIndex = struct {
         seg_id: u64,
         l0_key: [8]u8,
         segment_bytes: []u8,
+        /// Parsed once at prepare and handed to the snapshot at install.
+        reader: ?segment_mod.SegmentReader,
         /// Every copy the segment publishes (keys in `copies_arena`), decided
         /// at the commit's tip by the caller's resolver.
         copies_arena: std.heap.ArenaAllocator,
         copies: []const VersionedChange,
+        index: *PersistentIndex,
 
         /// Valid only while `self` stays at this address.
         pub fn mutations(self: *const InlineSegmentPublication) [1]native_catalog_backend.Mutation {
@@ -2807,8 +2793,10 @@ pub const PersistentIndex = struct {
 
         /// Discards a publication whose mutations were never committed.
         pub fn abort(self: *InlineSegmentPublication, alloc: Allocator) void {
+            if (self.reader) |*reader| reader.deinit();
             alloc.free(self.segment_bytes);
             self.copies_arena.deinit();
+            _ = self.index.inline_segments_pending.fetchSub(1, .acq_rel);
             self.* = undefined;
         }
     };
@@ -2823,17 +2811,22 @@ pub const PersistentIndex = struct {
         std.debug.assert(self.segment_files == null);
         var copies_arena = std.heap.ArenaAllocator.init(self.alloc);
         errdefer copies_arena.deinit();
-        const copies = try segmentCopiesAlloc(copies_arena.allocator(), segment_bytes);
+        var reader = try segment_mod.SegmentReader.init(self.alloc, segment_bytes);
+        errdefer reader.deinit();
+        const copies = try readerCopiesAlloc(copies_arena.allocator(), &reader);
         if (copies.len == 0) return error.InlineTextPublicationUnsupported;
         var first = copies[0].version;
         for (copies) |copy| first = @min(first, copy.version);
         const seg_id = l0SegmentId(first);
+        _ = self.inline_segments_pending.fetchAdd(1, .acq_rel);
         return .{
             .seg_id = seg_id,
             .l0_key = l0Key(seg_id),
             .segment_bytes = segment_bytes,
+            .reader = reader,
             .copies_arena = copies_arena,
             .copies = copies,
+            .index = self,
         };
     }
 
@@ -2859,6 +2852,13 @@ pub const PersistentIndex = struct {
     }
 
     /// Forces this index's in-memory mirror to reload from the file.
+    fn nativeCatalogBackend(self: *PersistentIndex) ?*native_catalog_backend.Backend {
+        return switch (self.main_store_owner) {
+            .native_catalog => |backend| backend,
+            else => null,
+        };
+    }
+
     fn invalidateNativeCatalogMirror(self: *PersistentIndex) void {
         switch (self.main_store_owner) {
             .native_catalog => |backend| backend.invalidateMirror(),
@@ -2866,11 +2866,12 @@ pub const PersistentIndex = struct {
         }
     }
 
-    /// Runs only after `publication`'s record is durable: adds its segment to
-    /// the writer snapshot, after which the write's ack may return. A failure
-    /// leaves memory behind the file; the next refresh reloads it.
-    pub fn installInlineSegmentPublication(self: *PersistentIndex, publication: *InlineSegmentPublication) !void {
-        var deleted = self.inlineDeletionBitmap(publication.copies) catch |err| {
+    /// Publishes a committed level-0 segment. Its copies are deleted when
+    /// they were dead at their own commit (`resolution`) or a later commit
+    /// killed them before this install (`VersionLocations.parked`): installs
+    /// can run out of commit order, and nothing here reads the tip.
+    pub fn installInlineSegmentPublication(self: *PersistentIndex, publication: *InlineSegmentPublication, resolution: ?*const VersionResolution) !void {
+        var deleted = self.inlineDeletionBitmap(publication.copies, resolution) catch |err| {
             publication.abort(self.alloc);
             self.invalidateNativeCatalogMirror();
             return err;
@@ -2880,10 +2881,13 @@ pub const PersistentIndex = struct {
             .id = publication.seg_id,
             .data = index_mod.SegmentData.fromOwnedHeap(publication.segment_bytes),
             .deleted = if (deleted) |*bitmap| bitmap else null,
+            .prepared_reader = publication.reader,
         }};
         publication.copies_arena.deinit();
         publication.* = undefined;
+        defer _ = self.inline_segments_pending.fetchSub(1, .acq_rel);
         var prepared = self.writer.prepareSegmentsManyData(&.{}, &replacement) catch |err| {
+            if (replacement[0].prepared_reader) |*reader| reader.deinit();
             replacement[0].data.deinit(self.alloc);
             self.invalidateNativeCatalogMirror();
             return err;
@@ -2891,25 +2895,16 @@ pub const PersistentIndex = struct {
         prepared.publish();
     }
 
-    /// Install can run after a later commit on the same key. Read the
-    /// authoritative doc map so the incoming snapshot never exposes that copy.
-    fn inlineDeletionBitmap(self: *PersistentIndex, copies: []const VersionedChange) !?roaring.RoaringBitmap {
-        const backend = switch (self.main_store_owner) {
-            .native_catalog => |backend| backend,
-            else => return error.NotNativeCatalogBackend,
-        };
-        var arena = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena.deinit();
-        const alloc = arena.allocator();
-        const keys = try alloc.alloc(native_catalog_backend.Mutation, copies.len);
-        const values = try alloc.alloc(?[]const u8, copies.len);
-        for (copies, keys) |copy, *key| key.* = .{ .namespace = native_catalog_backend.tip_namespace, .key = copy.key };
-        try backend.loadCommittedValues(alloc, keys, values);
-
+    fn inlineDeletionBitmap(self: *PersistentIndex, copies: []const VersionedChange, resolution: ?*const VersionResolution) !?roaring.RoaringBitmap {
         var bitmap = roaring.RoaringBitmap.init(self.alloc);
         errdefer bitmap.deinit();
-        for (copies, values, 0..) |copy, value, local| {
-            if (value == null or try DocVersion.decode(value.?) != copy.version) try bitmap.add(@intCast(local));
+        const locations = &self.version_locations;
+        @import("antfly_platform").sync.lockYielding(&locations.mutex);
+        defer locations.mutex.unlock();
+        for (copies, 0..) |copy, local| {
+            const parked = locations.parked.remove(copy.version);
+            const dead = if (resolution) |r| r.deadAtCommit(copy.version) else false;
+            if (parked or dead) try bitmap.add(@intCast(local));
         }
         if (bitmap.isEmpty()) {
             bitmap.deinit();
@@ -4615,8 +4610,9 @@ pub const PersistentIndex = struct {
         first: u64 = 0,
         resolver: ?native_catalog_backend.Resolver = null,
 
-        fn stage(self: *SegmentCounterFloor, alloc: Allocator, txn: *MainTxn) !void {
+        fn stage(self: *SegmentCounterFloor, alloc: Allocator, txn: *MainTxn, epoch_backend: ?*native_catalog_backend.Backend) !void {
             self.resolver = .init(alloc, self, resolve);
+            self.resolver.?.epoch_backend = epoch_backend;
             try txn.stageResolver(&self.resolver.?);
         }
 
@@ -4639,7 +4635,7 @@ pub const PersistentIndex = struct {
     fn saveSegmentCounterFloor(self: *PersistentIndex, txn: *MainTxn, floor: *SegmentCounterFloor, value: u64) !void {
         if (!self.keepsDocMap()) return saveNextSegmentId(txn, value);
         floor.* = .{ .floor = value };
-        try floor.stage(self.alloc, txn);
+        try floor.stage(self.alloc, txn, self.nativeCatalogBackend());
     }
 
     /// `count` consecutive segment ids, the first returned. A native catalog
@@ -4671,7 +4667,7 @@ pub const PersistentIndex = struct {
         errdefer txn.abort();
         // Lost with a crash only together with every publication using it.
         txn.setDurable(false);
-        try reservation.stage(self.alloc, &txn);
+        try reservation.stage(self.alloc, &txn, self.nativeCatalogBackend());
         try txn.commit();
         self.writer.lockMutex();
         defer self.writer.mu.unlock();
@@ -4725,14 +4721,40 @@ pub const PersistentIndex = struct {
 
         pub fn stage(self: *VersionResolution, txn: *MainTxn) !void {
             self.resolver = .init(self.index.alloc, self, resolve);
+            self.resolver.?.epoch_backend = self.index.nativeCatalogBackend();
             try txn.stageResolver(&self.resolver.?);
         }
 
         /// The resolver, for a caller that stages it into a transaction of
         /// its own (an inline write, through `commit_participant.View`).
         pub fn resolverForStaging(self: *VersionResolution) *native_catalog_backend.Resolver {
-            if (self.resolver == null) self.resolver = .init(self.index.alloc, self, resolve);
+            if (self.resolver == null) {
+                self.resolver = .init(self.index.alloc, self, resolve);
+                self.resolver.?.epoch_backend = self.index.nativeCatalogBackend();
+            }
             return &self.resolver.?;
+        }
+
+        /// This resolution's commit did not happen (rejected, failed or
+        /// aborted after the resolver ran).
+        pub fn revert(self: *VersionResolution) void {
+            const resolver = if (self.resolver) |*r| r else return;
+            if (resolver.epoch_backend) |backend| backend.revertResolved(resolver);
+        }
+
+        /// Committed: the decided values go to the mirror, except keys a
+        /// later commit has decided since (installs can run out of order).
+        pub fn applyToMirror(self: *const VersionResolution) !void {
+            const resolver = if (self.resolver) |*r| r else return;
+            const backend = resolver.epoch_backend orelse return error.NotNativeCatalogBackend;
+            try backend.applyCommittedResolution(resolver);
+        }
+
+        /// Whether `version`, one of this resolution's own copies, was dead
+        /// at its commit (born behind a newer copy).
+        pub fn deadAtCommit(self: *const VersionResolution, version: u64) bool {
+            return std.mem.indexOfScalar(u64, self.newly_dead.items, version) != null or
+                std.mem.indexOfScalar(u64, self.extra_dead.items, version) != null;
         }
 
         /// Copies a caller already holds (an inline segment's).
@@ -4832,6 +4854,7 @@ pub const PersistentIndex = struct {
         /// them. Outputs are added after, before the commit.
         fn stage(self: *MergeResolution, txn: *MainTxn) !void {
             self.resolver = .init(self.index.alloc, self, resolve);
+            self.resolver.?.epoch_backend = self.index.nativeCatalogBackend();
             try txn.stageResolver(&self.resolver.?);
         }
 
@@ -5043,6 +5066,10 @@ pub const PersistentIndex = struct {
         /// Each indexed segment's versions, so a retired segment's entries
         /// leave in time proportional to that segment.
         indexed: std.AutoHashMapUnmanaged(u64, []u64) = .empty,
+        /// Versions a committed death named before their level-0 segment was
+        /// installed (a later commit's install ran first). The segment's
+        /// install takes them.
+        parked: std.AutoHashMapUnmanaged(u64, void) = .empty,
 
         const Location = struct { seg_id: u64, local_id: u32 };
 
@@ -5052,12 +5079,14 @@ pub const PersistentIndex = struct {
             self.freeIndexed(alloc);
             self.map.clearAndFree(alloc);
             self.indexed.clearAndFree(alloc);
+            self.parked.clearAndFree(alloc);
         }
 
         fn deinit(self: *VersionLocations, alloc: Allocator) void {
             self.freeIndexed(alloc);
             self.map.deinit(alloc);
             self.indexed.deinit(alloc);
+            self.parked.deinit(alloc);
         }
 
         fn freeIndexed(self: *VersionLocations, alloc: Allocator) void {
@@ -5083,6 +5112,9 @@ pub const PersistentIndex = struct {
         defer locations.mutex.unlock();
         const snap = self.writer.acquireSnapshot();
         defer snap.release();
+        // Parked deaths outlive only the publications they wait for.
+        const pending = self.inline_segments_pending.load(.acquire) != 0;
+        if (!pending and locations.parked.count() != 0) locations.parked.clearRetainingCapacity();
         var refreshed = false;
         for (versions) |version| {
             var location = locations.map.get(version);
@@ -5093,7 +5125,10 @@ pub const PersistentIndex = struct {
                 }
                 location = locations.map.get(version);
             }
-            const found = location orelse continue;
+            const found = location orelse {
+                if (pending) try locations.parked.put(self.alloc, version, {});
+                continue;
+            };
             if ((try snap.segmentIndex(found.seg_id)) == null) continue;
             try self.writer.applyCommittedDeletes(found.seg_id, &.{found.local_id});
             _ = locations.map.remove(version);
@@ -7030,7 +7065,7 @@ test "persistent index merge folds level-0 records into a segment" {
     try test_sink.foreignPut(native_catalog_backend.tip_namespace, "doc:a", &DocVersion.encode(va));
     const mutations = publication.mutations();
     try InlinePublicationTestSink.submit(&test_sink, "", &mutations, true);
-    try pi.installInlineSegmentPublication(&publication);
+    try pi.installInlineSegmentPublication(&publication, null);
     const other = try buildSimpleSegment(alloc, "doc:b", "beta");
     defer alloc.free(other);
     try pi.indexSegment(other);
@@ -7091,7 +7126,7 @@ test "persistent index publishes an inline write as a level-0 record and reloads
             .native_catalog => |backend| try backend.applyExternallyCommittedMutations(&mutations),
             else => return error.TestUnexpectedResult,
         }
-        try pi.installInlineSegmentPublication(&publication);
+        try pi.installInlineSegmentPublication(&publication, null);
         const snap = pi.writer.acquireSnapshot();
         defer snap.release();
         try std.testing.expectEqual(@as(usize, 1), snap.segments.len);
@@ -7136,7 +7171,7 @@ test "persistent index masks a late level-0 install and clears it on rebuild" {
         try sink.foreignPut(native_catalog_backend.tip_namespace, "doc:a", &DocVersion.encode(DocVersion.deletion(version)));
 
         pi.installDeadVersions(&.{version});
-        try pi.installInlineSegmentPublication(&publication);
+        try pi.installInlineSegmentPublication(&publication, null);
         {
             const snapshot = pi.writer.acquireSnapshot();
             defer snapshot.release();
@@ -7175,8 +7210,40 @@ test "persistent index reconciles dead buckets after reverse completion" {
     defer alloc.free(newer_value);
     try sink.foreignPut(dead_namespace, &key, newer_value);
 
-    try pi.reconcileInlineCommittedMutations(&.{.{ .namespace = dead_namespace, .key = &key, .value = newer_value }});
-    try pi.reconcileInlineCommittedMutations(&.{.{ .namespace = dead_namespace, .key = &key, .value = older_value }});
+    // Two commits decide the same bucket in order; their installs run in
+    // reverse. The later decision stays.
+    const Decision = struct {
+        key: []const u8,
+        value: []const u8,
+        fn resolve(ptr: *anyopaque, _: native_catalog_backend.TipReader, resolver: *native_catalog_backend.Resolver) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try resolver.put(dead_namespace, self.key, self.value);
+        }
+        fn noTip(_: *anyopaque, _: Allocator, _: ?[]const u8, _: []const u8) anyerror!?[]u8 {
+            return null;
+        }
+    };
+    const backend = pi.nativeCatalogBackend().?;
+    var older: Decision = .{ .key = &key, .value = older_value };
+    var newer: Decision = .{ .key = &key, .value = newer_value };
+    var first_resolver = native_catalog_backend.Resolver.init(alloc, &older, Decision.resolve);
+    defer first_resolver.deinit();
+    first_resolver.epoch_backend = backend;
+    var second_resolver = native_catalog_backend.Resolver.init(alloc, &newer, Decision.resolve);
+    defer second_resolver.deinit();
+    second_resolver.epoch_backend = backend;
+    const tip: native_catalog_backend.TipReader = .{ .ptr = undefined, .getFn = Decision.noTip };
+    try first_resolver.run(tip);
+    try second_resolver.run(tip);
+    // A third decision that never committed changes nothing.
+    var rejected_resolver = native_catalog_backend.Resolver.init(alloc, &older, Decision.resolve);
+    defer rejected_resolver.deinit();
+    rejected_resolver.epoch_backend = backend;
+    try rejected_resolver.run(tip);
+    backend.revertResolved(&rejected_resolver);
+
+    try backend.applyCommittedResolution(&second_resolver);
+    try backend.applyCommittedResolution(&first_resolver);
 
     var read = try pi.beginReadMainTxn();
     defer read.abort();
