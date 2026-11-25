@@ -255,3 +255,20 @@ it("preserves server-provided chat history on JSON fallback", async () => {
   await expect(turn.messages).resolves.toEqual(messages);
   expect(onMessagesUpdated).toHaveBeenCalledExactlyOnceWith(messages);
 });
+
+it("requests generation by default for chat and rejects a completed turn with sources only", async () => {
+  const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+    new Response('event: done\ndata: {"status":"completed","hits":[]}\n\n', {
+      headers: { "Content-Type": "text/event-stream" },
+    })
+  );
+  const turn = await new AntflyClient({ baseUrl: "http://localhost:8080" }).chatAgent(
+    "question",
+    chatConfig,
+    [],
+    {}
+  );
+  if (!("abortController" in turn)) throw new Error("expected streaming turn");
+  expect(JSON.parse(String(fetch.mock.calls[0][1]?.body)).steps).toEqual({ generation: {} });
+  await expect(turn.messages).rejects.toThrow("Retrieval completed without generating an answer.");
+});

@@ -444,18 +444,28 @@ const LiveEmitter = struct {
         }
     }
 
-    fn emitStep(self: *LiveEmitter, step: AgentStep) !void {
-        if (self.sink == null) return;
-        const step_id = try std.fmt.allocPrint(self.alloc, "step_{d}", .{self.next_step_index});
-        defer self.alloc.free(step_id);
+    fn startStep(self: *LiveEmitter, step: AgentStep) !?usize {
+        if (self.sink == null) return null;
+        const index = self.next_step_index;
         self.next_step_index += 1;
-
+        const id = try std.fmt.allocPrint(self.alloc, "step_{d}", .{index});
+        defer self.alloc.free(id);
         try self.emitValue("step_started", .{
-            .id = step_id,
+            .id = id,
             .kind = step.kind,
             .name = step.name,
             .action = step.action,
         });
+        return index;
+    }
+
+    fn emitStep(self: *LiveEmitter, step: AgentStep) !void {
+        try self.completeStep(try self.startStep(step), step);
+    }
+
+    fn completeStep(self: *LiveEmitter, index: ?usize, step: AgentStep) !void {
+        const step_id = try std.fmt.allocPrint(self.alloc, "step_{d}", .{index orelse return});
+        defer self.alloc.free(step_id);
 
         if (std.mem.eql(u8, step.name, "pipeline")) {
             if (self.replay_result) |result| try self.emitHits(result.hits, result.strategy_used == .tree or hasTreeHits(result.hits));
@@ -1720,8 +1730,29 @@ test "model-directed retrieval executes authorized tools and returns results to 
     const Fake = struct {
         turn: usize = 0,
         searches: usize = 0,
+        search_step_started: bool = false,
+        search_step_completed: bool = false,
+
+        fn emit(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, json: []const u8) !void {
+            const start = std.mem.eql(u8, name, "step_started");
+            const complete = std.mem.eql(u8, name, "step_completed");
+            if (!start and !complete) return;
+            const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+            defer parsed.deinit();
+            if (!std.mem.eql(u8, parsed.value.object.get("name").?.string, "search")) return;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (start) {
+                try std.testing.expect(!self.search_step_started and self.searches == 0);
+                self.search_step_started = true;
+            } else {
+                try std.testing.expect(self.search_step_started and self.searches == 1);
+                self.search_step_completed = true;
+            }
+        }
+
         fn query(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, body: []const u8) !query_api.QueryResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.search_step_started and !self.search_step_completed);
             self.searches += 1;
             try std.testing.expectEqualStrings("docs", table);
             // Model refinements must not replace mandatory table predicates.
@@ -1753,7 +1784,9 @@ test "model-directed retrieval executes authorized tools and returns results to 
     const body =
         \\{"query":"Find the anatomy canary","stream":false,"max_internal_iterations":3,"generator":{"provider":"antfly","model":"ggml-org/gemma-4-E4B-it-GGUF","max_tokens":512,"temperature":0},"steps":{"generation":{"enabled":true}},"queries":[{"table":"docs","full_text_search":{"match":"anatomy","field":"title"},"filter_query":{"term":"tenant-a","field":"tenant"},"limit":3}]}
     ;
-    const encoded = try executeJson(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .run_query = Fake.query } }, .{ .ptr = &fake, .vtable = &.{ .execute_chain = Fake.generate } }, body);
+    const response = try executeWithEventSink(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .run_query = Fake.query } }, .{ .ptr = &fake, .vtable = &.{ .execute_chain = Fake.generate } }, body, .{ .ptr = &fake, .emit_json_fn = Fake.emit });
+    const encoded = response.body;
+    try std.testing.expect(fake.search_step_completed);
     defer std.testing.allocator.free(encoded);
     var result = try std.json.parseFromSlice(RetrievalAgentResult, std.testing.allocator, encoded, .{});
     defer result.deinit();
@@ -2378,28 +2411,35 @@ fn executeModelTools(
                 if (predicates[index].exclusion_query) |filter| try constraints.map.put(arena, "mandatory_exclusion", filter);
                 if (scope.indexes) |indexes| try constraints.map.put(arena, "allowed_indexes", (try std.json.parseFromSlice(std.json.Value, arena, try std.json.Stringify.valueAlloc(arena, indexes, .{}), .{})).value);
                 if (scope.full_text_index) |index_name| try constraints.map.put(arena, "full_text_index", .{ .string = index_name });
+                var plan_step: AgentStep = .{ .kind = .tool_call, .name = "build_query", .action = "planning a search", .status = .@"error" };
+                var details = JsonObject{};
+                try details.map.put(arena, "tool_call_id", .{ .string = call.id });
+                try details.map.put(arena, "query_index", .{ .integer = @intCast(index) });
+                plan_step.details = details;
+                const step_index = try live.startStep(plan_step);
                 const built = runner.buildQuery(arena, .{
                     .intent = args.value.intent,
                     .table = scope.table,
                     .constraints = constraints,
                     .generator = generating.openApiFromConfig(base_chain[0].generator),
                     .max_internal_iterations = @min(rounds - budget.used, planning_calls),
-                }, .{ .ptr = &budget, .vtable = &.{ .execute_chain = AgentGenerationBudget.generate } }) catch |err| switch (err) {
-                    error.AgentToolLimitExceeded => {
+                }, .{ .ptr = &budget, .vtable = &.{ .execute_chain = AgentGenerationBudget.generate } }) catch |err| {
+                    try live.completeStep(step_index, plan_step);
+                    if (err == error.AgentToolLimitExceeded) {
                         outcome.rounds = budget.used;
                         outcome.exhausted = true;
                         return outcome;
-                    },
-                    else => return err,
+                    }
+                    return err;
                 };
                 outcome.rounds = budget.used;
                 for (built.steps orelse &.{}) |step| if (step.kind == .tool_call) {
                     outcome.calls += 1;
                 };
-                var details = JsonObject{};
-                try details.map.put(arena, "tool_call_id", .{ .string = call.id });
-                try details.map.put(arena, "query_index", .{ .integer = @intCast(index) });
-                try appendStep(arena, steps, live, .{ .kind = .tool_call, .name = "build_query", .action = "delegated query planning to query-builder", .status = if (built.status == .completed) .success else .@"error", .details = details });
+                plan_step.action = "delegated query planning to query-builder";
+                if (built.status == .completed and built.query_request != null) plan_step.status = .success;
+                try steps.append(arena, plan_step);
+                try live.completeStep(step_index, plan_step);
                 for (built.steps orelse &.{}) |step| try appendStep(arena, steps, live, step);
                 if (built.status != .completed or built.query_request == null) {
                     try rejectModelToolCall(arena, steps, live, &history, call, "{\"error\":\"Query builder did not produce a validated plan\"}");
@@ -2529,18 +2569,30 @@ fn executeModelTools(
             // The same canonical encoder reinstalls every mandatory predicate.
             const query_json = try encodeQueryValueForRetrievalQuery(alloc, runner, raw_queries[index], query, active_predicates[index], hits.items, null, index, .initial);
             defer alloc.free(query_json);
-            const executed = try runQueryWithResults(alloc, arena, runner, query.table orelse return error.InvalidRetrievalAgentRequest, query_json, request.query, query.tree_search != null, true);
+            var search_step: AgentStep = .{ .kind = .tool_call, .name = "search", .action = "searching the table", .status = .@"error" };
+            const table = query.table orelse return error.InvalidRetrievalAgentRequest;
+            const strategy = detectStrategy(query);
+            var details = try buildToolStepDetails(arena, query, index, strategy);
+            try details.map.put(arena, "tool_call_id", .{ .string = call.id });
+            try details.map.put(arena, "arguments", .{ .string = call.arguments });
+            try details.map.put(arena, "selection_source", .{ .string = "model_tool_call" });
+            search_step.details = details;
+            const step_index = try live.startStep(search_step);
+            const executed = runQueryWithResults(alloc, arena, runner, table, query_json, request.query, query.tree_search != null, true) catch |err| {
+                try live.completeStep(step_index, search_step);
+                return err;
+            };
             const found = executed.hits;
+            try details.map.put(arena, "hit_count", .{ .integer = @intCast(found.len) });
+            search_step.details = details;
+            search_step.action = "executed model-requested authorized search";
+            search_step.status = .success;
+            try steps.append(arena, search_step);
+            try live.completeStep(step_index, search_step);
             successful_searches += 1;
             last_hit_counts[index] = found.len;
             try accumulateHits(arena, hits, seen, state_ptrs.hit_tables, query.table, found);
-            try strategies.append(arena, detectStrategy(query));
-            var details = try buildToolStepDetails(arena, query, index, detectStrategy(query));
-            try details.map.put(arena, "tool_call_id", .{ .string = call.id });
-            try details.map.put(arena, "arguments", .{ .string = call.arguments });
-            try details.map.put(arena, "hit_count", .{ .integer = @intCast(found.len) });
-            try details.map.put(arena, "selection_source", .{ .string = "model_tool_call" });
-            try appendStep(arena, steps, live, .{ .kind = .tool_call, .name = "search", .action = "executed model-requested authorized search", .status = .success, .details = details });
+            try strategies.append(arena, strategy);
             try live.emitHits(found, query.tree_search != null);
             // Keep complete JSON documents; never truncate in the middle of a
             // UTF-8 string or silently lose the tool/result correlation.
