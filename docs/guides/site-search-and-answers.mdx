@@ -18,11 +18,11 @@ Your React app has a search page and an answer box on the same Antfly table. Typ
 
 ## Before You Start
 
-Antfly running with an indexed table and the Gemma 4 generation model pulled. The examples use a table called `docs` with an embeddings index named `body_embeddings`; the [Quickstart](/docs/guides/quickstart#add-text-embeddings) shows how to add an embeddings index. Adapt its table and index names to this example.
+Antfly running with an indexed table and the Gemma 4 E2B IT generation model pulled. The examples use a table called `docs` with an embeddings index named `body_embeddings`; the [Quickstart](/docs/guides/quickstart#add-text-embeddings) shows how to add an embeddings index. Adapt its table and index names to this example.
 
 ```bash
 curl -s http://127.0.0.1:8080/db/v1/tables/docs | head -c 300
-antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0 --tasks generate --projector auto
+antfly inference pull hf:ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_0 --tasks generate --projector auto
 ```
 
 ### Connect from the browser
@@ -131,7 +131,7 @@ import {
   renderThumbsUpDown,
 } from '@antfly/components'
 
-const GENERATOR = { provider: 'antfly', model: 'ggml-org/gemma-4-E4B-it-GGUF' }
+const GENERATOR = { provider: 'antfly', model: 'hf:ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_0' }
 
 export function AnswerBox() {
   return (
@@ -150,6 +150,7 @@ export function AnswerBox() {
         retrievalMode="planned"
         semanticIndexes={['body_embeddings']}
         generator={GENERATOR}
+        systemPrompt="Cite the supporting search hit in your final answer with its numbered reference, such as [1] when you use the first hit."
         limit={10}
         showHits
         showActivity
