@@ -177,38 +177,24 @@ pub const FrontierSlots = struct {
     };
 
     pub fn readLatest(self: FrontierSlots, file: File, io: Io) !?Published {
-        return self.read(file, io, null);
+        return (try self.read(file, io, null)).newest;
     }
 
     /// Find the frontier named by a live publication. The other slot can
     /// already contain the next group's frontier before that group is visible.
     pub fn readSequence(self: FrontierSlots, file: File, io: Io, sequence: u64) !?Published {
-        return self.read(file, io, sequence);
+        return (try self.read(file, io, sequence)).newest;
     }
 
-    /// Both logical slots, newest first (either may be absent).
-    pub fn readSlots(self: FrontierSlots, file: File, io: Io) !struct { newest: ?Published, other: ?Published } {
-        const newest = (try self.read(file, io, null)) orelse return .{ .newest = null, .other = null };
-        var other: ?Published = null;
-        for (self.offsets, 0..) |offset, page| {
-            var raw: [2 * Frontier.encoded_len]u8 = undefined;
-            const len = file.readPositionalAll(io, &raw, offset) catch |err| switch (err) {
-                error.InputOutput => continue,
-                else => return err,
-            };
-            for (0..len / Frontier.encoded_len) |copy| {
-                const slot: u1 = @intCast(page ^ copy);
-                if (slot == newest.slot) continue;
-                const frontier = Frontier.decode(raw[copy * Frontier.encoded_len ..][0..Frontier.encoded_len]) orelse continue;
-                if (frontier.sequence >= newest.frontier.sequence) continue;
-                if (other == null or frontier.sequence > other.?.frontier.sequence) other = .{ .slot = slot, .frontier = frontier };
-            }
-        }
-        return .{ .newest = newest, .other = other };
+    const ReadSlots = struct { newest: ?Published, other: ?Published };
+
+    /// Both logical slots from one pass over their two mirrored pages.
+    pub fn readSlots(self: FrontierSlots, file: File, io: Io) !ReadSlots {
+        return self.read(file, io, null);
     }
 
-    fn read(self: FrontierSlots, file: File, io: Io, sequence: ?u64) !?Published {
-        var latest: ?Published = null;
+    fn read(self: FrontierSlots, file: File, io: Io, sequence: ?u64) !ReadSlots {
+        var slots: [2]?Published = .{ null, null };
         var read_error: ?error{InputOutput} = null;
         for (self.offsets, 0..) |offset, page| {
             var raw: [2 * Frontier.encoded_len]u8 = undefined;
@@ -223,18 +209,30 @@ pub const FrontierSlots = struct {
                 const record = raw[copy * Frontier.encoded_len ..][0..Frontier.encoded_len];
                 const frontier = Frontier.decode(record) orelse continue;
                 if (sequence) |want| if (frontier.sequence != want) continue;
-                if (latest) |prior| {
+                const slot: u1 = @intCast(page ^ copy);
+                if (slots[slot]) |prior| {
                     if (frontier.sequence < prior.frontier.sequence) continue;
                     if (frontier.sequence == prior.frontier.sequence) {
                         if (!std.meta.eql(frontier, prior.frontier)) return error.ConflictingRedoFrontiers;
                         continue;
                     }
                 }
-                latest = .{ .slot = @intCast(page ^ copy), .frontier = frontier };
+                slots[slot] = .{ .slot = slot, .frontier = frontier };
             }
         }
-        if (latest == null) if (read_error) |err| return err;
-        return latest;
+        const first = slots[0] orelse {
+            if (slots[1] == null) if (read_error) |err| return err;
+            return .{ .newest = slots[1], .other = null };
+        };
+        const second = slots[1] orelse return .{ .newest = first, .other = null };
+        if (first.frontier.sequence == second.frontier.sequence) {
+            if (!std.meta.eql(first.frontier, second.frontier)) return error.ConflictingRedoFrontiers;
+            return .{ .newest = first, .other = null };
+        }
+        return if (first.frontier.sequence > second.frontier.sequence)
+            .{ .newest = first, .other = second }
+        else
+            .{ .newest = second, .other = first };
     }
 
     /// Each logical slot has one copy on each frontier page. Updating it

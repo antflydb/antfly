@@ -77,6 +77,7 @@ const c = struct {
 };
 
 const api = struct {
+    extern fn antfly_last_error_detail() [*:0]const u8;
     extern fn antfly_db_create_with_options(path: ?[*:0]const u8, options: ?*const c.OpenOptions, out_handle: ?*?*anyopaque) c.ErrorCode;
     extern fn antfly_db_open_with_options(path: ?[*:0]const u8, options: ?*const c.OpenOptions, out_handle: ?*?*anyopaque) c.ErrorCode;
     extern fn antfly_db_close(handle: ?*anyopaque) void;
@@ -218,7 +219,11 @@ fn runWorker(path: [:0]const u8, cfg: Config, indexed: bool, worker: usize) Work
             .stalled => result.stalled += 1,
             else => result.other += 1,
         }
-        if (code != .ok and result.first_error == 0) result.first_error = @backingInt(code);
+        if (code != .ok and result.first_error == 0) {
+            result.first_error = @backingInt(code);
+            const detail = std.mem.span(api.antfly_last_error_detail());
+            std.debug.print("writer {d} first error at sequence {d}: {s} {s}\n", .{ worker, sequence, c.errorCodeName(result.first_error), detail });
+        }
         // A write whose outcome is unknown leaves its slot's expectations
         // undefined; stop rather than verify against a guess.
         if (code != .ok and code != .busy) break;
