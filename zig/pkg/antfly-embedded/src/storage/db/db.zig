@@ -3165,6 +3165,10 @@ pub const DB = struct {
         schema_version: ?u32,
     };
     query_schema_identity: std.atomic.Value(u64) = .init(0),
+    /// Endpoint cleanup jobs come from graph topology. Without a graph index,
+    /// only jobs left from before open can exist; this records whether any
+    /// did, so a write need not open a read to look for them.
+    graph_endpoint_jobs_at_open: bool = true,
     resolver_query_schema_mutex: std.atomic.Mutex = .unlocked,
     resolver_query_schema_epoch: ?ResolverQuerySchemaEpoch = null,
     resolver_query_schema_digest: [32]u8 = undefined,
@@ -4736,6 +4740,8 @@ pub const DB = struct {
                 if (opts.defer_index_backfill_on_open) try db.core.loadIndexesDeferredBackfill() else try db.core.loadIndexes();
                 profile.load_indexes_ns = elapsedSince(load_indexes_started_ns);
             }
+            if (!openModeRequiresReadOnlyBackends(opts.open_mode))
+                db.graph_endpoint_jobs_at_open = db.core.hasGraphIndexes() or (db.core.store.hasGraphEndpointCleanup() catch true);
             if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
                 for (db.core.index_manager.graph_indexes.items) |entry| if (entry.ttl_duration_ns != 0) {
                     try db.core.index_manager.aggregateAuthoritativeReaderVersion(db.core.store, resolver_catalog_mod.graph_expiration_namespace_reader_version);
@@ -8102,8 +8108,13 @@ pub const DB = struct {
     fn drainStandaloneGraphEndpointCleanupWithOptions(self: *DB, opts: BatchExecutionOptions, max_pages: usize) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
         // Most batches create no endpoint jobs. Avoid authority probes and
-        // maintenance admission altogether on their completion path.
-        if (!try self.core.store.hasGraphEndpointCleanup()) return false;
+        // maintenance admission altogether on their completion path, and the
+        // probe's read itself without a graph index (`graph_endpoint_jobs_at_open`).
+        if (!self.core.hasGraphIndexes() and !self.graph_endpoint_jobs_at_open) return false;
+        if (!try self.core.store.hasGraphEndpointCleanup()) {
+            if (!self.core.hasGraphIndexes()) self.graph_endpoint_jobs_at_open = false;
+            return false;
+        }
         if (!try self.canRunLocalGraphEndpointCleanup()) return false;
         var pages: usize = 0;
         while (pages < max_pages and try self.core.store.hasGraphEndpointCleanup()) {

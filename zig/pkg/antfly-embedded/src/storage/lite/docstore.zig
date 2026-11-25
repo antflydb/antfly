@@ -7657,10 +7657,28 @@ pub const Txn = struct {
         // writer's pre-staging reads behind every fsync, so concurrent
         // writers could never share a group (WS3).
         const serialized_admission = store.file.externally_locked;
-        if (serialized_admission) lockStore(store);
-        defer if (serialized_admission) store.mutex.unlock();
         const pin = try store.readMetadataAllocator().create(ReadPin);
         errdefer store.readMetadataAllocator().destroy(pin);
+        // Serialized admission exists for the kernel fence wait. A pin that
+        // takes no fence (the generation already holds it, or a nested read
+        // borrowing the writer's lease) needs only `read_mutex`, which
+        // publication also takes, and so does not queue behind a group's
+        // apply for the publication mutex.
+        if (serialized_admission) fast: {
+            store.read_mutex.lockUncancelable(io);
+            defer store.read_mutex.unlock(io);
+            const generation = store.read_generation orelse break :fast;
+            if (store.read_outcome_unknown) break :fast;
+            store.writer_mutex.lockUncancelable(io);
+            const kernel_reader = !store.writer_active;
+            store.writer_mutex.unlock(io);
+            if (kernel_reader and generation.kernel_readers == 0) break :fast;
+            const checkpoint = generation.checkpoint;
+            pin.* = .{ .sequence = checkpoint.commit_sequence, .pinned_at = std.Io.Clock.awake.now(io), .kernel_reader = kernel_reader };
+            return .{ .allocator = store.allocator, .store = store, .read_pin = pin, .prefix = prefix, .read_generation = try store.pinInitializedReadGeneration(pin), .checkpoint = checkpoint };
+        }
+        if (serialized_admission) lockStore(store);
+        defer if (serialized_admission) store.mutex.unlock();
         store.read_mutex.lockUncancelable(io);
         if (store.read_generation == null) {
             store.read_mutex.unlock(io);
