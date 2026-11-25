@@ -56,6 +56,8 @@ pub const Summary = struct {
     skipped_paths: usize = 0,
     invalid_utf8_files: usize = 0,
     complete: bool = true,
+    scan_complete: bool = true,
+    coverage_complete: bool = true,
 };
 pub const Line = @import("source_cache.zig").Line;
 const Limits = @import("budget.zig").Limits;
@@ -609,6 +611,13 @@ pub const Search = struct {
     pub fn stopped(self: *Search) bool {
         return self.stop or (if (self.shared_limits) |limits| limits.cancel.load(.monotonic) else false);
     }
+    /// Coverage is an observed source milestone, independent of whether the
+    /// retained search itself finished. Do not count a known gap as a scan error.
+    pub fn reportCoverage(self: *Search, path: []const u8, artifact: []const u8, reason: []const u8, observation: anytype) !void {
+        self.summary.coverage_complete = false;
+        if (self.options.json and !self.options.quiet) try self.json(.{ .type = "coverage", .path = path, .artifact = artifact, .complete = false, .reason = reason, .observation = observation });
+        if (!self.options.no_messages) std.debug.print("antfly-grep: {s}: {s}: incomplete extraction coverage ({s}); searching available content\n", .{ path, artifact, reason });
+    }
     pub fn reportError(self: *Search, path: []const u8, err: anyerror) !void {
         if (err == error.WriteFailed or err == error.BrokenPipe) return err;
         if (self.pipeline) |pool| pool.context.mutex.lockUncancelable(self.io);
@@ -853,6 +862,8 @@ pub const Search = struct {
             self.summary.complete = false;
             try self.reportError("<search>", error.Canceled);
         }
+        self.summary.scan_complete = self.summary.complete;
+        self.summary.complete = self.summary.scan_complete and self.summary.coverage_complete;
         const elapsed = started.durationTo(std.Io.Clock.awake.now(self.io)).nanoseconds;
         const seconds = @as(f64, @floatFromInt(elapsed)) / 1_000_000_000.0;
         var human_buffer: [64]u8 = undefined;
@@ -861,7 +872,7 @@ pub const Search = struct {
         if (self.options.stats and !self.options.json) std.debug.print("{d} matches\n{d} matched lines\n{d} files contained matches\n{d} files searched\n{d} bytes searched\n{s} total\n", .{ self.summary.occurrences, self.summary.matches, self.summary.files_with_matches, self.summary.files, self.summary.bytes, human });
         if (self.options.ask != null and !self.options.quiet and !self.options.suppress_progress) std.debug.print("antfly-grep: {d} files, {d}/{d} regions evaluated, {d} matches, {d} requests, {d} input tokens, {s}\n", .{ self.summary.files, self.summary.regions_evaluated, self.summary.regions_considered, self.summary.matches, self.decider.requests, self.decider.input_tokens, if (self.summary.complete) "complete" else "partial" });
         try self.flushOutput();
-        return if (self.options.quiet and self.summary.matches > 0) 0 else if (!self.summary.complete) 2 else if (self.summary.matches != 0 or self.summary.reading_leads != 0) 0 else 1;
+        return if (!self.summary.coverage_complete) 2 else if (self.options.quiet and self.summary.matches > 0) 0 else if (!self.summary.complete) 2 else if (self.summary.matches != 0 or self.summary.reading_leads != 0) 0 else 1;
     }
     pub fn skipped(self: *Search) void {
         if (self.pipeline) |pool| pool.context.mutex.lockUncancelable(self.io);

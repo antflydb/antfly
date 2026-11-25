@@ -127,17 +127,51 @@ pub fn run(search: anytype) !void {
         }
     }
 }
-// A readable index can still contain only a prefix of an extraction. Check
-// convergence on both sides of a retained scan, including its catalog identity.
+// A retained scan and its extraction coverage are separate observations.
+// Revision progress is expected during ingestion; only a definition change
+// invalidates the binding of the retained scan.
+const StreamReadiness = struct {
+    incarnation: []const u8,
+    target_revision: u64,
+    published_revision: u64,
+    complete: bool,
+
+    fn sameRevision(self: @This(), other: @This()) bool {
+        return self.target_revision == other.target_revision and self.published_revision == other.published_revision;
+    }
+};
+
 fn scanStream(search: anytype, http: *httpx.Client, config: Config, table: Table, count: *usize, seen: *Seen) !void {
     const stream = table.selected_stream orelse return error.InvalidArtifactStream;
     if (stream.artifact == null) return scan(search, http, config, table, count, seen);
-    const before = try streamReadiness(search, http, config, table, stream);
-    defer search.a.free(before);
-    try scanArtifacts(search, http, config, table, count, seen);
-    const after = try streamReadiness(search, http, config, table, stream);
-    defer search.a.free(after);
-    if (!std.mem.eql(u8, before, after)) return error.ArtifactDefinitionChanged;
+    const before = streamReadiness(search, http, config, table, stream) catch |err| {
+        search.summary.coverage_complete = false;
+        return err;
+    };
+    defer search.a.free(before.incarnation);
+    if (!before.complete) {
+        search.summary.coverage_complete = false;
+        if (search.options.require_complete) return error.ArtifactStreamIncomplete;
+        try search.reportCoverage(table.alias orelse table.name, stream.artifact.?, "source_incomplete", before);
+    }
+    scanArtifacts(search, http, config, table, count, seen) catch |err| {
+        search.summary.coverage_complete = false;
+        return err;
+    };
+    const after = streamReadiness(search, http, config, table, stream) catch |err| {
+        search.summary.coverage_complete = false;
+        return err;
+    };
+    defer search.a.free(after.incarnation);
+    if (!std.mem.eql(u8, before.incarnation, after.incarnation)) {
+        search.summary.coverage_complete = false;
+        return error.ArtifactDefinitionChanged;
+    }
+    // These observations are not a coverage certificate for remote_snapshot.
+    // A moving revision cannot certify complete coverage of that scan's cut.
+    if (before.complete and (!after.complete or !before.sameRevision(after))) {
+        try search.reportCoverage(table.alias orelse table.name, stream.artifact.?, if (!after.complete) "source_incomplete" else "observation_changed", after);
+    }
 }
 fn scanArtifacts(search: anytype, http: *httpx.Client, config: Config, table: Table, count: *usize, seen: *Seen) !void {
     const stream = table.selected_stream.?;
@@ -284,7 +318,16 @@ fn responseResult(value: std.json.Value) !std.json.Value {
     return result;
 }
 
-fn streamReadiness(search: anytype, http: *httpx.Client, config: Config, table: Table, stream: record_view.Stream) ![]const u8 {
+fn readinessRevision(value: ?std.json.Value) !u64 {
+    const revision = value orelse return error.ArtifactReadinessUnavailable;
+    return switch (revision) {
+        .integer => if (revision.integer >= 0) @intCast(revision.integer) else error.InvalidIndexResponse,
+        .number_string => std.fmt.parseInt(u64, revision.number_string, 10) catch error.InvalidIndexResponse,
+        else => error.InvalidIndexResponse,
+    };
+}
+
+fn streamReadiness(search: anytype, http: *httpx.Client, config: Config, table: Table, stream: record_view.Stream) !StreamReadiness {
     var arena = std.heap.ArenaAllocator.init(search.a);
     defer arena.deinit();
     const a = arena.allocator();
@@ -349,23 +392,32 @@ fn streamReadiness(search: anytype, http: *httpx.Client, config: Config, table: 
     }
     if (!matching_field) return error.ArtifactIndexBindingChanged;
     const readiness = document.at(parsed.value, "status.readiness") orelse return error.ArtifactReadinessUnavailable;
-    const queryable = document.field(readiness, "queryable") orelse return error.ArtifactStreamIncomplete;
-    if (queryable != .bool or !queryable.bool) return error.ArtifactStreamIncomplete;
+    const queryable = document.field(readiness, "queryable") orelse return error.ArtifactReadinessUnavailable;
+    if (queryable != .bool) return error.InvalidIndexResponse;
+    if (!queryable.bool) return error.ArtifactStreamNotQueryable;
     const sources = document.field(readiness, "sources") orelse return error.ArtifactReadinessUnavailable;
     if (sources != .array) return error.InvalidIndexResponse;
     var found = false;
+    var source_complete = true;
     for (sources.array.items) |source| {
         const name = try document.string(source, "artifact");
         if (!std.mem.eql(u8, name, stream.artifact.?)) continue;
         found = true;
-        const complete = document.field(source, "complete") orelse return error.ArtifactStreamIncomplete;
-        if (complete != .bool or !complete.bool) return error.ArtifactStreamIncomplete;
+        const complete = document.field(source, "complete") orelse return error.ArtifactReadinessUnavailable;
+        if (complete != .bool) return error.InvalidIndexResponse;
+        source_complete = source_complete and complete.bool;
     }
     if (!found) return error.ArtifactIndexBindingChanged;
-    const incarnation = document.field(readiness, "incarnation") orelse return error.ArtifactReadinessUnavailable;
-    const target = document.field(readiness, "target_revision") orelse return error.ArtifactReadinessUnavailable;
-    const published = document.field(readiness, "published_revision") orelse return error.ArtifactReadinessUnavailable;
-    return std.json.Stringify.valueAlloc(search.a, .{ .incarnation = incarnation, .target = target, .published = published }, .{});
+    const incarnation = document.string(readiness, "incarnation") catch return error.ArtifactReadinessUnavailable;
+    if (incarnation.len == 0) return error.ArtifactReadinessUnavailable;
+    const target = try readinessRevision(document.field(readiness, "target_revision"));
+    const published = try readinessRevision(document.field(readiness, "published_revision"));
+    return .{
+        .incarnation = try search.a.dupe(u8, incarnation),
+        .target_revision = @intCast(target),
+        .published_revision = @intCast(published),
+        .complete = source_complete and target == published,
+    };
 }
 // Resolve user-facing selectors once to a set of physical source identities.
 // Cloud IDs take precedence over aliases. Manual configs select alias-or-name

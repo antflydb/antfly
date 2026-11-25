@@ -307,6 +307,22 @@ secrets, background synchronization, or Cloud source-management state. A conveni
 indexing command delegates to the shared ingestion runtime rather than embedding
 a second connector/extraction pipeline into the search process.
 
+Artifact scans distinguish retained-query completion from source extraction
+coverage. By default, a queryable artifact index can return its available content
+while OCR, transcription or other producers are pending or failed. Coverage gaps
+emit a structured `coverage` event containing the observed catalog incarnation,
+consumer target/published revisions and reason. Summary `scan_complete` describes
+execution; `coverage_complete` describes the selected artifact observations;
+`complete` is their conjunction. Unknown coverage remains an error, and a known
+gap exits 2 (including quiet mode) rather than returning an exhaustive no-match.
+`--require-complete` rejects known gaps before dispatch and requires complete,
+unchanged coverage observations after dispatch. Status observations do not certify
+coverage of an arbitrary retained snapshot: advancing revisions make coverage
+uncertain, but do not turn a successfully completed retained scan into a scan
+failure. Catalog incarnation changes, authorization failures and expired or
+changed query snapshots still fail the scan. No per-document manifest walk is
+added to the search path; coverage comes from bounded native readiness metadata.
+
 The durable searchable-source catalog lives in an ordinary Antfly table named
 `antfly_sources` by default (configurable for self-hosted profiles). It is shared
 infrastructure for hosted and self-hosted ingestion, not Cloud-specific storage or

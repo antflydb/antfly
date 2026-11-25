@@ -888,6 +888,20 @@ optional OR branches do not exclude their siblings. An unbound native-original
 completeness check can still require metadata verification across the source
 selection. Explicit `--artifact source` selects only inline text; configured
 artifact streams provide their own readiness checks.
+
+Artifact-backed searches require a queryable index, but can search its available
+content before every source has completed extraction. Gaps emit a coverage warning
+and a `coverage` JSON event with the observed incarnation and target/published
+revisions. Summary `scan_complete` reports whether the retained scan finished;
+`coverage_complete` reports whether selected source coverage was observed complete
+and stable across the scan. Overall `complete` requires both. Incomplete coverage
+exits 2 even with matches (including quiet mode); a no-match over that content is
+not an exhaustive corpus no-match. `--require-complete` rejects known gaps before
+searching each selected artifact stream. Revision progress can make coverage
+uncertain without invalidating the retained scan. Status observations are not
+snapshot-bound coverage certificates. Authorization failures, unknown readiness,
+changed definitions and invalid snapshots remain errors.
+
 Every alternative must supply a substring of
 at least three bytes; otherwise the entire query falls back to an exact scan.
 All returned content is verified with the shared matcher. Missing certificates
