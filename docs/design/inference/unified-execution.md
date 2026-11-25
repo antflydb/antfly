@@ -768,6 +768,34 @@ migration. Compatibility paths stay until their replacements satisfy correctness
 residency, lifetime and performance checks. Physical L4/A100 qualification remains
 deferred; CPU, local Metal and Glowworm GB10 provide the available hardware tests.
 
+### Inkling 2 Mini CUDA integration
+
+The released safetensors text and single-image routes use the shared model
+session and admission controller. Request state and concurrent workspace are
+admitted together. The same cold decoder layout supplies the allocation sizes
+for hybrid BF16 K/V, convolution history, page tables, attention scratch and
+command buffers. The existing conservative allowance remains for compatibility
+and vendor workspace. Image scratch and DSpark state retain their distinct
+storage classifications. The checkpoint loader uses the shared bounded pinned
+upload arena. The numerical path reuses the standalone Tile CUDA catalog.
+
+Spark GB10 tests at `89315aae16` exercised the released checkpoint, compared
+physical request allocation with the declared envelope, and checked model
+logits across 130 positions with capture and replay. The merged hybrid K/V
+and relative-attention suites passed on the same device, including the
+32,768-token, 48-visit cache rollback case. Warm native CLI generation
+returned identical bytes for 64 code tokens before and after the layout
+change, with observed decode intervals of 1,532.52 and 1,532.21 ms in one
+run each. A production HTTP test on the
+initial merge showed a different greedy continuation with batched DSpark
+verification for a 26-token code prompt. Production now selects exact
+row-wise verification. The batched path remains available for explicit
+qualification with `ANTFLY_INFERENCE_INKLING_BATCHED_SPECULATION=1`. The
+final production build matched all 96 generated tokens on that prompt with
+and without forced DSpark and returned the expected text and invoice answers.
+A single warm request took 2,524 ms without speculation and 2,808 ms with
+exact DSpark. The earlier batched throughput applies only to that verifier.
+
 ### Official Gemma 4 E2B QAT serving comparison
 
 The decoder and projector came from Google's E2B QAT Q4_0 GGUF revision
