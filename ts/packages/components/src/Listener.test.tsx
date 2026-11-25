@@ -25,11 +25,20 @@ describe("Listener", () => {
     expect(facetFilterMatches("Anything", "[", (value) => value)).toBe(false);
   });
   it("batches independent semantic results and binds facets to the selected results", async () => {
-    const multiquery = vi.spyOn(await import("./utils"), "multiquery").mockResolvedValue({
-      responses: [],
-    });
+    const multiquery = vi
+      .spyOn(await import("./utils"), "multiquery")
+      .mockImplementation(async (_url, batch) => ({
+        responses: batch.map(({ query }) => {
+          const index = query.indexes?.[0];
+          return {
+            status: 200,
+            took: 1,
+            hits: { hits: index ? [{ _id: index, _score: 1, _source: { title: index } }] : [] },
+          };
+        }),
+      }));
     try {
-      const { getByPlaceholderText } = render(
+      const { getByPlaceholderText, getByTestId } = render(
         <TestWrapper>
           <QueryBox id="search" mode="live" placeholder="Search articles" />
           <Results
@@ -37,14 +46,14 @@ describe("Listener", () => {
             searchBoxId="search"
             semanticIndexes={["body"]}
             itemsPerPage={4}
-            items={() => null}
+            items={(hits) => <output data-testid="text-hits">{hits.map((hit) => hit._id)}</output>}
           />
           <Results
             id="images"
             searchBoxId="search"
             semanticIndexes={["thumbnail"]}
             itemsPerPage={8}
-            items={() => null}
+            items={(hits) => <output data-testid="image-hits">{hits.map((hit) => hit._id)}</output>}
           />
           <Facet id="category" fields={["category"]} resultsId="images" />
         </TestWrapper>
@@ -63,6 +72,8 @@ describe("Listener", () => {
             aggregations: { category: expect.anything() },
           }),
         ]);
+        expect(getByTestId("text-hits").textContent).toBe("body");
+        expect(getByTestId("image-hits").textContent).toBe("thumbnail");
       });
     } finally {
       multiquery.mockRestore();

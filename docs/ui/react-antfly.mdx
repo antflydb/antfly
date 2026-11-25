@@ -457,6 +457,7 @@ const generator = {
 - `showActivity` (boolean): Display structured tool activity (default: false)
 - `showReasoning` (boolean): Legacy text stream, deprecated in favor of `showActivity`
 - `showFollowUpQuestions` (boolean): Opt in to legacy follow-up suggestions. Supplying `followUpCount` also opts in unless this prop is explicitly false.
+  The retrieval agent's `steps.followup`, `followup_questions`, and `followup` SSE event are deprecated. Apps can provide their own prompts for another turn. Required user input is still returned in `questions`.
 - `showConfidence` (boolean): Display confidence assessment (default: false)
 - `showHits` (boolean): Display search results used for context (default: false)
 
