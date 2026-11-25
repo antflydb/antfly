@@ -42946,6 +42946,7 @@ test "asset batch fallback isolates malformed envelope and preserves typed mixed
         .config = .{ .asset_producer = producer },
         .ownership = undefined,
     };
+    defer runtime.submitted_outputs.deinit(alloc);
 
     try index_manager.addEnrichment(&store, .{ .name = "asset", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}" });
     // Publication validates both the admitted recipe and its primary revision.
@@ -46038,6 +46039,7 @@ test "asset preparation is lazy and byte bounded across retryable provider batch
         .ownership = undefined,
     };
     defer clearPublishedGeneratedArtifacts(&runtime);
+    defer runtime.submitted_outputs.deinit(alloc);
     defer clearIsolatedFailedIndexes(&runtime);
     var window = GeneratedReplayWindow{ .alloc = alloc };
     defer window.deinit();
@@ -46238,6 +46240,7 @@ test "generic contextual asset publication keeps raw upstream identity" {
         .ownership = undefined,
     };
     defer clearPublishedGeneratedArtifacts(&runtime);
+    defer runtime.submitted_outputs.deinit(alloc);
     defer clearIsolatedFailedIndexes(&runtime);
     var window = GeneratedReplayWindow{ .alloc = alloc };
     defer window.deinit();
@@ -46447,6 +46450,7 @@ test "asset producer neighbor context samples local graph adjacency into the inp
         .ownership = undefined,
     };
     defer clearPublishedGeneratedArtifacts(&runtime);
+    defer runtime.submitted_outputs.deinit(alloc);
     defer clearIsolatedFailedIndexes(&runtime);
     var window = GeneratedReplayWindow{ .alloc = alloc };
     defer window.deinit();
@@ -46732,6 +46736,7 @@ test "asset batch fallback keeps the logical request retry budget" {
         },
         .ownership = undefined,
     };
+    defer runtime.submitted_outputs.deinit(alloc);
     defer clearIsolatedFailedIndexes(&runtime);
     var window = GeneratedReplayWindow{ .alloc = alloc };
     defer window.deinit();
@@ -48101,6 +48106,7 @@ test "model aware media vector labels rebuild from stored vectors without media 
         .config = .{},
         .ownership = undefined,
     };
+    defer runtime.submitted_outputs.deinit(alloc);
     try index_manager.addEnrichment(&store, .{ .name = "clips", .kind = .chunk, .field = "body", .chunk_size = 8 });
     try index_manager.addEnrichment(&store, .{ .name = "vectors", .kind = .embedding, .field = "body", .source_artifact_name = "clips", .expected_dims = 2 });
     try index_manager.addEnrichment(&store, .{ .name = "labels", .kind = .asset, .source_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}}" });
@@ -48348,6 +48354,7 @@ test "model aware media output repairs retain healthy vectors and persist indepe
         .config = .{},
         .ownership = undefined,
     };
+    defer runtime.submitted_outputs.deinit(alloc);
     const C = @import("inference_chunker");
     const output_types = C.outputs;
     var initial = [_]output_types.Result{
@@ -49864,6 +49871,7 @@ test "model aware media vocabulary cache retains 32 admitted vocabularies withou
         .config = .{},
         .ownership = undefined,
     };
+    defer runtime.submitted_outputs.deinit(alloc);
     try index_manager.addEnrichment(&store, .{ .name = "clips", .kind = .chunk, .field = "body", .chunk_size = 8 });
     try index_manager.addEnrichment(&store, .{ .name = "vectors", .kind = .embedding, .field = "body", .source_artifact_name = "clips", .expected_dims = 2 });
     try index_manager.addEnrichment(&store, .{ .name = "labels", .kind = .asset, .source_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}}" });
@@ -49956,6 +49964,7 @@ test "model aware media labels authenticate independently refreshed retained tex
         .config = .{},
         .ownership = undefined,
     };
+    defer runtime.submitted_outputs.deinit(alloc);
     try index_manager.addEnrichment(&store, .{ .name = "clips", .kind = .chunk, .field = "body", .chunk_size = 8 });
     try index_manager.addEnrichment(&store, .{ .name = "vectors", .kind = .embedding, .field = "body", .source_artifact_name = "clips", .expected_dims = 2, .producer_json = "{\"provider\":\"antfly\",\"model\":\"vectors\"}" });
     try index_manager.addEnrichment(&store, .{ .name = "labels", .kind = .asset, .source_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"}]}}" });
