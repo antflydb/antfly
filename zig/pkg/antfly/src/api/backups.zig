@@ -8058,7 +8058,7 @@ pub fn fenceUnpublishedCohortAttempt(alloc: std.mem.Allocator, io: std.Io, locat
     defer marker.deinit();
     if (!std.mem.eql(u8, marker.value.cluster_backup_id, backup_id)) return error.InvalidBackupAttemptMarker;
     var budget: usize = backup_attempt_cleanup_object_budget;
-    _ = try reclaimClusterBackupAttemptMarker(alloc, io, location, &marker.value, now_unix_ns, null, &budget);
+    _ = try reclaimClusterBackupAttemptMarker(alloc, io, location, &marker.value, now_unix_ns, &budget);
     var remaining = readClusterBackupAttemptMarker(alloc, io, location, attempt_id) catch |err| switch (err) {
         error.FileNotFound => return !try clusterManifestExistsAtLocationWithIo(alloc, io, location, backup_id),
         else => return err,
