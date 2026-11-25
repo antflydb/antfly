@@ -728,11 +728,13 @@ fn uintField(field: std.json.Value, min: u64, max: u64) Error!u64 {
 /// query using any of them is a snapshot: it registers no subscriptions and
 /// its dependents are never `current`. Every other query clause decides a
 /// row's membership from that row alone and is tracked live.
+/// Statement clauses come first: a statement decides membership on its own,
+/// so it is the reason a source is a snapshot even beside a `limit`.
 pub const ranking_clauses = [_][]const u8{
-    "full_text_search", "semantic_search", "embeddings",   "indexes",     "merge_config",
-    "reranker",         "exclusion_query", "graph_queries", "limit",       "text",
-    "text_field",       "vector",          "vector_index",  "k",           "cypher",
-    "sql",
+    "cypher",          "sql",           "full_text_search", "semantic_search", "embeddings",
+    "indexes",         "merge_config",  "reranker",         "exclusion_query", "graph_queries",
+    "limit",           "text",          "text_field",       "vector",          "vector_index",
+    "k",
 };
 const search_shorthands = [_][]const u8{ "text", "text_field", "vector", "vector_index", "k" };
 
@@ -4442,7 +4444,7 @@ test "sql query sources are snapshots whose members come from the _id column" {
     defer bindings.deinit();
     try testing.expect(std.mem.indexOf(u8, bindings.items[0].search_request, "\"parameters\":[\"p:1\"]") != null);
     const summary_value = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"s":{"query":{"sql":{"statement":"SELECT _id FROM t"}},"fields":["t"]}}
+        \\{"s":{"query":{"sql":{"statement":"SELECT _id FROM t"},"limit":5},"fields":["t"]}}
     , .{});
     defer summary_value.deinit();
     const summary = try trackingSummaryJsonAlloc(alloc, summary_value.value);
