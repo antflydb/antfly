@@ -26138,13 +26138,6 @@ test "generated Q6_K Q8_1 LM head excludes suppression and non-exact shapes" {
     try std.testing.expect(!generatedQ6KQ8_1LmHeadArgmaxEligible(1, 4096, 262144, 0));
 }
 
-fn allocQ4_0Q8_1ArgmaxTemp(self: *CudaCompute, bytes: usize) !?buffer_mod.DeviceBuffer {
-    return allocDeviceBuffer(self, bytes) catch |err| switch (err) {
-        error.CudaGraphCaptureUnsafeTempAlloc => null,
-        else => return err,
-    };
-}
-
 fn tryLinearQ4_0Q8_1ArgmaxE2BDevice(
     self: *CudaCompute,
     input_tensor: *const CudaTensor,
@@ -26173,49 +26166,15 @@ fn tryLinearQ4_0Q8_1ArgmaxE2BDevice(
     var profile_scope = beginDecodeProfile(self, .lm_head_argmax, rows);
     defer if (profile_scope) |*scope| scope.end();
 
-    const row_blocks = in_dim / 32;
-    const q8_blocks = try checkedMul(rows, row_blocks);
-    const q8_bytes = try checkedMul(q8_blocks, 36);
-    const col_tiles = (out_dim + 7) / 8;
-    const partial_count = try checkedMul(rows, col_tiles);
-    const partial_bytes = try checkedMul(partial_count, @sizeOf(f32));
-    const partial_storage_bytes = try checkedMul(partial_bytes, 2);
-
-    var q8_input = (try allocQ4_0Q8_1ArgmaxTemp(self, q8_bytes)) orelse {
-        noteQ4_0Q8_1ArgmaxFallback(self, "capture_unsafe_q8_temp", rows, in_dim, out_dim);
-        return null;
-    };
-    defer releaseDeviceBuffer(self, &q8_input);
-    var partial_storage = (try allocQ4_0Q8_1ArgmaxTemp(self, partial_storage_bytes)) orelse {
-        noteQ4_0Q8_1ArgmaxFallback(self, "capture_unsafe_partial_storage", rows, in_dim, out_dim);
-        return null;
-    };
-    defer releaseDeviceBuffer(self, &partial_storage);
-    const partial_values: buffer_mod.DeviceBuffer = .{
-        .ptr = partial_storage.ptr,
-        .len = partial_bytes,
-    };
-    const partial_indices: buffer_mod.DeviceBuffer = .{
-        .ptr = partial_storage.ptr + @as(u64, @intCast(partial_bytes)),
-        .len = partial_bytes,
-    };
-
-    var suppress_device: buffer_mod.DeviceBuffer = .{};
-    defer if (suppress_device.len != 0) releaseDeviceBuffer(self, &suppress_device);
-    if (suppress_token_ids.len != 0) {
-        const suppress_bytes = try checkedMul(suppress_token_ids.len, @sizeOf(i32));
-        suppress_device = (try allocQ4_0Q8_1ArgmaxTemp(self, suppress_bytes)) orelse {
-            noteQ4_0Q8_1ArgmaxFallback(self, "capture_unsafe_suppress_temp", rows, in_dim, out_dim);
+    const q8_bytes = try checkedMul(try checkedMul(rows, in_dim / 32), 36);
+    var scratch = ProjectionArgmaxScratch.acquire(self, rows, out_dim, 8, q8_bytes, suppress_token_ids) catch |err| switch (err) {
+        error.CudaGraphCaptureUnsafeTempAlloc, error.CudaGraphCaptureUnsafeHostCopy => {
+            noteQ4_0Q8_1ArgmaxFallback(self, @errorName(err), rows, in_dim, out_dim);
             return null;
-        };
-        copyFromHostTracked(self, suppress_device, std.mem.sliceAsBytes(suppress_token_ids)) catch |err| switch (err) {
-            error.CudaGraphCaptureUnsafeHostCopy => {
-                noteQ4_0Q8_1ArgmaxFallback(self, "capture_unsafe_suppress_copy", rows, in_dim, out_dim);
-                return null;
-            },
-            else => return err,
-        };
-    }
+        },
+        else => return err,
+    };
+    defer scratch.deinit(self);
 
     var token_device = allocGreedyTokenDeviceBuffer(self, @sizeOf(u32)) catch |err| switch (err) {
         error.CudaGraphCaptureUnsafeTempAlloc => {
@@ -26227,7 +26186,7 @@ fn tryLinearQ4_0Q8_1ArgmaxE2BDevice(
     var token_device_transferred = false;
     defer if (!token_device_transferred) releaseDeviceBufferLease(self, &token_device);
 
-    self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_input, input_tensor.buffer, rows, in_dim) catch |err| switch (err) {
+    self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, scratch.quantized_input, input_tensor.buffer, rows, in_dim) catch |err| switch (err) {
         error.CudaKernelUnavailable => {
             noteQ4_0Q8_1ArgmaxFallback(self, "quantize_unavailable", rows, in_dim, out_dim);
             return null;
@@ -26237,11 +26196,11 @@ fn tryLinearQ4_0Q8_1ArgmaxE2BDevice(
     self.kernels.launchLinearQ4_0Q8_1ArgmaxRowsTile8E2B(
         &self.ctx,
         token_device.buffer,
-        partial_values,
-        partial_indices,
-        q8_input,
+        scratch.partial_values,
+        scratch.partial_indices,
+        scratch.quantized_input,
         weight_tensor.buffer,
-        suppress_device,
+        scratch.suppression,
         rows,
         in_dim,
         out_dim,
@@ -26275,20 +26234,22 @@ fn tryLinearQ4_0Q8_1ArgmaxE2BDevice(
     return token_device;
 }
 
-// The tile-4 scalar and batched reductions have the same scratch lifetime.
+// Projection reductions and any input packing share one scratch lifetime.
 const ProjectionArgmaxScratch = struct {
     bank: buffer_mod.DeviceBuffer,
     partial_values: buffer_mod.DeviceBuffer,
     partial_indices: buffer_mod.DeviceBuffer,
     suppression: buffer_mod.DeviceBuffer,
+    quantized_input: buffer_mod.DeviceBuffer,
 
-    fn acquire(self: *CudaCompute, rows: usize, columns: usize, suppressed: []const i32) !ProjectionArgmaxScratch {
-        const tiles = (columns - 1) / 4 + 1;
+    fn acquire(self: *CudaCompute, rows: usize, columns: usize, tile_columns: usize, packed_bytes: usize, suppressed: []const i32) !ProjectionArgmaxScratch {
+        const tiles = (columns - 1) / tile_columns + 1;
         const partial_count = try checkedMul(rows, tiles);
         const values_bytes = try checkedMul(partial_count, @sizeOf(f32));
         const indices_bytes = try checkedMul(partial_count, @sizeOf(u32));
         const suppression_bytes = try checkedMul(suppressed.len, @sizeOf(i32));
-        const suppression_offset = try std.math.add(usize, values_bytes, indices_bytes);
+        const indices_offset = try std.math.add(usize, packed_bytes, values_bytes);
+        const suppression_offset = try std.math.add(usize, indices_offset, indices_bytes);
         const total = try std.math.add(usize, suppression_offset, suppression_bytes);
         var bank = try allocDeviceBuffer(self, total);
         errdefer releaseDeviceBuffer(self, &bank);
@@ -26300,8 +26261,9 @@ const ProjectionArgmaxScratch = struct {
         if (suppressed.len != 0) try copyFromHostTracked(self, suppression, std.mem.sliceAsBytes(suppressed));
         return .{
             .bank = bank,
-            .partial_values = .{ .ptr = bank.ptr, .len = values_bytes, .borrowed = true },
-            .partial_indices = .{ .ptr = bank.ptr + values_bytes, .len = indices_bytes, .borrowed = true },
+            .partial_values = .{ .ptr = bank.ptr + packed_bytes, .len = values_bytes, .borrowed = true },
+            .partial_indices = .{ .ptr = bank.ptr + indices_offset, .len = indices_bytes, .borrowed = true },
+            .quantized_input = if (packed_bytes == 0) .{} else .{ .ptr = bank.ptr, .len = packed_bytes, .borrowed = true },
             .suppression = suppression,
         };
     }
@@ -26399,7 +26361,7 @@ fn linearNoBiasArgmaxLastRowSuppressTensor(ctx: *anyopaque, input: CT, weight: C
         return null;
     }
 
-    var scratch = try ProjectionArgmaxScratch.acquire(self, 1, out_dim, suppress_token_ids);
+    var scratch = try ProjectionArgmaxScratch.acquire(self, 1, out_dim, 4, 0, suppress_token_ids);
     defer scratch.deinit(self);
 
     var token_device = try allocGreedyTokenDeviceBuffer(self, @sizeOf(i32));
@@ -26519,7 +26481,7 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
         null;
     defer if (profile_scope) |*scope| scope.end();
 
-    var scratch = try ProjectionArgmaxScratch.acquire(self, rows, out_dim, suppress_token_ids);
+    var scratch = try ProjectionArgmaxScratch.acquire(self, rows, out_dim, 4, 0, suppress_token_ids);
     defer scratch.deinit(self);
 
     var token_device = if (rows == 1 and allow_prepared_greedy_output)
@@ -42343,6 +42305,41 @@ test "CUDA projection argmax shares scratch across scalar and batched tails" {
         defer a.free(batch);
         try std.testing.expectEqualSlices(u32, &.{ first, last }, batch);
     }
+}
+
+test "CUDA generated Q4_0 projection argmax packs into its declared scratch" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.testing.init(a);
+    defer compute.deinit();
+    if (!compute.kernels.hasLinearQ4_0Q8_1ArgmaxE2BPrimitives()) return error.SkipZigTest;
+    const cb = compute.computeBackend();
+    const width = 1536;
+    const vocabulary = 262144;
+    const storage = try a.alloc(u8, vocabulary * (width / 32) * 18);
+    defer a.free(storage);
+    // Zero scales yield an exact tie. Suppressing the smallest index tests
+    // both the packed input and the distinct mask span at native geometry.
+    @memset(storage, 0);
+    var buffer = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, storage.len);
+    defer buffer.free(&compute.ctx);
+    try buffer.copyFromHost(&compute.ctx, storage);
+    var shape = [_]i64{ vocabulary, width };
+    const weight = CudaTensor{
+        .buffer = buffer,
+        .dtype = .u8,
+        .shape = &shape,
+        .elem_count = vocabulary * width,
+        .quant_type = .{ .known = .Q4_0 },
+    };
+    const values: [width]f32 = @splat(1);
+    const input = try cb.fromFloat32Shape(&values, &.{ 1, width });
+    defer cb.free(input);
+    var selected = (try tryLinearQ4_0Q8_1ArgmaxE2BDevice(&compute, tensorFromCt(input), &weight, 1, width, vocabulary, &.{0})) orelse return error.ExpectedFusedArgmax;
+    defer releaseDeviceBufferLease(&compute, &selected);
+    var token: [1]u32 = undefined;
+    try copyToHostTrackedAndSync(&compute, selected.buffer, std.mem.sliceAsBytes(&token));
+    try std.testing.expectEqual(@as(u32, 1), token[0]);
 }
 
 test "LightOnOCR3 CUDA Florence F16 LM head declines quantized fusion and preserves dense argmax" {
