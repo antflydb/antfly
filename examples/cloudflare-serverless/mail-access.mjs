@@ -17,7 +17,8 @@ const keysByIssuer = new Map();
 
 function bytes(value) {
   if (!/^[A-Za-z0-9_-]+$/.test(value)) throw Error("InvalidAccessToken");
-  return Uint8Array.from(atob(value.replaceAll("-", "+").replaceAll("_", "/")), (c) => c.charCodeAt(0));
+  const base64 = value.replaceAll("-", "+").replaceAll("_", "/");
+  return Uint8Array.from(atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, "=")), (c) => c.charCodeAt(0));
 }
 
 export function accessConfig(env) {
@@ -63,11 +64,16 @@ export async function accessIdentity(token, { issuer, audience }, onReject = () 
         (nbf !== undefined && (!Number.isFinite(nbf) || nbf > now)) ||
         type !== "app" || typeof sub !== "string" || !sub ||
         typeof email !== "string" || !email.includes("@")) return reject("AccessClaimsInvalid");
-    const key = await signingKey(issuer, kid);
+    let key;
+    try {
+      key = await signingKey(issuer, kid);
+    } catch (error) {
+      return reject(error.message === "UnknownAccessKey" ? "AccessSigningKeyUnknown" : "AccessSigningKeysUnavailable");
+    }
     if (!(await crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, bytes(signature),
       new TextEncoder().encode(header + "." + payload)))) return reject("AccessSignatureInvalid");
     return { id: "access:" + issuer + ":" + sub, email, name: email };
   } catch {
-    return reject("AccessVerificationFailed");
+    return reject("AccessAssertionMalformed");
   }
 }
