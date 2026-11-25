@@ -24252,7 +24252,14 @@ pub const ApiHttpServer = struct {
             }
         }
 
-        for (table_names, destinations, 0..) |source_name, table_name, i| {
+        // On retry the active table owns the only publication checkpoint.
+        // Resolve it before revisiting any earlier table that failed preflight.
+        const first_index = active_table_index orelse 0;
+        if (active_table_index != null and first_index >= table_names.len) return error.InternalFailure;
+        for (0..table_names.len) |step| {
+            const i = if (step == 0) first_index else if (step <= first_index) step - 1 else step;
+            const source_name = table_names[i];
+            const table_name = destinations[i];
             try self.ensureRestoreActive(cancellation);
             if (statuses[i].@"error" != null or std.mem.eql(u8, statuses[i].status, "skipped") or
                 (locally_completed.isSet(i) or restore_jobs.containsTableIndex(completed_table_ranges, @intCast(i)))) continue;
