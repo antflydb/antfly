@@ -12,7 +12,9 @@ export interface FacetProps {
   showFilter?: boolean;
   filterValueModifier?: (value: string) => string;
   itemsPerBlock?: number;
-  table?: string; // Optional table override (Phase 1: single table only)
+  table?: string;
+  /** Results widget whose query supplies the facet population. */
+  resultsId?: string;
   items?: (
     data: AggregationBucket[],
     options: {
@@ -45,6 +47,7 @@ export default function Facet({
   filterValueModifier,
   itemsPerBlock,
   table,
+  resultsId,
   items,
 }: FacetProps) {
   const [{ widgets }, dispatch] = useSharedContext();
@@ -82,9 +85,9 @@ export default function Facet({
       query: disjunctsFrom(toTermQueries(fields, value)),
       value,
       table: table,
-      configuration: { size, fields },
+      configuration: { size, fields, resultsId },
     });
-  }, [dispatch, id, size, value, fields, table]);
+  }, [dispatch, id, size, value, fields, table, resultsId]);
 
   // If widget value was updated elsewhere (ex: from active filters deletion)
   // We have to update and dispatch the component.

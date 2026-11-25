@@ -1,4 +1,5 @@
 import type {
+  AgentStep,
   ClassificationTransformationResult,
   EvalConfig,
   EvalResult,
@@ -8,7 +9,9 @@ import type {
   QueryHit,
   RetrievalAgentRequest,
   RetrievalAgentResult,
+  SSEStepStarted,
 } from "@antfly/sdk";
+import { type AnswerRetrievalOptions, answerRetrieval } from "@antfly/sdk";
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AnswerResultsContext, type AnswerResultsContextValue } from "./AnswerResultsContext";
 import { SafeRender } from "./SafeRender";
@@ -26,13 +29,18 @@ export interface AnswerResultsProps {
   exclusionQuery?: Record<string, unknown>; // Exclusion query to exclude matches
   fields?: string[];
   semanticIndexes?: string[];
+  retrievalMode?: AnswerRetrievalOptions["retrievalMode"];
+  maxInternalIterations?: number;
+  tools?: RetrievalAgentRequest["tools"];
 
   // Eval configuration - enables inline evaluation of answer quality
   eval?: EvalConfig;
 
   // Visibility controls
   showClassification?: boolean;
+  /** @deprecated Use showActivity for structured retrieval activity. */
   showReasoning?: boolean;
+  showActivity?: boolean;
   showFollowUpQuestions?: boolean;
   showConfidence?: boolean;
   showHits?: boolean;
@@ -41,6 +49,7 @@ export interface AnswerResultsProps {
   renderLoading?: () => ReactNode;
   renderEmpty?: () => ReactNode;
   renderClassification?: (data: ClassificationTransformationResult) => ReactNode;
+  /** @deprecated Use showActivity for structured retrieval activity. */
   renderReasoning?: (reasoning: string, isStreaming: boolean) => ReactNode;
   renderAnswer?: (answer: string, isStreaming: boolean, hits?: QueryHit[]) => ReactNode;
   renderConfidence?: (confidence: GenerationConfidence) => ReactNode;
@@ -101,6 +110,9 @@ export default function AnswerResults({
   exclusionQuery,
   fields,
   semanticIndexes,
+  retrievalMode,
+  maxInternalIterations,
+  tools,
   eval: evalConfig,
   systemPrompt,
   generationContext,
@@ -108,7 +120,8 @@ export default function AnswerResults({
   followUpCount,
   showClassification = false,
   showReasoning = false,
-  showFollowUpQuestions = true,
+  showActivity = false,
+  showFollowUpQuestions = followUpCount !== undefined,
   showConfidence = false,
   showHits = false,
   renderLoading,
@@ -138,6 +151,8 @@ export default function AnswerResults({
   const [classification, setClassification] = useState<ClassificationTransformationResult | null>(
     null
   );
+  const [activeSteps, setActiveSteps] = useState<SSEStepStarted[]>([]);
+  const [completedSteps, setCompletedSteps] = useState<AgentStep[]>([]);
   const [hits, setHits] = useState<QueryHit[]>([]);
   const [reasoning, setReasoning] = useState("");
   const [answer, setAnswer] = useState("");
@@ -168,6 +183,9 @@ export default function AnswerResults({
     exclusionQuery,
     fields,
     semanticIndexes,
+    retrievalMode,
+    maxInternalIterations,
+    tools,
     evalConfig,
     systemPrompt,
     generationContext,
@@ -175,6 +193,7 @@ export default function AnswerResults({
     followUpCount,
     showClassification,
     showReasoning,
+    showActivity,
     showFollowUpQuestions,
     showConfidence,
   ]);
@@ -184,6 +203,8 @@ export default function AnswerResults({
     previousRequestContextRef.current = requestContext;
     abortControllerRef.current?.abort();
     abortControllerRef.current = null;
+    setActiveSteps([]);
+    setCompletedSteps([]);
     setClassification(null);
     setHits([]);
     setReasoning("");
@@ -231,22 +252,11 @@ export default function AnswerResults({
 
     // Build the Retrieval Agent request with generation steps
     // QueryBox only provides the text value, AnswerResults owns the query configuration
-    const retrievalRequest: RetrievalAgentRequest = {
+    const retrievalRequest: Omit<RetrievalAgentRequest, "queries"> = {
       query: currentQuery,
       generator,
       agent_knowledge: agentKnowledge,
       stream: true,
-      queries: [
-        {
-          table: resolvedTable,
-          semantic_search: currentQuery,
-          ...(semanticIndexes?.length ? { indexes: semanticIndexes } : {}),
-          ...(fields?.length ? { fields: fields } : {}),
-          ...(filterQuery ? { filter_query: filterQuery } : {}),
-          ...(exclusionQuery ? { exclusion_query: exclusionQuery } : {}),
-          limit: limit ?? 10,
-        },
-      ],
       steps: {
         generation: {
           ...(systemPrompt ? { system_prompt: systemPrompt } : {}),
@@ -266,6 +276,8 @@ export default function AnswerResults({
     // Start streaming
     const startStream = async () => {
       // Reset state at the start of the async operation
+      setActiveSteps([]);
+      setCompletedSteps([]);
       setClassification(null);
       setHits([]);
       setReasoning("");
@@ -280,10 +292,23 @@ export default function AnswerResults({
         onStreamStart();
       }
 
+      let receivedAnswer = false;
       try {
         await streamAnswer(
           url,
-          retrievalRequest,
+          {
+            ...retrievalRequest,
+            ...answerRetrieval(resolvedTable, currentQuery, {
+              retrievalMode,
+              semanticIndexes,
+              maxInternalIterations,
+              tools,
+              fields,
+              filterQuery,
+              exclusionQuery,
+              limit,
+            }),
+          },
           headers || {},
           {
             onClassification: (data) => {
@@ -300,8 +325,22 @@ export default function AnswerResults({
               setHits((prev) => [...prev, hit]);
               onHitCallback?.(hit);
             },
+            ...(showActivity
+              ? {
+                  onStepStarted: (step: SSEStepStarted) => {
+                    if (requestController.signal.aborted || step.kind !== "tool_call") return;
+                    setActiveSteps((steps) => [...steps, step]);
+                  },
+                  onStepCompleted: (step: AgentStep) => {
+                    if (requestController.signal.aborted || step.kind !== "tool_call") return;
+                    setActiveSteps((steps) => steps.filter((active) => active.id !== step.id));
+                    setCompletedSteps((steps) => [...steps, step]);
+                  },
+                }
+              : {}),
             onGeneration: (chunk) => {
               if (requestController.signal.aborted) return;
+              receivedAnswer ||= chunk.trim().length > 0;
               setAnswer((prev) => prev + chunk);
               onGenerationChunkCallback?.(chunk);
             },
@@ -342,7 +381,13 @@ export default function AnswerResults({
               if (result.classification !== undefined) {
                 setClassification(result.classification ?? null);
               }
+              setActiveSteps([]);
               if (result.generation !== undefined) setAnswer(result.generation);
+              if (result.status === "completed" && !(result.generation?.trim() || receivedAnswer)) {
+                const message = "Retrieval completed without generating an answer.";
+                setError(message);
+                onErrorCallback?.(message);
+              }
               if (result.followup_questions !== undefined) {
                 setFollowUpQuestions(result.followup_questions);
               }
@@ -391,6 +436,9 @@ export default function AnswerResults({
     agentKnowledge,
     fields,
     semanticIndexes,
+    retrievalMode,
+    maxInternalIterations,
+    tools,
     filterQuery,
     exclusionQuery,
     evalConfig,
@@ -399,6 +447,7 @@ export default function AnswerResults({
     limit,
     followUpCount,
     showReasoning,
+    showActivity,
     showFollowUpQuestions,
     showConfidence,
     onController,
@@ -660,6 +709,22 @@ export default function AnswerResults({
           ) : (
             defaultRenderClassification(classification)
           ))}
+        {showActivity && (activeSteps.length > 0 || completedSteps.length > 0) && (
+          <details className="react-af-answer-activity">
+            <summary>{activeSteps.at(-1)?.action ?? "Retrieval activity"}</summary>
+            <ul>
+              {completedSteps.map((step, index) => (
+                <li key={step.id ?? index}>
+                  {step.action}
+                  {step.status === "error" ? " (failed)" : ""}
+                </li>
+              ))}
+              {activeSteps.map((step) => (
+                <li key={step.id}>{step.action}</li>
+              ))}
+            </ul>
+          </details>
+        )}
         {showReasoning &&
           reasoning &&
           (renderReasoning ? (

@@ -124,7 +124,7 @@ function defaultRenderError(error: string) {
 
 export default function ChatMessages({
   showHits = false,
-  showFollowUpQuestions = true,
+  showFollowUpQuestions = false,
   showConfidence = false,
   renderUserMessage,
   renderAssistantMessage,

@@ -45,8 +45,9 @@ afterEach(() => {
 });
 
 // Mock the @antfly/sdk module
-vi.mock("@antfly/sdk", () => {
+vi.mock("@antfly/sdk", async (importOriginal) => {
   return {
+    ...(await importOriginal<typeof import("@antfly/sdk")>()),
     queryHitsTotalValue: vi.fn((total) => total?.value),
     queryResultTotalHits: vi.fn((result) => result?.hits?.total?.value),
     AntflyClient: vi.fn(function () {

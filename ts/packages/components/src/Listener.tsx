@@ -25,6 +25,7 @@ interface FacetWidgetConfig {
   fields: string[];
   size: number;
   useCustomQuery?: boolean;
+  resultsId?: string;
 }
 
 interface SemanticQueryConfig {
@@ -127,6 +128,11 @@ export default function Listener({ children, onChange }: ListenerProps) {
       .sort();
   }
 
+  const widgetScopes = [...widgets].map(([id, widget]): [string, unknown] => [
+    id,
+    [widget.table, widget.filterQuery, widget.exclusionQuery, widget.rootQuery],
+  ]);
+
   // Track change groups using the actual widget inputs that drive requests.
   // This keeps autosuggest keystrokes isolated from submitted search widgets
   // while still invalidating correctly when configuration or backend context changes.
@@ -135,12 +141,14 @@ export default function Listener({ children, onChange }: ListenerProps) {
     queries: entriesForGroup(queries.entries(), true),
     semanticQueries: entriesForGroup(semanticQueries.entries(), true),
     configurations: entriesForGroup(configurations.entries(), true),
+    scopes: entriesForGroup(widgetScopes, true),
   });
   const nonAutosuggestGroupKey = JSON.stringify({
     context: { url, table, headers },
     queries: entriesForGroup(queries.entries(), false),
     semanticQueries: entriesForGroup(semanticQueries.entries(), false),
     configurations: entriesForGroup(configurations.entries(), false),
+    scopes: entriesForGroup(widgetScopes, false),
   });
 
   // Track previous group keys to determine which request families changed.
@@ -171,7 +179,9 @@ export default function Listener({ children, onChange }: ListenerProps) {
     // If you are debugging and your debug path leads you here, you might
     // check configurableWidgets and searchWidgets actually covers
     // the whole list of components that are configurables and queryable.
-    const queriesReady = queries.size + semanticQueries.size === searchWidgets.size;
+    const queriesReady = [...searchWidgets.keys()].every(
+      (id) => queries.has(id) || widgets.get(id)?.isSemantic
+    );
     const configurationsReady = configurations.size === configurableWidgets.size;
     const isAtLeastOneWidgetReady = searchWidgets.size + configurableWidgets.size > 0;
 
@@ -207,61 +217,34 @@ export default function Listener({ children, onChange }: ListenerProps) {
                   return; // Skip widgets without proper configuration
                 }
                 const { itemsPerPage, page, sort } = config;
-                // For autosuggest widgets, only include their own semantic query (complete isolation)
-                // For other widgets, exclude other autosuggest widgets
-                const filteredSemanticQueries = r.isAutosuggest
-                  ? [...semanticQueries.entries()].filter(([widgetId]) => widgetId === id)
-                  : [...semanticQueries.entries()].filter(([widgetId]) => {
-                      const widget = widgets.get(widgetId);
-                      // Include this widget's own semantic query
-                      if (widgetId === id) return true;
-                      // Exclude other autosuggest widgets
-                      return !widget?.isAutosuggest;
-                    });
-
-                const nonAutosuggestSemanticQueries = filteredSemanticQueries.map(([, v]) => v);
-                const semanticQuery = nonAutosuggestSemanticQueries.map((v) => v.query).join(" ");
-                const hasSemanticQuery = semanticQuery.length > 0;
-                // Get the first indexes configured for the widget
-                const indexes = nonAutosuggestSemanticQueries
-                  .map((v) => v.indexes)
-                  .filter((i) => i && Array.isArray(i) && i.length > 0)[0];
-
-                // If this widget is an autosuggest, only include its own query (complete isolation)
-                // Otherwise, if it's a root query, filter out other root queries
-                const filteredQueries = r.isAutosuggest
-                  ? new Map([...queries].filter(([queryId]) => queryId === id))
-                  : r.rootQuery
-                    ? new Map(
-                        [...queries].filter(([queryId]) => {
-                          const w = widgets.get(queryId);
-                          // Always include this widget's own query
-                          if (queryId === id) return true;
-                          // Include non-root queries (facets), but exclude autosuggest widgets
-                          return !w?.rootQuery && !w?.isAutosuggest;
-                        })
-                      )
-                    : new Map(
-                        [...queries].filter(([queryId]) => {
-                          const w = widgets.get(queryId);
-                          // For non-root query widgets, exclude only autosuggest widgets
-                          return !w?.isAutosuggest;
-                        })
-                      );
-
-                // Resolve table for this widget
+                const semantic = semanticQueries.get(id);
                 const tableName = resolveTable(r.table, table);
+                const filteredQueries = new Map(
+                  [...queries].filter(([queryId]) => {
+                    if (queryId === id) return true;
+                    const widget = widgets.get(queryId);
+                    if (!widget || r.isAutosuggest || widget.isAutosuggest || widget.wantResults) {
+                      return false;
+                    }
+                    const facetOwner = widget.isFacet ? widget.configuration?.resultsId : undefined;
+                    return (
+                      (!facetOwner || facetOwner === id) &&
+                      resolveTable(widget.table, table) === tableName &&
+                      (!r.rootQuery || !widget.rootQuery)
+                    );
+                  })
+                );
 
                 // Build the query object
                 const queryObj: Record<string, unknown> = {
                   table: tableName,
-                  semantic_search: hasSemanticQuery ? semanticQuery : undefined,
-                  indexes: hasSemanticQuery ? indexes : undefined,
+                  semantic_search: semantic?.query,
+                  indexes: semantic?.indexes,
                   limit: itemsPerPage,
                   offset: (page - 1) * itemsPerPage,
                   order_by: sort,
                 };
-                if (filteredQueries.size > 0 || !hasSemanticQuery) {
+                if (filteredQueries.size > 0 || !semantic) {
                   queryObj.full_text_search = conjunctsFrom(filteredQueries);
                 }
                 if (config.fields) {
@@ -337,25 +320,34 @@ export default function Listener({ children, onChange }: ListenerProps) {
                   fields.forEach((f: string) => {
                     result = { ...result, ...aggFromField(f) };
                   });
-                  // Join semanticQueries as a string, excluding autosuggest widgets except this one
-                  const nonAutosuggestSemanticQueries = [...semanticQueries.entries()]
-                    .filter(([widgetId]) => {
-                      const widget = widgets.get(widgetId);
-                      // Include this widget's own semantic query
-                      if (widgetId === id) return true;
-                      // Exclude other autosuggest widgets
-                      return !widget?.isAutosuggest;
+                  // An unbound facet can infer its source when the table has one result set.
+                  const candidates = [...resultWidgets].filter(
+                    ([, result]) =>
+                      !result.isAutosuggest && resolveTable(result.table, table) === tableName
+                  );
+                  const owner = config.resultsId
+                    ? candidates.find(([resultId]) => resultId === config.resultsId)?.[0]
+                    : candidates.length === 1
+                      ? candidates[0][0]
+                      : undefined;
+                  const ownerWidget = owner ? resultWidgets.get(owner) : undefined;
+                  const semantic = owner ? semanticQueries.get(owner) : undefined;
+                  const baseQueries = new Map(
+                    [...withoutOwnQueries()].filter(([queryId]) => {
+                      if (queryId === owner) return true;
+                      const widget = widgets.get(queryId);
+                      const facetOwner = widget?.isFacet
+                        ? widget.configuration?.resultsId
+                        : undefined;
+                      return (
+                        (!facetOwner || facetOwner === owner) &&
+                        widget &&
+                        !widget.isAutosuggest &&
+                        !widget.wantResults &&
+                        resolveTable(widget.table, table) === tableName
+                      );
                     })
-                    .map(([, v]) => v);
-                  const semanticQuery = nonAutosuggestSemanticQueries.map((v) => v.query).join(" ");
-                  // Get the first indexes configured for the widget
-                  const indexes = nonAutosuggestSemanticQueries
-                    .map((v) => v.indexes)
-                    .filter((i) => i && Array.isArray(i) && i.length > 0)[0];
-                  const limit = nonAutosuggestSemanticQueries.map((v) => v.limit)[0] || 10;
-
-                  // Build query with custom query support
-                  const baseQueries = withoutOwnQueries();
+                  );
 
                   // For custom queries, only include queries from other facets (exclude searchbox)
                   const facetOnlyQueries = new Map(
@@ -372,17 +364,17 @@ export default function Listener({ children, onChange }: ListenerProps) {
 
                   const facetQueryObj: Record<string, unknown> = {
                     table: tableName,
-                    semantic_search: semanticQuery || undefined,
-                    indexes: semanticQuery ? indexes : undefined,
-                    limit: semanticQuery ? limit : 0,
+                    semantic_search: semantic?.query,
+                    indexes: semantic?.indexes,
+                    limit: semantic ? (semantic.limit ?? 10) : 0,
                     full_text_search: fullTextQuery,
                     aggregations: result,
                   };
-                  if (f.filterQuery) {
-                    facetQueryObj.filter_query = f.filterQuery;
+                  if (f.filterQuery || ownerWidget?.filterQuery) {
+                    facetQueryObj.filter_query = f.filterQuery ?? ownerWidget?.filterQuery;
                   }
-                  if (f.exclusionQuery) {
-                    facetQueryObj.exclusion_query = f.exclusionQuery;
+                  if (f.exclusionQuery || ownerWidget?.exclusionQuery) {
+                    facetQueryObj.exclusion_query = f.exclusionQuery ?? ownerWidget?.exclusionQuery;
                   }
 
                   return facetQueryObj;
