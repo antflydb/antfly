@@ -58,6 +58,9 @@ pub const Stage = enum(u8) {
     merge,
     /// A merge commit waiting for the writer lease.
     merge_lease_wait,
+    /// A merge refused at the tip (`IndexScopeChanged`) and the index
+    /// refreshed from it before planning again.
+    merge_scope_changed,
     /// Within `text_segment_build` (from `BuildTextProfile`): tokenizing
     /// and accumulating terms.
     text_build_analyze,

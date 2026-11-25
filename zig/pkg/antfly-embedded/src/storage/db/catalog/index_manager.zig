@@ -27487,6 +27487,7 @@ pub const IndexManager = struct {
 
         const input_bytes = textMergeTaskInputBytes(task);
         const output_stats = textMergeResultOutputStats(result);
+        var scope_changed = false;
         const applied = if (result.prepared_segments.len == 0 and result.segments.len == 0) blk: {
             break :blk try entry.persistent.removeSegmentsIfActive(old_ids);
         } else if (result.prepared_segments.len > 0) blk: {
@@ -27502,7 +27503,10 @@ pub const IndexManager = struct {
                 error.EmptySegment => try entry.persistent.removeSegmentsIfActive(old_ids),
                 // At the tip an input was no longer active, or a live key had
                 // two copies: stale, like any other; it is planned again.
-                error.IndexScopeChanged => false,
+                error.IndexScopeChanged => scope: {
+                    scope_changed = true;
+                    break :scope false;
+                },
                 else => {
                     const mapped_err = task.deletion_state.allocationError(err);
                     logTextMergeFailure("apply", task.index_name, mapped_err);
@@ -27521,7 +27525,10 @@ pub const IndexManager = struct {
                 error.EmptySegment => try entry.persistent.removeSegmentsIfActive(old_ids),
                 // At the tip an input was no longer active, or a live key had
                 // two copies: stale, like any other; it is planned again.
-                error.IndexScopeChanged => false,
+                error.IndexScopeChanged => scope: {
+                    scope_changed = true;
+                    break :scope false;
+                },
                 else => {
                     const mapped_err = task.deletion_state.allocationError(err);
                     logTextMergeFailure("apply", task.index_name, mapped_err);
@@ -27529,6 +27536,19 @@ pub const IndexManager = struct {
                 },
             };
         };
+        if (scope_changed) {
+            // Another process committed under this index (most often its
+            // own merge of these inputs). Planned again from this view, the
+            // merge would fail the same way while a producer waits for it:
+            // take the index as committed first. The index is held here, by
+            // this merge or by the producer lending it. Pending inline
+            // installs refuse; the next pass retries.
+            write_stage_profile.add(.merge_scope_changed, 0);
+            entry.persistent.refreshFromTip() catch |err| switch (err) {
+                error.UnsupportedRefresh => {},
+                else => logTextMergeFailure("refresh", task.index_name, err),
+            };
+        }
         entry.merge_delta_mutex.unlock(entry.io);
         merge_delta_locked = false;
         if (index_apply_locked) entry.apply_mutex.unlock();
