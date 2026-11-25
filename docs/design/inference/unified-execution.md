@@ -855,8 +855,17 @@ suite tests on Spark GB10. The seed token 42 produced 34,851, 220 and 110,104,
 with peak logits 26.41237, 27.44930 and 24.88801. The suite also checked
 capture through position 130, heterogeneous batching, image prefill and
 speculative rollback. The first three decode intervals were 301.52, 37.99
-and 36.98 ms in this single run. The Mac GPU exercised all 48 Metal visits
-with synthetic weights. The released-checkpoint Metal comparison is pending.
+and 36.98 ms in this single run. The Mac GPU first exercised all 48 Metal visits with synthetic weights.
+
+The released Metal checkpoint at Hugging Face revision
+`c9d028302cd0f035fdf8e7e91f089a4ce94d2195` then passed all 80 tests in the
+focused suite. Metal reproduced CUDA's first three greedy token IDs. Its
+peak logits were 26.42824, 27.44696, and 24.87517. The fourth Metal step
+produced token 1541 with a peak of 26.31770. The decoder reported
+18,881,301,664 resident device bytes and a 55.88 s load. The four decode
+intervals were 21,549.53, 564.39, 61.19, and 60.54 ms with concurrent server
+compilation. These timings are from one run and leave the on-Mac HTTP and
+reference-engine gates open.
 
 ### Official Gemma 4 E2B QAT serving comparison
 
