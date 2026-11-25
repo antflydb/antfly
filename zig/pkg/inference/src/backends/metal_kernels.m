@@ -1781,6 +1781,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> causal_depthwise4_bf16_pipeline;
     id<MTLComputePipelineState> dense_bf16_projection_pipeline;
     id<MTLComputePipelineState> head_norm_bf16_pipeline;
+    id<MTLComputePipelineState> residual_mix_bf16_pipeline;
     TermiteMetalMtpHeadWorkspace *mtp_head_workspace;
     id<MTLDevice> device;
     // Opt-in dense embedding workspace guard. Counts fresh allocations until
@@ -12921,6 +12922,88 @@ static NSString *termite_metal_shader_source(void) {
            "    uint total = p.rows * p.dim; if (gid >= total) return; uint row = gid / p.dim; uint col = gid % p.dim; float value = 0.0f; uint route_base = row * p.top_k; for (uint k = 0u; k < p.top_k; ++k) { uint route = route_base + k; float scale = p.has_expert_scale != 0u ? expert_scale[expert_ids[route]] : 1.0f; value += (route_output[route * p.dim + col] * scale) * route_weights[route]; } output[gid] = value;\n"
            "}\n"
            // tile-codegen:end expert.projection.direct.7 family
+           // tile-codegen:begin residual.mix_bf16 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "struct ResidualMixBf16Params {\n"
+           "    uint rows, width, sources, add_last, normalize;\n"
+           "    float epsilon, norm_epsilon;\n"
+           "};\n"
+           "\n"
+           "inline float antfly_residual_mix_reduce(float value, uint tid, threadgroup float *partial) {\n"
+           "    const uint lane = tid % 32u;\n"
+           "    for (uint step = 16; step; step >>= 1) value += simd_shuffle_down(value, step);\n"
+           "    if (lane == 0) partial[tid / 32u] = value;\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    value = lane < 4u ? partial[lane] : 0.0f;\n"
+           "    for (uint step = 16; step; step >>= 1) value += simd_shuffle_down(value, step);\n"
+           "    value = simd_broadcast(value, 0);\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    return value;\n"
+           "}\n"
+           "\n"
+           "kernel void antfly_residual_mix_bf16(\n"
+           "    device const bfloat *blocks [[buffer(0)]],\n"
+           "    device const bfloat *last [[buffer(1)]],\n"
+           "    device const bfloat *add [[buffer(2)]],\n"
+           "    device const float *query [[buffer(3)]],\n"
+           "    device const bfloat *gamma [[buffer(4)]],\n"
+           "    device uchar *output [[buffer(5)]],\n"
+           "    constant ResidualMixBf16Params &p [[buffer(6)]],\n"
+           "    uint row [[threadgroup_position_in_grid]],\n"
+           "    uint tid [[thread_index_in_threadgroup]]\n"
+           ") {\n"
+           "    threadgroup float partial[4], scores[8], weights[8], mixed[4096];\n"
+           "    const ulong base = ulong(row) * p.width;\n"
+           "    const float scale = rsqrt(float(p.width));\n"
+           "    for (uint source = 0; source < p.sources; ++source) {\n"
+           "        const bool final = source + 1u == p.sources;\n"
+           "        const device bfloat *buf = final ? last + base : blocks + ulong(source) * p.rows * p.width + base;\n"
+           "        float dot = 0.0f, square = 0.0f;\n"
+           "        for (uint column = tid; column < p.width; column += 128u) {\n"
+           "            const float x = float(buf[column]) + (final && p.add_last ? float(add[base + column]) : 0.0f);\n"
+           "            dot = fma(x, query[column] * scale, dot);\n"
+           "            square = fma(x, x, square);\n"
+           "        }\n"
+           "        dot = antfly_residual_mix_reduce(dot, tid, partial);\n"
+           "        const float inv = rsqrt(antfly_residual_mix_reduce(square, tid, partial) / float(p.width) + p.epsilon);\n"
+           "        if (tid == 0u) {\n"
+           "            scores[source] = dot * inv;\n"
+           "            weights[source] = inv;\n"
+           "        }\n"
+           "    }\n"
+           "    if (tid == 0u) {\n"
+           "        float maximum = -INFINITY;\n"
+           "        for (uint i = 0; i < p.sources; ++i) maximum = max(maximum, scores[i]);\n"
+           "        float denom = 0.0f;\n"
+           "        for (uint i = 0; i < p.sources; ++i) {\n"
+           "            scores[i] = exp(scores[i] - maximum);\n"
+           "            denom += scores[i];\n"
+           "        }\n"
+           "        for (uint i = 0; i < p.sources; ++i) weights[i] *= scores[i] / denom;\n"
+           "    }\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    float square = 0.0f;\n"
+           "    for (uint column = tid; column < p.width; column += 128u) {\n"
+           "        float result = 0.0f;\n"
+           "        for (uint source = 0; source < p.sources; ++source) {\n"
+           "            const bool final = source + 1u == p.sources;\n"
+           "            const ulong index = base + column;\n"
+           "            const float x = final ? float(last[index]) + (p.add_last ? float(add[index]) : 0.0f)\n"
+           "                                  : float(blocks[ulong(source) * p.rows * p.width + index]);\n"
+           "            result = fma(x, weights[source], result);\n"
+           "        }\n"
+           "        if (p.normalize) {\n"
+           "            mixed[column] = result;\n"
+           "            square = fma(result, result, square);\n"
+           "        } else {\n"
+           "            reinterpret_cast<device float *>(output)[base + column] = result;\n"
+           "        }\n"
+           "    }\n"
+           "    if (!p.normalize) return;\n"
+           "    const float norm = rsqrt(antfly_residual_mix_reduce(square, tid, partial) / float(p.width) + p.norm_epsilon);\n"
+           "    for (uint column = tid; column < p.width; column += 128u)\n"
+           "        reinterpret_cast<device bfloat *>(output)[base + column] = bfloat((mixed[column] * norm) * float(gamma[column]));\n"
+           "}\n"
+           // tile-codegen:end residual.mix_bf16 family
            // tile-codegen:begin normalization.head_bf16 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "struct HeadNormBf16Params {\n"
            "    uint rows, heads, dim, position, log_floor, weighted;\n"
@@ -33751,6 +33834,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->causal_depthwise4_bf16_pipeline = nil;
     runtime->dense_bf16_projection_pipeline = nil;
     runtime->head_norm_bf16_pipeline = nil;
+    runtime->residual_mix_bf16_pipeline = nil;
     free(runtime);
     }
 }
@@ -36801,8 +36885,10 @@ static int antfly_metal_encode_typed_stage(
             runtime, command, TERMITE_METAL_COMPUTE_SOURCE_OTHER, &encoder_owned);
         if (!encoder) return -5;
         antfly_metal_set_compute_pipeline(encoder, pipeline);
+        size_t first_present = 0;
+        while (first_present < view_count && !buffers[first_present]) ++first_present;
         for (size_t index = 0; index < view_count; ++index) {
-            const size_t source = buffers[index] ? index : 0;
+            const size_t source = buffers[index] ? index : first_present;
             [encoder setBuffer:buffers[source] offset:views[source].offset atIndex:index];
         }
         [encoder setBytes:parameters length:parameter_size atIndex:view_count];
@@ -37022,6 +37108,31 @@ int antfly_metal_dispatch_head_norm_bf16(
     return antfly_metal_encode_typed_stage(runtime, @"antfly_head_norm_bf16_simd32",
         &runtime->head_norm_bf16_pipeline, views, required, alignment, 3, 1u << 2,
         p, sizeof(*p), MTLSizeMake(row_heads, 1, 1), MTLSizeMake(32, 1, 1));
+}
+
+typedef struct {
+    uint32_t rows, width, sources, add_last, normalize;
+    float epsilon, norm_epsilon;
+} antfly_metal_residual_mix_bf16_params;
+
+int antfly_metal_dispatch_residual_mix_bf16(
+    termite_metal_decode_runtime *runtime, const antfly_metal_routed_buffer views[6],
+    const antfly_metal_residual_mix_bf16_params *p
+) {
+    if (!runtime || !views || !p || !p->rows || !p->width || p->width > 4096 ||
+        !p->sources || p->sources > 8 || !isfinite(p->epsilon) || p->epsilon <= 0 ||
+        (p->normalize && (!isfinite(p->norm_epsilon) || p->norm_epsilon <= 0))) return -1;
+    const size_t row_bytes = (size_t)p->width * 2;
+    size_t bf16_bytes, blocks, output_bytes;
+    if (!termite_metal_size_mul(row_bytes, p->rows, &bf16_bytes) ||
+        !termite_metal_size_mul(bf16_bytes, p->sources - 1, &blocks) ||
+        !termite_metal_size_mul(bf16_bytes, p->normalize ? 1 : 2, &output_bytes)) return -1;
+    const size_t required[6] = {blocks, bf16_bytes, p->add_last ? bf16_bytes : 0,
+        (size_t)p->width * 4, p->normalize ? row_bytes : 0, output_bytes};
+    const size_t alignment[6] = {2, 2, 2, 4, 2, p->normalize ? 2 : 4};
+    return antfly_metal_encode_typed_stage(runtime, @"antfly_residual_mix_bf16",
+        &runtime->residual_mix_bf16_pipeline, views, required, alignment, 6, 1u << 5,
+        p, sizeof(*p), MTLSizeMake(p->rows, 1, 1), MTLSizeMake(128, 1, 1));
 }
 
 typedef struct { uint32_t rows, hidden, head_dim, grid_x, grid_y; float eps, theta, scale; uint32_t stride, start, rotate, weighted, cached_rotary; } termite_vision_norm_rope_params;

@@ -53696,3 +53696,93 @@ pub const HeadNormBf16 = struct {
         output.invalidateHostMirror();
     }
 };
+
+pub const ResidualMixBf16 = struct {
+    rows: u32,
+    width: u32,
+    sources: u32,
+    epsilon: f32,
+    norm_epsilon: f32 = 0,
+
+    const Buffer = RoutedBlockScaledProjection.Buffer;
+    const Wire = extern struct {
+        rows: u32,
+        width: u32,
+        sources: u32,
+        add_last: u32,
+        normalize: u32,
+        epsilon: f32,
+        norm_epsilon: f32,
+    };
+
+    extern fn antfly_metal_dispatch_residual_mix_bf16(runtime: *RawMetalDecodeRuntime, views: *const [6]Buffer, params: *const Wire) c_int;
+
+    pub const Inputs = struct {
+        blocks: ?*const MetalTensor,
+        last: *const MetalTensor,
+        add_last: ?*const MetalTensor = null,
+        query: *const MetalTensor,
+        gamma: ?*const MetalTensor = null,
+    };
+
+    pub fn encode(self: ResidualMixBf16, runtime: *RawMetalDecodeRuntime, input: Inputs, output: *MetalTensor) !void {
+        if (!hasActiveFrame(runtime)) return error.MetalFrameRequired;
+        if (output.isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
+        const dtype: metal_tensor.DType = if (input.gamma == null) .f32 else .i16;
+        const views: [6]Buffer = .{
+            if (input.blocks) |blocks| try .fromTensor(blocks, .i16) else .{},
+            try .fromTensor(input.last, .i16),
+            if (input.add_last) |add| try .fromTensor(add, .i16) else .{},
+            try .fromTensor(input.query, .f32),
+            if (input.gamma) |gamma| try .fromTensor(gamma, .i16) else .{},
+            try .fromTensor(output, dtype),
+        };
+        if (antfly_metal_dispatch_residual_mix_bf16(runtime, &views, &.{
+            .rows = self.rows,
+            .width = self.width,
+            .sources = self.sources,
+            .add_last = @intFromBool(input.add_last != null),
+            .normalize = @intFromBool(input.gamma != null),
+            .epsilon = self.epsilon,
+            .norm_epsilon = self.norm_epsilon,
+        }) != 0) return error.MetalKernelDispatchFailed;
+        output.invalidateHostMirror();
+    }
+};
+
+test "Metal BF16 residual mixing preserves F32 and normalized output boundaries" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const zero: [128]f32 = @splat(0);
+    const minus: [128]u16 = @splat(0xbf80);
+    const ones: [128]u16 = @splat(0x3f80);
+    const twos: [128]u16 = @splat(0x4000);
+    const payloads: [4][]const u8 = .{
+        std.mem.asBytes(&minus), std.mem.asBytes(&ones), std.mem.asBytes(&zero), std.mem.asBytes(&twos),
+    };
+    var tensors: [6]MetalTensor = undefined;
+    var initialized: usize = 0;
+    defer for (tensors[0..initialized]) |*value| value.deinit();
+    for (&tensors, [_]metal_tensor.DType{ .i16, .i16, .f32, .i16, .f32, .i16 }, 0..) |*value, dtype, index| {
+        value.* = try MetalTensor.deviceAllocateTyped(a, runtime, dtype, .shared, &.{128});
+        initialized += 1;
+        if (index < payloads.len) try value.uploadBytes(payloads[index]);
+    }
+    try beginFrame(runtime);
+    errdefer cancelFrame(runtime) catch {};
+    const mixed: ResidualMixBf16 = .{ .rows = 1, .width = 128, .sources = 2, .epsilon = 0.000001 };
+    try mixed.encode(runtime, .{ .blocks = &tensors[0], .last = &tensors[1], .query = &tensors[2] }, &tensors[4]);
+    const normalized: ResidualMixBf16 = .{ .rows = 1, .width = 128, .sources = 1, .epsilon = 0.000001, .norm_epsilon = 0.000001 };
+    try normalized.encode(runtime, .{ .blocks = null, .last = &tensors[1], .add_last = &tensors[1], .query = &tensors[2], .gamma = &tensors[3] }, &tensors[5]);
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+    var raw: [128]f32 = undefined;
+    try tensors[4].downloadF32Into(&raw);
+    for (raw) |value| try std.testing.expectEqual(@as(f32, 0), value);
+    var bf16: [128]u16 = undefined;
+    try tensors[5].downloadBytesInto(std.mem.asBytes(&bf16));
+    try std.testing.expectEqual(twos, bf16);
+}
