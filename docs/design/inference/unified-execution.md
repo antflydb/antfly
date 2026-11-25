@@ -972,11 +972,11 @@ EmbeddingGemma2, LightOnOCR, GLiNER2.5/DECIDE, Inkling 2 Mini and the
 representative Qwen3 routes. Spark GB10, local Metal and CPU are the
 available physical targets. L4 and A100 remain the user-deferred targets.
 
-One local Metal candidate narrowed the compatibility guard for integer
-gather after addition to the actual axis-zero column-bias fusion. The
-physical fixture for a live F32 add followed by an axis-one I32 gather
-produced `[3, 2, 6, 5]` where it expected `[4, 2, 7, 5]` after alternating
-index values. The observed row equals the other valid index case. This
-leaves index binding and output custody unqualified for that combination.
-The broad compatibility guard continues to own this signature pending
-isolation of the failing boundary.
+The Metal integer-gather compatibility guard now applies to the actual
+axis-zero column-bias fusion. An axis-one I32 gather after a live F32 add
+uses two assigned dispatches and retains both results independently across
+later requests. The fixture also covers negative and invalid indices,
+zero intermediate downloads, and ownership after session shutdown. The
+initial mismatch came from the shutdown probe reusing the second request's
+host index buffer. Restoring the first index before the final dispatch
+makes that probe compare the intended result.

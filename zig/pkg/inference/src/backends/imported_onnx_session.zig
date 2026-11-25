@@ -5688,7 +5688,7 @@ test "Native planned integer concat slice gather and reshape through imported ON
     try std.testing.expectEqual(@as(u64, 3), session.executionDiagnostics().?.execution.?.assigned_kernel_dispatches);
 }
 
-fn importedTypedHostIngress(comptime backend_type: BackendType, comptime Index: type, comptime axis: u8) !void {
+fn importedTypedHostIngress(comptime backend_type: BackendType, comptime Index: type, comptime axis: u8, comptime live_add: bool) !void {
     const a = std.testing.allocator;
     if (backend_type == .cuda) {
         var probe = @import("compute_context.zig").BackendContext.init(a, .cuda, null) catch |err| switch (@as(anyerror, err)) {
@@ -5703,12 +5703,17 @@ fn importedTypedHostIngress(comptime backend_type: BackendType, comptime Index: 
     const dtype = @field(ml.graph.DType, @typeName(Index));
     const wire_type = @field(@import("tensor.zig").DType, @typeName(Index));
     const indices = try b.parameter("indices", Shape.init(dtype, &.{2}));
-    const table = try b.tensorConst(&.{ 1, 2, 3, 4, 5, 6 }, Shape.init(.f32, if (axis == 0) &.{ 3, 2 } else &.{ 2, 3 }));
+    const table_shape = Shape.init(.f32, if (axis == 0) &.{ 3, 2 } else &.{ 2, 3 });
+    const base = try b.tensorConst(&.{ 1, 2, 3, 4, 5, 6 }, table_shape);
+    const table = if (live_add)
+        try b.add(base, try b.parameter("table_delta", table_shape))
+    else
+        base;
     const output_node = try b.gather(table, indices, Shape.init(.f32, &.{ 2, 2 }));
     graph.nodeMut(output_node).op.gather.axis = axis;
     try graph.markOutput(output_node);
-    const first_expected: []const f32 = if (axis == 0) &.{ 5, 6, 1, 2 } else &.{ 3, 1, 6, 4 };
-    const second_expected: []const f32 = if (axis == 0) &.{ 3, 4, 1, 2 } else &.{ 2, 1, 5, 4 };
+    const first_expected: []const f32 = if (axis == 0) &.{ 5, 6, 1, 2 } else if (live_add) &.{ 4, 2, 7, 5 } else &.{ 3, 1, 6, 4 };
+    const second_expected: []const f32 = if (axis == 0) &.{ 3, 4, 1, 2 } else if (live_add) &.{ 3, 2, 6, 5 } else &.{ 2, 1, 5, 4 };
     const bytes = try onnx_graph.exportGraph(a, &graph, .{});
     defer a.free(bytes);
     var dir = std.testing.tmpDir(.{});
@@ -5731,11 +5736,14 @@ fn importedTypedHostIngress(comptime backend_type: BackendType, comptime Index: 
     const selected = [_]Index{ 2, 0 };
     @memcpy(raw, std.mem.sliceAsBytes(&selected));
     const input = Tensor{ .data = raw, .dtype = wire_type, .shape = &.{2}, .name = "indices", .allocator = a, .owns_data = false, .owns_shape = false };
+    var table_delta = try Tensor.initFloat32(a, "table_delta", &.{ 2, 3 }, &.{ 1, 1, 1, 1, 1, 1 });
+    defer table_delta.deinit();
+    const inputs: []const Tensor = if (live_add) &.{ input, table_delta } else &.{input};
     {
-        var invocation = (try prepared_mod.prepare(session, .{ .tensors = &.{input} }, a, null)).?;
+        var invocation = (try prepared_mod.prepare(session, .{ .tensors = inputs }, a, null)).?;
         defer invocation.deinit();
         const routes = invocation.routes orelse return error.MissingPreparedKernelRoute;
-        try std.testing.expectEqual(@as(usize, 1), routes.pool.host_input_plans.len);
+        try std.testing.expectEqual(@as(usize, if (live_add) 2 else 1), routes.pool.host_input_plans.len);
         try std.testing.expectEqual(dtype, routes.pool.host_input_plans[0].shape.dtype);
         try std.testing.expectEqual(bytes_per_pair, routes.pool.host_input_plans[0].requirements.bytes);
         if (backend_type != .cuda and !invocation.hasCompleteOwnedPayload()) {
@@ -5743,7 +5751,7 @@ fn importedTypedHostIngress(comptime backend_type: BackendType, comptime Index: 
             return error.MissingOwnedGatherPayload;
         }
     }
-    const legacy = try session.vtable.run(session.ptr, &.{input}, a);
+    const legacy = try session.vtable.run(session.ptr, inputs, a);
     defer {
         for (legacy) |*value| value.deinit();
         a.free(legacy);
@@ -5752,7 +5760,7 @@ fn importedTypedHostIngress(comptime backend_type: BackendType, comptime Index: 
     for (0..3) |iteration| {
         const current = [_]Index{ if (iteration % 2 == 0) 2 else 1, 0 };
         @memcpy(raw, std.mem.sliceAsBytes(&current));
-        const output = try session.run(&.{input}, a);
+        const output = try session.run(inputs, a);
         defer {
             for (output) |*value| value.deinit();
             a.free(output);
@@ -5761,15 +5769,15 @@ fn importedTypedHostIngress(comptime backend_type: BackendType, comptime Index: 
     }
     if (backend_type == .metal) {
         @memcpy(raw, std.mem.sliceAsBytes(&[_]Index{ -1, 0 }));
-        var resident = (try session.runResident(&.{input}, a)) orelse return error.MissingResidentResult;
+        var resident = (try session.runResident(inputs, a)) orelse return error.MissingResidentResult;
         defer resident.deinit();
         const stats = session.executionDiagnostics().?.execution.?;
-        try std.testing.expectEqual(@as(u64, 1), stats.assigned_kernel_dispatches);
+        try std.testing.expectEqual(@as(u64, if (live_add) 2 else 1), stats.assigned_kernel_dispatches);
         try std.testing.expectEqual(@as(u64, 0), stats.actual_download_bytes);
         @memcpy(raw, std.mem.sliceAsBytes(&[_]Index{ if (Index == i64) 9_007_199_254_740_993 else 16_777_217, 0 }));
-        try std.testing.expectError(error.IndexOutOfBounds, session.run(&.{input}, a));
+        try std.testing.expectError(error.IndexOutOfBounds, session.run(inputs, a));
         @memcpy(raw, std.mem.sliceAsBytes(&[_]Index{ 1, 0 }));
-        var next = (try session.runResident(&.{input}, a)) orelse return error.MissingResidentResult;
+        var next = (try session.runResident(inputs, a)) orelse return error.MissingResidentResult;
         defer next.deinit();
         const second = try next.backend.toFloat32(next.outputs[0], a);
         defer a.free(second);
@@ -5777,28 +5785,31 @@ fn importedTypedHostIngress(comptime backend_type: BackendType, comptime Index: 
         const first = try resident.backend.toFloat32(resident.outputs[0], a);
         defer a.free(first);
         try std.testing.expectEqualSlices(f32, first_expected, first);
-        @memcpy(raw, std.mem.sliceAsBytes(&selected));
-        const stage_backend = session.shared_compute_context.?.stableBackend();
-        const control: InferenceExecutionControl = .{ .native_call_policy = .in_process };
-        const source = (try stage_backend.fromReadOnlyBytes(raw, dtype, &.{2})) orelse return error.MissingResidentIndices;
-        defer stage_backend.free(source);
-        const stage_input: session_mod.StageInput = .{ .resident = .{ .backend = stage_backend, .value = source, .shape = &.{2}, .estimated_bytes = bytes_per_pair } };
-        var device_result = (try session.runStageInputsWithControl(&.{stage_input}, a, control)) orelse return error.MissingResidentResult;
-        defer device_result.deinit();
-        const ingress_stats = session.executionDiagnostics().?.execution.?;
-        try std.testing.expectEqual(@as(u64, bytes_per_pair), ingress_stats.physical_input_copy_bytes);
-        try std.testing.expectEqual(@as(u64, 0), ingress_stats.actual_download_bytes);
-        const found = try device_result.backend.toFloat32(device_result.outputs[0], a);
-        defer a.free(found);
-        try std.testing.expectEqualSlices(f32, first_expected, found);
-        const invalid = [_]Index{ if (Index == i64) 9_007_199_254_740_993 else 16_777_217, 0 };
-        const invalid_source = (try stage_backend.fromReadOnlyBytes(std.mem.sliceAsBytes(&invalid), dtype, &.{2})) orelse return error.MissingResidentIndices;
-        defer stage_backend.free(invalid_source);
-        var invalid_input = stage_input;
-        invalid_input.resident.value = invalid_source;
-        try std.testing.expectError(error.IndexOutOfBounds, session.runStageInputsWithControl(&.{invalid_input}, a, control));
+        if (!live_add) {
+            @memcpy(raw, std.mem.sliceAsBytes(&selected));
+            const stage_backend = session.shared_compute_context.?.stableBackend();
+            const control: InferenceExecutionControl = .{ .native_call_policy = .in_process };
+            const source = (try stage_backend.fromReadOnlyBytes(raw, dtype, &.{2})) orelse return error.MissingResidentIndices;
+            defer stage_backend.free(source);
+            const stage_input: session_mod.StageInput = .{ .resident = .{ .backend = stage_backend, .value = source, .shape = &.{2}, .estimated_bytes = bytes_per_pair } };
+            var device_result = (try session.runStageInputsWithControl(&.{stage_input}, a, control)) orelse return error.MissingResidentResult;
+            defer device_result.deinit();
+            const ingress_stats = session.executionDiagnostics().?.execution.?;
+            try std.testing.expectEqual(@as(u64, bytes_per_pair), ingress_stats.physical_input_copy_bytes);
+            try std.testing.expectEqual(@as(u64, 0), ingress_stats.actual_download_bytes);
+            const found = try device_result.backend.toFloat32(device_result.outputs[0], a);
+            defer a.free(found);
+            try std.testing.expectEqualSlices(f32, first_expected, found);
+            const invalid = [_]Index{ if (Index == i64) 9_007_199_254_740_993 else 16_777_217, 0 };
+            const invalid_source = (try stage_backend.fromReadOnlyBytes(std.mem.sliceAsBytes(&invalid), dtype, &.{2})) orelse return error.MissingResidentIndices;
+            defer stage_backend.free(invalid_source);
+            var invalid_input = stage_input;
+            invalid_input.resident.value = invalid_source;
+            try std.testing.expectError(error.IndexOutOfBounds, session.runStageInputsWithControl(&.{invalid_input}, a, control));
+        }
     }
-    const held = try session.run(&.{input}, a);
+    @memcpy(raw, std.mem.sliceAsBytes(&selected));
+    const held = try session.run(inputs, a);
     defer {
         for (held) |*value| value.deinit();
         a.free(held);
@@ -5810,16 +5821,17 @@ fn importedTypedHostIngress(comptime backend_type: BackendType, comptime Index: 
 test "Imported Metal provider qualified typed host ingress preserves public gather semantics" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     if (!@import("metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
-    try importedTypedHostIngress(.metal, i32, 1);
-    try importedTypedHostIngress(.metal, i64, 0);
+    try importedTypedHostIngress(.metal, i32, 1, false);
+    try importedTypedHostIngress(.metal, i32, 1, true);
+    try importedTypedHostIngress(.metal, i64, 0, false);
 }
 
 test "Imported Native provider qualified typed host ingress preserves public gather semantics" {
-    try importedTypedHostIngress(.native, i64, 0);
+    try importedTypedHostIngress(.native, i64, 0, false);
 }
 test "Imported CUDA provider qualified typed host ingress preserves public gather semantics" {
     if (comptime !build_options.enable_cuda) return error.SkipZigTest;
-    try importedTypedHostIngress(.cuda, i64, 0);
+    try importedTypedHostIngress(.cuda, i64, 0, false);
 }
 test "Imported mixed unsupported boolean entries retain whole entry legacy import" {
     const a = std.testing.allocator;

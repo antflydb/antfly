@@ -1649,7 +1649,10 @@ pub const MetalPartitionExecutor = struct {
                         const pending = required_deferrals orelse return .deferred_producer;
                         try pending.append(.{ .producer = gather.producer, .consumer = id });
                     }
-                    if (value.input_shapes[1].dtype != .f32 and graph.node(node.inputs[0]).op == .add) return .backend_region;
+                    // Preserve the compatibility gather-after-column-bias
+                    // fusion. Other additions can publish assigned storage.
+                    if (value.input_shapes[1].dtype != .f32 and value.operation.gather.axis == 0 and
+                        ops_mod.kernel_descriptor.MatrixColumnBias.match(graph, node.inputs[0]) != null) return .backend_region;
                 },
                 .dot => {
                     if (transposes) |seen| if (seen.isSet(node.inputs[1])) continue;
