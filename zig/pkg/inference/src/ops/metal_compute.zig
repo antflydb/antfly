@@ -1054,6 +1054,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         if (metal_runtime.hasSubmittedFrame(runtime)) try metal_runtime.waitFrame(runtime);
     }
+    pub fn drainPrivateDecoderFrame(cb: *const ops.ComputeBackend, graph: *const ml.graph.Graph, operation: operation_mod.Borrowed) !void {
+        if (!operationAccepts(cb.vtable)) return error.BackendOperationChanged;
+        try operation.validate(.{ .implementation = .{ .context = cb.ptr, .table = cb.vtable }, .program = graph, .mode = .managed });
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        try operationQuiesce(self.provider_impl, true);
+    }
     fn operationFinish(raw: *anyopaque, nonce: u64) !void {
         const record = try operationRecord(raw, nonce);
         if (!record.entered) return error.BackendOperationInactive;
@@ -12412,11 +12418,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return descriptor.operation == .linear and self.audio_capture == null and
                 self.provider_impl.hasDecoderRuntime() and supportsAssignedDescriptor(descriptor);
         }
-        fn supportedRegion(raw: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
-            const self: *MetalCompute = @ptrCast(@alignCast(raw));
-            if (descriptor.operation != .linear or !supportsAssignedDescriptor(descriptor)) return false;
-            return supported(raw, descriptor) and (descriptor.operation.linear.rows == 1 or self.projectionScopeValid());
-        }
         fn bindingKey(compute: *MetalCompute, descriptor: *const ops.kernel_descriptor.Descriptor, bindings: []const route.Binding) ?DynamicLinearSlotKey {
             // Activation inputs may be planned, but the prepared immutable
             // weight/bias must be concrete source tensors, never guessed planes.
@@ -12446,12 +12447,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return facts[0..bindings.len];
         }
         fn prepare(compute: *MetalCompute, request: route.Prepare, table: *const ops.ComputeBackend.VTable) !?route.Owned {
-            return prepareWith(compute, request, table, supported, true);
+            return prepareWith(compute, request, table, true);
         }
         fn prepareRegion(compute: *MetalCompute, request: route.Prepare, table: *const ops.ComputeBackend.VTable) !?route.Owned {
-            return prepareWith(compute, request, table, supportedRegion, false);
+            // The enclosing region validates the exact provider/frame scope.
+            // Member routes only attest their immutable bindings and geometry.
+            return prepareWith(compute, request, table, false);
         }
-        fn prepareWith(compute: *MetalCompute, request: route.Prepare, table: *const ops.ComputeBackend.VTable, comptime supported_fn: *const fn (*anyopaque, *const ops.kernel_descriptor.Descriptor) bool, comptime direct: bool) !?route.Owned {
+        fn prepareWith(compute: *MetalCompute, request: route.Prepare, table: *const ops.ComputeBackend.VTable, comptime direct: bool) !?route.Owned {
             if (comptime !build_options.enable_metal) return null;
             const key = bindingKey(compute, request.descriptor, request.inputs) orelse return null;
             const slot = compute.assignedDenseLinearSlot(key) orelse return null;
@@ -12462,7 +12465,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             var host_planes: [2]@import("../execution/storage_ownership.zig").Plane = undefined;
             var checked = request;
             checked.inputs = directInputs(compute, request.descriptor, request.inputs, &facts, &host_planes) orelse return null;
-            var checked_route = (try @import("../execution/assigned_kernel_route.zig").prepare(.{ .ptr = compute, .vtable = table }, checked, supported_fn)) orelse return null;
+            var checked_route = (try @import("../execution/assigned_kernel_route.zig").prepare(.{ .ptr = compute, .vtable = table }, checked, supported)) orelse return null;
             var committed = false;
             defer if (!committed) checked_route.deinit();
             const owner = try request.allocator.create(PreparedDenseLinear);
@@ -13759,6 +13762,65 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const request = self.projectionPackRequest(members[0..count]) orelse return null;
         if (metal_runtime.antfly_metal_projection_pack_available(self.provider_impl.raw_decode_runtime, request.count, &request.slots, request.width, &request.widths) == 0) return null;
         return request;
+    }
+
+    /// Resolve the exact installed linear declarations in one metadata scope.
+    /// Packing itself runs after this scope closes and revalidates the slots.
+    pub fn collectDecoderQkvPacks(cb: *const ops.ComputeBackend, width: usize, slots: []const [3]usize, requests: []ProjectionPack.Request) !usize {
+        if (comptime !build_options.enable_metal) return 0;
+        if (!acceptsPhysicalImplementation(cb.vtable)) return error.ForeignPreparedProjectionBackend;
+        if (slots.len != requests.len) return error.InvalidRegionOrder;
+        if (platform.env.getenvBool("TERMITE_METAL_DISABLE_DENSE_QKV_PACKED")) return 0;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        var metadata: DecoderMetadataScope = .{};
+        defer metadata.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
+        try metadata.beginInto(cb, null);
+        const geometry = try ops.kernel_descriptor.Linear.init(1, width, width, false);
+        var count: usize = 0;
+        for (slots) |group| {
+            var members: [3]ProjectionPackSlot = undefined;
+            for (group, &members) |slot, *member| member.* = .{ .slot = slot, .geometry = geometry };
+            const request = self.projectionPackRequest(&members) orelse continue;
+            if (metal_runtime.antfly_metal_projection_pack_available(self.provider_impl.raw_decode_runtime, request.count, &request.slots, request.width, &request.widths) == 0) continue;
+            requests[count] = request;
+            count += 1;
+        }
+        return count;
+    }
+
+    /// Cold decoder construction owns its provider lease but has not entered
+    /// a Model lane or bound a numerical cleanup epoch yet. Temporarily yield
+    /// that lease for cache funding and then reenter before using the slots.
+    pub fn prepareColdDecoderQkvPacks(cb: *const ops.ComputeBackend, requests: []const ProjectionPack.Request, allocator: std.mem.Allocator, pin: *const @import("../runtime/tier/admission_domain.zig").Pin, cleanup: @import("../execution/cleanup_context.zig").Context) !void {
+        if (comptime !build_options.enable_metal) return;
+        if (!acceptsPhysicalImplementation(cb.vtable)) return error.ForeignPreparedProjectionBackend;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const io = self.shared_provider_lease_io orelse return;
+        const engine = currentEngineOperation(self) orelse return;
+        if (self.engine_operation == null or self.engine_borrowed_operation != null or self.decoderWorkspaceBusy() or !DenseProjectionProfile.noFrame(self)) return;
+        if (try engine.retainCleanupEpoch()) |held| {
+            var epoch = held;
+            epoch.release();
+            return;
+        }
+        {
+            var metadata: DecoderMetadataScope = .{};
+            defer metadata.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
+            try metadata.beginInto(cb, null);
+            for (requests) |request| {
+                if (!self.hasInstalledProjectionPack(request)) break;
+            } else return;
+        }
+
+        try operationQuiesce(self.provider_impl, false);
+        self.finishEngineOperationWithCleanup(cleanup);
+        self.shared_provider_lease_io = null;
+        unlockSharedMetalData(self.data, io);
+        const prepared = prepareProjectionPacksOutsideExecution(cb, null, requests, allocator, pin, cleanup);
+        const resumed_io = lockSharedMetalData(self.data, self.io) catch return error.PreparedProjectionProviderResumeFailed;
+        self.shared_provider_lease_io = resumed_io;
+        try self.beginEngineOperation();
+        try prepared;
     }
 
     const ProjectionPackSlot = struct { slot: usize, geometry: ops.kernel_descriptor.Linear };

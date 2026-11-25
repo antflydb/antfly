@@ -2224,6 +2224,7 @@ pub const Frame = struct {
     claim_nonce: u64 = 0,
     retired: bool = false,
     managed_terminal_evidence: @import("backend_operation.zig").TerminalEvidence = .{},
+    private_decoder_drained: bool = false,
     stats: Stats = .{},
     scope_backends: usize = 0,
     scope_cleanup: @import("cleanup_context.zig").Context = .{},
@@ -2451,6 +2452,7 @@ pub const Frame = struct {
                     proven = true;
                 };
             };
+            if (!proven and kind == .metal and self.pool.backends.len == 1 and self.private_decoder_drained) proven = true;
             if (!proven and kind == .metal and self.pool.backends.len == 1) {
                 const backend = self.pool.backends[0];
                 try self.managed_terminal_evidence.validateTerminal(.{ .context = backend.ptr, .table = backend.vtable });
@@ -2696,6 +2698,14 @@ pub const Frame = struct {
         return self.finishWithCleanup(.{});
     }
     pub fn finishWithCleanup(self: *Frame, cleanup: @import("cleanup_context.zig").Context) !Stats {
+        if (comptime @import("build_options").enable_metal) {
+            if (self.retired and self.prepared_program and self.pool.private_decoder_program and self.pool.backends.len == 1 and self.pool.backends[0].kind() == .metal) {
+                const operation = self.scope_cleanup.operation orelse return error.PhysicalCompletionUnavailable;
+                const graph = self.pool.coverage_graph orelse return error.PhysicalCompletionUnavailable;
+                try @import("../ops/metal_compute.zig").MetalCompute.drainPrivateDecoderFrame(&self.pool.backends[0], graph, operation);
+                self.private_decoder_drained = true;
+            }
+        }
         try self.releaseRegionClaimsChecked();
         if (self.prepared_program) {
             // This also covers an error halfway through a step, whose final

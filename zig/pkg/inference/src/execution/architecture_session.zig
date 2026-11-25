@@ -5833,6 +5833,24 @@ fn prepareColdWhisperPhases(session: Session, allocator: std.mem.Allocator, cont
     return self;
 }
 
+fn prepareWhisperProjectionPacks(cb: *const ops.ComputeBackend, layers: []const whisper_arch.LayerWeights, width: usize, allocator: std.mem.Allocator, pin: *const @import("../runtime/tier/admission_domain.zig").Pin, cleanup: @import("cleanup_context.zig").Context) !void {
+    const Metal = @import("../ops/metal_compute.zig").MetalCompute;
+    const slots = try allocator.alloc([3]usize, layers.len);
+    defer allocator.free(slots);
+    for (layers, slots) |layer, *group| group.* = layer.qkv_slots orelse return error.UnsupportedDenseSchedule;
+    const requests = try allocator.alloc(@import("../backends/dense_projection_pack.zig").Request, layers.len);
+    defer allocator.free(requests);
+    const count = Metal.collectDecoderQkvPacks(cb, width, slots, requests) catch |err| switch (err) {
+        error.QueueFull, error.UnsupportedDenseSchedule => return,
+        else => return err,
+    };
+    if (count == 0) return;
+    Metal.prepareColdDecoderQkvPacks(cb, requests[0..count], allocator, pin, cleanup) catch |err| switch (err) {
+        error.QueueFull, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.MemoryBudgetExceeded => return,
+        else => return err,
+    };
+}
+
 fn buildColdNativeWhisper(self: *ColdNativeWhisper, session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, config: whisper_mod.Config, geometry: whisper_arch.CacheGeometry, base: *const @import("../backends/session.zig").RunPermit, encoder: ColdWhisperEncoder, data: *const anyopaque, domain: ?*const @import("../runtime/tier/admission_domain.zig").Pin, current: @import("cleanup_context.zig").Context, construction_epoch: *const @import("retirement_sink.zig").Epoch, initial_rows: ?usize) !bool {
     const metadata = self.metadata;
     self.cb = if (encoder == .shared_metal)
@@ -5866,6 +5884,13 @@ fn buildColdNativeWhisper(self: *ColdNativeWhisper, session: Session, allocator:
     self.weights = try whisper_arch.PreparedDecoderWeights.initWithSource(cb, metadata.allocator(), config, true, .{ .expected_data = data, .domain = domain });
     if (cb.kind() == .native) try NativeCompute.stampHeldF32WeightSources(cb, data, self.weights.?.fetcher.handles.items);
     if (cb.kind() == .metal and !try self.weights.?.prepareMetalSchedulePayload(cb, data, config)) return false;
+    if (comptime build_options.enable_metal) {
+        if (cb.kind() == .metal and initial_rows != null and initial_rows.? > 1 and encoder == .host and
+            @import("antfly_platform").env.getenvBool("TERMITE_METAL_WHISPER_PREPARE_PACKED_QKV"))
+        {
+            if (domain) |pin| try prepareWhisperProjectionPacks(cb, self.weights.?.weights.layers, config.d_model, metadata.allocator(), pin, current);
+        }
+    }
     const schedule = @import("dense_decoder_schedule.zig");
     const arch: *ArchSession = @ptrCast(@alignCast(session.ptr));
     const source = (try whisper_arch.PreparedSingleToken.specSource(cb, data, config, geometry.encoder_rows, &self.weights.?, 1, false)) orelse return false;
@@ -12956,12 +12981,34 @@ test "Metal Whisper prepared initial rows and decode match ordinary execution" {
     var session = try incrementalMetalFixtureSession(a);
     defer session.close();
     try session.installOwnedExecutionGate(a);
+    const packed_enabled = @import("antfly_platform").env.getenvBool("TERMITE_METAL_WHISPER_PREPARE_PACKED_QKV");
+    const domain = if (packed_enabled) try @import("../runtime/tier/admission_domain.zig").Domain.create() else null;
+    defer if (domain) |owner| owner.release();
+    if (domain) |owner| {
+        const pin = owner.pin();
+        defer pin.release();
+        session.model_lifetime.?.admission_domain = pin.retain();
+        const arch: *ArchSession = @ptrCast(@alignCast(session.ptr));
+        const data = gpuBackendData(arch);
+        if (data.tier_cache == null) data.tier_cache = runtime.tier.cache.SharedCache.init(.{});
+        const limits: runtime.tier.memory.Limits = .{ .host_limit_bytes = 64 << 20, .backend_limit_bytes = 64 << 20 };
+        try data.tier_cache.?.configureManagedAdmissionOutsideExecution(pin.controller(), .gpu, limits, .{});
+        try data.tier_cache.?.installRetirementDomainOutsideExecution(&pin);
+        session.run_admission = .{ .controller = pin.controller(), .backend_class = .gpu, .limits = limits, .static_workspace_bytes = 0, .check_live_memory = false };
+    }
     const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
     const control = InferenceExecutionControl{ .io = std.testing.io, .native_call_policy = .in_process };
     var decoder = (try IncrementalDecoderAdapter.fromHostPrepared(session, a, control, &hidden, 2, .{ .expected_initial_query_rows = 2 })) orelse return error.MissingWhisperDecoder;
     defer decoder.deinit();
     const program = if (decoder.cache.native_program) |*value| value else return error.MissingPreparedWhisperSchedule;
     const initial = if (program.initial) |phase| phase.schedule else return error.MissingPreparedWhisperInitialSchedule;
+    if (packed_enabled) {
+        const compute: *@import("../ops/metal_compute.zig").MetalCompute = @ptrCast(@alignCast(decoder.cb.backend.ptr));
+        try std.testing.expect(compute.projectionPackCache().entries != null);
+        const regions = initial.selected.pool.regions;
+        try std.testing.expectEqual(decoder.config.decoder_layers, regions.len);
+        for (regions) |region| try std.testing.expect(region.owner.requirements.dispatch_workspace.byte_size > 0);
+    }
     var reference = try whisper_arch.DecodeCache.init(&decoder.cb.backend, a, decoder.config, decoder.encoder_hidden, 2);
     defer reference.deinit(&decoder.cb.backend);
     for ([_][]const i64{ &.{ 0, 1 }, &.{2}, &.{3} }) |tokens| {
