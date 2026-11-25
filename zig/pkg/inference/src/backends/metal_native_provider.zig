@@ -105,6 +105,7 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     embeddinggemma2_constant_cache: std.StringHashMapUnmanaged(PreparedConstant) = .empty,
     embeddinggemma2_constant_bytes: usize = 0,
     embeddinggemma2_linear_cache_bytes: usize = 0,
+    linear_slot_owners: [decoder_runtime_linear_slot_capacity]?*prepared_slot.Owner = @splat(null),
     linear_slot_owner_epoch: u64 = 1,
     linear_slot_index_mutex: std.atomic.Mutex = .unlocked,
     operations: *@import("../execution/operation_owner.zig").Owner,
@@ -544,6 +545,7 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
             }
             metal_runtime.clearRawLinearSlot(self, candidate.slot);
             const removed = self.embeddinggemma2_linear_cache.fetchRemove(name).?;
+            self.linear_slot_owners[candidate.slot] = null;
             self.embeddinggemma2_linear_cache_bytes -= removed.value.bytes;
             if (cache_class == .vision) self.embeddinggemma2_vision_linear_cache_bytes -= removed.value.bytes;
             if (cache_class == .audio) self.embeddinggemma2_audio_linear_cache_bytes -= removed.value.bytes;
@@ -603,6 +605,15 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         return owner;
     }
 
+    /// Both lookup indexes publish under the provider's slot-index guard.
+    pub fn publishLinearCacheAssumeCapacity(self: *MetalNativeProvider, name: []const u8, entry: EmbeddingGemma2LinearCacheEntry) void {
+        const owner = entry.owner.?;
+        std.debug.assert(owner.slot == entry.slot and self.linear_slot_owners[entry.slot] == null);
+        self.embeddinggemma2_linear_cache.putAssumeCapacityNoClobber(name, entry);
+        owner.publish();
+        self.linear_slot_owners[entry.slot] = owner;
+    }
+
     fn releaseRetiredLinearCharge(owner: *const prepared_slot.Owner) void {
         const self: *MetalNativeProvider = @ptrCast(@alignCast(owner.resource.context));
         const cache = self.embeddinggemma2_cache_admission orelse unreachable;
@@ -614,13 +625,9 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     pub fn pinLinearSlot(self: *MetalNativeProvider, slot: usize) ?prepared_slot.Owner.Pin {
         if (!self.linear_slot_index_mutex.tryLock()) return null;
         defer self.linear_slot_index_mutex.unlock();
-        var iterator = self.embeddinggemma2_linear_cache.valueIterator();
-        while (iterator.next()) |entry| {
-            if (entry.slot != slot) continue;
-            const owner = entry.owner orelse return null;
-            return owner.tryPin(owner.epoch);
-        }
-        return null;
+        if (slot >= self.linear_slot_owners.len) return null;
+        const owner = self.linear_slot_owners[slot] orelse return null;
+        return owner.tryPin(owner.epoch);
     }
 
     /// A persistent compiled/decoder plan must distinguish a proven private
@@ -634,26 +641,18 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
 
     /// Caller holds this provider's linear slot index on the current thread.
     pub fn pinLinearSlotForPersistentUseWithIndexHeld(self: *MetalNativeProvider, slot: usize) !?prepared_slot.Owner.Pin {
-        var iterator = self.embeddinggemma2_linear_cache.valueIterator();
-        while (iterator.next()) |entry| {
-            if (entry.slot != slot) continue;
-            const owner = entry.owner orelse return error.MissingPreparedSlotOwner;
-            return owner.tryPin(owner.epoch) orelse return error.PreparedSlotUnavailable;
-        }
-        return null; // Exact cache membership was checked under its mutation lock.
+        if (slot >= self.linear_slot_owners.len) return null;
+        const owner = self.linear_slot_owners[slot] orelse return null;
+        return owner.tryPin(owner.epoch) orelse return error.PreparedSlotUnavailable;
     }
 
     /// A cached payload cannot be cleared/reassigned behind a frozen selector.
     /// Only its marked retirement (or a noncached legacy slot) permits mutation.
     pub fn allowsOwnedSlotMutation(self: *MetalNativeProvider, slot: usize) bool {
-        if (slot < self.private_linear_pins.len and self.private_linear_pins[slot].load(.acquire) != 0) return false;
-        var iterator = self.embeddinggemma2_linear_cache.valueIterator();
-        while (iterator.next()) |entry| {
-            if (entry.slot != slot) continue;
-            const owner = entry.owner orelse return true;
-            return owner.retirementInProgress();
-        }
-        return true;
+        if (slot >= self.linear_slot_owners.len) return true;
+        if (self.private_linear_pins[slot].load(.acquire) != 0) return false;
+        const owner = self.linear_slot_owners[slot] orelse return true;
+        return owner.retirementInProgress();
     }
 
     /// Idle selectors borrow metadata only. Cache publication/lookup is already
@@ -666,13 +665,9 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
 
     /// Caller already owns the narrow index mutex; this never reenters it.
     pub fn profileLinearSlotLocked(self: *MetalNativeProvider, slot: usize) ?prepared_slot.Owner.Profile {
-        var iterator = self.embeddinggemma2_linear_cache.valueIterator();
-        while (iterator.next()) |entry| {
-            if (entry.slot != slot) continue;
-            const owner = entry.owner orelse return null;
-            return owner.profile();
-        }
-        return null;
+        if (slot >= self.linear_slot_owners.len) return null;
+        const owner = self.linear_slot_owners[slot] orelse return null;
+        return owner.profile();
     }
 
     fn preparedUseUncertain(_: *anyopaque) callconv(.c) void {
@@ -815,6 +810,7 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         var embeddinggemma2_it = self.embeddinggemma2_linear_cache.iterator();
         while (embeddinggemma2_it.next()) |entry| {
             std.heap.c_allocator.free(entry.key_ptr.*);
+            self.linear_slot_owners[entry.value_ptr.slot] = null;
             if (entry.value_ptr.owner) |owner|
                 (prepared_slot.Owner.Retirement{ .owner = owner }).commitRetiredPayload()
             else if (self.embeddinggemma2_cache_admission) |cache|

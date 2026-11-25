@@ -8447,14 +8447,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // The slot is published only after its complete owned snapshot exists.
         // It is deliberately absent from the request's dynamic slot map, whose
         // teardown must not erase another request's reusable model constants.
-        provider.embeddinggemma2_linear_cache.putAssumeCapacityNoClobber(owned_name, .{
+        provider.publishLinearCacheAssumeCapacity(owned_name, .{
             .slot = slot,
             .in_dim = in_dim,
             .out_dim = out_dim,
             .bytes = bytes,
             .owner = slot_owner,
         });
-        slot_owner.publish();
         provider.embeddinggemma2_linear_cache_bytes += bytes;
         if (cache_class == .vision) provider.embeddinggemma2_vision_linear_cache_bytes += bytes;
         if (cache_class == .audio) provider.embeddinggemma2_audio_linear_cache_bytes += bytes;
@@ -12474,10 +12473,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const payload = (if (index_held)
                 compute.provider_impl.pinLinearSlotForPersistentUseWithIndexHeld(slot)
             else
-                compute.provider_impl.pinLinearSlotForPersistentUse(slot)) catch |err| switch (err) {
-                error.QueueFull, error.PreparedSlotUnavailable => return null,
-                else => return err,
-            };
+                compute.provider_impl.pinLinearSlotForPersistentUse(slot)) catch return null;
             defer if (!committed) if (payload) |pin| pin.release();
             const epoch = compute.provider_impl.privateSlotDeclaration(.linear, slot);
             const declaration = (if (payload) |pin|
@@ -26122,8 +26118,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.timing_stats.decoder_runtime_prepare_linear_calls += 1;
         var projection_widths: [3]usize = @splat(0);
         @memcpy(projection_widths[0..widths.len], widths);
-        provider.embeddinggemma2_linear_cache.putAssumeCapacityNoClobber(owned_name, .{ .slot = slot, .in_dim = in_dim, .out_dim = out_dim, .bytes = bytes, .projection_widths = projection_widths, .owner = slot_owner });
-        slot_owner.publish();
+        provider.publishLinearCacheAssumeCapacity(owned_name, .{ .slot = slot, .in_dim = in_dim, .out_dim = out_dim, .bytes = bytes, .projection_widths = projection_widths, .owner = slot_owner });
         provider.embeddinggemma2_linear_cache_bytes += bytes;
         switch (class.?) {
             .vision => provider.embeddinggemma2_vision_linear_cache_bytes += bytes,
