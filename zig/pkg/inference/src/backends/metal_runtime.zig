@@ -53081,3 +53081,137 @@ test "Metal routed block-scaled projection chains the complete expert stage in o
     try tensors[14].downloadBytesInto(std.mem.asBytes(&output));
     try std.testing.expectEqual(@as([32]u16, @splat(0x4340)), output);
 }
+
+pub const PagedRelativeBf16Attention = struct {
+    const geometry = @import("../ops/paged_relative_attention.zig");
+    const StagedRange = @import("../runtime/kv/hybrid_paged.zig").StagedRange;
+    const Buffer = RoutedBlockScaledProjection.Buffer;
+    const Wire = extern struct {
+        start: u32,
+        visible_start: u32,
+        page_tokens: u32,
+        first_page: u32,
+        page_count: u32,
+        physical_pages: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        window: u32,
+        relative_extent: u32,
+        splits: u32,
+        keys_per_split: u32,
+        score_scale: f32,
+    };
+
+    extern fn antfly_metal_dispatch_paged_relative_bf16(runtime: *RawMetalDecodeRuntime, views: *const [9]Buffer, wire: *const Wire, row_heads: u32, physical_rows: usize) c_int;
+
+    query: geometry.Query,
+    range: StagedRange,
+
+    pub const Inputs = struct {
+        query: *const MetalTensor,
+        keys: *const MetalTensor,
+        values: *const MetalTensor,
+        relative: ?*const MetalTensor,
+        page_ids: *const MetalTensor,
+        sinks: *const MetalTensor,
+        gates: *const MetalTensor,
+    };
+
+    fn splits(coverage: geometry.Query.Coverage) u32 {
+        return @min(64, (coverage.live_keys - 1) / 128 + 1);
+    }
+
+    pub fn scratchElements(self: PagedRelativeBf16Attention) !i32 {
+        const coverage = try self.query.coverage(self.range.visible_start, self.range.visible_end);
+        return @intCast(coverage.row_heads * splits(coverage) * 130);
+    }
+
+    pub fn encode(self: PagedRelativeBf16Attention, runtime: *RawMetalDecodeRuntime, input: Inputs, scratch: *MetalTensor, output: *MetalTensor) !void {
+        if (!hasActiveFrame(runtime)) return error.MetalFrameRequired;
+        if (scratch.isReadOnlyPhysical() or output.isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
+        if (self.query.relative_extent != 0 and input.relative == null) return error.InvalidShape;
+        const coverage = try self.query.coverage(self.range.visible_start, self.range.visible_end);
+        const physical_rows = try self.range.physicalRows();
+        const split_count = splits(coverage);
+        const views: [9]Buffer = .{
+            try .fromTensor(input.query, .i16),
+            try .fromTensor(input.keys, .i16),
+            try .fromTensor(input.values, .i16),
+            if (input.relative) |relative| try .fromTensor(relative, .i16) else .{},
+            try .fromTensor(input.page_ids, .i32),
+            try .fromTensor(scratch, .f32),
+            try .fromTensor(input.sinks, .i16),
+            try .fromTensor(input.gates, .i16),
+            try .fromTensor(output, .i16),
+        };
+        if (antfly_metal_dispatch_paged_relative_bf16(runtime, &views, &.{
+            .start = self.query.start,
+            .visible_start = @intCast(self.range.visible_start),
+            .page_tokens = self.range.page_tokens,
+            .first_page = @intCast(self.range.first_page),
+            .page_count = @intCast(self.range.page_count),
+            .physical_pages = @intCast(self.range.physical_pages),
+            .q_heads = self.query.q_heads,
+            .kv_heads = self.query.kv_heads,
+            .window = self.query.window,
+            .relative_extent = self.query.relative_extent,
+            .splits = split_count,
+            .keys_per_split = (coverage.live_keys - 1) / split_count + 1,
+            .score_scale = self.query.score_scale,
+        }, coverage.row_heads, physical_rows) != 0) return error.MetalKernelDispatchFailed;
+        scratch.invalidateHostMirror();
+        output.invalidateHostMirror();
+    }
+};
+
+test "Metal paged relative attention resolves shuffled pages with sink and gate" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const attention: PagedRelativeBf16Attention = .{
+        .query = .{ .rows = 2, .start = 3, .q_heads = 2, .kv_heads = 1, .window = 2, .relative_extent = 2, .score_scale = 1 },
+        .range = .{ .first_page = 1, .page_count = 2, .physical_pages = 2, .page_tokens = 2, .visible_start = 2, .visible_end = 5 },
+    };
+    const zeros: [512]u16 = @splat(0);
+    var values: [512]u16 = @splat(0);
+    @memset(values[0..128], 0x4080); // position 4, value 4
+    @memset(values[256..384], 0x3f80); // position 2, value 1
+    @memset(values[384..512], 0x4000); // position 3, value 2
+    const ids = [2]u32{ 1, 0 };
+    const relative: [8]u16 = @splat(0);
+    const sinks: [4]u16 = @splat(0);
+    const payloads: [7][]const u8 = .{
+        std.mem.asBytes(&zeros),    std.mem.asBytes(&zeros), std.mem.asBytes(&values),
+        std.mem.asBytes(&relative), std.mem.asBytes(&ids),   std.mem.asBytes(&sinks),
+        std.mem.asBytes(&zeros),
+    };
+    const types: [9]metal_tensor.DType = .{ .i16, .i16, .i16, .i16, .i32, .i16, .i16, .f32, .i16 };
+    const sizes = [9]i32{ 512, 512, 512, 8, 2, 4, 512, try attention.scratchElements(), 512 };
+    var tensors: [9]MetalTensor = undefined;
+    var count: usize = 0;
+    defer for (tensors[0..count]) |*tensor| tensor.deinit();
+    for (&tensors, types, sizes, 0..) |*tensor, dtype, size, index| {
+        tensor.* = try MetalTensor.deviceAllocateTyped(a, runtime, dtype, .shared, &.{size});
+        count += 1;
+        if (index < payloads.len) try tensor.uploadBytes(payloads[index]);
+    }
+    try beginFrame(runtime);
+    errdefer cancelFrame(runtime) catch {};
+    try attention.encode(runtime, .{
+        .query = &tensors[0],
+        .keys = &tensors[1],
+        .values = &tensors[2],
+        .relative = &tensors[3],
+        .page_ids = &tensors[4],
+        .sinks = &tensors[5],
+        .gates = &tensors[6],
+    }, &tensors[7], &tensors[8]);
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+    var output: [512]u16 = undefined;
+    try tensors[8].downloadBytesInto(std.mem.asBytes(&output));
+    for (output[0..256]) |value| try std.testing.expectEqual(@as(u16, 0x3f00), value);
+    for (output[256..]) |value| try std.testing.expectEqual(@as(u16, 0x3f80), value);
+}

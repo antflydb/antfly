@@ -114,6 +114,7 @@ pub const paths = [_][]const u8{
     "src/tile/families/native/metal/kv_storage.metal",
     "src/tile/families/native/metal/normalization_direct.metal",
     "src/tile/families/native/metal/packed_recurrence_hd128.m",
+    "src/tile/families/native/metal/paged_relative_attention.metal",
     "src/tile/families/native/metal/projection_direct.metal",
     "src/tile/families/native/metal/projection_direct_abi.m",
     "src/tile/families/native/metal/projection_f16_tiled.m",

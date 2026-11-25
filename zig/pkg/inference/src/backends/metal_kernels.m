@@ -1777,6 +1777,7 @@ typedef struct termite_metal_decode_runtime {
     uint16_t pipeline_quant_formats;
     bool prefer_dense_mps_linear;
     id<MTLComputePipelineState> routed_block_scaled_pipelines[4];
+    id<MTLComputePipelineState> paged_relative_bf16_pipelines[2];
     TermiteMetalMtpHeadWorkspace *mtp_head_workspace;
     id<MTLDevice> device;
     // Opt-in dense embedding workspace guard. Counts fresh allocations until
@@ -12917,6 +12918,100 @@ static NSString *termite_metal_shader_source(void) {
            "    uint total = p.rows * p.dim; if (gid >= total) return; uint row = gid / p.dim; uint col = gid % p.dim; float value = 0.0f; uint route_base = row * p.top_k; for (uint k = 0u; k < p.top_k; ++k) { uint route = route_base + k; float scale = p.has_expert_scale != 0u ? expert_scale[expert_ids[route]] : 1.0f; value += (route_output[route * p.dim + col] * scale) * route_weights[route]; } output[gid] = value;\n"
            "}\n"
            // tile-codegen:end expert.projection.direct.7 family
+           // tile-codegen:begin attention.paged_relative_bf16.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "struct PagedRelativeGqaParams {\n"
+           "    uint start, visible_start, page_tokens, first_page, page_count, physical_pages;\n"
+           "    uint q_heads, kv_heads, window, relative_extent, splits, keys_per_split;\n"
+           "    float score_scale;\n"
+           "};\n"
+           "\n"
+           "kernel void antfly_paged_relative_gqa_d128_bf16_partial(\n"
+           "    device const bfloat *query [[buffer(0)]],\n"
+           "    device const bfloat *keys [[buffer(1)]],\n"
+           "    device const bfloat *values [[buffer(2)]],\n"
+           "    device const bfloat *relative [[buffer(3)]],\n"
+           "    device const uint *page_ids [[buffer(4)]],\n"
+           "    device float *partials [[buffer(5)]],\n"
+           "    constant PagedRelativeGqaParams &p [[buffer(6)]],\n"
+           "    uint2 group [[threadgroup_position_in_grid]],\n"
+           "    uint lane [[thread_index_in_simdgroup]]\n"
+           ") {\n"
+           "    const uint row_head = group.x;\n"
+           "    const uint head = row_head % p.q_heads;\n"
+           "    const uint kv_head = head / (p.q_heads / p.kv_heads);\n"
+           "    const uint position = p.start + row_head / p.q_heads;\n"
+           "    const uint end = position + 1u;\n"
+           "    const uint first = max(p.visible_start, p.window != 0u && end > p.window ? end - p.window : 0u);\n"
+           "    const uint begin = first + group.y * p.keys_per_split;\n"
+           "    const uint limit = min(end, begin + p.keys_per_split);\n"
+           "    const ulong q_base = ulong(row_head) * 128u + lane;\n"
+           "    float4 q;\n"
+           "    for (uint i = 0; i < 4; ++i) q[i] = float(query[q_base + i * 32u]);\n"
+           "    float4 numerator = 0.0f;\n"
+           "    float maximum = -INFINITY;\n"
+           "    float denominator = 0.0f;\n"
+           "    for (uint pos = begin; pos < limit; ++pos) {\n"
+           "        const uint index = pos / p.page_tokens - p.first_page;\n"
+           "        if (index >= p.page_count) continue;\n"
+           "        const uint page = page_ids[index];\n"
+           "        if (page >= p.physical_pages) continue;\n"
+           "        const ulong row = ulong(page) * p.page_tokens + pos % p.page_tokens;\n"
+           "        const ulong base = (row * p.kv_heads + kv_head) * 128u + lane;\n"
+           "        float dot = 0.0f;\n"
+           "        for (uint i = 0; i < 4; ++i) dot = fma(q[i], float(keys[base + i * 32u]), dot);\n"
+           "        const float reduced = simd_sum(dot);\n"
+           "        const uint distance = position - pos;\n"
+           "        const float bias = distance < p.relative_extent ? float(relative[ulong(row_head) * p.relative_extent + distance]) : 0.0f;\n"
+           "        const float score = reduced * p.score_scale + bias;\n"
+           "        const float next_max = max(maximum, score);\n"
+           "        const float retain = exp(maximum - next_max);\n"
+           "        const float add = exp(score - next_max);\n"
+           "        denominator = fma(denominator, retain, add);\n"
+           "        for (uint i = 0; i < 4; ++i)\n"
+           "            numerator[i] = fma(add, float(values[base + i * 32u]), numerator[i] * retain);\n"
+           "        maximum = next_max;\n"
+           "    }\n"
+           "    const ulong dst = (ulong(row_head) * p.splits + group.y) * 130u;\n"
+           "    for (uint i = 0; i < 4; ++i) partials[dst + i * 32u + lane] = numerator[i];\n"
+           "    if (lane == 0u) {\n"
+           "        partials[dst + 128u] = maximum;\n"
+           "        partials[dst + 129u] = denominator;\n"
+           "    }\n"
+           "}\n"
+           "\n"
+           // tile-codegen:end attention.paged_relative_bf16.0 family
+           // tile-codegen:begin attention.paged_relative_bf16.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "kernel void antfly_paged_relative_gqa_d128_bf16_reduce(\n"
+           "    device const float *partials [[buffer(0)]],\n"
+           "    device const bfloat *sinks [[buffer(1)]],\n"
+           "    device const bfloat *gates [[buffer(2)]],\n"
+           "    device bfloat *output [[buffer(3)]],\n"
+           "    constant uint &splits [[buffer(4)]],\n"
+           "    uint row_head [[threadgroup_position_in_grid]],\n"
+           "    uint lane [[thread_index_in_simdgroup]]\n"
+           ") {\n"
+           "    const ulong partial = ulong(row_head) * splits * 130u;\n"
+           "    const float sink = float(sinks[row_head]);\n"
+           "    float maximum = sink;\n"
+           "    for (uint split = 0; split < splits; ++split)\n"
+           "        maximum = max(maximum, partials[partial + split * 130u + 128u]);\n"
+           "    float denominator = exp(sink - maximum);\n"
+           "    float4 numerator = 0.0f;\n"
+           "    for (uint split = 0; split < splits; ++split) {\n"
+           "        const ulong src = partial + split * 130u;\n"
+           "        if (partials[src + 129u] == 0.0f) continue;\n"
+           "        const float weight = exp(partials[src + 128u] - maximum);\n"
+           "        denominator = fma(weight, partials[src + 129u], denominator);\n"
+           "        for (uint i = 0; i < 4; ++i)\n"
+           "            numerator[i] = fma(weight, partials[src + i * 32u + lane], numerator[i]);\n"
+           "    }\n"
+           "    const ulong base = ulong(row_head) * 128u + lane;\n"
+           "    for (uint i = 0; i < 4; ++i) {\n"
+           "        const ulong index = base + i * 32u;\n"
+           "        output[index] = bfloat((numerator[i] / denominator) / (1.0f + exp(-float(gates[index]))));\n"
+           "    }\n"
+           "}\n"
+           // tile-codegen:end attention.paged_relative_bf16.1 family
            // tile-codegen:begin expert.projection.block_scaled.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "struct RoutedBlockScaledParams {\n"
            "    uint rows;\n"
@@ -33517,6 +33612,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->attention_span_position_offset = 0;
     runtime->mtp_head_workspace = nil;
     for (size_t index = 0; index < 4; ++index) runtime->routed_block_scaled_pipelines[index] = nil;
+    for (size_t index = 0; index < 2; ++index) runtime->paged_relative_bf16_pipelines[index] = nil;
     free(runtime);
     }
 }
@@ -36518,9 +36614,10 @@ typedef struct {
     uint32_t rows, input_width, output_width, expert_count, input_repeat, format;
 } antfly_metal_routed_block_scaled_params;
 
-static int antfly_metal_encode_routed_stage(
+static int antfly_metal_encode_typed_stage(
     termite_metal_decode_runtime *runtime,
-    size_t stage,
+    NSString *name,
+    id<MTLComputePipelineState> __strong *slot,
     const antfly_metal_routed_buffer *views,
     const size_t *required,
     const size_t *alignments,
@@ -36531,12 +36628,6 @@ static int antfly_metal_encode_routed_stage(
     MTLSize grid,
     MTLSize threads
 ) {
-    static NSString *const names[4] = {
-        @"antfly_routed_block_scaled_bf16",
-        @"antfly_routed_biased_sigmoid_topk",
-        @"antfly_routed_capped_gate_bf16",
-        @"antfly_routed_reduce_bf16",
-    };
     @autoreleasepool {
         id<MTLBuffer> buffers[7] = { nil };
         termite_metal_planned_encoder_range accesses[7];
@@ -36557,11 +36648,8 @@ static int antfly_metal_encode_routed_stage(
                     termite_metal_planned_ranges_overlap(&accesses[prior], &accesses[count])) return -2;
             ++count;
         }
-        if (!runtime->routed_block_scaled_pipelines[stage]) {
-            runtime->routed_block_scaled_pipelines[stage] = termite_metal_make_pipeline(
-                runtime->device, runtime->library, names[stage]);
-        }
-        id<MTLComputePipelineState> pipeline = runtime->routed_block_scaled_pipelines[stage];
+        if (!*slot) *slot = termite_metal_make_pipeline(runtime->device, runtime->library, name);
+        id<MTLComputePipelineState> pipeline = *slot;
         if (!pipeline || pipeline.threadExecutionWidth != 32 ||
             pipeline.maxTotalThreadsPerThreadgroup < threads.width * threads.height) return -3;
         bool owned = false;
@@ -36584,6 +36672,29 @@ static int antfly_metal_encode_routed_stage(
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command, owned, -6);
     }
+}
+
+static int antfly_metal_encode_routed_stage(
+    termite_metal_decode_runtime *runtime,
+    size_t stage,
+    const antfly_metal_routed_buffer *views,
+    const size_t *required,
+    const size_t *alignments,
+    size_t view_count,
+    unsigned write_mask,
+    const void *parameters,
+    size_t parameter_size,
+    MTLSize grid,
+    MTLSize threads
+) {
+    static NSString *const names[4] = {
+        @"antfly_routed_block_scaled_bf16",
+        @"antfly_routed_biased_sigmoid_topk",
+        @"antfly_routed_capped_gate_bf16",
+        @"antfly_routed_reduce_bf16",
+    };
+    return antfly_metal_encode_typed_stage(runtime, names[stage], &runtime->routed_block_scaled_pipelines[stage],
+        views, required, alignments, view_count, write_mask, parameters, parameter_size, grid, threads);
 }
 
 int antfly_metal_dispatch_routed_block_scaled_bf16(
@@ -36667,6 +36778,41 @@ int antfly_metal_dispatch_routed_epilogue(
             &shader, sizeof(shader), grid, threads);
     }
     return -1;
+}
+
+typedef struct {
+    uint32_t start, visible_start, page_tokens, first_page, page_count, physical_pages;
+    uint32_t q_heads, kv_heads, window, relative_extent, splits, keys_per_split;
+    float score_scale;
+} antfly_metal_paged_relative_bf16_params;
+
+int antfly_metal_dispatch_paged_relative_bf16(
+    termite_metal_decode_runtime *runtime,
+    const antfly_metal_routed_buffer views[9],
+    const antfly_metal_paged_relative_bf16_params *p,
+    uint32_t row_heads,
+    size_t physical_rows
+) {
+    if (!runtime || !views || !p || !p->q_heads || !p->kv_heads || !p->splits || !row_heads) return -1;
+    size_t q_bytes, kv_bytes, relative_bytes, page_bytes, scratch_bytes;
+    if (!termite_metal_size_mul(row_heads, 256, &q_bytes) ||
+        !termite_metal_size_mul(physical_rows, (size_t)p->kv_heads * 256, &kv_bytes) ||
+        !termite_metal_size_mul(row_heads, (size_t)p->relative_extent * 2, &relative_bytes) ||
+        !termite_metal_size_mul(p->page_count, 4, &page_bytes) ||
+        !termite_metal_size_mul(row_heads, (size_t)p->splits * 130 * 4, &scratch_bytes)) return -1;
+    const size_t partial_bytes[6] = {q_bytes, kv_bytes, kv_bytes, relative_bytes, page_bytes, scratch_bytes};
+    const size_t partial_alignments[6] = {2, 2, 2, 2, 4, 4};
+    const MTLSize threads = MTLSizeMake(32, 1, 1);
+    int status = antfly_metal_encode_typed_stage(runtime, @"antfly_paged_relative_gqa_d128_bf16_partial",
+        &runtime->paged_relative_bf16_pipelines[0], views, partial_bytes, partial_alignments, 6, 1u << 5,
+        p, sizeof(*p), MTLSizeMake(row_heads, p->splits, 1), threads);
+    if (status != 0) return status;
+    const antfly_metal_routed_buffer reduce_views[4] = {views[5], views[6], views[7], views[8]};
+    const size_t reduce_bytes[4] = {scratch_bytes, (size_t)row_heads * 2, q_bytes, q_bytes};
+    const size_t reduce_alignments[4] = {4, 2, 2, 2};
+    return antfly_metal_encode_typed_stage(runtime, @"antfly_paged_relative_gqa_d128_bf16_reduce",
+        &runtime->paged_relative_bf16_pipelines[1], reduce_views, reduce_bytes, reduce_alignments, 4, 1u << 3,
+        &p->splits, sizeof(p->splits), MTLSizeMake(row_heads, 1, 1), threads);
 }
 
 typedef struct { uint32_t rows, hidden, head_dim, grid_x, grid_y; float eps, theta, scale; uint32_t stride, start, rotate, weighted, cached_rotary; } termite_vision_norm_rope_params;
