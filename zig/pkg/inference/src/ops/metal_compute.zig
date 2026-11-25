@@ -23949,16 +23949,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.encodeAudioLinear(ctx, x, request, .prefer_fused);
     }
 
-    // Eager projections may reuse the funded scratch when each projection
-    // owns its submission and waits before the next projection can borrow it.
+    // The plan retains the scratch throughout ordinary frame encoding.
+    // Ordered encoders track the reuse dependency on the same Metal buffer.
     fn audioEagerClampWorkspace(self: *const MetalCompute, rows: usize, width: usize) ?CT {
         const plan = self.audio_eager_plan orelse return null;
         const runtime = self.provider_impl.raw_decode_runtime;
-        if (metal_runtime.hasActiveFrame(runtime) or metal_runtime.hasSubmittedFrame(runtime)) return null;
+        if (metal_runtime.hasSubmittedFrame(runtime)) return null;
         for (plan.workspaces) |entry| {
             const ct = entry orelse continue;
             const view = denseDeviceF32(ct) orelse continue;
-            if (deviceTensorMatchesLinearRows(&view, rows, width)) return ct;
+            if (deviceTensorMatchesLinearRows(&view, rows, width) and
+                metal_runtime.antfly_metal_can_reuse_ordered_scratch(runtime, view.deviceHandle()) != 0) return ct;
         }
         return null;
     }
@@ -63241,15 +63242,35 @@ test "Metal prepared audio projection consumes disjoint clamp workspace after fu
     const synced_values = try cb.toFloat32(synced, a);
     defer a.free(synced_values);
     try std.testing.expectEqualSlices(f32, expected, synced_values);
-    try metal_runtime_mod.beginFrame(runtime);
-    defer metal_runtime_mod.cancelFrame(runtime) catch {};
-    try std.testing.expect(compute.audioEagerClampWorkspace(rows, width) == null);
-    try metal_runtime_mod.cancelFrame(runtime);
+    {
+        try metal_runtime_mod.beginFrame(runtime);
+        errdefer metal_runtime_mod.cancelFrame(runtime) catch {};
+        const before_frames = metal_runtime_mod.frameCommandBufferCount(runtime);
+        request.output = null;
+        const first = (try compute.encodeAudioLinear(&compute, source, &request, .staged)).?;
+        defer cb.free(first);
+        const second_input = MetalCompute.denseDeviceF32(shared_output).?;
+        const second = (try compute.encodeAudioLinear(&compute, second_input, &request, .staged)).?;
+        defer cb.free(second);
+        try std.testing.expectEqual(before_frames, metal_runtime_mod.frameCommandBufferCount(runtime));
+        try metal_runtime_mod.submitFrame(runtime);
+        try std.testing.expect(compute.audioEagerClampWorkspace(rows, width) == null);
+        try metal_runtime_mod.waitFrame(runtime);
+        const first_values = try cb.toFloat32(first, a);
+        defer a.free(first_values);
+        const second_values = try cb.toFloat32(second, a);
+        defer a.free(second_values);
+        try std.testing.expectEqualSlices(f32, expected, first_values);
+        for (expected, second_values) |value, actual| {
+            const bounded = std.math.clamp(value, -0.5, 0.5);
+            try std.testing.expectApproxEqAbs(bounded / (1.0 + @exp(-bounded)), actual, 1e-6);
+        }
+    }
 
     _ = observation.finish();
     const measured = observation.metal_serial_workspace orelse return error.MissingMetalAudioScratchObservation;
-    try std.testing.expectEqual(@as(u64, 9), measured.planned_clamp_bindings);
-    try std.testing.expectEqual(@as(u64, 9 * bytes), measured.planned_clamp_bytes);
+    try std.testing.expectEqual(@as(u64, 11), measured.planned_clamp_bindings);
+    try std.testing.expectEqual(@as(u64, 11 * bytes), measured.planned_clamp_bytes);
     try std.testing.expectEqual(@as(u64, 3), measured.temporary_clamp_bindings);
     try std.testing.expectEqual(@as(u64, 3 * bytes), measured.temporary_clamp_bytes);
     request.output = destination;

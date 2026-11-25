@@ -69307,6 +69307,17 @@ int antfly_metal_audio_storage_clear(termite_metal_decode_runtime *r) {
     r->audio_reuse_bytes = 0;
     return 0;
 }
+// Ordinary framed encoders and MPS use tracked Metal resources. A
+// concurrent planned scope needs its own explicit range/lifetime recipe.
+int antfly_metal_can_reuse_ordered_scratch(termite_metal_decode_runtime *r, void *handle) {
+    if (r == NULL || handle == NULL || r->submitted_frame_cb != nil) return 0;
+    if (r->active_frame_cb == nil) return 1;
+    id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)handle;
+    return r->active_planned_compute_encoder == nil && !r->audio_replay_scope &&
+        !termite_metal_lightonocr3_decode_coalescing_enabled(r) &&
+        buffer.hazardTrackingMode != MTLHazardTrackingModeUntracked;
+}
+
 int antfly_metal_audio_storage_scope(termite_metal_decode_runtime *r, int begin) {
     if (!r)
         return -1;

@@ -50818,6 +50818,8 @@ pub fn decoderRuntimeAudioClampInto(self: anytype, input: MetalTensor, output: M
     return rc == 0;
 }
 
+pub extern fn antfly_metal_can_reuse_ordered_scratch(runtime: ?*RawMetalDecodeRuntime, buffer_handle: ?*anyopaque) c_int;
+
 pub extern fn antfly_metal_audio_replay_scope(runtime: ?*RawMetalDecodeRuntime, enabled: c_int) c_int;
 
 pub extern fn antfly_metal_masked_mean_batch(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, metadata: [*]const i64, sequence: usize, width: usize, dimensions: usize, batch: usize, output: ?*anyopaque, output_offset: usize, normalize: bool, segmented: bool) c_int;
