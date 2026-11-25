@@ -205,6 +205,125 @@ pub const Layer = struct {
     }
 };
 
+/// One BF16 arena and one reduction plane, reusable across all visits.
+pub const RequestWorkspace = struct {
+    const Plane = enum {
+        query,
+        relative,
+        gate,
+        sink,
+        key,
+        value,
+        normalized_query,
+        normalized_relative,
+        relative_logits,
+        staged_key,
+        staged_value,
+        heads,
+        key_taps,
+        value_taps,
+    };
+    const plane_count = @typeInfo(Plane).@"enum".field_names.len;
+    backing: Tensor,
+    views: [plane_count]Tensor,
+    reduction: Tensor,
+
+    pub const Plan = struct {
+        offsets: [plane_count]usize,
+        elements: [plane_count]i32,
+        bytes: usize,
+        reduction_elements: i32,
+
+        pub fn init(text: checkpoint.TextConfig, rows: u32, max_tokens: u32) !Plan {
+            if (rows == 0 or rows > max_tokens or rows > 256) return error.InvalidShape;
+            const query = layout.projectionWidth(text, .q);
+            const key = layout.projectionWidth(text, .k);
+            const relative = layout.projectionWidth(text, .r);
+            const tap_width = @as(u32, text.num_key_value_heads) * text.sconv_kernel_size;
+            const widths: [plane_count]u32 = .{
+                query,     relative,  query,                                                text.num_attention_heads, key, key,
+                query,     relative,  @as(u32, text.num_attention_heads) * text.rel_extent, key,                      key, query,
+                tap_width, tap_width,
+            };
+            const attention: metal.PagedRelativeBf16Attention = .{
+                .query = .{
+                    .rows = rows,
+                    .start = max_tokens - rows,
+                    .q_heads = text.num_attention_heads,
+                    .kv_heads = text.num_key_value_heads,
+                    .relative_extent = text.rel_extent,
+                    .score_scale = 1,
+                },
+                .range = .{
+                    .first_page = 0,
+                    .page_count = max_tokens,
+                    .physical_pages = max_tokens,
+                    .page_tokens = 1,
+                    .visible_start = 0,
+                    .visible_end = max_tokens,
+                },
+            };
+            var result: Plan = .{ .offsets = undefined, .elements = undefined, .bytes = 0, .reduction_elements = try attention.scratchElements() };
+            for (widths, &result.offsets, &result.elements) |width, *offset, *elements| {
+                if (width == 0) return error.InvalidShape;
+                const count = @as(usize, rows) * width;
+                elements.* = std.math.cast(i32, count) orelse return error.InvalidShape;
+                offset.* = std.mem.alignForward(usize, result.bytes, 256);
+                result.bytes = offset.* + count * 2;
+            }
+            return result;
+        }
+    };
+
+    pub fn init(a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, plan: Plan) !RequestWorkspace {
+        const size = std.math.cast(i32, plan.bytes / 2) orelse return error.InvalidShape;
+        var backing = try Tensor.deviceAllocateTyped(a, runtime, .i16, .private, &.{size});
+        errdefer backing.deinit();
+        var reduction = try Tensor.deviceAllocateTyped(a, runtime, .f32, .private, &.{plan.reduction_elements});
+        errdefer reduction.deinit();
+        var views: [plane_count]Tensor = undefined;
+        var count: usize = 0;
+        errdefer for (views[0..count]) |*view| view.deinit();
+        for (&views, plan.offsets, plan.elements) |*view, offset, elements| {
+            view.* = try backing.retainedView(offset, @as(usize, @intCast(elements)) * 2, &.{elements});
+            count += 1;
+        }
+        return .{ .backing = backing, .views = views, .reduction = reduction };
+    }
+
+    pub fn deinit(self: *RequestWorkspace) void {
+        for (&self.views) |*view| view.deinit();
+        self.reduction.deinit();
+        self.backing.deinit();
+    }
+
+    fn plane(self: *RequestWorkspace, key: Plane) *Tensor {
+        return &self.views[@backingInt(key)];
+    }
+
+    pub fn bind(self: *RequestWorkspace, local: bool) Layer.Workspace {
+        return .{
+            .projected = .{
+                .query = self.plane(.query),
+                .relative = self.plane(.relative),
+                .gate = self.plane(.gate),
+                .sink = self.plane(.sink),
+                .key = self.plane(.key),
+                .value = self.plane(.value),
+                .key_taps = if (local) null else self.plane(.key_taps),
+                .value_taps = if (local) null else self.plane(.value_taps),
+            },
+            .normalized_query = self.plane(.normalized_query),
+            .normalized_relative = self.plane(.normalized_relative),
+            .relative_logits = self.plane(.relative_logits),
+            .staged_key = self.plane(.staged_key),
+            .staged_value = self.plane(.staged_value),
+            .heads = self.plane(.heads),
+            .attention_scratch = &self.reduction,
+        };
+    }
+};
+
 fn allocate(a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, elements: usize) !Tensor {
     if (elements == 0) return error.InvalidShape;
     const extent = std.math.cast(i32, elements) orelse return error.InvalidShape;
@@ -358,16 +477,10 @@ test "Inkling Metal attention weights drive local and global visits across commi
 
         var source = try allocate(a, runtime, 1);
         defer source.deinit();
-        var scratch = try Tensor.deviceAllocateTyped(a, runtime, .f32, .shared, &.{130});
-        defer scratch.deinit();
-        const sizes = [_]usize{ 128, 1, 128, 1, 128, 128, 128, 1, 1, 128, 128, 128, 1, 4, 4 };
-        var buffers: [sizes.len]Tensor = undefined;
-        var count: usize = 0;
-        defer for (buffers[0..count]) |*buffer| buffer.deinit();
-        for (&buffers, sizes) |*buffer, size| {
-            buffer.* = try allocate(a, runtime, size);
-            count += 1;
-        }
+        var workspace = try RequestWorkspace.init(a, runtime, try .init(text, 1, 2));
+        defer workspace.deinit();
+        var output = try allocate(a, runtime, 1);
+        defer output.deinit();
         for ([_]u16{ 0x3f80, 0xbf80 }, 0..) |activation, position| {
             var append = try state.prepare(1);
             defer append.abort();
@@ -375,30 +488,12 @@ test "Inkling Metal attention weights drive local and global visits across commi
             try source.uploadBytes(std.mem.asBytes(&activation));
             try metal.beginFrame(runtime);
             errdefer metal.cancelFrame(runtime) catch {};
-            try layer.encode(runtime, text, &append, .{ .query = &source, .key = &source, .value = &source }, binding.page_ids, binding.planes, binding.history, .{
-                .projected = .{
-                    .query = &buffers[0],
-                    .relative = &buffers[1],
-                    .gate = &buffers[2],
-                    .sink = &buffers[3],
-                    .key = &buffers[4],
-                    .value = &buffers[5],
-                    .key_taps = if (layer.local) null else &buffers[13],
-                    .value_taps = if (layer.local) null else &buffers[14],
-                },
-                .normalized_query = &buffers[6],
-                .normalized_relative = &buffers[7],
-                .relative_logits = &buffers[8],
-                .staged_key = &buffers[9],
-                .staged_value = &buffers[10],
-                .heads = &buffers[11],
-                .attention_scratch = &scratch,
-            }, &buffers[12]);
+            try layer.encode(runtime, text, &append, .{ .query = &source, .key = &source, .value = &source }, binding.page_ids, binding.planes, binding.history, workspace.bind(layer.local), &output);
             try metal.submitFrame(runtime);
             try state.publish(&append);
             try std.testing.expectEqual(position + 1, state.sequence.committed_tokens);
             var result: u16 = undefined;
-            try buffers[12].downloadBytesInto(std.mem.asBytes(&result));
+            try output.downloadBytesInto(std.mem.asBytes(&result));
             // Global retains +1 and -1 values, while the one-token window sees only -1.
             const expected: u16 = if (position == 0) 0x4200 else if (layer.local) 0xc200 else 0;
             try std.testing.expectEqual(expected, result);
