@@ -2826,8 +2826,12 @@ def _exercise_online_document_merge(
     return table_name
 
 
+@pytest.mark.parametrize(
+    "damage_sibling", [False, True], ids=["healthy", "damaged-sibling"]
+)
 def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
     three_by_three_backup_cluster: ThreeByThreeBackupCluster,
+    damage_sibling: bool,
 ) -> None:
     cluster = three_by_three_backup_cluster
     table_name = f"metadata_leader_backup_{time.time_ns()}"
@@ -2886,6 +2890,21 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
         interval_s=0.5,
     ), cluster.debug_logs()
 
+    backup_tables = [table_name]
+    sibling = f"a_damaged_backup_sibling_{time.time_ns()}"
+    sibling_topology = None
+    if damage_sibling:
+        _create_cluster_table_when_admitted(
+            cluster, session, sibling, {"num_shards": 3}
+        )
+        sibling_topology = wait_until(
+            lambda: cluster.fully_replicated_topology(sibling),
+            timeout_s=90.0,
+            interval_s=0.5,
+        )
+        assert sibling_topology is not None, cluster.debug_logs()
+        backup_tables.insert(0, sibling)
+
     # The registered repository remains owned by the live cluster: its
     # background reclaimer can publish a cursor even after restore completes.
     # Cluster teardown stops every process before deleting this directory.
@@ -2901,7 +2920,7 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
                     "backup_id": backup_id,
                     "location": _file_location(backup_dir),
                     "connection": BACKUP_CONNECTION,
-                    "table_names": [table_name],
+                    "table_names": backup_tables,
                 },
                 timeout=30,
             )
@@ -2926,14 +2945,21 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
 
     assert backup["backup_id"] == backup_id
     assert backup["status"] == "completed", f"backup={backup}\n{cluster.debug_logs()}"
-    assert [table["name"] for table in backup["tables"]] == [table_name]
-    table_manifests = [
-        path
-        for path in Path(backup_dir).glob("*-metadata.json")
-        if not path.name.endswith("-cluster-metadata.json")
-    ]
-    assert len(table_manifests) == 1
-    table_manifest = json.loads(table_manifests[0].read_text(encoding="utf-8"))
+    assert {table["name"] for table in backup["tables"]} == set(backup_tables)
+    repository = Path(backup_dir)
+    aggregate = json.loads(
+        (repository / f"{backup_id}-cluster-metadata.json").read_text(encoding="utf-8")
+    )
+    assert [entry["name"] for entry in aggregate["tables"]] == backup_tables
+    manifests = {
+        entry["name"]: json.loads(
+            (repository / f'{entry["table_backup_id"]}-metadata.json').read_text(
+                encoding="utf-8"
+            )
+        )
+        for entry in aggregate["tables"]
+    }
+    table_manifest = manifests[table_name]
     assert len(table_manifest["shards"]) == 3
     assert len({int(shard["group_id"]) for shard in table_manifest["shards"]}) == 3
     routed_source_groups = set()
@@ -2964,6 +2990,15 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
     _delete_cluster_table_and_observe(
         cluster, session, table_name, original_table_id, original_group_ids
     )
+
+    if sibling_topology is not None:
+        sibling_id, sibling_groups = sibling_topology
+        _delete_cluster_table_and_observe(
+            cluster, session, sibling, sibling_id, sibling_groups
+        )
+        # The first table's manifest remains valid. Its missing artifact
+        # must not strand the active checkpoint and block the healthy table.
+        (repository / manifests[sibling]["shards"][0]["snapshot_path"]).unlink()
 
     restore_response = None
     restore_coordinator_url = None
@@ -3057,13 +3092,16 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
         f"restore job {job_id} did not finish; last_jobs={last_jobs!r}\n"
         f"{cluster.debug_logs()}"
     )
-    assert restore_job["phase"] == "succeeded", (
+    expected_phase = "failed" if damage_sibling else "succeeded"
+    assert restore_job["phase"] == expected_phase, (
         f"restore={restore_job}\n{cluster.debug_logs()}"
     )
+    if damage_sibling:
+        assert restore_job["error"] == "ClusterRestorePartialFailure", restore_job
     restore = restore_job["result"]
-    assert restore["status"] == "completed"
+    assert restore["status"] == ("partial" if damage_sibling else "completed")
     assert restore["committed_table_count"] == 1
-    assert restore["failed_table_count"] == 0
+    assert restore["failed_table_count"] == int(damage_sibling)
 
     assert wait_until(lambda: cluster.refresh_table_identity(table_name), timeout_s=30)
     restored_topology = wait_until(

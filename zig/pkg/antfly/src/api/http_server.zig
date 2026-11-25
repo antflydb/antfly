@@ -23964,8 +23964,8 @@ pub const ApiHttpServer = struct {
         // archives instead of writing lease sidecars into the source.
         var verification_cache: backups_api.ArtifactVerificationCache = .{};
         defer verification_cache.deinit(op_alloc);
-        // Pinned legacy attempts already verified repository health at admission.
-        // Reopening the head would check unrelated and already published shards.
+        // Admission pins the aggregate and selected child manifests so retries
+        // can recover publication using the same backup identities.
         var manifest = (if (req.admitted_manifest_json) |bytes|
             backups_api.parseClusterManifestBytes(op_alloc, bytes, req.backup_id)
         else if (req.admitted_child_pins != null or (req.single_table_destination != null and req.admitted_manifest_sha256 != null))
