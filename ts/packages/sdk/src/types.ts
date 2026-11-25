@@ -619,10 +619,12 @@ export type SSEToolMode = components["schemas"]["SSEToolMode"];
 export interface RetrievalAgentStreamCallbacks {
   onContextManagement?: (event: AgentContextEvent) => void;
   onClassification?: (data: ClassificationTransformationResult) => void;
+  /** @deprecated Use structured step events for retrieval activity. */
   onReasoning?: (chunk: string) => void;
   onHit?: (hit: QueryHit) => void;
   onGeneration?: (chunk: string) => void;
   onConfidence?: (data: GenerationConfidence) => void;
+  /** @deprecated Legacy canned suggestions. User clarifications are returned in the result. */
   onFollowup?: (question: string) => void;
   onEvalResult?: (data: EvalResult) => void;
   onToolMode?: (data: SSEToolMode) => void;
@@ -717,6 +719,7 @@ export interface ChatAgentConfig {
   table?: string;
   /** Semantic indexes to use */
   semanticIndexes?: string[];
+  retrievalMode?: "planned" | "semantic";
   /** Domain-specific knowledge for the agent */
   agentKnowledge?: string;
   /** System prompt override */

@@ -1,3 +1,4 @@
+import { answerRetrieval } from "./answer-retrieval.js";
 import { AntflyHTTPError, AntflyResponseError } from "./errors.js";
 import { encodeGraphParameter } from "./graph-wire.js";
 import {
@@ -2605,24 +2606,22 @@ export class AntflyClient {
     // Build retrieval agent request with conversation history
     const request: RetrievalAgentRequest = {
       query: userMessage,
-      queries: [
-        {
-          table: config.table,
-          semantic_search: userMessage,
-          indexes: config.semanticIndexes,
-          limit: config.limit ?? 10,
-        },
-      ],
+      ...answerRetrieval(config.table, userMessage, {
+        ...config,
+        maxInternalIterations:
+          config.maxInternalIterations ?? (config.semanticIndexes?.length ? 5 : undefined),
+      }),
       generator: config.generator,
       messages: [...history, { role: "user", content: userMessage }],
-      max_internal_iterations: config.maxInternalIterations ?? 5,
       stream: !!callbacks,
       agent_knowledge: config.agentKnowledge,
     };
 
-    if (config.steps) {
-      request.steps = config.steps;
-    }
+    request.steps = config.steps ?? {
+      generation: config.systemPrompt ? { system_prompt: config.systemPrompt } : {},
+    };
+    const generationRequested =
+      request.steps.generation !== undefined && request.steps.generation.enabled !== false;
 
     if (callbacks) {
       // Streaming mode: accumulate answer and emit chat-specific callbacks
@@ -2655,12 +2654,19 @@ export class AntflyClient {
           // The terminal result also covers JSON fallback and streams without
           // generation deltas. Prefer its complete answer and conversation.
           answerText = data.generation ?? answerText;
+          if (generationRequested && data.status === "completed" && !answerText.trim()) {
+            const error = new Error("Retrieval completed without generating an answer.");
+            failMessages(error);
+            callbacks.onErrorDetail?.(error);
+            callbacks.onError?.(error.message);
+            return;
+          }
           const updatedMessages: ChatMessage[] = data.messages?.length
             ? data.messages
             : [
                 ...history,
                 { role: "user", content: userMessage },
-                { role: "assistant", content: answerText },
+                ...(answerText ? [{ role: "assistant" as const, content: answerText }] : []),
               ];
           settled = true;
           removeAbortListener();
@@ -2694,6 +2700,9 @@ export class AntflyClient {
 
     // Non-streaming mode
     const result = await this.retrievalAgent(request);
+    if (generationRequested && result.status === "completed" && !result.generation?.trim()) {
+      throw new Error("Retrieval completed without generating an answer.");
+    }
 
     // Use server-provided messages or build from response
     const updatedMessages: ChatMessage[] = result.messages?.length

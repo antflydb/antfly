@@ -281,6 +281,8 @@ The `<Facet>` component creates filterable facets for categorical data.
 - `placeholder` (string): Search placeholder within facet
 - `seeMore` (string): Text for "see more" button
 
+When there are multiple result sets for the same table, pass `resultsId` to scope a facet to one of them.
+
 ### Custom Facet Rendering
 
 You can customize how facet items are rendered:
@@ -428,7 +430,7 @@ const generator = {
   systemPrompt="You are a helpful research assistant."
   fields={["content", "title"]}
   semanticIndexes={["embeddings"]}
-  showReasoning={true}
+  showActivity={true}
   showFollowUpQuestions={true}
 />
 ```
@@ -444,6 +446,7 @@ const generator = {
 - `filterQuery` (object): Query to constrain search results
 - `exclusionQuery` (object): Query to exclude matches
 - `fields` (array): Fields to search for context
+- `retrievalMode` (`"planned"` or `"semantic"`): Start from a table scope and let the server plan, or start with a semantic query. For compatibility, supplying `semanticIndexes` without a mode selects semantic retrieval. When indexes are omitted, the default is planned keyword retrieval.
 - `semanticIndexes` (array): Vector indexes to search
 - `limit` (number): Results limit per search (default: 10)
 - `followUpCount` (number): Number of follow-up questions to request
@@ -451,8 +454,9 @@ const generator = {
 
 **Visibility Controls:**
 - `showClassification` (boolean): Display query classification (default: false)
-- `showReasoning` (boolean): Display reasoning process (default: false)
-- `showFollowUpQuestions` (boolean): Display follow-up questions (default: true)
+- `showActivity` (boolean): Display structured tool activity (default: false)
+- `showReasoning` (boolean): Legacy text stream, deprecated in favor of `showActivity`
+- `showFollowUpQuestions` (boolean): Opt in to legacy follow-up suggestions. Supplying `followUpCount` also opts in unless this prop is explicitly false.
 - `showConfidence` (boolean): Display confidence assessment (default: false)
 - `showHits` (boolean): Display search results used for context (default: false)
 
