@@ -32588,11 +32588,19 @@ fn requireUncapturedDenseCross(self: *CudaCompute) !void {
     if (try self.ctx.streamCaptureActive()) return error.CudaGraphCaptureUnsafeMatmulPlan;
 }
 
+fn reducedCrossKvElementBytes(ctx: *anyopaque) ?usize {
+    const self: *const CudaCompute = @ptrCast(@alignCast(ctx));
+    return if (self.capability_profile == .transformer_seq2seq and self.runtime_policy.seq2seq.cross_kv == .f16)
+        @sizeOf(f16)
+    else
+        null;
+}
+
 /// Both returned CTs own independent device storage. Metadata is complete
 /// before casts are queued, and source custody never transfers on refusal.
 fn prepareDenseCrossKv(ctx: *anyopaque, k_ct: CT, v_ct: CT) anyerror!?ops.LinearNoBiasPairResult {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
-    if (self.capability_profile != .transformer_seq2seq or self.runtime_policy.seq2seq.cross_kv != .f16) return null;
+    const element_bytes = reducedCrossKvElementBytes(ctx) orelse return null;
     if (self.runtime_policy.seq2seq.cross_schedule != .split_kv_128 or self.kernels.cross_split_hd64_f16 == null or
         self.kernels.cross_split_hd64_merge_f32 == null or self.kernels.f32_to_f16 == null) return error.CudaKernelUnavailable;
     const k = tensorFromCt(k_ct);
@@ -32602,24 +32610,24 @@ fn prepareDenseCrossKv(ctx: *anyopaque, k_ct: CT, v_ct: CT) anyerror!?ops.Linear
     if (k.elem_count == 0 or k.elem_count != v.elem_count or !std.mem.eql(i64, k.shape, v.shape)) return error.InvalidShape;
     try requireUncapturedDenseCross(self);
     const Allocation = struct {
-        fn run(compute: *CudaCompute, source: *const CudaTensor) !CT {
+        fn run(compute: *CudaCompute, source: *const CudaTensor, bytes_per_element: usize) !CT {
             const shape = try dupeShape(compute.allocator, source.shape);
             errdefer compute.allocator.free(shape);
             // This cache outlives the projection frame: never borrow its
             // assigned outputs, pinned ordinal slots or temporary arena.
-            var buffer = try buffer_mod.DeviceBuffer.allocWithPurpose(&compute.ctx, try checkedMul(source.elem_count, 2), .kv_state);
+            var buffer = try buffer_mod.DeviceBuffer.allocWithPurpose(&compute.ctx, try checkedMul(source.elem_count, bytes_per_element), .kv_state);
             compute.stats.device_alloc_calls += 1;
             errdefer buffer.free(&compute.ctx);
             return createTensorWithDType(compute, buffer, shape, source.elem_count, .f16);
         }
     };
-    const first = try Allocation.run(self, k);
+    const first = try Allocation.run(self, k, element_bytes);
     errdefer {
         const header = tensorFromCt(first);
         freeCudaTensorStorageUncached(self, header);
         self.allocator.destroy(header);
     }
-    const second = try Allocation.run(self, v);
+    const second = try Allocation.run(self, v, element_bytes);
     errdefer {
         const header = tensorFromCt(second);
         freeCudaTensorStorageUncached(self, header);
@@ -36873,6 +36881,7 @@ const vtable: ops.ComputeBackend.VTable = .{
 
         .sequence_projection = .{
             .unfold1dReady = &conv1dIm2colReady,
+            .reducedCrossKvElementBytes = &reducedCrossKvElementBytes,
             .prepareCrossKv = &prepareDenseCrossKv,
             .firstWordRows = &glinerWordEmbeddings,
             .gruSummary = &glinerLabelGruCombined,
@@ -54358,6 +54367,21 @@ test "CUDA split cross static dtype cache survives source release and matches in
         // Missing artifacts on an actual CUDA worker fail qualification.
         try compute.configureSeq2seqPolicy(.{ .cross_kv = precision, .cross_schedule = .split_kv_128 });
         const cb = compute.computeBackend();
+        const geometry = try @import("../../architectures/whisper.zig").CacheGeometry.init(.{
+            .d_model = heads * dim,
+            .decoder_layers = 1,
+            .max_target_positions = 16,
+        }, batch * keys);
+        const eager_amounts = try geometry.eagerCacheAmounts(&cb);
+        const planned_amounts = try geometry.cacheAmounts(&cb);
+        const self_bytes = try ops.physical_storage.reservationBytes(cb, .{ .byte_size = geometry.self_tensor_bytes });
+        const cross_bytes = try ops.physical_storage.reservationBytes(cb, .{
+            .byte_size = if (precision == .f16) geometry.cross_tensor_bytes / 2 else geometry.cross_tensor_bytes,
+        });
+        try std.testing.expectEqual(2 * (self_bytes + cross_bytes), eager_amounts.backend_kv_bytes);
+        if (precision == .f16) {
+            try std.testing.expect(eager_amounts.backend_kv_bytes < planned_amounts.backend_kv_bytes);
+        } else try std.testing.expectEqualDeep(planned_amounts, eager_amounts);
         const qt = try cb.fromFloat32Shape(&q, &.{ batch * queries, heads * dim });
         defer cb.free(qt);
         const kt = try cb.fromFloat32Shape(&k, &.{ batch * keys, heads * dim });

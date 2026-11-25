@@ -6107,7 +6107,7 @@ fn incrementalBasePermit(session: Session, config: whisper_mod.Config, geometry:
 }
 
 fn incrementalCachePermit(session: Session, base: *const @import("../backends/session.zig").RunPermit, geometry: whisper_arch.CacheGeometry, cb: *const ops.ComputeBackend) !?@import("../backends/session.zig").RunPermit {
-    return incrementalCachePermitForAmounts(session, base, try geometry.cacheAmounts(cb));
+    return incrementalCachePermitForAmounts(session, base, try geometry.eagerCacheAmounts(cb));
 }
 fn incrementalCachePermitForAmounts(session: Session, base: *const @import("../backends/session.zig").RunPermit, amounts: runtime.tier.memory.AdmissionAmounts) !?@import("../backends/session.zig").RunPermit {
     const lease = base.lease orelse return null;

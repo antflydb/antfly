@@ -905,7 +905,7 @@ const WeightFetcher = struct {
 /// attention kernel reads a zero-copy view of the live prefix. Elsewhere the
 /// cache grows by concatenation.
 /// Canonical allocation geometry shared by cache construction and admission.
-/// KV values are F32 on every current backend; opaque source preparation keeps
+/// Prepared destinations and self-cache slabs use F32. Opaque preparation keeps
 /// the existing model/static workspace floor until its selected-route bound is
 /// available. No private cache is mislabeled as a published output tensor.
 pub const CacheGeometry = struct {
@@ -929,11 +929,24 @@ pub const CacheGeometry = struct {
     }
 
     pub fn cacheAmounts(self: CacheGeometry, cb: *const ComputeBackend) !@import("../runtime/tier/memory.zig").AdmissionAmounts {
+        return self.cacheAmountsForCrossBytes(cb, self.cross_tensor_bytes);
+    }
+
+    pub fn eagerCacheAmounts(self: CacheGeometry, cb: *const ComputeBackend) !@import("../runtime/tier/memory.zig").AdmissionAmounts {
+        const width = if (cb.vtable.regions.sequence_projection.reducedCrossKvElementBytes) |query|
+            query(cb.ptr) orelse @sizeOf(f32)
+        else
+            @sizeOf(f32);
+        if (width != @sizeOf(f32) and width != @sizeOf(f16)) return error.InvalidPhysicalStorageReservation;
+        return self.cacheAmountsForCrossBytes(cb, try cacheMul(usize, self.cross_tensor_bytes / @sizeOf(f32), width));
+    }
+
+    fn cacheAmountsForCrossBytes(self: CacheGeometry, cb: *const ComputeBackend, cross_bytes: usize) !@import("../runtime/tier/memory.zig").AdmissionAmounts {
         if (self.layers == 0) return .{ .host_scratch_bytes = self.known_metadata_bytes };
         const functions = cb.vtable.kernels;
-        const cross = if (functions) |table| if (table.physical_storage_policy) |_| try ops.physical_storage.reservationBytes(cb.*, .{ .byte_size = self.cross_tensor_bytes }) else self.cross_tensor_bytes else self.cross_tensor_bytes;
+        const cross = if (functions) |table| if (table.physical_storage_policy) |_| try ops.physical_storage.reservationBytes(cb.*, .{ .byte_size = cross_bytes }) else cross_bytes else cross_bytes;
         const slab = if (functions) |table| if (table.physical_storage_policy) |_| try ops.physical_storage.reservationBytes(cb.*, .{ .byte_size = self.self_tensor_bytes }) else self.self_tensor_bytes else self.self_tensor_bytes;
-        if (cross < self.cross_tensor_bytes or slab < self.self_tensor_bytes) return error.InvalidPhysicalStorageReservation;
+        if (cross < cross_bytes or slab < self.self_tensor_bytes) return error.InvalidPhysicalStorageReservation;
         const bytes = try cacheMul(usize, try cacheMul(usize, self.layers, 2), try cacheAdd(usize, cross, slab));
         var result = @import("../runtime/tier/memory.zig").AdmissionAmounts{ .host_scratch_bytes = self.known_metadata_bytes };
         switch (cb.kind()) {

@@ -2716,6 +2716,9 @@ pub const ComputeBackend = struct {
         /// Null hook retains legacy unfold policy. A present false decision
         /// declines before dense-slot preparation or any numerical submission.
         unfold1dReady: ?*const fn (ctx: *anyopaque, request: *const Conv1dUnfoldRequest) anyerror!bool = null,
+        /// Physical element width of the retained result of prepareCrossKv.
+        /// A null value preserves the projection output's F32 storage.
+        reducedCrossKvElementBytes: ?*const fn (ctx: *anyopaque) ?usize = null,
         /// Immutable backend-preferred cross-attention cache; null preserves input precision.
         prepareCrossKv: ?*const fn (ctx: *anyopaque, k: CT, v: CT) anyerror!?LinearNoBiasPairResult = null,
         /// GLiNER-specific word embedding aggregation:
