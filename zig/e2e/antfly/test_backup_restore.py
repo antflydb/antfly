@@ -211,6 +211,11 @@ def _enroll_store_root_once(
     raise AssertionError(f"store-root enrollment was not confirmed: {last}")
 
 
+def _backup_entry_public_name(entry: dict) -> str:
+    target = entry.get("catalog_target")
+    return target["table"] if target is not None else entry["name"]
+
+
 def _wait_for_terminal_restore_job(
     backup_api, response: requests.Response, *, timeout_s: float = 30.0
 ) -> dict:
@@ -2821,6 +2826,22 @@ def _exercise_online_document_merge(
 def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
     three_by_three_backup_cluster: ThreeByThreeBackupCluster,
 ) -> None:
+    _three_by_three_cluster_backup_restore(three_by_three_backup_cluster)
+
+
+def test_distributed_cluster_restore_rejects_damage_and_can_restore_healthy_selection(
+    three_by_three_backup_cluster: ThreeByThreeBackupCluster,
+) -> None:
+    _three_by_three_cluster_backup_restore(
+        three_by_three_backup_cluster, damage_sibling=True
+    )
+
+
+def _three_by_three_cluster_backup_restore(
+    three_by_three_backup_cluster: ThreeByThreeBackupCluster,
+    *,
+    damage_sibling: bool = False,
+) -> None:
     cluster = three_by_three_backup_cluster
     table_name = f"metadata_leader_backup_{time.time_ns()}"
     backup_id = f"metadata-leader-backup-{time.time_ns()}"
@@ -2878,6 +2899,21 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
         interval_s=0.5,
     ), cluster.debug_logs()
 
+    backup_tables = [table_name]
+    sibling = f"a_damaged_backup_sibling_{time.time_ns()}"
+    sibling_topology = None
+    if damage_sibling:
+        _create_cluster_table_when_admitted(
+            cluster, session, sibling, {"num_shards": 3}
+        )
+        sibling_topology = wait_until(
+            lambda: cluster.fully_replicated_topology(sibling),
+            timeout_s=90.0,
+            interval_s=0.5,
+        )
+        assert sibling_topology is not None, cluster.debug_logs()
+        backup_tables.insert(0, sibling)
+
     # The registered repository remains owned by the live cluster: its
     # background reclaimer can publish a cursor even after restore completes.
     # Cluster teardown stops every process before deleting this directory.
@@ -2893,7 +2929,7 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
                     "backup_id": backup_id,
                     "location": _file_location(backup_dir),
                     "connection": BACKUP_CONNECTION,
-                    "table_names": [table_name],
+                    "table_names": backup_tables,
                 },
                 timeout=30,
             )
@@ -2918,14 +2954,23 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
 
     assert backup["backup_id"] == backup_id
     assert backup["status"] == "completed", f"backup={backup}\n{cluster.debug_logs()}"
-    assert [table["name"] for table in backup["tables"]] == [table_name]
-    table_manifests = [
-        path
-        for path in Path(backup_dir).glob("*-metadata.json")
-        if not path.name.endswith("-cluster-metadata.json")
-    ]
-    assert len(table_manifests) == 1
-    table_manifest = json.loads(table_manifests[0].read_text(encoding="utf-8"))
+    assert {table["name"] for table in backup["tables"]} == set(backup_tables)
+    repository = Path(backup_dir)
+    aggregate = json.loads(
+        (repository / f"{backup_id}-cluster-metadata.json").read_text(encoding="utf-8")
+    )
+    assert [
+        _backup_entry_public_name(entry) for entry in aggregate["tables"]
+    ] == backup_tables
+    manifests = {
+        _backup_entry_public_name(entry): json.loads(
+            (repository / f'{entry["table_backup_id"]}-metadata.json').read_text(
+                encoding="utf-8"
+            )
+        )
+        for entry in aggregate["tables"]
+    }
+    table_manifest = manifests[table_name]
     assert len(table_manifest["shards"]) == 3
     assert len({int(shard["group_id"]) for shard in table_manifest["shards"]}) == 3
     routed_source_groups = set()
@@ -2957,98 +3002,122 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
         cluster, session, table_name, original_table_id, original_group_ids
     )
 
-    restore_response = None
-    restore_coordinator_url = None
-    last_response = None
+    if sibling_topology is not None:
+        sibling_id, sibling_groups = sibling_topology
+        _delete_cluster_table_and_observe(
+            cluster, session, sibling, sibling_id, sibling_groups
+        )
+        # Keep the manifest valid while removing one pinned artifact.
+        (repository / manifests[sibling]["shards"][0]["snapshot_path"]).unlink()
+        head = json.loads(
+            (repository / ".antfly-backup-attempt-head.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        (repository / ".antfly-incomplete" / f'{head["attempt_id"]}.json').unlink()
+
+    def run_restore(restore_payload: dict, attempt: str) -> dict:
+        restore_coordinator_url = None
+        last_response = None
+        # A lost admission acknowledgement is not a rejected restore. Reuse one
+        # explicit key through leader changes so recovery cannot create two jobs.
+        restore_headers = {"Idempotency-Key": f"restore-{backup_id}-{attempt}"}
+        unknown_job_id = None
+
+        def admit_restore() -> requests.Response | None:
+            nonlocal last_response, restore_coordinator_url, unknown_job_id
+            leader_public_url = cluster.metadata_leader_public_url(timeout_s=30.0)
+            try:
+                response = session.post(
+                    f"{leader_public_url}/restore",
+                    json=restore_payload,
+                    headers=restore_headers,
+                    timeout=10,
+                )
+            except requests.RequestException:
+                return None
+            last_response = response
+            if _is_metadata_not_leader_response(response):
+                return None
+            if response.status_code == 503:
+                body = response.json()
+                assert body.get("admission_outcome") == "unknown", response.text
+                if unknown_job_id is not None:
+                    assert body["job_id"] == unknown_job_id, response.text
+                unknown_job_id = body["job_id"]
+                return None
+            assert response.status_code == 202, response.text
+            if unknown_job_id is not None:
+                assert response.json()["job_id"] == unknown_job_id, response.text
+            restore_coordinator_url = leader_public_url
+            return response
+
+        restore_response = wait_until(admit_restore, timeout_s=60.0, interval_s=0.5)
+        assert restore_response is not None, (
+            "metadata leader stayed unavailable for restore after retries; "
+            f"last_response={last_response.text if last_response is not None else None}\n"
+            f"{cluster.debug_logs()}"
+        )
+        assert restore_coordinator_url is not None
+        assert restore_response.status_code == 202, restore_response.text
+        accepted = _check_response(restore_response)
+        job_id = accepted.get("job_id")
+        assert isinstance(job_id, str) and job_id
+        last_jobs = {}
+
+        def terminal_restore() -> dict | None:
+            cluster.assert_processes_alive()
+            candidate_urls = [
+                restore_coordinator_url,
+                *(
+                    url
+                    for url in cluster.metadata_public_urls
+                    if url != restore_coordinator_url
+                ),
+            ]
+            for api_url in candidate_urls:
+                try:
+                    response = session.get(f"{api_url}/restore/jobs/{job_id}", timeout=1)
+                except requests.RequestException:
+                    continue
+                if response.status_code == 503:
+                    continue
+                try:
+                    job = _check_response(response)
+                except AssertionError as exc:
+                    cluster.metadata_snapshots()
+                    raise AssertionError(
+                        f"restore job poll failed: {exc}; last_jobs={last_jobs!r}\n"
+                        f"{cluster.debug_logs()}"
+                    ) from exc
+                last_jobs[api_url] = job
+                if job.get("phase") in {"succeeded", "failed", "cancelled"}:
+                    return job
+            return None
+
+        restore_job = wait_until(terminal_restore, timeout_s=120.0, interval_s=0.1)
+        if restore_job is None:
+            cluster.metadata_snapshots()
+        assert restore_job is not None, (
+            f"restore job {job_id} did not finish; last_jobs={last_jobs!r}\n"
+            f"{cluster.debug_logs()}"
+        )
+        return restore_job
+
+
     restore_payload = {
         "backup_id": backup_id,
         "location": _file_location(backup_dir),
         "connection": BACKUP_CONNECTION,
         "restore_mode": "fail_if_exists",
     }
-    # A lost admission acknowledgement is not a rejected restore. Reuse one
-    # explicit key through leader changes so recovery cannot create two jobs.
-    restore_headers = {"Idempotency-Key": f"restore-{backup_id}"}
-    unknown_job_id = None
+    if damage_sibling:
+        damaged = run_restore(restore_payload, "damaged")
+        assert damaged["phase"] == "failed", damaged
+        assert damaged["error"] == "BackupIntegrityFailure", damaged
+        restore_payload["table_names"] = [table_name]
 
-    def admit_restore() -> requests.Response | None:
-        nonlocal last_response, restore_coordinator_url, unknown_job_id
-        leader_public_url = cluster.metadata_leader_public_url(timeout_s=30.0)
-        try:
-            response = session.post(
-                f"{leader_public_url}/restore",
-                json=restore_payload,
-                headers=restore_headers,
-                timeout=10,
-            )
-        except requests.RequestException:
-            return None
-        last_response = response
-        if _is_metadata_not_leader_response(response):
-            return None
-        if response.status_code == 503:
-            body = response.json()
-            assert body.get("admission_outcome") == "unknown", response.text
-            if unknown_job_id is not None:
-                assert body["job_id"] == unknown_job_id, response.text
-            unknown_job_id = body["job_id"]
-            return None
-        assert response.status_code == 202, response.text
-        if unknown_job_id is not None:
-            assert response.json()["job_id"] == unknown_job_id, response.text
-        restore_coordinator_url = leader_public_url
-        return response
-
-    restore_response = wait_until(admit_restore, timeout_s=60.0, interval_s=0.5)
-    assert restore_response is not None, (
-        "metadata leader stayed unavailable for restore after retries; "
-        f"last_response={last_response.text if last_response is not None else None}\n"
-        f"{cluster.debug_logs()}"
-    )
-    assert restore_coordinator_url is not None
-    assert restore_response.status_code == 202, restore_response.text
-    accepted = _check_response(restore_response)
-    job_id = accepted.get("job_id")
-    assert isinstance(job_id, str) and job_id
-    last_jobs = {}
-
-    def terminal_restore() -> dict | None:
-        cluster.assert_processes_alive()
-        candidate_urls = [
-            restore_coordinator_url,
-            *(
-                url
-                for url in cluster.metadata_public_urls
-                if url != restore_coordinator_url
-            ),
-        ]
-        for api_url in candidate_urls:
-            try:
-                response = session.get(f"{api_url}/restore/jobs/{job_id}", timeout=1)
-            except requests.RequestException:
-                continue
-            if response.status_code == 503:
-                continue
-            try:
-                job = _check_response(response)
-            except AssertionError as exc:
-                cluster.metadata_snapshots()
-                raise AssertionError(
-                    f"restore job poll failed: {exc}; last_jobs={last_jobs!r}\n"
-                    f"{cluster.debug_logs()}"
-                ) from exc
-            last_jobs[api_url] = job
-            if job.get("phase") in {"succeeded", "failed", "cancelled"}:
-                return job
-        return None
-
-    restore_job = wait_until(terminal_restore, timeout_s=120.0, interval_s=0.1)
-    if restore_job is None:
-        cluster.metadata_snapshots()
-    assert restore_job is not None, (
-        f"restore job {job_id} did not finish; last_jobs={last_jobs!r}\n"
-        f"{cluster.debug_logs()}"
-    )
+    restore_job = run_restore(restore_payload, "healthy")
     assert restore_job["phase"] == "succeeded", (
         f"restore={restore_job}\n{cluster.debug_logs()}"
     )
@@ -3076,21 +3145,22 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
         f"a fresh incarnation: source={original_group_ids}, restored={restored_group_ids}"
     )
 
-    def restored_docs_visible_from_every_data_node() -> bool | None:
-        for api_url in cluster.data_api_urls:
-            for key, expected in source_docs.items():
-                doc = _lookup_doc_from_url(session, api_url, table_name, key)
-                if doc is None or doc.get("title") != expected["title"]:
-                    return None
-        return True
+    if not damage_sibling:
+        def restored_docs_visible_from_every_data_node() -> bool | None:
+            for api_url in cluster.data_api_urls:
+                for key, expected in source_docs.items():
+                    doc = _lookup_doc_from_url(session, api_url, table_name, key)
+                    if doc is None or doc.get("title") != expected["title"]:
+                        return None
+            return True
 
-    assert wait_until(
-        restored_docs_visible_from_every_data_node,
-        timeout_s=60.0,
-        interval_s=0.5,
-    ), (
-        f"restored documents were not readable through every data node\n{cluster.debug_logs()}"
-    )
+        assert wait_until(
+            restored_docs_visible_from_every_data_node,
+            timeout_s=60.0,
+            interval_s=0.5,
+        ), (
+            f"restored documents were not readable through every data node\n{cluster.debug_logs()}"
+        )
 
     assert wait_until(
         lambda: cluster.restore_progress_cleared(table_name) or None,
@@ -3748,6 +3818,34 @@ def _cluster_restore_modes(backup_api, *, concurrent_observers=False):
         assert restored_docs is not None
         assert restored_docs[table_a]["title"] == "Original Alpha"
         assert restored_docs[table_b]["title"] == "Original Beta"
+
+        repository = Path(backup_dir)
+        aggregate = json.loads(
+            (repository / f"{backup_id}-cluster-metadata.json").read_text()
+        )
+        sibling = next(
+            entry
+            for entry in aggregate["tables"]
+            if _backup_entry_public_name(entry) == table_b
+        )
+        sibling_manifest = json.loads(
+            (repository / f'{sibling["table_backup_id"]}-metadata.json').read_text()
+        )
+        (repository / sibling_manifest["shards"][0]["snapshot_path"]).unlink()
+
+        skip_damaged = backup_api.cluster_restore(
+            backup_id=backup_id, location=location, restore_mode="skip_if_exists"
+        )
+        assert skip_damaged["skipped_table_count"] == 2, skip_damaged
+
+        selective = backup_api.cluster_restore(
+            backup_id=backup_id,
+            location=location,
+            table_names=[table_a],
+            restore_mode="overwrite",
+        )
+        assert selective["status"] == "completed", selective
+        assert selective["committed_table_count"] == 1, selective
 
 
 @pytest.mark.parametrize("backup_format", ["native", "portable"])
