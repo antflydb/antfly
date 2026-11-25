@@ -19,6 +19,7 @@
 //! External publications reopen that owner; SQL streams retain their pinned
 //! generations, and sessions and cursor IDs remain connection-local.
 const h = @import("handles.zig");
+const write_stage_profile = @import("../storage/write_stage_profile.zig");
 const api = @import("db.zig");
 const std = h.std;
 const native = h.lite_backend.native;
@@ -26,6 +27,11 @@ const inode_lock = @import("../storage/lite/inode_lock.zig");
 const shared_lock_region = @import("../storage/lite/shared_lock_region.zig");
 const antfly_platform = @import("antfly_platform");
 const alloc = std.heap.c_allocator;
+
+/// A maintenance turn can replace the runtime, opening the database under a
+/// write turn. Debug frames on that path are megabytes each (`DB.open` and
+/// `IndexManager.openConfiguredIndexDetached` alone take about 7.5 MiB).
+const maintenance_stack_size: usize = if (@import("builtin").mode == .debug) 32 * 1024 * 1024 else 8 * 1024 * 1024;
 
 const memo_mod = @import("antfly_inference_query_embedding_cache");
 const cache_budget = @import("antfly_cache_budget");
@@ -42,6 +48,7 @@ const StoreLease = @typeInfo(@typeInfo(std.meta.Child(@FieldType(PublicationPort
 const RuntimeStore = @FieldType(StoreLease, "store");
 const SourceRead = @typeInfo(@typeInfo(std.meta.Child(@FieldType(RuntimeStore.VTable, "begin_read"))).@"fn".return_type.?).error_union.payload;
 const keys = @import("../storage/internal_keys.zig");
+const text_merge_runtime = @import("../storage/db/maintenance/text_merge_runtime.zig");
 const ProducerLease = @FieldType(@FieldType(EnrichmentRuntime, "ownership"), "lease");
 const NativeStore = std.meta.Child(std.meta.Child(@FieldType(std.meta.Child(@FieldType(h.Handle, "owned_lite_backend")), "native_docstore")));
 const WriterAdmission = std.meta.Child(@FieldType(NativeStore, "writer_admission"));
@@ -1369,7 +1376,6 @@ pub const WriterLane = struct {
                 self.parked = null;
                 self.checked_out = true;
                 self.holder = std.Thread.getCurrentId();
-                self.holder = std.Thread.getCurrentId();
                 const likely_root = self.last_root;
                 self.mutex.unlock(io);
                 // A suspended immutable query still borrows that root as its
@@ -1432,8 +1438,8 @@ pub const WriterLane = struct {
                     }
                     return err;
                 };
-                connection.gate.mutex.unlock(io);
                 _ = root.lane_pins.fetchAdd(1, .release);
+                connection.gate.mutex.unlock(io);
                 self.mutex.lockUncancelable(io);
                 self.held_lease = lease;
                 self.last_root = root;
@@ -1442,7 +1448,6 @@ pub const WriterLane = struct {
             }
             if (!self.checked_out and !self.reading) {
                 self.checked_out = true;
-                self.holder = std.Thread.getCurrentId();
                 self.holder = std.Thread.getCurrentId();
                 self.mutex.unlock(io);
                 // Cold path: nothing parked yet. Do the full admission
@@ -1481,8 +1486,8 @@ pub const WriterLane = struct {
                     }
                     return err;
                 };
-                connection.gate.mutex.unlock(io);
                 _ = root.lane_pins.fetchAdd(1, .release);
+                connection.gate.mutex.unlock(io);
                 self.mutex.lockUncancelable(io);
                 self.held_lease = lease;
                 self.last_root = root;
@@ -1573,11 +1578,21 @@ pub const WriterLane = struct {
     /// applies derived work, and that work can host a maintenance turn which
     /// borrows the lane again on the same thread. It runs under the outer
     /// checkout: waiting would wait on this thread's own return.
+    /// Also true on a text merge's thread when the holder is a producer
+    /// blocked on that merge: its own assisted merge
+    /// (`text_merge_runtime.assisting_producer`), or any merge while it waits
+    /// on admission. The producer cannot release the lane mid-batch, so a
+    /// merge commit waiting for it could only end by timing out.
     fn heldByCurrentThread(self: *WriterLane) bool {
         const io = h.handleLockIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        return self.checked_out and self.holder == std.Thread.getCurrentId();
+        if (!self.checked_out) return false;
+        if (self.holder == std.Thread.getCurrentId()) return true;
+        if (text_merge_runtime.assisting_producer) |producer| if (self.holder == producer) return true;
+        // Any merge, while the holder waits on that merge runtime's
+        // admission (`text_merge_runtime.mergeMayUseLeaseOf`).
+        return text_merge_runtime.mergeMayUseLeaseOf(self.holder);
     }
 
     /// `PathWriterLock.ReturnTo.give_back` for the synthetic lease a nested
@@ -2265,10 +2280,7 @@ pub const Owner = struct {
     /// unverified pool allocates append-only instead of walking the file
     /// again: a peer committing continuously loses every walk, and walking
     /// before each write starves this owner. Guarded by the gate.
-    reuse_proof_lost_ns: i96 = 0,
-    /// Proofs lost in a row; one is retried at once, a second starts the
-    /// append-only backoff. Reset by a proof that holds.
-    reuse_proofs_lost: u32 = 0,
+    reuse_proof_lost_ns: ?i96 = null,
     // Directory progress belongs to the path owner, not a serving generation.
     artifact_marker_sweep: @FieldType(NativeStore, "artifact_marker_sweep") = .{},
     reader_coordinator: *native.ReaderCoordinator = undefined,
@@ -2551,6 +2563,16 @@ pub const Owner = struct {
         return true;
     }
 
+    fn invalidatePeerQueryProducers(self: *Owner) void {
+        for (self.connections.items) |connection| {
+            for (connection.table_handles.items) |id| {
+                const child, const slot = api.handleRegistry().enter(id) orelse continue;
+                defer api.HandleRegistry.leave(slot);
+                h.invalidateQueryProducer(child);
+            }
+        }
+    }
+
     fn rememberRedoRecoveryCursor(self: *Owner, candidate: native.RedoRecoveryCursor) void {
         if (self.redo_recovery_cursor) |saved| {
             if (std.meta.eql(saved.identity, candidate.identity) and
@@ -2560,6 +2582,8 @@ pub const Owner = struct {
     }
 
     fn refreshImpl(self: *Owner, fast_only: bool) !?*h.Handle {
+        const profile_span = write_stage_profile.begin(.refresh);
+        defer profile_span.end();
         wal_trace.recordOp(.serving_runtime_refresh);
         if (comptime h.builtin.is_test) _ = self.test_refresh_count.fetchAdd(1, .release);
         var known_maintenance: ?*h.Handle = null;
@@ -2591,7 +2615,6 @@ pub const Owner = struct {
                     }
                 }
             }
-            if (!fast_only and self.writer_reopen_pending) self.foreground_runtime_stale = true;
             var recovered_probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{
                 .read_only = true,
                 .internal_reader = true,
@@ -2638,7 +2661,7 @@ pub const Owner = struct {
             // An uncertain publication can fail before writing anything, so an
             // unchanged header does not prove the runtime is reusable: reopen
             // to reconcile from durable state.
-            if (!self.foreground_runtime_stale and !adopted_unseen and current.immutable_query_borrows == 0 and maintenance_references_clear and same_inode and !needsOutcomeReconciliation(current) and sequence_unchanged and std.meta.eql(probe.header, file.header)) {
+            if (!self.foreground_runtime_stale and !adopted_unseen and current.immutable_query_borrows == 0 and maintenance_references_clear and same_inode and !needsOutcomeReconciliation(current) and (fast_only or !self.writer_reopen_pending) and sequence_unchanged and std.meta.eql(probe.header, file.header)) {
                 if (!file.free_pages_verified) if (self.maintenance_snapshot) |snapshot|
                     try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
                 return current;
@@ -2655,7 +2678,7 @@ pub const Owner = struct {
             // prove no primary/index root moved; that is sufficient on a
             // non-redo file, which has no logical watermark separate from
             // the physical one for `sequence_unchanged` to protect.
-            if (!self.foreground_runtime_stale and !adopted_unseen and current.immutable_query_borrows == 0 and maintenance_references_clear and same_inode and !needsOutcomeReconciliation(current) and (sequence_unchanged or file.redo == null) and
+            if (!self.foreground_runtime_stale and !adopted_unseen and current.immutable_query_borrows == 0 and maintenance_references_clear and same_inode and !needsOutcomeReconciliation(current) and (fast_only or !self.writer_reopen_pending) and (sequence_unchanged or file.redo == null) and
                 try file.runtimeMetadataUnchanged(probe) and try loadedIndexInputsUnchanged(current, file, probe))
             {
                 // Lease bookkeeping and unpublished shadow files do not change
@@ -2671,10 +2694,10 @@ pub const Owner = struct {
                 current.lite_runtime_sequence = @max(current.lite_runtime_sequence, probe.committedSequence());
                 return current;
             }
-            // A lease-free read can adopt a proven redo-only peer cut.
-            // The next writer must reconcile its private state under the
-            // writer lease before reusing this runtime.
-            if (fast_only and !self.foreground_runtime_stale and current.immutable_query_borrows == 0 and current.lane_pins.load(.acquire) == 0 and maintenance_references_clear and same_inode and
+            // Adopt the serving delta against the pinned peer cut. A
+            // writer then promotes that same cut under writer authority
+            // before it can append or reserve replay sequences.
+            if (!self.foreground_runtime_stale and current.immutable_query_borrows == 0 and current.lane_pins.load(.acquire) == 0 and maintenance_references_clear and same_inode and
                 !needsOutcomeReconciliation(current) and file.redo != null and
                 (self.refreshInPlace(current, file, probe) catch |err| {
                     // An earlier scope may already have installed its delta.
@@ -2686,19 +2709,18 @@ pub const Owner = struct {
                     self.foreground_runtime_stale = true;
                     return err;
                 };
-                if (comptime h.builtin.is_test) _ = self.test_in_place_refresh_count.fetchAdd(1, .release);
+                current.lite_runtime_sequence = probe.committedSequence();
                 self.writer_reopen_pending = true;
-                for (self.connections.items) |connection| {
-                    for (connection.table_handles.items) |id| {
-                        const child, const slot = api.handleRegistry().enter(id) orelse continue;
-                        defer api.HandleRegistry.leave(slot);
-                        h.invalidateQueryProducer(child);
-                    }
+                if (!fast_only and (self.promotePeerReadRuntime(current) catch false)) self.writer_reopen_pending = false;
+                if (fast_only or !self.writer_reopen_pending) {
+                    if (comptime h.builtin.is_test) _ = self.test_in_place_refresh_count.fetchAdd(1, .release);
+                    self.invalidatePeerQueryProducers();
+                    current.lite_refresh_adoption_epoch = file.adoptionEpoch();
+                    return current;
                 }
-                current.lite_refresh_adoption_epoch = file.adoptionEpoch();
-                current.lite_runtime_sequence = @max(current.lite_runtime_sequence, probe.committedSequence());
-                return current;
+                self.foreground_runtime_stale = true;
             }
+            if (!fast_only and self.writer_reopen_pending) self.foreground_runtime_stale = true;
             if (self.maintenance_snapshot) |snapshot| {
                 const captured = &snapshot.owned_lite_backend.?.native_docstore.?.file;
                 if (std.meta.eql(probe.header, captured.header) and
@@ -2710,6 +2732,12 @@ pub const Owner = struct {
             if (file.redo != null and !file.header.protected_redo) try file.refreshCrossProcessRedoOverlay();
         }
         if (fast_only) return null;
+        // Queued and in-flight groups on the serving store commit before the
+        // replacement opens, so it loads them from the file. Draining after
+        // the open (as below, for the handoff) let a replacement miss the
+        // last commits of writers waiting with their lane yielded, whose
+        // installs then went to the outgoing runtime.
+        if (self.current) |outgoing| if (outgoing.owned_lite_backend.?.native_docstore) |outgoing_store| outgoing_store.ensureDurableForReuse();
         var options = self.options;
         options.externally_locked = true;
         options.redo_recovery_base = self.redo_recovery_cursor;
@@ -2966,19 +2994,9 @@ pub const Owner = struct {
         };
         defer retained.abort();
         const since = root.lite_runtime_sequence;
-        const folded_before = redo.checkpoint_sequence;
-        // Compare before adopting the overlay. Adoption may replace the
-        // local header with the probe's physical roots.
         if (!sameRedoReadRoots(file.activeCheckpoint(), probe.activeCheckpoint())) return false;
-        try file.refreshCrossProcessRedoOverlay();
-        // A fold adopts records without decoding them into the overlay.
-        if (redo.checkpoint_sequence != folded_before or
-            !sameRedoReadRoots(file.activeCheckpoint(), probe.activeCheckpoint())) return false;
-        // A slot another writer published without a fold is only visible
-        // to a fresh open.
-        if (probe.activeCheckpoint().page_count > file.activeCheckpoint().page_count) return false;
         const through = probe.committedSequence();
-        if (file.committedSequence() != through) return false;
+        if (!try file.adoptPeerRedoReadCut(probe)) return false;
         const io = file.runtime();
         const shared = redo.shared;
         // A reclaim past `since` may have dropped versions this must see.
@@ -3464,13 +3482,16 @@ pub const Owner = struct {
         const started = std.Io.Clock.awake.now(io).nanoseconds;
         const default_budget = 5 * std.time.ns_per_s;
         const budget = if (h.builtin.is_test) self.test_maintenance_wait_ns orelse default_budget else default_budget;
+        const lease_span = write_stage_profile.begin(.merge_lease_wait);
         var borrowed = self.writer_lane.borrowLease(self, &self.gate.mutex, started + budget, false, null) catch |err| {
+            lease_span.end();
             if (err == error.FileBusy) {
                 self.publication_stats.maintenance_queue_timeouts +|= 1;
                 stats.recordBusy(@intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
             }
             return err;
         };
+        lease_span.end();
         errdefer borrowed.lease.close();
         stats.recordAcquired(switch (borrowed.source) {
             .handoff => .handoff,
@@ -4879,7 +4900,7 @@ pub const Owner = struct {
                 live.sameDataFile(&probe))
             {
                 try live.inheritAllocatorVerification(reader);
-                self.reuse_proofs_lost = 0;
+                self.reuse_proof_lost_ns = null;
             }
         }
         self.allocator_proof_receipt = null;
@@ -4889,13 +4910,13 @@ pub const Owner = struct {
     /// (`reuse_proof_lost_ns`): allocate append-only for now instead of
     /// proving again. Capacity-limited stores still need their proof.
     fn noteReuseProofLost(self: *Owner) void {
-        self.reuse_proofs_lost +|= 1;
         self.reuse_proof_lost_ns = std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds;
     }
 
     fn reuseProofBackoffActive(self: *Owner, root: *h.Handle) bool {
-        if (self.reuse_proofs_lost < 2 or Connection.usesCapacityAdmission(root)) return false;
-        return std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds - self.reuse_proof_lost_ns < Connection.reuse_proof_backoff_ns;
+        const lost = self.reuse_proof_lost_ns orelse return false;
+        if (Connection.usesCapacityAdmission(root)) return false;
+        return std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds - lost < Connection.reuse_proof_backoff_ns;
     }
 
     fn deinitMaintenanceSchedules(self: *Owner) void {
@@ -5452,13 +5473,8 @@ pub const Connection = struct {
                 // allocate append-only, and skip proofs for a while, rather
                 // than starve while a peer keeps writing.
                 if (try needsCapacityProof(root)) return error.FileBusy;
-                if (intent == .mutation and try self.needsReuseAdmission(root)) {
-                    // The first loss refuses, as before, so admission retries
-                    // with a fresh proof inside its busy budget; a second loss
-                    // in a row proceeds append-only and starts the backoff.
+                if (!root.owned_lite_backend.?.native_docstore.?.file.free_pages_verified)
                     self.owner.noteReuseProofLost();
-                    if (self.owner.reuse_proofs_lost < 2) return error.FileBusy;
-                }
             }
         }
         self.current = root;
@@ -5807,7 +5823,7 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
         };
         if (comptime h.builtin.os.tag != .freestanding and !h.builtin.single_threaded) {
             if (options.profile == .native and h.liteOpenModeCanWrite(options.open_mode))
-                owner.worker = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Owner.maintenanceLoop, .{owner});
+                owner.worker = try std.Thread.spawn(.{ .stack_size = maintenance_stack_size }, Owner.maintenanceLoop, .{owner});
         }
         gate.owners.appendAssumeCapacity(owner);
     }
@@ -6745,7 +6761,7 @@ test "capi resolver curation publication proofs skip large catalogs and fence ch
     std.debug.print("PUBLICATION PROOF catalog_bytes=4194304 primary_commits=20 hydrated_catalogs=0 same_content=accepted changed_content=fenced\n", .{});
 }
 
-test "capi native allocator proof refuses admission on a moving tip" {
+test "capi native optional allocator proof admits append-only on a moving tip" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     const a = std.testing.allocator;
     const io = h.handleLockIo();
@@ -6756,18 +6772,7 @@ test "capi native allocator proof refuses admission on a moving tip" {
     defer a.free(path);
     {
         var seed = try native.NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
-        defer seed.close();
-        const value: [32768]u8 = @splat('v');
-        for (0..16) |i| {
-            var key: [16]u8 = undefined;
-            try seed.putCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}), &value);
-        }
-        for (0..16) |i| {
-            var key: [16]u8 = undefined;
-            try seed.deleteCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}));
-        }
-        _ = try seed.reclaimPages(4096);
-        try std.testing.expect((try seed.allocatorStats()).?.reusable_pages > 64);
+        seed.close();
     }
     const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, false);
     defer h.closeHandle(wrapper);
@@ -6813,20 +6818,39 @@ test "capi native allocator proof refuses admission on a moving tip" {
         if (lease) |*held| held.close();
         connection.gate.mutex.unlock(io);
     }
-    owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
+    // Runtime bootstrap may consume the seed file's free pool. Create
+    // reusable pages after open so the mutation must enter the proof path.
+    const live = &owner.current.?.owned_lite_backend.?.native_docstore.?.file;
+    {
+        const value: [32768]u8 = @splat('v');
+        for (0..16) |i| {
+            var key: [16]u8 = undefined;
+            try live.putCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}), &value);
+        }
+        for (0..16) |i| {
+            var key: [16]u8 = undefined;
+            try live.deleteCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}));
+        }
+        _ = try live.reclaimPages(4096);
+        try std.testing.expect((try live.allocatorStats()).?.reusable_pages > 64);
+    }
+    live.free_pages_verified = false;
     const proof_walks_before = owner.publication_stats.allocator_proof_walks;
     const proof_failures_before = owner.publication_stats.allocator_proof_failures;
     const result = connection.refresh(&lease, .mutation, false);
     if (probe.failure) |err| return err;
-    try std.testing.expectError(error.FileBusy, result);
+    const admitted = try result;
+    try std.testing.expect(!admitted.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
+    try std.testing.expect(owner.reuseProofBackoffActive(admitted));
     try std.testing.expectEqual(@as(usize, 1), probe.captures);
     try std.testing.expectEqual(@as(u64, 1), owner.publication_stats.allocator_proof_walks - proof_walks_before);
     try std.testing.expectEqual(@as(u64, 0), owner.publication_stats.allocator_proof_failures - proof_failures_before);
     try std.testing.expect(owner.publication_stats.allocator_proof_ns >= owner.publication_stats.allocator_proof_max_ns);
     try std.testing.expect(!owner.verification_cancel.requested.load(.acquire));
-    // The refusal occurs before a transaction starts. A later, stable request
-    // can obtain a new proof and proceed using the same connection.
+    // After the backoff, a stable request can verify pages for reuse.
+    connection.detach();
     owner.test_after_allocator_capture = null;
+    owner.reuse_proof_lost_ns = null;
     const root = try connection.refresh(&lease, .mutation, false);
     try std.testing.expect(root.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
 }
@@ -6924,7 +6948,7 @@ test "capi native allocator proof queue retains eligible wake after spurious com
     try std.testing.expectEqual(gate.next, gate.serving);
 }
 
-test "capi native allocator proof mutation preflight honors busy timeout before batch and SQL execution" {
+test "capi native optional allocator proof admits batch and SQL on a moving tip" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     const a = std.testing.allocator;
     const io = h.handleLockIo();
@@ -7003,20 +7027,22 @@ test "capi native allocator proof mutation preflight honors busy timeout before 
             else
                 api.antfly_db_sql_json(id, .fromSlice("{\"statement\":\"INSERT INTO numbers (_id,n) VALUES ('accepted',7)\"}"), &output);
             if (probe.failure) |err| return err;
-            try std.testing.expectEqual(if (timeout_ms == 0) h.capi.ErrorCode.busy else h.capi.ErrorCode.ok, result);
-            try std.testing.expectEqual(if (timeout_ms == 0) h.capi.ErrorCode.busy else h.capi.ErrorCode.ok, h.capi.lastErrorCode());
-            try std.testing.expectEqual(@as(usize, if (timeout_ms == 0) 1 else 2), probe.captures);
+            try std.testing.expectEqual(h.capi.ErrorCode.ok, result);
+            try std.testing.expectEqual(h.capi.ErrorCode.ok, h.capi.lastErrorCode());
+            // An inherited proof can admit the write without a new walk.
+            // If a walk did run, a competing publication cannot force a second.
+            try std.testing.expect(probe.captures <= 1);
             var out: h.capi.Buffer = .{};
             defer api.antfly_buffer_free_zero(&out);
             if (operation == .batch) {
                 const found = api.antfly_db_lookup_json(id, .{ .ptr = key.ptr, .len = key.len }, &out);
-                try std.testing.expectEqual(if (timeout_ms == 0) h.capi.ErrorCode.not_found else h.capi.ErrorCode.ok, found);
+                try std.testing.expectEqual(h.capi.ErrorCode.ok, found);
             } else {
                 try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_sql_json(id, .fromSlice("{\"statement\":\"SELECT n FROM numbers WHERE _id = 'accepted'\"}"), &out));
                 const parsed = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
                 defer parsed.deinit();
                 const rows = parsed.value.object.get("rows").?.array.items;
-                try std.testing.expectEqual(@as(usize, if (timeout_ms == 0) 0 else 1), rows.len);
+                try std.testing.expectEqual(@as(usize, 1), rows.len);
             }
         }
     }
@@ -8035,7 +8061,7 @@ test "capi native allocator proof maintenance yields before refreshing an active
     const result = fixture.call(.batch);
     if (probe.failure) |err| return err;
     try std.testing.expectEqual(h.capi.ErrorCode.ok, result);
-    try std.testing.expectEqual(@as(usize, 2), probe.captures);
+    try std.testing.expectEqual(@as(usize, 1), probe.captures);
     try fixture.expectWritten(.batch, true);
 }
 
@@ -9077,10 +9103,24 @@ test "capi native separate writer processes refresh full-text in place" {
     try std.testing.expect(!try Search.found(id, "parentfirst", "\"doc-0\""));
     try std.testing.expect(owner.test_in_place_refresh_count.load(.acquire) > in_place_before);
     try std.testing.expect(owner.current.? == runtime_before);
-    // This runtime still writes, and its write supersedes the child's.
+    // This runtime still writes, and its write supersedes the child's. No
+    // version the child overwrote comes back.
     try Search.write(id, "doc-0", "parentagain");
     try std.testing.expect(owner.current.? == runtime_before);
     try std.testing.expect(try Search.found(id, "parentagain", "\"doc-0\""));
+    try std.testing.expect(!try Search.found(id, "childwrote6", "\"doc-0\""));
+    try std.testing.expect(!try Search.found(id, "childwrote4", "\"doc-0\""));
+    try std.testing.expect(try Search.found(id, "childwrote7", "\"doc-1\""));
+    try std.testing.expect(!try Search.found(id, "childwrote5", "\"doc-1\""));
+    // Writer admission must also adopt a suffix directly, without a search
+    // first priming the serving runtime.
+    xprocReleaseWithoutFold(owner);
+    const before_direct_write = owner.test_in_place_refresh_count.load(.acquire);
+    try xprocRunTest("capi native separate writer processes refresh full-text in place", &environment);
+    try Search.write(id, "doc-0", "parentdirect");
+    if (owner.current.? != runtime_before) return error.DirectWriterRefreshReopened;
+    if (owner.test_in_place_refresh_count.load(.acquire) <= before_direct_write) return error.DirectWriterRefreshSkipped;
+    try std.testing.expect(try Search.found(id, "parentdirect", "\"doc-0\""));
     try std.testing.expect(!try Search.found(id, "childwrote6", "\"doc-0\""));
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "@antfly/embedded",
-  "version": "0.1.0",
+  "version": "0.4.0",
   "description": "TypeScript/Node binding for local Antfly databases and inference (libantfly C ABI)",
   "type": "module",
   "main": "./dist/index.cjs",

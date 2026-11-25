@@ -82,7 +82,7 @@ pub const Store = struct {
 
     /// Unsynced handles cannot promise durable mutation success.
     pub fn nativeStore(self: *Store) ?contract.NativeStore {
-        if (self.docs.read_only or self.docs.file.no_sync) return null;
+        if (self.docs.read_only or self.docs.file.syncsSkipped()) return null;
         return .{ .source = self.source(), .writer = .{ .ptr = self, .vtable = &.{ .put = put, .remove_override = removeOverride } } };
     }
 
@@ -187,7 +187,7 @@ pub const Store = struct {
 
     fn mutate(self: *Store, scope: []const u8, key: []const u8, value: ?[]const u8, expected: contract.ExpectedRevision) !contract.Mutation {
         try self.authorize(scope);
-        if (self.docs.read_only or self.docs.file.no_sync) return error.UnsupportedOperation;
+        if (self.docs.read_only or self.docs.file.syncsSkipped()) return error.UnsupportedOperation;
         try self.docs.reserveWriterSlotYielding();
         defer self.docs.releaseWriterSlot();
         const entry_key = self.entryKey(key);

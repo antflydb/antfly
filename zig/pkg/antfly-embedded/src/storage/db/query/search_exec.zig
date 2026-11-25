@@ -7790,7 +7790,7 @@ fn nativeSortValueFromTextDocValuesAlloc(
     defer segment_lease.deinit();
     const segment = segment_lease.entry;
     try reads.retainSegment(segment_lease);
-    const reader = (try reads.get(&segment.reader, field)) orelse {
+    const reader = (try reads.get(segment.reader.encoded(), field)) orelse {
         if (try segment.reader.provesNullIndexSortField(field)) return .null_value;
         logNativeDocValueLoadFailure(field, "missing_doc_values_section");
         return error.UnsupportedExactSort;
@@ -9533,7 +9533,7 @@ fn nextSortedSegmentHeadAlloc(
         if (executor.is_expired_key) |is_expired| {
             if (try is_expired(executor.ctx, alloc, stored.id)) continue;
         }
-        const ordinal = try sortedCandidateOrdinal(identity_scratch.allocator(), req, executor, constraints, &segment.reader, local_doc_id, &stored.id);
+        const ordinal = try sortedCandidateOrdinal(identity_scratch.allocator(), req, executor, constraints, segment.reader.encoded(), local_doc_id, &stored.id);
         const candidate = MatchAllCandidate{
             .id = @constCast(stored.id),
             .ordinal = ordinal,
@@ -9625,7 +9625,7 @@ fn countSortedSegmentVisibleCandidatesWithoutSortValuesAlloc(
             if (executor.is_expired_key) |is_expired| {
                 if (try is_expired(executor.ctx, alloc, stored.id)) continue;
             }
-            const ordinal = try sortedCandidateOrdinal(identity_scratch.allocator(), req, executor, constraints, &segment.reader, local_doc_id, &stored.id);
+            const ordinal = try sortedCandidateOrdinal(identity_scratch.allocator(), req, executor, constraints, segment.reader.encoded(), local_doc_id, &stored.id);
             const candidate = MatchAllCandidate{
                 .id = @constCast(stored.id),
                 .ordinal = ordinal,
@@ -9695,7 +9695,7 @@ fn countSortedSegmentVisibleCandidatesFromSeekAlloc(
             if (executor.is_expired_key) |is_expired| {
                 if (try is_expired(executor.ctx, alloc, stored.id)) continue;
             }
-            const ordinal = try sortedCandidateOrdinal(identity_scratch.allocator(), req, executor, constraints, &segment.reader, local_doc_id, &stored.id);
+            const ordinal = try sortedCandidateOrdinal(identity_scratch.allocator(), req, executor, constraints, segment.reader.encoded(), local_doc_id, &stored.id);
             const candidate = MatchAllCandidate{
                 .id = @constCast(stored.id),
                 .ordinal = ordinal,
@@ -11534,7 +11534,7 @@ const IndexedPredicateEvaluator = struct {
             }
             var lease = try self.snapshot.leaseSegment(segment_index);
             defer lease.deinit();
-            var ordinals = try segment_mod.DocOrdinalCursor.init(&lease.entry.reader);
+            var ordinals = try segment_mod.DocOrdinalCursor.init(lease.entry.reader.encoded());
             while (next) |doc| {
                 if (doc >= upper) break;
                 try self.control.check();
@@ -16602,7 +16602,7 @@ const TextLiveVisibilityProducer = struct {
         defer segment.deinit();
         if (resolved.local_id != 0 or segment.entry.reader.doc_count != count) return error.InvalidQueryRequest;
         segment.entry.noteAccess();
-        var ordinal_cursor = try segment_mod.DocOrdinalCursor.init(&segment.entry.reader);
+        var ordinal_cursor = try segment_mod.DocOrdinalCursor.init(segment.entry.reader.encoded());
         var iterator = if (candidates) |bitmap| bitmap.iterator() else null;
         var position: u32 = 0;
         var docs: [64]u32 = undefined;
@@ -22197,7 +22197,7 @@ fn snapshotSegmentsHaveIndexSortAlloc(
         defer segment_lease.deinit();
         const segment = segment_lease.entry;
         covered_live_segments = true;
-        if (!try segmentIndexSortMatchesSchemaAlloc(alloc, &segment.reader, schema)) return false;
+        if (!try segmentIndexSortMatchesSchemaAlloc(alloc, segment.reader.encoded(), schema)) return false;
     }
     return covered_live_segments;
 }
@@ -25574,15 +25574,94 @@ fn textQueryToSearchQueryWithValues(
             .pattern = regexp.pattern,
             .boost = regexp.boost,
         } },
-        .bool_query => |bool_query| .{ .bool_query = .{
-            .must = try textQuerySliceToSearchQuerySlice(alloc, bool_query.must, text_analysis, runtime_schema, values, false),
-            .should = try textQuerySliceToSearchQuerySlice(alloc, bool_query.should, text_analysis, runtime_schema, values, true),
-            .must_not = try textQuerySliceToSearchQuerySlice(alloc, bool_query.must_not, text_analysis, runtime_schema, values, false),
-            .min_should = bool_query.min_should,
-            .pure_should_optional = bool_query.pure_should_optional,
-            .boost = bool_query.boost,
-        } },
+        .bool_query => |bool_query| if (bool_query.query_string != null)
+            (try lowerQueryStringClause(alloc, text_query, text_analysis, runtime_schema)) orelse .match_none
+        else
+            .{ .bool_query = .{
+                .must = try textQuerySliceToSearchQuerySlice(alloc, bool_query.must, text_analysis, runtime_schema, values, false),
+                .should = try textQuerySliceToSearchQuerySlice(alloc, bool_query.should, text_analysis, runtime_schema, values, true),
+                .must_not = try textQuerySliceToSearchQuerySlice(alloc, bool_query.must_not, text_analysis, runtime_schema, values, false),
+                .min_should = bool_query.min_should,
+                .pure_should_optional = bool_query.pure_should_optional,
+                .boost = bool_query.boost,
+            } },
     };
+}
+
+// A missing clause means analysis removed its entire text. Keep actual
+// match-none queries and terms with no postings in the Boolean expression.
+fn lowerQueryStringClause(
+    alloc: Allocator,
+    query: types.TextQuery,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) anyerror!?search_mod.SearchQuery {
+    if (query == .bool_query) {
+        const boolean = query.bool_query;
+        const must = try lowerQueryStringClauses(alloc, boolean.must, text_analysis, runtime_schema);
+        const should = try lowerQueryStringClauses(alloc, boolean.should, text_analysis, runtime_schema);
+        const must_not = try lowerQueryStringClauses(alloc, boolean.must_not, text_analysis, runtime_schema);
+        if (must.len == 0 and should.len == 0 and must_not.len == 0) return null;
+        // The parser anchors a standalone negation with match-all. When
+        // analysis erases the exclusion, omit the whole negated clause.
+        if (must_not.len == 0 and boolean.must_not.len != 0 and
+            must.len == 1 and must[0] == .match_all and should.len == 0)
+        {
+            alloc.free(must);
+            return null;
+        }
+        // Use the same scoring path as the equivalent single-clause string.
+        if (boolean.boost == 1 and must_not.len == 0) {
+            if (must.len == 1 and should.len == 0 and boolean.must.len > 1) {
+                const clause = must[0];
+                alloc.free(must);
+                return clause;
+            }
+            if (should.len == 1 and must.len == 0 and boolean.should.len > 1 and boolean.min_should <= 1) {
+                const clause = should[0];
+                alloc.free(should);
+                return clause;
+            }
+        }
+        return .{ .bool_query = .{
+            .must = must,
+            .should = should,
+            .must_not = must_not,
+            .min_should = if (should.len == 0) 0 else boolean.min_should,
+            .boost = boolean.boost,
+        } };
+    }
+
+    var lowered = try textQueryToSearchQuery(alloc, query, text_analysis, runtime_schema);
+    switch (lowered) {
+        inline .match, .phrase => |*clause| {
+            const analyzer = clause.analyzer orelse &analysis_mod.default_analyzer;
+            const tokens = try analyzer.analyze(alloc, clause.text);
+            if (tokens.len == 0) {
+                analysis_mod.Analyzer.freeTokens(alloc, tokens);
+                return null;
+            }
+            clause.analyzed_tokens = tokens;
+        },
+        else => {},
+    }
+    return lowered;
+}
+
+fn lowerQueryStringClauses(
+    alloc: Allocator,
+    queries: []const types.TextQuery,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) anyerror![]const search_mod.SearchQuery {
+    var clauses: std.ArrayListUnmanaged(search_mod.SearchQuery) = .empty;
+    defer clauses.deinit(alloc);
+    for (queries) |query| {
+        if (try lowerQueryStringClause(alloc, query, text_analysis, runtime_schema)) |clause| {
+            try clauses.append(alloc, clause);
+        }
+    }
+    return try clauses.toOwnedSlice(alloc);
 }
 
 fn textQuerySliceToSearchQuerySlice(
@@ -39985,7 +40064,7 @@ test "native text stats fallback supports range-backed segments and filters" {
     try std.testing.expectEqual(@as(u32, 1), stats.term_doc_freqs[0].doc_freq);
     try std.testing.expectEqual(@as(u32, 1), stats.term_doc_freqs[1].doc_freq);
     try std.testing.expectEqual(@as(u32, 0), stats.term_doc_freqs[2].doc_freq);
-    try std.testing.expectEqual(@as(usize, 0), writer.snapshot().segments[0].reader.native.?.identity_bytes);
+    try std.testing.expectEqual(@as(usize, 0), writer.snapshot().segments[0].reader.encoded().native.?.identity_bytes);
 }
 
 test "query reader reuse shares native sort navigation and decoded chunks" {
@@ -41187,7 +41266,7 @@ test "text live visibility refines posting candidates and skips an all-visible f
     var candidates = roaring.RoaringBitmap.init(a);
     defer candidates.deinit();
     try candidates.addRange(0, 512);
-    const cache = &pinned.segments[0].reader.native.?.metadata_cache.?;
+    const cache = &pinned.segments[0].reader.encoded().native.?.metadata_cache.?;
     const before = cache.cache.clock;
     var selected = try TextLiveVisibilityProducer.produce(&producer, a, 0, 5000, &candidates);
     defer selected.deinit();

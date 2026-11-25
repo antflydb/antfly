@@ -18,6 +18,7 @@ export interface ChatBarProps extends ChatMessagesProps, ChatInputProps {
   table?: string;
   /** Semantic indexes to use */
   semanticIndexes?: string[];
+  retrievalMode?: ChatConfig["retrievalMode"];
   /** Domain-specific knowledge for the agent */
   agentKnowledge?: string;
   /** System prompt override */
@@ -55,6 +56,7 @@ export default function ChatBar({
   generator,
   table,
   semanticIndexes,
+  retrievalMode,
   agentKnowledge,
   systemPrompt,
   maxInternalIterations,
@@ -89,6 +91,9 @@ export default function ChatBar({
   const { turns, isStreaming, sendMessage: rawSendMessage, abort, reset } = useChatStream();
 
   const resolvedTable = resolveTable(table, defaultTable);
+  const followUpsVisible =
+    showFollowUpQuestions ??
+    (followUpCount !== undefined || (steps?.followup != null && steps.followup.enabled !== false));
 
   const config = useMemo<ChatConfig>(
     () => ({
@@ -97,10 +102,12 @@ export default function ChatBar({
       generator,
       table: resolvedTable,
       semanticIndexes,
+      retrievalMode,
       agentKnowledge,
       systemPrompt,
       maxInternalIterations,
       followUpCount,
+      showFollowUpQuestions: followUpsVisible,
       limit,
       steps,
       tools,
@@ -114,10 +121,12 @@ export default function ChatBar({
       generator,
       resolvedTable,
       semanticIndexes,
+      retrievalMode,
       agentKnowledge,
       systemPrompt,
       maxInternalIterations,
       followUpCount,
+      followUpsVisible,
       limit,
       steps,
       tools,
@@ -134,6 +143,7 @@ export default function ChatBar({
     headers,
     resolvedTable,
     semanticIndexes,
+    retrievalMode,
     generator,
   ]);
   const previousContext = useRef(conversationContext);
@@ -212,7 +222,7 @@ export default function ChatBar({
       <div className="react-af-chat-bar">
         <ChatMessages
           showHits={showHits}
-          showFollowUpQuestions={showFollowUpQuestions}
+          showFollowUpQuestions={followUpsVisible}
           showConfidence={showConfidence}
           renderUserMessage={renderUserMessage}
           renderAssistantMessage={renderAssistantMessage}

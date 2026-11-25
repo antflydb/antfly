@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const write_stage_profile = @import("../../write_stage_profile.zig");
 const ordinal_core = @import("storage_ordinals");
 const builtin = @import("builtin");
 const is_hostless = builtin.os.tag == .freestanding or builtin.os.tag == .wasi;
@@ -294,8 +295,11 @@ const default_text_build_memory_target_bytes: usize = 96 * 1024 * 1024;
 const default_text_doc_scratch_retained_bytes: usize = 1024 * 1024;
 const force_merge_max_segments_at_once = 16;
 /// Level-0 folds: at least this many records, at most this many records
-/// and bytes per merge.
-const level0_fold_min_records = 4;
+/// and bytes per merge. A merge's cost is mostly fixed: folding a handful of
+/// one-write records at a time cost an 8-writer indexed bench more per write
+/// than encoding them. Below the minimum, level-0 records wait for the fold
+/// (writers merge at the producer cap regardless).
+const level0_fold_min_records = 32;
 const level0_fold_max_records = 256;
 const level0_fold_max_bytes: u64 = 8 * 1024 * 1024;
 
@@ -3491,6 +3495,13 @@ pub const IndexManager = struct {
 
         pub fn relockIndex(self: *ManagedIndexApplyGuard) void {
             self.manager.lockAtomicWithBackoff(self.mutex);
+        }
+
+        /// For a caller that may already hold this index's mutex further up
+        /// its own stack (a group leader completing members while its own
+        /// replay apply holds the guard): false instead of waiting.
+        pub fn tryRelockIndex(self: *ManagedIndexApplyGuard) bool {
+            return self.mutex.tryLock();
         }
 
         pub fn unlockCatalog(self: *ManagedIndexApplyGuard) void {
@@ -21844,6 +21855,7 @@ pub const IndexManager = struct {
                     filtered.items[start..end],
                     projection_options,
                 );
+                const project_span = write_stage_profile.begin(.text_project);
                 const source_docs_with_ordinals = try self.textProjectionSourceDocsWithOrdinals(arena, store, entry, source_batch.docs);
                 var chunk_observed = std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer).empty;
                 defer chunk_observed.deinit(arena);
@@ -21854,10 +21866,16 @@ pub const IndexManager = struct {
                     &chunk_observed,
                     null,
                 );
+                project_span.end();
                 try appendOwnedObservedFieldAnalyzers(alloc, &observed, projection_batch.observed_field_analyzers);
 
                 const runtime_index_sort = if (entry.runtime_schema) |schema| schema.index_sort else &.{};
                 const index_sort = try textIndexSortFieldsForSegmentAlloc(arena, runtime_index_sort);
+                const build_span = write_stage_profile.begin(.text_segment_build);
+                defer build_span.end();
+                var build_profile: introducer_mod.BuildTextProfile = .{};
+                const profiling = write_stage_profile.enabled();
+                defer if (profiling) noteTextBuildProfile(build_profile);
                 const built = try mapper.buildTextSegmentsFromProjectionBatch(
                     segment_alloc,
                     projection_batch,
@@ -21871,6 +21889,9 @@ pub const IndexManager = struct {
                         .target_build_memory_bytes = @max(@as(usize, 1), textBuildMemoryTargetBytes()),
                         .doc_scratch_retained_bytes = textDocScratchRetainedBytes(),
                         .index_sort = index_sort,
+                        .profile = if (profiling) &build_profile else null,
+                        .profile_timings = profiling,
+                        .profile_working_set = false,
                         .resource_manager = self.resource_manager,
                         .store_document_source = false,
                     },
@@ -21894,6 +21915,15 @@ pub const IndexManager = struct {
             .segments = try segments.toOwnedSlice(alloc),
             .observed_field_analyzers = try observed.toOwnedSlice(alloc),
         };
+    }
+
+    fn noteTextBuildProfile(profile: introducer_mod.BuildTextProfile) void {
+        write_stage_profile.add(.text_build_analyze, profile.analyzer_ns +| profile.term_accum_ns +| profile.hit_materialize_ns);
+        write_stage_profile.add(.text_build_typed, profile.typed_collect_ns +| profile.typed_build_ns);
+        write_stage_profile.add(.text_build_inverted, profile.inverted_build_ns);
+        write_stage_profile.add(.text_build_term_dict, profile.inverted_term_dict_ns);
+        write_stage_profile.add(.text_build_bloom, profile.inverted_bloom_finish_ns);
+        write_stage_profile.add(.text_build_assembly, profile.segment_assembly_ns -| profile.inverted_build_ns -| profile.typed_build_ns);
     }
 
     fn buildTextProjectionBatchForEntry(
@@ -22073,6 +22103,17 @@ pub const IndexManager = struct {
         const snap = entry.persistent.acquireSnapshot();
         defer snap.release();
         return @intCast(snap.segments.len);
+    }
+
+    /// Used on the foreground path before attempting producer assistance.
+    /// Segment count is available directly from the pinned snapshot.
+    pub fn textMergeAtSegmentCap(self: *IndexManager, cap: u64) bool {
+        for (self.text_indexes.items) |*entry| {
+            const snapshot = entry.persistent.acquireSnapshot();
+            defer snapshot.release();
+            if (snapshot.segments.len >= cap) return true;
+        }
+        return false;
     }
 
     fn textMergeStatsWithPrune(self: *IndexManager, prune_expired: bool) types.TextMergeStats {
@@ -27105,6 +27146,10 @@ pub const IndexManager = struct {
     }
 
     pub fn beginTextMergeTask(self: *IndexManager) !?TextMergeTask {
+        return self.beginTextMergeTaskWithPressure(0, false);
+    }
+
+    pub fn beginTextMergeTaskWithPressure(self: *IndexManager, segment_cap: u64, producer_waiting: bool) !?TextMergeTask {
         const now_ns = platform_time.monotonicNs();
         self.text_merge_scheduler.pruneExpiredQuarantines(self.alloc, now_ns);
         _ = self.textMergeStats();
@@ -27112,12 +27157,22 @@ pub const IndexManager = struct {
             self.text_merge_scheduler.deferred_for_pressure += 1;
             return null;
         }
+        if (producer_waiting or segment_cap != 0) {
+            for (self.text_indexes.items) |*entry| {
+                const snapshot = entry.persistent.acquireSnapshot();
+                defer snapshot.release();
+                const segment_count = snapshot.segments.len;
+                if (segment_count >= 2 and (producer_waiting or (segment_cap != 0 and segment_count >= segment_cap))) {
+                    TextMergeScheduler.schedule(entry);
+                }
+            }
+        }
         var attempts: usize = 0;
         while (attempts < self.text_indexes.items.len) : (attempts += 1) {
             const idx = self.text_merge_scheduler.select(self.text_indexes.items) orelse return null;
             const entry = &self.text_indexes.items[idx];
             const has_in_flight = self.text_merge_scheduler.indexHasInFlight(entry.config.name);
-            const maybe_task = self.beginTextMergeTaskForEntry(entry) catch |err| switch (err) {
+            const maybe_task = self.beginTextMergeTaskForEntryWithPressure(entry, segment_cap, producer_waiting) catch |err| switch (err) {
                 error.ResourceBudgetExceeded => {
                     self.text_merge_scheduler.deferred_for_pressure += 1;
                     return null;
@@ -27542,6 +27597,10 @@ pub const IndexManager = struct {
     }
 
     fn beginTextMergeTaskForEntry(self: *IndexManager, entry: *TextIndex) !?TextMergeTask {
+        return self.beginTextMergeTaskForEntryWithPressure(entry, 0, false);
+    }
+
+    fn beginTextMergeTaskForEntryWithPressure(self: *IndexManager, entry: *TextIndex, segment_cap: u64, producer_waiting: bool) !?TextMergeTask {
         if (entry.backfill_active.load(.acquire) != 0) return error.IndexApplyBusy;
         // Full-text replay holds this mutex while changing the shared deletion
         // bitmap. Keep planning and cloning in one short critical section so a
@@ -27576,6 +27635,7 @@ pub const IndexManager = struct {
         if (infos.items.len < 2) return null;
 
         const policy = activeTextMergePolicy();
+        const pressure = producer_waiting or (segment_cap != 0 and snap.segments.len >= segment_cap);
         // Inline writes publish one small level-0 record each. Fold them
         // wide and first: a tier-sized merge of ten cannot keep up with
         // them, and producer admission counts every one.
@@ -27589,12 +27649,24 @@ pub const IndexManager = struct {
                 try picked.append(self.alloc, info.index);
                 bytes += info.size;
             }
-            if (picked.items.len < level0_fold_min_records) {
+            if (picked.items.len < (if (pressure) @as(usize, 2) else level0_fold_min_records)) {
                 picked.deinit(self.alloc);
                 break :level0 null;
             }
             break :level0 try picked.toOwnedSlice(self.alloc);
         };
+        // Waiting level-0 records stay out of the tiered and forced plans,
+        // which would otherwise fold them a few at a time.
+        if (level0_plan == null and !pressure) {
+            var kept: usize = 0;
+            for (infos.items) |info| {
+                if (persistent_mod.isL0SegmentId(snap.segments[info.index].id)) continue;
+                infos.items[kept] = info;
+                kept += 1;
+            }
+            infos.shrinkRetainingCapacity(kept);
+            if (infos.items.len < 2) return null;
+        }
         const planned = level0_plan orelse (try policy.plan(self.alloc, infos.items)) orelse blk: {
             // The tiered policy found nothing to merge (for example every
             // eligible segment floors to the same effective size under
@@ -27604,7 +27676,9 @@ pub const IndexManager = struct {
             // segments so producer admission always has a merge in flight to
             // wait on instead of retrying TextMergeBackpressureTimeout
             // against a scheduler that gave up.
-            if (snap.segments.len <= policy.max_segments_per_tier) return null;
+            // Count only what the plan may take: waiting level-0 records would
+            // otherwise keep re-draining the same few merged segments.
+            if (!pressure and infos.items.len <= policy.max_segments_per_tier) return null;
             self.text_merge_scheduler.forced_drains += 1;
             break :blk try text_index_maintenance.planForceDrainFromInfos(
                 self.alloc,
@@ -27820,7 +27894,7 @@ pub const IndexManager = struct {
                 break;
             }
             if (is_source) continue;
-            total_fields = try addTextMergeEstimate(total_fields, @intCast(segment.reader.fields.len));
+            total_fields = try addTextMergeEstimate(total_fields, @intCast(segment.reader.encoded().fields.len));
         }
         if (result.prepared_segments.len > 0) {
             for (result.prepared_segments) |*prepared| {
@@ -50374,7 +50448,7 @@ test "text merge file provenance resolves deletion races off lock and retries re
     var output = segment_mod.MemorySegmentSink.init(a);
     defer output.deinit();
     var sink = output.sink();
-    const inputs = [_]segment_mod.MergeInput{ .{ .reader = &snap.segments[0].reader }, .{ .reader = &snap.segments[1].reader } };
+    const inputs = [_]segment_mod.MergeInput{ .{ .reader = snap.segments[0].reader.encoded() }, .{ .reader = snap.segments[1].reader.encoded() } };
     try segment_mod.writeMergedSegmentToSinkWithOptions(alloc, &sink, &inputs, .{ .index_sort = &sort, .source_map = &provenance, .scratch = .{ .io = std.testing.io, .directory = path, .in_memory_plan_bytes = 0 } });
     try provenance.finishOutput(4);
     result.source_map.?.deinit();

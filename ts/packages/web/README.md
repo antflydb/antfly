@@ -63,7 +63,7 @@ asset compatibility; it does not establish numerical or production qualification
 
 ```ts
 import { Inference, downloadCatalogModel } from "@antfly/web/inference";
-const assets = "/inference/0.1.0-<runtime-id-prefix>/";
+const assets = "/inference/0.4.0-<runtime-id-prefix>/";
 const client = await Inference.create({ assets });
 const unsubscribe = client.subscribe((state) => {
   renderStatus(state.status, state.error?.code, state.recovery);

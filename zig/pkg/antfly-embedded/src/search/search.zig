@@ -238,6 +238,8 @@ pub const MatchQuery = struct {
     field: []const u8,
     text: []const u8,
     analyzer: ?*const analysis_mod.Analyzer = null,
+    /// Borrowed from the query arena when the clause was analyzed during lowering.
+    analyzed_tokens: ?[]const analysis_mod.Token = null,
     boost: f32 = 1.0,
 };
 
@@ -361,6 +363,8 @@ pub const PhraseQuery = struct {
     field: []const u8,
     text: []const u8,
     analyzer: ?*const analysis_mod.Analyzer = null,
+    /// Borrowed from the query arena when the clause was analyzed during lowering.
+    analyzed_tokens: ?[]const analysis_mod.Token = null,
     max_edits: u8 = 0,
     auto_fuzzy: bool = false,
     boost: f32 = 1.0,
@@ -731,6 +735,22 @@ fn executeGraphSearches(alloc: Allocator, result: *SearchResult, request: Search
     result.graph_results = graph_results;
 }
 
+const QueryTextAnalysis = struct {
+    tokens: []const analysis_mod.Token,
+    owned: ?[]analysis_mod.Token = null,
+
+    fn init(alloc: Allocator, query: anytype) !QueryTextAnalysis {
+        if (query.analyzed_tokens) |tokens| return .{ .tokens = tokens };
+        const analyzer = query.analyzer orelse &analysis_mod.default_analyzer;
+        const tokens = try analyzer.analyze(alloc, query.text);
+        return .{ .tokens = tokens, .owned = tokens };
+    }
+
+    fn deinit(self: QueryTextAnalysis, alloc: Allocator) void {
+        if (self.owned) |tokens| analysis_mod.Analyzer.freeTokens(alloc, tokens);
+    }
+};
+
 fn executeMatch(
     alloc: Allocator,
     snap: *const index_mod.IndexSnapshot,
@@ -742,9 +762,9 @@ fn executeMatch(
         if (try executeSimpleTextBool(alloc, snap, .{ .should = &.{.{ .match = mq }} }, request)) |result| return result;
         if (try executeStreamingTextBool(alloc, snap, .{ .should = &.{.{ .match = mq }} }, request, .{})) |result| return result;
     }
-    const analyzer = mq.analyzer orelse &analysis_mod.default_analyzer;
-    const tokens = try analyzer.analyze(alloc, mq.text);
-    defer analysis_mod.Analyzer.freeTokens(alloc, tokens);
+    const analyzed = try QueryTextAnalysis.init(alloc, mq);
+    defer analyzed.deinit(alloc);
+    const tokens = analyzed.tokens;
 
     if (tokens.len == 0) {
         return .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 };
@@ -838,18 +858,10 @@ fn matchingFieldStats(
     return null;
 }
 
-fn buildPhraseFilter(
-    alloc: Allocator,
-    field: []const u8,
-    text: []const u8,
-    analyzer: *const analysis_mod.Analyzer,
-    max_edits: u8,
-    auto_fuzzy: bool,
-) !?query_mod.Filter {
-    const tokens = try analyzer.analyze(alloc, text);
-    defer analysis_mod.Analyzer.freeTokens(alloc, tokens);
-
-    return buildPhraseFilterFromTokens(alloc, field, tokens, max_edits, auto_fuzzy);
+fn buildPhraseFilter(alloc: Allocator, query: PhraseQuery) !?query_mod.Filter {
+    const analyzed = try QueryTextAnalysis.init(alloc, query);
+    defer analyzed.deinit(alloc);
+    return buildPhraseFilterFromTokens(alloc, query.field, analyzed.tokens, query.max_edits, query.auto_fuzzy);
 }
 
 fn buildPhraseFilterFromTokens(alloc: Allocator, field: []const u8, tokens: []const analysis_mod.Token, max_edits: u8, auto_fuzzy: bool) !?query_mod.Filter {
@@ -1325,8 +1337,7 @@ fn executePhrase(
     pq: PhraseQuery,
     request: SearchRequest,
 ) !SearchResult {
-    const analyzer = pq.analyzer orelse &analysis_mod.default_analyzer;
-    const filter = (try buildPhraseFilter(alloc, pq.field, pq.text, analyzer, pq.max_edits, pq.auto_fuzzy)) orelse {
+    const filter = (try buildPhraseFilter(alloc, pq)) orelse {
         return .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 };
     };
     defer freePhraseFilterTerms(alloc, filter);
@@ -2188,9 +2199,9 @@ fn appendSimpleTextTerms(alloc: Allocator, out: *std.ArrayListUnmanaged(SimpleTe
             return true;
         },
         .match => |mq| {
-            const analyzer = mq.analyzer orelse &analysis_mod.default_analyzer;
-            const tokens = try analyzer.analyze(alloc, mq.text);
-            defer analysis_mod.Analyzer.freeTokens(alloc, tokens);
+            const analyzed = try QueryTextAnalysis.init(alloc, mq);
+            defer analyzed.deinit(alloc);
+            const tokens = analyzed.tokens;
             if (!singleAnalyzedTerm(tokens)) return false;
 
             for (tokens, 0..) |tok, i| {
@@ -3889,7 +3900,7 @@ const StreamingBoolStats = struct {
         if (self.preparation) |prepared| for (prepared.stats.phrases.items) |entry| if (entry.analyzer == analyzer and std.mem.eql(u8, entry.field, q.field) and std.mem.eql(u8, entry.text, q.text)) return entry.filter;
         for (self.phrases.items) |entry| if (entry.analyzer == analyzer and std.mem.eql(u8, entry.field, q.field) and std.mem.eql(u8, entry.text, q.text)) return entry.filter;
         if (self.sealed) return error.InvalidArgument;
-        const filter = try buildPhraseFilterFromTokens(self.a, q.field, try self.analyzed(q.text, analyzer), 0, false);
+        const filter = try buildPhraseFilterFromTokens(self.a, q.field, q.analyzed_tokens orelse try self.analyzed(q.text, analyzer), 0, false);
         try self.phrases.append(self.a, .{ .field = q.field, .text = q.text, .analyzer = analyzer, .filter = filter });
         return filter;
     }
@@ -3908,7 +3919,7 @@ const StreamingBoolStats = struct {
             .term => |t| try self.add(t.field, t.term, matchingFieldStats(self.overrides, t.field, &.{t.term}) == null),
             .match => |m| {
                 const analyzer = m.analyzer orelse &analysis_mod.default_analyzer;
-                const tokens = try self.analyzed(m.text, analyzer);
+                const tokens = m.analyzed_tokens orelse try self.analyzed(m.text, analyzer);
                 const names = try self.a.alloc([]const u8, tokens.len);
                 for (tokens, names) |token, *name| name.* = token.term;
                 const local = matchingFieldStats(self.overrides, m.field, names) == null;
@@ -4099,7 +4110,7 @@ const LoweredText = struct {
             switch (query) {
                 .term => |t| try out.append(self.a, .{ .field = t.field, .term = t.term, .boost = t.boost }),
                 .match => |m| {
-                    const tokens = try self.stats.analyzed(m.text, m.analyzer orelse &analysis_mod.default_analyzer);
+                    const tokens = m.analyzed_tokens orelse try self.stats.analyzed(m.text, m.analyzer orelse &analysis_mod.default_analyzer);
                     if (!singleAnalyzedTerm(tokens)) return false;
                     for (tokens, 0..) |token, i| {
                         var duplicate = false;
@@ -4175,7 +4186,7 @@ const LoweredText = struct {
                     return self.node(.{ .kind = .boolean, .must = try self.children(b.must), .should = try self.children(b.should), .must_not = try self.children(b.must_not), .boost = b.boost, .minimum = if (b.should.len == 0) 0 else if (b.min_should == 0 and b.must.len == 0 and !b.pure_should_optional) 1 else b.min_should, .baseline = if (b.must.len == 0 and (b.should.len == 0 or b.pure_should_optional)) (if (b.pure_should_optional) @as(f32, 0) else @as(f32, 1)) else null });
                 },
                 .match => |m| {
-                    const tokens = try self.stats.analyzed(m.text, m.analyzer orelse &analysis_mod.default_analyzer);
+                    const tokens = m.analyzed_tokens orelse try self.stats.analyzed(m.text, m.analyzer orelse &analysis_mod.default_analyzer);
                     const names = try self.a.alloc([]const u8, tokens.len);
                     for (tokens, names) |token, *name| name.* = token.term;
                     const override = matchingFieldStats(self.stats.overrides, m.field, names);
@@ -4618,7 +4629,7 @@ const StreamingBoolBuilder = struct {
             },
             .match => |mq| {
                 const analyzer = mq.analyzer orelse &analysis_mod.default_analyzer;
-                const tokens = try self.stats.analyzed(mq.text, analyzer);
+                const tokens = mq.analyzed_tokens orelse try self.stats.analyzed(mq.text, analyzer);
                 var names: std.ArrayListUnmanaged([]const u8) = .empty;
                 for (tokens) |token| try names.append(self.a, token.term);
                 const previous_override = self.stats_override;
@@ -5780,8 +5791,9 @@ pub fn searchQueryToFilterWithPreparation(alloc: Allocator, sq: SearchQuery, pre
             .polygons = gq.polygons,
         } },
         .match => |mq| blk: {
-            const analyzer = mq.analyzer orelse &analysis_mod.default_analyzer;
-            const tokens = try analyzer.analyze(alloc, mq.text);
+            const analyzed = try QueryTextAnalysis.init(alloc, mq);
+            defer analyzed.deinit(alloc);
+            const tokens = analyzed.tokens;
             if (tokens.len == 0) break :blk .{ .match_none = {} };
             if (tokens.len == 1) {
                 break :blk .{ .term = .{
@@ -5798,7 +5810,7 @@ pub fn searchQueryToFilterWithPreparation(alloc: Allocator, sq: SearchQuery, pre
             }
             break :blk .{ .bool_filter = .{ .must = &.{}, .should = filters, .must_not = &.{} } };
         },
-        .phrase => |pq| (try buildPhraseFilter(alloc, pq.field, pq.text, pq.analyzer orelse &analysis_mod.default_analyzer, pq.max_edits, pq.auto_fuzzy)) orelse
+        .phrase => |pq| (try buildPhraseFilter(alloc, pq)) orelse
             .{ .bool_filter = .{ .must = &.{}, .should = &.{}, .must_not = &.{} } },
         .prefix => |pq| .{ .prefix = .{ .field = pq.field, .prefix = pq.prefix, .indexed_field = pq.indexed_field } },
         .wildcard => |wq| .{ .wildcard = .{ .field = wq.field, .pattern = wq.pattern } },
@@ -5961,9 +5973,9 @@ fn queryToFilter(alloc: Allocator, sq: SearchQuery) !OwnedFilter {
             .filter_slice = &.{},
         },
         .match => |mq| blk: {
-            const analyzer = mq.analyzer orelse &analysis_mod.default_analyzer;
-            const tokens = try analyzer.analyze(alloc, mq.text);
-            defer analysis_mod.Analyzer.freeTokens(alloc, tokens);
+            const analyzed = try QueryTextAnalysis.init(alloc, mq);
+            defer analyzed.deinit(alloc);
+            const tokens = analyzed.tokens;
 
             if (tokens.len == 0) break :blk OwnedFilter{ .filter = .{ .match_none = {} }, .duped_terms = &.{}, .filter_slice = &.{} };
             if (tokens.len == 1) {
@@ -5992,7 +6004,7 @@ fn queryToFilter(alloc: Allocator, sq: SearchQuery) !OwnedFilter {
             };
         },
         .phrase => |pq| blk: {
-            const filter = (try buildPhraseFilter(alloc, pq.field, pq.text, pq.analyzer orelse &analysis_mod.default_analyzer, pq.max_edits, pq.auto_fuzzy)) orelse
+            const filter = (try buildPhraseFilter(alloc, pq)) orelse
                 query_mod.Filter{ .bool_filter = .{ .must = &.{}, .should = &.{}, .must_not = &.{} } };
             const duped_terms = switch (filter) {
                 .phrase => |pf| pf.terms,
@@ -6757,7 +6769,7 @@ fn collectStatsGrouped(
         defer selected_segment.deinit();
         const seg = selected_segment.entry;
         try reads.retainSegment(selected_segment);
-        const reader = (try reads.get(&seg.reader, field)) orelse continue;
+        const reader = (try reads.get(seg.reader.encoded(), field)) orelse continue;
 
         // Selective aggregations probe only their candidates. Dense scans use
         // one cursor and join sorted IDs in linear time without value arrays.
@@ -6806,7 +6818,7 @@ fn readF64ForDoc(
     defer selected_segment.deinit();
     const seg = selected_segment.entry;
     try reads.retainSegment(selected_segment);
-    const reader = (try reads.get(&seg.reader, field)) orelse return null;
+    const reader = (try reads.get(seg.reader.encoded(), field)) orelse return null;
     return readNumericAsF64(reader, resolved.local_id);
 }
 
@@ -6842,7 +6854,7 @@ fn readBytesForDoc(
     defer selected_segment.deinit();
     const seg = selected_segment.entry;
     try reads.retainSegment(selected_segment);
-    const reader = (try reads.get(&seg.reader, field)) orelse return null;
+    const reader = (try reads.get(seg.reader.encoded(), field)) orelse return null;
     if (reader.value_type != .bytes_val) return null;
 
     return reader.getBytesAllocWithAllocator(alloc, resolved.local_id);
@@ -6862,7 +6874,7 @@ fn readTimestampForDoc(
     defer selected_segment.deinit();
     const seg = selected_segment.entry;
     try reads.retainSegment(selected_segment);
-    const reader = (try reads.get(&seg.reader, field)) orelse return null;
+    const reader = (try reads.get(seg.reader.encoded(), field)) orelse return null;
     if (reader.value_type == .datetime_ns) return try reader.getDateTimeNs(resolved.local_id);
     if (reader.value_type != .u64_val) return null;
     return if (try reader.getU64(resolved.local_id)) |ns| @as(i128, ns) else null;
@@ -6882,7 +6894,7 @@ fn readGeoPointForDoc(
     defer selected_segment.deinit();
     const seg = selected_segment.entry;
     try reads.retainSegment(selected_segment);
-    const reader = (try reads.get(&seg.reader, field)) orelse return null;
+    const reader = (try reads.get(seg.reader.encoded(), field)) orelse return null;
     if (reader.value_type != .geo_point) return null;
     const gp = try reader.getGeoPoint(resolved.local_id) orelse return null;
     return geo_mod.GeoPoint{ .lat = gp.lat, .lon = gp.lon };
@@ -8945,7 +8957,7 @@ test "search stored hit cursor preserves order ownership and allocation failure 
     try populateStoredHits(a, native.snapshot(), &native_single, null);
     try std.testing.expectEqualStrings("b", native_single[0].id.?);
     try std.testing.expectEqualStrings("second", native_single[0].stored_data.?);
-    try std.testing.expectEqual(@as(usize, 0), native.snapshot().segments[0].reader.native.?.identity_bytes);
+    try std.testing.expectEqual(@as(usize, 0), native.snapshot().segments[0].reader.encoded().native.?.identity_bytes);
     var singleton = [_]ScoredHit{.{ .doc_id = 0, .score = 1, .id = null, .stored_data = null }};
     defer freeStoredBodies(a, &singleton);
     try populateStoredHits(a, snapshot, &singleton, null);
@@ -9093,14 +9105,14 @@ test "native ID filters and deletes never retain stable identity pages" {
     defer matches.deinit();
     const after = entry.reader.nativeNavigationBytes();
     try std.testing.expectEqual(@as(usize, 0), matches.cardinality());
-    try std.testing.expectEqual(@as(usize, 0), entry.reader.native.?.identity_bytes);
+    try std.testing.expectEqual(@as(usize, 0), entry.reader.encoded().native.?.identity_bytes);
     var id: [1024]u8 = @splat('x');
     std.mem.writeInt(u64, id[0..8], 1023, .little);
     const deletes = try writer.deleteAllByIdsTracked(a, &.{ &id, "absent" });
     defer index_mod.IndexWriter.freeDeleteInfos(a, deletes);
     try std.testing.expectEqual(@as(usize, 1), deletes.len);
     try std.testing.expectEqual(@as(usize, 1), deletes[0].local_ids.len);
-    try std.testing.expectEqual(@as(usize, 0), entry.reader.native.?.identity_bytes);
+    try std.testing.expectEqual(@as(usize, 0), entry.reader.encoded().native.?.identity_bytes);
     std.debug.print("LITE_ID_SCAN rows=2048 retained_growth={d} retained_ids=0\n", .{after - before});
 }
 
@@ -10890,7 +10902,7 @@ test "streaming boolean term candidates avoid inventory plans and exact bounds r
     var provider: Provider = .{};
     // Any eager readSegment() now allocates a query binding even though all
     // planning and refinement statistics are available independently.
-    for (writer.snapshot().segments) |*entry| entry.reader.postings_loader = .{ .ptr = &provider, .ensure = Provider.ensure };
+    for (writer.snapshot().segments) |*entry| entry.reader.encodedMut().postings_loader = .{ .ptr = &provider, .ensure = Provider.ensure };
     const snapshot = try writer.acquireSnapshotWithReadCapability(.{ .ptr = &provider, .check = Provider.check });
     defer snapshot.release();
     snapshot.text_statistics = .{ .ptr = &provider, .check = Provider.check, .frequencies = Provider.frequencies, .summary = Provider.summary, .candidates = Provider.candidates, .hierarchical = true };
@@ -11147,7 +11159,7 @@ test "streaming boolean inherited publication cutoff prunes before payload admis
     };
     var provider: u8 = 0;
     const snapshot = writer.snapshot();
-    for (snapshot.segments) |*entry| entry.reader.postings_loader = .{ .ptr = &provider, .ensure = Provider.ensure };
+    for (snapshot.segments) |*entry| entry.reader.encodedMut().postings_loader = .{ .ptr = &provider, .ensure = Provider.ensure };
     snapshot.text_statistics = .{ .ptr = &provider, .check = Provider.check, .frequencies = Provider.frequencies, .summary = Provider.summary };
     var diagnostics: SearchDiagnostics = .{};
     var result = try execute(a, snapshot, .{ .query = .{ .term = .{ .field = "body", .term = "common" } }, .k = 2, .include_stored = false, .minimum_competitive_score = 1e6, .diagnostics = &diagnostics });

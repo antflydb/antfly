@@ -244,7 +244,7 @@ Portable backups preserve each explicit relationship’s owner, logical endpoint
 Creation starts materialization and replay; it does not mean coverage is complete. Poll `GET /db/v1/tables/{table}/indexes/{index}`:
 
 - `readiness.queryable` is the serving authority: the index can answer queries.
-- `readiness.complete` is the convergence authority: every source is fully covered.
+- `readiness.complete` is convergence at the captured target revision: required source production and index publication have completed according to the configured policies. It is not a promise about future writes.
 - `readiness.pending_reasons` gives typed aggregate blockers or failure reasons.
 - `readiness.sources` lists each artifact stream in configuration order with its state, completeness, and typed blockers, so document-vector lag and chunk-vector lag show up separately.
 
@@ -255,6 +255,48 @@ The document-level `coverage` object belongs to embedding indexes. Full-text and
 Artifact source readiness also waits for verified completion of that source's producer dependencies. A caught-up replay cursor cannot mark unfinished OCR, transcription, chunking, or relation extraction complete before its output is published. Producer work uses durable, revision-fenced summaries; status polling does not scan documents. Each source is checked independently, so relation extraction debt does not block a text stream that has finished. Intentional empty outputs can complete; extraction failures remain unhealthy.
 
 Existing stores establish these summaries through bounded background discovery and verification of retained artifacts. Local producers use the durable paged source-recovery owner and retain the published generation once its receipts and native checkpoint agree. Until discovery finishes, producer-backed sources remain pending. Restart, source edits, and catalog changes retain or reopen the appropriate completion fences. Known terminal failures remain with their repair/retry owner rather than being regenerated on every open.
+
+Full-text indexes remain queryable while extraction is incomplete or replay is
+catching up, provided the current runtime observation and physical checkpoint are
+valid. Failed OCR is a source-coverage problem; a missing runtime, stale or
+mismatched shard observation, blocked physical checkpoint, or serving failure is
+a queryability problem. Equal replay watermarks alone do not prove complete OCR.
+
+`target_revision` and `published_revision` describe the captured consumer replay
+observation. Producer completion also depends on its own durable revision fences;
+these sequence domains are not interchangeable. A later write may reopen
+completion without invalidating an existing retained query snapshot. Status
+observations are not certificates of extraction coverage for an arbitrary query
+snapshot.
+
+Hierarchy member navigation enumerates published logical members in the retained
+store even when a different source is incomplete. An empty member page is not a
+producer-completion certificate. Selected immutable chunk heads still shadow
+legacy rows and unpublished tails; staging data is not exposed as a logical
+member. Parent authorization, retention, cursor validation and cancellation
+checks continue to apply.
+
+Antfly-grep searches available artifact content when the index is queryable. It
+retains the query snapshot across pages and checks the artifact binding before
+and after scanning. Incomplete source coverage emits a `coverage` JSON event with
+the observed incarnation and replay revisions, plus a human-readable warning.
+The summary separates `scan_complete` from `coverage_complete`; `complete` is their
+conjunction, and incomplete coverage exits 2 even when matches were found.
+A changed observation during the scan also prevents a complete-coverage claim;
+ordinary revision progress does not invalidate the retained scan. Definition
+changes and query failures still invalidate the scan. `--require-complete`
+rejects known gaps before searching and requires stable, complete observations
+through the scan. This is an operational observation check, not a snapshot-bound
+coverage certificate. It does not wait for a permanently idle table.
+
+After a quiet-mode match, grep stops fetching content but checks readiness for
+remaining selected artifact streams within the request budget. A gap or unknown
+readiness still exits 2; cancellation stops further checks.
+
+Successful artifact grep scans also emit a `coverage` JSON observation with
+`complete: true`, the table/index/field, incarnation, and target/published revisions, including when
+there are no matches. This qualifies the observation behind the summary boolean;
+it does not turn the observation into a snapshot-bound extraction certificate.
 
 Internal replay watermarks are diagnostics only.
 

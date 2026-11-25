@@ -31,6 +31,9 @@ BINARY = str(Path(sys.argv.pop(1)).resolve())
 class NativeStreams(unittest.TestCase):
     def setUp(self):
         self.complete = True
+        self.complete_by_artifact = {}
+        self.queryable = True
+        self.incarnation = "index-1"
         self.binary = False
         self.revision = 1
         self.wrong_field = False
@@ -69,12 +72,17 @@ class NativeStreams(unittest.TestCase):
                         "config": config,
                         "status": {
                             "readiness": {
-                                "queryable": True,
-                                "incarnation": "index-1",
+                                "queryable": owner.queryable,
+                                "incarnation": owner.incarnation,
                                 "target_revision": owner.revision,
                                 "published_revision": owner.revision,
                                 "sources": [
-                                    {"artifact": artifact, "complete": owner.complete}
+                                    {
+                                        "artifact": artifact,
+                                        "complete": owner.complete_by_artifact.get(
+                                            artifact, owner.complete
+                                        ),
+                                    }
                                 ],
                             }
                         },
@@ -379,7 +387,7 @@ class NativeStreams(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertFalse(self.requests)
 
-    def test_data_revision_change_invalidates_scan(self):
+    def test_data_revision_progress_preserves_scan_but_not_coverage_certificate(self):
         handler = self.server.RequestHandlerClass
         original = handler.do_POST
         owner = self
@@ -392,6 +400,17 @@ class NativeStreams(unittest.TestCase):
         result = self.run_grep("absent")
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn('"complete":false', result.stdout)
+        summary = json.loads(result.stdout.splitlines()[-1])["stats"]
+        self.assertTrue(summary["scan_complete"])
+        self.assertFalse(summary["coverage_complete"])
+        self.assertNotIn("ArtifactDefinitionChanged", result.stdout)
+        self.assertIn("observation_changed", result.stdout)
+        result = self.run_grep("Tuesday", "--require-complete")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        stats = json.loads(result.stdout.splitlines()[-1])["stats"]
+        self.assertTrue(stats["scan_complete"])
+        self.assertFalse(stats["coverage_complete"])
+        self.assertEqual(stats["errors"], 0)
 
     def test_native_paths_honor_globs_and_types_before_member_fetch(self):
         for flags in [("--glob", "!**"), ("--type", "py")]:
@@ -505,9 +524,154 @@ class NativeStreams(unittest.TestCase):
         self.assertEqual(summary["stats"]["files"], 1000)
         self.assertLessEqual(summary["stats"]["index_requests"], 40)
 
+    def test_complete_no_match_carries_its_coverage_revision(self):
+        result = self.run_grep("absent")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        events = [json.loads(line) for line in result.stdout.splitlines()]
+        coverage = next(e for e in events if e["type"] == "coverage")
+        self.assertTrue(coverage["complete"])
+        self.assertEqual(coverage["observation"]["target_revision"], 1)
+        self.assertEqual(coverage["observation"]["published_revision"], 1)
+        self.assertEqual(coverage["observation"]["incarnation"], "index-1")
+        self.assertEqual(coverage["observation"]["table"], "recordings")
+        self.assertEqual(coverage["observation"]["index"], "speech_text")
+        self.assertEqual(coverage["observation"]["field"], "text")
+        self.assertTrue(events[-1]["stats"]["complete"])
+        self.assertNotIn("incomplete extraction coverage", result.stderr)
+
+    def test_available_content_is_searched_with_incomplete_coverage(self):
+        self.complete = False
+        for pattern, expected_matches in [("Tuesday", 2), ("absent", 0)]:
+            result = self.run_grep(pattern)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            events = [json.loads(line) for line in result.stdout.splitlines()]
+            self.assertEqual(
+                sum(e["type"] == "match" for e in events), expected_matches
+            )
+            summary = events[-1]["stats"]
+            self.assertTrue(summary["scan_complete"])
+            self.assertFalse(summary["coverage_complete"])
+            self.assertFalse(summary["complete"])
+            self.assertEqual(summary["errors"], 0)
+            coverage = next(e for e in events if e["type"] == "coverage")
+            self.assertEqual(coverage["observation"]["target_revision"], 1)
+            self.assertEqual(coverage["artifact"], "speech")
+        self.assertIn("incomplete extraction coverage", result.stderr)
+        self.assertEqual(self.run_grep("Tuesday", "-q").returncode, 2)
+
+    def test_quiet_checks_remaining_selected_coverage_without_scanning_it(self):
+        for split_tables in [False, True]:
+            config = json.loads(self.config.read_text())
+            table = config["tables"][0]
+            if split_tables:
+                other = json.loads(json.dumps(table))
+                other["name"] = "other"
+                other["streams"] = [other["streams"][1]]
+                table["streams"] = [table["streams"][0]]
+                config["tables"].append(other)
+            self.config.write_text(json.dumps(config))
+            for complete, expected in [(False, 2), (None, 2), (True, 0)]:
+                for strict in [[], ["--require-complete"]]:
+                    self.requests.clear()
+                    self.complete_by_artifact["summary"] = complete
+                    result = self.run_grep("Tuesday", "-q", "--all-artifacts", *strict)
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    self.assertTrue(
+                        any(
+                            method == "GET" and path.endswith("summary_text")
+                            for method, path in self.requests
+                        )
+                    )
+                    self.assertFalse(
+                        any(
+                            method == "POST"
+                            and body.get("hierarchy", {})
+                            .get("children", {})
+                            .get("artifact")
+                            == "summary"
+                            for method, body in self.requests
+                        )
+                    )
+            self.requests.clear()
+            self.complete_by_artifact["summary"] = True
+            limited = self.run_grep(
+                "Tuesday", "-q", "--all-artifacts", "--max-requests", "4"
+            )
+            self.assertEqual(limited.returncode, 2, limited.stderr)
+            self.assertLessEqual(len(self.requests), 4)
+
+    def test_quiet_does_not_ignore_unsearchable_selected_sources(self):
+        config = json.loads(self.config.read_text())
+        other = json.loads(json.dumps(config["tables"][0]))
+        other["name"] = "unavailable"
+        other["status"] = "paused"
+        config["tables"].append(other)
+        self.config.write_text(json.dumps(config))
+        result = self.run_grep("Tuesday", "-q")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("SourceNotSearchable", result.stderr)
+        self.assertFalse(
+            any(
+                method == "GET" and "/unavailable/" in path
+                for method, path in self.requests
+            )
+        )
+
+    def test_unqueryable_index_does_not_dispatch_queries(self):
+        self.queryable = False
+        result = self.run_grep("Tuesday")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("ArtifactStreamNotQueryable", result.stderr)
+        self.assertFalse(any(method == "POST" for method, _ in self.requests))
+
+    def test_coverage_watermarks_preserve_uint64_range(self):
+        self.revision = (1 << 64) - 1
+        result = self.run_grep("Tuesday")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_unknown_coverage_and_failed_scan_are_distinct(self):
+        self.complete = None
+        result = self.run_grep("Tuesday")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse(any(method == "POST" for method, _ in self.requests))
+        self.assertFalse(
+            json.loads(result.stdout.splitlines()[-1])["stats"]["coverage_complete"]
+        )
+        self.complete = False
+        result = self.run_grep("Tuesday", "--max-requests", "2")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        stats = json.loads(result.stdout.splitlines()[-1])["stats"]
+        self.assertFalse(stats["scan_complete"])
+        self.assertFalse(stats["coverage_complete"])
+        self.assertGreater(stats["errors"], 0)
+
+        self.complete = True
+        result = self.run_grep("Tuesday", "--max-requests", "2")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        stats = json.loads(result.stdout.splitlines()[-1])["stats"]
+        self.assertFalse(stats["scan_complete"])
+        self.assertFalse(stats["coverage_complete"])
+
+    def test_definition_change_still_invalidates_the_scan(self):
+        handler = self.server.RequestHandlerClass
+        original = handler.do_POST
+        owner = self
+
+        def changing_post(request):
+            original(request)
+            owner.incarnation = "index-2"
+
+        handler.do_POST = changing_post
+        result = self.run_grep("Tuesday")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("ArtifactDefinitionChanged", result.stderr)
+        self.assertFalse(
+            json.loads(result.stdout.splitlines()[-1])["stats"]["scan_complete"]
+        )
+
     def test_pending_unknown_and_budget_are_errors(self):
         self.complete = False
-        result = self.run_grep("absent")
+        result = self.run_grep("absent", "--require-complete")
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertFalse(any(method == "POST" for method, _ in self.requests))
         self.complete = True

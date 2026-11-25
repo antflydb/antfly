@@ -100,12 +100,12 @@ pairs = [
 ]
 # Original synthetic subjects, generated against pinned test-only executable.
 parser = argparse.ArgumentParser(
-    description="Generate original synthetic fixtures with ripgrep 15.2.0 / PCRE2 10.45 (test-only oracle)."
+    description="Generate original synthetic fixtures with ripgrep 16.0.0 / PCRE2 10.45 (test-only oracle)."
 )
 parser.add_argument("oracle", type=Path)
 args = parser.parse_args()
 rg = str(args.oracle.resolve())
-assert "ripgrep 15.2.0" in subprocess.check_output([rg, "--version"]).decode()
+assert "ripgrep 16.0.0" in subprocess.check_output([rg, "--version"]).decode()
 assert "10.45" in subprocess.check_output([rg, "--pcre2-version"]).decode()
 rows = []
 for i, (pattern, text) in enumerate(pairs):

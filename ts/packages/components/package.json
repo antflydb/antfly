@@ -1,6 +1,6 @@
 {
   "name": "@antfly/components",
-  "version": "0.0.14",
+  "version": "0.4.0",
   "description": "React components for Antfly search",
   "type": "module",
   "main": "dist/main.js",
@@ -17,11 +17,15 @@
       "import": "./dist/adapters.js",
       "require": "./dist/adapters.cjs"
     },
-    "./styles": "./dist/components.css"
+    "./styles": {
+      "types": "./styles.d.ts",
+      "default": "./dist/components.css"
+    }
   },
   "files": [
     "dist",
     "types",
+    "styles.d.ts",
     "README.md",
     "LICENSE"
   ],
@@ -60,7 +64,7 @@
     ">0.03%"
   ],
   "peerDependencies": {
-    "@antfly/sdk": "workspace:*",
+    "@antfly/sdk": "workspace:^",
     "react": "^16.0.0 || ^17.0 || ^18.0 || ^19.0",
     "react-dom": "^16.0 || ^17.0 || ^18.0 || ^19.0"
   },

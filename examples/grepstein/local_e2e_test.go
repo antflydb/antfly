@@ -366,8 +366,7 @@ func testLocalNativeGCSExtraction(t *testing.T, options nativeCorpusSmokeOptions
 	}
 	t.Log("append preserved sample extraction generation and OCR call count; only new PDF fetched")
 	if options.PolicyRetry {
-		// Keep policy recovery independent of query/grep traversal. The
-		// extraction cases below exercise those paths against the same schema.
+		// Verify partial-corpus grep before recovering only incomplete work.
 		testNativeExecutionPolicyRetry(t, ctx, client, tableURL, document, &ocrCalls)
 	} else {
 		query := map[string]any{"fields": []string{"text", "provenance"}, "hierarchy": map[string]any{"children": map[string]any{"level": "unit", "parent": map[string]any{"level": "source", "id": "evidence"}}}, "order_by": []any{map[string]any{"field": "_hierarchy.position"}}, "limit": 2}

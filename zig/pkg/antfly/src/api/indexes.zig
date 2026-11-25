@@ -4502,10 +4502,17 @@ fn appendIndexReadinessStatus(
     // revoke an already admitted immutable snapshot. Load/repair failures have
     // their own active-generation fence; enrichment uses the exact serving
     // snapshot proof so threshold waits can still consume published results.
+    const full_text_serviceable = index_type == .full_text and
+        (active_generation_serviceable or
+            (observation.observation_available and consumerCheckpointComplete(item) and
+                !repair_blocks_queryable));
     const serving_failed = aggregate_query_blocked or
         ((terminal_load_failure or repair_failed) and
             (!active_generation_serviceable or repair_blocks_queryable)) or
-        (terminal_enrichment_failure and !serving_snapshot_ready);
+        // A producer supervisor failure still leaves a valid full-text
+        // checkpoint readable. Storage/load and repair admission above own
+        // serving failures; producer failures own extraction completeness.
+        (terminal_enrichment_failure and !serving_snapshot_ready and !full_text_serviceable);
     const publication_pending = incarnation_current and
         (!consumerCheckpointComplete(item) or (index_type == .embeddings and
             (replay_target_sequence > replay_applied_sequence or artifact_publish_pending or !serving_snapshot_ready)));
@@ -4522,6 +4529,11 @@ fn appendIndexReadinessStatus(
     // from repair lifecycle or result count here.
     const partial_generation_serviceable = if (index_type == .embeddings)
         serving_snapshot_ready
+    else if (index_type == .full_text)
+        // Full-text reads the existing checkpoint while producers and replay
+        // advance. Source coverage gates completion, not that read path. The
+        // common evaluator still requires a fresh, matching shard observation.
+        full_text_serviceable
     else
         active_generation_serviceable;
     const completion_fences = IndexCompletionFences{
@@ -5271,6 +5283,69 @@ fn consumerTests() type {
     const test_owner_root = @import("antfly_source_root");
     if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
     const Suite = struct {
+        test "full-text queryability is independent of source extraction coverage" {
+            const a = std.testing.allocator;
+            const metadata: runtime_status.RuntimeStatusMetadata = .{ .source = .live_writer_publish, .freshness = .fresh };
+            var sources = [_]db_mod.types.IndexSourceReplayStatus{.{ .artifact_name = "pages", .published_sequence = 9, .target_sequence = 9, .producer_complete = false, .repair_summary_ready = true, .observation_count = 1 }};
+            var item: db_mod.types.DBIndexStats = .{
+                .name = "text",
+                .kind = .full_text,
+                .coverage_generation = 7,
+                .coverage_config_hash = 41,
+                .coverage_identity_ready = true,
+                .replay_applied_sequence = 9,
+                .replay_target_sequence = 9,
+                .projection_checkpoint_status = "clean",
+                .source_replay = &sources,
+            };
+            var encoded: std.ArrayListUnmanaged(u8) = .empty;
+            defer encoded.deinit(a);
+            // Empty and nonempty full-text snapshots are both valid. Neither
+            // cardinality nor a producer's terminal failure is read admission.
+            for ([_]u64{ 0, 25 }) |count| {
+                item.doc_count = count;
+                for ([_]bool{ false, true }) |failed| {
+                    sources[0].failed = failed;
+                    encoded.clearRetainingCapacity();
+                    try appendSingleIndexRuntimeStatus(a, &encoded, .full_text, item, 1, .strict, false, 7, 41, .{}, null, null, null, .{}, metadata, true);
+                    try ant_json.testing.expectSubsetJsonText(a, "{\"readiness\":{\"queryable\":true,\"complete\":false,\"sources\":[{\"artifact\":\"pages\",\"complete\":false}]}}", encoded.items);
+                }
+            }
+            // Even a failed producer supervisor cannot revoke a readable
+            // full-text checkpoint. It does keep source completion failed.
+            encoded.clearRetainingCapacity();
+            try appendSingleIndexRuntimeStatus(a, &encoded, .full_text, item, 1, .strict, false, 7, 41, .{}, .{ .enabled = true, .worker_failed = true }, null, null, .{}, metadata, true);
+            try ant_json.testing.expectSubsetJsonText(a, "{\"readiness\":{\"queryable\":true,\"complete\":false}}", encoded.items);
+            // Preserve the existing serving proof for a repair retaining its
+            // old checkpoint while the candidate checkpoint is rebuilding.
+            var repairing = item;
+            repairing.index_lifecycle_work_class = .repair;
+            repairing.index_repair_status = .rebuilding;
+            repairing.index_repair_active_generation_serviceable = true;
+            repairing.projection_checkpoint_status = "rebuilding";
+            encoded.clearRetainingCapacity();
+            try appendSingleIndexRuntimeStatus(a, &encoded, .full_text, repairing, 1, .strict, false, 7, 41, .{}, null, null, null, .{}, metadata, true);
+            try ant_json.testing.expectSubsetJsonText(a, "{\"readiness\":{\"queryable\":true,\"complete\":false}}", encoded.items);
+            // New replay work changes the desired cut, not the readability of
+            // the existing full-text checkpoint.
+            item.replay_target_sequence = 10;
+            item.replay_catch_up_required = true;
+            encoded.clearRetainingCapacity();
+            try appendSingleIndexRuntimeStatus(a, &encoded, .full_text, item, 1, .strict, false, 7, 41, .{}, null, null, null, .{}, metadata, true);
+            try ant_json.testing.expectSubsetJsonText(a, "{\"readiness\":{\"queryable\":true,\"complete\":false}}", encoded.items);
+            // Serviceability does not override physical publication, stale
+            // observations, a missing runtime, or a different definition.
+            for (0..4) |fault| {
+                var unavailable = item;
+                if (fault == 0) unavailable.runtime_observation_stale = true;
+                if (fault == 1) unavailable.coverage_generation = 6;
+                if (fault == 2) unavailable.projection_checkpoint_status = "rebuilding";
+                encoded.clearRetainingCapacity();
+                try appendSingleIndexRuntimeStatus(a, &encoded, .full_text, unavailable, 1, .strict, false, 7, 41, .{}, null, null, null, .{}, metadata, fault != 3);
+                try ant_json.testing.expectSubsetJsonText(a, "{\"readiness\":{\"queryable\":false,\"complete\":false}}", encoded.items);
+            }
+        }
+
         test "public media pass admits named outputs from model chunks (#1210)" {
             const a = std.testing.allocator;
             const recipe =

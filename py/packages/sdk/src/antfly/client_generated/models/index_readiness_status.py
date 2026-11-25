@@ -23,9 +23,12 @@ class IndexReadinessStatus:
         state (IndexReadinessState): Lifecycle state for the desired index incarnation. A failed desired repair may
             coexist with queryable=true when a separately proven serving incarnation remains available; clients must use the
             explicit milestone booleans.
-        queryable (bool): Whether the published generation can safely answer queries.
-        complete (bool): Whether the desired incarnation has complete coverage and publication according to its
-            configured policies.
+        queryable (bool): Whether the current index runtime can safely answer queries. Full-text extraction gaps and
+            replay lag do not alone block queries against its valid existing checkpoint; unavailable or incompatible serving
+            state still does.
+        complete (bool): Whether the desired incarnation has complete coverage and publication at the captured target
+            according to its configured policies and producer revision fences. Later writes can reopen completion. This
+            observation is not a coverage certificate for an arbitrary retained query snapshot.
         pending_reasons (list[IndexReadinessReason]): Stable, machine-readable blockers or failure reasons. Empty when
             state is ready.
         incarnation (str | Unset): Opaque identity for the desired index incarnation. Clients may compare it for

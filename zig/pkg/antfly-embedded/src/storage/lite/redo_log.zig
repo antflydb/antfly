@@ -130,6 +130,13 @@ pub const Frontier = struct {
     generation: u64,
     sequence: u64,
     end_offset: u64,
+    /// Written before the fsync that also made its records durable, rather
+    /// than after it: a crash inside that fsync can keep this slot and lose
+    /// records it covers, so a reader verifies them (from the other slot's
+    /// end) before trusting it, and falls back to the other slot.
+    combined: bool = false,
+    /// The extent `end_offset` is relative to (`SegmentRotation.active`).
+    segment: u1 = 0,
 
     pub const encoded_len = 40;
     const signature = "AFRF\x01\x00\x00\x00";
@@ -140,6 +147,8 @@ pub const Frontier = struct {
         std.mem.writeInt(u64, raw[8..16], self.generation, .little);
         std.mem.writeInt(u64, raw[16..24], self.sequence, .little);
         std.mem.writeInt(u64, raw[24..32], self.end_offset, .little);
+        raw[32] = @intFromBool(self.combined);
+        raw[33] = self.segment;
         std.mem.writeInt(u32, raw[36..40], Crc32.hash(raw[0..36]), .little);
         return raw;
     }
@@ -147,10 +156,13 @@ pub const Frontier = struct {
     pub fn decode(raw: *const [encoded_len]u8) ?Frontier {
         if (!std.mem.eql(u8, raw[0..8], signature)) return null;
         if (std.mem.readInt(u32, raw[36..40], .little) != Crc32.hash(raw[0..36])) return null;
+        if (raw[32] > 1 or raw[33] > 1) return null;
         return .{
             .generation = std.mem.readInt(u64, raw[8..16], .little),
             .sequence = std.mem.readInt(u64, raw[16..24], .little),
             .end_offset = std.mem.readInt(u64, raw[24..32], .little),
+            .combined = raw[32] == 1,
+            .segment = @intCast(raw[33]),
         };
     }
 };
@@ -165,17 +177,24 @@ pub const FrontierSlots = struct {
     };
 
     pub fn readLatest(self: FrontierSlots, file: File, io: Io) !?Published {
-        return self.read(file, io, null);
+        return (try self.read(file, io, null)).newest;
     }
 
     /// Find the frontier named by a live publication. The other slot can
     /// already contain the next group's frontier before that group is visible.
     pub fn readSequence(self: FrontierSlots, file: File, io: Io, sequence: u64) !?Published {
-        return self.read(file, io, sequence);
+        return (try self.read(file, io, sequence)).newest;
     }
 
-    fn read(self: FrontierSlots, file: File, io: Io, sequence: ?u64) !?Published {
-        var latest: ?Published = null;
+    const ReadSlots = struct { newest: ?Published, other: ?Published };
+
+    /// Both logical slots from one pass over their two mirrored pages.
+    pub fn readSlots(self: FrontierSlots, file: File, io: Io) !ReadSlots {
+        return self.read(file, io, null);
+    }
+
+    fn read(self: FrontierSlots, file: File, io: Io, sequence: ?u64) !ReadSlots {
+        var slots: [2]?Published = .{ null, null };
         var read_error: ?error{InputOutput} = null;
         for (self.offsets, 0..) |offset, page| {
             var raw: [2 * Frontier.encoded_len]u8 = undefined;
@@ -190,18 +209,30 @@ pub const FrontierSlots = struct {
                 const record = raw[copy * Frontier.encoded_len ..][0..Frontier.encoded_len];
                 const frontier = Frontier.decode(record) orelse continue;
                 if (sequence) |want| if (frontier.sequence != want) continue;
-                if (latest) |prior| {
+                const slot: u1 = @intCast(page ^ copy);
+                if (slots[slot]) |prior| {
                     if (frontier.sequence < prior.frontier.sequence) continue;
                     if (frontier.sequence == prior.frontier.sequence) {
                         if (!std.meta.eql(frontier, prior.frontier)) return error.ConflictingRedoFrontiers;
                         continue;
                     }
                 }
-                latest = .{ .slot = @intCast(page ^ copy), .frontier = frontier };
+                slots[slot] = .{ .slot = slot, .frontier = frontier };
             }
         }
-        if (latest == null) if (read_error) |err| return err;
-        return latest;
+        const first = slots[0] orelse {
+            if (slots[1] == null) if (read_error) |err| return err;
+            return .{ .newest = slots[1], .other = null };
+        };
+        const second = slots[1] orelse return .{ .newest = first, .other = null };
+        if (first.frontier.sequence == second.frontier.sequence) {
+            if (!std.meta.eql(first.frontier, second.frontier)) return error.ConflictingRedoFrontiers;
+            return .{ .newest = first, .other = null };
+        }
+        return if (first.frontier.sequence > second.frontier.sequence)
+            .{ .newest = first, .other = second }
+        else
+            .{ .newest = second, .other = first };
     }
 
     /// Each logical slot has one copy on each frontier page. Updating it
