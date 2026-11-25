@@ -44783,7 +44783,9 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
             const before = harness.queued.items.len;
             var scope: FailureScope = .{};
             if (batching == .parallel_capacity_cancel) {
-                try std.testing.expectError(error.ProviderInvocationCanceled, processChunkedDenseWindow(runtime, &requests, &cache, &window, &scope));
+                // The canceled sibling prevents a serial capacity retry.
+                // Both errors are request-owned, so the first retains priority.
+                try std.testing.expectError(error.EmbedAdmissionRefused, processChunkedDenseWindow(runtime, &requests, &cache, &window, &scope));
                 try std.testing.expectEqual(@as(usize, 1), harness.capacity_attempts.load(.acquire));
                 try std.testing.expectEqual(before, harness.queued.items.len);
             } else {
