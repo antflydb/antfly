@@ -795,6 +795,28 @@ pub fn saveRuntimeStatusAndProjection(alloc: Allocator, store: anytype, scope: [
     return next;
 }
 
+/// Refund only the exact unadvanced recovery reservation. The CAS leaves
+/// any newer retry observation, rewind, or concurrent publication untouched.
+pub fn restoreBoundaryRecoveryReservation(alloc: Allocator, store: backend_erased.Store, scope: []const u8, applied: u64, generation: u64, reserved_revision: u64, status: RuntimeStatus) !?u64 {
+    const key = try appliedSequenceKey(alloc, scope);
+    defer alloc.free(key);
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginWrite();
+    errdefer txn.abort();
+    const raw = txn.get(key) catch |err| if (err == error.NotFound) null else return err;
+    const checkpoint = if (raw) |bytes| try decodeProjectionCheckpoint(bytes) else ProjectionCheckpoint{};
+    const revision = try loadStatusRevisionTxn(alloc, &txn, scope);
+    if (checkpoint.generation != generation or checkpoint.applied_sequence != applied or revision != reserved_revision) {
+        txn.abort();
+        return null;
+    }
+    // Reservation and refund both retain the repair-required projection.
+    const next = try putVersionedStatusTxn(alloc, &txn, scope, status, revision);
+    try txn.commit();
+    return next;
+}
+
 fn mergeOutstandingFailure(previous: RuntimeStatus, failure: RuntimeStatus) RuntimeStatus {
     var merged = failure;
     merged.target_sequence = @max(previous.target_sequence, failure.target_sequence);

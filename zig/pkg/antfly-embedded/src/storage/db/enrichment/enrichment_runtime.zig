@@ -587,8 +587,7 @@ const ForegroundCatchUpGuard = struct {
     }
 
     fn check(self: @This()) !void {
-        if (self.cancellation.isCancelled())
-            return RuntimeError.EnrichmentWaitCanceled;
+        self.cancellation.check() catch |err| return if (isOperationCanceled(err)) RuntimeError.EnrichmentWaitCanceled else err;
         if (self.deadline_ns) |deadline_ns| {
             if (self.clock.nowRealtimeNs() >= deadline_ns)
                 return RuntimeError.EnrichmentWaitTimeout;
@@ -4987,6 +4986,28 @@ test "enrichment cancellation recovery reserves one replay pass without resettin
     try runtime.reloadDurableState();
     try std.testing.expect(runtime.worker_failed and !runtime.boundary_recovery_pending);
 
+    try enrichment_state.saveRuntimeStatus(erased, scope_name, failed);
+    try runtime.reloadDurableState();
+    var receipt: ?BoundaryRecoveryReservation = null;
+    try saveRuntimeStatusWithPlanReceipt(&runtime, .boundary_recovery, null, runtime.replay_generation, null, &receipt);
+    try std.testing.expect(!runtime.boundary_recovery_pending);
+    const expired: ForegroundCatchUpGuard = .{ .deadline_ns = 0 };
+    try std.testing.expectEqual(error.EnrichmentWaitTimeout, foregroundPassFailure(&runtime, expired, error.Canceled));
+    try releaseBoundaryRecoveryReservation(&runtime, receipt.?);
+    try runtime.reloadDurableState();
+    try std.testing.expect(runtime.boundary_recovery_pending and !runtime.worker_failed);
+    const refunded = try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name);
+    try std.testing.expectEqualDeep(failed, refunded.status);
+    try std.testing.expectEqual(first.applied, refunded.applied);
+    try std.testing.expectEqual(first.generation, refunded.generation);
+
+    receipt = null;
+    try saveRuntimeStatusWithPlanReceipt(&runtime, .boundary_recovery, null, runtime.replay_generation, null, &receipt);
+    try enrichment_state.saveRuntimeStatus(erased, scope_name, ordinary);
+    const winner = try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name);
+    try releaseBoundaryRecoveryReservation(&runtime, receipt.?);
+    try std.testing.expectEqualDeep(winner, try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name));
+
     // A different writer can supersede the failed snapshot before this
     // detached owner obtains the replay lease. Its newer retry must win.
     try enrichment_state.saveRuntimeStatus(erased, scope_name, failed);
@@ -5410,6 +5431,7 @@ fn scopedAssetProducer(
         .cancellation = .{
             .ptr = cancellation,
             .is_cancelled_fn = AssetInvocationCancellation.isCancelled,
+            .check_fn = AssetInvocationCancellation.check,
         },
         .max_response_bytes = producer.invocation_context.max_response_bytes,
         .expected_model_revision = producer.invocation_context.expected_model_revision,
@@ -5429,7 +5451,7 @@ fn checkAssetInvocationOwner(runtime: *EnrichmentRuntime, guard: ForegroundCatch
         if (runtime.shutdown_requested.load(.acquire)) return error.EnrichmentRetryAborted;
     }
     try guard.check();
-    if (runtime.config.cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
+    runtime.config.cancellation.check() catch |err| return if (isOperationCanceled(err)) error.EnrichmentWaitCanceled else err;
     context.check() catch |err| {
         if (isOperationCanceled(err)) return error.EnrichmentWaitCanceled;
         if (err == error.Timeout) return error.EnrichmentWaitTimeout;
@@ -6429,7 +6451,12 @@ fn embeddingInvocationFailure(runtime: *EnrichmentRuntime, guard: ForegroundCatc
 /// cached generation or an asynchronous job.
 fn scopedEmbeddingRequestContext(runtime: *const EnrichmentRuntime, foreground: ?inference_request_context.RequestContext, inherited: ?inference_request_context.RequestContext, cancellation: *AssetInvocationCancellation) ?inference_request_context.RequestContext {
     if (foreground == null and (inherited == null or runtime.config.cancellation.ptr == null)) return inherited;
-    var effective = foreground orelse inherited.?;
+    var effective = inherited orelse foreground.?;
+    if (foreground) |request| {
+        effective.io = request.io;
+        effective.deadline_ns = request.deadline_ns;
+        effective.progress = request.progress orelse effective.progress;
+    }
     cancellation.* = .{
         .lifecycle = runtime.config.cancellation,
         .request = if (foreground) |value| value.cancellation orelse .none else .none,
@@ -9565,10 +9592,7 @@ const PlatformEnrichmentRuntime = struct {
         if (self.config.dense_embedder) |dense_embedder| dense_embedder.setProgress(progress);
         if (self.config.sparse_embedder) |sparse_embedder| sparse_embedder.setProgress(progress);
         const io = io_impl.io();
-        if (self.config.chunk_provider) |*provider| {
-            provider.execution.cancellation = cancellation;
-            provider.execution.io = io;
-        }
+        if (self.config.chunk_provider) |*provider| provider.execution.io = io;
     }
 
     pub fn start(self: *EnrichmentRuntime) !void {
@@ -10540,6 +10564,13 @@ test "enrichment cancellation defers dense sparse and multimodal provider calls 
         expected_deadline: ?u64 = null,
         inherited: std.atomic.Value(bool) = .init(false),
         cancel_revision: bool = false,
+        fn submitted(_: *anyopaque) void {}
+        fn authorityLost(_: *const anyopaque) !void {
+            return error.EnrichmentLeaseFenceLost;
+        }
+        fn pollActive(_: *const anyopaque) bool {
+            return false;
+        }
         fn fail(ptr: *anyopaque) anyerror {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
@@ -10565,7 +10596,10 @@ test "enrichment cancellation defers dense sparse and multimodal provider calls 
             return error.TestUnexpectedResult;
         }
         fn denseLease(ptr: *anyopaque, a: Allocator, name: []const u8, context: ?inference_request_context.RequestContext) !inference_work.CapabilityLease {
-            const revision = try sparseRevision(ptr, a, name, context orelse return error.MissingExecutionContext);
+            const control = context orelse return error.MissingExecutionContext;
+            try std.testing.expect(control.document_store.context == ptr);
+            try std.testing.expect(control.submission.?.ptr == ptr);
+            const revision = try sparseRevision(ptr, a, name, control);
             return .{ .capabilities = .{ .task = .embed, .input_modalities = .{ .text = true }, .input_granularity = .item, .output = .embedding, .model_revision = revision } };
         }
         fn sparseWithContext(ptr: *anyopaque, a: Allocator, name: []const u8, _: []const u8, context: inference_request_context.RequestContext) !embedder_mod.SparseEmbedding {
@@ -10646,7 +10680,13 @@ test "enrichment cancellation defers dense sparse and multimodal provider calls 
     mock.expected_deadline = context.deadline_ns.? - std.time.ns_per_s;
     var controlled_dense = dense;
     controlled_dense.resolve_part_lease_fn = Mock.denseLease;
-    controlled_dense.part_request_context = .{ .io = std.testing.io, .deadline_ns = mock.expected_deadline, .cancellation = CancellationToken.fromAtomic(&mock.inherited) };
+    controlled_dense.part_request_context = .{
+        .io = std.testing.io,
+        .deadline_ns = mock.expected_deadline,
+        .cancellation = CancellationToken.fromAtomic(&mock.inherited),
+        .document_store = .{ .context = &mock },
+        .submission = .{ .ptr = &mock, .notify = Mock.submitted },
+    };
     const generation = try captureDenseGeneration(&runtime, controlled_dense, std.testing.allocator, "dense", context);
     mock.cancel_revision = true;
     try std.testing.expectError(error.EnrichmentWaitCanceled, requireDenseGeneration(&runtime, controlled_dense, std.testing.allocator, "dense", generation, context));
@@ -10665,8 +10705,24 @@ test "enrichment cancellation defers dense sparse and multimodal provider calls 
         .chunk_page_with_context_callback = @ptrCast(&Mock.chunkPage),
         .execution = .{ .deadline_ns = mock.expected_deadline, .cancellation = CancellationToken.fromAtomic(&mock.inherited) },
     };
+    runtime.io_impl = .{ .borrowed = std.testing.io };
+    try runtime.resumeInlineAfterStop();
     try std.testing.expectError(error.EnrichmentWaitCanceled, dispatchModelPage(&runtime, std.testing.allocator, .{ .provider = .antfly, .model = "test", .embedding = .{ .model = "test" }, .page = true, .max_chunks = 1 }, .{ .text = "source" }));
     try std.testing.expectEqual(@as(usize, 7), mock.revision_calls);
+    const checkpoint: CancellationToken = .{ .ptr = &mock, .is_cancelled_fn = Mock.pollActive, .check_fn = Mock.authorityLost };
+    const producer = asset_producer_mod.Producer{
+        .ptr = &mock,
+        .vtable = &.{ .produce = struct {
+            fn run(_: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+                return error.TestUnexpectedResult;
+            }
+        }.run },
+        .invocation_context = .{ .cancellation = checkpoint },
+    };
+    var cancel: AssetInvocationCancellation = undefined;
+    const scoped = scopedAssetProducer(&runtime, producer, &cancel);
+    try std.testing.expect(!scoped.invocation_context.cancellation.isCancelled());
+    try std.testing.expectError(error.EnrichmentLeaseFenceLost, checkAssetInvocationOwner(&runtime, runtime.active_provider_guard, scoped.invocation_context));
 }
 
 test "enrichment provider deadlines and progress cross native clock boundaries" {
@@ -11852,21 +11908,30 @@ fn runForegroundCatchUpPassGuarded(
     const generation = runtime.replayCut().generation;
     const previous_generation = swapReplayWriteGeneration(runtime, generation);
     defer _ = swapReplayWriteGeneration(runtime, previous_generation);
-    runForegroundCatchUpPassOwned(runtime, io, target_sequence, guard, generation) catch |err| {
-        // Request cancellation and the visibility deadline are waiter
-        // outcomes, not provider or pipeline failures. Never persist them into
-        // the durable worker retry budget.
-        if (isOperationCanceled(err)) {
-            try guard.check();
-            if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
+    var recovery: ?BoundaryRecoveryReservation = null;
+    runForegroundCatchUpPassOwned(runtime, io, target_sequence, guard, generation, &recovery) catch |err| {
+        const failure = foregroundPassFailure(runtime, guard, err);
+        // A clean waiter exit can refund an unchanged reservation. A crash,
+        // provider failure, or superseding writer leaves its own durable state.
+        if (failure == RuntimeError.EnrichmentWaitCanceled or
+            failure == RuntimeError.EnrichmentWaitTimeout or
+            (failure == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)))
+        {
+            if (recovery) |reserved| try releaseBoundaryRecoveryReservation(runtime, reserved);
+            return failure;
         }
-        if (err == RuntimeError.EnrichmentWaitCanceled or
-            err == RuntimeError.EnrichmentWaitTimeout or
-            err == error.EnrichmentReplayAuthorityBusy or
-            isGraphRecoveryPending(err)) return err;
-        handleWorkerLoopError(runtime, io, err, .{ .generation = generation, .through = target_sequence });
-        return err;
+        if (failure == error.EnrichmentReplayAuthorityBusy or isGraphRecoveryPending(failure)) return failure;
+        handleWorkerLoopError(runtime, io, failure, .{ .generation = generation, .through = target_sequence });
+        return failure;
     };
+}
+
+fn foregroundPassFailure(runtime: *EnrichmentRuntime, guard: ForegroundCatchUpGuard, err: anyerror) anyerror {
+    if (isOperationCanceled(err)) {
+        guard.check() catch |control| return control;
+        if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
+    }
+    return err;
 }
 
 fn runForegroundCatchUpPassOwned(
@@ -11875,6 +11940,7 @@ fn runForegroundCatchUpPassOwned(
     target_sequence: u64,
     guard: ForegroundCatchUpGuard,
     generation: u64,
+    recovery: *?BoundaryRecoveryReservation,
 ) !void {
     try guard.check();
     try validateReplayPassGeneration(runtime, generation);
@@ -11920,7 +11986,7 @@ fn runForegroundCatchUpPassOwned(
     runtime.mutex.lockUncancelable(io);
     const recovery_pending = runtime.boundary_recovery_pending;
     runtime.mutex.unlock(io);
-    if (recovery_pending) try saveRuntimeStatusWithPlan(runtime, .boundary_recovery, null, generation, null);
+    if (recovery_pending) try saveRuntimeStatusWithPlanReceipt(runtime, .boundary_recovery, null, generation, null, recovery);
     try scavengeGraphStagesPage(runtime);
     runtime.mutex.lockUncancelable(io);
     const already_failed = runtime.worker_failed or runtime.last_error_name != null;
@@ -12542,6 +12608,7 @@ const SharedPdfWindowScheduler = struct {
         defer self.runtime.alloc.free(source_url);
         consumer.source_identity = PreparedDocumentSourceCache.sourceIdentity(source_url);
         const policy = try enrichment_types.parseExecutionPolicyJson(self.runtime.alloc, request.execution_json);
+        try checkEmbeddingInvocationOwner(self.runtime, self.runtime.active_provider_guard, embedder.part_request_context);
         const execution_lease = embedder.resolveMediaPartLease(self.runtime.alloc, requestEmbeddingName(request), @min(policy.batch_items orelse generated_ocr_default_batch_max_items, generated_ocr_absolute_batch_max_items)) catch |err|
             return embeddingInvocationFailure(self.runtime, self.runtime.active_provider_guard, embedder.part_request_context, err);
         const caps = execution_lease.capabilities.?;
@@ -12828,6 +12895,14 @@ const SharedPdfWindowScheduler = struct {
                     job.inherited_cancellation.isCancelled() or job.guard.cancellation.isCancelled();
             }
 
+            fn checkCancellation(raw: *const anyopaque) !void {
+                const job: *const @This() = @ptrCast(@alignCast(raw));
+                if (job.canceled.load(.acquire)) return error.Canceled;
+                try job.cancellation.check();
+                try job.guard.cancellation.check();
+                try job.inherited_cancellation.check();
+            }
+
             fn invocationFailure(self: *const @This(), err: anyerror) anyerror {
                 if (!isOperationInterruption(err)) return err;
                 if (self.text) |text| checkAssetInvocationOwner(self.group.scheduler.runtime, self.guard, text.producer.invocation_context) catch |control| return control;
@@ -12948,7 +13023,7 @@ const SharedPdfWindowScheduler = struct {
             var context = producer.invocation_context;
             context.io = self.lane.?.io();
             context.deadline_ns = job.guard.nativeDeadlineNs(context.deadline_ns);
-            context.cancellation = .{ .ptr = job, .is_cancelled_fn = Job.isCanceled };
+            context.cancellation = .{ .ptr = job, .is_cancelled_fn = Job.isCanceled, .check_fn = Job.checkCancellation };
             context.progress = .{ .ptr = job, .update_fn = Job.progress };
             text.producer = producer.withInvocationContext(context);
             text.started_ns = runtime.clock.nowRealtimeNs();
@@ -13030,7 +13105,12 @@ const SharedPdfWindowScheduler = struct {
             const io = self.lane.?.io();
             const inherited = provider.part_request_context;
             if (inherited) |context| job.inherited_cancellation = context.cancellation orelse .none;
-            job.embedder.part_request_context = .{ .io = io, .deadline_ns = job.guard.nativeDeadlineNs(if (inherited) |context| context.deadline_ns else null), .cancellation = .{ .ptr = job, .is_cancelled_fn = Job.isCanceled }, .progress = .{ .ptr = job, .update_fn = Job.progress } };
+            var context = inherited orelse inference_request_context.RequestContext{ .io = io, .deadline_ns = null };
+            context.io = io;
+            context.deadline_ns = job.guard.nativeDeadlineNs(context.deadline_ns);
+            context.cancellation = .{ .ptr = job, .is_cancelled_fn = Job.isCanceled, .check_fn = Job.checkCancellation };
+            context.progress = .{ .ptr = job, .update_fn = Job.progress };
+            job.embedder.part_request_context = context;
             // A saturated executor keeps the same isolated job/context and
             // executes it inline; it never creates another thread pool.
             self.launch(job);
@@ -13128,7 +13208,8 @@ const SharedPdfWindowScheduler = struct {
                 if (job.text) |text|
                     try checkAssetInvocationOwner(runtime, job.guard, text.producer.invocation_context)
                 else {
-                    if (Job.isCanceled(job)) return error.EnrichmentWaitCanceled;
+                    if (job.embedder.part_request_context == null)
+                        Job.checkCancellation(job) catch |err| return if (isOperationCanceled(err)) error.EnrichmentWaitCanceled else err;
                     try checkEmbeddingInvocationOwner(runtime, job.guard, job.embedder.part_request_context);
                 }
             }
@@ -15630,9 +15711,19 @@ const DocumentPreparationPipeline = struct {
         }
         fn isCancelled(ptr: *const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(ptr));
-            self.context.active_provider_guard.check() catch return true;
-            return self.cancel.load(.acquire) or self.context.config.cancellation.isCancelled() or self.producer.invocation_context.cancellation.isCancelled();
+            const guard = self.context.active_provider_guard;
+            if (guard.deadline_ns) |deadline| if (guard.clock.nowRealtimeNs() >= deadline) return true;
+            return self.cancel.load(.acquire) or guard.cancellation.isCancelled() or
+                self.context.config.cancellation.isCancelled() or self.producer.invocation_context.cancellation.isCancelled();
         }
+        fn checkCancellation(ptr: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            if (self.cancel.load(.acquire)) return error.Canceled;
+            try self.context.active_provider_guard.check();
+            try self.context.config.cancellation.check();
+            try self.producer.invocation_context.cancellation.check();
+        }
+
         fn probeCancelled(ptr: ?*const anyopaque) bool {
             return isCancelled(ptr orelse return true);
         }
@@ -15658,7 +15749,7 @@ const DocumentPreparationPipeline = struct {
             try self.units.append(self.allocator(), owned);
         }
         fn checkInvocation(self: *@This(), producer: asset_producer_mod.Producer, requests: []const asset_producer_mod.Request) !void {
-            if (isCancelled(self)) return error.Canceled;
+            try checkCancellation(self);
             if (self.context.provider_admission) |runtime| {
                 if (comptime builtin.os.tag != .freestanding) {
                     if (runtime.shutdown_requested.load(.acquire)) return error.EnrichmentRetryAborted;
@@ -15668,11 +15759,11 @@ const DocumentPreparationPipeline = struct {
             // Speculation always needs cooperative teardown, even for durable
             // replay with no caller deadline. Never dispatch a legacy callback.
             const bounded = producer.foregroundBoundedForRequests(self.allocator(), requests) catch |err| {
-                if (isCancelled(self)) return error.Canceled;
+                try checkCancellation(self);
                 return assetProviderFailure(&self.context, producer, err);
             };
             if (!bounded) return error.UnboundedEnrichmentProvider;
-            if (isCancelled(self)) return error.Canceled;
+            try checkCancellation(self);
         }
         fn checkDiscovery(self: *@This(), producer: asset_producer_mod.Producer, requests: []const asset_producer_mod.Request) !void {
             try self.checkInvocation(producer, requests);
@@ -15682,15 +15773,15 @@ const DocumentPreparationPipeline = struct {
                 return error.UnboundedEnrichmentProvider;
         }
         fn prepare(self: *@This()) !void {
-            if (isCancelled(self)) return error.Canceled;
+            try checkCancellation(self);
             var cancellation: AssetInvocationCancellation = undefined;
             var context = self.producer.invocation_context;
-            context.cancellation = .{ .ptr = self, .is_cancelled_fn = isCancelled };
+            context.cancellation = .{ .ptr = self, .is_cancelled_fn = isCancelled, .check_fn = checkCancellation };
             context.progress = null;
             context.document_checkpoints = null;
             const producer = scopedAssetProducer(&self.context, self.producer.withInvocationContext(context), &cancellation);
             const a = self.allocator();
-            if (isCancelled(self)) return error.Canceled;
+            try checkCancellation(self);
             var fetch_config = remoteRenderConfig(self.context.config.secret_store, &self.remote_config, self.context.config.io, .{ .ptr = self, .is_cancelled_fn = isCancelled }, null, null);
             fetch_config.deadline_ns = producer.invocation_context.deadline_ns;
             const fetched = try self.cache.fetch(self.source_url, if (self.config.credentials.len > 0) self.config.credentials else null, fetch_config);
@@ -15698,6 +15789,7 @@ const DocumentPreparationPipeline = struct {
                 .ok => |lease| lease,
                 .http_error => return,
             };
+            try producer.invocation_context.check();
             const entry = self.source.?.entry();
             try document_extraction_mod.verifyChecksumDigest(self.config, &entry.content_sha256);
             if (!document_extraction_mod.resolvesToPdf(self.config, self.source_url, entry.content.content_type, entry.content.data)) return;
@@ -15785,7 +15877,7 @@ const DocumentPreparationPipeline = struct {
                 const executor = producer.withInvocationContext(execution_context);
                 var produced = if (self.raster) try executor.produceBorrowedRasterBatchReported(a, &.{request}, &rasters) else try executor.produceBatchReported(a, &.{request});
                 defer produced.deinit(a);
-                if (isCancelled(self)) return error.Canceled;
+                try checkCancellation(self);
                 try produced.validateForRequests(&.{request});
                 const executed_revision = produced.executed_model_revision orelse return;
                 if (!std.mem.eql(u8, &expected_revision, &executed_revision)) return;
@@ -16447,7 +16539,7 @@ const PreparedDocumentSourceCache = struct {
         return false;
     }
 
-    fn waitForPreparationAssumeLocked(self: *@This(), owner: asset_producer_mod.InvocationContext) !void {
+    fn waitForPreparationAssumeLocked(self: *@This(), owner: asset_producer_mod.InvocationContext, poll_ns: *u64) !void {
         self.active_waiters += 1;
         defer {
             self.active_waiters -= 1;
@@ -16460,7 +16552,9 @@ const PreparedDocumentSourceCache = struct {
         // Wake immediately on completion. External cancellation tokens do
         // not signal this condition, so sample them only on contended waits.
         const remaining = if (owner.deadline_ns) |deadline| deadline -| platform_time.monotonicNs() else std.math.maxInt(u64);
-        self.drained.waitTimeout(self.io, &self.mutex, .{ .duration = .{ .clock = .awake, .raw = .fromNanoseconds(@min(remaining, 10 * std.time.ns_per_ms)) } }) catch return error.EnrichmentWaitCanceled;
+        const delay = @min(remaining, poll_ns.*);
+        self.drained.waitTimeout(self.io, &self.mutex, .{ .duration = .{ .clock = .awake, .raw = .fromNanoseconds(delay) } }) catch return error.EnrichmentWaitCanceled;
+        poll_ns.* = @min(poll_ns.* * 2, 100 * std.time.ns_per_ms);
     }
 
     fn fetch(
@@ -16474,6 +16568,7 @@ const PreparedDocumentSourceCache = struct {
         if (comptime @hasField(template_remote.RenderConfig, "cancellation")) {
             if (config.cancellation) |token| owner.cancellation = .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn };
         }
+        var poll_ns: u64 = 10 * std.time.ns_per_ms;
         self.mutex.lockUncancelable(self.io);
         while (true) {
             checkPreparedSourceOwner(owner) catch |err| {
@@ -16494,10 +16589,10 @@ const PreparedDocumentSourceCache = struct {
                     return err;
                 };
                 self.mutex.unlock(self.io);
-                return .{ .ok = lease };
+                return checkedFetchOutcome(owner, .{ .ok = lease });
             }
             if (self.sourcePendingAssumeLocked(identity, credential_name)) {
-                self.waitForPreparationAssumeLocked(owner) catch |err| {
+                self.waitForPreparationAssumeLocked(owner, &poll_ns) catch |err| {
                     self.mutex.unlock(self.io);
                     return err;
                 };
@@ -16544,7 +16639,7 @@ const PreparedDocumentSourceCache = struct {
                 const shutting_down = self.shutting_down;
                 self.mutex.unlock(self.io);
                 if (shutting_down) return error.PreparedDocumentCacheShuttingDown;
-                return .{ .http_error = http_error };
+                return checkedFetchOutcome(owner, .{ .http_error = http_error });
             },
             .ok => |content| {
                 // Content hashing is proportional to source size and therefore
@@ -16578,17 +16673,14 @@ const PreparedDocumentSourceCache = struct {
                 };
                 self.finishPendingSourceAssumeLocked(identity, credential_name);
                 self.mutex.unlock(self.io);
-                return .{ .ok = lease };
+                return checkedFetchOutcome(owner, .{ .ok = lease });
             },
         } else |err| {
             self.mutex.lockUncancelable(self.io);
             self.finishPendingSourceAssumeLocked(identity, credential_name);
             self.mutex.unlock(self.io);
-            const canceled = if (comptime @hasField(template_remote.RenderConfig, "cancellation"))
-                if (config.cancellation) |token| token.isCancelled() else false
-            else
-                false;
-            return classifyProviderCancellation(err, .{}, canceled);
+            try checkPreparedSourceOwner(owner);
+            return classifyProviderCancellation(err, .{}, false);
         }
     }
 
@@ -16715,6 +16807,7 @@ const PreparedDocumentSourceCache = struct {
         if (source.cache != self or source.entry_ptr == null)
             return error.InvalidPreparedDocumentSourceLease;
         const entry = source.entry();
+        var poll_ns: u64 = 10 * std.time.ns_per_ms;
         self.mutex.lockUncancelable(self.io);
         while (true) {
             checkPreparedSourceOwner(owner) catch |err| {
@@ -16738,7 +16831,7 @@ const PreparedDocumentSourceCache = struct {
                 return lease;
             }
             if (self.pdfPendingAssumeLocked(entry, decode_limits)) {
-                self.waitForPreparationAssumeLocked(owner) catch |err| {
+                self.waitForPreparationAssumeLocked(owner, &poll_ns) catch |err| {
                     self.mutex.unlock(self.io);
                     return err;
                 };
@@ -16957,6 +17050,15 @@ const PreparedDocumentSourceCache = struct {
     }
 };
 
+fn checkedFetchOutcome(owner: asset_producer_mod.InvocationContext, outcome: PreparedDocumentSourceCache.FetchOutcome) !PreparedDocumentSourceCache.FetchOutcome {
+    errdefer if (outcome == .ok) {
+        var lease = outcome.ok;
+        lease.deinit();
+    };
+    try checkPreparedSourceOwner(owner);
+    return outcome;
+}
+
 fn checkPreparedSourceOwner(owner: asset_producer_mod.InvocationContext) !void {
     if (owner.deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.EnrichmentWaitTimeout;
     owner.cancellation.check() catch |err| return if (isOperationCanceled(err)) error.EnrichmentWaitCanceled else err;
@@ -17169,6 +17271,11 @@ test "prepared document cache detaches a timed-out waiter without canceling the 
     try std.testing.expectError(error.EnrichmentWaitTimeout, prepared);
     try std.testing.expectEqual(@as(usize, 0), cache.active_waiters);
     try std.testing.expectEqual(@as(usize, 0), cache.pdf_preparation_computations);
+    try std.testing.expectError(error.EnrichmentWaitTimeout, checkedFetchOutcome(.{ .deadline_ns = 0 }, .{ .http_error = .{ .status = 404, .message = "not found" } }));
+    const late = (try cache.lookup(url, null)).?;
+    try std.testing.expectEqual(@as(usize, 2), cache.active_borrows);
+    try std.testing.expectError(error.EnrichmentWaitTimeout, checkedFetchOutcome(.{ .deadline_ns = 0 }, .{ .ok = late }));
+    try std.testing.expectEqual(@as(usize, 1), cache.active_borrows);
 }
 
 test "prepared document cache single-flights concurrent PDF variants and drains leases" {
@@ -21168,6 +21275,7 @@ fn processDocumentExtractionAsset(
             raw_err;
         // Consult the owning durable retry scope before publishing a terminal
         // receipt. The runtime-global counter does not own lane retries.
+        try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, .{});
         if (try scope.shouldYield(runtime, err)) return err;
         try writeDocumentExtractionFailureManifest(
             runtime,
@@ -21193,6 +21301,7 @@ fn processDocumentExtractionAsset(
     var prepared_source_lease = switch (fetched) {
         .ok => |lease| lease,
         .http_error => |http_error| {
+            try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, .{});
             if (document_extraction_mod.remoteHttpStatusIsTransient(http_error.status)) {
                 // Parking persists the deadline, so install the server hint
                 // before asking the durable scope to schedule this attempt.
@@ -35894,6 +36003,7 @@ fn processPdfPageImageEmbeddingWithAllocator(
     var cancellation: AssetInvocationCancellation = undefined;
     const dense_embedder = provider.withRequestContext(scopedEmbeddingRequestContext(runtime, foregroundProviderRequestContext(runtime), provider.part_request_context, &cancellation));
     const policy = try enrichment_types.parseExecutionPolicyJson(metadata_alloc, request.execution_json);
+    try checkEmbeddingInvocationOwner(runtime, runtime.active_provider_guard, dense_embedder.part_request_context);
     const execution_lease = dense_embedder.resolveMediaPartLease(metadata_alloc, embedding_name, @min(policy.batch_items orelse generated_ocr_default_batch_max_items, generated_ocr_absolute_batch_max_items)) catch |err|
         return embeddingInvocationFailure(runtime, runtime.active_provider_guard, dense_embedder.part_request_context, err);
     const capabilities = execution_lease.capabilities.?;
@@ -35924,12 +36034,12 @@ fn processPdfPageImageEmbeddingWithAllocator(
     var resource_tracker = RuntimeDocumentExtractionResourceTracker.init(runtime);
     defer resource_tracker.deinit();
     const fetched = try fetchEnrichmentSource(runtime, prepared_sources, source_url, null, request, raw);
-    try embedding_lease_guard.check();
     var prepared_source_lease = switch (fetched) {
         .ok => |lease| lease,
         .http_error => return error.RemoteDocumentFetchFailed,
     };
     defer prepared_source_lease.deinit();
+    try embedding_lease_guard.check();
     const prepared_source = prepared_source_lease.entry();
     const downloaded = &prepared_source.content;
     resource_tracker.setExternallyAccountedDownloadedBytes(downloaded.data.len);
@@ -40635,11 +40745,62 @@ fn clearReplayCursorWithRetry(runtime: *EnrichmentRuntime) !void {
 
 const StatusPublication = enum { current, failure, boundary_recovery };
 
+const BoundaryRecoveryReservation = struct {
+    cut: ReplayCut,
+    revision: u64,
+    status: enrichment_state.RuntimeStatus,
+};
+
+fn releaseBoundaryRecoveryReservation(runtime: *EnrichmentRuntime, reservation: BoundaryRecoveryReservation) !void {
+    const publication_io = lockAppliedPublication(runtime);
+    defer unlockAppliedPublication(runtime, publication_io);
+    const io = lockRuntime(runtime);
+    const still_reserved = runtime.replay_generation == reservation.cut.generation and
+        runtime.applied_sequence == reservation.cut.applied and
+        runtime.status_revision == reservation.revision;
+    unlockRuntime(runtime, io);
+    if (!still_reserved) return;
+
+    var publication_store = try RuntimePublicationStore.init(runtime);
+    defer publication_store.deinit();
+    var status = reservation.status;
+    status.consecutive_retry_count -= 1;
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        const revision = enrichment_state.restoreBoundaryRecoveryReservation(
+            runtime.alloc,
+            publication_store.store(runtime).*,
+            scope_name,
+            reservation.cut.applied,
+            reservation.cut.generation,
+            reservation.revision,
+            status,
+        ) catch |err| switch (err) {
+            error.WriterLocked => {
+                if (attempt >= writer_locked_retry_count) return err;
+                backoffWriterLockRetry();
+                continue;
+            },
+            else => return err,
+        } orelse return;
+        const state_io = lockRuntime(runtime);
+        runtime.status_revision = revision;
+        // Keep the same admitted pass available within this process as well.
+        runtime.boundary_recovery_pending = true;
+        unlockRuntime(runtime, state_io);
+        return;
+    }
+}
+
 fn saveRuntimeStatusWithRetry(runtime: *EnrichmentRuntime, mode: StatusPublication) !void {
     try saveRuntimeStatusWithPlan(runtime, mode, null, null, null);
 }
 
 fn saveRuntimeStatusWithPlan(runtime: *EnrichmentRuntime, mode: StatusPublication, pass_config_hash: ?u64, pass_generation: ?u64, failed_through: ?u64) !void {
+    try saveRuntimeStatusWithPlanReceipt(runtime, mode, pass_config_hash, pass_generation, failed_through, null);
+}
+
+fn saveRuntimeStatusWithPlanReceipt(runtime: *EnrichmentRuntime, mode: StatusPublication, pass_config_hash: ?u64, pass_generation: ?u64, failed_through: ?u64, reservation: ?*?BoundaryRecoveryReservation) !void {
     const publication_io = lockAppliedPublication(runtime);
     defer unlockAppliedPublication(runtime, publication_io);
     const io = lockRuntime(runtime);
@@ -40673,6 +40834,10 @@ fn saveRuntimeStatusWithPlan(runtime: *EnrichmentRuntime, mode: StatusPublicatio
                 if (mode == .boundary_recovery) {
                     const state_io = lockRuntime(runtime);
                     runtime.boundary_recovery_pending = false;
+                    if (reservation) |receipt| {
+                        runtime.status_revision = next.?;
+                        receipt.* = .{ .cut = .{ .generation = generation, .applied = applied }, .revision = next.?, .status = status };
+                    }
                     unlockRuntime(runtime, state_io);
                 }
             }
