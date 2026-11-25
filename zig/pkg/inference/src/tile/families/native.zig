@@ -238,6 +238,7 @@ pub const regions = r.regions(&.{
     r.encodedMetalSourceFamily("expert.projection.direct", @embedFile("native/metal/expert_projection.m")),
     r.metalSourceFamily("residual.sum_bf16", @embedFile("native/metal/residual_sum_bf16.metal")),
     r.metalSourceFamily("residual.mix_bf16", @embedFile("native/metal/residual_mix_bf16.metal")),
+    r.metalSourceFamily("normalization.row_rms_bf16", @embedFile("native/metal/row_rms_bf16.metal")),
     r.metalSourceFamily("residual.gated_bf16", @embedFile("native/metal/gated_residual_bf16.metal")),
     r.metalSourceFamily("normalization.head_bf16", @embedFile("native/metal/head_norm_bf16.metal")),
     r.metalSourceFamily("projection.dense_bf16", @embedFile("native/metal/dense_bf16_projection.metal")),

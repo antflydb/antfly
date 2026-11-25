@@ -1783,6 +1783,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> head_norm_bf16_pipeline;
     id<MTLComputePipelineState> residual_mix_bf16_pipeline;
     id<MTLComputePipelineState> residual_sum_bf16_pipeline;
+    id<MTLComputePipelineState> row_rms_bf16_pipeline;
     id<MTLComputePipelineState> gated_residual_bf16_pipelines[2];
     TermiteMetalMtpHeadWorkspace *mtp_head_workspace;
     id<MTLDevice> device;
@@ -13024,6 +13025,36 @@ static NSString *termite_metal_shader_source(void) {
            "        reinterpret_cast<device bfloat *>(output)[base + column] = bfloat((mixed[column] * norm) * float(gamma[column]));\n"
            "}\n"
            // tile-codegen:end residual.mix_bf16 family
+           // tile-codegen:begin normalization.row_rms_bf16 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "struct RowRmsBf16Params { uint width, input_f32; float epsilon; };\n"
+           "\n"
+           "inline float antfly_row_rms_input(device const uchar *source, ulong index, bool f32) {\n"
+           "    return f32 ? reinterpret_cast<device const float *>(source)[index]\n"
+           "               : float(reinterpret_cast<device const bfloat *>(source)[index]);\n"
+           "}\n"
+           "\n"
+           "kernel void antfly_row_rms_to_bf16(\n"
+           "    device const uchar *source [[buffer(0)]],\n"
+           "    device const bfloat *gamma [[buffer(1)]],\n"
+           "    device bfloat *output [[buffer(2)]],\n"
+           "    constant RowRmsBf16Params &p [[buffer(3)]],\n"
+           "    uint row [[threadgroup_position_in_grid]],\n"
+           "    uint tid [[thread_index_in_threadgroup]]\n"
+           ") {\n"
+           "    const ulong base = ulong(row) * p.width;\n"
+           "    threadgroup float partial[4];\n"
+           "    float square = 0.0f;\n"
+           "    for (uint i = tid; i < p.width; i += 128u) {\n"
+           "        const float value = antfly_row_rms_input(source, base + i, p.input_f32);\n"
+           "        square = fma(value, value, square);\n"
+           "    }\n"
+           "    const float scale = rsqrt(antfly_residual_mix_reduce(square, tid, partial) / float(p.width) + p.epsilon);\n"
+           "    for (uint i = tid; i < p.width; i += 128u) {\n"
+           "        const float value = antfly_row_rms_input(source, base + i, p.input_f32);\n"
+           "        output[base + i] = bfloat((value * scale) * float(gamma[i]));\n"
+           "    }\n"
+           "}\n"
+           // tile-codegen:end normalization.row_rms_bf16 family
            // tile-codegen:begin residual.gated_bf16.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "struct GatedResidualParams { uint width; float epsilon; };\n"
            "\n"
@@ -33914,6 +33945,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->head_norm_bf16_pipeline = nil;
     runtime->residual_mix_bf16_pipeline = nil;
     runtime->residual_sum_bf16_pipeline = nil;
+    runtime->row_rms_bf16_pipeline = nil;
     for (size_t index = 0; index < 2; ++index) runtime->gated_residual_bf16_pipelines[index] = nil;
     free(runtime);
     }
@@ -37254,6 +37286,23 @@ int antfly_metal_dispatch_residual_sum_bf16(
     return antfly_metal_encode_typed_stage(runtime, @"antfly_residual_sum3_bf16_pointwise",
         &runtime->residual_sum_bf16_pipeline, views, required, alignment, 4, 1u << 3,
         &params, sizeof(params), MTLSizeMake(((size_t)values + 127u) / 128u, 1, 1), MTLSizeMake(128, 1, 1));
+}
+
+int antfly_metal_dispatch_row_rms_bf16(
+    termite_metal_decode_runtime *runtime, const antfly_metal_routed_buffer views[3],
+    uint32_t rows, uint32_t width, float epsilon, bool input_f32
+) {
+    if (!runtime || !views || !rows || !width || width > (1u << 20) || !isfinite(epsilon) || epsilon <= 0) return -1;
+    const size_t input_size = input_f32 ? 4u : 2u;
+    size_t values, input_bytes;
+    if (!termite_metal_size_mul(rows, width, &values) ||
+        !termite_metal_size_mul(values, input_size, &input_bytes)) return -1;
+    const size_t required[3] = {input_bytes, (size_t)width * 2u, values * 2u};
+    const size_t alignment[3] = {input_size, 2, 2};
+    const struct { uint32_t width, input_f32; float epsilon; } params = {width, input_f32 ? 1u : 0u, epsilon};
+    return antfly_metal_encode_typed_stage(runtime, @"antfly_row_rms_to_bf16",
+        &runtime->row_rms_bf16_pipeline, views, required, alignment, 3, 1u << 2,
+        &params, sizeof(params), MTLSizeMake(rows, 1, 1), MTLSizeMake(128, 1, 1));
 }
 
 typedef struct { uint32_t rows, hidden, head_dim, grid_x, grid_y; float eps, theta, scale; uint32_t stride, start, rotate, weighted, cached_rotary; } termite_vision_norm_rope_params;

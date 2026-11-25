@@ -53929,3 +53929,58 @@ test "Metal BF16 residual sum handles a new block and in-place ordered updates" 
         try std.testing.expectEqual(@as(u16, 0x3f80), value);
     }
 }
+
+/// Normalize complete hidden rows and round once at the BF16 output boundary.
+pub fn rowRmsBf16(runtime: *RawMetalDecodeRuntime, rows: u32, width: u32, epsilon: f32, input: *const MetalTensor, gamma: *const MetalTensor, output: *MetalTensor) !void {
+    if (!hasActiveFrame(runtime)) return error.MetalFrameRequired;
+    if (input.dtype != .f32 and input.dtype != .i16) return error.UnsupportedTensorType;
+    if (output.isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
+    const Buffer = RoutedBlockScaledProjection.Buffer;
+    const views: [3]Buffer = .{
+        try .fromTensor(input, input.dtype),
+        try .fromTensor(gamma, .i16),
+        try .fromTensor(output, .i16),
+    };
+    if (antfly_metal_dispatch_row_rms_bf16(runtime, &views, rows, width, epsilon, input.dtype == .f32) != 0)
+        return error.MetalKernelDispatchFailed;
+    output.invalidateHostMirror();
+}
+
+extern fn antfly_metal_dispatch_row_rms_bf16(runtime: *RawMetalDecodeRuntime, views: *const [3]RoutedBlockScaledProjection.Buffer, rows: u32, width: u32, epsilon: f32, input_f32: bool) c_int;
+
+test "Metal full-width BF16 RMS accepts checkpoint rows and F32 residuals" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const width = 2304;
+    const rows = 2;
+    var bf16: [width * rows]u16 = undefined;
+    @memset(bf16[0..width], 0x3f80);
+    @memset(bf16[width..], 0xbf80);
+    var full: [width * rows]f32 = undefined;
+    @memset(full[0..width], 3);
+    @memset(full[width..], -3);
+    const gamma: [width]u16 = @splat(0x4000);
+    var tensors: [5]MetalTensor = undefined;
+    var count: usize = 0;
+    defer for (tensors[0..count]) |*tensor| tensor.deinit();
+    for (&tensors, [_]metal_tensor.DType{ .i16, .f32, .i16, .i16, .i16 }, [_]i32{ width * rows, width * rows, width, width * rows, width * rows }) |*tensor, dtype, size| {
+        tensor.* = try MetalTensor.deviceAllocateTyped(std.testing.allocator, runtime, dtype, .shared, &.{size});
+        count += 1;
+    }
+    try tensors[0].uploadBytes(std.mem.asBytes(&bf16));
+    try tensors[1].uploadBytes(std.mem.asBytes(&full));
+    try tensors[2].uploadBytes(std.mem.asBytes(&gamma));
+    try beginFrame(runtime);
+    errdefer cancelFrame(runtime) catch {};
+    try rowRmsBf16(runtime, rows, width, 0.000001, &tensors[0], &tensors[2], &tensors[3]);
+    try rowRmsBf16(runtime, rows, width, 0.000001, &tensors[1], &tensors[2], &tensors[4]);
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+    for (tensors[3..]) |*tensor| {
+        try tensor.downloadBytesInto(std.mem.asBytes(&bf16));
+        for (bf16[0..width]) |value| try std.testing.expectEqual(@as(u16, 0x4000), value);
+        for (bf16[width..]) |value| try std.testing.expectEqual(@as(u16, 0xc000), value);
+    }
+}
