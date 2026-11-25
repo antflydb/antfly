@@ -1539,6 +1539,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         _ = preparedBackendIdentity(cb) orelse return null;
         return parameterIdentity(toBuf(tensor));
     }
+    pub fn borrowProjectorWeight(cb: *const ops.ComputeBackend, source: *const @import("../models/tensor_store.zig").GgufStore, name: []const u8) !?CT {
+        _ = preparedBackendIdentity(cb) orelse return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const store = self.data.tensor_store orelse return null;
+        if (!store.resolvesAuxiliaryTensor(source, name)) return null;
+        return cb.getWeight(name) catch |err| switch (err) {
+            error.MissingWeight => null,
+            else => return err,
+        };
+    }
     fn embeddingTableIdentity(model: *const Buf) ?metal_runtime_mod.EmbeddingTableIdentity {
         if (!immutableTable(model) or hasHostView(model)) return null;
         const identity = parameterIdentity(model) orelse return null;

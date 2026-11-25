@@ -1558,16 +1558,18 @@ pub const Executor = struct {
 
         // Preserve the scheduler's turn, execution lock, and reservation
         // rollback. Only the originating request can authorize pruning, and
-        // only a singleton KV-only prefill may use the direct KV context.
+        // only a singleton prefill may use the direct KV context. Native
+        // can also return the requested last vocabulary row.
         // Mixed batches and query/hidden-state consumers retain the full path.
         if (claimed.len == 1 and claimed[0].phase == .prefill) {
             const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(claimed[0].work_ptr));
-            if (work.allow_shared_kv_prefill and !work.wants_last_logits) {
+            if (work.allow_shared_kv_prefill and (!work.wants_last_logits or self.context.cb.kind() == .native)) {
                 var decode_runtime = BorrowedDecodeStateRuntime.init(work.decode_state);
                 var context = decode_runtime.makeDecodeContext(work.seq_len, work.query_seq_len);
                 try self.context.bindDecoderCleanup(&context);
-                if (try gpt_arch.trySharedKvPrefill(self.context.cb, self.context.allocator, self.context.gpt_config.*, work.token_ids, work.seq_len, &context, .kv_only)) |_| {
-                    return .{ .logits = null, .max_query_seq_len = max_query_seq_len };
+                const intent: @import("../graph/backend_contracts.zig").PrefillOutputIntent = if (work.wants_last_logits) .last_logits else .kv_only;
+                if (try gpt_arch.trySharedKvPrefill(self.context.cb, self.context.allocator, self.context.gpt_config.*, work.token_ids, work.seq_len, &context, intent)) |prefill| {
+                    return .{ .logits = prefill.last_logits, .max_query_seq_len = max_query_seq_len, .last_rows_only = work.wants_last_logits };
                 }
             }
         }

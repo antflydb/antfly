@@ -37015,8 +37015,62 @@ fn gqaPagedAttentionDirect(
     const sink_scores = try attentionSinkScores(attention.attention_sink, num_heads);
     const output = try self.allocator.alloc(f32, q_seq_len * H_q);
     errdefer self.allocator.free(output);
-    try gqaPagedAttentionDirectInto(pool, block_ids, layer_index, Q, bias, attention, num_heads, num_kv_heads, head_dim, sink_scores, output);
+    const tiled = bias == null and sink_scores == null and
+        platform.env.getenvBool("ANTFLY_INFERENCE_NATIVE_TILED_PAGED_PREFILL") and
+        try tryGqaTiledPagedPrefill(self, pool, block_ids, layer_index, Q, attention, num_heads, num_kv_heads, head_dim, output);
+    if (!tiled) try gqaPagedAttentionDirectInto(pool, block_ids, layer_index, Q, bias, attention, num_heads, num_kv_heads, head_dim, sink_scores, output);
     return self.makeBuf(output, true);
+}
+
+fn tryGqaTiledPagedPrefill(
+    self: *NativeCompute,
+    pool: *runtime.kv.storage.KvStorage,
+    block_ids: []const runtime.kv.block.KvBlockId,
+    layer_index: usize,
+    query: []const f32,
+    attention: AttentionContext,
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    output: []f32,
+) !bool {
+    const queries = attention.query_sequence_len;
+    const keys = attention.kv_sequence_len;
+    if (attention.mode != .paged_prefill or queries < 16 or queries > attention.total_sequence_len or keys == 0 or
+        attention.kv_position_offset > attention.total_sequence_len or keys > attention.total_sequence_len - attention.kv_position_offset or
+        (pool.config.dtype != .f16 and pool.config.dtype != .f32)) return false;
+
+    const width = try std.math.mul(usize, kv_heads, head_dim);
+    const key_values = try std.math.mul(usize, keys, width);
+    const packed_elements = try std.math.mul(usize, 2, key_values);
+    const max_scratch = 16 * 1024 * 1024;
+    if (packed_elements > max_scratch / @sizeOf(f32)) return false;
+    const workspace_offset = std.mem.alignForward(usize, packed_elements, 64 / @sizeOf(f32));
+    const tiles = try linalg.FlashCausalWorkspace.init(queries, keys, head_dim);
+    const elements = try std.math.add(usize, workspace_offset, tiles.floats);
+    if (elements > max_scratch / @sizeOf(f32)) return false;
+
+    const estimate = NativeCompute.scratchEstimate(elements * @sizeOf(f32));
+    if (self.run_budget) |budget| budget.reserveEstimate(estimate) catch return false;
+    defer if (self.run_budget) |budget| budget.releaseEstimate(estimate);
+    const scratch = self.allocator.alignedAlloc(f32, .@"64", elements) catch return false;
+    defer self.allocator.free(scratch);
+    const k = scratch[0..key_values];
+    const v = scratch[key_values..][0..key_values];
+
+    // Read each compressed KV row once. The storage view is valid only
+    // until the next read, so copy both slices before advancing the page.
+    for (0..keys) |index| {
+        const page = index / pool.config.page_size_tokens;
+        if (page >= block_ids.len) return error.InvalidPagedKvState;
+        const row = try pool.readToken(block_ids[page], layer_index, index % pool.config.page_size_tokens);
+        if (row.k.len < width or row.v.len < width) return error.InvalidPagedKvState;
+        @memcpy(k[index * width ..][0..width], row.k[0..width]);
+        @memcpy(v[index * width ..][0..width], row.v[0..width]);
+    }
+
+    try linalg.flashCausalAttentionHostInto(query, k, v, null, attention.attn_or_mask, attention.sliding_window, 1, queries, keys, attention.total_sequence_len - queries, attention.kv_position_offset, heads, kv_heads, head_dim, output, @alignCast(scratch[workspace_offset..]));
+    return true;
 }
 
 /// Same target-owned paged attention schedule, with caller-authored output.
@@ -37052,8 +37106,11 @@ fn gqaPagedAttentionDirectInto(
             const out_ptr = output[qi * H_q + h * head_dim ..].ptr;
             var running_max = if (sink_scores) |scores| scores[h] else -std.math.inf(f32);
             var running_sum: f32 = if (sink_scores != null) 1.0 else 0.0;
+            const query_pos = query_position_offset + qi;
 
             for (0..kv_seq_len) |token_idx| {
+                const key_pos = kv_position_offset + token_idx;
+                if ((key_pos > query_pos and !allowsFutureAttention(attention.attn_or_mask, attention.total_sequence_len, query_pos, key_pos)) or !allowsPastAttention(attention.sliding_window, query_pos, key_pos)) continue;
                 const block_idx = token_idx / pool.config.page_size_tokens;
                 const token_offset = token_idx % pool.config.page_size_tokens;
                 if (block_idx >= block_ids.len) return error.InvalidPagedKvState;
@@ -37061,10 +37118,6 @@ fn gqaPagedAttentionDirectInto(
                 const row = try pool.readToken(block_id, layer_index, token_offset);
                 const k_ptr = row.k[kv_h * head_dim ..].ptr;
                 const v_ptr = row.v[kv_h * head_dim ..].ptr;
-
-                const query_pos = query_position_offset + qi;
-                const key_pos = kv_position_offset + token_idx;
-                if ((key_pos > query_pos and !allowsFutureAttention(attention.attn_or_mask, attention.total_sequence_len, query_pos, key_pos)) or !allowsPastAttention(attention.sliding_window, query_pos, key_pos)) continue;
 
                 var score = linalg.dot(q_ptr[0..head_dim], k_ptr[0..head_dim]) * scale;
                 if (bias) |bias_data| {
@@ -37088,6 +37141,57 @@ fn gqaPagedAttentionDirectInto(
             }
         }
     }
+}
+
+test "Native tiled paged prefill preserves grouped F16 rows and mask positions" {
+    const a = std.testing.allocator;
+    const queries = 16;
+    const keys = 20;
+    const total = 24;
+    const heads = 4;
+    const head_dim = 32;
+    var manager = runtime.kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const pool_id = try manager.addPool(.{ .backend = .native, .dtype = .f16, .page_size_tokens = 4, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = head_dim });
+    const sequence = try manager.attachSequence(pool_id);
+    try manager.appendTokens(sequence, keys);
+    var k: [keys * head_dim]f32 = undefined;
+    var v: [k.len]f32 = undefined;
+    var query: [queries * heads * head_dim]f32 = undefined;
+    for (&k, &v, 0..) |*key, *value, index| {
+        key.* = @as(f32, @floatFromInt(index % 23)) / 24 - 0.5;
+        value.* = @as(f32, @floatFromInt(index % 19)) / 20 - 0.5;
+    }
+    for (&query, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index % 29)) / 30 - 0.5;
+    try manager.writeFullLayerKv(sequence, 0, keys, &k, &v);
+    const pool = manager.getPoolMut(pool_id).?;
+    const block_ids = manager.blockTable(sequence).?.blocks.items;
+    var mask: [total * total]u8 = @splat(0);
+    mask[(total - queries) * total + (total - queries + 2)] = 1;
+    const attention: AttentionContext = .{
+        .mode = .paged_prefill,
+        .total_sequence_len = total,
+        .query_sequence_len = queries,
+        .kv_sequence_len = keys,
+        .kv_position_offset = total - keys,
+        .sliding_window = 7,
+        .attn_or_mask = &mask,
+        .layer_index = 0,
+    };
+    var weights = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    var want: [query.len]f32 = undefined;
+    var got: [query.len]f32 = undefined;
+    try gqaPagedAttentionDirectInto(pool, block_ids, 0, &query, null, attention, heads, 1, head_dim, null, &want);
+    try std.testing.expect(try tryGqaTiledPagedPrefill(&compute, pool, block_ids, 0, &query, attention, heads, 1, head_dim, &got));
+    for (want, got) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 1e-5);
+
+    var budget = run_memory.RunBudget.init(.{ .scratch_limit_bytes = 16 });
+    compute.run_budget = &budget;
+    @memset(&got, -11);
+    try std.testing.expect(!try tryGqaTiledPagedPrefill(&compute, pool, block_ids, 0, &query, attention, heads, 1, head_dim, &got));
+    for (got) |actual| try std.testing.expectEqual(@as(f32, -11), actual);
 }
 
 fn gqaPagedAttentionDirectTurboQuant(

@@ -767,3 +767,45 @@ The issue checklist records implementation and evidence separately from remainin
 migration. Compatibility paths stay until their replacements satisfy correctness,
 residency, lifetime and performance checks. Physical L4/A100 qualification remains
 deferred; CPU, local Metal and Glowworm GB10 provide the available hardware tests.
+
+### Official Gemma 4 E2B QAT serving comparison
+
+The decoder and projector came from Google's E2B QAT Q4_0 GGUF revision
+`675cff42a74c774d6cb76f76d8eacb49b48c9b93`. The comparison against llama.cpp
+`b12706` used warm loopback requests, identical media files, F16 K/V, 16
+greedy output tokens and disabled prompt reuse.
+
+| Hardware and Antfly route | Text | Image | Audio | Video |
+| --- | ---: | ---: | ---: | ---: |
+| M4 Max CPU, opt-in shared suffix | 7032 / 416 | 4562 / 14917 | 1003 / 1260 | 4114 / 24000 |
+| M4 Max Metal, warm manifest | 424 / 185 | 991 / 255 | 310 / 157 | 941 / 361 |
+| Spark GB10 CUDA, standard | 1169 / 168 | 4672 / 206 | 875 / 169 | 4447 / 280 |
+| Spark GB10 CUDA, BF16 donors and replay | 885 / 169 | 607 / 206 | 286 / 164 | 603 / 281 |
+
+Cells report Antfly and llama.cpp p50 milliseconds. CPU used eight measured
+samples per engine and modality. Metal and standard CUDA used 24. The CUDA
+replay comparison used 12 samples per engine in ABBA order. Spark had other
+resident CUDA contexts. Both engines used 514 text prompt tokens and 79 audio
+prompt tokens. The image and video serving routes produced different
+projected token counts. The video fixture used a silent H.264 clip.
+
+On Native CPU, a four-sample trial of tiled paged prefill on top of shared
+suffix pruning reduced p50 from 4997 to 2299 ms for text, 3979 to 3111 ms for
+image, 923 to 857 ms for audio and 3453 to 2459 ms for video. All sampled
+responses matched the direct paged route.
+
+On Metal, a four-sample trial of the opt-in resident projector reduced image
+p50 from 1015 to 660 ms and video from 959 to 617 ms. Text and audio were
+effectively unchanged. The trial produced identical sampled output with and
+without the option. In semantic checks, both engines recovered the invoice
+number and amount, transcribed the audio, and named the video colors in order.
+All four semantic response strings matched llama.cpp on each backend.
+
+A separate four-sample CUDA trial using the explicit BF16 donor plan measured
+897, 620, 300 and 624 ms in the same order. The trial kept the text, image and
+video response bytes from the ordinary route. The audio response changed an
+article and retained the transcript's content. Automatic placement still
+requires the existing geometry and mirror inventory qualification. Required CUDA
+replay completed one request per modality. The explicitly required SM89 Flash
+prefill profile rejected the GB10 capability before launch. The eager gated
+token-tensor variant ran correctly and was slower across all four cases.

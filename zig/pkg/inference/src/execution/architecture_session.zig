@@ -8137,6 +8137,7 @@ fn forwardDecisionProgram(ptr: *anyopaque, cb: *const ops.ComputeBackend, alloca
 fn auxiliaryProjectorStore(self: *ArchSession) ?*tensor_store_mod.GgufStore {
     const store = switch (self.backend_type) {
         .native => self.backend_data.native.tensor_store,
+        .metal => if (comptime build_options.enable_metal) self.backend_data.metal.tensor_store else null,
         .pjrt => self.backend_data.pjrt.native.tensor_store,
         else => null,
     } orelse return null;
@@ -8144,10 +8145,14 @@ fn auxiliaryProjectorStore(self: *ArchSession) ?*tensor_store_mod.GgufStore {
 }
 
 pub fn getAuxiliaryProjectorMetadata(session: Session) ?*const gguf_mod.format.File {
+    const source = getAuxiliaryProjectorStore(session) orelse return null;
+    return &source.parsed;
+}
+
+pub fn getAuxiliaryProjectorStore(session: Session) ?*tensor_store_mod.GgufStore {
     if (session.vtable != &arch_vtable) return null;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
-    const metadata = auxiliaryProjectorStore(self) orelse return null;
-    return &metadata.parsed;
+    return auxiliaryProjectorStore(self);
 }
 
 fn resolveArchModelProgram(ptr: *anyopaque, stage: @import("model_frontend.zig").Stage) anyerror!?@import("capture.zig").Forward {

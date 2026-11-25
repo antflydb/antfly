@@ -1718,7 +1718,14 @@ pub const Runtime = struct {
         const physical = try proof.artifacts().constructionPath(path);
         defer self.allocator.free(physical);
         try proof.artifacts().verifyPath(physical);
-        const store = try gemma4_projector.ProjectorStore.open(self.allocator, physical);
+        const source = if (self.session.backend() == .metal and platform.env.getenvBool("ANTFLY_INFERENCE_METAL_RESIDENT_PROJECTOR"))
+            session_factory.getAuxiliaryProjectorStore(self.session)
+        else
+            null;
+        const store = if (source != null and std.mem.eql(u8, source.?.path orelse "", physical))
+            try gemma4_projector.ProjectorStore.borrow(self.allocator, physical, source.?)
+        else
+            try gemma4_projector.ProjectorStore.open(self.allocator, physical);
         errdefer store.close();
         try proof.finish();
         self.projector_store = store;

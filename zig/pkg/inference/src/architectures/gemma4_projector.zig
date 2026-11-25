@@ -804,17 +804,16 @@ pub const ProjectorStore = struct {
     allocator: std.mem.Allocator,
     path: []u8,
     gguf: *tensor_store_mod.GgufStore,
+    owns_gguf: bool = true,
     /// Scalar clamp bounds per linear prefix, resolved on first use.
     clamp_specs: std.StringHashMapUnmanaged(ClampSpec) = .empty,
     clamp_mutex: std.atomic.Mutex = .unlocked,
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !*ProjectorStore {
-        const self = try allocator.create(ProjectorStore);
-        errdefer allocator.destroy(self);
-        const owned_path = try allocator.dupe(u8, path);
-        errdefer allocator.free(owned_path);
         const gguf = try tensor_store_mod.GgufStore.initAbsolute(allocator, path);
-        self.* = .{ .allocator = allocator, .path = owned_path, .gguf = gguf, .cache_identity = next_projector_cache_identity.fetchAdd(1, .monotonic) };
+        errdefer gguf.tensorStore().deinit();
+        const self = try borrow(allocator, path, gguf);
+        self.owns_gguf = true;
         return self;
     }
 
@@ -823,9 +822,18 @@ pub const ProjectorStore = struct {
         var it = self.clamp_specs.keyIterator();
         while (it.next()) |key| allocator.free(key.*);
         self.clamp_specs.deinit(allocator);
-        self.gguf.tensorStore().deinit();
+        if (self.owns_gguf) self.gguf.tensorStore().deinit();
         allocator.free(self.path);
         allocator.destroy(self);
+    }
+
+    /// The containing session retains this verified source until after close.
+    pub fn borrow(allocator: std.mem.Allocator, path: []const u8, source: *tensor_store_mod.GgufStore) !*ProjectorStore {
+        const self = try allocator.create(ProjectorStore);
+        errdefer allocator.destroy(self);
+        const owned_path = try allocator.dupe(u8, path);
+        self.* = .{ .allocator = allocator, .path = owned_path, .gguf = source, .owns_gguf = false, .cache_identity = next_projector_cache_identity.fetchAdd(1, .monotonic) };
+        return self;
     }
 
     /// Cached scalar clamp bounds for `prefix`; null when the bounds are not
@@ -868,6 +876,12 @@ const ProjectorWeights = struct {
     }
 
     fn residentWeight(self: *const ProjectorWeights, name: []const u8) !CT {
+        if (@import("build_options").enable_metal and self.cb.kind() == .metal and platform.env.getenvBool("ANTFLY_INFERENCE_METAL_RESIDENT_PROJECTOR")) {
+            if (self.gguf) |projector_source| {
+                const metal = @import("../ops/metal_compute.zig").MetalCompute;
+                return (try metal.borrowProjectorWeight(self.cb, projector_source, name)) orelse error.MissingWeight;
+            }
+        }
         var buffer: [256]u8 = undefined;
         return self.cb.getWeight(if (self.huggingface and self.cb.kind() == .cuda) try hf_weights.resolve(&buffer, name) else name);
     }
@@ -897,6 +911,12 @@ const ProjectorWeights = struct {
 
     fn weightCt(self: *ProjectorWeights, tensor_name: []const u8) !CT {
         if (self.require_resident_weights) return self.cb.getWeight(tensor_name);
+        if (self.owner) |owner| {
+            if (@import("build_options").enable_metal and self.cb.kind() == .metal and !owner.owns_gguf) {
+                const metal = @import("../ops/metal_compute.zig").MetalCompute;
+                if (try metal.borrowProjectorWeight(self.cb, owner.gguf, tensor_name)) |weight| return weight;
+            }
+        }
         if (try self.cudaCachedWeight(tensor_name, null)) |weight| return weight;
         if (self.gguf) |gguf| {
             var buffer: [256]u8 = undefined;

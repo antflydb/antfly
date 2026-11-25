@@ -1324,12 +1324,21 @@ pub fn prepare(
             // by their own names they load lazily on first use and stay
             // resident like any other weight, so a media request no longer
             // reads and dequantizes the encoder from disk.
-            if (try tensor_store_mod.projectorAudioTensorNames(tensor_store.?, allocator)) |projector_names| {
-                defer allocator.free(projector_names);
-                for (projector_names) |name| {
+            const resident_projector = backend_type == .metal and arch_config == .gpt and
+                arch_config.gpt.usesGemma4Channels() and platform.env.getenvBool("ANTFLY_INFERENCE_METAL_RESIDENT_PROJECTOR");
+            const projector_names = if (resident_projector)
+                try tensor_store.?.auxiliaryTensorNames(allocator)
+            else
+                try tensor_store_mod.projectorAudioTensorNames(tensor_store.?, allocator);
+            if (projector_names) |names| {
+                defer allocator.free(names);
+                for (names) |name| {
                     if (lazy_weights.contains(name)) continue;
-                    const tensor_ref = try tensor_store.?.describeTensor(allocator, name);
-                    try lazy_weights.put(allocator, try allocator.dupe(u8, name), .{
+                    var tensor_ref = try tensor_store.?.describeTensor(allocator, name);
+                    errdefer tensor_ref.deinit(allocator);
+                    const owned_name = try allocator.dupe(u8, name);
+                    errdefer allocator.free(owned_name);
+                    try lazy_weights.put(allocator, owned_name, .{
                         .tensor_ref = tensor_ref,
                         .placement = runtime.tier.planner.planForContext(plan_context, name, tensor_ref.byte_len),
                     });

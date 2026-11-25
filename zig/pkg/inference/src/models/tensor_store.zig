@@ -230,6 +230,12 @@ pub const TensorStore = struct {
         return owner.projector;
     }
 
+    pub fn resolvesAuxiliaryTensor(self: TensorStore, source: *const GgufStore, name: []const u8) bool {
+        if (self.vtable != &CompositeProjectorStore.vtable) return false;
+        const owner: *CompositeProjectorStore = @ptrCast(@alignCast(self.ptr));
+        return owner.projector == source and owner.hasProjectorTensor(name);
+    }
+
     pub fn kind(self: TensorStore) StoreKind {
         return self.vtable.kind(self.ptr);
     }
