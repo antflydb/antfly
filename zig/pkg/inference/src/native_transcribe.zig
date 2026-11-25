@@ -358,6 +358,36 @@ test "Whisper Small Metal checkpoint runs assigned packed prefill" {
     const Adapter = @import("execution/architecture_session.zig").IncrementalDecoderAdapter;
     const control = @import("execution_control.zig").InferenceExecutionControl{ .io = std.testing.io, .native_call_policy = .in_process };
     const tokens = [_]i64{ cfg.decoder_start_token_id, 50259, 50359, 50363 };
+    {
+        const frames = 16;
+        const mel = try a.alloc(f32, cfg.num_mel_bins * frames);
+        defer a.free(mel);
+        @memset(mel, 0);
+        var features = try backends.Tensor.initFloat32(a, "input_features", &.{ 1, @intCast(cfg.num_mel_bins), frames }, mel);
+        defer features.deinit();
+        var outputs = (try model.session.runResident(&.{features}, a)) orelse return error.MissingWhisperEncoderOutput;
+        defer outputs.deinit();
+        const receiver = Adapter.qualify(model.session, model.session) orelse return error.MissingWhisperReceiver;
+        const shape = try outputs.backend.tensorShape(outputs.outputs[0], a);
+        defer a.free(shape);
+        try std.testing.expectEqual(@as(usize, 3), shape.len);
+        var decoder = try Adapter.fromResidentPrepared(model.session, a, control, .{
+            .receiver = receiver,
+            .value = outputs.outputs[0],
+            .backend = outputs.backend,
+            .shape = .{ shape[0], shape[1], shape[2] },
+            .resources = try outputs.retainResources(a),
+        }, .{ .expected_initial_query_rows = tokens.len });
+        defer decoder.deinit();
+        const program = decoder.cache.native_program orelse return error.MissingPreparedWhisperSchedule;
+        const initial = program.initial orelse return error.MissingPreparedWhisperInitialSchedule;
+        try std.testing.expectEqual(cfg.decoder_layers, initial.schedule.selected.pool.regions.len);
+        for (initial.schedule.selected.pool.regions) |region| try std.testing.expect(region.owner.requirements.dispatch_workspace.byte_size != 0);
+        const logits = try decoder.step(&tokens);
+        defer a.free(logits);
+        try std.testing.expectEqual(cfg.vocab_size, logits.len);
+        try std.testing.expectEqual(initial.schedule.steps.len, initial.schedule.cursor);
+    }
     const expected = blk: {
         var ordinary = (try Adapter.fromHostPrepared(model.session, a, control, hidden, 8, .{})) orelse return error.MissingWhisperDecoder;
         defer ordinary.deinit();

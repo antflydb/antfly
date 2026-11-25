@@ -1050,10 +1050,11 @@ pub const PreparedDecoderWeights = struct {
         // Fused Q/K/V projection: one dispatch per layer instead of three.
         // Slots live in the backend runtime; a backend without them (or one
         // that ran out of slots) leaves the separate projections in place.
+        const retain_model_slots = cb.kind() == .metal and metalPackedPrefillEnabled();
         for (layer_weights) |*lw| {
-            const q_slot = (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = lw.q.w, .bias = lw.q.b, .in_dim = d_model, .out_dim = d_model })) orelse break;
-            const k_slot = (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = lw.k.w, .bias = lw.k.b, .in_dim = d_model, .out_dim = d_model })) orelse break;
-            const v_slot = (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = lw.v.w, .bias = lw.v.b, .in_dim = d_model, .out_dim = d_model })) orelse break;
+            const q_slot = (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = lw.q.w, .bias = lw.q.b, .in_dim = d_model, .out_dim = d_model, .retain_model_slot = retain_model_slots })) orelse break;
+            const k_slot = (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = lw.k.w, .bias = lw.k.b, .in_dim = d_model, .out_dim = d_model, .retain_model_slot = retain_model_slots })) orelse break;
+            const v_slot = (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = lw.v.w, .bias = lw.v.b, .in_dim = d_model, .out_dim = d_model, .retain_model_slot = retain_model_slots })) orelse break;
             if (q_slot == k_slot or q_slot == v_slot or k_slot == v_slot) break;
             lw.qkv_slots = .{ q_slot, k_slot, v_slot };
         }

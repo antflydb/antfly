@@ -1482,6 +1482,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         slot: usize,
         generation: u64,
         preparation_scope: u64 = 0,
+        borrowed_model_slot: bool = false,
         declaration_id: u64,
         fn capture(provider: *MetalNativeProvider, kind: metal_runtime.PreparedBindingKind, slot: usize, preparation_scope: u64) CachedPreparedSlot {
             const generation = metal_runtime.antfly_metal_prepared_binding_generation(provider.raw_decode_runtime, kind, slot);
@@ -1489,10 +1490,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return .{ .slot = slot, .generation = generation, .preparation_scope = preparation_scope, .declaration_id = provider.privateSlotDeclaration(kind, slot) };
         }
         fn ownsDeclaration(self: CachedPreparedSlot, provider: *MetalNativeProvider, kind: metal_runtime.PreparedBindingKind) bool {
+            return !self.borrowed_model_slot and self.matchesDeclaration(provider, kind);
+        }
+        fn matchesDeclaration(self: CachedPreparedSlot, provider: *MetalNativeProvider, kind: metal_runtime.PreparedBindingKind) bool {
             return self.declaration_id != 0 and self.declaration_id == provider.privateSlotDeclaration(kind, self.slot);
         }
         fn live(self: CachedPreparedSlot, provider: *MetalNativeProvider, kind: metal_runtime.PreparedBindingKind) bool {
-            return self.ownsDeclaration(provider, kind) and !metal_runtime.preparedBindingRetired(provider, kind, self.slot);
+            return self.matchesDeclaration(provider, kind) and !metal_runtime.preparedBindingRetired(provider, kind, self.slot);
         }
     };
     fn livePreparedSlot(self: *MetalCompute, comptime map_name: []const u8, kind: metal_runtime.PreparedBindingKind, key: anytype) ?CachedPreparedSlot {
@@ -5427,7 +5431,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         for (linear_keys[0..linear_count]) |key| {
             if (self.dynamic_linear_slots.fetchRemove(key)) |removed| {
-                if (removed.value.live(self.provider_impl, .linear)) metal_runtime.clearRawLinearSlot(self.provider_impl, removed.value.slot);
+                if (!removed.value.borrowed_model_slot and removed.value.live(self.provider_impl, .linear)) metal_runtime.clearRawLinearSlot(self.provider_impl, removed.value.slot);
             }
         }
 
@@ -8364,6 +8368,62 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }, if (immutable_f32 or self.require_f32_linears) .owned_shared_if_unified else .private))) return null;
         errdefer metal_runtime.clearRawLinearSlot(self.provider_impl, slot);
         try self.dynamic_linear_slots.put(self.allocator, key, CachedPreparedSlot.capture(self.provider_impl, .linear, slot, preparation_scope));
+        return slot;
+    }
+
+    /// Request aliases keep no payload ownership. The provider's model cache
+    /// owns the charge and declaration until eviction or close.
+    fn ensureModelDenseLinearSlot(self: *MetalCompute, weight: CT, bias: CT, in_dim: usize, out_dim: usize) !?usize {
+        const weight_buf = toBuf(weight);
+        const bias_buf = toBuf(bias);
+        if (!isBorrowedImmutableF32(weight_buf) or
+            !(bias_buf.canonical_zero_bias or isBorrowedImmutableF32(bias_buf))) return null;
+        const cache = if (self.data.tier_cache) |*value| value else return null;
+        const provider = self.provider_impl;
+        const key = dynamicLinearSlotKey(weight, bias, in_dim, out_dim);
+        if (self.livePreparedSlot("dynamic_linear_slots", .linear, key)) |entry| return entry.slot;
+        try self.dynamic_linear_slots.ensureUnusedCapacity(self.allocator, 1);
+        const name = weight_buf.lazy_entry.?.tensor_ref.name;
+        const sources = [2]u64{ key.weight_value.?.value, key.bias_value.?.value };
+        const slot = slot: {
+            self.data.prefetch.lock();
+            defer self.data.prefetch.unlock();
+            if (!provider.linear_slot_index_mutex.tryLock()) return null;
+            defer provider.linear_slot_index_mutex.unlock();
+            if (provider.embeddinggemma2_cache_admission) |bound| {
+                if (bound != cache) return null;
+            } else provider.embeddinggemma2_cache_admission = cache;
+            if (provider.embeddinggemma2_linear_cache.get(name)) |entry| {
+                const existing = entry.immutable_sources orelse return null;
+                if (!std.mem.eql(u64, &existing, &sources) or entry.in_dim != in_dim or entry.out_dim != out_dim or
+                    !metal_runtime.decoderRuntimeLinearSlotPrepared(provider, entry.slot, in_dim, out_dim)) return null;
+                break :slot entry.slot;
+            }
+            // Borrowed receivers may reuse a publication, while the cold
+            // model owner alone can reserve and install new persistent slots.
+            if (self.shared_provider_lease_io == null) return null;
+            const next = self.nextFreeDynamicLinearSlot() orelse return null;
+            const elements = try std.math.add(usize, try std.math.mul(usize, in_dim, out_dim), out_dim);
+            const bytes = try std.math.mul(usize, elements, @sizeOf(f32));
+            cache.reserve(.backend, bytes) catch return null;
+            var committed = false;
+            defer if (!committed) cache.noteRelease(.backend, bytes);
+            const allocator = std.heap.c_allocator;
+            const owned_name = try allocator.dupe(u8, name);
+            defer if (!committed) allocator.free(owned_name);
+            try provider.embeddinggemma2_linear_cache.ensureUnusedCapacity(allocator, 1);
+            const owner = try provider.createLinearSlotOwner(next, bytes);
+            defer if (!committed) owner.discardUnpublished();
+            defer if (!committed) metal_runtime.clearRawLinearSlot(provider, next);
+            if (!try self.prepareLinearWithF32Storage(&.{ .slot = next, .weight = weight, .bias = bias, .in_dim = in_dim, .out_dim = out_dim, .retain_dense_fallback = false }, .private)) return null;
+            provider.publishLinearCacheAssumeCapacity(owned_name, .{ .slot = next, .in_dim = in_dim, .out_dim = out_dim, .bytes = bytes, .owner = owner, .immutable_sources = sources });
+            provider.embeddinggemma2_linear_cache_bytes += bytes;
+            committed = true;
+            break :slot next;
+        };
+        var alias = CachedPreparedSlot.capture(provider, .linear, slot, 0);
+        alias.borrowed_model_slot = true;
+        self.dynamic_linear_slots.putAssumeCapacityNoClobber(key, alias);
         return slot;
     }
 
@@ -40996,13 +41056,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn decoderRuntimeEnsureLinearSlotOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeEnsureLinearSlotRequest) anyerror!?usize {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (request.bias) |bias| {
-            return self.ensureDynamicLinearSlotForPreparation(request.weight, bias, request.in_dim, request.out_dim, request.preparation_scope);
-        }
         var zero_bias_view: Buf = undefined;
         var zero_bias_shape: [1]i64 = undefined;
-        const zero_bias = try self.borrowedZeroBiasBuf(&zero_bias_view, &zero_bias_shape, request.out_dim);
-        return self.ensureDynamicLinearSlotForPreparation(request.weight, zero_bias, request.in_dim, request.out_dim, request.preparation_scope);
+        const bias = request.bias orelse try self.borrowedZeroBiasBuf(&zero_bias_view, &zero_bias_shape, request.out_dim);
+        if (request.retain_model_slot) {
+            if (try self.ensureModelDenseLinearSlot(request.weight, bias, request.in_dim, request.out_dim)) |slot| return slot;
+        }
+        return self.ensureDynamicLinearSlotForPreparation(request.weight, bias, request.in_dim, request.out_dim, request.preparation_scope);
     }
 
     fn decoderRuntimePrepareLinearOp(ctx: *anyopaque, request: *const ops.DecoderRuntimePrepareLinearRequest) anyerror!bool {

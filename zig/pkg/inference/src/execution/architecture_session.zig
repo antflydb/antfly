@@ -5837,7 +5837,7 @@ fn prepareWhisperProjectionPacks(cb: *const ops.ComputeBackend, layers: []const 
     const Metal = @import("../ops/metal_compute.zig").MetalCompute;
     const slots = try allocator.alloc([3]usize, layers.len);
     defer allocator.free(slots);
-    for (layers, slots) |layer, *group| group.* = layer.qkv_slots orelse return error.UnsupportedDenseSchedule;
+    for (layers, slots) |layer, *group| group.* = layer.qkv_slots orelse return;
     const requests = try allocator.alloc(@import("../backends/dense_projection_pack.zig").Request, layers.len);
     defer allocator.free(requests);
     const count = Metal.collectDecoderQkvPacks(cb, width, slots, requests) catch |err| switch (err) {
@@ -7328,6 +7328,23 @@ fn createPreparationBackend(raw: *anyopaque, session: Session, allocator: std.me
     return makeComputeBackend(self, allocator, null);
 }
 
+fn prepareWhisperPackedProjections(session: Session, control: ?InferenceExecutionControl) !void {
+    if (comptime !build_options.enable_metal) return;
+    if (session.backend() != .metal or !whisper_arch.metalPackedPrefillEnabled()) return;
+    const owner: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (owner.arch_config != .whisper) return;
+    const policy = session.run_admission orelse return;
+    const model = session.model_lifetime orelse return;
+    const pin = model.retainAdmissionDomain(policy.controller) orelse return;
+    defer pin.release();
+    const config = owner.arch_config.whisper;
+    var receiver = try getComputeBackendWithControl(session, owner.allocator, control);
+    defer receiver.deinit();
+    var weights = try whisper_arch.PreparedDecoderWeights.init(&receiver.backend, owner.allocator, config, false);
+    defer weights.deinit();
+    try prepareWhisperProjectionPacks(&receiver.backend, weights.weights.layers, config.d_model, owner.allocator, &pin, .{ .outside_execution = true });
+}
+
 fn prepareArchResident(ctx: *anyopaque, published: Session, control: ?InferenceExecutionControl) !void {
     // Preserve the published admission/interruption contract while addressing
     // the actual model owner, rather than a transient wrapper implementation.
@@ -7336,6 +7353,7 @@ fn prepareArchResident(ctx: *anyopaque, published: Session, control: ?InferenceE
     owner_session.vtable = &arch_vtable;
     try prepareGlinerBoundaryResidentImpl(owner_session, published, control);
     try prepareLayaResidentImpl(owner_session, published, control);
+    try prepareWhisperPackedProjections(owner_session, control);
 }
 
 /// Publish architecture metadata once. Serving can combine this with format

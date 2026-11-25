@@ -757,6 +757,8 @@ pub const DecoderRuntimeEnsureLinearSlotRequest = struct {
     /// Explicit invocation scope. Zero never authorizes reuse of an unknown
     /// source across independent calls. No ambient/TLS preparation state.
     preparation_scope: u64 = 0,
+    /// Only immutable model-owned F32 projections may outlive this receiver.
+    retain_model_slot: bool = false,
     weight: CT,
     bias: ?CT,
     in_dim: usize,

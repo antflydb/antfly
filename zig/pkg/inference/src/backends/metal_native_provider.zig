@@ -38,6 +38,7 @@ const prepared_slot = @import("prepared_slot_owner.zig");
 pub const PreparedConstant = struct { tensor: MetalTensor, bytes: usize };
 pub const EmbeddingGemma2LinearCacheEntry = struct {
     owner: ?*prepared_slot.Owner = null,
+    immutable_sources: ?[2]u64 = null,
     projection_widths: [3]usize = @splat(0),
     slot: usize,
     in_dim: usize,
@@ -246,13 +247,7 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
 
     /// Caller holds this provider's linear slot index on the current thread.
     pub fn pinCachedLinearDeclarationWithIndexHeld(self: *MetalNativeProvider, slot: usize, expected: u64, payload: prepared_slot.Owner.Pin) !PrivateLinearPin {
-        var found = false;
-        var iterator = self.embeddinggemma2_linear_cache.valueIterator();
-        while (iterator.next()) |entry| if (entry.slot == slot and entry.owner == payload.owner) {
-            found = true;
-            break;
-        };
-        if (!found or !payload.valid()) return error.ForeignPreparedSlotOwner;
+        if (slot >= self.linear_slot_owners.len or self.linear_slot_owners[slot] != payload.owner or !payload.valid()) return error.ForeignPreparedSlotOwner;
         const pin = try self.pinPrivateLinearDeclaration(slot, expected);
         self.lockPrivateDeclarations();
         // Pin already excludes declaration mutation, so this pure ownership
