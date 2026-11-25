@@ -820,6 +820,9 @@ pub const Adapter = struct {
                     .antfly_provider = self.server.antfly_provider,
                     .antfly_url = config.inference.api_url,
                     .antfly_api_key = config.inference.api_key,
+                    .inference_connections = &config.connections,
+                    .attribution_principal = if (self.identity.*) |identity| identity.username else null,
+                    .attribution_metadata_json = if (self.identity.*) |identity| identity.metadata_json else "",
                 };
             }
         }

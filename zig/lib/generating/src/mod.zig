@@ -611,9 +611,11 @@ pub const GeneratorConfig = struct {
 
     pub fn validate(self: GeneratorConfig) !void {
         if (self.provider == .cloudflare) {
-            try cloudflare.identifier(self.account_id orelse return error.InvalidCloudflareConfig);
-            try cloudflare.modelId(self.model);
-            if (self.gateway_id) |id| try cloudflare.identifier(id);
+            if (std.mem.startsWith(u8, self.model, "connections/")) {
+                if (self.url.len != 0 or self.account_id != null or self.gateway_id != null or self.api_key != null) return error.InvalidCloudflareConfig;
+            } else {
+                try cloudflare.validateModelRoute(self.model, self.account_id, self.gateway_id);
+            }
         } else if (self.account_id != null or self.gateway_id != null) return error.InvalidCloudflareConfig;
         try self.provider.validate();
         if (self.provider == .chatgpt) {
@@ -627,7 +629,7 @@ pub const GeneratorConfig = struct {
                 return error.InvalidGeneratorConfig;
         } else if (self.connection_id != null) return error.InvalidGeneratorConfig;
         if (self.model.len == 0 and self.provider != .mock and self.provider != .apple) return error.InvalidGeneratorConfig;
-        if (self.url.len == 0 and self.provider != .mock and self.provider != .antfly and self.provider != .apple and self.provider != .vertex and self.provider != .gemini and self.provider != .chatgpt and self.provider != .bedrock and self.provider != .anthropic) return error.InvalidGeneratorConfig;
+        if (self.url.len == 0 and !std.mem.startsWith(u8, self.model, "connections/") and self.provider != .mock and self.provider != .antfly and self.provider != .apple and self.provider != .vertex and self.provider != .gemini and self.provider != .chatgpt and self.provider != .bedrock and self.provider != .anthropic) return error.InvalidGeneratorConfig;
         if (self.workspace_id != null and self.provider != .anthropic) return error.InvalidGeneratorConfig;
         if (self.provider == .anthropic) {
             if (self.frequency_penalty != null or self.presence_penalty != null or self.logprobs) return error.UnsupportedInferenceFeature;
@@ -749,7 +751,8 @@ pub fn stringifyChainLinkAlloc(alloc: std.mem.Allocator, link: ChainLink) ![]u8 
 
 pub fn configFromOpenApi(alloc: std.mem.Allocator, generated: openapi.GeneratorConfig) !GeneratorConfig {
     const provider = try providerFromOpenApi(generated.provider);
-    if (provider == .cloudflare) {
+    const qualified = if (generated.model) |model| std.mem.startsWith(u8, model, "connections/") else false;
+    if (provider == .cloudflare and !qualified) {
         try cloudflare.identifier(generated.account_id orelse return error.InvalidCloudflareConfig);
         try cloudflare.modelId(generated.model orelse return error.InvalidGeneratorConfig);
         if (generated.gateway_id) |id| try cloudflare.identifier(id);
@@ -757,7 +760,7 @@ pub fn configFromOpenApi(alloc: std.mem.Allocator, generated: openapi.GeneratorC
     if (provider == .chatgpt and (generated.max_tokens != null or generated.max_completion_tokens != null or generated.api_url != null)) return error.InvalidGeneratorConfig;
     if (provider == .apple and generated.model != null) return error.UnsupportedAppleGenerationOptions;
     if (generated.max_tokens != null and generated.max_completion_tokens != null) return error.InvalidGeneratorConfig;
-    const cloudflare_url = if (provider == .cloudflare) try cloudflare.baseUrl(alloc, generated.account_id, generated.url) else null;
+    const cloudflare_url = if (provider == .cloudflare and !qualified) try cloudflare.baseUrl(alloc, generated.account_id, generated.url) else null;
     defer if (cloudflare_url) |url| alloc.free(url);
     const cfg = GeneratorConfig{
         .rate_limit = generated.rate_limit,
@@ -772,6 +775,8 @@ pub fn configFromOpenApi(alloc: std.mem.Allocator, generated: openapi.GeneratorC
             url
         else if (generated.api_url) |api_url|
             api_url
+        else if (generated.model) |model|
+            if (std.mem.startsWith(u8, model, "connections/")) "" else defaultUrl(provider)
         else
             defaultUrl(provider),
         .connection_id = if (generated.connection_id) |id| id else null,

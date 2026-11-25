@@ -74,6 +74,17 @@ pub const ProviderTag = enum {
     anthropic,
     antfly,
     mock,
+    cloudflare,
+    jev,
+    elevenlabs,
+    pioneer,
+
+    pub fn supportsDiscovery(self: ProviderTag) bool {
+        return switch (self) {
+            .jev, .elevenlabs, .pioneer => false,
+            else => true,
+        };
+    }
 };
 
 pub const ListedModel = struct {
@@ -106,6 +117,7 @@ pub const ListResult = struct {
 };
 
 pub const Endpoint = struct {
+    headers: []const [2][]const u8 = &.{},
     provider: ProviderTag,
     url: []const u8 = "",
     api_key: ?[]const u8 = null,
@@ -120,6 +132,20 @@ const default_timeout_ms: u64 = 5_000;
 
 /// Query the provider's list-models API and normalize the response.
 /// The caller owns the returned result and frees it with `deinit(alloc)`.
+pub fn defaultDiscoveryURL(alloc: std.mem.Allocator, provider: ProviderTag, region: ?[]const u8) ![]const u8 {
+    return switch (provider) {
+        .openai => provider_defaults.openai_origin,
+        .openrouter => "https://openrouter.ai/api/v1",
+        .ollama => provider_defaults.ollama_origin,
+        .gemini => provider_defaults.gemini_v1beta_base,
+        .vertex => provider_defaults.vertex_v1beta1_base,
+        .anthropic => "https://api.anthropic.com",
+        .cohere => provider_defaults.cohere_origin,
+        .bedrock => try std.fmt.allocPrint(alloc, "https://bedrock.{s}.amazonaws.com", .{region orelse provider_defaults.default_aws_region}),
+        .antfly, .mock, .cloudflare, .jev, .elevenlabs, .pioneer => "",
+    };
+}
+
 pub fn listModels(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, timeout_ms: u64) !ListResult {
     const timeout = if (timeout_ms == 0) default_timeout_ms else timeout_ms;
     return switch (ep.provider) {
@@ -133,7 +159,41 @@ pub fn listModels(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, t
         .bedrock => try listBedrock(alloc, http, ep, timeout),
         .antfly => try listAntfly(alloc, http, ep, timeout),
         .mock => try mockListResult(alloc),
+        .cloudflare => try listCloudflare(alloc, http, ep, timeout),
+        .jev, .elevenlabs, .pioneer => error.UnsupportedModelDiscovery,
     };
+}
+
+pub fn cloudflareDiscoveryURL(alloc: std.mem.Allocator, account: []const u8) ![]u8 {
+    if (account.len == 0 or account.len > 64) return error.InvalidCloudflareConfig;
+    for (account) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_') return error.InvalidCloudflareConfig;
+    return std.fmt.allocPrint(alloc, "https://api.cloudflare.com/client/v4/accounts/{s}/ai/models/search", .{account});
+}
+
+fn listCloudflare(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, timeout_ms: u64) !ListResult {
+    const key = ep.api_key orelse return error.MissingCloudflareCredentials;
+    const query_url = try std.fmt.allocPrint(alloc, "{s}?per_page=100", .{ep.url});
+    defer alloc.free(query_url);
+    const body = try getBodyWithBearerAlloc(alloc, http, query_url, key, ep.headers, timeout_ms);
+    defer alloc.free(body);
+    const Response = struct {
+        success: bool,
+        result: []const struct {
+            name: []const u8,
+            task: ?struct { name: []const u8 } = null,
+        },
+    };
+    var parsed = try std.json.parseFromSlice(Response, alloc, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    if (!parsed.value.success) return error.CloudflareModelDiscoveryFailed;
+    var builder = ResultBuilder.init(alloc);
+    errdefer builder.deinit();
+    for (parsed.value.result) |entry| {
+        const task = if (entry.task) |value| value.name else "";
+        const kind: ModelKind = if (std.ascii.eqlIgnoreCase(task, "Text Embeddings")) .embedder else if (std.ascii.eqlIgnoreCase(task, "Text Generation")) .generator else if (std.ascii.eqlIgnoreCase(task, "Automatic Speech Recognition")) .transcriber else if (std.ascii.eqlIgnoreCase(task, "Text-to-Speech")) .synthesizer else openAiKindHeuristic(entry.name);
+        try builder.append(entry.name, null, kind, null);
+    }
+    return try builder.toOwned();
 }
 
 fn listOpenAi(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, timeout_ms: u64, default_base: []const u8) !ListResult {
@@ -142,7 +202,7 @@ fn listOpenAi(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, timeo
     defer alloc.free(base);
     const url = try std.fmt.allocPrint(alloc, "{s}/models", .{base});
     defer alloc.free(url);
-    const body = try getBodyWithBearerAlloc(alloc, http, url, ep.api_key, timeout_ms);
+    const body = try getBodyWithBearerAlloc(alloc, http, url, ep.api_key, ep.headers, timeout_ms);
     defer alloc.free(body);
     return try parseOpenAiModels(alloc, body);
 }
@@ -152,7 +212,7 @@ fn listOllama(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, timeo
     if (std.mem.endsWith(u8, base, "/v1")) base = base[0 .. base.len - "/v1".len];
     const url = try std.fmt.allocPrint(alloc, "{s}/api/tags", .{base});
     defer alloc.free(url);
-    const body = try getBodyAlloc(alloc, http, url, null, timeout_ms);
+    const body = try getBodyAlloc(alloc, http, url, ep.headers, timeout_ms);
     defer alloc.free(body);
     return try parseOllamaTags(alloc, body);
 }
@@ -162,7 +222,7 @@ fn listGemini(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, timeo
     const url = try std.fmt.allocPrint(alloc, "{s}/models?pageSize=200", .{base});
     defer alloc.free(url);
     const headers = [_][2][]const u8{.{ "x-goog-api-key", ep.api_key orelse "" }};
-    const body = try getBodyAlloc(alloc, http, url, &headers, timeout_ms);
+    const body = try getBodyWithHeadersAlloc(alloc, http, url, &headers, ep.headers, timeout_ms);
     defer alloc.free(body);
     return try parseGeminiModels(alloc, body);
 }
@@ -179,10 +239,13 @@ fn listVertex(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, timeo
     const location = if (ep.location.len > 0) ep.location else provider_defaults.default_google_location;
     const url = try std.fmt.allocPrint(alloc, "{s}/projects/{s}/locations/{s}/publishers/google/models?pageSize=100", .{ base, project_id, location });
     defer alloc.free(url);
-    const auth = try vertex.mintAuthorizationValueAllocWithControl(alloc, if (ep.credentials_path.len > 0) ep.credentials_path else null, control);
+    const auth = if (ep.api_key) |token|
+        try std.fmt.allocPrint(alloc, "Bearer {s}", .{token})
+    else
+        try vertex.mintAuthorizationValueAllocWithControl(alloc, if (ep.credentials_path.len > 0) ep.credentials_path else null, control);
     defer alloc.free(auth);
     const headers = [_][2][]const u8{.{ "Authorization", auth }};
-    const body = try getBodyAlloc(alloc, http, url, &headers, (try control.remainingTimeoutMs()) orelse timeout_ms);
+    const body = try getBodyWithHeadersAlloc(alloc, http, url, &headers, ep.headers, (try control.remainingTimeoutMs()) orelse timeout_ms);
     defer alloc.free(body);
     return try parseVertexPublisherModels(alloc, body);
 }
@@ -198,7 +261,8 @@ fn listAnthropic(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, ti
         .{ "anthropic-version", provider_defaults.anthropic_api_version },
         .{ "anthropic-workspace-id", ep.workspace_id },
     };
-    const body = try getBodyAlloc(alloc, http, url, headers[0..if (ep.workspace_id.len > 0) @as(usize, 3) else 2], timeout_ms);
+    const protocol_headers = headers[0..if (ep.workspace_id.len > 0) @as(usize, 3) else 2];
+    const body = try getBodyWithHeadersAlloc(alloc, http, url, protocol_headers, ep.headers, timeout_ms);
     defer alloc.free(body);
     return try parseAnthropicModels(alloc, body);
 }
@@ -209,14 +273,14 @@ fn listCohere(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, timeo
     defer alloc.free(base);
     const url = try std.fmt.allocPrint(alloc, "{s}/models?page_size=100", .{base});
     defer alloc.free(url);
-    const body = try getBodyWithBearerAlloc(alloc, http, url, ep.api_key, timeout_ms);
+    const body = try getBodyWithBearerAlloc(alloc, http, url, ep.api_key, ep.headers, timeout_ms);
     defer alloc.free(body);
     return try parseCohereModels(alloc, body);
 }
 
 fn listBedrock(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, timeout_ms: u64) !ListResult {
     const region = if (ep.region.len > 0) ep.region else provider_defaults.default_aws_region;
-    const body = try bedrock.listFoundationModelsBodyAlloc(alloc, http, region, if (ep.url.len > 0) ep.url else null, timeout_ms);
+    const body = try bedrock.listFoundationModelsBodyAllocWithHeaders(alloc, http, region, if (ep.url.len > 0) ep.url else null, timeout_ms, ep.api_key, ep.headers);
     defer alloc.free(body);
     return try parseBedrockFoundationModels(alloc, body);
 }
@@ -226,7 +290,7 @@ fn listAntfly(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, timeo
     defer alloc.free(base);
     const url = try std.fmt.allocPrint(alloc, "{s}/models", .{base});
     defer alloc.free(url);
-    const body = try getBodyWithBearerAlloc(alloc, http, url, ep.api_key, timeout_ms);
+    const body = try getBodyWithBearerAlloc(alloc, http, url, ep.api_key, ep.headers, timeout_ms);
     defer alloc.free(body);
     return try parseAntflyModels(alloc, body);
 }
@@ -241,13 +305,20 @@ fn mockListResult(alloc: std.mem.Allocator) !ListResult {
     return try builder.toOwned();
 }
 
-fn getBodyWithBearerAlloc(alloc: std.mem.Allocator, http: *httpx.Client, url: []const u8, api_key: ?[]const u8, timeout_ms: u64) ![]u8 {
+fn getBodyWithBearerAlloc(alloc: std.mem.Allocator, http: *httpx.Client, url: []const u8, api_key: ?[]const u8, custom_headers: []const [2][]const u8, timeout_ms: u64) ![]u8 {
     const key = api_key orelse "";
-    if (key.len == 0) return try getBodyAlloc(alloc, http, url, null, timeout_ms);
+    if (key.len == 0) return try getBodyAlloc(alloc, http, url, custom_headers, timeout_ms);
     const auth = try std.fmt.allocPrint(alloc, "Bearer {s}", .{key});
     defer alloc.free(auth);
-    const headers = [_][2][]const u8{.{ "Authorization", auth }};
-    return try getBodyAlloc(alloc, http, url, &headers, timeout_ms);
+    const authorization = [_][2][]const u8{.{ "Authorization", auth }};
+    return getBodyWithHeadersAlloc(alloc, http, url, &authorization, custom_headers, timeout_ms);
+}
+
+fn getBodyWithHeadersAlloc(alloc: std.mem.Allocator, http: *httpx.Client, url: []const u8, protocol_headers: []const [2][]const u8, custom_headers: []const [2][]const u8, timeout_ms: u64) ![]u8 {
+    if (custom_headers.len == 0) return getBodyAlloc(alloc, http, url, protocol_headers, timeout_ms);
+    const headers = try std.mem.concat(alloc, [2][]const u8, &.{ protocol_headers, custom_headers });
+    defer alloc.free(headers);
+    return try getBodyAlloc(alloc, http, url, headers, timeout_ms);
 }
 
 fn getBodyAlloc(alloc: std.mem.Allocator, http: *httpx.Client, url: []const u8, headers: ?[]const [2][]const u8, timeout_ms: u64) ![]u8 {
@@ -786,6 +857,44 @@ test "parse antfly metadata remains valid across every allocation failure" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "Cloudflare model discovery authenticates the configured search endpoint" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const expected_url = try cloudflareDiscoveryURL(a, "account");
+    defer a.free(expected_url);
+    try std.testing.expectEqualStrings("https://api.cloudflare.com/client/v4/accounts/account/ai/models/search", expected_url);
+    const Check = struct {
+        fn request(info: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("per_page=100", info.query);
+            try std.testing.expectEqualStrings("Bearer fixture", info.header("Authorization") orelse return error.MissingFixtureAuthorization);
+            try std.testing.expectEqualStrings("catalog", info.header("X-Billing-Team") orelse return error.MissingFixtureAttribution);
+        }
+    };
+    var server = try httpx.TestServer.start(a, io, &.{.{
+        .method = .GET,
+        .path = "/catalog",
+        .assert_request = Check.request,
+        .respond = .{ .body = "{\"success\":true,\"result\":[{\"name\":\"@cf/example/model\",\"task\":{\"name\":\"Text Embeddings\"}}]}" },
+    }});
+    defer server.deinit();
+    var serving = try io.concurrent(httpx.TestServer.handleOne, .{&server});
+    defer serving.cancel(io) catch {};
+    const url = try server.url("/catalog");
+    defer a.free(url);
+    var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var found = try listModels(a, &client, .{
+        .provider = .cloudflare,
+        .url = url,
+        .api_key = "fixture",
+        .headers = &.{.{ "X-Billing-Team", "catalog" }},
+    }, 2_000);
+    defer found.deinit(a);
+    try serving.await(io);
+    try std.testing.expectEqual(@as(usize, 1), found.models.len);
+    try std.testing.expectEqual(ModelKind.embedder, found.models[0].kind);
 }
 
 test "mock provider lists static models" {

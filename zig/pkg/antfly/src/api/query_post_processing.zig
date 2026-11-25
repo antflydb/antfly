@@ -105,6 +105,42 @@ pub fn applyGraphPostProcessing(
         try @import("antfly_local_sources").functions_query_eval.apply(alloc, req, result, meta, runtime_cfg);
 }
 
+fn resolveQueryReranker(
+    arena: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+    cfg: *reranking_runtime.Config,
+) !?local.inference_connection_runtime.ResolvedInferenceConnection {
+    const reference = (try local.common_config.InferenceModelReference.parse(cfg.model)) orelse return null;
+    const binding = req.inference_binding orelse return error.ConnectionNotFound;
+    const connection = try local.common_config.resolveInferenceConnection(
+        binding.connections,
+        reference.connection,
+        "models.rerank",
+    );
+    if (!std.mem.eql(u8, connection.provider, @tagName(cfg.provider))) return error.InvalidRerankerConfig;
+    if (cfg.url.len != 0 or cfg.api_key != null or cfg.account_id != null or
+        cfg.gateway_id != null or cfg.project_id.len != 0 or cfg.credentials_path.len != 0)
+        return error.InvalidRerankerConfig;
+
+    cfg.model = reference.model;
+    cfg.api_key = connection.api_key;
+    cfg.account_id = connection.account_id;
+    cfg.gateway_id = connection.gateway_id;
+    cfg.project_id = connection.project_id orelse "";
+    cfg.credentials_path = connection.credentials_path orelse "";
+    cfg.url = if (connection.url) |url| url else switch (cfg.provider) {
+        .antfly => return error.InvalidRerankerConfig,
+        .cloudflare => try @import("antfly_reranking").cloudflare.nativeUrl(
+            arena,
+            cfg.account_id orelse return error.InvalidRerankerConfig,
+            cfg.model,
+        ),
+        .cohere, .vertex => cfg.defaultedUrl(),
+    };
+    try cfg.validate();
+    return .{ .reference = reference, .config = connection };
+}
+
 pub fn applyReranker(
     alloc: std.mem.Allocator,
     req: db_mod.types.SearchRequest,
@@ -112,7 +148,13 @@ pub fn applyReranker(
     meta: *query_api.QueryResponseMeta,
     runtime_cfg: ManagedReadRuntimeConfig,
 ) !usize {
-    const cfg = req.reranker orelse return 0;
+    var cfg = req.reranker orelse return 0;
+    var policy_arena = std.heap.ArenaAllocator.init(alloc);
+    defer policy_arena.deinit();
+    const connection = resolveQueryReranker(policy_arena.allocator(), req, &cfg) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidQueryRequest,
+    };
     if (req.reranker_query_text.len == 0) return error.UnsupportedQueryRequest;
     try checkQueryDeadline(req);
 
@@ -135,7 +177,16 @@ pub fn applyReranker(
 
     var fallback_http: ?httpx.Client = null;
     defer if (fallback_http) |*http| http.deinit();
-    const http = if (runtime_cfg.reranker_runtime) |runtime|
+    const http = if (connection) |resolved| blk: {
+        const binding = req.inference_binding.?;
+        fallback_http = try local.inference_connection_runtime.client(policy_arena.allocator(), alloc, io, resolved, cfg.url, "rerank", .{
+            .principal = binding.principal,
+            .metadata_json = binding.metadata_json,
+            .secret_store = runtime_cfg.secret_store,
+            .max_response_bytes = 4 << 20,
+        });
+        break :blk &fallback_http.?;
+    } else if (runtime_cfg.reranker_runtime) |runtime|
         &runtime.http
     else blk: {
         fallback_http = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
@@ -169,13 +220,14 @@ pub fn applyReranker(
     const content = try documents.content();
 
     const dependencies: reranking_runtime.Options = .{
-        .antfly_provider = runtime_cfg.antfly_provider,
+        .antfly_provider = if (connection == null) runtime_cfg.antfly_provider else null,
         .secret_store = runtime_cfg.secret_store,
-        .inference_api_key = runtime_cfg.inference_api_key,
-        .capability_cache = runtime_cfg.remote_capability_cache,
+        .inference_api_key = if (connection == null) runtime_cfg.inference_api_key else null,
+        .capability_cache = if (connection == null) runtime_cfg.remote_capability_cache else null,
+        .runtime = runtime_cfg.reranker_runtime,
         .execution = execution_context.Context{
-            .default_endpoint = runtime_cfg.inference_api_url,
-            .capability_cache = runtime_cfg.remote_capability_cache,
+            .default_endpoint = if (connection == null) runtime_cfg.inference_api_url else null,
+            .capability_cache = if (connection == null) runtime_cfg.remote_capability_cache else null,
             .io = io,
             .routing = .{ .source_table = runtime_cfg.source_table },
             .deadline_ns = req.execution_deadline_ns,
@@ -183,17 +235,7 @@ pub fn applyReranker(
         },
         .execution_context = inference_context,
     };
-    const scores = if (runtime_cfg.reranker_runtime) |runtime|
-        runtime.rerankContentAdmitted(alloc, cfg, dependencies, req.reranker_query_text, content)
-    else
-        reranking_runtime.rerankContentWithOptions(
-            alloc,
-            http,
-            cfg,
-            dependencies,
-            req.reranker_query_text,
-            content,
-        );
+    const scores = reranking_runtime.rerankContentWithOptions(alloc, http, cfg, dependencies, req.reranker_query_text, content);
     const owned_scores = scores catch |err| switch (err) {
         error.InvalidRateLimitPolicy,
         error.ConflictingRateLimitPolicy,

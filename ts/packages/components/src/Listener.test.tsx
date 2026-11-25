@@ -411,38 +411,48 @@ describe("Listener", () => {
         ],
       });
 
-      const { container } = render(
-        <TestWrapper>
-          <QueryBox id="main" mode="live" />
-          <Results
-            id="results-sem"
-            searchBoxId="main"
-            semanticIndexes={["main_semantic_index"]}
-            limit={20}
-            items={() => <div />}
-          />
-        </TestWrapper>
-      );
+      try {
+        const { container } = render(
+          <TestWrapper>
+            <QueryBox id="main" mode="live" />
+            <Results
+              id="results-sem"
+              searchBoxId="main"
+              semanticIndexes={["main_semantic_index"]}
+              limit={20}
+              items={() => <div />}
+            />
+          </TestWrapper>
+        );
 
-      const input = container.querySelector("input") as HTMLInputElement;
-      expect(input).toBeTruthy();
+        const input = container.querySelector("input") as HTMLInputElement;
+        expect(input).toBeTruthy();
 
-      await userEvent.type(input, "what's");
+        // Ensure a partial query has fired before typing the final characters.
+        await userEvent.type(input, "what");
+        await waitFor(() => {
+          const queries = msearchSpy.mock.calls.flatMap((call) => call[1] || []);
+          expect(queries).toContainEqual(
+            expect.objectContaining({
+              query: expect.objectContaining({ semantic_search: "what" }),
+            })
+          );
+        });
+        await userEvent.type(input, "'s");
 
-      await waitFor(() => {
-        expect(msearchSpy).toHaveBeenCalled();
-      });
+        await waitFor(() => {
+          const queries = msearchSpy.mock.calls.flatMap((call) => call[1] || []);
+          const semanticQuery = queries.find(
+            (request: { query?: { semantic_search?: string; indexes?: string[] } }) =>
+              request.query?.semantic_search === "what's"
+          );
 
-      const queries = msearchSpy.mock.calls.flatMap((call) => call[1] || []);
-      const semanticQuery = queries.find(
-        (request: { query?: { semantic_search?: string; indexes?: string[] } }) =>
-          request.query?.semantic_search === "what's"
-      );
-
-      expect(semanticQuery?.query?.indexes).toEqual(["main_semantic_index"]);
-      expect(semanticQuery?.query).not.toHaveProperty("full_text_search");
-
-      msearchSpy.mockRestore();
+          expect(semanticQuery?.query?.indexes).toEqual(["main_semantic_index"]);
+          expect(semanticQuery?.query).not.toHaveProperty("full_text_search");
+        });
+      } finally {
+        msearchSpy.mockRestore();
+      }
     });
 
     it("should refetch autosuggest queries when autosuggest configuration changes", async () => {

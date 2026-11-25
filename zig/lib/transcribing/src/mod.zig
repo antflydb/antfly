@@ -74,7 +74,18 @@ pub const Config = struct {
     download_assets: bool = false,
 
     pub fn validate(self: Config) !void {
-        if (self.provider == .cloudflare) {
+        return self.validateConfig(false);
+    }
+
+    pub fn validateForRegistry(self: Config) !void {
+        return self.validateConfig(true);
+    }
+
+    fn validateConfig(self: Config, allow_connection_reference: bool) !void {
+        const qualified = allow_connection_reference and std.mem.startsWith(u8, (self.model orelse ""), "connections/");
+        if (qualified and self.provider == .cloudflare) {
+            if (self.account_id != null or self.gateway_id != null) return error.InvalidCloudflareConfig;
+        } else if (self.provider == .cloudflare) {
             try cloudflare.identifier(self.account_id orelse return error.InvalidCloudflareConfig);
             try cloudflare.modelId(self.model orelse return error.UnsupportedCloudflareModel);
             if (self.gateway_id) |id| try cloudflare.identifier(id);
@@ -344,7 +355,7 @@ pub const Registry = struct {
     }
 
     pub fn registerConfig(self: *Registry, name: []const u8, cfg: Config) !void {
-        try cfg.validate();
+        try cfg.validateForRegistry();
         const key = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(key);
         const owned = try cloneConfig(self.allocator, cfg);

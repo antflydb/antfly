@@ -107,6 +107,8 @@ const (
 type OpenOptions struct {
 	// ModelsDir selects models used by database enrichments. Empty uses default.
 	ModelsDir string
+	// InferenceConnectionsJSON is an operator-owned map of managed inference connections.
+	InferenceConnectionsJSON []byte
 	// Storage selects a .aflite file (the default) or a directory. Directory
 	// storage is created by opening a missing path; CreateWithOptions only
 	// creates .aflite files.
@@ -432,6 +434,11 @@ func openWithOptions(path string, opts OpenOptions, create bool) (*DB, error) {
 		directory := C.CBytes([]byte(opts.ModelsDir))
 		defer C.free(directory)
 		cOpts.models_dir = C.antfly_slice{ptr: (*C.uint8_t)(directory), len: C.size_t(len(opts.ModelsDir))}
+	}
+	if len(opts.InferenceConnectionsJSON) != 0 {
+		connections := C.CBytes(opts.InferenceConnectionsJSON)
+		defer C.free(connections)
+		cOpts.inference_connections_json = C.antfly_slice{ptr: (*C.uint8_t)(connections), len: C.size_t(len(opts.InferenceConnectionsJSON))}
 	}
 	cOpts.inference_host_budget_mb = C.uint32_t(opts.HostBudgetMB)
 	cOpts.inference_backend_budget_mb = C.uint32_t(opts.BackendBudgetMB)

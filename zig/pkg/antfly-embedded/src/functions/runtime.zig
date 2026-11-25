@@ -98,6 +98,9 @@ fn fatalItemFailure(err: anyerror) bool {
     return err == error.OutOfMemory or err == error.Cancelled or err == error.Canceled or err == error.Timeout;
 }
 
+const inference_config = @import("../common/config.zig");
+const connection_runtime = @import("../generating/connection_runtime.zig");
+
 pub const Runtime = struct {
     registry: *const registry_mod.Registry,
     resolution_allocator: std.mem.Allocator = std.heap.smp_allocator,
@@ -117,6 +120,10 @@ pub const Runtime = struct {
     antfly_url: ?[]const u8 = null,
     antfly_api_key: ?[]const u8 = null,
     source_table: []const u8 = "",
+    inference_connections: ?*const inference_config.Config.ConnectionsConfig = null,
+    attribution_principal: ?[]const u8 = null,
+    attribution_metadata_json: []const u8 = "",
+    enable_index_attribution: bool = false,
     rows: u64 = 0,
     reserved_rows: u64 = 0,
     input_tokens: u64 = 0,
@@ -134,6 +141,7 @@ pub const Runtime = struct {
     const ResolvedGenerator = struct {
         arena: std.heap.ArenaAllocator,
         cache: remote_capabilities.Cache,
+        http: ?httpx.Client,
         name: []const u8,
         source_table: []const u8,
         media: ?bool,
@@ -150,6 +158,7 @@ pub const Runtime = struct {
         self.stage_budgets = .empty;
         for (self.resolved_generators.items) |entry| {
             entry.cache.deinit();
+            if (entry.http) |*client| client.deinit();
             entry.arena.deinit();
             self.resolution_allocator.destroy(entry);
         }
@@ -175,6 +184,7 @@ pub const Runtime = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
         var generator = try configured.clone(a);
+        const connection = try connection_runtime.resolveGenerator(self.inference_connections, a, &generator, .decide);
         if (generator.provider == .antfly and generator.url.len == 0) {
             generator.url = try a.dupe(u8, self.antfly_url orelse "");
             if (generator.url.len > 0 and generator.api_key == null) {
@@ -185,7 +195,16 @@ pub const Runtime = struct {
         errdefer self.resolution_allocator.destroy(entry);
         entry.cache = remote_capabilities.Cache.init(self.resolution_allocator, self.io);
         errdefer entry.cache.deinit();
+        entry.http = if (connection) |resolved| try connection_runtime.client(a, self.resolution_allocator, self.io, resolved, generator.url, "decide", .{
+            .principal = self.attribution_principal,
+            .metadata_json = self.attribution_metadata_json,
+            .workload = if (self.enable_index_attribution) .{ .operation = .index_decide, .physical_table = self.source_table } else null,
+            .secret_store = self.secret_store,
+            .max_response_bytes = max_response_bytes,
+        }) else null;
+        errdefer if (entry.http) |*client| client.deinit();
         var engine = self.constrainedRuntime(&entry.cache);
+        if (entry.http) |*client| engine.http = client;
         engine.options.source_table = source_table;
         engine.options.execution.routing.source_table = source_table;
         const caps = if (media) |has_media|
@@ -349,6 +368,7 @@ pub const Runtime = struct {
         const media = batchHasImages(requests);
         const resolved = try self.resolveGenerator(requests[0].decider, source_table, media);
         var engine = self.constrainedRuntime(&resolved.cache);
+        if (resolved.http) |*client| engine.http = client;
         engine.capability_snapshot = resolved.capabilities;
         engine.required_media = media;
         engine.require_execution_lease = resolved.generator.capability_token != null;
@@ -411,6 +431,31 @@ pub const Runtime = struct {
             self.responses[id] = try generated.responseValue(a, self.cfg, self.requests[id].questions, value, proof, id, 0, 0);
         }
     };
+    fn routeTypedDecision(self: *Runtime, a: std.mem.Allocator, cfg: *decisions.DeciderConfig) !?httpx.Client {
+        const reference = (try inference_config.InferenceModelReference.parse(cfg.model)) orelse return null;
+        try cfg.validate();
+        const connections = self.inference_connections orelse return error.ConnectionNotFound;
+        const connection = try inference_config.resolveInferenceConnection(connections, reference.connection, "models.decide");
+        if (!std.mem.eql(u8, connection.provider, @tagName(cfg.provider))) return error.ModelTaskMismatch;
+        cfg.model = reference.model;
+        cfg.account_id = connection.account_id;
+        cfg.gateway_id = connection.gateway_id;
+        cfg.api_key = connection.api_key;
+        cfg.url = connection.url orelse switch (cfg.provider) {
+            .antfly => return error.ConnectionURLMissing,
+            .cloudflare => try @import("antfly_decisions").cloudflare.endpoint(a, cfg.account_id orelse return error.InvalidDeciderConfig, cfg.model),
+            .openai, .jev => cfg.baseUrl(),
+        };
+        try cfg.validate();
+        return try connection_runtime.client(a, a, self.io, .{ .reference = reference, .config = connection }, cfg.url, "decide", .{
+            .principal = self.attribution_principal,
+            .metadata_json = self.attribution_metadata_json,
+            .workload = if (self.enable_index_attribution) .{ .operation = .index_decide, .physical_table = self.source_table } else null,
+            .secret_store = self.secret_store,
+            .max_response_bytes = max_response_bytes,
+        });
+    }
+
     const Job = struct {
         runtime: *Runtime,
         request: decisions.Request,
@@ -438,7 +483,7 @@ pub const Runtime = struct {
         fn invoke(self: *Job) !decisions.Json {
             try checkpoint(self.runtime);
             const a = self.arena.allocator();
-            const cfg = self.cfg;
+            var cfg = self.cfg;
             if (cfg.decision_method == .generated) {
                 const result = try self.runtime.generateBatchPartial(a, cfg, &.{self.request}, cfg.max_input_tokens -| self.runtime.input_tokens);
                 self.usage = .{ .input_tokens = result.input_tokens, .output_tokens = result.output_tokens };
@@ -449,6 +494,9 @@ pub const Runtime = struct {
                 self.usage = .{ .input_tokens = result.input_tokens };
                 return result.values[0] orelse return result.failures[0] orelse error.InvalidDecisionOutput;
             }
+            var scoped_http = try self.runtime.routeTypedDecision(a, &cfg);
+            defer if (scoped_http) |*client| client.deinit();
+            const http = if (scoped_http) |*client| client else self.runtime.http;
             const payload = try requestPayload(a, self.runtime.io, cfg, self.request);
             const body = payload.body;
             const base = if (cfg.provider == .antfly and cfg.url.len == 0) if (self.runtime.antfly_url) |endpoint| try @import("../common/inference_gateway.zig").apiBaseAlloc(a, endpoint) else cfg.baseUrl() else cfg.baseUrl();
@@ -458,13 +506,16 @@ pub const Runtime = struct {
                 .openai => "/decisions",
                 .cloudflare => unreachable,
             } });
-            var key_source = try secrets.SecretValue.initConfigOrEnv(a, cfg.api_key orelse (if (cfg.provider == .antfly and cfg.url.len == 0) self.runtime.antfly_api_key else null), switch (cfg.provider) {
-                .antfly => "ANTFLY_INFERENCE_API_KEY",
-                .jev => "TYPESAFE_API_KEY",
-                .openai => "OPENAI_API_KEY",
-                .cloudflare => "CLOUDFLARE_API_TOKEN",
-            });
-            defer key_source.deinit(a);
+            var key_source: ?secrets.SecretValue = if (scoped_http != null)
+                try secrets.SecretValue.initConfig(a, cfg.api_key)
+            else
+                try secrets.SecretValue.initConfigOrEnv(a, cfg.api_key orelse (if (cfg.provider == .antfly and cfg.url.len == 0) self.runtime.antfly_api_key else null), switch (cfg.provider) {
+                    .antfly => "ANTFLY_INFERENCE_API_KEY",
+                    .jev => "TYPESAFE_API_KEY",
+                    .openai => "OPENAI_API_KEY",
+                    .cloudflare => "CLOUDFLARE_API_TOKEN",
+                });
+            defer if (key_source) |*source| source.deinit(a);
             var quota = try self.runtime.limits.acquire(.{ .operation = .decision, .endpoint = .{
                 .provider = std.meta.stringToEnum(quotas.Provider, @tagName(cfg.provider)).?,
                 .endpoint = if (cfg.provider == .cloudflare) url else base,
@@ -498,7 +549,7 @@ pub const Runtime = struct {
                 self.observeUsage(&reservation, parsed);
                 return parsed;
             };
-            const key = key_source.resolveOwned(a, self.runtime.secret_store) catch |err| return operationalError(err);
+            const key = if (key_source) |source| source.resolveOwned(a, self.runtime.secret_store) catch |err| return operationalError(err) else null;
             if (cfg.provider != .antfly and key == null) return error.MissingDecisionApiKey;
             const headers = try a.alloc([2][]const u8, payload.headers.len + 4);
             var count: usize = 0;
@@ -522,7 +573,7 @@ pub const Runtime = struct {
                 count += 1;
             }
             const ctx = self.runtime.context;
-            var response = self.runtime.http.post(url, .{
+            var response = http.post(url, .{
                 .body = body,
                 .max_response_size = max_response_bytes,
                 .max_retries = 0,
@@ -1246,6 +1297,62 @@ test "decision functions OpenAI HTTP routing alignment provenance budgets and er
     var cancelled = std.atomic.Value(bool).init(true);
     runtime.context = .{ .io = io, .deadline_ns = null, .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancelled) };
     try std.testing.expectError(error.Cancelled, runtime.provider().evaluateBatch(alloc, &.{.{ .input = .{ .text = "refund" }, .decider = "openai", .questions = questions }}));
+}
+
+test "decision functions resolve managed generated model attribution" {
+    const a = std.testing.allocator;
+    var config = try inference_config.Config.parseFromSlice(a,
+        \\{"connections":{"judge":{"kind":"inference","capabilities":["models.decide"],"inference":{"provider":"openai","api_key":"fixture-key","url":"https://gateway.internal/v1","allow_private_ips":false,"headers":{"X-Team":"review"},"attribution":{"header":"X-Billing","principals":{"reviewer":"staff"},"workloads":{"index_decide/records":"background"}}}}}}
+    );
+    defer config.deinit();
+    var http = httpx.Client.init(a, std.testing.io);
+    defer http.deinit();
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    try registry.registerDeciderConfig("judge", .{ .decision_method = .generated, .generator = .{ .provider = .openai, .model = "connections/judge/models/gpt-4.1", .url = "" }, .probabilities = .verdict_only });
+    var runtime = Runtime{ .registry = &registry, .http = &http, .io = std.testing.io, .inference_connections = &config.connections };
+    defer runtime.deinit();
+    try std.testing.expectError(error.InferenceAttributionDenied, runtime.resolveGenerator("judge", "", false));
+    runtime.attribution_principal = "reviewer";
+    {
+        const resolved = try runtime.resolveGenerator("judge", "", false);
+        try std.testing.expectEqualStrings("gpt-4.1", resolved.generator.model);
+        try std.testing.expectEqualStrings("https://gateway.internal/v1", resolved.generator.url);
+        try std.testing.expect(resolved.http.?.config.address_filter != null);
+        try std.testing.expectEqualStrings("review", resolved.http.?.config.default_headers.?[0][1]);
+        try std.testing.expectEqualStrings("staff", resolved.http.?.config.default_headers.?[1][1]);
+    }
+    runtime.attribution_principal = null;
+    runtime.enable_index_attribution = true;
+    runtime.source_table = "records";
+    const background = try runtime.resolveGenerator("judge", "query-table", false);
+    try std.testing.expectEqualStrings("background", background.http.?.config.default_headers.?[1][1]);
+}
+
+test "decision functions route native models through the managed decision connection" {
+    const a = std.testing.allocator;
+    var config = try inference_config.Config.parseFromSlice(a,
+        \\{"connections":{"workers":{"kind":"inference","capabilities":["models.decide"],"inference":{"provider":"cloudflare","api_key":"fixture-key","account_id":"worker-account","gateway_id":"worker-gateway","headers":{"X-Team":"review"}}}}}
+    );
+    defer config.deinit();
+    var http = httpx.Client.init(a, std.testing.io);
+    defer http.deinit();
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    var runtime = Runtime{ .registry = &registry, .http = &http, .io = std.testing.io, .inference_connections = &config.connections };
+    defer runtime.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var cfg: decisions.DeciderConfig = .{ .provider = .cloudflare, .model = "connections/workers/models/@cf/cloudflare/clef" };
+    var overridden = cfg;
+    overridden.url = "https://caller.internal";
+    try std.testing.expectError(error.InvalidDeciderConfig, runtime.routeTypedDecision(arena.allocator(), &overridden));
+    var scoped = (try runtime.routeTypedDecision(arena.allocator(), &cfg)).?;
+    defer scoped.deinit();
+    try std.testing.expectEqualStrings("@cf/cloudflare/clef", cfg.model);
+    try std.testing.expectEqualStrings("https://api.cloudflare.com/client/v4/accounts/worker-account/ai/run/@cf/cloudflare/clef", cfg.url);
+    try std.testing.expectEqualStrings("worker-gateway", cfg.gateway_id.?);
+    try std.testing.expectEqualStrings("review", scoped.config.default_headers.?[0][1]);
 }
 
 test "generating backend generated decisions batch through native constrained output" {
@@ -2390,6 +2497,31 @@ test "decision functions Cloudflare native run transport supports gateway routin
         try std.testing.expectEqual(@as(u64, 7), runtime.input_tokens);
         try std.testing.expectEqual(@as(u64, 1), runtime.rows);
     }
+}
+
+test "decision functions embedding decisions enforce managed embedder attribution" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var config = try inference_config.Config.parseFromSlice(a,
+        \\{"connections":{"private":{"kind":"inference","capabilities":["models.embed"],"inference":{"provider":"openai","url":"https://gateway.internal/v1","api_key":"fixture-key","attribution":{"header":"X-Billing","principals":{"reader":"approved"}}}}}}
+    );
+    defer config.deinit();
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    try registry.registerEmbedderConfig("dense", .{ .provider = .openai, .model = "connections/private/models/text-embedding-3-small", .dimensions = 2 });
+    try registry.registerDeciderConfig("routing", .{ .decision_method = .embedding_similarity, .embedder = "dense", .embedding_options = .{ .dimensions = 2 } });
+    var http = httpx.Client.init(a, std.testing.io);
+    defer http.deinit();
+    var runtime = Runtime{ .registry = &registry, .http = &http, .io = std.testing.io, .inference_connections = &config.connections };
+    defer runtime.deinit();
+    const questions = try std.json.parseFromSliceLeaky(decisions.Json, a,
+        \\{"route":{"type":"choice","instructions":"Choose a category","criteria":{"account":"Account","billing":"Billing"}}}
+    , .{});
+    const req = decisions.Request{ .decider = "routing", .input = .{ .text = "account" }, .questions = questions };
+    const result = try runtime.evaluatePartial(a, &.{req});
+    try std.testing.expect(result.values[0] == null);
+    try std.testing.expectEqual(error.InferenceAttributionDenied, result.failures[0].?);
 }
 
 test "decision provider embedding similarity batches and deduplicates named embedder prototypes" {

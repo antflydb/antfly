@@ -532,6 +532,11 @@ def compare_channel_tags(
     return (left_sequence > right_sequence) - (left_sequence < right_sequence)
 
 
+def embedded_publication_enabled(channel: dict[str, Any]) -> bool:
+    """Retain and publish embedded inputs for every registry-enabled stable channel."""
+    return channel["tag_kind"] == "stable" and channel["publish_npm"]
+
+
 def github_outputs(
     channel_name: str,
     channel: dict[str, Any],
@@ -539,7 +544,10 @@ def github_outputs(
     *,
     allow_legacy: bool = False,
 ) -> dict[str, str]:
-    result = {"channel": channel_name}
+    result = {
+        "channel": channel_name,
+        "publish_embedded": str(embedded_publication_enabled(channel)).lower(),
+    }
     for key, value in channel.items():
         if isinstance(value, bool):
             result[key] = str(value).lower()

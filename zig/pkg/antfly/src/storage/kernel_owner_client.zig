@@ -93,6 +93,13 @@ pub const Context = struct {
         ));
     }
 
+    /// Borrow the immutable node registry until this storage context and
+    /// all of its owners close.
+    pub fn configureInferenceConnections(self: *Context, connections: ?*const common_config.Config.ConnectionsConfig) !void {
+        try self.ensure();
+        try statusToError(abi.antfly_storage_context_configure_inference_connections(self.handle, connections));
+    }
+
     pub fn configureNativeQueries(self: *Context, setup: []const u8) !void {
         try self.ensure();
         try statusToError(abi.antfly_storage_context_configure_native_queries(self.handle, .fromSlice(setup)));

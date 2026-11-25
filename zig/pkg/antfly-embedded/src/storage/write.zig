@@ -19,6 +19,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const storage_engine = @import("engine_dispatch.zig").implementation;
 pub const scraping = if (builtin.os.tag == .freestanding) @import("db/scraping_stub.zig") else @import("antfly_scraping");
+pub const InferenceConnections = @import("../common/config.zig").Config.ConnectionsConfig;
 const common_secrets = @import("../common/secrets.zig");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const backups_api = @import("../api/backups.zig");
@@ -407,6 +408,7 @@ pub const ManagedDbOpenOptions = struct {
     /// Node-level default credential for `inference_api_url`. Managed
     /// embedders without their own `api_key` inherit it with the endpoint.
     inference_api_key: ?[]const u8 = null,
+    inference_connections: ?*const InferenceConnections = null,
     remote_capability_cache: ?*remote_capabilities.Cache = null,
     replication_write_gate: ?db_mod.ReplicationWriteGate = null,
     replication_async_effect_mirror: ?db_mod.ReplicationAsyncEffectMirror = null,
@@ -588,8 +590,9 @@ pub fn createManagedDbEnrichments(
     source_table: []const u8,
     store: ?*common_secrets.FileStore,
     remote: ?*const scraping.RemoteContentConfig,
+    inference_connections: ?*const InferenceConnections,
 ) !ManagedDbEnrichmentSet {
-    if (comptime storage_engine.enabled) return storage_engine.call("writeCreateManagedDbEnrichments", .{ allocator, raw_indexes_json, runtime, local_provider, remote_capability_cache, inference_api_url, inference_api_key, source_table, store, remote });
+    if (comptime storage_engine.enabled) return storage_engine.call("writeCreateManagedDbEnrichments", .{ allocator, raw_indexes_json, runtime, local_provider, remote_capability_cache, inference_api_url, inference_api_key, source_table, store, remote, inference_connections });
     // Managed HTTP providers use a concurrent watchdog to enforce the
     // whole-request deadline. Reuse the table's backend executor so write
     // enrichment never falls back to the process-global single-threaded I/O,
@@ -604,12 +607,14 @@ pub fn createManagedDbEnrichments(
             .inference_api_url = inference_api_url,
             .inference_api_key = inference_api_key,
             .secret_store = store,
+            .inference_connections = inference_connections,
+            .enable_index_attribution = true,
             .remote_capability_cache = remote_capability_cache,
             .source_table = source_table,
         });
     } else null;
-    result.dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .remote_capability_cache = remote_capability_cache, .io = managed_io, .bounded_http_request = managed_io != null, .secret_store = store, .remote_content = remote, .inference_api_url = inference_api_url, .inference_api_key = inference_api_key, .source_table = source_table });
-    result.sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .remote_capability_cache = remote_capability_cache, .io = managed_io, .bounded_http_request = managed_io != null, .secret_store = store, .remote_content = remote, .inference_api_url = inference_api_url, .inference_api_key = inference_api_key, .source_table = source_table });
+    result.dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .remote_capability_cache = remote_capability_cache, .io = managed_io, .bounded_http_request = managed_io != null, .secret_store = store, .inference_connections = inference_connections, .enable_index_attribution = true, .remote_content = remote, .inference_api_url = inference_api_url, .inference_api_key = inference_api_key, .source_table = source_table });
+    result.sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .remote_capability_cache = remote_capability_cache, .io = managed_io, .bounded_http_request = managed_io != null, .secret_store = store, .inference_connections = inference_connections, .enable_index_attribution = true, .remote_content = remote, .inference_api_url = inference_api_url, .inference_api_key = inference_api_key, .source_table = source_table });
     result.chunk_provider = try chunkProviderForRuntime(
         allocator,
         local_provider,
@@ -636,8 +641,9 @@ pub fn reconfigureManagedDbEnrichmentRuntime(
     source_table: []const u8,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
+    inference_connections: ?*const InferenceConnections,
 ) !void {
-    if (comptime storage_engine.enabled) return storage_engine.call("writeReconfigureManagedDbEnrichmentRuntime", .{ ignored_allocator, db, indexes_json, backend_runtime, antfly_provider, remote_capability_cache, inference_api_url, inference_api_key, source_table, secret_store, remote_content });
+    if (comptime storage_engine.enabled) return storage_engine.call("writeReconfigureManagedDbEnrichmentRuntime", .{ ignored_allocator, db, indexes_json, backend_runtime, antfly_provider, remote_capability_cache, inference_api_url, inference_api_key, source_table, secret_store, remote_content, inference_connections });
     var enrichments = try createManagedDbEnrichments(
         db.runtime_alloc,
         indexes_json,
@@ -649,6 +655,7 @@ pub fn reconfigureManagedDbEnrichmentRuntime(
         source_table,
         secret_store,
         remote_content,
+        inference_connections,
     );
     defer enrichments.deinit(db.runtime_alloc);
     // An empty replacement is meaningful: dropping the last managed producer
@@ -725,7 +732,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
         reconcile_options.replication_async_batch_mirror = null;
         reconcile_options.replication_async_metadata_mirror = null;
     }
-    var enrichments = try createManagedDbEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, options.remote_capability_cache, options.inference_api_url, options.inference_api_key, options.source_table, secret_store, remote_content);
+    var enrichments = try createManagedDbEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, options.remote_capability_cache, options.inference_api_url, options.inference_api_key, options.source_table, secret_store, remote_content, options.inference_connections);
     // takeConfig() clears every transferred owner. An unconditional defer is
     // therefore both the success-path cleanup for an unused provider-only set
     // and the error-path cleanup for a partially constructed replacement.
@@ -1098,6 +1105,11 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
         .embedding_options = .{
             .antfly_provider = antfly_provider,
             .inference_api_url = options.inference_api_url,
+            .inference_api_key = options.inference_api_key,
+            .inference_connections = options.inference_connections,
+            .secret_store = secret_store,
+            .source_table = options.source_table,
+            .enable_index_attribution = true,
         },
         .source_table = options.source_table,
         .destination_authorizer = options.destination_authorizer,
@@ -1128,6 +1140,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
             options.source_table,
             secret_store,
             remote_content,
+            options.inference_connections,
         );
         db = blk: {
             const enrichment_cfg = if (enrichments.enabled()) enrichments.takeConfig() else null;
@@ -1738,6 +1751,7 @@ pub fn freeOwnerSchemaBeforeIndexLoad(alloc: std.mem.Allocator, prepared: ?db_mo
 pub const InferenceDefaults = struct {
     api_url: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
+    connections: ?*const InferenceConnections = null,
     /// Node secret store that resolves `api_key` (and index-scoped secret
     /// references) on paths that take no explicit store, such as owner
     /// reconciliation. Without it a `${secret:...}` reference would fall back
@@ -1789,7 +1803,7 @@ pub fn configureStorageKernelOwnerDbAtOpen(
         // Restore only the already durable query/producer runtime. No schema,
         // index reconciliation or desired-contract write is admitted here.
         if (backend_runtime != null and (if (installed) |state| !state.matches(durable) else true)) {
-            try reconfigureManagedDbEnrichmentRuntimePaused(alloc, db, durable, backend_runtime, antfly_provider, null, inference.api_url, inference.api_key, table_name, secret_store, remote_content);
+            try reconfigureManagedDbEnrichmentRuntimePaused(alloc, db, durable, backend_runtime, antfly_provider, null, inference.api_url, inference.api_key, table_name, secret_store, remote_content, inference.connections);
             try db.resumeEnrichmentRuntimeAfterReconfigure("protected schema owner reopen", "*");
         }
         if (installed) |state| state.publish(durable);
@@ -1805,7 +1819,7 @@ pub fn configureStorageKernelOwnerDbAtOpen(
             // the physical index catalog. "1" is the prior marker format;
             // the next current-catalog acquisition upgrades it to JSON.
             if (!std.mem.eql(u8, value, "1") and backend_runtime != null) {
-                try reconfigureManagedDbEnrichmentRuntimePaused(alloc, db, value, backend_runtime, antfly_provider, null, inference.api_url, inference.api_key, table_name, secret_store, remote_content);
+                try reconfigureManagedDbEnrichmentRuntimePaused(alloc, db, value, backend_runtime, antfly_provider, null, inference.api_url, inference.api_key, table_name, secret_store, remote_content, inference.connections);
                 try db.resumeEnrichmentRuntimeAfterReconfigure("historical owner reopen", "*");
                 if (installed) |state| state.publish(value);
             }
@@ -1860,9 +1874,20 @@ pub fn configureStorageKernelOwnerDbAtOpen(
             table_name,
             secret_store,
             remote_content,
+            inference.connections,
         );
         _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, db, indexes_json, .{
             .drain_resolver_backfill = false,
+            .source_table = table_name,
+            .embedding_options = .{
+                .antfly_provider = antfly_provider,
+                .inference_api_url = inference.api_url,
+                .inference_api_key = inference.api_key,
+                .inference_connections = inference.connections,
+                .secret_store = secret_store,
+                .source_table = table_name,
+                .enable_index_attribution = true,
+            },
         });
         if (replace) try db.resumeEnrichmentRuntimeAfterReconfigure("owner configuration", "*");
         if (!installed_matches) try persistOwnerCatalogContract(alloc, db, indexes_json);
@@ -2050,9 +2075,22 @@ pub fn reconcileStorageKernelOwnerDb(
         table_name,
         inference.secret_store,
         null,
+        inference.connections,
     );
     const provisioned = if (indexes_json.len > 0) blk: {
-        const options: metadata_table_provisioner.ReconcileDbIndexOptions = .{ .drain_resolver_backfill = false };
+        const options: metadata_table_provisioner.ReconcileDbIndexOptions = .{
+            .drain_resolver_backfill = false,
+            .source_table = table_name,
+            .embedding_options = .{
+                .antfly_provider = antfly_provider,
+                .inference_api_url = inference.api_url,
+                .inference_api_key = inference.api_key,
+                .inference_connections = inference.connections,
+                .secret_store = inference.secret_store,
+                .source_table = table_name,
+                .enable_index_attribution = true,
+            },
+        };
         break :blk if (target_index_name) |target|
             try metadata_table_provisioner.reconcileDbIndexTargetWithOptions(alloc, db, indexes_json, target, options)
         else
@@ -2356,8 +2394,9 @@ pub fn reconfigureManagedDbEnrichmentRuntimePaused(
     source_table: []const u8,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
+    inference_connections: ?*const InferenceConnections,
 ) !void {
-    if (comptime storage_engine.enabled) return storage_engine.call("writeReconfigureManagedDbEnrichmentRuntimePaused", .{ ignored_allocator, db, indexes_json, backend_runtime, antfly_provider, remote_capability_cache, inference_api_url, inference_api_key, source_table, secret_store, remote_content });
+    if (comptime storage_engine.enabled) return storage_engine.call("writeReconfigureManagedDbEnrichmentRuntimePaused", .{ ignored_allocator, db, indexes_json, backend_runtime, antfly_provider, remote_capability_cache, inference_api_url, inference_api_key, source_table, secret_store, remote_content, inference_connections });
     var enrichments = try createManagedDbEnrichments(
         db.runtime_alloc,
         indexes_json,
@@ -2369,6 +2408,7 @@ pub fn reconfigureManagedDbEnrichmentRuntimePaused(
         source_table,
         secret_store,
         remote_content,
+        inference_connections,
     );
     defer enrichments.deinit(db.runtime_alloc);
     try db.reconfigureEnrichmentRuntimePaused(enrichments.takeConfig());
@@ -2553,6 +2593,7 @@ test "managed enrichments inherit the default inference credential with the defa
             base_uri,
             "node-default-key",
             "docs",
+            null,
             null,
             null,
         );

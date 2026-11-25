@@ -782,9 +782,9 @@ pub const DeciderConfig = struct {
     output: ?antfly_generating_openapi.ConstrainedOutput = null,
     probabilities: ?antfly_generating_openapi.ConstrainedProbabilities = null,
     batch: ?antfly_generating_openapi.ConstrainedGenerationBatch = null,
-    /// Required for Antfly, OpenAI, and Cloudflare; Jev defaults to jev-latest. Cloudflare uses @cf/cloudflare/clef or @cf/cloudflare/clef-flash.
+    /// Required for Antfly, OpenAI, and Cloudflare; Jev defaults to jev-latest. Typed deciders may select a connection-qualified model with models.decide. Cloudflare uses @cf/cloudflare/clef or @cf/cloudflare/clef-flash.
     model: ?[]const u8 = null,
-    /// Required with the cloudflare provider; Workers AI account identifier.
+    /// Workers AI account identifier. Required for a direct Cloudflare model. A connection-qualified model takes it from its connection.
     account_id: ?[]const u8 = null,
     /// Optional Cloudflare AI Gateway identifier.
     gateway_id: ?[]const u8 = null,
@@ -1629,8 +1629,18 @@ pub const InferenceConnectionConfig = struct {
     provider: []const u8,
     /// Provider endpoint URL when applicable.
     url: ?[]const u8 = null,
+    /// Complete Workers AI model search URL for an operator-managed Cloudflare gateway. Uses the connection's credentials, fixed headers, and network policy.
+    discovery_url: ?[]const u8 = null,
     /// Provider API key or secret reference. Never returned by inventory APIs.
     api_key: ?[]const u8 = null,
+    /// Explicit destination policy for this provider endpoint. Set false to connect only to globally routable DNS results or IP literals. Set true to authorize the configured private origin. Omission preserves existing inference behavior. Independent of remote-content fetching.
+    allow_private_ips: ?bool = null,
+    /// Absolute path to a PEM CA bundle for this explicit HTTPS inference endpoint. The bundle replaces the system trust roots for this connection. Hostname verification remains enabled.
+    tls_ca_file: ?[]const u8 = null,
+    /// Fixed outbound headers for discovery and supported inference operations through a configured or supported provider-default endpoint. Values may reference secrets. Authentication, protocol, and Antfly control headers are reserved.
+    headers: ?std.json.ArrayHashMap([]const u8) = null,
+    /// Requires at least one nonempty principals, tenants, projects, or workloads mapping.
+    attribution: ?std.json.Value = null,
     /// Cloud region when applicable.
     region: ?[]const u8 = null,
     /// Google Cloud project when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
@@ -1639,6 +1649,10 @@ pub const InferenceConnectionConfig = struct {
     location: ?[]const u8 = null,
     /// Anthropic workspace for an API key that is not workspace-scoped.
     workspace_id: ?[]const u8 = null,
+    /// Cloudflare account for Workers AI endpoint resolution.
+    account_id: ?[]const u8 = null,
+    /// Cloudflare AI Gateway routing identifier when applicable.
+    gateway_id: ?[]const u8 = null,
     /// Filesystem path to provider credentials when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
     credentials_path: ?[]const u8 = null,
     /// Per-image input token upper bound for hosted decisions. Required to enable images; must cover every admitted decision model on this connection. Named deciders can specify tighter per-model bounds.
@@ -1652,11 +1666,18 @@ pub const InferenceConnectionConfig = struct {
     pub const openApiFieldMetadata = .{
         .{ "provider", "provider", false },
         .{ "url", "url", true },
+        .{ "discovery_url", "discovery_url", true },
         .{ "api_key", "api_key", true },
+        .{ "allow_private_ips", "allow_private_ips", true },
+        .{ "tls_ca_file", "tls_ca_file", true },
+        .{ "headers", "headers", true },
+        .{ "attribution", "attribution", true },
         .{ "region", "region", true },
         .{ "project_id", "project_id", true },
         .{ "location", "location", true },
         .{ "workspace_id", "workspace_id", true },
+        .{ "account_id", "account_id", true },
+        .{ "gateway_id", "gateway_id", true },
         .{ "credentials_path", "credentials_path", true },
         .{ "max_image_input_tokens", "max_image_input_tokens", true },
         .{ "names", "names", true },
@@ -1679,8 +1700,28 @@ pub const InferenceConnectionConfig = struct {
             try jw.objectField("url");
             try jw.write(value);
         }
+        if (self.discovery_url) |value| {
+            try jw.objectField("discovery_url");
+            try jw.write(value);
+        }
         if (self.api_key) |value| {
             try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.allow_private_ips) |value| {
+            try jw.objectField("allow_private_ips");
+            try jw.write(value);
+        }
+        if (self.tls_ca_file) |value| {
+            try jw.objectField("tls_ca_file");
+            try jw.write(value);
+        }
+        if (self.headers) |value| {
+            try jw.objectField("headers");
+            try jw.write(value);
+        }
+        if (self.attribution) |value| {
+            try jw.objectField("attribution");
             try jw.write(value);
         }
         if (self.region) |value| {
@@ -1697,6 +1738,14 @@ pub const InferenceConnectionConfig = struct {
         }
         if (self.workspace_id) |value| {
             try jw.objectField("workspace_id");
+            try jw.write(value);
+        }
+        if (self.account_id) |value| {
+            try jw.objectField("account_id");
+            try jw.write(value);
+        }
+        if (self.gateway_id) |value| {
+            try jw.objectField("gateway_id");
             try jw.write(value);
         }
         if (self.credentials_path) |value| {

@@ -92,10 +92,10 @@ components:
           $ref: '../shared/generating.yaml#/components/schemas/ConstrainedGenerationBatch'
         model:
           type: string
-          description: Required for Antfly, OpenAI, and Cloudflare; Jev defaults to jev-latest. Cloudflare uses @cf/cloudflare/clef or @cf/cloudflare/clef-flash.
+          description: Required for Antfly, OpenAI, and Cloudflare; Jev defaults to jev-latest. Typed deciders may select a connection-qualified model with models.decide. Cloudflare uses @cf/cloudflare/clef or @cf/cloudflare/clef-flash.
         account_id:
           type: string
-          description: Required with the cloudflare provider; Workers AI account identifier.
+          description: Workers AI account identifier. Required for a direct Cloudflare model. A connection-qualified model takes it from its connection.
         gateway_id:
           type: string
           description: Optional Cloudflare AI Gateway identifier.
@@ -899,9 +899,58 @@ components:
         url:
           type: string
           description: Provider endpoint URL when applicable.
+        discovery_url:
+          type: string
+          writeOnly: true
+          description: Complete Workers AI model search URL for an operator-managed Cloudflare gateway. Uses the connection's credentials, fixed headers, and network policy.
         api_key:
           type: string
           description: Provider API key or secret reference. Never returned by inventory APIs.
+        allow_private_ips:
+          type: boolean
+          description: Explicit destination policy for this provider endpoint. Set false to connect only to globally routable DNS results or IP literals. Set true to authorize the configured private origin. Omission preserves existing inference behavior. Independent of remote-content fetching.
+        tls_ca_file:
+          type: string
+          writeOnly: true
+          description: Absolute path to a PEM CA bundle for this explicit HTTPS inference endpoint. The bundle replaces the system trust roots for this connection. Hostname verification remains enabled.
+        headers:
+          type: object
+          writeOnly: true
+          maxProperties: 16
+          additionalProperties:
+            type: string
+            maxLength: 4096
+          description: Fixed outbound headers for discovery and supported inference operations through a configured or supported provider-default endpoint. Values may reference secrets. Authentication, protocol, and Antfly control headers are reserved.
+        attribution:
+          type: object
+          writeOnly: true
+          additionalProperties: false
+          required: [header]
+          description: Requires at least one nonempty principals, tenants, projects, or workloads mapping.
+          properties:
+            header:
+              type: string
+              description: Outbound billing header name, distinct from all fixed and reserved headers.
+            principals:
+              type: object
+              additionalProperties:
+                type: string
+              description: Operator-defined mapping from authenticated Antfly usernames to billing values or secret references. Invocations without a mapping are denied.
+            tenants:
+              type: object
+              additionalProperties:
+                type: string
+              description: Operator-defined billing values or secret references keyed by authenticated tenant_id.
+            projects:
+              type: object
+              additionalProperties:
+                type: string
+              description: Operator-defined billing values or secret references keyed by authenticated tenant_id/project_id. Unknown projects are denied.
+            workloads:
+              type: object
+              additionalProperties:
+                type: string
+              description: Operator-defined billing values or secret references keyed by index_embed, index_extract, index_generate, index_decide, index_transcribe, or index_read followed by a slash and the physical storage table name.
         region:
           type: string
           description: Cloud region when applicable.
@@ -914,6 +963,12 @@ components:
         workspace_id:
           type: string
           description: Anthropic workspace for an API key that is not workspace-scoped.
+        account_id:
+          type: string
+          description: Cloudflare account for Workers AI endpoint resolution.
+        gateway_id:
+          type: string
+          description: Cloudflare AI Gateway routing identifier when applicable.
         credentials_path:
           type: string
           description: Filesystem path to provider credentials when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.

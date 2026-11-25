@@ -401,6 +401,7 @@ pub const MetadataServer = struct {
             // the restarted node has started its Raft transport.
             _ = public_write_source.withBackendRuntime(backend_runtime);
             _ = public_write_source.withInferenceAPIURL(if (cfg.api_server_cfg.node_config) |node_config| node_config.inference.api_url else null);
+            _ = public_write_source.withInferenceConnections(if (cfg.api_server_cfg.node_config) |node| &node.connections else null);
             _ = public_write_source.withInferenceAPIKey(cfg.api_server_cfg.inference_api_key);
             _ = public_write_source.withSecretStore(cfg.api_server_cfg.secret_store);
             _ = public_write_source.withRemoteContent(cfg.api_server_cfg.remote_content);

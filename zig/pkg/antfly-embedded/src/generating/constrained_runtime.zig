@@ -177,6 +177,53 @@ pub const Runtime = struct {
         return constrained.execute(a, .{ .ptr = &backend, .invoke = Backend.invoke, .checkpoint = Backend.checkpoint, .validate_item = Backend.validateItem }, mode, schema, instructions, batch, inputs);
     }
 
+    /// Execute the public extraction envelope with a generator selected and
+    /// scoped by the caller. Transport options stay on the runtime client.
+    pub fn extract(self: *Runtime, a: Allocator, envelope: Json, selected_generator: Json, public_model: []const u8) ![]u8 {
+        const extractor = constrained.extraction;
+        const inputs = envelope.object.get("inputs") orelse return error.InvalidGeneratedExtractorConfig;
+        if (inputs != .array or inputs.array.items.len == 0 or inputs.array.items.len > 128) return error.InvalidGeneratedExtractorConfig;
+        var texts: [128][]const u8 = undefined;
+        for (inputs.array.items, texts[0..inputs.array.items.len]) |item, *text| {
+            if (item != .object) return error.InvalidGeneratedExtractorConfig;
+            for (item.object.keys()) |key| {
+                if (!std.mem.eql(u8, key, "id") and !std.mem.eql(u8, key, "content")) return error.InvalidGeneratedExtractorConfig;
+            }
+            if (item.object.get("id")) |id| {
+                if (id != .string or id.string.len == 0 or id.string.len > 1024 or !std.unicode.utf8ValidateSlice(id.string)) return error.InvalidGeneratedExtractorConfig;
+            }
+            const content = item.object.get("content") orelse return error.InvalidGeneratedExtractorConfig;
+            if (content != .string or content.string.len > 1024 * 1024) return error.InvalidGeneratedExtractorConfig;
+            text.* = content.string;
+        }
+        if (envelope.object.get("schema_version")) |version| {
+            if (version != .integer or version.integer != 2) return error.InvalidGeneratedExtractorConfig;
+        }
+        var fields = try envelope.object.clone(a);
+        _ = fields.swapRemove("inputs");
+        _ = fields.swapRemove("schema_version");
+        try fields.put(a, "generator", selected_generator);
+        var parsed = try extractor.parse(a, try std.json.Stringify.valueAlloc(a, Json{ .object = fields }, .{}));
+        defer parsed.deinit();
+        var config = parsed.value;
+        const caps = try self.capabilitiesForMedia(a, &config.generator, false);
+        const mode = try caps.select(config.output, config.probabilities);
+        config.generator.logprobs = config.probabilities == .token_logprobs;
+        const text_control: @import("antfly_extracting").text_processing.Checkpoint = .{ .ptr = self, .check_fn = checkCancellation };
+        const sources = texts[0..inputs.array.items.len];
+        const planned = try extractor.planWithControl(a, config, sources, text_control);
+        const instructions = try std.fmt.allocPrint(a, "Extract only entities and relations grounded in each input. Use literal source surface forms. Relations reference entity positions. Set present=false for absent candidates. Never invent offsets or confidence. {s}", .{config.instructions});
+        var validation = extractor.Validation{ .config = config };
+        self.semantic_validation = .{ .ptr = &validation, .validate = extractor.Validation.validate };
+        defer self.semantic_validation = null;
+        const generated = try self.execute(a, config.generator, mode, try extractor.outputSchema(a, config), instructions, config.batch, planned.inputs);
+        const values = try extractor.materializeWithControl(a, config, sources, planned, generated, text_control);
+        // The standard generated extraction envelope omits usage without a
+        // complete measurement from every constituent provider call.
+        const response = try extractor.responseValueWithUsage(a, public_model, inputs.array.items, values, null);
+        return std.json.Stringify.valueAlloc(a, response, .{});
+    }
+
     pub fn executeEvidence(self: *Runtime, a: Allocator, cfg: generating.GeneratorConfig, mode: constrained.Output, schema: Json, instructions: []const u8, batch: constrained.Batch, inputs: []const Json) !constrained.Result {
         var backend = Backend{ .runtime = self, .cfg = cfg };
         return constrained.executeEvidence(a, .{ .limits = self.limits, .ptr = &backend, .invoke = Backend.invoke, .checkpoint = Backend.checkpoint, .validate_item = Backend.validateItem }, mode, schema, instructions, batch, inputs);

@@ -25,6 +25,7 @@ const httpx = @import("httpx");
 const hbs = @import("handlebars");
 const openai_api = @import("openai_api");
 const google_auth = @import("antfly_google").auth;
+const inference_config = @import("../common/config.zig");
 const common_secrets = @import("../common/secrets.zig");
 const credential_source_identity = @import("../common/credential_source_identity.zig");
 const credential_safety = @import("../common/credential_safety.zig");
@@ -553,6 +554,15 @@ pub const InitOptions = struct {
     /// embedders borrow it; standalone callers retain an owned fallback.
     remote_capability_cache: ?*remote_capabilities.Cache = null,
     io: ?std.Io = null,
+    /// Borrowed for the constructed embedder and its request-local overlays.
+    provider_http: ?*httpx.Client = null,
+    inference_connections: ?*const inference_config.Config.ConnectionsConfig = null,
+    attribution_principal: ?[]const u8 = null,
+    attribution_metadata_json: []const u8 = "",
+    attribution_scope: ?inference_config.InferenceAttributionScope = null,
+    enable_index_attribution: bool = false,
+    /// Query planning can load several indexes before selecting a target.
+    defer_attribution_denial: bool = false,
     /// The supplied I/O executor can run the provider request and its timeout
     /// watchdog concurrently. Keep this explicit: merely having an Io value
     /// does not imply concurrency (query probes often use the global
@@ -703,6 +713,8 @@ pub const ManagedEmbeddingEntry = struct {
     /// Request-local overlays borrow this pointer, preserving connection/DNS/
     /// TLS state without moving client synchronization objects.
     shared_http_client: ?*httpx.Client = null,
+    scoped_http: ?*ScopedEmbeddingHttp = null,
+    attribution_denied: bool = false,
     provider_runtime: ?*ProviderRuntime = null,
     request_id: []const u8 = "",
     remote_query_workload: bool = false,
@@ -769,6 +781,7 @@ pub const ManagedEmbeddingEntry = struct {
     }
 
     fn httpClient(self: *const ManagedEmbeddingEntry, alloc: std.mem.Allocator, fallback: *?httpx.Client) !*httpx.Client {
+        if (self.attribution_denied) return error.InferenceAttributionDenied;
         if (self.shared_http_client) |client| return client;
         if (self.provider_runtime) |runtime| return runtime.httpClient();
         // Direct unit construction remains supported; production constructors
@@ -779,6 +792,8 @@ pub const ManagedEmbeddingEntry = struct {
 
     pub fn deinit(self: *ManagedEmbeddingEntry, alloc: std.mem.Allocator) void {
         std.debug.assert(self.alloc.ptr == alloc.ptr);
+        if (self.remote_capability_cache) |*cache| cache.deinit();
+        if (self.scoped_http) |http| http.deinit(alloc);
         if (self.quota) |*quota| quota.release();
         alloc.free(self.index_name);
         if (self.embedding_name.len > 0) alloc.free(self.embedding_name);
@@ -805,7 +820,6 @@ pub const ManagedEmbeddingEntry = struct {
             cache.deinit(alloc);
             alloc.destroy(cache);
         }
-        if (self.remote_capability_cache) |*cache| cache.deinit();
         if (self.api_key) |*api_key| api_key.deinit(alloc);
         self.auth_header_cache.deinit(alloc);
         self.* = undefined;
@@ -1308,13 +1322,13 @@ pub const ManagedEmbedder = struct {
         for (owned_entries) |*entry| {
             if (entry.antfly_provider == null) entry.provider_runtime = options.provider_runtime;
         }
-        const owned_http_client = if (options.provider_runtime == null)
+        const owned_http_client = if (options.provider_runtime == null and options.provider_http == null)
             try createManagedEmbeddingHttpClient(alloc, owned_entries)
         else
             null;
         errdefer deinitManagedEmbeddingHttpClient(alloc, owned_http_client);
         if (owned_http_client) |client| for (owned_entries) |*entry| {
-            if (entry.antfly_provider == null) entry.shared_http_client = client;
+            if (entry.antfly_provider == null and entry.shared_http_client == null) entry.shared_http_client = client;
         };
         if (options.setup_context) |control| try control.check();
         for (owned_entries) |*entry| {
@@ -1331,6 +1345,7 @@ pub const ManagedEmbedder = struct {
         retained_options.cancellation = null;
         retained_options.progress = null;
         retained_options.request_id = "";
+        if (supplied_options.attribution_principal) |principal| retained_options.attribution_principal = try options_arena.allocator().dupe(u8, principal);
         retained_options.source_table = try options_arena.allocator().dupe(u8, supplied_options.source_table);
         if (supplied_options.inference_api_url) |value| retained_options.inference_api_url = try options_arena.allocator().dupe(u8, value);
         if (supplied_options.inference_api_key) |value| retained_options.inference_api_key = try options_arena.allocator().dupe(u8, value);
@@ -1616,6 +1631,7 @@ pub const ManagedEmbedder = struct {
         placement: enum { generic, text, after_render },
     ) !PreparedQueryEmbedding {
         const configured = self.findQueryEntry(index_name) orelse return error.EmbeddingIndexNotFound;
+        if (configured.attribution_denied) return error.InferenceAttributionDenied;
         var entry = configured.requestOverlay(alloc);
         errdefer entry.auth_header_cache.deinit(alloc);
         entry.deadline_ns = deadline_ns;
@@ -1694,7 +1710,7 @@ pub const ManagedEmbedder = struct {
     }
 
     fn queryCacheKeyForEntry(entry: *const ManagedEmbeddingEntry, security_domain: QueryCacheSecurityDomain, security_scope: []const u8, text: []const u8) ![32]u8 {
-        if (entry.sparse or entry.declaresMedia()) return error.QueryEmbeddingNotCacheable;
+        if (entry.sparse or entry.declaresMedia() or entry.scoped_http != null) return error.QueryEmbeddingNotCacheable;
         const endpoint = managedEmbeddingEndpointIdentity(entry);
         // Only effective file-backed credentials depend on this store. Other
         // credential sources must neither refresh it nor invalidate on rotation.
@@ -2685,7 +2701,7 @@ fn embeddingOperationDeadline(entry: *const ManagedEmbeddingEntry) u64 {
     return entry.deadline_ns orelse monotonicNowNs() +| max_embedding_request_timeout_ns;
 }
 
-const remote_embedding_max_response_bytes: usize = 4 << 20;
+pub const remote_embedding_max_response_bytes: usize = 4 << 20;
 const remote_embedding_response_resident_multiplier: usize = 8;
 // No JSON tree/arena exists on the numeric-only path. Four payload ceilings
 // cover HTTP buffer growth, retained compressed input and growing decoded
@@ -2752,7 +2768,7 @@ fn createManagedEmbeddingHttpClient(
     entries: []const ManagedEmbeddingEntry,
 ) !?*httpx.Client {
     for (entries) |*entry| {
-        if (entry.antfly_provider != null or entry.base_url.len == 0) continue;
+        if (entry.antfly_provider != null or entry.base_url.len == 0 or entry.shared_http_client != null or entry.attribution_denied) continue;
         var config = try embeddingHttpClientConfigForDeadline(
             entry,
             monotonicNowNs() +| max_embedding_request_timeout_ns,
@@ -3117,12 +3133,14 @@ pub fn embeddingSemanticProducerJsonAllocWithOptions(
         .object => |object| object.get("embedder") orelse return error.InvalidCreateTableRequest,
         else => return error.InvalidCreateTableRequest,
     };
-    var embedder_cfg = parseEmbedderConfigFromValue(alloc, embedder_value) catch |err| switch (err) {
+    var original_cfg = parseEmbedderConfigFromValue(alloc, embedder_value) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.InvalidCreateTableRequest,
     };
-    defer embedder_cfg.deinit(alloc);
-    const provider = try parseEmbedderProvider(embedder_cfg);
+    defer original_cfg.deinit(alloc);
+    const provider = try parseEmbedderProvider(original_cfg);
+    const connection = try EmbeddingConnection.resolve(original_cfg, provider, options);
+    const embedder_cfg = if (connection) |selected| selected.effective(original_cfg) else original_cfg;
     if (embedder_cfg.model.len == 0 and provider != .antfly) return error.InvalidCreateTableRequest;
     const region = if (provider == .bedrock)
         try resolveBedrockRegion(alloc, embedder_cfg)
@@ -3142,7 +3160,7 @@ pub fn embeddingSemanticProducerJsonAllocWithOptions(
     else
         try alloc.dupe(u8, "");
     defer alloc.free(project_id);
-    const endpoint = switch (provider) {
+    const endpoint = if (connection) |selected| try selected.endpoint(alloc, provider, embedder_cfg, region) else switch (provider) {
         .cloudflare => try embeddings_types.cloudflare.baseUrl(alloc, embedder_cfg.account_id, if (embedder_cfg.url.len > 0) embedder_cfg.url else null),
         .openai => try resolveOpenAiBaseUrl(alloc, embedder_cfg),
         .openrouter => try resolveOpenRouterBaseUrl(alloc, embedder_cfg),
@@ -3178,7 +3196,7 @@ pub fn embeddingSemanticProducerJsonAllocWithOptions(
     };
     return try std.json.Stringify.valueAlloc(alloc, SemanticProducer{
         .provider = @tagName(provider),
-        .model = embedder_cfg.model,
+        .model = original_cfg.model,
         .endpoint = endpoint,
         .region = region,
         .project_id = if (project_id.len > 0) project_id else null,
@@ -5466,6 +5484,113 @@ fn shouldUseAntflyProvider(embedder: embeddings_types.Config, options: InitOptio
     return options.antfly_provider != null and !hasRemoteAntflyEndpoint(embedder, options.inference_api_url);
 }
 
+const EmbeddingConnection = struct {
+    reference: inference_config.InferenceModelReference,
+    config: inference_config.Config.InferenceConnectionConfig,
+
+    fn resolve(cfg: embeddings_types.Config, provider: ProviderKind, options: InitOptions) !?EmbeddingConnection {
+        const reference = (try inference_config.InferenceModelReference.parse(cfg.model)) orelse return null;
+        const connections = options.inference_connections orelse return error.ConnectionNotFound;
+        const connection = try inference_config.resolveInferenceConnection(connections, reference.connection, "models.embed");
+        if (!std.mem.eql(u8, connection.provider, @tagName(provider))) return error.ModelTaskMismatch;
+        if (cfg.url.len != 0 or cfg.api_key != null or cfg.region.len != 0 or cfg.location.len != 0 or
+            cfg.project_id.len != 0 or cfg.credentials_path.len != 0 or cfg.account_id != null or cfg.gateway_id != null) return error.InvalidManagedEmbeddingIndex;
+        if (connection.url) |url| {
+            if (!inference_config.validInferenceURL(url)) return error.InvalidConnectionURL;
+        } else if (provider == .antfly) return error.ConnectionURLMissing;
+        return .{ .reference = reference, .config = connection };
+    }
+
+    fn effective(self: EmbeddingConnection, original: embeddings_types.Config) embeddings_types.Config {
+        var cfg = original;
+        cfg.model = self.reference.model;
+        cfg.url = self.config.url orelse "";
+        cfg.api_key = self.config.api_key;
+        cfg.account_id = self.config.account_id;
+        cfg.gateway_id = self.config.gateway_id;
+        cfg.region = self.config.region orelse "";
+        cfg.project_id = self.config.project_id orelse "";
+        cfg.location = self.config.location orelse "";
+        cfg.credentials_path = self.config.credentials_path orelse "";
+        return cfg;
+    }
+
+    fn endpoint(self: EmbeddingConnection, alloc: std.mem.Allocator, provider: ProviderKind, cfg: embeddings_types.Config, region: []const u8) ![]u8 {
+        return switch (provider) {
+            .cloudflare => embeddings_types.cloudflare.baseUrl(alloc, cfg.account_id, self.config.url),
+            .openai => resolveOpenAiBaseUrl(alloc, cfg),
+            .openrouter => resolveOpenRouterBaseUrl(alloc, cfg),
+            .ollama => resolveOllamaBaseUrl(alloc, cfg),
+            .cohere => resolveCohereBaseUrl(alloc, cfg),
+            .gemini => resolveGeminiBaseUrl(alloc, cfg),
+            .bedrock => resolveBedrockEndpoint(alloc, cfg, region),
+            .vertex => resolveVertexBaseUrl(alloc, cfg, region),
+            .antfly => normalizeAntflyInferenceBaseUrl(alloc, self.config.url.?),
+        };
+    }
+};
+
+const ScopedEmbeddingHttp = struct {
+    arena: std.heap.ArenaAllocator,
+    client: httpx.Client,
+    headers: inference_config.InferenceRequestHeaders,
+    attempts: @import("../common/inference_telemetry.zig").ProviderAttempts,
+
+    fn create(alloc: std.mem.Allocator, connection: EmbeddingConnection, endpoint: []const u8, options: InitOptions) !*ScopedEmbeddingHttp {
+        const self = try alloc.create(ScopedEmbeddingHttp);
+        errdefer alloc.destroy(self);
+        self.arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer self.arena.deinit();
+        const arena = self.arena.allocator();
+        const scope: ?inference_config.InferenceAttributionScope = if (connection.config.attribution == null or options.attribution_principal == null)
+            null
+        else if (options.attribution_scope) |trusted|
+            .{
+                .tenant = try arena.dupe(u8, trusted.tenant),
+                .project = if (trusted.project) |project| try arena.dupe(u8, project) else null,
+            }
+        else
+            try inference_config.inferenceScopeFromAuthenticatedMetadata(arena, options.attribution_metadata_json);
+        const identity: ?inference_config.InferenceAttributionIdentity = if (options.attribution_principal != null)
+            inference_config.authenticatedInferenceAttribution(connection.config.attribution, options.attribution_principal, scope)
+        else if (options.enable_index_attribution)
+            .{ .workload = .{ .operation = .index_embed, .physical_table = options.source_table } }
+        else
+            null;
+        self.headers = try inference_config.InferenceRequestHeaders.init(self.arena.allocator(), connection.config, options.secret_store, identity);
+        self.attempts = .{
+            .connection = try arena.dupe(u8, connection.reference.connection),
+            .task = "embed",
+            .model = try arena.dupe(u8, connection.reference.model),
+            .billing_principal = if (connection.config.attribution != null)
+                if (options.attribution_principal) |principal| try arena.dupe(u8, principal) else null
+            else
+                null,
+            .billing_scope = inference_config.InferenceAttributionIdentity.billingScope(identity),
+            .billing_workload = if (connection.config.attribution != null) if (identity) |value| switch (value) {
+                .workload => |workload| try arena.dupe(u8, workload.physical_table),
+                else => null,
+            } else null else null,
+        };
+        const default_url = if (connection.config.url == null) try self.arena.allocator().dupe(u8, endpoint) else null;
+        const transport = try connection.config.transportConfigWithDefaultURL(.{
+            .request_headers = self.headers.source(),
+            .attempt_result_observer = self.attempts.observer(),
+            .keep_alive = true,
+            .max_response_size = remote_embedding_max_response_bytes,
+            .timeouts = httpx.Timeouts.uniform(max_embedding_request_timeout_ms),
+        }, default_url);
+        self.client = httpx.Client.initWithConfig(std.heap.smp_allocator, options.io orelse return error.InferenceTransportUnavailable, transport);
+        return self;
+    }
+
+    fn deinit(self: *ScopedEmbeddingHttp, alloc: std.mem.Allocator) void {
+        self.client.deinit();
+        self.arena.deinit();
+        alloc.destroy(self);
+    }
+};
+
 fn buildManagedEmbeddingEntry(
     alloc: std.mem.Allocator,
     index_name: []const u8,
@@ -5476,13 +5601,15 @@ fn buildManagedEmbeddingEntry(
     semantic_binding: ?CatalogSemanticExecutionBinding,
 ) !ManagedEmbeddingEntry {
     const sparse = cfg.sparse orelse false;
-    var embedder_cfg = parseEmbedderConfigFromValue(alloc, embedder) catch |err| switch (err) {
+    var original_cfg = parseEmbedderConfigFromValue(alloc, embedder) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.InvalidManagedEmbeddingIndex,
     };
-    defer embedder_cfg.deinit(alloc);
+    defer original_cfg.deinit(alloc);
 
-    const provider = try parseEmbedderProvider(embedder_cfg);
+    const provider = try parseEmbedderProvider(original_cfg);
+    const connection = try EmbeddingConnection.resolve(original_cfg, provider, options);
+    const embedder_cfg = if (connection) |selected| selected.effective(original_cfg) else original_cfg;
     if (embedder_cfg.model.len == 0 and provider != .antfly) return error.InvalidManagedEmbeddingIndex;
     const bedrock_request_format = if (provider == .bedrock)
         try bedrock_provider.resolveRequestFormat(
@@ -5562,8 +5689,20 @@ fn buildManagedEmbeddingEntry(
     else
         @constCast("");
     errdefer if (location.len > 0) alloc.free(location);
+    if (connection) |selected| {
+        if (semantic_binding) |binding| {
+            const endpoint = try selected.endpoint(alloc, provider, embedder_cfg, provider_region);
+            defer alloc.free(endpoint);
+            if (binding.embedded or !std.mem.eql(u8, endpoint, binding.endpoint)) return error.InvalidEmbeddingArtifactProducer;
+            if (provider == .bedrock and embedder_cfg.region.len > 0 and !std.mem.eql(u8, embedder_cfg.region, binding.region)) return error.InvalidEmbeddingArtifactProducer;
+            if (provider == .vertex and (embedder_cfg.location.len > 0 and !std.mem.eql(u8, embedder_cfg.location, binding.region) or
+                embedder_cfg.project_id.len > 0 and !std.mem.eql(u8, embedder_cfg.project_id, binding.project_id))) return error.InvalidEmbeddingArtifactProducer;
+        }
+    }
     const base_url = if (semantic_binding) |binding|
         try alloc.dupe(u8, if (binding.embedded) "" else binding.endpoint)
+    else if (connection) |selected|
+        try selected.endpoint(alloc, provider, embedder_cfg, provider_region)
     else switch (provider) {
         .cloudflare => try embeddings_types.cloudflare.baseUrl(alloc, embedder_cfg.account_id, if (embedder_cfg.url.len > 0) embedder_cfg.url else null),
         .openai => try resolveOpenAiBaseUrl(alloc, embedder_cfg),
@@ -5613,14 +5752,27 @@ fn buildManagedEmbeddingEntry(
                 null,
             "ANTFLY_INFERENCE_API_KEY",
         ),
-        .ollama, .bedrock, .vertex => null,
+        .bedrock, .vertex => if (embedder_cfg.api_key) |token|
+            try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, token, if (provider == .bedrock) "AWS_BEARER_TOKEN_BEDROCK" else "VERTEX_API_KEY")
+        else
+            null,
+        .ollama => null,
     };
     errdefer if (api_key) |*owned_api_key| owned_api_key.deinit(alloc);
 
+    var attribution_denied = false;
+    const scoped_http = if (connection) |selected| ScopedEmbeddingHttp.create(alloc, selected, base_url, options) catch |err| blk: {
+        if (err != error.InferenceAttributionDenied or !options.defer_attribution_denial) return err;
+        attribution_denied = true;
+        break :blk null;
+    } else null;
     return .{
         .alloc = alloc,
         .io = options.io,
         .bounded_http_request = options.bounded_http_request,
+        .shared_http_client = if (scoped_http) |http| &http.client else options.provider_http,
+        .scoped_http = scoped_http,
+        .attribution_denied = attribution_denied,
         .deadline_ns = options.deadline_ns,
         .cancellation = options.cancellation,
         .progress = options.progress,
@@ -5657,15 +5809,198 @@ fn buildManagedEmbeddingEntry(
         .requests_per_minute = requests_per_minute,
         .burst = burst,
         .antfly_provider = antfly_provider,
-        .shared_remote_capability_cache = if (provider == .antfly and antfly_provider == null)
+        // Discovery keys include explicit routing selectors, while a managed
+        // client's fixed and attribution headers are applied by its transport.
+        // A lease from one such client cannot be reused by another policy scope.
+        .shared_remote_capability_cache = if (provider == .antfly and antfly_provider == null and connection == null)
             options.remote_capability_cache
         else
             null,
-        .remote_capability_cache = if (provider == .antfly and antfly_provider == null and options.remote_capability_cache == null)
+        .remote_capability_cache = if (provider == .antfly and antfly_provider == null and (connection != null or options.remote_capability_cache == null))
             remote_capabilities.Cache.init(alloc, options.io orelse std.Io.Threaded.global_single_threaded.io())
         else
             null,
     };
+}
+
+test "managed embedder pins a connection endpoint without persisting credentials" {
+    const a = std.testing.allocator;
+    var config = try inference_config.Config.parseFromSlice(a,
+        \\{"connections":{"private":{"kind":"inference","capabilities":["models.embed"],"inference":{"provider":"openai","url":"https://gateway.internal","api_key":"local-secret","headers":{"X-Team":"indexing"}}}}}
+    );
+    defer config.deinit();
+    const raw =
+        \\{"type":"embeddings","field":"body","dimension":2,"embedder":{"provider":"openai","model":"connections/private/models/text-embedding-3-small"}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer parsed.deinit();
+    const options: InitOptions = .{ .io = std.testing.io, .inference_connections = &config.connections };
+    const identity = try embeddingSemanticProducerJsonAllocWithOptions(a, parsed.value, options);
+    defer a.free(identity);
+    try std.testing.expect(std.mem.indexOf(u8, identity, "https://gateway.internal/v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, identity, "connections/private/models/text-embedding-3-small") != null);
+    try std.testing.expect(std.mem.indexOf(u8, identity, "local-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, identity, "X-Team") == null);
+}
+
+test "managed embedder isolates Antfly capability leases from the shared runtime" {
+    const a = std.testing.allocator;
+    var config = try inference_config.Config.parseFromSlice(a,
+        \\{"connections":{"private":{"kind":"inference","capabilities":["models.embed"],"inference":{"provider":"antfly","url":"https://gateway.internal/ai/v1","api_key":"fixture","headers":{"X-Team":"docs"}}}}}
+    );
+    defer config.deinit();
+    var shared_cache = remote_capabilities.Cache.init(a, std.testing.io);
+    defer shared_cache.deinit();
+    const indexes =
+        \\{"search":{"type":"embeddings","field":"body","dimension":2,"embedder":{"provider":"antfly","model":"connections/private/models/embeddinggemma2"}}}
+    ;
+    var first = try ManagedEmbedder.initFromIndexesJsonWithOptions(a, indexes, .{
+        .io = std.testing.io,
+        .inference_connections = &config.connections,
+        .remote_capability_cache = &shared_cache,
+    });
+    defer first.deinit();
+    var second = try ManagedEmbedder.initFromIndexesJsonWithOptions(a, indexes, .{
+        .io = std.testing.io,
+        .inference_connections = &config.connections,
+        .remote_capability_cache = &shared_cache,
+    });
+    defer second.deinit();
+    const first_cache = first.findQueryEntry("search").?.capabilityCache().?;
+    const second_cache = second.findQueryEntry("search").?.capabilityCache().?;
+    try std.testing.expect(first_cache != &shared_cache);
+    try std.testing.expect(second_cache != &shared_cache);
+    try std.testing.expect(first_cache != second_cache);
+}
+
+test "managed embedder takes Cloudflare routing and credentials from the connection" {
+    const a = std.testing.allocator;
+    var config = try inference_config.Config.parseFromSlice(a,
+        \\{"connections":{"workers":{"kind":"inference","capabilities":["models.embed"],"inference":{"provider":"cloudflare","account_id":"account","gateway_id":"gateway","api_key":"fixture"}}}}
+    );
+    defer config.deinit();
+    const options: InitOptions = .{ .inference_connections = &config.connections };
+    var index = try embeddings_types.parseConfigFromSlice(a,
+        \\{"provider":"cloudflare","model":"connections/workers/models/@cf/baai/bge-base-en-v1.5"}
+    );
+    defer index.deinit(a);
+    const connection = (try EmbeddingConnection.resolve(index, .cloudflare, options)).?;
+    const effective = connection.effective(index);
+    try std.testing.expectEqualStrings("@cf/baai/bge-base-en-v1.5", effective.model);
+    try std.testing.expectEqualStrings("gateway", effective.gateway_id.?);
+    try std.testing.expectEqualStrings("fixture", effective.api_key.?);
+    const endpoint = try connection.endpoint(a, .cloudflare, effective, "");
+    defer a.free(endpoint);
+    try std.testing.expectEqualStrings("https://api.cloudflare.com/client/v4/accounts/account/ai/v1", endpoint);
+    var overridden = index;
+    overridden.account_id = "another-account";
+    try std.testing.expectError(error.InvalidManagedEmbeddingIndex, EmbeddingConnection.resolve(overridden, .cloudflare, options));
+}
+
+test "managed embedder pins cloud connection placement and excludes bearer tokens" {
+    const a = std.testing.allocator;
+    var config = try inference_config.Config.parseFromSlice(a,
+        \\{"connections":{"google":{"kind":"inference","capabilities":["models.embed"],"inference":{"provider":"vertex","url":"https://vertex.internal","project_id":"production","location":"us-central1","api_key":"token-value"}},"aws":{"kind":"inference","capabilities":["models.embed"],"inference":{"provider":"bedrock","url":"https://bedrock.internal","region":"us-west-2","api_key":"token-value"}},"regional":{"kind":"inference","capabilities":["models.embed"],"inference":{"provider":"bedrock","region":"eu-west-1"}}}}
+    );
+    defer config.deinit();
+    const options: InitOptions = .{ .io = std.testing.io, .inference_connections = &config.connections };
+    for ([_]struct { index: []const u8, endpoint_prefix: []const u8, region: []const u8 }{
+        .{
+            .index = "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":2,\"embedder\":{\"provider\":\"vertex\",\"model\":\"connections/google/models/text-embedding-005\"}}",
+            .endpoint_prefix = "https://vertex.internal",
+            .region = "us-central1",
+        },
+        .{
+            .index = "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":2,\"embedder\":{\"provider\":\"bedrock\",\"model\":\"connections/aws/models/amazon.titan-embed-text-v2:0\"}}",
+            .endpoint_prefix = "https://bedrock.internal",
+            .region = "us-west-2",
+        },
+        .{
+            .index = "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":2,\"embedder\":{\"provider\":\"bedrock\",\"model\":\"connections/regional/models/amazon.titan-embed-text-v2:0\"}}",
+            .endpoint_prefix = "https://bedrock-runtime.eu-west-1.amazonaws.com",
+            .region = "eu-west-1",
+        },
+    }) |fixture| {
+        var index = try std.json.parseFromSlice(std.json.Value, a, fixture.index, .{});
+        defer index.deinit();
+        const identity = try embeddingSemanticProducerJsonAllocWithOptions(a, index.value, options);
+        defer a.free(identity);
+        var decoded = try std.json.parseFromSlice(std.json.Value, a, identity, .{});
+        defer decoded.deinit();
+        try std.testing.expect(std.mem.startsWith(u8, decoded.value.object.get("endpoint").?.string, fixture.endpoint_prefix));
+        try std.testing.expectEqualStrings(fixture.region, decoded.value.object.get("region").?.string);
+        try std.testing.expect(std.mem.indexOf(u8, identity, "token-value") == null);
+    }
+}
+
+test "managed embedder binds default endpoint and request headers to the same client" {
+    const a = std.testing.allocator;
+    var config = try inference_config.Config.parseFromSlice(a,
+        \\{"connections":{"aws":{"kind":"inference","capabilities":["models.embed"],"inference":{"provider":"bedrock","region":"eu-west-1","allow_private_ips":false,"headers":{"X-Team":"indexing"}}}}}
+    );
+    defer config.deinit();
+    const indexes =
+        \\{"search":{"type":"embeddings","field":"body","dimension":2,"embedder":{"provider":"bedrock","model":"connections/aws/models/amazon.titan-embed-text-v2:0"}}}
+    ;
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithOptions(a, indexes, .{
+        .io = std.testing.io,
+        .inference_connections = &config.connections,
+    });
+    defer managed.deinit();
+    const entry = managed.findQueryEntry("search").?;
+    const client_cfg = entry.scoped_http.?.client.config;
+    try std.testing.expectEqualStrings("bedrock-runtime.eu-west-1.amazonaws.com", client_cfg.request_origin.?.host.?);
+    try std.testing.expect(client_cfg.address_filter != null);
+    const source = client_cfg.request_headers.?;
+    var headers = httpx.Headers.init(a);
+    defer headers.deinit();
+    try source.apply(source.context, &headers);
+    try std.testing.expectEqualStrings("indexing", headers.get("X-Team").?);
+}
+
+test "managed embedder forwards billing only for a mapped query principal" {
+    const a = std.testing.allocator;
+    var config = try inference_config.Config.parseFromSlice(a,
+        \\{"connections":{"private":{"kind":"inference","capabilities":["models.embed"],"inference":{"provider":"openai","url":"https://gateway.internal","attribution":{"header":"X-Billing-Team","principals":{"alice":"team-a"},"projects":{"acme/search":"search-team"}}}}}}
+    );
+    defer config.deinit();
+    const indexes =
+        \\{"search":{"type":"embeddings","field":"body","dimension":2,"embedder":{"provider":"openai","model":"connections/private/models/text-embedding-3-small"}}}
+    ;
+    var options: InitOptions = .{
+        .io = std.testing.io,
+        .inference_connections = &config.connections,
+        .attribution_principal = "alice",
+        .defer_attribution_denial = true,
+    };
+    var allowed = try ManagedEmbedder.initFromIndexesJsonWithOptions(a, indexes, options);
+    defer allowed.deinit();
+    const allowed_entry = allowed.findQueryEntry("search").?;
+    const source = allowed_entry.scoped_http.?.client.config.request_headers.?;
+    var headers = httpx.Headers.init(a);
+    defer headers.deinit();
+    try source.apply(source.context, &headers);
+    try std.testing.expectEqualStrings("team-a", headers.get("X-Billing-Team").?);
+
+    options.attribution_metadata_json = "{\"tenant_id\":\"acme\",\"project_id\":\"search\"}";
+    var scoped = try ManagedEmbedder.initFromIndexesJsonWithOptions(a, indexes, options);
+    defer scoped.deinit();
+    const scoped_source = scoped.findQueryEntry("search").?.scoped_http.?.client.config.request_headers.?;
+    var scoped_headers = httpx.Headers.init(a);
+    defer scoped_headers.deinit();
+    try scoped_source.apply(scoped_source.context, &scoped_headers);
+    try std.testing.expectEqualStrings("search-team", scoped_headers.get("X-Billing-Team").?);
+
+    options.attribution_metadata_json = "{\"tenant_id\":\"other\",\"project_id\":\"search\"}";
+    var cross_tenant = try ManagedEmbedder.initFromIndexesJsonWithOptions(a, indexes, options);
+    defer cross_tenant.deinit();
+    try std.testing.expectError(error.InferenceAttributionDenied, cross_tenant.prepareQueryEmbedding(a, "search", 0, null, "", null));
+
+    options.attribution_metadata_json = "";
+    options.attribution_principal = "bob";
+    var denied = try ManagedEmbedder.initFromIndexesJsonWithOptions(a, indexes, options);
+    defer denied.deinit();
+    try std.testing.expectError(error.InferenceAttributionDenied, denied.prepareQueryEmbedding(a, "search", 0, null, "", null));
 }
 
 fn isAntflyProvider(provider: ProviderKind) bool {
@@ -6821,7 +7156,10 @@ fn embedWithEntryPartsForTaskOnce(
         defer if (fallback_http) |*client| client.deinit();
         const http = try entry.httpClient(alloc, &fallback_http);
 
+        const bearer = if (entry.api_key) |*key| try key.resolveOwned(alloc, entry.secret_store) else null;
+        defer if (bearer) |value| alloc.free(value);
         var provider = bedrock_provider.Provider.initWithCredentialCache(alloc, http, .{
+            .embedding_bearer_token = bearer,
             .region = entry.region,
             .endpoint = entry.base_url,
             .request_format = entry.bedrock_request_format,
@@ -7559,6 +7897,25 @@ pub fn testTextOnlyManagedProvidersRejectMedia() !void {
     );
 }
 
+pub fn defaultConnectionEmbeddingURL(alloc: std.mem.Allocator, provider_name: []const u8, location: ?[]const u8, region: ?[]const u8) !?[]const u8 {
+    if (std.mem.eql(u8, provider_name, "openai")) return try resolveOpenAiBaseUrl(alloc, .{ .provider = .openai });
+    if (std.mem.eql(u8, provider_name, "openrouter")) return try resolveOpenRouterBaseUrl(alloc, .{ .provider = .openrouter });
+    if (std.mem.eql(u8, provider_name, "ollama")) return try resolveOllamaBaseUrl(alloc, .{ .provider = .ollama });
+    if (std.mem.eql(u8, provider_name, "cohere")) return try resolveCohereBaseUrl(alloc, .{ .provider = .cohere });
+    if (std.mem.eql(u8, provider_name, "gemini")) return try resolveGeminiBaseUrl(alloc, .{ .provider = .gemini });
+    if (std.mem.eql(u8, provider_name, "vertex")) {
+        const effective_location = try resolveVertexLocation(alloc, .{ .provider = .vertex, .location = location orelse "" });
+        defer alloc.free(effective_location);
+        return try provider_defaults.vertexRegionalV1BaseAlloc(alloc, "", effective_location);
+    }
+    if (std.mem.eql(u8, provider_name, "bedrock")) {
+        const effective_region = try resolveBedrockRegion(alloc, .{ .provider = .bedrock, .region = region orelse "" });
+        defer alloc.free(effective_region);
+        return try provider_defaults.bedrockRuntimeEndpointAlloc(alloc, "", effective_region);
+    }
+    return null;
+}
+
 fn resolveOpenAiBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_types.Config) ![]u8 {
     const raw = try resolveConfigString(
         alloc,
@@ -8279,7 +8636,9 @@ fn embedBatchWithVertex(
     var fallback_http: ?httpx.Client = null;
     defer if (fallback_http) |*client| client.deinit();
     const http = try entry.httpClient(alloc, &fallback_http);
-    const token_source = if (entry.google_credentials) |manager|
+    const bearer = if (entry.api_key) |*key| try key.resolveOwned(alloc, entry.secret_store) else null;
+    defer if (bearer) |value| alloc.free(value);
+    const token_source = if (bearer != null) null else if (entry.google_credentials) |manager|
         manager.tokenSourceWithControl(
             if (entry.credentials_path.len > 0) entry.credentials_path else null,
             vertex_provider.vertex_auth_scope,
@@ -8296,6 +8655,7 @@ fn embedBatchWithVertex(
         .location = entry.location,
         .credentials_path = if (entry.credentials_path.len > 0) entry.credentials_path else null,
         .token_source = token_source,
+        .bearer_token = bearer,
         .request_control = auth_control,
     });
     defer provider.deinit();
@@ -8465,7 +8825,10 @@ fn embedBatchWithBedrockRequest(
     var fallback_http: ?httpx.Client = null;
     defer if (fallback_http) |*client| client.deinit();
     const http = try entry.httpClient(alloc, &fallback_http);
+    const bearer = if (entry.api_key) |*key| try key.resolveOwned(alloc, entry.secret_store) else null;
+    defer if (bearer) |value| alloc.free(value);
     var provider = bedrock_provider.Provider.initWithCredentialCache(alloc, http, .{
+        .embedding_bearer_token = bearer,
         .region = entry.region,
         .endpoint = entry.base_url,
         .request_format = entry.bedrock_request_format,

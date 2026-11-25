@@ -49,6 +49,15 @@ pub const ReconcileDbIndexOptions = struct {
     embedding_options: managed_embedder.InitOptions = .{},
     source_table: []const u8 = "",
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
+
+    fn managedEmbeddingOptions(self: ReconcileDbIndexOptions) managed_embedder.InitOptions {
+        var options = self.embedding_options;
+        if (self.source_table.len != 0 and options.inference_connections != null) {
+            options.source_table = self.source_table;
+            options.enable_index_attribution = true;
+        }
+        return options;
+    }
 };
 
 pub fn dbIndexReconciliationCanMutate(db: *const db_mod.DB) bool {
@@ -73,7 +82,7 @@ pub fn reconcileDbIndexesWithOptions(
         for (desired_enrichments.items) |*cfg| cfg.deinit(alloc);
         desired_enrichments.deinit(alloc);
     }
-    try collectDesiredEnrichmentsFromJson(alloc, indexes_json, options.embedding_options, &desired_enrichments);
+    try collectDesiredEnrichmentsFromJson(alloc, indexes_json, options.managedEmbeddingOptions(), &desired_enrichments);
     try indexes_api.validateArtifactEnrichmentConfigs(alloc, desired_enrichments.items);
     dedupeDesiredEnrichments(alloc, &desired_enrichments);
     try indexes_api.sortArtifactEnrichmentsByDependency(alloc, desired_enrichments.items);
@@ -162,7 +171,7 @@ pub fn reconcileDbIndexTargetWithOptions(
         for (desired_enrichments.items) |*cfg| cfg.deinit(alloc);
         desired_enrichments.deinit(alloc);
     }
-    try collectDesiredEnrichmentsFromJson(alloc, indexes_json, options.embedding_options, &desired_enrichments);
+    try collectDesiredEnrichmentsFromJson(alloc, indexes_json, options.managedEmbeddingOptions(), &desired_enrichments);
     try indexes_api.validateArtifactEnrichmentConfigs(alloc, desired_enrichments.items);
     dedupeDesiredEnrichments(alloc, &desired_enrichments);
     try indexes_api.sortArtifactEnrichmentsByDependency(alloc, desired_enrichments.items);
@@ -198,7 +207,7 @@ pub fn reconcileDbIndexTargetWithOptions(
     }
 
     if (target_value) |value| {
-        try indexes_api.collectArtifactEnrichmentsFromValueWithOptions(alloc, value, options.embedding_options, &target_enrichments);
+        try indexes_api.collectArtifactEnrichmentsFromValueWithOptions(alloc, value, options.managedEmbeddingOptions(), &target_enrichments);
         // Root producers are shared declarations, but activation owns only the
         // transitive dependency closure of its target. The desired list is
         // already in topological order, so append selected nodes in that order.

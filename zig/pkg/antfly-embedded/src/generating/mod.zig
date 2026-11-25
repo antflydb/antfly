@@ -211,6 +211,12 @@ test "Apple generation backend bypasses HTTP quotas and honors request deadlines
     try std.testing.expectError(error.Timeout, generator.generate(alloc, "", &.{.{ .role = .user, .content = .{ .text = "hello" } }}));
 }
 
+pub const ManagedConnections = struct {
+    connections: *const @import("../common/config.zig").Config.ConnectionsConfig,
+    principal: ?[]const u8 = null,
+    metadata_json: []const u8 = "",
+};
+
 pub const BackendFactory = struct {
     chatgpt: ?*chatgpt_manager.Manager = null,
     personal_owner: ?[]const u8 = null,
@@ -229,6 +235,7 @@ pub const BackendFactory = struct {
     usage_observer: ?provider_limits.UsageObserver = null,
     provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     require_completion: bool = false,
+    managed_connections: ?ManagedConnections = null,
 
     pub fn init(alloc: std.mem.Allocator, http: *httpx.Client) BackendFactory {
         return .{ .alloc = alloc, .http = http };
@@ -258,6 +265,7 @@ pub const BackendFactory = struct {
         usage_observer: ?provider_limits.UsageObserver = null,
         provider_runtime: ?*managed_embedder.ProviderRuntime = null,
         require_completion: bool = false,
+        managed_connections: ?ManagedConnections = null,
     };
 
     pub fn initWithOptions(
@@ -286,6 +294,7 @@ pub const BackendFactory = struct {
             .usage_observer = options.usage_observer,
             .provider_runtime = options.provider_runtime,
             .require_completion = options.require_completion,
+            .managed_connections = options.managed_connections,
         };
     }
 
@@ -298,6 +307,8 @@ pub const BackendFactory = struct {
 
     fn create(ptr: *anyopaque, alloc: std.mem.Allocator, cfg: GeneratorConfig) !lib.Generator {
         const self: *BackendFactory = @ptrCast(@alignCast(ptr));
+        if (std.mem.startsWith(u8, cfg.model, "connections/"))
+            return ManagedBackend.init(alloc, self, cfg);
         if (cfg.provider == .chatgpt) {
             try cfg.validate();
             const manager = self.chatgpt orelse return error.ChatGPTDisabled;
@@ -307,6 +318,50 @@ pub const BackendFactory = struct {
             return .{ .ptr = state, .vtable = &.{ .generate = ChatGPTBackend.generate, .deinit = ChatGPTBackend.deinit } };
         }
         return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key, self.max_response_bytes, self.execution, self.request_context, self.limits, self.usage_observer, self.provider_runtime, self.require_completion);
+    }
+};
+
+const ManagedBackend = struct {
+    const connection_runtime = @import("connection_runtime.zig");
+
+    arena: std.heap.ArenaAllocator,
+    client: httpx.Client,
+    inner: lib.Generator,
+    model: []const u8,
+
+    fn init(alloc: std.mem.Allocator, factory: *BackendFactory, cfg: GeneratorConfig) !lib.Generator {
+        const binding = factory.managed_connections orelse return error.ConnectionNotFound;
+        const state = try alloc.create(ManagedBackend);
+        errdefer alloc.destroy(state);
+        state.arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer state.arena.deinit();
+        const a = state.arena.allocator();
+        var resolved_cfg = cfg;
+        const resolved = (try connection_runtime.resolveGenerator(binding.connections, a, &resolved_cfg, .generate)) orelse unreachable;
+        state.model = resolved_cfg.model;
+        state.client = try connection_runtime.client(a, alloc, factory.http.io, resolved, resolved_cfg.url, "generate", .{
+            .principal = binding.principal,
+            .metadata_json = binding.metadata_json,
+            .secret_store = factory.secret_store,
+            .max_response_bytes = factory.max_response_bytes orelse 0,
+        });
+        errdefer state.client.deinit();
+        state.inner = try BackendState.init(alloc, &state.client, resolved_cfg, null, factory.secret_store, null, factory.max_response_bytes, factory.execution, factory.request_context, factory.limits, factory.usage_observer, factory.provider_runtime, factory.require_completion);
+        return .{ .ptr = state, .vtable = &.{ .generate = generate, .deinit = deinit } };
+    }
+
+    fn generate(raw: *anyopaque, alloc: std.mem.Allocator, _: []const u8, messages: []const ChatMessage) !GenerateResult {
+        const self: *ManagedBackend = @ptrCast(@alignCast(raw));
+        return self.inner.generate(alloc, self.model, messages);
+    }
+
+    fn deinit(raw: *anyopaque) void {
+        const self: *ManagedBackend = @ptrCast(@alignCast(raw));
+        const alloc = self.arena.child_allocator;
+        self.inner.deinit();
+        self.client.deinit();
+        self.arena.deinit();
+        alloc.destroy(self);
     }
 };
 
@@ -1017,6 +1072,40 @@ pub fn executeChainWithOptions(
     };
     const control = Control{ .options = effective };
     return try lib.executeChainWithControl(alloc, http.io, chain, factory_impl.factory(), messages, .{ .context = &control, .check_fn = Control.check });
+}
+
+test "generating backend binds each managed chain link and enforces attribution" {
+    const a = std.testing.allocator;
+    var config = try @import("../common/config.zig").Config.parseFromSlice(a,
+        \\{"connections":{"private":{"kind":"inference","capabilities":["models.generate"],"inference":{"provider":"openai","url":"https://gateway.internal/v1","api_key":"key","attribution":{"header":"X-Billing","principals":{"alice":"team-a"}}}}}}
+    );
+    defer config.deinit();
+    var shared = httpx.Client.init(a, std.testing.io);
+    defer shared.deinit();
+    const cfg = GeneratorConfig{ .provider = .openai, .model = "connections/private/models/gpt-4.1", .url = "" };
+    var factory = BackendFactory.initWithOptions(a, &shared, .{ .managed_connections = .{ .connections = &config.connections, .principal = "bob" } });
+    try std.testing.expectError(error.InferenceAttributionDenied, factory.factory().create(a, cfg));
+    factory.managed_connections.?.principal = "alice";
+    var backend = try factory.factory().create(a, cfg);
+    defer backend.deinit();
+    const managed: *ManagedBackend = @ptrCast(@alignCast(backend.ptr));
+    try std.testing.expectEqualStrings("gpt-4.1", managed.model);
+    try std.testing.expectEqualStrings("gateway.internal", managed.client.config.request_origin.?.host.?);
+    const header = managed.client.config.default_headers.?[0];
+    try std.testing.expectEqualStrings("X-Billing", header[0]);
+    try std.testing.expectEqualStrings("team-a", header[1]);
+}
+
+test "generating backend fails closed for an unresolved connection model" {
+    const a = std.testing.allocator;
+    var client = httpx.Client.init(a, std.testing.io);
+    defer client.deinit();
+    var factory = BackendFactory.initWithOptions(a, &client, .{});
+    try std.testing.expectError(error.ConnectionNotFound, factory.factory().create(a, .{
+        .provider = .openai,
+        .model = "connections/private/models/example",
+        .url = "https://api.openai.com/v1",
+    }));
 }
 
 test "generating backend Bedrock borrows service credential caches by region" {

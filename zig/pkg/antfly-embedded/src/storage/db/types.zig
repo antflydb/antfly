@@ -2306,7 +2306,19 @@ pub const GraphQueryDiagnosticSink = struct {
 };
 
 pub const IndexAliasFence = struct { name: []const u8, incarnation: u64 };
+pub const QueryInferenceBinding = struct {
+    connections: *const @import("../../common/config.zig").Config.ConnectionsConfig,
+    principal: ?[]const u8 = null,
+    metadata_json: []const u8 = "",
+};
+
 pub const SearchRequest = struct {
+    pub fn usesInferenceBinding(self: @This()) bool {
+        if (self.evaluation_limit > 0) return true;
+        const reranker = self.reranker orelse return false;
+        return std.mem.startsWith(u8, reranker.model, "connections/");
+    }
+
     pub fn hasHitEvaluation(self: @This()) bool {
         return self.evaluation_limit > 0 and !self.evaluation_graph;
     }
@@ -2315,6 +2327,8 @@ pub const SearchRequest = struct {
     /// a nonzero value must match the installed policy before reading data.
     index_alias_fences: []const IndexAliasFence = &.{},
     privacy_policy_version: ?[64]u8 = null,
+    // Borrowed from the trusted query coordinator. Never serialized.
+    inference_binding: ?QueryInferenceBinding = null,
     /// Trusted graph admission workspace; never part of the public wire DSL.
     graph_work_budget: ?*@import("../../graph/work_budget.zig").WorkBudget = null,
     /// Trusted request-local preparation, never decoded from public input.
@@ -2614,6 +2628,7 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "merge_config",
     "reranker",
     "reranker_query_text",
+    "inference_binding",
     "pruner",
     "expand_strategy",
     "max_chunks_per_parent",
