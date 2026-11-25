@@ -274,14 +274,17 @@ pub const State = struct {
         const row = try @import("encoder_decoder_runtime.zig").residentVocabularyRow(self.allocator, self.session, &outputs, self.logits_index, suffix.tokens.len, self.vocab_size, control);
         errdefer self.allocator.free(row);
         for (self.roles, updated) |role, *slot| switch (role) {
-            .past => |past| if (!past.cross) {
-                const provisional = slot.* orelse return error.InvalidDecoderOutput;
+            .past => |past| {
+                const provisional = slot.* orelse {
+                    if (past.cross) continue; // An omitted cross output keeps its previous binding.
+                    return error.InvalidDecoderOutput;
+                };
                 var aliases: usize = 0;
                 for (outputs.outputs) |value| {
                     if (value == provisional.input.value) aliases += 1;
                 }
                 if (aliases != 1) continue;
-                const adopted = self.adoptSelfCache(provisional) catch |err| switch (err) {
+                const adopted = self.adoptCache(provisional, if (past.cross) .standalone else .pooled_or_standalone) catch |err| switch (err) {
                     error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => null,
                     else => return err,
                 };
@@ -309,14 +312,22 @@ pub const State = struct {
         return row;
     }
 
-    fn adoptSelfCache(self: *State, source: ResidentSlot) !?ResidentSlot {
+    const CacheAdoption = enum { standalone, pooled_or_standalone };
+
+    fn adoptCache(self: *State, source: ResidentSlot, policy: CacheAdoption) !?ResidentSlot {
         const shared = self.session.shared_compute_context orelse return null;
         const backend = shared.stableBackend();
         if (self.session.model_lifetime == null or source.input.backend.ptr != backend.ptr or source.input.backend.vtable != backend.vtable) return null;
         const kernels = backend.vtable.kernels orelse return null;
         if (!kernels.accepts(backend.vtable)) return null;
         const retain = kernels.retainImmutableTensor orelse return null;
-        const pooled = if (kernels.pooledOutputStorage) |storage| storage(backend.ptr, source.input.value) else null;
+        // A cross-cache binding can outlive every suffix. Detaching a
+        // standalone allocation avoids migration without pinning a reusable
+        // producer bank for the rest of the sequence.
+        const pooled = if (policy == .pooled_or_standalone)
+            if (kernels.pooledOutputStorage) |storage| storage(backend.ptr, source.input.value) else null
+        else
+            null;
         var admission = if (pooled) |lease| blk: {
             if (lease.backend.ptr != backend.ptr or lease.backend.vtable != backend.vtable or
                 lease.usage != .ordinary or lease.accounting_class != .activation or lease.isReadOnly() or
@@ -788,7 +799,7 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
                 standalone_input.input.value = original;
                 standalone_input.input.backend = shared.stableBackend();
                 const before_adopt = controller.snapshot();
-                const adopted = (try state.adoptSelfCache(standalone_input)) orelse return error.MissingIndependentSelfCache;
+                const adopted = (try state.adoptCache(standalone_input, .standalone)) orelse return error.MissingIndependentSelfCache;
                 defer adopted.pin.release();
                 try std.testing.expect(adopted.independent);
                 try std.testing.expect(controller.snapshot().backend_kv_bytes >= before_adopt.backend_kv_bytes + owned.input.estimated_bytes);
@@ -971,7 +982,9 @@ fn checkPooledSelfAdoption(state: *State, previous: ResidentSlot, controller: *@
         const charged = controller.snapshot();
         var source = previous;
         source.input.value = value;
-        const result = (try state.adoptSelfCache(source)) orelse return error.MissingIndependentPooledCache;
+        try std.testing.expect((try state.adoptCache(source, .standalone)) == null);
+        try std.testing.expectEqualDeep(charged, controller.snapshot());
+        const result = (try state.adoptCache(source, .pooled_or_standalone)) orelse return error.MissingIndependentPooledCache;
         errdefer result.pin.release();
         try std.testing.expect(result.independent);
         try std.testing.expectEqualDeep(charged, controller.snapshot());
