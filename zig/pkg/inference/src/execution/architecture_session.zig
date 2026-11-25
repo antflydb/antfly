@@ -5846,7 +5846,7 @@ fn prepareWhisperProjectionPacks(cb: *const ops.ComputeBackend, layers: []const 
     };
     if (count == 0) return;
     Metal.prepareColdDecoderQkvPacks(cb, requests[0..count], allocator, pin, cleanup) catch |err| switch (err) {
-        error.QueueFull, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.MemoryBudgetExceeded => return,
+        error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.MemoryBudgetExceeded => return,
         else => return err,
     };
 }
@@ -5886,7 +5886,7 @@ fn buildColdNativeWhisper(self: *ColdNativeWhisper, session: Session, allocator:
     if (cb.kind() == .metal and !try self.weights.?.prepareMetalSchedulePayload(cb, data, config)) return false;
     if (comptime build_options.enable_metal) {
         if (cb.kind() == .metal and initial_rows != null and initial_rows.? > 1 and encoder == .host and
-            @import("antfly_platform").env.getenvBool("TERMITE_METAL_WHISPER_PREPARE_PACKED_QKV"))
+            whisper_arch.metalPackedPrefillEnabled())
         {
             if (domain) |pin| try prepareWhisperProjectionPacks(cb, self.weights.?.weights.layers, config.d_model, metadata.allocator(), pin, current);
         }
@@ -12981,7 +12981,7 @@ test "Metal Whisper prepared initial rows and decode match ordinary execution" {
     var session = try incrementalMetalFixtureSession(a);
     defer session.close();
     try session.installOwnedExecutionGate(a);
-    const packed_enabled = @import("antfly_platform").env.getenvBool("TERMITE_METAL_WHISPER_PREPARE_PACKED_QKV");
+    const packed_enabled = whisper_arch.metalPackedPrefillEnabled();
     const domain = if (packed_enabled) try @import("../runtime/tier/admission_domain.zig").Domain.create() else null;
     defer if (domain) |owner| owner.release();
     if (domain) |owner| {

@@ -667,6 +667,12 @@ fn whisperMetalFramesEnabled() bool {
     return !platform.env.getenvBool("TERMITE_WHISPER_METAL_DISABLE_FRAMES");
 }
 
+pub fn metalPackedPrefillEnabled() bool {
+    return whisperMetalFramesEnabled() and
+        !platform.env.getenvBool("TERMITE_METAL_DISABLE_DENSE_QKV_PACKED") and
+        platform.env.getenvBool("TERMITE_METAL_WHISPER_PREPARE_PACKED_QKV");
+}
+
 fn whisperMetalProfileEnabled() bool {
     return platform.env.getenvBool("TERMITE_WHISPER_METAL_PROFILE");
 }

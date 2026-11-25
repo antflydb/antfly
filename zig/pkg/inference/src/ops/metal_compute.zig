@@ -13817,10 +13817,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.shared_provider_lease_io = null;
         unlockSharedMetalData(self.data, io);
         const prepared = prepareProjectionPacksOutsideExecution(cb, null, requests, allocator, pin, cleanup);
-        const resumed_io = lockSharedMetalData(self.data, self.io) catch return error.PreparedProjectionProviderResumeFailed;
+        const resumed_io = try lockSharedMetalData(self.data, self.io);
         self.shared_provider_lease_io = resumed_io;
         try self.beginEngineOperation();
-        try prepared;
+        // Contention during optional packing can use the restored ordinary
+        // receiver. Contention while restoring the receiver must reach the
+        // caller so it can retry construction with an actual provider lease.
+        prepared catch |err| switch (err) {
+            error.QueueFull, error.UnpreparedPackedProjectionScope => return,
+            else => return err,
+        };
     }
 
     const ProjectionPackSlot = struct { slot: usize, geometry: ops.kernel_descriptor.Linear };
