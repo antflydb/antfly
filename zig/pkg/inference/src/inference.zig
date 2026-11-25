@@ -508,4 +508,5 @@ test {
     _ = @import("architectures/inkling2_chat.zig");
     _ = @import("architectures/inkling2_moe_metal.zig");
     _ = @import("architectures/inkling2_attention_weights.zig");
+    _ = @import("architectures/inkling2_attention_metal.zig");
 }
