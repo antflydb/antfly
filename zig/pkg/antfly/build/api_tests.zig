@@ -128,6 +128,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api http server routes table query through read schema full text index",
         "api http server serves table query response envelope",
         "api http server query string boolean controls survive reopen",
+        "query string stopword pruning survives worker transport",
         "api http server executes public Query filter roots and compositions",
         "public table query handler preserves structured filter and hierarchy diagnostics",
         "query dependency errors expose a stable JSON retry contract",
