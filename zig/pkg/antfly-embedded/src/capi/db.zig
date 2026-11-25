@@ -836,6 +836,9 @@ pub const HandleGuard = struct {
     /// Tracked separately from `guard.handle` because that field can be
     /// reassigned to a child table handle later in the same entry.
     lane_pinned_root: ?*Handle = null,
+    /// The runtime a resumed write continued on, when it was not the one it
+    /// was admitted on (`resumeWriterLaneAfterIndexedWait`).
+    resumed_root: ?*Handle = null,
     /// Busy-wait budget left for this export call. The busy timeout bounds
     /// total admission waiting across every re-entry of one call (for
     /// example after inference), not each admission separately. Null means
@@ -967,7 +970,21 @@ pub const HandleGuard = struct {
         }
         self.connection_gate_held = true;
         self.writer_lane_released = false;
+        if (!same_runtime) self.resumed_root = root;
         return same_runtime;
+    }
+
+    /// A committed write's visibility work was owed to the runtime it was
+    /// admitted on, which was replaced while it waited
+    /// (`EnrichmentSourceChanged` from the resume). The replacement opened
+    /// after the outgoing store drained, so it already holds this commit:
+    /// finish the batch's sync level there instead of reporting the
+    /// committed write as stalled.
+    pub fn finishCommittedOnCurrentRuntime(self: *HandleGuard, sync_level: db_mod.types.SyncLevel) !void {
+        if (!self.lane_managed or !self.writer_lane_released) return error.EnrichmentSourceChanged;
+        _ = try self.resumeWriterLaneAfterIndexedWait(true);
+        const root = self.resumed_root orelse self.lane_pinned_root orelse return error.EnrichmentSourceChanged;
+        try root.database().waitForCurrentSyncLevelWithCancellation(sync_level, .none);
     }
 
     pub fn releaseWriterLaneBeforeWait(self: *HandleGuard) void {
@@ -1704,6 +1721,15 @@ pub fn trackedBatchWithWriterLaneHook(
             writer.retire(marker, if (named) |name| .{ .name = name, .id = database.core.identity_namespace.table_id } else null);
         return err;
     };
+}
+
+/// Whether a batch that failed after its primary write committed, because
+/// its runtime was replaced while it waited, reached its sync level on the
+/// replacement. Table handles keep the stalled report.
+fn committedOnReplacedRuntime(guard: *HandleGuard, handle: *Handle, err: anyerror, primary_committed: bool, sync_level: db_mod.types.SyncLevel) bool {
+    if (!primary_committed or err != error.EnrichmentSourceChanged or handle.selected_db != null) return false;
+    guard.finishCommittedOnCurrentRuntime(sync_level) catch return false;
+    return true;
 }
 
 /// C result for a failed batch, classified by the batch's own state: an
@@ -5414,7 +5440,9 @@ pub fn antfly_db_batch_json(
     defer receipt_scope.end();
     var primary_committed = false;
     // A table handle commits to its table's database, which holds the marker.
-    trackedBatchWithWriterLaneHook(handle.database(), db_mod.types.fromPublicMutation(owned.req), &primary_committed, handle.selected_table_name, writerLaneHookFromGuard(&guard)) catch |err| return batchFailureCode(err, primary_committed);
+    trackedBatchWithWriterLaneHook(handle.database(), db_mod.types.fromPublicMutation(owned.req), &primary_committed, handle.selected_table_name, writerLaneHookFromGuard(&guard)) catch |err| {
+        if (!committedOnReplacedRuntime(&guard, handle, err, primary_committed, db_mod.types.fromPublicMutation(owned.req).sync_level)) return batchFailureCode(err, primary_committed);
+    };
     // Committed: a response failure must not read as a failed batch.
     const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch
         return capi.recordError(.stalled, "batch committed; its response could not be encoded; do not retry the batch");
@@ -5456,7 +5484,9 @@ pub fn antfly_db_batch_wire(
     defer receipt_scope.end();
     var primary_committed = false;
     const req = decoded.asRequest();
-    trackedBatchWithWriterLaneHook(handle.database(), db_mod.types.fromPublicMutation(req), &primary_committed, handle.selected_table_name, writerLaneHookFromGuard(&guard)) catch |err| return batchFailureCode(err, primary_committed);
+    trackedBatchWithWriterLaneHook(handle.database(), db_mod.types.fromPublicMutation(req), &primary_committed, handle.selected_table_name, writerLaneHookFromGuard(&guard)) catch |err| {
+        if (!committedOnReplacedRuntime(&guard, handle, err, primary_committed, db_mod.types.fromPublicMutation(req).sync_level)) return batchFailureCode(err, primary_committed);
+    };
     const response = batch_api.encodeBatchResponse(std.heap.c_allocator, .{
         .inserted = @as(u32, @intCast(decoded.writes.len)),
         .deleted = @as(u32, @intCast(decoded.deletes.len)),
