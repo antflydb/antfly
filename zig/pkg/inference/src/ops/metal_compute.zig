@@ -24018,6 +24018,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (!metal_runtime.decoderRuntimeAudioClampInto(self.provider_impl, mt, mt, (p.flags >> 2) & 3, p.output_min, p.output_max, p.flags & 16 != 0)) return error.AudioScheduleRouteChanged;
             };
             if (owns_frame) {
+                // Hand scratch to the frame's retirement path so an audio
+                // storage scope can reuse it after this submission completes.
+                if (owned_scratch) |*tensor| self.retireTemporaryWorkspaceValue(tensor);
+                owned_scratch = null;
                 try metal_runtime.submitFrame(runtime);
                 owns_frame = false;
                 try metal_runtime.waitFrame(runtime);
@@ -63151,19 +63155,28 @@ test "Metal prepared audio projection consumes disjoint clamp workspace after fu
     }
     request.output = null;
     request.input_workspace = null;
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime_mod.antfly_metal_audio_storage_scope(runtime, 1));
+    defer _ = metal_runtime_mod.antfly_metal_audio_storage_scope(runtime, 0);
     const frames_before = metal_runtime_mod.frameCommandBufferCount(runtime);
+    const storage_hits = metal_runtime_mod.antfly_metal_audio_storage_hits(runtime);
     const eager = (try compute.encodeAudioLinear(&compute, source, &request, .staged)) orelse return error.MissingAudioProjection;
     defer cb.free(eager);
-    try std.testing.expectEqual(frames_before + 1, metal_runtime_mod.frameCommandBufferCount(runtime));
+    const repeat = (try compute.encodeAudioLinear(&compute, source, &request, .staged)) orelse return error.MissingAudioProjection;
+    defer cb.free(repeat);
+    try std.testing.expectEqual(frames_before + 2, metal_runtime_mod.frameCommandBufferCount(runtime));
+    try std.testing.expectEqual(storage_hits + 1, metal_runtime_mod.antfly_metal_audio_storage_hits(runtime));
     const eager_values = try cb.toFloat32(eager, a);
     defer a.free(eager_values);
     try std.testing.expectEqualSlices(f32, expected, eager_values);
+    const repeat_values = try cb.toFloat32(repeat, a);
+    defer a.free(repeat_values);
+    try std.testing.expectEqualSlices(f32, expected, repeat_values);
     _ = observation.finish();
     const measured = observation.metal_serial_workspace orelse return error.MissingMetalAudioScratchObservation;
     try std.testing.expectEqual(@as(u64, 8), measured.planned_clamp_bindings);
     try std.testing.expectEqual(@as(u64, 8 * bytes), measured.planned_clamp_bytes);
-    try std.testing.expectEqual(@as(u64, 2), measured.temporary_clamp_bindings);
-    try std.testing.expectEqual(@as(u64, 2 * bytes), measured.temporary_clamp_bytes);
+    try std.testing.expectEqual(@as(u64, 3), measured.temporary_clamp_bindings);
+    try std.testing.expectEqual(@as(u64, 3 * bytes), measured.temporary_clamp_bytes);
     request.output = destination;
     request.input_workspace = input;
     try std.testing.expectError(error.InvalidPreparedProjectionWorkspace, MetalCompute.audioPreparedLinearOp(&compute, &request));
