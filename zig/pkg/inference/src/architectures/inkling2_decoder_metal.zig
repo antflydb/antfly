@@ -183,7 +183,7 @@ pub const prefill_chunk_rows = 16;
 const grouped_prefill_chunk_rows = 64;
 
 fn groupedPrefillEnabled() bool {
-    return @import("antfly_platform").env.getenvBool("ANTFLY_METAL_GROUPED_ROUTED_PREFILL");
+    return @import("antfly_platform").env.getenvBoolDefault("ANTFLY_METAL_GROUPED_ROUTED_PREFILL", true);
 }
 
 pub fn preferredPrefillRows() u32 {
@@ -323,6 +323,30 @@ const Work = struct {
     }
 };
 
+pub const PrefixPart = union(enum) {
+    tokens: []const i32,
+    embeddings: struct { tensor: *const Tensor, start: usize, count: usize },
+
+    pub fn rows(self: PrefixPart) usize {
+        return switch (self) {
+            .tokens => |tokens| tokens.len,
+            .embeddings => |values| values.count,
+        };
+    }
+
+    pub fn slice(self: PrefixPart, start: usize, count: usize) PrefixPart {
+        std.debug.assert(start <= self.rows() and count <= self.rows() - start);
+        return switch (self) {
+            .tokens => |tokens| .{ .tokens = tokens[start..][0..count] },
+            .embeddings => |values| .{ .embeddings = .{
+                .tensor = values.tensor,
+                .start = values.start + start,
+                .count = count,
+            } },
+        };
+    }
+};
+
 pub const Request = struct {
     model: *const Decoder,
     state: State,
@@ -424,8 +448,7 @@ pub const Request = struct {
 
     const Input = union(enum) {
         token: u32,
-        embedding: *const Tensor,
-        tokens: []const i32,
+        prefix: []const PrefixPart,
     };
 
     const Output = enum { none, logits, greedy };
@@ -439,13 +462,7 @@ pub const Request = struct {
         const hidden = work.stack.reset();
         switch (input) {
             .token => |token| try self.model.endpoints.embed(runtime, token, hidden),
-            .embedding => |image_row| try image_row.copyInto(hidden),
-            .tokens => |tokens| for (tokens, 0..) |id, index| {
-                var destination = try row(hidden, index, self.model.text.hidden_size);
-                defer destination.deinit();
-                const token = std.math.cast(u32, id) orelse return error.InvalidInkling2Token;
-                try self.model.endpoints.embed(runtime, token, &destination);
-            },
+            .prefix => |parts| try self.encodePrefix(parts, hidden),
         }
         for (self.model.schedule) |op| try self.visit(work, &pending, op);
         if (output != .none) {
@@ -466,19 +483,55 @@ pub const Request = struct {
         try self.run(&self.decode, .{ .token = token }, .none);
     }
 
+    fn encodePrefix(self: *Request, parts: []const PrefixPart, hidden: *Tensor) !void {
+        const width = self.model.text.hidden_size;
+        const row_bytes = @as(usize, width) * @sizeOf(u16);
+        var offset: usize = 0;
+        for (parts) |part| {
+            switch (part) {
+                .tokens => |tokens| for (tokens, offset..) |id, index| {
+                    var destination = try row(hidden, index, width);
+                    defer destination.deinit();
+                    const token = std.math.cast(u32, id) orelse return error.InvalidInkling2Token;
+                    try self.model.endpoints.embed(self.model.runtime, token, &destination);
+                },
+                .embeddings => |values| {
+                    const source = values.tensor;
+                    if (!source.isDevice() or source.dtype != .i16 or
+                        values.start > source.deviceByteLen() / row_bytes or
+                        values.count > source.deviceByteLen() / row_bytes - values.start)
+                        return error.InvalidShape;
+                    if (values.count > 0) {
+                        const bytes = values.count * row_bytes;
+                        const elements: i32 = @intCast(bytes / @sizeOf(u16));
+                        var image_rows = try source.retainedView(values.start * row_bytes, bytes, &.{elements});
+                        defer image_rows.deinit();
+                        var destination = try hidden.retainedView(offset * row_bytes, bytes, &.{elements});
+                        defer destination.deinit();
+                        try image_rows.copyInto(&destination);
+                    }
+                },
+            }
+            offset += part.rows();
+        }
+    }
+
+    pub fn appendPrefix(self: *Request, parts: []const PrefixPart) !void {
+        var rows: usize = 0;
+        for (parts) |part| rows = try std.math.add(usize, rows, part.rows());
+        const work = if (rows == 1) &self.decode else if (self.prefill) |*batch| batch else return error.InvalidShape;
+        if (rows != work.stack.rows) return error.InvalidShape;
+        try self.run(work, .{ .prefix = parts }, .none);
+    }
+
     pub fn appendTokens(self: *Request, tokens: []const i32) !void {
-        const batch = if (self.prefill) |*work| work else return error.InvalidShape;
-        if (tokens.len != batch.stack.rows) return error.InvalidShape;
-        try self.run(batch, .{ .tokens = tokens }, .none);
+        return self.appendPrefix(&.{.{ .tokens = tokens }});
     }
 
     pub fn appendEmbeddings(self: *Request, image_rows: *const Tensor, rows: u32) !void {
-        if (!image_rows.isDevice() or image_rows.dtype != .i16 or
-            image_rows.deviceByteLen() != @as(usize, rows) * self.model.text.hidden_size * @sizeOf(u16))
+        if (image_rows.deviceByteLen() != @as(usize, rows) * self.model.text.hidden_size * @sizeOf(u16))
             return error.InvalidShape;
-        const work = if (rows == 1) &self.decode else if (self.prefill) |*batch| batch else return error.InvalidShape;
-        if (rows != work.stack.rows) return error.InvalidShape;
-        try self.run(work, .{ .embedding = image_rows }, .none);
+        return self.appendPrefix(&.{.{ .embeddings = .{ .tensor = image_rows, .start = 0, .count = rows } }});
     }
 
     pub fn step(self: *Request, token: u32) ![]const f32 {
@@ -575,8 +628,7 @@ test "Inkling Metal resident decoder runs the released text checkpoint" {
         try std.testing.expect(std.math.isFinite(actual));
         max_delta = @max(max_delta, @abs(expected - actual));
     }
-    if (!platform.env.getenvBool("ANTFLY_METAL_BF16_TILED_PROJECTION"))
-        try std.testing.expectEqualSlices(f32, reference, candidate);
+    try std.testing.expectEqualSlices(f32, reference, candidate);
     std.debug.print("Inkling Metal prefill rows={d} serial_ms={d:.3} batched_ms={d:.3} peak_id={d} max_logit_delta={d:.5}\n", .{
         prefix.len, @as(f64, @floatFromInt(serial_ns)) / 1e6, @as(f64, @floatFromInt(batch_ns)) / 1e6, argmax(candidate), max_delta,
     });
@@ -604,8 +656,7 @@ test "Inkling Metal resident decoder runs the released text checkpoint" {
         const elapsed = time.monotonicNs() - started;
         const grouped = try large.step(last);
         try std.testing.expectEqual(argmax(baseline_logits), argmax(grouped));
-        if (!platform.env.getenvBool("ANTFLY_METAL_BF16_TILED_PROJECTION"))
-            try std.testing.expectEqualSlices(f32, baseline_logits, grouped);
+        try std.testing.expectEqualSlices(f32, baseline_logits, grouped);
         try std.testing.expectEqual(tokens.len + 1, large.state.sequence.committed_tokens);
         std.debug.print("Inkling Metal grouped prefill rows={d} default_ms={d:.3} grouped_ms={d:.3} next={d}\n", .{
             tokens.len, @as(f64, @floatFromInt(baseline_ns)) / 1e6, @as(f64, @floatFromInt(elapsed)) / 1e6, argmax(grouped),

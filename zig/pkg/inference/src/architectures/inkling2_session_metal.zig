@@ -178,9 +178,8 @@ pub const TextPipeline = struct {
             config.token_observer != null or (config.speculation_requested and config.speculation_policy == .force))
             return error.UnsupportedInkling2Request;
         const tokens = try std.math.add(usize, self.prompt.count(), @as(usize, @intCast(config.max_tokens)) - 1);
-        const prefix = @max(self.prompt.before_image.len, self.prompt.after_image.len - 1, self.prompt.imageRows());
-        const preferred = decoder.preferredPrefillRows();
-        const prefill_rows: u32 = if (prefix >= preferred) preferred else if (prefix >= decoder.prefill_chunk_rows) decoder.prefill_chunk_rows else 1;
+        const prefix = self.prompt.count() - 1;
+        const prefill_rows: u32 = @intCast(@max(1, @min(prefix, decoder.preferredPrefillRows())));
         const format: @import("../runtime/kv/hybrid_paged.zig").PlaneFormat = if (config.cache_dtype) |dtype| blk: {
             const parsed = @import("../runtime/kv/pool.zig").parseKvDType(dtype) orelse return error.UnsupportedInkling2Request;
             break :blk switch (parsed) {
@@ -209,12 +208,7 @@ pub const TextPipeline = struct {
         const greedy = chat.usesUnpenalizedGreedy(config);
         const after = self.prompt.after_image;
         const chunk_rows: u32 = @intCast(plan.bank.layout.max_append_tokens);
-        try self.prefillTokens(&request, self.prompt.before_image, chunk_rows);
-        if (self.prompt.image) |data| {
-            const encoder = vision orelse return error.UnsupportedInkling2Request;
-            try self.prefillImage(&request, model, encoder, data, chunk_rows);
-        }
-        try self.prefillTokens(&request, after[0 .. after.len - 1], chunk_rows);
+        try self.prefillPrompt(&request, model, vision, after[0 .. after.len - 1], chunk_rows);
         if (!greedy) {
             for ([_][]const i32{ self.prompt.before_image, after[0 .. after.len - 1] }) |prefix| {
                 for (prefix) |id| try history.append(self.allocator, id);
@@ -256,19 +250,52 @@ pub const TextPipeline = struct {
         return output.finalize(self.options, self.prompt.count(), limit);
     }
 
-    fn prefillTokens(self: *const TextPipeline, request: *decoder.Request, tokens: []const i32, chunk_rows: u32) !void {
-        var offset: usize = 0;
-        while (chunk_rows > 1 and tokens.len - offset >= chunk_rows) : (offset += chunk_rows) {
-            try self.control.check();
-            try request.appendTokens(tokens[offset..][0..chunk_rows]);
+    fn prefillPrompt(self: *const TextPipeline, request: *decoder.Request, model: *const decoder.Decoder, vision: ?*const vision_model.Vision, after: []const i32, chunk_rows: u32) !void {
+        var image_rows: ?vision_model.Vision.Embeddings = null;
+        defer if (image_rows) |*values| values.tensor.deinit();
+        var parts: [3]decoder.PrefixPart = undefined;
+        parts[0] = .{ .tokens = self.prompt.before_image };
+        var count: usize = 1;
+        if (self.prompt.image) |data| {
+            const encoder = vision orelse return error.UnsupportedInkling2Request;
+            image_rows = try self.encodeImage(model, encoder, data);
+            parts[count] = .{ .embeddings = .{ .tensor = &image_rows.?.tensor, .start = 0, .count = image_rows.?.rows } };
+            count += 1;
         }
-        for (tokens[offset..]) |id| {
+        parts[count] = .{ .tokens = after };
+        count += 1;
+
+        const total = self.prompt.count() - 1;
+        var position: usize = 0;
+        var part_index: usize = 0;
+        var part_position: usize = 0;
+        while (position < total) {
             try self.control.check();
-            try request.append(std.math.cast(u32, id) orelse return error.InvalidInkling2Token);
+            const rows: usize = if (total - position >= chunk_rows) chunk_rows else 1;
+            var pending = rows;
+            var batch: [3]decoder.PrefixPart = undefined;
+            var active: usize = 0;
+            while (pending > 0 and part_index < count) {
+                const part = parts[part_index];
+                const take = @min(pending, part.rows() - part_position);
+                if (take > 0) {
+                    batch[active] = part.slice(part_position, take);
+                    active += 1;
+                    pending -= take;
+                    part_position += take;
+                }
+                if (part_position == part.rows()) {
+                    part_index += 1;
+                    part_position = 0;
+                }
+            }
+            if (pending != 0) return error.InvalidShape;
+            try request.appendPrefix(batch[0..active]);
+            position += rows;
         }
     }
 
-    fn prefillImage(self: *const TextPipeline, request: *decoder.Request, model: *const decoder.Decoder, encoder: *const vision_model.Vision, data: []const u8, chunk_rows: u32) !void {
+    fn encodeImage(self: *const TextPipeline, model: *const decoder.Decoder, encoder: *const vision_model.Vision, data: []const u8) !vision_model.Vision.Embeddings {
         try self.control.check();
         const rgb = image.decodeRgb(self.allocator, data) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -277,19 +304,9 @@ pub const TextPipeline = struct {
         defer rgb.deinit(self.allocator);
         if (rgb.width != self.prompt.image_width or rgb.height != self.prompt.image_height) return error.InvalidInkling2Image;
         var embeddings = try encoder.encodeRgb(self.allocator, model.runtime, rgb.data, rgb.width, rgb.height);
-        defer embeddings.tensor.deinit();
+        errdefer embeddings.tensor.deinit();
         if (embeddings.rows != self.prompt.imageRows()) return error.InvalidInkling2Image;
-        const row_bytes = @as(usize, model.text.hidden_size) * @sizeOf(u16);
-        var offset: u32 = 0;
-        while (offset < embeddings.rows) {
-            try self.control.check();
-            const count = if (embeddings.rows - offset >= chunk_rows) chunk_rows else 1;
-            const bytes = @as(usize, count) * row_bytes;
-            var rows = try embeddings.tensor.retainedView(@as(usize, offset) * row_bytes, bytes, &.{@intCast(bytes / @sizeOf(u16))});
-            defer rows.deinit();
-            try request.appendEmbeddings(&rows, count);
-            offset += count;
-        }
+        return embeddings;
     }
 };
 

@@ -1782,7 +1782,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> pack_kv_q4_pipeline;
     id<MTLComputePipelineState> causal_depthwise4_bf16_pipeline;
     id<MTLComputePipelineState> dense_bf16_projection_pipeline;
-    id<MTLComputePipelineState> dense_bf16_projection_m16_pipeline;
+    id<MTLComputePipelineState> dense_bf16_projection_reuse4_pipeline;
     id<MTLComputePipelineState> patch_transformer_pipeline[8];
     id<MTLComputePipelineState> head_norm_bf16_pipeline;
     id<MTLComputePipelineState> residual_mix_bf16_pipeline;
@@ -13334,6 +13334,18 @@ static NSString *termite_metal_shader_source(void) {
            "    float softcap;\n"
            "};\n"
            "\n"
+           "inline void antfly_dense_bf16_store(\n"
+           "    device uchar *output, device const bfloat *bias,\n"
+           "    constant DenseBf16ProjectionParams &p, uint row, uint column, float dot\n"
+           ") {\n"
+           "    const ulong index = ulong(row) * p.output_width + column;\n"
+           "    const float value = p.has_bias ? dot + float(bias[column]) : dot;\n"
+           "    if (p.f32_output)\n"
+           "        reinterpret_cast<device float *>(output)[index] = p.softcap > 0.0f ? tanh(value / p.softcap) * p.softcap : value;\n"
+           "    else\n"
+           "        reinterpret_cast<device bfloat *>(output)[index] = bfloat(value);\n"
+           "}\n"
+           "\n"
            "kernel void antfly_dense_bf16_projection_simd4(\n"
            "    device const bfloat *input [[buffer(0)]],\n"
            "    device const bfloat *weight [[buffer(1)]],\n"
@@ -13352,50 +13364,37 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint k = lane; k < p.input_width; k += 32u)\n"
            "        product = fma(float(input[a + k]), float(weight[b + k]), product);\n"
            "    const float dot = simd_sum(product);\n"
-           "    if (lane == 0u) {\n"
-           "        const float total = p.has_bias ? dot + float(bias[column]) : dot;\n"
-           "        const ulong index = ulong(group.y) * p.output_width + column;\n"
-           "        if (p.f32_output) reinterpret_cast<device float *>(output)[index] = p.softcap > 0.0f ? tanh(total / p.softcap) * p.softcap : total;\n"
-           "        else reinterpret_cast<device bfloat *>(output)[index] = bfloat(total);\n"
-           "    }\n"
+           "    if (lane == 0u) antfly_dense_bf16_store(output, bias, p, group.y, column, dot);\n"
            "}\n"
            "\n"
            // tile-codegen:end projection.dense_bf16.0 family
            // tile-codegen:begin projection.dense_bf16.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
-           "kernel void antfly_dense_bf16_projection_m16_n16(\n"
-           "    device const bfloat *input [[buffer(0)]],\n"
-           "    device const bfloat *weight [[buffer(1)]],\n"
-           "    device uchar *output [[buffer(2)]],\n"
-           "    device const bfloat *bias [[buffer(3)]],\n"
+           "kernel void antfly_dense_bf16_projection_reuse4(\n"
+           "    device const bfloat *input [[buffer(0)]], device const bfloat *weight [[buffer(1)]],\n"
+           "    device uchar *output [[buffer(2)]], device const bfloat *bias [[buffer(3)]],\n"
            "    constant DenseBf16ProjectionParams &p [[buffer(4)]],\n"
-           "    uint2 group [[threadgroup_position_in_grid]],\n"
-           "    uint warp [[simdgroup_index_in_threadgroup]],\n"
+           "    uint2 group [[threadgroup_position_in_grid]], uint warp [[simdgroup_index_in_threadgroup]],\n"
            "    uint lane [[thread_index_in_simdgroup]]\n"
            ") {\n"
-           "    const uint row = group.y * 16u + (warp / 2u) * 8u;\n"
-           "    const uint column = group.x * 16u + (warp % 2u) * 8u;\n"
-           "    if (row >= p.rows || column >= p.output_width) return;\n"
-           "    const device bfloat *a = input + ulong(row) * p.input_width;\n"
-           "    const device bfloat *b = weight + ulong(column) * p.input_width;\n"
-           "    simdgroup_float8x8 accumulated = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
-           "    for (uint k = 0; k < p.input_width; k += 8u) {\n"
-           "        simdgroup_matrix<bfloat, 8, 8> left, right;\n"
-           "        simdgroup_load(left, a + k, p.input_width);\n"
-           "        simdgroup_load(right, b + k, p.input_width, ulong2(0, 0), true);\n"
-           "        simdgroup_multiply_accumulate(accumulated, left, right, accumulated);\n"
+           "    const uint column = group.x * 4u + warp;\n"
+           "    const uint first = group.y * 4u;\n"
+           "    if (column >= p.output_width) return;\n"
+           "    const uint count = min(4u, p.rows - first);\n"
+           "    const device bfloat *a = input + ulong(first) * p.input_width;\n"
+           "    const device bfloat *w = weight + ulong(column) * p.input_width;\n"
+           "    float4 product = 0.0f;\n"
+           "    for (uint k = lane; k < p.input_width; k += 32u) {\n"
+           "        const float b = float(w[k]);\n"
+           "        #pragma unroll\n"
+           "        for (uint i = 0u; i < 4u; ++i)\n"
+           "            if (i < count) product[i] = fma(float(a[ulong(i) * p.input_width + k]), b, product[i]);\n"
            "    }\n"
-           "    threadgroup float tiles[4][64];\n"
-           "    simdgroup_store(accumulated, &tiles[warp][0], 8u);\n"
-           "    simdgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    for (uint i = lane; i < 64u; i += 32u) {\n"
-           "        const uint col = column + i % 8u;\n"
-           "        const ulong dst = ulong(row + i / 8u) * p.output_width + col;\n"
-           "        const float dot = tiles[warp][i];\n"
-           "        const float value = p.has_bias ? dot + float(bias[col]) : dot;\n"
-           "        if (p.f32_output)\n"
-           "            reinterpret_cast<device float *>(output)[dst] = p.softcap > 0.0f ? tanh(value / p.softcap) * p.softcap : value;\n"
-           "        else\n"
-           "            reinterpret_cast<device bfloat *>(output)[dst] = bfloat(value);\n"
+           "    #pragma unroll\n"
+           "    for (uint i = 0u; i < 4u; ++i) {\n"
+           "        if (i < count) {\n"
+           "            const float dot = simd_sum(product[i]);\n"
+           "            if (lane == 0u) antfly_dense_bf16_store(output, bias, p, first + i, column, dot);\n"
+           "        }\n"
            "    }\n"
            "}\n"
            // tile-codegen:end projection.dense_bf16.1 family
@@ -34338,7 +34337,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->pack_kv_q4_pipeline = nil;
     runtime->causal_depthwise4_bf16_pipeline = nil;
     runtime->dense_bf16_projection_pipeline = nil;
-    runtime->dense_bf16_projection_m16_pipeline = nil;
+    runtime->dense_bf16_projection_reuse4_pipeline = nil;
     for (size_t i = 0; i < 8; ++i) runtime->patch_transformer_pipeline[i] = nil;
     runtime->head_norm_bf16_pipeline = nil;
     runtime->residual_mix_bf16_pipeline = nil;
@@ -37633,14 +37632,12 @@ int antfly_metal_dispatch_dense_bf16_projection(
         !termite_metal_size_mul(p->output_width, (size_t)p->input_width * 2u, &required[1]) ||
         !termite_metal_size_mul(p->rows, (size_t)p->output_width * output_size, &required[2])) return -1;
     const size_t alignment[4] = {2, 2, output_size, 2};
-    if (p->rows >= 8 && !(p->rows % 8) && !(p->input_width % 8) && !(p->output_width % 8) &&
-        termite_metal_env_flag_enabled(getenv("ANTFLY_METAL_BF16_TILED_PROJECTION")) &&
-        [runtime->device supportsFamily:MTLGPUFamilyApple9]) {
-        const int tiled = antfly_metal_encode_typed_stage(runtime, @"antfly_dense_bf16_projection_m16_n16",
-            &runtime->dense_bf16_projection_m16_pipeline, views, required, alignment, 4, 1u << 2,
-            p, sizeof(*p), MTLSizeMake(((size_t)p->output_width + 15u) / 16u, ((size_t)p->rows + 15u) / 16u, 1),
+    if (p->rows >= 4 && p->input_width >= 256) {
+        const int shared = antfly_metal_encode_typed_stage(runtime, @"antfly_dense_bf16_projection_reuse4",
+            &runtime->dense_bf16_projection_reuse4_pipeline, views, required, alignment, 4, 1u << 2,
+            p, sizeof(*p), MTLSizeMake(((size_t)p->output_width + 3u) / 4u, ((size_t)p->rows + 3u) / 4u, 1),
             MTLSizeMake(128, 1, 1));
-        if (tiled != -3) return tiled;
+        if (shared != -3) return shared;
     }
     return antfly_metal_encode_typed_stage(runtime, @"antfly_dense_bf16_projection_simd4",
         &runtime->dense_bf16_projection_pipeline, views, required, alignment, 4, 1u << 2,

@@ -916,11 +916,11 @@ This compares the tested memory configurations. A full-length benchmark
 still needs completed prompts on both engines.
 
 The 16-token compressed probe selected the same next token as BF16, with
-a maximum logit deviation of 1.89. In a separate run, experimental native
-BF16 projection tiles reduced 16-token prefill from about 522 ms to 468 ms
-and changed some logits by up to 1.54. The tiles require
-`ANTFLY_METAL_BF16_TILED_PROJECTION=1` while broader accuracy validation is
-pending.
+a maximum logit deviation of 1.89. The experimental native BF16 matrix
+projection was replaced with a shared-weight projection that retains
+the scalar arithmetic order. It reused one weight read across four input
+rows. All output bits matched on the three physical model-width projection
+fixtures, which improved by 1.5–1.8× on the M4 Max.
 
 The grouped routed projection builds a device-side map of tokens sharing an
 expert and reuses it across the gate/up and down projections. Its precise
@@ -934,7 +934,12 @@ The 64-token prefill took 1,312.42 ms versus 2,089.60 ms for four ungrouped
 16-token chunks. Both comparisons matched the complete next-token logit
 vectors. All 84 tests passed with grouping enabled. The final two warm
 decode steps took about 62 ms wall time and 59–60 ms of GPU time, so most
-decode latency is on the device.
+decode latency is on the device. The exact grouped path is enabled inside
+the opt-in Metal backend and can be disabled with
+`ANTFLY_METAL_GROUPED_ROUTED_PREFILL=0`. Text and device-resident image rows
+now share the same prefill batch. The combined exact path passed all 84
+tests and took 1.18 s for the 64-token prefill, with identical logits to
+the four ungrouped chunks.
 
 ### Official Gemma 4 E2B QAT serving comparison
 

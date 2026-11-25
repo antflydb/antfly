@@ -19,6 +19,18 @@ struct DenseBf16ProjectionParams {
     float softcap;
 };
 
+inline void antfly_dense_bf16_store(
+    device uchar *output, device const bfloat *bias,
+    constant DenseBf16ProjectionParams &p, uint row, uint column, float dot
+) {
+    const ulong index = ulong(row) * p.output_width + column;
+    const float value = p.has_bias ? dot + float(bias[column]) : dot;
+    if (p.f32_output)
+        reinterpret_cast<device float *>(output)[index] = p.softcap > 0.0f ? tanh(value / p.softcap) * p.softcap : value;
+    else
+        reinterpret_cast<device bfloat *>(output)[index] = bfloat(value);
+}
+
 kernel void antfly_dense_bf16_projection_simd4(
     device const bfloat *input [[buffer(0)]],
     device const bfloat *weight [[buffer(1)]],
@@ -37,48 +49,35 @@ kernel void antfly_dense_bf16_projection_simd4(
     for (uint k = lane; k < p.input_width; k += 32u)
         product = fma(float(input[a + k]), float(weight[b + k]), product);
     const float dot = simd_sum(product);
-    if (lane == 0u) {
-        const float total = p.has_bias ? dot + float(bias[column]) : dot;
-        const ulong index = ulong(group.y) * p.output_width + column;
-        if (p.f32_output) reinterpret_cast<device float *>(output)[index] = p.softcap > 0.0f ? tanh(total / p.softcap) * p.softcap : total;
-        else reinterpret_cast<device bfloat *>(output)[index] = bfloat(total);
-    }
+    if (lane == 0u) antfly_dense_bf16_store(output, bias, p, group.y, column, dot);
 }
 
-// native-program:entry antfly_dense_bf16_projection_m16_n16
-kernel void antfly_dense_bf16_projection_m16_n16(
-    device const bfloat *input [[buffer(0)]],
-    device const bfloat *weight [[buffer(1)]],
-    device uchar *output [[buffer(2)]],
-    device const bfloat *bias [[buffer(3)]],
+// native-program:entry antfly_dense_bf16_projection_reuse4
+kernel void antfly_dense_bf16_projection_reuse4(
+    device const bfloat *input [[buffer(0)]], device const bfloat *weight [[buffer(1)]],
+    device uchar *output [[buffer(2)]], device const bfloat *bias [[buffer(3)]],
     constant DenseBf16ProjectionParams &p [[buffer(4)]],
-    uint2 group [[threadgroup_position_in_grid]],
-    uint warp [[simdgroup_index_in_threadgroup]],
+    uint2 group [[threadgroup_position_in_grid]], uint warp [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
 ) {
-    const uint row = group.y * 16u + (warp / 2u) * 8u;
-    const uint column = group.x * 16u + (warp % 2u) * 8u;
-    if (row >= p.rows || column >= p.output_width) return;
-    const device bfloat *a = input + ulong(row) * p.input_width;
-    const device bfloat *b = weight + ulong(column) * p.input_width;
-    simdgroup_float8x8 accumulated = make_filled_simdgroup_matrix<float, 8>(0.0f);
-    for (uint k = 0; k < p.input_width; k += 8u) {
-        simdgroup_matrix<bfloat, 8, 8> left, right;
-        simdgroup_load(left, a + k, p.input_width);
-        simdgroup_load(right, b + k, p.input_width, ulong2(0, 0), true);
-        simdgroup_multiply_accumulate(accumulated, left, right, accumulated);
+    const uint column = group.x * 4u + warp;
+    const uint first = group.y * 4u;
+    if (column >= p.output_width) return;
+    const uint count = min(4u, p.rows - first);
+    const device bfloat *a = input + ulong(first) * p.input_width;
+    const device bfloat *w = weight + ulong(column) * p.input_width;
+    float4 product = 0.0f;
+    for (uint k = lane; k < p.input_width; k += 32u) {
+        const float b = float(w[k]);
+        #pragma unroll
+        for (uint i = 0u; i < 4u; ++i)
+            if (i < count) product[i] = fma(float(a[ulong(i) * p.input_width + k]), b, product[i]);
     }
-    threadgroup float tiles[4][64];
-    simdgroup_store(accumulated, &tiles[warp][0], 8u);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = lane; i < 64u; i += 32u) {
-        const uint col = column + i % 8u;
-        const ulong dst = ulong(row + i / 8u) * p.output_width + col;
-        const float dot = tiles[warp][i];
-        const float value = p.has_bias ? dot + float(bias[col]) : dot;
-        if (p.f32_output)
-            reinterpret_cast<device float *>(output)[dst] = p.softcap > 0.0f ? tanh(value / p.softcap) * p.softcap : value;
-        else
-            reinterpret_cast<device bfloat *>(output)[dst] = bfloat(value);
+    #pragma unroll
+    for (uint i = 0u; i < 4u; ++i) {
+        if (i < count) {
+            const float dot = simd_sum(product[i]);
+            if (lane == 0u) antfly_dense_bf16_store(output, bias, p, first + i, column, dot);
+        }
     }
 }
