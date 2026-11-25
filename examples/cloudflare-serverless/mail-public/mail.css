@@ -178,7 +178,17 @@ button.icon-only .icon { width: 16px; height: 16px; }
 /* The magnifier is the submit button; Enter works too. */
 .search-go { display: inline-flex; border: 0; background: none; border-radius: 999px; padding: 0.35rem; margin-left: -0.4rem; color: inherit; cursor: pointer; }
 .search-go:hover { background: var(--hover); color: var(--foreground); }
-#search-note { padding: 0 1.25rem 0.75rem; }
+/* Under the search box: Local / Server (once on-device search is ready) and the credit. */
+.search-meta { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; padding: 0 1.25rem 0.75rem; }
+.search-meta .credit { margin-left: auto; }
+.scope { display: inline-flex; margin: 0; padding: 2px; border: 0; border-radius: 999px; background: var(--selected); }
+.scope[hidden] { display: none; }
+.scope label { position: relative; cursor: pointer; }
+.scope input { position: absolute; inset: 0; margin: 0; opacity: 0; cursor: pointer; }
+.scope span { display: block; padding: 0.2rem 0.75rem; border-radius: 999px; font-size: 12px; color: var(--muted); }
+.scope label:hover span { color: var(--foreground); }
+.scope input:checked + span { background: var(--surface); color: var(--foreground); font-weight: 500; box-shadow: 0 1px 2px rgb(0 0 0 / 0.1); }
+.scope input:focus-visible + span { outline: 2px solid var(--foreground); outline-offset: 1px; }
 #list-title { font-size: 15px; font-weight: 600; padding: 0.25rem 1.25rem 0.5rem; }
 #trash-banner { margin: 0 1rem 0.5rem; padding: 0.65rem 0.8rem; background: var(--hover); border-radius: var(--radius); font-size: 13px; color: var(--muted); }
 #trash-banner button { font-size: 13px; }

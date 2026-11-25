@@ -142,7 +142,7 @@ try {
   console.log(`[${elapsed()}] opted in, downloaded the model and indexed ${mail.length} messages: ${status}`);
 
   async function deviceSearch(query) {
-    await page.selectOption("#search-where", "device");
+    await page.check("#search-where input[value=device]");
     await page.fill("#search input[name=query]", query);
     // Clear the previous results so the wait below sees this search's rows.
     await page.evaluate(() => document.getElementById("messages").replaceChildren());

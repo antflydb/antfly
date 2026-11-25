@@ -65,9 +65,14 @@
   <section class="list" aria-label="Messages">
     <form id="search" role="search">
       <button class="search-go" aria-label="Search" title="Search"><svg class="icon" aria-hidden="true"><use href="#i-search"/></svg></button><input name="query" type="search" autocomplete="off" aria-label="Search messages" placeholder="Search your mail" required maxlength="1024">
-      <select name="where" id="search-where" aria-label="Search location" hidden><option value="device">This device</option><option value="server">Server</option></select>
     </form>
-    <p id="search-note" class="credit"><svg class="mark" aria-hidden="true"><use href="#mark"/></svg><span id="search-note-text">Search by Antfly</span></p>
+    <div class="search-meta">
+      <fieldset id="search-where" class="scope" role="radiogroup" aria-label="Search location" hidden>
+        <label title="Search this browser's copy: keywords and meaning, works offline"><input type="radio" name="where" value="device" form="search" checked><span>Local</span></label>
+        <label title="Search the mailbox on the server"><input type="radio" name="where" value="server" form="search"><span>Server</span></label>
+      </fieldset>
+      <p id="search-note" class="credit"><svg class="mark" aria-hidden="true"><use href="#mark"/></svg><span id="search-note-text">Search by Antfly</span></p>
+    </div>
     <h2 id="list-title">Inbox</h2>
     <p id="trash-banner" hidden><span id="trash-retention"></span> <button type="button" id="empty-trash" class="link danger">Empty Trash now</button></p>
     <div id="messages"></div>

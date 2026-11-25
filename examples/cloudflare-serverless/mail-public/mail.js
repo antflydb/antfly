@@ -535,7 +535,6 @@ function localStatus(message, progress) {
 }
 function localReady(state) {
   $("local-badge").textContent = state ? (state.messages ?? 0) + " messages on this device" : "Off";
-  $("search-note-text").textContent = state ? "Search by meaning on this device, by Antfly" : "Search by Antfly";
   $("search-where").hidden = !state;
   $("local-sync").hidden = !state;
 }
@@ -680,6 +679,11 @@ $("logout").onclick = guarded(async () => {
       ". Close other tabs of this app and sign in and out again to retry.", true);
   else status("Signed out.");
 });
+// Switching Local / Server re-runs the current search there.
+for (const scope of document.querySelectorAll('#search-where input[name="where"]'))
+  scope.onchange = () => {
+    if ($("search").elements.query.value.trim()) $("search").requestSubmit();
+  };
 $("search").onsubmit = guarded(async (event) => {
   const e = event.currentTarget.elements,
     query = e.query.value;
