@@ -8397,7 +8397,7 @@ fn prepareModelPassChunksWithProbe(runtime: *EnrichmentRuntime, request: enrichm
                 if (!std.mem.eql(u8, &sourceRecordDigest(raw_doc), &source_digest)) return error.EnrichmentSourceChanged;
                 var repair_request = request;
                 repair_request.chunker_json = request.chunker_json;
-                if (try repairMediaOutputPage(runtime, repair_request, raw_doc, supplied_config, input, prefix, target.name, target, identity, page.chunks)) return error.IncompleteChunkCoverage;
+                if (try repairMediaOutputPage(runtime, repair_request, raw_doc, supplied_config, input, prefix, target.name, target, identity, page.chunks, null)) return error.IncompleteChunkCoverage;
                 const updated = try storeGetOptionalAllocWithRetry(runtime, cursor_key) orelse return error.EnrichmentSourceChanged;
                 if (cursor_bytes) |bytes| a.free(bytes);
                 cursor_bytes = updated;
@@ -19277,7 +19277,7 @@ fn persistMediaRepairs(runtime: *EnrichmentRuntime, request: enrichment_types.Ge
     }
 }
 
-fn repairMediaOutputPage(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, raw_doc: []const u8, chunk_config: chunking_types_mod.Config, input: @import("inference_chunker").Input, stage_prefix: []const u8, name: []const u8, target: @import("inference_chunker").outputs.Target, current_output: ?@import("inference_chunker").outputs.Result, chunks: []const @import("inference_chunker").Chunk) !bool {
+fn repairMediaOutputPage(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, raw_doc: []const u8, chunk_config: chunking_types_mod.Config, input: @import("inference_chunker").Input, stage_prefix: []const u8, name: []const u8, target: @import("inference_chunker").outputs.Target, current_output: ?@import("inference_chunker").outputs.Result, chunks: []const @import("inference_chunker").Chunk, scope: ?*FailureScope) !bool {
     const a = runtime.alloc;
     var decision_arena = std.heap.ArenaAllocator.init(a);
     defer decision_arena.deinit();
@@ -19316,7 +19316,7 @@ fn repairMediaOutputPage(runtime: *EnrichmentRuntime, request: enrichment_types.
             if (err != error.IncompleteChunkCoverage) return err;
             retry = true;
         };
-        try persistMediaRepairs(runtime, request, raw_doc, stage_prefix, name, pending.updates.items);
+        persistMediaRepairs(runtime, request, raw_doc, stage_prefix, name, pending.updates.items) catch |err| return FailureScope.assetPublicationFailure(scope, err);
         _ = decision_arena.reset(.retain_capacity);
         first = end;
     }
@@ -19364,7 +19364,7 @@ fn processMediaOutput(runtime: *EnrichmentRuntime, request: enrichment_types.Gen
     else empty: {
         // Missing/null media is an intentional empty revision, not a transient
         // source race. Retire private preparation and publish empty coverage.
-        try clearMediaPassScope(runtime, stage_prefix, null);
+        clearMediaPassScope(runtime, stage_prefix, null) catch |err| return FailureScope.assetPublicationFailure(scope, err);
         shared.clearMedia();
         break :empty null;
     };
@@ -19406,7 +19406,7 @@ fn processMediaOutput(runtime: *EnrichmentRuntime, request: enrichment_types.Gen
         defer page.deinit(a);
         if (page.start_ordinal != collected.count or page.chunks.len == 0 or page.covered_through_ordinal > prepared.chunks.len) return error.InvalidEnrichmentState;
         try hydrateMediaPassPageWithAssets(runtime, source_request, &page, assets);
-        retry = try repairMediaOutputPage(runtime, source_request, raw_doc, chunk_config, source.input.?, stage_prefix, config.value.output_name, target, current_output, page.chunks) or retry;
+        retry = try repairMediaOutputPage(runtime, source_request, raw_doc, chunk_config, source.input.?, stage_prefix, config.value.output_name, target, current_output, page.chunks, scope) or retry;
         var page_arena = std.heap.ArenaAllocator.init(a);
         defer page_arena.deinit();
         const pa = page_arena.allocator();
@@ -19451,7 +19451,7 @@ fn processMediaOutput(runtime: *EnrichmentRuntime, request: enrichment_types.Gen
     var item = AssetProducerBatchItem{ .request = request, .producer_type = .media_output, .config_json = @constCast(config_json), .raw_doc = @constCast(raw_doc), .source_text = &fingerprint, .artifact_key = @constCast(output_key), .state_key = state_key, .state_value = state };
     try applyAssetProducerBatchOutput(runtime, &item, produced, window, scope);
     if (collected.status == .failed) try recordIsolatedRequestError(runtime, window, request, error.RequiredMediaOutputFailed);
-    try retireMediaPassForAssetRequest(runtime, request);
+    retireMediaPassForAssetRequest(runtime, request) catch |err| return FailureScope.assetPublicationFailure(scope, err);
 }
 
 /// A fused vector authenticates against its selected receipt and canonical
