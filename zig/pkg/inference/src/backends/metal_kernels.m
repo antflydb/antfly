@@ -1782,6 +1782,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> dense_bf16_projection_pipeline;
     id<MTLComputePipelineState> head_norm_bf16_pipeline;
     id<MTLComputePipelineState> residual_mix_bf16_pipeline;
+    id<MTLComputePipelineState> residual_sum_bf16_pipeline;
     id<MTLComputePipelineState> gated_residual_bf16_pipelines[2];
     TermiteMetalMtpHeadWorkspace *mtp_head_workspace;
     id<MTLDevice> device;
@@ -12923,6 +12924,24 @@ static NSString *termite_metal_shader_source(void) {
            "    uint total = p.rows * p.dim; if (gid >= total) return; uint row = gid / p.dim; uint col = gid % p.dim; float value = 0.0f; uint route_base = row * p.top_k; for (uint k = 0u; k < p.top_k; ++k) { uint route = route_base + k; float scale = p.has_expert_scale != 0u ? expert_scale[expert_ids[route]] : 1.0f; value += (route_output[route * p.dim + col] * scale) * route_weights[route]; } output[gid] = value;\n"
            "}\n"
            // tile-codegen:end expert.projection.direct.7 family
+           // tile-codegen:begin residual.sum_bf16 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "struct ResidualSumBf16Params { uint values, previous; };\n"
+           "\n"
+           "kernel void antfly_residual_sum3_bf16_pointwise(\n"
+           "    device const bfloat *attention [[buffer(0)]],\n"
+           "    device const bfloat *expert [[buffer(1)]],\n"
+           "    device const bfloat *previous [[buffer(2)]],\n"
+           "    device bfloat *output [[buffer(3)]],\n"
+           "    constant ResidualSumBf16Params &p [[buffer(4)]],\n"
+           "    uint index [[thread_position_in_grid]]\n"
+           ") {\n"
+           "    #pragma clang fp reassociate(off)\n"
+           "    if (index >= p.values) return;\n"
+           "    const float old = p.previous == 2u ? float(output[index])\n"
+           "        : p.previous == 1u ? float(previous[index]) : 0.0f;\n"
+           "    output[index] = bfloat((old + float(attention[index])) + float(expert[index]));\n"
+           "}\n"
+           // tile-codegen:end residual.sum_bf16 family
            // tile-codegen:begin residual.mix_bf16 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "struct ResidualMixBf16Params {\n"
            "    uint rows, width, sources, add_last, normalize;\n"
@@ -33894,6 +33913,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->dense_bf16_projection_pipeline = nil;
     runtime->head_norm_bf16_pipeline = nil;
     runtime->residual_mix_bf16_pipeline = nil;
+    runtime->residual_sum_bf16_pipeline = nil;
     for (size_t index = 0; index < 2; ++index) runtime->gated_residual_bf16_pipelines[index] = nil;
     free(runtime);
     }
@@ -37218,6 +37238,22 @@ int antfly_metal_dispatch_gated_residual_bf16(
     return antfly_metal_encode_typed_stage(runtime, @"antfly_gated_residual_rms_f32_to_bf16",
         &runtime->gated_residual_bf16_pipelines[1], views, required, alignment, 5, 1u << 4,
         &params, sizeof(params), grid, threads);
+}
+
+int antfly_metal_dispatch_residual_sum_bf16(
+    termite_metal_decode_runtime *runtime, const antfly_metal_routed_buffer views[4],
+    uint32_t values, bool has_previous
+) {
+    if (!runtime || !views || !values) return -1;
+    const size_t bytes = (size_t)values * 2u;
+    if (has_previous && (!views[2].handle || views[2].bytes < bytes)) return -1;
+    const bool in_place = has_previous && views[2].handle == views[3].handle && views[2].offset == views[3].offset;
+    const struct { uint32_t values, previous; } params = {values, in_place ? 2u : has_previous ? 1u : 0u};
+    const size_t required[4] = {bytes, bytes, params.previous == 1u ? bytes : 0, bytes};
+    const size_t alignment[4] = {2, 2, 2, 2};
+    return antfly_metal_encode_typed_stage(runtime, @"antfly_residual_sum3_bf16_pointwise",
+        &runtime->residual_sum_bf16_pipeline, views, required, alignment, 4, 1u << 3,
+        &params, sizeof(params), MTLSizeMake(((size_t)values + 127u) / 128u, 1, 1), MTLSizeMake(128, 1, 1));
 }
 
 typedef struct { uint32_t rows, hidden, head_dim, grid_x, grid_y; float eps, theta, scale; uint32_t stride, start, rotate, weighted, cached_rotary; } termite_vision_norm_rope_params;

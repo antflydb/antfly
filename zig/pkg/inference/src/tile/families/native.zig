@@ -236,6 +236,7 @@ pub const regions = r.regions(&.{
     }),
     r.shared(r.metalSourceFamily("elementwise.direct", program.render(@embedFile("native/metal/elementwise_direct.metal"), row_statistics.metal_scalar)), &.{.{ .operation = "statistics.tree", .source = "../../lib/tile/src/native_statistics.zig", .scope = .phase, .source_index = 12, .export_name = "termite_dot_general_2d_f32_reduce", .precision = "F32; retain native max/sum, masks and nonfinite behavior", .schedule = "qualified halving shared tree and scratch publication order" }}),
     r.encodedMetalSourceFamily("expert.projection.direct", @embedFile("native/metal/expert_projection.m")),
+    r.metalSourceFamily("residual.sum_bf16", @embedFile("native/metal/residual_sum_bf16.metal")),
     r.metalSourceFamily("residual.mix_bf16", @embedFile("native/metal/residual_mix_bf16.metal")),
     r.metalSourceFamily("residual.gated_bf16", @embedFile("native/metal/gated_residual_bf16.metal")),
     r.metalSourceFamily("normalization.head_bf16", @embedFile("native/metal/head_norm_bf16.metal")),

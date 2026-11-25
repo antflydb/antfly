@@ -53875,3 +53875,57 @@ test "Metal gated residual projects and applies the controller without readback"
     try tensors[8].downloadBytesInto(std.mem.asBytes(&output));
     try std.testing.expectEqual(gamma, output);
 }
+
+/// Publish a residual stack row with one BF16 rounding after the ordered sum.
+pub fn residualSumBf16(runtime: *RawMetalDecodeRuntime, values: u32, previous: ?*const MetalTensor, attention: *const MetalTensor, expert: *const MetalTensor, output: *MetalTensor) !void {
+    if (!hasActiveFrame(runtime)) return error.MetalFrameRequired;
+    if (output.isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
+    const Buffer = RoutedBlockScaledProjection.Buffer;
+    const views: [4]Buffer = .{
+        try .fromTensor(attention, .i16),
+        try .fromTensor(expert, .i16),
+        if (previous) |old| try .fromTensor(old, .i16) else .{},
+        try .fromTensor(output, .i16),
+    };
+    if (antfly_metal_dispatch_residual_sum_bf16(runtime, &views, values, previous != null) != 0)
+        return error.MetalKernelDispatchFailed;
+    output.invalidateHostMirror();
+}
+
+extern fn antfly_metal_dispatch_residual_sum_bf16(runtime: *RawMetalDecodeRuntime, views: *const [4]RoutedBlockScaledProjection.Buffer, values: u32, has_previous: bool) c_int;
+
+test "Metal BF16 residual sum handles a new block and in-place ordered updates" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const payloads = [_]u16{ 0xcb80, 0x3f80, 0x4b80, 0x4b80, 0 };
+    var tensors: [payloads.len]MetalTensor = undefined;
+    var count: usize = 0;
+    defer for (tensors[0..count]) |*tensor| tensor.deinit();
+    for (&tensors, &payloads) |*tensor, *bits| {
+        tensor.* = try MetalTensor.deviceAllocateTyped(std.testing.allocator, runtime, .i16, .shared, &.{1});
+        count += 1;
+        try tensor.uploadBytes(std.mem.asBytes(bits));
+    }
+
+    try beginFrame(runtime);
+    errdefer cancelFrame(runtime) catch {};
+    try residualSumBf16(runtime, 1, null, &tensors[0], &tensors[1], &tensors[4]);
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+    var value: u16 = undefined;
+    try tensors[4].downloadBytesInto(std.mem.asBytes(&value));
+    try std.testing.expectEqual(@as(u16, 0xcb80), value);
+
+    try beginFrame(runtime);
+    errdefer cancelFrame(runtime) catch {};
+    try residualSumBf16(runtime, 1, &tensors[2], &tensors[0], &tensors[1], &tensors[2]);
+    try residualSumBf16(runtime, 1, &tensors[3], &tensors[0], &tensors[1], &tensors[4]);
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+    for ([_]usize{ 2, 4 }) |i| {
+        try tensors[i].downloadBytesInto(std.mem.asBytes(&value));
+        try std.testing.expectEqual(@as(u16, 0x3f80), value);
+    }
+}
