@@ -2077,9 +2077,7 @@ pub const Search = struct {
             try self.write(doc.path);
             try self.write(if (self.options.null_paths) "\x00" else "\n");
         } else if ((self.options.count or self.options.count_matches) and (selected > 0 or self.options.include_zero)) {
-            const row = try std.fmt.allocPrint(self.a, "{s}:{d}\n", .{ doc.path, selected });
-            defer self.a.free(row);
-            try self.write(row);
+            try self.emitCount(self.a, doc.path, selected);
         }
         committed = output.written().len;
     }
@@ -2529,7 +2527,7 @@ pub const Search = struct {
                 try storage.writer.writeByte(delimiter);
             }
             const raw = storage.written();
-            self.replacement_absolute_start = if (self.replacement_file_context and !self.transcoding) offset == 0 else record_buffer_start == 0 or peek == null or raw.len > record_buffer_available;
+            self.replacement_absolute_start = self.options.null_data or if (self.replacement_file_context and !self.transcoding) offset == 0 else record_buffer_start == 0 or peek == null or raw.len > record_buffer_available;
             var text: []const u8 = if (peek != null) raw[0 .. raw.len - 1] else raw;
             if (self.options.crlf and std.mem.endsWith(u8, text, "\r")) text = text[0 .. text.len - 1];
             line += 1;
@@ -2752,11 +2750,18 @@ pub const Search = struct {
         if (self.options.count or self.options.count_matches) {
             const n = if ((self.options.count_matches or self.options.only_matching) and !self.options.invert and self.options.ask == null) match_count else count;
             if (n > 0 or self.options.include_zero) {
-                const out = if (self.render_filename) try std.fmt.allocPrint(self.a, "{s}{s}{d}\n", .{ path_name, if (self.options.null_paths) "\x00" else self.options.field_match_separator, n }) else try std.fmt.allocPrint(self.a, "{d}\n", .{n});
-                defer self.a.free(out);
-                try self.write(out);
+                try self.emitCount(self.a, if (self.render_filename) path_name else null, n);
             }
         }
+    }
+    fn emitCount(self: *Search, a: Allocator, path: ?[]const u8, count: usize) !void {
+        const delimiter: u8 = if (self.options.null_data) 0 else '\n';
+        const row = if (path) |name|
+            try std.fmt.allocPrint(a, "{s}{s}{d}{c}", .{ name, if (self.options.null_paths) "\x00" else self.options.field_match_separator, count, delimiter })
+        else
+            try std.fmt.allocPrint(a, "{d}{c}", .{ count, delimiter });
+        defer a.free(row);
+        try self.write(row);
     }
     pub fn content(self: *Search, path_name: []const u8, bytes: []const u8) !void {
         self.replay_spans = false;
@@ -2915,8 +2920,7 @@ pub const Search = struct {
                 count = matched_occurrences;
             }
             if (count == 0 and !self.options.include_zero) return;
-            const output = if (self.render_filename) try std.fmt.allocPrint(a, "{s}{s}{d}\n", .{ path_name, if (self.options.null_paths) "\x00" else self.options.field_match_separator, count }) else try std.fmt.allocPrint(a, "{d}\n", .{count});
-            try self.write(output);
+            try self.emitCount(a, if (self.render_filename) path_name else null, count);
             return;
         }
         if (self.options.json and self.options.multiline and self.options.ask == null and !self.options.invert) {
@@ -3082,6 +3086,8 @@ pub const Search = struct {
     }
     fn renderMultilineJson(self: *Search, a: Allocator, path: []const u8, bytes: []const u8, lines: []const Line, selected: []const bool, hits: []const @import("matcher.zig").Match) !void {
         defer self.current_hits = null;
+        var relative: std.ArrayList(@import("matcher.zig").Match) = .empty;
+        defer relative.deinit(a);
         var i: usize = 0;
         var hit_index: usize = 0;
         while (i < lines.len) {
@@ -3102,26 +3108,24 @@ pub const Search = struct {
             }
             const start_hit = hit_index;
             var end_line = i;
-            var spanning = self.matcher.joinsMultilineJson();
             while (hit_index < hits.len) {
                 const hit = hits[hit_index];
                 const start_line = lineIndex(lines, hit.span.start);
                 const last = lineIndex(lines, if (hit.span.end > hit.span.start) hit.span.end - 1 else hit.span.end);
-                if (start_line > end_line and !(spanning and start_line == end_line + 1)) break;
+                if (start_line > end_line) break;
                 end_line = @max(end_line, last);
-                spanning = spanning or last > start_line;
                 hit_index += 1;
             }
             i = end_line + 1;
             const raw_end = if (i < lines.len) lines[i].start else bytes.len;
-            const relative = try a.alloc(@import("matcher.zig").Match, hit_index - start_hit);
-            for (hits[start_hit..hit_index], relative) |hit, *target| {
+            try relative.resize(a, hit_index - start_hit);
+            for (hits[start_hit..hit_index], relative.items) |hit, *target| {
                 target.* = hit;
                 target.span = .{ .start = hit.span.start - lines[first].start, .end = hit.span.end - lines[first].start };
             }
             // A match may include the record terminator itself.
-            const rendered = bytes[lines[first].start..@max(lines[end_line].end, if (relative.len > 0) hits[hit_index - 1].span.end else lines[end_line].end)];
-            self.current_hits = relative;
+            const rendered = bytes[lines[first].start..@max(lines[end_line].end, if (relative.items.len > 0) hits[hit_index - 1].span.end else lines[end_line].end)];
+            self.current_hits = relative.items;
             self.current_hit_text = rendered;
             self.raw_line = bytes[lines[first].start..raw_end];
             try self.emit(path, rendered, first + 1, lines[first].start, true, std.math.nan(f64));

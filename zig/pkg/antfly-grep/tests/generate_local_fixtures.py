@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Reproducible local-search contracts from test-only ripgrep 15.2 / PCRE2 10.45.
+"""Reproducible local-search contracts from test-only ripgrep 16.0 / PCRE2 10.45.
 
 Run with a pinned oracle path; stdout is a fixture manifest. These synthetic
 inputs cover both engines and output/Unicode combinations without depending on
@@ -33,7 +33,7 @@ parser.add_argument("oracle", type=Path)
 args = parser.parse_args()
 oracle = str(args.oracle.resolve())
 version = subprocess.check_output([oracle, "--version"]).decode()
-assert "ripgrep 15.2.0" in version
+assert "ripgrep 16.0.0" in version
 assert "10.45" in subprocess.check_output([oracle, "--pcre2-version"]).decode()
 patterns = [
     r"[a-z]+",
