@@ -5065,7 +5065,7 @@ pub const Node = struct {
     }
 
     fn tensorBatchDispatch(self: *Node, task: executor_microbatch.Task) @import("tensor_microbatch.zig").Dispatch {
-        return .{ .ptr = self, .task = task, .run_fn = runTensorBatch, .run_resident_fn = runResidentTensorBatch, .run_stage_fn = runStageTensorBatch };
+        return .{ .ptr = self, .task = task, .run_fn = runTensorBatch, .run_resident_fn = runResidentTensorBatch, .run_stage_fn = runStageTensorBatch, .accepts_shape_only_stage_inputs = true };
     }
 
     fn runStageTensorBatch(raw: *anyopaque, task: executor_microbatch.Task, allocator: std.mem.Allocator, session: backends_mod.Session, inputs: []const @import("../backends/session.zig").StageInput, supplied: ?InferenceExecutionControl) anyerror!@import("../backends/session.zig").ResidentOutputs {

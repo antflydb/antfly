@@ -1199,6 +1199,19 @@ pub fn cachedEncoderShapeOnly(session: Session) bool {
     return self.cached_encoder_shape_only;
 }
 
+pub fn cachedEncoderStageInputIsShapeOnly(session: Session, inputs: []const session_mod.StageInput, index: usize) bool {
+    if (!cachedEncoderShapeOnly(session)) return false;
+    const info = session.inputInfo();
+    if (inputs.len != info.len or index >= info.len) return false;
+    const host = switch (inputs[index]) {
+        .host => |value| value,
+        .resident => return false,
+    };
+    if (!std.mem.eql(u8, info[index].name, "encoder_hidden_states") or host.dtype != .f32 or host.shape.len != 3 or host.data.len != 0) return false;
+    for (host.shape) |dim| if (dim <= 0) return false;
+    return cacheBranchValue(.{ .stage_inputs = .{ .info = info, .values = inputs } }) catch false;
+}
+
 pub fn supportsMergedCacheBranch(session: Session) bool {
     if (session.vtable != &imported_session_vtable) return true;
     const self: *const ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));

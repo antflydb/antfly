@@ -399,7 +399,7 @@ fn eligibleStage(session: session_mod.Session, views: []const Tensor, inputs: []
         (backend.kind() == .cuda and kernels.createPhysicalCompletion == null)) return false;
     const first = views[0].shape;
     if (first.len == 0 or first[0] < 1) return false;
-    for (inputs, views, session.inputInfo()) |value, view, declared| {
+    for (inputs, views, session.inputInfo(), 0..) |value, view, declared, index| {
         if (view.shape.len > 8 or view.shape.len != declared.shape.len) return false;
         if (session.isBroadcastInput(view.name)) {
             if (value != .host or !validTensor(view) or view.data.len == 0 or view.data.len > 8 or !std.mem.eql(i64, view.shape, declared.shape)) return false;
@@ -408,7 +408,7 @@ fn eligibleStage(session: session_mod.Session, views: []const Tensor, inputs: []
         if (view.shape.len == 0 or view.shape[0] != first[0] or declared.shape[0] > 0) return false;
         for (view.shape[1..], declared.shape[1..]) |actual, expected| if (actual < 0 or (expected > 0 and expected != actual)) return false;
         switch (value) {
-            .host => if (!validTensor(view)) return false,
+            .host => if (!validTensor(view) and !@import("../backends/imported_onnx_session.zig").cachedEncoderStageInputIsShapeOnly(session, inputs, index)) return false,
             .resident => |resident| if (declared.dtype != .f32 or resident.estimated_bytes != (denseBytes(view.shape, @sizeOf(f32)) catch return false) or !denseDeviceInput(backend, resident.value, view.shape)) return false,
         }
     }
@@ -504,7 +504,7 @@ fn runMode(comptime placement: OutputPlacement, broker: *micro.Broker, allocator
         const device_bytes = if (stage) |mixed| if (mixed[column] == .resident) mixed[column].resident.estimated_bytes else 0 else 0;
         bytes = try std.math.add(usize, bytes, try std.math.add(usize, tensor.data.len, device_bytes));
         const broadcast = session.isBroadcastInput(tensor.name);
-        try std.json.Stringify.value(.{ .name = tensor.name, .dtype = tensor.dtype, .shape = if (broadcast) tensor.shape else tensor.shape[1..], .value = if (broadcast) tensor.data else &.{}, .device = if (stage) |mixed| mixed[column] == .resident else false }, .{}, &signature.writer);
+        try std.json.Stringify.value(.{ .name = tensor.name, .dtype = tensor.dtype, .shape = if (broadcast) tensor.shape else tensor.shape[1..], .value = if (broadcast) tensor.data else &.{}, .device = if (stage) |mixed| mixed[column] == .resident else false, .empty = tensor.data.len == 0 }, .{}, &signature.writer);
     }
     const policy: session_mod.ForwardBatchPolicy = if (stage != null) .{} else session.forwardBatchPolicy(inputs);
     const max_items = @min(@as(usize, 8), policy.max_items);

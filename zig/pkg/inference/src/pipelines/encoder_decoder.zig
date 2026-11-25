@@ -152,7 +152,8 @@ pub const EncoderDecoderPipeline = struct {
             .incremental_with_vocabulary = .{ .vocabulary = self.config.vocab_size, .allow_native = self.batch_dispatch == null },
         });
         defer encoded.deinit(allocator);
-        return self.greedyDecodeOutputs(allocator, &encoded, mask, input_ids.len, self.batch_dispatch == null);
+        const retire_encoder = if (self.batch_dispatch) |dispatch| dispatch.accepts_shape_only_stage_inputs else true;
+        return self.greedyDecodeOutputs(allocator, &encoded, mask, input_ids.len, retire_encoder);
     }
 
     /// Greedy autoregressive decode from encoder outputs.

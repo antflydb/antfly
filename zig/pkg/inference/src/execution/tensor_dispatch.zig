@@ -36,6 +36,7 @@ pub const Task = enum {
 pub const Dispatch = struct {
     ptr: *anyopaque,
     task: Task,
+    accepts_shape_only_stage_inputs: bool = false,
     run_stage_fn: ?*const fn (*anyopaque, Task, std.mem.Allocator, session_mod.Session, []const session_mod.StageInput, ?Control) anyerror!session_mod.ResidentOutputs = null,
     run_resident_fn: ?*const fn (*anyopaque, Task, std.mem.Allocator, session_mod.Session, ?*session_mod.RunPermit, ?*std.atomic.Mutex, []const Tensor, ?Control) anyerror!?session_mod.ResidentOutputs = null,
     run_fn: *const fn (*anyopaque, Task, std.mem.Allocator, session_mod.Session, ?*session_mod.RunPermit, ?*std.atomic.Mutex, []const Tensor, ?Control) anyerror![]Tensor,
