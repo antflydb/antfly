@@ -760,6 +760,47 @@ pub const PromptPlan = struct {
     pub fn greedy(self: PromptPlan) bool {
         return self.cuda_greedy or self.metal_greedy;
     }
+
+    pub const Chunk = struct {
+        request: ChunkRequest,
+        scheduler_eligible: bool,
+        execution_mutex: ?*std.atomic.Mutex,
+    };
+
+    /// Bind the cursor's admitted attempt to the selected numerical route.
+    /// The caller still coordinates scheduler turns and publishes progress.
+    pub fn bindChunk(self: PromptPlan, prompt: PromptRequest, cursor: *const ChunkCursor, attempt: ChunkCursor.Attempt, tokens: []const i64, execution_mutex: ?*std.atomic.Mutex, gpu_oracle: bool, exact_repeat_calls: *usize) Chunk {
+        const final = attempt.total_end == prompt.prompt_tokens;
+        return .{
+            .scheduler_eligible = !self.exact_repeat_probe and !decoder_routes.prefillFinalChunkNeedsDirectExecution(attempt.total_end, prompt.prompt_tokens, attempt.output_intent, self.cuda_last_logits, self.metal_last_logits),
+            .execution_mutex = decoder_routes.directPrefillExecutionMutex(
+                self.exact_repeat_probe,
+                self.cuda_greedy or (final and self.cuda_last_logits),
+                self.metal_greedy,
+                execution_mutex,
+            ),
+            .request = .{
+                .token_ids = tokens[attempt.start..attempt.end],
+                .total_chunk_end = attempt.total_end,
+                .prompt_tokens = prompt.prompt_tokens,
+                .already_prefilled = prompt.prefilled_tokens,
+                .processed_rows = attempt.start,
+                .output_intent = attempt.output_intent,
+                .capture_hidden = prompt.capture_hidden,
+                .shared_kv_pruning = self.shared_kv,
+                .prepared_metal_whole_prompt = attempt.start == 0 and final and self.metal_greedy,
+                .metal_target_last_logits = self.metal_last_logits,
+                .cuda_direct_last_logits = self.cuda_last_logits,
+                .typed_outputs = self.typed_outputs,
+                .attempted_chunk_size = attempt.chunk.rows,
+                .allow_resize = cursor.options.admitted_plan == null,
+                .compact_selected = prompt.selected_kv,
+                .selection_gpu_oracle = gpu_oracle,
+                .exact_repeat_probe = self.exact_repeat_probe,
+                .exact_repeat_calls = exact_repeat_calls,
+            },
+        };
+    }
 };
 
 pub const CompiledPromptPlan = struct { chunk_rows: usize, bounded_swa: bool };

@@ -394,6 +394,15 @@ Issue [#1166](https://github.com/antflydb/antfly/issues/1166) also requests a
 complete migration of execution policy. Shared kernel ownership and the common
 preparation API do not by themselves complete these remaining requirements:
 
+- The remaining eager token-prefill route binds each admitted `ChunkCursor`
+  attempt through `execution/decoder_prefill.zig`. The runtime supplies
+  scheduler eligibility, direct execution exclusion, resize permission,
+  output intent and the numerical inputs together. Generation coordinates
+  scheduler turns and publishes progress after successful runtime completion.
+  The CUDA replay-capacity and native prefill chunk-size decisions named in
+  #1771 already live in `decoder_storage.zig` and `decoder_prefill.zig`,
+  respectively.
+
 - Imported ONNX and architecture graphs share the bounded specialization owner
   in `execution/specialization_cache.zig`, with stable executable handles,
   allocation-before-eviction admission and explicit retirement. Their limits

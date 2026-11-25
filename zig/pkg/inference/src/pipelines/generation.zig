@@ -4811,11 +4811,7 @@ pub const NativeGenerationPipeline = struct {
         var prefill_last_hidden: ?ops.CT = null;
         var prefill_last_hidden_rows: usize = 0;
         errdefer if (prefill_last_hidden) |hidden| self.cb.free(hidden);
-        const use_cuda_prefill_greedy_token = prompt_plan.cuda_greedy;
-        const use_metal_prefill_greedy_token = prompt_plan.metal_greedy;
         const use_prefill_greedy_token = prompt_plan.greedy();
-        const use_metal_target_last_logits = prompt_plan.metal_last_logits;
-        const can_use_typed_prefill_outputs = prompt_plan.typed_outputs;
         const allow_shared_kv_prefill = prompt_plan.shared_kv;
         try prompt_runtime.preparePromptState(.{
             .prompt_tokens = seq_len,
@@ -4827,7 +4823,6 @@ pub const NativeGenerationPipeline = struct {
             .has_draft = self.draft_cb != null,
             .speculation_requested = config.speculation_requested,
         });
-        const prefer_cuda_direct_last_logits = prompt_plan.cuda_last_logits;
         debugGenerationStage(
             "executePrefill enter seq_len={d} prefilled={d} query_len={d} paged={} scheduler={} compiled_whole_model={} prefill_greedy={}",
             .{
@@ -4904,7 +4899,6 @@ pub const NativeGenerationPipeline = struct {
                 .pure_greedy = isPureGreedyConfig(config) and config.grammar == null,
                 .resident_greedy_allowed = request.allow_resident_greedy,
             });
-            const admitted_plan = cursor.options.admitted_plan;
             switch (cursor.plan_decision) {
                 .none => {},
                 .bypassed_prompt_cache => |plan| std.log.info(
@@ -4930,31 +4924,22 @@ pub const NativeGenerationPipeline = struct {
             prompt_runtime.prepareChunkWindow(request, cursor.current_chunk_size);
             while (try cursor.next(if (self.scheduler_lease) |lease| lease.prefill_chunk_size else cursor.current_chunk_size)) |attempt| {
                 defer cursor.cancel(attempt) catch {};
-                const processed = attempt.start;
                 var direct_prefill_turn_acquired = false;
                 defer if (direct_prefill_turn_acquired) {
                     self.scheduler.?.finishTurn(self.scheduler_lease.?, .prefill);
                 };
                 const planned_chunk = attempt.chunk;
-                const chunk_size = planned_chunk.rows;
-                const chunk_end = attempt.end;
                 const total_chunk_end = attempt.total_end;
-                const chunk = prompt_ids[processed..chunk_end];
-                const output_intent = attempt.output_intent;
+                const route = prompt_plan.bindChunk(request, &cursor, attempt, prompt_ids, self.execution_lock, select_v1_gpu_oracle, &exact_prefill_calls);
+                const chunk = route.request.token_ids;
                 debugGenerationStage(
                     "executePrefill chunk start processed={d} chunk_len={d} total_chunk_end={d} current_chunk_size={d} output={s} weight_route_hint={s}",
-                    .{ processed, chunk.len, total_chunk_end, cursor.current_chunk_size, @tagName(output_intent), @tagName(planned_chunk.weight_route_hint) },
+                    .{ attempt.start, chunk.len, total_chunk_end, cursor.current_chunk_size, @tagName(attempt.output_intent), @tagName(planned_chunk.weight_route_hint) },
                 );
                 if (self.scheduler) |scheduler| {
                     if (self.scheduler_lease) |lease| {
                         if (self.io) |io| {
-                            if (!exact_prefill_probe and !prefillFinalChunkNeedsDirectExecution(
-                                total_chunk_end,
-                                seq_len,
-                                output_intent,
-                                prefer_cuda_direct_last_logits,
-                                use_metal_target_last_logits,
-                            )) {
+                            if (route.scheduler_eligible) {
                                 prefill_last_logits = self.runScheduledPrefillBatch(scheduler, lease, io, decode_state, chunk, total_chunk_end, chunk.len, total_chunk_end == seq_len, allow_shared_kv_prefill) catch |err| {
                                     if (try cursor.retryMemoryBudgetExceeded(attempt, err)) continue;
                                     return err;
@@ -4976,32 +4961,8 @@ pub const NativeGenerationPipeline = struct {
                         }
                     }
                 }
-                var numerical = self.prefillRuntime(decode_state, directPrefillExecutionMutex(
-                    exact_prefill_probe,
-                    use_cuda_prefill_greedy_token or (total_chunk_end == seq_len and prefer_cuda_direct_last_logits),
-                    use_metal_prefill_greedy_token,
-                    self.execution_lock,
-                ));
-                const outcome = try numerical.runChunk(.{
-                    .token_ids = chunk,
-                    .total_chunk_end = total_chunk_end,
-                    .prompt_tokens = seq_len,
-                    .already_prefilled = prefilled_tokens,
-                    .processed_rows = processed,
-                    .output_intent = output_intent,
-                    .capture_hidden = capture_last_hidden,
-                    .shared_kv_pruning = allow_shared_kv_prefill,
-                    .prepared_metal_whole_prompt = processed == 0 and total_chunk_end == seq_len and use_metal_prefill_greedy_token,
-                    .metal_target_last_logits = use_metal_target_last_logits,
-                    .cuda_direct_last_logits = prefer_cuda_direct_last_logits,
-                    .typed_outputs = can_use_typed_prefill_outputs,
-                    .attempted_chunk_size = chunk_size,
-                    .allow_resize = admitted_plan == null,
-                    .compact_selected = config.kv_cache_mode == .select_v1,
-                    .selection_gpu_oracle = select_v1_gpu_oracle,
-                    .exact_repeat_probe = exact_prefill_probe,
-                    .exact_repeat_calls = &exact_prefill_calls,
-                });
+                var numerical = self.prefillRuntime(decode_state, route.execution_mutex);
+                const outcome = try numerical.runChunk(route.request);
                 switch (outcome) {
                     .retry_chunk_size => |smaller| {
                         try cursor.retry(attempt, smaller);
