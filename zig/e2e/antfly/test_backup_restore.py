@@ -211,6 +211,11 @@ def _enroll_store_root_once(
     raise AssertionError(f"store-root enrollment was not confirmed: {last}")
 
 
+def _backup_entry_public_name(entry: dict) -> str:
+    target = entry.get("catalog_target")
+    return target["table"] if target is not None else entry["name"]
+
+
 def _wait_for_terminal_restore_job(
     backup_api, response: requests.Response, *, timeout_s: float = 30.0
 ) -> dict:
@@ -2962,9 +2967,11 @@ def _three_by_three_cluster_backup_restore(
     aggregate = json.loads(
         (repository / f"{backup_id}-cluster-metadata.json").read_text(encoding="utf-8")
     )
-    assert [entry["name"] for entry in aggregate["tables"]] == backup_tables
+    assert [
+        _backup_entry_public_name(entry) for entry in aggregate["tables"]
+    ] == backup_tables
     manifests = {
-        entry["name"]: json.loads(
+        _backup_entry_public_name(entry): json.loads(
             (repository / f'{entry["table_backup_id"]}-metadata.json').read_text(
                 encoding="utf-8"
             )
@@ -3817,7 +3824,11 @@ def _cluster_restore_modes(backup_api, *, concurrent_observers=False):
         aggregate = json.loads(
             (repository / f"{backup_id}-cluster-metadata.json").read_text()
         )
-        sibling = next(entry for entry in aggregate["tables"] if entry["name"] == table_b)
+        sibling = next(
+            entry
+            for entry in aggregate["tables"]
+            if _backup_entry_public_name(entry) == table_b
+        )
         sibling_manifest = json.loads(
             (repository / f'{sibling["table_backup_id"]}-metadata.json').read_text()
         )
