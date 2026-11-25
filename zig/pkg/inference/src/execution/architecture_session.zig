@@ -5286,6 +5286,7 @@ pub const WhisperNativeDecoder = struct {
     cold_metadata: ?*@import("cold_metadata.zig").Owner = null,
     diagnostics_binding: ?incremental_observation.Binding = null,
     pending_observation: @import("pending_observation.zig").Span = .{},
+    encoded_position_pending: bool = false,
     fn ensurePendingObservation(self: *WhisperNativeDecoder) void {
         if (self.pending_observation.source != null) return;
         const binding = self.diagnostics_binding orelse return;
@@ -5316,6 +5317,7 @@ pub const WhisperNativeDecoder = struct {
     }
 
     fn stepImpl(self: *WhisperNativeDecoder, tokens: []const i64) ![]f32 {
+        if (self.encoded_position_pending) return error.FrameAlreadyActive;
         if (self.cb.backend.execution_control) |control| try control.check();
         return whisper_arch.decoderStepCachedLogits(&self.cb.backend, self.allocator, self.config, tokens, &self.cache);
     }
@@ -5333,8 +5335,11 @@ pub const WhisperNativeDecoder = struct {
     }
 
     fn stepWithImpl(self: *WhisperNativeDecoder, tokens: []const i64, output: whisper_arch.StepOutput) !whisper_arch.StepResult {
+        if (self.encoded_position_pending) return error.FrameAlreadyActive;
         if (self.cb.backend.execution_control) |control| try control.check();
-        return whisper_arch.decoderStepCached(&self.cb.backend, self.allocator, self.config, tokens, &self.cache, output);
+        const result = try whisper_arch.decoderStepCached(&self.cb.backend, self.allocator, self.config, tokens, &self.cache, output);
+        self.encoded_position_pending = result == .encoded;
+        return result;
     }
 
     /// Enter or leave pipelined decoding (`.pipelined` steps); false when
@@ -5351,13 +5356,18 @@ pub const WhisperNativeDecoder = struct {
     /// Submit the step the last `.pipelined` call encoded.
     pub fn submit(self: *WhisperNativeDecoder) !void {
         self.ensurePendingObservation();
-        return self.pending_observation.call(&self.cb.backend, .submit, .unavailable, whisper_arch.decoderStepSubmit, .{&self.cb.backend});
+        try self.pending_observation.call(&self.cb.backend, .submit, .unavailable, whisper_arch.decoderStepSubmit, .{&self.cb.backend});
+        if (self.encoded_position_pending) {
+            self.cache.positions += 1;
+            self.encoded_position_pending = false;
+        }
     }
 
     /// Drop the step the last `.pipelined` call encoded without running it.
     pub fn discard(self: *WhisperNativeDecoder) void {
         self.ensurePendingObservation();
-        _ = self.pending_observation.call(&self.cb.backend, .cancel, .unavailable, discardPending, .{&self.cb.backend}) catch {};
+        const discarded = self.pending_observation.call(&self.cb.backend, .cancel, .unavailable, discardPending, .{&self.cb.backend}) catch return;
+        if (discarded) self.encoded_position_pending = false;
     }
 
     /// Collect the statistics of the step in flight from `slot`.
@@ -5377,6 +5387,7 @@ pub const WhisperNativeDecoder = struct {
         // A failed fence cannot authorize freeing cache/provider addresses.
         // Preserve process fail-closed policy instead of unlocking/replaying.
         self.pending_observation.call(&self.cb.backend, .drain, .unavailable, retirePending, .{&self.cb.backend}) catch platform.inference_process_supervisor.restartWorker();
+        self.encoded_position_pending = false;
     }
 
     pub fn positions(self: *const WhisperNativeDecoder) usize {
@@ -12356,6 +12367,12 @@ test "actual opt-in Metal Whisper pipelined numerical step preserves encoded sub
         else => return err,
     };
     try std.testing.expect(result == .encoded);
+    try std.testing.expectEqual(@as(usize, 2), decoder.positions());
+    try std.testing.expectError(error.FrameAlreadyActive, decoder.stepWith(&.{1}, .none));
+    try std.testing.expectError(error.FrameAlreadyActive, decoder.step(&.{1}));
+    decoder.discard();
+    try std.testing.expectEqual(@as(usize, 2), decoder.positions());
+    try std.testing.expect((try decoder.stepWith(&.{2}, .{ .pipelined = .{ .params = params, .suppress = &.{} } })) == .encoded);
     const encoded_phase = diagnostics.snapshot().?;
     try std.testing.expect(encoded_phase.pending_interval.?.phase == .encode_next and encoded_phase.pending_interval.?.completion == .unavailable);
     try decoder.submit();

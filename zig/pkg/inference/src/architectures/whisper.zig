@@ -1790,12 +1790,6 @@ pub fn decoderStepSubmit(cb: *const ComputeBackend) !void {
     try cb.decoderRuntimeSubmitFrame();
 }
 
-/// Drop an encoded step that will never be submitted (the step before it
-/// ended the text).
-pub fn decoderStepDiscard(cb: *const ComputeBackend) void {
-    if (cb.decoderRuntimeHasActiveFrame()) cb.decoderRuntimeCancelFrame() catch {};
-}
-
 /// Wait for the step submitted by `decoderStepSubmit` and read the
 /// statistics it left in `slot`. Null when nothing could be read.
 pub fn decoderStepAwait(cb: *const ComputeBackend, slot: usize) !?ops.WhisperLogitsStatsRaw {
@@ -2066,7 +2060,6 @@ fn decodeBlockCached(
         // The frame stays open; the caller submits it once the previous
         // step has been awaited (the backend keeps one frame in flight).
         frame_active = false;
-        cache.positions += n;
         return .encoded;
     }
     if (output == .stats) {
