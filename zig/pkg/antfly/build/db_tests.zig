@@ -336,6 +336,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "document extraction missing model and truncated OCR are actionable terminal unit failures",
         "asset batch fallback isolates malformed envelope and preserves typed mixed results",
         "asset batch fallback keeps the logical request retry budget",
+        "shared PDF consumers borrow one window and retain independent typed results",
+        "enrichment PDF preparers retain owner cancellation across operation retries",
         "document-wide OCR resource failure preserves units and marks pending pages",
         "OCR pending metadata construction is allocation-failure safe",
         "OCR text selection preserves dense embedded numeric tables",

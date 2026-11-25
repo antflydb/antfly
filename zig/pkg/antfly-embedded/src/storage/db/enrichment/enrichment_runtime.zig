@@ -12372,6 +12372,13 @@ const SharedPdfWindowScheduler = struct {
                 return job.canceled.load(.acquire) or job.cancellation.isCancelled() or job.guard.cancellation.isCancelled();
             }
 
+            fn textInvocationFailure(self: *const @This(), err: anyerror) anyerror {
+                if (!isOperationCanceled(err)) return err;
+                self.guard.check() catch |control| return control;
+                if (self.canceled.load(.acquire) or self.cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
+                return error.AssetInvocationCanceled;
+            }
+
             fn progress(_: ?*anyopaque, _: inference_request_context.Progress) void {
                 // A worker must not write the coordinator's current-consumer
                 // status. Publication and errors are attributed after join.
@@ -12387,7 +12394,7 @@ const SharedPdfWindowScheduler = struct {
                         text.producer.produceBorrowedRasterBatchReported(self.invocation.allocator(), text.requests, rasters)
                     else
                         text.producer.produceBatchReported(self.invocation.allocator(), text.requests)) catch |err| {
-                        self.err = self.invocation.mapError(err);
+                        self.err = self.textInvocationFailure(self.invocation.mapError(err));
                         return;
                     };
                     // Admission may be reported per item. Preserve the batch
@@ -12604,7 +12611,7 @@ const SharedPdfWindowScheduler = struct {
         fn needsTextRecovery(self: *@This(), job: *const Job) bool {
             const text = job.text orelse return false;
             const err = job.err orelse return false;
-            if (isGroupAbort(err) or err == error.QueueFull) return false;
+            if (isGroupAbort(err) or err == error.QueueFull or err == error.AssetInvocationCanceled) return false;
             if (generatedTextBatchFailureIsAttributable(.ocr, err, text.requests.len)) return true;
             return text.rasters == null and (malformedGeneratedTextBatchAllowsSequentialIsolation(err) or
                 !shouldYieldRequestError(self.scheduler.runtime, err));
@@ -14489,7 +14496,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         try scheduler.consumers.?[4].plans.resize(alloc, 3);
         scheduler.consumers.?[4].plans.items[2] = try Harness.partMemory(&harness, "visual", .{ .item_count = 2 }, 2, null);
         for ([_]usize{ 1, 2 }) |text_index| {
-            for ([_]?anyerror{ null, error.InvalidProducedBatchCardinality }) |failure| {
+            for ([_]?anyerror{ null, error.InvalidProducedBatchCardinality, error.Canceled, error.Cancelled }, 0..) |failure, scenario| {
                 try scheduler.cleanupSpool();
                 scheduler.consumers.?[1].enabled = text_index == 1;
                 scheduler.consumers.?[2].enabled = text_index == 2;
@@ -14503,7 +14510,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
                 harness.owner_released.store(false, .release);
                 const text_before = harness.text_calls;
                 const embed_before = harness.embed_calls;
-                const fresh_digest = @as([32]u8, @splat(@intCast(20 + text_index * 2 + @intFromBool(failure != null))));
+                const fresh_digest = @as([32]u8, @splat(@intCast(20 + text_index * 4 + scenario)));
                 var fresh_units = [_]document_extraction_mod.Unit{
                     try cloneDocumentExtractionUnit(alloc, .{ .unit_id = @constCast("page:000001"), .unit_type = @constCast("page"), .text = @constCast(""), .method = @constCast("pdf_text"), .page_number = 1, .extraction_status = @constCast("pending_ocr") }),
                     try cloneDocumentExtractionUnit(alloc, .{ .unit_id = @constCast("page:000002"), .unit_type = @constCast("page"), .text = @constCast(""), .method = @constCast("pdf_text"), .page_number = 2, .extraction_status = @constCast("pending_ocr") }),
@@ -14518,6 +14525,15 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
                 try std.testing.expect(try scheduler.drainOwnerAdmission(error.QueueFull));
                 try std.testing.expect(!try scheduler.drainOwnerAdmission(error.QueueFull));
                 try SharedPdfWindowScheduler.WindowWork.finish(&work);
+                if (failure != null and isOperationCanceled(failure.?)) {
+                    const captured = scheduler.failure(text_index) orelse return error.TestUnexpectedResult;
+                    try std.testing.expectEqual(error.AssetInvocationCanceled, captured.cause);
+                    try std.testing.expectEqual(text_before, harness.text_calls);
+                    try std.testing.expectEqual(embed_before + 1, harness.embed_calls);
+                    try std.testing.expectEqual(before, resources.sliceStats(.document_extraction_working_set).used_bytes);
+                    consumer.err = null;
+                    continue;
+                }
                 try std.testing.expect(consumer.err == null);
                 try std.testing.expect(scheduler.consumers.?[4].err == null);
                 try std.testing.expectEqual(text_before + 2, harness.text_calls);
@@ -19125,6 +19141,19 @@ fn flushTextAssetProducerBatchItems(
 
     var produced_batch = assetProducerProduceBatchReportedGuarded(runtime, producer, runtime.alloc, requests) catch |err| {
         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
+        if (err == error.AssetInvocationCanceled) {
+            var outcome: AssetBatchOutcome = .{};
+            for (items) |*item| {
+                try checkProviderFailureGuard(runtime);
+                const cause = assetInvocationFailure(runtime, error.Canceled);
+                if (cause != error.AssetInvocationCanceled) return cause;
+                scope.enterAsset(item);
+                if (try scope.shouldYield(runtime, cause)) {
+                    outcome.deferRetry(scope, cause);
+                } else try recordAssetProducerFailure(runtime, window, item.*, cause, scope.attemptNumber(runtime));
+            }
+            return outcome.finish();
+        }
         // Batch execution is an optimization boundary, not a logical repair
         // identity. Fall back immediately so durable retry ownership belongs to
         // each source request and cannot oscillate between batch and singleton
@@ -20749,7 +20778,7 @@ fn processDocumentExtractionAsset(
         config.pdf_decode_limits = configured_pdf_decode_limits;
         config.pdf_render_max_inflight_bytes = configured_pdf_render_inflight_bytes;
         const err: anyerror = if (raw_err != error.OutOfMemory)
-            pdf_inspection_deadline.classifyError(raw_err)
+            raw_err
         else if (pdf_inspection_reservation.limit_exceeded)
             error.DocumentExtractionWorkingSetTooLarge
         else if (collection_budgeted != null and collection_budgeted.?.denied())
@@ -21981,6 +22010,41 @@ pub fn runNativePdfOcrCoordinatorIntegration(
     );
     defer coordinator.destroy();
 
+    const CancelSink = struct {
+        fn begin(_: *anyopaque, _: document_extraction_mod.StreamInfo) !void {}
+        fn unit(raw: *anyopaque, _: *document_extraction_mod.Unit) !void {
+            const deadline: *document_extraction_mod.PdfRenderDeadline = @ptrCast(@alignCast(raw));
+            deadline.deadline_ns = 0;
+            return error.Canceled;
+        }
+        fn end(_: *anyopaque) !void {}
+    };
+    const cancel_sink: document_extraction_mod.UnitSink = .{
+        .ptr = &coordinator.deadline,
+        .on_begin = CancelSink.begin,
+        .on_unit = CancelSink.unit,
+        .on_end = CancelSink.end,
+    };
+    try std.testing.expectError(error.Canceled, document_extraction_mod.extractPreparedPdfStreamingWithTextCache(
+        alloc,
+        &coordinator.session,
+        "application/pdf",
+        .{},
+        .always,
+        cancel_sink,
+        null,
+    ));
+    try std.testing.expectError(error.PdfRenderTimeout, document_extraction_mod.extractPreparedPdfStreamingWithTextCache(
+        alloc,
+        &coordinator.session,
+        "application/pdf",
+        .{},
+        .always,
+        cancel_sink,
+        null,
+    ));
+    coordinator.beginOperation(30_000);
+
     const persistent_bytes = coordinator.reservation.live_bytes;
     if (persistent_bytes == 0) return error.PdfCoordinatorDidNotRetainParsedState;
     try std.testing.expect(resources.sliceStats(.document_extraction_working_set).used_bytes >= persistent_bytes);
@@ -22060,6 +22124,17 @@ pub fn runNativePdfOcrCoordinatorIntegration(
             .config = .{},
             .ownership = undefined,
         };
+        const expired: document_extraction_mod.PdfRenderDeadline = .{ .deadline_ns = 0 };
+        var expired_retry = try PdfDeferredRenderRetry.capture(alloc, &plans, rendered, deferred.?.options, available_bytes);
+        defer if (expired_retry) |*retry| retry.deinit(alloc);
+        try std.testing.expectError(error.PdfRenderTimeout, PdfDeferredRenderRetry.retryAfterRelease(&expired_retry, &runtime, &coordinator.session, window_lease, &rendered, expired.probe()));
+        try std.testing.expect(expired_retry == null);
+        try std.testing.expectEqual(first_pointer, rendered.encoded.results[0].rendered.?.png.ptr);
+        for ([_]bool{ false, true }) |raster| {
+            var options = deferred.?.options;
+            options.cancellation = expired.probe();
+            try std.testing.expectError(error.PdfRenderTimeout, renderAdmittedPdfWindowBatchAlloc(&runtime, &coordinator.session, window_lease, &plans, options, raster, available_bytes, null));
+        }
         try PdfDeferredRenderRetry.retryAfterRelease(&deferred, &runtime, &coordinator.session, window_lease, &rendered, coordinator.deadline.probe());
         batch = rendered.encoded;
         try std.testing.expect(deferred == null and window_lease.rendering_finished);
@@ -23091,8 +23166,14 @@ const RuntimePdfRenderCancellation = struct {
         return false;
     }
 
+    fn cancellationError(raw: ?*const anyopaque, err: anyerror) anyerror {
+        const self: *const @This() = @ptrCast(@alignCast(raw orelse return err));
+        self.external.check() catch return self.external.classifyError(err);
+        return self.deadline.classifyError(err);
+    }
+
     fn probe(self: *const @This()) document_extraction_mod.PdfCancellationProbe {
-        return .{ .context = self, .is_cancelled_fn = isCancelled };
+        return .{ .context = self, .is_cancelled_fn = isCancelled, .cancellation_error_fn = cancellationError };
     }
 };
 
@@ -24195,6 +24276,7 @@ fn renderAdmittedPdfWindowBatchAlloc(
     max_scratch_bytes: usize,
     deferred: ?*?PdfDeferredRenderRetry,
 ) !RuntimePdfRenderBatch {
+    options.cancellation.check() catch |err| return options.cancellation.classifyError(err);
     const Growth = struct {
         lease: *PdfWindowCompositeLease,
         maximum: usize,
@@ -24226,12 +24308,12 @@ fn renderAdmittedPdfWindowBatchAlloc(
                 .{ .encoded = try renderPreparedPdfWindowBatchAlloc(self.runtime, self.session, alloc, active_plans, opts) };
         }
     };
-    var batch = try renderPdfWindowWithScratchRetry(Render{
+    var batch = renderPdfWindowWithScratchRetry(Render{
         .runtime = runtime,
         .session = session,
         .plans = plans,
         .use_rasters = use_rasters,
-    }, lease, admitted_options, max_scratch_bytes);
+    }, lease, admitted_options, max_scratch_bytes) catch |err| return options.cancellation.classifyError(err);
     errdefer batch.deinit(lease.allocator());
     if (deferred) |slot| slot.* = try PdfDeferredRenderRetry.capture(lease.owner_alloc, plans, batch, options, max_scratch_bytes);
     return batch;
@@ -24291,7 +24373,7 @@ const PdfDeferredRenderRetry = struct {
         var retry = slot.* orelse return;
         slot.* = null; // Includes cancellation/error paths: never retry forever.
         defer retry.deinit(lease.owner_alloc);
-        try cancellation.check();
+        cancellation.check() catch |err| return cancellation.classifyError(err);
         std.debug.assert(lease.rendering_finished and lease.consumer_count == 0);
         lease.rendering_finished = false;
         defer lease.finishRendering();
@@ -24810,7 +24892,7 @@ fn renderRuntimePdfWindow(
     admission_phase = "render";
     var deferred_render: ?PdfDeferredRenderRetry = null;
     errdefer if (deferred_render) |*retry| retry.deinit(alloc);
-    var batch = renderAdmittedPdfWindowBatchAlloc(runtime, session, lease, prepared_plans[0..requests.items.len], .{
+    var batch = try renderAdmittedPdfWindowBatchAlloc(runtime, session, lease, prepared_plans[0..requests.items.len], .{
         .max_batch_pages = max_pages,
         .max_parallel_pages = parallel_pages,
         .max_inflight_pixels = config.pdf_render_max_inflight_pixels,
@@ -24820,10 +24902,7 @@ fn renderRuntimePdfWindow(
         .profile = .ocr,
         .cancellation = render_cancellation.probe(),
         .executor_io = runtime.config.io,
-    }, use_borrowed_rasters, max_inflight_bytes, if (batch_policy.defer_render_pressure) &deferred_render else null) catch |err| {
-        if (isOperationCanceled(err)) try cancellation.check();
-        return render_cancellation.deadline.classifyError(err);
-    };
+    }, use_borrowed_rasters, max_inflight_bytes, if (batch_policy.defer_render_pressure) &deferred_render else null);
     errdefer switch (batch) {
         inline else => |*value| value.deinit(lease.allocator()),
     };
@@ -24846,6 +24925,20 @@ fn renderRuntimePdfWindow(
 /// fully admitted render window to run on an Io worker during inference for
 /// the preceding window. The renderer itself may still use its bounded page
 /// lane; no second caller touches the session until this preparation returns.
+fn pdfWindowCancellationProbe(preparer: anytype) document_extraction_mod.PdfCancellationProbe {
+    const Preparer = @TypeOf(preparer.*);
+    const Probe = struct {
+        fn classify(raw: ?*const anyopaque, err: anyerror) anyerror {
+            const self: *const Preparer = @ptrCast(@alignCast(raw orelse return err));
+            self.guard.check() catch |control| return control;
+            if (self.lifecycle.isCancelled()) return error.EnrichmentWaitCanceled;
+            if (self.cancel_requested.load(.acquire)) return err;
+            return self.coordinator.deadline.classifyError(err);
+        }
+    };
+    return .{ .context = preparer, .is_cancelled_fn = Preparer.isCancelled, .cancellation_error_fn = Probe.classify };
+}
+
 const RuntimePdfRenderWindowPreparer = struct {
     runtime: *EnrichmentRuntime,
     // Snapshot the owner's guard before dispatch: shared consumers may change
@@ -24874,7 +24967,7 @@ const RuntimePdfRenderWindowPreparer = struct {
     }
 
     fn cancellationProbe(self: *const @This()) document_extraction_mod.PdfCancellationProbe {
-        return .{ .context = self, .is_cancelled_fn = isCancelled };
+        return pdfWindowCancellationProbe(self);
     }
 
     fn prepare(self: *const @This(), start_index: usize) !RuntimePdfRenderWindow {
@@ -24909,13 +25002,7 @@ const RuntimePdfRenderWindowPreparer = struct {
             start_index,
             self.use_borrowed_rasters,
             self.cancellationProbe(),
-        ) catch |err| {
-            if (isOperationCanceled(err)) {
-                try self.guard.check();
-                if (self.lifecycle.isCancelled() or self.cancel_requested.load(.acquire)) return err;
-            }
-            return self.coordinator.deadline.classifyError(err);
-        };
+        ) catch |err| return self.cancellationProbe().classifyError(err);
         errdefer window.deinit();
         if (self.cancel_requested.load(.acquire)) return error.Canceled;
         return window;
@@ -24952,6 +25039,12 @@ test "enrichment PDF preparers retain owner cancellation across operation retrie
         try std.testing.expectError(error.Canceled, probe.check());
         local.store(false, .release);
         try probe.check();
+        coordinator.deadline.deadline_ns = 0;
+        try std.testing.expectEqual(error.PdfRenderTimeout, probe.classifyError(error.Canceled));
+        lifecycle.store(true, .release);
+        try std.testing.expectEqual(error.EnrichmentWaitCanceled, probe.classifyError(error.Canceled));
+        lifecycle.store(false, .release);
+        coordinator.deadline.deadline_ns = std.math.maxInt(u64);
     }
 }
 
@@ -34323,7 +34416,7 @@ const PdfEmbeddingWindowPreparer = struct {
     }
 
     fn cancellationProbe(self: *const @This()) document_extraction_mod.PdfCancellationProbe {
-        return .{ .context = self, .is_cancelled_fn = isCancelled };
+        return pdfWindowCancellationProbe(self);
     }
 
     fn prepare(self: *const @This(), first_item: usize) !PdfEmbeddingPreparedWindow {
@@ -34373,13 +34466,13 @@ const PdfEmbeddingWindowPreparer = struct {
         );
         defer concurrent_alloc.free(prepared_plans);
         const requested_count = count;
-        count = try preparePdfPixelPrefix(
+        count = preparePdfPixelPrefix(
             &self.coordinator.session,
             requests[0..count],
             prepared_plans,
             .{ .max_inflight_pixels = self.render_config.pdf_render_max_inflight_pixels, .max_inflight_bytes = available_bytes },
             self.use_borrowed_rasters,
-        );
+        ) catch |err| return self.cancellationProbe().classifyError(err);
         if (count < requested_count and count > self.batch_items and count % self.batch_items != 0)
             count = nextPdfWindowCandidate(count, self.batch_items);
         const per_page_bytes = self.page_output_bytes_cap;
@@ -46771,6 +46864,7 @@ test "asset batch fallback keeps the logical request retry budget" {
 
     const AlwaysTransientProducer = struct {
         batch_count: usize = 0,
+        batch_error: anyerror = error.EmbedRateLimited,
         single_count: usize = 0,
 
         fn producer(self: *@This()) asset_producer_mod.Producer {
@@ -46793,7 +46887,7 @@ test "asset batch fallback keeps the logical request retry budget" {
         fn produceBatch(ptr: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) ![][]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.batch_count += 1;
-            return error.EmbedRateLimited;
+            return self.batch_error;
         }
     };
 
@@ -46882,6 +46976,20 @@ test "asset batch fallback keeps the logical request retry budget" {
     try std.testing.expectEqual(@as(usize, 2), producer_impl.single_count);
     try std.testing.expectEqual(@as(usize, 1), failure_capture.count);
     try std.testing.expectEqual(@as(u64, 2), failure_capture.failure.?.attempts);
+    // Whole-batch cancellation must defer the attempt without asking the
+    // provider to execute the same items again as singleton calls.
+    producer_impl.batch_error = error.Cancelled;
+    var third = std.ArrayListUnmanaged(AssetProducerBatchItem).empty;
+    defer third.deinit(alloc);
+    try third.append(alloc, try TestItem.make(alloc));
+    third.items[0].request.doc_key = "doc:2";
+    try third.append(alloc, try TestItem.make(alloc));
+    third.items[1].request.doc_key = "doc:3";
+    var third_scope = FailureScope{};
+    try std.testing.expectError(error.AssetInvocationCanceled, flushAssetProducerBatch(&runtime, &third, &window, &third_scope));
+    try std.testing.expectEqual(@as(usize, 3), producer_impl.batch_count);
+    try std.testing.expectEqual(@as(usize, 2), producer_impl.single_count);
+    try std.testing.expectEqual(@as(usize, 1), failure_capture.count);
 }
 
 test "document extraction generated OCR bypasses unsupported native batch" {
