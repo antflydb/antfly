@@ -3156,7 +3156,7 @@ test "borrowed BF16 bias epilogue clears descriptor after success and partial pu
     try std.testing.expect(Probe.bound == null);
     try std.testing.expectEqual(@as(usize, 4), Probe.calls);
     Probe.fail = true;
-    try std.testing.expectError(error.CublasLtError, CublasLt.BorrowedBiasBinding.bind(&blas, descriptor, bias, CUDA_R_16BF));
+    try std.testing.expectError(error.CublasLtUnsupported, CublasLt.BorrowedBiasBinding.bind(&blas, descriptor, bias, CUDA_R_16BF));
     try std.testing.expect(Probe.bound == null);
     try std.testing.expectEqual(@as(usize, 8), Probe.calls);
 }

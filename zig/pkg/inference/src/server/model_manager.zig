@@ -7856,14 +7856,19 @@ test "optional session adoption owns rollback and transfers admission exactly on
         var primary = try manager.loadManagedSessionWithAdmission(root, &.{.native}, null, null, .{ .path = root, .publication = try managed_receipt.publicationGeneration(allocator, std.testing.io, root) }, null);
         defer primary.deinit();
         const baseline = manager.admissionController().snapshot();
-        var model: LoadedModel = undefined;
-        model.managed_publication = null;
-        model.model_dir = root;
-        model.allocator = allocator;
-        model.session = primary.session;
-        model.session_manager = &manager.session_manager;
-        model.host = manager.loadedRuntimeHost();
-        model.kernel_jit_profile_bundle = null;
+        var model: LoadedModel = .{
+            .model_dir = root,
+            .allocator = allocator,
+            .session = primary.session,
+            .session_manager = &manager.session_manager,
+            .host = manager.loadedRuntimeHost(),
+            .manifest = .{ .allocator = allocator },
+            .hf_tok = null,
+            .sp_tok = null,
+            .prompt_prefix_cache = .init(allocator),
+            .native_generation_graph_cache = .init(allocator),
+            .resource_lease = primary.resource_lease,
+        };
         var slot: ?backends.Session = null;
         var lease_slot: ?runtime.tier.memory.AdmissionLease = null;
         defer if (lease_slot) |*lease| lease.release();
@@ -13471,17 +13476,20 @@ test "model selection lazy optional component retains primary publication" {
     defer manager.deinit();
     var primary = try manager.loadManagedSessionWithAdmission(root, &.{.native}, null, null, .{ .path = root, .publication = try managed_receipt.publicationGeneration(a, std.testing.io, root) }, null);
     defer primary.deinit();
-    var model: LoadedModel = undefined;
-    model.managed_publication = publication_a;
-    model.model_dir = root;
-    model.allocator = a;
-    model.session = primary.session;
-    model.session_manager = &manager.session_manager;
-    model.host = manager.loadedRuntimeHost();
-    model.kernel_jit_profile_bundle = null;
-    model.manifest = .{ .allocator = a, .gguf_projector_path = gguf };
-    model.projector_store_mutex = .unlocked;
-    model.projector_store = null;
+    var model: LoadedModel = .{
+        .managed_publication = publication_a,
+        .model_dir = root,
+        .allocator = a,
+        .session = primary.session,
+        .session_manager = &manager.session_manager,
+        .host = manager.loadedRuntimeHost(),
+        .manifest = .{ .allocator = a, .gguf_projector_path = gguf },
+        .hf_tok = null,
+        .sp_tok = null,
+        .prompt_prefix_cache = .init(a),
+        .native_generation_graph_cache = .init(a),
+        .resource_lease = primary.resource_lease,
+    };
     const old_selection = @import("../registry/model_selection.zig").ResolvedModel{ .path = root, .publication = publication_a };
     const control = old_selection.bind(InferenceExecutionControl{ .io = io, .native_call_policy = .in_process });
     var existing: ?backends.Session = null;
@@ -13875,14 +13883,20 @@ test "model selection lazy ONNX sessions enforce graph and external tensor recei
     defer manager.deinit();
     var primary = try manager.loadManagedSessionWithAdmission(root, &.{.native}, null, control, selected, null);
     defer primary.deinit();
-    var model: LoadedModel = undefined;
-    model.managed_publication = selected.publication;
-    model.model_dir = root;
-    model.allocator = a;
-    model.session = primary.session;
-    model.session_manager = &manager.session_manager;
-    model.host = manager.loadedRuntimeHost();
-    model.kernel_jit_profile_bundle = null;
+    var model: LoadedModel = .{
+        .managed_publication = selected.publication,
+        .model_dir = root,
+        .allocator = a,
+        .session = primary.session,
+        .session_manager = &manager.session_manager,
+        .host = manager.loadedRuntimeHost(),
+        .manifest = .{ .allocator = a },
+        .hf_tok = null,
+        .sp_tok = null,
+        .prompt_prefix_cache = .init(a),
+        .native_generation_graph_cache = .init(a),
+        .resource_lease = primary.resource_lease,
+    };
     var slot: ?backends.Session = null;
     var lease: ?runtime.tier.memory.AdmissionLease = null;
     defer if (lease) |*held| held.release();
@@ -13905,6 +13919,7 @@ test "model selection lazy ONNX sessions enforce graph and external tensor recei
     defer current_primary.deinit();
     model.managed_publication = current.publication;
     model.session = current_primary.session;
+    model.resource_lease = current_primary.resource_lease;
     try std.testing.expect(try model.ensureOptionalSessionWithControl(.text_projection, &slot, &lease, optional, current_control));
     var tensor = try backends.Tensor.initFloat32(a, "input", &.{4}, &.{ 0, 0, 0, 0 });
     defer tensor.deinit();
@@ -15779,15 +15794,33 @@ test "model selection lazy projector authenticates before opening and reuses its
     var sm = backends.SessionManager.initWithIo(a, io);
     var manager = ModelManager.init(a, sm);
     defer manager.deinit();
-    var model: LoadedModel = undefined;
-    model.allocator = a;
-    model.model_dir = root;
-    model.managed_publication = man.managed_publication;
-    model.session_manager = &sm;
-    model.host = manager.loadedRuntimeHost();
-    model.manifest = man;
-    model.projector_store_mutex = .unlocked;
-    model.projector_store = null;
+    const Primary = struct {
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+
+        const vtable: backends.Session.VTable = .{
+            .run = undefined,
+            .inputInfo = undefined,
+            .outputInfo = undefined,
+            .backend = backend,
+            .close = undefined,
+        };
+    };
+    var primary: u8 = 0;
+    var model: LoadedModel = .{
+        .allocator = a,
+        .model_dir = root,
+        .managed_publication = man.managed_publication,
+        .session = .{ .ptr = &primary, .vtable = &Primary.vtable },
+        .session_manager = &sm,
+        .host = manager.loadedRuntimeHost(),
+        .manifest = man,
+        .hf_tok = null,
+        .sp_tok = null,
+        .prompt_prefix_cache = .init(a),
+        .native_generation_graph_cache = .init(a),
+    };
     const control = selected.bind(InferenceExecutionControl{ .io = io });
     try std.testing.expectError(error.ChecksumMismatch, model.ensureProjectorStoreWithControl(control));
     try std.testing.expect(model.projector_store == null);
