@@ -6393,8 +6393,53 @@ fn embedDensePartsWithRetry(
     }
 }
 
-fn captureSparseRevision(runtime: *EnrichmentRuntime, provider: embedder_mod.SparseEmbedder, alloc: Allocator, name: []const u8) !?[32]u8 {
-    return provider.captureRevision(alloc, name) catch |err| return providerInvocationFailure(runtime, err);
+fn checkEmbeddingInvocationOwner(runtime: *EnrichmentRuntime, guard: ForegroundCatchUpGuard, context: ?inference_request_context.RequestContext) !void {
+    try checkAssetInvocationOwner(runtime, guard, if (context) |value| .fromRequestContext(value) else .{});
+}
+
+fn embeddingInvocationFailure(runtime: *EnrichmentRuntime, guard: ForegroundCatchUpGuard, context: ?inference_request_context.RequestContext, err: anyerror) anyerror {
+    if (!isOperationInterruption(err)) return err;
+    checkEmbeddingInvocationOwner(runtime, guard, context) catch |control| return control;
+    return classifyProviderCancellation(err, guard, false);
+}
+
+fn captureDenseCacheRevision(runtime: *EnrichmentRuntime, provider: embedder_mod.DenseEmbedder, alloc: Allocator, name: []const u8) !?[32]u8 {
+    const resolve = provider.cache_revision_fn orelse return null;
+    const guard = runtime.active_provider_guard;
+    try checkEmbeddingInvocationOwner(runtime, guard, provider.part_request_context);
+    const revision = resolve(provider.ptr, alloc, name) catch |err| {
+        try checkEmbeddingInvocationOwner(runtime, guard, provider.part_request_context);
+        return classifyProviderCancellation(err, guard, false);
+    };
+    try checkEmbeddingInvocationOwner(runtime, guard, provider.part_request_context);
+    return revision;
+}
+
+fn captureSparseRevision(runtime: *EnrichmentRuntime, provider: embedder_mod.SparseEmbedder, alloc: Allocator, name: []const u8, foreground: ?inference_request_context.RequestContext) !?[32]u8 {
+    const guard = runtime.active_provider_guard;
+    var scoped = provider;
+    var cancellation: AssetInvocationCancellation = undefined;
+    if (foreground) |context| {
+        var effective = context;
+        const inherited = provider.request_context;
+        cancellation = .{
+            .lifecycle = runtime.config.cancellation,
+            .request = context.cancellation orelse .none,
+            .inherited = if (inherited) |value| value.cancellation orelse .none else .none,
+        };
+        effective.cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = AssetInvocationCancellation.isCancelled };
+        if (inherited) |value| if (value.deadline_ns) |deadline| {
+            effective.deadline_ns = if (effective.deadline_ns) |current| @min(current, deadline) else deadline;
+        };
+        scoped = provider.withRequestContext(effective);
+    }
+    try checkEmbeddingInvocationOwner(runtime, guard, scoped.request_context);
+    const revision = scoped.captureRevision(alloc, name) catch |err| {
+        try checkEmbeddingInvocationOwner(runtime, guard, scoped.request_context);
+        return classifyProviderCancellation(err, guard, false);
+    };
+    try checkEmbeddingInvocationOwner(runtime, guard, scoped.request_context);
+    return revision;
 }
 
 fn embedSparseWithRetry(
@@ -10416,6 +10461,10 @@ test "enrichment cancellation distinguishes PDF deadlines and asset invocation f
 test "enrichment cancellation defers dense sparse and multimodal provider calls without inline retry" {
     const Mock = struct {
         calls: usize = 0,
+        revision_calls: usize = 0,
+        expected_deadline: ?u64 = null,
+        inherited: std.atomic.Value(bool) = .init(false),
+        cancel_revision: bool = false,
         fn fail(ptr: *anyopaque) anyerror {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
@@ -10435,6 +10484,17 @@ test "enrichment cancellation defers dense sparse and multimodal provider calls 
         }
         fn sparseBatch(ptr: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]embedder_mod.SparseEmbedding {
             return fail(ptr);
+        }
+        fn sparseRevision(ptr: *anyopaque, _: Allocator, _: []const u8, context: inference_request_context.RequestContext) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.revision_calls += 1;
+            try std.testing.expectEqual(self.expected_deadline, context.deadline_ns);
+            if (self.cancel_revision) {
+                self.inherited.store(true, .release);
+                try std.testing.expect(context.cancellation.?.isCancelled());
+                return error.Cancelled;
+            }
+            return @splat(7);
         }
     };
     var mock = Mock{};
@@ -10469,6 +10529,30 @@ test "enrichment cancellation defers dense sparse and multimodal provider calls 
     try std.testing.expectEqual(@as(usize, 5), mock.calls);
     try std.testing.expectEqual(@as(u64, 5), runtime.inference_cancel_count.load(.acquire));
     try std.testing.expectEqual(@as(u32, 0), runtime.consecutive_retry_count);
+
+    // The ordered checkpoint passes its exact deadline and preserves any
+    // earlier owner that was already bound to the provider.
+    var controlled_sparse = sparse;
+    controlled_sparse.cache_revision_with_context_fn = Mock.sparseRevision;
+    controlled_sparse.request_context = .{
+        .io = std.testing.io,
+        .deadline_ns = null,
+        .cancellation = CancellationToken.fromAtomic(&mock.inherited),
+    };
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{
+        .kind = .sparse_embedding,
+        .index_name = "sparse",
+        .doc_key = "doc",
+        .source_field = "body",
+    };
+    runtime.active_provider_guard.deadline_ns = std.math.maxInt(u64);
+    const context = assetProviderRequestContext(&runtime);
+    mock.expected_deadline = context.deadline_ns;
+    const revision = try captureSparseRevision(&runtime, controlled_sparse, std.testing.allocator, "sparse", context);
+    try requireChunkProviderRevision(&runtime, std.testing.allocator, request, null, controlled_sparse, .{}, revision, context);
+    mock.cancel_revision = true;
+    try std.testing.expectError(error.EnrichmentWaitCanceled, requireChunkProviderRevision(&runtime, std.testing.allocator, request, null, controlled_sparse, .{}, revision, context));
+    try std.testing.expectEqual(@as(usize, 3), mock.revision_calls);
 }
 
 test "enrichment provider deadlines and progress cross native clock boundaries" {
@@ -12343,7 +12427,7 @@ const SharedPdfWindowScheduler = struct {
         consumer.source_identity = PreparedDocumentSourceCache.sourceIdentity(source_url);
         const policy = try enrichment_types.parseExecutionPolicyJson(self.runtime.alloc, request.execution_json);
         const execution_lease = embedder.resolveMediaPartLease(self.runtime.alloc, requestEmbeddingName(request), @min(policy.batch_items orelse generated_ocr_default_batch_max_items, generated_ocr_absolute_batch_max_items)) catch |err|
-            return providerInvocationFailure(self.runtime, err);
+            return embeddingInvocationFailure(self.runtime, self.runtime.active_provider_guard, embedder.part_request_context, err);
         const caps = execution_lease.capabilities.?;
         consumer.execution_lease = execution_lease;
         const raster = embedder.supportsRasterItems() and caps.borrowed_rasters;
@@ -12351,7 +12435,7 @@ const SharedPdfWindowScheduler = struct {
             return error.UnsupportedEmbeddingProvider;
         consumer.max_items = @min(@min(policy.batch_items orelse caps.batch.preferred_items, caps.batch.max_items), generated_ocr_absolute_batch_max_items);
         consumer.max_items = embedder.withPartLease(execution_lease).partBatchLimit(requestEmbeddingName(request), request.expected_dims, consumer.max_items) catch |err|
-            return providerInvocationFailure(self.runtime, err);
+            return embeddingInvocationFailure(self.runtime, self.runtime.active_provider_guard, embedder.part_request_context, err);
         if (consumer.max_items == 0)
             return error.InvalidInferenceCapabilities;
         consumer.max_bytes = if (raster) policy.batch_bytes orelse 1 else if (caps.batch.max_encoded_media_bytes) |limit| pdfImageEmbeddingBatchBytes(policy.batch_bytes, limit) else policy.batch_bytes orelse return error.InferenceCapabilitiesUnavailable;
@@ -12364,7 +12448,7 @@ const SharedPdfWindowScheduler = struct {
             count,
             "image/png",
             request.expected_dims,
-        ) catch |err| return providerInvocationFailure(self.runtime, err);
+        ) catch |err| return embeddingInvocationFailure(self.runtime, self.runtime.active_provider_guard, embedder.part_request_context, err);
         const page_bytes = if (raster) 1 else @min(maximum_pdf_page_inline_png_bytes, try consumer.plans.items[1].attachment_transport.maxRawBytesForLimits("image/png".len, 1, consumer.max_bytes, std.math.maxInt(usize)));
         consumer.transform = SharedPdfTransform.init(consumer.config, caps.renderPixelLimit(raster), if (caps.image_transform) |t| t.target_width else null, if (caps.image_transform) |t| t.target_height else null, page_bytes, raster);
         consumer.enabled = true;
@@ -12661,11 +12745,8 @@ const SharedPdfWindowScheduler = struct {
                     }
                     return;
                 }
-                self.output = switch (self.rendered) {
-                    .encoded => |batch| embedRenderedPdfPageBatch(self.invocation.allocator(), self.embedder, requestEmbeddingName(self.request), batch, self.request.expected_dims),
-                    .raster => |batch| embedRenderedPdfPageRasterBatch(self.invocation.allocator(), self.embedder, requestEmbeddingName(self.request), batch, self.request.expected_dims),
-                } catch |err| {
-                    self.err = self.invocationFailure(self.invocation.mapError(err));
+                self.output = embedPdfWindowPart(self.group.scheduler.runtime, self.guard, self.invocation.allocator(), self.embedder, requestEmbeddingName(self.request), self.rendered, self.request.expected_dims) catch |err| {
+                    self.err = self.invocation.mapError(err);
                     return;
                 };
             }
@@ -12917,6 +12998,7 @@ const SharedPdfWindowScheduler = struct {
                 if (runtime.shutdown_requested.load(.acquire)) return error.EnrichmentRetryAborted;
                 try job.guard.check();
                 if (Job.isCanceled(job)) return error.EnrichmentWaitCanceled;
+                if (job.text == null) try checkEmbeddingInvocationOwner(runtime, job.guard, job.embedder.part_request_context);
             }
             if (publish) if (job.text) |*text| {
                 if (text.batch) |batch| {
@@ -13622,8 +13704,8 @@ const SharedPdfWindowScheduler = struct {
             defer invocation.deinit();
             const alloc = invocation.allocator();
             const scoped_embedder = embedder.withPartLease(consumer.execution_lease orelse .{ .capabilities = consumer.capabilities });
-            var output = embedPdfWindowPart(alloc, scoped_embedder, embedding_name, job_window, request.expected_dims) catch |err|
-                return providerInvocationFailure(runtime, invocation.mapError(err));
+            var output = embedPdfWindowPart(runtime, runtime.active_provider_guard, alloc, scoped_embedder, embedding_name, job_window, request.expected_dims) catch |err|
+                return invocation.mapError(err);
             defer output.deinit(alloc);
             try self.commitEmbeddingOutput(alloc, consumer, request, source_sha, stage_id, output);
             start = end;
@@ -14031,6 +14113,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         wait_for_cancel: bool = false,
         prefetch_started: ?*const std.atomic.Value(bool) = null,
         worker_failure: ?anyerror = null,
+        cancel_embedder_owner: ?*std.atomic.Value(bool) = null,
         text_calls: usize = 0,
         embed_calls: usize = 0,
         last_embed_items: usize = 0,
@@ -14163,7 +14246,10 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
                     @import("antfly_platform").time.yieldNow();
                 }
             }
-            if (self.worker_failure) |err| return err;
+            if (self.worker_failure) |err| {
+                if (self.cancel_embedder_owner) |signal| signal.store(true, .release);
+                return err;
+            }
             const deadline = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s;
             if (self.prefetch_started) |started| while (!started.load(.acquire)) {
                 try context.check();
@@ -14297,6 +14383,38 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             null,
             &jobs,
         ));
+        try std.testing.expectEqual(@as(usize, 0), jobs.count);
+    }
+    {
+        // Force a synchronous shared consumer even though the provider
+        // supports context. Its inherited owner cancels inside the call.
+        var inherited = std.atomic.Value(bool).init(false);
+        const original = runtime.config.dense_embedder.?;
+        defer runtime.config.dense_embedder = original;
+        runtime.config.dense_embedder.?.dense_embed_part_items_with_context_fn = Harness.embedWithContext;
+        runtime.config.dense_embedder.?.part_request_context = .{
+            .io = std.testing.io,
+            .deadline_ns = null,
+            .cancellation = CancellationToken.fromAtomic(&inherited),
+        };
+        harness.cancel_embedder_owner = &inherited;
+        defer harness.cancel_embedder_owner = null;
+        harness.worker_failure = error.Canceled;
+        defer harness.worker_failure = null;
+        const canceled_digest: [32]u8 = @splat(79);
+        var jobs = SharedPdfWindowScheduler.WindowJobs{ .scheduler = &scheduler, .primary = "{}" };
+        defer jobs.deinit();
+        try std.testing.expectError(error.EnrichmentWaitCanceled, scheduler.consumeEmbedding(
+            &scheduler.consumers.?[4],
+            requests[4],
+            &canceled_digest,
+            .{ .encoded = batch },
+            batch.results.len,
+            window_lease,
+            null,
+            &jobs,
+        ));
+        try std.testing.expect(inherited.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), jobs.count);
     }
     const digest = @as([32]u8, @splat(7));
@@ -20142,11 +20260,11 @@ fn processVectorLabels(runtime: *EnrichmentRuntime, request: enrichment_types.Ge
     if (upstream.source_artifact_name.len == 0) return error.InvalidEnrichmentConfig;
     const provider = runtime.config.dense_embedder orelse return error.MissingDenseEmbedder;
     // Capture the producing contract before reading vectors or probing caches.
-    const generation = try captureDenseGeneration(runtime, provider, a, upstream.name, null);
+    const foreground = foregroundProviderRequestContext(runtime);
+    const generation = try captureDenseGeneration(runtime, provider, a, upstream.name, foreground);
     const pinned_provider = provider.withTextGeneration(generation);
     const provider_model = provider.recoveryIdentity(upstream.name).model;
-    const revision_fn = provider.cache_revision_fn;
-    const revision = if (revision_fn) |resolve| try resolve(provider.ptr, a, upstream.name) else null;
+    const revision = try captureDenseCacheRevision(runtime, provider, a, upstream.name);
     const source_request = mediaEmbeddingComputationRequest(runtime, .{ .kind = .dense_embedding, .index_name = upstream.name, .artifact_name = upstream.source_artifact_name, .embedding_name = upstream.name, .doc_key = request.doc_key, .source_field = upstream.source_field, .expected_dims = upstream.expected_dims, .producer_json = upstream.producer_json, .reprocess_generation = try embeddingReprocessGeneration(runtime, request.doc_key, upstream.name) });
     const manifest_key = try @import("../artifact_chunk_manifest.zig").keyAlloc(a, request.doc_key, upstream.source_artifact_name);
     defer a.free(manifest_key);
@@ -20280,9 +20398,9 @@ fn processVectorLabels(runtime: *EnrichmentRuntime, request: enrichment_types.Ge
             if (admitted != error.ResourceBudgetExceeded or Cache.reclaim(scorer_cache, Cache.max_bytes) == 0) return admitted;
             break :blk labels.Scorer.initValidated(entry.arena.allocator(), entry.config, prompt_vectors) catch |retry| return entry.admissionError(retry);
         };
-        try requireDenseGeneration(runtime, provider, a, upstream.name, generation, null);
+        try requireDenseGeneration(runtime, provider, a, upstream.name, generation, foreground);
         if (revision) |before| {
-            const after = (try revision_fn.?(provider.ptr, a, upstream.name)) orelse return error.EmbeddingIdentityMismatch;
+            const after = (try captureDenseCacheRevision(runtime, provider, a, upstream.name)) orelse return error.EmbeddingIdentityMismatch;
             if (!std.mem.eql(u8, &before, &after)) return error.EmbeddingIdentityMismatch;
             if (cacheable) scorer_cache.retain(entry);
         }
@@ -20300,9 +20418,9 @@ fn processVectorLabels(runtime: *EnrichmentRuntime, request: enrichment_types.Ge
     const produced = try std.json.Stringify.valueAlloc(a, .{ .object = "vector.labels", .embedding_name = upstream.name, .vector_digest = @as([]const u8, &vector_digest), .parent_count = if (addresses.items.len == 0) @as(u32, 0) else addresses.items[addresses.items.len - 1].chunk_id + 1, .chunks = rows }, .{});
     defer a.free(produced);
     if (produced.len > 16 * 1024 * 1024) return error.ResourceLimitExceeded;
-    try requireDenseGeneration(runtime, provider, a, upstream.name, generation, null);
+    try requireDenseGeneration(runtime, provider, a, upstream.name, generation, foreground);
     if (revision) |before| {
-        const after = (try revision_fn.?(provider.ptr, a, upstream.name)) orelse return error.EmbeddingIdentityMismatch;
+        const after = (try captureDenseCacheRevision(runtime, provider, a, upstream.name)) orelse return error.EmbeddingIdentityMismatch;
         if (!std.mem.eql(u8, &before, &after)) return error.EmbeddingIdentityMismatch;
     }
     if (token) |context| return enqueueAssetProducerOutput(runtime, request, context, output_key, produced, scope);
@@ -22850,11 +22968,27 @@ const PdfEmbeddingRenderedWindow = union(enum) {
     }
 };
 
-fn embedPdfWindowPart(alloc: Allocator, embedder: embedder_mod.DenseEmbedder, name: []const u8, part: PdfEmbeddingRenderedWindow, dims: u32) !PdfPageEmbeddingBatch {
-    return switch (part) {
+fn embedPdfWindowPart(
+    runtime: *EnrichmentRuntime,
+    guard: ForegroundCatchUpGuard,
+    alloc: Allocator,
+    embedder: embedder_mod.DenseEmbedder,
+    name: []const u8,
+    part: PdfEmbeddingRenderedWindow,
+    dims: u32,
+) !PdfPageEmbeddingBatch {
+    const context = embedder.part_request_context;
+    try checkEmbeddingInvocationOwner(runtime, guard, context);
+    var output = (switch (part) {
         .encoded => |batch| embedRenderedPdfPageBatch(alloc, embedder, name, batch, dims),
         .raster => |batch| embedRenderedPdfPageRasterBatch(alloc, embedder, name, batch, dims),
+    }) catch |err| {
+        try checkEmbeddingInvocationOwner(runtime, guard, context);
+        return classifyProviderCancellation(err, guard, false);
     };
+    errdefer output.deinit(alloc);
+    try checkEmbeddingInvocationOwner(runtime, guard, context);
+    return output;
 }
 
 /// Invocation-scoped, lazy lossless representation of a borrowed raster
@@ -32114,7 +32248,9 @@ fn chunkVectorAtRevision(request: enrichment_types.GeneratedEnrichmentRequest, t
 fn requireChunkProviderRevision(runtime: *EnrichmentRuntime, a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, dense: ?embedder_mod.DenseEmbedder, sparse: ?embedder_mod.SparseEmbedder, generation: embedder_mod.DenseEmbedder.TextGeneration, revision: ?[32]u8, context: inference_request_context.RequestContext) !void {
     try checkEnrichmentExecutionContext(runtime, context);
     if (dense) |provider| try requireDenseGeneration(runtime, provider, a, requestEmbeddingName(request), generation, context);
-    if (sparse) |provider| if (!std.meta.eql(revision, try captureSparseRevision(runtime, provider, a, requestEmbeddingName(request)))) return error.EnrichmentSourceChanged;
+    const guard = runtime.active_provider_guard;
+    const foreground = if (guard.deadline_ns != null or guard.cancellation.ptr != null) context else null;
+    if (sparse) |provider| if (!std.meta.eql(revision, try captureSparseRevision(runtime, provider, a, requestEmbeddingName(request), foreground))) return error.EnrichmentSourceChanged;
     try checkEnrichmentExecutionContext(runtime, context);
 }
 
@@ -32347,7 +32483,9 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
     const context = assetProviderRequestContext(runtime);
     try checkEnrichmentExecutionContext(runtime, context);
     const text_generation = if (shared) |batch| batch.generation else if (dense) |provider| try captureDenseGeneration(runtime, provider, alloc, requestEmbeddingName(request), context) else embedder_mod.DenseEmbedder.TextGeneration{};
-    const sparse_revision = if (sparse) |provider| try captureSparseRevision(runtime, provider, alloc, requestEmbeddingName(request)) else null;
+    const guard = runtime.active_provider_guard;
+    const sparse_foreground = if (guard.deadline_ns != null or guard.cancellation.ptr != null) context else null;
+    const sparse_revision = if (sparse) |provider| try captureSparseRevision(runtime, provider, alloc, requestEmbeddingName(request), sparse_foreground) else null;
     const execution_revision = if (dense != null) text_generation.revision else sparse_revision;
     try checkEnrichmentExecutionContext(runtime, context);
     const publication = @import("../artifact_chunk_vector_publication.zig");
@@ -32645,7 +32783,7 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
             } else if (sparse) |provider| {
                 sparse_vectors = try embedSparseBatchWithRetry(provider, runtime, requestEmbeddingName(request), texts.items);
                 if (sparse_vectors.?.len != texts.items.len) return error.InvalidEmbeddingResponse;
-                if (!std.meta.eql(sparse_revision, try captureSparseRevision(runtime, provider, alloc, requestEmbeddingName(request)))) return error.EnrichmentSourceChanged;
+                if (!std.meta.eql(sparse_revision, try captureSparseRevision(runtime, provider, alloc, requestEmbeddingName(request), sparse_foreground))) return error.EnrichmentSourceChanged;
             } else return error.InvalidArgument;
             succeeded = true;
         }
@@ -33027,7 +33165,7 @@ fn processMaterializedChunkSparseRequest(
     window: *GeneratedReplayWindow,
 ) !void {
     if (try processOrderedChunkVectorRequest(runtime, request, null, sparse_embedder, consumer_indexes)) return;
-    const revision = try captureSparseRevision(runtime, sparse_embedder, runtime.alloc, embedding_artifact_name);
+    const revision = try captureSparseRevision(runtime, sparse_embedder, runtime.alloc, embedding_artifact_name, foregroundProviderRequestContext(runtime));
     const max_window_items = generatedReplayWindowItems();
     const max_batch_items = effectiveRequestEmbedBatchItems(runtime, request);
     const max_batch_bytes = requestEmbedBatchBytes(runtime.alloc, request);
@@ -35490,7 +35628,7 @@ fn processPdfPageImageEmbeddingWithAllocator(
     const embedding_name = requestEmbeddingName(request);
     const policy = try enrichment_types.parseExecutionPolicyJson(metadata_alloc, request.execution_json);
     const execution_lease = dense_embedder.resolveMediaPartLease(metadata_alloc, embedding_name, @min(policy.batch_items orelse generated_ocr_default_batch_max_items, generated_ocr_absolute_batch_max_items)) catch |err|
-        return providerInvocationFailure(runtime, err);
+        return embeddingInvocationFailure(runtime, runtime.active_provider_guard, dense_embedder.part_request_context, err);
     const capabilities = execution_lease.capabilities.?;
     const use_borrowed_rasters = dense_embedder.supportsRasterItems() and capabilities.borrowed_rasters;
     if (!capabilities.supports(.{ .image = true }) or
@@ -35502,7 +35640,7 @@ fn processPdfPageImageEmbeddingWithAllocator(
     const capability_items = @max(@as(usize, 1), capabilities.batch.max_items);
     const default_items = @max(@as(usize, 1), capabilities.batch.preferred_items);
     const batch_items = dense_embedder.withPartLease(execution_lease).partBatchLimit(embedding_name, request.expected_dims, @min(@min(policy.batch_items orelse default_items, capability_items), generated_ocr_absolute_batch_max_items)) catch |err|
-        return providerInvocationFailure(runtime, err);
+        return embeddingInvocationFailure(runtime, runtime.active_provider_guard, dense_embedder.part_request_context, err);
     if (batch_items == 0) return error.InvalidInferenceCapabilities;
     // Encoded routes require an exact wire ceiling. A local raw-raster route
     // is bounded by decoded pixels and its composite retained-byte lease, so
@@ -35592,7 +35730,7 @@ fn processPdfPageImageEmbeddingWithAllocator(
             item_count,
             "image/png",
             request.expected_dims,
-        ) catch |err| return providerInvocationFailure(runtime, err);
+        ) catch |err| return embeddingInvocationFailure(runtime, runtime.active_provider_guard, dense_embedder.part_request_context, err);
         if (item_count > 1) {
             var peak = PdfWindowInvocationPeak{ .memory = invocation_memory_by_count[item_count - 1] };
             try peak.include(invocation_memory_by_count[item_count]);
@@ -35810,11 +35948,10 @@ fn processPdfPageImageEmbeddingWithAllocator(
                 },
             };
             const embedder = dense_embedder.withPartLease(execution_lease);
-            var embedded = embedPdfWindowPart(lease.allocator(), embedder, embedding_name, part, request.expected_dims) catch |err| blk: {
-                const shared = runtime.shared_pdf_windows orelse return providerInvocationFailure(runtime, err);
-                if (!try shared.drainOwnerAdmission(err)) return providerInvocationFailure(runtime, err);
-                break :blk embedPdfWindowPart(lease.allocator(), embedder, embedding_name, part, request.expected_dims) catch |retry_err|
-                    return providerInvocationFailure(runtime, retry_err);
+            var embedded = embedPdfWindowPart(runtime, runtime.active_provider_guard, lease.allocator(), embedder, embedding_name, part, request.expected_dims) catch |err| blk: {
+                const shared = runtime.shared_pdf_windows orelse return err;
+                if (!try shared.drainOwnerAdmission(err)) return err;
+                break :blk try embedPdfWindowPart(runtime, runtime.active_provider_guard, lease.allocator(), embedder, embedding_name, part, request.expected_dims);
             };
             var embedded_owned = true;
             defer if (embedded_owned) embedded.deinit(lease.allocator());
@@ -36892,7 +37029,7 @@ fn processSparseEmbedding(
             return;
         }
 
-        const chunk_revision = try captureSparseRevision(runtime, sparse_embedder, runtime.alloc, embedding_artifact_name);
+        const chunk_revision = try captureSparseRevision(runtime, sparse_embedder, runtime.alloc, embedding_artifact_name, foregroundProviderRequestContext(runtime));
         const chunk_embeddings = try buildChunkSparseEmbeddingsFromSources(runtime, request, sparse_embedder, consumer_indexes, source_set.sources, chunk_revision);
         defer {
             for (chunk_embeddings) |embedding| freeDerivedSparseEmbedding(runtime.alloc, embedding);
@@ -36925,7 +37062,7 @@ fn processSparseEmbedding(
     defer runtime.alloc.free(raw);
     var input = try captureProducerInput(runtime, request, doc_store_key, raw);
     defer if (input) |*token| token.deinit();
-    const revision = try captureSparseRevision(runtime, sparse_embedder, runtime.alloc, embedding_artifact_name);
+    const revision = try captureSparseRevision(runtime, sparse_embedder, runtime.alloc, embedding_artifact_name, foregroundProviderRequestContext(runtime));
     // Only protocol 17 can carry an execution identity or an output guard.
     if (input) |*token| {
         var read = try runtime.store.beginProbe();
@@ -36969,7 +37106,7 @@ fn processSparseEmbedding(
     noteEmbedBatchFinished(runtime, consumer_indexes, 1, source_text.len, source_text.len, elapsedNsSince(runtime, embed_started_ns), true);
     defer finishActivePostprocess(runtime);
     defer sparse.deinit(runtime.alloc);
-    if (!std.meta.eql(revision, try captureSparseRevision(runtime, sparse_embedder, runtime.alloc, embedding_artifact_name))) return error.EnrichmentSourceChanged;
+    if (!std.meta.eql(revision, try captureSparseRevision(runtime, sparse_embedder, runtime.alloc, embedding_artifact_name, foregroundProviderRequestContext(runtime)))) return error.EnrichmentSourceChanged;
     const payload = try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(runtime.alloc, source_hash, sparse.indices, sparse.values);
     defer runtime.alloc.free(payload);
     if (input) |*token| return enqueueProducerArtifact(runtime, token, artifact_key, payload);
@@ -49036,8 +49173,12 @@ test "model aware media vector labels rebuild from stored vectors without media 
     const Fake = struct {
         calls: usize = 0,
         generation: u8 = 1,
+        revision_reads: usize = 0,
+        cancel_at: usize = 0,
         fn revision(ptr: *anyopaque, _: Allocator, _: []const u8) !?[32]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.revision_reads += 1;
+            if (self.revision_reads == self.cancel_at) return error.Canceled;
             return @splat(self.generation);
         }
         fn embed(ptr: *anyopaque, a: Allocator, name: []const u8, prompt: []const u8, dims: u32) ![]f32 {
@@ -49083,6 +49224,17 @@ test "model aware media vector labels rebuild from stored vectors without media 
     // fencing check (pre-existing, unrelated to any change in this task)
     // now rejects as EnrichmentSourceChanged.
     var request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}}" };
+    for (1..4) |attempt| {
+        const poisoned = try std.fmt.allocPrint(alloc, "{{\"labels\":[{{\"label\":\"phase-{d}\"}}]}}", .{attempt});
+        defer alloc.free(poisoned);
+        fake.revision_reads = 0;
+        fake.cancel_at = attempt;
+        try std.testing.expectError(error.ProviderInvocationCanceled, processVectorLabels(&runtime, request, poisoned, null, "{}", output_key, &window, null));
+        try std.testing.expectEqual(attempt, fake.revision_reads);
+        try std.testing.expect((try storeGetOptionalAllocWithRetry(&runtime, output_key)) == null);
+    }
+    fake.cancel_at = 0;
+    fake.calls = 0;
     try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}", null, "{}", output_key, &window, null);
     {
         const result = (try storeGetOptionalAllocWithRetry(&runtime, output_key)).?;
