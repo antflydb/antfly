@@ -146,12 +146,11 @@ pub const EncoderDecoderPipeline = struct {
             .{ .name = "attention_mask", .data = @constCast(std.mem.sliceAsBytes(mask)), .shape = &shape, .dtype = .i64, .allocator = allocator, .owns_data = false, .owns_shape = false },
         };
         if (self.execution_control) |control| try control.update(.executing, 0, 1);
-        // An installed dispatcher retains its public scheduling contract.
-        // Direct tasks can use the runtime's stateful resident receiver.
-        var encoded = if (self.batch_dispatch == null)
-            try stage_runtime.encodeWithIntent(allocator, self.encoder, self.decoder, &inputs, self.batch_dispatch, self.execution_control, null, .{ .incremental_with_vocabulary = self.config.vocab_size })
-        else
-            try stage_runtime.encode(allocator, self.encoder, self.decoder, &inputs, self.batch_dispatch, self.execution_control);
+        // A dispatcher with both resident stages can schedule the merged
+        // cache path. The native typed receiver still requires a direct task.
+        var encoded = try stage_runtime.encodeWithIntent(allocator, self.encoder, self.decoder, &inputs, self.batch_dispatch, self.execution_control, null, .{
+            .incremental_with_vocabulary = .{ .vocabulary = self.config.vocab_size, .allow_native = self.batch_dispatch == null },
+        });
         defer encoded.deinit(allocator);
         return self.greedyDecodeOutputs(allocator, &encoded, mask, input_ids.len);
     }

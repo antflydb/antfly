@@ -148,7 +148,7 @@ pub fn encodeForIncrementalWithPermit(allocator: std.mem.Allocator, encoder: bac
 pub const EncoderIntent = union(enum) {
     resident,
     incremental,
-    incremental_with_vocabulary: usize,
+    incremental_with_vocabulary: struct { vocabulary: usize, allow_native: bool },
     vocabulary_row,
 };
 
@@ -171,10 +171,13 @@ fn encoderRoute(encoder: backends.Session, decoder: backends.Session, dispatch: 
         return .{ .placement = .dispatcher_host_only };
     }
     if (intent == .incremental or intent == .incremental_with_vocabulary) {
-        if (Incremental.qualify(encoder, decoder)) |receiver| {
-            return .{ .dispatcher = dispatcher, .incremental = receiver, .placement = .resident_incremental };
+        const configured = if (intent == .incremental_with_vocabulary) intent.incremental_with_vocabulary else null;
+        if (configured == null or configured.?.allow_native) {
+            if (Incremental.qualify(encoder, decoder)) |receiver| {
+                return .{ .dispatcher = dispatcher, .incremental = receiver, .placement = .resident_incremental };
+            }
         }
-        const vocabulary = if (intent == .incremental_with_vocabulary) intent.incremental_with_vocabulary else null;
+        const vocabulary = if (configured) |options| options.vocabulary else null;
         if (residentMergedPlacement(encoder, decoder, control != null, vocabulary)) |placement| return .{ .dispatcher = dispatcher, .placement = placement };
     }
     const placement = residentPairPlacement(encoder, decoder, control != null);

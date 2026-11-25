@@ -727,11 +727,44 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
         const saved_vocab = vocab_axis.*;
         defer vocab_axis.* = saved_vocab;
         if (backend == .native) vocab_axis.* = -1;
+        const Broker = struct {
+            encode_calls: usize = 0,
+            decode_calls: usize = 0,
+
+            fn encode(raw: *anyopaque, _: tensor_dispatch.Task, allocator: std.mem.Allocator, target: backends.Session, supplied: ?*sessions.RunPermit, _: ?*std.atomic.Mutex, inputs: []const backends.Tensor, active: ?Control) !?sessions.ResidentOutputs {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.encode_calls += 1;
+                if (supplied != null) return error.UnexpectedStagePermit;
+                var permit = try target.admitInputs(inputs, allocator, active);
+                defer permit.deinit();
+                try permit.prepareResidentOutputRetirement();
+                var output = (try permit.runResidentWithControl(inputs, allocator, active)) orelse return null;
+                if (output.resource_lease == null) {
+                    output.resource_lease = permit.lease;
+                    permit.lease = null;
+                }
+                return output;
+            }
+
+            fn decode(raw: *anyopaque, _: tensor_dispatch.Task, allocator: std.mem.Allocator, target: backends.Session, bindings: []const sessions.StageInput, active: ?Control) !sessions.ResidentOutputs {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.decode_calls += 1;
+                return (try target.runStageInputsWithControl(bindings, allocator, active)) orelse error.UnexpectedResidentStageDecline;
+            }
+
+            fn host(_: *anyopaque, _: tensor_dispatch.Task, _: std.mem.Allocator, _: backends.Session, _: ?*sessions.RunPermit, _: ?*std.atomic.Mutex, _: []const backends.Tensor, _: ?Control) ![]backends.Tensor {
+                return error.UnexpectedHostDecoder;
+            }
+        };
+        var broker = Broker{};
+        const dispatch: tensor_dispatch.Dispatch = .{ .ptr = &broker, .task = .generate, .run_resident_fn = Broker.encode, .run_stage_fn = Broker.decode, .run_fn = Broker.host };
         var encoded_resident = resident: {
             var audit = @import("transfer_audit.zig").Audit{ .forbid_activation_readbacks = true };
             try @import("transfer_audit.zig").begin(&audit);
             defer @import("transfer_audit.zig").end();
-            break :resident try stages.encodeWithIntent(a, encoder_session, session, &.{feature_input}, null, control, null, .{ .incremental_with_vocabulary = 4 });
+            break :resident try stages.encodeWithIntent(a, encoder_session, session, &.{feature_input}, dispatch, control, null, .{
+                .incremental_with_vocabulary = .{ .vocabulary = 4, .allow_native = false },
+            });
         };
         defer encoded_resident.deinit(a);
         try std.testing.expect(encoded_resident == .resident);
@@ -741,12 +774,14 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
         try std.testing.expectEqual(.merged_incremental, resident_route.selected);
         try std.testing.expectEqual(.resident, resident_route.encoder_storage);
         try std.testing.expect(resident_decoder.incremental.?.encoder == .resident);
-        var resident_first = try resident_decoder.stepSuffix(.{ .position = 0, .tokens = &.{2} }, null, null);
+        var resident_first = try resident_decoder.stepSuffix(.{ .position = 0, .tokens = &.{2} }, null, dispatch);
         defer resident_first.deinit();
         try std.testing.expectEqualSlices(f32, first.logits, resident_first.logits);
-        var resident_next = try resident_decoder.stepSuffix(.{ .position = 1, .tokens = &.{5} }, null, null);
+        var resident_next = try resident_decoder.stepSuffix(.{ .position = 1, .tokens = &.{5} }, null, dispatch);
         defer resident_next.deinit();
         try std.testing.expectEqualSlices(f32, next.logits, resident_next.logits);
+        try std.testing.expectEqual(@as(usize, 1), broker.encode_calls);
+        try std.testing.expectEqual(@as(usize, 2), broker.decode_calls);
     }
     if (backend == .native) {
         const slots = state.resident_slots orelse return error.MissingResidentResult;
