@@ -21850,11 +21850,8 @@ pub const ApiHttpServer = struct {
                 location,
                 attempt_id,
             ) catch |err| blk: {
-                // The immutable aggregate above is the commit point. Preserve
-                // success after an ambiguous terminal-head update: active-head
-                // admission validates the same marker, manifest, and artifact
-                // identities and maintenance never treats a present commit as
-                // an unpublished attempt.
+                // The immutable aggregate above is the commit point. Named
+                // restores verify that aggregate and its artifacts directly.
                 std.log.warn("cluster backup committed head update deferred class={s}", .{@errorName(err)});
                 break :blk false;
             })) {
@@ -24295,12 +24292,7 @@ pub const ApiHttpServer = struct {
                 continue;
             }
 
-            if (!restoreTableAttempted(active_table_index, durability_pending_table_ranges, published_table_ranges, @intCast(i))) {
-                self.checkpointRestoreTableStarted(cancellation, @intCast(i)) catch |err| {
-                    if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return error.NotLeader;
-                    return error.InternalFailure;
-                };
-            }
+            var needs_start_checkpoint = !restoreTableAttempted(active_table_index, durability_pending_table_ranges, published_table_ranges, @intCast(i));
 
             // Overwrite publication is local and generation-aware. New-table
             // restores may delegate to metadata in distributed deployments.
@@ -24433,6 +24425,14 @@ pub const ApiHttpServer = struct {
                 };
 
                 table_manifest.restore_admission_fingerprint = admission_fingerprint;
+                if (needs_start_checkpoint) {
+                    self.checkpointRestoreTableStarted(cancellation, @intCast(i)) catch |err| {
+                        if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return error.NotLeader;
+                        return error.InternalFailure;
+                    };
+                    needs_start_checkpoint = false;
+                }
+
                 const restored_via_metadata = self.restoreMetadataTableWithRetry(
                     alloc,
                     table_name,
@@ -24513,6 +24513,13 @@ pub const ApiHttpServer = struct {
                 authorized_manifest.indexes_json,
             ) catch return error.InternalFailure;
             defer op_alloc.free(destination_authorization_fingerprint);
+            if (needs_start_checkpoint) {
+                self.checkpointRestoreTableStarted(cancellation, @intCast(i)) catch |err| {
+                    if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return error.NotLeader;
+                    return error.InternalFailure;
+                };
+            }
+
             const outcome = self.restoreOwnedTableWithRetryAndLifecycle(
                 table_name,
                 location,

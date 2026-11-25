@@ -3757,6 +3757,30 @@ def _cluster_restore_modes(backup_api, *, concurrent_observers=False):
         assert restored_docs[table_a]["title"] == "Original Alpha"
         assert restored_docs[table_b]["title"] == "Original Beta"
 
+        repository = Path(backup_dir)
+        aggregate = json.loads(
+            (repository / f"{backup_id}-cluster-metadata.json").read_text()
+        )
+        sibling = next(entry for entry in aggregate["tables"] if entry["name"] == table_b)
+        sibling_manifest = json.loads(
+            (repository / f'{sibling["table_backup_id"]}-metadata.json').read_text()
+        )
+        (repository / sibling_manifest["shards"][0]["snapshot_path"]).unlink()
+
+        skip_damaged = backup_api.cluster_restore(
+            backup_id=backup_id, location=location, restore_mode="skip_if_exists"
+        )
+        assert skip_damaged["skipped_table_count"] == 2, skip_damaged
+
+        selective = backup_api.cluster_restore(
+            backup_id=backup_id,
+            location=location,
+            table_names=[table_a],
+            restore_mode="overwrite",
+        )
+        assert selective["status"] == "completed", selective
+        assert selective["committed_table_count"] == 1, selective
+
 
 @pytest.mark.parametrize("backup_format", ["native", "portable"])
 def test_partial_cluster_backup_is_not_published_and_can_retry(
