@@ -300,7 +300,7 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             "name": "title_body",
             "type": "embeddings",
             "template": (
-                "{{#if (trim title)}}{{#if (trim body)}}"
+                "{{#if (scrubHtml title)}}{{#if (scrubHtml body)}}"
                 "{{title}} {{body}}{{/if}}{{/if}}"
             ),
             "coverage_policy": "partial",

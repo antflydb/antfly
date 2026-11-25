@@ -135,7 +135,7 @@ terminal, continue with the model and index setup.
 
 ```bash
 antfly inference pull hf:google/embeddinggemma-2:bf16-safetensors-bundle-v1
-antfly --output table inference list
+antfly inference list
 ```
 
 EmbeddingGemma2 embeds text, images, audio, and video in the same 768-dimensional
@@ -151,7 +151,7 @@ antfly index create --table wikipedia \
   --index title_body \
   --type embeddings \
   --coverage-policy partial \
-  --template '{{#if (trim title)}}{{#if (trim body)}}{{title}} {{body}}{{/if}}{{/if}}' \
+  --template '{{#if (scrubHtml title)}}{{#if (scrubHtml body)}}{{title}} {{body}}{{/if}}{{/if}}' \
   --embedder '{"provider":"antfly","model":"google/embeddinggemma-2:bf16-safetensors-bundle-v1"}' \
   --chunker '{"provider":"antfly","text":{"target_tokens":200,"overlap_tokens":25}}'
 ```
