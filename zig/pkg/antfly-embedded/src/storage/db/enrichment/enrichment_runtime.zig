@@ -5563,7 +5563,13 @@ fn assetProviderFailure(runtime: anytype, producer: asset_producer_mod.Producer,
     if (comptime @TypeOf(runtime.*) == EnrichmentRuntime) {
         if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
     }
-    return classifyProviderCancellation(err, runtime.active_provider_guard, runtime.config.cancellation.isCancelled() or producer.invocation_context.cancellation.isCancelled());
+    runtime.active_provider_guard.check() catch |control| return control;
+    runtime.config.cancellation.check() catch |owner| return if (isOperationCanceled(owner)) error.EnrichmentWaitCanceled else owner;
+    producer.invocation_context.check() catch |owner| {
+        if (isOperationCanceled(owner)) return error.EnrichmentWaitCanceled;
+        return if (owner == error.Timeout) error.EnrichmentWaitTimeout else owner;
+    };
+    return if (isOperationCanceled(err)) error.ProviderInvocationCanceled else err;
 }
 
 fn assetProviderCapabilities(runtime: anytype, producer: asset_producer_mod.Producer, alloc: Allocator, requests: []const asset_producer_mod.Request) !?inference_work.InferenceCapabilities {
@@ -11945,7 +11951,10 @@ fn runForegroundCatchUpPassOwned(
     runtime.mutex.lockUncancelable(io);
     const recovery_pending = runtime.boundary_recovery_pending;
     runtime.mutex.unlock(io);
-    if (recovery_pending) try saveRuntimeStatusWithPlanReceipt(runtime, .boundary_recovery, null, generation, null, recovery);
+    if (recovery_pending) {
+        try saveRuntimeStatusWithPlanReceipt(runtime, .boundary_recovery, null, generation, null, recovery);
+        try guard.check();
+    }
     try scavengeGraphStagesPage(runtime);
     runtime.mutex.lockUncancelable(io);
     const already_failed = runtime.worker_failed or runtime.last_error_name != null;
@@ -14600,10 +14609,16 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
     const digest = @as([32]u8, @splat(7));
     const resources = runtime.config.resource_manager orelse manager.resource_manager.?;
     const before = resources.sliceStats(.document_extraction_working_set).used_bytes;
-    {
-        // A completed OCR result can sit in the queue after its provider
-        // returns. Reject it if the inherited deadline expires before commit.
-        const expired = producer.withInvocationContext(.{ .deadline_ns = 0 });
+    for ([_]anyerror{ error.EnrichmentWaitTimeout, error.EnrichmentLeaseFenceLost }) |expected| {
+        // A completed OCR result can lose authority while queued for commit.
+        const Checkpoint = struct {
+            fn poll(_: *const anyopaque) bool {
+                return false;
+            }
+            fn check(_: *const anyopaque) !void {
+                return error.EnrichmentLeaseFenceLost;
+            }
+        };
         var jobs = SharedPdfWindowScheduler.WindowJobs{ .scheduler = &scheduler, .primary = "{}" };
         defer jobs.deinit();
         var empty = batch;
@@ -14625,11 +14640,21 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             .guard = .{},
             .cancellation = .none,
             .group = &jobs,
-            .text = .{ .producer = expired, .index = 1, .recovered = true },
+            .text = .{ .producer = producer, .index = 1, .recovered = true },
+            .inherited_cancellation = if (expected == error.EnrichmentLeaseFenceLost)
+                .{ .ptr = &harness, .is_cancelled_fn = Checkpoint.poll, .check_fn = Checkpoint.check }
+            else
+                .none,
         };
+        const Job = SharedPdfWindowScheduler.WindowJobs.Job;
+        job.text.?.producer = producer.withInvocationContext(.{
+            .deadline_ns = if (expected == error.EnrichmentWaitTimeout) 0 else null,
+            .cancellation = .{ .ptr = job, .is_cancelled_fn = Job.isCanceled, .check_fn = Job.checkCancellation },
+        });
         jobs.jobs[0] = job;
         jobs.count = 1;
-        try std.testing.expectError(error.EnrichmentWaitTimeout, jobs.retireCompleted(&jobs.jobs[0], true));
+        try std.testing.expect(!Job.isCanceled(job));
+        try std.testing.expectError(expected, jobs.retireCompleted(&jobs.jobs[0], true));
         try std.testing.expectEqual(@as(usize, 0), jobs.count);
         try std.testing.expectEqual(before, resources.sliceStats(.document_extraction_working_set).used_bytes);
     }
@@ -15973,12 +15998,15 @@ const DocumentPreparationPipeline = struct {
                 job.units.items.len == 0 or !std.mem.eql(u8, job.units.items[0].unit_id, units[0].unit_id) or job.units.items[0].page_number != units[0].page_number) continue;
             var cancellation: AssetInvocationCancellation = undefined;
             const scoped = scopedAssetProducer(self.runtime, producer, &cancellation);
+            try checkAssetInvocationOwner(self.runtime, self.runtime.active_provider_guard, scoped.invocation_context);
+            Job.checkCancellation(job) catch continue;
+            job.producer.invocation_context.check() catch continue;
             const prototype = asset_producer_mod.Request{ .producer_type = document_extraction_mod.ocrProducerType(config), .config_json = document_extraction_mod.effectiveOcrConfigJson(config), .source_text = "", .content_type = "image/png", .inline_media_trusted = true };
             const current = try assetProviderCapabilities(self.runtime, scoped, alloc, &.{prototype}) orelse continue;
             if (job.capabilities == null or !std.meta.eql(job.capabilities.?, current)) continue;
             // Allocate before replacing the owner's unit. No partial metadata
             // transfer can authorize a source, retry or publication transition.
-            const replacement = cloneDocumentExtractionUnit(alloc, job.units.items[0]) catch |err| {
+            var replacement = cloneDocumentExtractionUnit(alloc, job.units.items[0]) catch |err| {
                 if (err != error.OutOfMemory) return err;
                 // Copying optional cached output must not turn foreground
                 // memory pressure into document/provider failure. No unit has
@@ -15988,6 +16016,8 @@ const DocumentPreparationPipeline = struct {
                 pipeline_metrics.prefetch(.reclaimed);
                 return false;
             };
+            errdefer replacement.deinit(alloc);
+            try checkAssetInvocationOwner(self.runtime, self.runtime.active_provider_guard, scoped.invocation_context);
             units[0].deinit(alloc);
             units[0] = replacement;
             job.consumed = true;
