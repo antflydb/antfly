@@ -28,6 +28,7 @@ const image = @import("../pipelines/inkling2_image.zig");
 const vision_model = @import("inkling2_vision_metal.zig");
 const MetalNativeProvider = @import("../backends/metal_native_provider.zig").MetalNativeProvider;
 const State = @import("inkling2_state_metal.zig").State;
+const memory = @import("../runtime/tier/memory.zig");
 const Scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler;
 
 // The resident decoder records frames against a single Metal runtime.
@@ -71,21 +72,26 @@ pub const Runtime = struct {
 
     /// Widen only the automatically chosen KV bucket, and only when the
     /// complete plan fits both of the existing physical envelopes.
-    pub fn widenCacheBudget(self: *const Runtime, limits: @import("../runtime/tier/memory.zig").Limits) @TypeOf(limits) {
+    pub fn widenCacheBudget(self: *const Runtime, limits: memory.Limits) memory.Limits {
         if (limits.kv_limit_bytes == 0) return limits;
         const context = self.model.text.model_max_length;
-        const plan = decoder.RequestPlan.initWithFormat(&self.model, context, @min(context, decoder.preferredPrefillRows()), .q4_head128) catch return limits;
-        const retained = State.deviceBytes(plan.bank, plan.width) catch return limits;
-        if (retained <= limits.kv_limit_bytes) return limits;
-        const device = self.resident_bytes +| (plan.deviceBytes() catch return limits);
-        const host = @as(usize, self.model.text.unpadded_vocab_size) * @sizeOf(f32);
-        if ((limits.backend_limit_bytes != 0 and device > limits.backend_limit_bytes) or
-            (limits.combined_limit_bytes != 0 and device +| host > limits.combined_limit_bytes) or
-            (limits.host_limit_bytes != 0 and host > limits.host_limit_bytes))
-            return limits;
-        var widened = limits;
-        widened.kv_limit_bytes = retained;
-        return widened;
+        var rows = @min(context, decoder.preferredPrefillRows());
+        while (true) {
+            const plan = decoder.RequestPlan.initWithFormat(&self.model, context, rows, .q4_head128) catch return limits;
+            const retained = State.deviceBytes(plan.bank, plan.width) catch return limits;
+            const physical = plan.deviceBytes() catch return limits;
+            var candidate = limits;
+            candidate.kv_limit_bytes = @max(limits.kv_limit_bytes, retained);
+            const required: memory.AdmissionAmounts = .{
+                .backend_weight_bytes = self.resident_bytes,
+                .backend_kv_bytes = retained,
+                .backend_scratch_bytes = physical - retained,
+                .host_scratch_bytes = @as(usize, self.model.text.unpadded_vocab_size) * @sizeOf(f32),
+            };
+            if (required.fitsLimits(candidate) catch false) return candidate;
+            if (rows == 1) return limits;
+            rows /= 2;
+        }
     }
 
     pub fn fromSession(session: backends.Session) ?*Runtime {
@@ -93,19 +99,25 @@ pub const Runtime = struct {
     }
 
     pub fn generate(self: *Runtime, session: backends.Session, pipeline: *const TextPipeline, config: generation.GenerationConfig, callbacks: TextPipeline.Callbacks) !generation.GenerationResult {
-        const plan = try pipeline.requestPlan(&self.model, config);
-        const retained = try State.deviceBytes(plan.bank, plan.width);
-        const physical = try plan.deviceBytes();
         const logit_bytes = @as(usize, self.model.text.unpadded_vocab_size) * @sizeOf(f32);
         const vision_bytes: vision_model.AdmissionBytes = if (pipeline.prompt.image != null)
             vision_model.admissionBytes(pipeline.prompt.image_width, pipeline.prompt.image_height)
         else
             .{ .host = 0, .device = 0 };
-        var permit = try session.withAdmissionControl(pipeline.control).admitRetainedStateWithWorkspace(
-            logit_bytes + vision_bytes.host,
-            retained,
-            physical - retained + vision_bytes.device,
-        );
+        const host = logit_bytes + vision_bytes.host;
+        const guarded = session.withAdmissionControl(pipeline.control);
+        var rows = decoder.preferredPrefillRows();
+        var plan = try pipeline.requestPlanWithRowLimit(&self.model, config, rows);
+        const retained, const workspace = while (true) {
+            const kv_bytes = try State.deviceBytes(plan.bank, plan.width);
+            const device_bytes = try plan.deviceBytes();
+            const scratch = device_bytes - kv_bytes + vision_bytes.device;
+            if (plan.bank.layout.max_append_tokens == 1 or try guarded.fitsRetainedStateWithWorkspace(host, kv_bytes, scratch))
+                break .{ kv_bytes, scratch };
+            rows = @intCast(plan.bank.layout.max_append_tokens / 2);
+            plan = try pipeline.requestPlanWithRowLimit(&self.model, config, rows);
+        };
+        var permit = try guarded.admitRetainedStateWithWorkspace(host, retained, workspace);
         defer permit.deinit();
         var waiter: Scheduler.Waiter = .{};
         try self.scheduler.enter(&waiter, &self.gate, pipeline.control);
@@ -184,6 +196,10 @@ pub const TextPipeline = struct {
     }
 
     pub fn requestPlan(self: *const TextPipeline, model: *const decoder.Decoder, config: generation.GenerationConfig) !decoder.RequestPlan {
+        return self.requestPlanWithRowLimit(model, config, decoder.preferredPrefillRows());
+    }
+
+    fn requestPlanWithRowLimit(self: *const TextPipeline, model: *const decoder.Decoder, config: generation.GenerationConfig, row_limit: u32) !decoder.RequestPlan {
         if (config.max_tokens <= 0 or self.prompt.after_image.len == 0 or
             config.grammar != null or config.kv_cache_mode != .exact_hybrid or
             config.cache_compaction_ratio != null or config.prompt_cache_enabled or config.draft_model != null or
@@ -191,7 +207,7 @@ pub const TextPipeline = struct {
             return error.UnsupportedInkling2Request;
         const tokens = try std.math.add(usize, self.prompt.count(), @as(usize, @intCast(config.max_tokens)) - 1);
         const prefix = self.prompt.count() - 1;
-        const prefill_rows: u32 = @intCast(@max(1, @min(prefix, decoder.preferredPrefillRows())));
+        const prefill_rows: u32 = @intCast(@max(1, @min(prefix, row_limit)));
         const format: @import("../runtime/kv/hybrid_paged.zig").PlaneFormat = if (config.cache_dtype) |dtype| blk: {
             const parsed = @import("../runtime/kv/pool.zig").parseKvDType(dtype) orelse return error.UnsupportedInkling2Request;
             break :blk switch (parsed) {

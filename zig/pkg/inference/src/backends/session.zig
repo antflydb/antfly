@@ -3198,20 +3198,38 @@ pub const Session = struct {
         return self.admitRetainedStateWithWorkspace(host_metadata_bytes, state_bytes, 0);
     }
 
+    fn retainedStateAmounts(backend_class: memory.BackendClass, host_scratch_bytes: usize, state_bytes: usize, workspace_bytes: usize) !memory.AdmissionAmounts {
+        return switch (backend_class) {
+            .gpu => .{
+                .host_scratch_bytes = host_scratch_bytes,
+                .backend_kv_bytes = state_bytes,
+                .backend_scratch_bytes = workspace_bytes,
+            },
+            .cpu => .{
+                .host_scratch_bytes = try addBytes(host_scratch_bytes, workspace_bytes),
+                .host_kv_bytes = state_bytes,
+            },
+        };
+    }
+
+    /// Check a candidate against intrinsic limits, including model residency.
+    /// The selected candidate still needs a permit against live capacity.
+    pub fn fitsRetainedStateWithWorkspace(self: Session, host_scratch_bytes: usize, state_bytes: usize, workspace_bytes: usize) !bool {
+        const admission = self.run_admission orelse return true;
+        const amounts = try retainedStateAmounts(admission.backend_class, host_scratch_bytes, state_bytes, workspace_bytes);
+        admission.controller.validateRequests(&.{.{
+            .backend_class = admission.backend_class,
+            .limits = admission.limits,
+            .amounts = amounts,
+            .required_residency = admission.requiredResidency(),
+        }}) catch return false;
+        return true;
+    }
+
     /// Acquire request state and its concurrent workspace in one admission.
     pub fn admitRetainedStateWithWorkspace(self: Session, host_scratch_bytes: usize, state_bytes: usize, workspace_bytes: usize) !RunPermit {
         const admission = self.run_admission orelse return self.retainPermit(.{ .session = self, .lease = null });
-        var amounts = memory.AdmissionAmounts{ .host_scratch_bytes = host_scratch_bytes };
-        switch (admission.backend_class) {
-            .gpu => {
-                amounts.backend_kv_bytes = state_bytes;
-                amounts.backend_scratch_bytes = workspace_bytes;
-            },
-            .cpu => {
-                amounts.host_kv_bytes = state_bytes;
-                amounts.host_scratch_bytes = try addBytes(host_scratch_bytes, workspace_bytes);
-            },
-        }
+        const amounts = try retainedStateAmounts(admission.backend_class, host_scratch_bytes, state_bytes, workspace_bytes);
         return self.retainPermit(.{ .session = self, .lease = try admission.acquireAmounts(amounts) });
     }
 

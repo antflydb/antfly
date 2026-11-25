@@ -986,6 +986,27 @@ The 256-row plan allocated 9,074,803,012 bytes of packed K/V at the full
 window and completed a decode with that capacity reserved. Its BF16 K/V
 layout would require 34,576,171,332 bytes.
 
+A GPU counter run of the focused test cohort attributed 51.1% of GPU
+time to grouped routed expert projections and 14.2% to grouped BF16
+dense projections. Fusing the routed gate improved the prefill probe
+but changed released-checkpoint logits and slowed single-row decode.
+Compact GPU dispatch preserved the logits and took 4.94 s on the
+273-token probe, compared with 4.95 s before the change. The branch
+keeps the previously qualified projection path.
+
+The first full-window image HTTP request passed tokenization and reached
+Metal admission. The request and required model residency needed
+29,159,583,056 bytes against the automatically selected combined limit
+of 28,991,029,248 bytes. This included 280,661,148 bytes of admitted host
+residency. The runtime now tries smaller prefill workspaces before taking
+a permit for the selected request geometry. This keeps the context size
+and K/V format fixed and checks the same live limits at acquisition.
+The optimized build passed the text/image batch and streaming smoke test
+and admitted the same full-window image request under the unchanged
+automatic limits. Metal submitted the prompt frames. This verifies
+admission and start of execution. Full-window completion and latency
+remain unmeasured.
+
 ### Official Gemma 4 E2B QAT serving comparison
 
 The decoder and projector came from Google's E2B QAT Q4_0 GGUF revision

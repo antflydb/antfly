@@ -702,6 +702,11 @@ test "Inkling Metal resident decoder runs the released text checkpoint" {
     try std.testing.expectEqual(retained_at_full, widened.kv_limit_bytes);
     const capped = resident.widenCacheBudget(.{ .kv_limit_bytes = default_kv_budget, .combined_limit_bytes = 25_000_000_000 });
     try std.testing.expectEqual(@as(usize, default_kv_budget), capped.kv_limit_bytes);
+    const thin_rows = @max(1, preferredPrefillRows() / 4);
+    const thin = try RequestPlan.initWithFormat(decoder, full_context, thin_rows, .q4_head128);
+    const thin_bytes = resident.resident_bytes + try thin.deviceBytes() + @as(usize, decoder.text.unpadded_vocab_size) * @sizeOf(f32);
+    const widened_under_tight_limit = resident.widenCacheBudget(.{ .kv_limit_bytes = default_kv_budget, .combined_limit_bytes = thin_bytes });
+    try std.testing.expectEqual(try State.deviceBytes(thin.bank, thin.width), widened_under_tight_limit.kv_limit_bytes);
     if (platform.env.getenvBool("ANTFLY_INKLING2_METAL_FULL_LAYOUT")) {
         const allocation_start = time.monotonicNs();
         var maximum: Request = undefined;
