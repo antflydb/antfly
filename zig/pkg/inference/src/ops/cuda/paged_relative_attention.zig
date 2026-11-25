@@ -130,11 +130,7 @@ pub const Module = struct {
         const q = r.geometry;
         const g = try plan(q, r.kv.visible_start, r.kv.visible_end);
         const page_tokens = r.kv.page_tokens;
-        if (page_tokens == 0 or r.kv.physical_pages == 0 or r.kv.physical_pages > std.math.maxInt(u32) or
-            r.kv.first_page != r.kv.visible_start / page_tokens or
-            r.kv.page_count != (r.kv.visible_end - 1) / page_tokens + 1 - r.kv.first_page)
-            return error.InvalidAttentionGeometry;
-        const physical_rows = try std.math.mul(usize, r.kv.physical_pages, page_tokens);
+        const physical_rows = try r.kv.range().physicalRows();
         const kv_bytes = try std.math.mul(usize, physical_rows, q.kv_heads * head_dim * 2);
         const q_bytes = @as(usize, g.rows_by_heads) * head_dim * 2;
         const relative_bytes = try std.math.mul(usize, g.rows_by_heads, @as(usize, q.relative_extent) * 2);

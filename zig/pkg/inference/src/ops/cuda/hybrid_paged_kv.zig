@@ -26,38 +26,8 @@ const DeviceBuffer = buffer.DeviceBuffer;
 pub const Group = metadata.Group;
 pub const Layout = metadata.Layout;
 
-pub const Config = struct {
-    layout: Layout,
-    full_slots: u16,
-    sliding_slots: u16,
-    kv_heads: u32,
-    head_dim: u32,
-
-    fn slots(self: Config, group: Group) u16 {
-        return switch (group) {
-            .full => self.full_slots,
-            .sliding => self.sliding_slots,
-        };
-    }
-
-    fn rowBytes(self: Config) !usize {
-        if (self.kv_heads == 0 or self.head_dim == 0) return error.InvalidKvShape;
-        return std.math.mul(usize, try std.math.mul(usize, self.kv_heads, self.head_dim), @sizeOf(u16));
-    }
-
-    pub fn deviceBytes(self: Config, group: Group) !usize {
-        const slot_count = self.slots(group);
-        if (slot_count == 0) return error.InvalidKvShape;
-        const rows = try std.math.mul(usize, try self.layout.pageCapacity(group), self.layout.page_tokens);
-        const plane = try std.math.mul(usize, rows, try self.rowBytes());
-        return std.math.mul(usize, plane, @as(usize, slot_count) * 2);
-    }
-};
-
-pub const Visit = struct {
-    group: Group,
-    slot: u16,
-};
+pub const Config = metadata.BankConfig;
+pub const Visit = metadata.Visit;
 
 pub const Planes = struct {
     key: DeviceBuffer,
@@ -72,6 +42,17 @@ pub const StagedView = struct {
     page_tokens: u16,
     visible_start: usize,
     visible_end: usize,
+
+    pub fn range(self: StagedView) metadata.StagedRange {
+        return .{
+            .first_page = self.first_page,
+            .page_count = self.page_count,
+            .physical_pages = self.physical_pages,
+            .page_tokens = self.page_tokens,
+            .visible_start = self.visible_start,
+            .visible_end = self.visible_end,
+        };
+    }
 };
 
 fn view(parent: DeviceBuffer, offset: usize, len: usize) DeviceBuffer {

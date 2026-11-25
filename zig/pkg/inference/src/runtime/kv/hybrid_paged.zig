@@ -54,6 +54,62 @@ pub const Layout = struct {
     }
 };
 
+/// Resident BF16 bank geometry for independently stored full and sliding visits.
+pub const BankConfig = struct {
+    layout: Layout,
+    full_slots: u16,
+    sliding_slots: u16,
+    kv_heads: u32,
+    head_dim: u32,
+
+    pub fn slots(self: BankConfig, group: Group) u16 {
+        return switch (group) {
+            .full => self.full_slots,
+            .sliding => self.sliding_slots,
+        };
+    }
+
+    pub fn rowBytes(self: BankConfig) !usize {
+        if (self.kv_heads == 0 or self.head_dim == 0) return error.InvalidKvShape;
+        return std.math.mul(usize, try std.math.mul(usize, self.kv_heads, self.head_dim), @sizeOf(u16));
+    }
+
+    pub fn deviceBytes(self: BankConfig, group: Group) !usize {
+        const slot_count = self.slots(group);
+        if (slot_count == 0) return error.InvalidKvShape;
+        return std.math.mul(usize, try self.planeBytes(group), @as(usize, slot_count) * 2);
+    }
+
+    pub fn planeBytes(self: BankConfig, group: Group) !usize {
+        const rows = try std.math.mul(usize, try self.layout.pageCapacity(group), self.layout.page_tokens);
+        return std.math.mul(usize, rows, try self.rowBytes());
+    }
+};
+
+pub const Visit = struct {
+    group: Group,
+    slot: u16,
+};
+
+/// A staged logical range and the physical geometry of its payload planes.
+pub const StagedRange = struct {
+    first_page: usize,
+    page_count: usize,
+    physical_pages: usize,
+    page_tokens: u16,
+    visible_start: usize,
+    visible_end: usize,
+
+    pub fn physicalRows(self: StagedRange) !usize {
+        if (self.page_tokens == 0 or self.physical_pages == 0 or self.physical_pages > std.math.maxInt(u32) or
+            self.visible_start >= self.visible_end or
+            self.first_page != self.visible_start / self.page_tokens or
+            self.page_count != (self.visible_end - 1) / self.page_tokens + 1 - self.first_page)
+            return error.InvalidAttentionGeometry;
+        return std.math.mul(usize, self.physical_pages, self.page_tokens);
+    }
+};
+
 const PageGroup = struct {
     pool: *storage.KvStorage,
     pages: table.SequenceBlockTable = .{},
