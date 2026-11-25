@@ -185,13 +185,45 @@ function showFolder(name, title = folderTitles[name]) {
     else $(id).removeAttribute("aria-current");
   $("list-title").textContent = title;
 }
+let listRequest = 0;
+let listPath = "/mail/messages";
+let listSnapshot = null;
+let refreshingList = false;
+
+async function refreshList() {
+  if (!me || !navigator.onLine || document.hidden || refreshingList || !listPath || listSnapshot === null) return;
+  // Keep older pages and search results stable while the user is browsing.
+  if (listPath.includes("?") || listPath === "/mail/trash") return;
+  const request = listRequest;
+  const path = listPath;
+  refreshingList = true;
+  try {
+    const result = await api(path);
+    if (request !== listRequest || path !== listPath || !me) return;
+    const snapshot = JSON.stringify(result);
+    if (snapshot === listSnapshot) return;
+    const list = $("messages");
+    const panel = list.parentElement;
+    if (list.scrollTop || panel?.scrollTop || list.contains(document.activeElement)) return;
+    listSnapshot = snapshot;
+    cursor = result.cursor;
+    render(result.messages);
+  } finally {
+    refreshingList = false;
+  }
+}
 async function load(path = "/mail/messages") {
+  const request = ++listRequest;
+  listPath = path;
+  listSnapshot = null;
   const search = path.startsWith("/mail/search");
   showFolder(
     path.startsWith("/mail/outbox") ? "outbox" : path.startsWith("/mail/trash") ? "trash" : "inbox",
     search ? "Results" : undefined
   );
   const result = await api(path);
+  if (request !== listRequest) return;
+  listSnapshot = JSON.stringify(result);
   cursor = result.cursor;
   $("trash-banner").hidden = folder !== "trash";
   if (folder === "trash") {
@@ -480,6 +512,8 @@ function rememberIdentity() {
   }
 }
 async function refresh() {
+  ++listRequest;
+  listSnapshot = null;
   let offline = false;
   try {
     me = await api("/api/me");
@@ -709,10 +743,13 @@ $("search").onsubmit = guarded(async (event) => {
   const e = event.currentTarget.elements,
     query = e.query.value;
   if (local && (e.where.value === "device" || !navigator.onLine)) {
+    const request = ++listRequest;
+    listPath = null;
     showFolder("inbox", "Results by meaning, on this device");
     $("trash-banner").hidden = true;
     cursor = null;
-    render(await local.search(query));
+    const messages = await local.search(query);
+    if (request === listRequest) render(messages);
     return;
   }
   await load("/mail/search?q=" + encodeURIComponent(query));
@@ -722,7 +759,19 @@ $("local-toggle").onchange = guarded(async (event) => {
   else await stopLocal();
 });
 $("local-sync").onclick = guarded(syncLocal);
+const refreshVisibleList = () => refreshList().catch(() => {
+  // Keep the current list when a background request fails.
+});
+document.addEventListener("visibilitychange", refreshVisibleList);
+addEventListener("focus", refreshVisibleList);
+if (typeof window !== "undefined") {
+  const timer = window.setInterval(refreshVisibleList, 20_000);
+  addEventListener("pagehide", (event) => {
+    if (!event.persisted) window.clearInterval(timer);
+  });
+}
 addEventListener("online", () => {
+  refreshVisibleList();
   if (local) syncLocal().catch((error) => localStatus(error.message));
 });
 if ("serviceWorker" in navigator)
