@@ -14,16 +14,34 @@ order: 2
 
 ## The Result
 
-Your React app has a search page and an answer box on the same Antfly table. Type `billing` and results appear before you finish the word, with a category facet you can click to narrow. Type "how do refunds work?" into the ask box and an answer streams in, cites the documents it used, and offers a follow-up. The search page is one provider and five components; the answer box is two more.
+Your React app has a search page and an answer box on the same Antfly table. Type `billing` and results appear before you finish the word, with a category facet you can click to narrow. Type "how do refunds work?" into the ask box and an answer streams in, and cites the documents it used. The search page is one provider and five components; the answer box is two more.
 
 ## Before You Start
 
-Antfly running with an indexed table and the Gemma 4 generation model pulled. The examples use a table called `docs` with an embeddings index named `body_embeddings`; the [Quickstart](/docs/guides/quickstart) shows how to create one.
+Antfly running with an indexed table and the Gemma 4 E2B IT generation model pulled. The examples use a table called `docs` with an embeddings index named `body_embeddings`; the [Quickstart](/docs/guides/quickstart#add-text-embeddings) shows how to add an embeddings index. Adapt its table and index names to this example.
 
 ```bash
 curl -s http://127.0.0.1:8080/db/v1/tables/docs | head -c 300
-antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0 --tasks generate --projector auto
+antfly inference pull hf:google/gemma-4-E2B-it-qat-q4_0-gguf:gguf --tasks generate --projector auto
 ```
+
+### Connect from the browser
+
+If Vite serves the app at `http://localhost:5173` and it calls Antfly directly on port 8080, add that exact app origin to the `cors` section of the standalone configuration:
+
+```json
+{
+  "cors": {
+    "allowed_origins": ["http://localhost:5173"]
+  }
+}
+```
+
+Pass the JSON file with `antfly standalone --config antfly.json` alongside your existing storage flags. Use the origin shown in your browser, including its scheme and port. For example, `http://127.0.0.1:5173` requires its own entry. This enables browser preflight requests and cross-origin reads of search results and streamed answers.
+
+You can also route requests through a same-origin proxy. Use a relative API URL such as `/db/v1` and configure Vite's development proxy to forward that path to `http://127.0.0.1:8080`. For a deployed app with private Antfly credentials, have your backend authenticate callers and attach the Antfly credential server-side. Variables prefixed with `VITE_` are exposed to browser code.
+
+`--data-dir` controls database data. Inference models use the shared `~/.antfly/inference/models` directory by default. To isolate a run, point the model pull and standalone runtime at the same model directory using `--models-dir`, or set `inference.models_dir` for the runtime.
 
 ## Build It
 
@@ -97,9 +115,13 @@ Three props do the work. `QueryBox` defaults to `mode="live"`, so this searches 
 
 Facet buckets come from the stored document values at the field path you name, so use the plain field name (`category`, not `category.keyword`). Values are never tokenized: short label-like fields facet well, long prose fields do not.
 
+For corpora with image-only records, mark whether each article has a nonblank body at ingest. Use that flag to filter text and answer queries before Antfly paginates them. Image search can still include records with a thumbnail and no body.
+
+When several result widgets share an input, each keeps its own query and index selection in the batch. Set a facet’s `resultsId` to the result widget it should follow when a table has multiple result widgets.
+
 ### 3. Add the Answer Box
 
-The answer box lives inside the same provider and gets its own input, in submit mode:
+The answer box lives inside the same provider and gets its own input in submit mode. Planned retrieval lets the agent use indexed text while embeddings are pending. The index list optionally allows semantic retrieval as well.
 
 ```tsx
 import {
@@ -109,7 +131,7 @@ import {
   renderThumbsUpDown,
 } from '@antfly/components'
 
-const GENERATOR = { provider: 'antfly', model: 'ggml-org/gemma-4-E4B-it-GGUF' }
+const GENERATOR = { provider: 'antfly', model: 'google/gemma-4-E2B-it-qat-q4_0-gguf' }
 
 export function AnswerBox() {
   return (
@@ -125,10 +147,13 @@ export function AnswerBox() {
         id="answer"
         searchBoxId="ask"
         fields={['title', 'body', 'url']}
+        retrievalMode="planned"
         semanticIndexes={['body_embeddings']}
         generator={GENERATOR}
+        systemPrompt="Cite the supporting search hit in your final answer with its numbered reference, such as [1] when you use the first hit."
         limit={10}
         showHits
+        showActivity
       >
         <AnswerFeedback
           scale={1}
@@ -149,7 +174,7 @@ export function AnswerBox() {
 Drop `<AnswerBox />` beside `<Results>` and the page is done. The answer streams in token by token and `showHits` renders the documents it was answered from. Follow-up questions appear underneath by default; `showFollowUpQuestions={false}` tells the server to stop producing them rather than just hiding them.
 
 <Callout type="warning">
-`searchBoxId` must match the `id` of the `QueryBox` driving it: `"ask"` here, `"search"` on `<Results>`. A mismatch throws nothing and logs nothing. `AnswerResults` never fires, and a mismatched semantic `Results` contributes no query at all, which stalls the whole batched request and leaves the facets empty too. When a page goes silent, check these two strings first.
+`searchBoxId` must match the `id` of the `QueryBox` driving it: `"ask"` here, `"search"` on `<Results>`. A mismatch throws nothing and logs nothing. `AnswerResults` never fires, and a mismatched semantic `Results` has no search text. When a page goes silent, check these two strings first.
 </Callout>
 
 The retrieval agent accepts `gemini`, `vertex`, `openai`, `openrouter`, `ollama`, and `antfly` as generator providers. Other values parse and then fail the request with a 400.
@@ -161,7 +186,7 @@ antfly standalone
 npm run dev
 ```
 
-Type into the search box and watch the results and facet counts move. Before the first keystroke the page shows no results and no facet counts, because a semantic `Results` with an empty query contributes nothing to the batched request; that is expected, not a wiring fault. Then ask a full question in the ask box and press Ask. If search works and the ask box does nothing, it is a `searchBoxId` typo. If both are silent, open the network tab: an empty multiquery means no widget is contributing a query.
+Type into the search box and watch the results and facet counts move. Then ask a full question in the ask box and press Ask. If search works and the ask box does nothing, it is a `searchBoxId` typo. If both are silent, open the network tab: an empty multiquery means no widget is contributing a query.
 
 ## Tradeoffs
 

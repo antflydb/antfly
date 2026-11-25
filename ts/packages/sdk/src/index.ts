@@ -33,6 +33,8 @@
  * ```
  */
 
+export { type AnswerRetrievalOptions, answerRetrieval } from "./answer-retrieval.js";
+
 // Main client export
 export {
   AntflyClient,
