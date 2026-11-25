@@ -7173,7 +7173,7 @@ pub fn tryE2bSharedKvPrefill(
     want_last_logits: bool,
 ) !?gpt_arch.SharedKvPrefillResult {
     if (cb.kind() != .metal or
-        !platform.env.getenvBool("ANTFLY_INFERENCE_METAL_E2B_SHARED_KV_LAST_ROW") or
+        !platform.env.getenvBoolDefault("ANTFLY_INFERENCE_METAL_E2B_SHARED_KV_LAST_ROW", true) or
         gpt_arch.metalE2bSharedKvPrefillBoundary(config, context.*) == null or
         context.query_sequence_len != input_ids.len or context.total_sequence_len != seq_len or
         gatedFamilyCompareRequested() or gatedFamilyDumpLayer() != null)

@@ -7661,7 +7661,10 @@ pub const NativeGenerationPipeline = struct {
             capture_last_hidden,
         );
         const can_use_typed_prefill_outputs = self.graph_cache == null and self.compiled_partition_backend == null;
+        // A cache hit attaches existing pages to a new sequence. The Metal
+        // donor frame needs to own the prefix it consumes.
         const allow_shared_kv_prefill = can_use_typed_prefill_outputs and
+            (self.cb.kind() != .metal or prefilled_tokens == 0) and
             self.checkpoint_prepare == null and self.checkpoint_resume == null and
             !capture_last_hidden and config.kv_cache_mode == .exact_hybrid;
         // Admission already covers prompt + output KV. Reserve the prompt and
@@ -10448,7 +10451,7 @@ pub const NativeGenerationPipeline = struct {
         want_last_logits: bool,
     ) !?gpt_arch.SharedKvPrefillResult {
         if (self.cb.kind() != .metal or !self.gpt_config.isGemma4E2bDenseLayout() or
-            !platform.env.getenvBool("ANTFLY_INFERENCE_METAL_E2B_SHARED_KV_LAST_ROW") or
+            !platform.env.getenvBoolDefault("ANTFLY_INFERENCE_METAL_E2B_SHARED_KV_LAST_ROW", true) or
             context.total_sequence_len < 512)
             return null;
 
