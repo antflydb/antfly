@@ -158,6 +158,9 @@ pub const DenseEmbedder = struct {
     set_cancellation_fn: ?EmbedSetCancellationFn = null,
     set_progress_fn: ?EmbedSetProgressFn = null,
     cache_revision_fn: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!?[32]u8 = null,
+    /// Derive the effective cache identity from an already resolved model.
+    /// Implementations must not perform provider discovery or inference.
+    cache_revision_from_model_fn: ?*const fn (*anyopaque, Allocator, []const u8, [32]u8) anyerror!?[32]u8 = null,
     recovery_identity_fn: ?EmbedRecoveryIdentityFn = null,
     /// The implementation guarantees that each provider invocation has its
     /// own finite deadline. Foreground post-commit replay rejects legacy
