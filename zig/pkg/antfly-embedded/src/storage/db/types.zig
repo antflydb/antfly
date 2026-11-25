@@ -1157,6 +1157,8 @@ pub const DocumentArtifactManifestList = struct {
 };
 
 pub const TextBoolQuery = struct {
+    /// Retains query-string semantics through worker transport.
+    query_string: ?struct { text: []const u8, boost: f32 } = null,
     must: []const TextQuery = &.{},
     should: []const TextQuery = &.{},
     must_not: []const TextQuery = &.{},
@@ -1384,6 +1386,7 @@ pub const TextQuery = union(enum) {
                 if (shape.polygons.len > 0) alloc.free(shape.polygons);
             },
             .bool_query => |bool_query| {
+                if (bool_query.query_string) |source| alloc.free(source.text);
                 for (bool_query.must) |*query| {
                     var owned = query.*;
                     owned.deinit(alloc);
