@@ -2629,7 +2629,7 @@ pub const ComputeBackend = struct {
         /// input and return all projected outputs.
         applyLinearQkv: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearQkvRequest) anyerror!?LinearNoBiasTripleResult = null,
         applyLinearQkvInto: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearQkvRequest, k_out: CT, v_out: CT) anyerror!?CT = null,
-        applyLinearInto: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearRequest, out: CT) anyerror!bool = null,
+        applyLinearKvInto: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearQkvRequest, key: CT, value: CT) anyerror!bool = null,
         beginPlannedComputeScope: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
         endPlannedComputeScope: ?*const fn (ctx: *anyopaque) void = null,
         /// Apply an activation inside the backend-owned decoder runtime.
@@ -6921,11 +6921,10 @@ pub const ComputeBackend = struct {
         return null;
     }
 
-    /// Dense linear written into `out`, a `rows x out_dim` device tensor
-    /// such as rows of a resident cache. False (nothing written) when the
-    /// backend cannot place the output.
-    pub fn decoderRuntimeApplyLinearInto(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLinearRequest, out: CT) !bool {
-        if (self.vtable.regions.decoder.applyLinearInto) |op| return self.observeBackendEntry(.prepared_linear_into, op, .{ self.ptr, request, out });
+    /// Project K and V into separate caller-owned cache views. False means
+    /// the pair declined before writing. After the first write, propagate errors.
+    pub fn decoderRuntimeApplyLinearKvInto(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLinearQkvRequest, key: CT, value: CT) !bool {
+        if (self.vtable.regions.decoder.applyLinearKvInto) |op| return self.observeBackendEntry(.prepared_linear_into, op, .{ self.ptr, request, key, value });
         return false;
     }
 
