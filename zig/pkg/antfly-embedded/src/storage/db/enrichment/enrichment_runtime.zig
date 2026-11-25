@@ -17776,9 +17776,13 @@ fn processAsset(
                 const owner: *@This() = @ptrCast(@alignCast(ptr));
                 const json = try @import("antfly-json").stringifyValueAlloc(a, item);
                 defer a.free(json);
+                try checkProviderFailureGuard(owner.runtime);
+                const cancellation = enrichmentSourceCancellation(owner.runtime);
                 var scoped_config = owner.runtime.config;
+                scoped_config.cancellation = cancellation.token();
                 scoped_config.fetch_retry_hint = scopedRetryHint(scoped_config.fetch_retry_hint, owner.request, owner.primary);
-                return renderSourceTemplateText(a, scoped_config, json, prior_template);
+                return renderSourceTemplateText(a, scoped_config, json, prior_template) catch |err|
+                    return providerInvocationFailure(owner.runtime, err);
             }
         };
         var render_context = Render{ .runtime = runtime, .request = request, .primary = observed.? };
@@ -17959,7 +17963,7 @@ fn processAsset(
     }
 
     var source_parts_json = if (producer_cfg.type.usesTemplateParts(request.source_template))
-        try renderSourcePartsJson(runtime.alloc, runtime.config, raw, request)
+        try extractEnrichmentSource(runtime, renderSourcePartsJson, runtime.alloc, raw, request)
     else
         null;
     var source_parts_json_owned = true;
@@ -32303,7 +32307,7 @@ fn collectPlainDenseBatchItem(
     }
 
     const dense_embedder = runtime.config.dense_embedder.?;
-    var prepared = try prepareDenseSourceInput(runtime.alloc, runtime.config, dense_embedder, raw, request);
+    var prepared = try prepareDenseEnrichmentSourceInput(runtime, dense_embedder, raw, request);
     defer prepared.deinit(runtime.alloc);
     const source_text = switch (prepared) {
         .text => |text| text,
@@ -35871,7 +35875,7 @@ fn processDenseEmbedding(
         if (try token.authoredAccepted(&read)) return;
     }
 
-    var prepared = try prepareDenseSourceInput(runtime.alloc, runtime.config, dense_embedder, raw, request);
+    var prepared = try prepareDenseEnrichmentSourceInput(runtime, dense_embedder, raw, request);
     defer prepared.deinit(runtime.alloc);
     const source_text = switch (prepared) {
         .text => |text| text,
@@ -41452,7 +41456,7 @@ fn extractEnrichmentSource(
     alloc: Allocator,
     raw: []const u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
-) !?[]const u8 {
+) anyerror!@typeInfo(@typeInfo(@TypeOf(extract)).@"fn".return_type.?).error_union.payload {
     if (request.source_template.len == 0) return extract(alloc, runtime.config, raw, request);
     try runtime.active_provider_guard.check();
     const cancellation = enrichmentSourceCancellation(runtime);
@@ -41504,14 +41508,14 @@ fn renderSourceTemplateText(
             source_template,
             raw_doc,
             remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, null, config.fetch_retry_hint),
-        ) catch |err| return classifyProviderCancellation(err, .{}, config.cancellation.isCancelled());
+        );
     }
     return template_remote.renderJsonToTextWithConfig(
         alloc,
         source_template,
         raw_doc,
         remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, null, config.fetch_retry_hint),
-    ) catch |err| return classifyProviderCancellation(err, .{}, config.cancellation.isCancelled());
+    );
 }
 
 fn extractAssetSourceValue(
@@ -41571,6 +41575,16 @@ const DenseSourceInput = union(enum) {
         self.* = .empty;
     }
 };
+
+fn prepareDenseEnrichmentSourceInput(runtime: *EnrichmentRuntime, dense: embedder_mod.DenseEmbedder, raw: []const u8, request: enrichment_types.GeneratedEnrichmentRequest) !DenseSourceInput {
+    if (request.source_template.len == 0) return prepareDenseSourceInput(runtime.alloc, runtime.config, dense, raw, request);
+    try checkProviderFailureGuard(runtime);
+    const cancellation = enrichmentSourceCancellation(runtime);
+    var config = runtime.config;
+    config.cancellation = cancellation.token();
+    return prepareDenseSourceInput(runtime.alloc, config, dense, raw, request) catch |err|
+        return providerInvocationFailure(runtime, err);
+}
 
 fn prepareDenseSourceInput(alloc: Allocator, config: Config, dense: embedder_mod.DenseEmbedder, raw: []const u8, request: enrichment_types.GeneratedEnrichmentRequest) !DenseSourceInput {
     if (request.source_template.len > 0 and dense.supportsParts()) {
@@ -47114,12 +47128,32 @@ test "enrichment preserves snapshot failures instead of skipping source content"
         .source_template = "{{remoteMedia url=url}}",
     };
     const doc = "{\"url\":\"file:///media.png\"}";
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
     for ([_]anyerror{ error.OutOfMemory, error.ResourceTemporarilyUnavailable, error.Timeout, error.Canceled, error.UnexpectedEof, error.ConnectionResetByPeer, error.ConnectionClosed }) |err| {
         failure = err;
         try std.testing.expectError(err, extractSourceText(std.testing.allocator, .{}, doc, request));
         try std.testing.expectError(err, extractAssetSourceValue(std.testing.allocator, .{}, doc, request));
         try std.testing.expectError(err, renderSourceParts(std.testing.allocator, .{}, doc, request, null));
+        const native_error = if (isOperationCanceled(err)) error.ProviderInvocationCanceled else err;
+        try std.testing.expectError(native_error, extractEnrichmentSource(&runtime, extractSourceText, std.testing.allocator, doc, request));
+        try std.testing.expectError(native_error, extractEnrichmentSource(&runtime, renderSourcePartsJson, std.testing.allocator, doc, request));
     }
+    runtime.active_provider_guard.deadline_ns = 0;
+    try std.testing.expectError(error.EnrichmentWaitTimeout, extractEnrichmentSource(&runtime, renderSourcePartsJson, std.testing.allocator, doc, request));
 }
 
 test "enrichment extractSourceText with template error directive fails instead of returning text" {
