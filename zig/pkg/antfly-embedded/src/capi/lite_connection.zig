@@ -2587,6 +2587,8 @@ pub const Owner = struct {
 
     fn promotePeerReadRuntime(self: *Owner, root: *h.Handle) !bool {
         if (self.options.open_mode != .writer or root.maintenance_references != 0) return false;
+        const profile_span = write_stage_profile.begin(.refresh_promote);
+        defer profile_span.end();
         const store = root.owned_lite_backend.?.native_docstore.?;
         if (!try store.prepareWriterFromReadCut(root.lite_runtime_sequence)) return false;
         if (root.db_live and !try root.db.adoptLiteWriterCut()) return false;
@@ -2643,6 +2645,7 @@ pub const Owner = struct {
                         self.reader_coordinator.observeCurrent(identity, file.headerFingerprint());
                         if (!file.free_pages_verified) if (self.maintenance_snapshot) |snapshot|
                             try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
+                        write_stage_profile.count(.refresh_path_tip, 1);
                         return current;
                     }
                 }
@@ -2696,6 +2699,7 @@ pub const Owner = struct {
             if (!self.foreground_runtime_stale and !adopted_unseen and current.immutable_query_borrows == 0 and maintenance_references_clear and same_inode and !needsOutcomeReconciliation(current) and (fast_only or !self.writer_reopen_pending) and sequence_unchanged and std.meta.eql(probe.header, file.header)) {
                 if (!file.free_pages_verified) if (self.maintenance_snapshot) |snapshot|
                     try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
+                write_stage_profile.count(.refresh_path_header, 1);
                 return current;
             }
             // `sequence_unchanged` exists to catch a redo-only commit that
@@ -2724,6 +2728,7 @@ pub const Owner = struct {
                 }
                 current.lite_refresh_adoption_epoch = file.adoptionEpoch();
                 current.lite_runtime_sequence = @max(current.lite_runtime_sequence, probe.committedSequence());
+                write_stage_profile.count(.refresh_path_metadata, 1);
                 return current;
             }
             // Adopt the serving delta against the pinned peer cut. A
@@ -2748,6 +2753,7 @@ pub const Owner = struct {
                     if (comptime h.builtin.is_test) _ = self.test_in_place_refresh_count.fetchAdd(1, .release);
                     self.invalidatePeerQueryProducers();
                     current.lite_refresh_adoption_epoch = file.adoptionEpoch();
+                    write_stage_profile.count(.refresh_path_in_place, 1);
                     return current;
                 }
                 self.foreground_runtime_stale = true;
@@ -2764,6 +2770,7 @@ pub const Owner = struct {
             if (file.redo != null and !file.header.protected_redo) try file.refreshCrossProcessRedoOverlay();
         }
         if (fast_only) return null;
+        write_stage_profile.count(.refresh_path_reopen, 1);
         // Queued and in-flight groups on the serving store commit before the
         // replacement opens, so it loads them from the file. Draining after
         // the open (as below, for the handoff) let a replacement miss the

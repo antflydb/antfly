@@ -10997,7 +10997,13 @@ pub const NativeFile = struct {
         if (identity_unchanged) {
             self.allocator_rebase_header = null;
         } else {
-            self.allocator_rebase_header = if (self.free_pages_verified and self.ledger != null) self.header else null;
+            // Rebase the cached ledger whether or not its free pages were
+            // verified: the rebase authenticates its result against the
+            // new root (or its retained ancestry), and verification is
+            // cleared below either way. Without it, every foreign commit
+            // under writer contention, where pages are rarely verified,
+            // reloads and re-digests the whole ledger on the next handoff.
+            self.allocator_rebase_header = if (self.ledger != null) self.header else null;
             if (self.allocator_rebase_header == null) self.invalidateLedger();
             self.free_pages_verified = false;
             self.allocator_verification_base = null;

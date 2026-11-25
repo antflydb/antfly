@@ -80,6 +80,15 @@ pub const Stage = enum(u8) {
     lane_hold_peer,
     lane_hold_parked,
     lane_checkout_wait,
+    /// `Owner.refreshImpl` outcomes (counts): unchanged redo tip, unchanged
+    /// header, unchanged runtime metadata, delta adopted in place, and a
+    /// replacement open; and the writer promotion's time (`refresh_promote`).
+    refresh_path_tip,
+    refresh_path_header,
+    refresh_path_metadata,
+    refresh_path_in_place,
+    refresh_path_reopen,
+    refresh_promote,
     /// Within `text_segment_build` (from `BuildTextProfile`): tokenizing
     /// and accumulating terms.
     text_build_analyze,
