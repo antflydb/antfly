@@ -708,11 +708,19 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
         const stages = @import("encoder_decoder_runtime.zig");
         const control: Control = .{ .native_call_policy = .in_process };
         const feature_input = hidden.borrowedView("features");
+        // Exercise dynamic output metadata with the actual imported provider
+        // and a separately known vocabulary from the task configuration.
+        const logits_info = session.outputInfo()[0];
+        try std.testing.expectEqualStrings("logits", logits_info.name);
+        const vocab_axis = &@constCast(logits_info.shape)[2];
+        const saved_vocab = vocab_axis.*;
+        defer vocab_axis.* = saved_vocab;
+        if (backend == .native) vocab_axis.* = -1;
         var encoded_resident = resident: {
             var audit = @import("transfer_audit.zig").Audit{ .forbid_activation_readbacks = true };
             try @import("transfer_audit.zig").begin(&audit);
             defer @import("transfer_audit.zig").end();
-            break :resident try stages.encodeForIncrementalWithPermit(a, encoder_session, session, &.{feature_input}, null, control, null);
+            break :resident try stages.encodeWithIntent(a, encoder_session, session, &.{feature_input}, null, control, null, .{ .incremental_with_vocabulary = 4 });
         };
         defer encoded_resident.deinit(a);
         try std.testing.expect(encoded_resident == .resident);

@@ -149,7 +149,7 @@ pub const EncoderDecoderPipeline = struct {
         // An installed dispatcher retains its public scheduling contract.
         // Direct tasks can use the runtime's stateful resident receiver.
         var encoded = if (self.batch_dispatch == null)
-            try stage_runtime.encodeForIncrementalWithPermit(allocator, self.encoder, self.decoder, &inputs, self.batch_dispatch, self.execution_control, null)
+            try stage_runtime.encodeWithIntent(allocator, self.encoder, self.decoder, &inputs, self.batch_dispatch, self.execution_control, null, .{ .incremental_with_vocabulary = self.config.vocab_size })
         else
             try stage_runtime.encode(allocator, self.encoder, self.decoder, &inputs, self.batch_dispatch, self.execution_control);
         defer encoded.deinit(allocator);

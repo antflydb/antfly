@@ -108,8 +108,8 @@ pub fn residentPairPlacement(encoder: backends.Session, decoder: backends.Sessio
     return if (tokens and hidden) .resident_pair else .unsupported_decoder_signature;
 }
 
-fn residentMergedPlacement(encoder: backends.Session, decoder: backends.Session, controlled: bool) ?PlacementReason {
-    const vocab = for (decoder.outputInfo()) |output| {
+fn residentMergedPlacement(encoder: backends.Session, decoder: backends.Session, controlled: bool, vocabulary: ?usize) ?PlacementReason {
+    const vocab = vocabulary orelse for (decoder.outputInfo()) |output| {
         if (std.mem.eql(u8, output.name, "logits") and output.shape.len == 3 and output.shape[2] > 0) {
             break std.math.cast(usize, output.shape[2]) orelse return null;
         }
@@ -136,16 +136,21 @@ pub fn encode(allocator: std.mem.Allocator, encoder: backends.Session, decoder: 
 /// A preprocessing permit may transfer its lease into resident encoder outputs.
 /// Host reference execution preserves the caller's existing permit lifetime.
 pub fn encodeWithPermit(allocator: std.mem.Allocator, encoder: backends.Session, decoder: backends.Session, inputs: []const backends.Tensor, dispatch: anytype, control: ?Control, supplied: ?*session_mod.RunPermit) !EncoderOutputs {
-    return encodeOptions(allocator, encoder, decoder, inputs, dispatch, control, supplied, .resident);
+    return encodeWithIntent(allocator, encoder, decoder, inputs, dispatch, control, supplied, .resident);
 }
 
 /// An incremental consumer explicitly opts into its typed cache receiver. A
 /// stateless full-prefix task must never inherit a native KV route implicitly.
 pub fn encodeForIncrementalWithPermit(allocator: std.mem.Allocator, encoder: backends.Session, decoder: backends.Session, inputs: []const backends.Tensor, dispatch: anytype, control: ?Control, supplied: ?*session_mod.RunPermit) !EncoderOutputs {
-    return encodeOptions(allocator, encoder, decoder, inputs, dispatch, control, supplied, .incremental);
+    return encodeWithIntent(allocator, encoder, decoder, inputs, dispatch, control, supplied, .incremental);
 }
 
-pub const EncoderIntent = enum { resident, incremental, vocabulary_row };
+pub const EncoderIntent = union(enum) {
+    resident,
+    incremental,
+    incremental_with_vocabulary: usize,
+    vocabulary_row,
+};
 
 const EncoderRoute = struct {
     dispatcher: ?@import("tensor_dispatch.zig").Dispatch = null,
@@ -165,11 +170,12 @@ fn encoderRoute(encoder: backends.Session, decoder: backends.Session, dispatch: 
     if (stages.hasDispatcher(dispatch) and (dispatcher == null or !dispatcher.?.supportsResident())) {
         return .{ .placement = .dispatcher_host_only };
     }
-    if (intent == .incremental) {
+    if (intent == .incremental or intent == .incremental_with_vocabulary) {
         if (Incremental.qualify(encoder, decoder)) |receiver| {
             return .{ .dispatcher = dispatcher, .incremental = receiver, .placement = .resident_incremental };
         }
-        if (residentMergedPlacement(encoder, decoder, control != null)) |placement| return .{ .dispatcher = dispatcher, .placement = placement };
+        const vocabulary = if (intent == .incremental_with_vocabulary) intent.incremental_with_vocabulary else null;
+        if (residentMergedPlacement(encoder, decoder, control != null, vocabulary)) |placement| return .{ .dispatcher = dispatcher, .placement = placement };
     }
     const placement = residentPairPlacement(encoder, decoder, control != null);
     return .{ .dispatcher = dispatcher, .placement = placement };
@@ -185,7 +191,7 @@ pub fn prepareEncoderPermit(encoder: backends.Session, decoder: backends.Session
     if (selected.isResident() and selected.dispatcher == null) try permit.prepareResidentOutputRetirement();
 }
 
-fn encodeOptions(allocator: std.mem.Allocator, encoder: backends.Session, decoder: backends.Session, inputs: []const backends.Tensor, dispatch: anytype, control: ?Control, supplied: ?*session_mod.RunPermit, intent: EncoderIntent) !EncoderOutputs {
+pub fn encodeWithIntent(allocator: std.mem.Allocator, encoder: backends.Session, decoder: backends.Session, inputs: []const backends.Tensor, dispatch: anytype, control: ?Control, supplied: ?*session_mod.RunPermit, intent: EncoderIntent) !EncoderOutputs {
     if (supplied) |permit| if (permit.session.ptr != encoder.ptr or permit.session.vtable != encoder.vtable) return error.InvalidStagePermit;
     const selected = encoderRoute(encoder, decoder, dispatch, control, intent);
     observePlacement(encoder, decoder, selected.placement);
@@ -365,7 +371,7 @@ pub fn outputVocabulary(decoder: backends.Session) ?usize {
 }
 
 pub fn encodeForFinalRowWithPermit(allocator: std.mem.Allocator, encoder: backends.Session, decoder: backends.Session, inputs: []const backends.Tensor, dispatch: anytype, control: ?Control, supplied: ?*session_mod.RunPermit) !EncoderOutputs {
-    return encodeOptions(allocator, encoder, decoder, inputs, dispatch, control, supplied, .vocabulary_row);
+    return encodeWithIntent(allocator, encoder, decoder, inputs, dispatch, control, supplied, .vocabulary_row);
 }
 
 /// Only the final vocabulary row crosses the output boundary. The encoder and
