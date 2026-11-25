@@ -302,7 +302,7 @@ pub const State = struct {
             else => {},
         };
         // The logits readback has finished the invocation's numerical use.
-        if (!fresh) try self.migrateOmittedCrossCaches(slots, updated, control);
+        if (!fresh or outputs.backend.kind() == .native) try self.migrateDependentCaches(slots, updated, fresh, control);
         if (control) |active| try active.check();
         for (slots, updated) |*old, new| if (new) |value| {
             if (old.*) |previous| previous.pin.release();
@@ -377,8 +377,9 @@ pub const State = struct {
 
     /// Prepare each independently admitted target before submitting the
     /// copies. One stream completion protects all sources and destinations.
-    const CrossCacheReservation = struct {
+    const CacheCopyReservation = struct {
         index: usize,
+        source: ResidentSlot,
         bound: usize,
         dimensions: [4]i32,
         permit: sessions.RunPermit,
@@ -386,7 +387,7 @@ pub const State = struct {
         rejected: bool = false,
     };
 
-    fn migrateOmittedCrossCaches(self: *State, previous: []const ?ResidentSlot, updated: []?ResidentSlot, control: ?Control) !void {
+    fn migrateDependentCaches(self: *State, previous: []const ?ResidentSlot, updated: []?ResidentSlot, fresh: bool, control: ?Control) !void {
         const shared = self.session.shared_compute_context orelse return;
         const backend = shared.stableBackend();
         if (self.session.model_lifetime == null) return;
@@ -396,7 +397,7 @@ pub const State = struct {
         if (kernels.physicalTensorView == null) return;
         if (backend.kind() != .native and backend.kind() != .metal and kernels.createPhysicalCompletion == null) return;
 
-        var reservations: std.ArrayList(CrossCacheReservation) = .empty;
+        var reservations: std.ArrayList(CacheCopyReservation) = .empty;
         defer {
             for (reservations.items) |*item| {
                 if (item.output) |*output| output.deinit();
@@ -405,11 +406,13 @@ pub const State = struct {
             reservations.deinit(self.allocator);
         }
         for (self.roles, previous, updated, 0..) |role, old, slot, index| switch (role) {
-            .past => |past| if (past.cross and slot == null) {
-                const source = old orelse return error.InvalidDecoderOutput;
+            .past => |past| if (fresh or (past.cross and slot == null)) {
+                // CPU prefill can publish a slice of a larger transient bank.
+                // Detach it synchronously before keeping that bank for decode.
+                const source = (if (fresh) slot else old) orelse return error.InvalidDecoderOutput;
                 if (source.independent or source.input.backend.ptr != backend.ptr or source.input.backend.vtable != backend.vtable) continue;
                 if (control) |active| try active.check();
-                const item = self.reserveCrossCache(backend, source, index) catch |err| switch (err) {
+                const item = self.reserveCacheCopy(backend, source, index) catch |err| switch (err) {
                     error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.QueueFull, error.InvalidPhysicalTransferSize => null,
                     else => return err,
                 };
@@ -432,7 +435,7 @@ pub const State = struct {
 
         var staged = false;
         for (reservations.items) |*item| {
-            item.output = self.prepareCrossCache(backend, kernels, previous[item.index].?, item) catch |err| switch (err) {
+            item.output = self.prepareCacheCopy(backend, kernels, item) catch |err| switch (err) {
                 error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.QueueFull, error.InvalidPhysicalTransferSize => null,
                 else => return err,
             };
@@ -454,7 +457,7 @@ pub const State = struct {
             };
             for (reservations.items) |*item| {
                 const output = item.output orelse continue;
-                copy(backend.ptr, output.outputs[0], previous[item.index].?.input.value) catch |err| switch (err) {
+                copy(backend.ptr, output.outputs[0], item.source.input.value) catch |err| switch (err) {
                     error.InvalidPhysicalTransferSize, error.InvalidShape => item.rejected = true,
                     else => return err,
                 };
@@ -468,30 +471,31 @@ pub const State = struct {
         for (reservations.items) |*item| {
             if (item.rejected) continue;
             if (item.output) |*output| {
-                const source = previous[item.index].?;
+                const pin = try output.retainResources(self.allocator);
+                if (updated[item.index]) |prior| prior.pin.release();
                 updated[item.index] = .{
-                    .pin = try output.retainResources(self.allocator),
-                    .input = .{ .value = output.outputs[0], .backend = backend, .estimated_bytes = source.input.estimated_bytes },
-                    .shape = source.shape,
+                    .pin = pin,
+                    .input = .{ .value = output.outputs[0], .backend = backend, .estimated_bytes = item.source.input.estimated_bytes },
+                    .shape = item.source.shape,
                     .independent = true,
                 };
             }
         }
     }
 
-    fn reserveCrossCache(self: *State, backend: *const ops.ComputeBackend, previous: ResidentSlot, index: usize) !?CrossCacheReservation {
+    fn reserveCacheCopy(self: *State, backend: *const ops.ComputeBackend, previous: ResidentSlot, index: usize) !?CacheCopyReservation {
         const storage = @import("../ops/physical_storage.zig");
         var dimensions: [4]i32 = undefined;
         for (&dimensions, previous.shape) |*dim, axis| dim.* = std.math.cast(i32, axis) orelse return null;
         const bound = try storage.reservationBytes(backend.*, .{ .byte_size = previous.input.estimated_bytes });
-        return .{ .index = index, .bound = bound, .dimensions = dimensions, .permit = try self.session.admitRetainedState(0, bound) };
+        return .{ .index = index, .source = previous, .bound = bound, .dimensions = dimensions, .permit = try self.session.admitRetainedState(0, bound) };
     }
 
     /// All bank creation and copies share the caller's provider operation.
     /// Each target takes only the admission permit for its own bank.
-    fn prepareCrossCache(self: *State, backend: *const ops.ComputeBackend, kernels: *const @import("../ops/kernel_backend.zig").VTable, previous: ResidentSlot, reservation: *CrossCacheReservation) !?sessions.ResidentOutputs {
+    fn prepareCacheCopy(self: *State, backend: *const ops.ComputeBackend, kernels: *const @import("../ops/kernel_backend.zig").VTable, reservation: *CacheCopyReservation) !?sessions.ResidentOutputs {
         const storage = @import("../ops/physical_storage.zig");
-        const allocation = (try storage.Lease.create(self.allocator, backend.*, previous.input.estimated_bytes)) orelse return null;
+        const allocation = (try storage.Lease.create(self.allocator, backend.*, reservation.source.input.estimated_bytes)) orelse return null;
         defer allocation.release();
         if ((allocation.backing_byte_size orelse return null) > reservation.bound) return error.PhysicalStorageExceededReservation;
         const handles = try self.allocator.alloc(ops.CT, 1);
@@ -863,7 +867,7 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
                 defer for (targets) |target| if (target) |value| value.pin.release();
                 const before_denial = controller.snapshot();
                 const copy_control: Control = .{ .native_call_policy = .in_process };
-                try copy_state.migrateOmittedCrossCaches(&previous, &targets, copy_control);
+                try copy_state.migrateDependentCaches(&previous, &targets, false, copy_control);
                 try std.testing.expect(targets[0] == null and targets[1] == null);
                 try std.testing.expectEqualDeep(before_denial, controller.snapshot());
                 copy_state.session.run_admission.?.limits = original_limits;
@@ -876,7 +880,7 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
                 {
                     var observation = @import("runtime_observation.zig").Scope.init();
                     defer observation.deinit();
-                    try copy_state.migrateOmittedCrossCaches(&previous, &targets, copy_control);
+                    try copy_state.migrateDependentCaches(&previous, &targets, false, copy_control);
                     if (backend == .metal) {
                         const counters = observation.snapshot();
                         try std.testing.expectEqual(@as(?u64, 1), counters.metal_command_submissions);
@@ -898,7 +902,7 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
                 mixed[1].?.input.value = malformed;
                 var partial_targets: [2]?ResidentSlot = @splat(null);
                 defer for (partial_targets) |target| if (target) |value| value.pin.release();
-                try copy_state.migrateOmittedCrossCaches(&mixed, &partial_targets, copy_control);
+                try copy_state.migrateDependentCaches(&mixed, &partial_targets, false, copy_control);
                 try std.testing.expect(partial_targets[0] != null and partial_targets[1] == null);
                 const partial_cache = try partial_targets[0].?.input.backend.toFloat32(partial_targets[0].?.input.value, a);
                 defer a.free(partial_cache);
@@ -918,7 +922,7 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
                 var cancelled_targets: [2]?ResidentSlot = @splat(null);
                 defer for (cancelled_targets) |target| if (target) |value| value.pin.release();
                 const before_cancel = controller.snapshot();
-                try std.testing.expectError(error.Cancelled, copy_state.migrateOmittedCrossCaches(&previous, &cancelled_targets, .{
+                try std.testing.expectError(error.Cancelled, copy_state.migrateDependentCaches(&previous, &cancelled_targets, false, .{
                     .ptr = &cancellation,
                     .check_fn = CancelBeforePublication.check,
                     .native_call_policy = .in_process,
