@@ -7632,6 +7632,17 @@ fn qualifyT5CachedRows(a: std.mem.Allocator, session: Session, selected: []const
             try std.testing.expect(captures != 0);
             try std.testing.expect(replays != 0);
         }
+        const root: *const ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
+        const encoder_index = for (session.inputInfo(), 0..) |info, index| {
+            if (std.mem.eql(u8, info.name, "encoder_hidden_states")) break index;
+        } else return error.UnqualifiedMergedDecoder;
+        var cached_variants: usize = 0;
+        for (root.specializations.entries.items) |entry| {
+            if (entry.shapes[0] != 1) continue;
+            cached_variants += 1;
+            try std.testing.expectEqual(ml.graph.null_node, entry.session.input_node_ids[encoder_index]);
+        }
+        try std.testing.expect(cached_variants != 0);
         for (rows, 0..) |row, offset| {
             var full = (try runtime.State.init(a, session, .{ .host = hidden }, &.{ 1, 1, 1, 1 }, vocab)) orelse return error.UnqualifiedMergedDecoder;
             defer full.deinit();
