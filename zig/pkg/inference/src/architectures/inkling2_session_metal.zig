@@ -71,7 +71,7 @@ pub const Runtime = struct {
     pub fn widenCacheBudget(self: *const Runtime, limits: @import("../runtime/tier/memory.zig").Limits) @TypeOf(limits) {
         if (limits.kv_limit_bytes == 0) return limits;
         const context = self.model.text.model_max_length;
-        const plan = decoder.RequestPlan.initWithFormat(&self.model, context, @min(context, decoder.prefill_chunk_rows), .q4_head128) catch return limits;
+        const plan = decoder.RequestPlan.initWithFormat(&self.model, context, @min(context, decoder.preferredPrefillRows()), .q4_head128) catch return limits;
         const retained = State.deviceBytes(plan.bank, plan.width) catch return limits;
         if (retained <= limits.kv_limit_bytes) return limits;
         const device = self.resident_bytes +| (plan.deviceBytes() catch return limits);
@@ -179,7 +179,8 @@ pub const TextPipeline = struct {
             return error.UnsupportedInkling2Request;
         const tokens = try std.math.add(usize, self.prompt.count(), @as(usize, @intCast(config.max_tokens)) - 1);
         const prefix = @max(self.prompt.before_image.len, self.prompt.after_image.len - 1, self.prompt.imageRows());
-        const prefill_rows: u32 = if (prefix >= decoder.prefill_chunk_rows) decoder.prefill_chunk_rows else 1;
+        const preferred = decoder.preferredPrefillRows();
+        const prefill_rows: u32 = if (prefix >= preferred) preferred else if (prefix >= decoder.prefill_chunk_rows) decoder.prefill_chunk_rows else 1;
         const format: @import("../runtime/kv/hybrid_paged.zig").PlaneFormat = if (config.cache_dtype) |dtype| blk: {
             const parsed = @import("../runtime/kv/pool.zig").parseKvDType(dtype) orelse return error.UnsupportedInkling2Request;
             break :blk switch (parsed) {

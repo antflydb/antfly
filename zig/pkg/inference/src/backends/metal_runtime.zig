@@ -52780,7 +52780,7 @@ pub const RoutedBlockScaledProjection = struct {
         }
     };
 
-    extern fn antfly_metal_dispatch_routed_block_scaled_bf16(runtime: *RawMetalDecodeRuntime, buffers: *const [7]Buffer, wire: *const Wire) c_int;
+    extern fn antfly_metal_dispatch_routed_block_scaled_bf16(runtime: *RawMetalDecodeRuntime, buffers: *const [8]Buffer, wire: *const Wire) c_int;
 
     /// Input and output use BF16 bits in two-byte storage. Packed weights and
     /// per-block byte scales keep their original checkpoint layout.
@@ -52795,10 +52795,25 @@ pub const RoutedBlockScaledProjection = struct {
         outer_denominator: ?*const MetalTensor,
         output: *MetalTensor,
     ) !void {
+        return self.encodeGrouped(runtime, input, values, scales, expert_ids, outer_amax, outer_denominator, null, output);
+    }
+
+    fn encodeGrouped(
+        self: RoutedBlockScaledProjection,
+        runtime: *RawMetalDecodeRuntime,
+        input: *const MetalTensor,
+        values: *const MetalTensor,
+        scales: *const MetalTensor,
+        expert_ids: *const MetalTensor,
+        outer_amax: ?*const MetalTensor,
+        outer_denominator: ?*const MetalTensor,
+        groups: ?*const MetalTensor,
+        output: *MetalTensor,
+    ) !void {
         _ = try self.format.row(self.input_width);
         if (output.isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
         if (self.format == .nvfp4 and (outer_amax == null or outer_denominator == null)) return error.InvalidShape;
-        const descriptors: [7]Buffer = .{
+        const descriptors: [8]Buffer = .{
             try .fromTensor(input, .i16),
             try .fromTensor(values, .u8),
             try .fromTensor(scales, .u8),
@@ -52806,6 +52821,7 @@ pub const RoutedBlockScaledProjection = struct {
             if (outer_amax) |tensor| try .fromTensor(tensor, .f32) else .{},
             if (outer_denominator) |tensor| try .fromTensor(tensor, .f32) else .{},
             try .fromTensor(output, .i16),
+            if (groups) |table| try .fromTensor(table, .i32) else .{},
         };
         const status = antfly_metal_dispatch_routed_block_scaled_bf16(runtime, &descriptors, &.{
             .rows = self.rows,
@@ -52904,6 +52920,7 @@ pub const RoutedBlockScaledFfn = struct {
         gate_up: *MetalTensor,
         activated: *MetalTensor,
         projected: *MetalTensor,
+        groups: ?*MetalTensor = null,
     };
 
     pub const ScratchShape = struct {
@@ -52933,6 +52950,12 @@ pub const RoutedBlockScaledFfn = struct {
         };
     }
 
+    pub fn groupElements(self: RoutedBlockScaledFfn) !usize {
+        const shape = try self.scratchShape();
+        if (self.rows < 16 or shape.selected > 512 or self.hidden % 32 != 0 or self.intermediate % 32 != 0) return 0;
+        return @as(usize, @intCast(shape.selected)) * 9;
+    }
+
     const Stage = enum(c_uint) { select = 1, gate = 2, reduce = 3 };
     const Wire = extern struct {
         rows: u32,
@@ -52944,6 +52967,7 @@ pub const RoutedBlockScaledFfn = struct {
         up_cap: f32,
     };
     const Buffer = RoutedBlockScaledProjection.Buffer;
+    extern fn antfly_metal_dispatch_routed_groups(runtime: *RawMetalDecodeRuntime, views: *const [2]Buffer, rows: u32) c_int;
     extern fn antfly_metal_dispatch_routed_epilogue(runtime: *RawMetalDecodeRuntime, stage: Stage, buffers: *const [4]Buffer, wire: *const Wire) c_int;
 
     fn dispatch(self: RoutedBlockScaledFfn, runtime: *RawMetalDecodeRuntime, stage: Stage, views: [4]Buffer, rows: u32, width: u32) !void {
@@ -53010,6 +53034,17 @@ pub const RoutedBlockScaledFfn = struct {
         }, self.rows, 0);
         scratch.selected.invalidateHostMirror();
         scratch.weights.invalidateHostMirror();
+        const groups: ?*const MetalTensor = if (scratch.groups) |table| gather: {
+            if (table.isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
+            if (try self.groupElements() == 0) break :gather null;
+            const views: [2]Buffer = .{ try .fromTensor(scratch.selected, .i32), try .fromTensor(table, .i32) };
+            switch (antfly_metal_dispatch_routed_groups(runtime, &views, routed_rows)) {
+                0 => table.invalidateHostMirror(),
+                1 => break :gather null,
+                else => return error.MetalKernelDispatchFailed,
+            }
+            break :gather table;
+        } else null;
         const gate_projection: RoutedBlockScaledProjection = .{
             .rows = routed_rows,
             .input_width = self.hidden,
@@ -53018,7 +53053,7 @@ pub const RoutedBlockScaledFfn = struct {
             .input_repeat = self.top_k,
             .format = self.format,
         };
-        try gate_projection.encode(runtime, input, gate_up.values, gate_up.scales, scratch.selected, gate_up.amax, gate_up.denominator, scratch.gate_up);
+        try gate_projection.encodeGrouped(runtime, input, gate_up.values, gate_up.scales, scratch.selected, gate_up.amax, gate_up.denominator, groups, scratch.gate_up);
         try self.dispatch(runtime, .gate, .{
             try .fromTensor(scratch.gate_up, .i16),
             try .fromTensor(scratch.weights, .f32),
@@ -53034,7 +53069,7 @@ pub const RoutedBlockScaledFfn = struct {
             .input_repeat = 1,
             .format = self.format,
         };
-        try down_projection.encode(runtime, scratch.activated, down.values, down.scales, scratch.selected, down.amax, down.denominator, scratch.projected);
+        try down_projection.encodeGrouped(runtime, scratch.activated, down.values, down.scales, scratch.selected, down.amax, down.denominator, groups, scratch.projected);
         try self.dispatch(runtime, .reduce, .{
             try .fromTensor(scratch.projected, .i16),
             try .fromTensor(output, .i16),
@@ -53044,6 +53079,68 @@ pub const RoutedBlockScaledFfn = struct {
         output.invalidateHostMirror();
     }
 };
+
+test "Metal routed block-scaled projection groups frequent experts and preserves scalar tails" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const rows, const width, const columns, const experts = .{ 16, 32, 8, 4 };
+    const ids: [rows]u32 = .{ 0, 1, 0, 2, 3, 0, 3, 3, 1, 0, 0, 3, 1, 2, 1, 0 };
+    var input: [rows * width]u16 = undefined;
+    for (&input, 0..) |*bits, i| bits.* = if (i % 3 == 0) 0x4000 else 0xbf80;
+    var values: [experts * columns * width / 2]u8 = undefined;
+    for (&values, 0..) |*byte, i| byte.* = @truncate(i * 17);
+    const scales: [experts * columns * width / 16]u8 = @splat(0x38);
+    const amax: [experts]f32 = @splat(1);
+    const denominator: [1]f32 = .{1};
+    const payloads: [6][]const u8 = .{
+        std.mem.asBytes(&input), &values, &scales, std.mem.asBytes(&ids), std.mem.asBytes(&amax), std.mem.asBytes(&denominator),
+    };
+    const dtypes: [9]metal_tensor.DType = .{ .i16, .u8, .u8, .i32, .f32, .f32, .i32, .i16, .i16 };
+    const sizes: [9]i32 = .{ input.len, values.len, scales.len, ids.len, amax.len, 1, rows * 9, rows * columns, rows * columns };
+    var tensors: [9]MetalTensor = undefined;
+    var initialized: usize = 0;
+    defer for (tensors[0..initialized]) |*tensor| tensor.deinit();
+    for (&tensors, dtypes, sizes, 0..) |*tensor, dtype, size, i| {
+        tensor.* = try MetalTensor.deviceAllocateTyped(a, runtime, dtype, .shared, &.{size});
+        initialized += 1;
+        if (i < payloads.len) try tensor.uploadBytes(payloads[i]);
+    }
+    try beginFrame(runtime);
+    errdefer cancelFrame(runtime) catch {};
+    const Buffer = RoutedBlockScaledProjection.Buffer;
+    const group_views: [2]Buffer = .{ try .fromTensor(&tensors[3], .i32), try .fromTensor(&tensors[6], .i32) };
+    switch (RoutedBlockScaledFfn.antfly_metal_dispatch_routed_groups(runtime, &group_views, rows)) {
+        0 => {},
+        1 => return error.SkipZigTest,
+        else => return error.MetalKernelDispatchFailed,
+    }
+    const projection: RoutedBlockScaledProjection = .{
+        .rows = rows,
+        .input_width = width,
+        .output_width = columns,
+        .expert_count = experts,
+        .input_repeat = 1,
+        .format = .nvfp4,
+    };
+    try projection.encode(runtime, &tensors[0], &tensors[1], &tensors[2], &tensors[3], &tensors[4], &tensors[5], &tensors[7]);
+    try projection.encodeGrouped(runtime, &tensors[0], &tensors[1], &tensors[2], &tensors[3], &tensors[4], &tensors[5], &tensors[6], &tensors[8]);
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+    var expected: [rows * columns]u16 = undefined;
+    var actual: [rows * columns]u16 = undefined;
+    var groups: [rows * 9]u32 = undefined;
+    try tensors[7].downloadBytesInto(std.mem.asBytes(&expected));
+    try tensors[8].downloadBytesInto(std.mem.asBytes(&actual));
+    try tensors[6].downloadBytesInto(std.mem.asBytes(&groups));
+    try std.testing.expectEqual(expected, actual);
+    try std.testing.expectEqual(@as(u32, 6), groups[0]);
+    try std.testing.expectEqual(@as(u32, 4), groups[9]);
+    try std.testing.expectEqual(@as(u32, 0), groups[18]);
+    try std.testing.expectEqual(@as(u32, 1), groups[27]);
+}
 
 test "Metal routed block-scaled projection chains the complete expert stage in one frame" {
     if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;

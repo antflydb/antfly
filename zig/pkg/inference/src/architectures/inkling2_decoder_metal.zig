@@ -180,17 +180,28 @@ fn tempDtype(kind: Temp) tensors.DType {
 }
 
 pub const prefill_chunk_rows = 16;
+const grouped_prefill_chunk_rows = 64;
+
+fn groupedPrefillEnabled() bool {
+    return @import("antfly_platform").env.getenvBool("ANTFLY_METAL_GROUPED_ROUTED_PREFILL");
+}
+
+pub fn preferredPrefillRows() u32 {
+    return if (groupedPrefillEnabled()) grouped_prefill_chunk_rows else prefill_chunk_rows;
+}
 
 const WorkPlan = struct {
     rows: u32,
     elements: [@typeInfo(Temp).@"enum".field_names.len]usize,
     attention: attention.RequestWorkspace.Plan,
+    group_elements: usize,
 
     fn init(model: *const Decoder, rows: u32, max_tokens: u32) !WorkPlan {
         const text = model.text;
         const width: usize = text.hidden_size;
         const count = @as(usize, rows) * width;
-        const shape = try model.layers[0].experts.geometry(text, rows).scratchShape();
+        const experts = model.layers[0].experts.geometry(text, rows);
+        const shape = try experts.scratchShape();
         const elements = std.EnumArray(Temp, usize).init(.{
             .query = count,
             .key = count,
@@ -217,6 +228,10 @@ const WorkPlan = struct {
             .rows = rows,
             .elements = elements.values,
             .attention = try .init(text, rows, max_tokens),
+            .group_elements = if (rows > 1 and groupedPrefillEnabled())
+                try experts.groupElements()
+            else
+                0,
         };
     }
 
@@ -226,7 +241,7 @@ const WorkPlan = struct {
         bytes = try std.math.add(usize, bytes, @as(usize, @intCast(self.attention.reduction_elements)) * @sizeOf(f32));
         for (std.enums.values(Temp), self.elements) |kind, count|
             bytes = try std.math.add(usize, bytes, try std.math.mul(usize, count, tempDtype(kind).byteSize()));
-        return bytes;
+        return std.math.add(usize, bytes, try std.math.mul(usize, self.group_elements, @sizeOf(u32)));
     }
 };
 
@@ -249,7 +264,7 @@ pub const RequestPlan = struct {
     pub fn initWithFormat(model: *const Decoder, max_tokens: u32, prefill_rows: u32, format: kv.PlaneFormat) !RequestPlan {
         const text = model.text;
         if (max_tokens == 0 or max_tokens > text.model_max_length or prefill_rows == 0 or
-            prefill_rows > @min(prefill_chunk_rows, max_tokens)) return error.InvalidInkling2Context;
+            prefill_rows > @min(grouped_prefill_chunk_rows, max_tokens)) return error.InvalidInkling2Context;
         return .{
             .width = text.hidden_size,
             .bank = .{
@@ -275,6 +290,7 @@ pub const RequestPlan = struct {
 const Work = struct {
     stack: Stack,
     attention: attention.RequestWorkspace,
+    groups: ?Tensor,
     temps: [@typeInfo(Temp).@"enum".field_names.len]Tensor,
 
     fn init(a: std.mem.Allocator, runtime: *Runtime, width: u32, plan: WorkPlan) !Work {
@@ -290,10 +306,12 @@ const Work = struct {
             tensor.* = try allocate(a, runtime, tempDtype(kind), elements, if (kind == .logits) .shared else .private);
             initialized += 1;
         }
+        result.groups = if (plan.group_elements > 0) try allocate(a, runtime, .i32, plan.group_elements, .private) else null;
         return result;
     }
 
     fn deinit(self: *Work) void {
+        if (self.groups) |*groups| groups.deinit();
         const count = if (self.stack.rows == 1) self.temps.len else @backingInt(Temp.logits);
         for (self.temps[0..count]) |*tensor| tensor.deinit();
         self.attention.deinit();
@@ -398,6 +416,7 @@ pub const Request = struct {
             .gate_up = work.get(.gate_up),
             .activated = work.get(.activated),
             .projected = work.get(.projected),
+            .groups = if (work.groups) |*groups| groups else null,
         }, work.get(.raw));
         try self.state.convolveResidual(pending, text.hidden_size, work.get(.raw), layer.weight(.mlp_taps), binding.expert_residual, work.get(.convolved_expert));
         try work.stack.finish(runtime, boundary, work.get(.convolved_attention), work.get(.convolved_expert));
@@ -535,6 +554,17 @@ test "Inkling Metal resident decoder runs the released text checkpoint" {
     const batch_start = time.monotonicNs();
     try batched.appendTokens(&prefix);
     const batch_ns = time.monotonicNs() - batch_start;
+    if (batched.prefill.?.groups) |*table| {
+        const words = try a.alloc(u32, table.deviceByteLen() / @sizeOf(u32));
+        defer a.free(words);
+        try table.downloadBytesInto(std.mem.sliceAsBytes(words));
+        var grouped_rows: usize = 0;
+        var offset: usize = 0;
+        while (offset < words.len) : (offset += 9) {
+            if (words[offset] >= 4 and words[offset] <= 8) grouped_rows += words[offset];
+        }
+        std.debug.print("Inkling Metal grouped expert rows {d}/{d} in the last prefill visit\n", .{ grouped_rows, words.len / 9 });
+    }
     const candidate = try batched.step(last);
     try std.testing.expectEqual(prefix.len + 1, batched.state.sequence.committed_tokens);
     const argmax = @import("../backends/activations.zig").argmax;
@@ -548,9 +578,25 @@ test "Inkling Metal resident decoder runs the released text checkpoint" {
         prefix.len, @as(f64, @floatFromInt(serial_ns)) / 1e6, @as(f64, @floatFromInt(batch_ns)) / 1e6, argmax(candidate), max_delta,
     });
 
+    if (groupedPrefillEnabled()) {
+        var tokens: [grouped_prefill_chunk_rows]i32 = undefined;
+        for (&tokens, 0..) |*id, i| id.* = prefix[i % prefix.len];
+        var large: Request = undefined;
+        try large.initWithPlan(a, decoder, try RequestPlan.initPrefill(decoder, tokens.len + 1, tokens.len));
+        defer large.deinit();
+        const started = time.monotonicNs();
+        try large.appendTokens(&tokens);
+        const elapsed = time.monotonicNs() - started;
+        const next = try large.stepGreedy(last);
+        try std.testing.expectEqual(tokens.len + 1, large.state.sequence.committed_tokens);
+        std.debug.print("Inkling Metal grouped prefill rows={d} latency_ms={d:.3} next={d}\n", .{
+            tokens.len, @as(f64, @floatFromInt(elapsed)) / 1e6, next,
+        });
+    }
+
     const full_context = decoder.text.model_max_length;
-    const full_plan = try RequestPlan.initWithFormat(decoder, full_context, prefill_chunk_rows, .q4_head128);
-    const full_exact = try RequestPlan.initPrefill(decoder, full_context, prefill_chunk_rows);
+    const full_plan = try RequestPlan.initWithFormat(decoder, full_context, preferredPrefillRows(), .q4_head128);
+    const full_exact = try RequestPlan.initPrefill(decoder, full_context, preferredPrefillRows());
     try std.testing.expectEqual(@as(usize, 8_858_370_048), try full_plan.bank.deviceBytes(.full));
     try std.testing.expectEqual(@as(usize, 34_359_738_368), try full_exact.bank.deviceBytes(.full));
     try std.testing.expect(resident.resident_bytes + try full_plan.deviceBytes() < 29_000_000_000);

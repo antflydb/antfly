@@ -904,7 +904,9 @@ BF16 layout. The warmed Metal process completed the first decode with that
 capacity reserved. A separate GPU test read the remapped last page across
 a synthetic million-token sequence. All 83 tests passed. Running the full
 model through a million-token prompt and measuring accuracy and latency
-at that length remain open.
+at that length remain open. The HTTP option returned the expected answers
+for a 28-token text prompt, a 33-token image prompt, and a mixed 6,404-token
+lookup request. The last request returned `271` in 220.80 s.
 
 The 16-token compressed probe selected the same next token as BF16, with
 a maximum logit deviation of 1.89. In a separate run, experimental native
@@ -912,6 +914,17 @@ BF16 projection tiles reduced 16-token prefill from about 522 ms to 468 ms
 and changed some logits by up to 1.54. The tiles require
 `ANTFLY_METAL_BF16_TILED_PROJECTION=1` while broader accuracy validation is
 pending.
+
+The grouped routed projection builds a device-side map of tokens sharing an
+expert and reuses it across the gate/up and down projections. It matched
+the scalar kernel exactly on a synthetic route mix with 60 grouped and
+four scalar routes. In the released-model suite, the final prefill visit
+grouped 102 of 128 routes. Measured prefill took 371.49 ms for 16 tokens
+and 1,014.57 ms for 64 tokens. The 16-token candidate selected the same
+next token as the 530.86 ms default path and shifted individual logits by
+up to 1.26. All 84 tests passed with the grouped candidate enabled through
+`ANTFLY_METAL_GROUPED_ROUTED_PREFILL=1`. Accuracy and HTTP latency across a
+broader workload remain qualification gates.
 
 ### Official Gemma 4 E2B QAT serving comparison
 
