@@ -24137,7 +24137,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return false;
     }
 
-    fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, _: @import("../execution/cleanup_context.zig").Context, defer_arena: bool) anyerror!?CT {
+    fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: @import("../execution/cleanup_context.zig").Context, defer_arena: bool) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const observation = @import("../execution/runtime_observation.zig");
         const selection = audioExecutionSelection(self, key, inputs) orelse {
@@ -24239,8 +24239,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 const scope = if (metal_runtime.hasActiveFrame(p.raw_decode_runtime)) try self.beginPlannedGraphScopeForSelf(.ffn) else PlannedGraphScope{};
                 var ended = false;
                 defer if (!ended) self.abortPlannedGraphScopeForSelf(scope);
-                out = try plan.replay(&cb, inputs);
-                errdefer freeOp(ctx, out);
+                out = try plan.replay(&cb, inputs, cleanup);
+                errdefer freeWithCleanupOp(ctx, out, cleanup);
                 ended = true;
                 try self.endPlannedGraphScopeForSelf(scope);
             } else out = try run(context, inputs);
@@ -24275,7 +24275,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
         self.audio_capture = null;
         capture.finish(out);
-        errdefer freeOp(ctx, out);
+        errdefer freeWithCleanupOp(ctx, out, cleanup);
         if (plan.ready) {
             self.audioFreezePlan(plan) catch {
                 plan.nodes = &.{};
@@ -54075,7 +54075,7 @@ test "embeddinggemma2 Metal audio replay survives fused selector eviction after 
     for (0..2) |_| {
         try std.testing.expect(try cb.decoderRuntimeBeginFrame());
         defer cb.decoderRuntimeCancelFrame() catch {};
-        const out = try plan.replay(&cb, &.{ x, w });
+        const out = try plan.replay(&cb, &.{ x, w }, .{});
         defer cb.free(out);
         try cb.decoderRuntimeSubmitAndWaitFrame();
         const actual = try cb.toFloat32(out, a);
@@ -54286,7 +54286,7 @@ test "embeddinggemma2 Metal audio prepared slots reuse arenas without mutating r
         const runtime = compute.provider_impl.raw_decode_runtime;
         const previous_scope = metal_runtime_mod.antfly_metal_audio_replay_scope(runtime, 1);
         defer _ = metal_runtime_mod.antfly_metal_audio_replay_scope(runtime, previous_scope);
-        const out = plan.replay(&cb, &.{x}) catch |err| {
+        const out = plan.replay(&cb, &.{x}, .{}) catch |err| {
             _ = metal_runtime_mod.antfly_metal_audio_replay_scope(runtime, previous_scope);
             return err;
         };
@@ -54363,7 +54363,7 @@ test "embeddinggemma2 Metal compact audio plans recover admission and reuse inte
         defer compute.allocator = a;
         try std.testing.expect(try cb.decoderRuntimeBeginFrame());
         defer cb.decoderRuntimeCancelFrame() catch {};
-        const output = try plan.replay(&cb, &.{x});
+        const output = try plan.replay(&cb, &.{x}, .{});
         defer cb.free(output);
         try cb.decoderRuntimeSubmitAndWaitFrame();
         const got = try cb.toFloat32(output, a);

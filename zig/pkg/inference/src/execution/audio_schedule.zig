@@ -505,11 +505,11 @@ pub const Plan = struct {
         return .{ .outputs_bytes = outputs, .input_workspace_bytes = scratch, .total_bytes = try std.math.add(usize, outputs, scratch) };
     }
 
-    pub fn replay(self: *Plan, cb: *const ops.ComputeBackend, inputs: []const CT) !CT {
+    pub fn replay(self: *Plan, cb: *const ops.ComputeBackend, inputs: []const CT, cleanup: @import("cleanup_context.zig").Context) !CT {
         var values: [capacity]?CT = @splat(null);
         var owned: [capacity]bool = @splat(false);
         defer for (values, owned) |value, own| {
-            if (own) cb.free(value.?);
+            if (own) cb.freeWithCleanup(value.?, cleanup);
         };
         for (inputs, 0..) |ct, i| values[i] = ct;
         for (self.constants[0..self.constant_count]) |c| {
@@ -529,23 +529,24 @@ pub const Plan = struct {
             if (!persistent) if (self.arena) |arena| if (try self.arena_recipe.outputView(node)) |region| {
                 if (cb.vtable.audioArenaView) |view| hint = try view(cb.ptr, arena, region.offset, region.bytes, region.shape);
             };
-            const result = node.run(cb, &values, hint, if (self.workspaces.len > i) self.workspaces[i] else null) catch |err| {
-                if (!persistent) if (hint) |ct| cb.free(ct);
+            const result = node.run(cb, &values, hint, if (self.workspaces.len > i) self.workspaces[i] else null, cleanup) catch |err| {
+                if (!persistent) if (hint) |ct| cb.freeWithCleanup(ct, cleanup);
                 return err;
             };
             if (!persistent) if (hint) |ct| if (result != ct) {
-                cb.free(ct);
+                cb.freeWithCleanup(ct, cleanup);
             };
             values[node.output] = result;
             owned[node.output] = !persistent or result != hint.?;
             for (node.inputs[0..node.input_count]) |id| {
                 if (id != self.output and self.last_use[id] == i and owned[id]) {
-                    cb.free(values[id].?);
+                    cb.freeWithCleanup(values[id].?, cleanup);
                     values[id] = null;
                     owned[id] = false;
                 }
             }
         }
+        try cb.checkExecutionControl();
         if (!owned[self.output]) return error.AudioScheduleInvalid;
         const output = values[self.output] orelse return error.AudioScheduleInvalid;
         owned[self.output] = false;
@@ -677,7 +678,7 @@ pub const Node = struct {
             else => null,
         };
     }
-    fn run(self: *const Node, cb: *const ops.ComputeBackend, values: *[capacity]?CT, hint: ?CT, workspace: ?CT) !CT {
+    fn run(self: *const Node, cb: *const ops.ComputeBackend, values: *[capacity]?CT, hint: ?CT, workspace: ?CT, cleanup: @import("cleanup_context.zig").Context) !CT {
         if (self.prepared_slot) |slot| if (cb.vtable.audioPreparedLinear) |linear| {
             const d = self.linearDimensions().?;
             const id = switch (self.args) {
@@ -710,7 +711,7 @@ pub const Node = struct {
             },
             .clippedLinear => |a| {
                 if (try cb.clippedLinear(values[a.input].?, values[a.weight].?, a.p)) |out| return out;
-                return stagedClippedLinear(cb, values[a.input].?, values[a.weight].?, a.p);
+                return stagedClippedLinear(cb, values[a.input].?, values[a.weight].?, a.p, cleanup);
             },
             .clampScalar => |a| {
                 return (try cb.vtable.clampScalar.?(cb.ptr, values[a.input].?, a.min_value, a.max_value)) orelse error.AudioScheduleRouteChanged;
@@ -805,30 +806,30 @@ test "audio schedule only publishes a value produced by the captured stage" {
 }
 
 /// A declining optional route must not invalidate a correctly recorded request.
-pub fn stagedClippedLinear(cb: *const ops.ComputeBackend, input: CT, weight: CT, p: ops.ClippedLinearParams) !CT {
+fn stagedClippedLinear(cb: *const ops.ComputeBackend, input: CT, weight: CT, p: ops.ClippedLinearParams, cleanup: @import("cleanup_context.zig").Context) !CT {
     const lo = if (p.flags & 1 != 0) @as(?f32, p.input_min) else null;
     const hi = if (p.flags & 2 != 0) @as(?f32, p.input_max) else null;
     const clipped = if (p.flags & 3 != 0) (try cb.clampScalar(input, lo, hi)) orelse return error.AudioScheduleRouteChanged else input;
-    defer if (clipped != input) cb.free(clipped);
+    defer if (clipped != input) cb.freeWithCleanup(clipped, cleanup);
     const result = try cb.linearNoBias(clipped, weight, p.rows, p.in_dim, p.out_dim);
-    errdefer cb.free(result);
+    errdefer cb.freeWithCleanup(result, cleanup);
     const omin = if (p.flags & 4 != 0) @as(?f32, p.output_min) else null;
     const omax = if (p.flags & 8 != 0) @as(?f32, p.output_max) else null;
     if (p.flags & 16 != 0) {
         if (try cb.clampSilu(result, omin, omax)) |out| {
-            cb.free(result);
+            cb.freeWithCleanup(result, cleanup);
             return out;
         }
     }
     const bounded = if (p.flags & 12 != 0) (try cb.clampScalar(result, omin, omax)) orelse return error.AudioScheduleRouteChanged else result;
     if (p.flags & 16 != 0) {
-        errdefer if (bounded != result) cb.free(bounded);
+        errdefer if (bounded != result) cb.freeWithCleanup(bounded, cleanup);
         const out = try cb.silu(bounded);
-        if (bounded != result) cb.free(bounded);
-        cb.free(result);
+        if (bounded != result) cb.freeWithCleanup(bounded, cleanup);
+        cb.freeWithCleanup(result, cleanup);
         return out;
     }
-    if (bounded != result) cb.free(result);
+    if (bounded != result) cb.freeWithCleanup(result, cleanup);
     return bounded;
 }
 

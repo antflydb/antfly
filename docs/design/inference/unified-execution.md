@@ -813,6 +813,12 @@ without the option. In semantic checks, both engines recovered the invoice
 number and amount, transcribed the audio, and named the video colors in order.
 All four semantic response strings matched llama.cpp on each backend.
 
+At `3d6872cceb`, the production Metal server admitted the prepared 35-layer
+prefill plan for each of the four E2B prompts and matched the four llama.cpp
+responses with a 64-token semantic allowance. A separate MP4 with an embedded
+speech track failed the transcription fixture on both servers. The video
+latency measurements above cover frame processing on a silent clip.
+
 A separate four-sample CUDA trial using the explicit BF16 donor plan measured
 897, 620, 300 and 624 ms in the same order. The trial kept the text, image and
 video response bytes from the ordinary route. The audio response changed an
