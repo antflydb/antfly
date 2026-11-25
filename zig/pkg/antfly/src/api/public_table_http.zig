@@ -205,6 +205,7 @@ pub const TableApi = struct {
         EmbedRateLimited,
         EmbedTransientFailure,
         EmbedUpstreamFailure,
+        InferenceAttributionDenied,
         RerankRateLimited,
         RerankTransientFailure,
         RerankUpstreamFailure,
@@ -2172,6 +2173,7 @@ pub fn handleTableQueryRequest(
             error.ValueSearchRequiresScan => return try queryDependencyErrorOwnedResponse(alloc, 422, "value_verification_requires_scan", "no compatible indexed candidate plan; explicitly permit scans with execution.value_verification.allow_scan", false),
             error.ValueSearchLimitExceeded => return try queryDependencyErrorOwnedResponse(alloc, 422, "value_verification_limit_exceeded", "logical value search exceeded its verification budget", false),
             error.DecisionLimitExceeded => return try queryDependencyErrorOwnedResponse(alloc, 422, "decision_limit_exceeded", "decision evaluation budget exceeded", false),
+            error.InferenceAttributionDenied => return try queryDependencyErrorOwnedResponse(alloc, 403, "inference_attribution_denied", "inference attribution denied", false),
             error.RerankRateLimited => {
                 return try queryDependencyErrorOwnedResponse(alloc, 429, "reranker_rate_limited", "reranker rate limited", true);
             },

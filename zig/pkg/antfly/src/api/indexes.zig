@@ -556,7 +556,15 @@ pub fn validateArtifactEnrichmentsForTableIndexesJson(
     alloc: std.mem.Allocator,
     indexes_json: []const u8,
 ) !void {
-    const enrichments = try collectArtifactEnrichmentsFromTableIndexesJson(alloc, indexes_json);
+    return validateArtifactEnrichmentsForTableIndexesJsonWithOptions(alloc, indexes_json, .{});
+}
+
+pub fn validateArtifactEnrichmentsForTableIndexesJsonWithOptions(
+    alloc: std.mem.Allocator,
+    indexes_json: []const u8,
+    options: managed_embedder.InitOptions,
+) !void {
+    const enrichments = try collectArtifactEnrichmentsFromTableIndexesJsonWithOptions(alloc, indexes_json, options);
     defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
     try validateArtifactEnrichmentConfigs(alloc, enrichments);
 

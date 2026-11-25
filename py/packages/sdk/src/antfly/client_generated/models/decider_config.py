@@ -46,9 +46,11 @@ class DeciderConfig:
         probabilities (ConstrainedProbabilities | Unset): Token probabilities require complete decoder evidence for the
             allowed values. Verdict-only is explicit opt-in; model-reported confidence is never used.
         batch (ConstrainedGenerationBatch | Unset):
-        model (str | Unset): Required for Antfly, OpenAI, and Cloudflare; Jev defaults to jev-latest. Cloudflare uses
-            @cf/cloudflare/clef or @cf/cloudflare/clef-flash.
-        account_id (str | Unset): Required with the cloudflare provider; Workers AI account identifier.
+        model (str | Unset): Required for Antfly, OpenAI, and Cloudflare; Jev defaults to jev-latest. Typed deciders may
+            select a connection-qualified model with models.decide. Cloudflare uses @cf/cloudflare/clef or
+            @cf/cloudflare/clef-flash.
+        account_id (str | Unset): Workers AI account identifier. Required for a direct Cloudflare model. A connection-
+            qualified model takes it from its connection.
         gateway_id (str | Unset): Optional Cloudflare AI Gateway identifier.
         model_identity (str | Unset): Pin the exact EmbeddingGemma 2 assets and recipe. Requires embedding_similarity.
         embedder (str | Unset): Named dense embedder for provider-neutral embedding_similarity routing. Specify matching

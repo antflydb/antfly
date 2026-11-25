@@ -66,6 +66,10 @@ pub fn isPredictorDiscoveryPath(path: []const u8) bool {
 // Execution policy belongs to the logical invocation, independent of HTTP
 // headers and of whether its response goes to a socket or a batch envelope.
 const ExecutionOptions = struct {
+    provider_http_config: ?httpx.ClientConfig = null,
+    managed_generator_defaults: ?generating.GeneratorConfig = null,
+    managed_rewrite_instructions: ?[]const u8 = null,
+    managed_task_defaults: ?Json = null,
     response_delivery: enum { direct, buffered } = .direct,
     // A composite dictation holds one admission lease across recognition and cleanup.
     admission_held: bool = false,
@@ -173,7 +177,7 @@ pub fn session(server: anytype, ctx: *httpx.Context, principal: []const u8, meth
             return context.isCancellationRequested();
         }
     }.cancelled);
-    var result = connections.invokeInferenceConnectionWithRequest(a, &client, server.cfg.node_config, server.cfg.local_inference_connection_target, server.cfg.secret_store, connection, operation, body, cancel, ctx.application_deadline_ns orelse connections.inferenceInvocationDeadlineNs(), if (streaming) session_sink.sink() else .{}, method, .{ .attempt_observer = observeAttempt(ctx, null), .content_type = ctx.header("content-type") orelse "application/json", .query = if (raw_stream) ctx.request.uri.query else null, .body_source = if (raw_stream) transport.bodySource() else .{} }) catch |err| {
+    var result = connections.invokeInferenceConnectionWithRequest(a, &client, server.cfg.node_config, server.cfg.local_inference_connection_target, server.cfg.secret_store, connection, operation, body, cancel, ctx.application_deadline_ns orelse connections.inferenceInvocationDeadlineNs(), if (streaming) session_sink.sink() else .{}, method, .{ .attribution_principal = attributionPrincipal(ctx), .attribution_scope = attributionScope(ctx), .request_id = observation.request_id, .shared_attempt_sequence = providerAttemptSequence(ctx), .backend_model = observation.backend_model, .stream_observation = if (streaming) &observation else null, .attempt_observer = observeAttempt(ctx, null), .content_type = ctx.header("content-type") orelse "application/json", .query = if (raw_stream) ctx.request.uri.query else null, .body_source = if (raw_stream) transport.bodySource() else .{} }) catch |err| {
         observation.failure = @errorName(err);
         if (transport.started) return error.InferenceResponseCommitted;
         return err;
@@ -287,10 +291,13 @@ pub fn disabledResponse(ctx: *httpx.Context) !httpx.Response {
 const InvocationState = struct {
     allocator: std.mem.Allocator,
     request_id: ?[]u8 = null,
+    attribution_principal: ?[]u8 = null,
+    attribution_scope: ?sources.common_config.InferenceAttributionScope = null,
     // A transport that began sending may have submitted billable work. This is not an
     // acknowledgement of completion, billing, or successful cancellation.
     submitted: std.atomic.Value(bool) = .init(false),
     uncertain: std.atomic.Value(bool) = .init(false),
+    provider_attempt_sequence: std.atomic.Value(u32) = .init(1),
     fn mark(raw: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         self.submitted.store(true, .release);
@@ -298,6 +305,11 @@ const InvocationState = struct {
     fn destroy(raw: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (self.request_id) |id| self.allocator.free(id);
+        if (self.attribution_principal) |name| self.allocator.free(name);
+        if (self.attribution_scope) |scope| {
+            self.allocator.free(scope.tenant);
+            if (scope.project) |project| self.allocator.free(project);
+        }
         self.allocator.destroy(self);
     }
 };
@@ -305,6 +317,36 @@ const invocation_state_key = "antfly.inference.invocation";
 fn invocationState(ctx: *const httpx.Context) ?*InvocationState {
     return @ptrCast(@alignCast(ctx.getData(invocation_state_key)));
 }
+/// Called only after request authentication and before any batch items start.
+pub fn setAttributionPrincipal(ctx: *httpx.Context, username: []const u8, metadata_json: []const u8) !void {
+    const state = invocationState(ctx) orelse return;
+    if (state.attribution_principal != null) return;
+    state.attribution_principal = try state.allocator.dupe(u8, username);
+    var arena = std.heap.ArenaAllocator.init(state.allocator);
+    defer arena.deinit();
+    const scope = (try sources.common_config.inferenceScopeFromAuthenticatedMetadata(arena.allocator(), metadata_json)) orelse return;
+    const tenant = try state.allocator.dupe(u8, scope.tenant);
+    errdefer state.allocator.free(tenant);
+    state.attribution_scope = .{
+        .tenant = tenant,
+        .project = if (scope.project) |project| try state.allocator.dupe(u8, project) else null,
+    };
+}
+
+fn providerAttemptSequence(ctx: *const httpx.Context) ?*std.atomic.Value(u32) {
+    return if (invocationState(ctx)) |state| &state.provider_attempt_sequence else null;
+}
+
+pub fn attributionPrincipal(ctx: *const httpx.Context) ?[]const u8 {
+    const state = invocationState(ctx) orelse return null;
+    return state.attribution_principal;
+}
+
+pub fn attributionScope(ctx: *const httpx.Context) ?sources.common_config.InferenceAttributionScope {
+    const state = invocationState(ctx) orelse return null;
+    return state.attribution_scope;
+}
+
 pub fn observeAttempt(ctx: *httpx.Context, delegate: ?httpx.AttemptObserver) httpx.AttemptObserver {
     var result = delegate orelse httpx.AttemptObserver{
         .ptr = ctx,
@@ -443,12 +485,24 @@ fn generatedSelector(task: gateway.Task, request: Json) !?[]const u8 {
 fn executeGenerated(server: anytype, ctx: *httpx.Context, task: gateway.Task, a: std.mem.Allocator, request: Json, model: []const u8, options: ExecutionOptions) !httpx.Response {
     const named = try view(server);
     const raw_models = if (std.mem.indexOfScalar(u8, model, '/') == null or named.contains(.generate, model)) try localModels(a, server, .generate) else &.{};
-    const target = try named.resolve(.generate, model, raw_models);
+    var target = try named.resolve(.generate, model, raw_models);
     var destination: []const u8 = if (server.cfg.local_inference_connection_target != null) sources.common_config.local_inference_connection_id else sources.common_config.default_inference_connection_id;
     var backend: []const u8 = undefined;
     var endpoint: ?[]const u8 = null;
     var api_key: ?[]const u8 = null;
     var generator = request.object.get("generator").?;
+    var adapted = request;
+    if (target == .configured and !target.configured.chain) {
+        const cfg = try named.providers.getGeneratorConfig(target.configured.name);
+        if (try managedGeneratorTarget(named, cfg, task)) |physical| {
+            if (cfg.rate_limit != null or cfg.max_completion_tokens != null or cfg.tools_json != null or
+                cfg.tool_choice_json != null or cfg.response_format_json != null or cfg.logprobs)
+                return error.UnsupportedInferenceFeature;
+            try applyManagedGenerationDefaults(a, cfg, &generator);
+            try adapted.object.put(a, "generator", generator);
+            target = physical;
+        }
+    }
     switch (target) {
         .local => |local| {
             if (local.explicit and server.cfg.local_inference_connection_target == null) return error.ModelNotFound;
@@ -456,7 +510,10 @@ fn executeGenerated(server: anytype, ctx: *httpx.Context, task: gateway.Task, a:
         },
         .connection => |connection| {
             if (server.cfg.node_config) |config| if (config.connections.get(connection.connection)) |configured| {
-                if (configured.kind != .inference or configured.inference == null or !std.mem.eql(u8, configured.inference.?.provider, "antfly")) return error.UnsupportedInferenceFeature;
+                if (configured.kind != .inference or configured.inference == null) return error.UnsupportedInferenceFeature;
+                if (!std.mem.eql(u8, configured.inference.?.provider, "antfly")) {
+                    return executeVendorConstrained(server, ctx, task, a, adapted, model, named, target, configured);
+                }
             };
             backend = connection.model;
             destination = connection.connection;
@@ -476,7 +533,6 @@ fn executeGenerated(server: anytype, ctx: *httpx.Context, task: gateway.Task, a:
         },
     }
     try generator.object.put(a, "model", .{ .string = backend });
-    var adapted = request;
     try adapted.object.put(a, "generator", generator);
     const encoded = try std.json.Stringify.valueAlloc(a, adapted, .{});
     var observation = tasks.Observation{
@@ -496,6 +552,97 @@ fn executeGenerated(server: anytype, ctx: *httpx.Context, task: gateway.Task, a:
         observation.failure = @errorName(err);
         return err;
     };
+}
+
+fn executeVendorConstrained(server: anytype, ctx: *httpx.Context, task: gateway.Task, a: std.mem.Allocator, request: Json, model: []const u8, named: gateway.View, target: gateway.Target, connection: sources.common_config.Config.ConnectionConfig) !httpx.Response {
+    try sources.common_config.validateInferenceModelPath(target.connection.model);
+    try sources.common_config.requireInferenceCapability(connection.capabilities, if (task == .decide) "models.decide" else "models.extract");
+    const cfg = connection.inference.?;
+    const library = @import("antfly_generating");
+    const provider = std.meta.stringToEnum(library.Provider, cfg.provider) orelse return error.UnsupportedInferenceFeature;
+    switch (provider) {
+        .openai, .anthropic, .bedrock, .cloudflare, .gemini, .vertex => {},
+        else => return error.UnsupportedInferenceFeature,
+    }
+    const default_url = if (cfg.url == null) if (provider == .cloudflare)
+        try defaultCloudflareTaskURL(a, .generate, cfg.account_id orelse return error.InvalidConfig, target.connection.model)
+    else
+        try defaultVendorGenerationURL(a, cfg.provider, cfg.region) else null;
+    const url = cfg.url orelse default_url orelse return error.ConnectionURLMissing;
+    if (!sources.common_config.validInferenceURL(url)) return error.InvalidConnectionURL;
+    if (!server.tryAcquireInference()) return error.InferenceCapacityUnavailable;
+    defer server.releaseInference();
+
+    const supplied = request.object.get("generator").?;
+    try only(supplied, &.{ "model", "max_tokens", "temperature", "top_p", "top_k", "frequency_penalty", "presence_penalty" });
+    var generator: Json = .{ .object = try supplied.object.clone(a) };
+    try generator.object.put(a, "provider", .{ .string = cfg.provider });
+    try generator.object.put(a, "model", .{ .string = target.connection.model });
+    try generator.object.put(a, "url", .{ .string = url });
+    inline for (.{ "api_key", "workspace_id", "region", "project_id", "location", "credentials_path", "account_id", "gateway_id" }) |field| if (@field(cfg, field)) |value| {
+        try generator.object.put(a, field, .{ .string = value });
+    };
+
+    var attempts = tasks.ProviderAttempts{
+        .shared_sequence = providerAttemptSequence(ctx),
+        .request_id = ctx.response.headers.get("x-request-id") orelse try requestId(server, ctx, a),
+        .connection = target.connection.connection,
+        .task = @tagName(task),
+        .model = target.connection.model,
+        .billing_principal = if (cfg.attribution != null) attributionPrincipal(ctx) else null,
+        .billing_scope = sources.common_config.InferenceAttributionIdentity.billingScope(sources.common_config.authenticatedInferenceAttribution(cfg.attribution, attributionPrincipal(ctx), attributionScope(ctx))),
+    };
+    const transport = try cfg.clientConfigForIdentityWithDefaultURL(a, server.cfg.secret_store, .{
+        .keep_alive = false,
+        .attempt_result_observer = attempts.observer(),
+    }, sources.common_config.authenticatedInferenceAttribution(cfg.attribution, attributionPrincipal(ctx), attributionScope(ctx)), default_url);
+    var client = httpx.Client.initWithConfig(std.heap.smp_allocator, server.inferenceIo(), transport);
+    defer client.deinit();
+    const executor = executorFor(server, ctx, &client, named, null);
+    if (task == .decide) {
+        const parsed = @import("antfly_decisions").generated.parseRequest(a, request) catch |err| switch (err) {
+            error.InvalidDecideRequest, error.DecideRequestLimitExceeded => return error.InvalidDecisionSpecification,
+            else => return err,
+        };
+        var scoped_registry = registry.Registry.init(a);
+        defer scoped_registry.deinit();
+        var generator_config = try library.parseConfigFromValue(a, generator);
+        defer generator_config.deinit(a);
+        const name = "connection-decision";
+        try scoped_registry.registerDeciderConfig(name, .{
+            .decision_method = .generated,
+            .generator = generator_config,
+            .output = parsed.output,
+            .probabilities = parsed.probabilities,
+            .batch = parsed.batch,
+            .instructions = parsed.instructions,
+            .max_image_input_tokens = cfg.max_image_input_tokens,
+        });
+        var scoped_executor = executor;
+        scoped_executor.view.providers = &scoped_registry;
+        scoped_executor.use_scoped_provider_http = true;
+        var effective: Json = .{ .object = .empty };
+        try effective.object.put(a, "questions", parsed.questions);
+        const input_field = if (parsed.batched) "inputs" else "input";
+        try effective.object.put(a, input_field, request.object.get(input_field).?);
+        var result = try scoped_executor.decideRequest(a, name, effective);
+        try result.object.put(a, "model", .{ .string = model });
+        return ctx.json(result);
+    }
+    var runtime = tasks.ConstrainedRuntime{
+        .http = &client,
+        .options = .{
+            .provider_runtime = &server.embedding_provider_runtime,
+            .secret_store = server.cfg.secret_store,
+            .request_context = executor.context,
+            .limits = server.embedding_provider_runtime.limits,
+        },
+        .cache = &server.embedding_provider_runtime.remote_capability_cache,
+    };
+    const body = try runtime.extract(a, request, generator, model);
+    try ctx.setHeader("content-type", "application/json");
+    _ = ctx.response.body(body);
+    return ctx.response.build();
 }
 
 fn executeResolved(server: anytype, ctx: *httpx.Context, task: gateway.Task, a: std.mem.Allocator, request: Json, named: gateway.View, target: gateway.Target, generator_override: ?generating.GeneratorConfig, fallback: bool, attempt: u8, options: ExecutionOptions) anyerror!httpx.Response {
@@ -525,13 +672,145 @@ fn executeResolved(server: anytype, ctx: *httpx.Context, task: gateway.Task, a: 
     return response;
 }
 
+fn managedGeneratorTarget(named: gateway.View, cfg: generating.GeneratorConfig, task: gateway.Task) !?gateway.Target {
+    const ref = (try sources.common_config.InferenceModelReference.parse(cfg.model)) orelse return null;
+    const connections_map = named.connections orelse return error.ConnectionNotFound;
+    const connection = try sources.common_config.resolveInferenceConnection(connections_map, ref.connection, switch (task) {
+        .generate => "models.generate",
+        .decide => "models.decide",
+        .extract => "models.extract",
+        .rewrite => "models.rewrite",
+        else => return error.UnsupportedInferenceFeature,
+    });
+    if (!std.mem.eql(u8, connection.provider, @tagName(cfg.provider))) return error.ModelTaskMismatch;
+    if (cfg.url.len != 0 or cfg.api_key != null or cfg.workspace_id != null or cfg.region != null or cfg.project_id != null or
+        cfg.location != null or cfg.credentials_path != null or cfg.account_id != null or cfg.gateway_id != null or cfg.connection_id != null or
+        cfg.capability_token != null or cfg.capability_revision != null)
+        return error.InvalidInferenceRequest;
+    return .{ .connection = .{ .task = task, .connection = ref.connection, .model = ref.model } };
+}
+
+fn applyManagedGenerationDefaults(a: std.mem.Allocator, cfg: generating.GeneratorConfig, request: *Json) !void {
+    inline for (.{ "temperature", "top_p", "top_k", "frequency_penalty", "presence_penalty" }) |field| {
+        if (!request.object.contains(field)) if (@field(cfg, field)) |value| {
+            try request.object.put(a, field, try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, value, .{}), .{}));
+        };
+    }
+    if (!request.object.contains("max_tokens")) try request.object.put(a, "max_tokens", .{ .integer = cfg.max_tokens });
+}
+
+const ManagedTaskTarget = struct {
+    target: gateway.Target,
+    defaults: Json,
+};
+
+fn managedTaskTarget(a: std.mem.Allocator, named: gateway.View, task: gateway.Task, cfg: anytype, selected_model: ?[]const u8) !?ManagedTaskTarget {
+    const ref = (try sources.common_config.InferenceModelReference.parse(selected_model orelse return null)) orelse return null;
+    const available = named.connections orelse return error.ConnectionNotFound;
+    const capability = try std.fmt.allocPrint(a, "models.{s}", .{@tagName(task)});
+    const connection = try sources.common_config.resolveInferenceConnection(available, ref.connection, capability);
+    var defaults = try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, cfg, .{ .emit_null_optional_fields = false }), .{});
+    const provider = try string(defaults.object.get("provider") orelse return error.InvalidConfig);
+    if (!std.mem.eql(u8, connection.provider, provider)) return error.ModelTaskMismatch;
+    for ([_][]const u8{ "url", "api_url", "base_url", "api_key", "bearer_token", "account_id", "gateway_id", "project_id", "location", "credentials_path", "capability_revision", "capability_token", "model_id" }) |field| {
+        if (defaults.object.get(field)) |value| {
+            if (value != .string or value.string.len != 0) return error.InvalidInferenceRequest;
+            _ = defaults.object.swapRemove(field);
+        }
+    }
+    return .{
+        .target = .{ .connection = .{ .task = task, .connection = ref.connection, .model = ref.model } },
+        .defaults = defaults,
+    };
+}
+
 fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task, a: std.mem.Allocator, raw_request: Json, named: gateway.View, target: gateway.Target, generator_override: ?generating.GeneratorConfig, fallback: bool, observation: *tasks.Observation, execution_options: ExecutionOptions) anyerror!httpx.Response {
     var request = raw_request;
     const model = try string(request.object.get("model") orelse return error.ModelRequired);
+    if (task == .generate and target == .configured) {
+        const cfg = generator_override orelse try named.providers.getGeneratorConfig(target.configured.name);
+        if (try managedGeneratorTarget(named, cfg, .generate)) |physical| {
+            const prepared = try prepareGeneration(a, cfg, request, execution_options.operation orelse "generate");
+            try named.capabilities(target).require(prepared.requirements);
+            var options = execution_options;
+            options.managed_generator_defaults = cfg;
+            observation.connection = physical.connection.connection;
+            observation.backend_model = physical.connection.model;
+            observation.executor = "connection";
+            if (cfg.provider == .antfly) {
+                if (cfg.rate_limit != null or cfg.max_completion_tokens != null) return error.UnsupportedInferenceFeature;
+                try applyManagedGenerationDefaults(a, cfg, &request);
+            }
+            return executeResolvedImpl(server, ctx, task, a, request, named, physical, null, fallback, observation, options);
+        }
+    }
+    if (task == .rewrite and target == .configured) {
+        const binding = named.providers.rewriter_configs.get(target.configured.name) orelse return error.ModelNotFound;
+        if (binding.generator) |generator_name| {
+            const cfg = try named.providers.getGeneratorConfig(generator_name);
+            if (try managedGeneratorTarget(named, cfg, .rewrite)) |physical| {
+                var options = execution_options;
+                options.managed_generator_defaults = cfg;
+                options.managed_rewrite_instructions = binding.instructions;
+                observation.connection = physical.connection.connection;
+                observation.backend_model = physical.connection.model;
+                observation.executor = "connection";
+                return executeResolvedImpl(server, ctx, task, a, request, named, physical, null, fallback, observation, options);
+            }
+        }
+    }
+    if (target == .configured and target.configured.task == task) {
+        const name = target.configured.name;
+        const managed = switch (task) {
+            .read => blk: {
+                const cfg = try (named.readers orelse return error.ModelNotFound).getConfig(name);
+                break :blk try managedTaskTarget(a, named, task, cfg, cfg.model);
+            },
+            .transcribe => blk: {
+                const cfg = try (named.transcribers orelse return error.ModelNotFound).getConfig(name);
+                break :blk try managedTaskTarget(a, named, task, cfg, cfg.model);
+            },
+            .synthesize => blk: {
+                const cfg = try (named.synthesizers orelse return error.ModelNotFound).getConfig(name);
+                break :blk try managedTaskTarget(a, named, task, cfg, cfg.model);
+            },
+            .rerank => blk: {
+                const cfg = try named.providers.getRerankerConfig(name);
+                break :blk try managedTaskTarget(a, named, task, cfg, cfg.model);
+            },
+            else => null,
+        };
+        if (managed) |resolved| {
+            var options = execution_options;
+            options.managed_task_defaults = resolved.defaults;
+            observation.connection = resolved.target.connection.connection;
+            observation.backend_model = resolved.target.connection.model;
+            observation.executor = "connection";
+            if (std.mem.eql(u8, resolved.defaults.object.get("provider").?.string, "antfly")) {
+                // The native task receives its normal projected request options.
+                switch (task) {
+                    .read => {
+                        var cfg = try named.readers.?.getConfig(name);
+                        cfg.model = resolved.target.connection.model;
+                        request = try std.json.parseFromSliceLeaky(Json, a, try tasks.readingBody(a, cfg, request), .{});
+                    },
+                    .transcribe => {
+                        var cfg = try named.transcribers.?.getConfig(name);
+                        cfg.model = resolved.target.connection.model;
+                        request = try std.json.parseFromSliceLeaky(Json, a, try tasks.transcriptionBody(a, cfg, request), .{});
+                    },
+                    else => {},
+                }
+            }
+            return executeResolvedImpl(server, ctx, task, a, request, named, resolved.target, null, fallback, observation, options);
+        }
+    }
     if (target == .connection) if (server.cfg.node_config) |config| if (config.connections.get(target.connection.connection)) |connection| {
         if (connection.kind != .inference) return error.ConnectionNotInference;
         const cfg = connection.inference orelse return error.InvalidInferenceRequest;
-        if (!std.mem.eql(u8, cfg.provider, "antfly")) return executeVendorConnection(server, ctx, task, a, request, named, target, connection, fallback, observation, execution_options);
+        if (task == .rewrite and execution_options.managed_generator_defaults != null and std.mem.eql(u8, cfg.provider, "antfly") and cfg.url == null)
+            return error.ConnectionURLMissing;
+        if (!std.mem.eql(u8, cfg.provider, "antfly") or (task == .rewrite and execution_options.managed_generator_defaults != null)) return executeVendorConnection(server, ctx, task, a, request, named, target, connection, fallback, observation, execution_options);
     };
     if (task == .read) if (try tasks.planReading(a, named, target, request)) |plan| {
         if (plan.local_only and server.cfg.local_inference_connection_target == null) return error.ModelNotFound;
@@ -599,7 +878,7 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
         // Raw runtime cleanup models retain their existing forwarding path.
         // Named cleanup generators use the same orchestration as Apple, so
         // Whisper can also clean up through Apple or a hosted generator.
-        if (cfg.provider == .antfly and !request.object.contains("transcript_text") and (cleanup_name == null or !named.contains(.generate, cleanup_name.?))) {
+        if (cfg.provider == .antfly and !request.object.contains("transcript_text") and (cleanup_name == null or (!named.contains(.generate, cleanup_name.?) and (try sources.common_config.InferenceModelReference.parse(cleanup_name.?)) == null))) {
             const operation = execution_options.operation orelse "dictate";
             const encoded = try tasks.transcriptionBody(a, cfg, request);
             return forward(server, ctx, try std.fmt.allocPrint(a, "transcribers/{s}", .{target.configured.name}), operation, encoded, false, observation, execution_options);
@@ -632,9 +911,12 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
     const caller_owns_admission = task != .transcribe and (if (generator_override) |cfg| !(cfg.provider == .antfly and cfg.url.len == 0 and server.antfly_provider != null and server.antfly_provider.?.owns_invocation_admission) else !try ownsLocalAdmission(server, named, target.configured.task, target.configured.name));
     if (caller_owns_admission and !server.tryAcquireInference()) return error.InferenceCapacityUnavailable;
     defer if (caller_owns_admission) server.releaseInference();
-    var client = httpx.Client.initWithConfig(a, server.inferenceIo(), .{ .keep_alive = false });
+    const scoped = execution_options.provider_http_config != null;
+    const client_config = execution_options.provider_http_config orelse httpx.ClientConfig{ .keep_alive = false };
+    var client = httpx.Client.initWithConfig(if (scoped) std.heap.smp_allocator else a, server.inferenceIo(), client_config);
     defer client.deinit();
-    const executor = executorFor(server, ctx, &client, named, generator_override);
+    var executor = executorFor(server, ctx, &client, named, generator_override);
+    executor.use_scoped_provider_http = scoped;
     const name = target.configured.name;
     switch (task) {
         .generate => {
@@ -845,7 +1127,7 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
                 if (executor.inference_api_url) |url| cfg.url = try gateway.apiBaseAlloc(a, url);
                 cfg.api_key = cfg.api_key orelse executor.inference_api_key;
             }
-            const scores = try @import("../reranking/mod.zig").rerankContentWithOptions(a, if (cfg.provider == .cloudflare) try server.embedding_provider_runtime.httpClient() else &client, cfg, .{
+            const scores = try @import("../reranking/mod.zig").rerankContentWithOptions(a, if (cfg.provider == .cloudflare and !scoped) try server.embedding_provider_runtime.httpClient() else &client, cfg, .{
                 .antfly_provider = server.antfly_provider,
                 .secret_store = server.cfg.secret_store,
                 .execution = .{ .default_endpoint = executor.inference_api_url },
@@ -875,7 +1157,8 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
             if (transcription_cfg.provider != .antfly and (value.transcript_prompt != null or value.vad != null or value.audio_context != null)) return error.UnsupportedInferenceFeature;
             const cleanup_name = configuredCleanupName(request) orelse "";
             const run_cleanup = cleanup_name.len > 0 and cleanup.needsCleanup(options);
-            if (run_cleanup) _ = try executor.generatorConfig(a, cleanup_name);
+            const cleanup_target = if (run_cleanup) try managedCleanupTarget(named, cleanup_name) else null;
+            if (run_cleanup and cleanup_target == null) _ = try executor.generatorConfig(a, cleanup_name);
             const attachment = try dictationAttachment(value.audio, execution_options.attachments);
             const transcript = if (value.transcript_text) |text| blk: {
                 if (value.audio.len != 0 or execution_options.attachments != null or text.len > 65536 or
@@ -931,7 +1214,18 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
                     .{ .role = .system, .content = .{ .text = try cleanup.buildSystemPrompt(a, options) } },
                     .{ .role = .user, .content = .{ .text = try cleanup.buildUserPrompt(a, raw) } },
                 };
-                var generated = admittedDictationCleanup(server, named, a, executor, cleanup_name, &messages, value.max_tokens orelse cleanup.suggestedMaxTokens(raw.len)) catch |err| {
+                var cleanup_executor = executor;
+                // Recognition and cleanup can target different provider connections.
+                var cleanup_client: ?httpx.Client = if (scoped)
+                    httpx.Client.initWithConfig(a, server.inferenceIo(), .{ .keep_alive = false })
+                else
+                    null;
+                defer if (cleanup_client) |*ordinary| ordinary.deinit();
+                if (cleanup_client) |*ordinary| {
+                    cleanup_executor.http = ordinary;
+                    cleanup_executor.use_scoped_provider_http = false;
+                }
+                var generated = admittedDictationCleanup(server, ctx, named, a, cleanup_executor, cleanup_name, cleanup_target, &messages, value.max_tokens orelse cleanup.suggestedMaxTokens(raw.len)) catch |err| {
                     if (writer) |*stream| {
                         try dictationEvent(a, stream, .{ .type = "error", .id = id, .@"error" = @errorName(err), .message = "Dictation cleanup failed; raw transcript is available." });
                         try stream.writeEvent(null, "[DONE]");
@@ -1014,6 +1308,8 @@ fn executorFor(server: anytype, ctx: *httpx.Context, client: *httpx.Client, name
         .inference_api_key = server.cfg.inference_api_key orelse server.cfg.node_config.?.inference.api_key,
         .secret_store = server.cfg.secret_store,
         .provider_runtime = &server.embedding_provider_runtime,
+        .attribution_principal = attributionPrincipal(ctx),
+        .attribution_scope = attributionScope(ctx),
     };
 }
 
@@ -1029,13 +1325,23 @@ fn embeddingIdentity(cfg: @import("antfly_embeddings").Config, request: Json) !?
 fn executeNativeEmbedding(server: anytype, ctx: *httpx.Context, a: std.mem.Allocator, request: Json, named: gateway.View, name: []const u8, observation: *tasks.Observation, options: ExecutionOptions) !httpx.Response {
     const cfg = try named.providers.getEmbedderConfig(name);
     const requested = try string(request.object.get("model").?);
+    const managed_reference = try sources.common_config.InferenceModelReference.parse(cfg.model);
+    if (managed_reference) |reference| {
+        const available = named.connections orelse return error.ConnectionNotFound;
+        const connection = try sources.common_config.resolveInferenceConnection(available, reference.connection, "models.embed");
+        if (!std.mem.eql(u8, connection.provider, "antfly")) return error.ModelTaskMismatch;
+        if (cfg.url.len != 0 or cfg.api_key != null or cfg.rate_limit != null) return error.InvalidInferenceRequest;
+        observation.connection = reference.connection;
+        observation.backend_model = reference.model;
+        observation.executor = "connection";
+    }
     const identity = try embeddingIdentity(cfg, request);
     const encoding = if (request.object.get("encoding_format")) |value| try string(value) else "float";
     const encoded_vectors = std.mem.eql(u8, encoding, "base64");
     if ((!encoded_vectors and !std.mem.eql(u8, encoding, "float")) or (encoded_vectors and (cfg.sparse orelse false))) return error.UnsupportedInferenceFeature;
     var adapted = request;
     if (encoded_vectors) try adapted.object.put(a, "encoding_format", .{ .string = "float" });
-    try adapted.object.put(a, "model", .{ .string = cfg.model });
+    try adapted.object.put(a, "model", .{ .string = if (managed_reference) |reference| reference.model else cfg.model });
     if (identity) |pin| try adapted.object.put(a, "model_identity", .{ .string = pin });
     if (!adapted.object.contains("dimensions")) if (cfg.dimensions orelse cfg.dimension) |dimensions| {
         try adapted.object.put(a, "dimensions", .{ .integer = dimensions });
@@ -1047,7 +1353,9 @@ fn executeNativeEmbedding(server: anytype, ctx: *httpx.Context, a: std.mem.Alloc
     var execution = options;
     execution.response_delivery = .buffered;
     var response: httpx.Response = undefined;
-    if (server.cfg.local_inference_connection_target != null and !sources.inference_managed_embedder.hasRemoteAntflyEndpoint(cfg, server.cfg.node_config.?.inference.api_url)) {
+    if (managed_reference) |reference| {
+        response = try forward(server, ctx, reference.connection, options.operation orelse "embeddings", body, false, observation, execution);
+    } else if (server.cfg.local_inference_connection_target != null and !sources.inference_managed_embedder.hasRemoteAntflyEndpoint(cfg, server.cfg.node_config.?.inference.api_url)) {
         if ((try sources.common_provider_limits.Policy.fromConfig(cfg.rate_limit)).enabled()) return error.UnsupportedLocalRateLimit;
         response = try forward(server, ctx, sources.common_config.local_inference_connection_id, options.operation orelse "embeddings", body, false, observation, execution);
     } else {
@@ -1089,49 +1397,268 @@ fn executeNativeEmbedding(server: anytype, ctx: *httpx.Context, a: std.mem.Alloc
     return ctx.json(value);
 }
 
+fn executeVendorNativeExtraction(server: anytype, ctx: *httpx.Context, a: std.mem.Allocator, request: Json, named: gateway.View, target: gateway.Target, cfg: sources.common_config.Config.InferenceConnectionConfig, observation: *tasks.Observation, execution: ExecutionOptions) !httpx.Response {
+    const extracting = @import("antfly_extracting");
+    const provider = std.meta.stringToEnum(extracting.Provider, cfg.provider) orelse return error.UnsupportedInferenceFeature;
+    if (provider != .cloudflare and provider != .pioneer) return error.UnsupportedInferenceFeature;
+    if (execution.attachments != null) return error.UnsupportedInferenceFeature;
+    try only(request, &.{ "model", "schema", "schema_version", "inputs", "options" });
+    const requested = request.object.get("inputs") orelse return error.InvalidInferenceRequest;
+    if (requested != .array or requested.array.items.len == 0 or requested.array.items.len > 128) return error.InvalidInferenceRequest;
+    const schema = request.object.get("schema") orelse return error.InvalidInferenceRequest;
+    if (schema != .object) return error.InvalidInferenceRequest;
+    const inputs = try a.alloc(extracting.Input, requested.array.items.len);
+    for (requested.array.items, inputs) |input, *out| {
+        try only(input, &.{ "id", "content" });
+        out.* = .{
+            .id = if (input.object.get("id")) |id| try string(id) else null,
+            .content_json = try std.json.Stringify.valueAlloc(a, input.object.get("content") orelse return error.InvalidInferenceRequest, .{}),
+        };
+    }
+    const default_url = if (cfg.url == null) switch (provider) {
+        .cloudflare => try defaultCloudflareTaskURL(a, .extract, cfg.account_id orelse return error.InvalidConfig, target.connection.model),
+        .pioneer => extracting.pioneer.default_url,
+        else => unreachable,
+    } else null;
+    const identity = sources.common_config.authenticatedInferenceAttribution(cfg.attribution, attributionPrincipal(ctx), attributionScope(ctx));
+    var attempts = tasks.ProviderAttempts{
+        .shared_sequence = providerAttemptSequence(ctx),
+        .request_id = observation.request_id,
+        .connection = target.connection.connection,
+        .task = "extract",
+        .model = target.connection.model,
+        .billing_principal = if (cfg.attribution != null) attributionPrincipal(ctx) else null,
+        .billing_scope = sources.common_config.InferenceAttributionIdentity.billingScope(identity),
+    };
+    const transport = try cfg.clientConfigForIdentityWithDefaultURL(a, server.cfg.secret_store, .{
+        .keep_alive = false,
+        .attempt_result_observer = attempts.observer(),
+    }, identity, default_url);
+    var client = httpx.Client.initWithConfig(std.heap.smp_allocator, server.inferenceIo(), transport);
+    defer client.deinit();
+    const control = executorFor(server, ctx, &client, named, null).context;
+    if (!server.tryAcquireInference()) return error.InferenceCapacityUnavailable;
+    defer server.releaseInference();
+    const api_key = if (cfg.api_key) |key| try sources.common_secrets.resolveReferenceOwned(a, server.cfg.secret_store, key) else null;
+    var response = try extracting.extractWithConfigAndOptions(a, &client, .{
+        .provider = provider,
+        .model = target.connection.model,
+        .url = cfg.url orelse default_url orelse return error.ConnectionURLMissing,
+        .api_key = api_key,
+        .account_id = cfg.account_id,
+        .gateway_id = cfg.gateway_id,
+    }, .{
+        .inputs = inputs,
+        .schema_json = try std.json.Stringify.valueAlloc(a, schema, .{}),
+        .options_json = if (request.object.get("options")) |options| try std.json.Stringify.valueAlloc(a, options, .{}) else "",
+        .schema_version = if (request.object.get("schema_version")) |version| std.math.cast(u32, try integer(version)) orelse return error.InvalidInferenceRequest else null,
+    }, .{
+        .timeout_ms = try control.remainingTimeoutMs(),
+        .cancellation = if (control.cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null,
+    });
+    defer response.deinit();
+    var result = try std.json.parseFromSliceLeaky(Json, a, response.json, .{});
+    if (result != .object) return error.InvalidInferenceResponse;
+    try result.object.put(a, "model", .{ .string = observation.requested });
+    return ctx.json(result);
+}
+
 fn executeVendorConnection(server: anytype, ctx: *httpx.Context, task: gateway.Task, a: std.mem.Allocator, request: Json, original: gateway.View, target: gateway.Target, connection: sources.common_config.Config.ConnectionConfig, fallback: bool, observation: *tasks.Observation, execution_options: ExecutionOptions) !httpx.Response {
     const cfg = connection.inference.?;
-    if (std.mem.indexOfAny(u8, target.connection.model, "?%#\\\r\n") != null) return error.InvalidModelIdentity;
-    var segments = std.mem.splitScalar(u8, target.connection.model, '/');
-    while (segments.next()) |segment| if (segment.len == 0 or std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) return error.InvalidModelIdentity;
-    const capability = try std.fmt.allocPrint(a, "models.{s}", .{if (task == .generate) "generate" else if (task == .embed) "embed" else if (task == .decide) "decide" else @tagName(task)});
-    try @import("connections.zig").requireInferenceCapability(connection.capabilities, capability);
+    try sources.common_config.validateInferenceModelPath(target.connection.model);
+    const capability = try std.fmt.allocPrint(a, "models.{s}", .{@tagName(task)});
+    try sources.common_config.requireInferenceCapability(connection.capabilities, capability);
     switch (task) {
-        .extract, .rewrite, .chunk, .predict => return error.UnsupportedInferenceFeature,
+        .extract => return executeVendorNativeExtraction(server, ctx, a, request, original, target, cfg, observation, execution_options),
+        .chunk, .predict => return error.UnsupportedInferenceFeature,
         else => {},
     }
+    const generation_task = task == .generate or task == .rewrite;
+    const cloudflare = std.mem.eql(u8, cfg.provider, "cloudflare");
+    const default_url = if (cfg.url == null) if (cloudflare)
+        try defaultCloudflareTaskURL(a, task, cfg.account_id orelse return error.InvalidConfig, target.connection.model)
+    else switch (task) {
+        .generate, .rewrite => try defaultVendorGenerationURL(a, cfg.provider, cfg.region),
+        .decide => defaultVendorDecisionURL(cfg.provider),
+        .rerank => defaultVendorRerankingURL(cfg.provider),
+        .read => defaultVendorReadingURL(cfg.provider),
+        .transcribe => defaultVendorTranscriptionURL(cfg.provider),
+        .synthesize => defaultVendorSynthesisURL(cfg.provider),
+        .embed => try sources.inference_managed_embedder.defaultConnectionEmbeddingURL(a, cfg.provider, cfg.location, cfg.region),
+        else => null,
+    } else null;
     // A request-owned overlay reuses the same typed vendor factories and quota
     // identities. It never mutates the instance registry or copies credentials
     // into a public catalog descriptor.
-    var provider: Json = .{ .object = .empty };
+    var provider: Json = if (generation_task and execution_options.managed_generator_defaults != null)
+        try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, @import("antfly_generating").openApiFromConfig(execution_options.managed_generator_defaults.?), .{ .emit_null_optional_fields = false }), .{})
+    else
+        execution_options.managed_task_defaults orelse .{ .object = .empty };
     try provider.object.put(a, "provider", .{ .string = cfg.provider });
     try provider.object.put(a, "model", .{ .string = target.connection.model });
-    if (cfg.url) |url| {
-        try provider.object.put(a, if (task == .read or task == .transcribe or task == .synthesize) "base_url" else "url", .{ .string = url });
+    if (cfg.url orelse default_url) |url| {
+        const key = if (task == .read or task == .transcribe or task == .synthesize)
+            "base_url"
+        else if (generation_task and std.mem.eql(u8, cfg.provider, "antfly"))
+            "api_url"
+        else
+            "url";
+        try provider.object.put(a, key, .{ .string = url });
     }
-    inline for (.{ "api_key", "project_id", "location", "credentials_path" }) |field| if (@field(cfg, field)) |value| {
+    inline for (.{ "api_key", "project_id", "location", "credentials_path", "account_id", "gateway_id" }) |field| if (@field(cfg, field)) |value| {
         try provider.object.put(a, field, .{ .string = value });
     };
-    if (task == .generate) if (cfg.workspace_id) |workspace| try provider.object.put(a, "workspace_id", .{ .string = workspace });
-    if (task == .embed or task == .generate) {
+    if (generation_task) if (cfg.workspace_id) |workspace| try provider.object.put(a, "workspace_id", .{ .string = workspace });
+    if (task == .embed or generation_task) {
         if (cfg.region) |value| try provider.object.put(a, "region", .{ .string = value });
         if (task == .embed) if (request.object.get("dimensions")) |value| try provider.object.put(a, "dimensions", value);
     }
     if (task == .decide or task == .generate) {
         if (cfg.max_image_input_tokens) |bound| try provider.object.put(a, "max_image_input_tokens", .{ .integer = std.math.cast(i64, bound) orelse return error.InvalidConfig });
     }
-    if (task == .rerank) try provider.object.put(a, "field", .{ .string = "text" });
+    if (task == .rerank and execution_options.managed_task_defaults == null) try provider.object.put(a, "field", .{ .string = "text" });
     var entries: Json = .{ .object = .empty };
     const name = "connection-target";
     try entries.object.put(a, name, provider);
     var root: Json = .{ .object = .empty };
-    try root.object.put(a, if (task == .synthesize) "text_to_speech" else task.namespace(), entries);
+    if (task == .rewrite) {
+        var binding: Json = .{ .object = .empty };
+        try binding.object.put(a, "generator", .{ .string = name });
+        if (execution_options.managed_rewrite_instructions) |instructions|
+            try binding.object.put(a, "instructions", .{ .string = instructions });
+        var rewriters: Json = .{ .object = .empty };
+        try rewriters.object.put(a, name, binding);
+        try root.object.put(a, "generators", entries);
+        try root.object.put(a, "rewriters", rewriters);
+    } else try root.object.put(a, if (task == .synthesize) "text_to_speech" else task.namespace(), entries);
     var config = try sources.common_config.Config.parseFromSlice(a, try std.json.Stringify.valueAlloc(a, root, .{}));
     defer config.deinit();
     const capability_key = try std.fmt.allocPrint(a, "{s}/{s}", .{ task.namespace(), name });
     try config.registry.inference_capabilities.put(a, capability_key, original.capabilities(target));
-    const named = gateway.View{ .providers = if (task == .transcribe) original.providers else &config.registry, .readers = &config.readers, .transcribers = &config.transcribers, .synthesizers = &config.text_to_speech };
-    return executeResolvedImpl(server, ctx, task, a, request, named, .{ .configured = .{ .task = task, .name = name } }, null, fallback, observation, execution_options);
+    const named = gateway.View{ .providers = if (task == .transcribe) original.providers else &config.registry, .connections = original.connections, .readers = &config.readers, .transcribers = &config.transcribers, .synthesizers = &config.text_to_speech };
+    var attempts = tasks.ProviderAttempts{
+        .shared_sequence = providerAttemptSequence(ctx),
+        .request_id = observation.request_id,
+        .connection = target.connection.connection,
+        .task = @tagName(task),
+        .model = target.connection.model,
+        .stream_observation = if (task == .generate) observation else null,
+        .billing_principal = if (cfg.attribution != null) attributionPrincipal(ctx) else null,
+        .billing_scope = sources.common_config.InferenceAttributionIdentity.billingScope(sources.common_config.authenticatedInferenceAttribution(cfg.attribution, attributionPrincipal(ctx), attributionScope(ctx))),
+    };
+    var options = execution_options;
+    const requires_policy = cfg.headers.count() != 0 or cfg.tls_ca_file != null or cfg.attribution != null or cfg.allow_private_ips != null;
+    if (requires_policy or cfg.url != null or default_url != null) {
+        options.provider_http_config = try cfg.clientConfigForIdentityWithDefaultURL(a, server.cfg.secret_store, .{
+            .keep_alive = false,
+            .attempt_result_observer = attempts.observer(),
+            .max_response_size = switch (task) {
+                .embed => sources.inference_managed_embedder.remote_embedding_max_response_bytes,
+                .read, .transcribe, .synthesize => 64 << 20,
+                else => httpx.types.default_max_body_size,
+            },
+        }, sources.common_config.authenticatedInferenceAttribution(cfg.attribution, attributionPrincipal(ctx), attributionScope(ctx)), default_url);
+    }
+    return executeResolvedImpl(server, ctx, task, a, request, named, .{ .configured = .{ .task = task, .name = name } }, null, fallback, observation, options);
+}
+
+fn defaultCloudflareTaskURL(a: std.mem.Allocator, task: gateway.Task, account: []const u8, model: []const u8) !?[]const u8 {
+    const routing = @import("antfly_generating").cloudflare;
+    return switch (task) {
+        .generate, .embed, .read, .rewrite => try routing.baseUrl(a, account, null),
+        .decide, .extract, .rerank, .transcribe, .synthesize => try routing.nativeUrl(a, account, model),
+        else => null,
+    };
+}
+
+test "managed Cloudflare operations resolve the adapter endpoint shape" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const model = "@cf/cloudflare/clef";
+    try std.testing.expectEqualStrings("https://api.cloudflare.com/client/v4/accounts/account/ai/v1", (try defaultCloudflareTaskURL(a, .embed, "account", model)).?);
+    try std.testing.expectEqualStrings("https://api.cloudflare.com/client/v4/accounts/account/ai/run/@cf/cloudflare/clef", (try defaultCloudflareTaskURL(a, .decide, "account", model)).?);
+    try std.testing.expectError(error.InvalidCloudflareConfig, defaultCloudflareTaskURL(a, .generate, "../account", model));
+}
+
+fn defaultVendorRerankingURL(provider_name: []const u8) ?[]const u8 {
+    const reranking = @import("../reranking/mod.zig");
+    const provider = std.meta.stringToEnum(reranking.Provider, provider_name) orelse return null;
+    return switch (provider) {
+        .cohere, .vertex => reranking.providerCapabilities(provider).default_url,
+        .antfly, .cloudflare => null,
+    };
+}
+
+fn defaultVendorReadingURL(provider_name: []const u8) ?[]const u8 {
+    const readers = @import("antfly_readers");
+    const provider = std.meta.stringToEnum(readers.Provider, provider_name) orelse return null;
+    return readers.defaultRemoteBaseUrl(provider);
+}
+
+fn defaultVendorTranscriptionURL(provider_name: []const u8) ?[]const u8 {
+    const transcribing = @import("antfly_transcribing");
+    const provider = std.meta.stringToEnum(transcribing.Provider, provider_name) orelse return null;
+    return switch (provider) {
+        .openai, .vertex => (transcribing.Config{ .provider = provider }).effectiveEndpoint(),
+        .antfly, .apple, .cloudflare => null,
+    };
+}
+
+fn defaultVendorSynthesisURL(provider_name: []const u8) ?[]const u8 {
+    const synthesizing = @import("antfly_synthesizing");
+    const provider = std.meta.stringToEnum(synthesizing.Provider, provider_name) orelse return null;
+    return synthesizing.defaultBaseUrl(provider);
+}
+
+test "inference gateway scopes vendor reranking, reading, and audio to adapter defaults" {
+    try std.testing.expectEqualStrings("https://api.cohere.com", defaultVendorRerankingURL("cohere").?);
+    try std.testing.expectEqualStrings("https://discoveryengine.googleapis.com/v1", defaultVendorRerankingURL("vertex").?);
+    try std.testing.expectEqualStrings("https://aiplatform.googleapis.com/v1", defaultVendorReadingURL("vertex").?);
+    try std.testing.expectEqualStrings("https://api.openai.com/v1", defaultVendorTranscriptionURL("openai").?);
+    try std.testing.expectEqualStrings("https://speech.googleapis.com/v2", defaultVendorTranscriptionURL("vertex").?);
+    try std.testing.expectEqual(@as(?[]const u8, null), defaultVendorTranscriptionURL("apple"));
+    try std.testing.expectEqualStrings("https://texttospeech.googleapis.com/v1", defaultVendorSynthesisURL("vertex").?);
+    try std.testing.expectEqualStrings("https://api.elevenlabs.io/v1", defaultVendorSynthesisURL("elevenlabs").?);
+}
+
+fn defaultVendorDecisionURL(provider_name: []const u8) ?[]const u8 {
+    const decisions = sources.functions_decisions;
+    const provider = std.meta.stringToEnum(decisions.Provider, provider_name) orelse return null;
+    return switch (provider) {
+        .jev, .openai => (decisions.DeciderConfig{ .provider = provider }).baseUrl(),
+        .antfly, .cloudflare => null,
+    };
+}
+
+test "inference gateway typed decision defaults use the decision adapter endpoints" {
+    try std.testing.expectEqualStrings("https://api.typesafe.ai", defaultVendorDecisionURL("jev").?);
+    try std.testing.expectEqualStrings("https://api.openai.com/v1", defaultVendorDecisionURL("openai").?);
+    try std.testing.expectEqual(@as(?[]const u8, null), defaultVendorDecisionURL("antfly"));
+    try std.testing.expectEqual(@as(?[]const u8, null), defaultVendorDecisionURL("anthropic"));
+}
+
+fn defaultVendorGenerationURL(arena: std.mem.Allocator, provider_name: []const u8, region: ?[]const u8) !?[]const u8 {
+    const library = @import("antfly_generating");
+    const provider = std.meta.stringToEnum(library.Provider, provider_name) orelse return null;
+    return switch (provider) {
+        .openai, .anthropic, .openrouter, .gemini, .ollama, .vertex => library.defaultUrl(provider),
+        .bedrock => blk: {
+            const env = @import("antfly_platform").env;
+            const defaults = @import("antfly_inference_provider_defaults");
+            break :blk try defaults.bedrockRuntimeEndpointAlloc(arena, "", region orelse env.getenv("AWS_REGION") orelse env.getenv("AWS_DEFAULT_REGION") orelse defaults.default_aws_region);
+        },
+        else => null,
+    };
+}
+
+test "inference gateway generation defaults resolve the configured service region" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("https://bedrock-runtime.eu-west-1.amazonaws.com", (try defaultVendorGenerationURL(a, "bedrock", "eu-west-1")).?);
+    try std.testing.expectEqualStrings("https://aiplatform.googleapis.com/v1", (try defaultVendorGenerationURL(a, "vertex", null)).?);
+    try std.testing.expect((try defaultVendorGenerationURL(a, "unknown", null)) == null);
 }
 
 const PreparedGeneration = struct {
@@ -1327,24 +1854,25 @@ test "httpx inference gateway image admission is independent of streaming and mo
 fn executeChain(server: anytype, ctx: *httpx.Context, a: std.mem.Allocator, request: Json, named: gateway.View, name: []const u8, options: ExecutionOptions) !httpx.Response {
     const links = try named.providers.getChain(name);
     if (links.len == 0 or links.len > 8) return error.InvalidInferenceRequest;
-    const configs = try a.alloc(generating.GeneratorConfig, links.len);
+    const candidates = try a.alloc(gateway.View.GenerationChainTarget, links.len);
     const original = try std.json.Stringify.valueAlloc(a, request, .{});
     // Retry storage must refund the same admission layers as the invocation,
     // rather than accumulating failed providers' base64 and JSON in its arena.
     const scratch = sources.sql_memory_budget.reclaimingAllocator(a);
     // Qualify every link through the same request adapter used for execution.
     // Each receives its own JSON tree because body adaptation mutates objects.
-    for (links, configs) |link, *cfg| {
+    for (links, candidates) |link, *binding| {
         var preflight = std.heap.ArenaAllocator.init(scratch);
         defer preflight.deinit();
         const p = preflight.allocator();
-        const qualified: gateway.Target = .{ .configured = .{ .task = .generate, .name = link.generator_name orelse name, .chain = link.generator_name == null } };
         const candidate = try std.json.parseFromSliceLeaky(Json, p, original, .{});
         // Store only registry-owned configuration. Request-derived options are
         // recreated by each attempt and cannot outlive preflight's arena.
-        cfg.* = link.generator_config orelse try named.providers.getGeneratorConfig(link.generator_name.?);
-        const prepared = try prepareGeneration(p, cfg.*, candidate, options.operation orelse "generate");
-        try named.capabilities(qualified).require(prepared.requirements);
+        binding.* = try named.generationChainTarget(name, link);
+        const cfg = binding.config;
+        if (binding.target == .configured) _ = try managedGeneratorTarget(named, cfg, .generate);
+        const prepared = try prepareGeneration(p, cfg, candidate, options.operation orelse "generate");
+        try named.capabilities(binding.target).require(prepared.requirements);
         if (cfg.provider != .cloudflare and cfg.provider != .openai and cfg.provider != .openrouter and cfg.provider != .ollama and cfg.provider != .antfly and cfg.provider != .gemini and cfg.provider != .vertex and cfg.provider != .bedrock and cfg.provider != .anthropic) return error.UnsupportedInferenceFeature;
     }
     const previous_deadline = ctx.application_deadline_ns;
@@ -1359,7 +1887,7 @@ fn executeChain(server: anytype, ctx: *httpx.Context, a: std.mem.Allocator, requ
     const budget = options.attempt_limit;
     var attempts = gateway.Attempts{ .deadline_ns = deadline, .remaining = budget };
     var failure: anyerror = error.InferenceUpstreamUnavailable;
-    for (links, configs, 0..) |link, cfg, index| {
+    for (links, candidates, 0..) |link, binding, index| {
         if (index != 0 and !gateway.permitsFallback(links[index - 1].condition, failure)) return failure;
         const count = @min(@as(u32, 8), if (link.retry) |retry| retry.max_attempts else 1);
         var backoff_ms: u32 = if (link.retry) |retry| retry.initial_backoff_ms else 0;
@@ -1382,8 +1910,8 @@ fn executeChain(server: anytype, ctx: *httpx.Context, a: std.mem.Allocator, requ
             defer attempt_arena.deinit();
             const attempt_allocator = attempt_arena.allocator();
             const candidate = try std.json.parseFromSliceLeaky(Json, attempt_allocator, original, .{});
-            const target: gateway.Target = .{ .configured = .{ .task = .generate, .name = link.generator_name orelse name, .chain = link.generator_name == null } };
-            return executeResolved(server, ctx, .generate, attempt_allocator, candidate, named, target, cfg, true, budget - attempts.remaining, options) catch |err| {
+            const override = if (binding.target == .configured) binding.config else null;
+            return executeResolved(server, ctx, .generate, attempt_allocator, candidate, named, binding.target, override, true, budget - attempts.remaining, options) catch |err| {
                 if (err == error.InferenceResponseCommitted) return err;
                 failure = err;
                 // Invalid requests, credentials, refusals and malformed output
@@ -1562,7 +2090,6 @@ fn predictorCatalog(a: std.mem.Allocator, server: anytype, control: @import("ant
 }
 
 fn predictorTransports(a: std.mem.Allocator, named: gateway.View, config: ?*const sources.common_config.Config, default_connection: []const u8) !std.StringArrayHashMapUnmanaged(Json) {
-    const connections = @import("connections.zig");
     // Select each transport once before doing I/O. Alias transports retain
     // priority; explicit connections share the same sixteen-transport ceiling.
     var transports: std.StringArrayHashMapUnmanaged(Json) = .{};
@@ -1576,7 +2103,7 @@ fn predictorTransports(a: std.mem.Allocator, named: gateway.View, config: ?*cons
         if (connection.kind != .inference) continue;
         const inference = connection.inference orelse continue;
         if (!std.mem.eql(u8, inference.provider, "antfly")) continue;
-        connections.requireInferenceCapability(connection.capabilities, "models.predict") catch continue;
+        sources.common_config.requireInferenceCapability(connection.capabilities, "models.predict") catch continue;
         if (!transports.contains(id)) try transports.put(a, id, .{ .object = .empty });
     };
     return transports;
@@ -1845,7 +2372,7 @@ fn forward(server: anytype, ctx: *httpx.Context, connection: []const u8, operati
         owned_client = httpx.Client.initWithConfig(ctx.allocator, server.inferenceIo(), .{ .keep_alive = false });
         break :blk &owned_client.?;
     };
-    var result = connections.invokeInferenceConnectionWithRequest(ctx.allocator, client, server.cfg.node_config, server.cfg.local_inference_connection_target, server.cfg.secret_store, connection, operation, encoded, cancellation, ctx.application_deadline_ns orelse connections.inferenceInvocationDeadlineNs(), if (options.response_delivery == .buffered) .{} else if (fallback) guard.sink() else observed, .post, .{ .content_type = if (options.attachments != null) httpx.attachment_envelope.content_type else "application/json", .attempt_observer = observeAttempt(ctx, options.attempt_observer) }) catch |err| {
+    var result = connections.invokeInferenceConnectionWithRequest(ctx.allocator, client, server.cfg.node_config, server.cfg.local_inference_connection_target, server.cfg.secret_store, connection, operation, encoded, cancellation, ctx.application_deadline_ns orelse connections.inferenceInvocationDeadlineNs(), if (options.response_delivery == .buffered) .{} else if (fallback) guard.sink() else observed, .post, .{ .attribution_principal = attributionPrincipal(ctx), .attribution_scope = attributionScope(ctx), .request_id = observation.request_id, .shared_attempt_sequence = providerAttemptSequence(ctx), .backend_model = observation.backend_model, .stream_observation = if (options.response_delivery == .buffered) null else observation, .content_type = if (options.attachments != null) httpx.attachment_envelope.content_type else "application/json", .attempt_observer = observeAttempt(ctx, options.attempt_observer) }) catch |err| {
         if (transport.started or guard.committed) return error.InferenceResponseCommitted;
         return guard.failure orelse err;
     };
@@ -2387,11 +2914,64 @@ fn dictationAttachment(audio: []const u8, attachments: ?[]const httpx.attachment
 
 /// Composite stages run sequentially and must never reserve a gateway slot
 /// while an embedded invocation reserves that same resource again.
-fn admittedDictationCleanup(server: anytype, named: gateway.View, a: std.mem.Allocator, executor: tasks.Executor, name: []const u8, messages: []const generating.ChatMessage, max_tokens: i64) !generating.GenerateResult {
-    const acquire = !try ownsLocalAdmission(server, named, .generate, name);
+const ManagedCleanupTarget = struct {
+    target: gateway.Target,
+    generator: generating.GeneratorConfig,
+};
+
+fn managedCleanupTarget(named: gateway.View, name: []const u8) !?ManagedCleanupTarget {
+    const generator = if (try sources.common_config.InferenceModelReference.parse(name)) |reference| blk: {
+        const available = named.connections orelse return error.ConnectionNotFound;
+        const connection = try sources.common_config.resolveInferenceConnection(available, reference.connection, "models.generate");
+        const provider = std.meta.stringToEnum(@FieldType(generating.GeneratorConfig, "provider"), connection.provider) orelse return error.UnsupportedInferenceFeature;
+        break :blk generating.GeneratorConfig{ .provider = provider, .model = name, .url = "" };
+    } else try named.providers.getGeneratorConfig(name);
+    const target = (try managedGeneratorTarget(named, generator, .generate)) orelse return null;
+    return .{ .target = target, .generator = generator };
+}
+
+fn admittedDictationCleanup(server: anytype, ctx: *httpx.Context, named: gateway.View, a: std.mem.Allocator, executor: tasks.Executor, name: []const u8, selected: ?ManagedCleanupTarget, messages: []const generating.ChatMessage, max_tokens: i64) !generating.GenerateResult {
+    const acquire = selected != null or !try ownsLocalAdmission(server, named, .generate, name);
     if (acquire and !server.tryAcquireInference()) return error.InferenceCapacityUnavailable;
     defer if (acquire) server.releaseInference();
-    return generateDictationCleanup(a, executor, name, messages, max_tokens);
+    const managed = selected orelse return generateDictationCleanup(a, executor, name, messages, max_tokens);
+    const ref = managed.target.connection;
+    const connection = try sources.common_config.resolveInferenceConnection(named.connections.?, ref.connection, "models.generate");
+    var cfg = managed.generator;
+    cfg.model = ref.model;
+    cfg.url = connection.url orelse (if (cfg.provider == .cloudflare)
+        try @import("antfly_generating").cloudflare.baseUrl(a, connection.account_id, null)
+    else
+        try defaultVendorGenerationURL(a, connection.provider, connection.region)) orelse return error.ConnectionURLMissing;
+    cfg.api_key = connection.api_key;
+    cfg.region = connection.region;
+    cfg.workspace_id = connection.workspace_id;
+    cfg.project_id = connection.project_id;
+    cfg.location = connection.location;
+    cfg.credentials_path = connection.credentials_path;
+    cfg.account_id = connection.account_id;
+    cfg.gateway_id = connection.gateway_id;
+    const identity = sources.common_config.authenticatedInferenceAttribution(connection.attribution, attributionPrincipal(ctx), attributionScope(ctx));
+    var attempts = tasks.ProviderAttempts{
+        .shared_sequence = providerAttemptSequence(ctx),
+        .request_id = if (invocationState(ctx)) |state| state.request_id orelse "" else "",
+        .connection = ref.connection,
+        .task = "dictation_cleanup",
+        .model = ref.model,
+        .billing_principal = if (connection.attribution != null) attributionPrincipal(ctx) else null,
+        .billing_scope = sources.common_config.InferenceAttributionIdentity.billingScope(identity),
+    };
+    const transport = try connection.clientConfigForIdentityWithDefaultURL(a, executor.secret_store, .{
+        .keep_alive = false,
+        .attempt_result_observer = attempts.observer(),
+    }, identity, cfg.url);
+    var http = httpx.Client.initWithConfig(std.heap.smp_allocator, server.inferenceIo(), transport);
+    defer http.deinit();
+    var scoped = executor;
+    scoped.http = &http;
+    scoped.use_scoped_provider_http = true;
+    scoped.generator_override = cfg;
+    return generateDictationCleanup(a, scoped, name, messages, max_tokens);
 }
 
 fn generateDictationCleanup(a: std.mem.Allocator, executor: tasks.Executor, name: []const u8, messages: []const generating.ChatMessage, max_tokens: i64) !generating.GenerateResult {

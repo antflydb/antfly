@@ -97,6 +97,12 @@ pub fn classifyCreateTableRequestError(err: anyerror) CreateTableRequestErrorDis
 }
 
 pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tables_api.CreateTableRequest {
+    return parseCreateTableRequestWithOptions(alloc, body, .{});
+}
+
+const EmbeddingInitOptions = @import("antfly_local_sources").inference_managed_embedder.InitOptions;
+
+pub fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8, embedding_options: EmbeddingInitOptions) !tables_api.CreateTableRequest {
     if (body.len == 0) return .{ .indexes_json = try coverage_policy.withMissingIncarnationsAlloc(alloc, tables_api.default_indexes_json) };
     if (try @import("relational_index/mutation.zig").normalizeCreateTableBody(alloc, body)) |normalized| {
         defer alloc.free(normalized);
@@ -181,6 +187,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
             try validateCreateTableIndexSemantics(
                 alloc,
                 fallback.indexes_json orelse tables_api.default_indexes_json,
+                embedding_options,
             );
             try @import("antfly_local_sources").schema_relational_index_namespace.validate(alloc, fallback.schema_json orelse "", fallback.indexes_json orelse tables_api.default_indexes_json);
             return fallback;
@@ -211,7 +218,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
     } else {
         req.indexes_json = try coverage_policy.withMissingIncarnationsAlloc(alloc, implicit_indexes);
     }
-    try validateCreateTableIndexSemantics(alloc, req.indexes_json.?);
+    try validateCreateTableIndexSemantics(alloc, req.indexes_json.?, embedding_options);
 
     // The generated scalar parser and artifact validators use machine
     // numbers. Extract only schema separately so typed literals retain their
@@ -479,8 +486,8 @@ pub fn parseCreateIndexRequest(alloc: std.mem.Allocator, index_name: []const u8,
     return normalized;
 }
 
-fn validateCreateTableIndexSemantics(alloc: std.mem.Allocator, indexes_json: []const u8) !void {
-    indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json) catch |err| switch (err) {
+fn validateCreateTableIndexSemantics(alloc: std.mem.Allocator, indexes_json: []const u8, embedding_options: EmbeddingInitOptions) !void {
+    indexes_api.validateArtifactEnrichmentsForTableIndexesJsonWithOptions(alloc, indexes_json, embedding_options) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.InvalidCreateTableRequest,
     };
@@ -1438,6 +1445,21 @@ test "table contract preserves multi shard create table requests" {
     );
     defer req.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(?u32, 4), req.num_shards);
+}
+
+test "table contract admits embedding indexes backed by configured inference connections" {
+    const a = std.testing.allocator;
+    var config = try @import("antfly_local_sources").common_config.Config.parseFromSlice(a,
+        \\{"connections":{"provider":{"kind":"inference","capabilities":["models.embed"],"inference":{"provider":"openai","url":"https://gateway.internal/v1"}}}}
+    );
+    defer config.deinit();
+    const body =
+        \\{"num_shards":1,"indexes":{"semantic":{"type":"embeddings","field":"body","dimension":2,"embedder":{"provider":"openai","model":"connections/provider/models/text-embedding-3-small"}}}}
+    ;
+    try std.testing.expectError(error.InvalidCreateTableRequest, parseCreateTableRequest(a, body));
+    var req = try parseCreateTableRequestWithOptions(a, body, .{ .inference_connections = &config.connections });
+    defer req.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, req.indexes_json.?, "connections/provider/models/text-embedding-3-small") != null);
 }
 
 test "table contract rejects zero shard create table requests" {

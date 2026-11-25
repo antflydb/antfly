@@ -31,6 +31,7 @@ components:
         account_id:
           type: string
           minLength: 1
+          description: Required for a direct model. A connection-qualified model takes the account from its connection.
         gateway_id:
           type: string
           minLength: 1
@@ -52,7 +53,7 @@ components:
           type: integer
           minimum: 1
           description: Alias of dimensions.
-      required: [provider, account_id, model]
+      required: [provider, model]
 
     GoogleEmbedderConfig:
       type: object

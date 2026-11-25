@@ -138,7 +138,7 @@ pub const Owner = struct {
             // by the backend on every write, including provider reservations.
             // Avoid a second timeout/heartbeat owner for long index invocations.
             if (fenced.state == .running) fenced.lease_until_ms = std.math.maxInt(u64);
-            const bytes = try std.json.Stringify.valueAlloc(a, Root{ .binding = self.owner.binding, .run = fenced }, .{});
+            const bytes = try std.json.Stringify.valueAlloc(a, Root{ .binding = self.owner.binding, .run = fenced }, .{ .emit_null_optional_fields = false });
             if (bytes.len > rpc.max_metadata_bytes) return error.DocumentOutputTooLarge;
             return self.owner.backend.mutate(self.owner.backend.ptr, self.root_key, encoded, &.{.{ .key = self.root_key, .value = bytes }}, &.{}) catch |err| return protocolError(err);
         }

@@ -1290,6 +1290,7 @@ pub const Detail = enum(c_int) {
     invalid_generation_transaction = 1206,
     generation_transaction_changed = 1207,
     stored_destination_authorization_revoked = 1208,
+    inference_attribution_denied = 1209,
 };
 
 test "SQL relation persistence callback failures preserve exact identity and behavior" {
@@ -2051,6 +2052,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.RestoreIntentConflict => status(.conflict, .restore_intent_conflict),
         error.Unauthorized => status(.unauthorized, .unauthorized),
         error.Forbidden => status(.forbidden, .forbidden),
+        error.InferenceAttributionDenied => status(.forbidden, .inference_attribution_denied),
         error.StoredDestinationAuthorizationRevoked => status(.forbidden, .stored_destination_authorization_revoked),
         // Capability barriers can be unavailable during provisioning or a
         // rolling upgrade. They fail before batch proposal admission.
@@ -3336,6 +3338,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .unauthorized => "Unauthorized",
         .forbidden => "Forbidden",
         .stored_destination_authorization_revoked => "StoredDestinationAuthorizationRevoked",
+        .inference_attribution_denied => "InferenceAttributionDenied",
         .unavailable => "Unavailable",
         .write_unavailable => "WriteUnavailable",
         .read_unavailable => "ReadUnavailable",
@@ -3922,6 +3925,9 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.RerankRateLimited, errorFromStatus(statusFromError(error.RerankRateLimited)));
     try std.testing.expectEqual(error.RerankTransientFailure, errorFromStatus(statusFromError(error.RerankTransientFailure)));
     try std.testing.expectEqual(error.RerankUpstreamFailure, errorFromStatus(statusFromError(error.RerankUpstreamFailure)));
+    const denied = statusFromError(error.InferenceAttributionDenied);
+    try std.testing.expectEqual(@backingInt(Code.forbidden), denied.code);
+    try std.testing.expectEqual(error.InferenceAttributionDenied, errorFromStatus(denied));
     try std.testing.expectEqual(error.IncompatibleModel, errorFromStatus(statusFromError(error.IncompatibleModel)));
     try std.testing.expectEqual(error.UnsupportedGeneratorProvider, errorFromStatus(statusFromError(error.UnsupportedGeneratorProvider)));
     try std.testing.expectEqual(error.GenerateRequestFailed, errorFromStatus(statusFromError(error.GenerateRequestFailed)));

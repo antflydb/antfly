@@ -124,6 +124,8 @@ pub const Handle = struct {
     /// Directory-backed native handles also restore managed remote providers.
     /// Hosted handles retain their explicitly supplied execution surface.
     embedded_native_providers: bool = false,
+    inference_connection_config: ?*@import("../common/config.zig").Config = null,
+    owned_query_embedder: @FieldType(db_mod.DB, "resolution_embedder") = null,
     lite_inference_status: ?lite_backend.InferenceStatus = null,
     storage_owner_path: ?[]u8 = null,
     storage_owner_managed_config: local_write.OwnerManagedConfig = .{},
@@ -341,7 +343,12 @@ pub fn closeHandle(handle: *Handle) void {
     var cached = handle.embedding_cache_pending.valueIterator();
     while (cached.next()) |value| handle.alloc.free(value.*);
     handle.embedding_cache_pending.deinit(handle.alloc);
+    if (handle.owned_query_embedder) |embedder| embedder.deinit(handle.alloc);
     stopLiteEmbeddedInference(handle);
+    if (handle.inference_connection_config) |config| {
+        config.deinit();
+        handle.alloc.destroy(config);
+    }
     if (handle.server_cleanup) |cleanup| cleanup(handle);
     if (handle.owned_lite_backend) |*backend| {
         backend.deinit();

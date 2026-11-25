@@ -44,10 +44,11 @@ components:
     CloudflareTTSConfig:
       type: object
       description: Cloudflare Workers AI native speech adapter. Credentials use CLOUDFLARE_API_TOKEN.
-      required: [account_id, model]
+      required: [model]
       properties:
         account_id:
           type: string
+          description: Required for a direct Cloudflare model. A connection-qualified model takes the account from its connection.
         gateway_id:
           type: string
         model:
@@ -185,13 +186,14 @@ components:
     CloudflareSTTConfig:
       type: object
       description: Cloudflare Workers AI native speech adapter. Credentials use CLOUDFLARE_API_TOKEN.
-      required: [provider, account_id, model]
+      required: [provider, model]
       properties:
         provider:
           type: string
           enum: [cloudflare]
         account_id:
           type: string
+          description: Required for a direct Cloudflare model. A connection-qualified model takes the account from its connection.
         gateway_id:
           type: string
         model:

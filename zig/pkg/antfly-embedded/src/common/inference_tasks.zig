@@ -30,14 +30,18 @@ const transcribing = @import("antfly_transcribing");
 const synthesizing = @import("antfly_synthesizing");
 pub const SessionSink = @import("inference_stream.zig").SessionSink;
 pub const FallbackSink = @import("inference_stream.zig").FallbackSink;
+pub const ProviderAttempts = @import("inference_telemetry.zig").ProviderAttempts;
 pub const Observation = @import("inference_telemetry.zig").Observation;
 pub const StreamWriter = @import("inference_stream.zig").Writer;
 const Json = std.json.Value;
+
+pub const ConstrainedRuntime = @import("../generating/constrained_runtime.zig").Runtime;
 
 pub const Executor = struct {
     view: gateway.View,
     generator_override: ?generating.GeneratorConfig = null,
     http: *httpx.Client,
+    use_scoped_provider_http: bool = false,
     context: execution.RequestContext,
     antfly_provider: ?managed.AntflyProvider = null,
     inference_api_url: ?[]const u8 = null,
@@ -45,10 +49,15 @@ pub const Executor = struct {
     secret_store: ?*secrets.FileStore = null,
     provider_runtime: ?*managed.ProviderRuntime = null,
     source_table: []const u8 = "",
+    attribution_principal: ?[]const u8 = null,
+    attribution_metadata_json: []const u8 = "",
+    attribution_scope: ?@import("config.zig").InferenceAttributionScope = null,
+    enable_index_attribution: bool = false,
 
     fn providerHttp(self: Executor) !*httpx.Client {
         // Media tasks can exceed embedding's 30-second I/O envelope regardless
         // of provider. Invocation deadlines and cancellation remain authoritative.
+        if (self.use_scoped_provider_http) return self.http;
         if (self.provider_runtime) |runtime| return runtime.assetHttpClient();
         return self.http;
     }
@@ -76,8 +85,16 @@ pub const Executor = struct {
         return generator.generate(a, cfg.model, messages);
     }
 
+    fn generationHttp(self: Executor, provider: @FieldType(generating.GeneratorConfig, "provider")) !*httpx.Client {
+        if (self.use_scoped_provider_http) return self.http;
+        if (provider == .cloudflare or provider == .anthropic or provider == .bedrock or provider == .gemini or provider == .vertex) {
+            if (self.provider_runtime) |runtime| return runtime.generationHttpClient();
+        }
+        return self.http;
+    }
+
     fn generationFactory(self: Executor, a: std.mem.Allocator, cfg: generating.GeneratorConfig) !generating.BackendFactory {
-        const provider_http = if (cfg.provider == .cloudflare or cfg.provider == .anthropic or cfg.provider == .bedrock or cfg.provider == .gemini or cfg.provider == .vertex) if (self.provider_runtime) |runtime| try runtime.generationHttpClient() else self.http else self.http;
+        const provider_http = try self.generationHttp(cfg.provider);
         return generating.BackendFactory.initWithOptions(a, provider_http, .{
             .antfly_provider = self.antfly_provider,
             .provider_runtime = self.provider_runtime,
@@ -155,7 +172,7 @@ pub const Executor = struct {
         var cfg = try self.generatorConfig(a, name);
         cfg = try withGenerationOptions(cfg, overrides);
         const body = try chatBody(a, cfg, request);
-        const provider_http = if (cfg.provider == .cloudflare or cfg.provider == .anthropic or cfg.provider == .bedrock or cfg.provider == .gemini or cfg.provider == .vertex) if (self.provider_runtime) |runtime| try runtime.generationHttpClient() else self.http else self.http;
+        const provider_http = try self.generationHttp(cfg.provider);
         var factory = generating.BackendFactory.initWithOptions(a, provider_http, .{
             .antfly_provider = self.antfly_provider,
             .provider_runtime = self.provider_runtime,
@@ -317,6 +334,12 @@ pub const Executor = struct {
         return managed.ManagedEmbedder.initFromIndexesJsonWithOptions(a, indexes, .{
             .antfly_provider = self.antfly_provider,
             .io = self.http.io,
+            .provider_http = if (self.use_scoped_provider_http) self.http else null,
+            .inference_connections = self.view.connections,
+            .attribution_principal = self.attribution_principal,
+            .attribution_metadata_json = self.attribution_metadata_json,
+            .attribution_scope = self.attribution_scope,
+            .enable_index_attribution = self.enable_index_attribution,
             .bounded_http_request = true,
             .deadline_ns = self.context.deadline_ns,
             .cancellation = self.context.cancellation,

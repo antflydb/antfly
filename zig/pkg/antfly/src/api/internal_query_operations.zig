@@ -49,6 +49,7 @@ pub fn normalizeQueryEmbeddingOperationalError(err: anyerror) ?anyerror {
         error.RemoteCapabilitySelectorAbsent,
         error.TlsTransportReadFailed,
         => error.EmbedTransientFailure,
+        error.InferenceAttributionDenied,
         error.QueryEmbeddingInputTooLarge,
         error.QueryEmbeddingOverloaded,
         error.EmbedRateLimited,
@@ -137,6 +138,15 @@ pub const Context = struct {
         var semantic_resolver = SemanticStatusResolver{ .planning = self.queryPlanning() };
         var request = try query_api.parseQueryRequest(alloc, semantic_resolver.iface(), table_name, body);
         request.req.graph_execution_limits = self.graph_execution_limits;
+        if (request.req.usesInferenceBinding()) {
+            if (semantic_resolver.planning) |planning| {
+                if (planning.inference_connections) |connections| request.req.inference_binding = .{
+                    .connections = connections,
+                    .principal = planning.attribution_principal,
+                    .metadata_json = planning.attribution_metadata_json,
+                };
+            }
+        }
         return request;
     }
 
@@ -160,12 +170,15 @@ pub const QueryPlanningContext = struct {
     remote_content: ?*const scraping.RemoteContentConfig = null,
     inference_api_url: ?[]const u8 = null,
     inference_api_key: ?[]const u8 = null,
+    inference_connections: ?*const @import("antfly_local_sources").common_config.Config.ConnectionsConfig = null,
     secret_store: ?*common_secrets.FileStore = null,
     provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     query_embedding_cache: ?*query_embedding_cache.QueryEmbeddingCache = null,
     query_embedding_budget: ?*cache_budget.CacheBudget = null,
     query_embedding_security_domain: managed_embedder.QueryCacheSecurityDomain = .internal,
     query_embedding_security_scope: []const u8 = "internal",
+    attribution_principal: ?[]const u8 = null,
+    attribution_metadata_json: []const u8 = "",
     query_embedding_deadline_ns: ?u64 = null,
     query_cancellation: ?CancellationToken = null,
     request_id: []const u8 = "",
@@ -285,6 +298,10 @@ pub fn planSemanticQuery(
         .remote_content = planning.remote_content,
         .inference_api_url = planning.inference_api_url,
         .inference_api_key = planning.inference_api_key,
+        .inference_connections = planning.inference_connections,
+        .attribution_principal = planning.attribution_principal,
+        .attribution_metadata_json = planning.attribution_metadata_json,
+        .defer_attribution_denial = true,
         .secret_store = planning.secret_store,
         .provider_runtime = planning.provider_runtime,
         .remote_capability_cache = if (planning.provider_runtime) |runtime| &runtime.remote_capability_cache else null,

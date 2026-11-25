@@ -27,6 +27,15 @@ pub const Request = audio.TTSRequest;
 pub const Response = audio.TTSResponse;
 pub const Voice = audio.Voice;
 
+pub fn defaultBaseUrl(provider: Provider) ?[]const u8 {
+    return switch (provider) {
+        .openai => "https://api.openai.com/v1",
+        .elevenlabs => "https://api.elevenlabs.io/v1",
+        .vertex => "https://texttospeech.googleapis.com/v1",
+        .cloudflare => null,
+    };
+}
+
 pub const SynthesisResult = struct {
     audio: ?[]u8 = null,
     response: Response = .{},
@@ -306,7 +315,7 @@ const OpenAiSynthesizerState = struct {
         state.* = .{
             .alloc = alloc,
             .http = http,
-            .base_url = try alloc.dupe(u8, cfg.base_url orelse "https://api.openai.com/v1"),
+            .base_url = try alloc.dupe(u8, cfg.base_url orelse defaultBaseUrl(cfg.provider).?),
             .model = try alloc.dupe(u8, cfg.model orelse "tts-1"),
             .voice = try alloc.dupe(u8, cfg.voice orelse "alloy"),
         };
@@ -505,7 +514,7 @@ const RemoteSynthesizerState = struct {
         const auth = @import("antfly_google").auth;
         const control = auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation);
         const format = request.format orelse .mp3;
-        const base = std.mem.trimEnd(u8, cfg.base_url orelse (if (cfg.provider == .elevenlabs) "https://api.elevenlabs.io/v1" else "https://texttospeech.googleapis.com/v1"), "/");
+        const base = std.mem.trimEnd(u8, cfg.base_url orelse defaultBaseUrl(cfg.provider).?, "/");
         var headers: std.ArrayList([2][]const u8) = .empty;
         defer headers.deinit(a);
         var token_source: ?@import("antfly_google").auth.CachedTokenSource = null;

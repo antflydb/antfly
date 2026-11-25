@@ -104,6 +104,7 @@ pub const Options = struct {
     /// upstream operation and must not consume this model's quota.
     attempt_observer: ?httpx.AttemptObserver = null,
     credential_source: CredentialSource = .default,
+    embedding_bearer_token: ?[]const u8 = null,
     region: []const u8,
     endpoint: []const u8,
     request_format: RequestFormat = .auto,
@@ -345,19 +346,6 @@ pub const Provider = struct {
     }
 
     fn invokeEmbeddingsJson(self: *Provider, alloc: std.mem.Allocator, model: []const u8, json_body: []const u8, request_context: RequestContext) !inference.EmbedResult {
-        const cache = self.credential_cache orelse &self.owned_credential_cache;
-        // Cached snapshots outlive this invocation and may be refreshed by a
-        // concurrent request. Never allocate them from the caller's arena.
-        var creds = try cache.getForSourceWithContext(
-            alloc,
-            std.heap.smp_allocator,
-            self.http,
-            self.options.region,
-            self.options.credential_source,
-            request_context,
-        );
-        defer creds.deinit(alloc);
-
         const endpoint = try endpointBaseAlloc(alloc, self.options.endpoint);
         defer alloc.free(endpoint);
         const path = try bedrockInvokePathAlloc(alloc, model);
@@ -367,13 +355,21 @@ pub const Provider = struct {
         const host = try endpointHostAlloc(alloc, endpoint);
         defer alloc.free(host);
 
-        const signed = try signHeadersAlloc(alloc, creds, self.options.region, host, path, json_body);
-        defer freeHeaderPairs(alloc, signed);
+        const bearer = if (self.options.embedding_bearer_token) |token| try std.fmt.allocPrint(alloc, "Bearer {s}", .{token}) else null;
+        defer if (bearer) |value| alloc.free(value);
+        const signed = if (bearer == null) blk: {
+            const cache = self.credential_cache orelse &self.owned_credential_cache;
+            var creds = try cache.getForSourceWithContext(alloc, std.heap.smp_allocator, self.http, self.options.region, self.options.credential_source, request_context);
+            defer creds.deinit(alloc);
+            break :blk try signHeadersAlloc(alloc, creds, self.options.region, host, path, json_body);
+        } else null;
+        defer if (signed) |headers| freeHeaderPairs(alloc, headers);
+        const bearer_headers = [_]HeaderPair{ .{ "Authorization", bearer orelse "" }, .{ "Content-Type", "application/json" } };
 
         var resp = try self.http.request(.POST, url, .{
             .follow_redirects = false,
             .attempt_observer = self.options.attempt_observer,
-            .headers = signed,
+            .headers = if (signed) |headers| headers else &bearer_headers,
             .body = json_body,
             .timeout_ms = try request_context.remainingTimeoutMs(self.http.io),
             .cookies_enabled = false,
@@ -434,10 +430,11 @@ pub const Provider = struct {
 /// Fetch the Bedrock control-plane foundation-models listing for a region.
 /// Returns the raw JSON response body; the caller owns it.
 pub fn listFoundationModelsBodyAlloc(alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, endpoint_override: ?[]const u8, timeout_ms: u64) ![]u8 {
-    const request_context = RequestContext.init(http.io, timeout_ms, null);
-    var creds = try resolveCredentialsUncached(alloc, http, region, .default, request_context);
-    defer creds.deinit(alloc);
+    return listFoundationModelsBodyAllocWithHeaders(alloc, http, region, endpoint_override, timeout_ms, null, &.{});
+}
 
+pub fn listFoundationModelsBodyAllocWithHeaders(alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, endpoint_override: ?[]const u8, timeout_ms: u64, bearer_token: ?[]const u8, custom_headers: []const HeaderPair) ![]u8 {
+    const request_context = RequestContext.init(http.io, timeout_ms, null);
     const default_endpoint = try std.fmt.allocPrint(alloc, "https://bedrock.{s}.amazonaws.com", .{region});
     defer alloc.free(default_endpoint);
     const endpoint = try endpointBaseAlloc(alloc, endpoint_override orelse default_endpoint);
@@ -448,12 +445,21 @@ pub fn listFoundationModelsBodyAlloc(alloc: std.mem.Allocator, http: *httpx.Clie
     const url = try std.fmt.allocPrint(alloc, "{s}{s}", .{ endpoint, path });
     defer alloc.free(url);
 
-    const signed = try signRequestHeadersAlloc(alloc, creds, region, "GET", host, path, "");
-    defer freeHeaderPairs(alloc, signed);
-
+    const bearer = if (bearer_token) |token| try std.fmt.allocPrint(alloc, "Bearer {s}", .{token}) else null;
+    defer if (bearer) |value| alloc.free(value);
+    const signed = if (bearer == null) blk: {
+        var creds = try resolveCredentialsUncached(alloc, http, region, .default, request_context);
+        defer creds.deinit(alloc);
+        break :blk try signRequestHeadersAlloc(alloc, creds, region, "GET", host, path, "");
+    } else null;
+    defer if (signed) |headers| freeHeaderPairs(alloc, headers);
+    const bearer_headers = [_]HeaderPair{.{ "Authorization", bearer orelse "" }};
+    const protocol_headers: []const HeaderPair = if (signed) |headers| headers else &bearer_headers;
+    const transport_headers = if (custom_headers.len > 0) try std.mem.concat(alloc, HeaderPair, &.{ protocol_headers, custom_headers }) else null;
+    defer if (transport_headers) |headers| alloc.free(headers);
     var resp = try http.request(.GET, url, .{
         .follow_redirects = false,
-        .headers = signed,
+        .headers = transport_headers orelse protocol_headers,
         .timeout_ms = try request_context.remainingTimeoutMs(http.io),
         .cookies_enabled = false,
     });

@@ -25,6 +25,7 @@ components:
           enum: [cloudflare]
         account_id:
           type: string
+          description: Required for a direct Cloudflare model. A connection-qualified model takes the account from its connection.
           minLength: 1
         gateway_id:
           type: string
@@ -39,7 +40,7 @@ components:
         url:
           type: string
           description: Optional deployment-owned endpoint override.
-      required: [provider, account_id, model]
+      required: [provider, model]
 
     AntflyRerankerConfig:
       type: object

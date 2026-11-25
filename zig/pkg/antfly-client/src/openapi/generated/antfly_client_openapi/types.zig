@@ -6110,7 +6110,8 @@ pub const ClassificationTransformationResult = struct {
 /// Cloudflare Workers AI embedding. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference.
 pub const CloudflareEmbedderConfig = struct {
     provider: []const u8,
-    account_id: []const u8,
+    /// Required for a direct model. A connection-qualified model takes the account from its connection.
+    account_id: ?[]const u8 = null,
     /// Optional AI Gateway ID, sent through cf-aig-gateway-id.
     gateway_id: ?[]const u8 = null,
     model: []const u8,
@@ -6125,7 +6126,7 @@ pub const CloudflareEmbedderConfig = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "provider", "provider", false },
-        .{ "account_id", "account_id", false },
+        .{ "account_id", "account_id", true },
         .{ "gateway_id", "gateway_id", true },
         .{ "model", "model", false },
         .{ "api_key", "api_key", true },
@@ -6146,8 +6147,10 @@ pub const CloudflareEmbedderConfig = struct {
         try jw.beginObject();
         try jw.objectField("provider");
         try jw.write(self.provider);
-        try jw.objectField("account_id");
-        try jw.write(self.account_id);
+        if (self.account_id) |value| {
+            try jw.objectField("account_id");
+            try jw.write(value);
+        }
         if (self.gateway_id) |value| {
             try jw.objectField("gateway_id");
             try jw.write(value);
@@ -6177,7 +6180,8 @@ pub const CloudflareEmbedderConfig = struct {
 /// Cloudflare Workers AI generation. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference.
 pub const CloudflareGeneratorConfig = struct {
     provider: []const u8,
-    account_id: []const u8,
+    /// Required for a direct model. A connection-qualified model takes the account from its connection.
+    account_id: ?[]const u8 = null,
     /// Optional AI Gateway ID, sent through cf-aig-gateway-id.
     gateway_id: ?[]const u8 = null,
     model: []const u8,
@@ -6193,7 +6197,7 @@ pub const CloudflareGeneratorConfig = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "provider", "provider", false },
-        .{ "account_id", "account_id", false },
+        .{ "account_id", "account_id", true },
         .{ "gateway_id", "gateway_id", true },
         .{ "model", "model", false },
         .{ "api_key", "api_key", true },
@@ -6217,8 +6221,10 @@ pub const CloudflareGeneratorConfig = struct {
         try jw.beginObject();
         try jw.objectField("provider");
         try jw.write(self.provider);
-        try jw.objectField("account_id");
-        try jw.write(self.account_id);
+        if (self.account_id) |value| {
+            try jw.objectField("account_id");
+            try jw.write(value);
+        }
         if (self.gateway_id) |value| {
             try jw.objectField("gateway_id");
             try jw.write(value);
@@ -6260,7 +6266,8 @@ pub const CloudflareGeneratorConfig = struct {
 /// Cloudflare Workers AI reranking. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference.
 pub const CloudflareRerankerConfig = struct {
     provider: []const u8,
-    account_id: []const u8,
+    /// Required for a direct Cloudflare model. A connection-qualified model takes the account from its connection.
+    account_id: ?[]const u8 = null,
     /// Optional AI Gateway ID, sent through cf-aig-gateway-id.
     gateway_id: ?[]const u8 = null,
     model: []const u8,
@@ -6271,7 +6278,7 @@ pub const CloudflareRerankerConfig = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "provider", "provider", false },
-        .{ "account_id", "account_id", false },
+        .{ "account_id", "account_id", true },
         .{ "gateway_id", "gateway_id", true },
         .{ "model", "model", false },
         .{ "api_key", "api_key", true },
@@ -6290,8 +6297,10 @@ pub const CloudflareRerankerConfig = struct {
         try jw.beginObject();
         try jw.objectField("provider");
         try jw.write(self.provider);
-        try jw.objectField("account_id");
-        try jw.write(self.account_id);
+        if (self.account_id) |value| {
+            try jw.objectField("account_id");
+            try jw.write(value);
+        }
         if (self.gateway_id) |value| {
             try jw.objectField("gateway_id");
             try jw.write(value);
@@ -6313,7 +6322,8 @@ pub const CloudflareRerankerConfig = struct {
 /// Cloudflare Workers AI native speech adapter. Credentials use CLOUDFLARE_API_TOKEN.
 pub const CloudflareSTTConfig = struct {
     provider: []const u8,
-    account_id: []const u8,
+    /// Required for a direct Cloudflare model. A connection-qualified model takes the account from its connection.
+    account_id: ?[]const u8 = null,
     gateway_id: ?[]const u8 = null,
     model: []const u8,
     api_key: ?[]const u8 = null,
@@ -6325,7 +6335,7 @@ pub const CloudflareSTTConfig = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "provider", "provider", false },
-        .{ "account_id", "account_id", false },
+        .{ "account_id", "account_id", true },
         .{ "gateway_id", "gateway_id", true },
         .{ "model", "model", false },
         .{ "api_key", "api_key", true },
@@ -6346,8 +6356,10 @@ pub const CloudflareSTTConfig = struct {
         try jw.beginObject();
         try jw.objectField("provider");
         try jw.write(self.provider);
-        try jw.objectField("account_id");
-        try jw.write(self.account_id);
+        if (self.account_id) |value| {
+            try jw.objectField("account_id");
+            try jw.write(value);
+        }
         if (self.gateway_id) |value| {
             try jw.objectField("gateway_id");
             try jw.write(value);
@@ -11148,9 +11160,9 @@ pub const DeciderConfig = struct {
     output: ?ConstrainedOutput = null,
     probabilities: ?ConstrainedProbabilities = null,
     batch: ?ConstrainedGenerationBatch = null,
-    /// Required for Antfly, OpenAI, and Cloudflare; Jev defaults to jev-latest. Cloudflare uses @cf/cloudflare/clef or @cf/cloudflare/clef-flash.
+    /// Required for Antfly, OpenAI, and Cloudflare; Jev defaults to jev-latest. Typed deciders may select a connection-qualified model with models.decide. Cloudflare uses @cf/cloudflare/clef or @cf/cloudflare/clef-flash.
     model: ?[]const u8 = null,
-    /// Required with the cloudflare provider; Workers AI account identifier.
+    /// Workers AI account identifier. Required for a direct Cloudflare model. A connection-qualified model takes it from its connection.
     account_id: ?[]const u8 = null,
     /// Optional Cloudflare AI Gateway identifier.
     gateway_id: ?[]const u8 = null,
@@ -14458,6 +14470,7 @@ pub const EdgesResponse = struct {
 /// A unified configuration for an embedding provider. Embedders can be configured with templates to customize how documents are converted to text before embedding. Templates use Handlebars syntax and support various built-in helpers. **Template System:** - **Syntax**: Handlebars templating (https://handlebarsjs.com/guide/) - **Caching**: Templates are automatically cached with configurable TTL (default: 5 minutes) - **Context**: Templates receive the full document as context **Built-in Helpers:** 1. **scrubHtml** - Remove script/style tags and extract clean text from HTML ```handlebars {{scrubHtml html_content}} ``` - Removes `<script>` and `<style>` tags - Adds newlines after block elements (p, div, h1-h6, li, etc.) - Returns plain text with preserved readability 2. **eq** - Equality comparison for conditionals ```handlebars {{#if (eq status "active")}}Active user{{/if}} {{#if (eq @key "special")}}Special field{{/if}} ``` 3. **media** - GenKit dotprompt media directive for multimodal content ```handlebars {{media url=imageDataURI}} {{media url=this.image_url}} {{media url="https://example.com/image.jpg"}} {{media url="s3://endpoint/bucket/image.png"}} {{media url="file:///path/to/image.jpg"}} ``` **Supported URL Schemes:** - `data:` - Base64 encoded data URIs (e.g., `data:image/jpeg;base64,...`) - `http://` / `https://` - Web URLs with automatic content type detection - `file://` - Local filesystem paths - `s3://` - S3-compatible storage (format: `s3://endpoint/bucket/key`) **Automatic Content Processing:** - **Images**: Downloaded, resized (if needed), converted to data URIs - **PDFs**: Text extracted or first page rendered as image - **HTML**: Readable text extracted using Mozilla Readability **Security Controls:** Downloads are protected by content security settings (see Configuration Reference): - Allowed host whitelist - Private IP blocking (prevents SSRF attacks) - Download size limits (default: 100MB) - HTTP downloads time out after 30 seconds by default; zero disables the deadline - Image dimension limits (default: 2048px, auto-resized) See: https://antfly.io/docs/configuration#security--cors 4. **encodeToon** is not available in these templates. It is a helper of the retrieval agent's `document_renderer`, which renders documents into the generation prompt as TOON by default. **Template Examples:** Document with metadata: ```handlebars Title: {{metadata.title}} Date: {{metadata.date}} Tags: {{#each metadata.tags}}{{this}}, {{/each}} {{content}} ``` HTML content extraction: ```handlebars Product: {{name}} Description: {{scrubHtml description_html}} Price: ${{price}} ``` Multimodal with image: ```handlebars Product: {{title}} {{media url=image}} Description: {{description}} ``` Conditional formatting: ```handlebars {{title}} {{#if author}}By: {{author}}{{/if}} {{#if (eq category "premium")}}⭐ Premium Content{{/if}} {{body}} ``` **Environment Variables:** - `GEMINI_API_KEY` - API key for Google AI - `OPENAI_API_KEY` - API key for OpenAI - `OPENAI_BASE_URL` - Base URL for OpenAI-compatible APIs - `OLLAMA_HOST` - Ollama server URL (e.g., http://localhost:11434) **Importing Pre-computed Embeddings:** You can import existing embeddings (from OpenAI, Cohere, or any provider), but only for indexes configured with `external: true`. External indexes accept vectors written directly through the document `_embeddings` field and do not generate prompts from `field` or `template`. **Steps:** 1. Create an embeddings index with `external: true` 2. For dense indexes, set the index `dimension` 3. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }` **Example:** ```json { "title": "My Document", "content": "Document text...", "_embeddings": { "my_vector_index": [0.1, 0.2, 0.3, ...] } } ``` **Delete Behavior:** - Use `"_embeddings": { "<indexName>": null }` to delete a stored external vector - Omitting `_embeddings[<indexName>]` leaves the existing vector unchanged **Use Cases:** - Migrating from another vector database with existing embeddings - Using embeddings generated by external systems - Importing pre-computed OpenAI, Cohere, or other provider embeddings - Batch processing embeddings offline before ingestion
 pub const EmbedderConfig = struct {
     provider: ?[]const u8 = null,
+    /// Required for a direct model. A connection-qualified model takes the account from its connection.
     account_id: ?[]const u8 = null,
     /// Optional AI Gateway ID, sent through cf-aig-gateway-id.
     gateway_id: ?[]const u8 = null,
@@ -21933,6 +21946,7 @@ pub const GenerationStepConfig = struct {
 /// A unified configuration for a generative AI provider.
 pub const GeneratorConfig = struct {
     provider: ?[]const u8 = null,
+    /// Required for a direct model. A connection-qualified model takes the account from its connection.
     account_id: ?[]const u8 = null,
     /// Optional AI Gateway ID, sent through cf-aig-gateway-id.
     gateway_id: ?[]const u8 = null,
@@ -58602,6 +58616,7 @@ pub const SSEToolMode = struct {
 /// Unified configuration for an STT provider. Select the provider type and configure provider-specific settings. **Supported Providers:** - `openai` - OpenAI Whisper (whisper-1) - `vertex` - Google Cloud Speech-to-Text (Vertex AI) - `antfly` - Antfly inference service (Whisper, Wav2Vec2, HuBERT) **Example:** ```yaml provider: antfly api_url: "http://localhost:8080" model: openai/whisper-base ```
 pub const STTConfig = struct {
     provider: ?[]const u8 = null,
+    /// Required for a direct Cloudflare model. A connection-qualified model takes the account from its connection.
     account_id: ?[]const u8 = null,
     gateway_id: ?[]const u8 = null,
     model: ?[]const u8 = null,
