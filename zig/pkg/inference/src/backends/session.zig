@@ -36,6 +36,8 @@ fn unsupportedControlledRun(
 
 pub const ResidentInput = struct {
     value: ops.CT,
+    // Only a selected prepared stage can omit the tensor payload.
+    metadata_only: bool = false,
     backend: *const ops.ComputeBackend,
     estimated_bytes: usize = 0,
     shape: []const i64 = &.{},
@@ -3246,7 +3248,7 @@ pub const Session = struct {
         const stage_backend = shared.stableBackend();
         for (inputs, self.inputInfo()) |input, info| switch (input) {
             .host => |host| if (!std.mem.eql(u8, host.name, info.name) or host.dtype != info.dtype) return false,
-            .resident => |value| if (!ResidentInput.backendCompatible(value.backend, stage_backend)) return false,
+            .resident => |value| if (value.metadata_only or !ResidentInput.backendCompatible(value.backend, stage_backend)) return false,
         };
         return true;
     }
@@ -5885,10 +5887,17 @@ pub const RunPermit = struct {
         defer if (allocate) allocator.free(resident);
         var initialized: usize = 0;
         defer for (inputs[0..initialized], resident[0..initialized]) |input, value| {
-            if (input == .host) backend.free(value.value);
+            if (input == .host and !value.metadata_only) backend.free(value.value);
         };
-        for (inputs, resident) |input, *value| {
+        var omitted_payload = false;
+        for (inputs, resident, 0..) |input, *value, index| {
             if (control) |active| try active.check();
+            if (input == .host) if (self.prepared) |*selected| if (!selected.executed and selected.stageInputUnused(index)) {
+                value.* = .{ .value = backend.ptr, .metadata_only = true, .backend = backend, .shape = input.host.shape };
+                omitted_payload = true;
+                initialized += 1;
+                continue;
+            };
             value.* = switch (input) {
                 .host => |host| .{
                     .value = try shared.importReadOnlyHostTensor(allocator, &host),
@@ -5901,6 +5910,7 @@ pub const RunPermit = struct {
             initialized += 1;
         }
         if (try self.executePreparedResident(.{ .resident = resident }, allocator, control)) |outputs| return outputs;
+        if (omitted_payload) return error.UnpreparedStagePayload;
         var outputs = (if (control) |active|
             try @import("../execution/invocation_observation.zig").callResident(self.session.invocation_diagnostics, resident, self.session.vtable.runResidentInputsWithControl.?, .{ self.session.ptr, resident, allocator, active })
         else

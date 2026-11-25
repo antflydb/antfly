@@ -896,6 +896,7 @@ fn prepareInvocationIntoWithCleanup(session: *const Session, shapes: session_mod
         _ = target.model_lifetime.retain();
     } else try validatePreparedShapes(root, shapes);
     prepared.target = target;
+    prepared.stage_input_unused = preparedStageInputUnused;
     if (target.cache_branch) prepared.validate_stage_controls = validateStageCacheBranch;
     prepared.target_lifetime = if (target != root) &target.model_lifetime else null;
     prepared.backend_cookie = events;
@@ -937,6 +938,11 @@ fn validatePreparedShapes(target: *const ImportedOnnxSession, shapes: session_mo
     }
 }
 
+fn preparedStageInputUnused(prepared: *const prepared_mod.PreparedInvocation, index: usize) bool {
+    const target: *const ImportedOnnxSession = @ptrCast(@alignCast(prepared.target));
+    return index < target.input_node_ids.len and target.input_node_ids[index] == ml.graph.null_node;
+}
+
 fn validateStageCacheBranch(prepared: *prepared_mod.PreparedInvocation, inputs: []const session_mod.StageInput) !void {
     const target: *ImportedOnnxSession = @ptrCast(@alignCast(prepared.target));
     const key = target.shape_key orelse return error.MissingOnnxCacheBranch;
@@ -975,12 +981,16 @@ fn validatePreparedInputs(target: *ImportedOnnxSession, inputs: prepared_mod.Inp
         .resident => |resident| {
             if (resident.len != target.input_info.len) return error.InputArityMismatch;
             var cursor: usize = @intFromBool(target.cache_branch);
-            for (resident, target.input_info) |input, expected| {
-                try validateResidentInput(target, input);
-                if (try input.backend.tensorDType(input.value) != expected.dtype) return error.PreparedInvocationShapeMismatch;
+            for (resident, target.input_info, target.input_node_ids) |input, expected, node| {
+                if (input.metadata_only) {
+                    if (node != ml.graph.null_node) return error.UnpreparedStagePayload;
+                } else {
+                    try validateResidentInput(target, input);
+                    if (try input.backend.tensorDType(input.value) != expected.dtype) return error.PreparedInvocationShapeMismatch;
+                }
                 // Verify real tensor metadata; estimates never authorize stale
                 // shape reuse. This does not download tensor payloads.
-                const owned_shape = try residentInputShapeAllocation(input, allocator);
+                const owned_shape = if (input.metadata_only) null else try residentInputShapeAllocation(input, allocator);
                 defer if (owned_shape) |value| allocator.free(value);
                 const shape = owned_shape orelse input.shape;
                 if (shape.len != expected.shape.len) return error.PreparedInvocationShapeMismatch;
@@ -1504,7 +1514,7 @@ fn runConcreteWithOutputs(
     };
     var diagnostics_before: ?@import("../execution/diagnostics.zig").Start = if (observing) self.executable.diagnostics.beginEnabled(&self.cb) else null;
     if (diagnostics_before) |*start| start.device_owners = &device_owners;
-    if (observing) if (resident_inputs) |inputs| for (inputs) |input| input.backend.registerTensorOwnershipObservation(input.value);
+    if (observing) if (resident_inputs) |inputs| for (inputs) |input| if (!input.metadata_only) input.backend.registerTensorOwnershipObservation(input.value);
     defer if (observing) @import("../execution/diagnostics.zig").Diagnostics.end(diagnostics_before);
     const outputs = runConcreteObservedWithOutputs(self, host_inputs, resident_inputs, allocator, control, resident, storage_capability, frame_claim, prepared_routes, region_claims, region_execution_profile, operation_scope.token(), if (diagnostics_before) |*before| before else null) catch |err| {
         if (observing) self.executable.diagnostics.recordFailure(&self.cb, diagnostics_before, err);
@@ -1640,6 +1650,7 @@ fn runConcreteObservedWithOutputs(
 }
 
 fn validateResidentInput(self: *ImportedOnnxSession, input: ResidentInput) !void {
+    if (input.metadata_only) return error.UnpreparedStagePayload;
     if (!ResidentInput.backendCompatible(input.backend, &self.cb)) return error.UnsupportedResidentInputBackend;
 }
 
@@ -7586,6 +7597,9 @@ fn qualifyT5CachedRows(a: std.mem.Allocator, session: Session, selected: []const
                     null;
                 defer stopT5CudaProfile(&profile);
                 const row = try state.stepResident(.{ .position = start, .tokens = tokens[start..end] }, control);
+                // The cached branch only needs the encoder shape. Removing the
+                // bytes here proves the prepared ingress never imports them.
+                if (offset == 0) state.encoder.host.data = &.{};
                 elapsed.* = platform.time.monotonicNs() - before;
                 stopT5CudaProfile(&profile);
                 if (observe_replay) {
