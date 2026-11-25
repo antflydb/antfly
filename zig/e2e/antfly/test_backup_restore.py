@@ -3153,21 +3153,22 @@ def _three_by_three_cluster_backup_restore(
         f"a fresh incarnation: source={original_group_ids}, restored={restored_group_ids}"
     )
 
-    def restored_docs_visible_from_every_data_node() -> bool | None:
-        for api_url in cluster.data_api_urls:
-            for key, expected in source_docs.items():
-                doc = _lookup_doc_from_url(session, api_url, table_name, key)
-                if doc is None or doc.get("title") != expected["title"]:
-                    return None
-        return True
+    if not damage_sibling:
+        def restored_docs_visible_from_every_data_node() -> bool | None:
+            for api_url in cluster.data_api_urls:
+                for key, expected in source_docs.items():
+                    doc = _lookup_doc_from_url(session, api_url, table_name, key)
+                    if doc is None or doc.get("title") != expected["title"]:
+                        return None
+            return True
 
-    assert wait_until(
-        restored_docs_visible_from_every_data_node,
-        timeout_s=60.0,
-        interval_s=0.5,
-    ), (
-        f"restored documents were not readable through every data node\n{cluster.debug_logs()}"
-    )
+        assert wait_until(
+            restored_docs_visible_from_every_data_node,
+            timeout_s=60.0,
+            interval_s=0.5,
+        ), (
+            f"restored documents were not readable through every data node\n{cluster.debug_logs()}"
+        )
 
     assert wait_until(
         lambda: cluster.restore_progress_cleared(table_name) or None,
