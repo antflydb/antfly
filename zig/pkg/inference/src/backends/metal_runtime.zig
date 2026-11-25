@@ -53537,3 +53537,66 @@ test "Metal causal depthwise stencil normalizes and stages independent BF16 hist
         try std.testing.expectEqualSlices(u16, &history, &previous);
     }
 }
+
+/// Projects BF16 input and output-major BF16 weights with F32 accumulation.
+/// Router callers can retain the F32 logits through expert selection.
+pub const DenseBf16Projection = struct {
+    rows: u32,
+    input_width: u32,
+    output_width: u32,
+
+    const Buffer = RoutedBlockScaledProjection.Buffer;
+    const Wire = extern struct { rows: u32, input_width: u32, output_width: u32, f32_output: u32 };
+    extern fn antfly_metal_dispatch_dense_bf16_projection(runtime: *RawMetalDecodeRuntime, views: *const [3]Buffer, params: *const Wire) c_int;
+
+    pub fn encode(self: DenseBf16Projection, runtime: *RawMetalDecodeRuntime, input: *const MetalTensor, weight: *const MetalTensor, output: *MetalTensor) !void {
+        if (!hasActiveFrame(runtime)) return error.MetalFrameRequired;
+        if (output.isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
+        if (output.dtype != .i16 and output.dtype != .f32) return error.UnsupportedTensorType;
+        const views: [3]Buffer = .{
+            try .fromTensor(input, .i16), try .fromTensor(weight, .i16), try .fromTensor(output, output.dtype),
+        };
+        if (antfly_metal_dispatch_dense_bf16_projection(runtime, &views, &.{
+            .rows = self.rows,
+            .input_width = self.input_width,
+            .output_width = self.output_width,
+            .f32_output = @intFromBool(output.dtype == .f32),
+        }) != 0) return error.MetalKernelDispatchFailed;
+        output.invalidateHostMirror();
+    }
+};
+
+test "Metal dense BF16 projection publishes typed rows and router logits" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const input = [6]u16{ 0x3f80, 0x4000, 0x4040, 0xbf80, 0x4000, 0x3f80 };
+    const weights = [6]u16{ 0x3f80, 0, 0x3f80, 0x3f00, 0xbf80, 0x3f80 };
+    const a = std.testing.allocator;
+    var source = try MetalTensor.deviceAllocateTyped(a, runtime, .i16, .shared, &.{6});
+    defer source.deinit();
+    try source.uploadBytes(std.mem.asBytes(&input));
+    var matrix = try MetalTensor.deviceAllocateTyped(a, runtime, .i16, .shared, &.{6});
+    defer matrix.deinit();
+    try matrix.uploadBytes(std.mem.asBytes(&weights));
+    var projected = try MetalTensor.deviceAllocateTyped(a, runtime, .i16, .shared, &.{4});
+    defer projected.deinit();
+    var router = try MetalTensor.deviceAllocateTyped(a, runtime, .f32, .shared, &.{4});
+    defer router.deinit();
+
+    const projection: DenseBf16Projection = .{ .rows = 2, .input_width = 3, .output_width = 2 };
+    try beginFrame(runtime);
+    errdefer cancelFrame(runtime) catch {};
+    try projection.encode(runtime, &source, &matrix, &projected);
+    try projection.encode(runtime, &source, &matrix, &router);
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+
+    var bf16: [4]u16 = undefined;
+    var logits: [4]f32 = undefined;
+    try projected.downloadBytesInto(std.mem.asBytes(&bf16));
+    try router.downloadF32Into(&logits);
+    try std.testing.expectEqual([4]u16{ 0x4080, 0x3fc0, 0, 0xbfc0 }, bf16);
+    try std.testing.expectEqual([4]f32{ 4, 1.5, 0, -1.5 }, logits);
+}

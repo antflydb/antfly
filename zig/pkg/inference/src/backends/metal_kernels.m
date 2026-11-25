@@ -1779,6 +1779,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> routed_block_scaled_pipelines[4];
     id<MTLComputePipelineState> paged_relative_bf16_pipelines[2];
     id<MTLComputePipelineState> causal_depthwise4_bf16_pipeline;
+    id<MTLComputePipelineState> dense_bf16_projection_pipeline;
     TermiteMetalMtpHeadWorkspace *mtp_head_workspace;
     id<MTLDevice> device;
     // Opt-in dense embedding workspace guard. Counts fresh allocations until
@@ -12919,6 +12920,35 @@ static NSString *termite_metal_shader_source(void) {
            "    uint total = p.rows * p.dim; if (gid >= total) return; uint row = gid / p.dim; uint col = gid % p.dim; float value = 0.0f; uint route_base = row * p.top_k; for (uint k = 0u; k < p.top_k; ++k) { uint route = route_base + k; float scale = p.has_expert_scale != 0u ? expert_scale[expert_ids[route]] : 1.0f; value += (route_output[route * p.dim + col] * scale) * route_weights[route]; } output[gid] = value;\n"
            "}\n"
            // tile-codegen:end expert.projection.direct.7 family
+           // tile-codegen:begin projection.dense_bf16 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "struct DenseBf16ProjectionParams {\n"
+           "    uint rows, input_width, output_width, f32_output;\n"
+           "};\n"
+           "\n"
+           "kernel void antfly_dense_bf16_projection_simd4(\n"
+           "    device const bfloat *input [[buffer(0)]],\n"
+           "    device const bfloat *weight [[buffer(1)]],\n"
+           "    device uchar *output [[buffer(2)]],\n"
+           "    constant DenseBf16ProjectionParams &p [[buffer(3)]],\n"
+           "    uint2 group [[threadgroup_position_in_grid]],\n"
+           "    uint simd_group [[simdgroup_index_in_threadgroup]],\n"
+           "    uint lane [[thread_index_in_simdgroup]]\n"
+           ") {\n"
+           "    const uint column = group.x * 4u + simd_group;\n"
+           "    if (column >= p.output_width) return;\n"
+           "    const ulong a = ulong(group.y) * p.input_width;\n"
+           "    const ulong b = ulong(column) * p.input_width;\n"
+           "    float product = 0.0f;\n"
+           "    for (uint k = lane; k < p.input_width; k += 32u)\n"
+           "        product = fma(float(input[a + k]), float(weight[b + k]), product);\n"
+           "    const float total = simd_sum(product);\n"
+           "    if (lane == 0u) {\n"
+           "        const ulong index = ulong(group.y) * p.output_width + column;\n"
+           "        if (p.f32_output) reinterpret_cast<device float *>(output)[index] = total;\n"
+           "        else reinterpret_cast<device bfloat *>(output)[index] = bfloat(total);\n"
+           "    }\n"
+           "}\n"
+           // tile-codegen:end projection.dense_bf16 family
            // tile-codegen:begin convolution.causal_depthwise4_bf16 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "struct CausalDepthwise4Bf16Params {\n"
            "    uint channels, rows, valid_history, dynamic;\n"
@@ -33675,6 +33705,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     for (size_t index = 0; index < 4; ++index) runtime->routed_block_scaled_pipelines[index] = nil;
     for (size_t index = 0; index < 2; ++index) runtime->paged_relative_bf16_pipelines[index] = nil;
     runtime->causal_depthwise4_bf16_pipeline = nil;
+    runtime->dense_bf16_projection_pipeline = nil;
     free(runtime);
     }
 }
@@ -36903,6 +36934,26 @@ int antfly_metal_dispatch_causal_depthwise4_bf16(
     return antfly_metal_encode_typed_stage(runtime, @"antfly_causal_depthwise4_head_norm_d128_bf16",
         &runtime->causal_depthwise4_bf16_pipeline, views, required, alignment, 6, (1u << 4) | (1u << 5),
         p, sizeof(*p), MTLSizeMake(p->channels / 128u, p->rows, 1), MTLSizeMake(32, 1, 1));
+}
+
+typedef struct {
+    uint32_t rows, input_width, output_width, f32_output;
+} antfly_metal_dense_bf16_projection_params;
+
+int antfly_metal_dispatch_dense_bf16_projection(
+    termite_metal_decode_runtime *runtime, const antfly_metal_routed_buffer views[3],
+    const antfly_metal_dense_bf16_projection_params *p
+) {
+    if (!runtime || !views || !p || !p->rows || !p->input_width || !p->output_width) return -1;
+    const size_t output_size = p->f32_output ? 4u : 2u;
+    size_t required[3];
+    if (!termite_metal_size_mul(p->rows, (size_t)p->input_width * 2u, &required[0]) ||
+        !termite_metal_size_mul(p->output_width, (size_t)p->input_width * 2u, &required[1]) ||
+        !termite_metal_size_mul(p->rows, (size_t)p->output_width * output_size, &required[2])) return -1;
+    const size_t alignment[3] = {2, 2, output_size};
+    return antfly_metal_encode_typed_stage(runtime, @"antfly_dense_bf16_projection_simd4",
+        &runtime->dense_bf16_projection_pipeline, views, required, alignment, 3, 1u << 2,
+        p, sizeof(*p), MTLSizeMake(((size_t)p->output_width + 3u) / 4u, p->rows, 1), MTLSizeMake(128, 1, 1));
 }
 
 typedef struct { uint32_t rows, hidden, head_dim, grid_x, grid_y; float eps, theta, scale; uint32_t stride, start, rotate, weighted, cached_rotary; } termite_vision_norm_rope_params;

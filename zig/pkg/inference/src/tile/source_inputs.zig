@@ -108,6 +108,7 @@ pub const paths = [_][]const u8{
     "src/tile/families/native/metal/audio_abi.m",
     "src/tile/families/native/metal/causal_depthwise4_bf16.metal",
     "src/tile/families/native/metal/convolution.metal",
+    "src/tile/families/native/metal/dense_bf16_projection.metal",
     "src/tile/families/native/metal/elementwise_direct.metal",
     "src/tile/families/native/metal/elementwise_direct_abi.m",
     "src/tile/families/native/metal/expert_projection.m",
