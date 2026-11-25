@@ -4503,8 +4503,9 @@ fn appendIndexReadinessStatus(
     // their own active-generation fence; enrichment uses the exact serving
     // snapshot proof so threshold waits can still consume published results.
     const full_text_serviceable = index_type == .full_text and
-        observation.observation_available and consumerCheckpointComplete(item) and
-        !repair_blocks_queryable;
+        (active_generation_serviceable or
+            (observation.observation_available and consumerCheckpointComplete(item) and
+                !repair_blocks_queryable));
     const serving_failed = aggregate_query_blocked or
         ((terminal_load_failure or repair_failed) and
             (!active_generation_serviceable or repair_blocks_queryable)) or
@@ -5314,6 +5315,16 @@ fn consumerTests() type {
             // full-text checkpoint. It does keep source completion failed.
             encoded.clearRetainingCapacity();
             try appendSingleIndexRuntimeStatus(a, &encoded, .full_text, item, 1, .strict, false, 7, 41, .{}, .{ .enabled = true, .worker_failed = true }, null, null, .{}, metadata, true);
+            try ant_json.testing.expectSubsetJsonText(a, "{\"readiness\":{\"queryable\":true,\"complete\":false}}", encoded.items);
+            // Preserve the existing serving proof for a repair retaining its
+            // old checkpoint while the candidate checkpoint is rebuilding.
+            var repairing = item;
+            repairing.index_lifecycle_work_class = .repair;
+            repairing.index_repair_status = .rebuilding;
+            repairing.index_repair_active_generation_serviceable = true;
+            repairing.projection_checkpoint_status = "rebuilding";
+            encoded.clearRetainingCapacity();
+            try appendSingleIndexRuntimeStatus(a, &encoded, .full_text, repairing, 1, .strict, false, 7, 41, .{}, null, null, null, .{}, metadata, true);
             try ant_json.testing.expectSubsetJsonText(a, "{\"readiness\":{\"queryable\":true,\"complete\":false}}", encoded.items);
             // New replay work changes the desired cut, not the readability of
             // the existing full-text checkpoint.
