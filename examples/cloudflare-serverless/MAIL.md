@@ -328,23 +328,40 @@ receive external mail. Select the inbox in the web app before composing.
    sender-domain setup before composing a new test. Rejected messages are
    not resent automatically.
 
-### Planned on-device mail classification
+### On-device GLiDE classification
 
-The GLiDE-0.4B checkpoint needs a browser decision adapter before it can be
-published in the mailbox catalog. Use the existing Antfly GLiDE prompt
-format, tokenizer assets, readout weights and option scoring. Validate the
-browser's CPU and WebGPU results against native decisions on the same
-checkpoint before enabling downloads in the UI.
+GLiDE-0.4B is a separate, optional model. On a message with plain text, select
+**Classify on this device (model download)** to see a suggested category and
+a separate importance flag. The action keeps message text on the device and
+leaves inbox ordering and message state alone. Uncertain categories remain
+in Primary. Image-bearing decision requests require a separate vision-capable
+model. GLiDE-0.4B accepts text only.
 
-Classify bounded message text into Primary, Updates, Promotions, Social or
-Forums. Keep Important independent. Start by showing suggestions and keep
-uncertain messages in Primary. Preserve user corrections across model
-upgrades. GLiDE-0.4B supports text only. For decisions with image content,
-require a model that advertises and implements image input rather than
-dropping the images.
+Prepare the licensed checkpoint and enable the optional UI in the runtime build:
 
-Keep the model opt-in and cache it independently from EmbeddingGemma 2.
-Publish a revision-pinned, hashed bundle with the upstream license and
-notices. Large weight files use multipart R2 uploads. Carry the Fastino
-attribution and check the checkpoint's commercial terms before enabling
-production use.
+```sh
+npm run publish:local-model -- --glide --model-dir ./glide-0.4b --out dist/glide-model
+LOCAL_GLIDE=1 npm run build:local
+```
+
+Upload the pinned files from the resulting catalog to
+`local-models/glide/` in the private model bucket using R2 S3 multipart.
+Publish `catalog.json` last. The first use downloads about 756 MiB. The app
+shows the Fastino attribution, and the model bundle includes the upstream
+license and notices. Check the commercial terms before enabling production use.
+
+For browser parity, set `GLIDE_MODEL` to the checkpoint directory. The
+built-in oracle uses Fastino revision
+`16fb9d63cc34d1b4b5a1fb7cbf2d9d4a3dd5ad71` with native Antfly CPU and covers
+choice, score and predicate decisions. Set `GLIDE_NATIVE_CASES` to override
+the oracle with JSON `{request, response}` pairs from
+`antfly inference decisions --backend native`. From the repository root, run:
+
+```sh
+EXTRACTION_WASM="$PWD/zig/zig-out/antfly-extraction-cpu.wasm" \
+  node --test zig/pkg/inference/web/test-glide-runtime.mjs
+EXTRACTION_GPU=1 node --test ts/packages/web/test/browser/glide-runtime.test.mjs
+```
+
+The WebGPU test requires a Chromium hardware adapter, both prepared WASM
+backends and a built `@antfly/web` client. It fails if execution falls back to CPU.

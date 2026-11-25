@@ -42,7 +42,8 @@ export class ExtractionSession {
     if (this.wasm.extraction_abi_version?.() !== 2) throw new Error('Extraction WASM ABI mismatch; rebuild browser assets');
     const bundle = await inspectBundle(files, precision);
     const read = path => bundle.files.get(path).text();
-    const metadata = { config: bundle.architecture === 'laya' ? JSON.stringify(bundle.config) : await read('config.json'), encoder_config: ['laya', 'embedding_similarity'].includes(bundle.architecture) ? JSON.stringify(bundle.encoderConfig) : await read('encoder_config/config.json'), tokenizer_config: await read('tokenizer_config.json'), precision: bundle.precision, tasks: bundle.execution.tasks, capabilities: bundle.capabilities };
+    const metadata = { config: bundle.architecture === 'laya' ? JSON.stringify(bundle.config) : await read('config.json'), encoder_config: ['glide', 'laya', 'embedding_similarity'].includes(bundle.architecture) ? JSON.stringify(bundle.encoderConfig) : await read('encoder_config/config.json'), tokenizer_config: await read('tokenizer_config.json'), precision: bundle.precision, tasks: bundle.execution.tasks, capabilities: bundle.capabilities };
+    if (bundle.architecture === 'glide') metadata.decision_config = await read('decision_config.json');
     if (bundle.architecture === 'embedding_similarity') {
       metadata.processor_config = await read('processor_config.json');
       metadata.sentence_config = await read('config_sentence_transformers.json');
@@ -75,6 +76,10 @@ export class ExtractionSession {
       this.handle = this.check(this.text(JSON.stringify(metadata), (ptr, len) => this.wasm.extraction_create(ptr, len)));
       const tokenizer = new Uint8Array(await bundle.files.get('tokenizer.json').arrayBuffer());
       this.check(this.bytes(tokenizer, (ptr, len) => this.wasm.extraction_tokenizer(this.handle, ptr, len)));
+      if (bundle.architecture === 'glide') {
+        const readout = new Uint8Array(await bundle.files.get('readout.safetensors').arrayBuffer());
+        this.check(this.bytes(readout, (ptr, len) => this.wasm.extraction_glide_readout(this.handle, ptr, len)));
+      }
       let weightHash, weightBytes = 0;
       for (let index = 0; index < bundle.weights.length; index++) {
         const path = bundle.weights[index], file = bundle.files.get(path);

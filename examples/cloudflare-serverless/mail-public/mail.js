@@ -337,6 +337,32 @@ function showOutbound(message) {
   notes.append(state);
   $("message").append(notes, text("pre", message.text));
 }
+async function addClassificationAction(message, toolbar) {
+  if (message.offline || !message.text?.trim()) return;
+  const response = await fetch("/local/config.json", { cache: "no-cache" });
+  if (!response.ok) return;
+  const config = await response.json();
+  if (!config.classifier || !toolbar.isConnected) return;
+  const button = text("button", "Classify on this device (model download)");
+  toolbar.append(button);
+  button.onclick = guarded(async () => {
+    button.disabled = true;
+    let classifier;
+    try {
+      const { createMailClassifier } = await import("./local-index.js");
+      classifier = await createMailClassifier(config, (progress) => {
+        if (progress.total) button.textContent = "Preparing classifier… " + Math.round(100 * progress.loaded / progress.total) + "%";
+      });
+      const label = await classifier.classify(message);
+      if (toolbar.isConnected) button.replaceWith(span("snippet", label.category + (label.important ? " · Important" : "") + " · Built with Fastino GLiDE"));
+    } finally {
+      classifier?.close();
+      button.disabled = false;
+      button.textContent = "Classify on this device (model download)";
+    }
+  });
+}
+
 async function openMessage(id) {
   let message;
   try {
@@ -379,6 +405,7 @@ async function openMessage(id) {
       "To " + message.to
     )
   );
+  if (me) addClassificationAction(message, toolbar).catch(() => {});
   const notes = document.createElement("div");
   notes.className = "notes";
   const note = (value, tone = "") => {

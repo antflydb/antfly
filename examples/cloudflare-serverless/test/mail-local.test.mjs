@@ -209,6 +209,11 @@ function env(overrides = {}) {
             files: [{ path: "model.safetensors", url: "/local/models/model.safetensors", sha256: "a".repeat(64), size_bytes: 4 }],
           }),
           "local-models/model.safetensors": "wgts",
+          "local-models/glide/catalog.json": JSON.stringify({
+            id: "glide",
+            files: [{ path: "model.safetensors", sha256: "b".repeat(64), size_bytes: 5 }],
+          }),
+          "local-models/glide/model.safetensors": "glide",
         };
         return key in objects ? { body: objects[key], size: objects[key].length } : null;
       },
@@ -221,6 +226,17 @@ function env(overrides = {}) {
   };
 }
 const get = (path, e, headers = {}) => worker.fetch(new Request("https://mail.example.test" + path, { headers }), e);
+
+test("classifier catalog requires sign-in and file grants are namespaced", async () => {
+  const e = env();
+  const anonymous = env({ AUTH_SERVICE: { session: async () => ({ session: null, cookies: [] }) } });
+  const path = "/local/models/glide/catalog.json";
+  assert.equal((await get(path, anonymous)).status, 401);
+  const [file] = (await (await get(path, e)).json()).files;
+  assert.match(file.url, /^\/local\/models\/glide\/model\.safetensors\?grant=/);
+  assert.equal(await (await get(file.url, anonymous)).text(), "glide");
+  assert.equal((await get(file.url.replace("/glide/", "/"), anonymous)).status, 401);
+});
 
 test("sync and model routes are scoped to the signed-in mailbox", async () => {
   const e = env();

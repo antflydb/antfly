@@ -92,6 +92,7 @@ export async function inspectBundle(input, precision, signal) {
     laya.mask_token = typeof mask === 'string' ? mask : mask.content;
     config = { ...config, laya };
   }
+  if (files.has('decision_config.json')) config = { ...config, glideDecision: await readJson(files, 'decision_config.json') };
   const isLaya = ['modernbert', 'modern_bert'].includes(config.model_type) && config.laya && typeof config.laya === 'object';
   if (isLaya) {
     for (const key of ['attention_bias', 'mlp_bias', 'norm_bias']) if (config[key]) throw new Error(`Unsupported Laya encoder: ${key}`);
@@ -104,7 +105,7 @@ export async function inspectBundle(input, precision, signal) {
     }
   }
   const isEmbedding = ['embedding_gemma2', 'embedding_gemma2_text'].includes(config.model_type);
-  const encoderConfig = isLaya || isEmbedding ? config : await readJson(files, 'encoder_config/config.json');
+  const encoderConfig = config.glideDecision || isLaya || isEmbedding ? config : await readJson(files, 'encoder_config/config.json');
   await readJson(files, 'tokenizer_config.json');
   if (!files.has('tokenizer.json') || files.get('tokenizer.json').size > 32 * 1024 ** 2) throw new Error('Missing or oversized tokenizer.json');
   const manifest = await readModelManifest(files);
@@ -113,7 +114,14 @@ export async function inspectBundle(input, precision, signal) {
   const architecture = descriptor.adapter;
   const variants = [...files.keys()].filter(p => /(^|\/)model\.gguf$/.test(p) || /(^|\/)encoder_model\.gguf$/.test(p));
   let weights;
-  if (architecture === 'embedding_similarity') {
+  if (architecture === 'glide') {
+    if (!files.has('readout.safetensors') || files.get('readout.safetensors').size > 4 * 1024 ** 2)
+      throw new Error('Missing or oversized GLiDE readout');
+    const index = await readJson(files, 'model.safetensors.index.json');
+    weights = [...new Set(Object.values(index.weight_map ?? {}))];
+    if (weights.length !== 1 || !/^model-\d+-of-\d+\.safetensors$/.test(weights[0]) || !files.has(weights[0]))
+      throw new Error('GLiDE requires a complete single-shard encoder');
+  } else if (architecture === 'embedding_similarity') {
     for (const path of ['processor_config.json', 'config_sentence_transformers.json', '1_Pooling/config.json']) await readJson(files, path);
     if (!files.has('model.safetensors')) throw new Error('EmbeddingGemma2 requires model.safetensors');
     weights = ['model.safetensors'];
@@ -136,12 +144,12 @@ export async function inspectBundle(input, precision, signal) {
   if (architecture === 'boundary' && weights.length !== 1) throw new Error('Select exactly one boundary model variant');
   let receipt = null;
   if (files.has('antfly_inference_bundle.json')) receipt = await readJson(files, 'antfly_inference_bundle.json', 65536);
-  const layaTensors = (['laya', 'embedding_similarity'].includes(architecture) || (architecture === 'decide' && ['modernbert', 'modern_bert'].includes(encoderConfig.model_type))) && weights[0].endsWith('.safetensors') && !precision ? await tensorDirectory(files.get(weights[0]), 'safetensors') : null;
+  const layaTensors = (['glide', 'laya', 'embedding_similarity'].includes(architecture) || (architecture === 'decide' && ['modernbert', 'modern_bert'].includes(encoderConfig.model_type))) && weights[0].endsWith('.safetensors') && !precision ? await tensorDirectory(files.get(weights[0]), 'safetensors') : null;
   const layaPrecision = layaTensors ? (layaTensors.some(t => t.kind === 30) ? 'bf16' : layaTensors.some(t => t.kind === 1) ? 'fp16' : 'fp32') : null;
   const selectedPrecision = precision || receipt?.precision || layaPrecision || (weights.every(p => p.endsWith('.safetensors')) ? 'fp32' : /q4_k/i.test(weights[0]) ? 'q4_k' : /q8_0/i.test(weights[0]) ? 'q8_0' : /q4_0/i.test(weights[0]) ? 'q4_0' : null);
   if (!['fp32', 'fp16', 'bf16', 'fp16_encoder', 'q8_0', 'q4_k', 'q4_0'].includes(selectedPrecision)) throw new Error('Unknown precision: provide a bundle receipt or select precision explicitly');
   if (architecture === 'laya' && !['fp16', 'fp32', 'bf16'].includes(selectedPrecision)) throw new Error('Laya supports dense FP16/FP32/BF16 SafeTensors, not GLiNER quantized bundles');
-  if (!['laya', 'embedding_similarity'].includes(architecture) && !(architecture === 'decide' && ['modernbert', 'modern_bert'].includes(encoderConfig.model_type)) && selectedPrecision === 'bf16') throw new Error('BF16 browser bundles are supported for Laya/OpenDecider');
+  if (!['glide', 'laya', 'embedding_similarity'].includes(architecture) && !(architecture === 'decide' && ['modernbert', 'modern_bert'].includes(encoderConfig.model_type)) && selectedPrecision === 'bf16') throw new Error('BF16 browser bundles are supported for Laya/OpenDecider');
   if (architecture === 'embedding_similarity' && !['bf16', 'fp32'].includes(selectedPrecision)) throw new Error('EmbeddingGemma2 supports native BF16/FP32 SafeTensors');
   if (architecture === 'boundary' && ['modernbert', 'modern_bert'].includes(encoderConfig.model_type) && selectedPrecision !== 'fp32') throw new Error('ModernBERT boundary requires its native FP32 artifact profile');
   const reason = await configurationReason(files, config, encoderConfig, selectedPrecision, signal);
