@@ -259,10 +259,8 @@ The retrieval agent plans the query, runs the search, and hands the results to a
 <Steps>
 ### Pull a generation model
 
-This example uses Gemma 4 E2B IT in a quantized GGUF build. The smaller E2B model reduces memory use for local generation.
-
 ```bash
-antfly inference pull hf:ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_0 \
+antfly inference pull hf:google/gemma-4-E2B-it-qat-q4_0-gguf:gguf \
   --tasks generate \
   --projector auto
 ```
@@ -281,7 +279,7 @@ antfly agents retrieval --table wikipedia \
   --limit 5 \
   --generator '{
     "provider": "antfly",
-    "model": "hf:ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_0",
+    "model": "google/gemma-4-E2B-it-qat-q4_0-gguf",
     "max_tokens": 512
   }' \
   --max-internal-iterations 8 \

@@ -22,7 +22,7 @@ Antfly running with an indexed table and the Gemma 4 E2B IT generation model pul
 
 ```bash
 curl -s http://127.0.0.1:8080/db/v1/tables/docs | head -c 300
-antfly inference pull hf:ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_0 --tasks generate --projector auto
+antfly inference pull hf:google/gemma-4-E2B-it-qat-q4_0-gguf:gguf --tasks generate --projector auto
 ```
 
 ### Connect from the browser
@@ -131,7 +131,7 @@ import {
   renderThumbsUpDown,
 } from '@antfly/components'
 
-const GENERATOR = { provider: 'antfly', model: 'hf:ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_0' }
+const GENERATOR = { provider: 'antfly', model: 'google/gemma-4-E2B-it-qat-q4_0-gguf' }
 
 export function AnswerBox() {
   return (
