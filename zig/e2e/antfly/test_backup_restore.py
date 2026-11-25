@@ -2826,12 +2826,24 @@ def _exercise_online_document_merge(
     return table_name
 
 
-@pytest.mark.parametrize(
-    "damage_sibling", [False, True], ids=["healthy", "damaged-sibling"]
-)
 def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
     three_by_three_backup_cluster: ThreeByThreeBackupCluster,
-    damage_sibling: bool,
+) -> None:
+    _three_by_three_cluster_backup_restore(three_by_three_backup_cluster)
+
+
+def test_distributed_cluster_restore_continues_after_damaged_sibling(
+    three_by_three_backup_cluster: ThreeByThreeBackupCluster,
+) -> None:
+    _three_by_three_cluster_backup_restore(
+        three_by_three_backup_cluster, damage_sibling=True
+    )
+
+
+def _three_by_three_cluster_backup_restore(
+    three_by_three_backup_cluster: ThreeByThreeBackupCluster,
+    *,
+    damage_sibling: bool = False,
 ) -> None:
     cluster = three_by_three_backup_cluster
     table_name = f"metadata_leader_backup_{time.time_ns()}"
