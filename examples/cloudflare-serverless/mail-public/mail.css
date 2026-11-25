@@ -163,19 +163,21 @@ button.icon-only .icon { width: 16px; height: 16px; }
   align-items: center;
   gap: 0.4rem;
   margin: 1rem 1rem 0.4rem;
-  padding: 0 0.35rem 0 0.85rem;
+  padding: 0 0.75rem 0 0.85rem;
   border: 1px solid var(--input);
   border-radius: 999px;
   background: var(--surface);
   color: var(--muted);
 }
 #search:focus-within { border-color: var(--foreground); color: var(--foreground); }
-#search input { border: 0; background: none; outline: 0; min-width: 0; flex: 1; padding: 0.6rem 0.2rem; }
+#search input { border: 0; background: none; color: var(--foreground); outline: 0; min-width: 0; flex: 1; padding: 0.6rem 0.2rem; }
 #search input:-webkit-autofill, #search input:autofill { -webkit-text-fill-color: var(--foreground); box-shadow: 0 0 0 100px var(--surface) inset; transition: background-color 9999s; }
 #search input::-webkit-search-cancel-button { -webkit-appearance: none; appearance: none; width: 14px; height: 14px; cursor: pointer; background: var(--muted); -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round'%3E%3Cpath d='M6 6l12 12M18 6 6 18'/%3E%3C/svg%3E") center / contain no-repeat; mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round'%3E%3Cpath d='M6 6l12 12M18 6 6 18'/%3E%3C/svg%3E") center / contain no-repeat; }
 #search input::-webkit-search-cancel-button:hover { background: var(--foreground); }
 #search select { width: auto; border: 0; background: var(--hover); border-radius: 999px; font-size: 12px; padding: 0.3rem 0.5rem; color: var(--muted); }
-.search-go { border: 0; background: none; border-radius: 999px; padding: 0.4rem 0.75rem; font-size: 13px; color: var(--muted); }
+/* The magnifier is the submit button; Enter works too. */
+.search-go { display: inline-flex; border: 0; background: none; border-radius: 999px; padding: 0.35rem; margin-left: -0.4rem; color: inherit; cursor: pointer; }
+.search-go:hover { background: var(--hover); color: var(--foreground); }
 #search-note { padding: 0 1.25rem 0.75rem; }
 #list-title { font-size: 15px; font-weight: 600; padding: 0.25rem 1.25rem 0.5rem; }
 #trash-banner { margin: 0 1rem 0.5rem; padding: 0.65rem 0.8rem; background: var(--hover); border-radius: var(--radius); font-size: 13px; color: var(--muted); }

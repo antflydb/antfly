@@ -64,9 +64,8 @@
 
   <section class="list" aria-label="Messages">
     <form id="search" role="search">
-      <svg class="icon" aria-hidden="true"><use href="#i-search"/></svg><input name="query" type="search" autocomplete="off" aria-label="Search messages" placeholder="Search your mail" required maxlength="1024">
+      <button class="search-go" aria-label="Search" title="Search"><svg class="icon" aria-hidden="true"><use href="#i-search"/></svg></button><input name="query" type="search" autocomplete="off" aria-label="Search messages" placeholder="Search your mail" required maxlength="1024">
       <select name="where" id="search-where" aria-label="Search location" hidden><option value="device">This device</option><option value="server">Server</option></select>
-      <button aria-label="Search" class="search-go">Search</button>
     </form>
     <p id="search-note" class="credit"><svg class="mark" aria-hidden="true"><use href="#mark"/></svg><span id="search-note-text">Search by Antfly</span></p>
     <h2 id="list-title">Inbox</h2>
