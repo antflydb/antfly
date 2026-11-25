@@ -42,26 +42,32 @@ async function signingKey(issuer, kid) {
   return crypto.subtle.importKey("jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
 }
 
-export async function accessIdentity(token, { issuer, audience }) {
-  if (!token || token.length > 16384) return null;
+export async function accessIdentity(token, { issuer, audience }, onReject = () => {}) {
+  function reject(reason) {
+    onReject(reason);
+    return null;
+  }
+  if (!token) return reject("AccessAssertionMissing");
+  if (token.length > 16384) return reject("AccessAssertionMalformed");
   try {
     const parts = token.split(".");
-    if (parts.length !== 3) return null;
+    if (parts.length !== 3) return reject("AccessAssertionMalformed");
     const [header, payload, signature] = parts;
     const decode = (part) => JSON.parse(new TextDecoder().decode(bytes(part)));
     const { alg, kid } = decode(header);
     const { iss, aud, exp, nbf, sub, email, type } = decode(payload);
     const now = Date.now() / 1000;
-    if (alg !== "RS256" || typeof kid !== "string" || iss !== issuer ||
-        !Array.isArray(aud) || !aud.includes(audience) || !Number.isFinite(exp) || exp <= now ||
+    if (iss !== issuer) return reject("AccessIssuerMismatch");
+    if (!Array.isArray(aud) || !aud.includes(audience)) return reject("AccessAudienceMismatch");
+    if (alg !== "RS256" || typeof kid !== "string" || !Number.isFinite(exp) || exp <= now ||
         (nbf !== undefined && (!Number.isFinite(nbf) || nbf > now)) ||
         type !== "app" || typeof sub !== "string" || !sub ||
-        typeof email !== "string" || !email.includes("@")) return null;
+        typeof email !== "string" || !email.includes("@")) return reject("AccessClaimsInvalid");
     const key = await signingKey(issuer, kid);
     if (!(await crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, bytes(signature),
-      new TextEncoder().encode(header + "." + payload)))) return null;
+      new TextEncoder().encode(header + "." + payload)))) return reject("AccessSignatureInvalid");
     return { id: "access:" + issuer + ":" + sub, email, name: email };
   } catch {
-    return null;
+    return reject("AccessVerificationFailed");
   }
 }

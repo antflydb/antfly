@@ -135,10 +135,12 @@ export class MailAuth extends DurableObject {
   async session(headerEntries) {
     if (this.access) {
       const token = new Headers(headerEntries).get("Cf-Access-Jwt-Assertion");
-      const user = await accessIdentity(token, this.access);
+      let accessError;
+      const user = await accessIdentity(token, this.access, (reason) => { accessError = reason; });
       return {
         session: user ? { user, mailbox: await this.teamMailbox(), auth: "access" } : null,
         cookies: [],
+        ...(accessError ? { accessError } : {}),
       };
     }
     await this.ensureReady();
