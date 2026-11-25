@@ -31000,10 +31000,10 @@ test "enrichment runtime graph materializer rejects non-finite mapped weights" {
     var dependent = request;
     dependent.upstream_artifact_name = "relations_v1";
     var queued: std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest) = .empty;
-    defer queued.deinit(alloc);
+    defer queued.deinit(runtime.alloc);
     var sources = PreparedDocumentSourceCache.init(runtime);
     defer sources.deinit();
-    var window = GeneratedReplayWindow{ .alloc = alloc };
+    var window = GeneratedReplayWindow{ .alloc = runtime.alloc };
     defer window.deinit();
     const fingerprint = requestFailureFingerprint(request);
     setActiveFailureFingerprint(runtime, fingerprint);
