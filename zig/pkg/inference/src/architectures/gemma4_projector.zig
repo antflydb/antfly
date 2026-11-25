@@ -876,7 +876,10 @@ const ProjectorWeights = struct {
     }
 
     fn residentWeight(self: *const ProjectorWeights, name: []const u8) !CT {
-        if (@import("build_options").enable_metal and self.cb.kind() == .metal and platform.env.getenvBool("ANTFLY_INFERENCE_METAL_RESIDENT_PROJECTOR")) {
+        const model_owned = if (self.owner) |owner| !owner.owns_gguf else false;
+        if (@import("build_options").enable_metal and self.cb.kind() == .metal and
+            (model_owned or platform.env.getenvBool("ANTFLY_INFERENCE_METAL_RESIDENT_PROJECTOR")))
+        {
             if (self.gguf) |projector_source| {
                 const metal = @import("../ops/metal_compute.zig").MetalCompute;
                 return (try metal.borrowProjectorWeight(self.cb, projector_source, name)) orelse error.MissingWeight;

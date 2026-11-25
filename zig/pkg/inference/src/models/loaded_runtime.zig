@@ -1718,7 +1718,7 @@ pub const Runtime = struct {
         const physical = try proof.artifacts().constructionPath(path);
         defer self.allocator.free(physical);
         try proof.artifacts().verifyPath(physical);
-        const source = if (self.session.backend() == .metal and platform.env.getenvBool("ANTFLY_INFERENCE_METAL_RESIDENT_PROJECTOR"))
+        const source = if (self.session.backend() == .metal and @import("../execution/gemma4_native_plan.zig").metalResidentProjectorEnabled(session_factory.getGptConfig(self.session)))
             session_factory.getAuxiliaryProjectorStore(self.session)
         else
             null;

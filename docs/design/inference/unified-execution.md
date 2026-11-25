@@ -1003,3 +1003,32 @@ disabled packed preparation and B used the default with no override. All 30
 publications matched exactly, including three phrase segments and timestamp
 offsets. The pooled warm p50 was 1413.81 ms with the override and 1374.38 ms
 with the default on M4 Max, a 2.8% reduction.
+
+### Gemma 4 resident Metal projection
+
+The qualified Gemma 4 E2B and E4B channel geometries use the verified
+model-owned projector inventory by default on Metal. The existing
+`ANTFLY_INFERENCE_METAL_RESIDENT_PROJECTOR=0` override disables this policy.
+
+A same-binary M4 Max comparison used the official Google QAT Q4_0 GGUF
+checkpoints and projectors, with 12 warm requests per case with the policy
+disabled and eight with the default. All responses matched exactly within
+each case. Warm p50 latency in milliseconds:
+
+| Checkpoint | Image disabled → default | Silent video disabled → default |
+| --- | ---: | ---: |
+| E2B | 1084.52 → 740.02 | 933.40 → 601.07 |
+| E4B | 1333.56 → 983.89 | 1149.18 → 819.58 |
+
+A separate warm loopback comparison used llama.cpp `b12706`, F16 K/V,
+no prompt reuse and a 48-token output cap. Both engines passed the four
+short semantic fixtures. Cells are Antfly / llama.cpp p50 milliseconds,
+with eight measured requests per engine and case. The Spark GPU had other
+resident CUDA contexts during the comparison.
+
+| Checkpoint and device | Text | Image | Audio | Silent video |
+| --- | ---: | ---: | ---: | ---: |
+| E2B M4 Max Metal | 472 / 223 | 740 / 314 | 251 / 121 | 600 / 363 |
+| E4B M4 Max Metal | 567 / 436 | 987 / 517 | 332 / 211 | 818 / 620 |
+| E2B Spark GB10 CUDA | 248 / 214 | 348 / 275 | 161 / 126 | 246 / 280 |
+| E4B Spark GB10 CUDA | 352 / 324 | 540 / 462 | 260 / 215 | 386 / 464 |

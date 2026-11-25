@@ -13,13 +13,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Native CUDA Gemma4 policy shared by model loading and request execution.
+//! Native Gemma4 policy shared by model loading and request execution.
 //! Decode continues to use the quantized primary weights and the same paged KV.
 const std = @import("std");
 const platform = @import("antfly_platform");
 const Config = @import("../models/gpt.zig").Config;
 
 pub const Projection = enum { packed_q4, bf16_donors };
+
+/// Prefer the shared verified projector inventory for qualified channel
+/// geometry. Other layouts keep explicit opt-in and the ordinary fallback.
+pub fn metalResidentProjectorEnabled(config: ?Config) bool {
+    const qualified = if (config) |model| model.usesGemma4Channels() and automaticGeometry(model) else false;
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_METAL_RESIDENT_PROJECTOR", qualified);
+}
 
 /// Explicit values, including off/invalid values, override automatic policy.
 /// Probe only the same default device used by CudaContext; no context or model

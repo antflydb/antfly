@@ -1325,7 +1325,7 @@ pub fn prepare(
             // resident like any other weight, so a media request no longer
             // reads and dequantizes the encoder from disk.
             const resident_projector = backend_type == .metal and arch_config == .gpt and
-                arch_config.gpt.usesGemma4Channels() and platform.env.getenvBool("ANTFLY_INFERENCE_METAL_RESIDENT_PROJECTOR");
+                arch_config.gpt.usesGemma4Channels() and @import("../execution/gemma4_native_plan.zig").metalResidentProjectorEnabled(arch_config.gpt);
             const projector_names = if (resident_projector)
                 try tensor_store.?.auxiliaryTensorNames(allocator)
             else
