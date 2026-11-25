@@ -128,6 +128,11 @@ export default function Listener({ children, onChange }: ListenerProps) {
       .sort();
   }
 
+  const widgetScopes = [...widgets].map(([id, widget]): [string, unknown] => [
+    id,
+    [widget.table, widget.filterQuery, widget.exclusionQuery, widget.rootQuery],
+  ]);
+
   // Track change groups using the actual widget inputs that drive requests.
   // This keeps autosuggest keystrokes isolated from submitted search widgets
   // while still invalidating correctly when configuration or backend context changes.
@@ -136,12 +141,14 @@ export default function Listener({ children, onChange }: ListenerProps) {
     queries: entriesForGroup(queries.entries(), true),
     semanticQueries: entriesForGroup(semanticQueries.entries(), true),
     configurations: entriesForGroup(configurations.entries(), true),
+    scopes: entriesForGroup(widgetScopes, true),
   });
   const nonAutosuggestGroupKey = JSON.stringify({
     context: { url, table, headers },
     queries: entriesForGroup(queries.entries(), false),
     semanticQueries: entriesForGroup(semanticQueries.entries(), false),
     configurations: entriesForGroup(configurations.entries(), false),
+    scopes: entriesForGroup(widgetScopes, false),
   });
 
   // Track previous group keys to determine which request families changed.
@@ -219,9 +226,7 @@ export default function Listener({ children, onChange }: ListenerProps) {
                     if (!widget || r.isAutosuggest || widget.isAutosuggest || widget.wantResults) {
                       return false;
                     }
-                    const facetOwner = widget.isFacet
-                      ? (widget.configuration as FacetWidgetConfig)?.resultsId
-                      : undefined;
+                    const facetOwner = widget.isFacet ? widget.configuration?.resultsId : undefined;
                     return (
                       (!facetOwner || facetOwner === id) &&
                       resolveTable(widget.table, table) === tableName &&
@@ -332,7 +337,7 @@ export default function Listener({ children, onChange }: ListenerProps) {
                       if (queryId === owner) return true;
                       const widget = widgets.get(queryId);
                       const facetOwner = widget?.isFacet
-                        ? (widget.configuration as FacetWidgetConfig)?.resultsId
+                        ? widget.configuration?.resultsId
                         : undefined;
                       return (
                         (!facetOwner || facetOwner === owner) &&
