@@ -40397,13 +40397,17 @@ const DenseAssignedAttention = struct {
             // The selected native policy uses F16 paged storage. Reproduce its
             // storage boundary inside the assigned operation, with graph-owned
             // scratch instead of capturing any request's KV address.
+            const native_warp = if (self.gemma4_native_plan) |plan|
+                plan.warp_decode and self.kernels.f16WarpSplitSelected(result.heads, result.kv_heads, result.dimension, 2, 2)
+            else
+                false;
             result.compact_kv = self.gemma4_native_plan != null and
-                result.heads == 8 and result.kv_heads == 2 and (result.dimension == 256 or result.dimension == 512) and
+                result.heads == 8 and (result.kv_heads == 2 or (result.queries == 1 and native_warp)) and
+                (result.dimension == 256 or result.dimension == 512) and
                 self.kernels.gqa_attention_decode_turboquant_f32 != null;
             if (result.compact_kv) {
                 const capacity = std.mem.alignForward(usize, result.keys, 16);
                 result.kv_bytes = try checkedMul(try checkedMul(try checkedMul(capacity, result.kv_heads), result.dimension), 4);
-                const native_warp = self.gemma4_native_plan.?.warp_decode and self.kernels.f16WarpSplitSelected(result.heads, result.kv_heads, result.dimension, 2, 2);
                 // Keep explicit schedule overrides and the eager kernel's
                 // short-context decline. Only a single final query can split.
                 if (native_warp and result.queries == 1 and !self.kernels.gqaSplitkOnlineDecodeProfileSelected() and
