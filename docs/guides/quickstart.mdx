@@ -260,7 +260,7 @@ The retrieval agent plans the query, runs the search, and hands the results to a
 ### Pull a generation model
 
 ```bash
-antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0 \
+antfly inference pull hf:google/gemma-4-E2B-it-qat-q4_0-gguf:gguf \
   --tasks generate \
   --projector auto
 ```
@@ -279,7 +279,7 @@ antfly agents retrieval --table wikipedia \
   --limit 5 \
   --generator '{
     "provider": "antfly",
-    "model": "ggml-org/gemma-4-E4B-it-GGUF",
+    "model": "google/gemma-4-E2B-it-qat-q4_0-gguf",
     "max_tokens": 512
   }' \
   --max-internal-iterations 8 \

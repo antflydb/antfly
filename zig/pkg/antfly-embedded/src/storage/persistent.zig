@@ -2704,21 +2704,25 @@ pub const PersistentIndex = struct {
     /// index's segment/range/active-set records must scope them exactly
     /// the same way `native_catalog_sink.zig`'s `Sink.submit` does, or
     /// they will not be found by this index's own reads.
-    /// Whether `key`'s current version at the tip is at least as new as
-    /// `version`: a copy at `version` is already published or superseded.
-    /// Replaying a record some process already applied would add a second
-    /// copy of a published version; a merge that drops one copy prunes the
-    /// version from the dead set while the other still carries it, and the
-    /// overwritten copy is live again. False without tip reads.
-    pub fn versionCoveredAtTip(self: *PersistentIndex, alloc: Allocator, key: []const u8, version: u64) !bool {
-        if (!self.versioned) return false;
+    /// Reads a batch of version-map keys at one committed catalog cut.
+    pub fn loadVersionsAtTip(self: *PersistentIndex, alloc: Allocator, keys: []const []const u8, versions: []?u64) !void {
+        std.debug.assert(keys.len == versions.len);
+        @memset(versions, null);
+        if (!self.versioned or !self.resolvesAtTip()) return;
         const backend = switch (self.main_store_owner) {
             .native_catalog => |backend| backend,
-            .mem, .lsm => return false,
+            .mem, .lsm => return,
         };
-        const bytes = (try backend.loadTipOneAlloc(alloc, native_catalog_backend.tip_namespace, key)) orelse return false;
-        defer alloc.free(bytes);
-        return DocVersion.order(version) <= DocVersion.order(try DocVersion.decode(bytes));
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const lookups = try scratch.alloc(native_catalog_backend.Mutation, keys.len);
+        for (keys, lookups) |key, *lookup| lookup.* = .{ .namespace = native_catalog_backend.tip_namespace, .key = key };
+        const values = try scratch.alloc(?[]const u8, keys.len);
+        try backend.loadCommittedValues(scratch, lookups, values);
+        for (values, versions) |value, *version| if (value) |bytes| {
+            version.* = try DocVersion.decode(bytes);
+        };
     }
 
     pub fn nativeCatalogScope(self: *const PersistentIndex) ?[]const u8 {
@@ -6815,25 +6819,21 @@ test "persistent index reports versions the tip already covers" {
     const first = try buildSimpleSegment(alloc, "doc:a", "alpha");
     defer alloc.free(first);
     try pi.indexSegment(first);
-    const v1 = (try test_sink.docVersion("doc:a")).?;
     const second = try buildSimpleSegment(alloc, "doc:a", "beta");
     defer alloc.free(second);
     try pi.indexSegment(second);
     const v2 = (try test_sink.docVersion("doc:a")).?;
 
-    // Superseded and current versions are covered; a newer one and an
-    // unknown key are not.
-    try std.testing.expect(try pi.versionCoveredAtTip(alloc, "doc:a", v1));
-    try std.testing.expect(try pi.versionCoveredAtTip(alloc, "doc:a", v2));
-    const v3 = try DocVersion.of(nextTestWriteSequence(), 0);
-    try std.testing.expect(!try pi.versionCoveredAtTip(alloc, "doc:a", v3));
-    try std.testing.expect(!try pi.versionCoveredAtTip(alloc, "doc:never", v1));
+    var versions: [2]?u64 = undefined;
+    try pi.loadVersionsAtTip(alloc, &.{ "doc:a", "doc:never" }, &versions);
+    try std.testing.expectEqual(@as(?u64, v2), versions[0]);
+    try std.testing.expectEqual(@as(?u64, null), versions[1]);
 
-    // A delete covers everything up to its version, not a later write.
     const delete_version = try DocVersion.of(nextTestWriteSequence(), 0);
     try pi.deleteVersioned(&.{"doc:a"}, &.{delete_version});
-    try std.testing.expect(try pi.versionCoveredAtTip(alloc, "doc:a", v3));
-    try std.testing.expect(!try pi.versionCoveredAtTip(alloc, "doc:a", try DocVersion.of(nextTestWriteSequence(), 0)));
+    try pi.loadVersionsAtTip(alloc, &.{ "doc:a", "doc:never" }, &versions);
+    try std.testing.expectEqual(DocVersion.order(delete_version), DocVersion.order(versions[0].?));
+    try std.testing.expectEqual(@as(?u64, null), versions[1]);
 }
 
 // A merge decides nothing per document: a write another process commits

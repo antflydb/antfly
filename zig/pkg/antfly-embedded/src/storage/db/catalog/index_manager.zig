@@ -22105,6 +22105,17 @@ pub const IndexManager = struct {
         return @intCast(snap.segments.len);
     }
 
+    /// Used on the foreground path before attempting producer assistance.
+    /// Segment count is available directly from the pinned snapshot.
+    pub fn textMergeAtSegmentCap(self: *IndexManager, cap: u64) bool {
+        for (self.text_indexes.items) |*entry| {
+            const snapshot = entry.persistent.acquireSnapshot();
+            defer snapshot.release();
+            if (snapshot.segments.len >= cap) return true;
+        }
+        return false;
+    }
+
     fn textMergeStatsWithPrune(self: *IndexManager, prune_expired: bool) types.TextMergeStats {
         const now_ns = platform_time.monotonicNs();
         if (prune_expired) self.text_merge_scheduler.pruneExpiredQuarantines(self.alloc, now_ns);
@@ -27135,6 +27146,10 @@ pub const IndexManager = struct {
     }
 
     pub fn beginTextMergeTask(self: *IndexManager) !?TextMergeTask {
+        return self.beginTextMergeTaskWithPressure(0, false);
+    }
+
+    pub fn beginTextMergeTaskWithPressure(self: *IndexManager, segment_cap: u64, producer_waiting: bool) !?TextMergeTask {
         const now_ns = platform_time.monotonicNs();
         self.text_merge_scheduler.pruneExpiredQuarantines(self.alloc, now_ns);
         _ = self.textMergeStats();
@@ -27142,12 +27157,22 @@ pub const IndexManager = struct {
             self.text_merge_scheduler.deferred_for_pressure += 1;
             return null;
         }
+        if (producer_waiting or segment_cap != 0) {
+            for (self.text_indexes.items) |*entry| {
+                const snapshot = entry.persistent.acquireSnapshot();
+                defer snapshot.release();
+                const segment_count = snapshot.segments.len;
+                if (segment_count >= 2 and (producer_waiting or (segment_cap != 0 and segment_count >= segment_cap))) {
+                    TextMergeScheduler.schedule(entry);
+                }
+            }
+        }
         var attempts: usize = 0;
         while (attempts < self.text_indexes.items.len) : (attempts += 1) {
             const idx = self.text_merge_scheduler.select(self.text_indexes.items) orelse return null;
             const entry = &self.text_indexes.items[idx];
             const has_in_flight = self.text_merge_scheduler.indexHasInFlight(entry.config.name);
-            const maybe_task = self.beginTextMergeTaskForEntry(entry) catch |err| switch (err) {
+            const maybe_task = self.beginTextMergeTaskForEntryWithPressure(entry, segment_cap, producer_waiting) catch |err| switch (err) {
                 error.ResourceBudgetExceeded => {
                     self.text_merge_scheduler.deferred_for_pressure += 1;
                     return null;
@@ -27572,6 +27597,10 @@ pub const IndexManager = struct {
     }
 
     fn beginTextMergeTaskForEntry(self: *IndexManager, entry: *TextIndex) !?TextMergeTask {
+        return self.beginTextMergeTaskForEntryWithPressure(entry, 0, false);
+    }
+
+    fn beginTextMergeTaskForEntryWithPressure(self: *IndexManager, entry: *TextIndex, segment_cap: u64, producer_waiting: bool) !?TextMergeTask {
         if (entry.backfill_active.load(.acquire) != 0) return error.IndexApplyBusy;
         // Full-text replay holds this mutex while changing the shared deletion
         // bitmap. Keep planning and cloning in one short critical section so a
@@ -27606,6 +27635,7 @@ pub const IndexManager = struct {
         if (infos.items.len < 2) return null;
 
         const policy = activeTextMergePolicy();
+        const pressure = producer_waiting or (segment_cap != 0 and snap.segments.len >= segment_cap);
         // Inline writes publish one small level-0 record each. Fold them
         // wide and first: a tier-sized merge of ten cannot keep up with
         // them, and producer admission counts every one.
@@ -27619,7 +27649,7 @@ pub const IndexManager = struct {
                 try picked.append(self.alloc, info.index);
                 bytes += info.size;
             }
-            if (picked.items.len < level0_fold_min_records) {
+            if (picked.items.len < (if (pressure) @as(usize, 2) else level0_fold_min_records)) {
                 picked.deinit(self.alloc);
                 break :level0 null;
             }
@@ -27627,7 +27657,7 @@ pub const IndexManager = struct {
         };
         // Waiting level-0 records stay out of the tiered and forced plans,
         // which would otherwise fold them a few at a time.
-        if (level0_plan == null) {
+        if (level0_plan == null and !pressure) {
             var kept: usize = 0;
             for (infos.items) |info| {
                 if (persistent_mod.isL0SegmentId(snap.segments[info.index].id)) continue;
@@ -27648,7 +27678,7 @@ pub const IndexManager = struct {
             // against a scheduler that gave up.
             // Count only what the plan may take: waiting level-0 records would
             // otherwise keep re-draining the same few merged segments.
-            if (infos.items.len <= policy.max_segments_per_tier) return null;
+            if (!pressure and infos.items.len <= policy.max_segments_per_tier) return null;
             self.text_merge_scheduler.forced_drains += 1;
             break :blk try text_index_maintenance.planForceDrainFromInfos(
                 self.alloc,

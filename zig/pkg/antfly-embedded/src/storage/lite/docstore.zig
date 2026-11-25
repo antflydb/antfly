@@ -11573,7 +11573,7 @@ test "lite maintenance upgrades a v11 redo file without reclamation debt" {
     defer store.close();
     try std.testing.expectEqual(native.format_version, store.file.header.diskFormatVersion());
     try store.maintainOnce(false);
-    try std.testing.expectEqual(native.segmented_redo_format_version, store.file.header.diskFormatVersion());
+    try std.testing.expectEqual(native.segmented_redo_format_version | native.sealed_redo_format_bit, store.file.header.diskFormatVersion());
     var read = try store.beginRead();
     defer read.abort();
     try std.testing.expectEqualStrings("old", try read.get("doc"));
