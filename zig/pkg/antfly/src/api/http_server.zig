@@ -24294,6 +24294,11 @@ pub const ApiHttpServer = struct {
 
             var needs_start_checkpoint = !restoreTableAttempted(active_table_index, durability_pending_table_ranges, published_table_ranges, @intCast(i));
 
+            // An interrupted publication may still own its checkpoint. If
+            // preflight fails on that ordinal, preserve the checkpoint and
+            // return the actual failure instead of advancing to another table.
+            const resuming_active_table = active_table_index == @as(u16, @intCast(i));
+
             // Overwrite publication is local and generation-aware. New-table
             // restores may delegate to metadata in distributed deployments.
             if (!is_overwrite and !self.cfg.deployment_mode.isStandalone()) {
@@ -24314,10 +24319,12 @@ pub const ApiHttpServer = struct {
                             return error.InternalFailure;
                         },
                         error.BackupIntegrityFailure => {
+                            if (resuming_active_table) return error.BackupIntegrityFailure;
                             statuses[i].@"error" = backups_api.integrity_failure_message;
                             continue;
                         },
                         error.InvalidRequest => {
+                            if (resuming_active_table) return error.InvalidRequest;
                             statuses[i].@"error" = "invalid table backup manifest";
                             continue;
                         },
@@ -24326,6 +24333,7 @@ pub const ApiHttpServer = struct {
                 };
                 defer table_manifest.deinit(op_alloc);
                 if (!std.mem.eql(u8, table_manifest.table_name, cluster_table.name)) {
+                    if (resuming_active_table) return error.BackupIntegrityFailure;
                     statuses[i].@"error" = "table backup manifest does not match table";
                     continue;
                 }
@@ -24356,10 +24364,12 @@ pub const ApiHttpServer = struct {
                             return error.InternalFailure;
                         },
                         error.BackupIntegrityFailure => {
+                            if (resuming_active_table) return error.BackupIntegrityFailure;
                             statuses[i].@"error" = backups_api.integrity_failure_message;
                             continue;
                         },
                         error.InvalidRequest => {
+                            if (resuming_active_table) return error.InvalidRequest;
                             statuses[i].@"error" = "unable to bind portable backup artifact integrity";
                             continue;
                         },
