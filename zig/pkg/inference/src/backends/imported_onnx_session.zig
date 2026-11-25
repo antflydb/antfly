@@ -944,6 +944,31 @@ fn validateStageCacheBranch(prepared: *prepared_mod.PreparedInvocation, inputs: 
     if (key.len == 0 or key[0] != @intFromBool(value)) return error.PreparedInvocationShapeMismatch;
 }
 
+/// Reuse a stage's borrowed shape only after the provider attests its actual
+/// metadata. Other providers and stale hints retain the ordinary shape query.
+fn residentInputShapeAllocation(input: ResidentInput, allocator: std.mem.Allocator) !?[]i64 {
+    if ((try input.backend.tensorShapeMatches(input.value, input.shape)) == true) return null;
+    return try input.backend.tensorShape(input.value, allocator);
+}
+
+test "ONNX cache shape reuses attested metadata and queries a stale hint" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const shared = try SharedBackendContext.init(allocator, .native, std.testing.io);
+    defer shared.release();
+    const backend = shared.stableBackend();
+    const value = try backend.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 });
+    defer backend.free(value);
+    var input: ResidentInput = .{ .value = value, .backend = backend, .shape = &.{ 2, 2 } };
+    var fail = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expect((try residentInputShapeAllocation(input, fail.allocator())) == null);
+
+    input.shape = &.{ 1, 4 };
+    const actual = (try residentInputShapeAllocation(input, allocator)) orelse return error.StaleShapeHintAccepted;
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 2 }, actual);
+}
+
 fn validatePreparedInputs(target: *ImportedOnnxSession, inputs: prepared_mod.Inputs, allocator: std.mem.Allocator) !void {
     switch (inputs) {
         .host => |host| try validatePreparedShapes(target, .{ .tensors = host }),
@@ -955,8 +980,9 @@ fn validatePreparedInputs(target: *ImportedOnnxSession, inputs: prepared_mod.Inp
                 if (try input.backend.tensorDType(input.value) != expected.dtype) return error.PreparedInvocationShapeMismatch;
                 // Verify real tensor metadata; estimates never authorize stale
                 // shape reuse. This does not download tensor payloads.
-                const shape = try input.backend.tensorShape(input.value, allocator);
-                defer allocator.free(shape);
+                const owned_shape = try residentInputShapeAllocation(input, allocator);
+                defer if (owned_shape) |value| allocator.free(value);
+                const shape = owned_shape orelse input.shape;
                 if (shape.len != expected.shape.len) return error.PreparedInvocationShapeMismatch;
                 for (expected.shape, shape) |declared, concrete| {
                     if (!validConcreteExtent(declared, concrete)) return error.PreparedInvocationShapeMismatch;
@@ -1401,21 +1427,22 @@ fn runWithOutputs(
         const metadata = if (host_inputs == null) try allocator.alloc(Tensor, if (resident_inputs) |inputs| inputs.len else 0) else null;
         var initialized: usize = 0;
         defer if (metadata) |inputs| {
-            for (inputs[0..initialized]) |input| allocator.free(input.shape);
+            for (inputs[0..initialized]) |input| if (input.owns_shape) allocator.free(input.shape);
             allocator.free(inputs);
         };
         if (metadata) |inputs| {
             if (inputs.len != self.input_info.len) return error.InputArityMismatch;
             for (resident_inputs.?, self.input_info, inputs) |input, info, *meta| {
                 try validateResidentInput(self, input);
+                const owned_shape = try residentInputShapeAllocation(input, allocator);
                 meta.* = .{
                     .name = info.name,
                     .dtype = info.dtype,
-                    .shape = try input.backend.tensorShape(input.value, allocator),
+                    .shape = owned_shape orelse input.shape,
                     .data = &.{},
                     .allocator = allocator,
                     .owns_data = false,
-                    .owns_shape = false,
+                    .owns_shape = owned_shape != null,
                 };
                 initialized += 1;
             }
