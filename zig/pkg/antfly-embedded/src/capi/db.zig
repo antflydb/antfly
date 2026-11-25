@@ -17,6 +17,7 @@
 comptime {
     _ = @import("sql_describe.zig");
     _ = @import("cypher.zig");
+    _ = @import("context_dependencies.zig");
 }
 const handles = @import("handles.zig");
 const inference_config = @import("../common/config.zig");
@@ -235,6 +236,7 @@ pub fn registerLiteIndexEnrichments(handle: *Handle, config_json: []const u8, ro
         &collected,
     );
     if (collected.items.len == 0) return;
+    for (collected.items) |*cfg| try @import("context_dependencies.zig").resolveStored(handle, alloc, cfg);
     try indexes_api.sortArtifactEnrichmentsByDependency(alloc, collected.items);
     for (collected.items) |cfg| {
         // Record the touch before mutating, so a mid-loop failure still rolls
@@ -242,6 +244,11 @@ pub fn registerLiteIndexEnrichments(handle: *Handle, config_json: []const u8, ro
         try rollback.willTouchEnrichment(cfg.kind, cfg.name);
         _ = try handle.database().*.upsertEnrichment(cfg);
     }
+    for (collected.items) |cfg| if (cfg.context_sources_json.len != 0) {
+        try @import("tables.zig").ensureDiscovered(@import("context_dependencies.zig").rootOf(handle));
+        try @import("context_dependencies.zig").sync(handle);
+        break;
+    };
 }
 
 /// Undo buffer for the catalog mutations an embedded AddIndex performs
@@ -10126,7 +10133,22 @@ pub fn antfly_db_add_enrichment_json(
         .ignore_unknown_fields = true,
     }) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     defer parsed.deinit();
-    handle.database().*.addEnrichment(parsed.value) catch |err| return capi.mapError(err);
+    var config = db_mod.types.EnrichmentConfig.clone(handle.alloc, parsed.value) catch |err| return capi.mapError(err);
+    defer config.deinit(handle.alloc);
+    const context_dependencies = @import("context_dependencies.zig");
+    context_dependencies.resolveEnrichment(handle, handle.alloc, config_json.bytes(), &config) catch |err| return capi.mapErrorContext(err, @src().fn_name);
+    // A derived enrichment without its own sources can still close a loop
+    // through what its source artifact reads.
+    if (config.context_sources_json.len != 0 or config.source_artifact_name.len != 0) {
+        @import("tables.zig").ensureDiscovered(@import("context_dependencies.zig").rootOf(handle)) catch |err| return capi.mapError(err);
+        context_dependencies.rejectCrossTableCycle(handle, handle.database(), config) catch |err| return capi.mapErrorContext(err, @src().fn_name);
+    }
+    handle.database().*.addEnrichment(config) catch |err| return capi.mapError(err);
+    if (config.context_sources_json.len != 0) {
+        // Every namespace must be open so inbound dependents are complete.
+        @import("tables.zig").ensureDiscovered(@import("context_dependencies.zig").rootOf(handle)) catch |err| return capi.mapError(err);
+    }
+    context_dependencies.sync(handle) catch |err| return capi.mapError(err);
     refreshLiteManagedEmbeddingRuntime(handle) catch |err| return capi.mapError(err);
     return .ok;
 }

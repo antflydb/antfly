@@ -589,6 +589,7 @@ pub const OwnedBatchRequest = struct {
     restore_staging: ?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").Control) = null,
     online_source: ?std.json.Parsed(@import("../storage/db/online_source_contract.zig").Command) = null,
     group_source: ?std.json.Parsed(@import("../storage/db/group_source_contract.zig").Command) = null,
+    context_dependency: ?std.json.Parsed(@import("../storage/db/enrichment/context_dependency_command.zig").Command) = null,
     sql_lock: ?std.json.Parsed(@import("../storage/pessimistic_lock/control.zig").Command) = null,
     resolver_review: ?std.json.Parsed(@import("../storage/db/resolver_review.zig").Command) = null,
     artifact_catalog: ?std.json.Parsed(@import("../storage/db/artifact_inventory.zig").Command) = null,
@@ -655,6 +656,7 @@ pub const OwnedBatchRequest = struct {
         if (self.restore_staging) |*control| control.deinit();
         if (self.online_source) |*control| control.deinit();
         if (self.group_source) |*control| control.deinit();
+        if (self.context_dependency) |*control| control.deinit();
         if (self.sql_lock) |*control| control.deinit();
         if (self.resolver_review) |*control| control.deinit();
         if (self.artifact_catalog) |*control| control.deinit();
@@ -1280,6 +1282,17 @@ noinline fn parseBatchRowsAndControls(alloc: std.mem.Allocator, root: std.json.O
         try parsed_control.value.validate();
         break :control @as(?std.json.Parsed(@import("../storage/db/group_source_contract.zig").Command), parsed_control);
     } else null;
+    out.context_dependency = if (root.get("_context_dependency")) |value| control: {
+        if (!allow_internal) return error.InvalidBatchRequest;
+        const marker = root.get("_merge_checkpoint") orelse return error.InvalidBatchRequest;
+        if (marker != .object or marker.object.count() != 1) return error.InvalidBatchRequest;
+        const kind = marker.object.get("kind") orelse return error.InvalidBatchRequest;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "context_dependency_v1")) return error.InvalidBatchRequest;
+        const parsed_control = try std.json.parseFromValue(@import("../storage/db/enrichment/context_dependency_command.zig").Command, alloc, value, .{ .allocate = .alloc_always });
+        errdefer parsed_control.deinit();
+        parsed_control.value.validate() catch return error.InvalidBatchRequest;
+        break :control @as(?std.json.Parsed(@import("../storage/db/enrichment/context_dependency_command.zig").Command), parsed_control);
+    } else null;
     out.sql_lock = if (root.get("_sql_lock")) |value| control: {
         if (!allow_internal) return error.InvalidBatchRequest;
         const marker = root.get("_merge_checkpoint") orelse return error.InvalidBatchRequest;
@@ -1477,7 +1490,7 @@ noinline fn parseBatchTransitions(alloc: std.mem.Allocator, root: std.json.Objec
         // single-purpose validators correctly reject. Ordinary unmarked row
         // replay retains its historical legacy interpretation.
         const isolated_control = graph_endpoint_cleanup or out.req.activate_range_tracking or out.relational_topology != null or out.relational_generation_gc != null or
-            out.row_policy_publication != null or out.artifact_catalog != null or out.group_source != null or
+            out.row_policy_publication != null or out.artifact_catalog != null or out.group_source != null or out.context_dependency != null or
             out.resolver_review != null or out.artifact_publication != null or out.artifact_publication_transport != null or
             out.leann_record_index != null or out.merge_proof_adoption != null;
         const value = root.get("_document_version_scheme") orelse break :scheme if (!allow_internal or local_owner or isolated_control) .admit_current else .legacy;
@@ -1738,6 +1751,10 @@ noinline fn parseBatchTransitions(alloc: std.mem.Allocator, root: std.json.Objec
         }
         if (std.mem.eql(u8, kind_value.string, "group_source_v1")) {
             if (out.group_source == null or object.count() != 1) return error.InvalidBatchRequest;
+            break :merge null;
+        }
+        if (std.mem.eql(u8, kind_value.string, "context_dependency_v1")) {
+            if (out.context_dependency == null or object.count() != 1) return error.InvalidBatchRequest;
             break :merge null;
         }
         if (std.mem.eql(u8, kind_value.string, "sql_lock_v1")) {
@@ -2205,6 +2222,7 @@ noinline fn finishBatchRequest(root: std.json.ObjectMap, allow_internal: bool, l
     out.req.restore_staging = if (out.restore_staging) |control| control.value else null;
     out.req.online_source = if (out.online_source) |control| control.value else null;
     out.req.group_source = if (out.group_source) |control| control.value else null;
+    out.req.context_dependency = if (out.context_dependency) |control| control.value else null;
     out.req.sql_lock = if (out.sql_lock) |control| control.value else null;
     out.req.resolver_review = if (out.resolver_review) |control| control.value else null;
     out.req.artifact_catalog = if (out.artifact_catalog) |control| control.value else null;
@@ -2800,6 +2818,12 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_types.BatchRequest,
     }
     if (req.group_source) |control| {
         try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"group_source_v1\"},\"_group_source\":");
+        const encoded = try std.json.Stringify.valueAlloc(alloc, control, .{});
+        defer alloc.free(encoded);
+        try writer.writeAll(encoded);
+    }
+    if (req.context_dependency) |control| {
+        try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"context_dependency_v1\"},\"_context_dependency\":");
         const encoded = try std.json.Stringify.valueAlloc(alloc, control, .{});
         defer alloc.free(encoded);
         try writer.writeAll(encoded);

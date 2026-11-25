@@ -196,6 +196,14 @@ const OpaqueApiHttpServer = struct {
         try callFallible(@import("../common/runtime_lifecycle.zig").ShutdownDeadline, void, self.functions.drain_sql_connections, self.opaque_handle, &deadline, null);
     }
 
+    pub fn executeContextStatement(self: *OpaqueApiHttpServer, alloc: std.mem.Allocator, owner_table_id: u64, request: []const u8) ![]u8 {
+        if (!abi.validFunctionTable(self.functions, abi.Capability.context_statement)) return error.ContextSearchUnavailable;
+        const in: abi.ContextStatementInput = .{ .allocator = alloc, .owner_table_id = owner_table_id, .request = request };
+        var out: abi.ContextStatementOutput = .{};
+        try callFallible(abi.ContextStatementInput, abi.ContextStatementOutput, self.functions.context_statement, self.opaque_handle, &in, &out);
+        return out.result;
+    }
+
     pub fn scheduleSessionMaintenance(self: *OpaqueApiHttpServer) !void {
         try callFallible(void, void, self.functions.schedule_session_maintenance, self.opaque_handle, null, null);
     }

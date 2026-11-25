@@ -1,0 +1,812 @@
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Cross-table context sources on multi-shard tables over the public API.
+
+The producer echoes its rendered input, so each artifact shows exactly which
+context it was built from. Both tables span several Raft groups, so source
+notices cross groups and tables, resolution uses the routed read path, and
+rebuilds come from the leader-only maintenance job.
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from uuid import uuid4
+
+import pytest
+import requests
+from helpers import start_http_server, wait_until
+
+NUM_SHARDS = 3
+
+
+class EchoGenerator:
+    """OpenAI-compatible structured generator echoing each item's input."""
+
+    def __init__(self) -> None:
+        self.inputs: list[str] = []
+        self.errors: list[Exception] = []
+        self.lock = threading.Lock()
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_POST(self):
+                try:
+                    payload = outer.reply(
+                        json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                    )
+                    self.send_response(200)
+                except Exception as exc:  # noqa: BLE001 - surfaced by the test
+                    outer.errors.append(exc)
+                    payload = repr(exc).encode()
+                    self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = start_http_server(self.server)
+        self.url = f"http://127.0.0.1:{self.server.server_port}/v1"
+
+    def reply(self, body: dict) -> bytes:
+        prompt = json.loads(body["messages"][1]["content"])
+        items = []
+        with self.lock:
+            for item in prompt["items"]:
+                self.inputs.append(item["input"])
+                items.append(
+                    {
+                        "item": item["id"],
+                        "value": {"kind": "fact", "statement": item["input"]},
+                    }
+                )
+        call = {
+            "id": f"call_{len(self.inputs)}",
+            "type": "function",
+            "function": {
+                "name": "antfly_output",
+                "arguments": json.dumps({"items": items}),
+            },
+        }
+        return json.dumps(
+            {
+                "choices": [{"message": {"content": None, "tool_calls": [call]}}],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 10},
+            }
+        ).encode()
+
+    def calls_for(self, needle: str) -> int:
+        with self.lock:
+            return sum(needle in value for value in self.inputs)
+
+    def stop(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+
+@pytest.fixture
+def echo_generator():
+    generator = EchoGenerator()
+    yield generator
+    generator.stop()
+
+
+def _enrichment(generator: EchoGenerator, context_sources: dict) -> dict:
+    return {
+        "kind": "asset",
+        "field": "body",
+        "content_type": "application/json",
+        "producer": {
+            "type": "generator",
+            "config": {
+                "generator": {
+                    "provider": "openai",
+                    "api_key": "fixture-key",
+                    "model": "gpt-4.1",
+                    "url": generator.url,
+                },
+                "output": "auto",
+                "batch": {"max_items_per_call": 8},
+                "output_schema": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"type": "string", "enum": ["fact"]},
+                        "statement": {"type": "string"},
+                    },
+                    "required": ["kind", "statement"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "context_sources": context_sources,
+    }
+
+
+def _statement(api, table: str, key: str, artifact: str) -> str | None:
+    try:
+        row = api.get(f"/tables/{table}/documents/{key}?fields=_artifacts.{artifact}")
+    except Exception:  # noqa: BLE001 - polling until the artifact exists
+        return None
+    value = row.get("_artifacts", {}).get(artifact, {}).get("value")
+    if isinstance(value, str):
+        value = json.loads(value)
+    return value.get("statement") if isinstance(value, dict) else None
+
+
+def _statement_containing(api, table, key, artifact, *needles, absent=()):
+    def ready():
+        statement = _statement(api, table, key, artifact)
+        if statement is None:
+            return None
+        if all(n in statement for n in needles) and not any(
+            a in statement for a in absent
+        ):
+            return statement
+        return None
+
+    return ready
+
+
+def _status(response) -> int:
+    if isinstance(response, requests.Response):
+        return response.status_code
+    return getattr(response, "status_code", 0)
+
+
+def test_cross_table_context_sources_follow_source_changes(
+    stateful_api, echo_generator
+):
+    suffix = uuid4().hex[:8]
+    orgs = f"ctx_orgs_{suffix}"
+    people = f"ctx_people_{suffix}"
+    stateful_api.create_table(orgs, num_shards=NUM_SHARDS)
+    stateful_api.create_table(people, num_shards=NUM_SHARDS)
+    stateful_api.batch_write(
+        orgs,
+        inserts={
+            "org:acme": {"org": "acme", "title": "Acme Alpha"},
+            "org:globex": {"org": "globex", "title": "Globex One"},
+        },
+        sync_level="full_index",
+    )
+
+    registered = stateful_api.put(
+        f"/tables/{people}/artifacts/brief/enrichment",
+        _enrichment(
+            echo_generator,
+            {
+                "peers": {
+                    "query": {
+                        "table": orgs,
+                        "filter_query": {"field": "org", "term": {"$source": "/org"}},
+                    },
+                    "fields": ["title"],
+                    "max_documents": 10,
+                }
+            },
+        ),
+    )
+    # Registration reports each source's effective tracking.
+    assert registered["context_sources"]["peers"] == {
+        "kind": "query",
+        "tracking": "live",
+    }, registered
+    stateful_api.batch_write(
+        people,
+        inserts={
+            "person:1": {"org": "acme", "body": "person one"},
+            "person:2": {"org": "globex", "body": "person two"},
+        },
+        sync_level="enrichments",
+    )
+
+    first = wait_until(
+        _statement_containing(
+            stateful_api, people, "person:1", "brief", "person one", "Acme Alpha"
+        ),
+        timeout_s=60,
+        interval_s=0.25,
+    )
+    assert first is not None, _statement(stateful_api, people, "person:1", "brief")
+    assert "Globex" not in first
+    assert not echo_generator.errors, echo_generator.errors
+
+    # A consumed field change on another table and Raft group rebuilds the
+    # dependent through notice delivery, inbox apply and leader maintenance.
+    stateful_api.batch_write(
+        orgs,
+        inserts={"org:acme": {"org": "acme", "title": "Acme Beta"}},
+        sync_level="full_index",
+    )
+    updated = wait_until(
+        _statement_containing(
+            stateful_api,
+            people,
+            "person:1",
+            "brief",
+            "Acme Beta",
+            absent=("Acme Alpha",),
+        ),
+        timeout_s=60,
+        interval_s=0.25,
+    )
+    assert updated is not None, _statement(stateful_api, people, "person:1", "brief")
+
+    # Dependency state over HTTP: the read barrier clears once every source
+    # group delivered its notices and the dependent's state is current.
+    deps_path = f"/tables/{people}/documents/person%3A1/artifacts/brief/dependencies"
+    current = None
+    for _ in range(40):
+        response = stateful_api._request(
+            "GET", f"{deps_path}?freshness=require_current&wait_timeout_ms=5000"
+        )
+        if _status(response) == 200:
+            current = response.json()
+            break
+        assert _status(response) == 409, getattr(response, "text", response)
+        assert response.json()["error"] == "artifact_not_current"
+    assert current is not None
+    assert current["current"] is True
+    assert current["freshness"]["state"] == "current"
+    assert current["versions"], current
+    plain = stateful_api.get(deps_path)
+    assert plain["freshness"]["state"] == "current"
+    assert "current" not in plain
+    assert plain["sources"] == [
+        {
+            "name": "peers",
+            "kind": "query",
+            "tracking": "live",
+            "ranked": False,
+            "traversal": False,
+        }
+    ], plain
+
+    # Reverse lineage: the source row's dependents across tables.
+    impact = stateful_api.post(
+        f"/tables/{orgs}/dependencies/impact", {"key": "org:acme", "limit": 50}
+    )
+    assert any(
+        row.get("table") == people
+        and row["key"] == "person:1"
+        and row["artifact"] == "brief"
+        for row in impact["dependents"]
+    ), (
+        people,
+        [
+            (r.get("table"), r.get("table_id"), r["key"], r["artifact"])
+            for r in impact["dependents"]
+        ],
+    )
+    assert not any(row["key"] == "person:2" for row in impact["dependents"]), impact
+
+    # Transitive impact crosses tables: a third table reads the dependents'
+    # generated briefs, so its digest is a (via) dependent of the org row.
+    teams = f"ctx_teams_{suffix}"
+    stateful_api.create_table(teams, num_shards=NUM_SHARDS)
+    stateful_api.put(
+        f"/tables/{teams}/artifacts/digest/enrichment",
+        _enrichment(
+            echo_generator,
+            {
+                "members": {
+                    "query": {
+                        "table": people,
+                        "filter_query": {"field": "org", "term": {"$source": "/org"}},
+                    },
+                    "fields": ["_artifacts.brief"],
+                    "max_documents": 10,
+                }
+            },
+        ),
+    )
+    stateful_api.batch_write(
+        teams,
+        inserts={"team:acme": {"org": "acme", "body": "team acme"}},
+        sync_level="enrichments",
+    )
+    assert (
+        wait_until(
+            _statement_containing(
+                stateful_api, teams, "team:acme", "digest", "team acme"
+            ),
+            timeout_s=60,
+            interval_s=0.25,
+        )
+        is not None
+    ), _statement(stateful_api, teams, "team:acme", "digest")
+    transitive = stateful_api.post(
+        f"/tables/{orgs}/dependencies/impact",
+        {"key": "org:acme", "traversal": "transitive", "max_depth": 4, "limit": 50},
+    )
+    downstream = [
+        row
+        for row in transitive["dependents"]
+        if row["table"] == teams and row["key"] == "team:acme"
+    ]
+    assert downstream, transitive
+    assert downstream[0]["via"][0] == {
+        "table": people,
+        "key": "person:1",
+        "artifact": "brief",
+    }, downstream
+    direct_only = stateful_api.post(
+        f"/tables/{orgs}/dependencies/impact", {"key": "org:acme", "limit": 50}
+    )
+    assert not any(row["table"] == teams for row in direct_only["dependents"]), (
+        direct_only
+    )
+    bad = stateful_api._request(
+        "POST",
+        f"/tables/{orgs}/dependencies/impact",
+        {"key": "org:acme", "traversal": "sideways"},
+    )
+    assert _status(bad) == 400, getattr(bad, "text", bad)
+
+    # Membership: a new matching row joins the dependent's context.
+    stateful_api.batch_write(
+        orgs,
+        inserts={"org:acme-west": {"org": "acme", "title": "Acme West"}},
+        sync_level="full_index",
+    )
+    joined = wait_until(
+        _statement_containing(
+            stateful_api, people, "person:1", "brief", "Acme Beta", "Acme West"
+        ),
+        timeout_s=60,
+        interval_s=0.25,
+    )
+    assert joined is not None, _statement(stateful_api, people, "person:1", "brief")
+
+    # Deletion leaves the matching set.
+    stateful_api.batch_write(orgs, deletes=["org:acme-west"], sync_level="full_index")
+    left = wait_until(
+        _statement_containing(
+            stateful_api,
+            people,
+            "person:1",
+            "brief",
+            "Acme Beta",
+            absent=("Acme West",),
+        ),
+        timeout_s=60,
+        interval_s=0.25,
+    )
+    assert left is not None, _statement(stateful_api, people, "person:1", "brief")
+
+    # An unrelated row does not rebuild person:1; the related dependent does.
+    acme_calls = echo_generator.calls_for("person one")
+    stateful_api.batch_write(
+        orgs,
+        inserts={"org:globex": {"org": "globex", "title": "Globex Two"}},
+        sync_level="full_index",
+    )
+    rebuilt = wait_until(
+        _statement_containing(stateful_api, people, "person:2", "brief", "Globex Two"),
+        timeout_s=60,
+        interval_s=0.25,
+    )
+    assert rebuilt is not None, _statement(stateful_api, people, "person:2", "brief")
+    time.sleep(2.0)
+    assert echo_generator.calls_for("person one") == acme_calls
+    assert not echo_generator.errors, echo_generator.errors
+
+
+def test_distributed_context_source_admission(stateful_api, echo_generator):
+    suffix = uuid4().hex[:8]
+    left = f"ctx_left_{suffix}"
+    right = f"ctx_right_{suffix}"
+    stateful_api.create_table(left, num_shards=NUM_SHARDS)
+    stateful_api.create_table(right, num_shards=NUM_SHARDS)
+
+    def peers(table: str, fields: list[str]) -> dict:
+        return {
+            "peers": {
+                "query": {
+                    "table": table,
+                    "filter_query": {"field": "org", "term": {"$source": "/org"}},
+                },
+                "fields": fields,
+                "max_documents": 10,
+            }
+        }
+
+    # Unknown source tables are rejected at admission.
+    response = stateful_api._request(
+        "PUT",
+        f"/tables/{left}/artifacts/brief/enrichment",
+        _enrichment(echo_generator, peers(f"ctx_missing_{suffix}", ["title"])),
+    )
+    assert _status(response) == 400, getattr(response, "text", response)
+    assert "context_source_table_not_found" in getattr(response, "text", ""), getattr(
+        response, "text", response
+    )
+
+    # A downstream consumer of another table's generated output is admitted;
+    # closing the loop back through generated inputs is a cycle.
+    stateful_api.put(
+        f"/tables/{left}/artifacts/brief/enrichment",
+        _enrichment(echo_generator, peers(right, ["title"])),
+    )
+    stateful_api.put(
+        f"/tables/{right}/artifacts/digest/enrichment",
+        _enrichment(echo_generator, peers(left, ["_artifacts.brief"])),
+    )
+    response = stateful_api._request(
+        "PUT",
+        f"/tables/{left}/artifacts/brief/enrichment",
+        _enrichment(echo_generator, peers(right, ["_artifacts.digest"])),
+    )
+    assert _status(response) == 400, getattr(response, "text", response)
+    assert "context_source_cycle" in getattr(response, "text", ""), getattr(
+        response, "text", response
+    )
+
+    # A ranking clause makes a query a snapshot; asserting live is refused
+    # rather than silently downgraded, and the default reports the reason.
+    ranked = {
+        "related": {
+            "query": {
+                "table": right,
+                "full_text_search": {"query": "acme"},
+                "limit": 5,
+            },
+            "fields": ["title"],
+        }
+    }
+    pinned = {name: dict(spec, tracking="live") for name, spec in ranked.items()}
+    response = stateful_api._request(
+        "PUT",
+        f"/tables/{left}/artifacts/related/enrichment",
+        _enrichment(echo_generator, pinned),
+    )
+    assert _status(response) == 400, getattr(response, "text", response)
+    assert "context_source_requires_snapshot" in getattr(response, "text", ""), getattr(
+        response, "text", response
+    )
+    registered = stateful_api.put(
+        f"/tables/{left}/artifacts/related/enrichment",
+        _enrichment(echo_generator, ranked),
+    )
+    assert registered["context_sources"]["related"] == {
+        "kind": "query",
+        "tracking": "snapshot",
+        "reason": "full_text_search",
+    }, registered
+
+    # Graph traversal is a query: one plain bounded traverse (here with a
+    # filter on the reached rows) is live; an edge filter makes it a snapshot.
+    def traversal(extra: dict) -> dict:
+        return {
+            "cited": {
+                "query": {
+                    "table": right,
+                    "graph_queries": {
+                        "refs": {
+                            "index": "refs",
+                            "traverse": {
+                                "edge_types": ["cites"],
+                                "max_depth": 2,
+                                **extra,
+                            },
+                        }
+                    },
+                    "filter_query": {"field": "status", "term": "published"},
+                },
+                "fields": ["title"],
+            }
+        }
+
+    registered = stateful_api.put(
+        f"/tables/{left}/artifacts/cited/enrichment",
+        _enrichment(echo_generator, traversal({})),
+    )
+    assert registered["context_sources"]["cited"] == {
+        "kind": "query",
+        "tracking": "live",
+    }, registered
+    # The query engine runs a filtered walk as a snapshot whose members are
+    # its graph results; a top-level filter does not scope those, so it is
+    # refused rather than silently ignored.
+    filtered_walk = traversal({"edge_filter": {"types": ["cites"]}})
+    response = stateful_api._request(
+        "PUT",
+        f"/tables/{left}/artifacts/cited/enrichment",
+        _enrichment(echo_generator, filtered_walk),
+    )
+    assert _status(response) == 400, getattr(response, "text", response)
+    del filtered_walk["cited"]["query"]["filter_query"]
+    registered = stateful_api.put(
+        f"/tables/{left}/artifacts/cited/enrichment",
+        _enrichment(echo_generator, filtered_walk),
+    )
+    assert registered["context_sources"]["cited"] == {
+        "kind": "query",
+        "tracking": "snapshot",
+        "reason": "graph_queries",
+    }, registered
+
+
+def test_cypher_writes_rebuild_and_cypher_sources_resolve(stateful_api, echo_generator):
+    """Graph statements are both writers and readers of context.
+
+    A Cypher `SET` on a row a live traversal reached, and a relationship
+    `CREATE` on a node it walks from, rebuild the dependent through the same
+    notices as document writes. A `cypher` query source runs a read-only
+    statement as its declarer; its members are the source table's nodes the
+    statement returns.
+    """
+    suffix = uuid4().hex[:8]
+    docs = f"ctx_docs_{suffix}"
+    notes = f"ctx_notes_{suffix}"
+    graph = f"ctx_graph_{suffix}"
+    stateful_api.create_table(docs, num_shards=NUM_SHARDS)
+    stateful_api.create_table(notes, num_shards=NUM_SHARDS)
+    stateful_api.post(
+        f"/tables/{docs}/indexes/links",
+        {"type": "graph", "edge_types": [{"name": "cites"}]},
+    )
+    stateful_api.batch_write(
+        docs,
+        inserts={
+            key: {"id": key, "title": title}
+            for key, title in (("a", "Alpha"), ("b", "Bravo"), ("c", "Charlie"))
+        },
+        sync_level="full_index",
+    )
+    stateful_api.post(
+        f"/graphs/{graph}",
+        {
+            "labels": [{"name": "Document", "table": docs}],
+            "relationships": [
+                {
+                    "name": "CITES",
+                    "index": "links",
+                    "source_label": "Document",
+                    "target_label": "Document",
+                    "stored_type": "cites",
+                }
+            ],
+        },
+    )
+
+    def cypher(statement: str) -> dict:
+        def run():
+            response = stateful_api._request(
+                "POST", f"/graphs/{graph}/query", {"query": statement}
+            )
+            if response.status_code in (409, 503):
+                return None
+            assert response.status_code == 200, response.text
+            return response.json()
+
+        result = wait_until(run, timeout_s=30, interval_s=0.2)
+        assert result is not None, statement
+        return result
+
+    cypher(
+        "MATCH (a:Document {id:'a'}), (b:Document {id:'b'}) CREATE (a)-[:CITES]->(b)"
+    )
+
+    traversal = {
+        "cited": {
+            "query": {
+                "table": docs,
+                "graph_queries": {
+                    "w": {
+                        "index": "links",
+                        "traverse": {
+                            "start": {"keys": [{"$source": "/doc"}]},
+                            "edge_types": ["cites"],
+                            "max_depth": 1,
+                        },
+                    }
+                },
+            },
+            "fields": ["title"],
+            "max_documents": 10,
+        }
+    }
+    registered = stateful_api.put(
+        f"/tables/{notes}/artifacts/brief/enrichment",
+        _enrichment(echo_generator, traversal),
+    )
+    assert registered["context_sources"]["cited"]["tracking"] == "live", registered
+
+    neighbors = {
+        "neighbors": {
+            "query": {
+                "table": docs,
+                "cypher": {
+                    "graph": graph,
+                    "query": "MATCH (:Document {id: $id})-[:CITES]->(n:Document) RETURN n",
+                    "parameters": {"id": {"$source": "/doc"}},
+                },
+            },
+            "fields": ["title"],
+        }
+    }
+    # Context statements only read.
+    writing = {
+        "neighbors": {
+            **neighbors["neighbors"],
+            "query": {
+                "table": docs,
+                "cypher": {
+                    "graph": graph,
+                    "query": "MATCH (n:Document) SET n.title = 'x' RETURN n",
+                },
+            },
+        }
+    }
+    response = stateful_api._request(
+        "PUT",
+        f"/tables/{notes}/artifacts/neighbors/enrichment",
+        _enrichment(echo_generator, writing),
+    )
+    assert _status(response) == 400, getattr(response, "text", response)
+    registered = stateful_api.put(
+        f"/tables/{notes}/artifacts/neighbors/enrichment",
+        _enrichment(echo_generator, neighbors),
+    )
+    assert registered["context_sources"]["neighbors"] == {
+        "kind": "query",
+        "tracking": "snapshot",
+        "reason": "cypher",
+    }, registered
+
+    stateful_api.batch_write(
+        notes,
+        inserts={"note:1": {"doc": "a", "body": "note one"}},
+        sync_level="enrichments",
+    )
+    first = wait_until(
+        _statement_containing(
+            stateful_api, notes, "note:1", "brief", "note one", "Bravo"
+        ),
+        timeout_s=60,
+        interval_s=0.25,
+    )
+    assert first is not None, _statement(stateful_api, notes, "note:1", "brief")
+    assert "Charlie" not in first
+    via_cypher = wait_until(
+        _statement_containing(
+            stateful_api, notes, "note:1", "neighbors", "note one", "Bravo"
+        ),
+        timeout_s=60,
+        interval_s=0.25,
+    )
+    assert via_cypher is not None, _statement(
+        stateful_api, notes, "note:1", "neighbors"
+    )
+    assert "Alpha" not in via_cypher and "Charlie" not in via_cypher, via_cypher
+
+    # A Cypher SET on a reached row rebuilds the dependent.
+    cypher("MATCH (n:Document {id:'b'}) SET n.title = 'Bravo Two' RETURN n")
+    renamed = wait_until(
+        _statement_containing(stateful_api, notes, "note:1", "brief", "Bravo Two"),
+        timeout_s=60,
+        interval_s=0.25,
+    )
+    assert renamed is not None, _statement(stateful_api, notes, "note:1", "brief")
+
+    # A relationship created on the walked node changes its adjacency.
+    cypher(
+        "MATCH (a:Document {id:'a'}), (c:Document {id:'c'}) CREATE (a)-[:CITES]->(c)"
+    )
+    widened = wait_until(
+        _statement_containing(
+            stateful_api, notes, "note:1", "brief", "Bravo Two", "Charlie"
+        ),
+        timeout_s=60,
+        interval_s=0.25,
+    )
+    assert widened is not None, _statement(stateful_api, notes, "note:1", "brief")
+    assert not echo_generator.errors, echo_generator.errors
+
+
+def test_sql_sources_resolve_members_from_the_id_column(stateful_api, echo_generator):
+    """A `sql` query source runs a read-only SELECT as its declarer; its
+    members are the source table's rows its `_id` column names."""
+    suffix = uuid4().hex[:8]
+    orgs = f"ctx_sql_orgs_{suffix}"
+    people = f"ctx_sql_people_{suffix}"
+
+    def sql(statement: str, parameters: list | None = None) -> dict:
+        body: dict = {"statement": statement}
+        if parameters is not None:
+            body["parameters"] = parameters
+        return stateful_api.post("/sql", body)
+
+    sql(f"CREATE TABLE {orgs} (org TEXT, title TEXT)")
+    for key, org, title in (
+        ("org:1", "acme", "Acme Alpha"),
+        ("org:2", "acme", "Acme Beta"),
+        ("org:3", "globex", "Globex One"),
+    ):
+        sql(
+            f"INSERT INTO {orgs} (_id, org, title) VALUES ($1, $2, $3)",
+            [key, org, title],
+        )
+    stateful_api.create_table(people, num_shards=NUM_SHARDS)
+
+    peers = {
+        "peers": {
+            "query": {
+                "table": orgs,
+                "sql": {
+                    "statement": f"SELECT _id FROM {orgs} WHERE org = $1 ORDER BY _id DESC",
+                    "parameters": [{"$source": "/org"}],
+                },
+                "limit": 10,
+            },
+            "fields": ["title"],
+        }
+    }
+    # Context statements only read.
+    writing = {
+        "peers": {
+            **peers["peers"],
+            "query": {"table": orgs, "sql": {"statement": f"DELETE FROM {orgs}"}},
+        }
+    }
+    response = stateful_api._request(
+        "PUT",
+        f"/tables/{people}/artifacts/peers/enrichment",
+        _enrichment(echo_generator, writing),
+    )
+    assert _status(response) == 400, getattr(response, "text", response)
+    registered = stateful_api.put(
+        f"/tables/{people}/artifacts/peers/enrichment",
+        _enrichment(echo_generator, peers),
+    )
+    assert registered["context_sources"]["peers"] == {
+        "kind": "query",
+        "tracking": "snapshot",
+        "reason": "sql",
+    }, registered
+
+    stateful_api.batch_write(
+        people,
+        inserts={"person:1": {"org": "acme", "body": "person one"}},
+        sync_level="enrichments",
+    )
+    statement = wait_until(
+        _statement_containing(
+            stateful_api,
+            people,
+            "person:1",
+            "peers",
+            "person one",
+            "Acme Alpha",
+            "Acme Beta",
+        ),
+        timeout_s=60,
+        interval_s=0.25,
+    )
+    assert statement is not None, _statement(stateful_api, people, "person:1", "peers")
+    assert "Globex" not in statement, statement
+    # Result order is member order.
+    assert statement.index("Acme Beta") < statement.index("Acme Alpha"), statement
+    assert not echo_generator.errors, echo_generator.errors

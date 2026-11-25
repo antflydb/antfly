@@ -66,7 +66,7 @@ fn bindTemplate(alloc: std.mem.Allocator, txn: anytype, request: requests.Genera
 pub fn authorizeDocument(alloc: std.mem.Allocator, txn: anytype, request: requests.GeneratedEnrichmentRequest, plan: *const @import("catalog/index_manager.zig").IndexManager.WritePlanSnapshot) !?DocumentAuthority {
     const authority = (try publication.authority(txn)) orelse return null;
     if (request.input_kind != .document or request.embedding_input != .text or request.chunk_size != 0 or
-        request.neighbor_context_json.len != 0 or request.upstream_artifact_name.len != 0 or
+        (request.neighbor_context_json.len != 0 or request.context_sources_json.len != 0) or request.upstream_artifact_name.len != 0 or
         (request.kind != .dense_embedding and request.kind != .sparse_embedding)) return error.OnlineMergeArtifactTailsUnsupported;
     const bound = try bindTemplate(alloc, txn, request, plan, authority);
     const requirement = bound.requirement;
