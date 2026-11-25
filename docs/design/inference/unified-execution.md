@@ -777,6 +777,33 @@ provider with request cancellation checks if a sibling still owns the scope.
 This fixture verifies physical batching and output correctness. It does not
 measure serving throughput.
 
+An in-process serving comparison at `e2b8e9bfb5` timed the pair of cached
+suffixes after independent four-token prefills, excluding prefill and
+including broker collection, device gathering and final row readback. Each
+phase used three warmups and 12 measurements. The serial control had 48
+measured pairs. Each broker arm had 24, and all broker pairs physically fused.
+All runs checked both full vocabulary rows against full-prefix decoding.
+
+| Provider | Serial p50 / p95 (ms) | 200 µs broker | 1,000 µs broker |
+| --- | ---: | ---: | ---: |
+| Native | 3.36 / 3.52 | 5.84 / 5.96 | 6.87 / 7.21 |
+| Metal, M4 Max | 18.61 / 31.45 | 14.43 / 16.83 | 18.72 / 21.97 |
+| CUDA, shared Spark GB10 | 2.59 / 2.65 | 3.45 / 3.60 | 4.34 / 4.47 |
+
+Native and CUDA were faster serially at this shape. On Metal, the serial
+phase medians moved from 14.8–14.9 ms to 25.7–27.3 ms.
+Metal throughput remains uncertain. This was a same-revision
+comparison at one shape. HTTP throughput and broader shape qualification
+remain open.
+
+On the same shared Spark, grouping the cache-column copies with
+`cuMemcpyBatchAsync_v2` reduced the 200 µs broker p50 from 3.45 to 3.20 ms
+and the 1,000 µs broker p50 from 4.34 to 4.06 ms. The serial control stayed
+at 2.59 ms. The grouped copy brings this CUDA path closer to serial and
+still trails it by about 24% at the shorter collection window. Both arms
+retained logit parity and fused all 24 measured pairs per window. Providers
+without the grouped copy capability use their per-column path.
+
 ### Inkling 2 Mini CUDA integration
 
 The released safetensors text and single-image routes use the shared model

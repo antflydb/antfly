@@ -815,7 +815,23 @@ fn gatherStageInputs(first: *const Ticket, items: []const micro.ExecuteItem, ten
         var audit: transfers.Audit = .{ .forbid_device_host_access = true };
         try transfers.begin(&audit);
         defer transfers.end();
-        for (values, 0..) |destination, column| if (destination == .resident) {
+        const gathered_columns = columns: {
+            const gather = kernels.gatherDeviceColumns orelse break :columns false;
+            const Column = @import("../ops/kernel_backend.zig").VTable.DeviceRowColumn;
+            var columns: [64]Column = undefined;
+            var rows: [64][8]ops.CT = undefined;
+            var count: usize = 0;
+            for (values, 0..) |destination, column| {
+                if (destination != .resident) continue;
+                if (count == columns.len) break :columns false;
+                const sources = rows[count][0..items.len];
+                for (items, sources) |item, *source| source.* = item.payloadAs(Ticket).stage.?[column].resident.value;
+                columns[count] = .{ .output = destination.resident.value, .sources = sources };
+                count += 1;
+            }
+            break :columns try gather(backend.ptr, columns[0..count]);
+        };
+        if (!gathered_columns) for (values, 0..) |destination, column| if (destination == .resident) {
             const width = try denseBytes(destination.resident.shape[1..], 1);
             if (kernels.gatherDeviceRows) |gather| {
                 var sources: [8]ops.CT = undefined;

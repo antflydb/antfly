@@ -23110,6 +23110,50 @@ fn allocUninitF32ShapeOp(ctx: *anyopaque, shape_i32: []const i32) anyerror!?CT {
     return try createTensor(self, device, shape, elem_count);
 }
 
+fn gatherDeviceColumnsOp(ctx: *anyopaque, columns: []const ops.KernelBackend.DeviceRowColumn) !bool {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const submit = self.ctx.driver.fns.cuMemcpyBatchAsync orelse return false;
+    if (self.debug_cuda_graph_capture_active or self.ctx.stream == null) return false;
+
+    var destinations: [256]driver_mod.CUdeviceptr = undefined;
+    var sources: [256]driver_mod.CUdeviceptr = undefined;
+    var sizes: [256]usize = undefined;
+    var count: usize = 0;
+    var total: usize = 0;
+    for (columns) |column| {
+        const target = tensorFromCt(column.output);
+        try ensureF32(target);
+        const capacity = try checkedMul(target.elem_count, @sizeOf(f32));
+        if (capacity > target.buffer.len) return error.InvalidShape;
+        var offset: usize = 0;
+        for (column.sources) |value| {
+            const source = tensorFromCt(value);
+            try ensureF32(source);
+            const bytes = try checkedMul(source.elem_count, @sizeOf(f32));
+            if (bytes > source.buffer.len or bytes > capacity - offset) return error.InvalidShape;
+            if (bytes == 0) continue;
+            if (count == sizes.len) return false;
+            destinations[count] = target.buffer.ptr + offset;
+            sources[count] = source.buffer.ptr;
+            sizes[count] = bytes;
+            count += 1;
+            offset += bytes;
+        }
+        if (offset != capacity) return error.InvalidShape;
+        total = try checkedAdd(total, offset);
+    }
+    if (count <= 1) return false;
+    try self.ctx.makeCurrent();
+    // Fresh admitted destinations are disjoint from the retained sources and
+    // each other. No copy in the batch depends on the order of another.
+    var attributes = [_]driver_mod.MemcpyAttributes{.{}};
+    var attribute_indices = [_]usize{0};
+    try self.ctx.driver.check(submit(&destinations, &sources, &sizes, count, &attributes, &attribute_indices, 1, self.ctx.stream));
+    @import("../../execution/transfer_audit.zig").deviceCopy(total);
+    self.stats.d2d_bytes += total;
+    return true;
+}
+
 fn copyRows2DOp(
     ctx: *anyopaque,
     dst: CT,
@@ -36881,6 +36925,7 @@ fn glideSegmentAttentionGrouped(ctx: *anyopaque, q: CT, k: CT, v: CT, request: *
 
 const kernel_backend_impl: ops.KernelBackend = .{
     .regionRoutesInOrdinaryFrame = true,
+    .gatherDeviceColumns = gatherDeviceColumnsOp,
     .regionPolicyKey = AssignedProjectionGroup.policy,
     .prepareRegionRoutes = AssignedProjectionGroup.select,
     .denseDecoder = &cuda_dense_decoder_services,
