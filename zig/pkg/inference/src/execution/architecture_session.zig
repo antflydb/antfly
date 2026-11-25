@@ -6081,7 +6081,7 @@ fn finishColdNativeWhisper(session: Session, allocator: std.mem.Allocator, contr
     return .{ .allocator = allocator, .cb = cb, .config = config, .encoder_hidden = encoder, .cache = cache, .gate = gate, .encoder_owned = owns_encoder, .source_resources = source_resources, .receiver_cleanup = cleanup.*, .destination_model = destination_model, .base_permit = base, .cache_permit = cache_permit, .program_permit = bank_permit, .cold_metadata = metadata, .diagnostics_binding = session.invocation_diagnostics };
 }
 
-fn incrementalBasePermit(session: Session, config: whisper_mod.Config, geometry: whisper_arch.CacheGeometry, resident_input_held: bool, independent_device_copy: bool) !@import("../backends/session.zig").RunPermit {
+fn incrementalBasePermit(session: Session, config: whisper_mod.Config, geometry: whisper_arch.CacheGeometry, resident_input_held: bool, independent_device_copy: bool, declared_initial_rows: ?usize) !@import("../backends/session.zig").RunPermit {
     const hidden_bytes = std.math.mul(usize, geometry.encoder_rows, std.math.mul(usize, geometry.width, @sizeOf(f32)) catch return error.ResourceLimitExceeded) catch return error.ResourceLimitExceeded;
     const output_bytes = std.math.mul(usize, config.vocab_size, @sizeOf(f32)) catch return error.ResourceLimitExceeded;
     // CUDA row statistics retain no device workspace after encode. Bound the
@@ -6091,7 +6091,9 @@ fn incrementalBasePermit(session: Session, config: whisper_mod.Config, geometry:
         (try @import("../ops/row_selection_stats.zig").Geometry.init(config.vocab_size, config.vocab_size)).workspace_bytes
     else
         0;
-    const workspace = std.math.add(usize, try geometry.workspaceBytes(config), selection_workspace) catch return error.ResourceLimitExceeded;
+    const initial_rows = declared_initial_rows orelse 1;
+    const workspace_rows = if (whisper_arch.PreparedSingleToken.supportsInitialRows(config, initial_rows)) initial_rows else 1;
+    const workspace = std.math.add(usize, try geometry.workspaceBytes(config, workspace_rows), selection_workspace) catch return error.ResourceLimitExceeded;
     return session.admit(.{
         .batch = 1,
         .sequence = 1,
@@ -6156,7 +6158,7 @@ fn createResidentIncrementalDecoderObserved(session: Session, allocator: std.mem
     const foreign_cuda = source.receiver.backend == .cuda and !source.receiver.same_model_owner;
     const foreign_async_eligible = foreign_cuda and ReceiverCleanup.permitsAsyncSource(session, source.payloadCharge());
     cleanup = try ReceiverCleanup.beginForOwnedGate(session);
-    var base = try incrementalBasePermit(session, config, geometry, true, foreign_cuda);
+    var base = try incrementalBasePermit(session, config, geometry, true, foreign_cuda, options.expected_initial_query_rows);
     errdefer base.deinit();
     const encoder: ColdWhisperEncoder = if (same_owner and expected_backend == .metal)
         .{ .shared_metal = .{ .value = source.value, .backend = source.backend } }
@@ -6350,7 +6352,7 @@ fn createHostIncrementalDecoderObserved(
     const destination_model = if (session.model_lifetime) |model| model.retain() else null;
     errdefer if (destination_model) |model| model.releaseWithBoundary(cleanup.boundary());
     const geometry = try whisper_arch.CacheGeometry.init(cfg, enc_seq);
-    var base_permit = try incrementalBasePermit(session, cfg, geometry, false, false);
+    var base_permit = try incrementalBasePermit(session, cfg, geometry, false, false, options.expected_initial_query_rows);
     errdefer base_permit.deinit();
     var cold = try optionalColdNativeWhisper(session, allocator, control, cfg, geometry, &base_permit, .{ .host = encoder_hidden }, construction_observation, options);
     defer if (cold) |prepared| prepared.destroy(.{ .boundary = cleanup.boundary() });
@@ -11468,7 +11470,7 @@ test "native incremental private cache is denied before actual cache weight look
     defer session.close();
     session.run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false };
     const geometry = try whisper_arch.CacheGeometry.init(owner.arch_config.whisper, 2);
-    var base = try incrementalBasePermit(session, owner.arch_config.whisper, geometry, false, false);
+    var base = try incrementalBasePermit(session, owner.arch_config.whisper, geometry, false, false, null);
     const base_amounts = base.lease.?.amounts;
     base.deinit();
     session.run_admission.?.limits.host_limit_bytes = base_amounts.hostTotalBytes();
@@ -20925,7 +20927,7 @@ test "Native Whisper optional metadata quota declines cold and preserves the exa
     var probe = try getComputeBackendWithControl(session, a, null);
     var probe_open = true;
     defer if (probe_open) probe.deinit();
-    var base = try incrementalBasePermit(session, cfg, geometry, false, false);
+    var base = try incrementalBasePermit(session, cfg, geometry, false, false, null);
     var base_open = true;
     defer if (base_open) base.deinit();
     const original = try base.lease.?.amounts.merge(try geometry.cacheAmounts(&probe.backend));
@@ -21276,13 +21278,13 @@ fn nativeWhisperSharedDefinitionCase(a: std.mem.Allocator) !void {
     const config = arch.arch_config.whisper;
     const geometry = try whisper_arch.CacheGeometry.init(config, 2);
     const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
-    var base_first = try incrementalBasePermit(session, config, geometry, false, false);
+    var base_first = try incrementalBasePermit(session, config, geometry, false, false, null);
     var first_base_open = true;
     defer if (first_base_open) base_first.deinit();
     const first = (try prepareColdNativeWhisper(session, a, null, config, geometry, &base_first, .{ .host = &hidden })) orelse return error.MissingFirstColdWhisper;
     var first_open = true;
     defer if (first_open) destroyColdWhisperFixture(first);
-    var base_second = try incrementalBasePermit(session, config, geometry, false, false);
+    var base_second = try incrementalBasePermit(session, config, geometry, false, false, null);
     var second_base_open = true;
     defer if (second_base_open) base_second.deinit();
     const second = (try prepareColdNativeWhisper(session, a, null, config, geometry, &base_second, .{ .host = &hidden })) orelse return error.MissingSecondColdWhisper;

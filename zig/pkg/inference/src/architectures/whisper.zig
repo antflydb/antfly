@@ -957,7 +957,7 @@ pub const CacheGeometry = struct {
         return result;
     }
 
-    pub fn workspaceBytes(self: CacheGeometry, config: Config) !usize {
+    pub fn workspaceBytes(self: CacheGeometry, config: Config, initial_rows: usize) !usize {
         const mul = cacheMul;
         const add = cacheAdd;
         const keys = @max(self.encoder_rows, self.capacity);
@@ -966,7 +966,15 @@ pub const CacheGeometry = struct {
         const context = try mul(usize, try mul(usize, keys, self.width), 6);
         const constructor = try mul(usize, try mul(usize, self.encoder_rows, self.width), 6);
         const head = try add(usize, self.width, config.vocab_size);
-        return mul(usize, @max(constructor, @max(head, @max(attention, @max(activations, context)))), @sizeOf(f32));
+        const decode_peak = @max(constructor, head, attention, activations, context);
+        if (initial_rows <= 1) return mul(usize, decode_peak, @sizeOf(f32));
+
+        // Initial self-attention has no preceding keys. Cross-attention
+        // sees the encoder rows. The logits head consumes only the last row.
+        const prefill_keys = @max(initial_rows, self.encoder_rows);
+        const prefill_attention = try mul(usize, try mul(usize, try mul(usize, initial_rows, prefill_keys), config.decoder_attention_heads), 3);
+        const prefill_activations = try mul(usize, initial_rows, activations);
+        return mul(usize, @max(decode_peak, prefill_attention, prefill_activations), @sizeOf(f32));
     }
 };
 
@@ -2431,7 +2439,14 @@ test "incremental resident encoder and real Metal KV steps match Native referenc
 test "incremental canonical cache geometry bounds full encoder constructor and rejects overflow" {
     const config: Config = .{ .d_model = 64, .decoder_layers = 2, .decoder_attention_heads = 2, .decoder_ffn_dim = 128, .max_target_positions = 8, .vocab_size = 4 };
     const geometry = try CacheGeometry.init(config, 1024);
-    try std.testing.expect(try geometry.workspaceBytes(config) >= 6 * 1024 * 64 * @sizeOf(f32));
+    const decode_workspace = try geometry.workspaceBytes(config, 1);
+    try std.testing.expect(decode_workspace >= 6 * 1024 * 64 * @sizeOf(f32));
+    try std.testing.expectEqual(decode_workspace, try geometry.workspaceBytes(config, 0));
+    var prefill_config = config;
+    prefill_config.max_target_positions = 256;
+    const prefill_geometry = try CacheGeometry.init(prefill_config, 32);
+    try std.testing.expect(try prefill_geometry.workspaceBytes(prefill_config, 256) >= 256 * 256 * 2 * 3 * @sizeOf(f32));
+    try std.testing.expectError(error.ResourceLimitExceeded, geometry.workspaceBytes(config, std.math.maxInt(usize)));
     try std.testing.expectError(error.ResourceLimitExceeded, CacheGeometry.init(config, std.math.maxInt(usize)));
     try std.testing.expectError(error.InvalidInputShape, CacheGeometry.init(config, 0));
 }
