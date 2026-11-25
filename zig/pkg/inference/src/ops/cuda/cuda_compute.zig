@@ -26275,6 +26275,42 @@ fn tryLinearQ4_0Q8_1ArgmaxE2BDevice(
     return token_device;
 }
 
+// The tile-4 scalar and batched reductions have the same scratch lifetime.
+const ProjectionArgmaxScratch = struct {
+    bank: buffer_mod.DeviceBuffer,
+    partial_values: buffer_mod.DeviceBuffer,
+    partial_indices: buffer_mod.DeviceBuffer,
+    suppression: buffer_mod.DeviceBuffer,
+
+    fn acquire(self: *CudaCompute, rows: usize, columns: usize, suppressed: []const i32) !ProjectionArgmaxScratch {
+        const tiles = (columns - 1) / 4 + 1;
+        const partial_count = try checkedMul(rows, tiles);
+        const values_bytes = try checkedMul(partial_count, @sizeOf(f32));
+        const indices_bytes = try checkedMul(partial_count, @sizeOf(u32));
+        const suppression_bytes = try checkedMul(suppressed.len, @sizeOf(i32));
+        const suppression_offset = try std.math.add(usize, values_bytes, indices_bytes);
+        const total = try std.math.add(usize, suppression_offset, suppression_bytes);
+        var bank = try allocDeviceBuffer(self, total);
+        errdefer releaseDeviceBuffer(self, &bank);
+        const suppression: buffer_mod.DeviceBuffer = if (suppressed.len == 0) .{} else .{
+            .ptr = bank.ptr + suppression_offset,
+            .len = suppression_bytes,
+            .borrowed = true,
+        };
+        if (suppressed.len != 0) try copyFromHostTracked(self, suppression, std.mem.sliceAsBytes(suppressed));
+        return .{
+            .bank = bank,
+            .partial_values = .{ .ptr = bank.ptr, .len = values_bytes, .borrowed = true },
+            .partial_indices = .{ .ptr = bank.ptr + values_bytes, .len = indices_bytes, .borrowed = true },
+            .suppression = suppression,
+        };
+    }
+
+    fn deinit(scratch: *ProjectionArgmaxScratch, self: *CudaCompute) void {
+        releaseDeviceBuffer(self, &scratch.bank);
+    }
+};
+
 fn linearNoBiasArgmaxLastRowSuppressTensor(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize, suppress_token_ids: []const i32) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input_tensor = tensorFromCt(input);
@@ -26363,18 +26399,8 @@ fn linearNoBiasArgmaxLastRowSuppressTensor(ctx: *anyopaque, input: CT, weight: C
         return null;
     }
 
-    const col_tiles = (out_dim + 3) / 4;
-    var partial_values = try allocDeviceBuffer(self, try checkedMul(col_tiles, @sizeOf(f32)));
-    defer releaseDeviceBuffer(self, &partial_values);
-    var partial_indices = try allocDeviceBuffer(self, try checkedMul(col_tiles, @sizeOf(u32)));
-    defer releaseDeviceBuffer(self, &partial_indices);
-
-    var suppress_device: buffer_mod.DeviceBuffer = .{};
-    defer if (suppress_device.len != 0) releaseDeviceBuffer(self, &suppress_device);
-    if (suppress_token_ids.len != 0) {
-        suppress_device = try allocDeviceBuffer(self, try checkedMul(suppress_token_ids.len, @sizeOf(i32)));
-        try copyFromHostTracked(self, suppress_device, std.mem.sliceAsBytes(suppress_token_ids));
-    }
+    var scratch = try ProjectionArgmaxScratch.acquire(self, 1, out_dim, suppress_token_ids);
+    defer scratch.deinit(self);
 
     var token_device = try allocGreedyTokenDeviceBuffer(self, @sizeOf(i32));
     errdefer releaseDeviceBufferLease(self, &token_device);
@@ -26383,11 +26409,11 @@ fn linearNoBiasArgmaxLastRowSuppressTensor(ctx: *anyopaque, input: CT, weight: C
         self.kernels.launchLinearQ8_0ArgmaxTile4F32(
             &self.ctx,
             token_device.buffer,
-            partial_values,
-            partial_indices,
+            scratch.partial_values,
+            scratch.partial_indices,
             input_tensor.buffer,
             weight_tensor.buffer,
-            suppress_device,
+            scratch.suppression,
             rows,
             in_dim,
             out_dim,
@@ -26406,11 +26432,11 @@ fn linearNoBiasArgmaxLastRowSuppressTensor(ctx: *anyopaque, input: CT, weight: C
         self.kernels.launchLinearQ4KArgmaxTile4F32(
             &self.ctx,
             token_device.buffer,
-            partial_values,
-            partial_indices,
+            scratch.partial_values,
+            scratch.partial_indices,
             input_tensor.buffer,
             weight_tensor.buffer,
-            suppress_device,
+            scratch.suppression,
             rows,
             in_dim,
             out_dim,
@@ -26493,19 +26519,8 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
         null;
     defer if (profile_scope) |*scope| scope.end();
 
-    const col_tiles = (out_dim + 3) / 4;
-    const partial_count = try checkedMul(rows, col_tiles);
-    var partial_values = try allocDeviceBuffer(self, try checkedMul(partial_count, @sizeOf(f32)));
-    defer releaseDeviceBuffer(self, &partial_values);
-    var partial_indices = try allocDeviceBuffer(self, try checkedMul(partial_count, @sizeOf(u32)));
-    defer releaseDeviceBuffer(self, &partial_indices);
-
-    var suppress_device: buffer_mod.DeviceBuffer = .{};
-    defer if (suppress_device.len != 0) releaseDeviceBuffer(self, &suppress_device);
-    if (suppress_token_ids.len != 0) {
-        suppress_device = try allocDeviceBuffer(self, try checkedMul(suppress_token_ids.len, @sizeOf(i32)));
-        try copyFromHostTracked(self, suppress_device, std.mem.sliceAsBytes(suppress_token_ids));
-    }
+    var scratch = try ProjectionArgmaxScratch.acquire(self, rows, out_dim, suppress_token_ids);
+    defer scratch.deinit(self);
 
     var token_device = if (rows == 1 and allow_prepared_greedy_output)
         try allocGreedyTokenDeviceBuffer(self, @sizeOf(u32))
@@ -26521,11 +26536,11 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
         self.kernels.launchLinearQ8_0ArgmaxRowsTile4F32(
             &self.ctx,
             token_device.buffer,
-            partial_values,
-            partial_indices,
+            scratch.partial_values,
+            scratch.partial_indices,
             input_tensor.buffer,
             weight_tensor.buffer,
-            suppress_device,
+            scratch.suppression,
             rows,
             in_dim,
             out_dim,
@@ -26545,11 +26560,11 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
             self.kernels.launchLinearQ4_0ArgmaxRowsTile16F32(
                 &self.ctx,
                 token_device.buffer,
-                partial_values,
-                partial_indices,
+                scratch.partial_values,
+                scratch.partial_indices,
                 input_tensor.buffer,
                 weight_tensor.buffer,
-                suppress_device,
+                scratch.suppression,
                 rows,
                 in_dim,
                 out_dim,
@@ -26564,11 +26579,11 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
             self.kernels.launchLinearQ4_0ArgmaxRowsTile4F32(
                 &self.ctx,
                 token_device.buffer,
-                partial_values,
-                partial_indices,
+                scratch.partial_values,
+                scratch.partial_indices,
                 input_tensor.buffer,
                 weight_tensor.buffer,
-                suppress_device,
+                scratch.suppression,
                 rows,
                 in_dim,
                 out_dim,
@@ -26603,11 +26618,11 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
         self.kernels.launchLinearQ4KArgmaxRowsTile4F32(
             &self.ctx,
             token_device.buffer,
-            partial_values,
-            partial_indices,
+            scratch.partial_values,
+            scratch.partial_indices,
             input_tensor.buffer,
             weight_tensor.buffer,
-            suppress_device,
+            scratch.suppression,
             rows,
             in_dim,
             out_dim,
@@ -26650,8 +26665,8 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
                 self.kernels.launchLinearQ6KQ8_1GeneratedArgmaxRowsTile8F32(
                     &self.ctx,
                     token_device.buffer,
-                    partial_values,
-                    partial_indices,
+                    scratch.partial_values,
+                    scratch.partial_indices,
                     q8_input,
                     weight_tensor.buffer,
                     rows,
@@ -26671,11 +26686,11 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
                 self.kernels.launchLinearQ6KQ8_1ArgmaxRowsTile8F32(
                     &self.ctx,
                     token_device.buffer,
-                    partial_values,
-                    partial_indices,
+                    scratch.partial_values,
+                    scratch.partial_indices,
                     q8_input,
                     weight_tensor.buffer,
-                    suppress_device,
+                    scratch.suppression,
                     rows,
                     in_dim,
                     out_dim,
@@ -26700,11 +26715,11 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
             self.kernels.launchLinearQ6KArgmaxRowsTile16F32(
                 &self.ctx,
                 token_device.buffer,
-                partial_values,
-                partial_indices,
+                scratch.partial_values,
+                scratch.partial_indices,
                 input_tensor.buffer,
                 weight_tensor.buffer,
-                suppress_device,
+                scratch.suppression,
                 rows,
                 in_dim,
                 out_dim,
@@ -26720,11 +26735,11 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
             self.kernels.launchLinearQ6KArgmaxRowsTile8F32(
                 &self.ctx,
                 token_device.buffer,
-                partial_values,
-                partial_indices,
+                scratch.partial_values,
+                scratch.partial_indices,
                 input_tensor.buffer,
                 weight_tensor.buffer,
-                suppress_device,
+                scratch.suppression,
                 rows,
                 in_dim,
                 out_dim,
@@ -26739,11 +26754,11 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
             self.kernels.launchLinearQ6KArgmaxRowsTile4F32(
                 &self.ctx,
                 token_device.buffer,
-                partial_values,
-                partial_indices,
+                scratch.partial_values,
+                scratch.partial_indices,
                 input_tensor.buffer,
                 weight_tensor.buffer,
-                suppress_device,
+                scratch.suppression,
                 rows,
                 in_dim,
                 out_dim,
@@ -42282,6 +42297,51 @@ test "LightOnOCR3 CUDA F32 projection row chunks cover large vision batches and 
             for (data, host[0..count]) |value, got| try std.testing.expectEqual(value * factor + 0.5, got);
             for (host[count..]) |canary| try std.testing.expectEqual(@as(f32, 123456), canary);
         }
+    }
+}
+
+test "CUDA projection argmax shares scratch across scalar and batched tails" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.testing.init(a);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+
+    // Nine rows leave a partial tile and put the scalar index span at an
+    // offset that is aligned for u32 but is not aligned to a full tile.
+    var quantized: [9 * 34]u8 = @splat(0);
+    for (0..9) |row| {
+        std.mem.writeInt(u16, quantized[row * 34 ..][0..2], 0x3c00, .little);
+        quantized[row * 34 + 2 + row] = 1;
+    }
+    var weight_storage = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, quantized.len);
+    defer weight_storage.free(&compute.ctx);
+    try copyFromHostTracked(&compute, weight_storage, &quantized);
+    var shape = [_]i64{ 9, 32 };
+    var weight = CudaTensor{
+        .buffer = weight_storage,
+        .dtype = .u8,
+        .shape = &shape,
+        .elem_count = 9 * 32,
+        .quant_type = .{ .known = .Q8_0 },
+    };
+    var values: [64]f32 = @splat(0);
+    values[8] = 6;
+    values[5] = 4;
+    values[32 + 8] = 7;
+    values[32 + 3] = 5;
+    const input = try cb.fromFloat32Shape(&values, &.{ 2, 32 });
+    defer cb.free(input);
+
+    for ([_][]const i32{ &.{}, &.{8} }, [_]u32{ 8, 3 }, [_]u32{ 8, 5 }) |suppressed, last, first| {
+        const token = (try cb.linearNoBiasArgmaxLastRowSuppressTensor(input, &weight, 2, 32, 9, suppressed)) orelse return error.ExpectedFusedArgmax;
+        defer cb.free(token);
+        const scalar = try cb.toFloat32(token, a);
+        defer a.free(scalar);
+        try std.testing.expectEqual(@as(f32, @floatFromInt(last)), scalar[0]);
+        const batch = (try cb.linearNoBiasArgmaxRowsSuppress(input, &weight, 2, 32, 9, suppressed, a)) orelse return error.ExpectedFusedArgmax;
+        defer a.free(batch);
+        try std.testing.expectEqualSlices(u32, &.{ first, last }, batch);
     }
 }
 
