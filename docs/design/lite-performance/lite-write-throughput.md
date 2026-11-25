@@ -124,28 +124,43 @@ operations queries, deletions and merge planning use, with the encoded
 (merges, cursors, native navigation, integrity checks) asks for `encoded()`.
 A level-0 buffer reader (4) becomes a second variant. No behavior change.
 
-### 4. Level-0 as a memtable
+### 4. Cheap level-0 publication (replaces the memtable)
 
-Measured (Debug, 8 threads): of ~340 µs of inline preparation per write,
-~200 µs encodes the level-0 segment and ~57 µs analyzes the text; install
-adds ~90 µs of catalog-mirror sync and ~90 µs publishing the segment; and
-every write's segment is merged again later.
+A CPU sample of the ReleaseFast 8-thread run put most of the install time in
+`nanosleep`: both install steps opened a read transaction to read back
+values their own commit had decided (the mirror's dead buckets, and the doc
+map versions behind the deletion bitmap), and a Lite read transaction waited
+for the store's publication mutex behind the next group's apply.
 
-Design (the LSM memtable, as FTS5's pending-terms buffer):
+The read-backs existed because installs run out of commit order (the leader
+installs only if the index guard is free; otherwise the writer installs after
+its wait). Instead:
 
-- Per full-text index, an in-memory mutable buffer of postings
-  (term -> (doc, version, frequency, positions)) and stored-field refs.
-  A write tokenizes into it: no segment is encoded.
-- The commit records only `l0/<version> -> (key, version)` lists. Recovery
-  and cross-process refresh rebuild the buffer from them, re-analyzing each
-  listed document from the primary store when its version is still current
-  at the tip (an overwritten version is dead and skipped).
-- Queries read the buffer beside the segments: a buffer reader implementing
-  the segment reader interface over the mutable postings, snapshotted per
-  query by a generation counter.
-- A bounded flush (size or count) encodes the buffer into one segment and
-  deletes the records it covers in the same commit, replacing per-write
-  level-0 segments and most merges.
+- Every resolver run takes the next epoch of its index's mirror inside its
+  commit (`Backend.noteResolved`), in commit order. An install applies its
+  decided values only for keys whose latest epoch is still its own
+  (`Backend.applyCommittedResolution`); merges' `mirrorResolved` does the
+  same. A run whose commit did not happen restores the keys' earlier epochs
+  (`revertResolved`); a peer delta's keys take a new epoch
+  (`noteExternallyDecided`), so a pending local install keeps them.
+- A level-0 copy is deleted at install when it was dead at its own commit
+  (`VersionResolution.deadAtCommit`) or a later commit's install killed it
+  first: that death waits in `VersionLocations.parked` while level-0
+  publications are pending.
+- The segment is parsed once at prepare and handed to the snapshot.
+
+A queryable in-memory buffer (the memtable this section used to describe)
+would need an abstract postings interface across the query layer, which
+reads postings through concrete encoded types. FTS5 also writes a segment
+per commit; what made ours expensive was publishing it.
+
+Peer deltas no longer refuse while inline installs are pending, so a writer
+that refreshes past another process's commit stays incremental.
+
+On the shared write path, a Lite read whose pin takes no reader fence (the
+generation already holds it, or a nested read under the writer's lease) is
+admitted under `read_mutex` alone instead of the publication mutex, and a
+write without graph indexes skips its endpoint-cleanup read.
 
 ### 5. Bounded merges outside the lease
 
@@ -193,6 +208,6 @@ removes.
 | 3. indexed writes overlap their wait (group commit) | committed |
 | 4a. level-0 encoding: CRC shortcut, profile split | committed |
 | 4b. `SegmentView` interface | committed |
-| 4. level-0 memtable | designed |
-| 5. bounded merges outside the lease | after 4 (the flush is the bounded merge) |
-| 6. incremental writer refresh | after 4 (the buffer rebuild is the refresh) |
+| 4. cheap level-0 publication, read admission | implemented |
+| 5. bounded merges outside the lease | designed |
+| 6. incremental writer refresh | #1830; peer deltas no longer wait for inline installs |
