@@ -214,6 +214,8 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
     // linked chunk callback. They still use the local direct chunker when no
     // remote endpoint resolves (for example while rebuilding a restore).
     if (resolved_endpoint == null and linked_callback_available) if (antfly_provider) |provider| {
+        if (!paged and provider.require_controlled_linked and provider.chunk_input_with_context_callback == null)
+            return error.UncancellableInferenceProvider;
         const ptr = provider.ptr orelse return error.InvalidChunkProvider;
         const dispatch = provider.boundary_dispatch orelse return error.InvalidChunkProvider;
         const io = execution.io orelse if (builtin.os.tag == .freestanding)
@@ -236,7 +238,6 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
             const chunk_input: ChunkInputWithContextFn = @ptrCast(@alignCast(callback));
             break :blk try ChunkProviderBoundary.call("chunk_input_with_context", dispatch, chunk_input, .{ ptr, alloc, if (cfg.model.len > 0) cfg.model else "fixed", input, cfg, request_context });
         } else if (provider.chunk_input_callback) |callback| blk: {
-            if (provider.require_controlled_linked) return error.UncancellableInferenceProvider;
             const chunk_input: ChunkInputFn = @ptrCast(@alignCast(callback));
             break :blk try ChunkProviderBoundary.call("chunk_input", dispatch, chunk_input, .{ ptr, alloc, if (cfg.model.len > 0) cfg.model else "fixed", input, cfg });
         } else return error.InvalidChunkProvider;
