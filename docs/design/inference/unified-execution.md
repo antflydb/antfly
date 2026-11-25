@@ -946,6 +946,25 @@ from 2.33 to 1.10 ms. All FP32 partials matched bit for bit. The released
 checkpoint suite still passed all 84 tests, including three queries
 reading the remapped final position of the synthetic million-token cache.
 
+The follow-up HTTP comparison on the same M4 Max used the released
+Safetensors in Antfly and the pinned NVFP4 GGUF in llama.cpp b12706. Both
+answered `4`, classified the red and blue PNGs correctly, and returned
+`271` for the long text lookup. Each engine received the same serialized
+prompt where its chat interface allowed it. The lookup token counts differ
+by one. Warm short and image figures are medians over three and six runs
+respectively. Long figures are individual runs.
+
+| HTTP workload | Antfly Metal | llama.cpp Metal |
+| --- | ---: | ---: |
+| Short text, 28 prompt tokens | 0.719 s | 0.339 s |
+| Red and blue images, 33 prompt tokens | 0.832 s | 0.405 s |
+| Text lookup, 6,397 / 6,396 prompt tokens | 127.76 s | 20.52 s |
+| Packed K/V image lookup, 6,404 prompt tokens | 125.12 s | — |
+
+The packed-cache image lookup also returned `271`. The streaming image
+request returned `Blue`, a stop reason, usage and `[DONE]` in 0.833 s.
+No comparable vLLM Metal run was available for this checkpoint.
+
 ### Official Gemma 4 E2B QAT serving comparison
 
 The decoder and projector came from Google's E2B QAT Q4_0 GGUF revision
