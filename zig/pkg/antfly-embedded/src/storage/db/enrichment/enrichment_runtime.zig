@@ -5378,6 +5378,10 @@ fn classifyProviderCancellation(err: anyerror, guard: ForegroundCatchUpGuard, ca
     return if (isOperationCanceled(err)) error.ProviderInvocationCanceled else err;
 }
 
+fn checkEnrichmentExecutionContext(runtime: *EnrichmentRuntime, context: inference_request_context.RequestContext) !void {
+    context.check() catch |err| return providerInvocationFailure(runtime, err);
+}
+
 fn assetProviderRequestContext(runtime: *EnrichmentRuntime) inference_request_context.RequestContext {
     const guard = runtime.active_provider_guard;
     const cancellation = if (guard.cancellation.ptr != null)
@@ -10235,6 +10239,10 @@ test "enrichment cancellation distinguishes PDF deadlines and asset invocation f
     try std.testing.expectEqual(EnrichmentErrorDisposition.retryable_request, enrichmentErrorDisposition(upstream));
     signal.store(true, .release);
     try std.testing.expectEqual(error.EnrichmentWaitCanceled, providerInvocationFailure(&runtime, error.Cancelled));
+
+    signal.store(false, .release);
+    runtime.active_provider_guard.deadline_ns = 0;
+    try std.testing.expectError(error.EnrichmentWaitTimeout, checkEnrichmentExecutionContext(&runtime, assetProviderRequestContext(&runtime)));
 
     var scope = FailureScope{};
     for ([_]anyerror{ error.EnrichmentWaitCanceled, error.EnrichmentWaitTimeout }) |control| {
@@ -31210,10 +31218,10 @@ fn chunkVectorAtRevision(request: enrichment_types.GeneratedEnrichmentRequest, t
 }
 
 fn requireChunkProviderRevision(runtime: *EnrichmentRuntime, a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, dense: ?embedder_mod.DenseEmbedder, sparse: ?embedder_mod.SparseEmbedder, generation: embedder_mod.DenseEmbedder.TextGeneration, revision: ?[32]u8, context: inference_request_context.RequestContext) !void {
-    try context.check();
+    try checkEnrichmentExecutionContext(runtime, context);
     if (dense) |provider| try requireDenseGeneration(runtime, provider, a, requestEmbeddingName(request), generation, context);
     if (sparse) |provider| if (!std.meta.eql(revision, try captureSparseRevision(runtime, provider, a, requestEmbeddingName(request)))) return error.EnrichmentSourceChanged;
-    try context.check();
+    try checkEnrichmentExecutionContext(runtime, context);
 }
 
 // The batch owns captured input tokens, never a storage snapshot. Each output
@@ -31402,7 +31410,8 @@ const OrderedDenseTextBatch = struct {
                     };
                     continue;
                 }
-                try assetProviderRequestContext(runtime).check();
+                try checkProviderFailureGuard(runtime);
+                if (runtime.config.cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
                 const values = results[index] catch unreachable;
                 for (items, values) |*item, vector| {
                     if (self.failed_requests.contains(requestFailureFingerprint(item.request))) continue;
@@ -31442,11 +31451,11 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
     // Capture once, outside any storage snapshot. Every accepted member must
     // match this deployed generation before a completed census can be reused.
     const context = assetProviderRequestContext(runtime);
-    try context.check();
+    try checkEnrichmentExecutionContext(runtime, context);
     const text_generation = if (shared) |batch| batch.generation else if (dense) |provider| try captureDenseGeneration(runtime, provider, alloc, requestEmbeddingName(request), context) else embedder_mod.DenseEmbedder.TextGeneration{};
     const sparse_revision = if (sparse) |provider| try captureSparseRevision(runtime, provider, alloc, requestEmbeddingName(request)) else null;
     const execution_revision = if (dense != null) text_generation.revision else sparse_revision;
-    try context.check();
+    try checkEnrichmentExecutionContext(runtime, context);
     const publication = @import("../artifact_chunk_vector_publication.zig");
     const logical = @import("../artifact_chunk_cursor.zig");
     const Candidates = @import("../artifact_chunk_vector_cursor.zig").Cursor(logical.BorrowedRead);
