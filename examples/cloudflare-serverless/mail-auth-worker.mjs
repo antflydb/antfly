@@ -27,6 +27,7 @@ import { actorOwner } from "./actor-owner.mjs";
 import { openAuthority, coordinatorAuthorityMode } from "./coordinator-authority.mjs";
 import { AuthorityAdmission } from "./authority-admission.mjs";
 import module from "./dist/antfly-serverless-observe.wasm";
+import { accessConfig, accessIdentity } from "./mail-access.mjs";
 import { MailOutbox, digest, address, uuid } from "./mail-core.mjs";
 const kernel = new RequestPool(() => instantiateHost(module, null), 1, {
   maxReservedBytes: 8 * 1024 * 1024,
@@ -35,6 +36,7 @@ const kernel = new RequestPool(() => instantiateHost(module, null), 1, {
 export class MailAuth extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
+    this.access = accessConfig(env);
     const origin = new URL(env.AUTH_ORIGIN);
     if (
       !env.BETTER_AUTH_SECRET ||
@@ -112,10 +114,33 @@ export class MailAuth extends DurableObject {
     }
   }
   async fetch(request) {
+    if (this.access) return new Response("not found", { status: 404 });
     await this.ensureReady();
     return this.auth.handler(request);
   }
+  async teamMailbox() {
+    const alias = address(this.env.MAIL_TEAM_ADDRESS);
+    return this.store.transaction(async (tx) => {
+      const key = "mail-alias/v1/" + alias;
+      let mailbox = await tx.get(key);
+      if (!mailbox) {
+        const id = crypto.randomUUID();
+        mailbox = { id, address: alias };
+        await tx.put(key, mailbox);
+        await tx.put("mail-directory/v1/" + id, id);
+      }
+      return mailbox;
+    });
+  }
   async session(headerEntries) {
+    if (this.access) {
+      const token = new Headers(headerEntries).get("Cf-Access-Jwt-Assertion");
+      const user = await accessIdentity(token, this.access);
+      return {
+        session: user ? { user, mailbox: await this.teamMailbox(), auth: "access" } : null,
+        cookies: [],
+      };
+    }
     await this.ensureReady();
     const { response: session, headers } = await this.auth.api.getSession({
       headers: new Headers(headerEntries),
@@ -141,6 +166,7 @@ export class MailAuth extends DurableObject {
     return { session: { user, mailbox }, cookies };
   }
   async recipient(to) {
+    if (this.access) return address(to) === address(this.env.MAIL_TEAM_ADDRESS) ? this.teamMailbox() : null;
     await this.ensureReady();
     return this.store.transaction((tx) => tx.get("mail-alias/v1/" + address(to)));
   }

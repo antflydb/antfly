@@ -253,3 +253,35 @@ Duplicate client operation IDs must have identical content. Neither a Message-ID
 nor the current Cloudflare sending API is assumed to guarantee exactly-once SMTP
 delivery. The transport boundary can be replaced without changing mailbox/auth
 ownership. See the [design](../../docs/design/cloudflare-mail-service.md).
+
+## Shared team inbox with Cloudflare Access
+
+Use a dedicated deployment for each team inbox. For Antfly Support, set
+`AUTH_ORIGIN=https://mail.antfly.ai` and `MAIL_DOMAIN=antfly.ai` on both Workers.
+Create a Cloudflare Access self-hosted application for the entire hostname.
+Choose the company Google Workspace identity provider and allow only the
+approved support group or explicit team members. Use a short application
+session duration and test access removal. Keep the auth Worker private and
+disable the app Worker's workers.dev and preview URLs.
+
+Set these variables on the private auth Worker:
+
+- `MAIL_ACCESS_ISSUER` is the HTTPS team URL, such as
+  `https://your-team.cloudflareaccess.com`.
+- `MAIL_ACCESS_AUDIENCE` is the Access application's audience tag.
+- `MAIL_TEAM_ADDRESS` is the full shared address, such as `support@antfly.ai`.
+
+Keep the existing auth storage settings and secret. In Access mode the private
+Worker verifies the signed application token, disables the password endpoints,
+and maps every admitted user to the configured mailbox. Each user keeps a
+distinct identity. The Access policy grants access to the whole inbox.
+
+Route the exact shared address to the app Worker through Email Routing.
+Inbound delivery can provision the configured mailbox before the first
+sign-in. Configure Email Sending separately if replies are needed. Verify
+with two allowed users, one denied user and a real inbound message before
+relying on the inbox. Leave browser model assets unconfigured unless the team
+has approved keeping offline copies on staff devices.
+
+This mode supports one shared inbox per deployment. Mailbox switching,
+assignments and per-user unread state are separate work.

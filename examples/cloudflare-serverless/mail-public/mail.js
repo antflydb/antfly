@@ -666,6 +666,10 @@ $("logout").onclick = guarded(async () => {
   let wipeError = null;
   if (local || Object.keys(localFlags()).length) await wipeLocal().catch((error) => (wipeError = error));
   // Always end the session, even if the on-device copy could not be removed.
+  if (me?.auth === "access") {
+    location.assign("/cdn-cgi/access/logout");
+    return;
+  }
   await api("/api/auth/sign-out", {});
   await refresh(); // also retries a failed wipe once
   let stillPending = false;
