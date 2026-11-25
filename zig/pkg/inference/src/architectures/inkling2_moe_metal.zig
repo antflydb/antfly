@@ -56,6 +56,14 @@ const PackedWeights = struct {
         self.values.deinit();
     }
 
+    fn residentBytes(self: *const PackedWeights) usize {
+        var bytes: usize = 0;
+        for ([_]?*const Tensor{ &self.values, &self.scales, if (self.amax) |*value| value else null, if (self.denominator) |*value| value else null }) |entry| {
+            if (entry) |value| bytes += value.allocatedDeviceBytes() orelse value.deviceByteLen();
+        }
+        return bytes;
+    }
+
     fn bind(self: *const PackedWeights) Ffn.Weights {
         return .{
             .values = &self.values,
@@ -99,6 +107,12 @@ pub const Layer = struct {
         self.gate_up.deinit();
         self.router_bias.deinit();
         self.router_weight.deinit();
+    }
+
+    pub fn residentBytes(self: *const Layer) usize {
+        return self.gate_up.residentBytes() + self.down.residentBytes() +
+            (self.router_weight.allocatedDeviceBytes() orelse self.router_weight.deviceByteLen()) +
+            (self.router_bias.allocatedDeviceBytes() orelse self.router_bias.deviceByteLen());
     }
 
     pub fn geometry(self: *const Layer, text: checkpoint.TextConfig, rows: u32) Ffn {

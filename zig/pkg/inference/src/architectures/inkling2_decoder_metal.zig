@@ -124,6 +124,23 @@ pub const Decoder = struct {
         self.endpoints.deinit();
     }
 
+    pub fn residentBytes(self: *const Decoder) usize {
+        var bytes: usize = 0;
+        for (&self.endpoints.weights) |*value| bytes += value.allocatedDeviceBytes() orelse value.deviceByteLen();
+        for (&self.controller_queries) |*value| bytes += value.allocatedDeviceBytes() orelse value.deviceByteLen();
+        for (&self.layers) |*layer| {
+            bytes += layer.attention.residentBytes() + layer.experts.residentBytes();
+            for (&layer.weights) |*entry| if (entry.*) |*value| {
+                bytes += value.allocatedDeviceBytes() orelse value.deviceByteLen();
+            };
+            for (&layer.controllers) |*entry| if (entry.*) |*controller| {
+                for ([_]*const Tensor{ &controller.down, &controller.gates }) |value|
+                    bytes += value.allocatedDeviceBytes() orelse value.deviceByteLen();
+            };
+        }
+        return bytes;
+    }
+
     fn query(self: *const Decoder, layer: usize, stream: checkpoint.ControllerStream) !Tensor {
         const bank: usize = @intFromBool(stream == .k or stream == .v);
         const lane: usize = @intFromBool(stream == .v or stream == .mlp);
@@ -535,6 +552,8 @@ test "Inkling Metal resident decoder executes the full visit schedule on a synth
         layer.* = try Fixture.load(runtime, text, index);
         loaded += 1;
     }
+    const weights_before = model.residentBytes();
+    try std.testing.expect(weights_before > 0);
     const short_plan = try RequestPlan.init(&model, 3);
     const expanded_plan = try RequestPlan.init(&model, 17);
     const new_page_bytes = checkpoint.visit_count * 16 * width * 2 * @sizeOf(u16) + 2 * @sizeOf(u32);
@@ -567,4 +586,5 @@ test "Inkling Metal resident decoder executes the full visit schedule on a synth
     try std.testing.expectEqualSlices(i32, &.{ 0, 1 }, generated.token_ids.?);
     try std.testing.expectEqualStrings("length", generated.finish_reason);
     try std.testing.expectEqual(@as(usize, 1), generated.prompt_tokens);
+    try std.testing.expectEqual(weights_before, model.residentBytes());
 }

@@ -193,6 +193,14 @@ pub const Layer = struct {
         try projection.encode(runtime, input, self.get(key) orelse return error.MissingWeight, output);
     }
 
+    pub fn residentBytes(self: *const Layer) usize {
+        var bytes = self.projections.allocatedDeviceBytes() orelse self.projections.deviceByteLen();
+        for ([_]Weight{ .out, .q_scale, .r_scale, .k_taps, .v_taps, .k_dynamic, .v_dynamic, .relative_basis }) |key| {
+            if (self.get(key)) |weight| bytes += weight.allocatedDeviceBytes() orelse weight.deviceByteLen();
+        }
+        return bytes;
+    }
+
     pub fn deinit(self: *Layer) void {
         for (&self.weights) |*entry| {
             if (entry.*) |*weight| weight.deinit();
