@@ -188,6 +188,29 @@ pub const Append = struct {
     sliding: writable.PreparedAppend,
     active: bool = true,
 
+    pub fn stagedRange(self: *const Append, group: Group) !StagedRange {
+        if (!self.active) return error.KvAppendMissing;
+        const layout = self.sequence.layout;
+        const start = if (group == .sliding) self.sequence.committed_tokens -| layout.window_tokens else 0;
+        const first = layout.firstPage(group, self.sequence.committed_tokens);
+        return .{
+            .first_page = first,
+            .page_count = layout.pageEnd(self.next_tokens) - first,
+            .physical_pages = try layout.pageCapacity(group),
+            .page_tokens = layout.page_tokens,
+            .visible_start = start,
+            .visible_end = self.next_tokens,
+        };
+    }
+
+    pub fn stagedPageIds(self: *Append, group: Group, ids: []u32) !usize {
+        const range = try self.stagedRange(group);
+        if (ids.len < range.page_count) return error.KvCapacityTooSmall;
+        for (ids[0..range.page_count], range.first_page..) |*id, logical|
+            id.* = self.pageId(group, logical) orelse return error.InvalidKvRange;
+        return range.page_count;
+    }
+
     /// Old rows are readable during the append. Payload writes may touch only
     /// rows at or beyond the committed cursor and before next_tokens.
     pub fn pageId(self: *Append, group: Group, logical_page: usize) ?block.KvBlockId {
@@ -271,6 +294,16 @@ test "hybrid paged KV bounds sliding pages through long and misaligned prefills"
         if (first_local > 0) try std.testing.expectEqual(null, append.pageId(.sliding, first_local - 1));
         try std.testing.expect(append.pageId(.sliding, last) != null);
         try std.testing.expectEqual(null, append.pageId(.sliding, last + 1));
+        const range = try append.stagedRange(.sliding);
+        try std.testing.expectEqual(before -| layout.window_tokens, range.visible_start);
+        try std.testing.expectEqual(before + count, range.visible_end);
+        try std.testing.expectEqual(first_local, range.first_page);
+        try std.testing.expectEqual(last + 1 - first_local, range.page_count);
+        var ids: [81]u32 = undefined;
+        try std.testing.expectEqual(range.page_count, try append.stagedPageIds(.sliding, &ids));
+        for (ids[0..range.page_count], first_local..) |id, logical|
+            try std.testing.expectEqual(append.pageId(.sliding, logical).?, id);
+        try std.testing.expectEqual(@as(usize, 81 * 16), try range.physicalRows());
         try std.testing.expectEqual(before, sequence.committed_tokens);
         append.commit();
     }

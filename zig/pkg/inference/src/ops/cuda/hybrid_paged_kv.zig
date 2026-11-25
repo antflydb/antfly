@@ -220,18 +220,7 @@ pub const Cache = struct {
     pub fn stagedPageIds(self: *Cache, group: Group, page_ids: []u32) !usize {
         const pending = if (self.pending) |*value| value else return error.KvAppendMissing;
         if (pending.failed) return error.KvAppendFailed;
-        const range = self.stagedPageRange(group, pending.append.next_tokens);
-        if (page_ids.len < range.count) return error.KvCapacityTooSmall;
-        for (page_ids[0..range.count], range.first..) |*id, logical|
-            id.* = pending.append.pageId(group, logical) orelse return error.InvalidKvRange;
-        return range.count;
-    }
-
-    fn stagedPageRange(self: *const Cache, group: Group, end: usize) struct { start: usize, first: usize, count: usize } {
-        const start = if (group == .sliding) self.committedTokens() -| self.sequence.layout.window_tokens else 0;
-        const page_tokens = self.sequence.layout.page_tokens;
-        const first = start / page_tokens;
-        return .{ .start = start, .first = first, .count = (end - 1) / page_tokens + 1 - first };
+        return pending.append.stagedPageIds(group, page_ids);
     }
 
     /// Borrow a visit's staged planes. The caller uses the page table for the
@@ -242,16 +231,15 @@ pub const Cache = struct {
         if (visit.slot >= selected.written.len) return error.InvalidKvRange;
         if (pending.failed) return error.KvAppendFailed;
         if (!selected.written[visit.slot]) return error.KvVisitNotWritten;
-        const end = pending.append.next_tokens;
-        const range = self.stagedPageRange(visit.group, end);
+        const range = try pending.append.stagedRange(visit.group);
         return .{
             .planes = selected.planes(visit.slot),
-            .first_page = range.first,
-            .page_count = range.count,
-            .physical_pages = try self.sequence.layout.pageCapacity(visit.group),
-            .page_tokens = self.sequence.layout.page_tokens,
-            .visible_start = range.start,
-            .visible_end = end,
+            .first_page = range.first_page,
+            .page_count = range.page_count,
+            .physical_pages = range.physical_pages,
+            .page_tokens = range.page_tokens,
+            .visible_start = range.visible_start,
+            .visible_end = range.visible_end,
         };
     }
 
