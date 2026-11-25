@@ -1613,9 +1613,7 @@ fn runConcreteObservedWithOutputs(
 }
 
 fn validateResidentInput(self: *ImportedOnnxSession, input: ResidentInput) !void {
-    if (input.backend.ptr == self.cb.ptr and input.backend.vtable == self.cb.vtable) return;
-    if (input.backend.kind() == .native and self.cb.kind() == .native) return;
-    return error.UnsupportedResidentInputBackend;
+    if (!ResidentInput.backendCompatible(input.backend, &self.cb)) return error.UnsupportedResidentInputBackend;
 }
 
 fn findSdpaMask(inputs: []const Tensor) ?[]const i64 {

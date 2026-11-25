@@ -66,10 +66,11 @@ fn supportsSingletonStageShape(shape: []const i64, rank: usize) bool {
 
 fn residentStageDecline(encoder: backends.Session, decoder: backends.Session, controlled: bool) ?PlacementReason {
     const source = encoder.shared_compute_context orelse return .no_source_context;
-    if (decoder.shared_compute_context != source) return .foreign_context;
+    const target = decoder.shared_compute_context orelse return .foreign_context;
+    if (!session_mod.ResidentInput.backendCompatible(source.stableBackend(), target.stableBackend())) return .foreign_context;
     if (encoder.vtable.runResident == null or decoder.vtable.runResidentInputs == null) return .missing_resident_entry;
     if (controlled and (encoder.vtable.runResidentWithControl == null or decoder.vtable.runResidentInputsWithControl == null)) return .missing_controlled_entry;
-    if (source.stableBackend().vtable.sliceRows2D == null) return .missing_resident_row_selection;
+    if (target.stableBackend().vtable.sliceRows2D == null) return .missing_resident_row_selection;
     const outputs = encoder.outputInfo();
     if (outputs.len != 1 or outputs[0].dtype != .f32 or !supportsSingletonStageShape(outputs[0].shape, 3)) return .unsupported_encoder_signature;
     return null;

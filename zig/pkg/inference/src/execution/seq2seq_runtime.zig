@@ -149,7 +149,7 @@ pub const State = struct {
         if (encoder == .resident) {
             const value = encoder.resident;
             const target = session.shared_compute_context.?.stableBackend();
-            if (value.backend != target or value.shape.len != 3 or value.shape[0] != 1 or
+            if (!sessions.ResidentInput.backendCompatible(value.backend, target) or value.shape.len != 3 or value.shape[0] != 1 or
                 value.shape[1] <= 0 or value.shape[2] <= 0 or std.math.cast(usize, value.shape[1]) != mask.len)
                 return error.InvalidInputShape;
             for (input_info) |info| {
@@ -702,8 +702,8 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
     const state = if (decoder.incremental) |*value| value else return error.InvalidMergedDecoderFixture;
     const expected_cache: []const f32 = &.{ 3, 4, 5, 6, 7, 8, 9, 10 };
     if (!require_independent) {
-        // Exercise the full producer/consumer path with a real imported
-        // encoder sharing the decoder's exact provider context.
+        // Use separate Native contexts, and the shared context required for
+        // device input, through the same imported producer and consumer.
         var producer = ml.graph.Graph.init(a);
         defer producer.deinit();
         var encoder_builder = ml.graph.Builder.init(&producer);
@@ -714,8 +714,11 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
         try directory.dir.writeFile(std.testing.io, .{ .sub_path = "encoder.onnx", .data = encoder_model });
         const encoder_path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", directory.sub_path[0..], "encoder.onnx" });
         defer a.free(encoder_path);
-        var encoder_session = try @import("../backends/imported_onnx_session.zig").createSessionWithOptions(a, encoder_path, backend, .{ .shared_backend_ctx = session.shared_compute_context });
+        var encoder_session = try @import("../backends/imported_onnx_session.zig").createSessionWithOptions(a, encoder_path, backend, .{
+            .shared_backend_ctx = if (backend == .native) null else session.shared_compute_context,
+        });
         defer encoder_session.close();
+        if (backend == .native) try std.testing.expect(encoder_session.shared_compute_context != session.shared_compute_context);
         const stages = @import("encoder_decoder_runtime.zig");
         const control: Control = .{ .native_call_policy = .in_process };
         const feature_input = hidden.borrowedView("features");

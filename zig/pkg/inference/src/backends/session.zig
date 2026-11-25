@@ -39,6 +39,13 @@ pub const ResidentInput = struct {
     backend: *const ops.ComputeBackend,
     estimated_bytes: usize = 0,
     shape: []const i64 = &.{},
+
+    /// Native CPU tensors share a host representation across providers.
+    /// Device tensors require the exact provider context and table.
+    pub fn backendCompatible(source: *const ops.ComputeBackend, target: *const ops.ComputeBackend) bool {
+        return (source.ptr == target.ptr and source.vtable == target.vtable) or
+            (source.kind() == .native and target.kind() == .native);
+    }
 };
 
 /// Borrowed stage inputs ordered by the destination session signature.
@@ -3225,11 +3232,7 @@ pub const Session = struct {
         const stage_backend = shared.stableBackend();
         for (inputs, self.inputInfo()) |input, info| switch (input) {
             .host => |host| if (!std.mem.eql(u8, host.name, info.name) or host.dtype != info.dtype) return false,
-            .resident => |value| {
-                if (value.backend.ptr == stage_backend.ptr and value.backend.vtable == stage_backend.vtable) continue;
-                if (value.backend.kind() == .native and stage_backend.kind() == .native) continue;
-                return false;
-            },
+            .resident => |value| if (!ResidentInput.backendCompatible(value.backend, stage_backend)) return false,
         };
         return true;
     }
