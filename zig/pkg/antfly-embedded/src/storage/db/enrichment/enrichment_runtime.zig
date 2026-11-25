@@ -12745,6 +12745,13 @@ const SharedPdfWindowScheduler = struct {
                 self.count -= 1;
             }
             setActiveFailureFingerprint(runtime, requestFailureFingerprint(job.request));
+            if (publish) {
+                // Check the original owner after join, including providers
+                // that return a partial envelope instead of a control error.
+                if (runtime.shutdown_requested.load(.acquire)) return error.EnrichmentRetryAborted;
+                try job.guard.check();
+                if (Job.isCanceled(job)) return error.EnrichmentWaitCanceled;
+            }
             if (publish) if (job.text) |*text| {
                 if (text.batch) |batch| {
                     const execution = if (batch.execution.fallback_items > 0) "serial_fallback" else if (batch.execution.native_items > 0) "native_batch" else "serial_compatibility";
