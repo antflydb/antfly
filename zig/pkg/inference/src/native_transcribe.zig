@@ -371,7 +371,10 @@ test "Whisper Small Metal checkpoint runs assigned packed prefill" {
         const shape = try outputs.backend.tensorShape(outputs.outputs[0], a);
         defer a.free(shape);
         try std.testing.expectEqual(@as(usize, 3), shape.len);
-        var decoder = try Adapter.fromResidentPrepared(model.session, a, control, .{
+        var request = std.heap.ArenaAllocator.init(a);
+        defer request.deinit();
+        const task_allocator = request.allocator();
+        var decoder = try Adapter.fromResidentPrepared(model.session, task_allocator, control, .{
             .receiver = receiver,
             .value = outputs.outputs[0],
             .backend = outputs.backend,
@@ -384,7 +387,7 @@ test "Whisper Small Metal checkpoint runs assigned packed prefill" {
         try std.testing.expectEqual(cfg.decoder_layers, initial.schedule.selected.pool.regions.len);
         for (initial.schedule.selected.pool.regions) |region| try std.testing.expect(region.owner.requirements.dispatch_workspace.byte_size != 0);
         const logits = try decoder.step(&tokens);
-        defer a.free(logits);
+        defer task_allocator.free(logits);
         try std.testing.expectEqual(cfg.vocab_size, logits.len);
         try std.testing.expectEqual(initial.schedule.steps.len, initial.schedule.cursor);
     }

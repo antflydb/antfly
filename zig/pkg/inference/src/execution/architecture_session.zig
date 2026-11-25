@@ -5802,7 +5802,15 @@ fn prepareColdWhisperPhases(session: Session, allocator: std.mem.Allocator, cont
         defer source_epoch.release();
         if (try source_epoch.isSealed()) return null;
     };
-    if (!@import("dense_decoder_schedule.zig").preparationBackingSupported(allocator)) return null;
+    // Output and task handles keep the request allocator. A managed Metal
+    // plan has independently admitted metadata and banks, whose lifetimes
+    // require reclaiming storage even when the task uses an arena.
+    const backing = if (@import("dense_decoder_schedule.zig").preparationBackingSupported(allocator))
+        allocator
+    else if (session.backend() == .metal and session.run_admission != null and whisper_arch.metalPackedPrefillEnabled())
+        std.heap.c_allocator
+    else
+        return null;
     // This actual published source/Model pins the native store throughout cold
     // metadata queries and any existing typed lazy-weight preparation.
     const data = denseWhisperPreparationModelData(session) orelse return null;
@@ -5814,7 +5822,7 @@ fn prepareColdWhisperPhases(session: Session, allocator: std.mem.Allocator, cont
     var construction = try ReceiverCleanup.beginStandalone();
     defer construction.finish();
     const current = @import("cleanup_context.zig").Context{ .boundary = construction.boundary() };
-    const metadata = try @import("cold_metadata.zig").Owner.create(allocator, session, &.{base});
+    const metadata = try @import("cold_metadata.zig").Owner.create(backing, session, &.{base});
     var metadata_owned = true;
     defer if (metadata_owned) metadata.deinitOutsideExecution();
     const self = try metadata.allocator().create(ColdNativeWhisper);
@@ -5824,7 +5832,7 @@ fn prepareColdWhisperPhases(session: Session, allocator: std.mem.Allocator, cont
         metadata_owned = false;
         self.destroy(current);
     };
-    const ready = buildColdNativeWhisper(self, session, allocator, control, config, geometry, base, encoder, data, if (domain) |*pin| pin else null, current, construction.boundary(), initial_rows) catch |err| {
+    const ready = buildColdNativeWhisper(self, session, backing, control, config, geometry, base, encoder, data, if (domain) |*pin| pin else null, current, construction.boundary(), initial_rows) catch |err| {
         return if (err == error.OutOfMemory) metadata.admissionError() orelse err else err;
     };
     if (!ready) return null;
@@ -6059,6 +6067,26 @@ const WhisperConstructionObservation = struct {
         selected.diagnostics.publish(.{ .scope = .session_preparation, .operation = .decoder_init, .outcome = .failed, .error_name = diagnostics.Text.init(@errorName(err)), .native_program_construction = self.program, .native_definition_templates = self.templates, .batch = if (selected.batch) |batch| batch.* else null, .pending_interval = if (selected.pending_interval) |pending| pending.* else null });
     }
 };
+
+/// Snapshot only owned immutable definitions. Request-private Frames,
+/// ingress, and cache payloads keep their original admission classes.
+pub fn whisperRetainedDefinitionHostBytes(session: Session) !usize {
+    if (session.vtable != &arch_vtable) return 0;
+    const owner: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (owner.arch_config != .whisper) return 0;
+    const decode = owner.dense_decoder_definitions.acquireCandidate();
+    defer if (decode) |definition| definition.release(.{ .outside_execution = true });
+    const initial = owner.dense_decoder_initial_definitions.acquireCandidate();
+    defer if (initial) |definition| definition.release(.{ .outside_execution = true });
+    const decode_shared = if (decode) |definition| definition.shared else null;
+    const initial_shared = if (initial) |definition| definition.shared else null;
+    const decode_bytes = if (decode_shared) |value| value.admittedAmounts().host_scratch_bytes else 0;
+    const initial_bytes = if (initial_shared != decode_shared)
+        if (initial_shared) |value| value.admittedAmounts().host_scratch_bytes else 0
+    else
+        0;
+    return std.math.add(usize, decode_bytes, initial_bytes);
+}
 
 fn optionalColdNativeWhisper(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, config: whisper_mod.Config, geometry: whisper_arch.CacheGeometry, base: *const @import("../backends/session.zig").RunPermit, encoder: ColdWhisperEncoder, observation: *WhisperConstructionObservation, options: IncrementalDecoderAdapter.PreparationOptions) !?*ColdNativeWhisper {
     const cold = prepareColdNativeWhisperWithInitial(session, allocator, control, config, geometry, base, encoder, options.expected_initial_query_rows) catch |err| {

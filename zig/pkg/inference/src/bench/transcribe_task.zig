@@ -20,14 +20,15 @@ const inference = @import("inference_internal");
 const memory = inference.runtime.tier.memory;
 const Control = inference.execution_control.InferenceExecutionControl;
 
-fn transient(amounts: memory.AdmissionAmounts) memory.AdmissionAmounts {
+fn transient(amounts: memory.AdmissionAmounts, definition_bytes: usize) !memory.AdmissionAmounts {
     var result = amounts;
     result.host_weight_bytes = 0;
     result.backend_weight_bytes = 0;
+    result.host_scratch_bytes = try std.math.sub(usize, result.host_scratch_bytes, definition_bytes);
     return result;
 }
-fn waitRetired(controller: *memory.AdmissionController, initial: memory.AdmissionAmounts, control: Control) !void {
-    while (!std.meta.eql(transient(controller.snapshot()), transient(initial))) {
+fn waitRetired(controller: *memory.AdmissionController, initial: memory.AdmissionAmounts, retained_definition_bytes: usize, control: Control) !void {
+    while (!std.meta.eql(try transient(controller.snapshot(), retained_definition_bytes), initial)) {
         try control.check();
         inference.platform.time.sleepNs(100 * std.time.ns_per_us);
     }
@@ -185,7 +186,8 @@ pub fn run(init: std.process.Init, model: anytype, allocator: std.mem.Allocator,
         const lifecycle_start = inference.platform.time.monotonicNs();
         const timeout_seconds: u64 = if (iteration == 0) options.transcribe_cold_timeout_seconds else 120;
         const control = Control{ .io = init.io, .deadline_ns = inference.platform.time.monotonicNs() + timeout_seconds * std.time.ns_per_s, .hard_cancellation = watchdog.boundary(), .native_call_policy = .require_supervision, .cancellation_grace_ns = std.time.ns_per_s };
-        const initial = domain.controller().snapshot();
+        const initial_definition_bytes = try inference.execution.architecture_session.whisperRetainedDefinitionHostBytes(session);
+        const initial = try transient(domain.controller().snapshot(), initial_definition_bytes);
         var arena = std.heap.ArenaAllocator.init(allocator);
         var arena_open = true;
         defer if (arena_open) arena.deinit();
@@ -253,7 +255,8 @@ pub fn run(init: std.process.Init, model: anytype, allocator: std.mem.Allocator,
         pipeline_open = false;
         arena.deinit();
         arena_open = false;
-        try waitRetired(domain.controller(), initial, control);
+        const retained_definition_bytes = try inference.execution.architecture_session.whisperRetainedDefinitionHostBytes(session);
+        try waitRetired(domain.controller(), initial, retained_definition_bytes, control);
         const retired = inference.platform.time.monotonicNs();
         const record = try std.json.Stringify.valueAlloc(allocator, .{
             .schema_version = 1,
@@ -310,6 +313,11 @@ pub fn run(init: std.process.Init, model: anytype, allocator: std.mem.Allocator,
             .encoded_file_read_in_lifecycle = true,
             .retained_report_publication_outlives_task = true,
             .diagnostic_observation = options.diagnostics,
+            .retained_definition_host_scratch_bytes = retained_definition_bytes,
+            .native_program_construction = if (options.diagnostics)
+                if (session.executionDiagnostics()) |observed| observed.native_program_construction else null
+            else
+                null,
             .language = publication.language,
             .text = publication.text,
             .selected_text_tokens = publication.tokens,
