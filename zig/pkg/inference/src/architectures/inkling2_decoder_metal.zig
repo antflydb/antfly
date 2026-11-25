@@ -361,20 +361,21 @@ test "Inkling Metal resident decoder runs the released text checkpoint" {
     if (!@import("build_options").enable_metal or !metal.metalDeviceAvailable()) return error.SkipZigTest;
     const dir = @import("antfly_platform").env.getenv("ANTFLY_INKLING2_METAL_MODEL_DIR") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
-    var provider = try @import("../backends/metal_native_provider.zig").MetalNativeProvider.create();
-    defer provider.deinitOwned();
-    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
     var source = try checkpoint.Checkpoint.open(a, dir);
     defer source.deinit();
     const time = @import("antfly_platform").time;
     const load_start = time.monotonicNs();
-    var decoder = try Decoder.load(a, runtime, &source);
-    defer decoder.deinit();
-    std.debug.print("Inkling Metal resident text model loaded in {d:.3}s, {d} visits\n", .{
-        @as(f64, @floatFromInt(time.monotonicNs() - load_start)) / 1e9, decoder.schedule.len,
+    const MetalSession = @import("inkling2_session_metal.zig").Runtime;
+    const session = try MetalSession.loadCheckpoint(a, &source);
+    defer session.close();
+    const resident = MetalSession.fromSession(session) orelse return error.Inkling2FixtureRequired;
+    const decoder = &resident.model;
+    try std.testing.expect(resident.resident_bytes > 0);
+    std.debug.print("Inkling Metal resident text model loaded in {d:.3}s, {d} visits, {d} resident bytes\n", .{
+        @as(f64, @floatFromInt(time.monotonicNs() - load_start)) / 1e9, decoder.schedule.len, resident.resident_bytes,
     });
     var request: Request = undefined;
-    try request.init(a, &decoder, 8);
+    try request.init(a, decoder, 8);
     defer request.deinit();
     // Start from the same token as the released CUDA decoder test.
     var token: u32 = 42;

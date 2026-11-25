@@ -21,6 +21,96 @@ const generation = @import("../pipelines/generation.zig");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const Tokenizer = @import("inference_tokenizer").Tokenizer;
 
+const backends = @import("../backends/backends.zig");
+const Manifest = @import("../models/manifest.zig").ModelManifest;
+const checkpoint = @import("inkling2_checkpoint.zig");
+const MetalNativeProvider = @import("../backends/metal_native_provider.zig").MetalNativeProvider;
+const State = @import("inkling2_state_metal.zig").State;
+const Scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler;
+
+pub const Runtime = struct {
+    allocator: std.mem.Allocator,
+    provider: MetalNativeProvider,
+    model: decoder.Decoder,
+    eos: u32,
+    resident_bytes: usize,
+    scheduler: Scheduler = .{},
+    gate: std.atomic.Mutex = .unlocked,
+
+    pub fn load(a: std.mem.Allocator, manifest: *const Manifest) !backends.Session {
+        var source = try checkpoint.Checkpoint.openFiles(a, manifest.config_path orelse return error.NoModelFileFound, manifest.inkling2_shard_path orelse return error.NoModelFileFound);
+        defer source.deinit();
+        return loadCheckpoint(a, &source);
+    }
+
+    pub fn loadCheckpoint(a: std.mem.Allocator, source: *const checkpoint.Checkpoint) !backends.Session {
+        const self = try a.create(Runtime);
+        errdefer a.destroy(self);
+        self.* = .{
+            .allocator = a,
+            .provider = try MetalNativeProvider.create(),
+            .model = undefined,
+            .eos = source.config.value.eos_token_id,
+            .resident_bytes = 0,
+        };
+        errdefer self.provider.deinitOwned();
+        const raw = self.provider.raw_decode_runtime orelse return error.MetalUnavailable;
+        self.model = try decoder.Decoder.load(a, raw, source);
+        self.resident_bytes = self.model.residentBytes();
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    pub fn fromSession(session: backends.Session) ?*Runtime {
+        return if (session.vtable == &vtable) @ptrCast(@alignCast(session.ptr)) else null;
+    }
+
+    pub fn generate(self: *Runtime, session: backends.Session, pipeline: *const TextPipeline, config: generation.GenerationConfig, callbacks: TextPipeline.Callbacks) !generation.GenerationResult {
+        const plan = try pipeline.requestPlan(&self.model, config);
+        const retained = try State.deviceBytes(plan.bank, plan.width);
+        const physical = try plan.deviceBytes();
+        const logit_bytes = @as(usize, self.model.text.unpadded_vocab_size) * @sizeOf(f32);
+        var permit = try session.withAdmissionControl(pipeline.control).admitRetainedStateWithWorkspace(logit_bytes, retained, physical - retained);
+        defer permit.deinit();
+        var waiter: Scheduler.Waiter = .{};
+        try self.scheduler.enter(&waiter, &self.gate, pipeline.control);
+        defer Scheduler.leave(&waiter);
+        return pipeline.generateWithPlan(&self.model, self.eos, config, callbacks, plan);
+    }
+
+    const vtable: backends.Session.VTable = .{
+        .executionCapabilities = capabilities,
+        .run = run,
+        .inputInfo = tensorInfo,
+        .outputInfo = tensorInfo,
+        .backend = backend,
+        .close = close,
+    };
+
+    fn capabilities(ptr: *anyopaque) @import("../backends/session.zig").ExecutionCapabilities {
+        const self: *const Runtime = @ptrCast(@alignCast(ptr));
+        return .{ .measured_resident_weights = self.resident_bytes };
+    }
+
+    fn run(_: *anyopaque, _: []const backends.Tensor, _: std.mem.Allocator) anyerror![]backends.Tensor {
+        return error.UnsupportedSessionRun;
+    }
+
+    fn tensorInfo(_: *anyopaque) []const backends.TensorInfo {
+        return &.{};
+    }
+
+    fn backend(_: *anyopaque) backends.BackendType {
+        return .metal;
+    }
+
+    fn close(ptr: *anyopaque) void {
+        const self: *Runtime = @ptrCast(@alignCast(ptr));
+        self.model.deinit();
+        self.provider.deinitOwned();
+        self.allocator.destroy(self);
+    }
+};
+
 pub const TextPipeline = struct {
     allocator: std.mem.Allocator,
     tokenizer: Tokenizer,
@@ -61,8 +151,11 @@ pub const TextPipeline = struct {
     /// The caller owns the runtime execution gate and memory admission for
     /// the complete request, including prompt prefill and streaming callbacks.
     pub fn generate(self: *const TextPipeline, model: *const decoder.Decoder, eos: u32, config: generation.GenerationConfig, callbacks: Callbacks) !generation.GenerationResult {
+        return self.generateWithPlan(model, eos, config, callbacks, try self.requestPlan(model, config));
+    }
+
+    fn generateWithPlan(self: *const TextPipeline, model: *const decoder.Decoder, eos: u32, config: generation.GenerationConfig, callbacks: Callbacks, plan: decoder.RequestPlan) !generation.GenerationResult {
         try self.control.check();
-        const plan = try self.requestPlan(model, config);
         var request: decoder.Request = undefined;
         try request.initWithPlan(self.allocator, model, plan);
         defer request.deinit();
