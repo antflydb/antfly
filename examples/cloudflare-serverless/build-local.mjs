@@ -77,8 +77,9 @@ for (const name of ["antfly.wasm", "antfly_embedded_wasm_client.mjs", "antfly_em
 
 // 2. Browser inference client and its matching runtime assets.
 if (!process.env.LOCAL_SKIP_WEB) {
-  run("pnpm", ["--dir", "ts", "install", "--frozen-lockfile", "--filter", "@antfly/web..."]);
-  run("pnpm", ["--dir", "ts", "--filter", "@antfly/web", "build"]);
+  // Run from ts/ so Corepack picks the pnpm pinned by ts/package.json.
+  run("pnpm", ["install", "--frozen-lockfile", "--filter", "@antfly/web..."], join(root, "ts"));
+  run("pnpm", ["--filter", "@antfly/web", "build"], join(root, "ts"));
   run("node", [
     join(root, "ts/packages/web/scripts/prepare-runtime.mjs"),
     "--zig-root", join(root, "zig"),
