@@ -511,4 +511,5 @@ test {
     _ = @import("architectures/inkling2_attention_metal.zig");
     _ = @import("architectures/inkling2_controller_metal.zig");
     _ = @import("architectures/inkling2_endpoints_metal.zig");
+    _ = @import("architectures/inkling2_residual_metal.zig");
 }
