@@ -487,7 +487,7 @@ provider-reported token-counter limits; it does not establish live-model quality
 
 The integration suite exercises actual executable behavior with HTTP and native
 inference fixtures, and uses installed ripgrep as an optional development oracle.
-The differential target is ripgrep 15.2.0 with PCRE2 10.45; older versions differ
+The differential target is ripgrep 16.0.0 with PCRE2 10.45; older versions differ
 in some Unicode-property and discovery behavior.
 Cross-compilation covers Linux and Windows; platform runtime checks are separate.
 
@@ -503,7 +503,7 @@ compares 328 valid upstream named trees. These checks establish specific behavio
 not universal PCRE2 or JIT parity. Provider checks currently use fixtures;
 live-provider testing is deferred at the user’s request. Windows validation uses
 cross-compilation; macOS and Linux have runtime checks.
-Regenerate the synthetic PCRE fixtures with a test-only ripgrep 15.2.0 /
+Regenerate the synthetic PCRE fixtures with a test-only ripgrep 16.0.0 /
 PCRE2 10.45 executable:
 
 ```sh
@@ -638,7 +638,7 @@ Server-backed indexed-search tests continue in the Antfly E2E base/full suites.
 `tests/differential.py` generates reproducible PCRE2 patterns, malformed syntax,
 Unicode subjects and option combinations from a seed. It compares syntax
 acceptance, selected output, JSON byte spans and capture replacements against
-**ripgrep 15.2.0 with runtime PCRE2 10.45**, recording executable hashes. Mismatches
+**ripgrep 16.0.0 with runtime PCRE2 10.45**, recording executable hashes. Mismatches
 are reduced by deleting argument units, pattern fragments and subject characters
 under an explicit evaluation budget; UTF-8 subjects remain UTF-8 during reduction.
 Malformed JSON and process failures become replayable failures. Timeouts fail the
@@ -888,6 +888,29 @@ optional OR branches do not exclude their siblings. An unbound native-original
 completeness check can still require metadata verification across the source
 selection. Explicit `--artifact source` selects only inline text; configured
 artifact streams provide their own readiness checks.
+
+Artifact-backed searches require a queryable index, but can search its available
+content before every source has completed extraction. Gaps emit a coverage warning
+and a `coverage` JSON event with the observed incarnation and target/published
+revisions. Summary `scan_complete` reports whether the retained scan finished;
+`coverage_complete` reports whether selected source coverage was observed complete
+and stable across the scan. Overall `complete` requires both. Incomplete coverage
+exits 2 even with matches (including quiet mode); a no-match over that content is
+not an exhaustive corpus no-match. `--require-complete` rejects known gaps before
+searching each selected artifact stream. Revision progress can make coverage
+uncertain without invalidating the retained scan. Status observations are not
+snapshot-bound coverage certificates. Authorization failures, unknown readiness,
+changed definitions and invalid snapshots remain errors.
+
+After a quiet-mode match, grep stops fetching content but checks readiness for
+remaining selected artifact streams within the request budget. A gap or unknown
+readiness still exits 2; cancellation stops further checks.
+
+Successful artifact grep scans also emit a `coverage` JSON observation with
+`complete: true`, the table/index/field, incarnation, and target/published revisions, including when
+there are no matches. This qualifies the observation behind the summary boolean;
+it does not turn the observation into a snapshot-bound extraction certificate.
+
 Every alternative must supply a substring of
 at least three bytes; otherwise the entire query falls back to an exact scan.
 All returned content is verified with the shared matcher. Missing certificates
@@ -2681,7 +2704,7 @@ Final validation covers 227 CLI tests on each of macOS and Linux (two skips each
 hardening tests/four fuzz targets, 1,000 generated comparisons with zero
 mismatches/timeouts, and Windows cross-compilation. Linux package tests run on the
 VM's native filesystem so bind-mount limitations cannot silently skip membership
-coverage. Put the pinned GNU ripgrep 15.2 / PCRE2 10.45 oracle on `PATH` when
+coverage. Put the pinned ripgrep 16.0 / PCRE2 10.45 oracle on `PATH` when
 running Linux CLI qualification; two skips are expected here, and a higher skip
 count can indicate missing oracle coverage. Run package unit executables from
 local VM storage rather than a host bind mount. Native fixtures establish
