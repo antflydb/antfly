@@ -59,9 +59,7 @@ pub const Owner = struct {
         self.instance_id = entry.instance_id;
         self.projection_revision = entry.projection_revision;
         if (input.config_hash) |expected| if (expected != self.config_hash) return error.PreparedGenerationChanged;
-        var parsed = try public.parseFilterAlloc(a, input.query);
-        defer parsed.deinit(a);
-        const native = try public.filterToStatefulTextQueryAlloc(a, parsed.filter, 1);
+        const native = try public.parseStatefulQueryAlloc(a, input.query, 1);
         const normalized = try search.textQueryToSearchQuery(a, native, entry.text_analysis, entry.runtime_schema);
         const lowered = try @import("../../search/search.zig").searchQueryToFilterArena(a, normalized);
         self.filter = try public.cloneFilterAlloc(a, lowered);

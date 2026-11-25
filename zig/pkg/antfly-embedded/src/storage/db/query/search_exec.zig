@@ -25574,15 +25574,94 @@ fn textQueryToSearchQueryWithValues(
             .pattern = regexp.pattern,
             .boost = regexp.boost,
         } },
-        .bool_query => |bool_query| .{ .bool_query = .{
-            .must = try textQuerySliceToSearchQuerySlice(alloc, bool_query.must, text_analysis, runtime_schema, values, false),
-            .should = try textQuerySliceToSearchQuerySlice(alloc, bool_query.should, text_analysis, runtime_schema, values, true),
-            .must_not = try textQuerySliceToSearchQuerySlice(alloc, bool_query.must_not, text_analysis, runtime_schema, values, false),
-            .min_should = bool_query.min_should,
-            .pure_should_optional = bool_query.pure_should_optional,
-            .boost = bool_query.boost,
-        } },
+        .bool_query => |bool_query| if (bool_query.query_string != null)
+            (try lowerQueryStringClause(alloc, text_query, text_analysis, runtime_schema)) orelse .match_none
+        else
+            .{ .bool_query = .{
+                .must = try textQuerySliceToSearchQuerySlice(alloc, bool_query.must, text_analysis, runtime_schema, values, false),
+                .should = try textQuerySliceToSearchQuerySlice(alloc, bool_query.should, text_analysis, runtime_schema, values, true),
+                .must_not = try textQuerySliceToSearchQuerySlice(alloc, bool_query.must_not, text_analysis, runtime_schema, values, false),
+                .min_should = bool_query.min_should,
+                .pure_should_optional = bool_query.pure_should_optional,
+                .boost = bool_query.boost,
+            } },
     };
+}
+
+// A missing clause means analysis removed its entire text. Keep actual
+// match-none queries and terms with no postings in the Boolean expression.
+fn lowerQueryStringClause(
+    alloc: Allocator,
+    query: types.TextQuery,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) anyerror!?search_mod.SearchQuery {
+    if (query == .bool_query) {
+        const boolean = query.bool_query;
+        const must = try lowerQueryStringClauses(alloc, boolean.must, text_analysis, runtime_schema);
+        const should = try lowerQueryStringClauses(alloc, boolean.should, text_analysis, runtime_schema);
+        const must_not = try lowerQueryStringClauses(alloc, boolean.must_not, text_analysis, runtime_schema);
+        if (must.len == 0 and should.len == 0 and must_not.len == 0) return null;
+        // The parser anchors a standalone negation with match-all. When
+        // analysis erases the exclusion, omit the whole negated clause.
+        if (must_not.len == 0 and boolean.must_not.len != 0 and
+            must.len == 1 and must[0] == .match_all and should.len == 0)
+        {
+            alloc.free(must);
+            return null;
+        }
+        // Use the same scoring path as the equivalent single-clause string.
+        if (boolean.boost == 1 and must_not.len == 0) {
+            if (must.len == 1 and should.len == 0 and boolean.must.len > 1) {
+                const clause = must[0];
+                alloc.free(must);
+                return clause;
+            }
+            if (should.len == 1 and must.len == 0 and boolean.should.len > 1 and boolean.min_should <= 1) {
+                const clause = should[0];
+                alloc.free(should);
+                return clause;
+            }
+        }
+        return .{ .bool_query = .{
+            .must = must,
+            .should = should,
+            .must_not = must_not,
+            .min_should = if (should.len == 0) 0 else boolean.min_should,
+            .boost = boolean.boost,
+        } };
+    }
+
+    var lowered = try textQueryToSearchQuery(alloc, query, text_analysis, runtime_schema);
+    switch (lowered) {
+        inline .match, .phrase => |*clause| {
+            const analyzer = clause.analyzer orelse &analysis_mod.default_analyzer;
+            const tokens = try analyzer.analyze(alloc, clause.text);
+            if (tokens.len == 0) {
+                analysis_mod.Analyzer.freeTokens(alloc, tokens);
+                return null;
+            }
+            clause.analyzed_tokens = tokens;
+        },
+        else => {},
+    }
+    return lowered;
+}
+
+fn lowerQueryStringClauses(
+    alloc: Allocator,
+    queries: []const types.TextQuery,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) anyerror![]const search_mod.SearchQuery {
+    var clauses: std.ArrayListUnmanaged(search_mod.SearchQuery) = .empty;
+    defer clauses.deinit(alloc);
+    for (queries) |query| {
+        if (try lowerQueryStringClause(alloc, query, text_analysis, runtime_schema)) |clause| {
+            try clauses.append(alloc, clause);
+        }
+    }
+    return try clauses.toOwnedSlice(alloc);
 }
 
 fn textQuerySliceToSearchQuerySlice(
