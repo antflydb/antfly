@@ -53135,16 +53135,11 @@ pub const PagedRelativeBf16Attention = struct {
                 return error.InvalidShape;
         }
 
-        var position = start;
-        while (position < range.visible_end) {
-            const logical = position / range.page_tokens;
-            const within_page = position % range.page_tokens;
-            const page = append.pageId(group, logical) orelse return error.InvalidKvRange;
-            if (page >= range.physical_pages) return error.InvalidKvRange;
-            const rows = @min(range.visible_end - position, range.page_tokens - within_page);
-            const bytes = rows * row_bytes;
-            const source_offset = (position - start) * row_bytes;
-            const destination_offset = (@as(usize, page) * range.page_tokens + within_page) * row_bytes;
+        var spans = try @import("../runtime/kv/hybrid_paged.zig").RowSpans.init(append.sequence, append, group, start, range.visible_end);
+        while (try spans.next()) |span| {
+            const bytes = span.rows * row_bytes;
+            const source_offset = span.linear_row * row_bytes;
+            const destination_offset = span.physical_row * row_bytes;
             const elements = std.math.cast(i32, bytes / 2) orelse return error.InvalidShape;
             for ([_]*const MetalTensor{ source.key, source.value }, [_]*MetalTensor{ destination.key, destination.value }) |src, dst| {
                 var input = try src.retainedView(source_offset, bytes, &.{elements});
@@ -53154,7 +53149,6 @@ pub const PagedRelativeBf16Attention = struct {
                 dst.invalidateHostMirror();
                 try input.copyInto(&output);
             }
-            position += rows;
         }
     }
 

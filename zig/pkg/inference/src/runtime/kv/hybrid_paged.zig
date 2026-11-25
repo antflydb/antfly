@@ -256,6 +256,59 @@ pub const Append = struct {
     }
 };
 
+/// Maps a linear token range to contiguous physical rows within each page.
+pub const RowSpans = struct {
+    sequence: *const Sequence,
+    append: ?*Append,
+    group: Group,
+    start: usize,
+    end: usize,
+    position: usize,
+    physical_pages: usize,
+
+    pub const Span = struct {
+        linear_row: usize,
+        physical_row: usize,
+        rows: usize,
+    };
+
+    pub fn init(sequence: *const Sequence, append: ?*Append, group: Group, start: usize, end: usize) !RowSpans {
+        const oldest = if (group == .sliding) sequence.committed_tokens -| sequence.layout.window_tokens else 0;
+        const available_end = if (append) |staged| blk: {
+            if (!staged.active or staged.sequence != sequence) return error.InvalidKvRange;
+            break :blk staged.next_tokens;
+        } else sequence.committed_tokens;
+        if (start < oldest or end < start or end > available_end) return error.InvalidKvRange;
+        return .{
+            .sequence = sequence,
+            .append = append,
+            .group = group,
+            .start = start,
+            .end = end,
+            .position = start,
+            .physical_pages = try sequence.layout.pageCapacity(group),
+        };
+    }
+
+    pub fn next(self: *RowSpans) !?Span {
+        if (self.position == self.end) return null;
+        const tokens = self.sequence.layout.page_tokens;
+        const logical = self.position / tokens;
+        const within = self.position % tokens;
+        const page = (if (self.append) |staged| staged.pageId(self.group, logical) else self.sequence.pageId(self.group, logical)) orelse
+            return error.InvalidKvRange;
+        if (page >= self.physical_pages) return error.InvalidKvRange;
+        const rows = @min(self.end - self.position, tokens - within);
+        const span: Span = .{
+            .linear_row = self.position - self.start,
+            .physical_row = @as(usize, page) * tokens + within,
+            .rows = rows,
+        };
+        self.position += rows;
+        return span;
+    }
+};
+
 const inkling_test_layout: Layout = .{ .page_tokens = 16, .window_tokens = 1024, .max_tokens = 32768, .max_append_tokens = 256 };
 
 fn testPool(layer_count: u16) !storage.KvStorage {

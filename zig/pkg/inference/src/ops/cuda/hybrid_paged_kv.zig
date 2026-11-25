@@ -275,17 +275,11 @@ pub const Cache = struct {
     }
 
     fn copyRows(self: *Cache, bank_planes: Planes, linear: Planes, group: Group, start: usize, end: usize, append: ?*metadata.Append, direction: CopyDirection) !void {
-        const page_tokens = self.sequence.layout.page_tokens;
-        var position = start;
-        while (position < end) {
-            const logical_page = position / page_tokens;
-            const within_page = position % page_tokens;
-            const physical_page = (if (append) |staged| staged.pageId(group, logical_page) else self.sequence.pageId(group, logical_page)) orelse
-                return error.InvalidKvRange;
-            const rows = @min(end - position, page_tokens - within_page);
-            const bytes = rows * self.row_bytes;
-            const offset = (@as(usize, physical_page) * page_tokens + within_page) * self.row_bytes;
-            const linear_offset = (position - start) * self.row_bytes;
+        var spans = try metadata.RowSpans.init(&self.sequence, append, group, start, end);
+        while (try spans.next()) |span| {
+            const bytes = span.rows * self.row_bytes;
+            const offset = span.physical_row * self.row_bytes;
+            const linear_offset = span.linear_row * self.row_bytes;
             const keys = view(bank_planes.key, offset, bytes);
             const values = view(bank_planes.value, offset, bytes);
             const linear_keys = view(linear.key, linear_offset, bytes);
@@ -297,7 +291,6 @@ pub const Cache = struct {
                 try linear_keys.copyFromDevice(self.ctx, keys, bytes);
                 try linear_values.copyFromDevice(self.ctx, values, bytes);
             }
-            position += rows;
         }
     }
 
