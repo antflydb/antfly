@@ -1423,7 +1423,7 @@ pub fn forwardPrefillHiddenFromEmbeddingsWithLayer0Overrides(
     const output: SharedKvPrefillOutput = if (batch == 1 and can_prune and !disableSharedKvDebug() and
         decode_context != null and
         decode_context.?.query_sequence_len > 1 and decode_context.?.query_sequence_len <= seq_len and decode_context.?.total_sequence_len == seq_len and
-        sharedKvPrefillBoundaryForBackend(cb.kind(), config, decode_context.?.*) != null)
+        sharedKvPrefillBoundaryForBackend(cb, config, decode_context.?.*) != null)
         .last
     else
         .all;
@@ -2994,8 +2994,10 @@ pub fn nativeSharedKvPrefillEnabled(config: Config) bool {
     return platform.env.getenvBool("ANTFLY_INFERENCE_NATIVE_SHARED_KV_PREFILL") and config.sharedKvFunctionalDonorLayers() != null;
 }
 
-fn sharedKvPrefillBoundaryForBackend(backend: ops.BackendKind, config: Config, dc: DecodeContext) ?usize {
-    return sharedKvBoundary(if (backend == .native) config.sharedKvFunctionalDonorLayers() else config.sharedKvPrefillDonorLayers(), dc);
+fn sharedKvPrefillBoundaryForBackend(cb: *const ComputeBackend, config: Config, dc: DecodeContext) ?usize {
+    const supports_functional = cb.kind() == .native or (build_options.enable_cuda and cb.kind() == .cuda and
+        @import("../ops/cuda/cuda_compute.zig").CudaCompute.nativePrefillPolicySelected(cb));
+    return sharedKvBoundary(if (supports_functional) config.sharedKvFunctionalDonorLayers() else config.sharedKvPrefillDonorLayers(), dc);
 }
 
 fn sharedKvBoundary(donors: ?usize, dc: DecodeContext) ?usize {
@@ -3222,7 +3224,7 @@ pub fn trySharedKvPrefill(
             (config.video_token_index >= 0 and token == config.video_token_index) or
             (config.boi_token_index >= 0 and token == config.boi_token_index)) return null;
     }
-    _ = sharedKvPrefillBoundaryForBackend(cb.kind(), config, dc.*) orelse return null;
+    _ = sharedKvPrefillBoundaryForBackend(cb, config, dc.*) orelse return null;
     if (input_ids.len != dc.query_sequence_len or seq_len != dc.total_sequence_len) return null;
     if (cb.kind() == .metal) {
         if (want_last_row) return null;
@@ -3351,7 +3353,7 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
     }
     const shared_boundary: ?usize = if (output == .all) null else blk: {
         if (batch != 1 or pre_norm_out != null or trace_sink != null) return error.UnsupportedShape;
-        break :blk sharedKvPrefillBoundaryForBackend(cb.kind(), config, (decode_context orelse return error.UnsupportedShape).*) orelse return error.UnsupportedShape;
+        break :blk sharedKvPrefillBoundaryForBackend(cb, config, (decode_context orelse return error.UnsupportedShape).*) orelse return error.UnsupportedShape;
     };
     var shared_context: DecodeContext = undefined;
     var layer_context = decode_context;

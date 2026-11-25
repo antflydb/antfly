@@ -56,7 +56,7 @@ pub fn selected() ?Projection {
 /// Automatic rollout is narrower than explicit experimental policy. Check
 /// parsed geometry and the actual donor storage inventory, never a model name.
 pub fn automaticGeometry(config: Config) bool {
-    return Geometry.resolve(config) != null and config.intermediate_size == 10240 and
+    return config.sharedKvPrefillDonorLayers() != null and config.intermediate_size == 10240 and
         config.sliding_window == 512 and config.sliding_window_pattern == 6 and
         config.ple_hidden_size == 256 and config.vocab_size == 262144 and config.max_position_embeddings == 131072;
 }
@@ -156,9 +156,12 @@ pub const Geometry = struct {
     }
 
     pub fn resolve(config: Config) ?Geometry {
-        // Scope the plan to the E4B geometry exercised by the native prefill
-        // path. Other Gemma configurations continue through their own routes.
-        const boundary = config.sharedKvPrefillDonorLayers() orelse return null;
+        if (config.sharedKvPrefillDonorLayers()) |boundary| return .{ .donor_layers = boundary };
+        // The explicit plan uses common paged query widths. Automatic rollout
+        // separately verifies the tuned geometry and each donor projection.
+        if (!config.hasPle() or config.attention_head_dim != 256 or config.global_head_dim != 512 or
+            config.num_attention_heads != 8 or config.num_key_value_heads == 0 or config.num_key_value_heads > 2) return null;
+        const boundary = config.sharedKvFunctionalDonorLayers() orelse return null;
         return .{ .donor_layers = boundary };
     }
 
@@ -168,6 +171,7 @@ pub const Geometry = struct {
         var bytes: usize = 0;
         for (file.tensors) |tensor| {
             if (!self.mirrorsWeight(tensor.name)) continue;
+            if (tensor.tensor_type != .known or tensor.tensor_type.known != .Q4_0) continue;
             if (tensor.dimensions.len != 2) return error.InvalidNativeMirrorInventory;
             var elements: usize = 1;
             for (tensor.dimensions) |dimension| elements = try std.math.mul(usize, elements, std.math.cast(usize, dimension) orelse return error.ResourceLimitExceeded);
