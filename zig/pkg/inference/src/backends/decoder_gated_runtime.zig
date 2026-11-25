@@ -2403,6 +2403,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
             .layers = planned_frame_layers,
             .include_tail = row_output != .kv_only,
             .output_hidden = &frame_hidden,
+            .execution_control = cb.execution_control,
         })) {
             const frame_execute_finished_at = monotonicNowNs();
             if (frame_execute_finished_at > frame_execute_started_at) {

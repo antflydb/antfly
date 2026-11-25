@@ -38391,35 +38391,42 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
     }
 
+    fn prefillFrameLayerWindowMatches(
+        self: *const MetalCompute,
+        window: metal_command_planner.GatedFrameLayerWindow,
+        full_contract: ops.PlannedLayerContract,
+    ) bool {
+        return window.layer_end <= self.active_prefill_frame_contract_storage.command_ops.len and
+            window.layer_start < window.setup_start and
+            window.setup_start < window.block_start and window.block_start < window.layer_end and
+            plannedContractIsActive(full_contract) and
+            window.layer_end <= full_contract.command_ops.len and
+            window.layer_end <= full_contract.ops.len and
+            window.layer_end <= full_contract.barriers.len and
+            window.layer_end <= full_contract.quant_dispatches.len;
+    }
+
     fn activePrefillFrameLayerDispatch(
         self: *MetalCompute,
         window: metal_command_planner.GatedFrameLayerWindow,
         full_contract: ops.PlannedLayerContract,
     ) ?PrefillFrameLayerDispatch {
-        if (window.layer_end > self.active_prefill_frame_contract_storage.command_ops.len) return null;
-        if (window.layer_start >= window.setup_start) return null;
-        if (window.setup_start >= window.block_start or window.block_start >= window.layer_end) return null;
-        if (!plannedContractIsActive(full_contract)) return null;
-        if (window.layer_end > full_contract.command_ops.len or
-            window.layer_end > full_contract.ops.len or
-            window.layer_end > full_contract.barriers.len or
-            window.layer_end > full_contract.quant_dispatches.len)
-        {
-            return null;
-        }
+        if (!self.prefillFrameLayerWindowMatches(window, full_contract)) return null;
         self.timing_stats.prefill_frame_executor_scope_links += 1;
         return .{ .window = window, .full_contract = full_contract };
     }
 
-    fn activePrefillFrameTailContract(
+    fn prefillFrameTailContract(
         self: *MetalCompute,
         window: metal_command_planner.GatedFrameTailWindow,
     ) ?ops.PlannedLayerContract {
         if (window.end > self.active_prefill_frame_contract_storage.command_ops.len) return null;
-        const contract = self.activePrefillFrameContractWindow(window.start, window.end);
-        if (!plannedContractIsActive(contract)) return null;
-        self.timing_stats.prefill_frame_executor_tail_contracts += 1;
-        return contract;
+        const contract = metal_runtime.plannedContractWindowFromStorage(
+            self.active_prefill_frame_contract_storage.view(),
+            window.start,
+            window.end,
+        );
+        return if (plannedContractIsActive(contract)) contract else null;
     }
 
     fn declinePrefillFrameExecute(self: *MetalCompute, reason: PrefillFrameExecuteDeclineReason) bool {
@@ -39570,26 +39577,36 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         errdefer if (owns_hidden) freeTemporaryWorkspaceCtOp(ctx, hidden);
 
         const full_frame_contract = self.activePrefillFrameFullContract() orelse return self.declinePrefillFrameExecute(.plan_mismatch);
-        // Reject a stale or mismatched prefix/tail plan before the first KV
-        // write. The same cursor will drive the actual existing layer kernels.
+        // Check every layer and its dispatch window before a stateful layer
+        // publishes K/V. Returning false permits ordinary execution in this frame.
         var validation = metal_command_planner.GatedFramePlanCursor.init(frame_plan.view());
         for (request.layers) |layer| {
-            _ = validation.nextLayer(.{ .shares_kv = layer.shares_kv, .value_norm = request.global_head_dim != 0 and !layer.shares_kv, .kv_seed = true, .include_ple = true }) orelse return self.declinePrefillFrameExecute(.plan_mismatch);
-        }
-        if (request.include_tail) _ = validation.nextTailLogits() orelse return self.declinePrefillFrameExecute(.plan_mismatch);
-        if (!validation.complete()) return self.declinePrefillFrameExecute(.plan_mismatch);
-        var frame_cursor = metal_command_planner.GatedFramePlanCursor.init(frame_plan.view());
-        for (request.layers, 0..) |layer, layer_index| {
-            const head_dim = layer.head_dim;
-            if (head_dim == 0 or layer.kv_heads == 0 or layer.intermediate_size == 0) return error.UnsupportedShape;
-            const attention_input_size = request.num_attention_heads * head_dim;
-            const layer_window = frame_cursor.nextLayer(.{
+            if (layer.head_dim == 0 or layer.kv_heads == 0 or layer.intermediate_size == 0) return self.declinePrefillFrameExecute(.invalid_shape);
+            const window = validation.nextLayer(.{
                 .shares_kv = layer.shares_kv,
                 .value_norm = request.global_head_dim != 0 and !layer.shares_kv,
                 .kv_seed = true,
                 .include_ple = true,
             }) orelse return self.declinePrefillFrameExecute(.plan_mismatch);
-            const layer_dispatch = self.activePrefillFrameLayerDispatch(layer_window, full_frame_contract) orelse return self.declinePrefillFrameExecute(.plan_mismatch);
+            if (!self.prefillFrameLayerWindowMatches(window, full_frame_contract)) return self.declinePrefillFrameExecute(.plan_mismatch);
+        }
+        const tail_contract: ?ops.PlannedLayerContract = if (request.include_tail) blk: {
+            const window = validation.nextTailLogits() orelse return self.declinePrefillFrameExecute(.plan_mismatch);
+            break :blk self.prefillFrameTailContract(window) orelse return self.declinePrefillFrameExecute(.plan_mismatch);
+        } else null;
+        if (!validation.complete()) return self.declinePrefillFrameExecute(.plan_mismatch);
+
+        var frame_cursor = metal_command_planner.GatedFramePlanCursor.init(frame_plan.view());
+        for (request.layers, 0..) |layer, layer_index| {
+            if (request.execution_control) |control| try control.check();
+            const head_dim = layer.head_dim;
+            const layer_window = frame_cursor.nextLayer(.{
+                .shares_kv = layer.shares_kv,
+                .value_norm = request.global_head_dim != 0 and !layer.shares_kv,
+                .kv_seed = true,
+                .include_ple = true,
+            }) orelse return error.PrefillFramePlanChangedAfterCommit;
+            const layer_dispatch = self.activePrefillFrameLayerDispatch(layer_window, full_frame_contract) orelse return error.PrefillFramePlanChangedAfterCommit;
 
             try self.maybeDumpDecodeStageCt("prefill-hidden", layer_index, hidden, request.hidden_size);
             const attn_normed = (try decoderRuntimeApplyRmsNormOp(ctx, &.{
@@ -39667,14 +39684,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             hidden = block_hidden;
             owns_hidden = true;
             try self.maybeDumpDecodeStageCt("prefill-output-scale", layer_index, hidden, request.hidden_size);
-            _ = attention_input_size;
         }
 
-        if (request.include_tail) {
-            const tail_window = frame_cursor.nextTailLogits() orelse return error.PrefillFramePlanChangedAfterCommit;
-            self.active_prefill_frame_tail_contract = self.activePrefillFrameTailContract(tail_window) orelse return error.PrefillFramePlanChangedAfterCommit;
-        } else self.active_prefill_frame_tail_contract = null;
+        if (tail_contract != null) _ = frame_cursor.nextTailLogits() orelse return error.PrefillFramePlanChangedAfterCommit;
         if (!frame_cursor.complete()) return error.PrefillFramePlanChangedAfterCommit;
+        if (request.execution_control) |control| try control.check();
+        self.active_prefill_frame_tail_contract = tail_contract;
+        if (tail_contract != null) {
+            self.timing_stats.prefill_frame_contract_windows += 1;
+            self.timing_stats.prefill_frame_executor_tail_contracts += 1;
+        }
         request.output_hidden.* = hidden;
         owns_hidden = false;
         execute_success = true;
