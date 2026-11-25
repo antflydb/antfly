@@ -72,6 +72,14 @@ pub const Stage = enum(u8) {
     merge_plan_tiered,
     /// segments an inline full-text write found at prepare (value: count).
     inline_segments_seen,
+    /// The writer lane held by a writer's checkout, a maintenance turn, a
+    /// local peer handoff, or parked-lease maintenance; and a writer's wait
+    /// in checkout.
+    lane_hold_writer,
+    lane_hold_maintenance,
+    lane_hold_peer,
+    lane_hold_parked,
+    lane_checkout_wait,
     /// Within `text_segment_build` (from `BuildTextProfile`): tokenizing
     /// and accumulating terms.
     text_build_analyze,

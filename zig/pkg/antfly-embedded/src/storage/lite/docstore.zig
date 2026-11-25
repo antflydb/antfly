@@ -3029,13 +3029,25 @@ pub const WriterAdmission = struct {
 /// Store publication can include durable I/O. Reserve a turn before waiting:
 /// a continuous group-commit writer must not barge ahead of queued vacuum,
 /// reader-release or maintenance work each time it drops the owner mutex.
-/// Keep the existing bounded-spin/yield policy without allocating wait nodes
-/// or depending on a foreign executor's futex namespace.
+/// No wait nodes are allocated and no executor's futex namespace is used:
+/// after a bounded spin, a waiter parks on the OS futex word `wake_epoch`,
+/// which `unlock` bumps and wakes when anyone is parked. Sleeping in fixed
+/// steps instead (`platform_sync.lockYielding`) oversleeps every contended
+/// acquisition, and the writer staging a transaction does that while it
+/// holds the connection's writer lane, behind each group's apply.
 const publication_mutex_owner_tracking = std.debug.runtime_safety;
+const publication_mutex_parks = switch (@import("builtin").os.tag) {
+    .linux, .macos => true,
+    else => false,
+};
 
 const PublicationMutex = struct {
     next_ticket: std.atomic.Value(u64) = .init(0),
     serving_ticket: std.atomic.Value(u64) = .init(0),
+    /// Bumped by `unlock` while `parked` is nonzero; parked waiters wait on
+    /// it. Every waiter wakes and rechecks its ticket: few wait at once.
+    wake_epoch: std.atomic.Value(u32) = .init(0),
+    parked: std.atomic.Value(u32) = .init(0),
     /// Debug-only re-entrancy guard. This is a cooperative, ticketed
     /// yield-spin (`platform_sync.lockYielding`), not a hard OS mutex: a
     /// caller that re-enters `lock()` from the same thread that already
@@ -3077,7 +3089,7 @@ const PublicationMutex = struct {
             }
         };
         var turn = Turn{ .serving = &self.serving_ticket, .ticket = self.next_ticket.fetchAdd(1, .monotonic) };
-        platform_sync.lockYielding(&turn);
+        if (comptime publication_mutex_parks) self.waitTurn(turn.ticket) else platform_sync.lockYielding(&turn);
         if (publication_mutex_owner_tracking) self.owner.store(@as(u64, std.Thread.getCurrentId()), .release);
     }
 
@@ -3088,9 +3100,34 @@ const PublicationMutex = struct {
         return acquired;
     }
 
+    /// Sequentially consistent so that a waiter that missed this turn's
+    /// release is seen as parked (the waiter registers, then rechecks).
+    fn waitTurn(self: *@This(), ticket: u64) void {
+        var spins: u32 = 0;
+        while (self.serving_ticket.load(.acquire) != ticket) {
+            if (spins < 64) {
+                std.atomic.spinLoopHint();
+                spins += 1;
+                continue;
+            }
+            _ = self.parked.fetchAdd(1, .seq_cst);
+            const epoch = self.wake_epoch.load(.seq_cst);
+            // Bounded, so a lost wake costs a retry rather than a hang.
+            if (self.serving_ticket.load(.seq_cst) != ticket) platform_sync.rawFutexWaitShared(&self.wake_epoch.raw, epoch, 10);
+            _ = self.parked.fetchSub(1, .monotonic);
+        }
+    }
+
     pub fn unlock(self: *@This()) void {
         if (publication_mutex_owner_tracking) self.owner.store(no_owner, .release);
-        _ = self.serving_ticket.fetchAdd(1, .release);
+        if (comptime !publication_mutex_parks) {
+            _ = self.serving_ticket.fetchAdd(1, .release);
+            return;
+        }
+        _ = self.serving_ticket.fetchAdd(1, .seq_cst);
+        if (self.parked.load(.seq_cst) == 0) return;
+        _ = self.wake_epoch.fetchAdd(1, .seq_cst);
+        platform_sync.futexWakeShared(&self.wake_epoch.raw);
     }
 };
 
@@ -5719,16 +5756,32 @@ pub const Store = struct {
         /// of a since-read `activeCheckpoint()` avoids the false positive a
         /// later, unrelated non-durable ride-along commit would otherwise
         /// cause.
+        /// The writer is held by a maintenance turn: this store's own, or,
+        /// for a request forwarded from a maintenance snapshot, the
+        /// snapshot's, which is where that turn's admission marks it.
+        fn heldByMaintenance(self: Ticket) bool {
+            if (self.store.writer_held_by_maintenance.load(.acquire)) return true;
+            const origin = self.origin orelse return false;
+            return origin.writer_held_by_maintenance.load(.acquire);
+        }
+
         pub fn waitSequence(self: Ticket) !u64 {
             const io = self.store.file.runtime();
             self.store.commit_mutex.lockUncancelable(io);
             while (!self.request.done) {
-                if (self.request.ride_along and self.store.writer_held_by_maintenance.load(.acquire)) {
+                if (self.request.ride_along and self.heldByMaintenance()) {
                     self.store.commit_mutex.unlock(io);
                     {
+                        // No foreground writer can lead a group while a
+                        // maintenance turn holds the writer, so waiting for
+                        // one only idles the turn with the lane checked out.
+                        // Drive this group without a barrier of its own: a
+                        // ride-along rides the next durable group, and a
+                        // store with writer admission still syncs every
+                        // group (`applyMutationGroup`).
                         const flush_scope = wal_trace.scope(.ride_along_flush);
                         defer flush_scope.end();
-                        self.store.forceDrainDurable();
+                        self.store.forceDrain(false);
                     }
                     self.store.commit_mutex.lockUncancelable(io);
                 } else if (self.request.ride_along) {
@@ -6006,6 +6059,10 @@ pub const Store = struct {
     /// in `stageRideAlong` above), `Store.close`, `Store.sync`, and the
     /// hook WS1's reuse frontier calls before trusting `durableSequence()`.
     fn forceDrainDurable(self: *Store) void {
+        self.forceDrain(true);
+    }
+
+    fn forceDrain(self: *Store, force_durable: bool) void {
         const io = self.file.runtime();
         self.commit_mutex.lockUncancelable(io);
         const become_leader = self.commit_head != null and !self.commit_draining;
@@ -6015,7 +6072,7 @@ pub const Store = struct {
         // null`), not just until some one ticket is covered. Nothing must
         // be left behind for close/sync/the reuse frontier to have called
         // this for in the first place.
-        if (become_leader) self.driveMutationCoordinator(true, null);
+        if (become_leader) self.driveMutationCoordinator(force_durable, null);
     }
 
     /// WS1 hook: call before relying on `durableSequence()` to bound which

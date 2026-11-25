@@ -1153,6 +1153,8 @@ pub const Demand = packed struct(u8) {
 /// always parks for it as long as it is already polling (`waiting != 0`),
 /// no matter when it started.
 pub const WriterLane = struct {
+    /// Write profile (`ANTFLY_LITE_WRITE_PROFILE`): the current hold.
+    held_since: ?write_stage_profile.Span = null,
     mutex: std.Io.Mutex = .init,
     /// The kernel lease, parked between writers: held by this process,
     /// not currently in use by any call. `null` either because nobody has
@@ -1315,7 +1317,20 @@ pub const WriterLane = struct {
     /// though nothing external changed) -- observed empirically as a
     /// `metadata_pool`/`source_certificates` crash from a generation torn
     /// down while another writer was still pinned on it.
+    fn noteTaken(self: *WriterLane, kind: write_stage_profile.Stage) void {
+        if (!write_stage_profile.enabled()) return;
+        self.held_since = write_stage_profile.begin(kind);
+    }
+
+    fn noteReleased(self: *WriterLane) void {
+        const span = self.held_since orelse return;
+        self.held_since = null;
+        span.end();
+    }
+
     pub fn checkout(self: *WriterLane, connection: *Connection, intent: api.StorageIntent) !*h.Handle {
+        const wait_span = write_stage_profile.begin(.lane_checkout_wait);
+        defer wait_span.end();
         const io = h.handleLockIo();
         const deadline = connection.admissionDeadline();
         // See `min_local_wait_ns`'s doc comment: the "someone else is
@@ -1375,6 +1390,7 @@ pub const WriterLane = struct {
             if (if (self.reading) null else self.parked) |parked| {
                 self.parked = null;
                 self.checked_out = true;
+                self.noteTaken(.lane_hold_writer);
                 self.holder = std.Thread.getCurrentId();
                 const likely_root = self.last_root;
                 self.mutex.unlock(io);
@@ -1428,6 +1444,7 @@ pub const WriterLane = struct {
                     if (lease) |*held| held.close();
                     self.mutex.lockUncancelable(io);
                     self.checked_out = false;
+                    self.noteReleased();
                     self.mutex.unlock(io);
                     self.signalReleased(io);
                     if (err == error.MaintenanceTurnBusy) {
@@ -1448,6 +1465,7 @@ pub const WriterLane = struct {
             }
             if (!self.checked_out and !self.reading) {
                 self.checked_out = true;
+                self.noteTaken(.lane_hold_writer);
                 self.holder = std.Thread.getCurrentId();
                 self.mutex.unlock(io);
                 // Cold path: nothing parked yet. Do the full admission
@@ -1464,6 +1482,7 @@ pub const WriterLane = struct {
                 var lease: ?native.PathWriterLock = connection.acquireForOwnCheckout() catch |err| {
                     self.mutex.lockUncancelable(io);
                     self.checked_out = false;
+                    self.noteReleased();
                     self.mutex.unlock(io);
                     self.signalReleased(io);
                     return err;
@@ -1476,6 +1495,7 @@ pub const WriterLane = struct {
                     connection.gate.mutex.unlock(io);
                     self.mutex.lockUncancelable(io);
                     self.checked_out = false;
+                    self.noteReleased();
                     self.mutex.unlock(io);
                     self.signalReleased(io);
                     if (err == error.MaintenanceTurnBusy) {
@@ -1556,6 +1576,7 @@ pub const WriterLane = struct {
         defer self.mutex.unlock(io);
         if (self.checked_out or self.reading) return .busy;
         self.checked_out = true;
+        self.noteTaken(.lane_hold_maintenance);
         self.holder = std.Thread.getCurrentId();
         const lease = self.parked orelse return .fresh;
         self.parked = null;
@@ -1803,6 +1824,7 @@ pub const WriterLane = struct {
         const io = h.handleLockIo();
         self.mutex.lockUncancelable(io);
         self.checked_out = false;
+        self.noteReleased();
         self.mutex.unlock(io);
         self.signalReleased(io);
     }
@@ -1818,6 +1840,7 @@ pub const WriterLane = struct {
         self.mutex.lockUncancelable(io);
         if (self.closing) {
             self.checked_out = false;
+            self.noteReleased();
             self.mutex.unlock(io);
             var released = lease;
             released.close();
@@ -1835,6 +1858,7 @@ pub const WriterLane = struct {
         // through another instance: the next checkout must refresh.
         self.last_root = null;
         self.checked_out = false;
+        self.noteReleased();
         self.mutex.unlock(io);
         self.signalReleased(io);
         // A timed loop wait re-reads the parked-lease timer on its own; a
@@ -1847,6 +1871,7 @@ pub const WriterLane = struct {
         const io = h.handleLockIo();
         self.mutex.lockUncancelable(io);
         self.checked_out = false;
+        self.noteReleased();
         self.mutex.unlock(io);
         self.signalReleased(io);
     }
@@ -1944,6 +1969,7 @@ pub const WriterLane = struct {
             self.parked_since_ns = now;
             self.parked_store = store;
             self.checked_out = false;
+            self.noteReleased();
             self.mutex.unlock(io);
             self.signalReleased(io);
             // A local waiter takes this immediately (its own poll, not
@@ -1968,6 +1994,7 @@ pub const WriterLane = struct {
             self.parked_since_ns = now;
             self.parked_store = store;
             self.checked_out = false;
+            self.noteReleased();
             self.mutex.unlock(io);
             self.signalReleased(io);
             // Bare `self.wake.set(io)` isn't enough: `Owner.maintenanceLoop`
@@ -1984,6 +2011,7 @@ pub const WriterLane = struct {
             return;
         }
         self.checked_out = false;
+        self.noteReleased();
         self.mutex.unlock(io);
         self.signalReleased(io);
         store.ensureDurableForReuse();
@@ -2057,6 +2085,7 @@ pub const WriterLane = struct {
         self.parked = null;
         self.foreign_release_due = false;
         self.checked_out = true;
+        self.noteTaken(.lane_hold_peer);
         self.holder = std.Thread.getCurrentId();
         self.local_reader_activity.begin();
         const store = self.parked_store;
@@ -2081,6 +2110,7 @@ pub const WriterLane = struct {
         const io = h.handleLockIo();
         self.mutex.lockUncancelable(io);
         self.checked_out = false;
+        self.noteReleased();
         self.mutex.unlock(io);
         self.signalReleased(io);
         if (comptime h.builtin.is_test) if (test_peer_release_pause) |pause| {
@@ -2136,6 +2166,7 @@ pub const WriterLane = struct {
         self.parked = null;
         self.foreign_release_due = false;
         self.checked_out = true;
+        self.noteTaken(.lane_hold_parked);
         self.holder = std.Thread.getCurrentId();
         const store = self.parked_store;
         self.parked_store = null;
@@ -2153,6 +2184,7 @@ pub const WriterLane = struct {
         lease.close();
         self.mutex.lockUncancelable(io);
         self.checked_out = false;
+        self.noteReleased();
         self.mutex.unlock(io);
         self.signalReleased(io);
         return null;
