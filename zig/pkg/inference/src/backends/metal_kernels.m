@@ -47480,6 +47480,29 @@ int termite_metal_decode_runtime_apply_linear_qkv_slots_device(
     }
 }
 
+// Pair and QKV use the same custody boundary: reject every overlap
+// before retaining resources, then retain each distinct backing only once.
+static bool antfly_metal_retain_disjoint_projection_ranges(
+    termite_metal_decode_runtime *runtime,
+    const termite_metal_planned_encoder_range *ranges,
+    size_t count
+) {
+    unsigned retain_mask = 0;
+    for (size_t i = 0; i < count; ++i) {
+        bool first_use = true;
+        for (size_t j = 0; j < i; ++j) {
+            if (termite_metal_planned_ranges_overlap(&ranges[i], &ranges[j])) return false;
+            if (ranges[i].buffer == ranges[j].buffer) first_use = false;
+        }
+        if (first_use) retain_mask |= 1u << i;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if ((retain_mask & (1u << i)) != 0 &&
+            termite_metal_decode_runtime_retain_frame_resource(runtime, ranges[i].buffer) != 0) return false;
+    }
+    return true;
+}
+
 static int termite_metal_decode_runtime_apply_dense_linear_qkv_slots_scratch_device_with_destinations(
     termite_metal_decode_runtime *runtime,
     size_t q_slot,
@@ -47577,11 +47600,7 @@ static int termite_metal_decode_runtime_apply_dense_linear_qkv_slots_scratch_dev
             if (termite_metal_planned_range_make(k_output_buffer, k_output_offset, kv_output_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &ranges[2], -18) != 0) return -18;
             if (termite_metal_planned_range_make(v_output_buffer, v_output_offset, kv_output_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &ranges[3], -18) != 0) return -18;
             if (termite_metal_planned_range_make(packed_output_buffer, packed_output_offset, packed_output_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &ranges[4], -18) != 0) return -18;
-            for (size_t i = 0; i < 5; ++i) {
-                for (size_t j = i + 1; j < 5; ++j)
-                    if (termite_metal_planned_ranges_overlap(&ranges[i], &ranges[j])) return -18;
-                if (termite_metal_decode_runtime_retain_frame_resource(runtime, ranges[i].buffer) != 0) return -18;
-            }
+            if (!antfly_metal_retain_disjoint_projection_ranges(runtime, ranges, 5)) return -18;
         }
         if (entry && ((__bridge id<MTLBuffer>)entry->weight == q_output_buffer || (__bridge id<MTLBuffer>)entry->bias == q_output_buffer ||
             (__bridge id<MTLBuffer>)entry->weight == k_output_buffer || (__bridge id<MTLBuffer>)entry->bias == k_output_buffer ||
@@ -47874,11 +47893,7 @@ static int termite_metal_decode_runtime_apply_dense_linear_pair_slots_scratch_de
             if (termite_metal_planned_range_make(a_output_buffer, a_output_offset, output_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &ranges[1], -18) != 0) return -18;
             if (termite_metal_planned_range_make(b_output_buffer, b_output_offset, output_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &ranges[2], -18) != 0) return -18;
             if (termite_metal_planned_range_make(packed_output_buffer, packed_output_offset, packed_output_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &ranges[3], -18) != 0) return -18;
-            for (size_t i = 0; i < 4; ++i) {
-                for (size_t j = i + 1; j < 4; ++j)
-                    if (termite_metal_planned_ranges_overlap(&ranges[i], &ranges[j])) return -18;
-                if (termite_metal_decode_runtime_retain_frame_resource(runtime, ranges[i].buffer) != 0) return -18;
-            }
+            if (!antfly_metal_retain_disjoint_projection_ranges(runtime, ranges, 4)) return -18;
         }
 	        if (entry && ((__bridge id<MTLBuffer>)entry->weight == a_output_buffer || (__bridge id<MTLBuffer>)entry->bias == a_output_buffer ||
             (__bridge id<MTLBuffer>)entry->weight == b_output_buffer || (__bridge id<MTLBuffer>)entry->bias == b_output_buffer ||
