@@ -12051,6 +12051,7 @@ fn runForegroundCatchUpPassOwned(
     if (runtime.pending_boundary_refund) |reservation| {
         releaseBoundaryRecoveryReservation(runtime, reservation) catch |err| switch (err) {
             error.EnrichmentLeaseFenceLost, error.EnrichmentSourceChanged => {},
+            error.WriterLocked => return error.EnrichmentReplayAuthorityBusy,
             else => return err,
         };
         runtime.pending_boundary_refund = null;
@@ -18056,7 +18057,7 @@ const LaneOutcome = struct {
             if (scope.first_scheduled_fingerprint != 0 and deferred == err and scope.retry_fingerprint == scope.first_scheduled_fingerprint) return .ok;
             break :blk if (deferred == err) scope.retry_fingerprint else 0;
         };
-        const publication_failure = if (result) |_| null else |err| if (scope.publication_failed and !isEnrichmentControlError(err)) err else null;
+        const publication_failure: ?anyerror = if (result) |_| null else |err| if (scope.publication_failed and !isEnrichmentControlError(err)) err else null;
         return .{ .result = result, .retry_fingerprint = retry_fingerprint, .publication_failure = publication_failure };
     }
 };
