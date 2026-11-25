@@ -3324,6 +3324,46 @@ class CliTests(unittest.TestCase):
             r = self.raw_cli("-P", "--null-data", "-o", r"b\Z", input=data)
             self.assertEqual(r.stdout, b"b\0")
 
+    def test_nul_multiline_regular_subject_boundaries(self):
+        for engine in ("default", "auto", "pcre2"):
+            for pattern, count in (
+                ("a|$", 1),
+                ("$", 0),
+                ("^b", 0 if engine == "pcre2" else 1),
+            ):
+                with self.subTest(engine=engine, pattern=pattern):
+                    r = self.raw_cli(
+                        "--engine",
+                        engine,
+                        "--null-data",
+                        "-U",
+                        "--count-matches",
+                        "--include-zero",
+                        pattern,
+                        input=b"a\0b\0",
+                        code=0 if count else 1,
+                    )
+                    self.assertEqual(r.stdout, str(count).encode() + b"\0")
+        # Captures are translated back into the full source's byte coordinates.
+        r = self.raw_cli(
+            "--null-data",
+            "-U",
+            "-o",
+            "-r",
+            "[${id}]",
+            r"^(?P<id>b)",
+            input=b"a\0b\0b\0",
+        )
+        self.assertEqual(r.stdout, b"[b]\0[b]\0")
+        r = self.raw_cli("--null-data", "-U", "--json", r"^b", input=b"a\0b\0b\0")
+        matches = [
+            json.loads(line)["data"]
+            for line in r.stdout.splitlines()
+            if json.loads(line)["type"] == "match"
+        ]
+        self.assertEqual([m["absolute_offset"] for m in matches], [2, 4])
+        self.assertEqual([m["submatches"][0]["start"] for m in matches], [0, 0])
+
     def test_nul_records_isolate_capture_context(self):
         for pattern in ("^b", r"(?-m)^b", r"\Ab"):
             for flags, expected in (

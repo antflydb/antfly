@@ -3789,6 +3789,546 @@
       "input": "wmEK",
       "code": 0,
       "stdout": "YQo="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "default",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "a|$"
+      ],
+      "input": "YWE=",
+      "code": 0,
+      "stdout": "MgA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "default",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "$"
+      ],
+      "input": "YWE=",
+      "code": 0,
+      "stdout": "MQA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "default",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "^b"
+      ],
+      "input": "YWE=",
+      "code": 1,
+      "stdout": "MAA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "default",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "a|$"
+      ],
+      "input": "YWENCg==",
+      "code": 0,
+      "stdout": "MwA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "default",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "$"
+      ],
+      "input": "YWENCg==",
+      "code": 0,
+      "stdout": "MQA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "default",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "^b"
+      ],
+      "input": "YWENCg==",
+      "code": 1,
+      "stdout": "MAA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "default",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "a|$"
+      ],
+      "input": "YWENCgA=",
+      "code": 0,
+      "stdout": "NAA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "default",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "$"
+      ],
+      "input": "YWENCgA=",
+      "code": 0,
+      "stdout": "MgA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "default",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "^b"
+      ],
+      "input": "YWENCgA=",
+      "code": 1,
+      "stdout": "MAA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "default",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "a|$"
+      ],
+      "input": "YQBiAA==",
+      "code": 0,
+      "stdout": "MQA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "default",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "$"
+      ],
+      "input": "YQBiAA==",
+      "code": 1,
+      "stdout": "MAA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "default",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "^b"
+      ],
+      "input": "YQBiAA==",
+      "code": 0,
+      "stdout": "MQA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "pcre2",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "a|$"
+      ],
+      "input": "YWE=",
+      "code": 0,
+      "stdout": "MgA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "pcre2",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "$"
+      ],
+      "input": "YWE=",
+      "code": 0,
+      "stdout": "MQA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "pcre2",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "^b"
+      ],
+      "input": "YWE=",
+      "code": 1,
+      "stdout": "MAA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "pcre2",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "a|$"
+      ],
+      "input": "YWENCg==",
+      "code": 0,
+      "stdout": "MwA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "pcre2",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "$"
+      ],
+      "input": "YWENCg==",
+      "code": 0,
+      "stdout": "MQA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "pcre2",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "^b"
+      ],
+      "input": "YWENCg==",
+      "code": 1,
+      "stdout": "MAA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "pcre2",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "a|$"
+      ],
+      "input": "YWENCgA=",
+      "code": 0,
+      "stdout": "MwA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "pcre2",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "$"
+      ],
+      "input": "YWENCgA=",
+      "code": 0,
+      "stdout": "MQA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "pcre2",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "^b"
+      ],
+      "input": "YWENCgA=",
+      "code": 1,
+      "stdout": "MAA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "pcre2",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "a|$"
+      ],
+      "input": "YQBiAA==",
+      "code": 0,
+      "stdout": "MQA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "pcre2",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "$"
+      ],
+      "input": "YQBiAA==",
+      "code": 1,
+      "stdout": "MAA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "pcre2",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "^b"
+      ],
+      "input": "YQBiAA==",
+      "code": 1,
+      "stdout": "MAA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "auto",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "a|$"
+      ],
+      "input": "YWE=",
+      "code": 0,
+      "stdout": "MgA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "auto",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "$"
+      ],
+      "input": "YWE=",
+      "code": 0,
+      "stdout": "MQA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "auto",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "^b"
+      ],
+      "input": "YWE=",
+      "code": 1,
+      "stdout": "MAA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "auto",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "a|$"
+      ],
+      "input": "YWENCg==",
+      "code": 0,
+      "stdout": "MwA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "auto",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "$"
+      ],
+      "input": "YWENCg==",
+      "code": 0,
+      "stdout": "MQA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "auto",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "^b"
+      ],
+      "input": "YWENCg==",
+      "code": 1,
+      "stdout": "MAA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "auto",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "a|$"
+      ],
+      "input": "YWENCgA=",
+      "code": 0,
+      "stdout": "NAA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "auto",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "$"
+      ],
+      "input": "YWENCgA=",
+      "code": 0,
+      "stdout": "MgA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "auto",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "^b"
+      ],
+      "input": "YWENCgA=",
+      "code": 1,
+      "stdout": "MAA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "auto",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "a|$"
+      ],
+      "input": "YQBiAA==",
+      "code": 0,
+      "stdout": "MQA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "auto",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "$"
+      ],
+      "input": "YQBiAA==",
+      "code": 1,
+      "stdout": "MAA="
+    },
+    {
+      "category": "multiline-record-boundaries",
+      "args": [
+        "--engine",
+        "auto",
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        "^b"
+      ],
+      "input": "YQBiAA==",
+      "code": 0,
+      "stdout": "MQA="
     }
   ]
 }

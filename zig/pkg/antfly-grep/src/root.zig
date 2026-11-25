@@ -2815,7 +2815,8 @@ pub const Search = struct {
             var offset: usize = 0;
             var last_line: ?usize = null;
             var previous_end: ?usize = null;
-            while (self.matcher.find(bytes, offset)) |hit| {
+            var subject = self.matcher.subject(bytes);
+            while (subject.find(offset)) |hit| {
                 if (lines.len == 0 or (hit.span.start == bytes.len and hit.span.end == bytes.len and (bytes[bytes.len - 1] == '\n' or (self.options.null_data and bytes[bytes.len - 1] == 0)))) break;
                 if (hit.span.start == hit.span.end and previous_end != null and previous_end.? == hit.span.end) {
                     offset = self.matcher.advance(bytes, hit.span.end);
@@ -2932,7 +2933,7 @@ pub const Search = struct {
                 if (hit.span.start == hit.span.end and self.options.replacement == null) continue;
                 var line_no = lineIndex(lines, hit.span.start) + 1;
                 const rendered = if (self.options.replacement) |template| try Matcher.replacement(a, template, bytes, hit) else bytes[hit.span.start..hit.span.end];
-                var split = std.mem.splitScalar(u8, rendered, '\n');
+                var split = std.mem.splitScalar(u8, rendered, if (self.options.null_data) 0 else '\n');
                 while (split.next()) |row| {
                     defer line_no += 1;
                     if (row.len == 0) continue;
@@ -2941,7 +2942,7 @@ pub const Search = struct {
                     if (self.color_enabled) try @import("style.zig").start(&output.writer, self.options, "match");
                     try output.writer.writeAll(row);
                     if (self.color_enabled) try output.writer.writeAll("\x1b[0m");
-                    try output.writer.writeByte('\n');
+                    try output.writer.writeByte(if (self.options.null_data) 0 else '\n');
                     try self.write(output.written());
                 }
             }
@@ -3146,7 +3147,7 @@ pub const Search = struct {
                 if (context) {
                     if (last_shown != null and i > last_shown.? + 1 and self.options.context_separator.len > 0) {
                         try self.write(self.options.context_separator);
-                        try self.write("\n");
+                        try self.write(if (self.options.null_data) "\x00" else "\n");
                     }
                     try self.emit(path, bytes[lines[i].start..lines[i].end], i + 1, lines[i].start, false, std.math.nan(f64));
                     last_shown = i;
@@ -3158,7 +3159,7 @@ pub const Search = struct {
             while (end < lines.len and selected[end]) end += 1;
             if (last_shown != null and i > last_shown.? + 1 and (self.options.before > 0 or self.options.after > 0) and self.options.context_separator.len > 0) {
                 try self.write(self.options.context_separator);
-                try self.write("\n");
+                try self.write(if (self.options.null_data) "\x00" else "\n");
             }
             const begin_byte = lines[i].start;
             const end_byte = lines[end - 1].end;
@@ -3174,7 +3175,7 @@ pub const Search = struct {
                 cursor = hit.span.end;
             }
             try changed.writer.writeAll(bytes[cursor..end_byte]);
-            var split = std.mem.splitScalar(u8, changed.written(), '\n');
+            var split = std.mem.splitScalar(u8, changed.written(), if (self.options.null_data) 0 else '\n');
             var row: usize = 0;
             var offset: usize = 0;
             while (split.next()) |text| {
@@ -3192,7 +3193,7 @@ pub const Search = struct {
                     at = stop - offset;
                 }
                 try out.writer.writeAll(text[at..]);
-                try out.writer.writeByte('\n');
+                try out.writer.writeByte(if (self.options.null_data) 0 else '\n');
                 try self.write(out.written());
                 row += 1;
                 offset += text.len + 1;

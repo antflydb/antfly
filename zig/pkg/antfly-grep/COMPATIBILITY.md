@@ -2,7 +2,7 @@
 
 Target: ripgrep 16.0.0 / PCRE2 10.45, with the oracle build identities retained in each report. Empty-match iteration is byte based on all supported platforms. Implementation: native Zig.
 
-Checked-in differential contracts: 292 local-search cases and 76 PCRE2 dialect cases, plus 1500 generated cases. Normal tests require no oracle executable.
+Checked-in differential contracts: 328 local-search cases and 76 PCRE2 dialect cases, plus 1500 generated cases. Normal tests require no oracle executable.
 
 | Area | Status | Evidence and limits |
 |---|---|---|

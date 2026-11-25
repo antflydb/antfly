@@ -90,6 +90,34 @@ for flags, data in [
             "stdout": base64.b64encode(result.stdout).decode(),
         }
     )
+# Selection and match enumeration have different record boundaries in the
+# regular multiline optimization. Keep these contracts without a live oracle.
+for engine, data, pattern in itertools.product(
+    ["default", "pcre2", "auto"],
+    [b"aa", b"aa\r\n", b"aa\r\n\0", b"a\0b\0"],
+    ["a|$", "$", "^b"],
+):
+    flags = [
+        "--engine",
+        engine,
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        pattern,
+    ]
+    result = subprocess.run(
+        [oracle, *flags], input=data, check=False, capture_output=True, timeout=5
+    )
+    cases.append(
+        {
+            "category": "multiline-record-boundaries",
+            "args": flags,
+            "input": base64.b64encode(data).decode(),
+            "code": result.returncode,
+            "stdout": base64.b64encode(result.stdout).decode(),
+        }
+    )
 print(
     json.dumps(
         {

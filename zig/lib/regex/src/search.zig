@@ -25,7 +25,7 @@ pub const prefilter = @import("prefilter.zig");
 const native_jit = @import("jit.zig");
 const Allocator = std.mem.Allocator;
 pub const Error = error{ InvalidRegex, UnsupportedRegex, RegexTooLarge } || Allocator.Error;
-pub const Flags = struct { insensitive: bool = false, multiline: bool = false, dotall: bool = false, unicode: bool = true, ungreedy: bool = false, extended: bool = false, crlf: bool = false, whole_word: bool = false, whole_line: bool = false, no_auto_capture: bool = false, duplicate_names: bool = false, pcre: bool = false, extended_more: bool = false, caseless_restrict: bool = false, ascii_digit: bool = false, ascii_posix: bool = false, ascii_bsd: bool = false, ascii_bss: bool = false, ascii_bsw: bool = false, line_terminator: u8 = '\n', additional_line_terminator: ?u8 = null };
+pub const Flags = struct { insensitive: bool = false, multiline: bool = false, dotall: bool = false, unicode: bool = true, ungreedy: bool = false, extended: bool = false, crlf: bool = false, whole_word: bool = false, whole_line: bool = false, no_auto_capture: bool = false, duplicate_names: bool = false, pcre: bool = false, extended_more: bool = false, caseless_restrict: bool = false, ascii_digit: bool = false, ascii_posix: bool = false, ascii_bsd: bool = false, ascii_bss: bool = false, ascii_bsw: bool = false, line_terminator: u8 = '\n' };
 pub const Span = struct { start: usize, end: usize };
 pub const CaptureName = struct { name: []const u8, index: usize };
 pub const Match = struct { span: Span, captures: []const ?Span };
@@ -660,12 +660,6 @@ fn consume(n: *const Node, cp: u32) bool {
         else => unreachable,
     };
 }
-// A record-oriented caller can retain physical LF anchors inside a record
-// while also recognizing its record boundary when scanning a whole buffer.
-fn isLineTerminator(flags: Flags, value: u32) bool {
-    return value == flags.line_terminator or (flags.additional_line_terminator != null and value == flags.additional_line_terminator.?);
-}
-
 fn assertion(n: *const Node, text: []const u8, pos: usize, utf8: bool) bool {
     const prev = unicode.previous(text, pos, utf8);
     const next = if (pos < text.len) unicode.decode(text, pos, utf8).cp else 0x110000;
@@ -678,10 +672,10 @@ fn assertion(n: *const Node, text: []const u8, pos: usize, utf8: bool) bool {
     return switch (n.assertion) {
         .absolute_start => pos == 0,
         .absolute_end => pos == text.len,
-        .soft_end => pos == text.len or (pos + 1 == text.len and isLineTerminator(n.flags, next)),
+        .soft_end => pos == text.len or (pos + 1 == text.len and next == n.flags.line_terminator),
         .previous_match => pos == 0,
-        .start => pos == 0 or (n.flags.multiline and isLineTerminator(n.flags, prev) and !(n.flags.pcre and pos == text.len)),
-        .end => pos == text.len or (n.flags.multiline and (isLineTerminator(n.flags, next) or (isLineTerminator(n.flags, '\n') and n.flags.crlf and next == '\r' and pos + 1 < text.len and text[pos + 1] == '\n'))),
+        .start => pos == 0 or (n.flags.multiline and prev == n.flags.line_terminator and !(n.flags.pcre and pos == text.len)),
+        .end => pos == text.len or (n.flags.multiline and (next == n.flags.line_terminator or (n.flags.line_terminator == '\n' and n.flags.crlf and next == '\r' and pos + 1 < text.len and text[pos + 1] == '\n'))),
         .word => before != after,
         .not_word => before == after,
         .word_start => !before and after,
@@ -2831,7 +2825,6 @@ test "record anchors preserve explicit delimiters across native and interpreted 
     const a = std.testing.allocator;
     for ([_]Flags{
         .{ .multiline = true, .line_terminator = 0 },
-        .{ .multiline = true, .line_terminator = 0, .additional_line_terminator = '\n' },
         .{ .multiline = true },
     }, 0..) |flags, mode| {
         var pattern = try Pattern.init(a, "^b$", flags);
@@ -2843,7 +2836,7 @@ test "record anchors preserve explicit delimiters across native and interpreted 
         var runner = try BacktrackingRunner.init(a, &advanced);
         defer runner.deinit();
         for ([_][]const u8{ "a\nb\nc", "a\x00b\x00c" }, 0..) |text, delimiter| {
-            const expected = if (delimiter == 0) mode != 0 else mode != 2;
+            const expected = if (delimiter == 0) mode == 1 else mode == 0;
             try std.testing.expectEqual(expected, vm.find(text, 0) != null);
             try std.testing.expectEqual(expected, try runner.find(text, 0) != null);
             runner.jit_enabled = false;
