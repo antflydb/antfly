@@ -77,7 +77,7 @@ pub const Layer = struct {
         return fromWeights(a, runtime, try source.router(layer), try source.experts(layer, .w13), try source.experts(layer, .w2));
     }
 
-    fn fromWeights(a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, router: checkpoint.RouterWeights, gate: checkpoint.ExpertWeights, down: checkpoint.ExpertWeights) !Layer {
+    pub fn fromWeights(a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, router: checkpoint.RouterWeights, gate: checkpoint.ExpertWeights, down: checkpoint.ExpertWeights) !Layer {
         if (gate.format != down.format) return error.InvalidShape;
         var router_weight = try upload(a, runtime, .i16, router.weight);
         errdefer router_weight.deinit();

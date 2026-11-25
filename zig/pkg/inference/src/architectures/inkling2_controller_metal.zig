@@ -30,7 +30,7 @@ pub const Controller = struct {
         return fromWeights(allocator, runtime, text.hidden_size, text.loop_config.gate_rank, try source.controller(layer, stream));
     }
 
-    fn fromWeights(allocator: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, width: u32, rank: u32, weights: checkpoint.ControllerWeights) !Controller {
+    pub fn fromWeights(allocator: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, width: u32, rank: u32, weights: checkpoint.ControllerWeights) !Controller {
         const gate_bytes = try std.math.mul(usize, try std.math.mul(usize, width, rank), 2);
         const down_bytes = try std.math.mul(usize, gate_bytes, 2);
         if (gate_bytes == 0 or weights.down.len != down_bytes or weights.gain.len != gate_bytes or weights.forget.len != gate_bytes)

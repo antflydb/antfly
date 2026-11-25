@@ -38,7 +38,7 @@ pub const Endpoints = struct {
         });
     }
 
-    fn fromBytes(a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, width: u32, vocab: u32, epsilon: f32, softcap: f32, payloads: [5][]const u8) !Endpoints {
+    pub fn fromBytes(a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, width: u32, vocab: u32, epsilon: f32, softcap: f32, payloads: [5][]const u8) !Endpoints {
         if (width == 0 or vocab == 0) return error.InvalidShape;
         const matrix = try std.math.mul(usize, width, vocab);
         const elements = [5]usize{ matrix, width, width, width, matrix };

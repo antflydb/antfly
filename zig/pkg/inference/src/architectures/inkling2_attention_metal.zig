@@ -30,7 +30,7 @@ pub const Layer = struct {
         return loadTensors(a, runtime, source, source.config.value.text_config, layer);
     }
 
-    fn loadTensors(a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, source: anytype, text: checkpoint.TextConfig, layer: usize) !Layer {
+    pub fn loadTensors(a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, source: anytype, text: checkpoint.TextConfig, layer: usize) !Layer {
         const local = try layout.isLocal(text, layer);
         const hidden: usize = text.hidden_size;
         const elements = try std.math.mul(usize, hidden, layout.projectionSize(text, &layout.projection_weights));

@@ -338,3 +338,171 @@ test "Inkling Metal resident decoder runs the released text checkpoint" {
     for (logits) |score| try std.testing.expect(std.math.isFinite(score));
     try std.testing.expectEqual(@as(usize, 2), request.state.sequence.committed_tokens);
 }
+
+test "Inkling Metal resident decoder executes the full visit schedule on a synthetic checkpoint" {
+    if (!@import("build_options").enable_metal or !metal.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var provider = try @import("../backends/metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+
+    var text: checkpoint.TextConfig = .{
+        .model_type = "inkling2_loop_text",
+        .model_max_length = 1048576,
+        .hidden_size = 2304,
+        .num_hidden_layers = 24,
+        .vocab_size = 201024,
+        .unpadded_vocab_size = 200058,
+        .num_attention_heads = 24,
+        .num_key_value_heads = 8,
+        .head_dim = 128,
+        .d_rel = 16,
+        .rel_extent = 1024,
+        .q_bias = false,
+        .o_bias = false,
+        .log_scaling_n_floor = 8192,
+        .log_scaling_alpha = 1,
+        .rms_norm_eps = 0.000001,
+        .use_value_norm_no_gamma = true,
+        .qk_l2_clip_threshold = 1,
+        .rel_l2_clip_threshold = 1,
+        .local_layer_ids = .{ 0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22 },
+        .sconv_kernel_size = 4,
+        .final_logit_softcapping = 1,
+        .swa_head_dim = 128,
+        .swa_num_attention_heads = 24,
+        .swa_num_key_value_heads = 8,
+        .sliding_window_size = 1024,
+        .n_layers_per_attn_res_block = 6,
+        .attn_res_normalize_values = true,
+        .n_routed_experts = 128,
+        .num_experts_per_tok = 8,
+        .n_shared_experts = 0,
+        .intermediate_size = 1152,
+        .mlp_gate_softcap = 3,
+        .mlp_up_softcap = 2,
+        .route_scale = 1,
+        .use_gate_bias = true,
+        .loop_config = .{ .is_varloop = false, .core_start = 6, .core_end = 18, .num_passes = 3, .gate_rank = 64 },
+    };
+    const config: checkpoint.Config = .{
+        .model_type = "inkling2_loop",
+        .eos_token_id = 0,
+        .text_config = text,
+        .quantization_config = .{ .quant_method = "modelopt", .quant_algo = "NVFP4" },
+    };
+    const schedule = try config.visits();
+    const width = 128;
+    const intermediate = 32;
+    text.hidden_size = width;
+    text.num_attention_heads = 1;
+    text.num_key_value_heads = 1;
+    text.d_rel = 1;
+    text.rel_extent = 1;
+    text.n_routed_experts = 2;
+    text.num_experts_per_tok = 1;
+    text.intermediate_size = intermediate;
+    text.loop_config.gate_rank = 1;
+    text.vocab_size = 2;
+    text.unpadded_vocab_size = 2;
+    text.sliding_window_size = 2;
+
+    const Fixture = struct {
+        const zero: [width * width * 2]u8 = @splat(0);
+        const norm: [width]u16 = @splat(0x3f80);
+
+        pub fn layerTensor(_: @This(), _: usize, name: []const u8) ![]const u8 {
+            const layout = @import("inkling2_attention_weights.zig");
+            for ([_]layout.Weight{ .q, .k, .v, .gate, .out }) |key|
+                if (std.mem.eql(u8, name, layout.tensorName(key, false))) return zero[0 .. width * width * 2];
+            for ([_]layout.Weight{ .r, .sink, .q_scale }) |key|
+                if (std.mem.eql(u8, name, layout.tensorName(key, false))) return zero[0 .. width * 2];
+            if (std.mem.endsWith(u8, name, "sconv.weight_proj") or std.mem.endsWith(u8, name, "sconv.static_w") or
+                std.mem.endsWith(u8, name, "sconv.weight")) return zero[0 .. 4 * width * 2];
+            return zero[0..2];
+        }
+
+        fn load(runtime_arg: *Runtime, text_arg: checkpoint.TextConfig, index: usize) !Layer {
+            var attn = try attention.Layer.loadTensors(std.testing.allocator, runtime_arg, @This(){}, text_arg, index);
+            const bias = [2]f32{ 0, 0 };
+            const scales: [2048]u8 = @splat(0x38);
+            const outer = [2]f32{ 1, 1 };
+            const divisor = [1]f32{1};
+            const format: checkpoint.ExpertFormat = if (index < checkpoint.nvfp4_layers) .nvfp4 else .mxfp8;
+            const gate: checkpoint.ExpertWeights = .{
+                .format = format,
+                .weights = &zero,
+                .block_scales = &scales,
+                .outer_amax = if (format == .nvfp4) std.mem.asBytes(&outer) else null,
+                .outer_denominator = if (format == .nvfp4) std.mem.asBytes(&divisor) else null,
+            };
+            const experts = moe.Layer.fromWeights(std.testing.allocator, runtime_arg, .{
+                .weight = zero[0 .. 2 * width * 2],
+                .bias = std.mem.asBytes(&bias),
+            }, gate, gate) catch |err| {
+                attn.deinit();
+                return err;
+            };
+            var result: Layer = .{ .attention = attn, .experts = experts };
+            errdefer result.deinit();
+            for (&result.weights, 0..) |*weight, slot| {
+                weight.* = switch (slot) {
+                    0...3 => try upload(std.testing.allocator, runtime_arg, .i16, std.mem.asBytes(&norm)),
+                    4, 5 => try upload(std.testing.allocator, runtime_arg, .i16, zero[0 .. 4 * width * 2]),
+                    6 => try upload(std.testing.allocator, runtime_arg, .f32, zero[0 .. 3 * width * 4]),
+                    7 => try upload(std.testing.allocator, runtime_arg, .f32, zero[0 .. width * 4]),
+                    else => unreachable,
+                };
+            }
+            if (index >= 6 and index < 18) for (&result.controllers) |*controller| {
+                controller.* = try Controller.fromWeights(std.testing.allocator, runtime_arg, width, 1, .{
+                    .down = zero[0 .. width * 4],
+                    .gain = zero[0 .. width * 2],
+                    .forget = zero[0 .. width * 2],
+                });
+            };
+            return result;
+        }
+    };
+
+    var embeddings: [2 * width]u16 = @splat(0x3f80);
+    @memset(embeddings[0..width], 0xbf80);
+    var vocabulary: [2 * width]u16 = @splat(0);
+    vocabulary[0] = 0x3f80;
+    vocabulary[width] = 0xbf80;
+
+    var model: Decoder = .{
+        .runtime = runtime,
+        .text = text,
+        .schedule = schedule,
+        .layers = undefined,
+        .controller_queries = undefined,
+        .endpoints = try Endpoints.fromBytes(a, runtime, width, 2, text.rms_norm_eps, 1, .{
+            std.mem.asBytes(&embeddings),   std.mem.asBytes(&Fixture.norm), Fixture.zero[0 .. width * 4],
+            std.mem.asBytes(&Fixture.norm), std.mem.asBytes(&vocabulary),
+        }),
+    };
+    defer model.endpoints.deinit();
+    var queries_loaded: usize = 0;
+    defer for (model.controller_queries[0..queries_loaded]) |*weight| weight.deinit();
+    for (&model.controller_queries) |*weight| {
+        weight.* = try upload(a, runtime, .f32, Fixture.zero[0 .. 24 * width * 4]);
+        queries_loaded += 1;
+    }
+    var loaded: usize = 0;
+    defer for (model.layers[0..loaded]) |*layer| layer.deinit();
+    for (&model.layers, 0..) |*layer, index| {
+        layer.* = try Fixture.load(runtime, text, index);
+        loaded += 1;
+    }
+    var request: Request = undefined;
+    try request.init(a, &model, 3);
+    defer request.deinit();
+    try request.append(0);
+    try std.testing.expectError(error.InvalidInkling2Token, request.append(2));
+    try std.testing.expectEqual(@as(usize, 1), request.state.sequence.committed_tokens);
+    const logits = try request.step(1);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.76159416), logits[0], 0.00001);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.76159416), logits[1], 0.00001);
+    try std.testing.expectEqual(@as(usize, 2), request.state.sequence.committed_tokens);
+}
