@@ -971,3 +971,12 @@ Gemma4 text/image/audio/video and the E2B comparative deficits above,
 EmbeddingGemma2, LightOnOCR, GLiNER2.5/DECIDE, Inkling 2 Mini and the
 representative Qwen3 routes. Spark GB10, local Metal and CPU are the
 available physical targets. L4 and A100 remain the user-deferred targets.
+
+One local Metal candidate narrowed the compatibility guard for integer
+gather after addition to the actual axis-zero column-bias fusion. The
+physical fixture for a live F32 add followed by an axis-one I32 gather
+produced `[3, 2, 6, 5]` where it expected `[4, 2, 7, 5]` after alternating
+index values. The observed row equals the other valid index case. This
+leaves index binding and output custody unqualified for that combination.
+The broad compatibility guard continues to own this signature pending
+isolation of the failing boundary.
