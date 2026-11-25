@@ -19427,7 +19427,7 @@ fn flushTextAssetProducerBatchItems(
                 // budget. Independent successful items publish even when a
                 // sibling still needs another attempt.
                 setRetryAfterHintFor(runtime, scope.fingerprint, failure.retry_after_ms);
-                if (failure.retryable and try scope.shouldYield(runtime, cause)) {
+                if ((failure.retryable or cause == error.ProviderInvocationCanceled) and try scope.shouldYield(runtime, cause)) {
                     outcome.deferRetry(scope, cause);
                 } else try recordAssetProducerFailure(runtime, window, item.*, cause, scope.attemptNumber(runtime), scope);
             },
@@ -25941,6 +25941,7 @@ fn runtimeGeneratedTextBatchFailureToYield(
         .item_error => |raw_failure| {
             var failure = raw_failure;
             failure.cause = providerInvocationFailure(runtime, failure.cause);
+            if (failure.cause == error.ProviderInvocationCanceled) failure.retryable = true;
             if (isEnrichmentControlError(failure.cause) or
                 (failure.retryable and shouldYieldRequestError(runtime, failure.cause)))
                 return failure;
@@ -42683,6 +42684,13 @@ test "document extraction generated OCR rejects malformed envelopes before apply
         return error.TestExpectedRetryableBatchFailure;
     try std.testing.expectEqual(error.GenerateBatchItemRetryable, failure.cause);
     try std.testing.expectEqual(@as(?u64, 250), failure.retry_after_ms);
+    var canceled_items = items;
+    canceled_items[1].result.item_error.cause = error.Canceled;
+    canceled_items[1].result.item_error.retryable = false;
+    const canceled_failure = runtimeGeneratedTextBatchFailureToYield(&runtime, &canceled_items) orelse
+        return error.TestExpectedRetryableBatchFailure;
+    try std.testing.expectEqual(error.ProviderInvocationCanceled, canceled_failure.cause);
+    try std.testing.expect(canceled_failure.retryable);
 }
 
 test "document extraction generated OCR applies unit updates transactionally" {
@@ -43421,6 +43429,7 @@ test "asset batch fallback isolates malformed envelope and preserves typed mixed
         batch_count: usize = 0,
         single_count: usize = 0,
         retryable: bool = false,
+        cancel_item: bool = false,
 
         fn producer(self: *@This()) asset_producer_mod.Producer {
             return .{
@@ -43451,7 +43460,7 @@ test "asset batch fallback isolates malformed envelope and preserves typed mixed
             produced[1] = .{
                 .identity = .{},
                 .result = .{ .item_error = .{
-                    .cause = if (self.retryable) error.EmbedRateLimited else error.UnsupportedGeneratorProvider,
+                    .cause = if (self.cancel_item) error.Cancelled else if (self.retryable) error.EmbedRateLimited else error.UnsupportedGeneratorProvider,
                     .code = .invalid_request,
                     .retryable = self.retryable,
                 } },
@@ -43593,6 +43602,18 @@ test "asset batch fallback isolates malformed envelope and preserves typed mixed
     try items.append(alloc, try TestItem.make(alloc, "doc:6", "six", "artifact:six", "state:six"));
     var replay_scope = FailureScope{};
     try flushAssetProducerBatch(&runtime, &items, &window, &replay_scope);
+    try std.testing.expectEqual(@as(usize, 2), failure_capture.count);
+
+    // The provider's raw cancellation flag cannot force a terminal receipt
+    // while the caller and worker remain active.
+    mixed.retryable = false;
+    mixed.cancel_item = true;
+    runtime.retry_failure_count = 0;
+    try items.append(alloc, try TestItem.make(alloc, "doc:5", "five", "artifact:five", "state:five"));
+    try items.append(alloc, try TestItem.make(alloc, "doc:6", "six", "artifact:six", "state:six"));
+    var canceled_scope = FailureScope{};
+    try std.testing.expectError(error.ProviderInvocationCanceled, flushAssetProducerBatch(&runtime, &items, &window, &canceled_scope));
+    try std.testing.expectEqual(failed_identity, canceled_scope.retry_fingerprint);
     try std.testing.expectEqual(@as(usize, 2), failure_capture.count);
     try std.testing.expectEqual(@as(usize, 0), mixed.single_count);
 }
