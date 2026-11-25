@@ -35,7 +35,8 @@ After pushing a Rust SDK tag, dispatch its dedicated publisher from `main`:
 gh workflow run rust-sdk-release.yml --ref main -f tag_name=rs/antfly/sdk/v0.4.0
 ```
 
-The controller checks the tag's package version and main ancestry. Its read-only
+The controller checks the tag's package version and ancestry on its configured
+release-line branch (`v0.3.x` for 0.3 SDK patches; `main` for 0.4). Its read-only
 job tests and packages the SDK, verifies the bundled OpenAPI spec, and seals the
 crate with source commit, size, and digest. The protected `crates-io` job uploads
 those exact bytes without running Cargo or source build scripts with credentials.
