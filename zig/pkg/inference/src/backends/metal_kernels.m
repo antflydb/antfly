@@ -1775,6 +1775,7 @@ typedef struct antfly_metal_workspace_allocation_service {
 
 typedef struct termite_metal_decode_runtime {
     uint16_t pipeline_quant_formats;
+    bool prefer_dense_mps_linear;
     TermiteMetalMtpHeadWorkspace *mtp_head_workspace;
     id<MTLDevice> device;
     // Opt-in dense embedding workspace guard. Counts fresh allocations until
@@ -21859,8 +21860,16 @@ static id<MTLCommandBuffer> termite_metal_decode_runtime_command_buffer(termite_
     return *frame_owned ? termite_metal_new_command_buffer(runtime->queue, label_cstr) : runtime->active_frame_cb;
 }
 
-static bool termite_metal_dense_mps_linear_enabled(void) {
-    return termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_DENSE_MPS_LINEAR"));
+bool antfly_metal_swap_dense_mps_linear_preference(termite_metal_decode_runtime *runtime, bool enabled) {
+    if (runtime == NULL) return false;
+    const bool previous = runtime->prefer_dense_mps_linear;
+    runtime->prefer_dense_mps_linear = enabled;
+    return previous;
+}
+
+static bool termite_metal_dense_mps_linear_enabled(const termite_metal_decode_runtime *runtime) {
+    const char *override = getenv("TERMITE_METAL_ENABLE_DENSE_MPS_LINEAR");
+    return override == NULL ? runtime->prefer_dense_mps_linear : termite_metal_env_flag_enabled(override);
 }
 
 static bool termite_metal_direct_packed_dense_enabled(void) {
@@ -42752,7 +42761,7 @@ static bool termite_metal_dense_linear_uses_mps(
     return in_dim >= 64 && out_dim >= 64 &&
         runtime->linear_weight_buffers[slot] != nil && runtime->linear_bias_buffers[slot] != nil &&
         (prefer_mps || (dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F32 &&
-            rows >= 128 && termite_metal_dense_mps_linear_enabled()));
+            rows >= 128 && termite_metal_dense_mps_linear_enabled(runtime)));
 }
 
 // The F32 row-reduce and tiled schedules can write directly into the plan.
@@ -43634,7 +43643,7 @@ int termite_metal_decode_runtime_apply_dense_ffn_layer_norm_device(
         }
         const BOOL force_mps = first_weight_dtype != TERMITE_METAL_DENSE_LINEAR_DTYPE_F32 ||
             second_weight_dtype != TERMITE_METAL_DENSE_LINEAR_DTYPE_F32;
-        if (!termite_metal_dense_mps_linear_enabled() && !force_mps) {
+        if (!termite_metal_dense_mps_linear_enabled(runtime) && !force_mps) {
             runtime->deberta_ffn_fused_fallbacks += 1;
             return -17;
         }
@@ -43817,7 +43826,7 @@ int termite_metal_decode_runtime_apply_dense_linear_layer_norm_device(
         }
 
         const BOOL force_mps = weight_dtype != TERMITE_METAL_DENSE_LINEAR_DTYPE_F32;
-        if (!termite_metal_dense_mps_linear_enabled() && !force_mps) {
+        if (!termite_metal_dense_mps_linear_enabled(runtime) && !force_mps) {
             if (runtime->linear_multi_row_pipeline != nil &&
                 runtime->linear_multi_row_reduce_pipeline != nil &&
                 runtime->layer_norm_add_pipeline != nil)

@@ -1004,6 +1004,23 @@ publications matched exactly, including three phrase segments and timestamp
 offsets. The pooled warm p50 was 1413.81 ms with the override and 1374.38 ms
 with the default on M4 Max, a 2.8% reduction.
 
+The 71.49-second Whisper Small fixture also ran against whisper.cpp
+`v1.9.6` on M4 Max Metal. Both warm HTTP servers used fixed English,
+greedy decoding and phrase timestamps. With ten measured requests per
+engine in ABBA order, Antfly measured 1378.43 ms p50 and whisper.cpp
+measured 321.47 ms p50. Both returned the same three sentences after
+trimming whitespace. The first phrase bounds matched. The two later
+starts differed by 10 and 20 ms, and the last phrase end differed by
+2.98 s. Antfly's CPU, Metal and Spark CUDA segment text and bounds
+matched one another exactly on this fixture.
+
+Whisper Small's owned encoder frames now prefer the existing Metal MPS
+dense matrix-multiply path. The preference is scoped to encoder execution
+and respects `TERMITE_METAL_ENABLE_DENSE_MPS_LINEAR`. With packed decoder
+prefill enabled on both arms and the same five-phase schedule, the
+disabled/default warm p50 was 1378.75/1132.22 ms. All 30 publications
+matched the previous route exactly, including phrase boundaries.
+
 ### Gemma 4 resident Metal projection
 
 The qualified Gemma 4 E2B and E4B channel geometries use the verified
@@ -1032,13 +1049,3 @@ resident CUDA contexts during the comparison.
 | E4B M4 Max Metal | 567 / 436 | 987 / 517 | 332 / 211 | 818 / 620 |
 | E2B Spark GB10 CUDA | 248 / 214 | 348 / 275 | 161 / 126 | 246 / 280 |
 | E4B Spark GB10 CUDA | 352 / 324 | 540 / 462 | 260 / 215 | 386 / 464 |
-
-The 71.49-second Whisper Small fixture also ran against whisper.cpp
-`v1.9.6` on M4 Max Metal. Both warm HTTP servers used fixed English,
-greedy decoding and phrase timestamps. With ten measured requests per
-engine in ABBA order, Antfly measured 1378.43 ms p50 and whisper.cpp
-measured 321.47 ms p50. Both returned the same three sentences after
-trimming whitespace. The first phrase bounds matched. The two later
-starts differed by 10 and 20 ms, and the last phrase end differed by
-2.98 s. Antfly's CPU, Metal and Spark CUDA segment text and bounds
-matched one another exactly on this fixture.

@@ -21968,6 +21968,8 @@ pub extern fn termite_metal_decode_runtime_prefer_linear_f16_tensor_ops(runtime:
 pub extern fn termite_metal_decode_runtime_glide_tensor_ops_available(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_glide_mlp_device(runtime: ?*RawMetalDecodeRuntime, in_slot: usize, out_slot: usize, input: ?*anyopaque, input_offset: usize, residual: ?*anyopaque, residual_offset: usize, rows: usize, hidden: usize, width: usize, output: ?*anyopaque, output_offset: usize) c_int;
 pub extern fn termite_metal_decode_runtime_glide_geglu_linear_device(runtime: ?*RawMetalDecodeRuntime, slot: usize, input: ?*anyopaque, input_offset: usize, rows: usize, in_dim: usize, width: usize, output: ?*anyopaque, output_offset: usize) c_int;
+pub extern fn antfly_metal_swap_dense_mps_linear_preference(runtime: ?*RawMetalDecodeRuntime, enabled: bool) bool;
+
 pub extern fn termite_metal_decode_runtime_prefer_linear_mps(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,

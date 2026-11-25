@@ -187,6 +187,14 @@ fn encoderForwardOutput(
 
     var frame_active = try beginWhisperMetalFrame(cb, .prefill);
     errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
+    const MetalCompute = @import("../ops/metal_compute.zig").MetalCompute;
+    const previous_mps: ?bool = if (@import("build_options").enable_metal and frame_active and qualifiedMetalSmall(config))
+        MetalCompute.swapDenseMpsLinearPreference(cb, true)
+    else
+        null;
+    defer if (comptime @import("build_options").enable_metal) {
+        if (previous_mps) |previous| _ = MetalCompute.swapDenseMpsLinearPreference(cb, previous);
+    };
     const scope_active = frame_active and (cb.decoderRuntimeBeginPlannedComputeScope() catch false);
     defer if (scope_active) cb.decoderRuntimeEndPlannedComputeScope();
     var profile = EncoderProfile{ .enabled = frame_active and whisperMetalProfileEnabled(), .frame_active = &frame_active };
@@ -667,14 +675,15 @@ fn whisperMetalFramesEnabled() bool {
     return !platform.env.getenvBool("TERMITE_WHISPER_METAL_DISABLE_FRAMES");
 }
 
-pub fn metalPackedPrefillEnabled(config: Config) bool {
-    // The released Small model has passed single- and multi-window
-    // serving qualification with this geometry.
-    const qualified = config.d_model == 768 and config.encoder_layers == 12 and
+fn qualifiedMetalSmall(config: Config) bool {
+    return config.d_model == 768 and config.encoder_layers == 12 and
         config.decoder_layers == 12 and config.decoder_attention_heads == 12 and config.num_mel_bins == 80;
+}
+
+pub fn metalPackedPrefillEnabled(config: Config) bool {
     return whisperMetalFramesEnabled() and
         !platform.env.getenvBool("TERMITE_METAL_DISABLE_DENSE_QKV_PACKED") and
-        platform.env.getenvBoolDefault("TERMITE_METAL_WHISPER_PREPARE_PACKED_QKV", qualified);
+        platform.env.getenvBoolDefault("TERMITE_METAL_WHISPER_PREPARE_PACKED_QKV", qualifiedMetalSmall(config));
 }
 
 fn whisperMetalProfileEnabled() bool {

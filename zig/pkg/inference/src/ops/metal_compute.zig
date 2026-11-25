@@ -24235,6 +24235,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return cache.retirementDomainMatches(pin);
     }
 
+    /// Change dispatch preference while the caller owns the active frame.
+    pub fn swapDenseMpsLinearPreference(cb: *const ops.ComputeBackend, enabled: bool) bool {
+        std.debug.assert(cb.kind() == .metal);
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return metal_runtime.antfly_metal_swap_dense_mps_linear_preference(self.provider_impl.raw_decode_runtime, enabled);
+    }
+
     pub fn pendingAudioScratch(cb: *const ops.ComputeBackend, key: u64, inputs: []const CT) !?audio_tape.Plan.ArenaRequest {
         if (!acceptsEmbeddingStage(cb)) return null;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
