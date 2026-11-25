@@ -21,6 +21,7 @@ const implementation = @import("../execution/architecture_session.zig");
 pub const getAuxiliaryProjectorMetadata = implementation.getAuxiliaryProjectorMetadata;
 
 pub const CudaRuntimeStats = implementation.CudaRuntimeStats;
+pub const GenerationCudaProfile = implementation.GenerationCudaProfile;
 pub const estimateNativeWeightBytes = implementation.estimateNativeWeightBytes;
 pub const estimateBackendWeightResidencyBytes = implementation.estimateBackendWeightResidencyBytes;
 pub const refineGptConfigFromGgufTensorInfo = implementation.refineGptConfigFromGgufTensorInfo;
