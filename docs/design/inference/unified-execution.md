@@ -778,23 +778,33 @@ greedy output tokens and disabled prompt reuse.
 | Hardware and Antfly route | Text | Image | Audio | Video |
 | --- | ---: | ---: | ---: | ---: |
 | M4 Max CPU, opt-in shared suffix | 7032 / 416 | 4562 / 14917 | 1003 / 1260 | 4114 / 24000 |
+| M4 Max CPU, tiled prefill and grouped decode | 1606 / 416 | 2799 / 14917 | 790 / 1260 | 2118 / 24000 |
 | M4 Max Metal, warm manifest | 424 / 185 | 991 / 255 | 310 / 157 | 941 / 361 |
 | M4 Max Metal, resident projector | 423 / 185 | 643 / 255 | 310 / 156 | 600 / 358 |
 | Spark GB10 CUDA, standard | 1169 / 168 | 4672 / 206 | 875 / 169 | 4447 / 280 |
 | Spark GB10 CUDA, BF16 donors and replay | 885 / 169 | 607 / 206 | 286 / 164 | 603 / 281 |
+| Spark GB10 CUDA, BF16 donors, tensor-core prefill and warp-split decode | 218 / 169 | 288 / 206 | 223 / 163 | 265 / 280 |
+| Spark GB10 CUDA, same plan with persistent decode replay | 201.2 / 168.8 | 271.7 / 206.0 | 220.8 / 164.1 | 243.4 / 279.4 |
 
 Cells report Antfly and llama.cpp p50 milliseconds. CPU used eight measured
 samples per engine and modality. Metal and standard CUDA used 24. The CUDA
-replay and Metal resident comparisons used 12 samples per engine in ABBA
-order. Spark had other
-resident CUDA contexts. Both engines used 514 text prompt tokens and 79 audio
-prompt tokens. The image and video serving routes produced different
+replay, tuned CUDA and Metal resident comparisons used 12 samples per engine in ABBA
+order. The persistent decode replay comparison used 16 samples per engine in
+ABBA order at `f42ac57257` and reproduced all four semantic responses exactly.
+Spark had other resident CUDA contexts. Both engines used 514 text prompt tokens. Audio prompt token counts varied
+with the request and serving route. The image and video serving routes produced different
 projected token counts. The video fixture used a silent H.264 clip.
 
 On Native CPU, a four-sample trial of tiled paged prefill on top of shared
 suffix pruning reduced p50 from 4997 to 2299 ms for text, 3979 to 3111 ms for
 image, 923 to 857 ms for audio and 3453 to 2459 ms for video. All sampled
-responses matched the direct paged route.
+responses matched the direct paged route. A four-sample follow-up using the
+system BLAS provider and skipping masked key tiles measured 1883, 2975, 848
+and 2304 ms in the same order. All four semantic response strings again
+matched llama.cpp.
+The subsequent grouped decode trial reused each converted F16 page row across
+query heads. It used four samples per case and the earlier uncontended
+llama.cpp reference. The semantic responses remained identical.
 
 On Metal, a four-sample trial of the opt-in resident projector reduced image
 p50 from 1015 to 660 ms and video from 959 to 617 ms. Text and audio were
@@ -811,3 +821,13 @@ requires the existing geometry and mirror inventory qualification. Required CUDA
 replay completed one request per modality. The explicitly required SM89 Flash
 prefill profile rejected the GB10 capability before launch. The eager gated
 token-tensor variant ran correctly and was slower across all four cases.
+
+On GB10, the generic 32-key split decode trial measured 457, 378, 251 and
+362 ms across text, image, audio and video, with three samples per case. A
+two-sample trial combining that decode schedule with tensor-core prefill
+measured 252 ms for text and 287 ms for video, with the same sampled output.
+
+At `c354c55ac4`, functional prefill returned all four E2B semantic answers. Its
+representation declined physical replay, and the eager graph was slower in
+every case. New geometries now require physical replay admission before
+numerical submission. The ordinary CUDA route handles a declined graph.

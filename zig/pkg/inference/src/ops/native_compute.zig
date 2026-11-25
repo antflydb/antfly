@@ -37106,14 +37106,21 @@ fn gqaPagedAttentionDirectInto(
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
     if (output.len != q_seq_len * H_q) return error.InvalidAttentionOutputSize;
     @memset(output, 0.0);
+    if (q_seq_len == 1 and pool.config.dtype == .f16 and heads_per_group >= 4 and
+        num_heads <= grouped_decode_max_heads and bias == null and sink_scores == null)
+    {
+        return gqaPagedDecodeReuseRows(pool, block_ids, layer_index, Q, attention, num_heads, num_kv_heads, head_dim, scale, output);
+    }
 
     for (0..num_heads) |h| {
         const kv_h = h / heads_per_group;
         for (0..q_seq_len) |qi| {
             const q_ptr = Q[qi * H_q + h * head_dim ..].ptr;
             const out_ptr = output[qi * H_q + h * head_dim ..].ptr;
-            var running_max = if (sink_scores) |scores| scores[h] else -std.math.inf(f32);
-            var running_sum: f32 = if (sink_scores != null) 1.0 else 0.0;
+            var accumulator: PagedAttentionAccumulator = .{
+                .maximum = if (sink_scores) |scores| scores[h] else -std.math.inf(f32),
+                .sum = if (sink_scores != null) 1 else 0,
+            };
             const query_pos = query_position_offset + qi;
 
             for (0..kv_seq_len) |token_idx| {
@@ -37132,23 +37139,81 @@ fn gqaPagedAttentionDirectInto(
                     score += bias_data[h * q_seq_len * kv_seq_len + qi * kv_seq_len + key_pos];
                 }
 
-                const new_max = @max(running_max, score);
-                const prev_scale: f32 = if (running_sum == 0.0) 0.0 else @exp(running_max - new_max);
-                const score_scale = @exp(score - new_max);
-                if (prev_scale != 1.0) {
-                    for (0..head_dim) |d| out_ptr[d] *= prev_scale;
-                }
-                linalg.axpy(score_scale, v_ptr[0..head_dim], out_ptr[0..head_dim]);
-                running_sum = running_sum * prev_scale + score_scale;
-                running_max = new_max;
+                accumulator.add(score, v_ptr[0..head_dim], out_ptr[0..head_dim]);
             }
+            accumulator.normalize(out_ptr[0..head_dim]);
+        }
+    }
+}
 
-            if (running_sum != 0.0) {
-                const inv_sum = 1.0 / running_sum;
-                for (0..head_dim) |d| out_ptr[d] *= inv_sum;
+const PagedAttentionAccumulator = struct {
+    maximum: f32 = -std.math.inf(f32),
+    sum: f32 = 0,
+
+    inline fn add(self: *PagedAttentionAccumulator, score: f32, value: []const f32, output: []f32) void {
+        const new_max = @max(self.maximum, score);
+        const prev_scale: f32 = if (self.sum == 0.0) 0.0 else @exp(self.maximum - new_max);
+        const score_scale = @exp(score - new_max);
+        if (prev_scale != 1.0) for (output) |*part| {
+            part.* *= prev_scale;
+        };
+        linalg.axpy(score_scale, value, output);
+        self.sum = self.sum * prev_scale + score_scale;
+        self.maximum = new_max;
+    }
+
+    inline fn normalize(self: PagedAttentionAccumulator, output: []f32) void {
+        if (self.sum == 0.0) return;
+        const inverse = 1.0 / self.sum;
+        for (output) |*part| part.* *= inverse;
+    }
+};
+
+const grouped_decode_max_heads = 64;
+
+/// Convert each cache row once while preserving every query head's softmax order.
+fn gqaPagedDecodeReuseRows(
+    pool: *runtime.kv.storage.KvStorage,
+    block_ids: []const runtime.kv.block.KvBlockId,
+    layer_index: usize,
+    query: []const f32,
+    attention: AttentionContext,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    output: []f32,
+) !void {
+    const query_pos = attention.total_sequence_len - 1;
+    const key_offset = attention.kv_position_offset;
+    const first = if (attention.sliding_window == 0) 0 else (query_pos -| (attention.sliding_window - 1)) -| key_offset;
+    const end = if (attention.attn_or_mask == null)
+        @min(attention.kv_sequence_len, attention.total_sequence_len -| key_offset)
+    else
+        attention.kv_sequence_len;
+    if (first >= end) return;
+
+    var accumulators: [grouped_decode_max_heads]PagedAttentionAccumulator = undefined;
+    @memset(accumulators[0..num_heads], .{});
+    const heads_per_group = num_heads / num_kv_heads;
+    const page_size = pool.config.page_size_tokens;
+    for (first..end) |token| {
+        const key_pos = key_offset + token;
+        if (key_pos > query_pos and !allowsFutureAttention(attention.attn_or_mask, attention.total_sequence_len, query_pos, key_pos)) continue;
+        const page = token / page_size;
+        if (page >= block_ids.len) return error.InvalidPagedKvState;
+        const row = try pool.readToken(block_ids[page], layer_index, token % page_size);
+        for (0..num_kv_heads) |group| {
+            const key = row.k[group * head_dim ..][0..head_dim];
+            const value = row.v[group * head_dim ..][0..head_dim];
+            for (group * heads_per_group..(group + 1) * heads_per_group) |head| {
+                const q = query[head * head_dim ..][0..head_dim];
+                const out = output[head * head_dim ..][0..head_dim];
+                accumulators[head].add(linalg.dot(q, key) * scale, value, out);
             }
         }
     }
+    for (accumulators[0..num_heads], 0..) |accumulator, head| accumulator.normalize(output[head * head_dim ..][0..head_dim]);
 }
 
 test "Native tiled paged prefill preserves grouped F16 rows and mask positions" {
@@ -37200,6 +37265,15 @@ test "Native tiled paged prefill preserves grouped F16 rows and mask positions" 
     @memset(&got, -11);
     try std.testing.expect(!try tryGqaTiledPagedPrefill(&compute, pool, block_ids, 0, &query, attention, heads, 1, head_dim, &got));
     for (got) |actual| try std.testing.expectEqual(@as(f32, -11), actual);
+
+    var single_query = attention;
+    single_query.mode = .paged_decode;
+    single_query.query_sequence_len = 1;
+    const width = heads * head_dim;
+    const invisible_sink: [heads]f32 = @splat(-std.math.inf(f32));
+    try gqaPagedAttentionDirectInto(pool, block_ids, 0, query[0..width], null, single_query, heads, 1, head_dim, &invisible_sink, want[0..width]);
+    try gqaPagedAttentionDirectInto(pool, block_ids, 0, query[0..width], null, single_query, heads, 1, head_dim, null, got[0..width]);
+    try std.testing.expectEqualSlices(f32, want[0..width], got[0..width]);
 }
 
 fn gqaPagedAttentionDirectTurboQuant(
