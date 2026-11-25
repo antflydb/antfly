@@ -312,6 +312,33 @@ pub const Output = struct {
         }
     }
 
+    /// Transfer the accumulated token, text and tool results to the caller.
+    pub fn finalize(self: *Output, options: ChatOptions, prompt_tokens: usize, limit: usize) !generation.GenerationResult {
+        if (self.channel == .tool and self.tokens.items.len < limit) try self.finishTool();
+        if ((options.choice == .required or options.choice == .function) and self.calls.items.len == 0 and self.tokens.items.len < limit)
+            return error.InvalidInkling2ToolOutput;
+        const result = if (self.callback != null or self.channels != null)
+            try self.text.bytes.toOwnedSlice(self.allocator)
+        else
+            try self.tokenizer.decodeText(self.allocator, self.tokens.items);
+        errdefer self.allocator.free(result);
+        const reasoning = if (self.reasoning.bytes.items.len != 0) try self.reasoning.bytes.toOwnedSlice(self.allocator) else null;
+        errdefer if (reasoning) |reasoning_text| self.allocator.free(reasoning_text);
+        const ids = try self.tokens.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(ids);
+        const calls = if (self.calls.items.len != 0) try self.calls.toOwnedSlice(self.allocator) else null;
+        return .{
+            .allocator = self.allocator,
+            .text = result,
+            .reasoning_text = reasoning,
+            .native_tool_calls = calls,
+            .token_ids = ids,
+            .prompt_tokens = prompt_tokens,
+            .tokens_used = ids.len,
+            .finish_reason = if (ids.len == limit) "length" else if (calls != null) "tool_calls" else "stop",
+        };
+    }
+
     fn appendText(self: *Output, output: *Utf8Text, ctx: ?*anyopaque, callback: ?generation.TokenCallback, token: u32, at_start: bool) !void {
         const bytes = try self.tokenizer.decodeToken(self.allocator, @intCast(token), at_start);
         defer self.allocator.free(bytes);
@@ -410,4 +437,9 @@ test "Inkling chat frontend builds prompts and publishes tokens without a device
     try output.append(11);
     try output.append(1);
     try std.testing.expectEqualStrings("x", output.text.bytes.items);
+    var result = try output.finalize(.{}, prompt.count(), 2);
+    defer result.deinit();
+    try std.testing.expectEqualStrings("x", result.text);
+    try std.testing.expectEqualStrings("length", result.finish_reason);
+    try std.testing.expectEqualSlices(i32, &.{ 11, 1 }, result.token_ids.?);
 }

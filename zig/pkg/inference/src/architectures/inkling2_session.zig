@@ -502,33 +502,12 @@ pub const Pipeline = struct {
             }
             last = try self.next(&request, config, &history, last);
         }
-        if (output.channel == .tool and output.tokens.items.len < limit) try output.finishTool();
-        if ((self.options.choice == .required or self.options.choice == .function) and output.calls.items.len == 0 and output.tokens.items.len < limit)
-            return error.InvalidInkling2ToolOutput;
-        const result = if (callback != null or channels != null)
-            try output.text.bytes.toOwnedSlice(self.allocator)
-        else
-            try self.tokenizer.decodeText(self.allocator, output.tokens.items);
-        errdefer self.allocator.free(result);
-        const reasoning = if (output.reasoning.bytes.items.len != 0) try output.reasoning.bytes.toOwnedSlice(self.allocator) else null;
-        errdefer if (reasoning) |reasoning_text| self.allocator.free(reasoning_text);
-        const ids = try output.tokens.toOwnedSlice(self.allocator);
-        errdefer self.allocator.free(ids);
-        const calls = if (output.calls.items.len != 0) try output.calls.toOwnedSlice(self.allocator) else null;
-        return .{
-            .allocator = self.allocator,
-            .text = result,
-            .reasoning_text = reasoning,
-            .native_tool_calls = calls,
-            .token_ids = ids,
-            .prompt_tokens = self.prompt.count(),
-            .tokens_used = ids.len,
-            .finish_reason = if (ids.len == limit) "length" else if (calls != null) "tool_calls" else "stop",
-            .speculative = if (draft != null) stats else if (self.speculation_context_disabled) .{
-                .speculation_policy = config.speculation_policy,
-                .speculation_policy_decision = .disabled_unavailable,
-                .mtp_disabled_reason = "inkling_speculative_context_limit",
-            } else null,
-        };
+        var result = try output.finalize(self.options, self.prompt.count(), limit);
+        result.speculative = if (draft != null) stats else if (self.speculation_context_disabled) .{
+            .speculation_policy = config.speculation_policy,
+            .speculation_policy_decision = .disabled_unavailable,
+            .mtp_disabled_reason = "inkling_speculative_context_limit",
+        } else null;
+        return result;
     }
 };
