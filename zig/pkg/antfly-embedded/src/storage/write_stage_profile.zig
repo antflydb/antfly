@@ -22,6 +22,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const platform_time = @import("antfly_platform").time;
+const AtomicU64 = @import("antfly_platform").atomic.Value(u64);
 
 pub const Stage = enum(u8) {
     /// `capi` entry: admission, writer lease and refresh.
@@ -77,8 +78,8 @@ const stage_count = @typeInfo(Stage).@"enum".field_names.len;
 const report_every = 2000;
 
 var state: std.atomic.Value(u8) = .init(0); // 0 unknown, 1 off, 2 on
-var total_ns: [stage_count]std.atomic.Value(u64) = @splat(.init(0));
-var counts: [stage_count]std.atomic.Value(u64) = @splat(.init(0));
+var total_ns: [stage_count]AtomicU64 = @splat(.init(0));
+var counts: [stage_count]AtomicU64 = @splat(.init(0));
 
 pub fn enabled() bool {
     if (builtin.os.tag == .freestanding) return false;
