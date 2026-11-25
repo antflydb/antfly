@@ -16,6 +16,7 @@
 // native-program:entry antfly_dense_bf16_projection_simd4
 struct DenseBf16ProjectionParams {
     uint rows, input_width, output_width, f32_output;
+    float softcap;
 };
 
 kernel void antfly_dense_bf16_projection_simd4(
@@ -37,7 +38,7 @@ kernel void antfly_dense_bf16_projection_simd4(
     const float total = simd_sum(product);
     if (lane == 0u) {
         const ulong index = ulong(group.y) * p.output_width + column;
-        if (p.f32_output) reinterpret_cast<device float *>(output)[index] = total;
+        if (p.f32_output) reinterpret_cast<device float *>(output)[index] = p.softcap > 0.0f ? tanh(total / p.softcap) * p.softcap : total;
         else reinterpret_cast<device bfloat *>(output)[index] = bfloat(total);
     }
 }

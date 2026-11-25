@@ -53591,9 +53591,10 @@ pub const DenseBf16Projection = struct {
     rows: u32,
     input_width: u32,
     output_width: u32,
+    softcap: f32 = 0,
 
     const Buffer = RoutedBlockScaledProjection.Buffer;
-    const Wire = extern struct { rows: u32, input_width: u32, output_width: u32, f32_output: u32 };
+    const Wire = extern struct { rows: u32, input_width: u32, output_width: u32, f32_output: u32, softcap: f32 };
     extern fn antfly_metal_dispatch_dense_bf16_projection(runtime: *RawMetalDecodeRuntime, views: *const [3]Buffer, params: *const Wire) c_int;
 
     pub fn encode(self: DenseBf16Projection, runtime: *RawMetalDecodeRuntime, input: *const MetalTensor, weight: *const MetalTensor, output: *MetalTensor) !void {
@@ -53608,6 +53609,7 @@ pub const DenseBf16Projection = struct {
             .input_width = self.input_width,
             .output_width = self.output_width,
             .f32_output = @intFromBool(output.dtype == .f32),
+            .softcap = self.softcap,
         }) != 0) return error.MetalKernelDispatchFailed;
         output.invalidateHostMirror();
     }

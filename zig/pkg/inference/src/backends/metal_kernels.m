@@ -13157,6 +13157,7 @@ static NSString *termite_metal_shader_source(void) {
            // tile-codegen:begin projection.dense_bf16 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "struct DenseBf16ProjectionParams {\n"
            "    uint rows, input_width, output_width, f32_output;\n"
+           "    float softcap;\n"
            "};\n"
            "\n"
            "kernel void antfly_dense_bf16_projection_simd4(\n"
@@ -13178,7 +13179,7 @@ static NSString *termite_metal_shader_source(void) {
            "    const float total = simd_sum(product);\n"
            "    if (lane == 0u) {\n"
            "        const ulong index = ulong(group.y) * p.output_width + column;\n"
-           "        if (p.f32_output) reinterpret_cast<device float *>(output)[index] = total;\n"
+           "        if (p.f32_output) reinterpret_cast<device float *>(output)[index] = p.softcap > 0.0f ? tanh(total / p.softcap) * p.softcap : total;\n"
            "        else reinterpret_cast<device bfloat *>(output)[index] = bfloat(total);\n"
            "    }\n"
            "}\n"
@@ -37181,13 +37182,15 @@ int antfly_metal_dispatch_causal_depthwise4_bf16(
 
 typedef struct {
     uint32_t rows, input_width, output_width, f32_output;
+    float softcap;
 } antfly_metal_dense_bf16_projection_params;
 
 int antfly_metal_dispatch_dense_bf16_projection(
     termite_metal_decode_runtime *runtime, const antfly_metal_routed_buffer views[3],
     const antfly_metal_dense_bf16_projection_params *p
 ) {
-    if (!runtime || !views || !p || !p->rows || !p->input_width || !p->output_width) return -1;
+    if (!runtime || !views || !p || !p->rows || !p->input_width || !p->output_width ||
+        !isfinite(p->softcap) || p->softcap < 0 || (!p->f32_output && p->softcap != 0)) return -1;
     const size_t output_size = p->f32_output ? 4u : 2u;
     size_t required[3];
     if (!termite_metal_size_mul(p->rows, (size_t)p->input_width * 2u, &required[0]) ||
