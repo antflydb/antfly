@@ -243,6 +243,10 @@ pub const RequestPlan = struct {
     }
 
     pub fn initPrefill(model: *const Decoder, max_tokens: u32, prefill_rows: u32) !RequestPlan {
+        return initWithFormat(model, max_tokens, prefill_rows, .bf16);
+    }
+
+    pub fn initWithFormat(model: *const Decoder, max_tokens: u32, prefill_rows: u32, format: kv.PlaneFormat) !RequestPlan {
         const text = model.text;
         if (max_tokens == 0 or max_tokens > text.model_max_length or prefill_rows == 0 or
             prefill_rows > @min(prefill_chunk_rows, max_tokens)) return error.InvalidInkling2Context;
@@ -254,6 +258,7 @@ pub const RequestPlan = struct {
                 .sliding_slots = checkpoint.sliding_slot_count,
                 .kv_heads = text.num_key_value_heads,
                 .head_dim = text.head_dim,
+                .full_format = format,
             },
             .decode = try .init(model, 1, max_tokens),
             .prefill = if (prefill_rows == 1) null else try .init(model, prefill_rows, max_tokens),
@@ -476,12 +481,15 @@ test "Inkling Metal resident decoder runs the released text checkpoint" {
     if (!@import("build_options").enable_metal or !metal.metalDeviceAvailable()) return error.SkipZigTest;
     const dir = @import("antfly_platform").env.getenv("ANTFLY_INKLING2_METAL_MODEL_DIR") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
-    var source = try checkpoint.Checkpoint.open(a, dir);
-    defer source.deinit();
-    const time = @import("antfly_platform").time;
+    const platform = @import("antfly_platform");
+    const time = platform.time;
     const load_start = time.monotonicNs();
     const MetalSession = @import("inkling2_session_metal.zig").Runtime;
-    const session = try MetalSession.loadCheckpoint(a, &source);
+    const session = load: {
+        var source = try checkpoint.Checkpoint.open(a, dir);
+        defer source.deinit();
+        break :load try MetalSession.loadCheckpoint(a, &source);
+    };
     defer session.close();
     const resident = MetalSession.fromSession(session) orelse return error.Inkling2FixtureRequired;
     const decoder = &resident.model;
@@ -538,6 +546,48 @@ test "Inkling Metal resident decoder runs the released text checkpoint" {
     }
     std.debug.print("Inkling Metal prefill rows={d} serial_ms={d:.3} batched_ms={d:.3} peak_id={d} max_logit_delta={d:.5}\n", .{
         prefix.len, @as(f64, @floatFromInt(serial_ns)) / 1e6, @as(f64, @floatFromInt(batch_ns)) / 1e6, argmax(candidate), max_delta,
+    });
+
+    const full_context = decoder.text.model_max_length;
+    const full_plan = try RequestPlan.initWithFormat(decoder, full_context, prefill_chunk_rows, .q4_head128);
+    const full_exact = try RequestPlan.initPrefill(decoder, full_context, prefill_chunk_rows);
+    try std.testing.expectEqual(@as(usize, 8_858_370_048), try full_plan.bank.deviceBytes(.full));
+    try std.testing.expectEqual(@as(usize, 34_359_738_368), try full_exact.bank.deviceBytes(.full));
+    try std.testing.expect(resident.resident_bytes + try full_plan.deviceBytes() < 29_000_000_000);
+    const retained_at_full = try State.deviceBytes(full_plan.bank, full_plan.width);
+    const default_kv_budget = 3 * 1024 * 1024 * 1024;
+    const widened = resident.widenCacheBudget(.{ .kv_limit_bytes = default_kv_budget, .combined_limit_bytes = 29_000_000_000 });
+    try std.testing.expectEqual(retained_at_full, widened.kv_limit_bytes);
+    const capped = resident.widenCacheBudget(.{ .kv_limit_bytes = default_kv_budget, .combined_limit_bytes = 25_000_000_000 });
+    try std.testing.expectEqual(@as(usize, default_kv_budget), capped.kv_limit_bytes);
+    if (platform.env.getenvBool("ANTFLY_INKLING2_METAL_FULL_LAYOUT")) {
+        const allocation_start = time.monotonicNs();
+        var maximum: Request = undefined;
+        try maximum.initWithPlan(a, decoder, full_plan);
+        defer maximum.deinit();
+        const allocation_ns = time.monotonicNs() - allocation_start;
+        try std.testing.expectEqual(@as(u32, 34851), try maximum.stepGreedy(42));
+        std.debug.print("Inkling Metal allocated {d} positions with {d} KV bytes in {d:.3}ms and completed the first decode\n", .{
+            full_context, retained_at_full, @as(f64, @floatFromInt(allocation_ns)) / 1e6,
+        });
+    }
+    const compressed_plan = try RequestPlan.initWithFormat(decoder, prefix.len + 1, prefix.len, .q4_head128);
+    var compressed: Request = undefined;
+    try compressed.initWithPlan(a, decoder, compressed_plan);
+    defer compressed.deinit();
+    const compressed_start = time.monotonicNs();
+    try compressed.appendTokens(&prefix);
+    const compressed_ns = time.monotonicNs() - compressed_start;
+    const compressed_logits = try compressed.step(last);
+    try std.testing.expectEqual(argmax(reference), argmax(compressed_logits));
+    var compact_error: f32 = 0;
+    for (reference, compressed_logits) |expected, actual| {
+        try std.testing.expect(std.math.isFinite(actual));
+        compact_error = @max(compact_error, @abs(expected - actual));
+    }
+    std.debug.print("Inkling Metal Q4 prefill_ms={d:.3} peak_id={d} max_logit_delta={d:.5} full_kv_bytes={d} exact_kv_bytes={d}\n", .{
+        @as(f64, @floatFromInt(compressed_ns)) / 1e6,           argmax(compressed_logits),                                compact_error,
+        try State.deviceBytes(full_plan.bank, full_plan.width), try State.deviceBytes(full_exact.bank, full_exact.width),
     });
 
     // The same patterned RGB fixture runs in the released CUDA decoder suite.

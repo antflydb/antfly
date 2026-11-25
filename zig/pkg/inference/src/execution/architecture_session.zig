@@ -7476,6 +7476,10 @@ pub fn widenBudgetLimitsForSession(
     limits: runtime.tier.memory.Limits,
 ) runtime.tier.memory.Limits {
     if (session.generation_workspace) |workspace| return workspace.widenLimits(limits);
+    if (comptime build_options.enable_metal) {
+        if (@import("../architectures/inkling2_session_metal.zig").Runtime.fromSession(session)) |inkling|
+            return inkling.widenCacheBudget(limits);
+    }
     if (session.vtable != &arch_vtable) return limits;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     return widenLimits(limits, self.budget_floor);

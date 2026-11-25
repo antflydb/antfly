@@ -53119,7 +53119,8 @@ test "Metal routed block-scaled projection chains the complete expert stage in o
 
 pub const PagedRelativeBf16Attention = struct {
     const geometry = @import("../ops/paged_relative_attention.zig");
-    const StagedRange = @import("../runtime/kv/hybrid_paged.zig").StagedRange;
+    const metadata = @import("../runtime/kv/hybrid_paged.zig");
+    const StagedRange = metadata.StagedRange;
     const Buffer = RoutedBlockScaledProjection.Buffer;
     const Wire = extern struct {
         start: u32,
@@ -53134,15 +53135,20 @@ pub const PagedRelativeBf16Attention = struct {
         relative_extent: u32,
         splits: u32,
         keys_per_split: u32,
+        q4: u32,
         score_scale: f32,
     };
 
     extern fn antfly_metal_dispatch_paged_relative_bf16(runtime: *RawMetalDecodeRuntime, views: *const [9]Buffer, wire: *const Wire, row_heads: u32, physical_rows: usize) c_int;
 
+    const Pack = extern struct { rows: u32, kv_heads: u32 };
+    extern fn antfly_metal_dispatch_pack_kv_q4(runtime: *RawMetalDecodeRuntime, views: *const [4]Buffer, params: *const Pack) c_int;
+
     query: geometry.Query,
     range: StagedRange,
+    format: metadata.PlaneFormat = .bf16,
 
-    pub const Planes = struct { key: *MetalTensor, value: *MetalTensor };
+    pub const Planes = struct { key: *MetalTensor, value: *MetalTensor, format: metadata.PlaneFormat = .bf16 };
     pub const SourcePlanes = struct { key: *const MetalTensor, value: *const MetalTensor };
 
     /// Stage the append suffix into the already admitted physical visit planes.
@@ -53157,9 +53163,10 @@ pub const PagedRelativeBf16Attention = struct {
     ) !void {
         if (!hasActiveFrame(runtime)) return error.MetalFrameRequired;
         if (kv_heads == 0 or kv_heads > 64) return error.InvalidShape;
-        const row_bytes = @as(usize, kv_heads) * 256;
+        const row_bytes = try metadata.PlaneFormat.bf16.rowBytes(kv_heads, 128);
+        const stored_row_bytes = try destination.format.rowBytes(kv_heads, 128);
         const range = try append.stagedRange(group);
-        const plane_bytes = try std.math.mul(usize, try range.physicalRows(), row_bytes);
+        const plane_bytes = try std.math.mul(usize, try range.physicalRows(), stored_row_bytes);
         const start = append.sequence.committed_tokens;
         const input_bytes = try std.math.mul(usize, range.visible_end - start, row_bytes);
         for ([_]*const MetalTensor{ source.key, source.value }, [_]*MetalTensor{ destination.key, destination.value }) |src, dst| {
@@ -53172,17 +53179,32 @@ pub const PagedRelativeBf16Attention = struct {
 
         var spans = try @import("../runtime/kv/hybrid_paged.zig").RowSpans.init(append.sequence, append, group, start, range.visible_end);
         while (try spans.next()) |span| {
-            const bytes = span.rows * row_bytes;
+            const source_bytes = span.rows * row_bytes;
+            const destination_bytes = span.rows * stored_row_bytes;
             const source_offset = span.linear_row * row_bytes;
-            const destination_offset = span.physical_row * row_bytes;
-            const elements = std.math.cast(i32, bytes / 2) orelse return error.InvalidShape;
-            for ([_]*const MetalTensor{ source.key, source.value }, [_]*MetalTensor{ destination.key, destination.value }) |src, dst| {
-                var input = try src.retainedView(source_offset, bytes, &.{elements});
-                defer input.deinit();
-                var output = try dst.retainedView(destination_offset, bytes, &.{elements});
-                defer output.deinit();
-                dst.invalidateHostMirror();
-                try input.copyInto(&output);
+            const destination_offset = span.physical_row * stored_row_bytes;
+            const source_elements = std.math.cast(i32, source_bytes / 2) orelse return error.InvalidShape;
+            const destination_elements = std.math.cast(i32, destination_bytes / 2) orelse return error.InvalidShape;
+            var key = try source.key.retainedView(source_offset, source_bytes, &.{source_elements});
+            defer key.deinit();
+            var value = try source.value.retainedView(source_offset, source_bytes, &.{source_elements});
+            defer value.deinit();
+            var key_out = try destination.key.retainedView(destination_offset, destination_bytes, &.{destination_elements});
+            defer key_out.deinit();
+            var value_out = try destination.value.retainedView(destination_offset, destination_bytes, &.{destination_elements});
+            defer value_out.deinit();
+            destination.key.invalidateHostMirror();
+            destination.value.invalidateHostMirror();
+            if (destination.format == .bf16) {
+                try key.copyInto(&key_out);
+                try value.copyInto(&value_out);
+            } else {
+                const views: [4]Buffer = .{
+                    try .fromTensor(&key, .i16),     try .fromTensor(&value, .i16),
+                    try .fromTensor(&key_out, .i16), try .fromTensor(&value_out, .i16),
+                };
+                if (antfly_metal_dispatch_pack_kv_q4(runtime, &views, &.{ .rows = @intCast(span.rows), .kv_heads = kv_heads }) != 0)
+                    return error.MetalKernelDispatchFailed;
             }
         }
     }
@@ -53237,6 +53259,7 @@ pub const PagedRelativeBf16Attention = struct {
             .relative_extent = self.query.relative_extent,
             .splits = split_count,
             .keys_per_split = (coverage.live_keys - 1) / split_count + 1,
+            .q4 = @intFromBool(self.format == .q4_head128),
             .score_scale = self.query.score_scale,
         }, coverage.row_heads, physical_rows) != 0) return error.MetalKernelDispatchFailed;
         scratch.invalidateHostMirror();
@@ -53303,6 +53326,71 @@ test "Metal paged relative attention resolves shuffled pages with sink and gate"
         for (output[head * 128 ..][0..128]) |value| try std.testing.expectEqual(bits, value);
 }
 
+test "Metal paged relative attention resolves the final token of a packed million-token window" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const context = 1_048_576;
+    const page_tokens = 16;
+    const pages = context / page_tokens;
+    const words = 33;
+    const attention: PagedRelativeBf16Attention = .{
+        .query = .{ .rows = 1, .start = context - 1, .q_heads = 1, .kv_heads = 1, .relative_extent = 0, .score_scale = 1.0 / @sqrt(128.0) },
+        .range = .{ .first_page = 0, .page_count = pages, .physical_pages = pages, .page_tokens = page_tokens, .visible_start = 0, .visible_end = context },
+        .format = .q4_head128,
+    };
+    const dtypes: [8]metal_tensor.DType = .{ .i16, .i16, .i16, .i32, .i16, .i16, .f32, .i16 };
+    const sizes: [8]i32 = .{ 128, context * words, context * words, pages, 1, 128, try attention.scratchElements(), 128 };
+    var tensors: [8]MetalTensor = undefined;
+    var initialized: usize = 0;
+    defer for (tensors[0..initialized]) |*tensor| tensor.deinit();
+    for (&tensors, dtypes, sizes) |*tensor, dtype, size| {
+        tensor.* = try MetalTensor.deviceAllocateTyped(a, runtime, dtype, .shared, &.{size});
+        initialized += 1;
+    }
+    const zero: [128]u16 = @splat(0);
+    const query: [128]u16 = @splat(0x3f80);
+    try tensors[0].uploadBytes(std.mem.asBytes(&query));
+    try tensors[4].uploadBytes(std.mem.asBytes(&[_]u16{0}));
+    try tensors[5].uploadBytes(std.mem.asBytes(&zero));
+
+    // Reverse the final two physical pages and put the only strong key at the
+    // last logical position. The attention must traverse every split and land
+    // at the remapped physical row.
+    const table_raw = termite_metal_buffer_contents(tensors[3].deviceHandle().?) orelse return error.ExpectedActualSharedContents;
+    const table: [*]u32 = @ptrCast(@alignCast(table_raw));
+    for (table[0..pages], 0..) |*page_id, i| page_id.* = @intCast(i);
+    table[pages - 1] = pages - 2;
+    table[pages - 2] = pages - 1;
+    const final = ((pages - 1) * page_tokens - 1) * words;
+    for (tensors[1..3], [_]u16{ 0xffff, 0xeeee }) |tensor, pattern| {
+        const storage_raw = termite_metal_buffer_contents(tensor.deviceHandle().?) orelse return error.ExpectedActualSharedContents;
+        const storage: [*]u16 = @ptrCast(@alignCast(storage_raw));
+        @memset(storage[0 .. context * words], 0);
+        @memset(storage[final..][0..32], pattern);
+        storage[final + 32] = 0x3c00;
+    }
+
+    try beginFrame(runtime);
+    errdefer cancelFrame(runtime) catch {};
+    try attention.encode(runtime, .{
+        .query = &tensors[0],
+        .keys = &tensors[1],
+        .values = &tensors[2],
+        .relative = null,
+        .page_ids = &tensors[3],
+        .sinks = &tensors[4],
+        .gates = &tensors[5],
+    }, &tensors[6], &tensors[7]);
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+    var output: [128]u16 = undefined;
+    try tensors[7].downloadBytesInto(std.mem.asBytes(&output));
+    try std.testing.expectEqual(@as([128]u16, @splat(0x4040)), output);
+}
+
 /// Runs the projected attention operands through the causal K/V stencils and
 /// paged GQA. The request owns the frame and publishes history and the append
 /// only after every visit has completed.
@@ -53341,7 +53429,7 @@ pub const CausalPagedRelativeBf16 = struct {
             convolution.rows != query.rows or query.kv_heads > 64 or convolution.channels != query.kv_heads * 128 or
             convolution.valid_history != @min(3, query.start) or !convolution.normalize)
             return error.InvalidShape;
-        const attention: PagedRelativeBf16Attention = .{ .query = query, .range = range };
+        const attention: PagedRelativeBf16Attention = .{ .query = query, .range = range, .format = planes.format };
         try convolution.encode(runtime, key.input, key.staged, key.next_history);
         var value_convolution = convolution;
         value_convolution.clip = 0;

@@ -33,10 +33,9 @@ inline float antfly_routed_decode_e4m3(uint bits) {
     const uint exponent = (bits >> 3u) & 15u;
     const uint mantissa = bits & 7u;
     if (exponent == 15u && mantissa == 7u) return as_type<float>(0x7fc00000u);
-    const float magnitude = exponent == 0u
-        ? ldexp(float(mantissa), -9)
-        : ldexp(1.0f + float(mantissa) * 0.125f, int(exponent) - 7);
-    return (bits & 128u) == 0 ? magnitude : -magnitude;
+    const uint normal = ((exponent + 120u) << 23u) | (mantissa << 20u);
+    const uint magnitude = exponent == 0u ? as_type<uint>(float(mantissa) * 0.001953125f) : normal;
+    return as_type<float>(magnitude | ((bits & 128u) << 24u));
 }
 
 inline float antfly_routed_decode_e8m0(uint bits) {

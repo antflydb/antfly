@@ -46,6 +46,7 @@ const Bank = struct {
     slots: []Slot,
     page_ids: Tensor,
     host_ids: []u32,
+    format: kv.PlaneFormat,
     staged_first_page: ?usize = null,
 
     fn init(a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, config: kv.BankConfig, group: kv.Group, hidden_width: u32) !Bank {
@@ -58,7 +59,7 @@ const Bank = struct {
         if (residual == 0) return error.InvalidKvShape;
         var pool = try storage.initHost(a, .{
             .backend = .metal,
-            .dtype = .bf16,
+            .dtype = if (config.format(group) == .bf16) .bf16 else .int4,
             .page_size_tokens = config.layout.page_tokens,
             .num_layers_packed = count,
             .num_kv_heads = config.kv_heads,
@@ -78,7 +79,7 @@ const Bank = struct {
         const host_ids = try a.alloc(u32, pages);
         errdefer a.free(host_ids);
         const page_ids = try Tensor.deviceAllocateTyped(a, runtime, .i32, .shared, &.{std.math.cast(i32, pages) orelse return error.InvalidKvShape});
-        return .{ .pool = pool, .slots = slots, .page_ids = page_ids, .host_ids = host_ids };
+        return .{ .pool = pool, .slots = slots, .page_ids = page_ids, .host_ids = host_ids, .format = config.format(group) };
     }
 
     fn deinit(self: *Bank, a: std.mem.Allocator) void {
@@ -199,7 +200,7 @@ pub const State = struct {
         const old = 2 + self.history_index * 2;
         const next = 2 + (1 - self.history_index) * 2;
         return .{
-            .planes = .{ .key = &buffers[0], .value = &buffers[1] },
+            .planes = .{ .key = &buffers[0], .value = &buffers[1], .format = bank.format },
             .history = .{
                 .key = if (self.sequence.committed_tokens == 0) null else &buffers[old],
                 .value = if (self.sequence.committed_tokens == 0) null else &buffers[old + 1],

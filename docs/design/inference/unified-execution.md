@@ -896,6 +896,23 @@ passed all 81 tests. The opt-in Metal HTTP route correctly identified
 `[DONE]` at 1.64 s. The matched reference image performance gate remains
 open.
 
+The opt-in `cache_dtype: "int4"` format stores four-bit global K/V with one
+FP16 scale per 128-element head. Sliding K/V and convolution history stay
+BF16. At the advertised 1,048,576 positions, the request planned and
+allocated 9,035,481,352 KV bytes versus 34,536,849,672 bytes in the exact
+BF16 layout. The warmed Metal process completed the first decode with that
+capacity reserved. A separate GPU test read the remapped last page across
+a synthetic million-token sequence. All 83 tests passed. Running the full
+model through a million-token prompt and measuring accuracy and latency
+at that length remain open.
+
+The 16-token compressed probe selected the same next token as BF16, with
+a maximum logit deviation of 1.89. In a separate run, experimental native
+BF16 projection tiles reduced 16-token prefill from about 522 ms to 468 ms
+and changed some logits by up to 1.54. The tiles require
+`ANTFLY_METAL_BF16_TILED_PROJECTION=1` while broader accuracy validation is
+pending.
+
 ### Official Gemma 4 E2B QAT serving comparison
 
 The decoder and projector came from Google's E2B QAT Q4_0 GGUF revision

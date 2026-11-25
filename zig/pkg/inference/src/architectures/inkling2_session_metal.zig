@@ -66,6 +66,25 @@ pub const Runtime = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
+    /// Widen only the automatically chosen KV bucket, and only when the
+    /// complete plan fits both of the existing physical envelopes.
+    pub fn widenCacheBudget(self: *const Runtime, limits: @import("../runtime/tier/memory.zig").Limits) @TypeOf(limits) {
+        if (limits.kv_limit_bytes == 0) return limits;
+        const context = self.model.text.model_max_length;
+        const plan = decoder.RequestPlan.initWithFormat(&self.model, context, @min(context, decoder.prefill_chunk_rows), .q4_head128) catch return limits;
+        const retained = State.deviceBytes(plan.bank, plan.width) catch return limits;
+        if (retained <= limits.kv_limit_bytes) return limits;
+        const device = self.resident_bytes +| (plan.deviceBytes() catch return limits);
+        const host = @as(usize, self.model.text.unpadded_vocab_size) * @sizeOf(f32);
+        if ((limits.backend_limit_bytes != 0 and device > limits.backend_limit_bytes) or
+            (limits.combined_limit_bytes != 0 and device +| host > limits.combined_limit_bytes) or
+            (limits.host_limit_bytes != 0 and host > limits.host_limit_bytes))
+            return limits;
+        var widened = limits;
+        widened.kv_limit_bytes = retained;
+        return widened;
+    }
+
     pub fn fromSession(session: backends.Session) ?*Runtime {
         return if (session.vtable == &vtable) @ptrCast(@alignCast(session.ptr)) else null;
     }
@@ -154,14 +173,22 @@ pub const TextPipeline = struct {
 
     pub fn requestPlan(self: *const TextPipeline, model: *const decoder.Decoder, config: generation.GenerationConfig) !decoder.RequestPlan {
         if (config.max_tokens <= 0 or self.prompt.after_image.len == 0 or
-            config.grammar != null or config.cache_dtype != null or config.kv_cache_mode != .exact_hybrid or
+            config.grammar != null or config.kv_cache_mode != .exact_hybrid or
             config.cache_compaction_ratio != null or config.prompt_cache_enabled or config.draft_model != null or
             config.token_observer != null or (config.speculation_requested and config.speculation_policy == .force))
             return error.UnsupportedInkling2Request;
         const tokens = try std.math.add(usize, self.prompt.count(), @as(usize, @intCast(config.max_tokens)) - 1);
         const prefix = @max(self.prompt.before_image.len, self.prompt.after_image.len - 1, self.prompt.imageRows());
         const prefill_rows: u32 = if (prefix >= decoder.prefill_chunk_rows) decoder.prefill_chunk_rows else 1;
-        return decoder.RequestPlan.initPrefill(model, std.math.cast(u32, tokens) orelse return error.InvalidInkling2Context, prefill_rows);
+        const format: @import("../runtime/kv/hybrid_paged.zig").PlaneFormat = if (config.cache_dtype) |dtype| blk: {
+            const parsed = @import("../runtime/kv/pool.zig").parseKvDType(dtype) orelse return error.UnsupportedInkling2Request;
+            break :blk switch (parsed) {
+                .bf16 => .bf16,
+                .int4 => .q4_head128,
+                else => return error.UnsupportedInkling2Request,
+            };
+        } else .bf16;
+        return decoder.RequestPlan.initWithFormat(model, std.math.cast(u32, tokens) orelse return error.InvalidInkling2Context, prefill_rows, format);
     }
 
     /// The caller owns the runtime execution gate and memory admission for

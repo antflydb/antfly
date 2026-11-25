@@ -16,20 +16,34 @@
 // native-program:entry antfly_paged_relative_gqa_d128_bf16_partial
 struct PagedRelativeGqaParams {
     uint start, visible_start, page_tokens, first_page, page_count, physical_pages;
-    uint q_heads, kv_heads, window, relative_extent, splits, keys_per_split;
+    uint q_heads, kv_heads, window, relative_extent, splits, keys_per_split, q4;
     float score_scale;
 };
 
-kernel void antfly_paged_relative_gqa_d128_bf16_partial(
-    device const bfloat *query [[buffer(0)]],
-    device const bfloat *keys [[buffer(1)]],
-    device const bfloat *values [[buffer(2)]],
-    device const bfloat *relative [[buffer(3)]],
-    device const uint *page_ids [[buffer(4)]],
-    device float *partials [[buffer(5)]],
-    constant PagedRelativeGqaParams &p [[buffer(6)]],
-    uint2 group [[threadgroup_position_in_grid]],
-    uint lane [[thread_index_in_simdgroup]]
+template <bool compressed>
+inline float4 antfly_relative_kv_head(device const ushort *storage, ulong head, uint lane) {
+    if (compressed) {
+        const ulong base = head * 33u;
+        const uint packed = storage[base + lane];
+        const float scale = float(as_type<half>(storage[base + 32u]));
+        return float4(float(int(packed & 15u) - 8), float(int((packed >> 4u) & 15u) - 8),
+            float(int((packed >> 8u) & 15u) - 8), float(int((packed >> 12u) & 15u) - 8)) * scale;
+    }
+    const device bfloat *values = reinterpret_cast<device const bfloat *>(storage) + head * 128u + lane;
+    return float4(float(values[0]), float(values[32]), float(values[64]), float(values[96]));
+}
+
+template <bool compressed>
+inline void antfly_paged_relative_gqa_d128_partial(
+    device const bfloat *query,
+    device const ushort *keys,
+    device const ushort *values,
+    device const bfloat *relative,
+    device const uint *page_ids,
+    device float *partials,
+    constant PagedRelativeGqaParams &p,
+    uint2 group,
+    uint lane
 ) {
     const uint row_head = group.x;
     const uint head = row_head % p.q_heads;
@@ -51,9 +65,10 @@ kernel void antfly_paged_relative_gqa_d128_bf16_partial(
         const uint page = page_ids[index];
         if (page >= p.physical_pages) continue;
         const ulong row = ulong(page) * p.page_tokens + pos % p.page_tokens;
-        const ulong base = (row * p.kv_heads + kv_head) * 128u + lane;
+        const ulong stored_head = row * p.kv_heads + kv_head;
+        const float4 key = antfly_relative_kv_head<compressed>(keys, stored_head, lane);
         float dot = 0.0f;
-        for (uint i = 0; i < 4; ++i) dot = fma(q[i], float(keys[base + i * 32u]), dot);
+        for (uint i = 0; i < 4; ++i) dot = fma(q[i], key[i], dot);
         const float reduced = simd_sum(dot);
         const uint distance = position - pos;
         const float bias = distance < p.relative_extent ? float(relative[ulong(row_head) * p.relative_extent + distance]) : 0.0f;
@@ -62,8 +77,8 @@ kernel void antfly_paged_relative_gqa_d128_bf16_partial(
         const float retain = exp(maximum - next_max);
         const float add = exp(score - next_max);
         denominator = fma(denominator, retain, add);
-        for (uint i = 0; i < 4; ++i)
-            numerator[i] = fma(add, float(values[base + i * 32u]), numerator[i] * retain);
+        const float4 value = antfly_relative_kv_head<compressed>(values, stored_head, lane);
+        numerator = fma(float4(add), value, numerator * retain);
         maximum = next_max;
     }
     const ulong dst = (ulong(row_head) * p.splits + group.y) * 130u;
@@ -72,6 +87,20 @@ kernel void antfly_paged_relative_gqa_d128_bf16_partial(
         partials[dst + 128u] = maximum;
         partials[dst + 129u] = denominator;
     }
+}
+
+kernel void antfly_paged_relative_gqa_d128_bf16_partial(
+    device const bfloat *query [[buffer(0)]],
+    device const ushort *keys [[buffer(1)]],
+    device const ushort *values [[buffer(2)]],
+    device const bfloat *relative [[buffer(3)]],
+    device const uint *page_ids [[buffer(4)]],
+    device float *partials [[buffer(5)]],
+    constant PagedRelativeGqaParams &p [[buffer(6)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    antfly_paged_relative_gqa_d128_partial<false>(query, keys, values, relative, page_ids, partials, p, group, lane);
 }
 
 // native-program:entry antfly_paged_relative_gqa_d128_bf16_reduce
@@ -104,4 +133,43 @@ kernel void antfly_paged_relative_gqa_d128_bf16_reduce(
         const ulong index = base + i * 32u;
         output[index] = bfloat((numerator[i] / denominator) / (1.0f + exp(-float(gates[index]))));
     }
+}
+
+// native-program:entry antfly_paged_relative_gqa_d128_q4_partial
+kernel void antfly_paged_relative_gqa_d128_q4_partial(
+    device const bfloat *query [[buffer(0)]],
+    device const ushort *keys [[buffer(1)]],
+    device const ushort *values [[buffer(2)]],
+    device const bfloat *relative [[buffer(3)]],
+    device const uint *page_ids [[buffer(4)]],
+    device float *partials [[buffer(5)]],
+    constant PagedRelativeGqaParams &p [[buffer(6)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    antfly_paged_relative_gqa_d128_partial<true>(query, keys, values, relative, page_ids, partials, p, group, lane);
+}
+
+// native-program:entry antfly_pack_bf16_kv_d128_q4
+kernel void antfly_pack_bf16_kv_d128_q4(
+    device const bfloat *key [[buffer(0)]], device const bfloat *value [[buffer(1)]],
+    device ushort *key_out [[buffer(2)]], device ushort *value_out [[buffer(3)]],
+    constant uint2 &geometry [[buffer(4)]],
+    uint2 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint head = group.x;
+    if (head >= geometry.x * geometry.y) return;
+    const device bfloat *src = group.y == 0u ? key : value;
+    device ushort *dst = group.y == 0u ? key_out : value_out;
+    const ulong begin = ulong(head) * 128u + lane;
+    const float4 values = float4(float(src[begin]), float(src[begin + 32u]),
+        float(src[begin + 64u]), float(src[begin + 96u]));
+    const float4 magnitude = abs(values);
+    const float maximum = simd_max(max(max(magnitude.x, magnitude.y), max(magnitude.z, magnitude.w)));
+    const half scale = half(maximum / 7.0f);
+    const float inverse = scale == half(0.0f) ? 0.0f : 1.0f / float(scale);
+    const uint4 q = uint4(int4(clamp(rint(values * inverse), -8.0f, 7.0f)) + 8);
+    const ulong offset = ulong(head) * 33u;
+    dst[offset + lane] = ushort(q.x | (q.y << 4u) | (q.z << 8u) | (q.w << 12u));
+    if (lane == 0u) dst[offset + 32u] = as_type<ushort>(scale);
 }

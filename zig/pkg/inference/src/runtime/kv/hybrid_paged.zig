@@ -54,13 +54,28 @@ pub const Layout = struct {
     }
 };
 
-/// Resident BF16 bank geometry for independently stored full and sliding visits.
+pub const PlaneFormat = enum {
+    bf16,
+    q4_head128,
+
+    pub fn rowBytes(self: PlaneFormat, kv_heads: u32, head_dim: u32) !usize {
+        if (kv_heads == 0 or head_dim == 0) return error.InvalidKvShape;
+        const head_bytes: usize = switch (self) {
+            .bf16 => @as(usize, head_dim) * @sizeOf(u16),
+            .q4_head128 => if (head_dim == 128) 32 * @sizeOf(u16) + @sizeOf(f16) else return error.InvalidKvShape,
+        };
+        return std.math.mul(usize, kv_heads, head_bytes);
+    }
+};
+
+/// Resident bank geometry for independently stored full and sliding visits.
 pub const BankConfig = struct {
     layout: Layout,
     full_slots: u16,
     sliding_slots: u16,
     kv_heads: u32,
     head_dim: u32,
+    full_format: PlaneFormat = .bf16,
 
     pub fn slots(self: BankConfig, group: Group) u16 {
         return switch (group) {
@@ -70,8 +85,11 @@ pub const BankConfig = struct {
     }
 
     pub fn rowBytes(self: BankConfig) !usize {
-        if (self.kv_heads == 0 or self.head_dim == 0) return error.InvalidKvShape;
-        return std.math.mul(usize, try std.math.mul(usize, self.kv_heads, self.head_dim), @sizeOf(u16));
+        return PlaneFormat.bf16.rowBytes(self.kv_heads, self.head_dim);
+    }
+
+    pub fn format(self: BankConfig, group: Group) PlaneFormat {
+        return if (group == .full) self.full_format else .bf16;
     }
 
     pub fn deviceBytes(self: BankConfig, group: Group) !usize {
@@ -82,7 +100,7 @@ pub const BankConfig = struct {
 
     pub fn planeBytes(self: BankConfig, group: Group) !usize {
         const rows = try std.math.mul(usize, try self.layout.pageCapacity(group), self.layout.page_tokens);
-        return std.math.mul(usize, rows, try self.rowBytes());
+        return std.math.mul(usize, rows, try self.format(group).rowBytes(self.kv_heads, self.head_dim));
     }
 };
 
