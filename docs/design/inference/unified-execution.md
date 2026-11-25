@@ -865,3 +865,22 @@ At `c354c55ac4`, functional prefill returned all four E2B semantic answers. Its
 representation declined physical replay, and the eager graph was slower in
 every case. New geometries now require physical replay admission before
 numerical submission. The ordinary CUDA route handles a declined graph.
+
+At `4cc90259a9`, the official E2B checkpoint passed the four fixture fact
+checks on both Spark servers with a 48-token cap. The earlier 16-token
+semantic run was too short to emit the invoice total on either server. For
+timing, the unchanged 16-token workloads used eight measured samples per arm
+and the Antfly/llama.cpp/llama.cpp/Antfly order on the shared Spark GPU.
+Values are the mean of the two arm medians, in milliseconds.
+
+| Workload | Antfly defaults | BF16 donors and MMA prefill | Also enable F16 MQA warp split | llama.cpp with MQA comparison |
+| --- | ---: | ---: | ---: | ---: |
+| Text | 1168 | 679 | 201 | 170 |
+| Image | 4646 | 543 | 271 | 205 |
+| Audio | 880 | 281 | 220 | 165 |
+| Video | 4448 | 530 | 242 | 279 |
+
+The F16 MQA route reproduced the earlier tuned regime on the same binary.
+It leads the llama.cpp reference on the silent video fixture and trails on
+text, image and audio. The tuned flags are explicit, so these measurements
+leave default qualification open.
