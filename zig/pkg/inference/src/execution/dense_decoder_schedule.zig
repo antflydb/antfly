@@ -836,8 +836,11 @@ pub const Schedule = struct {
                 step += 1;
                 continue;
             };
-            if (self.steps.len - step < 3 or installed.owner.entry_node != self.steps[step] or
-                installed.owner.vtable.dispatch_qkv_cache_row == null) return error.UnsupportedDenseSchedule;
+            // Direct cache-row writes are optional. Initial prefill uses the
+            // assigned QKV outputs, and decode can consume those same outputs
+            // when the region cannot write directly into the cache.
+            if (self.steps.len - step < 3 or installed.owner.entry_node != self.steps[step])
+                return error.UnsupportedDenseSchedule;
             validateQkvRegion(installed, self.steps[step..][0..3]) catch return error.UnsupportedDenseSchedule;
             step += 3;
         }

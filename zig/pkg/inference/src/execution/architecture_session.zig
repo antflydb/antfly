@@ -12950,6 +12950,33 @@ test "Metal Whisper resident publication binds one provider retirement guard" {
     try std.testing.expectEqual(@as(usize, 1), outputs.outputs.len);
 }
 
+test "Metal Whisper prepared initial rows and decode match ordinary execution" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var session = try incrementalMetalFixtureSession(a);
+    defer session.close();
+    try session.installOwnedExecutionGate(a);
+    const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
+    const control = InferenceExecutionControl{ .io = std.testing.io, .native_call_policy = .in_process };
+    var decoder = (try IncrementalDecoderAdapter.fromHostPrepared(session, a, control, &hidden, 2, .{ .expected_initial_query_rows = 2 })) orelse return error.MissingWhisperDecoder;
+    defer decoder.deinit();
+    const program = if (decoder.cache.native_program) |*value| value else return error.MissingPreparedWhisperSchedule;
+    const initial = if (program.initial) |phase| phase.schedule else return error.MissingPreparedWhisperInitialSchedule;
+    var reference = try whisper_arch.DecodeCache.init(&decoder.cb.backend, a, decoder.config, decoder.encoder_hidden, 2);
+    defer reference.deinit(&decoder.cb.backend);
+    for ([_][]const i64{ &.{ 0, 1 }, &.{2}, &.{3} }) |tokens| {
+        const expected = try whisper_arch.decoderStepCachedLogits(&decoder.cb.backend, a, decoder.config, tokens, &reference);
+        defer a.free(expected);
+        const actual = try decoder.step(tokens);
+        defer a.free(actual);
+        try std.testing.expectEqual(expected.len, actual.len);
+        for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.0001);
+    }
+    try std.testing.expectEqual(initial.steps.len, initial.cursor);
+    try std.testing.expectEqual(program.schedule.steps.len, program.schedule.cursor);
+    try std.testing.expectEqual(@as(usize, 4), decoder.positions());
+}
+
 test "foreign Metal public Whisper encoder final norm promotes before receiver admission without transport" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     const a = std.testing.allocator;
