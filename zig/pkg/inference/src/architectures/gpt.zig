@@ -2995,15 +2995,20 @@ pub fn nativeSharedKvPrefillEnabled(config: Config) bool {
 }
 
 fn sharedKvPrefillBoundaryForBackend(cb: *const ComputeBackend, config: Config, dc: DecodeContext) ?usize {
-    const supports_functional = cb.kind() == .native or (build_options.enable_cuda and cb.kind() == .cuda and
+    // Functional prefill owns its donor values and has no paged backend state.
+    // Its traced and ordinary calls must select the same structural boundary.
+    const supports_functional = hasFunctionalPrefillKv(dc) or cb.kind() == .native or (build_options.enable_cuda and cb.kind() == .cuda and
         @import("../ops/cuda/cuda_compute.zig").CudaCompute.nativePrefillPolicySelected(cb));
     return sharedKvBoundary(if (supports_functional) config.sharedKvFunctionalDonorLayers() else config.sharedKvPrefillDonorLayers(), dc);
 }
 
+fn hasFunctionalPrefillKv(dc: DecodeContext) bool {
+    return dc.attention_mode == .full_recompute and dc.forward_kv_reuse != null and dc.kv_cache == null;
+}
+
 fn sharedKvBoundary(donors: ?usize, dc: DecodeContext) ?usize {
     const donor_layers = donors orelse return null;
-    const functional = dc.attention_mode == .full_recompute and dc.forward_kv_reuse != null and dc.kv_cache == null;
-    if ((!functional and (dc.attention_mode != .paged_prefill or dc.kv_cache == null)) or dc.query_sequence_len <= 1 or
+    if ((!hasFunctionalPrefillKv(dc) and (dc.attention_mode != .paged_prefill or dc.kv_cache == null)) or dc.query_sequence_len <= 1 or
         dc.query_sequence_len > dc.total_sequence_len or
         dc.kv_batch != null or dc.selection_query_capture != null or
         dc.mrope_positions != null or dc.qwen3vl_visual_mask != null or
@@ -3014,6 +3019,34 @@ fn sharedKvBoundary(donors: ?usize, dc: DecodeContext) ?usize {
     }
     if (dc.input_ids) |ids| if (ids.len == 0) return null;
     return donor_layers;
+}
+
+test "functional shared KV prefill admits traced one-head donor geometry" {
+    const allocator = std.testing.allocator;
+    var trace = @import("../graph/tracing_compute.zig").TracingCompute.init(allocator);
+    defer trace.deinit();
+    const cb = trace.backend();
+    const config: Config = .{
+        .family = .gemma,
+        .hidden_size = 1536,
+        .num_hidden_layers = 35,
+        .num_kv_shared_layers = 20,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .position_encoding = .rope,
+        .sliding_window = 512,
+        .sliding_window_pattern = 5,
+    };
+    var donors = try @import("../execution/forward_kv_reuse.zig").Scope.init(allocator, &cb, config.num_hidden_layers, null);
+    defer donors.deinit();
+    var context: DecodeContext = .{ .total_sequence_len = 79, .query_sequence_len = 79, .kv_sequence_len = 79 };
+    try std.testing.expectEqual(@as(?usize, null), sharedKvPrefillBoundaryForBackend(&cb, config, context));
+    context.forward_kv_reuse = donors.context();
+    try std.testing.expectEqual(@as(?usize, 15), sharedKvPrefillBoundaryForBackend(&cb, config, context));
+    context.mrope_positions = &.{};
+    try std.testing.expectEqual(@as(?usize, null), sharedKvPrefillBoundaryForBackend(&cb, config, context));
 }
 
 fn preparedSharedKvPrefillEligible(config: Config, overrides: Layer0DecoderOverrides, batch: usize, seq_len: usize, context: ?*const DecodeContext) bool {

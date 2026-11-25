@@ -779,12 +779,14 @@ greedy output tokens and disabled prompt reuse.
 | --- | ---: | ---: | ---: | ---: |
 | M4 Max CPU, opt-in shared suffix | 7032 / 416 | 4562 / 14917 | 1003 / 1260 | 4114 / 24000 |
 | M4 Max Metal, warm manifest | 424 / 185 | 991 / 255 | 310 / 157 | 941 / 361 |
+| M4 Max Metal, resident projector | 423 / 185 | 643 / 255 | 310 / 156 | 600 / 358 |
 | Spark GB10 CUDA, standard | 1169 / 168 | 4672 / 206 | 875 / 169 | 4447 / 280 |
 | Spark GB10 CUDA, BF16 donors and replay | 885 / 169 | 607 / 206 | 286 / 164 | 603 / 281 |
 
 Cells report Antfly and llama.cpp p50 milliseconds. CPU used eight measured
 samples per engine and modality. Metal and standard CUDA used 24. The CUDA
-replay comparison used 12 samples per engine in ABBA order. Spark had other
+replay and Metal resident comparisons used 12 samples per engine in ABBA
+order. Spark had other
 resident CUDA contexts. Both engines used 514 text prompt tokens and 79 audio
 prompt tokens. The image and video serving routes produced different
 projected token counts. The video fixture used a silent H.264 clip.
