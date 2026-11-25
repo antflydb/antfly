@@ -105,7 +105,7 @@ pub fn run(search: anytype) !void {
     defer seen.deinit();
     var count: usize = 0;
     for (config.tables, selected_tables) |table, selected| {
-        if (search.stopped()) break;
+        if (search.stopped() and !(search.options.quiet and search.summary.matches > 0)) break;
         if (!selected) continue;
         if (table.fields != null and !metadataListing(search.options)) {
             var selected_count: usize = 0;
@@ -119,13 +119,21 @@ pub fn run(search: anytype) !void {
                 var bound = table;
                 bound.selected_stream = stream;
                 scanStream(search, &http, config, bound, &count, &seen) catch |err| try search.reportError(table.alias orelse table.name, err);
-                if (search.stopped()) break;
+                if (search.stopped() and !(search.options.quiet and search.summary.matches > 0)) break;
             }
             if (selected_count == 0 and search.options.artifacts.items.len == 0) try search.reportError(table.alias orelse table.name, error.NoSearchableTextStreams);
-        } else {
+        } else if (!search.stopped()) {
             scan(search, &http, config, table, &count, &seen) catch |err| try search.reportError(table.alias orelse table.name, err);
         }
     }
+}
+// Quiet mode can stop reading content once existence is established, but must
+// still observe the remaining selected artifact coverage. Cancellation and
+// exhausted budgets stop all work, including these bounded metadata requests.
+fn quietCoverageOnly(search: anytype) bool {
+    if (!search.options.quiet or search.summary.matches == 0 or !search.stop or search.limits.cancel.load(.monotonic)) return false;
+    if (search.shared_limits) |limits| if (limits.cancel.load(.monotonic)) return false;
+    return true;
 }
 // A retained scan and its extraction coverage are separate observations.
 // Revision progress is expected during ingestion; only a definition change
@@ -146,7 +154,16 @@ const StreamReadiness = struct {
 
 fn scanStream(search: anytype, http: *httpx.Client, config: Config, table: Table, count: *usize, seen: *Seen) !void {
     const stream = table.selected_stream orelse return error.InvalidArtifactStream;
-    if (stream.artifact == null) return scan(search, http, config, table, count, seen);
+    if (stream.artifact == null) {
+        if (!search.stopped()) try scan(search, http, config, table, count, seen);
+        return;
+    }
+    if (search.stopped() and !quietCoverageOnly(search)) {
+        // A quiet match does not certify unobserved streams when cancellation
+        // or budget exhaustion prevents their readiness checks.
+        search.summary.coverage_complete = false;
+        return;
+    }
     const before = streamReadiness(search, http, config, table, stream) catch |err| {
         search.summary.coverage_complete = false;
         return err;
@@ -156,6 +173,10 @@ fn scanStream(search: anytype, http: *httpx.Client, config: Config, table: Table
         search.summary.coverage_complete = false;
         if (search.options.require_complete) return error.ArtifactStreamIncomplete;
         try search.reportCoverage(table.alias orelse table.name, stream.artifact.?, false, "source_incomplete", before);
+    }
+    if (quietCoverageOnly(search)) {
+        if (before.complete) try search.reportCoverage(table.alias orelse table.name, stream.artifact.?, true, "observed_complete", before);
+        return;
     }
     scanArtifacts(search, http, config, table, count, seen) catch |err| {
         search.summary.coverage_complete = false;

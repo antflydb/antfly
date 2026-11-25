@@ -31,6 +31,7 @@ BINARY = str(Path(sys.argv.pop(1)).resolve())
 class NativeStreams(unittest.TestCase):
     def setUp(self):
         self.complete = True
+        self.complete_by_artifact = {}
         self.queryable = True
         self.incarnation = "index-1"
         self.binary = False
@@ -76,7 +77,12 @@ class NativeStreams(unittest.TestCase):
                                 "target_revision": owner.revision,
                                 "published_revision": owner.revision,
                                 "sources": [
-                                    {"artifact": artifact, "complete": owner.complete}
+                                    {
+                                        "artifact": artifact,
+                                        "complete": owner.complete_by_artifact.get(
+                                            artifact, owner.complete
+                                        ),
+                                    }
                                 ],
                             }
                         },
@@ -552,6 +558,47 @@ class NativeStreams(unittest.TestCase):
             self.assertEqual(coverage["artifact"], "speech")
         self.assertIn("incomplete extraction coverage", result.stderr)
         self.assertEqual(self.run_grep("Tuesday", "-q").returncode, 2)
+
+    def test_quiet_checks_remaining_selected_coverage_without_scanning_it(self):
+        for split_tables in [False, True]:
+            config = json.loads(self.config.read_text())
+            table = config["tables"][0]
+            if split_tables:
+                other = json.loads(json.dumps(table))
+                other["name"] = "other"
+                other["streams"] = [other["streams"][1]]
+                table["streams"] = [table["streams"][0]]
+                config["tables"].append(other)
+            self.config.write_text(json.dumps(config))
+            for complete, expected in [(False, 2), (None, 2), (True, 0)]:
+                for strict in [[], ["--require-complete"]]:
+                    self.requests.clear()
+                    self.complete_by_artifact["summary"] = complete
+                    result = self.run_grep("Tuesday", "-q", "--all-artifacts", *strict)
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    self.assertTrue(
+                        any(
+                            method == "GET" and path.endswith("summary_text")
+                            for method, path in self.requests
+                        )
+                    )
+                    self.assertFalse(
+                        any(
+                            method == "POST"
+                            and body.get("hierarchy", {})
+                            .get("children", {})
+                            .get("artifact")
+                            == "summary"
+                            for method, body in self.requests
+                        )
+                    )
+            self.requests.clear()
+            self.complete_by_artifact["summary"] = True
+            limited = self.run_grep(
+                "Tuesday", "-q", "--all-artifacts", "--max-requests", "4"
+            )
+            self.assertEqual(limited.returncode, 2, limited.stderr)
+            self.assertLessEqual(len(self.requests), 4)
 
     def test_unqueryable_index_does_not_dispatch_queries(self):
         self.queryable = False

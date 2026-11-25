@@ -323,6 +323,10 @@ failure. Catalog incarnation changes, authorization failures and expired or
 changed query snapshots still fail the scan. No per-document manifest walk is
 added to the search path; coverage comes from bounded native readiness metadata.
 
+After a quiet-mode match, grep stops fetching content but checks readiness for
+remaining selected artifact streams within the request budget. A gap or unknown
+readiness still exits 2; cancellation stops further checks.
+
 Successful artifact grep scans also emit a `coverage` JSON observation with
 `complete: true`, the table/index/field, incarnation, and target/published revisions, including when
 there are no matches. This qualifies the observation behind the summary boolean;

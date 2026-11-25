@@ -902,6 +902,10 @@ uncertain without invalidating the retained scan. Status observations are not
 snapshot-bound coverage certificates. Authorization failures, unknown readiness,
 changed definitions and invalid snapshots remain errors.
 
+After a quiet-mode match, grep stops fetching content but checks readiness for
+remaining selected artifact streams within the request budget. A gap or unknown
+readiness still exits 2; cancellation stops further checks.
+
 Successful artifact grep scans also emit a `coverage` JSON observation with
 `complete: true`, the table/index/field, incarnation, and target/published revisions, including when
 there are no matches. This qualifies the observation behind the summary boolean;
