@@ -16356,6 +16356,7 @@ pub const EnrichmentContextQuery = struct {
     /// Graph operations (QueryRequest shape). Exactly one `traverse` from the dependent row (or `start: {keys: [{"$source": "/pointer"}]}`) with only `edge_types`, `direction`, `max_depth` (at most 3), and the context options `max_fanout` (edges per visited node, default 100) and `include_generated` (also follow field-derived and enrichment-generated edges) is a live traversal: dependents watch every visited node's edges and every reached row, members render with depth, edge type, and direction, and `max_documents` bounds the rows reached. A `filter_query` beside it narrows the reached rows and stays live. Anything else (`match`, shortest paths, `edge_filter`, `edge_weight`, `limit`, metrics, deeper traversals, several operations) runs in the query engine as a snapshot.
     graph_queries: ?std.json.ArrayHashMap(std.json.Value) = null,
     cypher: ?EnrichmentContextCypher = null,
+    sql: ?EnrichmentContextSql = null,
     /// Ranked queries: member count.
     limit: ?i64 = null,
     /// Shorthand ranking clause: query text literal or `{"$source":"/pointer"}`, with `text_field`.
@@ -16380,6 +16381,7 @@ pub const EnrichmentContextQuery = struct {
         .{ "exclusion_query", "exclusion_query", true },
         .{ "graph_queries", "graph_queries", true },
         .{ "cypher", "cypher", true },
+        .{ "sql", "sql", true },
         .{ "limit", "limit", true },
         .{ "text", "text", false },
         .{ "text_field", "text_field", true },
@@ -16453,6 +16455,10 @@ pub const EnrichmentContextQuery = struct {
             try jw.objectField("cypher");
             try jw.write(value);
         }
+        if (self.sql) |value| {
+            try jw.objectField("sql");
+            try jw.write(value);
+        }
         if (self.limit) |value| {
             try jw.objectField("limit");
             try jw.write(value);
@@ -16488,7 +16494,7 @@ pub const EnrichmentContextQuery = struct {
     }
 };
 
-/// One named context source: exactly one of `document` (a referenced row) or `query` (a filter, a graph traversal, or a ranked retrieval). `tracking` decides the freshness guarantee. A query whose membership is decided row by row is tracked live: subscriptions invalidate dependents exactly and they can be `current`. That covers a `filter_query` (optionally with a top-N `order_by`) and one plain bounded `graph_queries` traverse (optionally with a `filter_query` narrowing the rows it reaches). A query with any ranking clause (`full_text_search`, `semantic_search`, `embeddings`, `indexes`, `merge_config`, `reranker`, `exclusion_query`, `limit`, `cypher`, the `text`/`vector` shorthands, or `graph_queries` beyond one plain bounded traverse) depends on the whole corpus and is a snapshot: its dependents are `unverified` and rebuild on `refresh_interval` or manually. Registration reports each source's effective tracking and, for a snapshot, the clause that made it one.
+/// One named context source: exactly one of `document` (a referenced row) or `query` (a filter, a graph traversal, or a ranked retrieval). `tracking` decides the freshness guarantee. A query whose membership is decided row by row is tracked live: subscriptions invalidate dependents exactly and they can be `current`. That covers a `filter_query` (optionally with a top-N `order_by`) and one plain bounded `graph_queries` traverse (optionally with a `filter_query` narrowing the rows it reaches). A query with any ranking clause (`full_text_search`, `semantic_search`, `embeddings`, `indexes`, `merge_config`, `reranker`, `exclusion_query`, `limit`, `cypher`, `sql`, the `text`/`vector` shorthands, or `graph_queries` beyond one plain bounded traverse) depends on the whole corpus and is a snapshot: its dependents are `unverified` and rebuild on `refresh_interval` or manually. Registration reports each source's effective tracking and, for a snapshot, the clause that made it one.
 pub const EnrichmentContextSource = struct {
     document: ?EnrichmentContextDocument = null,
     query: ?EnrichmentContextQuery = null,
@@ -16568,6 +16574,53 @@ pub const EnrichmentContextSource = struct {
         }
         if (self.refresh_interval) |value| {
             try jw.objectField("refresh_interval");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Ranking clause: a read-only SQL `SELECT` (see `POST /sql`), run as the principal that declared the enrichment (its table permissions and row policies apply; the server binds the declaration to that principal, and revoking the credential stops rebuilds). Members are the rows of the source `table` named by the result's `_id` column (every table exposes its document key as `_id`; alias another key column `AS _id`), in result order, each once, up to `limit`, and render as those rows' `fields`. A result without an `_id` column fails. Results are admitted up to 4096 rows; a larger result fails rather than truncating, so bound it with `LIMIT`. Only `limit` may sit beside it. A SQL source is a snapshot: dependents rebuild on `refresh_interval` or manually. Any statement but a `SELECT` is rejected. Embedded Lite resolves names in its single catalog and rejects `database` and `namespace`.
+pub const EnrichmentContextSql = struct {
+    /// One SQL SELECT statement.
+    statement: []const u8,
+    /// Positional parameters (`$1`, `$2`, ...); values are literals or `{"$source":"/pointer"}` bindings from the dependent row.
+    parameters: ?[]const std.json.Value = null,
+    /// Database used to resolve unqualified names (default `default`).
+    database: ?[]const u8 = null,
+    /// Namespace used to resolve unqualified table names (default `public`).
+    namespace: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "statement", "statement", false },
+        .{ "parameters", "parameters", true },
+        .{ "database", "database", true },
+        .{ "namespace", "namespace", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("statement");
+        try jw.write(self.statement);
+        if (self.parameters) |value| {
+            try jw.objectField("parameters");
+            try jw.write(value);
+        }
+        if (self.database) |value| {
+            try jw.objectField("database");
+            try jw.write(value);
+        }
+        if (self.namespace) |value| {
+            try jw.objectField("namespace");
             try jw.write(value);
         }
         try jw.endObject();

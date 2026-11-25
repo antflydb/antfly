@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from ..models.enrichment_context_query_order_by import EnrichmentContextQueryOrderBy
     from ..models.enrichment_context_query_reranker import EnrichmentContextQueryReranker
     from ..models.enrichment_context_query_vector import EnrichmentContextQueryVector
+    from ..models.enrichment_context_sql import EnrichmentContextSql
 
 
 T = TypeVar("T", bound="EnrichmentContextQuery")
@@ -73,6 +74,15 @@ class EnrichmentContextQuery:
                 used, not members. Only `limit` may sit beside it. A Cypher source is a snapshot: a statement's result depends
                 on rows it does not return, so dependents rebuild on `refresh_interval` or manually. Statements that write
                 (`CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`) or `EXPLAIN` are rejected.
+            sql (EnrichmentContextSql | Unset): Ranking clause: a read-only SQL `SELECT` (see `POST /sql`), run as the
+                principal that declared the enrichment (its table permissions and row policies apply; the server binds the
+                declaration to that principal, and revoking the credential stops rebuilds). Members are the rows of the source
+                `table` named by the result's `_id` column (every table exposes its document key as `_id`; alias another key
+                column `AS _id`), in result order, each once, up to `limit`, and render as those rows' `fields`. A result
+                without an `_id` column fails. Results are admitted up to 4096 rows; a larger result fails rather than
+                truncating, so bound it with `LIMIT`. Only `limit` may sit beside it. A SQL source is a snapshot: dependents
+                rebuild on `refresh_interval` or manually. Any statement but a `SELECT` is rejected. Embedded Lite resolves
+                names in its single catalog and rejects `database` and `namespace`.
             limit (int | Unset): Ranked queries: member count.
             text (Any | Unset): Shorthand ranking clause: query text literal or `{"$source":"/pointer"}`, with `text_field`.
             text_field (str | Unset):
@@ -94,6 +104,7 @@ class EnrichmentContextQuery:
     exclusion_query: EnrichmentContextQueryExclusionQuery | Unset = UNSET
     graph_queries: EnrichmentContextQueryGraphQueries | Unset = UNSET
     cypher: EnrichmentContextCypher | Unset = UNSET
+    sql: EnrichmentContextSql | Unset = UNSET
     limit: int | Unset = UNSET
     text: Any | Unset = UNSET
     text_field: str | Unset = UNSET
@@ -146,6 +157,10 @@ class EnrichmentContextQuery:
         if not isinstance(self.cypher, Unset):
             cypher = self.cypher.to_dict()
 
+        sql: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.sql, Unset):
+            sql = self.sql.to_dict()
+
         limit = self.limit
 
         text = self.text
@@ -187,6 +202,8 @@ class EnrichmentContextQuery:
             field_dict["graph_queries"] = graph_queries
         if cypher is not UNSET:
             field_dict["cypher"] = cypher
+        if sql is not UNSET:
+            field_dict["sql"] = sql
         if limit is not UNSET:
             field_dict["limit"] = limit
         if text is not UNSET:
@@ -214,6 +231,7 @@ class EnrichmentContextQuery:
         from ..models.enrichment_context_query_order_by import EnrichmentContextQueryOrderBy
         from ..models.enrichment_context_query_reranker import EnrichmentContextQueryReranker
         from ..models.enrichment_context_query_vector import EnrichmentContextQueryVector
+        from ..models.enrichment_context_sql import EnrichmentContextSql
 
         if set(src_dict) - {
             "table",
@@ -228,6 +246,7 @@ class EnrichmentContextQuery:
             "exclusion_query",
             "graph_queries",
             "cypher",
+            "sql",
             "limit",
             "text",
             "text_field",
@@ -306,6 +325,13 @@ class EnrichmentContextQuery:
         else:
             cypher = EnrichmentContextCypher.from_dict(_cypher)
 
+        _sql = d.pop("sql", UNSET)
+        sql: EnrichmentContextSql | Unset
+        if isinstance(_sql, Unset):
+            sql = UNSET
+        else:
+            sql = EnrichmentContextSql.from_dict(_sql)
+
         limit = d.pop("limit", UNSET)
 
         text = d.pop("text", UNSET)
@@ -336,6 +362,7 @@ class EnrichmentContextQuery:
             exclusion_query=exclusion_query,
             graph_queries=graph_queries,
             cypher=cypher,
+            sql=sql,
             limit=limit,
             text=text,
             text_field=text_field,

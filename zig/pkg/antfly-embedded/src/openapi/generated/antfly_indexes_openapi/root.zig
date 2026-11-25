@@ -60,6 +60,7 @@ pub const EnrichmentContextCypher = types.EnrichmentContextCypher;
 pub const EnrichmentContextDocument = types.EnrichmentContextDocument;
 pub const EnrichmentContextQuery = types.EnrichmentContextQuery;
 pub const EnrichmentContextSource = types.EnrichmentContextSource;
+pub const EnrichmentContextSql = types.EnrichmentContextSql;
 pub const EnrichmentKind = types.EnrichmentKind;
 pub const EnrichmentNeighborContextConfig = types.EnrichmentNeighborContextConfig;
 pub const EnrichmentProducerConfig = types.EnrichmentProducerConfig;

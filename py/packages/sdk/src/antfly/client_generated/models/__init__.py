@@ -506,6 +506,7 @@ from .enrichment_context_query_vector import EnrichmentContextQueryVector
 from .enrichment_context_source import EnrichmentContextSource
 from .enrichment_context_source_overflow import EnrichmentContextSourceOverflow
 from .enrichment_context_source_tracking import EnrichmentContextSourceTracking
+from .enrichment_context_sql import EnrichmentContextSql
 from .enrichment_kind import EnrichmentKind
 from .enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
 from .enrichment_neighbor_context_config_direction import EnrichmentNeighborContextConfigDirection
@@ -3344,6 +3345,7 @@ __all__ = (
     "EnrichmentContextSource",
     "EnrichmentContextSourceOverflow",
     "EnrichmentContextSourceTracking",
+    "EnrichmentContextSql",
     "EnrichmentKind",
     "EnrichmentNeighborContextConfig",
     "EnrichmentNeighborContextConfigDirection",
