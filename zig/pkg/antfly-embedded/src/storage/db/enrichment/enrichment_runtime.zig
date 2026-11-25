@@ -49135,7 +49135,8 @@ test "enrichment preserves snapshot failures instead of skipping source content"
         try std.testing.expectError(native_error, extractEnrichmentSource(&runtime, extractSourceText, std.testing.allocator, doc, request));
         try std.testing.expectError(native_error, extractEnrichmentSource(&runtime, renderSourcePartsJson, std.testing.allocator, doc, request));
     }
-    runtime.active_provider_guard = .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s };
+    var clock: platform_clock.ManualClock = .{};
+    runtime.active_provider_guard = .{ .clock = clock.clock(), .deadline_ns = std.time.ns_per_s };
     probe.failure = error.ResourceTemporarilyUnavailable;
     inline for (.{ extractSourceText, renderSourcePartsJson }) |extract| {
         probe.deadline = null;
