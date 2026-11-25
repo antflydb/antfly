@@ -300,6 +300,21 @@ const force_merge_max_segments_at_once = 16;
 /// than encoding them. Below the minimum, level-0 records wait for the fold
 /// (writers merge at the producer cap regardless).
 const level0_fold_min_records = 32;
+
+/// Merging must keep an index's steady state well below its producer cap
+/// (`max_pending_segments`): within it, an inline write's producer admission
+/// fails and the write falls to the replay path, which holds the writer lane
+/// through its catch-up. Waiting level-0 records fold at a quarter of the cap,
+/// and eager (pressure) merging starts at three quarters, before admission
+/// blocks.
+fn level0FoldMinRecords(segment_cap: u64) usize {
+    if (segment_cap == 0) return level0_fold_min_records;
+    return @intCast(std.math.clamp(segment_cap / 4, 2, level0_fold_min_records));
+}
+
+fn mergePressureSegments(segment_cap: u64) u64 {
+    return segment_cap - segment_cap / 4;
+}
 const level0_fold_max_records = 256;
 const level0_fold_max_bytes: u64 = 8 * 1024 * 1024;
 
@@ -27162,7 +27177,7 @@ pub const IndexManager = struct {
                 const snapshot = entry.persistent.acquireSnapshot();
                 defer snapshot.release();
                 const segment_count = snapshot.segments.len;
-                if (segment_count >= 2 and (producer_waiting or (segment_cap != 0 and segment_count >= segment_cap))) {
+                if (segment_count >= 2 and (producer_waiting or (segment_cap != 0 and segment_count >= mergePressureSegments(segment_cap)))) {
                     TextMergeScheduler.schedule(entry);
                 }
             }
@@ -27666,10 +27681,15 @@ pub const IndexManager = struct {
         if (infos.items.len < 2) return null;
 
         const policy = activeTextMergePolicy();
-        const pressure = producer_waiting or (segment_cap != 0 and snap.segments.len >= segment_cap);
+        const pressure = producer_waiting or (segment_cap != 0 and snap.segments.len >= mergePressureSegments(segment_cap));
         // Inline writes publish one small level-0 record each. Fold them
         // wide and first: a tier-sized merge of ten cannot keep up with
         // them, and producer admission counts every one.
+        // Under pressure the fold also takes every other segment below the
+        // floor size: a merge's fixed cost (commit, lease) dominates for
+        // these, and one fold of all of them keeps the segment count well
+        // below the producer cap, where folding only level-0 records left
+        // their tiny outputs to tiered merges ten at a time.
         const level0_plan = level0: {
             var picked = std.ArrayListUnmanaged(usize).empty;
             errdefer picked.deinit(self.alloc);
@@ -27680,7 +27700,13 @@ pub const IndexManager = struct {
                 try picked.append(self.alloc, info.index);
                 bytes += info.size;
             }
-            if (picked.items.len < (if (pressure) @as(usize, 2) else level0_fold_min_records)) {
+            if (pressure) for (infos.items) |info| {
+                if (persistent_mod.isL0SegmentId(snap.segments[info.index].id) or info.size >= policy.floor_segment_size) continue;
+                if (picked.items.len >= level0_fold_max_records or bytes + info.size > level0_fold_max_bytes) break;
+                try picked.append(self.alloc, info.index);
+                bytes += info.size;
+            };
+            if (picked.items.len < (if (pressure) @as(usize, 2) else level0FoldMinRecords(segment_cap))) {
                 picked.deinit(self.alloc);
                 break :level0 null;
             }
