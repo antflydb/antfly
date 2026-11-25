@@ -850,6 +850,14 @@ expert suite, and the shared host KV suite passed 13 tests. Metal coverage
 here reaches the resident expert stage. The Metal decoder and released
 checkpoint serving path remain open.
 
+At `27d09ee01f`, the released checkpoint passed all four CUDA decoder
+suite tests on Spark GB10. The seed token 42 produced 34,851, 220 and 110,104,
+with peak logits 26.41237, 27.44930 and 24.88801. The suite also checked
+capture through position 130, heterogeneous batching, image prefill and
+speculative rollback. The first three decode intervals were 301.52, 37.99
+and 36.98 ms in this single run. The Mac GPU exercised all 48 Metal visits
+with synthetic weights. The released-checkpoint Metal comparison is pending.
+
 ### Official Gemma 4 E2B QAT serving comparison
 
 The decoder and projector came from Google's E2B QAT Q4_0 GGUF revision
