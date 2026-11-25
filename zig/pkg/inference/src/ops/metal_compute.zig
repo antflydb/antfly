@@ -11959,10 +11959,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (owned.implementation.context != ctx or !acceptsPhysicalImplementation(owned.implementation.table)) return false;
         if (owned.vtable == &DenseFusedRegion.table) return DenseFusedRegion.attests(ctx, owned);
         if (owned.vtable == &TransposedRightDotRegion.table) return TransposedRightDotRegion.attests(ctx, owned);
-        if (owned.vtable != &DenseProjectionRegion.table) return false;
+        if (owned.vtable != &DenseProjectionRegion.table and owned.vtable != &DenseProjectionRegion.cache_row_table) return false;
         const self: *const DenseProjectionRegion = @ptrCast(@alignCast(owned.context));
         if (@as(*anyopaque, @ptrCast(self.compute)) != ctx or self.count < 2 or self.count > 3 or
-            owned.entry_node != self.nodes[0]) return false;
+            owned.entry_node != self.nodes[0] or owned.vtable != self.dispatchTable()) return false;
         const need = owned.requirements;
         if (need.dispatch_workspace.byte_size != self.scratch_bytes or need.dispatch_workspace.host_byte_size != 0 or
             need.preparation_workspace.byte_size != 0 or need.preparation_workspace.host_byte_size != 0) return false;
@@ -12970,7 +12970,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return .completed;
         }
 
-        const table: region.Owned.VTable = .{ .pinned_input = pinnedInput, .matches = matches, .validate = validate, .dispatch = dispatch, .dispatch_qkv_cache_row = dispatchQkvCacheRow, .deinit = @This().deinit };
+        const table: region.Owned.VTable = .{ .pinned_input = pinnedInput, .matches = matches, .validate = validate, .dispatch = dispatch, .deinit = @This().deinit };
+        const cache_row_table: region.Owned.VTable = cache_row: {
+            var result = table;
+            result.dispatch_qkv_cache_row = dispatchQkvCacheRow;
+            break :cache_row result;
+        };
+
+        fn dispatchTable(self: *const @This()) *const region.Owned.VTable {
+            return if (self.count == 3 and self.packed_request == null) &cache_row_table else &table;
+        }
     };
     const DenseRegionReadiness = struct {
         const region = @import("../execution/region_route.zig");
@@ -13673,7 +13682,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 owner.scratch_bytes = try (try pack.layout()).outputBytes(first.operation.linear.rows);
             }
             // Slices point into their stable heap owner, never this call frame.
-            try result.append(request.allocator, .{ .context = owner, .implementation = request.implementation, .key = first_node, .policy_key = request.policy_key, .covered_nodes = owner.nodes[0..count], .input_nodes = owner.inputs[0..owner.input_count], .entry_node = first_node, .requirements = .{ .outputs = owner.outputs[0..count], .dispatch_workspace = .{ .byte_size = owner.scratch_bytes }, .requires_execution_profile = !ordinary, .uncovered = .{} }, .vtable = &DenseProjectionRegion.table });
+            try result.append(request.allocator, .{ .context = owner, .implementation = request.implementation, .key = first_node, .policy_key = request.policy_key, .covered_nodes = owner.nodes[0..count], .input_nodes = owner.inputs[0..owner.input_count], .entry_node = first_node, .requirements = .{ .outputs = owner.outputs[0..count], .dispatch_workspace = .{ .byte_size = owner.scratch_bytes }, .requires_execution_profile = !ordinary, .uncovered = .{} }, .vtable = owner.dispatchTable() });
             transferred = true;
             cursor = member_positions[count - 1] + 1;
         }
