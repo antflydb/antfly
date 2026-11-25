@@ -223,7 +223,7 @@ function render(messages) {
     if (outbound && message.state)
       tag(outboundLabels[message.state] ?? message.state, outboundTone[message.state]);
     if (message.delete_at) tag("Deleted forever in " + daysLeft(message.delete_at) + " days", "warn");
-    if (message.local) tag("Matched by meaning");
+    if (message.local) tag("Matched by meaning", "local");
     if (message.id === selected) button.setAttribute("aria-current", "true");
     button.onclick = guarded(async () => {
       if (!discardDraft()) return;

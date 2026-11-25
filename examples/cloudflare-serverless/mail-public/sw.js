@@ -32,6 +32,7 @@ const SHELL_FILES = [
   "/local-db-worker.js",
   "/manifest.webmanifest",
   "/icon.svg",
+  "/clear.svg",
 ];
 
 self.addEventListener("install", (event) => {
