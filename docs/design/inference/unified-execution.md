@@ -1088,3 +1088,12 @@ The short warm CPU llama.cpp reference measured 467 / 15027 / 1224 /
 Both checkpoints also retrieved the same code on M4 Max Metal at 16,384
 and 131,060 prompt tokens and rejected overflow with the 12-token output
 reservation. These Metal runs qualified context admission and retrieval.
+
+On GB10, the generated 64-row CUDA Flash kernel now also handles one
+physical K/V head. It is selected for the qualified single-head decoder
+beyond 8,192 live keys, and the short MMA route and explicit profiles
+keep their existing contracts. With the regenerated CUDA 13.2 fatbin,
+E2B returned the same code at 16,384 and 131,060 prompt tokens. The
+near-limit request took 33.87 s versus 568.55 s with the original MMA
+route on the same shared Spark. E4B returned the same answer in 55.48 s
+at 131,060 prompt tokens. Both models retained the overflow rejection.

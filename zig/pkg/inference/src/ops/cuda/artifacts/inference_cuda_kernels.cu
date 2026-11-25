@@ -5012,7 +5012,7 @@ template <unsigned KvHeads>
 struct Geometry {
 static constexpr unsigned kHeads = 8u;
 static constexpr unsigned kKvHeads = KvHeads;
-static_assert(kKvHeads == 1u || kKvHeads == 2u, "Only Gemma E2B/E4B geometries are supported");
+static_assert(kKvHeads == 1u || kKvHeads == 2u, "Invalid paged Flash geometry");
 static constexpr unsigned kPageTokens = 16u;
 static constexpr unsigned kQueryTile = kKvHeads == 2u ? 64u : 16u;
 static constexpr unsigned kKeyTile = 16u;
@@ -5143,10 +5143,17 @@ static __device__ bool validate_launch(
                 ? ceil_div_u32(q_seq_len, kQueryTile)
                 : q_seq_len;
             const unsigned expected_threads = Flash ? kThreads : static_cast<unsigned>(HeadDim);
+            bool supported_heads = num_kv_heads == kKvHeads;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200 && __CUDA_ARCH__ < 1300
+            // On GB10 the 64-row schedule accepts either physical KV stride.
+            if constexpr (Flash && kKvHeads == 2u) {
+                supported_heads |= num_kv_heads == 1u;
+            }
+#endif
             if (blockDim.x != expected_threads || blockDim.y != 1u || blockDim.z != 1u ||
                 gridDim.x != kHeads || gridDim.y != expected_grid_y || gridDim.z != 1u) {
                 error = kStatusLaunchGeometry;
-            } else if (batch != 1u || num_heads != kHeads || num_kv_heads != kKvHeads ||
+            } else if (batch != 1u || num_heads != kHeads || !supported_heads ||
                 head_dim != static_cast<unsigned>(HeadDim) ||
                 (kKvHeads == 1u ? (q_seq_len != 512u && q_seq_len != 3u)
                                   : (q_seq_len < 2u || q_seq_len > 8192u)) ||
@@ -5169,7 +5176,7 @@ static __device__ bool validate_launch(
             } else if (error == kStatusOk && (mask_len != 0u || bias_mode != 0u || format != 2u ||
                 value_format != 2u || decode_scalars != nullptr)) {
                 error = kStatusUnsupportedPolicy;
-            } else if (error == kStatusOk && (key_row_bytes != kKvHeads * static_cast<unsigned>(HeadDim) * sizeof(half) ||
+            } else if (error == kStatusOk && (key_row_bytes != num_kv_heads * static_cast<unsigned>(HeadDim) * sizeof(half) ||
                 base_key_row_bytes != key_row_bytes || value_row_bytes != key_row_bytes)) {
                 error = kStatusInvalidStride;
             } else if (error == kStatusOk && (query_position_offset > 0xffffffffu - q_seq_len ||
@@ -5191,7 +5198,7 @@ static __device__ bool validate_launch(
                     const unsigned long long q_elements =
                         static_cast<unsigned long long>(q_seq_len) * kHeads * HeadDim;
                     const unsigned long long kv_elements =
-                        static_cast<unsigned long long>(physical_token_capacity) * kKvHeads * HeadDim;
+                        static_cast<unsigned long long>(physical_token_capacity) * num_kv_heads * HeadDim;
                     const unsigned long long output_elements = q_elements;
                     if (q_elements > 0x7fffffffffffffffull / sizeof(float) ||
                         kv_elements > 0x7fffffffffffffffull / sizeof(half) ||
@@ -5283,7 +5290,7 @@ static __device__ void flash_prefill_body(
                 block_count, page_size_tokens, format, value_format,
                 physical_token_capacity, decode_scalars, shared_error)) return;
         const unsigned tid = threadIdx.x, warp = tid / 32u, lane = tid % 32u;
-        const unsigned head = blockIdx.x, kv_head = head / (kHeads / kKvHeads);
+        const unsigned head = blockIdx.x, kv_head = num_kv_heads == 1u ? 0u : head / (kHeads / 2u);
         const unsigned tile_begin = blockIdx.y * kQueryTile;
         const unsigned valid_rows = min(kQueryTile, q_seq_len - tile_begin);
         const unsigned query_group = warp / 2u;

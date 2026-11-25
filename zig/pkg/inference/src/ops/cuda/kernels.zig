@@ -1485,6 +1485,7 @@ const GqaFlashPrefillRequest = struct {
     kv_position_offset: usize,
     sliding_window: usize,
     total_sequence_len: usize,
+    wide_single_kv: bool = false,
 };
 
 fn gqaFlashPrefillTargetSupported(major: i32, minor: i32, kv_heads: usize) bool {
@@ -1494,7 +1495,9 @@ fn gqaFlashPrefillTargetSupported(major: i32, minor: i32, kv_heads: usize) bool 
 }
 
 fn gqaFlashPrefillEligibility(request: GqaFlashPrefillRequest) GqaFlashPrefillEligibility {
-    if (!gqaFlashPrefillTargetSupported(request.compute_major, request.compute_minor, request.base.num_kv_heads)) {
+    const wide_single_kv = request.wide_single_kv and request.base.num_kv_heads == 1;
+    if (wide_single_kv and (request.compute_major != 12 or request.compute_minor != 1)) return .compute_capability_ineligible;
+    if (!wide_single_kv and !gqaFlashPrefillTargetSupported(request.compute_major, request.compute_minor, request.base.num_kv_heads)) {
         return .compute_capability_ineligible;
     }
     const kv_heads: usize = if (request.base.num_kv_heads == 2) 2 else 1;
@@ -1511,7 +1514,7 @@ fn gqaFlashPrefillEligibility(request: GqaFlashPrefillRequest) GqaFlashPrefillEl
     if (request.base.page_size_tokens != cuda_kernel_renderer.generated_flash_prefill_page_size_tokens) {
         return .page_size_ineligible;
     }
-    const policy: cuda_kernel_renderer.FlashPrefillQueryLengthPolicy = if (kv_heads == 2)
+    const policy: cuda_kernel_renderer.FlashPrefillQueryLengthPolicy = if (kv_heads == 2 or wide_single_kv)
         .paged_f16_q2_to_8192_128k_v2
     else
         .gemma4_q512_or_q3_v1;
@@ -2631,6 +2634,7 @@ pub const KernelModule = struct {
     /// Admitted by a model adapter; all physical/storage/target checks remain
     /// in the shared Flash selector, including explicit rollback profiles.
     grouped_f16_flash_prefill: bool = false,
+    long_single_kv_flash_prefill: bool = false,
     // Resolved once at module load: the score-prework decision runs per layer
     // per decoded token and getenv is a linear scan of environ.
     gqa_score_prework_mode: GeneratedGqaScorePreworkMode = .automatic,
@@ -9806,8 +9810,13 @@ pub const KernelModule = struct {
         );
         const f16_prefill_request = r.eligibility(GqaF16PrefillRequest);
         const f16_prefill_eligibility = gqaF16PrefillEligibility(f16_prefill_request);
+        const wide_single_kv = self.long_single_kv_flash_prefill and self.gqa_prefill_profile == .mma and
+            r.num_kv_heads == 1 and r.kv_seq_len > 8192;
+        const wide_flash = r.num_kv_heads == 2 or wide_single_kv;
+        const flash_prefill_profile: GqaPrefillProfile = if (wide_single_kv) .automatic else self.gqa_prefill_profile;
         const flash_prefill_request = GqaFlashPrefillRequest{
             .base = f16_prefill_request,
+            .wide_single_kv = wide_single_kv,
             .compute_major = ctx.info.compute_major,
             .compute_minor = ctx.info.compute_minor,
             .query_position_offset = r.query_position_offset,
@@ -9821,12 +9830,12 @@ pub const KernelModule = struct {
             self.gqa_prefill_profile != .tiled_f16_exact))
             return error.CudaKernelUnavailable;
         const flash_prefill_function = switch (r.head_dim) {
-            256 => if (r.num_kv_heads == 2) self.gqa_attention_prefill_flash_sm89_e4b_hd256_f32 else self.gqa_attention_prefill_flash_sm89_hd256_f32,
-            512 => if (r.num_kv_heads == 2) self.gqa_attention_prefill_flash_sm89_e4b_hd512_f32 else self.gqa_attention_prefill_flash_sm89_hd512_f32,
+            256 => if (wide_flash) self.gqa_attention_prefill_flash_sm89_e4b_hd256_f32 else self.gqa_attention_prefill_flash_sm89_hd256_f32,
+            512 => if (wide_flash) self.gqa_attention_prefill_flash_sm89_e4b_hd512_f32 else self.gqa_attention_prefill_flash_sm89_hd512_f32,
             else => null,
         };
         const flash_prefill_launch = selectGqaFlashPrefillLaunch(
-            self.gqa_prefill_profile,
+            flash_prefill_profile,
             flash_prefill_eligibility,
             flash_prefill_function != null and (r.num_kv_heads != 2 or self.gqa_prefill_profile != .automatic or self.grouped_f16_flash_prefill),
         );
@@ -9841,7 +9850,7 @@ pub const KernelModule = struct {
         // falls through silently and keeps the historical unset (`off`)
         // launch topology; only the explicit `flash-f16-sm89` profile tags
         // fallback launch kinds for telemetry.
-        if (self.gqa_prefill_profile.selectsFlashF16Sm89() and r.q_seq_len > 1) {
+        if (flash_prefill_profile.selectsFlashF16Sm89() and r.q_seq_len > 1) {
             if (flash_prefill_launch == .prefill_flash_f16_sm89) {
                 function = flash_prefill_function.?;
                 launch_kind = .prefill_flash_f16_sm89;
@@ -9857,7 +9866,7 @@ pub const KernelModule = struct {
             function = (if (r.head_dim == 256) self.gqa_repeat_hd256 else self.gqa_repeat_hd512) orelse
                 return error.CudaKernelUnavailable;
             launch_kind = .prefill_tiled_f16_exact;
-        } else if (self.gqa_prefill_profile != .off and prefill_storage_eligible and prefill_shape_eligible) {
+        } else if (launch_kind != .prefill_flash_f16_sm89 and self.gqa_prefill_profile != .off and prefill_storage_eligible and prefill_shape_eligible) {
             switch (self.gqa_prefill_profile) {
                 .off => unreachable,
                 .fast, .required_fast => {
@@ -10059,8 +10068,8 @@ pub const KernelModule = struct {
             grid_y = try toU32((r.q_seq_len + 15) / 16);
         } else if (launch_kind == .prefill_flash_f16_sm89) {
             const plan = cuda_kernel_renderer.flashPrefillPlanFor(switch (r.head_dim) {
-                256 => if (r.num_kv_heads == 2) .gqa_prefill_flash_sm89_e4b_hd256_swa512_f32 else .gqa_prefill_flash_sm89_hd256_swa512_f32,
-                512 => if (r.num_kv_heads == 2) .gqa_prefill_flash_sm89_e4b_hd512_global_f32 else .gqa_prefill_flash_sm89_hd512_global_f32,
+                256 => if (wide_flash) .gqa_prefill_flash_sm89_e4b_hd256_swa512_f32 else .gqa_prefill_flash_sm89_hd256_swa512_f32,
+                512 => if (wide_flash) .gqa_prefill_flash_sm89_e4b_hd512_global_f32 else .gqa_prefill_flash_sm89_hd512_global_f32,
                 else => unreachable,
             });
             block = @intCast(plan.launch.threads_per_block);
@@ -23113,6 +23122,17 @@ test "E4B Flash selector checks two-head strides and long-context bounds" {
     request.compute_minor = 1;
     request.query_position_offset += 1;
     try std.testing.expect(gqaFlashPrefillEligibility(request) == .query_length_policy_ineligible);
+    request.query_position_offset -= 1;
+    request.base.num_kv_heads = 1;
+    request.base.key_row_bytes = 1024;
+    request.base.base_key_row_bytes = 1024;
+    request.base.value_row_bytes = 1024;
+    try std.testing.expect(gqaFlashPrefillEligibility(request) == .compute_capability_ineligible);
+    request.wide_single_kv = true;
+    try std.testing.expect(gqaFlashPrefillEligibility(request) == .eligible);
+    request.compute_major = 8;
+    request.compute_minor = 9;
+    try std.testing.expect(gqaFlashPrefillEligibility(request) == .compute_capability_ineligible);
 }
 
 test "E4B Flash prefill target gate keeps GB10 qualification narrow" {

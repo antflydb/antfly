@@ -722,7 +722,10 @@ pub fn prepareWithOptions(
             if (automatic_mqa) {
                 if (cuda_compute.kernels.gqa_prefill_profile == .automatic and
                     platform.env.getenv("ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE") == null)
+                {
                     cuda_compute.kernels.gqa_prefill_profile = .mma;
+                    cuda_compute.kernels.long_single_kv_flash_prefill = plan.flash_prefill;
+                }
                 if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX") == null)
                     cuda_compute.tuned_route_gates.lm_head_q8_1_argmax = true;
             }
