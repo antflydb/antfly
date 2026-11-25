@@ -3184,9 +3184,23 @@ pub const Session = struct {
     /// Request-retained decoder banks use the KV quota independently of
     /// transient operator workspace. CPU provider state is physical host KV.
     pub fn admitRetainedState(self: Session, host_metadata_bytes: usize, state_bytes: usize) !RunPermit {
+        return self.admitRetainedStateWithWorkspace(host_metadata_bytes, state_bytes, 0);
+    }
+
+    /// Acquire request state and its concurrent workspace in one admission.
+    pub fn admitRetainedStateWithWorkspace(self: Session, host_scratch_bytes: usize, state_bytes: usize, workspace_bytes: usize) !RunPermit {
         const admission = self.run_admission orelse return self.retainPermit(.{ .session = self, .lease = null });
-        var amounts = memory.AdmissionAmounts{ .host_scratch_bytes = host_metadata_bytes };
-        if (admission.backend_class == .gpu) amounts.backend_kv_bytes = state_bytes else amounts.host_kv_bytes = state_bytes;
+        var amounts = memory.AdmissionAmounts{ .host_scratch_bytes = host_scratch_bytes };
+        switch (admission.backend_class) {
+            .gpu => {
+                amounts.backend_kv_bytes = state_bytes;
+                amounts.backend_scratch_bytes = workspace_bytes;
+            },
+            .cpu => {
+                amounts.host_kv_bytes = state_bytes;
+                amounts.host_scratch_bytes = try addBytes(host_scratch_bytes, workspace_bytes);
+            },
+        }
         return self.retainPermit(.{ .session = self, .lease = try admission.acquireAmounts(amounts) });
     }
 
@@ -6282,6 +6296,33 @@ test "controlled blocked backend expires and admission unwinds" {
     try std.testing.expectError(error.Timeout, permit.runWithControl(&.{}, std.testing.allocator, control));
     permit.deinit();
     try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+test "retained decoder state and workspace admit and retire together" {
+    var controller = memory.AdmissionController{};
+    var session = Session{ .ptr = &controller, .vtable = undefined, .run_admission = .{
+        .controller = &controller,
+        .backend_class = .gpu,
+        .limits = .{ .combined_limit_bytes = 63 },
+        .static_workspace_bytes = 0,
+        .check_live_memory = false,
+    } };
+    if (session.admitRetainedStateWithWorkspace(16, 32, 16)) |unexpected| {
+        var permit = unexpected;
+        permit.deinit();
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
+
+    session.run_admission.?.limits.combined_limit_bytes = 64;
+    var permit = try session.admitRetainedStateWithWorkspace(16, 32, 16);
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{
+        .host_scratch_bytes = 16,
+        .backend_kv_bytes = 32,
+        .backend_scratch_bytes = 16,
+    }, controller.snapshot());
+    permit.deinit();
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
 }
 
 test "run admission credits retained Qwen workspace once and keeps hard limits" {

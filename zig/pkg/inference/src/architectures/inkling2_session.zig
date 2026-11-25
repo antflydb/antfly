@@ -624,11 +624,13 @@ pub const Pipeline = struct {
         const pixels = @as(usize, self.prompt.image_width) * self.prompt.image_height;
         const amount = try decoder.requestMemory(model.model.text, self.context_tokens, self.chunk_rows);
         const draft_kv = if (self.speculate) dspark.Draft.requestKvBytes(self.context_tokens) else 0;
-        var state = try session.admitRetainedState(amount.host, amount.kv + draft_kv);
-        defer state.deinit();
-        var workspace = try session.admitRetainedMedia(pixels * 11, amount.workspace +
-            if (self.prompt.image != null) vision.requestWorkspaceBytes(self.prompt.imageRows(), pixels) else @as(usize, 0));
-        defer workspace.deinit();
+        const image_workspace = if (self.prompt.image != null) vision.requestWorkspaceBytes(self.prompt.imageRows(), pixels) else 0;
+        var admission = try session.admitRetainedStateWithWorkspace(
+            try std.math.add(usize, amount.host, try std.math.mul(usize, pixels, 11)),
+            try std.math.add(usize, amount.kv, draft_kv),
+            try std.math.add(usize, amount.workspace, image_workspace),
+        );
+        defer admission.deinit();
 
         var request: decoder.Request = undefined;
         const draft: ?*dspark.Draft = if (self.speculate) &model.draft.? else null;
