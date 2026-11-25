@@ -4955,6 +4955,8 @@ test "enrichment cancellation recovery reserves one replay pass without resettin
     // its durable deadline and retry state intact, even if replay never runs.
     var ordinary = failed;
     ordinary.worker_failed = false;
+    ordinary.consecutive_retry_count = 1;
+    ordinary.retry_failure_count = 1;
     ordinary.retrying = true;
     ordinary.next_retry_at_ms = 1234;
     try enrichment_state.saveRuntimeStatus(erased, scope_name, ordinary);
@@ -4984,6 +4986,17 @@ test "enrichment cancellation recovery reserves one replay pass without resettin
     try std.testing.expectEqualDeep(reopened, try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name));
     try runtime.reloadDurableState();
     try std.testing.expect(runtime.worker_failed and !runtime.boundary_recovery_pending);
+
+    // A different writer can supersede the failed snapshot before this
+    // detached owner obtains the replay lease. Its newer retry must win.
+    try enrichment_state.saveRuntimeStatus(erased, scope_name, failed);
+    try runtime.reloadDurableState();
+    try std.testing.expect(runtime.boundary_recovery_pending);
+    try enrichment_state.saveRuntimeStatus(erased, scope_name, ordinary);
+    const superseding = try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name);
+    try std.testing.expectError(error.EnrichmentSourceChanged, saveRuntimeStatusWithRetry(&runtime, .boundary_recovery));
+    try std.testing.expect(!runtime.boundary_recovery_pending and runtime.retrying and !runtime.worker_failed);
+    try std.testing.expectEqualDeep(superseding, try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name));
     try std.testing.expect(boundaryFailureReadmission(failed, 14, 6) == null);
     var unrelated = failed;
     unrelated.retry_failure_fingerprint = 0;
@@ -51374,6 +51387,24 @@ test "model aware media URL fields fetch bounded binary input and preserve plain
     try std.testing.expect(source.input.?.binary.data.ptr == sibling.input.?.binary.data.ptr);
     try std.testing.expectEqual(@as(usize, 1), app.calls.load(.monotonic));
     try std.testing.expectError(error.Timeout, extractModelChunkSource(a, config, raw, request, .{ .io = std.testing.io, .deadline_ns = 0 }));
+    {
+        const metadata: @import("inference_chunker").types.ModelMetadata = .{
+            .descriptor = .{ .ordinal = 0, .coordinates = .{ .kind = .video, .start_ns = 0, .end_ns = 100 }, .input_tokens = 1 },
+            .inference_id = "plan:0",
+            .plan_id = "plan",
+            .source_fingerprint = "source",
+            .source_version = "v1",
+            .model = "model",
+            .model_identity = "model",
+            .model_revision = "v1",
+            .task_type = "RETRIEVAL_DOCUMENT",
+            .dimensions = 2,
+            .policy = .{},
+        };
+        runtime.active_provider_guard.deadline_ns = 0;
+        defer runtime.active_provider_guard = .{};
+        try std.testing.expectError(error.EnrichmentWaitTimeout, replayModelChunkVector(&runtime, a, request, &metadata, "body"));
+    }
     try std.testing.expectEqual(@as(usize, 1), app.calls.load(.monotonic));
     var text = try extractModelChunkSource(a, config, "{\"body\":\"a real passage\"}", request, null);
     defer text.deinit(a);
