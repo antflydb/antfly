@@ -53268,7 +53268,66 @@ test "Metal paged relative attention resolves shuffled pages with sink and gate"
         for (output[head * 128 ..][0..128]) |value| try std.testing.expectEqual(bits, value);
 }
 
-test "Metal paged relative attention reads KV staged in the same frame" {
+/// Runs the projected attention operands through the causal K/V stencils and
+/// paged GQA. The request owns the frame and publishes history and the append
+/// only after every visit has completed.
+pub const CausalPagedRelativeBf16 = struct {
+    const metadata = @import("../runtime/kv/hybrid_paged.zig");
+
+    pub const QueryInputs = struct {
+        query: *const MetalTensor,
+        relative: ?*const MetalTensor,
+        page_ids: *const MetalTensor,
+        sinks: *const MetalTensor,
+        gates: *const MetalTensor,
+    };
+
+    pub const Operand = struct {
+        input: CausalDepthwise4Bf16.Inputs,
+        staged: *MetalTensor,
+        next_history: *MetalTensor,
+    };
+
+    pub fn encode(
+        runtime: *RawMetalDecodeRuntime,
+        append: *metadata.Append,
+        group: metadata.Group,
+        query: PagedRelativeBf16Attention.geometry.Query,
+        input: QueryInputs,
+        planes: PagedRelativeBf16Attention.Planes,
+        key: Operand,
+        value: Operand,
+        convolution: CausalDepthwise4Bf16,
+        scratch: *MetalTensor,
+        output: *MetalTensor,
+    ) !void {
+        const range = try append.stagedRange(group);
+        if (query.start != append.sequence.committed_tokens or query.rows != range.visible_end - query.start or
+            convolution.rows != query.rows or query.kv_heads > 64 or convolution.channels != query.kv_heads * 128 or
+            convolution.valid_history != @min(3, query.start))
+            return error.InvalidShape;
+        const attention: PagedRelativeBf16Attention = .{ .query = query, .range = range };
+        try convolution.encode(runtime, key.input, key.staged, key.next_history);
+        var value_convolution = convolution;
+        value_convolution.clip = 0;
+        try value_convolution.encode(runtime, value.input, value.staged, value.next_history);
+        try PagedRelativeBf16Attention.stageRows(runtime, append, group, query.kv_heads, .{
+            .key = key.staged,
+            .value = value.staged,
+        }, planes);
+        try attention.encode(runtime, .{
+            .query = input.query,
+            .keys = planes.key,
+            .values = planes.value,
+            .relative = input.relative,
+            .page_ids = input.page_ids,
+            .sinks = input.sinks,
+            .gates = input.gates,
+        }, scratch, output);
+    }
+};
+
+test "Metal paged relative attention reads convolved KV staged in the same frame" {
     if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
     const a = std.testing.allocator;
     const metadata = @import("../runtime/kv/hybrid_paged.zig");
@@ -53303,21 +53362,21 @@ test "Metal paged relative attention reads KV staged in the same frame" {
     defer provider.deinitOwned();
     const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
     const attention: PagedRelativeBf16Attention = .{
-        .query = .{ .rows = 1, .start = 2, .q_heads = 1, .kv_heads = 1, .relative_extent = 0, .score_scale = 1 },
+        .query = .{ .rows = 2, .start = 1, .q_heads = 1, .kv_heads = 1, .relative_extent = 0, .score_scale = 1 },
         .range = try append.stagedRange(.full),
     };
     const zeros: [512]u16 = @splat(0);
     var values: [256]u16 = undefined;
     @memset(values[0..128], 0x4000);
     @memset(values[128..], 0x4080);
-    const dtypes: [9]metal_tensor.DType = .{ .i16, .i16, .i16, .i16, .i16, .i32, .i16, .f32, .i16 };
-    const sizes = [9]i32{ 128, 512, 512, 256, 256, 2, 1, try attention.scratchElements(), 128 };
+    const dtypes: [15]metal_tensor.DType = .{ .i16, .i16, .i16, .i16, .i16, .i32, .i16, .f32, .i16, .i16, .i16, .i16, .i16, .i16, .i16 };
+    const sizes = [15]i32{ 256, 512, 512, 256, 256, 2, 2, try attention.scratchElements(), 256, 512, 384, 256, 256, 384, 384 };
     const payloads: [7][]const u8 = .{
-        std.mem.sliceAsBytes(zeros[0..128]), std.mem.asBytes(&zeros),  std.mem.asBytes(&zeros),
+        std.mem.sliceAsBytes(zeros[0..256]), std.mem.asBytes(&zeros),  std.mem.asBytes(&zeros),
         std.mem.sliceAsBytes(zeros[0..256]), std.mem.asBytes(&values), std.mem.asBytes(&ids),
-        std.mem.sliceAsBytes(zeros[0..1]),
+        std.mem.sliceAsBytes(zeros[0..2]),
     };
-    var tensors: [9]MetalTensor = undefined;
+    var tensors: [15]MetalTensor = undefined;
     var count: usize = 0;
     defer for (tensors[0..count]) |*tensor| tensor.deinit();
     for (&tensors, dtypes, sizes, 0..) |*tensor, dtype, size, index| {
@@ -53326,17 +53385,31 @@ test "Metal paged relative attention reads KV staged in the same frame" {
         if (index < payloads.len) try tensor.uploadBytes(payloads[index]);
     }
 
+    try tensors[9].uploadBytes(std.mem.asBytes(&zeros));
+    try tensors[10].uploadBytes(std.mem.sliceAsBytes(zeros[0..384]));
     try beginFrame(runtime);
     errdefer cancelFrame(runtime) catch {};
-    try PagedRelativeBf16Attention.stageRows(runtime, &append, .full, 1, .{ .key = &tensors[3], .value = &tensors[4] }, .{ .key = &tensors[1], .value = &tensors[2] });
-    try attention.encode(runtime, .{
+    try CausalPagedRelativeBf16.encode(runtime, &append, .full, attention.query, .{
         .query = &tensors[0],
-        .keys = &tensors[1],
-        .values = &tensors[2],
         .relative = null,
         .page_ids = &tensors[5],
         .sinks = &tensors[6],
         .gates = &tensors[0],
+    }, .{ .key = &tensors[1], .value = &tensors[2] }, .{
+        .input = .{ .values = &tensors[3], .weight = &tensors[9], .history = &tensors[10], .dynamic_taps = null },
+        .staged = &tensors[11],
+        .next_history = &tensors[13],
+    }, .{
+        .input = .{ .values = &tensors[4], .weight = &tensors[9], .history = &tensors[10], .dynamic_taps = null },
+        .staged = &tensors[12],
+        .next_history = &tensors[14],
+    }, .{
+        .channels = 128,
+        .rows = 2,
+        .valid_history = 1,
+        .output_scale = 1,
+        .clip = 1,
+        .epsilon = 0.000001,
     }, &tensors[7], &tensors[8]);
     try std.testing.expectEqual(@as(usize, 1), sequence.committed_tokens);
     try submitFrame(runtime);
@@ -53344,9 +53417,11 @@ test "Metal paged relative attention reads KV staged in the same frame" {
     append.commit();
     try std.testing.expectEqual(@as(usize, 3), sequence.committed_tokens);
 
-    var output: [128]u16 = undefined;
+    var output: [256]u16 = undefined;
     try tensors[8].downloadBytesInto(std.mem.asBytes(&output));
-    for (output) |value| try std.testing.expectEqual(@as(u16, 0x3f40), value);
+    // Visible values are [0, 1] then [0, 1, 1], plus one zero-valued sink.
+    for (output[0..128]) |value| try std.testing.expectEqual(@as(u16, 0x3e2b), value);
+    for (output[128..]) |value| try std.testing.expectEqual(@as(u16, 0x3e80), value);
 }
 
 pub const CausalDepthwise4Bf16 = struct {
