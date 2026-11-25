@@ -352,8 +352,9 @@ const ManualRuntime = struct {
     fn adoptDurableProgress(self: *ManualRuntime, name: []const u8, sequence: u64) bool {
         for (self.workers.items) |*worker| {
             if (!std.mem.eql(u8, worker.name, name)) continue;
-            if (worker.applied_sequence > sequence) return false;
-            worker.applied_sequence = sequence;
+            // Inline publications and no-work advances can leave the local
+            // worker ahead of the authoritative persisted replay watermark.
+            worker.applied_sequence = @max(worker.applied_sequence, sequence);
             worker.target_sequence = @max(worker.target_sequence, sequence);
             return true;
         }

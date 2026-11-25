@@ -61,36 +61,24 @@ Today: append records, fsync, write the next frontier slot, fsync. Recovery
 replays only to the newest frontier, so the second fsync is what makes an
 acknowledged commit recoverable.
 
-New: append records and write the next frontier slot, then fsync once. A
-crash inside that fsync can leave the new slot durable and some of its
-records not. Recovery accepts the newest slot only when every record between
-the older slot's end and the newest slot's end decodes, checksums, carries
-the newest slot's generation, and runs exactly to its sequence; otherwise it
-uses the older slot, which the previous fsync made durable. The commit
-acknowledged only after its fsync returned, so nothing acknowledged is lost.
-A commit whose previous slot is in another log generation (rotation, reset)
-keeps the two-fsync order, so verification only ever spans one contiguous
-range.
+Protected redo syncs the group's WAL records, writes the next sealed
+frontier, then syncs that frontier before acknowledging the group. All
+writers in the group share those barriers. Live readers use the shared
+region's durable watermark, published after both barriers. Cold recovery
+uses the sealed frontier and reports corruption if the WAL cannot reach it.
 
-Every production read of the disk frontier (cold recovery, reader seals,
-writer tail resync, folds, crashed-writer recovery) goes through
-`NativeFile.readDurableFrontier`, which runs that verification; the slot
-carries `combined` and its log segment under its checksum. A failed fsync,
-or a failed write of the slot itself, writes the previous frontier back into
-the staged slot, so the commit fails like a plain record sync failure and
-the next one proceeds; only a failure of that write leaves the frontier
-uncertain. Commits after a rotation, reset or frontier baseline keep the
-two-fsync order. In Debug, 82 of 6,314 commits of an 8-thread full-text run
-took the two-fsync path.
-
-Trade-off: damage to the newest commit's records is indistinguishable from
-a crash inside its fsync, so cold recovery drops that commit instead of
-failing as corrupt (SQLite's WAL truncates at a bad frame the same way).
-Damage below the older slot still fails recovery.
-
-Readers must not treat the slot as a visibility signal before the fsync: the
-shared region's durable watermark, published after the fsync, stays the live
-signal; the slot is read only by cold opens, which run the verification.
+PR #1797 tried writing the record and frontier before a single barrier.
+That protocol could persist a frontier whose WAL range was lost during the
+barrier. The same on-disk state could result from damage after acknowledgment.
+The writer now emits only sealed frontiers. New protected files and vacuum
+replacement generations carry a sealed-redo format bit. Old binaries reject
+those generations when decoding their headers. An existing file can continue
+in its original format until a vacuum publishes a fenced generation. Legacy
+combined slots remain readable where that bit is absent, including during
+the vacuum's source read. Publishing a private imported generation first
+syncs the verified WAL cut, then writes sealed frontier copies and the
+format bit before renaming the image. A new sealed commit establishes a
+stronger acknowledgment boundary even before the vacuum.
 
 ### 3. Indexed writes overlap their durability wait (done)
 
@@ -201,7 +189,7 @@ removes.
 | change | state |
 |---|---|
 | 1. full_index fast path, merging at the cap | committed |
-| 2. one fsync per commit | committed |
+| 2. protected redo barriers | two barriers per group |
 | 3. indexed writes overlap their wait (group commit) | committed |
 | 4a. level-0 encoding: CRC shortcut, profile split | committed |
 | 4b. `SegmentView` interface | committed |

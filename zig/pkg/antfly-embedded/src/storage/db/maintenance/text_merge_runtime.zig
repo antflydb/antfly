@@ -659,7 +659,10 @@ const PlatformTextMergeRuntime = struct {
                 return false;
             },
         };
-        maybe_task = self.index_manager.beginTextMergeTask() catch |err| {
+        self.mutex.lockUncancelable(io);
+        const producer_waiting = self.producer_admission_head != null;
+        self.mutex.unlock(io);
+        maybe_task = self.index_manager.beginTextMergeTaskWithPressure(self.config.max_pending_segments, producer_waiting) catch |err| {
             self.apply_mutex.unlockExclusive();
             return err;
         };
@@ -806,9 +809,9 @@ const PlatformTextMergeRuntime = struct {
         var rounds: usize = 0;
         while (rounds < 4) : (rounds += 1) {
             lockApplyShared(self.apply_mutex);
-            const largest = self.index_manager.textMergeStatsSnapshot().max_active_segments_per_index;
+            const at_cap = self.index_manager.textMergeAtSegmentCap(self.config.max_pending_segments);
             self.apply_mutex.unlockShared();
-            if (largest < self.config.max_pending_segments) return;
+            if (!at_cap) return;
             const merged = self.runOnce() catch return;
             if (!merged) return;
         }

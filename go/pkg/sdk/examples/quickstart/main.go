@@ -137,7 +137,7 @@ func main() {
 	fmt.Printf("image: %+v\n", results)
 
 	generator, err := antfly.NewGeneratorConfig(antfly.AntflyGeneratorConfig{
-		Model:     "ggml-org/gemma-4-E4B-it-GGUF",
+		Model:     "google/gemma-4-E2B-it-qat-q4_0-gguf",
 		MaxTokens: 128,
 	})
 	if err != nil {

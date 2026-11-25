@@ -711,10 +711,10 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         defer self.mutex.unlock(io);
         for (self.workers.items) |worker| {
             if (!std.mem.eql(u8, worker.name, name)) continue;
-            if (worker.dispatch_active or worker.catch_up_open or worker.paused or
-                worker.applied_sequence > sequence or worker.persisted_sequence > sequence) return false;
-            worker.applied_sequence = sequence;
-            worker.persisted_sequence = sequence;
+            if (worker.dispatch_active or worker.catch_up_open or worker.paused)
+                return worker.applied_sequence >= sequence;
+            worker.applied_sequence = @max(worker.applied_sequence, sequence);
+            worker.persisted_sequence = @max(worker.persisted_sequence, sequence);
             worker.target_sequence = @max(worker.target_sequence, sequence);
             return true;
         }

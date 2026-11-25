@@ -3855,15 +3855,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         S.ownerField(self, "core").*.index_manager,
                         materialized_derived_batch.?,
                         index_ref,
-                        // `max_pending_segments` is where a writer starts merging
-                        // (`mergeAtCapBeforeWrite`); while a merge already in flight
-                        // elsewhere catches up, writes stay inline up to twice it.
-                        // Without writer merges nothing bounds that overshoot, so
-                        // the cap stays where merging starts.
-                        if (S.ownerField(self, "text_merge_runtime").*) |runtime|
-                            (if (!runtime.config.enabled) 0 else if (runtime.config.manual_producer_assistance) runtime.config.max_pending_segments *| 2 else runtime.config.max_pending_segments)
-                        else
-                            0,
+                        S.ownerField(self, "text_merge_runtime").*,
                     ) catch {
                         prepare_span.end();
                         continue;
@@ -4913,23 +4905,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // cleanup. DDL may already own the lane and be waiting for them.
             if (indexed_lane_yielded) {
                 const hook = opts.writer_lane_release_before_wait.?;
-                // Nothing below owes the write's own runtime anything when
-                // every index served it inline and no replication, child
-                // range or split work follows: it may finish on a newer one.
-                const finished_at_commit = sync_targets.served_inline and sync_targets.all_indexes.len == 0 and
+                // A fully inline publication can finish its bookkeeping on the
+                // pinned runtime without checking out the writer lane again.
+                // Visibility work that can write must run under the lease.
+                const finish_without_lane = sync_targets.served_inline and sync_targets.all_indexes.len == 0 and
                     sync_targets.full_text_indexes.len == 0 and split_shadow_ticket == null and
                     opts.document_child_range_dispatcher == null and opts.transaction_resolution == null and
                     durable_replication_batch_payload == null and durable_replication_replay_payload == null and
                     deferred_replication_gates.gate_count == 0 and
                     !(queued_index_publication and pending_identity_visibility_summary != null) and
-                    // The caller's graph endpoint cleanup still runs on this
-                    // write's runtime (`finishBatchGraphEndpointCleanup`).
+                    S.ownerField(self, "local_execution").*.replication_write_gate == null and
+                    S.ownerField(self, "enrichment_runtime").* == null and
+                    !S.ownerField(self, "core").*.index_manager.hasGroupSources() and
+                    !S.ownerField(self, "core").*.index_manager.leann_replication and
+                    (effective_req.sync_level != .full_index or S.ownerField(self, "text_merge_runtime").* != null) and
                     !S.ownerField(self, "core").*.hasGraphIndexes();
-                // Such a write is done: its installs ran (or just ran above),
-                // and what follows is a no-op for it. Taking the lane back only
-                // to return it made every write cross the lane twice.
-                if (finished_at_commit) return;
-                _ = try hook.resume_after_indexed_wait.?(hook.ptr, false);
+                if (!finish_without_lane) _ = try hook.resume_after_indexed_wait.?(hook.ptr, false);
             }
             if (queued_index_publication and pending_identity_visibility_summary != null) {
                 try self.lockApplyForPortableRuntime();
