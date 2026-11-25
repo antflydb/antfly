@@ -352,6 +352,32 @@ test "Whisper CUDA checkpoint transcribes English with reusable model state" {
     const model = try manager.loadFromDir(std.mem.span(model_dir));
     try std.testing.expectEqual(backends.BackendType.cuda, model.session.backend());
     const cfg = session_factory.getWhisperConfig(model.session).?;
+    {
+        const whisper = @import("architectures/whisper.zig");
+        const hidden = try a.alloc(f32, 2 * cfg.d_model);
+        defer a.free(hidden);
+        @memset(hidden, 0);
+        var decoder = (try session_factory.whisperNativeDecoder(model.session, a, .{ .io = std.testing.io, .native_call_policy = .in_process }, hidden, 2)) orelse return error.TestUnexpectedResult;
+        defer decoder.deinit();
+        var backend = decoder.cb.backend;
+        var prepared = try whisper.PreparedDecoderWeights.init(&backend, a, cfg, true);
+        defer prepared.deinit();
+        const CancelBetweenLayers = struct {
+            fn check(raw: ?*anyopaque) !void {
+                const count: *usize = @ptrCast(@alignCast(raw.?));
+                count.* += 1;
+                if (count.* == 3) return error.Cancelled;
+            }
+        };
+        var count: usize = 0;
+        backend.execution_control = .{ .ptr = &count, .check_fn = CancelBetweenLayers.check, .native_call_policy = .in_process };
+        try std.testing.expectError(error.Cancelled, whisper.DecodeCache.initPrepared(&backend, a, cfg, decoder.encoder_hidden, 2, &prepared, null));
+        try std.testing.expectEqual(cfg.decoder_layers, prepared.weights.layers.len);
+        backend.execution_control = null;
+        var retry = try whisper.DecodeCache.initPrepared(&backend, a, cfg, decoder.encoder_hidden, 2, &prepared, null);
+        defer retry.deinit(&backend);
+        try std.testing.expectEqual(cfg.decoder_layers, retry.layers.len);
+    }
     const prompt = &model.whisper_prompt_cache.?;
     var scratch: [3]whisper_prompt.ForcedDecoderId = undefined;
     const forced = try prompt.resolve(&scratch, "en");
