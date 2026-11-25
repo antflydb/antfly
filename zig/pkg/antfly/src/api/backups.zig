@@ -10631,13 +10631,13 @@ fn validateNewestCurrentGoBackupAttempt(
     return decoded.manifest;
 }
 
-fn readCurrentGoManifestForRestoreAdmission(
+fn validateCurrentGoRestoreAdmission(
     alloc: std.mem.Allocator,
     io: std.Io,
     location: *BackupLocation,
-    backup_id: []const u8,
+    selected: *const ClusterBackupManifest,
     cache: ?*ArtifactVerificationCache,
-) !ClusterBackupManifest {
+) !void {
     var before = (try readCurrentGoClusterBackupAttemptHead(
         alloc,
         io,
@@ -10658,12 +10658,6 @@ fn readCurrentGoManifestForRestoreAdmission(
     defer newest_parsed.deinit();
     const newest = &newest_parsed.parsed.value;
 
-    // A Zig producer may have started while the migration head was being
-    // validated. Never mix both repository protocols in one admission.
-    var intermediate_head = try readClusterBackupAttemptHead(alloc, io, location);
-    defer if (intermediate_head) |*head| head.deinit();
-    if (intermediate_head != null) return error.BackupRepositoryBusy;
-
     var newest_manifest = try validateNewestCurrentGoBackupAttempt(
         alloc,
         io,
@@ -10671,24 +10665,10 @@ fn readCurrentGoManifestForRestoreAdmission(
         newest,
         cache,
     );
-    var decoded: DecodedClusterManifest = if (std.mem.eql(
-        u8,
-        backup_id,
-        newest.backup_id,
-    ))
-        .{ .manifest = newest_manifest, .encoding = .go_portable_v2 }
-    else blk: {
-        newest_manifest.deinit(alloc);
-        break :blk try readClusterManifestFromLocationDecoded(
-            alloc,
-            io,
-            location,
-            backup_id,
-        );
-    };
-    errdefer decoded.manifest.deinit(alloc);
-    if (decoded.encoding != .go_portable_v2)
-        return error.IncompleteClusterBackup;
+    defer newest_manifest.deinit(alloc);
+    if (std.mem.eql(u8, selected.backup_id, newest.backup_id) and
+        !std.mem.eql(u8, &selected.persisted_sha256.?, &newest_manifest.persisted_sha256.?))
+        return error.BackupRepositoryBusy;
 
     var after = (try readCurrentGoClusterBackupAttemptHead(
         alloc,
@@ -10696,14 +10676,8 @@ fn readCurrentGoManifestForRestoreAdmission(
         location,
     )) orelse return error.BackupRepositoryBusy;
     defer after.deinit();
-    var final_head = try readClusterBackupAttemptHead(alloc, io, location);
-    defer if (final_head) |*head| head.deinit();
-    if (final_head != null or
-        !currentGoClusterBackupAttemptHeadsEqual(&before.value, &after.value))
-    {
+    if (!currentGoClusterBackupAttemptHeadsEqual(&before.value, &after.value))
         return error.BackupRepositoryBusy;
-    }
-    return decoded.manifest;
 }
 
 /// Admit the requested backup using its published aggregate and artifacts.
@@ -10736,18 +10710,17 @@ pub fn readClusterManifestForRestoreAdmissionWithCache(
         // rules. Preserve them for backups written by that producer.
         var attempt: usize = 0;
         while (attempt < 4) : (attempt += 1) {
-            const manifest = readCurrentGoManifestForRestoreAdmission(
+            validateCurrentGoRestoreAdmission(
                 alloc,
                 io,
                 location,
-                backup_id,
+                &decoded.manifest,
                 cache,
             ) catch |err| switch (err) {
                 error.BackupRepositoryBusy => continue,
                 else => return err,
             };
-            decoded.manifest.deinit(alloc);
-            return manifest;
+            return decoded.manifest;
         }
         return error.BackupRepositoryBusy;
     }
@@ -18683,6 +18656,13 @@ test "restore admission validates the stable newest current Go attempt" {
     try writeClusterManifestToLocationWithIo(alloc, io, &location, &zig_manifest);
     var admitted_zig = try readClusterManifestForRestoreAdmission(alloc, io, &location, zig_backup_id);
     defer admitted_zig.deinit(alloc);
+
+    // A Zig writer can publish to the same repository. Its attempt head
+    // must not prevent validating the Go producer's separate commit record.
+    try writeClusterBackupAttemptHead(alloc, io, &location, "zig-attempt");
+    var admitted_go_in_mixed_repository = try readClusterManifestForRestoreAdmission(alloc, io, &location, go_backup_id);
+    defer admitted_go_in_mixed_repository.deinit(alloc);
+    try std.testing.expectEqualStrings(go_backup_id, admitted_go_in_mixed_repository.backup_id);
 
     const newer_attempt_body =
         "{\"version\":1,\"attempt_id\":\"afba-newer\",\"backup_id\":\"newer-cluster\",\"created_at\":\"2026-07-25T12:00:00.3Z\",\"format\":\"portable\",\"expected_table_count\":1,\"table_names\":[\"events\"],\"metadata_ids\":[\"table-b2aa693bbed89e7783245e7a6b468282bff526817c1285fd6bb3b8707b3187b7\"],\"artifact_names\":[\"newer-cluster-1.afb\"]}";

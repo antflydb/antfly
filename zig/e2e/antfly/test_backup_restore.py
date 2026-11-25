@@ -2999,6 +2999,12 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
         # The first table's manifest remains valid. Its missing artifact
         # must not strand the active checkpoint and block the healthy table.
         (repository / manifests[sibling]["shards"][0]["snapshot_path"]).unlink()
+        head = json.loads(
+            (repository / ".antfly-backup-attempt-head.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        (repository / ".antfly-incomplete" / f'{head["attempt_id"]}.json').unlink()
 
     restore_response = None
     restore_coordinator_url = None
