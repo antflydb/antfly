@@ -7128,7 +7128,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("completion-recovery-maintenance-test", "Verify retained completion scheduling and preserve legacy maintenance").dependOn(&addFilteredTestRunArtifact(b, completion_recovery_maintenance_tests).step);
     b.step("antfly-local-transaction-recovery-test", "Run local transaction recovery regressions").dependOn(&addFilteredTestRunArtifact(b, local_recovery_tests).step);
-    const server_db_filters = [_][]const u8{ "storage.server_db_integration_test.", "storage.server_transaction_recovery.", "storage.artifact_upload_recovery.", "storage.server_coordinated_ttl.", "storage.server_query_visibility.", "storage.server_document_child_range.", "storage.server_group_metadata." };
+    const server_db_filters = [_][]const u8{ "storage.server_db_integration_test.", "storage.server_transaction_recovery.", "storage.artifact_upload_recovery.", "storage.server_coordinated_ttl.", "storage.server_query_visibility.", "storage.server_document_child_range.", "storage.server_group_metadata.", "api.context_host." };
     const server_db_tests = b.addTest(.{
         .root_module = server_db_test_mod,
         .filters = &server_db_filters,
@@ -9129,6 +9129,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.coalesced_job_admission.",
             "storage.db.dense_publication_admission.",
             "storage.db.local_runtime_owner.",
+            "storage.db.context_api.",
+            "storage.db.context_host_json.",
             "storage.db.embedding_activity_cache.",
             "storage.db.managed_admission_owner.",
             "storage.db.result_collectors.",

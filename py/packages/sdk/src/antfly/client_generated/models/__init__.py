@@ -61,7 +61,15 @@ from .api_key_with_secret import ApiKeyWithSecret
 from .apple_generator_config import AppleGeneratorConfig
 from .apple_generator_config_provider import AppleGeneratorConfigProvider
 from .apple_stt_config import AppleSTTConfig
+from .artifact_dependencies import ArtifactDependencies
+from .artifact_dependencies_freshness_type_0 import ArtifactDependenciesFreshnessType0
+from .artifact_dependencies_sources_item import ArtifactDependenciesSourcesItem
+from .artifact_dependencies_sources_item_kind import ArtifactDependenciesSourcesItemKind
+from .artifact_dependencies_sources_item_tracking import ArtifactDependenciesSourcesItemTracking
+from .artifact_dependencies_versions_item import ArtifactDependenciesVersionsItem
 from .artifact_index_source import ArtifactIndexSource
+from .artifact_not_current import ArtifactNotCurrent
+from .artifact_not_current_error import ArtifactNotCurrentError
 from .artifact_repair_kind import ArtifactRepairKind
 from .artifact_repair_reason import ArtifactRepairReason
 from .artifact_sources_capability_state import ArtifactSourcesCapabilityState
@@ -364,6 +372,12 @@ from .dense_native_storage_phase import DenseNativeStoragePhase
 from .dense_repair_backpressure_error import DenseRepairBackpressureError
 from .dense_repair_backpressure_error_code import DenseRepairBackpressureErrorCode
 from .dense_vector_publication_status import DenseVectorPublicationStatus
+from .dependency_impact_request import DependencyImpactRequest
+from .dependency_impact_request_traversal import DependencyImpactRequestTraversal
+from .dependency_impact_response import DependencyImpactResponse
+from .dependency_impact_response_input import DependencyImpactResponseInput
+from .dependency_impact_row import DependencyImpactRow
+from .dependency_impact_row_via_item import DependencyImpactRowViaItem
 from .derived_coverage_observation_incomplete_reason import DerivedCoverageObservationIncompleteReason
 from .derived_coverage_policy import DerivedCoveragePolicy
 from .derived_coverage_status import DerivedCoverageStatus
@@ -473,13 +487,34 @@ from .embeddings_index_stats_index_type import EmbeddingsIndexStatsIndexType
 from .embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
 from .embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
 from .enrichment_config import EnrichmentConfig
+from .enrichment_config_context_sources import EnrichmentConfigContextSources
 from .enrichment_config_embedding_input import EnrichmentConfigEmbeddingInput
+from .enrichment_context_cypher import EnrichmentContextCypher
+from .enrichment_context_cypher_parameters import EnrichmentContextCypherParameters
+from .enrichment_context_document import EnrichmentContextDocument
+from .enrichment_context_query import EnrichmentContextQuery
+from .enrichment_context_query_embeddings import EnrichmentContextQueryEmbeddings
+from .enrichment_context_query_exclusion_query import EnrichmentContextQueryExclusionQuery
+from .enrichment_context_query_filter_query import EnrichmentContextQueryFilterQuery
+from .enrichment_context_query_full_text_search import EnrichmentContextQueryFullTextSearch
+from .enrichment_context_query_graph_queries import EnrichmentContextQueryGraphQueries
+from .enrichment_context_query_merge_config import EnrichmentContextQueryMergeConfig
+from .enrichment_context_query_order_by import EnrichmentContextQueryOrderBy
+from .enrichment_context_query_order_by_order import EnrichmentContextQueryOrderByOrder
+from .enrichment_context_query_reranker import EnrichmentContextQueryReranker
+from .enrichment_context_query_vector import EnrichmentContextQueryVector
+from .enrichment_context_source import EnrichmentContextSource
+from .enrichment_context_source_overflow import EnrichmentContextSourceOverflow
+from .enrichment_context_source_tracking import EnrichmentContextSourceTracking
+from .enrichment_context_sql import EnrichmentContextSql
 from .enrichment_kind import EnrichmentKind
 from .enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
 from .enrichment_neighbor_context_config_direction import EnrichmentNeighborContextConfigDirection
 from .enrichment_producer_config import EnrichmentProducerConfig
 from .enrichment_producer_config_config_type_2 import EnrichmentProducerConfigConfigType2
 from .enrichment_producer_config_type import EnrichmentProducerConfigType
+from .enrichment_refresh_config import EnrichmentRefreshConfig
+from .enrichment_refresh_config_mode import EnrichmentRefreshConfigMode
 from .enrichment_runtime_status import EnrichmentRuntimeStatus
 from .enrichment_runtime_status_active_phase import EnrichmentRuntimeStatusActivePhase
 from .enrichment_runtime_status_stall_reason import EnrichmentRuntimeStatusStallReason
@@ -748,6 +783,7 @@ from .geo_shape import GeoShape
 from .geo_shape_geometry import GeoShapeGeometry
 from .geo_shape_geometry_relation import GeoShapeGeometryRelation
 from .geo_shape_query import GeoShapeQuery
+from .get_artifact_dependencies_freshness import GetArtifactDependenciesFreshness
 from .get_current_user_response_200 import GetCurrentUserResponse200
 from .get_current_user_response_200_metadata_type_0 import GetCurrentUserResponse200MetadataType0
 from .get_document_artifact_manifest_detail import GetDocumentArtifactManifestDetail
@@ -2211,6 +2247,16 @@ from .provenance_origin_trace_type_0_kind import ProvenanceOriginTraceType0Kind
 from .prune_stats import PruneStats
 from .pruner import Pruner
 from .put_artifact_enrichment_response_201 import PutArtifactEnrichmentResponse201
+from .put_artifact_enrichment_response_201_context_sources import PutArtifactEnrichmentResponse201ContextSources
+from .put_artifact_enrichment_response_201_context_sources_additional_property import (
+    PutArtifactEnrichmentResponse201ContextSourcesAdditionalProperty,
+)
+from .put_artifact_enrichment_response_201_context_sources_additional_property_kind import (
+    PutArtifactEnrichmentResponse201ContextSourcesAdditionalPropertyKind,
+)
+from .put_artifact_enrichment_response_201_context_sources_additional_property_tracking import (
+    PutArtifactEnrichmentResponse201ContextSourcesAdditionalPropertyTracking,
+)
 from .put_namespace_table_privacy_response_403 import PutNamespaceTablePrivacyResponse403
 from .put_namespace_table_privacy_response_412 import PutNamespaceTablePrivacyResponse412
 from .put_namespace_table_privacy_response_422 import PutNamespaceTablePrivacyResponse422
@@ -2856,7 +2902,15 @@ __all__ = (
     "AppleGeneratorConfig",
     "AppleGeneratorConfigProvider",
     "AppleSTTConfig",
+    "ArtifactDependencies",
+    "ArtifactDependenciesFreshnessType0",
+    "ArtifactDependenciesSourcesItem",
+    "ArtifactDependenciesSourcesItemKind",
+    "ArtifactDependenciesSourcesItemTracking",
+    "ArtifactDependenciesVersionsItem",
     "ArtifactIndexSource",
+    "ArtifactNotCurrent",
+    "ArtifactNotCurrentError",
     "ArtifactRepairKind",
     "ArtifactRepairReason",
     "ArtifactSourcesCapabilityState",
@@ -3159,6 +3213,12 @@ __all__ = (
     "DenseRepairBackpressureError",
     "DenseRepairBackpressureErrorCode",
     "DenseVectorPublicationStatus",
+    "DependencyImpactRequest",
+    "DependencyImpactRequestTraversal",
+    "DependencyImpactResponse",
+    "DependencyImpactResponseInput",
+    "DependencyImpactRow",
+    "DependencyImpactRowViaItem",
     "DerivedCoverageObservationIncompleteReason",
     "DerivedCoveragePolicy",
     "DerivedCoverageStatus",
@@ -3266,13 +3326,34 @@ __all__ = (
     "EmbeddingType1",
     "EmbeddingType3",
     "EnrichmentConfig",
+    "EnrichmentConfigContextSources",
     "EnrichmentConfigEmbeddingInput",
+    "EnrichmentContextCypher",
+    "EnrichmentContextCypherParameters",
+    "EnrichmentContextDocument",
+    "EnrichmentContextQuery",
+    "EnrichmentContextQueryEmbeddings",
+    "EnrichmentContextQueryExclusionQuery",
+    "EnrichmentContextQueryFilterQuery",
+    "EnrichmentContextQueryFullTextSearch",
+    "EnrichmentContextQueryGraphQueries",
+    "EnrichmentContextQueryMergeConfig",
+    "EnrichmentContextQueryOrderBy",
+    "EnrichmentContextQueryOrderByOrder",
+    "EnrichmentContextQueryReranker",
+    "EnrichmentContextQueryVector",
+    "EnrichmentContextSource",
+    "EnrichmentContextSourceOverflow",
+    "EnrichmentContextSourceTracking",
+    "EnrichmentContextSql",
     "EnrichmentKind",
     "EnrichmentNeighborContextConfig",
     "EnrichmentNeighborContextConfigDirection",
     "EnrichmentProducerConfig",
     "EnrichmentProducerConfigConfigType2",
     "EnrichmentProducerConfigType",
+    "EnrichmentRefreshConfig",
+    "EnrichmentRefreshConfigMode",
     "EnrichmentRuntimeStatus",
     "EnrichmentRuntimeStatusActivePhase",
     "EnrichmentRuntimeStatusStallReason",
@@ -3535,6 +3616,7 @@ __all__ = (
     "GeoShapeGeometry",
     "GeoShapeGeometryRelation",
     "GeoShapeQuery",
+    "GetArtifactDependenciesFreshness",
     "GetCurrentUserResponse200",
     "GetCurrentUserResponse200MetadataType0",
     "GetDocumentArtifactManifestDetail",
@@ -4782,6 +4864,10 @@ __all__ = (
     "Pruner",
     "PruneStats",
     "PutArtifactEnrichmentResponse201",
+    "PutArtifactEnrichmentResponse201ContextSources",
+    "PutArtifactEnrichmentResponse201ContextSourcesAdditionalProperty",
+    "PutArtifactEnrichmentResponse201ContextSourcesAdditionalPropertyKind",
+    "PutArtifactEnrichmentResponse201ContextSourcesAdditionalPropertyTracking",
     "PutNamespaceTablePrivacyResponse403",
     "PutNamespaceTablePrivacyResponse412",
     "PutNamespaceTablePrivacyResponse422",

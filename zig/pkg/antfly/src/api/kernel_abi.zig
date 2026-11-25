@@ -17,6 +17,7 @@
 //! Keep this file free of production imports so both codegen units agree on one
 //! ABI definition without pulling either implementation across the boundary.
 
+const std = @import("std");
 const error_abi = @import("antfly_runtime_abi").error_abi;
 const http_abi = @import("antfly_runtime_abi").http_abi;
 pub const memory_abi = @import("runtime_memory_abi");
@@ -221,6 +222,19 @@ pub const Capability = struct {
     pub const inference_admission_stats: u64 = 1 << 4;
     pub const internal_service_ingress: u64 = 1 << 5;
     pub const lake_stream_owner: u64 = 1 << 6;
+    pub const context_statement: u64 = 1 << 7;
+};
+
+/// A bound Cypher or SQL context request run as its sealed principal. The result
+/// is allocated with `allocator` and owned by the caller.
+pub const ContextStatementInput = struct {
+    allocator: std.mem.Allocator,
+    owner_table_id: u64,
+    request: []const u8,
+};
+
+pub const ContextStatementOutput = struct {
+    result: []u8 = &.{},
 };
 
 /// The sole discovery point for the API-kernel ABI. Keeping the table itself
@@ -260,6 +274,7 @@ pub const FunctionTable = extern struct {
     authorize_sql_lock: *const fn (*const CallContext) callconv(.c) Status,
     drain_sql_connections: *const fn (*const CallContext) callconv(.c) Status,
     lake_stream_owner_options: *const fn (*const CallContext) callconv(.c) Status,
+    context_statement: *const fn (*const CallContext) callconv(.c) Status,
 };
 
 pub fn validContext(comptime T: type, version: u32, struct_size: u32) bool {
@@ -281,7 +296,8 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
     const known = Capability.core |
         Capability.route_manifest |
         Capability.inference_admission_stats |
-        Capability.internal_service_ingress | Capability.lake_stream_owner;
+        Capability.internal_service_ingress | Capability.lake_stream_owner |
+        Capability.context_statement;
     if (required_capabilities & ~known != 0) return null;
     var required = functionTableFieldEnd("capabilities");
     if (required_capabilities & Capability.core != 0)
@@ -294,11 +310,12 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
         required = @max(required, functionTableFieldEnd("handler_authorize_internal_service"));
     if (required_capabilities & Capability.lake_stream_owner != 0)
         required = @max(required, functionTableFieldEnd("lake_stream_owner_options"));
+    if (required_capabilities & Capability.context_statement != 0)
+        required = @max(required, functionTableFieldEnd("context_statement"));
     return required;
 }
 
 test "API kernel control contexts retain C layout" {
-    const std = @import("std");
     try std.testing.expectEqual(.@"extern", @typeInfo(CreateContext).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(CallContext).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(HandlerCreateContext).@"struct".layout);
@@ -313,7 +330,6 @@ test "API kernel control contexts retain C layout" {
 }
 
 test "API kernel ABI rejects mismatched context and function-table prefixes" {
-    const std = @import("std");
     try std.testing.expect(validContext(CallContext, abi_version, @sizeOf(CallContext)));
     try std.testing.expect(!validContext(CallContext, abi_version - 1, @sizeOf(CallContext)));
     try std.testing.expect(!validContext(CallContext, 29, @sizeOf(CallContext)));
@@ -347,7 +363,6 @@ test "API kernel ABI rejects mismatched context and function-table prefixes" {
 }
 
 test "API imported runtime capability struct retains versioned C layout" {
-    const std = @import("std");
     try std.testing.expectEqual(.@"extern", @typeInfo(RuntimeIoBorrows).@"struct".layout);
     try std.testing.expect(validContext(RuntimeIoBorrows, abi_version, @sizeOf(RuntimeIoBorrows)));
     try std.testing.expect(!validContext(RuntimeIoBorrows, abi_version - 1, @sizeOf(RuntimeIoBorrows)));

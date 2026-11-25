@@ -395,6 +395,11 @@ pub const TableApi = struct {
         InferenceEndpointAccessDenied,
         ModelNotFound,
         AmbiguousModelIdentifier,
+        Forbidden,
+        InvalidContextSources,
+        ContextSourceTableUnavailable,
+        ContextSourceFeedbackCycle,
+        ContextSourceRequiresSnapshot,
         InternalFailure,
     };
 
@@ -2708,6 +2713,11 @@ pub fn handlePutArtifactEnrichment(
         error.AmbiguousModelIdentifier => return .{ .status = 409, .body = try alloc.dupe(u8, "{\"error\":\"ambiguous_model\",\"message\":\"model selection matches multiple installed artifacts; specify a variant and revision\",\"retryable\":false}"), .json = true },
         error.InferenceEndpointAccessDenied => return .{ .status = 400, .body = try alloc.dupe(u8, inference_endpoint_access_denied_message) },
         error.InvalidEnrichmentRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported artifact enrichment configuration") },
+        error.Forbidden => return .{ .status = 403, .body = try alloc.dupe(u8, "{\"error\":\"forbidden\",\"message\":\"the declaring principal may not read a context source (missing read permission, or a row filter on a document source, a ranked graph operation, or the text/vector shorthands)\",\"retryable\":false}"), .json = true },
+        error.InvalidContextSources => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"invalid_context_sources\",\"message\":\"context_sources declaration is not supported\",\"retryable\":false}"), .json = true },
+        error.ContextSourceTableUnavailable => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"context_source_table_not_found\",\"message\":\"a context source names a table that does not exist\",\"retryable\":false}"), .json = true },
+        error.ContextSourceFeedbackCycle => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"context_source_cycle\",\"message\":\"context sources would form a generated-input cycle\",\"retryable\":false}"), .json = true },
+        error.ContextSourceRequiresSnapshot => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"context_source_requires_snapshot\",\"message\":\"a query with ranking clauses (full_text_search, semantic_search, embeddings, indexes, merge_config, reranker, exclusion_query, graph_queries, limit, or the text/vector shorthands) is a snapshot: remove tracking: live, or remove the ranking clause to keep the source live\",\"retryable\":false}"), .json = true },
         error.MissingEmbeddingArtifactEnrichment => return .{ .status = 400, .body = try alloc.dupe(u8, "embedding index source has no matching embedding enrichment") },
         error.MissingEmbeddingArtifactProducer => return .{ .status = 400, .body = try alloc.dupe(u8, "embedding enrichment has no producer configuration") },
         error.InvalidEmbeddingArtifactProducer => return .{ .status = 400, .body = try alloc.dupe(u8, "embedding enrichment producer is not runnable") },
@@ -2720,7 +2730,20 @@ pub fn handlePutArtifactEnrichment(
             .retryable = false,
         }, .{}), .json = true },
     };
-    return .{ .status = 201, .body = try alloc.dupe(u8, "{}") };
+    return .{ .status = 201, .body = try putEnrichmentResponseAlloc(alloc, body), .json = true };
+}
+
+/// Registration response. With `context_sources`, reports each source's
+/// effective tracking (and what made a snapshot one), so a ranking clause
+/// can never silently turn a live source into a snapshot.
+fn putEnrichmentResponseAlloc(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return alloc.dupe(u8, "{}");
+    defer parsed.deinit();
+    if (parsed.value != .object) return alloc.dupe(u8, "{}");
+    const sources = parsed.value.object.get("context_sources") orelse return alloc.dupe(u8, "{}");
+    const summary = try @import("antfly_local_sources").storage_db_enrichment_context_sources.trackingSummaryJsonAlloc(alloc, sources);
+    defer alloc.free(summary);
+    return std.fmt.allocPrint(alloc, "{{\"context_sources\":{s}}}", .{summary});
 }
 
 pub fn handleDeleteArtifactEnrichment(

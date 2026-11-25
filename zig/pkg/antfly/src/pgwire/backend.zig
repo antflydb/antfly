@@ -315,7 +315,7 @@ pub const Result = struct {
     transaction_id: ?[32]u8 = null,
     /// Optional zero-copy owner for native result arenas. Released before the
     /// enclosing caller arena; its allocations still use the caller's budget.
-    owner: ?struct { context: *anyopaque, release: *const fn (*anyopaque) void } = null,
+    owner: ?ResultOwner = null,
 
     pub fn deinit(self: *Result) void {
         if (self.owner) |owner| owner.release(owner.context);
@@ -537,12 +537,16 @@ pub const ReplicationStream = struct {
         return Boundary.callRemote("feedback", self.boundary_dispatch, self.feedback, .{ self.context, a, request, value });
     }
 };
+/// Releases a backend-owned result arena. Named so native ABI layout ids,
+/// which hash field type names, are stable across compilations.
+pub const ResultOwner = struct { context: *anyopaque, release: *const fn (*anyopaque) void };
+
 pub const ReplicationChunk = struct { start_lsn: pgoutput.Lsn, bytes: []const u8 };
 pub const ReplicationPoll = struct {
     end_lsn: pgoutput.Lsn,
     chunk: ?ReplicationChunk = null,
     chunks: []const ReplicationChunk = &.{},
-    owner: ?struct { context: *anyopaque, release: *const fn (*anyopaque) void } = null,
+    owner: ?ResultOwner = null,
     pub fn deinit(self: *@This()) void {
         if (self.owner) |owner| owner.release(owner.context);
         self.* = undefined;

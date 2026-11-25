@@ -272,6 +272,12 @@ fn partition(b: *std.Build, executable: *std.Build.Step.Compile) ?*std.Build.Ste
         .root_module = root,
         .filters = tests.filters,
         .max_rss = partition_max_rss,
+        // The partition compiles the same sources as its consumer, so it must
+        // use the same backend: on ELF that is LLVM, because the self-hosted
+        // x86 backend cannot lower the 128-bit atomics in Lite's shared lock
+        // region ("genSetReg called with a value larger than dst_reg").
+        .use_llvm = tests.use_llvm orelse executable.use_llvm orelse
+            @import("../embedded/source_owner.zig").llvmBackend(tests.root_module.resolved_target.?.result),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     partitions.put(b.allocator, tests, artifact) catch @panic("OOM");

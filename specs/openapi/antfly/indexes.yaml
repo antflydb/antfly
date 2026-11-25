@@ -1413,6 +1413,14 @@ components:
         neighbor_context:
           $ref: "#/components/schemas/EnrichmentNeighborContextConfig"
           description: "Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator, extractor, or decision); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission."
+        context_sources:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/EnrichmentContextSource"
+          maxProperties: 16
+          description: "Named cross-document context consumed by this asset producer, rendered as a canonical `{\"context\":{<name>:...}}` block appended to the producer input and folded into its skip state. Changes to consumed inputs (projected fields, query membership, insertion of a first match, deletion, TTL expiry, or a missing optional document becoming present) invalidate and rebuild the artifact; unrelated rows and unconsumed fields do not. Only valid on asset enrichments whose producer consumes prompt text. Supported by embedded runtimes (single-table and multi-table Lite) and by distributed tables, where context sources are declared through the artifact enrichment endpoint (not inline at table creation) and admission resolves table names and rejects cross-table generated-input cycles. Context reads execute as the declaring principal: it must be able to read every source table, and its row filter on each is conjoined into query sources (filters, traversals, and ranked queries) at declaration (document sources, ranked graph operations, and the `text`/`vector` shorthands are refused where a row filter applies). Re-declare the enrichment to re-capture changed policies."
+        refresh:
+          $ref: "#/components/schemas/EnrichmentRefreshConfig"
         execution:
           $ref: "#/components/schemas/ExecutionPolicy"
           description: "Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity."
@@ -1488,6 +1496,191 @@ components:
           maximum: 128
           default: 8
           description: Earlier segments available for context and the maximum later segments invalidated at each affected position of an original source change. A move invalidates the old and new neighborhoods independently; recomputed outputs never extend either interval.
+    EnrichmentContextSource:
+      type: object
+      additionalProperties: false
+      required: [fields]
+      description: "One named context source: exactly one of `document` (a referenced row) or `query` (a filter, a graph traversal, or a ranked retrieval). `tracking` decides the freshness guarantee. A query whose membership is decided row by row is tracked live: subscriptions invalidate dependents exactly and they can be `current`. That covers a `filter_query` (optionally with a top-N `order_by`) and one plain bounded `graph_queries` traverse (optionally with a `filter_query` narrowing the rows it reaches). A query with any ranking clause (`full_text_search`, `semantic_search`, `embeddings`, `indexes`, `merge_config`, `reranker`, `exclusion_query`, `limit`, `cypher`, `sql`, the `text`/`vector` shorthands, or `graph_queries` beyond one plain bounded traverse) depends on the whole corpus and is a snapshot: its dependents are `unverified` and rebuild on `refresh_interval` or manually. Registration reports each source's effective tracking and, for a snapshot, the clause that made it one."
+      properties:
+        document:
+          $ref: "#/components/schemas/EnrichmentContextDocument"
+        query:
+          $ref: "#/components/schemas/EnrichmentContextQuery"
+        fields:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items:
+            type: string
+            minLength: 1
+          description: "Projected fields consumed by the producer (dotted paths). Only these fields, predicate fields, and the order field participate in fingerprints and invalidation. `_artifacts.<artifact>[.<path>]` reads a row's generated output (asset: parsed JSON or text; chunk: array of chunk payloads; embedding: document vector) and may be used in projections and predicates; when the artifact is regenerated, dependents are invalidated like for a field change. Admission rejects artifacts that depend on the consuming enrichment (directly, through artifact streams, through other context sources, or across tables). Other fields starting with `_` are reserved and rejected."
+        required:
+          type: boolean
+          default: false
+          description: "Document sources only: a missing referenced document fails the rebuild explicitly instead of rendering null."
+        max_documents:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 10000
+          default: 100
+          description: "Query sources: maximum members (for a traversal, rows reached). Exceeding it fails explicitly; with `order_by` it is the declared top-N."
+        max_candidates:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 100000
+          default: 1000
+          description: "Query sources with residual predicates (range, prefix, match, similar) or `order_by`: maximum candidate rows examined after equality filtering. Exceeding it fails explicitly."
+        max_bytes:
+          type: integer
+          format: uint64
+          minimum: 1
+          maximum: 16777216
+          default: 1048576
+          description: "Maximum rendered bytes for this source."
+        overflow:
+          type: string
+          enum: [error]
+          default: error
+        tracking:
+          type: string
+          enum: [live, snapshot]
+          description: "Defaults to the strongest guarantee the source supports: `live` for filters, `snapshot` for ranked queries. `live` registers subscriptions and keeps dependents current. `snapshot` registers nothing: dependents publish with freshness `unverified` (never `current`), rebuild on `refresh_interval` or manually, and `freshness=require_current` dependency reads refuse them. Declaring `live` asserts the guarantee: a query with a ranking clause is then rejected (400 `context_source_requires_snapshot`) instead of silently becoming a snapshot. Declaring `snapshot` opts a filter out of live tracking."
+        refresh_interval:
+          type: string
+          pattern: "^[0-9]+(ms|s|m|h)$"
+          description: "Snapshot sources only: rebuild interval (at least 1s)."
+    EnrichmentContextDocument:
+      type: object
+      additionalProperties: false
+      required: [key_from]
+      properties:
+        table:
+          type: string
+          description: "Table holding the referenced document; omitted means the enrichment's own table. Resolved to an immutable table identity at admission, so renaming or recreating a table cannot retarget the dependency."
+        key_from:
+          type: string
+          description: "JSON pointer into the source document yielding the referenced key."
+    EnrichmentContextQuery:
+      type: object
+      additionalProperties: false
+      description: "A filter (tracked live) or a ranked retrieval (a snapshot). Any ranking clause makes the whole query a public QueryRequest executed by the table's query engine, with `{\"$source\":\"/pointer\"}` bindings anywhere; `limit` (at most 1000) is then the member count, and paging (`offset`, `search_after`, `search_before`), `count`, `aggregations`, and a top-N `order_by` are rejected. Distributed tables refuse `semantic_search` (data servers have no query embedder); pass precomputed vectors in `embeddings` instead."
+      properties:
+        table:
+          type: string
+          description: "Table queried; omitted means the enrichment's own table."
+        filter_query:
+          type: object
+          description: "An Antfly `filter_query` (Query shape): `bool` (`must`/`filter`/`should`/`must_not`/`minimum_should_match`, filter-context semantics), `conjuncts`, `disjuncts` (`min`), `match_all`, `match_none`, and leaves. Leaves evaluated by context resolution itself: `term`/`terms` (equality; at the top of the conjunction they form indexed subscriptions, at most one bound `terms` set), `range` (`gt`/`gte`/`lt`/`lte`), `numeric_range`/`term_range` (`min`/`max`/`inclusive_*`), `prefix`, `match` and `match_phrase` (pinned `antfly.context.simple.v1` analyzer: lowercase ASCII words; `operator` and|or), and `similar` (`{vector, threshold, metric: cosine|dot, dims, model}` over a vector stored in a document field). Every other row-decidable leaf (wildcard, regexp, fuzzy, date and IP ranges, geo, bool fields, `exists`, doc ids, `equals`/`contains`/`matches`) is lowered at admission into the storage engine's per-row filter and evaluated per changed row. Values are literals or typed bindings `{\"$source\":\"/json/pointer\"}` from the source document (in storage-evaluated leaves, string-valued positions only). Corpus-relative text queries (`query_string`, `multi_match`, analyzer-specific `match`) are rejected in a live filter; express them as a ranking clause (`full_text_search`) instead."
+        order_by:
+          type: object
+          additionalProperties: false
+          required: [field]
+          description: "Live filters only: top-N by a field (ties by key); `max_documents` is N. Invalidation tracks the current boundary."
+          properties:
+            field:
+              type: string
+            order:
+              type: string
+              enum: [asc, desc]
+              default: asc
+        full_text_search:
+          type: object
+          description: "Ranking clause: full-text relevance (QueryRequest shape)."
+        semantic_search:
+          description: "Ranking clause: query text embedded for vector search (QueryRequest shape)."
+        embeddings:
+          type: object
+          description: "Ranking clause: precomputed query vectors by index (QueryRequest shape)."
+        indexes:
+          type: array
+          items:
+            type: string
+        merge_config:
+          type: object
+        reranker:
+          type: object
+        exclusion_query:
+          type: object
+        graph_queries:
+          type: object
+          description: "Graph operations (QueryRequest shape). Exactly one `traverse` from the dependent row (or `start: {keys: [{\"$source\": \"/pointer\"}]}`) with only `edge_types`, `direction`, `max_depth` (at most 3), and the context options `max_fanout` (edges per visited node, default 100) and `include_generated` (also follow field-derived and enrichment-generated edges) is a live traversal: dependents watch every visited node's edges and every reached row, members render with depth, edge type, and direction, and `max_documents` bounds the rows reached. A `filter_query` beside it narrows the reached rows and stays live. Anything else (`match`, shortest paths, `edge_filter`, `edge_weight`, `limit`, metrics, deeper traversals, several operations) runs in the query engine as a snapshot."
+        cypher:
+          $ref: "#/components/schemas/EnrichmentContextCypher"
+        sql:
+          $ref: "#/components/schemas/EnrichmentContextSql"
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          description: "Ranked queries: member count."
+        text:
+          description: "Shorthand ranking clause: query text literal or `{\"$source\":\"/pointer\"}`, with `text_field`."
+        text_field:
+          type: string
+        vector:
+          type: object
+          description: "Shorthand ranking clause: `{\"$source\":\"/pointer\"}` to a query vector in the dependent row, with `vector_index`."
+        vector_index:
+          type: string
+        k:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          default: 10
+    EnrichmentContextCypher:
+      type: object
+      additionalProperties: false
+      required: [graph, query]
+      description: "Ranking clause: a read-only Cypher statement against a graph, run as the principal that declared the enrichment (its graph and table permissions and row policies apply; the server binds the declaration to that principal, and revoking the credential stops rebuilds). Members are the nodes of the source `table` the statement returns, anywhere in a row (bare nodes, paths, lists, maps), in result order, each once, up to `limit`, and render as those rows' `fields`. Nodes of other tables are context the statement used, not members. Only `limit` may sit beside it. A Cypher source is a snapshot: a statement's result depends on rows it does not return, so dependents rebuild on `refresh_interval` or manually. Statements that write (`CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`) or `EXPLAIN` are rejected."
+      properties:
+        graph:
+          type: string
+          description: "Graph name (see `/graphs/{graphName}`)."
+        query:
+          type: string
+          maxLength: 16384
+          description: "Cypher statement."
+        parameters:
+          type: object
+          additionalProperties: true
+          description: "Statement parameters; values are literals or `{\"$source\":\"/pointer\"}` bindings from the dependent row."
+    EnrichmentContextSql:
+      type: object
+      additionalProperties: false
+      required: [statement]
+      description: "Ranking clause: a read-only SQL `SELECT` (see `POST /sql`), run as the principal that declared the enrichment (its table permissions and row policies apply; the server binds the declaration to that principal, and revoking the credential stops rebuilds). Members are the rows of the source `table` named by the result's `_id` column (every table exposes its document key as `_id`; alias another key column `AS _id`), in result order, each once, up to `limit`, and render as those rows' `fields`. A result without an `_id` column fails. Results are admitted up to 4096 rows; a larger result fails rather than truncating, so bound it with `LIMIT`. Only `limit` may sit beside it. A SQL source is a snapshot: dependents rebuild on `refresh_interval` or manually. Any statement but a `SELECT` is rejected. Embedded Lite resolves names in its single catalog and rejects `database` and `namespace`."
+      properties:
+        statement:
+          type: string
+          maxLength: 16384
+          description: "One SQL SELECT statement."
+        parameters:
+          type: array
+          maxItems: 1024
+          description: "Positional parameters (`$1`, `$2`, ...); values are literals or `{\"$source\":\"/pointer\"}` bindings from the dependent row."
+          items: {}
+        database:
+          type: string
+          description: "Database used to resolve unqualified names (default `default`)."
+        namespace:
+          type: string
+          description: "Namespace used to resolve unqualified table names (default `public`)."
+    EnrichmentRefreshConfig:
+      type: object
+      additionalProperties: false
+      description: "Rebuild policy for context-source invalidation. Invalidation (stale freshness) is always reported immediately; debounce only coalesces rebuild work."
+      properties:
+        mode:
+          type: string
+          enum: [background, manual]
+          default: background
+          description: "`background` journals rebuilds automatically; `manual` only marks dependents stale (rebuild with the reprocess endpoints)."
+        debounce:
+          type: string
+          pattern: "^[0-9]+(ms|s|m|h)$"
+          description: "Coalescing delay before a background rebuild (for example `2s`)."
     EnrichmentNeighborContextConfig:
       type: object
       additionalProperties: false
