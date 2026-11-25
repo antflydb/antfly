@@ -15,7 +15,7 @@
 
 // native-program:entry antfly_causal_depthwise4_head_norm_d128_bf16
 struct CausalDepthwise4Bf16Params {
-    uint channels, rows, valid_history, dynamic;
+    uint channels, rows, valid_history, dynamic, normalize;
     float output_scale, clip, epsilon;
 };
 
@@ -57,13 +57,15 @@ kernel void antfly_causal_depthwise4_head_norm_d128_bf16(
         }
         const ulong index = ulong(row) * p.channels + channel;
         rounded[i] = float(bfloat((sum + float(input[index])) * p.output_scale));
-        square = fma(rounded[i], rounded[i], square);
+        if (p.normalize) square = fma(rounded[i], rounded[i], square);
+        else output[index] = bfloat(rounded[i]);
         if (row == 0) {
             for (uint j = 0; j < 3; ++j)
                 next_history[ulong(j) * p.channels + channel] =
                     antfly_causal_depthwise4_sample(input, history, int(p.rows) - 3 + int(j), channel, p);
         }
     }
+    if (!p.normalize) return;
     for (uint delta = 16u; delta != 0u; delta >>= 1u)
         square += simd_shuffle_down(square, delta);
     square = simd_broadcast(square, 0);

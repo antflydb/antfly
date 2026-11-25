@@ -12993,7 +12993,7 @@ static NSString *termite_metal_shader_source(void) {
            // tile-codegen:end projection.dense_bf16 family
            // tile-codegen:begin convolution.causal_depthwise4_bf16 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "struct CausalDepthwise4Bf16Params {\n"
-           "    uint channels, rows, valid_history, dynamic;\n"
+           "    uint channels, rows, valid_history, dynamic, normalize;\n"
            "    float output_scale, clip, epsilon;\n"
            "};\n"
            "\n"
@@ -13035,13 +13035,15 @@ static NSString *termite_metal_shader_source(void) {
            "        }\n"
            "        const ulong index = ulong(row) * p.channels + channel;\n"
            "        rounded[i] = float(bfloat((sum + float(input[index])) * p.output_scale));\n"
-           "        square = fma(rounded[i], rounded[i], square);\n"
+           "        if (p.normalize) square = fma(rounded[i], rounded[i], square);\n"
+           "        else output[index] = bfloat(rounded[i]);\n"
            "        if (row == 0) {\n"
            "            for (uint j = 0; j < 3; ++j)\n"
            "                next_history[ulong(j) * p.channels + channel] =\n"
            "                    antfly_causal_depthwise4_sample(input, history, int(p.rows) - 3 + int(j), channel, p);\n"
            "        }\n"
            "    }\n"
+           "    if (!p.normalize) return;\n"
            "    for (uint delta = 16u; delta != 0u; delta >>= 1u)\n"
            "        square += simd_shuffle_down(square, delta);\n"
            "    square = simd_broadcast(square, 0);\n"
@@ -36952,7 +36954,7 @@ int antfly_metal_dispatch_paged_relative_bf16(
 }
 
 typedef struct {
-    uint32_t channels, rows, valid_history, dynamic;
+    uint32_t channels, rows, valid_history, dynamic, normalize;
     float output_scale, clip, epsilon;
 } antfly_metal_causal_depthwise4_bf16_params;
 

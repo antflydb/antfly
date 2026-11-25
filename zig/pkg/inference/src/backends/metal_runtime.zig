@@ -53339,7 +53339,7 @@ pub const CausalPagedRelativeBf16 = struct {
         const range = try append.stagedRange(group);
         if (query.start != append.sequence.committed_tokens or query.rows != range.visible_end - query.start or
             convolution.rows != query.rows or query.kv_heads > 64 or convolution.channels != query.kv_heads * 128 or
-            convolution.valid_history != @min(3, query.start))
+            convolution.valid_history != @min(3, query.start) or !convolution.normalize)
             return error.InvalidShape;
         const attention: PagedRelativeBf16Attention = .{ .query = query, .range = range };
         try convolution.encode(runtime, key.input, key.staged, key.next_history);
@@ -53466,6 +53466,7 @@ pub const CausalDepthwise4Bf16 = struct {
     output_scale: f32,
     clip: f32,
     epsilon: f32,
+    normalize: bool = true,
 
     const Buffer = RoutedBlockScaledProjection.Buffer;
     const Wire = extern struct {
@@ -53473,6 +53474,7 @@ pub const CausalDepthwise4Bf16 = struct {
         rows: u32,
         valid_history: u32,
         dynamic: u32,
+        normalize: u32,
         output_scale: f32,
         clip: f32,
         epsilon: f32,
@@ -53504,6 +53506,7 @@ pub const CausalDepthwise4Bf16 = struct {
             .rows = self.rows,
             .valid_history = self.valid_history,
             .dynamic = @intFromBool(input.dynamic_taps != null),
+            .normalize = @intFromBool(self.normalize),
             .output_scale = self.output_scale,
             .clip = self.clip,
             .epsilon = self.epsilon,
@@ -53543,8 +53546,10 @@ test "Metal causal depthwise stencil normalizes and stages independent BF16 hist
     }
     var output: [256]u16 = undefined;
     var next: [384]u16 = undefined;
-    for ([_]bool{ false, true }) |dynamic| {
+    for ([_]enum { clip, rms, plain }{ .clip, .rms, .plain }) |mode| {
+        const dynamic = mode == .rms;
         const stencil: CausalDepthwise4Bf16 = .{
+            .normalize = mode != .plain,
             .channels = 128,
             .rows = 2,
             .valid_history = 3,
@@ -53564,7 +53569,14 @@ test "Metal causal depthwise stencil normalizes and stages independent BF16 hist
         try waitFrame(runtime);
         try tensors[5].downloadBytesInto(std.mem.asBytes(&output));
         try tensors[6].downloadBytesInto(std.mem.asBytes(&next));
-        for (output) |value| try std.testing.expectEqual(@as(u16, if (dynamic) 0x3f80 else 0xbf00), value);
+        for (output, 0..) |value, index| {
+            const expected: u16 = switch (mode) {
+                .clip => 0xbf00,
+                .rms => 0x3f80,
+                .plain => if (index < 128) 0xc000 else 0xc040,
+            };
+            try std.testing.expectEqual(expected, value);
+        }
         try std.testing.expectEqualSlices(u16, history[256..], next[0..128]);
         try std.testing.expectEqualSlices(u16, &input, next[128..]);
         var previous: [384]u16 = undefined;
