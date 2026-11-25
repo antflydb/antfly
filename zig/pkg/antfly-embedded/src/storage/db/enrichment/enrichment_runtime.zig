@@ -52487,6 +52487,9 @@ test "durable enrichment scoped retry permits healthy targets and restores exact
     defer scheduler.deinit(a);
     runtime.retry_scheduler = &scheduler;
     const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .asset, .index_name = "asset", .doc_key = "bad", .source_field = "body", .sequence = 2 };
+    const primary_key = try documentSourceStoreKeyAlloc(&runtime, request.doc_key);
+    defer a.free(primary_key);
+    try storePutBatchWithRetry(&runtime, &.{.{ .key = primary_key, .value = "{}" }}, &.{});
     const fingerprint = requestFailureFingerprint(request);
     setRetryAfterHintFor(&runtime, fingerprint, 3_600_000);
     var scope = FailureScope{};
@@ -52528,12 +52531,13 @@ test "durable enrichment scoped retry permits healthy targets and restores exact
         // budget even when no scanner-global request identity is installed.
         const http = @import("../../../common/http/http_common.zig");
         const App = struct {
-            fn execute(_: *anyopaque, _: Allocator, _: http.HttpRequest) !http.HttpResponse {
-                return .{ .status = 503 };
+            fn execute(ptr: *anyopaque, _: Allocator, _: http.HttpRequest) !http.HttpResponse {
+                const status: *std.atomic.Value(u16) = @ptrCast(@alignCast(ptr));
+                return .{ .status = status.load(.acquire) };
             }
         };
-        var marker: u8 = 0;
-        var listener = @import("../../../common/http/std_http_listener.zig").StdHttpListener.init(a, .{}, .{ .ptr = &marker, .vtable = &.{ .execute = App.execute } });
+        var status = std.atomic.Value(u16).init(503);
+        var listener = @import("../../../common/http/std_http_listener.zig").StdHttpListener.init(a, .{}, .{ .ptr = &status, .vtable = &.{ .execute = App.execute } });
         defer listener.deinit();
         try listener.start();
         const uri = try listener.baseUri(a);
@@ -52551,9 +52555,6 @@ test "durable enrichment scoped retry permits healthy targets and restores exact
         extraction_scope.enterRequest(request);
         const manifest_key = try internal_keys.artifactNamedPrefixAlloc(a, request.doc_key, "asset", requestArtifactName(request));
         defer a.free(manifest_key);
-        const primary_key = try documentSourceStoreKeyAlloc(&runtime, request.doc_key);
-        defer a.free(primary_key);
-        try storePutBatchWithRetry(&runtime, &.{.{ .key = primary_key, .value = "{}" }}, &.{});
         try processDocumentExtractionAsset(&runtime, request, "{}", uri, "{}", manifest_key, &sources, &window, &extraction_scope);
         const manifest = try storeGetAlloc(&runtime, manifest_key);
         defer a.free(manifest);
@@ -52562,6 +52563,7 @@ test "durable enrichment scoped retry permits healthy targets and restores exact
         try std.testing.expectEqualStrings("error", parsed.value.object.get("route_type").?.string);
         try std.testing.expectEqualStrings("RemoteDocumentFetchFailed", parsed.value.object.get("last_error").?.object.get("code").?.string);
         try storePutBatchWithRetry(&runtime, &.{.{ .key = primary_key, .value = "{\"body\":\"replacement\"}" }}, &.{});
+        status.store(404, .release);
         try std.testing.expectError(error.EnrichmentSourceChanged, processDocumentExtractionAsset(&runtime, request, "{}", uri, "{}", manifest_key, &sources, &window, &extraction_scope));
         const unchanged = try storeGetAlloc(&runtime, manifest_key);
         defer a.free(unchanged);
