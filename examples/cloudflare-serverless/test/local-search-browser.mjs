@@ -142,13 +142,13 @@ try {
   console.log(`[${elapsed()}] opted in, downloaded the model and indexed ${mail.length} messages: ${status}`);
 
   async function deviceSearch(query) {
-    await page.selectOption("#search-where", "device");
+    await page.check("#search-where input[value=device]");
     await page.fill("#search input[name=query]", query);
     // Clear the previous results so the wait below sees this search's rows.
     await page.evaluate(() => document.getElementById("messages").replaceChildren());
     await page.click("#search button");
     await page.waitForFunction(() => document.querySelector("#messages .mail-row .local"), null, { timeout: 120_000 });
-    return page.$$eval("#messages .mail-row strong", (rows) => rows.map((row) => row.textContent));
+    return page.$$eval("#messages .mail-row .subject", (rows) => rows.map((row) => row.textContent));
   }
   const queries = [
     ["how much do I owe the plumber", "Invoice #4471 from Rapid Plumbing"],
@@ -172,8 +172,9 @@ try {
   // Delete moves to Trash: the message leaves this device's copy at once.
   await deviceSearch("how much do I owe the plumber");
   await page.click("#messages .mail-row");
-  await page.waitForSelector("#message button.danger");
-  await page.click("#message button.danger");
+  const trash = page.locator("#message button", { hasText: /^Delete$/ });
+  await trash.waitFor();
+  await trash.click();
   await page.waitForFunction(() => document.getElementById("message").textContent === "Message moved to Trash.");
   let results = await deviceSearch("how much do I owe the plumber");
   assert.ok(!results.includes("Invoice #4471 from Rapid Plumbing"), `trashed message is gone: ${results.join(" / ")}`);

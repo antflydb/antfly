@@ -264,7 +264,7 @@ pub const SegmentShared = struct {
     /// generation sharing this segment observes the same live count without
     /// reading roaring containers or taking the deletion lock.
     deleted_count: std.atomic.Value(u32) = .init(0),
-    deletion_revision: std.atomic.Value(u64) = .init(0),
+    deletion_revision: AtomicU64 = .init(0),
     deletion_lock: std.atomic.Value(u32) = .init(0),
     /// Lazily populated physical column summaries plus an atomically
     /// maintained count of missing values that still belong to live

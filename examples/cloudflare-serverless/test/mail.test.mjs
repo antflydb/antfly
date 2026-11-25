@@ -17,6 +17,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   MailOutbox,
+  displayName,
+  providerMessage,
   parseMail,
   boundedBytes,
   safeFilename,
@@ -85,6 +87,21 @@ test("outbox persists before send, serializes competing deliveries and replays c
   });
   assert.deepEqual(await outbox.pending(), []);
   await assert.rejects(outbox.enqueue(id, { ...mail, text: "different" }), /Conflict/);
+});
+test("outgoing mail carries the sender's display name as { email, name }", async () => {
+  const store = new Store(),
+    outbox = new MailOutbox(store),
+    named = crypto.randomUUID(),
+    unnamed = crypto.randomUUID();
+  await outbox.enqueue(named, { ...mail, from_name: "  Ada\r\nLovelace \u202e " });
+  await outbox.enqueue(unnamed, { ...mail, from_name: "ada@example.test" });
+  const sent = [];
+  for (const id of [named, unnamed]) await outbox.dispatch(id, async (payload) => (sent.push(providerMessage(payload)), { messageId: id }));
+  assert.deepEqual(sent[0].from, { email: "support@example.test", name: "Ada Lovelace" });
+  assert.equal(sent[0].from_name, undefined);
+  assert.equal(sent[1].from, "support@example.test", "an address-shaped name falls back to the bare mailbox");
+  assert.equal(displayName(undefined), "");
+  assert.equal(displayName("x".repeat(300)).length, 100);
 });
 test("ambiguous sends and expired claimed sends are never automatically resubmitted", async () => {
   let now = 1000;

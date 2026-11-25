@@ -77,8 +77,9 @@ for (const name of ["antfly.wasm", "antfly_embedded_wasm_client.mjs", "antfly_em
 
 // 2. Browser inference client and its matching runtime assets.
 if (!process.env.LOCAL_SKIP_WEB) {
-  run("pnpm", ["--dir", "ts", "install", "--frozen-lockfile", "--filter", "@antfly/web..."]);
-  run("pnpm", ["--dir", "ts", "--filter", "@antfly/web", "build"]);
+  // Run from ts/ so Corepack picks the pnpm pinned by ts/package.json.
+  run("pnpm", ["install", "--frozen-lockfile", "--filter", "@antfly/web..."], join(root, "ts"));
+  run("pnpm", ["--filter", "@antfly/web", "build"], join(root, "ts"));
   run("node", [
     join(root, "ts/packages/web/scripts/prepare-runtime.mjs"),
     "--zig-root", join(root, "zig"),
@@ -113,8 +114,11 @@ const bucket = process.env.LOCAL_RUNTIME_BUCKET ?? "antfly-mail-models";
 for (const path of oversized) {
   const key = `${bucket}/local-runtime/${build}/${path}`;
   if (process.argv.includes("--upload")) {
-    const where = process.argv.includes("--local") ? "--local" : "--remote";
-    run("npx", ["wrangler", "r2", "object", "put", key, "--file", join(r2, build, path), where], here);
+    // --local writes where `npm run dev:mail` keeps the app Worker's R2 state.
+    const where = process.argv.includes("--local")
+      ? ["--local", "--persist-to", join(here, "dist/mail-local/app/.wrangler/state")]
+      : ["--remote"];
+    run("npx", ["wrangler", "r2", "object", "put", key, "--file", join(r2, build, path), ...where], here);
   } else console.log(`upload to R2: npx wrangler r2 object put ${key} --file dist/local-r2/${build}/${path} --remote`);
 }
 const base = `/local/${build}/`;

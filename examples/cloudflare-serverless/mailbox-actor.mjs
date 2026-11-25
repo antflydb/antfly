@@ -30,6 +30,7 @@ import {
   digest,
   address,
   safeFilename,
+  providerMessage,
 } from "./mail-core.mjs";
 const sha = (v) => typeof v === "string" && /^[a-f0-9]{64}$/.test(v);
 export class Mailbox extends R2CommitCoordinator {
@@ -434,7 +435,7 @@ export class Mailbox extends R2CommitCoordinator {
   }
   async dispatch(mailbox, id) {
     this.scope(mailbox);
-    return this.outbox.dispatch(id, (mail) => this.env.EMAIL.send(mail));
+    return this.outbox.dispatch(id, (mail) => this.env.EMAIL.send(providerMessage(mail)));
   }
   async outboundList(mailbox, cursor = "") {
     this.scope(mailbox);

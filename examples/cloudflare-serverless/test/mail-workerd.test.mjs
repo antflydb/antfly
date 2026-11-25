@@ -207,7 +207,7 @@ test("actual workerd auth and mailbox isolation, native search, attachments and 
     const outgoing = JSON.parse(await (await mf.getWorker("capture")).takeJSON());
     assert.equal(outgoing.length, 1);
     assert.equal(outgoing[0].to, "customer@example.net");
-    assert.equal(outgoing[0].from, alice.mailbox.address);
+    assert.deepEqual(outgoing[0].from, { email: alice.mailbox.address, name: "alice" });
     assert.equal(outgoing[0].headers["In-Reply-To"], "<invoice@example.net>");
     assert.equal((await json("/mail/outbox/" + outboxId, null, "alice")).state, "accepted");
     assert.equal((await json("/mail/outbox", null, "alice")).messages[0].id, outboxId);
