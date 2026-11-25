@@ -474,7 +474,8 @@ pub const ChatMessageRole = enum {
 /// Cloudflare Workers AI generation. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference.
 pub const CloudflareGeneratorConfig = struct {
     provider: []const u8,
-    account_id: []const u8,
+    /// Required for a direct model. A connection-qualified model takes the account from its connection.
+    account_id: ?[]const u8 = null,
     /// Optional AI Gateway ID, sent through cf-aig-gateway-id.
     gateway_id: ?[]const u8 = null,
     model: []const u8,
@@ -490,7 +491,7 @@ pub const CloudflareGeneratorConfig = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "provider", "provider", false },
-        .{ "account_id", "account_id", false },
+        .{ "account_id", "account_id", true },
         .{ "gateway_id", "gateway_id", true },
         .{ "model", "model", false },
         .{ "api_key", "api_key", true },
@@ -514,8 +515,10 @@ pub const CloudflareGeneratorConfig = struct {
         try jw.beginObject();
         try jw.objectField("provider");
         try jw.write(self.provider);
-        try jw.objectField("account_id");
-        try jw.write(self.account_id);
+        if (self.account_id) |value| {
+            try jw.objectField("account_id");
+            try jw.write(value);
+        }
         if (self.gateway_id) |value| {
             try jw.objectField("gateway_id");
             try jw.write(value);
@@ -869,6 +872,7 @@ pub const ContentPart = union(enum) {
 /// A unified configuration for a generative AI provider.
 pub const GeneratorConfig = struct {
     provider: ?[]const u8 = null,
+    /// Required for a direct model. A connection-qualified model takes the account from its connection.
     account_id: ?[]const u8 = null,
     /// Optional AI Gateway ID, sent through cf-aig-gateway-id.
     gateway_id: ?[]const u8 = null,

@@ -1188,7 +1188,10 @@ pub fn runFromIterator(
         storage_kernel_context = context;
         try storage_kernel_context.?.configureRemoteContent(remote_content);
         try storage_kernel_context.?.configureSecrets(if (secret_store_initialized) &secret_store else null);
-        if (loaded_config) |*cfg| try storage_kernel_context.?.configureInferenceDefaults(cfg.inference.api_url, cfg.inference.api_key);
+        if (loaded_config) |*cfg| {
+            try storage_kernel_context.?.configureInferenceDefaults(cfg.inference.api_url, cfg.inference.api_key);
+            try storage_kernel_context.?.configureInferenceConnections(&cfg.connections);
+        }
     }
 
     var auth_backend: ?LegacyAuthBackend = null;

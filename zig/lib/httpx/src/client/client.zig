@@ -156,6 +156,59 @@ pub const RequestLimit = extern struct {
 };
 
 /// HTTP client configuration.
+fn sameRequestOrigin(expected: Uri, actual: Uri) bool {
+    const scheme = expected.scheme orelse return false;
+    const default_port: u16 = if (std.ascii.eqlIgnoreCase(scheme, "https")) 443 else if (std.ascii.eqlIgnoreCase(scheme, "http")) 80 else return false;
+    return expected.userinfo == null and actual.userinfo == null and
+        std.ascii.eqlIgnoreCase(scheme, actual.scheme orelse return false) and
+        std.ascii.eqlIgnoreCase(expected.host orelse return false, actual.host orelse return false) and
+        (expected.port orelse default_port) == (actual.port orelse default_port);
+}
+
+test "request origin includes scheme, host and effective port" {
+    const expected = try Uri.parse("https://gateway.internal/v1");
+    try std.testing.expect(sameRequestOrigin(expected, try Uri.parse("https://GATEWAY.internal:443/v1/messages")));
+    for ([_][]const u8{
+        "http://gateway.internal:443/v1/messages",
+        "https://gateway.internal:8443/v1/messages",
+        "https://gateway.internal.example/v1/messages",
+        "https://gateway.internal@other.internal/v1/messages",
+        "https://user@gateway.internal/v1/messages",
+    }) |url| try std.testing.expect(!sameRequestOrigin(expected, try Uri.parse(url)));
+}
+
+test "origin-scoped clients require the policy-aware streaming API" {
+    const a = std.testing.allocator;
+    var client = Client.initWithConfig(a, std.testing.io, .{
+        .request_origin = try Uri.parse("https://gateway.internal"),
+    });
+    defer client.deinit();
+    var request = try Request.init(a, .GET, "https://gateway.internal/v1");
+    defer request.deinit();
+    try std.testing.expectError(error.ScopedRequestRequiresWriter, client.requestStream(&request));
+}
+
+test "scoped header policy takes precedence over adapter headers" {
+    const a = std.testing.allocator;
+    var req = try Request.init(a, .GET, "https://gateway.internal/v1");
+    defer req.deinit();
+    var client = Client.initWithConfig(a, std.testing.io, .{ .default_headers = &.{.{ "X-Billing", "operator" }} });
+    defer client.deinit();
+    const adapter: []const [2][]const u8 = &.{.{ "x-billing", "adapter" }};
+    try client.applyRequestHeaders(&req.headers, adapter);
+    try std.testing.expectEqualStrings("adapter", req.headers.get("X-Billing").?);
+    client.config.request_origin = try Uri.parse("https://gateway.internal");
+    try client.applyRequestHeaders(&req.headers, adapter);
+    try std.testing.expectEqualStrings("operator", req.headers.get("X-Billing").?);
+}
+
+pub const AttemptResultObserver = @import("../core/attempt_observer.zig").AttemptResultObserver;
+
+pub const RequestHeaders = struct {
+    context: *const anyopaque,
+    apply: *const fn (*const anyopaque, *Headers) anyerror!void,
+};
+
 pub const ClientConfig = struct {
     request_limit: ?*RequestLimit = null,
     query_request_limit: ?*RequestLimit = null,
@@ -164,11 +217,17 @@ pub const ClientConfig = struct {
     /// Demand still has priority and two reserved slots; ordinary hints decline.
     wait_for_speculative_io: bool = false,
     attempt_observer: ?AttemptObserver = null,
+    attempt_result_observer: ?AttemptResultObserver = null,
     base_url: ?[]const u8 = null,
     timeouts: types.Timeouts = .{},
     retry_policy: types.RetryPolicy = .{},
     redirect_policy: types.RedirectPolicy = .{},
     default_headers: ?[]const [2][]const u8 = null,
+    /// Borrowed policy header source called for each request.
+    request_headers: ?RequestHeaders = null,
+    /// Restrict request helpers to this origin and disable redirects. The
+    /// caller owns the URI backing storage for the lifetime of the client.
+    request_origin: ?Uri = null,
     user_agent: []const u8 = meta.default_user_agent,
     max_response_size: usize = types.default_max_body_size,
     /// Optional body ceiling for 4xx/5xx responses, independent of the request
@@ -227,6 +286,7 @@ pub const ClientConfig = struct {
 pub const RequestOptions = struct {
     delivery_observer: ?Request.DeliveryObserver = null,
     attempt_observer: ?AttemptObserver = null,
+    attempt_result_observer: ?AttemptResultObserver = null,
     /// Recompute this trusted forwarding header immediately before serializing
     /// request headers, after quota, connection setup and send-lock waits.
     /// Retries and redirects consume the same request-wide deadline.
@@ -1259,6 +1319,21 @@ pub const Client = struct {
     }
 
     /// Makes an HTTP request.
+    fn applyRequestHeaders(self: *const Self, headers: *Headers, adapter_headers: ?[]const [2][]const u8) !void {
+        try headers.set(HeaderName.USER_AGENT, self.config.user_agent);
+        // Managed headers are operator policy. Ordinary client defaults
+        // retain their existing precedence below per-request headers.
+        const scoped = self.config.request_origin != null;
+        if (scoped) try setRequestHeaders(headers, adapter_headers);
+        try setRequestHeaders(headers, self.config.default_headers);
+        if (self.config.request_headers) |source| try source.apply(source.context, headers);
+        if (!scoped) try setRequestHeaders(headers, adapter_headers);
+    }
+
+    fn setRequestHeaders(headers: *Headers, entries: ?[]const [2][]const u8) !void {
+        for (entries orelse return) |header| try headers.set(header[0], header[1]);
+    }
+
     pub fn request(self: *Self, method: types.Method, url: []const u8, reqOpts: RequestOptions) !Response {
         const deadline_ms = requestDeadlineMs(self.io, reqOpts.timeout_ms orelse self.config.timeouts.request_ms);
         var lease = try self.request_gate.tryAcquire(self.io);
@@ -1327,26 +1402,18 @@ pub const Client = struct {
 
         var req = try Request.init(self.allocator, method, full_url);
         defer req.deinit();
+        if (self.config.request_origin) |origin| {
+            if (!sameRequestOrigin(origin, req.uri)) return error.RequestOriginMismatch;
+        }
         req.max_response_size = reqOpts.max_response_size;
         req.max_retries = reqOpts.max_retries;
         req.replay_safe = reqOpts.replay_safe;
         req.attempt_observer = reqOpts.attempt_observer orelse self.config.attempt_observer;
+        req.attempt_result_observer = reqOpts.attempt_result_observer orelse self.config.attempt_result_observer;
         req.remaining_timeout_header = reqOpts.remaining_timeout_header;
         req.delivery_observer = reqOpts.delivery_observer;
 
-        try req.headers.set(HeaderName.USER_AGENT, self.config.user_agent);
-
-        if (self.config.default_headers) |hdrs| {
-            for (hdrs) |h| {
-                try req.headers.set(h[0], h[1]);
-            }
-        }
-
-        if (reqOpts.headers) |hdrs| {
-            for (hdrs) |h| {
-                try req.headers.set(h[0], h[1]);
-            }
-        }
+        try self.applyRequestHeaders(&req.headers, reqOpts.headers);
 
         if (shouldSendConnectionClose(self.config) and !req.headers.contains(HeaderName.CONNECTION)) {
             try req.headers.set(HeaderName.CONNECTION, "close");
@@ -1407,7 +1474,7 @@ pub const Client = struct {
             }
         }
 
-        const should_follow = reqOpts.body_stream == null and (reqOpts.follow_redirects orelse
+        const should_follow = self.config.request_origin == null and reqOpts.body_stream == null and (reqOpts.follow_redirects orelse
             self.config.redirect_policy.follow_redirects);
         if (should_follow and response.isRedirect()) {
             if (depth >= self.config.redirect_policy.max_redirects) {
@@ -1457,26 +1524,18 @@ pub const Client = struct {
 
         var req = try Request.init(self.allocator, method, full_url);
         defer req.deinit();
+        if (self.config.request_origin) |origin| {
+            if (!sameRequestOrigin(origin, req.uri)) return error.RequestOriginMismatch;
+        }
         req.max_response_size = reqOpts.max_response_size;
         req.max_retries = reqOpts.max_retries;
         req.replay_safe = reqOpts.replay_safe;
         req.attempt_observer = reqOpts.attempt_observer orelse self.config.attempt_observer;
+        req.attempt_result_observer = reqOpts.attempt_result_observer orelse self.config.attempt_result_observer;
         req.remaining_timeout_header = reqOpts.remaining_timeout_header;
         req.delivery_observer = reqOpts.delivery_observer;
 
-        try req.headers.set(HeaderName.USER_AGENT, self.config.user_agent);
-
-        if (self.config.default_headers) |hdrs| {
-            for (hdrs) |h| {
-                try req.headers.set(h[0], h[1]);
-            }
-        }
-
-        if (reqOpts.headers) |hdrs| {
-            for (hdrs) |h| {
-                try req.headers.set(h[0], h[1]);
-            }
-        }
+        try self.applyRequestHeaders(&req.headers, reqOpts.headers);
 
         if (shouldSendConnectionClose(self.config) and !req.headers.contains(HeaderName.CONNECTION)) {
             try req.headers.set(HeaderName.CONNECTION, "close");
@@ -1539,7 +1598,7 @@ pub const Client = struct {
             }
         }
 
-        const should_follow = reqOpts.body_stream == null and (reqOpts.follow_redirects orelse
+        const should_follow = self.config.request_origin == null and reqOpts.body_stream == null and (reqOpts.follow_redirects orelse
             self.config.redirect_policy.follow_redirects);
         if (should_follow and response.isRedirect()) {
             if (depth >= self.config.redirect_policy.max_redirects) {
@@ -2164,6 +2223,19 @@ pub const Client = struct {
         return err != error.ResponseTooLarge;
     }
 
+    fn observeAttemptResult(self: *Self, req: *Request, started: ?i96, result: ?*const Response, err: ?anyerror) void {
+        if (req.attempt_result_observer) |sink| {
+            const elapsed = Io.Clock.awake.now(self.io).nanoseconds -| started.?;
+            if (req.attempt_report_request == null) {
+                var nonce: [16]u8 = undefined;
+                self.io.random(&nonce);
+                req.attempt_report_request = std.mem.readInt(u128, &nonce, .little);
+            }
+            req.attempt_report_number +|= 1;
+            sink.record(sink.context, .{ .request = req.attempt_report_request.?, .number = req.attempt_report_number }, @intCast(std.math.clamp(elapsed, 0, std.math.maxInt(u64))), result, err);
+        }
+    }
+
     fn executeRequestOnce(self: *Self, req: *Request, timeout_override_ms: ?u64, deadline_ms: ?i64, interrupt: *RequestInterrupt) !Response {
         const observer = req.attempt_observer;
         if (observer) |hook| try hook.before(hook.ptr, .{
@@ -2174,11 +2246,14 @@ pub const Client = struct {
             .body_bytes = req.bodyLen(),
             .output_tokens = hook.output_tokens,
         });
+        const started = if (req.attempt_result_observer != null) Io.Clock.awake.now(self.io).nanoseconds else null;
         var response = self.executeRequestOnceUnobserved(req, timeout_override_ms, deadline_ms, interrupt) catch |err| {
+            self.observeAttemptResult(req, started, null, err);
             if (observer) |hook| hook.after(hook.ptr, null);
             return err;
         };
         if (observer) |hook| hook.after(hook.ptr, &response);
+        self.observeAttemptResult(req, started, &response, null);
         return response;
     }
 
@@ -2309,11 +2384,14 @@ pub const Client = struct {
             .body_bytes = req.bodyLen(),
             .output_tokens = hook.output_tokens,
         });
+        const started = if (req.attempt_result_observer != null) Io.Clock.awake.now(self.io).nanoseconds else null;
         var response = self.executeRequestToWriterOnceUnobserved(req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx, interrupt) catch |err| {
+            self.observeAttemptResult(req, started, null, err);
             if (req.attempt_observer) |hook| hook.after(hook.ptr, null);
             return err;
         };
         if (req.attempt_observer) |hook| hook.after(hook.ptr, &response);
+        self.observeAttemptResult(req, started, &response, null);
         return response;
     }
 
@@ -3212,6 +3290,10 @@ pub const Client = struct {
     /// body reader. The caller reads DATA frames as they arrive without
     /// waiting for END_STREAM. Requires multiplexed mode (recv_running=true).
     pub fn requestStream(self: *Self, req: *Request) !H2StreamResponse {
+        // This low-level API takes a fully constructed request and bypasses
+        // request policy and attempt reporting. Scoped callers must use the
+        // policy-aware streaming API.
+        if (self.config.request_origin != null) return error.ScopedRequestRequiresWriter;
         if (req.body_stream != null) return error.StreamingRequestRequiresWriter;
         const host = req.uri.host orelse return error.InvalidUri;
         const is_tls = req.uri.isTls();
@@ -4624,6 +4706,17 @@ test "DNS retry recovers idempotent GET and HEAD without external DNS" {
     var vtable = io.vtable.*;
     vtable.netLookup = DnsRetryFixture.lookup;
     const fault_io: Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    const Attempts = struct {
+        entries: [3]AttemptResultObserver.Attempt = undefined,
+        count: usize = 0,
+
+        fn record(raw: *anyopaque, attempt: AttemptResultObserver.Attempt, _: u64, _: ?*const Response, _: ?anyerror) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.count < self.entries.len) self.entries[self.count] = attempt;
+            self.count += 1;
+        }
+    };
+    var previous_request: ?u128 = null;
     for ([_]types.Method{ .GET, .HEAD }) |method| {
         DnsRetryFixture.reset(2, error.NameServerFailure);
         var server = try TestServer.start(std.testing.allocator, io, &.{.{ .method = method, .path = "/", .respond = .{ .body = "ok" } }});
@@ -4632,8 +4725,10 @@ test "DNS retry recovers idempotent GET and HEAD without external DNS" {
         defer serving.cancel(io) catch {};
         const url = try std.fmt.allocPrint(std.testing.allocator, "http://model-download.test:{d}/", .{server.port});
         defer std.testing.allocator.free(url);
+        var attempts: Attempts = .{};
         var client = Client.initWithConfig(std.testing.allocator, fault_io, .{
             .keep_alive = false,
+            .attempt_result_observer = .{ .context = &attempts, .record = Attempts.record },
             .retry_policy = .{ .initial_delay_ms = 1 },
             .timeouts = .{ .request_ms = 2_000 },
         });
@@ -4642,6 +4737,14 @@ test "DNS retry recovers idempotent GET and HEAD without external DNS" {
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 200), response.status.code);
         try std.testing.expectEqual(@as(usize, 3), DnsRetryFixture.calls.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 3), attempts.count);
+        const request = attempts.entries[0].request;
+        if (previous_request) |previous| try std.testing.expect(request != previous);
+        for (attempts.entries, 1..) |attempt, number| {
+            try std.testing.expectEqual(request, attempt.request);
+            try std.testing.expectEqual(@as(u32, @intCast(number)), attempt.number);
+        }
+        previous_request = request;
         try serving.await(io);
     }
 }

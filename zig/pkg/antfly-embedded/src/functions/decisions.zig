@@ -118,7 +118,10 @@ pub const DeciderConfig = struct {
         if (self.embedder) |name| {
             if (name.len == 0 or self.decision_method != .embedding_similarity or self.model.len != 0 or self.model_identity != null or self.url.len != 0 or self.api_key != null or self.rate_limit != null or (self.embedding_options != null and self.embedding_options.?.calibration_id != null)) return error.InvalidDeciderConfig;
         }
-        if (self.provider == .cloudflare) {
+        const qualified = std.mem.startsWith(u8, self.model, "connections/");
+        if (qualified) {
+            if (self.decision_method != .typed or self.url.len != 0 or self.api_key != null or self.account_id != null or self.gateway_id != null) return error.InvalidDeciderConfig;
+        } else if (self.provider == .cloudflare) {
             if (self.account_id == null or self.decision_method != .typed) return error.InvalidDeciderConfig;
             if (!std.mem.eql(u8, self.model, "@cf/cloudflare/clef") and !std.mem.eql(u8, self.model, "@cf/cloudflare/clef-flash")) return error.UnsupportedCloudflareModel;
             var buf: [1024]u8 = undefined;

@@ -94,8 +94,19 @@ pub const Config = struct {
     uses_language_correction: bool = false,
 
     pub fn validate(self: Config) !void {
+        return self.validateConfig(false);
+    }
+
+    pub fn validateForRegistry(self: Config) !void {
+        return self.validateConfig(true);
+    }
+
+    fn validateConfig(self: Config, allow_connection_reference: bool) !void {
         if (self.hosted_parallelism == 0 or self.hosted_parallelism > 8 or (self.provider != .openai and self.hosted_parallelism != 1)) return error.InvalidReaderConfig;
-        if (self.provider == .cloudflare) {
+        const qualified = allow_connection_reference and std.mem.startsWith(u8, (self.model orelse ""), "connections/");
+        if (qualified and self.provider == .cloudflare) {
+            if (self.account_id != null or self.gateway_id != null) return error.InvalidCloudflareConfig;
+        } else if (self.provider == .cloudflare) {
             try cloudflare.identifier(self.account_id orelse return error.InvalidCloudflareConfig);
             try cloudflare.modelId(self.model orelse return error.UnsupportedCloudflareModel);
             if (self.gateway_id) |id| try cloudflare.identifier(id);

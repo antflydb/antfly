@@ -575,6 +575,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi system write cursor",
         "capi lite exposes hosted and status-only profiles",
         "capi lite open options validate and configure ttl cleanup",
+        "capi managed inference connections",
         "capi directory restore coordinates with open handles and publishes atomically",
         "capi directory restore publishes with derived work drained",
         "capi handle ids are safe to use after close and across slot reuse",

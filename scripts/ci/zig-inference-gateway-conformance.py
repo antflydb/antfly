@@ -29,7 +29,9 @@ import http.client
 import io
 import struct
 import json
+import os
 import socket
+import ssl
 import subprocess
 import tempfile
 import threading
@@ -38,11 +40,10 @@ import urllib.error
 import urllib.request
 import zlib
 import wave
+from contextlib import ExitStack, contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import ClassVar
-
-import openai
 
 
 class Upstream(BaseHTTPRequestHandler):
@@ -61,6 +62,7 @@ class Upstream(BaseHTTPRequestHandler):
     chat_attempts: ClassVar[list[str]] = []
     requests: ClassVar[list[tuple[str, dict]]] = []
     authorizations: ClassVar[list[str | None]] = []
+    billing_headers: ClassVar[list[tuple[str, str, str]]] = []
 
     def log_message(self, *_args):
         pass
@@ -101,6 +103,51 @@ class Upstream(BaseHTTPRequestHandler):
                     )
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+    def generated_structured_output(self, request):
+        anthropic = self.path == "/anthropic/messages"
+        if anthropic:
+            assert self.headers.get("x-api-key") == "mock-server-key"
+            output_format = request["output_config"]["format"]
+            assert output_format["type"] == "json_schema"
+            user = request["messages"][0]["content"]
+            prompt = user if isinstance(user, str) else user[0]["text"]
+        else:
+            assert self.path == "/ai/v1/chat/completions"
+            assert self.headers.get("Authorization") == "Bearer mock-server-key"
+            output_format = request["response_format"]
+            assert output_format["type"] == "json_schema"
+            prompt = request["messages"][1]["content"]
+        items = json.loads(prompt)["items"]
+        schema = json.dumps(output_format)
+        if '"refund"' in schema:
+            value = {"refund": True}
+        elif '"answer"' in schema:
+            value = {"answer": True}
+        else:
+            value = {
+                "entities": [{"label": "person", "text": "Ada", "present": True}],
+                "relations": [],
+            }
+        answer = json.dumps(
+            {"items": [{"item": item["id"], "value": value} for item in items]}
+        )
+        if anthropic:
+            self.reply(
+                {
+                    "id": "msg_extract",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": request["model"],
+                    "content": [{"type": "text", "text": answer}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 10, "output_tokens": 10},
+                }
+            )
+        else:
+            self.reply(
+                {"choices": [{"message": {"content": answer}, "finish_reason": "stop"}]}
+            )
 
     def anthropic_chat(self, request):
         assert self.headers.get("x-api-key") == "mock-server-key"
@@ -638,6 +685,7 @@ class Upstream(BaseHTTPRequestHandler):
                     else "tool_use"
                     if tools
                     else "end_turn",
+                    "metrics": {"latencyMs": 1},
                     "usage": usage,
                 }
             )
@@ -720,7 +768,36 @@ class Upstream(BaseHTTPRequestHandler):
         self.image_stream(packets, "application/vnd.amazon.eventstream")
 
     def do_GET(self):
+        if billing_team := self.headers.get("X-Billing-Team"):
+            self.billing_headers.append((self.command, self.path, billing_team))
         path = self.path.split("?")[0]
+        if path == "/workers/models/search":
+            assert self.headers.get("Authorization") == "Bearer mock-server-key"
+            assert self.headers.get("X-Billing-Team") == "worker-discovery-poc"
+            assert self.headers.get("X-User-Billing") is None
+            self.reply(
+                {
+                    "success": True,
+                    "result": [{"name": "@cf/baai/bge-reranker-base"}],
+                }
+            )
+            return
+        if path == "/v1/models" and self.headers.get("X-Billing-Team") == "cohere-poc":
+            assert self.headers.get("Authorization") == "Bearer mock-server-key"
+            self.reply(
+                {"models": [{"name": "rerank-v4.0-pro", "endpoints": ["rerank"]}]}
+            )
+            return
+        if path == "/bedrock/foundation-models":
+            assert self.headers.get("Authorization") == "Bearer mock-server-key"
+            self.reply(
+                {
+                    "modelSummaries": [
+                        {"modelId": "new-vision-model", "outputModalities": ["TEXT"]}
+                    ]
+                }
+            )
+            return
         if path == "/anthropic/models":
             assert self.headers.get("x-api-key") == "mock-server-key"
             assert self.headers.get("anthropic-version") == "2026-10-21"
@@ -1008,6 +1085,11 @@ class Upstream(BaseHTTPRequestHandler):
                 "session_id": "backend-session",
                 "data": [],
             },
+            "/ai/v1/embeddings": {
+                "object": "list",
+                "model": "text-embedding-3-small",
+                "data": [{"object": "embedding", "index": 0, "embedding": [0.25, 0.5]}],
+            },
             "/ai/v1/embed": {
                 "object": "list",
                 "model": "mock-sparse",
@@ -1045,6 +1127,121 @@ class Upstream(BaseHTTPRequestHandler):
         return False
 
     def do_POST(self):
+        if billing_team := self.headers.get("X-Billing-Team"):
+            self.billing_headers.append((self.command, self.path, billing_team))
+        if self.path == "/billing-first/chat/completions":
+            assert self.headers.get("Authorization") == "Bearer first-provider-key"
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.reply({"error": "provider temporarily unavailable"}, status=503)
+            return
+        if self.path == "/reader-v1/chat/completions":
+            assert self.headers.get("Authorization") == "Bearer mock-server-key"
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            assert request["model"] == "mock-reader"
+            image = next(
+                part["image_url"]["url"]
+                for part in request["messages"][-1]["content"]
+                if part["type"] == "image_url"
+            )
+            assert image == "data:image/png;base64,aW1hZ2U=", image
+            self.reply(
+                {
+                    "choices": [
+                        {
+                            "message": {"content": "private reader result"},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+            )
+            return
+        if self.path == "/workers/extract":
+            assert self.headers.get("Authorization") == "Bearer mock-server-key"
+            assert self.headers.get("cf-aig-gateway-id") == "fixture-gateway"
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            assert request["model"] == "clairic" and "fields" in request, request
+            self.reply(
+                {
+                    "success": True,
+                    "result": {
+                        "answers": {
+                            "total": {
+                                "type": "number",
+                                "value": 12.5,
+                                "confidence": 0.95,
+                            }
+                        },
+                        "truncated": False,
+                        "usage": {"input_tokens": 20, "output_tokens": 0},
+                    },
+                }
+            )
+            return
+        if self.path == "/pioneer/v1/chat/completions":
+            assert self.headers.get("Authorization") == "Bearer mock-server-key"
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            assert request["schema"]["entities"] == ["person"], request
+            if "rate-limited fixture input" in json.dumps(request["messages"]):
+                self.reply({"error": "provider rate limited"}, status=429)
+                return
+            self.reply(
+                {
+                    "id": "fixture",
+                    "object": "chat.completion",
+                    "model": request["model"],
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": json.dumps(
+                                    {
+                                        "entities": {
+                                            "person": [
+                                                {
+                                                    "text": "Ada",
+                                                    "confidence": 0.9,
+                                                    "start": 0,
+                                                    "end": 3,
+                                                }
+                                            ]
+                                        },
+                                    }
+                                ),
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 5,
+                        "completion_tokens": 0,
+                        "total_tokens": 5,
+                    },
+                }
+            )
+            return
+        if self.path == "/workers/rerank":
+            assert self.headers.get("Authorization") == "Bearer mock-server-key"
+            assert self.headers.get("cf-aig-gateway-id") == "fixture-gateway"
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            assert request["query"] == "hello", request
+            self.reply(
+                {"success": True, "result": {"response": [{"id": 0, "score": 0.625}]}}
+            )
+            return
+        if self.path == "/v2/rerank":
+            assert self.headers.get("Authorization") == "Bearer mock-server-key"
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            assert request["model"] == "rerank-v4.0-pro"
+            self.reply({"results": [{"index": 0, "relevance_score": 0.75}]})
+            return
+        if self.path == "/v1/audio/transcriptions":
+            assert self.headers.get("Authorization") == "Bearer mock-server-key"
+            assert self.headers["Content-Type"].startswith("multipart/form-data;")
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            assert b"whisper-1" in body and b"pcm!" in body
+            self.reply({"text": "private gateway transcript"})
+            return
         if self.path == "/mock-token":
             self.rfile.read(int(self.headers.get("Content-Length", 0)))
             time.sleep(0.65)
@@ -1100,6 +1297,9 @@ class Upstream(BaseHTTPRequestHandler):
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.requests.append((self.path, request))
         self.authorizations.append(self.headers.get("Authorization"))
+        if request.get("model") in ("gpt-4.1", "claude-sonnet-4-5-20250929"):
+            self.generated_structured_output(request)
+            return
         if self.path.endswith("/anthropic/messages"):
             self.anthropic_chat(request)
             return
@@ -1137,6 +1337,32 @@ class Upstream(BaseHTTPRequestHandler):
             "Bearer speech-bearer-key",
         )
         if self.extra(request):
+            return
+        if (
+            self.path == "/ai/v1/chat/completions"
+            and request["model"] == "research-planner"
+        ):
+            assert self.headers.get("X-Billing-Team") == "openai-poc"
+            plan = {
+                "brief": "Synthetic planning check",
+                "sub_questions": [
+                    {"question": "What does the fixture say?", "sources": ["tables"]}
+                ],
+            }
+            self.reply(
+                {
+                    "model": request["model"],
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": json.dumps(plan),
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+            )
             return
         if request["model"].startswith("openai-audio-"):
             self.google_chat(request)
@@ -1233,7 +1459,16 @@ class Upstream(BaseHTTPRequestHandler):
                         "probability": 0.9,
                     }
                 ],
-                "usage": {"input_tokens": 2, "output_tokens": 0, "total_tokens": 2},
+                "usage": {
+                    "input_tokens": 2,
+                    "input_tokens_details": {
+                        "cached_tokens": 0,
+                        "cache_write_tokens": 0,
+                    },
+                    "output_tokens": 0,
+                    "output_tokens_details": {"reasoning_tokens": 0},
+                    "total_tokens": 2,
+                },
             }
         elif self.path == "/v1/embeddings":
             response = {
@@ -1262,6 +1497,50 @@ class Upstream(BaseHTTPRequestHandler):
             self.wfile.write(encoded)
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+
+@contextmanager
+def private_tls_gateway(root: Path):
+    certificate = root / "provider-ca.pem"
+    key = root / "provider-key.pem"
+    openssl_config = root / "provider-openssl.cnf"
+    openssl_config.write_text(
+        "[req]\nprompt = no\ndistinguished_name = dn\nx509_extensions = cert\n"
+        "[dn]\nCN = Private provider test gateway\n"
+        "[cert]\nsubjectAltName = IP:127.0.0.1\n"
+        "basicConstraints = critical,CA:TRUE\n"
+    )
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "2",
+            "-config",
+            str(openssl_config),
+            "-keyout",
+            str(key),
+            "-out",
+            str(certificate),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certificate, key)
+    with ThreadingHTTPServer(("127.0.0.1", 0), Upstream) as server:
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            yield server.server_port, certificate
+        finally:
+            server.shutdown()
+            worker.join()
 
 
 def free_port() -> int:
@@ -2373,6 +2652,773 @@ def verify_hosted_generation_contracts(base_url):
     )
 
 
+def verify_managed_connection_embedding(invoke):
+    table = "/db/v1/tables/connection_policy_docs"
+    model = "connections/vendor-embeddings/models/text-embedding-3-small"
+    try:
+        created = invoke(
+            table,
+            {
+                "num_shards": 1,
+                "indexes": {
+                    "semantic": {
+                        "type": "embeddings",
+                        "field": "body",
+                        "dimension": 2,
+                        "embedder": {"provider": "openai", "model": model},
+                    }
+                },
+            },
+        )
+    except urllib.error.HTTPError as error:
+        raise AssertionError(
+            f"managed connection table creation returned {error.code}: {error.read().decode(errors='replace')}"
+        ) from error
+    assert created["name"] == "connection_policy_docs", created
+    before_indexing = len(Upstream.billing_headers)
+    written = invoke(
+        table + "/batch",
+        {
+            "inserts": {"sample": {"body": "document connection sample"}},
+            "sync_level": "full_index",
+        },
+    )
+    assert written["inserted"] == 1, written
+    assert ("POST", "/ai/v1/embeddings", "embeddings-poc") in Upstream.billing_headers[
+        before_indexing:
+    ]
+    before_query = len(Upstream.billing_headers)
+    result = invoke(
+        table + "/query",
+        {
+            "semantic_search": "query connection sample",
+            "indexes": ["semantic"],
+            "limit": 1,
+        },
+    )
+    hits = result["responses"][0]["hits"]["hits"]
+    assert hits and hits[0]["_id"] == "sample", result
+    assert ("POST", "/ai/v1/embeddings", "embeddings-poc") in Upstream.billing_headers[
+        before_query:
+    ]
+
+    before_reranking = len(Upstream.billing_headers)
+    rank_query = {
+        "semantic_search": "query connection sample",
+        "indexes": ["semantic"],
+        "limit": 1,
+        "reranker": {
+            "provider": "cohere",
+            "model": "connections/vendor-rerank/models/rerank-v4.0-pro",
+            "field": "body",
+        },
+    }
+    reranked = invoke(table + "/query", rank_query)
+    assert reranked["responses"][0]["hits"]["hits"][0]["_id"] == "sample", reranked
+    assert ("POST", "/v2/rerank", "cohere-poc") in Upstream.billing_headers[
+        before_reranking:
+    ]
+
+    before_override = len(Upstream.billing_headers)
+    rank_query["reranker"]["url"] = "http://127.0.0.1:1"
+    try:
+        invoke(table + "/query", rank_query)
+    except urllib.error.HTTPError as error:
+        assert error.code == 400, (error.code, error.read())
+    else:
+        raise AssertionError("managed query reranking accepted an inline endpoint")
+    assert not any(
+        path == "/v2/rerank"
+        for _, path, _ in Upstream.billing_headers[before_override:]
+    )
+    del rank_query["reranker"]["url"]
+
+    before_denial = len(Upstream.billing_headers)
+    rank_query["reranker"]["model"] = (
+        "connections/restricted-rerank/models/rerank-v4.0-pro"
+    )
+    try:
+        invoke(table + "/query", rank_query, headers={"X-Billing-Team": "forged"})
+    except urllib.error.HTTPError as error:
+        denied = json.loads(error.read())
+        assert error.code == 403 and denied["code"] == "inference_attribution_denied", (
+            denied
+        )
+    else:
+        raise AssertionError(
+            "managed query reranking accepted unauthenticated attribution"
+        )
+    assert not any(
+        path == "/v2/rerank" for _, path, _ in Upstream.billing_headers[before_denial:]
+    )
+
+    before_decision = len(Upstream.billing_headers)
+    evaluated = invoke(
+        table + "/query",
+        {
+            "semantic_search": "query connection sample",
+            "indexes": ["semantic"],
+            "limit": 1,
+            "evaluate": {
+                "scope": "candidates",
+                "candidate_count": 1,
+                "compute": {
+                    "p": {
+                        "call": "ai_probability",
+                        "input": {"literal": "refund"},
+                        "statement": "Refund?",
+                        "decider": "managed-triage",
+                    }
+                },
+                "where": {"gte": [{"ref": "p"}, {"literal": 0.8}]},
+            },
+        },
+    )
+    assert evaluated["responses"][0]["hits"]["hits"][0]["_id"] == "sample", evaluated
+    assert ("POST", "/ai/v1/decisions", "decision-poc") in Upstream.billing_headers[
+        before_decision:
+    ]
+
+    before_research = len(Upstream.billing_headers)
+    job_path = "/db/v1/agents/research/jobs"
+    job = invoke(
+        job_path,
+        {
+            "request": {
+                "query": "What does the fixture say?",
+                "queries": [{"table": "connection_policy_docs"}],
+                "generator": {
+                    "provider": "openai",
+                    "model": "connections/vendor/models/research-planner",
+                },
+                "budget": {
+                    "deadline_ms": 5000,
+                    "max_rounds": 1,
+                    "max_sub_questions": 1,
+                },
+            },
+        },
+    )
+    advanced = invoke(job_path + "/" + job["job_id"] + "/advance", {"max_phases": 1})
+    assert advanced["phase"] == "research" and not advanced.get("last_error"), advanced
+    assert (
+        "POST",
+        "/ai/v1/chat/completions",
+        "openai-poc",
+    ) in Upstream.billing_headers[before_research:]
+
+
+def verify_connection_policy(invoke, log_path: Path):
+    def read_upstream_attempts():
+        return [
+            json.loads(line.split("upstream_attempt ", 1)[1])
+            for line in log_path.read_text().splitlines()
+            if "upstream_attempt {" in line
+        ]
+
+    prompt = {"messages": [{"role": "user", "content": "hello"}]}
+    catalog = invoke("/ai/v1/models", method="GET")
+    assert (
+        "connections/worker-discovery/models/@cf/baai/bge-reranker-base"
+        in catalog["rerankers"]
+    ), catalog
+    assert (
+        "GET",
+        "/workers/models/search?per_page=100",
+        "worker-discovery-poc",
+    ) in Upstream.billing_headers
+    assert all(
+        team != "worker-public-only-poc" for _, _, team in Upstream.billing_headers
+    )
+    for model in (
+        "connections/bedrock-vision/models/new-vision-model",
+        "connections/anthropic-vision/models/new-vision-model",
+    ):
+        result = invoke("/ai/v1/chat/completions", {"model": model, **prompt})
+        assert result["choices"][0]["message"]["content"], result
+    qualified = invoke(
+        "/ai/v1/chat/completions",
+        {"model": "connections/vendor/models/mock-chat", **prompt},
+    )
+    assert qualified["choices"][0]["message"]["content"] == "hello"
+    assert (
+        "GET",
+        "/bedrock/foundation-models",
+        "bedrock-poc",
+    ) in Upstream.billing_headers
+    assert any(
+        method == "POST" and path.startswith("/bedrock/") and team == "bedrock-poc"
+        for method, path, team in Upstream.billing_headers
+    )
+    before_rewrite = len(Upstream.billing_headers)
+    rewritten = invoke(
+        "/ai/v1/rewrite",
+        {
+            "model": "connections/vendor/models/mock-chat",
+            "inputs": ["first", "second"],
+        },
+    )
+    assert [row["texts"] for row in rewritten["data"]] == [["hello"], ["hello"]], (
+        rewritten
+    )
+    assert Upstream.billing_headers[before_rewrite:] == [
+        ("POST", "/ai/v1/chat/completions", "openai-poc"),
+        ("POST", "/ai/v1/chat/completions", "openai-poc"),
+    ]
+    before_fallback = len(Upstream.billing_headers)
+    fallback_response = invoke(
+        "/ai/v1/chat/completions",
+        {"model": "chains/connection-fallback", **prompt},
+    )
+    assert fallback_response["choices"][0]["message"]["content"] == "hello"
+    assert Upstream.billing_headers[before_fallback:] == [
+        ("POST", "/billing-first/chat/completions", "first-team"),
+        ("POST", "/ai/v1/chat/completions", "openai-poc"),
+    ]
+    embedded = invoke(
+        "/ai/v1/embeddings",
+        {
+            "model": "connections/vendor-embeddings/models/text-embedding-3-small",
+            "input": "hello",
+            "dimensions": 2,
+        },
+    )
+    assert embedded["data"][0]["embedding"] == [0.25, 0.5], embedded
+    decision_request = {
+        "model": "connections/vendor-decision/models/mock-decision",
+        "input": "refund",
+        "questions": [
+            {"name": "refund", "type": "predicate", "instructions": "Refund?"}
+        ],
+    }
+    decided = invoke("/ai/v1/decisions", decision_request)
+    assert decided["answers"][0]["probability"] == 0.9, decided
+    assert ("POST", "/ai/v1/decisions", "decision-poc") in Upstream.billing_headers
+    before_sql_decision = len(Upstream.billing_headers)
+    sql_decision = invoke(
+        "/db/v1/sql",
+        {
+            "statement": "SELECT ai_probability('refund', 'Refund?', 'deciders/managed-triage') AS score"
+        },
+    )
+    assert sql_decision["rows"][0][0] == 0.9, sql_decision
+    assert ("POST", "/ai/v1/decisions", "decision-poc") in Upstream.billing_headers[
+        before_sql_decision:
+    ]
+    before_generated_sql = len(Upstream.billing_headers)
+    generated_sql = invoke(
+        "/db/v1/sql",
+        {
+            "statement": "SELECT ai_probability('refund', 'Refund?', 'deciders/managed-generated') AS score"
+        },
+    )
+    assert float(generated_sql["rows"][0][0]) == 1, generated_sql
+    assert (
+        "POST",
+        "/ai/v1/chat/completions",
+        "openai-poc",
+    ) in Upstream.billing_headers[before_generated_sql:]
+    before_blocked_decision = len(Upstream.billing_headers)
+    try:
+        invoke(
+            "/ai/v1/decisions",
+            {
+                **decision_request,
+                "model": "connections/public-decision/models/mock-decision",
+            },
+        )
+    except urllib.error.HTTPError as error:
+        assert error.code == 502, error.read()
+    else:
+        raise AssertionError(
+            "public-only decision connection reached a private gateway"
+        )
+    assert len(Upstream.billing_headers) == before_blocked_decision
+    reranked = invoke(
+        "/ai/v1/rerank",
+        {
+            "model": "connections/vendor-rerank/models/rerank-v4.0-pro",
+            "query": "hello",
+            "documents": ["hello"],
+        },
+    )
+    assert reranked["data"][0]["score"] == 0.75, reranked
+    cloudflare_rerank = invoke(
+        "/ai/v1/rerank",
+        {
+            "model": "connections/worker-rerank/models/@cf/baai/bge-reranker-base",
+            "query": "hello",
+            "documents": ["hello"],
+        },
+    )
+    assert cloudflare_rerank["data"][0]["score"] == 0.625, cloudflare_rerank
+    assert ("POST", "/workers/rerank", "worker-poc") in Upstream.billing_headers
+    native_cloudflare = invoke(
+        "/ai/v1/extract",
+        {
+            "model": "connections/worker-extract/models/@cf/cloudflare/clairic",
+            "schema_version": 2,
+            "schema": {
+                "structures": {"receipt": {"fields": {"total": {"type": "number"}}}}
+            },
+            "inputs": [{"id": "receipt", "content": "Total 12.50 USD"}],
+        },
+    )
+    assert (
+        native_cloudflare["data"][0]["structures"]["receipt"][0]["total"]["value"]
+        == 12.5
+    ), native_cloudflare
+    assert (
+        "POST",
+        "/workers/extract",
+        "worker-extract-poc",
+    ) in Upstream.billing_headers
+    native_pioneer = invoke(
+        "/ai/v1/extract",
+        {
+            "model": "connections/pioneer-extract/models/fastino/gliner2.5-multi-v1",
+            "schema": {"entities": ["person"]},
+            "inputs": [{"id": "person", "content": "Ada arrived."}],
+        },
+    )
+    assert native_pioneer["data"][0]["entities"][0]["text"] == "Ada", native_pioneer
+    assert (
+        "POST",
+        "/pioneer/v1/chat/completions",
+        "pioneer-poc",
+    ) in Upstream.billing_headers
+    try:
+        invoke(
+            "/ai/v1/extract",
+            {
+                "model": "connections/pioneer-extract/models/fastino/gliner2.5-multi-v1",
+                "schema": {"entities": ["person"]},
+                "inputs": [{"content": "rate-limited fixture input"}],
+            },
+        )
+    except urllib.error.HTTPError as error:
+        assert error.code == 429, error.read()
+        assert error.headers["Retry-After"] == "1", error.headers
+    else:
+        raise AssertionError("Pioneer upstream rate limit was not propagated")
+    reading = invoke(
+        "/ai/v1/read",
+        {
+            "model": "connections/vendor-reader/models/mock-reader",
+            "images": [{"url": "data:image/png;base64,aW1hZ2U="}],
+        },
+    )
+    assert reading["data"][0]["text"] == "private reader result", reading
+    assert (
+        "POST",
+        "/reader-v1/chat/completions",
+        "reader-poc",
+    ) in Upstream.billing_headers
+    dictated = invoke(
+        "/ai/v1/dictate",
+        {
+            "model": "connections/vendor-audio/models/whisper-1",
+            "audio": "cGNtIQ==",
+        },
+    )
+    assert dictated["text"] == "private gateway transcript", dictated
+    spoken = invoke(
+        "/ai/v1/synthesize",
+        {
+            "model": "connections/vendor-audio/models/mock-voice",
+            "text": "hello",
+        },
+    )
+    assert spoken == b"ID3mock-audio", spoken
+    assert {
+        ("POST", "/ai/v1/chat/completions", "openai-poc"),
+        ("GET", "/ai/v1/models", "openai-poc"),
+        ("POST", "/ai/v1/embeddings", "embeddings-poc"),
+        ("POST", "/v1/audio/transcriptions", "audio-poc"),
+        ("POST", "/v1/audio/speech", "audio-poc"),
+        ("GET", "/v1/models?page_size=100", "cohere-poc"),
+        ("POST", "/v2/rerank", "cohere-poc"),
+        ("POST", "/anthropic/messages", "anthropic-poc"),
+        ("GET", "/anthropic/models?limit=100", "anthropic-poc"),
+    }.issubset(Upstream.billing_headers), Upstream.billing_headers
+    for connection, backend, path, team in (
+        ("vendor", "gpt-4.1", "/ai/v1/chat/completions", "openai-poc"),
+        (
+            "anthropic-vision",
+            "claude-sonnet-4-5-20250929",
+            "/anthropic/messages",
+            "anthropic-poc",
+        ),
+    ):
+        prior_billing_count = len(Upstream.billing_headers)
+        extraction = invoke(
+            "/ai/v1/extract",
+            {
+                "method": "generated",
+                "generator": {"model": f"connections/{connection}/models/{backend}"},
+                "output": "json_schema",
+                "probabilities": "verdict_only",
+                "schema": {"entities": ["person"]},
+                "inputs": [{"id": "sample", "content": "Ada arrived."}],
+            },
+        )
+        assert extraction["schema_version"] == 2, extraction
+        assert extraction["data"][0]["id"] == "sample", extraction
+        assert ("POST", path, team) in Upstream.billing_headers[prior_billing_count:]
+        generated_model = f"connections/{connection}/models/{backend}"
+        prior_billing_count = len(Upstream.billing_headers)
+        generated_decision = {
+            "decision_method": "generated",
+            "generator": {"model": generated_model},
+            "output": "json_schema",
+            "probabilities": "verdict_only",
+            "questions": [
+                {"name": "refund", "type": "predicate", "instructions": "Refund?"}
+            ],
+        }
+        decision = invoke(
+            "/ai/v1/decisions", {**generated_decision, "input": "Refund requested."}
+        )
+        assert decision["model"] == generated_model, decision
+        assert decision["answers"][0]["probability"] == 1, decision
+        assert ("POST", path, team) in Upstream.billing_headers[prior_billing_count:]
+
+        prior_billing_count = len(Upstream.billing_headers)
+        batch = invoke(
+            "/ai/v1/decisions",
+            {
+                **generated_decision,
+                "inputs": [
+                    {"id": "first", "input": "Refund requested."},
+                    {"id": "second", "input": "Another refund requested."},
+                ],
+            },
+        )
+        assert batch["model"] == generated_model, batch
+        assert [(row["input_index"], row["id"]) for row in batch["data"]] == [
+            (0, "first"),
+            (1, "second"),
+        ], batch
+        assert all(row["answers"][0]["probability"] == 1 for row in batch["data"]), (
+            batch
+        )
+        assert ("POST", path, team) in Upstream.billing_headers[prior_billing_count:]
+    before_override = len(Upstream.billing_headers)
+    try:
+        invoke(
+            "/ai/v1/decisions",
+            {
+                "decision_method": "generated",
+                "generator": {
+                    "model": "connections/vendor/models/gpt-4.1",
+                    "url": "https://override.invalid/v1",
+                },
+                "input": "Refund requested.",
+                "questions": [
+                    {"name": "refund", "type": "predicate", "instructions": "Refund?"}
+                ],
+            },
+        )
+    except urllib.error.HTTPError as error:
+        assert error.code == 400, error.read()
+    else:
+        raise AssertionError("generated decision accepted a caller-supplied endpoint")
+    assert len(Upstream.billing_headers) == before_override
+
+    for connection in ("runtime", "vendor"):
+        streamed = invoke(
+            "/ai/v1/chat/completions",
+            {
+                "model": f"connections/{connection}/models/mock-chat",
+                "stream": True,
+                **prompt,
+            },
+        )
+        assert b"data: [DONE]" in streamed, streamed
+    before_anthropic_stream = len(Upstream.billing_headers)
+    anthropic_stream = invoke(
+        "/ai/v1/chat/completions",
+        {
+            "model": "connections/anthropic-vision/models/new-vision-model",
+            "stream": True,
+            **prompt,
+        },
+    )
+    assert b"data: [DONE]" in anthropic_stream, anthropic_stream
+    assert all(
+        json.loads(line[6:]).get("usage") is None
+        for line in anthropic_stream.splitlines()
+        if line.startswith(b"data: ") and line != b"data: [DONE]"
+    ), anthropic_stream
+    assert ("POST", "/anthropic/messages", "anthropic-poc") in (
+        Upstream.billing_headers[before_anthropic_stream:]
+    )
+    secured = invoke(
+        "/ai/v1/chat/completions",
+        {"model": "connections/private-tls/models/mock-chat", **prompt},
+    )
+    assert secured["choices"][0]["message"]["content"] == "hello"
+    assert {
+        ("GET", "/ai/v1/models", "private-tls"),
+        ("POST", "/ai/v1/chat/completions", "private-tls"),
+    }.issubset(Upstream.billing_headers), Upstream.billing_headers
+    for connection in ("untrusted-tls", "mismatched-tls", "public-only-tls"):
+        try:
+            invoke(
+                "/ai/v1/chat/completions",
+                {"model": f"connections/{connection}/models/mock-chat", **prompt},
+            )
+        except urllib.error.HTTPError as error:
+            assert error.code == 502, error.read()
+        else:
+            raise AssertionError(f"gateway accepted {connection}")
+        assert all(team != connection for _, _, team in Upstream.billing_headers)
+
+    verify_managed_connection_embedding(invoke)
+    upstream_attempts = read_upstream_attempts()
+    embedding_requests = {
+        attempt["request_id"]
+        for attempt in upstream_attempts
+        if attempt["connection"] == "vendor-embeddings"
+        and attempt["task"] == "embed"
+        and attempt["status"] == 200
+        and attempt["request_id"].startswith("provider-")
+    }
+    assert len(embedding_requests) >= 2, upstream_attempts
+    assert {
+        ("vendor-decision", "mock-decision"),
+        ("vendor", "gpt-4.1"),
+    }.issubset(
+        (attempt["connection"], attempt["backend_model"])
+        for attempt in upstream_attempts
+        if attempt["request_id"].startswith("internal-")
+        and attempt["task"] == "decide"
+        and attempt["status"] == 200
+    ), upstream_attempts
+    assert {
+        ("vendor", "decide", 200),
+        ("anthropic-vision", "decide", 200),
+        ("vendor", "extract", 200),
+        ("vendor", "rewrite", 200),
+        ("worker-extract", "extract", 200),
+        ("pioneer-extract", "extract", 200),
+        ("pioneer-extract", "extract", 429),
+        ("worker-rerank", "rerank", 200),
+        ("worker-discovery", "discover", 200),
+        ("vendor-decision", "decide", 200),
+        ("anthropic-vision", "extract", 200),
+        ("runtime", "chat/completions", 200),
+    }.issubset(
+        (attempt["connection"], attempt["task"], attempt["status"])
+        for attempt in upstream_attempts
+    ), upstream_attempts
+    assert any(
+        attempt["connection"] == "vendor-decision"
+        and attempt["input_tokens"] == 2
+        and attempt["output_tokens"] == 0
+        for attempt in upstream_attempts
+    ), upstream_attempts
+    assert {"runtime", "vendor"}.issubset(
+        attempt["connection"]
+        for attempt in upstream_attempts
+        if attempt["streaming"]
+        and attempt["input_tokens"] == 2
+        and attempt["output_tokens"] == 1
+    ), upstream_attempts
+    assert any(
+        attempt["connection"] == "anthropic-vision"
+        and attempt["streaming"]
+        and attempt["status"] == 200
+        and attempt["output_tokens"] == 1
+        for attempt in upstream_attempts
+    ), upstream_attempts
+    fallback_request_ids = {
+        attempt["request_id"]
+        for attempt in upstream_attempts
+        if attempt["connection"] == "billing-first" and attempt["task"] == "generate"
+    }
+    assert len(fallback_request_ids) == 1 and all(fallback_request_ids), (
+        upstream_attempts
+    )
+    assert [
+        (attempt["connection"], attempt["attempt"], attempt["status"])
+        for attempt in upstream_attempts
+        if attempt["request_id"] in fallback_request_ids
+    ] == [("billing-first", 1, 503), ("vendor", 2, 200)], upstream_attempts
+
+    for alias in ("generators/managed-gateway", "chains/managed-alias"):
+        before_alias = len(Upstream.billing_headers)
+        before_requests = len(Upstream.requests)
+        alias_response = invoke("/ai/v1/chat/completions", {"model": alias, **prompt})
+        assert alias_response["choices"], alias_response
+        assert (
+            "POST",
+            "/ai/v1/chat/completions",
+            "openai-poc",
+        ) in Upstream.billing_headers[before_alias:]
+        assert any(
+            path == "/ai/v1/chat/completions"
+            and request.get("model") == "mock-chat"
+            and request.get("max_tokens") == 73
+            for path, request in Upstream.requests[before_requests:]
+        ), Upstream.requests[before_requests:]
+
+    before_alias = len(Upstream.billing_headers)
+    decision = invoke(
+        "/ai/v1/decisions",
+        {
+            "decision_method": "generated",
+            "generator": {"model": "generators/managed-structured"},
+            "output": "json_schema",
+            "probabilities": "verdict_only",
+            "input": "Refund requested.",
+            "questions": [
+                {"name": "refund", "type": "predicate", "instructions": "Refund?"}
+            ],
+        },
+    )
+    assert decision["answers"][0]["probability"] == 1, decision
+    assert (
+        "POST",
+        "/ai/v1/chat/completions",
+        "openai-poc",
+    ) in Upstream.billing_headers[before_alias:]
+
+    before_override = len(Upstream.requests)
+    try:
+        invoke(
+            "/ai/v1/chat/completions",
+            {"model": "generators/managed-override", **prompt},
+        )
+    except urllib.error.HTTPError as error:
+        assert error.code == 400, error.read()
+    else:
+        raise AssertionError("qualified generator accepted an inline endpoint")
+    assert len(Upstream.requests) == before_override
+
+    before_named_embed = len(Upstream.billing_headers)
+    named_embed = invoke(
+        "/ai/v1/embeddings",
+        {"model": "embedders/managed-dense", "input": "hello", "dimensions": 2},
+    )
+    assert named_embed["data"][0]["embedding"] == [0.25, 0.5], named_embed
+    assert ("POST", "/ai/v1/embeddings", "embeddings-poc") in Upstream.billing_headers[
+        before_named_embed:
+    ]
+
+    before_rewrite = len(Upstream.requests)
+    rewritten = invoke(
+        "/ai/v1/rewrite", {"model": "rewriters/managed-rewrite", "inputs": ["hello"]}
+    )
+    assert rewritten["data"][0]["texts"] == ["hello"], rewritten
+    assert any(
+        path == "/ai/v1/chat/completions"
+        and request.get("model") == "mock-chat"
+        and any(
+            message["content"] == "Preserve the fixture text."
+            for message in request["messages"]
+        )
+        for path, request in Upstream.requests[before_rewrite:]
+    ), Upstream.requests[before_rewrite:]
+
+    for cleanup_model in (
+        "generators/managed-gateway",
+        "connections/vendor/models/mock-chat",
+    ):
+        before_cleanup = len(Upstream.billing_headers)
+        result = invoke(
+            "/ai/v1/dictate",
+            {
+                "model": "transcribers/speech",
+                "audio": "",
+                "transcript_text": "hello",
+                "cleanup_model": cleanup_model,
+                "style": "clean",
+            },
+        )
+        assert result["transcript"]["text"] == "hello", result
+        assert result["text"] == "hello", result
+        assert (
+            "POST",
+            "/ai/v1/chat/completions",
+            "openai-poc",
+        ) in Upstream.billing_headers[before_cleanup:]
+
+    for path, body, expected, upstream in (
+        (
+            "/ai/v1/read",
+            {
+                "model": "readers/managed-image",
+                "images": [{"url": "data:image/png;base64,aW1hZ2U="}],
+            },
+            "private reader result",
+            ("/reader-v1/chat/completions", "reader-poc"),
+        ),
+        (
+            "/ai/v1/dictate",
+            {"model": "transcribers/managed-audio", "audio": "cGNtIQ=="},
+            "private gateway transcript",
+            ("/v1/audio/transcriptions", "audio-poc"),
+        ),
+        (
+            "/ai/v1/synthesize",
+            {"model": "synthesizers/managed-voice", "text": "hello"},
+            b"ID3mock-audio",
+            ("/v1/audio/speech", "audio-poc"),
+        ),
+        (
+            "/ai/v1/rerank",
+            {
+                "model": "rerankers/managed-rank",
+                "query": "hello",
+                "documents": ["hello"],
+            },
+            0.75,
+            ("/v2/rerank", "cohere-poc"),
+        ),
+        (
+            "/ai/v1/rerank",
+            {
+                "model": "rerankers/managed-worker-rank",
+                "query": "hello",
+                "documents": ["hello"],
+            },
+            0.625,
+            ("/workers/rerank", "worker-poc"),
+        ),
+    ):
+        before = len(Upstream.billing_headers)
+        result = invoke(path, body)
+        observed = (
+            result["data"][0]["text"]
+            if path.endswith("/read")
+            else result["text"]
+            if path.endswith("/dictate")
+            else result["data"][0]["score"]
+            if path.endswith("/rerank")
+            else result
+        )
+        assert observed == expected, result
+        assert ("POST", *upstream) in Upstream.billing_headers[before:]
+
+    upstream_attempts = read_upstream_attempts()
+    cleanup_attempts = [
+        attempt
+        for attempt in upstream_attempts
+        if attempt["task"] == "dictation_cleanup"
+        and attempt["connection"] == "vendor"
+        and attempt["status"] == 200
+    ]
+    assert len(cleanup_attempts) == 2, cleanup_attempts
+    physical_attempts = [
+        attempt["transport_attempt_id"] for attempt in upstream_attempts
+    ]
+    assert all(physical_attempts) and len(set(physical_attempts)) == len(
+        physical_attempts
+    )
+    assert "mock-server-key" not in json.dumps(upstream_attempts)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -2385,13 +3431,28 @@ def main() -> None:
         action="store_true",
         help="Run the hosted image contract without the unrelated session/discovery checks",
     )
+    parser.add_argument(
+        "--only-connection-policy",
+        action="store_true",
+        help="Run connection policy checks without unrelated hosted and session scenarios",
+    )
     args = parser.parse_args()
+    if args.only_images and args.only_connection_policy:
+        parser.error("choose one focused conformance mode")
+    if not args.only_connection_policy:
+        global openai
+        import openai
+    if not args.antfly.is_file() or not os.access(args.antfly, os.X_OK):
+        parser.error(f"Antfly executable is missing or not executable: {args.antfly}")
     upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     try:
-        with tempfile.TemporaryDirectory(
-            prefix="antfly-gateway-conformance-"
-        ) as temporary:
+        with (
+            tempfile.TemporaryDirectory(
+                prefix="antfly-gateway-conformance-"
+            ) as temporary,
+            ExitStack() as providers,
+        ):
             root = Path(temporary)
             upstream_url = f"http://127.0.0.1:{upstream.server_port}"
             config = {
@@ -2521,14 +3582,244 @@ def main() -> None:
             config["connections"] = {
                 "vendor": {
                     "kind": "inference",
-                    "capabilities": ["models.generate"],
+                    "capabilities": [
+                        "models.generate",
+                        "models.extract",
+                        "models.decide",
+                        "models.rewrite",
+                    ],
                     "inference": {
                         "provider": "openai",
                         "url": upstream_url + "/ai/v1",
                         "api_key": "mock-server-key",
+                        "headers": {"X-Billing-Team": "openai-poc"},
                     },
                 }
             }
+            config["generators"]["managed-gateway"] = {
+                "provider": "openai",
+                "model": "connections/vendor/models/mock-chat",
+                "max_tokens": 73,
+            }
+            config["generators"]["managed-override"] = {
+                "provider": "openai",
+                "model": "connections/vendor/models/mock-chat",
+                "url": upstream_url + "/unexpected",
+            }
+            config["generators"]["managed-structured"] = {
+                "provider": "openai",
+                "model": "connections/vendor/models/gpt-4.1",
+            }
+            config.setdefault("rewriters", {})["managed-rewrite"] = {
+                "generator": "managed-gateway",
+                "instructions": "Preserve the fixture text.",
+            }
+            config["chains"]["managed-alias"] = [{"generator": "managed-gateway"}]
+            config["connections"]["billing-first"] = {
+                "kind": "inference",
+                "capabilities": ["models.generate"],
+                "inference": {
+                    "provider": "openai",
+                    "url": upstream_url + "/billing-first",
+                    "api_key": "first-provider-key",
+                    "headers": {"X-Billing-Team": "first-team"},
+                },
+            }
+            config["chains"]["connection-fallback"] = [
+                {
+                    "generator": "connections/billing-first/models/first-model",
+                    "condition": "on_error",
+                },
+                {"generator": "connections/vendor/models/mock-chat"},
+            ]
+            config["connections"]["vendor-embeddings"] = {
+                "kind": "inference",
+                "capabilities": ["models.embed"],
+                "inference": {
+                    "provider": "openai",
+                    "url": upstream_url + "/ai/v1",
+                    "api_key": "mock-server-key",
+                    "headers": {"X-Billing-Team": "embeddings-poc"},
+                },
+            }
+            config["embedders"]["managed-dense"] = {
+                "provider": "openai",
+                "model": "connections/vendor-embeddings/models/text-embedding-3-small",
+                "dimensions": 2,
+            }
+            config["readers"]["managed-image"] = {
+                "provider": "openai",
+                "model": "connections/vendor-reader/models/mock-reader",
+            }
+            config["transcribers"]["managed-audio"] = {
+                "provider": "openai",
+                "model": "connections/vendor-audio/models/whisper-1",
+            }
+            config["text_to_speech"]["managed-voice"] = {
+                "provider": "openai",
+                "model": "connections/vendor-audio/models/mock-voice",
+            }
+            config.setdefault("rerankers", {})["managed-rank"] = {
+                "provider": "cohere",
+                "model": "connections/vendor-rerank/models/rerank-v4.0-pro",
+                "field": "text",
+            }
+            config["rerankers"]["managed-worker-rank"] = {
+                "provider": "cloudflare",
+                "model": "connections/worker-rerank/models/@cf/baai/bge-reranker-base",
+                "field": "text",
+            }
+            config["connections"]["vendor-decision"] = {
+                "kind": "inference",
+                "capabilities": ["models.decide"],
+                "inference": {
+                    "provider": "openai",
+                    "url": upstream_url + "/ai/v1",
+                    "api_key": "mock-server-key",
+                    "headers": {"X-Billing-Team": "decision-poc"},
+                },
+            }
+            config["deciders"]["managed-triage"] = {
+                "provider": "openai",
+                "model": "connections/vendor-decision/models/mock-decision",
+            }
+            config["deciders"]["managed-generated"] = {
+                "decision_method": "generated",
+                "generator": {
+                    "provider": "openai",
+                    "model": "connections/vendor/models/gpt-4.1",
+                },
+                "output": "json_schema",
+                "probabilities": "verdict_only",
+            }
+            config["connections"]["public-decision"] = {
+                **config["connections"]["vendor-decision"],
+                "inference": {
+                    **config["connections"]["vendor-decision"]["inference"],
+                    "allow_private_ips": False,
+                },
+            }
+            config["connections"]["vendor-rerank"] = {
+                "kind": "inference",
+                "capabilities": ["models.rerank"],
+                "inference": {
+                    "provider": "cohere",
+                    "url": upstream_url,
+                    "api_key": "mock-server-key",
+                    "headers": {"X-Billing-Team": "cohere-poc"},
+                },
+            }
+            config["connections"]["restricted-rerank"] = {
+                **config["connections"]["vendor-rerank"],
+                "inference": {
+                    **config["connections"]["vendor-rerank"]["inference"],
+                    "attribution": {
+                        "header": "X-Cost-Center",
+                        "principals": {"operator": "search"},
+                    },
+                },
+            }
+            config["connections"]["worker-rerank"] = {
+                "kind": "inference",
+                "capabilities": ["models.rerank"],
+                "inference": {
+                    "provider": "cloudflare",
+                    "url": upstream_url + "/workers/rerank",
+                    "account_id": "fixture-account",
+                    "gateway_id": "fixture-gateway",
+                    "api_key": "mock-server-key",
+                    "headers": {"X-Billing-Team": "worker-poc"},
+                },
+            }
+            for name, team, allow_private in (
+                ("worker-discovery", "worker-discovery-poc", True),
+                ("worker-public-only", "worker-public-only-poc", False),
+            ):
+                config["connections"][name] = {
+                    "kind": "inference",
+                    "capabilities": ["models.rerank"],
+                    "inference": {
+                        "provider": "cloudflare",
+                        "url": upstream_url + "/workers/rerank",
+                        "discovery_url": upstream_url + "/workers/models/search",
+                        "account_id": "fixture-account",
+                        "api_key": "mock-server-key",
+                        "allow_private_ips": allow_private,
+                        "headers": {"X-Billing-Team": team},
+                        "attribution": {
+                            "header": "X-User-Billing",
+                            "principals": {"fixture-user": "private-billing"},
+                        },
+                    },
+                }
+            for name, provider, path, team, routing in (
+                (
+                    "worker-extract",
+                    "cloudflare",
+                    "/workers/extract",
+                    "worker-extract-poc",
+                    {
+                        "account_id": "fixture-account",
+                        "gateway_id": "fixture-gateway",
+                    },
+                ),
+                ("pioneer-extract", "pioneer", "/pioneer", "pioneer-poc", {}),
+            ):
+                config["connections"][name] = {
+                    "kind": "inference",
+                    "capabilities": ["models.extract"],
+                    "inference": {
+                        "provider": provider,
+                        "url": upstream_url + path,
+                        "api_key": "mock-server-key",
+                        "headers": {"X-Billing-Team": team},
+                        **routing,
+                    },
+                }
+            config["connections"]["vendor-reader"] = {
+                "kind": "inference",
+                "capabilities": ["models.read"],
+                "inference": {
+                    "provider": "openai",
+                    "url": upstream_url + "/reader-v1",
+                    "api_key": "mock-server-key",
+                    "headers": {"X-Billing-Team": "reader-poc"},
+                },
+            }
+            config["connections"]["vendor-audio"] = {
+                "kind": "inference",
+                "capabilities": ["models.transcribe", "models.synthesize"],
+                "inference": {
+                    "provider": "openai",
+                    "url": upstream_url + "/v1",
+                    "api_key": "mock-server-key",
+                    "headers": {"X-Billing-Team": "audio-poc"},
+                },
+            }
+            if not args.only_images:
+                tls_port, certificate = providers.enter_context(
+                    private_tls_gateway(root)
+                )
+                for name, hostname, ca_file in (
+                    ("private-tls", "127.0.0.1", certificate),
+                    ("untrusted-tls", "127.0.0.1", None),
+                    ("mismatched-tls", "localhost", certificate),
+                    ("public-only-tls", "127.0.0.1", certificate),
+                ):
+                    inference = {
+                        "provider": "openai",
+                        "url": f"https://{hostname}:{tls_port}/ai/v1",
+                        "api_key": "mock-server-key",
+                        "headers": {"X-Billing-Team": name},
+                        "allow_private_ips": name != "public-only-tls",
+                    }
+                    if ca_file is not None:
+                        inference["tls_ca_file"] = str(ca_file)
+                    config["connections"][name] = {
+                        "kind": "inference",
+                        "capabilities": ["models.generate"],
+                        "inference": inference,
+                    }
             config["connections"]["runtime"] = {
                 "kind": "inference",
                 "capabilities": ["models.generate", "models.decide"],
@@ -2538,6 +3829,12 @@ def main() -> None:
                     "api_key": "mock-server-key",
                 },
             }
+            for connection in ("runtime", "vendor"):
+                config["inference_capabilities"][
+                    f"connections/{connection}/models/mock-chat"
+                ] = {
+                    "streaming": "supported",
+                }
             config["generators"]["google-known"] = {
                 "provider": "gemini",
                 "model": "mock-known",
@@ -2590,16 +3887,18 @@ def main() -> None:
                     "url": upstream_url + "/bedrock",
                     "region": "us-east-1",
                     "api_key": "mock-server-key",
+                    "headers": {"X-Billing-Team": "bedrock-poc"},
                 },
             }
             config["connections"]["anthropic-vision"] = {
                 "kind": "inference",
-                "capabilities": ["models.generate"],
+                "capabilities": ["models.generate", "models.extract", "models.decide"],
                 "inference": {
                     "provider": "anthropic",
                     "url": upstream_url + "/anthropic",
                     "api_key": "mock-server-key",
                     "workspace_id": "fixture-workspace",
+                    "headers": {"X-Billing-Team": "anthropic-poc"},
                 },
             }
             config["chains"]["vision-fallback"] = [
@@ -2789,6 +4088,10 @@ def main() -> None:
                 config["inference_capabilities"]["generators/" + alias] = {
                     "streaming": "supported"
                 }
+            if args.only_connection_policy:
+                # Private provider fixtures must remain reachable with the
+                # independent remote-content private-address block enabled.
+                config["inference"]["content_security"] = {"block_private_ips": True}
             config_path = root / "config.json"
             config_path.write_text(json.dumps(config))
             port = free_port()
@@ -2813,6 +4116,11 @@ def main() -> None:
                     ],
                     stdout=log,
                     stderr=subprocess.STDOUT,
+                    env={
+                        key: value
+                        for key, value in os.environ.items()
+                        if key != "OPENAI_API_KEY"
+                    },
                 )
                 try:
                     deadline = time.monotonic() + 90
@@ -2835,6 +4143,32 @@ def main() -> None:
                             )
                         time.sleep(0.1)
                     print("remote-only gateway ready", flush=True)
+
+                    def invoke(operation, value=None, *, method="POST", headers=None):
+                        payload = None if value is None else json.dumps(value).encode()
+                        request = urllib.request.Request(
+                            base_url + operation,
+                            data=payload,
+                            method=method,
+                            headers={
+                                "Content-Type": "application/json",
+                                **(headers or {}),
+                            },
+                        )
+                        with urllib.request.urlopen(request, timeout=10) as response:
+                            raw = response.read()
+                            if (
+                                "json" in response.headers.get("Content-Type", "")
+                                and raw
+                            ):
+                                return json.loads(raw)
+                            return raw
+
+                    if args.only_connection_policy:
+                        verify_connection_policy(invoke, root / "server.log")
+                        print("connection policy conformance passed", flush=True)
+                        return
+
                     verify_hosted_image_inputs(base_url)
                     verify_hosted_image_streams(base_url)
                     verify_hosted_generation_contracts(base_url)
@@ -3065,26 +4399,6 @@ def main() -> None:
                         read = json.load(response)
                     assert read["data"][0]["text"] == "recognized"
                     assert read["usage"]["total_tokens"] == 3
-
-                    def invoke(operation, value=None, *, method="POST", headers=None):
-                        payload = None if value is None else json.dumps(value).encode()
-                        request = urllib.request.Request(
-                            base_url + operation,
-                            data=payload,
-                            method=method,
-                            headers={
-                                "Content-Type": "application/json",
-                                **(headers or {}),
-                            },
-                        )
-                        with urllib.request.urlopen(request, timeout=10) as response:
-                            raw = response.read()
-                            if (
-                                "json" in response.headers.get("Content-Type", "")
-                                and raw
-                            ):
-                                return json.loads(raw)
-                            return raw
 
                     catalog = invoke("/ai/v1/models", method="GET")
                     chain = next(
@@ -3623,11 +4937,7 @@ def main() -> None:
                             Upstream.session_delete_status = 204
                         if delete_status == 503:
                             invoke(deletion_path, method="DELETE")
-                    qualified = invoke(
-                        "/ai/v1/chat/completions",
-                        {"model": "connections/vendor/models/mock-chat", **prompt},
-                    )
-                    assert qualified["choices"][0]["message"]["content"] == "hello"
+                    verify_connection_policy(invoke, root / "server.log")
                     virtual = invoke(
                         "/db/v1/connections/named-inference/inference/generate",
                         {"model": "generators/support", **prompt},

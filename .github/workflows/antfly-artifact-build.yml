@@ -49,6 +49,7 @@ jobs:
       runtime_products: ${{ steps.source-contract.outputs.runtime_products }}
       apple_provider_bundle: ${{ steps.source-contract.outputs.apple_provider_bundle }}
       channel: ${{ steps.channel.outputs.channel }}
+      publish_embedded: ${{ steps.channel.outputs.publish_embedded }}
       build_controller_commit: ${{ steps.controller.outputs.commit }}
       python_build: ${{ steps.toolchain.outputs.python_build }}
       zig_version: ${{ steps.toolchain.outputs.zig_version }}
@@ -343,8 +344,11 @@ jobs:
       - release-plan
       - build-zig-runtime-archives
     uses: ./.github/workflows/embedded-package.yml
+    permissions:
+      contents: read
+      actions: read
     with:
-      retain_snapshot: ${{ needs.release-plan.outputs.channel == 'stable' }}
+      retain_snapshot: ${{ needs.release-plan.outputs.publish_embedded == 'true' }}
       version: ${{ inputs.tag_name }}
       source_commit: ${{ inputs.source_commit }}
       python_build: ${{ needs.release-plan.outputs.python_build }}

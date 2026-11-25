@@ -76,6 +76,14 @@ test "reader classifies retryable HTTP statuses" {
 }
 
 pub const Provider = config.Provider;
+
+pub fn defaultRemoteBaseUrl(provider: Provider) ?[]const u8 {
+    return switch (provider) {
+        .openai => "https://api.openai.com/v1",
+        .vertex => "https://aiplatform.googleapis.com/v1",
+        .antfly, .apple, .cloudflare => null,
+    };
+}
 pub const Config = config.Config;
 pub const max_output_tokens = config.max_output_tokens;
 pub const apple = @import("apple.zig");
@@ -450,7 +458,7 @@ pub const Registry = struct {
     }
 
     pub fn registerConfig(self: *Registry, name: []const u8, cfg: Config) !void {
-        try cfg.validate();
+        try cfg.validateForRegistry();
         const key = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(key);
         const owned = try cloneConfig(self.allocator, cfg);
@@ -1087,11 +1095,7 @@ fn CloudReaderState(comptime provider: Provider) type {
             state.* = .{ .alloc = alloc, .http = http, .options = options, .base_url = "", .model = "", .max_tokens = cfg.max_tokens };
             errdefer state.deinitState();
             state.gateway_id = try dupOpt(alloc, cfg.gateway_id);
-            state.base_url = if (provider == .cloudflare) try config.cloudflare.baseUrl(alloc, cfg.account_id, cfg.base_url orelse cfg.url) else try alloc.dupe(u8, cfg.base_url orelse (if (provider == .openai) cfg.resolvedUrl() else null) orelse switch (provider) {
-                .openai => "https://api.openai.com/v1",
-                .vertex => "https://aiplatform.googleapis.com/v1",
-                else => unreachable,
-            });
+            state.base_url = if (provider == .cloudflare) try config.cloudflare.baseUrl(alloc, cfg.account_id, cfg.base_url orelse cfg.url) else try alloc.dupe(u8, cfg.base_url orelse (if (provider == .openai) cfg.resolvedUrl() else null) orelse defaultRemoteBaseUrl(provider).?);
             state.model = try alloc.dupe(u8, cfg.model orelse switch (provider) {
                 .cloudflare => return error.InvalidReaderConfig,
                 .openai => "gpt-4.1-mini",

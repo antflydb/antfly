@@ -2083,6 +2083,7 @@ pub extern fn antfly_storage_context_configure_native_queries(context: ?*anyopaq
 /// the configured secret facade per request. Configure before opening any
 /// table owner; empty values clear the defaults.
 pub extern fn antfly_storage_context_configure_inference_defaults(context: ?*anyopaque, api_url: BorrowedBytes, api_key: BorrowedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_context_configure_inference_connections(context: ?*anyopaque, connections: ?*const anyopaque) callconv(.c) Status;
 
 /// Replaces the context-owned remote-content security snapshot before any
 /// table owner opens. The payload is a ContentSecurityConfig JSON object.

@@ -53,7 +53,7 @@ pub const Provider = struct {
             headers[count] = .{ "anthropic-workspace-id", workspace };
             count += 1;
         }
-        const options = httpx.RequestOptions{
+        var options = httpx.RequestOptions{
             .headers = headers[0..count],
             .json = body,
             .timeout_ms = self.timeout_ms,
@@ -65,6 +65,33 @@ pub const Provider = struct {
             .cookies_enabled = false,
         };
         if (comptime @TypeOf(writer) == @TypeOf(null)) return self.http.post(url, options);
+        const Observer = struct {
+            downstream: httpx.AttemptResultObserver,
+            stream_writer: @TypeOf(writer),
+
+            fn record(raw: *anyopaque, attempt: httpx.AttemptResultObserver.Attempt, elapsed_ns: u64, response: ?*const httpx.Response, err: ?anyerror) void {
+                const observer: *@This() = @ptrCast(@alignCast(raw));
+                if (response) |reply| if (observer.stream_writer.decoder.usage) |counts| {
+                    // The HTTP observer runs before chatStream builds its
+                    // normalized usage body. Report the decoded counters in
+                    // a borrowed observer-only copy of the response.
+                    var buffer: [192]u8 = undefined;
+                    if (std.fmt.bufPrint(&buffer, "{{\"usage\":{{\"input_tokens\":{d},\"output_tokens\":{d},\"total_tokens\":{d}}}}}", .{ counts.input_tokens, counts.output_tokens, counts.total_tokens orelse counts.input_tokens +| counts.output_tokens })) |body_bytes| {
+                        var observed = reply.*;
+                        observed.body = body_bytes;
+                        observed.body_owned = false;
+                        observer.downstream.record(observer.downstream.context, attempt, elapsed_ns, &observed, err);
+                        return;
+                    } else |_| {}
+                };
+                observer.downstream.record(observer.downstream.context, attempt, elapsed_ns, response, err);
+            }
+        };
+        var observer: Observer = undefined;
+        if (self.http.config.attempt_result_observer) |downstream| {
+            observer = .{ .downstream = downstream, .stream_writer = writer };
+            options.attempt_result_observer = .{ .context = &observer, .record = Observer.record };
+        }
         return self.http.requestToWriter(.POST, url, options, writer, null, null);
     }
     pub fn generate(self: *Provider, a: Allocator, model: []const u8, messages: []const lib.ChatMessage) !inference.GenerateResult {

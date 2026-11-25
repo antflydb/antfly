@@ -70,7 +70,8 @@ pub fn build(a: A, io: std.Io, table: local.common_topology_records.TableRecord,
     request.transport_io = if (transport_io) |*value| c.native.IoBorrow.init(value) else null;
     request.source.io = null;
     // Clients/caches embed the creator's executor and cannot cross error domains.
-    // Only the checked AntflyProvider and secret-store capabilities are borrowed.
+    // Checked AntflyProvider and secret-store capabilities and immutable
+    // connection configuration may be borrowed for this synchronous call.
     if (request.embedding_options) |*options| {
         if (options.provider_runtime) |runtime| request.provider_limits = runtime.limits;
         options.provider_runtime = null;

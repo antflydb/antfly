@@ -596,25 +596,92 @@ pub const Config = struct {
     pub const InferenceConnectionConfig = struct {
         provider: []u8,
         url: ?[]u8 = null,
+        discovery_url: ?[]u8 = null,
         api_key: ?[]u8 = null,
+        tls_ca_file: ?[]u8 = null,
+        allow_private_ips: ?bool = null,
+        headers: std.StringArrayHashMapUnmanaged([]u8) = .empty,
+        attribution: ?InferenceAttribution = null,
+
         region: ?[]u8 = null,
         project_id: ?[]u8 = null,
         location: ?[]u8 = null,
         credentials_path: ?[]u8 = null,
         workspace_id: ?[]u8 = null,
+        account_id: ?[]u8 = null,
+        gateway_id: ?[]u8 = null,
         max_image_input_tokens: ?u64 = null,
         names: []const []u8 = &.{},
         configured_model_types: []const []u8 = &.{},
 
+        pub const InferenceAttribution = struct {
+            header: []u8,
+            principals: std.StringArrayHashMapUnmanaged([]u8) = .empty,
+            workloads: std.StringArrayHashMapUnmanaged([]u8) = .empty,
+            tenants: std.StringArrayHashMapUnmanaged([]u8) = .empty,
+            projects: std.StringArrayHashMapUnmanaged([]u8) = .empty,
+
+            fn deinit(self: *InferenceAttribution, alloc: std.mem.Allocator) void {
+                alloc.free(self.header);
+                deinitInferenceHeaderMap(alloc, &self.principals);
+                deinitInferenceHeaderMap(alloc, &self.workloads);
+                deinitInferenceHeaderMap(alloc, &self.tenants);
+                deinitInferenceHeaderMap(alloc, &self.projects);
+            }
+        };
+
+        /// Resolve per-invocation secrets into a supplied arena, then bind the
+        /// caller's transport limits to this operator-configured destination.
+        pub fn clientConfig(self: InferenceConnectionConfig, arena: std.mem.Allocator, secret_store: ?*secrets.FileStore, base: @import("httpx").ClientConfig) !@import("httpx").ClientConfig {
+            return self.clientConfigForPrincipal(arena, secret_store, base, null);
+        }
+
+        pub fn clientConfigForPrincipal(self: InferenceConnectionConfig, arena: std.mem.Allocator, secret_store: ?*secrets.FileStore, base: @import("httpx").ClientConfig, principal: ?[]const u8) !@import("httpx").ClientConfig {
+            return self.clientConfigForIdentity(arena, secret_store, base, if (principal) |name| .{ .principal = name } else null);
+        }
+
+        pub fn clientConfigForIdentity(self: InferenceConnectionConfig, arena: std.mem.Allocator, secret_store: ?*secrets.FileStore, base: @import("httpx").ClientConfig, identity: ?InferenceAttributionIdentity) !@import("httpx").ClientConfig {
+            return self.clientConfigForIdentityWithDefaultURL(arena, secret_store, base, identity, null);
+        }
+
+        pub fn clientConfigForIdentityWithDefaultURL(self: InferenceConnectionConfig, arena: std.mem.Allocator, secret_store: ?*secrets.FileStore, base: @import("httpx").ClientConfig, identity: ?InferenceAttributionIdentity, default_url: ?[]const u8) !@import("httpx").ClientConfig {
+            var config = try self.transportConfigWithDefaultURL(base, default_url);
+            config.default_headers = try resolveInferenceHeadersForIdentity(arena, secret_store, self.headers, self.attribution, identity);
+            return config;
+        }
+
+        pub fn transportConfig(self: InferenceConnectionConfig, base: @import("httpx").ClientConfig) !@import("httpx").ClientConfig {
+            return self.transportConfigWithDefaultURL(base, null);
+        }
+
+        pub fn transportConfigWithDefaultURL(self: InferenceConnectionConfig, base: @import("httpx").ClientConfig, default_url: ?[]const u8) !@import("httpx").ClientConfig {
+            const url = self.url orelse default_url orelse return error.ConnectionURLMissing;
+            if (!validInferenceURL(url)) return error.InvalidConnectionURL;
+            var config = base;
+            config.request_origin = @import("httpx").Uri.parse(url) catch return error.InvalidConnectionURL;
+            config.base_url = null;
+            config.tls_ca_file = self.tls_ca_file;
+            config.address_filter = inferenceAddressFilter(self.allow_private_ips) orelse config.address_filter;
+            config.verify_ssl = true;
+            config.cookies_enabled = false;
+            return config;
+        }
+
         pub fn deinit(self: *InferenceConnectionConfig, alloc: std.mem.Allocator) void {
             alloc.free(self.provider);
             if (self.url) |value| alloc.free(value);
+            if (self.discovery_url) |value| alloc.free(value);
             if (self.api_key) |value| alloc.free(value);
+            if (self.tls_ca_file) |value| alloc.free(value);
             if (self.region) |value| alloc.free(value);
             if (self.project_id) |value| alloc.free(value);
             if (self.location) |value| alloc.free(value);
             if (self.credentials_path) |value| alloc.free(value);
             if (self.workspace_id) |value| alloc.free(value);
+            if (self.account_id) |value| alloc.free(value);
+            if (self.gateway_id) |value| alloc.free(value);
+            deinitInferenceHeaderMap(alloc, &self.headers);
+            if (self.attribution) |*attribution| attribution.deinit(alloc);
             freeOwnedStringSlice(alloc, self.names);
             freeOwnedStringSlice(alloc, self.configured_model_types);
             self.* = undefined;
@@ -2250,24 +2317,367 @@ fn parseConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Confi
     return connection;
 }
 
+pub const InferenceModelReference = struct {
+    connection: []const u8,
+    model: []const u8,
+
+    pub fn parse(id: []const u8) !?InferenceModelReference {
+        const prefix = "connections/";
+        if (!std.mem.startsWith(u8, id, prefix)) return null;
+        const rest = id[prefix.len..];
+        const separator = std.mem.indexOf(u8, rest, "/models/") orelse return error.InvalidModelIdentity;
+        const connection = rest[0..separator];
+        const model = rest[separator + "/models/".len ..];
+        if (connection.len == 0 or model.len == 0 or std.mem.indexOfScalar(u8, connection, '/') != null) return error.InvalidModelIdentity;
+        try validateInferenceModelPath(model);
+        return .{ .connection = connection, .model = model };
+    }
+};
+
+pub fn validateInferenceModelPath(model: []const u8) !void {
+    for (model) |byte| {
+        if (std.ascii.isControl(byte) or std.mem.indexOfScalar(u8, "?%#\\", byte) != null)
+            return error.InvalidModelIdentity;
+    }
+    var segments = std.mem.splitScalar(u8, model, '/');
+    while (segments.next()) |segment| {
+        if (segment.len == 0 or std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, ".."))
+            return error.InvalidModelIdentity;
+    }
+}
+
+test "connection model references preserve qualified model names and reject unsafe paths" {
+    const valid = (try InferenceModelReference.parse("connections/aws/models/vendor/model:0")).?;
+    try std.testing.expectEqualStrings("vendor/model:0", valid.model);
+    for ([_][]const u8{ "a/../b", "a//b", "a?b", "a%2fb", "a\x00b" }) |model| {
+        try std.testing.expectError(error.InvalidModelIdentity, validateInferenceModelPath(model));
+    }
+}
+
+pub fn resolveInferenceConnection(connections: *const Config.ConnectionsConfig, id: []const u8, capability: []const u8) !Config.InferenceConnectionConfig {
+    const connection = connections.get(id) orelse return error.ConnectionNotFound;
+    if (connection.kind != .inference) return error.ConnectionNotInference;
+    try requireInferenceCapability(connection.capabilities, capability);
+    return connection.inference orelse error.InvalidConfig;
+}
+
+pub fn requireInferenceCapability(capabilities: []const []const u8, required: []const u8) !void {
+    for (capabilities) |capability| {
+        if (std.mem.eql(u8, capability, required)) return;
+    }
+    return error.ConnectionCapabilityMissing;
+}
+
+pub fn inferenceAddressFilter(allow_private_ips: ?bool) ?@import("httpx").AddressFilter {
+    if (allow_private_ips == false) return scraping.globalAddressFilter();
+    return null;
+}
+
+pub fn validInferenceURL(raw_url: []const u8) bool {
+    if (std.mem.indexOfAny(u8, raw_url, "?#") != null) return false;
+    const parsed = std.Uri.parse(raw_url) catch return false;
+    return parsed.host != null and parsed.user == null and parsed.password == null and
+        (std.ascii.eqlIgnoreCase(parsed.scheme, "http") or std.ascii.eqlIgnoreCase(parsed.scheme, "https"));
+}
+
+// The allocator belongs to the invocation or discovery request arena.
+pub fn resolveInferenceHeaders(
+    arena: std.mem.Allocator,
+    secret_store: ?*secrets.FileStore,
+    raw_headers: std.StringArrayHashMapUnmanaged([]u8),
+) ![]const [2][]const u8 {
+    if (raw_headers.count() == 0) return &.{};
+    if (raw_headers.count() > max_inference_connection_headers) return error.InvalidConfig;
+    const headers = try arena.alloc([2][]const u8, raw_headers.count());
+    for (raw_headers.keys(), raw_headers.values(), headers) |name, raw, *header| {
+        const value = try secrets.resolveReferenceOwned(arena, secret_store, raw);
+        if (!validInferenceHeaderValue(value)) return error.InvalidConfig;
+        header.* = .{ name, value };
+    }
+    return headers;
+}
+
+fn deinitInferenceHeaderMap(alloc: std.mem.Allocator, headers: *std.StringArrayHashMapUnmanaged([]u8)) void {
+    for (headers.keys(), headers.values()) |key, value| {
+        alloc.free(key);
+        alloc.free(value);
+    }
+    headers.deinit(alloc);
+}
+
+pub const InferenceAttributionScope = struct { tenant: []const u8, project: ?[]const u8 = null };
+
+pub const InferenceAttributionIdentity = union(enum) {
+    principal: []const u8,
+    scope: InferenceAttributionScope,
+    workload: Workload,
+
+    pub const Workload = struct {
+        operation: enum { index_embed, index_extract, index_generate, index_decide, index_transcribe, index_read },
+        physical_table: []const u8,
+    };
+
+    pub fn billingScope(identity: ?InferenceAttributionIdentity) ?InferenceAttributionScope {
+        return switch (identity orelse return null) {
+            .scope => |value| value,
+            else => null,
+        };
+    }
+};
+
+/// The caller supplies metadata from an authenticated identity. The slices
+/// borrow the supplied arena and are suitable for an admission-time snapshot.
+pub fn inferenceScopeFromAuthenticatedMetadata(arena: std.mem.Allocator, metadata_json: []const u8) !?InferenceAttributionScope {
+    if (metadata_json.len == 0) return null;
+    const value = std.json.parseFromSliceLeaky(std.json.Value, arena, metadata_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    if (value != .object) return null;
+    const tenant = value.object.get("tenant_id");
+    const project = value.object.get("project_id");
+    if (tenant == null and project == null) return null;
+    // An explicitly malformed scope must fail the scope lookup rather than
+    // letting a mixed policy charge a different username billing account.
+    if (tenant == null or tenant.? != .string or (project != null and project.? != .string))
+        return .{ .tenant = "" };
+    return .{ .tenant = tenant.?.string, .project = if (project) |attribute| attribute.string else null };
+}
+
+pub fn authenticatedInferenceAttribution(
+    mapping: ?Config.InferenceConnectionConfig.InferenceAttribution,
+    principal: ?[]const u8,
+    scope: ?InferenceAttributionScope,
+) ?InferenceAttributionIdentity {
+    const rules = mapping orelse return null;
+    const username = principal orelse return null;
+    if (scope) |value| {
+        if (rules.tenants.count() != 0 or rules.projects.count() != 0) return .{ .scope = value };
+    }
+    return .{ .principal = username };
+}
+
+pub fn resolveAttributedInferenceHeaders(
+    arena: std.mem.Allocator,
+    secret_store: ?*secrets.FileStore,
+    static: std.StringArrayHashMapUnmanaged([]u8),
+    attribution: ?Config.InferenceConnectionConfig.InferenceAttribution,
+    principal: ?[]const u8,
+) ![]const [2][]const u8 {
+    return resolveInferenceHeadersForIdentity(arena, secret_store, static, attribution, if (principal) |name| .{ .principal = name } else null);
+}
+
+pub fn resolveInferenceHeadersForIdentity(
+    arena: std.mem.Allocator,
+    secret_store: ?*secrets.FileStore,
+    static: std.StringArrayHashMapUnmanaged([]u8),
+    attribution: ?Config.InferenceConnectionConfig.InferenceAttribution,
+    identity: ?InferenceAttributionIdentity,
+) ![]const [2][]const u8 {
+    const mapping = attribution orelse return resolveInferenceHeaders(arena, secret_store, static);
+    const raw = try selectInferenceAttribution(arena, mapping, identity);
+    const value = try secrets.resolveReferenceOwned(arena, secret_store, raw);
+    if (!validInferenceHeaderValue(value)) return error.InvalidConfig;
+    const fixed = try resolveInferenceHeaders(arena, secret_store, static);
+    const header = [_][2][]const u8{.{ mapping.header, value }};
+    return std.mem.concat(arena, [2][]const u8, &.{ fixed, &header });
+}
+
+fn validAttributionScopeComponent(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |byte| if (byte == '/' or std.ascii.isControl(byte)) return false;
+    return true;
+}
+
+pub fn selectInferenceAttribution(
+    scratch: std.mem.Allocator,
+    mapping: Config.InferenceConnectionConfig.InferenceAttribution,
+    identity: ?InferenceAttributionIdentity,
+) ![]const u8 {
+    return switch (identity orelse return error.InferenceAttributionDenied) {
+        .principal => |username| mapping.principals.get(username),
+        .scope => |scope| blk: {
+            if (!validAttributionScopeComponent(scope.tenant)) return error.InferenceAttributionDenied;
+            const project = scope.project orelse break :blk mapping.tenants.get(scope.tenant);
+            if (!validAttributionScopeComponent(project)) return error.InferenceAttributionDenied;
+            const key = try std.fmt.allocPrint(scratch, "{s}/{s}", .{ scope.tenant, project });
+            break :blk mapping.projects.get(key);
+        },
+        .workload => |workload| blk: {
+            if (workload.physical_table.len == 0) return error.InferenceAttributionDenied;
+            const key = try std.fmt.allocPrint(scratch, "{s}/{s}", .{ @tagName(workload.operation), workload.physical_table });
+            break :blk mapping.workloads.get(key);
+        },
+    } orelse return error.InferenceAttributionDenied;
+}
+
+pub const InferenceRequestHeaders = struct {
+    fixed: std.StringArrayHashMapUnmanaged([]u8),
+    billing: ?[2][]const u8,
+    secret_store: ?*secrets.FileStore,
+
+    /// Retain the authorized unresolved references. The immutable connection
+    /// config and secret store outlive the client holding this source.
+    pub fn init(arena: std.mem.Allocator, connection: Config.InferenceConnectionConfig, secret_store: ?*secrets.FileStore, identity: ?InferenceAttributionIdentity) !InferenceRequestHeaders {
+        const billing: ?[2][]const u8 = if (connection.attribution) |mapping|
+            .{ mapping.header, try selectInferenceAttribution(arena, mapping, identity) }
+        else
+            null;
+        return .{ .fixed = connection.headers, .billing = billing, .secret_store = secret_store };
+    }
+
+    pub fn source(self: *const InferenceRequestHeaders) @import("httpx").RequestHeaders {
+        return .{ .context = self, .apply = apply };
+    }
+
+    fn apply(raw: *const anyopaque, out: *@import("httpx").Headers) !void {
+        const self: *const InferenceRequestHeaders = @ptrCast(@alignCast(raw));
+        for (self.fixed.keys(), self.fixed.values()) |name, reference| {
+            try self.applyOne(out, name, reference);
+        }
+        if (self.billing) |billing| try self.applyOne(out, billing[0], billing[1]);
+    }
+
+    fn applyOne(self: *const InferenceRequestHeaders, out: *@import("httpx").Headers, name: []const u8, reference: []const u8) !void {
+        if (secrets.parseSecretReference(reference) == null) {
+            if (!validInferenceHeaderValue(reference)) return error.InvalidConfig;
+            return out.set(name, reference);
+        }
+        const value = try secrets.resolveReferenceOwned(out.allocator, self.secret_store, reference);
+        defer {
+            std.crypto.secureZero(u8, value);
+            out.allocator.free(value);
+        }
+        if (!validInferenceHeaderValue(value)) return error.InvalidConfig;
+        try out.set(name, value);
+    }
+};
+
+fn parseInferenceAttribution(alloc: std.mem.Allocator, value: std.json.Value) !Config.InferenceConnectionConfig.InferenceAttribution {
+    if (value != .object or !objectContainsOnly(value.object, &.{ "header", "principals", "workloads", "tenants", "projects" })) return error.InvalidConfig;
+    var result: Config.InferenceConnectionConfig.InferenceAttribution = .{ .header = try requiredStringFieldDup(alloc, value.object, "header") };
+    errdefer result.deinit(alloc);
+    if (!validInferenceHeaderName(result.header)) return error.InvalidConfig;
+    if (value.object.get("principals")) |principals| try parseInferenceAttributionMap(alloc, principals, &result.principals);
+    if (value.object.get("workloads")) |workloads| try parseInferenceAttributionMap(alloc, workloads, &result.workloads);
+    if (value.object.get("tenants")) |tenants| try parseInferenceAttributionMap(alloc, tenants, &result.tenants);
+    if (value.object.get("projects")) |projects| try parseInferenceAttributionMap(alloc, projects, &result.projects);
+    if (result.principals.count() == 0 and result.workloads.count() == 0 and result.tenants.count() == 0 and result.projects.count() == 0) return error.InvalidConfig;
+    return result;
+}
+
+fn parseInferenceAttributionMap(alloc: std.mem.Allocator, value: std.json.Value, result: *std.StringArrayHashMapUnmanaged([]u8)) !void {
+    if (value != .object) return error.InvalidConfig;
+    for (value.object.keys(), value.object.values()) |name, raw| {
+        if (name.len == 0 or raw != .string or !validInferenceHeaderValue(raw.string)) return error.InvalidConfig;
+        const key = try alloc.dupe(u8, name);
+        errdefer alloc.free(key);
+        const billing_value = try alloc.dupe(u8, raw.string);
+        errdefer alloc.free(billing_value);
+        try result.put(alloc, key, billing_value);
+    }
+}
+
+pub const max_inference_connection_headers = 16;
+
 fn parseInferenceConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Config.InferenceConnectionConfig {
     if (value != .object) return error.InvalidConfig;
-    if (!objectContainsOnly(value.object, &.{ "provider", "url", "api_key", "region", "project_id", "location", "credentials_path", "workspace_id", "names", "configured_model_types", "max_image_input_tokens" })) return error.InvalidConfig;
+    if (!objectContainsOnly(value.object, &.{ "provider", "url", "discovery_url", "api_key", "tls_ca_file", "allow_private_ips", "headers", "attribution", "region", "project_id", "location", "credentials_path", "workspace_id", "account_id", "gateway_id", "names", "configured_model_types", "max_image_input_tokens" })) return error.InvalidConfig;
     const image_tokens = try optionalU64Field(value.object, "max_image_input_tokens");
     if (image_tokens == 0) return error.InvalidConfig;
-    return .{
-        .max_image_input_tokens = image_tokens,
+    var cfg: Config.InferenceConnectionConfig = .{
         .provider = try requiredStringFieldDup(alloc, value.object, "provider"),
-        .url = try optionalStringFieldDup(alloc, value.object, "url"),
-        .api_key = try optionalStringFieldDup(alloc, value.object, "api_key"),
-        .region = try optionalStringFieldDup(alloc, value.object, "region"),
-        .project_id = try optionalStringFieldDup(alloc, value.object, "project_id"),
-        .location = try optionalStringFieldDup(alloc, value.object, "location"),
-        .credentials_path = try optionalStringFieldDup(alloc, value.object, "credentials_path"),
-        .workspace_id = try optionalStringFieldDup(alloc, value.object, "workspace_id"),
-        .names = try optionalStringArrayField(alloc, value.object, "names") orelse &.{},
-        .configured_model_types = try optionalStringArrayField(alloc, value.object, "configured_model_types") orelse &.{},
+        .max_image_input_tokens = image_tokens,
     };
+    errdefer cfg.deinit(alloc);
+    cfg.url = try optionalStringFieldDup(alloc, value.object, "url");
+    cfg.discovery_url = try optionalStringFieldDup(alloc, value.object, "discovery_url");
+    if (cfg.discovery_url) |url| {
+        if (!std.mem.eql(u8, cfg.provider, "cloudflare") or !validInferenceURL(url)) return error.InvalidConfig;
+    }
+    cfg.api_key = try optionalStringFieldDup(alloc, value.object, "api_key");
+    cfg.allow_private_ips = try optionalBoolField(value.object, "allow_private_ips");
+    cfg.tls_ca_file = try optionalStringFieldDup(alloc, value.object, "tls_ca_file");
+    if (cfg.tls_ca_file) |path| {
+        if (!std.fs.path.isAbsolute(path) or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidConfig;
+        const url = cfg.url orelse return error.InvalidConfig;
+        const uri = std.Uri.parse(url) catch return error.InvalidConfig;
+        if (!std.ascii.eqlIgnoreCase(uri.scheme, "https") or uri.host == null or uri.user != null or uri.password != null or uri.query != null or uri.fragment != null) return error.InvalidConfig;
+    }
+    cfg.region = try optionalStringFieldDup(alloc, value.object, "region");
+    cfg.project_id = try optionalStringFieldDup(alloc, value.object, "project_id");
+    cfg.location = try optionalStringFieldDup(alloc, value.object, "location");
+    cfg.credentials_path = try optionalStringFieldDup(alloc, value.object, "credentials_path");
+    cfg.workspace_id = try optionalStringFieldDup(alloc, value.object, "workspace_id");
+    cfg.account_id = try optionalStringFieldDup(alloc, value.object, "account_id");
+    cfg.gateway_id = try optionalStringFieldDup(alloc, value.object, "gateway_id");
+    if (std.mem.eql(u8, cfg.provider, "cloudflare")) {
+        const routing = @import("antfly_embeddings").cloudflare;
+        routing.identifier(cfg.account_id orelse return error.InvalidConfig) catch return error.InvalidConfig;
+        if (cfg.gateway_id) |gateway| routing.identifier(gateway) catch return error.InvalidConfig;
+    } else if (cfg.account_id != null or cfg.gateway_id != null) return error.InvalidConfig;
+    cfg.names = try optionalStringArrayField(alloc, value.object, "names") orelse &.{};
+    cfg.configured_model_types = try optionalStringArrayField(alloc, value.object, "configured_model_types") orelse &.{};
+
+    if (value.object.get("headers")) |headers| {
+        if (headers != .object or headers.object.count() > max_inference_connection_headers) return error.InvalidConfig;
+        for (headers.object.keys(), headers.object.values()) |name, raw| {
+            if (!validInferenceHeaderName(name) or raw != .string or !validInferenceHeaderValue(raw.string)) return error.InvalidConfig;
+            for (cfg.headers.keys()) |existing| {
+                if (std.ascii.eqlIgnoreCase(existing, name)) return error.InvalidConfig;
+            }
+            const key = try alloc.dupe(u8, name);
+            errdefer alloc.free(key);
+            const header_value = try alloc.dupe(u8, raw.string);
+            errdefer alloc.free(header_value);
+            try cfg.headers.put(alloc, key, header_value);
+        }
+    }
+    if (value.object.get("attribution")) |raw| {
+        cfg.attribution = try parseInferenceAttribution(alloc, raw);
+        if (cfg.headers.count() == max_inference_connection_headers) return error.InvalidConfig;
+        for (cfg.headers.keys()) |name| {
+            if (std.ascii.eqlIgnoreCase(name, cfg.attribution.?.header)) return error.InvalidConfig;
+        }
+    }
+    if (cfg.headers.count() > 0 or cfg.tls_ca_file != null or cfg.attribution != null or cfg.allow_private_ips != null) {
+        if (cfg.url) |url| {
+            if (!validInferenceURL(url)) return error.InvalidConfig;
+        } else if (std.mem.eql(u8, cfg.provider, "antfly")) return error.InvalidConfig;
+        const supported = [_][]const u8{ "antfly", "openai", "anthropic", "openrouter", "ollama", "cohere", "gemini", "vertex", "bedrock", "cloudflare", "jev", "elevenlabs", "pioneer" };
+        for (supported) |provider| {
+            if (std.mem.eql(u8, cfg.provider, provider)) break;
+        } else return error.InvalidConfig;
+    }
+    return cfg;
+}
+
+fn validInferenceHeaderName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 128) return false;
+    for (name) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and std.mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", byte) == null) return false;
+    }
+    if (std.ascii.startsWithIgnoreCase(name, "x-antfly-") or std.ascii.startsWithIgnoreCase(name, "proxy-")) return false;
+    for ([_][]const u8{
+        "authorization",     "host",              "content-length",         "content-type",    "content-encoding",
+        "transfer-encoding", "connection",        "upgrade",                "keep-alive",      "te",
+        "trailer",           "anthropic-version", "anthropic-workspace-id", "anthropic-beta",  "expect",
+        "cookie",            "set-cookie",        "forwarded",              "accept-encoding", "x-api-key",
+        "cf-aig-gateway-id",
+    }) |reserved| {
+        if (std.ascii.eqlIgnoreCase(name, reserved)) return false;
+    }
+    return !std.ascii.startsWithIgnoreCase(name, "x-forwarded-") and
+        !std.ascii.startsWithIgnoreCase(name, "x-goog-") and
+        !std.ascii.startsWithIgnoreCase(name, "x-amz-");
+}
+
+pub fn validInferenceHeaderValue(value: []const u8) bool {
+    if (value.len > 4096) return false;
+    for (value) |byte| {
+        if (byte < 0x20 or byte > 0x7e) return false;
+    }
+    return true;
 }
 
 fn parseWebSearchConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Config.WebSearchConnectionConfig {
@@ -2773,7 +3183,7 @@ fn resolveSecretReferencesInValue(
                     .config_root => if (std.mem.eql(u8, entry.key_ptr.*, "connections")) .connections else if (std.mem.eql(u8, entry.key_ptr.*, "inference")) .inference_root else .normal,
                     .connections => .connection,
                     .connection => if (std.mem.eql(u8, entry.key_ptr.*, "external_io")) .external_io else if (std.mem.eql(u8, entry.key_ptr.*, "inference") or std.mem.eql(u8, entry.key_ptr.*, "web_search")) .inference_connection else .normal,
-                    .inference_connection => if (std.mem.eql(u8, entry.key_ptr.*, "api_key")) continue else .normal,
+                    .inference_connection => if (std.mem.eql(u8, entry.key_ptr.*, "api_key") or std.mem.eql(u8, entry.key_ptr.*, "headers") or std.mem.eql(u8, entry.key_ptr.*, "attribution")) continue else .normal,
                     .inference_root => if (std.mem.eql(u8, entry.key_ptr.*, "api_key") or std.mem.eql(u8, entry.key_ptr.*, "s3_credentials")) continue else .normal,
                     .external_io => if (std.mem.eql(u8, entry.key_ptr.*, "credentials")) continue else .normal,
                     .normal => .normal,
@@ -4270,6 +4680,224 @@ test "provider registry gateway connection image token bounds are positive and o
         const input = try std.fmt.allocPrint(a, "{{\"connections\":{{\"vendor\":{{\"kind\":\"inference\",\"capabilities\":[\"models.decide\"],\"inference\":{{\"provider\":\"openai\",\"max_image_input_tokens\":{s}}}}}}}}}", .{bound});
         defer a.free(input);
         try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, input));
+    }
+}
+
+test "inference connection admits policy headers on managed Cloudflare routing" {
+    const a = std.testing.allocator;
+    var config = try Config.parseFromSlice(a,
+        \\{"connections":{"workers":{"kind":"inference","capabilities":["models.rerank"],"inference":{"provider":"cloudflare","url":"https://gateway.internal/rerank","account_id":"account","gateway_id":"gateway","headers":{"X-Billing-Team":"workers"}}}}}
+    );
+    defer config.deinit();
+    const connection = config.connections.get("workers").?.inference.?;
+    try std.testing.expectEqualStrings("gateway", connection.gateway_id.?);
+    try std.testing.expectEqualStrings("workers", connection.headers.get("X-Billing-Team").?);
+}
+
+test "inference connection rejects invalid Cloudflare routing configuration" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        \\{"provider":"cloudflare"}
+        ,
+        \\{"provider":"cloudflare","account_id":"../account"}
+        ,
+        \\{"provider":"cloudflare","account_id":"account","gateway_id":"bad/id"}
+        ,
+        \\{"provider":"openai","account_id":"account"}
+        ,
+    }) |raw| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidConfig, parseInferenceConnectionConfig(a, parsed.value));
+    }
+}
+
+test "native inference connection validates operator headers" {
+    const a = std.testing.allocator;
+    var config = try Config.parseFromSlice(a,
+        \\{"connections":{"gateway":{"kind":"inference","capabilities":["models.generate"],"inference":{"provider":"antfly","url":"https://gateway.internal","headers":{"X-Billing-Team":"search","X-Gateway-Token":"${secret:gateway.token}"}}}}}
+    );
+    defer config.deinit();
+    const headers = config.connections.get("gateway").?.inference.?.headers;
+    try std.testing.expectEqualStrings("search", headers.get("X-Billing-Team").?);
+    try std.testing.expectEqualStrings("${secret:gateway.token}", headers.get("X-Gateway-Token").?);
+
+    for ([_][]const u8{
+        \\{"cf-aig-gateway-id":"override"}
+        ,
+        \\{"Authorization":"override"}
+        ,
+        \\{"x-antfly-inference-timeout-ms":"500"}
+        ,
+        \\{"X-Billing":"a","x-billing":"b"}
+        ,
+        \\{"X-Billing":"a\r\nb"}
+        ,
+        \\{"Bad Header":"value"}
+        ,
+        \\{"X-Billing":123}
+        ,
+    }) |invalid_headers| {
+        const raw = try std.fmt.allocPrint(a, "{{\"provider\":\"antfly\",\"url\":\"https://gateway.internal\",\"headers\":{s}}}", .{invalid_headers});
+        defer a.free(raw);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidConfig, parseInferenceConnectionConfig(a, parsed.value));
+    }
+}
+
+test "inference connection attribution resolves only mapped authenticated usernames" {
+    const a = std.testing.allocator;
+    const raw =
+        \\{"provider":"openai","url":"https://gateway.internal","headers":{"X-Product":"search"},"attribution":{"header":"X-Billing-Team","principals":{"alice":"team-17","bob":"team-23"}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer parsed.deinit();
+    var cfg = try parseInferenceConnectionConfig(a, parsed.value);
+    defer cfg.deinit(a);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scoped = try cfg.clientConfigForPrincipal(arena.allocator(), null, .{}, "alice");
+    const headers = scoped.default_headers.?;
+    try std.testing.expectEqual(@as(usize, 2), headers.len);
+    try std.testing.expectEqualStrings("X-Billing-Team", headers[1][0]);
+    try std.testing.expectEqualStrings("team-17", headers[1][1]);
+    try std.testing.expectError(error.InferenceAttributionDenied, cfg.clientConfigForPrincipal(arena.allocator(), null, .{}, null));
+    try std.testing.expectError(error.InferenceAttributionDenied, cfg.clientConfigForPrincipal(arena.allocator(), null, .{}, "team-17"));
+}
+
+test "inference attribution distinguishes tenants, projects, and usernames" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"header":"X-Billing-Team","principals":{"acme":"user"},"tenants":{"acme":"tenant"},"projects":{"acme/search":"project"}}
+    , .{});
+    defer parsed.deinit();
+    var attribution = try parseInferenceAttribution(a, parsed.value);
+    defer attribution.deinit(a);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    try std.testing.expectEqualStrings("user", try selectInferenceAttribution(scratch, attribution, .{ .principal = "acme" }));
+    try std.testing.expectEqualStrings("tenant", try selectInferenceAttribution(scratch, attribution, .{ .scope = .{ .tenant = "acme" } }));
+    try std.testing.expectEqualStrings("project", try selectInferenceAttribution(scratch, attribution, .{ .scope = .{ .tenant = "acme", .project = "search" } }));
+    const malformed = try inferenceScopeFromAuthenticatedMetadata(scratch, "{\"tenant_id\":\"acme\",\"project_id\":42}");
+    try std.testing.expectError(error.InferenceAttributionDenied, selectInferenceAttribution(scratch, attribution, authenticatedInferenceAttribution(attribution, "acme", malformed)));
+    try std.testing.expectError(error.InferenceAttributionDenied, selectInferenceAttribution(scratch, attribution, .{ .scope = .{ .tenant = "other", .project = "search" } }));
+    try std.testing.expectError(error.InferenceAttributionDenied, selectInferenceAttribution(scratch, attribution, .{ .scope = .{ .tenant = "acme", .project = "missing" } }));
+}
+
+test "inference connection workload grants do not authorize public principals" {
+    const a = std.testing.allocator;
+    const raw =
+        \\{"provider":"openai","url":"https://gateway.internal","attribution":{"header":"X-Billing-Team","workloads":{"index_embed/physical-docs":"index-team","index_extract/physical-docs":"extraction-team","index_generate/physical-docs":"generation-team"}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer parsed.deinit();
+    var cfg = try parseInferenceConnectionConfig(a, parsed.value);
+    defer cfg.deinit(a);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const embedding = try cfg.clientConfigForIdentity(scratch, null, .{}, .{ .workload = .{ .operation = .index_embed, .physical_table = "physical-docs" } });
+    const extraction = try cfg.clientConfigForIdentity(scratch, null, .{}, .{ .workload = .{ .operation = .index_extract, .physical_table = "physical-docs" } });
+    try std.testing.expectEqualStrings("index-team", embedding.default_headers.?[0][1]);
+    try std.testing.expectEqualStrings("extraction-team", extraction.default_headers.?[0][1]);
+    const generation = try cfg.clientConfigForIdentity(scratch, null, .{}, .{ .workload = .{ .operation = .index_generate, .physical_table = "physical-docs" } });
+    try std.testing.expectEqualStrings("generation-team", generation.default_headers.?[0][1]);
+    try std.testing.expectError(error.InferenceAttributionDenied, cfg.clientConfigForPrincipal(scratch, null, .{}, "index_embed/physical-docs"));
+    try std.testing.expectError(error.InferenceAttributionDenied, cfg.clientConfigForIdentity(scratch, null, .{}, .{ .workload = .{ .operation = .index_embed, .physical_table = "another-table" } }));
+}
+
+test "inference connection request headers observe workload secret rotation" {
+    const a = std.testing.allocator;
+    const path = try std.fmt.allocPrint(a, ".zig-cache/test-inference-header-rotation-{d}.json", .{platform.time.monotonicNs()});
+    defer a.free(path);
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io_impl.io(), path) catch {};
+    var store = try secrets.FileStore.init(a, path);
+    defer store.deinit();
+    const raw =
+        \\{"provider":"openai","url":"https://gateway.internal","attribution":{"header":"X-Billing-Team","workloads":{"index_embed/docs":"${secret:index.team}"}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer parsed.deinit();
+    var cfg = try parseInferenceConnectionConfig(a, parsed.value);
+    defer cfg.deinit(a);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const resolver = try InferenceRequestHeaders.init(arena.allocator(), cfg, &store, .{ .workload = .{ .operation = .index_embed, .physical_table = "docs" } });
+    const source = resolver.source();
+    for ([_][]const u8{ "before-rotation", "after-rotation" }) |value| {
+        var stored = try store.put(a, "index.team", value);
+        defer stored.deinit(a);
+        var outbound = @import("httpx").Headers.init(a);
+        defer outbound.deinit();
+        try source.apply(source.context, &outbound);
+        try std.testing.expectEqualStrings(value, outbound.get("X-Billing-Team").?);
+    }
+}
+
+test "inference connection transport binds headers to its effective origin" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"provider":"openai","allow_private_ips":false,"headers":{"X-Billing-Team":"search"}}
+    , .{});
+    defer parsed.deinit();
+    var cfg = try parseInferenceConnectionConfig(a, parsed.value);
+    defer cfg.deinit(a);
+
+    const default_url = "https://api.openai.com/v1";
+    try std.testing.expectError(error.ConnectionURLMissing, cfg.transportConfig(.{}));
+    const standard = try cfg.clientConfigForIdentityWithDefaultURL(scratch, null, .{}, null, default_url);
+    try std.testing.expectEqualStrings("api.openai.com", standard.request_origin.?.host.?);
+    try std.testing.expectEqualStrings("search", standard.default_headers.?[0][1]);
+    try std.testing.expect(standard.address_filter != null);
+    try std.testing.expect(standard.verify_ssl);
+
+    cfg.url = try a.dupe(u8, "https://gateway.internal/v1");
+    const custom = try cfg.clientConfigForIdentityWithDefaultURL(scratch, null, .{}, null, default_url);
+    try std.testing.expectEqualStrings("gateway.internal", custom.request_origin.?.host.?);
+    try std.testing.expectEqualStrings("search", custom.default_headers.?[0][1]);
+}
+
+test "inference connection public-only policy rejects loopback and private addresses" {
+    const filter = inferenceAddressFilter(false).?;
+    for ([_][]const u8{ "127.0.0.1", "10.0.0.12", "169.254.169.254", "::1", "fd00::1" }) |literal| {
+        try std.testing.expect(!filter.accepts(try std.Io.net.IpAddress.parse(literal, 443)));
+    }
+    try std.testing.expect(filter.accepts(try std.Io.net.IpAddress.parse("8.8.8.8", 443)));
+    try std.testing.expect(inferenceAddressFilter(true) == null);
+    try std.testing.expect(inferenceAddressFilter(null) == null);
+}
+
+test "inference connection CA bundle requires an absolute path and explicit HTTPS origin" {
+    const a = std.testing.allocator;
+    const accepted =
+        \\{"provider":"openai","url":"https://gateway.internal/v1","tls_ca_file":"/etc/antfly/private-gateway.pem"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, accepted, .{});
+    defer parsed.deinit();
+    var cfg = try parseInferenceConnectionConfig(a, parsed.value);
+    defer cfg.deinit(a);
+    try std.testing.expectEqualStrings("/etc/antfly/private-gateway.pem", cfg.tls_ca_file.?);
+
+    for ([_][]const u8{
+        \\{"provider":"openai","url":"https://gateway.internal","tls_ca_file":"relative.pem"}
+        ,
+        \\{"provider":"openai","url":"http://gateway.internal","tls_ca_file":"/ca.pem"}
+        ,
+        \\{"provider":"openai","url":"https://user@gateway.internal","tls_ca_file":"/ca.pem"}
+        ,
+        \\{"provider":"openai","tls_ca_file":"/ca.pem"}
+        ,
+    }) |rejected| {
+        const invalid = try std.json.parseFromSlice(std.json.Value, a, rejected, .{});
+        defer invalid.deinit();
+        try std.testing.expectError(error.InvalidConfig, parseInferenceConnectionConfig(a, invalid.value));
     }
 }
 

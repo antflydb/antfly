@@ -39,6 +39,7 @@ from embedded_cargo import (
     upload,
     upload_metadata,
 )
+from release_lines import resolve_tag
 
 NAME = "antfly-sdk"
 
@@ -49,13 +50,15 @@ def identity(repo: Path, tag: str) -> tuple[str, str]:
     ):
         raise ValueError("expected an rs/antfly/sdk/vX.Y.Z release tag")
     version = tag.removeprefix("rs/antfly/sdk/v")
+    source = resolve_tag("v" + version).source_ref
+    source_branch = "origin/" + source.removeprefix("refs/heads/")
     commit = subprocess.check_output(
         ["git", "rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}"],
         cwd=repo,
         text=True,
     ).strip()
     subprocess.run(
-        ["git", "merge-base", "--is-ancestor", commit, "origin/main"],
+        ["git", "merge-base", "--is-ancestor", commit, source_branch],
         cwd=repo,
         check=True,
     )
