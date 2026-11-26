@@ -37916,7 +37916,7 @@ int antfly_metal_dispatch_paged_relative_bf16(
         const int direct = antfly_metal_encode_typed_stage(runtime, @"antfly_paged_relative_gqa_d128_direct",
             &runtime->paged_relative_bf16_pipelines[7], direct_views, direct_bytes, direct_alignments, 8, 1u << 7,
             p, sizeof(*p), MTLSizeMake(row_heads, 1, 1), threads);
-        if (direct != -3) return direct;
+        if (direct != -3 || !views[5].handle) return direct;
     }
     const size_t partial_bytes[6] = {q_bytes, kv_bytes, kv_bytes, relative_bytes, page_bytes, scratch_bytes};
     const size_t partial_alignments[6] = {2, 2, 2, 2, 4, 4};

@@ -138,7 +138,7 @@ pub const Layer = struct {
         normalized_query: *Tensor,
         normalized_relative: *Tensor,
         relative_logits: *Tensor,
-        attention_scratch: *Tensor,
+        attention_scratch: ?*Tensor,
         heads: *Tensor,
     };
 
@@ -241,7 +241,7 @@ pub const RequestWorkspace = struct {
     const plane_count = @typeInfo(Plane).@"enum".field_names.len;
     backing: Tensor,
     views: [plane_count]Tensor,
-    reduction: Tensor,
+    reduction: ?Tensor,
     packed_rows: bool,
 
     pub const Plan = struct {
@@ -307,11 +307,13 @@ pub const RequestWorkspace = struct {
         const size = std.math.cast(i32, plan.bytes / 2) orelse return error.InvalidShape;
         var backing = try Tensor.deviceAllocateTyped(a, runtime, .i16, .private, &.{size});
         errdefer backing.deinit();
-        var reduction = if (supplied_reduction) |storage|
+        var reduction: ?Tensor = if (plan.reduction_elements == 0)
+            null
+        else if (supplied_reduction) |storage|
             try storage.arena.retainedTypedView(storage.offset, &.{plan.reduction_elements}, .f32)
         else
             try Tensor.deviceAllocateTyped(a, runtime, .f32, .private, &.{plan.reduction_elements});
-        errdefer reduction.deinit();
+        errdefer if (reduction) |*storage| storage.deinit();
         var views: [plane_count]Tensor = undefined;
         var count: usize = 0;
         errdefer for (views[0..count]) |*view| view.deinit();
@@ -324,7 +326,7 @@ pub const RequestWorkspace = struct {
 
     pub fn deinit(self: *RequestWorkspace) void {
         for (&self.views) |*view| view.deinit();
-        self.reduction.deinit();
+        if (self.reduction) |*storage| storage.deinit();
         self.backing.deinit();
     }
 
@@ -351,7 +353,7 @@ pub const RequestWorkspace = struct {
             .normalized_relative = self.plane(.normalized_relative),
             .relative_logits = self.plane(.relative_logits),
             .heads = self.plane(.heads),
-            .attention_scratch = &self.reduction,
+            .attention_scratch = if (self.reduction) |*storage| storage else null,
         };
     }
 };

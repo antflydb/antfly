@@ -1183,13 +1183,14 @@ test "Inkling Metal resident decoder executes the full visit schedule on a synth
     try std.testing.expectEqual(@as(usize, 5), tail_request.state.sequence.committed_tokens);
     if (groupedPrefillEnabled()) {
         var group_request: Request = undefined;
-        const grouped_plan = (try RequestPlan.initPrefill(&model, 17, 16)).withDeviceSelection();
+        const grouped_plan = (try RequestPlan.initPrefill(&model, 129, 16)).withDeviceSelection();
         try group_request.initWithPlan(a, &model, grouped_plan);
         defer group_request.deinit();
         const work = &group_request.prefill.?;
         const groups = work.groups orelse return error.InvalidFixture;
-        try std.testing.expectEqual(work.get(.router).deviceHandle(), work.attention.reduction.deviceHandle());
-        try std.testing.expectEqual(work.get(.router).deviceByteOffset(), work.attention.reduction.deviceByteOffset());
+        const reduction = work.attention.reduction orelse return error.InvalidFixture;
+        try std.testing.expectEqual(work.get(.router).deviceHandle(), reduction.deviceHandle());
+        try std.testing.expectEqual(work.get(.router).deviceByteOffset(), reduction.deviceByteOffset());
         try std.testing.expectEqual(work.get(.selected).deviceHandle(), groups.deviceHandle());
         try std.testing.expect(groups.deviceByteOffset() >= work.get(.selected).deviceByteOffset() + work.get(.selected).deviceByteLen());
         try group_request.appendTokens(&@as([16]i32, @splat(1)));

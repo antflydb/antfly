@@ -53274,17 +53274,24 @@ pub const PagedRelativeBf16Attention = struct {
 
     pub fn scratchElements(self: PagedRelativeBf16Attention) !i32 {
         const coverage = try self.query.coverage(self.range.visible_start, self.range.visible_end);
-        return @intCast(coverage.row_heads * splits(coverage) * 130);
+        const split_count = splits(coverage);
+        return if (split_count == 1) 0 else @intCast(coverage.row_heads * split_count * 130);
     }
 
-    pub fn encode(self: PagedRelativeBf16Attention, runtime: *RawMetalDecodeRuntime, input: Inputs, scratch: *MetalTensor, output: *MetalTensor) !void {
+    pub fn encode(self: PagedRelativeBf16Attention, runtime: *RawMetalDecodeRuntime, input: Inputs, scratch: ?*MetalTensor, output: *MetalTensor) !void {
         if (!hasActiveFrame(runtime)) return error.MetalFrameRequired;
-        if (scratch.isReadOnlyPhysical() or output.isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
+        if ((if (scratch) |storage| storage.isReadOnlyPhysical() else false) or output.isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
         if (self.query.relative_extent != 0 and input.relative == null) return error.InvalidShape;
         const coverage = try self.query.coverage(self.range.visible_start, self.range.visible_end);
         const physical_rows = try self.range.physicalRows();
-        const scratch_row_bytes = @as(usize, self.query.q_heads) * splits(coverage) * 130 * @sizeOf(f32);
-        const rows_per_dispatch: u32 = @intCast(@min(self.query.rows, scratch.deviceByteLen() / scratch_row_bytes));
+        const split_count = splits(coverage);
+        const scratch_row_bytes = @as(usize, self.query.q_heads) * split_count * 130 * @sizeOf(f32);
+        const rows_per_dispatch: u32 = if (split_count == 1)
+            self.query.rows
+        else if (scratch) |storage|
+            @intCast(@min(self.query.rows, storage.deviceByteLen() / scratch_row_bytes))
+        else
+            return error.InvalidShape;
         if (rows_per_dispatch == 0) return error.InvalidShape;
         const views: [9]Buffer = .{
             try .fromTensor(input.query, .i16),
@@ -53292,7 +53299,7 @@ pub const PagedRelativeBf16Attention = struct {
             try .fromTensor(input.values, .i16),
             if (input.relative) |relative| try .fromTensor(relative, .i16) else .{},
             try .fromTensor(input.page_ids, .i32),
-            try .fromTensor(scratch, .f32),
+            if (scratch) |storage| try .fromTensor(storage, .f32) else .{},
             try .fromTensor(input.sinks, .i16),
             try .fromTensor(input.gates, .i16),
             try .fromTensor(output, .i16),
@@ -53322,7 +53329,7 @@ pub const PagedRelativeBf16Attention = struct {
                 offset += query.rows;
             }
         }
-        scratch.invalidateHostMirror();
+        if (scratch) |storage| storage.invalidateHostMirror();
         output.invalidateHostMirror();
     }
 
@@ -53527,7 +53534,7 @@ pub const CausalPagedRelativeBf16 = struct {
         key: Operand,
         value: Operand,
         convolution: CausalDepthwise4Bf16,
-        scratch: *MetalTensor,
+        scratch: ?*MetalTensor,
         output: *MetalTensor,
     ) !void {
         const range = try append.stagedRange(group);
@@ -53600,18 +53607,19 @@ test "Metal paged relative attention reads convolved KV written directly in the 
         .range = try append.stagedRange(.sliding),
     };
     try std.testing.expectEqual(@as(usize, 1), attention.range.first_page);
+    try std.testing.expectEqual(@as(i32, 0), try attention.scratchElements());
     const zeros: [512]u16 = @splat(0);
     var values: [256]u16 = undefined;
     @memset(values[0..128], 0x4000);
     @memset(values[128..], 0x4080);
-    const dtypes: [13]metal_tensor.DType = .{ .i16, .i16, .i16, .i16, .i16, .i32, .i16, .f32, .i16, .i16, .i16, .i16, .i16 };
-    const sizes = [13]i32{ 256, 512, 512, 256, 256, 2, 2, try attention.scratchElements(), 256, 512, 384, 384, 384 };
+    const dtypes: [12]metal_tensor.DType = .{ .i16, .i16, .i16, .i16, .i16, .i32, .i16, .i16, .i16, .i16, .i16, .i16 };
+    const sizes = [12]i32{ 256, 512, 512, 256, 256, 2, 2, 256, 512, 384, 384, 384 };
     const payloads: [7][]const u8 = .{
         std.mem.sliceAsBytes(zeros[0..256]), std.mem.asBytes(&zeros),  std.mem.asBytes(&zeros),
         std.mem.sliceAsBytes(zeros[0..256]), std.mem.asBytes(&values), std.mem.asBytes(&ids),
         std.mem.sliceAsBytes(zeros[0..2]),
     };
-    var tensors: [13]MetalTensor = undefined;
+    var tensors: [12]MetalTensor = undefined;
     var count: usize = 0;
     defer for (tensors[0..count]) |*tensor| tensor.deinit();
     for (&tensors, dtypes, sizes, 0..) |*tensor, dtype, size, index| {
@@ -53633,8 +53641,8 @@ test "Metal paged relative attention reads convolved KV written directly in the 
     var packed_output = try MetalTensor.deviceAllocateTyped(a, runtime, .i16, .shared, &.{256});
     defer packed_output.deinit();
 
-    try tensors[9].uploadBytes(std.mem.asBytes(&zeros));
-    try tensors[10].uploadBytes(std.mem.sliceAsBytes(zeros[0..384]));
+    try tensors[8].uploadBytes(std.mem.asBytes(&zeros));
+    try tensors[9].uploadBytes(std.mem.sliceAsBytes(zeros[0..384]));
     try beginFrame(runtime);
     errdefer cancelFrame(runtime) catch {};
     const operands: CausalPagedRelativeBf16.QueryInputs = .{
@@ -53645,12 +53653,12 @@ test "Metal paged relative attention reads convolved KV written directly in the 
         .gates = &tensors[0],
     };
     const key: CausalPagedRelativeBf16.Operand = .{
-        .input = .{ .values = &tensors[3], .weight = &tensors[9], .history = &tensors[10], .dynamic_taps = null },
-        .next_history = &tensors[11],
+        .input = .{ .values = &tensors[3], .weight = &tensors[8], .history = &tensors[9], .dynamic_taps = null },
+        .next_history = &tensors[10],
     };
     const value_operand: CausalPagedRelativeBf16.Operand = .{
-        .input = .{ .values = &tensors[4], .weight = &tensors[9], .history = &tensors[10], .dynamic_taps = null },
-        .next_history = &tensors[12],
+        .input = .{ .values = &tensors[4], .weight = &tensors[8], .history = &tensors[9], .dynamic_taps = null },
+        .next_history = &tensors[11],
     };
     const stencil: CausalDepthwise4Bf16 = .{
         .channels = 128,
@@ -53662,8 +53670,8 @@ test "Metal paged relative attention reads convolved KV written directly in the 
     };
     var counters = @import("../execution/runtime_observation.zig").Scope.init();
     defer counters.deinit();
-    try CausalPagedRelativeBf16.encode(runtime, &append, .sliding, attention.query, operands, .{ .key = &tensors[1], .value = &tensors[2] }, key, value_operand, stencil, &tensors[7], &tensors[8]);
-    try CausalPagedRelativeBf16.encode(runtime, &append, .sliding, attention.query, operands, .{ .key = &packed_key, .value = &packed_value, .format = .q4_head128 }, key, value_operand, stencil, &tensors[7], &packed_output);
+    try CausalPagedRelativeBf16.encode(runtime, &append, .sliding, attention.query, operands, .{ .key = &tensors[1], .value = &tensors[2] }, key, value_operand, stencil, null, &tensors[7]);
+    try CausalPagedRelativeBf16.encode(runtime, &append, .sliding, attention.query, operands, .{ .key = &packed_key, .value = &packed_value, .format = .q4_head128 }, key, value_operand, stencil, null, &packed_output);
     // Each format writes two KV planes and dispatches one fused attention.
     try std.testing.expectEqual(@as(?u64, 6), counters.snapshot().metal_encoded_dispatches);
     try std.testing.expectEqual(@as(usize, 3), sequence.committed_tokens);
@@ -53673,7 +53681,7 @@ test "Metal paged relative attention reads convolved KV written directly in the 
     try std.testing.expectEqual(@as(usize, 5), sequence.committed_tokens);
 
     var output: [256]u16 = undefined;
-    try tensors[8].downloadBytesInto(std.mem.asBytes(&output));
+    try tensors[7].downloadBytesInto(std.mem.asBytes(&output));
     var packed_result: [256]u16 = undefined;
     try packed_output.downloadBytesInto(std.mem.asBytes(&packed_result));
     try std.testing.expectEqual(output, packed_result);
