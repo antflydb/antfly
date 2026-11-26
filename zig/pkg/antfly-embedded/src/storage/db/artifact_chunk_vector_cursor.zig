@@ -43,6 +43,7 @@ pub fn Cursor(comptime Txn: type) type {
         output: ?[]u8 = null,
         output_entry: ?@import("../backend_erased.zig").Entry = null,
         started: bool = false,
+        capture_window_hints: bool = false,
         output_has_windows: bool = false,
         member_has_windows: bool = false,
         result: ?[]u8 = null,
@@ -55,6 +56,11 @@ pub fn Cursor(comptime Txn: type) type {
             errdefer outputs.close();
             const prefix = try keys.artifactNamedPrefixAlloc(alloc, document, "chunk", producer);
             return .{ .alloc = alloc, .chunks = chunks, .outputs = outputs, .prefix = prefix, .embedding = embedding };
+        }
+
+        pub fn enableWindowHints(self: *Self) void {
+            self.capture_window_hints = true;
+            self.outputs.setKeysOnly();
         }
 
         pub fn close(self: *Self) void {
@@ -155,8 +161,9 @@ pub fn Cursor(comptime Txn: type) type {
                 if (keys.isDerivedEmbeddingArtifactKey(row.key) and keys.matchesDerivedEmbeddingArtifactName(row.key, self.embedding)) {
                     const base = (try keys.derivedEmbeddingBaseKeyAlloc(self.alloc, row.key)).?;
                     defer self.alloc.free(base);
-                    self.output = try self.alloc.dupe(u8, keys.mediaWindowParent(base));
-                    self.output_has_windows = keys.mediaWindowIndex(base) != null;
+                    const parent = keys.mediaWindowParent(base);
+                    self.output = try self.alloc.dupe(u8, parent);
+                    self.output_has_windows = self.capture_window_hints and parent.len != base.len;
                 }
                 self.output_entry = try self.outputs.next();
             }
@@ -183,10 +190,8 @@ pub fn Cursor(comptime Txn: type) type {
                 const window = row.key.len > member.len and row.key[member.len] == keys.media_window_kind;
                 self.member_has_windows = self.member_has_windows or window;
                 visits += 1;
-                budget.visits +|= 1;
-                budget.bytes +|= row.key.len +| row.value.len;
-                if (self.member_has_windows or visits == 3) {
-                    if (!self.member_has_windows and row.key.len > member.len and row.key[member.len] < keys.media_window_kind) {
+                if (!self.capture_window_hints or self.member_has_windows or visits == 3) {
+                    if (self.capture_window_hints and !self.member_has_windows and row.key.len > member.len and row.key[member.len] < keys.media_window_kind) {
                         const lower = try keys.mediaWindowChildKeyAlloc(self.alloc, member, 0);
                         defer self.alloc.free(lower);
                         if (try self.outputs.seekAtOrAfter(lower)) |found| {
