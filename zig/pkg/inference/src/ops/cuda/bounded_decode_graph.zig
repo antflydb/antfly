@@ -50,6 +50,11 @@ pub const StorageLayout = struct {
         }
     };
 
+    pub const max_readback_words = blk: {
+        const maximum = init(max_rows, 1, 1, 1) catch unreachable;
+        break :blk maximum.readbackProgressIndex() + 1;
+    };
+
     pub fn readback(self: StorageLayout, backing: buffer.DeviceBuffer) buffer.DeviceBuffer {
         return (Span{ .offset = self.tokens.offset, .bytes = self.counter.offset + self.counter.bytes - self.tokens.offset }).bind(backing);
     }
@@ -517,6 +522,8 @@ test "captured sequence storage layout preserves existing narrow wide and aligne
         try std.testing.expectEqual(value.progress + @sizeOf(u32) - value.bank, actual.readback(backing).len);
         try std.testing.expectEqual((value.positions - value.bank) / @sizeOf(u32), actual.readbackPositionIndex());
         try std.testing.expectEqual((value.progress - value.bank) / @sizeOf(u32), actual.readbackProgressIndex());
+        try std.testing.expect(actual.readbackProgressIndex() < StorageLayout.max_readback_words);
+        if (value.rows == max_rows) try std.testing.expectEqual(StorageLayout.max_readback_words, actual.readbackProgressIndex() + 1);
         try std.testing.expectEqual(@sizeOf(plan_mod.Plan) + 196608, actual.host_bytes);
     }
     try std.testing.expectError(error.InvalidShape, StorageLayout.init(1, 1024, 8, 1));

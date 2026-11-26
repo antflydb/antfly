@@ -3824,7 +3824,7 @@ pub const CudaCompute = struct {
         pub fn read(self: *@This(), burst_value: *LightOnTokenBurst, tokens: []u32) !void {
             const owner = &self.compute.bounded_decode_graph;
             if (tokens.len != 2 * owner.rows) return error.InvalidShape;
-            var host: [768]u32 = undefined;
+            var host: [@import("bounded_decode_graph.zig").StorageLayout.max_readback_words]u32 = undefined;
             const layout = owner.storage_layout orelse return error.InvalidExecutionPlan;
             const source = layout.readback(owner.metadata);
             try copyToHostTrackedAndSync(self.compute, source, std.mem.sliceAsBytes(host[0 .. source.len / @sizeOf(u32)]));
