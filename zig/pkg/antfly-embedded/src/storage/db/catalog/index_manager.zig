@@ -36301,6 +36301,14 @@ pub fn configUsesExternalCoverage(alloc: Allocator, cfg: types.IndexConfig) !boo
     };
 }
 
+pub fn denseGeneratorChunkerJson(alloc: Allocator, raw: []const u8) ![]const u8 {
+    var generator = (try parseDenseGeneratorConfig(alloc, raw)) orelse return "";
+    defer generator.deinit(alloc);
+    const chunker = generator.chunker_json;
+    generator.chunker_json = &.{};
+    return chunker;
+}
+
 pub fn denseConfigDimensions(alloc: Allocator, cfg: types.IndexConfig) !u32 {
     if (cfg.kind != .dense_vector) return error.InvalidIndexConfiguration;
     const dense_cfg = try parseDenseConfig(alloc, cfg.config_json);

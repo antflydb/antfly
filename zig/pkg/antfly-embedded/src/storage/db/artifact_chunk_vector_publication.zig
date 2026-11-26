@@ -147,30 +147,7 @@ pub fn emptyWindowKey(namespace: publication.Namespace, scalar: []const u8) Empt
     return key;
 }
 
-const FusedConsumer = struct {
-    model: ?[]const u8 = null,
-    identity: ?[]const u8 = null,
-    allows_fusion: bool = true,
-
-    fn fromConfig(raw: std.json.Value) FusedConsumer {
-        const config = if (raw == .object) raw.object.get("config") orelse raw else raw;
-        if (config != .object) return .{};
-        var consumer: FusedConsumer = .{};
-        if (config.object.get("provider")) |provider|
-            consumer.allows_fusion = provider == .string and std.mem.eql(u8, provider.string, "antfly");
-        inline for (.{ "instruction", "query_instruction", "document_input_type" }) |name|
-            if (config.object.get(name)) |value| {
-                if (value != .null) consumer.allows_fusion = false;
-            };
-        if (config.object.get("model")) |model| {
-            if (model == .string) consumer.model = model.string;
-        }
-        if (config.object.get("model_identity")) |pin| {
-            if (pin == .string) consumer.identity = pin.string;
-        }
-        return consumer;
-    }
-};
+const media_embedding_recipe = @import("media_embedding_recipe.zig");
 
 pub const Fence = struct {
     scope: []const u8,
@@ -179,6 +156,9 @@ pub const Fence = struct {
     prepared: bool = false,
     dense: bool = false,
     embedding_config: []const u8 = "",
+    chunker_config: ?[]const u8 = null,
+    inline_index_config: []const u8 = "",
+    dimensions: u32 = 0,
     revalidate_window_plan: bool = false,
     certify_empty: ?EmptyWindowKey = null,
     /// Resolve membership and decode inherited provenance before serialized
@@ -253,32 +233,28 @@ pub const Fence = struct {
             return;
         };
         const publishes_windows = live.count() != 0;
-        var parsed = if (self.embedding_config.len != 0)
-            try std.json.parseFromSlice(std.json.Value, alloc, self.embedding_config, .{})
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const owned = arena.allocator();
+        const chunker = self.chunker_config orelse if (self.inline_index_config.len != 0)
+            try manager.denseGeneratorChunkerJson(owned, self.inline_index_config)
         else
-            null;
-        defer if (parsed) |*config| config.deinit();
-        const consumer = if (parsed) |config| FusedConsumer.fromConfig(config.value) else FusedConsumer{};
-        if (!consumer.allows_fusion) {
+            "";
+        const consumer = try media_embedding_recipe.resolve(owned, self.embedding_config, chunker, self.dimensions) orelse {
             if (publishes_windows) return error.EnrichmentSourceChanged;
             return;
-        }
+        };
         const O = @import("inference_chunker").outputs;
         var receipts = try std.json.parseFromSlice([]O.Result, alloc, raw, .{});
         defer receipts.deinit();
-        const revision_hex = if (command.execution_identity) |revision| std.fmt.bytesToHex(revision, .lower) else null;
         var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
         defer seen.deinit(alloc);
         for (receipts.value) |receipt| {
             if (receipt.kind != .embedding or !std.mem.eql(u8, receipt.name, "embedding")) continue;
-            const current_model = if (consumer.model) |model| std.mem.eql(u8, model, receipt.model) else true;
-            // An unbound tombstone still has to account for this consumer's receipts.
-            const current_revision = if (revision_hex) |revision|
-                std.ascii.eqlIgnoreCase(&revision, receipt.model_revision)
-            else
-                !publishes_windows or receipt.model_revision.len == 0;
-            const current_identity = if (consumer.identity) |pin| std.mem.eql(u8, pin, receipt.model_identity) else true;
-            if (!current_model or !current_revision or !current_identity) {
+            // An unbound tombstone must still account for this consumer's receipts.
+            const revision_matches = (command.execution_identity == null and !publishes_windows) or
+                media_embedding_recipe.matchesRevision(receipt.model_revision, command.execution_identity);
+            if (!revision_matches or !try consumer.matches(alloc, receipt)) {
                 if (publishes_windows) return error.EnrichmentSourceChanged;
                 continue;
             }
@@ -383,6 +359,9 @@ pub fn prepare(alloc: std.mem.Allocator, command: publication.Command, catalogs:
     const model_config = for (producers) |entry| {
         if (entry.kind == .embedding and std.mem.eql(u8, entry.name, command.producer_artifact_name)) break entry.producer_json;
     } else "";
+    const chunker_config = for (producers) |entry| {
+        if (entry.kind == .chunk and std.mem.eql(u8, entry.name, scope.name)) break entry.chunker_json;
+    } else null;
     var dense: std.ArrayList(derived.DerivedDenseEmbeddingWrite) = .empty;
     var sparse: std.ArrayList(derived.DerivedSparseEmbeddingWrite) = .empty;
     var changed: std.ArrayList([]const u8) = .empty;
@@ -418,7 +397,7 @@ pub fn prepare(alloc: std.mem.Allocator, command: publication.Command, catalogs:
     // Finish allocations before copying the arena owner. Growing the arena
     // after that copy would leave its new allocation chain unowned.
     const owned_scope = try owned.dupe(u8, command.producer_scope_key);
-    return .{ .arena = arena, .chunk_vector_fence = .{ .scope = owned_scope, .requires_member = changed.items.len != 0, .dense = producer.kind == .dense_vector, .embedding_config = model_config }, .batch = .{
+    return .{ .arena = arena, .chunk_vector_fence = .{ .scope = owned_scope, .requires_member = changed.items.len != 0, .dense = producer.kind == .dense_vector, .embedding_config = model_config, .chunker_config = chunker_config, .inline_index_config = producer.config_json, .dimensions = dims }, .batch = .{
         .dense_embeddings = dense.items,
         .sparse_embeddings = sparse.items,
         .changed_artifact_keys = changed.items,
@@ -596,28 +575,47 @@ test "model aware media fused receipt validation covers tombstones and pending w
         .mutations = effects[0..1],
         .publication_digest = @splat(0),
     };
-    const fence: Fence = .{ .scope = scope, .requires_member = false, .dense = true, .embedding_config = "{\"provider\":\"antfly\",\"model\":\"model\"}" };
+    const fence: Fence = .{
+        .scope = scope,
+        .requires_member = false,
+        .dense = true,
+        .dimensions = 2,
+        .embedding_config =
+        \\{"provider":"antfly","model":"model"}
+        ,
+        .chunker_config =
+        \\{"provider":"antfly","outputs":{"boundary_model":"model","targets":[{"name":"embedding","kind":"embedding","model":"model","dimensions":2}]}}
+        ,
+    };
     const revision: publication.Digest = @splat(8);
     const revision_hex = std.fmt.bytesToHex(revision, .lower);
+    const identity: [64]u8 = @splat('3');
+    var target: O.Target = .{ .name = "embedding", .kind = .embedding, .model = "model", .dimensions = 2 };
+    const matching_recipe = try target.recipeIdentity(a, &identity, &revision_hex);
+    target.task_type = "RETRIEVAL_QUERY";
+    const foreign_recipe = try target.recipeIdentity(a, &identity, &revision_hex);
     const completed: O.Result = .{
         .name = "embedding",
         .kind = .embedding,
         .required = true,
         .model = "model",
-        .model_identity = "",
+        .model_identity = &identity,
         .model_revision = &revision_hex,
-        .recipe_id = "",
+        .recipe_id = &matching_recipe,
         .status = .complete,
     };
     var pending = completed;
     pending.sub_index = 1;
     pending.status = .failed;
+    pending.code = "temporary";
     var terminal = pending;
     terminal.terminal = true;
     terminal.sub_index = 0;
-    const outcomes = [_][]const O.Result{ &.{completed}, &.{ completed, pending }, &.{terminal} };
-    for (0..3) |scenario| {
-        const raw = try std.json.Stringify.valueAlloc(a, outcomes[scenario], .{});
+    var foreign = completed;
+    foreign.recipe_id = &foreign_recipe;
+    const outcomes = [_][]const O.Result{ &.{completed}, &.{ completed, pending }, &.{terminal}, &.{foreign} };
+    for (outcomes, 0..) |outcome, scenario| {
+        const raw = try std.json.Stringify.valueAlloc(a, outcome, .{});
         defer a.free(raw);
         const Model = @import("inference_chunker").types.ModelMetadata;
         const metadata: Model = .{
@@ -643,6 +641,14 @@ test "model aware media fused receipt validation covers tombstones and pending w
             try std.testing.expectError(error.EnrichmentSourceChanged, fence.validateFusedReceipts(a, command, payload));
             command.execution_identity = revision;
         }
-        if (scenario == 2) try fence.validateFusedReceipts(a, command, payload) else try std.testing.expectError(error.EnrichmentSourceChanged, fence.validateFusedReceipts(a, command, payload));
+        if (scenario == 2 or scenario == 3) {
+            try fence.validateFusedReceipts(a, command, payload);
+        } else {
+            try std.testing.expectError(error.EnrichmentSourceChanged, fence.validateFusedReceipts(a, command, payload));
+        }
+        if (scenario == 3) {
+            command.mutations = &effects;
+            try std.testing.expectError(error.EnrichmentSourceChanged, fence.validateFusedReceipts(a, command, payload));
+        }
     }
 }
