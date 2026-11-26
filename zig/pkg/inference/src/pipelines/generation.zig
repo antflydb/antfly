@@ -1989,40 +1989,9 @@ fn shouldEnterSpeculativeDecodeLoop(callback_allows_generation: bool, first_is_e
     return callback_allows_generation and !first_is_eos and !grammar_complete;
 }
 
-fn gemma4MtpDedicatedRuntimeEnabled() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_DEDICATED_RUNTIME", true);
-}
-
-fn gemma4MtpVerifyDeviceResultEnabled() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_VERIFY_DEVICE_RESULT", false);
-}
-
-/// Fold the correction/bonus materialize forward into the next verify: the
-/// committed token stays pending (KV unwritten) and the next round's verify
-/// prepends it as row 0, whose suffix write materializes the KV.
-fn gemma4MtpDeferMaterializeEnabled(kind: ops.BackendKind) bool {
-    _ = kind;
-    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE", false);
-}
-
-/// Reuse the target verify row as the next draft activation after a folded
-/// correction/bonus instead of the assistant chain projection.
-fn gemma4MtpDeferMaterializeTargetActivationEnabled(kind: ops.BackendKind) bool {
-    _ = kind;
-    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE_TARGET_ACTIVATION", false);
-}
-
 fn gemma4MtpDeferredTargetActivationRow(cached_first: bool, logit_base_row: usize, accepted: usize) ?usize {
     if (cached_first) return if (accepted >= 2) accepted - 2 else null;
     return if (accepted != 0) logit_base_row + accepted - 1 else null;
-}
-
-fn gemma4MtpDraftEmbeddingCacheSize() usize {
-    return platform.env.getenvUsize("ANTFLY_GEMMA4_MTP_DRAFT_EMBED_CACHE") orelse 256;
-}
-
-fn gemma4MtpResidentDraftBackendAllowed(kind: ops.BackendKind) bool {
-    return kind == .cuda or kind == .metal;
 }
 
 pub fn gemma4MtpMetalAutoEnabled() bool {
@@ -4070,7 +4039,7 @@ pub const NativeGenerationPipeline = struct {
                     if (gbnf_grammar != null) &(gbnf_grammar.?) else null,
                     mtp_top_k_for_resident,
                 ) and
-                gemma4MtpResidentDraftBackendAllowed(draft_pipeline.cb.kind());
+                speculative_activation.residentDraftSupported(draft_pipeline.cb.kind());
             if (can_use_resident_mtp) debugGemma4Mtp("resident setup enabled", .{});
 
             // Prefill an ordinary draft model. Gemma 4 MTP assistants are not
@@ -6368,7 +6337,7 @@ pub const NativeGenerationPipeline = struct {
                 },
             };
         };
-        return activation.cachedTargetEmbedding(self.physicalDecoder(), &draft_pipeline.gpt_config, token_id, gemma4MtpDraftEmbeddingCacheSize());
+        return activation.cachedTargetEmbedding(self.physicalDecoder(), &draft_pipeline.gpt_config, token_id, speculative_activation.draftEmbeddingCacheCapacity());
     }
 
     fn forwardAllLogitsAndHiddenHost(
@@ -6656,7 +6625,8 @@ pub const NativeGenerationPipeline = struct {
         var round_penalties = try penalty_state.clone(allocator);
         defer round_penalties.deinit(allocator);
 
-        const defer_materialize = gemma4MtpDeferMaterializeEnabled(self.cb.kind());
+        const round_policy = speculative_activation.RoundPolicy.configured();
+        const defer_materialize = round_policy.defer_materialize;
         const entry_pending = mtp_activation.pendingCount();
         try mtp_activation.validateKvTokensInSync(decode_state, seq_len.*);
 
@@ -6688,7 +6658,7 @@ pub const NativeGenerationPipeline = struct {
             mtp_activation.residentReady() and
             gemma4_mtp.deviceResidentDraftAllowed(mtp_top_k) and
             use_greedy_device_verifier and
-            gemma4MtpResidentDraftBackendAllowed(draft_pipeline.cb.kind());
+            speculative_activation.residentDraftSupported(draft_pipeline.cb.kind());
         if (!use_resident_draft and mtp_activation.host == null) return error.MissingGemma4MtpActivation;
         const seed_requested = platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET", false) and
             actual_k == 2 and use_resident_draft and !defer_materialize and
@@ -6977,7 +6947,7 @@ pub const NativeGenerationPipeline = struct {
                         }
                     }
                     used_fused_verify = true;
-                } else if (prepared_tail_choices == null and gemma4MtpDedicatedRuntimeEnabled()) {
+                } else if (prepared_tail_choices == null and round_policy.dedicated_verify) {
                     // The dedicated-runtime verify commit recomputes lm_head
                     // logits internally through the dense fallback weight;
                     // when the prepared-slot argmax already produced the
@@ -7048,7 +7018,7 @@ pub const NativeGenerationPipeline = struct {
                         used_fused_verify = true;
                     } else if (mtp_profile.enabled) {
                         mtp_profile.dedicated_runtime_fallbacks += 1;
-                        if (gemma4MtpVerifyDeviceResultEnabled()) {
+                        if (round_policy.verify_device_result) {
                             mtp_profile.device_verify_commit_fallbacks += 1;
                         }
                     }
@@ -7104,7 +7074,7 @@ pub const NativeGenerationPipeline = struct {
                 }
                 if (used_fused_verify and
                     defer_materialize and
-                    gemma4MtpDeferMaterializeTargetActivationEnabled(self.cb.kind()) and
+                    round_policy.reuse_deferred_target_activation and
                     (verify_result.correction_added or verify_result.had_bonus) and
                     !verify_result.hit_eos and
                     !verify_result.hit_grammar_stop)
@@ -7360,7 +7330,7 @@ pub const NativeGenerationPipeline = struct {
         gbnf_grammar: ?*const grammar_mod.GbnfGrammar,
         mtp_top_k: usize,
     ) bool {
-        if (!gemma4MtpResidentDraftBackendAllowed(self.cb.kind())) return false;
+        if (!speculative_activation.residentDraftSupported(self.cb.kind())) return false;
         if (self.graph_cache != null or self.compiled_partition_backend != null) return false;
         if (mtp_top_k != 0) return false;
         if (!isPureGreedyConfig(config)) return false;
@@ -11952,10 +11922,9 @@ test "Gemma4 MTP active materialization is default" {
 }
 
 test "Gemma4 MTP deferred materialization defaults off" {
-    try std.testing.expectEqual(false, gemma4MtpDeferMaterializeEnabled(.metal));
-    try std.testing.expectEqual(false, gemma4MtpDeferMaterializeTargetActivationEnabled(.metal));
-    try std.testing.expectEqual(false, gemma4MtpDeferMaterializeEnabled(.cuda));
-    try std.testing.expectEqual(false, gemma4MtpDeferMaterializeTargetActivationEnabled(.cuda));
+    const policy = speculative_activation.RoundPolicy.configured();
+    try std.testing.expect(!policy.defer_materialize);
+    try std.testing.expect(!policy.reuse_deferred_target_activation);
 }
 
 test "Gemma4 MTP Metal auto defaults off" {

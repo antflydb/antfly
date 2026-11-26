@@ -25,6 +25,33 @@ const state_mod = @import("decode_state_runtime.zig");
 const NativeDecodeState = state_mod.NativeDecodeState;
 const BorrowedDecodeStateRuntime = state_mod.BorrowedDecodeStateRuntime;
 
+/// Physical options for one verification round. Draft acceptance, grammar,
+/// and sampling remain with the caller.
+pub const RoundPolicy = struct {
+    dedicated_verify: bool,
+    verify_device_result: bool,
+    defer_materialize: bool,
+    reuse_deferred_target_activation: bool,
+
+    pub fn configured() RoundPolicy {
+        const env = @import("antfly_platform").env;
+        return .{
+            .dedicated_verify = env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_DEDICATED_RUNTIME", true),
+            .verify_device_result = env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_VERIFY_DEVICE_RESULT", false),
+            .defer_materialize = env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE", false),
+            .reuse_deferred_target_activation = env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE_TARGET_ACTIVATION", false),
+        };
+    }
+};
+
+pub fn residentDraftSupported(kind: ops.BackendKind) bool {
+    return kind == .cuda or kind == .metal;
+}
+
+pub fn draftEmbeddingCacheCapacity() usize {
+    return @import("antfly_platform").env.getenvUsize("ANTFLY_GEMMA4_MTP_DRAFT_EMBED_CACHE") orelse 256;
+}
+
 pub const State = struct {
     /// One physical drafting round. Retained deferred slots and logits own
     /// their actual producer allocator/backend; ordinary chains own only the
