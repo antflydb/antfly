@@ -1521,8 +1521,13 @@ On frozen main, the same text request returned all 768 coordinates
 identically under both policies. Its public model identity accounts for
 the different digest, and the cuDNN run reproduced the historical digest.
 The default-path focused comparison matched the earlier fallback digest
-and passed all control and crossover gates for both models. The full
-matrix with cuDNN loaded is separate.
+and passed all control and crossover gates for both models. With the
+same installed cuDNN 9.19 runtime as the reference, the 40-sample focused
+repeat matched both historical output digests and all 24 provider receipts
+selected CUDA. EmbeddingGemma2 p50 was 9.00 → 8.88 ms and p95 was
+10.18 → 9.56 ms. Its control and crossover gates passed. GLiNER's
+crossover passed, while its repeated-main p50 spread was 5.22%, above
+the 5% control limit. The full cuDNN matrix is separate.
 
 The same Spark binaries also served grouped EmbeddingGemma2 image, audio,
 and video requests through the public embedding endpoint. Each crossover
