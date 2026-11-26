@@ -31,6 +31,10 @@ const legacy = @import("extraction_span.zig");
 const decide = @import("extraction_decide.zig");
 const span_v2 = @import("../extractors/gliner_span_v2_executor.zig");
 const regex = @import("../pipelines/extraction_regex.zig");
+const glide = @import("../models/glide.zig");
+const glide_prompt = @import("../pipelines/glide_prompt.zig");
+const glide_encoder = @import("../architectures/glide_encoder.zig");
+const modern_bert = @import("../architectures/modern_bert_config.zig");
 const laya = @import("extraction_laya.zig");
 const decision_api = @import("antfly_decisions");
 const model_caps = @import("../models/capabilities.zig");
@@ -44,6 +48,7 @@ pub const Metadata = struct {
     encoder_config: []const u8,
     tokenizer_config: []const u8,
     precision: []const u8,
+    decision_config: ?[]const u8 = null,
     gliner_config: []const u8 = "{}",
     processor_config: []const u8 = "{}",
     sentence_config: []const u8 = "{}",
@@ -60,7 +65,8 @@ pub const Model = struct {
     encoder_gpu: bool,
     metadata: std.json.Parsed(Metadata),
     tokenizer: ?*HfTokenizer = null,
-    config: union(enum) { span: legacy.Config, decide: decide.Config, boundary: boundary.Config, laya: laya.Config, embedding: gemma.Config },
+    config: union(enum) { span: legacy.Config, decide: decide.Config, boundary: boundary.Config, laya: laya.Config, glide: modern_bert.Config, embedding: gemma.Config },
+    glide_head: ?*glide.Head = null,
     descriptors: std.ArrayListUnmanaged(access.Descriptor) = .empty,
     identity: ?bundle.Identity = null,
     tokenizer_digest: ?bundle.Digest = null,
@@ -71,6 +77,10 @@ pub const Model = struct {
 
     fn deinit(self: *Model) void {
         const a = self.budget.allocator();
+        if (self.glide_head) |head| {
+            head.deinit();
+            a.destroy(head);
+        }
         if (self.tokenizer) |tok| tok.deinitSelf();
         for (self.descriptors.items) |d| {
             a.free(d.name);
@@ -124,7 +134,7 @@ pub fn create(json: []const u8) !u32 {
     const model_type = if (root.value == .object) root.value.object.get("model_type") else null;
     const is_embedding = model_type != null and model_type.? == .string and gemma.isModel(model_type.?.string);
     const is_laya = root.value == .object and root.value.object.contains("laya");
-    const config: @FieldType(Model, "config") = if (is_embedding) blk: {
+    const config: @FieldType(Model, "config") = if (parsed.value.decision_config != null) .{ .glide = try modern_bert.parseConfig(a, parsed.value.config) } else if (is_embedding) blk: {
         var cfg = try gemma.parseConfig(a, parsed.value.config);
         // Decisions are text-only: media towers are not loaded into the browser.
         cfg.vision = false;
@@ -144,12 +154,16 @@ pub fn create(json: []const u8) !u32 {
     model.encoder_gpu = model.compute.use_gpu;
     // Boundary heads stay on CPU; an encoder scope temporarily enables GPU.
     if (config == .boundary or config == .embedding or (config == .decide and config.decide == .modern_bert)) model.compute.use_gpu = false;
-    if (config == .laya) model.compute.resident_dense_gpu = true;
+    if (config == .laya or config == .glide) model.compute.resident_dense_gpu = true;
+    // GLiDE retains exact BF16 weights on the host. The FP32 GPU mirrors
+    // exceed the browser's budget if every layer stays resident.
+    if (config == .glide) model.compute.stream_gpu_weights = true;
     model.metadata = parsed;
     model.config = config;
     model.tokenizer = null;
     model.tokenizer_digest = null;
     model.descriptors = .empty;
+    model.glide_head = null;
     model.identity = null;
     model.ready = false;
     model.handle = next_handle;
@@ -211,15 +225,30 @@ pub fn weight(handle: u32, metadata: []const u8, bytes: []const u8) !void {
     defer if (prefixed) |value| a.free(value);
     const runtime_name = prefixed orelse stripped;
     if (model.config == .laya and kind != .F32 and kind != .F16 and kind != .BF16) return error.UnsupportedLayaArtifact;
-    if (!modern_encoder and model.config != .embedding and kind == .BF16) return error.UnsupportedTensorType;
+    if (!modern_encoder and model.config != .embedding and model.config != .glide and kind == .BF16) return error.UnsupportedTensorType;
     if (model.config == .embedding and kind != .F32 and kind != .BF16) return error.UnsupportedEmbeddingGemma2Precision;
     if (model.config == .span) try legacy.validateWeight(runtime_name, shape);
     if (model.config == .decide) try decide.validateWeight(model.config.decide, stripped, shape);
+    if (model.config == .glide and (kind != .BF16 and kind != .F32)) return error.UnsupportedTensorType;
     if (model.config == .laya) {
         try laya.registerWeight(a, &model.compute, model.config.laya, name, runtime_name, shape, bytes, kind);
     } else try model.compute.registerShapedWeight(runtime_name, shape, bytes, kind);
     model.descriptors.appendAssumeCapacity(.{ .name = name, .shape = shape, .encoding = .{ .gguf = .{ .known = kind } }, .byte_len = bytes.len, .quantized = kind != .F32 and kind != .F16 and kind != .BF16 });
 }
+pub fn registerGlideReadout(handle: u32, bytes: []const u8) !void {
+    const model = try get(handle);
+    if (model.config != .glide or model.ready or model.glide_head != null or bytes.len > 4 * 1024 * 1024)
+        return error.InvalidLoadState;
+    const a = model.budget.allocator();
+    const head = try glide.loadHeadBytes(a, model.metadata.value.decision_config.?, bytes, model.config.glide.hidden_size);
+    errdefer {
+        head.deinit();
+        a.destroy(head);
+    }
+    if (head.config.backbone != .encoder) return error.UnsupportedGlideBackbone;
+    model.glide_head = head;
+}
+
 pub fn finalize(handle: u32, digest: []const u8, size: u64) !void {
     const model = try get(handle);
     if (model.ready or model.tokenizer == null or digest.len != 64 or size == 0) return error.InvalidLoadState;
@@ -241,6 +270,8 @@ pub fn finalize(handle: u32, digest: []const u8, size: u64) !void {
         inline for (sidecars, 2..) |bytes, i| std.crypto.hash.sha2.Sha256.hash(bytes, &digests[i], .{});
         _ = try std.fmt.hexToBytes(&digests[6], digest);
         model.embedding_model_identity = embedding_identity.fromDigests(digests);
+    } else if (model.config == .glide) {
+        if (model.glide_head == null) return error.InvalidGlideReadout;
     } else if (model.config == .laya) {
         try laya.validateWeights(model.budget.allocator(), model.config.laya, model.descriptors.items);
     } else if (model.config == .decide) {
@@ -312,7 +343,7 @@ fn adapter(model: *const Model) Adapter {
         .span => .{ .extraction = true, .decisions = null },
         .decide => .{ .extraction = true, .decisions = .span_marker },
         .boundary => .{ .extraction = true, .decisions = .boundary },
-        .laya => .{ .extraction = false, .decisions = .laya },
+        .laya, .glide => .{ .extraction = false, .decisions = .laya },
         .embedding => .{ .extraction = false, .decisions = null },
     };
 }
@@ -366,6 +397,37 @@ pub fn runTask(handle: u32, json: []const u8, task: u32, validate_only: bool) !v
     if (request.inner.model_identity != null) return error.UnsupportedDecideModel;
     for (request.policies) |question_policy| if (question_policy.embedding_configured or question_policy.kind == .multi_choice) return error.UnsupportedDecideModel;
     for (request.inner.questions) |question| for (question.examples) |examples| if (examples.len != 0) return error.UnsupportedDecideModel;
+    if (model.config == .glide) {
+        const head = model.glide_head.?;
+        const questions = try glide_prompt.questionsFromPublic(a, request);
+        const probabilities = try a.alloc([]const f64, questions.len);
+        var prompt_tokens: usize = 0;
+        for (questions, probabilities) |question, *output| {
+            const rendered = try glide_prompt.render(a, head.config.codes, request.items[0].input, question);
+            const tokens = try glide_prompt.encode(a, model.tokenizer.?.tokenizer(), &head.config, rendered);
+            if (tokens.len > 1024) return error.DecideRequestLimitExceeded;
+            prompt_tokens += tokens.len;
+            if (validate_only) continue;
+            const ids = try a.alloc(i64, tokens.len);
+            for (ids, tokens) |*id, token| id.* = token;
+            const mask = try a.alloc(i64, tokens.len);
+            @memset(mask, 1);
+            const row: i64 = @intCast(try head.config.readoutIndex(tokens.len));
+            const compute = model.compute.computeBackend();
+            const hidden = try glide_encoder.readoutHidden(&compute, a, model.config.glide, ids, mask, 1, ids.len, &.{row});
+            var logits: [glide.max_options]f32 = undefined;
+            try head.apply(hidden, 1, &logits);
+            const values = try a.alloc(f64, question.options.len);
+            try glide.optionProbabilities(&logits, values.len, head.config.temperature, values);
+            output.* = values;
+        }
+        if (!validate_only) {
+            const decisions = try glide_prompt.decisionsJson(a, questions, 1, probabilities, prompt_tokens);
+            const response = try decision_api.trainedResponse(a, request, decisions, .laya);
+            result = try ctx.allocator.dupe(u8, response);
+        }
+        return;
+    }
     const lowered = try decision_api.extractionValue(a, request, contract);
     if (lowered.schema_bytes > limits.max_total_schema_bytes) return error.ExtractionSchemaLimitExceeded;
     const bytes = try std.json.Stringify.valueAlloc(a, lowered.value, .{});

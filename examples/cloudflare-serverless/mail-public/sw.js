@@ -21,13 +21,14 @@
 // - mail, auth and model weights always go to the network and are never
 //   stored here. Message data lives only in the opt-in OPFS copy, and the
 //   weights in @antfly/web's verified OPFS model cache.
-const SHELL = "antfly-mail-shell-v3";
+const SHELL = "antfly-mail-shell-v5";
 const RUNTIME = "antfly-mail-runtime-v2";
 const SHELL_FILES = [
   "/",
   "/mail.css",
   "/mail.js",
   "/local-index.js",
+  "/local-classification.js",
   "/local-schema.js",
   "/local-db-worker.js",
   "/manifest.webmanifest",
