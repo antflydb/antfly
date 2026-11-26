@@ -395,6 +395,9 @@ const DataRaftBatchRoute = struct {
     /// Local structural commands must not be forwarded into a successor term.
     required_local_term: ?u64 = null,
     allow_remote_forward: bool = true,
+    /// Borrowed only by local publication jobs. Once Raft assigns an index,
+    /// even an unknown synchronous outcome must retain that position.
+    local_proposal_index: ?*u64 = null,
     discovery: DataRaftMutationDiscovery,
     /// Local-only provenance. A forwarded target may follow an exact Raft
     /// leader, but must not choose another blind placement and bounce the
@@ -6321,7 +6324,7 @@ pub const DataServer = struct {
         // dispatcher there fences local production behind an unavailable
         // replicated authority, even for an empty index.
         if (owner_source.online_source_authority == .raft)
-            _ = owner_source.withArtifactPublications(.{ .ptr = self, .enqueue_fn = enqueueArtifactPublication, .enqueue_tracked_fn = enqueueTrackedArtifactPublication });
+            _ = owner_source.withArtifactPublications(.{ .ptr = self, .enqueue_fn = enqueueArtifactPublication, .enqueue_tracked_fn = enqueueTrackedArtifactPublication, .applied_index_fn = artifactPublicationAppliedIndex });
         _ = owner_source.withSecretStore(self.api_server_cfg.secret_store);
         if (comptime linked_storage) {
             if (self.storageKernelContextHandle()) |handle|
@@ -7226,12 +7229,23 @@ pub const DataServer = struct {
         try runtime.durable_jobs.submit(.{ .owner_id = try self.dataServerBackgroundOwnerId(runtime), .class = .maintenance, .ptr = job, .run = runArtifactPublicationJob, .deinit = deinitArtifactPublicationJob });
     }
 
+    fn artifactPublicationAppliedIndex(ptr: *anyopaque, group_id: u64) u64 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        // A receipt poll must never wait on the Raft apply owner while the
+        // storage replay worker is reconciling its own state.
+        if (!self.data_raft_mutex.tryLock()) return 0;
+        defer self.data_raft_mutex.unlock();
+        const raft = self.data_raft orelse return 0;
+        const status = raft.host.http_host.host.raftStatus(group_id) orelse return 0;
+        return status.applied_index;
+    }
+
     const ArtifactPublicationJob = struct {
         server: *DataServer,
         proposal: *artifact_publication_dispatch.Queue.Job,
         io: std.Io,
         owns_proposal: bool = true,
-        may_apply: bool = false,
+        observed: artifact_publication_dispatch.Receipt.Observation = .{ .state = .abandoned },
         upload_root: ?[32]u8 = null,
         publication_digest: [32]u8 = @splat(0),
         next_chunk: usize = 0,
@@ -7275,6 +7289,10 @@ pub const DataServer = struct {
             job.table_name = try self.alloc.dupe(u8, table.name);
         }
         const table_name = job.table_name.?;
+        const control_route: DataRaftBatchRoute = .{
+            .discovery = .cached,
+            .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown),
+        };
         // Until the native publication apply path is installed, do not
         // substitute a Raft-shaped receipt for a standalone owner's clock.
         if (self.data_raft == null) return error.ArtifactCatalogDrift;
@@ -7288,27 +7306,33 @@ pub const DataServer = struct {
             const catalog = parsed.value;
             try catalog.validate();
             if (!std.mem.eql(u8, &catalog.namespace, &job.proposal.namespace)) return error.IdentityNamespaceMismatch;
-            try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_catalog = catalog, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
+            try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_catalog = catalog, .sync_level = .write }, control_route);
             var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
             activation.publication_digest = activation.digest();
-            try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication = activation, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
+            try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication = activation, .sync_level = .write }, control_route);
             return;
         }
         if (try transport.RecoveryHint.decode(job.proposal.command)) |hint| {
             if (!std.mem.eql(u8, &hint.namespace, &job.proposal.namespace)) return error.IdentityNamespaceMismatch;
-            try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication_transport = hint.request(), .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
+            try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication_transport = hint.request(), .sync_level = .write }, control_route);
             return;
         }
         if (@import("antfly_local_sources").storage_db_artifact_catalog_proposal.isProposal(job.proposal.command)) {
             var catalog = try @import("antfly_local_sources").storage_db_artifact_catalog_proposal.decode(self.alloc, job.proposal.command);
             defer catalog.deinit();
             if (!std.mem.eql(u8, &catalog.value.namespace, &job.proposal.namespace)) return error.IdentityNamespaceMismatch;
-            try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_catalog = catalog.value, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
+            try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_catalog = catalog.value, .sync_level = .write }, control_route);
             var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.value.namespace, .authority_epoch = catalog.value.binding.epoch, .catalog_digest = catalog.value.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
             activation.publication_digest = activation.digest();
-            try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication = activation, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
+            try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication = activation, .sync_level = .write }, control_route);
             return;
         }
+        const local_route: DataRaftBatchRoute = .{
+            .allow_remote_forward = false,
+            .campaign_allowed = false,
+            .discovery = .cached,
+            .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown),
+        };
         const count = (job.proposal.command.len + codec.chunk_bytes - 1) / codec.chunk_bytes;
         // The queue already owns the compact bytes. Hash and send one bounded
         // chunk at a time; no whole-command JSON/base64 expansion is allocated.
@@ -7323,11 +7347,12 @@ pub const DataServer = struct {
             // instead of hashing a maximum-size payload two more times here.
             if (!std.mem.eql(u8, &command.namespace, &job.proposal.namespace)) return error.IdentityNamespaceMismatch;
             if (job.proposal.command.len <= codec.chunk_bytes) {
-                self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication = command, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) }) catch |err| {
-                    job.may_apply = err == error.RaftBatchWriteOutcomeUnknown;
-                    return err;
+                var route = local_route;
+                route.local_proposal_index = &job.observed.index;
+                defer if (job.observed.index != 0) {
+                    job.observed.state = .ordered;
                 };
-                job.may_apply = true;
+                try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication = command, .sync_level = .write }, route);
                 return;
             }
             var hashes: [codec.max_chunks]transport.Digest = undefined;
@@ -7336,7 +7361,7 @@ pub const DataServer = struct {
                 hashes[ordinal] = transport.chunkDigest(ordinal, job.proposal.command[offset..@min(offset + codec.chunk_bytes, job.proposal.command.len)]);
             }
             const begin: transport.Request = .{ .action = .begin, .namespace = command.namespace, .publication_digest = command.publication_digest, .command_digest = command.publication_digest, .encoded_len = @intCast(job.proposal.command.len), .chunk_hashes = hashes[0..count], .control = transport.usesReservedControl(command.mode, job.proposal.command.len) };
-            try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication_transport = begin, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
+            try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication_transport = begin, .sync_level = .write }, local_route);
             job.upload_root = begin.proposedManifest().root();
             job.publication_digest = command.publication_digest;
         }
@@ -7365,17 +7390,20 @@ pub const DataServer = struct {
             const offset = ordinal * codec.chunk_bytes;
             const chunk = job.proposal.command[offset..@min(offset + codec.chunk_bytes, job.proposal.command.len)];
             const encoded = std.base64.standard.Encoder.encode(base64, chunk);
-            self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication_transport = .{ .action = .chunk, .namespace = job.proposal.namespace, .publication_digest = job.publication_digest, .manifest_root = root, .ordinal = @intCast(ordinal), .chunk_base64 = encoded }, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) }) catch |err| {
-                job.may_apply = ordinal + 1 == count and err == error.RaftBatchWriteOutcomeUnknown;
-                return err;
+            var route = local_route;
+            if (ordinal + 1 == count) route.local_proposal_index = &job.observed.index;
+            defer if (job.observed.index != 0) {
+                // The final chunk may make this upload recoverable without
+                // another proposal from this job.
+                job.observed.state = .upload;
             };
-            // A complete durable upload can finalize after this worker
-            // exits. Preserve the apply barrier even if finalize fails.
-            job.may_apply = ordinal + 1 == count;
+            try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication_transport = .{ .action = .chunk, .namespace = job.proposal.namespace, .publication_digest = job.publication_digest, .manifest_root = root, .ordinal = @intCast(ordinal), .chunk_base64 = encoded }, .sync_level = .write }, route);
             job.next_chunk += 1;
             slice_chunks += 1;
         }
-        try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication_transport = .{ .action = .finalize, .namespace = job.proposal.namespace, .publication_digest = job.publication_digest, .manifest_root = root }, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
+        var finalize_route = local_route;
+        finalize_route.local_proposal_index = &job.observed.index;
+        try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication_transport = .{ .action = .finalize, .namespace = job.proposal.namespace, .publication_digest = job.publication_digest, .manifest_root = root }, .sync_level = .write }, finalize_route);
     }
 
     fn submitArtifactPublicationSuccessor(job: *ArtifactPublicationJob, runtime: *backend_runtime_mod.BackendRuntime, owner: u64) bool {
@@ -7402,7 +7430,7 @@ pub const DataServer = struct {
         const self = job.server;
         if (job.owns_proposal) {
             if (job.table_name) |name| self.alloc.free(name);
-            self.artifact_publication_queue.finish(job.io, job.proposal, if (job.may_apply) .awaiting_apply else .abandoned);
+            self.artifact_publication_queue.finish(job.io, job.proposal, job.observed);
         }
         self.alloc.destroy(job);
     }
@@ -13690,6 +13718,7 @@ pub const DataServer = struct {
                         };
                         target_index = target_index orelse accepted_index orelse
                             return error.RaftBatchWriteOutcomeUnknown;
+                        if (route.local_proposal_index) |observed| observed.* = target_index.?;
                         if (proposal_req.sync_level != .propose) {
                             const index = target_index.?;
                             const apply_sm = self.data_raft_apply orelse

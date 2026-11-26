@@ -557,6 +557,7 @@ pub const StorageOwnerRuntimeHooks = struct {
             .ptr = self,
             .enqueue_status = enqueueArtifactPublicationStatus,
             .enqueue_tracked_status = if (self.config.artifact_publication_enqueue_tracked_fn != null) enqueueTrackedArtifactPublicationStatus else null,
+            .applied_index_fn = if (self.config.artifact_publication_applied_index_fn != null) artifactPublicationAppliedIndex else null,
             .upload_recovery = .{ .recover = recoverArtifactUploads, .should_poll = shouldRecoverArtifactUploads },
         };
     }
@@ -585,6 +586,12 @@ pub const StorageOwnerRuntimeHooks = struct {
         const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
         const enqueue = self.config.artifact_publication_enqueue_tracked_fn orelse return .artifact_catalog_drift;
         return enqueue(self.config.artifact_publication_ctx, self.group_id, namespace, .fromSlice(command[0..command_len]), receipt);
+    }
+
+    fn artifactPublicationAppliedIndex(ptr: *anyopaque) callconv(.c) u64 {
+        const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        const observe = self.config.artifact_publication_applied_index_fn orelse return 0;
+        return observe(self.config.artifact_publication_ctx, self.group_id);
     }
 
     const CandidateCapture = struct {
@@ -3794,7 +3801,8 @@ pub fn storageOwnerOpen(
     }
     const runtime_hooks_config = request.runtime_hooks;
     if ((runtime_hooks_config.artifact_publication_ctx == null) != (runtime_hooks_config.artifact_publication_enqueue_fn == null) or
-        (runtime_hooks_config.artifact_publication_enqueue_tracked_fn != null and runtime_hooks_config.artifact_publication_enqueue_fn == null))
+        ((runtime_hooks_config.artifact_publication_enqueue_tracked_fn != null or runtime_hooks_config.artifact_publication_applied_index_fn != null) and
+            runtime_hooks_config.artifact_publication_enqueue_fn == null))
         return .invalid_argument;
     if ((runtime_hooks_config.coordinated_ttl_ctx == null) != (runtime_hooks_config.coordinated_ttl_enqueue_fn == null))
         return .invalid_argument;

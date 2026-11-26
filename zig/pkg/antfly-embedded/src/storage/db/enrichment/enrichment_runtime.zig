@@ -32367,6 +32367,7 @@ const PublicationFlights = struct {
     const AppendKey = struct {
         bytes: []const u8,
         refs: usize = 1,
+        reservation: ?resource_manager_mod.Reservation = null,
     };
 
     const Flight = struct {
@@ -32391,23 +32392,33 @@ const PublicationFlights = struct {
                 key.refs -= 1;
                 if (key.refs == 0) {
                     a.free(key.bytes);
+                    if (key.reservation) |*reservation| reservation.release();
                     a.destroy(key);
                 }
             }
         }
 
-        fn settled(self: Flight, read: anytype, authority: ?ordered_publication.Authority) !bool {
+        fn settled(self: Flight, read: anytype, authority: ?ordered_publication.Authority, applied_index: u64) !bool {
             if (self.submitting) return false;
             if (!std.meta.eql(authority, @as(?ordered_publication.Authority, self.authority))) return true;
             if (self.input) |input| {
                 if (!std.meta.eql(input.revision, try ordered_publication.inputRevisionAt(read, self.authority.namespace, input.key))) return true;
             }
+            // A digest identifies the command, not the attempt. Another
+            // attempt's receipt or the producer's latest rejection slot
+            // cannot resolve a queue admission at a newer Raft position.
+            if (self.dispatch.observe()) |attempt| return switch (attempt.state) {
+                .abandoned => !self.uploaded or !try upload.isReady(read, self.authority.namespace, self.digest),
+                .ordered => attempt.index != 0 and applied_index >= attempt.index,
+                .upload => attempt.index != 0 and applied_index >= attempt.index and
+                    (try upload.terminal(read, self.authority.namespace, self.digest) != null or
+                        !try upload.isReady(read, self.authority.namespace, self.digest)),
+                else => false,
+            };
             if (try ordered_publication.rejectedAt(read, self.rejection, self.digest)) |rejected| {
                 if (rejected.applied_index > self.rejected_at) return true;
             }
             if (self.uploaded and try upload.terminal(read, self.authority.namespace, self.digest) != null) return true;
-            if (self.dispatch.abandoned() and
-                (!self.uploaded or !try upload.isReady(read, self.authority.namespace, self.digest))) return true;
             switch (self.completion) {
                 .receipt => |watch| {
                     const receipt = (try ordered_publication.receiptAt(read, watch.key)) orelse return false;
@@ -32449,15 +32460,20 @@ const PublicationFlights = struct {
         for (self.items.items) |flight| {
             if (owner == null or flight.owner == owner.?) break;
         } else return false;
+        // Read the host watermark before opening the store snapshot. An
+        // upload whose last chunk has applied must be visible in this read.
+        const host_index = if (runtime.artifact_publication_dispatcher) |dispatcher| dispatcher.appliedIndex() else 0;
         var read = try runtime.store.beginProbe();
         defer read.abort();
+        const local_marker = try @import("../apply_receipts.zig").readOrderedApplyReceiptTxn(&read);
+        const applied_index = @max(host_index, if (local_marker) |marker| marker.index else 0);
         const authority = try ordered_publication.authority(&read);
         var pending = false;
         var index: usize = 0;
         while (index < self.items.items.len) {
             const flight = self.items.items[index];
             if (owner == null or flight.owner == owner.?) {
-                if (try flight.settled(&read, authority)) {
+                if (try flight.settled(&read, authority, applied_index)) {
                     self.items.swapRemove(index).deinit(runtime.alloc);
                     continue;
                 }
@@ -32489,29 +32505,58 @@ const PublicationFlights = struct {
         };
     }
 
-    fn retainAppendKey(self: *PublicationFlights, a: Allocator, bytes: []const u8) !*AppendKey {
+    fn retainAppendKey(self: *PublicationFlights, runtime: *EnrichmentRuntime, bytes: []const u8, encoding_budget: ?*resource_manager_mod.BudgetedAllocator) !*AppendKey {
         for (self.items.items) |flight| if (flight.append_key) |key| {
             if (std.mem.eql(u8, key.bytes, bytes)) {
                 key.refs += 1;
                 return key;
             }
         };
+        // The encoder may have reserved amortized credit for its scratch
+        // buffer. Return only the unused portion before admitting retained
+        // bytes separately for the lifetime of this generation's witnesses.
+        if (encoding_budget) |budget| _ = budget.releaseUnusedCreditThreadSafe();
+        const a = runtime.alloc;
+        const charge = std.math.add(usize, bytes.len, @sizeOf(AppendKey)) catch return error.PublicationEncoderAdmissionDenied;
+        var reservation = if (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) |manager|
+            manager.reserveWithoutReclaim(.relational_preparation_working_set, charge) catch |err| switch (err) {
+                error.ResourceBudgetExceeded => return error.PublicationEncoderAdmissionDenied,
+                else => return err,
+            }
+        else
+            null;
+        errdefer if (reservation) |*owned| owned.release();
         const key = try a.create(AppendKey);
         errdefer a.destroy(key);
-        key.* = .{ .bytes = try a.dupe(u8, bytes) };
+        key.* = .{ .bytes = try a.dupe(u8, bytes), .reservation = reservation };
         return key;
     }
 
-    fn submit(self: *PublicationFlights, runtime: *EnrichmentRuntime, dispatcher: ordered_publication.Dispatcher, prepared: Flight, bytes: []const u8) !void {
+    fn find(self: *const PublicationFlights, prepared: Flight) ?usize {
+        for (self.items.items, 0..) |*flight, index| {
+            if (flight.owner == prepared.owner and std.mem.eql(u8, &flight.digest, &prepared.digest)) return index;
+        }
+        return null;
+    }
+
+    fn submit(self: *PublicationFlights, runtime: *EnrichmentRuntime, dispatcher: ordered_publication.Dispatcher, prepared: Flight, bytes: []const u8, encoding_budget: ?*resource_manager_mod.BudgetedAllocator) !void {
         const io = concurrencyIo(runtime);
         const fresh = reserve: {
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
-            for (self.items.items) |*previous| {
-                if (previous.owner != prepared.owner or !std.mem.eql(u8, &previous.digest, &prepared.digest)) continue;
+            // Serialize submissions of the exact command when the owner
+            // supports attempt receipts. A distinct retry may start only
+            // after the prior proposal or upload can no longer apply.
+            if (self.find(prepared)) |index| {
+                const previous = &self.items.items[index];
                 if (previous.submitting) return error.ArtifactPublicationPending;
-                previous.submitting = true;
-                break :reserve false;
+                if (previous.dispatch.observe_fn != null) {
+                    _ = try self.reconcileLocked(runtime, prepared.owner);
+                    if (self.find(prepared) != null) return error.ArtifactPublicationPending;
+                } else {
+                    previous.submitting = true;
+                    break :reserve false;
+                }
             }
             if (self.items.items.len == max_flights) {
                 _ = try self.reconcileLocked(runtime, null);
@@ -32520,7 +32565,7 @@ const PublicationFlights = struct {
             try self.items.ensureUnusedCapacity(runtime.alloc, 1);
             var flight = prepared;
             if (flight.completion == .append) {
-                const key = try self.retainAppendKey(runtime.alloc, flight.completion.append.key);
+                const key = try self.retainAppendKey(runtime, flight.completion.append.key, encoding_budget);
                 flight.append_key = key;
                 flight.completion.append.key = key.bytes;
             }
@@ -32541,8 +32586,7 @@ const PublicationFlights = struct {
                 if (fresh) self.items.swapRemove(index).deinit(runtime.alloc);
                 return err;
             };
-            // A later admission does not erase an earlier ambiguous apply.
-            if (fresh or flight.dispatch.abandoned() or prepared.rejected_at > flight.rejected_at) {
+            if (fresh or dispatched.observe_fn != null or prepared.rejected_at > flight.rejected_at) {
                 flight.dispatch.release();
                 flight.dispatch = dispatched;
                 flight.rejected_at = prepared.rejected_at;
@@ -32681,7 +32725,7 @@ fn driveOrderedChunkVectorCensus(runtime: *EnrichmentRuntime, alloc: Allocator, 
     // touching the dispatcher. Queue refusal leaves durable progress unchanged.
     const dispatcher = runtime.artifact_publication_dispatcher orelse return error.ArtifactCatalogDrift;
     if (flight) |witness|
-        try runtime.publication_flights.submit(runtime, dispatcher, witness, encoded.?)
+        try runtime.publication_flights.submit(runtime, dispatcher, witness, encoded.?, null)
     else
         try dispatcher.submit(namespace, encoded.?);
     publication.dispatched();
@@ -34372,7 +34416,7 @@ fn submitProducerCommand(runtime: *EnrichmentRuntime, token: *@import("../artifa
             defer read.abort();
             break :blk try PublicationFlights.prepare(&read, owner, command, token.source, bytes.len, options.completion);
         };
-        runtime.publication_flights.submit(runtime, dispatcher, flight, bytes) catch |err|
+        runtime.publication_flights.submit(runtime, dispatcher, flight, bytes, resource_manager_mod.BudgetedAllocator.fromAllocator(transport)) catch |err|
             return FailureScope.assetPublicationFailure(failure_scope, err);
     } else {
         dispatcher.submit(token.namespace, bytes) catch |err|
@@ -46369,8 +46413,8 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
                 const owner = logicalRequestFingerprint(requests[healthy]);
                 try std.testing.expect(!try runtime.publication_flights.reconcile(runtime, owner));
                 const Abandoned = struct {
-                    fn state(_: ?*anyopaque) callconv(.c) u8 {
-                        return @backingInt(ordered_publication.DispatchReceipt.State.abandoned);
+                    fn observe(_: ?*anyopaque, out: *ordered_publication.DispatchReceipt.Observation) callconv(.c) void {
+                        out.* = .{ .state = .abandoned };
                     }
                 };
                 var witness = blk: {
@@ -46382,16 +46426,131 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
                 // ordered responses that could otherwise clear these entries.
                 for (0..PublicationFlights.max_flights) |i| {
                     witness.digest = @splat(@intCast(i));
-                    witness.dispatch = .{ .state_fn = Abandoned.state };
+                    witness.dispatch = .{ .observe_fn = Abandoned.observe };
                     try runtime.publication_flights.items.append(runtime.alloc, witness);
                 }
                 {
                     var next = witness;
                     next.digest = submitted.command.publication_digest;
                     next.dispatch = .{};
-                    try runtime.publication_flights.submit(runtime, runtime.artifact_publication_dispatcher.?, next, harness.queued.items[before]);
+                    try runtime.publication_flights.submit(runtime, runtime.artifact_publication_dispatcher.?, next, harness.queued.items[before], null);
                     try std.testing.expectEqual(@as(usize, 1), runtime.publication_flights.items.items.len);
                 }
+                try std.testing.expect(!try runtime.publication_flights.reconcile(runtime, owner));
+
+                const Dispatch = struct {
+                    const Observation = ordered_publication.DispatchReceipt.Observation;
+                    observations: [5]Observation = @splat(.{}),
+                    submitted: usize = 0,
+                    applied: u64 = 0,
+
+                    fn enqueue(ptr: *anyopaque, _: *const ordered_publication.Namespace, _: [*]const u8, _: usize, out: *ordered_publication.DispatchReceipt) callconv(.c) @import("kernel_error_identity").Status {
+                        const self: *@This() = @ptrCast(@alignCast(ptr));
+                        if (self.submitted == self.observations.len) return .invalid_argument;
+                        out.* = .{ .ctx = &self.observations[self.submitted], .observe_fn = observe };
+                        self.submitted += 1;
+                        return .ok;
+                    }
+
+                    fn observe(ptr: ?*anyopaque, out: *Observation) callconv(.c) void {
+                        const observation: *Observation = @ptrCast(@alignCast(ptr.?));
+                        out.* = observation.*;
+                    }
+
+                    fn appliedIndex(ptr: *anyopaque) callconv(.c) u64 {
+                        const self: *@This() = @ptrCast(@alignCast(ptr));
+                        return self.applied;
+                    }
+                };
+                var dispatch: Dispatch = .{ .applied = index };
+                const dispatcher: ordered_publication.Dispatcher = .{
+                    .ptr = &dispatch,
+                    .enqueue_tracked_status = Dispatch.enqueue,
+                    .applied_index_fn = Dispatch.appliedIndex,
+                };
+                const previous_dispatcher = runtime.artifact_publication_dispatcher;
+                runtime.artifact_publication_dispatcher = dispatcher;
+                defer runtime.artifact_publication_dispatcher = previous_dispatcher;
+                var command = submitted.command;
+                command.publication_digest = @splat(71);
+                witness.digest = command.publication_digest;
+                witness.dispatch = .{};
+                try runtime.publication_flights.submit(runtime, dispatcher, witness, "attempt A", null);
+                const rejected_index = index + 10;
+                dispatch.observations[0] = .{ .state = .ordered, .index = rejected_index };
+                try std.testing.expectError(error.ArtifactPublicationPending, runtime.publication_flights.submit(runtime, dispatcher, witness, "early retry", null));
+                try std.testing.expectEqual(@as(usize, 1), dispatch.submitted);
+                {
+                    var write = try db.core.store.beginWriteTxn();
+                    errdefer write.abort();
+                    try ordered_publication.stageRejection(&write, command, rejected_index, .baseline_pending);
+                    try write.commit();
+                }
+                dispatch.applied = rejected_index;
+                try runtime.publication_flights.submit(runtime, dispatcher, witness, "attempt B", null);
+                try std.testing.expectEqual(@as(usize, 2), dispatch.submitted);
+                try std.testing.expectEqual(error.ArtifactPublicationPending, publicationAdmissionOutcome(runtime, owner));
+                dispatch.observations[1] = .{ .state = .ordered, .index = rejected_index + 1 };
+                try std.testing.expectEqual(error.ArtifactPublicationPending, publicationAdmissionOutcome(runtime, owner));
+                // Raft applied through B's position without a new producer
+                // response. This also covers a superseding log entry.
+                dispatch.applied = rejected_index + 1;
+                try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, publicationAdmissionOutcome(runtime, owner));
+
+                var other = command;
+                other.publication_digest = @splat(72);
+                witness.completion = .{ .append = .{ .key = "state for this generation", .count = 128 } };
+                try runtime.publication_flights.submit(runtime, dispatcher, witness, "append A", null);
+                witness.digest = other.publication_digest;
+                witness.completion.append.count = 256;
+                try runtime.publication_flights.submit(runtime, dispatcher, witness, "append B", null);
+                dispatch.observations[2] = .{ .state = .ordered, .index = rejected_index + 2 };
+                dispatch.observations[3] = .{ .state = .ordered, .index = rejected_index + 3 };
+                {
+                    var write = try db.core.store.beginWriteTxn();
+                    errdefer write.abort();
+                    try ordered_publication.stageRejection(&write, command, rejected_index + 2, .baseline_pending);
+                    try ordered_publication.stageRejection(&write, other, rejected_index + 3, .baseline_pending);
+                    try write.commit();
+                }
+                {
+                    var read = try runtime.store.beginRead();
+                    defer read.abort();
+                    try std.testing.expect((try ordered_publication.rejected(&read, command)) == null);
+                    try std.testing.expect((try ordered_publication.rejected(&read, other)) != null);
+                }
+                dispatch.applied = rejected_index + 3;
+                try std.testing.expect(!try runtime.publication_flights.reconcile(runtime, owner));
+
+                const upload = @import("../artifact_publication_transport.zig");
+                witness.digest = @splat(73);
+                witness.uploaded = true;
+                try runtime.publication_flights.submit(runtime, dispatcher, witness, "upload", null);
+                const upload_index = rejected_index + 4;
+                dispatch.observations[4] = .{ .state = .upload, .index = upload_index + 1 };
+                {
+                    var write = try db.core.store.beginWriteTxn();
+                    errdefer write.abort();
+                    const hashes = [_]upload.Digest{upload.chunkDigest(0, "lost chunk")};
+                    try upload.stageBegin(alloc, &write, .{
+                        .namespace = witness.authority.namespace,
+                        .publication_digest = witness.digest,
+                        .command_digest = witness.digest,
+                        .encoded_len = "lost chunk".len,
+                        .created_index = 0,
+                        .chunk_hashes = &hashes,
+                    }, upload_index);
+                    try write.commit();
+                }
+                try std.testing.expectEqual(error.ArtifactPublicationPending, publicationAdmissionOutcome(runtime, owner));
+                {
+                    var write = try db.core.store.beginWriteTxn();
+                    errdefer write.abort();
+                    try std.testing.expect(try upload.pruneOneExpired(&write, std.math.maxInt(u64)));
+                    try write.commit();
+                }
+                dispatch.applied = upload_index + 1;
+                try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, publicationAdmissionOutcome(runtime, owner));
             }
             return;
         }
@@ -51362,6 +51521,17 @@ test "model aware media ordered generation publishes beyond 4095 chunks and resu
     {
         var token = try Harness.capture(runtime, request, scope);
         defer token.deinit();
+        const limit = 1024 * 1024;
+        const slice: resource_manager_mod.Slice = .relational_preparation_working_set;
+        var manager = resource_manager_mod.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = limit } });
+        defer manager.deinit(a);
+        const original_manager = runtime.config.resource_manager;
+        runtime.config.resource_manager = &manager;
+        defer {
+            runtime.publication_flights.deinit(runtime.alloc);
+            runtime.publication_flights = .{};
+            runtime.config.resource_manager = original_manager;
+        }
         try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedChunkGeneration(runtime, request, &token, scope, desired, true));
         var shared_key: ?*PublicationFlights.AppendKey = null;
         var page_witnesses: usize = 0;
@@ -51372,7 +51542,15 @@ test "model aware media ordered generation publishes beyond 4095 chunks and resu
         }
         try std.testing.expect(page_witnesses > 1);
         try std.testing.expectEqual(page_witnesses, shared_key.?.refs);
+        const charged_bytes = @sizeOf(PublicationFlights.AppendKey) + shared_key.?.bytes.len;
+        try std.testing.expectEqual(charged_bytes, manager.sliceStats(slice).used_bytes);
+        {
+            var competing = try manager.reserve(slice, limit - charged_bytes);
+            defer competing.release();
+            try std.testing.expectError(error.PublicationEncoderAdmissionDenied, runtime.publication_flights.retainAppendKey(runtime, "distinct generation key", null));
+        }
         try std.testing.expect(!try runtime.publication_flights.reconcile(runtime, logicalRequestFingerprint(request)));
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(slice).used_bytes);
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
         try std.testing.expectEqual(@as(u32, 5000), (try manifests.Manifest.decode(try read.get(scope))).count);
