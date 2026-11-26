@@ -4275,7 +4275,7 @@ fn isEnrichmentProgressPending(err: anyerror) bool {
 fn isEnrichmentControlError(err: anyerror) bool {
     return err == error.EnrichmentRetryAborted or err == error.Cancelled or err == error.Canceled or
         err == error.EnrichmentWaitCanceled or err == error.EnrichmentWaitTimeout or
-        err == error.EnrichmentRetryInProgress or isEnrichmentProgressPending(err);
+        err == error.EnrichmentRetryInProgress or err == error.UncancellableInferenceProvider or isEnrichmentProgressPending(err);
 }
 
 test "commit requirements prepared sources defer background publication without terminal failure" {
@@ -5042,6 +5042,27 @@ test "enrichment cancellation recovery reserves one replay pass without resettin
     try std.testing.expectError(error.EnrichmentReplayAuthorityBusy, runForegroundCatchUpPassGuarded(&runtime, std.testing.io, failed.target_sequence, .{}));
     try std.testing.expect(!runtime.boundary_recovery_pending and runtime.retrying and !runtime.worker_failed);
     try std.testing.expectEqualDeep(superseding, try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name));
+
+    try enrichment_state.saveRuntimeStatus(erased, scope_name, failed);
+    try runtime.reloadDurableState();
+    runtime.lease_fencing_enabled = true;
+    const new_lease = try std.json.Stringify.valueAlloc(alloc, lease_mod.LeaseRecord{
+        .owner_id = "new owner",
+        .epoch = runtime.ownership.lease_epoch + 1,
+        .expires_at_ms = std.math.maxInt(u64),
+    }, .{});
+    defer alloc.free(new_lease);
+    {
+        var txn = try erased.beginWrite();
+        errdefer txn.abort();
+        try txn.put(lease_key, new_lease);
+        try txn.commit();
+    }
+    const before_takeover_reserve = try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name);
+    receipt = null;
+    try std.testing.expectError(error.EnrichmentReplayAuthorityBusy, saveRuntimeStatusWithPlanReceipt(&runtime, .boundary_recovery, null, runtime.replay_generation, null, &receipt));
+    try std.testing.expect(receipt == null);
+    try std.testing.expectEqualDeep(before_takeover_reserve, try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name));
     try std.testing.expect(boundaryFailureReadmission(failed, 14, 6) == null);
     var unrelated = failed;
     unrelated.retry_failure_fingerprint = 0;
@@ -8417,7 +8438,8 @@ fn scopedChunkProvider(runtime: *EnrichmentRuntime, provider: ?ChunkProvider, ca
     };
     scoped.execution.cancellation = .{ .ptr = cancellation, .is_cancelled_fn = AssetInvocationCancellation.isCancelled, .check_fn = AssetInvocationCancellation.check };
     scoped.execution.deadline_ns = guard.nativeDeadlineNs(scoped.execution.deadline_ns);
-    scoped.require_controlled_linked = scoped.require_controlled_linked or guard.deadline_ns != null or guard.cancellation.ptr != null;
+    if (guard.deadline_ns != null or guard.cancellation.ptr != null)
+        scoped.legacy_linked_admission = if (runtime.isStarted()) .defer_to_worker else .require_control;
     return scoped;
 }
 
@@ -9968,6 +9990,7 @@ const PlatformEnrichmentRuntime = struct {
                 return switch (err) {
                     RuntimeError.EnrichmentWaitCanceled => RuntimeError.EnrichmentWaitCanceled,
                     RuntimeError.EnrichmentWaitTimeout => RuntimeError.EnrichmentWaitTimeout,
+                    error.UncancellableInferenceProvider => error.UncancellableInferenceProvider,
                     RuntimeError.EnrichmentWorkerFailed => RuntimeError.EnrichmentWorkerFailed,
                     RuntimeError.EnrichmentRetryInProgress => RuntimeError.EnrichmentRetryInProgress,
                     else => switch (enrichmentErrorDisposition(err)) {
@@ -10760,8 +10783,16 @@ test "enrichment cancellation defers dense sparse and multimodal provider calls 
     mock.inherited.store(false, .release);
     runtime.config.chunk_provider.?.chunk_input_callback = @ptrCast(&Mock.legacyChunk);
     const media_config: chunking_types_mod.Config = .{ .provider = .antfly, .model = "test", .embedding = .{ .model = "test" } };
+    try std.testing.expectError(error.UncancellableInferenceProvider, chunkMediaWithProviderForEnrichment(&runtime, std.testing.allocator, media_config, .{ .text = "source" }, runtime.config.chunk_provider));
+    var linked_cancellation: AssetInvocationCancellation = undefined;
+    const minimal = @import("chunker_stub.zig");
+    const minimal_config = "{\"provider\":\"antfly\"}";
+    try std.testing.expectError(error.UncancellableInferenceProvider, minimal.chunkTextWithConfigJsonAndProvider(std.testing.allocator, "source", minimal_config, scopedChunkProvider(&runtime, runtime.config.chunk_provider, &linked_cancellation)));
+    runtime.future = .{ .task = undefined }; // Dispatch observes only registration.
     try std.testing.expectError(error.EnrichmentRetryInProgress, chunkMediaWithProviderForEnrichment(&runtime, std.testing.allocator, media_config, .{ .text = "source" }, runtime.config.chunk_provider));
-    try std.testing.expect(isEnrichmentControlError(error.EnrichmentRetryInProgress));
+    try std.testing.expectError(error.EnrichmentRetryInProgress, minimal.chunkTextWithConfigJsonAndProvider(std.testing.allocator, "source", minimal_config, scopedChunkProvider(&runtime, runtime.config.chunk_provider, &linked_cancellation)));
+    runtime.future = null;
+    try std.testing.expect(isEnrichmentControlError(error.UncancellableInferenceProvider));
     runtime.active_provider_guard = .{};
     try std.testing.expectError(error.LegacyChunkDispatched, chunkMediaWithProviderForEnrichment(&runtime, std.testing.allocator, media_config, .{ .text = "source" }, runtime.config.chunk_provider));
 }
@@ -11979,6 +12010,7 @@ fn runForegroundCatchUpPassGuarded(
         if (failure == RuntimeError.EnrichmentWaitCanceled or
             failure == RuntimeError.EnrichmentWaitTimeout or
             failure == RuntimeError.EnrichmentRetryInProgress or
+            (failure == error.UncancellableInferenceProvider and (guard.deadline_ns != null or guard.cancellation.ptr != null)) or
             (failure == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)))
         {
             if (recovery) |reserved| releaseBoundaryRecoveryReservation(runtime, reserved) catch |refund_err| switch (refund_err) {
@@ -15816,8 +15848,8 @@ const DocumentPreparationPipeline = struct {
             const self: *const @This() = @ptrCast(@alignCast(ptr));
             const guard = self.context.active_provider_guard;
             if (guard.deadline_ns) |deadline| if (guard.clock.nowRealtimeNs() >= deadline) return true;
-            return self.cancel.load(.acquire) or guard.cancellation.isCancelled() or
-                self.context.config.cancellation.isCancelled() or self.producer.invocation_context.cancellation.isCancelled();
+            return self.cancel.load(.acquire) or pollSourceCancellation(guard.cancellation) or
+                pollSourceCancellation(self.context.config.cancellation) or pollSourceCancellation(self.producer.invocation_context.cancellation);
         }
         fn checkCancellation(ptr: *const anyopaque) !void {
             const self: *const @This() = @ptrCast(@alignCast(ptr));
@@ -15887,7 +15919,7 @@ const DocumentPreparationPipeline = struct {
             try checkCancellation(self);
             var fetch_config = remoteRenderConfig(self.context.config.secret_store, &self.remote_config, self.context.config.io, .{ .ptr = self, .is_cancelled_fn = isCancelled }, null, null);
             fetch_config.deadline_ns = producer.invocation_context.deadline_ns;
-            const fetched = try self.cache.fetch(self.source_url, if (self.config.credentials.len > 0) self.config.credentials else null, fetch_config);
+            const fetched = try self.cache.fetchControlled(self.source_url, if (self.config.credentials.len > 0) self.config.credentials else null, fetch_config, producer.invocation_context.cancellation);
             self.source = switch (fetched) {
                 .ok => |lease| lease,
                 .http_error => return,
@@ -16671,15 +16703,27 @@ const PreparedDocumentSourceCache = struct {
         credential_name: ?[]const u8,
         config: template_remote.RenderConfig,
     ) !FetchOutcome {
+        return self.fetchControlled(source_url, credential_name, config, null);
+    }
+
+    fn fetchControlled(
+        self: *@This(),
+        source_url: []const u8,
+        credential_name: ?[]const u8,
+        config: template_remote.RenderConfig,
+        cancellation: ?CancellationToken,
+    ) !FetchOutcome {
         const identity = sourceIdentity(source_url);
         var owner: asset_producer_mod.InvocationContext = .{ .deadline_ns = config.deadline_ns };
         if (comptime @hasField(template_remote.RenderConfig, "cancellation")) {
             if (config.cancellation) |token| owner.cancellation = .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn };
         }
+        if (cancellation) |token| owner.cancellation = token;
+        try checkPreparedSourceOwner(owner);
         var poll_ns: u64 = 10 * std.time.ns_per_ms;
         self.mutex.lockUncancelable(self.io);
         while (true) {
-            checkPreparedSourceOwner(owner) catch |err| {
+            checkPreparedSourcePoll(owner) catch |err| {
                 self.mutex.unlock(self.io);
                 return err;
             };
@@ -16734,12 +16778,12 @@ const PreparedDocumentSourceCache = struct {
         const alloc = self.allocator();
         const fetch_timer = pipeline_metrics.start(.source_fetch);
         defer fetch_timer.finish();
-        const fetched = template_remote.downloadRemoteContentOutcomeAllocWithRenderConfig(
-            alloc,
-            config,
-            source_url,
-            credential_name,
-        );
+        // Another caller may have held the keyed flight while we waited.
+        // Reconfirm authority before starting transport, outside the mutex.
+        const fetched = if (checkPreparedSourceOwner(owner)) |_|
+            template_remote.downloadRemoteContentOutcomeAllocWithRenderConfig(alloc, config, source_url, credential_name)
+        else |err|
+            err;
         if (fetched) |outcome| switch (outcome) {
             .http_error => |http_error| {
                 self.mutex.lockUncancelable(self.io);
@@ -16915,10 +16959,11 @@ const PreparedDocumentSourceCache = struct {
         if (source.cache != self or source.entry_ptr == null)
             return error.InvalidPreparedDocumentSourceLease;
         const entry = source.entry();
+        try checkPreparedSourceOwner(owner);
         var poll_ns: u64 = 10 * std.time.ns_per_ms;
         self.mutex.lockUncancelable(self.io);
         while (true) {
-            checkPreparedSourceOwner(owner) catch |err| {
+            checkPreparedSourcePoll(owner) catch |err| {
                 self.mutex.unlock(self.io);
                 return err;
             };
@@ -16936,7 +16981,7 @@ const PreparedDocumentSourceCache = struct {
                     return err;
                 };
                 self.mutex.unlock(self.io);
-                return lease;
+                return checkedPdfOutcome(owner, lease);
             }
             if (self.pdfPendingAssumeLocked(entry, decode_limits)) {
                 self.waitForPreparationAssumeLocked(owner, &poll_ns) catch |err| {
@@ -16975,12 +17020,10 @@ const PreparedDocumentSourceCache = struct {
             variant.deadline.owner = .{ .context = &owner, .is_cancelled_fn = preparedSourceOwnerCanceled };
         const prepare_timer = pipeline_metrics.start(.pdf_prepare);
         defer prepare_timer.finish();
-        const prepared = self.prepare_pdf_session_fn(
-            alloc,
-            entry.content.data,
-            decode_limits,
-            &variant.deadline,
-        );
+        const prepared = if (checkPreparedSourceOwner(owner)) |_|
+            self.prepare_pdf_session_fn(alloc, entry.content.data, decode_limits, &variant.deadline)
+        else |err|
+            err;
         if (prepared) |session| {
             variant.session = session;
             // A retained parser must never refer to the preparing caller.
@@ -17011,10 +17054,7 @@ const PreparedDocumentSourceCache = struct {
             };
             self.finishPendingPdfAssumeLocked(entry, decode_limits);
             self.mutex.unlock(self.io);
-            var owned_lease = lease;
-            errdefer owned_lease.deinit();
-            try checkPreparedSourceOwner(owner);
-            return owned_lease;
+            return checkedPdfOutcome(owner, lease);
         } else |err| {
             const classified = self.classifyPreparationError(variant.deadline.classifyError(err));
             alloc.destroy(variant);
@@ -17167,6 +17207,25 @@ fn checkedFetchOutcome(owner: asset_producer_mod.InvocationContext, outcome: Pre
     return outcome;
 }
 
+fn checkedPdfOutcome(owner: asset_producer_mod.InvocationContext, lease: PreparedDocumentSourceCache.PreparedPdfLease) !PreparedDocumentSourceCache.PreparedPdfLease {
+    var result = lease;
+    errdefer result.deinit();
+    try checkPreparedSourceOwner(owner);
+    return result;
+}
+
+/// Polling must not fall back to a token's authoritative checkpoint.
+fn pollSourceCancellation(token: CancellationToken) bool {
+    const ptr = token.ptr orelse return false;
+    const poll = token.is_cancelled_fn orelse return false;
+    return poll(ptr);
+}
+
+fn checkPreparedSourcePoll(owner: asset_producer_mod.InvocationContext) !void {
+    if (owner.deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.EnrichmentWaitTimeout;
+    if (pollSourceCancellation(owner.cancellation)) return error.EnrichmentWaitCanceled;
+}
+
 fn checkPreparedSourceOwner(owner: asset_producer_mod.InvocationContext) !void {
     if (owner.deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.EnrichmentWaitTimeout;
     owner.cancellation.check() catch |err| return callerCheckpointFailure(err);
@@ -17174,7 +17233,7 @@ fn checkPreparedSourceOwner(owner: asset_producer_mod.InvocationContext) !void {
 
 fn preparedSourceOwnerCanceled(ptr: ?*const anyopaque) bool {
     const owner: *const asset_producer_mod.InvocationContext = @ptrCast(@alignCast(ptr orelse return true));
-    checkPreparedSourceOwner(owner.*) catch return true;
+    checkPreparedSourcePoll(owner.*) catch return true;
     return false;
 }
 
@@ -17383,6 +17442,25 @@ test "prepared document cache detaches a timed-out waiter without canceling the 
     const late = (try cache.lookup(url, null)).?;
     try std.testing.expectEqual(@as(usize, 2), cache.active_borrows);
     try std.testing.expectError(error.EnrichmentWaitTimeout, checkedFetchOutcome(.{ .deadline_ns = 0 }, .{ .ok = late }));
+    try std.testing.expectEqual(@as(usize, 1), cache.active_borrows);
+
+    const Probe = struct {
+        cache: *PreparedDocumentSourceCache,
+        checks: usize = 0,
+        fn check(ptr: *const anyopaque) !void {
+            const probe: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            try std.testing.expect(probe.cache.mutex.tryLock());
+            probe.cache.mutex.unlock(probe.cache.io);
+            probe.checks += 1;
+            if (probe.checks == 2) return error.DeadlineExceeded;
+        }
+    };
+    var probe = Probe{ .cache = &cache };
+    const control = EnrichmentSourceCancellation{ .lifecycle = .none, .guard = .{ .cancellation = .{ .ptr = &probe, .check_fn = Probe.check } } };
+    try std.testing.expect(!control.token().isCancelled());
+    try std.testing.expectEqual(@as(usize, 0), probe.checks);
+    try std.testing.expectError(error.EnrichmentWaitTimeout, cache.fetchControlled(url, null, .{}, control.token()));
+    try std.testing.expectEqual(@as(usize, 2), probe.checks);
     try std.testing.expectEqual(@as(usize, 1), cache.active_borrows);
 }
 
@@ -17824,7 +17902,10 @@ fn processPendingDocumentGroup(
                     try recordIsolatedRequestError(runtime, window, request, err);
                     continue;
                 };
-                if (requestHasChunkSource(request)) try retireMediaPassForDenseRequest(runtime, request);
+                if (requestHasChunkSource(request)) retireMediaPassForDenseRequest(runtime, request) catch |err| {
+                    setActiveFailureFingerprint(runtime, 0);
+                    return err;
+                };
             },
             .sparse_embedding => processSparseEmbedding(runtime, request, chunk_cache, window) catch |err| {
                 if (try scheduleScannerRetry(runtime, request, err)) {
@@ -17946,7 +18027,12 @@ const DenseExecutionLane = struct {
         // A deferred retry's identity travels in `scope`; the pipeline
         // installs it on the scanner thread when it returns this error.
         if (deferred_retry_error) |err| return err;
-        for (self.chunked_dense) |request| try retireMediaPassForDenseRequest(self.runtime, request);
+        try self.finishPublishedQuantum();
+    }
+
+    fn finishPublishedQuantum(self: *DenseExecutionLane) anyerror!void {
+        for (self.chunked_dense) |request| retireMediaPassForDenseRequest(self.runtime, request) catch |err|
+            return FailureScope.assetPublicationFailure(&self.scope, err);
         if (self.group) |group| saveReplayCursorForGroup(self.runtime, .dense, self.applied_sequence, self.cursor_config_hash, self.replay_generation, group) catch |err| return FailureScope.assetPublicationFailure(&self.scope, err);
     }
 
@@ -40872,6 +40958,15 @@ const BoundaryRecoveryReservation = struct {
     fence: ?GeneratedWriteFence,
 };
 
+const ReplayStatusLeaseGuard = struct {
+    runtime: *EnrichmentRuntime,
+    fence: ?GeneratedWriteFence,
+
+    pub fn validate(self: @This(), txn: anytype) !void {
+        try validateRuntimeStoreWriteFenceTxn(self.runtime, txn, self.fence);
+    }
+};
+
 fn releaseBoundaryRecoveryReservation(runtime: *EnrichmentRuntime, reservation: BoundaryRecoveryReservation) !void {
     const publication_io = lockAppliedPublication(runtime);
     defer unlockAppliedPublication(runtime, publication_io);
@@ -40886,13 +40981,7 @@ fn releaseBoundaryRecoveryReservation(runtime: *EnrichmentRuntime, reservation: 
     defer publication_store.deinit();
     var status = reservation.status;
     status.consecutive_retry_count -= 1;
-    const Guard = struct {
-        runtime: *EnrichmentRuntime,
-        fence: ?GeneratedWriteFence,
-        pub fn validate(self: @This(), txn: anytype) !void {
-            try validateRuntimeStoreWriteFenceTxn(self.runtime, txn, self.fence);
-        }
-    };
+
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
         const revision = enrichment_state.restoreBoundaryRecoveryReservation(
@@ -40903,7 +40992,7 @@ fn releaseBoundaryRecoveryReservation(runtime: *EnrichmentRuntime, reservation: 
             reservation.cut.generation,
             reservation.revision,
             status,
-            Guard{ .runtime = runtime, .fence = reservation.fence },
+            ReplayStatusLeaseGuard{ .runtime = runtime, .fence = reservation.fence },
         ) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
@@ -40942,7 +41031,9 @@ fn saveRuntimeStatusWithPlanReceipt(runtime: *EnrichmentRuntime, mode: StatusPub
         .current, .failure => snapshot,
         .boundary_recovery => boundaryFailureAdmissionStatus(snapshot, recovery_pending, applied) orelse return,
     };
-    const reservation_fence = if (reservation != null) try requiredRuntimeStoreWriteFence(runtime, generation) else null;
+    // The transaction already checks the replay generation. This proof
+    // supplies the exact lease epoch for the initial reservation and refund.
+    const reservation_fence = if (mode == .boundary_recovery) try requiredRuntimeStoreWriteFence(runtime, null) else null;
     var publication_store = try RuntimePublicationStore.init(runtime);
     defer publication_store.deinit();
     const live_store = publication_store.store(runtime);
@@ -40950,7 +41041,8 @@ fn saveRuntimeStatusWithPlanReceipt(runtime: *EnrichmentRuntime, mode: StatusPub
     const projection_status = runtimeProjectionStatus(status.retrying, status.worker_failed);
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        const next = enrichment_state.saveRuntimeStatusAndProjection(runtime.alloc, live_store.*, scope_name, applied, runtime.status_revision, status, projection_status, config_hash, generation, if (mode == .failure) failed_through orelse snapshot.target_sequence else null) catch |err| switch (err) {
+        const next = enrichment_state.saveRuntimeStatusAndProjectionGuarded(runtime.alloc, live_store.*, scope_name, applied, runtime.status_revision, status, projection_status, config_hash, generation, if (mode == .failure) failed_through orelse snapshot.target_sequence else null, ReplayStatusLeaseGuard{ .runtime = runtime, .fence = reservation_fence }) catch |err| switch (err) {
+            error.EnrichmentLeaseFenceLost => return error.EnrichmentReplayAuthorityBusy,
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
                 backoffWriterLockRetry();
@@ -43057,7 +43149,7 @@ fn fetchEnrichmentSource(
     const cancellation = enrichmentSourceCancellation(runtime);
     var config = remoteRenderConfig(runtime.config.secret_store, runtime.config.remote_content, runtime.config.io, cancellation.token(), null, scopedRetryHint(runtime.config.fetch_retry_hint, request, raw));
     config.deadline_ns = runtime.active_provider_guard.nativeDeadlineNs(null);
-    return cache.fetch(source_url, credentials, config) catch |err| return providerInvocationFailure(runtime, err);
+    return cache.fetchControlled(source_url, credentials, config, cancellation.token()) catch |err| return providerInvocationFailure(runtime, err);
 }
 
 fn extractModelChunkEnrichmentSource(runtime: *EnrichmentRuntime, a: Allocator, raw: []const u8, request: enrichment_types.GeneratedEnrichmentRequest, cache: ?*PreparedDocumentSourceCache) !ModelChunkSource {
@@ -43073,11 +43165,19 @@ fn extractModelChunkSource(a: Allocator, config: Config, raw: []const u8, reques
     return extractModelChunkSourceCached(a, config, raw, request, context, null);
 }
 fn extractModelChunkSourceCached(a: Allocator, config: Config, raw: []const u8, request: enrichment_types.GeneratedEnrichmentRequest, context: ?inference_request_context.RequestContext, prepared_sources: ?*PreparedDocumentSourceCache) !ModelChunkSource {
-    if (context) |controlled| try controlled.check();
+    var owner: asset_producer_mod.InvocationContext = .{ .deadline_ns = config.source_deadline_ns, .cancellation = config.cancellation };
+    if (context) |controlled| {
+        if (controlled.deadline_ns) |deadline| owner.deadline_ns = @min(owner.deadline_ns orelse deadline, deadline);
+        owner.cancellation = controlled.cancellation orelse owner.cancellation;
+    }
     if (request.source_template.len != 0) {
-        const text = try extractSourceText(a, config, raw, request) orelse return .{};
+        var scoped = config;
+        scoped.source_deadline_ns = owner.deadline_ns;
+        scoped.cancellation = owner.cancellation;
+        const text = try extractSourceText(a, scoped, raw, request) orelse return .{};
         return .{ .input = .{ .text = text }, .bytes = text };
     }
+    try checkPreparedSourceOwner(owner);
     var parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return .{};
@@ -43088,14 +43188,14 @@ fn extractModelChunkSourceCached(a: Allocator, config: Config, raw: []const u8, 
         .text => |value| {
             if (@import("../../../chunking/chunk.zig").isRemoteModelLocator(value)) {
                 var render_config = remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, null, scopedRetryHint(config.fetch_retry_hint, request, raw));
-                render_config.deadline_ns = if (context) |controlled| controlled.deadline_ns else null;
+                render_config.deadline_ns = owner.deadline_ns;
                 if (comptime @hasField(template_remote.RenderConfig, "cancellation")) {
                     if (context) |controlled| if (controlled.cancellation) |token| {
                         render_config.cancellation = scraping.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn);
                     };
                 }
                 if (prepared_sources) |cache| {
-                    const cached = try cache.fetch(value, null, render_config);
+                    const cached = try cache.fetchControlled(value, null, render_config, owner.cancellation);
                     switch (cached) {
                         .http_error => |failure| return if (document_extraction_mod.remoteHttpStatusIsTransient(failure.status)) error.TransientPromptFailure else error.PermanentPromptFailure,
                         .ok => |lease| return .{ .source_lease = lease, .input = .{ .binary = .{ .mime_type = lease.entry().content.content_type, .data = lease.entry().content.data } } },
@@ -43108,7 +43208,7 @@ fn extractModelChunkSourceCached(a: Allocator, config: Config, raw: []const u8, 
                 errdefer a.destroy(owned);
                 owned.* = PreparedDocumentSourceCache.initWithConfig(a, config, null);
                 errdefer owned.deinit();
-                switch (try owned.fetch(value, null, render_config)) {
+                switch (try owned.fetchControlled(value, null, render_config, owner.cancellation)) {
                     .http_error => |failure| return if (document_extraction_mod.remoteHttpStatusIsTransient(failure.status)) error.TransientPromptFailure else error.PermanentPromptFailure,
                     .ok => |lease| return .{ .source_lease = lease, .owned_source_cache = owned, .input = .{ .binary = .{ .mime_type = lease.entry().content.content_type, .data = lease.entry().content.data } } },
                 }
@@ -43159,14 +43259,19 @@ const EnrichmentSourceCancellation = struct {
 
     fn isCancelled(ptr: *const anyopaque) bool {
         const self: *const @This() = @ptrCast(@alignCast(ptr));
-        if (self.lifecycle.isCancelled()) return true;
-        self.guard.check() catch return true;
-        return false;
+        if (self.guard.deadline_ns) |deadline| if (self.guard.clock.nowRealtimeNs() >= deadline) return true;
+        return pollSourceCancellation(self.lifecycle) or pollSourceCancellation(self.guard.cancellation);
+    }
+
+    fn check(ptr: *const anyopaque) !void {
+        const self: *const @This() = @ptrCast(@alignCast(ptr));
+        try self.guard.check();
+        try self.lifecycle.check();
     }
 
     fn token(self: *const @This()) CancellationToken {
         if (self.guard.deadline_ns == null and self.guard.cancellation.ptr == null and self.lifecycle.ptr == null) return .none;
-        return .{ .ptr = self, .is_cancelled_fn = isCancelled };
+        return .{ .ptr = self, .is_cancelled_fn = isCancelled, .check_fn = check };
     }
 };
 
@@ -43229,20 +43334,15 @@ fn renderSourceTemplateText(
 ) ![]const u8 {
     var render_config = remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, null, config.fetch_retry_hint);
     render_config.deadline_ns = config.source_deadline_ns;
-    if (comptime @hasDecl(template_remote, "renderJsonToValidatedTextWithConfig")) {
-        return template_remote.renderJsonToValidatedTextWithConfig(
-            alloc,
-            source_template,
-            raw_doc,
-            render_config,
-        );
-    }
-    return template_remote.renderJsonToTextWithConfig(
-        alloc,
-        source_template,
-        raw_doc,
-        render_config,
-    );
+    const owner: asset_producer_mod.InvocationContext = .{ .deadline_ns = config.source_deadline_ns, .cancellation = config.cancellation };
+    try checkPreparedSourceOwner(owner);
+    const rendered = if (comptime @hasDecl(template_remote, "renderJsonToValidatedTextWithConfig"))
+        try template_remote.renderJsonToValidatedTextWithConfig(alloc, source_template, raw_doc, render_config)
+    else
+        try template_remote.renderJsonToTextWithConfig(alloc, source_template, raw_doc, render_config);
+    errdefer alloc.free(rendered);
+    try checkPreparedSourceOwner(owner);
+    return rendered;
 }
 
 fn extractAssetSourceValue(
@@ -43338,6 +43438,8 @@ fn renderSourceParts(
     if (request.source_template.len == 0) return null;
     var render_config = remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, max_media_parts, scopedRetryHint(config.fetch_retry_hint, request, raw_doc));
     render_config.deadline_ns = config.source_deadline_ns;
+    const owner: asset_producer_mod.InvocationContext = .{ .deadline_ns = config.source_deadline_ns, .cancellation = config.cancellation };
+    try checkPreparedSourceOwner(owner);
     const parts = if (comptime @hasDecl(template_remote, "renderJsonToPartsWithConfig"))
         template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, raw_doc, render_config) catch |err| {
             if (sourceTemplateHasNoInput(err)) return null;
@@ -43348,6 +43450,8 @@ fn renderSourceParts(
             if (sourceTemplateHasNoInput(err)) return null;
             return err;
         };
+    errdefer template.freeContentParts(alloc, parts);
+    try checkPreparedSourceOwner(owner);
     if (parts.len == 0) {
         template.freeContentParts(alloc, parts);
         return null;
@@ -49144,6 +49248,10 @@ test "enrichment preserves snapshot failures instead of skipping source content"
         try std.testing.expect(probe.deadline != null and probe.deadline.? > platform_time.monotonicNs());
         try std.testing.expect(probe.deadline.? - platform_time.monotonicNs() <= std.time.ns_per_s);
     }
+    probe.deadline = null;
+    try std.testing.expectError(probe.failure, extractModelChunkEnrichmentSource(&runtime, std.testing.allocator, doc, request, null));
+    try std.testing.expect(probe.deadline != null and probe.deadline.? > platform_time.monotonicNs());
+    try std.testing.expect(probe.deadline.? - platform_time.monotonicNs() <= std.time.ns_per_s);
     runtime.active_provider_guard.deadline_ns = 0;
     try std.testing.expectError(error.EnrichmentWaitTimeout, extractEnrichmentSource(&runtime, renderSourcePartsJson, std.testing.allocator, doc, request));
 }
@@ -52167,7 +52275,77 @@ test "dense text planning forwards request control to capability discovery" {
     }
 }
 
+fn verifyDenseMediaAcknowledgementDrain() !void {
+    const a = platform.allocator.concurrentFallback();
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "media-drain" });
+    defer store.deinit();
+    var erased = try backend_erased.storeFrom(a, store);
+    defer erased.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/media-drain", .{tmp.sub_path});
+    var indexes = try index_manager_mod.IndexManager.init(a, path);
+    defer indexes.deinit();
+    try indexes.addEnrichment(&store, .{ .name = "clips", .kind = .chunk, .field = "body", .chunk_size = 8 });
+    try indexes.addEnrichment(&store, .{ .name = "vectors", .kind = .embedding, .source_artifact_name = "clips", .expected_dims = 2 });
+    var runtime = EnrichmentRuntime{
+        .alloc = a,
+        .io_impl = .{ .borrowed = std.testing.io },
+        .store = erased,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &indexes,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+    const prefix = try media_pass.scope(a, "doc", "clips", "body");
+    defer a.free(prefix);
+    const key = try media_pass.key(a, prefix, null);
+    defer a.free(key);
+    const cursor = try media_pass.encode(a, media_pass.Cursor{ .input_digest = @splat(1), .source_sequence = 7, .complete = true });
+    defer a.free(cursor);
+    try storePutWithRetry(&runtime, key, cursor);
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .dense_embedding, .index_name = "vectors", .doc_key = "doc", .source_field = "body", .sequence = 7 };
+    const owned = try enrichment_types.cloneGeneratedRequests(a, &.{request});
+    const lane = a.create(DenseExecutionLane) catch |err| {
+        enrichment_types.deinitGeneratedRequests(a, owned);
+        return err;
+    };
+    lane.* = .{ .runtime = &runtime, .plain_dense = &.{}, .chunked_dense = owned, .chunk_cache = &lane.chunk_cache_storage, .window = .{ .alloc = a }, .applied_sequence = 0, .group = null };
+
+    const Lock = struct {
+        fn begin(_: Allocator, _: *anyopaque) anyerror!backend_erased.WriteTxn {
+            return error.WriterLocked;
+        }
+    };
+    var failing = runtime.store.vtable.*;
+    failing.begin_write = Lock.begin;
+    runtime.store.vtable = &failing;
+    const future = std.testing.io.concurrent(DenseExecutionLane.finishPublishedQuantum, .{lane}) catch |err| {
+        lane.deinitOwned();
+        a.destroy(lane);
+        return err;
+    };
+    var pipeline = LanePipeline.init(&runtime);
+    pipeline.dense_inflight = .{ .lane = lane, .future = future };
+    const scanner_error = error.EnrichmentWaitTimeout;
+    setActiveFailureFingerprint(&runtime, 99);
+    try std.testing.expectError(error.WriterLocked, pipeline.drainAll(false));
+    try std.testing.expectEqual(error.WriterLocked, pipeline.publication_failure.?);
+    try std.testing.expectEqual(@as(u64, 99), runtime.active_failure_fingerprint);
+    try std.testing.expectEqual(error.EnrichmentWaitTimeout, foregroundPassFailure(&runtime, .{}, scanner_error));
+}
+
 test "dense lane publication failure stops later work and retains pipeline provenance" {
+    try verifyDenseMediaAcknowledgementDrain();
     const a = std.testing.allocator;
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const P = struct {

@@ -765,6 +765,12 @@ pub fn saveRuntimeStatus(store: anytype, scope: []const u8, status: RuntimeStatu
 /// Publish worker status and its projection metadata without replacing progress
 /// from a checkpoint read before write admission.
 pub fn saveRuntimeStatusAndProjection(alloc: Allocator, store: anytype, scope: []const u8, observed_applied: u64, observed_revision: ?u64, status: RuntimeStatus, projection_status: ProjectionStatus, config_hash: u64, generation: ?u64, failed_through: ?u64) !?u64 {
+    return saveRuntimeStatusAndProjectionGuarded(alloc, store, scope, observed_applied, observed_revision, status, projection_status, config_hash, generation, failed_through, struct {
+        pub fn validate(_: @This(), _: anytype) !void {}
+    }{});
+}
+
+pub fn saveRuntimeStatusAndProjectionGuarded(alloc: Allocator, store: anytype, scope: []const u8, observed_applied: u64, observed_revision: ?u64, status: RuntimeStatus, projection_status: ProjectionStatus, config_hash: u64, generation: ?u64, failed_through: ?u64, guard: anytype) !?u64 {
     const key = try appliedSequenceKey(alloc, scope);
     defer alloc.free(key);
     var runtime = try initRuntimeStore(alloc, store);
@@ -782,6 +788,7 @@ pub fn saveRuntimeStatusAndProjection(alloc: Allocator, store: anytype, scope: [
         txn.abort();
         return null;
     }
+    try guard.validate(&txn);
     const next_status = if (conflict)
         mergeOutstandingFailure(try loadRuntimeStatusTxn(alloc, &txn, scope), status)
     else
