@@ -67771,9 +67771,9 @@ fn recordEnrichmentRequestFailure(ctx_ptr: *anyopaque, failure: enrichment_runti
     defer ctx.alloc.free(artifact_key);
 
     const Guard = struct {
-        fn validate(ptr: *anyopaque, _: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) !void {
+        fn validate(ptr: *anyopaque, alloc: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) !void {
             const proof: *const enrichment_runtime_mod.MediaFailureProof = @ptrCast(@alignCast(ptr));
-            try proof.validate(txn);
+            try proof.validate(alloc, txn);
         }
     };
     var proof = failure.media_proof;
@@ -111607,6 +111607,18 @@ test "db terminal enrichment sequence index survives coalescing and retires with
     failure.sequence = 25;
     try db.core.store.put(primary_key, "{\"text\":\"new revision\"}");
     try std.testing.expectError(error.EnrichmentSourceChanged, recordEnrichmentRequestFailure(append_ctx, failure));
+
+    try db.core.store.put(primary_key, captured_primary);
+    const lease_key = "\x00\x00__metadata__:media_pass:test-lease";
+    const replacement = try std.json.Stringify.valueAlloc(alloc, @import("lease.zig").LeaseRecord{
+        .owner_id = "successor",
+        .epoch = 2,
+        .expires_at_ms = std.math.maxInt(u64),
+    }, .{});
+    defer alloc.free(replacement);
+    try db.core.store.put(lease_key, replacement);
+    failure.media_proof.?.fence = .{ .lease_key = lease_key, .owner_id = "worker-a", .epoch = 1 };
+    try std.testing.expectError(error.EnrichmentLeaseFenceLost, recordEnrichmentRequestFailure(append_ctx, failure));
 
     const issues = try db.listArtifactRepairIssues(alloc, .asset, "relations_graph", 0);
     defer types.freeArtifactRepairIssues(alloc, issues);

@@ -420,8 +420,11 @@ pub const MediaFailureProof = struct {
     primary_key: []const u8,
     primary_digest: [32]u8,
     primary_revision: ?u64,
+    fence: ?GeneratedWriteFence = null,
+    clock: platform_clock.Clock = platform_clock.Clock.real(),
 
-    pub fn validate(self: @This(), txn: anytype) !void {
+    pub fn validate(self: @This(), alloc: Allocator, txn: anytype) !void {
+        try validateEnrichmentWriteFenceTxn(alloc, txn, self.fence, self.clock);
         const cursor = txn.get(self.cursor_key) catch |err| return if (err == error.NotFound) error.EnrichmentSourceChanged else err;
         if (!std.mem.eql(u8, cursor, self.cursor_value)) return error.EnrichmentSourceChanged;
         const revisions = @import("../../document_mutation_revision.zig");
@@ -8145,12 +8148,13 @@ fn mutateMediaPassOnce(runtime: *EnrichmentRuntime, cursor_key: []const u8, expe
 const MediaEmbeddingSelection = struct { revision: ?[32]u8 };
 const MediaAcknowledgementMode = union(enum) {
     completed: ?MediaEmbeddingSelection,
-    pending_repair,
+    pending_repair: *bool,
 };
 
 fn retireMediaPassForDenseRequest(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, mode: MediaAcknowledgementMode) !void {
     const embedding = runtime.index_manager.getEnrichment(.embedding, requestEmbeddingName(request)) orelse return;
     const chunks = runtime.index_manager.getEnrichment(.chunk, embedding.source_artifact_name) orelse return;
+    if (mode == .pending_repair and chunks.chunker_json.len == 0) return;
     try acknowledgeMediaPassConsumer(runtime, request, chunks.name, chunks.source_field, .embedding, embedding.name, mode);
 }
 
@@ -8221,6 +8225,10 @@ fn mediaEmbeddingAcknowledgement(runtime: *EnrichmentRuntime, request: enrichmen
     };
     const computation = mediaEmbeddingComputationRequest(runtime, request);
     const provider = if (selection != null) runtime.config.dense_embedder else null;
+    var recipe_arena = std.heap.ArenaAllocator.init(a);
+    defer recipe_arena.deinit();
+    var resolved = false;
+    var recipe: ?ModelEmbeddingConsumerRecipe = null;
     for (0..cursor.page_count) |page_index| {
         const page_key = try media_pass.key(a, prefix, @intCast(page_index));
         defer a.free(page_key);
@@ -8239,14 +8247,13 @@ fn mediaEmbeddingAcknowledgement(runtime: *EnrichmentRuntime, request: enrichmen
                 for (receipts.value) |receipt| {
                     if (!isModelChunkEmbeddingFailure(receipt)) continue;
                     if (metadata.output_sub_index) |index| if (receipt.sub_index != index) continue;
-                    // A spool parent contains all child windows. Match each
-                    // receipt against the same sub-index vector replay uses.
-                    var window = metadata.*;
-                    window.output_sub_index = receipt.sub_index;
-                    if (!try modelChunkEmbeddingFailureMatches(a, selected_provider, computation, &window, receipt))
-                        continue;
-                    if (!modelChunkEmbeddingReceiptMatchesRevision(receipt.model_revision, selection.?.revision))
-                        continue;
+                    if (!modelChunkEmbeddingReceiptMatchesRevision(receipt.model_revision, selection.?.revision)) continue;
+                    if (!resolved) {
+                        recipe = try resolveModelEmbeddingConsumerRecipe(recipe_arena.allocator(), selected_provider, computation);
+                        resolved = true;
+                    }
+                    const current = recipe orelse break;
+                    if (!try current.matches(a, receipt)) continue;
                     failed = true;
                     terminal = terminal or receipt.terminal;
                     required = required or receipt.required;
@@ -8296,7 +8303,9 @@ fn captureMediaFailureProof(runtime: *EnrichmentRuntime, request: enrichment_typ
             .cursor_key = cursor_key,
             .cursor_value = cursor_value,
             .primary_key = primary_key,
-            .primary_digest = sourceRecordDigest(raw),
+            .primary_digest = if (logical != null) sourceRecordDigest(raw) else logical_digest,
+            .fence = try requiredRuntimeStoreWriteFence(runtime, replayWriteGeneration(runtime)),
+            .clock = runtime.clock,
             .primary_revision = if (revisions.keyForPhysical(primary_key)) |key| try revisions.load(&probe, key) else null,
         },
         .logical_digest = logical_digest,
@@ -8314,11 +8323,20 @@ fn acknowledgeMediaPassConsumer(runtime: *EnrichmentRuntime, request: enrichment
     var parsed = try std.json.parseFromSlice(media_pass.Cursor, a, try media_pass.payload(raw), .{});
     defer parsed.deinit();
     if (!parsed.value.complete or parsed.value.retiring or parsed.value.source_sequence != request.sequence) return;
+    if (mode == .pending_repair) {
+        for (parsed.value.acknowledged_consumers) |value| {
+            if (std.mem.startsWith(u8, value, pending_media_repair_prefix)) break;
+        } else return;
+    }
     const consumer = try mediaPassConsumerIdentity(runtime, a, chunk_name, @tagName(kind), consumer_name);
     defer a.free(consumer);
     var acknowledgements = std.ArrayList([]const u8).empty;
     defer acknowledgements.deinit(a);
     try acknowledgements.appendSlice(a, parsed.value.acknowledged_consumers);
+    const pending_index = for (acknowledgements.items, 0..) |value, index| {
+        if (pendingMediaEmbeddingRepair(value, consumer) != null) break @as(?usize, index);
+    } else null;
+    if (mode == .pending_repair and pending_index == null) return;
     const already = for (acknowledgements.items) |value| {
         if (std.mem.eql(u8, value, consumer)) break true;
     } else false;
@@ -8346,10 +8364,6 @@ fn acknowledgeMediaPassConsumer(runtime: *EnrichmentRuntime, request: enrichment
     var cursor = parsed.value;
     var staged_cursor: ?[]u8 = null;
     defer if (staged_cursor) |bytes| a.free(bytes);
-    const pending_index = for (acknowledgements.items, 0..) |value, index| {
-        if (pendingMediaEmbeddingRepair(value, consumer) != null) break @as(?usize, index);
-    } else null;
-    if (mode == .pending_repair and pending_index == null) return;
     const repair_prefix = "repair:";
     const repair_done = for (acknowledgements.items) |value| {
         if (std.mem.startsWith(u8, value, repair_prefix) and std.mem.eql(u8, value[repair_prefix.len..], consumer))
@@ -8437,6 +8451,7 @@ fn acknowledgeMediaPassConsumer(runtime: *EnrichmentRuntime, request: enrichment
     // Independent asset and dense lanes must both acknowledge durable output
     // before their shared decoded-work spool can retire.
     if (complete) try compactMediaPassScope(runtime, prefix, cursor.input_digest);
+    if (mode == .pending_repair) mode.pending_repair.* = true;
 }
 
 const MediaPassVectorCache = struct {
@@ -11530,14 +11545,15 @@ fn skipPersistedRequestFailure(
 }
 
 fn resumePersistedDocumentRequestFailure(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, request: enrichment_types.GeneratedEnrichmentRequest) !bool {
-    if (!try skipPersistedRequestFailure(runtime, window, request)) return false;
     if (request.kind == .dense_embedding and requestHasChunkSource(request)) {
-        retireMediaPassForDenseRequest(runtime, request, .pending_repair) catch |err| {
+        var resumed = false;
+        retireMediaPassForDenseRequest(runtime, request, .{ .pending_repair = &resumed }) catch |err| {
             if (!isEnrichmentControlError(err)) setActiveFailureFingerprint(runtime, 0);
             return err;
         };
+        if (resumed) return true;
     }
-    return true;
+    return skipPersistedRequestFailure(runtime, window, request);
 }
 
 /// Scanner-thread variant: the attempt number is read from the runtime-global
@@ -32282,27 +32298,48 @@ fn selectTerminalModelChunkEmbeddingFailure(receipts: []const @import("inference
     return null;
 }
 
-fn modelChunkEmbeddingFailureMatches(a: Allocator, provider: embedder_mod.DenseEmbedder, request: enrichment_types.GeneratedEnrichmentRequest, parent: *const @import("inference_chunker").types.ModelMetadata, receipt: @import("inference_chunker").outputs.Result) !bool {
-    var producer = try std.json.parseFromSlice(std.json.Value, a, request.producer_json, .{});
-    defer producer.deinit();
-    var config = producer.value;
+const ModelEmbeddingConsumerRecipe = struct {
+    target: @import("inference_chunker").outputs.Target,
+    pinned_identity: ?[]const u8,
+
+    fn matches(self: @This(), a: Allocator, receipt: @import("inference_chunker").outputs.Result) !bool {
+        if (!std.mem.eql(u8, self.target.model, receipt.model)) return false;
+        if (self.pinned_identity) |expected| if (!std.mem.eql(u8, expected, receipt.model_identity)) return false;
+        var target = self.target;
+        target.required = receipt.required;
+        const recipe = try target.receiptRecipeIdentity(a, receipt);
+        if (!std.mem.eql(u8, &recipe, receipt.recipe_id)) return false;
+        // A complete receipt may describe a vector staged separately. The
+        // publisher validates the actual vector when it loads that payload.
+        if (receipt.status != .complete or receipt.embedding != null)
+            try receipt.validate(target);
+        return true;
+    }
+};
+
+/// Resolve once per consumer. The caller owns the arena and uses a separate
+/// scratch allocator for per-receipt hashing.
+fn resolveModelEmbeddingConsumerRecipe(arena: Allocator, provider: embedder_mod.DenseEmbedder, request: enrichment_types.GeneratedEnrichmentRequest) !?ModelEmbeddingConsumerRecipe {
+    if (request.producer_json.len == 0) return null;
+    var config = try std.json.parseFromSliceLeaky(std.json.Value, arena, request.producer_json, .{});
     if (config == .object) if (config.object.get("config")) |nested| {
         config = nested;
     };
-    if (config != .object) return false;
-    const kind = config.object.get("provider") orelse return false;
-    const model = config.object.get("model") orelse return false;
-    if (kind != .string or !std.mem.eql(u8, kind.string, "antfly") or model != .string or !std.mem.eql(u8, model.string, receipt.model) or !std.mem.eql(u8, provider.recoveryIdentity(requestEmbeddingName(request)).model, receipt.model)) return false;
-    if (config.object.get("model_identity")) |pin| if (pin != .null and (pin != .string or !std.mem.eql(u8, pin.string, receipt.model_identity))) return false;
-    inline for (.{ "instruction", "query_instruction", "document_input_type" }) |name| if (config.object.get(name)) |value| if (value != .null) return false;
-    const selected = modelEmbeddingMetadataForWindow(a, request, parent, receipt, 1) catch |err| switch (err) {
-        error.IncompatibleChunkEmbeddingTarget => return false,
+    if (config != .object) return null;
+    const kind = config.object.get("provider") orelse return null;
+    const model = config.object.get("model") orelse return null;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "antfly") or model != .string or !std.mem.eql(u8, provider.recoveryIdentity(requestEmbeddingName(request)).model, model.string)) return null;
+    const pin = config.object.get("model_identity") orelse std.json.Value.null;
+    if (pin != .null and pin != .string) return null;
+    inline for (.{ "instruction", "query_instruction", "document_input_type" }) |name| if (config.object.get(name)) |value| if (value != .null) return null;
+    const task = config.object.get("task_type") orelse std.json.Value{ .string = "RETRIEVAL_DOCUMENT" };
+    if (task != .string) return error.InvalidChunkOutput;
+    const target = modelEmbeddingOutputTarget(arena, request, model.string, task.string, false) catch |err| switch (err) {
+        error.IncompatibleChunkEmbeddingTarget => return null,
         else => return err,
     };
-    defer selected.deinit(a);
-    if (!std.mem.eql(u8, selected.model, receipt.model) or selected.dimensions != request.expected_dims) return false;
-    try receipt.validate(.{ .name = "embedding", .kind = .embedding, .model = receipt.model, .required = receipt.required, .dimensions = request.expected_dims, .task_type = selected.task_type });
-    return true;
+    if (!std.mem.eql(u8, target.model, model.string)) return null;
+    return .{ .target = target, .pinned_identity = if (pin == .string) pin.string else null };
 }
 
 fn modelChunkEmbeddingReceiptMatchesRevision(receipt_revision: []const u8, observed_revision: ?[32]u8) bool {
@@ -32316,7 +32353,10 @@ fn terminalModelChunkEmbedding(a: Allocator, provider: embedder_mod.DenseEmbedde
     var parsed = try std.json.parseFromSlice([]O.Result, a, raw, .{});
     defer parsed.deinit();
     const receipt = selectTerminalModelChunkEmbeddingFailure(parsed.value, parent.output_sub_index orelse 0) orelse return false;
-    if (!try modelChunkEmbeddingFailureMatches(a, provider, request, parent, receipt)) return false;
+    var recipe_arena = std.heap.ArenaAllocator.init(a);
+    defer recipe_arena.deinit();
+    const recipe = try resolveModelEmbeddingConsumerRecipe(recipe_arena.allocator(), provider, request) orelse return false;
+    if (!try recipe.matches(a, receipt)) return false;
     const capabilities = provider.capabilities(a, requestEmbeddingName(request)) catch |err| switch (err) {
         error.EmbeddingCapabilitiesUnavailable => return modelChunkEmbeddingReceiptMatchesRevision(receipt.model_revision, null),
         else => return err,
@@ -32457,8 +32497,30 @@ fn modelEmbeddingMetadataFromResults(a: Allocator, request: enrichment_types.Gen
     };
     return modelEmbeddingMetadataForWindow(a, request, parent, selected, window_count);
 }
-fn modelEmbeddingMetadataForWindow(a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, parent: *const @import("inference_chunker").types.ModelMetadata, selected: ?@import("inference_chunker").outputs.Result, window_count: usize) !*@import("inference_chunker").types.ModelMetadata {
+fn modelEmbeddingOutputTarget(a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, model: []const u8, task: []const u8, required: bool) !@import("inference_chunker").outputs.Target {
     const O = @import("inference_chunker").outputs;
+    var target = O.Target{ .name = "embedding", .kind = .embedding, .model = model, .required = required, .task_type = task, .dimensions = request.expected_dims };
+    if (request.chunker_json.len != 0) {
+        var chunks = try chunking_types_mod.parseConfigFromSlice(a, request.chunker_json);
+        defer chunks.deinit(a);
+        if (chunks.outputs_json.len != 0) {
+            var consumers = try std.json.parseFromSlice(O.Config, a, chunks.outputs_json, .{});
+            defer consumers.deinit();
+            if (chunks.embedding) |legacy| consumers.value = try consumers.value.includingEmbedding(consumers.arena.allocator(), .{ .name = "embedding", .kind = .embedding, .model = legacy.model, .model_identity = legacy.model_identity, .task_type = legacy.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (legacy.dimensions) |dims| @intCast(dims) else null });
+            const configured = for (consumers.value.targets) |candidate| {
+                if (std.mem.eql(u8, candidate.name, "embedding")) break candidate;
+            } else return error.IncompatibleChunkEmbeddingTarget;
+            // Own target strings until receipt validation and hashing finish.
+            const encoded_target = try std.json.Stringify.valueAlloc(a, configured, .{});
+            target = try std.json.parseFromSliceLeaky(O.Target, a, encoded_target, .{});
+            target.required = required;
+            if (!std.mem.eql(u8, target.task_type, task) or (target.dimensions != null and target.dimensions.? != request.expected_dims)) return error.IncompatibleChunkEmbeddingTarget;
+        }
+    }
+    return target;
+}
+
+fn modelEmbeddingMetadataForWindow(a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, parent: *const @import("inference_chunker").types.ModelMetadata, selected: ?@import("inference_chunker").outputs.Result, window_count: usize) !*@import("inference_chunker").types.ModelMetadata {
     var recipe_parent = parent.*;
     recipe_parent.outputs_json = null;
     const result = try recipe_parent.clone(a);
@@ -32477,26 +32539,9 @@ fn modelEmbeddingMetadataForWindow(a: Allocator, request: enrichment_types.Gener
     if (model != .string or !std.mem.eql(u8, model.string, value.model)) return result;
     const task = config.object.get("task_type") orelse std.json.Value{ .string = "RETRIEVAL_DOCUMENT" };
     if (task != .string) return error.InvalidChunkOutput;
-    var target = O.Target{ .name = "embedding", .kind = .embedding, .model = value.model, .required = value.required, .task_type = task.string, .dimensions = request.expected_dims };
-    var config_arena = std.heap.ArenaAllocator.init(a);
-    defer config_arena.deinit();
-    if (request.chunker_json.len != 0) {
-        var chunks = try chunking_types_mod.parseConfigFromSlice(a, request.chunker_json);
-        defer chunks.deinit(a);
-        if (chunks.outputs_json.len != 0) {
-            var consumers = try std.json.parseFromSlice(O.Config, a, chunks.outputs_json, .{});
-            defer consumers.deinit();
-            if (chunks.embedding) |legacy| consumers.value = try consumers.value.includingEmbedding(consumers.arena.allocator(), .{ .name = "embedding", .kind = .embedding, .model = legacy.model, .model_identity = legacy.model_identity, .task_type = legacy.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (legacy.dimensions) |dims| @intCast(dims) else null });
-            const configured = for (consumers.value.targets) |candidate| {
-                if (std.mem.eql(u8, candidate.name, "embedding")) break candidate;
-            } else return error.IncompatibleChunkEmbeddingTarget;
-            // Own target strings until receipt validation and hashing finish.
-            const encoded_target = try std.json.Stringify.valueAlloc(config_arena.allocator(), configured, .{});
-            target = try std.json.parseFromSliceLeaky(O.Target, config_arena.allocator(), encoded_target, .{});
-            target.required = value.required;
-            if (!std.mem.eql(u8, target.task_type, task.string) or (target.dimensions != null and target.dimensions.? != request.expected_dims)) return error.IncompatibleChunkEmbeddingTarget;
-        }
-    }
+    var recipe_arena = std.heap.ArenaAllocator.init(a);
+    defer recipe_arena.deinit();
+    const target = try modelEmbeddingOutputTarget(recipe_arena.allocator(), request, value.model, task.string, value.required);
     if (value.status == .complete and value.embedding != null) try value.validate(target);
     const recipe = try target.receiptRecipeIdentity(a, value);
     if (!std.mem.eql(u8, &recipe, value.recipe_id)) return error.IncompatibleChunkEmbeddingTarget;
@@ -32781,13 +32826,25 @@ fn processCachedChunkDenseItems(
     cached_items.clearRetainingCapacity();
 }
 
+fn fusedMediaVectorReceiptsMatch(arena: Allocator, scratch: Allocator, provider: embedder_mod.DenseEmbedder, request: enrichment_types.GeneratedEnrichmentRequest, revision: ?[32]u8, receipts: []const @import("inference_chunker").outputs.Result) !bool {
+    var consumer: ?ModelEmbeddingConsumerRecipe = null;
+    for (receipts) |receipt| {
+        if (receipt.kind != .embedding or !std.mem.eql(u8, receipt.name, "embedding")) continue;
+        if (!modelChunkEmbeddingReceiptMatchesRevision(receipt.model_revision, revision)) return false;
+        if (consumer == null)
+            consumer = try resolveModelEmbeddingConsumerRecipe(arena, provider, request) orelse return false;
+        if (!try consumer.?.matches(scratch, receipt)) return false;
+    }
+    return consumer != null;
+}
+
 /// Ordered producers never use local cache flags as acceptance and never
 /// publish directly to the legacy artifact store. Each bounded provider batch
 /// owns its causal inputs; no storage snapshot spans inference or dispatch.
 /// One parent remains one causal publication, with an atomic set of independently
 /// indexed sub-window vectors. Child keys sort under the parent, so the ordinary
 /// stream census and source guards cover every vector and its retirement.
-fn publishMediaWindowVectors(runtime: *EnrichmentRuntime, a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, provider: embedder_mod.DenseEmbedder, input: *@import("../artifact_chunk_vector_publication.zig").Input, payload: ?[]const u8, cache: *MediaPassVectorCache) !bool {
+fn publishMediaWindowVectors(runtime: *EnrichmentRuntime, a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, provider: embedder_mod.DenseEmbedder, revision: ?[32]u8, input: *@import("../artifact_chunk_vector_publication.zig").Input, payload: ?[]const u8, cache: *MediaPassVectorCache) !bool {
     const O = @import("inference_chunker").outputs;
     const metadata = if (payload) |raw| try @import("../../../chunking/chunk.zig").modelMetadataAlloc(a, raw) else null;
     defer if (metadata) |value| value.deinit(a);
@@ -32796,36 +32853,51 @@ fn publishMediaWindowVectors(runtime: *EnrichmentRuntime, a: Allocator, request:
     const scratch = arena.allocator();
     const receipts = try std.json.parseFromSliceLeaky([]O.Result, scratch, if (metadata) |value| value.outputs_json orelse "[]" else "[]", .{});
     var count: usize = 0;
-    for (receipts) |receipt| if (receipt.kind == .embedding and std.mem.eql(u8, receipt.name, "embedding")) {
+    var terminal = false;
+    for (receipts) |receipt| {
+        if (receipt.kind != .embedding or !std.mem.eql(u8, receipt.name, "embedding")) continue;
         count += 1;
-    };
-    // A shortened set must also remove older child vectors.
+        terminal = terminal or (receipt.status == .failed and receipt.terminal);
+    }
+    if (count == 0) return false;
+    const computation = mediaEmbeddingComputationRequest(runtime, request);
+    const member_set = count > 1 or terminal;
+    if (member_set and !try fusedMediaVectorReceiptsMatch(scratch, a, provider, computation, revision, receipts)) return false;
+
+    // Single successful windows normally use the scalar path. Only resolve
+    // their fused recipe here when a previous publication left child vectors
+    // that this receipt can legitimately replace.
     var old_keys = std.ArrayList([]const u8).empty;
     {
         var read = try runtime.store.beginRead();
         defer read.abort();
-        var borrowed: @import("../artifact_chunk_cursor.zig").BorrowedRead = .{ .read = &read };
-        var cursor = try borrowed.openPhysicalCursorAdapter();
-        defer cursor.close();
-        var row = try cursor.seekAtOrAfter(input.token.producer_scope_key);
-        while (row) |entry| {
-            if (!std.mem.startsWith(u8, entry.key, input.token.producer_scope_key)) break;
-            if (internal_keys.isDerivedEmbeddingArtifactKey(entry.key) and internal_keys.matchesDerivedEmbeddingArtifactName(entry.key, requestEmbeddingName(request))) {
-                const base = (try internal_keys.derivedEmbeddingBaseKeyAlloc(scratch, entry.key)).?;
-                if (std.mem.eql(u8, internal_keys.mediaWindowParent(base), input.token.producer_scope_key)) {
-                    try old_keys.append(scratch, try scratch.dupe(u8, entry.key));
-                    if (!std.mem.eql(u8, entry.key, input.output_key)) try input.token.observePrecondition(entry.key, entry.value, try ordered_publication.artifactRevision(&read, input.token.namespace, entry.key));
+        var has_children = false;
+        {
+            var borrowed: @import("../artifact_chunk_cursor.zig").BorrowedRead = .{ .read = &read };
+            var cursor = try borrowed.openPhysicalCursorAdapter();
+            defer cursor.close();
+            var row = try cursor.seekAtOrAfter(input.token.producer_scope_key);
+            while (row) |entry| {
+                if (!std.mem.startsWith(u8, entry.key, input.token.producer_scope_key)) break;
+                if (internal_keys.isDerivedEmbeddingArtifactKey(entry.key) and internal_keys.matchesDerivedEmbeddingArtifactName(entry.key, requestEmbeddingName(request))) {
+                    const base = (try internal_keys.derivedEmbeddingBaseKeyAlloc(scratch, entry.key)).?;
+                    if (std.mem.eql(u8, internal_keys.mediaWindowParent(base), input.token.producer_scope_key)) {
+                        try old_keys.append(scratch, try scratch.dupe(u8, entry.key));
+                        has_children = has_children or internal_keys.mediaWindowIndex(base) != null;
+                    }
                 }
+                row = try cursor.next();
             }
-            row = try cursor.next();
+        }
+        if (!member_set) {
+            if (!has_children or !try fusedMediaVectorReceiptsMatch(scratch, a, provider, computation, revision, receipts)) return false;
+        }
+        for (old_keys.items) |key| {
+            if (std.mem.eql(u8, key, input.output_key)) continue;
+            const raw = read.get(key) catch |err| if (err == error.NotFound) null else return err;
+            try input.token.observePrecondition(key, raw, try ordered_publication.artifactRevision(&read, input.token.namespace, key));
         }
     }
-    const has_children = for (old_keys.items) |key| {
-        const base = (try internal_keys.derivedEmbeddingBaseKeyAlloc(scratch, key)).?;
-        if (internal_keys.mediaWindowIndex(base) != null) break true;
-    } else false;
-    const terminal_scalar = if (metadata) |value| count == 1 and (terminalModelChunkEmbedding(scratch, provider, mediaEmbeddingComputationRequest(runtime, request), value) catch |err| return providerInvocationFailure(runtime, err)) else false;
-    if (count <= 1 and !has_children and !terminal_scalar) return false;
     var effects = std.ArrayList(ordered_publication.Mutation).empty;
     var wanted = std.StringHashMap(void).init(scratch);
     var pending = false;
@@ -33593,7 +33665,7 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
         }
         if (dense) |provider| for (items.items) |*item| {
             if (item.carried != null) continue;
-            if (try publishMediaWindowVectors(runtime, alloc, request, provider, &item.input, item.input.value, &staged_vectors)) item.failed = true;
+            if (try publishMediaWindowVectors(runtime, alloc, request, provider, execution_revision, &item.input, item.input.value, &staged_vectors)) item.failed = true;
         };
         if (dense) |provider| for (items.items) |*item| if (!item.failed and item.carried == null) if (item.input.value) |payload| {
             item.precomputed = storedModelChunkVectorCached(runtime, item.input.token.arena.allocator(), provider, request, payload, &staged_vectors) catch |err| {
@@ -42857,9 +42929,13 @@ fn validateRuntimeStoreWriteFenceTxn(
     txn: anytype,
     fence: ?GeneratedWriteFence,
 ) !void {
+    return validateEnrichmentWriteFenceTxn(runtime.alloc, txn, fence, runtime.clock);
+}
+
+fn validateEnrichmentWriteFenceTxn(alloc: Allocator, txn: anytype, fence: ?GeneratedWriteFence, clock: platform_clock.Clock) !void {
     const expected = fence orelse return;
     if (expected.replay_generation) |generation|
-        try enrichment_state.validateReplayGenerationTxn(runtime.alloc, txn, scope_name, generation);
+        try enrichment_state.validateReplayGenerationTxn(alloc, txn, scope_name, generation);
     if (expected.lease_key.len == 0) return;
     const raw = txn.get(expected.lease_key) catch |err| switch (err) {
         error.NotFound => return error.EnrichmentLeaseFenceLost,
@@ -42867,7 +42943,7 @@ fn validateRuntimeStoreWriteFenceTxn(
     };
     var parsed = std.json.parseFromSlice(
         lease_mod.LeaseRecord,
-        runtime.alloc,
+        alloc,
         raw,
         .{ .allocate = .alloc_always, .ignore_unknown_fields = true },
     ) catch |err| switch (err) {
@@ -42877,7 +42953,7 @@ fn validateRuntimeStoreWriteFenceTxn(
     defer parsed.deinit();
     if (!std.mem.eql(u8, parsed.value.owner_id, expected.owner_id) or
         parsed.value.epoch != expected.epoch or
-        parsed.value.expires_at_ms <= runtime.clock.nowRealtimeMs())
+        parsed.value.expires_at_ms <= clock.nowRealtimeMs())
     {
         return error.EnrichmentLeaseFenceLost;
     }
@@ -50325,7 +50401,7 @@ test "model aware media preparation retires only after independent output consum
             if (self.change_primary) try storePutWithRetry(self.runtime, proof.primary_key, "{\"body\":\"replacement\"}");
             var txn = try self.runtime.store.beginProbe();
             defer txn.abort();
-            try proof.validate(&txn);
+            try proof.validate(self.runtime.alloc, &txn);
             try TestFailureCapture.record(&self.capture, failure);
         }
 
@@ -50508,19 +50584,19 @@ test "model aware media preparation retires only after independent output consum
     try std.testing.expectEqual(@as(usize, 0), recorder.capture.count);
     recorder.change_primary = false;
     try storePutWithRetry(&runtime, primary_key, raw_primary);
-    try storePutWithRetry(&runtime, key, failed_cursor);
+    recorder.offline = true;
+    const discovery_calls = recorder.discovery_calls;
 
+    // The first attempt staged the marker but the guarded ledger write failed.
+    // Resume it before any provider selection, then fail the final cursor write.
     runtime.generated_publication = .{ .ptr = &recorder, .commit = undefined, .heartbeat = undefined, .acquire_store = Recorder.acquire };
     recorder.block_after_record = true;
-    try std.testing.expectError(error.WriterLocked, lane.finishPublishedQuantum());
-    try std.testing.expect(lane.scope.publication_failed);
+    try std.testing.expectError(error.WriterLocked, resumePersistedDocumentRequestFailure(&runtime, &lane.window, failed_request));
     try std.testing.expectEqual(@as(usize, 1), recorder.capture.count);
     const before_resume = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
     try std.testing.expectEqual(@as(u64, 0), before_resume.output_counts.embedding.failed);
 
     recorder.block_after_record = false;
-    recorder.offline = true;
-    const discovery_calls = recorder.discovery_calls;
     lane.scope = .{};
     try std.testing.expect(try resumePersistedDocumentRequestFailure(&runtime, &lane.window, failed_request));
     try lane.finishPublishedQuantum();
@@ -51586,7 +51662,29 @@ test "model aware media ordered vector windows are searchable with exact clocks 
         defer input.deinit();
         var cache = MediaPassVectorCache{ .allocator = a };
         defer cache.deinit();
-        try std.testing.expect(try publishMediaWindowVectors(runtime, a, vector_request, provider, &input, input.value.?, &cache));
+        if (round == 0) {
+            var failed = results;
+            for (&failed) |*receipt| {
+                receipt.status = .failed;
+                receipt.embedding = null;
+                receipt.code = "Unavailable";
+                receipt.terminal = true;
+            }
+            const failed_outputs = try std.json.Stringify.valueAlloc(a, &failed, .{});
+            defer a.free(failed_outputs);
+            var failed_metadata = metadata;
+            failed_metadata.outputs_json = failed_outputs;
+            const failed_payload = try std.json.Stringify.valueAlloc(a, .{ ._chunk = failed_metadata }, .{});
+            defer a.free(failed_payload);
+            const calls = harness.calls;
+            var independent = vector_request;
+            independent.embedding_name = "independent";
+            independent.producer_json = "{\"provider\":\"antfly\",\"model\":\"independent\"}";
+            try std.testing.expect(!try publishMediaWindowVectors(runtime, a, independent, provider, @as([32]u8, @splat(marker)), &input, failed_payload, &cache));
+            try std.testing.expect(!try publishMediaWindowVectors(runtime, a, vector_request, provider, @as([32]u8, @splat(0x22)), &input, failed_payload, &cache));
+            try std.testing.expectEqual(calls, harness.calls);
+        }
+        try std.testing.expect(try publishMediaWindowVectors(runtime, a, vector_request, provider, @as([32]u8, @splat(marker)), &input, input.value.?, &cache));
         try db.runUntilIdle();
         {
             var lookup = (try db.lookup(a, "doc", .{ .fields = &.{"_artifacts"}, .include_all_fields = false })).?;
@@ -51993,7 +52091,7 @@ test "model aware media terminal scalar output acknowledges failure without mode
         defer input.deinit();
         var cache = MediaPassVectorCache{ .allocator = a };
         defer cache.deinit();
-        try std.testing.expect(try publishMediaWindowVectors(runtime, a, vector_request, provider, &input, input.value.?, &cache));
+        try std.testing.expect(try publishMediaWindowVectors(runtime, a, vector_request, provider, @as([32]u8, @splat(marker)), &input, input.value.?, &cache));
         {
             var read = try runtime.store.beginRead();
             defer read.abort();
