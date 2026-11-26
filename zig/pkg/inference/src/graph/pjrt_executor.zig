@@ -90,6 +90,22 @@ fn downloadTypedOutput(buffer: *const pjrt_lib.pjrt.Buffer, backend: *const Comp
 
 // ── PjrtExecutor ───────────────────────────────────────────────────
 
+pub const ResidentOperand = struct { node: ml.graph.NodeId, value: CT };
+
+const InputValues = union(enum) {
+    graph: []const ?CT,
+    resident: []const ResidentOperand,
+
+    fn get(self: InputValues, target: ml.graph.NodeId) ?CT {
+        return switch (self) {
+            .graph => |values| values[target],
+            .resident => |values| for (values) |operand| {
+                if (operand.node == target) break operand.value;
+            } else null,
+        };
+    }
+};
+
 pub const PjrtExecutor = struct {
     allocator: Allocator,
     /// Compiled PJRT executable. Owned.
@@ -147,14 +163,14 @@ pub const PjrtExecutor = struct {
         retained_cache: ?*const PjrtRetainedBufferCache,
         semantic_input_bindings: []const PjrtSemanticInputBinding,
     ) ![]pjrt_lib.pjrt.Buffer {
-        return self.executeToBuffersWithAllocators(values, exec_ctx, allocator, allocator, retained_cache, semantic_input_bindings, null);
+        return self.executeToBuffersWithAllocators(.{ .graph = values }, exec_ctx, allocator, allocator, retained_cache, semantic_input_bindings, null);
     }
 
     /// Borrow request-owned inputs without donating them. Publication belongs
     /// to the request transaction after synchronization and logits readback.
-    pub fn executeWithResidentState(self: *PjrtExecutor, values: []?CT, backend: *const ComputeBackend, state: []const pjrt_lib.pjrt.Buffer, allocator: Allocator) ![]pjrt_lib.pjrt.Buffer {
+    pub fn executeWithResidentState(self: *PjrtExecutor, values: []const ResidentOperand, backend: *const ComputeBackend, state: []const pjrt_lib.pjrt.Buffer, allocator: Allocator) ![]pjrt_lib.pjrt.Buffer {
         if (self.resident_output_start == null) return error.NotResidentDecoder;
-        return self.executeToBuffersWithAllocators(values, .{ .backend = backend }, allocator, allocator, null, &.{}, state);
+        return self.executeToBuffersWithAllocators(.{ .resident = values }, .{ .backend = backend }, allocator, allocator, null, &.{}, state);
     }
 
     fn uploadTensor(self: *PjrtExecutor, backend: *const ComputeBackend, value: CT, index: usize, allocator: Allocator) !pjrt_lib.pjrt.Buffer {
@@ -253,7 +269,7 @@ pub const PjrtExecutor = struct {
 
     fn executeToBuffersWithAllocators(
         self: *PjrtExecutor,
-        values: []?CT,
+        values: InputValues,
         exec_ctx: PartitionExecutor.ExecutionContext,
         allocator: Allocator,
         transfer_allocator: Allocator,
@@ -337,11 +353,11 @@ pub const PjrtExecutor = struct {
                             owned_input_bufs[i] = false;
                             break :blk buffer;
                         };
-                        const value = values[nid] orelse return error.MissingValue;
+                        const value = values.get(nid) orelse return error.MissingValue;
                         break :blk try self.uploadTensor(exec_ctx.backend orelse self.host_backend, value, i, staging_allocator);
                     },
                     .semantic_past_graph_node => |nid| blk: {
-                        const ct = values[@intCast(nid)] orelse {
+                        const ct = values.get(nid) orelse {
                             if (debug) {
                                 std.log.warn(
                                     "PJRT execute input[{d}/{d}] missing semantic graph node value node={d}",
@@ -1378,7 +1394,7 @@ const PjrtModelRuntime = struct {
         @memset(retained, false);
         const exec_ctx: PartitionExecutor.ExecutionContext = .{ .embedding_ids = input_ids };
         var outputs = try phase.executor.executeToBuffersWithAllocators(
-            values,
+            .{ .graph = values },
             exec_ctx,
             bookkeeping,
             allocator,

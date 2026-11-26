@@ -46,7 +46,7 @@ pub const State = struct {
         self.client = null;
     }
 
-    pub fn run(self: *State, executor: *Executor, backend: *const ops.ComputeBackend, values: []?ops.CT, rows: usize, valid_rows: usize, a: std.mem.Allocator, control: ?@import("../execution_control.zig").InferenceExecutionControl) ![]f32 {
+    pub fn run(self: *State, executor: *Executor, backend: *const ops.ComputeBackend, values: []const @import("pjrt_executor.zig").ResidentOperand, rows: usize, valid_rows: usize, a: std.mem.Allocator, control: ?@import("../execution_control.zig").InferenceExecutionControl) ![]f32 {
         if (rows == 0 or rows != executor.resident_query_rows or executor.resident_capacity != self.capacity or self.position > self.capacity or rows > self.capacity - self.position) return error.InvalidResidentDecodePosition;
         if (valid_rows == 0 or valid_rows > rows or (valid_rows != rows and !executor.resident_dynamic_rows)) return error.InvalidResidentDecodePosition;
         if (executor.resident_prefill_only and self.position != 0) return error.InvalidResidentDecodePosition;

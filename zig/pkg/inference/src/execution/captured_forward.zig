@@ -413,10 +413,12 @@ pub const Cache = struct {
         defer entry.returnFrame(frame);
         frame.backend.execution_control = control;
         defer frame.backend.execution_control = null;
-        const values = try allocator.alloc(?ops.CT, entry.program.graph.nodeCount());
-        defer allocator.free(values);
-        @memset(values, null);
-        defer for (values) |value| if (value) |tensor| frame.backend.free(tensor);
+        const Operand = @import("../graph/pjrt_executor.zig").ResidentOperand;
+        var local: [8]Operand = undefined;
+        const values = if (inputs.len <= local.len) local[0..inputs.len] else try allocator.alloc(Operand, inputs.len);
+        defer if (inputs.len > local.len) allocator.free(values);
+        var value_count: usize = 0;
+        defer for (values[0..value_count]) |operand| frame.backend.free(operand.value);
         for (inputs) |input| {
             for (entry.program.bindings) |binding| {
                 if (binding.kind != .input or !std.mem.eql(u8, binding.name, input.tensor.name) or binding.node_id == @import("ml").graph.null_node) continue;
@@ -430,7 +432,12 @@ pub const Cache = struct {
                     }
                 } else false;
                 if (!required) continue;
-                values[binding.node_id] = try provider.import(provider.context, &frame.backend, &input.tensor, allocator);
+                values[value_count] = .{
+                    .node = binding.node_id,
+                    .value = try provider.import(provider.context, &frame.backend, &input.tensor, allocator),
+                };
+                value_count += 1;
+                break;
             }
         }
         var rows: usize = 0;
@@ -451,7 +458,7 @@ pub const Cache = struct {
         errdefer allocator.free(outputs);
         const shape = try allocator.dupe(i64, entry.resident.?.output_shapes[0]);
         errdefer allocator.free(shape);
-        const data = try state.run(entry.resident.?, &frame.backend, values, rows, valid_rows, allocator, control);
+        const data = try state.run(entry.resident.?, &frame.backend, values[0..value_count], rows, valid_rows, allocator, control);
         outputs[0] = .{ .data = std.mem.sliceAsBytes(data), .dtype = .f32, .shape = shape, .name = output_names[0], .allocator = allocator, .owns_data = true, .owns_shape = true, .data_alignment = .of(f32) };
         return outputs;
     }
