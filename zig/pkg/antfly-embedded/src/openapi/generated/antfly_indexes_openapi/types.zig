@@ -4726,6 +4726,7 @@ pub const EnrichmentConfig = struct {
     neighbor_context: ?EnrichmentNeighborContextConfig = null,
     /// Named cross-document context consumed by this asset producer, rendered as a canonical `{"context":{<name>:...}}` block appended to the producer input and folded into its skip state. Changes to consumed inputs (projected fields, query membership, insertion of a first match, deletion, TTL expiry, or a missing optional document becoming present) invalidate and rebuild the artifact; unrelated rows and unconsumed fields do not. Only valid on asset enrichments whose producer consumes prompt text. Supported by embedded runtimes (single-table and multi-table Lite) and by distributed tables, where context sources are declared through the artifact enrichment endpoint (not inline at table creation) and admission resolves table names and rejects cross-table generated-input cycles. Context reads execute as the declaring principal: it must be able to read every source table, and its row filter on each is conjoined into query sources (filters, traversals, and ranked queries) at declaration (document sources, ranked graph operations, and the `text`/`vector` shorthands are refused where a row filter applies). Re-declare the enrichment to re-capture changed policies.
     context_sources: ?std.json.ArrayHashMap(EnrichmentContextSource) = null,
+    seed: ?EnrichmentSeedMapping = null,
     refresh: ?EnrichmentRefreshConfig = null,
     /// Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity.
     execution: ?ExecutionPolicy = null,
@@ -4754,6 +4755,7 @@ pub const EnrichmentConfig = struct {
         .{ "producer_json", "producer_json", true },
         .{ "neighbor_context", "neighbor_context", true },
         .{ "context_sources", "context_sources", true },
+        .{ "seed", "seed", true },
         .{ "refresh", "refresh", true },
         .{ "execution", "execution", true },
         .{ "transcriber", "transcriber", true },
@@ -4846,6 +4848,10 @@ pub const EnrichmentConfig = struct {
         }
         if (self.context_sources) |value| {
             try jw.objectField("context_sources");
+            try jw.write(value);
+        }
+        if (self.seed) |value| {
+            try jw.objectField("seed");
             try jw.write(value);
         }
         if (self.refresh) |value| {
@@ -5591,6 +5597,46 @@ pub const EnrichmentRuntimeStatus = struct {
         try jw.write(self.last_embed_batch_ns);
         try jw.objectField("total_embed_ns");
         try jw.write(self.total_embed_ns);
+        try jw.endObject();
+    }
+};
+
+/// Accepts an existing result for this enrichment from an ordinary field of the written record instead of invoking its producer (artifact seeding). The mapped field stays an ordinary document field; its value is decoded like an explicit `_artifacts.<name>` or `_chunks.<name>` seed and bound to the same source version. An explicit seed in the write wins over the mapping. The mapping is not part of the enrichment's artifact identity: adding or changing it never rebuilds existing output.
+pub const EnrichmentSeedMapping = struct {
+    /// Dotted path of the record field holding the existing result.
+    field: []const u8,
+    /// How the field value is read. `text` and `json` are asset values, `vector` is a dense document embedding, `chunk_vectors` is an array of per-chunk vectors in chunk order, and `chunks` is an array of `ChunkSeed`. `auto` infers the format from the enrichment kind.
+    format: ?[]const u8 = null,
+    /// When the field is absent: `generate` runs the producer as usual; `fail` rejects the write (`ArtifactSeedMissing`).
+    on_missing: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "field", "field", false },
+        .{ "format", "format", true },
+        .{ "on_missing", "on_missing", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("field");
+        try jw.write(self.field);
+        if (self.format) |value| {
+            try jw.objectField("format");
+            try jw.write(value);
+        }
+        if (self.on_missing) |value| {
+            try jw.objectField("on_missing");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };

@@ -827,6 +827,10 @@ pub const ApiHttpClient = struct {
         include_json_null_fields: bool = false,
         row_policy_principal_proof: []const u8 = "",
         row_policy_database: []const u8 = "",
+        /// Render selected artifacts in their seed write shapes.
+        artifact_view_seed: bool = false,
+        /// Seed planning request (`artifact_seed_plan.zig`), sent as the body.
+        seed_plan_json: []const u8 = "",
     };
 
     /// Compatibility entrypoint for main callers. All native authority,
@@ -888,11 +892,12 @@ pub const ApiHttpClient = struct {
         // value even when they contain URI delimiters.
         const encoded_table_name = try percentEncodePathComponent(self.alloc, table_name);
         defer self.alloc.free(encoded_table_name);
-        const special = sql_lock_query_json.len != 0 or group_source_query_json.len != 0 or relational_integrity_catalog or relational_integrity_action or relational_integrity_jobs_json.len != 0 or relational_activation_json.len != 0 or relational_topology_json.len != 0 or relational_index_status_json.len != 0;
+        const special = options.seed_plan_json.len != 0 or sql_lock_query_json.len != 0 or group_source_query_json.len != 0 or relational_integrity_catalog or relational_integrity_action or relational_integrity_jobs_json.len != 0 or relational_activation_json.len != 0 or relational_topology_json.len != 0 or relational_index_status_json.len != 0;
         // Routing uses the actual logical key, including empty first-range
         // boundaries. Only the already-routed HTTP path needs a placeholder.
-        const key_in_body = documentKeyNeedsBody(key);
-        const encoded_key = try percentEncodePathComponent(self.alloc, if (key_in_body) "" else if (special and key.len == 0) "\x00relational_control" else key);
+        // A seed plan addresses its documents in the body; the key only routed it.
+        const key_in_body = options.seed_plan_json.len == 0 and documentKeyNeedsBody(key);
+        const encoded_key = try percentEncodePathComponent(self.alloc, if (key_in_body) "" else if (special and (key.len == 0 or options.seed_plan_json.len != 0)) "\x00relational_control" else key);
         defer self.alloc.free(encoded_key);
         const encoded_consistency = try percentEncodePathComponent(self.alloc, read_consistency);
         defer self.alloc.free(encoded_consistency);
@@ -961,7 +966,11 @@ pub const ApiHttpClient = struct {
         defer if (privacy_path) |value| self.alloc.free(value);
         const policy_path = if (privacy_policy_version) |version| try std.fmt.allocPrint(self.alloc, "{s}&_privacy_policy_version={s}", .{ privacy_path orelse typed_path, if (std.mem.allEqual(u8, &version, 0)) "none" else &version }) else null;
         defer if (policy_path) |value| self.alloc.free(value);
-        const legacy_path = policy_path orelse privacy_path orelse typed_path;
+        const view_path = if (options.artifact_view_seed) try std.fmt.allocPrint(self.alloc, "{s}&artifact_view=seed", .{policy_path orelse privacy_path orelse typed_path}) else null;
+        defer if (view_path) |value| self.alloc.free(value);
+        const plan_path = if (options.seed_plan_json.len != 0) try std.fmt.allocPrint(self.alloc, "{s}&_seed_plan=true", .{view_path orelse policy_path orelse privacy_path orelse typed_path}) else null;
+        defer if (plan_path) |value| self.alloc.free(value);
+        const legacy_path = plan_path orelse view_path orelse policy_path orelse privacy_path orelse typed_path;
         const body = if (key_in_body) try @import("http_routes.zig").DocumentReadRequest.encode(self.alloc, .lookup, key, legacy_path[(std.mem.indexOfScalar(u8, legacy_path, '?') orelse return error.InvalidArgument) + 1 ..], "") else null;
         defer if (body) |value| self.alloc.free(value);
         const target = if (key_in_body) try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}/document-read", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, encoded_table_name }) else null;
@@ -970,9 +979,9 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(uri);
 
         var resp = try self.executeRequest(.{
-            .method = if (key_in_body or body_control) .POST else .GET,
+            .method = if (key_in_body or body_control or options.seed_plan_json.len != 0) .POST else .GET,
             .uri = uri,
-            .body = body orelse if (body_control) relational_integrity_jobs_json else "",
+            .body = body orelse if (options.seed_plan_json.len != 0) options.seed_plan_json else if (body_control) relational_integrity_jobs_json else "",
             .content_type = if (key_in_body or body_control) "application/json" else null,
             .headers = headers[0..header_count],
             .timeout_ms = timeout_ms,

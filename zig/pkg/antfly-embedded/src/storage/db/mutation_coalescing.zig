@@ -187,7 +187,7 @@ pub fn coalesceKeyValueRequest(
         var seeds_artifacts = false;
         for (transform.operations) |operation| {
             if (try transform_mod.reservedProjectionOperation(operation)) |reserved| {
-                if (reserved.path.field != .embeddings) seeds_artifacts = true;
+                if (reserved.path.field == .artifacts or reserved.path.field == .chunks) seeds_artifacts = true;
                 try reserved_operations.append(alloc, reserved);
                 continue;
             }

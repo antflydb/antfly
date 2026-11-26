@@ -6304,6 +6304,12 @@ paths:
             schema:
               $ref: '#/components/schemas/BatchRequest'
       responses:
+        '200':
+          description: Validation-only seed plan (`validate_only` set); nothing was written.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SeedPlanResponse'
         '201':
           description: Batch operation successful
           content:
@@ -6900,6 +6906,23 @@ paths:
           schema:
             type: string
           example: title,author,metadata.tags
+        - name: artifact_view
+          in: query
+          required: false
+          description: >
+            How selected `_artifacts` and `_chunks` render. `descriptive` (the
+
+            default) returns artifact metadata. `seed` returns exactly the
+
+            artifact seed write shapes (`ArtifactSeed`, `ChunkSeed`), vectors
+
+            included, so the response can be written into another table to
+
+            publish the same outputs without invoking producers. Example:
+
+            `fields=*,_artifacts,_chunks&artifact_view=seed`.
+          schema:
+            $ref: '#/components/schemas/ArtifactView'
         - name: consistency
           in: query
           required: false
@@ -32464,6 +32487,95 @@ components:
           description: Value for operation (not required for $unset). Type depends on the supported operator.
             `$pull` removes every array element exactly equal to this JSON value; projected graph-edge
             values identify the relationship by `target`.
+    ArtifactView:
+      type: string
+      enum:
+        - descriptive
+        - seed
+      default: descriptive
+      description: >
+        Rendering of selected `_artifacts` and `_chunks`. `seed` emits exactly
+
+        the artifact seed write shapes, vectors included, and omits descriptive
+
+        and internal fields. Outputs without a seed write shape (explicit
+
+        external vectors, sparse vectors, unit-scoped extraction children) are
+
+        omitted.
+    SeedConflictPolicy:
+      type: string
+      enum:
+        - keep
+        - replace
+      default: keep
+      description: >
+        What a seed does when the enrichment already has accepted output for
+
+        the same input (same source version, producer and configuration)
+
+        that differs from the seed. `keep` rejects the batch
+
+        (`ArtifactSeedConflict`); identical output is reported `unchanged`.
+
+        `replace` publishes the seed. A document or transform may set its own
+
+        policy with the reserved `_seed_conflict` member, which wins over the
+
+        request. During distributed transaction resolution a conflict never
+
+        fails: the existing output is kept.
+    SeedOutcome:
+      type: object
+      required:
+        - key
+        - outcome
+      properties:
+        key:
+          type: string
+        name:
+          type: string
+          description: Enrichment name. Absent for items rejected as a whole.
+        outcome:
+          type: string
+          enum:
+            - accepted
+            - unchanged
+            - conflict
+            - replaced
+            - deleted
+            - missing
+            - rejected
+          description: >
+            - `accepted`: the seed becomes the output.
+
+            - `unchanged`: identical output is already accepted for this input.
+
+            - `conflict`: different output is already accepted (kept).
+
+            - `replaced`: different output is replaced by the seed.
+
+            - `deleted`: a `null` seed drops the accepted output.
+
+            - `missing`: no seed was supplied; the producer will run.
+
+            - `rejected`: the write would fail with `error`.
+        existing_origin:
+          type: string
+          enum:
+            - generated
+            - seeded
+        error:
+          type: string
+    SeedPlanResponse:
+      type: object
+      required:
+        - seeds
+      properties:
+        seeds:
+          type: array
+          items:
+            $ref: '#/components/schemas/SeedOutcome'
     ArtifactSeed:
       type: object
       description: >
@@ -32484,10 +32596,15 @@ components:
           `{ "text": "..." }`.
         - JSON asset: any JSON value.
 
+        - Document extraction asset: `{ "text": "..." }`, the already
+          extracted plain text. No fetch, OCR or transcription runs; `source`
+          identifies the remote object it was extracted from.
         - Document embedding: an array of finite numbers.
 
         - Chunk-derived embedding: an array of `ChunkVectorSeed`.
 
+        - Sparse embedding: `{ "indices": [...], "values": [...] }` with
+          strictly ascending indices.
 
         Descriptive read fields (`artifact_id`, `artifact_ref`, `kind`,
 
@@ -32712,6 +32829,8 @@ components:
             - title
             - author
             - metadata.tags
+        artifact_view:
+          $ref: '#/components/schemas/ArtifactView'
         filter_query:
           $ref: '#/components/schemas/RawQuery'
           description: >
@@ -33100,6 +33219,23 @@ components:
                 - op: $addToSet
                   path: $.tags
                   value: vip
+        seed_conflict:
+          $ref: '#/components/schemas/SeedConflictPolicy'
+        validate_only:
+          type: boolean
+          default: false
+          description: >
+            Plan the batch's artifact seeds without writing anything. Each
+
+            seeded insert or transform is planned by its owning shard with the
+
+            write's exact producer preparation; the response (200,
+
+            `SeedPlanResponse`) reports one outcome per seeded output, and
+
+            items the write would reject are reported as `rejected` with the
+
+            error instead of failing the request.
         commit_requires:
           $ref: '#/components/schemas/CommitRequires'
         sync_level:
@@ -45507,6 +45643,60 @@ components:
           type: string
           pattern: ^[0-9]+(ms|s|m|h)$
           description: 'Snapshot sources only: rebuild interval (at least 1s).'
+    EnrichmentSeedMapping:
+      type: object
+      additionalProperties: false
+      required:
+        - field
+      description: >
+        Accepts an existing result for this enrichment from an ordinary field
+
+        of the written record instead of invoking its producer (artifact
+
+        seeding). The mapped field stays an ordinary document field; its value
+
+        is decoded like an explicit `_artifacts.<name>` or `_chunks.<name>`
+
+        seed and bound to the same source version. An explicit seed in the
+
+        write wins over the mapping. The mapping is not part of the
+
+        enrichment's artifact identity: adding or changing it never rebuilds
+
+        existing output.
+      properties:
+        field:
+          type: string
+          minLength: 1
+          description: Dotted path of the record field holding the existing result.
+        format:
+          type: string
+          enum:
+            - auto
+            - text
+            - json
+            - vector
+            - chunk_vectors
+            - chunks
+          default: auto
+          description: >
+            How the field value is read. `text` and `json` are asset values,
+
+            `vector` is a dense document embedding, `chunk_vectors` is an array
+
+            of per-chunk vectors in chunk order, and `chunks` is an array of
+
+            `ChunkSeed`. `auto` infers the format from the enrichment kind.
+        on_missing:
+          type: string
+          enum:
+            - generate
+            - fail
+          default: generate
+          description: >
+            When the field is absent: `generate` runs the producer as usual;
+
+            `fail` rejects the write (`ArtifactSeedMissing`).
     EnrichmentRefreshConfig:
       type: object
       additionalProperties: false
@@ -45788,6 +45978,8 @@ components:
             traversals, and ranked queries) at declaration (document sources, ranked graph operations,
             and the `text`/`vector` shorthands are refused where a row filter applies). Re-declare the
             enrichment to re-capture changed policies.'
+        seed:
+          $ref: '#/components/schemas/EnrichmentSeedMapping'
         refresh:
           $ref: '#/components/schemas/EnrichmentRefreshConfig'
         execution:

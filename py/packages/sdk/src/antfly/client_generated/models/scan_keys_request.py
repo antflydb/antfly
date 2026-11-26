@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.artifact_view import ArtifactView
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -73,6 +74,11 @@ class ScanKeysRequest:
                 - Exclusions: "-_chunks.*._embedding"
                 - Special fields: "_embeddings", "_summaries", "_chunks"
                  Example: ['title', 'author', 'metadata.tags'].
+            artifact_view (ArtifactView | Unset): Rendering of selected `_artifacts` and `_chunks`. `seed` emits exactly
+                the artifact seed write shapes, vectors included, and omits descriptive
+                and internal fields. Outputs without a seed write shape (explicit
+                external vectors, sparse vectors, unit-scoped extraction children) are
+                omitted.
             filter_query (AutocompleteQuery | BooleanQuery | BoolFieldQuery | BoolQuery | ConjunctionQuery | ContainsQuery |
                 DateRangeStringQuery | DisjunctionQuery | DocIdQuery | EqualsQuery | FuzzyQuery | GeoBoundingBoxQuery |
                 GeoBoundingPolygonQuery | GeoDistanceQuery | GeoShapeQuery | IPRangeQuery | MatchAllQuery | MatchesQuery |
@@ -89,6 +95,7 @@ class ScanKeysRequest:
     inclusive_from: bool | Unset = False
     exclusive_to: bool | Unset = False
     fields: list[str] | Unset = UNSET
+    artifact_view: ArtifactView | Unset = UNSET
     filter_query: (
         AutocompleteQuery
         | BooleanQuery
@@ -169,6 +176,10 @@ class ScanKeysRequest:
         fields: list[str] | Unset = UNSET
         if not isinstance(self.fields, Unset):
             fields = self.fields
+
+        artifact_view: str | Unset = UNSET
+        if not isinstance(self.artifact_view, Unset):
+            artifact_view = self.artifact_view.value
 
         filter_query: dict[str, Any] | Unset
         if isinstance(self.filter_query, Unset):
@@ -251,6 +262,8 @@ class ScanKeysRequest:
             field_dict["exclusive_to"] = exclusive_to
         if fields is not UNSET:
             field_dict["fields"] = fields
+        if artifact_view is not UNSET:
+            field_dict["artifact_view"] = artifact_view
         if filter_query is not UNSET:
             field_dict["filter_query"] = filter_query
         if limit is not UNSET:
@@ -302,6 +315,13 @@ class ScanKeysRequest:
         exclusive_to = d.pop("exclusive_to", UNSET)
 
         fields = cast(list[str], d.pop("fields", UNSET))
+
+        _artifact_view = d.pop("artifact_view", UNSET)
+        artifact_view: ArtifactView | Unset
+        if isinstance(_artifact_view, Unset):
+            artifact_view = UNSET
+        else:
+            artifact_view = ArtifactView(_artifact_view)
 
         def _parse_filter_query(
             data: object,
@@ -597,6 +617,7 @@ class ScanKeysRequest:
             inclusive_from=inclusive_from,
             exclusive_to=exclusive_to,
             fields=fields,
+            artifact_view=artifact_view,
             filter_query=filter_query,
             limit=limit,
         )

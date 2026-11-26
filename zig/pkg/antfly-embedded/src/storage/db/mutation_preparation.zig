@@ -93,6 +93,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const computeSeededDenseRequestDerived = S.computeSeededDenseRequestDerived;
         const computeSeededDenseChunkRequestDerived = S.computeSeededDenseChunkRequestDerived;
         const installSeededChunks = S.installSeededChunks;
+        const computeSeededSparseRequestDerived = S.computeSeededSparseRequestDerived;
         const computeSparseRequestDerived = S.computeSparseRequestDerived;
         const containsName = S.containsName;
         const deinitOwnedGraphEdgeDelete = S.deinitOwnedGraphEdgeDelete;
@@ -1287,6 +1288,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 for (coverage_outcomes.items) |outcome| outcome.deinit(alloc);
                 coverage_outcomes.deinit(alloc);
             }
+            var seed_outcomes = std.ArrayListUnmanaged(artifact_seeds.OutcomeEntry).empty;
+            errdefer {
+                for (seed_outcomes.items) |entry| {
+                    alloc.free(entry.key);
+                    alloc.free(entry.name);
+                }
+                seed_outcomes.deinit(alloc);
+            }
             var coverage_candidates = std.ArrayListUnmanaged(PrecomputedCoverageCandidate).empty;
             defer {
                 for (coverage_candidates.items) |candidate| candidate.deinit(alloc);
@@ -1386,27 +1395,41 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     }
                     chunk_cache.deinit(alloc);
                 }
-                // Artifact seeds accepted in place of this row's producers.
+                // Artifact seeds accepted in place of this row's producers:
+                // explicit `_artifacts`/`_chunks` seeds win over enrichment
+                // field mappings (`seed: {field, ...}`) for the same output.
                 var row_seeds: ?artifact_seeds.Seeds = if (extracted[i].artifact_seeds_json) |json| try artifact_seeds.Seeds.parse(alloc, json) else null;
                 defer if (row_seeds) |*seeds| seeds.deinit();
-                if (row_seeds) |*seeds| {
-                    try requireEverySeedMatchesRequest(alloc, seeds, generated);
-                    // Seeded chunks become this revision's chunker output before
-                    // any chunk record, text or inline-embedding consumer runs.
-                    for (generated) |request| {
-                        const consumes_chunks = request.kind == .chunk_text or (request.kind == .dense_embedding and request.input_kind == .inline_chunks);
-                        if (!consumes_chunks) continue;
-                        const entry = seeds.chunks(requestArtifactName(request)) orelse continue;
-                        switch (entry) {
-                            .chunks => |items| {
-                                try requireSeedableRequest(request);
-                                const source = (if (request.source_template.len > 0) try extracted[i].logicalJson() else try extracted[i].logicalJsonForField(request.source_field)).?;
-                                try installSeededChunks(alloc, self, source, request, items, &chunk_cache);
-                            },
-                            .delete, .artifact => {},
-                        }
+                if (row_seeds) |*seeds| try requireEverySeedMatchesRequest(alloc, seeds, generated);
+                const row_policy: artifact_seeds.ConflictPolicy = if (row_seeds) |*seeds| seeds.conflictPolicy() else .keep;
+                var mapping_arena = std.heap.ArenaAllocator.init(alloc);
+                defer mapping_arena.deinit();
+                var mapped_document: ?std.json.Value = null;
+                const request_seeds = try alloc.alloc(?artifact_seeds.Entry, generated.len);
+                defer alloc.free(request_seeds);
+                var seeded_row = row_seeds != null;
+                for (generated, request_seeds) |request, *slot| {
+                    slot.* = if (row_seeds) |*seeds| try requestSeed(seeds, request) else null;
+                    if (slot.* == null and request.seed_mapping_json.len != 0) {
+                        if (mapped_document == null) mapped_document = try std.json.parseFromSliceLeaky(std.json.Value, mapping_arena.allocator(), (try extracted[i].logicalJson()).?, .{ .parse_numbers = false });
+                        slot.* = try mappedSeed(mapping_arena.allocator(), request, mapped_document.?);
                     }
+                    if (slot.* != null) seeded_row = true;
                 }
+                // Seeded chunks become this revision's chunker output before
+                // any chunk record, text or inline-embedding consumer runs.
+                if (seeded_row) for (generated) |request| {
+                    const consumes_chunks = request.kind == .chunk_text or (request.kind == .dense_embedding and request.input_kind == .inline_chunks);
+                    if (!consumes_chunks) continue;
+                    const explicit_chunks: ?[]const std.json.Value = if (row_seeds) |*seeds| if (seeds.chunks(requestArtifactName(request))) |explicit| switch (explicit) {
+                        .chunks => |items| items,
+                        .delete, .artifact => null,
+                    } else null else null;
+                    const entry = explicit_chunks orelse chunkSeedFor(generated, request_seeds, requestArtifactName(request)) orelse continue;
+                    try requireSeedableRequest(request);
+                    const source = (if (request.source_template.len > 0) try extracted[i].logicalJson() else try extracted[i].logicalJsonForField(request.source_field)).?;
+                    try installSeededChunks(alloc, self, source, request, entry, &chunk_cache);
+                };
                 var inline_embedding_cleanup = InlineChunkEmbeddingCleanup{};
                 defer inline_embedding_cleanup.deinit(alloc);
 
@@ -1416,9 +1439,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 defer direct_execution_requests.deinit(alloc);
                 // Seeded requests never dispatch a producer, so they are never
                 // part of the concurrent precommit execution set.
-                const filter_execution = precompute_mode == .direct or row_seeds != null;
-                if (filter_execution) for (generated) |request| {
-                    if (row_seeds) |*seeds| if (try requestSeed(seeds, request) != null) continue;
+                const filter_execution = precompute_mode == .direct or seeded_row;
+                if (filter_execution) for (generated, request_seeds) |request, request_seed| {
+                    if (request_seed != null) continue;
                     if (precompute_mode != .direct or @import("commit_requirements.zig").directEligibility(request) == .eligible)
                         try direct_execution_requests.append(alloc, request);
                 };
@@ -1455,15 +1478,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             if (only_incomplete_assets and reprocess_snapshot.complete()) continue;
                         }
                     }
-                    const seed: ?artifact_seeds.Entry = if (row_seeds) |*seeds| try requestSeed(seeds, request) else null;
+                    const seed = request_seeds[request_index];
+                    // Planning a seeded document also names what it will generate.
+                    if (seeded_row and seed == null) try appendSeedOutcome(alloc, &seed_outcomes, request, .{ .outcome = .missing });
                     const execution_position = unseeded_index;
                     if (seed == null) unseeded_index += 1;
                     if (seed) |entry| {
                         try requireSeedableRequest(request);
-                        if (entry == .delete) {
+                        if (entry == .delete and request.kind == .dense_embedding and request.input_kind != .document) {
+                            // Chunk-derived vectors live beneath each chunk
+                            // and keep their index entries; they are
+                            // regenerated below, in this write, without reuse.
+                            try appendSeedOutcome(alloc, &seed_outcomes, request, .{ .outcome = .deleted });
+                        } else if (entry == .delete) {
                             // Drop the accepted output so its producer
                             // regenerates through ordinary replay.
                             try appendSeedDeleteKeys(alloc, request, &artifact_delete_keys);
+                            try appendSeedOutcome(alloc, &seed_outcomes, request, .{ .outcome = .deleted });
                             try appendGeneratedEnrichmentRef(alloc, &planned, request);
                             continue;
                         }
@@ -1512,9 +1543,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             // produced, its delete alone is intentional no-output,
                             // and a deferred prompt producer touches neither here —
                             // it settles in the batch flush below or through replay.
-                            if (seed) |entry| {
-                                try computeSeededAssetRequestDerived(alloc, self, cleaned, request, entry.artifact.value, &artifact_writes, &artifact_delete_keys, &documents, &coverage_outcomes);
+                            const extraction = if (seed != null) extraction: {
+                                var producer = try @import("enrichment/asset_producer.zig").parseProducerConfig(alloc, request.producer_json);
+                                defer producer.deinit(alloc);
+                                break :extraction producer.type == .document_extraction;
+                            } else false;
+                            if (seed != null and !extraction) {
+                                try appendSeedOutcome(alloc, &seed_outcomes, request, try computeSeededAssetRequestDerived(alloc, self, cleaned, request, seed.?.artifact.value, &artifact_writes, &artifact_delete_keys, &documents, &coverage_outcomes, row_policy, seed.?.artifact.source));
                             } else {
+                                // Document extraction seeds run the native text
+                                // route in place of fetching and OCR.
+                                var extraction_result: artifact_seeds.Result = .{ .outcome = .accepted };
+                                const extraction_seed: ?S.ExtractionSeed = if (seed) |entry| .{
+                                    .text = try artifact_seeds.assetText(entry.artifact.value),
+                                    .source = entry.artifact.source,
+                                    .policy = row_policy,
+                                    .result = &extraction_result,
+                                } else null;
                                 var invocation_request = request;
                                 if (only_incomplete_assets and force_asset) invocation_request.reprocess_generation = try std.math.add(u64, reprocess_snapshot.generation, 1);
                                 computeAssetRequestDerived(
@@ -1534,13 +1579,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                     preparation_memo,
                                     precompute_mode,
                                     &pending_child_work,
+                                    extraction_seed,
                                 ) catch |err| {
                                     if (precompute_mode == .direct and err == error.InferenceResultTooLarge) return error.CommitRequirementTooLarge;
                                     return err;
                                 };
+                                if (extraction_seed != null) try appendSeedOutcome(alloc, &seed_outcomes, request, extraction_result);
                             }
                         },
                         .chunk_text => {
+                            // Chunk collections have no input-identity record:
+                            // the seeded set becomes this revision's chunks.
+                            if (seed != null) try appendSeedOutcome(alloc, &seed_outcomes, request, .{ .outcome = .accepted });
                             const writes_before = artifact_writes.items.len;
                             const docs_before = documents.items.len;
                             const deletes_before = artifact_delete_keys.items.len;
@@ -1572,11 +1622,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             try indexPendingArtifactWrites(alloc, &pending_writes, artifact_writes.items, &indexed_write_count);
                             const before = dense_embeddings.items.len;
                             const reuse_unchanged = !containsName(force_generated_artifact_names, requestArtifactName(request)) and !containsName(force_generated_artifact_names, requestEmbeddingName(request));
-                            if (seed) |entry| {
-                                if (request.input_kind == .document)
-                                    try computeSeededDenseRequestDerived(alloc, self, cleaned, request, entry.artifact.value, &artifact_writes, &dense_embeddings, preparation_memo)
+                            if (seed != null and seed.? == .delete) {
+                                // A dropped chunk-derived output is embedded
+                                // again now; with no embedder the write fails
+                                // visibly rather than keep the seeded vectors.
+                                computeDenseRequestDerived(alloc, self, cleaned, request, &artifact_writes, &pending_deletes.keys, &dense_embeddings, &chunk_cache, preparation_memo, &pending_writes, false) catch |err| switch (err) {
+                                    error.MissingDenseEmbedder => return error.ArtifactSeedNotAccepted,
+                                    else => return err,
+                                };
+                            } else if (seed) |entry| {
+                                const result = if (request.input_kind == .document)
+                                    try computeSeededDenseRequestDerived(alloc, self, cleaned, request, entry.artifact.value, &artifact_writes, &dense_embeddings, preparation_memo, row_policy, entry.artifact.source)
                                 else
-                                    try computeSeededDenseChunkRequestDerived(alloc, self, cleaned, request, entry.artifact.value, &artifact_writes, &dense_embeddings, &chunk_cache, preparation_memo);
+                                    try computeSeededDenseChunkRequestDerived(alloc, self, cleaned, request, entry.artifact.value, &artifact_writes, &dense_embeddings, &chunk_cache, preparation_memo, row_policy, entry.artifact.source);
+                                try appendSeedOutcome(alloc, &seed_outcomes, request, result);
                             } else computeDenseRequestDerived(alloc, self, cleaned, request, &artifact_writes, &pending_deletes.keys, &dense_embeddings, &chunk_cache, preparation_memo, &pending_writes, reuse_unchanged) catch |err| switch (err) {
                                 error.MissingDenseEmbedder => {
                                     if (precompute_mode == .direct) return error.CommitRequirementUnavailable;
@@ -1598,7 +1657,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             try indexPendingArtifactWrites(alloc, &pending_writes, artifact_writes.items, &indexed_write_count);
                             const before = sparse_embeddings.items.len;
                             const reuse_unchanged = !containsName(force_generated_artifact_names, requestArtifactName(request)) and !containsName(force_generated_artifact_names, requestEmbeddingName(request));
-                            computeSparseRequestDerived(alloc, self, cleaned, request, &artifact_writes, &pending_deletes.keys, &sparse_embeddings, &chunk_cache, preparation_memo, &pending_writes, reuse_unchanged) catch |err| switch (err) {
+                            if (seed) |entry| {
+                                try appendSeedOutcome(alloc, &seed_outcomes, request, try computeSeededSparseRequestDerived(alloc, self, cleaned, request, entry.artifact.value, &artifact_writes, &sparse_embeddings, preparation_memo, row_policy, entry.artifact.source));
+                            } else computeSparseRequestDerived(alloc, self, cleaned, request, &artifact_writes, &pending_deletes.keys, &sparse_embeddings, &chunk_cache, preparation_memo, &pending_writes, reuse_unchanged) catch |err| switch (err) {
                                 error.MissingSparseEmbedder => {
                                     if (precompute_mode == .direct) return error.CommitRequirementUnavailable;
                                     try appendGeneratedEnrichmentRef(alloc, &planned, request);
@@ -1682,6 +1743,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             result.sparse_embeddings = try sparse_embeddings.toOwnedSlice(alloc);
             result.generated_enrichment_refs = try planned.toOwnedSlice(alloc);
             result.coverage_outcomes = try coverage_outcomes.toOwnedSlice(alloc);
+            result.seed_outcomes = try seed_outcomes.toOwnedSlice(alloc);
             if (precompute_mode == .direct) {
                 try output_budget.checkpoint(result.artifact_writes, result.artifact_delete_keys);
                 for (result.coverage_outcomes) |outcome|
@@ -2055,6 +2117,46 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return split_shadow or (has_text_consumers and (sync_level == .full_text or sync_level == .full_index));
         }
 
+        /// The seed an enrichment field mapping derives from the document,
+        /// or null when the field is absent and the mapping generates.
+        fn mappedSeed(arena: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, document: std.json.Value) !?artifact_seeds.Entry {
+            const mapping = try artifact_seeds.parseMapping(arena, request.seed_mapping_json);
+            return try artifact_seeds.mappedEntry(mapping, document, request.kind == .chunk_text) orelse {
+                if (mapping.on_missing == .fail) return error.ArtifactSeedMissing;
+                return null;
+            };
+        }
+
+        /// The seeded chunk set for `name`: the chunk request's seed, which
+        /// inline chunk embeddings of the same name consume too.
+        fn chunkSeedFor(requests: []const enrichment_types.GeneratedEnrichmentRequest, seeds: []const ?artifact_seeds.Entry, name: []const u8) ?[]const std.json.Value {
+            for (requests, seeds) |request, seed| {
+                if (request.kind != .chunk_text or !std.mem.eql(u8, requestArtifactName(request), name)) continue;
+                const entry = seed orelse return null;
+                return switch (entry) {
+                    .chunks => |items| items,
+                    .delete, .artifact => null,
+                };
+            }
+            return null;
+        }
+
+        fn appendSeedOutcome(alloc: Allocator, outcomes: *std.ArrayListUnmanaged(artifact_seeds.OutcomeEntry), request: enrichment_types.GeneratedEnrichmentRequest, result: artifact_seeds.Result) !void {
+            const name = if (request.kind == .asset or request.kind == .chunk_text) requestArtifactName(request) else requestEmbeddingName(request);
+            // One entry per output even when several consumers plan it.
+            for (outcomes.items) |*existing| if (std.mem.eql(u8, existing.key, request.doc_key) and std.mem.eql(u8, existing.name, name)) {
+                const merged = (artifact_seeds.Result{ .outcome = existing.outcome, .existing_origin = existing.existing_origin }).merge(result);
+                existing.outcome = merged.outcome;
+                existing.existing_origin = merged.existing_origin;
+                return;
+            };
+            const key = try alloc.dupe(u8, request.doc_key);
+            errdefer alloc.free(key);
+            const owned_name = try alloc.dupe(u8, name);
+            errdefer alloc.free(owned_name);
+            try outcomes.append(alloc, .{ .key = key, .name = owned_name, .outcome = result.outcome, .existing_origin = result.existing_origin });
+        }
+
         /// The seed for `request`, if any. Assets and embeddings are seeded
         /// only under `_artifacts`, chunk collections only under `_chunks`;
         /// the other reserved field naming the same output is a kind mismatch.
@@ -2068,10 +2170,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .asset, .dense_embedding, .sparse_embedding => {
                     const name = if (request.kind == .asset) requestArtifactName(request) else requestEmbeddingName(request);
                     if (seeds.chunks(name) != null) return error.UnknownArtifactSeed;
-                    const entry = seeds.artifact(name) orelse return null;
-                    // Sparse seeds join the typed adapters in a later release.
-                    if (request.kind == .sparse_embedding) return error.ArtifactSeedNotAccepted;
-                    return entry;
+                    return seeds.artifact(name);
                 },
             }
         }
@@ -2085,8 +2184,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const matched = for (requests) |request| {
                     const name = switch (request.kind) {
                         .chunk_text => if (seeded.field == .chunks) requestArtifactName(request) else continue,
+                        // Inline chunks of an embedding are that revision's
+                        // chunk set too; seeded chunks replace the chunker.
+                        .dense_embedding => if (seeded.field == .chunks and request.input_kind == .inline_chunks)
+                            requestArtifactName(request)
+                        else if (seeded.field == .artifacts) requestEmbeddingName(request) else continue,
                         .asset => if (seeded.field == .artifacts) requestArtifactName(request) else continue,
-                        .dense_embedding, .sparse_embedding => if (seeded.field == .artifacts) requestEmbeddingName(request) else continue,
+                        .sparse_embedding => if (seeded.field == .artifacts) requestEmbeddingName(request) else continue,
                     };
                     if (std.mem.eql(u8, name, seeded.name)) break true;
                 } else false;
@@ -2121,8 +2225,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     try artifact_delete_keys.append(alloc, state_key);
                 },
                 .dense_embedding => {
-                    // Chunk-derived vectors live beneath each chunk; their
-                    // regeneration follows the chunk set instead.
+                    // Chunk-derived vectors regenerate in preparation instead.
                     if (request.input_kind != .document) return error.ArtifactSeedNotAccepted;
                     const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, request.doc_key, requestEmbeddingName(request));
                     errdefer alloc.free(key);
@@ -2130,7 +2233,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 },
                 // The chunk producer re-chunks every source revision.
                 .chunk_text => {},
-                .sparse_embedding => return error.ArtifactSeedNotAccepted,
+                .sparse_embedding => {
+                    if (request.input_kind != .document) return error.ArtifactSeedNotAccepted;
+                    const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, request.doc_key, requestEmbeddingName(request));
+                    errdefer alloc.free(key);
+                    try artifact_delete_keys.append(alloc, key);
+                },
             }
         }
 

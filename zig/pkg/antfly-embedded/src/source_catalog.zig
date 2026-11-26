@@ -506,6 +506,7 @@ pub const storage_db_online_merge_receiver = @import("storage/db/online_merge_re
 pub const storage_db_online_merge_snapshot = @import("storage/db/online_merge_snapshot.zig");
 pub const storage_db_online_source = @import("storage/db/online_source.zig");
 pub const storage_db_online_source_contract = @import("storage/db/online_source_contract.zig");
+pub const storage_db_artifact_seeds = @import("storage/db/artifact_seeds.zig");
 pub const storage_db_online_vector_artifacts = @import("storage/db/online_vector_artifacts.zig");
 pub const storage_db_online_vector_snapshot = @import("storage/db/online_vector_snapshot.zig");
 pub const storage_db_ownership = @import("storage/db/ownership.zig");

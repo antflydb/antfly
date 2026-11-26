@@ -158,6 +158,28 @@ pub fn collectArtifactEnrichmentsFromValueWithOptions(
                         };
                         stored.deinit();
                     }
+                    if (item.object.get("seed")) |seed| {
+                        if (seed != .null) {
+                            // The public mapping object is canonicalized; the
+                            // stored form is never accepted alongside it.
+                            if (owned.seed_json.len > 0 or owned.kind == .group) return error.InvalidEnrichmentConfig;
+                            owned.seed_json = @import("../storage/db/artifact_seeds.zig").canonicalMappingAlloc(alloc, seed) catch |err| switch (err) {
+                                error.OutOfMemory => return err,
+                                else => return error.InvalidEnrichmentConfig,
+                            };
+                        }
+                    } else if (owned.seed_json.len > 0) {
+                        // Stored form (backup/restore): validate the grammar.
+                        var scratch = std.heap.ArenaAllocator.init(alloc);
+                        defer scratch.deinit();
+                        const stored = std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), owned.seed_json, .{}) catch return error.InvalidEnrichmentConfig;
+                        const canonical = @import("../storage/db/artifact_seeds.zig").canonicalMappingAlloc(alloc, stored) catch |err| switch (err) {
+                            error.OutOfMemory => return err,
+                            else => return error.InvalidEnrichmentConfig,
+                        };
+                        alloc.free(owned.seed_json);
+                        owned.seed_json = canonical;
+                    }
                     if (owned.kind == .embedding) {
                         if (embedding_producer_json) |raw| {
                             if (owned.producer_json.len > 0) alloc.free(owned.producer_json);

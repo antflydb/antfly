@@ -3674,6 +3674,10 @@ pub const StorageKernelLookupWireRequest = struct {
     group_source_query_json: []const u8 = "",
     sql_lock_query_json: []const u8 = "",
     relational_topology_json: []const u8 = "",
+    /// Artifact seed view and planning (#1791). Written only when set, so
+    /// ordinary lookups keep their exact wire bytes.
+    artifact_view: db_mod.types.ArtifactView = .descriptive,
+    seed_plan_json: []const u8 = "",
 
     pub fn options(self: StorageKernelLookupWireRequest) db_mod.types.LookupOptions {
         return .{
@@ -3697,13 +3701,15 @@ pub const StorageKernelLookupWireRequest = struct {
             .group_source_query_json = self.group_source_query_json,
             .sql_lock_query_json = self.sql_lock_query_json,
             .relational_topology_json = self.relational_topology_json,
+            .artifact_view = self.artifact_view,
+            .seed_plan_json = self.seed_plan_json,
         };
     }
 
     pub fn jsonStringify(self: StorageKernelLookupWireRequest, stream: anytype) @TypeOf(stream.*).Error!void {
         try stream.beginObject();
         inline for (comptime std.meta.fieldNames(StorageKernelLookupWireRequest)) |reflected_name| {
-            if (comptime std.mem.eql(u8, reflected_name, "include_json_null_fields")) continue;
+            if (comptime std.mem.eql(u8, reflected_name, "include_json_null_fields") or std.mem.eql(u8, reflected_name, "artifact_view") or std.mem.eql(u8, reflected_name, "seed_plan_json")) continue;
             try stream.objectField(reflected_name);
             if (comptime std.mem.eql(u8, reflected_name, "key") or std.mem.eql(u8, reflected_name, "restore_staging_scope") or std.mem.eql(u8, reflected_name, "restore_staging_plan_id")) {
                 try @import("../storage/db/relational/integrity/json.zig").write(@field(self, reflected_name), stream);
@@ -3712,6 +3718,14 @@ pub const StorageKernelLookupWireRequest = struct {
         if (self.include_json_null_fields) {
             try stream.objectField("include_json_null_fields");
             try stream.write(true);
+        }
+        if (self.artifact_view != .descriptive) {
+            try stream.objectField("artifact_view");
+            try stream.write(self.artifact_view);
+        }
+        if (self.seed_plan_json.len != 0) {
+            try stream.objectField("seed_plan_json");
+            try stream.write(self.seed_plan_json);
         }
         try stream.endObject();
     }
@@ -3793,6 +3807,8 @@ pub fn encodeStorageKernelLookupRequest(
         .group_source_query_json = opts.group_source_query_json,
         .sql_lock_query_json = opts.sql_lock_query_json,
         .relational_topology_json = opts.relational_topology_json,
+        .artifact_view = opts.artifact_view,
+        .seed_plan_json = opts.seed_plan_json,
     }, .{});
 }
 

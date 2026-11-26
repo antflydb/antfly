@@ -23046,6 +23046,9 @@ pub const ProvisionedTableWriteSource = struct {
             error.ArtifactSeedNotAccepted,
             error.ArtifactSeedDocumentNotFound,
             error.ArtifactSeedSourceBindingRequired,
+            error.ArtifactSeedConflict,
+            error.ArtifactSeedMissing,
+            error.ArtifactSeedSourceMismatch,
             => return error.InvalidBatchRequest,
             else => return err,
         };

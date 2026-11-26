@@ -465,6 +465,26 @@ pub const CreateTableResponse = union(enum) {
     }
 };
 
+/// Success payload selected by HTTP status, never by trial-decoding another status's schema.
+pub const BatchWriteResponse = union(enum) {
+    status_200: types.SeedPlanResponse,
+    status_201: types.BatchResponse,
+    status_202: types.BatchResponse,
+    pub fn parseResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) !std.json.Parsed(@This()) {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const value: @This() = switch (status) {
+            200 => .{ .status_200 = try std.json.parseFromSliceLeaky(types.SeedPlanResponse, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            201 => .{ .status_201 = try std.json.parseFromSliceLeaky(types.BatchResponse, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            202 => .{ .status_202 = try std.json.parseFromSliceLeaky(types.BatchResponse, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            else => return error.InvalidApiResponse,
+        };
+        return .{ .arena = arena, .value = value };
+    }
+};
+
 pub const ListCurationProposalsParams = struct {
     state: ?[]const u8 = null,
     action: ?[]const u8 = null,
@@ -475,6 +495,8 @@ pub const ListCurationProposalsParams = struct {
 pub const LookupKeyParams = struct {
     /// Comma-separated list of fields to include in the response. If not specified, returns the full document. Supports: - Simple fields: "title,author" - Nested paths: "user.address.city" - Wildcards: "_chunks.*" - Exclusions: "-_chunks.*._embedding" - Special fields: "_embeddings,_summaries,_chunks"
     fields: ?[]const u8 = null,
+    /// How selected `_artifacts` and `_chunks` render. `descriptive` (the default) returns artifact metadata. `seed` returns exactly the artifact seed write shapes (`ArtifactSeed`, `ChunkSeed`), vectors included, so the response can be written into another table to publish the same outputs without invoking producers. Example: `fields=*,_artifacts,_chunks&artifact_view=seed`.
+    artifact_view: ?[]const u8 = null,
     /// Read consistency for the lookup. The default `read_index` routes to the primary for linearizable reads. `stale` allows a hot standby to serve the lookup at its safe-read LSN. Owned object document tables support only explicit `stale` reads of published generations. The default `read_index` and `leader_lease` are rejected with HTTP 400. Use `sync_level=full_index` on writes to wait for publication before a stale lookup.
     consistency: ?[]const u8 = null,
 };
@@ -4286,7 +4308,7 @@ pub const Client = struct {
 
     /// Perform batch inserts and deletes on a table
     /// POST /db/v1/tables/{tableName}/batch
-    pub fn batchWrite(self: *@This(), table_name: []const u8, body: types.BatchRequest) !ApiResponse(types.BatchResponse) {
+    pub fn batchWrite(self: *@This(), table_name: []const u8, body: types.BatchRequest) !ApiResponse(BatchWriteResponse) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
         defer self.allocator.free(encoded_table_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/batch", .{ self.base_url, encoded_table_name });
@@ -4294,7 +4316,7 @@ pub const Client = struct {
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.BatchResponse).fromResponse(self.allocator, &resp);
+        return ApiResponse(BatchWriteResponse).fromResponse(self.allocator, &resp);
     }
 
     /// Repair version-conditional rows after failed or diagnosed constraint activation
@@ -4512,6 +4534,14 @@ pub const Client = struct {
             defer self.allocator.free(encoded_query_value);
             try query_buf.appendSlice(self.allocator, &.{sep});
             try query_buf.appendSlice(self.allocator, "fields=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.artifact_view) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "artifact_view=");
             try query_buf.appendSlice(self.allocator, encoded_query_value);
             sep = '&';
         }

@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from ..models.enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
     from ..models.enrichment_producer_config import EnrichmentProducerConfig
     from ..models.enrichment_refresh_config import EnrichmentRefreshConfig
+    from ..models.enrichment_seed_mapping import EnrichmentSeedMapping
     from ..models.execution_policy import ExecutionPolicy
     from ..models.grouped_artifact_source import GroupedArtifactSource
     from ..models.prior_artifact_context import PriorArtifactContext
@@ -80,6 +81,14 @@ class EnrichmentConfig:
                 query sources (filters, traversals, and ranked queries) at declaration (document sources, ranked graph
                 operations, and the `text`/`vector` shorthands are refused where a row filter applies). Re-declare the
                 enrichment to re-capture changed policies.
+            seed (EnrichmentSeedMapping | Unset): Accepts an existing result for this enrichment from an ordinary field
+                of the written record instead of invoking its producer (artifact
+                seeding). The mapped field stays an ordinary document field; its value
+                is decoded like an explicit `_artifacts.<name>` or `_chunks.<name>`
+                seed and bound to the same source version. An explicit seed in the
+                write wins over the mapping. The mapping is not part of the
+                enrichment's artifact identity: adding or changing it never rebuilds
+                existing output.
             refresh (EnrichmentRefreshConfig | Unset): Rebuild policy for context-source invalidation. Invalidation (stale
                 freshness) is always reported immediately; debounce only coalesces rebuild work.
             execution (ExecutionPolicy | Unset): Non-semantic execution policy for one producer or index maintenance
@@ -127,6 +136,7 @@ class EnrichmentConfig:
     producer_json: str | Unset = UNSET
     neighbor_context: EnrichmentNeighborContextConfig | Unset = UNSET
     context_sources: EnrichmentConfigContextSources | Unset = UNSET
+    seed: EnrichmentSeedMapping | Unset = UNSET
     refresh: EnrichmentRefreshConfig | Unset = UNSET
     execution: ExecutionPolicy | Unset = UNSET
     transcriber: TranscriberEnrichmentConfig | Unset = UNSET
@@ -187,6 +197,10 @@ class EnrichmentConfig:
         if not isinstance(self.context_sources, Unset):
             context_sources = self.context_sources.to_dict()
 
+        seed: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.seed, Unset):
+            seed = self.seed.to_dict()
+
         refresh: dict[str, Any] | Unset = UNSET
         if not isinstance(self.refresh, Unset):
             refresh = self.refresh.to_dict()
@@ -243,6 +257,8 @@ class EnrichmentConfig:
             field_dict["neighbor_context"] = neighbor_context
         if context_sources is not UNSET:
             field_dict["context_sources"] = context_sources
+        if seed is not UNSET:
+            field_dict["seed"] = seed
         if refresh is not UNSET:
             field_dict["refresh"] = refresh
         if execution is not UNSET:
@@ -259,6 +275,7 @@ class EnrichmentConfig:
         from ..models.enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
         from ..models.enrichment_producer_config import EnrichmentProducerConfig
         from ..models.enrichment_refresh_config import EnrichmentRefreshConfig
+        from ..models.enrichment_seed_mapping import EnrichmentSeedMapping
         from ..models.execution_policy import ExecutionPolicy
         from ..models.grouped_artifact_source import GroupedArtifactSource
         from ..models.prior_artifact_context import PriorArtifactContext
@@ -340,6 +357,13 @@ class EnrichmentConfig:
         else:
             context_sources = EnrichmentConfigContextSources.from_dict(_context_sources)
 
+        _seed = d.pop("seed", UNSET)
+        seed: EnrichmentSeedMapping | Unset
+        if isinstance(_seed, Unset):
+            seed = UNSET
+        else:
+            seed = EnrichmentSeedMapping.from_dict(_seed)
+
         _refresh = d.pop("refresh", UNSET)
         refresh: EnrichmentRefreshConfig | Unset
         if isinstance(_refresh, Unset):
@@ -382,6 +406,7 @@ class EnrichmentConfig:
             producer_json=producer_json,
             neighbor_context=neighbor_context,
             context_sources=context_sources,
+            seed=seed,
             refresh=refresh,
             execution=execution,
             transcriber=transcriber,

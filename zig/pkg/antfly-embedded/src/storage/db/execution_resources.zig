@@ -1279,9 +1279,17 @@ pub const PreparationCapture = struct {
     json: ?[]u8 = null,
 };
 
+/// Validation-only seed planning: preparation runs exactly as for a write,
+/// then the per-seed outcomes are captured as JSON and nothing is committed.
+pub const SeedPlanCapture = struct {
+    alloc: Allocator,
+    json: ?[]u8 = null,
+};
+
 pub const BatchExecutionOptions = struct {
     // Process-local checked plan, never serialized or derived from JSON.
     checked_native_atomic: ?*const CheckedNativeAtomic = null,
+    seed_plan: ?*SeedPlanCapture = null,
     preparation_context: ?@import("antfly_inference_execution_context").RequestContext = null,
     preparation_capture: ?*PreparationCapture = null,
     resolver_review_command: ?*const @import("resolver_review.zig").Command = null,
@@ -2356,6 +2364,9 @@ pub const PrecomputedGeneratedBatch = struct {
     sparse_embeddings: []const derived_types.DerivedSparseEmbeddingWrite = &.{},
     generated_enrichment_refs: []const enrichment_types.GeneratedEnrichmentRef = &.{},
     coverage_outcomes: []PrecomputedCoverageOutcome = &.{},
+    /// Per-seed acceptance results (`artifact_seeds.OutcomeEntry`); keys and
+    /// names are owned. Planning reports them; commit rejects conflicts.
+    seed_outcomes: []@import("artifact_seeds.zig").OutcomeEntry = &.{},
 
     // Batch cleanup is shared by many fallible preparation exits. Keep its
     // allocation walks out of those exits; each batch pays one call while LLVM
@@ -2380,6 +2391,11 @@ pub const PrecomputedGeneratedBatch = struct {
         derived_types.deinitDerivedBatch(alloc, &derived_batch);
         for (self.coverage_outcomes) |outcome| outcome.deinit(alloc);
         if (self.coverage_outcomes.len > 0) alloc.free(self.coverage_outcomes);
+        for (self.seed_outcomes) |entry| {
+            alloc.free(entry.key);
+            alloc.free(entry.name);
+        }
+        if (self.seed_outcomes.len > 0) alloc.free(self.seed_outcomes);
         self.* = undefined;
     }
 };

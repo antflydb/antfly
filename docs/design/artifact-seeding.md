@@ -50,12 +50,16 @@ Seeds travel in the document, under reserved fields keyed by enrichment name:
 | --- | --- |
 | Text asset | String, or `{ "text": ... }`. `""` is a valid complete result, distinct from missing. |
 | JSON asset | Any JSON value. |
+| Document extraction asset | `{ "text": ... }`: already extracted plain text. No fetch, OCR or transcription runs. |
 | Document embedding | Array of finite numbers; length must match the enrichment's dimensions. |
 | Chunk-derived embedding | `[{ chunk_id, window_index?, vector }]`. |
+| Sparse embedding | `{ "indices": [...], "values": [...] }` with strictly ascending indices, or a token-weight map. |
 | Chunk collection | `_chunks.<name>`: `[{ _chunk_id (or _id), _content, _start_char?, _end_char?, _start_time_ms?, _end_time_ms? }]`. |
 
-`"<name>": null` drops accepted output so the producer regenerates it;
-omitting a name is a no-op. A name may be seeded through only one reserved
+`"<name>": null` drops accepted output so the producer regenerates it
+(chunk-derived vectors are embedded again in the same write; with no embedder
+configured the write fails rather than keep the seeded vectors); omitting a
+name is a no-op. A name may be seeded through only one reserved
 field: an asset or embedding under `_chunks` (or a chunk collection under
 `_artifacts`) is a kind mismatch.
 
@@ -100,8 +104,21 @@ accepts each seed in place of exactly one producer invocation:
    - chunk collections: the seeded set is installed as this revision's chunker
      output, so chunk records, full-text consumers and inline chunk embeddings
      consume exactly the seeded set.
+   - sparse embeddings: the sparse row with the producer's source hash at the
+     sparse contract's provider revision;
+   - document extraction: the seed replaces the fetch with `text/plain`
+     content and runs the in-process native text route, so the manifest,
+     units and children are built exactly as for an extracted text file. No
+     checksum, OCR or transcription runs. The input fingerprint is the remote
+     metadata fingerprint when the source metadata is known, else a
+     `seed-sha256:` digest over the URL, extraction config, `source`
+     identity and text, so an identical resumed import is `unchanged`.
 4. Seeded requests are excluded from the concurrent precommit execution set,
    so they never dispatch a provider call.
+5. Generic asset seeds also record the local publication receipt the
+   maintenance worker writes (`artifact_local_publication.zig`), so a later
+   replay of the document (for example for another, unseeded enrichment)
+   reuses the seed instead of invoking the producer.
 
 Because the stored identity equals the generated identity, every reuse check
 (synchronous preparation, the replay worker, re-embed recovery) treats seeded
@@ -129,6 +146,70 @@ the bit.
   relational intent sidecars carry them; acceptance runs at participant
   resolution from the same bytes.
 
+- **Declared input.** `source.source_hash` (the `source_hash` of an earlier
+  `_artifacts` read, `xxh64:<hex>`) must equal the input identity the seed is
+  bound to now, or the batch fails with `ArtifactSeedSourceMismatch`. Only
+  document-level dense and sparse embeddings have a single source hash;
+  other outputs reject a declared hash (`ArtifactSeedNotAccepted`) instead of
+  ignoring it.
+
+### Conflicts and outcomes
+
+Each seeded output has one outcome:
+
+| Outcome | Meaning |
+| --- | --- |
+| `accepted` | No accepted output exists for this input; the seed becomes it. |
+| `unchanged` | Identical output is already accepted for this input. Idempotent. |
+| `conflict` | Different output is already accepted for this input (`keep`). |
+| `replaced` | Different output was replaced by the seed (`replace`). |
+| `deleted` | A `null` seed dropped the accepted output. |
+| `missing` | A seeded document's unseeded enrichment; its producer runs. |
+
+`seed_conflict: keep | replace` (default `keep`) chooses what a conflict does.
+The public batch lowers a request-level `seed_conflict: replace` into a
+reserved per-document `_seed_conflict` member (a document's own wins), so the
+policy travels with the seeds through replication and 2PC. Under `keep`, a
+conflict rejects the batch with `ArtifactSeedConflict`. During distributed
+transaction resolution a conflict never fails: the existing output is kept,
+because the coordinator has already committed. Conflicts are detected only
+against output accepted for the same input; a changed input is a fresh
+`accepted`.
+
+### Validation-only planning
+
+`{"validate_only": true}` on a public batch plans every seeded insert and
+transform without writing (`api/seed_planning.zig`). Each item is sent to its
+owning shard as a private routed lookup (`_seed_plan=true`); the owner runs the
+write's exact producer preparation under the apply lock and returns before
+commit (`BatchExecutionOptions.seed_plan`). The response is
+`{"seeds": [{key, name, outcome, existing_origin?, error?}]}`; items a write
+would reject are reported as `rejected` with the error instead of failing the
+request. Embedded callers use `DB.planArtifactSeeds`.
+
+### Field mappings
+
+An enrichment can accept existing record fields as seeds:
+
+```json
+{
+  "name": "summary_v1",
+  "kind": "asset",
+  "field": "body",
+  "producer": { "type": "generator", "config": { ... } },
+  "seed": { "field": "legacy.summary", "format": "text", "on_missing": "generate" }
+}
+```
+
+`format` is `auto | text | json | vector | chunk_vectors | chunks`; `auto`
+follows the enrichment kind. The mapped value is decoded like an explicit
+seed and accepted through the same path. The field stays an ordinary
+document field. An explicit `_artifacts`/`_chunks` seed in the same write
+wins. `on_missing: fail` rejects a write whose record lacks the field
+(`ArtifactSeedMissing`); `generate` runs the producer. The mapping is stored
+as `seed_json` and excluded from the enrichment's artifact identity, so adding
+or changing it never rebuilds existing output.
+
 ### Transforms
 
 `_artifacts.<name>`, `_chunks.<name>` and `_embeddings.<index>` take exactly
@@ -145,41 +226,44 @@ seeds.
 Requesting `_chunks.<name>` or `_embeddings.<index>` alone now loads the
 reserved projection (`query/projection.zig`).
 
+`artifact_view=seed` (lookup query parameter, `ScanKeysRequest` property)
+renders the selected `_artifacts` and `_chunks` in exactly the write shapes,
+vectors included, and omits descriptive and internal fields
+(`artifact_seed_view.zig`). Writing that response into another table with the
+same enrichments publishes the same outputs without invoking producers, and a
+second export is byte-identical, so resumed migrations converge. Document
+extraction assets export their text; explicit external vectors (exported
+through `_embeddings`) and unit-scoped extraction children are omitted. The
+view is forwarded through the storage kernel wire, routed lookups and scans.
+
 ## Not yet accepted
 
 These fail with `ArtifactSeedNotAccepted` rather than regenerating:
 
-- `document_extraction` assets (OCR/transcription manifests, units and child
-  ranges). The text seed adapter must build a native text manifest bound to the
-  source identity (`source.generation`/`sha256`) without fabricating page
-  coordinates.
-- Chunk and vector seeds downstream of an upstream asset (extraction → chunks
-  → vectors in one write). Preparation consumes upstream outputs only after
-  commit today.
+- Chunk and vector seeds downstream of an upstream asset (for example
+  extraction → chunks → vectors in one write). Chunk rows over an upstream
+  asset are materialized only after commit, with the upstream causal witness;
+  seed the upstream asset and let its descendants generate, or seed chunks of
+  a source field.
+- Rich document extraction seeds (pages, layout, unit-scoped
+  `_parent_unit_id` and diarized `_speaker` chunks). Text seeds produce a
+  native text manifest; page coordinates are never fabricated.
 - Producers whose input is outside the write: neighbor or context sources,
   committed graph adjacency, grouped sources, prior context, privacy-managed
-  artifacts, PDF page-image embeddings.
-- Sparse embeddings, unit-scoped (`_parent_unit_id`) and diarized (`_speaker`)
-  chunks.
-- Deleting chunk-derived vector seeds with `null`.
+  artifacts, PDF page-image embeddings, chunk-derived sparse vectors.
+- `copy` assets (free to regenerate).
 
 ## Remaining work
 
-- Enrichment field mappings (`seed: { field, format, on_missing }`) that
-  synthesize the same seeds from existing record fields. They reuse this
-  acceptance path; explicit seeds win per document.
-- A seed view on reads (`artifact_view=seed`) that emits exactly the write
-  shapes, vectors included, for Antfly-to-Antfly migration.
-- `seed_conflict: keep | replace` and per-item `accepted | unchanged | conflict
-  | replaced` reporting. Today a seed replaces accepted output for its input.
 - Retaining seeded chunk collections across later source-unchanged replays.
   The chunk producer has no input-identity record in local mode and re-chunks
   each processed revision, which replaces seeded chunks with generated ones.
 - Leader-prepared seed acceptance for Raft. Replicas accept seeds during
-  deterministic apply; dense seeds resolve the embedder's provider generation
-  there, as synchronous generated preparation does.
-- Validation-only planning, migration progress reporting, and a streaming
-  import path beyond the 4,095-chunk atomic-mutation ceiling and request
-  bounds (#1354).
+  deterministic apply (seed errors are expected apply failures that advance
+  the entry on every replica alike); dense seeds resolve the embedder's
+  provider generation there, as synchronous generated preparation does.
+- Migration progress reporting and a streaming import path beyond the
+  4,095-chunk atomic-mutation ceiling and request bounds (#1354).
 - The binary `antfly_db_batch_wire` entry point does not carry transforms;
-  seed-only writes use the JSON batch path.
+  seed-only writes use the JSON batch path. The serverless coordinator rejects
+  seed paths until serverless publication accepts seeds.

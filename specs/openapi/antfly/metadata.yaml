@@ -6462,6 +6462,64 @@ components:
             equal to this JSON value; projected graph-edge values identify the
             relationship by `target`.
 
+    ArtifactView:
+      type: string
+      enum:
+        - descriptive
+        - seed
+      default: descriptive
+      description: |
+        Rendering of selected `_artifacts` and `_chunks`. `seed` emits exactly
+        the artifact seed write shapes, vectors included, and omits descriptive
+        and internal fields. Document extraction assets export their extracted
+        text. Outputs without a seed write shape (explicit external vectors,
+        unit-scoped extraction children) are omitted.
+    SeedConflictPolicy:
+      type: string
+      enum: [keep, replace]
+      default: keep
+      description: |
+        What a seed does when the enrichment already has accepted output for
+        the same input (same source version, producer and configuration)
+        that differs from the seed. `keep` rejects the batch
+        (`ArtifactSeedConflict`); identical output is reported `unchanged`.
+        `replace` publishes the seed. A document or transform may set its own
+        policy with the reserved `_seed_conflict` member, which wins over the
+        request. During distributed transaction resolution a conflict never
+        fails: the existing output is kept.
+    SeedOutcome:
+      type: object
+      required: [key, outcome]
+      properties:
+        key:
+          type: string
+        name:
+          type: string
+          description: Enrichment name. Absent for items rejected as a whole.
+        outcome:
+          type: string
+          enum: [accepted, unchanged, conflict, replaced, deleted, missing, rejected]
+          description: |
+            - `accepted`: the seed becomes the output.
+            - `unchanged`: identical output is already accepted for this input.
+            - `conflict`: different output is already accepted (kept).
+            - `replaced`: different output is replaced by the seed.
+            - `deleted`: a `null` seed drops the accepted output.
+            - `missing`: no seed was supplied; the producer will run.
+            - `rejected`: the write would fail with `error`.
+        existing_origin:
+          type: string
+          enum: [generated, seeded]
+        error:
+          type: string
+    SeedPlanResponse:
+      type: object
+      required: [seeds]
+      properties:
+        seeds:
+          type: array
+          items:
+            $ref: "#/components/schemas/SeedOutcome"
     ArtifactSeed:
       type: object
       description: |
@@ -6475,8 +6533,13 @@ components:
         - Text asset: a string (`""` is a valid, complete empty result), or
           `{ "text": "..." }`.
         - JSON asset: any JSON value.
+        - Document extraction asset: `{ "text": "..." }`, the already
+          extracted plain text. No fetch, OCR or transcription runs; `source`
+          identifies the remote object it was extracted from.
         - Document embedding: an array of finite numbers.
         - Chunk-derived embedding: an array of `ChunkVectorSeed`.
+        - Sparse embedding: `{ "indices": [...], "values": [...] }` with
+          strictly ascending indices.
 
         Descriptive read fields (`artifact_id`, `artifact_ref`, `kind`,
         `status`, `dims`, `items`, `content_type`) and internal routing
@@ -6662,6 +6725,8 @@ components:
             - Exclusions: "-_chunks.*._embedding"
             - Special fields: "_embeddings", "_summaries", "_chunks"
           example: ["title", "author", "metadata.tags"]
+        artifact_view:
+          $ref: "#/components/schemas/ArtifactView"
         filter_query:
           $ref: "#/components/schemas/RawQuery"
           description: |
@@ -6957,6 +7022,18 @@ components:
                 - op: "$addToSet"
                   path: "$.tags"
                   value: "vip"
+        seed_conflict:
+          $ref: "#/components/schemas/SeedConflictPolicy"
+        validate_only:
+          type: boolean
+          default: false
+          description: |
+            Plan the batch's artifact seeds without writing anything. Each
+            seeded insert or transform is planned by its owning shard with the
+            write's exact producer preparation; the response (200,
+            `SeedPlanResponse`) reports one outcome per seeded output, and
+            items the write would reject are reported as `rejected` with the
+            error instead of failing the request.
         commit_requires:
           $ref: "#/components/schemas/CommitRequires"
         sync_level:
@@ -17041,6 +17118,12 @@ paths:
             schema:
               $ref: "#/components/schemas/BatchRequest"
       responses:
+        "200":
+          description: Validation-only seed plan (`validate_only` set); nothing was written.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SeedPlanResponse"
         "201": # Corrected to 201 as per handler
           description: Batch operation successful
           content:
@@ -17543,6 +17626,18 @@ paths:
           schema:
             type: string
           example: "title,author,metadata.tags"
+        - name: artifact_view
+          in: query
+          required: false
+          description: |
+            How selected `_artifacts` and `_chunks` render. `descriptive` (the
+            default) returns artifact metadata. `seed` returns exactly the
+            artifact seed write shapes (`ArtifactSeed`, `ChunkSeed`), vectors
+            included, so the response can be written into another table to
+            publish the same outputs without invoking producers. Example:
+            `fields=*,_artifacts,_chunks&artifact_view=seed`.
+          schema:
+            $ref: "#/components/schemas/ArtifactView"
         - name: consistency
           in: query
           required: false

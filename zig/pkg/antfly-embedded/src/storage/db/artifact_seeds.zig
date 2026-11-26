@@ -35,6 +35,73 @@ const Allocator = std.mem.Allocator;
 
 pub const artifacts_field = "_artifacts";
 pub const chunks_field = "_chunks";
+/// Per-document conflict policy for the seeds it carries. Request-level
+/// `seed_conflict` lowers to this member so the policy travels with the
+/// seeds through Raft, 2PC intents and relational sidecars.
+pub const conflict_field = "_seed_conflict";
+
+/// What happens when a seed differs from output already accepted for the
+/// same input: `keep` rejects the write (it is never dropped silently),
+/// `replace` overwrites it. Identical values are always unchanged no-ops.
+pub const ConflictPolicy = enum {
+    keep,
+    replace,
+
+    pub fn parse(text: []const u8) ?ConflictPolicy {
+        return std.meta.stringToEnum(ConflictPolicy, text);
+    }
+};
+
+/// Per-seed acceptance result, as reported by seed planning.
+pub const Outcome = enum {
+    /// No accepted output existed for this input; the seed becomes it.
+    accepted,
+    /// Accepted output for this input already equals the seed.
+    unchanged,
+    /// Accepted output for this input differs and the policy keeps it.
+    conflict,
+    /// Accepted output for this input differs and the seed replaces it.
+    replaced,
+    /// `null`: accepted output is dropped so the producer regenerates it.
+    deleted,
+    /// An output of the seeded document without a seed: its producer
+    /// generates it as usual.
+    missing,
+};
+
+pub const Origin = enum { seeded, generated, external };
+
+/// The acceptance decision for one seeded output.
+pub const Result = struct {
+    outcome: Outcome,
+    existing_origin: ?Origin = null,
+
+    /// Combines per-row results (chunk windows) into the output's result:
+    /// any conflict dominates, then replacement, then acceptance.
+    pub fn merge(self: Result, other: Result) Result {
+        const rank = struct {
+            fn of(outcome: Outcome) u8 {
+                return switch (outcome) {
+                    .missing => 0,
+                    .unchanged => 0,
+                    .accepted => 1,
+                    .deleted => 2,
+                    .replaced => 3,
+                    .conflict => 4,
+                };
+            }
+        }.of;
+        return if (rank(other.outcome) > rank(self.outcome)) other else self;
+    }
+};
+
+pub const OutcomeEntry = struct {
+    key: []const u8,
+    name: []const u8,
+    outcome: Outcome,
+    /// Origin of the output that existed before this write, when any did.
+    existing_origin: ?Origin = null,
+};
 
 /// Upper bound on one seeded chunk collection inside a single atomic write.
 /// Larger inventories belong to staged publication (`docs/design/media-pass.md`).
@@ -51,7 +118,7 @@ pub const Error = error{
     /// through the wrong reserved field (`_artifacts` versus `_chunks`).
     UnknownArtifactSeed,
     /// The target enrichment exists but this release cannot accept a seed for
-    /// it (for example a context-dependent producer or a sparse embedding).
+    /// it (for example a context-dependent producer).
     ArtifactSeedNotAccepted,
     /// A seed-only transform names a document that does not exist. There are
     /// no pending seeds and no seed-only rows.
@@ -59,10 +126,32 @@ pub const Error = error{
     /// A seed-only transform must name the source version (`expected_version`)
     /// its seeds were computed from.
     ArtifactSeedSourceBindingRequired,
+    /// Under `seed_conflict: keep`, a seed differs from output already
+    /// accepted for the same input. Plan the write to see which items.
+    ArtifactSeedConflict,
+    /// An enrichment field mapping with `on_missing: fail` found no value.
+    ArtifactSeedMissing,
+    /// `source.source_hash` names a different input than the one the seed
+    /// would be bound to: the seed was computed from another source version
+    /// or producer revision.
+    ArtifactSeedSourceMismatch,
 };
 
+/// Checks a seed's `source.source_hash` against the input identity it would
+/// be bound to. Without a declared hash there is nothing to check.
+pub fn requireSourceHash(source: ?Source, bound: ?u64) !void {
+    const declared = (source orelse return).source_hash orelse return;
+    if (bound == null or bound.? != declared) return error.ArtifactSeedSourceMismatch;
+}
+
+/// Outputs whose identity is not one `source_hash` (chunk-derived vectors,
+/// assets) cannot honor a declared hash; refuse rather than ignore it.
+pub fn rejectSourceHash(source: ?Source) !void {
+    if (source) |declared| if (declared.source_hash != null) return error.ArtifactSeedNotAccepted;
+}
+
 pub fn isSeedField(name: []const u8) bool {
-    return std.mem.eql(u8, name, artifacts_field) or std.mem.eql(u8, name, chunks_field);
+    return std.mem.eql(u8, name, artifacts_field) or std.mem.eql(u8, name, chunks_field) or std.mem.eql(u8, name, conflict_field);
 }
 
 /// Returns whether a JSON object contains either reserved seed field.
@@ -76,7 +165,15 @@ pub fn hasSeedFields(object: std.json.ObjectMap) bool {
 pub fn extractCanonicalAlloc(alloc: Allocator, object: std.json.ObjectMap) !?[]u8 {
     const artifacts = object.get(artifacts_field);
     const chunks = object.get(chunks_field);
-    if (artifacts == null and chunks == null) return null;
+    const conflict = object.get(conflict_field);
+    if (artifacts == null and chunks == null) {
+        // A policy without seeds would be silently meaningless.
+        if (conflict != null) return error.InvalidArtifactSeed;
+        return null;
+    }
+    if (conflict) |value| {
+        if (value != .string or ConflictPolicy.parse(value.string) == null) return error.InvalidArtifactSeed;
+    }
     if (artifacts) |value| try validateArtifactsField(value);
     if (chunks) |value| try validateChunksField(value);
     if (artifacts != null and chunks != null) {
@@ -96,6 +193,10 @@ pub fn extractCanonicalAlloc(alloc: Allocator, object: std.json.ObjectMap) !?[]u
     }
     if (chunks) |value| {
         writer.objectField(chunks_field) catch return error.OutOfMemory;
+        writer.write(value) catch return error.OutOfMemory;
+    }
+    if (conflict) |value| {
+        writer.objectField(conflict_field) catch return error.OutOfMemory;
         writer.write(value) catch return error.OutOfMemory;
     }
     writer.endObject() catch return error.OutOfMemory;
@@ -329,9 +430,17 @@ pub const Seeds = struct {
         // the envelope checks rather than trusting their producer.
         if (parsed.value.object.get(artifacts_field)) |value| try validateArtifactsField(value);
         if (parsed.value.object.get(chunks_field)) |value| try validateChunksField(value);
+        if (parsed.value.object.get(conflict_field)) |value| {
+            if (value != .string or ConflictPolicy.parse(value.string) == null) return error.InvalidArtifactSeed;
+        }
         var it = parsed.value.object.iterator();
         while (it.next()) |entry| if (!isSeedField(entry.key_ptr.*)) return error.InvalidArtifactSeed;
         return .{ .parsed = parsed };
+    }
+
+    pub fn conflictPolicy(self: *const Seeds) ConflictPolicy {
+        const value = self.parsed.value.object.get(conflict_field) orelse return .keep;
+        return ConflictPolicy.parse(value.string) orelse .keep;
     }
 
     pub fn deinit(self: *Seeds) void {
@@ -385,6 +494,133 @@ pub const Seeds = struct {
     }
 };
 
+/// Enrichment field mapping (`seed: {field, format, on_missing}`): an
+/// existing record field supplies the enrichment's seed. Explicit
+/// `_artifacts`/`_chunks` seeds in the same write win over the mapping.
+pub const Mapping = struct {
+    /// Dotted path of the record field holding the existing result.
+    field: []const u8,
+    format: Format = .auto,
+    on_missing: OnMissing = .generate,
+
+    pub const Format = enum {
+        /// Follow the enrichment kind: text or JSON per the asset content
+        /// type, a vector for document embeddings, chunk vectors for
+        /// chunk-derived embeddings, and chunk arrays for chunk collections.
+        auto,
+        /// A string, accepted as a text asset value.
+        text,
+        /// Any JSON value, accepted as a JSON asset value.
+        json,
+        /// `[number, ...]`.
+        vector,
+        /// `[{chunk_id, window_index?, vector}]`.
+        chunk_vectors,
+        /// `[{_chunk_id, _content, ...}]`.
+        chunks,
+    };
+
+    pub const OnMissing = enum {
+        /// The producer generates the output as usual.
+        generate,
+        /// The write is rejected (`ArtifactSeedMissing`).
+        fail,
+    };
+};
+
+/// Validates a public `seed` mapping object and returns its canonical JSON.
+pub fn canonicalMappingAlloc(alloc: Allocator, value: std.json.Value) ![]u8 {
+    if (value != .object) return error.InvalidArtifactSeed;
+    var mapping: Mapping = .{ .field = "" };
+    var it = value.object.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const item = entry.value_ptr.*;
+        if (item != .string) return error.InvalidArtifactSeed;
+        if (std.mem.eql(u8, key, "field")) {
+            mapping.field = item.string;
+        } else if (std.mem.eql(u8, key, "format")) {
+            mapping.format = std.meta.stringToEnum(Mapping.Format, item.string) orelse return error.InvalidArtifactSeed;
+        } else if (std.mem.eql(u8, key, "on_missing")) {
+            mapping.on_missing = std.meta.stringToEnum(Mapping.OnMissing, item.string) orelse return error.InvalidArtifactSeed;
+        } else return error.InvalidArtifactSeed;
+    }
+    if (mapping.field.len == 0 or mapping.field.len > max_name_bytes or mapping.field[0] == '_') return error.InvalidArtifactSeed;
+    var parts = std.mem.splitScalar(u8, mapping.field, '.');
+    while (parts.next()) |part| if (part.len == 0) return error.InvalidArtifactSeed;
+    return try std.json.Stringify.valueAlloc(alloc, mapping, .{});
+}
+
+pub fn parseMapping(a: Allocator, canonical: []const u8) !Mapping {
+    return std.json.parseFromSliceLeaky(Mapping, a, canonical, .{ .allocate = .alloc_always }) catch error.InvalidArtifactSeed;
+}
+
+/// The seed a field mapping derives from `document`, or null when the field
+/// is absent or null. `chunk_collection` selects the `_chunks` shape. The
+/// entry borrows `document`'s values.
+pub fn mappedEntry(mapping: Mapping, document: std.json.Value, chunk_collection: bool) !?Entry {
+    var current = document;
+    var parts = std.mem.splitScalar(u8, mapping.field, '.');
+    while (parts.next()) |part| {
+        if (current != .object) return null;
+        current = current.object.get(part) orelse return null;
+    }
+    if (current == .null) return null;
+    if (chunk_collection) {
+        if (mapping.format != .auto and mapping.format != .chunks) return error.InvalidArtifactSeed;
+        try validateChunkCollection(current);
+        return .{ .chunks = current.array.items };
+    }
+    switch (mapping.format) {
+        .chunks => return error.InvalidArtifactSeed,
+        .text => if (current != .string) return error.InvalidArtifactSeed,
+        .vector, .chunk_vectors => if (current != .array) return error.InvalidArtifactSeed,
+        .auto, .json => {},
+    }
+    return .{ .artifact = .{ .value = current } };
+}
+
+test "enrichment field mappings derive typed seeds from record fields" {
+    const alloc = std.testing.allocator;
+    var spec = try parseForTest(alloc,
+        \\{"field":"legacy.ocr","on_missing":"fail"}
+    );
+    defer spec.deinit();
+    const canonical = try canonicalMappingAlloc(alloc, spec.value);
+    defer alloc.free(canonical);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const mapping = try parseMapping(arena.allocator(), canonical);
+    try std.testing.expectEqual(Mapping.OnMissing.fail, mapping.on_missing);
+
+    var doc = try parseForTest(alloc,
+        \\{"legacy":{"ocr":"scanned text"},"chunks":[{"_chunk_id":0,"_content":"a"}]}
+    );
+    defer doc.deinit();
+    const entry = (try mappedEntry(mapping, doc.value, false)).?;
+    try std.testing.expectEqualStrings("scanned text", entry.artifact.value.string);
+    const chunk_mapping: Mapping = .{ .field = "chunks" };
+    try std.testing.expectEqual(@as(usize, 1), (try mappedEntry(chunk_mapping, doc.value, true)).?.chunks.len);
+    try std.testing.expect((try mappedEntry(.{ .field = "absent" }, doc.value, false)) == null);
+    try std.testing.expectError(error.InvalidArtifactSeed, mappedEntry(.{ .field = "legacy", .format = .text }, doc.value, false));
+
+    for ([_][]const u8{
+        \\{"field":""}
+        ,
+        \\{"field":"_artifacts"}
+        ,
+        \\{"field":"a","format":"pdf"}
+        ,
+        \\{"field":"a","on_missing":"pending"}
+        ,
+        \\{"field":"a","template":"{{x}}"}
+    }) |json| {
+        var bad = try parseForTest(alloc, json);
+        defer bad.deinit();
+        try std.testing.expectError(error.InvalidArtifactSeed, canonicalMappingAlloc(alloc, bad.value));
+    }
+}
+
 /// Dense vectors are arrays of finite numbers, as in `_embeddings`.
 pub fn decodeDenseVectorAlloc(alloc: Allocator, value: std.json.Value, expected_dims: u32) ![]f32 {
     if (value != .array or value.array.items.len == 0 or value.array.items.len > max_vector_dims) return error.InvalidArtifactSeed;
@@ -393,6 +629,68 @@ pub fn decodeDenseVectorAlloc(alloc: Allocator, value: std.json.Value, expected_
     errdefer alloc.free(vector);
     for (value.array.items, vector) |item, *slot| slot.* = try jsonF32(item);
     return vector;
+}
+
+pub const SparseVector = struct {
+    indices: []u32,
+    values: []f32,
+
+    pub fn deinit(self: SparseVector, alloc: Allocator) void {
+        alloc.free(self.indices);
+        alloc.free(self.values);
+    }
+};
+
+/// Sparse vectors are token-weight maps (`{"7": 1.5}`), as in `_embeddings`,
+/// or `{indices, values}`. Indices are returned ascending and unique.
+pub fn decodeSparseVectorAlloc(alloc: Allocator, value: std.json.Value) !SparseVector {
+    if (value != .object) return error.InvalidArtifactSeed;
+    var pairs = std.ArrayListUnmanaged(struct { index: u32, weight: f32 }).empty;
+    defer pairs.deinit(alloc);
+    if (value.object.get("indices")) |indices| {
+        const weights = value.object.get("values") orelse return error.InvalidArtifactSeed;
+        if (value.object.count() != 2 or indices != .array or weights != .array or indices.array.items.len != weights.array.items.len) return error.InvalidArtifactSeed;
+        for (indices.array.items, weights.array.items) |index, weight| try pairs.append(alloc, .{ .index = try jsonU32(index), .weight = try jsonF32(weight) });
+    } else {
+        var it = value.object.iterator();
+        while (it.next()) |entry| {
+            const index = std.fmt.parseUnsigned(u32, entry.key_ptr.*, 10) catch return error.InvalidArtifactSeed;
+            try pairs.append(alloc, .{ .index = index, .weight = try jsonF32(entry.value_ptr.*) });
+        }
+    }
+    if (pairs.items.len > max_vector_dims) return error.InvalidArtifactSeed;
+    std.mem.sort(@TypeOf(pairs.items[0]), pairs.items, {}, struct {
+        fn less(_: void, a: @TypeOf(pairs.items[0]), b: @TypeOf(pairs.items[0])) bool {
+            return a.index < b.index;
+        }
+    }.less);
+    const indices = try alloc.alloc(u32, pairs.items.len);
+    errdefer alloc.free(indices);
+    const values = try alloc.alloc(f32, pairs.items.len);
+    errdefer alloc.free(values);
+    for (pairs.items, indices, values, 0..) |pair, *index, *weight, i| {
+        if (i > 0 and pairs.items[i - 1].index == pair.index) return error.InvalidArtifactSeed;
+        index.* = pair.index;
+        weight.* = pair.weight;
+    }
+    return .{ .indices = indices, .values = values };
+}
+
+test "artifact seed sparse vectors accept token-weight maps and index arrays" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseForTest(alloc,
+        \\{"map":{"42":2.0,"7":1.5},"arrays":{"indices":[3,1],"values":[0.5,0.25]},"dup":{"indices":[1,1],"values":[1,2]},"bad":{"x":1}}
+    );
+    defer parsed.deinit();
+    const map = try decodeSparseVectorAlloc(alloc, parsed.value.object.get("map").?);
+    defer map.deinit(alloc);
+    try std.testing.expectEqualSlices(u32, &.{ 7, 42 }, map.indices);
+    try std.testing.expectEqualSlices(f32, &.{ 1.5, 2.0 }, map.values);
+    const arrays = try decodeSparseVectorAlloc(alloc, parsed.value.object.get("arrays").?);
+    defer arrays.deinit(alloc);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 3 }, arrays.indices);
+    try std.testing.expectError(error.InvalidArtifactSeed, decodeSparseVectorAlloc(alloc, parsed.value.object.get("dup").?));
+    try std.testing.expectError(error.InvalidArtifactSeed, decodeSparseVectorAlloc(alloc, parsed.value.object.get("bad").?));
 }
 
 pub const ChunkVector = struct {
@@ -650,4 +948,30 @@ test "artifact seed asset values follow the content type" {
     try std.testing.expectError(error.InvalidArtifactSeed, assetBytesAlloc(alloc, parsed.value.object.get("json").?, false));
     try std.testing.expectEqual(@as(?u64, 0xabc), parseSourceHash("xxh64:abc"));
     try std.testing.expectEqual(@as(?u64, null), parseSourceHash("sha:abc"));
+}
+
+test "artifact seed conflict policy travels with the seeds" {
+    const alloc = std.testing.allocator;
+    var doc = try parseForTest(alloc,
+        \\{"b":1,"_artifacts":{"a":{"value":"x"}},"_seed_conflict":"replace"}
+    );
+    defer doc.deinit();
+    const canonical = (try extractCanonicalAlloc(alloc, doc.value.object)).?;
+    defer alloc.free(canonical);
+    var seeds = try Seeds.parse(alloc, canonical);
+    defer seeds.deinit();
+    try std.testing.expectEqual(ConflictPolicy.replace, seeds.conflictPolicy());
+    const names = try seeds.names(alloc);
+    defer alloc.free(names);
+    try std.testing.expectEqual(@as(usize, 1), names.len);
+
+    for ([_][]const u8{
+        \\{"b":1,"_seed_conflict":"replace"}
+        ,
+        \\{"b":1,"_artifacts":{"a":{"value":"x"}},"_seed_conflict":"merge"}
+    }) |json| {
+        var bad = try parseForTest(alloc, json);
+        defer bad.deinit();
+        try std.testing.expectError(error.InvalidArtifactSeed, extractCanonicalAlloc(alloc, bad.value.object));
+    }
 }

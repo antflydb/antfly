@@ -1704,6 +1704,8 @@ pub const IndexManager = struct {
     resolvers: std.ArrayListUnmanaged(resolver_catalog.ResolverConfig) = .empty,
     retired_resolvers: std.ArrayListUnmanaged(resolver_catalog.ResolverConfig) = .empty,
     cached_has_generated_enrichment_targets: std.atomic.Value(bool),
+    /// Some enrichment maps a record field to its artifact seed.
+    cached_has_seed_mappings: std.atomic.Value(bool) = .init(false),
     cached_has_group_sources: std.atomic.Value(bool) = .init(false),
     status_only_index_configs: []types.IndexConfig,
     // Indexes whose persisted artifacts failed to open (e.g. UnsupportedVersion).
@@ -16464,7 +16466,17 @@ pub const IndexManager = struct {
             if (entry.group_source_json.len > 0) break true;
         } else false;
         self.cached_has_group_sources.store(grouped, .release);
+        const mapped = for (self.enrichments.items) |entry| {
+            if (entry.seed_json.len > 0) break true;
+        } else false;
+        self.cached_has_seed_mappings.store(mapped, .release);
         self.cached_has_generated_enrichment_targets.store(value, .release);
+    }
+
+    /// Whether writes must run producer preparation to apply enrichment
+    /// field mappings (`seed: {field, ...}`), even at `sync_level: write`.
+    pub fn hasSeedMappings(self: *const IndexManager) bool {
+        return self.cached_has_seed_mappings.load(.acquire);
     }
     pub fn hasGroupSources(self: *const IndexManager) bool {
         return self.cached_has_group_sources.load(.acquire);
@@ -17453,6 +17465,18 @@ pub const IndexManager = struct {
                 retained += 1;
             }
             requests.shrinkRetainingCapacity(retained);
+        }
+        // Artifact seed field mappings ride with the request so preparation
+        // can derive seeds from the pinned catalog without live lookups.
+        for (requests.items) |*request| {
+            if (request.seed_mapping_json.len != 0) continue;
+            const cfg = switch (request.kind) {
+                .asset => self.getEnrichment(.asset, enrichment_types.requestArtifactName(request.*)),
+                .chunk_text => self.getEnrichment(.chunk, enrichment_types.requestArtifactName(request.*)),
+                .dense_embedding, .sparse_embedding => self.getEnrichment(.embedding, enrichment_types.requestEmbeddingName(request.*)),
+            } orelse continue;
+            if (cfg.seed_json.len == 0) continue;
+            request.seed_mapping_json = try alloc.dupe(u8, cfg.seed_json);
         }
         try orderGeneratedArtifactDependencies(self.alloc, requests.items);
         return try requests.toOwnedSlice(alloc);
@@ -38047,11 +38071,13 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
         .neighbor_context_json = neighbor_context_json,
         .context_sources_json = context_sources_json,
         .execution_json = execution_json,
+        .seed_json = if (cfg.seed_json.len > 0) try alloc.dupe(u8, cfg.seed_json) else "",
     };
 }
 
 fn internalEnrichmentConfigsEqual(alloc: Allocator, a: enrichment_catalog.EnrichmentConfig, b: enrichment_catalog.EnrichmentConfig) !bool {
     return a.kind == b.kind and
+        std.mem.eql(u8, a.seed_json, b.seed_json) and
         std.mem.eql(u8, a.group_source_json, b.group_source_json) and
         std.mem.eql(u8, a.prior_context_json, b.prior_context_json) and
         std.mem.eql(u8, a.name, b.name) and
@@ -38111,6 +38137,7 @@ pub fn enrichmentToPublic(alloc: Allocator, cfg: enrichment_catalog.EnrichmentCo
         .producer_json = if (cfg.group_source_json.len > 0) "" else if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
         .neighbor_context = neighbor_context,
         .context_sources_json = if (cfg.context_sources_json.len > 0) try alloc.dupe(u8, cfg.context_sources_json) else "",
+        .seed_json = if (cfg.seed_json.len > 0) try alloc.dupe(u8, cfg.seed_json) else "",
         .execution = execution,
     };
     errdefer out.deinit(alloc);

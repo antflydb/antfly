@@ -76,6 +76,7 @@ from .artifact_seed import ArtifactSeed
 from .artifact_seed_provenance import ArtifactSeedProvenance
 from .artifact_seed_source import ArtifactSeedSource
 from .artifact_sources_capability_state import ArtifactSourcesCapabilityState
+from .artifact_view import ArtifactView
 from .audio_chunk_options import AudioChunkOptions
 from .audio_read_options import AudioReadOptions
 from .auth_subject import AuthSubject
@@ -523,6 +524,9 @@ from .enrichment_refresh_config_mode import EnrichmentRefreshConfigMode
 from .enrichment_runtime_status import EnrichmentRuntimeStatus
 from .enrichment_runtime_status_active_phase import EnrichmentRuntimeStatusActivePhase
 from .enrichment_runtime_status_stall_reason import EnrichmentRuntimeStatusStallReason
+from .enrichment_seed_mapping import EnrichmentSeedMapping
+from .enrichment_seed_mapping_format import EnrichmentSeedMappingFormat
+from .enrichment_seed_mapping_on_missing import EnrichmentSeedMappingOnMissing
 from .entity_consumer_progress_page import EntityConsumerProgressPage
 from .entity_consumer_progress_page_results_item import EntityConsumerProgressPageResultsItem
 from .entity_curation_result import EntityCurationResult
@@ -2553,6 +2557,11 @@ from .secret_list import SecretList
 from .secret_status import SecretStatus
 from .secret_store_status import SecretStoreStatus
 from .secret_write_request import SecretWriteRequest
+from .seed_conflict_policy import SeedConflictPolicy
+from .seed_outcome import SeedOutcome
+from .seed_outcome_existing_origin import SeedOutcomeExistingOrigin
+from .seed_outcome_outcome import SeedOutcomeOutcome
+from .seed_plan_response import SeedPlanResponse
 from .semantic_query_mode import SemanticQueryMode
 from .serper_search_config import SerperSearchConfig
 from .serper_search_config_provider import SerperSearchConfigProvider
@@ -2922,6 +2931,7 @@ __all__ = (
     "ArtifactSeedProvenance",
     "ArtifactSeedSource",
     "ArtifactSourcesCapabilityState",
+    "ArtifactView",
     "AudioChunkOptions",
     "AudioReadOptions",
     "AuthSubject",
@@ -3367,6 +3377,9 @@ __all__ = (
     "EnrichmentRuntimeStatus",
     "EnrichmentRuntimeStatusActivePhase",
     "EnrichmentRuntimeStatusStallReason",
+    "EnrichmentSeedMapping",
+    "EnrichmentSeedMappingFormat",
+    "EnrichmentSeedMappingOnMissing",
     "EntityConsumerProgressPage",
     "EntityConsumerProgressPageResultsItem",
     "EntityCurationResult",
@@ -5169,6 +5182,11 @@ __all__ = (
     "SecretStatus",
     "SecretStoreStatus",
     "SecretWriteRequest",
+    "SeedConflictPolicy",
+    "SeedOutcome",
+    "SeedOutcomeExistingOrigin",
+    "SeedOutcomeOutcome",
+    "SeedPlanResponse",
     "SemanticQueryMode",
     "SerperSearchConfig",
     "SerperSearchConfigProvider",

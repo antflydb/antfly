@@ -17077,6 +17077,8 @@ fn lookupRemoteWithFence(
             .include_json_null_fields = opts.include_json_null_fields,
             .row_policy_principal_proof = opts.row_policy_principal_proof,
             .row_policy_database = opts.row_policy_database,
+            .artifact_view_seed = opts.artifact_view == .seed,
+            .seed_plan_json = opts.seed_plan_json,
         },
     ) catch |err| return if (err == error.ConcurrencyUnavailable)
         // Keep proven local scheduling pressure distinct from unavailable
@@ -17834,6 +17836,7 @@ fn encodeScanRequest(
     if (opts.include_content_hashes) {
         try appendJsonFieldBool(alloc, &out, &first, "_include_content_hashes", true);
     }
+    if (opts.artifact_view == .seed) try appendJsonFieldString(alloc, &out, &first, "artifact_view", "seed");
     if (opts.isRelational()) {
         try appendJsonFieldName(alloc, &out, &first, "_relational_query");
         if (opts.relational_query) |query| {

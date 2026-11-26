@@ -1501,7 +1501,7 @@ pub const ArtifactRepairReason = enum {
     }
 };
 
-/// An already computed result for a named enrichment, written as `_artifacts.<name>` in a document or transform. The enrichment defines the output contract (content type, dimensions, vector space); the seed does not repeat it. `"<name>": null` drops the accepted output so its producer regenerates it; omitting a name leaves it unchanged. `value` by enrichment kind: - Text asset: a string (`""` is a valid, complete empty result), or `{ "text": "..." }`. - JSON asset: any JSON value. - Document embedding: an array of finite numbers. - Chunk-derived embedding: an array of `ChunkVectorSeed`. Descriptive read fields (`artifact_id`, `artifact_ref`, `kind`, `status`, `dims`, `items`, `content_type`) and internal routing fields are rejected.
+/// An already computed result for a named enrichment, written as `_artifacts.<name>` in a document or transform. The enrichment defines the output contract (content type, dimensions, vector space); the seed does not repeat it. `"<name>": null` drops the accepted output so its producer regenerates it; omitting a name leaves it unchanged. `value` by enrichment kind: - Text asset: a string (`""` is a valid, complete empty result), or `{ "text": "..." }`. - JSON asset: any JSON value. - Document extraction asset: `{ "text": "..." }`, the already extracted plain text. No fetch, OCR or transcription runs; `source` identifies the remote object it was extracted from. - Document embedding: an array of finite numbers. - Chunk-derived embedding: an array of `ChunkVectorSeed`. - Sparse embedding: `{ "indices": [...], "values": [...] }` with strictly ascending indices. Descriptive read fields (`artifact_id`, `artifact_ref`, `kind`, `status`, `dims`, `items`, `content_type`) and internal routing fields are rejected.
 pub const ArtifactSeed = struct {
     /// The seeded result; its shape follows the enrichment kind.
     value: std.json.Value,
@@ -1565,6 +1565,32 @@ pub const ArtifactSourcesCapabilityState = enum {
             .{ "available", .available },
             .{ "upgrade_pending", .upgrade_pending },
             .{ "unsupported", .unsupported },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Rendering of selected `_artifacts` and `_chunks`. `seed` emits exactly the artifact seed write shapes, vectors included, and omits descriptive and internal fields. Outputs without a seed write shape (explicit external vectors, sparse vectors, unit-scoped extraction children) are omitted.
+pub const ArtifactView = enum {
+    descriptive,
+    seed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .descriptive => "descriptive",
+            .seed => "seed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "descriptive", .descriptive },
+            .{ "seed", .seed },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -1883,6 +1909,9 @@ pub const BatchRequest = struct {
     deletes: ?[]const []const u8 = null,
     /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric and set-like operations ($inc, $min, $max, $addToSet, $pull) Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($set) - Add or remove array values ($addToSet, $pull) - Update nested fields without overwriting the entire document
     transforms: ?[]const Transform = null,
+    seed_conflict: ?SeedConflictPolicy = null,
+    /// Plan the batch's artifact seeds without writing anything. Each seeded insert or transform is planned by its owning shard with the write's exact producer preparation; the response (200, `SeedPlanResponse`) reports one outcome per seeded output, and items the write would reject are reported as `rejected` with the error instead of failing the request.
+    validate_only: ?bool = null,
     commit_requires: ?CommitRequires = null,
     sync_level: ?SyncLevel = null,
 
@@ -1891,6 +1920,8 @@ pub const BatchRequest = struct {
         .{ "inserts", "inserts", true },
         .{ "deletes", "deletes", true },
         .{ "transforms", "transforms", true },
+        .{ "seed_conflict", "seed_conflict", true },
+        .{ "validate_only", "validate_only", true },
         .{ "commit_requires", "commit_requires", true },
         .{ "sync_level", "sync_level", true },
     };
@@ -1915,6 +1946,14 @@ pub const BatchRequest = struct {
         }
         if (self.transforms) |value| {
             try jw.objectField("transforms");
+            try jw.write(value);
+        }
+        if (self.seed_conflict) |value| {
+            try jw.objectField("seed_conflict");
+            try jw.write(value);
+        }
+        if (self.validate_only) |value| {
+            try jw.objectField("validate_only");
             try jw.write(value);
         }
         if (self.commit_requires) |value| {
@@ -15531,6 +15570,7 @@ pub const ScanKeysRequest = struct {
     exclusive_to: ?bool = null,
     /// List of fields to include in each result. If not specified, only returns the key. Supports: - Simple fields: "title", "author" - Nested paths: "user.address.city" - Wildcards: "_chunks.*" - Exclusions: "-_chunks.*._embedding" - Special fields: "_embeddings", "_summaries", "_chunks"
     fields: ?[]const []const u8 = null,
+    artifact_view: ?ArtifactView = null,
     /// Structured subset of the Antfly query AST used to filter a primary-key scan. Only documents matching this query are included in results. Because scans do not open a text index, text-index-only variants such as phrase and multi-match queries are rejected with a validation error instead of being evaluated with slower stored-document semantics. Examples: - Status filtering: `{"term":{"path":"/status","value":"published"}}` - Date ranges: `{"range":{"/created_at":{"gte":"2023-01-01"}}}` - Field existence: `{"exists":{"path":"/category"}}`
     filter_query: ?RawQuery = null,
     /// Maximum number of results to return. If not specified, returns all matching keys in the range. Useful for pagination or sampling.
@@ -15543,6 +15583,7 @@ pub const ScanKeysRequest = struct {
         .{ "inclusive_from", "inclusive_from", true },
         .{ "exclusive_to", "exclusive_to", true },
         .{ "fields", "fields", true },
+        .{ "artifact_view", "artifact_view", true },
         .{ "filter_query", "filter_query", true },
         .{ "limit", "limit", true },
     };
@@ -15575,6 +15616,10 @@ pub const ScanKeysRequest = struct {
         }
         if (self.fields) |value| {
             try jw.objectField("fields");
+            try jw.write(value);
+        }
+        if (self.artifact_view) |value| {
+            try jw.objectField("artifact_view");
             try jw.write(value);
         }
         if (self.filter_query) |value| {
@@ -16053,6 +16098,84 @@ pub const SecretStoreStatus = struct {
 pub const SecretWriteRequest = struct {
     /// Secret value (stored in the configured protected secret store and never returned)
     value: []const u8,
+};
+
+/// What a seed does when the enrichment already has accepted output for the same input (same source version, producer and configuration) that differs from the seed. `keep` rejects the batch (`ArtifactSeedConflict`); identical output is reported `unchanged`. `replace` publishes the seed. A document or transform may set its own policy with the reserved `_seed_conflict` member, which wins over the request. During distributed transaction resolution a conflict never fails: the existing output is kept.
+pub const SeedConflictPolicy = enum {
+    keep,
+    replace,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .keep => "keep",
+            .replace => "replace",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "keep", .keep },
+            .{ "replace", .replace },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const SeedOutcome = struct {
+    key: []const u8,
+    /// Enrichment name. Absent for items rejected as a whole.
+    name: ?[]const u8 = null,
+    /// - `accepted`: the seed becomes the output. - `unchanged`: identical output is already accepted for this input. - `conflict`: different output is already accepted (kept). - `replaced`: different output is replaced by the seed. - `deleted`: a `null` seed drops the accepted output. - `missing`: no seed was supplied; the producer will run. - `rejected`: the write would fail with `error`.
+    outcome: []const u8,
+    existing_origin: ?[]const u8 = null,
+    @"error": ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "key", "key", false },
+        .{ "name", "name", true },
+        .{ "outcome", "outcome", false },
+        .{ "existing_origin", "existing_origin", true },
+        .{ "error", "error", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("key");
+        try jw.write(self.key);
+        if (self.name) |value| {
+            try jw.objectField("name");
+            try jw.write(value);
+        }
+        try jw.objectField("outcome");
+        try jw.write(self.outcome);
+        if (self.existing_origin) |value| {
+            try jw.objectField("existing_origin");
+            try jw.write(value);
+        }
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const SeedPlanResponse = struct {
+    seeds: []const SeedOutcome,
 };
 
 pub const ShardConfig = struct {

@@ -376,12 +376,15 @@ pub const ReservedProjectionPath = struct {
         embeddings,
         artifacts,
         chunks,
+        /// `_seed_conflict` (one segment): the policy for this write's seeds.
+        seed_conflict,
 
         pub fn jsonName(self: Field) []const u8 {
             return switch (self) {
                 .embeddings => "_embeddings",
                 .artifacts => "_artifacts",
                 .chunks => "_chunks",
+                .seed_conflict => "_seed_conflict",
             };
         }
     };
@@ -395,6 +398,10 @@ pub fn reservedProjectionPath(path: []const u8) !?ReservedProjectionPath {
         const candidate = @field(ReservedProjectionPath.Field, name);
         if (std.mem.eql(u8, parts[0], candidate.jsonName())) break candidate;
     } else return null;
+    if (field == .seed_conflict) {
+        if (parts.len != 1) return error.InvalidArgument;
+        return .{ .field = field, .name = "" };
+    }
     if (parts.len != 2) return error.InvalidArgument;
     return .{ .field = field, .name = parts[1] };
 }
@@ -426,6 +433,13 @@ pub fn applyReservedProjectionOperationsAlloc(alloc: Allocator, resolved: []cons
     if (root != .object) return error.InvalidArgument;
     for (operations) |operation| {
         const field_name = operation.path.field.jsonName();
+        if (operation.path.field == .seed_conflict) {
+            if (operation.value_json) |json| {
+                const value = std.json.parseFromSliceLeaky(std.json.Value, a, json, .{ .parse_numbers = false }) catch return error.InvalidArgument;
+                try root.object.put(a, field_name, value);
+            } else _ = root.object.swapRemove(field_name);
+            continue;
+        }
         const holder = try root.object.getOrPut(a, field_name);
         if (!holder.found_existing or holder.value_ptr.* != .object) holder.value_ptr.* = .{ .object = .empty };
         const value: std.json.Value = if (operation.value_json) |json|

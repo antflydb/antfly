@@ -6,6 +6,7 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
+from ...models.artifact_view import ArtifactView
 from ...models.error import Error
 from ...models.lookup_key_consistency import LookupKeyConsistency
 from ...models.lookup_key_response_200 import LookupKeyResponse200
@@ -17,12 +18,19 @@ def _get_kwargs(
     key: str,
     *,
     fields: str | Unset = UNSET,
+    artifact_view: ArtifactView | Unset = UNSET,
     consistency: LookupKeyConsistency | Unset = LookupKeyConsistency.READ_INDEX,
 ) -> dict[str, Any]:
 
     params: dict[str, Any] = {}
 
     params["fields"] = fields
+
+    json_artifact_view: str | Unset = UNSET
+    if not isinstance(artifact_view, Unset):
+        json_artifact_view = artifact_view.value
+
+    params["artifact_view"] = json_artifact_view
 
     json_consistency: str | Unset = UNSET
     if not isinstance(consistency, Unset):
@@ -90,6 +98,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     fields: str | Unset = UNSET,
+    artifact_view: ArtifactView | Unset = UNSET,
     consistency: LookupKeyConsistency | Unset = LookupKeyConsistency.READ_INDEX,
 ) -> Response[Error | LookupKeyResponse200]:
     """Retrieve a document by key
@@ -98,6 +107,12 @@ def sync_detailed(
         table_name (str):
         key (str):
         fields (str | Unset):
+        artifact_view (ArtifactView | Unset): Rendering of selected `_artifacts` and `_chunks`.
+            `seed` emits exactly
+            the artifact seed write shapes, vectors included, and omits descriptive
+            and internal fields. Outputs without a seed write shape (explicit
+            external vectors, sparse vectors, unit-scoped extraction children) are
+            omitted.
         consistency (LookupKeyConsistency | Unset):  Default: LookupKeyConsistency.READ_INDEX.
 
     Raises:
@@ -112,6 +127,7 @@ def sync_detailed(
         table_name=table_name,
         key=key,
         fields=fields,
+        artifact_view=artifact_view,
         consistency=consistency,
     )
 
@@ -128,6 +144,7 @@ def sync(
     *,
     client: AuthenticatedClient,
     fields: str | Unset = UNSET,
+    artifact_view: ArtifactView | Unset = UNSET,
     consistency: LookupKeyConsistency | Unset = LookupKeyConsistency.READ_INDEX,
 ) -> Error | LookupKeyResponse200 | None:
     """Retrieve a document by key
@@ -136,6 +153,12 @@ def sync(
         table_name (str):
         key (str):
         fields (str | Unset):
+        artifact_view (ArtifactView | Unset): Rendering of selected `_artifacts` and `_chunks`.
+            `seed` emits exactly
+            the artifact seed write shapes, vectors included, and omits descriptive
+            and internal fields. Outputs without a seed write shape (explicit
+            external vectors, sparse vectors, unit-scoped extraction children) are
+            omitted.
         consistency (LookupKeyConsistency | Unset):  Default: LookupKeyConsistency.READ_INDEX.
 
     Raises:
@@ -151,6 +174,7 @@ def sync(
         key=key,
         client=client,
         fields=fields,
+        artifact_view=artifact_view,
         consistency=consistency,
     ).parsed
 
@@ -161,6 +185,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     fields: str | Unset = UNSET,
+    artifact_view: ArtifactView | Unset = UNSET,
     consistency: LookupKeyConsistency | Unset = LookupKeyConsistency.READ_INDEX,
 ) -> Response[Error | LookupKeyResponse200]:
     """Retrieve a document by key
@@ -169,6 +194,12 @@ async def asyncio_detailed(
         table_name (str):
         key (str):
         fields (str | Unset):
+        artifact_view (ArtifactView | Unset): Rendering of selected `_artifacts` and `_chunks`.
+            `seed` emits exactly
+            the artifact seed write shapes, vectors included, and omits descriptive
+            and internal fields. Outputs without a seed write shape (explicit
+            external vectors, sparse vectors, unit-scoped extraction children) are
+            omitted.
         consistency (LookupKeyConsistency | Unset):  Default: LookupKeyConsistency.READ_INDEX.
 
     Raises:
@@ -183,6 +214,7 @@ async def asyncio_detailed(
         table_name=table_name,
         key=key,
         fields=fields,
+        artifact_view=artifact_view,
         consistency=consistency,
     )
 
@@ -197,6 +229,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     fields: str | Unset = UNSET,
+    artifact_view: ArtifactView | Unset = UNSET,
     consistency: LookupKeyConsistency | Unset = LookupKeyConsistency.READ_INDEX,
 ) -> Error | LookupKeyResponse200 | None:
     """Retrieve a document by key
@@ -205,6 +238,12 @@ async def asyncio(
         table_name (str):
         key (str):
         fields (str | Unset):
+        artifact_view (ArtifactView | Unset): Rendering of selected `_artifacts` and `_chunks`.
+            `seed` emits exactly
+            the artifact seed write shapes, vectors included, and omits descriptive
+            and internal fields. Outputs without a seed write shape (explicit
+            external vectors, sparse vectors, unit-scoped extraction children) are
+            omitted.
         consistency (LookupKeyConsistency | Unset):  Default: LookupKeyConsistency.READ_INDEX.
 
     Raises:
@@ -221,6 +260,7 @@ async def asyncio(
             key=key,
             client=client,
             fields=fields,
+            artifact_view=artifact_view,
             consistency=consistency,
         )
     ).parsed

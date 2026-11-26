@@ -184,6 +184,10 @@ pub const GeneratedEnrichmentRequest = struct {
     /// Replay sequence of the source document change. This is attached when a
     /// cached request plan is instantiated for a pending journal group.
     sequence: u64 = 0,
+    /// Canonical enrichment field mapping (`artifact_seeds.Mapping`): a record
+    /// field that supplies this output's seed. Ingestion configuration, not
+    /// producer identity: it never enters the definition digest.
+    seed_mapping_json: []const u8 = "",
     /// Document/producer-owned reprocess epoch, resolved once before execution.
     /// Monotonic across model configuration changes, including rollbacks.
     /// Zero preserves legacy source-hash identities.
@@ -254,6 +258,7 @@ pub fn freeGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReques
     if (request.context_sources_json.len > 0) alloc.free(request.context_sources_json);
     if (request.execution_json.len > 0) alloc.free(request.execution_json);
     if (request.upstream_artifact_name.len > 0) alloc.free(request.upstream_artifact_name);
+    if (request.seed_mapping_json.len > 0) alloc.free(request.seed_mapping_json);
     for (request.consumer_indexes) |name| alloc.free(name);
     if (request.consumer_indexes.len > 0) alloc.free(request.consumer_indexes);
 }
@@ -291,6 +296,8 @@ pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReque
     errdefer if (execution_json.len > 0) alloc.free(execution_json);
     const upstream_artifact_name = if (request.upstream_artifact_name.len > 0) try alloc.dupe(u8, request.upstream_artifact_name) else "";
     errdefer if (upstream_artifact_name.len > 0) alloc.free(upstream_artifact_name);
+    const seed_mapping_json = if (request.seed_mapping_json.len > 0) try alloc.dupe(u8, request.seed_mapping_json) else "";
+    errdefer if (seed_mapping_json.len > 0) alloc.free(seed_mapping_json);
     const consumer_indexes = try alloc.alloc([]u8, request.consumer_indexes.len);
     var consumer_indexes_initialized: usize = 0;
     errdefer {
@@ -329,6 +336,7 @@ pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReque
         .context_sources_json = context_sources_json,
         .execution_json = execution_json,
         .upstream_artifact_name = upstream_artifact_name,
+        .seed_mapping_json = seed_mapping_json,
         .consumer_indexes = consumer_indexes,
         .sequence = request.sequence,
         .reprocess_generation = request.reprocess_generation,

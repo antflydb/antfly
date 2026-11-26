@@ -28,8 +28,13 @@ class ArtifactSeed:
     - Text asset: a string (`""` is a valid, complete empty result), or
       `{ "text": "..." }`.
     - JSON asset: any JSON value.
+    - Document extraction asset: `{ "text": "..." }`, the already
+      extracted plain text. No fetch, OCR or transcription runs; `source`
+      identifies the remote object it was extracted from.
     - Document embedding: an array of finite numbers.
     - Chunk-derived embedding: an array of `ChunkVectorSeed`.
+    - Sparse embedding: `{ "indices": [...], "values": [...] }` with
+      strictly ascending indices.
 
     Descriptive read fields (`artifact_id`, `artifact_ref`, `kind`,
     `status`, `dims`, `items`, `content_type`) and internal routing

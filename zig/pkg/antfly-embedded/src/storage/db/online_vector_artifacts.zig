@@ -43,7 +43,8 @@ pub fn validate(key: []const u8, value: ?[]const u8) !void {
 pub fn validatePayload(value: ?[]const u8) !void {
     const bytes = value orelse return;
     const header = codec.decodeHeader(bytes) catch return error.InvalidMergePage;
-    if (header.flags.has_graph_generation or header.flags.portable_unbound_graph_generation or header.flags._reserved != 0 or header.payload_len < 4)
+    // `seeded` is descriptive origin; decodeHeader restricts it to dense vectors.
+    if (header.flags.has_graph_generation or header.flags.portable_unbound_graph_generation or header.payload_len < 4)
         return error.InvalidMergePage;
     if (header.flags.vector_elided) {
         // A transient LEANN stub: dims and a digest, no vector.

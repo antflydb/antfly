@@ -106,7 +106,7 @@ fn edgeGeneration(raw: []const u8) !u64 {
     const header = try codec.decodeHeader(raw);
     if (header.kind != .graph_edge or header.version != codec.graph_edge_codec_version or
         !header.flags.has_graph_generation or header.flags.portable_unbound_graph_generation or
-        header.flags._reserved != 0 or header.payload_len < 36) return error.InvalidGraphTransfer;
+        header.flags.seeded or header.payload_len < 36) return error.InvalidGraphTransfer;
     const payload = raw[codec.header_len..];
     const generation = std.mem.readInt(u64, payload[0..8], .little);
     if (generation == 0 or std.mem.readInt(u32, payload[32..36], .little) != payload.len - 36)

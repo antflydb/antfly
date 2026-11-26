@@ -642,6 +642,38 @@ pub fn assetPayloadJsonValue(alloc: Allocator, content_type: []const u8, raw: []
     return .{ .string = try alloc.dupe(u8, raw) };
 }
 
+/// Seed view (`artifact_view=seed`, see `artifact_seed_view.zig`).
+pub fn loadSeedViewTxn(self: Source, alloc: Allocator, doc_key: []const u8, read_txn: ?*docstore_mod.DocStore.Txn) !?std.json.Value {
+    if (read_txn == null) {
+        var read = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+        defer read.abort();
+        return loadSeedViewTxn(self, alloc, doc_key, &read);
+    }
+    return try @import("artifact_seed_view.zig").loadTxn(alloc, doc_key, read_txn.?, .{ .ctx = self.core, .lookup = seedViewAssetContract });
+}
+
+fn seedViewAssetContract(ctx: *const anyopaque, alloc: Allocator, name: []const u8) anyerror!?@import("artifact_seed_view.zig").AssetContract.Asset {
+    const core: *db_core.DBCore = @ptrCast(@alignCast(@constCast(ctx)));
+    const cfg = core.index_manager.getEnrichment(.asset, name) orelse return null;
+    var producer = @import("enrichment/asset_producer.zig").parseProducerConfig(alloc, cfg.producer_json) catch return null;
+    defer producer.deinit(alloc);
+    return .{
+        .content_type = try alloc.dupe(u8, if (cfg.content_type.len > 0) cfg.content_type else "text/plain"),
+        // A copy is free to regenerate and is never seeded. Document
+        // extraction rows are manifests; their units' text is the seed.
+        .mode = switch (producer.type) {
+            .copy => .none,
+            .document_extraction => .extraction_text,
+            else => .value,
+        },
+    };
+}
+
+pub fn loadSeedViewTxnCallback(ctx: ?*anyopaque, alloc: Allocator, doc_key: []const u8) anyerror!?std.json.Value {
+    const projection: *TransactionProjectionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    return try loadSeedViewTxn(projection.source, alloc, doc_key, projection.read_txn);
+}
+
 pub const TransactionProjectionContext = struct {
     source: Source,
     read_txn: *docstore_mod.DocStore.Txn,
@@ -703,6 +735,7 @@ pub const ColumnScanMaterializer = struct {
         return projectLookupStoredBytesTxn(self.context, alloc, key, logical, .{
             .fields = self.opts.fields,
             .include_all_fields = self.opts.include_all_fields,
+            .artifact_view = self.opts.artifact_view,
         });
     }
 };
@@ -721,6 +754,7 @@ pub fn projectLookupStoredBytesTxn(
         .open_embeddings = openEmbeddingStreamTxnCallback,
         .load_embeddings_compact = loadEmbeddingFieldsTxnCallback,
         .load_artifacts = loadArtifactFieldValueTxnCallback,
+        .load_seed_view = loadSeedViewTxnCallback,
     });
 }
 

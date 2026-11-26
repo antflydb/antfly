@@ -7,6 +7,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.commit_requires import CommitRequires
+from ..models.seed_conflict_policy import SeedConflictPolicy
 from ..models.sync_level import SyncLevel
 from ..types import UNSET, Unset
 
@@ -100,6 +101,21 @@ class BatchRequest:
                  Example: [{'key': 'article:123', 'operations': [{'op': '$inc', 'path': '$.views', 'value': 1}, {'op': '$set',
                 'path': '$.lastViewed', 'value': '2026-07-28T12:00:00Z'}]}, {'key': 'user:456', 'operations': [{'op':
                 '$addToSet', 'path': '$.tags', 'value': 'vip'}]}].
+            seed_conflict (SeedConflictPolicy | Unset): What a seed does when the enrichment already has accepted output for
+                the same input (same source version, producer and configuration)
+                that differs from the seed. `keep` rejects the batch
+                (`ArtifactSeedConflict`); identical output is reported `unchanged`.
+                `replace` publishes the seed. A document or transform may set its own
+                policy with the reserved `_seed_conflict` member, which wins over the
+                request. During distributed transaction resolution a conflict never
+                fails: the existing output is kept.
+            validate_only (bool | Unset): Plan the batch's artifact seeds without writing anything. Each
+                seeded insert or transform is planned by its owning shard with the
+                write's exact producer preparation; the response (200,
+                `SeedPlanResponse`) reports one outcome per seeded output, and
+                items the write would reject are reported as `rejected` with the
+                error instead of failing the request.
+                 Default: False.
             commit_requires (CommitRequires | Unset): Admission prerequisite independent of sync_level. Explicit none
                 commits the
                 source without precomputing enrichments. direct_enrichments requires eligible
@@ -137,6 +153,8 @@ class BatchRequest:
     inserts: BatchRequestInserts | Unset = UNSET
     deletes: list[str] | Unset = UNSET
     transforms: list[Transform] | Unset = UNSET
+    seed_conflict: SeedConflictPolicy | Unset = UNSET
+    validate_only: bool | Unset = False
     commit_requires: CommitRequires | Unset = UNSET
     sync_level: SyncLevel | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -157,6 +175,12 @@ class BatchRequest:
                 transforms_item = transforms_item_data.to_dict()
                 transforms.append(transforms_item)
 
+        seed_conflict: str | Unset = UNSET
+        if not isinstance(self.seed_conflict, Unset):
+            seed_conflict = self.seed_conflict.value
+
+        validate_only = self.validate_only
+
         commit_requires: str | Unset = UNSET
         if not isinstance(self.commit_requires, Unset):
             commit_requires = self.commit_requires.value
@@ -174,6 +198,10 @@ class BatchRequest:
             field_dict["deletes"] = deletes
         if transforms is not UNSET:
             field_dict["transforms"] = transforms
+        if seed_conflict is not UNSET:
+            field_dict["seed_conflict"] = seed_conflict
+        if validate_only is not UNSET:
+            field_dict["validate_only"] = validate_only
         if commit_requires is not UNSET:
             field_dict["commit_requires"] = commit_requires
         if sync_level is not UNSET:
@@ -205,6 +233,15 @@ class BatchRequest:
 
                 transforms.append(transforms_item)
 
+        _seed_conflict = d.pop("seed_conflict", UNSET)
+        seed_conflict: SeedConflictPolicy | Unset
+        if isinstance(_seed_conflict, Unset):
+            seed_conflict = UNSET
+        else:
+            seed_conflict = SeedConflictPolicy(_seed_conflict)
+
+        validate_only = d.pop("validate_only", UNSET)
+
         _commit_requires = d.pop("commit_requires", UNSET)
         commit_requires: CommitRequires | Unset
         if isinstance(_commit_requires, Unset):
@@ -223,6 +260,8 @@ class BatchRequest:
             inserts=inserts,
             deletes=deletes,
             transforms=transforms,
+            seed_conflict=seed_conflict,
+            validate_only=validate_only,
             commit_requires=commit_requires,
             sync_level=sync_level,
         )

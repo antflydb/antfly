@@ -30,6 +30,7 @@ test {
     _ = @import("antfly_local_sources").api_internal_batch;
     _ = @import("api/distributed_txn.zig");
     _ = @import("api/http_route_helpers.zig");
+    _ = @import("api/seed_planning.zig");
     _ = @import("antfly_local_sources").api_local_query_contract;
     _ = @import("antfly_local_sources").schema_relational_declarations;
     _ = @import("antfly_local_sources").schema_relational_expression;

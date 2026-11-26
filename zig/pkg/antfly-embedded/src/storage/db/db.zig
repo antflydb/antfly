@@ -178,6 +178,7 @@ const json_helpers = @import("../../api/json_helpers.zig");
 
 test {
     _ = durable_outbox;
+    _ = @import("artifact_seed_plan.zig");
     _ = durable_outbox_store;
     _ = apply_receipts;
     _ = graph_edge_ttl_expiration;
@@ -8651,6 +8652,24 @@ pub const DB = struct {
     /// ANTFLY_BENCH_METRICS phase profile.
     /// Capture normalized source mutations and producer outputs without commit.
     pub const validatePreparedEnrichments = local_mutation.validatePreparedEnrichments;
+
+    /// Validation-only artifact seed planning (#1791). Runs the write's exact
+    /// producer preparation and returns `{"seeds":[{key,name,outcome,
+    /// existing_origin?}]}` without committing anything.
+    pub fn planArtifactSeeds(self: *DB, alloc: Allocator, req: types.BatchRequest) ![]u8 {
+        var capture = execution_resources.SeedPlanCapture{ .alloc = alloc };
+        errdefer if (capture.json) |json| alloc.free(json);
+        try self.batchInternal(req, null, .{ .seed_plan = &capture, .wait_for_sync_level = false });
+        return capture.json orelse try alloc.dupe(u8, "{\"seeds\":[]}");
+    }
+
+    /// `planArtifactSeeds` for the `{inserts, transforms}` subset of a public
+    /// batch (`artifact_seed_plan.zig`), as routed through private lookups.
+    pub fn planArtifactSeedsJson(self: *DB, alloc: Allocator, plan_json: []const u8) ![]u8 {
+        var request = try @import("artifact_seed_plan.zig").parse(alloc, plan_json);
+        defer request.deinit();
+        return self.planArtifactSeeds(alloc, .{ .writes = request.writes, .transforms = request.transforms });
+    }
 
     pub fn prepareDirectEnrichments(self: *DB, alloc: Allocator, req: types.BatchRequest) ![]u8 {
         return self.prepareDirectEnrichmentsWithContext(alloc, req, null);
@@ -25160,6 +25179,7 @@ pub const DB = struct {
             try @import("restore_staging.zig").requireScope(alloc, &staging_read, opts.restore_staging_scope, false);
         }
         if (opts.group_source_query_json.len != 0) return self.lookupGroupSource(alloc, opts.group_source_query_json);
+        if (opts.seed_plan_json.len != 0) return .{ .json = try self.planArtifactSeedsJson(alloc, opts.seed_plan_json) };
         if (std.mem.eql(u8, opts.relational_topology_json, @import("native_empty_origin.zig").finalization_selector) and
             !@import("native_empty_origin.zig").finalizationLookupMatches(key, opts)) return error.RestoreStagingScopeChanged;
         if (opts.relational_topology_json.len != 0) return self.lookupRelationalTopology(alloc, opts.relational_topology_json, opts);
@@ -25323,6 +25343,7 @@ pub const DB = struct {
                 .open_embeddings = openEmbeddingStreamCallback,
                 .load_embeddings_compact = loadEmbeddingFieldsCallback,
                 .load_artifacts = loadArtifactFieldValueCallback,
+                .load_seed_view = loadSeedViewCallback,
             }, if (prepared) |plans| try plans.getPlain() else null);
         };
         errdefer output.free(stored);
@@ -51974,6 +51995,7 @@ pub const DB = struct {
         const projection_plan = db_query_projection.buildLookupFieldSelectionPlan(.{
             .fields = opts.fields,
             .include_all_fields = opts.include_all_fields,
+            .artifact_view = opts.artifact_view,
         });
         const needs_catalog_projection = opts.include_documents and projection_plan.special.all_artifacts;
         // Briefly pin immutable request state. The storage transaction below,
@@ -52354,6 +52376,7 @@ pub const DB = struct {
                                 .cypher_presence_fields = state.opts.cypher_presence_fields,
                                 .cypher_projection_json = state.opts.cypher_projection_json,
                                 .include_all_fields = state.opts.include_all_fields,
+                                .artifact_view = state.opts.artifact_view,
                             })
                     else
                         try projectLookupStoredBytesTxn(state.projection_context, state.alloc, raw_key, logical_value.?, .{
@@ -52361,6 +52384,7 @@ pub const DB = struct {
                             .cypher_presence_fields = state.opts.cypher_presence_fields,
                             .cypher_projection_json = state.opts.cypher_projection_json,
                             .include_all_fields = state.opts.include_all_fields,
+                            .artifact_view = state.opts.artifact_view,
                         })
                 else
                     null;
@@ -60709,6 +60733,7 @@ fn projectLookupStoredBytes(self: *DB, alloc: Allocator, doc_key: []const u8, ra
         .open_embeddings = openEmbeddingStreamCallback,
         .load_embeddings_compact = loadEmbeddingFieldsCallback,
         .load_artifacts = loadArtifactFieldValueCallback,
+        .load_seed_view = loadSeedViewCallback,
     });
 }
 
@@ -60723,6 +60748,7 @@ fn projectStoredBytesForSearch(self: *DB, alloc: Allocator, req: types.SearchReq
         .open_embeddings = openEmbeddingStreamCallback,
         .load_embeddings_compact = loadEmbeddingFieldsCallback,
         .load_artifacts = loadArtifactFieldValueCallback,
+        .load_seed_view = loadSeedViewCallback,
     });
 }
 
@@ -60737,6 +60763,7 @@ fn projectOwnedStoredBytesForSearch(self: *DB, alloc: Allocator, req: types.Sear
         .open_embeddings = openEmbeddingStreamCallback,
         .load_embeddings_compact = loadEmbeddingFieldsCallback,
         .load_artifacts = loadArtifactFieldValueCallback,
+        .load_seed_view = loadSeedViewCallback,
     });
 }
 
@@ -61026,6 +61053,7 @@ fn loadStoredSearchDocumentsMany(
                     .open_embeddings = openEmbeddingStreamCallback,
                     .load_embeddings_compact = loadEmbeddingFieldsCallback,
                     .load_artifacts = loadArtifactFieldValueCallback,
+                    .load_seed_view = loadSeedViewCallback,
                 })
             else
                 try alloc.dupe(u8, safe);
@@ -61088,6 +61116,11 @@ fn loadArtifactFieldValueCallback(
 ) anyerror!?std.json.Value {
     const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
     return try loadArtifactFieldValue(self, alloc, doc_key);
+}
+
+fn loadSeedViewCallback(ctx: ?*anyopaque, alloc: Allocator, doc_key: []const u8) anyerror!?std.json.Value {
+    const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    return try read_projection.loadSeedViewTxn(.{ .core = self.core }, alloc, doc_key, null);
 }
 
 const TransactionProjectionContext = read_projection.TransactionProjectionContext;
@@ -108582,6 +108615,21 @@ test "db artifact seeds publish a document vector without invoking its producer"
     try std.testing.expectEqual(@as(usize, 0), counting.calls);
     try expectSeededDenseVector(alloc, &db, "doc:a", "same source", &.{ 0.5, 0.25, 1 });
 
+    // A `source.source_hash` copied from a read must name this same input.
+    {
+        const bound = try std.fmt.allocPrint(alloc, "{{\"title\":\"changed\",\"body\":\"same source\",\"_artifacts\":{{\"body_dense_v1\":{{\"value\":[0.5,0.25,1],\"source\":{{\"source_hash\":\"xxh64:{x}\"}}}}}}}}", .{enrichment_artifact_codec.hashSource("same source")});
+        defer alloc.free(bound);
+        try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = bound }}, .sync_level = .write });
+        try db.runUntilIdle();
+        try expectSeededDenseVector(alloc, &db, "doc:a", "same source", &.{ 0.5, 0.25, 1 });
+        const stale = "{\"title\":\"changed\",\"body\":\"same source\",\"_artifacts\":{\"body_dense_v1\":{\"value\":[0.5,0.25,1],\"source\":{\"source_hash\":\"xxh64:1\"}}}}";
+        if (db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = stale }}, .sync_level = .write })) |_|
+            return error.TestUnexpectedResult
+        else |err|
+            try std.testing.expect(err == error.ArtifactSeedSourceMismatch);
+        try std.testing.expectEqual(@as(usize, 0), counting.calls);
+    }
+
     // A changed input invalidates it like generated output.
     try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"changed\",\"body\":\"new source\"}" }}, .sync_level = .write });
     try db.runUntilIdle();
@@ -108608,9 +108656,17 @@ test "db artifact seeds bind through transforms and reject unusable seeds" {
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(usize, 1), counting.calls);
 
-    // A seed-only transform replaces accepted output for the stored input.
-    try db.batch(.{
+    // Generated output for the same input is kept by default; a seed-only
+    // transform replaces it only with `replace`.
+    try std.testing.expectError(error.ArtifactSeedConflict, db.batch(.{
         .transforms = &.{.{ .key = "doc:a", .operations = &.{.{ .op = .set, .path = "_artifacts.body_dense_v1", .value_json = "{\"value\":[1,2,3]}" }} }},
+        .sync_level = .write,
+    }));
+    try db.batch(.{
+        .transforms = &.{.{ .key = "doc:a", .operations = &.{
+            .{ .op = .set, .path = "_artifacts.body_dense_v1", .value_json = "{\"value\":[1,2,3]}" },
+            .{ .op = .set, .path = "_seed_conflict", .value_json = "\"replace\"" },
+        } }},
         .sync_level = .write,
     });
     try db.runUntilIdle();
@@ -108642,6 +108698,296 @@ test "db artifact seeds bind through transforms and reject unusable seeds" {
     })) |_| return error.TestUnexpectedResult else |err| try std.testing.expect(err == error.ArtifactSeedDocumentNotFound or err == error.InvalidBatchRequest);
     try std.testing.expect((try db.get(alloc, "doc:missing")) == null);
     try std.testing.expectEqual(@as(usize, 1), counting.calls);
+}
+
+fn expectSeedPlanOutcome(alloc: Allocator, db: *DB, plan_json: []const u8, expected: []const u8) !void {
+    const plan = try db.planArtifactSeedsJson(alloc, plan_json);
+    defer alloc.free(plan);
+    if (std.mem.indexOf(u8, plan, expected) == null) {
+        std.debug.print("seed plan {s} lacks {s}\n", .{ plan, expected });
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "db artifact seed planning reports outcomes and conflicts follow the policy" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var counting = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a", .dense_embedder = counting.interface() } });
+    defer db.close();
+    try addSeededDenseTestIndex(&db);
+
+    // Planning a new document neither commits it nor invokes a producer.
+    try expectSeedPlanOutcome(alloc, &db,
+        \\{"inserts":{"doc:a":{"body":"same source","_artifacts":{"body_dense_v1":{"value":[1,2,3]}}}}}
+    , "\"outcome\":\"accepted\"");
+    try std.testing.expect((try db.get(alloc, "doc:a")) == null);
+    try std.testing.expectEqual(@as(usize, 0), counting.calls);
+
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"same source\",\"_artifacts\":{\"body_dense_v1\":{\"value\":[1,2,3]}}}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+
+    // Resumed imports are idempotent: the same value is unchanged.
+    const same = "{\"body\":\"same source\",\"_artifacts\":{\"body_dense_v1\":{\"value\":[1,2,3]}}}";
+    try expectSeedPlanOutcome(alloc, &db, "{\"inserts\":{\"doc:a\":" ++ same ++ "}}", "\"outcome\":\"unchanged\",\"existing_origin\":\"seeded\"");
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = same }}, .sync_level = .write });
+
+    // A different value for the same input conflicts under the default
+    // `keep`: never dropped silently, and the accepted output stays.
+    const differing = "{\"body\":\"same source\",\"_artifacts\":{\"body_dense_v1\":{\"value\":[3,2,1]}}}";
+    try expectSeedPlanOutcome(alloc, &db, "{\"inserts\":{\"doc:a\":" ++ differing ++ "}}", "\"outcome\":\"conflict\",\"existing_origin\":\"seeded\"");
+    if (db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = differing }}, .sync_level = .write })) |_|
+        return error.TestUnexpectedResult
+    else |err|
+        try std.testing.expect(err == error.ArtifactSeedConflict);
+    try expectSeededDenseVector(alloc, &db, "doc:a", "same source", &.{ 1, 2, 3 });
+
+    // `replace` overwrites it and reports the replacement.
+    const replacing = "{\"body\":\"same source\",\"_seed_conflict\":\"replace\",\"_artifacts\":{\"body_dense_v1\":{\"value\":[3,2,1]}}}";
+    try expectSeedPlanOutcome(alloc, &db, "{\"inserts\":{\"doc:a\":" ++ replacing ++ "}}", "\"outcome\":\"replaced\"");
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = replacing }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try expectSeededDenseVector(alloc, &db, "doc:a", "same source", &.{ 3, 2, 1 });
+
+    // Output for another input is stale, not a conflict.
+    try expectSeedPlanOutcome(alloc, &db,
+        \\{"inserts":{"doc:a":{"body":"new source","_artifacts":{"body_dense_v1":{"value":[1,1,1]}}}}}
+    , "\"outcome\":\"accepted\"");
+
+    // Generated output conflicts the same way and names its origin.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = "{\"body\":\"generated source\"}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 1), counting.calls);
+    try expectSeedPlanOutcome(alloc, &db,
+        \\{"transforms":[{"key":"doc:b","operations":[{"op":"$set","path":"_artifacts.body_dense_v1","value":{"value":[9,9,9]}}]}]}
+    , "\"outcome\":\"conflict\",\"existing_origin\":\"generated\"");
+    try expectSeedPlanOutcome(alloc, &db,
+        \\{"inserts":{"doc:b":{"body":"generated source","_artifacts":{"body_dense_v1":null}}}}
+    , "\"outcome\":\"deleted\"");
+    try std.testing.expectEqual(@as(usize, 1), counting.calls);
+}
+
+fn expectStoredAssetForTest(alloc: Allocator, db: *DB, doc_key: []const u8, name: []const u8, expected: []const u8) !void {
+    const key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", name);
+    defer alloc.free(key);
+    const stored = try db.core.store.get(alloc, key);
+    defer alloc.free(stored);
+    try std.testing.expectEqualStrings(expected, stored);
+}
+
+test "db artifact seed field mappings accept existing record results before generating" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var fake = TestAssetProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a", .asset_producer = fake.producer() } });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "summary_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+        .seed_json = "{\"field\":\"legacy.summary\",\"format\":\"text\",\"on_missing\":\"generate\"}",
+    });
+    try db.addEnrichment(.{
+        .name = "labels_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+        .seed_json = "{\"field\":\"legacy_labels\",\"format\":\"json\",\"on_missing\":\"fail\"}",
+    });
+
+    // Mapped record fields are accepted without invoking a producer, at the
+    // ordinary write level, and remain ordinary document fields.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"report\",\"legacy\":{\"summary\":\"short\"},\"legacy_labels\":{\"tags\":[\"x\"]}}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 0), fake.generator_calls);
+    try expectStoredAssetForTest(alloc, &db, "doc:a", "summary_v1", "short");
+    try expectStoredAssetForTest(alloc, &db, "doc:a", "labels_v1", "{\"tags\":[\"x\"]}");
+
+    // An explicit seed in the same write wins over the mapping; the empty
+    // string is a complete result, distinct from missing.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = "{\"body\":\"memo\",\"legacy\":{\"summary\":\"mapped\"},\"legacy_labels\":[],\"_artifacts\":{\"summary_v1\":{\"value\":\"\"}}}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 0), fake.generator_calls);
+    try expectStoredAssetForTest(alloc, &db, "doc:b", "summary_v1", "");
+
+    // `on_missing: fail` rejects the write visibly instead of generating.
+    if (db.batch(.{ .writes = &.{.{ .key = "doc:c", .value = "{\"body\":\"memo\"}" }}, .sync_level = .write })) |_|
+        return error.TestUnexpectedResult
+    else |err|
+        try std.testing.expect(err == error.ArtifactSeedMissing);
+    try std.testing.expectEqual(@as(usize, 0), fake.generator_calls);
+
+    // `on_missing: generate` runs the producer for the unmapped output.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:d", .value = "{\"body\":\"memo\",\"legacy_labels\":[]}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 1), fake.generator_calls);
+}
+
+test "db artifact seeds accept extracted text for document extraction without fetching or OCR" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var fake = TestAssetProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a", .asset_producer = fake.producer() } });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "extracted_text",
+        .kind = .asset,
+        .template = "{{url}}",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+
+    // The source is unreachable: any fetch, OCR or transcription would fail.
+    const seeded =
+        \\{"url":"https://example.invalid/report.pdf","_artifacts":{"extracted_text":{"value":{"text":"Previously extracted text about quarterly revenue."},"source":{"generation":"1712345678901234"},"provenance":{"producer":"legacy-ocr","model":"tesseract-5"}}}}
+    ;
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = seeded }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+
+    var result = (try db.lookup(alloc, "doc:a", .{ .fields = &.{"_artifacts"}, .include_all_fields = false })).?;
+    defer result.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, result.json, "\"extracted_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.json, "\"last_error\"") == null);
+    // The seed view exports the extracted text in its write shape.
+    var view = (try db.lookup(alloc, "doc:a", .{ .fields = &.{ "url", "_artifacts" }, .include_all_fields = false, .artifact_view = .seed })).?;
+    defer view.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, view.json, "\"extracted_text\":{\"value\":{\"text\":\"Previously extracted text about quarterly revenue.\"}}") != null);
+
+    // Resumed imports are idempotent, and planning reports them unchanged.
+    try expectSeedPlanOutcome(alloc, &db, "{\"inserts\":{\"doc:a\":" ++ seeded ++ "}}", "\"outcome\":\"unchanged\"");
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = seeded }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+}
+
+fn addSeedRoundTripTestIndexes(db: *DB) !void {
+    try db.addIndex(.{
+        .name = "dv_doc",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
+    });
+    try db.addIndex(.{
+        .name = "dv_chunks",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
+    });
+}
+
+fn collectEmbeddingArtifactsForTest(alloc: Allocator, db: *DB, doc_key: []const u8) !std.StringArrayHashMapUnmanaged([]f32) {
+    var out = std.StringArrayHashMapUnmanaged([]f32).empty;
+    errdefer {
+        for (out.keys(), out.values()) |key, vector| {
+            alloc.free(key);
+            alloc.free(vector);
+        }
+        out.deinit(alloc);
+    }
+    for ([_][]const u8{ "embedding", "chunk" }) |family| {
+        const prefix = try internal_keys.artifactTypePrefixAlloc(alloc, doc_key, family);
+        defer alloc.free(prefix);
+        const rows = try db.core.store.scanPrefix(alloc, prefix);
+        defer docstore_mod.DocStore.freeResults(alloc, rows);
+        for (rows) |row| {
+            const header = enrichment_artifact_codec.decodeHeader(row.value) catch continue;
+            if (header.kind != .dense_embedding) continue;
+            const vector = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, row.value);
+            errdefer alloc.free(vector);
+            const key = try alloc.dupe(u8, row.key);
+            errdefer alloc.free(key);
+            try out.put(alloc, key, vector);
+        }
+    }
+    return out;
+}
+
+fn freeEmbeddingArtifactsForTest(alloc: Allocator, map: *std.StringArrayHashMapUnmanaged([]f32)) void {
+    for (map.keys(), map.values()) |key, vector| {
+        alloc.free(key);
+        alloc.free(vector);
+    }
+    map.deinit(alloc);
+}
+
+test "db artifact seed view exports outputs that import into another table without inference" {
+    const alloc = std.testing.allocator;
+    var source_tmp = try TestDirectory.init("db");
+    defer source_tmp.cleanup();
+    const source_path = source_tmp.path().ptr;
+    defer cleanupTempDir(source_path);
+    var target_tmp = try TestDirectory.init("db");
+    defer target_tmp.cleanup();
+    const target_path = target_tmp.path().ptr;
+    defer cleanupTempDir(target_path);
+
+    var source_embedder = CountingDenseEmbedder{};
+    var source = try DB.open(alloc, std.mem.span(source_path), .{ .enrichment = .{ .owner_id = "worker-a", .dense_embedder = source_embedder.interface() } });
+    defer source.close();
+    try addSeedRoundTripTestIndexes(&source);
+    try source.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"abcdefghijklmno\"}" }}, .sync_level = .write });
+    try source.runUntilIdle();
+    try std.testing.expect(source_embedder.calls > 0);
+
+    var exported = (try source.lookup(alloc, "doc:a", .{
+        .fields = &.{ "title", "body", "_artifacts", "_chunks" },
+        .include_all_fields = false,
+        .artifact_view = .seed,
+    })).?;
+    defer exported.deinit(alloc);
+    // The seed view carries vectors and nothing descriptive or internal.
+    for ([_][]const u8{ "artifact_id", "status", "source_hash", "_parent_doc_key", "_artifact_name", "\"dims\"" }) |forbidden|
+        try std.testing.expect(std.mem.indexOf(u8, exported.json, forbidden) == null);
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, exported.json, .{});
+        defer parsed.deinit();
+        const artifacts = parsed.value.object.get("_artifacts").?.object;
+        try std.testing.expectEqual(@as(usize, 3), artifacts.get("body_dense_v1").?.object.get("value").?.array.items.len);
+        try std.testing.expect(artifacts.get("chunk_dense_v1").?.object.get("value").?.array.items.len > 0);
+    }
+
+    var target_embedder = CountingDenseEmbedder{};
+    var target = try DB.open(alloc, std.mem.span(target_path), .{ .enrichment = .{ .owner_id = "worker-a", .dense_embedder = target_embedder.interface() } });
+    defer target.close();
+    try addSeedRoundTripTestIndexes(&target);
+    try target.batch(.{ .writes = &.{.{ .key = "doc:a", .value = exported.json }}, .sync_level = .write });
+    try target.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 0), target_embedder.calls);
+
+    var expected = try collectEmbeddingArtifactsForTest(alloc, &source, "doc:a");
+    defer freeEmbeddingArtifactsForTest(alloc, &expected);
+    var actual = try collectEmbeddingArtifactsForTest(alloc, &target, "doc:a");
+    defer freeEmbeddingArtifactsForTest(alloc, &actual);
+    try std.testing.expect(expected.count() > 1);
+    try std.testing.expectEqual(expected.count(), actual.count());
+    for (expected.keys(), expected.values()) |key, vector| try std.testing.expectEqualSlices(f32, vector, actual.get(key).?);
+    try std.testing.expectEqual(@as(u64, 1), target.core.index_manager.denseIndex("dv_doc").?.index.metadata.active_count);
+
+    // A second export of the imported table is identical: the round trip is
+    // stable, so resumed migrations converge.
+    var reexported = (try target.lookup(alloc, "doc:a", .{ .fields = &.{ "title", "body", "_artifacts", "_chunks" }, .include_all_fields = false, .artifact_view = .seed })).?;
+    defer reexported.deinit(alloc);
+    try std.testing.expectEqualStrings(exported.json, reexported.json);
+
+    // A `null` seed drops accepted chunk-derived vectors; the producer
+    // regenerates them through ordinary replay.
+    try target.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"abcdefghijklmno\",\"_artifacts\":{\"chunk_dense_v1\":null}}" }}, .sync_level = .write });
+    try target.runUntilIdle();
+    try std.testing.expect(target_embedder.calls > 0);
+    var regenerated = try collectEmbeddingArtifactsForTest(alloc, &target, "doc:a");
+    defer freeEmbeddingArtifactsForTest(alloc, &regenerated);
+    try std.testing.expectEqual(expected.count(), regenerated.count());
 }
 
 test "db dense enrichment republishes unchanged source hash from cached artifact after index reset" {
@@ -142130,7 +142476,7 @@ test "db scan includes chunk artifacts when _chunks is requested" {
     try std.testing.expect(chunks[0].object.get("_artifact_name") == null);
 }
 
-test "db lookup does not load chunks for nested _chunks projection without explicit include-all selector" {
+test "db lookup loads chunks for a named nested _chunks projection" {
     const alloc = std.testing.allocator;
 
     var path_tmp = try TestDirectory.init("db");
@@ -142157,7 +142503,9 @@ test "db lookup does not load chunks for nested _chunks projection without expli
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.json, .{});
     defer parsed.deinit();
-    try std.testing.expect(parsed.value.object.get("_chunks") == null);
+    const chunks = parsed.value.object.get("_chunks").?.object.get("body_chunks_v1").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), chunks.len);
+    try std.testing.expectEqualStrings("hello", chunks[0].object.get("_content").?.string);
 }
 
 test "db lookup loads chunks for _chunks.* selector and allows nested projection" {
@@ -142304,7 +142652,7 @@ test "db scan includes embedding artifacts when _embeddings is requested" {
     try std.testing.expectEqual(@as(usize, 2), vector.len);
 }
 
-test "db lookup does not load embeddings for nested _embeddings projection without explicit include-all selector" {
+test "db lookup loads embeddings for a named _embeddings projection" {
     const alloc = std.testing.allocator;
 
     var path_tmp = try TestDirectory.init("db");
@@ -142331,7 +142679,8 @@ test "db lookup does not load embeddings for nested _embeddings projection witho
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.json, .{});
     defer parsed.deinit();
-    try std.testing.expect(parsed.value.object.get("_embeddings") == null);
+    const vector = parsed.value.object.get("_embeddings").?.object.get("body_dense_v1").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), vector.len);
 }
 
 test "db lookup loads embeddings for _embeddings.* selector and allows nested projection" {
@@ -142366,14 +142715,15 @@ test "db lookup loads embeddings for _embeddings.* selector and allows nested pr
     try expectJsonNumber(vector[0], 1);
 }
 
-test "db field selection plan only enables chunk special field for explicit include-all selectors" {
-    const none = db_query_projection.buildFieldSelectionPlan(&.{"_chunks.body_chunks_v1.0._content"}, false);
-    try std.testing.expect(!none.special.all_artifacts);
-    try std.testing.expect(!none.special.all_chunks);
-    try std.testing.expect(!none.special.all_embeddings);
+test "db field selection plan hydrates each reserved field for named and include-all selectors" {
+    // A named collection (`_chunks.<name>`, `_embeddings.<index>`) loads its
+    // reserved field exactly like the include-all forms (#1791).
+    const named = db_query_projection.buildFieldSelectionPlan(&.{"_chunks.body_chunks_v1.0._content"}, false);
+    try std.testing.expect(!named.special.all_artifacts);
+    try std.testing.expect(named.special.all_chunks);
+    try std.testing.expect(!named.special.all_embeddings);
 
-    // Named artifact projections request hydration directly. The legacy
-    // chunk/embedding aliases still require their explicit include-all form.
+    // Named artifact projections request hydration directly.
     const artifacts_nested = db_query_projection.buildFieldSelectionPlan(&.{"_artifacts.body_chunks_v1.items.0.value"}, false);
     try std.testing.expect(artifacts_nested.special.all_artifacts);
     try std.testing.expect(!artifacts_nested.special.all_chunks);
@@ -142400,10 +142750,10 @@ test "db field selection plan only enables chunk special field for explicit incl
     try std.testing.expect(!all_wildcard.special.all_embeddings);
     try std.testing.expectEqual(@as(usize, 2), all_wildcard.projection.fields.len);
 
-    const embedding_none = db_query_projection.buildFieldSelectionPlan(&.{"_embeddings.body_dense_v1"}, false);
-    try std.testing.expect(!embedding_none.special.all_artifacts);
-    try std.testing.expect(!embedding_none.special.all_chunks);
-    try std.testing.expect(!embedding_none.special.all_embeddings);
+    const embedding_named = db_query_projection.buildFieldSelectionPlan(&.{"_embeddings.body_dense_v1"}, false);
+    try std.testing.expect(!embedding_named.special.all_artifacts);
+    try std.testing.expect(!embedding_named.special.all_chunks);
+    try std.testing.expect(embedding_named.special.all_embeddings);
 
     const embedding_plain = db_query_projection.buildFieldSelectionPlan(&.{"_embeddings"}, false);
     try std.testing.expect(!embedding_plain.special.all_artifacts);

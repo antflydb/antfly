@@ -1394,8 +1394,22 @@ const RaftTableApplyStateMachine = struct {
         SourceCheckpointConflict,
         SourceTransactionIdentityConflict,
         SourceAlreadyCommitted,
+        // Artifact seeds (#1791) are validated against the committed catalog
+        // and stored outputs in deterministic apply; a rejection advances the
+        // entry on every replica alike.
+        InvalidArtifactSeed,
+        UnknownArtifactSeed,
+        ArtifactSeedNotAccepted,
+        ArtifactSeedDocumentNotFound,
+        ArtifactSeedSourceBindingRequired,
+        ArtifactSeedConflict,
+        ArtifactSeedMissing,
+        ArtifactSeedSourceMismatch,
 
         fn fromError(err: anyerror) ?ExpectedApplyFailure {
+            inline for (@typeInfo(@import("antfly_local_sources").storage_db_artifact_seeds.Error).error_set.error_names.?) |field| {
+                if (err == @field(@import("antfly_local_sources").storage_db_artifact_seeds.Error, field)) return @field(ExpectedApplyFailure, field);
+            }
             inline for (@typeInfo(@import("antfly_local_sources").storage_db_online_source_contract.Rejection).error_set.error_names.?) |field| {
                 if (err == @field(@import("antfly_local_sources").storage_db_online_source_contract.Rejection, field)) return @field(ExpectedApplyFailure, field);
             }
@@ -1470,6 +1484,9 @@ const RaftTableApplyStateMachine = struct {
         }
 
         fn toError(self: ExpectedApplyFailure) anyerror {
+            inline for (@typeInfo(@import("antfly_local_sources").storage_db_artifact_seeds.Error).error_set.error_names.?) |name| {
+                if (self == @field(ExpectedApplyFailure, name)) return @field(@import("antfly_local_sources").storage_db_artifact_seeds.Error, name);
+            }
             inline for (@typeInfo(@import("antfly_local_sources").storage_pessimistic_lock_control.Rejection).error_set.error_names.?) |name| {
                 if (self == @field(ExpectedApplyFailure, name)) return @field(@import("antfly_local_sources").storage_pessimistic_lock_control.Rejection, name);
             }

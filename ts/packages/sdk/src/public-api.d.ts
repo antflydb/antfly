@@ -11697,6 +11697,51 @@ export interface components {
             value?: unknown;
         };
         /**
+         * @description Rendering of selected `_artifacts` and `_chunks`. `seed` emits exactly
+         *     the artifact seed write shapes, vectors included, and omits descriptive
+         *     and internal fields. Outputs without a seed write shape (explicit
+         *     external vectors, sparse vectors, unit-scoped extraction children) are
+         *     omitted.
+         * @default descriptive
+         * @enum {string}
+         */
+        ArtifactView: "descriptive" | "seed";
+        /**
+         * @description What a seed does when the enrichment already has accepted output for
+         *     the same input (same source version, producer and configuration)
+         *     that differs from the seed. `keep` rejects the batch
+         *     (`ArtifactSeedConflict`); identical output is reported `unchanged`.
+         *     `replace` publishes the seed. A document or transform may set its own
+         *     policy with the reserved `_seed_conflict` member, which wins over the
+         *     request. During distributed transaction resolution a conflict never
+         *     fails: the existing output is kept.
+         * @default keep
+         * @enum {string}
+         */
+        SeedConflictPolicy: "keep" | "replace";
+        SeedOutcome: {
+            key: string;
+            /** @description Enrichment name. Absent for items rejected as a whole. */
+            name?: string;
+            /**
+             * @description - `accepted`: the seed becomes the output.
+             *     - `unchanged`: identical output is already accepted for this input.
+             *     - `conflict`: different output is already accepted (kept).
+             *     - `replaced`: different output is replaced by the seed.
+             *     - `deleted`: a `null` seed drops the accepted output.
+             *     - `missing`: no seed was supplied; the producer will run.
+             *     - `rejected`: the write would fail with `error`.
+             * @enum {string}
+             */
+            outcome: "accepted" | "unchanged" | "conflict" | "replaced" | "deleted" | "missing" | "rejected";
+            /** @enum {string} */
+            existing_origin?: "generated" | "seeded";
+            error?: string;
+        };
+        SeedPlanResponse: {
+            seeds: components["schemas"]["SeedOutcome"][];
+        };
+        /**
          * @description An already computed result for a named enrichment, written as
          *     `_artifacts.<name>` in a document or transform. The enrichment defines
          *     the output contract (content type, dimensions, vector space); the seed
@@ -11707,8 +11752,13 @@ export interface components {
          *     - Text asset: a string (`""` is a valid, complete empty result), or
          *       `{ "text": "..." }`.
          *     - JSON asset: any JSON value.
+         *     - Document extraction asset: `{ "text": "..." }`, the already
+         *       extracted plain text. No fetch, OCR or transcription runs; `source`
+         *       identifies the remote object it was extracted from.
          *     - Document embedding: an array of finite numbers.
          *     - Chunk-derived embedding: an array of `ChunkVectorSeed`.
+         *     - Sparse embedding: `{ "indices": [...], "values": [...] }` with
+         *       strictly ascending indices.
          *
          *     Descriptive read fields (`artifact_id`, `artifact_ref`, `kind`,
          *     `status`, `dims`, `items`, `content_type`) and internal routing
@@ -11866,6 +11916,7 @@ export interface components {
              *     ]
              */
             fields?: string[];
+            artifact_view?: components["schemas"]["ArtifactView"];
             /**
              * @description Structured subset of the Antfly query AST used to filter a primary-key
              *     scan. Only documents matching this query are included in results.
@@ -12132,6 +12183,17 @@ export interface components {
              *     ]
              */
             transforms?: components["schemas"]["Transform"][];
+            seed_conflict?: components["schemas"]["SeedConflictPolicy"];
+            /**
+             * @description Plan the batch's artifact seeds without writing anything. Each
+             *     seeded insert or transform is planned by its owning shard with the
+             *     write's exact producer preparation; the response (200,
+             *     `SeedPlanResponse`) reports one outcome per seeded output, and
+             *     items the write would reject are reported as `rejected` with the
+             *     error instead of failing the request.
+             * @default false
+             */
+            validate_only?: boolean;
             commit_requires?: components["schemas"]["CommitRequires"];
             sync_level?: components["schemas"]["SyncLevel"];
         };
@@ -19233,6 +19295,36 @@ export interface components {
             /** @description Snapshot sources only: rebuild interval (at least 1s). */
             refresh_interval?: string;
         };
+        /**
+         * @description Accepts an existing result for this enrichment from an ordinary field
+         *     of the written record instead of invoking its producer (artifact
+         *     seeding). The mapped field stays an ordinary document field; its value
+         *     is decoded like an explicit `_artifacts.<name>` or `_chunks.<name>`
+         *     seed and bound to the same source version. An explicit seed in the
+         *     write wins over the mapping. The mapping is not part of the
+         *     enrichment's artifact identity: adding or changing it never rebuilds
+         *     existing output.
+         */
+        EnrichmentSeedMapping: {
+            /** @description Dotted path of the record field holding the existing result. */
+            field: string;
+            /**
+             * @description How the field value is read. `text` and `json` are asset values,
+             *     `vector` is a dense document embedding, `chunk_vectors` is an array
+             *     of per-chunk vectors in chunk order, and `chunks` is an array of
+             *     `ChunkSeed`. `auto` infers the format from the enrichment kind.
+             * @default auto
+             * @enum {string}
+             */
+            format?: "auto" | "text" | "json" | "vector" | "chunk_vectors" | "chunks";
+            /**
+             * @description When the field is absent: `generate` runs the producer as usual;
+             *     `fail` rejects the write (`ArtifactSeedMissing`).
+             * @default generate
+             * @enum {string}
+             */
+            on_missing?: "generate" | "fail";
+        };
         /** @description Rebuild policy for context-source invalidation. Invalidation (stale freshness) is always reported immediately; debounce only coalesces rebuild work. */
         EnrichmentRefreshConfig: {
             /**
@@ -19379,6 +19471,7 @@ export interface components {
             context_sources?: {
                 [key: string]: components["schemas"]["EnrichmentContextSource"];
             };
+            seed?: components["schemas"]["EnrichmentSeedMapping"];
             refresh?: components["schemas"]["EnrichmentRefreshConfig"];
             /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
             execution?: components["schemas"]["ExecutionPolicy"];
@@ -37835,6 +37928,15 @@ export interface operations {
             };
         };
         responses: {
+            /** @description Validation-only seed plan (`validate_only` set); nothing was written. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SeedPlanResponse"];
+                };
+            };
             /** @description Batch operation successful */
             201: {
                 headers: {
@@ -38212,6 +38314,15 @@ export interface operations {
                  * @example title,author,metadata.tags
                  */
                 fields?: string;
+                /**
+                 * @description How selected `_artifacts` and `_chunks` render. `descriptive` (the
+                 *     default) returns artifact metadata. `seed` returns exactly the
+                 *     artifact seed write shapes (`ArtifactSeed`, `ChunkSeed`), vectors
+                 *     included, so the response can be written into another table to
+                 *     publish the same outputs without invoking producers. Example:
+                 *     `fields=*,_artifacts,_chunks&artifact_view=seed`.
+                 */
+                artifact_view?: components["schemas"]["ArtifactView"];
                 /**
                  * @description Read consistency for the lookup. The default `read_index` routes to
                  *     the primary for linearizable reads. `stale` allows a hot standby to

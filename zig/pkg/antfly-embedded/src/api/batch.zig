@@ -112,6 +112,12 @@ pub fn parseBatchValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedBa
     if (root.get("graph_deletes")) |item| if (item != .null) {
         owned.graph_deletes = try parseGraphDeletes(alloc, item);
     };
+    if (root.get("seed_conflict")) |item| if (item != .null) {
+        if (item != .string) return error.InvalidBatchRequest;
+        if (std.mem.eql(u8, item.string, "replace")) {
+            try applyReplaceSeedConflict(alloc, &owned);
+        } else if (!std.mem.eql(u8, item.string, "keep")) return error.InvalidBatchRequest;
+    };
     const sync_level = if (root.get("sync_level")) |item| if (item == .null) mutation.SyncLevel.propose else try syncLevelFromValue(item) else mutation.SyncLevel.propose;
     owned.req = .{ .writes = owned.writes, .deletes = owned.deletes, .transforms = owned.transforms, .graph_writes = owned.graph_writes, .graph_deletes = owned.graph_deletes, .sync_level = sync_level, .commit_requires = if (root.get("commit_requires")) |item| try mutation.parseCommitRequires(item) else null };
     for (owned.writes) |write| if (isReservedControlKey(write.key)) return error.InvalidBatchRequest;
@@ -373,6 +379,63 @@ fn parseGraphDeletes(alloc: std.mem.Allocator, value: std.json.Value) ![]mutatio
     return deletes;
 }
 
+/// Lowers request-level `seed_conflict: replace` into the per-document
+/// `_seed_conflict` member so the policy travels with the seeds through
+/// replication and 2PC. A document's own `_seed_conflict` wins. `keep` is the
+/// default and needs no lowering.
+fn applyReplaceSeedConflict(alloc: std.mem.Allocator, owned: *OwnedBatchRequest) !void {
+    for (owned.writes) |*write| {
+        if (std.mem.indexOf(u8, write.value, "_artifacts") == null and std.mem.indexOf(u8, write.value, "_chunks") == null) continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, write.value, .{ .parse_numbers = false }) catch return error.InvalidBatchRequest;
+        defer parsed.deinit();
+        if (parsed.value != .object) continue;
+        const object = &parsed.value.object;
+        if (!object.contains("_artifacts") and !object.contains("_chunks")) continue;
+        if (object.contains("_seed_conflict")) continue;
+        try object.put(parsed.arena.allocator(), "_seed_conflict", .{ .string = "replace" });
+        const encoded = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+        alloc.free(@constCast(write.value));
+        write.value = encoded;
+    }
+    for (owned.transforms) |*transform| {
+        var seeds = false;
+        for (transform.operations) |operation| {
+            const path = if (std.mem.startsWith(u8, operation.path, "$.")) operation.path[2..] else operation.path;
+            if (std.mem.eql(u8, path, "_seed_conflict")) {
+                seeds = false;
+                break;
+            }
+            if (std.mem.startsWith(u8, path, "_artifacts.") or std.mem.startsWith(u8, path, "_chunks.")) seeds = true;
+        }
+        if (!seeds) continue;
+        const operations = try alloc.alloc(mutation.TransformOp, transform.operations.len + 1);
+        errdefer alloc.free(operations);
+        const path = try alloc.dupe(u8, "_seed_conflict");
+        errdefer alloc.free(path);
+        const value_json = try alloc.dupe(u8, "\"replace\"");
+        @memcpy(operations[0..transform.operations.len], transform.operations);
+        operations[transform.operations.len] = .{ .op = .set, .path = path, .value_json = value_json };
+        if (transform.operations.len > 0) alloc.free(@constCast(transform.operations));
+        transform.operations = operations;
+    }
+}
+
+test "public seed_conflict replace lowers into seeded documents and seed transforms" {
+    const a = std.testing.allocator;
+    var owned = try parseBatchRequest(a,
+        \\{"seed_conflict":"replace","inserts":{"a":{"t":1,"_artifacts":{"s":{"value":"x"}}},"b":{"t":2}},"transforms":[{"key":"a","expected_version":"3","operations":[{"op":"$set","path":"_chunks.c","value":[]}]}]}
+    );
+    defer owned.deinit(a);
+    var seeded: usize = 0;
+    for (owned.writes) |write| {
+        if (std.mem.indexOf(u8, write.value, "\"_seed_conflict\":\"replace\"") != null) seeded += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), seeded);
+    try std.testing.expectEqual(@as(usize, 2), owned.transforms[0].operations.len);
+    try std.testing.expectEqualStrings("_seed_conflict", owned.transforms[0].operations[1].path);
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(a, "{\"seed_conflict\":\"merge\"}"));
+}
+
 /// `expected_version` preconditions of already validated transforms. A
 /// transform whose every operation writes an artifact seed has no source
 /// fields of its own and must name the source version its seeds bind to.
@@ -401,7 +464,7 @@ fn parseExpectedVersions(alloc: std.mem.Allocator, value: std.json.Value) ![]Exp
         const seed_only = for (operations) |operation| {
             const path = operation.object.get("path").?.string;
             const normalized = if (std.mem.startsWith(u8, path, "$.")) path[2..] else path;
-            if (!std.mem.startsWith(u8, normalized, "_artifacts.") and !std.mem.startsWith(u8, normalized, "_chunks.")) break false;
+            if (!std.mem.startsWith(u8, normalized, "_artifacts.") and !std.mem.startsWith(u8, normalized, "_chunks.") and !std.mem.eql(u8, normalized, "_seed_conflict")) break false;
         } else true;
         if (seed_only) return error.ArtifactSeedSourceBindingRequired;
     }

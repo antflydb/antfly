@@ -1419,6 +1419,8 @@ components:
             $ref: "#/components/schemas/EnrichmentContextSource"
           maxProperties: 16
           description: "Named cross-document context consumed by this asset producer, rendered as a canonical `{\"context\":{<name>:...}}` block appended to the producer input and folded into its skip state. Changes to consumed inputs (projected fields, query membership, insertion of a first match, deletion, TTL expiry, or a missing optional document becoming present) invalidate and rebuild the artifact; unrelated rows and unconsumed fields do not. Only valid on asset enrichments whose producer consumes prompt text. Supported by embedded runtimes (single-table and multi-table Lite) and by distributed tables, where context sources are declared through the artifact enrichment endpoint (not inline at table creation) and admission resolves table names and rejects cross-table generated-input cycles. Context reads execute as the declaring principal: it must be able to read every source table, and its row filter on each is conjoined into query sources (filters, traversals, and ranked queries) at declaration (document sources, ranked graph operations, and the `text`/`vector` shorthands are refused where a row filter applies). Re-declare the enrichment to re-capture changed policies."
+        seed:
+          $ref: "#/components/schemas/EnrichmentSeedMapping"
         refresh:
           $ref: "#/components/schemas/EnrichmentRefreshConfig"
         execution:
@@ -1427,6 +1429,40 @@ components:
         transcriber:
           $ref: "#/components/schemas/TranscriberEnrichmentConfig"
           description: "Typed shorthand for a transcription asset enrichment. Only valid with kind=asset and without producer_json; Antfly expands it into a document_extraction producer whose audio route transcribes each recording with this speech-to-text provider. The produced units carry the transcript text, provider confidence, and per-phrase time offsets, and chunk enrichments that consume them emit _start_time_ms/_end_time_ms on every chunk. With diarization: true the phrases also carry who spoke them, and a chunk that does not straddle a turn emits _speaker. content_type defaults to application/json."
+    EnrichmentSeedMapping:
+      type: object
+      additionalProperties: false
+      required: [field]
+      description: |
+        Accepts an existing result for this enrichment from an ordinary field
+        of the written record instead of invoking its producer (artifact
+        seeding). The mapped field stays an ordinary document field; its value
+        is decoded like an explicit `_artifacts.<name>` or `_chunks.<name>`
+        seed and bound to the same source version. An explicit seed in the
+        write wins over the mapping. The mapping is not part of the
+        enrichment's artifact identity: adding or changing it never rebuilds
+        existing output.
+      properties:
+        field:
+          type: string
+          minLength: 1
+          description: Dotted path of the record field holding the existing result.
+        format:
+          type: string
+          enum: [auto, text, json, vector, chunk_vectors, chunks]
+          default: auto
+          description: |
+            How the field value is read. `text` and `json` are asset values,
+            `vector` is a dense document embedding, `chunk_vectors` is an array
+            of per-chunk vectors in chunk order, and `chunks` is an array of
+            `ChunkSeed`. `auto` infers the format from the enrichment kind.
+        on_missing:
+          type: string
+          enum: [generate, fail]
+          default: generate
+          description: |
+            When the field is absent: `generate` runs the producer as usual;
+            `fail` rejects the write (`ArtifactSeedMissing`).
     GroupedArtifactSource:
       type: object
       additionalProperties: false

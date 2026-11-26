@@ -52,10 +52,18 @@ pub const SpecialFieldLoader = struct {
         alloc: Allocator,
         doc_key: []const u8,
     ) anyerror!?std.json.Value,
+    /// Seed view (`artifact_view=seed`): `{ "_artifacts", "_chunks" }` in the
+    /// write shapes. Readers without it reject the view instead of degrading.
+    load_seed_view: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        doc_key: []const u8,
+    ) anyerror!?std.json.Value = null,
 };
 
 pub fn buildLookupFieldSelectionPlan(opts: types.LookupOptions) FieldSelectionPlan {
     var plan = buildFieldSelectionPlan(opts.fields, opts.include_all_fields);
+    plan.projection.artifact_view = opts.artifact_view;
     plan.projection.output_exact = opts.output_exact;
     plan.projection.cypher_presence_fields = opts.cypher_presence_fields;
     plan.projection.cypher_projection_json = opts.cypher_projection_json;
@@ -244,8 +252,23 @@ fn projectWithSelectionAndOutput(alloc: Allocator, output: Allocator, doc_key: [
     var values: [3]?std.json.Value = @splat(null);
     defer for (&values) |*value| if (value.*) |*owned| freeJsonValue(alloc, owned);
     const names = [_][]const u8{ "_artifacts", "_chunks", "_embeddings" };
-    if (selection.special.all_artifacts) values[0] = try loader.load_artifacts(loader.ctx, alloc, doc_key);
-    if (selection.special.all_chunks) values[1] = try loader.load_chunks(loader.ctx, alloc, doc_key);
+    if (selection.projection.artifact_view == .seed and (selection.special.all_artifacts or selection.special.all_chunks)) {
+        const load_seed_view = loader.load_seed_view orelse return error.UnsupportedArtifactView;
+        if (try load_seed_view(loader.ctx, alloc, doc_key)) |loaded| {
+            var view = loaded;
+            defer freeJsonValue(alloc, &view);
+            for (names[0..2], 0..) |name, i| {
+                const selected = if (i == 0) selection.special.all_artifacts else selection.special.all_chunks;
+                if (!selected) continue;
+                const member = view.object.fetchSwapRemove(name) orelse continue;
+                alloc.free(member.key);
+                values[i] = member.value;
+            }
+        }
+    } else {
+        if (selection.special.all_artifacts) values[0] = try loader.load_artifacts(loader.ctx, alloc, doc_key);
+        if (selection.special.all_chunks) values[1] = try loader.load_chunks(loader.ctx, alloc, doc_key);
+    }
     var stream: ?EmbeddingStream = null;
     defer if (stream) |*fields| fields.deinit();
     var compact: ?EmbeddingFields = null;

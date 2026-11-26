@@ -7334,9 +7334,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             preparation_memo: *GeneratedEmbeddingMemo,
             precompute_mode: execution_resources.GeneratedPrecomputeMode,
             pending_child_work: *bool,
+            /// Artifact seed for a document extraction asset: plain text that
+            /// replaces fetching and OCR (`artifact_seeds.zig`).
+            extraction_seed: ?ExtractionSeed,
         ) !void {
             var producer_cfg = try asset_producer_mod.parseProducerConfig(alloc, request.producer_json);
             defer producer_cfg.deinit(alloc);
+            if (extraction_seed != null and producer_cfg.type != .document_extraction) return error.InvalidArgument;
 
             const artifact_name = requestArtifactName(request);
             const key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", artifact_name);
@@ -7402,6 +7406,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             if (source_text == null or source_text.?.len == 0) {
                 if (source_text) |s| alloc.free(s);
+                // A seed binds to a source; without one there is nothing to bind.
+                if (extraction_seed != null) return error.ArtifactSeedNotAccepted;
                 try appendFullTextDeleteDocument(alloc, documents, key, text_indexes);
                 if (producer_cfg.type == .document_extraction) {
                     try appendDocumentExtractionDeleteKeys(alloc, db, &document_extraction_view, request.doc_key, artifact_name, key, artifact_delete_keys);
@@ -7435,6 +7441,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     force_reprocess,
                     document_execution,
                     preparation_memo,
+                    extraction_seed,
                 );
                 var selected_manifest: ?[]const u8 = null;
                 var i = artifact_writes.items.len;
@@ -7956,7 +7963,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             artifact_writes: anytype,
             dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
             memo: ?*GeneratedEmbeddingMemo,
-        ) !void {
+            policy: artifact_seeds.ConflictPolicy,
+            binding: ?artifact_seeds.Source,
+        ) !artifact_seeds.Result {
             if (requestUsesChunkSource(request)) return error.InvalidArgument;
             const resolved = try seedEmbedder(db, artifact_writes);
             const embedding_name = requestEmbeddingName(request);
@@ -7967,7 +7976,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const generation = if (memo) |cache_memo| try cache_memo.generation(resolved.embedder, embedding_name) else try resolved.embedder.captureTextGeneration(alloc, embedding_name);
 
             // Mirror computeDenseRequestImpl's input identity for each source form.
-            const source_hash: u64 = hash: {
+            const source_hash: ?u64 = hash: {
                 if (request.source_template.len > 0 and resolved.embedder.supportsParts()) {
                     if (try renderSourceParts(alloc, db, doc_value, request, resolved.embedder.mediaPartLimit(embedding_name))) |parts| {
                         defer template_mod.freeContentParts(alloc, parts);
@@ -7991,9 +8000,114 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (text.len == 0) return error.ArtifactSeedNotAccepted;
                 break :hash enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, text, generation.revision);
             };
+            try artifact_seeds.requireSourceHash(binding, source_hash);
+            const existing_key = try embeddingArtifactKeyForBaseAlloc(alloc, request.doc_key, embedding_name);
+            defer alloc.free(existing_key);
+            const decision = seedDecision(try seededDenseExisting(alloc, db, existing_key, source_hash, vector), policy);
+            if (decision.outcome == .unchanged or decision.outcome == .conflict) {
+                // Existing accepted output stays; consumers attach to it.
+                try appendDerivedDenseEmbeddingForConsumers(alloc, dense_embeddings, request.doc_key, null, existing_key, &.{}, consumer_indexes);
+                return decision;
+            }
             const artifact_key = try appendEmbeddingArtifactWrite(alloc, artifact_writes, request.doc_key, request.doc_key, embedding_name, request.source_field, null, .{ .seeded = source_hash }, vector);
             defer alloc.free(artifact_key);
             try appendDerivedDenseEmbeddingForConsumers(alloc, dense_embeddings, request.doc_key, null, artifact_key, vector, consumer_indexes);
+            return decision;
+        }
+
+        /// Compares a seed with output already stored under `artifact_key`.
+        /// Only output accepted for the same input identity can conflict;
+        /// output for another input is stale and the seed simply replaces it.
+        fn seededDenseExisting(alloc: Allocator, db: anytype, artifact_key: []const u8, source_hash: ?u64, vector: []const f32) !?artifact_seeds.Result {
+            const raw = (try S.ownerField(db, "core").*.getStoreValue(alloc, artifact_key)) orelse return null;
+            defer alloc.free(raw);
+            const header = enrichment_artifact_codec.decodeHeader(raw) catch return null;
+            if (header.kind != .dense_embedding) return null;
+            const origin: artifact_seeds.Origin = if (header.flags.authored) .external else if (header.flags.seeded) .seeded else .generated;
+            if (!header.flags.authored) {
+                const expected = source_hash orelse return null;
+                if (!header.flags.has_source_hash or header.source_hash != expected) return null;
+            }
+            const existing = enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, raw) catch
+                return .{ .outcome = .conflict, .existing_origin = origin };
+            defer alloc.free(existing);
+            if (std.mem.eql(f32, existing, vector)) return .{ .outcome = .unchanged, .existing_origin = origin };
+            return .{ .outcome = .conflict, .existing_origin = origin };
+        }
+
+        /// Applies the policy to a comparison: identical output is kept as is,
+        /// a differing one is kept (`keep`, reported as conflict) or replaced.
+        fn seedDecision(existing: ?artifact_seeds.Result, policy: artifact_seeds.ConflictPolicy) artifact_seeds.Result {
+            const found = existing orelse return .{ .outcome = .accepted };
+            if (found.outcome == .conflict and policy == .replace) return .{ .outcome = .replaced, .existing_origin = found.existing_origin };
+            return found;
+        }
+
+        /// Seeded document-level sparse vector, bound like generated output to
+        /// the source text at the sparse contract's provider revision.
+        pub fn computeSeededSparseRequestDerived(
+            alloc: Allocator,
+            db: anytype,
+            doc_value: []const u8,
+            request: enrichment_types.GeneratedEnrichmentRequest,
+            seed_value: std.json.Value,
+            artifact_writes: anytype,
+            sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
+            memo: ?*GeneratedEmbeddingMemo,
+            policy: artifact_seeds.ConflictPolicy,
+            binding: ?artifact_seeds.Source,
+        ) !artifact_seeds.Result {
+            // Chunk-derived sparse vectors bind per chunk; not seedable yet.
+            if (requestUsesChunkSource(request)) return error.ArtifactSeedNotAccepted;
+            const runtime = S.ownerField(db, "enrichment_runtime").* orelse return error.ArtifactSeedNotAccepted;
+            var sparse_embedder = (runtime.config.sparse_embedder orelse return error.ArtifactSeedNotAccepted).withRequestContext(requestContext(artifact_writes));
+            const embedding_name = requestEmbeddingName(request);
+            const generation = if (memo) |cache_memo| try cache_memo.sparseGeneration(sparse_embedder, embedding_name) else try sparse_embedder.captureGeneration(alloc, embedding_name);
+            sparse_embedder = sparse_embedder.withGeneration(generation);
+            const revision = if (memo) |cache_memo| try cache_memo.sparseRevision(sparse_embedder, embedding_name) else try sparse_embedder.captureRevision(alloc, embedding_name);
+            const consumer_indexes: []const []const u8 = request.consumer_indexes;
+            if (consumer_indexes.len == 0) return error.ArtifactSeedNotAccepted;
+            const sparse = try artifact_seeds.decodeSparseVectorAlloc(alloc, seed_value);
+            defer sparse.deinit(alloc);
+            const source_text = if (request.source_template.len > 0)
+                renderSourceTemplateText(alloc, db, request.source_template, doc_value) catch |err| switch (err) {
+                    error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                    else => null,
+                }
+            else
+                try extractStringField(alloc, doc_value, request.source_field);
+            const text = source_text orelse return error.ArtifactSeedNotAccepted;
+            defer alloc.free(text);
+            if (text.len == 0) return error.ArtifactSeedNotAccepted;
+            const source_hash = enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, text, revision);
+            try artifact_seeds.requireSourceHash(binding, source_hash);
+
+            const existing_key = try embeddingArtifactKeyForBaseAlloc(alloc, request.doc_key, embedding_name);
+            defer alloc.free(existing_key);
+            const existing: ?artifact_seeds.Result = existing: {
+                const raw = (try S.ownerField(db, "core").*.getStoreValue(alloc, existing_key)) orelse break :existing null;
+                defer alloc.free(raw);
+                const header = enrichment_artifact_codec.decodeHeader(raw) catch break :existing null;
+                if (header.kind != .sparse_embedding) break :existing null;
+                const origin: artifact_seeds.Origin = if (header.flags.authored) .external else .generated;
+                if (!header.flags.authored and (!header.flags.has_source_hash or header.source_hash != source_hash)) break :existing null;
+                const stored = enrichment_artifact_codec.decodeSparseEmbeddingAlloc(alloc, raw) catch break :existing .{ .outcome = .conflict, .existing_origin = origin };
+                defer alloc.free(stored.indices);
+                defer alloc.free(stored.values);
+                break :existing .{
+                    .outcome = if (std.mem.eql(u32, stored.indices, sparse.indices) and std.mem.eql(f32, stored.values, sparse.values)) .unchanged else .conflict,
+                    .existing_origin = origin,
+                };
+            };
+            const decision = seedDecision(existing, policy);
+            if (decision.outcome == .unchanged or decision.outcome == .conflict) {
+                try appendDerivedSparseEmbeddingForConsumers(alloc, sparse_embeddings, request.doc_key, existing_key, &.{}, &.{}, consumer_indexes);
+                return decision;
+            }
+            const artifact_key = try appendSparseEmbeddingArtifactWrite(alloc, artifact_writes, request.doc_key, embedding_name, .{ .seeded = source_hash }, sparse.indices, sparse.values);
+            defer alloc.free(artifact_key);
+            try appendDerivedSparseEmbeddingForConsumers(alloc, sparse_embeddings, request.doc_key, artifact_key, sparse.indices, sparse.values, consumer_indexes);
+            return decision;
         }
 
         fn seededChunkIdentity(key: []const u8) ?struct { chunk_id: u32, window: u32 } {
@@ -8017,8 +8131,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
             cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
             memo: ?*GeneratedEmbeddingMemo,
-        ) !void {
+            policy: artifact_seeds.ConflictPolicy,
+            binding: ?artifact_seeds.Source,
+        ) !artifact_seeds.Result {
             if (!requestUsesChunkSource(request)) return error.InvalidArgument;
+            try artifact_seeds.rejectSourceHash(binding);
             const resolved = try seedEmbedder(db, artifact_writes);
             const embedding_name = requestEmbeddingName(request);
             const consumer_indexes: []const []const u8 = request.consumer_indexes;
@@ -8074,6 +8191,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .document => unreachable,
             }
 
+            var result: ?artifact_seeds.Result = null;
             const used = try alloc.alloc(bool, seeds.len);
             defer alloc.free(used);
             @memset(used, false);
@@ -8114,6 +8232,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, source.text, generation.revision)
                 else
                     enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
+                const existing_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
+                defer alloc.free(existing_key);
+                const decision = seedDecision(try seededDenseExisting(alloc, db, existing_key, source_hash, vector), policy);
+                result = if (result) |prior| prior.merge(decision) else decision;
+                if (decision.outcome == .unchanged or decision.outcome == .conflict) {
+                    try appendDerivedDenseEmbeddingForConsumers(alloc, dense_embeddings, source.key, request.doc_key, existing_key, &.{}, consumer_indexes);
+                    continue;
+                }
                 const artifact_key = try appendEmbeddingArtifactWrite(alloc, artifact_writes, source.key, request.doc_key, embedding_name, request.source_field, source.key, .{ .seeded = source_hash }, vector);
                 defer alloc.free(artifact_key);
                 try appendDerivedDenseEmbeddingForConsumers(alloc, dense_embeddings, source.key, request.doc_key, artifact_key, vector, consumer_indexes);
@@ -8135,6 +8261,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 start = end;
             }
             try resolved.embedder.requireTextGeneration(alloc, embedding_name, generation);
+            return result orelse .{ .outcome = .accepted };
         }
 
         /// Installs seeded chunks as this document revision's chunker output
@@ -8203,7 +8330,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             artifact_delete_keys: anytype,
             documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
             coverage_outcomes: *std.ArrayListUnmanaged(PrecomputedCoverageOutcome),
-        ) !void {
+            policy: artifact_seeds.ConflictPolicy,
+            binding: ?artifact_seeds.Source,
+        ) !artifact_seeds.Result {
+            try artifact_seeds.rejectSourceHash(binding);
             var producer_cfg = try asset_producer_mod.parseProducerConfig(alloc, request.producer_json);
             defer producer_cfg.deinit(alloc);
             // `copy` is free to regenerate. Document extraction publishes a
@@ -8255,10 +8385,80 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const json_content = @import("document_collectors.zig").assetContentTypeIsJson(request.content_type);
             const bytes = try artifact_seeds.assetBytesAlloc(alloc, seed_value, json_content);
             defer alloc.free(bytes);
-            try appendPreparedArtifactCopy(alloc, artifact_writes, key, bytes);
-            try appendInlineFullTextDocument(alloc, documents, key, bytes, request.consumer_indexes);
+            // Output accepted for this same input is recorded by its state.
+            const existing: ?artifact_seeds.Result = existing: {
+                const stored_state = (try S.ownerField(db, "core").*.getStoreValue(alloc, state_key)) orelse break :existing null;
+                defer alloc.free(stored_state);
+                if (!std.mem.eql(u8, stored_state, state_value)) break :existing null;
+                const stored = (try S.ownerField(db, "core").*.getStoreValue(alloc, key)) orelse break :existing null;
+                defer alloc.free(stored);
+                // Asset rows carry no origin; a matching state means the
+                // producer (or an earlier seed) accepted output for it.
+                break :existing .{ .outcome = if (std.mem.eql(u8, stored, bytes)) .unchanged else .conflict, .existing_origin = .generated };
+            };
+            const decision = seedDecision(existing, policy);
+            const value = if (decision.outcome == .unchanged or decision.outcome == .conflict) blk: {
+                break :blk (try S.ownerField(db, "core").*.getStoreValue(alloc, key)).?;
+            } else try alloc.dupe(u8, bytes);
+            defer alloc.free(value);
+            try appendPreparedArtifactCopy(alloc, artifact_writes, key, value);
+            try appendInlineFullTextDocument(alloc, documents, key, value, request.consumer_indexes);
             try appendPrecomputedArtifactCoverageOutcomes(db, alloc, coverage_outcomes, request, .produced);
             try appendPreparedArtifactCopy(alloc, artifact_writes, state_key, state_value);
+            try appendSeededLocalPublicationReceipt(alloc, db, artifact_writes, request, key, if (S.ownerField(db, "core").*.index_manager.artifactFeedsGraph(artifact_name)) doc_value else text, value);
+            return decision;
+        }
+
+        /// Accepted seed output is reusable by the local maintenance worker
+        /// exactly as producer output is: record the same publication receipt
+        /// (`recipe || sha256(parent) || sha256(output)`) the worker writes,
+        /// so a later replay of the document skips the producer for it.
+        fn appendSeededLocalPublicationReceipt(alloc: Allocator, db: anytype, artifact_writes: anytype, request: enrichment_types.GeneratedEnrichmentRequest, artifact_key: []const u8, parent: []const u8, output: []const u8) !void {
+            {
+                var read = try S.ownerField(db, "core").*.store.beginProbeTxn();
+                defer read.abort();
+                if (try @import("../source_authority.zig").maintenanceMode(&read) != .local) return;
+            }
+            const local = @import("artifact_local_publication.zig");
+            const receipt_key = try local.key(alloc, artifact_key);
+            defer alloc.free(receipt_key);
+            const receipt = local.encode(local.requestRecipe(request), parent, output);
+            try appendPreparedArtifactCopy(alloc, artifact_writes, receipt_key, &receipt);
+        }
+
+        /// Plain-text seed for a document extraction asset.
+        pub const ExtractionSeed = struct {
+            text: []const u8,
+            source: ?artifact_seeds.Source = null,
+            policy: artifact_seeds.ConflictPolicy = .keep,
+            result: *artifact_seeds.Result,
+        };
+
+        fn seededExtractionFingerprintAlloc(alloc: Allocator, source_url: []const u8, config_json: []const u8, seed: ExtractionSeed) ![]u8 {
+            var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+            const parts = [_][]const u8{ "antfly-seeded-extraction-v1", source_url, config_json };
+            for (parts) |part| {
+                var length: [8]u8 = undefined;
+                std.mem.writeInt(u64, &length, part.len, .little);
+                hasher.update(&length);
+                hasher.update(part);
+            }
+            if (seed.source) |source| {
+                if (source.generation) |generation| {
+                    hasher.update("generation");
+                    hasher.update(generation);
+                }
+                if (source.sha256) |digest| {
+                    hasher.update("sha256");
+                    hasher.update(digest);
+                }
+            }
+            // Identical seeds are idempotent; a different text is new output.
+            hasher.update("text");
+            hasher.update(seed.text);
+            var digest: [32]u8 = undefined;
+            hasher.final(&digest);
+            return try std.fmt.allocPrint(alloc, "seed-sha256:{x}", .{&digest});
         }
 
         fn reuseDocumentExtractionByFingerprint(
@@ -8305,6 +8505,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             force_reprocess: bool,
             document_execution: ?*enrichment_runtime_mod.PrecommitDocumentExecution,
             preparation_memo: *GeneratedEmbeddingMemo,
+            extraction_seed: ?ExtractionSeed,
         ) !void {
             const artifact_name = requestArtifactName(request);
             var config = try document_extraction_mod.parseConfig(alloc, config_json);
@@ -8347,7 +8548,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // metadata-only legacy fingerprints cannot prove that provenance.
             if (!must_force) {
                 if (metadata_fingerprint) |fingerprint| {
-                    if (try reuseDocumentExtractionByFingerprint(alloc, db, request.doc_key, artifact_name, fingerprint, existing_state, existing_manifest, manifest_key, from_generation, artifact_writes, artifact_delete_keys)) return;
+                    // Complete output already accepted for this declared source
+                    // identity: a seed keeps it (`keep`, reported as conflict)
+                    // or replaces it; generation simply reuses it.
+                    const keep = if (extraction_seed) |seed| seed.policy == .keep else true;
+                    if (keep and try reuseDocumentExtractionByFingerprint(alloc, db, request.doc_key, artifact_name, fingerprint, existing_state, existing_manifest, manifest_key, from_generation, artifact_writes, artifact_delete_keys)) {
+                        if (extraction_seed) |seed| seed.result.* = .{ .outcome = .conflict, .existing_origin = .generated };
+                        return;
+                    }
+                    if (extraction_seed) |seed| if (existing_state != null and documentExtractionStateFingerprintMatches(alloc, existing_state.?, fingerprint)) {
+                        seed.result.* = .{ .outcome = .replaced, .existing_origin = .generated };
+                    };
                 }
             }
 
@@ -8387,7 +8598,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 try context.check();
             }
-            const fetched = template_remote.downloadRemoteContentOutcomeAllocWithRenderConfig(
+            const DownloadOutcome = @typeInfo(@typeInfo(@TypeOf(template_remote.downloadRemoteContentOutcomeAllocWithRenderConfig)).@"fn".return_type.?).error_union.payload;
+            // A text seed stands in for the fetched bytes as plain text: the
+            // native text route builds units, manifest and children, with no
+            // fetch and no OCR or transcription.
+            const fetched: DownloadOutcome = if (extraction_seed) |seed| .{ .ok = .{
+                .content_type = try extraction_alloc.dupe(u8, "text/plain"),
+                .data = try extraction_alloc.dupe(u8, seed.text),
+            } } else template_remote.downloadRemoteContentOutcomeAllocWithRenderConfig(
                 extraction_alloc,
                 source_control,
                 source_url,
@@ -8420,7 +8638,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // referenced. downloaded_mut.data is already fully buffered by
             // this path, so hashing it here adds no additional buffering,
             // only an extra pass over memory already resident.
-            if (config.checksum_algorithm != null and config.checksum.len > 0) {
+            // A declared checksum names the source bytes, not the seeded text.
+            if (extraction_seed == null and config.checksum_algorithm != null and config.checksum.len > 0) {
                 var content_digest: [32]u8 = undefined;
                 std.crypto.hash.sha2.Sha256.hash(downloaded_mut.data, &content_digest, .{});
                 document_extraction_mod.verifyChecksumDigest(config, &content_digest) catch |raw_err| {
@@ -8429,21 +8648,35 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 };
             }
 
-            const byte_source_fingerprint = if (metadata_fingerprint == null)
-                try document_extraction_mod.downloadedMetadataFingerprintAlloc(alloc, source_url, config_json, config, downloaded_mut.content_type) orelse try document_extraction_mod.contentFingerprintAlloc(alloc, source_url, config_json, config, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data)
+            const byte_source_fingerprint = if (metadata_fingerprint != null)
+                null
+            else if (extraction_seed) |seed|
+                // Without declared source identity the seed binds to the
+                // caller's remote identity (generation, digest) or, failing
+                // that, to its own text. A mutable URL alone is no identity.
+                try seededExtractionFingerprintAlloc(alloc, source_url, config_json, seed)
             else
-                null;
+                try document_extraction_mod.downloadedMetadataFingerprintAlloc(alloc, source_url, config_json, config, downloaded_mut.content_type) orelse try document_extraction_mod.contentFingerprintAlloc(alloc, source_url, config_json, config, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data);
             defer if (byte_source_fingerprint) |fingerprint| alloc.free(fingerprint);
             const source_fingerprint = metadata_fingerprint orelse byte_source_fingerprint.?;
 
-            if (metadata_fingerprint == null and !must_force and
-                try reuseDocumentExtractionByFingerprint(alloc, db, request.doc_key, artifact_name, source_fingerprint, existing_state, existing_manifest, manifest_key, from_generation, artifact_writes, artifact_delete_keys)) return;
+            if (metadata_fingerprint == null and !must_force and (extraction_seed == null or extraction_seed.?.policy == .keep) and
+                try reuseDocumentExtractionByFingerprint(alloc, db, request.doc_key, artifact_name, source_fingerprint, existing_state, existing_manifest, manifest_key, from_generation, artifact_writes, artifact_delete_keys))
+            {
+                // The same seeded text was accepted before: unchanged.
+                if (extraction_seed) |seed| seed.result.* = .{ .outcome = .unchanged, .existing_origin = .seeded };
+                return;
+            }
+            if (extraction_seed) |seed| {
+                if (seed.result.outcome == .accepted and existing_manifest != null)
+                    seed.result.* = .{ .outcome = .replaced, .existing_origin = .generated };
+            }
 
             // Downloaded bytes, inspection state, and decoded extraction results are
             // charged at their actual live allocator size. OCR render scratch plus
             // provider/output memory are admitted atomically for each page window in
             // enrichment_runtime and released before the next window.
-            const source_is_pdf = document_extraction_mod.resolvesToPdf(config, source_url, if (config.content_type.len > 0) config.content_type else downloaded_mut.content_type, downloaded_mut.data);
+            const source_is_pdf = extraction_seed == null and document_extraction_mod.resolvesToPdf(config, source_url, if (config.content_type.len > 0) config.content_type else downloaded_mut.content_type, downloaded_mut.data);
             const pdf_inspection_bytes: usize = if (source_is_pdf) config.pdf_decode_limits.max_working_set_bytes else 0;
 
             var pdf_inspection_reservation = enrichment_runtime_mod.ReservedWorkingSetAllocator.init(extraction_alloc, pdf_inspection_bytes);
@@ -8452,12 +8685,27 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             else
                 extraction_alloc;
             var extraction_config = config;
+            if (extraction_seed != null) {
+                // Route the seeded text as text regardless of the source's
+                // declared media type or configured routes; OCR and
+                // transcription cannot apply.
+                extraction_config.content_type = "text/plain";
+                extraction_config.filename = "";
+                extraction_config.transcription_enabled = false;
+                extraction_config.routes = &.{};
+                extraction_config.route_preset = .mixed_files;
+            }
             if (source_is_pdf) {
                 extraction_config.pdf_decode_limits.max_working_set_bytes = pdf_inspection_bytes;
                 extraction_config.pdf_decode_limits.max_decoded_stream_bytes = @min(extraction_config.pdf_decode_limits.max_decoded_stream_bytes, pdf_inspection_bytes);
             }
             var extraction_failure: runtime_failure_abi.FailureIdentity = .{};
-            var extraction = extractDocumentDownloadedAlloc(document_extraction_alloc, downloaded_mut, source_url, extraction_config, config_json, doc_value, &extraction_failure, preparation_memo.context) catch |raw_err| {
+            // Seeded text needs no isolated PDF/media decoder: the in-process
+            // text route builds its units, with no URL-based routing.
+            var extraction = (if (extraction_seed != null)
+                document_extraction_mod.extractDownloadedAlloc(document_extraction_alloc, downloaded_mut, "", extraction_config)
+            else
+                extractDocumentDownloadedAlloc(document_extraction_alloc, downloaded_mut, source_url, extraction_config, config_json, doc_value, &extraction_failure, preparation_memo.context)) catch |raw_err| {
                 const err = if (raw_err != error.OutOfMemory)
                     raw_err
                 else if (pdf_inspection_reservation.limit_exceeded)
@@ -8478,7 +8726,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
             defer extraction.deinit(document_extraction_alloc);
             extraction.execution_json = request.execution_json;
-            if (S.ownerField(db, "enrichment_runtime").*) |runtime| {
+            if (extraction_seed != null) {
+                // Seeded text is the complete extraction: nothing to generate.
+            } else if (S.ownerField(db, "enrichment_runtime").*) |runtime| {
                 enrichment_runtime_mod.completeDocumentExtractionGeneratedTextForRequestWithMemory(
                     if (document_execution) |execution| &execution.runtime else runtime,
                     document_extraction_alloc,

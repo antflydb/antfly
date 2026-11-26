@@ -813,15 +813,18 @@ pub const EnrichmentConfig = struct {
     /// objects are canonicalized into this form at the API edge.
     context_sources_json: []const u8 = "",
     execution: ?EnrichmentExecutionConfig = null,
+    /// Canonical artifact seed field mapping (`artifact_seeds.Mapping`); the
+    /// public `seed` object is canonicalized into this form at the API edge.
+    seed_json: []const u8 = "",
 
     pub fn clone(alloc: Allocator, cfg: EnrichmentConfig) !EnrichmentConfig {
         var out = cfg;
-        inline for (.{ "name", "field", "template", "source_artifact_name", "vector_space", "chunker_json", "content_type", "producer_json", "context_sources_json" }) |field| @field(out, field) = "";
+        inline for (.{ "name", "field", "template", "source_artifact_name", "vector_space", "chunker_json", "content_type", "producer_json", "context_sources_json", "seed_json" }) |field| @field(out, field) = "";
         out.source = null;
         out.prior_context = null;
         out.neighbor_context = null;
         errdefer out.deinit(alloc);
-        inline for (.{ "name", "field", "template", "source_artifact_name", "vector_space", "chunker_json", "content_type", "producer_json", "context_sources_json" }) |field| {
+        inline for (.{ "name", "field", "template", "source_artifact_name", "vector_space", "chunker_json", "content_type", "producer_json", "context_sources_json", "seed_json" }) |field| {
             const value = @field(cfg, field);
             if (value.len > 0) @field(out, field) = try alloc.dupe(u8, value);
         }
@@ -843,6 +846,7 @@ pub const EnrichmentConfig = struct {
         if (self.content_type.len > 0) alloc.free(self.content_type);
         if (self.producer_json.len > 0) alloc.free(self.producer_json);
         if (self.context_sources_json.len > 0) alloc.free(self.context_sources_json);
+        if (self.seed_json.len > 0) alloc.free(self.seed_json);
         if (self.neighbor_context) |*context| context.deinit(alloc);
         self.* = undefined;
     }
@@ -1549,6 +1553,17 @@ pub fn supportsIntegrityReadProof(include_primary_digest: bool, jobs_json: []con
     return include_primary_digest or jobs_json.len != 0;
 }
 
+/// Rendering of reserved artifact fields on reads. `seed` emits exactly the
+/// `_artifacts`/`_chunks` write shapes (`artifact_seed_view.zig`).
+pub const ArtifactView = enum {
+    descriptive,
+    seed,
+
+    pub fn parse(text: []const u8) ?ArtifactView {
+        return std.meta.stringToEnum(ArtifactView, text);
+    }
+};
+
 pub const LookupOptions = struct {
     /// Borrowed trusted preparation authority. Routing binds it to the exact
     /// captured native descriptor; it is never serialized on lookup wires.
@@ -1604,6 +1619,13 @@ pub const LookupOptions = struct {
     generation_handoff_install_read_index_certified: bool = false,
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
+    /// How selected `_artifacts`/`_chunks` render: descriptive metadata, or
+    /// the seed write shapes (vectors included) that round-trip as a write.
+    artifact_view: ArtifactView = .descriptive,
+    /// Private seed planning request (`artifact_seed_plan.zig`): the owner
+    /// plans the batch subset and answers with per-seed outcomes instead of a
+    /// document. Public lookup parsers never populate it.
+    seed_plan_json: []const u8 = "",
     /// Internal, absolute monotonic deadline used by routed lookups. It is not
     /// part of the public lookup projection contract and is never serialized.
     execution_deadline_ns: ?u64 = null,
@@ -1775,6 +1797,7 @@ pub const ScanOptions = struct {
     limit: u32 = 0,
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
+    artifact_view: ArtifactView = .descriptive,
     filter_query_json: []const u8 = "",
     /// Internal Cypher visitation only. Reserved document identities consume
     /// progress but must not be decoded by a user row filter. Never serialized.

@@ -2653,10 +2653,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Artifact seeds are accepted in producer preparation, which needs no
             // inference for the seeded outputs; their effects then commit with
             // the source like any prepared producer result.
-            const carries_artifact_seeds = for (extracted[0..extracted_initialized]) |row| {
+            const carries_artifact_seeds = S.ownerField(self, "core").*.index_manager.hasSeedMappings() or for (extracted[0..extracted_initialized]) |row| {
                 if (row.artifact_seeds_json != null) break true;
             } else false;
-            const prepare_generated = !use_thin_replay_fast_path or effective_req.commit_requires == .direct_enrichments or carries_artifact_seeds;
+            const prepare_generated = !use_thin_replay_fast_path or effective_req.commit_requires == .direct_enrichments or carries_artifact_seeds or opts.seed_plan != null;
 
             var precomputed_generated: PrecomputedGeneratedBatch = .{};
             defer precomputed_generated.deinit(preparation_alloc);
@@ -2713,6 +2713,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     );
                 }
 
+                if (opts.seed_plan) |capture| {
+                    // Planning reports outcomes for the exact prepared write
+                    // and returns before anything is staged or committed.
+                    capture.json = try std.json.Stringify.valueAlloc(capture.alloc, .{ .seeds = precomputed_generated.seed_outcomes }, .{ .emit_null_optional_fields = false });
+                    S.ownerField(self, "core").*.unlockApply();
+                    apply_mutex_held = false;
+                    return;
+                }
+                // `keep` never drops a differing seed silently: the write is
+                // rejected and planning names the conflicting items. A
+                // committed transaction's resolution cannot be rejected; its
+                // participants voted at prepare, and preparation kept the
+                // existing output for any later conflict.
+                if (opts.transaction_resolution == null) for (precomputed_generated.seed_outcomes) |entry| if (entry.outcome == .conflict) return error.ArtifactSeedConflict;
                 if (opts.transaction_resolution != null) if (decoded_prepared) |packet| {
                     var plan = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
                     defer plan.release();

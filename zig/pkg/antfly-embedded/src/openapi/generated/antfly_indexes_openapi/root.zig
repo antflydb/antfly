@@ -66,6 +66,7 @@ pub const EnrichmentNeighborContextConfig = types.EnrichmentNeighborContextConfi
 pub const EnrichmentProducerConfig = types.EnrichmentProducerConfig;
 pub const EnrichmentRefreshConfig = types.EnrichmentRefreshConfig;
 pub const EnrichmentRuntimeStatus = types.EnrichmentRuntimeStatus;
+pub const EnrichmentSeedMapping = types.EnrichmentSeedMapping;
 pub const ExecutionPolicy = types.ExecutionPolicy;
 pub const FullTextArtifactIndexSource = types.FullTextArtifactIndexSource;
 pub const FullTextIndexConfig = types.FullTextIndexConfig;

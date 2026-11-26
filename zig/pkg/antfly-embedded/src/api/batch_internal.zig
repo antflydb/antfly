@@ -3473,7 +3473,7 @@ fn countTransformExpectedVersions(root: std.json.ObjectMap, require_seed_binding
             const path = operation.object.get("path") orelse break false;
             if (path != .string) break false;
             const normalized = if (std.mem.startsWith(u8, path.string, "$.")) path.string[2..] else path.string;
-            if (!std.mem.startsWith(u8, normalized, "_artifacts.") and !std.mem.startsWith(u8, normalized, "_chunks.")) break false;
+            if (!std.mem.startsWith(u8, normalized, "_artifacts.") and !std.mem.startsWith(u8, normalized, "_chunks.") and !std.mem.eql(u8, normalized, "_seed_conflict")) break false;
         } else true;
         // Internal encodings carry the lowered precondition in `_predicates`.
         if (seed_only and require_seed_binding) return error.ArtifactSeedSourceBindingRequired;

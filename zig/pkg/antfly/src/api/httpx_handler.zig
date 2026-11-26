@@ -3895,6 +3895,8 @@ pub const AntflyApiHandler = struct {
         return self.internalGroupLookupKey(ctx, params.group_id, params.table_name, key, ctx.request.uri.query orelse "");
     }
 
+    const seed_plan_max_body_bytes: usize = 64 * 1024 * 1024;
+
     fn internalGroupLookupKey(self: *AntflyApiHandler, ctx: *httpx.Context, group_id: u64, table_name: []const u8, key: []const u8, query: []const u8) !httpx.Response {
         var lookup_options = http_route_helpers.parseInternalLookupOptions(ctx.allocator, query) catch return textResponse(ctx, 400, "invalid lookup options");
         defer lookup_options.deinit(ctx.allocator);
@@ -3909,11 +3911,16 @@ pub const AntflyApiHandler = struct {
                 lookup_options.opts.relational_index_status_json.len != 0 or (lookup_options.opts.sql_lock_query_json.len != 0 or lookup_options.opts.group_source_query_json.len != 0))
                 return textResponse(ctx, 400, "ambiguous lookup controls");
             const body = (try ctx.body()) orelse return textResponse(ctx, 400, "lookup control body required");
-            if (body.len == 0 or body.len > @import("antfly_local_sources").storage_db_relational_integrity_contract.max_preparation_bytes)
+            // Seed planning requests carry seeds, vectors included.
+            const max_body = if (lookup_options.seed_plan_body) seed_plan_max_body_bytes else @import("antfly_local_sources").storage_db_relational_integrity_contract.max_preparation_bytes;
+            if (body.len == 0 or body.len > max_body)
                 return textResponse(ctx, 413, "lookup control body too large");
             // Context owns these bytes through dispatch; OwnedLookupOptions
             // only frees query buffers that it allocated itself.
-            lookup_options.opts.relational_integrity_jobs_json = body;
+            if (lookup_options.seed_plan_body)
+                lookup_options.opts.seed_plan_json = body
+            else
+                lookup_options.opts.relational_integrity_jobs_json = body;
         }
         const policy_authority = @import("../usermgr/mod.zig").row_policy_authority;
         const policy_token = ctx.header(policy_authority.principal_header);
@@ -11619,6 +11626,19 @@ pub const AntflyApiHandler = struct {
         };
         if (try self.acquirePublicOperation(ctx, "batchWrite")) |response| return response;
         defer self.releasePublicOperation("batchWrite");
+        // Validation-only artifact seed planning: plan every seeded item on
+        // its owning shard and report outcomes; nothing is written.
+        if (@import("seed_planning.zig").requested(body_data)) {
+            const source = self.api_server.table_reads orelse return jsonErrorResponse(ctx, 404, "not found");
+            const planned = @import("seed_planning.zig").planTableBatch(ctx.allocator, source, decoded_table_name, body_data) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return jsonErrorResponse(ctx, 400, @errorName(err)),
+            };
+            _ = ctx.status(200);
+            try ctx.setHeader("content-type", "application/json");
+            _ = ctx.response.bodyOwned(ctx.allocator, planned);
+            return ctx.response.build();
+        }
         if (self.api_server.tryObjectTableRequest(decoded_table_name, .post, "batch", body_data, authenticated_identity, operationContext(ctx, authenticated_identity)) catch |err| switch (err) {
             error.TableGenerationChanged => return jsonErrorResponse(ctx, 409, "table incarnation changed; refresh and retry"),
             else => return err,
@@ -12462,7 +12482,13 @@ pub const AntflyApiHandler = struct {
             return ctx.text("not found");
         };
 
-        var lookup_opts = try http_route_helpers.parseLookupOptions(alloc, ctx.request.uri.query orelse "");
+        var lookup_opts = http_route_helpers.parseLookupOptions(alloc, ctx.request.uri.query orelse "") catch |err| switch (err) {
+            error.InvalidQueryRequest => {
+                _ = ctx.status(400);
+                return ctx.text("invalid artifact_view: expected descriptive or seed");
+            },
+            else => return err,
+        };
         defer lookup_opts.deinit(alloc);
         var row_policy_proof: ?[]u8 = null;
         defer if (row_policy_proof) |proof| alloc.free(proof);

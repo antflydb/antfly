@@ -125,6 +125,8 @@ pub const OwnedLookupOptions = struct {
     group_source_query_json: []const u8 = "",
     sql_lock_query_json: []const u8 = "",
     relational_topology_json: []const u8 = "",
+    /// Private `_seed_plan=true`: the POST body is a seed planning request.
+    seed_plan_body: bool = false,
     opts: @import("antfly_local_sources").storage_db_types.LookupOptions = .{},
 
     pub fn deinit(self: *OwnedLookupOptions, alloc: std.mem.Allocator) void {
@@ -161,11 +163,19 @@ pub const OwnedScanKeysRequest = struct {
 
 pub fn parseLookupOptions(alloc: std.mem.Allocator, query: []const u8) !OwnedLookupOptions {
     if (query.len == 0) return .{};
+    // `artifact_view=seed` renders selected `_artifacts`/`_chunks` in their
+    // seed write shapes; any other value is rejected rather than ignored.
+    var artifact_view: @import("antfly_local_sources").storage_db_types.ArtifactView = .descriptive;
+    var views = std.mem.splitScalar(u8, query, '&');
+    while (views.next()) |part| {
+        if (!std.mem.startsWith(u8, part, "artifact_view=")) continue;
+        artifact_view = @import("antfly_local_sources").storage_db_types.ArtifactView.parse(part["artifact_view=".len..]) orelse return error.InvalidQueryRequest;
+    }
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |part| {
         if (!std.mem.startsWith(u8, part, "fields=")) continue;
         const raw_fields = part["fields=".len..];
-        if (raw_fields.len == 0) return .{};
+        if (raw_fields.len == 0) return .{ .opts = .{ .artifact_view = artifact_view } };
         const decoded_fields = try decodePercentEncodedPathComponentAlloc(alloc, raw_fields);
         defer alloc.free(decoded_fields);
         var field_count: usize = 1;
@@ -188,10 +198,23 @@ pub fn parseLookupOptions(alloc: std.mem.Allocator, query: []const u8) !OwnedLoo
             .opts = .{
                 .fields = fields,
                 .include_all_fields = false,
+                .artifact_view = artifact_view,
             },
         };
     }
-    return .{};
+    return .{ .opts = .{ .artifact_view = artifact_view } };
+}
+
+test "lookup options parse the artifact seed view" {
+    const alloc = std.testing.allocator;
+    var seed = try parseLookupOptions(alloc, "fields=_artifacts%2C_chunks&artifact_view=seed");
+    defer seed.deinit(alloc);
+    try std.testing.expectEqual(@import("antfly_local_sources").storage_db_types.ArtifactView.seed, seed.opts.artifact_view);
+    try std.testing.expectEqual(@as(usize, 2), seed.opts.fields.len);
+    var plain = try parseLookupOptions(alloc, "fields=title");
+    defer plain.deinit(alloc);
+    try std.testing.expectEqual(@import("antfly_local_sources").storage_db_types.ArtifactView.descriptive, plain.opts.artifact_view);
+    try std.testing.expectError(error.InvalidQueryRequest, parseLookupOptions(alloc, "fields=_artifacts&artifact_view=raw"));
 }
 
 pub fn parseInternalLookupOptions(alloc: std.mem.Allocator, query: []const u8) !OwnedLookupOptions {
@@ -263,6 +286,9 @@ pub fn parseInternalLookupOptions(alloc: std.mem.Allocator, query: []const u8) !
             result.relational_topology_json = try decodePercentEncodedPathComponentAlloc(alloc, part["_relational_topology=".len..]);
             if (result.relational_topology_json.len == 0 or result.relational_topology_json.len > 4096) return error.InvalidQueryRequest;
             result.opts.relational_topology_json = result.relational_topology_json;
+        } else if (std.mem.startsWith(u8, part, "_seed_plan=")) {
+            if (result.seed_plan_body or !std.mem.eql(u8, part, "_seed_plan=true")) return error.InvalidQueryRequest;
+            result.seed_plan_body = true;
         } else if (std.mem.startsWith(u8, part, "_restore_staging_scope=")) {
             if (result.opts.restore_staging_scope != null) return error.InvalidQueryRequest;
             const hex = part["_restore_staging_scope=".len..];
@@ -589,6 +615,10 @@ fn parseScanKeysRequestImpl(alloc: std.mem.Allocator, body: []const u8, allow_in
             .resume_from_key = private_scan.resuming,
             .include_content_hashes = include_content_hashes,
             .relational_query_json = relational_query_json,
+            .artifact_view = if (parsed.value.artifact_view) |view| switch (view) {
+                .descriptive => .descriptive,
+                .seed => .seed,
+            } else .descriptive,
         },
     };
 }
