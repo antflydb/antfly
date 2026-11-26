@@ -2904,13 +2904,17 @@ pub const PersistentIndex = struct {
     fn inlineDeletionBitmap(self: *PersistentIndex, copies: []const VersionedChange, resolution: ?*const VersionResolution) !?roaring.RoaringBitmap {
         var bitmap = roaring.RoaringBitmap.init(self.alloc);
         errdefer bitmap.deinit();
+        // One set of the commit's deaths, so a batch that overwrites many
+        // documents (a copy and a death each) costs their sum, not product.
+        var dead_at_commit: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer dead_at_commit.deinit(self.alloc);
+        if (resolution) |r| try r.collectDeadAtCommit(self.alloc, &dead_at_commit);
         const locations = &self.version_locations;
         @import("antfly_platform").sync.lockYielding(&locations.mutex);
         defer locations.mutex.unlock();
         for (copies, 0..) |copy, local| {
             const parked = locations.parked.remove(copy.version);
-            const dead = if (resolution) |r| r.deadAtCommit(copy.version) else false;
-            if (parked or dead) try bitmap.add(@intCast(local));
+            if (parked or dead_at_commit.contains(copy.version)) try bitmap.add(@intCast(local));
         }
         if (bitmap.isEmpty()) {
             bitmap.deinit();
@@ -4751,11 +4755,12 @@ pub const PersistentIndex = struct {
             try backend.applyDecided(resolver.outputs.items, resolver.stamp);
         }
 
-        /// Whether `version`, one of this resolution's own copies, was dead
-        /// at its commit (born behind a newer copy).
-        pub fn deadAtCommit(self: *const VersionResolution, version: u64) bool {
-            return std.mem.indexOfScalar(u64, self.newly_dead.items, version) != null or
-                std.mem.indexOfScalar(u64, self.extra_dead.items, version) != null;
+        /// The versions of this resolution's own copies that were dead at its
+        /// commit (born behind a newer copy), as a set.
+        pub fn collectDeadAtCommit(self: *const VersionResolution, allocator: std.mem.Allocator, out: *std.AutoHashMapUnmanaged(u64, void)) !void {
+            try out.ensureUnusedCapacity(allocator, @intCast(self.newly_dead.items.len + self.extra_dead.items.len));
+            for (self.newly_dead.items) |version| out.putAssumeCapacity(version, {});
+            for (self.extra_dead.items) |version| out.putAssumeCapacity(version, {});
         }
 
         /// Copies a caller already holds (an inline segment's).
@@ -7186,6 +7191,53 @@ test "persistent index masks a late level-0 install and clears it on rebuild" {
     const snapshot = reopened.writer.acquireSnapshot();
     defer snapshot.release();
     try std.testing.expectEqual(@as(usize, 0), snapshot.segments.len);
+}
+
+// A bulk install's deletion bitmap: a copy is masked when it died at its own
+// commit (born behind a newer copy) or a later install parked its death, and
+// a parked death is consumed. One death set per install (not a scan of the
+// commit's deaths per copy) keeps a batch of overwrites linear.
+test "persistent index inline deletion bitmap masks commit-time and parked deaths in a bulk install" {
+    const alloc = std.testing.allocator;
+    var sink = InlinePublicationTestSink{ .allocator = alloc };
+    defer sink.deinit(alloc);
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+    var pi = try openVersionedTestIndex(alloc, &sink, path);
+    defer pi.close();
+
+    const count = 512;
+    var copies: [count]VersionedChange = undefined;
+    for (&copies, 0..) |*copy, i| copy.* = .{ .key = "doc", .version = try DocVersion.of(@intCast(i + 1), 0) };
+    var resolution = PersistentIndex.VersionResolution.init(&pi);
+    defer resolution.deinit();
+    const ra = resolution.result_arena.allocator();
+    // Every third copy died at its commit (resolver deaths and supplied
+    // ones), every fifth was killed first by a later install.
+    for (copies, 0..) |copy, i| {
+        if (i % 3 == 0) try (if (i % 2 == 0) &resolution.newly_dead else &resolution.extra_dead).append(ra, copy.version);
+    }
+    // A death of a version outside this install stays parked.
+    const foreign = try DocVersion.of(count + 10, 0);
+    {
+        const locations = &pi.version_locations;
+        @import("antfly_platform").sync.lockYielding(&locations.mutex);
+        defer locations.mutex.unlock();
+        for (copies, 0..) |copy, i| if (i % 5 == 0) try locations.parked.put(alloc, copy.version, {});
+        try locations.parked.put(alloc, foreign, {});
+    }
+    var bitmap = (try pi.inlineDeletionBitmap(&copies, &resolution)).?;
+    defer bitmap.deinit();
+    for (0..count) |i| try std.testing.expectEqual(i % 3 == 0 or i % 5 == 0, bitmap.contains(@intCast(i)));
+    const locations = &pi.version_locations;
+    try std.testing.expectEqual(@as(u32, 1), locations.parked.count());
+    try std.testing.expect(locations.parked.contains(foreign));
+
+    // Nothing dead and nothing parked for this install: no bitmap.
+    var clean = PersistentIndex.VersionResolution.init(&pi);
+    defer clean.deinit();
+    try std.testing.expect((try pi.inlineDeletionBitmap(copies[1..2], &clean)) == null);
 }
 
 // Installs can complete out of commit order. The mirror keeps each key's
@@ -9743,6 +9795,60 @@ test "persistent index refreshes another writer's segments, rewrites and merges 
     try std.testing.expectEqual(@as(usize, 1), snap.segments.len);
     try std.testing.expect(std.mem.indexOfScalar(u64, ids.items, snap.segments[0].id) == null);
     try std.testing.expectEqual(@as(u32, 1), snap.liveDocCount());
+}
+
+// A merge planned from a view a peer has since merged past is stale: its
+// input removal is refused, and the refresh it triggers
+// (`IndexManager.removeMergeInputs`, then `refreshFromTip`) leaves the next
+// plan the peer's output as its only input, never the retired inputs.
+test "persistent index refreshed after a peer merge plans from the peer's output" {
+    const alloc = std.testing.allocator;
+    var sink = InlinePublicationTestSink{ .allocator = alloc };
+    defer sink.deinit(alloc);
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+    var index = try openVersionedTestIndex(alloc, &sink, path);
+    defer index.close();
+
+    const older = try DocVersion.of(1, 0);
+    const newer = try DocVersion.of(2, 0);
+    const old_key = l0Key(l0SegmentId(older));
+    const new_key = l0Key(l0SegmentId(newer));
+    const first = try buildVersionedSegment(alloc, &.{.{ .doc_id = "doc:a", .term = "alpha", .version = older }});
+    defer alloc.free(first);
+    const second = try buildVersionedSegment(alloc, &.{.{ .doc_id = "doc:b", .term = "beta", .version = newer }});
+    defer alloc.free(second);
+    try sink.foreignPut(l0_namespace, &old_key, first);
+    try sink.foreignPut(l0_namespace, &new_key, second);
+    try index.refreshChangedFromTip(&.{
+        .{ .namespace = l0_namespace, .key = &old_key },
+        .{ .namespace = l0_namespace, .key = &new_key },
+    });
+    const inputs = [_]u64{ l0SegmentId(older), l0SegmentId(newer) };
+    {
+        const snapshot = index.writer.acquireSnapshot();
+        defer snapshot.release();
+        try std.testing.expectEqual(@as(usize, 2), snapshot.segments.len);
+    }
+
+    // The peer merges both records into one segment.
+    const merged_id: u64 = 1;
+    const merged_key = std.mem.toBytes(std.mem.nativeToBig(u64, merged_id));
+    const active_key = activeSegmentMetaKey(merged_id);
+    try sink.foreignDelete(l0_namespace, &old_key);
+    try sink.foreignDelete(l0_namespace, &new_key);
+    try sink.foreignPut("segments", &merged_key, second);
+    try sink.foreignPut("meta", &active_key, "");
+    try sink.foreignPut("meta", meta_next_seg_id, &PersistentIndex.nextSegmentIdValue(merged_id, 1));
+
+    try index.refreshFromTip();
+    try std.testing.expect(!try index.removeSegmentsIfActive(&inputs));
+    const snapshot = index.writer.acquireSnapshot();
+    defer snapshot.release();
+    try std.testing.expectEqual(@as(usize, 1), snapshot.segments.len);
+    try std.testing.expectEqual(merged_id, snapshot.segments[0].id);
+    for (snapshot.segments) |segment| for (inputs) |input| try std.testing.expect(segment.id != input);
 }
 
 test "persistent index applies peer level-0, merge and rebuild deltas" {

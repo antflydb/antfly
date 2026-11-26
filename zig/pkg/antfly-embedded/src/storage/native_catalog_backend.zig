@@ -939,8 +939,13 @@ pub const Backend = struct {
         try self.applied_stamps.ensureUnusedCapacity(self.allocator, @intCast(keys.len));
         for (owned) |key| {
             const entry = self.applied_stamps.getOrPutAssumeCapacity(key);
-            if (entry.found_existing) self.allocator.free(key) else entry.key_ptr.* = key;
-            entry.value_ptr.* = @max(entry.value_ptr.*, stamp);
+            if (entry.found_existing) {
+                self.allocator.free(key);
+                entry.value_ptr.* = @max(entry.value_ptr.*, stamp);
+            } else {
+                entry.key_ptr.* = key;
+                entry.value_ptr.* = stamp;
+            }
         }
         made = 0;
     }
@@ -1616,6 +1621,21 @@ test "native catalog backend fails closed once its mirror misses a committed wri
     backend.invalidateMirror();
     try std.testing.expectError(error.IndexMirrorInvalid, backend.beginRead());
     try std.testing.expectError(error.IndexMirrorInvalid, backend.beginWrite());
+}
+
+test "native catalog backend records a key's first decision stamp as is and keeps the newest" {
+    const a = std.testing.allocator;
+    var test_sink = TestSink{ .allocator = a };
+    defer test_sink.deinit();
+    var backend = try Backend.init(a, .{ .sink = test_sink.sink(), .scope = "idx1" });
+    defer backend.close();
+    try backend.recordStamps(&.{ "a", "b" }, 3);
+    try std.testing.expectEqual(@as(?u64, 3), backend.applied_stamps.get("a"));
+    try std.testing.expectEqual(@as(?u64, 3), backend.applied_stamps.get("b"));
+    try backend.recordStamps(&.{"a"}, 5);
+    try backend.recordStamps(&.{"b"}, 2);
+    try std.testing.expectEqual(@as(?u64, 5), backend.applied_stamps.get("a"));
+    try std.testing.expectEqual(@as(?u64, 3), backend.applied_stamps.get("b"));
 }
 
 test "native catalog backend supports prefix cursors over a namespace" {

@@ -136,17 +136,18 @@ The read-backs existed because installs run out of commit order (the leader
 installs only if the index guard is free; otherwise the writer installs after
 its wait). Instead:
 
-- Every resolver run takes the next epoch of its index's mirror inside its
-  commit (`Backend.noteResolved`), in commit order. An install applies its
-  decided values only for keys whose latest epoch is still its own
-  (`Backend.applyCommittedResolution`); merges' `mirrorResolved` does the
-  same. A run whose commit did not happen restores the keys' earlier epochs
-  (`revertResolved`); a peer delta's keys take a new epoch
-  (`noteExternallyDecided`), so a pending local install keeps them.
+- Every resolver run takes a decision stamp from its backend when it runs
+  inside its group's apply (`Resolver.run`), so among committed decisions
+  stamp order is commit order. An install applies a decided key only if no
+  newer stamp has been applied to it (`Backend.applyDecided`); merges'
+  `mirrorResolved` does the same. Stamps are recorded per key only at
+  install time and only while level-0 decisions are pending
+  (`beginPendingDecision`), and dropped with the last one, so a resolver
+  that never commits records nothing and the map holds no historical keys.
 - A level-0 copy is deleted at install when it was dead at its own commit
-  (`VersionResolution.deadAtCommit`) or a later commit's install killed it
-  first: that death waits in `VersionLocations.parked` while level-0
-  publications are pending.
+  (`VersionResolution.collectDeadAtCommit`) or a later commit's install
+  killed it first: that death waits in `VersionLocations.parked` while
+  level-0 publications are pending.
 - The segment is parsed once at prepare and handed to the snapshot.
 
 A queryable in-memory buffer (the memtable this section used to describe)
@@ -154,8 +155,10 @@ would need an abstract postings interface across the query layer, which
 reads postings through concrete encoded types. FTS5 also writes a segment
 per commit; what made ours expensive was publishing it.
 
-Peer deltas no longer refuse while inline installs are pending, so a writer
-that refreshes past another process's commit stays incremental.
+A peer delta (`refreshPeerDelta`) is refused while this process's own
+inline installs are pending: a delayed install could otherwise publish a
+segment the peer already retired. The refresh runs once they land, and
+then forgets the recorded stamps.
 
 On the shared write path, a Lite read whose pin takes no reader fence (the
 generation already holds it, or a nested read under the writer's lease) is
@@ -267,4 +270,4 @@ handoff rule, not the reopen, is the limit.
 | 4b. `SegmentView` interface | committed |
 | 4. cheap level-0 publication, read admission | committed |
 | 5. bounded merges outside the lease | designed |
-| 6. incremental writer refresh | #1830; peer deltas no longer wait for inline installs |
+| 6. incremental writer refresh | #1830; peer deltas wait for pending inline installs |

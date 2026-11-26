@@ -27430,6 +27430,16 @@ pub const IndexManager = struct {
         return self.finishTextMergeTaskImpl(task, result, false);
     }
 
+    /// A merge whose output is empty removes its inputs instead. Removal
+    /// fails when an input already left the tip, which is stale like a
+    /// refused replacement (`IndexScopeChanged`): the caller refreshes
+    /// before planning again.
+    fn removeMergeInputs(entry: anytype, old_ids: []const u64, scope_changed: *bool) !bool {
+        const removed = try entry.persistent.removeSegmentsIfActive(old_ids);
+        if (!removed) scope_changed.* = true;
+        return removed;
+    }
+
     fn finishTextMergeTaskImpl(self: *IndexManager, task: *const TextMergeTask, result: *TextMergeResult, borrowed_apply_lease: bool) !bool {
         var retire_task = true;
         defer if (retire_task) self.completeTextMergeTaskTracking(task);
@@ -27503,12 +27513,9 @@ pub const IndexManager = struct {
         const input_bytes = textMergeTaskInputBytes(task);
         const output_stats = textMergeResultOutputStats(result);
         var scope_changed = false;
-        const applied = if (result.prepared_segments.len == 0 and result.segments.len == 0) blk: {
-            // Stale like a refused replacement: its inputs left the tip.
-            const removed = try entry.persistent.removeSegmentsIfActive(old_ids);
-            if (!removed) scope_changed = true;
-            break :blk removed;
-        } else if (result.prepared_segments.len > 0) blk: {
+        const applied = if (result.prepared_segments.len == 0 and result.segments.len == 0)
+            try removeMergeInputs(entry, old_ids, &scope_changed)
+        else if (result.prepared_segments.len > 0) blk: {
             const prepared_segments = result.prepared_segments;
             result.prepared_segments = &.{};
             result.prepared_owner = null;
@@ -27518,7 +27525,7 @@ pub const IndexManager = struct {
                 prepared_segments,
                 publication_deletes.bitmaps,
             ) catch |err| switch (err) {
-                error.EmptySegment => try entry.persistent.removeSegmentsIfActive(old_ids),
+                error.EmptySegment => try removeMergeInputs(entry, old_ids, &scope_changed),
                 // At the tip an input was no longer active, or a live key had
                 // two copies: stale, like any other; it is planned again.
                 error.IndexScopeChanged => scope: {
@@ -27540,7 +27547,7 @@ pub const IndexManager = struct {
                 segments,
                 publication_deletes.bitmaps,
             ) catch |err| switch (err) {
-                error.EmptySegment => try entry.persistent.removeSegmentsIfActive(old_ids),
+                error.EmptySegment => try removeMergeInputs(entry, old_ids, &scope_changed),
                 // At the tip an input was no longer active, or a live key had
                 // two copies: stale, like any other; it is planned again.
                 error.IndexScopeChanged => scope: {

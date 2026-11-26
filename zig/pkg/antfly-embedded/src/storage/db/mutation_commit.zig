@@ -4912,7 +4912,30 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     !S.ownerField(self, "core").*.index_manager.leann_replication and
                     (effective_req.sync_level != .full_index or S.ownerField(self, "text_merge_runtime").* != null) and
                     !S.ownerField(self, "core").*.hasGraphIndexes();
-                if (!finish_without_lane) _ = try hook.resume_after_indexed_wait.?(hook.ptr, false, committed_primary_sequence);
+                // Only a write whose remaining work is the derived visibility
+                // wait can finish on a replacement runtime; everything else
+                // below is owed to this one.
+                const replacement_shape: execution_resources.ReplacementShape = .{
+                    .shadow_apply = split_shadow_ticket != null,
+                    .child_range_dispatch = opts.document_child_range_dispatcher != null,
+                    .transaction_resolution = opts.transaction_resolution != null,
+                    .replication = durable_replication_batch_payload != null or durable_replication_replay_payload != null or
+                        deferred_replication_gates.gate_count != 0 or
+                        (!opts.bypass_replication_write_gate and S.ownerField(self, "local_execution").*.replication_write_gate != null),
+                    .caller_visibility_completion = opts.visibility_completion != null,
+                    .materialized_apply = append_derived_replay and !S.ownerField(self, "executor").*.hasWorkers(),
+                };
+                const replacement_continuation: execution_resources.ReplacementContinuation = .{
+                    .replay_sequence = if (append_derived_replay) sequence else 0,
+                    .sync_level = if (opts.wait_for_sync_level) effective_req.sync_level else .write,
+                    .enrichment_fully_precomputed = enrichment_fully_precomputed,
+                    .refresh_identity_visibility = queued_index_publication and pending_identity_visibility_summary != null,
+                    .targets = sync_targets,
+                };
+                const continuation = if (execution_resources.replacementContinuationEligible(replacement_shape)) &replacement_continuation else null;
+                if (comptime @import("builtin").is_test) if (!finish_without_lane) if (execution_resources.test_before_indexed_resume) |test_hook|
+                    test_hook.run(test_hook.ptr, continuation, committed_primary_sequence);
+                if (!finish_without_lane) _ = try hook.resume_after_indexed_wait.?(hook.ptr, false, continuation);
             }
             if (queued_index_publication and pending_identity_visibility_summary != null) {
                 try self.lockApplyForPortableRuntime();
