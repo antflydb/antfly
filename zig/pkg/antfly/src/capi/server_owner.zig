@@ -160,6 +160,7 @@ pub const StorageOwnerContext = struct {
     /// server does; the key resolves through `secret_store` per request.
     inference_api_url: ?[]u8 = null,
     inference_api_key: ?[]u8 = null,
+    inference_connections: ?*const common_config.Config.ConnectionsConfig = null,
     lite_backend: ?lite_backend.Handle = null,
     auth_backend: ?antfly.lsm_backend.BackendHandle = null,
     auth_users_store: ?antfly.storage_backend_erased.Store = null,
@@ -228,7 +229,7 @@ pub const StorageOwnerContext = struct {
     }
 
     pub fn inferenceDefaults(self: *const StorageOwnerContext) local_write.InferenceDefaults {
-        return .{ .api_url = self.inference_api_url, .api_key = self.inference_api_key, .secret_store = self.secret_store };
+        return .{ .api_url = self.inference_api_url, .api_key = self.inference_api_key, .connections = self.inference_connections, .secret_store = self.secret_store };
     }
 
     fn clearInferenceDefaults(self: *StorageOwnerContext) void {
@@ -600,6 +601,45 @@ pub const StorageOwnerRuntimeHooks = struct {
         return callback(self.config.native_authority_ctx) != 0;
     }
 
+    /// Context-source host for this group's DB (Raft owners): replicated
+    /// dependency commands, leadership, cross-group delivery, routed reads,
+    /// and the table topology, all through one host callback.
+    pub fn contextHostConfig(self: *StorageOwnerRuntimeHooks) ?db_mod.DB.ContextHostConfig {
+        if (self.config.context.call_fn == null) return null;
+        self.context_host = .{ .call = .{ .ptr = self, .call_fn = contextCall } };
+        return .{
+            .table_id = "",
+            .read_source = self.context_host.readSource(),
+            .dispatcher = self.context_host.dispatcher(),
+            .replication = self.context_host.replication(),
+            .topology = self.context_host.topology(),
+        };
+    }
+
+    fn contextCall(ptr: *anyopaque, alloc: Allocator, op: @import("antfly_local_sources").storage_db_context_host_json.Op, request: []const u8) anyerror![]u8 {
+        const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        const call = self.config.context.call_fn orelse return error.ContextSourceTableUnavailable;
+        const Collect = struct {
+            alloc: Allocator,
+            out: ?[]u8 = null,
+            failed: bool = false,
+            fn consume(p: ?*anyopaque, bytes: kernel_owner_abi.BorrowedBytes) callconv(.c) kernel_owner_abi.Status {
+                const c: *@This() = @ptrCast(@alignCast(p.?));
+                if (c.out) |old| c.alloc.free(old);
+                c.out = c.alloc.dupe(u8, bytes.slice()) catch {
+                    c.failed = true;
+                    return .out_of_memory;
+                };
+                return .ok;
+            }
+        };
+        var collect = Collect{ .alloc = alloc };
+        errdefer if (collect.out) |bytes| alloc.free(bytes);
+        try kernel_error_identity.statusToError(call(self.config.context.callback_ctx, @backingInt(op), self.group_id, .fromSlice(self.table_name), .fromSlice(request), &collect, Collect.consume));
+        if (collect.failed) return error.OutOfMemory;
+        return collect.out orelse try alloc.dupe(u8, "");
+    }
+
     pub fn nativeMigrationPolicy(self: *const StorageOwnerRuntimeHooks) ?db_mod.DenseNativeMigrationPolicySource {
         if (self.config.native_authority_fn == null) return null;
         return .{ .ptr = self, .authority_permitted = nativeAuthorityPermitted };
@@ -607,6 +647,9 @@ pub const StorageOwnerRuntimeHooks = struct {
 
     config: kernel_owner_abi.RuntimeHooksConfig,
     group_id: u64,
+    /// Borrowed from the owner handle (set once the handle exists).
+    table_name: []const u8 = "",
+    context_host: @import("antfly_local_sources").storage_db_context_host_json.Host = undefined,
     artifact_upload_recovery: @import("../storage/artifact_upload_recovery.zig").Scheduler = .{},
 
     pub fn artifactPublicationDispatcher(self: *StorageOwnerRuntimeHooks) ?db_mod.ArtifactPublicationDispatcher {
@@ -1049,6 +1092,15 @@ pub fn storageOwnerContextConfigureInferenceDefaults(
     owner_context.clearInferenceDefaults();
     owner_context.inference_api_url = next_url;
     owner_context.inference_api_key = next_key;
+    return .ok;
+}
+
+pub fn storageOwnerContextConfigureInferenceConnections(context: ?*anyopaque, connections: ?*const anyopaque) callconv(.c) kernel_owner_abi.Status {
+    const owner = asStorageOwnerContext(context) orelse return .invalid_argument;
+    owner.lock();
+    defer owner.mutex.unlock();
+    if (owner.active_owners != 0) return .busy;
+    owner.inference_connections = if (connections) |map| @ptrCast(@alignCast(map)) else null;
     return .ok;
 }
 
@@ -4681,7 +4733,7 @@ pub fn storageOwnerOpen(
         alloc.destroy(value);
     };
     var runtime_hooks: ?*StorageOwnerRuntimeHooks = null;
-    if (candidate_configured or entity_sink_configured or runtime_hooks_config.promotion_owner_fn != null or runtime_hooks_config.native_authority_fn != null or runtime_hooks_config.coordinated_ttl_enqueue_fn != null or runtime_hooks_config.artifact_publication_enqueue_fn != null) {
+    if (candidate_configured or entity_sink_configured or runtime_hooks_config.promotion_owner_fn != null or runtime_hooks_config.native_authority_fn != null or runtime_hooks_config.coordinated_ttl_enqueue_fn != null or runtime_hooks_config.artifact_publication_enqueue_fn != null or runtime_hooks_config.context.call_fn != null) {
         runtime_hooks = alloc.create(StorageOwnerRuntimeHooks) catch return .out_of_memory;
         runtime_hooks.?.* = .{ .config = runtime_hooks_config, .group_id = request.group_id };
     }
@@ -4881,6 +4933,13 @@ pub fn storageOwnerOpen(
     handle.db.local_execution.row_policy_authority_issuer = owned_policy_issuer;
     handle.db.local_execution.row_policy_table_name = owned_table_name;
     if (runtime_hooks) |hooks| handle.db.setCoordinatedTtl(hooks.coordinatedTtlPort());
+    if (runtime_hooks) |hooks| {
+        hooks.table_name = owned_table_name;
+        if (hooks.contextHostConfig()) |config| handle.db.installContextHost(config) catch |err| {
+            std.log.err("storage owner context host install failed table={s} group_id={} err={s}", .{ table_name, request.group_id, @errorName(err) });
+            return storageOwnerStatusFromError(err);
+        };
+    }
     if (request.target_observer.notify != null or request.target_observer.status_changed != null) handle.db.setQueryVisibilityHook(.{
         .ptr = handle,
         .on_change = storageOwnerTargetAdvanced,

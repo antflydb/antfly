@@ -96,7 +96,11 @@ pub const OpenOptions = extern struct {
     // database's writer lock (ANTFLY_BUSY), like sqlite3_busy_timeout. 0
     // fails immediately.
     busy_timeout_ms: u64 = 0,
-    reserved: [6]u64 = @splat(0),
+    reserved: [4]u64 = @splat(0),
+    /// Operator-owned JSON connection map for remote inference. Copied on open.
+    inference_connections_json: Slice = .{},
+    /// Keep the legacy OpenOptions layout when pointers are narrower than u64.
+    inference_connections_padding: [16 - @sizeOf(Slice)]u8 = @splat(0),
     /// Base directory for models used by database enrichments.
     models_dir: Slice = .{},
 };

@@ -95,7 +95,8 @@ function modelPathOf(pathname) {
 async function localModel(env, url, method, signedIn) {
   const path = modelPathOf(url.pathname);
   if (method !== "GET" || !env.MAIL_MODELS || !path) return new Response("not found", { status: 404 });
-  if (path === "catalog.json") {
+  const catalogPath = path === "catalog.json" || path === "glide/catalog.json";
+  if (catalogPath) {
     if (!signedIn) return Response.json({ error: "SignInRequired" }, { status: 401 });
     if (!env.LOCAL_MODEL_GRANT_SECRET)
       return Response.json({ error: "LocalModelGrantSecretMissing" }, { status: 503 });
@@ -107,11 +108,12 @@ async function localModel(env, url, method, signedIn) {
     "Content-Type": path.endsWith(".json") ? "application/json" : "application/octet-stream",
     "X-Content-Type-Options": "nosniff",
   };
-  if (path === "catalog.json") {
+  if (catalogPath) {
+    const prefix = path === "catalog.json" ? "" : "glide/";
     const catalog = JSON.parse(await new Response(object.body).text());
     for (const file of catalog.files ?? [])
       if (typeof file.path === "string" && modelPathOf("/local/models/" + file.path))
-        file.url = "/local/models/" + file.path + "?grant=" + (await modelGrant(env, file.path));
+        file.url = "/local/models/" + prefix + file.path + "?grant=" + (await modelGrant(env, prefix + file.path));
     return Response.json(catalog, { headers: { ...headers, "Cache-Control": "private, no-store" } });
   }
   // Pinned weight files are content-checked by the browser before use.
@@ -131,7 +133,7 @@ export default {
     if (url.pathname.startsWith("/api/auth/")) return env.AUTH_SERVICE.fetch(request);
     const modelPath = url.pathname.startsWith("/local/models/");
     // Granted weight downloads carry no cookies; they are authorized by URL.
-    if (modelPath && url.pathname !== "/local/models/catalog.json" && url.searchParams.has("grant"))
+    if (modelPath && !url.pathname.endsWith("/catalog.json") && url.searchParams.has("grant"))
       return localModel(env, url, request.method, false);
     if (!url.pathname.startsWith("/mail/") && url.pathname !== "/api/me" && !modelPath) {
       if (request.method !== "GET" || !env.MAIL_ASSETS)
@@ -147,6 +149,8 @@ export default {
       }
       const headers = new Headers(asset.headers);
       headers.set("Content-Security-Policy", contentSecurityPolicy);
+      headers.set("Cross-Origin-Opener-Policy", "same-origin");
+      headers.set("Cross-Origin-Embedder-Policy", "require-corp");
       headers.set("X-Content-Type-Options", "nosniff");
       // The service worker must update promptly; versioned runtimes never change.
       if (url.pathname === "/sw.js" || url.pathname === "/local/config.json")
@@ -162,10 +166,12 @@ export default {
     };
     const reply = (body, status = 200) => withCookies(response(body, status));
     try {
-      const result = await takeRpcData(env.AUTH_SERVICE.session([...request.headers]));
+      const authHeaders = new Headers(request.headers);
+      authHeaders.set("X-Antfly-Mailbox", url.searchParams.get("mailbox") ?? "team");
+      const result = await takeRpcData(env.AUTH_SERVICE.session([...authHeaders]));
       cookies = result.cookies;
       const session = result.session;
-      if (!session) return reply({ error: "SignInRequired" }, 401);
+      if (!session) return reply({ error: result.accessError ?? "SignInRequired" }, 401);
       const { mailbox } = session,
         stub = actor(env, mailbox.id);
       if (request.method !== "GET" && request.headers.get("Origin") !== env.AUTH_ORIGIN)
@@ -231,7 +237,13 @@ export default {
           Object.keys(body).some((k) => !["id", "to", "subject", "text", "reply_to"].includes(k))
         )
           return reply({ error: "InvalidOutgoingMail" }, 400);
-        const mail = { to: body.to, subject: body.subject, text: body.text, from: mailbox.address };
+        const mail = {
+          to: body.to,
+          subject: body.subject,
+          text: body.text,
+          from: mailbox.address,
+          from_name: session.user?.name,
+        };
         if (body.reply_to) {
           const prior = await takeRpcData(stub.message(mailbox.id, body.reply_to));
           if (!prior) return reply({ error: "NotFound" }, 404);

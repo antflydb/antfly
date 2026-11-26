@@ -143,7 +143,7 @@ class RustSdkReleaseTests(unittest.TestCase):
             self.assertEqual(sdk.identity(self.root, TAG), (VERSION, COMMIT))
             self.assertEqual(
                 git.call_args.args[0],
-                ["git", "merge-base", "--is-ancestor", COMMIT, "origin/main"],
+                ["git", "merge-base", "--is-ancestor", COMMIT, "origin/v0.3.x"],
             )
         with (
             patch.object(sdk.subprocess, "check_output", return_value=COMMIT),
@@ -165,6 +165,44 @@ class RustSdkReleaseTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, "package identity"):
                 sdk.identity(self.root, TAG)
+
+    def test_maintenance_and_main_tags_use_their_own_source_branches(self):
+        repo = self.root / "repo"
+        repo.mkdir()
+
+        def git(*args):
+            return subprocess.check_output(["git", *args], cwd=repo, text=True).strip()
+
+        def commit(version):
+            path = repo / "rs/crates/sdk/Cargo.toml"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                f'[package]\nname="antfly-sdk"\nversion="{version}"\nlicense="Apache-2.0"\n'
+            )
+            git("add", ".")
+            git("commit", "-qm", version)
+            return git("rev-parse", "HEAD")
+
+        git("init", "-q", "--initial-branch=main")
+        git("config", "user.name", "SDK release tests")
+        git("config", "user.email", "release@example.invalid")
+        base = commit("0.3.0")
+        main = commit("0.4.0")
+        git("tag", "rs/antfly/sdk/v0.4.0", main)
+        git("checkout", "-qb", "v0.3.x", base)
+        maintenance = commit("0.3.1")
+        git("update-ref", "refs/remotes/origin/v0.3.x", maintenance)
+        git("tag", "rs/antfly/sdk/v0.3.1", maintenance)
+        git("checkout", "-q", "main")
+        wrong_line = commit("0.3.2")
+        git("update-ref", "refs/remotes/origin/main", wrong_line)
+        git("tag", "rs/antfly/sdk/v0.3.2", wrong_line)
+        self.assertEqual(
+            sdk.identity(repo, "rs/antfly/sdk/v0.3.1"), ("0.3.1", maintenance)
+        )
+        self.assertEqual(sdk.identity(repo, "rs/antfly/sdk/v0.4.0"), ("0.4.0", main))
+        with self.assertRaises(subprocess.CalledProcessError):
+            sdk.identity(repo, "rs/antfly/sdk/v0.3.2")
 
     def test_publisher_does_not_execute_source_or_build_tools(self):
         workflow = (

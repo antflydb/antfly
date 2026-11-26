@@ -230,7 +230,7 @@ test "document artifact run checkpoints survive closing and reopening the existi
         defer files.deinit();
         var context = Context{ .metadata = &metadata, .artifacts = files.artifactStore(), .io = io_impl.io(), .now_fn = Clock.now };
         const store = try context.interface();
-        try store.create(.{ .run_id = "document-run", .owner = "alice", .identity = identity, .limits = .{ .calls = 10, .tokens = 100, .output_bytes = 1024 }, .inputs = &.{} });
+        try store.create(.{ .run_id = "document-run", .owner = "alice", .attribution_principal = "alice-billing-user", .attribution_tenant = "acme", .attribution_project = "docs", .identity = identity, .limits = .{ .calls = 10, .tokens = 100, .output_bytes = 1024 }, .inputs = &.{} });
         const original = try store.load(work, "document-run", "alice");
         var drifted = original;
         drifted.revision += 1;
@@ -239,6 +239,14 @@ test "document artifact run checkpoints survive closing and reopening the existi
         drifted = original;
         drifted.revision += 1;
         drifted.limits.calls += 1;
+        try std.testing.expectError(error.InvalidDocumentCheckpoint, metadata.compareDocumentRun(@as(?runs.Version, original.version()), drifted, Clock.now));
+        drifted = original;
+        drifted.revision += 1;
+        drifted.attribution_principal = "different-user";
+        try std.testing.expectError(error.InvalidDocumentCheckpoint, metadata.compareDocumentRun(@as(?runs.Version, original.version()), drifted, Clock.now));
+        drifted = original;
+        drifted.revision += 1;
+        drifted.attribution_project = "another-project";
         try std.testing.expectError(error.InvalidDocumentCheckpoint, metadata.compareDocumentRun(@as(?runs.Version, original.version()), drifted, Clock.now));
         old_lease = try store.claim(work, "document-run", "alice", identity, Clock.value, 10);
         try std.testing.expect(try store.reserve(work, old_lease, @splat(8), .{ .calls = 1, .tokens = 10, .output_bytes = 64 }, Clock.value));
@@ -258,6 +266,9 @@ test "document artifact run checkpoints survive closing and reopening the existi
     const store = try context.interface();
     try std.testing.expectError(error.DocumentRunNotFound, store.load(work, "document-run", "bob"));
     const record = try store.load(work, "document-run", "alice");
+    try std.testing.expectEqualStrings("alice-billing-user", record.attribution_principal.?);
+    try std.testing.expectEqualStrings("acme", record.attribution_tenant.?);
+    try std.testing.expectEqualStrings("docs", record.attribution_project.?);
     try std.testing.expectEqual(@as(u64, 2), record.used.calls);
     try std.testing.expectEqual(@as(u64, 17), record.used.tokens);
     var index = try runs.Index.init(a, store, record, 100, 16384);

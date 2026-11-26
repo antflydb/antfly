@@ -125,7 +125,8 @@ pub const AudioFormat = enum {
 /// Cloudflare Workers AI native speech adapter. Credentials use CLOUDFLARE_API_TOKEN.
 pub const CloudflareSTTConfig = struct {
     provider: []const u8,
-    account_id: []const u8,
+    /// Required for a direct Cloudflare model. A connection-qualified model takes the account from its connection.
+    account_id: ?[]const u8 = null,
     gateway_id: ?[]const u8 = null,
     model: []const u8,
     api_key: ?[]const u8 = null,
@@ -137,7 +138,7 @@ pub const CloudflareSTTConfig = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "provider", "provider", false },
-        .{ "account_id", "account_id", false },
+        .{ "account_id", "account_id", true },
         .{ "gateway_id", "gateway_id", true },
         .{ "model", "model", false },
         .{ "api_key", "api_key", true },
@@ -158,8 +159,10 @@ pub const CloudflareSTTConfig = struct {
         try jw.beginObject();
         try jw.objectField("provider");
         try jw.write(self.provider);
-        try jw.objectField("account_id");
-        try jw.write(self.account_id);
+        if (self.account_id) |value| {
+            try jw.objectField("account_id");
+            try jw.write(value);
+        }
         if (self.gateway_id) |value| {
             try jw.objectField("gateway_id");
             try jw.write(value);
@@ -188,7 +191,8 @@ pub const CloudflareSTTConfig = struct {
 
 /// Cloudflare Workers AI native speech adapter. Credentials use CLOUDFLARE_API_TOKEN.
 pub const CloudflareTTSConfig = struct {
-    account_id: []const u8,
+    /// Required for a direct Cloudflare model. A connection-qualified model takes the account from its connection.
+    account_id: ?[]const u8 = null,
     gateway_id: ?[]const u8 = null,
     model: []const u8,
     api_key: ?[]const u8 = null,
@@ -199,7 +203,7 @@ pub const CloudflareTTSConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "account_id", "account_id", false },
+        .{ "account_id", "account_id", true },
         .{ "gateway_id", "gateway_id", true },
         .{ "model", "model", false },
         .{ "api_key", "api_key", true },
@@ -218,8 +222,10 @@ pub const CloudflareTTSConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        try jw.objectField("account_id");
-        try jw.write(self.account_id);
+        if (self.account_id) |value| {
+            try jw.objectField("account_id");
+            try jw.write(value);
+        }
         if (self.gateway_id) |value| {
             try jw.objectField("gateway_id");
             try jw.write(value);
@@ -401,6 +407,7 @@ pub const OpenAITTSConfig = struct {
 /// Unified configuration for an STT provider. Select the provider type and configure provider-specific settings. **Supported Providers:** - `openai` - OpenAI Whisper (whisper-1) - `vertex` - Google Cloud Speech-to-Text (Vertex AI) - `antfly` - Antfly inference service (Whisper, Wav2Vec2, HuBERT) **Example:** ```yaml provider: antfly api_url: "http://localhost:8080" model: openai/whisper-base ```
 pub const STTConfig = struct {
     provider: ?[]const u8 = null,
+    /// Required for a direct Cloudflare model. A connection-qualified model takes the account from its connection.
     account_id: ?[]const u8 = null,
     gateway_id: ?[]const u8 = null,
     model: ?[]const u8 = null,
@@ -722,6 +729,7 @@ pub const Speaker = struct {
 
 /// Unified configuration for a TTS provider. Select the provider type and configure provider-specific settings. **Supported Providers:** - `openai` - OpenAI TTS (tts-1, tts-1-hd) - `vertex` - Google Cloud Text-to-Speech (Vertex AI) - `elevenlabs` - ElevenLabs premium voices **Example:** ```yaml provider: openai model: tts-1-hd voice: nova ```
 pub const TTSConfig = struct {
+    /// Required for a direct Cloudflare model. A connection-qualified model takes the account from its connection.
     account_id: ?[]const u8 = null,
     gateway_id: ?[]const u8 = null,
     model: ?[]const u8 = null,

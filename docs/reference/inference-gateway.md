@@ -210,6 +210,175 @@ NVIDIA GPU. Elsewhere, or for an HEVC clip no available decoder accepts, the req
 returns 400 `VIDEO_CODEC_UNAVAILABLE`; transcode the clip to H.264 or AV1, or run on
 a host with hardware HEVC decoding.
 
+## Fixed headers for remote inference connections
+
+Set `connections.<id>.inference.headers` to send operator-defined headers
+to the configured provider endpoint. Header values can use `${secret:...}`
+references that Antfly resolves at invocation time. Authentication, HTTP
+protocol, and Antfly control headers are reserved. The inference transport
+disables redirects.
+
+```yaml
+connections:
+  private-openai:
+    kind: inference
+    capabilities: [models.generate, models.extract, models.embed]
+    inference:
+      provider: openai
+      url: https://gateway.internal/openai/v1
+      api_key: ${secret:gateway.openai}
+      allow_private_ips: true
+      headers:
+        X-Billing-Team: search
+  private-anthropic:
+    kind: inference
+    capabilities: [models.generate, models.extract]
+    inference:
+      provider: anthropic
+      url: https://gateway.internal/anthropic/v1
+      api_key: ${secret:gateway.anthropic}
+      allow_private_ips: true
+      headers:
+        X-Billing-Team: search
+```
+
+Set each URL to the base path the gateway exposes for that provider. The
+OpenAI generator appends `/chat/completions`, and the Anthropic generator
+appends `/messages`. The same connection can serve streaming generation and
+generated extraction. Set `tls_ca_file` when the gateway uses a private CA.
+
+The deployment operator configures the gateway URL, credential and header
+references, allowed inference tasks, network policy, and billing mappings.
+Application callers select a permitted model and supply task inputs and
+generation options. Antfly resolves the connection and secrets, applies the
+outbound policy, and derives billing headers from authenticated identity or
+the trusted workload binding. The upstream gateway owns provider selection
+behind its endpoint, account budgets, and billing reconciliation.
+
+These headers apply to model discovery and to buffered and streaming inference
+invocations through the Antfly connection. OpenAI and Anthropic connections
+with an explicit endpoint support the same headers for generation and model
+discovery. OpenAI connections also apply them to embeddings, image
+reading, transcription, and speech synthesis. A generated extraction request can select
+an OpenAI or Anthropic connection through `generator.model` when that
+connection grants `models.extract`. These requests are restricted to the
+configured origin. OpenRouter, Ollama, Cohere, and Gemini connections also apply
+this policy to model discovery and their supported generation, embedding, or
+reranking operations. Vertex and Bedrock apply the connection policy to model
+API calls and discovery. Their credential exchanges use their own transport.
+Rewrites through a managed generator require `models.rewrite`. Each input
+uses the connection's generation endpoint and attribution policy.
+Typed decisions use the connection policy on their decision endpoints.
+Generated decisions select an operator-managed generator through
+`generator.model` and require `models.decide` on the connection. The selected
+model must support the requested constrained output and probability mode. Table query
+evaluations use the named decider, generator, or embedder connection and derive
+attribution from the authenticated query identity. Retrieval, research, and query
+builder agents can select managed generators in their generation chains. Each
+fallback link resolves its own connection and attribution. A durable research
+job records the submitting principal, tenant, and project. Resuming the job
+requires the same authenticated scope, and Antfly resolves the current
+connection policy and credentials when it calls the provider.
+Managed Cohere and Vertex reranking, OpenAI and Vertex reading and
+transcription, and OpenAI, Vertex, and ElevenLabs speech synthesis
+also use scoped transport when the connection uses the provider's default
+endpoint. Table queries can select the same reranking policy with
+`reranker.model: connections/<connection>/models/<model>`. The reranker provider
+must match the connection, and Antfly uses the authenticated query identity to
+resolve attribution. Set `account_id` on a Cloudflare Workers AI connection and
+`gateway_id` when using AI Gateway routing. An explicit `url` uses the
+adapter's endpoint shape. Generation, embedding, and reading take an API
+base URL. Typed decisions, native extraction, reranking, transcription, and
+synthesis take a complete Workers AI invocation URL.
+Pioneer native extraction takes an API base URL. Native extraction requests
+with inline inputs require `models.extract` on the connection.
+Cloudflare connections using the provider's default endpoint get the account
+model catalog automatically. Set `discovery_url` to the complete model search
+URL for a custom gateway. Discovery uses the connection credentials, fixed
+headers, and network policy.
+The configured endpoint uses the deployment's DNS and routing. For a gateway
+with a private CA, set `tls_ca_file` to an absolute path to a PEM CA bundle on
+the Antfly host. The connection uses that bundle in place of the system roots
+and verifies the configured HTTPS hostname.
+Set `allow_private_ips: false` for endpoints that must resolve to globally
+routable addresses. Antfly vets the address it connects to. Set
+`allow_private_ips: true` to authorize a configured private provider origin.
+Omitting the field preserves legacy inference behavior. On supported vendor
+operations, a connection with no URL can apply fixed headers, attribution, and
+the private-IP policy to the provider's resolved default endpoint. A custom
+CA bundle requires an explicit HTTPS URL. Content downloads continue to use
+the remote-content policy.
+
+Set `attribution.header` to the gateway's billing header. Use
+`attribution.principals` to map authenticated Antfly usernames to billing
+values, `attribution.tenants` to map tenant IDs, or `attribution.projects` to
+map `<tenant_id>/<project_id>` pairs. All maps accept secret references.
+
+Antfly reads `tenant_id` and optional `project_id` from the authenticated
+identity's metadata. Keep those attributes under your authentication
+administrator's control. When a connection has a tenant or project map and
+the authenticated identity includes a tenant, Antfly selects the corresponding
+tenant or project entry. An unknown project receives HTTP 403. An identity
+without a tenant can use an explicit username mapping. Anonymous and unmapped
+callers receive HTTP 403.
+
+Model discovery sends fixed headers only. Durable document jobs preserve the
+authenticated attribution identity at submission and look up the billing value
+in current connection policy on each retry. Attempt logs include
+`billing_principal_hash` for the authenticated username, `billing_scope_hash`
+when a tenant or project mapping applies, and `billing_workload_hash` when
+a storage workload mapping applies. The hashes are scoped to the connection.
+Managed embedding HTTP calls generate a request ID for transport attempts
+when an invocation ID is unavailable. Retries within one HTTP request share
+that ID and increment the attempt number. Each log entry also includes a
+`transport_attempt_id` that distinguishes physical attempts across durable
+worker restarts. Logs omit raw scope IDs, billing values, and credentials.
+
+Semantic search applies the authenticated attribution identity when the
+index selects a connection-qualified embedding model. Storage-owned
+enrichment uses `attribution.workloads` with keys
+`index_embed/<physical-table>`, `index_extract/<physical-table>`,
+`index_generate/<physical-table>`, `index_decide/<physical-table>`,
+`index_transcribe/<physical-table>`, or `index_read/<physical-table>`.
+The worker obtains the physical table
+from its durable catalog binding. Managed embedding workers resolve header
+secret references for each outbound request.
+
+Managed generation and schema extraction can select an operator connection
+with a model reference such as `connections/private-gateway/models/gpt-4.1`.
+Set the producer's provider to match the connection. Configure the endpoint,
+credentials, and provider routing fields on the connection. For custom
+OpenAI, Anthropic, OpenRouter, and Gemini endpoints, set an explicit
+`api_key` or secret reference so an instance-wide provider credential is
+only used with the provider's default endpoint.
+
+Native Antfly, Cloudflare, and Pioneer extraction producers use the same
+connection reference in their top-level `model` field. Grant `models.extract`
+and configure the endpoint and any required `api_key` on the connection. For Cloudflare, also set `account_id` and, if
+needed, `gateway_id` on the connection. The producer supplies its extraction
+schema and options. Inline endpoint and credential fields are rejected for
+connection-qualified native extraction.
+
+SQL decisions and decision enrichment also support operator connections.
+Set `generator.model` for generated decisions and `model` for typed decisions.
+The connection must grant `models.decide`. SQL uses the authenticated user's
+attribution. Background decision enrichment uses the physical table's
+`index_decide` workload mapping.
+
+Reading and transcription enrichment can use a qualified `model` and a
+connection that grants `models.read` or `models.transcribe`, respectively.
+The connection owns the endpoint and credentials.
+
+A named generator can set its `model` to a connection-qualified ID. The
+alias keeps its generation defaults, and the connection supplies its
+transport and billing policy. The same alias can serve as a chain link or
+as a generator for extraction, decisions, or rewriting when the connection
+grants that task. A rewriter keeps its configured instructions.
+A fallback chain can also put a connection-qualified model directly in a
+link's `generator` field. Each hop uses the selected connection's endpoint,
+credentials, TLS policy, and attribution. Attempt numbers continue across the
+chain under the original request ID.
+
 ## Direct Anthropic generation
 
 Use `provider: anthropic` for the native Claude Messages API. Named generators,

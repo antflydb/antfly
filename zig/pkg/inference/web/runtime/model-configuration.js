@@ -63,6 +63,7 @@ export async function configurationReason(files, config, encoderConfig, precisio
   if (wasm.extraction_abi_version?.() !== 2) throw new Error('Extraction WASM ABI mismatch; rebuild browser assets');
   const abi = createWasmAbi(wasm);
   const metadata = { config: JSON.stringify(config), encoder_config: JSON.stringify(encoderConfig), tokenizer_config: '{}', precision };
+  if (config.glideDecision) metadata.decision_config = JSON.stringify(config.glideDecision);
   if (['embedding_gemma2', 'embedding_gemma2_text'].includes(config.model_type)) {
     const { readJson } = await import('./extraction-bundle.js');
     metadata.processor_config = JSON.stringify(await readJson(files, 'processor_config.json'));

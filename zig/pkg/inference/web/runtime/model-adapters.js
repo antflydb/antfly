@@ -20,6 +20,13 @@ const limits = Object.freeze({ maxInputs: 1, maxTextBytes: 256 * 1024, maxReques
 const trainedKinds = Object.freeze(['choice', 'score', 'predicate']);
 const adapters = [
   {
+    id: 'glide', family: () => 'glide', architecture: 'modernbert',
+    matches: c => ['modernbert', 'modern_bert'].includes(c.model_type) && c.glideDecision?.backbone === 'encoder',
+    tasks: ['decide'], capabilities: ['typed_decisions'], kinds: trainedKinds,
+    unavailable: c => c.vocab_size > 262144 || c.hidden_size > 1024 || c.num_hidden_layers > 32 || c.intermediate_size > 4096
+      ? 'This GLiDE encoder exceeds the browser geometry budget.' : undefined,
+  },
+  {
     id: 'laya', family: c => c.laya.format === 'opendecider' ? 'opendecider' : 'laya', architecture: 'modernbert',
     matches: c => ['modernbert', 'modern_bert'].includes(c.model_type) && c.laya && typeof c.laya === 'object',
     tasks: ['decide'], capabilities: ['typed_decisions'], kinds: trainedKinds,
@@ -93,8 +100,9 @@ export async function inspectModel(input, precision, signal) {
   const upstreamLaya = !files.has('config.json') && files.has('rl_agent_config.json');
   let config = await readJson(files, upstreamLaya ? 'encoder/config.json' : 'config.json');
   if (upstreamLaya) config = { ...config, laya: await readJson(files, 'rl_agent_config.json') };
+  if (files.has('decision_config.json')) config = { ...config, glideDecision: await readJson(files, 'decision_config.json') };
   const manifest = await readModelManifest(files);
-  const encoder = config.laya || ['embedding_gemma2', 'embedding_gemma2_text'].includes(config.model_type) || manifest?.capabilities?.includes('embedding_similarity') ? config : await readJson(files, 'encoder_config/config.json');
+  const encoder = config.glideDecision || config.laya || ['embedding_gemma2', 'embedding_gemma2_text'].includes(config.model_type) || manifest?.capabilities?.includes('embedding_similarity') ? config : await readJson(files, 'encoder_config/config.json');
   const result = resolveAdapter(config, encoder, manifest);
   if (result.availability.available) {
     const { configurationReason } = await import('./model-configuration.js');

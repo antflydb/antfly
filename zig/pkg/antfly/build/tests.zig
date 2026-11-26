@@ -1756,6 +1756,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-reader-discovery-test", "Verify reader discovery, transport, identity and native batching").dependOn(&b.addRunArtifact(reader_discovery_tests).step);
     const transcriber_credential_tests = b.addTest(.{ .root_module = index_document_producer_mod, .filters = &.{"transcriber"}, .max_rss = 4 * 1024 * 1024 * 1024 });
     b.step("antfly-transcriber-credentials-test", "Verify native STT credentials, source ownership and batching").dependOn(&b.addRunArtifact(transcriber_credential_tests).step);
+    const asset_inference_connection_tests = b.addTest(.{
+        .root_module = index_document_producer_mod,
+        .filters = &.{ "asset producer runtime resolves native extraction", "asset producer runtime resolves an inference connection", "asset producer runtime resolves a managed reader connection" },
+    });
+    b.step("antfly-asset-inference-connection-test", "Verify managed connections for asset generation and extraction").dependOn(&b.addRunArtifact(asset_inference_connection_tests).step);
     const index_document_producer_tests = b.addTest(.{ .root_module = index_document_producer_mod, .filters = &.{"index document checkpoint producer"} });
     b.step("antfly-index-document-producer-test", "Verify native indexed document checkpoint propagation and final replay").dependOn(&b.addRunArtifact(index_document_producer_tests).step);
     const index_document_checkpoint_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/db/enrichment/document_checkpoints.zig"), .target = target, .optimize = optimize });
@@ -3125,6 +3130,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "table contract admits and preserves multi-source index requests",
         "table contract enforces stable graph source identities and numeric targets",
         "table contract admits and projects explicit embedding vector space",
+        "table contract admits embedding indexes backed by configured inference connections",
         "table contract retains pinned embedding identity through table and index admission and responses",
         "create index request defers upstream artifact resolution to merged catalog",
         "table contract rejects malformed multi-source members",
@@ -7128,7 +7134,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("completion-recovery-maintenance-test", "Verify retained completion scheduling and preserve legacy maintenance").dependOn(&addFilteredTestRunArtifact(b, completion_recovery_maintenance_tests).step);
     b.step("antfly-local-transaction-recovery-test", "Run local transaction recovery regressions").dependOn(&addFilteredTestRunArtifact(b, local_recovery_tests).step);
-    const server_db_filters = [_][]const u8{ "storage.server_db_integration_test.", "storage.server_transaction_recovery.", "storage.artifact_upload_recovery.", "storage.server_coordinated_ttl.", "storage.server_query_visibility.", "storage.server_document_child_range.", "storage.server_group_metadata." };
+    const server_db_filters = [_][]const u8{ "storage.server_db_integration_test.", "storage.server_transaction_recovery.", "storage.artifact_upload_recovery.", "storage.server_coordinated_ttl.", "storage.server_query_visibility.", "storage.server_document_child_range.", "storage.server_group_metadata.", "api.context_host." };
     const server_db_tests = b.addTest(.{
         .root_module = server_db_test_mod,
         .filters = &server_db_filters,
@@ -9129,6 +9135,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.coalesced_job_admission.",
             "storage.db.dense_publication_admission.",
             "storage.db.local_runtime_owner.",
+            "storage.db.context_api.",
+            "storage.db.context_host_json.",
             "storage.db.embedding_activity_cache.",
             "storage.db.managed_admission_owner.",
             "storage.db.result_collectors.",

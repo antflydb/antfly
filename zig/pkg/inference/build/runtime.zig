@@ -1052,7 +1052,12 @@ pub fn configureRuntimeLinks(
 }
 
 pub fn configureCudaVideo(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget, enabled: bool, paths: Paths) void {
-    if (!enabled or target.result.os.tag != .linux) return;
+    // The decoder binds the NVIDIA driver with dlopen at runtime and its
+    // headers are vendored, so it builds without CUDA. Zig callers reference
+    // its symbols whether or not the CUDA backend is enabled; linking it
+    // on every Linux build keeps `-Dcuda=false` links resolvable.
+    _ = enabled;
+    if (target.result.os.tag != .linux) return;
     module.addCSourceFile(.{ .file = b.path(pathJoin(b, paths.inference_root, "src/ops/cuda/video_decode.c")), .flags = &.{"-std=c11"} });
 }
 

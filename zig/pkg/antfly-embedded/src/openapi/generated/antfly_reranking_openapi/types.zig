@@ -53,7 +53,8 @@ pub const AntflyRerankerConfig = struct {
 /// Cloudflare Workers AI reranking. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference.
 pub const CloudflareRerankerConfig = struct {
     provider: []const u8,
-    account_id: []const u8,
+    /// Required for a direct Cloudflare model. A connection-qualified model takes the account from its connection.
+    account_id: ?[]const u8 = null,
     /// Optional AI Gateway ID, sent through cf-aig-gateway-id.
     gateway_id: ?[]const u8 = null,
     model: []const u8,
@@ -64,7 +65,7 @@ pub const CloudflareRerankerConfig = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "provider", "provider", false },
-        .{ "account_id", "account_id", false },
+        .{ "account_id", "account_id", true },
         .{ "gateway_id", "gateway_id", true },
         .{ "model", "model", false },
         .{ "api_key", "api_key", true },
@@ -83,8 +84,10 @@ pub const CloudflareRerankerConfig = struct {
         try jw.beginObject();
         try jw.objectField("provider");
         try jw.write(self.provider);
-        try jw.objectField("account_id");
-        try jw.write(self.account_id);
+        if (self.account_id) |value| {
+            try jw.objectField("account_id");
+            try jw.write(value);
+        }
         if (self.gateway_id) |value| {
             try jw.objectField("gateway_id");
             try jw.write(value);

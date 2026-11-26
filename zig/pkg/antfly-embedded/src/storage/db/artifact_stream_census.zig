@@ -132,7 +132,7 @@ pub fn requireStreamPlan(alloc: std.mem.Allocator, txn: anytype, request: Reques
 fn captureSession(alloc: std.mem.Allocator, txn: anytype, request: Request, plan: *const Plan, authority: publication.Authority) !vectors.CaptureSession(@TypeOf(txn)) {
     if (request.doc_key.len > checkpoints.max_cursor_bytes) return error.InvalidBatchRequest;
     if ((request.kind != .dense_embedding and request.kind != .sparse_embedding) or request.input_kind != .materialized_chunks or
-        request.embedding_input != .text or request.neighbor_context_json.len != 0) return error.OnlineMergeArtifactTailsUnsupported;
+        request.embedding_input != .text or (request.neighbor_context_json.len != 0 or request.context_sources_json.len != 0)) return error.OnlineMergeArtifactTailsUnsupported;
     // Validate even empty streams, then share authorization across this page.
     const bound = (try vectors.captureSession(alloc, txn, request, plan)) orelse return error.ArtifactCatalogDrift;
     if (!std.meta.eql(bound.authority, authority)) return error.ArtifactCatalogDrift;

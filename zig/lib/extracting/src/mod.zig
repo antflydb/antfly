@@ -276,40 +276,44 @@ pub const Runtime = struct {
 pub fn parseConfigFromSlice(alloc: Allocator, raw: []const u8) !Config {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidExtractionConfig;
+    return parseConfigFromValue(alloc, parsed.value);
+}
 
-    const provider_raw = stringField(parsed.value, "provider") orelse return error.InvalidExtractionConfig;
+pub fn parseConfigFromValue(alloc: Allocator, value: std.json.Value) !Config {
+    if (value != .object) return error.InvalidExtractionConfig;
+
+    const provider_raw = stringField(value, "provider") orelse return error.InvalidExtractionConfig;
     const provider = try parseProvider(provider_raw);
-    const schema_version_field = parsed.value.object.get("schema_version");
+    const schema_version_field = value.object.get("schema_version");
     const schema_version: u32 = if (schema_version_field) |version| blk: {
         if (version != .integer or (version.integer != 1 and version.integer != 2)) return error.UnsupportedExtractionSchemaVersion;
         break :blk @intCast(version.integer);
     } else 1;
     const schema_version_explicit = schema_version_field != null;
-    const model = if (stringField(parsed.value, "model")) |value| try alloc.dupe(u8, value) else "";
+    const model = if (stringField(value, "model")) |field| try alloc.dupe(u8, field) else "";
     errdefer if (model.len > 0) alloc.free(model);
 
-    const url_raw = stringField(parsed.value, "url") orelse stringField(parsed.value, "api_url");
-    const url = if (url_raw) |value| try alloc.dupe(u8, value) else "";
+    const url_raw = stringField(value, "url") orelse stringField(value, "api_url");
+    const url = if (url_raw) |field| try alloc.dupe(u8, field) else "";
     errdefer if (url.len > 0) alloc.free(url);
 
-    const api_key = if (stringField(parsed.value, "api_key")) |value| try alloc.dupe(u8, value) else null;
-    errdefer if (api_key) |value| alloc.free(value);
+    const api_key = if (stringField(value, "api_key")) |field| try alloc.dupe(u8, field) else null;
+    errdefer if (api_key) |field| alloc.free(field);
 
-    const account_id = if (stringField(parsed.value, "account_id")) |v| try alloc.dupe(u8, v) else null;
+    const account_id = if (stringField(value, "account_id")) |v| try alloc.dupe(u8, v) else null;
     errdefer if (account_id) |v| alloc.free(v);
-    const gateway_id = if (stringField(parsed.value, "gateway_id")) |v| try alloc.dupe(u8, v) else null;
+    const gateway_id = if (stringField(value, "gateway_id")) |v| try alloc.dupe(u8, v) else null;
     errdefer if (gateway_id) |v| alloc.free(v);
-    const bearer_token = if (stringField(parsed.value, "bearer_token")) |value| try alloc.dupe(u8, value) else null;
-    errdefer if (bearer_token) |value| alloc.free(value);
+    const bearer_token = if (stringField(value, "bearer_token")) |field| try alloc.dupe(u8, field) else null;
+    errdefer if (bearer_token) |field| alloc.free(field);
 
-    const schema_json = if (parsed.value.object.get("schema")) |schema|
+    const schema_json = if (value.object.get("schema")) |schema|
         try std.json.Stringify.valueAlloc(alloc, schema, .{})
     else
         try alloc.dupe(u8, "{}");
     errdefer alloc.free(schema_json);
 
-    const options_json = if (parsed.value.object.get("options")) |options|
+    const options_json = if (value.object.get("options")) |options|
         try std.json.Stringify.valueAlloc(alloc, options, .{})
     else
         try alloc.dupe(u8, "{}");

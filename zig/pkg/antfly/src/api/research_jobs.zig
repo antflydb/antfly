@@ -69,9 +69,25 @@ pub const JobState = enum { queued, running, succeeded, failed, cancelled };
 /// Persisted record. `request` is the research request JSON whose
 /// research_state is replaced after every pass; `result` is the latest
 /// ResearchAgentResult JSON.
+pub const Attribution = struct {
+    principal: []const u8,
+    tenant: ?[]const u8 = null,
+    project: ?[]const u8 = null,
+
+    pub fn matches(self: Attribution, other: Attribution) bool {
+        return std.mem.eql(u8, self.principal, other.principal) and
+            sameOptionalString(self.tenant, other.tenant) and sameOptionalString(self.project, other.project);
+    }
+
+    fn sameOptionalString(left: ?[]const u8, right: ?[]const u8) bool {
+        return if (left) |value| if (right) |other| std.mem.eql(u8, value, other) else false else right == null;
+    }
+};
+
 pub const Record = struct {
     job_id: []const u8,
     owner: []const u8,
+    attribution: ?Attribution = null,
     state: JobState,
     phase: []const u8 = "plan",
     query: []const u8 = "",
@@ -196,7 +212,7 @@ pub const Store = struct {
             if (active >= self.cfg.max_active_per_owner) return error.TooManyActiveJobs;
             outer = .{ .job_id = next.run_id, .owner = next.owner, .request = "", .state = .queued, .created_at_ms = nowMillis(), .updated_at_ms = nowMillis(), .expires_at_ms = 0 };
         }
-        outer.request = try std.json.Stringify.valueAlloc(a, next, .{});
+        outer.request = try std.json.Stringify.valueAlloc(a, next, .{ .emit_null_optional_fields = false });
         outer.state = std.meta.stringToEnum(JobState, @tagName(next.state)) orelse return error.InvalidDocumentCheckpoint;
         outer.phase = if (next.retired) "document-retired" else "document";
         outer.attempt = next.attempt;
@@ -407,6 +423,10 @@ pub const Store = struct {
     /// Create a queued job. Returns error.TooManyActiveJobs when the owner
     /// already has the configured number of non-terminal jobs.
     pub fn create(self: *Store, alloc: std.mem.Allocator, job_id: []const u8, owner: []const u8, query: []const u8, request: []const u8) ![]u8 {
+        return self.createWithAttribution(alloc, job_id, owner, query, request, null);
+    }
+
+    pub fn createWithAttribution(self: *Store, alloc: std.mem.Allocator, job_id: []const u8, owner: []const u8, query: []const u8, request: []const u8, attribution: ?Attribution) ![]u8 {
         const now = nowMillis();
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -420,6 +440,7 @@ pub const Store = struct {
         const record = Record{
             .job_id = job_id,
             .owner = owner,
+            .attribution = attribution,
             .state = .queued,
             .query = agent_tools.truncateUtf8(query, 4096),
             .request = request,
@@ -903,7 +924,7 @@ test "research job store survives reopen and recovers interrupted attempts" {
         const opened = try alloc.create(OpenedStore);
         opened.* = try OpenedStore.open(alloc, db_path);
         try store.attachOpenedStore(opened);
-        alloc.free(try store.create(alloc, "rsj_x", "alice", "q", "{\"query\":\"q\"}"));
+        alloc.free(try store.createWithAttribution(alloc, "rsj_x", "alice", "q", "{\"query\":\"q\"}", .{ .principal = "alice", .tenant = "acme", .project = "search" }));
         _ = (try store.begin(arena, "rsj_x", "alice", 60_000)).?.started;
     }
     var store = Store.init(alloc, .{});
@@ -914,6 +935,8 @@ test "research job store survives reopen and recovers interrupted attempts" {
     const recovered = (try store.load(arena, "rsj_x", "alice")).?;
     try std.testing.expectEqual(JobState.queued, recovered.state);
     try std.testing.expectEqualStrings("recovered_interrupted_attempt", recovered.last_error.?);
+    try std.testing.expect(recovered.attribution.?.matches(.{ .principal = "alice", .tenant = "acme", .project = "search" }));
+    try std.testing.expect(!recovered.attribution.?.matches(.{ .principal = "alice", .tenant = "other", .project = "search" }));
     try std.testing.expectEqual(@as(u64, 1), recovered.attempt);
 }
 

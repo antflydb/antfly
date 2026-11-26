@@ -336,6 +336,10 @@ pub const BatchRequest = struct {
     online_source: ?@import("online_source_contract.zig").Command = null,
     /// Ordered complete artifact catalog; accepted only by private Raft ingress.
     artifact_catalog: ?@import("artifact_inventory.zig").Command = null,
+    /// Leader-planned context-dependency effects or delivered change notices
+    /// (see enrichment/context_dependency_command.zig). Private Raft ingress
+    /// only; replicas validate the read set and apply verbatim.
+    context_dependency: ?@import("enrichment/context_dependency_command.zig").Command = null,
     /// Private grouped-source control; public batch JSON cannot populate it.
     group_source: ?@import("group_source_contract.zig").Command = null,
     /// Exact producer result; only authenticated owner-leader Raft ingress.
@@ -804,16 +808,20 @@ pub const EnrichmentConfig = struct {
     content_type: []const u8 = "",
     producer_json: []const u8 = "",
     neighbor_context: ?EnrichmentNeighborContextConfig = null,
+    /// Canonical context-source declaration (see
+    /// `enrichment/context_sources.zig`); public `context_sources`/`refresh`
+    /// objects are canonicalized into this form at the API edge.
+    context_sources_json: []const u8 = "",
     execution: ?EnrichmentExecutionConfig = null,
 
     pub fn clone(alloc: Allocator, cfg: EnrichmentConfig) !EnrichmentConfig {
         var out = cfg;
-        inline for (.{ "name", "field", "template", "source_artifact_name", "vector_space", "chunker_json", "content_type", "producer_json" }) |field| @field(out, field) = "";
+        inline for (.{ "name", "field", "template", "source_artifact_name", "vector_space", "chunker_json", "content_type", "producer_json", "context_sources_json" }) |field| @field(out, field) = "";
         out.source = null;
         out.prior_context = null;
         out.neighbor_context = null;
         errdefer out.deinit(alloc);
-        inline for (.{ "name", "field", "template", "source_artifact_name", "vector_space", "chunker_json", "content_type", "producer_json" }) |field| {
+        inline for (.{ "name", "field", "template", "source_artifact_name", "vector_space", "chunker_json", "content_type", "producer_json", "context_sources_json" }) |field| {
             const value = @field(cfg, field);
             if (value.len > 0) @field(out, field) = try alloc.dupe(u8, value);
         }
@@ -834,6 +842,7 @@ pub const EnrichmentConfig = struct {
         if (self.chunker_json.len > 0) alloc.free(self.chunker_json);
         if (self.content_type.len > 0) alloc.free(self.content_type);
         if (self.producer_json.len > 0) alloc.free(self.producer_json);
+        if (self.context_sources_json.len > 0) alloc.free(self.context_sources_json);
         if (self.neighbor_context) |*context| context.deinit(alloc);
         self.* = undefined;
     }
@@ -914,6 +923,7 @@ pub fn enrichmentConfigHash(cfg: EnrichmentConfig) u64 {
         hashLengthPrefixedBytes(&hasher, @tagName(context.direction));
         hashU32(&hasher, context.limit);
     }
+    if (cfg.context_sources_json.len != 0) hashLengthPrefixedBytes(&hasher, cfg.context_sources_json);
     return hasher.final();
 }
 
@@ -2306,7 +2316,19 @@ pub const GraphQueryDiagnosticSink = struct {
 };
 
 pub const IndexAliasFence = struct { name: []const u8, incarnation: u64 };
+pub const QueryInferenceBinding = struct {
+    connections: *const @import("../../common/config.zig").Config.ConnectionsConfig,
+    principal: ?[]const u8 = null,
+    metadata_json: []const u8 = "",
+};
+
 pub const SearchRequest = struct {
+    pub fn usesInferenceBinding(self: @This()) bool {
+        if (self.evaluation_limit > 0) return true;
+        const reranker = self.reranker orelse return false;
+        return std.mem.startsWith(u8, reranker.model, "connections/");
+    }
+
     pub fn hasHitEvaluation(self: @This()) bool {
         return self.evaluation_limit > 0 and !self.evaluation_graph;
     }
@@ -2315,6 +2337,8 @@ pub const SearchRequest = struct {
     /// a nonzero value must match the installed policy before reading data.
     index_alias_fences: []const IndexAliasFence = &.{},
     privacy_policy_version: ?[64]u8 = null,
+    // Borrowed from the trusted query coordinator. Never serialized.
+    inference_binding: ?QueryInferenceBinding = null,
     /// Trusted graph admission workspace; never part of the public wire DSL.
     graph_work_budget: ?*@import("../../graph/work_budget.zig").WorkBudget = null,
     /// Trusted request-local preparation, never decoded from public input.
@@ -2614,6 +2638,7 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "merge_config",
     "reranker",
     "reranker_query_text",
+    "inference_binding",
     "pruner",
     "expand_strategy",
     "max_chunks_per_parent",
@@ -6074,6 +6099,22 @@ pub const LeannPlanStatus = struct {
 
 /// Upper bound for one record: writes plus an inline generation.
 pub const leann_record_max_bytes: usize = 8 << 20;
+
+/// A context-dependency command is standalone, like a LEANN record.
+pub fn validateContextDependencyCommand(req: BatchRequest) !void {
+    const command = req.context_dependency orelse return;
+    command.validate() catch return error.InvalidBatchRequest;
+    const defaults = BatchRequest{};
+    inline for (@typeInfo(BatchRequest).@"struct".field_names, @typeInfo(BatchRequest).@"struct".field_types) |field_name, field_type| {
+        if (comptime std.mem.eql(u8, field_name, "document_version_scheme")) continue;
+        if (comptime !std.mem.eql(u8, field_name, "context_dependency") and !std.mem.eql(u8, field_name, "timestamp_ns") and !std.mem.eql(u8, field_name, "sync_level")) {
+            const value = @field(req, field_name);
+            if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
+                if (value.len != 0) return error.InvalidBatchRequest;
+            } else if (!std.meta.eql(value, @field(defaults, field_name))) return error.InvalidBatchRequest;
+        }
+    }
+}
 
 /// A LEANN record is a standalone private command: it carries no other
 /// effect, so replicas never apply part of a batch.

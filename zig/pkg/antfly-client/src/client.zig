@@ -536,7 +536,7 @@ pub const AntflyClient = struct {
         table_name: []const u8,
         artifact_name: []const u8,
         body: openapi.types.EnrichmentConfig,
-    ) !openapi.ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
+    ) !openapi.ApiResponse(std.json.Value) {
         return try self.inner.putArtifactEnrichment(table_name, artifact_name, body);
     }
 

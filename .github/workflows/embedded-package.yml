@@ -7,6 +7,10 @@ on:
         description: Keep registry inputs for stable publication and retries
         type: boolean
         default: true
+      archive_run_id:
+        description: Optional authenticated successful release build supplying native archives
+        type: string
+        default: ''
       version:
         required: true
         type: string
@@ -19,6 +23,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -37,6 +42,8 @@ jobs:
           pattern: antfly-zig-*
           merge-multiple: true
           path: dist/release-archives
+          run-id: ${{ inputs.archive_run_id || github.run_id }}
+          github-token: ${{ github.token }}
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:

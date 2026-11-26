@@ -35,7 +35,7 @@ pub const Authorizer = struct {
     manager: ?*const usermgr.UserManager = null,
     auth_enabled: bool = false,
 
-    fn signatureAlloc(
+    pub fn signatureAlloc(
         self: Authorizer,
         alloc: std.mem.Allocator,
         principal: []const u8,

@@ -58,6 +58,9 @@ pub const Request = struct {
     /// The caller guarantees server-side replay safety (for example a generation precondition).
     replay_safe: bool = false,
     attempt_observer: ?@import("attempt_observer.zig").AttemptObserver = null,
+    attempt_result_observer: ?@import("attempt_observer.zig").AttemptResultObserver = null,
+    attempt_report_request: ?u128 = null,
+    attempt_report_number: u32 = 0,
     remaining_timeout_header: ?[]const u8 = null,
     /// Borrowed through synchronous execution, including retries and redirects.
     /// Called before request bytes can reach the peer, never during setup.

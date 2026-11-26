@@ -653,6 +653,64 @@ def promote_feed(storage, channel, identity, feed):
     raise AssertionError("Unreachable feed publication state")
 
 
+def download_page(identity):
+    """A browser redirect, with a normal link for clients disabling refresh."""
+    validate_identity(identity)
+    short = identity["version"]
+    url = (
+        f"{POLICY['public_base_url']}/releases/{short}/"
+        f"Antfly-Dictation-{short}-arm64.zip"
+    )
+    root = ET.Element("html", lang="en")
+    head = ET.SubElement(root, "head")
+    ET.SubElement(head, "meta", charset="utf-8")
+    ET.SubElement(head, "meta", name="dictation-version", content=short)
+    ET.SubElement(head, "meta", {"http-equiv": "refresh", "content": f"0;url={url}"})
+    ET.SubElement(head, "title").text = "Download Antfly Dictation"
+    body = ET.SubElement(root, "body")
+    ET.SubElement(
+        body, "a", href=url
+    ).text = f"Download Antfly Dictation {short} for Apple Silicon"
+    return ET.tostring(root, encoding="utf-8", method="xml") + b"\n"
+
+
+def promote_download(storage, identity):
+    # Stable becomes the default permanently after its first publication. A
+    # newer beta still advances its Sparkle feed, but never the default download.
+    def order(tag):
+        parsed = version(tag)
+        return (parsed["channel"] == "stable", parsed["order"])
+
+    page = download_page(identity)
+    store = storage.channel_store(f"{POLICY['storage_prefix']}/download.html")
+    for attempt in range(3):
+        previous = store.load_bytes(max_bytes=256 * 1024)
+        if previous.body is not None:
+            root = ET.fromstring(previous.body)
+            meta = root.find("head/meta[@name='dictation-version']")
+            if meta is None or not meta.get("content"):
+                raise ValueError("Current download page has no release identity")
+            old = order("dictation/v" + meta.get("content"))
+            new = order(identity["tag"])
+            if new < old:
+                return "superseded"
+            if new == old:
+                if previous.body != page:
+                    raise ValueError(
+                        "Conflicting download page for an existing version"
+                    )
+                return "committed"
+        try:
+            store.compare_and_swap_bytes(
+                previous, page, "text/html; charset=utf-8", "no-cache, no-transform"
+            )
+            return "committed"
+        except ConditionalWriteConflict:
+            if attempt == 2:
+                raise
+    raise AssertionError("Unreachable download publication state")
+
+
 def publish(identity, directory, storage, source_verifier=None):
     source_verifier = source_verifier or verify_source
     source_verifier(identity)
@@ -717,9 +775,13 @@ def publish(identity, directory, storage, source_verifier=None):
     channels = (
         [identity["channel"]] if identity["channel"] == "beta" else ["stable", "beta"]
     )
-    return {
+    result = {
         channel: promote_feed(storage, channel, identity, feed) for channel in channels
     }
+    # All release bytes are verified and sealed before either discovery path
+    # advances. A retry repairs a partial feed/download update idempotently.
+    promote_download(storage, identity)
+    return result
 
 
 def recover(storage, tag, commit, ledger_sha256, out_dir):

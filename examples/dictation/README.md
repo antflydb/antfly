@@ -17,7 +17,11 @@ Antfly's existing native provider; the app does not ship a second speech engine.
 Official releases are Apple Silicon ZIPs containing a signed, notarized app and
 its pinned Antfly runtime.
 
-[Download v0.1.0-beta.1 for Apple Silicon](https://releases.antfly.io/antfly-dictation/releases/0.1.0-beta.1/Antfly-Dictation-0.1.0-beta.1-arm64.zip).
+[Download Antfly Dictation for Apple Silicon](https://releases.antfly.io/antfly-dictation/download.html).
+
+This permanent link follows the latest successfully published beta until a stable
+app release is available, then follows stable releases. Versioned downloads remain
+available for reproducible installs.
 
 After downloading:
 
@@ -222,7 +226,7 @@ Official downloads are Apple Silicon only and include a pinned, released Antfly 
 download Whisper Tiny, or use native Apple speech and cleanup on macOS 26+
 when the required assets and Apple Intelligence are ready. Automatic local presets
 prefer ready Apple speech and otherwise use Whisper; explicit transcriber choices
-are preserved. The bundled v0.3.1
+are preserved. The bundled v0.3.4
 runtime includes the Apple bridge. The app handles startup,
 authentication, model discovery, and shutdown. No separate server install is needed.
 Existing configurations keep their chosen external server. See [updates and
@@ -592,7 +596,7 @@ selected). This does not record microphone audio, paste text, or create history.
 Apple controls the download and does not expose percentage progress through this
 released runtime. Installation uses a separate cancellable HTTP session and an
 explicit `X-Antfly-Inference-Timeout-Ms: 1800000` budget supported by the pinned
-v0.3.1 engine. The setup request allows 30 minutes, with a short client grace period
+v0.3.4 engine. The setup request allows 30 minutes, with a short client grace period
 for the server's final response. Normal dictation keeps its existing shorter
 request budgets; this does not change inference defaults globally. Select another
 preset before setup to install/check its language separately. Regional equivalence

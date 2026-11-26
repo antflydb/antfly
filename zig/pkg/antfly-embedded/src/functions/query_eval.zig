@@ -67,6 +67,7 @@ fn applyBounded(a: std.mem.Allocator, req: types.SearchRequest, result: *types.S
         fallback_providers = managed.ProviderRuntime.init(std.heap.smp_allocator, io);
         break :owned &fallback_providers.?;
     };
+    const binding = req.inference_binding;
     var execution: runtime.Runtime = .{
         .profile_allocator = scratch,
         .registry = registry,
@@ -80,6 +81,9 @@ fn applyBounded(a: std.mem.Allocator, req: types.SearchRequest, result: *types.S
         .antfly_provider = options.antfly_provider,
         .antfly_api_key = if (@hasField(@TypeOf(options), "inference_api_key")) options.inference_api_key else null,
         .antfly_url = options.inference_api_url,
+        .inference_connections = if (binding) |value| value.connections else null,
+        .attribution_principal = if (binding) |value| value.principal else null,
+        .attribution_metadata_json = if (binding) |value| value.metadata_json else "",
     };
     defer execution.deinit();
     const provider = execution.provider();

@@ -1060,6 +1060,28 @@ pub const CoordinatedTtlRequest = extern struct {
 /// The receiver must clone all borrowed bytes before returning acceptance.
 pub const CoordinatedTtlEnqueueFn = *const fn (?*anyopaque, *const CoordinatedTtlRequest) callconv(.c) u8;
 
+/// Receives one response of a context call; bytes are borrowed for the
+/// duration of the callback only.
+pub const ContextConsumeFn = *const fn (?*anyopaque, BorrowedBytes) callconv(.c) Status;
+/// One context-dependency host operation (see storage/db/context_host_json.zig
+/// for `op` and the JSON request/response shapes) for the owner of
+/// `group_id`/`table_name`. Must not reenter the owner synchronously except
+/// for `propose`, which returns once the command applied on this replica.
+pub const ContextCallFn = *const fn (
+    ctx: ?*anyopaque,
+    op: u32,
+    group_id: u64,
+    table_name: BorrowedBytes,
+    request: BorrowedBytes,
+    consume_ctx: ?*anyopaque,
+    consume: ContextConsumeFn,
+) callconv(.c) Status;
+
+pub const ContextHooksConfig = extern struct {
+    callback_ctx: ?*anyopaque = null,
+    call_fn: ?ContextCallFn = null,
+};
+
 pub const RuntimeHooksConfig = extern struct {
     artifact_publication_ctx: ?*anyopaque = null,
     /// Zero means queue admission only. Native producers must observe their
@@ -1073,6 +1095,8 @@ pub const RuntimeHooksConfig = extern struct {
     promotion_owner_fn: ?PromotionOwnerFn = null,
     coordinated_ttl_ctx: ?*anyopaque = null,
     coordinated_ttl_enqueue_fn: ?CoordinatedTtlEnqueueFn = null,
+    /// Context-source dependencies across groups and tables (Raft owners).
+    context: ContextHooksConfig = .{},
 };
 
 /// Unspecified legacy callers retain the persisted table policy. Explicit
@@ -2083,6 +2107,7 @@ pub extern fn antfly_storage_context_configure_native_queries(context: ?*anyopaq
 /// the configured secret facade per request. Configure before opening any
 /// table owner; empty values clear the defaults.
 pub extern fn antfly_storage_context_configure_inference_defaults(context: ?*anyopaque, api_url: BorrowedBytes, api_key: BorrowedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_context_configure_inference_connections(context: ?*anyopaque, connections: ?*const anyopaque) callconv(.c) Status;
 
 /// Replaces the context-owned remote-content security snapshot before any
 /// table owner opens. The payload is a ContentSecurityConfig JSON object.

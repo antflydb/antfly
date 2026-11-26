@@ -50,9 +50,9 @@ pub fn context(server: anytype) !storage.Context {
     if (server.document_job_store.replicated != null and (term == 0 or server.document_job_store.replicated_term.load(.acquire) != term)) return error.DocumentStorageNotConfigured;
     return .{ .metadata = &server.document_job_store, .artifacts = server.cfg.document_artifact_store orelse if (server.document_artifact_files) |*files| files.artifactStore() else return error.DocumentStorageNotConfigured, .io = server.inferenceIo(), .leadership_term = server.restore_leadership_term.load(.acquire) };
 }
-pub fn handle(server: anytype, ctx: *httpx.Context, principal: []const u8, operation: Operation, action: Action) !httpx.Response {
+pub fn handle(server: anytype, ctx: *httpx.Context, principal: []const u8, username: ?[]const u8, metadata_json: []const u8, operation: Operation, action: Action) !httpx.Response {
     var budget: sources.sql_memory_budget = .{ .backing = ctx.allocator, .limit = 128 * 1024 * 1024 };
-    return handleBounded(server, ctx, principal, operation, action, budget.allocator()) catch |err| {
+    return handleBounded(server, ctx, principal, username, metadata_json, operation, action, budget.allocator()) catch |err| {
         if (budget.exhausted) return error.InferenceRequestTooLarge;
         return err;
     };
@@ -139,7 +139,7 @@ const LeaseRenewal = struct {
     }
 };
 
-fn handleBounded(server: anytype, ctx: *httpx.Context, principal: []const u8, operation: Operation, action: Action, backing: A) !httpx.Response {
+fn handleBounded(server: anytype, ctx: *httpx.Context, principal: []const u8, username: ?[]const u8, metadata_json: []const u8, operation: Operation, action: Action, backing: A) !httpx.Response {
     if (!server.publicInferenceEnabled()) return gateway.disabledResponse(ctx);
     var arena = std.heap.ArenaAllocator.init(backing);
     defer arena.deinit();
@@ -199,6 +199,16 @@ fn handleBounded(server: anytype, ctx: *httpx.Context, principal: []const u8, op
         };
         // Resolve and enforce Antfly compatibility before persisting a job.
         _ = try connections.inferenceConnectionAdmissionOwner(server.cfg.node_config, server.cfg.local_inference_connection_target, connection, @tagName(operation));
+        const config_policy = @import("antfly_local_sources").common_config;
+        const attribution_scope = try config_policy.inferenceScopeFromAuthenticatedMetadata(a, metadata_json);
+        const attribution_principal: ?[]const u8 = blk: {
+            const config = server.cfg.node_config orelse break :blk null;
+            const configured = config.connections.get(connection) orelse break :blk null;
+            const inference = configured.inference orelse break :blk null;
+            const attribution = inference.attribution orelse break :blk null;
+            _ = try config_policy.selectInferenceAttribution(a, attribution, config_policy.authenticatedInferenceAttribution(attribution, username, attribution_scope));
+            break :blk username;
+        };
         try request.object.put(a, "model", .{ .string = model });
         if (operation == .read) {
             _ = request.object.swapRemove("retain_artifact");
@@ -218,7 +228,7 @@ fn handleBounded(server: anytype, ctx: *httpx.Context, principal: []const u8, op
         var id_buffer: [36]u8 = undefined;
         const id = jobs.formatJobId(&id_buffer, entropy);
         const identity: runs.Identity = .{ .request = digest(bytes), .sources = @splat(0), .definition = @splat(0), .models = @splat(0), .runtime = @splat(0) };
-        try store.create(.{ .run_id = id, .owner = principal, .operation = operation, .connection = connection, .prepared = false, .identity = identity, .retention_until_ms = now() + retention * 1000, .limits = .{ .calls = 10_000, .tokens = 1_000_000, .pixels = 400_000_000, .source_bytes = 64 * 1024 * 1024 + bytes.len, .output_bytes = 256 * 1024 * 1024 }, .inputs = &.{} });
+        try store.create(.{ .run_id = id, .owner = principal, .attribution_principal = attribution_principal, .attribution_tenant = if (attribution_principal != null and attribution_scope != null) attribution_scope.?.tenant else null, .attribution_project = if (attribution_principal != null and attribution_scope != null) attribution_scope.?.project else null, .operation = operation, .connection = connection, .prepared = false, .identity = identity, .retention_until_ms = now() + retention * 1000, .limits = .{ .calls = 10_000, .tokens = 1_000_000, .pixels = 400_000_000, .source_bytes = 64 * 1024 * 1024 + bytes.len, .output_bytes = 256 * 1024 * 1024 }, .inputs = &.{} });
         const lease = try store.claim(a, id, principal, identity, now(), lease_ms);
         errdefer store.fail(a, lease, now()) catch {};
         var renewal = LeaseRenewal{ .persistence = &persistence, .lease = lease };
@@ -375,7 +385,7 @@ pub fn Work(comptime Server: type) type {
             var transport_budget: sources.sql_memory_budget = .{ .backing = self.server.alloc, .limit = 256 * 1024 * 1024 };
             var client = httpx.Client.initWithConfig(transport_budget.allocator(), self.server.inferenceIo(), .{ .keep_alive = false, .max_response_size = 1024 * 1024 * 1024, .max_error_response_size = 64 * 1024, .retry_policy = .{ .max_retries = 0 } });
             defer client.deinit();
-            var response = connections.invokeInferenceConnectionWithRequest(a, &client, self.server.cfg.node_config, self.server.cfg.local_inference_connection_target, self.server.cfg.secret_store, record.connection, @tagName(record.operation), request, httpx.CancellationToken.fromCallback(self, cancelledFn), @import("antfly_platform").time.monotonicNs() + 1_800_000 * std.time.ns_per_ms, .{}, .post, .{ .document_store = binding.view(), .document_allocator = transport_budget.allocator() }) catch |err| {
+            var response = connections.invokeInferenceConnectionWithRequest(a, &client, self.server.cfg.node_config, self.server.cfg.local_inference_connection_target, self.server.cfg.secret_store, record.connection, @tagName(record.operation), request, httpx.CancellationToken.fromCallback(self, cancelledFn), @import("antfly_platform").time.monotonicNs() + 1_800_000 * std.time.ns_per_ms, .{}, .post, .{ .document_store = binding.view(), .document_allocator = transport_budget.allocator(), .attribution_principal = record.attribution_principal, .attribution_scope = if (record.attribution_tenant) |tenant| .{ .tenant = tenant, .project = record.attribution_project } else null, .request_id = record.run_id }) catch |err| {
                 if (cancelledFn(self)) return;
                 try self.settleFailure(a, store, lease, failures.fromError(err));
                 return;

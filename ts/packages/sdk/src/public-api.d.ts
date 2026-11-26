@@ -2599,6 +2599,67 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}/dependencies": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Percent-encoded source document key. */
+                key: string;
+                /** @description Name of an asset enrichment that declares context sources. */
+                artifactName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Inspect an artifact's context dependencies and freshness
+         * @description Returns the dependency state of one generated artifact: its freshness,
+         *     live subscriptions, and retained lineage manifests. With
+         *     `freshness=require_current` the read waits up to `wait_timeout_ms` for
+         *     a read barrier: every group of every source table the enrichment reads
+         *     has delivered all committed change notices for this table, this
+         *     group's inbox has applied them, and the artifact's state is current.
+         *     Otherwise it answers 409 `artifact_not_current`. The route is
+         *     shard-aware and requires read permission on the table.
+         */
+        get: operations["getArtifactDependencies"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/dependencies/impact": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the source table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Find generated artifacts that consumed a source document
+         * @description Reverse lineage for one source document key: retained dependent artifact
+         *     versions confirmed against their lineage manifests, from every table
+         *     whose enrichments read this table, and optionally their same-document
+         *     downstream consumers. Rows from tables the caller may not read are
+         *     omitted and make the response incomplete.
+         */
+        post: operations["analyzeDependencyImpact"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess": {
         parameters: {
             query?: never;
@@ -9566,6 +9627,106 @@ export interface components {
             child_count: number;
             /** @description Approximate extracted text bytes covered by this range when available. */
             text_bytes?: number | null;
+        };
+        /**
+         * @description Dependency state of one document artifact whose enrichment declares
+         *     `context_sources`. `freshness` is null when the artifact was never
+         *     generated with context dependencies. Freshness (`current`, `stale`,
+         *     `failed`, `pending`) is reported separately from rebuild execution
+         *     state. `versions` lists retained lineage manifests, newest first.
+         */
+        ArtifactDependencies: {
+            /** @description State, generation, published generation, version, validated-through frontier, input fingerprint, rebuild state, and bounded change reasons. */
+            freshness: {
+                [key: string]: unknown;
+            } | null;
+            /**
+             * Format: int64
+             * @description Live subscription tuples registered for this artifact.
+             */
+            subscriptions?: number;
+            versions: {
+                [key: string]: unknown;
+            }[];
+            /** @description Each declared context source with its effective tracking. A ranked query (or a source declared `snapshot`) keeps the artifact `unverified`. */
+            sources?: {
+                name?: string;
+                /** @enum {string} */
+                kind?: "document" | "query";
+                /** @enum {string} */
+                tracking?: "live" | "snapshot";
+                ranked?: boolean;
+                /** @description A live graph traversal (`graph_queries` traverse). */
+                traversal?: boolean;
+            }[];
+            /**
+             * @description Present when `freshness=require_current` was requested: true when a
+             *     read barrier observed no undelivered committed change to any of the
+             *     artifact's source tables and its dependency state is current.
+             */
+            current?: boolean;
+        };
+        ArtifactNotCurrent: {
+            /** @enum {string} */
+            error: "artifact_not_current";
+            message: string;
+            retryable: boolean;
+            /** @description What kept the artifact from being current when the wait ended (for example `stale`, `inbox`, or `outbox:<table>`). */
+            pending?: string[];
+            dependencies: components["schemas"]["ArtifactDependencies"];
+        };
+        DependencyImpactRequest: {
+            /** @description Source document key whose dependents are requested. */
+            key: string;
+            /** @description Optional hex input revision; only outputs that consumed that revision are returned. */
+            revision?: string;
+            /**
+             * @description `transitive` follows every dependent output onward: same-document artifacts that consume it (live candidates with their path) and rows of any table whose declarations read it as `_artifacts.<name>` (with `via`), up to `max_depth` hops.
+             * @default direct
+             * @enum {string}
+             */
+            traversal?: "direct" | "transitive";
+            /** @default 8 */
+            max_depth?: number;
+            /** @default 100 */
+            limit?: number;
+        };
+        DependencyImpactRow: {
+            table_id: string;
+            /** @description Public name of the dependent table, when visible to the caller. */
+            table?: string;
+            key: string;
+            artifact: string;
+            /** Format: int64 */
+            version?: number;
+            historical?: boolean;
+            live_candidate?: boolean;
+            freshness: string;
+            /** @description Same-document artifact chain from the consumed input to this output. */
+            path: string[];
+            /** @description Transitive rows only, the generated outputs (in other rows or tables) this dependent consumed on the way from the input, nearest the input first. */
+            via?: {
+                table?: string;
+                key?: string;
+                artifact?: string;
+            }[];
+        };
+        /**
+         * @description Reverse lineage of one source document: dependent artifact versions that
+         *     consumed it, across every table whose enrichments read this table. A
+         *     dependency establishes possible impact, not that regenerated bytes
+         *     differ. `complete` is false whenever a depth or row budget was reached
+         *     or a group could not be read.
+         */
+        DependencyImpactResponse: {
+            input: {
+                table_id?: string;
+                key?: string;
+            };
+            dependents: components["schemas"]["DependencyImpactRow"][];
+            complete: boolean;
+            traversal: string;
+            semantics?: string;
         };
         /**
          * @description Inspection view for a derived document artifact produced from a source
@@ -17189,7 +17350,8 @@ export interface components {
         CloudflareGeneratorConfig: {
             /** @enum {string} */
             provider: "cloudflare";
-            account_id: string;
+            /** @description Required for a direct model. A connection-qualified model takes the account from its connection. */
+            account_id?: string;
             /** @description Optional AI Gateway ID, sent through cf-aig-gateway-id. */
             gateway_id?: string;
             /** @default @cf/meta/llama-3.3-70b-instruct-fp8-fast */
@@ -17666,7 +17828,8 @@ export interface components {
              * @enum {string}
              */
             provider: "cloudflare";
-            account_id: string;
+            /** @description Required for a direct model. A connection-qualified model takes the account from its connection. */
+            account_id?: string;
             /** @description Optional AI Gateway ID, sent through cf-aig-gateway-id. */
             gateway_id?: string;
             /** @default @cf/baai/bge-base-en-v1.5 */
@@ -18590,7 +18753,8 @@ export interface components {
         CloudflareSTTConfig: {
             /** @enum {string} */
             provider: "cloudflare";
-            account_id: string;
+            /** @description Required for a direct Cloudflare model. A connection-qualified model takes the account from its connection. */
+            account_id?: string;
             gateway_id?: string;
             /** @default @cf/openai/whisper-large-v3-turbo */
             model: string;
@@ -18847,6 +19011,127 @@ export interface components {
              */
             limit?: number;
         };
+        EnrichmentContextDocument: {
+            /** @description Table holding the referenced document; omitted means the enrichment's own table. Resolved to an immutable table identity at admission, so renaming or recreating a table cannot retarget the dependency. */
+            table?: string;
+            /** @description JSON pointer into the source document yielding the referenced key. */
+            key_from: string;
+        };
+        /** @description Ranking clause: a read-only Cypher statement against a graph, run as the principal that declared the enrichment (its graph and table permissions and row policies apply; the server binds the declaration to that principal, and revoking the credential stops rebuilds). Members are the nodes of the source `table` the statement returns, anywhere in a row (bare nodes, paths, lists, maps), in result order, each once, up to `limit`, and render as those rows' `fields`. Nodes of other tables are context the statement used, not members. Only `limit` may sit beside it. A Cypher source is a snapshot: a statement's result depends on rows it does not return, so dependents rebuild on `refresh_interval` or manually. Statements that write (`CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`) or `EXPLAIN` are rejected. */
+        EnrichmentContextCypher: {
+            /** @description Graph name (see `/graphs/{graphName}`). */
+            graph: string;
+            /** @description Cypher statement. */
+            query: string;
+            /** @description Statement parameters; values are literals or `{"$source":"/pointer"}` bindings from the dependent row. */
+            parameters?: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description Ranking clause: a read-only SQL `SELECT` (see `POST /sql`), run as the principal that declared the enrichment (its table permissions and row policies apply; the server binds the declaration to that principal, and revoking the credential stops rebuilds). Members are the rows of the source `table` named by the result's `_id` column (every table exposes its document key as `_id`; alias another key column `AS _id`), in result order, each once, up to `limit`, and render as those rows' `fields`. A result without an `_id` column fails. Results are admitted up to 4096 rows; a larger result fails rather than truncating, so bound it with `LIMIT`. Only `limit` may sit beside it. A SQL source is a snapshot: dependents rebuild on `refresh_interval` or manually. Any statement but a `SELECT` is rejected. Embedded Lite resolves names in its single catalog and rejects `database` and `namespace`. */
+        EnrichmentContextSql: {
+            /** @description One SQL SELECT statement. */
+            statement: string;
+            /** @description Positional parameters (`$1`, `$2`, ...); values are literals or `{"$source":"/pointer"}` bindings from the dependent row. */
+            parameters?: unknown[];
+            /** @description Database used to resolve unqualified names (default `default`). */
+            database?: string;
+            /** @description Namespace used to resolve unqualified table names (default `public`). */
+            namespace?: string;
+        };
+        /** @description A filter (tracked live) or a ranked retrieval (a snapshot). Any ranking clause makes the whole query a public QueryRequest executed by the table's query engine, with `{"$source":"/pointer"}` bindings anywhere; `limit` (at most 1000) is then the member count, and paging (`offset`, `search_after`, `search_before`), `count`, `aggregations`, and a top-N `order_by` are rejected. Distributed tables refuse `semantic_search` (data servers have no query embedder); pass precomputed vectors in `embeddings` instead. */
+        EnrichmentContextQuery: {
+            /** @description Table queried; omitted means the enrichment's own table. */
+            table?: string;
+            /** @description An Antfly `filter_query` (Query shape): `bool` (`must`/`filter`/`should`/`must_not`/`minimum_should_match`, filter-context semantics), `conjuncts`, `disjuncts` (`min`), `match_all`, `match_none`, and leaves. Leaves evaluated by context resolution itself: `term`/`terms` (equality; at the top of the conjunction they form indexed subscriptions, at most one bound `terms` set), `range` (`gt`/`gte`/`lt`/`lte`), `numeric_range`/`term_range` (`min`/`max`/`inclusive_*`), `prefix`, `match` and `match_phrase` (pinned `antfly.context.simple.v1` analyzer: lowercase ASCII words; `operator` and|or), and `similar` (`{vector, threshold, metric: cosine|dot, dims, model}` over a vector stored in a document field). Every other row-decidable leaf (wildcard, regexp, fuzzy, date and IP ranges, geo, bool fields, `exists`, doc ids, `equals`/`contains`/`matches`) is lowered at admission into the storage engine's per-row filter and evaluated per changed row. Values are literals or typed bindings `{"$source":"/json/pointer"}` from the source document (in storage-evaluated leaves, string-valued positions only). Corpus-relative text queries (`query_string`, `multi_match`, analyzer-specific `match`) are rejected in a live filter; express them as a ranking clause (`full_text_search`) instead. */
+            filter_query?: Record<string, never>;
+            /** @description Live filters only: top-N by a field (ties by key); `max_documents` is N. Invalidation tracks the current boundary. */
+            order_by?: {
+                field: string;
+                /**
+                 * @default asc
+                 * @enum {string}
+                 */
+                order?: "asc" | "desc";
+            };
+            /** @description Ranking clause: full-text relevance (QueryRequest shape). */
+            full_text_search?: Record<string, never>;
+            /** @description Ranking clause: query text embedded for vector search (QueryRequest shape). */
+            semantic_search?: unknown;
+            /** @description Ranking clause: precomputed query vectors by index (QueryRequest shape). */
+            embeddings?: Record<string, never>;
+            indexes?: string[];
+            merge_config?: Record<string, never>;
+            reranker?: Record<string, never>;
+            exclusion_query?: Record<string, never>;
+            /** @description Graph operations (QueryRequest shape). Exactly one `traverse` from the dependent row (or `start: {keys: [{"$source": "/pointer"}]}`) with only `edge_types`, `direction`, `max_depth` (at most 3), and the context options `max_fanout` (edges per visited node, default 100) and `include_generated` (also follow field-derived and enrichment-generated edges) is a live traversal: dependents watch every visited node's edges and every reached row, members render with depth, edge type, and direction, and `max_documents` bounds the rows reached. A `filter_query` beside it narrows the reached rows and stays live. Anything else (`match`, shortest paths, `edge_filter`, `edge_weight`, `limit`, metrics, deeper traversals, several operations) runs in the query engine as a snapshot. */
+            graph_queries?: Record<string, never>;
+            cypher?: components["schemas"]["EnrichmentContextCypher"];
+            sql?: components["schemas"]["EnrichmentContextSql"];
+            /** @description Ranked queries: member count. */
+            limit?: number;
+            /** @description Shorthand ranking clause: query text literal or `{"$source":"/pointer"}`, with `text_field`. */
+            text?: unknown;
+            text_field?: string;
+            /** @description Shorthand ranking clause: `{"$source":"/pointer"}` to a query vector in the dependent row, with `vector_index`. */
+            vector?: Record<string, never>;
+            vector_index?: string;
+            /** @default 10 */
+            k?: number;
+        };
+        /** @description One named context source: exactly one of `document` (a referenced row) or `query` (a filter, a graph traversal, or a ranked retrieval). `tracking` decides the freshness guarantee. A query whose membership is decided row by row is tracked live: subscriptions invalidate dependents exactly and they can be `current`. That covers a `filter_query` (optionally with a top-N `order_by`) and one plain bounded `graph_queries` traverse (optionally with a `filter_query` narrowing the rows it reaches). A query with any ranking clause (`full_text_search`, `semantic_search`, `embeddings`, `indexes`, `merge_config`, `reranker`, `exclusion_query`, `limit`, `cypher`, `sql`, the `text`/`vector` shorthands, or `graph_queries` beyond one plain bounded traverse) depends on the whole corpus and is a snapshot: its dependents are `unverified` and rebuild on `refresh_interval` or manually. Registration reports each source's effective tracking and, for a snapshot, the clause that made it one. */
+        EnrichmentContextSource: {
+            document?: components["schemas"]["EnrichmentContextDocument"];
+            query?: components["schemas"]["EnrichmentContextQuery"];
+            /** @description Projected fields consumed by the producer (dotted paths). Only these fields, predicate fields, and the order field participate in fingerprints and invalidation. `_artifacts.<artifact>[.<path>]` reads a row's generated output (asset: parsed JSON or text; chunk: array of chunk payloads; embedding: document vector) and may be used in projections and predicates; when the artifact is regenerated, dependents are invalidated like for a field change. Admission rejects artifacts that depend on the consuming enrichment (directly, through artifact streams, through other context sources, or across tables). Other fields starting with `_` are reserved and rejected. */
+            fields: string[];
+            /**
+             * @description Document sources only: a missing referenced document fails the rebuild explicitly instead of rendering null.
+             * @default false
+             */
+            required?: boolean;
+            /**
+             * Format: uint32
+             * @description Query sources: maximum members (for a traversal, rows reached). Exceeding it fails explicitly; with `order_by` it is the declared top-N.
+             * @default 100
+             */
+            max_documents?: number;
+            /**
+             * Format: uint32
+             * @description Query sources with residual predicates (range, prefix, match, similar) or `order_by`: maximum candidate rows examined after equality filtering. Exceeding it fails explicitly.
+             * @default 1000
+             */
+            max_candidates?: number;
+            /**
+             * Format: uint64
+             * @description Maximum rendered bytes for this source.
+             * @default 1048576
+             */
+            max_bytes?: number;
+            /**
+             * @default error
+             * @enum {string}
+             */
+            overflow?: "error";
+            /**
+             * @description Defaults to the strongest guarantee the source supports: `live` for filters, `snapshot` for ranked queries. `live` registers subscriptions and keeps dependents current. `snapshot` registers nothing: dependents publish with freshness `unverified` (never `current`), rebuild on `refresh_interval` or manually, and `freshness=require_current` dependency reads refuse them. Declaring `live` asserts the guarantee: a query with a ranking clause is then rejected (400 `context_source_requires_snapshot`) instead of silently becoming a snapshot. Declaring `snapshot` opts a filter out of live tracking.
+             * @enum {string}
+             */
+            tracking?: "live" | "snapshot";
+            /** @description Snapshot sources only: rebuild interval (at least 1s). */
+            refresh_interval?: string;
+        };
+        /** @description Rebuild policy for context-source invalidation. Invalidation (stale freshness) is always reported immediately; debounce only coalesces rebuild work. */
+        EnrichmentRefreshConfig: {
+            /**
+             * @description `background` journals rebuilds automatically; `manual` only marks dependents stale (rebuild with the reprocess endpoints).
+             * @default background
+             * @enum {string}
+             */
+            mode?: "background" | "manual";
+            /** @description Coalescing delay before a background rebuild (for example `2s`). */
+            debounce?: string;
+        };
         /** @description Non-semantic execution policy for one producer or index maintenance operation. Updates persist separately from the frozen publication catalog and affect future invocations without invalidating accepted artifacts. To retry incomplete extraction or regenerate accepted output, explicitly use the bounded reprocess APIs. Node/provider ceilings still apply. */
         ExecutionPolicy: {
             /**
@@ -18978,6 +19263,11 @@ export interface components {
             producer_json?: string;
             /** @description Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator, extractor, or decision); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission. */
             neighbor_context?: components["schemas"]["EnrichmentNeighborContextConfig"];
+            /** @description Named cross-document context consumed by this asset producer, rendered as a canonical `{"context":{<name>:...}}` block appended to the producer input and folded into its skip state. Changes to consumed inputs (projected fields, query membership, insertion of a first match, deletion, TTL expiry, or a missing optional document becoming present) invalidate and rebuild the artifact; unrelated rows and unconsumed fields do not. Only valid on asset enrichments whose producer consumes prompt text. Supported by embedded runtimes (single-table and multi-table Lite) and by distributed tables, where context sources are declared through the artifact enrichment endpoint (not inline at table creation) and admission resolves table names and rejects cross-table generated-input cycles. Context reads execute as the declaring principal: it must be able to read every source table, and its row filter on each is conjoined into query sources (filters, traversals, and ranked queries) at declaration (document sources, ranked graph operations, and the `text`/`vector` shorthands are refused where a row filter applies). Re-declare the enrichment to re-capture changed policies. */
+            context_sources?: {
+                [key: string]: components["schemas"]["EnrichmentContextSource"];
+            };
+            refresh?: components["schemas"]["EnrichmentRefreshConfig"];
             /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
             execution?: components["schemas"]["ExecutionPolicy"];
             /** @description Typed shorthand for a transcription asset enrichment. Only valid with kind=asset and without producer_json; Antfly expands it into a document_extraction producer whose audio route transcribes each recording with this speech-to-text provider. The produced units carry the transcript text, provider confidence, and per-phrase time offsets, and chunk enrichments that consume them emit _start_time_ms/_end_time_ms on every chunk. With diarization: true the phrases also carry who spoke them, and a chunk that does not straddle a turn emits _speaker. content_type defaults to application/json. */
@@ -19464,9 +19754,9 @@ export interface components {
             output?: components["schemas"]["ConstrainedOutput"];
             probabilities?: components["schemas"]["ConstrainedProbabilities"];
             batch?: components["schemas"]["ConstrainedGenerationBatch"];
-            /** @description Required for Antfly, OpenAI, and Cloudflare; Jev defaults to jev-latest. Cloudflare uses @cf/cloudflare/clef or @cf/cloudflare/clef-flash. */
+            /** @description Required for Antfly, OpenAI, and Cloudflare; Jev defaults to jev-latest. Typed deciders may select a connection-qualified model with models.decide. Cloudflare uses @cf/cloudflare/clef or @cf/cloudflare/clef-flash. */
             model?: string;
-            /** @description Required with the cloudflare provider; Workers AI account identifier. */
+            /** @description Workers AI account identifier. Required for a direct Cloudflare model. A connection-qualified model takes it from its connection. */
             account_id?: string;
             /** @description Optional Cloudflare AI Gateway identifier. */
             gateway_id?: string;
@@ -23523,7 +23813,8 @@ export interface components {
         CloudflareRerankerConfig: {
             /** @enum {string} */
             provider: "cloudflare";
-            account_id: string;
+            /** @description Required for a direct Cloudflare model. A connection-qualified model takes the account from its connection. */
+            account_id?: string;
             /** @description Optional AI Gateway ID, sent through cf-aig-gateway-id. */
             gateway_id?: string;
             /** @default @cf/baai/bge-reranker-base */
@@ -38370,13 +38661,27 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Artifact enrichment registered */
+            /**
+             * @description Artifact enrichment registered. With `context_sources`, reports each
+             *     source's effective tracking (`live` or `snapshot`) and, for a
+             *     snapshot, the ranking clause that made it one (or `declared`).
+             */
             201: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": {
+                        context_sources?: {
+                            [key: string]: {
+                                /** @enum {string} */
+                                kind?: "document" | "query";
+                                /** @enum {string} */
+                                tracking?: "live" | "snapshot";
+                                reason?: string;
+                            };
+                        };
+                    };
                 };
             };
             400: components["responses"]["BadRequest"];
@@ -38616,6 +38921,80 @@ export interface operations {
                     };
                 };
             };
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getArtifactDependencies: {
+        parameters: {
+            query?: {
+                freshness?: "any" | "require_current";
+                wait_timeout_ms?: number;
+            };
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Percent-encoded source document key. */
+                key: string;
+                /** @description Name of an asset enrichment that declares context sources. */
+                artifactName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Dependency state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ArtifactDependencies"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description The artifact did not become current before the wait ended. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ArtifactNotCurrent"];
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    analyzeDependencyImpact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the source table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DependencyImpactRequest"];
+            };
+        };
+        responses: {
+            /** @description Impact rows */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DependencyImpactResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
             500: components["responses"]["InternalServerError"];
             503: components["responses"]["ServiceUnavailable"];
         };

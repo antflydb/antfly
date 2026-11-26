@@ -57,6 +57,7 @@ export async function downloadCatalogModel(
     onProgress?: (p: InferenceProgress) => void;
     cache?: boolean;
     assets?: string;
+    sameOriginCredentials?: boolean;
   } = {}
 ) {
   if (!model.files.length)
@@ -135,9 +136,13 @@ export async function downloadCatalogModel(
       }
       if (!file) {
         const fetchFile = async (persist: boolean): Promise<Blob> => {
+          const authenticated =
+            options.sameOriginCredentials &&
+            new URL(pin.url, location.href).origin === location.origin;
           const response = await fetch(pin.url, {
             signal: options.signal,
-            credentials: "omit",
+            credentials: authenticated ? "same-origin" : "omit",
+            ...(authenticated ? { redirect: "error" } : {}),
             referrerPolicy: "no-referrer",
           });
           if (!response.ok || !response.body)

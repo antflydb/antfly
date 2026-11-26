@@ -174,6 +174,7 @@ pub const Context = struct {
     space: []const u8 = "",
     execution_principal: []const u8 = "",
     execution_signature: []const u8 = "",
+    execution_attribution_metadata_json: []const u8 = "",
     durable_execution_required: bool = false,
     principal: []const u8,
     admin: bool = false,
@@ -302,7 +303,7 @@ pub const Service = struct {
             var config = try parse(t.Config, a, body);
             config.generation = 1;
             config.embedding_generation = 1;
-            run.state = .{ .table_id = self.context.table_id, .database = self.context.database, .namespace = self.context.namespace, .space = self.context.space, .execution_principal = self.context.execution_principal, .execution_signature = self.context.execution_signature, .execution_owner = self.context.principal, .config = config, .owner = self.context.principal, .created_at = self.context.now_ms };
+            run.state = .{ .table_id = self.context.table_id, .database = self.context.database, .namespace = self.context.namespace, .space = self.context.space, .execution_principal = self.context.execution_principal, .execution_signature = self.context.execution_signature, .execution_attribution_metadata_json = self.context.execution_attribution_metadata_json, .execution_owner = self.context.principal, .config = config, .owner = self.context.principal, .created_at = self.context.now_ms };
         } else {
             const row = state_row orelse return error.MemorySpaceNotFound;
             run.state = try parse(t.State, a, row.json);
@@ -382,6 +383,7 @@ pub const Service = struct {
             .required_grant = required_grant,
             .execution_principal = self.context.execution_principal,
             .execution_signature = self.context.execution_signature,
+            .execution_attribution_metadata_json = self.context.execution_attribution_metadata_json,
             .id = if (receipt_key.len > 0) receipt_identity else "",
             .branch = run.service.context.branch,
             .action = @tagName(action),
@@ -440,6 +442,7 @@ pub const Service = struct {
                 if (self.context.execution_signature.len > 0) {
                     run.state.execution_principal = self.context.execution_principal;
                     run.state.execution_signature = self.context.execution_signature;
+                    run.state.execution_attribution_metadata_json = self.context.execution_attribution_metadata_json;
                     run.state.execution_owner = self.context.principal;
                 }
                 if (config.retention_ms != run.state.config.retention_ms) run.state.next_expiry_at = self.context.now_ms;

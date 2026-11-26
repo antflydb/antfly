@@ -113,6 +113,24 @@ export function safeFilename(value) {
       .slice(0, 255) || "attachment"
   );
 }
+// The sender's display name, as typed at signup. Control and bidi characters
+// are dropped, and a name that is itself an address (signup's fallback) is not
+// used, so the recipient sees "Name <mailbox>" or just the mailbox.
+export function displayName(value) {
+  if (typeof value !== "string") return "";
+  const name = value
+    .replace(/[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 100)
+    .trim();
+  return name.includes("@") ? "" : name;
+}
+// The Email Service binding takes a named sender as { email, name }.
+export function providerMessage(payload) {
+  const { from_name, ...message } = payload;
+  return from_name ? { ...message, from: { email: message.from, name: from_name } } : message;
+}
 const outgoingMessage = (value) => {
   if (
     value?.headers &&
@@ -131,8 +149,10 @@ const outgoingMessage = (value) => {
     new TextEncoder().encode(value.text).length > mailLimits.outgoingTextBytes
   )
     throw Error("InvalidOutgoingMail");
+  const name = displayName(value.from_name);
   return {
     from: address(value.from),
+    ...(name ? { from_name: name } : {}),
     to: address(value.to),
     subject: value.subject,
     text: value.text,

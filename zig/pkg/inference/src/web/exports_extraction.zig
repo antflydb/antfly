@@ -26,6 +26,10 @@ export fn extraction_tokenizer(handle: u32, ptr: [*]const u8, len: Len) u32 {
     api.tokenizer(handle, host.sliceConst(u8, ptr, len)) catch |err| return api.fail(err);
     return 1;
 }
+export fn extraction_glide_readout(handle: u32, ptr: [*]const u8, len: Len) u32 {
+    api.registerGlideReadout(handle, host.sliceConst(u8, ptr, len)) catch |err| return api.fail(err);
+    return 1;
+}
 export fn extraction_weight(handle: u32, meta: [*]const u8, meta_len: Len, ptr: [*]const u8, len: Len) u32 {
     api.weight(handle, host.sliceConst(u8, meta, meta_len), host.sliceConst(u8, ptr, len)) catch |err| return api.fail(err);
     return 1;
