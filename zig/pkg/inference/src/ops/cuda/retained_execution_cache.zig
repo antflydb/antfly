@@ -676,6 +676,11 @@ test "retained CUDA execution accepts an independent typed recipe without model 
 
     try std.testing.expectEqual(P.Arena.GraphAction.eager, arena.graphAction(false));
     try std.testing.expectEqual(P.Arena.GraphAction.capture, arena.graphAction(true));
+    arena.captureFailed(error.CudaDriverError);
+    try std.testing.expectEqual(P.Arena.GraphAction.eager, arena.graphAction(true));
+    arena.disabled = false;
+    arena.captureFailed(error.Cancelled);
+    try std.testing.expectEqual(P.Arena.GraphAction.capture, arena.graphAction(true));
     arena.disabled = true;
     try std.testing.expectEqual(P.Arena.GraphAction.eager, arena.graphAction(true));
     arena.disabled = false;

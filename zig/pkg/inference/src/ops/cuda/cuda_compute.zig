@@ -21029,8 +21029,10 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
             return null;
         }
         if (capture) {
-            arena.graph = graph_mod.endCaptureExec(&self.ctx) catch {
-                entry.disabled = true;
+            arena.graph = graph_mod.endCaptureExec(&self.ctx) catch |err| {
+                // Recording matched the admitted plan. Only the SDK graph
+                // failed, so later requests can still use assigned execution.
+                arena.captureFailed(err);
                 return null;
             };
         }
