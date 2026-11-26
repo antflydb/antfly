@@ -7341,7 +7341,7 @@ test "convertNode ReduceMean" {
 
 // ── Coverage Tests: Compound Ops ────────────────────────────────────
 
-test "convertNode Gemm with transB" {
+test "convertNode Gemm with transB retains the affine projection and scaled fallback" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
     defer g.deinit();
@@ -7355,8 +7355,16 @@ test "convertNode Gemm with transB" {
     };
     const node = NodeProto{ .op_type = "Gemm", .attributes = &attrs };
     const result = try convertNode(allocator, &b, &node, &.{ a, bm, c }, null);
-    // Ends with add (bias)
-    try std.testing.expect(std.meta.activeTag(g.node(result).op) == .add);
+    const projection = g.node(result);
+    try std.testing.expect(std.meta.activeTag(projection.op) == .fused_linear);
+    try std.testing.expectEqualSlices(NodeId, &.{ a, bm, c }, projection.getInputs());
+    try std.testing.expectEqual(@as(i64, 2), projection.output_shape.dim(0));
+    try std.testing.expectEqual(@as(i64, 4), projection.output_shape.dim(1));
+
+    var scaled_attrs = [_]AttributeProto{ attrs[0], .{ .name = "alpha", .f = 0.5 } };
+    const scaled = try convertNode(allocator, &b, &.{ .op_type = "Gemm", .attributes = &scaled_attrs }, &.{ a, bm, c }, null);
+    try std.testing.expect(std.meta.activeTag(g.node(scaled).op) == .add);
+    try std.testing.expect(std.meta.activeTag(g.node(g.node(scaled).getInputs()[0]).op) == .mul);
 }
 
 test "convertNode Constant value_float" {
