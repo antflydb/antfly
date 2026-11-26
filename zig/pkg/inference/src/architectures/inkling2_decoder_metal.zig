@@ -703,7 +703,7 @@ test "Inkling Metal resident decoder runs the released text checkpoint" {
     const prefix = [_]i32{ 42, 34851, 220, 110104, 42, 34851, 220, 110104, 42, 34851, 220, 110104, 42, 34851, 220, 110104 };
     const last: u32 = 1541;
     var serial: Request = undefined;
-    try serial.init(a, decoder, prefix.len + 1);
+    try serial.init(a, decoder, prefix.len + 2);
     defer serial.deinit();
     const serial_start = time.monotonicNs();
     for (prefix) |id| try serial.append(@intCast(id));
@@ -778,6 +778,26 @@ test "Inkling Metal resident decoder runs the released text checkpoint" {
         });
     }
 
+    // Consume the final token as part of the same BF16 prefill batch and
+    // then decode one more token to check the published cache and history.
+    {
+        var fused: Request = undefined;
+        const plan = (try RequestPlan.initPrefill(decoder, prefix.len + 2, prefix.len + 1)).withDeviceSelection();
+        try fused.initWithPlan(a, decoder, plan);
+        defer fused.deinit();
+        const parts: []const PrefixPart = &.{
+            .{ .tokens = &prefix },
+            .{ .tokens = &.{@intCast(last)} },
+        };
+        const before = metal.runtimeMemorySnapshot(decoder.runtime).frame_submit_count;
+        const next = try fused.appendPrefixGreedy(parts);
+        try std.testing.expectEqual(argmax(reference), next);
+        try std.testing.expectEqual(before + 1, metal.runtimeMemorySnapshot(decoder.runtime).frame_submit_count);
+        try std.testing.expectEqual(prefix.len + 1, fused.state.sequence.committed_tokens);
+        fused.releasePrefill();
+        try std.testing.expectEqual(try serial.stepGreedy(next), try fused.stepGreedy(next));
+    }
+
     const full_context = decoder.text.model_max_length;
     const full_plan = try RequestPlan.initWithFormat(decoder, full_context, preferredPrefillRows(), .q4_head128);
     const full_exact = try RequestPlan.initPrefill(decoder, full_context, preferredPrefillRows());
@@ -837,13 +857,29 @@ test "Inkling Metal resident decoder runs the released text checkpoint" {
     const vision_ns = time.monotonicNs() - vision_start;
     try std.testing.expectEqual(@as(u32, 4), image.rows);
     var multimodal: Request = undefined;
-    try multimodal.initWithPlan(a, decoder, try RequestPlan.initPrefill(decoder, image.rows + 1, image.rows));
+    try multimodal.initWithPlan(a, decoder, try RequestPlan.initPrefill(decoder, image.rows + 2, image.rows));
     defer multimodal.deinit();
     try multimodal.appendEmbeddings(&image.tensor, image.rows);
     const image_logits = try multimodal.step(42);
     const image_next = argmax(image_logits);
     try std.testing.expectEqual(@as(usize, 5), multimodal.state.sequence.committed_tokens);
     try std.testing.expectEqual(@as(usize, 12), image_next);
+    {
+        var fused: Request = undefined;
+        const plan = (try RequestPlan.initPrefill(decoder, image.rows + 2, image.rows + 1)).withDeviceSelection();
+        try fused.initWithPlan(a, decoder, plan);
+        defer fused.deinit();
+        const before = metal.runtimeMemorySnapshot(decoder.runtime).frame_submit_count;
+        const next = try fused.appendPrefixGreedy(&.{
+            .{ .embeddings = .{ .tensor = &image.tensor, .start = 0, .count = image.rows } },
+            .{ .tokens = &.{42} },
+        });
+        try std.testing.expectEqual(image_next, next);
+        try std.testing.expectEqual(before + 1, metal.runtimeMemorySnapshot(decoder.runtime).frame_submit_count);
+        try std.testing.expectEqual(@as(usize, 5), fused.state.sequence.committed_tokens);
+        fused.releasePrefill();
+        try std.testing.expectEqual(try multimodal.stepGreedy(next), try fused.stepGreedy(next));
+    }
     try std.testing.expectApproxEqAbs(@as(f32, 19.87989), image_logits[image_next], 0.25);
     std.debug.print("Inkling Metal image={d}x{d} projected_rows={d} next={d} peak={d:.5} vision_ms={d:.3}\n", .{
         image_width, image_height, image.rows, image_next, image_logits[image_next], @as(f64, @floatFromInt(vision_ns)) / 1e6,
