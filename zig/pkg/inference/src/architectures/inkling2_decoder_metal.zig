@@ -915,9 +915,27 @@ test "Inkling Metal resident decoder executes the full visit schedule on a synth
     const physical = try full.deviceBytes();
     try std.testing.expectEqual(@as(usize, 256), full.bank.layout.max_append_tokens);
     try std.testing.expectEqual(@as(u32, 32), full.prefill.?.reduction_rows);
-    try std.testing.expect(19_517_813_920 + physical < 28_991_029_248);
+    const memory = @import("../runtime/tier/memory.zig");
+    const vision = @import("inkling2_vision_metal.zig").admissionBytes(80, 80);
+    const resident_bytes = 19_517_813_920;
+    const combined_limit = 28_991_029_248;
+    const retained = try State.deviceBytes(full.bank, full.width);
+    const required: memory.AdmissionAmounts = .{
+        .backend_weight_bytes = resident_bytes,
+        .backend_kv_bytes = retained,
+        .backend_scratch_bytes = physical - retained + vision.device,
+        .host_scratch_bytes = vision.host,
+    };
+    try std.testing.expect(try required.fitsLimits(.{
+        .combined_limit_bytes = combined_limit,
+        .kv_limit_bytes = retained,
+    }));
+    try std.testing.expect(!try required.fitsLimits(.{
+        .combined_limit_bytes = combined_limit,
+        .kv_limit_bytes = retained - 1,
+    }));
     const exact = try RequestPlan.initForGeometry(text, .nvfp4, text.model_max_length, 256, 32, .bf16);
-    try std.testing.expect(19_517_813_920 + try exact.deviceBytes() > 28_991_029_248);
+    try std.testing.expect(resident_bytes + try exact.deviceBytes() > combined_limit);
     const width = 128;
     const intermediate = 32;
     text.hidden_size = width;
