@@ -52,12 +52,16 @@ const HistoryLayout = struct {
 const Slot = struct {
     buffers: [2 + HistoryLayout.view_count]Tensor,
 
-    fn init(a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, plane: i32, history: *const Tensor, layout: HistoryLayout, start: usize) !Slot {
+    fn init(a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, plane: i32, backing: ?*const Tensor, plane_start: usize, history: *const Tensor, layout: HistoryLayout, start: usize) !Slot {
         var result: Slot = undefined;
         var initialized: usize = 0;
         errdefer for (result.buffers[0..initialized]) |*buffer| buffer.deinit();
-        for (result.buffers[0..2]) |*buffer| {
-            buffer.* = try Tensor.deviceAllocateTyped(a, runtime, .i16, .private, &.{plane});
+        const plane_bytes = @as(usize, @intCast(plane)) * @sizeOf(u16);
+        for (result.buffers[0..2], 0..) |*buffer, index| {
+            buffer.* = if (backing) |arena|
+                try arena.retainedView(plane_start + index * plane_bytes, plane_bytes, &.{plane})
+            else
+                try Tensor.deviceAllocateTyped(a, runtime, .i16, .private, &.{plane});
             initialized += 1;
         }
         var offset = start;
@@ -89,7 +93,9 @@ const Bank = struct {
         const pages = try config.layout.pageCapacity(group);
         const count = config.slots(group);
         if (count == 0) return error.InvalidKvShape;
-        const plane = std.math.cast(i32, (try config.planeBytes(group)) / 2) orelse return error.InvalidKvShape;
+        const plane_bytes = try config.planeBytes(group);
+        const plane = std.math.cast(i32, plane_bytes / @sizeOf(u16)) orelse return error.InvalidKvShape;
+        const pair_bytes = try std.math.mul(usize, plane_bytes, 2);
         const layout = try HistoryLayout.init(config, hidden_width);
         const history_elements = std.math.cast(i32, (try layout.bytes(count)) / @sizeOf(u16)) orelse return error.InvalidKvShape;
         var pool = try storage.initHost(a, .{
@@ -107,15 +113,30 @@ const Bank = struct {
         errdefer a.free(slots);
         var initialized: usize = 0;
         errdefer for (slots[0..initialized]) |*slot| slot.deinit();
-        // History has the same lifetime for every visit in the bank. Keep
-        // planes separate so their context capacity is not limited by the
-        // maximum single Metal buffer size.
         var history = try Tensor.deviceAllocateTyped(a, runtime, .i16, .private, &.{history_elements});
         defer history.deinit();
         const slot_bytes = try layout.bytes(1);
-        for (slots, 0..) |*slot, index| {
-            slot.* = try Slot.init(a, runtime, plane, &history, layout, index * slot_bytes);
-            initialized += 1;
+
+        // Short contexts have small planes with a common lifetime. Pack
+        // whole slot pairs within a bounded arena. Large individual planes
+        // retain their original capacity and allocation geometry.
+        const plane_arena_limit = 64 * 1024 * 1024;
+        const slots_per_arena = if (plane_bytes % 16 == 0) plane_arena_limit / pair_bytes else 0;
+        while (initialized < slots.len) {
+            const remaining = slots.len - initialized;
+            const batch = @min(remaining, slots_per_arena);
+            if (batch == 0) {
+                slots[initialized] = try .init(a, runtime, plane, null, 0, &history, layout, initialized * slot_bytes);
+                initialized += 1;
+                continue;
+            }
+            const arena_elements: i32 = @intCast(batch * pair_bytes / @sizeOf(u16));
+            var planes = try Tensor.deviceAllocateTyped(a, runtime, .i16, .private, &.{arena_elements});
+            defer planes.deinit();
+            for (0..batch) |index| {
+                slots[initialized] = try .init(a, runtime, plane, &planes, index * pair_bytes, &history, layout, initialized * slot_bytes);
+                initialized += 1;
+            }
         }
         const host_ids = try a.alloc(u32, pages);
         errdefer a.free(host_ids);
