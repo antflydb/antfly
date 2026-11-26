@@ -6563,71 +6563,28 @@ fn decoderBlock(
     // boundaries: host readbacks flush and reopen the active frame. This
     // replaces the per-op synchronous command buffers used by the generic
     // path without changing routing or residency.
-    var owns_a4b_layer_frame = false;
-    if (cb.kind() == .metal and
-        isDecodeStep(decode_context) and
-        gemma4_runtime.isQualifiedA4bArchitecture(config) and
-        !getenvBool("TERMITE_METAL_DISABLE_A4B_LAYER_FRAME") and
-        !cb.decoderRuntimeHasActiveFrame())
-    {
-        owns_a4b_layer_frame = try cb.decoderRuntimeBeginFrame();
-        if (owns_a4b_layer_frame) {
-            try cb.decoderRuntimeSetActiveFrameRegime(.decode);
+    const layer_regime: ?ops.DecoderRuntimeFrameRegime = regime: {
+        if (cb.kind() != .metal) break :regime null;
+        const decode = isDecodeStep(decode_context);
+        if (decode and gemma4_runtime.isQualifiedA4bArchitecture(config) and
+            !getenvBool("TERMITE_METAL_DISABLE_A4B_LAYER_FRAME")) break :regime .decode;
+        if (config.family == .qwen3_vl) {
+            if (decode and qwen3VlMetalDecodeFrameEnabled()) break :regime .decode;
+            if (qwen3VlMetalPrefillFastPathEnabled() and
+                decoderOverrideLayerSlot(raw_overrides.attn_q_slots, layer) != null and
+                decoderOverrideLayerSlot(raw_overrides.mlp_down_slots, layer) != null and
+                decode_context != null and decode_context.?.attention_mode == .paged_prefill and
+                decode_context.?.query_sequence_len > 1) break :regime .prefill;
         }
-    }
-    defer if (owns_a4b_layer_frame) cb.decoderRuntimeCancelFrame() catch {};
-
-    // Decode with the established eager Qwen3-VL math but submit the layer as
-    // one bounded Metal frame. This avoids the mRoPE correctness hazard of a
-    // whole-token prepared decoder while removing its per-op submit/wait
-    // bubbles. An explicit disable gate remains available for rollout safety.
-    var owns_qwen3vl_decode_frame = false;
-    if (cb.kind() == .metal and
-        config.family == .qwen3_vl and
-        isDecodeStep(decode_context) and
-        qwen3VlMetalDecodeFrameEnabled() and
-        !cb.decoderRuntimeHasActiveFrame())
-    {
-        owns_qwen3vl_decode_frame = try cb.decoderRuntimeBeginFrame();
-        if (owns_qwen3vl_decode_frame) try cb.decoderRuntimeSetActiveFrameRegime(.decode);
-    }
-    defer if (owns_qwen3vl_decode_frame) cb.decoderRuntimeCancelFrame() catch {};
-
-    // The qualified Qwen3-VL prefill lane uses one command buffer per decoder
-    // layer. This preserves bounded lifetimes while coalescing the 20+ device
-    // dispatches in attention and FFN; the paired slot/frame gate prevents the
-    // independently unqualified slots-only execution from becoming reachable.
-    var owns_qwen3vl_prefill_frame = false;
-    const qwen3vl_prepared_layer = decoderOverrideLayerSlot(raw_overrides.attn_q_slots, layer) != null and
-        decoderOverrideLayerSlot(raw_overrides.mlp_down_slots, layer) != null;
-    if (cb.kind() == .metal and
-        config.family == .qwen3_vl and
-        qwen3VlMetalPrefillFastPathEnabled() and
-        qwen3vl_prepared_layer and
-        decode_context != null and
-        decode_context.?.attention_mode == .paged_prefill and
-        decode_context.?.query_sequence_len > 1 and
-        !cb.decoderRuntimeHasActiveFrame())
-    {
-        owns_qwen3vl_prefill_frame = try cb.decoderRuntimeBeginFrame();
-        if (owns_qwen3vl_prefill_frame) try cb.decoderRuntimeSetActiveFrameRegime(.prefill);
-    }
-    defer if (owns_qwen3vl_prefill_frame) cb.decoderRuntimeCancelFrame() catch {};
-
-    // Independent Gemma4 KV rows use the eager batched math, rather than the
-    // singleton prepared decoder. Bound temporary lifetimes to one layer while
-    // coalescing its GPU dispatches; singleton direct decoding is unaffected.
-    var owns_gemma4_batch_frame = false;
-    if (cb.kind() == .metal and config.family == .gemma and config.hasPle() and
-        config.usesGemma4Channels() and isDecodeStep(decode_context) and
-        batch <= 4 and decode_context != null and decode_context.?.kv_batch != null and
-        !getenvBool("ANTFLY_GEMMA4_METAL_OCR_DISABLE_LAYER_FRAMES") and
-        !cb.decoderRuntimeHasActiveFrame())
-    {
-        owns_gemma4_batch_frame = try cb.decoderRuntimeBeginFrame();
-        if (owns_gemma4_batch_frame) try cb.decoderRuntimeSetActiveFrameRegime(.decode);
-    }
-    defer if (owns_gemma4_batch_frame) cb.decoderRuntimeCancelFrame() catch {};
+        if (decode and config.family == .gemma and config.hasPle() and config.usesGemma4Channels() and
+            batch <= 4 and decode_context != null and decode_context.?.kv_batch != null and
+            !getenvBool("ANTFLY_GEMMA4_METAL_OCR_DISABLE_LAYER_FRAMES")) break :regime .decode;
+        break :regime null;
+    };
+    const Submission = @import("../execution/submission.zig").Scope;
+    var frame: Submission = if (layer_regime != null) try Submission.begin(cb) else .{ .backend = cb };
+    defer frame.deinit();
+    if (frame.owns) try cb.decoderRuntimeSetActiveFrameRegime(layer_regime.?);
 
     const owns_ocr_prefill_scope = if (config.hasQwen35VisionArchitectureContract() and
         decode_context != null and decode_context.?.attention_mode == .paged_prefill and
@@ -6657,22 +6614,8 @@ fn decoderBlock(
         layer0_v_override,
         trace_sink,
     );
-    if (owns_a4b_layer_frame) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        owns_a4b_layer_frame = false;
-    }
-    if (owns_qwen3vl_decode_frame) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        owns_qwen3vl_decode_frame = false;
-    }
-    if (owns_qwen3vl_prefill_frame) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        owns_qwen3vl_prefill_frame = false;
-    }
-    if (owns_gemma4_batch_frame) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        owns_gemma4_batch_frame = false;
-    }
+    errdefer cb.free(result);
+    try frame.finish();
     return result;
 }
 
