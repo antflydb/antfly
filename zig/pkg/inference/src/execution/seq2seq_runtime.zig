@@ -400,6 +400,7 @@ pub const State = struct {
         dimensions: [4]i32,
         permit: sessions.RunPermit,
         output: ?sessions.ResidentOutputs = null,
+        publication_pin: ?sessions.Session.ModelLifetime.ResourcePin = null,
         rejected: bool = false,
     };
 
@@ -416,6 +417,7 @@ pub const State = struct {
         var reservations: std.ArrayList(CacheCopyReservation) = .empty;
         defer {
             for (reservations.items) |*item| {
+                if (item.publication_pin) |pin| pin.release();
                 if (item.output) |*output| output.deinit();
                 item.permit.deinit();
             }
@@ -466,7 +468,12 @@ pub const State = struct {
                 => null,
                 else => return err,
             };
-            staged = staged or item.output != null;
+            if (item.output) |*output| {
+                // Reserve publication ownership before enqueueing any copies.
+                // The staged owner and pin both survive backend completion.
+                item.publication_pin = try output.retainResources(self.allocator);
+                staged = true;
+            }
         }
         if (!staged) return scope.finish();
         // Keep the Metal copies in one frame and publish only after retirement.
@@ -493,17 +500,17 @@ pub const State = struct {
         }
         if (metal_frame) try backend.decoderRuntimeSubmitAndWaitFrame();
         try scope.finish();
-        // Promote only completed copies. Both rejection and promotion
-        // failure retire the staging owners after leaving the provider gate.
+        // Publish only completed copies. All ownership is already staged;
+        // rejection and cancellation leave the prior slots authoritative.
         if (control) |active| try active.check();
         for (reservations.items) |*item| {
             if (item.rejected) continue;
-            if (item.output) |*output| {
-                const pin = try output.retainResources(self.allocator);
+            if (item.publication_pin) |pin| {
+                item.publication_pin = null;
                 if (updated[item.index]) |prior| prior.pin.release();
                 updated[item.index] = .{
                     .pin = pin,
-                    .input = .{ .value = output.outputs[0], .backend = backend, .estimated_bytes = item.source.input.estimated_bytes },
+                    .input = .{ .value = item.output.?.outputs[0], .backend = backend, .estimated_bytes = item.source.input.estimated_bytes },
                     .shape = item.source.shape,
                     .independent = true,
                 };
