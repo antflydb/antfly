@@ -32196,6 +32196,11 @@ fn createMediaWindowCapture(runtime: *EnrichmentRuntime, cache: *MediaWindowCapt
 
 fn ensureMediaWindowOutputs(runtime: *EnrichmentRuntime, a: Allocator, input: *@import("../artifact_chunk_vector_publication.zig").Input) !void {
     if (input.old_window_outputs != null) return;
+    return ensureMediaWindowOutputsAt(runtime, a, input, platform.time.monotonicNs());
+}
+
+fn ensureMediaWindowOutputsAt(runtime: *EnrichmentRuntime, a: Allocator, input: *@import("../artifact_chunk_vector_publication.zig").Input, checkpoint_now_ns: u64) !void {
+    if (input.old_window_outputs != null) return;
     const first_child = try internal_keys.mediaWindowChildKeyAlloc(a, input.token.producer_scope_key, 0);
     defer a.free(first_child);
     const child_prefix = first_child[0 .. first_child.len - @sizeOf(u32)];
@@ -32236,12 +32241,12 @@ fn ensureMediaWindowOutputs(runtime: *EnrichmentRuntime, a: Allocator, input: *@
     while (!scan.complete) : (pages += 1) {
         checkEnrichmentExecutionContext(runtime, owner) catch |err| {
             if (scan.resume_key.items.len != 0 and (isEnrichmentControlError(err) or isOperationInterruption(err))) {
-                retained = runtime.media_window_capture.saveIfSpace(scan);
+                retained = runtime.media_window_capture.saveIfSpace(scan, checkpoint_now_ns);
             }
             return err;
         };
         if (pages == 4) {
-            retained = runtime.media_window_capture.saveIfSpace(scan);
+            retained = runtime.media_window_capture.saveIfSpace(scan, checkpoint_now_ns);
             return error.ArtifactPublicationPending;
         }
         var read = try runtime.store.beginRead();
@@ -32295,7 +32300,7 @@ fn ensureMediaWindowOutputs(runtime: *EnrichmentRuntime, a: Allocator, input: *@
     // reading the child range again. The token borrows the captured keys.
     checkEnrichmentExecutionContext(runtime, owner) catch |err| {
         if (isEnrichmentControlError(err) or isOperationInterruption(err))
-            retained = runtime.media_window_capture.saveIfSpace(scan);
+            retained = runtime.media_window_capture.saveIfSpace(scan, checkpoint_now_ns);
         return err;
     };
     if (scan.records.items.len == 0) {
@@ -32303,7 +32308,7 @@ fn ensureMediaWindowOutputs(runtime: *EnrichmentRuntime, a: Allocator, input: *@
         return;
     }
     input.token.borrowWindowPreconditions(scan.records.items, scan.key_bytes) catch |err| {
-        if (err == error.OutOfMemory) retained = runtime.media_window_capture.saveIfSpace(scan);
+        if (err == error.OutOfMemory) retained = runtime.media_window_capture.saveIfSpace(scan, checkpoint_now_ns);
         return err;
     };
     input.old_window_outputs = scan.records.items;
@@ -34021,9 +34026,23 @@ fn enqueueProducerEffects(runtime: *EnrichmentRuntime, token: *@import("../artif
     }
     const dispatcher = runtime.artifact_publication_dispatcher orelse return error.ArtifactCatalogDrift;
     const command = try token.command(effects);
-    try command.validate(runtime.alloc);
-    const bytes = try @import("../artifact_publication_transport_codec.zig").encodeAlloc(runtime.alloc, command);
-    defer runtime.alloc.free(bytes);
+    // Use the replay allocator that already accounts for the inputs and
+    // payloads. The codec measures the full wire buffer before allocating.
+    const backing = token.arena.child_allocator;
+    var transport_budget = if (resource_manager_mod.BudgetedAllocator.fromAllocator(backing) == null)
+        if (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) |manager|
+            runtime.media_window_capture.budget(manager, backing)
+        else
+            null
+    else
+        null;
+    defer if (transport_budget) |*budget| budget.deinit();
+    const transport = if (transport_budget) |*budget| budget.allocator() else backing;
+    const bytes = @import("../artifact_publication_transport_codec.zig").encodeAlloc(transport, command) catch |err| {
+        if (err == error.OutOfMemory) if (transport_budget) |*budget| if (budget.denied()) return error.ResourceBudgetExceeded;
+        return err;
+    };
+    defer transport.free(bytes);
     dispatcher.submit(token.namespace, bytes) catch |err|
         return FailureScope.assetPublicationFailure(failure_scope, err);
     // Provider completion is not owner acceptance; hold replay progress until
@@ -50977,6 +50996,8 @@ test "model aware media ordered vector windows are searchable with exact clocks 
     try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 4 });
     try db.addEnrichment(.{ .name = "model", .kind = .embedding, .source_artifact_name = "chunks", .expected_dims = 2, .producer_json = "{\"provider\":\"antfly\",\"model\":\"model\"}" });
     try db.addIndex(.{ .name = "vectors", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"model\"}" });
+    try db.addEnrichment(.{ .name = "bad-recipe", .kind = .embedding, .source_artifact_name = "chunks", .expected_dims = 2, .producer_json = "{\"provider\":\"antfly\",\"model\":\"model\",\"task_type\":123}" });
+    try db.addIndex(.{ .name = "bad-vectors", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"bad-recipe\"}" });
     try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"chunks\"}]}" });
     try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"source\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
     const scope = try manifests.keyAlloc(a, "doc", "chunks");
@@ -51070,7 +51091,7 @@ test "model aware media ordered vector windows are searchable with exact clocks 
             abandoned.deinit();
             return err;
         };
-        try std.testing.expect(idle.saveIfSpace(abandoned));
+        try std.testing.expect(idle.saveIfSpace(abandoned, 0));
         const active = try createMediaWindowCapture(runtime, &idle, @splat(4), @splat(44));
         defer active.deinit();
         try active.resume_key.resize(active.allocator(), 4096);
@@ -51086,9 +51107,9 @@ test "model aware media ordered vector windows are searchable with exact clocks 
         // second document or a continuation already admitted by the manager.
         const first = try createMediaWindowCapture(runtime, &runtime.media_window_capture, @splat(1), @splat(11));
         try first.resume_key.resize(first.allocator(), 2 * 1024 * 1024 + 1);
-        try std.testing.expect(runtime.media_window_capture.saveIfSpace(first));
+        try std.testing.expect(runtime.media_window_capture.saveIfSpace(first, 0));
         const second = try createMediaWindowCapture(runtime, &runtime.media_window_capture, @splat(2), @splat(22));
-        try std.testing.expect(runtime.media_window_capture.saveIfSpace(second));
+        try std.testing.expect(runtime.media_window_capture.saveIfSpace(second, 0));
         const resumed = runtime.media_window_capture.take(@splat(1), @splat(11)) orelse return error.TestUnexpectedResult;
         defer resumed.deinit();
         try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024 + 1), resumed.resume_key.items.len);
@@ -51102,11 +51123,11 @@ test "model aware media ordered vector windows are searchable with exact clocks 
         for (0..saturated.saved.len) |index| {
             const marker_: u8 = @intCast(index);
             const scan = try createMediaWindowCapture(runtime, &saturated, @splat(marker_), @splat(marker_));
-            try std.testing.expect(saturated.saveIfSpace(scan));
+            try std.testing.expect(saturated.saveIfSpace(scan, 0));
         }
         const overflow = try createMediaWindowCapture(runtime, &saturated, @splat(100), @splat(101));
         defer overflow.deinit();
-        try std.testing.expect(!saturated.saveIfSpace(overflow));
+        try std.testing.expect(!saturated.saveIfSpace(overflow, 0));
         const first = saturated.take(@splat(0), @splat(0)) orelse return error.TestUnexpectedResult;
         first.deinit();
     }
@@ -51260,6 +51281,24 @@ test "model aware media ordered vector windows are searchable with exact clocks 
                     .{ .family = .derived_vector, .key = partial.output_key, .value = null, .source_index = 0 },
                     .{ .family = .derived_vector, .key = key, .value = vector, .source_index = 0 },
                 };
+                {
+                    // Keep the command's inputs live and give the encoder
+                    // too little credit for its full multi-window envelope.
+                    var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 4096 } });
+                    defer manager.deinit(a);
+                    const previous_manager = runtime.config.resource_manager;
+                    runtime.config.resource_manager = &manager;
+                    defer runtime.config.resource_manager = previous_manager;
+                    const payload = try a.alloc(u8, 64 * 1024);
+                    defer a.free(payload);
+                    @memset(payload, 0);
+                    var wide = effects;
+                    wide[1].value = payload;
+                    const index = harness.next_index;
+                    try std.testing.expectError(error.ResourceBudgetExceeded, enqueueProducerEffects(runtime, &partial.token, &wide, null));
+                    try std.testing.expectEqual(index, harness.next_index);
+                    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.relational_preparation_working_set).used_bytes);
+                }
                 const incomplete = try partial.token.command(&effects);
                 try std.testing.expectError(error.ArtifactPublicationPending, enqueueProducerEffects(runtime, &partial.token, &effects, null));
                 var read = try runtime.store.beginRead();
@@ -51267,6 +51306,39 @@ test "model aware media ordered vector windows are searchable with exact clocks 
                 const rejected = (try ordered_publication.rejected(&read, incomplete)) orelse return error.TestUnexpectedResult;
                 try std.testing.expectEqual(ordered_publication.Rejection.stale_source, rejected.reason);
                 try std.testing.expectError(error.NotFound, read.get(key));
+            }
+            // The ordered catalog can retain provider fields unknown to
+            // its generic schema. Reject a deterministic recipe error and
+            // prove the immediately following healthy vector applies.
+            {
+                var invalid = blk: {
+                    var read = try runtime.store.beginRead();
+                    defer read.abort();
+                    var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+                    defer plan.release();
+                    var request = for (plan.plan().generated_templates) |candidate| {
+                        if (candidate.kind == .dense_embedding and std.mem.eql(u8, requestEmbeddingName(candidate), "bad-recipe")) break candidate;
+                    } else return error.TestUnexpectedResult;
+                    request.doc_key = "doc";
+                    break :blk (try @import("../artifact_chunk_vector_publication.zig").capture(a, &read, request, plan.plan(), member)).?;
+                };
+                defer invalid.deinit();
+                invalid.token.execution_identity = @splat(marker);
+                invalid.token.execution_bound = true;
+                const effects: []const ordered_publication.Mutation = &.{.{
+                    .family = .derived_vector,
+                    .key = invalid.output_key,
+                    .value = null,
+                    .source_index = 0,
+                }};
+                const command = try invalid.token.command(effects);
+                const index = harness.next_index;
+                try std.testing.expectError(error.ArtifactPublicationPending, enqueueProducerEffects(runtime, &invalid.token, effects, null));
+                try std.testing.expectEqual(index, (try db.orderedApplyReceipt()).?.index);
+                var read = try runtime.store.beginRead();
+                defer read.abort();
+                const outcome = (try ordered_publication.rejected(&read, command)) orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(ordered_publication.Rejection.invalid_output, outcome.reason);
             }
             const published_parent = harness.calls;
             const next_valid_entry = harness.next_index;
@@ -51396,19 +51468,27 @@ test "model aware media ordered vector windows are searchable with exact clocks 
                 try std.testing.expectEqual(ordered_publication.Rejection.stale_source, rejected.reason);
                 _ = try read.get(phantom);
             }
+            // All slots are full and their original members never run.
+            // An overflow member must finish without a reclaim callback.
+            const captures = &runtime.media_window_capture;
+            for (0..captures.saved.len) |slot| {
+                const id: u8 = @intCast(slot);
+                const abandoned = try createMediaWindowCapture(runtime, captures, @splat(id), @splat(id));
+                try std.testing.expect(captures.saveIfSpace(abandoned, 0));
+            }
             {
                 var deadline: Deadline = .{};
                 const previous = runtime.active_provider_guard;
                 defer runtime.active_provider_guard = previous;
                 runtime.active_provider_guard.cancellation = .{ .ptr = &deadline, .check_fn = Deadline.check };
-                try std.testing.expectError(error.EnrichmentWaitTimeout, ensureMediaWindowOutputs(runtime, a, &final));
-                try std.testing.expect(runtime.media_window_capture.saved[0].resume_key.items.len != 0);
+                try std.testing.expectError(error.EnrichmentWaitTimeout, ensureMediaWindowOutputsAt(runtime, a, &final, MediaWindowCaptureCache.idle_timeout_ns - 1));
+                try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(0)), &captures.saved[0].member);
             }
             // A wide active member releases the replay worker. The next
             // turn attaches the same keys, without copying either key set.
             var yielded: usize = 0;
             while (true) {
-                ensureMediaWindowOutputs(runtime, a, &final) catch |err| {
+                ensureMediaWindowOutputsAt(runtime, a, &final, MediaWindowCaptureCache.idle_timeout_ns) catch |err| {
                     if (err != error.ArtifactPublicationPending) return err;
                     yielded += 1;
                     try std.testing.expect(yielded < 128);
@@ -51424,7 +51504,8 @@ test "model aware media ordered vector windows are searchable with exact clocks 
             } else return error.TestUnexpectedResult;
             try std.testing.expectEqual(@intFromPtr(captured_key.ptr), @intFromPtr(borrowed.ptr));
             try std.testing.expectError(error.ArtifactPublicationPending, enqueueScalarChunkVector(runtime, &final, vector, true));
-            try std.testing.expect(runtime.media_window_capture.saved_count == 0);
+            try std.testing.expectEqual(captures.saved.len - 1, captures.saved_count);
+            _ = MediaWindowCaptureCache.reclaim(captures, std.math.maxInt(u64));
             const retired = try storeGetOptionalAllocWithRetry(runtime, phantom);
             defer if (retired) |value| runtime.alloc.free(value);
             try std.testing.expect(retired == null);

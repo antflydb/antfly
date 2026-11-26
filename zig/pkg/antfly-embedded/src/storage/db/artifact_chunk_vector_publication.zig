@@ -241,11 +241,10 @@ pub const Fence = struct {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const owned = arena.allocator();
-        const chunker = self.chunker_config orelse if (self.inline_index_config.len != 0)
-            try manager.denseGeneratorChunkerJson(owned, self.inline_index_config)
-        else
-            "";
-        const consumer = try media_embedding_recipe.resolve(owned, self.embedding_config, chunker, self.dimensions) orelse {
+        const consumer = (self.resolveFusedConsumer(owned) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidBatchRequest,
+        }) orelse {
             if (publishes_windows) return error.EnrichmentSourceChanged;
             return;
         };
@@ -278,6 +277,14 @@ pub const Fence = struct {
             }
         }
         if (live.count() != 0) return error.EnrichmentSourceChanged;
+    }
+
+    fn resolveFusedConsumer(self: Fence, alloc: std.mem.Allocator) !?media_embedding_recipe.Recipe {
+        const chunker = self.chunker_config orelse if (self.inline_index_config.len != 0)
+            try manager.denseGeneratorChunkerJson(alloc, self.inline_index_config)
+        else
+            "";
+        return media_embedding_recipe.resolve(alloc, self.embedding_config, chunker, self.dimensions);
     }
 
     pub fn requireCurrent(self: Fence, txn: anytype) !void {
