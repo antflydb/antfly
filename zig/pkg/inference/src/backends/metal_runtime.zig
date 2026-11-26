@@ -53503,6 +53503,43 @@ test "Metal paged relative attention resolves the final token of a packed millio
     var single_row_output: [output_elements]u16 = undefined;
     try single_row_result.downloadBytesInto(std.mem.asBytes(&single_row_output));
     try std.testing.expectEqual(output, single_row_output);
+
+    // The released decoder uses 1024 relative positions even on global
+    // layers. A per-row bias can select the key two positions before the
+    // end without leaking that bias or the final value into the next query.
+    const relative_extent = 1024;
+    var relative = try MetalTensor.deviceAllocateTyped(a, runtime, .i16, .shared, &.{9 * relative_extent});
+    defer relative.deinit();
+    var relative_values: [9 * relative_extent]u16 = @splat(0);
+    for (0..3) |head| relative_values[head * relative_extent] = 0x4200; // BF16 32
+    try relative.uploadBytes(std.mem.asBytes(&relative_values));
+    const value_contents = termite_metal_buffer_contents(tensors[2].deviceHandle().?) orelse return error.ExpectedActualSharedContents;
+    const packed_value: [*]u16 = @ptrCast(@alignCast(value_contents));
+    const earlier = final - 2 * words;
+    @memset(packed_value[earlier..][0..32], 0xaaaa); // Q4 2
+    packed_value[earlier + 32] = 0x3c00;
+    var biased = attention;
+    biased.query.relative_extent = relative_extent;
+    var biased_inputs = inputs;
+    biased_inputs.relative = &relative;
+    try beginFrame(runtime);
+    errdefer cancelFrame(runtime) catch {};
+    try biased.encode(runtime, biased_inputs, &tensors[6], &tensors[7]);
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+    try tensors[7].downloadBytesInto(std.mem.asBytes(&output));
+    try std.testing.expectEqual(@as([384]u16, @splat(0x3f80)), output[0..384].*);
+    for (output[384..768]) |value| {
+        try std.testing.expect(value > 0 and value < 0x3728); // Smaller than 1e-5
+    }
+    try std.testing.expectEqual(@as([384]u16, @splat(0x4040)), output[768..].*);
+    try beginFrame(runtime);
+    errdefer cancelFrame(runtime) catch {};
+    try biased.encode(runtime, biased_inputs, &single_row_scratch, &single_row_result);
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+    try single_row_result.downloadBytesInto(std.mem.asBytes(&single_row_output));
+    try std.testing.expectEqual(output, single_row_output);
 }
 
 /// Runs the projected attention operands through the causal K/V stencils and

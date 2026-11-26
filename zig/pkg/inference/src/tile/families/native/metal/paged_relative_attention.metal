@@ -44,6 +44,44 @@ inline void antfly_store_relative_attention(
     }
 }
 
+template <bool compressed, uint heads, uint rows, bool with_relative>
+inline void antfly_accumulate_relative_page(
+    device const ushort *keys, device const ushort *values,
+    device const bfloat *relative, constant PagedRelativeGqaParams &p,
+    uint first, uint next_key, ulong stored_head, uint batch_row, uint row_head, uint lane,
+    thread const uint *begin, thread const uint *limit,
+    thread const float4 *q, thread float4 *numerator,
+    thread float *maximum, thread float *denominator
+) {
+    for (uint pos = first; pos < next_key; ++pos, stored_head += p.kv_heads) {
+        const float4 key = antfly_relative_kv_head<compressed>(keys, stored_head, lane);
+        const float4 value = antfly_relative_kv_head<compressed>(values, stored_head, lane);
+        #pragma unroll
+        for (uint h = 0u; h < heads * rows; ++h) {
+            const uint r = h / heads;
+            if (rows > 1 && (pos < begin[r] || pos >= limit[r])) continue;
+            float dot = 0.0f;
+            for (uint i = 0u; i < 4u; ++i) dot = fma(q[h][i], key[i], dot);
+            const float reduced = simd_sum(dot);
+            float bias = 0.0f;
+            if (with_relative) {
+                const uint distance = p.start + batch_row + r - pos;
+                if (distance < p.relative_extent) {
+                    const ulong output_head = ulong(row_head + r * p.q_heads + h % heads);
+                    bias = float(relative[output_head * p.relative_extent + distance]);
+                }
+            }
+            const float score = reduced * p.score_scale + bias;
+            const float next_max = max(maximum[h], score);
+            const float retain = exp(maximum[h] - next_max);
+            const float add = exp(score - next_max);
+            denominator[h] = fma(denominator[h], retain, add);
+            numerator[h] = fma(float4(add), value, numerator[h] * retain);
+            maximum[h] = next_max;
+        }
+    }
+}
+
 template <bool compressed, uint heads, uint rows = 1, bool direct = false>
 inline void antfly_paged_relative_gqa_d128_partial(
     device const bfloat *query,
@@ -110,27 +148,21 @@ inline void antfly_paged_relative_gqa_d128_partial(
         if (index >= p.page_count) continue;
         const uint page = page_ids[index];
         if (page >= p.physical_pages) continue;
-        ulong stored_head = (ulong(page) * p.page_tokens + in_page) * p.kv_heads + kv_head;
-        for (uint pos = first; pos < next_key; ++pos, stored_head += p.kv_heads) {
-            const float4 key = antfly_relative_kv_head<compressed>(keys, stored_head, lane);
-            const float4 value = antfly_relative_kv_head<compressed>(values, stored_head, lane);
-            #pragma unroll
-            for (uint h = 0u; h < heads * rows; ++h) {
-                const uint r = h / heads;
-                if (rows > 1 && (pos < begin[r] || pos >= limit[r])) continue;
-                const uint distance = p.start + batch_row + r - pos;
-                float dot = 0.0f;
-                for (uint i = 0u; i < 4u; ++i) dot = fma(q[h][i], key[i], dot);
-                const float reduced = simd_sum(dot);
-                const float bias = distance < p.relative_extent ? float(relative[ulong(row_head + (h / heads) * p.q_heads + h % heads) * p.relative_extent + distance]) : 0.0f;
-                const float score = reduced * p.score_scale + bias;
-                const float next_max = max(maximum[h], score);
-                const float retain = exp(maximum[h] - next_max);
-                const float add = exp(score - next_max);
-                denominator[h] = fma(denominator[h], retain, add);
-                numerator[h] = fma(float4(add), value, numerator[h] * retain);
-                maximum[h] = next_max;
-            }
+        const ulong stored_head = (ulong(page) * p.page_tokens + in_page) * p.kv_heads + kv_head;
+        // Relative logits cover only the most recent keys. A page that
+        // is old enough for the earliest query also has zero bias for every
+        // later query. Keep the same key/split order in both page schedules.
+        const uint earliest = p.start + batch_row;
+        const uint last_in_page = next_key - 1u;
+        if (rows > 1 && (p.relative_extent == 0u ||
+            (earliest >= last_in_page && earliest - last_in_page >= p.relative_extent))) {
+            antfly_accumulate_relative_page<compressed, heads, rows, false>(
+                keys, values, relative, p, first, next_key, stored_head, batch_row,
+                row_head, lane, begin, limit, q, numerator, maximum, denominator);
+        } else {
+            antfly_accumulate_relative_page<compressed, heads, rows, true>(
+                keys, values, relative, p, first, next_key, stored_head, batch_row,
+                row_head, lane, begin, limit, q, numerator, maximum, denominator);
         }
     }
     #pragma unroll
