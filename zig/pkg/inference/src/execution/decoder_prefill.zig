@@ -1855,7 +1855,7 @@ fn checkMetalCompiledChunk(cb: ComputeBackend, native_reference: ComputeBackend)
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     const a = std.testing.allocator;
     const backend_session = @import("../backends/session.zig");
-    const model = CompiledPrefillFixture.config();
+    var model = CompiledPrefillFixture.config();
     const ids = [_]i64{ 0, 1 };
     const expected = try CompiledPrefillFixture.eager(native_reference, model, &ids);
     defer a.free(expected);
@@ -1912,6 +1912,37 @@ fn checkMetalCompiledChunk(cb: ComputeBackend, native_reference: ComputeBackend)
         if (scenario == 1) for (expected, result.last_logits.?) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.001);
         if (scenario == 2) try std.testing.expectEqual(@as(usize, if (expected[1] > expected[0]) 1 else 0), result.greedy_token.?);
         try std.testing.expectEqual(@as(usize, 2), state.total_tokens);
+    }
+
+    const unmasked = try CompiledPrefillFixture.eager(native_reference, model, &.{ 0, 1, 1 });
+    defer a.free(unmasked);
+    const suppressed: i32 = if (unmasked[1] > unmasked[0]) 1 else 0;
+    model.suppress_token_ids_len = 1;
+    model.suppress_token_ids[0] = suppressed;
+    var executor = try graph_mod.metal_executor.createModelExecutor(a, session, model, .f16, null);
+    defer executor.deinit();
+    var model_instance = try executor.createRuntime(a);
+    defer model_instance.deinit();
+    for (ids, 0..) |id, index| {
+        var result = try model_instance.prefill(a, .{
+            .input_ids = &.{id},
+            .seq_len = index + 1,
+            .query_seq_len = 1,
+            .attention_mode = .paged_prefill,
+            .kv_only = true,
+        });
+        defer result.deinit(a);
+        try std.testing.expect(result.device_logits != null);
+    }
+    var history = [_]i64{ 0, 1, 1, 0 };
+    for (2..4) |position| {
+        const result = try model_instance.decodeSample(a, .{
+            .decode = .{ .token_id = history[position], .position = position, .attention_mode = .paged_decode },
+            .sampling = .{ .temperature = 1, .top_k = 1 },
+            .token_history = history[0 .. position + 1],
+        });
+        try std.testing.expectEqual(@as(i64, 1 - suppressed), result.token_id);
+        if (position + 1 < history.len) history[position + 1] = result.token_id;
     }
 }
 

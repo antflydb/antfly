@@ -6691,31 +6691,15 @@ fn tryRunLiveWholeModelExecutorGenerate(
     var generated: usize = 0;
     var first_token_at: ?std.Io.Timestamp = null;
     while (generated < max_tokens) {
-        const sampled_token_i32: i32 = if (generated == 0) blk: {
-            if (use_greedy_decode) {
-                break :blk try liveWholeModelFirstGreedyToken(&output, allocator, &gpt_config);
-            }
-            const output_logits = try output.takeHostLogits(allocator);
-            defer allocator.free(output_logits);
-            traceGenerateTopLogits("prefill", generated, output_logits);
-            try dumpGenerateLogits(allocator, io, dump_generate_logits_path, "prefill", generated, output_logits);
-            for (gpt_config.suppressTokenIds()) |id| {
-                if (id >= 0 and id < output_logits.len) output_logits[@intCast(id)] = -std.math.inf(f32);
-            }
-            break :blk @intCast(generation.sampleTokenFromLogits(
-                allocator,
-                output_logits,
-                config,
-                all_token_ids.items,
-            ));
-        } else if (use_greedy_decode) blk: {
+        const sampled_token_i32: i32 = if (use_greedy_decode) blk: {
+            if (generated == 0) break :blk try liveWholeModelFirstGreedyToken(&output, allocator, &gpt_config);
             const greedy = try runtime_model.decodeGreedy(allocator, .{
                 .token_id = all_token_ids.items[all_token_ids.items.len - 1],
                 .position = all_token_ids.items.len - 1,
                 .attention_mode = .paged_decode,
             });
             break :blk @intCast(greedy.token_id);
-        } else if (use_sample_decode) blk: {
+        } else if (generated != 0 and use_sample_decode) blk: {
             const sampled = try runtime_model.decodeSample(allocator, .{
                 .decode = .{
                     .token_id = all_token_ids.items[all_token_ids.items.len - 1],
@@ -6727,14 +6711,17 @@ fn tryRunLiveWholeModelExecutorGenerate(
             });
             break :blk @intCast(sampled.token_id);
         } else blk: {
-            const output_logits = try output.hostLogits(allocator);
-            traceGenerateTopLogits("decode", generated, output_logits);
-            try dumpGenerateLogits(allocator, io, dump_generate_logits_path, "decode", generated, output_logits);
-            break :blk @intCast(generation.sampleTokenFromLogits(
+            const output_logits = try output.takeHostLogits(allocator);
+            defer allocator.free(output_logits);
+            const stage = if (generated == 0) "prefill" else "decode";
+            traceGenerateTopLogits(stage, generated, output_logits);
+            try dumpGenerateLogits(allocator, io, dump_generate_logits_path, stage, generated, output_logits);
+            break :blk @intCast(try graph_mod.model_runtime.sampleTokenFromLogitsSuppressInPlace(
                 allocator,
                 output_logits,
-                config,
+                sampling_config,
                 all_token_ids.items,
+                gpt_config.suppressTokenIds(),
             ));
         };
         const next_token_i32 = if (teacher_force_token_ids) |ids| ids[generated] else sampled_token_i32;

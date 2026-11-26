@@ -2614,7 +2614,7 @@ fn runtimePrefill(
     if (decoderRuntimePrefillTraceRequested()) {
         std.debug.print("prefill-trace: runtimePrefill qlen={d} seq={d} ready={}\n", .{ request.query_seq_len, request.seq_len, decoder_runtime_ready });
     }
-    if (decoder_runtime_ready and !request.kv_only and request.query_seq_len == 1 and request.prepared_rows == null) {
+    if (decoder_runtime_ready and request.query_seq_len == 1 and request.prepared_rows == null) {
         try request.check();
         const token_id = request.input_ids[request.input_ids.len - 1];
         const direct_started_at = monotonicNowNs();
@@ -2751,7 +2751,8 @@ fn runtimeDecodeSample(
 ) !model_runtime.SampledDecodeOutput {
     const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
     try request.decode.check();
-    if (request.sampling.isPureGreedy()) {
+    const suppressed = runtime_ctx.definition.configuration.value.suppressTokenIds();
+    if (request.sampling.isPureGreedy() and suppressed.len == 0) {
         const greedy = try runtimeDecodeGreedy(ctx, allocator, request.decode);
         return .{ .token_id = greedy.token_id };
     }
@@ -2791,7 +2792,7 @@ fn runtimeDecodeSample(
         timing_stats.decode_sample_direct_nanos += @intCast(monotonicNowNs() - direct_started_at);
         return .{ .token_id = token_id };
     }
-    if (runtime_ctx.decoderRuntimeExecutorEnabled()) {
+    if (suppressed.len == 0 and runtime_ctx.decoderRuntimeExecutorEnabled()) {
         const direct_started_at = monotonicNowNs();
         if (try runtime_ctx.forwardDecoderRuntimeSampledToken(
             allocator,
@@ -2826,7 +2827,7 @@ fn runtimeDecodeSample(
     }
     timing_stats.decode_sample_fallback_nanos += @intCast(monotonicNowNs() - fallback_started_at);
     defer output.deinitWithCleanup(allocator, .{ .boundary = request.decode.cleanup_epoch, .operation = request.decode.backend_operation });
-    if (output.final_logit_softcap <= 0.0) {
+    if (suppressed.len == 0 and output.final_logit_softcap <= 0.0) {
         if (output.device_logits) |device_logits| {
             const backend = output.device_logits_backend orelse return error.InvalidModelOutput;
             if (try backend.sampleLastRow(&.{
@@ -2846,14 +2847,10 @@ fn runtimeDecodeSample(
             }
         }
     }
-    return .{
-        .token_id = @intCast(model_runtime.sampleTokenFromLogits(
-            allocator,
-            try output.hostLogitsWithCleanup(allocator, .{ .boundary = request.decode.cleanup_epoch, .operation = request.decode.backend_operation }),
-            request.sampling,
-            request.token_history,
-        )),
-    };
+    const logits = try output.takeHostLogitsWithCleanup(allocator, .{ .boundary = request.decode.cleanup_epoch, .operation = request.decode.backend_operation });
+    defer allocator.free(logits);
+    const token = try model_runtime.sampleTokenFromLogitsSuppressInPlace(allocator, logits, request.sampling, request.token_history, suppressed);
+    return .{ .token_id = @intCast(token) };
 }
 
 fn runtimeSupportsSampleDecodeRequest(
