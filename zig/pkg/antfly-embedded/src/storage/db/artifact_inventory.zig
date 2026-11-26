@@ -52,7 +52,9 @@ pub fn requirePublicationDigest(txn: anytype, expected: [32]u8) !void {
 }
 
 pub const dense_artifact_flags_protocol: u16 = 19;
-pub const max_effect_protocol: u16 = dense_artifact_flags_protocol;
+/// One revision-bound scalar replacement may also retire its prior windows.
+pub const scalar_window_retirement_protocol: u16 = 20;
+pub const max_effect_protocol: u16 = scalar_window_retirement_protocol;
 
 pub const Binding = struct {
     epoch: u64,
@@ -83,7 +85,8 @@ pub const Catalogs = struct {
     /// Select capabilities from this immutable definition cut, independently
     /// of the database's monotonic reader floor. Resolver/producer receipts
     /// need protocol 15; grouped producer ownership needs protocol 16.
-    /// Base dense and sparse vectors need protocol 17; scoped chunk vectors need protocol 18.
+    /// Base vectors need protocol 17 and scoped chunk vectors need protocol 18.
+    /// Dense chunk vectors also need protocol 20 to retire windows atomically.
     pub fn requiredEffectProtocol(self: Catalogs, alloc: std.mem.Allocator) !u16 {
         const enrichments = @import("catalog/enrichment_catalog.zig");
         const producers = if (self.enrichments.len != 0)
@@ -108,8 +111,11 @@ pub const Catalogs = struct {
             const configs = try indexes.deserializeCatalog(alloc, self.indexes);
             defer @import("types.zig").freeIndexConfigs(alloc, configs);
             for (configs) |cfg| {
-                if (try indexes.denseArtifactFlagsRequired(alloc, cfg)) return dense_artifact_flags_protocol;
-                if (try indexes.onlineGeneratedChunkVectorConfig(alloc, cfg, producers)) required = @max(required, 18);
+                if (try indexes.denseArtifactFlagsRequired(alloc, cfg)) required = @max(required, dense_artifact_flags_protocol);
+                if (try indexes.onlineGeneratedChunkVectorConfig(alloc, cfg, producers)) {
+                    if (cfg.kind == .dense_vector) return scalar_window_retirement_protocol;
+                    required = @max(required, 18);
+                }
                 if (try indexes.onlineBaseGeneratedVectorConfig(alloc, cfg, producers)) required = @max(required, 17);
             }
         }

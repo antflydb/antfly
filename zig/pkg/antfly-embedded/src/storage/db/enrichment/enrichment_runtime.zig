@@ -8154,7 +8154,6 @@ const MediaAcknowledgementMode = union(enum) {
 fn retireMediaPassForDenseRequest(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, mode: MediaAcknowledgementMode) !void {
     const embedding = runtime.index_manager.getEnrichment(.embedding, requestEmbeddingName(request)) orelse return;
     const chunks = runtime.index_manager.getEnrichment(.chunk, embedding.source_artifact_name) orelse return;
-    if (mode == .pending_repair and chunks.chunker_json.len == 0) return;
     try acknowledgeMediaPassConsumer(runtime, request, chunks.name, chunks.source_field, .embedding, embedding.name, mode);
 }
 
@@ -11505,6 +11504,15 @@ fn failureIdentityForRequest(request: enrichment_types.GeneratedEnrichmentReques
     };
 }
 
+fn publishRequestTerminalCoverage(runtime: *EnrichmentRuntime, window: ?*GeneratedReplayWindow, request: enrichment_types.GeneratedEnrichmentRequest, indexes: []const []const u8) !void {
+    if (runtime.coverage_apply_mutex == null) return;
+    if (window) |pending| {
+        try queueDerivedCoverageOutcome(runtime, pending, request, indexes, .terminal_failed);
+    } else for (indexes) |index_name| {
+        try markDerivedCoverageTerminalFailedForIndex(runtime, index_name, request);
+    }
+}
+
 /// A terminal request can be followed by a different request that still needs
 /// to yield. On the next pass, consult the durable repair ledger before calling
 /// the provider again. This makes progress monotonic across batch boundaries
@@ -11539,13 +11547,12 @@ fn skipPersistedRequestFailure(
         markIsolatedFailedSource(runtime, index_name, failure_identity.artifact_name);
     };
 
-    if (window) |pending_window| if (runtime.coverage_apply_mutex != null)
-        try queueDerivedCoverageOutcome(runtime, pending_window, request, indexes, .terminal_failed);
+    try publishRequestTerminalCoverage(runtime, window, request, indexes);
     return true;
 }
 
 fn resumePersistedDocumentRequestFailure(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, request: enrichment_types.GeneratedEnrichmentRequest) !bool {
-    if (request.kind == .dense_embedding and requestHasChunkSource(request)) {
+    if (request.kind == .dense_embedding and request.input_kind == .materialized_chunks and request.model_aware_chunking) {
         var resumed = false;
         retireMediaPassForDenseRequest(runtime, request, .{ .pending_repair = &resumed }) catch |err| {
             if (!isEnrichmentControlError(err)) setActiveFailureFingerprint(runtime, 0);
@@ -11607,13 +11614,7 @@ fn recordIsolatedRequestErrorGuarded(runtime: *EnrichmentRuntime, window: ?*Gene
             });
         }
     }
-    if (runtime.coverage_apply_mutex != null) {
-        if (window) |active_window| {
-            try queueDerivedCoverageOutcome(runtime, active_window, request, indexes, .terminal_failed);
-        } else for (indexes) |index_name| {
-            try markDerivedCoverageTerminalFailedForIndex(runtime, index_name, request);
-        }
-    }
+    try publishRequestTerminalCoverage(runtime, window, request, indexes);
     try noteTerminalRequestFailure(
         runtime,
         request.sequence,
@@ -32864,40 +32865,14 @@ fn publishMediaWindowVectors(runtime: *EnrichmentRuntime, a: Allocator, request:
     const member_set = count > 1 or terminal;
     if (member_set and !try fusedMediaVectorReceiptsMatch(scratch, a, provider, computation, revision, receipts)) return false;
 
+    try ensureMediaWindowOutputs(runtime, a, input);
+    const children = input.old_window_outputs.?;
     // Single successful windows normally use the scalar path. Only resolve
-    // their fused recipe here when a previous publication left child vectors
-    // that this receipt can legitimately replace.
+    // the fused recipe here when replacing previously published child vectors.
+    if (!member_set and (children.len == 0 or !try fusedMediaVectorReceiptsMatch(scratch, a, provider, computation, revision, receipts))) return false;
     var old_keys = std.ArrayList([]const u8).empty;
-    {
-        var read = try runtime.store.beginRead();
-        defer read.abort();
-        var has_children = false;
-        {
-            var borrowed: @import("../artifact_chunk_cursor.zig").BorrowedRead = .{ .read = &read };
-            var cursor = try borrowed.openPhysicalCursorAdapter();
-            defer cursor.close();
-            var row = try cursor.seekAtOrAfter(input.token.producer_scope_key);
-            while (row) |entry| {
-                if (!std.mem.startsWith(u8, entry.key, input.token.producer_scope_key)) break;
-                if (internal_keys.isDerivedEmbeddingArtifactKey(entry.key) and internal_keys.matchesDerivedEmbeddingArtifactName(entry.key, requestEmbeddingName(request))) {
-                    const base = (try internal_keys.derivedEmbeddingBaseKeyAlloc(scratch, entry.key)).?;
-                    if (std.mem.eql(u8, internal_keys.mediaWindowParent(base), input.token.producer_scope_key)) {
-                        try old_keys.append(scratch, try scratch.dupe(u8, entry.key));
-                        has_children = has_children or internal_keys.mediaWindowIndex(base) != null;
-                    }
-                }
-                row = try cursor.next();
-            }
-        }
-        if (!member_set) {
-            if (!has_children or !try fusedMediaVectorReceiptsMatch(scratch, a, provider, computation, revision, receipts)) return false;
-        }
-        for (old_keys.items) |key| {
-            if (std.mem.eql(u8, key, input.output_key)) continue;
-            const raw = read.get(key) catch |err| if (err == error.NotFound) null else return err;
-            try input.token.observePrecondition(key, raw, try ordered_publication.artifactRevision(&read, input.token.namespace, key));
-        }
-    }
+    try old_keys.appendSlice(scratch, children);
+    if (input.previous_output_exists) try old_keys.append(scratch, input.output_key);
     var effects = std.ArrayList(ordered_publication.Mutation).empty;
     var wanted = std.StringHashMap(void).init(scratch);
     var pending = false;
@@ -32937,6 +32912,55 @@ fn publishMediaWindowVectors(runtime: *EnrichmentRuntime, a: Allocator, request:
         else => return err,
     };
     return true;
+}
+
+fn captureMediaWindowOutputs(a: Allocator, read: *backend_erased.ReadTxn, input: *@import("../artifact_chunk_vector_publication.zig").Input) !void {
+    const first_child = try internal_keys.mediaWindowChildKeyAlloc(a, input.token.producer_scope_key, 0);
+    defer a.free(first_child);
+    const child_prefix = first_child[0 .. first_child.len - @sizeOf(u32)];
+    var borrowed: @import("../artifact_chunk_cursor.zig").BorrowedRead = .{ .read = read };
+    var cursor = try borrowed.openPhysicalCursorAdapter();
+    defer cursor.close();
+    const owned = input.token.arena.allocator();
+    var keys: std.ArrayList([]const u8) = .empty;
+    var row = try cursor.seekAtOrAfter(first_child);
+    while (row) |entry| : (row = try cursor.next()) {
+        if (!std.mem.startsWith(u8, entry.key, child_prefix)) break;
+        if (!internal_keys.matchesDerivedEmbeddingArtifactName(entry.key, input.token.artifact_name)) continue;
+        const key = try owned.dupe(u8, entry.key);
+        const revision = try ordered_publication.artifactRevision(read, input.token.namespace, key);
+        try input.token.observePrecondition(key, entry.value, revision);
+        try keys.append(owned, key);
+    }
+    input.old_window_outputs = keys.items;
+}
+
+fn ensureMediaWindowOutputs(runtime: *EnrichmentRuntime, a: Allocator, input: *@import("../artifact_chunk_vector_publication.zig").Input) !void {
+    if (input.old_window_outputs != null) return;
+    var read = try runtime.store.beginRead();
+    defer read.abort();
+    try captureMediaWindowOutputs(a, &read, input);
+}
+
+/// A scalar publication also replaces this consumer's previously published
+/// windows. Bind each child deletion to the same source and write command.
+fn enqueueScalarChunkVector(runtime: *EnrichmentRuntime, input: *@import("../artifact_chunk_vector_publication.zig").Input, value: ?[]const u8, retire_windows: bool) !void {
+    const scalar: ordered_publication.Mutation = .{ .family = .derived_vector, .key = input.output_key, .value = value, .source_index = 0 };
+    if (!retire_windows)
+        return enqueueProducerEffects(runtime, &input.token, &.{scalar}, null);
+    const a = runtime.alloc;
+    try ensureMediaWindowOutputs(runtime, a, input);
+    const children = input.old_window_outputs.?;
+    if (children.len == 0)
+        return enqueueProducerEffects(runtime, &input.token, &.{scalar}, null);
+    if (input.token.execution_identity != null and input.effect_protocol < ordered_publication.executionIdentityEffectProtocol(input.token.producer_scope_key, children.len + 1))
+        return error.ArtifactCatalogDrift;
+    const effects = try a.alloc(ordered_publication.Mutation, children.len + 1);
+    defer a.free(effects);
+    effects[0] = scalar;
+    for (children, effects[1..]) |key, *effect|
+        effect.* = .{ .family = .derived_vector, .key = key, .value = null, .source_index = 0 };
+    try enqueueProducerEffects(runtime, &input.token, effects, null);
 }
 
 fn processOrderedChunkVectorRequest(
@@ -33398,7 +33422,7 @@ const OrderedDenseTextBatch = struct {
                     if (self.failed_requests.contains(requestFailureFingerprint(item.request))) continue;
                     const value = enrichment_artifact_codec.encodeDenseEmbeddingAlloc(runtime.alloc, item.source_hash, vector) catch |err| return self.scope.publicationFailure(err);
                     defer runtime.alloc.free(value);
-                    enqueueProducerEffects(runtime, &item.input.token, &.{.{ .family = .derived_vector, .key = item.input.output_key, .value = value, .source_index = 0 }}, null) catch |err| switch (err) {
+                    enqueueScalarChunkVector(runtime, &item.input, value, true) catch |err| switch (err) {
                         error.ArtifactPublicationPending => {},
                         else => return self.scope.publicationFailure(err),
                     };
@@ -33623,6 +33647,7 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
                 // Publishing changes this document's census witness. Such a
                 // pass may drive work, but cannot also certify completion.
                 publishing = true;
+                if (dense != null) try captureMediaWindowOutputs(alloc, &read, &input);
                 const text = if (input.value) |value| try chunkPayloadTextAlloc(input.token.arena.allocator(), value, request.source_field) else null;
                 const carried = if (text) |value| try carriedChunkVectorAlloc(input.token.arena.allocator(), &read, request, execution_revision, input.value.?, input.output_key, value) else null;
                 if (carried == null) bytes +|= if (text) |value| value.len else 0;
@@ -33759,7 +33784,7 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
                 break :blk encoded;
             } else null;
             defer if (value) |bytes| alloc.free(bytes);
-            enqueueProducerEffects(runtime, &item.input.token, &.{.{ .family = .derived_vector, .key = item.input.output_key, .value = value, .source_index = 0 }}, null) catch |err| switch (err) {
+            enqueueScalarChunkVector(runtime, &item.input, value, dense != null) catch |err| switch (err) {
                 error.ArtifactPublicationPending => {},
                 else => return err,
             };
@@ -35355,6 +35380,19 @@ fn getOrCreatePlannedRequests(
         explicit_dense,
         explicit_sparse,
     );
+    errdefer enrichment_types.deinitGeneratedRequests(runtime.alloc, planned);
+    if (for (planned) |request| {
+        if (request.kind == .dense_embedding and request.input_kind == .materialized_chunks and request.chunker_json.len != 0) break true;
+    } else false) {
+        var pin = try runtime.index_manager.acquireWritePlanSnapshot();
+        defer pin.release();
+        for (planned) |*request| {
+            if (request.kind != .dense_embedding or request.input_kind != .materialized_chunks or request.chunker_json.len == 0) continue;
+            request.model_aware_chunking = for (pin.plan().generated_templates) |candidate| {
+                if (candidate.model_aware_chunking and std.mem.eql(u8, candidate.chunker_json, request.chunker_json)) break true;
+            } else false;
+        }
+    }
     try request_plan_cache.append(runtime.alloc, .{
         .doc_key = owned_doc_key,
         .requests = planned,
@@ -46262,8 +46300,7 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
     }
     var catalog = try db.artifactInventoryCommand(alloc);
     defer catalog.catalogs.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 18), catalog.binding.effect_protocol);
-    catalog.binding.effect_protocol = 18;
+    try std.testing.expectEqual(@import("../artifact_inventory.zig").scalar_window_retirement_protocol, catalog.binding.effect_protocol);
     try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
     var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
@@ -50389,6 +50426,7 @@ test "model aware media preparation retires only after independent output consum
         runtime: *EnrichmentRuntime = undefined,
         block_after_record: bool = false,
         after_record_claims: usize = 0,
+        allowed_claims: usize = 0,
         change_primary: bool = false,
         revision: [32]u8 = @splat(0x42),
         discovery_calls: usize = 0,
@@ -50402,7 +50440,12 @@ test "model aware media preparation retires only after independent output consum
             var txn = try self.runtime.store.beginProbe();
             defer txn.abort();
             try proof.validate(self.runtime.alloc, &txn);
-            try TestFailureCapture.record(&self.capture, failure);
+            // The actual runtime owns and frees the per-index list after
+            // recording. Keep a stable name in this in-memory ledger fixture.
+            try std.testing.expectEqualStrings("visual_search", failure.index_name);
+            var retained = failure;
+            retained.index_name = "visual_search";
+            try TestFailureCapture.record(&self.capture, retained);
         }
 
         fn pendingIssue(ptr: *anyopaque, failure: FailureIdentity, index_name: []const u8) !bool {
@@ -50414,9 +50457,7 @@ test "model aware media preparation retires only after independent output consum
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.block_after_record and self.capture.count != 0) {
                 self.after_record_claims += 1;
-                // The first acquisition publishes the terminal status. Fail
-                // all attempts to acquire the writer for the cursor and counts.
-                if (self.after_record_claims > 1) return error.WriterLocked;
+                if (self.after_record_claims > self.allowed_claims) return error.WriterLocked;
             }
             return .{ .store = self.runtime.store, .ptr = ptr, .release = release, .guard_key = guardKey };
         }
@@ -50468,6 +50509,14 @@ test "model aware media preparation retires only after independent output consum
     try index_api.validateArtifactEnrichmentConfigs(alloc, configs);
     try index_api.sortArtifactEnrichmentsByDependency(alloc, configs);
     for (configs) |cfg| try index_manager.addEnrichment(&store, cfg);
+    try index_manager.addEnrichment(&store, .{ .name = "fixed_chunks", .kind = .chunk, .field = "body", .chunker_json = "{\"provider\":\"antfly\",\"text\":{\"target_tokens\":64}}" });
+    try index_manager.addEnrichment(&store, .{ .name = "fixed_vectors", .kind = .embedding, .field = "body", .source_artifact_name = "fixed_chunks", .expected_dims = 2 });
+    var documents = try @import("../../docstore.zig").DocStore.openRuntime(alloc, &store);
+    defer documents.close();
+    try index_manager.addAllNoBackfill(&documents, &.{
+        .{ .name = "visual_search", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"vectors\"}" },
+        .{ .name = "fixed_search", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"fixed_vectors\"}" },
+    });
     const prefix = try media_pass.scope(alloc, "doc", "clips", "body");
     defer alloc.free(prefix);
     const key = try media_pass.key(alloc, prefix, null);
@@ -50534,6 +50583,31 @@ test "model aware media preparation retires only after independent output consum
     defer alloc.free(primary_key);
     const raw_primary = "{\"body\":\"original\"}";
     try storePutWithRetry(&runtime, primary_key, raw_primary);
+    var cache: std.ArrayListUnmanaged(RequestPlanCacheEntry) = .empty;
+    defer freeRequestPlanCache(alloc, &cache);
+    const planned = try getOrCreatePlannedRequests(&runtime, failed_request.doc_key, &cache);
+    var seen_fixed = false;
+    for (planned) |item| {
+        if (item.kind != .dense_embedding) continue;
+        const name = requestEmbeddingName(item);
+        if (std.mem.eql(u8, name, "vectors")) {
+            failed_request.model_aware_chunking = item.model_aware_chunking;
+        } else if (std.mem.eql(u8, name, "fixed_vectors")) {
+            seen_fixed = true;
+            try std.testing.expect(!item.model_aware_chunking);
+            const fixed_scope = try media_pass.scope(alloc, item.doc_key, "fixed_chunks", "body");
+            defer alloc.free(fixed_scope);
+            const fixed_key = try media_pass.key(alloc, fixed_scope, null);
+            defer alloc.free(fixed_key);
+            try storePutWithRetry(&runtime, fixed_key, "invalid cursor must remain unread");
+            var window: GeneratedReplayWindow = .{ .alloc = alloc };
+            defer window.deinit();
+            try std.testing.expect(!try resumePersistedDocumentRequestFailure(&runtime, &window, item));
+        }
+    }
+    try std.testing.expect(seen_fixed);
+    try std.testing.expect(failed_request.model_aware_chunking);
+
     var upstream = failed_request;
     upstream.chunker_json = index_manager.getEnrichment(.chunk, "clips").?.chunker_json;
     const failed_state: media_pass.Cursor = .{ .input_digest = try mediaPassInputDigest(&runtime, upstream, sourceRecordDigest(raw_primary)), .source_sequence = 10, .page_count = 1, .covered_through_ordinal = 1, .complete = true };
@@ -50586,15 +50660,33 @@ test "model aware media preparation retires only after independent output consum
     try storePutWithRetry(&runtime, primary_key, raw_primary);
     recorder.offline = true;
     const discovery_calls = recorder.discovery_calls;
+    var coverage_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
+    runtime.coverage_apply_mutex = &coverage_mutex;
+    const coverage_generation = index_manager.coverageGenerationForIndex("visual_search").?;
+    const transition = try initCoverageOutcomeTransition(&runtime, "visual_search", coverage_generation, failed_request.doc_key, failed_request.sequence, .terminal_failed);
+    defer deinitCoverageOutcomeTransition(alloc, transition);
+    // Another issue at this sequence can already have established the
+    // envelope when this issue's first coverage write fails.
+    runtime.terminal_failure_min_sequence = failed_request.sequence;
+    runtime.terminal_failure_max_sequence = failed_request.sequence;
 
     // The first attempt staged the marker but the guarded ledger write failed.
-    // Resume it before any provider selection, then fail the final cursor write.
+    // Resume it offline, then interrupt durable terminal coverage.
     runtime.generated_publication = .{ .ptr = &recorder, .commit = undefined, .heartbeat = undefined, .acquire_store = Recorder.acquire };
     recorder.block_after_record = true;
     try std.testing.expectError(error.WriterLocked, resumePersistedDocumentRequestFailure(&runtime, &lane.window, failed_request));
     try std.testing.expectEqual(@as(usize, 1), recorder.capture.count);
     const before_resume = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
     try std.testing.expectEqual(@as(u64, 0), before_resume.output_counts.embedding.failed);
+
+    try std.testing.expect((try storeGetOptionalAllocWithRetry(&runtime, transition.marker_key)) == null);
+    recorder.after_record_claims = 0;
+    recorder.allowed_claims = 1;
+    // Retry the missing coverage first, then fail the cursor write.
+    try std.testing.expectError(error.WriterLocked, resumePersistedDocumentRequestFailure(&runtime, &lane.window, failed_request));
+    const terminal = try storeGetAlloc(&runtime, transition.marker_key);
+    defer alloc.free(terminal);
+    try std.testing.expectEqualStrings("terminal_failed", terminal);
 
     recorder.block_after_record = false;
     lane.scope = .{};
@@ -51558,17 +51650,8 @@ test "model aware media ordered vector windows are searchable with exact clocks 
     }
     var catalog = try db.artifactInventoryCommand(a);
     defer catalog.catalogs.deinit(a);
-    // Unlike sibling tests in this file that copy this same activation
-    // sequence to pin an *old* catalog baseline (effect_protocol = 15),
-    // this test's own "vectors" index is exactly a chunk-generated dense
-    // vector config (artifact_inventory.zig's onlineGeneratedChunkVectorConfig),
-    // which naturally computes to the current max, 18 -- the floor
-    // processOrderedChunkVectorWithAllocator's own execution_revision !=
-    // null and effect_protocol < 18 check requires before it will even
-    // reach the chunk-embedding-target compatibility error this test
-    // expects (error.IncompatibleChunkEmbeddingTarget). Pinning 15 here
-    // instead hits the earlier, unrelated error.OnlineMergeArtifactTailsUnsupported.
-    catalog.binding.effect_protocol = 18;
+    const retirement_protocol = @import("../artifact_inventory.zig").scalar_window_retirement_protocol;
+    try std.testing.expectEqual(retirement_protocol, catalog.binding.effect_protocol);
     try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
     var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
@@ -51628,7 +51711,9 @@ test "model aware media ordered vector windows are searchable with exact clocks 
     defer a.free(pass_key);
     const page_key = try media_pass.key(a, pass_scope, 0);
     defer a.free(page_key);
-    for (0..2) |round| {
+    const multi_outputs = metadata.outputs_json;
+    for (0..4) |round| {
+        const multiple = round % 2 == 0;
         if (round == 1) {
             marker = 0x22;
             try std.testing.expectError(error.IncompatibleChunkEmbeddingTarget, processOrderedChunkVectorWithAllocator(runtime, a, vector_request, provider, null, &.{"vectors"}));
@@ -51636,11 +51721,13 @@ test "model aware media ordered vector windows are searchable with exact clocks 
         }
         const single = try std.json.Stringify.valueAlloc(a, results[0..1], .{});
         defer a.free(single);
-        if (round == 1) {
-            try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"changed source\"}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = harness.next_index });
+        if (round != 0) {
+            const value = try std.fmt.allocPrint(a, "{{\"body\":\"source {d}\"}}", .{round});
+            defer a.free(value);
+            try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = value }}, .timestamp_ns = @intCast(100 + round) }, .{ .term = 1, .index = harness.next_index });
             harness.next_index += 1;
-            metadata.outputs_json = single;
         }
+        metadata.outputs_json = if (round == 3) single else multi_outputs;
         {
             var token = try Harness.capture(runtime, parent_request, scope);
             defer token.deinit();
@@ -51684,7 +51771,26 @@ test "model aware media ordered vector windows are searchable with exact clocks 
             try std.testing.expect(!try publishMediaWindowVectors(runtime, a, vector_request, provider, @as([32]u8, @splat(0x22)), &input, failed_payload, &cache));
             try std.testing.expectEqual(calls, harness.calls);
         }
-        try std.testing.expect(try publishMediaWindowVectors(runtime, a, vector_request, provider, @as([32]u8, @splat(marker)), &input, input.value.?, &cache));
+        if (round == 1) {
+            const scalar_revision: [32]u8 = @splat(0x22);
+            const calls = harness.calls;
+            try std.testing.expect(!try publishMediaWindowVectors(runtime, a, vector_request, provider, scalar_revision, &input, input.value.?, &cache));
+            try std.testing.expectEqual(calls, harness.calls);
+            const vector = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, retainedTextEmbeddingHashAtRevision(vector_request, "source 1", scalar_revision), &.{ 0.8, 0.6 });
+            defer a.free(vector);
+            input.token.execution_identity = scalar_revision;
+            input.effect_protocol = retirement_protocol - 1;
+            try std.testing.expectError(error.ArtifactCatalogDrift, enqueueScalarChunkVector(runtime, &input, vector, true));
+            try std.testing.expectEqual(calls, harness.calls);
+            input.effect_protocol = retirement_protocol;
+            enqueueScalarChunkVector(runtime, &input, vector, true) catch |err| switch (err) {
+                error.ArtifactPublicationPending => {},
+                else => return err,
+            };
+            try std.testing.expectEqual(calls + 1, harness.calls);
+        } else {
+            try std.testing.expect(try publishMediaWindowVectors(runtime, a, vector_request, provider, @as([32]u8, @splat(marker)), &input, input.value.?, &cache));
+        }
         try db.runUntilIdle();
         {
             var lookup = (try db.lookup(a, "doc", .{ .fields = &.{"_artifacts"}, .include_all_fields = false })).?;
@@ -51693,7 +51799,7 @@ test "model aware media ordered vector windows are searchable with exact clocks 
             defer projected.deinit();
             try std.testing.expect(projected.value.object.get("_artifacts").?.object.contains("model"));
             const projected_model = projected.value.object.get("_artifacts").?.object.get("model").?;
-            if (round == 0) {
+            if (multiple) {
                 const items = projected_model.object.get("items").?.array.items;
                 try std.testing.expectEqual(@as(usize, 2), items.len);
                 for (items, 0..) |item, index| {
@@ -51703,7 +51809,7 @@ test "model aware media ordered vector windows are searchable with exact clocks 
             } else try std.testing.expect(projected_model.object.get("artifact_ref").?.object.get("source").?.object.get("window_index") == null);
         }
 
-        if (round == 0) for (0..2) |index| {
+        if (multiple) for (0..2) |index| {
             const child = try internal_keys.mediaWindowChildKeyAlloc(a, member, @intCast(index));
             defer a.free(child);
             const vector = try internal_keys.derivedEmbeddingArtifactKeyAlloc(a, child, "model");
@@ -51714,11 +51820,11 @@ test "model aware media ordered vector windows are searchable with exact clocks 
             defer a.free(decoded);
             try std.testing.expectEqualSlices(f32, results[index].embedding.?, decoded);
         };
-        try std.testing.expectEqual(@as(u64, if (round == 0) 2 else 1), db.core.index_manager.denseIndex("vectors").?.index.stats().active_count);
+        try std.testing.expectEqual(@as(u64, if (multiple) 2 else 1), db.core.index_manager.denseIndex("vectors").?.index.stats().active_count);
         var found = try db.search(a, .{ .index_name = "vectors", .dense = .{ .vector = &.{ 0.2, 1 }, .k = 4 }, .return_mode = .member, .limit = 4, .include_stored = true });
         defer found.deinit();
-        try std.testing.expectEqual(@as(usize, if (round == 0) 2 else 1), found.hits.len);
-        if (round == 0) {
+        try std.testing.expectEqual(@as(usize, if (multiple) 2 else 1), found.hits.len);
+        if (multiple) {
             try std.testing.expectEqual(@as(?u32, 1), found.hits[0].artifact_ref.?.window_index);
             for (found.hits) |hit| {
                 const index = hit.artifact_ref.?.window_index orelse return error.TestUnexpectedResult;
@@ -51979,13 +52085,6 @@ test "model aware media terminal scalar output acknowledges failure without mode
     }
     var catalog = try db.artifactInventoryCommand(a);
     defer catalog.catalogs.deinit(a);
-    // This catalog's "vectors" index is exactly artifact_inventory.zig's
-    // onlineGeneratedChunkVectorConfig shape, which computes to the current
-    // max (18), not the stale floor (15) a sibling test deliberately pins.
-    // Pinning 15 here trips processOrderedChunkVectorWithAllocator's
-    // execution_revision-gated floor check before reaching the terminal
-    // failure this test means to exercise.
-    catalog.binding.effect_protocol = 18;
     try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
     var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
