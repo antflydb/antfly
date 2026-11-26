@@ -376,6 +376,34 @@ test "uniform video owned root values survive producer mutation without independ
     try std.testing.expect(retained.interval_peak_bytes[0] != retained.interval_peak_bytes[1] + retained.interval_peak_bytes[2]);
 }
 
+test "uniform report retains the observed CUDA audio workspace across publication" {
+    const std = @import("std");
+    const observation = @import("runtime_observation.zig");
+    var source = @import("diagnostics.zig").Diagnostics{};
+    source.configure(true);
+    source.publish(.{});
+    try std.testing.expect(source.snapshot().?.report.?.cuda_audio_workspace == null);
+
+    const workspace: observation.CudaAudioWorkspace = .{
+        .plan_origin = .observed,
+        .planned_events = 12,
+        .planned_arena_bytes = 4096,
+        .bound_arena_bytes = 4096,
+        .bound_input_bytes = 512,
+        .planned_terminal_bytes = 256,
+        .bound_terminal_bytes = 256,
+        .terminal_outside_arena = true,
+    };
+    var scope: observation.KernelScope = undefined;
+    scope.begin();
+    observation.cudaAudioWorkspace(workspace);
+    _ = scope.finish();
+    var sample: runtime.Snapshot = .{};
+    sample.recordKernelInterval(&scope);
+    source.publish(.{ .runtime = sample.since(.{}) });
+    try std.testing.expectEqual(workspace, source.snapshot().?.report.?.cuda_audio_workspace.?);
+}
+
 test "uniform report separates planned literal publication from opaque Metal output copies" {
     const std = @import("std");
     var source = @import("diagnostics.zig").Diagnostics{};
