@@ -279,49 +279,37 @@ pub const State = struct {
         if (outputs.outputs.len != self.session.outputInfo().len) return error.InvalidDecoderOutput;
         defer @memset(updated, null);
         errdefer for (updated) |slot| if (slot) |owned| owned.pin.release();
+        const row = try @import("encoder_decoder_runtime.zig").residentVocabularyRow(self.allocator, self.session, &outputs, self.logits_index, suffix.tokens.len, self.vocab_size, control, dispatch != null);
+        errdefer self.allocator.free(row);
         for (self.roles, slots, updated) |role, old, *slot| switch (role) {
             .past => |past| {
                 const value = outputs.outputs[past.output_index];
                 const length = std.math.cast(i64, if (past.cross) self.mask.len else end) orelse return error.InvalidDecoderOutput;
-                const want = [_]i64{ 1, past.empty_shape[1], length, past.empty_shape[3] };
-                const bytes = (try residentCacheBytes(outputs.backend, value, &want, if (!fresh and past.cross) &past.empty_shape else null)) orelse {
+                const shape = [_]i64{ 1, past.empty_shape[1], length, past.empty_shape[3] };
+                const bytes = (try residentCacheBytes(outputs.backend, value, &shape, if (!fresh and past.cross) &past.empty_shape else null)) orelse {
                     if (old == null) return error.InvalidDecoderOutput;
                     continue;
                 };
-                slot.* = .{
-                    .pin = try outputs.retainResources(self.allocator),
-                    .input = .{ .value = value, .backend = outputs.backend, .estimated_bytes = bytes },
-                    .shape = want,
-                };
-            },
-            else => {},
-        };
-        const row = try @import("encoder_decoder_runtime.zig").residentVocabularyRow(self.allocator, self.session, &outputs, self.logits_index, suffix.tokens.len, self.vocab_size, control, dispatch != null);
-        errdefer self.allocator.free(row);
-        for (self.roles, updated) |role, *slot| switch (role) {
-            .past => |past| {
-                const provisional = slot.* orelse {
-                    if (past.cross) continue; // An omitted cross output keeps its previous binding.
-                    return error.InvalidDecoderOutput;
-                };
+                const input: sessions.ResidentInput = .{ .value = value, .backend = outputs.backend, .estimated_bytes = bytes };
                 var aliases: usize = 0;
-                for (outputs.outputs) |value| {
-                    if (value == provisional.input.value) aliases += 1;
+                for (outputs.outputs) |other| {
+                    if (other == value) aliases += 1;
                 }
-                if (aliases != 1) continue;
-                const adopted = self.adoptCache(provisional, if (past.cross) .isolated_or_standalone else .pooled_or_standalone) catch |err| switch (err) {
-                    error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => null,
-                    else => return err,
-                };
+                const adopted = if (aliases == 1)
+                    self.adoptCache(input, shape, if (past.cross) .isolated_or_standalone else .pooled_or_standalone) catch |err| switch (err) {
+                        error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => null,
+                        else => return err,
+                    }
+                else
+                    null;
                 if (adopted) |independent| {
-                    // The new lease owns this backing. Keep the output vector
-                    // in signature order but remove this CT from the original
-                    // invocation's retirement inventory. Its destruction
-                    // already deduplicates repeated handles.
+                    // The independent lease owns this backing. Remove the CT
+                    // from invocation retirement without reordering its ABI.
                     outputs.outputs[past.output_index] = outputs.outputs[self.logits_index];
-                    outputs.backend.free(provisional.input.value);
-                    provisional.pin.release();
+                    outputs.backend.free(value);
                     slot.* = independent;
+                } else {
+                    slot.* = .{ .pin = try outputs.retainResources(self.allocator), .input = input, .shape = shape };
                 }
             },
             else => {},
@@ -339,27 +327,27 @@ pub const State = struct {
 
     const CacheAdoption = enum { standalone, isolated_or_standalone, pooled_or_standalone };
 
-    fn adoptCache(self: *State, source: ResidentSlot, policy: CacheAdoption) !?ResidentSlot {
+    fn adoptCache(self: *State, input: sessions.ResidentInput, shape: [4]i64, policy: CacheAdoption) !?ResidentSlot {
         const shared = self.session.shared_compute_context orelse return null;
         const backend = shared.stableBackend();
-        if (self.session.model_lifetime == null or source.input.backend.ptr != backend.ptr or source.input.backend.vtable != backend.vtable) return null;
+        if (self.session.model_lifetime == null or input.backend.ptr != backend.ptr or input.backend.vtable != backend.vtable) return null;
         const kernels = backend.vtable.kernels orelse return null;
         if (!kernels.accepts(backend.vtable)) return null;
         const retain = kernels.retainImmutableTensor orelse return null;
         // Cross-cache bindings can outlive every suffix. Retain pool backing
         // only when the cache spans the entire logical allocation.
         const candidate = if (policy != .standalone)
-            if (kernels.pooledOutputStorage) |storage| storage(backend.ptr, source.input.value) else null
+            if (kernels.pooledOutputStorage) |storage| storage(backend.ptr, input.value) else null
         else
             null;
         const pooled = if (candidate) |lease| blk: {
-            if (policy == .isolated_or_standalone and lease.byte_size != source.input.estimated_bytes) break :blk null;
+            if (policy == .isolated_or_standalone and lease.byte_size != input.estimated_bytes) break :blk null;
             break :blk lease;
         } else null;
         var admission = if (pooled) |lease| blk: {
             if (lease.backend.ptr != backend.ptr or lease.backend.vtable != backend.vtable or
                 lease.usage != .ordinary or lease.accounting_class != .activation or lease.isReadOnly() or
-                lease.byte_size < source.input.estimated_bytes) return null;
+                lease.byte_size < input.estimated_bytes) return null;
             const backing_bytes = lease.backing_byte_size orelse lease.byte_size;
             if (lease.admission) |charged| {
                 const expected = self.session.run_admission orelse return null;
@@ -373,8 +361,8 @@ pub const State = struct {
             break :blk try self.session.admitRetainedState(0, backing_bytes);
         } else blk: {
             const measure = kernels.standaloneOutputBytes orelse return null;
-            const bytes = measure(backend.ptr, source.input.value) orelse return null;
-            if (bytes < source.input.estimated_bytes) return null;
+            const bytes = measure(backend.ptr, input.value) orelse return null;
+            if (bytes < input.estimated_bytes) return null;
             break :blk try self.session.admitRetainedState(0, bytes);
         };
         defer if (admission) |*reservation| reservation.deinit();
@@ -382,7 +370,7 @@ pub const State = struct {
         var populated = false;
         var owned: sessions.ResidentOutputs = .{ .outputs = handles, .backend = backend, .allocator = self.allocator };
         defer if (populated) owned.deinit() else self.allocator.free(handles);
-        handles[0] = (try retain(backend.ptr, source.input.value)) orelse return null;
+        handles[0] = (try retain(backend.ptr, input.value)) orelse return null;
         populated = true;
         self.session.pinResident(&owned);
         owned.physical_backing_requires_epoch = if (pooled) |lease| lease.retirement_owner != null else false;
@@ -392,12 +380,15 @@ pub const State = struct {
             owned.resource_lease = reservation.lease;
             reservation.lease = null;
         }
-        var result = source;
-        result.pin = try owned.retainResources(self.allocator);
-        result.input.value = handles[0];
-        result.input.backend = backend;
-        result.independent = true;
-        return result;
+        var retained = input;
+        retained.value = handles[0];
+        retained.backend = backend;
+        return .{
+            .pin = try owned.retainResources(self.allocator),
+            .input = retained,
+            .shape = shape,
+            .independent = true,
+        };
     }
 
     /// Prepare each independently admitted target before submitting the
@@ -881,7 +872,7 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
                 standalone_input.input.value = original;
                 standalone_input.input.backend = shared.stableBackend();
                 const before_adopt = controller.snapshot();
-                const adopted = (try state.adoptCache(standalone_input, .standalone)) orelse return error.MissingIndependentSelfCache;
+                const adopted = (try state.adoptCache(standalone_input.input, standalone_input.shape, .standalone)) orelse return error.MissingIndependentSelfCache;
                 defer adopted.pin.release();
                 try std.testing.expect(adopted.independent);
                 try std.testing.expect(controller.snapshot().backend_kv_bytes >= before_adopt.backend_kv_bytes + owned.input.estimated_bytes);
@@ -1064,9 +1055,9 @@ fn checkPooledSelfAdoption(state: *State, previous: ResidentSlot, controller: *@
         const charged = controller.snapshot();
         var source = previous;
         source.input.value = value;
-        try std.testing.expect((try state.adoptCache(source, .standalone)) == null);
+        try std.testing.expect((try state.adoptCache(source.input, source.shape, .standalone)) == null);
         try std.testing.expectEqualDeep(charged, controller.snapshot());
-        const result = (try state.adoptCache(source, .isolated_or_standalone)) orelse return error.MissingIndependentPooledCache;
+        const result = (try state.adoptCache(source.input, source.shape, .isolated_or_standalone)) orelse return error.MissingIndependentPooledCache;
         errdefer result.pin.release();
         try std.testing.expect(result.independent);
         try std.testing.expectEqualDeep(charged, controller.snapshot());
