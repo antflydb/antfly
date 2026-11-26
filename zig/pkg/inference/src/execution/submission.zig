@@ -24,6 +24,23 @@ pub const Pending = struct {
     backend: *const ops.ComputeBackend,
     active: bool = false,
 
+    /// Submit a frame explicitly lent by the caller. The caller retains
+    /// cancellation authority for any encoding the provider leaves active.
+    pub fn submitBorrowed(self: *Pending) !void {
+        if (self.active) return error.InvalidFrameSubmissionOwner;
+        const commands = self.backend.vtable.regions.commands;
+        const has_active = commands.hasActiveFrame orelse return error.UnsupportedOperation;
+        const has_submitted = commands.hasSubmittedFrame orelse return error.UnsupportedOperation;
+        if (commands.waitSubmittedFrame == null) return error.UnsupportedOperation;
+        const submit = commands.submitFrame orelse return error.UnsupportedOperation;
+        if (!has_active(self.backend.ptr) or has_submitted(self.backend.ptr)) return error.InvalidFrameSubmissionOwner;
+        submit(self.backend.ptr) catch |err| {
+            self.active = has_submitted(self.backend.ptr);
+            return err;
+        };
+        self.active = true;
+    }
+
     pub fn wait(self: *Pending) !void {
         if (!self.active) return;
         const commands = self.backend.vtable.regions.commands;
@@ -224,4 +241,12 @@ test "submission scopes preserve foreign batches unwind encoding and never repla
     try pending.wait();
     try std.testing.expect(!pending.active and !probe.submitted);
     try std.testing.expectEqual(@as(usize, 3), probe.commits);
+
+    try std.testing.expectError(error.InvalidFrameSubmissionOwner, pending.submitBorrowed());
+    try std.testing.expect(try Probe.begin(&probe));
+    try std.testing.expectError(error.SubmissionFailed, pending.submitBorrowed());
+    try std.testing.expect(pending.active and probe.submitted and !probe.active);
+    try pending.wait();
+    try std.testing.expectEqual(@as(usize, 4), probe.commits);
+    try std.testing.expectEqual(@as(usize, 2), probe.cancels);
 }

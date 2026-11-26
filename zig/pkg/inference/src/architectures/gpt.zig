@@ -3528,7 +3528,6 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
         qwen_pending.wait() catch {
             if (qwen_pending.active) platform.inference_process_supervisor.restartWorker();
         };
-        if (borrowed_stream) cb.decoderRuntimeWaitSubmittedFrame() catch {};
     }
 
     if (a4b_frame.owns) {
@@ -3667,12 +3666,11 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
             try cb.checkExecutionControl();
             // Finish the prior submitted group before promoting this active
             // group. Only the existing two storage banks can be in flight.
+            try qwen_pending.wait();
             if (borrowed_stream) {
-                try cb.decoderRuntimeWaitSubmittedFrame();
-                try cb.decoderRuntimeSubmitFrame();
+                try qwen_pending.submitBorrowed();
                 if (!try cb.decoderRuntimeBeginFrame()) return error.StreamedForwardFrameUnavailable;
             } else {
-                try qwen_pending.wait();
                 try qwen_frame.submitInto(&qwen_pending);
                 qwen_frame = try Submission.beginPipelined(cb);
                 if (!qwen_frame.owns) return error.StreamedForwardFrameUnavailable;
