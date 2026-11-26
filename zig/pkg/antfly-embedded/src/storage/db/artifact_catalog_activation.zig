@@ -23,23 +23,15 @@ const window_fence_key = "\x00\x00__metadata__:artifact_window_set_fence";
 
 /// Only capable replicas can install protocol 20. Older log entries retain
 /// their original physical effects during catch-up and mixed-version rollout.
-pub fn windowSetFenced(alloc: std.mem.Allocator, txn: anytype, active: publication.Authority) !bool {
-    const marker = txn.get(window_fence_key) catch |err| switch (err) {
-        error.NotFound => null,
+pub fn windowSetFenced(txn: anytype, active: publication.Authority) !bool {
+    const raw = txn.get(window_fence_key) catch |err| switch (err) {
+        error.NotFound => return false,
         else => return err,
     };
-    if (marker) |raw| {
-        if (raw.len != 64) return error.ArtifactCatalogCorrupt;
-        if (std.mem.readInt(u64, raw[0..8], .big) == active.epoch and
-            std.mem.eql(u8, raw[8..32], &active.namespace) and
-            std.mem.eql(u8, raw[32..64], &active.catalog_digest)) return true;
-    }
-    // A restored ordered binding can predate the compact marker.
-    const ordered = (try inventory.load(alloc, txn)) orelse return false;
-    defer ordered.deinit();
-    const command = ordered.value.command;
-    return command.binding.effect_protocol >= inventory.scalar_window_retirement_protocol and command.binding.epoch == active.epoch and
-        std.mem.eql(u8, &command.namespace, &active.namespace) and std.mem.eql(u8, &command.binding.digest, &active.catalog_digest);
+    if (raw.len != 64) return error.ArtifactCatalogCorrupt;
+    return std.mem.readInt(u64, raw[0..8], .big) == active.epoch and
+        std.mem.eql(u8, raw[8..32], &active.namespace) and
+        std.mem.eql(u8, raw[32..64], &active.catalog_digest);
 }
 
 pub fn stage(a: std.mem.Allocator, txn: anytype, command: inventory.Command) !void {
@@ -64,4 +56,25 @@ pub fn stage(a: std.mem.Allocator, txn: anytype, command: inventory.Command) !vo
     const authority = (try publication.authority(txn)).?;
     try @import("artifact_producer_obligations.zig").begin(a, txn, authority);
     try @import("artifact_producer_validation.zig").begin(a, txn, authority);
+}
+
+test "ordered media window fence uses only its compact authority marker" {
+    const Reader = struct {
+        marker: ?[]const u8 = null,
+
+        pub fn get(self: @This(), key: []const u8) ![]const u8 {
+            try std.testing.expectEqualStrings(window_fence_key, key);
+            return self.marker orelse error.NotFound;
+        }
+    };
+    const active: publication.Authority = .{ .namespace = @splat(1), .epoch = 2, .catalog_digest = @splat(3) };
+    try std.testing.expect(!try windowSetFenced(Reader{}, active));
+    var bytes: [64]u8 = undefined;
+    std.mem.writeInt(u64, bytes[0..8], active.epoch, .big);
+    @memcpy(bytes[8..32], &active.namespace);
+    @memcpy(bytes[32..64], &active.catalog_digest);
+    const reader: Reader = .{ .marker = &bytes };
+    try std.testing.expect(try windowSetFenced(reader, active));
+    bytes[63] ^= 1;
+    try std.testing.expect(!try windowSetFenced(reader, active));
 }

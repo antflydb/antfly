@@ -136,11 +136,21 @@ pub const Fence = struct {
     certificate: ?@import("artifact_producer_provenance.zig").ArtifactCertificate = null,
     prepared: bool = false,
     dense: bool = false,
+    revalidate_window_plan: bool = false,
     /// Resolve membership and decode inherited provenance before serialized
     /// apply. Published generation rows are immutable; the head/member guards
     /// plus this exact proof reference fence preserve the prepared observation.
     pub fn bind(self: *Fence, alloc: std.mem.Allocator, txn: anytype, command: publication.Command, window_protocol: bool) !void {
-        if (window_protocol) try self.validateWindowPlan(alloc, txn, command);
+        if (window_protocol and self.dense) {
+            try self.validateWindowPlan(alloc, txn, command);
+            // A restored binding without the compact marker cannot rely on
+            // the parent revision to fence a concurrent child insertion.
+            self.revalidate_window_plan = !try @import("artifact_catalog_activation.zig").windowSetFenced(txn, .{
+                .namespace = command.namespace,
+                .epoch = command.authority_epoch,
+                .catalog_digest = command.catalog_digest,
+            });
+        }
         self.prepared = false;
         self.certificate = null;
         var input = try @import("artifact_chunk_generation.zig").captureInput(alloc, txn, self.scope);
@@ -184,18 +194,15 @@ pub const Fence = struct {
     /// Validate the window plan outside the serialized writer. The scalar
     /// precondition also fences the output set: physical child writes advance
     /// the parent revision, even when the parent has no stored value.
-    fn validateWindowPlan(self: Fence, alloc: std.mem.Allocator, txn: anytype, command: publication.Command) !void {
+    pub fn validateWindowPlan(self: Fence, alloc: std.mem.Allocator, txn: anytype, command: publication.Command) !void {
         if (!self.dense) return;
         if (!publication.isRevisionBoundChunkVectorSet(self.scope, command.producer_artifact_name, command.mutations))
             return error.EnrichmentSourceChanged;
         var scalar_effect = false;
-        var window_effect = false;
         for (command.mutations) |effect| {
             scalar_effect = scalar_effect or effect.key[self.scope.len] == keys.derived_embedding_kind;
-            window_effect = window_effect or effect.key[self.scope.len] == keys.media_window_kind;
         }
         if (!scalar_effect) return error.EnrichmentSourceChanged;
-        if (!window_effect) return;
         const first = try keys.mediaWindowChildKeyAlloc(alloc, self.scope, 0);
         defer alloc.free(first);
         const prefix = first[0 .. first.len - @sizeOf(u32)];
