@@ -29,6 +29,10 @@ pub const Input = struct {
     token: context.Token,
     value: ?[]const u8,
     output_key: []const u8,
+    previous_output_exists: bool = false,
+    effect_protocol: u16 = 18,
+    /// Captured only for a dense member that needs publication.
+    old_window_outputs: ?[]const []const u8 = null,
     pub fn deinit(self: *Input) void {
         self.token.deinit();
         self.* = undefined;
@@ -52,7 +56,7 @@ pub fn CaptureSession(comptime Txn: type) type {
         effect_protocol: u16,
 
         pub fn capture(self: @This(), alloc: std.mem.Allocator, scope: []const u8) !Input {
-            return captureMember(alloc, self.txn, self.request, self.authority, self.generation, scope);
+            return captureMember(alloc, self.txn, self.request, self.authority, self.generation, self.effect_protocol, scope);
         }
     };
 }
@@ -79,7 +83,7 @@ pub fn captureSession(alloc: std.mem.Allocator, txn: anytype, request: @import("
     return .{ .txn = txn, .request = request, .authority = authority, .generation = generation, .effect_protocol = binding.effect_protocol };
 }
 
-fn captureMember(alloc: std.mem.Allocator, txn: anytype, request: @import("enrichment/enrichment_types.zig").GeneratedEnrichmentRequest, authority: publication.Authority, generation: u64, scope: []const u8) !Input {
+fn captureMember(alloc: std.mem.Allocator, txn: anytype, request: @import("enrichment/enrichment_types.zig").GeneratedEnrichmentRequest, authority: publication.Authority, generation: u64, effect_protocol: u16, scope: []const u8) !Input {
     var token: context.Token = .{
         .arena = std.heap.ArenaAllocator.init(alloc),
         .namespace = authority.namespace,
@@ -122,7 +126,7 @@ fn captureMember(alloc: std.mem.Allocator, txn: anytype, request: @import("enric
         else => return err,
     };
     try token.observePrecondition(output, previous, try publication.artifactRevision(txn, authority.namespace, output));
-    return .{ .token = token, .value = value, .output_key = output };
+    return .{ .token = token, .value = value, .output_key = output, .previous_output_exists = previous != null, .effect_protocol = effect_protocol };
 }
 
 pub const Fence = struct {

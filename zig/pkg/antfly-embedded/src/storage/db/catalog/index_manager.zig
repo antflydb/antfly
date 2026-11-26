@@ -6828,6 +6828,15 @@ pub const IndexManager = struct {
         }
         const generated_templates = try self.planGeneratedEnrichments(alloc, "", "{}", &.{}, &.{});
         errdefer enrichment_types.deinitGeneratedRequests(alloc, generated_templates);
+        for (generated_templates) |*template| {
+            if (template.kind != .dense_embedding or template.input_kind != .materialized_chunks or template.chunker_json.len == 0) continue;
+            var chunker = chunking_types.parseConfigFromSlice(alloc, template.chunker_json) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => continue, // Classification does not replace execution-time validation.
+            };
+            defer chunker.deinit(alloc);
+            template.model_aware_chunking = chunker.isModelAware();
+        }
         var group_sources = try @import("../group_source_mutations.zig").Plan.init(alloc, generated_templates);
         errdefer group_sources.deinit();
         const chunk_dependents = try alloc.alloc([]u32, generated_templates.len);

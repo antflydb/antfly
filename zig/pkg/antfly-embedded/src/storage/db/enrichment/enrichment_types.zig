@@ -150,6 +150,8 @@ pub const GeneratedEnrichmentRequest = struct {
     chunk_size: u32 = 0,
     chunk_overlap: u32 = 0,
     chunker_json: []const u8 = "",
+    /// Set by the replay plan for a materialized model-aware chunk route.
+    model_aware_chunking: bool = false,
     full_text_index: bool = false,
     /// Persist generated chunk records even when no text index consumes them.
     /// Materialized embedding and graph consumers both require durable chunks.
@@ -308,6 +310,7 @@ pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReque
         .chunk_size = request.chunk_size,
         .chunk_overlap = request.chunk_overlap,
         .chunker_json = chunker_json,
+        .model_aware_chunking = request.model_aware_chunking,
         .full_text_index = request.full_text_index,
         .persist_artifact = request.persist_artifact,
         .independently_required = request.independently_required,

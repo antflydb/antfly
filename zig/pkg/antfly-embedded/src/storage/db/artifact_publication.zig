@@ -35,6 +35,35 @@ pub fn namespaceFromBytes(value: Namespace) @import("doc_identity_namespace.zig"
     return .{ .table_id = std.mem.readInt(u64, value[0..8], .big), .shard_id = std.mem.readInt(u64, value[8..16], .big), .range_id = std.mem.readInt(u64, value[16..24], .big) };
 }
 pub const Family = enum { base_vector, derived_vector, document_artifact, resolution, graph };
+/// Only the parent can receive a value. Every other effect must remove
+/// a window of this exact parent and embedding consumer.
+pub fn isRevisionBoundScalarWindowReplacement(scope: []const u8, artifact: []const u8, effects: anytype) bool {
+    if (!keys.isChunkArtifactRecordKey(scope) or keys.mediaWindowIndex(scope) != null) return false;
+    var scalar_seen = false;
+    for (effects) |effect| {
+        if (effect.family != .derived_vector or effect.source_index != 0 or
+            !std.mem.startsWith(u8, effect.key, scope) or effect.key.len <= scope.len or
+            !keys.matchesDerivedEmbeddingArtifactName(effect.key, artifact)) return false;
+        switch (effect.key[scope.len]) {
+            keys.derived_embedding_kind => {
+                if (scalar_seen) return false;
+                scalar_seen = true;
+            },
+            keys.media_window_kind => {
+                const live = if (comptime @hasField(@TypeOf(effect), "value")) effect.value != null else effect.value_digest != null;
+                if (live) return false;
+            },
+            else => return false,
+        }
+    }
+    return scalar_seen;
+}
+
+pub fn executionIdentityEffectProtocol(scope: []const u8, effects: usize) u16 {
+    if (effects > 1) return @import("artifact_inventory.zig").scalar_window_retirement_protocol;
+    return if (scope.len == 0) 17 else 18;
+}
+
 pub const authority_key = "\x00\x00__artifact_publication__:authority";
 pub const Authority = struct { namespace: Namespace, epoch: u64, catalog_digest: Digest };
 
@@ -376,8 +405,11 @@ pub const Command = struct {
     /// codecs and catalog consumer authorization are checked by the owner too.
     pub fn validate(self: Command, alloc: std.mem.Allocator) !void {
         if (self.execution_identity != null) {
-            if (self.mode != .publish or self.producer_kind != .index or
-                (self.producer_scope_key.len == 0 and self.sources.len != 1) or self.mutation_preconditions.len != 1 or self.mutations.len != 1 or
+            if (self.mode != .publish or self.producer_kind != .index) return error.InvalidBatchRequest;
+            if (self.mutations.len > 1) {
+                if (self.mutation_preconditions.len != self.mutations.len or
+                    !isRevisionBoundScalarWindowReplacement(self.producer_scope_key, self.producer_artifact_name, self.mutations)) return error.InvalidBatchRequest;
+            } else if ((self.producer_scope_key.len == 0 and self.sources.len != 1) or self.mutation_preconditions.len != 1 or self.mutations.len != 1 or
                 self.mutations[0].family != (if (self.producer_scope_key.len == 0) @as(@FieldType(Mutation, "family"), .base_vector) else @as(@FieldType(Mutation, "family"), .derived_vector)) or !std.mem.eql(u8, self.mutations[0].key, self.mutation_preconditions[0].key)) return error.InvalidBatchRequest;
         }
         if (self.authority_epoch == 0 or std.mem.allEqual(u8, &self.namespace, 0) or
