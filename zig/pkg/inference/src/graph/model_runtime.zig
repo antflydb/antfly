@@ -332,19 +332,21 @@ pub const ModelOutput = struct {
             };
         }
 
-        fn greedyToken(self: *PreparedTail) !?i64 {
-            if (self.greedy_token_id) |token_id| return token_id;
+        fn greedyToken(self: *PreparedTail, suppressed: []const i32) !?i64 {
+            if (self.greedy_token_id) |token_id| {
+                if (!tokenIsSuppressed(token_id, suppressed)) return token_id;
+            }
             // Final logit softcap is monotonic, so it changes sampling
             // probabilities but not the greedy argmax ordering.
             const token = switch (self.norm) {
-                .layer => try self.backend.decoderRuntimeApplyLayerNormLinearArgmax(&.{
+                .layer => if (suppressed.len == 0) try self.backend.decoderRuntimeApplyLayerNormLinearArgmax(&.{
                     .input = self.final_hidden,
                     .norm_slot = self.norm_slot,
                     .linear_slot = self.lm_head_slot,
                     .hidden_size = self.hidden_size,
                     .eps = self.eps,
                     .out_dim = self.vocab_size,
-                }),
+                }) else null,
                 .rms => try self.backend.decoderRuntimeApplyRmsNormLinearArgmax(&.{
                     .input = self.final_hidden,
                     .norm_slot = self.norm_slot,
@@ -352,6 +354,7 @@ pub const ModelOutput = struct {
                     .hidden_size = self.hidden_size,
                     .eps = self.eps,
                     .out_dim = self.vocab_size,
+                    .suppress_token_ids = suppressed,
                 }),
             };
             return if (token) |token_id| @intCast(token_id) else null;
@@ -404,26 +407,49 @@ pub const ModelOutput = struct {
     }
 
     pub fn greedyToken(self: *ModelOutput, allocator: std.mem.Allocator, vocab_size: usize) !i64 {
+        return self.greedyTokenSuppress(allocator, vocab_size, &.{});
+    }
+
+    pub fn greedyTokenSuppress(self: *ModelOutput, allocator: std.mem.Allocator, vocab_size: usize, suppressed: []const i32) !i64 {
         if (vocab_size == 0) return error.InvalidModelOutput;
         if (self.prepared_tail) |*tail| {
             if (tail.vocab_size == vocab_size) {
-                if (try tail.greedyToken()) |token_id| return token_id;
+                if (try tail.greedyToken(suppressed)) |token_id| {
+                    if (!tokenIsSuppressed(token_id, suppressed)) return token_id;
+                }
             }
         }
         if (self.device_logits) |device_logits| {
             const backend = self.device_logits_backend orelse return error.InvalidModelOutput;
-            if (try backend.argmaxLastRow(device_logits, 1, vocab_size)) |token_id| {
-                return @intCast(token_id);
+            if (suppressed.len == 0) {
+                if (try backend.argmaxLastRow(device_logits, 1, vocab_size)) |token_id| {
+                    return @intCast(token_id);
+                }
+            } else if (try backend.argmaxLastRowSuppressTensor(device_logits, 1, vocab_size, suppressed)) |token| {
+                defer backend.free(token);
+                const data = try backend.toFloat32(token, allocator);
+                defer allocator.free(data);
+                if (data.len != 1 or !std.math.isFinite(data[0]) or data[0] < 0 or data[0] >= @as(f32, @floatFromInt(vocab_size))) return error.InvalidModelOutput;
+                const token_id: i64 = @intFromFloat(data[0]);
+                if (!tokenIsSuppressed(token_id, suppressed)) return token_id;
             }
         }
 
         const logits = try self.hostLogits(allocator);
         if (logits.len < vocab_size) return error.InvalidModelOutput;
-        var best_idx: usize = 0;
-        for (logits[1..vocab_size], 1..) |value, idx| {
-            if (value > logits[best_idx]) best_idx = idx;
+        var best_idx: ?usize = null;
+        for (logits[0..vocab_size], 0..) |value, idx| {
+            if (best_idx) |best| {
+                if (!(value > logits[best])) continue;
+            }
+            if (!tokenIsSuppressed(@intCast(idx), suppressed)) best_idx = idx;
         }
-        return @intCast(best_idx);
+        return @intCast(best_idx orelse return error.InvalidModelOutput);
+    }
+
+    fn tokenIsSuppressed(token_id: i64, suppressed: []const i32) bool {
+        const id = std.math.cast(i32, token_id) orelse return false;
+        return std.mem.indexOfScalar(i32, suppressed, id) != null;
     }
 
     pub fn deinit(self: *ModelOutput, allocator: std.mem.Allocator) void {
@@ -466,6 +492,9 @@ pub const PrefillRequest = struct {
     max_inflight_tokens: usize = 0,
     allow_swa_ring: bool = false,
     force_host_logits: bool = false,
+    /// Whether the caller consumes the final row. Intermediate chunks only
+    /// need to update KV and may return an empty output.
+    want_last_logits: bool = true,
     prefer_greedy_token: bool = false,
 
     pub fn check(self: PrefillRequest) !void {

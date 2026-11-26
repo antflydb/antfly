@@ -2892,13 +2892,24 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithLayer0OverridesAndTrace(
 const SharedKvPrefillOutput = enum { all, last, kv_only };
 
 fn sharedKvPrefillBoundary(config: Config, dc: DecodeContext) ?usize {
-    // Keep this route specific to the measured E4B decoder geometry.
-    // Query collection needs every consumer's queries, including shared layers.
+    // CUDA keeps its existing qualified E4B geometry.
     if (config.family != .gemma or config.hidden_size != 2560 or config.num_hidden_layers != 42 or
         config.num_kv_shared_layers != 18 or config.num_attention_heads != 8 or
         config.num_key_value_heads != 2 or config.attention_head_dim != 256 or
         config.global_head_dim != 512 or config.position_encoding != .rope or
         config.gemma4_mtp_assistant or config.usesMoe() or config.isMultimodal()) return null;
+    return validatedSharedKvPrefillBoundary(config, dc);
+}
+
+pub fn metalE2bSharedKvPrefillBoundary(config: Config, dc: DecodeContext) ?usize {
+    // Below 512 tokens the change from matrix to singleton arithmetic can
+    // exceed the Metal logit error budget.
+    if (!config.isGemma4E2bDenseLayout() or dc.total_sequence_len < 512) return null;
+    return validatedSharedKvPrefillBoundary(config, dc);
+}
+
+fn validatedSharedKvPrefillBoundary(config: Config, dc: DecodeContext) ?usize {
+    // Query collection needs every consumer's queries, including shared layers.
     if (dc.attention_mode != .paged_prefill or dc.query_sequence_len <= 1 or
         dc.query_sequence_len > dc.total_sequence_len or dc.kv_cache == null or
         dc.kv_batch != null or dc.attn_or_mask != null or dc.selection_query_capture != null or
@@ -2921,6 +2932,44 @@ fn preparedSharedKvPrefillEligible(config: Config, overrides: Layer0DecoderOverr
     const dc = context orelse return false;
     if (dc.total_sequence_len != seq_len) return false;
     return sharedKvPrefillBoundary(config, dc.*) != null;
+}
+
+test "Metal E2B shared KV prefill requires exact text geometry and a long prompt" {
+    var config: Config = .{
+        .family = .gemma,
+        .gemma4_channel_protocol = true,
+        .hidden_size = 1536,
+        .num_hidden_layers = 35,
+        .vocab_size = 262144,
+        .ple_hidden_size = 256,
+        .num_kv_shared_layers = 20,
+        .intermediate_size = 6144,
+        .shared_layer_intermediate_size = 12288,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .position_encoding = .rope,
+        .sliding_window = 512,
+        .sliding_window_pattern = 5,
+    };
+    var dc: DecodeContext = .{
+        .attention_mode = .paged_prefill,
+        .total_sequence_len = 512,
+        .query_sequence_len = 256,
+        .kv_sequence_len = 512,
+        .kv_cache = .{ .sequence_id = 1, .pool_id = 0, .logical_block_count = 32, .tail_tokens = 0 },
+    };
+    try std.testing.expectEqual(@as(?usize, 15), metalE2bSharedKvPrefillBoundary(config, dc));
+    try std.testing.expectEqual(@as(?usize, null), sharedKvPrefillBoundary(config, dc));
+    dc.total_sequence_len = 511;
+    try std.testing.expectEqual(@as(?usize, null), metalE2bSharedKvPrefillBoundary(config, dc));
+    dc.total_sequence_len = 512;
+    dc.attn_or_mask = &.{0};
+    try std.testing.expectEqual(@as(?usize, null), metalE2bSharedKvPrefillBoundary(config, dc));
+    dc.attn_or_mask = null;
+    config.shared_layer_intermediate_size = 6144;
+    try std.testing.expectEqual(@as(?usize, null), metalE2bSharedKvPrefillBoundary(config, dc));
 }
 
 test "E4B shared KV prefill prepared rows preserve context and decline other consumers" {
@@ -3037,6 +3086,33 @@ test "E4B shared KV prefill excludes query capture and unsupported contexts" {
     model = config;
     model.gemma4_mtp_assistant = true;
     try std.testing.expect(sharedKvPrefillBoundary(model, dc) == null);
+}
+
+/// Evaluate the E2B shared suffix with the ordinary decoder math and the
+/// donor pages that the preceding Metal frame has already published.
+pub fn forwardE2bSharedKvSuffix(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    donor_hidden: CT,
+    context: DecodeContext,
+    ple: CT,
+    donor_layers: usize,
+) !CT {
+    const last_row = context.query_sequence_len - 1;
+    const width = try std.math.mul(usize, config.ple_hidden_size, config.num_hidden_layers);
+    const last_ple = try cb.sliceRows2D(allocator, ple, last_row, 1, width);
+    defer cb.free(last_ple);
+    var hidden = try cb.sliceRows2D(allocator, donor_hidden, last_row, 1, config.hidden_size);
+    errdefer cb.free(hidden);
+    var decode = sharedKvLastRowContext(context);
+    decode.attention_mode = .paged_decode;
+    for (donor_layers..config.num_hidden_layers) |layer| {
+        const next = try decoderBlock(cb, allocator, config, hidden, 1, context.total_sequence_len, config.effectiveKVHeadsForLayer(layer), config.effectiveHeadDimForLayer(layer), layer, &decode, last_ple, .{}, null, null, null, null, null, null);
+        if (next != hidden) cb.free(hidden);
+        hidden = next;
+    }
+    return hidden;
 }
 
 test "E4B shared KV last row retains absolute positions and full donor KV extent" {
