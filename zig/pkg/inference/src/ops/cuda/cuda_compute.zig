@@ -7681,9 +7681,8 @@ pub const CudaCompute = struct {
             }
         }
         if (recipe.count < 2 or !recipe.graph_allowed or !recipe.host_ops_empty or !self.embedding_gemma2_policy.audio_graph) return;
-        const rows = try recipe.rows();
         var segments: [4]usize = undefined;
-        for (recipe.frames[0..recipe.count], segments[0..recipe.count]) |frames, *span| span.* = (try checkedAdd(frames, 3)) / 4;
+        const rows = try recipe.rowsAndSegments(segments[0..recipe.count]);
         var shapes: [17][2]i64 = undefined;
         shapes[0] = .{ @intCast(rows), @intCast(recipe.hidden) };
         shapes[1] = .{ @intCast(recipe.context_left), @intCast(recipe.hidden) };

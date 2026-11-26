@@ -20,6 +20,11 @@ const std = @import("std");
 const ops = @import("../ops/ops.zig");
 const memory = @import("ml").graph.passes.memory;
 const CT = ops.CT;
+/// Two stride-two convolution stages produce one row per four input frames.
+pub fn subsampledRows(frames: usize) usize {
+    return frames / 4 + @intFromBool(frames % 4 != 0);
+}
+
 /// Copied operation geometry only. The actual Stage certifies the model and
 /// rebuilds mutable backend policy/learned-layout requests after every yield.
 pub const AudioRecipe = struct {
@@ -59,9 +64,18 @@ pub const AudioRecipe = struct {
             if (std.math.cast(i64, extent) == null) return error.InvalidPreparedAudioRecipe;
     }
     pub fn rows(self: AudioRecipe) !usize {
+        return self.rowsAndSegments(null);
+    }
+
+    pub fn rowsAndSegments(self: AudioRecipe, segments: ?[]usize) !usize {
         if (self.count > self.frames.len) return error.InvalidPreparedAudioRecipe;
+        if (segments) |output| if (output.len != self.count) return error.InvalidPreparedAudioRecipe;
         var total: usize = 0;
-        for (self.frames[0..self.count]) |frames| total = try std.math.add(usize, total, (try std.math.add(usize, frames, 3)) / 4);
+        for (self.frames[0..self.count], 0..) |frames, i| {
+            const span = subsampledRows(frames);
+            if (segments) |output| output[i] = span;
+            total = try std.math.add(usize, total, span);
+        }
         return total;
     }
     /// Identical to the actual execution key; singleton subsampling has no

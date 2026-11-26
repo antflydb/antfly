@@ -2949,7 +2949,7 @@ pub fn namedAudioLayout(file: *const gguf_format.File, frames: usize, width: usi
     const expected = if (cfg.direct_unified) cfg.raw_samples_per_token else cfg.mel_bins;
     const maximum = if (cfg.direct_unified) cfg.max_direct_audio_tokens else cfg.max_audio_samples / 160 + 4;
     if (frames == 0 or frames > maximum or width != expected) return error.InvalidInputShape;
-    return .{ .width = expected, .hidden = cfg.text_hidden, .max_tokens = if (cfg.direct_unified) frames else (frames + 3) / 4, .raw = cfg.direct_unified };
+    return .{ .width = expected, .hidden = cfg.text_hidden, .max_tokens = if (cfg.direct_unified) frames else audio_schedule.subsampledRows(frames), .raw = cfg.direct_unified };
 }
 
 /// Host-only waveform decoding and the checkpoint's existing feature policy.
@@ -3372,7 +3372,7 @@ fn audioSubsampleCohort(cb: *const ComputeBackend, a: std.mem.Allocator, store: 
     var rows: usize = 0;
     for (features, segments, offsets[0..features.len]) |f, *span, *off| {
         off.* = rows;
-        span.* = (f.frames + 3) / 4;
+        span.* = audio_schedule.subsampledRows(f.frames);
         rows = try std.math.add(usize, rows, span.*);
     }
     const valid = try a.alloc(bool, rows);
@@ -3418,7 +3418,7 @@ fn audioSubsampleCohort(cb: *const ComputeBackend, a: std.mem.Allocator, store: 
         for (indices[0..count], 0..) |index, slot| {
             const span = segments[index];
             for (0..span) |t| valid[offsets[index] + t] = features[index].mask[t * 4];
-            if (!try cb.copyRows2D(a, hidden, offsets[index], batch_hidden, slot * ((padded_frames + 3) / 4), span, cfg.audio_hidden)) return error.UnsupportedResidentGemma4Audio;
+            if (!try cb.copyRows2D(a, hidden, offsets[index], batch_hidden, slot * audio_schedule.subsampledRows(padded_frames), span, cfg.audio_hidden)) return error.UnsupportedResidentGemma4Audio;
         }
         if (frame) {
             try cb.decoderRuntimeSubmitAndWaitFrame();
