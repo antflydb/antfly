@@ -43,7 +43,6 @@ const ComputeBackend = ops.ComputeBackend;
 const activations = @import("../backends/activations.zig");
 const backends = @import("../backends/backends.zig");
 const decoder_tail_runtime = @import("../backends/decoder_tail_runtime.zig");
-const metal_runtime = @import("../backends/metal_runtime.zig");
 const runtime = @import("../runtime/root.zig");
 const jinja = @import("jinja");
 const grammar_mod = @import("grammar.zig");
@@ -2034,8 +2033,6 @@ const gemma4MtpMetalPrefillHiddenCaptureEnabled = decoder_routes.metalPreparedPr
 
 const gemma4MetalDirectGreedyDefault = decoder_forward.metalDirectTailDefault;
 
-const gemma4MetalDirectGreedyEnabled = decoder_forward.metalDirectTailEnabled;
-
 pub fn gemma4MtpAutoMinGenerationTokens() usize {
     return platform.env.getenvUsize("ANTFLY_GEMMA4_MTP_AUTO_MIN_TOKENS") orelse 128;
 }
@@ -2735,11 +2732,7 @@ pub const NativeGenerationPipeline = struct {
     }
 
     fn lockKvMetadata(self: *const NativeGenerationPipeline, mutex: *std.atomic.Mutex) !ExecutionScope {
-        // Backends without an explicit stream-drain contract keep the normal
-        // request transition. The CUDA cooperative scope can advance host KV
-        // tables without resetting an otherwise unchanged execution owner.
-        return self.lockExecutionPhase(mutex, if (self.prompt_cache != null and self.cb.execution_batch_drain != null and
-            platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_KV_METADATA_SCOPE", true)) .metadata else .step);
+        return self.lockExecutionPhase(mutex, decoder_storage.kvMetadataPhase(&self.cb, self.prompt_cache != null));
     }
 
     fn lockExecutionPhase(self: *const NativeGenerationPipeline, mutex: *std.atomic.Mutex, phase: @import("../ops/execution_scope.zig").Phase) !ExecutionScope {
@@ -5718,8 +5711,7 @@ pub const NativeGenerationPipeline = struct {
             seq_len.* += 1;
             tokens_generated += 1;
             _ = try storage_request.commitGeneratedToken(&decode_runtime, .{
-                .allow_metadata_scope = self.prompt_cache != null and self.cb.execution_batch_drain != null and
-                    platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_KV_METADATA_SCOPE", true),
+                .has_prefix_cache = self.prompt_cache != null,
                 .execution = if (self.execution_lock) |mutex| self.executionAccess(mutex) else .{ .io = self.io, .control = self.execution_control },
                 .cleanup_owner = self.execution_cleanup_owner,
                 .backend = &self.cb,
@@ -5770,17 +5762,11 @@ pub const NativeGenerationPipeline = struct {
         gbnf_grammar: ?*const grammar_mod.GbnfGrammar,
         decode_state: *NativeDecodeState,
     ) bool {
-        if (config.kv_cache_mode == .select_v1) return false;
-        var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
-        if (self.cb.kind() != .metal) return false;
-        if (self.scheduler != null) return false;
+        if (config.kv_cache_mode == .select_v1 or self.scheduler != null) return false;
         if (self.graph_cache != null or self.compiled_partition_backend != null) return false;
-        if (decode_runtime.kvView() == null) return false;
         if (!isPureGreedyConfig(config)) return false;
         if (token_table != null or json_grammar.* != null or gbnf_grammar != null) return false;
-        if (self.gpt_config.family != .gemma or !self.gpt_config.hasPle()) return false;
-        if (!gemma4MetalDirectGreedyEnabled()) return false;
-        return metal_runtime.pipelinedDecodeFrameEnabled();
+        return decoder_forward.metalPipelinedGreedyAvailable(&self.cb, &self.gpt_config, decode_state);
     }
 
     fn pendingStepContext(self: *NativeGenerationPipeline, state: *NativeDecodeState) pending_step.Context {

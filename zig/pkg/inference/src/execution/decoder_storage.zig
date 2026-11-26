@@ -342,6 +342,13 @@ pub fn validateSelectedTokenBudget(selected: bool, max_tokens: usize, protected:
         return error.ProtectedRowsExceedTarget;
 }
 
+/// Cooperative metadata scopes require a shared prefix cache and a provider
+/// that can drain its current batch without replacing the execution owner.
+pub fn kvMetadataPhase(backend: *const ComputeBackend, has_prefix_cache: bool) @import("../ops/execution_scope.zig").Phase {
+    return if (has_prefix_cache and backend.execution_batch_drain != null and
+        @import("antfly_platform").env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_KV_METADATA_SCOPE", true)) .metadata else .step;
+}
+
 /// Borrowed request lifetime, not a new execution engine. The loaded runtime
 /// owns state and model configuration; no allocation occurs on the ordinary path.
 pub const SelectedRequest = struct {
@@ -351,7 +358,7 @@ pub const SelectedRequest = struct {
     gpu_oracle: bool = false,
 
     pub const CommitContext = struct {
-        allow_metadata_scope: bool = false,
+        has_prefix_cache: bool = false,
         execution: @import("../execution_control.zig").ExecutionAccess = .{},
         cleanup_owner: ?*const @import("cleanup_owner.zig").Owner = null,
         backend: *const ComputeBackend,
@@ -386,9 +393,7 @@ pub const SelectedRequest = struct {
         // the model's execution exclusion, even without shared KV metadata.
         if (!self.enabled and state.kv_lock == null) access.mutex = null;
         if (access.mutex != null and access.mutex == state.kv_lock) return error.InvalidDecodeStorageRequest;
-        const metadata_only = context.allow_metadata_scope and !self.enabled and
-            context.backend.execution_batch_drain != null;
-        var scope = try access.acquireScopeForPhase(if (metadata_only) .metadata else .step);
+        var scope = try access.acquireScopeForPhase(kvMetadataPhase(context.backend, context.has_prefix_cache and !self.enabled));
         defer if (scope) |*held| held.deinit();
         if (access.control) |control| try control.check();
         // A parked caller can rotate B while acquireScope waits. Read only the

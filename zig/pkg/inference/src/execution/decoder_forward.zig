@@ -190,6 +190,15 @@ pub fn metalDirectTailEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_METAL_DIRECT_GREEDY", metalDirectTailDefault());
 }
 
+/// The pipelined Metal ABI requires a paged Gemma decoder with PLE
+/// and both direct-greedy and driver-frame routes enabled.
+pub fn metalPipelinedGreedyAvailable(backend: *const ComputeBackend, model: *const gpt_arch.Config, state: *NativeDecodeState) bool {
+    if (backend.kind() != .metal) return false;
+    var decode = BorrowedDecodeStateRuntime.init(state);
+    return decode.kvView() != null and model.family == .gemma and model.hasPle() and
+        metalDirectTailEnabled() and metal_runtime.pipelinedDecodeFrameEnabled();
+}
+
 /// Task semantics that affect physical device-token placement. The runtime
 /// inspects its actual backend/cache/state; no grammar or sampler is retained.
 pub const DeviceRouteRequest = struct {
