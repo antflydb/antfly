@@ -22,6 +22,29 @@ const NodeId = ml.graph.NodeId;
 pub const DeferredProducer = struct { producer: NodeId, consumer: NodeId };
 const none = std.math.maxInt(usize);
 
+/// Lazily compute graph-order facts once for all participating partitions.
+pub const DeferralAnalysis = struct {
+    last_use: []u32,
+    use_counts: []u8,
+
+    pub fn get(cache: *?DeferralAnalysis, allocator: std.mem.Allocator, graph: *const ml.graph.Graph, reachable: []const bool) !DeferralAnalysis {
+        if (cache.*) |analysis| return analysis;
+        const last_use = try ml.graph.passes.memory.computeLastUse(allocator, graph, .{ .reachable = reachable });
+        errdefer allocator.free(last_use);
+        const analysis: DeferralAnalysis = .{
+            .last_use = last_use,
+            .use_counts = try computeReachableUseCountsCapped(allocator, graph, reachable),
+        };
+        cache.* = analysis;
+        return analysis;
+    }
+
+    pub fn deinit(self: DeferralAnalysis, allocator: std.mem.Allocator) void {
+        allocator.free(self.use_counts);
+        allocator.free(self.last_use);
+    }
+};
+
 /// Keep deferred producer legality shared by the legacy executor and cold
 /// region selection. Last use is expressed in graph NodeIds in this proof.
 pub fn deferredAddConsumer(graph: *const ml.graph.Graph, node_id: NodeId, reachable: []const bool, last_use: []const u32, use_counts: ?[]const u8) ?NodeId {

@@ -13369,10 +13369,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         descriptor.F32ScaledAdd.match(graph, node.getInputs(), node.output_shape, .{ true, false }) != null or
                         descriptor.F32ScaledAdd.match(graph, node.getInputs(), node.output_shape, .{ false, true }) != null)) break;
             } else return;
-            const last_use = try @import("../graph/interpreter.zig").computeLastUse(allocator, graph, request.reachable);
-            defer allocator.free(last_use);
-            const uses = try schedule.computeReachableUseCountsCapped(allocator, graph, request.reachable);
-            defer allocator.free(uses);
+            var local_analysis: ?schedule.DeferralAnalysis = null;
+            defer if (local_analysis) |analysis| analysis.deinit(allocator);
+            const analysis = try schedule.DeferralAnalysis.get(request.deferral_analysis orelse &local_analysis, allocator, graph, request.reachable);
+            const last_use = analysis.last_use;
+            const uses = analysis.use_counts;
             for (request.partition_nodes) |add| {
                 if (descriptor.GatherAddBias.match(graph, add)) |gather| {
                     try appendGather(compute, request, positions, uses, add, gather, result);

@@ -134,6 +134,8 @@ pub fn select(request: Request) !?Selected {
     defer owners.deinit(a);
     var backend_indices: std.ArrayList(usize) = .empty;
     defer backend_indices.deinit(a);
+    var deferral_analysis: ?@import("region_schedule.zig").DeferralAnalysis = null;
+    defer if (deferral_analysis) |analysis| analysis.deinit(a);
     for (counts, offsets, 0..) |count, offset, partition| {
         if (count == 0) continue;
         const members = nodes[offset..][0..count];
@@ -160,7 +162,7 @@ pub fn select(request: Request) !?Selected {
         const query = backend.vtable.kernels.?.regionPolicyKey orelse continue;
         const policy_key = (try query(backend.ptr)) orelse continue;
         if (policy_key == 0) return error.PreparedRegionPolicyChanged;
-        var produced = (try prepare(backend.ptr, .{ .allocator = a, .implementation = .{ .context = backend.ptr, .table = backend.vtable }, .policy_key = policy_key, .execution_profile = request.execution_profile, .graph = request.graph, .reachable = request.reachable, .node_order = order[0..used], .last_use = last_use, .partition_index = @intCast(partition), .partition_nodes = members, .node_facts = request.node_facts })) orelse continue;
+        var produced = (try prepare(backend.ptr, .{ .allocator = a, .implementation = .{ .context = backend.ptr, .table = backend.vtable }, .policy_key = policy_key, .execution_profile = request.execution_profile, .graph = request.graph, .reachable = request.reachable, .node_order = order[0..used], .last_use = last_use, .partition_index = @intCast(partition), .partition_nodes = members, .deferral_analysis = &deferral_analysis, .node_facts = request.node_facts })) orelse continue;
         var transferred = false;
         defer if (!transferred) produced.deinit();
         if ((try query(backend.ptr)) != policy_key) return error.PreparedRegionPolicyChanged;

@@ -270,6 +270,7 @@ pub const Prepare = struct {
     last_use: []const u32,
     partition_index: u32,
     partition_nodes: []const NodeId,
+    deferral_analysis: ?*?@import("region_schedule.zig").DeferralAnalysis = null,
     /// Indexed by graph NodeId. Unknown/unbacked planned representations never
     /// establish a cached immutable source or cold-upload credit.
     node_facts: []const kernel.Binding,
