@@ -15339,7 +15339,7 @@ test "actual CUDA staged quota boundaries let same model reenter while owned sna
                 const prepared_rows = (try compute.embedding_gemma2_execution.allocatePacked(a, &compute.ctx, "stage-packed", 256)) orelse return error.MissingActualPackedCache;
                 const bytes: [32]u8 = @splat(7);
                 try compute.embedding_gemma2_resize.uploadSource(&compute.ctx, prepared_rows, &bytes);
-                _ = (try compute.embedding_gemma2_execution.arena(&compute.ctx, 1, 1, 0, .{ 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 })) orelse return error.MissingActualExecutionArena;
+                _ = (try compute.embedding_gemma2_execution.bindArenaRequest(&compute.ctx, .{ .kind = .encoder, .batch = 1, .sequence = 1, .sizes = .{ 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } })) orelse return error.MissingActualExecutionArena;
                 const source_value = try seed_backend.fromFloat32(&.{ 1, 2, 3, 4 });
                 defer seed_backend.free(source_value);
                 held_constant = (try seed_backend.modelConstant("audio_tower.prepared.stage-ownership-fixture", source_value)) orelse return error.MissingActualModelConstant;

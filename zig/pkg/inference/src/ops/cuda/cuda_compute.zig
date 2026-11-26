@@ -8107,7 +8107,7 @@ pub const CudaCompute = struct {
         const source_mask_kind = try encoderSourceMaskKind(attention_mask, batch, sequence);
         const cache_request = try self.encoderArenaRequest(config, batch, encoder_sequence, sequence, source_mask_kind);
         const arena = if (policy.graph_replay and batch <= 4 and rows <= 4096)
-            try self.embedding_gemma2_execution.arena(&self.ctx, batch, encoder_sequence, cache_request.arena.mask_kind, cache_request.arena.sizes)
+            try self.embedding_gemma2_execution.bindArenaRequest(&self.ctx, cache_request.arena)
         else
             null;
         defer if (arena) |entry| entry.noteUse(&self.ctx);
@@ -30655,7 +30655,7 @@ fn runEmbeddingGemma2VisionTowerImpl(ctx: *anyopaque, input_ct: CT, logical_sequ
     const sizes = cache_request.arena.sizes;
     const position_bytes = sizes[8];
     const arena = if (policy.graph_replay)
-        if (source_sequence != null) try self.embedding_gemma2_execution.sourceVisionArena(&self.ctx, batch, sequence, grid_x, grid_y, sizes) else try self.embedding_gemma2_execution.visionArena(&self.ctx, batch, grid_x, grid_y, sizes)
+        try self.embedding_gemma2_execution.bindArenaRequest(&self.ctx, cache_request.arena)
     else
         null;
     defer if (arena) |entry| entry.noteUse(&self.ctx);
@@ -38683,7 +38683,7 @@ test "embeddinggemma2 CUDA retained graph replay reads fresh request inputs" {
         var sizes: [11]usize = @splat(16);
         sizes[2] = count * 2;
         sizes[3] = count * 2;
-        const entry = (try cache.arena(&compute.ctx, shape[0], shape[1], 0, sizes)).?;
+        const entry = (try cache.bindArenaRequest(&compute.ctx, .{ .kind = .encoder, .batch = shape[0], .sequence = shape[1], .sizes = sizes })).?;
         try compute.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED);
         try module.launchScale(&compute.ctx, entry.buffers[3], entry.buffers[2], @intCast(count), 2);
         const graph = try compute.ctx.endStreamCapture();
@@ -54517,7 +54517,7 @@ test "CUDA typed cache retirement frees actual resize execution payloads outside
     // Real cache payload construction/admission is cold and outside the gate.
     _ = try compute.embedding_gemma2_resize.plan(a, &compute.ctx, .{ .width = 16, .height = 16, .target_width = 8, .target_height = 8, .resident = true });
     _ = (try compute.embedding_gemma2_execution.allocatePacked(a, &compute.ctx, "retirement.fixture.packed", 64)) orelse return error.MissingExecutionCache;
-    _ = (try compute.embedding_gemma2_execution.arena(&compute.ctx, 1, 1, 0, @splat(16))) orelse return error.MissingExecutionArena;
+    _ = (try compute.embedding_gemma2_execution.bindArenaRequest(&compute.ctx, .{ .kind = .encoder, .batch = 1, .sequence = 1, .mask_kind = 0, .sizes = @splat(16) })) orelse return error.MissingExecutionArena;
     const source = try cb.fromFloat32Shape(&.{ 1, -2, 3, 4 }, &.{ 2, 2 });
     defer cb.free(source);
     const held = (try modelConstantOp(&compute, "audio_tower.prepared.query_scale.retirement_fixture", source)) orelse return error.MissingModelConstant;
@@ -55527,7 +55527,7 @@ test "CUDA prepared cache producers reserve exact cold geometry before real mode
     try CudaCompute.bindCacheFunding(&cb, &compute, work, funding, &epoch);
     const plan = try compute.embedding_gemma2_resize.plan(a, &compute.ctx, resize_key);
     const plan_ptr = plan.device[0].ptr;
-    const arena = (try compute.embedding_gemma2_execution.arena(&compute.ctx, 1, 1, 0, arena_sizes)) orelse return error.MissingExecutionArena;
+    const arena = (try compute.embedding_gemma2_execution.bindArenaRequest(&compute.ctx, .{ .kind = .encoder, .batch = 1, .sequence = 1, .mask_kind = 0, .sizes = arena_sizes })) orelse return error.MissingExecutionArena;
     const arena_ptr = arena.buffers[0].ptr;
     const packed_span = (try compute.embedding_gemma2_execution.allocatePacked(a, &compute.ctx, "prepared.producer.fixture", 64)) orelse return error.MissingExecutionCache;
     const held = (try modelConstantOp(&compute, "audio_tower.prepared.producer.fixture", source)) orelse return error.MissingModelConstant;
@@ -55556,7 +55556,7 @@ test "CUDA prepared cache producers reserve exact cold geometry before real mode
     try std.testing.expect(!try CudaCompute.cacheWorkloadNeedsFunding(&cb, &compute, work));
     try CudaCompute.bindCacheFunding(&cb, &compute, work, &warm, &epoch);
     try std.testing.expectEqual(plan_ptr, (try compute.embedding_gemma2_resize.plan(a, &compute.ctx, resize_key)).device[0].ptr);
-    try std.testing.expectEqual(arena_ptr, (try compute.embedding_gemma2_execution.arena(&compute.ctx, 1, 1, 0, arena_sizes)).?.buffers[0].ptr);
+    try std.testing.expectEqual(arena_ptr, (try compute.embedding_gemma2_execution.bindArenaRequest(&compute.ctx, .{ .kind = .encoder, .batch = 1, .sequence = 1, .mask_kind = 0, .sizes = arena_sizes })).?.buffers[0].ptr);
     try std.testing.expectEqual(packed_span.ptr, compute.embedding_gemma2_execution.findPacked("prepared.producer.fixture").?.ptr);
     CudaCompute.unbindCacheFunding(&cb, &compute, &warm);
     model.execution_gate.unlock();
@@ -55598,8 +55598,8 @@ test "CUDA prepared geometry retirement preserves unrelated hot plans packed wei
     for (0..4) |i| _ = try compute.embedding_gemma2_resize.plan(a, &compute.ctx, .{ .width = @intCast(16 + i), .height = 16, .target_width = 8, .target_height = 8, .resident = true });
     const keep_plan = compute.embedding_gemma2_resize.plans[2].?.device[0].ptr;
     const keep_weights = (try compute.embedding_gemma2_execution.allocatePacked(a, &compute.ctx, "hot.packed.keep", 64)) orelse return error.MissingExecutionCache;
-    const first = (try compute.embedding_gemma2_execution.arena(&compute.ctx, 1, 1, 0, @splat(16))) orelse return error.MissingExecutionArena;
-    const second = (try compute.embedding_gemma2_execution.arena(&compute.ctx, 1, 2, 0, @splat(16))) orelse return error.MissingExecutionArena;
+    const first = (try compute.embedding_gemma2_execution.bindArenaRequest(&compute.ctx, .{ .kind = .encoder, .batch = 1, .sequence = 1, .mask_kind = 0, .sizes = @splat(16) })) orelse return error.MissingExecutionArena;
+    const second = (try compute.embedding_gemma2_execution.bindArenaRequest(&compute.ctx, .{ .kind = .encoder, .batch = 1, .sequence = 2, .mask_kind = 0, .sizes = @splat(16) })) orelse return error.MissingExecutionArena;
     const keep_bank = second.buffers[0].ptr;
     const dead_bank = first.buffers[0].ptr;
     const next_plan = compute.embedding_gemma2_resize.next_plan;
@@ -58314,7 +58314,7 @@ test "CUDA warm raw frontend five owners upgrade exact SDK addresses at full cap
     const key: @import("embedding_gemma2_resize.zig").Key = .{ .width = 16, .height = 16, .target_width = 8, .target_height = 8, .resident = true };
     const sizes: [11]usize = @splat(16);
     const plan = try compute.embedding_gemma2_resize.plan(a, &compute.ctx, key);
-    const arena = (try compute.embedding_gemma2_execution.arena(&compute.ctx, 1, 1, 0, sizes)).?;
+    const arena = (try compute.embedding_gemma2_execution.bindArenaRequest(&compute.ctx, .{ .kind = .encoder, .batch = 1, .sequence = 1, .mask_kind = 0, .sizes = sizes })).?;
     const packed_span = (try compute.embedding_gemma2_execution.allocatePacked(a, &compute.ctx, "warm.raw.sdk.fixture", 64)).?;
     const source_bytes: [32]u8 = @splat(7);
     var destination = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, source_bytes.len);

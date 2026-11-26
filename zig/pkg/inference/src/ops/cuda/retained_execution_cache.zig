@@ -551,28 +551,9 @@ pub fn Program(comptime Recipe: type) type {
                 return buffer;
             }
 
-            pub fn arena(self: *Cache, ctx: *Context, batch: usize, sequence: usize, mask_kind: u8, sizes: [11]usize) !?*Arena {
-                return self.arenaFor(ctx, .encoder, batch, sequence, mask_kind, 0, 0, sizes);
-            }
-
-            pub fn visionArena(self: *Cache, ctx: *Context, batch: usize, grid_x: usize, grid_y: usize, sizes: [11]usize) !?*Arena {
-                if (grid_x == 0 or grid_y == 0) return null;
-                const sequence = try std.math.mul(usize, grid_x, grid_y);
-                return self.arenaFor(ctx, .vision, batch, sequence, 0, grid_x, grid_y, sizes);
-            }
-
-            pub fn sourceVisionArena(self: *Cache, ctx: *Context, batch: usize, sequence: usize, grid_x: usize, grid_y: usize, sizes: [11]usize) !?*Arena {
-                const logical = try std.math.mul(usize, grid_x, grid_y);
-                _ = try @import("../kernel_geometry.zig").SourceGemmRows.resolve(logical, sequence);
-                return self.arenaFor(ctx, .vision, batch, sequence, 1, grid_x, grid_y, sizes);
-            }
-
             pub const ArenaSelection = struct { index: usize, hit: bool, victims: u8, bytes: usize };
             pub fn selectArena(self: *const Cache, request: prepared.Arena) !?ArenaSelection {
                 return selectArenaLayout(self, request);
-            }
-            fn arenaFor(self: *Cache, ctx: *Context, kind: @FieldType(Arena, "kind"), batch: usize, sequence: usize, mask_kind: u8, grid_x: usize, grid_y: usize, sizes: [11]usize) !?*Arena {
-                return self.bindArenaRequest(ctx, .{ .kind = @fromBackingInt(@intCast(@backingInt(kind))), .batch = batch, .sequence = sequence, .mask_kind = mask_kind, .grid_x = grid_x, .grid_y = grid_y, .sizes = sizes });
             }
             pub fn bindArenaRequest(self: *Cache, ctx: *Context, request: prepared.Arena) !?*Arena {
                 const kind: @FieldType(Arena, "kind") = @fromBackingInt(@intCast(@backingInt(request.kind)));
