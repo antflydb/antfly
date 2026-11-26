@@ -13594,7 +13594,7 @@ static NSString *termite_metal_shader_source(void) {
            // tile-codegen:begin attention.paged_relative_bf16.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "struct PagedRelativeGqaParams {\n"
            "    uint start, visible_start, page_tokens, first_page, page_count, physical_pages;\n"
-           "    uint q_heads, kv_heads, window, relative_extent, splits, q4;\n"
+           "    uint q_heads, kv_heads, window, relative_extent, splits, q4, query_rows;\n"
            "    float score_scale;\n"
            "};\n"
            "\n"
@@ -13627,6 +13627,7 @@ static NSString *termite_metal_shader_source(void) {
            "    const uint row_head = rows == 1u ? group.x * heads :\n"
            "        (group.x / groups_per_row) * rows * p.q_heads + (group.x % groups_per_row) * heads;\n"
            "    const uint batch_row = row_head / p.q_heads;\n"
+           "    const uint active_rows = rows == 1u ? 1u : min(rows, p.query_rows - batch_row);\n"
            "    const uint head = row_head % p.q_heads;\n"
            "    const uint kv_head = head / (p.q_heads / p.kv_heads);\n"
            "    uint begin[rows], limit[rows];\n"
@@ -13635,6 +13636,10 @@ static NSString *termite_metal_shader_source(void) {
            "    // Each row retains its original split boundary and accumulation order.\n"
            "    #pragma unroll\n"
            "    for (uint r = 0u; r < rows; ++r) {\n"
+           "        if (r >= active_rows) {\n"
+           "            begin[r] = limit[r] = 0u;\n"
+           "            continue;\n"
+           "        }\n"
            "        const uint end = p.start + batch_row + r + 1u;\n"
            "        const uint first = max(p.visible_start, p.window != 0u && end > p.window ? end - p.window : 0u);\n"
            "        const uint live = max(end - first, 1u);\n"
@@ -13654,6 +13659,7 @@ static NSString *termite_metal_shader_source(void) {
            "    float maximum[heads * rows], denominator[heads * rows];\n"
            "    #pragma unroll\n"
            "    for (uint h = 0u; h < heads * rows; ++h) {\n"
+           "        if (h / heads >= active_rows) continue;\n"
            "        const ulong q_base = ulong(row_head + (h / heads) * p.q_heads + h % heads) * 128u + lane;\n"
            "        for (uint i = 0; i < 4; ++i) q[h][i] = float(query[q_base + i * 32u]);\n"
            "        numerator[h] = float4(0.0f);\n"
@@ -13693,6 +13699,7 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            "    #pragma unroll\n"
            "    for (uint h = 0u; h < heads * rows; ++h) {\n"
+           "        if (h / heads >= active_rows) continue;\n"
            "        const ulong dst = (ulong(row_head + (h / heads) * p.q_heads + h % heads) * p.splits + group.y) * 130u;\n"
            "        for (uint i = 0u; i < 4u; ++i) partials[dst + i * 32u + lane] = numerator[h][i];\n"
            "        if (lane == 0u) {\n"
@@ -37834,7 +37841,7 @@ int antfly_metal_dispatch_routed_epilogue(
 
 typedef struct {
     uint32_t start, visible_start, page_tokens, first_page, page_count, physical_pages;
-    uint32_t q_heads, kv_heads, window, relative_extent, splits, q4;
+    uint32_t q_heads, kv_heads, window, relative_extent, splits, q4, query_rows;
     float score_scale;
 } antfly_metal_paged_relative_bf16_params;
 
@@ -37858,15 +37865,16 @@ int antfly_metal_dispatch_paged_relative_bf16(
     const bool reuse = p->q_heads / p->kv_heads == 3u && p->q_heads % p->kv_heads == 0u &&
         (p->window == 0u || p->window >= 8u) && p->start >= 256u;
     int status = -3;
-    const uint32_t query_rows = row_heads / p->q_heads;
+    if (!p->query_rows || row_heads % p->q_heads || row_heads / p->q_heads != p->query_rows) return -1;
+    const uint32_t query_rows = p->query_rows;
     // Adjacent global queries overlap on almost every key once the prefix
     // is long. Keep the single-row schedule for shorter and sliding spans.
-    if (reuse && !p->window && p->start >= 4096u && query_rows > 1u && query_rows % 2u == 0u) {
+    if (reuse && !p->window && p->start >= 4096u && query_rows > 1u) {
         NSString *partial = p->q4 ? @"antfly_paged_relative_gqa_d128_q4_partial_reuse3_rows2"
                                   : @"antfly_paged_relative_gqa_d128_bf16_partial_reuse3_rows2";
         status = antfly_metal_encode_typed_stage(runtime, partial,
             &runtime->paged_relative_bf16_pipelines[p->q4 ? 6u : 5u], views, partial_bytes, partial_alignments, 6, 1u << 5,
-            p, sizeof(*p), MTLSizeMake(row_heads / 6u, p->splits, 1), threads);
+            p, sizeof(*p), MTLSizeMake(((size_t)query_rows + 1u) / 2u * p->kv_heads, p->splits, 1), threads);
     }
     if (status == -3 && reuse) {
         NSString *partial = p->q4 ? @"antfly_paged_relative_gqa_d128_q4_partial_reuse3" : @"antfly_paged_relative_gqa_d128_bf16_partial_reuse3";

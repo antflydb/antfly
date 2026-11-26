@@ -16,7 +16,7 @@
 // native-program:entry antfly_paged_relative_gqa_d128_bf16_partial
 struct PagedRelativeGqaParams {
     uint start, visible_start, page_tokens, first_page, page_count, physical_pages;
-    uint q_heads, kv_heads, window, relative_extent, splits, q4;
+    uint q_heads, kv_heads, window, relative_extent, splits, q4, query_rows;
     float score_scale;
 };
 
@@ -49,6 +49,7 @@ inline void antfly_paged_relative_gqa_d128_partial(
     const uint row_head = rows == 1u ? group.x * heads :
         (group.x / groups_per_row) * rows * p.q_heads + (group.x % groups_per_row) * heads;
     const uint batch_row = row_head / p.q_heads;
+    const uint active_rows = rows == 1u ? 1u : min(rows, p.query_rows - batch_row);
     const uint head = row_head % p.q_heads;
     const uint kv_head = head / (p.q_heads / p.kv_heads);
     uint begin[rows], limit[rows];
@@ -57,6 +58,10 @@ inline void antfly_paged_relative_gqa_d128_partial(
     // Each row retains its original split boundary and accumulation order.
     #pragma unroll
     for (uint r = 0u; r < rows; ++r) {
+        if (r >= active_rows) {
+            begin[r] = limit[r] = 0u;
+            continue;
+        }
         const uint end = p.start + batch_row + r + 1u;
         const uint first = max(p.visible_start, p.window != 0u && end > p.window ? end - p.window : 0u);
         const uint live = max(end - first, 1u);
@@ -76,6 +81,7 @@ inline void antfly_paged_relative_gqa_d128_partial(
     float maximum[heads * rows], denominator[heads * rows];
     #pragma unroll
     for (uint h = 0u; h < heads * rows; ++h) {
+        if (h / heads >= active_rows) continue;
         const ulong q_base = ulong(row_head + (h / heads) * p.q_heads + h % heads) * 128u + lane;
         for (uint i = 0; i < 4; ++i) q[h][i] = float(query[q_base + i * 32u]);
         numerator[h] = float4(0.0f);
@@ -115,6 +121,7 @@ inline void antfly_paged_relative_gqa_d128_partial(
     }
     #pragma unroll
     for (uint h = 0u; h < heads * rows; ++h) {
+        if (h / heads >= active_rows) continue;
         const ulong dst = (ulong(row_head + (h / heads) * p.q_heads + h % heads) * p.splits + group.y) * 130u;
         for (uint i = 0u; i < 4u; ++i) partials[dst + i * 32u + lane] = numerator[h][i];
         if (lane == 0u) {
