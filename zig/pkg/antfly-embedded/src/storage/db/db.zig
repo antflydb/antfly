@@ -35535,7 +35535,7 @@ pub const DB = struct {
             var owned = catalogs;
             owned.deinit(alloc);
         }
-        const command = try inventory.desiredCommand(alloc, &txn, namespace, catalogs, observed, minimum);
+        const command = try inventory.desiredCommandForProposal(alloc, &txn, namespace, catalogs, observed, minimum);
         // Reused commands retain their historical `previous` field. Only the
         // current ordered binding on this exact read can authorize activation.
         return .{ .command = command, .activatable = observed.ready and observed.ordered != null and std.meta.eql(observed.ordered.?, command.binding) };
