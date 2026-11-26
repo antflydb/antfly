@@ -138,8 +138,6 @@ pub const Layer = struct {
         normalized_query: *Tensor,
         normalized_relative: *Tensor,
         relative_logits: *Tensor,
-        staged_key: *Tensor,
-        staged_value: *Tensor,
         attention_scratch: *Tensor,
         heads: *Tensor,
     };
@@ -183,11 +181,9 @@ pub const Layer = struct {
             .gates = q.gate,
         }, planes, .{
             .input = .{ .values = q.key, .weight = self.get(.k_taps) orelse return error.MissingWeight, .history = history.key, .dynamic_taps = q.key_taps },
-            .staged = workspace.staged_key,
             .next_history = history.next_key,
         }, .{
             .input = .{ .values = q.value, .weight = self.get(.v_taps) orelse return error.MissingWeight, .history = history.value, .dynamic_taps = q.value_taps },
-            .staged = workspace.staged_value,
             .next_history = history.next_value,
         }, .{
             .channels = @as(u32, text.num_key_value_heads) * text.head_dim,
@@ -238,8 +234,6 @@ pub const RequestWorkspace = struct {
         normalized_query,
         normalized_relative,
         relative_logits,
-        staged_key,
-        staged_value,
         heads,
         key_taps,
         value_taps,
@@ -265,9 +259,8 @@ pub const RequestWorkspace = struct {
             const relative = layout.projectionWidth(text, .r);
             const tap_width = @as(u32, text.num_key_value_heads) * text.sconv_kernel_size;
             const widths: [plane_count]u32 = .{
-                query,     relative,  query,                                                text.num_attention_heads, key, key,
-                query,     relative,  @as(u32, text.num_attention_heads) * text.rel_extent, key,                      key, query,
-                tap_width, tap_width,
+                query, relative, query,                                                text.num_attention_heads, key,       key,
+                query, relative, @as(u32, text.num_attention_heads) * text.rel_extent, query,                    tap_width, tap_width,
             };
             const attention: metal.PagedRelativeBf16Attention = .{
                 .query = .{
@@ -357,8 +350,6 @@ pub const RequestWorkspace = struct {
             .normalized_query = self.plane(.normalized_query),
             .normalized_relative = self.plane(.normalized_relative),
             .relative_logits = self.plane(.relative_logits),
-            .staged_key = self.plane(.staged_key),
-            .staged_value = self.plane(.staged_value),
             .heads = self.plane(.heads),
             .attention_scratch = &self.reduction,
         };

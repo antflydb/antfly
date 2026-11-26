@@ -1780,7 +1780,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> routed_group_build_pipeline, routed_group_projection_pipeline;
     id<MTLComputePipelineState> routed_group_projection_wide_pipeline;
     id<MTLComputePipelineState> paged_relative_bf16_pipelines[7];
-    id<MTLComputePipelineState> stage_paged_kv_pipeline;
+    id<MTLComputePipelineState> causal_paged_bf16_pipeline;
     id<MTLComputePipelineState> causal_depthwise4_bf16_pipeline;
     id<MTLComputePipelineState> dense_bf16_projection_pipeline;
     id<MTLComputePipelineState> dense_bf16_projection_reuse4_pipeline;
@@ -13465,7 +13465,7 @@ static NSString *termite_metal_shader_source(void) {
            "    antfly_dense_bf16_projection_four_rows<true>(input, weight, output, bias, p, group, warp, lane);\n"
            "}\n"
            // tile-codegen:end projection.dense_bf16.2 family
-           // tile-codegen:begin convolution.causal_depthwise4_bf16 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           // tile-codegen:begin convolution.causal_depthwise4_bf16.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "struct CausalDepthwise4Bf16Params {\n"
            "    uint channels, rows, valid_history, dynamic, normalize;\n"
            "    float output_scale, clip, epsilon;\n"
@@ -13480,16 +13480,23 @@ static NSString *termite_metal_shader_source(void) {
            "    return history[ulong(row + 3) * p.channels + channel];\n"
            "}\n"
            "\n"
-           "kernel void antfly_causal_depthwise4_head_norm_d128_bf16(\n"
-           "    device const bfloat *input [[buffer(0)]],\n"
-           "    device const bfloat *weight [[buffer(1)]],\n"
-           "    device const bfloat *history [[buffer(2)]],\n"
-           "    device const bfloat *dynamic_taps [[buffer(3)]],\n"
-           "    device bfloat *output [[buffer(4)]],\n"
-           "    device bfloat *next_history [[buffer(5)]],\n"
-           "    constant CausalDepthwise4Bf16Params &p [[buffer(6)]],\n"
-           "    uint2 group [[threadgroup_position_in_grid]],\n"
-           "    uint lane [[thread_index_in_simdgroup]]\n"
+           "struct CausalPagedKvParams {\n"
+           "    uint start, page_tokens, first_page, page_count, physical_pages, q4;\n"
+           "};\n"
+           "\n"
+           "struct CausalDepthwise4PagedWire {\n"
+           "    CausalDepthwise4Bf16Params convolution;\n"
+           "    CausalPagedKvParams pages;\n"
+           "};\n"
+           "\n"
+           "template <bool paged>\n"
+           "inline void antfly_causal_depthwise4_apply(\n"
+           "    device const bfloat *input, device const bfloat *weight,\n"
+           "    device const bfloat *history, device const bfloat *dynamic_taps,\n"
+           "    device bfloat *output, device bfloat *next_history,\n"
+           "    constant CausalDepthwise4Bf16Params &p,\n"
+           "    device const uint *page_ids, constant CausalPagedKvParams *pages,\n"
+           "    uint2 group, uint lane\n"
            ") {\n"
            "    const uint head = group.x;\n"
            "    const int row = int(group.y);\n"
@@ -13523,10 +13530,67 @@ static NSString *termite_metal_shader_source(void) {
            "    square = simd_broadcast(square, 0);\n"
            "    const float factor = p.clip > 0.0f ? min(1.0f, p.clip / (sqrt(square) + p.epsilon))\n"
            "                                       : rsqrt(square / 128.0f + p.epsilon);\n"
-           "    const ulong base = ulong(row) * p.channels + head * 128u + lane;\n"
+           "    ulong target = ulong(row) * heads + head;\n"
+           "    if (paged) {\n"
+           "        const uint position = pages->start + uint(row);\n"
+           "        const uint logical = position / pages->page_tokens - pages->first_page;\n"
+           "        if (logical >= pages->page_count) return;\n"
+           "        const uint physical = page_ids[logical];\n"
+           "        if (physical >= pages->physical_pages) return;\n"
+           "        target = (ulong(physical) * pages->page_tokens + position % pages->page_tokens) * heads + head;\n"
+           "        if (pages->q4) {\n"
+           "            // Keep the BF16 boundary that preceded cache quantization.\n"
+           "            float4 values;\n"
+           "            for (uint i = 0; i < 4; ++i) values[i] = float(bfloat(rounded[i] * factor));\n"
+           "            const float4 magnitude = abs(values);\n"
+           "            const float maximum = simd_max(max(max(magnitude.x, magnitude.y), max(magnitude.z, magnitude.w)));\n"
+           "            const half scale = half(maximum / 7.0f);\n"
+           "            const float inverse = scale == half(0.0f) ? 0.0f : 1.0f / float(scale);\n"
+           "            const uint4 q = uint4(int4(clamp(rint(values * inverse), -8.0f, 7.0f)) + 8);\n"
+           "            device ushort *bits = reinterpret_cast<device ushort *>(output);\n"
+           "            const ulong offset = target * 33u;\n"
+           "            bits[offset + lane] = ushort(q.x | (q.y << 4u) | (q.z << 8u) | (q.w << 12u));\n"
+           "            if (lane == 0u) bits[offset + 32u] = as_type<ushort>(scale);\n"
+           "            return;\n"
+           "        }\n"
+           "    }\n"
+           "    const ulong base = target * 128u + lane;\n"
            "    for (uint i = 0; i < 4; ++i) output[base + i * 32u] = bfloat(rounded[i] * factor);\n"
            "}\n"
-           // tile-codegen:end convolution.causal_depthwise4_bf16 family
+           "\n"
+           "kernel void antfly_causal_depthwise4_head_norm_d128_bf16(\n"
+           "    device const bfloat *input [[buffer(0)]],\n"
+           "    device const bfloat *weight [[buffer(1)]],\n"
+           "    device const bfloat *history [[buffer(2)]],\n"
+           "    device const bfloat *dynamic_taps [[buffer(3)]],\n"
+           "    device bfloat *output [[buffer(4)]],\n"
+           "    device bfloat *next_history [[buffer(5)]],\n"
+           "    constant CausalDepthwise4Bf16Params &p [[buffer(6)]],\n"
+           "    uint2 group [[threadgroup_position_in_grid]],\n"
+           "    uint lane [[thread_index_in_simdgroup]]\n"
+           ") {\n"
+           "    antfly_causal_depthwise4_apply<false>(input, weight, history, dynamic_taps, output, next_history,\n"
+           "        p, nullptr, nullptr, group, lane);\n"
+           "}\n"
+           "\n"
+           // tile-codegen:end convolution.causal_depthwise4_bf16.0 family
+           // tile-codegen:begin convolution.causal_depthwise4_bf16.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "kernel void antfly_causal_depthwise4_paged_d128_bf16(\n"
+           "    device const bfloat *input [[buffer(0)]],\n"
+           "    device const bfloat *weight [[buffer(1)]],\n"
+           "    device const bfloat *history [[buffer(2)]],\n"
+           "    device const bfloat *dynamic_taps [[buffer(3)]],\n"
+           "    device bfloat *output [[buffer(4)]],\n"
+           "    device bfloat *next_history [[buffer(5)]],\n"
+           "    device const uint *page_ids [[buffer(6)]],\n"
+           "    constant CausalDepthwise4PagedWire &wire [[buffer(7)]],\n"
+           "    uint2 group [[threadgroup_position_in_grid]],\n"
+           "    uint lane [[thread_index_in_simdgroup]]\n"
+           ") {\n"
+           "    antfly_causal_depthwise4_apply<true>(input, weight, history, dynamic_taps, output, next_history,\n"
+           "        wire.convolution, page_ids, &wire.pages, group, lane);\n"
+           "}\n"
+           // tile-codegen:end convolution.causal_depthwise4_bf16.1 family
            // tile-codegen:begin attention.paged_relative_bf16.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "struct PagedRelativeGqaParams {\n"
            "    uint start, visible_start, page_tokens, first_page, page_count, physical_pages;\n"
@@ -13703,47 +13767,6 @@ static NSString *termite_metal_shader_source(void) {
            "\n"
            // tile-codegen:end attention.paged_relative_bf16.2 family
            // tile-codegen:begin attention.paged_relative_bf16.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
-           "struct PagedKvStageParams { uint rows, kv_heads, start, page_tokens, first_page, page_count, physical_pages, q4; };\n"
-           "\n"
-           "kernel void antfly_stage_paged_bf16_kv_d128(\n"
-           "    device const bfloat *key [[buffer(0)]], device const bfloat *value [[buffer(1)]],\n"
-           "    device ushort *key_out [[buffer(2)]], device ushort *value_out [[buffer(3)]],\n"
-           "    device const uint *page_ids [[buffer(4)]],\n"
-           "    constant PagedKvStageParams &p [[buffer(5)]],\n"
-           "    uint2 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]\n"
-           ") {\n"
-           "    const uint head = group.x;\n"
-           "    const uint position = p.start + head / p.kv_heads;\n"
-           "    const uint page = position / p.page_tokens - p.first_page;\n"
-           "    if (page >= p.page_count) return;\n"
-           "    const uint physical = page_ids[page];\n"
-           "    if (physical >= p.physical_pages) return;\n"
-           "    const ulong target = (ulong(physical) * p.page_tokens + position % p.page_tokens)\n"
-           "        * p.kv_heads + head % p.kv_heads;\n"
-           "    const device bfloat *src = group.y == 0u ? key : value;\n"
-           "    device ushort *dst = group.y == 0u ? key_out : value_out;\n"
-           "    const ulong begin = ulong(head) * 128u + lane;\n"
-           "    if (!p.q4) {\n"
-           "        const ulong offset = target * 128u + lane;\n"
-           "        const device ushort *bits = reinterpret_cast<const device ushort *>(src);\n"
-           "        for (uint i = 0; i < 128u; i += 32u) dst[offset + i] = bits[begin + i];\n"
-           "        return;\n"
-           "    }\n"
-           "    const float4 values = float4(float(src[begin]), float(src[begin + 32u]),\n"
-           "        float(src[begin + 64u]), float(src[begin + 96u]));\n"
-           "    const float4 magnitude = abs(values);\n"
-           "    const float maximum = simd_max(max(max(magnitude.x, magnitude.y), max(magnitude.z, magnitude.w)));\n"
-           "    const half scale = half(maximum / 7.0f);\n"
-           "    const float inverse = scale == half(0.0f) ? 0.0f : 1.0f / float(scale);\n"
-           "    const uint4 q = uint4(int4(clamp(rint(values * inverse), -8.0f, 7.0f)) + 8);\n"
-           "    const ulong offset = target * 33u;\n"
-           "    dst[offset + lane] = ushort(q.x | (q.y << 4u) | (q.z << 8u) | (q.w << 12u));\n"
-           "    if (lane == 0u) dst[offset + 32u] = as_type<ushort>(scale);\n"
-           "}\n"
-           "\n"
-           "\n"
-           // tile-codegen:end attention.paged_relative_bf16.3 family
-           // tile-codegen:begin attention.paged_relative_bf16.4 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void antfly_paged_relative_gqa_d128_bf16_partial_reuse3(\n"
            "    device const bfloat *query [[buffer(0)]],\n"
            "    device const ushort *keys [[buffer(1)]],\n"
@@ -13758,8 +13781,8 @@ static NSString *termite_metal_shader_source(void) {
            "    antfly_paged_relative_gqa_d128_partial<false, 3>(query, keys, values, relative, page_ids, partials, p, group, lane);\n"
            "}\n"
            "\n"
-           // tile-codegen:end attention.paged_relative_bf16.4 family
-           // tile-codegen:begin attention.paged_relative_bf16.5 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           // tile-codegen:end attention.paged_relative_bf16.3 family
+           // tile-codegen:begin attention.paged_relative_bf16.4 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void antfly_paged_relative_gqa_d128_q4_partial_reuse3(\n"
            "    device const bfloat *query [[buffer(0)]],\n"
            "    device const ushort *keys [[buffer(1)]],\n"
@@ -13774,8 +13797,8 @@ static NSString *termite_metal_shader_source(void) {
            "    antfly_paged_relative_gqa_d128_partial<true, 3>(query, keys, values, relative, page_ids, partials, p, group, lane);\n"
            "}\n"
            "\n"
-           // tile-codegen:end attention.paged_relative_bf16.5 family
-           // tile-codegen:begin attention.paged_relative_bf16.6 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           // tile-codegen:end attention.paged_relative_bf16.4 family
+           // tile-codegen:begin attention.paged_relative_bf16.5 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void antfly_paged_relative_gqa_d128_bf16_partial_reuse3_rows2(\n"
            "    device const bfloat *query [[buffer(0)]],\n"
            "    device const ushort *keys [[buffer(1)]],\n"
@@ -13790,8 +13813,8 @@ static NSString *termite_metal_shader_source(void) {
            "    antfly_paged_relative_gqa_d128_partial<false, 3, 2>(query, keys, values, relative, page_ids, partials, p, group, lane);\n"
            "}\n"
            "\n"
-           // tile-codegen:end attention.paged_relative_bf16.6 family
-           // tile-codegen:begin attention.paged_relative_bf16.7 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           // tile-codegen:end attention.paged_relative_bf16.5 family
+           // tile-codegen:begin attention.paged_relative_bf16.6 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void antfly_paged_relative_gqa_d128_q4_partial_reuse3_rows2(\n"
            "    device const bfloat *query [[buffer(0)]],\n"
            "    device const ushort *keys [[buffer(1)]],\n"
@@ -13805,7 +13828,7 @@ static NSString *termite_metal_shader_source(void) {
            ") {\n"
            "    antfly_paged_relative_gqa_d128_partial<true, 3, 2>(query, keys, values, relative, page_ids, partials, p, group, lane);\n"
            "}\n"
-           // tile-codegen:end attention.paged_relative_bf16.7 family
+           // tile-codegen:end attention.paged_relative_bf16.6 family
            // tile-codegen:begin expert.projection.block_scaled.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "struct RoutedBlockScaledParams {\n"
            "    uint rows;\n"
@@ -34597,7 +34620,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->routed_group_projection_pipeline = nil;
     runtime->routed_group_projection_wide_pipeline = nil;
     for (size_t index = 0; index < 7; ++index) runtime->paged_relative_bf16_pipelines[index] = nil;
-    runtime->stage_paged_kv_pipeline = nil;
+    runtime->causal_paged_bf16_pipeline = nil;
     runtime->causal_depthwise4_bf16_pipeline = nil;
     runtime->dense_bf16_projection_pipeline = nil;
     runtime->dense_bf16_projection_reuse4_pipeline = nil;
@@ -37867,31 +37890,8 @@ int antfly_metal_dispatch_paged_relative_bf16(
 }
 
 typedef struct {
-    uint32_t rows, kv_heads, start, page_tokens, first_page, page_count, physical_pages, q4;
-} antfly_metal_stage_paged_kv_params;
-
-int antfly_metal_dispatch_stage_paged_kv(
-    termite_metal_decode_runtime *runtime, const antfly_metal_routed_buffer views[5],
-    const antfly_metal_stage_paged_kv_params *p
-) {
-    if (!runtime || !views || !p || !p->rows || !p->kv_heads || p->kv_heads > 64 ||
-        !p->page_tokens || !p->page_count || !p->physical_pages || p->q4 > 1 ||
-        p->rows - 1 > UINT32_MAX - p->start) return -1;
-    const uint32_t first = p->start / p->page_tokens;
-    const uint32_t last = (p->start + (p->rows - 1)) / p->page_tokens;
-    if (first < p->first_page || last - p->first_page >= p->page_count) return -1;
-    size_t heads, input, output;
-    if (!termite_metal_size_mul(p->rows, p->kv_heads, &heads) || heads > UINT32_MAX ||
-        !termite_metal_size_mul(heads, 256, &input) ||
-        !termite_metal_size_mul(p->physical_pages, p->page_tokens, &output) ||
-        !termite_metal_size_mul(output, p->kv_heads, &output) ||
-        !termite_metal_size_mul(output, p->q4 ? 66 : 256, &output)) return -1;
-    const size_t required[5] = {input, input, output, output, (size_t)p->page_count * sizeof(uint32_t)};
-    const size_t alignment[5] = {2, 2, 2, 2, 4};
-    return antfly_metal_encode_typed_stage(runtime, @"antfly_stage_paged_bf16_kv_d128",
-        &runtime->stage_paged_kv_pipeline, views, required, alignment, 5, (1u << 2) | (1u << 3),
-        p, sizeof(*p), MTLSizeMake(heads, 2, 1), MTLSizeMake(32, 1, 1));
-}
+    uint32_t start, page_tokens, first_page, page_count, physical_pages, q4;
+} antfly_metal_causal_paged_kv_params;
 
 typedef struct {
     uint32_t channels, rows, valid_history, dynamic, normalize;
@@ -37900,8 +37900,8 @@ typedef struct {
 
 int antfly_metal_dispatch_causal_depthwise4_bf16(
     termite_metal_decode_runtime *runtime,
-    const antfly_metal_routed_buffer views[6],
-    const antfly_metal_causal_depthwise4_bf16_params *p
+    const antfly_metal_routed_buffer views[7],
+    const antfly_metal_causal_depthwise4_bf16_params *p, const antfly_metal_causal_paged_kv_params *pages
 ) {
     if (!runtime || !views || !p || !p->rows || p->rows > 65535 ||
         !p->channels || p->channels > (1u << 20) || p->channels % 128u || p->valid_history > 3 ||
@@ -37911,14 +37911,34 @@ int antfly_metal_dispatch_causal_depthwise4_bf16(
     const size_t io_bytes = row_bytes * p->rows;
     const size_t history_bytes = row_bytes * 3u;
     const size_t dynamic_bytes = p->dynamic ? (size_t)p->rows * (p->channels / 128u) * 8u : 0;
-    const size_t required[6] = {
+    size_t required[7] = {
         io_bytes, row_bytes * 4u, p->valid_history ? history_bytes : 0,
-        dynamic_bytes, io_bytes, history_bytes,
+        dynamic_bytes, io_bytes, history_bytes, 0,
     };
-    const size_t alignment[6] = {2, 2, 2, 2, 2, 2};
-    return antfly_metal_encode_typed_stage(runtime, @"antfly_causal_depthwise4_head_norm_d128_bf16",
-        &runtime->causal_depthwise4_bf16_pipeline, views, required, alignment, 6, (1u << 4) | (1u << 5),
-        p, sizeof(*p), MTLSizeMake(p->channels / 128u, p->rows, 1), MTLSizeMake(32, 1, 1));
+    const size_t alignment[7] = {2, 2, 2, 2, 2, 2, 4};
+    const MTLSize grid = MTLSizeMake(p->channels / 128u, p->rows, 1);
+    const MTLSize threads = MTLSizeMake(32, 1, 1);
+    if (!pages)
+        return antfly_metal_encode_typed_stage(runtime, @"antfly_causal_depthwise4_head_norm_d128_bf16",
+            &runtime->causal_depthwise4_bf16_pipeline, views, required, alignment, 6, (1u << 4) | (1u << 5),
+            p, sizeof(*p), grid, threads);
+
+    if (!p->normalize || grid.width > 64 || !pages->page_tokens || !pages->page_count ||
+        !pages->physical_pages || pages->q4 > 1 || p->rows - 1 > UINT32_MAX - pages->start) return -1;
+    const uint32_t first = pages->start / pages->page_tokens;
+    const uint32_t last = (pages->start + (p->rows - 1)) / pages->page_tokens;
+    if (first < pages->first_page || last - pages->first_page >= pages->page_count) return -1;
+    size_t physical_rows;
+    if (!termite_metal_size_mul(pages->physical_pages, pages->page_tokens, &physical_rows) ||
+        !termite_metal_size_mul(physical_rows, grid.width * (pages->q4 ? 66u : 256u), &required[4])) return -1;
+    required[6] = (size_t)pages->page_count * sizeof(uint32_t);
+    const struct {
+        antfly_metal_causal_depthwise4_bf16_params convolution;
+        antfly_metal_causal_paged_kv_params pages;
+    } wire = {*p, *pages};
+    return antfly_metal_encode_typed_stage(runtime, @"antfly_causal_depthwise4_paged_d128_bf16",
+        &runtime->causal_paged_bf16_pipeline, views, required, alignment, 7, (1u << 4) | (1u << 5),
+        &wire, sizeof(wire), grid, threads);
 }
 
 typedef struct {

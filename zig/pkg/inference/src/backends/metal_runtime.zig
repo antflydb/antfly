@@ -53252,65 +53252,11 @@ pub const PagedRelativeBf16Attention = struct {
 
     extern fn antfly_metal_dispatch_paged_relative_bf16(runtime: *RawMetalDecodeRuntime, views: *const [9]Buffer, wire: *const Wire, row_heads: u32, physical_rows: usize) c_int;
 
-    const Stage = extern struct {
-        rows: u32,
-        kv_heads: u32,
-        start: u32,
-        page_tokens: u32,
-        first_page: u32,
-        page_count: u32,
-        physical_pages: u32,
-        q4: u32,
-    };
-    extern fn antfly_metal_dispatch_stage_paged_kv(runtime: *RawMetalDecodeRuntime, views: *const [5]Buffer, params: *const Stage) c_int;
-
     query: geometry.Query,
     range: StagedRange,
     format: metadata.PlaneFormat = .bf16,
 
     pub const Planes = struct { key: *MetalTensor, value: *MetalTensor, format: metadata.PlaneFormat = .bf16 };
-    pub const SourcePlanes = struct { key: *const MetalTensor, value: *const MetalTensor };
-
-    /// Stage the append suffix into the already admitted physical visit planes.
-    /// The request owns the frame, and can publish the transaction after its fence.
-    pub fn stageRows(
-        runtime: *RawMetalDecodeRuntime,
-        append: *@import("../runtime/kv/hybrid_paged.zig").Append,
-        group: @import("../runtime/kv/hybrid_paged.zig").Group,
-        kv_heads: u32,
-        page_ids: *const MetalTensor,
-        source: SourcePlanes,
-        destination: Planes,
-    ) !void {
-        if (!hasActiveFrame(runtime)) return error.MetalFrameRequired;
-        if (kv_heads == 0 or kv_heads > 64) return error.InvalidShape;
-        const range = try append.stagedRange(group);
-        const start = append.sequence.committed_tokens;
-        if (destination.key.isReadOnlyPhysical() or destination.value.isReadOnlyPhysical())
-            return error.ReadOnlyPhysicalStorage;
-        const views: [5]Buffer = .{
-            try .fromTensor(source.key, .i16),
-            try .fromTensor(source.value, .i16),
-            try .fromTensor(destination.key, .i16),
-            try .fromTensor(destination.value, .i16),
-            try .fromTensor(page_ids, .i32),
-        };
-        const params: Stage = .{
-            .rows = std.math.cast(u32, range.visible_end - start) orelse return error.InvalidShape,
-            .kv_heads = kv_heads,
-            .start = std.math.cast(u32, start) orelse return error.InvalidShape,
-            .page_tokens = range.page_tokens,
-            .first_page = std.math.cast(u32, range.first_page) orelse return error.InvalidShape,
-            .page_count = std.math.cast(u32, range.page_count) orelse return error.InvalidShape,
-            .physical_pages = std.math.cast(u32, range.physical_pages) orelse return error.InvalidShape,
-            .q4 = @intFromBool(destination.format == .q4_head128),
-        };
-        if (antfly_metal_dispatch_stage_paged_kv(runtime, &views, &params) != 0)
-            return error.MetalKernelDispatchFailed;
-        destination.key.invalidateHostMirror();
-        destination.value.invalidateHostMirror();
-    }
-
     pub const Inputs = struct {
         query: *const MetalTensor,
         keys: *const MetalTensor,
@@ -53551,7 +53497,6 @@ pub const CausalPagedRelativeBf16 = struct {
 
     pub const Operand = struct {
         input: CausalDepthwise4Bf16.Inputs,
-        staged: *MetalTensor,
         next_history: *MetalTensor,
     };
 
@@ -53574,14 +53519,16 @@ pub const CausalPagedRelativeBf16 = struct {
             convolution.valid_history != @min(3, query.start) or !convolution.normalize)
             return error.InvalidShape;
         const attention: PagedRelativeBf16Attention = .{ .query = query, .range = range, .format = planes.format };
-        try convolution.encode(runtime, key.input, key.staged, key.next_history);
+        const pages: CausalDepthwise4Bf16.Pages = .{
+            .range = range,
+            .start = query.start,
+            .format = planes.format,
+            .ids = input.page_ids,
+        };
+        try convolution.encodeDirect(runtime, key.input, planes.key, key.next_history, pages);
         var value_convolution = convolution;
         value_convolution.clip = 0;
-        try value_convolution.encode(runtime, value.input, value.staged, value.next_history);
-        try PagedRelativeBf16Attention.stageRows(runtime, append, group, query.kv_heads, input.page_ids, .{
-            .key = key.staged,
-            .value = value.staged,
-        }, planes);
+        try value_convolution.encodeDirect(runtime, value.input, planes.value, value.next_history, pages);
         try attention.encode(runtime, .{
             .query = input.query,
             .keys = planes.key,
@@ -53594,7 +53541,7 @@ pub const CausalPagedRelativeBf16 = struct {
     }
 };
 
-test "Metal paged relative attention reads convolved KV staged in the same frame" {
+test "Metal paged relative attention reads convolved KV written directly in the same frame" {
     if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
     const a = std.testing.allocator;
     const metadata = @import("../runtime/kv/hybrid_paged.zig");
@@ -53640,14 +53587,14 @@ test "Metal paged relative attention reads convolved KV staged in the same frame
     var values: [256]u16 = undefined;
     @memset(values[0..128], 0x4000);
     @memset(values[128..], 0x4080);
-    const dtypes: [15]metal_tensor.DType = .{ .i16, .i16, .i16, .i16, .i16, .i32, .i16, .f32, .i16, .i16, .i16, .i16, .i16, .i16, .i16 };
-    const sizes = [15]i32{ 256, 512, 512, 256, 256, 2, 2, try attention.scratchElements(), 256, 512, 384, 256, 256, 384, 384 };
+    const dtypes: [13]metal_tensor.DType = .{ .i16, .i16, .i16, .i16, .i16, .i32, .i16, .f32, .i16, .i16, .i16, .i16, .i16 };
+    const sizes = [13]i32{ 256, 512, 512, 256, 256, 2, 2, try attention.scratchElements(), 256, 512, 384, 384, 384 };
     const payloads: [7][]const u8 = .{
         std.mem.sliceAsBytes(zeros[0..256]), std.mem.asBytes(&zeros),  std.mem.asBytes(&zeros),
         std.mem.sliceAsBytes(zeros[0..256]), std.mem.asBytes(&values), std.mem.asBytes(&ids),
         std.mem.sliceAsBytes(zeros[0..2]),
     };
-    var tensors: [15]MetalTensor = undefined;
+    var tensors: [13]MetalTensor = undefined;
     var count: usize = 0;
     defer for (tensors[0..count]) |*tensor| tensor.deinit();
     for (&tensors, dtypes, sizes, 0..) |*tensor, dtype, size, index| {
@@ -53682,13 +53629,11 @@ test "Metal paged relative attention reads convolved KV staged in the same frame
     };
     const key: CausalPagedRelativeBf16.Operand = .{
         .input = .{ .values = &tensors[3], .weight = &tensors[9], .history = &tensors[10], .dynamic_taps = null },
-        .staged = &tensors[11],
-        .next_history = &tensors[13],
+        .next_history = &tensors[11],
     };
     const value_operand: CausalPagedRelativeBf16.Operand = .{
         .input = .{ .values = &tensors[4], .weight = &tensors[9], .history = &tensors[10], .dynamic_taps = null },
-        .staged = &tensors[12],
-        .next_history = &tensors[14],
+        .next_history = &tensors[12],
     };
     const stencil: CausalDepthwise4Bf16 = .{
         .channels = 128,
@@ -53741,7 +53686,21 @@ pub const CausalDepthwise4Bf16 = struct {
         epsilon: f32,
     };
 
-    extern fn antfly_metal_dispatch_causal_depthwise4_bf16(runtime: *RawMetalDecodeRuntime, views: *const [6]Buffer, params: *const Wire) c_int;
+    const PagedWire = extern struct {
+        start: u32,
+        page_tokens: u32,
+        first_page: u32,
+        page_count: u32,
+        physical_pages: u32,
+        q4: u32,
+    };
+    const Pages = struct {
+        range: @import("../runtime/kv/hybrid_paged.zig").StagedRange,
+        start: u32,
+        format: @import("../runtime/kv/hybrid_paged.zig").PlaneFormat,
+        ids: *const MetalTensor,
+    };
+    extern fn antfly_metal_dispatch_causal_depthwise4_bf16(runtime: *RawMetalDecodeRuntime, views: *const [7]Buffer, params: *const Wire, pages: ?*const PagedWire) c_int;
 
     pub const Inputs = struct {
         values: *const MetalTensor,
@@ -53751,17 +53710,30 @@ pub const CausalDepthwise4Bf16 = struct {
     };
 
     pub fn encode(self: CausalDepthwise4Bf16, runtime: *RawMetalDecodeRuntime, input: Inputs, output: *MetalTensor, next_history: *MetalTensor) !void {
+        return self.encodeDirect(runtime, input, output, next_history, null);
+    }
+
+    fn encodeDirect(self: CausalDepthwise4Bf16, runtime: *RawMetalDecodeRuntime, input: Inputs, output: *MetalTensor, next_history: *MetalTensor, pages: ?Pages) !void {
         if (!hasActiveFrame(runtime)) return error.MetalFrameRequired;
         if (output.isReadOnlyPhysical() or next_history.isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
         if (self.valid_history != 0 and input.history == null) return error.InvalidShape;
-        const views: [6]Buffer = .{
+        const views: [7]Buffer = .{
             try .fromTensor(input.values, .i16),
             try .fromTensor(input.weight, .i16),
             if (input.history) |history| try .fromTensor(history, .i16) else .{},
             if (input.dynamic_taps) |taps| try .fromTensor(taps, .i16) else .{},
             try .fromTensor(output, .i16),
             try .fromTensor(next_history, .i16),
+            if (pages) |layout| try .fromTensor(layout.ids, .i32) else .{},
         };
+        const paged_wire: ?PagedWire = if (pages) |layout| .{
+            .start = layout.start,
+            .page_tokens = layout.range.page_tokens,
+            .first_page = std.math.cast(u32, layout.range.first_page) orelse return error.InvalidShape,
+            .page_count = std.math.cast(u32, layout.range.page_count) orelse return error.InvalidShape,
+            .physical_pages = std.math.cast(u32, layout.range.physical_pages) orelse return error.InvalidShape,
+            .q4 = @intFromBool(layout.format == .q4_head128),
+        } else null;
         if (antfly_metal_dispatch_causal_depthwise4_bf16(runtime, &views, &.{
             .channels = self.channels,
             .rows = self.rows,
@@ -53771,7 +53743,7 @@ pub const CausalDepthwise4Bf16 = struct {
             .output_scale = self.output_scale,
             .clip = self.clip,
             .epsilon = self.epsilon,
-        }) != 0) return error.MetalKernelDispatchFailed;
+        }, if (paged_wire) |*wire| wire else null) != 0) return error.MetalKernelDispatchFailed;
         output.invalidateHostMirror();
         next_history.invalidateHostMirror();
     }
