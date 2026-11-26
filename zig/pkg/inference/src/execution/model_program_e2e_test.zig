@@ -827,7 +827,12 @@ test "model program resident decoder matches full-prefix logits without per-toke
         for (values, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 19)) - 9)) / 100;
         var embedding = try Tensor.initFloat32(a, "input_embeddings", &.{ 1, 1, cfg.hidden_size }, values);
         defer embedding.deinit();
-        const prefix = @import("media_prefix.zig").Prefix{ .embeddings = embedding.borrowedView("input_embeddings") };
+        // Real Gemma 4 media rows carry independent per-layer token IDs.
+        var prefix_ple = [_]i64{0};
+        const prefix = @import("media_prefix.zig").Prefix{
+            .embeddings = embedding.borrowedView("input_embeddings"),
+            .ple_ids = if (cfg.hasPle()) &prefix_ple else null,
+        };
         const history = [_]i64{ 1, 2, 3, 4, 5 };
         for (0..2) |round| {
             var cached = try @import("resident_decoder.zig").Decoder.init(a, session, 8 + round, null);
@@ -886,7 +891,11 @@ test "model program resident decoder matches full-prefix logits without per-toke
                 for (full_values, 0..) |*value, i| value.* = values[i % values.len];
                 var full_embedding = try Tensor.initFloat32(a, "input_embeddings", &.{ 1, @intCast(rows), cfg.hidden_size }, full_values);
                 defer full_embedding.deinit();
-                const prepared = @import("media_prefix.zig").Prefix{ .embeddings = full_embedding.borrowedView("input_embeddings") };
+                var full_ple: [history.len]i64 = @splat(0);
+                const prepared = @import("media_prefix.zig").Prefix{
+                    .embeddings = full_embedding.borrowedView("input_embeddings"),
+                    .ple_ids = if (cfg.hasPle()) full_ple[0..rows] else null,
+                };
                 const expected = try prepared.run(session, history[0..rows], a, .{ .native_call_policy = .in_process });
                 defer a.free(expected);
                 var cached = try @import("resident_decoder.zig").Decoder.init(a, session, 8, null);

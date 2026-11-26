@@ -218,6 +218,14 @@ parity. Both Whisper Small fixtures passed again. Gemma 4 E4B QAT GGUF
 passed positional-table HLO serialization, which exercises compilation
 input construction but leaves numerical execution to a separate fixture.
 
+With the same plugin, released Gemma 4 E4B passed image, audio and video
+projection parity and short resident decoding against full-prefix
+execution. The mixed embedding fixture supplied the model's per-layer
+token IDs. F32 logit differences were below 0.0001 and BF16 passed its
+F32-relative error and greedy-token checks. DECIDE-1B passed exact F32
+direct and HTTP classifier parity. These tests exercise model execution
+and serving correctness on CPU; they provide no latency gate.
+
 Whisper compiled requests use the resident PJRT bank publication owner. Prefill
 produces self K/V and immutable encoder cross K/V; subsequent single-token
 programs consume those banks and runtime learned positions. Decode reachability
