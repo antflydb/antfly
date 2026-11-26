@@ -422,6 +422,7 @@ test "uniform report retains bounded CUDA decoder workspace after completed publ
         .metadata_bytes = 512,
         .head_bytes = 0,
         .readback_bytes = 44,
+        .readback_backing = .admitted_pinned,
         .rows = 2,
     };
     var scope: observation.KernelScope = undefined;

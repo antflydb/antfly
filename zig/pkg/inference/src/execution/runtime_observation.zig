@@ -473,9 +473,11 @@ pub const CudaDecoderWorkspace = struct {
     metadata_bytes: usize,
     head_bytes: usize,
     readback_bytes: usize,
+    readback_backing: ReadbackBacking,
     rows: usize,
 
     pub const Route = enum { recorded_and_launched, replayed };
+    pub const ReadbackBacking = enum { admitted_pinned, request_buffer, legacy_policy };
 };
 
 pub inline fn cudaDecoderWorkspace(workspace: CudaDecoderWorkspace) void {

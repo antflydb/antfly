@@ -3831,7 +3831,7 @@ pub const CudaCompute = struct {
             const layout = owner.storage_layout orelse return error.InvalidExecutionPlan;
             const source = layout.readback(owner.metadata);
             const readback_words = host[0 .. source.len / @sizeOf(u32)];
-            copyBoundedGraphReceipt(self.compute, source, std.mem.sliceAsBytes(readback_words)) catch |err| {
+            const readback_backing = copyBoundedGraphReceipt(self.compute, source, std.mem.sliceAsBytes(readback_words)) catch |err| {
                 // A driver error can surface after earlier stream work was
                 // queued. Drain before returning this stack-backed receipt.
                 if (err == error.CudaDriverError) {
@@ -3855,6 +3855,7 @@ pub const CudaCompute = struct {
                     .metadata_bytes = layout.metadata_bytes,
                     .head_bytes = layout.head_bytes,
                     .readback_bytes = source.len,
+                    .readback_backing = readback_backing,
                     .rows = owner.rows,
                 });
             };
@@ -14985,9 +14986,13 @@ fn copyToPinnedScalarDownloadAndSync(self: *CudaCompute, device: buffer_mod.Devi
     return true;
 }
 
-fn copyBoundedGraphReceipt(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []u8) !void {
-    if (self.ctx.video_cache_budget.admission == null)
-        return copyToHostTrackedAndSync(self, device, bytes);
+const GraphReadbackBacking = @import("../../execution/runtime_observation.zig").CudaDecoderWorkspace.ReadbackBacking;
+
+fn copyBoundedGraphReceipt(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []u8) !GraphReadbackBacking {
+    if (self.ctx.video_cache_budget.admission == null) {
+        try copyToHostTrackedAndSync(self, device, bytes);
+        return .legacy_policy;
+    }
 
     if (!cudaPinnedScalarDownloadsDisabled() and bytes.len <= @import("burst_readback.zig").capacity) {
         if (try self.acquireBurstReadbackSlot()) |slot| {
@@ -14999,12 +15004,13 @@ fn copyBoundedGraphReceipt(self: *CudaCompute, device: buffer_mod.DeviceBuffer, 
             try copyToHostTracked(self, device, staging);
             try finishHostDownload(self);
             @memcpy(bytes, staging);
-            return;
+            return .admitted_pinned;
         }
     }
     // Without a prepared token, the caller's receipt is the only backing.
     try copyToHostTracked(self, device, bytes);
     try finishHostDownload(self);
+    return .request_buffer;
 }
 
 fn copyToHostTrackedAndSync(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []u8) !void {
@@ -45849,7 +45855,8 @@ test "CUDA bounded decoder drains a failed receipt transfer before returning" {
     };
     var out: [44]u8 = undefined;
     Fake.destination = if (cudaPinnedScalarDownloadsDisabled()) &out else &staging;
-    try copyBoundedGraphReceipt(&compute, .{ .ptr = 0x2000, .len = out.len }, &out);
+    const backing = try copyBoundedGraphReceipt(&compute, .{ .ptr = 0x2000, .len = out.len }, &out);
+    try std.testing.expectEqual(if (cudaPinnedScalarDownloadsDisabled()) GraphReadbackBacking.request_buffer else .admitted_pinned, backing);
     try std.testing.expectEqual(@as([44]u8, @splat(42)), out);
     try std.testing.expectEqual(@as(usize, 2), Fake.waits);
     try std.testing.expect(!compute.lighton_burst_readback.busy);

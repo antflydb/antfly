@@ -48764,7 +48764,7 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
             try std.testing.expectEqual(@as(usize, 44), report.readback_bytes);
             try std.testing.expectEqual(report.planned_scratch_bytes, report.bound_scratch_bytes);
             try std.testing.expect(report.planned_events != 0 and report.metadata_bytes != 0);
-            std.debug.print("LIGHTONOCR3 observed_cuda_workspace rows={d} readback_bytes={d} route={s}\n", .{ report.rows, report.readback_bytes, @tagName(report.route) });
+            std.debug.print("LIGHTONOCR3 observed_cuda_workspace rows={d} readback_bytes={d} backing={s} route={s}\n", .{ report.rows, report.readback_bytes, @tagName(report.readback_backing), @tagName(report.route) });
         }
         std.debug.print("LIGHTONOCR3 http_batch_pages=2 parity=true\n", .{});
     }
