@@ -1031,9 +1031,13 @@ a permit for the selected request geometry. This keeps the context size
 and K/V format fixed and checks the same live limits at acquisition.
 The optimized build passed the text/image batch and streaming smoke test
 and admitted the same full-window image request under the unchanged
-automatic limits. Metal submitted the prompt frames. This verifies
-admission and start of execution. Full-window completion and latency
-remain unmeasured.
+automatic limits. The older admission build completed that image
+request on the M4 Max with packed K/V. It returned `271` at 63,517.22 s
+and reported 1,048,576 prompt tokens, one completion token, and `[DONE]`.
+This single instrumented run establishes completion for that build and
+fixture. The matched image-dependent and text full-window comparisons
+remain open. The next Metal qualification run covers short through
+32K prompts before returning to the full-window comparisons.
 
 The shared ByteLevel tokenizer now applies the checkpoint's exact
 Unicode Split expression, including casing, three-digit groups, and
