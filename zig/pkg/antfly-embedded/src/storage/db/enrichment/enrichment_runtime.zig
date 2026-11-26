@@ -32179,7 +32179,7 @@ fn publishMediaWindowVectors(runtime: *EnrichmentRuntime, a: Allocator, request:
     for (old_keys.items) |old| if (!wanted.contains(old)) try effects.append(scratch, .{ .family = .derived_vector, .key = old, .value = null, .source_index = 0 });
     if (effects.items.len == 0) return false;
     if (pending) return error.IncompleteChunkCoverage;
-    enqueueProducerEffects(runtime, &input.token, effects.items, null) catch |err| switch (err) {
+    enqueueProducerEffectsWithBudgetError(runtime, &input.token, effects.items, null, error.ResourceTemporarilyUnavailable) catch |err| switch (err) {
         error.ArtifactPublicationPending => {},
         else => return err,
     };
@@ -32348,11 +32348,11 @@ fn scalarWindowRetirementPending(input: *const @import("../artifact_chunk_vector
 
 /// A scalar publication also replaces this consumer's previously published
 /// windows. Bind each child deletion to the same source and write command.
-const PublicationBudgetError = error{ ResourceBudgetExceeded, PublicationEncoderAdmissionDenied };
+const PublicationBudgetError = error{ ResourceBudgetExceeded, ResourceTemporarilyUnavailable, PublicationEncoderAdmissionDenied };
 
 const ScalarChunkPublication = struct {
     retire_windows: bool,
-    budget_error: PublicationBudgetError = error.ResourceBudgetExceeded,
+    budget_error: PublicationBudgetError = error.ResourceTemporarilyUnavailable,
 };
 
 fn enqueueScalarChunkVector(runtime: *EnrichmentRuntime, input: *@import("../artifact_chunk_vector_publication.zig").Input, value: ?[]const u8, options: ScalarChunkPublication) !void {
@@ -32659,6 +32659,7 @@ const OrderedDenseTextBatch = struct {
     alloc: Allocator,
     items: std.ArrayList(Item) = .empty,
     bytes: usize = 0,
+    publication_pending: bool = false,
     failed_requests: std.AutoHashMapUnmanaged(u64, void) = .empty,
     generation: embedder_mod.DenseEmbedder.TextGeneration,
 
@@ -32836,7 +32837,7 @@ const OrderedDenseTextBatch = struct {
                     const value = enrichment_artifact_codec.encodeDenseEmbeddingAlloc(runtime.alloc, item.source_hash, vector) catch |err| return self.scope.publicationFailure(err);
                     defer runtime.alloc.free(value);
                     enqueueScalarChunkVector(runtime, &item.input, value, .{ .retire_windows = true, .budget_error = error.PublicationEncoderAdmissionDenied }) catch |err| switch (err) {
-                        error.ArtifactPublicationPending => {},
+                        error.ArtifactPublicationPending => self.publication_pending = true,
                         error.PublicationEncoderAdmissionDenied => {
                             // This output never reached the dispatcher. A
                             // storage or submission failure still belongs to
@@ -34514,6 +34515,12 @@ fn processChunkedDenseWindow(
         defer if (ordered_budget) |*tracked| tracked.deinit();
         var ordered_batch: OrderedDenseTextBatch = .{ .generation = generation, .scope = scope, .alloc = if (ordered_budget) |*tracked| tracked.allocator() else runtime.alloc };
         defer ordered_batch.deinit();
+        // A retryable error can skip the ordinary receipt-wait loop below.
+        // Keep the cut pinned if a flush submitted any sibling while the
+        // retry scheduler parked another request.
+        defer if (ordered_batch.publication_pending and runtime.retry_scheduler != null) {
+            deferred_retry_error = error.ArtifactPublicationPending;
+        };
         var materialized_batch: MaterializedDenseBatch = .{};
         defer materialized_batch.deinit(runtime.alloc);
         var publication_pending: std.ArrayList(enrichment_types.GeneratedEnrichmentRequest) = .empty;
@@ -45178,6 +45185,10 @@ test "ordered materialized chunk embeddings recover from shared transport pressu
     try testOrderedChunkVectorCarry(true, .transport_pressure);
 }
 
+test "ordered materialized chunk embeddings keep the receipt barrier under transport pressure" {
+    try testOrderedChunkVectorCarry(true, .transport_barrier);
+}
+
 test "ordered materialized chunk embeddings use bounded parallel provider batches" {
     try testOrderedChunkVectorCarry(true, .parallel);
     try testOrderedChunkVectorCarry(true, .parallel_bytes);
@@ -45213,7 +45224,7 @@ test "ordered materialized chunk embeddings retain owners across planning failur
     try testOrderedChunkVectorCarry(true, .planning_retry);
 }
 
-const ChunkVectorBatchTest = enum { carry, items, bytes, revision, legacy, legacy_bytes, terminal, metadata_retry, metadata_tail_retry, relational_retry, legacy_budget, legacy_boundary_terminal, legacy_metadata_retry, legacy_metadata_terminal, parallel, parallel_bytes, legacy_preparation_retry, legacy_preparation_retry_cached, mixed_publication_pending, parallel_oversize, parallel_terminal, parallel_retry, collection_pressure, collection_too_large, parallel_cancel, cancel_first, cancel_second, cancel_global, source_first, source_second, abort_first, abort_second, mixed_retry_first, mixed_retry_second, memo_serial, memo_parallel, memo_unused, parallel_capacity, parallel_capacity_cancel, planning_terminal, planning_retry, collection_multi, collection_contention, legacy_cleanup_terminal, legacy_cleanup_terminal_empty, legacy_cleanup_terminal_current, transport_pressure };
+const ChunkVectorBatchTest = enum { carry, items, bytes, revision, legacy, legacy_bytes, terminal, metadata_retry, metadata_tail_retry, relational_retry, legacy_budget, legacy_boundary_terminal, legacy_metadata_retry, legacy_metadata_terminal, parallel, parallel_bytes, legacy_preparation_retry, legacy_preparation_retry_cached, mixed_publication_pending, parallel_oversize, parallel_terminal, parallel_retry, collection_pressure, collection_too_large, parallel_cancel, cancel_first, cancel_second, cancel_global, source_first, source_second, abort_first, abort_second, mixed_retry_first, mixed_retry_second, memo_serial, memo_parallel, memo_unused, parallel_capacity, parallel_capacity_cancel, planning_terminal, planning_retry, collection_multi, collection_contention, legacy_cleanup_terminal, legacy_cleanup_terminal_empty, legacy_cleanup_terminal_current, transport_pressure, transport_barrier };
 
 fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !void {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
@@ -45237,6 +45248,8 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
         generation: u8 = 1,
         change_generation: bool = false,
         fail_first_batch: bool = false,
+        transport_pressure: ?*resource_manager_mod.ResourceManager = null,
+        transport_reservation: ?resource_manager_mod.Reservation = null,
         planning_error: ?anyerror = null,
         capacity_test: bool = false,
         capacity_attempts: std.atomic.Value(usize) = .init(0),
@@ -45375,6 +45388,7 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
                 row.* = try embedDense(ptr, a, name, text, dims);
                 initialized += 1;
             }
+            try self.occupyTransportBudget();
             if (self.change_generation) self.generation += 1;
             return rows;
         }
@@ -45417,7 +45431,16 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
                 row.* = try embedDense(ptr, a, name, text, dims);
                 initialized += 1;
             }
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.occupyTransportBudget();
             return rows;
+        }
+        fn occupyTransportBudget(self: *@This()) !void {
+            const manager = self.transport_pressure orelse return;
+            if (self.transport_reservation != null) return;
+            const slice: resource_manager_mod.Slice = .relational_preparation_working_set;
+            const free = manager.memoryHardLimitForSlice(slice) -| manager.sliceStats(slice).used_bytes;
+            self.transport_reservation = try manager.reserve(slice, free -| (4 * 1024));
         }
         fn process(self: *@This(), runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, window: *GeneratedReplayWindow, use_dense: bool) !void {
             if (use_dense) {
@@ -45790,7 +45813,7 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
         defer for (keys[0..initialized]) |key| alloc.free(key);
         var index: u64 = 5;
         for (&requests, &keys, 0..) |*request, *key, i| {
-            key.* = if (batching == .collection_pressure or batching == .collection_multi)
+            key.* = if (batching == .collection_pressure or batching == .collection_multi or (batching == .transport_barrier and i == 0))
                 try std.fmt.allocPrint(alloc, "batch-doc-{d}-{s}", .{ i, &@as([2048]u8, @splat('k')) })
             else
                 try std.fmt.allocPrint(alloc, "batch-doc-{d}", .{i});
@@ -45870,6 +45893,45 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
                 try std.testing.expectEqual(@as(usize, count), scheduler.state.tickets.items.len);
             }
             try std.testing.expectEqual(@as(usize, 0), harness.provider_calls);
+            return;
+        }
+        if (batching == .transport_barrier) {
+            var scheduler = try ScopedReplay.load(runtime);
+            defer scheduler.deinit(runtime.alloc);
+            runtime.retry_scheduler = &scheduler;
+            defer runtime.retry_scheduler = null;
+            runtime.config.resource_manager = &pressure_manager;
+            defer runtime.config.resource_manager = null;
+            harness.transport_pressure = &pressure_manager;
+            defer if (harness.transport_reservation) |*reservation| reservation.release();
+            for (requests[0..2]) |*request| request.sequence = index;
+            const before = harness.queued.items.len;
+            var scope: FailureScope = .{};
+            const result = processChunkedDenseWindow(runtime, requests[0..2], &cache, &window, &scope);
+            try std.testing.expectError(error.ArtifactPublicationPending, result);
+            try std.testing.expectError(error.ArtifactPublicationPending, LaneOutcome.of(&scope, result).result);
+            try std.testing.expectEqual(@as(usize, 2), harness.provider_calls);
+            try std.testing.expect(harness.transport_reservation != null);
+            try std.testing.expectEqual(before + 1, harness.queued.items.len);
+            const source = try ScopedReplay.observeSource(runtime, keys[0], null, true);
+            const parked = try scheduler.state.priorLogical(runtime.alloc, logicalRequestFingerprint(requests[0]), source.logical_digest);
+            try std.testing.expectEqual(@as(u32, 1), parked.waits);
+            try std.testing.expectEqual(@as(u32, 0), parked.failures);
+
+            var submitted = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.queued.items[before]);
+            defer submitted.deinit();
+            try std.testing.expectEqualStrings(keys[1], submitted.command.sources[0].document_key);
+            {
+                var read = try runtime.store.beginRead();
+                defer read.abort();
+                try std.testing.expectError(error.NotFound, read.get(submitted.command.mutations[0].key));
+            }
+            try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = submitted.command }, .{ .term = 1, .index = index });
+            {
+                var read = try runtime.store.beginRead();
+                defer read.abort();
+                _ = try read.get(submitted.command.mutations[0].key);
+            }
             return;
         }
         if (batching == .collection_contention) {
@@ -46050,7 +46112,7 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
                 try std.testing.expectEqual(before, harness.queued.items.len);
                 return;
             }
-            try std.testing.expectError(if (harness.retry_text) error.UnexpectedProviderFailure else error.ArtifactPublicationPending, processChunkedDenseWindow(runtime, &requests, &cache, &window, &scope));
+            try std.testing.expectError(error.ArtifactPublicationPending, processChunkedDenseWindow(runtime, &requests, &cache, &window, &scope));
             const successful: usize = if (harness.retry_text) 32 else 33;
             try std.testing.expectEqual(successful, harness.provider_calls);
             try std.testing.expectEqual(successful, harness.queued.items.len - before);
@@ -46116,7 +46178,7 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
             harness.fail_metadata_at = if (batching == .metadata_retry) 2 else if (batching == .metadata_tail_retry) 4 else 0;
             harness.retry_first_batch = batching == .relational_retry;
             var scope: FailureScope = .{};
-            try std.testing.expectError(error.UnexpectedProviderFailure, processChunkedDenseWindow(runtime, &requests, &cache, &window, &scope));
+            try std.testing.expectError(if (batching == .metadata_tail_retry) error.ArtifactPublicationPending else error.UnexpectedProviderFailure, processChunkedDenseWindow(runtime, &requests, &cache, &window, &scope));
             try std.testing.expect(scope.owner == null);
             try std.testing.expectEqual(@as(usize, count), scheduler.state.tickets.items.len);
             const failed_start: usize = if (batching == .metadata_tail_retry) 64 else 0;
@@ -51453,6 +51515,43 @@ test "model aware media ordered vector windows are searchable with exact clocks 
                 defer read.abort();
                 const outcome = (try ordered_publication.rejected(&read, command)) orelse return error.TestUnexpectedResult;
                 try std.testing.expectEqual(ordered_publication.Rejection.invalid_output, outcome.reason);
+            }
+            {
+                var input = blk: {
+                    var read = try runtime.store.beginRead();
+                    defer read.abort();
+                    var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+                    defer plan.release();
+                    break :blk (try @import("../artifact_chunk_vector_publication.zig").capture(a, &read, vector_request, plan.plan(), member)).?;
+                };
+                defer input.deinit();
+                input.old_window_outputs = &.{};
+                input.token.execution_identity = @splat(marker);
+                input.token.execution_bound = true;
+                var budget = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 128 } });
+                defer budget.deinit(a);
+                const previous_manager = runtime.config.resource_manager;
+                runtime.config.resource_manager = &budget;
+                defer runtime.config.resource_manager = previous_manager;
+                var prepared = MediaPassVectorCache{ .allocator = a };
+                defer prepared.deinit();
+                const before = harness.calls;
+                try std.testing.expectError(error.ResourceTemporarilyUnavailable, publishMediaWindowVectors(runtime, a, vector_request, provider, @as([32]u8, @splat(marker)), &input, input.value.?, &prepared));
+                var scalar = blk: {
+                    var read = try runtime.store.beginRead();
+                    defer read.abort();
+                    var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+                    defer plan.release();
+                    break :blk (try @import("../artifact_chunk_vector_publication.zig").capture(a, &read, vector_request, plan.plan(), member)).?;
+                };
+                defer scalar.deinit();
+                scalar.old_window_outputs = &.{};
+                scalar.token.execution_identity = @splat(marker);
+                scalar.token.execution_bound = true;
+                const scalar_value = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, 0, &.{ 1, 0 });
+                defer a.free(scalar_value);
+                try std.testing.expectError(error.ResourceTemporarilyUnavailable, enqueueScalarChunkVector(runtime, &scalar, scalar_value, .{ .retire_windows = true }));
+                try std.testing.expectEqual(before, harness.calls);
             }
             const published_parent = harness.calls;
             const next_valid_entry = harness.next_index;

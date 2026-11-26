@@ -190,6 +190,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-storage-repair-activation-test", "Run bounded index activation, coverage, and candidate-resume regressions")
         .dependOn(&addFilteredTestRunArtifact(b, repair_activation_tests).step);
     const db_enrichment_filters: []const []const u8 = selectTestFilters(b, &.{
+        "ordered materialized chunk embeddings recover from shared transport pressure",
+        "ordered materialized chunk embeddings keep the receipt barrier under transport pressure",
         "#1210",
         "relational prepared writes validate orphan vector receipts",
         "db public artifact reprocess accepts durable work despite unrelated provider retries",
