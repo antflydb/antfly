@@ -82,6 +82,19 @@ pub const Capture = struct {
         try self.artifacts.put(alloc, owned, {});
     }
 
+    fn invalidateEmptyWindows(self: *Capture, alloc: std.mem.Allocator, txn: anytype, namespace: publication.Namespace, scalar: []const u8) !void {
+        const witness = @import("db/artifact_chunk_vector_publication.zig").emptyWindowKey(namespace, scalar);
+        if (self.window_set_fenced != true) {
+            // Markerless restored writers still invalidate any previously
+            // certified set. Legacy tables with no witness write nothing.
+            _ = txn.get(&witness) catch |err| switch (err) {
+                error.NotFound => return,
+                else => return err,
+            };
+        }
+        try self.invalidate_empty_windows.put(alloc, witness, {});
+    }
+
     pub fn touch(self: *Capture, alloc: std.mem.Allocator, txn: anytype, key: []const u8, value: ?[]const u8) !void {
         errdefer self.poisoned = true;
         if (self.participant) |participant| if (participant.charge) |charge| try charge(participant.ptr, key, value);
@@ -144,9 +157,13 @@ pub const Capture = struct {
             if (self.selected) |active| if (try keys.mediaWindowVectorParentAlloc(alloc, key)) |parent| {
                 defer alloc.free(parent);
                 if (self.window_set_fenced == null) self.window_set_fenced = try @import("db/artifact_catalog_activation.zig").windowSetFenced(txn, active);
-                if (self.window_set_fenced.?) {
-                    try self.rememberArtifact(alloc, parent);
-                    if (value != null) try self.invalidate_empty_windows.put(alloc, @import("db/artifact_chunk_vector_publication.zig").emptyWindowKey(active.namespace, parent), {});
+                if (self.window_set_fenced.?) try self.rememberArtifact(alloc, parent);
+                if (value != null) try self.invalidateEmptyWindows(alloc, txn, active.namespace, parent);
+            };
+            if (value == null) if (self.selected) |active| if (keys.derivedEmbeddingBaseKey(key)) |base| {
+                if (keys.isChunkArtifactRecordKey(base) and keys.mediaWindowIndex(base) == null) {
+                    if (self.window_set_fenced == null) self.window_set_fenced = try @import("db/artifact_catalog_activation.zig").windowSetFenced(txn, active);
+                    try self.invalidateEmptyWindows(alloc, txn, active.namespace, key);
                 }
             };
             if (self.artifacts.contains(key)) return;

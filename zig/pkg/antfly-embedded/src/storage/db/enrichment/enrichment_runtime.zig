@@ -32197,7 +32197,7 @@ fn publishMediaWindowVectors(runtime: *EnrichmentRuntime, a: Allocator, request:
     const computation = mediaEmbeddingComputationRequest(runtime, request);
     const member_set = count > 1 or child_receipt or terminal;
     if (member_set and !try fusedMediaVectorReceiptsMatch(scratch, a, provider, computation, revision, receipts)) return false;
-    input.media_window_layout = count > 1 or child_receipt;
+    input.media_window_layout = input.media_window_layout or count > 1 or child_receipt;
     if (scalarWindowRetirementPending(input)) return error.ArtifactPublicationPending;
 
     try ensureMediaWindowOutputs(runtime, a, input);
@@ -32250,70 +32250,99 @@ fn publishMediaWindowVectors(runtime: *EnrichmentRuntime, a: Allocator, request:
     return true;
 }
 
-// Retain one bounded, interrupted scan on the lifecycle runtime. The key
-// includes the ordered authority and the exact parent revision, so an epoch
-// or child-set change cannot reuse a partial observation.
+// Preserve partial member scans across replay attempts. Each checkpoint
+// owns budgeted storage so its reservation follows it while it waits.
 const MediaWindowCapture = struct {
+    backing: Allocator,
     arena: std.heap.ArenaAllocator,
+    budget: ?resource_manager_mod.BudgetedAllocator,
     identity: ordered_publication.Digest,
     member: [32]u8,
     resume_key: std.ArrayList(u8) = .empty,
     records: std.ArrayList(ordered_publication.ArtifactSource) = .empty,
     key_bytes: usize = 0,
-    revision_fenced: bool = false,
 
-    fn canResume(self: MediaWindowCapture) bool {
-        return self.revision_fenced and self.resume_key.items.len != 0 and
-            self.key_bytes +| self.resume_key.items.len <= 2 * 1024 * 1024;
+    fn create(runtime: *EnrichmentRuntime, member: [32]u8, identity: ordered_publication.Digest) !*MediaWindowCapture {
+        const backing = runtime.alloc;
+        const scan = try backing.create(MediaWindowCapture);
+        scan.* = .{
+            .backing = backing,
+            .arena = undefined,
+            .budget = if (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) |manager|
+                resource_manager_mod.BudgetedAllocator.init(manager, .relational_preparation_working_set, backing, 1)
+            else
+                null,
+            .identity = identity,
+            .member = member,
+        };
+        scan.arena = .init(scan.allocator());
+        return scan;
     }
 
-    fn deinit(self: *MediaWindowCapture, alloc: Allocator) void {
-        self.resume_key.deinit(alloc);
+    fn allocator(self: *MediaWindowCapture) Allocator {
+        return if (self.budget) |*budget| budget.allocator() else self.backing;
+    }
+
+    fn admissionError(self: *MediaWindowCapture, err: anyerror) anyerror {
+        if (err == error.OutOfMemory) if (self.budget) |*budget| if (budget.denied()) return error.ResourceBudgetExceeded;
+        return err;
+    }
+
+    fn deinit(self: *MediaWindowCapture) void {
+        self.resume_key.deinit(self.allocator());
         self.arena.deinit();
+        if (self.budget) |*budget| budget.deinit();
+        self.backing.destroy(self);
     }
 };
 
 const MediaWindowCaptureCache = struct {
     mutex: std.atomic.Mutex = .unlocked,
-    saved: ?MediaWindowCapture = null,
-    saved_at_ns: u64 = 0,
+    // Oldest first. Several documents can yield in the same replay pass.
+    saved: [32]*MediaWindowCapture = undefined,
+    saved_count: usize = 0,
 
-    fn take(self: *MediaWindowCaptureCache, alloc: Allocator, member: [32]u8, identity: ordered_publication.Digest) ?MediaWindowCapture {
-        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
-        var previous: ?MediaWindowCapture = null;
-        if (self.saved) |saved| {
-            if (std.mem.eql(u8, &saved.member, &member)) {
-                previous = saved;
-                self.saved = null;
-            }
-        }
-        self.mutex.unlock();
-        if (previous) |*old| {
-            if (std.mem.eql(u8, &old.identity, &identity)) return old.*;
-            old.deinit(alloc);
+    fn remove(self: *MediaWindowCaptureCache, index: usize) *MediaWindowCapture {
+        const previous = self.saved[index];
+        self.saved_count -= 1;
+        std.mem.copyForwards(*MediaWindowCapture, self.saved[index..self.saved_count], self.saved[index + 1 .. self.saved_count + 1]);
+        return previous;
+    }
+
+    fn find(self: *MediaWindowCaptureCache, member: [32]u8) ?usize {
+        for (self.saved[0..self.saved_count], 0..) |scan, index| {
+            if (std.mem.eql(u8, &scan.member, &member)) return index;
         }
         return null;
     }
 
-    fn save(self: *MediaWindowCaptureCache, scan: MediaWindowCapture) bool {
+    fn take(self: *MediaWindowCaptureCache, member: [32]u8, identity: ordered_publication.Digest) ?*MediaWindowCapture {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
-        const now = platform.time.monotonicNs();
-        // Keep the existing member's continuation while handling unrelated
-        // documents. Expire abandoned members so they cannot hold the slot.
-        if (self.saved != null and now -| self.saved_at_ns < 60 * std.time.ns_per_s) {
-            self.mutex.unlock();
-            return false;
-        }
-        var previous = self.saved;
-        self.saved = scan;
-        self.saved_at_ns = now;
+        const previous = if (self.find(member)) |index| self.remove(index) else null;
         self.mutex.unlock();
-        if (previous) |*old| old.deinit(old.arena.child_allocator);
-        return true;
+        if (previous) |old| {
+            if (std.mem.eql(u8, &old.identity, &identity)) return old;
+            old.deinit();
+        }
+        return null;
+    }
+
+    fn save(self: *MediaWindowCaptureCache, scan: *MediaWindowCapture) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        const evicted = if (self.find(scan.member)) |index|
+            self.remove(index)
+        else if (self.saved_count == self.saved.len)
+            self.remove(0)
+        else
+            null;
+        self.saved[self.saved_count] = scan;
+        self.saved_count += 1;
+        self.mutex.unlock();
+        if (evicted) |old| old.deinit();
     }
 
     fn deinit(self: *MediaWindowCaptureCache) void {
-        if (self.saved) |*saved| saved.deinit(saved.arena.child_allocator);
+        for (self.saved[0..self.saved_count]) |scan| scan.deinit();
     }
 };
 
@@ -32328,37 +32357,43 @@ fn ensureMediaWindowOutputs(runtime: *EnrichmentRuntime, a: Allocator, input: *@
     const owner = assetProviderRequestContext(runtime);
     const owned = input.token.arena.allocator();
     const authority: ordered_publication.Authority = .{ .namespace = input.token.namespace, .epoch = input.token.epoch, .catalog_digest = input.token.catalog_digest };
+    // The document materialization position fences every artifact write
+    // when an older binding has no per-member parent stamp.
+    const position: struct { parent: bool, revision: ?ordered_publication.Position } = blk: {
+        var read = try runtime.store.beginProbe();
+        defer read.abort();
+        if (try @import("../artifact_catalog_activation.zig").windowSetFenced(&read, authority))
+            break :blk .{ .parent = true, .revision = parent_revision };
+        break :blk .{ .parent = false, .revision = try ordered_publication.materializationRevision(&read, input.token.namespace, input.token.source.document_key) };
+    };
     var hash = std.crypto.hash.Blake3.init(.{});
     hash.update(&authority.namespace);
     hash.update(&std.mem.toBytes(authority.epoch));
     hash.update(&authority.catalog_digest);
-    hash.update(&.{@intFromBool(parent_revision != null)});
-    if (parent_revision) |position| hash.update(&(try position.encode()));
+    hash.update(&.{ @intFromBool(position.parent), @intFromBool(position.revision != null) });
+    if (position.revision) |revision| hash.update(&(try revision.encode()));
     hash.update(input.output_key);
     var identity: ordered_publication.Digest = undefined;
     hash.final(&identity);
-    const backing = runtime.alloc;
     var member: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(input.output_key, &member, .{});
-    var scan = runtime.media_window_capture.take(backing, member, identity) orelse MediaWindowCapture{
-        .arena = .init(backing),
-        .identity = identity,
-        .member = member,
-    };
+    const scan = runtime.media_window_capture.take(member, identity) orelse try MediaWindowCapture.create(runtime, member, identity);
     input.large_window_capture = scan.resume_key.items.len != 0;
     var retained = false;
-    defer if (!retained) scan.deinit(backing);
+    defer if (!retained) scan.deinit();
     // Release the snapshot between pages. Preserve revision-fenced progress
     // across deadlines and voluntarily yield wide scans back to replay.
     var pages: usize = 0;
     while (true) : (pages += 1) {
-        if (pages == 4 and scan.canResume() and runtime.media_window_capture.save(scan)) {
+        if (pages == 4 and scan.resume_key.items.len != 0) {
+            runtime.media_window_capture.save(scan);
             retained = true;
             return error.ArtifactPublicationPending;
         }
         checkEnrichmentExecutionContext(runtime, owner) catch |err| {
-            if (scan.canResume() and (isEnrichmentControlError(err) or isOperationInterruption(err))) {
-                retained = runtime.media_window_capture.save(scan);
+            if (scan.resume_key.items.len != 0 and (isEnrichmentControlError(err) or isOperationInterruption(err))) {
+                runtime.media_window_capture.save(scan);
+                retained = true;
             }
             return err;
         };
@@ -32366,8 +32401,8 @@ fn ensureMediaWindowOutputs(runtime: *EnrichmentRuntime, a: Allocator, input: *@
         defer read.abort();
         if (!std.meta.eql(parent_revision, try ordered_publication.artifactRevision(&read, input.token.namespace, input.output_key)))
             return error.EnrichmentSourceChanged;
-        if (scan.resume_key.items.len == 0)
-            scan.revision_fenced = try @import("../artifact_catalog_activation.zig").windowSetFenced(&read, authority);
+        if (!position.parent and !std.meta.eql(position.revision, try ordered_publication.materializationRevision(&read, input.token.namespace, input.token.source.document_key)))
+            return error.EnrichmentSourceChanged;
         var cursor = try read.openCursor();
         defer cursor.close();
         cursor.setKeysOnly();
@@ -32378,12 +32413,17 @@ fn ensureMediaWindowOutputs(runtime: *EnrichmentRuntime, a: Allocator, input: *@
         while (row) |entry| : (row = try cursor.next()) {
             if (!std.mem.startsWith(u8, entry.key, child_prefix)) break;
             if (budget.exhausted()) {
-                try scan.resume_key.resize(backing, entry.key.len);
+                scan.resume_key.resize(scan.allocator(), entry.key.len) catch |err| return scan.admissionError(err);
                 @memcpy(scan.resume_key.items, entry.key);
                 break;
             }
             budget.visit(entry.key.len);
             if (!internal_keys.matchesDerivedEmbeddingArtifactName(entry.key, input.token.artifact_name)) continue;
+            if (input.effect_protocol < @import("../artifact_inventory.zig").scalar_window_retirement_protocol) {
+                input.media_window_layout = true;
+                input.old_window_outputs = &.{};
+                return; // One owned child is sufficient to request the upgrade.
+            }
             if (scan.records.items.len + input.token.preconditions.items.len + input.token.reads.items.len >= ordered_publication.max_source_documents or
                 scan.key_bytes +| entry.key.len +| input.token.read_key_bytes > ordered_publication.max_identity_bytes)
                 return error.ResourceBudgetExceeded;
@@ -32392,12 +32432,13 @@ fn ensureMediaWindowOutputs(runtime: *EnrichmentRuntime, a: Allocator, input: *@
             var content: ordered_publication.Digest = undefined;
             std.crypto.hash.sha2.Sha256.hash(raw, &content, .{});
             const memory = scan.arena.allocator();
-            try scan.records.append(memory, .{
-                .key = try memory.dupe(u8, entry.key),
+            const stored_key = memory.dupe(u8, entry.key) catch |err| return scan.admissionError(err);
+            scan.records.append(memory, .{
+                .key = stored_key,
                 .content_digest = content,
                 .input_position = try ordered_publication.artifactRevision(&read, input.token.namespace, entry.key),
                 .source_index = 0,
-            });
+            }) catch |err| return scan.admissionError(err);
             scan.key_bytes += entry.key.len;
         }
         if (row) |entry| if (std.mem.startsWith(u8, entry.key, child_prefix)) {
@@ -50952,6 +50993,14 @@ test "model aware media ordered vector windows are searchable with exact clocks 
     const a = std.testing.allocator;
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const manifests = @import("../artifact_chunk_manifest.zig");
+    const Deadline = struct {
+        calls: usize = 0,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.calls > 1) return error.DeadlineExceeded;
+        }
+    };
     const Harness = struct {
         db: ?*db_mod.DB = null,
         next_index: u64 = 4,
@@ -51130,6 +51179,33 @@ test "model aware media ordered vector windows are searchable with exact clocks 
     defer enrichment_types.freeGeneratedRequest(a, vector_request);
     try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true, .lease_ttl_ms = 600_000 });
     const runtime = db.enrichment_runtime.?;
+    {
+        var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 4096 } });
+        defer manager.deinit(a);
+        const previous_manager = runtime.config.resource_manager;
+        runtime.config.resource_manager = &manager;
+        defer runtime.config.resource_manager = previous_manager;
+        const scan = try MediaWindowCapture.create(runtime, @splat(1), @splat(2));
+        defer scan.deinit();
+        scan.resume_key.resize(scan.allocator(), 64 * 1024) catch |err| {
+            try std.testing.expectEqual(error.ResourceBudgetExceeded, scan.admissionError(err));
+        };
+        try std.testing.expectEqual(@as(usize, 0), scan.resume_key.items.len);
+    }
+    {
+        // The former slot and per-checkpoint byte ceiling cannot discard a
+        // second document or a continuation already admitted by the manager.
+        const first = try MediaWindowCapture.create(runtime, @splat(1), @splat(11));
+        try first.resume_key.resize(first.allocator(), 2 * 1024 * 1024 + 1);
+        runtime.media_window_capture.save(first);
+        const second = try MediaWindowCapture.create(runtime, @splat(2), @splat(22));
+        runtime.media_window_capture.save(second);
+        const resumed = runtime.media_window_capture.take(@splat(1), @splat(11)) orelse return error.TestUnexpectedResult;
+        defer resumed.deinit();
+        try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024 + 1), resumed.resume_key.items.len);
+        const other = runtime.media_window_capture.take(@splat(2), @splat(22)) orelse return error.TestUnexpectedResult;
+        defer other.deinit();
+    }
     try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
     const member = try internal_keys.chunkArtifactKeyAlloc(a, "doc", "chunks", 0);
     defer a.free(member);
@@ -51168,6 +51244,31 @@ test "model aware media ordered vector windows are searchable with exact clocks 
         defer a.free(checkpoint);
         try storePutBatchWithRetry(runtime, &.{ .{ .key = page_key, .value = page }, .{ .key = pass_key, .value = checkpoint } }, &.{});
         if (round == 0) {
+            // At the older floor the parent stamp is unavailable. Foreign
+            // rows still resume under the document materialization revision.
+            try harness.writeForeignWindows(a, member, "foreign-vector");
+            {
+                var older = blk: {
+                    var read = try runtime.store.beginRead();
+                    defer read.abort();
+                    var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+                    defer plan.release();
+                    break :blk (try @import("../artifact_chunk_vector_publication.zig").capture(a, &read, vector_request, plan.plan(), member)).?;
+                };
+                defer older.deinit();
+                {
+                    var deadline: Deadline = .{};
+                    const previous = runtime.active_provider_guard;
+                    defer runtime.active_provider_guard = previous;
+                    runtime.active_provider_guard.cancellation = .{ .ptr = &deadline, .check_fn = Deadline.check };
+                    try std.testing.expectError(error.EnrichmentWaitTimeout, ensureMediaWindowOutputs(runtime, a, &older));
+                    try std.testing.expect(runtime.media_window_capture.saved_count != 0);
+                }
+                try ensureMediaWindowOutputs(runtime, a, &older);
+                try std.testing.expectEqual(@as(usize, 0), older.old_window_outputs.?.len);
+                try std.testing.expectEqual(@as(usize, 0), runtime.media_window_capture.saved_count);
+            }
+            try harness.writeForeignWindows(a, member, null);
             const calls = harness.calls;
             try std.testing.expectError(error.ArtifactPublicationPending, processOrderedChunkVectorWithAllocator(runtime, a, vector_request, provider, null, &.{"vectors"}));
             try std.testing.expectEqual(@as(usize, 1), harness.protocol_requests);
@@ -51265,7 +51366,10 @@ test "model aware media ordered vector windows are searchable with exact clocks 
             input.effect_protocol = retirement_protocol - 1;
             try std.testing.expectError(error.ArtifactPublicationPending, enqueueScalarChunkVector(runtime, &input, vector, true));
             try std.testing.expectEqual(calls, harness.calls);
+            try std.testing.expect(input.media_window_layout);
+            try std.testing.expectEqual(@as(usize, 0), input.old_window_outputs.?.len);
             input.effect_protocol = retirement_protocol;
+            input.old_window_outputs = null;
             const phantom_member = try internal_keys.mediaWindowChildKeyAlloc(a, member, 130);
             defer a.free(phantom_member);
             const phantom = try internal_keys.derivedEmbeddingArtifactKeyAlloc(a, phantom_member, "model");
@@ -51335,23 +51439,15 @@ test "model aware media ordered vector windows are searchable with exact clocks 
                 _ = try read.get(phantom);
             }
             {
-                const Deadline = struct {
-                    calls: usize = 0,
-                    fn check(raw: *const anyopaque) !void {
-                        const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
-                        self.calls += 1;
-                        if (self.calls > 1) return error.DeadlineExceeded;
-                    }
-                };
                 var deadline: Deadline = .{};
                 const previous = runtime.active_provider_guard;
                 defer runtime.active_provider_guard = previous;
                 runtime.active_provider_guard.cancellation = .{ .ptr = &deadline, .check_fn = Deadline.check };
                 try std.testing.expectError(error.EnrichmentWaitTimeout, ensureMediaWindowOutputs(runtime, a, &final));
-                try std.testing.expect(runtime.media_window_capture.saved.?.resume_key.items.len != 0);
+                try std.testing.expect(runtime.media_window_capture.saved[0].resume_key.items.len != 0);
             }
             try std.testing.expectError(error.ArtifactPublicationPending, enqueueScalarChunkVector(runtime, &final, vector, true));
-            try std.testing.expect(runtime.media_window_capture.saved == null);
+            try std.testing.expect(runtime.media_window_capture.saved_count == 0);
             const retired = try storeGetOptionalAllocWithRetry(runtime, phantom);
             defer if (retired) |value| runtime.alloc.free(value);
             try std.testing.expect(retired == null);
@@ -51422,6 +51518,23 @@ test "model aware media ordered vector windows are searchable with exact clocks 
             }
         }
     }
+    const scalar = try internal_keys.derivedEmbeddingArtifactKeyAlloc(a, member, "model");
+    defer a.free(scalar);
+    const witness = @import("../artifact_chunk_vector_publication.zig").emptyWindowKey(catalog.namespace, scalar);
+    {
+        var write = try db.core.store.beginWriteTxn();
+        errdefer write.abort();
+        _ = try write.get(&witness);
+        try write.delete(scalar);
+        const receipts = @import("../apply_receipts.zig");
+        var receipt_bytes: [receipts.ordered_apply_receipt_value_len]u8 = undefined;
+        const receipt = receipts.orderedApplyReceiptWrite(.{ .term = 1, .index = harness.next_index }, &receipt_bytes);
+        try write.put(receipt.key, receipt.value);
+        try write.commit();
+    }
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectError(error.NotFound, read.get(&witness));
 }
 
 test "model aware media label batches capture one vector space and fence it before publication" {
