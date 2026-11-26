@@ -172,6 +172,19 @@ pub fn packetGeometrySupported(key_heads: usize, value_heads: usize, dim: usize,
     return dim == 128 and value_dim == 128 and conv_kernel == 4 and key_heads == 16 and (value_heads == 16 or value_heads == 32);
 }
 
+/// The convolution and recurrent intermediates are private to the packet
+/// and retire together after submission.
+pub const PacketScratch = struct {
+    core_offset: usize,
+    bytes: usize,
+
+    pub fn init(rows: usize, channels: usize, width: usize) !PacketScratch {
+        const core_offset = try std.math.mul(usize, try std.math.mul(usize, rows, channels), @sizeOf(f32));
+        const core_bytes = try std.math.mul(usize, try std.math.mul(usize, rows, width), @sizeOf(f32));
+        return .{ .core_offset = core_offset, .bytes = try std.math.add(usize, core_offset, core_bytes) };
+    }
+};
+
 pub const Module = struct {
     program: Program = .{},
     bf16_prefill: ?@import("recurrent_prefill.zig").Module = null,

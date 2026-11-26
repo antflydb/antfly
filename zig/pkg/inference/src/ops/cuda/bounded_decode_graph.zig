@@ -1003,3 +1003,16 @@ test "batched CUDA attention scratch packs exact chunk values and statistics" {
     }
     try std.testing.expectError(error.InvalidShape, ScratchLayout.init(2, 8, 2, 256, 0, false));
 }
+
+test "CUDA recurrent packet scratch packs aligned convolution and recurrent planes" {
+    const Scratch = @import("gated_delta.zig").PacketScratch;
+    for ([_]usize{ 16, 32 }) |value_heads| {
+        const channels = (2 * 16 + value_heads) * 128;
+        const width = value_heads * 128;
+        const layout = try Scratch.init(65, channels, width);
+        try std.testing.expectEqual(65 * channels * @sizeOf(f32), layout.core_offset);
+        try std.testing.expectEqual(65 * width * @sizeOf(f32), layout.bytes - layout.core_offset);
+        try std.testing.expectEqual(@as(usize, 0), layout.core_offset % 256);
+    }
+    try std.testing.expectError(error.Overflow, Scratch.init(std.math.maxInt(usize), 2, 1));
+}

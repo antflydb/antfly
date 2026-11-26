@@ -5302,10 +5302,9 @@ pub const CudaCompute = struct {
         errdefer cb.free(output);
         const fused_decode = self.lighton_fused_gdn_decode_enabled and self.ctx.info.compute_major >= 8;
         const only_decode = fused_decode and rows == states.len;
-        const conv = if (only_decode) null else try allocUninitF32ShapeOp(self, &.{ @intCast(rows), @intCast(channels) });
-        defer if (conv) |tensor| cb.free(tensor);
-        const core = if (only_decode) null else try allocUninitF32ShapeOp(self, &.{ @intCast(rows), @intCast(width) });
-        defer if (core) |tensor| cb.free(tensor);
+        const scratch_layout = if (only_decode) null else try @import("gated_delta.zig").PacketScratch.init(rows, channels, width);
+        var scratch = if (scratch_layout) |layout| try allocDeviceBuffer(self, layout.bytes) else buffer_mod.DeviceBuffer{};
+        defer releaseDeviceBuffer(self, &scratch);
         var packets: [2]@import("gated_delta.zig").RaggedParams = undefined;
         var packet_rows: [2]u32 = @splat(0);
         var packet_scratch: [2]usize = @splat(0);
@@ -5319,13 +5318,13 @@ pub const CudaCompute = struct {
             var params = @import("gated_delta.zig").RaggedParams{ .base = .{
                 .mixed = tensorFromCt(request.mixed).buffer.ptr + row_offset * channels * 4,
                 .conv_weight = states[first].weights[0].ptr,
-                .conv = if (conv) |tensor| tensorFromCt(tensor).buffer.ptr + row_offset * channels * 4 else 0,
+                .conv = if (scratch_layout != null) scratch.ptr + row_offset * channels * 4 else 0,
                 .z = tensorFromCt(request.z).buffer.ptr + row_offset * width * 4,
                 .beta = tensorFromCt(request.beta).buffer.ptr + row_offset * vh * 4,
                 .a = tensorFromCt(request.a).buffer.ptr + row_offset * vh * 4,
                 .a_log = states[first].weights[1].ptr,
                 .dt_bias = states[first].weights[2].ptr,
-                .core = if (core) |tensor| tensorFromCt(tensor).buffer.ptr + row_offset * width * 4 else 0,
+                .core = if (scratch_layout) |layout| scratch.ptr + layout.core_offset + row_offset * width * 4 else 0,
                 .norm_weight = states[first].weights[3].ptr,
                 .out = tensorFromCt(output).buffer.ptr + row_offset * width * 4,
                 .key_heads = @intCast(kh),
@@ -5445,21 +5444,20 @@ pub const CudaCompute = struct {
         for (states) |state| try self.prepareLightOnRecurrentState(state, weights, weight_counts, kh, vh, pre_admitted);
         const output = (try allocUninitF32ShapeOp(self, &.{ @intCast(rows), @intCast(width) })).?;
         errdefer cb.free(output);
-        const conv = (try allocUninitF32ShapeOp(self, &.{ @intCast(rows), @intCast(channels) })).?;
-        defer cb.free(conv);
-        const core = (try allocUninitF32ShapeOp(self, &.{ @intCast(rows), @intCast(width) })).?;
-        defer cb.free(core);
+        const scratch_layout = try @import("gated_delta.zig").PacketScratch.init(rows, channels, width);
+        var scratch = try allocDeviceBuffer(self, scratch_layout.bytes);
+        defer releaseDeviceBuffer(self, &scratch);
         var params = @import("gated_delta.zig").PrefixBatchParams{
             .base = .{
                 .mixed = tensorFromCt(request.mixed).buffer.ptr,
                 .conv_weight = states[0].weights[0].ptr,
-                .conv = tensorFromCt(conv).buffer.ptr,
+                .conv = scratch.ptr,
                 .z = tensorFromCt(request.z).buffer.ptr,
                 .beta = tensorFromCt(request.beta).buffer.ptr,
                 .a = tensorFromCt(request.a).buffer.ptr,
                 .a_log = states[0].weights[1].ptr,
                 .dt_bias = states[0].weights[2].ptr,
-                .core = tensorFromCt(core).buffer.ptr,
+                .core = scratch.ptr + scratch_layout.core_offset,
                 .norm_weight = states[0].weights[3].ptr,
                 .out = tensorFromCt(output).buffer.ptr,
                 .key_heads = @intCast(kh),
