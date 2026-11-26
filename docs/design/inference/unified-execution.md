@@ -1213,8 +1213,15 @@ processed fused suffixes after encoder retirement. The physical KV
 reservation followed actual Metal buffer aliases until the SDK retired
 their backing. The remaining skips comprise 12 CUDA fixtures and the
 opt-in Metal pipelined-runtime fixture. These runs cover retirement and
-quota lifetimes alongside released T5-small correctness. The current-head
-Spark rerun and broader released-model performance matrix remain open.
+quota lifetimes alongside released T5-small correctness.
+
+On Spark GB10 at `41465abfe9`, the CUDA retirement cohort passed 124 of
+140 selected tests. The released merged T5-small decoder processed fused
+suffixes after encoder retirement using the same ONNX artifact as the
+local runs. Physical CUDA checks also covered bank-free failure, audio
+arena output custody and detached NVDEC retirement. The 16 skips were
+15 Metal cases and the CUDA-disabled video fixture. The broader
+released-model performance matrix remains open.
 
 At `552aba3e45`, the focused Spark GB10 cohort passed all 15 capture and
 workspace tests with zero skips. The physical tests covered immutable
