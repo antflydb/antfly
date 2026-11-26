@@ -1506,6 +1506,24 @@ HTTP p50 was 223.14 → 223.59 ms (+0.20%) and p95 was 225.20 → 224.64 ms
 CUDA. Both control and latency gates passed. The median difference
 exceeded the observed 0.11% same-binary spread.
 
+A ten-workload rerun of `4c4c7493bb` against the same frozen main used the
+default library path. All 120 model-and-arm receipts selected CUDA.
+Outputs matched between the two binaries in every arm and every
+crossover case passed both latency ratios. The GLiNER same-binary
+median spread was 5.53%, above the 5% control limit. With 40 warm samples
+per engine, its isolated repeat measured 12.68 → 12.58 ms at p50 and
+13.51 → 13.62 ms at p95, with 1.91% same-binary median spread. Both
+control and crossover thresholds passed on the repeat.
+
+The default library path selected EmbeddingGemma2's F32 audio fallback.
+The previous reference used the source BF16 recipe with cuDNN 9.19.
+On frozen main, the same text request returned all 768 coordinates
+identically under both policies. Its public model identity accounts for
+the different digest, and the cuDNN run reproduced the historical digest.
+The default-path focused comparison matched the earlier fallback digest
+and passed all control and crossover gates for both models. The full
+matrix with cuDNN loaded is separate.
+
 The same Spark binaries also served grouped EmbeddingGemma2 image, audio,
 and video requests through the public embedding endpoint. Each crossover
 engine contributed 16 measurements per modality, with two warmups per
