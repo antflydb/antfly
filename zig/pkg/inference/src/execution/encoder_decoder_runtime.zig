@@ -426,19 +426,20 @@ pub fn residentVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Ses
         const actual = (try outputs.backend.tensorShapeFixed(3, logits)) orelse return error.InvalidDecoderOutput;
         if (!std.mem.eql(i64, &expected, &actual)) return error.InvalidDecoderOutput;
     }
+    const knows_dtype = outputs.backend.vtable.tensorDType != null;
+    if (knows_dtype and try outputs.backend.tensorDType(logits) != .f32) return error.InvalidDecoderOutput;
     if (control) |active| try active.check();
     const values = readback: {
         var guard = if (control) |active| try active.enterUninterruptible(decoder.interruption()) else null;
         defer if (guard) |*scope| scope.deinit();
         // A single suffix row is already the complete requested output.
         // Keep the producer's ownership and read it without a temporary view.
-        const direct = query_rows == 1 and outputs.backend.vtable.tensorDType != null;
+        const direct = query_rows == 1 and knows_dtype;
         const row = if (direct) logits else selected: {
             const slice = outputs.backend.vtable.sliceRows2D orelse return error.UnexpectedResidentStageDecline;
             break :selected try slice(outputs.backend.ptr, logits, query_rows - 1, 1, vocab);
         };
         defer if (!direct) outputs.backend.free(row);
-        if (direct and try outputs.backend.tensorDType(logits) != .f32) return error.InvalidDecoderOutput;
         const result = downloaded: {
             if (outputs.backend.vtable.kernels) |kernels| {
                 if (kernels.accepts(outputs.backend.vtable) and kernels.readFloat32Into != null) {
@@ -597,6 +598,13 @@ test "encoder decoder resident stages retain hidden state and materialize only t
         defer a.free(retained);
         try std.testing.expectEqualSlices(f32, &.{ 0, 1, 2, 0, 3, 0, 1, 0 }, retained);
         if (kind == .native) {
+            var invalid = encoded.resident.values;
+            const integer_logits = (try invalid.backend.fromInt32Shape(&.{ 0, 1, 2, 3, 4, 5, 6, 7 }, &.{ 1, 2, 4 })) orelse return error.TestUnexpectedResult;
+            defer invalid.backend.free(integer_logits);
+            var invalid_values = [_]@import("../ops/ops.zig").CT{integer_logits};
+            invalid.outputs = &invalid_values;
+            try std.testing.expectError(error.InvalidDecoderOutput, residentVocabularyRow(a, decoder, &invalid, 0, 2, 4, control, false));
+
             const Case = struct {
                 fn run(allocator: std.mem.Allocator, target: backends.Session, values: *const EncoderOutputs) !void {
                     const token = try finalGreedyToken(allocator, target, values, &.{ 0, 1 }, &.{ 1, 1 }, 4, null);
