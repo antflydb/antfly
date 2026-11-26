@@ -53093,11 +53093,12 @@ test "Metal routed block-scaled projection groups frequent experts and preserves
     var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
     defer provider.deinitOwned();
     const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
-    const rows, const width, const columns, const experts = .{ 528, 32, 8, 4 };
+    const rows, const width, const columns, const experts = .{ 1040, 32, 8, 5 };
     const valid_ids = [_]u32{ 0, 1, 0, 2, 3, 0, 3, 3, 1, 0, 0, 3, 1, 2, 1, 0 };
     var ids: [rows]u32 = undefined;
     @memcpy(ids[0..valid_ids.len], &valid_ids);
-    for (ids[valid_ids.len..], 0..) |*id, i| id.* = experts + @as(u32, @intCast(i % 3));
+    for (ids[valid_ids.len .. rows - 8], 0..) |*id, i| id.* = experts + @as(u32, @intCast(i % 3));
+    @memset(ids[rows - 8 ..], experts - 1);
     var input: [rows * width]u16 = undefined;
     for (&input, 0..) |*bits, i| bits.* = if (i % 3 == 0) 0x4000 else 0xbf80;
     var values: [experts * columns * width / 2]u8 = undefined;
@@ -53150,6 +53151,7 @@ test "Metal routed block-scaled projection groups frequent experts and preserves
     try std.testing.expectEqual(@as(u32, 4), groups[9]);
     try std.testing.expectEqual(@as(u32, 0), groups[18]);
     try std.testing.expectEqual(@as(u32, 1), groups[27]);
+    try std.testing.expectEqual(@as(u32, 8), groups[(rows - 8) * 9]);
 }
 
 test "Metal routed block-scaled projection chains the complete expert stage in one frame" {

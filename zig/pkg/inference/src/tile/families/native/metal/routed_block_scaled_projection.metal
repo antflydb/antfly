@@ -233,20 +233,51 @@ kernel void antfly_routed_build_groups(
     antfly_write_routed_group(groups, pending, count);
 }
 
-// native-program:entry antfly_routed_block_scaled_bf16_grouped
-kernel void antfly_routed_block_scaled_bf16_grouped(
-    device const bfloat *input [[buffer(0)]],
-    device const uchar *values [[buffer(1)]],
-    device const uchar *scales [[buffer(2)]],
-    device const uint *expert_ids [[buffer(3)]],
-    device const float *outer_amax [[buffer(4)]],
-    device const float *outer_denominator [[buffer(5)]],
-    device bfloat *output [[buffer(6)]],
-    device const uint *groups [[buffer(7)]],
-    constant RoutedBlockScaledParams &p [[buffer(8)]],
-    uint2 group [[threadgroup_position_in_grid]],
-    uint warp [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]
+template<bool full_group>
+inline void antfly_routed_group_dot(
+    device const bfloat *input, device const uchar *weight, device const uchar *weight_scales,
+    device bfloat *output, device const uint *entry, constant RoutedBlockScaledParams &p,
+    uint count, uint column, uint lane, bool fp4, float outer
+) {
+    uint rows[8];
+    float accum[8] = {0.0f};
+    ulong offsets[8];
+    #pragma unroll
+    for (uint i = 0u; i < 8u; ++i) {
+        rows[i] = (full_group || i < count) ? entry[1u + i] : 0u;
+        offsets[i] = ulong(rows[i] / p.input_repeat) * p.input_width;
+    }
+    for (uint k = lane; k < p.input_width; k += 32u) {
+        const float w = float(antfly_routed_weight(weight, weight_scales, k, fp4, outer));
+        // Keep the per-lane accumulation and reduction order of the one-row
+        // kernel. Only the decoded weight is shared across grouped rows.
+        #pragma unroll
+        for (uint i = 0u; i < 8u; ++i)
+            if ((full_group || i < count)) accum[i] = fma(float(input[offsets[i] + k]), w, accum[i]);
+    }
+    #pragma unroll
+    for (uint i = 0u; i < 8u; ++i) {
+        if ((full_group || i < count)) {
+            const float dot = simd_sum(accum[i]);
+            if (lane == 0u) output[ulong(rows[i]) * p.output_width + column] = bfloat(dot);
+        }
+    }
+}
+
+template<bool specialize>
+inline void antfly_routed_group_projection(
+    device const bfloat *input,
+    device const uchar *values,
+    device const uchar *scales,
+    device const uint *expert_ids,
+    device const float *outer_amax,
+    device const float *outer_denominator,
+    device bfloat *output,
+    device const uint *groups,
+    constant RoutedBlockScaledParams &p,
+    uint2 group,
+    uint warp,
+    uint lane
 ) {
     const uint column = group.x * 4u + warp;
     const uint route = group.y;
@@ -284,27 +315,47 @@ kernel void antfly_routed_block_scaled_bf16_grouped(
         return;
     }
 
-    uint rows[8];
-    float accum[8] = {0.0f};
-    ulong offsets[8];
-    #pragma unroll
-    for (uint i = 0u; i < 8u; ++i) {
-        rows[i] = i < count ? entry[1u + i] : 0u;
-        offsets[i] = ulong(rows[i] / p.input_repeat) * p.input_width;
+    if (specialize && count == 8u) {
+        antfly_routed_group_dot<true>(input, weight, weight_scales, output, entry, p, count, column, lane, fp4, outer);
+    } else {
+        antfly_routed_group_dot<false>(input, weight, weight_scales, output, entry, p, count, column, lane, fp4, outer);
     }
-    for (uint k = lane; k < p.input_width; k += 32u) {
-        const float w = float(antfly_routed_weight(weight, weight_scales, k, fp4, outer));
-        // Keep the per-lane accumulation and reduction order of the one-row
-        // kernel. Only the decoded weight is shared across grouped rows.
-        #pragma unroll
-        for (uint i = 0u; i < 8u; ++i)
-            if (i < count) accum[i] = fma(float(input[offsets[i] + k]), w, accum[i]);
-    }
-    #pragma unroll
-    for (uint i = 0u; i < 8u; ++i) {
-        if (i < count) {
-            const float dot = simd_sum(accum[i]);
-            if (lane == 0u) output[ulong(rows[i]) * p.output_width + column] = bfloat(dot);
-        }
-    }
+}
+
+// native-program:entry antfly_routed_block_scaled_bf16_grouped
+kernel void antfly_routed_block_scaled_bf16_grouped(
+    device const bfloat *input [[buffer(0)]],
+    device const uchar *values [[buffer(1)]],
+    device const uchar *scales [[buffer(2)]],
+    device const uint *expert_ids [[buffer(3)]],
+    device const float *outer_amax [[buffer(4)]],
+    device const float *outer_denominator [[buffer(5)]],
+    device bfloat *output [[buffer(6)]],
+    device const uint *groups [[buffer(7)]],
+    constant RoutedBlockScaledParams &p [[buffer(8)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint warp [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    antfly_routed_group_projection<false>(input, values, scales, expert_ids, outer_amax,
+        outer_denominator, output, groups, p, group, warp, lane);
+}
+
+// native-program:entry antfly_routed_block_scaled_bf16_grouped_wide
+kernel void antfly_routed_block_scaled_bf16_grouped_wide(
+    device const bfloat *input [[buffer(0)]],
+    device const uchar *values [[buffer(1)]],
+    device const uchar *scales [[buffer(2)]],
+    device const uint *expert_ids [[buffer(3)]],
+    device const float *outer_amax [[buffer(4)]],
+    device const float *outer_denominator [[buffer(5)]],
+    device bfloat *output [[buffer(6)]],
+    device const uint *groups [[buffer(7)]],
+    constant RoutedBlockScaledParams &p [[buffer(8)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint warp [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    antfly_routed_group_projection<true>(input, values, scales, expert_ids, outer_amax,
+        outer_denominator, output, groups, p, group, warp, lane);
 }

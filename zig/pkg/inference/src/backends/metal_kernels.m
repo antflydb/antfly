@@ -1778,6 +1778,7 @@ typedef struct termite_metal_decode_runtime {
     bool prefer_dense_mps_linear;
     id<MTLComputePipelineState> routed_block_scaled_pipelines[4];
     id<MTLComputePipelineState> routed_group_build_pipeline, routed_group_projection_pipeline;
+    id<MTLComputePipelineState> routed_group_projection_wide_pipeline;
     id<MTLComputePipelineState> paged_relative_bf16_pipelines[7];
     id<MTLComputePipelineState> pack_kv_q4_pipeline;
     id<MTLComputePipelineState> causal_depthwise4_bf16_pipeline;
@@ -13974,21 +13975,51 @@ static NSString *termite_metal_shader_source(void) {
            "    antfly_write_routed_group(groups, pending, count);\n"
            "}\n"
            "\n"
-           // tile-codegen:end expert.projection.block_scaled.4 family
-           // tile-codegen:begin expert.projection.block_scaled.5 family (do not edit; run: zig build tile-kernel-codegen -- --write)
-           "kernel void antfly_routed_block_scaled_bf16_grouped(\n"
-           "    device const bfloat *input [[buffer(0)]],\n"
-           "    device const uchar *values [[buffer(1)]],\n"
-           "    device const uchar *scales [[buffer(2)]],\n"
-           "    device const uint *expert_ids [[buffer(3)]],\n"
-           "    device const float *outer_amax [[buffer(4)]],\n"
-           "    device const float *outer_denominator [[buffer(5)]],\n"
-           "    device bfloat *output [[buffer(6)]],\n"
-           "    device const uint *groups [[buffer(7)]],\n"
-           "    constant RoutedBlockScaledParams &p [[buffer(8)]],\n"
-           "    uint2 group [[threadgroup_position_in_grid]],\n"
-           "    uint warp [[simdgroup_index_in_threadgroup]],\n"
-           "    uint lane [[thread_index_in_simdgroup]]\n"
+           "template<bool full_group>\n"
+           "inline void antfly_routed_group_dot(\n"
+           "    device const bfloat *input, device const uchar *weight, device const uchar *weight_scales,\n"
+           "    device bfloat *output, device const uint *entry, constant RoutedBlockScaledParams &p,\n"
+           "    uint count, uint column, uint lane, bool fp4, float outer\n"
+           ") {\n"
+           "    uint rows[8];\n"
+           "    float accum[8] = {0.0f};\n"
+           "    ulong offsets[8];\n"
+           "    #pragma unroll\n"
+           "    for (uint i = 0u; i < 8u; ++i) {\n"
+           "        rows[i] = (full_group || i < count) ? entry[1u + i] : 0u;\n"
+           "        offsets[i] = ulong(rows[i] / p.input_repeat) * p.input_width;\n"
+           "    }\n"
+           "    for (uint k = lane; k < p.input_width; k += 32u) {\n"
+           "        const float w = float(antfly_routed_weight(weight, weight_scales, k, fp4, outer));\n"
+           "        // Keep the per-lane accumulation and reduction order of the one-row\n"
+           "        // kernel. Only the decoded weight is shared across grouped rows.\n"
+           "        #pragma unroll\n"
+           "        for (uint i = 0u; i < 8u; ++i)\n"
+           "            if ((full_group || i < count)) accum[i] = fma(float(input[offsets[i] + k]), w, accum[i]);\n"
+           "    }\n"
+           "    #pragma unroll\n"
+           "    for (uint i = 0u; i < 8u; ++i) {\n"
+           "        if ((full_group || i < count)) {\n"
+           "            const float dot = simd_sum(accum[i]);\n"
+           "            if (lane == 0u) output[ulong(rows[i]) * p.output_width + column] = bfloat(dot);\n"
+           "        }\n"
+           "    }\n"
+           "}\n"
+           "\n"
+           "template<bool specialize>\n"
+           "inline void antfly_routed_group_projection(\n"
+           "    device const bfloat *input,\n"
+           "    device const uchar *values,\n"
+           "    device const uchar *scales,\n"
+           "    device const uint *expert_ids,\n"
+           "    device const float *outer_amax,\n"
+           "    device const float *outer_denominator,\n"
+           "    device bfloat *output,\n"
+           "    device const uint *groups,\n"
+           "    constant RoutedBlockScaledParams &p,\n"
+           "    uint2 group,\n"
+           "    uint warp,\n"
+           "    uint lane\n"
            ") {\n"
            "    const uint column = group.x * 4u + warp;\n"
            "    const uint route = group.y;\n"
@@ -14026,31 +14057,53 @@ static NSString *termite_metal_shader_source(void) {
            "        return;\n"
            "    }\n"
            "\n"
-           "    uint rows[8];\n"
-           "    float accum[8] = {0.0f};\n"
-           "    ulong offsets[8];\n"
-           "    #pragma unroll\n"
-           "    for (uint i = 0u; i < 8u; ++i) {\n"
-           "        rows[i] = i < count ? entry[1u + i] : 0u;\n"
-           "        offsets[i] = ulong(rows[i] / p.input_repeat) * p.input_width;\n"
-           "    }\n"
-           "    for (uint k = lane; k < p.input_width; k += 32u) {\n"
-           "        const float w = float(antfly_routed_weight(weight, weight_scales, k, fp4, outer));\n"
-           "        // Keep the per-lane accumulation and reduction order of the one-row\n"
-           "        // kernel. Only the decoded weight is shared across grouped rows.\n"
-           "        #pragma unroll\n"
-           "        for (uint i = 0u; i < 8u; ++i)\n"
-           "            if (i < count) accum[i] = fma(float(input[offsets[i] + k]), w, accum[i]);\n"
-           "    }\n"
-           "    #pragma unroll\n"
-           "    for (uint i = 0u; i < 8u; ++i) {\n"
-           "        if (i < count) {\n"
-           "            const float dot = simd_sum(accum[i]);\n"
-           "            if (lane == 0u) output[ulong(rows[i]) * p.output_width + column] = bfloat(dot);\n"
-           "        }\n"
+           "    if (specialize && count == 8u) {\n"
+           "        antfly_routed_group_dot<true>(input, weight, weight_scales, output, entry, p, count, column, lane, fp4, outer);\n"
+           "    } else {\n"
+           "        antfly_routed_group_dot<false>(input, weight, weight_scales, output, entry, p, count, column, lane, fp4, outer);\n"
            "    }\n"
            "}\n"
+           "\n"
+           // tile-codegen:end expert.projection.block_scaled.4 family
+           // tile-codegen:begin expert.projection.block_scaled.5 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "kernel void antfly_routed_block_scaled_bf16_grouped(\n"
+           "    device const bfloat *input [[buffer(0)]],\n"
+           "    device const uchar *values [[buffer(1)]],\n"
+           "    device const uchar *scales [[buffer(2)]],\n"
+           "    device const uint *expert_ids [[buffer(3)]],\n"
+           "    device const float *outer_amax [[buffer(4)]],\n"
+           "    device const float *outer_denominator [[buffer(5)]],\n"
+           "    device bfloat *output [[buffer(6)]],\n"
+           "    device const uint *groups [[buffer(7)]],\n"
+           "    constant RoutedBlockScaledParams &p [[buffer(8)]],\n"
+           "    uint2 group [[threadgroup_position_in_grid]],\n"
+           "    uint warp [[simdgroup_index_in_threadgroup]],\n"
+           "    uint lane [[thread_index_in_simdgroup]]\n"
+           ") {\n"
+           "    antfly_routed_group_projection<false>(input, values, scales, expert_ids, outer_amax,\n"
+           "        outer_denominator, output, groups, p, group, warp, lane);\n"
+           "}\n"
+           "\n"
            // tile-codegen:end expert.projection.block_scaled.5 family
+           // tile-codegen:begin expert.projection.block_scaled.6 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "kernel void antfly_routed_block_scaled_bf16_grouped_wide(\n"
+           "    device const bfloat *input [[buffer(0)]],\n"
+           "    device const uchar *values [[buffer(1)]],\n"
+           "    device const uchar *scales [[buffer(2)]],\n"
+           "    device const uint *expert_ids [[buffer(3)]],\n"
+           "    device const float *outer_amax [[buffer(4)]],\n"
+           "    device const float *outer_denominator [[buffer(5)]],\n"
+           "    device bfloat *output [[buffer(6)]],\n"
+           "    device const uint *groups [[buffer(7)]],\n"
+           "    constant RoutedBlockScaledParams &p [[buffer(8)]],\n"
+           "    uint2 group [[threadgroup_position_in_grid]],\n"
+           "    uint warp [[simdgroup_index_in_threadgroup]],\n"
+           "    uint lane [[thread_index_in_simdgroup]]\n"
+           ") {\n"
+           "    antfly_routed_group_projection<true>(input, values, scales, expert_ids, outer_amax,\n"
+           "        outer_denominator, output, groups, p, group, warp, lane);\n"
+           "}\n"
+           // tile-codegen:end expert.projection.block_scaled.6 family
            // Read one byte from every VM page in a projection-sized no-copy
            // view. The private output is intentionally materialized so the
            // compiler cannot discard the reads as dead work.
@@ -34471,6 +34524,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     for (size_t index = 0; index < 4; ++index) runtime->routed_block_scaled_pipelines[index] = nil;
     runtime->routed_group_build_pipeline = nil;
     runtime->routed_group_projection_pipeline = nil;
+    runtime->routed_group_projection_wide_pipeline = nil;
     for (size_t index = 0; index < 7; ++index) runtime->paged_relative_bf16_pipelines[index] = nil;
     runtime->pack_kv_q4_pipeline = nil;
     runtime->causal_depthwise4_bf16_pipeline = nil;
@@ -37610,9 +37664,17 @@ int antfly_metal_dispatch_routed_block_scaled_bf16(
     const size_t alignments[8] = {2, 1, 1, 4, 4, 4, 2, 4};
     if (views[7].handle && p->rows <= ANTFLY_METAL_ROUTED_GROUP_MAX_ROUTES && !(p->input_width % 32u) && !(p->output_width % 8u)) {
         required[7] = (size_t)p->rows * 9u * sizeof(uint32_t);
+        const MTLSize grid = MTLSizeMake(((size_t)p->output_width + 3u) / 4u, p->rows, 1);
+        const MTLSize threads = MTLSizeMake(128, 1, 1);
+        if (p->rows >= 1024) {
+            const int wide = antfly_metal_encode_typed_stage(runtime, @"antfly_routed_block_scaled_bf16_grouped_wide",
+                &runtime->routed_group_projection_wide_pipeline, views, required, alignments, 8, 1u << 6,
+                p, sizeof(*p), grid, threads);
+            if (wide != -3) return wide;
+        }
         const int grouped = antfly_metal_encode_typed_stage(runtime, @"antfly_routed_block_scaled_bf16_grouped",
             &runtime->routed_group_projection_pipeline, views, required, alignments, 8, 1u << 6,
-            p, sizeof(*p), MTLSizeMake(((size_t)p->output_width + 3u) / 4u, p->rows, 1), MTLSizeMake(128, 1, 1));
+            p, sizeof(*p), grid, threads);
         if (grouped != -3) return grouped;
     }
     return antfly_metal_encode_routed_stage(runtime, 0, views, required, alignments,
