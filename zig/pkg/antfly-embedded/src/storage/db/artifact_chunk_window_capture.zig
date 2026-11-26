@@ -31,6 +31,7 @@ pub const MediaWindowCapture = struct {
     records: std.ArrayList(publication.ArtifactSource) = .empty,
     key_bytes: usize = 0,
     complete: bool = false,
+    saved_at_ns: u64 = 0,
 
     pub fn create(backing: Allocator, manager: ?*resource_manager_mod.ResourceManager, cache: *MediaWindowCaptureCache, member: [32]u8, identity: publication.Digest) !*MediaWindowCapture {
         const scan = try backing.create(MediaWindowCapture);
@@ -78,6 +79,8 @@ pub const MediaWindowCapture = struct {
 };
 
 pub const MediaWindowCaptureCache = struct {
+    pub const idle_timeout_ns = 60 * std.time.ns_per_s;
+
     mutex: std.atomic.Mutex = .unlocked,
     // Oldest first. Several documents can yield in the same replay pass.
     saved: [32]*MediaWindowCapture = undefined,
@@ -136,16 +139,22 @@ pub const MediaWindowCaptureCache = struct {
             .withLocalReclaimer(self, reclaim);
     }
 
-    /// Admit a suspended member without evicting another runnable member.
-    /// When all slots are taken, new wide members retry after admitted
-    /// members finish. They still release the replay worker at the boundary.
-    pub fn saveIfSpace(self: *MediaWindowCaptureCache, scan: *MediaWindowCapture) bool {
+    /// Keep live checkpoints under capacity contention. An abandoned slot
+    /// expires even when its source is never visited again and memory is idle.
+    pub fn saveIfSpace(self: *MediaWindowCaptureCache, scan: *MediaWindowCapture, now_ns: u64) bool {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
-        const previous = if (self.find(scan.member)) |index| self.remove(index) else null;
-        if (self.saved_count == self.saved.len) {
-            self.mutex.unlock();
-            return false;
-        }
+        const previous = if (self.find(scan.member)) |index|
+            self.remove(index)
+        else if (self.saved_count == self.saved.len) blk: {
+            const expired = for (self.saved[0..self.saved_count], 0..) |saved, index| {
+                if (now_ns -| saved.saved_at_ns >= idle_timeout_ns) break index;
+            } else {
+                self.mutex.unlock();
+                return false;
+            };
+            break :blk self.remove(expired);
+        } else null;
+        scan.saved_at_ns = now_ns;
         self.saved[self.saved_count] = scan;
         self.saved_count += 1;
         self.mutex.unlock();
