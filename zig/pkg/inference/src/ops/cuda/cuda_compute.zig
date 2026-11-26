@@ -3831,7 +3831,15 @@ pub const CudaCompute = struct {
             const layout = owner.storage_layout orelse return error.InvalidExecutionPlan;
             const source = layout.readback(owner.metadata);
             const readback_words = host[0 .. source.len / @sizeOf(u32)];
-            try copyToHostTrackedAndSync(self.compute, source, std.mem.sliceAsBytes(readback_words));
+            copyToHostTrackedAndSync(self.compute, source, std.mem.sliceAsBytes(readback_words)) catch |err| {
+                // A driver error can surface after earlier stream work was
+                // queued. Drain before returning this stack-backed receipt.
+                if (err == error.CudaDriverError) {
+                    self.compute.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
+                    burst_value.drained = true;
+                }
+                return err;
+            };
             burst_value.drained = true;
             try layout.publishReadback(readback_words, owner.next_positions[0 .. owner.rows * 3], &owner.progress, first, second);
             const observation = @import("../../execution/runtime_observation.zig");
