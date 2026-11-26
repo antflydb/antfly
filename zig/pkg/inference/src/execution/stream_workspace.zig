@@ -27,6 +27,7 @@ pub const Layout = struct {
     bytes: usize,
     scratch_offset: usize,
     events: usize,
+    recipe: u64,
     output: ?struct { offset: usize, bytes: usize },
     external_output: bool = false,
 };
@@ -57,6 +58,7 @@ pub const Plan = struct {
     peak: usize = 0,
     scratch_peak: usize = 0,
     output: ?usize = null,
+    recipe: u64 = 0,
     sealed: bool = false,
     valid: bool = true,
     fn event(self: *Plan, slot: usize, is_alloc: bool) void {
@@ -171,6 +173,7 @@ pub const Plan = struct {
             self.scratch_peak = @max(self.scratch_peak, allocation.offset + std.mem.alignForward(usize, allocation.bytes, alignment));
         };
         self.sealed = self.valid;
+        if (self.sealed) self.recipe = self.hashEvents(0);
         return self.valid;
     }
 
@@ -181,6 +184,10 @@ pub const Plan = struct {
     /// Identify the sealed event schedule independently of its backing addresses.
     pub fn fingerprint(self: *const Plan, seed: u64) u64 {
         std.debug.assert(self.sealed);
+        return if (seed == 0) self.recipe else self.hashEvents(seed);
+    }
+
+    fn hashEvents(self: *const Plan, seed: u64) u64 {
         var hash = std.hash.Wyhash.init(seed);
         for (self.events[0..self.event_count]) |entry| {
             const encoded: u16 = @bitCast(entry);
@@ -206,6 +213,7 @@ pub const Plan = struct {
             .bytes = prefix_bytes + peak,
             .scratch_offset = prefix_bytes,
             .events = self.event_count,
+            .recipe = self.recipe,
             .output = if (output) |region| .{ .offset = if (external) 0 else prefix_bytes + region.offset, .bytes = region.bytes } else null,
             .external_output = external,
         };
@@ -462,6 +470,20 @@ test "stream workspace binds the exact sealed layout and retains its published s
     try std.testing.expectEqual(@as(DevicePointer, 0x1100), try scope.allocate(4));
     plan.release(1000);
     try std.testing.expectEqualDeep(layout, try plan.layout(alignment));
+}
+
+test "stream workspace refuses to bind a layout admitted for different events" {
+    var admitted: Plan = .{};
+    try admitted.declareScratch(1024);
+    const layout_ = try admitted.layout(0);
+    var replacement: Plan = .{};
+    try replacement.declareScratch(1023);
+    const changed = try replacement.layout(0);
+    try std.testing.expectEqual(layout_.bytes, changed.bytes);
+    try std.testing.expectEqual(layout_.events, changed.events);
+    try std.testing.expect(layout_.recipe != changed.recipe);
+    try std.testing.expectError(error.InvalidExecutionPlan, Scope.bind(&replacement, layout_, 0x1000, layout_.bytes));
+    _ = try Scope.bind(&admitted, layout_, 0x1000, layout_.bytes);
 }
 
 test "stream workspace can exclude its terminal output from the scratch backing" {

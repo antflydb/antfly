@@ -396,7 +396,7 @@ pub const Module = struct {
         if (self.arena.ptr != 0) return;
         const layout = try self.arenaLayout();
         if (!phase.bound or phase.mode != .arena or layout.bytes != phase.old.peak or layout.events != phase.old.events) return error.InvalidPreparedCacheState;
-        const recipe = self.plan.?.fingerprint(0);
+        const recipe = layout.recipe;
         if (phase.old.arena_recipe != recipe) return error.PreparedCachePlanChanged;
         const request = phase.arenaRequest(layout.bytes, layout.events, recipe);
         var lease = try phase.cold.?.funding.?.take(request, request.captured_arena.amounts());
