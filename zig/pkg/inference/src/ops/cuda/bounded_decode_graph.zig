@@ -413,7 +413,10 @@ pub const Module = struct {
         }
         const layout = try self.arenaLayout();
         if (layout.bytes == 0) {
-            if (!phase.bound or phase.mode != .none) return error.InvalidPreparedCacheState;
+            // The reader's ready decision stays under the same owner lanes
+            // and carries no outside funding to bind.
+            if (phase.bound or phase.mode != .none or phase.cold != null) return error.InvalidPreparedCacheState;
+            if (!std.meta.eql(self.snapshot(), phase.old)) return error.PreparedCachePlanChanged;
             self.admitted_arena_layout = layout;
             return;
         }
@@ -826,8 +829,12 @@ test "CUDA bounded decoder binds zero scratch without reserving a device arena" 
     var plan: plan_mod.Plan = .{};
     try plan.declare(&.{}, null);
     var owner: Module = .{ .plan = &plan, .phase = .capture };
-    var phase: GraphPhase = .{ .descriptor = undefined, .bound = true, .mode = .none };
+    var phase: GraphPhase = .{ .descriptor = undefined, .mode = .none, .old = owner.snapshot() };
     var ctx = GraphTestDriver.contextValue();
+    owner.invalidations += 1;
+    try std.testing.expectError(error.PreparedCachePlanChanged, owner.reserveArenaPrepared(&ctx, &phase));
+    try std.testing.expect(owner.admitted_arena_layout == null);
+    phase.old = owner.snapshot();
     try owner.reserveArenaPrepared(&ctx, &phase);
     try owner.reserveArenaPrepared(&ctx, &phase);
     try std.testing.expectEqual(@as(usize, 0), owner.arena.len);
