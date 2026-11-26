@@ -3029,13 +3029,25 @@ pub const WriterAdmission = struct {
 /// Store publication can include durable I/O. Reserve a turn before waiting:
 /// a continuous group-commit writer must not barge ahead of queued vacuum,
 /// reader-release or maintenance work each time it drops the owner mutex.
-/// Keep the existing bounded-spin/yield policy without allocating wait nodes
-/// or depending on a foreign executor's futex namespace.
+/// No wait nodes are allocated and no executor's futex namespace is used:
+/// after a bounded spin, a waiter parks on the OS futex word `wake_epoch`,
+/// which `unlock` bumps and wakes when anyone is parked. Sleeping in fixed
+/// steps instead (`platform_sync.lockYielding`) oversleeps every contended
+/// acquisition, and the writer staging a transaction does that while it
+/// holds the connection's writer lane, behind each group's apply.
 const publication_mutex_owner_tracking = std.debug.runtime_safety;
+const publication_mutex_parks = switch (@import("builtin").os.tag) {
+    .linux, .macos => true,
+    else => false,
+};
 
 const PublicationMutex = struct {
     next_ticket: std.atomic.Value(u64) = .init(0),
     serving_ticket: std.atomic.Value(u64) = .init(0),
+    /// Bumped by `unlock` while `parked` is nonzero; parked waiters wait on
+    /// it. Every waiter wakes and rechecks its ticket: few wait at once.
+    wake_epoch: std.atomic.Value(u32) = .init(0),
+    parked: std.atomic.Value(u32) = .init(0),
     /// Debug-only re-entrancy guard. This is a cooperative, ticketed
     /// yield-spin (`platform_sync.lockYielding`), not a hard OS mutex: a
     /// caller that re-enters `lock()` from the same thread that already
@@ -3077,7 +3089,7 @@ const PublicationMutex = struct {
             }
         };
         var turn = Turn{ .serving = &self.serving_ticket, .ticket = self.next_ticket.fetchAdd(1, .monotonic) };
-        platform_sync.lockYielding(&turn);
+        if (comptime publication_mutex_parks) self.waitTurn(turn.ticket) else platform_sync.lockYielding(&turn);
         if (publication_mutex_owner_tracking) self.owner.store(@as(u64, std.Thread.getCurrentId()), .release);
     }
 
@@ -3088,9 +3100,34 @@ const PublicationMutex = struct {
         return acquired;
     }
 
+    /// Sequentially consistent so that a waiter that missed this turn's
+    /// release is seen as parked (the waiter registers, then rechecks).
+    fn waitTurn(self: *@This(), ticket: u64) void {
+        var spins: u32 = 0;
+        while (self.serving_ticket.load(.acquire) != ticket) {
+            if (spins < 64) {
+                std.atomic.spinLoopHint();
+                spins += 1;
+                continue;
+            }
+            _ = self.parked.fetchAdd(1, .seq_cst);
+            const epoch = self.wake_epoch.load(.seq_cst);
+            // Bounded, so a lost wake costs a retry rather than a hang.
+            if (self.serving_ticket.load(.seq_cst) != ticket) platform_sync.rawFutexWaitShared(&self.wake_epoch.raw, epoch, 10);
+            _ = self.parked.fetchSub(1, .monotonic);
+        }
+    }
+
     pub fn unlock(self: *@This()) void {
         if (publication_mutex_owner_tracking) self.owner.store(no_owner, .release);
-        _ = self.serving_ticket.fetchAdd(1, .release);
+        if (comptime !publication_mutex_parks) {
+            _ = self.serving_ticket.fetchAdd(1, .release);
+            return;
+        }
+        _ = self.serving_ticket.fetchAdd(1, .seq_cst);
+        if (self.parked.load(.seq_cst) == 0) return;
+        _ = self.wake_epoch.fetchAdd(1, .seq_cst);
+        platform_sync.futexWakeShared(&self.wake_epoch.raw);
     }
 };
 
@@ -3243,6 +3280,14 @@ pub const Store = struct {
     /// permanently idle. Guarded by `commit_mutex`, same as the
     /// `ride_along_*` fields above.
     last_mutation_enqueue_ns: i96 = 0,
+    /// The recent pace of foreground (non-ride-along) writes: a moving
+    /// average of the gaps between enqueues longer than the group-commit
+    /// window (`ride_along_idle_ns`), from `last_foreground_enqueue_ns`.
+    /// The idle fold waits for a quiet spell longer than this pace
+    /// (`foldIdleRedoLog`), so a steady low-rate writer is not idle between
+    /// two of its own writes. Guarded by `commit_mutex`.
+    foreground_enqueue_interval_ns: i96 = 0,
+    last_foreground_enqueue_ns: i96 = 0,
     /// §9: last time `maybeCheckpointRedoLogOnIdleTurn` actually ran a
     /// fold (attempted or not -- see that function's own comment), so its
     /// own idle debounce also covers "since the last fold", not just
@@ -5719,16 +5764,46 @@ pub const Store = struct {
         /// of a since-read `activeCheckpoint()` avoids the false positive a
         /// later, unrelated non-durable ride-along commit would otherwise
         /// cause.
+        /// The writer is held by a maintenance turn: this store's own, or,
+        /// for a request forwarded from a maintenance snapshot, the
+        /// snapshot's, which is where that turn's admission marks it.
+        fn heldByMaintenance(self: Ticket) bool {
+            if (self.store.writer_held_by_maintenance.load(.acquire)) return true;
+            const origin = self.origin orelse return false;
+            return origin.writer_held_by_maintenance.load(.acquire);
+        }
+
         pub fn waitSequence(self: Ticket) !u64 {
             const io = self.store.file.runtime();
             self.store.commit_mutex.lockUncancelable(io);
             while (!self.request.done) {
-                if (self.request.ride_along and self.store.writer_held_by_maintenance.load(.acquire)) {
+                if (self.request.ride_along and self.heldByMaintenance()) {
+                    // A leader already draining covers this request: wait
+                    // for its group to complete instead of retrying the
+                    // drain against it.
+                    if (self.store.commit_draining) {
+                        if (comptime @import("builtin").is_test) if (Store.test_maintenance_ride_along_wait_hook) |hook| hook.run(hook.ptr);
+                        self.store.commit_ready.waitTimeout(io, &self.store.commit_mutex, .{ .duration = .{
+                            .raw = .fromNanoseconds(@intCast(self.store.ride_along_idle_ns)),
+                            .clock = .awake,
+                        } }) catch |err| {
+                            self.store.commit_mutex.unlock(io);
+                            return err;
+                        };
+                        continue;
+                    }
+                    // No foreground writer can lead a group while a
+                    // maintenance turn holds the writer, so waiting for one
+                    // only idles the turn with the lane checked out. Lead
+                    // this group without a barrier of its own: a ride-along
+                    // rides the next durable group, and a store with writer
+                    // admission still syncs every group (`applyMutationGroup`).
+                    self.store.commit_draining = true;
                     self.store.commit_mutex.unlock(io);
                     {
                         const flush_scope = wal_trace.scope(.ride_along_flush);
                         defer flush_scope.end();
-                        self.store.forceDrainDurable();
+                        self.store.driveMutationCoordinator(false, null);
                     }
                     self.store.commit_mutex.lockUncancelable(io);
                 } else if (self.request.ride_along) {
@@ -5877,6 +5952,17 @@ pub const Store = struct {
         if (become_leader) self.commit_draining = true;
         const now_ns = std.Io.Clock.awake.now(io).nanoseconds;
         self.last_mutation_enqueue_ns = now_ns;
+        if (!ride_along) {
+            // One write enqueues several requests (its primary commit, queued
+            // index publications, catalog records) within milliseconds. Only
+            // a gap longer than the group-commit window separates two writes.
+            if (self.last_foreground_enqueue_ns != 0) {
+                const interval = now_ns -| self.last_foreground_enqueue_ns;
+                if (interval >= @as(i96, @intCast(self.ride_along_idle_ns)))
+                    self.foreground_enqueue_interval_ns = if (self.foreground_enqueue_interval_ns == 0) interval else @divTrunc(self.foreground_enqueue_interval_ns * 3 + interval, 4);
+            }
+            self.last_foreground_enqueue_ns = now_ns;
+        }
         if (ride_along) {
             self.ride_along_pending_count +|= 1;
             self.ride_along_pending_bytes +|= plan.estimated_bytes;
@@ -5986,6 +6072,9 @@ pub const Store = struct {
     // sync/commit counters' own stage attribution cannot answer "what is
     // actually staged" on its own. Never set outside a test.
     pub var test_ride_along_hook: ?*const fn (estimated_bytes: usize, pending_before: usize) void = null;
+    /// Test hook: a maintenance-held ride-along entering the completion wait
+    /// because another leader owns the drain (called under `commit_mutex`).
+    pub var test_maintenance_ride_along_wait_hook: ?struct { ptr: *anyopaque, run: *const fn (ptr: *anyopaque) void } = null;
 
     // Diagnostic-only: lets `write_amplification_bench_test.zig` classify
     // every KV mutation in a `Txn`'s pending set (primary rows, index-
@@ -6317,9 +6406,17 @@ pub const Store = struct {
         // instead of batching across many. See `redo_idle_checkpoint_ns`'s
         // own doc comment for the value and the `OpenOptions`/
         // `CreateOptions` override for tests.
+        //
+        // Idle is also relative to the writer's own pace: a writer enqueuing
+        // every 1.5s is not idle 1s after each write, and folding there pays
+        // a commit (and the next write's sync of it) per write instead of
+        // batching. Wait out twice the recent foreground interval, capped so
+        // a store that does go quiet still folds within `max_idle_pace_ns`.
         const now = std.Io.Clock.awake.now(io).nanoseconds;
         const last_activity_ns = @max(self.last_mutation_enqueue_ns, self.last_redo_fold_ns);
-        const idle_long_enough = now -| last_activity_ns >= @as(i96, @intCast(self.redo_idle_checkpoint_ns));
+        const max_idle_pace_ns: i96 = 30 * std.time.ns_per_s;
+        const idle_window_ns = @max(@as(i96, @intCast(self.redo_idle_checkpoint_ns)), @min(self.foreground_enqueue_interval_ns * 2, max_idle_pace_ns));
+        const idle_long_enough = now -| last_activity_ns >= idle_window_ns;
         // Safety valve: a store that is never idle for a full
         // `redo_idle_checkpoint_ns` (a continuous trickle of writes, each
         // comfortably under the byte-capacity `threshold_due` trigger
@@ -7657,10 +7754,28 @@ pub const Txn = struct {
         // writer's pre-staging reads behind every fsync, so concurrent
         // writers could never share a group (WS3).
         const serialized_admission = store.file.externally_locked;
-        if (serialized_admission) lockStore(store);
-        defer if (serialized_admission) store.mutex.unlock();
         const pin = try store.readMetadataAllocator().create(ReadPin);
         errdefer store.readMetadataAllocator().destroy(pin);
+        // Serialized admission exists for the kernel fence wait. A pin that
+        // takes no fence (the generation already holds it, or a nested read
+        // borrowing the writer's lease) needs only `read_mutex`, which
+        // publication also takes, and so does not queue behind a group's
+        // apply for the publication mutex.
+        if (serialized_admission) fast: {
+            store.read_mutex.lockUncancelable(io);
+            defer store.read_mutex.unlock(io);
+            const generation = store.read_generation orelse break :fast;
+            if (store.read_outcome_unknown) break :fast;
+            store.writer_mutex.lockUncancelable(io);
+            const kernel_reader = !store.writer_active;
+            store.writer_mutex.unlock(io);
+            if (kernel_reader and generation.kernel_readers == 0) break :fast;
+            const checkpoint = generation.checkpoint;
+            pin.* = .{ .sequence = checkpoint.commit_sequence, .pinned_at = std.Io.Clock.awake.now(io), .kernel_reader = kernel_reader };
+            return .{ .allocator = store.allocator, .store = store, .read_pin = pin, .prefix = prefix, .read_generation = try store.pinInitializedReadGeneration(pin), .checkpoint = checkpoint };
+        }
+        if (serialized_admission) lockStore(store);
+        defer if (serialized_admission) store.mutex.unlock();
         store.read_mutex.lockUncancelable(io);
         if (store.read_generation == null) {
             store.read_mutex.unlock(io);
@@ -12768,6 +12883,103 @@ test "lite ride-along ticket resolves within the idle window even if the idle-fl
     const value = try reopened.file.getDocumentAlloc(alloc, "no-flush-task");
     defer if (value) |bytes| alloc.free(bytes);
     try std.testing.expectEqualStrings("rode along anyway", value orelse return error.TestExpectedEqual);
+}
+
+test "lite maintenance ride-along waits for the leader that owns the drain" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "ride-along-behind-leader.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{});
+    defer store.close();
+    store.ride_along_idle_ns = 20 * std.time.ns_per_ms;
+    store.ride_along_flush_unavailable.store(true, .release);
+
+    const Leader = struct {
+        applying: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.applying.store(true, .release);
+            while (!self.release.load(.acquire)) antfly_platform.time.yieldNow();
+            try file.putDocument("leader", "led");
+        }
+        fn run(self: *@This(), s: *Store) void {
+            const staged = s.stage(.{ .context = self, .apply = apply }) catch return;
+            staged.wait() catch {};
+        }
+    };
+    const Waits = struct {
+        count: std.atomic.Value(u32) = .init(0),
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.count.fetchAdd(1, .acq_rel);
+        }
+    };
+    const RideAlong = struct {
+        done: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+        fn apply(_: *anyopaque, file: *native.NativeFile) !void {
+            try file.putDocument("ride-along", "rode");
+        }
+        fn run(self: *@This(), s: *Store) void {
+            var ctx: u8 = 0;
+            const ticket = s.stageRideAlong(.{ .context = &ctx, .apply = apply }) catch |err| {
+                self.failure = err;
+                return;
+            };
+            ticket.wait() catch |err| {
+                self.failure = err;
+            };
+            self.done.store(true, .release);
+        }
+    };
+    var waits: Waits = .{};
+    Store.test_maintenance_ride_along_wait_hook = .{ .ptr = &waits, .run = Waits.run };
+    defer Store.test_maintenance_ride_along_wait_hook = null;
+    // The turn holds the writer: no foreground leader is expected.
+    store.writer_held_by_maintenance.store(true, .release);
+    defer store.writer_held_by_maintenance.store(false, .release);
+
+    var leader: Leader = .{};
+    const leader_thread = try std.Thread.spawn(.{}, Leader.run, .{ &leader, &store });
+    var leader_joined = false;
+    defer if (!leader_joined) {
+        leader.release.store(true, .release);
+        leader_thread.join();
+    };
+    while (!leader.applying.load(.acquire)) antfly_platform.time.yieldNow();
+
+    var ride_along: RideAlong = .{};
+    const ride_thread = try std.Thread.spawn(.{}, RideAlong.run, .{ &ride_along, &store });
+    // Observed waiting on completion while the leader still owns the drain.
+    const deadline = antfly_platform.time.monotonicNs() + 10 * std.time.ns_per_s;
+    while (waits.count.load(.acquire) == 0) {
+        if (antfly_platform.time.monotonicNs() > deadline) break;
+        antfly_platform.time.yieldNow();
+    }
+    try std.testing.expect(waits.count.load(.acquire) != 0);
+    try std.testing.expect(!ride_along.done.load(.acquire));
+    // Waiting sleeps on the completion condition (bounded by the idle
+    // window), never a retry loop against the active drain.
+    std.Io.sleep(std.testing.io, .fromMilliseconds(100), .awake) catch {};
+    try std.testing.expect(waits.count.load(.acquire) <= 20);
+
+    leader.release.store(true, .release);
+    leader_thread.join();
+    leader_joined = true;
+    ride_thread.join();
+    if (ride_along.failure) |err| return err;
+    try std.testing.expect(ride_along.done.load(.acquire));
+    store.writer_held_by_maintenance.store(false, .release);
+    try store.sync();
+    var reopened = try Store.open(alloc, path, true);
+    defer reopened.close();
+    const value = try reopened.file.getDocumentAlloc(alloc, "ride-along");
+    defer if (value) |bytes| alloc.free(bytes);
+    try std.testing.expectEqualStrings("rode", value orelse return error.TestExpectedEqual);
 }
 
 test "lite ride-along undurable-bytes threshold triggers exactly 1 sync" {

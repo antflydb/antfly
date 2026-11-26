@@ -188,6 +188,14 @@ pub const Resolver = struct {
     resolve: *const fn (ptr: *anyopaque, tip: TipReader, resolver: *Resolver) anyerror!void,
     arena: std.heap.ArenaAllocator,
     outputs: std.ArrayListUnmanaged(Mutation) = .empty,
+    /// The mirror this resolver's decisions land in, when installs of them
+    /// can run out of commit order. Each run takes the next decision stamp
+    /// there: resolvers run inside their commits, one group and member at a
+    /// time, so among committed decisions stamp order is commit order. A run
+    /// whose commit fails leaves no trace; only installs record stamps
+    /// (`Backend.applyDecided`).
+    stamp_backend: ?*Backend = null,
+    stamp: u64 = 0,
 
     pub fn init(allocator: Allocator, ptr: *anyopaque, resolve: *const fn (ptr: *anyopaque, tip: TipReader, resolver: *Resolver) anyerror!void) Resolver {
         return .{ .ptr = ptr, .resolve = resolve, .arena = .init(allocator) };
@@ -203,6 +211,7 @@ pub const Resolver = struct {
         self.outputs = .empty;
         _ = self.arena.reset(.retain_capacity);
         try self.resolve(self.ptr, tip, self);
+        if (self.stamp_backend) |backend| self.stamp = backend.decision_stamps.fetchAdd(1, .monotonic) + 1;
     }
 
     pub fn put(self: *Resolver, namespace: ?[]const u8, key: []const u8, value: []const u8) !void {
@@ -398,6 +407,14 @@ pub const Backend = struct {
     /// of reading stale state or computing writes from it. Reopening the
     /// index rebuilds the mirror from the committed catalog.
     mirror_invalid: std.atomic.Value(bool) = .init(false),
+    /// The next `Resolver.stamp` for this mirror's decisions.
+    decision_stamps: std.atomic.Value(u64) = .init(0),
+    /// Guarded by `mutex`: per key, the stamp of the decision whose value the
+    /// mirror holds, kept only while an older install may still arrive.
+    applied_stamps: std.StringHashMapUnmanaged(u64) = .empty,
+    /// Installs not yet applied (the owning index's pending level-0
+    /// publications); stamps are recorded only while nonzero.
+    pending_decisions: std.atomic.Value(u32) = .init(0),
     /// Ride-along commits (`NamespaceTxn.commit()` with `durable = false`)
     /// staged via `sink.submitDeferred` but not yet waited on (design doc
     /// §3.2a: background work rides along and is crash-recomputable, but a
@@ -545,6 +562,8 @@ pub const Backend = struct {
         self.pending_ride_along.deinit(self.allocator);
         lockBackend(self);
         releaseState(self.allocator, self.state);
+        self.clearStampsLocked();
+        self.applied_stamps.deinit(self.allocator);
         self.mutex.unlock();
         self.allocator.free(self.scope);
         if (self.writer_view_parent) |parent| {
@@ -865,6 +884,108 @@ pub const Backend = struct {
         self.mirror_invalid.store(true, .release);
     }
 
+    /// Applies mutations a committed decision (`stamp`, see
+    /// `Resolver.stamp`) made, skipping keys whose mirror value came from a
+    /// later decision: installs can complete out of commit order. Stamps are
+    /// recorded only while `decisionsPending` (an older install may still
+    /// come), and every caller holds the index's apply guard, so the check
+    /// and the publication below are one step for this mirror.
+    pub fn applyDecided(self: *Backend, mutations: []const Mutation, stamp: u64) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var latest = std.ArrayListUnmanaged(Mutation).empty;
+        var keys = std.ArrayListUnmanaged([]const u8).empty;
+        const record = stamp != 0 and self.decisionsPending();
+        {
+            lockBackend(self);
+            defer self.mutex.unlock();
+            for (mutations) |m| {
+                if ((self.tipReads() and isTipNamespace(m.namespace)) or isStagedOnly(m.namespace)) continue;
+                if (stamp != 0 and epochTracked(m.namespace)) {
+                    const key = try epochKeyAlloc(a, m.namespace, m.key);
+                    if ((self.applied_stamps.get(key) orelse 0) > stamp) continue;
+                    if (record) try keys.append(a, key);
+                }
+                try latest.append(a, m);
+            }
+        }
+        try self.applyExternallyCommittedMutations(latest.items);
+        if (keys.items.len != 0) try self.recordStamps(keys.items, stamp);
+    }
+
+    /// Whether mutations from a decision at `stamp` may overwrite `m`'s key.
+    fn decidedLatestLocked(self: *const Backend, m: Mutation, stamp: u64) bool {
+        if (stamp == 0 or !epochTracked(m.namespace)) return true;
+        var buffer: [512]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&buffer);
+        const key = epochKeyAlloc(fba.allocator(), m.namespace, m.key) catch return true;
+        return (self.applied_stamps.get(key) orelse 0) <= stamp;
+    }
+
+    /// Owned keys and capacity are allocated before the map changes, so a
+    /// failure leaves it as it was.
+    fn recordStamps(self: *Backend, keys: []const []const u8, stamp: u64) !void {
+        const owned = try self.allocator.alloc([]u8, keys.len);
+        defer self.allocator.free(owned);
+        var made: usize = 0;
+        errdefer for (owned[0..made]) |key| self.allocator.free(key);
+        for (keys, owned) |key, *slot| {
+            slot.* = try self.allocator.dupe(u8, key);
+            made += 1;
+        }
+        lockBackend(self);
+        defer self.mutex.unlock();
+        try self.applied_stamps.ensureUnusedCapacity(self.allocator, @intCast(keys.len));
+        for (owned) |key| {
+            const entry = self.applied_stamps.getOrPutAssumeCapacity(key);
+            if (entry.found_existing) {
+                self.allocator.free(key);
+                entry.value_ptr.* = @max(entry.value_ptr.*, stamp);
+            } else {
+                entry.key_ptr.* = key;
+                entry.value_ptr.* = stamp;
+            }
+        }
+        made = 0;
+    }
+
+    /// No install can still be older than a recorded decision: drop them.
+    pub fn forgetDecisions(self: *Backend) void {
+        lockBackend(self);
+        defer self.mutex.unlock();
+        self.clearStampsLocked();
+    }
+
+    fn clearStampsLocked(self: *Backend) void {
+        var keys = self.applied_stamps.keyIterator();
+        while (keys.next()) |key| self.allocator.free(key.*);
+        self.applied_stamps.clearRetainingCapacity();
+    }
+
+    fn decisionsPending(self: *const Backend) bool {
+        return self.pending_decisions.load(.acquire) != 0;
+    }
+
+    /// An install of decisions not yet applied is now pending.
+    pub fn beginPendingDecision(self: *Backend) void {
+        _ = self.pending_decisions.fetchAdd(1, .acq_rel);
+    }
+
+    /// One pending install landed or was dropped; after the last, no older
+    /// install can arrive and the recorded stamps go.
+    pub fn finishPendingDecision(self: *Backend) void {
+        if (self.pending_decisions.fetchSub(1, .acq_rel) == 1) self.forgetDecisions();
+    }
+
+    fn epochTracked(namespace: ?[]const u8) bool {
+        return !isTipNamespace(namespace) and !isStagedOnly(namespace) and !isResolution(namespace);
+    }
+
+    fn epochKeyAlloc(a: Allocator, namespace: ?[]const u8, key: []const u8) ![]u8 {
+        return std.mem.concat(a, u8, &.{ namespace orelse "", "\x00", key });
+    }
+
     pub const PreparedMirror = struct {
         backend: *Backend,
         replacement: ?*RcState = null,
@@ -1152,8 +1273,20 @@ pub const Backend = struct {
         }
 
         fn mirrorResolved(self: *NamespaceTxn, resolver: *Resolver) !void {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            var keys = std.ArrayListUnmanaged([]const u8).empty;
+            const record = resolver.stamp_backend != null and resolver.stamp != 0 and self.backend.decisionsPending();
+            defer if (keys.items.len != 0) self.backend.recordStamps(keys.items, resolver.stamp) catch self.backend.invalidateMirror();
             for (resolver.outputs.items) |m| {
                 if ((self.backend.tipReads() and isTipNamespace(m.namespace)) or isStagedOnly(m.namespace)) continue;
+                if (resolver.stamp_backend != null) {
+                    lockBackend(self.backend);
+                    const latest = self.backend.decidedLatestLocked(m, resolver.stamp);
+                    self.backend.mutex.unlock();
+                    if (!latest) continue;
+                    if (record and epochTracked(m.namespace)) try keys.append(arena.allocator(), try epochKeyAlloc(arena.allocator(), m.namespace, m.key));
+                }
                 if (self.read_since_write) try self.borrowed_trees.ensureUnusedCapacity(self.allocator, 1);
                 const namespace: backend_types.Namespace = .{ .name = m.namespace };
                 self.replaceTree(if (m.is_delete)
@@ -1488,6 +1621,21 @@ test "native catalog backend fails closed once its mirror misses a committed wri
     backend.invalidateMirror();
     try std.testing.expectError(error.IndexMirrorInvalid, backend.beginRead());
     try std.testing.expectError(error.IndexMirrorInvalid, backend.beginWrite());
+}
+
+test "native catalog backend records a key's first decision stamp as is and keeps the newest" {
+    const a = std.testing.allocator;
+    var test_sink = TestSink{ .allocator = a };
+    defer test_sink.deinit();
+    var backend = try Backend.init(a, .{ .sink = test_sink.sink(), .scope = "idx1" });
+    defer backend.close();
+    try backend.recordStamps(&.{ "a", "b" }, 3);
+    try std.testing.expectEqual(@as(?u64, 3), backend.applied_stamps.get("a"));
+    try std.testing.expectEqual(@as(?u64, 3), backend.applied_stamps.get("b"));
+    try backend.recordStamps(&.{"a"}, 5);
+    try backend.recordStamps(&.{"b"}, 2);
+    try std.testing.expectEqual(@as(?u64, 5), backend.applied_stamps.get("a"));
+    try std.testing.expectEqual(@as(?u64, 3), backend.applied_stamps.get("b"));
 }
 
 test "native catalog backend supports prefix cursors over a namespace" {
