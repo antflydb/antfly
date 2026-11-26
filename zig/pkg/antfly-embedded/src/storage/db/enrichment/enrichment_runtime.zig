@@ -17926,7 +17926,7 @@ fn processPendingDocumentGroup(
                     continue;
                 };
                 if (requestHasChunkSource(request)) retireMediaPassForDenseRequest(runtime, request) catch |err| {
-                    setActiveFailureFingerprint(runtime, 0);
+                    if (err != error.RequiredMediaOutputFailed) setActiveFailureFingerprint(runtime, 0);
                     return err;
                 };
             },
@@ -18054,8 +18054,12 @@ const DenseExecutionLane = struct {
     }
 
     fn finishPublishedQuantum(self: *DenseExecutionLane) anyerror!void {
-        for (self.chunked_dense) |request| retireMediaPassForDenseRequest(self.runtime, request) catch |err|
+        for (self.chunked_dense) |request| retireMediaPassForDenseRequest(self.runtime, request) catch |err| {
+            // Acknowledgement can report a required model output failure after
+            // its storage operations succeeded. Keep that outcome separate.
+            if (err == error.RequiredMediaOutputFailed) return err;
             return FailureScope.assetPublicationFailure(&self.scope, err);
+        };
         if (self.group) |group| saveReplayCursorForGroup(self.runtime, .dense, self.applied_sequence, self.cursor_config_hash, self.replay_generation, group) catch |err| return FailureScope.assetPublicationFailure(&self.scope, err);
     }
 
