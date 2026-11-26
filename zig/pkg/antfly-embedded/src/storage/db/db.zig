@@ -29142,7 +29142,10 @@ pub const DB = struct {
                 try publication.validateArtifactSources(alloc, txn, guard.command.namespace, guard.command.sources, guard.command.artifact_sources);
                 try publication.validateArtifactSources(alloc, txn, guard.command.namespace, guard.command.sources, guard.command.mutation_preconditions);
                 if (guard.chunk_fence) |fence| try fence.requireCurrent(txn);
-                if (guard.chunk_vector_fence) |fence| try fence.requireCurrent(txn);
+                if (guard.chunk_vector_fence) |fence| {
+                    try fence.requireCurrent(txn);
+                    if (fence.revalidate_window_plan) try fence.validateWindowPlan(alloc, txn, guard.command);
+                }
                 for (guard.asset_upstream_fences) |fence| try fence.requireCurrent(txn);
                 try publication.stageCoverage(alloc, txn, guard.command, guard.coverage);
                 try publication.stageReceipts(txn, guard.command, guard.sequence);

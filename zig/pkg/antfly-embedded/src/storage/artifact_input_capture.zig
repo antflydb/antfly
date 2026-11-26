@@ -174,7 +174,7 @@ pub const Capture = struct {
             try self.rememberArtifact(alloc, key);
             if (try keys.mediaWindowVectorParentAlloc(alloc, key)) |parent| {
                 defer alloc.free(parent);
-                if (self.window_set_fenced == null) self.window_set_fenced = try @import("db/artifact_catalog_activation.zig").windowSetFenced(alloc, txn, self.selected.?);
+                if (self.window_set_fenced == null) self.window_set_fenced = try @import("db/artifact_catalog_activation.zig").windowSetFenced(txn, self.selected.?);
                 if (self.window_set_fenced.?) try self.rememberArtifact(alloc, parent);
             }
             return;

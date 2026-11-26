@@ -32247,32 +32247,58 @@ fn publishMediaWindowVectors(runtime: *EnrichmentRuntime, a: Allocator, request:
     return true;
 }
 
-fn captureMediaWindowOutputs(a: Allocator, read: *backend_erased.ReadTxn, input: *@import("../artifact_chunk_vector_publication.zig").Input) !void {
+fn ensureMediaWindowOutputs(runtime: *EnrichmentRuntime, a: Allocator, input: *@import("../artifact_chunk_vector_publication.zig").Input) !void {
+    if (input.old_window_outputs != null) return;
     const first_child = try internal_keys.mediaWindowChildKeyAlloc(a, input.token.producer_scope_key, 0);
     defer a.free(first_child);
     const child_prefix = first_child[0 .. first_child.len - @sizeOf(u32)];
-    var borrowed: @import("../artifact_chunk_cursor.zig").BorrowedRead = .{ .read = read };
-    var cursor = try borrowed.openPhysicalCursorAdapter();
-    defer cursor.close();
+    const parent_revision = for (input.token.preconditions.items) |guard| {
+        if (std.mem.eql(u8, guard.key, input.output_key)) break guard.input_position;
+    } else return error.InvalidBatchRequest;
+    const owner = assetProviderRequestContext(runtime);
     const owned = input.token.arena.allocator();
-    var keys: std.ArrayList([]const u8) = .empty;
-    var row = try cursor.seekAtOrAfter(first_child);
-    while (row) |entry| : (row = try cursor.next()) {
-        if (!std.mem.startsWith(u8, entry.key, child_prefix)) break;
-        if (!internal_keys.matchesDerivedEmbeddingArtifactName(entry.key, input.token.artifact_name)) continue;
-        const key = try owned.dupe(u8, entry.key);
-        const revision = try ordered_publication.artifactRevision(read, input.token.namespace, key);
-        try input.token.observePrecondition(key, entry.value, revision);
-        try keys.append(owned, key);
+    var output_keys: std.ArrayList([]const u8) = .empty;
+    var resume_key: ?[]u8 = null;
+    defer if (resume_key) |key| a.free(key);
+    // A logical page may already have used its budget when its cursor reports
+    // a possible child. Exact capture runs in separate bounded read snapshots,
+    // resuming inclusively and retaining only keys owned by this consumer.
+    while (true) {
+        try checkEnrichmentExecutionContext(runtime, owner);
+        var read = try runtime.store.beginRead();
+        defer read.abort();
+        if (!std.meta.eql(parent_revision, try ordered_publication.artifactRevision(&read, input.token.namespace, input.output_key)))
+            return error.EnrichmentSourceChanged;
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        cursor.setKeysOnly();
+        var budget: @import("../artifact_scan_budget.zig").Budget = .{
+            .deadline_ns = platform.time.monotonicNs() +| 2 * std.time.ns_per_ms,
+        };
+        var row = try cursor.seekAtOrAfter(resume_key orelse first_child);
+        while (row) |entry| : (row = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, child_prefix)) break;
+            if (budget.exhausted()) {
+                const next = try a.dupe(u8, entry.key);
+                if (resume_key) |old| a.free(old);
+                resume_key = next;
+                break;
+            }
+            budget.visit(entry.key.len);
+            if (!internal_keys.matchesDerivedEmbeddingArtifactName(entry.key, input.token.artifact_name)) continue;
+            const raw = try read.get(entry.key);
+            budget.bytes +|= raw.len;
+            const key = try owned.dupe(u8, entry.key);
+            const revision = try ordered_publication.artifactRevision(&read, input.token.namespace, key);
+            try input.token.observePrecondition(key, raw, revision);
+            try output_keys.append(owned, key);
+        }
+        // The loop only leaves an in-range row unprocessed when it has
+        // recorded that row as the next snapshot's starting point.
+        if (row) |entry| if (std.mem.startsWith(u8, entry.key, child_prefix)) continue;
+        input.old_window_outputs = output_keys.items;
+        return;
     }
-    input.old_window_outputs = keys.items;
-}
-
-fn ensureMediaWindowOutputs(runtime: *EnrichmentRuntime, a: Allocator, input: *@import("../artifact_chunk_vector_publication.zig").Input) !void {
-    if (input.old_window_outputs != null) return;
-    var read = try runtime.store.beginRead();
-    defer read.abort();
-    try captureMediaWindowOutputs(a, &read, input);
 }
 
 /// Only real window work raises the catalog floor. Publish the normal
@@ -33011,13 +33037,7 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
                 // Publishing changes this document's census witness. Such a
                 // pass may drive work, but cannot also certify completion.
                 publishing = true;
-                if (dense != null) {
-                    if (cursor.member_has_windows) {
-                        try captureMediaWindowOutputs(alloc, &read, &input);
-                    } else {
-                        input.old_window_outputs = &.{};
-                    }
-                }
+                if (dense != null and !cursor.member_has_windows) input.old_window_outputs = &.{};
                 const text = if (input.value) |value| try chunkPayloadTextAlloc(input.token.arena.allocator(), value, request.source_field) else null;
                 const carried = if (text) |value| try carriedChunkVectorAlloc(input.token.arena.allocator(), &read, request, execution_revision, input.value.?, input.output_key, value) else null;
                 if (carried == null) bytes +|= if (text) |value| value.len else 0;
@@ -33059,6 +33079,7 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
             if (!exhausted) return error.ArtifactPublicationPending;
         }
         if (dense) |provider| for (items.items) |*item| {
+            try ensureMediaWindowOutputs(runtime, alloc, &item.input);
             var item_waits_for_protocol = false;
             const published = item.carried == null and (publishMediaWindowVectors(runtime, alloc, request, provider, execution_revision, &item.input, item.input.value, &staged_vectors) catch |err| switch (err) {
                 error.ArtifactPublicationPending => blk: {
@@ -50878,6 +50899,23 @@ test "model aware media ordered vector windows are searchable with exact clocks 
             self.next_index += 1;
             self.calls += 1;
         }
+        fn writeForeignWindows(self: *@This(), scratch: Allocator, member: []const u8, value: ?[]const u8) !void {
+            var write = try self.db.?.core.store.beginWriteTxn();
+            errdefer write.abort();
+            for (0..130) |index| {
+                const child = try internal_keys.mediaWindowChildKeyAlloc(scratch, member, @intCast(index));
+                defer scratch.free(child);
+                const key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(scratch, child, "foreign");
+                defer scratch.free(key);
+                if (value) |payload| try write.put(key, payload) else try write.delete(key);
+            }
+            const receipts = @import("../apply_receipts.zig");
+            var receipt_bytes: [receipts.ordered_apply_receipt_value_len]u8 = undefined;
+            const receipt = receipts.orderedApplyReceiptWrite(.{ .term = 1, .index = self.next_index }, &receipt_bytes);
+            try write.put(receipt.key, receipt.value);
+            try write.commit();
+            self.next_index += 1;
+        }
         fn capture(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, scope: []const u8) !@import("../artifact_producer_context.zig").Token {
             var read = try runtime.store.beginProbe();
             defer read.abort();
@@ -51077,7 +51115,7 @@ test "model aware media ordered vector windows are searchable with exact clocks 
             try std.testing.expectError(error.ArtifactPublicationPending, enqueueScalarChunkVector(runtime, &input, vector, true));
             try std.testing.expectEqual(calls, harness.calls);
             input.effect_protocol = retirement_protocol;
-            const phantom_member = try internal_keys.mediaWindowChildKeyAlloc(a, member, 2);
+            const phantom_member = try internal_keys.mediaWindowChildKeyAlloc(a, member, 130);
             defer a.free(phantom_member);
             const phantom = try internal_keys.derivedEmbeddingArtifactKeyAlloc(a, phantom_member, "model");
             defer a.free(phantom);
@@ -51102,8 +51140,7 @@ test "model aware media ordered vector windows are searchable with exact clocks 
             try std.testing.expect(remaining == null);
             try std.testing.expectEqual(calls + 2, harness.calls);
 
-            // A scalar-only proposal has no physical preflight scan. An
-            // insertion into its previously empty set must invalidate the
+            // An insertion into a previously empty set must invalidate the
             // captured scalar revision without changing its stored bytes.
             var formerly_empty = blk: {
                 var read = try runtime.store.beginRead();
@@ -51121,6 +51158,9 @@ test "model aware media ordered vector windows are searchable with exact clocks 
             harness.phantom_key = phantom;
             try std.testing.expectError(error.ArtifactPublicationPending, enqueueScalarChunkVector(runtime, &formerly_empty, vector, true));
             try std.testing.expect(harness.stale_vector);
+            // The owned child sorts after more than one page of foreign
+            // children. Exact capture must resume and leave those untouched.
+            try harness.writeForeignWindows(a, member, vector);
             var final = blk: {
                 var read = try runtime.store.beginRead();
                 defer read.abort();
@@ -51131,10 +51171,30 @@ test "model aware media ordered vector windows are searchable with exact clocks 
             defer final.deinit();
             final.token.execution_identity = @splat(0x33);
             final.token.execution_bound = true;
+            // The scalar was captured AFTER the child was inserted. Its
+            // parent revision is current, but its proposed set is incomplete.
+            const omitted_child: ordered_publication.Mutation = .{ .family = .derived_vector, .key = final.output_key, .value = vector, .source_index = 0 };
+            const incomplete = try final.token.command(&.{omitted_child});
+            try std.testing.expectError(error.ArtifactPublicationPending, enqueueProducerEffects(runtime, &final.token, &.{omitted_child}, null));
+            {
+                var read = try runtime.store.beginRead();
+                defer read.abort();
+                const rejected = (try ordered_publication.rejected(&read, incomplete)) orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(ordered_publication.Rejection.stale_source, rejected.reason);
+                _ = try read.get(phantom);
+            }
             try std.testing.expectError(error.ArtifactPublicationPending, enqueueScalarChunkVector(runtime, &final, vector, true));
             const retired = try storeGetOptionalAllocWithRetry(runtime, phantom);
             defer if (retired) |value| runtime.alloc.free(value);
             try std.testing.expect(retired == null);
+            const foreign_member = try internal_keys.mediaWindowChildKeyAlloc(a, member, 0);
+            defer a.free(foreign_member);
+            const foreign = try internal_keys.derivedEmbeddingArtifactKeyAlloc(a, foreign_member, "foreign");
+            defer a.free(foreign);
+            const surviving = (try storeGetOptionalAllocWithRetry(runtime, foreign)) orelse return error.TestUnexpectedResult;
+            defer runtime.alloc.free(surviving);
+            try std.testing.expectEqualSlices(u8, vector, surviving);
+            try harness.writeForeignWindows(a, member, null);
         } else if (round != 0) {
             input.token.execution_identity = @splat(marker);
             try std.testing.expect(try publishMediaWindowVectors(runtime, a, vector_request, provider, @as([32]u8, @splat(marker)), &input, input.value.?, &cache));
