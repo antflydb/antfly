@@ -21017,6 +21017,8 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         observation.cudaAudioResult(.eager_assigned);
     }
     observation.cudaAudioWorkspace(.{
+        .plan_origin = plan.origin,
+        .planned_events = storage.events,
         .planned_arena_bytes = storage.bytes,
         .bound_arena_bytes = arena.buffers[0].len,
         .bound_input_bytes = input_bank.len,
@@ -60771,6 +60773,8 @@ test "public source audio linear recreates input bank through actual learning ca
         try std.testing.expect(compute.source_linear_scratch.active);
         if (iteration >= 2) {
             const workspace = workspace_observation.cuda_audio_workspace orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(.observed, workspace.plan_origin);
+            try std.testing.expect(workspace.planned_events > 0);
             try std.testing.expect(workspace.planned_arena_bytes <= workspace.bound_arena_bytes);
             try std.testing.expect(workspace.planned_terminal_bytes <= workspace.bound_terminal_bytes);
             if (iteration == 3 or iteration == 6) try std.testing.expect(workspace.bound_input_bytes != 0);

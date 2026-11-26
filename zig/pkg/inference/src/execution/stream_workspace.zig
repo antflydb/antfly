@@ -46,7 +46,10 @@ comptime {
 
     if (max_allocations - 1 > std.math.maxInt(u15)) @compileError("stream workspace event slot overflow");
 }
+pub const Origin = enum { observed, declared };
+
 pub const Plan = struct {
+    origin: Origin = .observed,
     allocations: [max_allocations]Allocation = undefined,
     events: [max_allocations * 2]Event = undefined,
     count: usize = 0,
@@ -137,6 +140,7 @@ pub const Plan = struct {
             break :p self.allocations[slot].live_id;
         } else null;
         if (!self.seal(published)) return error.InvalidExecutionPlan;
+        self.origin = .declared;
     }
 
     /// Both ordinary execution and recording consume the same interval.
@@ -390,6 +394,8 @@ test "declared CUDA workspace reuses dead slots and redirects its sole published
     try std.testing.expect(learned.finish(0x1000));
     try std.testing.expectEqual(try learned.layoutWithExternalOutput(alignment), layout);
     try std.testing.expectEqual(learned.fingerprint(0), plan.fingerprint(0));
+    try std.testing.expectEqual(Origin.observed, learned.origin);
+    try std.testing.expectEqual(Origin.declared, plan.origin);
 }
 
 test "CUDA arena preserves device addresses wider than a 32-bit host pointer" {

@@ -447,6 +447,8 @@ pub const CudaAudio = struct {
 /// Latest submitted learned audio workspace in the observing interval.
 /// Spans may alias one another and describe neither peak usage nor completion.
 pub const CudaAudioWorkspace = struct {
+    plan_origin: @import("stream_workspace.zig").Origin,
+    planned_events: usize,
     planned_arena_bytes: usize,
     bound_arena_bytes: usize,
     bound_input_bytes: usize,
