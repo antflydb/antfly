@@ -25,6 +25,39 @@ pub fn subsampledRows(frames: usize) usize {
     return frames / 4 + @intFromBool(frames % 4 != 0);
 }
 
+/// Ordered inputs shared by audio projection and workspace admission.
+pub const ExecutionInputs = struct {
+    pub const hidden = 0;
+    pub const relative = 1;
+    pub const valid = 2;
+    pub const segment_start = 3;
+    pub const segment_valid = 4;
+    pub const scales = 5;
+    pub const scale_count = 12;
+    pub const count = scales + scale_count;
+
+    pub const Metadata = struct { shape: []const i64, elements: usize };
+
+    pub fn describe(shapes: *[count][2]i64, rows: usize, width: usize, context_left: usize, heads: usize) ![count]Metadata {
+        const row_dim = std.math.cast(i64, rows) orelse return error.InvalidPreparedAudioRecipe;
+        const hidden_dim = std.math.cast(i64, width) orelse return error.InvalidPreparedAudioRecipe;
+        const context_dim = std.math.cast(i64, context_left) orelse return error.InvalidPreparedAudioRecipe;
+        if (heads == 0 or width % heads != 0) return error.InvalidPreparedAudioRecipe;
+        const head_dim = width / heads;
+        shapes[hidden] = .{ row_dim, hidden_dim };
+        shapes[relative] = .{ context_dim, hidden_dim };
+        var inputs: [count]Metadata = undefined;
+        inputs[hidden] = .{ .shape = &shapes[hidden], .elements = try std.math.mul(usize, rows, width) };
+        inputs[relative] = .{ .shape = &shapes[relative], .elements = try std.math.mul(usize, context_left, width) };
+        for (valid..count) |slot| {
+            const elements = if (slot < scales) rows else head_dim;
+            shapes[slot][0] = @intCast(elements);
+            inputs[slot] = .{ .shape = shapes[slot][0..1], .elements = elements };
+        }
+        return inputs;
+    }
+};
+
 /// Copied operation geometry only. The actual Stage certifies the model and
 /// rebuilds mutable backend policy/learned-layout requests after every yield.
 pub const AudioRecipe = struct {

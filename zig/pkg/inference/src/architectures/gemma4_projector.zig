@@ -4944,14 +4944,14 @@ fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store
         fn call(raw: *anyopaque, values: []const CT) !CT {
             const self: *@This() = @ptrCast(@alignCast(raw));
             var layer_inputs = self.inputs.*;
-            layer_inputs.rel_in = values[1];
-            layer_inputs.valid_ct = values[2];
-            layer_inputs.segment_starts = if (self.inputs.segment_starts != null) values[3] else null;
-            layer_inputs.segment_valid = if (self.inputs.segment_valid != null) values[4] else null;
-            var scales: [12]CT = undefined;
-            @memcpy(&scales, values[5..17]);
+            layer_inputs.rel_in = values[audio_schedule.ExecutionInputs.relative];
+            layer_inputs.valid_ct = values[audio_schedule.ExecutionInputs.valid];
+            layer_inputs.segment_starts = if (self.inputs.segment_starts != null) values[audio_schedule.ExecutionInputs.segment_start] else null;
+            layer_inputs.segment_valid = if (self.inputs.segment_valid != null) values[audio_schedule.ExecutionInputs.segment_valid] else null;
+            var scales: [audio_schedule.ExecutionInputs.scale_count]CT = undefined;
+            @memcpy(&scales, values[audio_schedule.ExecutionInputs.scales..]);
             layer_inputs.scales = &scales;
-            return runAudioLayers(self.cb, self.a, self.store, self.cfg, values[0], &layer_inputs, self.start, self.end);
+            return runAudioLayers(self.cb, self.a, self.store, self.cfg, values[audio_schedule.ExecutionInputs.hidden], &layer_inputs, self.start, self.end);
         }
     };
     var run = Run{ .cb = cb, .a = a, .store = store, .cfg = cfg, .inputs = inputs, .start = start, .end = end };
@@ -4963,14 +4963,14 @@ fn audioExecutionEligible(cb: *const ComputeBackend, store: *const ProjectorWeig
     return !((cb.kind() != .cuda and cb.kind() != .metal) or cb.vtable.audioExecution == null or !store.huggingface or !std.meta.eql(audioHostOps(), AudioHostOps{}) or cfg.block_count != 12 or inputs.scales.len != 12 or (cb.kind() == .cuda and (inputs.segment_starts == null or inputs.segment_valid == null)) or platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") != null);
 }
 
-fn audioExecutionInputs(hidden: CT, inputs: *const AudioLayerInputs) [17]CT {
-    var values: [17]CT = undefined;
-    values[0] = hidden;
-    values[1] = inputs.rel_in;
-    values[2] = inputs.valid_ct;
-    values[3] = inputs.segment_starts orelse inputs.valid_ct;
-    values[4] = inputs.segment_valid orelse inputs.valid_ct;
-    @memcpy(values[5..17], inputs.scales);
+fn audioExecutionInputs(hidden: CT, inputs: *const AudioLayerInputs) [audio_schedule.ExecutionInputs.count]CT {
+    var values: [audio_schedule.ExecutionInputs.count]CT = undefined;
+    values[audio_schedule.ExecutionInputs.hidden] = hidden;
+    values[audio_schedule.ExecutionInputs.relative] = inputs.rel_in;
+    values[audio_schedule.ExecutionInputs.valid] = inputs.valid_ct;
+    values[audio_schedule.ExecutionInputs.segment_start] = inputs.segment_starts orelse inputs.valid_ct;
+    values[audio_schedule.ExecutionInputs.segment_valid] = inputs.segment_valid orelse inputs.valid_ct;
+    @memcpy(values[audio_schedule.ExecutionInputs.scales..], inputs.scales);
     return values;
 }
 fn audioLayer(

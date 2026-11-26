@@ -7683,21 +7683,10 @@ pub const CudaCompute = struct {
         if (recipe.count < 2 or !recipe.graph_allowed or !recipe.host_ops_empty or !self.embedding_gemma2_policy.audio_graph) return;
         var segments: [4]usize = undefined;
         const rows = try recipe.rowsAndSegments(segments[0..recipe.count]);
-        var shapes: [17][2]i64 = undefined;
-        shapes[0] = .{ @intCast(rows), @intCast(recipe.hidden) };
-        shapes[1] = .{ @intCast(recipe.context_left), @intCast(recipe.hidden) };
-        var inputs: [17]AudioCacheInput = undefined;
-        inputs[0] = .{ .shape = &shapes[0], .elements = try checkedMul(rows, recipe.hidden) };
-        inputs[1] = .{ .shape = &shapes[1], .elements = relative };
-        for (2..5) |index| {
-            shapes[index][0] = @intCast(rows);
-            inputs[index] = .{ .shape = shapes[index][0..1], .elements = rows };
-        }
-        for (5..17) |index| {
-            shapes[index][0] = @intCast(recipe.hidden / recipe.heads);
-            inputs[index] = .{ .shape = shapes[index][0..1], .elements = recipe.hidden / recipe.heads };
-        }
-        const execution_key = recipe.key(segments[0..recipe.count], 0, 12);
+        const Inputs = @import("../../execution/audio_schedule.zig").ExecutionInputs;
+        var shapes: [Inputs.count][2]i64 = undefined;
+        const inputs = try Inputs.describe(&shapes, rows, recipe.hidden, recipe.context_left, recipe.heads);
+        const execution_key = recipe.key(segments[0..recipe.count], 0, recipe.blocks);
         const base = try self.audioCacheBase(execution_key, &inputs, null);
         const entry = self.audioPlanFor(base) orelse return;
         if (entry.owner == null or !entry.owner.?.managed)
@@ -7742,7 +7731,7 @@ pub const CudaCompute = struct {
         const native = expected.embedding_gemma2_policy.native_vision and cuda_artifact.hasBf16WmmaCodeFor(expected.ctx.info.compute_major, expected.ctx.info.compute_minor);
         return try expected.visionSourceArenaRequest(batch, grid_x, grid_y, source_sequence, source_sequence != null or fused != null or native);
     }
-    pub const AudioCacheInput = struct { shape: []const i64, elements: usize };
+    pub const AudioCacheInput = @import("../../execution/audio_schedule.zig").ExecutionInputs.Metadata;
     const AudioCacheBase = struct { key: u64, input_bytes: usize, output_bytes: usize };
     const AudioInputSpan = struct { offset: usize, bytes: usize };
     fn audioCacheBase(self: *const CudaCompute, key: u64, inputs: []const AudioCacheInput, spans: ?[]AudioInputSpan) !AudioCacheBase {
