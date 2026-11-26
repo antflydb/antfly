@@ -2231,13 +2231,9 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
     // runtime submits once instead of committing and waiting after every
     // op. The frame is owned only here; a caller that already composes one
     // keeps it.
-    var frame_active = false;
-    if (!cohort and cb.kind() == .metal and gemma4AudioEncoderFrameEnabled() and !cb.decoderRuntimeHasActiveFrame()) {
-        frame_active = try cb.decoderRuntimeBeginFrame();
-    }
-    errdefer if (frame_active and cb.decoderRuntimeHasActiveFrame()) cb.decoderRuntimeCancelFrame() catch {
-        if (cb.decoderRuntimeHasActiveFrame()) platform.inference_process_supervisor.restartWorker();
-    };
+    const Submission = @import("../execution/submission.zig").Scope;
+    var frame = try Submission.beginIfNeeded(cb, !cohort and cb.kind() == .metal and gemma4AudioEncoderFrameEnabled());
+    errdefer frame.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
 
     var subsampled = try audioSubsampleCohort(cb, allocator, store, cfg, features_list);
     defer subsampled.deinit(allocator);
@@ -2277,23 +2273,19 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
     if (cb.kind() == .metal and fits_retained_schedules and audioExecutionEligible(cb, store, cfg, &layer_inputs)) {
         if (cb.embedding_stage) |stage| if (stage.audio_scratch_fn) |prepare| {
             const Boundary = struct {
-                cb: *const ComputeBackend,
                 store: *ProjectorWeights,
-                frame: *bool,
+                frame: *Submission,
 
                 fn quiesce(raw: *anyopaque) !void {
                     const self: *@This() = @ptrCast(@alignCast(raw));
-                    if (self.frame.*) {
-                        try self.cb.decoderRuntimeSubmitAndWaitFrame();
-                        self.frame.* = false;
-                    }
+                    try self.frame.finish();
                     // The completed subsampler's weight handles belong to the
                     // current compute owner. Only independent tensors cross.
                     self.store.deinit();
                 }
             };
-            var boundary = Boundary{ .cb = cb, .store = store, .frame = &frame_active };
-            const restart_frame = frame_active;
+            var boundary = Boundary{ .cb = cb, .store = store, .frame = &frame.owns };
+            const restart_frame = frame.owns;
             var keys: [audio_schedule.retained_plan_capacity]u64 = undefined;
             const recipe = audioCacheConfig(cfg);
             for (keys[0..schedule_count], 0..) |*key, index| {
@@ -2304,11 +2296,11 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
             const values = audioExecutionInputs(hidden, &layer_inputs);
             defer_audio_arena = try prepare(stage.ptr, cb, keys[0..schedule_count], &values, .{
                 .storage = storage,
-                .owns_active_frame = frame_active,
+                .owns_active_frame = frame.owns,
                 .context = &boundary,
                 .quiesce = Boundary.quiesce,
             });
-            if (restart_frame and !frame_active) frame_active = try cb.decoderRuntimeBeginFrame();
+            if (restart_frame and !frame.owns) frame = try Submission.begin(cb);
         };
     }
     const pipelined = grouped_frames and frame_plan.in_flight == 2 and cb.decoderRuntimeSetWhisperPipelinedFrames(true);
@@ -2317,12 +2309,7 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
     errdefer if (frame_snapshot) |snapshot| cb.free(snapshot);
     // Drain before publishing or releasing a snapshot, layer inputs, or cached weights.
     defer {
-        if (frame_active) {
-            if (cb.decoderRuntimeHasActiveFrame()) cb.decoderRuntimeCancelFrame() catch {
-                if (cb.decoderRuntimeHasActiveFrame()) platform.inference_process_supervisor.restartWorker();
-            };
-            frame_active = false;
-        }
+        frame.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
         if (pending_frame) cb.decoderRuntimeWaitSubmittedFrame() catch {
             if (cb.decoderRuntimeHasSubmittedFrame()) platform.inference_process_supervisor.restartWorker();
         };
@@ -2338,25 +2325,23 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
     if (planned == null) while (layer < cfg.block_count) {
         try cb.checkExecutionControl();
         const end = @min(cfg.block_count, layer + cohort_layer_span);
-        if (cohort and cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame()) frame_active = try cb.decoderRuntimeBeginFrame();
+        if (cohort and cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame()) frame = if (pipelined) try Submission.beginPipelined(cb) else try Submission.begin(cb);
         const grouped = if (cohort and cb.kind() == .metal and fits_retained_schedules) try tryAudioExecutionRange(cb, allocator, store, cfg, hidden, &layer_inputs, layer, end, defer_audio_arena) else null;
         const next = grouped orelse try runAudioLayers(cb, allocator, store, cfg, hidden, &layer_inputs, layer, end);
         cb.free(hidden);
         hidden = next;
         layer = end;
-        if (cohort and frame_active and (layer % frame_plan.layers == 0 or layer == cfg.block_count)) {
+        if (cohort and frame.owns and (layer % frame_plan.layers == 0 or layer == cfg.block_count)) {
             if (pipelined) {
                 try @import("../ops/metal_compute.zig").MetalCompute.detachEmbeddingGemma2ActivationViews(cb);
                 if (pending_frame) {
                     try cb.decoderRuntimeWaitSubmittedFrame();
                     pending_frame = false;
                 }
-                try cb.decoderRuntimeSubmitFrame();
-                frame_active = false;
+                try frame.submit();
                 pending_frame = true;
             } else {
-                try cb.decoderRuntimeSubmitAndWaitFrame();
-                frame_active = false;
+                try frame.finish();
                 try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
             }
         }
@@ -2367,7 +2352,7 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
         }
     };
 
-    if (cohort and cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame()) frame_active = try cb.decoderRuntimeBeginFrame();
+    if (cohort and cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame()) frame = if (pipelined) try Submission.beginPipelined(cb) else try Submission.begin(cb);
     const output = try audioSourceLinear(cb, allocator, store, cfg, hidden, "a.pre_encode.out", subsampled.seq_len, cfg.audio_hidden, cfg.output_hidden, .row_major, false, true);
     cb.free(hidden);
     hidden_live = false;
@@ -2409,7 +2394,7 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
             }
         }
     }
-    if (frame_active and cb.kind() == .metal) {
+    if (frame.owns and cb.kind() == .metal) {
         if (contiguous_first) |first| {
             frame_snapshot = try cb.snapshotRows2D(allocator, projected, first, valid_count, cfg.text_hidden);
         } else if (valid_rows) |rows| {
@@ -2419,13 +2404,12 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
         }
     }
     if (pending_frame) {
-        if (frame_active) try @import("../ops/metal_compute.zig").MetalCompute.detachEmbeddingGemma2ActivationViews(cb);
+        if (frame.owns) try @import("../ops/metal_compute.zig").MetalCompute.detachEmbeddingGemma2ActivationViews(cb);
         try cb.decoderRuntimeWaitSubmittedFrame();
         pending_frame = false;
     }
-    if (frame_active) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        frame_active = false;
+    if (frame.owns) {
+        try frame.finish();
         if (cohort and cb.kind() == .metal) try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
     }
 
