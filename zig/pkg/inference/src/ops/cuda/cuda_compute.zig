@@ -7767,7 +7767,7 @@ pub const CudaCompute = struct {
         for (inputs, 0..) |input, index| {
             hash.update(std.mem.asBytes(&input.shape.len));
             hash.update(std.mem.sliceAsBytes(input.shape));
-            const bytes = try checkedMul(input.elements, 4);
+            const bytes = try input.f32Bytes();
             if (index == 0) output_bytes = bytes;
             hash.update(std.mem.asBytes(&bytes));
             if (spans) |output| output[index] = .{ .offset = input_bytes, .bytes = bytes };
@@ -20827,7 +20827,8 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     const spans = input_spans[0..inputs.len];
     const cache_base = try self.audioCacheBase(key, input_metadata[0..inputs.len], spans);
     for (inputs, spans) |ct, span| {
-        if (span.bytes > tensorFromCt(ct).buffer.len) return error.InvalidShape;
+        const storage = tensorFromCt(ct).buffer;
+        if (span.bytes > storage.len or (span.bytes != 0 and storage.ptr == 0)) return error.InvalidShape;
     }
     const first_input = tensorFromCt(inputs[0]);
     const output_bytes = cache_base.output_bytes;
@@ -61470,6 +61471,8 @@ test "source bias workspace policy isolates audio warm and arena plan identities
     const ranks_a = try compute.audioCacheBase(42, &.{ rank_one, rank_two }, null);
     const ranks_b = try compute.audioCacheBase(42, &.{ rank_two, rank_one }, null);
     try std.testing.expect(ranks_a.key != ranks_b.key);
+    try std.testing.expectError(error.InvalidShape, compute.audioCacheBase(42, &.{.{ .shape = &.{ 2, 2 }, .elements = 3 }}, null));
+    try std.testing.expectError(error.InvalidShape, compute.audioCacheBase(42, &.{.{ .shape = &.{-1}, .elements = 0 }}, null));
     // Context/driver/allocator remain poisoned: cache metadata has no SDK work.
     var spans: [inputs.len]CudaCompute.AudioInputSpan = undefined;
     const original = try compute.audioCacheBase(42, &inputs, &spans);

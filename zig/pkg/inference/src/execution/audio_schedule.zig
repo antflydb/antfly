@@ -36,7 +36,20 @@ pub const ExecutionInputs = struct {
     pub const scale_count = 12;
     pub const count = scales + scale_count;
 
-    pub const Metadata = struct { shape: []const i64, elements: usize };
+    pub const Metadata = struct {
+        shape: []const i64,
+        elements: usize,
+
+        pub fn f32Bytes(self: Metadata) !usize {
+            var element_count: usize = 1;
+            for (self.shape) |extent| {
+                const width = std.math.cast(usize, extent) orelse return error.InvalidShape;
+                element_count = try std.math.mul(usize, element_count, width);
+            }
+            if (element_count != self.elements) return error.InvalidShape;
+            return std.math.mul(usize, element_count, @sizeOf(f32));
+        }
+    };
 
     pub fn describe(shapes: *[count][2]i64, rows: usize, width: usize, context_left: usize, heads: usize) ![count]Metadata {
         const row_dim = std.math.cast(i64, rows) orelse return error.InvalidPreparedAudioRecipe;
