@@ -1238,6 +1238,14 @@ A separate seven-test CPU cohort passed for pending submission, readback,
 retirement and observation. These use fixture models and do not establish
 released-model or GPU coverage.
 
+At `4e7233ca5f`, the imported ONNX reading fixture passed on Native CPU,
+M4 Max Metal, and Spark CUDA. The explicit host reference kept its original
+session and used admitted input storage. The resident GPU routes read back
+the 12-byte vocabulary row and avoided the intermediate encoder download.
+Both branches matched text, stop reason, and token count. The fixture also
+checked cancellation and confirmed that separate Native contexts can
+share resident storage while foreign GPU contexts take the host route.
+
 At `61adc44649`, the M4 Max retirement cohort passed 129 of 142
 selected tests in each run with the released T5-small merged decoder
 enabled on Native CPU and Metal. On both providers, the released decoder
