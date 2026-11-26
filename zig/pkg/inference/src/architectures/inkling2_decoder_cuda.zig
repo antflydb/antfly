@@ -37,7 +37,21 @@ const streams = 4;
 const block_slots = 5;
 const page_tokens = 16;
 pub const prefill_chunk_rows = 16;
+pub const max_prefill_chunk_rows = attention.max_relative_rows;
+pub const native_prefill_min_rows = relative.wide_query_rows;
 pub const decode_batch_rows = 4;
+const wide_prefill_min_tokens = 8192;
+const narrow_prefill_prefix_tokens = 64;
+
+pub fn preferredPrefillRows(prompt_tokens: usize, wide_supported: bool) u32 {
+    return if (wide_supported and prompt_tokens >= wide_prefill_min_tokens) max_prefill_chunk_rows else prefill_chunk_rows;
+}
+
+pub fn prefillRowsAtPosition(position: usize, capacity: u32) u32 {
+    if (capacity > prefill_chunk_rows and position < narrow_prefill_prefix_tokens)
+        return @intCast(@min(prefill_chunk_rows, narrow_prefill_prefix_tokens - position));
+    return capacity;
+}
 
 pub fn speculativeBlockContextSupported(text: checkpoint.TextConfig, tokens: usize) bool {
     // The multirow target verifier has diverged from row-one greedy decoding
@@ -273,20 +287,22 @@ pub fn requestMemory(text: checkpoint.TextConfig, max_tokens: u32, chunk_rows: u
     const relative_bytes = try relativeScratchBytes(text, max_tokens, chunk_rows);
     const nv = try moe.scratchBytes(.nvfp4, text, chunk_rows);
     const mx = try moe.scratchBytes(.mxfp8, text, chunk_rows);
+    const additional_prefill = if (chunk_rows <= 64) 0 else (try attention.Workspace.allocationBytes(text, chunk_rows)) - (try attention.Workspace.allocationBytes(text, 64)) +
+        @as(usize, chunk_rows - 64) * (25 * hidden_bytes + @as(usize, text.loop_config.gate_rank) * 2);
     return .{
         .host = 128 * page_count + @as(usize, text.vocab_size) * 4,
         .kv = try config.deviceBytes(.full) + try config.deviceBytes(.sliding) + history_bytes,
         // Fixed allowance for BLAS, row-one plans, the vocabulary shortlist,
         // page tables, and row-bounded attention and controller intermediates.
         .workspace = 64 * 1024 * 1024 + 16 * page_count + relative_bytes +
-            @max(nv.logits, mx.logits) + @max(nv.routed, mx.routed),
+            @max(nv.logits, mx.logits) + @max(nv.routed, mx.routed) + additional_prefill,
     };
 }
 
 fn relativeScratchBytes(text: checkpoint.TextConfig, max_tokens: u32, chunk_rows: u32) !usize {
     var relative_bytes: usize = 0;
-    for (1..chunk_rows + 1) |count| {
-        const rows: u32 = @intCast(count);
+    // Split count is constant within each of these row ranges.
+    for ([_]u32{ @min(7, chunk_rows), chunk_rows }) |rows| {
         relative_bytes = @max(relative_bytes, try relative.scratchBytes(.{
             .rows = rows,
             .start = max_tokens - rows,
@@ -320,6 +336,7 @@ pub const Request = struct {
     history_side: usize = 0,
     /// Opt in to a different BF16 dot-product reduction order.
     use_dense: bool = false,
+    use_native_prefill: bool = false,
     use_reference_head: bool = false,
     use_packed_weights: bool = true,
     use_separate_controllers: bool = false,
@@ -331,7 +348,7 @@ pub const Request = struct {
     pub fn initWithPrefill(self: *Request, allocator: std.mem.Allocator, model: *Decoder, max_tokens: u32, chunk_rows: u32) !void {
         const text = model.text;
         if (max_tokens == 0 or max_tokens > text.model_max_length or chunk_rows == 0 or
-            chunk_rows > @min(prefill_chunk_rows, max_tokens)) return error.InvalidInkling2Context;
+            chunk_rows > @min(max_prefill_chunk_rows, max_tokens)) return error.InvalidInkling2Context;
         self.* = .{
             .model = model,
             .max_tokens = max_tokens,
@@ -659,6 +676,7 @@ pub const Request = struct {
         try m.attn.run(ctx, &m.blas, text, &layer.attn, .{
             .matvec = if (self.use_dense) &m.matvec else null,
             .use_packed = self.use_packed_weights,
+            .use_native_prefill = self.use_native_prefill and self.workspace.rows >= native_prefill_min_rows,
             .input = .{ .q = input[0], .k = input[1], .v = input[2] },
             .output = raw_heads orelse self.get(.raw),
             .project_output = raw_heads == null,
@@ -726,7 +744,8 @@ pub const Request = struct {
             .logits = self.get(.router),
             .blas = self.get(.blas),
             .routed = self.get(.routed),
-            .activation_precision = m.expert_activation_precision,
+            .use_pipelined_projection = self.use_native_prefill,
+            .activation_precision = if (self.use_native_prefill) .block_scaled else m.expert_activation_precision,
         });
         try self.finishVisit(visit, ordinal, completed, self.get(.raw));
         return completed;
@@ -844,7 +863,7 @@ pub const Request = struct {
         if (tokens.len > self.max_tokens - self.position()) return error.InvalidInkling2Context;
         var offset: usize = 0;
         while (offset < tokens.len) {
-            const rows: u32 = @intCast(@min(self.append_capacity, tokens.len - offset));
+            const rows: u32 = @intCast(@min(prefillRowsAtPosition(self.position(), self.append_capacity), tokens.len - offset));
             try self.run(.{ .tokens = tokens[offset..][0..rows] }, rows, .none);
             offset += rows;
         }

@@ -30,8 +30,23 @@ const Matvec = embedded.EmbeddedModule(struct {
 
 pub const Format = enum { nvfp4, mxfp8 };
 pub const ActivationPrecision = enum { block_scaled, bf16 };
+const small_grouped_routes = 128;
+const medium_grouped_routes = 512;
+const wide_grouped_routes = 4096;
+const max_grouped_routes = 32_768;
+const min_grouped_input_rows = 16;
+const routes_per_group = 8;
+const routes_per_wide_group = 32;
+const routes_per_large_group = 64;
+const route_group_threads = 256;
+const wide_route_group_threads = 128;
+
+fn groupBytes(routes: u32) usize {
+    return (@as(usize, routes) + 1) * @sizeOf(u32);
+}
 
 pub const Request = struct {
+    use_pipelined_projection: bool = false,
     format: Format,
     activation: DeviceBuffer,
     activation_block_scale: DeviceBuffer,
@@ -86,6 +101,7 @@ pub const Bf16Request = struct {
 };
 
 pub const FfnRequest = struct {
+    use_pipelined_projection: bool = false,
     format: Format,
     input: DeviceBuffer,
     logits: DeviceBuffer,
@@ -162,6 +178,10 @@ const FfnLayout = struct {
     routed_rows: u32,
     ids: Span,
     route_weights: Span,
+    group_count: Span,
+    groups: Span,
+    group_width: u32,
+    group_metadata: Span,
     encoded: Span,
     block_scale: Span,
     outer_scale: Span,
@@ -182,11 +202,21 @@ const FfnLayout = struct {
         const largest = try std.math.mul(usize, routed_rows, @max(r.hidden, r.intermediate));
         const expert_intermediate = try std.math.mul(usize, routed_rows, r.intermediate);
         const expert_hidden = try std.math.mul(usize, routed_rows, r.hidden);
+        const group_rows = r.rows >= min_grouped_input_rows and routed_rows <= max_grouped_routes;
+        const width: u32 = if (routed_rows <= medium_grouped_routes) routes_per_group else if (routed_rows <= wide_grouped_routes) routes_per_wide_group else routes_per_large_group;
+        // The extra bucket collects invalid expert IDs and preserves zero output.
+        // Each nonempty bucket contributes at most width - 1 padding slots.
+        const buckets = @min(routed_rows, r.experts + 1);
+        const max_groups = (routed_rows + (width - 1) * buckets) / width;
         var cursor: usize = 0;
         var result: FfnLayout = .{
             .routed_rows = routed_rows,
             .ids = try Span.allocate(&cursor, @as(usize, routed_rows) * 4),
             .route_weights = try Span.allocate(&cursor, @as(usize, routed_rows) * 4),
+            .group_count = try Span.allocate(&cursor, if (group_rows) @sizeOf(u32) else 0),
+            .groups = try Span.allocate(&cursor, if (group_rows) @as(usize, max_groups) * groupBytes(width) else 0),
+            .group_width = width,
+            .group_metadata = try Span.allocate(&cursor, if (group_rows and width == routes_per_large_group) 2 * @as(usize, r.experts + 1) * @sizeOf(u32) else 0),
             .encoded = try Span.allocate(&cursor, if (fp4) largest / 2 else largest),
             .block_scale = try Span.allocate(&cursor, largest / group),
             .outer_scale = try Span.allocate(&cursor, if (fp4) @as(usize, routed_rows) * 4 else 0),
@@ -204,9 +234,16 @@ pub fn ffnScratchBytes(r: FfnRequest) !usize {
     return (try FfnLayout.plan(r)).bytes;
 }
 
+const GroupedRoutes = struct {
+    table: DeviceBuffer = .{},
+    count: DeviceBuffer = .{},
+    width: u32 = routes_per_group,
+};
+
 pub const Module = struct {
     program: Program = .{},
     matvec: Matvec = .{},
+    use_single_route: bool = false,
 
     pub fn deinit(self: *Module, ctx: *Context) void {
         self.matvec.deinit(ctx);
@@ -246,7 +283,11 @@ pub const Module = struct {
         var args = [_]?*anyopaque{ &addresses[0], &addresses[1], &addresses[2], &addresses[3], &addresses[4], &addresses[5], &addresses[6], &width, &repeat, &experts };
         if (fp4 and sm120(ctx)) {
             try self.matvec.init(ctx);
-            try self.matvec.launch(ctx, .quantize_nvfp4, output_rows, 1, 256, &args);
+            const share = !self.use_single_route and r.repeat > 1 and r.activation.ptr % @alignOf(u64) == 0;
+            try self.matvec.launch(ctx, if (share) .quantize_nvfp4_routes else .quantize_nvfp4, if (share) r.input_rows else output_rows, 1, 256, &args);
+        } else if (!fp4 and !self.use_single_route and sm120(ctx) and r.input_rows >= min_grouped_input_rows and r.activation.ptr % @alignOf(u32) == 0) {
+            try self.matvec.init(ctx);
+            try self.matvec.launch(ctx, .quantize_mxfp8_routes, r.input_rows, 1, threads, &args);
         } else {
             try self.program.init(ctx);
             try self.program.launch(ctx, if (fp4) .quantize_nvfp4 else .quantize_mxfp8, output_rows, 1, 256, &args);
@@ -284,11 +325,16 @@ pub const Module = struct {
     }
 
     pub fn run(self: *Module, ctx: *Context, r: Request) !void {
+        return self.projectBlockScaled(ctx, r, .{});
+    }
+
+    fn projectBlockScaled(self: *Module, ctx: *Context, r: Request, grouped: GroupedRoutes) !void {
         try validate(r);
         if (ctx.info.compute_major < 8) return error.UnsupportedCudaDevice;
+        const routed = if (grouped.table.ptr != 0) grouped.table else r.expert_ids;
         var addresses = [7]u64{
             r.output.ptr,             r.activation.ptr, r.activation_block_scale.ptr, r.weight.ptr,
-            r.weight_block_scale.ptr, r.expert_ids.ptr, r.row_outer_scale.ptr,
+            r.weight_block_scale.ptr, routed.ptr,       r.row_outer_scale.ptr,
         };
         var k = r.in_dim;
         var n = r.out_dim;
@@ -297,7 +343,28 @@ pub const Module = struct {
         if (r.interleaved) {
             if (!supportsMatvec(ctx, r)) return error.InvalidShape;
             try self.matvec.init(ctx);
-            try self.matvec.launch(ctx, if (r.format == .nvfp4) .nvfp4 else .mxfp8, r.out_dim / 16, r.rows, threads, &args);
+            if (grouped.table.ptr == 0) {
+                try self.matvec.launch(ctx, if (r.format == .nvfp4) .nvfp4 else .mxfp8, r.out_dim / 16, r.rows, threads, &args);
+            } else {
+                const fp4 = r.format == .nvfp4;
+                const pipelined = r.use_pipelined_projection and fp4 and grouped.width == routes_per_large_group and
+                    r.rows >= 8192 and r.out_dim % 64 == 0 and (r.activation.ptr | r.weight.ptr | r.output.ptr) % 16 == 0;
+                const more_columns = grouped.width == routes_per_large_group and r.out_dim % 32 == 0;
+                const entry: Matvec.Entry = if (pipelined) .nvfp4_routes64_cols64_pipelined else switch (grouped.width) {
+                    routes_per_group => if (fp4) .nvfp4_routes8 else .mxfp8_routes8,
+                    routes_per_wide_group => if (fp4) .nvfp4_routes32 else .mxfp8_routes32,
+                    routes_per_large_group => if (more_columns)
+                        (if (fp4) .nvfp4_routes64_cols32 else .mxfp8_routes64_cols32)
+                    else
+                        (if (fp4) .nvfp4_routes64 else .mxfp8_routes64),
+                    else => unreachable,
+                };
+                var count = grouped.count.ptr;
+                var grouped_args = args ++ [_]?*anyopaque{&count};
+                const columns: u32 = if (pipelined) 64 else if (more_columns) 32 else 16;
+                const block_threads: u32 = if (pipelined) 256 else threads;
+                try self.matvec.launch(ctx, entry, r.out_dim / columns, @intCast(grouped.table.len / groupBytes(grouped.width)), block_threads, &grouped_args);
+            }
             return;
         }
         try self.program.init(ctx);
@@ -311,6 +378,10 @@ pub const Module = struct {
     /// Multiply BF16 activations by weights expanded from packed checkpoint
     /// fragments to BF16 at the Tensor Core input, with F32 accumulation.
     pub fn runBf16(self: *Module, ctx: *Context, r: Bf16Request) !void {
+        try self.projectBf16(ctx, r, .{});
+    }
+
+    fn projectBf16(self: *Module, ctx: *Context, r: Bf16Request, grouped: GroupedRoutes) !void {
         const fp4 = r.format == .nvfp4;
         const tile_width: u32 = if (fp4) 64 else 32;
         const scale_group: u32 = if (fp4) 16 else 32;
@@ -335,18 +406,61 @@ pub const Module = struct {
         try buffer.validateRegions(7, .{ r.input, r.weights.values, r.weights.scales, r.expert_ids, r.weights.amax, r.weights.denominator, r.output }, lengths, .{ 4, 16, 1, 4, 4, 4, 2 }, 6);
         if (fp4 and r.weights.scales.ptr % 4 != 0) return error.InvalidShape;
         try self.matvec.init(ctx);
-        var ptrs = [_]u64{ r.output.ptr, r.input.ptr, r.weights.values.ptr, r.weights.scales.ptr, r.expert_ids.ptr, r.weights.amax.ptr, r.weights.denominator.ptr };
+        const share_weights = grouped.table.ptr != 0;
+        const routing = if (share_weights) grouped.table.ptr else r.expert_ids.ptr;
+        var ptrs = [_]u64{ r.output.ptr, r.input.ptr, r.weights.values.ptr, r.weights.scales.ptr, routing, r.weights.amax.ptr, r.weights.denominator.ptr };
         var k = r.in_dim;
         var n = r.out_dim;
         var experts = r.expert_count;
         var repeat = r.repeat;
-        var args = [_]?*anyopaque{ &ptrs[0], &ptrs[1], &ptrs[2], &ptrs[3], &ptrs[4], &ptrs[5], &ptrs[6], &k, &n, &experts, &repeat };
-        try self.matvec.launch(ctx, if (fp4) .nvfp4_bf16 else .mxfp8_bf16, r.out_dim / 16, rows, threads, &args);
+        var count = grouped.count.ptr;
+        var args = [_]?*anyopaque{ &ptrs[0], &ptrs[1], &ptrs[2], &ptrs[3], &ptrs[4], &ptrs[5], &ptrs[6], &k, &n, &experts, &repeat, &count };
+        if (share_weights) {
+            const entry: Matvec.Entry = switch (grouped.width) {
+                routes_per_group => if (fp4) .nvfp4_bf16_grouped else .mxfp8_bf16_grouped,
+                routes_per_wide_group => if (fp4) .nvfp4_bf16_routes32 else .mxfp8_bf16_routes32,
+                routes_per_large_group => if (fp4) .nvfp4_bf16_routes64 else .mxfp8_bf16_routes64,
+                else => unreachable,
+            };
+            try self.matvec.launch(ctx, entry, r.out_dim / 16, @intCast(grouped.table.len / groupBytes(grouped.width)), threads, &args);
+        } else {
+            try self.matvec.launch(ctx, if (fp4) .nvfp4_bf16 else .mxfp8_bf16, r.out_dim / 16, rows, threads, args[0..11]);
+        }
     }
 
-    fn projectFfn(self: *Module, ctx: *Context, precision: ActivationPrecision, projection: Request, input: QuantizeRequest, weights: PackedWeights) !void {
+    fn groupRoutes(self: *Module, ctx: *Context, r: FfnRequest, layout: FfnLayout, ids: DeviceBuffer) !GroupedRoutes {
+        if (self.use_single_route or !r.gate_up.interleaved or !r.down.interleaved or layout.groups.len == 0 or
+            ctx.info.compute_major != 12 or ctx.info.compute_minor != 1) return .{};
+        const groups: GroupedRoutes = .{ .table = layout.groups.view(r.scratch), .count = layout.group_count.view(r.scratch), .width = layout.group_width };
+        try self.matvec.init(ctx);
+        var ptrs = [_]u64{ groups.table.ptr, groups.count.ptr, ids.ptr };
+        var rows = layout.routed_rows;
+        var experts = r.experts;
+        if (groups.width == routes_per_large_group) {
+            const metadata = layout.group_metadata.view(r.scratch);
+            var prefixes = metadata.ptr;
+            var cursors = metadata.ptr + metadata.len / 2;
+            var count_args = [_]?*anyopaque{ &ptrs[0], &ptrs[1], &prefixes, &cursors, &ptrs[2], &rows, &experts };
+            try self.matvec.launch(ctx, .group_rows64_count, 1, 1, route_group_threads, &count_args);
+            var scatter_args = [_]?*anyopaque{ &ptrs[0], &prefixes, &cursors, &ptrs[2], &rows, &experts };
+            try self.matvec.launch(ctx, .group_rows64_scatter, (rows - 1) / route_group_threads + 1, 1, route_group_threads, &scatter_args);
+            return groups;
+        }
+        var args = [_]?*anyopaque{ &ptrs[0], &ptrs[1], &ptrs[2], &rows, &experts };
+        const entry: Matvec.Entry = if (rows <= small_grouped_routes)
+            .group_rows
+        else if (rows <= medium_grouped_routes)
+            .group_rows_512
+        else
+            .group_rows32_4096;
+        const group_threads: u32 = if (groups.width == routes_per_wide_group) wide_route_group_threads else route_group_threads;
+        try self.matvec.launch(ctx, entry, 1, 1, group_threads, &args);
+        return groups;
+    }
+
+    fn projectFfn(self: *Module, ctx: *Context, precision: ActivationPrecision, projection: Request, input: QuantizeRequest, weights: PackedWeights, grouped: GroupedRoutes) !void {
         if (precision == .bf16) {
-            try self.runBf16(ctx, .{
+            try self.projectBf16(ctx, .{
                 .format = projection.format,
                 .input = input.input,
                 .weights = weights,
@@ -357,10 +471,10 @@ pub const Module = struct {
                 .in_dim = projection.in_dim,
                 .out_dim = projection.out_dim,
                 .expert_count = projection.expert_count,
-            });
+            }, grouped);
         } else {
             try self.quantize(ctx, input);
-            try self.run(ctx, projection);
+            try self.projectBlockScaled(ctx, projection, grouped);
         }
     }
 
@@ -405,6 +519,7 @@ pub const Module = struct {
         var args = [_]?*anyopaque{ &route_ptrs[0], &route_ptrs[1], &route_ptrs[2], &route_ptrs[3], &experts, &topk, &route_scale };
         const route_threads: u32 = if (r.experts == 128 and ctx.info.compute_major == 12 and ctx.info.compute_minor <= 1) 32 else 256;
         try self.program.launch(ctx, .route, r.rows, 1, route_threads, &args);
+        const grouped = try self.groupRoutes(ctx, r, layout, ids);
 
         var quantize_request: QuantizeRequest = .{
             .format = r.format,
@@ -421,6 +536,7 @@ pub const Module = struct {
             .expert_count = r.experts,
         };
         var projection: Request = .{
+            .use_pipelined_projection = r.use_pipelined_projection,
             .format = r.format,
             .activation = encoded,
             .activation_block_scale = block_scale,
@@ -435,14 +551,23 @@ pub const Module = struct {
             .out_dim = r.intermediate * 2,
             .expert_count = r.experts,
         };
-        try self.projectFfn(ctx, r.activation_precision, projection, quantize_request, r.gate_up);
+        try self.projectFfn(ctx, r.activation_precision, projection, quantize_request, r.gate_up, grouped);
         var activation_ptrs = [3]u64{ activated.ptr, gate_up.ptr, route_weights.ptr };
         var intermediate = r.intermediate;
         var routed_rows = layout.routed_rows;
         var gate_cap = r.gate_cap;
         var up_cap = r.up_cap;
-        var activation_args = [_]?*anyopaque{ &activation_ptrs[0], &activation_ptrs[1], &activation_ptrs[2], &intermediate, &routed_rows, &gate_cap, &up_cap };
-        try self.program.launch(ctx, .activate, (r.intermediate - 1) / threads + 1, layout.routed_rows, threads, &activation_args);
+        const fuse = !self.use_single_route and r.activation_precision == .block_scaled and sm120(ctx) and
+            r.rows >= min_grouped_input_rows and r.intermediate == 1152;
+        if (fuse) {
+            try self.matvec.init(ctx);
+            var ptrs = [_]u64{ encoded.ptr, block_scale.ptr, outer_scale.ptr, gate_up.ptr, route_weights.ptr, ids.ptr, r.down.amax.ptr, r.down.denominator.ptr };
+            var fused_args = [_]?*anyopaque{ &ptrs[0], &ptrs[1], &ptrs[2], &ptrs[3], &ptrs[4], &ptrs[5], &ptrs[6], &ptrs[7], &experts, &gate_cap, &up_cap };
+            try self.matvec.launch(ctx, if (fp4) .activate_nvfp4_1152 else .activate_mxfp8_1152, layout.routed_rows, 1, if (fp4) 256 else threads, &fused_args);
+        } else {
+            var activation_args = [_]?*anyopaque{ &activation_ptrs[0], &activation_ptrs[1], &activation_ptrs[2], &intermediate, &routed_rows, &gate_cap, &up_cap };
+            try self.program.launch(ctx, .activate, (r.intermediate - 1) / threads + 1, layout.routed_rows, threads, &activation_args);
+        }
 
         quantize_request.input = activated;
         quantize_request.weight_amax = r.down.amax;
@@ -456,7 +581,7 @@ pub const Module = struct {
         projection.output = down;
         projection.in_dim = r.intermediate;
         projection.out_dim = r.hidden;
-        try self.projectFfn(ctx, r.activation_precision, projection, quantize_request, r.down);
+        if (fuse) try self.projectBlockScaled(ctx, projection, grouped) else try self.projectFfn(ctx, r.activation_precision, projection, quantize_request, r.down, grouped);
         var output = r.output.ptr;
         var routed_output = down.ptr;
         var hidden = r.hidden;

@@ -75,6 +75,7 @@ pub const Layer = struct {
 };
 
 pub const Scratch = struct {
+    use_pipelined_projection: bool = false,
     logits: DeviceBuffer,
     blas: DeviceBuffer,
     routed: DeviceBuffer,
@@ -147,6 +148,7 @@ pub const Forward = struct {
         ffn.output = output;
         ffn.scratch = scratch.routed;
         ffn.activation_precision = scratch.activation_precision;
+        ffn.use_pipelined_projection = scratch.use_pipelined_projection;
         if (scratch.rowwise_router) {
             // The router's scores determine discrete expert selection. Keep
             // the same cuBLAS plan as a single request for each decode lane.

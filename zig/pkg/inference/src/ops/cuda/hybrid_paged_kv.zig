@@ -130,6 +130,18 @@ const Pending = struct {
     failed: bool = false,
 };
 
+const StagedWrite = struct {
+    pending: *Pending,
+    bank: *Bank,
+    start: usize,
+    end: usize,
+
+    fn finish(self: StagedWrite, slot: usize) void {
+        self.bank.written[slot] = true;
+        self.pending.remaining_slots -= 1;
+    }
+};
+
 const CopyDirection = enum { to_cache, from_cache };
 
 pub const Usage = struct {
@@ -196,9 +208,7 @@ pub const Cache = struct {
         self.pending = .{ .append = append, .remaining_slots = self.full.written.len + self.sliding.written.len };
     }
 
-    /// Sources must stay live until the ordered batch is committed or aborted.
-    /// Each visit supplies the entire staged suffix once.
-    pub fn queueWrite(self: *Cache, visit: Visit, source: Planes) !void {
+    fn prepareWrite(self: *Cache, visit: Visit, source: Planes) !StagedWrite {
         const pending = if (self.pending) |*value| value else return error.KvAppendMissing;
         if (pending.failed) return error.KvAppendFailed;
         const selected = self.bank(visit.group);
@@ -208,12 +218,28 @@ pub const Cache = struct {
         const end = pending.append.next_tokens;
         const bytes = (end - start) * self.row_bytes;
         try buffer.validateRegions(3, .{ source.key, source.value, selected.device }, .{ bytes, bytes, selected.device.len }, .{ 2, 2, 2 }, 2);
+        return .{ .pending = pending, .bank = selected, .start = start, .end = end };
+    }
 
-        pending.submitted = true;
-        errdefer pending.failed = true;
-        try self.copyRows(selected.planes(visit.slot), source, visit.group, start, end, &pending.append, .to_cache);
-        selected.written[visit.slot] = true;
-        pending.remaining_slots -= 1;
+    /// Sources must stay live until the ordered batch is committed or aborted.
+    /// Each visit supplies the entire staged suffix once.
+    pub fn queueWrite(self: *Cache, visit: Visit, source: Planes) !void {
+        const write = try self.prepareWrite(visit, source);
+        write.pending.submitted = true;
+        errdefer write.pending.failed = true;
+        try self.copyRows(write.bank.planes(visit.slot), source, visit.group, write.start, write.end, &write.pending.append, .to_cache);
+        write.finish(visit.slot);
+    }
+
+    /// Scatter the entire staged suffix using this group's published page IDs.
+    pub fn queueWriteWithPages(self: *Cache, visit: Visit, source: Planes, device_page_ids: DeviceBuffer, program: anytype) !StagedView {
+        const write = try self.prepareWrite(visit, source);
+        const destination = try self.viewForVisit(visit, write.bank, write.end);
+        write.pending.submitted = true;
+        errdefer write.pending.failed = true;
+        try program.appendStaged(self.ctx, destination, device_page_ids, source, write.start, self.row_bytes);
+        write.finish(visit.slot);
+        return destination;
     }
 
     /// Queue a read of committed rows on the same stream. Callers own the
@@ -260,7 +286,10 @@ pub const Cache = struct {
         if (visit.slot >= selected.written.len) return error.InvalidKvRange;
         if (pending.failed) return error.KvAppendFailed;
         if (!selected.written[visit.slot]) return error.KvVisitNotWritten;
-        const end = pending.append.next_tokens;
+        return self.viewForVisit(visit, selected, pending.append.next_tokens);
+    }
+
+    fn viewForVisit(self: *Cache, visit: Visit, selected: *const Bank, end: usize) !StagedView {
         const range = self.stagedPageRange(visit.group, end);
         return .{
             .planes = selected.planes(visit.slot),

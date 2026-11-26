@@ -126,14 +126,21 @@ pub const Layer = struct {
 
 const Temp = enum { projection, q, q_norm, k, v, k_norm, v_norm, r, r_norm, sink, gate, dynamic, rel_logits, attention };
 const TempArray = [@typeInfo(Temp).@"enum".field_names.len]DeviceBuffer;
+pub const max_relative_rows = 2304;
 
 pub const Workspace = struct {
     backing: DeviceBuffer,
     slices: TempArray,
     rows: u32,
 
-    pub fn init(ctx: *Context, text: model.TextConfig, rows: u32) !Workspace {
-        if (rows == 0 or rows > 256) return error.InvalidShape;
+    const Layout = struct {
+        offsets: [@typeInfo(Temp).@"enum".field_names.len]usize,
+        lengths: [@typeInfo(Temp).@"enum".field_names.len]usize,
+        total: usize,
+    };
+
+    fn layout(text: model.TextConfig, rows: u32) !Layout {
+        if (rows == 0 or rows > max_relative_rows) return error.InvalidShape;
         const q = @as(usize, text.num_attention_heads) * text.head_dim;
         const kv = @as(usize, text.num_key_value_heads) * text.head_dim;
         const rel = @as(usize, text.num_attention_heads) * text.d_rel;
@@ -153,16 +160,25 @@ pub const Workspace = struct {
             @as(usize, text.num_attention_heads) * text.rel_extent,
             q,
         };
-        var offsets: [widths.len]usize = undefined;
-        var total: usize = 0;
-        for (widths, &offsets) |width, *offset| {
-            offset.* = std.mem.alignForward(usize, total, 256);
-            total = offset.* + @as(usize, rows) * width * 2;
+        var result: Layout = .{ .offsets = undefined, .lengths = undefined, .total = 0 };
+        for (widths, &result.offsets, &result.lengths) |width, *offset, *length| {
+            offset.* = std.mem.alignForward(usize, result.total, 256);
+            length.* = try std.math.mul(usize, rows, 2 * width);
+            result.total = try std.math.add(usize, offset.*, length.*);
         }
-        const backing = try DeviceBuffer.allocWithPurpose(ctx, total, .command_workspace);
+        return result;
+    }
+
+    pub fn allocationBytes(text: model.TextConfig, rows: u32) !usize {
+        return (try layout(text, rows)).total;
+    }
+
+    pub fn init(ctx: *Context, text: model.TextConfig, rows: u32) !Workspace {
+        const plan = try layout(text, rows);
+        const backing = try DeviceBuffer.allocWithPurpose(ctx, plan.total, .command_workspace);
         var slices: TempArray = undefined;
-        for (&slices, widths, offsets) |*slice, width, offset|
-            slice.* = .{ .ptr = backing.ptr + offset, .len = @as(usize, rows) * width * 2, .borrowed = true };
+        for (&slices, plan.lengths, plan.offsets) |*slice, length, offset|
+            slice.* = .{ .ptr = backing.ptr + offset, .len = length, .borrowed = true };
         return .{ .backing = backing, .slices = slices, .rows = rows };
     }
 
@@ -184,6 +200,7 @@ pub const Workspace = struct {
 
 pub const Input = struct { q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer };
 pub const Request = struct {
+    use_native_prefill: bool = false,
     input: Input,
     matvec: ?*Dense = null,
     use_packed: bool = true,
@@ -324,11 +341,17 @@ pub const Forward = struct {
                 .output_scale = if (layer.local) 1.0 / @sqrt(@as(f32, 5.0)) else 1.0 / 3.0,
             }, op[7], text.rms_norm_eps);
         }
-        try blas.matmulBf16WeightBf16Out(ctx, r.workspace.get(.rel_logits), r.workspace.get(.r_norm), layer.get(.relative_basis), r.blas_space, @as(usize, rows) * text.num_attention_heads, text.d_rel, text.rel_extent);
+        const fuse_relative = r.use_native_prefill and replay == null and layer.local and text.rel_extent != 0 and
+            text.d_rel == relative.relative_width and
+            self.attention.supportsRelativeProjection(ctx, rows, text.num_attention_heads, text.num_key_value_heads);
+        if (!fuse_relative)
+            try blas.matmulBf16WeightBf16Out(ctx, r.workspace.get(.rel_logits), r.workspace.get(.r_norm), layer.get(.relative_basis), r.blas_space, @as(usize, rows) * text.num_attention_heads, text.d_rel, text.rel_extent);
         const staged: cache.Planes = .{ .key = r.workspace.get(.k_norm), .value = r.workspace.get(.v_norm) };
         const binding = if (replay) |binding| blk: {
             try self.attention.appendReplay(ctx, binding, r.replay_position, r.page_ids_device, staged, text.num_key_value_heads);
             break :blk binding;
+        } else if (rows >= 16 and ctx.info.compute_major >= 8) blk: {
+            break :blk try r.cache_owner.queueWriteWithPages(r.visit, staged, r.page_ids_device, &self.attention);
         } else blk: {
             try r.cache_owner.queueWrite(r.visit, staged);
             break :blk try r.cache_owner.stagedBinding(r.visit);
@@ -346,8 +369,13 @@ pub const Forward = struct {
             .kv = binding,
             .device_page_ids = r.page_ids_device,
             .replay_position = r.replay_position,
+            .use_native_prefill = r.use_native_prefill,
             .query = r.workspace.get(.q_norm),
-            .relative = r.workspace.get(.rel_logits),
+            .relative = if (fuse_relative) .{} else r.workspace.get(.rel_logits),
+            .relative_projection = if (fuse_relative) .{
+                .query = r.workspace.get(.r_norm),
+                .basis = layer.get(.relative_basis),
+            } else null,
             .sinks = projected[@backingInt(Temp.sink)],
             .gate = projected[@backingInt(Temp.gate)],
             .scratch = r.attention_space,

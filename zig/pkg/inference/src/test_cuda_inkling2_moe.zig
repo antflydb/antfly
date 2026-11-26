@@ -92,3 +92,75 @@ test "CUDA Inkling 2 loads and executes both resident MoE formats" {
         });
     }
 }
+
+test "CUDA Inkling 2 loads and executes same-expert groups with identical BF16 output" {
+    const dir = @import("antfly_platform").env.getenv("ANTFLY_INKLING2_MODEL_DIR") orelse return error.Inkling2FixtureRequired;
+    var ctx = try Context.initDefault();
+    defer ctx.deinit();
+    if (ctx.info.compute_major != 12 or ctx.info.compute_minor != 1) return error.SkipZigTest;
+    var source = try checkpoint.Checkpoint.open(std.testing.allocator, dir);
+    defer source.deinit();
+    var blas = try Blas.open(&ctx);
+    defer blas.deinit();
+    var staging: Staging = .{};
+    defer staging.deinit(&ctx);
+    var forward: moe.Forward = .{};
+    defer forward.deinit(&ctx);
+    const config = source.config.value.text_config;
+    const row_bytes = @as(usize, config.hidden_size) * 2;
+    const embed = try source.reader.rawTensorBytes("model.llm.embed.weight");
+    var blas_space = try buffer.DeviceBuffer.alloc(&ctx, 8 * 1024 * 1024);
+    defer blas_space.free(&ctx);
+    const pair = try ctx.createProfileEventPair();
+    defer ctx.destroyProfileEventPair(pair);
+
+    for ([_]usize{ 0, 20 }) |number| {
+        var layer = try moe.Layer.load(&ctx, &source, &staging, number);
+        defer layer.deinit(&ctx);
+        try forward.prepareResident(&ctx, config, &layer);
+        for ([_]u32{ 16, 32, 64, 128, 256, 512, 1024, 2048 }) |rows| {
+            const bytes = rows * row_bytes;
+            var host = try buffer.HostBuffer.alloc(&ctx, bytes * 2);
+            defer host.free(&ctx);
+            var input = try buffer.DeviceBuffer.alloc(&ctx, bytes);
+            defer input.free(&ctx);
+            var output = try buffer.DeviceBuffer.alloc(&ctx, bytes);
+            defer output.free(&ctx);
+            const sizes = try moe.scratchBytes(layer.format, config, rows);
+            var logits = try buffer.DeviceBuffer.alloc(&ctx, sizes.logits);
+            defer logits.free(&ctx);
+            var routed = try buffer.DeviceBuffer.alloc(&ctx, sizes.routed);
+            defer routed.free(&ctx);
+            for ([_]moe.ActivationPrecision{ .bf16, .block_scaled }) |precision| {
+                if (precision == .block_scaled and rows != 64 and rows != 512 and rows != 2048) continue;
+                const scratch: moe.Scratch = .{ .activation_precision = precision, .logits = logits, .blas = blas_space, .routed = routed };
+                for ([_]bool{ false, true }) |repeat_tokens| {
+                    // Repeated rows force an expert to use multiple groups,
+                    // including a partially filled group alongside the unique rows.
+                    for (0..rows) |row| {
+                        const token = if (repeat_tokens and row < rows - 5) 42 else 100 + row * 29;
+                        @memcpy(host.bytes()[row * row_bytes ..][0..row_bytes], embed[token * row_bytes ..][0..row_bytes]);
+                    }
+                    try input.copyFromHost(&ctx, host.constBytes()[0..bytes]);
+                    try ctx.synchronize();
+                    var elapsed: [2]u64 = undefined;
+                    for ([_]bool{ true, false }, &elapsed, 0..) |single_route, *us, index| {
+                        forward.projections.use_single_route = single_route;
+                        try forward.run(&ctx, &blas, config, &layer, rows, input, output, scratch);
+                        try ctx.recordProfileStart(pair);
+                        const samples: u64 = if (rows >= 1024) 3 else 12;
+                        for (0..samples) |_| try forward.run(&ctx, &blas, config, &layer, rows, input, output, scratch);
+                        try ctx.recordProfileEnd(pair);
+                        try output.copyToHost(&ctx, host.bytes()[index * bytes ..][0..bytes]);
+                        try ctx.synchronize();
+                        us.* = try ctx.readProfileEventPairUs(pair) / samples;
+                    }
+                    try std.testing.expectEqualSlices(u8, host.constBytes()[0..bytes], host.constBytes()[bytes..]);
+                    std.debug.print("{d}-row {s} {s} FFN ({s} tokens): independent {d} us, grouped {d} us, bit-identical BF16 output\n", .{
+                        rows, @tagName(layer.format), @tagName(precision), if (repeat_tokens) "mixed repeated and distinct" else "distinct", elapsed[0], elapsed[1],
+                    });
+                }
+            }
+        }
+    }
+}

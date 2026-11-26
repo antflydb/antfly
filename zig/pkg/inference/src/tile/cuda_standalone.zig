@@ -148,9 +148,16 @@ pub const routed_block_scaled_projection_entries = .{
 pub const routed_block_scaled_projection = nativeProfile("routed_block_scaled_projection", "routed_block_scaled_projection.ptx", "routed_block_scaled_projection.cu", 80, routed_block_scaled_projection_entries, &.{ "--fmad=false", "-std=c++17" });
 pub const paged_relative_attention_entries = .{
     .chunks = "antfly_paged_relative_gqa_d128_bf16_chunks",
+    .global_rows4_chunks = "antfly_paged_relative_gqa_d128_bf16_global_rows4_chunks",
+    .page16_global_rows4_chunks = "antfly_paged_relative_gqa_d128_bf16_page16_global_rows4_chunks",
+    .page16_sliding_rows4_chunks = "antfly_paged_relative_gqa_d128_bf16_page16_sliding_rows4_chunks",
+    .page16_m128n64_chunks = "antfly_paged_relative_gqa_d128_bf16_page16_m128n64_chunks",
+    .page16_m128n64_pipeline = "antfly_paged_relative_gqa_d128_bf16_page16_m128n64_pipeline",
+    .page16_m128n64_fused_relative = "antfly_paged_relative_gqa_d128_bf16_page16_m128n64_fused_relative",
     .parallel_chunks = "antfly_paged_relative_gqa_d128_bf16_parallel_chunks",
     .combine = "antfly_paged_relative_gqa_d128_bf16_reduce_sink_gate",
     .append = "antfly_paged_kv_append_bf16",
+    .append_rows = "antfly_paged_kv_append_rows_bf16",
 };
 pub const paged_relative_attention = nativeProfile("paged_relative_attention_bf16", "paged_relative_attention_bf16.ptx", "paged_relative_attention_bf16.cu", 80, paged_relative_attention_entries, &.{ "--fmad=false", "-std=c++17" });
 pub const causal_depthwise4_bf16_entries = .{
@@ -190,9 +197,33 @@ pub const routed_block_scaled_matvec_entries = .{
     .nvfp4 = "antfly_routed_e2m1_e4m3_m16n8k64_bf16_sm120",
     .mxfp8 = "antfly_routed_e4m3_e8m0_m16n8k32_bf16_sm120",
     .quantize_nvfp4 = "antfly_quantize_bf16_rows_e2m1_e4m3_sm120",
+    .quantize_nvfp4_routes = "antfly_quantize_bf16_tokens_e2m1_e4m3_routes_sm120",
+    .quantize_mxfp8_routes = "antfly_quantize_bf16_tokens_e4m3_e8m0_routes_sm120",
+    .activate_nvfp4_1152 = "antfly_weighted_swiglu_1152_e2m1_e4m3_sm120",
+    .activate_mxfp8_1152 = "antfly_weighted_swiglu_1152_e4m3_e8m0_sm120",
     .pack = "antfly_pack_m16n8_routed_weights_sm120",
     .nvfp4_bf16 = "antfly_routed_e2m1_e4m3_bf16_input_m16n8k16_sm120",
     .mxfp8_bf16 = "antfly_routed_e4m3_e8m0_bf16_input_m16n8k16_sm120",
+    .group_rows = "antfly_group_routed_rows8",
+    .group_rows_512 = "antfly_group_routed_rows8_512",
+    .group_rows32_4096 = "antfly_group_routed_rows32_4096",
+    .group_rows64_count = "antfly_group_routed_rows64_count",
+    .group_rows64_scatter = "antfly_group_routed_rows64_scatter",
+    .nvfp4_bf16_grouped = "antfly_routed_e2m1_e4m3_bf16_input_grouped_m16n8k16_sm120",
+    .mxfp8_bf16_grouped = "antfly_routed_e4m3_e8m0_bf16_input_grouped_m16n8k16_sm120",
+    .nvfp4_bf16_routes32 = "antfly_routed_e2m1_e4m3_bf16_input_routes32_m16n8k16_sm120",
+    .mxfp8_bf16_routes32 = "antfly_routed_e4m3_e8m0_bf16_input_routes32_m16n8k16_sm120",
+    .nvfp4_routes8 = "antfly_routed_e2m1_e4m3_routes8_m16n8k64_bf16_sm120",
+    .mxfp8_routes8 = "antfly_routed_e4m3_e8m0_routes8_m16n8k32_bf16_sm120",
+    .nvfp4_routes32 = "antfly_routed_e2m1_e4m3_routes32_m16n8k64_bf16_sm120",
+    .mxfp8_routes32 = "antfly_routed_e4m3_e8m0_routes32_m16n8k32_bf16_sm120",
+    .nvfp4_bf16_routes64 = "antfly_routed_e2m1_e4m3_bf16_input_routes64_m16n8k16_sm120",
+    .mxfp8_bf16_routes64 = "antfly_routed_e4m3_e8m0_bf16_input_routes64_m16n8k16_sm120",
+    .nvfp4_routes64 = "antfly_routed_e2m1_e4m3_routes64_m16n8k64_bf16_sm120",
+    .mxfp8_routes64 = "antfly_routed_e4m3_e8m0_routes64_m16n8k32_bf16_sm120",
+    .nvfp4_routes64_cols64_pipelined = "antfly_routed_e2m1_e4m3_routes64_cols64_pipelined_bf16_sm120",
+    .nvfp4_routes64_cols32 = "antfly_routed_e2m1_e4m3_routes64_cols32_k64_bf16_sm120",
+    .mxfp8_routes64_cols32 = "antfly_routed_e4m3_e8m0_routes64_cols32_k32_bf16_sm120",
 };
 pub const routed_block_scaled_matvec = nativeProfile("routed_block_scaled_matvec_sm120", "routed_block_scaled_matvec_sm120.ptx", "routed_block_scaled_matvec_sm120.cu", 120, routed_block_scaled_matvec_entries, &.{ "-arch=compute_120f", "--fmad=false", "-std=c++17" });
 pub const dense_bf16_matvec_entries = .{

@@ -762,10 +762,11 @@ main weight shard SHA-256 is
 `65e60f51aa1284d4fb022584908c315270334d991828bb774af60584523539d1`.
 [Released checkpoint](https://huggingface.co/thinkingmachines/Inkling-2-Mini/tree/7a67ae2314b44ef05c87fd1d4d311c58aaeb18f6)
 
-GB10 uses BF16 activations for both routed expert projections. The Tensor
-Core kernel expands NVFP4 and MXFP8 weights to BF16 in registers and
-accumulates in FP32. Use `--quantized-experts` to select the earlier
-block-scaled activation path.
+GB10 uses BF16 expert activations for decode, image prompts, and shorter
+text prompts. Long text prefill on GB10 uses block-scaled NVFP4 and MXFP8
+activations through first-token selection. Both paths accumulate in FP32.
+Use `--quantized-experts` to run the CLI with block-scaled activations
+throughout generation.
 
 The CLI enables fast matvec by default on GB10 (SM121). Use
 `--no-fast-matvec` to select cuBLAS for the attention and controller
@@ -792,6 +793,161 @@ matched eager logits bit for bit at the sampled positions. Compute
 Sanitizer reported zero memory errors and leaks when instrumenting the
 new expert kernels in text and image generation and zero synchronization
 errors for captured text decode.
+
+For global attention on GB10, eager prompt chunks with four or more rows in
+multiples of four reuse each paged K/V read across four adjacent queries once
+the chunk begins at position 8,192 or later. The 32K operator fixture with 16
+queries averaged 8.90 ms with the serial chunks and 5.66 ms with shared reads
+over 12 timed iterations per schedule. All BF16 output bytes matched, and
+nine sampled values agreed with an independent FP64 calculation. The new
+entry uses 80 registers and zero spills on SM121. All four existing entries
+compiled to the same instructions on SM120 and SM121.
+
+On a 32,848-token retrieval prompt, ReleaseFast CLI prefill fell from 350.74 s
+at `46a65479c9` to 328.43 s with the new schedule. Each build ran the same
+prompt once and returned the same text in three output tokens.
+The ReleaseFast HTTP worker returned the correct answer on an 11,212-token
+streaming retrieval prompt and released all request reservations afterward.
+
+The GB10 BF16 MoE path groups routes by expert for 16-row Inkling prompt
+chunks. Up to eight routes share each expert tile's weight reads, and both
+projections reuse the same route table. The kernels scatter outputs back to
+the original route slots and keep the existing split-K reduction order.
+With 16 distinct embeddings, a resident NVFP4 layer's full FFN took 2.31 ms
+with one route per tile and 1.51 ms with grouped routes. An MXFP8 layer took
+4.69 ms and 2.74 ms, respectively. Each timing averaged 12 runs of the full
+FFN. Outputs were bit-for-bit identical for both formats with distinct and
+mixed repeated embeddings. Both projection entries use 40 registers and zero
+spills on SM121. All six existing entries compiled to the same instructions
+on SM120 and SM121.
+
+Adding grouped expert projections reduced prefill on the same 32,848-token
+retrieval prompt from 328.43 s to 216.31 s in the ReleaseFast CLI. On an
+18,282-token prompt containing a CUDA manual, prefill went from 166.85 s to
+107.65 s. Each build ran each prompt once, with identical output text for
+each pair.
+On the same warm 11,212-token HTTP request, time to first streamed token
+fell from 102.76 s to 63.74 s. The response matched and the worker released
+all request reservations.
+
+For text prompts of at least 8,192 tokens on GB10, the CLI and HTTP worker
+process the first 64 tokens in 16-row chunks and then use up to 64 rows per
+chunk. The HTTP worker uses 16 rows while another decoder is active or a peer
+is waiting for the GPU. The expert table supports 512 routes per chunk and
+sizes its capacity from the maximum number of nonempty expert groups.
+
+Unrestricted 32- and 64-row schedules passed greedy token parity at the
+first logit checkpoint but exceeded the independent logit-error gates.
+Keeping the first 64 tokens in 16-row chunks passed all 12 full-vocabulary
+comparisons against Transformers 5.24.0, covering widths 16, 32, 64 and a
+mixed 16/64 schedule at positions 65, 134 and 269. The worst centered p99
+error was 0.668 against a 1.0 limit. Grouped BF16 expert outputs also matched
+the one-route kernels bit for bit at all three widths for NVFP4 and MXFP8.
+The widened route builder used 40 registers and zero spills on SM121. All
+nine existing entry points kept identical compiled instructions on SM120
+and SM121.
+
+On the 10,586-token mixed-text prompt, the width-16 CLI took 59.35 s.
+The exploratory 32- and 64-row schedules took 39.62 s and 28.87 s. The
+qualified 64-row schedule with a 16-row prefix took 28.99 s. On the 32,848-token
+retrieval fixture, the qualified build cut prefill from 216.31 s to 102.26 s.
+Each timing used one run per build, excluded model loading, and returned
+identical response text on each fixture.
+With a concurrent 128-token decode, the 10,586-token HTTP request reached
+its first streamed token in 38.00 s, down from 62.93 s with width 16. The
+short stream's p99 gap between content events was 116.0 ms, compared with
+116.6 ms on the frozen worker. Both streams matched the frozen responses,
+and request reservations drained after the run.
+
+The GB10 prefill kernel resolves each 16-token KV page once for four adjacent
+queries and reuses the key and value loads. The softmax uses one exponentiation
+per key while keeping the same FP32 accumulation order. The dispatch applies
+to both global and sliding attention for chunk sizes of at least 16 query
+rows in multiples of four, starting at position 1,024.
+
+At 32K context with 64 query rows, global attention fell from 16.63 ms to
+15.37 ms and sliding attention fell from 0.73 ms to 0.49 ms. All BF16 outputs
+matched the frozen schedules bit for bit. The new global and sliding entries
+use 80 and 94 registers respectively on SM121, with zero spills. The five
+existing entry points kept identical compiled instructions on SM80, SM120
+and SM121. On the 32,848-token fixture, CLI prefill fell from 102.26 s to
+94.29 s with identical retrieval text.
+
+With weights loaded and prompt reuse disabled, HTTP time to first streamed
+token fell from 28.94 s to 26.27 s at 10,586 tokens and from 102.34 s to
+93.79 s at 32,848 tokens. Both prompts returned the same retrieval text.
+With a concurrent 128-token decode, the 10,586-token request reached its
+first token in 35.61 s, down from 38.00 s. The short stream's p99 gap between
+content events went from 116.0 ms to 114.2 ms. Request reservations drained
+after the run.
+
+The Tensor Core attention experiment prefilled the 32,848-token fixture in
+62.97 s and returned the same retrieval text as the 102.26 s frozen path.
+The single-BF16, compensated BF16, and global-only schedules each exceeded
+the established independent centered-p99 logit gate on the stress sequence.
+The page-sharing schedule used in that qualification matched the frozen
+full-vocabulary logits bit for bit at positions 1,153 and 1,346
+on both the stress sequence and the mixed-text fixture. Both schedules
+exceeded the independent gate at position 1,346 on the stress sequence
+and at both positions on the mixed-text fixture. All 24 cases in the
+existing independent text and image qualification suite passed.
+
+### Warm long-text prefill on GB10
+
+Text prompts of at least 8,192 tokens use up to 2,304 rows per prefill chunk
+on SM121. The first 64 tokens retain 16-row chunks. Prefill yields to a
+waiting request after each chunk and takes 16-row chunks while decode or
+another device turn is waiting. Admission accounts for the wider attention,
+controller, expert, and KV staging buffers.
+
+The long-prefill schedule writes each visit's K/V rows to their pages in
+one launch. The Tensor Core attention tile shares each K/V load across a
+GQA group. Sliding attention computes the BF16 relative projection inside
+the tile. Global attention prefetches K/V into double-buffered shared
+memory. Grouped NVFP4 projection prefetches 64-column expert tiles, and
+the quantizers reuse each token's encoded blocks across its expert routes.
+
+The matched vLLM run used `0.34.1rc1.dev159+ged686ccec` and an 8,192-token
+prefill budget. On SM12x its NVFP4 expert kernel reuses each weight load
+across groups of routed tokens and issues block-scaled Tensor Core
+instructions. MXFP8 expands tiles to BF16 before the matrix multiply.
+Its paged relative attention shares K/V across GQA heads and reads
+sheared relative logits. The pinned 32,848-token trace spent 3.18 s in
+NVFP4 expert GEMMs, 0.57 s in MXFP8 GEMMs, and 2.14 s in relative
+attention and relative-bias projection.
+[Inkling 2 Mini in vLLM](https://vllm-project.github.io/2026/11/20/inkling2-mini.html)
+[SM12x expert kernels](https://docs.vllm.ai/en/latest/api/vllm/models/inkling2/nvidia/ops/moe_sm120/)
+
+In matched warm HTTP runs on the same DGX Spark and checkpoint, each engine
+returned `MARIGOLD` in three generated tokens. Prefix reuse and speculation
+were off. Each median covers three requests after the first request at that
+length.
+
+| Prompt tokens | Earlier Antfly | Antfly median TTFT | vLLM median TTFT | Antfly overhead |
+| ---: | ---: | ---: | ---: | ---: |
+| 10,586 | 26.27 s | 3.717 s | 3.296 s | 12.8% |
+| 32,848 | 93.79 s | 11.632 s | 10.375 s | 12.1% |
+
+A concurrent 128-token decode matched its isolated response and usage.
+The p99 gap between content events was 112.9 ms, and the 10,586-token
+prefill reached its first token in 16.57 s. Request reservations returned
+to their initial levels.
+
+All 24 existing independent text and image cases passed. The new prefill
+schedule passed both structured stress checkpoints, with centered p99
+errors of 0.935 and 0.798 against the threshold of 1.0. The two mixed-text
+diagnostic probes exceeded the same threshold on both schedules. The
+centered p99 errors on those probes rose from 2.942 and 1.913 to 5.295
+and 2.492. The 32K cache and abort checks passed across 48 visits. The
+row-wise decoder crossed the 8,192-token boundary through position 8,194.
+
+The mixed serving smoke passed with a 1 GiB test KV budget. The
+four-client phase accepted all six requests. The 16-client overload
+probe returned eight responses and eight retryable HTTP 503s. The
+worker passed active and queued timeout, disconnect, over-budget
+rejection, mixed batch, unload, and reload probes. A 256 MiB run hit
+transient KV capacity under overlapping requests and returned a
+terminal SSE error.
 
 The HTTP worker admits up to four Inkling requests per loaded model, subject
 to the server's work-unit and memory limits. It yields the CUDA turn after
@@ -820,8 +976,13 @@ context tokens. Beyond that limit, `force` verifies proposals with the
 regular greedy decoder one token at a time and stops at the first mismatch.
 `auto` uses regular decoding and reports `inkling_speculative_context_limit`,
 since row-wise verification adds drafting work to the same target computation.
-The ReleaseFast CLI matched the reference text and 70-token output length on
-the 11,067-token catalog retrieval case, with 47 draft tokens accepted.
+On the 11,067-token catalog retrieval case, the 16-row ReleaseFast CLI matched
+the reference text and its 70-token output length, with 47 draft tokens
+accepted. With the 64-row policy, greedy and forced DSpark matched each other
+on a 46-token response that also retrieved the correct answer. DSpark
+accepted 36 of 84 proposals with the wide policy.
+With the 2,304-row policy, greedy and forced DSpark matched on the
+70-token response, with 54 of 105 proposals accepted.
 
 `/ai/v1/chat/completions` and `/ai/v1/generate` accept
 `chat_template_kwargs.enable_thinking` and `reasoning_effort`. Set

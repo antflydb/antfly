@@ -161,18 +161,134 @@ fn verifyBatchedImagePrefill(allocator: std.mem.Allocator, model: *decoder.Decod
     try std.testing.expect(max_difference <= 4.0);
 }
 
+fn verifyPrefillWidths(allocator: std.mem.Allocator, model: *decoder.Decoder, dir: ?std.Io.Dir) !void {
+    const positions = [_]usize{ 65, 134, 269 };
+    var tokens: [positions[positions.len - 1]]u32 = undefined;
+    for (&tokens, 0..) |*token, index| token.* = head_tokens[(index * 7 + (index / 11) * 5) % head_tokens.len];
+    const vocab = model.text.unpadded_vocab_size;
+    const reference = try allocator.alloc(f32, vocab * positions.len);
+    defer allocator.free(reference);
+    for ([_]u32{ 16, 32, 64, 0 }) |rows| {
+        const alternating = rows == 0;
+        var request: decoder.Request = undefined;
+        try request.initWithPrefill(allocator, model, tokens.len, if (alternating) 64 else rows);
+        defer request.deinit() catch @panic("unable to drain Inkling width fixture");
+        request.use_dense = true;
+        request.replay_enabled = false;
+        var start: usize = 0;
+        for (positions, 0..) |end, sample| {
+            if (alternating) {
+                var offset = start;
+                var width: usize = decoder.prefill_chunk_rows;
+                while (offset < end - 1) {
+                    const next = @min(offset + width, end - 1);
+                    try request.appendTokens(tokens[offset..next]);
+                    offset = next;
+                    width = if (width == decoder.prefill_chunk_rows) 64 else decoder.prefill_chunk_rows;
+                }
+            } else try request.appendTokens(tokens[start .. end - 1]);
+            const logits = try request.step(tokens[end - 1]);
+            try std.testing.expectEqual(end, request.position());
+            const best = try topToken(logits, model.text.final_logit_softcapping);
+            const expected = reference[sample * vocab ..][0..vocab];
+            var max_delta: f32 = 0;
+            if (rows == 16) {
+                @memcpy(expected, logits);
+            } else {
+                try std.testing.expectEqual(try topToken(expected, model.text.final_logit_softcapping), best);
+                for (expected, logits) |a, b| max_delta = @max(max_delta, @abs(a - b));
+                try std.testing.expect(max_delta <= 4.0);
+            }
+            var width_label: [3]u8 = undefined;
+            const label = if (alternating) "mixed" else try std.fmt.bufPrint(&width_label, "{d}", .{rows});
+            if (dir) |output| {
+                var filename: [48]u8 = undefined;
+                const name = try std.fmt.bufPrint(&filename, "cuda-prefill-{s}-{d}.f32", .{ label, end });
+                try output.writeFile(std.testing.io, .{ .sub_path = name, .data = std.mem.sliceAsBytes(logits) });
+            }
+            std.debug.print("Inkling prefill width={s} position={d} argmax={d}, max delta vs width 16={d:.5}\n", .{ label, end, best, max_delta });
+            start = end;
+        }
+    }
+}
+
+fn verifyPagedPrefill(allocator: std.mem.Allocator, model: *decoder.Decoder, dir: ?std.Io.Dir) !void {
+    const positions = [_]usize{ 1153, 1346 };
+    var tokens: [positions[positions.len - 1]]u32 = undefined;
+    for (&tokens, 0..) |*token, index| token.* = head_tokens[(index * 7 + (index / 11) * 5) % head_tokens.len];
+    if (dir) |output| {
+        const data = output.readFileAlloc(std.testing.io, "attention-tokens.u32", allocator, .limited(@sizeOf(@TypeOf(tokens)) + 1)) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (data) |raw| {
+            defer allocator.free(raw);
+            try std.testing.expectEqual(@sizeOf(@TypeOf(tokens)), raw.len);
+            for (&tokens, 0..) |*token, i| token.* = std.mem.readInt(u32, raw[i * 4 ..][0..4], .little);
+        }
+    }
+    const vocab = model.text.unpadded_vocab_size;
+    const reference = try allocator.alloc(f32, vocab * positions.len);
+    defer allocator.free(reference);
+    const previous_policy = model.attn.attention.use_page_rows;
+    defer model.attn.attention.use_page_rows = previous_policy;
+    const policies = [_]enum { baseline, paged, serving }{ .baseline, .paged, .serving };
+    for (policies) |policy| {
+        model.attn.attention.use_page_rows = policy != .baseline;
+        var request: decoder.Request = undefined;
+        const width: u32 = switch (policy) {
+            .baseline, .paged => 64,
+            else => @min(decoder.max_prefill_chunk_rows, tokens.len),
+        };
+        try request.initWithPrefill(allocator, model, tokens.len, width);
+        defer request.deinit() catch @panic("unable to drain Inkling paged prefill fixture");
+        request.use_dense = true;
+        request.use_native_prefill = policy == .serving;
+        var start: usize = 0;
+        for (positions, 0..) |end, sample| {
+            try request.appendTokens(tokens[start .. end - 1]);
+            const logits = try request.step(tokens[end - 1]);
+            try std.testing.expectEqual(end, request.position());
+            const best = try topToken(logits, model.text.final_logit_softcapping);
+            const expected = reference[sample * vocab ..][0..vocab];
+            switch (policy) {
+                .baseline => @memcpy(expected, logits),
+                .paged => try std.testing.expectEqualSlices(f32, expected, logits),
+                else => {},
+            }
+            const label = @tagName(policy);
+            if (dir) |output| {
+                var filename: [48]u8 = undefined;
+                const name = try std.fmt.bufPrint(&filename, "cuda-attention-{s}-{d}.f32", .{ label, end });
+                try output.writeFile(std.testing.io, .{ .sub_path = name, .data = std.mem.sliceAsBytes(logits) });
+            }
+            std.debug.print("Inkling prefill attention={s} position={d} argmax={d}\n", .{ label, end, best });
+            start = end;
+        }
+    }
+}
+
 fn verifyDSparkTransactions(allocator: std.mem.Allocator, model: *decoder.Decoder, model_dir: []const u8, config: checkpoint.DraftConfig, limit: u32) !void {
-    var draft = try dspark.Draft.load(allocator, model.ctx, &model.blas, model_dir, config, model.sharedDraftWeights(), limit, decoder.prefill_chunk_rows);
+    const rowwise_verification = !decoder.speculativeBlockContextSupported(model.text, limit);
+    const verification_prefill_rows = 64;
+    const prefill_rows: u32 = if (rowwise_verification) verification_prefill_rows else decoder.prefill_chunk_rows;
+    var draft = try dspark.Draft.load(allocator, model.ctx, &model.blas, model_dir, config, model.sharedDraftWeights(), limit, prefill_rows);
     defer draft.deinit();
     var reference: decoder.Request = undefined;
-    try reference.init(allocator, model, limit);
+    try reference.initWithPrefill(allocator, model, limit, if (rowwise_verification) prefill_rows else 1);
     defer reference.deinit() catch @panic("unable to drain the serial Inkling request");
     reference.use_dense = true;
     var actual: decoder.Request = undefined;
-    try actual.initWithPrefill(allocator, model, limit, decoder.prefill_chunk_rows);
+    try actual.initWithPrefill(allocator, model, limit, prefill_rows);
     defer actual.deinit() catch @panic("unable to drain the speculative Inkling request");
     actual.use_dense = true;
     try actual.attachDraft(&draft);
+    if (rowwise_verification) {
+        var prefix: [2 * verification_prefill_rows]u32 = undefined;
+        for (&prefix, 0..) |*token, index| token.* = head_tokens[index % head_tokens.len];
+        try reference.appendTokens(&prefix);
+        try actual.appendTokens(&prefix);
+    }
     for (0..14) |i| {
         const token = head_tokens[i % head_tokens.len];
         try reference.append(token);
@@ -198,7 +314,8 @@ fn verifyDSparkTransactions(allocator: std.mem.Allocator, model: *decoder.Decode
         try std.testing.expectEqual(reference.position(), actual.position());
         try std.testing.expectEqual(actual.position(), draft.position);
         if (accepted == 0) {
-            try std.testing.expectEqual(null, actual.kv.sequence.pageId(.full, 1));
+            const next_page = actual.position() / actual.kv.sequence.layout.page_tokens;
+            try std.testing.expectEqual(null, actual.kv.sequence.pageId(.full, next_page));
             const prepared_tail: usize = @intFromBool(decoder.speculativeBlockContextSupported(model.text, limit));
             try std.testing.expectEqual(prepared_tail, actual.kv.full.storage.hostPool().?.freeListBlocks());
         }
@@ -511,6 +628,10 @@ test "CUDA Inkling 2 runs the fixed loop with all released text weights" {
     try verifyPackedWeights(allocator, &model);
     try verifyGreedyShortlist(allocator, &model);
     if (qualification_dir) |dir_handle| try exportQualificationLogits(allocator, &model, dir_handle);
+    if (ctx.info.compute_major == 12 and ctx.info.compute_minor == 1) {
+        try verifyPrefillWidths(allocator, &model, qualification_dir);
+        try verifyPagedPrefill(allocator, &model, qualification_dir);
+    }
 
     var encoder = try vision.Vision.load(&ctx, &source);
     defer encoder.deinit();

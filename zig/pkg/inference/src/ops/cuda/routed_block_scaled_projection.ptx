@@ -1429,11 +1429,14 @@ $L__BB0_51:
 	shl.b64 	%rd9, %rd7, 2;
 	add.s64 	%rd10, %rd8, %rd9;
 	ld.global.u16 	%rs1, [%rd10];
+	ld.global.u16 	%rs2, [%rd10+2];
+	mul.wide.u32 	%rd11, %r2, 4;
+	add.s64 	%rd12, %rd4, %rd11;
+	ld.global.f32 	%f12, [%rd12];
 	// begin inline asm
 	{ mov.b32 %f3, {0,%rs1};}
 
 	// end inline asm
-	ld.global.u16 	%rs2, [%rd10+2];
 	// begin inline asm
 	{ mov.b32 %f4, {0,%rs2};}
 
@@ -1442,21 +1445,18 @@ $L__BB0_51:
 	// begin inline asm
 	tanh.approx.f32 %f5, %f6;
 	// end inline asm
-	mul.rn.f32 	%f12, %f5, %f1;
+	mul.rn.f32 	%f13, %f5, %f1;
 	// begin inline asm
 	{ .reg .f32 t; mul.rn.f32 t, %f3, 0fBFB8AA3B; ex2.approx.ftz.f32 t, t; add.rn.f32 t, t, 0f3F800000; rcp.approx.ftz.f32 %f7, t; }
 	// end inline asm
-	mul.rn.f32 	%f13, %f12, %f7;
+	mul.rn.f32 	%f14, %f13, %f7;
 	div.rn.f32 	%f10, %f4, %f2;
 	// begin inline asm
 	tanh.approx.f32 %f9, %f10;
 	// end inline asm
-	mul.rn.f32 	%f14, %f9, %f2;
-	mul.rn.f32 	%f15, %f13, %f14;
-	mul.wide.u32 	%rd11, %r2, 4;
-	add.s64 	%rd12, %rd4, %rd11;
-	ld.global.f32 	%f16, [%rd12];
-	mul.rn.f32 	%f11, %f16, %f15;
+	mul.rn.f32 	%f15, %f9, %f2;
+	mul.rn.f32 	%f16, %f14, %f15;
+	mul.rn.f32 	%f11, %f12, %f16;
 	// begin inline asm
 	{  cvt.rn.bf16.f32 %rs3, %f11;}
 

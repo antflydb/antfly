@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const kv = @import("ops/cuda/hybrid_paged_kv.zig");
+const relative = @import("ops/cuda/paged_relative_attention.zig");
 const buffer = @import("ops/cuda/buffer.zig");
 const CudaContext = @import("ops/cuda/context.zig").CudaContext;
 
@@ -84,15 +85,34 @@ fn fill(dst: []u8, start: usize, rows: usize, visit: usize, salt: usize) void {
     }
 }
 
-fn stage(cache: *kv.Cache, ctx: *CudaContext, scratch: *Scratch, rows: usize, salt: usize) !void {
+fn stage(cache: *kv.Cache, ctx: *CudaContext, scratch: *Scratch, tables: *Scratch, program: *relative.Module, rows: usize, salt: usize) !void {
     const start = cache.committedTokens();
     try cache.prepareAppend(rows);
     const plane_bytes = rows * row_bytes;
     for (0..visits.len) |i|
         fill(scratch.host.bytes()[i * 2 * plane_bytes ..][0 .. 2 * plane_bytes], start, rows, i, salt);
     try scratch.device.copyFromHost(ctx, scratch.host.constBytes()[0 .. visits.len * 2 * plane_bytes]);
-    for (visits, 0..) |visit, i|
-        try cache.queueWrite(visit, scratch.planes(i * 2 * plane_bytes, plane_bytes));
+    if (rows >= 16 and ctx.info.compute_major >= 8) {
+        // These buffers are reused by the ordered readback after the append.
+        const page_capacity = config.layout.max_tokens / config.layout.page_tokens;
+        const page_bytes = page_capacity * @sizeOf(u32);
+        var ids: [2]buffer.DeviceBuffer = undefined;
+        for ([_]kv.Group{ .sliding, .full }, &ids, 0..) |group, *device, index| {
+            const offset = index * page_bytes;
+            const host: []align(@alignOf(u32)) u8 = @alignCast(tables.host.bytes()[offset..][0..page_bytes]);
+            const count = try cache.stagedPageIds(group, std.mem.bytesAsSlice(u32, host));
+            device.* = .{ .ptr = tables.device.ptr + offset, .len = page_bytes, .borrowed = true };
+            try device.copyFromHost(ctx, host[0 .. count * @sizeOf(u32)]);
+        }
+        for (visits, 0..) |visit, i| {
+            const mapping = ids[@intFromBool(visit.group == .full)];
+            _ = try cache.queueWriteWithPages(visit, scratch.planes(i * 2 * plane_bytes, plane_bytes), mapping, program);
+        }
+        if (salt != 0) try std.testing.expectError(error.KvVisitAlreadyWritten, cache.queueWriteWithPages(visits[0], scratch.planes(0, plane_bytes), ids[0], program));
+    } else {
+        for (visits, 0..) |visit, i|
+            try cache.queueWrite(visit, scratch.planes(i * 2 * plane_bytes, plane_bytes));
+    }
 }
 
 fn verify(cache: *kv.Cache, ctx: *CudaContext, got: *Scratch, expected: *Scratch, start: usize, rows: usize, group: ?kv.Group) !void {
@@ -135,6 +155,8 @@ test "CUDA hybrid paged KV verifies BF16 payload and abort across 48 visits at 3
     defer source.deinit(&ctx);
     var readback = try Scratch.init(&ctx);
     defer readback.deinit(&ctx);
+    var program: relative.Module = .{};
+    defer program.deinit(&ctx);
     errdefer ctx.synchronize() catch {};
 
     var verified_recovery = false;
@@ -149,7 +171,7 @@ test "CUDA hybrid paged KV verifies BF16 payload and abort across 48 visits at 3
         const rows = @min(if (before == 0) 1 else config.layout.max_append_tokens, config.layout.max_tokens - before);
         if (before == 1025) {
             // Deny the new sliding pages after the full group prepared, then
-            // abort another append after both groups queued actual D2D copies.
+            // abort another append after both groups queued device writes.
             const sliding_pool = cache.sliding.storage.hostPool().?;
             sliding_pool.setTargetMaxBlocks(sliding_pool.liveBlocks());
             try std.testing.expectError(error.KvCapacityTooSmall, cache.prepareAppend(rows));
@@ -157,7 +179,7 @@ test "CUDA hybrid paged KV verifies BF16 payload and abort across 48 visits at 3
             try std.testing.expectEqual(@as(usize, 16), cache.full.storage.hostPool().?.freeListBlocks());
             sliding_pool.setTargetMaxBlocks(try config.layout.pageCapacity(.sliding));
 
-            try stage(&cache, &ctx, &source, rows, 137);
+            try stage(&cache, &ctx, &source, &readback, &program, rows, 137);
             try std.testing.expectEqual(before, cache.committedTokens());
             try std.testing.expectError(error.InvalidKvRange, cache.queueRead(visits[0], before, 1, readback.planes(0, row_bytes)));
             const staged_rows = 3;
@@ -184,7 +206,7 @@ test "CUDA hybrid paged KV verifies BF16 payload and abort across 48 visits at 3
             verified_recovery = true;
         }
 
-        try stage(&cache, &ctx, &source, rows, 0);
+        try stage(&cache, &ctx, &source, &readback, &program, rows, 0);
         try cache.commit();
         if (before == 0) first_sliding_page = cache.sequence.pageId(.sliding, 0).?;
         if (before == 1281) {

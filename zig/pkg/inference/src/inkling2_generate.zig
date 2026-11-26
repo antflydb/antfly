@@ -105,7 +105,8 @@ pub fn main(init: std.process.Init) !void {
     var request: decoder.Request = undefined;
     // Short prompts already use the same prepared row-one plans as decoding.
     const batch_prompt = gb10 and fast_matvec and prompt_count > decoder.prefill_chunk_rows;
-    const chunk_rows: u32 = if (batch_prompt or draft_enabled) @intCast(@min(decoder.prefill_chunk_rows, tokens - 1)) else 1;
+    const prefill_rows = decoder.preferredPrefillRows(prompt_count, batch_prompt and pixels == null);
+    const chunk_rows: u32 = if (batch_prompt or draft_enabled) @intCast(@min(prefill_rows, tokens - 1)) else 1;
     request.initWithPrefill(allocator, &model, @intCast(tokens - 1), chunk_rows) catch |err| switch (err) {
         error.CudaMemoryLimitExceeded => {
             if (chunk_rows == 1 or draft_enabled) return err;
@@ -114,6 +115,7 @@ pub fn main(init: std.process.Init) !void {
         else => return err,
     };
     request.use_dense = fast_matvec;
+    request.use_native_prefill = request.append_capacity >= decoder.native_prefill_min_rows;
     defer request.deinit() catch @panic("unable to drain the Inkling CUDA stream");
     if (draft_enabled) {
         const config = source.config.value.mtp_config orelse return error.MissingInkling2DraftConfig;
@@ -137,6 +139,7 @@ pub fn main(init: std.process.Init) !void {
     for (text_prefill, prompt_ids[0 .. prompt_ids.len - 1]) |*token, id| token.* = try inputToken(id);
     if (batch_prompt) try request.appendTokens(text_prefill) else for (text_prefill) |token| try request.append(token);
     var last = try request.stepGreedy(try inputToken(prompt_ids[prompt_ids.len - 1]));
+    request.use_native_prefill = false;
     const decode_start = platform.time.monotonicNs();
     var generated: std.ArrayList(i32) = .empty;
     defer generated.deinit(allocator);

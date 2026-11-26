@@ -18,26 +18,23 @@
 #include <math.h>
 #include <stdint.h>
 #include "../kernels/quantize_bf16_nvfp4.cuh"
+#include "../kernels/quantize_bf16_mxfp8.cuh"
+#include "../kernels/routed_swiglu.cuh"
 
 namespace {
 
 using antfly_nvfp4::e4m3;
 using antfly_nvfp4::e2m1_twice;
 
-__device__ float e8m0(uint32_t exponent) {
-    if (exponent == 255u) return __uint_as_float(0x7fc00000u);
-    return __uint_as_float(exponent == 0u ? 0x00400000u : exponent << 23);
-}
+using antfly_mxfp8::e8m0;
 
 __device__ uint8_t e4m3_block(uint8_t* encoded, const __nv_bfloat16* source) {
     float maximum = 0.0f;
     #pragma unroll
     for (unsigned i = 0; i < 32u; ++i)
         maximum = fmaxf(maximum, fabsf(__bfloat162float(source[i])));
-    const float raw = maximum * (1.0f / 448.0f);
-    const uint32_t rounded = ((__float_as_uint(raw) + 0x007fffffu) & 0x7f800000u) >> 23;
-    const uint32_t exponent = raw <= 0x1p-127f ? 0u : min(rounded, 254u);
-    const float inverse = exponent == 0u ? 0x1p127f : __frcp_rn(e8m0(exponent));
+    const unsigned exponent = antfly_mxfp8::block_exponent(maximum);
+    const float inverse = antfly_mxfp8::inverse_scale(exponent);
     #pragma unroll
     for (unsigned i = 0; i < 32u; ++i)
         encoded[i] = __nv_cvt_float_to_fp8(__bfloat162float(source[i]) * inverse, __NV_SATFINITE, __NV_E4M3);
@@ -46,21 +43,6 @@ __device__ uint8_t e4m3_block(uint8_t* encoded, const __nv_bfloat16* source) {
 
 __device__ float stable_log_sigmoid(float x) {
     return fminf(x, 0.0f) - log1pf(expf(-fabsf(x)));
-}
-
-__device__ float fast_sigmoid(float x) {
-    float result;
-    asm("{ .reg .f32 t; mul.rn.f32 t, %1, 0fBFB8AA3B; "
-        "ex2.approx.ftz.f32 t, t; add.rn.f32 t, t, 0f3F800000; "
-        "rcp.approx.ftz.f32 %0, t; }" : "=f"(result) : "f"(x));
-    return result;
-}
-
-__device__ float softcap(float x, float cap) {
-    const float scaled = __fdiv_rn(x, cap);
-    float value;
-    asm("tanh.approx.f32 %0, %1;" : "=f"(value) : "f"(scaled));
-    return cap * value;
 }
 
 template <bool FP4>
@@ -221,10 +203,7 @@ extern "C" __global__ void antfly_weighted_softcapped_swiglu_interleaved_bf16(
     const unsigned row = blockIdx.y;
     if (column >= columns || row >= rows) return;
     const size_t index = (size_t)row * columns + column;
-    const float gate = __bfloat162float(gate_up[2 * index]);
-    const float up = __bfloat162float(gate_up[2 * index + 1]);
-    const float x = ((softcap(gate, gate_cap) * fast_sigmoid(gate)) * softcap(up, up_cap)) * route_weights[row];
-    output[index] = __float2bfloat16_rn(x);
+    output[index] = antfly_routed_swiglu::weighted(gate_up[2 * index], gate_up[2 * index + 1], route_weights[row], gate_cap, up_cap);
 }
 
 extern "C" __global__ void antfly_reduce_routed_rows_bf16(

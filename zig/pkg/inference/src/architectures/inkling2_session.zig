@@ -45,6 +45,7 @@ pub const Runtime = struct {
     steps: StepScheduler,
     batch_lock: std.atomic.Mutex,
     unmatched_decode: ?*DecodeStep,
+    active_decodes: std.atomic.Value(u32),
     active_greedy: std.atomic.Value(u32),
     batch_steps: [max_active_requests - 1]std.atomic.Value(u64),
 
@@ -62,6 +63,7 @@ pub const Runtime = struct {
         self.steps = .{};
         self.batch_lock = .unlocked;
         self.unmatched_decode = null;
+        self.active_decodes = .init(0);
         self.active_greedy = .init(0);
         self.batch_steps = @splat(.init(0));
         self.ctx = try Context.initDefault();
@@ -130,7 +132,7 @@ pub const Runtime = struct {
     fn decodeGreedy(self: *Runtime, request: *decoder.Request, token: u32, control: Control) !u32 {
         try control.check();
         const lanes = @min(request.append_capacity, max_active_requests, self.active_greedy.load(.acquire));
-        if (!self.fast_matvec or !request.canBatchGreedy() or control.io == null or lanes < 2) {
+        if (!self.fast_matvec or request.use_native_prefill or !request.canBatchGreedy() or control.io == null or lanes < 2) {
             var turn: StepScheduler.Waiter = .{};
             try self.enterStep(&turn, control);
             defer StepScheduler.leave(&turn);
@@ -485,8 +487,10 @@ pub const Pipeline = struct {
         if (speculate and (model.draft == null or !usesGreedy(config) or config.speculative_k == 0 or
             config.speculative_k > dspark.proposal_rows)) return error.UnsupportedInkling2Speculation;
         if (speculate and context > model.draft.?.max_capacity) return error.InvalidInkling2Context;
-        const batch_prompt = model.fast_matvec and prompt.count() > decoder.prefill_chunk_rows;
-        const prefill_rows: u32 = if (batch_prompt or (speculate and block_verification)) @intCast(@min(decoder.prefill_chunk_rows, context)) else 1;
+        const prompt_tokens = prompt.count();
+        const batch_prompt = model.fast_matvec and prompt_tokens > decoder.prefill_chunk_rows;
+        const preferred_rows = decoder.preferredPrefillRows(prompt_tokens, batch_prompt and prompt.image == null);
+        const prefill_rows: u32 = if (batch_prompt or (speculate and block_verification)) @intCast(@min(preferred_rows, context)) else 1;
         // The row-wise verifier must start from the same prefill as regular
         // decoding. Reserve its draft block capacity independently.
         const decode_rows: u32 = if (speculate) dspark.block_rows else if (model.fast_matvec and usesGreedy(config)) max_active_requests else 1;
@@ -527,12 +531,15 @@ pub const Pipeline = struct {
         var offset: usize = 0;
         while (offset < input.len) {
             try self.check();
-            var tokens: [decoder.prefill_chunk_rows]u32 = undefined;
-            const count = @min(self.prefill_rows, input.len - offset);
-            for (input[offset..][0..count], tokens[0..count]) |id, *token| token.* = @intCast(id);
             var turn: StepScheduler.Waiter = .{};
             try self.model.enterStep(&turn, self.control);
             defer StepScheduler.leave(&turn);
+            const contested = self.prefill_rows > decoder.prefill_chunk_rows and
+                (self.model.active_decodes.load(.acquire) != 0 or StepScheduler.hasPeer(&turn));
+            const rows = decoder.prefillRowsAtPosition(request.position(), if (contested) decoder.prefill_chunk_rows else self.prefill_rows);
+            const count = @min(rows, input.len - offset);
+            var tokens: [decoder.max_prefill_chunk_rows]u32 = undefined;
+            for (input[offset..][0..count], tokens[0..count]) |id, *token| token.* = @intCast(id);
             if (count == 1) try request.append(tokens[0]) else try request.appendTokens(tokens[0..count]);
             offset += count;
         }
@@ -550,6 +557,7 @@ pub const Pipeline = struct {
         try request.initWithPrefill(self.allocator, &self.model.model, self.context_tokens, self.chunk_rows);
         errdefer request.deinit() catch @panic("unable to drain the Inkling CUDA stream");
         request.use_dense = self.model.fast_matvec;
+        request.use_native_prefill = request.append_capacity >= decoder.native_prefill_min_rows;
         if (draft) |active| {
             try active.beginRequest(self.context_tokens, request.append_capacity);
             errdefer active.endRequest();
@@ -647,6 +655,8 @@ pub const Pipeline = struct {
         const turn_end = try specialToken(self.allocator, self.tokenizer, end_marker);
         const channels: ?ChannelTokens = if (self.prompt.initial_channel != null) try .init(self.allocator, self.tokenizer, turn_end) else null;
         const limit: usize = @intCast(config.max_tokens);
+        _ = model.active_decodes.fetchAdd(1, .acq_rel);
+        defer _ = model.active_decodes.fetchSub(1, .acq_rel);
         const batch_eligible = usesGreedy(config) and request.canBatchGreedy();
         if (batch_eligible) _ = model.active_greedy.fetchAdd(1, .acq_rel);
         defer if (batch_eligible) {
@@ -666,6 +676,7 @@ pub const Pipeline = struct {
         defer output.deinit();
         var stats: generation.SpeculativeDecodeStats = .{ .speculation_policy = config.speculation_policy, .speculation_policy_decision = if (config.speculation_policy == .force) .forced else .active, .mtp_enabled = draft != null };
         var last = try self.next(&request, config, &history, @intCast(after[after.len - 1]));
+        request.use_native_prefill = false;
         decode_loop: while (true) {
             try self.check();
             if (!config.ignore_eos and (last == model.eos or (channels == null and last == turn_end))) break;

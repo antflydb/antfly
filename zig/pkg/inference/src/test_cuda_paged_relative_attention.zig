@@ -322,6 +322,141 @@ fn deviceSlice(parent: buffer.DeviceBuffer, offset: usize, len: usize) buffer.De
     return .{ .ptr = parent.ptr + offset, .len = len, .borrowed = true };
 }
 
+test "CUDA paged relative attention shares page translations with exact scalar GQA at 32K" {
+    var ctx = try Context.initDefault();
+    defer ctx.deinit();
+    if (ctx.info.compute_major != 12 or ctx.info.compute_minor != 1) return error.SkipZigTest;
+    const start = 32766;
+    const count = 128;
+    const end = start + count;
+    const window = 1024;
+    const bias_extent = 1024;
+    var cache: kv.Cache = undefined;
+    try cache.init(std.testing.allocator, &ctx, .{
+        .layout = .{ .page_tokens = 16, .window_tokens = window, .max_tokens = end, .max_append_tokens = start },
+        .full_slots = 1,
+        .sliding_slots = 1,
+        .kv_heads = kv_heads,
+        .head_dim = head_dim,
+    });
+    defer cache.deinit() catch @panic("unable to drain long relative attention fixture");
+    {
+        var source = try stage(&cache, &ctx, start);
+        defer source.free(&ctx);
+        try cache.commit();
+    }
+    var suffix = try stage(&cache, &ctx, count);
+    defer suffix.free(&ctx);
+
+    var q: [count * q_heads * head_dim]u16 = undefined;
+    var gate: [q.len]u16 = undefined;
+    const relative = try std.testing.allocator.alloc(u16, count * q_heads * bias_extent);
+    defer std.testing.allocator.free(relative);
+    var sinks: [count * q_heads]u16 = undefined;
+    for (&q, &gate, 0..) |*query, *activation, i| {
+        query.* = bf16(sample(i / (q_heads * head_dim), i / head_dim % q_heads, i % head_dim, 1));
+        activation.* = bf16(sample(i / (q_heads * head_dim), i / head_dim % q_heads, i % head_dim, 11));
+    }
+    const rel_width = attention.relative_width;
+    var rel_queries: [count * q_heads * rel_width]u16 = undefined;
+    var basis: [bias_extent * rel_width]u16 = undefined;
+    for (&rel_queries, 0..) |*value, i| value.* = bf16(sample(i / (q_heads * rel_width), i / rel_width % q_heads, i % rel_width, 7));
+    for (&basis, 0..) |*value, i| value.* = bf16(sample(i / rel_width, 0, i % rel_width, 15));
+    for (relative, 0..) |*bias, i| {
+        var dot: f32 = 0;
+        for (0..rel_width) |d| dot = @mulAdd(f32, fromBits(rel_queries[i / bias_extent * rel_width + d]), fromBits(basis[i % bias_extent * rel_width + d]), dot);
+        bias.* = bf16(dot);
+    }
+    for (&sinks, 0..) |*sink, i| sink.* = bf16(sample(i / q_heads, i % q_heads, 0, 3));
+
+    var q_device = try upload(&ctx, std.mem.sliceAsBytes(&q));
+    defer q_device.free(&ctx);
+    var gate_device = try upload(&ctx, std.mem.sliceAsBytes(&gate));
+    defer gate_device.free(&ctx);
+    var relative_device = try upload(&ctx, std.mem.sliceAsBytes(relative));
+    defer relative_device.free(&ctx);
+    var relative_query = try upload(&ctx, std.mem.sliceAsBytes(&rel_queries));
+    defer relative_query.free(&ctx);
+    var relative_basis = try upload(&ctx, std.mem.sliceAsBytes(&basis));
+    defer relative_basis.free(&ctx);
+    var sink_device = try upload(&ctx, std.mem.sliceAsBytes(&sinks));
+    defer sink_device.free(&ctx);
+    var ids: [(end + 15) / 16]u32 = undefined;
+    const bytes = q.len * 2;
+    var result = try buffer.DeviceBuffer.alloc(&ctx, bytes);
+    defer result.free(&ctx);
+    const variants = 5;
+    var host = try buffer.HostBuffer.alloc(&ctx, bytes * variants);
+    defer host.free(&ctx);
+    var module: attention.Module = .{};
+    defer module.deinit(&ctx);
+    const pair = try ctx.createProfileEventPair();
+    defer ctx.destroyProfileEventPair(pair);
+    for ([_]kv.Group{ .full, .sliding }) |group| {
+        const binding = try cache.stagedView(.{ .group = group, .slot = 0 }, &ids);
+        var pages = try upload(&ctx, std.mem.sliceAsBytes(ids[0..binding.page_count]));
+        defer pages.free(&ctx);
+        const geometry: attention.Query = .{ .rows = count, .start = start, .q_heads = q_heads, .kv_heads = kv_heads, .relative_extent = bias_extent, .score_scale = model_scale, .window = if (group == .sliding) window else 0 };
+        var scratch = try buffer.DeviceBuffer.alloc(&ctx, try attention.scratchBytes(geometry, binding.visible_start, binding.visible_end));
+        defer scratch.free(&ctx);
+        var request: attention.Request = .{ .geometry = geometry, .kv = binding, .device_page_ids = pages, .query = q_device, .relative = relative_device, .sinks = sink_device, .gate = gate_device, .scratch = scratch, .output = result };
+        var times: [variants]u64 = undefined;
+        for (&times, 0..) |*elapsed, variant| {
+            module.use_serial_chunks = variant == 0;
+            module.use_page_rows = variant == 2;
+            request.use_native_prefill = variant >= 3;
+            request.relative_projection = if (variant == 4 and group == .sliding) .{ .query = relative_query, .basis = relative_basis } else null;
+            try module.run(&ctx, request);
+            try ctx.recordProfileStart(pair);
+            for (0..12) |_| try module.run(&ctx, request);
+            try ctx.recordProfileEnd(pair);
+            try result.copyToHost(&ctx, host.bytes()[variant * bytes ..][0..bytes]);
+            try ctx.synchronize();
+            elapsed.* = try ctx.readProfileEventPairUs(pair) / 12;
+        }
+        try std.testing.expectEqualSlices(u8, host.constBytes()[0..bytes], host.constBytes()[bytes .. 2 * bytes]);
+        try std.testing.expectEqualSlices(u8, host.constBytes()[0..bytes], host.constBytes()[2 * bytes .. 3 * bytes]);
+        for (4..variants) |variant|
+            try std.testing.expectEqualSlices(u8, host.constBytes()[3 * bytes .. 4 * bytes], host.constBytes()[variant * bytes ..][0..bytes]);
+        const outputs = std.mem.bytesAsSlice(u16, host.constBytes());
+        for (3..variants) |variant| {
+            var largest_delta: f32 = 0;
+            for (outputs[0 .. bytes / 2], outputs[variant * bytes / 2 ..][0 .. bytes / 2]) |regular, tiled| {
+                largest_delta = @max(largest_delta, @abs(fromBits(regular) - fromBits(tiled)));
+            }
+            std.debug.print("32K {s} GQA ({d} queries): variant {d}, {d} us, max delta {d:.8}\n", .{
+                @tagName(group), count, variant, times[variant], largest_delta,
+            });
+            try std.testing.expect(largest_delta <= 0.0005);
+        }
+        // Sample independent FP64 outputs on both sides of a page crossing.
+        for ([_]usize{ 0, 17, count - 1 }) |row| for ([_]usize{ 0, 7, 23 }) |head| {
+            const query_head = row * q_heads + head;
+            const kv_head = head / (q_heads / kv_heads);
+            const position = start + row;
+            const component = 17;
+            var denominator = @exp(@as(f64, fromBits(sinks[query_head])));
+            var numerator: f64 = 0;
+            const first = if (group == .sliding) position + 1 - window else 0;
+            for (first..position + 1) |key_pos| {
+                var dot: f64 = 0;
+                for (0..head_dim) |d| dot += @as(f64, fromBits(q[query_head * head_dim + d])) * sample(key_pos, kv_head, d, 0);
+                const distance = position - key_pos;
+                const bias: f64 = if (distance < bias_extent) fromBits(relative[query_head * bias_extent + distance]) else 0;
+                const weight = @exp(dot * model_scale + bias);
+                denominator += weight;
+                numerator += weight * sample(key_pos, kv_head, component, 9);
+            }
+            const i = query_head * head_dim + component;
+            const expected = numerator / denominator / (1 + @exp(-@as(f64, fromBits(gate[i]))));
+            for (0..variants) |variant| {
+                const actual = fromBits(std.mem.readInt(u16, host.constBytes()[variant * bytes + i * 2 ..][0..2], .little));
+                try std.testing.expectApproxEqAbs(expected, @as(f64, actual), 0.0005);
+            }
+        };
+    }
+}
+
 test "CUDA four-tap convolution preserves its committed BF16 history on abort" {
     var ctx = try Context.initDefault();
     defer ctx.deinit();
