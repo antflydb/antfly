@@ -67,6 +67,7 @@ pub const Layer = struct {
         value: *Tensor,
         key_taps: ?*Tensor = null,
         value_taps: ?*Tensor = null,
+        packed_projection: ?*Tensor = null,
     };
 
     /// Project normalized visit inputs into the operands for paged attention.
@@ -75,7 +76,19 @@ pub const Layer = struct {
             return error.InvalidShape;
         const destinations = [_]*Tensor{ outputs.query, outputs.relative, outputs.gate, outputs.sink, outputs.key, outputs.value };
         const sources = [_]*const Tensor{ inputs.query, inputs.query, inputs.query, inputs.query, inputs.key, inputs.value };
-        for (layout.projection_weights, sources, destinations) |key, input, output| {
+        var projected: usize = 0;
+        if (outputs.packed_projection) |packed_output| {
+            if (rows != 1) return error.InvalidShape;
+            const shared_input = inputs.query == inputs.key and inputs.query == inputs.value;
+            projected = if (shared_input) layout.projection_weights.len else layout.query_weights.len;
+            const projection: metal.DenseBf16Projection = .{
+                .rows = 1,
+                .input_width = text.hidden_size,
+                .output_width = layout.projectionSize(text, layout.projection_weights[0..projected]),
+            };
+            try projection.encode(runtime, inputs.query, &self.projections, packed_output);
+        }
+        for (layout.projection_weights[projected..], sources[projected..], destinations[projected..]) |key, input, output| {
             try self.project(runtime, key, rows, text.hidden_size, layout.projectionWidth(text, key), input, output);
         }
         if (!self.local) {
@@ -235,12 +248,14 @@ pub const RequestWorkspace = struct {
     backing: Tensor,
     views: [plane_count]Tensor,
     reduction: Tensor,
+    packed_rows: bool,
 
     pub const Plan = struct {
         offsets: [plane_count]usize,
         elements: [plane_count]i32,
         bytes: usize,
         reduction_elements: i32,
+        packed_rows: bool,
 
         pub fn init(text: checkpoint.TextConfig, rows: u32, max_tokens: u32, reduction_rows: u32) !Plan {
             if (rows == 0 or rows > max_tokens or rows > 256 or reduction_rows == 0 or reduction_rows > rows)
@@ -272,12 +287,21 @@ pub const RequestWorkspace = struct {
                     .visible_end = max_tokens,
                 },
             };
-            var result: Plan = .{ .offsets = undefined, .elements = undefined, .bytes = 0, .reduction_elements = try attention.scratchElements() };
-            for (widths, &result.offsets, &result.elements) |width, *offset, *elements| {
+            var result: Plan = .{
+                .offsets = undefined,
+                .elements = undefined,
+                .bytes = 0,
+                .reduction_elements = try attention.scratchElements(),
+                .packed_rows = rows == 1,
+            };
+            for (widths, &result.offsets, &result.elements, 0..) |width, *offset, *elements, index| {
                 if (width == 0) return error.InvalidShape;
                 const count = @as(usize, rows) * width;
                 elements.* = std.math.cast(i32, count) orelse return error.InvalidShape;
-                offset.* = std.mem.alignForward(usize, result.bytes, 256);
+                offset.* = if (result.packed_rows and index < layout.projection_weights.len)
+                    result.bytes
+                else
+                    std.mem.alignForward(usize, result.bytes, 256);
                 result.bytes = offset.* + count * 2;
             }
             return result;
@@ -302,7 +326,7 @@ pub const RequestWorkspace = struct {
             view.* = try backing.retainedView(offset, @as(usize, @intCast(elements)) * 2, &.{elements});
             count += 1;
         }
-        return .{ .backing = backing, .views = views, .reduction = reduction };
+        return .{ .backing = backing, .views = views, .reduction = reduction, .packed_rows = plan.packed_rows };
     }
 
     pub fn deinit(self: *RequestWorkspace) void {
@@ -326,6 +350,9 @@ pub const RequestWorkspace = struct {
                 .value = self.plane(.value),
                 .key_taps = if (local) null else self.plane(.key_taps),
                 .value_taps = if (local) null else self.plane(.value_taps),
+                // Output width limits the write to the contiguous projection
+                // prefix, leaving downstream work planes alone.
+                .packed_projection = if (self.packed_rows) &self.backing else null,
             },
             .normalized_query = self.plane(.normalized_query),
             .normalized_relative = self.plane(.normalized_relative),
@@ -431,6 +458,23 @@ test "Inkling Metal attention weights preserve packed offsets and local/global l
             var actual: u16 = undefined;
             try output.downloadBytesInto(std.mem.asBytes(&actual));
             try std.testing.expectEqual(bits, actual);
+        }
+
+        var separate_source = try upload(std.testing.allocator, runtime, &Fixture.data_b);
+        defer separate_source.deinit();
+        var work = try RequestWorkspace.init(std.testing.allocator, runtime, try .init(text, 1, 2, 1), null);
+        defer work.deinit();
+        for ([_]*const Tensor{ &source, &separate_source }) |kv_source| {
+            try metal.beginFrame(runtime);
+            errdefer metal.cancelFrame(runtime) catch {};
+            try layer.projectInputs(runtime, text, 1, .{ .query = &source, .key = kv_source, .value = kv_source }, work.bind(layer.local).projected);
+            try metal.submitFrame(runtime);
+            try metal.waitFrame(runtime);
+            for (work.views[0..layout.projection_weights.len], expected[0..layout.projection_weights.len]) |*output, bits| {
+                var actual: u16 = undefined;
+                try output.downloadBytesInto(std.mem.asBytes(&actual));
+                try std.testing.expectEqual(bits, actual);
+            }
         }
     }
 }
