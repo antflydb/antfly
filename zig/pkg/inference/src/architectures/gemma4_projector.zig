@@ -1448,6 +1448,28 @@ test "audio cache recipe shares exact execution key and original HF packed names
     const end: usize = 12;
     try std.testing.expectEqual(Legacy.key(cfg, &segments, start, end), recipe.key(&segments, start, end));
     try std.testing.expect(recipe.key(&segments, 0, 12) != recipe.key(&segments, 0, 6));
+    // Cold workspace admission describes exactly the tensor geometry of the
+    // segmented producer, including odd frame counts and rank-one masks.
+    var batch = recipe;
+    batch.frames = .{ 41, 68, 19, 0 };
+    batch.count = 3;
+    var measured: [3]usize = undefined;
+    const rows = try batch.rowsAndSegments(&measured);
+    try std.testing.expectEqualSlices(usize, &segments, &measured);
+    try std.testing.expectEqual(@as(usize, 33), rows);
+    const Inputs = audio_schedule.ExecutionInputs;
+    var shapes: [Inputs.count][2]i64 = undefined;
+    const metadata = try Inputs.describe(&shapes, rows, batch.hidden, batch.context_left, batch.heads);
+    try std.testing.expectEqualSlices(i64, &.{ 33, @intCast(batch.hidden) }, metadata[Inputs.hidden].shape);
+    try std.testing.expectEqualSlices(i64, &.{ @intCast(batch.context_left), @intCast(batch.hidden) }, metadata[Inputs.relative].shape);
+    for (metadata[Inputs.valid..Inputs.scales]) |mask| {
+        try std.testing.expectEqualSlices(i64, &.{33}, mask.shape);
+        try std.testing.expectEqual(rows, mask.elements);
+    }
+    for (metadata[Inputs.scales..]) |scale| {
+        try std.testing.expectEqualSlices(i64, &.{@intCast(batch.hidden / batch.heads)}, scale.shape);
+        try std.testing.expectEqual(batch.hidden / batch.heads, scale.elements);
+    }
     for (0..12) |layer| for ([_][]const u8{ "q", "k", "v" }, 0..) |component, index| {
         var original: [128]u8 = undefined;
         const logical = try std.fmt.bufPrint(&original, "a.blk.{d}.attn_{s}.weight", .{ layer, component });
