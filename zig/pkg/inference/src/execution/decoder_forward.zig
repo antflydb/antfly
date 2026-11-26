@@ -172,7 +172,6 @@ pub const DeviceStepRequest = struct {
     token_ids: []const i64,
     sequence_length: usize,
     input_token_tensor: ?ops.CT = null,
-    owned_input_token: ?*?ops.CT = null,
     sampling: ?graph_mod.model_runtime.SamplingConfig = null,
     prefetch_drain_budget: usize = 4,
 };
@@ -403,8 +402,7 @@ pub const Runtime = struct {
                 return .{ .token = .{ .token = @intCast(token) } };
             }
         }
-        const input_token = if (request.owned_input_token) |owner| owner.* else request.input_token_tensor;
-        if (input_token) |tensor| {
+        if (request.input_token_tensor) |tensor| {
             if (deviceTokenHandoffEnabled()) {
                 events.handoff_attempts += 1;
                 if (gatedTokenTensorEnabled() and (kind != .cuda or !gpt_arch.cudaDecodeGraphReplayPrefersGraph(self.context.cb))) {
@@ -413,7 +411,7 @@ pub const Runtime = struct {
                         return .{ .token = .{ .token = result.token_id, .token_tensor = result.token_tensor } };
                     }
                 }
-                if (try gpt_arch.forwardGreedyLastTokenFromTokenTensor(cb, allocator, model, tensor, 1, request.sequence_length, &decode, if (kind == .cuda) request.owned_input_token else null)) |result| {
+                if (try gpt_arch.forwardGreedyLastTokenFromTokenTensor(cb, allocator, model, tensor, 1, request.sequence_length, &decode)) |result| {
                     events.handoff_hits += 1;
                     return .{ .token = .{ .token = result.token_id, .token_tensor = result.token_tensor } };
                 }

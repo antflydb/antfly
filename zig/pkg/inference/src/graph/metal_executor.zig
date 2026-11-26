@@ -1534,7 +1534,6 @@ const RuntimeContext = struct {
             1,
             seq_len,
             decode_context,
-            null,
         ) catch |err| switch (err) {
             error.CudaGraphReplayRequired => null,
             else => return err,
