@@ -336,8 +336,14 @@ pub const TextPipeline = struct {
         const greedy = chat.usesUnpenalizedGreedy(config);
         const after = self.prompt.suffix;
         const chunk_rows: u32 = @intCast(plan.bank.layout.max_append_tokens);
+        var progress: diagnostics.PrefillProgress = .{};
+        var progress_target: ?*diagnostics.PrefillProgress = null;
         var prefill_observation = binding;
         if (prefill_observation) |*selected| {
+            if (selected.diagnostics.isEnabled()) {
+                progress_target = &progress;
+                selected.prefill_progress = &progress;
+            }
             selected.planned_prefill = .{
                 .max_append_rows = chunk_rows,
                 .attention_workspace_rows = if (plan.prefill) |work| work.reduction_rows else 1,
@@ -346,7 +352,7 @@ pub const TextPipeline = struct {
         }
         const select = selectsInPrefill(config);
         var first_token = try observation.callOperation(prefill_observation, .prefill, prefillPrompt, .{
-            self, &request, model, vision, if (select) after else after[0 .. after.len - 1], chunk_rows, select, binding,
+            self, &request, model, vision, if (select) after else after[0 .. after.len - 1], chunk_rows, select, progress_target, binding,
         });
         request.releasePrefill();
         if (!greedy) {
@@ -394,7 +400,7 @@ pub const TextPipeline = struct {
         return output.finalize(self.options, self.prompt.count(), limit);
     }
 
-    fn prefillPrompt(self: *const TextPipeline, request: *decoder.Request, model: *const decoder.Decoder, vision: ?*const vision_model.Vision, after: []const i32, chunk_rows: u32, select: bool, binding: ?observation.Binding) !?u32 {
+    fn prefillPrompt(self: *const TextPipeline, request: *decoder.Request, model: *const decoder.Decoder, vision: ?*const vision_model.Vision, after: []const i32, chunk_rows: u32, select: bool, progress: ?*diagnostics.PrefillProgress, binding: ?observation.Binding) !?u32 {
         const media = self.prompt.media;
         const count = media.len * 2 + 1;
         var local_images: [1]?vision_model.Vision.Embeddings = undefined;
@@ -447,10 +453,15 @@ pub const TextPipeline = struct {
                 }
             }
             if (pending != 0) return error.InvalidShape;
+            defer if (progress) |actual| {
+                actual.commitThrough(@intCast(request.state.sequence.committed_tokens));
+            };
             if (select and position + rows == total) {
                 // The last row supplies the head in the same frame that
                 // publishes its KV. Held image rows retire via the defer.
-                return try request.appendPrefixGreedy(batch[0..active]);
+                const token = try request.appendPrefixGreedy(batch[0..active]);
+                if (progress) |actual| actual.selected_first_token = true;
+                return token;
             }
             try request.appendPrefix(batch[0..active]);
             while (retired < part_index / 2) : (retired += 1) {

@@ -41,6 +41,7 @@ pub const Binding = struct {
     native_definition_templates: ?diagnostics_mod.NativeDefinitionTemplates = null,
     native_program_construction: ?diagnostics_mod.NativeProgramConstruction = null,
     planned_prefill: ?diagnostics_mod.PrefillGeometry = null,
+    prefill_progress: ?*const diagnostics_mod.PrefillProgress = null,
     model_allocator: ?std.mem.Allocator = null,
     stable_backend: ?ops.ComputeBackend = null,
     /// Shared providers require their own short metadata exclusion. Raw/private
@@ -145,6 +146,12 @@ pub fn recordContextAcquisitionFailure(context: anytype, operation: diagnostics_
 test "planned prefill geometry is exported separately from observed GPU work" {
     const Work = struct {
         fn run() !void {}
+        fn partial(progress: *diagnostics_mod.PrefillProgress) !void {
+            progress.commitThrough(256);
+            progress.commitThrough(512);
+            progress.commitThrough(512);
+            return error.Cancelled;
+        }
     };
     var owner = diagnostics_mod.Diagnostics{};
     owner.configure(true);
@@ -159,9 +166,22 @@ test "planned prefill geometry is exported separately from observed GPU work" {
     try std.testing.expectEqualStrings("prefill", report.operation);
     try std.testing.expectEqual(binding.planned_prefill, report.planned_prefill);
     try std.testing.expectEqual(@as(?u64, if (build_options.enable_metal) 0 else null), report.metal_encoded_dispatches);
+    var progress: diagnostics_mod.PrefillProgress = .{};
+    binding.prefill_progress = &progress;
+    try std.testing.expectError(error.Cancelled, callOperation(binding, .prefill, Work.partial, .{&progress}));
+    const partial = owner.snapshot().?.report.?;
+    try std.testing.expectEqualStrings("failed", partial.outcome);
+    try std.testing.expectEqual(diagnostics_mod.PrefillProgress{
+        .committed_input_tokens = 512,
+        .committed_chunks = 2,
+    }, partial.prefill_progress.?);
+
     binding.planned_prefill = null;
+    binding.prefill_progress = null;
     try callOperation(binding, .decode_step, Work.run, .{});
-    try std.testing.expect(owner.snapshot().?.report.?.planned_prefill == null);
+    const decode = owner.snapshot().?.report.?;
+    try std.testing.expect(decode.planned_prefill == null);
+    try std.testing.expect(decode.prefill_progress == null);
 }
 
 test "classified physical retries and declines preserve results and replace success only while enabled" {
@@ -308,6 +328,7 @@ const Invocation = struct {
         if (self.binding.native_definition_templates) |value| snapshot.native_definition_templates = value;
         if (self.binding.native_program_construction) |value| snapshot.native_program_construction = value;
         if (self.binding.planned_prefill) |value| snapshot.planned_prefill = value;
+        if (self.binding.prefill_progress) |value| snapshot.prefill_progress = value.*;
         _ = self.kernels.finish();
         snapshot.runtime.submission = self.scope.snapshot();
         snapshot.runtime.allocation_owners = self.owners.finish();

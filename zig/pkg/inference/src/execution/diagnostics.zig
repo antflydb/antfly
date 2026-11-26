@@ -228,8 +228,23 @@ pub const PrefillGeometry = struct {
     cache_capacity_tokens: u32,
 };
 
+/// State published by a managed prefill callback, including work retired
+/// before a later chunk fails. Counts exclude the subsequent decode phase.
+pub const PrefillProgress = struct {
+    committed_input_tokens: u32 = 0,
+    committed_chunks: u32 = 0,
+    selected_first_token: bool = false,
+
+    pub fn commitThrough(self: *PrefillProgress, tokens: u32) void {
+        if (tokens <= self.committed_input_tokens) return;
+        self.committed_input_tokens = tokens;
+        self.committed_chunks += 1;
+    }
+};
+
 pub const Snapshot = struct {
     planned_prefill: ?PrefillGeometry = null,
+    prefill_progress: ?PrefillProgress = null,
     decoder_route: ?DecoderRoute = null,
     stage_placement: ?StagePlacement = null,
     native_program_construction: ?NativeProgramConstruction = null,
