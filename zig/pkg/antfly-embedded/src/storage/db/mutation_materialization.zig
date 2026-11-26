@@ -11302,6 +11302,27 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             generation_attempts: u64,
             generation_error: []const u8,
         ) !void {
+            return recordArtifactRepairIssueContextDetailedGuarded(ctx, artifact_kind, index_name, doc_key, parent_doc_key, unit_id, index_source_artifact_name, source_artifact_name, artifact_name, artifact_key, chunk_id, sequence, reason, generation_attempts, generation_error, null);
+        }
+
+        pub fn recordArtifactRepairIssueContextDetailedGuarded(
+            ctx: *const AsyncContext,
+            artifact_kind: types.ArtifactRepairKind,
+            index_name: []const u8,
+            doc_key: []const u8,
+            parent_doc_key: []const u8,
+            unit_id: []const u8,
+            index_source_artifact_name: []const u8,
+            source_artifact_name: []const u8,
+            artifact_name: []const u8,
+            artifact_key: []const u8,
+            chunk_id: ?u32,
+            sequence: u64,
+            reason: types.ArtifactRepairReason,
+            generation_attempts: u64,
+            generation_error: []const u8,
+            guard: ?docstore_mod.DocStore.TransactionalGuard,
+        ) !void {
             const kind_name = @tagName(artifact_kind);
             const artifact_key_hex = if (artifact_key.len > 0)
                 try bytesToHexAlloc(ctx.alloc, artifact_key)
@@ -11352,6 +11373,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .first_seen_ns = now_ns,
                 };
             defer issue.deinit(ctx.alloc);
+            if (sequence < issue.sequence and reason == .enrichment_failed) {
+                if (guard != null) return error.EnrichmentSourceChanged;
+                return;
+            }
 
             const merged_generation_attempts = mergeGenerationFailureAttempts(
                 issue.reason,
@@ -11434,7 +11459,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (!existing_was_pending) completion.pending_issues +|= 1;
                 var encoded_completion: [artifact_repair_completion_state_len]u8 = undefined;
                 encodeArtifactRepairCompletionState(&encoded_completion, completion);
-                try saveArtifactRepairIssueToStoreWithSummary(
+                try saveArtifactRepairIssueToStoreWithSummaryGuarded(
                     ctx.alloc,
                     ctx.store,
                     issue_key,
@@ -11451,6 +11476,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .{ .key = terminal_marker.marker.issue_key, .value = terminal_marker.marker.sequence_key },
                     },
                     marker_deletes.items,
+                    guard,
                 );
             } else {
                 // A non-enrichment diagnosis supersedes the shared success fence. It
@@ -11472,7 +11498,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     true,
                 );
                 try marker_deletes.append(ctx.alloc, completion_key);
-                try saveArtifactRepairIssueToStoreWithSummary(
+                try saveArtifactRepairIssueToStoreWithSummaryGuarded(
                     ctx.alloc,
                     ctx.store,
                     issue_key,
@@ -11480,6 +11506,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     existing == null,
                     &.{},
                     marker_deletes.items,
+                    guard,
                 );
             }
             if (ctx.repair_issue_counter) |counter| _ = counter.fetchAdd(1, .monotonic);
@@ -12005,6 +12032,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             extra_writes: []const docstore_mod.KVPair,
             extra_deletes: []const []const u8,
         ) !void {
+            return saveArtifactRepairIssueToStoreWithSummaryGuarded(alloc, store, key, issue, new_issue, extra_writes, extra_deletes, null);
+        }
+
+        fn saveArtifactRepairIssueToStoreWithSummaryGuarded(
+            alloc: Allocator,
+            store: *docstore_mod.DocStore,
+            key: []const u8,
+            issue: types.ArtifactRepairIssue,
+            new_issue: bool,
+            extra_writes: []const docstore_mod.KVPair,
+            extra_deletes: []const []const u8,
+            guard: ?docstore_mod.DocStore.TransactionalGuard,
+        ) !void {
             const kind_key = try artifactRepairIssueKindKeyForIssueAlloc(alloc, issue);
             defer alloc.free(kind_key);
             const encoded = try encodeArtifactRepairIssueValueAlloc(alloc, issue);
@@ -12039,7 +12079,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             borrowed_write_count = writes.items.len;
             try deletes.appendSlice(alloc, extra_deletes);
             if (new_issue) try appendArtifactRepairSummaryDirtyForStore(alloc, store, &writes, &deletes, &owned_delete_keys);
-            try store.putBatch(writes.items, deletes.items);
+            if (guard) |proof| {
+                _ = try store.putBatchWithPromotionsReplayAndBuiltWrite(null, writes.items, deletes.items, &.{}, null, null, proof);
+            } else try store.putBatch(writes.items, deletes.items);
         }
 
         pub fn scanDerivedCoverageOutcomeFromStore(

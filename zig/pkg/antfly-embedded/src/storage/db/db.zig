@@ -59518,7 +59518,14 @@ fn recordEnrichmentRequestFailure(ctx_ptr: *anyopaque, failure: enrichment_runti
     );
     defer ctx.alloc.free(artifact_key);
 
-    try recordArtifactRepairIssueContextDetailed(
+    const Guard = struct {
+        fn validate(ptr: *anyopaque, _: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) !void {
+            const proof: *const enrichment_runtime_mod.MediaFailureProof = @ptrCast(@alignCast(ptr));
+            try proof.validate(txn);
+        }
+    };
+    var proof = failure.media_proof;
+    try local_mutation.recordArtifactRepairIssueContextDetailedGuarded(
         async_ctx,
         artifact_kind,
         failure.index_name,
@@ -59534,6 +59541,7 @@ fn recordEnrichmentRequestFailure(ctx_ptr: *anyopaque, failure: enrichment_runti
         .enrichment_failed,
         failure.attempts,
         failure.error_name,
+        if (proof) |*value| .{ .ptr = value, .validate = Guard.validate } else null,
     );
 }
 
@@ -102797,12 +102805,41 @@ test "db terminal enrichment sequence index survives coalescing and retires with
         );
     }
 
+    const append_ctx = db.enrichment_append_context.?;
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+    defer alloc.free(primary_key);
+    const cursor_key = "\x00\x00__metadata__:media_pass:test-proof";
+    const captured_primary = "{\"text\":\"original\"}";
+    try db.core.store.put(primary_key, captured_primary);
+    try db.core.store.put(cursor_key, "cursor");
+    var captured_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(captured_primary, &captured_digest, .{});
+    var failure: enrichment_runtime_mod.RequestFailure = .{
+        .kind = .asset,
+        .index_name = "relations_graph",
+        .artifact_name = "relations_v1",
+        .doc_key = "doc:a",
+        .error_name = "RequiredMediaOutputFailed",
+        .attempts = 1,
+        .sequence = 15,
+        .media_proof = .{
+            .cursor_key = cursor_key,
+            .cursor_value = "cursor",
+            .primary_key = primary_key,
+            .primary_digest = captured_digest,
+            .primary_revision = null,
+        },
+    };
+    try std.testing.expectError(error.EnrichmentSourceChanged, recordEnrichmentRequestFailure(append_ctx, failure));
+    failure.sequence = 25;
+    try db.core.store.put(primary_key, "{\"text\":\"new revision\"}");
+    try std.testing.expectError(error.EnrichmentSourceChanged, recordEnrichmentRequestFailure(append_ctx, failure));
+
     const issues = try db.listArtifactRepairIssues(alloc, .asset, "relations_graph", 0);
     defer types.freeArtifactRepairIssues(alloc, issues);
     try std.testing.expectEqual(@as(usize, 1), issues.len);
     try std.testing.expectEqual(@as(u64, 20), issues[0].sequence);
 
-    const append_ctx = db.enrichment_append_context.?;
     try std.testing.expect(try enrichmentRequestFailureRangePending(append_ctx, 9, 10));
     try std.testing.expect(!try enrichmentRequestFailureRangePending(append_ctx, 10, 15));
     try std.testing.expect(try enrichmentRequestFailureRangePending(append_ctx, 15, 20));
