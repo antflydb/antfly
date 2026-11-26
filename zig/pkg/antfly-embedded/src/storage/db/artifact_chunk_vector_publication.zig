@@ -139,7 +139,8 @@ pub const Fence = struct {
     /// Resolve membership and decode inherited provenance before serialized
     /// apply. Published generation rows are immutable; the head/member guards
     /// plus this exact proof reference fence preserve the prepared observation.
-    pub fn bind(self: *Fence, alloc: std.mem.Allocator, txn: anytype, command: publication.Command) !void {
+    pub fn bind(self: *Fence, alloc: std.mem.Allocator, txn: anytype, command: publication.Command, window_protocol: bool) !void {
+        if (window_protocol) try self.validateWindowPlan(alloc, txn, command);
         self.prepared = false;
         self.certificate = null;
         var input = try @import("artifact_chunk_generation.zig").captureInput(alloc, txn, self.scope);
@@ -180,10 +181,10 @@ pub const Fence = struct {
         if (self.certificate) |certificate| try certificate.requireCurrent(txn);
     }
 
-    /// Per-key CAS alone cannot observe a newly created sibling. Ordered
-    /// protocols with window support validate the entire preimage under the
-    /// same writer that installs the vector projection and its proof.
-    pub fn requireCurrentOutputs(self: Fence, alloc: std.mem.Allocator, txn: anytype, command: publication.Command) !void {
+    /// Validate the window plan outside the serialized writer. The scalar
+    /// precondition also fences the output set: physical child writes advance
+    /// the parent revision, even when the parent has no stored value.
+    fn validateWindowPlan(self: Fence, alloc: std.mem.Allocator, txn: anytype, command: publication.Command) !void {
         if (!self.dense) return;
         if (!publication.isRevisionBoundChunkVectorSet(self.scope, command.producer_artifact_name, command.mutations))
             return error.EnrichmentSourceChanged;
@@ -193,7 +194,8 @@ pub const Fence = struct {
             scalar_effect = scalar_effect or effect.key[self.scope.len] == keys.derived_embedding_kind;
             window_effect = window_effect or effect.key[self.scope.len] == keys.media_window_kind;
         }
-        if (window_effect and !scalar_effect) return error.EnrichmentSourceChanged;
+        if (!scalar_effect) return error.EnrichmentSourceChanged;
+        if (!window_effect) return;
         const first = try keys.mediaWindowChildKeyAlloc(alloc, self.scope, 0);
         defer alloc.free(first);
         const prefix = first[0 .. first.len - @sizeOf(u32)];

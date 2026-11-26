@@ -1120,7 +1120,7 @@ pub const DocStore = struct {
                 return try self.runtime.?.hasPrefix(prefix);
             }
 
-            pub fn openPhysicalCursorAdapter(self: @This()) !backend_erased.Cursor {
+            fn openPhysicalCursorAdapter(self: @This()) !backend_erased.Cursor {
                 return self.runtime.?.openCursor();
             }
 

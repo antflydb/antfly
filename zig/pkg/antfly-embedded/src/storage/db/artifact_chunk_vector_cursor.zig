@@ -187,27 +187,91 @@ pub fn Cursor(comptime Txn: type) type {
             var visits: usize = 0;
             while (self.output_entry) |row| {
                 if (!std.mem.startsWith(u8, row.key, member)) break;
-                const window = row.key.len > member.len and row.key[member.len] == keys.media_window_kind;
-                self.member_has_windows = self.member_has_windows or window;
-                visits += 1;
-                if (!self.capture_window_hints or self.member_has_windows or visits == 3) {
-                    if (self.capture_window_hints and !self.member_has_windows and row.key.len > member.len and row.key[member.len] < keys.media_window_kind) {
-                        const lower = try keys.mediaWindowChildKeyAlloc(self.alloc, member, 0);
-                        defer self.alloc.free(lower);
-                        if (try self.outputs.seekAtOrAfter(lower)) |found| {
-                            self.member_has_windows = std.mem.startsWith(u8, found.key, lower[0 .. lower.len - @sizeOf(u32)]);
+                if (self.capture_window_hints) {
+                    // A selected member must still advance when its budget
+                    // expires. Unknown is conservative: the caller will
+                    // capture the exact child set if this member needs a write.
+                    if (!budget.exhausted() and !self.member_has_windows) {
+                        budget.visit(row.key.len);
+                        const window = row.key.len > member.len and row.key[member.len] == keys.media_window_kind;
+                        self.member_has_windows = window;
+                        visits += 1;
+                        if (!window and visits < 3) {
+                            self.output_entry = try self.outputs.next();
+                            continue;
                         }
-                    }
-                    const upper = try keys.nextPrefixAlloc(self.alloc, member);
-                    defer if (upper) |value| self.alloc.free(value);
-                    self.output_entry = if (upper) |value| try self.outputs.seekAtOrAfter(value) else null;
-                    break;
+                        if (!window and row.key.len > member.len and row.key[member.len] < keys.media_window_kind) {
+                            if (!budget.exhausted()) {
+                                const lower = try keys.mediaWindowChildKeyAlloc(self.alloc, member, 0);
+                                defer self.alloc.free(lower);
+                                const found = try self.outputs.seekAtOrAfter(lower);
+                                budget.visit(if (found) |value| value.key.len else lower.len);
+                                self.member_has_windows = if (found) |value| std.mem.startsWith(u8, value.key, lower[0 .. lower.len - @sizeOf(u32)]) else false;
+                                if (!self.member_has_windows) {
+                                    self.output_entry = found;
+                                    break;
+                                }
+                            } else self.member_has_windows = true;
+                        }
+                    } else self.member_has_windows = true;
                 }
-                self.output_entry = try self.outputs.next();
+                const upper = try keys.nextPrefixAlloc(self.alloc, member);
+                defer if (upper) |value| self.alloc.free(value);
+                self.output_entry = if (upper) |value| try self.outputs.seekAtOrAfter(value) else null;
+                if (self.capture_window_hints) budget.visit(if (self.output_entry) |value| value.key.len else member.len);
+                break;
             }
             budget.visits +|= 1;
             budget.bytes +|= self.result.?.len;
             return .{ .member = self.result.? };
         }
     };
+}
+
+test "model aware media window hint lookahead charges its budget and still advances" {
+    const a = std.testing.allocator;
+    const backend_erased = @import("../backend_erased.zig");
+    var backend = @import("../mem_backend.zig").Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "window-hint-budget" });
+    defer store.deinit();
+    var erased = try backend_erased.storeFrom(a, store);
+    defer erased.deinit();
+    const member = try keys.chunkArtifactKeyAlloc(a, "doc", "text", 0);
+    defer a.free(member);
+    const scalar = try keys.derivedEmbeddingArtifactKeyAlloc(a, member, "model");
+    defer a.free(scalar);
+    {
+        var write = try erased.beginWrite();
+        errdefer write.abort();
+        try write.put(member, "{\"body\":\"text\"}");
+        try write.put(scalar, "vector");
+        try write.commit();
+    }
+    var read = try erased.beginRead();
+    defer read.abort();
+    var borrowed: logical.BorrowedRead = .{ .read = &read };
+    const C = Cursor(logical.BorrowedRead);
+    var plain = try C.open(a, &borrowed, "doc", "text", "model");
+    defer plain.close();
+    var hinted = try C.open(a, &borrowed, "doc", "text", "model");
+    defer hinted.close();
+    hinted.enableWindowHints();
+    var plain_budget: Budget = .{};
+    var budget: Budget = .{};
+    try std.testing.expectEqualStrings(member, (try plain.poll(&plain_budget)).member);
+    try std.testing.expectEqualStrings(member, (try hinted.poll(&budget)).member);
+    try std.testing.expect(!hinted.member_has_windows);
+    try std.testing.expectEqual(plain_budget.visits + 2, budget.visits);
+    try std.testing.expectEqual(plain_budget.bytes + member.len + scalar.len, budget.bytes);
+
+    var limited = try C.open(a, &borrowed, "doc", "text", "model");
+    defer limited.close();
+    limited.enableWindowHints();
+    budget = .{ .max_visits = 1, .max_bytes = 1 };
+    try std.testing.expectEqualStrings(member, (try limited.poll(&budget)).member);
+    try std.testing.expect(limited.member_has_windows); // Exact child capture is required when lookahead cannot certify absence.
+    try std.testing.expectEqual(@as(usize, 3), budget.visits); // Logical member, mandatory advance, returned member.
+    budget = .{};
+    try std.testing.expect((try limited.poll(&budget)) == .end);
 }
