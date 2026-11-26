@@ -53659,32 +53659,50 @@ test "Metal paged relative attention reads convolved KV staged in the same frame
         if (index < payloads.len) try tensor.uploadBytes(payloads[index]);
     }
 
+    const packed_plane_bytes = 4 * 66;
+    const packed_stride = comptime std.mem.alignForward(usize, packed_plane_bytes, 16);
+    const packed_elements = packed_plane_bytes / @sizeOf(u16);
+    var packed_storage = try MetalTensor.deviceAllocateTyped(a, runtime, .i16, .shared, &.{@intCast(3 * packed_stride / @sizeOf(u16))});
+    defer packed_storage.deinit();
+    try packed_storage.uploadBytes(&@as([3 * packed_stride]u8, @splat(0)));
+    var packed_key = try packed_storage.retainedView(packed_stride, packed_plane_bytes, &.{@intCast(packed_elements)});
+    defer packed_key.deinit();
+    var packed_value = try packed_storage.retainedView(2 * packed_stride, packed_plane_bytes, &.{@intCast(packed_elements)});
+    defer packed_value.deinit();
+    var packed_output = try MetalTensor.deviceAllocateTyped(a, runtime, .i16, .shared, &.{256});
+    defer packed_output.deinit();
+
     try tensors[9].uploadBytes(std.mem.asBytes(&zeros));
     try tensors[10].uploadBytes(std.mem.sliceAsBytes(zeros[0..384]));
     try beginFrame(runtime);
     errdefer cancelFrame(runtime) catch {};
-    try CausalPagedRelativeBf16.encode(runtime, &append, .full, attention.query, .{
+    const operands: CausalPagedRelativeBf16.QueryInputs = .{
         .query = &tensors[0],
         .relative = null,
         .page_ids = &tensors[5],
         .sinks = &tensors[6],
         .gates = &tensors[0],
-    }, .{ .key = &tensors[1], .value = &tensors[2] }, .{
+    };
+    const key: CausalPagedRelativeBf16.Operand = .{
         .input = .{ .values = &tensors[3], .weight = &tensors[9], .history = &tensors[10], .dynamic_taps = null },
         .staged = &tensors[11],
         .next_history = &tensors[13],
-    }, .{
+    };
+    const value_operand: CausalPagedRelativeBf16.Operand = .{
         .input = .{ .values = &tensors[4], .weight = &tensors[9], .history = &tensors[10], .dynamic_taps = null },
         .staged = &tensors[12],
         .next_history = &tensors[14],
-    }, .{
+    };
+    const stencil: CausalDepthwise4Bf16 = .{
         .channels = 128,
         .rows = 2,
         .valid_history = 1,
         .output_scale = 1,
         .clip = 1,
         .epsilon = 0.000001,
-    }, &tensors[7], &tensors[8]);
+    };
+    try CausalPagedRelativeBf16.encode(runtime, &append, .full, attention.query, operands, .{ .key = &tensors[1], .value = &tensors[2] }, key, value_operand, stencil, &tensors[7], &tensors[8]);
+    try CausalPagedRelativeBf16.encode(runtime, &append, .full, attention.query, operands, .{ .key = &packed_key, .value = &packed_value, .format = .q4_head128 }, key, value_operand, stencil, &tensors[7], &packed_output);
     try std.testing.expectEqual(@as(usize, 1), sequence.committed_tokens);
     try submitFrame(runtime);
     try waitFrame(runtime);
@@ -53693,6 +53711,9 @@ test "Metal paged relative attention reads convolved KV staged in the same frame
 
     var output: [256]u16 = undefined;
     try tensors[8].downloadBytesInto(std.mem.asBytes(&output));
+    var packed_result: [256]u16 = undefined;
+    try packed_output.downloadBytesInto(std.mem.asBytes(&packed_result));
+    try std.testing.expectEqual(output, packed_result);
     // Visible values are [0, 1] then [0, 1, 1], plus one zero-valued sink.
     for (output[0..128]) |value| try std.testing.expectEqual(@as(u16, 0x3e2b), value);
     for (output[128..]) |value| try std.testing.expectEqual(@as(u16, 0x3e80), value);
