@@ -586,6 +586,11 @@ preparation API do not by themselves complete these remaining requirements:
   Decoder storage installs the request-local replay bound before CUDA KV writes.
   Prepared-media and text prefill share chunk policy, and decoder prefill
   selects the prepared-media KV window before numerical submission.
+  Eager and compiled prefill use the same speculative in-flight row bound.
+  Decoder storage validates the opt-in sampled ring against scheduling and
+  compiled routes and selects cooperative KV metadata scopes. The decoder
+  runtime checks Metal driver-frame eligibility. Generation supplies the
+  request's grammar, scheduling and output intent.
   Incremental encoder-decoder callers supply new tokens and their absolute
   starting position. Native, compiled and merged decoders validate the position
   before submission and advance it only on success. Merged seq2seq ONNX

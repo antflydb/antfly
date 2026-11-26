@@ -2139,14 +2139,6 @@ test "Gemma4 CUDA default replay declines sampling transforms and compaction pro
     }) |config| try std.testing.expect(!gemma4DefaultReplayConfigEligible(config, false));
 }
 
-fn metalRingDecodeRequestEligible(config: GenerationConfig) bool {
-    return metalRingDecodeRequestEligibleWithQualification(config, exact_hybrid_sampled_ring_qualification_override);
-}
-
-fn metalRingDecodeRequestEligibleWithQualification(config: GenerationConfig, sampled_qualified: bool) bool {
-    return decoder_storage.ringRequestEligible(decoderStorageRequest(config), sampled_qualified);
-}
-
 fn decoderRouteRequest(config: GenerationConfig) decoder_routes.Request {
     return .{ .storage = decoderStorageRequest(config), .has_token_observer = config.token_observer != null, .exact_hybrid = config.kv_cache_mode == .exact_hybrid };
 }
@@ -2970,13 +2962,11 @@ pub const NativeGenerationPipeline = struct {
             config.cache_compaction_ratio != null or config.prompt_cache_enabled or config.speculation_requested))
             return error.UnsupportedAttentionMatchRoute;
         try decoder_storage.validateSelectedRoute(config.kv_cache_mode == .select_v1, self.cb.kind(), self.scheduler != null);
-        // The qualification-only sampled/grammar ring route is intentionally
-        // direct eager: scheduler microbatches and compiled whole-model paths
-        // can still request contiguous full-history KV.
-        if (exact_hybrid_sampled_ring_qualification_override and
-            (!isPureGreedyConfig(config) or config.grammar != null) and
-            (self.scheduler != null or self.graph_cache != null or self.compiled_partition_backend != null))
-            return error.UnsupportedKvCachePolicy;
+        try decoder_storage.validateSampledRingExecution(
+            decoderStorageRequest(config),
+            exact_hybrid_sampled_ring_qualification_override,
+            self.scheduler != null or self.graph_cache != null or self.compiled_partition_backend != null,
+        );
         if (self.execution_control) |control| try control.update(.tokenizing, 0, 1);
         const allocator = self.allocator;
         const started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
@@ -11478,7 +11468,7 @@ test "whole-model prefill stays bounded and speculative width is validated" {
 }
 
 test "Metal ring admission excludes decode paths that require materialized KV" {
-    try std.testing.expect(metalRingDecodeRequestEligible(.{ .temperature = 0 }));
+    try std.testing.expect(decoder_storage.ringRequestEligible(decoderStorageRequest(.{ .temperature = 0 }), false));
     const model_config = gpt_mod.Config{ .family = .gemma, .num_hidden_layers = 6, .position_encoding = .rope, .sliding_window = 512, .sliding_window_pattern = 6, .ple_hidden_size = 256 };
     for ([_]GenerationConfig{
         .{ .temperature = 0.7 },
@@ -11488,16 +11478,22 @@ test "Metal ring admission excludes decode paths that require materialized KV" {
         .{ .temperature = 0, .prompt_cache_enabled = true },
         .{ .temperature = 0, .cache_compaction_ratio = 0.5 },
     }) |config| {
-        try std.testing.expect(!metalRingDecodeRequestEligible(config));
+        try std.testing.expect(!decoder_storage.ringRequestEligible(decoderStorageRequest(config), false));
         try std.testing.expectEqual(.full_history, generationKvCapacityPolicyForRoute(.metal_whole_model, model_config, config, .f16));
     }
 }
 
 test "qualification-only exact hybrid ring admits sampled and grammar eager decode" {
-    try std.testing.expect(metalRingDecodeRequestEligibleWithQualification(.{ .temperature = 0.7 }, true));
-    try std.testing.expect(metalRingDecodeRequestEligibleWithQualification(.{ .temperature = 0, .grammar = "json" }, true));
-    try std.testing.expect(!metalRingDecodeRequestEligibleWithQualification(.{ .temperature = 0.7, .prompt_cache_enabled = true }, true));
-    try std.testing.expect(!metalRingDecodeRequestEligibleWithQualification(.{ .temperature = 0.7, .speculation_requested = true }, true));
+    try std.testing.expect(decoder_storage.ringRequestEligible(decoderStorageRequest(.{ .temperature = 0.7 }), true));
+    try std.testing.expect(decoder_storage.ringRequestEligible(decoderStorageRequest(.{ .temperature = 0, .grammar = "json" }), true));
+    try std.testing.expect(!decoder_storage.ringRequestEligible(decoderStorageRequest(.{ .temperature = 0.7, .prompt_cache_enabled = true }), true));
+    try std.testing.expect(!decoder_storage.ringRequestEligible(decoderStorageRequest(.{ .temperature = 0.7, .speculation_requested = true }), true));
+    for ([_]GenerationConfig{ .{ .temperature = 0.7 }, .{ .temperature = 0, .grammar = "json" } }) |config| {
+        const request = decoderStorageRequest(config);
+        try decoder_storage.validateSampledRingExecution(request, true, false);
+        try decoder_storage.validateSampledRingExecution(request, false, true);
+        try std.testing.expectError(error.UnsupportedKvCachePolicy, decoder_storage.validateSampledRingExecution(request, true, true));
+    }
 }
 
 test "generation KV capacity policy is route and device-format aware" {

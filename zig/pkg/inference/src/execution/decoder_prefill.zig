@@ -32,6 +32,11 @@ const runtime = @import("../runtime/root.zig");
 const cuda_compute = if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig") else struct {};
 const BorrowedDecodeStateRuntime = graph_mod.decode_state_runtime.BorrowedDecodeStateRuntime;
 
+fn inflightRows(chunk_rows: usize, speculative_k: u32) usize {
+    const speculative_rows = @as(usize, @min(speculative_k, runtime.tier.memory.generation_max_speculative_k)) + 1;
+    return @max(chunk_rows, speculative_rows);
+}
+
 /// Bound idle prefill chunks only for geometries with qualified measurements.
 /// Keep the general scheduler ceiling intact for every other model and backend;
 /// explicit request limits and memory admission are applied separately.
@@ -945,14 +950,12 @@ pub const Runtime = struct {
         else
             0;
         const rows = decoder_routes.wholeModelExecutionPrefillChunkSize(context.compiled_partition_backend, configured_rows, request.scheduler_chunk_rows, request.query_tokens, bounded);
-        const speculative = @min(@as(usize, @intCast(request.speculative_k)), @as(usize, runtime.tier.memory.generation_max_speculative_k)) + 1;
-        self.state.configureKvMaxInflightTokens(@max(rows, speculative), bounded);
+        self.state.configureKvMaxInflightTokens(inflightRows(rows, request.speculative_k), bounded);
         return .{ .chunk_rows = rows, .bounded_swa = bounded };
     }
 
     pub fn prepareChunkWindow(self: *Runtime, request: PromptRequest, chunk_rows: usize) void {
-        const speculative = @min(@as(usize, @intCast(request.speculative_k)), 16) + 1;
-        self.state.configureKvMaxInflightTokens(@max(chunk_rows, speculative), self.forward.context.cb.kind() == .metal and
+        self.state.configureKvMaxInflightTokens(inflightRows(chunk_rows, request.speculative_k), self.forward.context.cb.kind() == .metal and
             request.prefilled_tokens == 0 and decoder_storage.ringRequestEligible(request.route.storage, request.sampled_ring_qualified));
     }
 

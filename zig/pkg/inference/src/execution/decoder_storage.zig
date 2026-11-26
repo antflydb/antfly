@@ -123,6 +123,13 @@ pub fn ringRequestEligible(request: Request, sampled_qualified: bool) bool {
         !request.prompt_cache and !request.compaction and !request.speculation and !request.draft;
 }
 
+/// The opt-in sampled or grammar ring is a direct eager route. A scheduler
+/// or a compiled executor can still require contiguous full-history storage.
+pub fn validateSampledRingExecution(request: Request, sampled_qualified: bool, requires_contiguous: bool) !void {
+    if (sampled_qualified and requires_contiguous and (!request.pure_greedy or request.grammar))
+        return error.UnsupportedKvCachePolicy;
+}
+
 pub fn splitRingRequestEligible(config: Config, request: Request, sampled_qualified: bool) bool {
     if (comptime !@import("build_options").enable_metal) return false;
     const sampled_or_grammar = !request.pure_greedy or request.grammar;
