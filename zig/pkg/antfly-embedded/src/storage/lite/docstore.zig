@@ -3471,6 +3471,10 @@ pub const Store = struct {
     test_groups_total: if (@import("builtin").is_test) std.atomic.Value(u64) else void = if (@import("builtin").is_test) .init(0) else {},
     test_group_members_total: if (@import("builtin").is_test) std.atomic.Value(u64) else void = if (@import("builtin").is_test) .init(0) else {},
     writer_admission: ?WriterAdmission = null,
+    /// C API mutations admitted on this store and not yet finished, and when
+    /// the last one finished (awake clock): an idle fold waits for them.
+    foreground_requests: std.atomic.Value(u32) = .init(0),
+    foreground_last_end_ns: std.atomic.Value(u64) = .init(0),
     writer_active: bool = false,
     writer_ticketed: bool = false,
     next_writer_ticket: u64 = 0,
@@ -6358,6 +6362,17 @@ pub const Store = struct {
     /// lease-managed store, whose own turn never writes, see
     /// `background_write_admission`) the writer authority before it
     /// releases an idle lease (lite-writer-authority.md §4.3).
+    /// A C API mutation entered this store (`HandleGuard`).
+    pub fn beginForegroundRequest(self: *Store) void {
+        _ = self.foreground_requests.fetchAdd(1, .acq_rel);
+    }
+
+    pub fn endForegroundRequest(self: *Store) void {
+        const now = std.Io.Clock.awake.now(self.file.runtime()).nanoseconds;
+        self.foreground_last_end_ns.store(@intCast(@max(0, now)), .release);
+        _ = self.foreground_requests.fetchSub(1, .acq_rel);
+    }
+
     pub fn foldIdleRedoLog(self: *Store) void {
         if (self.read_only) return;
         if (self.forwardedWriter() != null) return;
@@ -6412,11 +6427,17 @@ pub const Store = struct {
         // a commit (and the next write's sync of it) per write instead of
         // batching. Wait out twice the recent foreground interval, capped so
         // a store that does go quiet still folds within `max_idle_pace_ns`.
+        //
+        // Nor is a store idle while a request on it runs: a slow write can
+        // go a second without enqueueing, and a fold in the middle of it
+        // costs that write and the next ones commits of their own. Idleness
+        // counts from the end of the last request.
         const now = std.Io.Clock.awake.now(io).nanoseconds;
-        const last_activity_ns = @max(self.last_mutation_enqueue_ns, self.last_redo_fold_ns);
+        const foreground_active = self.foreground_requests.load(.acquire) != 0;
+        const last_activity_ns = @max(@max(self.last_mutation_enqueue_ns, self.last_redo_fold_ns), @as(i96, self.foreground_last_end_ns.load(.acquire)));
         const max_idle_pace_ns: i96 = 30 * std.time.ns_per_s;
         const idle_window_ns = @max(@as(i96, @intCast(self.redo_idle_checkpoint_ns)), @min(self.foreground_enqueue_interval_ns * 2, max_idle_pace_ns));
-        const idle_long_enough = now -| last_activity_ns >= idle_window_ns;
+        const idle_long_enough = !foreground_active and now -| last_activity_ns >= idle_window_ns;
         // Safety valve: a store that is never idle for a full
         // `redo_idle_checkpoint_ns` (a continuous trickle of writes, each
         // comfortably under the byte-capacity `threshold_due` trigger
@@ -12898,16 +12919,20 @@ test "lite maintenance ride-along waits for the leader that owns the drain" {
     store.ride_along_flush_unavailable.store(true, .release);
 
     const Leader = struct {
-        applying: std.atomic.Value(bool) = .init(false),
+        const State = enum(u8) { starting, applying, failed };
+        state: std.atomic.Value(State) = .init(.starting),
         release: std.atomic.Value(bool) = .init(false),
         fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.applying.store(true, .release);
+            self.state.store(.applying, .release);
             while (!self.release.load(.acquire)) antfly_platform.time.yieldNow();
             try file.putDocument("leader", "led");
         }
         fn run(self: *@This(), s: *Store) void {
-            const staged = s.stage(.{ .context = self, .apply = apply }) catch return;
+            const staged = s.stage(.{ .context = self, .apply = apply }) catch {
+                self.state.store(.failed, .release);
+                return;
+            };
             staged.wait() catch {};
         }
     };
@@ -12950,12 +12975,22 @@ test "lite maintenance ride-along waits for the leader that owns the drain" {
         leader.release.store(true, .release);
         leader_thread.join();
     };
-    while (!leader.applying.load(.acquire)) antfly_platform.time.yieldNow();
+    const deadline = antfly_platform.time.monotonicNs() + 10 * std.time.ns_per_s;
+    while (leader.state.load(.acquire) == .starting) {
+        if (antfly_platform.time.monotonicNs() > deadline) return error.TestLeaderNeverApplied;
+        antfly_platform.time.yieldNow();
+    }
+    if (leader.state.load(.acquire) == .failed) return error.TestLeaderFailedToStage;
 
     var ride_along: RideAlong = .{};
     const ride_thread = try std.Thread.spawn(.{}, RideAlong.run, .{ &ride_along, &store });
+    // Runs before the leader's cleanup: the ride-along waits on the leader.
+    var ride_joined = false;
+    defer if (!ride_joined) {
+        leader.release.store(true, .release);
+        ride_thread.join();
+    };
     // Observed waiting on completion while the leader still owns the drain.
-    const deadline = antfly_platform.time.monotonicNs() + 10 * std.time.ns_per_s;
     while (waits.count.load(.acquire) == 0) {
         if (antfly_platform.time.monotonicNs() > deadline) break;
         antfly_platform.time.yieldNow();
@@ -12971,6 +13006,7 @@ test "lite maintenance ride-along waits for the leader that owns the drain" {
     leader_thread.join();
     leader_joined = true;
     ride_thread.join();
+    ride_joined = true;
     if (ride_along.failure) |err| return err;
     try std.testing.expect(ride_along.done.load(.acquire));
     store.writer_held_by_maintenance.store(false, .release);

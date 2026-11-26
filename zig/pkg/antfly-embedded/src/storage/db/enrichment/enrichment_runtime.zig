@@ -208,6 +208,8 @@ pub const Config = struct {
     /// Runtime-owned cancellation propagated through template remote I/O and
     /// provider calls. Set by `start`; callers do not configure this directly.
     cancellation: CancellationToken = .none,
+    /// Absolute native deadline for request-scoped template transports.
+    source_deadline_ns: ?u64 = null,
     /// Runtime-owned source retry observer, installed alongside cancellation.
     fetch_retry_hint: ?template_remote.RetryHintObserver = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
@@ -409,6 +411,32 @@ pub const ArtifactUnitTurnCommit = struct {
     ptr: *anyopaque,
     commit: *const fn (*anyopaque, ?*const @import("../artifact_unit_jobs.zig").DocumentTurn, ?*const @import("../artifact_unit_jobs.zig").WorkTurn) anyerror!void,
 };
+/// Captured from the media pass that produced the terminal result. The
+/// current primary and the exact media checkpoint must both survive until the
+/// repair ledger transaction acquires the writer.
+pub const MediaFailureProof = struct {
+    cursor_key: []const u8,
+    cursor_value: []const u8,
+    primary_key: []const u8,
+    primary_digest: [32]u8,
+    primary_revision: ?u64,
+    fence: ?GeneratedWriteFence = null,
+    clock: platform_clock.Clock = platform_clock.Clock.real(),
+
+    pub fn validate(self: @This(), alloc: Allocator, txn: anytype) !void {
+        try validateEnrichmentWriteFenceTxn(alloc, txn, self.fence, self.clock);
+        const cursor = txn.get(self.cursor_key) catch |err| return if (err == error.NotFound) error.EnrichmentSourceChanged else err;
+        if (!std.mem.eql(u8, cursor, self.cursor_value)) return error.EnrichmentSourceChanged;
+        const revisions = @import("../../document_mutation_revision.zig");
+        if (self.primary_revision) |expected| {
+            if (try revisions.load(txn, revisions.keyForPhysical(self.primary_key).?) != expected)
+                return error.EnrichmentSourceChanged;
+        }
+        const primary = txn.get(self.primary_key) catch |err| return if (err == error.NotFound) error.EnrichmentSourceChanged else err;
+        if (!std.mem.eql(u8, &sourceRecordDigest(primary), &self.primary_digest)) return error.EnrichmentSourceChanged;
+    }
+};
+
 pub const RequestFailure = struct {
     kind: enrichment_types.GeneratedEnrichmentKind,
     index_name: []const u8,
@@ -420,6 +448,7 @@ pub const RequestFailure = struct {
     error_name: []const u8,
     attempts: u64,
     sequence: u64,
+    media_proof: ?MediaFailureProof = null,
 };
 pub const FailureRecorder = *const fn (ptr: *anyopaque, failure: RequestFailure) anyerror!void;
 pub const FailureIdentity = struct {
@@ -550,8 +579,8 @@ const default_sync_wait_timeout_ms: u64 = 5 * std.time.ms_per_min;
 const authority_retry_initial_ms: u64 = 2;
 const authority_retry_max_ms: u64 = 32;
 const parked_authority_check_ms: u64 = 30_000;
-const borrowed_cancellation_poll_min_ns: i64 = 25 * std.time.ns_per_ms;
-const borrowed_cancellation_poll_max_ns: i64 = 250 * std.time.ns_per_ms;
+const borrowed_cancellation_poll_min_ns: u64 = 25 * std.time.ns_per_ms;
+const borrowed_cancellation_poll_max_ns: u64 = 250 * std.time.ns_per_ms;
 
 const ForegroundCatchUpGuard = struct {
     cancellation: CancellationToken = .none,
@@ -580,9 +609,14 @@ const ForegroundCatchUpGuard = struct {
         return bounded(clock, config, cancellation);
     }
 
+    fn nativeDeadlineNs(self: @This(), inherited: ?u64) ?u64 {
+        const deadline = self.deadline_ns orelse return inherited;
+        const native = platform_time.monotonicNs() +| (deadline -| self.clock.nowRealtimeNs());
+        return if (inherited) |limit| @min(limit, native) else native;
+    }
+
     fn check(self: @This()) !void {
-        if (self.cancellation.isCancelled())
-            return RuntimeError.EnrichmentWaitCanceled;
+        self.cancellation.check() catch |err| return callerCheckpointFailure(err);
         if (self.deadline_ns) |deadline_ns| {
             if (self.clock.nowRealtimeNs() >= deadline_ns)
                 return RuntimeError.EnrichmentWaitTimeout;
@@ -2769,7 +2803,7 @@ fn assetRequestRecoveryKey(alloc: Allocator, request: enrichment_types.Generated
 
 fn inferenceControlFailurePolicy(err: anyerror, batch_items: usize) ?InferenceControlFailurePolicy {
     if (!inferenceControlFailure(err)) return null;
-    if (err == error.Cancelled or err == error.Canceled or err == error.EnrichmentWaitCanceled) return .{};
+    if (err != error.Timeout) return .{};
     if (batch_items > 1) return .{
         .next_batch_cap = @max(@as(usize, 1), batch_items / 2),
         .failed_capacity_batch = batch_items,
@@ -2779,7 +2813,11 @@ fn inferenceControlFailurePolicy(err: anyerror, batch_items: usize) ?InferenceCo
 
 fn noteInferenceControlFailure(runtime: *EnrichmentRuntime, recovery_key: InferenceRecoveryKey, err: anyerror, batch_items: usize) void {
     const policy = inferenceControlFailurePolicy(err, batch_items) orelse return;
-    if (err == error.Timeout or err == error.EnrichmentWaitTimeout) {
+    if (err == error.EnrichmentWaitTimeout) {
+        _ = runtime.inference_timeout_count.fetchAdd(1, .monotonic);
+        return;
+    }
+    if (err == error.Timeout) {
         _ = runtime.inference_timeout_count.fetchAdd(1, .monotonic);
         lockInferenceRecovery(runtime);
         defer runtime.inference_recovery_mutex.unlock();
@@ -3781,27 +3819,39 @@ const ScopedReplay = struct {
             self.state.retireSuperseded(runtime.alloc, group, key, try sourceDigest(runtime, group.doc_key));
         }
     }
+    const ParkMember = struct {
+        request: *const enrichment_types.GeneratedEnrichmentRequest,
+        fingerprint: u64,
+        digest: ?[32]u8,
+        stamp: ?scoped_retries.SourceStamp,
+    };
+
+    fn prepareParkMember(self: *@This(), runtime: *EnrichmentRuntime, owner: FailureOwner, request: *const enrichment_types.GeneratedEnrichmentRequest, fingerprint: u64) !ParkMember {
+        const digest = try self.ownerSource(runtime, owner, request.*);
+        const stamp = try stampFor(runtime, request.*, digest);
+        if (owner == .request and stamp == null) {
+            const io = concurrencyIo(runtime);
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            if (self.sources.contains(requestFailureFingerprint(request.*))) return error.EnrichmentSourceChanged;
+        }
+        return .{ .request = request, .fingerprint = fingerprint, .digest = digest, .stamp = stamp };
+    }
+
     fn park(self: *@This(), runtime: *EnrichmentRuntime, owner: FailureOwner, fingerprint: u64, err: anyerror) !void {
         const requests = try members(runtime.alloc, owner);
         defer runtime.alloc.free(requests);
-        const digests = try runtime.alloc.alloc(?[32]u8, requests.len);
-        defer runtime.alloc.free(digests);
-        for (requests, digests) |request, *digest| digest.* = try self.ownerSource(runtime, owner, request);
-        const stamps = try runtime.alloc.alloc(?scoped_retries.SourceStamp, requests.len);
-        defer runtime.alloc.free(stamps);
-        for (requests, digests, stamps) |request, digest, *stamp| stamp.* = try stampFor(runtime, request, digest);
-        if (owner == .request) {
-            const io = concurrencyIo(runtime);
-            self.mutex.lockUncancelable(io);
-            const captured = self.sources.contains(requestFailureFingerprint(owner.request));
-            self.mutex.unlock(io);
-            if (captured and stamps[0] == null) return error.EnrichmentSourceChanged;
-        }
+        const prepared = try runtime.alloc.alloc(ParkMember, requests.len);
+        defer runtime.alloc.free(prepared);
+        for (requests, prepared) |*request, *member| member.* = try self.prepareParkMember(runtime, owner, request, fingerprint);
+        _ = try self.parkPreparedMembers(runtime, prepared, err, false);
+    }
+
+    /// Queue eligible owners under one writer fence. Each member retains its
+    /// own budget and retry hint, even when one physical provider call fails.
+    fn parkPreparedMembers(self: *@This(), runtime: *EnrichmentRuntime, prepared: []const ParkMember, err: anyerror, skip_recorded: bool) !usize {
         const prior_io = lockRuntime(runtime);
-        const legacy = if (runtime.retry_failure_fingerprint == fingerprint)
-            scoped_retries.Budget{ .fingerprint = fingerprint, .failures = runtime.retry_failure_count, .waits = runtime.transient_retry_count }
-        else
-            scoped_retries.Budget{ .fingerprint = fingerprint };
+        const legacy = scoped_retries.Budget{ .fingerprint = runtime.retry_failure_fingerprint, .failures = runtime.retry_failure_count, .waits = runtime.transient_retry_count };
         unlockRuntime(runtime, prior_io);
         var publication = try RuntimePublicationStore.initRetryWrite(runtime);
         defer publication.deinit();
@@ -3809,23 +3859,30 @@ const ScopedReplay = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         if (self.hint_failed) return error.OutOfMemory;
-        self.unsaved = true;
-        const batch_hint = self.hints.get(fingerprint) orelse 0;
+        try self.recorded_requests.ensureUnusedCapacity(runtime.alloc, @intCast(prepared.len));
         const jitter = retryJitterSample(runtime);
         const now_ms = runtime.clock.nowRealtimeMs();
-        for (requests, digests, stamps) |request, digest, stamp| {
+        var parked: usize = 0;
+        for (prepared) |member| {
+            const request = member.request.*;
+            const request_fp = requestFailureFingerprint(request);
+            if (skip_recorded and self.recorded_requests.contains(request_fp)) continue;
             const logical = logicalRequestFingerprint(request);
-            var budget = try self.state.priorLogical(runtime.alloc, logical, digest);
-            budget.fingerprint = fingerprint;
-            budget.failures = @max(budget.failures, legacy.failures);
-            budget.waits = @max(budget.waits, legacy.waits);
+            var budget = try self.state.priorLogical(runtime.alloc, logical, member.digest);
+            budget.fingerprint = member.fingerprint;
+            if (member.fingerprint == legacy.fingerprint) {
+                budget.failures = @max(budget.failures, legacy.failures);
+                budget.waits = @max(budget.waits, legacy.waits);
+            }
             if (enrichmentFailureSparesAttemptBudget(err)) budget.waits +|= 1 else budget.failures +|= 1;
-            const hint_ms = @max(batch_hint, self.ownerHint(request));
+            const hint_ms = @max(self.hints.get(member.fingerprint) orelse 0, self.ownerHint(request));
             const deadline = now_ms +| workerRetryDelayJitterMs(budget.failures +| budget.waits, hint_ms, jitter);
-            try self.parkTicket(runtime, .{ .doc_key = request.doc_key, .sequence = request.sequence }, deadline, budget, digest, stamp, &publication);
+            try self.parkTicket(runtime, .{ .doc_key = request.doc_key, .sequence = request.sequence }, deadline, budget, member.digest, member.stamp, &publication);
+            self.recorded_requests.putAssumeCapacity(request_fp, {});
+            parked += 1;
         }
-        try self.saveAssumeLocked(runtime, publication.store(runtime).*, publication.retry_fence);
-        for (requests) |request| try self.recorded_requests.put(runtime.alloc, requestFailureFingerprint(request), {});
+        if (parked != 0) try self.saveAssumeLocked(runtime, publication.store(runtime).*, publication.retry_fence);
+        return parked;
     }
     fn deferUnattempted(self: *@This(), runtime: *EnrichmentRuntime, fingerprint: u64, requests: []const enrichment_types.GeneratedEnrichmentRequest, seed: enrichment_types.GeneratedEnrichmentRequest, comptime same_key: anytype) !void {
         // A provider-key failure stops later batches for that key. They still
@@ -3958,6 +4015,7 @@ fn scopedRetryHint(observer: ?template_remote.RetryHintObserver, request: enrich
 /// carries its identity here instead, and `LanePipeline` installs the failing
 /// lane's deferred identity on the scanner thread when it returns the error.
 const FailureScope = struct {
+    media_embedding_selections: []?MediaEmbeddingSelection = &.{},
     /// The request (or provider batch) currently being attempted.
     fingerprint: u64 = 0,
     /// The first retryable error deferred in this scope and its identity.
@@ -3989,6 +4047,11 @@ const FailureScope = struct {
         return err;
     }
 
+    fn assetPublicationFailure(self: ?*FailureScope, err: anyerror) anyerror {
+        if (isEnrichmentControlError(err)) return err;
+        return if (self) |scope| scope.publicationFailure(err) else err;
+    }
+
     fn publish(self: *FailureScope, runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, complete: bool) !void {
         flushGeneratedReplayWindowWithIdentity(runtime, window, if (complete) self.completedFingerprint() else 0) catch |err|
             return self.publicationFailure(err);
@@ -4013,6 +4076,10 @@ const FailureScope = struct {
         return self.current_attempt_number orelse requestAttemptNumberFor(runtime, self.fingerprint);
     }
     fn shouldYield(self: *FailureScope, runtime: *EnrichmentRuntime, err: anyerror) !bool {
+        return self.shouldYieldWithPending(runtime, err, null);
+    }
+
+    fn shouldYieldWithPending(self: *FailureScope, runtime: *EnrichmentRuntime, err: anyerror, pending: ?*std.ArrayListUnmanaged(ScopedReplay.ParkMember)) !bool {
         if (isEnrichmentControlError(err)) return true;
         if (enrichmentErrorDisposition(err) == .fatal_worker) return true;
         if (self.scheduled_invocation == self.invocation) return true;
@@ -4028,13 +4095,13 @@ const FailureScope = struct {
             if (enrichmentErrorDisposition(err) == .terminal_request) return false;
             const transient = enrichmentFailureSparesAttemptBudget(err);
             if (!requestRetryBudgetAllows(if (transient) budget.waits else budget.failures, runtime.config.worker_retry_max_attempts, err)) return false;
-            scheduler.park(runtime, owner, self.fingerprint, err) catch |save_err| return self.publicationFailure(save_err);
-            const io = lockRuntime(runtime);
-            runtime.error_count +|= 1;
-            runtime.retryable_error_count +|= 1;
-            runtime.last_error_code = types.RuntimeErrorName.init(@errorName(err));
-            unlockRuntime(runtime, io);
-            scheduler.refreshRuntime(runtime);
+            if (pending) |members| {
+                std.debug.assert(owner == .assets and owner.assets.len == 1);
+                try members.append(runtime.alloc, try scheduler.prepareParkMember(runtime, owner, &owner.assets[0].request, self.fingerprint));
+            } else {
+                scheduler.park(runtime, owner, self.fingerprint, err) catch |save_err| return self.publicationFailure(save_err);
+                noteParkedRequests(runtime, scheduler, err, 1);
+            }
             self.scheduled_invocation = self.invocation;
             if (self.first_scheduled_fingerprint == 0) self.first_scheduled_fingerprint = self.fingerprint;
             return true;
@@ -4235,7 +4302,8 @@ fn isEnrichmentProgressPending(err: anyerror) bool {
 
 fn isEnrichmentControlError(err: anyerror) bool {
     return err == error.EnrichmentRetryAborted or err == error.Cancelled or err == error.Canceled or
-        err == error.EnrichmentWaitCanceled or isEnrichmentProgressPending(err);
+        err == error.EnrichmentWaitCanceled or err == error.EnrichmentWaitTimeout or
+        err == error.EnrichmentRetryInProgress or err == error.UncancellableInferenceProvider or isEnrichmentProgressPending(err);
 }
 
 test "commit requirements prepared sources defer background publication without terminal failure" {
@@ -4841,6 +4909,7 @@ fn restorePersistedRuntimeStatus(runtime: anytype, persisted_status: enrichment_
     runtime.retrying = persisted_status.retrying and !persisted_status.worker_failed;
     runtime.next_retry_at_ms = if (runtime.retrying) persisted_status.next_retry_at_ms else 0;
     runtime.worker_failed = persisted_status.worker_failed;
+    if (@hasField(@TypeOf(runtime.*), "boundary_recovery_pending")) runtime.boundary_recovery_pending = false;
     runtime.target_sequence = @max(runtime.applied_sequence, persisted_status.target_sequence);
 }
 
@@ -4849,9 +4918,17 @@ fn restorePersistedRuntimeStatus(runtime: anytype, persisted_status: enrichment_
 // diagnostics and request-owned retry/terminal debt. Ordinary fatal failures
 // and exhausted episodes still require explicit repair.
 fn boundaryFailureReadmission(status: enrichment_state.RuntimeStatus, applied: u64, limit: u32) ?enrichment_state.RuntimeStatus {
-    if (!status.worker_failed or status.target_sequence <= applied or
-        !std.mem.eql(u8, status.last_error_code.slice(), "RuntimeBoundaryFailure") or
-        status.consecutive_retry_count >= limit) return null;
+    if (!status.worker_failed or status.target_sequence <= applied) return null;
+    const code = status.last_error_code.slice();
+    if (std.mem.eql(u8, code, "RuntimeBoundaryFailure")) {
+        if (status.consecutive_retry_count >= limit) return null;
+    } else {
+        // Older owners could spend the pipeline budget on a document
+        // cancellation. Give an upgraded owner one fenced pass over pending
+        // work. Keep the existing checkpoint and request retry history.
+        if (!isLegacyPipelineCancellation(status) or limit < 2 or
+            status.consecutive_retry_count != limit - 1) return null;
+    }
     var admitted = status;
     admitted.worker_failed = false;
     admitted.retrying = true;
@@ -4860,16 +4937,179 @@ fn boundaryFailureReadmission(status: enrichment_state.RuntimeStatus, applied: u
     return admitted;
 }
 
+fn isLegacyPipelineCancellation(status: enrichment_state.RuntimeStatus) bool {
+    const code = status.last_error_code.slice();
+    return (std.mem.eql(u8, code, "Canceled") or std.mem.eql(u8, code, "Cancelled")) and
+        status.retry_failure_fingerprint == pipelineFailureFingerprint(error.Canceled);
+}
+
+test "enrichment cancellation recovery reserves one replay pass without resetting debt" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased = try backend_erased.storeFrom(alloc, store);
+    defer erased.deinit();
+    const failed: enrichment_state.RuntimeStatus = .{
+        .last_error_code = .init("Canceled"),
+        .target_sequence = 14,
+        .worker_failed = true,
+        .consecutive_retry_count = 5,
+        .retry_failure_count = 5,
+        .retry_failure_fingerprint = pipelineFailureFingerprint(error.Canceled),
+        .terminal_failure_min_sequence = 8,
+        .terminal_failure_max_sequence = 9,
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path, ".zig-cache/tmp/{s}/indexes", .{tmp.sub_path});
+    var manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer manager.deinit();
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .worker_retry_max_attempts = 6 },
+        .ownership = undefined,
+    };
+    try enrichment_state.saveAppliedSequence(erased, scope_name, 10);
+
+    // An ordinary retry can have the same error, fingerprint and populated
+    // counters as a recovered worker. The pre-replay reservation must leave
+    // its durable deadline and retry state intact, even if replay never runs.
+    var ordinary = failed;
+    ordinary.worker_failed = false;
+    ordinary.consecutive_retry_count = 1;
+    ordinary.retry_failure_count = 1;
+    ordinary.retrying = true;
+    ordinary.next_retry_at_ms = 1234;
+    try enrichment_state.saveRuntimeStatus(erased, scope_name, ordinary);
+    try runtime.reloadDurableState();
+    try std.testing.expect(!runtime.boundary_recovery_pending);
+    const retry_before = try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name);
+    try saveRuntimeStatusWithRetry(&runtime, .boundary_recovery);
+    const retry_reopened = try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name);
+    try std.testing.expectEqualDeep(retry_before, retry_reopened);
+    try runtime.reloadDurableState();
+    try std.testing.expect(runtime.retrying and !runtime.worker_failed);
+    try std.testing.expectEqual(ordinary.next_retry_at_ms, runtime.next_retry_at_ms);
+
+    try enrichment_state.saveRuntimeStatus(erased, scope_name, failed);
+    try runtime.reloadDurableState();
+    try std.testing.expect(runtime.boundary_recovery_pending);
+    const first = try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name);
+    try saveRuntimeStatusWithRetry(&runtime, .boundary_recovery);
+    try std.testing.expect(!runtime.boundary_recovery_pending);
+    const reopened = try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name);
+    var expected = failed;
+    expected.consecutive_retry_count = 6;
+    try std.testing.expectEqualDeep(expected, reopened.status);
+    try std.testing.expectEqual(first.applied, reopened.applied);
+    try std.testing.expectEqual(first.generation, reopened.generation);
+    try saveRuntimeStatusWithRetry(&runtime, .boundary_recovery);
+    try std.testing.expectEqualDeep(reopened, try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name));
+    try runtime.reloadDurableState();
+    try std.testing.expect(runtime.worker_failed and !runtime.boundary_recovery_pending);
+
+    try enrichment_state.saveRuntimeStatus(erased, scope_name, failed);
+    try runtime.reloadDurableState();
+    var receipt: ?BoundaryRecoveryReservation = null;
+    try saveRuntimeStatusWithPlanReceipt(&runtime, .boundary_recovery, null, runtime.replay_generation, null, &receipt);
+    try std.testing.expect(!runtime.boundary_recovery_pending);
+    const expired: ForegroundCatchUpGuard = .{ .deadline_ns = 0 };
+    try std.testing.expectEqual(error.EnrichmentWaitTimeout, foregroundPassFailure(&runtime, expired, error.Canceled));
+    const reserved_observed = try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name);
+    const lease_key = enrichment_lease.default_lease_key;
+    const successor_lease = try std.json.Stringify.valueAlloc(alloc, lease_mod.LeaseRecord{
+        .owner_id = "successor",
+        .epoch = 2,
+        .expires_at_ms = std.math.maxInt(u64),
+    }, .{});
+    defer alloc.free(successor_lease);
+    try storePutBatchWithRetry(&runtime, &.{.{ .key = lease_key, .value = successor_lease }}, &.{});
+    var stale = receipt.?;
+    stale.fence = .{ .lease_key = lease_key, .owner_id = "previous", .epoch = 1 };
+    try std.testing.expectError(error.EnrichmentLeaseFenceLost, releaseBoundaryRecoveryReservation(&runtime, stale));
+    try std.testing.expectEqualDeep(reserved_observed, try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name));
+    try storePutBatchWithRetry(&runtime, &.{}, &.{lease_key});
+    try releaseBoundaryRecoveryReservation(&runtime, receipt.?);
+    try runtime.reloadDurableState();
+    try std.testing.expect(runtime.boundary_recovery_pending and !runtime.worker_failed);
+    const refunded = try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name);
+    try std.testing.expectEqualDeep(failed, refunded.status);
+    try std.testing.expectEqual(first.applied, refunded.applied);
+    try std.testing.expectEqual(first.generation, refunded.generation);
+
+    receipt = null;
+    try saveRuntimeStatusWithPlanReceipt(&runtime, .boundary_recovery, null, runtime.replay_generation, null, &receipt);
+    try enrichment_state.saveRuntimeStatus(erased, scope_name, ordinary);
+    const winner = try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name);
+    try releaseBoundaryRecoveryReservation(&runtime, receipt.?);
+    try std.testing.expectEqualDeep(winner, try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name));
+
+    // A different writer can supersede the failed snapshot before this
+    // detached owner obtains the replay lease. Its newer retry must win.
+    try enrichment_state.saveRuntimeStatus(erased, scope_name, failed);
+    try runtime.reloadDurableState();
+    try std.testing.expect(runtime.boundary_recovery_pending);
+    try enrichment_state.saveRuntimeStatus(erased, scope_name, ordinary);
+    const superseding = try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name);
+    runtime.ownership = try ownership_mod.State.init(alloc, erased, enrichment_lease.default_lease_key, .{ .lease_owned = true });
+    defer runtime.ownership.deinitPreserveLease(alloc);
+    runtime.io_impl = .{ .borrowed = std.testing.io };
+    try std.testing.expectError(error.EnrichmentReplayAuthorityBusy, runForegroundCatchUpPassGuarded(&runtime, std.testing.io, failed.target_sequence, .{}));
+    try std.testing.expect(!runtime.boundary_recovery_pending and runtime.retrying and !runtime.worker_failed);
+    try std.testing.expectEqualDeep(superseding, try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name));
+
+    try enrichment_state.saveRuntimeStatus(erased, scope_name, failed);
+    try runtime.reloadDurableState();
+    runtime.lease_fencing_enabled = true;
+    const new_lease = try std.json.Stringify.valueAlloc(alloc, lease_mod.LeaseRecord{
+        .owner_id = "new owner",
+        .epoch = runtime.ownership.lease_epoch + 1,
+        .expires_at_ms = std.math.maxInt(u64),
+    }, .{});
+    defer alloc.free(new_lease);
+    {
+        var txn = try erased.beginWrite();
+        errdefer txn.abort();
+        try txn.put(lease_key, new_lease);
+        try txn.commit();
+    }
+    const before_takeover_reserve = try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name);
+    receipt = null;
+    try std.testing.expectError(error.EnrichmentReplayAuthorityBusy, saveRuntimeStatusWithPlanReceipt(&runtime, .boundary_recovery, null, runtime.replay_generation, null, &receipt));
+    try std.testing.expect(receipt == null);
+    try std.testing.expectEqualDeep(before_takeover_reserve, try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name));
+    try std.testing.expect(boundaryFailureReadmission(failed, 14, 6) == null);
+    var unrelated = failed;
+    unrelated.retry_failure_fingerprint = 0;
+    try std.testing.expect(boundaryFailureReadmission(unrelated, 10, 6) == null);
+}
+
 fn restoreThreadedRuntimeStatus(runtime: *EnrichmentRuntime, status: enrichment_state.RuntimeStatus) void {
-    restorePersistedRuntimeStatus(runtime, boundaryFailureReadmission(status, runtime.applied_sequence, runtime.config.worker_retry_max_attempts) orelse status);
+    const admitted = boundaryFailureReadmission(status, runtime.applied_sequence, runtime.config.worker_retry_max_attempts);
+    restorePersistedRuntimeStatus(runtime, admitted orelse status);
+    runtime.boundary_recovery_pending = admitted != null;
 }
 
 // Persist the reservation only after acquiring the replay lease. Keep the
 // failure latch durable until real replay progress: a crash during recovery
 // must consume this slot rather than silently forgiving the failed episode.
-fn boundaryFailureAdmissionStatus(status: enrichment_state.RuntimeStatus) ?enrichment_state.RuntimeStatus {
-    if (status.worker_failed or !status.retrying or status.consecutive_retry_count == 0 or
-        !std.mem.eql(u8, status.last_error_code.slice(), "RuntimeBoundaryFailure")) return null;
+fn boundaryFailureAdmissionStatus(status: enrichment_state.RuntimeStatus, pending: bool, applied: u64) ?enrichment_state.RuntimeStatus {
+    if (!pending or status.target_sequence <= applied or status.worker_failed or !status.retrying or status.consecutive_retry_count == 0 or
+        (!std.mem.eql(u8, status.last_error_code.slice(), "RuntimeBoundaryFailure") and
+            !isLegacyPipelineCancellation(status))) return null;
     var durable = status;
     durable.worker_failed = true;
     durable.retrying = false;
@@ -4908,7 +5148,7 @@ test "enrichment boundary failure readmission preserves durable debt and bounds 
         try std.testing.expectEqual(original.retry_failure_count, admitted.retry_failure_count);
         try std.testing.expectEqual(original.terminal_failure_min_sequence, admitted.terminal_failure_min_sequence);
         try std.testing.expectEqual(original.terminal_failure_max_sequence, admitted.terminal_failure_max_sequence);
-        const reservation = boundaryFailureAdmissionStatus(admitted) orelse return error.TestUnexpectedResult;
+        const reservation = boundaryFailureAdmissionStatus(admitted, true, 1) orelse return error.TestUnexpectedResult;
         try enrichment_state.saveRuntimeStatus(erased, scope_name, reservation);
         status = try enrichment_state.loadRuntimeStatus(alloc, erased, scope_name);
         try std.testing.expectEqual(@as(u32, @intCast(attempt)), status.consecutive_retry_count);
@@ -4924,7 +5164,7 @@ test "enrichment boundary failure readmission preserves durable debt and bounds 
         terminal.worker_failed = false;
         terminal.retrying = true;
         terminal.consecutive_retry_count = 1;
-        try std.testing.expect(boundaryFailureAdmissionStatus(terminal) == null);
+        try std.testing.expect(boundaryFailureAdmissionStatus(terminal, true, 1) == null);
     }
 }
 
@@ -5232,6 +5472,13 @@ const AssetInvocationCancellation = struct {
         return self.lifecycle.isCancelled() or self.request.isCancelled() or
             self.inherited.isCancelled();
     }
+
+    fn check(ptr: *const anyopaque) !void {
+        const self: *const @This() = @ptrCast(@alignCast(ptr));
+        try self.lifecycle.check();
+        try self.request.check();
+        try self.inherited.check();
+    }
 };
 
 fn scopedAssetProducer(
@@ -5247,28 +5494,35 @@ fn scopedAssetProducer(
     };
     // InvocationContext consumes the native monotonic epoch, while the
     // visibility guard belongs to the runtime's imported or manual clock.
-    const native_deadline = if (guard.deadline_ns) |deadline|
-        platform_time.monotonicNs() +| (deadline -| guard.clock.nowRealtimeNs())
-    else
-        null;
-    const deadline_ns = if (producer.invocation_context.deadline_ns) |inherited|
-        if (native_deadline) |deadline| @min(inherited, deadline) else inherited
-    else
-        native_deadline;
+    const deadline_ns = guard.nativeDeadlineNs(producer.invocation_context.deadline_ns);
     return producer.withInvocationContext(.{
         .io = producer.invocation_context.io orelse runtime.config.io,
         .deadline_ns = deadline_ns,
         .cancellation = .{
             .ptr = cancellation,
             .is_cancelled_fn = AssetInvocationCancellation.isCancelled,
+            .check_fn = AssetInvocationCancellation.check,
         },
         .max_response_bytes = producer.invocation_context.max_response_bytes,
+        .expected_model_revision = producer.invocation_context.expected_model_revision,
         .document_checkpoints = producer.invocation_context.document_checkpoints,
         .progress = if (comptime @TypeOf(runtime) == *EnrichmentRuntime)
             producer.invocation_context.progress orelse inference_request_context.ProgressSink{ .ptr = runtime, .update_fn = noteInferenceProgress }
         else
             null,
     });
+}
+
+/// Validate the owner in its original clock domains. The provider's scoped
+/// context borrows a stack token, so keep only the original producer at the
+/// result application boundary.
+fn checkAssetInvocationOwner(runtime: *EnrichmentRuntime, guard: ForegroundCatchUpGuard, context: asset_producer_mod.InvocationContext) !void {
+    if (comptime builtin.os.tag != .freestanding) {
+        if (runtime.shutdown_requested.load(.acquire)) return error.EnrichmentRetryAborted;
+    }
+    try guard.check();
+    runtime.config.cancellation.check() catch |err| return callerCheckpointFailure(err);
+    context.check() catch |err| return callerCheckpointFailure(err);
 }
 
 fn checkAssetProviderInvocation(
@@ -5290,6 +5544,7 @@ fn checkAssetProviderAdmission(
     requests: []const asset_producer_mod.Request,
 ) !void {
     if (requests.len == 0) return;
+    try checkAssetInvocationOwner(runtime, guard, producer.invocation_context);
     const recovery_key = assetInferenceRecoveryKey(requests[0]);
     lockInferenceRecovery(runtime);
     const circuit_open_until_ns = if (runtime.inference_recovery.get(recovery_key)) |state|
@@ -5299,12 +5554,12 @@ fn checkAssetProviderAdmission(
     runtime.inference_recovery_mutex.unlock();
     if (circuit_open_until_ns > runtime.deadline_clock.nowRealtimeNs()) return error.InferenceCircuitOpen;
     if (guard.deadline_ns == null and guard.cancellation.ptr == null) return;
-    try guard.check();
-    const foreground_bounded = try producer.foregroundBoundedForRequests(alloc, requests);
-    // Request-aware routing may parse provider configuration. Recheck before
-    // entering the provider so that work done by the contract hook cannot
-    // consume the caller's remaining deadline unnoticed.
-    try guard.check();
+    const foreground_bounded = producer.foregroundBoundedForRequests(alloc, requests) catch |err| {
+        try checkAssetInvocationOwner(runtime, guard, producer.invocation_context);
+        return classifyProviderCancellation(err, guard, false);
+    };
+    // Capability discovery may consume the owner's remaining time.
+    try checkAssetInvocationOwner(runtime, guard, producer.invocation_context);
     if (!foreground_bounded)
         return error.UnboundedEnrichmentProvider;
 }
@@ -5315,6 +5570,38 @@ fn checkProviderFailureGuard(runtime: *EnrichmentRuntime) !void {
     try guard.check();
 }
 
+fn callerCheckpointFailure(err: anyerror) anyerror {
+    if (isOperationCanceled(err)) return error.EnrichmentWaitCanceled;
+    if (err == error.DeadlineExceeded or err == error.Timeout) return error.EnrichmentWaitTimeout;
+    return err;
+}
+
+fn isOperationCanceled(err: anyerror) bool {
+    return err == error.Canceled or err == error.Cancelled;
+}
+
+fn isOperationInterruption(err: anyerror) bool {
+    return isOperationCanceled(err) or err == error.ProviderInvocationCanceled or
+        err == error.EnrichmentWaitCanceled or err == error.Timeout or err == error.PdfRenderTimeout;
+}
+
+fn providerInvocationFailure(runtime: *EnrichmentRuntime, err: anyerror) anyerror {
+    if (!isOperationInterruption(err)) return err;
+    if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
+    return classifyProviderCancellation(err, runtime.active_provider_guard, runtime.config.cancellation.isCancelled());
+}
+
+fn classifyProviderCancellation(err: anyerror, guard: ForegroundCatchUpGuard, canceled: bool) anyerror {
+    if (!isOperationInterruption(err)) return err;
+    guard.check() catch |control| return control;
+    if (canceled) return error.EnrichmentWaitCanceled;
+    return if (isOperationCanceled(err)) error.ProviderInvocationCanceled else err;
+}
+
+fn checkEnrichmentExecutionContext(runtime: *EnrichmentRuntime, context: inference_request_context.RequestContext) !void {
+    context.check() catch |err| return providerInvocationFailure(runtime, err);
+}
+
 fn assetProviderRequestContext(runtime: *EnrichmentRuntime) inference_request_context.RequestContext {
     const guard = runtime.active_provider_guard;
     const cancellation = if (guard.cancellation.ptr != null)
@@ -5323,13 +5610,11 @@ fn assetProviderRequestContext(runtime: *EnrichmentRuntime) inference_request_co
         runtime.config.cancellation;
     // Inference RequestContext still consumes native monotonic deadlines,
     // even when its I/O and this runtime borrow another executor clock.
-    const native_now = platform_time.monotonicNs();
-    const runtime_now = runtime.deadline_clock.nowRealtimeNs();
-    const deadline = guard.deadline_ns orelse
-        runtime_now +| @max(runtime.config.sync_wait_timeout_ms, 1) *| std.time.ns_per_ms;
+    const deadline = guard.nativeDeadlineNs(null) orelse
+        platform_time.monotonicNs() +| @max(runtime.config.sync_wait_timeout_ms, 1) *| std.time.ns_per_ms;
     return .{
         .io = concurrencyIo(runtime),
-        .deadline_ns = native_now +| (deadline -| runtime_now),
+        .deadline_ns = deadline,
         .cancellation = if (cancellation.ptr != null) cancellation else null,
         .progress = .{ .ptr = runtime, .update_fn = noteInferenceProgress },
     };
@@ -5345,11 +5630,31 @@ fn checkProviderFailureGuardRecording(
     runtime: *EnrichmentRuntime,
     recovery_key: InferenceRecoveryKey,
     batch_items: usize,
+    inherited: ?inference_request_context.RequestContext,
 ) !void {
-    checkProviderFailureGuard(runtime) catch |err| {
+    checkEmbeddingInvocationOwner(runtime, runtime.active_provider_guard, inherited) catch |err| {
         noteInferenceControlFailure(runtime, recovery_key, err, batch_items);
         return err;
     };
+}
+
+fn assetProviderFailure(runtime: anytype, producer: asset_producer_mod.Producer, err: anyerror) anyerror {
+    if (!isOperationInterruption(err)) return err;
+    if (comptime @TypeOf(runtime.*) == EnrichmentRuntime) {
+        if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
+    }
+    runtime.active_provider_guard.check() catch |control| return control;
+    runtime.config.cancellation.check() catch |owner| return callerCheckpointFailure(owner);
+    producer.invocation_context.check() catch |owner| return callerCheckpointFailure(owner);
+    return if (isOperationCanceled(err)) error.ProviderInvocationCanceled else err;
+}
+
+fn assetProviderCapabilities(runtime: anytype, producer: asset_producer_mod.Producer, alloc: Allocator, requests: []const asset_producer_mod.Request) !?inference_work.InferenceCapabilities {
+    return producer.capabilitiesForRequests(alloc, requests) catch |err| return assetProviderFailure(runtime, producer, err);
+}
+
+fn assetProviderInvocationMemory(runtime: anytype, producer: asset_producer_mod.Producer, alloc: Allocator, requests: []const asset_producer_mod.Request) !inference_work.InvocationMemoryPlan {
+    return producer.invocationMemoryForRequests(alloc, requests) catch |err| return assetProviderFailure(runtime, producer, err);
 }
 
 fn assetProducerCanBatchGuarded(
@@ -5372,7 +5677,7 @@ fn assetProducerBatchModeGuarded(
     const scoped = scopedAssetProducer(runtime, producer, &cancellation);
     const result = scoped.batchMode(alloc, requests) catch |err| {
         try checkProviderFailureGuard(runtime);
-        return err;
+        return assetProviderFailure(runtime, scoped, err);
     };
     try checkProviderFailureGuard(runtime);
     return result;
@@ -5389,11 +5694,15 @@ fn assetProducerProduceGuarded(
     var cancellation: AssetInvocationCancellation = undefined;
     const scoped = scopedAssetProducer(runtime, producer, &cancellation);
     const produced = scoped.produce(alloc, request) catch |err| {
-        checkProviderFailureGuardRecording(runtime, recovery_key, 1) catch |guard_err| return guard_err;
+        checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context) catch |owner_err| {
+            noteInferenceControlFailure(runtime, recovery_key, owner_err, 1);
+            return owner_err;
+        };
         if (inferenceControlFailure(err)) noteInferenceControlFailure(runtime, recovery_key, err, 1);
-        return err;
+        return assetProviderFailure(runtime, scoped, err);
     };
-    checkProviderFailureGuardRecording(runtime, recovery_key, 1) catch |err| {
+    checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context) catch |err| {
+        noteInferenceControlFailure(runtime, recovery_key, err, 1);
         alloc.free(produced);
         return err;
     };
@@ -5413,11 +5722,15 @@ fn assetProducerProduceBatchGuarded(
     var cancellation: AssetInvocationCancellation = undefined;
     const scoped = scopedAssetProducer(runtime, producer, &cancellation);
     const produced = scoped.produceBatch(alloc, requests) catch |err| {
-        checkProviderFailureGuardRecording(runtime, recovery_key, requests.len) catch |guard_err| return guard_err;
+        checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context) catch |owner_err| {
+            noteInferenceControlFailure(runtime, recovery_key, owner_err, requests.len);
+            return owner_err;
+        };
         if (inferenceControlFailure(err)) noteInferenceControlFailure(runtime, recovery_key, err, requests.len);
-        return err;
+        return assetProviderFailure(runtime, scoped, err);
     };
-    checkProviderFailureGuardRecording(runtime, recovery_key, requests.len) catch |err| {
+    checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context) catch |err| {
+        noteInferenceControlFailure(runtime, recovery_key, err, requests.len);
         for (produced) |output| if (output.len > 0) alloc.free(output);
         alloc.free(produced);
         return err;
@@ -5436,13 +5749,11 @@ fn assetProducerProduceBatchReportedGuarded(
     var cancellation: AssetInvocationCancellation = undefined;
     const scoped = scopedAssetProducer(runtime, producer, &cancellation);
     var produced = scoped.produceBatchReported(alloc, requests) catch |err| {
-        try checkProviderFailureGuard(runtime);
-        return err;
+        try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context);
+        return assetProviderFailure(runtime, scoped, err);
     };
-    checkProviderFailureGuard(runtime) catch |err| {
-        produced.deinit(alloc);
-        return err;
-    };
+    errdefer produced.deinit(alloc);
+    try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context);
     return produced;
 }
 
@@ -5461,7 +5772,7 @@ fn assetProducerBorrowedRasterBatchAvailableGuarded(
     const scoped = scopedAssetProducer(runtime, producer, &cancellation);
     const available = scoped.borrowedRasterBatchAvailable(alloc, requests) catch |err| {
         try checkProviderFailureGuard(runtime);
-        return err;
+        return assetProviderFailure(runtime, scoped, err);
     };
     try checkProviderFailureGuard(runtime);
     return available;
@@ -5482,13 +5793,11 @@ fn assetProducerProduceBorrowedRasterBatchReportedGuarded(
     var cancellation: AssetInvocationCancellation = undefined;
     const scoped = scopedAssetProducer(runtime, producer, &cancellation);
     var produced = scoped.produceBorrowedRasterBatchReported(alloc, requests, rasters) catch |err| {
-        try checkProviderFailureGuard(runtime);
-        return err;
+        try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context);
+        return assetProviderFailure(runtime, scoped, err);
     };
-    checkProviderFailureGuard(runtime) catch |err| {
-        produced.deinit(alloc);
-        return err;
-    };
+    errdefer produced.deinit(alloc);
+    try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context);
     return produced;
 }
 
@@ -5647,6 +5956,23 @@ test "forced dense generations recompute cached vectors and refresh the memo" {
     try std.testing.expectEqual(@as(usize, 2), harness.remembered);
 }
 
+fn captureDenseGeneration(runtime: *EnrichmentRuntime, provider: embedder_mod.DenseEmbedder, alloc: Allocator, name: []const u8, context: ?inference_request_context.RequestContext) !embedder_mod.DenseEmbedder.TextGeneration {
+    var cancellation: AssetInvocationCancellation = undefined;
+    const scoped = provider.withRequestContext(scopedEmbeddingRequestContext(runtime, context orelse foregroundProviderRequestContext(runtime), provider.part_request_context, &cancellation));
+    const guard = runtime.active_provider_guard;
+    try checkEmbeddingInvocationOwner(runtime, guard, provider.part_request_context);
+    const generation = scoped.captureTextGeneration(alloc, name) catch |err| return embeddingInvocationFailure(runtime, guard, provider.part_request_context, err);
+    try checkEmbeddingInvocationOwner(runtime, guard, provider.part_request_context);
+    return generation;
+}
+
+fn requireDenseGeneration(runtime: *EnrichmentRuntime, provider: embedder_mod.DenseEmbedder, alloc: Allocator, name: []const u8, generation: embedder_mod.DenseEmbedder.TextGeneration, context: ?inference_request_context.RequestContext) !void {
+    var current = provider;
+    current.part_lease = null;
+    const observed = try captureDenseGeneration(runtime, current, alloc, name, context);
+    if (!std.meta.eql(generation.revision, observed.revision)) return error.EnrichmentSourceChanged;
+}
+
 fn embedDenseWithRetryUncached(
     dense_embedder: embedder_mod.DenseEmbedder,
     runtime: *EnrichmentRuntime,
@@ -5658,14 +5984,16 @@ fn embedDenseWithRetryUncached(
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         try checkProviderInvocation(runtime, recovery_key, dense_embedder.foreground_bounded);
-        const vector = (if (foregroundProviderRequestContext(runtime)) |context|
+        try checkEmbeddingInvocationOwner(runtime, runtime.active_provider_guard, dense_embedder.part_request_context);
+        var cancellation: AssetInvocationCancellation = undefined;
+        const vector = (if (scopedEmbeddingRequestContext(runtime, foregroundProviderRequestContext(runtime), dense_embedder.part_request_context, &cancellation)) |context|
             dense_embedder.embedDenseWithContext(runtime.alloc, embedding_name, text, dims, context)
         else
             dense_embedder.embedDense(runtime.alloc, embedding_name, text, dims)) catch |err| {
-            try checkProviderFailureGuardRecording(runtime, recovery_key, 1);
+            try checkProviderFailureGuardRecording(runtime, recovery_key, 1, dense_embedder.part_request_context);
             if (inferenceControlFailure(err)) {
                 noteInferenceControlFailure(runtime, recovery_key, err, 1);
-                return err;
+                return providerInvocationFailure(runtime, err);
             }
             if (!isRetryableEnrichmentError(err)) return err;
             switch (transientEmbedRetryDecision(runtime, attempt)) {
@@ -5677,7 +6005,7 @@ fn embedDenseWithRetryUncached(
             sleepRetryBackoff(runtime, transientEmbedRetrySleepNs(attempt));
             continue;
         };
-        checkProviderFailureGuardRecording(runtime, recovery_key, 1) catch |err| {
+        checkProviderFailureGuardRecording(runtime, recovery_key, 1, dense_embedder.part_request_context) catch |err| {
             runtime.alloc.free(vector);
             return err;
         };
@@ -5698,15 +6026,16 @@ fn embedDenseBatchWithRetryUncached(
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         try checkProviderInvocation(runtime, recovery_key, dense_embedder.foreground_bounded);
+        try checkEmbeddingInvocationOwner(runtime, runtime.active_provider_guard, dense_embedder.part_request_context);
         const vectors = embedDenseBatchAttemptLimits(dense_embedder, runtime, embedding_name, texts, dims, limits) catch |err| {
-            try checkProviderFailureGuardRecording(runtime, recovery_key, texts.len);
+            try checkProviderFailureGuardRecording(runtime, recovery_key, texts.len, dense_embedder.part_request_context);
             // An immutable plan cannot repair itself by repeating execution.
             // Yield so the coordinator resolves a fresh generation/route;
             // this is not capacity pressure and must not shrink batch limits.
             if (err == error.EnrichmentSourceChanged or err == error.InferenceCapabilitiesStale) return err;
             if (inferenceControlFailure(err)) {
                 noteInferenceControlFailure(runtime, recovery_key, err, texts.len);
-                return err;
+                return providerInvocationFailure(runtime, err);
             }
             if (!isRetryableEnrichmentError(err)) return err;
             if (limits) |bounded| if (bounded.wave_owned_recovery and denseBatchCapacityFailure(err)) return err;
@@ -5719,7 +6048,7 @@ fn embedDenseBatchWithRetryUncached(
             sleepRetryBackoff(runtime, transientEmbedRetrySleepNs(attempt));
             continue;
         };
-        checkProviderFailureGuardRecording(runtime, recovery_key, texts.len) catch |err| {
+        checkProviderFailureGuardRecording(runtime, recovery_key, texts.len, dense_embedder.part_request_context) catch |err| {
             embedder_mod.freeDenseEmbeddingBatch(runtime.alloc, vectors);
             return err;
         };
@@ -5733,30 +6062,31 @@ fn embedDenseBatchAttempt(dense_embedder: embedder_mod.DenseEmbedder, runtime: *
 }
 
 fn embedDenseBatchAttemptLimits(dense_embedder: embedder_mod.DenseEmbedder, runtime: *EnrichmentRuntime, name: []const u8, texts: []const []const u8, dims: u32, limits: ?DenseBatchLimits) ![]const []const f32 {
+    var cancellation: AssetInvocationCancellation = undefined;
+    const context = scopedEmbeddingRequestContext(runtime, assetProviderRequestContext(runtime), dense_embedder.part_request_context, &cancellation).?;
+    const foreground = runtime.active_provider_guard.deadline_ns != null or runtime.active_provider_guard.cancellation.ptr != null;
     if (limits) |bounded| {
         // Foreground calls promise an interruptible provider. Background
         // publication also uses a context for deadline/progress fences, but
         // must continue to support legacy synchronous providers.
-        if (!denseProviderSupportsContext(dense_embedder)) {
-            if (foregroundProviderRequestContext(runtime)) |context| {
-                try context.check();
-                return error.UncancellableInferenceProvider;
-            }
+        if (foreground and !denseProviderSupportsContext(dense_embedder)) {
+            try context.check();
+            return error.UncancellableInferenceProvider;
         }
-        return plannedDenseBatches(runtime.alloc, concurrencyIo(runtime), dense_embedder, name, texts, dims, assetProviderRequestContext(runtime), bounded);
+        return plannedDenseBatches(runtime.alloc, concurrencyIo(runtime), dense_embedder, name, texts, dims, context, bounded);
     }
     // Context-aware callbacks still require an explicit reentrancy guarantee.
     // Custom and legacy providers retain their serial path by default.
     const parallelism = @min(@min(generatedEmbedParallelBatches(), @max(@as(usize, 1), dense_embedder.dense_batch_concurrency)), texts.len);
     if (parallelism <= 1 or dense_embedder.dense_embed_batch_with_context_fn == null) {
         if (dense_embedder.dense_embed_batch_with_context_fn != null)
-            return dense_embedder.embedDenseBatchWithContext(runtime.alloc, name, texts, dims, assetProviderRequestContext(runtime));
-        return if (foregroundProviderRequestContext(runtime)) |context|
+            return dense_embedder.embedDenseBatchWithContext(runtime.alloc, name, texts, dims, context);
+        return if (foreground or dense_embedder.part_request_context != null)
             dense_embedder.embedDenseBatchWithContext(runtime.alloc, name, texts, dims, context)
         else
             dense_embedder.embedDenseBatch(runtime.alloc, name, texts, dims);
     }
-    return parallelDenseBatchWithCapacityFallback(runtime.alloc, concurrencyIo(runtime), dense_embedder, name, texts, dims, assetProviderRequestContext(runtime), parallelism);
+    return parallelDenseBatchWithCapacityFallback(runtime.alloc, concurrencyIo(runtime), dense_embedder, name, texts, dims, context, parallelism);
 }
 
 fn parallelDenseBatchWithCapacityFallback(alloc: Allocator, io: Io, provider: embedder_mod.DenseEmbedder, name: []const u8, texts: []const []const u8, dims: u32, context: inference_request_context.RequestContext, parallelism: usize) ![]const []const f32 {
@@ -6148,14 +6478,17 @@ fn embedDensePartsWithRetry(
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         try checkProviderInvocation(runtime, recovery_key, dense_embedder.foreground_bounded);
-        const vector = (if (foregroundProviderRequestContext(runtime)) |context|
+        try checkEmbeddingInvocationOwner(runtime, runtime.active_provider_guard, dense_embedder.part_request_context);
+        var cancellation: AssetInvocationCancellation = undefined;
+        const context = scopedEmbeddingRequestContext(runtime, assetProviderRequestContext(runtime), dense_embedder.part_request_context, &cancellation).?;
+        const vector = (if (runtime.active_provider_guard.deadline_ns != null or runtime.active_provider_guard.cancellation.ptr != null)
             dense_embedder.embedDensePartsWithContext(runtime.alloc, embedding_name, parts, dims, context)
         else
-            dense_embedder.embedDensePartsBackgroundWithContext(runtime.alloc, embedding_name, parts, dims, assetProviderRequestContext(runtime))) catch |err| {
-            try checkProviderFailureGuardRecording(runtime, recovery_key, 1);
+            dense_embedder.embedDensePartsBackgroundWithContext(runtime.alloc, embedding_name, parts, dims, context)) catch |err| {
+            try checkProviderFailureGuardRecording(runtime, recovery_key, 1, dense_embedder.part_request_context);
             if (inferenceControlFailure(err)) {
                 noteInferenceControlFailure(runtime, recovery_key, err, 1);
-                return err;
+                return providerInvocationFailure(runtime, err);
             }
             if (err == error.EnrichmentSourceChanged or err == error.InferenceCapabilitiesStale) return err;
             if (!isRetryableEnrichmentError(err)) return err;
@@ -6168,13 +6501,73 @@ fn embedDensePartsWithRetry(
             sleepRetryBackoff(runtime, transientEmbedRetrySleepNs(attempt));
             continue;
         };
-        checkProviderFailureGuardRecording(runtime, recovery_key, 1) catch |err| {
+        checkProviderFailureGuardRecording(runtime, recovery_key, 1, dense_embedder.part_request_context) catch |err| {
             runtime.alloc.free(vector);
             return err;
         };
         noteInferenceControlSuccess(runtime, recovery_key, 1);
         return vector;
     }
+}
+
+fn checkEmbeddingInvocationOwner(runtime: *EnrichmentRuntime, guard: ForegroundCatchUpGuard, context: ?inference_request_context.RequestContext) !void {
+    try checkAssetInvocationOwner(runtime, guard, if (context) |value| .fromRequestContext(value) else .{});
+}
+
+fn embeddingInvocationFailure(runtime: *EnrichmentRuntime, guard: ForegroundCatchUpGuard, context: ?inference_request_context.RequestContext, err: anyerror) anyerror {
+    if (!isOperationInterruption(err)) return err;
+    checkEmbeddingInvocationOwner(runtime, guard, context) catch |control| return control;
+    return classifyProviderCancellation(err, guard, false);
+}
+
+/// The composed token borrows this call's stack and must never escape into a
+/// cached generation or an asynchronous job.
+fn scopedEmbeddingRequestContext(runtime: *const EnrichmentRuntime, foreground: ?inference_request_context.RequestContext, inherited: ?inference_request_context.RequestContext, cancellation: *AssetInvocationCancellation) ?inference_request_context.RequestContext {
+    if (foreground == null and (inherited == null or runtime.config.cancellation.ptr == null)) return inherited;
+    var effective = inherited orelse foreground.?;
+    if (foreground) |request| {
+        effective.io = request.io;
+        effective.deadline_ns = request.deadline_ns;
+        effective.progress = request.progress orelse effective.progress;
+    }
+    cancellation.* = .{
+        .lifecycle = runtime.config.cancellation,
+        .request = if (foreground) |value| value.cancellation orelse .none else .none,
+        .inherited = if (inherited) |value| value.cancellation orelse .none else .none,
+    };
+    effective.cancellation = .{ .ptr = cancellation, .is_cancelled_fn = AssetInvocationCancellation.isCancelled, .check_fn = AssetInvocationCancellation.check };
+    if (inherited) |value| if (value.deadline_ns) |deadline| {
+        effective.deadline_ns = if (effective.deadline_ns) |current| @min(current, deadline) else deadline;
+    };
+    return effective;
+}
+
+fn captureDenseCacheRevision(runtime: *EnrichmentRuntime, provider: embedder_mod.DenseEmbedder, alloc: Allocator, name: []const u8, model_revision: ?[32]u8, foreground: ?inference_request_context.RequestContext) !?[32]u8 {
+    const guard = runtime.active_provider_guard;
+    var cancellation: AssetInvocationCancellation = undefined;
+    const context = scopedEmbeddingRequestContext(runtime, foreground, provider.part_request_context, &cancellation);
+    try checkEmbeddingInvocationOwner(runtime, guard, context);
+    const revision = (if (provider.cache_revision_from_model_fn) |derive|
+        if (model_revision) |model| derive(provider.ptr, alloc, name, model) else null
+    else if (context == null or provider.foreground_bounded)
+        if (provider.cache_revision_fn) |resolve| resolve(provider.ptr, alloc, name) else null
+    else
+        null) catch |err| return embeddingInvocationFailure(runtime, guard, context, err);
+    try checkEmbeddingInvocationOwner(runtime, guard, context);
+    return revision;
+}
+
+fn captureSparseRevision(runtime: *EnrichmentRuntime, provider: embedder_mod.SparseEmbedder, alloc: Allocator, name: []const u8, foreground: ?inference_request_context.RequestContext) !?[32]u8 {
+    const guard = runtime.active_provider_guard;
+    var cancellation: AssetInvocationCancellation = undefined;
+    const scoped = provider.withRequestContext(scopedEmbeddingRequestContext(runtime, foreground, provider.request_context, &cancellation));
+    try checkEmbeddingInvocationOwner(runtime, guard, scoped.request_context);
+    const revision = scoped.captureRevision(alloc, name) catch |err| {
+        try checkEmbeddingInvocationOwner(runtime, guard, scoped.request_context);
+        return classifyProviderCancellation(err, guard, false);
+    };
+    try checkEmbeddingInvocationOwner(runtime, guard, scoped.request_context);
+    return revision;
 }
 
 fn embedSparseWithRetry(
@@ -6187,14 +6580,16 @@ fn embedSparseWithRetry(
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         try checkProviderInvocation(runtime, recovery_key, sparse_embedder.foreground_bounded);
-        const sparse = (if (foregroundProviderRequestContext(runtime)) |context|
+        try checkEmbeddingInvocationOwner(runtime, runtime.active_provider_guard, sparse_embedder.request_context);
+        var cancellation: AssetInvocationCancellation = undefined;
+        const sparse = (if (scopedEmbeddingRequestContext(runtime, foregroundProviderRequestContext(runtime), sparse_embedder.request_context, &cancellation)) |context|
             sparse_embedder.embedSparseWithContext(runtime.alloc, embedding_name, text, context)
         else
             sparse_embedder.embedSparse(runtime.alloc, embedding_name, text)) catch |err| {
-            try checkProviderFailureGuardRecording(runtime, recovery_key, 1);
+            try checkProviderFailureGuardRecording(runtime, recovery_key, 1, sparse_embedder.request_context);
             if (inferenceControlFailure(err)) {
                 noteInferenceControlFailure(runtime, recovery_key, err, 1);
-                return err;
+                return providerInvocationFailure(runtime, err);
             }
             if (!isRetryableEnrichmentError(err)) return err;
             switch (transientEmbedRetryDecision(runtime, attempt)) {
@@ -6207,7 +6602,7 @@ fn embedSparseWithRetry(
             continue;
         };
         var owned_sparse = sparse;
-        checkProviderFailureGuardRecording(runtime, recovery_key, 1) catch |err| {
+        checkProviderFailureGuardRecording(runtime, recovery_key, 1, sparse_embedder.request_context) catch |err| {
             owned_sparse.deinit(runtime.alloc);
             return err;
         };
@@ -6226,14 +6621,16 @@ fn embedSparseBatchWithRetry(
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         try checkProviderInvocation(runtime, recovery_key, sparse_embedder.foreground_bounded);
-        const sparse_batch = (if (foregroundProviderRequestContext(runtime)) |context|
+        try checkEmbeddingInvocationOwner(runtime, runtime.active_provider_guard, sparse_embedder.request_context);
+        var cancellation: AssetInvocationCancellation = undefined;
+        const sparse_batch = (if (scopedEmbeddingRequestContext(runtime, foregroundProviderRequestContext(runtime), sparse_embedder.request_context, &cancellation)) |context|
             sparse_embedder.embedSparseBatchWithContext(runtime.alloc, embedding_name, texts, context)
         else
             sparse_embedder.embedSparseBatch(runtime.alloc, embedding_name, texts)) catch |err| {
-            try checkProviderFailureGuardRecording(runtime, recovery_key, texts.len);
+            try checkProviderFailureGuardRecording(runtime, recovery_key, texts.len, sparse_embedder.request_context);
             if (inferenceControlFailure(err)) {
                 noteInferenceControlFailure(runtime, recovery_key, err, texts.len);
-                return err;
+                return providerInvocationFailure(runtime, err);
             }
             if (!isRetryableEnrichmentError(err)) return err;
             switch (transientEmbedRetryDecision(runtime, attempt)) {
@@ -6245,7 +6642,7 @@ fn embedSparseBatchWithRetry(
             sleepRetryBackoff(runtime, transientEmbedRetrySleepNs(attempt));
             continue;
         };
-        checkProviderFailureGuardRecording(runtime, recovery_key, texts.len) catch |err| {
+        checkProviderFailureGuardRecording(runtime, recovery_key, texts.len, sparse_embedder.request_context) catch |err| {
             embedder_mod.freeSparseEmbeddingBatch(runtime.alloc, sparse_batch);
             return err;
         };
@@ -7346,7 +7743,7 @@ fn getOrCreateRequestChunksWithProvider(runtime: *EnrichmentRuntime, alloc: Allo
         root_request.kind = .asset;
         root_request.source_field = upstream.source_field;
         root_request.source_template = upstream.source_template;
-        const input = try extractAssetSourceValue(alloc, runtime.config, raw.?, root_request);
+        const input = try extractEnrichmentSource(runtime, extractAssetSourceValue, alloc, raw.?, root_request);
         defer if (input) |text| alloc.free(@constCast(text));
         if (input != null) return error.ArtifactPublicationPending;
         const empty = try alloc.alloc(chunker_mod.Chunk, 0);
@@ -7372,11 +7769,11 @@ fn getOrCreateRequestChunksWithProvider(runtime: *EnrichmentRuntime, alloc: Allo
             else
                 try alloc.dupe(u8, bytes);
             defer alloc.free(sanitized);
-            const text = if (request.source_field.len == 0 and request.source_template.len == 0) try alloc.dupe(u8, sanitized) else try extractSourceText(alloc, runtime.config, sanitized, request);
+            const text = if (request.source_field.len == 0 and request.source_template.len == 0) try alloc.dupe(u8, sanitized) else try extractEnrichmentSource(runtime, extractSourceText, alloc, sanitized, request);
             defer if (text) |value| alloc.free(value);
             const chunks = if (text) |value|
                 if (request.chunker_json.len > 0)
-                    try chunker_mod.chunkTextWithConfigJsonAndProvider(alloc, value, request.chunker_json, provider)
+                    try chunkTextWithProviderForEnrichment(runtime, alloc, value, request.chunker_json, provider)
                 else
                     try chunker_mod.chunkText(alloc, value, request.chunk_size, request.chunk_overlap)
             else
@@ -7396,11 +7793,11 @@ fn getOrCreateRequestChunksWithProvider(runtime: *EnrichmentRuntime, alloc: Allo
             else
                 try alloc.dupe(u8, bytes);
             defer alloc.free(document);
-            const text = try extractSourceText(alloc, runtime.config, document, request);
+            const text = try extractEnrichmentSource(runtime, extractSourceText, alloc, document, request);
             defer if (text) |value| alloc.free(value);
             const chunks = if (text) |value|
                 if (request.chunker_json.len > 0)
-                    try chunker_mod.chunkTextWithConfigJsonAndProvider(alloc, value, request.chunker_json, provider)
+                    try chunkTextWithProviderForEnrichment(runtime, alloc, value, request.chunker_json, provider)
                 else
                     try chunker_mod.chunkText(alloc, value, request.chunk_size, request.chunk_overlap)
             else
@@ -7412,7 +7809,7 @@ fn getOrCreateRequestChunksWithProvider(runtime: *EnrichmentRuntime, alloc: Allo
         var asset = try std.json.parseFromSlice(struct { text: []const u8 }, alloc, bytes, .{ .ignore_unknown_fields = true });
         defer asset.deinit();
         const chunks = if (request.chunker_json.len > 0)
-            try chunker_mod.chunkTextWithConfigJsonAndProvider(alloc, asset.value.text, request.chunker_json, provider)
+            try chunkTextWithProviderForEnrichment(runtime, alloc, asset.value.text, request.chunker_json, provider)
         else
             try chunker_mod.chunkText(alloc, asset.value.text, request.chunk_size, request.chunk_overlap);
         errdefer chunker_mod.freeChunks(alloc, chunks);
@@ -7429,7 +7826,7 @@ fn getOrCreateRequestChunksWithProvider(runtime: *EnrichmentRuntime, alloc: Allo
             var local_sources: ?PreparedDocumentSourceCache = if (prepared_sources == null) PreparedDocumentSourceCache.init(runtime) else null;
             defer if (local_sources) |*owned| owned.deinit();
             const shared = prepared_sources orelse &local_sources.?;
-            var source = try extractModelChunkSourceCached(alloc, runtime.config, raw.?, request, assetProviderRequestContext(runtime), shared);
+            var source = try extractModelChunkEnrichmentSource(runtime, alloc, raw.?, request, shared);
             defer source.deinit(alloc);
             const pass_scope = try media_pass.scope(alloc, request.doc_key, requestArtifactName(request), request.source_field);
             errdefer alloc.free(pass_scope);
@@ -7440,10 +7837,8 @@ fn getOrCreateRequestChunksWithProvider(runtime: *EnrichmentRuntime, alloc: Allo
             const chunks = if (source.input) |input|
                 if (model_chunk_client.supportsPagedCalls(chunk_config, provider))
                     try prepareModelPassChunksWithProbe(runtime, request, chunk_config, input, doc_store_key, source_digest.?, pass_scope, observed, false)
-                else legacy: {
-                    try authorizeModelSource(runtime, input);
-                    break :legacy try model_chunk_client.chunkMediaWithProvider(alloc, chunk_config, input, provider);
-                }
+                else
+                    try chunkMediaWithProviderForEnrichment(runtime, alloc, chunk_config, input, provider)
             else
                 try alloc.alloc(chunker_mod.Chunk, 0);
             errdefer chunker_mod.freeChunks(alloc, chunks);
@@ -7455,7 +7850,7 @@ fn getOrCreateRequestChunksWithProvider(runtime: *EnrichmentRuntime, alloc: Allo
         }
     }
 
-    const source_text = try extractSourceText(alloc, runtime.config, raw.?, request) orelse {
+    const source_text = try extractEnrichmentSource(runtime, extractSourceText, alloc, raw.?, request) orelse {
         const empty = try alloc.alloc(chunker_mod.Chunk, 0);
         try cache.append(alloc, .{
             .key = cache_key,
@@ -7472,7 +7867,7 @@ fn getOrCreateRequestChunksWithProvider(runtime: *EnrichmentRuntime, alloc: Allo
     if (activity_indexes) |names| updateIndexPreparation(runtime, names, true, 0);
     defer if (activity_indexes) |names| updateIndexPreparation(runtime, names, false, chunks_created);
     const chunks = if (request.chunker_json.len > 0)
-        try chunker_mod.chunkTextWithConfigJsonAndProvider(alloc, source_text, request.chunker_json, provider)
+        try chunkTextWithProviderForEnrichment(runtime, alloc, source_text, request.chunker_json, provider)
     else
         try chunker_mod.chunkText(alloc, source_text, request.chunk_size, request.chunk_overlap);
     errdefer {
@@ -7750,10 +8145,16 @@ fn mutateMediaPassOnce(runtime: *EnrichmentRuntime, cursor_key: []const u8, expe
     try txn.commit();
 }
 
-fn retireMediaPassForDenseRequest(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest) !void {
+const MediaEmbeddingSelection = struct { revision: ?[32]u8 };
+const MediaAcknowledgementMode = union(enum) {
+    completed: ?MediaEmbeddingSelection,
+    pending_repair: *bool,
+};
+
+fn retireMediaPassForDenseRequest(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, mode: MediaAcknowledgementMode) !void {
     const embedding = runtime.index_manager.getEnrichment(.embedding, requestEmbeddingName(request)) orelse return;
     const chunks = runtime.index_manager.getEnrichment(.chunk, embedding.source_artifact_name) orelse return;
-    try acknowledgeMediaPassConsumer(runtime, request, chunks.name, chunks.source_field, .embedding, embedding.name);
+    try acknowledgeMediaPassConsumer(runtime, request, chunks.name, chunks.source_field, .embedding, embedding.name, mode);
 }
 
 fn settleAcceptedMediaOutput(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, window: *GeneratedReplayWindow) !void {
@@ -7784,7 +8185,7 @@ fn retireMediaPassForAssetRequest(runtime: *EnrichmentRuntime, request: enrichme
     defer producer.deinit(runtime.alloc);
     if (producer.type != .media_output) return;
     const chunks = runtime.index_manager.getEnrichment(.chunk, request.upstream_artifact_name) orelse return;
-    try acknowledgeMediaPassConsumer(runtime, request, chunks.name, chunks.source_field, .asset, requestArtifactName(request));
+    try acknowledgeMediaPassConsumer(runtime, request, chunks.name, chunks.source_field, .asset, requestArtifactName(request), .{ .completed = null });
 }
 
 fn mediaPassConsumerIdentity(runtime: *EnrichmentRuntime, a: Allocator, chunk_name: []const u8, kind: []const u8, name: []const u8) ![]u8 {
@@ -7811,7 +8212,106 @@ fn mediaPassConsumerIdentity(runtime: *EnrichmentRuntime, a: Allocator, chunk_na
     return std.fmt.allocPrint(a, "{s}:{s}:{s}", .{ kind, name, std.fmt.bytesToHex(hash.finalResult(), .lower) });
 }
 
-fn acknowledgeMediaPassConsumer(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, chunk_name: []const u8, source_field: []const u8, kind: enum { embedding, asset }, consumer_name: []const u8) !void {
+const MediaEmbeddingAcknowledgement = struct {
+    counts: media_output_counts.Values,
+    required_failure: bool = false,
+};
+
+fn mediaEmbeddingAcknowledgement(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, prefix: []const u8, cursor: media_pass.Cursor, selection: ?MediaEmbeddingSelection) !MediaEmbeddingAcknowledgement {
+    const a = runtime.alloc;
+    var result: MediaEmbeddingAcknowledgement = .{
+        .counts = .{ .complete = if (cursor.page_count == 0) cursor.covered_through_ordinal else 0 },
+    };
+    const computation = mediaEmbeddingComputationRequest(runtime, request);
+    const provider = if (selection != null) runtime.config.dense_embedder else null;
+    var recipe_arena = std.heap.ArenaAllocator.init(a);
+    defer recipe_arena.deinit();
+    var resolved = false;
+    var recipe: ?media_embedding_recipe.Recipe = null;
+    for (0..cursor.page_count) |page_index| {
+        const page_key = try media_pass.key(a, prefix, @intCast(page_index));
+        defer a.free(page_key);
+        const bytes = try storeGetOptionalAllocWithRetry(runtime, page_key) orelse return error.EnrichmentSourceChanged;
+        defer a.free(bytes);
+        var page = try media_pass.decodePage(a, bytes);
+        defer page.deinit(a);
+        for (page.chunks) |chunk| {
+            const metadata = chunk.metadata orelse return error.InvalidEnrichmentState;
+            var failed = false;
+            var terminal = false;
+            var required = false;
+            if (provider) |selected_provider| if (metadata.outputs_json) |encoded| {
+                var receipts = try std.json.parseFromSlice([]@import("inference_chunker").outputs.Result, a, encoded, .{});
+                defer receipts.deinit();
+                for (receipts.value) |receipt| {
+                    if (!isModelChunkEmbeddingFailure(receipt)) continue;
+                    if (metadata.output_sub_index) |index| if (receipt.sub_index != index) continue;
+                    if (!media_embedding_recipe.matchesRevision(receipt.model_revision, selection.?.revision)) continue;
+                    if (!resolved) {
+                        recipe = try resolveModelEmbeddingConsumerRecipe(recipe_arena.allocator(), selected_provider, computation);
+                        resolved = true;
+                    }
+                    const current = recipe orelse break;
+                    if (!try current.matches(a, receipt)) continue;
+                    failed = true;
+                    terminal = terminal or receipt.terminal;
+                    required = required or receipt.required;
+                    result.required_failure = result.required_failure or (receipt.required and receipt.terminal);
+                }
+            };
+            if (failed) result.counts.failed += 1 else result.counts.complete += 1;
+            if (terminal) result.counts.terminal += 1;
+            if (failed and !required) result.counts.degraded += 1;
+        }
+    }
+    return result;
+}
+
+const pending_media_repair_prefix = "repair-pending:";
+fn pendingMediaEmbeddingRepair(receipt: []const u8, consumer: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, receipt, pending_media_repair_prefix)) return null;
+    const tail = receipt[pending_media_repair_prefix.len..];
+    const separator = std.mem.indexOfScalar(u8, tail, 0) orelse return null;
+    if (!std.mem.eql(u8, tail[0..separator], consumer)) return null;
+    return tail[separator + 1 ..];
+}
+
+fn captureMediaFailureProof(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, chunk_name: []const u8, cursor_key: []const u8, cursor_value: []const u8, cursor: media_pass.Cursor, primary_key: []const u8) !struct { proof: MediaFailureProof, logical_digest: [32]u8 } {
+    const a = runtime.alloc;
+    const upstream = runtime.index_manager.getEnrichment(.chunk, chunk_name) orelse return error.EnrichmentSourceChanged;
+    var source_request = request;
+    source_request.source_field = upstream.source_field;
+    source_request.source_template = upstream.source_template;
+    source_request.chunker_json = upstream.chunker_json;
+    source_request.reprocess_generation = cursor.source_generation;
+
+    var probe = try runtime.store.beginProbe();
+    defer probe.abort();
+    const raw = probe.getLeased(primary_key) catch |err| return if (err == error.NotFound) error.EnrichmentSourceChanged else err;
+    const logical = if (runtimeUsesRelationalBaseRows(runtime))
+        try materializeProducerInput(runtime.index_manager, a, primary_key, raw)
+    else
+        null;
+    defer if (logical) |bytes| a.free(bytes);
+    const logical_digest = sourceRecordDigest(logical orelse raw);
+    const digest = try mediaPassInputDigest(runtime, source_request, logical_digest);
+    if (!std.mem.eql(u8, &digest, &cursor.input_digest)) return error.EnrichmentSourceChanged;
+    const revisions = @import("../../document_mutation_revision.zig");
+    return .{
+        .proof = .{
+            .cursor_key = cursor_key,
+            .cursor_value = cursor_value,
+            .primary_key = primary_key,
+            .primary_digest = if (logical != null) sourceRecordDigest(raw) else logical_digest,
+            .fence = try requiredRuntimeStoreWriteFence(runtime, replayWriteGeneration(runtime)),
+            .clock = runtime.clock,
+            .primary_revision = if (revisions.keyForPhysical(primary_key)) |key| try revisions.load(&probe, key) else null,
+        },
+        .logical_digest = logical_digest,
+    };
+}
+
+fn acknowledgeMediaPassConsumer(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, chunk_name: []const u8, source_field: []const u8, kind: enum { embedding, asset }, consumer_name: []const u8, mode: MediaAcknowledgementMode) !void {
     const a = runtime.alloc;
     const prefix = try media_pass.scope(a, request.doc_key, chunk_name, source_field);
     defer a.free(prefix);
@@ -7822,11 +8322,20 @@ fn acknowledgeMediaPassConsumer(runtime: *EnrichmentRuntime, request: enrichment
     var parsed = try std.json.parseFromSlice(media_pass.Cursor, a, try media_pass.payload(raw), .{});
     defer parsed.deinit();
     if (!parsed.value.complete or parsed.value.retiring or parsed.value.source_sequence != request.sequence) return;
+    if (mode == .pending_repair) {
+        for (parsed.value.acknowledged_consumers) |value| {
+            if (std.mem.startsWith(u8, value, pending_media_repair_prefix)) break;
+        } else return;
+    }
     const consumer = try mediaPassConsumerIdentity(runtime, a, chunk_name, @tagName(kind), consumer_name);
     defer a.free(consumer);
     var acknowledgements = std.ArrayList([]const u8).empty;
     defer acknowledgements.deinit(a);
     try acknowledgements.appendSlice(a, parsed.value.acknowledged_consumers);
+    const pending_index = for (acknowledgements.items, 0..) |value, index| {
+        if (pendingMediaEmbeddingRepair(value, consumer) != null) break @as(?usize, index);
+    } else null;
+    if (mode == .pending_repair and pending_index == null) return;
     const already = for (acknowledgements.items) |value| {
         if (std.mem.eql(u8, value, consumer)) break true;
     } else false;
@@ -7852,41 +8361,61 @@ fn acknowledgeMediaPassConsumer(runtime: *EnrichmentRuntime, request: enrichment
         if (!found) complete = false;
     }
     var cursor = parsed.value;
-    cursor.acknowledged_consumers = acknowledgements.items;
-    const updated = try media_pass.encode(a, cursor);
-    defer a.free(updated);
-    var embedding_values = media_output_counts.Values{ .complete = if (cursor.page_count == 0) cursor.covered_through_ordinal else 0 };
-    var required_embedding_failure = false;
-    if (kind == .embedding) for (0..cursor.page_count) |page_index| {
-        const page_key = try media_pass.key(a, prefix, @intCast(page_index));
-        defer a.free(page_key);
-        const bytes = try storeGetOptionalAllocWithRetry(runtime, page_key) orelse return error.EnrichmentSourceChanged;
-        defer a.free(bytes);
-        var page = try media_pass.decodePage(a, bytes);
-        defer page.deinit(a);
-        for (page.chunks) |chunk| {
-            var failed = false;
-            var terminal = false;
-            var required = false;
-            if (chunk.metadata.?.outputs_json) |encoded| {
-                var receipts = try std.json.parseFromSlice([]@import("inference_chunker").outputs.Result, a, encoded, .{});
-                defer receipts.deinit();
-                for (receipts.value) |value| if (value.kind == .embedding and std.mem.eql(u8, value.name, "embedding") and value.status == .failed) {
-                    failed = true;
-                    terminal = terminal or value.terminal;
-                    required = required or value.required;
-                };
-            } else failed = chunk.metadata.?.embedding_error != null;
-            if (failed) embedding_values.failed += 1 else embedding_values.complete += 1;
-            if (terminal) embedding_values.terminal += 1;
-            if (failed and !required) embedding_values.degraded += 1;
-            required_embedding_failure = required_embedding_failure or required;
+    var staged_cursor: ?[]u8 = null;
+    defer if (staged_cursor) |bytes| a.free(bytes);
+    const repair_prefix = "repair:";
+    const repair_done = for (acknowledgements.items) |value| {
+        if (std.mem.startsWith(u8, value, repair_prefix) and std.mem.eql(u8, value[repair_prefix.len..], consumer))
+            break true;
+    } else false;
+
+    const embedding = if (pending_index) |index| blk: {
+        var saved = try std.json.parseFromSlice(media_output_counts.Values, a, pendingMediaEmbeddingRepair(acknowledgements.items[index], consumer).?, .{});
+        defer saved.deinit();
+        break :blk MediaEmbeddingAcknowledgement{ .counts = saved.value, .required_failure = true };
+    } else if (kind == .embedding and !repair_done)
+        try mediaEmbeddingAcknowledgement(runtime, request, prefix, cursor, mode.completed)
+    else
+        MediaEmbeddingAcknowledgement{ .counts = .{} };
+    const needs_settlement = embedding.required_failure and !repair_done;
+    const primary_key = if (needs_settlement) try documentSourceStoreKeyAlloc(runtime, request.doc_key) else null;
+    defer if (primary_key) |value| a.free(value);
+    const source = if (primary_key) |value| try captureMediaFailureProof(runtime, request, chunk_name, cursor_key, raw, cursor, value) else null;
+    const repair_receipt = if (needs_settlement) try std.fmt.allocPrint(a, "{s}{s}", .{ repair_prefix, consumer }) else null;
+    defer if (repair_receipt) |receipt| a.free(receipt);
+    if (needs_settlement) {
+        var proof = source.?.proof;
+        if (pending_index) |index| {
+            _ = acknowledgements.orderedRemove(index);
+        } else {
+            // Persist the selected receipt and its counts before writing debt.
+            // A replay that finds the ledger can resume this acknowledgement
+            // without asking the provider which revision is now deployed.
+            const counts = try std.json.Stringify.valueAlloc(a, embedding.counts, .{});
+            defer a.free(counts);
+            const pending = try std.fmt.allocPrint(a, "{s}{s}\x00{s}", .{ pending_media_repair_prefix, consumer, counts });
+            defer a.free(pending);
+            const staged_acknowledgements = try a.alloc([]const u8, parsed.value.acknowledged_consumers.len + 1);
+            defer a.free(staged_acknowledgements);
+            @memcpy(staged_acknowledgements[0..parsed.value.acknowledged_consumers.len], parsed.value.acknowledged_consumers);
+            staged_acknowledgements[staged_acknowledgements.len - 1] = pending;
+            var staged = parsed.value;
+            staged.acknowledged_consumers = staged_acknowledgements;
+            staged_cursor = try media_pass.encode(a, staged);
+            try mutateMediaPass(runtime, cursor_key, raw, &.{.{ .key = cursor_key, .value = staged_cursor.? }}, &.{}, primary_key, source.?.logical_digest);
+            proof.cursor_value = staged_cursor.?;
         }
-    };
-    if (!already) {
+        try acknowledgements.append(a, repair_receipt.?);
+        if (!try skipPersistedRequestFailure(runtime, null, request))
+            try recordIsolatedRequestErrorGuarded(runtime, null, request, @errorName(error.RequiredMediaOutputFailed), requestAttemptNumberFor(runtime, requestFailureFingerprint(request)), proof);
+    }
+    if (!already or needs_settlement) {
+        cursor.acknowledged_consumers = acknowledgements.items;
+        const updated = try media_pass.encode(a, cursor);
+        defer a.free(updated);
         var delta = media_output_counts.Counts{};
         if (kind == .embedding) {
-            delta.embedding = embedding_values;
+            delta.embedding = embedding.counts;
         } else {
             const consumer_config = runtime.index_manager.getEnrichment(.asset, consumer_name) orelse return error.InvalidEnrichmentConfig;
             var producer = try asset_producer_mod.parseProducerConfig(a, consumer_config.producer_json);
@@ -7916,12 +8445,12 @@ fn acknowledgeMediaPassConsumer(runtime: *EnrichmentRuntime, request: enrichment
                 }
             }
         }
-        try mutateMediaPassControlled(runtime, cursor_key, raw, &.{.{ .key = cursor_key, .value = updated }}, &.{}, null, null, delta);
+        try mutateMediaPassControlled(runtime, cursor_key, staged_cursor orelse raw, &.{.{ .key = cursor_key, .value = updated }}, &.{}, primary_key, if (source) |captured| captured.logical_digest else null, if (already) null else delta);
     }
     // Independent asset and dense lanes must both acknowledge durable output
     // before their shared decoded-work spool can retire.
     if (complete) try compactMediaPassScope(runtime, prefix, cursor.input_digest);
-    if (required_embedding_failure) return error.RequiredMediaOutputFailed;
+    if (mode == .pending_repair) mode.pending_repair.* = true;
 }
 
 const MediaPassVectorCache = struct {
@@ -8058,9 +8587,61 @@ fn mediaPassInputDigest(runtime: *EnrichmentRuntime, request: enrichment_types.G
     return hash.finalResult();
 }
 
-fn dispatchModelPage(runtime: *EnrichmentRuntime, a: Allocator, config: chunking_types_mod.Config, input: @import("inference_chunker").Input) !@import("inference_chunker").types.ChunkPage {
+fn scopedChunkProvider(runtime: *EnrichmentRuntime, provider: ?ChunkProvider, cancellation: *AssetInvocationCancellation) ?ChunkProvider {
+    const guard = runtime.active_provider_guard;
+    if (guard.deadline_ns == null and guard.cancellation.ptr == null and runtime.config.cancellation.ptr == null) return provider;
+    var scoped = provider orelse ChunkProvider{};
+    cancellation.* = .{
+        .lifecycle = runtime.config.cancellation,
+        .request = guard.cancellation,
+        .inherited = scoped.execution.cancellation,
+    };
+    scoped.execution.cancellation = .{ .ptr = cancellation, .is_cancelled_fn = AssetInvocationCancellation.isCancelled, .check_fn = AssetInvocationCancellation.check };
+    scoped.execution.deadline_ns = guard.nativeDeadlineNs(scoped.execution.deadline_ns);
+    if (guard.deadline_ns != null or guard.cancellation.ptr != null)
+        scoped.legacy_linked_admission = if (runtime.isStarted()) .defer_to_worker else .require_control;
+    return scoped;
+}
+
+fn checkChunkOwner(runtime: *EnrichmentRuntime, provider: ?ChunkProvider) !void {
+    const context: asset_producer_mod.InvocationContext = if (provider) |scoped| .{
+        .deadline_ns = scoped.execution.deadline_ns,
+        .cancellation = scoped.execution.cancellation,
+    } else .{};
+    try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, context);
+}
+
+fn chunkProviderFailure(runtime: *EnrichmentRuntime, provider: ?ChunkProvider, err: anyerror) anyerror {
+    if (!isOperationInterruption(err)) return err;
+    checkChunkOwner(runtime, provider) catch |control| return control;
+    return providerInvocationFailure(runtime, err);
+}
+
+fn chunkTextWithProviderForEnrichment(runtime: *EnrichmentRuntime, alloc: Allocator, text: []const u8, config_json: []const u8, provider: ?ChunkProvider) ![]chunker_mod.Chunk {
+    var cancellation: AssetInvocationCancellation = undefined;
+    const scoped = scopedChunkProvider(runtime, provider, &cancellation);
+    try checkChunkOwner(runtime, scoped);
+    const chunks = chunker_mod.chunkTextWithConfigJsonAndProvider(alloc, text, config_json, scoped) catch |err|
+        return chunkProviderFailure(runtime, scoped, err);
+    errdefer chunker_mod.freeChunks(alloc, chunks);
+    try checkChunkOwner(runtime, scoped);
+    return chunks;
+}
+
+fn chunkMediaWithProviderForEnrichment(runtime: *EnrichmentRuntime, alloc: Allocator, config: chunking_types_mod.Config, input: @import("inference_chunker").Input, provider: ?ChunkProvider) ![]chunker_mod.Chunk {
+    var cancellation: AssetInvocationCancellation = undefined;
+    const scoped = scopedChunkProvider(runtime, provider, &cancellation);
+    try checkChunkOwner(runtime, scoped);
     try authorizeModelSource(runtime, input);
-    return model_chunk_client.chunkPageWithProvider(a, config, input, runtime.config.chunk_provider);
+    const chunks = model_chunk_client.chunkMediaWithProvider(alloc, config, input, scoped) catch |err|
+        return chunkProviderFailure(runtime, scoped, err);
+    errdefer chunker_mod.freeChunks(alloc, chunks);
+    try checkChunkOwner(runtime, scoped);
+    return chunks;
+}
+
+fn dispatchModelPage(runtime: *EnrichmentRuntime, a: Allocator, config: chunking_types_mod.Config, input: @import("inference_chunker").Input) !@import("inference_chunker").types.ChunkPage {
+    return dispatchModelPageWithMode(runtime, a, config, input, false);
 }
 
 fn authorizeModelSource(runtime: *EnrichmentRuntime, input: @import("inference_chunker").Input) !void {
@@ -8071,8 +8652,22 @@ fn authorizeModelSource(runtime: *EnrichmentRuntime, input: @import("inference_c
 /// Resolve deployed generations through the same local/remote chunk contract.
 /// Planning-only targets return identities without executing any output model.
 fn probeModelPass(runtime: *EnrichmentRuntime, supplied: chunking_types_mod.Config, input: @import("inference_chunker").Input) !@import("inference_chunker").types.ChunkPage {
+    return dispatchModelPageWithMode(runtime, runtime.alloc, supplied, input, true);
+}
+
+fn dispatchModelPageWithMode(runtime: *EnrichmentRuntime, a: Allocator, config: chunking_types_mod.Config, input: @import("inference_chunker").Input, probe: bool) !@import("inference_chunker").types.ChunkPage {
+    var cancellation: AssetInvocationCancellation = undefined;
+    const scoped = scopedChunkProvider(runtime, runtime.config.chunk_provider, &cancellation);
+    try checkChunkOwner(runtime, scoped);
     try authorizeModelSource(runtime, input);
-    return model_chunk_client.probeModelPageWithProvider(runtime.alloc, supplied, input, runtime.config.chunk_provider);
+    var page = (if (probe)
+        model_chunk_client.probeModelPageWithProvider(a, config, input, scoped)
+    else
+        model_chunk_client.chunkPageWithProvider(a, config, input, scoped)) catch |err|
+        return chunkProviderFailure(runtime, scoped, err);
+    errdefer page.deinit(a);
+    try checkChunkOwner(runtime, scoped);
+    return page;
 }
 
 fn prepareModelPassChunks(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, supplied_config: chunking_types_mod.Config, input: @import("inference_chunker").Input, source_key: []const u8, source_digest: [32]u8, prefix: []const u8) ![]chunker_mod.Chunk {
@@ -8213,7 +8808,7 @@ fn prepareModelPassChunksWithProbe(runtime: *EnrichmentRuntime, request: enrichm
                 if (!std.mem.eql(u8, &sourceRecordDigest(raw_doc), &source_digest)) return error.EnrichmentSourceChanged;
                 var repair_request = request;
                 repair_request.chunker_json = request.chunker_json;
-                if (try repairMediaOutputPage(runtime, repair_request, raw_doc, supplied_config, input, prefix, target.name, target, identity, page.chunks)) return error.IncompleteChunkCoverage;
+                if (try repairMediaOutputPage(runtime, repair_request, raw_doc, supplied_config, input, prefix, target.name, target, identity, page.chunks, null)) return error.IncompleteChunkCoverage;
                 const updated = try storeGetOptionalAllocWithRetry(runtime, cursor_key) orelse return error.EnrichmentSourceChanged;
                 if (cursor_bytes) |bytes| a.free(bytes);
                 cursor_bytes = updated;
@@ -8311,6 +8906,7 @@ const UnsupportedEnrichmentRuntime = struct {
     status_hook: ?StatusHook = null,
     dense_result_cache: ?embedder_mod.DenseResultCache = null,
     vector_label_cache: @import("vector_label_cache.zig").Cache = .{},
+    media_window_capture: MediaWindowCaptureCache = .{},
     /// Invocation-local runtimes borrow the lifecycle owner's cache.
     shared_vector_label_cache: ?*@import("vector_label_cache.zig").Cache = null,
     generated_publication: ?GeneratedPublicationPort = null,
@@ -8943,6 +9539,11 @@ const PlatformEnrichmentRuntime = struct {
     retry_error_has_request_identity: bool = false,
     retrying: bool = false,
     worker_failed: bool = false,
+    /// Set only when loading a failed durable status actually admitted recovery.
+    boundary_recovery_pending: bool = false,
+    // The replay-pass owner retries a clean exit's failed status write before
+    // dispatching work again. A new tenure cannot adopt a stale receipt.
+    pending_boundary_refund: ?BoundaryRecoveryReservation = null,
     relational_base_rows: std.atomic.Value(bool) = .init(false),
     skip_by_hash_count: u64 = 0,
     skipped_source_count: u64 = 0,
@@ -9011,6 +9612,7 @@ const PlatformEnrichmentRuntime = struct {
     status_hook: ?StatusHook = null,
     dense_result_cache: ?embedder_mod.DenseResultCache = null,
     vector_label_cache: @import("vector_label_cache.zig").Cache = .{},
+    media_window_capture: MediaWindowCaptureCache = .{},
     /// Invocation-local runtimes borrow the lifecycle owner's cache.
     shared_vector_label_cache: ?*@import("vector_label_cache.zig").Cache = null,
     generated_publication: ?GeneratedPublicationPort = null,
@@ -9126,6 +9728,7 @@ const PlatformEnrichmentRuntime = struct {
     pub fn deinit(self: *EnrichmentRuntime) void {
         self.stop();
         self.vector_label_cache.deinit();
+        self.media_window_capture.deinit();
         clearIndexEmbeddingActivity(self);
         clearPublishedGeneratedArtifacts(self);
         clearIsolatedFailedIndexes(self);
@@ -9204,10 +9807,7 @@ const PlatformEnrichmentRuntime = struct {
         if (self.config.dense_embedder) |dense_embedder| dense_embedder.setProgress(progress);
         if (self.config.sparse_embedder) |sparse_embedder| sparse_embedder.setProgress(progress);
         const io = io_impl.io();
-        if (self.config.chunk_provider) |*provider| {
-            provider.execution.cancellation = cancellation;
-            provider.execution.io = io;
-        }
+        if (self.config.chunk_provider) |*provider| provider.execution.io = io;
     }
 
     pub fn start(self: *EnrichmentRuntime) !void {
@@ -9359,11 +9959,8 @@ const PlatformEnrichmentRuntime = struct {
                 self.mutex.unlock(io);
                 return RuntimeError.EnrichmentWaitCanceled;
             }
-            if (cancellation.isCancelled()) {
-                self.mutex.unlock(io);
-                return RuntimeError.EnrichmentWaitCanceled;
-            }
-            if (self.deadline_clock.nowRealtimeNs() >= effective_deadline_ns) {
+            const now = self.deadline_clock.nowRealtimeNs();
+            if (now >= effective_deadline_ns) {
                 const applied = self.applied_sequence;
                 const target = self.target_sequence;
                 const worker_started = self.future != null;
@@ -9381,28 +9978,33 @@ const PlatformEnrichmentRuntime = struct {
             _ = self.sync_waiter_count.fetchAdd(1, .release);
             self.mutex.unlock(io);
 
-            // Borrowed transport cancellation is a callback rather than an
-            // Io future cancellation. Poll only this post-commit barrier at a
-            // short interval; the ordinary no-token path keeps its single
-            // hard-deadline futex wait.
-            const wait_deadline = if (cancellation.ptr != null)
-                Io.Clock.Timestamp.fromNow(io, .{
-                    .clock = .awake,
-                    .raw = .fromNanoseconds(cancellation_poll_ns),
-                })
-            else
-                deadline;
-            const wait_result = Io.futexWaitTimeout(
-                io,
-                u32,
-                &self.sync_wait_epoch.raw,
-                observed_epoch,
-                .{ .deadline = wait_deadline },
-            );
-            const previous_waiters = self.sync_waiter_count.fetchSub(1, .release);
-            std.debug.assert(previous_waiters > 0);
+            const wait_result: anyerror!void = wait: {
+                defer {
+                    const previous_waiters = self.sync_waiter_count.fetchSub(1, .release);
+                    std.debug.assert(previous_waiters > 0);
+                }
+                // The checkpoint can perform I/O. The epoch captured under
+                // the mutex prevents a lost wakeup while it runs.
+                cancellation.check() catch |err| break :wait callerCheckpointFailure(err);
+                const wait_deadline = if (cancellation.ptr != null)
+                    Io.Clock.Timestamp.fromNow(io, .{
+                        .clock = .awake,
+                        .raw = .fromNanoseconds(@min(cancellation_poll_ns, effective_deadline_ns -| self.deadline_clock.nowRealtimeNs())),
+                    })
+                else
+                    deadline;
+                break :wait Io.futexWaitTimeout(
+                    io,
+                    u32,
+                    &self.sync_wait_epoch.raw,
+                    observed_epoch,
+                    .{ .deadline = wait_deadline },
+                );
+            };
             wait_result catch |err| switch (err) {
-                error.Canceled => return self.resolveCanceledVisibilityWait(io, sequence, wait_cut),
+                error.Canceled, error.EnrichmentWaitCanceled => return self.resolveInterruptedVisibilityWait(io, sequence, wait_cut, error.EnrichmentWaitCanceled),
+                error.EnrichmentWaitTimeout => return self.resolveInterruptedVisibilityWait(io, sequence, wait_cut, error.EnrichmentWaitTimeout),
+                else => return err,
             };
             if (cancellation.ptr != null) {
                 // Preserve fast disconnect response for ordinary waits, then
@@ -9423,16 +10025,16 @@ const PlatformEnrichmentRuntime = struct {
         return null;
     }
 
-    fn resolveCanceledVisibilityWait(self: *EnrichmentRuntime, io: Io, sequence: u64, wait_cut: ReplayCut) !void {
+    fn resolveInterruptedVisibilityWait(self: *EnrichmentRuntime, io: Io, sequence: u64, wait_cut: ReplayCut, interruption: RuntimeError) !void {
         // A completed transition racing cancellation can still satisfy the wait.
         // Re-read runtime status if the probe reconciles a newer generation.
         self.mutex.lockUncancelable(io);
         const cut: ReplayCut = .{ .applied = self.applied_sequence, .generation = self.replay_generation };
         const blocked = self.visibilityBlockerAssumeLocked() != null;
         self.mutex.unlock(io);
-        if (cut.applied < sequence and !blocked) return RuntimeError.EnrichmentWaitCanceled;
+        if (cut.applied < sequence and !blocked) return interruption;
         const validated = (refreshReplayAuthority(self, cut, null, if (blocked) .status else .checkpoint) catch |err| switch (err) {
-            error.EnrichmentRetryInProgress => return RuntimeError.EnrichmentWaitCanceled,
+            error.EnrichmentRetryInProgress, error.EnrichmentWaitCanceled => return interruption,
             else => return err,
         }).cut;
 
@@ -9448,7 +10050,7 @@ const PlatformEnrichmentRuntime = struct {
             return;
         }
         if (same_generation) if (blocker) |err| return err;
-        return RuntimeError.EnrichmentWaitCanceled;
+        return interruption;
     }
 
     /// Run without a visibility deadline while preserving the wait API's
@@ -9553,6 +10155,7 @@ const PlatformEnrichmentRuntime = struct {
                 return switch (err) {
                     RuntimeError.EnrichmentWaitCanceled => RuntimeError.EnrichmentWaitCanceled,
                     RuntimeError.EnrichmentWaitTimeout => RuntimeError.EnrichmentWaitTimeout,
+                    error.UncancellableInferenceProvider => error.UncancellableInferenceProvider,
                     RuntimeError.EnrichmentWorkerFailed => RuntimeError.EnrichmentWorkerFailed,
                     RuntimeError.EnrichmentRetryInProgress => RuntimeError.EnrichmentRetryInProgress,
                     else => switch (enrichmentErrorDisposition(err)) {
@@ -9753,6 +10356,7 @@ const PlatformEnrichmentRuntime = struct {
             self.mutex.unlock(io);
             return;
         };
+        self.boundary_recovery_pending = false;
         self.last_error_code = types.RuntimeErrorName.init(@errorName(err));
         self.error_count += 1;
         self.fatal_error_count += 1;
@@ -9782,6 +10386,7 @@ const PlatformEnrichmentRuntime = struct {
             self.mutex.unlock(io);
             return;
         };
+        self.boundary_recovery_pending = false;
         if (err == error.EnrichmentSourceChanged) self.active_failure_fingerprint = 0;
         if (!awaiting_progress) {
             self.last_error_code = types.RuntimeErrorName.init(@errorName(err));
@@ -10089,6 +10694,55 @@ test "enrichment visibility wait observes borrowed request cancellation" {
         runtime.waitForAppliedWithCancellation(1, CancellationToken.fromAtomic(&signal)),
     );
     try std.testing.expectEqual(@as(u32, 0), runtime.sync_waiter_count.load(.acquire));
+
+    const Checkpoint = struct {
+        runtime: *EnrichmentRuntime,
+        checks: usize = 0,
+
+        fn check(ptr: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            try std.testing.expect(self.runtime.mutex.tryLock());
+            self.runtime.mutex.unlock(self.runtime.io_impl.?.io());
+            self.checks += 1;
+            if (self.checks == 2) return error.DeadlineExceeded;
+        }
+
+        fn poll(_: *const anyopaque) bool {
+            return false;
+        }
+    };
+    var checkpoint: Checkpoint = .{ .runtime = &runtime };
+    for ([_]?*const fn (*const anyopaque) bool{ null, Checkpoint.poll }) |poll| {
+        checkpoint.checks = 0;
+        try std.testing.expectError(error.EnrichmentWaitTimeout, runtime.waitForAppliedWithCancellation(1, .{
+            .ptr = &checkpoint,
+            .check_fn = Checkpoint.check,
+            .is_cancelled_fn = poll,
+        }));
+        try std.testing.expectEqual(@as(usize, 2), checkpoint.checks);
+        try std.testing.expectEqual(@as(u32, 0), runtime.sync_waiter_count.load(.acquire));
+    }
+
+    const Completes = struct {
+        runtime: *EnrichmentRuntime,
+        interruption: anyerror,
+
+        fn check(ptr: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            const io = self.runtime.io_impl.?.io();
+            self.runtime.mutex.lockUncancelable(io);
+            defer self.runtime.mutex.unlock(io);
+            self.runtime.applied_sequence = 1;
+            broadcastRuntimeStateChanged(self.runtime, io);
+            return self.interruption;
+        }
+    };
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded }) |interruption| {
+        runtime.applied_sequence = 0;
+        var completes: Completes = .{ .runtime = &runtime, .interruption = interruption };
+        try runtime.waitForAppliedWithCancellation(1, .{ .ptr = &completes, .check_fn = Completes.check });
+        try std.testing.expectEqual(@as(u32, 0), runtime.sync_waiter_count.load(.acquire));
+    }
 }
 
 test "foreground enrichment catch-up treats cancellation as a waiter outcome" {
@@ -10121,6 +10775,240 @@ test "foreground enrichment catch-up treats cancellation as a waiter outcome" {
     try std.testing.expect(!runtime.retrying);
     try std.testing.expectEqual(@as(u32, 0), runtime.consecutive_retry_count);
     try std.testing.expectEqual(@as(u64, 0), runtime.error_count);
+}
+
+test "enrichment cancellation distinguishes PDF deadlines and asset invocation failures" {
+    var signal = std.atomic.Value(bool).init(false);
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .cancellation = CancellationToken.fromAtomic(&signal) },
+        .ownership = undefined,
+    };
+    const expired: document_extraction_mod.PdfRenderDeadline = .{ .deadline_ns = 0 };
+    expired.probe().check() catch |err| {
+        const classified = expired.classifyError(err);
+        try std.testing.expectEqual(error.PdfRenderTimeout, classified);
+        try std.testing.expect(!isEnrichmentControlError(classified));
+        try std.testing.expectEqual(EnrichmentErrorDisposition.retryable_request, enrichmentErrorDisposition(classified));
+    };
+    try std.testing.expectEqual(error.WriterLocked, expired.classifyError(error.WriterLocked));
+    const upstream = providerInvocationFailure(&runtime, error.Canceled);
+    try std.testing.expectEqual(error.ProviderInvocationCanceled, upstream);
+    try std.testing.expect(!isEnrichmentControlError(upstream));
+    try std.testing.expectEqual(EnrichmentErrorDisposition.retryable_request, enrichmentErrorDisposition(upstream));
+    signal.store(true, .release);
+    try std.testing.expectEqual(error.EnrichmentWaitCanceled, providerInvocationFailure(&runtime, error.Cancelled));
+
+    signal.store(false, .release);
+    runtime.active_provider_guard.deadline_ns = 0;
+    try std.testing.expectError(error.EnrichmentWaitTimeout, checkEnrichmentExecutionContext(&runtime, assetProviderRequestContext(&runtime)));
+
+    var scope = FailureScope{};
+    for ([_]anyerror{ error.EnrichmentWaitCanceled, error.EnrichmentWaitTimeout }) |control| {
+        try std.testing.expect(isEnrichmentControlError(control));
+        try std.testing.expect(try scope.shouldYield(&runtime, control));
+        try std.testing.expect(!try scheduleScannerRetry(&runtime, undefined, control));
+    }
+    try std.testing.expectEqual(@as(u32, 0), runtime.consecutive_retry_count);
+    try std.testing.expectEqual(@as(u32, 0), runtime.retry_failure_count);
+    try std.testing.expectEqual(@as(u64, 0), runtime.error_count);
+}
+
+test "enrichment cancellation defers dense sparse and multimodal provider calls without inline retry" {
+    const Mock = struct {
+        calls: usize = 0,
+        revision_calls: usize = 0,
+        expected_deadline: ?u64 = null,
+        inherited: std.atomic.Value(bool) = .init(false),
+        cancel_revision: bool = false,
+        fn submitted(_: *anyopaque) void {}
+        fn authorityLost(_: *const anyopaque) !void {
+            return error.EnrichmentLeaseFenceLost;
+        }
+        fn pollActive(_: *const anyopaque) bool {
+            return false;
+        }
+        fn fail(ptr: *anyopaque) anyerror {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return if (self.calls % 2 == 0) error.Cancelled else error.Canceled;
+        }
+        fn dense(ptr: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return fail(ptr);
+        }
+        fn denseBatch(ptr: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8, _: u32) ![]const []const f32 {
+            return fail(ptr);
+        }
+        fn parts(ptr: *anyopaque, _: Allocator, _: []const u8, _: []const template.ContentPart, _: u32) ![]f32 {
+            return fail(ptr);
+        }
+        fn sparse(ptr: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !embedder_mod.SparseEmbedding {
+            return fail(ptr);
+        }
+        fn sparseBatch(ptr: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]embedder_mod.SparseEmbedding {
+            return fail(ptr);
+        }
+        fn legacyChunk(_: *anyopaque, _: Allocator, _: []const u8, _: @import("inference_chunker").Input, _: chunking_types_mod.Config) ![]@import("inference_chunker").Chunk {
+            return error.LegacyChunkDispatched;
+        }
+        fn chunkPage(ptr: *anyopaque, a: Allocator, name: []const u8, _: @import("inference_chunker").Input, _: chunking_types_mod.Config, context: inference_request_context.RequestContext) !@import("inference_chunker").types.ChunkPage {
+            _ = try sparseRevision(ptr, a, name, context);
+            return error.TestUnexpectedResult;
+        }
+        fn denseLease(ptr: *anyopaque, a: Allocator, name: []const u8, context: ?inference_request_context.RequestContext) !inference_work.CapabilityLease {
+            const control = context orelse return error.MissingExecutionContext;
+            try std.testing.expect(control.document_store.context == ptr);
+            try std.testing.expect(control.submission.?.ptr == ptr);
+            const revision = try sparseRevision(ptr, a, name, control);
+            return .{ .capabilities = .{ .task = .embed, .input_modalities = .{ .text = true }, .input_granularity = .item, .output = .embedding, .model_revision = revision } };
+        }
+        fn sparseWithContext(ptr: *anyopaque, a: Allocator, name: []const u8, _: []const u8, context: inference_request_context.RequestContext) !embedder_mod.SparseEmbedding {
+            _ = try sparseRevision(ptr, a, name, context);
+            return error.TestUnexpectedResult;
+        }
+        fn sparseRevision(ptr: *anyopaque, _: Allocator, _: []const u8, context: inference_request_context.RequestContext) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.revision_calls += 1;
+            try std.testing.expectEqual(self.expected_deadline, context.deadline_ns);
+            if (self.cancel_revision) {
+                self.inherited.store(true, .release);
+                try std.testing.expect(context.cancellation.?.isCancelled());
+                return error.Cancelled;
+            }
+            return @splat(7);
+        }
+    };
+    var mock = Mock{};
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .inline_retry_max_attempts = 4 },
+        .ownership = undefined,
+    };
+    defer runtime.inference_recovery.deinit(std.testing.allocator);
+    const dense: embedder_mod.DenseEmbedder = .{
+        .ptr = &mock,
+        .dense_embed_fn = Mock.dense,
+        .dense_embed_batch_fn = Mock.denseBatch,
+        .dense_embed_parts_fn = Mock.parts,
+    };
+    const sparse: embedder_mod.SparseEmbedder = .{ .ptr = &mock, .sparse_embed_fn = Mock.sparse, .sparse_embed_batch_fn = Mock.sparseBatch };
+    try std.testing.expectError(error.ProviderInvocationCanceled, embedDenseWithRetryUncached(dense, &runtime, "dense", "one", 2));
+    try std.testing.expectError(error.ProviderInvocationCanceled, embedDenseBatchWithRetryUncached(dense, &runtime, "dense", &.{ "one", "two" }, 2, null));
+    try std.testing.expectError(error.ProviderInvocationCanceled, embedDensePartsWithRetry(dense, &runtime, "media", &.{.{ .text = "one" }}, 2));
+    try std.testing.expectError(error.ProviderInvocationCanceled, embedSparseWithRetry(sparse, &runtime, "sparse", "one"));
+    try std.testing.expectError(error.ProviderInvocationCanceled, embedSparseBatchWithRetry(sparse, &runtime, "sparse", &.{ "one", "two" }));
+    try std.testing.expectEqual(@as(usize, 5), mock.calls);
+    try std.testing.expectEqual(@as(u64, 5), runtime.inference_cancel_count.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), runtime.consecutive_retry_count);
+
+    // The ordered checkpoint passes its exact deadline and preserves any
+    // earlier owner that was already bound to the provider.
+    var controlled_sparse = sparse;
+    controlled_sparse.cache_revision_with_context_fn = Mock.sparseRevision;
+    controlled_sparse.request_context = .{
+        .io = std.testing.io,
+        .deadline_ns = null,
+        .cancellation = CancellationToken.fromAtomic(&mock.inherited),
+    };
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{
+        .kind = .sparse_embedding,
+        .index_name = "sparse",
+        .doc_key = "doc",
+        .source_field = "body",
+    };
+    runtime.active_provider_guard.deadline_ns = std.math.maxInt(u64);
+    const context = assetProviderRequestContext(&runtime);
+    mock.expected_deadline = context.deadline_ns;
+    const revision = try captureSparseRevision(&runtime, controlled_sparse, std.testing.allocator, "sparse", context);
+    try requireChunkProviderRevision(&runtime, std.testing.allocator, request, null, controlled_sparse, .{}, revision, context);
+    mock.cancel_revision = true;
+    try std.testing.expectError(error.EnrichmentWaitCanceled, requireChunkProviderRevision(&runtime, std.testing.allocator, request, null, controlled_sparse, .{}, revision, context));
+    try std.testing.expectEqual(@as(usize, 3), mock.revision_calls);
+
+    mock.inherited.store(false, .release);
+    mock.cancel_revision = false;
+    mock.expected_deadline = context.deadline_ns.? - std.time.ns_per_s;
+    var controlled_dense = dense;
+    controlled_dense.resolve_part_lease_fn = Mock.denseLease;
+    controlled_dense.part_request_context = .{
+        .io = std.testing.io,
+        .deadline_ns = mock.expected_deadline,
+        .cancellation = CancellationToken.fromAtomic(&mock.inherited),
+        .document_store = .{ .context = &mock },
+        .submission = .{ .ptr = &mock, .notify = Mock.submitted },
+    };
+    const generation = try captureDenseGeneration(&runtime, controlled_dense, std.testing.allocator, "dense", context);
+    mock.cancel_revision = true;
+    try std.testing.expectError(error.EnrichmentWaitCanceled, requireDenseGeneration(&runtime, controlled_dense, std.testing.allocator, "dense", generation, context));
+
+    mock.inherited.store(false, .release);
+    controlled_sparse.foreground_bounded = true;
+    controlled_sparse.request_context.?.deadline_ns = mock.expected_deadline;
+    controlled_sparse.sparse_embed_with_context_fn = Mock.sparseWithContext;
+    try std.testing.expectError(error.EnrichmentWaitCanceled, embedSparseWithRetry(controlled_sparse, &runtime, "sparse", "one"));
+    try std.testing.expectEqual(@as(usize, 6), mock.revision_calls);
+
+    mock.inherited.store(false, .release);
+    runtime.config.chunk_provider = .{
+        .ptr = &mock,
+        .boundary_dispatch = chunk_provider.CallbackBoundary.local_dispatch,
+        .chunk_page_with_context_callback = @ptrCast(&Mock.chunkPage),
+        .execution = .{ .deadline_ns = mock.expected_deadline, .cancellation = CancellationToken.fromAtomic(&mock.inherited) },
+    };
+    runtime.io_impl = .{ .borrowed = std.testing.io };
+    try runtime.resumeInlineAfterStop();
+    try std.testing.expectError(error.EnrichmentWaitCanceled, dispatchModelPage(&runtime, std.testing.allocator, .{ .provider = .antfly, .model = "test", .embedding = .{ .model = "test" }, .page = true, .max_chunks = 1 }, .{ .text = "source" }));
+    try std.testing.expectEqual(@as(usize, 7), mock.revision_calls);
+    const checkpoint: CancellationToken = .{ .ptr = &mock, .is_cancelled_fn = Mock.pollActive, .check_fn = Mock.authorityLost };
+    const producer = asset_producer_mod.Producer{
+        .ptr = &mock,
+        .vtable = &.{ .produce = struct {
+            fn run(_: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+                return error.TestUnexpectedResult;
+            }
+        }.run },
+        .invocation_context = .{ .cancellation = checkpoint },
+    };
+    var cancel: AssetInvocationCancellation = undefined;
+    const scoped = scopedAssetProducer(&runtime, producer, &cancel);
+    try std.testing.expect(!scoped.invocation_context.cancellation.isCancelled());
+    try std.testing.expectError(error.EnrichmentLeaseFenceLost, checkAssetInvocationOwner(&runtime, runtime.active_provider_guard, scoped.invocation_context));
+
+    mock.inherited.store(false, .release);
+    runtime.config.chunk_provider.?.chunk_input_callback = @ptrCast(&Mock.legacyChunk);
+    const media_config: chunking_types_mod.Config = .{ .provider = .antfly, .model = "test", .embedding = .{ .model = "test" } };
+    try std.testing.expectError(error.UncancellableInferenceProvider, chunkMediaWithProviderForEnrichment(&runtime, std.testing.allocator, media_config, .{ .text = "source" }, runtime.config.chunk_provider));
+    var linked_cancellation: AssetInvocationCancellation = undefined;
+    const minimal = @import("chunker_stub.zig");
+    const minimal_config = "{\"provider\":\"antfly\"}";
+    try std.testing.expectError(error.UncancellableInferenceProvider, minimal.chunkTextWithConfigJsonAndProvider(std.testing.allocator, "source", minimal_config, scopedChunkProvider(&runtime, runtime.config.chunk_provider, &linked_cancellation)));
+    runtime.future = .{ .task = undefined }; // Dispatch observes only registration.
+    try std.testing.expectError(error.EnrichmentRetryInProgress, chunkMediaWithProviderForEnrichment(&runtime, std.testing.allocator, media_config, .{ .text = "source" }, runtime.config.chunk_provider));
+    try std.testing.expectError(error.EnrichmentRetryInProgress, minimal.chunkTextWithConfigJsonAndProvider(std.testing.allocator, "source", minimal_config, scopedChunkProvider(&runtime, runtime.config.chunk_provider, &linked_cancellation)));
+    runtime.future = null;
+    try std.testing.expect(isEnrichmentControlError(error.UncancellableInferenceProvider));
+    runtime.active_provider_guard = .{};
+    try std.testing.expectError(error.LegacyChunkDispatched, chunkMediaWithProviderForEnrichment(&runtime, std.testing.allocator, media_config, .{ .text = "source" }, runtime.config.chunk_provider));
 }
 
 test "enrichment provider deadlines and progress cross native clock boundaries" {
@@ -10196,6 +11084,17 @@ test "enrichment provider deadlines and progress cross native clock boundaries" 
 test "foreground enrichment catch-up guard has a monotonic deadline" {
     const guard = ForegroundCatchUpGuard{ .deadline_ns = platform_time.monotonicNs() };
     try std.testing.expectError(error.EnrichmentWaitTimeout, guard.check());
+    const Script = struct {
+        fn check(ptr: *const anyopaque) !void {
+            const failure: *const anyerror = @ptrCast(@alignCast(ptr));
+            return failure.*;
+        }
+    };
+    var failure: anyerror = error.DeadlineExceeded;
+    const caller: ForegroundCatchUpGuard = .{ .cancellation = .{ .ptr = &failure, .check_fn = Script.check } };
+    try std.testing.expectError(error.EnrichmentWaitTimeout, caller.check());
+    failure = error.EnrichmentLeaseFenceLost;
+    try std.testing.expectError(error.EnrichmentLeaseFenceLost, caller.check());
 }
 
 test "foreground enrichment rejects providers without a bounded-operation contract" {
@@ -10325,7 +11224,7 @@ test "asset inference recovery uses one identity from plan through provider call
     try std.testing.expectEqual(@as(usize, 4), recoveryBatchCap(&runtime, planned_key));
 }
 
-test "post-provider deadline records timeout recovery before returning" {
+test "post-provider caller deadline records a metric without changing admission" {
     var runtime = EnrichmentRuntime{
         .alloc = std.testing.allocator,
         .io_impl = null,
@@ -10347,10 +11246,12 @@ test "post-provider deadline records timeout recovery before returning" {
     const key = inferenceRecoveryKey(.{ .model = "bge-m3", .backend = "metal" });
     try std.testing.expectError(
         error.EnrichmentWaitTimeout,
-        checkProviderFailureGuardRecording(&runtime, key, 8),
+        checkProviderFailureGuardRecording(&runtime, key, 8, null),
     );
-    try std.testing.expectEqual(@as(u64, 1), runtime.inference_timeout_count.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 4), recoveryBatchCap(&runtime, key));
+    try std.testing.expectError(error.EnrichmentWaitTimeout, checkProviderFailureGuardRecording(&runtime, key, 1, null));
+    try std.testing.expectEqual(@as(u64, 2), runtime.inference_timeout_count.load(.acquire));
+    try std.testing.expectEqual(std.math.maxInt(usize), recoveryBatchCap(&runtime, key));
+    try std.testing.expectEqual(@as(usize, 0), runtime.inference_recovery.count());
 }
 
 const FailedReplay = struct { generation: u64, through: u64 };
@@ -10606,13 +11507,22 @@ fn failureIdentityForRequest(request: enrichment_types.GeneratedEnrichmentReques
     };
 }
 
+fn publishRequestTerminalCoverage(runtime: *EnrichmentRuntime, window: ?*GeneratedReplayWindow, request: enrichment_types.GeneratedEnrichmentRequest, indexes: []const []const u8) !void {
+    if (runtime.coverage_apply_mutex == null) return;
+    if (window) |pending| {
+        try queueDerivedCoverageOutcome(runtime, pending, request, indexes, .terminal_failed);
+    } else for (indexes) |index_name| {
+        try markDerivedCoverageTerminalFailedForIndex(runtime, index_name, request);
+    }
+}
+
 /// A terminal request can be followed by a different request that still needs
 /// to yield. On the next pass, consult the durable repair ledger before calling
 /// the provider again. This makes progress monotonic across batch boundaries
 /// and process restarts without adding a point lookup to the healthy hot path.
 fn skipPersistedRequestFailure(
     runtime: *EnrichmentRuntime,
-    window: *GeneratedReplayWindow,
+    window: ?*GeneratedReplayWindow,
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !bool {
     const pending_fn = runtime.failure_pending_fn orelse return false;
@@ -10640,10 +11550,20 @@ fn skipPersistedRequestFailure(
         markIsolatedFailedSource(runtime, index_name, failure_identity.artifact_name);
     };
 
-    if (runtime.coverage_apply_mutex != null) {
-        try queueDerivedCoverageOutcome(runtime, window, request, indexes, .terminal_failed);
-    }
+    try publishRequestTerminalCoverage(runtime, window, request, indexes);
     return true;
+}
+
+fn resumePersistedDocumentRequestFailure(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, request: enrichment_types.GeneratedEnrichmentRequest) !bool {
+    if (request.kind == .dense_embedding and request.input_kind == .materialized_chunks and request.model_aware_chunking) {
+        var resumed = false;
+        retireMediaPassForDenseRequest(runtime, request, .{ .pending_repair = &resumed }) catch |err| {
+            if (!isEnrichmentControlError(err)) setActiveFailureFingerprint(runtime, 0);
+            return err;
+        };
+        if (resumed) return true;
+    }
+    return skipPersistedRequestFailure(runtime, window, request);
 }
 
 /// Scanner-thread variant: the attempt number is read from the runtime-global
@@ -10660,6 +11580,10 @@ fn recordIsolatedRequestErrorFor(runtime: *EnrichmentRuntime, window: ?*Generate
 /// `error_name` is the durable, operator-visible cause. Callers that wrap a
 /// lower-level failure pass that failure's name rather than the wrapper.
 fn recordIsolatedRequestErrorNamed(runtime: *EnrichmentRuntime, window: ?*GeneratedReplayWindow, request: enrichment_types.GeneratedEnrichmentRequest, error_name: []const u8, attempt_number: u64) !void {
+    return recordIsolatedRequestErrorGuarded(runtime, window, request, error_name, attempt_number, null);
+}
+
+fn recordIsolatedRequestErrorGuarded(runtime: *EnrichmentRuntime, window: ?*GeneratedReplayWindow, request: enrichment_types.GeneratedEnrichmentRequest, error_name: []const u8, attempt_number: u64, proof: ?MediaFailureProof) !void {
     std.log.warn("enrichment request failed index={s} artifact={s} doc_key={s} doc_key_bytes={d}: {s}", .{ request.index_name, requestEmbeddingName(request), request.doc_key[0..@min(request.doc_key.len, 256)], request.doc_key.len, error_name });
     const owned_indexes = if (runtime.coverage_apply_mutex != null)
         try affectedIndexesForRequestAlloc(runtime, request)
@@ -10689,16 +11613,11 @@ fn recordIsolatedRequestErrorNamed(runtime: *EnrichmentRuntime, window: ?*Genera
                 .error_name = error_name,
                 .attempts = attempt_number,
                 .sequence = request.sequence,
+                .media_proof = proof,
             });
         }
     }
-    if (runtime.coverage_apply_mutex != null) {
-        if (window) |active_window| {
-            try queueDerivedCoverageOutcome(runtime, active_window, request, indexes, .terminal_failed);
-        } else for (indexes) |index_name| {
-            try markDerivedCoverageTerminalFailedForIndex(runtime, index_name, request);
-        }
-    }
+    try publishRequestTerminalCoverage(runtime, window, request, indexes);
     try noteTerminalRequestFailure(
         runtime,
         request.sequence,
@@ -11306,17 +12225,47 @@ fn runForegroundCatchUpPassGuarded(
     const generation = runtime.replayCut().generation;
     const previous_generation = swapReplayWriteGeneration(runtime, generation);
     defer _ = swapReplayWriteGeneration(runtime, previous_generation);
-    runForegroundCatchUpPassOwned(runtime, io, target_sequence, guard, generation) catch |err| {
-        // Request cancellation and the visibility deadline are waiter
-        // outcomes, not provider or pipeline failures. Never persist them into
-        // the durable worker retry budget.
-        if (err == RuntimeError.EnrichmentWaitCanceled or
-            err == RuntimeError.EnrichmentWaitTimeout or
-            err == error.EnrichmentReplayAuthorityBusy or
-            isGraphRecoveryPending(err)) return err;
-        handleWorkerLoopError(runtime, io, err, .{ .generation = generation, .through = target_sequence });
-        return err;
+    var recovery: ?BoundaryRecoveryReservation = null;
+    var publication_failure: ?anyerror = null;
+    var lease_guard = RuntimeLeaseHeartbeatGuard.init(runtime);
+    defer lease_guard.stop();
+    runForegroundCatchUpPassOwned(runtime, io, target_sequence, guard, generation, &lease_guard, &recovery, &publication_failure) catch |err| {
+        const failure = foregroundPassFailure(runtime, guard, err);
+        const failed = FailedReplay{ .generation = generation, .through = target_sequence };
+        if (publication_failure) |cause| {
+            setActiveFailureFingerprint(runtime, 0);
+            handleWorkerLoopError(runtime, io, cause, failed);
+            return failure;
+        }
+        // A clean waiter exit can refund an unchanged reservation. A crash,
+        // provider failure, or superseding writer leaves its own durable state.
+        if (failure == RuntimeError.EnrichmentWaitCanceled or
+            failure == RuntimeError.EnrichmentWaitTimeout or
+            failure == RuntimeError.EnrichmentRetryInProgress or
+            (failure == error.UncancellableInferenceProvider and (guard.deadline_ns != null or guard.cancellation.ptr != null)) or
+            (failure == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)))
+        {
+            if (recovery) |reserved| releaseBoundaryRecoveryReservation(runtime, reserved) catch |refund_err| switch (refund_err) {
+                error.EnrichmentLeaseFenceLost, error.EnrichmentSourceChanged => {},
+                else => {
+                    runtime.pending_boundary_refund = reserved;
+                    std.log.warn("enrichment recovery reservation refund deferred: {s}", .{@errorName(refund_err)});
+                },
+            };
+            return failure;
+        }
+        if (failure == error.EnrichmentReplayAuthorityBusy or isGraphRecoveryPending(failure)) return failure;
+        handleWorkerLoopError(runtime, io, failure, failed);
+        return failure;
     };
+}
+
+fn foregroundPassFailure(runtime: *EnrichmentRuntime, guard: ForegroundCatchUpGuard, err: anyerror) anyerror {
+    if (isOperationCanceled(err)) {
+        guard.check() catch |control| return control;
+        if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
+    }
+    return err;
 }
 
 fn runForegroundCatchUpPassOwned(
@@ -11325,6 +12274,9 @@ fn runForegroundCatchUpPassOwned(
     target_sequence: u64,
     guard: ForegroundCatchUpGuard,
     generation: u64,
+    replay_lease_guard: *RuntimeLeaseHeartbeatGuard,
+    recovery: *?BoundaryRecoveryReservation,
+    publication_failure: *?anyerror,
 ) !void {
     try guard.check();
     try validateReplayPassGeneration(runtime, generation);
@@ -11362,15 +12314,24 @@ fn runForegroundCatchUpPassOwned(
     // Per-write durable fences still reject results after a real takeover.
     try maintainIndexDocumentCheckpoints(runtime);
 
-    var replay_lease_guard = RuntimeLeaseHeartbeatGuard.init(runtime);
     try replay_lease_guard.start();
-    defer replay_lease_guard.stop();
+    if (runtime.pending_boundary_refund) |reservation| {
+        releaseBoundaryRecoveryReservation(runtime, reservation) catch |err| switch (err) {
+            error.EnrichmentLeaseFenceLost, error.EnrichmentSourceChanged => {},
+            error.WriterLocked => return error.EnrichmentReplayAuthorityBusy,
+            else => return err,
+        };
+        runtime.pending_boundary_refund = null;
+    }
 
     try guard.check();
     runtime.mutex.lockUncancelable(io);
-    const recovery_admission = boundaryFailureAdmissionStatus(runtimeStatusSnapshot(runtime));
+    const recovery_pending = runtime.boundary_recovery_pending;
     runtime.mutex.unlock(io);
-    if (recovery_admission != null) try saveRuntimeStatusWithRetry(runtime, .boundary_recovery);
+    if (recovery_pending) {
+        try saveRuntimeStatusWithPlanReceipt(runtime, .boundary_recovery, null, generation, null, recovery);
+        try guard.check();
+    }
     try scavengeGraphStagesPage(runtime);
     runtime.mutex.lockUncancelable(io);
     const already_failed = runtime.worker_failed or runtime.last_error_name != null;
@@ -11410,6 +12371,9 @@ fn runForegroundCatchUpPassOwned(
     var processed_request_count: u64 = 0;
     if (due.groups.len != 0) {
         var due_pipeline = LanePipeline.init(runtime);
+        defer if (due_pipeline.publication_failure) |err| {
+            publication_failure.* = err;
+        };
         const due_result = runGeneratedCatchUpQuanta(runtime, runtime.appliedSequence(), .due_tickets, due.groups, null, null, guard, &due_pipeline, &processed_request_count);
         const drain_due = due_pipeline.drainAll(if (due_result) |_| true else |_| false);
         _ = due_result catch |err| {
@@ -11454,6 +12418,9 @@ fn runForegroundCatchUpPassOwned(
     var pipeline = LanePipeline.init(runtime);
     pipeline.cursor_config_hash = config_hash;
     pipeline.replay_generation = generation;
+    defer if (pipeline.publication_failure) |err| {
+        publication_failure.* = err;
+    };
     if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
     // Draining unconditionally (not just on the success path) is what keeps
     // cross-quantum pipelining from turning into abandoned concurrent work:
@@ -11979,25 +12946,30 @@ const SharedPdfWindowScheduler = struct {
         // speculative vectors through replay's durable write/checkpoint path.
         if (self.precommit != null) return;
         if (request.kind != .dense_embedding or request.embedding_input != .pdf_page_images) return;
-        const embedder = self.runtime.config.dense_embedder orelse return;
+        const provider = self.runtime.config.dense_embedder orelse return;
+        var cancellation: AssetInvocationCancellation = undefined;
+        const embedder = provider.withRequestContext(scopedEmbeddingRequestContext(self.runtime, foregroundProviderRequestContext(self.runtime), provider.part_request_context, &cancellation));
         const indexes = try self.runtime.index_manager.denseIndexesForEmbedding(self.runtime.alloc, requestEmbeddingName(request), request.expected_dims);
         defer {
             for (indexes) |name| self.runtime.alloc.free(name);
             self.runtime.alloc.free(indexes);
         }
         if (indexes.len == 0) return;
-        const source_url = try extractSourceText(self.runtime.alloc, self.runtime.config, raw, request) orelse return;
+        const source_url = try extractEnrichmentSource(self.runtime, extractSourceText, self.runtime.alloc, raw, request) orelse return;
         defer self.runtime.alloc.free(source_url);
         consumer.source_identity = PreparedDocumentSourceCache.sourceIdentity(source_url);
         const policy = try enrichment_types.parseExecutionPolicyJson(self.runtime.alloc, request.execution_json);
-        const execution_lease = try embedder.resolveMediaPartLease(self.runtime.alloc, requestEmbeddingName(request), @min(policy.batch_items orelse generated_ocr_default_batch_max_items, generated_ocr_absolute_batch_max_items));
+        try checkEmbeddingInvocationOwner(self.runtime, self.runtime.active_provider_guard, embedder.part_request_context);
+        const execution_lease = embedder.resolveMediaPartLease(self.runtime.alloc, requestEmbeddingName(request), @min(policy.batch_items orelse generated_ocr_default_batch_max_items, generated_ocr_absolute_batch_max_items)) catch |err|
+            return embeddingInvocationFailure(self.runtime, self.runtime.active_provider_guard, embedder.part_request_context, err);
         const caps = execution_lease.capabilities.?;
         consumer.execution_lease = execution_lease;
         const raster = embedder.supportsRasterItems() and caps.borrowed_rasters;
         if (!caps.supports(.{ .image = true }) or (!raster and !caps.acceptsMimeType("image/png")) or caps.result_cardinality != .one_per_item)
             return error.UnsupportedEmbeddingProvider;
         consumer.max_items = @min(@min(policy.batch_items orelse caps.batch.preferred_items, caps.batch.max_items), generated_ocr_absolute_batch_max_items);
-        consumer.max_items = try embedder.withPartLease(execution_lease).partBatchLimit(requestEmbeddingName(request), request.expected_dims, consumer.max_items);
+        consumer.max_items = embedder.withPartLease(execution_lease).partBatchLimit(requestEmbeddingName(request), request.expected_dims, consumer.max_items) catch |err|
+            return embeddingInvocationFailure(self.runtime, self.runtime.active_provider_guard, embedder.part_request_context, err);
         if (consumer.max_items == 0)
             return error.InvalidInferenceCapabilities;
         consumer.max_bytes = if (raster) policy.batch_bytes orelse 1 else if (caps.batch.max_encoded_media_bytes) |limit| pdfImageEmbeddingBatchBytes(policy.batch_bytes, limit) else policy.batch_bytes orelse return error.InferenceCapabilitiesUnavailable;
@@ -12005,12 +12977,12 @@ const SharedPdfWindowScheduler = struct {
         consumer.capabilities = caps;
         applyDocumentExtractionRuntimePolicy(&consumer.config);
         try consumer.plans.resize(self.runtime.alloc, consumer.max_items + 1);
-        for (1..consumer.plans.items.len) |count| consumer.plans.items[count] = try embedder.withPartLease(execution_lease).partInvocationMemoryForMime(
+        for (1..consumer.plans.items.len) |count| consumer.plans.items[count] = embedder.withPartLease(execution_lease).partInvocationMemoryForMime(
             requestEmbeddingName(request),
             count,
             "image/png",
             request.expected_dims,
-        );
+        ) catch |err| return embeddingInvocationFailure(self.runtime, self.runtime.active_provider_guard, embedder.part_request_context, err);
         const page_bytes = if (raster) 1 else @min(maximum_pdf_page_inline_png_bytes, try consumer.plans.items[1].attachment_transport.maxRawBytesForLimits("image/png".len, 1, consumer.max_bytes, std.math.maxInt(usize)));
         consumer.transform = SharedPdfTransform.init(consumer.config, caps.renderPixelLimit(raster), if (caps.image_transform) |t| t.target_width else null, if (caps.image_transform) |t| t.target_height else null, page_bytes, raster);
         consumer.enabled = true;
@@ -12229,6 +13201,7 @@ const SharedPdfWindowScheduler = struct {
             invocation: PdfWindowConsumerLease,
             guard: ForegroundCatchUpGuard,
             cancellation: CancellationToken,
+            inherited_cancellation: CancellationToken = .none,
             canceled: std.atomic.Value(bool) = .init(false),
             done: std.atomic.Value(bool) = .init(false),
             group: *WindowJobs,
@@ -12269,7 +13242,22 @@ const SharedPdfWindowScheduler = struct {
 
             fn isCanceled(raw: *const anyopaque) bool {
                 const job: *const @This() = @ptrCast(@alignCast(raw));
-                return job.canceled.load(.acquire) or job.cancellation.isCancelled() or job.guard.cancellation.isCancelled();
+                return job.canceled.load(.acquire) or job.cancellation.isCancelled() or
+                    job.inherited_cancellation.isCancelled() or job.guard.cancellation.isCancelled();
+            }
+
+            fn checkCancellation(raw: *const anyopaque) !void {
+                const job: *const @This() = @ptrCast(@alignCast(raw));
+                if (job.canceled.load(.acquire)) return error.Canceled;
+                try job.cancellation.check();
+                try job.guard.cancellation.check();
+                try job.inherited_cancellation.check();
+            }
+
+            fn invocationFailure(self: *const @This(), err: anyerror) anyerror {
+                if (!isOperationInterruption(err)) return err;
+                if (self.text) |text| checkAssetInvocationOwner(self.group.scheduler.runtime, self.guard, text.producer.invocation_context) catch |control| return control;
+                return classifyProviderCancellation(err, self.guard, isCanceled(self));
             }
 
             fn progress(_: ?*anyopaque, _: inference_request_context.Progress) void {
@@ -12283,11 +13271,15 @@ const SharedPdfWindowScheduler = struct {
                     self.group.completed.set(self.group.lane.?.io());
                 }
                 if (self.text) |*text| {
+                    checkAssetInvocationOwner(self.group.scheduler.runtime, self.guard, text.producer.invocation_context) catch |err| {
+                        self.err = err;
+                        return;
+                    };
                     text.batch = (if (text.rasters) |rasters|
                         text.producer.produceBorrowedRasterBatchReported(self.invocation.allocator(), text.requests, rasters)
                     else
                         text.producer.produceBatchReported(self.invocation.allocator(), text.requests)) catch |err| {
-                        self.err = self.invocation.mapError(err);
+                        self.err = self.invocationFailure(self.invocation.mapError(err));
                         return;
                     };
                     // Admission may be reported per item. Preserve the batch
@@ -12300,10 +13292,7 @@ const SharedPdfWindowScheduler = struct {
                     }
                     return;
                 }
-                self.output = switch (self.rendered) {
-                    .encoded => |batch| embedRenderedPdfPageBatch(self.invocation.allocator(), self.embedder, requestEmbeddingName(self.request), batch, self.request.expected_dims),
-                    .raster => |batch| embedRenderedPdfPageRasterBatch(self.invocation.allocator(), self.embedder, requestEmbeddingName(self.request), batch, self.request.expected_dims),
-                } catch |err| {
+                self.output = embedPdfWindowPart(self.group.scheduler.runtime, self.guard, self.invocation.allocator(), self.embedder, requestEmbeddingName(self.request), self.rendered, self.request.expected_dims) catch |err| {
                     self.err = self.invocation.mapError(err);
                     return;
                 };
@@ -12351,6 +13340,7 @@ const SharedPdfWindowScheduler = struct {
                 .cancellation = runtime.config.cancellation,
                 .group = self,
                 .text = .{ .producer = producer, .index = index },
+                .inherited_cancellation = producer.invocation_context.cancellation,
             };
             const alloc = job.invocation.allocator();
             const text = &job.text.?;
@@ -12381,7 +13371,12 @@ const SharedPdfWindowScheduler = struct {
                     values[i].source_fingerprint = text.fingerprint;
                 }
             }
-            text.producer = producer.withInvocationContext(.{ .io = self.lane.?.io(), .deadline_ns = job.guard.deadline_ns, .cancellation = .{ .ptr = job, .is_cancelled_fn = Job.isCanceled }, .progress = .{ .ptr = job, .update_fn = Job.progress } });
+            var context = producer.invocation_context;
+            context.io = self.lane.?.io();
+            context.deadline_ns = job.guard.nativeDeadlineNs(context.deadline_ns);
+            context.cancellation = .{ .ptr = job, .is_cancelled_fn = Job.isCanceled, .check_fn = Job.checkCancellation };
+            context.progress = .{ .ptr = job, .update_fn = Job.progress };
+            text.producer = producer.withInvocationContext(context);
             text.started_ns = runtime.clock.nowRealtimeNs();
             text.request_bytes = runtimeGeneratedTextBatchBytes(text.requests);
             if (text.rasters) |values| for (values) |raster| {
@@ -12459,7 +13454,14 @@ const SharedPdfWindowScheduler = struct {
                 },
             };
             const io = self.lane.?.io();
-            job.embedder.part_request_context = .{ .io = io, .deadline_ns = job.guard.deadline_ns, .cancellation = .{ .ptr = job, .is_cancelled_fn = Job.isCanceled }, .progress = .{ .ptr = job, .update_fn = Job.progress } };
+            const inherited = provider.part_request_context;
+            if (inherited) |context| job.inherited_cancellation = context.cancellation orelse .none;
+            var context = inherited orelse inference_request_context.RequestContext{ .io = io, .deadline_ns = null };
+            context.io = io;
+            context.deadline_ns = job.guard.nativeDeadlineNs(context.deadline_ns);
+            context.cancellation = .{ .ptr = job, .is_cancelled_fn = Job.isCanceled, .check_fn = Job.checkCancellation };
+            context.progress = .{ .ptr = job, .update_fn = Job.progress };
+            job.embedder.part_request_context = context;
             // A saturated executor keeps the same isolated job/context and
             // executes it inline; it never creates another thread pool.
             self.launch(job);
@@ -12504,7 +13506,7 @@ const SharedPdfWindowScheduler = struct {
         fn needsTextRecovery(self: *@This(), job: *const Job) bool {
             const text = job.text orelse return false;
             const err = job.err orelse return false;
-            if (isGroupAbort(err) or err == error.QueueFull) return false;
+            if (isGroupAbort(err) or err == error.QueueFull or err == error.ProviderInvocationCanceled) return false;
             if (generatedTextBatchFailureIsAttributable(.ocr, err, text.requests.len)) return true;
             return text.rasters == null and (malformedGeneratedTextBatchAllowsSequentialIsolation(err) or
                 !shouldYieldRequestError(self.scheduler.runtime, err));
@@ -12522,6 +13524,10 @@ const SharedPdfWindowScheduler = struct {
             }
             setActiveFailureFingerprint(runtime, requestFailureFingerprint(job.request));
             const text = &job.text.?;
+            checkAssetInvocationOwner(runtime, job.guard, text.producer.invocation_context) catch |err| {
+                job.err = err;
+                return;
+            };
             const alloc = job.invocation.allocator();
             var parts = std.ArrayListUnmanaged([]u8).empty;
             recoverRuntimeGeneratedTextBatch(self.scheduler.runtime, alloc, alloc, text.producer, text.requests, text.rasters, text.indices, &parts, text.units, "ocr_text", .ocr, job.consumer.config.ocr_quality, document_extraction_mod.effectiveOcrPrompt(job.consumer.config), text.fingerprint, job.err.?) catch |err| {
@@ -12547,6 +13553,17 @@ const SharedPdfWindowScheduler = struct {
                 self.count -= 1;
             }
             setActiveFailureFingerprint(runtime, requestFailureFingerprint(job.request));
+            if (publish) {
+                // Check the original owner after join, including providers
+                // that return a partial envelope instead of a control error.
+                if (job.text) |text|
+                    try checkAssetInvocationOwner(runtime, job.guard, text.producer.invocation_context)
+                else {
+                    if (job.embedder.part_request_context == null)
+                        Job.checkCancellation(job) catch |err| return if (isOperationCanceled(err)) error.EnrichmentWaitCanceled else err;
+                    try checkEmbeddingInvocationOwner(runtime, job.guard, job.embedder.part_request_context);
+                }
+            }
             if (publish) if (job.text) |*text| {
                 if (text.batch) |batch| {
                     const execution = if (batch.execution.fallback_items > 0) "serial_fallback" else if (batch.execution.native_items > 0) "native_batch" else "serial_compatibility";
@@ -12653,7 +13670,7 @@ const SharedPdfWindowScheduler = struct {
         if (!document_extraction_mod.ocrEnabledForRoute(consumer.config, "pdf")) return;
         // Custom dispatch may select a non-PDF extractor even for PDF bytes.
         if (consumer.config.routes.len != 0 or consumer.config.route_preset != .mixed_files) return;
-        const source_url = try extractAssetSourceValue(alloc, self.runtime.config, raw, request) orelse return;
+        const source_url = try extractEnrichmentSource(self.runtime, extractAssetSourceValue, alloc, raw, request) orelse return;
         defer alloc.free(source_url);
         consumer.source_identity = PreparedDocumentSourceCache.sourceIdentity(source_url);
         if (try self.textConsumerIsComplete(request, source_url, outer.config_json, consumer.config)) {
@@ -12674,7 +13691,7 @@ const SharedPdfWindowScheduler = struct {
             .content_type = "image/png",
             .inline_media_trusted = true,
         };
-        const caps = try scoped.capabilitiesForRequests(alloc, &.{prototype}) orelse return;
+        const caps = try assetProviderCapabilities(self.runtime, scoped, alloc, &.{prototype}) orelse return;
         const raster = try assetProducerBorrowedRasterBatchAvailableGuarded(self.runtime, scoped, alloc, &.{prototype});
         if (!caps.supports(.{ .image = true }) or (!raster and !caps.acceptsMimeType("image/png"))) return;
         const policy = requestGeneratedTextBatchPolicy(alloc, request);
@@ -12684,7 +13701,7 @@ const SharedPdfWindowScheduler = struct {
         const execution = try enrichment_types.parseExecutionPolicyJson(alloc, request.execution_json);
         consumer.max_pages = effectivePdfMaxDocumentPages(execution.max_document_pages, generatedPdfMaxDocumentPages());
         consumer.capabilities = caps;
-        const memory = try scoped.invocationMemoryForRequests(alloc, &.{prototype});
+        const memory = try assetProviderInvocationMemory(self.runtime, scoped, alloc, &.{prototype});
         consumer.transport = memory.attachment_transport;
         const page_bytes = if (raster) 1 else @min(maximum_pdf_page_inline_png_bytes, try memory.attachment_transport.maxRawBytesForLimits("image/png".len, 1, consumer.max_bytes, std.math.maxInt(usize)));
         consumer.config.pdf_decode_limits.max_working_set_bytes = @min(consumer.config.pdf_decode_limits.max_working_set_bytes, consumer.config.pdf_render_max_inflight_bytes);
@@ -12755,7 +13772,7 @@ const SharedPdfWindowScheduler = struct {
                 !std.mem.eql(u8, config.credentials, other.credentials) or
                 other.native_text.policy != config.native_text.policy or
                 !std.meta.eql(config.pdf_decode_limits, other.pdf_decode_limits)) continue;
-            const url = try extractAssetSourceValue(self.runtime.alloc, self.runtime.config, raw, request) orelse continue;
+            const url = try extractEnrichmentSource(self.runtime, extractAssetSourceValue, self.runtime.alloc, raw, request) orelse continue;
             defer self.runtime.alloc.free(url);
             if (std.mem.eql(u8, source_url, url)) return true;
         }
@@ -12993,11 +14010,11 @@ const SharedPdfWindowScheduler = struct {
                 cursor += 1;
             }
             if (requests.items.len == 0) continue;
-            const memory = try scoped.invocationMemoryForRequests(alloc, requests.items);
+            const memory = try assetProviderInvocationMemory(runtime, scoped, alloc, requests.items);
             const transport = if (consumer.transform.raster) media_bytes else try memory.attachment_transport.batchPeakResidentSize(media_bytes, "image/png".len, requests.items.len);
             const required = std.math.add(usize, transport -| media_bytes, memory.allocator_limit_bytes) catch return error.DocumentExtractionWorkingSetTooLarge;
             const manager = runtime.config.resource_manager orelse runtime.index_manager.resource_manager;
-            if ((consumer.transform.raster or try scoped.batchMode(alloc, requests.items) != .none) and
+            if ((consumer.transform.raster or (scoped.batchMode(alloc, requests.items) catch |err| return assetProviderFailure(runtime, scoped, err)) != .none) and
                 try jobs.submitText(consumer, index, producer, requests.items, units.items, if (consumer.transform.raster) rasters[0..requests.items.len] else null, source.fingerprint, required)) continue;
             // Legacy callbacks cannot overlap: drain controlled borrowers first.
             try jobs.flush();
@@ -13250,18 +14267,11 @@ const SharedPdfWindowScheduler = struct {
             var invocation = try PdfWindowConsumerLease.init(runtime.alloc, manager, window_lease, required);
             defer invocation.deinit();
             const alloc = invocation.allocator();
-            var output = switch (rendered) {
-                .encoded => |batch| blk: {
-                    var slice = batch;
-                    slice.results = batch.results[start..end];
-                    break :blk try embedRenderedPdfPageBatch(alloc, embedder.withPartLease(consumer.execution_lease orelse .{ .capabilities = consumer.capabilities }), embedding_name, slice, request.expected_dims);
-                },
-                .raster => |batch| blk: {
-                    var slice = batch;
-                    slice.results = batch.results[start..end];
-                    break :blk try embedRenderedPdfPageRasterBatch(alloc, embedder, embedding_name, slice, request.expected_dims);
-                },
-            };
+            var cancellation: AssetInvocationCancellation = undefined;
+            const context = scopedEmbeddingRequestContext(runtime, foregroundProviderRequestContext(runtime), embedder.part_request_context, &cancellation);
+            const scoped_embedder = embedder.withRequestContext(context).withPartLease(consumer.execution_lease orelse .{ .capabilities = consumer.capabilities });
+            var output = embedPdfWindowPart(runtime, runtime.active_provider_guard, alloc, scoped_embedder, embedding_name, job_window, request.expected_dims) catch |err|
+                return invocation.mapError(err);
             defer output.deinit(alloc);
             try self.commitEmbeddingOutput(alloc, consumer, request, source_sha, stage_id, output);
             start = end;
@@ -13669,6 +14679,8 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         wait_for_cancel: bool = false,
         prefetch_started: ?*const std.atomic.Value(bool) = null,
         worker_failure: ?anyerror = null,
+        cancel_embedder_owner: ?*std.atomic.Value(bool) = null,
+        check_sync_deadline: bool = false,
         text_calls: usize = 0,
         embed_calls: usize = 0,
         last_embed_items: usize = 0,
@@ -13769,6 +14781,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             const self: *@This() = @ptrCast(@alignCast(ptr));
             while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
             defer self.mutex.unlock();
+            if (self.worker_failure) |err| return err;
             if (std.mem.eql(u8, name, "blocked")) {
                 self.failed_calls += 1;
                 return error.EmbedRateLimited;
@@ -13800,7 +14813,11 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
                     @import("antfly_platform").time.yieldNow();
                 }
             }
-            if (self.worker_failure) |err| return err;
+            if (self.check_sync_deadline) try std.testing.expect(context.deadline_ns != null);
+            if (self.worker_failure) |err| {
+                if (self.cancel_embedder_owner) |signal| signal.store(true, .release);
+                return err;
+            }
             const deadline = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s;
             if (self.prefetch_started) |started| while (!started.load(.acquire)) {
                 try context.check();
@@ -13918,9 +14935,112 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
     const source = SharedPdfWindowScheduler.TextSource{ .config = config, .content_type = "application/pdf", .fingerprint = "content-identity", .units = &units, .indices = &.{ 0, 1 } };
     try std.testing.expectEqual(@as(usize, 1), try pdfEmbeddingWindowBatchEnd(.{ .encoded = batch }, 0, 1, 64 * 1024 * 1024, std.math.maxInt(u64), .borrowed_binary));
     try std.testing.expectEqual(@as(usize, 2), try pdfEmbeddingWindowBatchEnd(.{ .encoded = batch }, 1, 1, 64 * 1024 * 1024, std.math.maxInt(u64), .borrowed_binary));
+    {
+        const canceled_digest: [32]u8 = @splat(78);
+        var jobs = SharedPdfWindowScheduler.WindowJobs{ .scheduler = &scheduler, .primary = "{}" };
+        defer jobs.deinit();
+        harness.worker_failure = error.Canceled;
+        defer harness.worker_failure = null;
+        try std.testing.expectError(error.ProviderInvocationCanceled, scheduler.consumeEmbedding(
+            &scheduler.consumers.?[4],
+            requests[4],
+            &canceled_digest,
+            .{ .encoded = batch },
+            batch.results.len,
+            window_lease,
+            null,
+            &jobs,
+        ));
+        try std.testing.expectEqual(@as(usize, 0), jobs.count);
+    }
+    {
+        // Force a synchronous shared consumer even though the provider
+        // supports context. Its inherited owner cancels inside the call.
+        var inherited = std.atomic.Value(bool).init(false);
+        const original = runtime.config.dense_embedder.?;
+        defer runtime.config.dense_embedder = original;
+        runtime.config.dense_embedder.?.dense_embed_part_items_with_context_fn = Harness.embedWithContext;
+        runtime.config.dense_embedder.?.part_request_context = .{
+            .io = concurrencyIo(&runtime),
+            .deadline_ns = null,
+            .cancellation = CancellationToken.fromAtomic(&inherited),
+        };
+        runtime.active_provider_guard.deadline_ns = std.math.maxInt(u64);
+        defer runtime.active_provider_guard.deadline_ns = null;
+        harness.check_sync_deadline = true;
+        defer harness.check_sync_deadline = false;
+        harness.cancel_embedder_owner = &inherited;
+        defer harness.cancel_embedder_owner = null;
+        harness.worker_failure = error.Canceled;
+        defer harness.worker_failure = null;
+        const canceled_digest: [32]u8 = @splat(79);
+        var jobs = SharedPdfWindowScheduler.WindowJobs{ .scheduler = &scheduler, .primary = "{}" };
+        defer jobs.deinit();
+        try std.testing.expectError(error.EnrichmentWaitCanceled, scheduler.consumeEmbedding(
+            &scheduler.consumers.?[4],
+            requests[4],
+            &canceled_digest,
+            .{ .encoded = batch },
+            batch.results.len,
+            window_lease,
+            null,
+            &jobs,
+        ));
+        try std.testing.expect(inherited.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), jobs.count);
+    }
     const digest = @as([32]u8, @splat(7));
     const resources = runtime.config.resource_manager orelse manager.resource_manager.?;
     const before = resources.sliceStats(.document_extraction_working_set).used_bytes;
+    for ([_]anyerror{ error.EnrichmentWaitTimeout, error.EnrichmentLeaseFenceLost }) |expected| {
+        // A completed OCR result can lose authority while queued for commit.
+        const Checkpoint = struct {
+            fn poll(_: *const anyopaque) bool {
+                return false;
+            }
+            fn check(_: *const anyopaque) !void {
+                return error.EnrichmentLeaseFenceLost;
+            }
+        };
+        var jobs = SharedPdfWindowScheduler.WindowJobs{ .scheduler = &scheduler, .primary = "{}" };
+        defer jobs.deinit();
+        var empty = batch;
+        empty.results = &.{};
+        const invocation = try PdfWindowConsumerLease.initIndependent(alloc, resources, 4096);
+        const job = alloc.create(SharedPdfWindowScheduler.WindowJobs.Job) catch |err| {
+            var grant = invocation;
+            grant.deinit();
+            return err;
+        };
+        job.* = .{
+            .embedder = undefined,
+            .request = requests[1],
+            .consumer = &scheduler.consumers.?[1],
+            .source_sha = &.{},
+            .stage_id = &.{},
+            .rendered = .{ .encoded = empty },
+            .invocation = invocation,
+            .guard = .{},
+            .cancellation = .none,
+            .group = &jobs,
+            .text = .{ .producer = producer, .index = 1, .recovered = true },
+            .inherited_cancellation = if (expected == error.EnrichmentLeaseFenceLost)
+                .{ .ptr = &harness, .is_cancelled_fn = Checkpoint.poll, .check_fn = Checkpoint.check }
+            else
+                .none,
+        };
+        const Job = SharedPdfWindowScheduler.WindowJobs.Job;
+        job.text.?.producer = producer.withInvocationContext(.{
+            .deadline_ns = if (expected == error.EnrichmentWaitTimeout) 0 else null,
+            .cancellation = .{ .ptr = job, .is_cancelled_fn = Job.isCanceled, .check_fn = Job.checkCancellation },
+        });
+        jobs.jobs[0] = job;
+        jobs.count = 1;
+        try std.testing.expect(!Job.isCanceled(job));
+        try std.testing.expectError(expected, jobs.retireCompleted(&jobs.jobs[0], true));
+        try std.testing.expectEqual(@as(usize, 0), jobs.count);
+        try std.testing.expectEqual(before, resources.sliceStats(.document_extraction_working_set).used_bytes);
+    }
     {
         const execution = try PrecommitDocumentExecution.create(&runtime, requests[0..3], "{}");
         defer execution.destroy();
@@ -14186,9 +15306,9 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             rejected.done.store(true, .release);
             rejected.rendered.encoded.results = try rejected.invocation.allocator().dupe(std.meta.Elem(@TypeOf(batch.results)), batch.results);
             rejected.embedder.part_request_context = .{ .io = jobs.lane.?.io(), .deadline_ns = null };
-            harness.worker_failure = error.Canceled;
+            harness.worker_failure = error.EnrichmentWaitCanceled;
             defer harness.worker_failure = null;
-            try std.testing.expectError(error.Canceled, jobs.flush());
+            try std.testing.expectError(error.EnrichmentWaitCanceled, jobs.flush());
             try std.testing.expectEqual(@as(usize, 0), jobs.count);
         }
         for ([_]bool{ false, true }) |parallel_encoding| {
@@ -14251,12 +15371,12 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         {
             // Inline serial submission transfers ownership to the job group
             // before flush can return a fatal error. It must not free twice.
-            harness.worker_failure = error.Canceled;
+            harness.worker_failure = error.EnrichmentWaitCanceled;
             defer harness.worker_failure = null;
             var jobs = SharedPdfWindowScheduler.WindowJobs{ .scheduler = &scheduler, .primary = "{}", .serial = true };
             defer jobs.deinit();
             const failed_digest = @as([32]u8, @splat(11));
-            try std.testing.expectError(error.Canceled, scheduler.consumeEmbedding(&scheduler.consumers.?[4], requests[4], &failed_digest, .{ .encoded = batch }, 2, window_lease, null, &jobs));
+            try std.testing.expectError(error.EnrichmentWaitCanceled, scheduler.consumeEmbedding(&scheduler.consumers.?[4], requests[4], &failed_digest, .{ .encoded = batch }, 2, window_lease, null, &jobs));
             try std.testing.expectEqual(@as(usize, 0), jobs.count);
             try std.testing.expectEqual(before, resources.sliceStats(.document_extraction_working_set).used_bytes);
         }
@@ -14389,7 +15509,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         try scheduler.consumers.?[4].plans.resize(alloc, 3);
         scheduler.consumers.?[4].plans.items[2] = try Harness.partMemory(&harness, "visual", .{ .item_count = 2 }, 2, null);
         for ([_]usize{ 1, 2 }) |text_index| {
-            for ([_]?anyerror{ null, error.InvalidProducedBatchCardinality }) |failure| {
+            for ([_]?anyerror{ error.Canceled, error.Cancelled, null, error.InvalidProducedBatchCardinality }, 0..) |failure, scenario| {
                 try scheduler.cleanupSpool();
                 scheduler.consumers.?[1].enabled = text_index == 1;
                 scheduler.consumers.?[2].enabled = text_index == 2;
@@ -14403,7 +15523,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
                 harness.owner_released.store(false, .release);
                 const text_before = harness.text_calls;
                 const embed_before = harness.embed_calls;
-                const fresh_digest = @as([32]u8, @splat(@intCast(20 + text_index * 2 + @intFromBool(failure != null))));
+                const fresh_digest = @as([32]u8, @splat(@intCast(20 + text_index * 4 + scenario)));
                 var fresh_units = [_]document_extraction_mod.Unit{
                     try cloneDocumentExtractionUnit(alloc, .{ .unit_id = @constCast("page:000001"), .unit_type = @constCast("page"), .text = @constCast(""), .method = @constCast("pdf_text"), .page_number = 1, .extraction_status = @constCast("pending_ocr") }),
                     try cloneDocumentExtractionUnit(alloc, .{ .unit_id = @constCast("page:000002"), .unit_type = @constCast("page"), .text = @constCast(""), .method = @constCast("pdf_text"), .page_number = 2, .extraction_status = @constCast("pending_ocr") }),
@@ -14418,6 +15538,15 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
                 try std.testing.expect(try scheduler.drainOwnerAdmission(error.QueueFull));
                 try std.testing.expect(!try scheduler.drainOwnerAdmission(error.QueueFull));
                 try SharedPdfWindowScheduler.WindowWork.finish(&work);
+                if (failure != null and isOperationCanceled(failure.?)) {
+                    const captured = scheduler.failure(text_index) orelse return error.TestUnexpectedResult;
+                    try std.testing.expectEqual(error.ProviderInvocationCanceled, captured.cause);
+                    try std.testing.expectEqual(text_before, harness.text_calls);
+                    try std.testing.expectEqual(embed_before + 1, harness.embed_calls);
+                    try std.testing.expectEqual(before, resources.sliceStats(.document_extraction_working_set).used_bytes);
+                    consumer.err = null;
+                    continue;
+                }
                 try std.testing.expect(consumer.err == null);
                 try std.testing.expect(scheduler.consumers.?[4].err == null);
                 try std.testing.expectEqual(text_before + 2, harness.text_calls);
@@ -14949,9 +16078,19 @@ const DocumentPreparationPipeline = struct {
         }
         fn isCancelled(ptr: *const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(ptr));
-            self.context.active_provider_guard.check() catch return true;
-            return self.cancel.load(.acquire) or self.context.config.cancellation.isCancelled() or self.producer.invocation_context.cancellation.isCancelled();
+            const guard = self.context.active_provider_guard;
+            if (guard.deadline_ns) |deadline| if (guard.clock.nowRealtimeNs() >= deadline) return true;
+            return self.cancel.load(.acquire) or pollSourceCancellation(guard.cancellation) or
+                pollSourceCancellation(self.context.config.cancellation) or pollSourceCancellation(self.producer.invocation_context.cancellation);
         }
+        fn checkCancellation(ptr: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            if (self.cancel.load(.acquire)) return error.Canceled;
+            try self.context.active_provider_guard.check();
+            try self.context.config.cancellation.check();
+            try self.producer.invocation_context.cancellation.check();
+        }
+
         fn probeCancelled(ptr: ?*const anyopaque) bool {
             return isCancelled(ptr orelse return true);
         }
@@ -14977,7 +16116,7 @@ const DocumentPreparationPipeline = struct {
             try self.units.append(self.allocator(), owned);
         }
         fn checkInvocation(self: *@This(), producer: asset_producer_mod.Producer, requests: []const asset_producer_mod.Request) !void {
-            if (isCancelled(self)) return error.Canceled;
+            try checkCancellation(self);
             if (self.context.provider_admission) |runtime| {
                 if (comptime builtin.os.tag != .freestanding) {
                     if (runtime.shutdown_requested.load(.acquire)) return error.EnrichmentRetryAborted;
@@ -14986,8 +16125,12 @@ const DocumentPreparationPipeline = struct {
             }
             // Speculation always needs cooperative teardown, even for durable
             // replay with no caller deadline. Never dispatch a legacy callback.
-            if (!try producer.foregroundBoundedForRequests(self.allocator(), requests)) return error.UnboundedEnrichmentProvider;
-            if (isCancelled(self)) return error.Canceled;
+            const bounded = producer.foregroundBoundedForRequests(self.allocator(), requests) catch |err| {
+                try checkCancellation(self);
+                return assetProviderFailure(&self.context, producer, err);
+            };
+            if (!bounded) return error.UnboundedEnrichmentProvider;
+            try checkCancellation(self);
         }
         fn checkDiscovery(self: *@This(), producer: asset_producer_mod.Producer, requests: []const asset_producer_mod.Request) !void {
             try self.checkInvocation(producer, requests);
@@ -14997,24 +16140,27 @@ const DocumentPreparationPipeline = struct {
                 return error.UnboundedEnrichmentProvider;
         }
         fn prepare(self: *@This()) !void {
-            if (isCancelled(self)) return error.Canceled;
+            try checkCancellation(self);
             var cancellation: AssetInvocationCancellation = undefined;
             var context = self.producer.invocation_context;
-            context.cancellation = .{ .ptr = self, .is_cancelled_fn = isCancelled };
+            context.cancellation = .{ .ptr = self, .is_cancelled_fn = isCancelled, .check_fn = checkCancellation };
             context.progress = null;
             context.document_checkpoints = null;
             const producer = scopedAssetProducer(&self.context, self.producer.withInvocationContext(context), &cancellation);
             const a = self.allocator();
-            if (isCancelled(self)) return error.Canceled;
-            const fetched = try self.cache.fetch(self.source_url, if (self.config.credentials.len > 0) self.config.credentials else null, remoteRenderConfig(self.context.config.secret_store, &self.remote_config, self.context.config.io, CancellationToken{ .ptr = self, .is_cancelled_fn = isCancelled }, null, null));
+            try checkCancellation(self);
+            var fetch_config = remoteRenderConfig(self.context.config.secret_store, &self.remote_config, self.context.config.io, .{ .ptr = self, .is_cancelled_fn = isCancelled }, null, null);
+            fetch_config.deadline_ns = producer.invocation_context.deadline_ns;
+            const fetched = try self.cache.fetchControlled(self.source_url, if (self.config.credentials.len > 0) self.config.credentials else null, fetch_config, producer.invocation_context.cancellation);
             self.source = switch (fetched) {
                 .ok => |lease| lease,
                 .http_error => return,
             };
+            try producer.invocation_context.check();
             const entry = self.source.?.entry();
             try document_extraction_mod.verifyChecksumDigest(self.config, &entry.content_sha256);
             if (!document_extraction_mod.resolvesToPdf(self.config, self.source_url, entry.content.content_type, entry.content.data)) return;
-            self.pdf = try self.cache.preparePdf(&self.source.?, self.config.pdf_decode_limits, self.context.timeout_ms);
+            self.pdf = try self.cache.preparePdf(&self.source.?, self.config.pdf_decode_limits, self.context.timeout_ms, producer.invocation_context);
             self.fingerprint = try a.dupe(u8, &entry.content_fingerprint);
             const coordinator = try RuntimePdfOcrCoordinator.createFromPrepared(a, platform.allocator.concurrentFallback(), self.context.config.resource_manager orelse self.context.index_manager.resource_manager, self.context.timeout_ms, self.config, self.pdf.?.session());
             defer coordinator.destroy();
@@ -15024,8 +16170,8 @@ const DocumentPreparationPipeline = struct {
             if (self.units.items.len == 0) return;
             const prototype = asset_producer_mod.Request{ .producer_type = document_extraction_mod.ocrProducerType(self.config), .config_json = document_extraction_mod.effectiveOcrConfigJson(self.config), .source_text = "", .content_type = "image/png", .inline_media_trusted = true, .media = &.{.{ .bytes = "", .mime_type = "image/png" }} };
             try self.checkDiscovery(producer, &.{prototype});
-            self.raster = try producer.borrowedRasterBatchAvailable(a, &.{prototype});
-            if (try producer.capabilitiesForRequests(a, &.{prototype})) |cap| {
+            self.raster = producer.borrowedRasterBatchAvailable(a, &.{prototype}) catch |err| return assetProviderFailure(&self.context, producer, err);
+            if (try assetProviderCapabilities(&self.context, producer, a, &.{prototype})) |cap| {
                 self.capabilities = cap;
                 if (!cap.supports(.{ .image = true }) or (!self.raster and !cap.acceptsMimeType("image/png"))) return;
                 self.policy.max_items = @min(self.policy.max_items, cap.batch.max_items);
@@ -15098,7 +16244,7 @@ const DocumentPreparationPipeline = struct {
                 const executor = producer.withInvocationContext(execution_context);
                 var produced = if (self.raster) try executor.produceBorrowedRasterBatchReported(a, &.{request}, &rasters) else try executor.produceBatchReported(a, &.{request});
                 defer produced.deinit(a);
-                if (isCancelled(self)) return error.Canceled;
+                try checkCancellation(self);
                 try produced.validateForRequests(&.{request});
                 const executed_revision = produced.executed_model_revision orelse return;
                 if (!std.mem.eql(u8, &expected_revision, &executed_revision)) return;
@@ -15235,12 +16381,15 @@ const DocumentPreparationPipeline = struct {
                 job.units.items.len == 0 or !std.mem.eql(u8, job.units.items[0].unit_id, units[0].unit_id) or job.units.items[0].page_number != units[0].page_number) continue;
             var cancellation: AssetInvocationCancellation = undefined;
             const scoped = scopedAssetProducer(self.runtime, producer, &cancellation);
+            try checkAssetInvocationOwner(self.runtime, self.runtime.active_provider_guard, scoped.invocation_context);
+            Job.checkCancellation(job) catch continue;
+            job.producer.invocation_context.check() catch continue;
             const prototype = asset_producer_mod.Request{ .producer_type = document_extraction_mod.ocrProducerType(config), .config_json = document_extraction_mod.effectiveOcrConfigJson(config), .source_text = "", .content_type = "image/png", .inline_media_trusted = true };
-            const current = try scoped.capabilitiesForRequests(alloc, &.{prototype}) orelse continue;
+            const current = try assetProviderCapabilities(self.runtime, scoped, alloc, &.{prototype}) orelse continue;
             if (job.capabilities == null or !std.meta.eql(job.capabilities.?, current)) continue;
             // Allocate before replacing the owner's unit. No partial metadata
             // transfer can authorize a source, retry or publication transition.
-            const replacement = cloneDocumentExtractionUnit(alloc, job.units.items[0]) catch |err| {
+            var replacement = cloneDocumentExtractionUnit(alloc, job.units.items[0]) catch |err| {
                 if (err != error.OutOfMemory) return err;
                 // Copying optional cached output must not turn foreground
                 // memory pressure into document/provider failure. No unit has
@@ -15250,6 +16399,8 @@ const DocumentPreparationPipeline = struct {
                 pipeline_metrics.prefetch(.reclaimed);
                 return false;
             };
+            errdefer replacement.deinit(alloc);
+            try checkAssetInvocationOwner(self.runtime, self.runtime.active_provider_guard, scoped.invocation_context);
             units[0].deinit(alloc);
             units[0] = replacement;
             job.consumed = true;
@@ -15332,7 +16483,7 @@ const DocumentPreparationPipeline = struct {
             defer self.runtime.alloc.free(source_key);
             const raw = try storeGetOptionalDocumentAllocWithRetry(self.runtime, source_key) orelse continue;
             defer self.runtime.alloc.free(raw);
-            const url = try extractAssetSourceValue(self.runtime.alloc, self.runtime.config, raw, request) orelse continue;
+            const url = try extractEnrichmentSource(self.runtime, extractAssetSourceValue, self.runtime.alloc, raw, request) orelse continue;
             defer self.runtime.alloc.free(@constCast(url));
             const current_key = try documentSourceStoreKeyAlloc(self.runtime, current.doc_key);
             defer self.runtime.alloc.free(current_key);
@@ -15350,7 +16501,7 @@ const DocumentPreparationPipeline = struct {
             }
             if (!compatible) continue;
             if (current_raw) |v| {
-                const current_url = try extractAssetSourceValue(self.runtime.alloc, self.runtime.config, v, request);
+                const current_url = try extractEnrichmentSource(self.runtime, extractAssetSourceValue, self.runtime.alloc, v, request);
                 defer if (current_url) |u| self.runtime.alloc.free(@constCast(u));
                 if (current_url) |u| if (std.mem.eql(u8, u, url)) continue;
             }
@@ -15498,7 +16649,8 @@ const PreparedDocumentSourceCache = struct {
     pending_pdfs: std.ArrayListUnmanaged(PendingPdf) = .empty,
     io: Io,
     mutex: Io.Mutex = .init,
-    drained: Io.Condition = .init,
+    drained: @import("antfly_platform").sync.BroadcastCondition = .{},
+    active_waiters: usize = 0,
     allocator_mutex: std.atomic.Mutex = .unlocked,
     shutting_down: bool = false,
     active_borrows: usize = 0,
@@ -15645,12 +16797,13 @@ const PreparedDocumentSourceCache = struct {
         self.clearMedia();
         self.mutex.lockUncancelable(self.io);
         self.shutting_down = true;
+        self.drained.broadcast(self.io);
         self.mutex.unlock(self.io);
         // Retire callbacks before destroying their context; never wait for a
         // ResourceManager callback while holding either of this cache's locks.
         if (self.budgeted) |*budgeted| budgeted.reservation.manager.unregisterReclaimer(self.reclaimer_id);
         self.mutex.lockUncancelable(self.io);
-        while (self.active_borrows != 0 or self.active_preparations != 0)
+        while (self.active_borrows != 0 or self.active_preparations != 0 or self.active_waiters != 0)
             self.drained.waitUncancelable(self.io, &self.mutex);
         const alloc = self.allocator();
         std.debug.assert(self.pending_sources.items.len == 0);
@@ -15758,15 +16911,79 @@ const PreparedDocumentSourceCache = struct {
         return false;
     }
 
+    const PreparationPoll = struct {
+        interval_ns: u64 = 10 * std.time.ns_per_ms,
+        next_ns: u64 = 0,
+    };
+
+    fn waitForPreparationAssumeLocked(self: *@This(), owner: asset_producer_mod.InvocationContext, poll: *PreparationPoll) !void {
+        self.active_waiters += 1;
+        defer {
+            self.active_waiters -= 1;
+            if (self.shutting_down and self.active_waiters == 0) self.drained.broadcast(self.io);
+        }
+        if (owner.deadline_ns == null and owner.cancellation.ptr == null) {
+            self.drained.waitUncancelable(self.io, &self.mutex);
+            return;
+        }
+        // Wake immediately on completion. External cancellation tokens do
+        // not signal this condition, so sample them only on contended waits.
+        const now = platform_time.monotonicNs();
+        if (poll.next_ns == 0) poll.next_ns = now +| poll.interval_ns;
+        const wake_at = @min(owner.deadline_ns orelse poll.next_ns, poll.next_ns);
+        self.drained.waitTimeout(self.io, &self.mutex, .{ .duration = .{ .clock = .awake, .raw = .fromNanoseconds(wake_at -| now) } }) catch return error.EnrichmentWaitCanceled;
+        const woke_at = platform_time.monotonicNs();
+        if (woke_at >= poll.next_ns) {
+            poll.interval_ns = @min(poll.interval_ns * 2, 100 * std.time.ns_per_ms);
+            if (owner.cancellation.check_fn != null) try self.recheckWaitingOwnerAssumeLocked(owner);
+            poll.next_ns = platform_time.monotonicNs() +| poll.interval_ns;
+        }
+    }
+
+    fn recheckWaitingOwnerAssumeLocked(self: *@This(), owner: asset_producer_mod.InvocationContext) !void {
+        // Keep the cache alive while dropping the mutex. Recheck before
+        // claiming the flight so a checkpoint can re-enter the same key.
+        self.active_waiters += 1;
+        self.mutex.unlock(self.io);
+        defer {
+            self.mutex.lockUncancelable(self.io);
+            self.active_waiters -= 1;
+            if (self.shutting_down and self.active_waiters == 0) self.drained.broadcast(self.io);
+        }
+        try checkPreparedSourceOwner(owner);
+    }
+
     fn fetch(
         self: *@This(),
         source_url: []const u8,
         credential_name: ?[]const u8,
         config: template_remote.RenderConfig,
     ) !FetchOutcome {
+        return self.fetchControlled(source_url, credential_name, config, null);
+    }
+
+    fn fetchControlled(
+        self: *@This(),
+        source_url: []const u8,
+        credential_name: ?[]const u8,
+        config: template_remote.RenderConfig,
+        cancellation: ?CancellationToken,
+    ) !FetchOutcome {
         const identity = sourceIdentity(source_url);
+        var owner: asset_producer_mod.InvocationContext = .{ .deadline_ns = config.deadline_ns };
+        if (comptime @hasField(template_remote.RenderConfig, "cancellation")) {
+            if (config.cancellation) |token| owner.cancellation = .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn };
+        }
+        if (cancellation) |token| owner.cancellation = token;
+        try checkPreparedSourceOwner(owner);
+        var poll: PreparationPoll = .{};
+        var waited = false;
+        self.mutex.lockUncancelable(self.io);
         while (true) {
-            self.mutex.lockUncancelable(self.io);
+            checkPreparedSourcePoll(owner) catch |err| {
+                self.mutex.unlock(self.io);
+                return err;
+            };
             if (self.shutting_down) {
                 self.mutex.unlock(self.io);
                 return error.PreparedDocumentCacheShuttingDown;
@@ -15781,11 +16998,22 @@ const PreparedDocumentSourceCache = struct {
                     return err;
                 };
                 self.mutex.unlock(self.io);
-                return .{ .ok = lease };
+                return checkedFetchOutcome(owner, .{ .ok = lease });
             }
             if (self.sourcePendingAssumeLocked(identity, credential_name)) {
-                self.drained.waitUncancelable(self.io, &self.mutex);
-                self.mutex.unlock(self.io);
+                self.waitForPreparationAssumeLocked(owner, &poll) catch |err| {
+                    self.mutex.unlock(self.io);
+                    return err;
+                };
+                waited = true;
+                continue;
+            }
+            if (waited) {
+                self.recheckWaitingOwnerAssumeLocked(owner) catch |err| {
+                    self.mutex.unlock(self.io);
+                    return err;
+                };
+                waited = false;
                 continue;
             }
             const owned_credential = if (credential_name) |value|
@@ -15816,12 +17044,7 @@ const PreparedDocumentSourceCache = struct {
         const alloc = self.allocator();
         const fetch_timer = pipeline_metrics.start(.source_fetch);
         defer fetch_timer.finish();
-        const fetched = template_remote.downloadRemoteContentOutcomeAllocWithRenderConfig(
-            alloc,
-            config,
-            source_url,
-            credential_name,
-        );
+        const fetched = template_remote.downloadRemoteContentOutcomeAllocWithRenderConfig(alloc, config, source_url, credential_name);
         if (fetched) |outcome| switch (outcome) {
             .http_error => |http_error| {
                 self.mutex.lockUncancelable(self.io);
@@ -15829,7 +17052,7 @@ const PreparedDocumentSourceCache = struct {
                 const shutting_down = self.shutting_down;
                 self.mutex.unlock(self.io);
                 if (shutting_down) return error.PreparedDocumentCacheShuttingDown;
-                return .{ .http_error = http_error };
+                return checkedFetchOutcome(owner, .{ .http_error = http_error });
             },
             .ok => |content| {
                 // Content hashing is proportional to source size and therefore
@@ -15863,13 +17086,14 @@ const PreparedDocumentSourceCache = struct {
                 };
                 self.finishPendingSourceAssumeLocked(identity, credential_name);
                 self.mutex.unlock(self.io);
-                return .{ .ok = lease };
+                return checkedFetchOutcome(owner, .{ .ok = lease });
             },
         } else |err| {
             self.mutex.lockUncancelable(self.io);
             self.finishPendingSourceAssumeLocked(identity, credential_name);
             self.mutex.unlock(self.io);
-            return err;
+            try checkPreparedSourceOwner(owner);
+            return classifyProviderCancellation(err, .{}, false);
         }
     }
 
@@ -15991,12 +17215,20 @@ const PreparedDocumentSourceCache = struct {
         source: *const PreparedSourceLease,
         decode_limits: document_extraction_mod.PdfDecodeLimits,
         timeout_ms: u64,
+        owner: asset_producer_mod.InvocationContext,
     ) !PreparedPdfLease {
         if (source.cache != self or source.entry_ptr == null)
             return error.InvalidPreparedDocumentSourceLease;
         const entry = source.entry();
+        try checkPreparedSourceOwner(owner);
+        var poll: PreparationPoll = .{};
+        var waited = false;
+        self.mutex.lockUncancelable(self.io);
         while (true) {
-            self.mutex.lockUncancelable(self.io);
+            checkPreparedSourcePoll(owner) catch |err| {
+                self.mutex.unlock(self.io);
+                return err;
+            };
             if (self.shutting_down) {
                 self.mutex.unlock(self.io);
                 return error.PreparedDocumentCacheShuttingDown;
@@ -16011,11 +17243,22 @@ const PreparedDocumentSourceCache = struct {
                     return err;
                 };
                 self.mutex.unlock(self.io);
-                return lease;
+                return checkedPdfOutcome(owner, lease);
             }
             if (self.pdfPendingAssumeLocked(entry, decode_limits)) {
-                self.drained.waitUncancelable(self.io, &self.mutex);
-                self.mutex.unlock(self.io);
+                self.waitForPreparationAssumeLocked(owner, &poll) catch |err| {
+                    self.mutex.unlock(self.io);
+                    return err;
+                };
+                waited = true;
+                continue;
+            }
+            if (waited) {
+                self.recheckWaitingOwnerAssumeLocked(owner) catch |err| {
+                    self.mutex.unlock(self.io);
+                    return err;
+                };
+                waited = false;
                 continue;
             }
             self.pending_pdfs.append(@import("antfly_platform").allocator.concurrentFallback(), .{
@@ -16044,16 +17287,16 @@ const PreparedDocumentSourceCache = struct {
         };
         variant.* = .{ .entry = entry, .decode_limits = decode_limits };
         variant.deadline = document_extraction_mod.PdfRenderDeadline.init(timeout_ms);
+        if (owner.deadline_ns != null or owner.cancellation.ptr != null)
+            variant.deadline.owner = .{ .context = &owner, .is_cancelled_fn = preparedSourceOwnerCanceled };
         const prepare_timer = pipeline_metrics.start(.pdf_prepare);
         defer prepare_timer.finish();
-        const prepared = self.prepare_pdf_session_fn(
-            alloc,
-            entry.content.data,
-            decode_limits,
-            &variant.deadline,
-        );
+        const prepared = self.prepare_pdf_session_fn(alloc, entry.content.data, decode_limits, &variant.deadline);
         if (prepared) |session| {
             variant.session = session;
+            // A retained parser must never refer to the preparing caller.
+            variant.session.?.setCancellationProbe(.{});
+            variant.deadline.owner = .{};
             self.mutex.lockUncancelable(self.io);
             if (self.shutting_down) {
                 variant.session.?.deinit();
@@ -16079,13 +17322,14 @@ const PreparedDocumentSourceCache = struct {
             };
             self.finishPendingPdfAssumeLocked(entry, decode_limits);
             self.mutex.unlock(self.io);
-            return lease;
+            return checkedPdfOutcome(owner, lease);
         } else |err| {
-            const classified = self.classifyPreparationError(err);
+            const classified = self.classifyPreparationError(variant.deadline.classifyError(err));
             alloc.destroy(variant);
             self.mutex.lockUncancelable(self.io);
             self.finishPendingPdfAssumeLocked(entry, decode_limits);
             self.mutex.unlock(self.io);
+            try checkPreparedSourceOwner(owner);
             return classified;
         }
     }
@@ -16221,6 +17465,49 @@ const PreparedDocumentSourceCache = struct {
         return digest;
     }
 };
+
+fn checkedFetchOutcome(owner: asset_producer_mod.InvocationContext, outcome: PreparedDocumentSourceCache.FetchOutcome) !PreparedDocumentSourceCache.FetchOutcome {
+    errdefer if (outcome == .ok) {
+        var lease = outcome.ok;
+        lease.deinit();
+    };
+    try checkPreparedSourceOwner(owner);
+    return outcome;
+}
+
+fn checkedPdfOutcome(owner: asset_producer_mod.InvocationContext, lease: PreparedDocumentSourceCache.PreparedPdfLease) !PreparedDocumentSourceCache.PreparedPdfLease {
+    var result = lease;
+    errdefer result.deinit();
+    try checkPreparedSourceOwner(owner);
+    return result;
+}
+
+/// Polling must not fall back to a token's authoritative checkpoint.
+fn pollSourceCancellation(token: CancellationToken) bool {
+    const ptr = token.ptr orelse return false;
+    const poll = token.is_cancelled_fn orelse return false;
+    return poll(ptr);
+}
+
+fn checkPreparedSourcePoll(owner: asset_producer_mod.InvocationContext) !void {
+    if (owner.deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.EnrichmentWaitTimeout;
+    if (pollSourceCancellation(owner.cancellation)) return error.EnrichmentWaitCanceled;
+}
+
+fn checkPreparedSourceOwner(owner: asset_producer_mod.InvocationContext) !void {
+    if (owner.deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.EnrichmentWaitTimeout;
+    owner.cancellation.check() catch |err| return callerCheckpointFailure(err);
+}
+
+fn preparedSourceOwnerCanceled(ptr: ?*const anyopaque) bool {
+    const owner: *const asset_producer_mod.InvocationContext = @ptrCast(@alignCast(ptr orelse return true));
+    checkPreparedSourcePoll(owner.*) catch return true;
+    return false;
+}
+
+fn pdfPreparationOwner(runtime: *EnrichmentRuntime, cancellation: *const EnrichmentSourceCancellation) asset_producer_mod.InvocationContext {
+    return .{ .deadline_ns = runtime.active_provider_guard.nativeDeadlineNs(null), .cancellation = cancellation.token() };
+}
 
 fn sourceContentFingerprintFromDigest(digest: [std.crypto.hash.sha2.Sha256.digest_length]u8) [16]u8 {
     const content_hex = std.fmt.bytesToHex(digest, .lower);
@@ -16397,6 +17684,80 @@ test "prepared document source cache accounts retained bytes through eviction" {
     try std.testing.expectEqual(@as(usize, 0), cache.retainedSourceBytes());
 }
 
+test "prepared document cache detaches a timed-out waiter without canceling the flight" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const url = "https://example.test/pending.pdf";
+    var cache = PreparedDocumentSourceCache{ .backing_alloc = a, .budgeted = null, .io = std.testing.io };
+    defer cache.deinit();
+    const concurrent = platform.allocator.concurrentFallback();
+    try cache.pending_sources.append(concurrent, .{ .source_identity = PreparedDocumentSourceCache.sourceIdentity(url), .credential_name = null });
+    const outcome = cache.fetch(url, null, .{ .deadline_ns = platform_time.monotonicNs() + 20 * std.time.ns_per_ms });
+    try std.testing.expectEqual(@as(usize, 1), cache.pending_sources.items.len);
+    _ = cache.pending_sources.pop();
+    try std.testing.expectError(error.EnrichmentWaitTimeout, outcome);
+    var source = try cache.adoptOwned(url, null, .{ .content_type = try a.dupe(u8, "application/pdf"), .data = try a.dupe(u8, "%PDF-pending") });
+    defer source.deinit();
+    const limits = document_extraction_mod.PdfDecodeLimits{};
+    try cache.pending_pdfs.append(concurrent, .{ .entry = source.entry(), .decode_limits = limits });
+    const prepared = cache.preparePdf(&source, limits, 1_000, .{ .deadline_ns = platform_time.monotonicNs() + 20 * std.time.ns_per_ms });
+    try std.testing.expectEqual(@as(usize, 1), cache.pending_pdfs.items.len);
+    _ = cache.pending_pdfs.pop();
+    try std.testing.expectError(error.EnrichmentWaitTimeout, prepared);
+    try std.testing.expectEqual(@as(usize, 0), cache.active_waiters);
+    try std.testing.expectEqual(@as(usize, 0), cache.pdf_preparation_computations);
+    try std.testing.expectError(error.EnrichmentWaitTimeout, checkedFetchOutcome(.{ .deadline_ns = 0 }, .{ .http_error = .{ .status = 404, .message = "not found" } }));
+    const late = (try cache.lookup(url, null)).?;
+    try std.testing.expectEqual(@as(usize, 2), cache.active_borrows);
+    try std.testing.expectError(error.EnrichmentWaitTimeout, checkedFetchOutcome(.{ .deadline_ns = 0 }, .{ .ok = late }));
+    try std.testing.expectEqual(@as(usize, 1), cache.active_borrows);
+
+    const Probe = struct {
+        cache: *PreparedDocumentSourceCache,
+        checks: usize = 0,
+        fn check(ptr: *const anyopaque) !void {
+            const probe: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            try std.testing.expect(probe.cache.mutex.tryLock());
+            probe.cache.mutex.unlock(probe.cache.io);
+            probe.checks += 1;
+            if (probe.checks == 2) return error.DeadlineExceeded;
+        }
+    };
+    var probe = Probe{ .cache = &cache };
+    const control = EnrichmentSourceCancellation{ .lifecycle = .none, .guard = .{ .cancellation = .{ .ptr = &probe, .check_fn = Probe.check } } };
+    try std.testing.expect(!control.token().isCancelled());
+    try std.testing.expectEqual(@as(usize, 0), probe.checks);
+    try std.testing.expectError(error.EnrichmentWaitTimeout, cache.fetchControlled(url, null, .{}, control.token()));
+    try std.testing.expectEqual(@as(usize, 2), probe.checks);
+    try std.testing.expectEqual(@as(usize, 1), cache.active_borrows);
+
+    // Leave each flight pending for the duration of the wait. A separate
+    // deadline only bounds the regression when the checkpoint is bypassed.
+    const pending_url = "https://example.test/another-pending.pdf";
+    {
+        try cache.pending_sources.append(concurrent, .{ .source_identity = PreparedDocumentSourceCache.sourceIdentity(pending_url), .credential_name = null });
+        defer _ = cache.pending_sources.pop();
+        probe.checks = 0;
+        try std.testing.expectError(error.EnrichmentWaitTimeout, cache.fetchControlled(pending_url, null, .{
+            .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
+        }, .{ .ptr = &probe, .check_fn = Probe.check }));
+        try std.testing.expectEqual(@as(usize, 2), probe.checks);
+        try std.testing.expectEqual(@as(usize, 1), cache.pending_sources.items.len);
+    }
+    {
+        try cache.pending_pdfs.append(concurrent, .{ .entry = source.entry(), .decode_limits = limits });
+        defer _ = cache.pending_pdfs.pop();
+        probe.checks = 0;
+        try std.testing.expectError(error.EnrichmentWaitTimeout, cache.preparePdf(&source, limits, 1_000, .{
+            .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
+            .cancellation = control.token(),
+        }));
+        try std.testing.expectEqual(@as(usize, 2), probe.checks);
+        try std.testing.expectEqual(@as(usize, 1), cache.pending_pdfs.items.len);
+    }
+    try std.testing.expectEqual(@as(usize, 0), cache.active_waiters);
+}
+
 test "prepared document cache single-flights concurrent PDF variants and drains leases" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
@@ -16436,7 +17797,7 @@ test "prepared document cache single-flights concurrent PDF variants and drains 
             var prepared = self.cache.preparePdf(&source, .{
                 .max_decoded_stream_bytes = 1024,
                 .max_working_set_bytes = 2048,
-            }, 1_000) catch |err| {
+            }, 1_000, .{}) catch |err| {
                 self.errors[index] = err;
                 return;
             };
@@ -16534,7 +17895,7 @@ test "prepared document cache prepares unrelated PDF keys concurrently" {
             var prepared = self.cache.preparePdf(&source, .{
                 .max_decoded_stream_bytes = 1024,
                 .max_working_set_bytes = 2048,
-            }, 1_000) catch |err| {
+            }, 1_000, .{}) catch |err| {
                 self.err = err;
                 return;
             };
@@ -16745,7 +18106,7 @@ fn processPendingDocumentGroup(
                 try failed_artifacts.put(runtime.alloc, requestArtifactName(request), err);
             continue;
         }
-        if (try skipPersistedRequestFailure(runtime, window, request)) {
+        if (try resumePersistedDocumentRequestFailure(runtime, window, request)) {
             if (request.kind == .asset or request.kind == .chunk_text)
                 try failed_artifacts.put(runtime.alloc, requestArtifactName(request), error.ArtifactDependencyFailed);
             continue;
@@ -16798,6 +18159,9 @@ fn processPendingDocumentGroup(
         switch (request.kind) {
             .asset => {
                 const succeeded = processPlannedAsset(runtime, request, planned[request_index + 1 ..], deferred_assets, prepared_sources, window) catch |err| {
+                    // Scanner publication clears its active identity on failure.
+                    // Do not reinstall the document owner on the scoped retry path.
+                    if (runtime.active_failure_fingerprint == 0) return err;
                     if (try scheduleScannerRetry(runtime, request, err)) {
                         try delayed_artifacts.put(runtime.alloc, if (request.kind == .dense_embedding or request.kind == .sparse_embedding) requestEmbeddingName(request) else requestArtifactName(request), {});
                         continue;
@@ -16822,7 +18186,8 @@ fn processPendingDocumentGroup(
                 continue;
             },
             .dense_embedding => {
-                processDenseEmbedding(runtime, request, chunk_cache, prepared_sources, window) catch |err| {
+                var media_selection: ?MediaEmbeddingSelection = null;
+                processDenseEmbedding(runtime, request, chunk_cache, prepared_sources, window, &media_selection) catch |err| {
                     if (try scheduleScannerRetry(runtime, request, err)) {
                         try delayed_artifacts.put(runtime.alloc, if (request.kind == .dense_embedding or request.kind == .sparse_embedding) requestEmbeddingName(request) else requestArtifactName(request), {});
                         continue;
@@ -16832,7 +18197,10 @@ fn processPendingDocumentGroup(
                     try recordIsolatedRequestError(runtime, window, request, err);
                     continue;
                 };
-                if (requestHasChunkSource(request)) try retireMediaPassForDenseRequest(runtime, request);
+                if (requestHasChunkSource(request)) retireMediaPassForDenseRequest(runtime, request, .{ .completed = media_selection }) catch |err| {
+                    if (!isEnrichmentControlError(err)) setActiveFailureFingerprint(runtime, 0);
+                    return err;
+                };
             },
             .sparse_embedding => processSparseEmbedding(runtime, request, chunk_cache, window) catch |err| {
                 if (try scheduleScannerRetry(runtime, request, err)) {
@@ -16895,7 +18263,7 @@ const AssetExecutionLane = struct {
             // identity travels in `scope`; the pipeline installs it.
             return err;
         }
-        if (self.group) |group| try saveReplayCursorForGroup(self.runtime, .assets, self.applied_sequence, self.cursor_config_hash, self.replay_generation, group);
+        if (self.group) |group| saveReplayCursorForGroup(self.runtime, .assets, self.applied_sequence, self.cursor_config_hash, self.replay_generation, group) catch |err| return FailureScope.assetPublicationFailure(&self.scope, err);
     }
 
     pub fn deinitOwned(self: *AssetExecutionLane) void {
@@ -16928,6 +18296,7 @@ const DenseExecutionLane = struct {
     replay_generation: ?u64 = null,
     /// This quantum's failure identity; see `FailureScope`.
     scope: FailureScope = .{},
+    media_embedding_selections: []?MediaEmbeddingSelection = &.{},
 
     fn run(self: *DenseExecutionLane) anyerror!void {
         if (runtimeShuttingDown(self.runtime)) return error.EnrichmentRetryAborted;
@@ -16943,6 +18312,9 @@ const DenseExecutionLane = struct {
         try self.scope.publish(self.runtime, &self.window, true);
         if (runtimeShuttingDown(self.runtime)) return error.EnrichmentRetryAborted;
         if (self.chunked_dense.len > 0) {
+            self.media_embedding_selections = try self.runtime.alloc.alloc(?MediaEmbeddingSelection, self.chunked_dense.len);
+            @memset(self.media_embedding_selections, null);
+            self.scope.media_embedding_selections = self.media_embedding_selections;
             processChunkedDenseWindow(self.runtime, self.chunked_dense, self.chunk_cache, &self.window, &self.scope) catch |err| {
                 if (self.scope.publication_failed) return err;
                 if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
@@ -16954,12 +18326,21 @@ const DenseExecutionLane = struct {
         // A deferred retry's identity travels in `scope`; the pipeline
         // installs it on the scanner thread when it returns this error.
         if (deferred_retry_error) |err| return err;
-        for (self.chunked_dense) |request| try retireMediaPassForDenseRequest(self.runtime, request);
-        if (self.group) |group| try saveReplayCursorForGroup(self.runtime, .dense, self.applied_sequence, self.cursor_config_hash, self.replay_generation, group);
+        try self.finishPublishedQuantum();
+    }
+
+    fn finishPublishedQuantum(self: *DenseExecutionLane) anyerror!void {
+        for (self.chunked_dense, 0..) |request, index| {
+            const selection = if (index < self.media_embedding_selections.len) self.media_embedding_selections[index] else null;
+            retireMediaPassForDenseRequest(self.runtime, request, .{ .completed = selection }) catch |err|
+                return FailureScope.assetPublicationFailure(&self.scope, err);
+        }
+        if (self.group) |group| saveReplayCursorForGroup(self.runtime, .dense, self.applied_sequence, self.cursor_config_hash, self.replay_generation, group) catch |err| return FailureScope.assetPublicationFailure(&self.scope, err);
     }
 
     pub fn deinitOwned(self: *DenseExecutionLane) void {
         self.window.deinit();
+        self.runtime.alloc.free(self.media_embedding_selections);
         enrichment_types.deinitGeneratedRequests(self.runtime.alloc, self.plain_dense);
         enrichment_types.deinitGeneratedRequests(self.runtime.alloc, self.chunked_dense);
         freeWorkerChunkCache(self.runtime.alloc, &self.chunk_cache_storage);
@@ -17053,6 +18434,7 @@ fn prepareDenseLane(
 const LaneOutcome = struct {
     result: anyerror!void,
     retry_fingerprint: u64,
+    publication_failure: ?anyerror = null,
 
     const ok: LaneOutcome = .{ .result = {}, .retry_fingerprint = 0 };
 
@@ -17067,7 +18449,8 @@ const LaneOutcome = struct {
             if (scope.first_scheduled_fingerprint != 0 and deferred == err and scope.retry_fingerprint == scope.first_scheduled_fingerprint) return .ok;
             break :blk if (deferred == err) scope.retry_fingerprint else 0;
         };
-        return .{ .result = result, .retry_fingerprint = retry_fingerprint };
+        const publication_failure: ?anyerror = if (result) |_| null else |err| if (scope.publication_failed and !isEnrichmentControlError(err)) err else null;
+        return .{ .result = result, .retry_fingerprint = retry_fingerprint, .publication_failure = publication_failure };
     }
 };
 
@@ -17090,8 +18473,9 @@ fn adoptLaneRetryIdentity(runtime: *EnrichmentRuntime, outcome: LaneOutcome) voi
 /// dense lane's identity overwrite the asset lane's while the asset error is
 /// the one returned, charging the wrong request's retry budget.
 fn selectLaneOutcome(asset: LaneOutcome, dense: LaneOutcome) LaneOutcome {
-    if (asset.result) |_| {} else |_| return asset;
-    return dense;
+    var selected = if (asset.result) |_| dense else |_| asset;
+    selected.publication_failure = asset.publication_failure orelse dense.publication_failure;
+    return selected;
 }
 
 test "lane outcome selection keeps the returned error's own identity" {
@@ -17108,6 +18492,12 @@ test "lane outcome selection keeps the returned error's own identity" {
     const neither = selectLaneOutcome(LaneOutcome.ok, LaneOutcome.ok);
     try neither.result;
     try std.testing.expectEqual(@as(u64, 0), neither.retry_fingerprint);
+
+    var failed_publish = FailureScope{};
+    const storage = LaneOutcome.of(&failed_publish, failed_publish.publicationFailure(error.WriterLocked));
+    const timeout = selectLaneOutcome(LaneOutcome.failed(error.EnrichmentWaitTimeout), storage);
+    try std.testing.expectError(error.EnrichmentWaitTimeout, timeout.result);
+    try std.testing.expectEqual(error.WriterLocked, timeout.publication_failure.?);
 }
 
 const LanePipeline = struct {
@@ -17125,6 +18515,7 @@ const LanePipeline = struct {
     replay_generation: ?u64 = null,
     asset_inflight: ?AssetInFlight = null,
     dense_inflight: ?DenseInFlight = null,
+    publication_failure: ?anyerror = null,
 
     fn init(runtime: *EnrichmentRuntime) LanePipeline {
         return .{ .runtime = runtime };
@@ -17171,6 +18562,7 @@ const LanePipeline = struct {
         const asset = self.awaitAsset() orelse LaneOutcome.ok;
         const dense = self.awaitDense() orelse LaneOutcome.ok;
         const selected = selectLaneOutcome(asset, dense);
+        if (self.publication_failure == null) self.publication_failure = selected.publication_failure;
         selected.result catch |err| {
             if (adopt_identity) adoptLaneRetryIdentity(self.runtime, selected);
             return err;
@@ -17315,6 +18707,7 @@ fn dispatchDeferredGeneratedWork(
     // would let the dense lane's overwrite the asset lane's while the asset
     // error is the one the supervisor charges.
     const selected = selectLaneOutcome(asset_outcome, dense_outcome);
+    if (pipeline.publication_failure == null) pipeline.publication_failure = selected.publication_failure;
     selected.result catch |err| {
         adoptLaneRetryIdentity(runtime, selected);
         return err;
@@ -17548,10 +18941,10 @@ fn processAsset(
         // Asset acceptance is not graph completion. Retry the ordered graph
         // consumer without reinvoking the provider, including accepted absence
         // after primary deletion. Pending publication holds the replay cursor.
-        try finishAcceptedAssetGraph(runtime, request);
-        try settleAcceptedMediaOutput(runtime, request, window);
-        try retireMediaPassForAssetRequest(runtime, request);
-        try retireIndexDocumentCheckpoint(runtime, request, if (context) |*value| value else null);
+        try finishAcceptedAssetGraph(runtime, request, scope);
+        settleAcceptedMediaOutput(runtime, request, window) catch |err| return FailureScope.assetPublicationFailure(scope, err);
+        retireMediaPassForAssetRequest(runtime, request) catch |err| return FailureScope.assetPublicationFailure(scope, err);
+        retireIndexDocumentCheckpoint(runtime, request, if (context) |*value| value else null) catch |err| return FailureScope.assetPublicationFailure(scope, err);
         return;
     }
     // Accepted provenance already validates the saved causal guards. In
@@ -17566,22 +18959,27 @@ fn processAsset(
                 const owner: *@This() = @ptrCast(@alignCast(ptr));
                 const json = try @import("antfly-json").stringifyValueAlloc(a, item);
                 defer a.free(json);
+                try checkProviderFailureGuard(owner.runtime);
+                const cancellation = enrichmentSourceCancellation(owner.runtime);
                 var scoped_config = owner.runtime.config;
+                scoped_config.cancellation = cancellation.token();
+                scoped_config.source_deadline_ns = owner.runtime.active_provider_guard.nativeDeadlineNs(scoped_config.source_deadline_ns);
                 scoped_config.fetch_retry_hint = scopedRetryHint(scoped_config.fetch_retry_hint, owner.request, owner.primary);
-                return renderSourceTemplateText(a, scoped_config, json, prior_template);
+                return renderSourceTemplateText(a, scoped_config, json, prior_template) catch |err|
+                    return providerInvocationFailure(owner.runtime, err);
             }
         };
         var render_context = Render{ .runtime = runtime, .request = request, .primary = observed.? };
         prior_input = try @import("group_prior_input.zig").capture(runtime.alloc, runtime.artifact_store orelse return error.ArtifactCatalogDrift, request, observed.?, if (context) |*value| value else null, .{ .ptr = &render_context, .render = Render.render });
     }
     const raw = observed orelse {
-        try retireIndexDocumentCheckpoint(runtime, request, if (context) |*value| value else null);
+        retireIndexDocumentCheckpoint(runtime, request, if (context) |*value| value else null) catch |err| return FailureScope.assetPublicationFailure(scope, err);
         if (context) |*value| {
             std.log.debug("producer retirement replay artifact={s}", .{requestArtifactName(request)});
             const artifact = requestArtifactName(request);
             const output_key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "asset", artifact);
             defer runtime.alloc.free(output_key);
-            try enqueueAssetProducerOutput(runtime, request, value, output_key, null);
+            try enqueueAssetProducerOutput(runtime, request, value, output_key, null, scope);
         }
         return;
     };
@@ -17600,10 +18998,10 @@ fn processAsset(
     }
 
     if (producer_cfg.type == .media_output) {
-        return processMediaOutput(runtime, request, producer_cfg.config_json, if (context) |*value| value else null, raw, key, window, prepared_sources);
+        return processMediaOutput(runtime, request, producer_cfg.config_json, if (context) |*value| value else null, raw, key, window, prepared_sources, scope);
     }
     if (producer_cfg.type == .vector_labels) {
-        return processVectorLabels(runtime, request, producer_cfg.config_json, if (context) |*value| value else null, raw, key, window);
+        return processVectorLabels(runtime, request, producer_cfg.config_json, if (context) |*value| value else null, raw, key, window, scope);
     }
 
     // Asset-consumes-asset: the source is another asset's produced bytes,
@@ -17639,18 +19037,18 @@ fn processAsset(
             }
         }
         break :blk bytes;
-    } else try extractAssetSourceValue(runtime.alloc, runtime.config, raw, request)) orelse {
-        if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, null);
+    } else try extractEnrichmentSource(runtime, extractAssetSourceValue, runtime.alloc, raw, request)) orelse {
+        if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, null, scope);
         const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
         defer runtime.alloc.free(state_key);
         if (producer_cfg.type == .document_extraction) {
-            try deleteDocumentExtractionForRuntime(runtime, request.doc_key, artifact_name, key, state_key, window);
+            deleteDocumentExtractionForRuntime(runtime, request.doc_key, artifact_name, key, state_key, window) catch |err| return FailureScope.assetPublicationFailure(scope, err);
         } else {
-            try retireLocalAssetOutput(runtime, request, key, state_key, .{ .doc_key = request.doc_key, .digest = sourceRecordDigest(raw), .upstream_name = request.upstream_artifact_name, .upstream_absent = consumes_upstream });
+            retireLocalAssetOutput(runtime, request, key, state_key, .{ .doc_key = request.doc_key, .digest = sourceRecordDigest(raw), .upstream_name = request.upstream_artifact_name, .upstream_absent = consumes_upstream }) catch |err| return FailureScope.assetPublicationFailure(scope, err);
             try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, key);
         }
         try appendFullTextDeleteDocumentToWindow(runtime, window, key, text_indexes);
-        try materializeGraphAssetDeleteForRuntime(runtime, request, window);
+        try materializeGraphAssetDeleteForRuntime(runtime, request, window, scope);
         // A null source is intentional no-output: settle graph/full_text
         // consumer coverage as skipped instead of leaving it pending.
         try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .skipped);
@@ -17681,16 +19079,16 @@ fn processAsset(
         source_text = sanitized;
     }
     if (consumes_upstream and (request.source_field.len != 0 or request.source_template.len != 0)) {
-        const selected = try extractAssetSourceValue(runtime.alloc, runtime.config, source_text, request);
+        const selected = try extractEnrichmentSource(runtime, extractAssetSourceValue, runtime.alloc, source_text, request);
         runtime.alloc.free(@constCast(source_text));
         source_text_owned = false;
         // Missing selected fields use the same explicit no-output transition
         // as a missing upstream, so stale outputs cannot remain searchable.
         if (selected == null) {
-            if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, null);
+            if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, null, scope);
             const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
             defer runtime.alloc.free(state_key);
-            try retireLocalAssetOutput(runtime, request, key, state_key, .{ .doc_key = request.doc_key, .digest = sourceRecordDigest(raw), .upstream_name = request.upstream_artifact_name, .upstream_digest = upstream_digest });
+            retireLocalAssetOutput(runtime, request, key, state_key, .{ .doc_key = request.doc_key, .digest = sourceRecordDigest(raw), .upstream_name = request.upstream_artifact_name, .upstream_digest = upstream_digest }) catch |err| return FailureScope.assetPublicationFailure(scope, err);
             try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, key);
             try appendFullTextDeleteDocumentToWindow(runtime, window, key, text_indexes);
             try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .skipped);
@@ -17711,17 +19109,17 @@ fn processAsset(
         source_text = selected;
     }
     if (source_text.len == 0) {
-        if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, null);
+        if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, null, scope);
         const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
         defer runtime.alloc.free(state_key);
         if (producer_cfg.type == .document_extraction) {
-            try deleteDocumentExtractionForRuntime(runtime, request.doc_key, artifact_name, key, state_key, window);
+            deleteDocumentExtractionForRuntime(runtime, request.doc_key, artifact_name, key, state_key, window) catch |err| return FailureScope.assetPublicationFailure(scope, err);
         } else {
-            try retireLocalAssetOutput(runtime, request, key, state_key, .{ .doc_key = request.doc_key, .digest = sourceRecordDigest(raw), .upstream_name = request.upstream_artifact_name, .upstream_digest = upstream_digest });
+            retireLocalAssetOutput(runtime, request, key, state_key, .{ .doc_key = request.doc_key, .digest = sourceRecordDigest(raw), .upstream_name = request.upstream_artifact_name, .upstream_digest = upstream_digest }) catch |err| return FailureScope.assetPublicationFailure(scope, err);
             try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, key);
         }
         try appendFullTextDeleteDocumentToWindow(runtime, window, key, text_indexes);
-        try materializeGraphAssetDeleteForRuntime(runtime, request, window);
+        try materializeGraphAssetDeleteForRuntime(runtime, request, window, scope);
         try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .skipped);
         return;
     }
@@ -17751,7 +19149,7 @@ fn processAsset(
     }
 
     var source_parts_json = if (producer_cfg.type.usesTemplateParts(request.source_template))
-        try renderSourcePartsJson(runtime.alloc, runtime.config, raw, request)
+        try extractEnrichmentSource(runtime, renderSourcePartsJson, runtime.alloc, raw, request)
     else
         null;
     var source_parts_json_owned = true;
@@ -17760,7 +19158,7 @@ fn processAsset(
     };
 
     if (producer_cfg.type == .copy) {
-        if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, source_text);
+        if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, source_text, scope);
         // Same reasoning as the generic producer's receipt below: key the
         // reuse receipt on the declared source (`source_text`), not the
         // whole primary document (`raw`), so an edit to an unrelated field
@@ -17770,7 +19168,7 @@ fn processAsset(
         const reuse_parent = if (runtime.index_manager.artifactFeedsGraph(artifact_name)) raw else source_text;
         if (try shouldSkipAssetArtifact(runtime, key, source_text) and try reusableLocalAsset(runtime, request.doc_key, artifact_name, reuse_parent, source_text)) {
             try appendInlineFullTextDocumentToWindow(runtime, window, key, source_text, text_indexes);
-            try materializeGraphAssetForRuntime(runtime, request, source_text, raw, window);
+            try materializeGraphAssetForRuntime(runtime, request, source_text, raw, window, scope);
             // The artifact exists and is current: produced coverage, so an
             // idempotent replay converges the consumer summary.
             try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .produced);
@@ -17781,10 +19179,10 @@ fn processAsset(
         defer runtime.alloc.free(receipt_key);
         const producer_recipe = local.requestRecipe(request);
         const receipt = local.encode(producer_recipe, reuse_parent, source_text);
-        try storePutBatchGuardedWithRetry(runtime, &.{ .{ .key = key, .value = source_text }, .{ .key = receipt_key, .value = &receipt } }, &.{}, .{ .doc_key = request.doc_key, .digest = sourceRecordDigest(raw), .upstream_name = request.upstream_artifact_name, .upstream_digest = upstream_digest, .producer_name = artifact_name, .producer_recipe = producer_recipe });
+        storePutBatchGuardedWithRetry(runtime, &.{ .{ .key = key, .value = source_text }, .{ .key = receipt_key, .value = &receipt } }, &.{}, .{ .doc_key = request.doc_key, .digest = sourceRecordDigest(raw), .upstream_name = request.upstream_artifact_name, .upstream_digest = upstream_digest, .producer_name = artifact_name, .producer_recipe = producer_recipe }) catch |err| return FailureScope.assetPublicationFailure(scope, err);
         try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, key);
         try appendInlineFullTextDocumentToWindow(runtime, window, key, source_text, text_indexes);
-        try materializeGraphAssetForRuntime(runtime, request, source_text, raw, window);
+        try materializeGraphAssetForRuntime(runtime, request, source_text, raw, window, scope);
         recordArtifactBytes(runtime, .asset, source_text.len);
         try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .produced);
         return;
@@ -17865,11 +19263,11 @@ fn processAsset(
             // dependency state still advances to the context just read (and
             // a snapshot source schedules its next refresh; the timer that
             // triggered this rebuild was consumed).
-            if (context_publish) |publish| try publishRetainedContextOutput(runtime, request.doc_key, requestArtifactName(request), publish);
-            try finishAcceptedAssetGraph(runtime, request);
-            try settleAcceptedMediaOutput(runtime, request, window);
-            try retireMediaPassForAssetRequest(runtime, request);
-            try retireIndexDocumentCheckpoint(runtime, request, token);
+            if (context_publish) |publish| publishRetainedContextOutput(runtime, request.doc_key, requestArtifactName(request), publish) catch |err| return FailureScope.assetPublicationFailure(scope, err);
+            try finishAcceptedAssetGraph(runtime, request, scope);
+            settleAcceptedMediaOutput(runtime, request, window) catch |err| return FailureScope.assetPublicationFailure(scope, err);
+            retireMediaPassForAssetRequest(runtime, request) catch |err| return FailureScope.assetPublicationFailure(scope, err);
+            retireIndexDocumentCheckpoint(runtime, request, token) catch |err| return FailureScope.assetPublicationFailure(scope, err);
             return;
         }
     };
@@ -17925,10 +19323,10 @@ fn processAsset(
                     // Equivalent inputs: the retained output becomes current
                     // through the captured frontier without a producer call or
                     // a new lineage version.
-                    try storePutBatchGuardedWithRetry(runtime, &.{}, &.{}, .{ .doc_key = request.doc_key, .digest = sourceRecordDigest(raw), .dependency = .{ .artifact = artifact_name, .publish = publish, .new_version = false } });
+                    storePutBatchGuardedWithRetry(runtime, &.{}, &.{}, .{ .doc_key = request.doc_key, .digest = sourceRecordDigest(raw), .dependency = .{ .artifact = artifact_name, .publish = publish, .new_version = false } }) catch |err| return FailureScope.assetPublicationFailure(scope, err);
                 }
                 try appendInlineFullTextDocumentToWindow(runtime, window, key, value, text_indexes);
-                try materializeGraphAssetForRuntime(runtime, request, value, raw, window);
+                try materializeGraphAssetForRuntime(runtime, request, value, raw, window, scope);
                 // Private outputs also require their destination-owned witness.
                 // A restored skip state cannot certify imported artifact bytes.
                 try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .produced);
@@ -18041,8 +19439,8 @@ fn captureContextSources(
     var bindings = enrichment_context_sources.bindForKeyAlloc(alloc, &config, request.doc_key, parsed.value) catch |err| switch (err) {
         error.OutOfMemory => return err,
         error.ContextBudgetExceeded, error.InvalidContextBinding => {
-            try recordContextFailure(runtime, request, artifact_name, null, &.{}, config_digest, @errorName(err));
-            try recordIsolatedRequestErrorNamed(runtime, window, request, @errorName(err), scope.attemptNumber(runtime));
+            recordContextFailure(runtime, request, artifact_name, null, &.{}, config_digest, @errorName(err)) catch |write_err| return FailureScope.assetPublicationFailure(scope, write_err);
+            recordIsolatedRequestErrorNamed(runtime, window, request, @errorName(err), scope.attemptNumber(runtime)) catch |write_err| return FailureScope.assetPublicationFailure(scope, write_err);
             return null;
         },
         else => return err,
@@ -18050,7 +19448,7 @@ fn captureContextSources(
     defer bindings.deinit();
     var tuples = try bindings.allTuplesAlloc(alloc);
     defer alloc.free(tuples);
-    var capture = try registerContextDependencies(runtime, request.doc_key, artifact_name, tuples, config_digest);
+    var capture = registerContextDependencies(runtime, request.doc_key, artifact_name, tuples, config_digest) catch |write_err| return FailureScope.assetPublicationFailure(scope, write_err);
     const reader = runtime.config.context_source_reader orelse return error.ContextSourceTableUnavailable;
     // Traversal discovers subscriptions only while reading (graph nodes and
     // members, top-N boundaries). Register what was discovered, then re-read
@@ -18061,8 +19459,8 @@ fn captureContextSources(
     while (true) : (attempt += 1) {
         var resolution = context_resolution.resolveAlloc(alloc, reader, &bindings, .{}) catch |err| switch (err) {
             error.ContextBudgetExceeded, error.RequiredContextMissing, error.InvalidContextBinding, error.ContextGraphUnavailable, error.ContextSearchUnavailable => {
-                try recordContextFailure(runtime, request, artifact_name, capture, tuples, config_digest, @errorName(err));
-                try recordIsolatedRequestErrorNamed(runtime, window, request, @errorName(err), scope.attemptNumber(runtime));
+                recordContextFailure(runtime, request, artifact_name, capture, tuples, config_digest, @errorName(err)) catch |write_err| return FailureScope.assetPublicationFailure(scope, write_err);
+                recordIsolatedRequestErrorNamed(runtime, window, request, @errorName(err), scope.attemptNumber(runtime)) catch |write_err| return FailureScope.assetPublicationFailure(scope, write_err);
                 return null;
             },
             else => return err,
@@ -18074,7 +19472,7 @@ fn captureContextSources(
             const merged = try mergeContextTuplesAlloc(alloc, tuples, resolution.tuples);
             alloc.free(tuples);
             tuples = merged;
-            capture = try registerContextDependencies(runtime, request.doc_key, artifact_name, tuples, config_digest);
+            capture = registerContextDependencies(runtime, request.doc_key, artifact_name, tuples, config_digest) catch |write_err| return FailureScope.assetPublicationFailure(scope, write_err);
             var validation = context_resolution.resolveAlloc(alloc, reader, &bindings, .{}) catch |err| switch (err) {
                 error.ContextBudgetExceeded, error.RequiredContextMissing, error.InvalidContextBinding => continue,
                 else => return err,
@@ -18459,7 +19857,7 @@ const PreparedAssetBatch = struct {
     /// holds: the request being attempted, or, after a provider batch flush,
     /// the identity that flush deferred (`FailureScope.retry_fingerprint`).
     fn retainRetry(self: *@This(), scope: *const FailureScope, err: anyerror) !void {
-        if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request) return err;
+        if (scope.publication_failed or isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request) return err;
         if (self.retry_error == null) {
             self.retry_error = err;
             self.retry_fingerprint = if (scope.retry_error != null and scope.retry_error.? == err) scope.retry_fingerprint else scope.fingerprint;
@@ -18524,7 +19922,8 @@ fn processPlannedAsset(
         try processAssetOrDefer(runtime, request, deferred, prepared_sources, window);
         return true;
     }
-    var scope = FailureScope{ .fingerprint = runtime.active_failure_fingerprint };
+    var scope = FailureScope{};
+    scope.enterRequest(request);
     var batch = PreparedAssetBatch{};
     defer batch.deinit(runtime.alloc);
     processAsset(runtime, request, &batch, prepared_sources, window, &scope) catch |err| return scope.scannerFailure(runtime, err);
@@ -18673,7 +20072,7 @@ fn flushAssetProducerBatch(
             runtime.extract_batches_completed += 1;
             runtime.extract_items_completed += @intCast(end - start);
             runtime.total_extract_ns += elapsedNsSince(runtime, extract_started_ns);
-            if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
+            if (scope.publication_failed or isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
                 return err;
             // The item flush already deferred this error under the failing
             // request's identity in `scope`.
@@ -18689,8 +20088,9 @@ fn flushAssetProducerBatch(
     if (deferred_retry_error) |err| return err;
 }
 
-fn recordAssetProducerFailure(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, item: AssetProducerBatchItem, err: anyerror, attempt: u64) !void {
-    try recordIsolatedRequestErrorFor(runtime, window, item.request, err, attempt);
+fn recordAssetProducerFailure(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, item: AssetProducerBatchItem, err: anyerror, attempt: u64, scope: *FailureScope) !void {
+    recordIsolatedRequestErrorFor(runtime, window, item.request, err, attempt) catch |save_err|
+        return FailureScope.assetPublicationFailure(scope, save_err);
     if (!@import("../../../privacy/document.zig").isArtifactName(item.request.artifact_name)) return;
     const parsed = try std.json.parseFromSlice(std.json.Value, runtime.alloc, item.config_json, .{});
     defer parsed.deinit();
@@ -18707,7 +20107,8 @@ fn recordAssetProducerFailure(runtime: *EnrichmentRuntime, window: *GeneratedRep
     // Asset skip-state is local recovery metadata, never a serving witness.
     // A JSON failure marker cannot match its successful 32-byte skip digest;
     // explicit retry/new source work therefore cannot reuse a failed result.
-    try storePutPrivateBatchWithRetry(runtime, &runtime.store, &.{.{ .key = item.state_key, .value = marker }}, &.{});
+    storePutPrivateBatchWithRetry(runtime, &runtime.store, &.{.{ .key = item.state_key, .value = marker }}, &.{}) catch |save_err|
+        return FailureScope.assetPublicationFailure(scope, save_err);
 }
 
 /// Publication progress never consumes the slot for a genuine provider retry.
@@ -18859,6 +20260,7 @@ const AssetBatchOutcome = struct {
 /// items were handled without production.
 fn resubmitPendingAssetOutputs(
     runtime: *EnrichmentRuntime,
+    producer: ?asset_producer_mod.Producer,
     items: []AssetProducerBatchItem,
     window: *GeneratedReplayWindow,
     scope: *FailureScope,
@@ -18896,7 +20298,9 @@ fn resubmitPendingAssetOutputs(
             },
         };
         defer runtime.alloc.free(cached);
-        applyAssetProducerBatchOutput(runtime, current, cached, window) catch |err| {
+        try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, if (producer) |value| value.invocation_context else .{});
+        applyAssetProducerBatchOutput(runtime, current, cached, window, scope) catch |err| {
+            if (scope.publication_failed) return err;
             if (err == error.ArtifactPublicationPending) {
                 outcome.publication_pending = true;
                 continue;
@@ -18904,7 +20308,7 @@ fn resubmitPendingAssetOutputs(
             if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
             if (try scope.shouldYield(runtime, err)) {
                 outcome.deferRetry(scope, err);
-            } else try recordAssetProducerFailure(runtime, window, current.*, err, scope.attemptNumber(runtime));
+            } else try recordAssetProducerFailure(runtime, window, current.*, err, scope.attemptNumber(runtime), scope);
         };
     }
     return served;
@@ -18939,7 +20343,7 @@ fn flushAssetProducerBatchItems(
         if (comptime builtin.os.tag != .freestanding) for (claimed.items) |key| runtime.submitted_outputs.release(key);
         claimed.deinit(runtime.alloc);
     }
-    const pending_count = try resubmitPendingAssetOutputs(runtime, items, window, scope, &outcome, &claimed);
+    const pending_count = try resubmitPendingAssetOutputs(runtime, runtime.config.asset_producer, items, window, scope, &outcome, &claimed);
     if (pending_count == items.len) return outcome.finish();
     const remaining = items[pending_count..];
     scope.enterOwned(assetProducerBatchFailureFingerprint(remaining), .{ .assets = remaining });
@@ -19017,6 +20421,7 @@ fn flushTextAssetProducerBatchItems(
     for (items, 0..) |*item, idx| requests[idx] = item.asRequest();
 
     const can_batch = assetProducerCanBatchGuarded(runtime, producer, runtime.alloc, requests) catch |err| {
+        if (err == error.ProviderInvocationCanceled) return deferCanceledAssetBatch(runtime, producer, items, window, scope);
         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
         return try flushAssetProducerBatchSequential(runtime, producer, items, window, scope);
     };
@@ -19025,6 +20430,7 @@ fn flushTextAssetProducerBatchItems(
 
     var produced_batch = assetProducerProduceBatchReportedGuarded(runtime, producer, runtime.alloc, requests) catch |err| {
         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
+        if (err == error.ProviderInvocationCanceled) return deferCanceledAssetBatch(runtime, producer, items, window, scope);
         // Batch execution is an optimization boundary, not a logical repair
         // identity. Fall back immediately so durable retry ownership belongs to
         // each source request and cannot oscillate between batch and singleton
@@ -19035,22 +20441,24 @@ fn flushTextAssetProducerBatchItems(
 
     var outcome: AssetBatchOutcome = .{};
     for (items, produced_batch.items) |*item, *produced| {
-        if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
+        try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context);
         scope.enterAsset(item);
         switch (produced.result) {
             .item_error => |failure| {
-                if (isEnrichmentControlError(failure.cause) or enrichmentErrorDisposition(failure.cause) == .fatal_worker)
-                    return failure.cause;
+                const cause = providerInvocationFailure(runtime, failure.cause);
+                if (isEnrichmentControlError(cause) or enrichmentErrorDisposition(cause) == .fatal_worker)
+                    return cause;
                 // The exact item identity is consulted for its durable
                 // budget. Independent successful items publish even when a
                 // sibling still needs another attempt.
                 setRetryAfterHintFor(runtime, scope.fingerprint, failure.retry_after_ms);
-                if (failure.retryable and try scope.shouldYield(runtime, failure.cause)) {
-                    outcome.deferRetry(scope, failure.cause);
-                } else try recordAssetProducerFailure(runtime, window, item.*, failure.cause, scope.attemptNumber(runtime));
+                if ((failure.retryable or cause == error.ProviderInvocationCanceled) and try scope.shouldYield(runtime, cause)) {
+                    outcome.deferRetry(scope, cause);
+                } else try recordAssetProducerFailure(runtime, window, item.*, cause, scope.attemptNumber(runtime), scope);
             },
             .value => |output| {
-                applyAssetProducerBatchOutput(runtime, item, output, window) catch |err| {
+                applyAssetProducerBatchOutput(runtime, item, output, window, scope) catch |err| {
+                    if (scope.publication_failed) return err;
                     if (err == error.ArtifactPublicationPending) {
                         outcome.publication_pending = true;
                         continue;
@@ -19058,13 +20466,51 @@ fn flushTextAssetProducerBatchItems(
                     if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
                     if (try scope.shouldYield(runtime, err)) {
                         outcome.deferRetry(scope, err);
-                    } else try recordAssetProducerFailure(runtime, window, item.*, err, scope.attemptNumber(runtime));
+                    } else try recordAssetProducerFailure(runtime, window, item.*, err, scope.attemptNumber(runtime), scope);
                     continue;
                 };
                 runtime.alloc.free(output);
                 produced.result = .{ .value = &.{} };
             },
         }
+    }
+    return outcome.finish();
+}
+
+fn noteParkedRequests(runtime: *EnrichmentRuntime, scheduler: *ScopedReplay, err: anyerror, count: usize) void {
+    if (count == 0) return;
+    const io = lockRuntime(runtime);
+    runtime.error_count +|= count;
+    runtime.retryable_error_count +|= count;
+    runtime.last_error_code = types.RuntimeErrorName.init(@errorName(err));
+    unlockRuntime(runtime, io);
+    scheduler.refreshRuntime(runtime);
+}
+
+fn deferCanceledAssetBatch(runtime: *EnrichmentRuntime, producer: asset_producer_mod.Producer, items: []AssetProducerBatchItem, window: *GeneratedReplayWindow, scope: *FailureScope) !void {
+    const cause = error.ProviderInvocationCanceled;
+    var outcome: AssetBatchOutcome = .{};
+    var pending: std.ArrayListUnmanaged(ScopedReplay.ParkMember) = .empty;
+    defer pending.deinit(runtime.alloc);
+    const Terminal = struct { item: *const AssetProducerBatchItem, attempt: u64 };
+    var terminal: std.ArrayListUnmanaged(Terminal) = .empty;
+    defer terminal.deinit(runtime.alloc);
+    for (items) |*item| {
+        try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context);
+        scope.enterAsset(item);
+        if (try scope.shouldYieldWithPending(runtime, cause, &pending)) {
+            outcome.deferRetry(scope, cause);
+        } else try terminal.append(runtime.alloc, .{ .item = item, .attempt = scope.attemptNumber(runtime) });
+    }
+    if (pending.items.len != 0) {
+        try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context);
+        const scheduler = runtime.retry_scheduler.?;
+        const parked = scheduler.parkPreparedMembers(runtime, pending.items, cause, true) catch |err| return scope.publicationFailure(err);
+        noteParkedRequests(runtime, scheduler, cause, parked);
+    }
+    for (terminal.items) |failure| {
+        try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context);
+        try recordAssetProducerFailure(runtime, window, failure.item.*, cause, failure.attempt, scope);
     }
     return outcome.finish();
 }
@@ -19122,15 +20568,17 @@ fn flushIndexDocumentBatch(runtime: *EnrichmentRuntime, producer: asset_producer
             runtime.alloc.free(bytes);
         };
         for (results[0..count], items[offset..][0..count]) |result, *item| {
+            try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context);
             scope.enterAsset(item);
             const bytes = result catch |err| {
                 if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
                 if (try scope.shouldYield(runtime, err)) {
                     outcome.deferRetry(scope, err);
-                } else try recordAssetProducerFailure(runtime, window, item.*, err, scope.attemptNumber(runtime));
+                } else try recordAssetProducerFailure(runtime, window, item.*, err, scope.attemptNumber(runtime), scope);
                 continue;
             };
-            applyAssetProducerBatchOutput(runtime, item, bytes, window) catch |err| {
+            applyAssetProducerBatchOutput(runtime, item, bytes, window, scope) catch |err| {
+                if (scope.publication_failed) return err;
                 if (err == error.ArtifactPublicationPending) {
                     outcome.publication_pending = true;
                     continue;
@@ -19138,7 +20586,7 @@ fn flushIndexDocumentBatch(runtime: *EnrichmentRuntime, producer: asset_producer
                 if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
                 if (try scope.shouldYield(runtime, err)) {
                     outcome.deferRetry(scope, err);
-                } else try recordAssetProducerFailure(runtime, window, item.*, err, scope.attemptNumber(runtime));
+                } else try recordAssetProducerFailure(runtime, window, item.*, err, scope.attemptNumber(runtime), scope);
             };
         }
         offset += count;
@@ -19155,18 +20603,20 @@ fn flushAssetProducerBatchSequential(
 ) !void {
     var outcome: AssetBatchOutcome = .{};
     for (items) |*item| {
-        if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
+        try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context);
         scope.enterAsset(item);
         const request = item.asRequest();
         const produced = assetProducerProduceGuarded(runtime, producer, runtime.alloc, request) catch |err| {
             if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
             if (try scope.shouldYield(runtime, err)) {
                 outcome.deferRetry(scope, err);
-            } else try recordAssetProducerFailure(runtime, window, item.*, err, scope.attemptNumber(runtime));
+            } else try recordAssetProducerFailure(runtime, window, item.*, err, scope.attemptNumber(runtime), scope);
             continue;
         };
         defer runtime.alloc.free(produced);
-        applyAssetProducerBatchOutput(runtime, item, produced, window) catch |err| {
+        try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context);
+        applyAssetProducerBatchOutput(runtime, item, produced, window, scope) catch |err| {
+            if (scope.publication_failed) return err;
             if (err == error.ArtifactPublicationPending) {
                 outcome.publication_pending = true;
                 continue;
@@ -19174,7 +20624,7 @@ fn flushAssetProducerBatchSequential(
             if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
             if (try scope.shouldYield(runtime, err)) {
                 outcome.deferRetry(scope, err);
-            } else try recordAssetProducerFailure(runtime, window, item.*, err, scope.attemptNumber(runtime));
+            } else try recordAssetProducerFailure(runtime, window, item.*, err, scope.attemptNumber(runtime), scope);
         };
     }
     return outcome.finish();
@@ -19188,7 +20638,7 @@ fn prepareVectorLabelPrompts(runtime: *EnrichmentRuntime, provider: embedder_mod
         for (rows[0..initialized]) |vector| a.free(vector);
         a.free(rows);
     }
-    const generation = try provider.captureTextGeneration(a, embedding_name);
+    const generation = try captureDenseGeneration(runtime, provider, a, embedding_name, null);
     // Known generations require an executor that accepts the expected lease.
     // Observation before/after an opaque invocation cannot detect a rollback.
     if (generation.revision != null and provider.dense_embed_batch_planned_fn == null) return error.InvalidEmbeddingIdentity;
@@ -19216,7 +20666,7 @@ fn prepareVectorLabelPrompts(runtime: *EnrichmentRuntime, provider: embedder_mod
         }
         start = end;
     }
-    try provider.requireTextGeneration(a, embedding_name, generation);
+    try requireDenseGeneration(runtime, provider, a, embedding_name, generation, null);
     return rows;
 }
 
@@ -19304,7 +20754,7 @@ fn repairMediaOutputPrepared(runtime: *EnrichmentRuntime, request: enrichment_ty
     defer if (owned_page) |*page| page.deinit(a);
     var failure: ?anyerror = if (batch) |prepared| prepared.failure else null;
     if (batch == null) {
-        var source = try extractModelChunkSource(a, runtime.config, raw_doc, request, assetProviderRequestContext(runtime));
+        var source = try extractModelChunkEnrichmentSource(runtime, a, raw_doc, request, null);
         defer source.deinit(a);
         owned_page = prepareMediaRepairPage(runtime, config, source.input orelse return error.EnrichmentSourceChanged, name, metadata, 1) catch |err| blk: {
             failure = err;
@@ -19470,7 +20920,7 @@ fn persistMediaRepairs(runtime: *EnrichmentRuntime, request: enrichment_types.Ge
     }
 }
 
-fn repairMediaOutputPage(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, raw_doc: []const u8, chunk_config: chunking_types_mod.Config, input: @import("inference_chunker").Input, stage_prefix: []const u8, name: []const u8, target: @import("inference_chunker").outputs.Target, current_output: ?@import("inference_chunker").outputs.Result, chunks: []const @import("inference_chunker").Chunk) !bool {
+fn repairMediaOutputPage(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, raw_doc: []const u8, chunk_config: chunking_types_mod.Config, input: @import("inference_chunker").Input, stage_prefix: []const u8, name: []const u8, target: @import("inference_chunker").outputs.Target, current_output: ?@import("inference_chunker").outputs.Result, chunks: []const @import("inference_chunker").Chunk, scope: ?*FailureScope) !bool {
     const a = runtime.alloc;
     var decision_arena = std.heap.ArenaAllocator.init(a);
     defer decision_arena.deinit();
@@ -19522,7 +20972,7 @@ fn repairMediaOutputPage(runtime: *EnrichmentRuntime, request: enrichment_types.
             if (err != error.IncompleteChunkCoverage) return err;
             retry = true;
         };
-        try persistMediaRepairs(runtime, request, raw_doc, stage_prefix, name, pending.updates.items);
+        persistMediaRepairs(runtime, request, raw_doc, stage_prefix, name, pending.updates.items) catch |err| return FailureScope.assetPublicationFailure(scope, err);
         _ = decision_arena.reset(.retain_capacity);
         if (batch.page) |page| if (page.terminal) |terminal| return terminal.failure();
         first = covered_end;
@@ -19530,7 +20980,7 @@ fn repairMediaOutputPage(runtime: *EnrichmentRuntime, request: enrichment_types.
     return retry;
 }
 
-fn processMediaOutput(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, config_json: []const u8, token: ?*@import("../artifact_producer_context.zig").Token, raw_doc: []const u8, output_key: []const u8, window: *GeneratedReplayWindow, shared: *PreparedDocumentSourceCache) !void {
+fn processMediaOutput(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, config_json: []const u8, token: ?*@import("../artifact_producer_context.zig").Token, raw_doc: []const u8, output_key: []const u8, window: *GeneratedReplayWindow, shared: *PreparedDocumentSourceCache, scope: ?*FailureScope) !void {
     const a = runtime.alloc;
     var config = try @import("media_output.zig").parse(a, config_json);
     defer config.deinit();
@@ -19564,14 +21014,14 @@ fn processMediaOutput(runtime: *EnrichmentRuntime, request: enrichment_types.Gen
         source_request.reprocess_generation = cursor.value.source_generation;
     }
 
-    var source = try extractModelChunkSourceCached(a, runtime.config, raw_doc, source_request, assetProviderRequestContext(runtime), shared);
+    var source = try extractModelChunkEnrichmentSource(runtime, a, raw_doc, source_request, shared);
     defer source.deinit(a);
     const probe: ?*const @import("inference_chunker").types.ChunkPage = if (source.input) |input|
         try shared.mediaProbe(runtime, source_request, raw_doc, chunk_config, input)
     else empty: {
         // Missing/null media is an intentional empty revision, not a transient
         // source race. Retire private preparation and publish empty coverage.
-        try clearMediaPassScope(runtime, stage_prefix, null);
+        clearMediaPassScope(runtime, stage_prefix, null) catch |err| return FailureScope.assetPublicationFailure(scope, err);
         shared.clearMedia();
         break :empty null;
     };
@@ -19613,7 +21063,7 @@ fn processMediaOutput(runtime: *EnrichmentRuntime, request: enrichment_types.Gen
         defer page.deinit(a);
         if (page.start_ordinal != collected.count or page.chunks.len == 0 or page.covered_through_ordinal > prepared.chunks.len) return error.InvalidEnrichmentState;
         try hydrateMediaPassPageWithAssets(runtime, source_request, &page, assets);
-        retry = try repairMediaOutputPage(runtime, source_request, raw_doc, chunk_config, source.input.?, stage_prefix, config.value.output_name, target, current_output, page.chunks) or retry;
+        retry = try repairMediaOutputPage(runtime, source_request, raw_doc, chunk_config, source.input.?, stage_prefix, config.value.output_name, target, current_output, page.chunks, scope) or retry;
         var page_arena = std.heap.ArenaAllocator.init(a);
         defer page_arena.deinit();
         const pa = page_arena.allocator();
@@ -19649,16 +21099,16 @@ fn processMediaOutput(runtime: *EnrichmentRuntime, request: enrichment_types.Gen
     const produced = try std.json.Stringify.valueAlloc(a, .{ .object = "media.output.list", .plan_id = if (boundary_metadata) |value| value.plan_id else null, .source_fingerprint = if (boundary_metadata) |value| value.source_fingerprint else null, .source_version = if (boundary_metadata) |value| value.source_version else null, .source_artifact_name = upstream.name, .output_name = config.value.output_name, .chunks = collected.rawRows(), .text = collected.text.items, .transcript_spans = collected.spans.items, .complete_chunks = collected.complete, .failed_chunks = collected.failed, .terminal_chunks = collected.terminal, .status = collected.status }, .{ .emit_null_optional_fields = false });
     defer a.free(produced);
     if (produced.len > 16 * 1024 * 1024) return error.ResourceLimitExceeded;
-    if (token) |context| return enqueueAssetProducerOutput(runtime, request, context, output_key, produced);
+    if (token) |context| return enqueueAssetProducerOutput(runtime, request, context, output_key, produced, scope);
     const state_key = try assetStateKeyAlloc(a, request.doc_key, requestArtifactName(request));
     defer a.free(state_key);
     const fingerprint = std.fmt.bytesToHex(digest.finalResult(), .lower);
     const state = try assetStateValueAlloc(a, &fingerprint, null, request.producer_json);
     defer a.free(state);
     var item = AssetProducerBatchItem{ .request = request, .producer_type = .media_output, .config_json = @constCast(config_json), .raw_doc = @constCast(raw_doc), .source_text = &fingerprint, .artifact_key = @constCast(output_key), .state_key = state_key, .state_value = state };
-    try applyAssetProducerBatchOutput(runtime, &item, produced, window);
+    try applyAssetProducerBatchOutput(runtime, &item, produced, window, scope);
     if (collected.status == .failed) try recordIsolatedRequestError(runtime, window, request, error.RequiredMediaOutputFailed);
-    try retireMediaPassForAssetRequest(runtime, request);
+    retireMediaPassForAssetRequest(runtime, request) catch |err| return FailureScope.assetPublicationFailure(scope, err);
 }
 
 /// A fused vector authenticates against its selected receipt and canonical
@@ -19678,7 +21128,7 @@ fn validateVectorLabelWindow(a: Allocator, provider_model: []const u8, request: 
     return error.IncompatibleChunkEmbeddingTarget;
 }
 
-fn processVectorLabels(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, config_json: []const u8, token: ?*@import("../artifact_producer_context.zig").Token, raw_doc: []const u8, output_key: []const u8, window: *GeneratedReplayWindow) !void {
+fn processVectorLabels(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, config_json: []const u8, token: ?*@import("../artifact_producer_context.zig").Token, raw_doc: []const u8, output_key: []const u8, window: *GeneratedReplayWindow, scope: ?*FailureScope) !void {
     const labels = @import("vector_labels.zig");
     const a = runtime.alloc;
     const scorer_cache = runtime.shared_vector_label_cache orelse &runtime.vector_label_cache;
@@ -19686,11 +21136,11 @@ fn processVectorLabels(runtime: *EnrichmentRuntime, request: enrichment_types.Ge
     if (upstream.source_artifact_name.len == 0) return error.InvalidEnrichmentConfig;
     const provider = runtime.config.dense_embedder orelse return error.MissingDenseEmbedder;
     // Capture the producing contract before reading vectors or probing caches.
-    const generation = try provider.captureTextGeneration(a, upstream.name);
+    const foreground = foregroundProviderRequestContext(runtime);
+    const generation = try captureDenseGeneration(runtime, provider, a, upstream.name, foreground);
     const pinned_provider = provider.withTextGeneration(generation);
     const provider_model = provider.recoveryIdentity(upstream.name).model;
-    const revision_fn = provider.cache_revision_fn;
-    const revision = if (revision_fn) |resolve| try resolve(provider.ptr, a, upstream.name) else null;
+    const revision = try captureDenseCacheRevision(runtime, provider, a, upstream.name, generation.revision, foreground);
     const source_request = mediaEmbeddingComputationRequest(runtime, .{ .kind = .dense_embedding, .index_name = upstream.name, .artifact_name = upstream.source_artifact_name, .embedding_name = upstream.name, .doc_key = request.doc_key, .source_field = upstream.source_field, .expected_dims = upstream.expected_dims, .producer_json = upstream.producer_json, .reprocess_generation = try embeddingReprocessGeneration(runtime, request.doc_key, upstream.name) });
     const manifest_key = try @import("../artifact_chunk_manifest.zig").keyAlloc(a, request.doc_key, upstream.source_artifact_name);
     defer a.free(manifest_key);
@@ -19824,9 +21274,9 @@ fn processVectorLabels(runtime: *EnrichmentRuntime, request: enrichment_types.Ge
             if (admitted != error.ResourceBudgetExceeded or Cache.reclaim(scorer_cache, Cache.max_bytes) == 0) return admitted;
             break :blk labels.Scorer.initValidated(entry.arena.allocator(), entry.config, prompt_vectors) catch |retry| return entry.admissionError(retry);
         };
-        try provider.requireTextGeneration(a, upstream.name, generation);
+        try requireDenseGeneration(runtime, provider, a, upstream.name, generation, foreground);
         if (revision) |before| {
-            const after = (try revision_fn.?(provider.ptr, a, upstream.name)) orelse return error.EmbeddingIdentityMismatch;
+            const after = (try captureDenseCacheRevision(runtime, provider, a, upstream.name, generation.revision, foreground)) orelse return error.EmbeddingIdentityMismatch;
             if (!std.mem.eql(u8, &before, &after)) return error.EmbeddingIdentityMismatch;
             if (cacheable) scorer_cache.retain(entry);
         }
@@ -19844,19 +21294,19 @@ fn processVectorLabels(runtime: *EnrichmentRuntime, request: enrichment_types.Ge
     const produced = try std.json.Stringify.valueAlloc(a, .{ .object = "vector.labels", .embedding_name = upstream.name, .vector_digest = @as([]const u8, &vector_digest), .parent_count = if (addresses.items.len == 0) @as(u32, 0) else addresses.items[addresses.items.len - 1].chunk_id + 1, .chunks = rows }, .{});
     defer a.free(produced);
     if (produced.len > 16 * 1024 * 1024) return error.ResourceLimitExceeded;
-    try provider.requireTextGeneration(a, upstream.name, generation);
+    try requireDenseGeneration(runtime, provider, a, upstream.name, generation, foreground);
     if (revision) |before| {
-        const after = (try revision_fn.?(provider.ptr, a, upstream.name)) orelse return error.EmbeddingIdentityMismatch;
+        const after = (try captureDenseCacheRevision(runtime, provider, a, upstream.name, generation.revision, foreground)) orelse return error.EmbeddingIdentityMismatch;
         if (!std.mem.eql(u8, &before, &after)) return error.EmbeddingIdentityMismatch;
     }
-    if (token) |context| return enqueueAssetProducerOutput(runtime, request, context, output_key, produced);
+    if (token) |context| return enqueueAssetProducerOutput(runtime, request, context, output_key, produced, scope);
     const state_key = try assetStateKeyAlloc(a, request.doc_key, requestArtifactName(request));
     defer a.free(state_key);
     const fingerprint = std.fmt.bytesToHex(source_hash.finalResult(), .lower);
     const state = try assetStateValueAlloc(a, &fingerprint, null, request.producer_json);
     defer a.free(state);
     var item = AssetProducerBatchItem{ .request = request, .producer_type = .vector_labels, .config_json = @constCast(config_json), .raw_doc = @constCast(raw_doc), .source_text = &fingerprint, .artifact_key = @constCast(output_key), .state_key = state_key, .state_value = state };
-    try applyAssetProducerBatchOutput(runtime, &item, produced, window);
+    try applyAssetProducerBatchOutput(runtime, &item, produced, window, scope);
 }
 
 const IndexDocumentCheckpoint = struct {
@@ -20097,6 +21547,7 @@ fn applyAssetProducerBatchOutput(
     item: *AssetProducerBatchItem,
     produced: []const u8,
     window: *GeneratedReplayWindow,
+    scope: ?*FailureScope,
 ) !void {
     const privacy_output = try @import("../../../privacy/materialize.zig").output(runtime.alloc, item.source_text, item.request.producer_json, produced);
     defer if (privacy_output) |value| runtime.alloc.free(value);
@@ -20104,7 +21555,7 @@ fn applyAssetProducerBatchOutput(
     if (item.producer_context) |*value| {
         // Record the dependency publication for exactly these bytes; every
         // replica promotes it when the ordered publication applies.
-        if (item.context_publish) |publish| try recordContextPublishIntent(runtime, item.request.doc_key, requestArtifactName(item.request), publish, validated);
+        if (item.context_publish) |publish| recordContextPublishIntent(runtime, item.request.doc_key, requestArtifactName(item.request), publish, validated) catch |err| return FailureScope.assetPublicationFailure(scope, err);
         // Until the owner applies it, a replay retry resubmits these bytes
         // rather than invoking the provider again for the same input.
         const submitted = try submittedOutputKey(item);
@@ -20112,7 +21563,7 @@ fn applyAssetProducerBatchOutput(
         // Keep the output across retries (pending, catalog activation drift,
         // owner rejections); only acceptance retires it. The output depends
         // on the producer input alone, and every resubmission is validated.
-        try enqueueAssetProducerOutput(runtime, item.request, value, item.artifact_key, validated);
+        try enqueueAssetProducerOutput(runtime, item.request, value, item.artifact_key, validated, scope);
         if (comptime builtin.os.tag != .freestanding) if (submitted) |key| runtime.submitted_outputs.remove(runtime.alloc, key);
         return;
     }
@@ -20173,7 +21624,7 @@ fn applyAssetProducerBatchOutput(
     // producing them again.
     const recorded = try submittedOutputKey(item);
     if (comptime builtin.os.tag != .freestanding) if (recorded) |key| try runtime.submitted_outputs.put(runtime.alloc, key, produced);
-    try storePutBatchGuarded(runtime, writes.items, &.{}, .{ .doc_key = item.request.doc_key, .digest = sourceRecordDigest(item.raw_doc), .upstream_name = item.request.upstream_artifact_name, .upstream_digest = item.upstream_digest, .producer_name = requestArtifactName(item.request), .producer_recipe = producer_recipe, .dependency = if (item.context_publish) |publish| .{ .artifact = requestArtifactName(item.request), .publish = publish, .new_version = true, .producer_recipe = producer_recipe } else null });
+    storePutBatchGuarded(runtime, writes.items, &.{}, .{ .doc_key = item.request.doc_key, .digest = sourceRecordDigest(item.raw_doc), .upstream_name = item.request.upstream_artifact_name, .upstream_digest = item.upstream_digest, .producer_name = requestArtifactName(item.request), .producer_recipe = producer_recipe, .dependency = if (item.context_publish) |publish| .{ .artifact = requestArtifactName(item.request), .publish = publish, .new_version = true, .producer_recipe = producer_recipe } else null }) catch |err| return FailureScope.assetPublicationFailure(scope, err);
     if (comptime builtin.os.tag != .freestanding) if (recorded) |key| runtime.submitted_outputs.remove(runtime.alloc, key);
 
     try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, item.artifact_key);
@@ -20185,10 +21636,10 @@ fn applyAssetProducerBatchOutput(
         runtime.alloc.free(text_indexes);
     }
     try appendInlineFullTextDocumentToWindow(runtime, window, item.artifact_key, validated, text_indexes);
-    try materializeGraphAssetForRuntime(runtime, item.request, validated, item.raw_doc, window);
+    try materializeGraphAssetForRuntime(runtime, item.request, validated, item.raw_doc, window, scope);
     recordArtifactBytes(runtime, .asset, validated.len);
     try queueArtifactCoverageOutcomeForRequest(runtime, window, item.request, .produced);
-    try retireIndexDocumentCheckpoint(runtime, item.request, null);
+    retireIndexDocumentCheckpoint(runtime, item.request, null) catch |err| return FailureScope.assetPublicationFailure(scope, err);
 }
 
 /// Use the same completed-state gate for metadata fingerprints known before a
@@ -20327,29 +21778,20 @@ fn processDocumentExtractionAsset(
     std.log.info("document extraction fetching source: doc_key={s} artifact={s}", .{ request.doc_key, artifact_name });
     var resource_tracker = RuntimeDocumentExtractionResourceTracker.init(runtime);
     defer resource_tracker.deinit();
-    const fetched = prepared_sources.fetch(
-        source_url,
-        if (config.credentials.len > 0) config.credentials else null,
-        remoteRenderConfig(
-            runtime.config.secret_store,
-            runtime.config.remote_content,
-            runtime.config.io,
-            runtime.config.cancellation,
-            null,
-            scopedRetryHint(runtime.config.fetch_retry_hint, request, raw_doc),
-        ),
-    ) catch |raw_err| {
-        const err: anyerror = if (raw_err == error.OutOfMemory and
+    const fetched = fetchEnrichmentSource(runtime, prepared_sources, source_url, if (config.credentials.len > 0) config.credentials else null, request, raw_doc) catch |raw_err| {
+        const err = if (raw_err == error.OutOfMemory and
             prepared_sources.budgeted != null and prepared_sources.budgeted.?.denied())
             documentExtractionBudgetDenialError(&prepared_sources.budgeted.?)
         else
             raw_err;
         // Consult the owning durable retry scope before publishing a terminal
         // receipt. The runtime-global counter does not own lane retries.
+        try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, .{});
         if (try scope.shouldYield(runtime, err)) return err;
         try writeDocumentExtractionFailureManifest(
             runtime,
             request.doc_key,
+            raw_doc,
             artifact_name,
             source_url,
             metadata_fingerprint orelse "",
@@ -20363,13 +21805,15 @@ fn processDocumentExtractionAsset(
             from_generation,
             request.execution_json,
             window,
+            scope,
         );
-        try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
+        recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime)) catch |save_err| return FailureScope.assetPublicationFailure(scope, save_err);
         return;
     };
     var prepared_source_lease = switch (fetched) {
         .ok => |lease| lease,
         .http_error => |http_error| {
+            try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, .{});
             if (document_extraction_mod.remoteHttpStatusIsTransient(http_error.status)) {
                 // Parking persists the deadline, so install the server hint
                 // before asking the durable scope to schedule this attempt.
@@ -20381,6 +21825,7 @@ fn processDocumentExtractionAsset(
             try writeDocumentExtractionFailureManifest(
                 runtime,
                 request.doc_key,
+                raw_doc,
                 artifact_name,
                 source_url,
                 metadata_fingerprint orelse "",
@@ -20394,8 +21839,9 @@ fn processDocumentExtractionAsset(
                 from_generation,
                 request.execution_json,
                 window,
+                scope,
             );
-            try recordIsolatedRequestErrorFor(runtime, window, request, error.RemoteDocumentFetchFailed, scope.attemptNumber(runtime));
+            recordIsolatedRequestErrorFor(runtime, window, request, error.RemoteDocumentFetchFailed, scope.attemptNumber(runtime)) catch |save_err| return FailureScope.assetPublicationFailure(scope, save_err);
             return;
         },
     };
@@ -20414,6 +21860,7 @@ fn processDocumentExtractionAsset(
         try writeDocumentExtractionFailureManifest(
             runtime,
             request.doc_key,
+            raw_doc,
             artifact_name,
             source_url,
             metadata_fingerprint orelse "",
@@ -20427,8 +21874,9 @@ fn processDocumentExtractionAsset(
             from_generation,
             request.execution_json,
             window,
+            scope,
         );
-        try recordIsolatedRequestErrorFor(runtime, window, request, raw_err, scope.attemptNumber(runtime));
+        recordIsolatedRequestErrorFor(runtime, window, request, raw_err, scope.attemptNumber(runtime)) catch |save_err| return FailureScope.assetPublicationFailure(scope, save_err);
         return;
     };
     const byte_source_fingerprint = if (metadata_fingerprint == null)
@@ -20492,16 +21940,20 @@ fn processDocumentExtractionAsset(
     // actual live bytes first. Task-local inspection is then allocator charged
     // at its live size, while each render/provider window owns a short-lived
     // atomic lease below.
+    const preparation_cancellation = enrichmentSourceCancellation(runtime);
     var prepared_pdf_source_lease: ?PreparedDocumentSourceCache.PreparedPdfLease = if (source_is_pdf)
         prepared_sources.preparePdf(
             &prepared_source_lease,
             configured_pdf_decode_limits,
             runtime.syncWaitTimeoutMs(),
-        ) catch |err| {
+            pdfPreparationOwner(runtime, &preparation_cancellation),
+        ) catch |raw_err| {
+            const err = providerInvocationFailure(runtime, raw_err);
             if (try scope.shouldYield(runtime, err)) return err;
             try writeDocumentExtractionFailureManifest(
                 runtime,
                 request.doc_key,
+                raw_doc,
                 artifact_name,
                 source_url,
                 source_fingerprint,
@@ -20515,8 +21967,9 @@ fn processDocumentExtractionAsset(
                 from_generation,
                 request.execution_json,
                 window,
+                scope,
             );
-            try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
+            recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime)) catch |save_err| return FailureScope.assetPublicationFailure(scope, save_err);
             return;
         }
     else
@@ -20541,11 +21994,11 @@ fn processDocumentExtractionAsset(
     const document_extraction_alloc = if (source_is_pdf) pdf_inspection_reservation.allocator() else runtime.alloc;
     var pdf_inspection_deadline = document_extraction_mod.PdfRenderDeadline.init(runtime.syncWaitTimeoutMs());
     var prepared_pdf_session: ?document_extraction_mod.PdfRenderSession = if (prepared_pdf_source) |source|
-        try document_extraction_mod.PdfRenderSession.initFromPrepared(
+        document_extraction_mod.PdfRenderSession.initFromPrepared(
             document_extraction_alloc,
             source,
             pdf_inspection_deadline.probe(),
-        )
+        ) catch |err| return pdf_inspection_deadline.classifyError(err)
     else
         null;
     if (prepared_pdf_session) |*session| try session.setDecodeLimits(extraction_config.pdf_decode_limits);
@@ -20658,6 +22111,7 @@ fn processDocumentExtractionAsset(
         try writeDocumentExtractionFailureManifest(
             runtime,
             request.doc_key,
+            raw_doc,
             artifact_name,
             source_url,
             source_fingerprint,
@@ -20671,8 +22125,9 @@ fn processDocumentExtractionAsset(
             from_generation,
             request.execution_json,
             window,
+            scope,
         );
-        try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
+        recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime)) catch |save_err| return FailureScope.assetPublicationFailure(scope, save_err);
         return;
     };
     // Page rendering is complete. Its task-local coordinator is gone, while the
@@ -20888,6 +22343,7 @@ fn processDocumentExtractionAsset(
         try writeDocumentExtractionFailureManifest(
             runtime,
             request.doc_key,
+            raw_doc,
             artifact_name,
             source_url,
             source_fingerprint,
@@ -20901,8 +22357,9 @@ fn processDocumentExtractionAsset(
             from_generation,
             request.execution_json,
             window,
+            scope,
         );
-        try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
+        recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime)) catch |save_err| return FailureScope.assetPublicationFailure(scope, save_err);
         return;
     };
     config.pdf_decode_limits = configured_pdf_decode_limits;
@@ -21052,6 +22509,7 @@ fn boundaryFailureErrorName(failure: *const runtime_failure_abi.FailureIdentity,
 fn writeDocumentExtractionFailureManifest(
     runtime: *EnrichmentRuntime,
     doc_key: []const u8,
+    raw_doc: []const u8,
     artifact_name: []const u8,
     source_url: []const u8,
     source_fingerprint: []const u8,
@@ -21065,6 +22523,7 @@ fn writeDocumentExtractionFailureManifest(
     from_generation: u64,
     execution_json: []const u8,
     window: *GeneratedReplayWindow,
+    scope: *FailureScope,
 ) !void {
     var previous_state = RuntimeDocumentExtractionPreviousState{};
     defer previous_state.deinit(runtime.alloc);
@@ -21104,26 +22563,15 @@ fn writeDocumentExtractionFailureManifest(
     );
     defer runtime.alloc.free(manifest);
 
-    var writes = std.ArrayListUnmanaged(KVPair).empty;
-    defer {
-        for (writes.items) |write| {
-            runtime.alloc.free(@constCast(write.key));
-            runtime.alloc.free(@constCast(write.value));
-        }
-        writes.deinit(runtime.alloc);
-    }
-
-    try writes.append(runtime.alloc, .{
-        .key = try runtime.alloc.dupe(u8, manifest_key),
-        .value = try runtime.alloc.dupe(u8, manifest),
-    });
-    try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, manifest_key);
-
     // Keep the last successfully materialized state and child artifacts. The
     // failed manifest and repair ledger make the source stale/observable, while
     // retaining searchable data and enough prior state for a later repair to
     // diff and remove obsolete children correctly.
-    try storePutBatchWithRetry(runtime, writes.items, &.{});
+    storePutBatchGuardedWithRetry(runtime, &.{.{ .key = manifest_key, .value = manifest }}, &.{}, .{
+        .doc_key = doc_key,
+        .digest = sourceRecordDigest(raw_doc),
+    }) catch |err| return FailureScope.assetPublicationFailure(scope, err);
+    appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, manifest_key) catch |err| return FailureScope.assetPublicationFailure(scope, err);
     recordArtifactBytes(runtime, .asset, manifest.len);
 }
 
@@ -21740,15 +23188,15 @@ const RuntimePdfOcrCoordinator = struct {
             self.deadline.probe(),
         ) catch |err| {
             if (self.allocationDeniedError()) |denial| return denial;
-            return err;
+            return self.deadline.classifyError(err);
         };
         self.session_initialized = true;
         errdefer self.session.deinit();
         self.session.prepareForBatchRendering() catch |err| {
             if (self.allocationDeniedError()) |denial| return denial;
-            return err;
+            return self.deadline.classifyError(err);
         };
-        try self.configureRenderBudget(config);
+        self.configureRenderBudget(config) catch |err| return self.deadline.classifyError(err);
         return self;
     }
 
@@ -21775,11 +23223,11 @@ const RuntimePdfOcrCoordinator = struct {
             self.deadline.probe(),
         ) catch |err| {
             if (self.allocationDeniedError()) |denial| return denial;
-            return err;
+            return self.deadline.classifyError(err);
         };
         self.session_initialized = true;
         errdefer self.session.deinit();
-        try self.configureRenderBudget(config);
+        self.configureRenderBudget(config) catch |err| return self.deadline.classifyError(err);
         return self;
     }
 
@@ -21877,6 +23325,41 @@ pub fn runNativePdfOcrCoordinatorIntegration(
     );
     defer coordinator.destroy();
 
+    const CancelSink = struct {
+        fn begin(_: *anyopaque, _: document_extraction_mod.StreamInfo) !void {}
+        fn unit(raw: *anyopaque, _: *document_extraction_mod.Unit) !void {
+            const deadline: *document_extraction_mod.PdfRenderDeadline = @ptrCast(@alignCast(raw));
+            deadline.deadline_ns = 0;
+            return error.Canceled;
+        }
+        fn end(_: *anyopaque) !void {}
+    };
+    const cancel_sink: document_extraction_mod.UnitSink = .{
+        .ptr = &coordinator.deadline,
+        .on_begin = CancelSink.begin,
+        .on_unit = CancelSink.unit,
+        .on_end = CancelSink.end,
+    };
+    try std.testing.expectError(error.Canceled, document_extraction_mod.extractPreparedPdfStreamingWithTextCache(
+        alloc,
+        &coordinator.session,
+        "application/pdf",
+        .{},
+        .always,
+        cancel_sink,
+        null,
+    ));
+    try std.testing.expectError(error.PdfRenderTimeout, document_extraction_mod.extractPreparedPdfStreamingWithTextCache(
+        alloc,
+        &coordinator.session,
+        "application/pdf",
+        .{},
+        .always,
+        cancel_sink,
+        null,
+    ));
+    coordinator.beginOperation(30_000);
+
     const persistent_bytes = coordinator.reservation.live_bytes;
     if (persistent_bytes == 0) return error.PdfCoordinatorDidNotRetainParsedState;
     try std.testing.expect(resources.sliceStats(.document_extraction_working_set).used_bytes >= persistent_bytes);
@@ -21956,6 +23439,17 @@ pub fn runNativePdfOcrCoordinatorIntegration(
             .config = .{},
             .ownership = undefined,
         };
+        const expired: document_extraction_mod.PdfRenderDeadline = .{ .deadline_ns = 0 };
+        var expired_retry = try PdfDeferredRenderRetry.capture(alloc, &plans, rendered, deferred.?.options, available_bytes);
+        defer if (expired_retry) |*retry| retry.deinit(alloc);
+        try std.testing.expectError(error.PdfRenderTimeout, PdfDeferredRenderRetry.retryAfterRelease(&expired_retry, &runtime, &coordinator.session, window_lease, &rendered, expired.probe()));
+        try std.testing.expect(expired_retry == null);
+        try std.testing.expectEqual(first_pointer, rendered.encoded.results[0].rendered.?.png.ptr);
+        for ([_]bool{ false, true }) |raster| {
+            var options = deferred.?.options;
+            options.cancellation = expired.probe();
+            try std.testing.expectError(error.PdfRenderTimeout, renderAdmittedPdfWindowBatchAlloc(&runtime, &coordinator.session, window_lease, &plans, options, raster, available_bytes, null));
+        }
         try PdfDeferredRenderRetry.retryAfterRelease(&deferred, &runtime, &coordinator.session, window_lease, &rendered, coordinator.deadline.probe());
         batch = rendered.encoded;
         try std.testing.expect(deferred == null and window_lease.rendering_finished);
@@ -22350,11 +23844,27 @@ const PdfEmbeddingRenderedWindow = union(enum) {
     }
 };
 
-fn embedPdfWindowPart(alloc: Allocator, embedder: embedder_mod.DenseEmbedder, name: []const u8, part: PdfEmbeddingRenderedWindow, dims: u32) !PdfPageEmbeddingBatch {
-    return switch (part) {
+fn embedPdfWindowPart(
+    runtime: *EnrichmentRuntime,
+    guard: ForegroundCatchUpGuard,
+    alloc: Allocator,
+    embedder: embedder_mod.DenseEmbedder,
+    name: []const u8,
+    part: PdfEmbeddingRenderedWindow,
+    dims: u32,
+) !PdfPageEmbeddingBatch {
+    const context = embedder.part_request_context;
+    try checkEmbeddingInvocationOwner(runtime, guard, context);
+    var output = (switch (part) {
         .encoded => |batch| embedRenderedPdfPageBatch(alloc, embedder, name, batch, dims),
         .raster => |batch| embedRenderedPdfPageRasterBatch(alloc, embedder, name, batch, dims),
+    }) catch |err| {
+        try checkEmbeddingInvocationOwner(runtime, guard, context);
+        return classifyProviderCancellation(err, guard, false);
     };
+    errdefer output.deinit(alloc);
+    try checkEmbeddingInvocationOwner(runtime, guard, context);
+    return output;
 }
 
 /// Invocation-scoped, lazy lossless representation of a borrowed raster
@@ -22857,8 +24367,8 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithBackingAllocator(
         if (try pipeline.restoreComputed(alloc, producer, config, batch_policy, source_fingerprint, source_bytes, units)) return;
     };
     if (uses_pdf_decoder_reservation and pdf_coordinator_slot.* == null) {
-        pdf_coordinator_slot.* = if (prepared_pdf_session) |prepared|
-            try RuntimePdfOcrCoordinator.createFromPrepared(
+        pdf_coordinator_slot.* = (if (prepared_pdf_session) |prepared|
+            RuntimePdfOcrCoordinator.createFromPrepared(
                 runtime.alloc,
                 backing_alloc,
                 runtime.config.resource_manager orelse runtime.index_manager.resource_manager,
@@ -22867,14 +24377,14 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithBackingAllocator(
                 prepared,
             )
         else
-            try RuntimePdfOcrCoordinator.create(
+            RuntimePdfOcrCoordinator.create(
                 runtime.alloc,
                 backing_alloc,
                 runtime.config.resource_manager orelse runtime.index_manager.resource_manager,
                 runtime.syncWaitTimeoutMs(),
                 config,
                 source_bytes,
-            );
+            )) catch |err| return providerInvocationFailure(runtime, err);
     }
     const pdf_coordinator = if (uses_pdf_decoder_reservation) pdf_coordinator_slot.* else null;
     var budgeted_allocator: ?resource_manager_mod.BudgetedAllocator = if ((runtime.config.resource_manager orelse runtime.index_manager.resource_manager) != null)
@@ -22987,8 +24497,14 @@ const RuntimePdfRenderCancellation = struct {
         return false;
     }
 
+    fn cancellationError(raw: ?*const anyopaque, err: anyerror) anyerror {
+        const self: *const @This() = @ptrCast(@alignCast(raw orelse return err));
+        self.external.check() catch return self.external.classifyError(err);
+        return self.deadline.classifyError(err);
+    }
+
     fn probe(self: *const @This()) document_extraction_mod.PdfCancellationProbe {
-        return .{ .context = self, .is_cancelled_fn = isCancelled };
+        return .{ .context = self, .is_cancelled_fn = isCancelled, .cancellation_error_fn = cancellationError };
     }
 };
 
@@ -23557,7 +25073,7 @@ pub fn documentExtractionPdfOutputReservationBytes(
     const requests = try alloc.alloc(asset_producer_mod.Request, policy.max_items);
     defer alloc.free(requests);
     for (requests) |*prototype| prototype.* = representative_request;
-    const invocation = try invocation_producer.invocationMemoryForRequests(alloc, requests);
+    const invocation = try assetProviderInvocationMemory(runtime, invocation_producer, alloc, requests);
     const maximum_retained_raw_bytes = @min(
         policy.max_bytes,
         std.math.mul(usize, policy.max_items, maximum_pdf_page_inline_png_bytes) catch std.math.maxInt(usize),
@@ -24091,6 +25607,7 @@ fn renderAdmittedPdfWindowBatchAlloc(
     max_scratch_bytes: usize,
     deferred: ?*?PdfDeferredRenderRetry,
 ) !RuntimePdfRenderBatch {
+    options.cancellation.check() catch |err| return options.cancellation.classifyError(err);
     const Growth = struct {
         lease: *PdfWindowCompositeLease,
         maximum: usize,
@@ -24122,12 +25639,12 @@ fn renderAdmittedPdfWindowBatchAlloc(
                 .{ .encoded = try renderPreparedPdfWindowBatchAlloc(self.runtime, self.session, alloc, active_plans, opts) };
         }
     };
-    var batch = try renderPdfWindowWithScratchRetry(Render{
+    var batch = renderPdfWindowWithScratchRetry(Render{
         .runtime = runtime,
         .session = session,
         .plans = plans,
         .use_rasters = use_rasters,
-    }, lease, admitted_options, max_scratch_bytes);
+    }, lease, admitted_options, max_scratch_bytes) catch |err| return options.cancellation.classifyError(err);
     errdefer batch.deinit(lease.allocator());
     if (deferred) |slot| slot.* = try PdfDeferredRenderRetry.capture(lease.owner_alloc, plans, batch, options, max_scratch_bytes);
     return batch;
@@ -24187,7 +25704,7 @@ const PdfDeferredRenderRetry = struct {
         var retry = slot.* orelse return;
         slot.* = null; // Includes cancellation/error paths: never retry forever.
         defer retry.deinit(lease.owner_alloc);
-        try cancellation.check();
+        cancellation.check() catch |err| return cancellation.classifyError(err);
         std.debug.assert(lease.rendering_finished and lease.consumer_count == 0);
         lease.rendering_finished = false;
         defer lease.finishRendering();
@@ -24371,13 +25888,13 @@ test "PDF render scratch retry admits delta and preserves completed results" {
 
 /// Plan only legal model sub-batches. Summing their ceilings is conservative
 /// for sequential execution and covers retained outputs across the window.
-fn pdfRenderWindowInvocationMemory(producer: asset_producer_mod.Producer, alloc: Allocator, requests: []const asset_producer_mod.Request, model_items: usize) !inference_work.InvocationMemoryPlan {
-    if (requests.len <= model_items) return producer.invocationMemoryForRequests(alloc, requests);
-    var total = try producer.invocationMemoryForRequests(alloc, requests[0..model_items]);
+fn pdfRenderWindowInvocationMemory(runtime: anytype, producer: asset_producer_mod.Producer, alloc: Allocator, requests: []const asset_producer_mod.Request, model_items: usize) !inference_work.InvocationMemoryPlan {
+    if (requests.len <= model_items) return assetProviderInvocationMemory(runtime, producer, alloc, requests);
+    var total = try assetProviderInvocationMemory(runtime, producer, alloc, requests[0..model_items]);
     var cursor = model_items;
     while (cursor < requests.len) {
         const end = cursor + @min(model_items, requests.len - cursor);
-        const next = try producer.invocationMemoryForRequests(alloc, requests[cursor..end]);
+        const next = try assetProviderInvocationMemory(runtime, producer, alloc, requests[cursor..end]);
         try addPdfWindowInvocationMemory(&total, next);
         cursor = end;
     }
@@ -24583,6 +26100,7 @@ fn renderRuntimePdfWindow(
         }
         admission_phase = "invocation";
         const full_invocation_memory = try pdfRenderWindowInvocationMemory(
+            runtime,
             invocation_producer,
             alloc,
             prototype_requests,
@@ -24613,6 +26131,7 @@ fn renderRuntimePdfWindow(
                 full_invocation_memory
             else
                 try pdfRenderWindowInvocationMemory(
+                    runtime,
                     invocation_producer,
                     alloc,
                     prototype_requests[0..candidate_count],
@@ -24739,6 +26258,20 @@ fn renderRuntimePdfWindow(
 /// fully admitted render window to run on an Io worker during inference for
 /// the preceding window. The renderer itself may still use its bounded page
 /// lane; no second caller touches the session until this preparation returns.
+fn pdfWindowCancellationProbe(preparer: anytype) document_extraction_mod.PdfCancellationProbe {
+    const Preparer = @TypeOf(preparer.*);
+    const Probe = struct {
+        fn classify(raw: ?*const anyopaque, err: anyerror) anyerror {
+            const self: *const Preparer = @ptrCast(@alignCast(raw orelse return err));
+            self.guard.check() catch |control| return control;
+            if (self.lifecycle.isCancelled()) return error.EnrichmentWaitCanceled;
+            if (self.cancel_requested.load(.acquire)) return err;
+            return self.coordinator.deadline.classifyError(err);
+        }
+    };
+    return .{ .context = preparer, .is_cancelled_fn = Preparer.isCancelled, .cancellation_error_fn = Probe.classify };
+}
+
 const RuntimePdfRenderWindowPreparer = struct {
     runtime: *EnrichmentRuntime,
     // Snapshot the owner's guard before dispatch: shared consumers may change
@@ -24767,7 +26300,7 @@ const RuntimePdfRenderWindowPreparer = struct {
     }
 
     fn cancellationProbe(self: *const @This()) document_extraction_mod.PdfCancellationProbe {
-        return .{ .context = self, .is_cancelled_fn = isCancelled };
+        return pdfWindowCancellationProbe(self);
     }
 
     fn prepare(self: *const @This(), start_index: usize) !RuntimePdfRenderWindow {
@@ -24785,7 +26318,7 @@ const RuntimePdfRenderWindowPreparer = struct {
         const available_bytes = try self.coordinator.availableRenderBytes();
         var policy = self.batch_policy;
         policy.defer_render_pressure = speculative;
-        var window = try renderRuntimePdfWindow(
+        var window = renderRuntimePdfWindow(
             self.runtime,
             @import("antfly_platform").allocator.concurrentFallback(),
             self.producer,
@@ -24802,7 +26335,7 @@ const RuntimePdfRenderWindowPreparer = struct {
             start_index,
             self.use_borrowed_rasters,
             self.cancellationProbe(),
-        );
+        ) catch |err| return self.cancellationProbe().classifyError(err);
         errdefer window.deinit();
         if (self.cancel_requested.load(.acquire)) return error.Canceled;
         return window;
@@ -24839,6 +26372,12 @@ test "enrichment PDF preparers retain owner cancellation across operation retrie
         try std.testing.expectError(error.Canceled, probe.check());
         local.store(false, .release);
         try probe.check();
+        coordinator.deadline.deadline_ns = 0;
+        try std.testing.expectEqual(error.PdfRenderTimeout, probe.classifyError(error.Canceled));
+        lifecycle.store(true, .release);
+        try std.testing.expectEqual(error.EnrichmentWaitCanceled, probe.classifyError(error.Canceled));
+        lifecycle.store(false, .release);
+        coordinator.deadline.deadline_ns = std.math.maxInt(u64);
     }
 }
 
@@ -24873,6 +26412,7 @@ fn checkPdfPrefetchRetry(err: anyerror) !void {
         error.ResourceTemporarilyUnavailable,
         error.DocumentExtractionWorkingSetTooLarge,
         error.Canceled,
+        error.PdfRenderTimeout,
         => {},
         else => err,
     };
@@ -24975,7 +26515,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
             .content_type = reader_mime,
             .inline_media_trusted = true,
         };
-        if (try invocation_producer.capabilitiesForRequests(working_alloc, &.{prototype})) |capabilities| {
+        if (try assetProviderCapabilities(runtime, invocation_producer, working_alloc, &.{prototype})) |capabilities| {
             if (!capabilities.supports(.{ .image = true }) or
                 (!use_pdf_borrowed_rasters and !capabilities.acceptsMimeType(reader_mime)))
                 return error.UnsupportedInferenceModality;
@@ -25446,8 +26986,12 @@ fn runtimeGeneratedTextBatchFailureToYield(
     items: []const asset_producer_mod.ProducedItem,
 ) ?inference_work.ItemFailure {
     for (items) |item| switch (item.result) {
-        .item_error => |failure| {
-            if (failure.retryable and shouldYieldRequestError(runtime, failure.cause))
+        .item_error => |raw_failure| {
+            var failure = raw_failure;
+            failure.cause = providerInvocationFailure(runtime, failure.cause);
+            if (failure.cause == error.ProviderInvocationCanceled) failure.retryable = true;
+            if (isEnrichmentControlError(failure.cause) or
+                (failure.retryable and shouldYieldRequestError(runtime, failure.cause)))
                 return failure;
         },
         .value => {},
@@ -25631,6 +27175,8 @@ fn recoverRuntimeGeneratedTextBatch(
     err: anyerror,
 ) !void {
     if (requests.len != unit_indices.len) return error.InvalidAssetProducerResponse;
+    // The canceled invocation may still be unwinding on the provider.
+    if (err == error.ProviderInvocationCanceled) return err;
     if (generatedTextBatchFailureIsAttributable(kind, err, requests.len)) {
         try markRuntimeGeneratedUnitFailuresTransactional(alloc, working_alloc, units, unit_indices, method, kind, err);
         clearRuntimeGeneratedTextBatchParts(working_alloc, parts_values);
@@ -25674,7 +27220,7 @@ fn applyRuntimeGeneratedTextBatch(
     for (produced_batch.items, unit_indices, 0..) |*item, unit_idx, i| {
         switch (item.result) {
             .item_error => |failure| {
-                staged_updates[i] = try stageRuntimeGeneratedUnitFailure(alloc, units[unit_idx], method, kind, failure.cause);
+                staged_updates[i] = try stageRuntimeGeneratedUnitFailure(alloc, units[unit_idx], method, kind, providerInvocationFailure(runtime, failure.cause));
             },
             .value => |output| {
                 staged_updates[i] = try cloneDocumentExtractionUnit(alloc, units[unit_idx]);
@@ -26466,7 +28012,7 @@ fn collectRuntimeDocumentExtractionDesiredKeysForUnit(
         if (entry.kind != .chunk) continue;
         if (!std.mem.eql(u8, entry.source_artifact_name, artifact_name)) continue;
         const chunks = if (entry.chunker_json.len > 0)
-            try chunker_mod.chunkTextWithConfigJsonAndProvider(alloc, unit.text, entry.chunker_json, runtime.config.chunk_provider)
+            try chunkTextWithProviderForEnrichment(runtime, alloc, unit.text, entry.chunker_json, runtime.config.chunk_provider)
         else
             try chunker_mod.chunkText(alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
         defer chunker_mod.freeChunks(alloc, chunks);
@@ -29000,7 +30546,7 @@ fn publishOrderedUnitChunksGenerationWithAllocator(runtime: *EnrichmentRuntime, 
         unit = parsed_unit.?.unit;
         fingerprint = parsed_unit.?.fingerprint;
         desired = if (config.chunker_json.len != 0)
-            try chunker_mod.chunkTextWithConfigJsonAndProvider(alloc, unit.text, config.chunker_json, runtime.config.chunk_provider)
+            try chunkTextWithProviderForEnrichment(runtime, alloc, unit.text, config.chunker_json, runtime.config.chunk_provider)
         else
             try chunker_mod.chunkText(alloc, unit.text, config.chunk_size, config.chunk_overlap);
         document_extraction_mod.applyTranscriptTiming(unit, desired);
@@ -29024,7 +30570,7 @@ fn publishOrderedUnitChunksGenerationWithAllocator(runtime: *EnrichmentRuntime, 
     }
     const manifest = builder.finish().encode();
     effects[count] = .{ .family = .document_artifact, .key = input.manifest_key, .value = &manifest, .source_index = 0 };
-    try enqueueProducerEffects(runtime, &input.token, effects);
+    try enqueueProducerEffects(runtime, &input.token, effects, null);
 }
 
 fn appendRuntimeDocumentUnitChunkWrites(
@@ -29040,7 +30586,7 @@ fn appendRuntimeDocumentUnitChunkWrites(
         if (entry.kind != .chunk) continue;
         if (!std.mem.eql(u8, entry.source_artifact_name, context.artifact_name)) continue;
         const chunks = if (entry.chunker_json.len > 0)
-            try chunker_mod.chunkTextWithConfigJsonAndProvider(working_alloc, unit.text, entry.chunker_json, context.runtime.config.chunk_provider)
+            try chunkTextWithProviderForEnrichment(context.runtime, working_alloc, unit.text, entry.chunker_json, context.runtime.config.chunk_provider)
         else
             try chunker_mod.chunkText(working_alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
         defer chunker_mod.freeChunks(working_alloc, chunks);
@@ -29184,20 +30730,20 @@ const GraphAssetExpectation = union(enum) {
     observed: ?[]const u8,
 };
 
-fn publishOrderedGraphForRuntime(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, expected_asset: GraphAssetExpectation) !bool {
+fn publishOrderedGraphForRuntime(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, expected_asset: GraphAssetExpectation, failure_scope: ?*FailureScope) !bool {
     var budget = if (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) |manager|
-        resource_manager_mod.BudgetedAllocator.init(manager, .relational_preparation_working_set, runtime.alloc, 1)
+        runtime.media_window_capture.budget(manager, runtime.alloc)
     else
         null;
     defer if (budget) |*tracked| tracked.deinit();
     const alloc = if (budget) |*tracked| tracked.allocator() else runtime.alloc;
-    return publishOrderedGraphWithAllocator(runtime, alloc, request, expected_asset) catch |err| {
+    return publishOrderedGraphWithAllocator(runtime, alloc, request, expected_asset, failure_scope) catch |err| {
         if (err == error.OutOfMemory) if (budget) |*tracked| if (tracked.denied()) return error.ResourceBudgetExceeded;
         return err;
     };
 }
 
-fn publishOrderedGraphWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, expected_asset: GraphAssetExpectation) !bool {
+fn publishOrderedGraphWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, expected_asset: GraphAssetExpectation, failure_scope: ?*FailureScope) !bool {
     var read = try runtime.store.beginRead();
     var read_open = true;
     defer if (read_open) read.abort();
@@ -29242,8 +30788,8 @@ fn publishOrderedGraphWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocato
         const raw = try read.get(row_key);
         const logical = try runtime.index_manager.materializeStoredValueAlloc(alloc, row_key, raw);
         defer alloc.free(logical);
-        try materializeGraphAssetForRuntime(context, request, value, logical, &window);
-    } else try materializeGraphAssetDeleteForRuntime(context, request, &window);
+        try materializeGraphAssetForRuntime(context, request, value, logical, &window, null);
+    } else try materializeGraphAssetDeleteForRuntime(context, request, &window, null);
     // Serialization owns all bytes before the snapshot is released. Queue
     // admission cannot itself credit replay or coverage; accepted retries use
     // the same logical-input receipt and skip mutable-state planning.
@@ -29261,7 +30807,8 @@ fn publishOrderedGraphWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocato
     read_open = false;
     if (encoded.items.len == 0) return true;
     const dispatcher = runtime.artifact_publication_dispatcher orelse return error.ArtifactCatalogDrift;
-    for (encoded.items) |bytes| try dispatcher.submit(context.base.namespace, bytes);
+    for (encoded.items) |bytes| dispatcher.submit(context.base.namespace, bytes) catch |err|
+        return FailureScope.assetPublicationFailure(failure_scope, err);
     return error.ArtifactPublicationPending;
 }
 
@@ -29325,9 +30872,9 @@ fn queueGraphNeighborMutations(runtime: anytype, window: *GeneratedReplayWindow,
 /// Publish legacy runtime graph projections through the same guarded promotion
 /// transaction as their replay record. Private stages are never graph effects;
 /// graph artifacts, source guards, and endpoint notifications commit together.
-fn publishRuntimeGraphMutations(runtime: anytype, window: *GeneratedReplayWindow, writes: []const KVPair, deletes: []const []const u8) !void {
+fn publishRuntimeGraphMutations(runtime: anytype, window: *GeneratedReplayWindow, writes: []const KVPair, deletes: []const []const u8, failure_scope: ?*FailureScope) !void {
     if (comptime @TypeOf(runtime) != *EnrichmentRuntime) {
-        return storePutBatchWithRetry(runtime, writes, deletes);
+        return storePutBatchWithRetry(runtime, writes, deletes) catch |err| return FailureScope.assetPublicationFailure(failure_scope, err);
     }
     const promotion_start = window.artifact_promotions.items.len;
     const guard_start = window.source_guards.items.len;
@@ -29396,17 +30943,19 @@ fn publishRuntimeGraphMutations(runtime: anytype, window: *GeneratedReplayWindow
         try appendGeneratedSourceGuard(runtime, window, key, sourceRecordDigest(raw), null, 0);
         try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.artifact_delete_keys, &window.artifact_delete_key_index, key);
     }
-    if (stages.items.len != 0) try storePutBatchWithRetry(runtime, stages.items, &.{});
+    if (stages.items.len != 0) storePutBatchWithRetry(runtime, stages.items, &.{}) catch |err|
+        return FailureScope.assetPublicationFailure(failure_scope, err);
 }
 
-fn materializeGraphAssetForRuntime(runtime: anytype, request: enrichment_types.GeneratedEnrichmentRequest, value: []const u8, raw_doc: []const u8, window: *GeneratedReplayWindow) !void {
+fn materializeGraphAssetForRuntime(runtime: anytype, request: enrichment_types.GeneratedEnrichmentRequest, value: []const u8, raw_doc: []const u8, window: *GeneratedReplayWindow, failure_scope: ?*FailureScope) !void {
     const before = window.artifact_promotions.items.len;
     const deletes_before = window.artifact_delete_keys.items.len;
-    try prepareGraphAssetForRuntime(runtime, request, value, raw_doc, window);
+    try prepareGraphAssetForRuntime(runtime, request, value, raw_doc, window, failure_scope);
     // Publish before another source on this document arbitrates contenders.
     // Preparation releases primary/index leases before entering the writer.
     if (comptime @TypeOf(runtime) == *EnrichmentRuntime) {
-        if (window.artifact_promotions.items.len != before or window.artifact_delete_keys.items.len != deletes_before) try flushGeneratedReplayWindowWithIdentity(runtime, window, 0);
+        if (window.artifact_promotions.items.len != before or window.artifact_delete_keys.items.len != deletes_before)
+            flushGeneratedReplayWindowWithIdentity(runtime, window, 0) catch |err| return FailureScope.assetPublicationFailure(failure_scope, err);
     }
 }
 
@@ -29416,9 +30965,10 @@ fn prepareGraphAssetForRuntime(
     value: []const u8,
     raw_doc: []const u8,
     window: *GeneratedReplayWindow,
+    failure_scope: ?*FailureScope,
 ) !void {
     if (comptime @TypeOf(runtime) == *EnrichmentRuntime) {
-        if (try publishOrderedGraphForRuntime(runtime, request, .{ .observed = value })) return;
+        if (try publishOrderedGraphForRuntime(runtime, request, .{ .observed = value }, failure_scope)) return;
     }
     if (!runtime.index_manager.hasGraphIndexes()) return;
     if (comptime @hasField(@typeInfo(@TypeOf(runtime)).pointer.child, "coverage_apply_mutex")) {
@@ -29637,19 +31187,20 @@ fn prepareGraphAssetForRuntime(
         }
         try visible_writes.appendSlice(runtime.alloc, writes.items[graph_write_count..]);
         if (visible_writes.items.len > 0 or deletes.items.len > 0) {
-            try publishRuntimeGraphMutations(runtime, window, visible_writes.items, deletes.items);
+            try publishRuntimeGraphMutations(runtime, window, visible_writes.items, deletes.items, failure_scope);
         }
     }
 }
 
-fn materializeGraphAssetDeleteForRuntime(runtime: anytype, request: enrichment_types.GeneratedEnrichmentRequest, window: *GeneratedReplayWindow) !void {
+fn materializeGraphAssetDeleteForRuntime(runtime: anytype, request: enrichment_types.GeneratedEnrichmentRequest, window: *GeneratedReplayWindow, failure_scope: ?*FailureScope) !void {
     const before = window.artifact_promotions.items.len;
     const deletes_before = window.artifact_delete_keys.items.len;
-    try prepareGraphAssetDeleteForRuntime(runtime, request, window);
+    try prepareGraphAssetDeleteForRuntime(runtime, request, window, failure_scope);
     // Publish before another source on this document arbitrates contenders.
     // Preparation releases primary/index leases before entering the writer.
     if (comptime @TypeOf(runtime) == *EnrichmentRuntime) {
-        if (window.artifact_promotions.items.len != before or window.artifact_delete_keys.items.len != deletes_before) try flushGeneratedReplayWindowWithIdentity(runtime, window, 0);
+        if (window.artifact_promotions.items.len != before or window.artifact_delete_keys.items.len != deletes_before)
+            flushGeneratedReplayWindowWithIdentity(runtime, window, 0) catch |err| return FailureScope.assetPublicationFailure(failure_scope, err);
     }
 }
 
@@ -29657,9 +31208,10 @@ fn prepareGraphAssetDeleteForRuntime(
     runtime: anytype,
     request: enrichment_types.GeneratedEnrichmentRequest,
     window: *GeneratedReplayWindow,
+    failure_scope: ?*FailureScope,
 ) !void {
     if (comptime @TypeOf(runtime) == *EnrichmentRuntime) {
-        if (try publishOrderedGraphForRuntime(runtime, request, .{ .observed = null })) return;
+        if (try publishOrderedGraphForRuntime(runtime, request, .{ .observed = null }, failure_scope)) return;
     }
     if (!runtime.index_manager.hasGraphIndexes()) return;
     if (comptime @hasField(@typeInfo(@TypeOf(runtime)).pointer.child, "coverage_apply_mutex")) {
@@ -29790,7 +31342,7 @@ fn prepareGraphAssetDeleteForRuntime(
             try appendUniqueIndexedRuntimeKey(runtime.alloc, &deletes, &delete_keys, key);
         }
         if (writes.items.len > 0 or deletes.items.len > 0) {
-            try publishRuntimeGraphMutations(runtime, window, writes.items, deletes.items);
+            try publishRuntimeGraphMutations(runtime, window, writes.items, deletes.items, failure_scope);
         }
     }
 }
@@ -30460,6 +32012,51 @@ test "enrichment runtime graph materializer rejects non-finite mapped weights" {
             100,
         ));
     }
+
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-validation", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try db_mod.DB.open(alloc, path, .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"artifact":"relations_v1","path":"$.items[*]","format":"extraction_relation",
+        \\    "nodes":{"target":"{{ _item.to }}"},"edge":{"type":"{{ _item.rel }}","weight":"{{ _item.score }}"}},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"relations\":{\"items\":[{\"rel\":\"mentions\",\"to\":\"doc:b\",\"score\":\"NaN\"}]}}" }},
+        .sync_level = .write,
+    });
+    try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
+    const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
+    var pin = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer pin.release();
+    var request = for (pin.plan().generated_templates) |candidate| {
+        if (candidate.kind == .asset and std.mem.eql(u8, requestArtifactName(candidate), "relations_v1")) break candidate;
+    } else return error.TestUnexpectedResult;
+    request.doc_key = "doc:a";
+    var dependent = request;
+    dependent.upstream_artifact_name = "relations_v1";
+    var queued: std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest) = .empty;
+    defer queued.deinit(runtime.alloc);
+    var sources = PreparedDocumentSourceCache.init(runtime);
+    defer sources.deinit();
+    var window = GeneratedReplayWindow{ .alloc = runtime.alloc };
+    defer window.deinit();
+    const fingerprint = requestFailureFingerprint(request);
+    setActiveFailureFingerprint(runtime, fingerprint);
+    try std.testing.expectError(error.InvalidGraphEdges, processPlannedAsset(runtime, request, &.{dependent}, &queued, &sources, &window));
+    try std.testing.expectEqual(fingerprint, runtime.active_failure_fingerprint);
+    try std.testing.expectEqual(@as(u32, 0), runtime.consecutive_retry_count);
 }
 
 fn runtimeAppendRelationItemsFromPath(
@@ -30694,39 +32291,40 @@ fn mediaEmbeddingComputationRequest(runtime: *EnrichmentRuntime, supplied: enric
 // A terminal receipt is an outcome, not a cache miss. Reuse it only for the
 // same declared Antfly computation; another provider/model/pin remains free
 // to embed retained text independently.
+fn isModelChunkEmbeddingFailure(receipt: @import("inference_chunker").outputs.Result) bool {
+    return receipt.kind == .embedding and std.mem.eql(u8, receipt.name, "embedding") and receipt.status == .failed;
+}
+
+fn selectTerminalModelChunkEmbeddingFailure(receipts: []const @import("inference_chunker").outputs.Result, sub_index: u32) ?@import("inference_chunker").outputs.Result {
+    for (receipts) |receipt| {
+        if (isModelChunkEmbeddingFailure(receipt) and receipt.sub_index == sub_index and receipt.terminal) return receipt;
+    }
+    return null;
+}
+
+const media_embedding_recipe = @import("../media_embedding_recipe.zig");
+
+fn resolveModelEmbeddingConsumerRecipe(arena: Allocator, provider: embedder_mod.DenseEmbedder, request: enrichment_types.GeneratedEnrichmentRequest) !?media_embedding_recipe.Recipe {
+    const recipe = try media_embedding_recipe.resolve(arena, request.producer_json, request.chunker_json, request.expected_dims) orelse return null;
+    if (!std.mem.eql(u8, provider.recoveryIdentity(requestEmbeddingName(request)).model, recipe.target.model)) return null;
+    return recipe;
+}
+
 fn terminalModelChunkEmbedding(a: Allocator, provider: embedder_mod.DenseEmbedder, request: enrichment_types.GeneratedEnrichmentRequest, parent: *const @import("inference_chunker").types.ModelMetadata) !bool {
     const raw = parent.outputs_json orelse return false;
     const O = @import("inference_chunker").outputs;
     var parsed = try std.json.parseFromSlice([]O.Result, a, raw, .{});
     defer parsed.deinit();
-    const receipt = for (parsed.value) |value| {
-        if (value.kind == .embedding and std.mem.eql(u8, value.name, "embedding") and value.sub_index == (parent.output_sub_index orelse 0) and value.status == .failed and value.terminal) break value;
-    } else return false;
-    var producer = try std.json.parseFromSlice(std.json.Value, a, request.producer_json, .{});
-    defer producer.deinit();
-    var config = producer.value;
-    if (config == .object) if (config.object.get("config")) |nested| {
-        config = nested;
-    };
-    if (config != .object) return false;
-    const kind = config.object.get("provider") orelse return false;
-    const model = config.object.get("model") orelse return false;
-    if (kind != .string or !std.mem.eql(u8, kind.string, "antfly") or model != .string or !std.mem.eql(u8, model.string, receipt.model) or !std.mem.eql(u8, provider.recoveryIdentity(requestEmbeddingName(request)).model, receipt.model)) return false;
-    if (config.object.get("model_identity")) |pin| if (pin != .null and (pin != .string or !std.mem.eql(u8, pin.string, receipt.model_identity))) return false;
-    inline for (.{ "instruction", "query_instruction", "document_input_type" }) |name| if (config.object.get(name)) |value| if (value != .null) return false;
-    const selected = modelEmbeddingMetadata(a, request, parent) catch |err| switch (err) {
-        error.IncompatibleChunkEmbeddingTarget => return false,
-        else => return err,
-    };
-    defer selected.deinit(a);
-    if (!std.mem.eql(u8, selected.model, receipt.model) or selected.dimensions != request.expected_dims) return false;
-    try receipt.validate(.{ .name = "embedding", .kind = .embedding, .model = receipt.model, .required = receipt.required, .dimensions = request.expected_dims, .task_type = selected.task_type });
+    const receipt = selectTerminalModelChunkEmbeddingFailure(parsed.value, parent.output_sub_index orelse 0) orelse return false;
+    var recipe_arena = std.heap.ArenaAllocator.init(a);
+    defer recipe_arena.deinit();
+    const recipe = try resolveModelEmbeddingConsumerRecipe(recipe_arena.allocator(), provider, request) orelse return false;
+    if (!try recipe.matches(a, receipt)) return false;
     const capabilities = provider.capabilities(a, requestEmbeddingName(request)) catch |err| switch (err) {
-        error.EmbeddingCapabilitiesUnavailable => return receipt.model_revision.len == 0,
+        error.EmbeddingCapabilitiesUnavailable => return media_embedding_recipe.matchesRevision(receipt.model_revision, null),
         else => return err,
     };
-    const revision = capabilities.model_revision orelse return receipt.model_revision.len == 0;
-    return std.mem.eql(u8, &std.fmt.bytesToHex(revision, .lower), receipt.model_revision);
+    return media_embedding_recipe.matchesRevision(receipt.model_revision, capabilities.model_revision);
 }
 
 fn storedModelChunkVectorCached(runtime: *EnrichmentRuntime, a: Allocator, provider: embedder_mod.DenseEmbedder, supplied_request: enrichment_types.GeneratedEnrichmentRequest, payload: []const u8, cache: ?*MediaPassVectorCache) !?[]f32 {
@@ -30736,8 +32334,9 @@ fn storedModelChunkVectorCached(runtime: *EnrichmentRuntime, a: Allocator, provi
     const request = if (parent.outputs_json != null) mediaEmbeddingComputationRequest(runtime, supplied_request) else supplied_request;
     const metadata = try modelEmbeddingMetadata(a, request, parent);
     defer metadata.deinit(a);
-    if (try terminalModelChunkEmbedding(a, provider, request, parent)) return error.RequiredMediaOutputFailed;
-    const compatible = try modelChunkSelectedTargetCompatible(runtime.alloc, provider, request, metadata);
+    if ((terminalModelChunkEmbedding(a, provider, request, parent) catch |err| return providerInvocationFailure(runtime, err))) return error.RequiredMediaOutputFailed;
+    const compatible = modelChunkSelectedTargetCompatible(runtime.alloc, provider, request, metadata) catch |err|
+        return providerInvocationFailure(runtime, err);
     const key = try chunk_mod.modelMemoKey(a, metadata.*);
     if (compatible and request.reprocess_generation == 0) if (runtime.dense_result_cache) |memo| if (try memo.lookup(memo.ptr, a, key)) |cached| return cached;
     if (compatible and request.reprocess_generation == 0) if (try stagedModelChunkVectorCached(runtime, a, request, payload, metadata, cache)) |vector| return vector;
@@ -30771,7 +32370,7 @@ fn replayModelChunkVector(runtime: *EnrichmentRuntime, a: Allocator, request: en
     var source_request = request;
     source_request.source_field = source_field;
     source_request.source_template = "";
-    var source = try extractModelChunkSource(a, runtime.config, parent, source_request, assetProviderRequestContext(runtime));
+    var source = try extractModelChunkEnrichmentSource(runtime, a, parent, source_request, null);
     defer source.deinit(a);
     const input = source.input orelse return error.EnrichmentSourceChanged;
     if (request.chunker_json.len != 0) {
@@ -30818,8 +32417,13 @@ fn replayModelChunkVector(runtime: *EnrichmentRuntime, a: Allocator, request: en
     config.replay.?.source_version = try a.dupe(u8, metadata.source_version);
     config.replay.?.source_fingerprint = try a.dupe(u8, metadata.source_fingerprint);
     config.replay.?.plan_id = try a.dupe(u8, metadata.plan_id);
-    const chunks = try @import("../../../chunking/inference.zig").chunkInputWithProvider(a, config, input, runtime.config.chunk_provider);
+    var cancellation: AssetInvocationCancellation = undefined;
+    const scoped = scopedChunkProvider(runtime, runtime.config.chunk_provider, &cancellation);
+    try checkChunkOwner(runtime, scoped);
+    const chunks = model_chunk_client.chunkInputWithProvider(a, config, input, scoped) catch |err|
+        return chunkProviderFailure(runtime, scoped, err);
     defer @import("inference_chunker").types.freeChunks(a, chunks);
+    try checkChunkOwner(runtime, scoped);
     if (chunks.len != 1) return error.InvalidChunkReplay;
     const reproduced = chunks[0].metadata orelse return error.InvalidChunkReplay;
     if (!std.mem.eql(u8, reproduced.model_revision, metadata.model_revision) or !std.mem.eql(u8, reproduced.model_identity, metadata.model_identity) or !std.mem.eql(u8, reproduced.inference_id, metadata.inference_id)) return error.EnrichmentSourceChanged;
@@ -30857,7 +32461,6 @@ fn modelEmbeddingMetadataFromResults(a: Allocator, request: enrichment_types.Gen
     return modelEmbeddingMetadataForWindow(a, request, parent, selected, window_count);
 }
 fn modelEmbeddingMetadataForWindow(a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, parent: *const @import("inference_chunker").types.ModelMetadata, selected: ?@import("inference_chunker").outputs.Result, window_count: usize) !*@import("inference_chunker").types.ModelMetadata {
-    const O = @import("inference_chunker").outputs;
     var recipe_parent = parent.*;
     recipe_parent.outputs_json = null;
     const result = try recipe_parent.clone(a);
@@ -30876,26 +32479,9 @@ fn modelEmbeddingMetadataForWindow(a: Allocator, request: enrichment_types.Gener
     if (model != .string or !std.mem.eql(u8, model.string, value.model)) return result;
     const task = config.object.get("task_type") orelse std.json.Value{ .string = "RETRIEVAL_DOCUMENT" };
     if (task != .string) return error.InvalidChunkOutput;
-    var target = O.Target{ .name = "embedding", .kind = .embedding, .model = value.model, .required = value.required, .task_type = task.string, .dimensions = request.expected_dims };
-    var config_arena = std.heap.ArenaAllocator.init(a);
-    defer config_arena.deinit();
-    if (request.chunker_json.len != 0) {
-        var chunks = try chunking_types_mod.parseConfigFromSlice(a, request.chunker_json);
-        defer chunks.deinit(a);
-        if (chunks.outputs_json.len != 0) {
-            var consumers = try std.json.parseFromSlice(O.Config, a, chunks.outputs_json, .{});
-            defer consumers.deinit();
-            if (chunks.embedding) |legacy| consumers.value = try consumers.value.includingEmbedding(consumers.arena.allocator(), .{ .name = "embedding", .kind = .embedding, .model = legacy.model, .model_identity = legacy.model_identity, .task_type = legacy.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (legacy.dimensions) |dims| @intCast(dims) else null });
-            const configured = for (consumers.value.targets) |candidate| {
-                if (std.mem.eql(u8, candidate.name, "embedding")) break candidate;
-            } else return error.IncompatibleChunkEmbeddingTarget;
-            // Own target strings until receipt validation and hashing finish.
-            const encoded_target = try std.json.Stringify.valueAlloc(config_arena.allocator(), configured, .{});
-            target = try std.json.parseFromSliceLeaky(O.Target, config_arena.allocator(), encoded_target, .{});
-            target.required = value.required;
-            if (!std.mem.eql(u8, target.task_type, task.string) or (target.dimensions != null and target.dimensions.? != request.expected_dims)) return error.IncompatibleChunkEmbeddingTarget;
-        }
-    }
+    var recipe_arena = std.heap.ArenaAllocator.init(a);
+    defer recipe_arena.deinit();
+    const target = try media_embedding_recipe.outputTarget(recipe_arena.allocator(), request.chunker_json, request.expected_dims, value.model, task.string, value.required);
     if (value.status == .complete and value.embedding != null) try value.validate(target);
     const recipe = try target.receiptRecipeIdentity(a, value);
     if (!std.mem.eql(u8, &recipe, value.recipe_id)) return error.IncompatibleChunkEmbeddingTarget;
@@ -31058,8 +32644,8 @@ fn flushChunkedDenseItems(
         return failChunkedDenseBatch(runtime, window, chunk_texts, chunk_items, owns_texts, scope, rejected_requests, error.InvalidEmbeddingResponse);
     }
     const generation_check: anyerror!void = check: {
-        const generation = dense_embedder.captureTextGeneration(runtime.alloc, embedding_artifact_name) catch |err| break :check err;
-        break :check dense_embedder.requireTextGeneration(runtime.alloc, embedding_artifact_name, generation);
+        const generation = captureDenseGeneration(runtime, dense_embedder, runtime.alloc, embedding_artifact_name, null) catch |err| break :check err;
+        break :check requireDenseGeneration(runtime, dense_embedder, runtime.alloc, embedding_artifact_name, generation, null);
     };
     generation_check catch |err| {
         noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
@@ -31180,13 +32766,25 @@ fn processCachedChunkDenseItems(
     cached_items.clearRetainingCapacity();
 }
 
+fn fusedMediaVectorReceiptsMatch(arena: Allocator, scratch: Allocator, provider: embedder_mod.DenseEmbedder, request: enrichment_types.GeneratedEnrichmentRequest, revision: ?[32]u8, receipts: []const @import("inference_chunker").outputs.Result) !bool {
+    var consumer: ?media_embedding_recipe.Recipe = null;
+    for (receipts) |receipt| {
+        if (receipt.kind != .embedding or !std.mem.eql(u8, receipt.name, "embedding")) continue;
+        if (!media_embedding_recipe.matchesRevision(receipt.model_revision, revision)) return false;
+        if (consumer == null)
+            consumer = try resolveModelEmbeddingConsumerRecipe(arena, provider, request) orelse return false;
+        if (!try consumer.?.matches(scratch, receipt)) return false;
+    }
+    return consumer != null;
+}
+
 /// Ordered producers never use local cache flags as acceptance and never
 /// publish directly to the legacy artifact store. Each bounded provider batch
 /// owns its causal inputs; no storage snapshot spans inference or dispatch.
 /// One parent remains one causal publication, with an atomic set of independently
 /// indexed sub-window vectors. Child keys sort under the parent, so the ordinary
 /// stream census and source guards cover every vector and its retirement.
-fn publishMediaWindowVectors(runtime: *EnrichmentRuntime, a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, provider: embedder_mod.DenseEmbedder, input: *@import("../artifact_chunk_vector_publication.zig").Input, payload: ?[]const u8, cache: *MediaPassVectorCache) !bool {
+fn publishMediaWindowVectors(runtime: *EnrichmentRuntime, a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, provider: embedder_mod.DenseEmbedder, revision: ?[32]u8, input: *@import("../artifact_chunk_vector_publication.zig").Input, payload: ?[]const u8, cache: *MediaPassVectorCache) !bool {
     const O = @import("inference_chunker").outputs;
     const metadata = if (payload) |raw| try @import("../../../chunking/chunk.zig").modelMetadataAlloc(a, raw) else null;
     defer if (metadata) |value| value.deinit(a);
@@ -31195,36 +32793,30 @@ fn publishMediaWindowVectors(runtime: *EnrichmentRuntime, a: Allocator, request:
     const scratch = arena.allocator();
     const receipts = try std.json.parseFromSliceLeaky([]O.Result, scratch, if (metadata) |value| value.outputs_json orelse "[]" else "[]", .{});
     var count: usize = 0;
-    for (receipts) |receipt| if (receipt.kind == .embedding and std.mem.eql(u8, receipt.name, "embedding")) {
+    var terminal = false;
+    var child_receipt = false;
+    for (receipts) |receipt| {
+        if (receipt.kind != .embedding or !std.mem.eql(u8, receipt.name, "embedding")) continue;
         count += 1;
-    };
-    // A shortened set must also remove older child vectors.
-    var old_keys = std.ArrayList([]const u8).empty;
-    {
-        var read = try runtime.store.beginRead();
-        defer read.abort();
-        var borrowed: @import("../artifact_chunk_cursor.zig").BorrowedRead = .{ .read = &read };
-        var cursor = try borrowed.openPhysicalCursorAdapter();
-        defer cursor.close();
-        var row = try cursor.seekAtOrAfter(input.token.producer_scope_key);
-        while (row) |entry| {
-            if (!std.mem.startsWith(u8, entry.key, input.token.producer_scope_key)) break;
-            if (internal_keys.isDerivedEmbeddingArtifactKey(entry.key) and internal_keys.matchesDerivedEmbeddingArtifactName(entry.key, requestEmbeddingName(request))) {
-                const base = (try internal_keys.derivedEmbeddingBaseKeyAlloc(scratch, entry.key)).?;
-                if (std.mem.eql(u8, internal_keys.mediaWindowParent(base), input.token.producer_scope_key)) {
-                    try old_keys.append(scratch, try scratch.dupe(u8, entry.key));
-                    if (!std.mem.eql(u8, entry.key, input.output_key)) try input.token.observePrecondition(entry.key, entry.value, try ordered_publication.artifactRevision(&read, input.token.namespace, entry.key));
-                }
-            }
-            row = try cursor.next();
-        }
+        child_receipt = child_receipt or receipt.sub_index != 0;
+        terminal = terminal or (receipt.status == .failed and receipt.terminal);
     }
-    const has_children = for (old_keys.items) |key| {
-        const base = (try internal_keys.derivedEmbeddingBaseKeyAlloc(scratch, key)).?;
-        if (internal_keys.mediaWindowIndex(base) != null) break true;
-    } else false;
-    const terminal_scalar = if (metadata) |value| count == 1 and try terminalModelChunkEmbedding(scratch, provider, mediaEmbeddingComputationRequest(runtime, request), value) else false;
-    if (count <= 1 and !has_children and !terminal_scalar) return false;
+    if (count == 0) return false;
+    const computation = mediaEmbeddingComputationRequest(runtime, request);
+    const member_set = count > 1 or child_receipt or terminal;
+    if (member_set and !try fusedMediaVectorReceiptsMatch(scratch, a, provider, computation, revision, receipts)) return false;
+    input.media_window_layout = input.media_window_layout or count > 1 or child_receipt;
+    if (scalarWindowRetirementPending(input)) return error.ArtifactPublicationPending;
+
+    try ensureMediaWindowOutputs(runtime, a, input);
+    const children = input.old_window_outputs.?;
+    if (scalarWindowRetirementPending(input)) return error.ArtifactPublicationPending;
+    // Single successful windows normally use the scalar path. Only resolve
+    // the fused recipe here when replacing previously published child vectors.
+    if (!member_set and (children.len == 0 or !try fusedMediaVectorReceiptsMatch(scratch, a, provider, computation, revision, receipts))) return false;
+    var old_keys = std.ArrayList([]const u8).empty;
+    for (children) |child| try old_keys.append(scratch, child.key);
+    if (input.previous_output_exists or count > 1 or child_receipt) try old_keys.append(scratch, input.output_key);
     var effects = std.ArrayList(ordered_publication.Mutation).empty;
     var wanted = std.StringHashMap(void).init(scratch);
     var pending = false;
@@ -31259,11 +32851,191 @@ fn publishMediaWindowVectors(runtime: *EnrichmentRuntime, a: Allocator, request:
     for (old_keys.items) |old| if (!wanted.contains(old)) try effects.append(scratch, .{ .family = .derived_vector, .key = old, .value = null, .source_index = 0 });
     if (effects.items.len == 0) return false;
     if (pending) return error.IncompleteChunkCoverage;
-    enqueueProducerEffects(runtime, &input.token, effects.items) catch |err| switch (err) {
+    enqueueProducerEffects(runtime, &input.token, effects.items, null) catch |err| switch (err) {
         error.ArtifactPublicationPending => {},
         else => return err,
     };
     return true;
+}
+
+const window_capture = @import("../artifact_chunk_window_capture.zig");
+const MediaWindowCapture = window_capture.MediaWindowCapture;
+const MediaWindowCaptureCache = window_capture.MediaWindowCaptureCache;
+
+fn createMediaWindowCapture(runtime: *EnrichmentRuntime, cache: *MediaWindowCaptureCache, member: [32]u8, identity: ordered_publication.Digest) !*MediaWindowCapture {
+    return MediaWindowCapture.create(runtime.alloc, runtime.config.resource_manager orelse runtime.index_manager.resource_manager, cache, member, identity);
+}
+
+fn ensureMediaWindowOutputs(runtime: *EnrichmentRuntime, a: Allocator, input: *@import("../artifact_chunk_vector_publication.zig").Input) !void {
+    if (input.old_window_outputs != null) return;
+    return ensureMediaWindowOutputsAt(runtime, a, input, platform.time.monotonicNs());
+}
+
+fn ensureMediaWindowOutputsAt(runtime: *EnrichmentRuntime, a: Allocator, input: *@import("../artifact_chunk_vector_publication.zig").Input, checkpoint_now_ns: u64) !void {
+    if (input.old_window_outputs != null) return;
+    const first_child = try internal_keys.mediaWindowChildKeyAlloc(a, input.token.producer_scope_key, 0);
+    defer a.free(first_child);
+    const child_prefix = first_child[0 .. first_child.len - @sizeOf(u32)];
+    const parent_revision = for (input.token.preconditions.items) |guard| {
+        if (std.mem.eql(u8, guard.key, input.output_key)) break guard.input_position;
+    } else return error.InvalidBatchRequest;
+    const owner = assetProviderRequestContext(runtime);
+    const authority: ordered_publication.Authority = .{ .namespace = input.token.namespace, .epoch = input.token.epoch, .catalog_digest = input.token.catalog_digest };
+    // The document materialization position fences every artifact write
+    // when an older binding has no per-member parent stamp.
+    const position: struct { parent: bool, revision: ?ordered_publication.Position } = blk: {
+        var read = try runtime.store.beginProbe();
+        defer read.abort();
+        if (try @import("../artifact_catalog_activation.zig").windowSetFenced(&read, authority))
+            break :blk .{ .parent = true, .revision = parent_revision };
+        break :blk .{ .parent = false, .revision = try ordered_publication.materializationRevision(&read, input.token.namespace, input.token.source.document_key) };
+    };
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update(&authority.namespace);
+    hash.update(&std.mem.toBytes(authority.epoch));
+    hash.update(&authority.catalog_digest);
+    hash.update(&.{ @intFromBool(position.parent), @intFromBool(position.revision != null) });
+    if (position.revision) |revision| hash.update(&(try revision.encode()));
+    hash.update(input.output_key);
+    var identity: ordered_publication.Digest = undefined;
+    hash.final(&identity);
+    var member: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(input.output_key, &member, .{});
+    if (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) |manager|
+        try runtime.media_window_capture.register(manager);
+    const scan = runtime.media_window_capture.take(member, identity) orelse try createMediaWindowCapture(runtime, &runtime.media_window_capture, member, identity);
+    input.large_window_capture = scan.resume_key.items.len != 0;
+    var retained = false;
+    defer if (!retained) scan.deinit();
+    // Return the replay worker to other members after a bounded turn.
+    // Checkpoints are admitted without displacing other suspended members.
+    var pages: usize = 0;
+    while (!scan.complete) : (pages += 1) {
+        checkEnrichmentExecutionContext(runtime, owner) catch |err| {
+            if (scan.resume_key.items.len != 0 and (isEnrichmentControlError(err) or isOperationInterruption(err))) {
+                retained = runtime.media_window_capture.saveIfSpace(scan, checkpoint_now_ns);
+            }
+            return err;
+        };
+        if (pages == 4) {
+            retained = runtime.media_window_capture.saveIfSpace(scan, checkpoint_now_ns);
+            return error.ArtifactPublicationPending;
+        }
+        var read = try runtime.store.beginRead();
+        defer read.abort();
+        if (!std.meta.eql(parent_revision, try ordered_publication.artifactRevision(&read, input.token.namespace, input.output_key)))
+            return error.EnrichmentSourceChanged;
+        if (!position.parent and !std.meta.eql(position.revision, try ordered_publication.materializationRevision(&read, input.token.namespace, input.token.source.document_key)))
+            return error.EnrichmentSourceChanged;
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        cursor.setKeysOnly();
+        var budget: @import("../artifact_scan_budget.zig").Budget = .{
+            .deadline_ns = platform.time.monotonicNs() +| 2 * std.time.ns_per_ms,
+        };
+        var row = try cursor.seekAtOrAfter(if (scan.resume_key.items.len == 0) first_child else scan.resume_key.items);
+        while (row) |entry| : (row = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, child_prefix)) break;
+            if (budget.exhausted()) {
+                try scan.setResumeKey(entry.key);
+                break;
+            }
+            budget.visit(entry.key.len);
+            if (!internal_keys.matchesDerivedEmbeddingArtifactName(entry.key, input.token.artifact_name)) continue;
+            if (input.effect_protocol < @import("../artifact_inventory.zig").scalar_window_retirement_protocol) {
+                input.media_window_layout = true;
+                input.old_window_outputs = &.{};
+                return; // One owned child is sufficient to request the upgrade.
+            }
+            if (entry.key.len > ordered_publication.max_cursor_bytes or
+                scan.records.items.len + input.token.preconditions.items.len + input.token.reads.items.len >= ordered_publication.max_source_documents or
+                scan.key_bytes +| entry.key.len +| input.token.read_key_bytes > ordered_publication.max_identity_bytes)
+                return error.ResourceBudgetExceeded;
+            const raw = try read.get(entry.key);
+            budget.bytes +|= raw.len;
+            var content: ordered_publication.Digest = undefined;
+            std.crypto.hash.sha2.Sha256.hash(raw, &content, .{});
+            try scan.appendGuard(.{
+                .key = entry.key,
+                .content_digest = content,
+                .input_position = try ordered_publication.artifactRevision(&read, input.token.namespace, entry.key),
+                .source_index = 0,
+            });
+        }
+        if (row) |entry| if (std.mem.startsWith(u8, entry.key, child_prefix)) {
+            input.large_window_capture = true;
+            continue;
+        };
+        scan.complete = true;
+    }
+    // A completed capture can be retried after allocator pressure without
+    // reading the child range again. The token borrows the captured keys.
+    checkEnrichmentExecutionContext(runtime, owner) catch |err| {
+        if (isEnrichmentControlError(err) or isOperationInterruption(err))
+            retained = runtime.media_window_capture.saveIfSpace(scan, checkpoint_now_ns);
+        return err;
+    };
+    if (scan.records.items.len == 0) {
+        input.old_window_outputs = &.{};
+        return;
+    }
+    input.token.borrowWindowPreconditions(scan.records.items, scan.key_bytes) catch |err| {
+        if (err == error.OutOfMemory) retained = runtime.media_window_capture.saveIfSpace(scan, checkpoint_now_ns);
+        return err;
+    };
+    input.old_window_outputs = scan.records.items;
+    input.window_capture = scan;
+    retained = true;
+}
+
+/// Only real window work raises the catalog floor. Publish the normal
+/// catalog proposal so the server enforces the all-member Raft barrier.
+fn requestMediaWindowProtocol(runtime: *EnrichmentRuntime) !void {
+    const inventory = @import("../artifact_inventory.zig");
+    const dispatcher = runtime.artifact_publication_dispatcher orelse return error.ArtifactCatalogDrift;
+    const a = runtime.alloc;
+    var encoded: []u8 = undefined;
+    var namespace: ordered_publication.Namespace = undefined;
+    {
+        var read = try runtime.store.beginProbe();
+        defer read.abort();
+        const authority = (try ordered_publication.authority(&read)) orelse return;
+        namespace = authority.namespace;
+        const observed = try inventory.status(a, &read, namespace);
+        const binding = observed.ordered orelse return;
+        if (!observed.ready or binding.epoch != authority.epoch or binding.effect_protocol >= inventory.scalar_window_retirement_protocol) return;
+        var catalogs = try inventory.copyCatalogs(a, &read);
+        defer catalogs.deinit(a);
+        const command = try inventory.desiredCommand(a, &read, namespace, catalogs, observed, inventory.scalar_window_retirement_protocol);
+        encoded = try @import("../artifact_catalog_proposal.zig").encode(a, command);
+    }
+    defer a.free(encoded);
+    try dispatcher.submit(namespace, encoded);
+}
+
+fn scalarWindowRetirementPending(input: *const @import("../artifact_chunk_vector_publication.zig").Input) bool {
+    const has_children = if (input.old_window_outputs) |children| children.len != 0 else false;
+    return (has_children or input.media_window_layout) and input.effect_protocol < @import("../artifact_inventory.zig").scalar_window_retirement_protocol;
+}
+
+/// A scalar publication also replaces this consumer's previously published
+/// windows. Bind each child deletion to the same source and write command.
+fn enqueueScalarChunkVector(runtime: *EnrichmentRuntime, input: *@import("../artifact_chunk_vector_publication.zig").Input, value: ?[]const u8, retire_windows: bool) !void {
+    const scalar: ordered_publication.Mutation = .{ .family = .derived_vector, .key = input.output_key, .value = value, .source_index = 0 };
+    if (!retire_windows)
+        return enqueueProducerEffects(runtime, &input.token, &.{scalar}, null);
+    const a = runtime.alloc;
+    try ensureMediaWindowOutputs(runtime, a, input);
+    const children = input.old_window_outputs.?;
+    if (scalarWindowRetirementPending(input)) return error.ArtifactPublicationPending;
+    if (children.len == 0)
+        return enqueueProducerEffects(runtime, &input.token, &.{scalar}, null);
+    const effects = try a.alloc(ordered_publication.Mutation, children.len + 1);
+    defer a.free(effects);
+    effects[0] = scalar;
+    for (children, effects[1..]) |child, *effect|
+        effect.* = .{ .family = .derived_vector, .key = child.key, .value = null, .source_index = 0 };
+    try enqueueProducerEffects(runtime, &input.token, effects, null);
 }
 
 fn processOrderedChunkVectorRequest(
@@ -31274,7 +33046,7 @@ fn processOrderedChunkVectorRequest(
     consumers: []const []const u8,
 ) !bool {
     var budget = if (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) |manager|
-        resource_manager_mod.BudgetedAllocator.init(manager, .relational_preparation_working_set, runtime.alloc, 1)
+        runtime.media_window_capture.budget(manager, runtime.alloc)
     else
         null;
     defer if (budget) |*tracked| tracked.deinit();
@@ -31523,11 +33295,13 @@ fn chunkVectorAtRevision(request: enrichment_types.GeneratedEnrichmentRequest, t
     return if (request.kind == .dense_embedding) metadata.header.kind == .dense_embedding and metadata.dense_dimensions == request.expected_dims else metadata.header.kind == .sparse_embedding;
 }
 
-fn requireChunkProviderRevision(a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, dense: ?embedder_mod.DenseEmbedder, sparse: ?embedder_mod.SparseEmbedder, generation: embedder_mod.DenseEmbedder.TextGeneration, revision: ?[32]u8, context: inference_request_context.RequestContext) !void {
-    try context.check();
-    if (dense) |provider| try provider.requireTextGenerationWithContext(a, requestEmbeddingName(request), generation, context);
-    if (sparse) |provider| if (!std.meta.eql(revision, try provider.captureRevision(a, requestEmbeddingName(request)))) return error.EnrichmentSourceChanged;
-    try context.check();
+fn requireChunkProviderRevision(runtime: *EnrichmentRuntime, a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, dense: ?embedder_mod.DenseEmbedder, sparse: ?embedder_mod.SparseEmbedder, generation: embedder_mod.DenseEmbedder.TextGeneration, revision: ?[32]u8, context: inference_request_context.RequestContext) !void {
+    try checkEnrichmentExecutionContext(runtime, context);
+    if (dense) |provider| try requireDenseGeneration(runtime, provider, a, requestEmbeddingName(request), generation, context);
+    const guard = runtime.active_provider_guard;
+    const foreground = if (guard.deadline_ns != null or guard.cancellation.ptr != null) context else null;
+    if (sparse) |provider| if (!std.meta.eql(revision, try captureSparseRevision(runtime, provider, a, requestEmbeddingName(request), foreground))) return error.EnrichmentSourceChanged;
+    try checkEnrichmentExecutionContext(runtime, context);
 }
 
 // The batch owns captured input tokens, never a storage snapshot. Each output
@@ -31615,7 +33389,7 @@ const OrderedDenseTextBatch = struct {
         const serial_memo = planned.computation_key_fn != null and
             (if (runtime.dense_result_cache) |cache| !cache.concurrent else false);
         const parallelism = if (serial_memo) 1 else denseBatchParallelism(planned);
-        const max_items = if (self.generation.lease != null) planned.partBatchLimit(name, request.expected_dims, limits.items) catch |err| return self.failPlanning(runtime, err) else limits.items;
+        const max_items = if (self.generation.lease != null) planned.partBatchLimit(name, request.expected_dims, limits.items) catch |err| return self.failPlanning(runtime, providerInvocationFailure(runtime, err)) else limits.items;
         // Each task owns one physical call. Its result survives sibling errors;
         // nested planners must not multiply the wave's concurrency allowance.
         planned.dense_batch_concurrency = 1;
@@ -31675,7 +33449,7 @@ const OrderedDenseTextBatch = struct {
             };
             // Deployment identity is a wave-wide fence, distinct from a call's
             // malformed response or input failure. Recheck after every worker.
-            var generation_result = provider.requireTextGenerationWithContext(runtime.alloc, name, self.generation, assetProviderRequestContext(runtime));
+            var generation_result = requireDenseGeneration(runtime, provider, runtime.alloc, name, self.generation, assetProviderRequestContext(runtime));
             var wave_failure: ?anyerror = null;
             for (results[0..count]) |result| if (result) |_| {} else |err| noteDenseBatchFailure(&wave_failure, err);
             if (generation_result) |_| {
@@ -31690,7 +33464,7 @@ const OrderedDenseTextBatch = struct {
                             if (!denseBatchCapacityFailure(retry_err)) break;
                         }
                     }
-                    generation_result = provider.requireTextGenerationWithContext(runtime.alloc, name, self.generation, assetProviderRequestContext(runtime));
+                    generation_result = requireDenseGeneration(runtime, provider, runtime.alloc, name, self.generation, assetProviderRequestContext(runtime));
                 };
             } else |_| {}
             var failed_scope: ?FailureScope = null;
@@ -31716,13 +33490,14 @@ const OrderedDenseTextBatch = struct {
                     };
                     continue;
                 }
-                try assetProviderRequestContext(runtime).check();
+                try checkProviderFailureGuard(runtime);
+                if (runtime.config.cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
                 const values = results[index] catch unreachable;
                 for (items, values) |*item, vector| {
                     if (self.failed_requests.contains(requestFailureFingerprint(item.request))) continue;
                     const value = enrichment_artifact_codec.encodeDenseEmbeddingAlloc(runtime.alloc, item.source_hash, vector) catch |err| return self.scope.publicationFailure(err);
                     defer runtime.alloc.free(value);
-                    enqueueProducerEffects(runtime, &item.input.token, &.{.{ .family = .derived_vector, .key = item.input.output_key, .value = value, .source_index = 0 }}) catch |err| switch (err) {
+                    enqueueScalarChunkVector(runtime, &item.input, value, true) catch |err| switch (err) {
                         error.ArtifactPublicationPending => {},
                         else => return self.scope.publicationFailure(err),
                     };
@@ -31756,11 +33531,13 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
     // Capture once, outside any storage snapshot. Every accepted member must
     // match this deployed generation before a completed census can be reused.
     const context = assetProviderRequestContext(runtime);
-    try context.check();
-    const text_generation = if (shared) |batch| batch.generation else if (dense) |provider| try provider.captureTextGenerationWithContext(alloc, requestEmbeddingName(request), context) else embedder_mod.DenseEmbedder.TextGeneration{};
-    const sparse_revision = if (sparse) |provider| try provider.captureRevision(alloc, requestEmbeddingName(request)) else null;
+    try checkEnrichmentExecutionContext(runtime, context);
+    const text_generation = if (shared) |batch| batch.generation else if (dense) |provider| try captureDenseGeneration(runtime, provider, alloc, requestEmbeddingName(request), context) else embedder_mod.DenseEmbedder.TextGeneration{};
+    const guard = runtime.active_provider_guard;
+    const sparse_foreground = if (guard.deadline_ns != null or guard.cancellation.ptr != null) context else null;
+    const sparse_revision = if (sparse) |provider| try captureSparseRevision(runtime, provider, alloc, requestEmbeddingName(request), sparse_foreground) else null;
     const execution_revision = if (dense != null) text_generation.revision else sparse_revision;
-    try context.check();
+    try checkEnrichmentExecutionContext(runtime, context);
     const publication = @import("../artifact_chunk_vector_publication.zig");
     const logical = @import("../artifact_chunk_cursor.zig");
     const Candidates = @import("../artifact_chunk_vector_cursor.zig").Cursor(logical.BorrowedRead);
@@ -31772,6 +33549,7 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
     var checkpoint_digest: ?ordered_publication.Digest = null;
     var census: ?checkpoints.State = null;
     var deferred_output_error: ?anyerror = null;
+    var window_protocol_pending = false;
     var publishing = false;
     var after: ?[]u8 = null;
     defer if (after) |key| alloc.free(key);
@@ -31850,6 +33628,7 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
             const captures = (try publication.captureSession(alloc, &read, request, plan.plan())) orelse return error.ArtifactCatalogDrift;
             var cursor = try Candidates.open(alloc, &borrowed, request.doc_key, request.artifact_name, requestEmbeddingName(request));
             defer cursor.close();
+            if (dense != null) cursor.enableWindowHints();
             if (after) |key| try cursor.seekAfter(key);
             if (scan_after) |key| try cursor.resumePhysical(key);
             if (logical_after) |key| try cursor.resumeLogical(key);
@@ -31921,7 +33700,7 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
                         if (dense) |provider| {
                             const metadata = try @import("../../../chunking/chunk.zig").modelMetadataAlloc(alloc, payload);
                             defer if (metadata) |value| value.deinit(alloc);
-                            if (metadata) |value| fused_compatible = try terminalModelChunkEmbedding(alloc, provider, mediaEmbeddingComputationRequest(runtime, request), value) or try modelChunkTargetCompatible(alloc, provider, mediaEmbeddingComputationRequest(runtime, request), value);
+                            if (metadata) |value| fused_compatible = (terminalModelChunkEmbedding(alloc, provider, mediaEmbeddingComputationRequest(runtime, request), value) catch |err| return providerInvocationFailure(runtime, err)) or (modelChunkTargetCompatible(alloc, provider, mediaEmbeddingComputationRequest(runtime, request), value) catch |err| return providerInvocationFailure(runtime, err));
                         }
                         if (!fused_compatible) {
                             const text = (try chunkPayloadTextAlloc(alloc, payload, request.source_field)) orelse return error.IncompatibleChunkEmbeddingTarget;
@@ -31945,16 +33724,20 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
                 // Publishing changes this document's census witness. Such a
                 // pass may drive work, but cannot also certify completion.
                 publishing = true;
+                if (dense != null and !cursor.member_has_windows) input.old_window_outputs = &.{};
                 const text = if (input.value) |value| try chunkPayloadTextAlloc(input.token.arena.allocator(), value, request.source_field) else null;
                 const carried = if (text) |value| try carriedChunkVectorAlloc(input.token.arena.allocator(), &read, request, execution_revision, input.value.?, input.output_key, value) else null;
                 if (carried == null) bytes +|= if (text) |value| value.len else 0;
                 try items.append(alloc, .{ .input = input, .text = text, .carried = carried });
                 input_owned = false;
+                // Let a potentially large child scan finish and publish
+                // before another candidate can yield this logical page.
+                if (dense != null and cursor.member_has_windows) break;
             }
             if (!publishing) try observation.?.requireCurrent(&read, request.doc_key);
         }
         if (validated_complete) {
-            try requireChunkProviderRevision(alloc, request, dense, sparse, text_generation, sparse_revision, context);
+            try requireChunkProviderRevision(runtime, alloc, request, dense, sparse, text_generation, sparse_revision, context);
             return switch (try driveOrderedChunkVectorCensus(runtime, alloc, request, .{})) {
                 .complete => true,
                 .pending => error.ArtifactPublicationPending,
@@ -31962,7 +33745,7 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
             };
         }
         if (!publishing) {
-            try requireChunkProviderRevision(alloc, request, dense, sparse, text_generation, sparse_revision, context);
+            try requireChunkProviderRevision(runtime, alloc, request, dense, sparse, text_generation, sparse_revision, context);
             census.?.observation = observation.?;
             census.?.enumerated = exhausted;
             var prepared_checkpoint = try checkpoints.Prepared.init(alloc, census.?);
@@ -31986,8 +33769,29 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
             if (!exhausted) return error.ArtifactPublicationPending;
         }
         if (dense) |provider| for (items.items) |*item| {
-            if (item.carried != null) continue;
-            if (try publishMediaWindowVectors(runtime, alloc, request, provider, &item.input, item.input.value, &staged_vectors)) item.failed = true;
+            ensureMediaWindowOutputs(runtime, alloc, &item.input) catch |err| switch (err) {
+                error.ArtifactPublicationPending => {
+                    item.failed = true;
+                    continue;
+                },
+                else => return err,
+            };
+            var item_waits_for_protocol = false;
+            const published = item.carried == null and (publishMediaWindowVectors(runtime, alloc, request, provider, execution_revision, &item.input, item.input.value, &staged_vectors) catch |err| switch (err) {
+                error.ArtifactPublicationPending => blk: {
+                    item_waits_for_protocol = true;
+                    break :blk false;
+                },
+                else => return err,
+            });
+            if (published) {
+                item.failed = true;
+            } else if (item_waits_for_protocol or scalarWindowRetirementPending(&item.input)) {
+                // The catalog upgrade is outstanding. Process other members
+                // without recomputing a scalar that cannot publish yet.
+                item.failed = true;
+                window_protocol_pending = true;
+            }
         };
         if (dense) |provider| for (items.items) |*item| if (!item.failed and item.carried == null) if (item.input.value) |payload| {
             item.precomputed = storedModelChunkVectorCached(runtime, item.input.token.arena.allocator(), provider, request, payload, &staged_vectors) catch |err| {
@@ -32002,7 +33806,10 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
                 item.model_hash = try orderedPrecomputedVectorHash(alloc, payload, mediaEmbeddingComputationRequest(runtime, request));
             }
         };
-        if (shared) |batch| {
+        const large_window_page = for (items.items) |item| {
+            if (item.input.large_window_capture) break true;
+        } else false;
+        if (if (large_window_page) null else shared) |batch| {
             const provider = dense.?;
             for (items.items) |*item| {
                 if (item.failed or item.carried != null or item.precomputed != null) continue;
@@ -32052,11 +33859,11 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
             if (dense) |provider| {
                 dense_vectors = try embedDenseBatchWithRetryLimits(provider.withTextGeneration(text_generation), runtime, requestEmbeddingName(request), texts.items, request.expected_dims, request.reprocess_generation == 0, batch_limits);
                 if (dense_vectors.?.len != texts.items.len) return error.InvalidEmbeddingResponse;
-                try provider.requireTextGeneration(alloc, requestEmbeddingName(request), text_generation);
+                try requireDenseGeneration(runtime, provider, alloc, requestEmbeddingName(request), text_generation, null);
             } else if (sparse) |provider| {
                 sparse_vectors = try embedSparseBatchWithRetry(provider, runtime, requestEmbeddingName(request), texts.items);
                 if (sparse_vectors.?.len != texts.items.len) return error.InvalidEmbeddingResponse;
-                if (!std.meta.eql(sparse_revision, try provider.captureRevision(alloc, requestEmbeddingName(request)))) return error.EnrichmentSourceChanged;
+                if (!std.meta.eql(sparse_revision, try captureSparseRevision(runtime, provider, alloc, requestEmbeddingName(request), sparse_foreground))) return error.EnrichmentSourceChanged;
             } else return error.InvalidArgument;
             succeeded = true;
         }
@@ -32067,7 +33874,7 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
             if (!item.failed) break true;
         } else false;
         if (shared == null or publishes_locally)
-            try requireChunkProviderRevision(alloc, request, dense, sparse, text_generation, sparse_revision, context);
+            try requireChunkProviderRevision(runtime, alloc, request, dense, sparse, text_generation, sparse_revision, context);
         var vector_index: usize = 0;
         for (items.items) |*item| {
             if (item.failed) continue;
@@ -32081,19 +33888,26 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
                 break :blk encoded;
             } else null;
             defer if (value) |bytes| alloc.free(bytes);
-            enqueueProducerEffects(runtime, &item.input.token, &.{.{ .family = .derived_vector, .key = item.input.output_key, .value = value, .source_index = 0 }}) catch |err| switch (err) {
+            enqueueScalarChunkVector(runtime, &item.input, value, dense != null) catch |err| switch (err) {
                 error.ArtifactPublicationPending => {},
                 else => return err,
             };
         }
-        if (exhausted) break;
+        if (exhausted or large_window_page) break;
+    }
+    if (window_protocol_pending) {
+        requestMediaWindowProtocol(runtime) catch |err| switch (err) {
+            error.ResourceTemporarilyUnavailable, error.ArtifactPublicationPending, error.ArtifactCatalogDrift => {},
+            else => return err,
+        };
+        return error.ArtifactPublicationPending;
     }
     if (deferred_output_error) |err| return err;
     // An independent text consumer can outlive the parent's model recipe.
     // Verify every accepted vector against its current provider generation
     // before permitting the census driver to certify these proofs.
     if (!publishing) {
-        try requireChunkProviderRevision(alloc, request, dense, sparse, text_generation, sparse_revision, context);
+        try requireChunkProviderRevision(runtime, alloc, request, dense, sparse, text_generation, sparse_revision, context);
         if (try driveOrderedChunkVectorCensus(runtime, alloc, request, .{}) == .complete) return true;
     }
     // Enumerating members is not an exact-input stream-completion certificate.
@@ -32165,7 +33979,7 @@ fn processMaterializedChunkDenseRequestWithBatch(
     if (ordered_batch) |batch| {
         if (try processOrderedChunkVectorWithBatch(runtime, batch.alloc, request, dense_embedder, null, consumer_indexes, batch)) return;
     } else if (try processOrderedChunkVectorRequest(runtime, request, dense_embedder, null, consumer_indexes)) return;
-    const generation = try dense_embedder.captureTextGenerationWithContext(runtime.alloc, embedding_artifact_name, assetProviderRequestContext(runtime));
+    const generation = try captureDenseGeneration(runtime, dense_embedder, runtime.alloc, embedding_artifact_name, assetProviderRequestContext(runtime));
     const pinned_embedder = dense_embedder.withTextGeneration(generation);
     const source_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
     defer runtime.alloc.free(source_key);
@@ -32335,7 +34149,7 @@ fn processMaterializedChunkDenseRequestWithBatch(
         defer if (collect.last_key) |key| runtime.alloc.free(key);
         try backend_scan.scanWithContext(&runtime.store, lower, upper_bound, .{}, &collect, Collect.scan);
 
-        try dense_embedder.requireTextGenerationWithContext(runtime.alloc, embedding_artifact_name, generation, assetProviderRequestContext(runtime));
+        try requireDenseGeneration(runtime, dense_embedder, runtime.alloc, embedding_artifact_name, generation, assetProviderRequestContext(runtime));
         try processCachedChunkDenseItems(runtime, request, consumer_indexes, window, &cached_items, max_window_items, scope);
         if (shared == null or collect.stopped_for_batch) {
             if (!try batch.flushForRequest(runtime, pinned_embedder, embedding_artifact_name, request, consumer_indexes, window, scope)) return;
@@ -32349,7 +34163,7 @@ fn processMaterializedChunkDenseRequestWithBatch(
         lower = next_lower;
     }
 
-    try dense_embedder.requireTextGenerationWithContext(runtime.alloc, embedding_artifact_name, generation, assetProviderRequestContext(runtime));
+    try requireDenseGeneration(runtime, dense_embedder, runtime.alloc, embedding_artifact_name, generation, assetProviderRequestContext(runtime));
     if (rejected_requests.contains(requestFailureFingerprint(request))) return;
     var source_guarded_in_window = false;
     for (existing_embedding_keys.items) |embedding_key| {
@@ -32438,7 +34252,7 @@ fn processMaterializedChunkSparseRequest(
     window: *GeneratedReplayWindow,
 ) !void {
     if (try processOrderedChunkVectorRequest(runtime, request, null, sparse_embedder, consumer_indexes)) return;
-    const revision = try sparse_embedder.captureRevision(runtime.alloc, embedding_artifact_name);
+    const revision = try captureSparseRevision(runtime, sparse_embedder, runtime.alloc, embedding_artifact_name, foregroundProviderRequestContext(runtime));
     const max_window_items = generatedReplayWindowItems();
     const max_batch_items = effectiveRequestEmbedBatchItems(runtime, request);
     const max_batch_bytes = requestEmbedBatchBytes(runtime.alloc, request);
@@ -32628,7 +34442,7 @@ fn collectPlainDenseBatchItem(
     }
 
     const dense_embedder = runtime.config.dense_embedder.?;
-    var prepared = try prepareDenseSourceInput(runtime.alloc, runtime.config, dense_embedder, raw, request);
+    var prepared = try prepareDenseEnrichmentSourceInput(runtime, dense_embedder, raw, request);
     defer prepared.deinit(runtime.alloc);
     const source_text = switch (prepared) {
         .text => |text| text,
@@ -32659,7 +34473,7 @@ fn collectPlainDenseBatchItem(
     prepared = .empty; // Ownership transfers to the batch item below.
     errdefer runtime.alloc.free(@constCast(source_text));
     if (generation_cache.* == null)
-        generation_cache.* = try dense_embedder.captureTextGenerationWithContext(runtime.alloc, embedding_artifact_name, assetProviderRequestContext(runtime));
+        generation_cache.* = try captureDenseGeneration(runtime, dense_embedder, runtime.alloc, embedding_artifact_name, assetProviderRequestContext(runtime));
     const generation = generation_cache.*.?;
     if (input) |*token| {
         var read = runtime.store.beginProbe() catch |err| return scope.publicationFailure(err);
@@ -32748,7 +34562,7 @@ fn flushPlainDenseItems(
         noteEmbedBatchFinished(runtime, consumer_indexes, items.len, total_source_bytes, max_source_bytes, elapsedNsSince(runtime, embed_started_ns), false);
         return error.InvalidEmbeddingResponse;
     }
-    dense_embedder.requireTextGenerationWithContext(runtime.alloc, embedding_artifact_name, generation, context) catch |err| {
+    requireDenseGeneration(runtime, dense_embedder, runtime.alloc, embedding_artifact_name, generation, context) catch |err| {
         noteEmbedBatchFinished(runtime, consumer_indexes, items.len, total_source_bytes, max_source_bytes, elapsedNsSince(runtime, embed_started_ns), false);
         return err;
     };
@@ -32861,18 +34675,18 @@ fn captureAssetProducerContext(runtime: *EnrichmentRuntime, request: enrichment_
     return @import("../artifact_asset_publication.zig").capture(runtime.alloc, &read, request, plan.plan(), source_key, logical_input, .{ .ptr = runtime.index_manager, .materialize = materializeProducerInput });
 }
 
-fn finishAcceptedAssetGraph(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest) !void {
-    _ = try publishOrderedGraphForRuntime(runtime, request, .current);
+fn finishAcceptedAssetGraph(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, failure_scope: ?*FailureScope) !void {
+    _ = try publishOrderedGraphForRuntime(runtime, request, .current, failure_scope);
 }
 
-fn enqueueAssetProducerOutput(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, token: *@import("../artifact_producer_context.zig").Token, key: []const u8, payload: ?[]const u8) !void {
-    try enqueueProducerEffects(runtime, token, &.{.{ .family = .document_artifact, .key = key, .value = payload, .source_index = 0 }});
+fn enqueueAssetProducerOutput(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, token: *@import("../artifact_producer_context.zig").Token, key: []const u8, payload: ?[]const u8, failure_scope: ?*FailureScope) !void {
+    try enqueueProducerEffects(runtime, token, &.{.{ .family = .document_artifact, .key = key, .value = payload, .source_index = 0 }}, failure_scope);
     // Acceptance can race enqueue, including a deferred provider callback.
     // Consume the accepted bytes, never this callback's uncommitted response.
-    try finishAcceptedAssetGraph(runtime, request);
+    try finishAcceptedAssetGraph(runtime, request, failure_scope);
 }
 
-fn enqueueProducerEffects(runtime: *EnrichmentRuntime, token: *@import("../artifact_producer_context.zig").Token, effects: []const ordered_publication.Mutation) !void {
+fn enqueueProducerEffects(runtime: *EnrichmentRuntime, token: *@import("../artifact_producer_context.zig").Token, effects: []const ordered_publication.Mutation, failure_scope: ?*FailureScope) !void {
     {
         const fence = try requiredRuntimeStoreWriteFence(runtime, replayWriteGeneration(runtime));
         var read = try runtime.store.beginProbe();
@@ -32883,14 +34697,35 @@ fn enqueueProducerEffects(runtime: *EnrichmentRuntime, token: *@import("../artif
         try token.validate(runtime.alloc, &read);
     }
     const dispatcher = runtime.artifact_publication_dispatcher orelse return error.ArtifactCatalogDrift;
-    const command = try token.command(effects);
-    try command.validate(runtime.alloc);
-    const bytes = try @import("../artifact_publication_transport_codec.zig").encodeAlloc(runtime.alloc, command);
-    defer runtime.alloc.free(bytes);
-    try dispatcher.submit(token.namespace, bytes);
+    // Use the replay allocator that already accounts for the inputs and
+    // payloads. The codec measures the full wire buffer before allocating.
+    const backing = token.arena.child_allocator;
+    const replay_budget = resource_manager_mod.BudgetedAllocator.fromAllocator(backing);
+    var transport_budget = if (replay_budget == null)
+        if (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) |manager|
+            runtime.media_window_capture.budget(manager, backing)
+        else
+            null
+    else
+        null;
+    defer if (transport_budget) |*budget| budget.deinit();
+    const transport = if (transport_budget) |*budget| budget.allocator() else backing;
+    const tracked = if (transport_budget) |*budget| budget else replay_budget;
+    const denial_before = if (tracked) |budget| budget.denialGeneration() else 0;
+    const bytes = encodeProducerEffects(token, effects, transport) catch |err| {
+        if (err == error.OutOfMemory) if (tracked) |budget| if (budget.denialGeneration() != denial_before) return error.ResourceBudgetExceeded;
+        return err;
+    };
+    defer transport.free(bytes);
+    dispatcher.submit(token.namespace, bytes) catch |err|
+        return FailureScope.assetPublicationFailure(failure_scope, err);
     // Provider completion is not owner acceptance; hold replay progress until
     // the next attempt observes the durable semantic receipt.
     return error.ArtifactPublicationPending;
+}
+
+fn encodeProducerEffects(token: *@import("../artifact_producer_context.zig").Token, effects: []const ordered_publication.Mutation, alloc: Allocator) ![]u8 {
+    return @import("../artifact_publication_transport_codec.zig").encodeAlloc(alloc, try token.command(effects));
 }
 
 fn captureProducerInput(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, source_key: []const u8, logical_input: []const u8) !?producer_input.Token {
@@ -33223,7 +35058,7 @@ fn processPlainDenseWindow(
         // Cache-only windows still publish vectors. Fence their captured
         // generation even though no provider invocation reached the flush.
         if (items.items.len == 0) if (generation_cache) |generation|
-            try dense_embedder.requireTextGenerationWithContext(runtime.alloc, embedding_artifact_name, generation, assetProviderRequestContext(runtime));
+            try requireDenseGeneration(runtime, dense_embedder, runtime.alloc, embedding_artifact_name, generation, assetProviderRequestContext(runtime));
         flushPlainDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, items.items, window, scope) catch |err| {
             if (scope.publication_failed) return err;
             if (try scope.shouldYield(runtime, err)) {
@@ -33292,7 +35127,7 @@ fn processChunkedDenseWindow(
         }
         if (consumer_indexes.len == 0) continue;
 
-        const generation = try dense_embedder.captureTextGeneration(runtime.alloc, embedding_artifact_name);
+        const generation = try captureDenseGeneration(runtime, dense_embedder, runtime.alloc, embedding_artifact_name, null);
         const pinned_embedder = dense_embedder.withTextGeneration(generation);
         const max_window_items = generatedReplayWindowItems();
         var chunk_texts = std.ArrayListUnmanaged([]const u8).empty;
@@ -33314,7 +35149,7 @@ fn processChunkedDenseWindow(
         defer rejected_requests.deinit(runtime.alloc);
 
         var ordered_budget = if (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) |manager|
-            resource_manager_mod.BudgetedAllocator.init(manager, .relational_preparation_working_set, runtime.alloc, 1)
+            runtime.media_window_capture.budget(manager, runtime.alloc)
         else
             null;
         defer if (ordered_budget) |*tracked| tracked.deinit();
@@ -33339,6 +35174,8 @@ fn processChunkedDenseWindow(
             if (!sameChunkedDenseBatchKey(seed, request)) continue;
             processed[j] = true;
             scope.enterRequest(request);
+            if (scope.media_embedding_selections.len != 0)
+                scope.media_embedding_selections[j] = .{ .revision = generation.revision };
 
             const chunk_artifact_name = requestArtifactName(request);
             if (requestUsesMaterializedChunkArtifact(request)) {
@@ -33425,21 +35262,21 @@ fn processChunkedDenseWindow(
             source_loop: for (source_set.sources) |*source| {
                 if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
                 const source_hash = if (source.metadata == null) retainedTextEmbeddingHashAtRevision(request, source.text, generation.revision) else try modelChunkEmbeddingSourceHash(runtime.alloc, source.*, request);
-                var owned_vector = if (source.metadata) |metadata| try compatibleModelChunkVector(runtime.alloc, dense_embedder, request, metadata) else null;
+                var owned_vector = if (source.metadata) |metadata| (compatibleModelChunkVector(runtime.alloc, dense_embedder, request, metadata) catch |err| return providerInvocationFailure(runtime, err)) else null;
                 defer if (owned_vector) |vector| runtime.alloc.free(vector);
                 var precomputed: ?[]const f32 = owned_vector;
                 const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, source.key, embedding_artifact_name);
                 defer runtime.alloc.free(embedding_key);
-                if ((source.metadata == null or try modelChunkTargetCompatible(runtime.alloc, dense_embedder, request, source.metadata.?)) and try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {
+                if ((source.metadata == null or (modelChunkTargetCompatible(runtime.alloc, dense_embedder, request, source.metadata.?) catch |err| return providerInvocationFailure(runtime, err))) and try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {
                     if (try appendCachedChunkDenseEmbeddingToWindow(runtime, window, request, source.key, embedding_key, consumer_indexes)) {
                         try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
                     }
                     if (window.itemCount() >= max_window_items)
-                        try dense_embedder.requireTextGeneration(runtime.alloc, embedding_artifact_name, generation);
+                        try requireDenseGeneration(runtime, dense_embedder, runtime.alloc, embedding_artifact_name, generation, null);
                     try flushGeneratedReplayWindowIfNeededWithIdentity(runtime, window, max_window_items, scope.completedFingerprint());
                     continue;
                 }
-                if (source.metadata) |metadata| if (precomputed == null and try modelChunkTargetCompatible(runtime.alloc, dense_embedder, request, metadata)) {
+                if (source.metadata) |metadata| if (precomputed == null and (modelChunkTargetCompatible(runtime.alloc, dense_embedder, request, metadata) catch |err| return providerInvocationFailure(runtime, err))) {
                     if (runtime.index_manager.getEnrichment(.chunk, chunk_artifact_name)) |chunk_config| {
                         const locator = try std.json.Stringify.valueAlloc(runtime.alloc, .{ ._artifact_name = chunk_artifact_name, ._source_field = chunk_config.source_field }, .{});
                         defer runtime.alloc.free(locator);
@@ -33450,7 +35287,7 @@ fn processChunkedDenseWindow(
                 };
                 if (source.text.len == 0 and precomputed == null) {
                     const metadata = source.metadata orelse return error.IncompatibleChunkEmbeddingTarget;
-                    if (!try modelChunkTargetCompatible(runtime.alloc, dense_embedder, request, metadata)) return error.IncompatibleChunkEmbeddingTarget;
+                    if (!(modelChunkTargetCompatible(runtime.alloc, dense_embedder, request, metadata) catch |err| return providerInvocationFailure(runtime, err))) return error.IncompatibleChunkEmbeddingTarget;
                     const chunk_config = runtime.index_manager.getEnrichment(.chunk, chunk_artifact_name);
                     owned_vector = replayModelChunkVector(runtime, runtime.alloc, request, metadata, if (chunk_config) |value| value.source_field else request.source_field) catch |err| {
                         if (scope.publication_failed) return err;
@@ -33550,7 +35387,7 @@ fn processChunkedDenseWindow(
                 }
             }
             if (!request_complete) continue;
-            try dense_embedder.requireTextGeneration(runtime.alloc, embedding_artifact_name, generation);
+            try requireDenseGeneration(runtime, dense_embedder, runtime.alloc, embedding_artifact_name, generation, null);
             if (stale_deletes.artifact_delete_keys.len > 0) {
                 // A provider retry must leave the previous published chunks
                 // intact. Finish this request's replacement embeddings before
@@ -33674,6 +35511,19 @@ fn getOrCreatePlannedRequests(
         explicit_dense,
         explicit_sparse,
     );
+    errdefer enrichment_types.deinitGeneratedRequests(runtime.alloc, planned);
+    if (for (planned) |request| {
+        if (request.kind == .dense_embedding and request.input_kind == .materialized_chunks and request.chunker_json.len != 0) break true;
+    } else false) {
+        var pin = try runtime.index_manager.acquireWritePlanSnapshot();
+        defer pin.release();
+        for (planned) |*request| {
+            if (request.kind != .dense_embedding or request.input_kind != .materialized_chunks or request.chunker_json.len == 0) continue;
+            request.model_aware_chunking = for (pin.plan().generated_templates) |candidate| {
+                if (candidate.model_aware_chunking and std.mem.eql(u8, candidate.chunker_json, request.chunker_json)) break true;
+            } else false;
+        }
+    }
     try request_plan_cache.append(runtime.alloc, .{
         .doc_key = owned_doc_key,
         .requests = planned,
@@ -34206,7 +36056,7 @@ const PdfEmbeddingWindowPreparer = struct {
     }
 
     fn cancellationProbe(self: *const @This()) document_extraction_mod.PdfCancellationProbe {
-        return .{ .context = self, .is_cancelled_fn = isCancelled };
+        return pdfWindowCancellationProbe(self);
     }
 
     fn prepare(self: *const @This(), first_item: usize) !PdfEmbeddingPreparedWindow {
@@ -34256,13 +36106,13 @@ const PdfEmbeddingWindowPreparer = struct {
         );
         defer concurrent_alloc.free(prepared_plans);
         const requested_count = count;
-        count = try preparePdfPixelPrefix(
+        count = preparePdfPixelPrefix(
             &self.coordinator.session,
             requests[0..count],
             prepared_plans,
             .{ .max_inflight_pixels = self.render_config.pdf_render_max_inflight_pixels, .max_inflight_bytes = available_bytes },
             self.use_borrowed_rasters,
-        );
+        ) catch |err| return self.cancellationProbe().classifyError(err);
         if (count < requested_count and count > self.batch_items and count % self.batch_items != 0)
             count = nextPdfWindowCandidate(count, self.batch_items);
         const per_page_bytes = self.page_output_bytes_cap;
@@ -34501,7 +36351,7 @@ fn processOrderedChunkText(runtime: *EnrichmentRuntime, request: enrichment_type
     };
     const manifest = rows.manifest.?.encode();
     effects[member_count] = .{ .family = .document_artifact, .key = captured.manifest_key, .value = &manifest, .source_index = 0 };
-    try enqueueProducerEffects(runtime, &captured.token, effects);
+    try enqueueProducerEffects(runtime, &captured.token, effects, null);
     return true;
 }
 
@@ -34860,7 +36710,7 @@ fn processPdfPageImageEmbeddingWithAllocator(
     runtime: *EnrichmentRuntime,
     metadata_alloc: Allocator,
     request: enrichment_types.GeneratedEnrichmentRequest,
-    dense_embedder: embedder_mod.DenseEmbedder,
+    provider: embedder_mod.DenseEmbedder,
     consumer_indexes: []const []const u8,
     prepared_sources: *PreparedDocumentSourceCache,
     window: *GeneratedReplayWindow,
@@ -34888,18 +36738,22 @@ fn processPdfPageImageEmbeddingWithAllocator(
         .guard = try captureEmbeddingSourceGuard(runtime, request, doc_store_key, sourceRecordDigest(raw)),
         .capacity = @max(4, generatedReplayWindowItems()),
     };
-    const source_url = try extractSourceText(metadata_alloc, runtime.config, raw, request) orelse {
+    const source_url = try extractEnrichmentSource(runtime, extractSourceText, metadata_alloc, raw, request) orelse {
         try retirePdfPageEmbeddings(publication, metadata_alloc, request, consumer_indexes);
         return;
     };
     defer metadata_alloc.free(source_url);
 
     if (!document_extraction_mod.pdf_runtime_available) return error.PdfRuntimeUnavailable;
-    if (!dense_embedder.supportsPartItems() and !dense_embedder.supportsRasterItems())
+    if (!provider.supportsPartItems() and !provider.supportsRasterItems())
         return error.UnsupportedEmbeddingProvider;
     const embedding_name = requestEmbeddingName(request);
+    var cancellation: AssetInvocationCancellation = undefined;
+    const dense_embedder = provider.withRequestContext(scopedEmbeddingRequestContext(runtime, foregroundProviderRequestContext(runtime), provider.part_request_context, &cancellation));
     const policy = try enrichment_types.parseExecutionPolicyJson(metadata_alloc, request.execution_json);
-    const execution_lease = try dense_embedder.resolveMediaPartLease(metadata_alloc, embedding_name, @min(policy.batch_items orelse generated_ocr_default_batch_max_items, generated_ocr_absolute_batch_max_items));
+    try checkEmbeddingInvocationOwner(runtime, runtime.active_provider_guard, dense_embedder.part_request_context);
+    const execution_lease = dense_embedder.resolveMediaPartLease(metadata_alloc, embedding_name, @min(policy.batch_items orelse generated_ocr_default_batch_max_items, generated_ocr_absolute_batch_max_items)) catch |err|
+        return embeddingInvocationFailure(runtime, runtime.active_provider_guard, dense_embedder.part_request_context, err);
     const capabilities = execution_lease.capabilities.?;
     const use_borrowed_rasters = dense_embedder.supportsRasterItems() and capabilities.borrowed_rasters;
     if (!capabilities.supports(.{ .image = true }) or
@@ -34910,7 +36764,8 @@ fn processPdfPageImageEmbeddingWithAllocator(
     }
     const capability_items = @max(@as(usize, 1), capabilities.batch.max_items);
     const default_items = @max(@as(usize, 1), capabilities.batch.preferred_items);
-    const batch_items = try dense_embedder.withPartLease(execution_lease).partBatchLimit(embedding_name, request.expected_dims, @min(@min(policy.batch_items orelse default_items, capability_items), generated_ocr_absolute_batch_max_items));
+    const batch_items = dense_embedder.withPartLease(execution_lease).partBatchLimit(embedding_name, request.expected_dims, @min(@min(policy.batch_items orelse default_items, capability_items), generated_ocr_absolute_batch_max_items)) catch |err|
+        return embeddingInvocationFailure(runtime, runtime.active_provider_guard, dense_embedder.part_request_context, err);
     if (batch_items == 0) return error.InvalidInferenceCapabilities;
     // Encoded routes require an exact wire ceiling. A local raw-raster route
     // is bounded by decoded pixels and its composite retained-byte lease, so
@@ -34926,24 +36781,16 @@ fn processPdfPageImageEmbeddingWithAllocator(
 
     var resource_tracker = RuntimeDocumentExtractionResourceTracker.init(runtime);
     defer resource_tracker.deinit();
-    const fetched = try prepared_sources.fetch(
-        source_url,
-        null,
-        remoteRenderConfig(
-            runtime.config.secret_store,
-            runtime.config.remote_content,
-            runtime.config.io,
-            runtime.config.cancellation,
-            null,
-            scopedRetryHint(runtime.config.fetch_retry_hint, request, raw),
-        ),
-    );
-    try embedding_lease_guard.check();
+    const fetched = try fetchEnrichmentSource(runtime, prepared_sources, source_url, null, request, raw);
     var prepared_source_lease = switch (fetched) {
         .ok => |lease| lease,
-        .http_error => return error.RemoteDocumentFetchFailed,
+        .http_error => {
+            try embedding_lease_guard.check();
+            return error.RemoteDocumentFetchFailed;
+        },
     };
     defer prepared_source_lease.deinit();
+    try embedding_lease_guard.check();
     const prepared_source = prepared_source_lease.entry();
     const downloaded = &prepared_source.content;
     resource_tracker.setExternallyAccountedDownloadedBytes(downloaded.data.len);
@@ -34955,25 +36802,27 @@ fn processPdfPageImageEmbeddingWithAllocator(
     // The cached parser is a retained owner, not render scratch. Admit it
     // first so the following operation reservation sees the true remaining
     // process budget instead of starving preparation behind its own peak.
-    var prepared_pdf_source_lease = try prepared_sources.preparePdf(
+    const preparation_cancellation = enrichmentSourceCancellation(runtime);
+    var prepared_pdf_source_lease = prepared_sources.preparePdf(
         &prepared_source_lease,
         render_config.pdf_decode_limits,
         runtime.config.sync_wait_timeout_ms,
-    );
+        pdfPreparationOwner(runtime, &preparation_cancellation),
+    ) catch |err| return providerInvocationFailure(runtime, err);
     defer prepared_pdf_source_lease.deinit();
     const prepared_pdf_source = prepared_pdf_source_lease.session();
     try embedding_lease_guard.check();
     // The next page window may render concurrently with result staging for
     // the current window, so the cloned render session must not share the
     // enrichment worker's task-confined allocator.
-    const coordinator = try RuntimePdfOcrCoordinator.createFromPrepared(
+    const coordinator = RuntimePdfOcrCoordinator.createFromPrepared(
         @import("antfly_platform").allocator.concurrentFallback(),
         @import("antfly_platform").allocator.concurrentFallback(),
         resource_tracker.manager,
         runtime.config.sync_wait_timeout_ms,
         render_config,
         prepared_pdf_source,
-    );
+    ) catch |err| return providerInvocationFailure(runtime, err);
     defer coordinator.destroy();
     coordinator.beginOperation(runtime.config.sync_wait_timeout_ms);
     const page_count = try coordinator.session.pageCount();
@@ -35006,12 +36855,12 @@ fn processPdfPageImageEmbeddingWithAllocator(
             invocation_memory_by_count[item_count] = invocation_memory_by_count[batch_items];
             continue;
         }
-        invocation_memory_by_count[item_count] = try dense_embedder.withPartLease(execution_lease).partInvocationMemoryForMime(
+        invocation_memory_by_count[item_count] = dense_embedder.withPartLease(execution_lease).partInvocationMemoryForMime(
             embedding_name,
             item_count,
             "image/png",
             request.expected_dims,
-        );
+        ) catch |err| return embeddingInvocationFailure(runtime, runtime.active_provider_guard, dense_embedder.part_request_context, err);
         if (item_count > 1) {
             var peak = PdfWindowInvocationPeak{ .memory = invocation_memory_by_count[item_count - 1] };
             try peak.include(invocation_memory_by_count[item_count]);
@@ -35228,10 +37077,11 @@ fn processPdfPageImageEmbeddingWithAllocator(
                     break :blk @unionInit(PdfEmbeddingRenderedWindow, @tagName(tag), borrowed);
                 },
             };
-            var embedded = embedPdfWindowPart(lease.allocator(), dense_embedder.withPartLease(execution_lease), embedding_name, part, request.expected_dims) catch |err| blk: {
+            const embedder = dense_embedder.withPartLease(execution_lease);
+            var embedded = embedPdfWindowPart(runtime, runtime.active_provider_guard, lease.allocator(), embedder, embedding_name, part, request.expected_dims) catch |err| blk: {
                 const shared = runtime.shared_pdf_windows orelse return err;
                 if (!try shared.drainOwnerAdmission(err)) return err;
-                break :blk try embedPdfWindowPart(lease.allocator(), dense_embedder.withPartLease(execution_lease), embedding_name, part, request.expected_dims);
+                break :blk try embedPdfWindowPart(runtime, runtime.active_provider_guard, lease.allocator(), embedder, embedding_name, part, request.expected_dims);
             };
             var embedded_owned = true;
             defer if (embedded_owned) embedded.deinit(lease.allocator());
@@ -36085,7 +37935,7 @@ fn processDenseTemplateParts(
 ) !void {
     const embedding_artifact_name = requestEmbeddingName(request);
     const context = assetProviderRequestContext(runtime);
-    const generation = try dense_embedder.captureTextGenerationWithContext(runtime.alloc, embedding_artifact_name, context);
+    const generation = try captureDenseGeneration(runtime, dense_embedder, runtime.alloc, embedding_artifact_name, context);
     // Bind before consulting generated acceptance: an alias change invalidates
     // the previous receipt even when the document and ordered parts are equal.
     if (input) |token| {
@@ -36119,7 +37969,7 @@ fn processDenseTemplateParts(
     }
     const vector = try embedDensePartsWithRetry(dense_embedder.withTextGeneration(generation), runtime, embedding_artifact_name, parts, request.expected_dims);
     defer runtime.alloc.free(vector);
-    try dense_embedder.requireTextGenerationWithContext(runtime.alloc, embedding_artifact_name, generation, context);
+    try requireDenseGeneration(runtime, dense_embedder, runtime.alloc, embedding_artifact_name, generation, context);
     // Inference succeeded. Errors while publishing its result belong to the
     // pipeline and must not consume this document's provider retry budget.
     errdefer {
@@ -36159,6 +38009,7 @@ fn processDenseEmbedding(
     chunk_cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry),
     prepared_sources: *PreparedDocumentSourceCache,
     window: *GeneratedReplayWindow,
+    media_selection: ?*?MediaEmbeddingSelection,
 ) !void {
     try enrichment_types.validateGeneratedEmbeddingInput(request);
     const dense_embedder = runtime.config.dense_embedder orelse return;
@@ -36176,7 +38027,10 @@ fn processDenseEmbedding(
         // Scanner thread: run the chunked path under the runtime-global
         // identity and install a deferred retry's identity the way the lane
         // boundary does for concurrent lanes.
-        var scope = FailureScope{ .fingerprint = runtime.active_failure_fingerprint };
+        var scope = FailureScope{
+            .fingerprint = runtime.active_failure_fingerprint,
+            .media_embedding_selections = if (media_selection) |selection| selection[0..1] else &.{},
+        };
         processChunkedDenseWindow(runtime, &.{request}, chunk_cache, window, &scope) catch |err| {
             // A deferred retry can carry fingerprint 0 ("no identity yet",
             // e.g. an error raised while post-processing a successful
@@ -36203,7 +38057,7 @@ fn processDenseEmbedding(
         if (try token.authoredAccepted(&read)) return;
     }
 
-    var prepared = try prepareDenseSourceInput(runtime.alloc, runtime.config, dense_embedder, raw, request);
+    var prepared = try prepareDenseEnrichmentSourceInput(runtime, dense_embedder, raw, request);
     defer prepared.deinit(runtime.alloc);
     const source_text = switch (prepared) {
         .text => |text| text,
@@ -36222,7 +38076,7 @@ fn processDenseEmbedding(
         },
     };
     const context = assetProviderRequestContext(runtime);
-    const generation = try dense_embedder.captureTextGenerationWithContext(runtime.alloc, embedding_artifact_name, context);
+    const generation = try captureDenseGeneration(runtime, dense_embedder, runtime.alloc, embedding_artifact_name, context);
     if (input) |*token| {
         var read = try runtime.store.beginProbe();
         defer read.abort();
@@ -36234,7 +38088,7 @@ fn processDenseEmbedding(
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     defer runtime.alloc.free(artifact_key);
     if (input == null and try shouldSkipEmbeddingArtifact(runtime, artifact_key, source_hash)) {
-        try dense_embedder.requireTextGenerationWithContext(runtime.alloc, embedding_artifact_name, generation, context);
+        try requireDenseGeneration(runtime, dense_embedder, runtime.alloc, embedding_artifact_name, generation, context);
         if (try appendCachedDenseEmbeddingToWindow(runtime, window, request.doc_key, artifact_key, consumer_indexes)) {
             try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
         }
@@ -36245,7 +38099,7 @@ fn processDenseEmbedding(
     const vectors = try embedDenseBatchWithRetry(dense_embedder.withTextGeneration(generation), runtime, embedding_artifact_name, &.{source_text}, request.expected_dims, request.reprocess_generation == 0);
     defer embedder_mod.freeDenseEmbeddingBatch(runtime.alloc, vectors);
     if (vectors.len != 1) return error.InvalidEmbeddingResponse;
-    try dense_embedder.requireTextGenerationWithContext(runtime.alloc, embedding_artifact_name, generation, context);
+    try requireDenseGeneration(runtime, dense_embedder, runtime.alloc, embedding_artifact_name, generation, context);
     const vector = vectors[0];
 
     if (!try writeEmbeddingArtifact(runtime, .{
@@ -36309,7 +38163,7 @@ fn processSparseEmbedding(
             return;
         }
 
-        const chunk_revision = try sparse_embedder.captureRevision(runtime.alloc, embedding_artifact_name);
+        const chunk_revision = try captureSparseRevision(runtime, sparse_embedder, runtime.alloc, embedding_artifact_name, foregroundProviderRequestContext(runtime));
         const chunk_embeddings = try buildChunkSparseEmbeddingsFromSources(runtime, request, sparse_embedder, consumer_indexes, source_set.sources, chunk_revision);
         defer {
             for (chunk_embeddings) |embedding| freeDerivedSparseEmbedding(runtime.alloc, embedding);
@@ -36342,7 +38196,7 @@ fn processSparseEmbedding(
     defer runtime.alloc.free(raw);
     var input = try captureProducerInput(runtime, request, doc_store_key, raw);
     defer if (input) |*token| token.deinit();
-    const revision = try sparse_embedder.captureRevision(runtime.alloc, embedding_artifact_name);
+    const revision = try captureSparseRevision(runtime, sparse_embedder, runtime.alloc, embedding_artifact_name, foregroundProviderRequestContext(runtime));
     // Only protocol 17 can carry an execution identity or an output guard.
     if (input) |*token| {
         var read = try runtime.store.beginProbe();
@@ -36353,7 +38207,7 @@ fn processSparseEmbedding(
     }
     if (input) |*token| if (try producerInputAccepted(runtime, token)) return;
 
-    const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse {
+    const source_text = try extractEnrichmentSource(runtime, extractSourceText, runtime.alloc, raw, request) orelse {
         if (input) |*token| {
             const key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
             defer runtime.alloc.free(key);
@@ -36386,7 +38240,7 @@ fn processSparseEmbedding(
     noteEmbedBatchFinished(runtime, consumer_indexes, 1, source_text.len, source_text.len, elapsedNsSince(runtime, embed_started_ns), true);
     defer finishActivePostprocess(runtime);
     defer sparse.deinit(runtime.alloc);
-    if (!std.meta.eql(revision, try sparse_embedder.captureRevision(runtime.alloc, embedding_artifact_name))) return error.EnrichmentSourceChanged;
+    if (!std.meta.eql(revision, try captureSparseRevision(runtime, sparse_embedder, runtime.alloc, embedding_artifact_name, foregroundProviderRequestContext(runtime)))) return error.EnrichmentSourceChanged;
     const payload = try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(runtime.alloc, source_hash, sparse.indices, sparse.values);
     defer runtime.alloc.free(payload);
     if (input) |*token| return enqueueProducerArtifact(runtime, token, artifact_key, payload);
@@ -39646,22 +41500,89 @@ fn clearReplayCursorWithRetry(runtime: *EnrichmentRuntime) !void {
 
 const StatusPublication = enum { current, failure, boundary_recovery };
 
+const BoundaryRecoveryReservation = struct {
+    cut: ReplayCut,
+    revision: u64,
+    status: enrichment_state.RuntimeStatus,
+    fence: ?GeneratedWriteFence,
+};
+
+const ReplayStatusLeaseGuard = struct {
+    runtime: *EnrichmentRuntime,
+    fence: ?GeneratedWriteFence,
+
+    pub fn validate(self: @This(), txn: anytype) !void {
+        try validateRuntimeStoreWriteFenceTxn(self.runtime, txn, self.fence);
+    }
+};
+
+fn releaseBoundaryRecoveryReservation(runtime: *EnrichmentRuntime, reservation: BoundaryRecoveryReservation) !void {
+    const publication_io = lockAppliedPublication(runtime);
+    defer unlockAppliedPublication(runtime, publication_io);
+    const io = lockRuntime(runtime);
+    const still_reserved = runtime.replay_generation == reservation.cut.generation and
+        runtime.applied_sequence == reservation.cut.applied and
+        runtime.status_revision == reservation.revision;
+    unlockRuntime(runtime, io);
+    if (!still_reserved) return;
+
+    var publication_store = try RuntimePublicationStore.init(runtime);
+    defer publication_store.deinit();
+    var status = reservation.status;
+    status.consecutive_retry_count -= 1;
+
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        const revision = enrichment_state.restoreBoundaryRecoveryReservation(
+            runtime.alloc,
+            publication_store.store(runtime).*,
+            scope_name,
+            reservation.cut.applied,
+            reservation.cut.generation,
+            reservation.revision,
+            status,
+            ReplayStatusLeaseGuard{ .runtime = runtime, .fence = reservation.fence },
+        ) catch |err| switch (err) {
+            error.WriterLocked => {
+                if (attempt >= writer_locked_retry_count) return err;
+                backoffWriterLockRetry();
+                continue;
+            },
+            else => return err,
+        } orelse return;
+        const state_io = lockRuntime(runtime);
+        runtime.status_revision = revision;
+        // Keep the same admitted pass available within this process as well.
+        runtime.boundary_recovery_pending = true;
+        unlockRuntime(runtime, state_io);
+        return;
+    }
+}
+
 fn saveRuntimeStatusWithRetry(runtime: *EnrichmentRuntime, mode: StatusPublication) !void {
     try saveRuntimeStatusWithPlan(runtime, mode, null, null, null);
 }
 
 fn saveRuntimeStatusWithPlan(runtime: *EnrichmentRuntime, mode: StatusPublication, pass_config_hash: ?u64, pass_generation: ?u64, failed_through: ?u64) !void {
+    try saveRuntimeStatusWithPlanReceipt(runtime, mode, pass_config_hash, pass_generation, failed_through, null);
+}
+
+fn saveRuntimeStatusWithPlanReceipt(runtime: *EnrichmentRuntime, mode: StatusPublication, pass_config_hash: ?u64, pass_generation: ?u64, failed_through: ?u64, reservation: ?*?BoundaryRecoveryReservation) !void {
     const publication_io = lockAppliedPublication(runtime);
     defer unlockAppliedPublication(runtime, publication_io);
     const io = lockRuntime(runtime);
     const snapshot = runtimeStatusSnapshot(runtime);
     const applied = runtime.applied_sequence;
     const generation = pass_generation orelse runtime.replay_generation;
+    const recovery_pending = if (@hasField(EnrichmentRuntime, "boundary_recovery_pending")) runtime.boundary_recovery_pending else false;
     unlockRuntime(runtime, io);
     const status = switch (mode) {
         .current, .failure => snapshot,
-        .boundary_recovery => boundaryFailureAdmissionStatus(snapshot) orelse return,
+        .boundary_recovery => boundaryFailureAdmissionStatus(snapshot, recovery_pending, applied) orelse return,
     };
+    // The transaction already checks the replay generation. This proof
+    // supplies the exact lease epoch for the initial reservation and refund.
+    const reservation_fence = if (mode == .boundary_recovery) try requiredRuntimeStoreWriteFence(runtime, null) else null;
     var publication_store = try RuntimePublicationStore.init(runtime);
     defer publication_store.deinit();
     const live_store = publication_store.store(runtime);
@@ -39669,7 +41590,8 @@ fn saveRuntimeStatusWithPlan(runtime: *EnrichmentRuntime, mode: StatusPublicatio
     const projection_status = runtimeProjectionStatus(status.retrying, status.worker_failed);
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        const next = enrichment_state.saveRuntimeStatusAndProjection(runtime.alloc, live_store.*, scope_name, applied, runtime.status_revision, status, projection_status, config_hash, generation, if (mode == .failure) failed_through orelse snapshot.target_sequence else null) catch |err| switch (err) {
+        const next = enrichment_state.saveRuntimeStatusAndProjectionGuarded(runtime.alloc, live_store.*, scope_name, applied, runtime.status_revision, status, projection_status, config_hash, generation, if (mode == .failure) failed_through orelse snapshot.target_sequence else null, ReplayStatusLeaseGuard{ .runtime = runtime, .fence = reservation_fence }) catch |err| switch (err) {
+            error.EnrichmentLeaseFenceLost => return error.EnrichmentReplayAuthorityBusy,
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
                 backoffWriterLockRetry();
@@ -39679,6 +41601,17 @@ fn saveRuntimeStatusWithPlan(runtime: *EnrichmentRuntime, mode: StatusPublicatio
         };
         if (next != null and (runtime.status_revision == null or next.? == runtime.status_revision.? + 1)) {
             if (runtime.status_revision != null) runtime.status_revision = next.?;
+            if (comptime @hasField(EnrichmentRuntime, "boundary_recovery_pending")) {
+                if (mode == .boundary_recovery) {
+                    const state_io = lockRuntime(runtime);
+                    runtime.boundary_recovery_pending = false;
+                    if (reservation) |receipt| {
+                        runtime.status_revision = next.?;
+                        receipt.* = .{ .cut = .{ .generation = generation, .applied = applied }, .revision = next.?, .status = status, .fence = reservation_fence };
+                    }
+                    unlockRuntime(runtime, state_io);
+                }
+            }
         } else {
             const observed = try enrichment_state.loadRuntimeObservation(runtime.alloc, live_store.*, scope_name);
             const state_io = lockRuntime(runtime);
@@ -39687,7 +41620,7 @@ fn saveRuntimeStatusWithPlan(runtime: *EnrichmentRuntime, mode: StatusPublicatio
                 reconcileRuntimeObservation(runtime, observed);
                 if (comptime builtin.os.tag != .freestanding) if (state_io) |value| broadcastRuntimeStateChanged(runtime, value);
             }
-            if (mode == .boundary_recovery) return error.EnrichmentSourceChanged;
+            if (mode == .boundary_recovery) return error.EnrichmentReplayAuthorityBusy;
         }
         return;
     }
@@ -40530,7 +42463,7 @@ test "enrichment applied checkpoint stays degraded until runtime status clears" 
             lite_runtime.replay_generation = old_cut.generation;
             lite_runtime.applied_sequence = old_cut.applied;
             lite_runtime.worker_failed = true;
-            try std.testing.expectError(error.EnrichmentWaitCanceled, lite_runtime.resolveCanceledVisibilityWait(std.testing.io, sequence, old_cut));
+            try std.testing.expectError(error.EnrichmentWaitCanceled, lite_runtime.resolveInterruptedVisibilityWait(std.testing.io, sequence, old_cut, error.EnrichmentWaitCanceled));
             try std.testing.expectEqual(rewound.generation, lite_runtime.replay_generation);
             try std.testing.expect(!lite_runtime.worker_failed);
         }
@@ -40614,7 +42547,7 @@ test "enrichment applied checkpoint stays degraded until runtime status clears" 
                 const token = CancellationToken.fromAtomic(&canceled);
                 switch (path) {
                     .waiter => try std.testing.expectError(error.EnrichmentWaitCanceled, lite_runtime.waitForAppliedWithCancellation(6, token)),
-                    .canceled_waiter => try std.testing.expectError(error.EnrichmentWaitCanceled, lite_runtime.resolveCanceledVisibilityWait(std.testing.io, 6, lite_runtime.replayCut())),
+                    .canceled_waiter => try std.testing.expectError(error.EnrichmentWaitCanceled, lite_runtime.resolveInterruptedVisibilityWait(std.testing.io, 6, lite_runtime.replayCut(), error.EnrichmentWaitCanceled)),
                     .foreground => try std.testing.expectError(error.EnrichmentWaitCanceled, lite_runtime.catchUpUntilWithCancellation(6, token)),
                     .worker => try std.testing.expectEqual(@as(?u64, 0), workerStep(&lite_runtime)),
                 }
@@ -41165,9 +43098,13 @@ fn validateRuntimeStoreWriteFenceTxn(
     txn: anytype,
     fence: ?GeneratedWriteFence,
 ) !void {
+    return validateEnrichmentWriteFenceTxn(runtime.alloc, txn, fence, runtime.clock);
+}
+
+fn validateEnrichmentWriteFenceTxn(alloc: Allocator, txn: anytype, fence: ?GeneratedWriteFence, clock: platform_clock.Clock) !void {
     const expected = fence orelse return;
     if (expected.replay_generation) |generation|
-        try enrichment_state.validateReplayGenerationTxn(runtime.alloc, txn, scope_name, generation);
+        try enrichment_state.validateReplayGenerationTxn(alloc, txn, scope_name, generation);
     if (expected.lease_key.len == 0) return;
     const raw = txn.get(expected.lease_key) catch |err| switch (err) {
         error.NotFound => return error.EnrichmentLeaseFenceLost,
@@ -41175,7 +43112,7 @@ fn validateRuntimeStoreWriteFenceTxn(
     };
     var parsed = std.json.parseFromSlice(
         lease_mod.LeaseRecord,
-        runtime.alloc,
+        alloc,
         raw,
         .{ .allocate = .alloc_always, .ignore_unknown_fields = true },
     ) catch |err| switch (err) {
@@ -41185,7 +43122,7 @@ fn validateRuntimeStoreWriteFenceTxn(
     defer parsed.deinit();
     if (!std.mem.eql(u8, parsed.value.owner_id, expected.owner_id) or
         parsed.value.epoch != expected.epoch or
-        parsed.value.expires_at_ms <= runtime.clock.nowRealtimeMs())
+        parsed.value.expires_at_ms <= clock.nowRealtimeMs())
     {
         return error.EnrichmentLeaseFenceLost;
     }
@@ -41527,7 +43464,7 @@ fn declaredSourceTextAlloc(runtime: *EnrichmentRuntime, doc_key: []const u8, raw
             .source_field = entry.source_field,
             .source_template = entry.source_template,
         };
-        const extracted = extractAssetSourceValue(runtime.alloc, runtime.config, source_input, synthetic) catch |err| switch (err) {
+        const extracted = extractEnrichmentSource(runtime, extractAssetSourceValue, runtime.alloc, source_input, synthetic) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return try runtime.alloc.dupe(u8, raw),
         };
@@ -41753,15 +43690,47 @@ const ModelChunkSource = struct {
         if (self.mime_type) |mime| a.free(mime);
     }
 };
+fn fetchEnrichmentSource(
+    runtime: *EnrichmentRuntime,
+    cache: *PreparedDocumentSourceCache,
+    source_url: []const u8,
+    credentials: ?[]const u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    raw: []const u8,
+) !PreparedDocumentSourceCache.FetchOutcome {
+    try checkProviderFailureGuard(runtime);
+    const cancellation = enrichmentSourceCancellation(runtime);
+    var config = remoteRenderConfig(runtime.config.secret_store, runtime.config.remote_content, runtime.config.io, cancellation.token(), null, scopedRetryHint(runtime.config.fetch_retry_hint, request, raw));
+    config.deadline_ns = runtime.active_provider_guard.nativeDeadlineNs(null);
+    return cache.fetchControlled(source_url, credentials, config, cancellation.token()) catch |err| return providerInvocationFailure(runtime, err);
+}
+
+fn extractModelChunkEnrichmentSource(runtime: *EnrichmentRuntime, a: Allocator, raw: []const u8, request: enrichment_types.GeneratedEnrichmentRequest, cache: ?*PreparedDocumentSourceCache) !ModelChunkSource {
+    const cancellation = enrichmentSourceCancellation(runtime);
+    var config = runtime.config;
+    config.cancellation = cancellation.token();
+    var context = assetProviderRequestContext(runtime);
+    context.cancellation = config.cancellation;
+    return extractModelChunkSourceCached(a, config, raw, request, context, cache) catch |err| return providerInvocationFailure(runtime, err);
+}
+
 fn extractModelChunkSource(a: Allocator, config: Config, raw: []const u8, request: enrichment_types.GeneratedEnrichmentRequest, context: ?inference_request_context.RequestContext) !ModelChunkSource {
     return extractModelChunkSourceCached(a, config, raw, request, context, null);
 }
 fn extractModelChunkSourceCached(a: Allocator, config: Config, raw: []const u8, request: enrichment_types.GeneratedEnrichmentRequest, context: ?inference_request_context.RequestContext, prepared_sources: ?*PreparedDocumentSourceCache) !ModelChunkSource {
-    if (context) |controlled| try controlled.check();
+    var owner: asset_producer_mod.InvocationContext = .{ .deadline_ns = config.source_deadline_ns, .cancellation = config.cancellation };
+    if (context) |controlled| {
+        if (controlled.deadline_ns) |deadline| owner.deadline_ns = @min(owner.deadline_ns orelse deadline, deadline);
+        owner.cancellation = controlled.cancellation orelse owner.cancellation;
+    }
     if (request.source_template.len != 0) {
-        const text = try extractSourceText(a, config, raw, request) orelse return .{};
+        var scoped = config;
+        scoped.source_deadline_ns = owner.deadline_ns;
+        scoped.cancellation = owner.cancellation;
+        const text = try extractSourceText(a, scoped, raw, request) orelse return .{};
         return .{ .input = .{ .text = text }, .bytes = text };
     }
+    try checkPreparedSourceOwner(owner);
     var parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return .{};
@@ -41772,14 +43741,14 @@ fn extractModelChunkSourceCached(a: Allocator, config: Config, raw: []const u8, 
         .text => |value| {
             if (@import("../../../chunking/chunk.zig").isRemoteModelLocator(value)) {
                 var render_config = remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, null, scopedRetryHint(config.fetch_retry_hint, request, raw));
-                render_config.deadline_ns = if (context) |controlled| controlled.deadline_ns else null;
+                render_config.deadline_ns = owner.deadline_ns;
                 if (comptime @hasField(template_remote.RenderConfig, "cancellation")) {
                     if (context) |controlled| if (controlled.cancellation) |token| {
                         render_config.cancellation = scraping.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn);
                     };
                 }
                 if (prepared_sources) |cache| {
-                    const cached = try cache.fetch(value, null, render_config);
+                    const cached = try cache.fetchControlled(value, null, render_config, owner.cancellation);
                     switch (cached) {
                         .http_error => |failure| return if (document_extraction_mod.remoteHttpStatusIsTransient(failure.status)) error.TransientPromptFailure else error.PermanentPromptFailure,
                         .ok => |lease| return .{ .source_lease = lease, .input = .{ .binary = .{ .mime_type = lease.entry().content.content_type, .data = lease.entry().content.data } } },
@@ -41792,7 +43761,7 @@ fn extractModelChunkSourceCached(a: Allocator, config: Config, raw: []const u8, 
                 errdefer a.destroy(owned);
                 owned.* = PreparedDocumentSourceCache.initWithConfig(a, config, null);
                 errdefer owned.deinit();
-                switch (try owned.fetch(value, null, render_config)) {
+                switch (try owned.fetchControlled(value, null, render_config, owner.cancellation)) {
                     .http_error => |failure| return if (document_extraction_mod.remoteHttpStatusIsTransient(failure.status)) error.TransientPromptFailure else error.PermanentPromptFailure,
                     .ok => |lease| return .{ .source_lease = lease, .owned_source_cache = owned, .input = .{ .binary = .{ .mime_type = lease.entry().content.content_type, .data = lease.entry().content.data } } },
                 }
@@ -41837,6 +43806,49 @@ fn sourceTemplateHasNoInput(err: anyerror) bool {
     };
 }
 
+const EnrichmentSourceCancellation = struct {
+    lifecycle: CancellationToken,
+    guard: ForegroundCatchUpGuard,
+
+    fn isCancelled(ptr: *const anyopaque) bool {
+        const self: *const @This() = @ptrCast(@alignCast(ptr));
+        if (self.guard.deadline_ns) |deadline| if (self.guard.clock.nowRealtimeNs() >= deadline) return true;
+        return pollSourceCancellation(self.lifecycle) or pollSourceCancellation(self.guard.cancellation);
+    }
+
+    fn check(ptr: *const anyopaque) !void {
+        const self: *const @This() = @ptrCast(@alignCast(ptr));
+        try self.guard.check();
+        try self.lifecycle.check();
+    }
+
+    fn token(self: *const @This()) CancellationToken {
+        if (self.guard.deadline_ns == null and self.guard.cancellation.ptr == null and self.lifecycle.ptr == null) return .none;
+        return .{ .ptr = self, .is_cancelled_fn = isCancelled, .check_fn = check };
+    }
+};
+
+fn enrichmentSourceCancellation(runtime: *EnrichmentRuntime) EnrichmentSourceCancellation {
+    return .{ .lifecycle = runtime.config.cancellation, .guard = runtime.active_provider_guard };
+}
+
+fn extractEnrichmentSource(
+    runtime: *EnrichmentRuntime,
+    comptime extract: anytype,
+    alloc: Allocator,
+    raw: []const u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+) anyerror!@typeInfo(@typeInfo(@TypeOf(extract)).@"fn".return_type.?).error_union.payload {
+    if (request.source_template.len == 0) return extract(alloc, runtime.config, raw, request);
+    try runtime.active_provider_guard.check();
+    const cancellation = enrichmentSourceCancellation(runtime);
+    var config = runtime.config;
+    config.cancellation = cancellation.token();
+    config.source_deadline_ns = runtime.active_provider_guard.nativeDeadlineNs(config.source_deadline_ns);
+    return extract(alloc, config, raw, request) catch |err|
+        return providerInvocationFailure(runtime, err);
+}
+
 fn extractSourceText(
     alloc: Allocator,
     config: Config,
@@ -41873,20 +43885,20 @@ fn renderSourceTemplateText(
     raw_doc: []const u8,
     source_template: []const u8,
 ) ![]const u8 {
-    if (comptime @hasDecl(template_remote, "renderJsonToValidatedTextWithConfig")) {
-        return try template_remote.renderJsonToValidatedTextWithConfig(
-            alloc,
-            source_template,
-            raw_doc,
-            remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, null, config.fetch_retry_hint),
-        );
-    }
-    return try template_remote.renderJsonToTextWithConfig(
-        alloc,
-        source_template,
-        raw_doc,
-        remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, null, config.fetch_retry_hint),
-    );
+    var render_config = remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, null, config.fetch_retry_hint);
+    render_config.deadline_ns = config.source_deadline_ns;
+    const owner: asset_producer_mod.InvocationContext = .{ .deadline_ns = config.source_deadline_ns, .cancellation = config.cancellation };
+    try checkPreparedSourceOwner(owner);
+    const rendered = (if (comptime @hasDecl(template_remote, "renderJsonToValidatedTextWithConfig"))
+        template_remote.renderJsonToValidatedTextWithConfig(alloc, source_template, raw_doc, render_config)
+    else
+        template_remote.renderJsonToTextWithConfig(alloc, source_template, raw_doc, render_config)) catch |err| {
+        try checkPreparedSourceOwner(owner);
+        return err;
+    };
+    errdefer alloc.free(rendered);
+    try checkPreparedSourceOwner(owner);
+    return rendered;
 }
 
 fn extractAssetSourceValue(
@@ -41947,6 +43959,17 @@ const DenseSourceInput = union(enum) {
     }
 };
 
+fn prepareDenseEnrichmentSourceInput(runtime: *EnrichmentRuntime, dense: embedder_mod.DenseEmbedder, raw: []const u8, request: enrichment_types.GeneratedEnrichmentRequest) !DenseSourceInput {
+    if (request.source_template.len == 0) return prepareDenseSourceInput(runtime.alloc, runtime.config, dense, raw, request);
+    try checkProviderFailureGuard(runtime);
+    const cancellation = enrichmentSourceCancellation(runtime);
+    var config = runtime.config;
+    config.cancellation = cancellation.token();
+    config.source_deadline_ns = runtime.active_provider_guard.nativeDeadlineNs(config.source_deadline_ns);
+    return prepareDenseSourceInput(runtime.alloc, config, dense, raw, request) catch |err|
+        return providerInvocationFailure(runtime, err);
+}
+
 fn prepareDenseSourceInput(alloc: Allocator, config: Config, dense: embedder_mod.DenseEmbedder, raw: []const u8, request: enrichment_types.GeneratedEnrichmentRequest) !DenseSourceInput {
     if (request.source_template.len > 0 and dense.supportsParts()) {
         const name = requestEmbeddingName(request);
@@ -41969,16 +43992,20 @@ fn renderSourceParts(
     max_media_parts: ?usize,
 ) !?[]template.ContentPart {
     if (request.source_template.len == 0) return null;
-    const parts = if (comptime @hasDecl(template_remote, "renderJsonToPartsWithConfig"))
-        template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, raw_doc, remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, max_media_parts, scopedRetryHint(config.fetch_retry_hint, request, raw_doc))) catch |err| {
-            if (sourceTemplateHasNoInput(err)) return null;
-            return err;
-        }
+    var render_config = remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, max_media_parts, scopedRetryHint(config.fetch_retry_hint, request, raw_doc));
+    render_config.deadline_ns = config.source_deadline_ns;
+    const owner: asset_producer_mod.InvocationContext = .{ .deadline_ns = config.source_deadline_ns, .cancellation = config.cancellation };
+    try checkPreparedSourceOwner(owner);
+    const parts = (if (comptime @hasDecl(template_remote, "renderJsonToPartsWithConfig"))
+        template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, raw_doc, render_config)
     else
-        template_remote.renderJsonToParts(alloc, request.source_template, raw_doc) catch |err| {
-            if (sourceTemplateHasNoInput(err)) return null;
-            return err;
-        };
+        template_remote.renderJsonToParts(alloc, request.source_template, raw_doc)) catch |err| {
+        try checkPreparedSourceOwner(owner);
+        if (sourceTemplateHasNoInput(err)) return null;
+        return err;
+    };
+    errdefer template.freeContentParts(alloc, parts);
+    try checkPreparedSourceOwner(owner);
     if (parts.len == 0) {
         template.freeContentParts(alloc, parts);
         return null;
@@ -42113,6 +44140,13 @@ test "document extraction generated OCR rejects malformed envelopes before apply
         return error.TestExpectedRetryableBatchFailure;
     try std.testing.expectEqual(error.GenerateBatchItemRetryable, failure.cause);
     try std.testing.expectEqual(@as(?u64, 250), failure.retry_after_ms);
+    var canceled_items = items;
+    canceled_items[1].result.item_error.cause = error.Canceled;
+    canceled_items[1].result.item_error.retryable = false;
+    const canceled_failure = runtimeGeneratedTextBatchFailureToYield(&runtime, &canceled_items) orelse
+        return error.TestExpectedRetryableBatchFailure;
+    try std.testing.expectEqual(error.ProviderInvocationCanceled, canceled_failure.cause);
+    try std.testing.expect(canceled_failure.retryable);
 }
 
 test "document extraction generated OCR applies unit updates transactionally" {
@@ -42851,22 +44885,42 @@ test "asset batch fallback isolates malformed envelope and preserves typed mixed
         batch_count: usize = 0,
         single_count: usize = 0,
         retryable: bool = false,
+        cancel_item: bool = false,
+        cancel_invocation: bool = false,
+        cancel_single: bool = false,
+        capability_error: ?anyerror = null,
+        inherited: std.atomic.Value(bool) = .init(false),
 
         fn producer(self: *@This()) asset_producer_mod.Producer {
             return .{
                 .ptr = self,
+                .invocation_context = .{ .cancellation = CancellationToken.fromAtomic(&self.inherited) },
                 .vtable = &.{
                     .produce = produce,
+                    .produce_with_context = produceWithContext,
+                    .foreground_bounded_for_requests = foregroundBounded,
                     .produce_batch_reported = produceBatchReported,
                     .invocation_memory_for_requests = testInvocationMemoryForRequests,
                 },
             };
         }
 
-        fn produce(ptr: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+        fn produce(ptr: *anyopaque, a: Allocator, _: asset_producer_mod.Request) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.single_count += 1;
-            return error.TestUnexpectedSequentialFallback;
+            if (!self.cancel_single) return error.TestUnexpectedSequentialFallback;
+            self.inherited.store(true, .release);
+            return a.dupe(u8, "singleton");
+        }
+
+        fn produceWithContext(ptr: *anyopaque, a: Allocator, request: asset_producer_mod.Request, _: asset_producer_mod.InvocationContext) ![]u8 {
+            return produce(ptr, a, request);
+        }
+
+        fn foregroundBounded(ptr: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.capability_error) |err| return err;
+            return true;
         }
 
         fn produceBatchReported(ptr: *anyopaque, a: Allocator, requests: []const asset_producer_mod.Request) !asset_producer_mod.ProducedBatch {
@@ -42881,11 +44935,12 @@ test "asset batch fallback isolates malformed envelope and preserves typed mixed
             produced[1] = .{
                 .identity = .{},
                 .result = .{ .item_error = .{
-                    .cause = if (self.retryable) error.EmbedRateLimited else error.UnsupportedGeneratorProvider,
+                    .cause = if (self.cancel_item) error.Cancelled else if (self.retryable) error.EmbedRateLimited else error.UnsupportedGeneratorProvider,
                     .code = .invalid_request,
                     .retryable = self.retryable,
                 } },
             };
+            if (self.cancel_invocation) self.inherited.store(true, .release);
             return .{
                 .items = produced,
                 .execution = inference_work.ExecutionReport.native(requests.len),
@@ -43024,7 +45079,79 @@ test "asset batch fallback isolates malformed envelope and preserves typed mixed
     var replay_scope = FailureScope{};
     try flushAssetProducerBatch(&runtime, &items, &window, &replay_scope);
     try std.testing.expectEqual(@as(usize, 2), failure_capture.count);
+
+    // The provider's raw cancellation flag cannot force a terminal receipt
+    // while the caller and worker remain active.
+    mixed.retryable = false;
+    mixed.cancel_item = true;
+    runtime.retry_failure_count = 0;
+    try items.append(alloc, try TestItem.make(alloc, "doc:5", "five", "artifact:five", "state:five"));
+    try items.append(alloc, try TestItem.make(alloc, "doc:6", "six", "artifact:six", "state:six"));
+    var canceled_scope = FailureScope{};
+    try std.testing.expectError(error.ProviderInvocationCanceled, flushAssetProducerBatch(&runtime, &items, &window, &canceled_scope));
+    try std.testing.expectEqual(failed_identity, canceled_scope.retry_fingerprint);
+    try std.testing.expectEqual(@as(usize, 2), failure_capture.count);
+    // Cancellation can arrive after the provider has completed a mixed
+    // envelope. Neither the canceled item nor its sibling may be applied.
+    mixed.cancel_invocation = true;
+    try items.append(alloc, try TestItem.make(alloc, "doc:5", "five", "artifact:inherited", "state:inherited"));
+    try items.append(alloc, try TestItem.make(alloc, "doc:6", "six", "artifact:inherited-sibling", "state:inherited-sibling"));
+    const before = runtimeStatusSnapshot(&runtime);
+    var inherited_scope = FailureScope{};
+    try std.testing.expectError(error.EnrichmentWaitCanceled, flushAssetProducerBatch(&runtime, &items, &window, &inherited_scope));
+    try std.testing.expect(mixed.inherited.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), inherited_scope.retry_fingerprint);
+    try std.testing.expectEqualDeep(before, runtimeStatusSnapshot(&runtime));
+    try std.testing.expectError(error.NotFound, storeGetAlloc(&runtime, "artifact:inherited"));
+    try std.testing.expectEqual(@as(usize, 2), failure_capture.count);
     try std.testing.expectEqual(@as(usize, 0), mixed.single_count);
+
+    // The first item's write can finish after the invocation owner cancels.
+    // The later failed item must not acquire a retry ticket or failure receipt.
+    const CancelOnWrite = struct {
+        var original: *const fn (Allocator, *anyopaque) anyerror!backend_erased.Batch = undefined;
+        var signal: *std.atomic.Value(bool) = undefined;
+        fn begin(a: Allocator, ptr: *anyopaque) anyerror!backend_erased.Batch {
+            signal.store(true, .release);
+            return original(a, ptr);
+        }
+    };
+    var scheduler = try ScopedReplay.load(&runtime);
+    defer scheduler.deinit(alloc);
+    runtime.retry_scheduler = &scheduler;
+    defer runtime.retry_scheduler = null;
+    const original = runtime.store.vtable;
+    var instrumented = original.*;
+    CancelOnWrite.original = original.begin_batch;
+    CancelOnWrite.signal = &mixed.inherited;
+    instrumented.begin_batch = CancelOnWrite.begin;
+    mixed.cancel_invocation = false;
+    mixed.inherited.store(false, .release);
+    try items.append(alloc, try TestItem.make(alloc, "doc:5", "five", "artifact:started", "state:started"));
+    try items.append(alloc, try TestItem.make(alloc, "doc:6", "six", "artifact:after-cancel", "state:after-cancel"));
+    var during_write = FailureScope{};
+    {
+        runtime.store.vtable = &instrumented;
+        defer runtime.store.vtable = original;
+        try std.testing.expectError(error.EnrichmentWaitCanceled, flushAssetProducerBatch(&runtime, &items, &window, &during_write));
+    }
+    const started = try storeGetAlloc(&runtime, "artifact:started");
+    defer alloc.free(started);
+    try std.testing.expectEqualStrings("native:three", started);
+    try std.testing.expectError(error.NotFound, storeGetAlloc(&runtime, "artifact:after-cancel"));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.state.tickets.items.len);
+    try std.testing.expectEqual(@as(usize, 2), failure_capture.count);
+
+    const request: asset_producer_mod.Request = .{ .producer_type = .generator, .config_json = "{}", .source_text = "one" };
+    mixed.inherited.store(false, .release);
+    mixed.cancel_single = true;
+    try std.testing.expectError(error.EnrichmentWaitCanceled, assetProducerProduceGuarded(&runtime, mixed.producer(), alloc, request));
+
+    mixed.inherited.store(false, .release);
+    mixed.capability_error = error.Canceled;
+    runtime.active_provider_guard.deadline_ns = std.math.maxInt(u64);
+    try std.testing.expectError(error.ProviderInvocationCanceled, checkAssetProviderInvocation(&runtime, mixed.producer(), alloc, &.{request}));
+    try std.testing.expectEqual(@as(usize, 1), mixed.single_count);
 }
 
 test "ordered artifact inventory unit chunk callback reconstructs publishes and retires accepted inputs" {
@@ -43448,7 +45575,7 @@ test "ordered artifact inventory authored document callbacks bypass providers an
         var window: GeneratedReplayWindow = .{ .alloc = alloc };
         defer window.deinit();
         if (dense) {
-            try processDenseEmbedding(runtime, request, &cache, &sources, &window);
+            try processDenseEmbedding(runtime, request, &cache, &sources, &window, null);
             var scope = FailureScope{};
             var generation: ?embedder_mod.DenseEmbedder.TextGeneration = null;
             try std.testing.expect(try collectPlainDenseBatchItem(runtime, request, &.{"vector"}, &window, &scope, &generation) == null);
@@ -43570,7 +45697,7 @@ fn testOrderedDirectProducerCarry(dense: bool, reprocess_generation: u64) !void 
 
     const Step = struct {
         fn run(rt: *EnrichmentRuntime, is_dense: bool, req: enrichment_types.GeneratedEnrichmentRequest, c: *std.ArrayListUnmanaged(WorkerChunkCacheEntry), s: *PreparedDocumentSourceCache, w: *GeneratedReplayWindow) !void {
-            if (is_dense) return processDenseEmbedding(rt, req, c, s, w);
+            if (is_dense) return processDenseEmbedding(rt, req, c, s, w, null);
             return processSparseEmbedding(rt, req, c, w);
         }
     };
@@ -43798,6 +45925,10 @@ test "ordered materialized chunk embeddings drain collection under memory pressu
     try testOrderedChunkVectorCarry(true, .collection_contention);
 }
 
+test "ordered materialized chunk embeddings recover from shared transport pressure" {
+    try testOrderedChunkVectorCarry(true, .transport_pressure);
+}
+
 test "ordered materialized chunk embeddings use bounded parallel provider batches" {
     try testOrderedChunkVectorCarry(true, .parallel);
     try testOrderedChunkVectorCarry(true, .parallel_bytes);
@@ -43833,7 +45964,7 @@ test "ordered materialized chunk embeddings retain owners across planning failur
     try testOrderedChunkVectorCarry(true, .planning_retry);
 }
 
-const ChunkVectorBatchTest = enum { carry, items, bytes, revision, legacy, legacy_bytes, terminal, metadata_retry, metadata_tail_retry, relational_retry, legacy_budget, legacy_boundary_terminal, legacy_metadata_retry, legacy_metadata_terminal, parallel, parallel_bytes, legacy_preparation_retry, legacy_preparation_retry_cached, mixed_publication_pending, parallel_oversize, parallel_terminal, parallel_retry, collection_pressure, collection_too_large, parallel_cancel, cancel_first, cancel_second, cancel_global, source_first, source_second, abort_first, abort_second, mixed_retry_first, mixed_retry_second, memo_serial, memo_parallel, memo_unused, parallel_capacity, parallel_capacity_cancel, planning_terminal, planning_retry, collection_multi, collection_contention, legacy_cleanup_terminal, legacy_cleanup_terminal_empty, legacy_cleanup_terminal_current };
+const ChunkVectorBatchTest = enum { carry, items, bytes, revision, legacy, legacy_bytes, terminal, metadata_retry, metadata_tail_retry, relational_retry, legacy_budget, legacy_boundary_terminal, legacy_metadata_retry, legacy_metadata_terminal, parallel, parallel_bytes, legacy_preparation_retry, legacy_preparation_retry_cached, mixed_publication_pending, parallel_oversize, parallel_terminal, parallel_retry, collection_pressure, collection_too_large, parallel_cancel, cancel_first, cancel_second, cancel_global, source_first, source_second, abort_first, abort_second, mixed_retry_first, mixed_retry_second, memo_serial, memo_parallel, memo_unused, parallel_capacity, parallel_capacity_cancel, planning_terminal, planning_retry, collection_multi, collection_contention, legacy_cleanup_terminal, legacy_cleanup_terminal_empty, legacy_cleanup_terminal_current, transport_pressure };
 
 fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !void {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
@@ -44305,7 +46436,6 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
     var catalog = try db.artifactInventoryCommand(alloc);
     defer catalog.catalogs.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 18), catalog.binding.effect_protocol);
-    catalog.binding.effect_protocol = 18;
     try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
     var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
@@ -44330,6 +46460,69 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
 
     try std.testing.expectError(error.ArtifactPublicationPending, processChunkText(runtime, chunk_request, &cache, &window, null));
     try harness.apply(&db, 4);
+    if (batching == .transport_pressure) {
+        const slice: resource_manager_mod.Slice = .relational_preparation_working_set;
+        const limit = 64 * 1024;
+        var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc, .memory_budget = .{ .hard_limit_bytes = limit } });
+        defer manager.deinit(alloc);
+        var failing = std.testing.FailingAllocator.init(alloc, .{});
+        var budget = runtime.media_window_capture.budget(&manager, failing.allocator());
+        defer budget.deinit();
+        const shared_alloc = budget.allocator();
+        const provider: embedder_mod.DenseEmbedder = .{ .ptr = &harness, .dense_embed_fn = Harness.embedDense, .dense_embed_batch_with_context_fn = Harness.embedDenseBatch, .cache_revision_fn = Harness.revision, .capabilities_fn = Harness.caps, .dense_embed_batch_planned_fn = Harness.planned };
+        const generation = try captureDenseGeneration(runtime, provider, alloc, "model", null);
+        const member = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc", "chunks", 0);
+        defer alloc.free(member);
+        const before = harness.publications;
+        for ([_]enum { admission, backing, recovered }{ .admission, .backing, .recovered }) |attempt| {
+            var scope: FailureScope = .{};
+            var batch: OrderedDenseTextBatch = .{ .scope = &scope, .alloc = shared_alloc, .generation = generation };
+            defer batch.deinit();
+            try batch.items.ensureUnusedCapacity(shared_alloc, 1);
+            var input = blk: {
+                var read = try runtime.store.beginRead();
+                defer read.abort();
+                break :blk (try @import("../artifact_chunk_vector_publication.zig").capture(shared_alloc, &read, vector_request, plan.plan(), member)).?;
+            };
+            var owned = true;
+            defer if (owned) input.deinit();
+            input.old_window_outputs = &.{};
+            input.token.execution_bound = true;
+            input.token.execution_identity = generation.revision;
+            // Prewarm the token so the command's mutation descriptor fits
+            // when the encoder itself has to request more host credit.
+            const warm = try input.token.command(&.{.{ .family = .derived_vector, .key = input.output_key, .value = null, .source_index = 0 }});
+            input.token.arena.allocator().free(warm.mutations);
+            batch.items.appendAssumeCapacity(.{ .request = vector_request, .input = input, .text = "hello world", .artifact_key = input.output_key, .source_hash = 0 });
+            owned = false;
+            _ = budget.releaseUnusedCredit();
+
+            const denial_before = budget.denialGeneration();
+            switch (attempt) {
+                .admission => {
+                    var competing = try manager.reserve(slice, limit - manager.sliceStats(slice).used_bytes);
+                    defer competing.release();
+                    try std.testing.expectError(error.ResourceBudgetExceeded, batch.flush(runtime, provider, &.{"vector"}));
+                    try std.testing.expect(budget.denialGeneration() != denial_before);
+                    try std.testing.expectEqual(EnrichmentErrorDisposition.retryable_request, enrichmentErrorDisposition(error.ResourceBudgetExceeded));
+                    try std.testing.expect(scope.publication_failed);
+                    try std.testing.expectEqual(before, harness.publications);
+                },
+                .backing => {
+                    // A previous denial must not mask genuine allocator failure.
+                    failing.fail_index = failing.alloc_index;
+                    defer failing.fail_index = std.math.maxInt(usize);
+                    try std.testing.expectError(error.OutOfMemory, batch.flush(runtime, provider, &.{"vector"}));
+                    try std.testing.expectEqual(denial_before, budget.denialGeneration());
+                    try std.testing.expectEqual(before, harness.publications);
+                },
+                .recovered => try batch.flush(runtime, provider, &.{"vector"}),
+            }
+        }
+        try std.testing.expectEqual(before + 1, harness.publications);
+        try harness.apply(&db, 5);
+        return;
+    }
     if (batching != .carry) {
         const count = 65;
         var requests: [count]enrichment_types.GeneratedEnrichmentRequest = undefined;
@@ -44387,7 +46580,9 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
             const before = harness.queued.items.len;
             var scope: FailureScope = .{};
             if (batching == .parallel_capacity_cancel) {
-                try std.testing.expectError(error.Cancelled, processChunkedDenseWindow(runtime, &requests, &cache, &window, &scope));
+                // The canceled sibling prevents a serial capacity retry.
+                // Both errors are request-owned, so the first retains priority.
+                try std.testing.expectError(error.EmbedAdmissionRefused, processChunkedDenseWindow(runtime, &requests, &cache, &window, &scope));
                 try std.testing.expectEqual(@as(usize, 1), harness.capacity_attempts.load(.acquire));
                 try std.testing.expectEqual(before, harness.queued.items.len);
             } else {
@@ -44557,12 +46752,12 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
             const before = harness.queued.items.len;
             var scope: FailureScope = .{};
             if (harness.cancel_globally) {
-                try std.testing.expectError(error.Cancelled, processChunkedDenseWindow(runtime, &requests, &cache, &window, &scope));
+                try std.testing.expectError(error.EnrichmentWaitCanceled, processChunkedDenseWindow(runtime, &requests, &cache, &window, &scope));
                 try std.testing.expect(harness.globally_cancelled.load(.acquire));
                 try std.testing.expectEqual(before, harness.queued.items.len);
                 return;
             }
-            try std.testing.expectError(error.Cancelled, processChunkedDenseWindow(runtime, &requests, &cache, &window, &scope));
+            try std.testing.expectError(error.ProviderInvocationCanceled, processChunkedDenseWindow(runtime, &requests, &cache, &window, &scope));
             try std.testing.expectEqual(@as(usize, 32), harness.provider_calls);
             try std.testing.expectEqual(before + 32, harness.queued.items.len);
             for (harness.queued.items[before..], 0..) |bytes, offset| {
@@ -44590,9 +46785,9 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
             var scope: FailureScope = .{};
             const before = harness.queued.items.len;
             if (batching == .parallel_cancel) {
-                try std.testing.expectError(error.Cancelled, processChunkedDenseWindow(runtime, &requests, &cache, &window, &scope));
-                try std.testing.expectError(error.Cancelled, LaneOutcome.of(&scope, error.Cancelled).result);
-                try std.testing.expectEqual(@as(usize, 32), scheduler.state.tickets.items.len);
+                try std.testing.expectError(error.UnexpectedProviderFailure, processChunkedDenseWindow(runtime, &requests, &cache, &window, &scope));
+                try LaneOutcome.of(&scope, error.UnexpectedProviderFailure).result;
+                try std.testing.expectEqual(@as(usize, count), scheduler.state.tickets.items.len);
                 try std.testing.expectEqual(before, harness.queued.items.len);
                 return;
             }
@@ -46311,7 +48506,7 @@ test "generic contextual asset publication keeps raw upstream identity" {
     try std.testing.expectEqual(sourceRecordDigest(raw_upstream), batch.items.items[0].upstream_digest.?);
     // A newer upstream must reject a result captured from the older bytes.
     try storePutWithRetry(&runtime, upstream_key, "new input");
-    try std.testing.expectError(error.EnrichmentSourceChanged, applyAssetProducerBatchOutput(&runtime, &batch.items.items[0], "{\"entities\":[]}", &window));
+    try std.testing.expectError(error.EnrichmentSourceChanged, applyAssetProducerBatchOutput(&runtime, &batch.items.items[0], "{\"entities\":[]}", &window, &scope));
     // Empty input retires the output and its receipt atomically.
     const missing = "";
     const missing_receipt = local.encode(local.recipe(upstream), parent, missing);
@@ -46654,6 +48849,8 @@ test "asset batch fallback keeps the logical request retry budget" {
 
     const AlwaysTransientProducer = struct {
         batch_count: usize = 0,
+        batch_error: anyerror = error.EmbedRateLimited,
+        negotiation_error: ?anyerror = null,
         single_count: usize = 0,
 
         fn producer(self: *@This()) asset_producer_mod.Producer {
@@ -46662,6 +48859,7 @@ test "asset batch fallback keeps the logical request retry budget" {
                 .vtable = &.{
                     .produce = produce,
                     .produce_batch = produceBatch,
+                    .can_produce_batch = canProduceBatch,
                     .invocation_memory_for_requests = testInvocationMemoryForRequests,
                 },
             };
@@ -46673,10 +48871,16 @@ test "asset batch fallback keeps the logical request retry budget" {
             return error.EmbedRateLimited;
         }
 
+        fn canProduceBatch(ptr: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.negotiation_error) |err| return err;
+            return true;
+        }
+
         fn produceBatch(ptr: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) ![][]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.batch_count += 1;
-            return error.EmbedRateLimited;
+            return self.batch_error;
         }
     };
 
@@ -46765,6 +48969,136 @@ test "asset batch fallback keeps the logical request retry budget" {
     try std.testing.expectEqual(@as(usize, 2), producer_impl.single_count);
     try std.testing.expectEqual(@as(usize, 1), failure_capture.count);
     try std.testing.expectEqual(@as(u64, 2), failure_capture.failure.?.attempts);
+    // Whole-batch cancellation must defer the attempt without asking the
+    // provider to execute the same items again as singleton calls.
+    producer_impl.batch_error = error.Cancelled;
+    var third = std.ArrayListUnmanaged(AssetProducerBatchItem).empty;
+    defer third.deinit(alloc);
+    try third.append(alloc, try TestItem.make(alloc));
+    third.items[0].request.doc_key = "doc:2";
+    try third.append(alloc, try TestItem.make(alloc));
+    third.items[1].request.doc_key = "doc:3";
+    var third_scope = FailureScope{};
+    try std.testing.expectError(error.ProviderInvocationCanceled, flushAssetProducerBatch(&runtime, &third, &window, &third_scope));
+    try std.testing.expectEqual(@as(usize, 3), producer_impl.batch_count);
+    producer_impl.negotiation_error = error.Canceled;
+    try third.append(alloc, try TestItem.make(alloc));
+    third.items[0].request.doc_key = "doc:4";
+    var discovery_scope = FailureScope{};
+    try std.testing.expectError(error.ProviderInvocationCanceled, flushAssetProducerBatch(&runtime, &third, &window, &discovery_scope));
+    try std.testing.expectEqual(@as(usize, 3), producer_impl.batch_count);
+    try std.testing.expectEqual(@as(usize, 2), producer_impl.single_count);
+    try std.testing.expectEqual(@as(usize, 1), failure_capture.count);
+
+    var scheduler = try ScopedReplay.load(&runtime);
+    defer scheduler.deinit(alloc);
+    runtime.retry_scheduler = &scheduler;
+    defer runtime.retry_scheduler = null;
+    const WriteCounter = struct {
+        var writes: usize = 0;
+        var original: *const fn (Allocator, *anyopaque) anyerror!backend_erased.WriteTxn = undefined;
+        fn begin(a: Allocator, raw: *anyopaque) anyerror!backend_erased.WriteTxn {
+            writes += 1;
+            return original(a, raw);
+        }
+    };
+    const original = runtime.store.vtable;
+    var instrumented = original.*;
+    WriteCounter.original = original.begin_write;
+    instrumented.begin_write = WriteCounter.begin;
+    for ([_][]const u8{ "doc:2", "doc:3", "doc:2" }) |key| {
+        try third.append(alloc, try TestItem.make(alloc));
+        third.items[third.items.len - 1].request.doc_key = key;
+    }
+    const first_owner = third.items[0].request;
+    const second_owner = third.items[1].request;
+    runtime.retry_failure_fingerprint = requestFailureFingerprint(first_owner);
+    runtime.retry_failure_count = 1;
+    runtime.config.worker_retry_max_attempts = 4;
+    var batched_scope = FailureScope{};
+    {
+        WriteCounter.writes = 0;
+        runtime.store.vtable = &instrumented;
+        defer runtime.store.vtable = original;
+        try std.testing.expectError(error.ProviderInvocationCanceled, flushAssetProducerBatch(&runtime, &third, &window, &batched_scope));
+        try std.testing.expectEqual(@as(usize, 1), WriteCounter.writes);
+    }
+    var durable = try enrichment_state.loadScopedRetries(alloc, runtime.store);
+    defer durable.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), durable.tickets.items.len);
+    const digest = sourceRecordDigest("{}");
+    try std.testing.expectEqual(@as(u32, 2), (try durable.priorLogical(alloc, logicalRequestFingerprint(first_owner), digest)).failures);
+    try std.testing.expectEqual(@as(u32, 1), (try durable.priorLogical(alloc, logicalRequestFingerprint(second_owner), digest)).failures);
+    try std.testing.expectEqual(@as(u64, 2), runtime.retryable_error_count);
+
+    // A copy feeding another artifact executes synchronously on the scanner.
+    // Inject storage contention after source capture to exercise its direct
+    // write and identity handoff, independently of provider failure.
+    const LockedWriter = struct {
+        fn begin(_: Allocator, _: *anyopaque) anyerror!backend_erased.Batch {
+            return error.WriterLocked;
+        }
+    };
+    const copy = enrichment_types.GeneratedEnrichmentRequest{
+        .kind = .asset,
+        .index_name = "copy",
+        .artifact_name = "copy",
+        .doc_key = "doc:copy",
+        .source_field = "body",
+        .producer_json = "{\"type\":\"copy\"}",
+        .sequence = 7,
+    };
+    const source_key = try documentSourceStoreKeyAlloc(&runtime, copy.doc_key);
+    defer alloc.free(source_key);
+    try storePutWithRetry(&runtime, source_key, "{\"body\":\"keep\"}");
+    var dependent = copy;
+    dependent.upstream_artifact_name = "copy";
+    var queued: std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest) = .empty;
+    defer queued.deinit(alloc);
+    var sources = PreparedDocumentSourceCache.init(&runtime);
+    defer sources.deinit();
+    instrumented.begin_batch = LockedWriter.begin;
+    runtime.store.vtable = &instrumented;
+    defer runtime.store.vtable = original;
+    setActiveFailureFingerprint(&runtime, requestFailureFingerprint(copy));
+    try std.testing.expectError(error.WriterLocked, processPlannedAsset(&runtime, copy, &.{dependent}, &queued, &sources, &window));
+    try std.testing.expectEqual(@as(u64, 0), runtime.active_failure_fingerprint);
+    try std.testing.expectEqual(@as(usize, 2), scheduler.state.tickets.items.len);
+    try std.testing.expectEqual(@as(usize, 1), failure_capture.count);
+
+    // Exhaust terminal source handling at its two durable boundaries.
+    // The bad input is document-owned, but a failed manifest or ledger write
+    // must clear the scanner's active request identity.
+    var extraction = copy;
+    extraction.index_name = "extraction";
+    extraction.artifact_name = "extraction";
+    extraction.producer_json = "{\"type\":\"document_extraction\",\"config\":{}}";
+    dependent.upstream_artifact_name = "extraction";
+    runtime.store.vtable = original;
+    try storePutWithRetry(&runtime, source_key, "{\"body\":\"data:text/plain;base64,%%%\"}");
+    runtime.config.worker_retry_max_attempts = 1;
+    runtime.store.vtable = &instrumented;
+    setActiveFailureFingerprint(&runtime, requestFailureFingerprint(extraction));
+    try std.testing.expectError(error.WriterLocked, processPlannedAsset(&runtime, extraction, &.{dependent}, &queued, &sources, &window));
+    try std.testing.expectEqual(@as(u64, 0), runtime.active_failure_fingerprint);
+    try std.testing.expectEqual(@as(usize, 1), failure_capture.count);
+
+    const LockedLedger = struct {
+        fn record(_: *anyopaque, _: RequestFailure) !void {
+            return error.WriterLocked;
+        }
+    };
+    runtime.store.vtable = original;
+    runtime.failure_fn = LockedLedger.record;
+    setActiveFailureFingerprint(&runtime, requestFailureFingerprint(extraction));
+    try std.testing.expectError(error.WriterLocked, processPlannedAsset(&runtime, extraction, &.{dependent}, &queued, &sources, &window));
+    try std.testing.expectEqual(@as(u64, 0), runtime.active_failure_fingerprint);
+    try std.testing.expectEqual(@as(usize, 2), scheduler.state.tickets.items.len);
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, extraction.doc_key, "asset", extraction.artifact_name);
+    defer alloc.free(manifest_key);
+    const manifest = try storeGetAlloc(&runtime, manifest_key);
+    defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"route_type\":\"error\"") != null);
 }
 
 test "document extraction generated OCR bypasses unsupported native batch" {
@@ -47477,17 +49811,21 @@ test "extractSourceText with template and invalid JSON returns null" {
 
 test "enrichment preserves snapshot failures instead of skipping source content" {
     const Probe = struct {
-        fn text(raw: ?*anyopaque, _: Allocator, _: []const u8, _: []const u8, _: template_remote.RenderConfig) anyerror![]const u8 {
-            const failure: *anyerror = @ptrCast(@alignCast(raw.?));
-            return failure.*;
+        failure: anyerror = error.ResourceTemporarilyUnavailable,
+        deadline: ?u64 = null,
+        fn text(raw: ?*anyopaque, _: Allocator, _: []const u8, _: []const u8, config: template_remote.RenderConfig) anyerror![]const u8 {
+            const probe: *@This() = @ptrCast(@alignCast(raw.?));
+            probe.deadline = config.deadline_ns;
+            return probe.failure;
         }
-        fn parts(raw: ?*anyopaque, _: Allocator, _: []const u8, _: []const u8, _: template_remote.RenderConfig) anyerror![]template.ContentPart {
-            const failure: *anyerror = @ptrCast(@alignCast(raw.?));
-            return failure.*;
+        fn parts(raw: ?*anyopaque, _: Allocator, _: []const u8, _: []const u8, config: template_remote.RenderConfig) anyerror![]template.ContentPart {
+            const probe: *@This() = @ptrCast(@alignCast(raw.?));
+            probe.deadline = config.deadline_ns;
+            return probe.failure;
         }
     };
-    var failure: anyerror = error.ResourceTemporarilyUnavailable;
-    template_remote.setHostRenderer(.{ .ctx = &failure, .render_json_to_text = Probe.text, .render_json_to_parts = Probe.parts });
+    var probe = Probe{};
+    template_remote.setHostRenderer(.{ .ctx = &probe, .render_json_to_text = Probe.text, .render_json_to_parts = Probe.parts });
     defer template_remote.setHostRenderer(null);
     const request = enrichment_types.GeneratedEnrichmentRequest{
         .kind = .dense_embedding,
@@ -47497,12 +49835,45 @@ test "enrichment preserves snapshot failures instead of skipping source content"
         .source_template = "{{remoteMedia url=url}}",
     };
     const doc = "{\"url\":\"file:///media.png\"}";
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
     for ([_]anyerror{ error.OutOfMemory, error.ResourceTemporarilyUnavailable, error.Timeout, error.Canceled, error.UnexpectedEof, error.ConnectionResetByPeer, error.ConnectionClosed }) |err| {
-        failure = err;
+        probe.failure = err;
         try std.testing.expectError(err, extractSourceText(std.testing.allocator, .{}, doc, request));
         try std.testing.expectError(err, extractAssetSourceValue(std.testing.allocator, .{}, doc, request));
         try std.testing.expectError(err, renderSourceParts(std.testing.allocator, .{}, doc, request, null));
+        const native_error = if (isOperationCanceled(err)) error.ProviderInvocationCanceled else err;
+        try std.testing.expectError(native_error, extractEnrichmentSource(&runtime, extractSourceText, std.testing.allocator, doc, request));
+        try std.testing.expectError(native_error, extractEnrichmentSource(&runtime, renderSourcePartsJson, std.testing.allocator, doc, request));
     }
+    var clock: platform_clock.ManualClock = .{};
+    runtime.active_provider_guard = .{ .clock = clock.clock(), .deadline_ns = std.time.ns_per_s };
+    probe.failure = error.ResourceTemporarilyUnavailable;
+    inline for (.{ extractSourceText, renderSourcePartsJson }) |extract| {
+        probe.deadline = null;
+        try std.testing.expectError(probe.failure, extractEnrichmentSource(&runtime, extract, std.testing.allocator, doc, request));
+        try std.testing.expect(probe.deadline != null and probe.deadline.? > platform_time.monotonicNs());
+        try std.testing.expect(probe.deadline.? - platform_time.monotonicNs() <= std.time.ns_per_s);
+    }
+    probe.deadline = null;
+    try std.testing.expectError(probe.failure, extractModelChunkEnrichmentSource(&runtime, std.testing.allocator, doc, request, null));
+    try std.testing.expect(probe.deadline != null and probe.deadline.? > platform_time.monotonicNs());
+    try std.testing.expect(probe.deadline.? - platform_time.monotonicNs() <= std.time.ns_per_s);
+    runtime.active_provider_guard.deadline_ns = 0;
+    try std.testing.expectError(error.EnrichmentWaitTimeout, extractEnrichmentSource(&runtime, renderSourcePartsJson, std.testing.allocator, doc, request));
 }
 
 test "enrichment extractSourceText with template error directive fails instead of returning text" {
@@ -47969,7 +50340,7 @@ test "model aware media pass resumes acknowledged pages after interruption and s
             const ordinal = if (cfg.replay) |position| position.ordinal else 0;
             if (ordinal == 0 and !probe) self.first_calls += 1;
             if (ordinal != 0 and self.stale) return error.StaleChunkContinuation;
-            if (ordinal != 0 and self.interrupted) return error.ChunkRequestFailed;
+            if (ordinal != 0 and self.interrupted) return error.Cancelled;
             const chunks = try a.alloc(C.Chunk, 1);
             errdefer a.free(chunks);
             const id = try std.fmt.allocPrint(a, "{s}:{d}", .{ "1111111111111111111111111111111111111111111111111111111111111111", ordinal });
@@ -48014,7 +50385,7 @@ test "model aware media pass resumes acknowledged pages after interruption and s
     try std.testing.expectError(error.ChunkCodedWindowBudgetExceeded, prepareModelPassChunks(&runtime, request, cfg, .{ .text = "original" }, source_key, sourceRecordDigest(raw), prefix));
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     fake.terminal_first = false;
-    try std.testing.expectError(error.ChunkRequestFailed, prepareModelPassChunks(&runtime, request, cfg, .{ .text = "original" }, source_key, sourceRecordDigest(raw), prefix));
+    try std.testing.expectError(error.ProviderInvocationCanceled, prepareModelPassChunks(&runtime, request, cfg, .{ .text = "original" }, source_key, sourceRecordDigest(raw), prefix));
     try std.testing.expectEqual(@as(usize, 1), fake.first_calls);
     fake.interrupted = false;
     fake.stale = true;
@@ -48114,8 +50485,12 @@ test "model aware media vector labels rebuild from stored vectors without media 
     const Fake = struct {
         calls: usize = 0,
         generation: u8 = 1,
+        revision_reads: usize = 0,
+        cancel_at: usize = 0,
         fn revision(ptr: *anyopaque, _: Allocator, _: []const u8) !?[32]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.revision_reads += 1;
+            if (self.revision_reads == self.cancel_at) return error.Canceled;
             return @splat(self.generation);
         }
         fn embed(ptr: *anyopaque, a: Allocator, name: []const u8, prompt: []const u8, dims: u32) ![]f32 {
@@ -48161,7 +50536,18 @@ test "model aware media vector labels rebuild from stored vectors without media 
     // fencing check (pre-existing, unrelated to any change in this task)
     // now rejects as EnrichmentSourceChanged.
     var request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}}" };
-    try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}", null, "{}", output_key, &window);
+    for (1..4) |attempt| {
+        const poisoned = try std.fmt.allocPrint(alloc, "{{\"labels\":[{{\"label\":\"phase-{d}\"}}]}}", .{attempt});
+        defer alloc.free(poisoned);
+        fake.revision_reads = 0;
+        fake.cancel_at = attempt;
+        try std.testing.expectError(error.ProviderInvocationCanceled, processVectorLabels(&runtime, request, poisoned, null, "{}", output_key, &window, null));
+        try std.testing.expectEqual(attempt, fake.revision_reads);
+        try std.testing.expect((try storeGetOptionalAllocWithRetry(&runtime, output_key)) == null);
+    }
+    fake.cancel_at = 0;
+    fake.calls = 0;
+    try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}", null, "{}", output_key, &window, null);
     {
         const result = (try storeGetOptionalAllocWithRetry(&runtime, output_key)).?;
         defer alloc.free(result);
@@ -48173,14 +50559,14 @@ test "model aware media vector labels rebuild from stored vectors without media 
     }
     // Identical vocabulary/model generation reuses validation, prompt vectors
     // and packing across documents/passes without invoking the provider.
-    try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}", null, "{}", output_key, &window);
+    try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}", null, "{}", output_key, &window, null);
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
     fake.generation = 2;
-    try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}", null, "{}", output_key, &window);
+    try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}", null, "{}", output_key, &window, null);
     try std.testing.expectEqual(@as(usize, 4), fake.calls);
     request.producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"music\"}],\"top_k\":1}}";
     _ = try index_manager.upsertEnrichment(&store, .{ .name = "labels", .kind = .asset, .source_artifact_name = "vectors", .producer_json = request.producer_json });
-    try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"music\"}],\"top_k\":1}", null, "{}", output_key, &window);
+    try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"music\"}],\"top_k\":1}", null, "{}", output_key, &window, null);
     const retained = (try storeGetOptionalAllocWithRetry(&runtime, vector_key)).?;
     defer alloc.free(retained);
     try std.testing.expectEqualSlices(u8, encoded, retained);
@@ -48207,7 +50593,7 @@ test "model aware media vector labels rebuild from stored vectors without media 
     const large_manifest = large.finish().encode();
     try writes.append(alloc, .{ .key = manifest_key, .value = &large_manifest });
     try storePutBatchWithRetry(&runtime, writes.items, &.{});
-    try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"music\"}],\"top_k\":1}", null, "{}", output_key, &window);
+    try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"music\"}],\"top_k\":1}", null, "{}", output_key, &window, null);
     const large_output = (try storeGetOptionalAllocWithRetry(&runtime, output_key)).?;
     defer alloc.free(large_output);
     var projected = try std.json.parseFromSlice(struct { parent_count: u32, chunks: []const std.json.Value }, alloc, large_output, .{ .ignore_unknown_fields = true });
@@ -48216,7 +50602,7 @@ test "model aware media vector labels rebuild from stored vectors without media 
     try std.testing.expectEqual(@as(usize, 5000), projected.value.chunks.len);
     try std.testing.expectEqual(@as(usize, 5), fake.calls);
     try storePutBatchWithRetry(&runtime, &.{}, &.{vector_key});
-    try std.testing.expectError(error.ArtifactPublicationPending, processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"}]}", null, "{}", output_key, &window));
+    try std.testing.expectError(error.ArtifactPublicationPending, processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"}]}", null, "{}", output_key, &window, null));
     try std.testing.expectEqual(@as(usize, 5), fake.calls);
 }
 
@@ -48234,6 +50620,62 @@ test "model aware media preparation retires only after independent output consum
     const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/empty-chunk-revisions", .{tmp.sub_path});
     var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
     defer index_manager.deinit();
+    const Recorder = struct {
+        runtime: *EnrichmentRuntime = undefined,
+        block_after_record: bool = false,
+        after_record_claims: usize = 0,
+        allowed_claims: usize = 0,
+        change_primary: bool = false,
+        revision: [32]u8 = @splat(0x42),
+        discovery_calls: usize = 0,
+        offline: bool = false,
+        capture: TestFailureCapture = .{},
+
+        fn record(ptr: *anyopaque, failure: RequestFailure) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const proof = failure.media_proof orelse return error.MissingMediaFailureProof;
+            if (self.change_primary) try storePutWithRetry(self.runtime, proof.primary_key, "{\"body\":\"replacement\"}");
+            var txn = try self.runtime.store.beginProbe();
+            defer txn.abort();
+            try proof.validate(self.runtime.alloc, &txn);
+            // The actual runtime owns and frees the per-index list after
+            // recording. Keep a stable name in this in-memory ledger fixture.
+            try std.testing.expectEqualStrings("visual_search", failure.index_name);
+            var retained = failure;
+            retained.index_name = "visual_search";
+            try TestFailureCapture.record(&self.capture, retained);
+        }
+
+        fn pendingIssue(ptr: *anyopaque, failure: FailureIdentity, index_name: []const u8) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return TestFailureCapture.pending(&self.capture, failure, index_name);
+        }
+
+        fn acquire(ptr: *anyopaque, _: ?GeneratedWriteFence, _: u64) !GeneratedStoreLease {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.block_after_record and self.capture.count != 0) {
+                self.after_record_claims += 1;
+                if (self.after_record_claims > self.allowed_claims) return error.WriterLocked;
+            }
+            return .{ .store = self.runtime.store, .ptr = ptr, .release = release, .guard_key = guardKey };
+        }
+        fn release(_: *anyopaque) void {}
+        fn guardKey(_: *anyopaque, _: []const u8) !void {}
+
+        fn embed(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.UnexpectedEmbedding;
+        }
+        fn capabilities(ptr: *anyopaque, _: Allocator, _: []const u8) !inference_work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.discovery_calls += 1;
+            if (self.offline) return error.UnexpectedDiscovery;
+            return .{ .model_revision = self.revision, .task = .embed, .input_modalities = .{ .text = true }, .input_granularity = .chunk, .output = .embedding };
+        }
+        fn identity(_: *anyopaque, name: []const u8) ?embedder_mod.RecoveryIdentity {
+            return .{ .model = if (std.mem.eql(u8, name, "vectors")) "model" else "another-model" };
+        }
+    };
+    var recorder: Recorder = .{};
     var runtime = EnrichmentRuntime{
         .alloc = alloc,
         .io_impl = null,
@@ -48244,24 +50686,35 @@ test "model aware media preparation retires only after independent output consum
         .index_manager = &index_manager,
         .write_ctx = undefined,
         .write_fn = undefined,
-        .failure_ctx = undefined,
-        .failure_fn = undefined,
+        .failure_ctx = &recorder,
+        .failure_fn = Recorder.record,
+        .failure_pending_fn = Recorder.pendingIssue,
         .notify_ctx = undefined,
         .notify_fn = undefined,
-        .config = .{},
+        .config = .{ .dense_embedder = .{ .ptr = &recorder, .dense_embed_fn = Recorder.embed, .capabilities_fn = Recorder.capabilities, .recovery_identity_fn = Recorder.identity } },
         .ownership = undefined,
     };
+    defer clearIsolatedFailedIndexes(&runtime);
+    recorder.runtime = &runtime;
     // Exercise the public catalog contract and installation order before the
     // independent publication/recovery assertions below.
     const index_api = @import("../../../api/indexes.zig");
     const declared =
-        \\{"enrichments":[{"name":"transcript_copy","kind":"asset","source_artifact_name":"transcript","producer":{"type":"copy"}},{"name":"transcript","kind":"asset","source_artifact_name":"clips","producer":{"type":"media_output","config":{"output_name":"speech"}}},{"name":"vectors","kind":"embedding","source_artifact_name":"clips","expected_dims":2},{"name":"clips","kind":"chunk","field":"body","chunker":{"provider":"antfly","outputs":{"boundary_model":"speech","targets":[{"name":"speech","kind":"transcribe","model":"whisper"}]}}}]}
+        \\{"enrichments":[{"name":"transcript_copy","kind":"asset","source_artifact_name":"transcript","producer":{"type":"copy"}},{"name":"transcript","kind":"asset","source_artifact_name":"clips","producer":{"type":"media_output","config":{"output_name":"speech"}}},{"name":"vectors","kind":"embedding","source_artifact_name":"clips","expected_dims":2},{"name":"clips","kind":"chunk","field":"body","chunker":{"provider":"antfly","outputs":{"boundary_model":"speech","targets":[{"name":"speech","kind":"transcribe","model":"whisper"},{"name":"embedding","kind":"embedding","model":"model","dimensions":2,"required":true}]}}}]}
     ;
     const configs = try index_api.collectArtifactEnrichmentsFromTableIndexesJsonWithOptions(alloc, declared, .{});
     defer @import("../types.zig").freeEnrichmentConfigs(alloc, configs);
     try index_api.validateArtifactEnrichmentConfigs(alloc, configs);
     try index_api.sortArtifactEnrichmentsByDependency(alloc, configs);
     for (configs) |cfg| try index_manager.addEnrichment(&store, cfg);
+    try index_manager.addEnrichment(&store, .{ .name = "fixed_chunks", .kind = .chunk, .field = "body", .chunker_json = "{\"provider\":\"antfly\",\"text\":{\"target_tokens\":64}}" });
+    try index_manager.addEnrichment(&store, .{ .name = "fixed_vectors", .kind = .embedding, .field = "body", .source_artifact_name = "fixed_chunks", .expected_dims = 2 });
+    var documents = try @import("../../docstore.zig").DocStore.openRuntime(alloc, &store);
+    defer documents.close();
+    try index_manager.addAllNoBackfill(&documents, &.{
+        .{ .name = "visual_search", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"vectors\"}" },
+        .{ .name = "fixed_search", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"fixed_vectors\"}" },
+    });
     const prefix = try media_pass.scope(alloc, "doc", "clips", "body");
     defer alloc.free(prefix);
     const key = try media_pass.key(alloc, prefix, null);
@@ -48272,12 +50725,12 @@ test "model aware media preparation retires only after independent output consum
     const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .dense_embedding, .index_name = "vectors", .doc_key = "doc", .source_field = "body", .sequence = 9 };
     var older = request;
     older.sequence = 8;
-    try acknowledgeMediaPassConsumer(&runtime, older, "clips", "body", .embedding, "vectors");
+    try acknowledgeMediaPassConsumer(&runtime, older, "clips", "body", .embedding, "vectors", .{ .completed = null });
     const unchanged = (try storeGetOptionalAllocWithRetry(&runtime, key)).?;
     defer alloc.free(unchanged);
     try std.testing.expectEqualSlices(u8, encoded, unchanged);
-    try acknowledgeMediaPassConsumer(&runtime, request, "clips", "body", .embedding, "vectors");
-    try acknowledgeMediaPassConsumer(&runtime, request, "clips", "body", .embedding, "vectors");
+    try acknowledgeMediaPassConsumer(&runtime, request, "clips", "body", .embedding, "vectors", .{ .completed = null });
+    try acknowledgeMediaPassConsumer(&runtime, request, "clips", "body", .embedding, "vectors", .{ .completed = null });
     const after_dense = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
     try std.testing.expectEqual(@as(u64, 1), after_dense.output_counts.embedding.complete);
     const pending = (try storeGetOptionalAllocWithRetry(&runtime, key)).?;
@@ -48289,7 +50742,7 @@ test "model aware media preparation retires only after independent output consum
     const transcript_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "transcript");
     defer alloc.free(transcript_key);
     try storePutWithRetry(&runtime, transcript_key, "{\"complete_chunks\":0,\"failed_chunks\":1,\"terminal_chunks\":1,\"status\":\"degraded\"}");
-    try acknowledgeMediaPassConsumer(&runtime, request, "clips", "body", .asset, "transcript");
+    try acknowledgeMediaPassConsumer(&runtime, request, "clips", "body", .asset, "transcript", .{ .completed = null });
     try enrichment_state.saveRuntimeStatus(runtime.store, scope_name, .{});
     const after_asset = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
     try std.testing.expectEqual(@as(u64, 1), after_asset.output_counts.embedding.complete);
@@ -48305,21 +50758,150 @@ test "model aware media preparation retires only after independent output consum
     // Finishing the retry lifecycle of a required index result must retain
     // failed coverage, and repeated acknowledgement must not double count it.
     const C = @import("inference_chunker");
-    const failure = "[{\"name\":\"embedding\",\"kind\":\"embedding\",\"required\":true,\"model\":\"model\",\"model_identity\":\"\",\"model_revision\":\"\",\"recipe_id\":\"\",\"status\":\"failed\",\"code\":\"Unavailable\",\"attempts\":3,\"terminal\":true}]";
-    var metadata = C.types.ModelMetadata{ .descriptor = .{ .ordinal = 0, .input_tokens = 0, .coordinates = .{ .kind = .audio, .start_ns = 0, .end_ns = 1 } }, .inference_id = "plan:0", .plan_id = "plan", .source_fingerprint = "source", .source_version = "v1", .model = "model", .model_identity = "", .model_revision = "", .task_type = "RETRIEVAL_DOCUMENT", .dimensions = 2, .policy = .{}, .outputs_json = failure };
+    const revision = std.fmt.bytesToHex(recorder.revision, .lower);
+    const target: C.outputs.Target = .{ .name = "embedding", .kind = .embedding, .model = "model", .required = true, .dimensions = 2, .task_type = "RETRIEVAL_DOCUMENT" };
+    var receipt: C.outputs.Result = .{ .name = "embedding", .kind = .embedding, .model = "model", .required = true, .model_identity = &revision, .model_revision = &revision, .recipe_id = "", .status = .failed, .code = "Unavailable", .attempts = 3, .terminal = true };
+    const recipe = try target.receiptRecipeIdentity(alloc, receipt);
+    receipt.recipe_id = &recipe;
+    const failure = try std.json.Stringify.valueAlloc(alloc, &[_]C.outputs.Result{receipt}, .{});
+    defer alloc.free(failure);
+    var metadata = C.types.ModelMetadata{ .descriptor = .{ .ordinal = 0, .input_tokens = 0, .coordinates = .{ .kind = .audio, .start_ns = 0, .end_ns = 1 } }, .inference_id = "plan:0", .plan_id = "plan", .source_fingerprint = "source", .source_version = "v1", .model = "model", .model_identity = &revision, .model_revision = &revision, .task_type = "RETRIEVAL_DOCUMENT", .dimensions = 2, .policy = .{}, .outputs_json = failure };
     var rows = [_]C.Chunk{.{ .id = 0, .mime_type = "audio/wav", .metadata = &metadata }};
     const page_key = try media_pass.key(alloc, prefix, 0);
     defer alloc.free(page_key);
     const page_bytes = try media_pass.encodePage(alloc, .{ .chunks = &rows, .plan_id = "plan", .source_fingerprint = "source", .source_version = "v1", .start_ordinal = 0, .covered_through_ordinal = 1, .complete = true });
     defer alloc.free(page_bytes);
-    const failed_cursor = try media_pass.encode(alloc, media_pass.Cursor{ .input_digest = @splat(2), .source_sequence = 10, .page_count = 1, .covered_through_ordinal = 1, .complete = true });
-    defer alloc.free(failed_cursor);
-    try storePutBatchWithRetry(&runtime, &.{ .{ .key = key, .value = failed_cursor }, .{ .key = page_key, .value = page_bytes } }, &.{});
     var failed_request = request;
     failed_request.sequence = 10;
-    for (0..2) |_| try std.testing.expectError(error.RequiredMediaOutputFailed, acknowledgeMediaPassConsumer(&runtime, failed_request, "clips", "body", .embedding, "vectors"));
+    failed_request.artifact_name = "clips";
+    failed_request.input_kind = .materialized_chunks;
+    failed_request.expected_dims = 2;
+    failed_request.producer_json = "{\"provider\":\"antfly\",\"model\":\"model\"}";
+    const primary_key = try documentSourceStoreKeyAlloc(&runtime, failed_request.doc_key);
+    defer alloc.free(primary_key);
+    const raw_primary = "{\"body\":\"original\"}";
+    try storePutWithRetry(&runtime, primary_key, raw_primary);
+    var cache: std.ArrayListUnmanaged(RequestPlanCacheEntry) = .empty;
+    defer freeRequestPlanCache(alloc, &cache);
+    const planned = try getOrCreatePlannedRequests(&runtime, failed_request.doc_key, &cache);
+    var seen_fixed = false;
+    for (planned) |item| {
+        if (item.kind != .dense_embedding) continue;
+        const name = requestEmbeddingName(item);
+        if (std.mem.eql(u8, name, "vectors")) {
+            failed_request.model_aware_chunking = item.model_aware_chunking;
+        } else if (std.mem.eql(u8, name, "fixed_vectors")) {
+            seen_fixed = true;
+            try std.testing.expect(!item.model_aware_chunking);
+            const fixed_scope = try media_pass.scope(alloc, item.doc_key, "fixed_chunks", "body");
+            defer alloc.free(fixed_scope);
+            const fixed_key = try media_pass.key(alloc, fixed_scope, null);
+            defer alloc.free(fixed_key);
+            try storePutWithRetry(&runtime, fixed_key, "invalid cursor must remain unread");
+            var window: GeneratedReplayWindow = .{ .alloc = alloc };
+            defer window.deinit();
+            try std.testing.expect(!try resumePersistedDocumentRequestFailure(&runtime, &window, item));
+        }
+    }
+    try std.testing.expect(seen_fixed);
+    try std.testing.expect(failed_request.model_aware_chunking);
+
+    var upstream = failed_request;
+    upstream.chunker_json = index_manager.getEnrichment(.chunk, "clips").?.chunker_json;
+    const failed_state: media_pass.Cursor = .{ .input_digest = try mediaPassInputDigest(&runtime, upstream, sourceRecordDigest(raw_primary)), .source_sequence = 10, .page_count = 1, .covered_through_ordinal = 1, .complete = true };
+    const failed_cursor = try media_pass.encode(alloc, failed_state);
+    defer alloc.free(failed_cursor);
+    try storePutBatchWithRetry(&runtime, &.{ .{ .key = key, .value = failed_cursor }, .{ .key = page_key, .value = page_bytes } }, &.{});
+
+    var other_model = failed_request;
+    other_model.index_name = "other";
+    other_model.producer_json = "{\"provider\":\"antfly\",\"model\":\"another-model\"}";
+    const healthy = try mediaEmbeddingAcknowledgement(&runtime, other_model, prefix, failed_state, .{ .revision = recorder.revision });
+    try std.testing.expectEqual(@as(u64, 1), healthy.counts.complete);
+    try std.testing.expect(!healthy.required_failure);
+    try std.testing.expectEqual(@as(usize, 0), recorder.discovery_calls);
+    recorder.revision = @splat(0x43);
+    const other_revision = try mediaEmbeddingAcknowledgement(&runtime, failed_request, prefix, failed_state, .{ .revision = recorder.revision });
+    try std.testing.expectEqual(@as(u64, 1), other_revision.counts.complete);
+    try std.testing.expect(!other_revision.required_failure);
+    recorder.revision = @splat(0x42);
+    metadata.output_sub_index = 1;
+    try std.testing.expect(!try terminalModelChunkEmbedding(alloc, runtime.config.dense_embedder.?, upstream, &metadata));
+    metadata.output_sub_index = null;
+
+    var healthy_request = failed_request;
+    healthy_request.doc_key = "healthy";
+    const healthy_prefix = try media_pass.scope(alloc, healthy_request.doc_key, "clips", "body");
+    defer alloc.free(healthy_prefix);
+    const healthy_key = try media_pass.key(alloc, healthy_prefix, null);
+    defer alloc.free(healthy_key);
+    const healthy_cursor = try media_pass.encode(alloc, media_pass.Cursor{ .input_digest = @splat(3), .source_sequence = 10, .covered_through_ordinal = 1, .complete = true });
+    defer alloc.free(healthy_cursor);
+    try storePutWithRetry(&runtime, healthy_key, healthy_cursor);
+
+    var requests = [_]enrichment_types.GeneratedEnrichmentRequest{ failed_request, healthy_request };
+    var selections = [_]?MediaEmbeddingSelection{ .{ .revision = recorder.revision }, null };
+    var lane = DenseExecutionLane{
+        .runtime = &runtime,
+        .plain_dense = &.{},
+        .chunked_dense = &requests,
+        .media_embedding_selections = &selections,
+        .chunk_cache = undefined,
+        .window = .{ .alloc = alloc },
+        .applied_sequence = 0,
+        .group = .{ .sequence = 10, .doc_key = healthy_request.doc_key },
+    };
+    recorder.change_primary = true;
+    try std.testing.expectError(error.EnrichmentSourceChanged, lane.finishPublishedQuantum());
+    try std.testing.expectEqual(@as(usize, 0), recorder.capture.count);
+    recorder.change_primary = false;
+    try storePutWithRetry(&runtime, primary_key, raw_primary);
+    recorder.offline = true;
+    const discovery_calls = recorder.discovery_calls;
+    var coverage_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
+    runtime.coverage_apply_mutex = &coverage_mutex;
+    const coverage_generation = index_manager.coverageGenerationForIndex("visual_search").?;
+    const transition = try initCoverageOutcomeTransition(&runtime, "visual_search", coverage_generation, failed_request.doc_key, failed_request.sequence, .terminal_failed);
+    defer deinitCoverageOutcomeTransition(alloc, transition);
+    // Another issue at this sequence can already have established the
+    // envelope when this issue's first coverage write fails.
+    runtime.terminal_failure_min_sequence = failed_request.sequence;
+    runtime.terminal_failure_max_sequence = failed_request.sequence;
+
+    // The first attempt staged the marker but the guarded ledger write failed.
+    // Resume it offline, then interrupt durable terminal coverage.
+    runtime.generated_publication = .{ .ptr = &recorder, .commit = undefined, .heartbeat = undefined, .acquire_store = Recorder.acquire };
+    recorder.block_after_record = true;
+    try std.testing.expectError(error.WriterLocked, resumePersistedDocumentRequestFailure(&runtime, &lane.window, failed_request));
+    try std.testing.expectEqual(@as(usize, 1), recorder.capture.count);
+    const before_resume = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
+    try std.testing.expectEqual(@as(u64, 0), before_resume.output_counts.embedding.failed);
+
+    try std.testing.expect((try storeGetOptionalAllocWithRetry(&runtime, transition.marker_key)) == null);
+    recorder.after_record_claims = 0;
+    recorder.allowed_claims = 1;
+    // Retry the missing coverage first, then fail the cursor write.
+    try std.testing.expectError(error.WriterLocked, resumePersistedDocumentRequestFailure(&runtime, &lane.window, failed_request));
+    const terminal = try storeGetAlloc(&runtime, transition.marker_key);
+    defer alloc.free(terminal);
+    try std.testing.expectEqualStrings("terminal_failed", terminal);
+
+    recorder.block_after_record = false;
+    lane.scope = .{};
+    try std.testing.expect(try resumePersistedDocumentRequestFailure(&runtime, &lane.window, failed_request));
+    try lane.finishPublishedQuantum();
+    try std.testing.expectEqual(discovery_calls, recorder.discovery_calls);
+    try std.testing.expect(!lane.scope.publication_failed);
+    try std.testing.expect(!runtime.worker_failed);
+    try std.testing.expectEqual(@as(usize, 1), recorder.capture.count);
+    try std.testing.expectEqualStrings(failed_request.doc_key, recorder.capture.failure.?.doc_key);
+    try std.testing.expectEqualStrings("RequiredMediaOutputFailed", recorder.capture.failure.?.error_name);
+    try std.testing.expectEqualStrings("clips", recorder.capture.failure.?.source_artifact_name);
+    const replay_cursor = try loadReplayCursorForPass(&runtime, 0, .dense, null, null);
+    defer if (replay_cursor) |cursor_value| alloc.free(cursor_value.doc_key);
+    try std.testing.expect(replayCursorCoversGroup(replay_cursor, 0, lane.group.?));
     const after_failure = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
-    try std.testing.expectEqual(@as(u64, 1), after_failure.output_counts.embedding.complete);
+    try std.testing.expectEqual(@as(u64, 2), after_failure.output_counts.embedding.complete);
     try std.testing.expectEqual(@as(u64, 1), after_failure.output_counts.embedding.failed);
     try std.testing.expectEqual(@as(u64, 1), after_failure.output_counts.embedding.terminal);
 }
@@ -48654,7 +51236,7 @@ test "model aware media output repairs retain healthy vectors and persist indepe
     var repair_request = request;
     repair_request.chunker_json = config;
     const speech_target = output_types.Target{ .name = "speech", .kind = .transcribe, .model = "whisper" };
-    try std.testing.expect(!try repairMediaOutputPage(&runtime, repair_request, raw, parsed_config, .{ .text = "original" }, prefix, "speech", speech_target, null, &originals));
+    try std.testing.expect(!try repairMediaOutputPage(&runtime, repair_request, raw, parsed_config, .{ .text = "original" }, prefix, "speech", speech_target, null, &originals, null));
     fake.page_cap = std.math.maxInt(usize);
     const saved_cursor = (try storeGetOptionalAllocWithRetry(&runtime, cursor_key)).?;
     defer alloc.free(saved_cursor);
@@ -48692,7 +51274,7 @@ test "model aware media output repairs retain healthy vectors and persist indepe
     var asset_request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .asset, .index_name = "transcript", .artifact_name = "transcript", .upstream_artifact_name = "clips", .doc_key = "doc", .source_field = "", .sequence = 7, .producer_json = "{\"type\":\"media_output\",\"config\":{\"output_name\":\"speech\"}}" };
     var stream_window = GeneratedReplayWindow{ .alloc = alloc };
     defer stream_window.deinit();
-    try processMediaOutput(&runtime, asset_request, "{\"output_name\":\"speech\"}", null, raw, asset_key, &stream_window, &shared);
+    try processMediaOutput(&runtime, asset_request, "{\"output_name\":\"speech\"}", null, raw, asset_key, &stream_window, &shared, null);
     const streamed = (try storeGetOptionalAllocWithRetry(&runtime, asset_key)).?;
     defer alloc.free(streamed);
     var streamed_output = try std.json.parseFromSlice(struct { text: []const u8, chunks: []const output_types.Row }, alloc, streamed, .{ .ignore_unknown_fields = true });
@@ -48710,7 +51292,7 @@ test "model aware media output repairs retain healthy vectors and persist indepe
     try storePutWithRetry(&runtime, source_key, empty_raw);
     try storePutWithRetry(&runtime, manifest_key, &Inventory.Builder.init().finish().encode());
     asset_request.sequence += 1;
-    try processMediaOutput(&runtime, asset_request, "{\"output_name\":\"speech\"}", null, empty_raw, asset_key, &stream_window, &shared);
+    try processMediaOutput(&runtime, asset_request, "{\"output_name\":\"speech\"}", null, empty_raw, asset_key, &stream_window, &shared, null);
     const emptied = (try storeGetOptionalAllocWithRetry(&runtime, asset_key)).?;
     defer alloc.free(emptied);
     var empty_output = try std.json.parseFromSlice(struct { text: []const u8, chunks: []const output_types.Row }, alloc, emptied, .{ .ignore_unknown_fields = true });
@@ -49198,17 +51780,44 @@ test "model aware media ordered vector windows are searchable with exact clocks 
     const a = std.testing.allocator;
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const manifests = @import("../artifact_chunk_manifest.zig");
+    const Deadline = struct {
+        calls: usize = 0,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.calls > 1) return error.DeadlineExceeded;
+        }
+    };
     const Harness = struct {
         db: ?*db_mod.DB = null,
         next_index: u64 = 4,
         calls: usize = 0,
         remaining: ?usize = null,
         last_retirement: ?[32]u8 = null,
+        protocol_requests: usize = 0,
+        last_vector_revision: ?[32]u8 = null,
+        phantom_key: ?[]const u8 = null,
+        stale_vector: bool = false,
         fn enqueue(raw: *anyopaque, _: ordered_publication.Namespace, bytes: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (self.remaining) |*remaining| {
                 if (remaining.* == 0) return error.ResourceTemporarilyUnavailable;
                 remaining.* -= 1;
+            }
+            const proposal = @import("../artifact_catalog_proposal.zig");
+            if (proposal.isProposal(bytes)) {
+                var parsed = try proposal.decode(std.testing.allocator, bytes);
+                defer parsed.deinit();
+                const catalog = parsed.value;
+                try std.testing.expectEqual(@import("../artifact_inventory.zig").scalar_window_retirement_protocol, catalog.binding.effect_protocol);
+                try server_test_adapter.applyOrdered(self.db.?, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = self.next_index });
+                self.next_index += 1;
+                var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
+                activation.publication_digest = activation.digest();
+                try server_test_adapter.applyOrdered(self.db.?, .{ .artifact_publication = activation }, .{ .term = 1, .index = self.next_index });
+                self.next_index += 1;
+                self.protocol_requests += 1;
+                return;
             }
             var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(std.testing.allocator, bytes);
             defer decoded.deinit();
@@ -49219,9 +51828,48 @@ test "model aware media ordered vector windows are searchable with exact clocks 
             }
             if (decoded.command.mode == .append_chunks) try std.testing.expect(decoded.command.mutations.len <= 128);
             if (decoded.command.mode == .publish and decoded.command.producer_kind == .enrichment) try std.testing.expectEqual(@as(usize, 2), decoded.command.mutations.len);
+            const inject = decoded.command.mode == .publish and decoded.command.producer_kind == .index and self.phantom_key != null;
+            if (decoded.command.mode == .publish and decoded.command.producer_kind == .index) self.last_vector_revision = decoded.command.execution_identity;
+            if (inject) {
+                var write = try self.db.?.core.store.beginWriteTxn();
+                errdefer write.abort();
+                // Give the intervening write its own ordered position while
+                // leaving the captured parent and sibling guards unchanged.
+                const receipts = @import("../apply_receipts.zig");
+                var receipt_bytes: [receipts.ordered_apply_receipt_value_len]u8 = undefined;
+                const receipt = receipts.orderedApplyReceiptWrite(.{ .term = 1, .index = self.next_index }, &receipt_bytes);
+                try write.put(self.phantom_key.?, decoded.command.mutations[0].value.?);
+                try write.put(receipt.key, receipt.value);
+                try write.commit();
+                self.next_index += 1;
+                self.phantom_key = null;
+            }
             try server_test_adapter.applyOrdered(self.db.?, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = self.next_index });
+            if (inject) {
+                var read = try self.db.?.core.store.beginReadTxn();
+                defer read.abort();
+                const outcome = (try ordered_publication.rejected(&read, decoded.command)) orelse return error.TestUnexpectedResult;
+                self.stale_vector = outcome.reason == .stale_source;
+            }
             self.next_index += 1;
             self.calls += 1;
+        }
+        fn writeForeignWindows(self: *@This(), scratch: Allocator, member: []const u8, count: usize, value: ?[]const u8) !void {
+            var write = try self.db.?.core.store.beginWriteTxn();
+            errdefer write.abort();
+            for (0..count) |index| {
+                const child = try internal_keys.mediaWindowChildKeyAlloc(scratch, member, @intCast(index));
+                defer scratch.free(child);
+                const key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(scratch, child, "foreign");
+                defer scratch.free(key);
+                if (value) |payload| try write.put(key, payload) else try write.delete(key);
+            }
+            const receipts = @import("../apply_receipts.zig");
+            var receipt_bytes: [receipts.ordered_apply_receipt_value_len]u8 = undefined;
+            const receipt = receipts.orderedApplyReceiptWrite(.{ .term = 1, .index = self.next_index }, &receipt_bytes);
+            try write.put(receipt.key, receipt.value);
+            try write.commit();
+            self.next_index += 1;
         }
         fn capture(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, scope: []const u8) !@import("../artifact_producer_context.zig").Token {
             var read = try runtime.store.beginProbe();
@@ -49254,6 +51902,8 @@ test "model aware media ordered vector windows are searchable with exact clocks 
     try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 4 });
     try db.addEnrichment(.{ .name = "model", .kind = .embedding, .source_artifact_name = "chunks", .expected_dims = 2, .producer_json = "{\"provider\":\"antfly\",\"model\":\"model\"}" });
     try db.addIndex(.{ .name = "vectors", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"model\"}" });
+    try db.addEnrichment(.{ .name = "bad-recipe", .kind = .embedding, .source_artifact_name = "chunks", .expected_dims = 2, .producer_json = "{\"provider\":\"antfly\",\"model\":\"model\",\"task_type\":123}" });
+    try db.addIndex(.{ .name = "bad-vectors", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"bad-recipe\"}" });
     try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"chunks\"}]}" });
     try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"source\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
     const scope = try manifests.keyAlloc(a, "doc", "chunks");
@@ -49266,17 +51916,8 @@ test "model aware media ordered vector windows are searchable with exact clocks 
     }
     var catalog = try db.artifactInventoryCommand(a);
     defer catalog.catalogs.deinit(a);
-    // Unlike sibling tests in this file that copy this same activation
-    // sequence to pin an *old* catalog baseline (effect_protocol = 15),
-    // this test's own "vectors" index is exactly a chunk-generated dense
-    // vector config (artifact_inventory.zig's onlineGeneratedChunkVectorConfig),
-    // which naturally computes to the current max, 18 -- the floor
-    // processOrderedChunkVectorWithAllocator's own execution_revision !=
-    // null and effect_protocol < 18 check requires before it will even
-    // reach the chunk-embedding-target compatibility error this test
-    // expects (error.IncompatibleChunkEmbeddingTarget). Pinning 15 here
-    // instead hits the earlier, unrelated error.OnlineMergeArtifactTailsUnsupported.
-    catalog.binding.effect_protocol = 18;
+    const retirement_protocol = @import("../artifact_inventory.zig").scalar_window_retirement_protocol;
+    try std.testing.expectEqual(@as(u16, 18), catalog.binding.effect_protocol);
     try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
     var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
@@ -49327,6 +51968,75 @@ test "model aware media ordered vector windows are searchable with exact clocks 
     defer enrichment_types.freeGeneratedRequest(a, vector_request);
     try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true, .lease_ttl_ms = 600_000 });
     const runtime = db.enrichment_runtime.?;
+    {
+        var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 4096 } });
+        defer manager.deinit(a);
+        const previous_manager = runtime.config.resource_manager;
+        runtime.config.resource_manager = &manager;
+        defer runtime.config.resource_manager = previous_manager;
+        const scan = try createMediaWindowCapture(runtime, &runtime.media_window_capture, @splat(1), @splat(2));
+        defer scan.deinit();
+        scan.resume_key.resize(scan.allocator(), 64 * 1024) catch |err| {
+            try std.testing.expectEqual(error.ResourceBudgetExceeded, scan.admissionError(err));
+        };
+        try std.testing.expectEqual(@as(usize, 0), scan.resume_key.items.len);
+    }
+    {
+        // An unrelated admission can reclaim even when nobody revisits the
+        // abandoned member. Leave the active scan outside the reclaimable cache.
+        var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 128 * 1024 } });
+        defer manager.deinit(a);
+        const previous_manager = runtime.config.resource_manager;
+        runtime.config.resource_manager = &manager;
+        defer runtime.config.resource_manager = previous_manager;
+        var idle: MediaWindowCaptureCache = .{};
+        defer idle.deinit();
+        try idle.register(&manager);
+        const abandoned = try createMediaWindowCapture(runtime, &idle, @splat(3), @splat(33));
+        abandoned.resume_key.resize(abandoned.allocator(), 48 * 1024) catch |err| {
+            abandoned.deinit();
+            return err;
+        };
+        try std.testing.expect(idle.saveIfSpace(abandoned, 0));
+        const active = try createMediaWindowCapture(runtime, &idle, @splat(4), @splat(44));
+        defer active.deinit();
+        try active.resume_key.resize(active.allocator(), 4096);
+        var replay_budget = idle.budget(&manager, a);
+        defer replay_budget.deinit();
+        const admitted = try replay_budget.allocator().alloc(u8, 96 * 1024);
+        defer replay_budget.allocator().free(admitted);
+        try std.testing.expectEqual(@as(usize, 0), idle.saved_count);
+        try std.testing.expectEqual(@as(usize, 4096), active.resume_key.items.len);
+    }
+    {
+        // The former slot and per-checkpoint byte ceiling cannot discard a
+        // second document or a continuation already admitted by the manager.
+        const first = try createMediaWindowCapture(runtime, &runtime.media_window_capture, @splat(1), @splat(11));
+        try first.resume_key.resize(first.allocator(), 2 * 1024 * 1024 + 1);
+        try std.testing.expect(runtime.media_window_capture.saveIfSpace(first, 0));
+        const second = try createMediaWindowCapture(runtime, &runtime.media_window_capture, @splat(2), @splat(22));
+        try std.testing.expect(runtime.media_window_capture.saveIfSpace(second, 0));
+        const resumed = runtime.media_window_capture.take(@splat(1), @splat(11)) orelse return error.TestUnexpectedResult;
+        defer resumed.deinit();
+        try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024 + 1), resumed.resume_key.items.len);
+        const other = runtime.media_window_capture.take(@splat(2), @splat(22)) orelse return error.TestUnexpectedResult;
+        defer other.deinit();
+    }
+    {
+        // Overload the scheduling slots without evicting the first member.
+        var saturated: MediaWindowCaptureCache = .{};
+        defer saturated.deinit();
+        for (0..saturated.saved.len) |index| {
+            const marker_: u8 = @intCast(index);
+            const scan = try createMediaWindowCapture(runtime, &saturated, @splat(marker_), @splat(marker_));
+            try std.testing.expect(saturated.saveIfSpace(scan, 0));
+        }
+        const overflow = try createMediaWindowCapture(runtime, &saturated, @splat(100), @splat(101));
+        defer overflow.deinit();
+        try std.testing.expect(!saturated.saveIfSpace(overflow, 0));
+        const first = saturated.take(@splat(0), @splat(0)) orelse return error.TestUnexpectedResult;
+        first.deinit();
+    }
     try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
     const member = try internal_keys.chunkArtifactKeyAlloc(a, "doc", "chunks", 0);
     defer a.free(member);
@@ -49336,7 +52046,9 @@ test "model aware media ordered vector windows are searchable with exact clocks 
     defer a.free(pass_key);
     const page_key = try media_pass.key(a, pass_scope, 0);
     defer a.free(page_key);
-    for (0..2) |round| {
+    const multi_outputs = metadata.outputs_json;
+    for (0..4) |round| {
+        const multiple = round % 2 == 0;
         if (round == 1) {
             marker = 0x22;
             try std.testing.expectError(error.IncompatibleChunkEmbeddingTarget, processOrderedChunkVectorWithAllocator(runtime, a, vector_request, provider, null, &.{"vectors"}));
@@ -49344,11 +52056,13 @@ test "model aware media ordered vector windows are searchable with exact clocks 
         }
         const single = try std.json.Stringify.valueAlloc(a, results[0..1], .{});
         defer a.free(single);
-        if (round == 1) {
-            try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"changed source\"}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = harness.next_index });
+        if (round != 0) {
+            const value = try std.fmt.allocPrint(a, "{{\"body\":\"source {d}\"}}", .{round});
+            defer a.free(value);
+            try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = value }}, .timestamp_ns = @intCast(100 + round) }, .{ .term = 1, .index = harness.next_index });
             harness.next_index += 1;
-            metadata.outputs_json = single;
         }
+        metadata.outputs_json = if (round == 3) single else multi_outputs;
         {
             var token = try Harness.capture(runtime, parent_request, scope);
             defer token.deinit();
@@ -49360,6 +52074,185 @@ test "model aware media ordered vector windows are searchable with exact clocks 
         const checkpoint = try media_pass.encode(a, media_pass.Cursor{ .input_digest = @splat(0), .page_count = 1, .covered_through_ordinal = 1, .complete = true });
         defer a.free(checkpoint);
         try storePutBatchWithRetry(runtime, &.{ .{ .key = page_key, .value = page }, .{ .key = pass_key, .value = checkpoint } }, &.{});
+        if (round == 0) {
+            // At the older floor the parent stamp is unavailable. Foreign
+            // rows still resume under the document materialization revision.
+            try harness.writeForeignWindows(a, member, 130, "foreign-vector");
+            {
+                var older = blk: {
+                    var read = try runtime.store.beginRead();
+                    defer read.abort();
+                    var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+                    defer plan.release();
+                    break :blk (try @import("../artifact_chunk_vector_publication.zig").capture(a, &read, vector_request, plan.plan(), member)).?;
+                };
+                defer older.deinit();
+                {
+                    var deadline: Deadline = .{};
+                    const previous = runtime.active_provider_guard;
+                    defer runtime.active_provider_guard = previous;
+                    runtime.active_provider_guard.cancellation = .{ .ptr = &deadline, .check_fn = Deadline.check };
+                    try std.testing.expectError(error.EnrichmentWaitTimeout, ensureMediaWindowOutputs(runtime, a, &older));
+                    try std.testing.expect(runtime.media_window_capture.saved_count != 0);
+                }
+                try ensureMediaWindowOutputs(runtime, a, &older);
+                try std.testing.expectEqual(@as(usize, 0), older.old_window_outputs.?.len);
+                try std.testing.expectEqual(@as(usize, 0), runtime.media_window_capture.saved_count);
+            }
+            try harness.writeForeignWindows(a, member, 130, null);
+            const calls = harness.calls;
+            try std.testing.expectError(error.ArtifactPublicationPending, processOrderedChunkVectorWithAllocator(runtime, a, vector_request, provider, null, &.{"vectors"}));
+            try std.testing.expectEqual(@as(usize, 1), harness.protocol_requests);
+            try std.testing.expectEqual(calls, harness.calls);
+            // Catalog activation rebuilds proof obligations under a new
+            // epoch. The unchanged parent is ready before vector replay.
+            {
+                var token = try Harness.capture(runtime, parent_request, scope);
+                defer token.deinit();
+                try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedChunkGeneration(runtime, parent_request, &token, scope, &chunks, true));
+            }
+            // Older retained media may contain a matching, invalid receipt.
+            // Reject that ordered command and keep applying the next entry.
+            {
+                const generations = @import("../artifact_chunk_generation.zig");
+                var fixture = std.heap.ArenaAllocator.init(a);
+                defer fixture.deinit();
+                const scratch = fixture.allocator();
+                var bad = results;
+                bad[0].status = .failed;
+                bad[0].embedding = null; // A failed receipt requires a code.
+                var bad_metadata = metadata;
+                bad_metadata.outputs_json = try std.json.Stringify.valueAlloc(scratch, &bad, .{});
+                const malformed = try std.json.Stringify.valueAlloc(scratch, .{ ._chunk = bad_metadata }, .{});
+                var invalid = blk: {
+                    var read = try runtime.store.beginRead();
+                    defer read.abort();
+                    var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+                    defer plan.release();
+                    break :blk (try @import("../artifact_chunk_vector_publication.zig").capture(a, &read, vector_request, plan.plan(), member)).?;
+                };
+                defer invalid.deinit();
+                const row = blk: {
+                    var read = try db.core.store.beginReadTxn();
+                    defer read.abort();
+                    var captured = try generations.captureInput(scratch, &read, member);
+                    defer captured.deinit();
+                    var plan = try generations.Plan.init(scratch, scope, try generations.Spec.decode(captured.head_value.?));
+                    defer plan.deinit();
+                    break :blk try std.mem.concat(scratch, u8, &.{ plan.row_prefix, &.{ 0, 0, 0, 0 } });
+                };
+                const original = invalid.value.?;
+                try storePutBatchWithRetry(runtime, &.{.{ .key = row, .value = malformed }}, &.{});
+                invalid.token.execution_identity = @splat(marker);
+                invalid.token.execution_bound = true;
+                const effects: []const ordered_publication.Mutation = &.{.{
+                    .family = .derived_vector,
+                    .key = invalid.output_key,
+                    .value = null,
+                    .source_index = 0,
+                }};
+                const command = try invalid.token.command(effects);
+                const index = harness.next_index;
+                try std.testing.expectError(error.ArtifactPublicationPending, enqueueProducerEffects(runtime, &invalid.token, effects, null));
+                try std.testing.expectEqual(index, (try db.orderedApplyReceipt()).?.index);
+                {
+                    var read = try runtime.store.beginRead();
+                    defer read.abort();
+                    const outcome = (try ordered_publication.rejected(&read, command)) orelse return error.TestUnexpectedResult;
+                    try std.testing.expectEqual(ordered_publication.Rejection.invalid_output, outcome.reason);
+                }
+                try storePutBatchWithRetry(runtime, &.{.{ .key = row, .value = original }}, &.{});
+            }
+            // First try a structurally valid fused command that silently
+            // drops receipt 1. The accepted proof cannot credit that set.
+            {
+                var partial = blk: {
+                    var read = try runtime.store.beginRead();
+                    defer read.abort();
+                    var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+                    defer plan.release();
+                    break :blk (try @import("../artifact_chunk_vector_publication.zig").capture(a, &read, vector_request, plan.plan(), member)).?;
+                };
+                defer partial.deinit();
+                partial.token.execution_identity = @splat(marker);
+                partial.token.execution_bound = true;
+                const child = try internal_keys.mediaWindowChildKeyAlloc(a, member, 0);
+                defer a.free(child);
+                const key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(a, child, "model");
+                defer a.free(key);
+                try partial.token.observePrecondition(key, null, null);
+                const vector = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, 0, &.{ 1, 0 });
+                defer a.free(vector);
+                const effects = [_]ordered_publication.Mutation{
+                    .{ .family = .derived_vector, .key = partial.output_key, .value = null, .source_index = 0 },
+                    .{ .family = .derived_vector, .key = key, .value = vector, .source_index = 0 },
+                };
+                {
+                    // Keep the command's inputs live and give the encoder
+                    // too little credit for its full multi-window envelope.
+                    var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 4096 } });
+                    defer manager.deinit(a);
+                    const previous_manager = runtime.config.resource_manager;
+                    runtime.config.resource_manager = &manager;
+                    defer runtime.config.resource_manager = previous_manager;
+                    const payload = try a.alloc(u8, 64 * 1024);
+                    defer a.free(payload);
+                    @memset(payload, 0);
+                    var wide = effects;
+                    wide[1].value = payload;
+                    const index = harness.next_index;
+                    try std.testing.expectError(error.ResourceBudgetExceeded, enqueueProducerEffects(runtime, &partial.token, &wide, null));
+                    try std.testing.expectEqual(index, harness.next_index);
+                    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.relational_preparation_working_set).used_bytes);
+                }
+                const incomplete = try partial.token.command(&effects);
+                try std.testing.expectError(error.ArtifactPublicationPending, enqueueProducerEffects(runtime, &partial.token, &effects, null));
+                var read = try runtime.store.beginRead();
+                defer read.abort();
+                const rejected = (try ordered_publication.rejected(&read, incomplete)) orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(ordered_publication.Rejection.stale_source, rejected.reason);
+                try std.testing.expectError(error.NotFound, read.get(key));
+            }
+            // The ordered catalog can retain provider fields unknown to
+            // its generic schema. Reject a deterministic recipe error and
+            // prove the immediately following healthy vector applies.
+            {
+                var invalid = blk: {
+                    var read = try runtime.store.beginRead();
+                    defer read.abort();
+                    var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+                    defer plan.release();
+                    var request = for (plan.plan().generated_templates) |candidate| {
+                        if (candidate.kind == .dense_embedding and std.mem.eql(u8, requestEmbeddingName(candidate), "bad-recipe")) break candidate;
+                    } else return error.TestUnexpectedResult;
+                    request.doc_key = "doc";
+                    break :blk (try @import("../artifact_chunk_vector_publication.zig").capture(a, &read, request, plan.plan(), member)).?;
+                };
+                defer invalid.deinit();
+                invalid.token.execution_identity = @splat(marker);
+                invalid.token.execution_bound = true;
+                const effects: []const ordered_publication.Mutation = &.{.{
+                    .family = .derived_vector,
+                    .key = invalid.output_key,
+                    .value = null,
+                    .source_index = 0,
+                }};
+                const command = try invalid.token.command(effects);
+                const index = harness.next_index;
+                try std.testing.expectError(error.ArtifactPublicationPending, enqueueProducerEffects(runtime, &invalid.token, effects, null));
+                try std.testing.expectEqual(index, (try db.orderedApplyReceipt()).?.index);
+                var read = try runtime.store.beginRead();
+                defer read.abort();
+                const outcome = (try ordered_publication.rejected(&read, command)) orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(ordered_publication.Rejection.invalid_output, outcome.reason);
+            }
+            const published_parent = harness.calls;
+            const next_valid_entry = harness.next_index;
+            try std.testing.expectError(error.ArtifactPublicationPending, processOrderedChunkVectorWithAllocator(runtime, a, vector_request, provider, null, &.{"vectors"}));
+            try std.testing.expectEqual(published_parent + 1, harness.calls);
+            try std.testing.expectEqual(next_valid_entry, (try db.orderedApplyReceipt()).?.index);
+            try std.testing.expectEqual(@as(?[32]u8, @as([32]u8, @splat(marker))), harness.last_vector_revision);
+        }
         var input = blk: {
             var read = try runtime.store.beginRead();
             defer read.abort();
@@ -49370,7 +52263,170 @@ test "model aware media ordered vector windows are searchable with exact clocks 
         defer input.deinit();
         var cache = MediaPassVectorCache{ .allocator = a };
         defer cache.deinit();
-        try std.testing.expect(try publishMediaWindowVectors(runtime, a, vector_request, provider, &input, input.value.?, &cache));
+        if (round == 0) {
+            var failed = results;
+            for (&failed) |*receipt| {
+                receipt.status = .failed;
+                receipt.embedding = null;
+                receipt.code = "Unavailable";
+                receipt.terminal = true;
+            }
+            const failed_outputs = try std.json.Stringify.valueAlloc(a, &failed, .{});
+            defer a.free(failed_outputs);
+            var failed_metadata = metadata;
+            failed_metadata.outputs_json = failed_outputs;
+            const failed_payload = try std.json.Stringify.valueAlloc(a, .{ ._chunk = failed_metadata }, .{});
+            defer a.free(failed_payload);
+            const calls = harness.calls;
+            var independent = vector_request;
+            independent.embedding_name = "independent";
+            independent.producer_json = "{\"provider\":\"antfly\",\"model\":\"independent\"}";
+            const active_floor = input.effect_protocol;
+            input.effect_protocol = 18;
+            input.old_window_outputs = &.{};
+            try std.testing.expect(!try publishMediaWindowVectors(runtime, a, independent, provider, @as([32]u8, @splat(marker)), &input, failed_payload, &cache));
+            try std.testing.expect(!scalarWindowRetirementPending(&input));
+            input.effect_protocol = active_floor;
+            input.old_window_outputs = null;
+            try std.testing.expect(!try publishMediaWindowVectors(runtime, a, vector_request, provider, @as([32]u8, @splat(0x22)), &input, failed_payload, &cache));
+            try std.testing.expectEqual(calls, harness.calls);
+        }
+        if (round == 1) {
+            const scalar_revision: [32]u8 = @splat(0x22);
+            const calls = harness.calls;
+            try std.testing.expect(!try publishMediaWindowVectors(runtime, a, vector_request, provider, scalar_revision, &input, input.value.?, &cache));
+            try std.testing.expectEqual(calls, harness.calls);
+            const vector = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, retainedTextEmbeddingHashAtRevision(vector_request, "source 1", scalar_revision), &.{ 0.8, 0.6 });
+            defer a.free(vector);
+            input.token.execution_identity = scalar_revision;
+            input.effect_protocol = retirement_protocol - 1;
+            try std.testing.expectError(error.ArtifactPublicationPending, enqueueScalarChunkVector(runtime, &input, vector, true));
+            try std.testing.expectEqual(calls, harness.calls);
+            try std.testing.expect(input.media_window_layout);
+            try std.testing.expectEqual(@as(usize, 0), input.old_window_outputs.?.len);
+            input.effect_protocol = retirement_protocol;
+            input.old_window_outputs = null;
+            const phantom_member = try internal_keys.mediaWindowChildKeyAlloc(a, member, 650);
+            defer a.free(phantom_member);
+            const phantom = try internal_keys.derivedEmbeddingArtifactKeyAlloc(a, phantom_member, "model");
+            defer a.free(phantom);
+            harness.phantom_key = phantom;
+            try std.testing.expectError(error.ArtifactPublicationPending, enqueueScalarChunkVector(runtime, &input, vector, true));
+            try std.testing.expect(harness.stale_vector);
+            const parent = try storeGetOptionalAllocWithRetry(runtime, input.output_key);
+            defer if (parent) |value| runtime.alloc.free(value);
+            try std.testing.expect(parent == null);
+            var refreshed = blk: {
+                var read = try runtime.store.beginRead();
+                defer read.abort();
+                var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+                defer plan.release();
+                break :blk (try @import("../artifact_chunk_vector_publication.zig").capture(a, &read, vector_request, plan.plan(), member)).?;
+            };
+            defer refreshed.deinit();
+            refreshed.token.execution_identity = scalar_revision;
+            try std.testing.expectError(error.ArtifactPublicationPending, enqueueScalarChunkVector(runtime, &refreshed, vector, true));
+            const remaining = try storeGetOptionalAllocWithRetry(runtime, phantom);
+            defer if (remaining) |value| runtime.alloc.free(value);
+            try std.testing.expect(remaining == null);
+            try std.testing.expectEqual(calls + 2, harness.calls);
+
+            // An insertion into a previously empty set must invalidate the
+            // captured scalar revision without changing its stored bytes.
+            var formerly_empty = blk: {
+                var read = try runtime.store.beginRead();
+                defer read.abort();
+                var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+                defer plan.release();
+                break :blk (try @import("../artifact_chunk_vector_publication.zig").capture(a, &read, vector_request, plan.plan(), member)).?;
+            };
+            defer formerly_empty.deinit();
+            try ensureMediaWindowOutputs(runtime, a, &formerly_empty);
+            try std.testing.expectEqual(@as(usize, 0), formerly_empty.old_window_outputs.?.len);
+            formerly_empty.token.execution_identity = @splat(0x33);
+            formerly_empty.token.execution_bound = true;
+            harness.stale_vector = false;
+            harness.phantom_key = phantom;
+            try std.testing.expectError(error.ArtifactPublicationPending, enqueueScalarChunkVector(runtime, &formerly_empty, vector, true));
+            try std.testing.expect(harness.stale_vector);
+            // The owned child sorts after more than one page of foreign
+            // children. Exact capture must resume and leave those untouched.
+            try harness.writeForeignWindows(a, member, 650, vector);
+            var final = blk: {
+                var read = try runtime.store.beginRead();
+                defer read.abort();
+                var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+                defer plan.release();
+                break :blk (try @import("../artifact_chunk_vector_publication.zig").capture(a, &read, vector_request, plan.plan(), member)).?;
+            };
+            defer final.deinit();
+            final.token.execution_identity = @splat(0x33);
+            final.token.execution_bound = true;
+            // The scalar was captured AFTER the child was inserted. Its
+            // parent revision is current, but its proposed set is incomplete.
+            const omitted_child: ordered_publication.Mutation = .{ .family = .derived_vector, .key = final.output_key, .value = vector, .source_index = 0 };
+            const incomplete = try final.token.command(&.{omitted_child});
+            try std.testing.expectError(error.ArtifactPublicationPending, enqueueProducerEffects(runtime, &final.token, &.{omitted_child}, null));
+            {
+                var read = try runtime.store.beginRead();
+                defer read.abort();
+                const rejected = (try ordered_publication.rejected(&read, incomplete)) orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(ordered_publication.Rejection.stale_source, rejected.reason);
+                _ = try read.get(phantom);
+            }
+            // All slots are full and their original members never run.
+            // An overflow member must finish without a reclaim callback.
+            const captures = &runtime.media_window_capture;
+            for (0..captures.saved.len) |slot| {
+                const id: u8 = @intCast(slot);
+                const abandoned = try createMediaWindowCapture(runtime, captures, @splat(id), @splat(id));
+                try std.testing.expect(captures.saveIfSpace(abandoned, 0));
+            }
+            {
+                var deadline: Deadline = .{};
+                const previous = runtime.active_provider_guard;
+                defer runtime.active_provider_guard = previous;
+                runtime.active_provider_guard.cancellation = .{ .ptr = &deadline, .check_fn = Deadline.check };
+                try std.testing.expectError(error.EnrichmentWaitTimeout, ensureMediaWindowOutputsAt(runtime, a, &final, MediaWindowCaptureCache.idle_timeout_ns - 1));
+                try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(0)), &captures.saved[0].member);
+            }
+            // A wide active member releases the replay worker. The next
+            // turn attaches the same keys, without copying either key set.
+            var yielded: usize = 0;
+            while (true) {
+                ensureMediaWindowOutputsAt(runtime, a, &final, MediaWindowCaptureCache.idle_timeout_ns) catch |err| {
+                    if (err != error.ArtifactPublicationPending) return err;
+                    yielded += 1;
+                    try std.testing.expect(yielded < 128);
+                    continue;
+                };
+                break;
+            }
+            try std.testing.expect(yielded > 0);
+            try std.testing.expectEqual(@as(usize, 1), final.old_window_outputs.?.len);
+            const captured_key = final.old_window_outputs.?[0].key;
+            const borrowed = for (final.token.preconditions.items) |guard| {
+                if (std.mem.eql(u8, guard.key, captured_key)) break guard.key;
+            } else return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@intFromPtr(captured_key.ptr), @intFromPtr(borrowed.ptr));
+            try std.testing.expectError(error.ArtifactPublicationPending, enqueueScalarChunkVector(runtime, &final, vector, true));
+            try std.testing.expectEqual(captures.saved.len - 1, captures.saved_count);
+            _ = MediaWindowCaptureCache.reclaim(captures, std.math.maxInt(u64));
+            const retired = try storeGetOptionalAllocWithRetry(runtime, phantom);
+            defer if (retired) |value| runtime.alloc.free(value);
+            try std.testing.expect(retired == null);
+            const foreign_member = try internal_keys.mediaWindowChildKeyAlloc(a, member, 0);
+            defer a.free(foreign_member);
+            const foreign = try internal_keys.derivedEmbeddingArtifactKeyAlloc(a, foreign_member, "foreign");
+            defer a.free(foreign);
+            const surviving = (try storeGetOptionalAllocWithRetry(runtime, foreign)) orelse return error.TestUnexpectedResult;
+            defer runtime.alloc.free(surviving);
+            try std.testing.expectEqualSlices(u8, vector, surviving);
+            try harness.writeForeignWindows(a, member, 650, null);
+        } else if (round != 0) {
+            input.token.execution_identity = @splat(marker);
+            try std.testing.expect(try publishMediaWindowVectors(runtime, a, vector_request, provider, @as([32]u8, @splat(marker)), &input, input.value.?, &cache));
+        }
         try db.runUntilIdle();
         {
             var lookup = (try db.lookup(a, "doc", .{ .fields = &.{"_artifacts"}, .include_all_fields = false })).?;
@@ -49379,7 +52435,7 @@ test "model aware media ordered vector windows are searchable with exact clocks 
             defer projected.deinit();
             try std.testing.expect(projected.value.object.get("_artifacts").?.object.contains("model"));
             const projected_model = projected.value.object.get("_artifacts").?.object.get("model").?;
-            if (round == 0) {
+            if (multiple) {
                 const items = projected_model.object.get("items").?.array.items;
                 try std.testing.expectEqual(@as(usize, 2), items.len);
                 for (items, 0..) |item, index| {
@@ -49389,7 +52445,7 @@ test "model aware media ordered vector windows are searchable with exact clocks 
             } else try std.testing.expect(projected_model.object.get("artifact_ref").?.object.get("source").?.object.get("window_index") == null);
         }
 
-        if (round == 0) for (0..2) |index| {
+        if (multiple) for (0..2) |index| {
             const child = try internal_keys.mediaWindowChildKeyAlloc(a, member, @intCast(index));
             defer a.free(child);
             const vector = try internal_keys.derivedEmbeddingArtifactKeyAlloc(a, child, "model");
@@ -49400,11 +52456,11 @@ test "model aware media ordered vector windows are searchable with exact clocks 
             defer a.free(decoded);
             try std.testing.expectEqualSlices(f32, results[index].embedding.?, decoded);
         };
-        try std.testing.expectEqual(@as(u64, if (round == 0) 2 else 1), db.core.index_manager.denseIndex("vectors").?.index.stats().active_count);
+        try std.testing.expectEqual(@as(u64, if (multiple) 2 else 1), db.core.index_manager.denseIndex("vectors").?.index.stats().active_count);
         var found = try db.search(a, .{ .index_name = "vectors", .dense = .{ .vector = &.{ 0.2, 1 }, .k = 4 }, .return_mode = .member, .limit = 4, .include_stored = true });
         defer found.deinit();
-        try std.testing.expectEqual(@as(usize, if (round == 0) 2 else 1), found.hits.len);
-        if (round == 0) {
+        try std.testing.expectEqual(@as(usize, if (multiple) 2 else 1), found.hits.len);
+        if (multiple) {
             try std.testing.expectEqual(@as(?u32, 1), found.hits[0].artifact_ref.?.window_index);
             for (found.hits) |hit| {
                 const index = hit.artifact_ref.?.window_index orelse return error.TestUnexpectedResult;
@@ -49426,6 +52482,23 @@ test "model aware media ordered vector windows are searchable with exact clocks 
             }
         }
     }
+    const scalar = try internal_keys.derivedEmbeddingArtifactKeyAlloc(a, member, "model");
+    defer a.free(scalar);
+    const witness = @import("../artifact_chunk_vector_publication.zig").emptyWindowKey(catalog.namespace, scalar);
+    {
+        var write = try db.core.store.beginWriteTxn();
+        errdefer write.abort();
+        _ = try write.get(&witness);
+        try write.delete(scalar);
+        const receipts = @import("../apply_receipts.zig");
+        var receipt_bytes: [receipts.ordered_apply_receipt_value_len]u8 = undefined;
+        const receipt = receipts.orderedApplyReceiptWrite(.{ .term = 1, .index = harness.next_index }, &receipt_bytes);
+        try write.put(receipt.key, receipt.value);
+        try write.commit();
+    }
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectError(error.NotFound, read.get(&witness));
 }
 
 test "model aware media label batches capture one vector space and fence it before publication" {
@@ -49665,13 +52738,6 @@ test "model aware media terminal scalar output acknowledges failure without mode
     }
     var catalog = try db.artifactInventoryCommand(a);
     defer catalog.catalogs.deinit(a);
-    // This catalog's "vectors" index is exactly artifact_inventory.zig's
-    // onlineGeneratedChunkVectorConfig shape, which computes to the current
-    // max (18), not the stale floor (15) a sibling test deliberately pins.
-    // Pinning 15 here trips processOrderedChunkVectorWithAllocator's
-    // execution_revision-gated floor check before reaching the terminal
-    // failure this test means to exercise.
-    catalog.binding.effect_protocol = 18;
     try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
     var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
@@ -49777,7 +52843,7 @@ test "model aware media terminal scalar output acknowledges failure without mode
         defer input.deinit();
         var cache = MediaPassVectorCache{ .allocator = a };
         defer cache.deinit();
-        try std.testing.expect(try publishMediaWindowVectors(runtime, a, vector_request, provider, &input, input.value.?, &cache));
+        try std.testing.expect(try publishMediaWindowVectors(runtime, a, vector_request, provider, @as([32]u8, @splat(marker)), &input, input.value.?, &cache));
         {
             var read = try runtime.store.beginRead();
             defer read.abort();
@@ -49928,7 +52994,7 @@ test "model aware media vocabulary cache retains 32 admitted vocabularies withou
         // belongs to the runtime and must survive all 64 independent windows.
         var window = GeneratedReplayWindow{ .alloc = alloc };
         defer window.deinit();
-        try processVectorLabels(&runtime, admitted_request, config, null, "{}", output_key, &window);
+        try processVectorLabels(&runtime, admitted_request, config, null, "{}", output_key, &window, null);
     };
     try std.testing.expectEqual(@as(usize, 32), fake.calls);
     std.debug.print("vocabulary prompts={d} retained={d} slots={d} budget={d}\n", .{ fake.calls, runtime.vector_label_cache.bytes, @import("vector_label_cache.zig").Cache.max_entries, @import("vector_label_cache.zig").Cache.max_bytes });
@@ -50034,7 +53100,7 @@ test "model aware media labels authenticate independently refreshed retained tex
     defer alloc.free(primary);
     try storePutWithRetry(&runtime, primary, "{}");
     const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"}]}}" };
-    try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"}]}", null, "{}", output_key, &window);
+    try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"}]}", null, "{}", output_key, &window, null);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     const output = try storeGetAlloc(&runtime, output_key);
     defer alloc.free(output);
@@ -50042,7 +53108,7 @@ test "model aware media labels authenticate independently refreshed retained tex
     defer parsed.deinit();
     try std.testing.expectEqualStrings("speech", parsed.value.object.get("chunks").?.array.items[0].object.get("labels").?.array.items[0].object.get("label").?.string);
     fake.generation = 3;
-    try std.testing.expectError(error.IncompatibleChunkEmbeddingTarget, processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"}]}", null, "{}", output_key, &window));
+    try std.testing.expectError(error.IncompatibleChunkEmbeddingTarget, processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"}]}", null, "{}", output_key, &window, null));
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
 }
 
@@ -50179,7 +53245,7 @@ test "model aware media known vocabulary generations require lease-aware executi
     var window = GeneratedReplayWindow{ .alloc = alloc };
     defer window.deinit();
     const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\"}" };
-    try std.testing.expectError(error.InvalidEmbeddingIdentity, processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}", null, "{}", output_key, &window));
+    try std.testing.expectError(error.InvalidEmbeddingIdentity, processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}", null, "{}", output_key, &window, null));
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
     try std.testing.expectEqual(@as(usize, 0), runtime.vector_label_cache.bytes);
 }
@@ -50509,7 +53575,85 @@ test "dense text planning forwards request control to capability discovery" {
     }
 }
 
+fn verifyDenseMediaAcknowledgementDrain() !void {
+    const a = platform.allocator.concurrentFallback();
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "media-drain" });
+    defer store.deinit();
+    var erased = try backend_erased.storeFrom(a, store);
+    defer erased.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/media-drain", .{tmp.sub_path});
+    var indexes = try index_manager_mod.IndexManager.init(a, path);
+    defer indexes.deinit();
+    try indexes.addEnrichment(&store, .{ .name = "clips", .kind = .chunk, .field = "body", .chunk_size = 8 });
+    try indexes.addEnrichment(&store, .{ .name = "vectors", .kind = .embedding, .source_artifact_name = "clips", .expected_dims = 2 });
+    var runtime = EnrichmentRuntime{
+        .alloc = a,
+        .io_impl = .{ .borrowed = std.testing.io },
+        .store = erased,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &indexes,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .dense_embedding, .index_name = "vectors", .doc_key = "doc", .source_field = "body", .sequence = 7 };
+    const embedding = indexes.getEnrichment(.embedding, requestEmbeddingName(request)) orelse return error.MissingTestEmbedding;
+    const chunks = indexes.getEnrichment(.chunk, embedding.source_artifact_name) orelse return error.MissingTestChunker;
+    const prefix = try media_pass.scope(a, request.doc_key, chunks.name, chunks.source_field);
+    defer a.free(prefix);
+    const key = try media_pass.key(a, prefix, null);
+    defer a.free(key);
+    const cursor = try media_pass.encode(a, media_pass.Cursor{ .input_digest = @splat(1), .source_sequence = request.sequence, .complete = true });
+    defer a.free(cursor);
+    try storePutWithRetry(&runtime, key, cursor);
+    const stored = (try storeGetOptionalAllocWithRetry(&runtime, key)) orelse return error.MissingTestMediaCursor;
+    defer a.free(stored);
+    try std.testing.expectEqualSlices(u8, cursor, stored);
+    const owned = try enrichment_types.cloneGeneratedRequests(a, &.{request});
+    const lane = a.create(DenseExecutionLane) catch |err| {
+        enrichment_types.deinitGeneratedRequests(a, owned);
+        return err;
+    };
+    lane.* = .{ .runtime = &runtime, .plain_dense = &.{}, .chunked_dense = owned, .chunk_cache = &lane.chunk_cache_storage, .window = .{ .alloc = a }, .applied_sequence = 0, .group = null };
+
+    const Lock = struct {
+        fn acquire(_: *anyopaque, _: ?GeneratedWriteFence, _: u64) anyerror!GeneratedStoreLease {
+            return error.WriterLocked;
+        }
+    };
+    runtime.generated_publication = .{
+        .ptr = &runtime,
+        .commit = undefined,
+        .heartbeat = undefined,
+        .acquire_store = Lock.acquire,
+    };
+    const future = std.testing.io.concurrent(DenseExecutionLane.finishPublishedQuantum, .{lane}) catch |err| {
+        lane.deinitOwned();
+        a.destroy(lane);
+        return err;
+    };
+    var pipeline = LanePipeline.init(&runtime);
+    pipeline.dense_inflight = .{ .lane = lane, .future = future };
+    const scanner_error = error.EnrichmentWaitTimeout;
+    setActiveFailureFingerprint(&runtime, 99);
+    try std.testing.expectError(error.WriterLocked, pipeline.drainAll(false));
+    try std.testing.expectEqual(error.WriterLocked, pipeline.publication_failure.?);
+    try std.testing.expectEqual(@as(u64, 99), runtime.active_failure_fingerprint);
+    try std.testing.expectEqual(error.EnrichmentWaitTimeout, foregroundPassFailure(&runtime, .{}, scanner_error));
+}
+
 test "dense lane publication failure stops later work and retains pipeline provenance" {
+    try verifyDenseMediaAcknowledgementDrain();
     const a = std.testing.allocator;
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const P = struct {
@@ -50689,7 +53833,25 @@ test "model aware media URL fields fetch bounded binary input and preserve plain
     defer sibling.deinit(a);
     try std.testing.expect(source.input.?.binary.data.ptr == sibling.input.?.binary.data.ptr);
     try std.testing.expectEqual(@as(usize, 1), app.calls.load(.monotonic));
-    try std.testing.expectError(error.Timeout, extractModelChunkSource(a, config, raw, request, .{ .io = std.testing.io, .deadline_ns = 0 }));
+    try std.testing.expectError(error.EnrichmentWaitTimeout, extractModelChunkSource(a, config, raw, request, .{ .io = std.testing.io, .deadline_ns = 0 }));
+    {
+        const metadata: @import("inference_chunker").types.ModelMetadata = .{
+            .descriptor = .{ .ordinal = 0, .coordinates = .{ .kind = .video, .start_ns = 0, .end_ns = 100 }, .input_tokens = 1 },
+            .inference_id = "plan:0",
+            .plan_id = "plan",
+            .source_fingerprint = "source",
+            .source_version = "v1",
+            .model = "model",
+            .model_identity = "model",
+            .model_revision = "v1",
+            .task_type = "RETRIEVAL_DOCUMENT",
+            .dimensions = 2,
+            .policy = .{},
+        };
+        runtime.active_provider_guard.deadline_ns = 0;
+        defer runtime.active_provider_guard = .{};
+        try std.testing.expectError(error.EnrichmentWaitTimeout, replayModelChunkVector(&runtime, a, request, &metadata, "body"));
+    }
     try std.testing.expectEqual(@as(usize, 1), app.calls.load(.monotonic));
     var text = try extractModelChunkSource(a, config, "{\"body\":\"a real passage\"}", request, null);
     defer text.deinit(a);
@@ -50773,6 +53935,45 @@ test "model aware media URL fields fetch bounded binary input and preserve plain
     try std.testing.expectEqual(sourceRecordDigest(raw), hint.digest.?);
 }
 
+test "enrichment source template failures recheck caller authority before classification" {
+    const Renderer = struct {
+        revoked: bool = false,
+        failure: anyerror = error.InvalidTemplateInput,
+
+        fn checkpoint(ptr: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            if (self.revoked) return error.DeadlineExceeded;
+        }
+
+        fn finish(ptr: ?*anyopaque) anyerror {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.revoked = true;
+            return self.failure;
+        }
+
+        fn renderText(ptr: ?*anyopaque, _: Allocator, _: []const u8, _: []const u8, _: template_remote.RenderConfig) anyerror![]const u8 {
+            return finish(ptr);
+        }
+
+        fn renderParts(ptr: ?*anyopaque, _: Allocator, _: []const u8, _: []const u8, _: template_remote.RenderConfig) anyerror![]template.ContentPart {
+            return finish(ptr);
+        }
+    };
+    var renderer: Renderer = .{};
+    template_remote.setHostRenderer(.{ .ctx = &renderer, .render_json_to_text = Renderer.renderText, .render_json_to_parts = Renderer.renderParts });
+    defer template_remote.setHostRenderer(null);
+    const a = std.testing.allocator;
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "asset", .doc_key = "doc", .source_field = "body", .source_template = "{{remoteText url=body}}" };
+    const config: Config = .{ .cancellation = .{ .ptr = &renderer, .check_fn = Renderer.checkpoint } };
+    for ([_]anyerror{ error.InvalidTemplateInput, error.PermanentPromptFailure }) |failure| {
+        renderer.failure = failure;
+        renderer.revoked = false;
+        try std.testing.expectError(error.EnrichmentWaitTimeout, extractAssetSourceValue(a, config, "{}", request));
+        renderer.revoked = false;
+        try std.testing.expectError(error.EnrichmentWaitTimeout, renderSourceParts(a, config, "{}", request, null));
+    }
+}
+
 test "durable enrichment scoped retry permits healthy targets and restores exact budgets" {
     const a = std.testing.allocator;
     var backend = mem_backend.Backend.init(a, .{});
@@ -50811,6 +54012,9 @@ test "durable enrichment scoped retry permits healthy targets and restores exact
     defer scheduler.deinit(a);
     runtime.retry_scheduler = &scheduler;
     const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .asset, .index_name = "asset", .doc_key = "bad", .source_field = "body", .sequence = 2 };
+    const primary_key = try documentSourceStoreKeyAlloc(&runtime, request.doc_key);
+    defer a.free(primary_key);
+    try storePutBatchWithRetry(&runtime, &.{.{ .key = primary_key, .value = "{}" }}, &.{});
     const fingerprint = requestFailureFingerprint(request);
     setRetryAfterHintFor(&runtime, fingerprint, 3_600_000);
     var scope = FailureScope{};
@@ -50852,12 +54056,13 @@ test "durable enrichment scoped retry permits healthy targets and restores exact
         // budget even when no scanner-global request identity is installed.
         const http = @import("../../../common/http/http_common.zig");
         const App = struct {
-            fn execute(_: *anyopaque, _: Allocator, _: http.HttpRequest) !http.HttpResponse {
-                return .{ .status = 503 };
+            fn execute(ptr: *anyopaque, _: Allocator, _: http.HttpRequest) !http.HttpResponse {
+                const status: *std.atomic.Value(u16) = @ptrCast(@alignCast(ptr));
+                return .{ .status = status.load(.acquire) };
             }
         };
-        var marker: u8 = 0;
-        var listener = @import("../../../common/http/std_http_listener.zig").StdHttpListener.init(a, .{}, .{ .ptr = &marker, .vtable = &.{ .execute = App.execute } });
+        var status = std.atomic.Value(u16).init(503);
+        var listener = @import("../../../common/http/std_http_listener.zig").StdHttpListener.init(a, .{}, .{ .ptr = &status, .vtable = &.{ .execute = App.execute } });
         defer listener.deinit();
         try listener.start();
         const uri = try listener.baseUri(a);
@@ -50882,6 +54087,12 @@ test "durable enrichment scoped retry permits healthy targets and restores exact
         defer parsed.deinit();
         try std.testing.expectEqualStrings("error", parsed.value.object.get("route_type").?.string);
         try std.testing.expectEqualStrings("RemoteDocumentFetchFailed", parsed.value.object.get("last_error").?.object.get("code").?.string);
+        try storePutBatchWithRetry(&runtime, &.{.{ .key = primary_key, .value = "{\"body\":\"replacement\"}" }}, &.{});
+        status.store(404, .release);
+        try std.testing.expectError(error.EnrichmentSourceChanged, processDocumentExtractionAsset(&runtime, request, "{}", uri, "{}", manifest_key, &sources, &window, &extraction_scope));
+        const unchanged = try storeGetAlloc(&runtime, manifest_key);
+        defer a.free(unchanged);
+        try std.testing.expectEqualStrings(manifest, unchanged);
         try std.testing.expectEqual(@as(u64, 2), extraction_scope.attemptNumber(&runtime));
         try std.testing.expectEqual(@as(u64, 0), runtime.active_failure_fingerprint);
     }
@@ -51972,7 +55183,7 @@ test "source semantic media input retained PDF chunk requests fail before replay
     defer scheduler.deinit();
     var consumer = SharedPdfWindowScheduler.Consumer{};
     try std.testing.expectError(error.InvalidEnrichmentConfig, scheduler.prepareConsumer(&consumer, invalid_document, "{}"));
-    try std.testing.expectError(error.InvalidEnrichmentConfig, processDenseEmbedding(&runtime, request, &cache, &sources, &window));
+    try std.testing.expectError(error.InvalidEnrichmentConfig, processDenseEmbedding(&runtime, request, &cache, &sources, &window, null));
     try std.testing.expectError(error.InvalidEnrichmentConfig, processChunkedDenseWindow(&runtime, &.{request}, &cache, &window, &scope));
     request.kind = .sparse_embedding;
     try std.testing.expectError(error.InvalidEnrichmentConfig, processSparseEmbedding(&runtime, request, &cache, &window));

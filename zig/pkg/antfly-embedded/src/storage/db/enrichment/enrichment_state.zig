@@ -765,6 +765,12 @@ pub fn saveRuntimeStatus(store: anytype, scope: []const u8, status: RuntimeStatu
 /// Publish worker status and its projection metadata without replacing progress
 /// from a checkpoint read before write admission.
 pub fn saveRuntimeStatusAndProjection(alloc: Allocator, store: anytype, scope: []const u8, observed_applied: u64, observed_revision: ?u64, status: RuntimeStatus, projection_status: ProjectionStatus, config_hash: u64, generation: ?u64, failed_through: ?u64) !?u64 {
+    return saveRuntimeStatusAndProjectionGuarded(alloc, store, scope, observed_applied, observed_revision, status, projection_status, config_hash, generation, failed_through, struct {
+        pub fn validate(_: @This(), _: anytype) !void {}
+    }{});
+}
+
+pub fn saveRuntimeStatusAndProjectionGuarded(alloc: Allocator, store: anytype, scope: []const u8, observed_applied: u64, observed_revision: ?u64, status: RuntimeStatus, projection_status: ProjectionStatus, config_hash: u64, generation: ?u64, failed_through: ?u64, guard: anytype) !?u64 {
     const key = try appliedSequenceKey(alloc, scope);
     defer alloc.free(key);
     var runtime = try initRuntimeStore(alloc, store);
@@ -782,6 +788,7 @@ pub fn saveRuntimeStatusAndProjection(alloc: Allocator, store: anytype, scope: [
         txn.abort();
         return null;
     }
+    try guard.validate(&txn);
     const next_status = if (conflict)
         mergeOutstandingFailure(try loadRuntimeStatusTxn(alloc, &txn, scope), status)
     else
@@ -791,6 +798,29 @@ pub fn saveRuntimeStatusAndProjection(alloc: Allocator, store: anytype, scope: [
     const encoded = encodeProjectionCheckpoint(checkpoint);
     try txn.put(key, &encoded);
     const next = try putVersionedStatusTxn(alloc, &txn, scope, next_status, revision);
+    try txn.commit();
+    return next;
+}
+
+/// Refund only the exact unadvanced recovery reservation. The CAS leaves
+/// any newer retry observation, rewind, or concurrent publication untouched.
+pub fn restoreBoundaryRecoveryReservation(alloc: Allocator, store: backend_erased.Store, scope: []const u8, applied: u64, generation: u64, reserved_revision: u64, status: RuntimeStatus, guard: anytype) !?u64 {
+    const key = try appliedSequenceKey(alloc, scope);
+    defer alloc.free(key);
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginWrite();
+    errdefer txn.abort();
+    const raw = txn.get(key) catch |err| if (err == error.NotFound) null else return err;
+    const checkpoint = if (raw) |bytes| try decodeProjectionCheckpoint(bytes) else ProjectionCheckpoint{};
+    const revision = try loadStatusRevisionTxn(alloc, &txn, scope);
+    if (checkpoint.generation != generation or checkpoint.applied_sequence != applied or revision != reserved_revision) {
+        txn.abort();
+        return null;
+    }
+    try guard.validate(&txn);
+    // Reservation and refund both retain the repair-required projection.
+    const next = try putVersionedStatusTxn(alloc, &txn, scope, status, revision);
     try txn.commit();
     return next;
 }

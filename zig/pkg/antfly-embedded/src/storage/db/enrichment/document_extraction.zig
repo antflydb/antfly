@@ -100,6 +100,14 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or bu
                 context: ?*const anyopaque = null,
                 is_cancelled_fn: ?*const fn (?*const anyopaque) bool = null,
 
+                cancellation_error_fn: ?*const fn (?*const anyopaque, anyerror) anyerror = null,
+
+                pub fn classifyError(self: CancellationProbe, err: anyerror) anyerror {
+                    if (err != error.Canceled and err != error.Cancelled) return err;
+                    const classify = self.cancellation_error_fn orelse return err;
+                    return classify(self.context, err);
+                }
+
                 pub fn check(self: CancellationProbe) !void {
                     if (self.is_cancelled_fn) |is_cancelled| if (is_cancelled(self.context)) return error.Canceled;
                 }
@@ -652,6 +660,7 @@ pub const PdfDecodeLimits = pdf.reader.DecodeLimits;
 /// a reader holds the returned probe.
 pub const PdfRenderDeadline = struct {
     deadline_ns: u64,
+    owner: PdfCancellationProbe = .{},
 
     pub fn init(timeout_ms: u64) @This() {
         const timeout_ns = std.math.mul(u64, @max(timeout_ms, 1), std.time.ns_per_ms) catch std.math.maxInt(u64);
@@ -660,11 +669,23 @@ pub const PdfRenderDeadline = struct {
 
     fn isCancelled(context: ?*const anyopaque) bool {
         const self: *const @This() = @ptrCast(@alignCast(context orelse return true));
+        self.owner.check() catch return true;
         return platform_time.monotonicNs() >= self.deadline_ns;
     }
 
+    pub fn classifyError(self: *const @This(), err: anyerror) anyerror {
+        if ((err == error.Canceled or err == error.Cancelled) and platform_time.monotonicNs() >= self.deadline_ns)
+            return error.PdfRenderTimeout;
+        return err;
+    }
+
+    fn cancellationError(raw: ?*const anyopaque, err: anyerror) anyerror {
+        const self: *const @This() = @ptrCast(@alignCast(raw orelse return err));
+        return self.classifyError(err);
+    }
+
     pub fn probe(self: *const @This()) PdfCancellationProbe {
-        return .{ .context = self, .is_cancelled_fn = isCancelled };
+        return .{ .context = self, .is_cancelled_fn = isCancelled, .cancellation_error_fn = cancellationError };
     }
 };
 
@@ -3404,7 +3425,9 @@ fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []cons
 /// Stream text through a task-local read fork. The prepared session may be
 /// shared by render work and is never mutated with a consumer's text policy.
 pub fn extractPreparedPdfStreaming(alloc: Allocator, session: *PdfRenderSession, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, sink: UnitSink) !void {
-    var text_session = try PdfRenderSession.initFromPrepared(alloc, session, session.parsed.cancellationProbe());
+    const cancellation = session.parsed.cancellationProbe();
+    var text_session = PdfRenderSession.initFromPrepared(alloc, session, cancellation) catch |err|
+        return cancellation.classifyError(err);
     defer text_session.deinit();
     text_session.parsed.setTextExtractionPolicy(native_text.policy);
     return extractParsedPdfStreaming(alloc, &text_session.parsed, content_type, native_text, ocr_mode, sink);
@@ -3455,7 +3478,9 @@ pub const PdfPageTextCache = struct {
 };
 
 pub fn extractPreparedPdfStreamingWithTextCache(alloc: Allocator, session: *PdfRenderSession, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, sink: UnitSink, cache: ?PdfPageTextCache) !void {
-    var text_session = try PdfRenderSession.initFromPrepared(alloc, session, session.parsed.cancellationProbe());
+    const cancellation = session.parsed.cancellationProbe();
+    var text_session = PdfRenderSession.initFromPrepared(alloc, session, cancellation) catch |err|
+        return cancellation.classifyError(err);
     defer text_session.deinit();
     text_session.parsed.setTextExtractionPolicy(native_text.policy);
     return extractParsedPdfStreamingWithTextCache(alloc, &text_session.parsed, content_type, native_text, ocr_mode, sink, cache);
@@ -3463,7 +3488,9 @@ pub fn extractPreparedPdfStreamingWithTextCache(alloc: Allocator, session: *PdfR
 
 fn inspectPdfPageText(alloc: Allocator, parsed: *pdf.reader.Reader, page_num: usize, policy: NativeTextPolicy, cache: ?PdfPageTextCache) !PdfPageText {
     if (cache) |c| if (try c.load_fn(c.ptr, alloc, page_num)) |page| return page;
-    const candidate = try extractPdfPageTextBestEffort(alloc, parsed, page_num);
+    const cancellation = parsed.cancellationProbe();
+    const candidate = extractPdfPageTextBestEffort(alloc, parsed, page_num) catch |err|
+        return cancellation.classifyError(err);
     const analysis = candidate.analysis;
     defer {
         for (analysis.runs) |*run| run.deinit(alloc);
@@ -3477,11 +3504,19 @@ fn inspectPdfPageText(alloc: Allocator, parsed: *pdf.reader.Reader, page_num: us
         .native_text_diagnostics = nativeTextDiagnostics(policy, analysis, candidate.extraction_complete),
     };
     errdefer result.deinit(alloc);
-    result.text_regions = try extractPdfTextRegionsFromAnalysisAlloc(alloc, analysis.runs, analysis.semantic_spans, result.text, parsed.cancellationProbe());
-    result.text_blocks = try pdf.text_structure.blocksFromAnalysisAlloc(alloc, result.text, analysis.runs, analysis.semantic_spans, parsed.cancellationProbe());
-    const box = parsed.extractPageBox(page_num) catch null;
+    result.text_regions = extractPdfTextRegionsFromAnalysisAlloc(alloc, analysis.runs, analysis.semantic_spans, result.text, cancellation) catch |err|
+        return cancellation.classifyError(err);
+    result.text_blocks = pdf.text_structure.blocksFromAnalysisAlloc(alloc, result.text, analysis.runs, analysis.semantic_spans, cancellation) catch |err|
+        return cancellation.classifyError(err);
+    const box = parsed.extractPageBox(page_num) catch |err| switch (@as(anyerror, err)) {
+        error.Canceled, error.Cancelled => return cancellation.classifyError(err),
+        else => null,
+    };
     result.bbox = if (box) |b| .{ b.min_x, b.min_y, b.max_x, b.max_y } else null;
-    result.rotation = parsed.extractPageRotation(page_num) catch null;
+    result.rotation = parsed.extractPageRotation(page_num) catch |err| switch (@as(anyerror, err)) {
+        error.Canceled, error.Cancelled => return cancellation.classifyError(err),
+        else => null,
+    };
     if (cache) |c| try c.store_fn(c.ptr, page_num, result);
     return result;
 }
@@ -3491,7 +3526,7 @@ fn extractParsedPdfStreaming(alloc: Allocator, parsed: *pdf.reader.Reader, conte
 }
 
 fn extractParsedPdfStreamingWithTextCache(alloc: Allocator, parsed: *pdf.reader.Reader, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, sink: UnitSink, cache: ?PdfPageTextCache) !void {
-    const page_count = try parsed.pageCount();
+    const page_count = parsed.pageCount() catch |err| return parsed.cancellationProbe().classifyError(err);
     try sink.on_begin(sink.ptr, .{ .content_type = content_type, .route_type = "pdf" });
 
     var page_num: usize = 1;

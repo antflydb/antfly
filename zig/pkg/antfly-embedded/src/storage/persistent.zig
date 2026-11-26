@@ -2851,6 +2851,17 @@ pub const PersistentIndex = struct {
 
     pub const next_segment_id_key = meta_next_seg_id;
 
+    /// Inline writes of this process are between commit and install, so
+    /// `refreshFromTip` refuses until they land or are dropped.
+    pub fn inlinePublicationsPending(self: *const PersistentIndex) bool {
+        return self.inline_in_flight.load(.acquire) != 0 or self.inline_segments_pending.load(.acquire) != 0;
+    }
+
+    /// Whether `refreshFromTip` can ever succeed for this index.
+    pub fn refreshesFromTip(self: *const PersistentIndex) bool {
+        return self.versioned and self.main_store_owner == .native_catalog;
+    }
+
     /// Applies committed tombstones to this process's loaded copy of
     /// `seg_id` (a segment it has not loaded is refreshed from the file).
     pub fn applyCommittedDeletes(self: *PersistentIndex, seg_id: u64, local_ids: []const u32) void {
@@ -6640,7 +6651,9 @@ test "persistent merge replacement carries deletion bitmap across reopen" {
     }
 }
 
-const InlinePublicationTestSink = struct {
+/// An in-memory native catalog for tests: one scope, shared by every index
+/// opened on it, so a second index acts as another process.
+pub const InlinePublicationTestSink = struct {
     entries: std.ArrayListUnmanaged(native_catalog_backend.Entry) = .empty,
     allocator: Allocator,
 
@@ -6715,7 +6728,7 @@ const InlinePublicationTestSink = struct {
 
     /// Like Lite's sink, and resolves each commit's resolvers against these
     /// entries (the "file") as it applies them.
-    fn resolvingSink(self: *@This()) NativeCatalogSink {
+    pub fn resolvingSink(self: *@This()) NativeCatalogSink {
         return .{ .ptr = self, .submit = resolvingSubmit, .loadAllAlloc = loadAllAlloc, .loadOneAlloc = loadOneAlloc, .loadTipAlloc = loadTipAlloc, .resolves = true };
     }
 
@@ -6775,7 +6788,7 @@ const InlinePublicationTestSink = struct {
         return try out.toOwnedSlice(allocator);
     }
 
-    fn deinit(self: *@This(), allocator: Allocator) void {
+    pub fn deinit(self: *@This(), allocator: Allocator) void {
         for (self.entries.items) |e| {
             if (e.namespace) |n| allocator.free(n);
             allocator.free(e.key);

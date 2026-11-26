@@ -82,6 +82,15 @@ pub const PageRenderDiagnostics = struct {
 pub const CancellationProbe = struct {
     context: ?*const anyopaque = null,
     is_cancelled_fn: ?*const fn (?*const anyopaque) bool = null,
+    cancellation_error_fn: ?*const fn (?*const anyopaque, anyerror) anyerror = null,
+
+    /// At the operation boundary, recover the cause from the probe that
+    /// the lower-level decoder or renderer observed as a boolean.
+    pub fn classifyError(self: CancellationProbe, err: anyerror) anyerror {
+        if (err != error.Canceled and err != error.Cancelled) return err;
+        const classify = self.cancellation_error_fn orelse return err;
+        return classify(self.context, err);
+    }
 
     pub fn check(self: CancellationProbe) !void {
         if (self.is_cancelled_fn) |is_cancelled| if (is_cancelled(self.context)) return error.Canceled;

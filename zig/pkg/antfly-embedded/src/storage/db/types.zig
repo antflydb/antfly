@@ -5981,6 +5981,21 @@ pub const IndexTargetVisibility = struct {
     serving_set_effect: ServingSetEffect = .may_reduce,
 };
 
+/// Revision-bound scalar replacement changes the effect language even
+/// though it uses the existing batch envelope. A catalog with the new floor
+/// must pass the same all-member barrier before any opaque upload can use it.
+pub fn requiresScalarWindowRetirementProtocol(req: BatchRequest) bool {
+    const floor = @import("artifact_inventory.zig").scalar_window_retirement_protocol;
+    if (req.artifact_catalog) |catalog| if (catalog.binding.effect_protocol >= floor) return true;
+    if (req.artifact_publication) |publication| if (publication.execution_identity != null and publication.mutations.len > 1) return true;
+    if (req.online_source) |source| if (source == .admit) {
+        if (source.admit.artifact_catalog) |catalog| if (catalog.effect_protocol >= floor) return true;
+    };
+    if (req.merge_checkpoint) |checkpoint| if (checkpoint.page_source) |source| if (source.artifact_catalog) |catalog| if (catalog.effect_protocol >= floor) return true;
+    if (req.merge_page) |page| if (page.source.artifact_catalog) |catalog| if (catalog.effect_protocol >= floor) return true;
+    return false;
+}
+
 /// New dense envelopes use formerly reserved bits. Gate the complete transport
 /// before proposal, including fragmented uploads whose header is not visible.
 /// Legacy commands retain their original minimum and remain replayable.

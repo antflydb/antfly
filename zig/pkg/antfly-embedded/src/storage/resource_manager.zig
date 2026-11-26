@@ -3938,6 +3938,7 @@ pub const BudgetedAllocator = struct {
     budget_denied: bool = false,
     denial_generation: u64 = 0,
     reclaim_on_denial: bool = false,
+    local_reclaimer: ?struct { context: *anyopaque, reclaim: ReclaimerFn } = null,
     reclaim_deficit: u64 = 0,
     last_allocation_failure: ?AllocationFailure = null,
     reservation_floor: u64 = 0,
@@ -4045,7 +4046,7 @@ pub const BudgetedAllocator = struct {
             self.recordAllocationFailure(.admission, bytes, @returnAddress());
             const deficit = self.reclaim_deficit;
             self.allocator_mutex.unlock();
-            if (attempt == 1 or !self.reclaim_on_denial or deficit == 0 or self.reservation.manager.reclaimForAllocation(self.reservation.slice, deficit) == 0)
+            if (attempt == 1 or !self.reclaim_on_denial or deficit == 0 or !self.reclaimAllocation(deficit))
                 return error.ResourceBudgetExceeded;
         }
         unreachable;
@@ -4118,6 +4119,23 @@ pub const BudgetedAllocator = struct {
         var self = init(manager, slice, backing, max_hard_limit_multiple);
         self.reclaim_on_denial = true;
         return self;
+    }
+
+    /// Limit retries to an owner-local, storage-independent cache. The
+    /// callback may run under the caller's storage snapshot.
+    pub fn withLocalReclaimer(self: BudgetedAllocator, context: *anyopaque, reclaim: ReclaimerFn) BudgetedAllocator {
+        var result = self;
+        std.debug.assert(result.reservation.identity == 0);
+        result.reclaim_on_denial = true;
+        result.local_reclaimer = .{ .context = context, .reclaim = reclaim };
+        return result;
+    }
+
+    fn reclaimAllocation(self: *BudgetedAllocator, deficit: u64) bool {
+        return if (self.local_reclaimer) |local|
+            local.reclaim(local.context, deficit) != 0
+        else
+            self.reservation.manager.reclaimForAllocation(self.reservation.slice, deficit) != 0;
     }
 
     pub fn deinit(self: *BudgetedAllocator) void {
@@ -4213,7 +4231,7 @@ pub const BudgetedAllocator = struct {
             const reclaim = ptr == null and self.reclaim_on_denial and self.denial_generation != generation;
             break :block .{ .result = result, .deficit = if (reclaim) self.reclaim_deficit else 0 };
         };
-        if (attempt.deficit == 0 or self.reservation.manager.reclaimForAllocation(self.reservation.slice, attempt.deficit) == 0) return attempt.result;
+        if (attempt.deficit == 0 or !self.reclaimAllocation(attempt.deficit)) return attempt.result;
         allocator_residency.Guard.enter(&self.allocator_mutex);
         defer allocator_residency.Guard.leave();
         lockAtomic(&self.allocator_mutex);
@@ -4234,7 +4252,7 @@ pub const BudgetedAllocator = struct {
             const reclaim = !result and self.reclaim_on_denial and self.denial_generation != generation;
             break :block .{ .result = result, .deficit = if (reclaim) self.reclaim_deficit else 0 };
         };
-        if (attempt.deficit == 0 or self.reservation.manager.reclaimForAllocation(self.reservation.slice, attempt.deficit) == 0) return attempt.result;
+        if (attempt.deficit == 0 or !self.reclaimAllocation(attempt.deficit)) return attempt.result;
         allocator_residency.Guard.enter(&self.allocator_mutex);
         defer allocator_residency.Guard.leave();
         lockAtomic(&self.allocator_mutex);
@@ -4254,7 +4272,7 @@ pub const BudgetedAllocator = struct {
             const reclaim = result == null and self.reclaim_on_denial and self.denial_generation != generation;
             break :block .{ .result = result, .deficit = if (reclaim) self.reclaim_deficit else 0 };
         };
-        if (attempt.deficit == 0 or self.reservation.manager.reclaimForAllocation(self.reservation.slice, attempt.deficit) == 0) return attempt.result;
+        if (attempt.deficit == 0 or !self.reclaimAllocation(attempt.deficit)) return attempt.result;
         allocator_residency.Guard.enter(&self.allocator_mutex);
         defer allocator_residency.Guard.leave();
         lockAtomic(&self.allocator_mutex);
@@ -4392,7 +4410,7 @@ pub const BudgetedAllocator = struct {
                 // growReservationAmortized has released the accounting lock.
                 // Ask only for the actual deficit, not amortized spare credit.
                 if (!allow_reclaim or !self.reclaim_on_denial or err != error.ResourceBudgetExceeded or
-                    self.reservation.manager.reclaimForAllocation(self.reservation.slice, minimum) == 0)
+                    !self.reclaimAllocation(minimum))
                 {
                     self.recordDenial();
                     return false;

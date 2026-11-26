@@ -129,8 +129,11 @@ pub const Proof = struct {
 
     /// Proofs that may name an execution identity: index vectors (the
     /// deployed model revision) and enrichment assets built from context
-    /// sources (the rendered context), each one effect for one source.
+    /// sources (the rendered context). A revision-bound chunk vector set
+    /// can publish or retire the windows of one consumer and parent.
     fn executionBound(self: Proof) bool {
+        if (self.effects.len > 1)
+            return self.producer_kind == .index and publication.isRevisionBoundChunkVectorSet(self.producer_scope_key, self.producer_artifact_name, self.effects);
         if (self.effects.len != 1) return false;
         return switch (self.producer_kind) {
             .index => (self.producer_scope_key.len != 0 or self.sources.len == 1) and
@@ -152,7 +155,7 @@ pub const Proof = struct {
             (effect.value_digest == null and effect.value_bytes != 0)) return error.ArtifactCatalogCorrupt;
         if (self.origin) |origin| {
             if (!origin.binding.valid() or origin.binding.effect_protocol < 15 or
-                (self.execution_identity != null and origin.binding.effect_protocol < @as(u16, if (self.producer_scope_key.len == 0) 17 else 18)) or
+                (self.execution_identity != null and origin.binding.effect_protocol < publication.executionIdentityEffectProtocol(self.producer_scope_key, self.effects.len)) or
                 std.mem.allEqual(u8, &origin.source_pin, 0) or std.mem.allEqual(u8, &origin.binding.digest, 0) or
                 std.mem.allEqual(u8, &origin.proof_checksum, 0) or self.mutation_preconditions.len != 0 or
                 origin.selected_bitmap.len != (self.sources.len + 7) / 8) return error.ArtifactCatalogCorrupt;

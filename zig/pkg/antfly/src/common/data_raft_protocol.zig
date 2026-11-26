@@ -66,7 +66,9 @@ pub const batch_merge_cutover_receipt_protocol_version: u16 = 74;
 /// change notices, and content outbox acknowledgements
 /// (`_context_dependency`). Older peers cannot apply them as empty batches.
 pub const batch_context_dependency_protocol_version: u16 = 75;
-pub const batch_protocol_version: u16 = batch_context_dependency_protocol_version;
+/// An all-member barrier for revision-bound scalar and window retirement.
+pub const batch_scalar_window_retirement_protocol_version: u16 = 76;
+pub const batch_protocol_version: u16 = batch_scalar_window_retirement_protocol_version;
 pub const maximum_decodable_batch_protocol_version: u16 = batch_protocol_version;
 pub const batch_split_origin_enrollment_protocol_version: u16 = 54;
 pub const batch_split_history_seed_protocol_version: u16 = 53;

@@ -144,6 +144,7 @@ pub fn chunkTextWithConfigJsonAndProvider(
         // Minimal owners may borrow an explicitly supplied text executor.
         // Remote sockets and model/media execution remain unavailable here.
         if (cfg.provider == .antfly and !cfg.isModelAware() and linked and std.mem.trim(u8, cfg.api_url, " \t\r\n").len == 0) {
+            try provider.admitLinkedInput();
             const ptr = provider.ptr orelse return error.InvalidChunkProvider;
             const dispatch = provider.boundary_dispatch orelse return error.InvalidChunkProvider;
             const io = provider.execution.io orelse if (@import("builtin").os.tag == .freestanding or @import("builtin").os.tag == .wasi)

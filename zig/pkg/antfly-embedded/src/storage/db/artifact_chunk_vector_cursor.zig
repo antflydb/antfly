@@ -43,6 +43,9 @@ pub fn Cursor(comptime Txn: type) type {
         output: ?[]u8 = null,
         output_entry: ?@import("../backend_erased.zig").Entry = null,
         started: bool = false,
+        capture_window_hints: bool = false,
+        output_has_windows: bool = false,
+        member_has_windows: bool = false,
         result: ?[]u8 = null,
         logical_resume: ?[]u8 = null,
 
@@ -53,6 +56,11 @@ pub fn Cursor(comptime Txn: type) type {
             errdefer outputs.close();
             const prefix = try keys.artifactNamedPrefixAlloc(alloc, document, "chunk", producer);
             return .{ .alloc = alloc, .chunks = chunks, .outputs = outputs, .prefix = prefix, .embedding = embedding };
+        }
+
+        pub fn enableWindowHints(self: *Self) void {
+            self.capture_window_hints = true;
+            self.outputs.setKeysOnly();
         }
 
         pub fn close(self: *Self) void {
@@ -153,12 +161,15 @@ pub fn Cursor(comptime Txn: type) type {
                 if (keys.isDerivedEmbeddingArtifactKey(row.key) and keys.matchesDerivedEmbeddingArtifactName(row.key, self.embedding)) {
                     const base = (try keys.derivedEmbeddingBaseKeyAlloc(self.alloc, row.key)).?;
                     defer self.alloc.free(base);
-                    self.output = try self.alloc.dupe(u8, keys.mediaWindowParent(base));
+                    const parent = keys.mediaWindowParent(base);
+                    self.output = try self.alloc.dupe(u8, parent);
+                    self.output_has_windows = self.capture_window_hints and parent.len != base.len;
                 }
                 self.output_entry = try self.outputs.next();
             }
             if (self.chunk == null and self.output == null) return .end;
             const order = if (self.chunk == null) std.math.Order.gt else if (self.output == null) std.math.Order.lt else std.mem.order(u8, self.chunk.?, self.output.?);
+            self.member_has_windows = order != .lt and self.output_has_windows;
             if (order != .gt) {
                 self.result = self.chunk;
                 self.chunk = null;
@@ -166,23 +177,101 @@ pub fn Cursor(comptime Txn: type) type {
                     self.alloc.free(self.output.?);
                     self.output = null;
                 }
-                if (self.output_entry) |row| if (std.mem.startsWith(u8, row.key, self.result.?)) {
-                    const upper = try keys.nextPrefixAlloc(self.alloc, self.result.?);
-                    defer if (upper) |value| self.alloc.free(value);
-                    self.output_entry = if (upper) |value| try self.outputs.seekAtOrAfter(value) else null;
-                };
             } else {
                 self.result = self.output;
                 self.output = null;
             }
-            if (self.output_entry) |row| if (std.mem.startsWith(u8, row.key, self.result.?)) {
-                const upper = try keys.nextPrefixAlloc(self.alloc, self.result.?);
+            const member = self.result.?;
+            // Use the existing ordered output scan to prove absence. Most
+            // text members have at most their scalar row to step over.
+            var visits: usize = 0;
+            while (self.output_entry) |row| {
+                if (!std.mem.startsWith(u8, row.key, member)) break;
+                if (self.capture_window_hints) {
+                    // A selected member must still advance when its budget
+                    // expires. Unknown is conservative: the caller will
+                    // capture the exact child set if this member needs a write.
+                    if (!budget.exhausted() and !self.member_has_windows) {
+                        budget.visit(row.key.len);
+                        const window = row.key.len > member.len and row.key[member.len] == keys.media_window_kind;
+                        self.member_has_windows = window;
+                        visits += 1;
+                        if (!window and visits < 3) {
+                            self.output_entry = try self.outputs.next();
+                            continue;
+                        }
+                        if (!window and row.key.len > member.len and row.key[member.len] < keys.media_window_kind) {
+                            if (!budget.exhausted()) {
+                                const lower = try keys.mediaWindowChildKeyAlloc(self.alloc, member, 0);
+                                defer self.alloc.free(lower);
+                                const found = try self.outputs.seekAtOrAfter(lower);
+                                budget.visit(if (found) |value| value.key.len else lower.len);
+                                self.member_has_windows = if (found) |value| std.mem.startsWith(u8, value.key, lower[0 .. lower.len - @sizeOf(u32)]) else false;
+                                if (!self.member_has_windows) {
+                                    self.output_entry = found;
+                                    break;
+                                }
+                            } else self.member_has_windows = true;
+                        }
+                    } else self.member_has_windows = true;
+                }
+                const upper = try keys.nextPrefixAlloc(self.alloc, member);
                 defer if (upper) |value| self.alloc.free(value);
                 self.output_entry = if (upper) |value| try self.outputs.seekAtOrAfter(value) else null;
-            };
+                if (self.capture_window_hints) budget.visit(if (self.output_entry) |value| value.key.len else member.len);
+                break;
+            }
             budget.visits +|= 1;
             budget.bytes +|= self.result.?.len;
             return .{ .member = self.result.? };
         }
     };
+}
+
+test "model aware media window hint lookahead charges its budget and still advances" {
+    const a = std.testing.allocator;
+    const backend_erased = @import("../backend_erased.zig");
+    var backend = @import("../mem_backend.zig").Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "window-hint-budget" });
+    defer store.deinit();
+    var erased = try backend_erased.storeFrom(a, store);
+    defer erased.deinit();
+    const member = try keys.chunkArtifactKeyAlloc(a, "doc", "text", 0);
+    defer a.free(member);
+    const scalar = try keys.derivedEmbeddingArtifactKeyAlloc(a, member, "model");
+    defer a.free(scalar);
+    {
+        var write = try erased.beginWrite();
+        errdefer write.abort();
+        try write.put(member, "{\"body\":\"text\"}");
+        try write.put(scalar, "vector");
+        try write.commit();
+    }
+    var read = try erased.beginRead();
+    defer read.abort();
+    var borrowed: logical.BorrowedRead = .{ .read = &read };
+    const C = Cursor(logical.BorrowedRead);
+    var plain = try C.open(a, &borrowed, "doc", "text", "model");
+    defer plain.close();
+    var hinted = try C.open(a, &borrowed, "doc", "text", "model");
+    defer hinted.close();
+    hinted.enableWindowHints();
+    var plain_budget: Budget = .{};
+    var budget: Budget = .{};
+    try std.testing.expectEqualStrings(member, (try plain.poll(&plain_budget)).member);
+    try std.testing.expectEqualStrings(member, (try hinted.poll(&budget)).member);
+    try std.testing.expect(!hinted.member_has_windows);
+    try std.testing.expectEqual(plain_budget.visits + 2, budget.visits);
+    try std.testing.expectEqual(plain_budget.bytes + member.len + scalar.len, budget.bytes);
+
+    var limited = try C.open(a, &borrowed, "doc", "text", "model");
+    defer limited.close();
+    limited.enableWindowHints();
+    budget = .{ .max_visits = 1, .max_bytes = 1 };
+    try std.testing.expectEqualStrings(member, (try limited.poll(&budget)).member);
+    try std.testing.expect(limited.member_has_windows); // Exact child capture is required when lookahead cannot certify absence.
+    try std.testing.expectEqual(@as(usize, 3), budget.visits); // Logical member, mandatory advance, returned member.
+    budget = .{};
+    try std.testing.expect((try limited.poll(&budget)) == .end);
 }
