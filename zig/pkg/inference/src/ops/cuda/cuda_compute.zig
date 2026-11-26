@@ -15093,6 +15093,13 @@ fn beginI32ScalarDownloadOp(ctx: *anyopaque, tensor: CT) anyerror!?ops.PendingI3
             };
         }
 
+        // A copy or event failure can leave either stream using unpublished
+        // slot storage. Settle both streams before returning to the caller.
+        errdefer {
+            self.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
+            self.ctx.driver.check(self.ctx.synchronizeStreamResult(self.async_i32_scalar_download.copy_stream)) catch
+                platform.inference_process_supervisor.restartWorker();
+        }
         try self.async_i32_scalar_download.staging.copyFromDevice(&self.ctx, logical_buffer, byte_len);
         self.stats.d2d_bytes += byte_len;
         try self.ctx.recordEvent(self.async_i32_scalar_download.ready_event);
@@ -15105,6 +15112,7 @@ fn beginI32ScalarDownloadOp(ctx: *anyopaque, tensor: CT) anyerror!?ops.PendingI3
         break :staged;
     }
     if (!staged_download_started) {
+        errdefer self.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
         try logical_buffer.copyToHost(&self.ctx, slot);
         try self.ctx.recordEvent(self.async_i32_scalar_download.event);
         self.stats.d2h_bytes += byte_len;

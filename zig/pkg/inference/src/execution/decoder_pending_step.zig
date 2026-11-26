@@ -157,7 +157,10 @@ pub const Readback = struct {
         if (self.pending) |pending| {
             const backend = self.context.backend;
             if (backend.vtable.drainI32ScalarDownload != null) {
-                self.observation.call(backend, .drain, .driver_await_returned, drainReadback, .{ backend, pending }) catch {};
+                // A failed fence leaves the provider's pinned scalar slot
+                // in use. Releasing the request cannot make it reusable.
+                self.observation.call(backend, .drain, .driver_await_returned, drainReadback, .{ backend, pending }) catch
+                    @import("antfly_platform").inference_process_supervisor.restartWorker();
             } else {
                 self.observation.call(backend, .cancel, .unavailable, cancelReadback, .{ backend, pending }) catch {};
             }
