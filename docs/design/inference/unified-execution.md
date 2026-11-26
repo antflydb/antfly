@@ -1610,6 +1610,20 @@ Native. DECIDE passed, with p50 594.79 → 610.92 ms and p95
 86.16 → 87.09 ms. Its main control drifted 7.98% at p50, so the
 reversal of the initial median increase remains inconclusive.
 
+The isolated LightOnOCR repeat also matched all frozen outputs and all
+12 Native backend receipts. Its 40 warm samples per binary and mode
+gave p50 11,389.27 → 11,339.78 ms and p95 12,208.70 → 11,876.24 ms.
+The main control drifted 25.03% at p50, leaving the latency gate
+inconclusive despite the lower candidate medians.
+
+On Spark GB10 at `1a509ebfa1`, seven focused CUDA and workspace
+fixtures passed on the default loader path. The BF16 source-audio
+fixture skipped there. A repeat with the identical compiled test
+binary and pinned cuDNN 9.19 CUDA 13 library passed it without skips,
+including learning, cancellation, capture, replay, and held-output
+checks. This establishes the observed recipe path's correctness
+at that revision. Declared production recipe coverage remains open.
+
 The default library path selected EmbeddingGemma2's F32 audio fallback.
 The previous reference used the source BF16 recipe with cuDNN 9.19.
 On frozen main, the same text request returned all 768 coordinates
