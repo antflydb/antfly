@@ -648,12 +648,12 @@ pub const ModelOutput = struct {
     pub fn greedyTokenSuppressWithCleanup(self: *ModelOutput, allocator: std.mem.Allocator, vocab_size: usize, suppressed: []const i32, cleanup_context: CleanupContext) !i64 {
         if (suppressed.len == 0) return self.greedyTokenWithCleanup(allocator, vocab_size, cleanup_context);
         if (vocab_size == 0) return error.InvalidModelOutput;
+        // The capped f32 values can tie even when the raw logits differ.
         if (self.prepared_tail) |tail| {
             if (tail.greedy_token_id) |id| {
-                if (id >= 0 and id < vocab_size and !tokenIsSuppressed(id, suppressed)) return id;
+                if (tail.final_logit_softcap <= 0 and id >= 0 and id < vocab_size and !tokenIsSuppressed(id, suppressed)) return id;
             }
         }
-        // The capped f32 values can tie even when the raw logits differ.
         if (self.final_logit_softcap <= 0) if (self.device_logits) |logits| {
             const backend = self.device_logits_backend orelse return error.InvalidModelOutput;
             if (try backend.argmaxLastRowSuppressTensor(logits, 1, vocab_size, suppressed)) |token| {
@@ -908,10 +908,15 @@ test "suppressed Metal-style greedy output honors f32 softcap ties" {
             const owner: *native.NativeCompute = @ptrCast(@alignCast(ctx));
             return try owner.computeBackend().fromFloat32Shape(&.{1}, &.{1});
         }
+        fn preparedLogits(ctx: *anyopaque, _: *const ops.DecoderRuntimeApplyRmsNormLinearRequest) !?ops.CT {
+            const owner: *native.NativeCompute = @ptrCast(@alignCast(ctx));
+            return try owner.computeBackend().fromFloat32Shape(&.{ 100, 101, 102 }, &.{ 1, 3 });
+        }
     };
     var backend = compute.computeBackend();
     var vtable = backend.vtable.*;
     vtable.argmaxLastRowSuppressTensor = Probe.rawArgmax;
+    vtable.regions.decoder.applyRmsNormLinear = Probe.preparedLogits;
     backend.vtable = &vtable;
     for ([_]f32{ 0, 1 }) |cap| {
         var output = ModelOutput{
@@ -921,6 +926,21 @@ test "suppressed Metal-style greedy output honors f32 softcap ties" {
         };
         defer output.deinit(a);
         try std.testing.expectEqual(@as(i64, if (cap == 0) 1 else 0), try output.greedyTokenSuppress(a, 3, &.{2}));
+
+        var prepared = ModelOutput{ .prepared_tail = .{
+            .final_hidden = try backend.fromFloat32Shape(&.{1}, &.{ 1, 1 }),
+            .backend = backend,
+            .norm = .rms,
+            .norm_slot = 0,
+            .lm_head_slot = 0,
+            .hidden_size = 1,
+            .vocab_size = 3,
+            .eps = 1e-5,
+            .final_logit_softcap = cap,
+            .greedy_token_id = 1,
+        } };
+        defer prepared.deinit(a);
+        try std.testing.expectEqual(@as(i64, if (cap == 0) 1 else 0), try prepared.greedyTokenSuppress(a, 3, &.{2}));
     }
 }
 

@@ -3211,10 +3211,20 @@ pub fn forwardE2bSharedKvSuffix(
     defer freeTensorWithCleanup(cb, last_ple, overrides.cleanup);
     var hidden = try cb.sliceRows2D(allocator, donor_hidden, last_row, 1, config.hidden_size);
     errdefer freeTensorWithCleanup(cb, hidden, overrides.cleanup);
+    // Donor KV is already published. Record the read-only suffix separately
+    // so its projections and attention can share a submission.
+    var owns_frame = try cb.decoderRuntimeBeginFrame();
+    defer if (owns_frame) cb.decoderRuntimeCancelFrame() catch {};
+    if (owns_frame) try cb.decoderRuntimeSetActiveFrameRegime(.prefill);
     for (donor_layers..config.num_hidden_layers) |layer| {
+        try cb.checkExecutionControl();
         const next = try decoderBlock(cb, allocator, config, hidden, 1, context.total_sequence_len, config.effectiveKVHeadsForLayer(layer), config.effectiveHeadDimForLayer(layer), layer, &decode, last_ple, overrides, null, null, null, null, null, null);
         if (next != hidden) freeTensorWithCleanup(cb, hidden, overrides.cleanup);
         hidden = next;
+    }
+    if (owns_frame) {
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        owns_frame = false;
     }
     return hidden;
 }

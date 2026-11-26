@@ -6832,7 +6832,8 @@ fn forwardPrefillPreparedTail(
         timing_stats.prefill_frame_finish_nanos += frame_finish_finished_at - frame_finish_started_at;
     }
     var greedy_token_id: ?i64 = null;
-    if (options.prefer_greedy_token) {
+    const suppressed = gpt_config.suppressTokenIds();
+    if (options.prefer_greedy_token and (gpt_config.final_logit_softcapping <= 0 or suppressed.len == 0)) {
         if (try cb.decoderRuntimeApplyRmsNormLinearArgmax(&.{
             .input = last_hidden,
             .norm_slot = finalNormSlot(configured_layer_count),
@@ -6840,7 +6841,7 @@ fn forwardPrefillPreparedTail(
             .hidden_size = gpt_config.hidden_size,
             .eps = gpt_config.norm_eps,
             .out_dim = gpt_config.vocab_size,
-            .suppress_token_ids = gpt_config.suppressTokenIds(),
+            .suppress_token_ids = suppressed,
         })) |token_id| {
             greedy_token_id = @intCast(token_id);
         }
