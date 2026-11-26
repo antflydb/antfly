@@ -1089,6 +1089,14 @@ each prefill phase, so the bounded diagnostics queue can retain its counts
 even when the request needs hundreds of chunks. These counts exclude the
 last prompt token handled by the first decode step.
 
+The same binary served two exact 32,768-token streams and returned `271`
+in both cases. Text committed 32,767 prefill tokens in 2,048 chunks and
+reached first content in 383.01 s including cold load. The warm image
+request reached first content in 345.67 s and committed 32,767 tokens in
+2,050 chunks, including the projected image rows. Both streams emitted
+periodic keepalives before content and returned final usage and `[DONE]`.
+These single requests establish correctness at this depth on Spark.
+
 ### Official Gemma 4 E2B QAT serving comparison
 
 The decoder and projector came from Google's E2B QAT Q4_0 GGUF revision
