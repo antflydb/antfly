@@ -8865,6 +8865,16 @@ test "capi native idle redo fold waits for a foreground write in flight" {
 }
 
 test "capi native full-text index dropped and never recreated leaves no records in the database file" {
+    try testDropFullTextIndex(false);
+}
+
+// The records go while the root pointer can still name the active
+// generation; an interrupted cleanup finishes on its next attempt.
+test "capi native full-text index drop interrupted after its records finishes on retry" {
+    try testDropFullTextIndex(true);
+}
+
+fn testDropFullTextIndex(interrupt_finalization: bool) !void {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     const a = std.testing.allocator;
     const io = h.handleLockIo();
@@ -8905,8 +8915,21 @@ test "capi native full-text index dropped and never recreated leaves no records 
     var deleted = false;
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_delete_index(id, .fromSlice("dropped_text"), &deleted));
     try std.testing.expect(deleted);
+    if (interrupt_finalization) {
+        // Stopped after the records went and before the directories, where
+        // a crash would leave the cleanup to a later attempt.
+        const index_manager = @import("../storage/db/catalog/index_manager.zig");
+        index_manager.IndexManager.test_interrupt_retired_storage_finalization = error.TestInterruptedFinalization;
+        defer index_manager.IndexManager.test_interrupt_retired_storage_finalization = null;
+        _ = api.antfly_db_run_until_idle(id);
+        try std.testing.expectEqual(@as(usize, 0), try Records.count(connection));
+    }
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(id));
     try std.testing.expectEqual(@as(usize, 0), try Records.count(connection));
+    // The cleanup finished: the name is free again.
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(
+        "{\"name\":\"dropped_text\",\"kind\":\"full_text\",\"config_json\":\"{}\"}",
+    )));
 }
 
 test "capi native full-text index recreated under its old name starts empty and indexes new writes" {

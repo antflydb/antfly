@@ -8320,7 +8320,9 @@ pub const DB = struct {
             notifyExecutorForSyncLevelWithDenseBulkDeferral(self.async_context, self.executor, level, sequence, continuation.targets);
             if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
             self.notifyResolverReplayRuntimes(sequence);
-            try self.waitForSyncLevelWithCancellation(level, sequence, continuation.targets, .none, continuation.enrichment_fully_precomputed);
+            var targets = continuation.targets;
+            targets.leann_cut = continuation.leann_cut;
+            try self.waitForSyncLevelWithCancellation(level, sequence, targets, .none, continuation.enrichment_fully_precomputed);
         }
         try self.finishBatchGraphEndpointCleanup(req, .{});
     }
@@ -46836,7 +46838,7 @@ pub const DB = struct {
                     try self.drainScheduledTextMerges();
                     try wait.check();
                 }
-                try self.waitForLeannGraphCoverage(wait);
+                try self.waitForLeannGraphCoverage(sync_targets.leann_cut, wait);
             },
         }
     }
@@ -46846,9 +46848,11 @@ pub const DB = struct {
     /// written vectors are searchable, so wait for those records too. Never
     /// called from Raft apply (`wait_for_sync_level` is off there), which
     /// would block the entries this waits for.
-    fn waitForLeannGraphCoverage(self: *DB, wait: derived_executor_mod.VisibilityWait) !void {
-        const targets = try self.core.index_manager.captureLeannCoverageTargets(self.alloc);
-        defer index_manager_mod.IndexManager.freeLeannCoverageTargets(self.alloc, targets);
+    /// `cut`, when given, holds the positions the write owes instead.
+    fn waitForLeannGraphCoverage(self: *DB, cut: ?[]const index_manager_mod.IndexManager.LeannCoverageTarget, wait: derived_executor_mod.VisibilityWait) !void {
+        const captured: []index_manager_mod.IndexManager.LeannCoverageTarget = if (cut == null) try self.core.index_manager.captureLeannCoverageTargets(self.alloc) else &.{};
+        defer if (cut == null) index_manager_mod.IndexManager.freeLeannCoverageTargets(self.alloc, captured);
+        const targets = cut orelse captured;
         if (targets.len == 0) return;
         const io = self.backend_runtime.controlIo() orelse self.backend_runtime.io() orelse return error.BackendRuntimeIoUnavailable;
         while (!self.core.index_manager.leannCoverageReached(targets)) {

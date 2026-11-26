@@ -4569,6 +4569,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const commit_participant = if (generated_acceptance) |*acceptance| acceptance.participant() else if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null;
 
             if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+            // What a replacement runtime must still match for this write to
+            // finish there (`ReplacementContinuation`), taken while its
+            // admission owns the catalog and before it commits, so nothing
+            // after the commit can fail on it.
+            const continuation_possible = opts.writer_lane_release_before_wait != null and opts.wait_for_sync_level and
+                (effective_req.sync_level == .enrichments or effective_req.sync_level == .full_index);
+            const admitted_obligation_digest: ?u64 = if (continuation_possible)
+                try S.ownerField(self, "core").*.index_manager.visibilityObligationDigest()
+            else
+                null;
+            const leann_cut: []index_manager_mod.IndexManager.LeannCoverageTarget = if (continuation_possible)
+                try S.ownerField(self, "core").*.index_manager.prepareLeannCoverageCut(S.ownerField(self, "alloc").*)
+            else
+                &.{};
+            defer if (leann_cut.len != 0) index_manager_mod.IndexManager.freeLeannCoverageTargets(S.ownerField(self, "alloc").*, leann_cut);
             if (comptime @import("builtin").is_test) if (test_before_primary_commit) |hook| {
                 test_before_primary_commit = null;
                 try hook.run(hook.ptr);
@@ -4777,6 +4792,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if ((primary_ticket != null or txn_ticket != null) and !commits_after_wait) {
                 if (opts.writer_lane_release_before_wait) |hook| hook.release(hook.ptr);
             }
+            // This write's LEANN positions, before the lane lets another write
+            // move them.
+            S.ownerField(self, "core").*.index_manager.fillLeannCoverageCut(leann_cut);
             var indexed_lane_yielded = false;
             if (primary_ticket != null and (inline_text_publication_count != 0 or inline_graph_publication != null or
                 inline_sparse_publication != null or inline_dense_publication != null))
@@ -4953,10 +4971,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .enrichment_fully_precomputed = enrichment_fully_precomputed,
                     .refresh_identity_visibility = queued_index_publication and pending_identity_visibility_summary != null,
                     .targets = sync_targets,
-                    .obligation_digest = if (opts.wait_for_sync_level and (effective_req.sync_level == .enrichments or effective_req.sync_level == .full_index))
-                        try S.ownerField(self, "core").*.index_manager.visibilityObligationDigest()
-                    else
-                        null,
+                    .obligation_digest = admitted_obligation_digest,
+                    .leann_cut = leann_cut,
                 };
                 const continuation = if (execution_resources.replacementContinuationEligible(replacement_shape)) &replacement_continuation else null;
                 if (comptime @import("builtin").is_test) if (!finish_without_lane) if (execution_resources.test_before_indexed_resume) |test_hook|
