@@ -430,6 +430,9 @@ pub const TextPipeline = struct {
 };
 
 pub const ServingPipeline = struct {
+    /// Generation and continuation callbacks run on the HTTP writer's thread.
+    pub const serial_stream_checkpoints = true;
+
     resident: *Runtime,
     session: backends.Session,
     text: TextPipeline,

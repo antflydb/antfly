@@ -570,6 +570,12 @@ fn generationStreamShouldContinue(
     return true;
 }
 
+fn writeGenerationKeepaliveIfIdle(writer: anytype, last_write_ns: *u128, now_ns: u128) !void {
+    if (now_ns -| last_write_ns.* < 15 * std.time.ns_per_s) return;
+    try writer.write(": keep-alive\n\n");
+    last_write_ns.* = now_ns;
+}
+
 fn generationStreamWriteIsPeerDisconnect(err: anyerror) bool {
     return switch (err) {
         error.Canceled,
@@ -691,6 +697,32 @@ test "generation stream continuation observes writes and peer cancellation" {
     cancellation.store(true, .release);
     try std.testing.expect(!generationStreamShouldContinue(false, &cancellation));
     try std.testing.expect(!generationStreamShouldContinue(true, null));
+}
+
+test "generation SSE keepalive is emitted only after an idle interval" {
+    const Writer = struct {
+        events: usize = 0,
+        closed: bool = false,
+
+        fn write(self: *@This(), bytes: []const u8) !void {
+            if (self.closed) return error.StreamClosed;
+            try std.testing.expectEqualStrings(": keep-alive\n\n", bytes);
+            self.events += 1;
+        }
+    };
+    const second = std.time.ns_per_s;
+    var writer: Writer = .{};
+    var last: u128 = second;
+    try writeGenerationKeepaliveIfIdle(&writer, &last, 15 * second);
+    try std.testing.expectEqual(@as(usize, 0), writer.events);
+    try writeGenerationKeepaliveIfIdle(&writer, &last, 16 * second);
+    try std.testing.expectEqual(@as(usize, 1), writer.events);
+    try std.testing.expectEqual(@as(u128, 16 * second), last);
+    try writeGenerationKeepaliveIfIdle(&writer, &last, 17 * second);
+    try std.testing.expectEqual(@as(usize, 1), writer.events);
+    writer.closed = true;
+    try std.testing.expectError(error.StreamClosed, writeGenerationKeepaliveIfIdle(&writer, &last, 31 * second));
+    try std.testing.expectEqual(@as(u128, 16 * second), last);
 }
 
 test "generation stream write classification separates peer disconnects from server faults" {
@@ -22053,6 +22085,9 @@ pub const Node = struct {
         defer ctx.allocator.free(stream_id);
         const stream_created = completionCreatedTimestamp();
 
+        const Pipeline = @TypeOf(pipeline.*);
+        const can_write_keepalive = @hasDecl(Pipeline, "serial_stream_checkpoints") and Pipeline.serial_stream_checkpoints;
+
         // Context for the token callback — carries the writer and model name for building SSE events
         const StreamCtx = struct {
             writer: *httpx.Context.StreamWriter,
@@ -22068,6 +22103,7 @@ pub const Node = struct {
             first_content_recorded: bool = false,
             write_error: ?anyerror = null,
             parser_failed: bool = false,
+            last_write_ns: u128 = 0,
 
             fn noteContent(stream: *@This()) void {
                 if (stream.first_content_recorded) return;
@@ -22075,11 +22111,23 @@ pub const Node = struct {
                 stream.first_content_recorded = true;
             }
 
+            fn noteWrite(stream: *@This()) void {
+                if (comptime can_write_keepalive) stream.last_write_ns = embedTimingNowNs();
+            }
+
             fn shouldContinue(raw_ctx: *anyopaque) bool {
                 const stream: *@This() = @ptrCast(@alignCast(raw_ctx));
-                return stream.write_error == null and
-                    !stream.parser_failed and
-                    !stream.request_context.isCancellationRequested();
+                if (stream.write_error != null or stream.parser_failed or stream.request_context.isCancellationRequested())
+                    return false;
+                // Only a serial pipeline may write from its continuation callback.
+                // SSE comments keep the connection active without publishing a token.
+                if (comptime can_write_keepalive) {
+                    writeGenerationKeepaliveIfIdle(stream.writer, &stream.last_write_ns, embedTimingNowNs()) catch |err| {
+                        stream.write_error = err;
+                        return false;
+                    };
+                }
+                return true;
             }
 
             fn onReasoning(raw_ctx: *anyopaque, token_text: []const u8) bool {
@@ -22088,6 +22136,7 @@ pub const Node = struct {
                     stream.write_error = err;
                     return false;
                 };
+                stream.noteWrite();
                 return true;
             }
 
@@ -22108,6 +22157,7 @@ pub const Node = struct {
                             stream.write_error = err;
                             return false;
                         };
+                        stream.noteWrite();
                         stream.noteContent();
                     }
                     if (!parser.streamsIncrementalToolDeltas() and update.new_calls.len > 0) {
@@ -22116,6 +22166,7 @@ pub const Node = struct {
                                 stream.write_error = err;
                                 return false;
                             };
+                            stream.noteWrite();
                         }
                     }
                     if (update.active_tool_delta) |delta| {
@@ -22123,6 +22174,7 @@ pub const Node = struct {
                             stream.write_error = err;
                             return false;
                         };
+                        stream.noteWrite();
                     }
                     return true;
                 }
@@ -22131,6 +22183,7 @@ pub const Node = struct {
                     stream.write_error = err;
                     return false;
                 };
+                stream.noteWrite();
                 if (token_text.len > 0) stream.noteContent();
                 return true;
             }
@@ -22184,6 +22237,7 @@ pub const Node = struct {
             writer.close() catch {};
             return ctx.response.build();
         };
+        stream_ctx.noteWrite();
 
         // Snapshot CUDA op-profile counters before generation so the emitted
         // line below reflects this request alone. Mirrors the direct-generator
