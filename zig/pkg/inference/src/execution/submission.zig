@@ -30,10 +30,22 @@ pub const Scope = struct {
     }
 
     pub fn beginIfNeeded(backend: *const ops.ComputeBackend, needed: bool) !Scope {
+        return beginUsing(backend, needed, false);
+    }
+
+    /// The caller owns the preceding submission and will wait for it before
+    /// committing this frame. A foreign active encoder is never borrowed.
+    pub fn beginPipelined(backend: *const ops.ComputeBackend) !Scope {
+        const commands = backend.vtable.regions.commands;
+        if (commands.submitFrame == null or commands.waitSubmittedFrame == null) return .{ .backend = backend };
+        return beginUsing(backend, true, true);
+    }
+
+    fn beginUsing(backend: *const ops.ComputeBackend, needed: bool, allow_submitted: bool) !Scope {
         const commands = backend.vtable.regions.commands;
         const active = if (commands.hasActiveFrame) |f| f(backend.ptr) else false;
         const submitted = if (commands.hasSubmittedFrame) |f| f(backend.ptr) else false;
-        if (active or submitted) return .{ .backend = backend, .foreign = true };
+        if (active or (submitted and !allow_submitted)) return .{ .backend = backend, .foreign = true };
         if (!needed) return .{ .backend = backend };
         const begin_frame = commands.beginFrame orelse return .{ .backend = backend };
         if (commands.hasActiveFrame == null or commands.submitAndWaitFrame == null or commands.cancelFrame == null)
@@ -43,11 +55,20 @@ pub const Scope = struct {
 
     pub fn finish(self: *Scope) !void {
         if (!self.owns) return;
+        try self.finishUsing(self.backend.vtable.regions.commands.submitAndWaitFrame.?);
+    }
+
+    pub fn submit(self: *Scope) !void {
+        if (!self.owns) return;
+        try self.finishUsing(self.backend.vtable.regions.commands.submitFrame orelse return error.UnsupportedOperation);
+    }
+
+    fn finishUsing(self: *Scope, submit_frame: *const fn (*anyopaque) anyerror!void) !void {
         if (self.submit_attempted) return error.FrameSubmissionAlreadyAttempted;
         self.submit_attempted = true;
         self.owns = false;
         const commands = self.backend.vtable.regions.commands;
-        commands.submitAndWaitFrame.?(self.backend.ptr) catch |err| {
+        submit_frame(self.backend.ptr) catch |err| {
             // A failed submit can leave an unsubmitted encoding active.
             self.owns = commands.hasActiveFrame.?(self.backend.ptr);
             return err;
@@ -69,6 +90,7 @@ pub const Scope = struct {
 test "submission scopes preserve foreign batches unwind encoding and never replay after commit" {
     const Probe = struct {
         active: bool = false,
+        submitted: bool = false,
         decline: bool = false,
         fail_submit: bool = false,
         fail_before_commit: bool = false,
@@ -86,6 +108,14 @@ test "submission scopes preserve foreign batches unwind encoding and never repla
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.active;
         }
+        fn submittedFrame(ptr: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.submitted;
+        }
+        fn wait(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.submitted = false;
+        }
         fn submit(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.fail_before_commit) return error.SubmissionFailed;
@@ -101,7 +131,7 @@ test "submission scopes preserve foreign batches unwind encoding and never repla
     };
     var probe = Probe{};
     var table: ops.ComputeBackend.VTable = undefined;
-    table.regions = .{ .commands = .{ .beginFrame = Probe.begin, .hasActiveFrame = Probe.activeFrame, .submitAndWaitFrame = Probe.submit, .cancelFrame = Probe.cancel } };
+    table.regions = .{ .commands = .{ .beginFrame = Probe.begin, .hasActiveFrame = Probe.activeFrame, .submitAndWaitFrame = Probe.submit, .submitFrame = Probe.submit, .waitSubmittedFrame = Probe.wait, .hasSubmittedFrame = Probe.submittedFrame, .cancelFrame = Probe.cancel } };
     const backend = ops.ComputeBackend{ .ptr = &probe, .vtable = &table };
     var completed = try Scope.begin(&backend);
     try completed.finish();
@@ -146,4 +176,15 @@ test "submission scopes preserve foreign batches unwind encoding and never repla
     try std.testing.expect(!probe.active);
     try std.testing.expectEqual(@as(usize, 2), probe.commits);
     try std.testing.expectEqual(@as(usize, 2), probe.cancels);
+
+    probe.submitted = true;
+    const ordinary = try Scope.begin(&backend);
+    try std.testing.expect(ordinary.foreign and !ordinary.owns);
+    var pipelined = try Scope.beginPipelined(&backend);
+    defer pipelined.deinit();
+    try std.testing.expect(pipelined.owns and probe.submitted);
+    try Probe.wait(&probe);
+    try pipelined.submit();
+    try std.testing.expect(!pipelined.owns and !probe.active);
+    try std.testing.expectEqual(@as(usize, 3), probe.commits);
 }

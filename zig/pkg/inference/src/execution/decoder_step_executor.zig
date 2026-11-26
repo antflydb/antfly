@@ -492,7 +492,9 @@ pub const Executor = struct {
         try M.encodeLightOnBurstArgmax(self.context.cb, first_logits, claimed.len, self.context.gpt_config.vocab_size, self.context.gpt_config.suppressTokenIds());
         try self.context.cb.decoderRuntimeSubmitFrame();
         for (1..steps) |step| {
-            if (!try self.context.cb.decoderRuntimeBeginFrame()) return error.StreamedForwardFrameUnavailable;
+            var frame = try @import("submission.zig").Scope.beginPipelined(self.context.cb);
+            defer frame.deinit();
+            if (!frame.owns) return error.StreamedForwardFrameUnavailable;
             try self.context.cb.decoderRuntimeSetActiveFrameRegime(.decode);
             if (!try self.context.cb.decoderRuntimeBeginPlannedComputeScope()) return error.StreamedForwardFrameUnavailable;
             M.noteLightOnTokenEncoderScope(self.context.cb);
@@ -537,7 +539,7 @@ pub const Executor = struct {
             try M.readLightOnBurstTokens(self.context.cb, output_tokens);
             if (previous_hidden) |old| self.context.cb.free(old);
             previous_hidden = null;
-            try self.context.cb.decoderRuntimeSubmitFrame();
+            try frame.submit();
             previous_hidden = hidden.hidden;
             hidden_owned = false;
         }
