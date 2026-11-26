@@ -1273,6 +1273,30 @@ compute tests passed locally, and the browser wasm32 build succeeded.
 Released-model performance and replacement of the learned audio layout
 remain open.
 
+The Spark GB10 HTTP comparison used frozen main `20563ec50a` and candidate
+`9e6097c363`, the shared cached models, and Google's official E4B QAT
+Q4_0 GGUF with its projector. Each AA, AB, and BB phase used four arms,
+two warmups per arm, and six retained measurements per engine and case.
+All compared outputs matched exactly. The server logs verified CUDA
+selection for every model in every arm. Another CUDA context remained
+resident on the device.
+
+| Workload | Main p50 (ms) | Candidate p50 (ms) | Change | Largest same-binary median difference |
+| --- | ---: | ---: | ---: | ---: |
+| Whisper | 382.46 | 382.73 | +0.07% | 0.24% |
+| EmbeddingGemma2 | 9.07 | 9.01 | −0.68% | 4.39% |
+| LightOnOCR | 320.18 | 321.08 | +0.28% | 0.73% |
+| GLiNER2.5 | 12.83 | 13.32 | +3.87% | 1.63% |
+| DECIDE | 40.75 | 40.16 | −1.43% | 1.94% |
+| Qwen3 | 84.99 | 84.54 | −0.53% | 0.92% |
+| Gemma 4 E4B text | 221.81 | 224.57 | +1.24% | 0.70% |
+| Gemma 4 E4B image | 279.65 | 280.63 | +0.35% | 0.56% |
+| Gemma 4 E4B audio | 216.67 | 219.62 | +1.36% | 0.35% |
+| Gemma 4 E4B video | 254.58 | 256.78 | +0.87% | 0.42% |
+
+The GLiNER2.5 and Gemma 4 text, audio, and video increases exceed the
+observed controls in this cohort. Their higher-sample repeat is pending.
+
 At `3e6bcf05c5`, both physical GPU fixtures passed the incremental
 ONNX cache handoff and output-retirement regression. The shared role
 parser now drives declared geometry and retained quota for self and cross
