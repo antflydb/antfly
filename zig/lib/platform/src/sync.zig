@@ -61,6 +61,31 @@ pub const BroadcastCondition = struct {
         _ = self.epoch.fetchAdd(1, .release);
         io.futexWake(u32, &self.epoch.raw, self.waiters);
     }
+
+    /// Like `waitUncancelable`, but also returns once `timeout` elapses,
+    /// instead of parking indefinitely for a `broadcast` that might never
+    /// come. For a predicate loop whose own progress must never depend on
+    /// some *other* task existing to eventually satisfy it (e.g. a
+    /// ride-along commit ticket whose idle-flush driver might never run --
+    /// a spawned `concurrent()` task that failed to start, or an `Io` with
+    /// no real background concurrency at all) -- the caller bounds the wait
+    /// by its own idle window and, if its predicate is still unmet once
+    /// this returns, drives the outcome itself instead of waiting again
+    /// unconditionally. `std.Io.futexWaitTimeout` returns normally (not an
+    /// error) on a plain timeout, same as a real wake or a spurious one --
+    /// only genuine cancellation (`io`'s own shutdown) surfaces as
+    /// `error.Canceled`, same as every other bounded wait in this codebase.
+    pub fn waitTimeout(self: *BroadcastCondition, io: std.Io, mutex: *std.Io.Mutex, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+        const observed = self.epoch.load(.acquire);
+        std.debug.assert(self.waiters < std.math.maxInt(u32));
+        self.waiters += 1;
+        mutex.unlock(io);
+        defer {
+            mutex.lockUncancelable(io);
+            self.waiters -= 1;
+        }
+        try io.futexWaitTimeout(u32, &self.epoch.raw, observed, timeout);
+    }
 };
 
 /// Acquire `mutex` (any type exposing `tryLock`), spinning briefly and then

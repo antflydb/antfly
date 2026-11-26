@@ -214,6 +214,7 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
     // linked chunk callback. They still use the local direct chunker when no
     // remote endpoint resolves (for example while rebuilding a restore).
     if (resolved_endpoint == null and linked_callback_available) if (antfly_provider) |provider| {
+        if (!paged) try provider.admitLinkedInput();
         const ptr = provider.ptr orelse return error.InvalidChunkProvider;
         const dispatch = provider.boundary_dispatch orelse return error.InvalidChunkProvider;
         const io = execution.io orelse if (builtin.os.tag == .freestanding)

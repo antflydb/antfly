@@ -12734,6 +12734,8 @@ pub const DataServer = struct {
     pub fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
         if (req.commit_requires == .direct_enrichments or req.prepared_enrichments_json != null)
             return @import("../common/data_raft_protocol.zig").batch_prepared_enrichments_protocol_version;
+        if (antfly.db.types.requiresScalarWindowRetirementProtocol(req))
+            return @import("../common/data_raft_protocol.zig").batch_scalar_window_retirement_protocol_version;
         if (antfly.db.types.requiresDenseArtifactFlagsProtocol(req))
             return @import("../common/data_raft_protocol.zig").batch_dense_artifact_flags_protocol_version;
         if (req.graph_endpoint_cleanup) return @import("../common/data_raft_protocol.zig").batch_graph_cleanup_neutral_protocol_version;
@@ -58311,6 +58313,19 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "scalar window retirement ordered catalog requires the all-member protocol" {
+    const protocol = @import("../common/data_raft_protocol.zig");
+    const inventory = @import("antfly_local_sources").storage_db_artifact_inventory;
+    var request: antfly.db.types.BatchRequest = .{ .artifact_catalog = .{
+        .namespace = @splat(1),
+        .catalogs = .{},
+        .binding = .{ .epoch = 1, .digest = @splat(2), .semantic_digest = @splat(3), .effect_protocol = inventory.dense_artifact_flags_protocol },
+    } };
+    try std.testing.expectEqual(protocol.batch_dense_artifact_flags_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+    request.artifact_catalog.?.binding.effect_protocol = inventory.scalar_window_retirement_protocol;
+    try std.testing.expectEqual(protocol.batch_scalar_window_retirement_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
 }
 
 test "grouped source protocol dominates coexisting graph envelope features" {

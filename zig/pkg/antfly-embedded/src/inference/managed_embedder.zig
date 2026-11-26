@@ -1436,6 +1436,7 @@ pub const ManagedEmbedder = struct {
             .set_cancellation_fn = setEmbedderCancellation,
             .set_progress_fn = setEmbedderProgress,
             .cache_revision_fn = cacheRevision,
+            .cache_revision_from_model_fn = cacheRevisionFromModel,
             .recovery_identity_fn = recoveryIdentity,
             .foreground_bounded = self.denseForegroundBounded(),
         };
@@ -1814,7 +1815,10 @@ pub const ManagedEmbedder = struct {
             error.OutOfMemory => return err,
             else => return null,
         };
-        const model = capabilities.model_revision orelse return null;
+        return cacheRevisionFromModel(ptr, a, name, capabilities.model_revision orelse return null);
+    }
+
+    fn cacheRevisionFromModel(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8, model: [32]u8) !?[32]u8 {
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
         const entry = self.findArtifactEntry(name) orelse return error.EmbeddingIndexNotFound;
         const endpoint = managedEmbeddingEndpointIdentity(entry);
@@ -12445,6 +12449,11 @@ pub fn testSparseCacheRevision() !void {
     defer managed.deinit();
     const dense_port = managed.denseInterface();
     const initial = (try dense_port.cache_revision_fn.?(dense_port.ptr, std.testing.allocator, "semantic_idx")).?;
+    const derive = dense_port.cache_revision_from_model_fn.?;
+    // Deriving the identity requires no provider capability callback.
+    managed.entries[0].antfly_provider.?.model_capabilities = null;
+    try std.testing.expectEqual(initial, (try derive(dense_port.ptr, std.testing.allocator, "semantic_idx", @splat(7))).?);
+    managed.entries[0].antfly_provider.?.model_capabilities = Local.capabilities;
     inline for (.{ "truncate", "query_instruction", "input_type", "document_input_type", "model_identity" }) |field| {
         @field(managed.entries[0], field) = try std.testing.allocator.dupe(u8, "different-setting");
         const changed = (try dense_port.cache_revision_fn.?(dense_port.ptr, std.testing.allocator, "semantic_idx")).?;
@@ -12461,7 +12470,7 @@ pub fn testSparseCacheRevision() !void {
     managed.entries[0].api_key = .{ .literal = @constCast("tenant-a") };
     const tenant_a = (try dense_port.cache_revision_fn.?(dense_port.ptr, std.testing.allocator, "semantic_idx")).?;
     managed.entries[0].api_key = .{ .literal = @constCast("tenant-b") };
-    const tenant_b = (try dense_port.cache_revision_fn.?(dense_port.ptr, std.testing.allocator, "semantic_idx")).?;
+    const tenant_b = (try derive(dense_port.ptr, std.testing.allocator, "semantic_idx", @splat(7))).?;
     try std.testing.expect(!std.mem.eql(u8, &tenant_a, &tenant_b));
     managed.entries[0].api_key = original_api_key;
     managed.entries[0].sparse = true;

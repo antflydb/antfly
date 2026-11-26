@@ -28832,7 +28832,7 @@ pub const DB = struct {
                             null;
                         defer if (input_budget) |*budget| budget.deinit();
                         const input_alloc = if (input_budget) |*budget| budget.allocator() else self.alloc;
-                        fence.bind(input_alloc, &read, command) catch |err| {
+                        fence.bind(input_alloc, &read, command, anticipated.?.value.command.binding.effect_protocol >= inventory.scalar_window_retirement_protocol) catch |err| {
                             if (err == error.OutOfMemory) if (input_budget) |*budget| if (budget.denied()) return error.ResourceBudgetExceeded;
                             preparation_error = err;
                             input_preparation_error = true;
@@ -28915,7 +28915,7 @@ pub const DB = struct {
         if (ordered_value.value.command.binding.epoch != command.authority_epoch or
             !std.mem.eql(u8, &ordered_value.value.command.binding.digest, &command.catalog_digest) or
             !std.mem.eql(u8, &ordered_value.value.command.namespace, &namespace)) return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .stale_catalog, &apply_held);
-        if (command.execution_identity != null and ordered_value.value.command.binding.effect_protocol < @as(u16, if (command.producer_scope_key.len == 0) 17 else 18)) return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .invalid_output, &apply_held);
+        if (command.execution_identity != null and ordered_value.value.command.binding.effect_protocol < publication.executionIdentityEffectProtocol(command.producer_scope_key, command.mutations.len)) return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .invalid_output, &apply_held);
         if (command.mode != .publish) {
             var txn = try self.core.store.beginWriteTxn();
             var txn_open = true;
@@ -29142,7 +29142,11 @@ pub const DB = struct {
                 try publication.validateArtifactSources(alloc, txn, guard.command.namespace, guard.command.sources, guard.command.artifact_sources);
                 try publication.validateArtifactSources(alloc, txn, guard.command.namespace, guard.command.sources, guard.command.mutation_preconditions);
                 if (guard.chunk_fence) |fence| try fence.requireCurrent(txn);
-                if (guard.chunk_vector_fence) |fence| try fence.requireCurrent(txn);
+                if (guard.chunk_vector_fence) |fence| {
+                    try fence.requireCurrent(txn);
+                    if (fence.revalidate_window_plan) try fence.validateWindowPlan(alloc, txn, guard.command);
+                    try fence.stageWindowWitness(txn);
+                }
                 for (guard.asset_upstream_fences) |fence| try fence.requireCurrent(txn);
                 try publication.stageCoverage(alloc, txn, guard.command, guard.coverage);
                 try publication.stageReceipts(txn, guard.command, guard.sequence);
@@ -59518,7 +59522,14 @@ fn recordEnrichmentRequestFailure(ctx_ptr: *anyopaque, failure: enrichment_runti
     );
     defer ctx.alloc.free(artifact_key);
 
-    try recordArtifactRepairIssueContextDetailed(
+    const Guard = struct {
+        fn validate(ptr: *anyopaque, alloc: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) !void {
+            const proof: *const enrichment_runtime_mod.MediaFailureProof = @ptrCast(@alignCast(ptr));
+            try proof.validate(alloc, txn);
+        }
+    };
+    var proof = failure.media_proof;
+    try local_mutation.recordArtifactRepairIssueContextDetailedGuarded(
         async_ctx,
         artifact_kind,
         failure.index_name,
@@ -59534,6 +59545,7 @@ fn recordEnrichmentRequestFailure(ctx_ptr: *anyopaque, failure: enrichment_runti
         .enrichment_failed,
         failure.attempts,
         failure.error_name,
+        if (proof) |*value| .{ .ptr = value, .validate = Guard.validate } else null,
     );
 }
 
@@ -102797,12 +102809,53 @@ test "db terminal enrichment sequence index survives coalescing and retires with
         );
     }
 
+    const append_ctx = db.enrichment_append_context.?;
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+    defer alloc.free(primary_key);
+    const cursor_key = "\x00\x00__metadata__:media_pass:test-proof";
+    const captured_primary = "{\"text\":\"original\"}";
+    try db.core.store.put(primary_key, captured_primary);
+    try db.core.store.put(cursor_key, "cursor");
+    var captured_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(captured_primary, &captured_digest, .{});
+    var failure: enrichment_runtime_mod.RequestFailure = .{
+        .kind = .asset,
+        .index_name = "relations_graph",
+        .artifact_name = "relations_v1",
+        .doc_key = "doc:a",
+        .error_name = "RequiredMediaOutputFailed",
+        .attempts = 1,
+        .sequence = 15,
+        .media_proof = .{
+            .cursor_key = cursor_key,
+            .cursor_value = "cursor",
+            .primary_key = primary_key,
+            .primary_digest = captured_digest,
+            .primary_revision = null,
+        },
+    };
+    try std.testing.expectError(error.EnrichmentSourceChanged, recordEnrichmentRequestFailure(append_ctx, failure));
+    failure.sequence = 25;
+    try db.core.store.put(primary_key, "{\"text\":\"new revision\"}");
+    try std.testing.expectError(error.EnrichmentSourceChanged, recordEnrichmentRequestFailure(append_ctx, failure));
+
+    try db.core.store.put(primary_key, captured_primary);
+    const lease_key = "\x00\x00__metadata__:media_pass:test-lease";
+    const replacement = try std.json.Stringify.valueAlloc(alloc, @import("lease.zig").LeaseRecord{
+        .owner_id = "successor",
+        .epoch = 2,
+        .expires_at_ms = std.math.maxInt(u64),
+    }, .{});
+    defer alloc.free(replacement);
+    try db.core.store.put(lease_key, replacement);
+    failure.media_proof.?.fence = .{ .lease_key = lease_key, .owner_id = "worker-a", .epoch = 1 };
+    try std.testing.expectError(error.EnrichmentLeaseFenceLost, recordEnrichmentRequestFailure(append_ctx, failure));
+
     const issues = try db.listArtifactRepairIssues(alloc, .asset, "relations_graph", 0);
     defer types.freeArtifactRepairIssues(alloc, issues);
     try std.testing.expectEqual(@as(usize, 1), issues.len);
     try std.testing.expectEqual(@as(u64, 20), issues[0].sequence);
 
-    const append_ctx = db.enrichment_append_context.?;
     try std.testing.expect(try enrichmentRequestFailureRangePending(append_ctx, 9, 10));
     try std.testing.expect(!try enrichmentRequestFailureRangePending(append_ctx, 10, 15));
     try std.testing.expect(try enrichmentRequestFailureRangePending(append_ctx, 15, 20));

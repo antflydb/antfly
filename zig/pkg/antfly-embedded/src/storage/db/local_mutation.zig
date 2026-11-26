@@ -662,6 +662,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const reconcileSingleGraphStateContenders = materialization.reconcileSingleGraphStateContenders;
         pub const recordArtifactRepairIssueContext = materialization.recordArtifactRepairIssueContext;
         pub const recordArtifactRepairIssueContextDetailed = materialization.recordArtifactRepairIssueContextDetailed;
+        pub const recordArtifactRepairIssueContextDetailedGuarded = materialization.recordArtifactRepairIssueContextDetailedGuarded;
         pub const recordArtifactRepairIssueContextForIndexSource = materialization.recordArtifactRepairIssueContextForIndexSource;
         pub const recordArtifactRepairIssueForRefContext = materialization.recordArtifactRepairIssueForRefContext;
         pub const recordEmbeddingArtifactRepairIssueContext = materialization.recordEmbeddingArtifactRepairIssueContext;

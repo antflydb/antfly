@@ -6828,6 +6828,15 @@ pub const IndexManager = struct {
         }
         const generated_templates = try self.planGeneratedEnrichments(alloc, "", "{}", &.{}, &.{});
         errdefer enrichment_types.deinitGeneratedRequests(alloc, generated_templates);
+        for (generated_templates) |*template| {
+            if (template.kind != .dense_embedding or template.input_kind != .materialized_chunks or template.chunker_json.len == 0) continue;
+            var chunker = chunking_types.parseConfigFromSlice(alloc, template.chunker_json) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => continue, // Classification does not replace execution-time validation.
+            };
+            defer chunker.deinit(alloc);
+            template.model_aware_chunking = chunker.isModelAware();
+        }
         var group_sources = try @import("../group_source_mutations.zig").Plan.init(alloc, generated_templates);
         errdefer group_sources.deinit();
         const chunk_dependents = try alloc.alloc([]u32, generated_templates.len);
@@ -36290,6 +36299,14 @@ pub fn configUsesExternalCoverage(alloc: Allocator, cfg: types.IndexConfig) !boo
         },
         else => false,
     };
+}
+
+pub fn denseGeneratorChunkerJson(alloc: Allocator, raw: []const u8) ![]const u8 {
+    var generator = (try parseDenseGeneratorConfig(alloc, raw)) orelse return "";
+    defer generator.deinit(alloc);
+    const chunker = generator.chunker_json;
+    generator.chunker_json = &.{};
+    return chunker;
 }
 
 pub fn denseConfigDimensions(alloc: Allocator, cfg: types.IndexConfig) !u32 {

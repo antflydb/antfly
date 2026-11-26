@@ -289,6 +289,13 @@ rejects known gaps before searching and requires stable, complete observations
 through the scan. This is an operational observation check, not a snapshot-bound
 coverage certificate. It does not wait for a permanently idle table.
 
+A document that exhausts its extraction retries remains in the artifact repair
+queue. Other documents can continue to publish, and default grep reports the
+coverage gap while searching published text. Use the artifact repair queue to
+inspect and retry failed work. A failure that blocks the pipeline itself can
+also prevent Antfly from opening a consistent snapshot. In that case grep
+reports a query error, and an empty result carries no no-match guarantee.
+
 After a quiet-mode match, grep stops fetching content but checks readiness for
 remaining selected artifact streams within the request budget. A gap or unknown
 readiness still exits 2; cancellation stops further checks.

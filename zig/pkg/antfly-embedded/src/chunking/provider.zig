@@ -49,11 +49,22 @@ pub const Provider = struct {
     chunk_page_with_context_callback: ?*const anyopaque = null,
     execution: execution_context.Context = .{},
     dispatch_accounting: ?DispatchAccounting = null,
+    legacy_linked_admission: enum { allow, defer_to_worker, require_control } = .allow,
     owned_allocator: ?std.mem.Allocator = null,
     owned_default_endpoint: ?[]u8 = null,
     owned_source_table: ?[]u8 = null,
     owned_default_credential_reference: ?[]u8 = null,
     owned_http_client: ?*httpx.Client = null,
+
+    /// Called only when this route would invoke a linked input callback.
+    pub fn admitLinkedInput(self: Provider) !void {
+        if (self.chunk_input_with_context_callback != null) return;
+        return switch (self.legacy_linked_admission) {
+            .allow => {},
+            .defer_to_worker => error.EnrichmentRetryInProgress,
+            .require_control => error.UncancellableInferenceProvider,
+        };
+    }
 
     /// Create the persistent form stored by an enrichment runtime. The
     /// execution context otherwise borrows its strings for one invocation;

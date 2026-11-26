@@ -158,6 +158,9 @@ pub const DenseEmbedder = struct {
     set_cancellation_fn: ?EmbedSetCancellationFn = null,
     set_progress_fn: ?EmbedSetProgressFn = null,
     cache_revision_fn: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!?[32]u8 = null,
+    /// Derive the effective cache identity from an already resolved model.
+    /// Implementations must not perform provider discovery or inference.
+    cache_revision_from_model_fn: ?*const fn (*anyopaque, Allocator, []const u8, [32]u8) anyerror!?[32]u8 = null,
     recovery_identity_fn: ?EmbedRecoveryIdentityFn = null,
     /// The implementation guarantees that each provider invocation has its
     /// own finite deadline. Foreground post-commit replay rejects legacy
@@ -898,9 +901,10 @@ pub const SparseEmbedder = struct {
                 try context.check();
                 return revision;
             }
-            // A provider with no revision contract has nothing to discover.
-            if (self.cache_revision_fn != null) return error.UncancellableInferenceProvider;
-            return null;
+            // A legacy callback can run in the foreground only when the
+            // provider guarantees it is bounded independently of the context.
+            if (self.cache_revision_fn != null and !self.foreground_bounded)
+                return error.UncancellableInferenceProvider;
         }
         const resolve = self.cache_revision_fn orelse return null;
         const revision = try resolve(self.ptr, a, name);
@@ -2021,14 +2025,17 @@ test "commit requirements dense grouped parts require and consume the captured l
     }
 }
 
-test "commit requirements sparse revision discovery carries control and rejects legacy resolvers" {
+test "commit requirements sparse revision discovery carries control and requires bounded legacy callbacks" {
     const Probe = struct {
         seen: bool = false,
+        legacy_calls: usize = 0,
         fn embed(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !SparseEmbedding {
             return error.UnexpectedInference;
         }
-        fn legacy(_: *anyopaque, _: Allocator, _: []const u8) !?[32]u8 {
-            return error.UnexpectedLegacyDiscovery;
+        fn legacy(ptr: *anyopaque, _: Allocator, _: []const u8) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.legacy_calls += 1;
+            return @splat(8);
         }
         fn controlled(ptr: *anyopaque, _: Allocator, _: []const u8, context: RequestContext) !?[32]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -2045,6 +2052,13 @@ test "commit requirements sparse revision discovery carries control and rejects 
     try std.testing.expect(probe.seen);
     provider.cache_revision_with_context_fn = null;
     try std.testing.expectError(error.UncancellableInferenceProvider, provider.withRequestContext(context).captureRevision(std.testing.allocator, "model"));
+    try std.testing.expectEqual(@as(usize, 0), probe.legacy_calls);
+    provider.foreground_bounded = true;
+    try std.testing.expectEqual(@as(?[32]u8, @as([32]u8, @splat(8))), try provider.withRequestContext(context).captureRevision(std.testing.allocator, "model"));
+    var expired = context;
+    expired.deadline_ns = 0;
+    try std.testing.expectError(error.Timeout, provider.withRequestContext(expired).captureRevision(std.testing.allocator, "model"));
+    try std.testing.expectEqual(@as(usize, 1), probe.legacy_calls);
 }
 
 test "commit requirements sparse execution pins one generation across partitions and ABA" {

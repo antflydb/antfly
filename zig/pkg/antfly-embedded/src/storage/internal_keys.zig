@@ -1870,6 +1870,10 @@ pub fn graphEdgeArtifactKeyWithSourceAlloc(
 }
 
 pub fn derivedEmbeddingBaseKeyAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
+    return try alloc.dupe(u8, derivedEmbeddingBaseKey(key) orelse return null);
+}
+
+pub fn derivedEmbeddingBaseKey(key: []const u8) ?[]const u8 {
     if (!isDerivedEmbeddingArtifactKey(key)) return null;
 
     const doc_term = findComponentTerminator(key, 1).?;
@@ -1883,11 +1887,20 @@ pub fn derivedEmbeddingBaseKeyAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
         const name_term = findComponentTerminator(key, pos).?;
         pos = name_term + 2;
 
-        pos = skipDerivedEmbeddingBaseRecordSuffix(key, pos) orelse return error.InvalidInternalUserKey;
+        pos = skipDerivedEmbeddingBaseRecordSuffix(key, pos) orelse return null;
     }
 
-    if (key[pos] != derived_embedding_kind) return error.InvalidInternalUserKey;
-    return try alloc.dupe(u8, key[0..pos]);
+    if (key[pos] != derived_embedding_kind) return null;
+    return key[0..pos];
+}
+
+/// Preserve the exact binary embedding name while removing a media child
+/// suffix. The resulting parent revision is the CAS for this member's set.
+pub fn mediaWindowVectorParentAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
+    const base = derivedEmbeddingBaseKey(key) orelse return null;
+    const parent = mediaWindowParent(base);
+    if (parent.len == base.len) return null;
+    return try std.mem.concat(alloc, u8, &.{ parent, key[base.len..] });
 }
 
 pub fn isPrimaryDocumentKey(key: []const u8) bool {
