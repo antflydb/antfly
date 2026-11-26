@@ -21936,12 +21936,19 @@ fn sourceLinear(self: *CudaCompute, request: @FieldType(ops.Bf16SourceOperation,
     const arithmetic: @import("libraries.zig").MatmulArithmetic = .bf16_reduced;
     const workspace_bytes = try arithmetic.workspaceBytes(self.ctx.info.compute_major);
     const blas = if (self.bf16_blas) |*value| value else return error.CublasBf16Unavailable;
-    const layout = try @import("libraries.zig").Bf16GemmProgram.TemporaryLayout.resolveSourceRows(rows, request.width, request.columns, weight.dtype != .bf16, bias_epilogue and bias.?.dtype != .bf16, workspace_bytes);
-    const steady = try @import("libraries.zig").Bf16GemmProgram.TemporaryLayout.resolveSourceRows(rows, 1024, 4096, false, false, workspace_bytes);
+    const Layout = @import("libraries.zig").Bf16GemmProgram.TemporaryLayout;
+    const layout = try Layout.resolveSourceRows(rows, request.width, request.columns, weight.dtype != .bf16, bias_epilogue and bias.?.dtype != .bf16, workspace_bytes);
+    const reuse_bytes = if (self.source_linear_scratch.active and self.execution_scope == null)
+        if (request.reuse_projection) |geometry|
+            (try Layout.resolveSourceRows(rows, geometry.width, geometry.columns, false, false, workspace_bytes)).bytes
+        else
+            layout.bytes
+    else
+        layout.bytes;
     const capture = try SourceLinearTemporary.preflightCapture(self);
     var output: ?OwnedF32Output = if (destination == null) try OwnedF32Output.alloc2(self, rows.physical, request.columns, output_count) else null;
     defer if (output) |*owned| owned.deinit();
-    var temporary = try SourceLinearTemporary.acquireKnownCapture(self, layout.bytes, steady.bytes, capture);
+    var temporary = try SourceLinearTemporary.acquireKnownCapture(self, layout.bytes, reuse_bytes, capture);
     defer temporary.deinit(self);
     const workspace = temporary.span(layout.workspace);
     const bias_workspace = if (bias_epilogue) try sourceBiasWorkspaceView(self.embedding_gemma2_policy.source_bias_workspace, workspace) else workspace;

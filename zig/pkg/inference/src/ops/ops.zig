@@ -170,6 +170,9 @@ pub const Bf16SourceOperation = union(enum) {
         source_rows: ?usize = null,
         width: usize,
         columns: usize,
+        /// Largest packed projection geometry expected in a shared scratch
+        /// scope with the same row count. Individual workspace stays exact.
+        reuse_projection: ?struct { width: usize, columns: usize } = null,
         reference_input_layout: SourceMatrixLayout = .row_major,
     },
     rms_norm: struct {

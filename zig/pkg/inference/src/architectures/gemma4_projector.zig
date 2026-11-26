@@ -1658,6 +1658,7 @@ fn audioSourceLinear(
         .rows = rows,
         .width = width,
         .columns = columns,
+        .reuse_projection = .{ .width = cfg.audio_hidden, .columns = cfg.intermediate_size },
         .reference_input_layout = layout,
     } })) orelse return error.SourceArithmeticUnavailable;
     var output = projected;
