@@ -56661,6 +56661,58 @@ test "CUDA typed recurrent SDK failure retains original allocating root and PAGE
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
 }
 
+test "CUDA scalar download event record failure retires direct and staged writes before retry" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    var compute = try CudaCompute.testing.init(std.testing.allocator);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const scalar = (try cb.fromInt32Shape(&.{73}, &.{1})) orelse return error.MissingCudaScalarImport;
+    defer cb.free(scalar);
+    const Inject = struct {
+        var actual: @TypeOf(@as(CudaCompute, undefined).ctx.driver.fns.cuEventRecord) = undefined;
+        var actual_sync: @TypeOf(@as(CudaCompute, undefined).ctx.driver.fns.cuStreamSynchronize) = undefined;
+        var target: driver_mod.CUevent = null;
+        var auxiliary: driver_mod.CUstream = null;
+        var auxiliary_waits: usize = 0;
+        fn record(event: driver_mod.CUevent, stream: driver_mod.CUstream) callconv(.c) driver_mod.CUresult {
+            return if (event == target) 1 else actual(event, stream);
+        }
+        fn sync(stream: driver_mod.CUstream) callconv(.c) driver_mod.CUresult {
+            if (auxiliary != null and stream == auxiliary) auxiliary_waits += 1;
+            return actual_sync(stream);
+        }
+    };
+    Inject.actual = compute.ctx.driver.fns.cuEventRecord;
+    Inject.actual_sync = compute.ctx.driver.fns.cuStreamSynchronize;
+    defer {
+        compute.ctx.driver.fns.cuEventRecord = Inject.actual;
+        compute.ctx.driver.fns.cuStreamSynchronize = Inject.actual_sync;
+    }
+    for ([_]bool{ false, true }) |staged| {
+        compute.tuned_route_gates.async_i32_download_staging = staged;
+        const initial = (try cb.beginI32ScalarDownload(scalar)) orelse return error.MissingCudaScalarReadback;
+        try std.testing.expectEqual(@as(i32, 73), try cb.finishI32ScalarDownload(initial));
+        if (staged) try std.testing.expect(compute.async_i32_scalar_download.copy_stream != null);
+        Inject.target = compute.async_i32_scalar_download.event;
+        Inject.auxiliary = compute.async_i32_scalar_download.copy_stream;
+        Inject.auxiliary_waits = 0;
+        compute.ctx.driver.fns.cuStreamSynchronize = Inject.sync;
+        const before = compute.ctx.stats.stream_syncs;
+        compute.ctx.driver.fns.cuEventRecord = Inject.record;
+        @import("../../test_error_logs.zig").expectErrorLogs(1);
+        try std.testing.expectError(error.CudaDriverError, cb.beginI32ScalarDownload(scalar));
+        compute.ctx.driver.fns.cuEventRecord = Inject.actual;
+        compute.ctx.driver.fns.cuStreamSynchronize = Inject.actual_sync;
+        try std.testing.expectEqual(before + 1, compute.ctx.stats.stream_syncs);
+        try std.testing.expectEqual(@as(usize, @intFromBool(staged)), Inject.auxiliary_waits);
+        try std.testing.expect(!compute.async_i32_scalar_download.in_use);
+        try std.testing.expectEqual(initial.handle, compute.async_i32_scalar_download.handle);
+        const retry = (try cb.beginI32ScalarDownload(scalar)) orelse return error.MissingCudaScalarReadback;
+        try std.testing.expect(retry.handle != initial.handle);
+        try std.testing.expectEqual(@as(i32, 73), try cb.finishI32ScalarDownload(retry));
+    }
+}
+
 test "CUDA checked deferred drain reports each successful SDK death before a later failure and exact retry" {
     if (comptime !cuda_enabled) return error.SkipZigTest;
     var compute = try CudaCompute.testing.init(std.testing.allocator);
