@@ -965,6 +965,13 @@ The packed-cache image lookup also returned `271`. The streaming image
 request returned `Blue`, a stop reason, usage and `[DONE]` in 0.833 s.
 No comparable vLLM Metal run was available for this checkpoint.
 
+The next comparison uses llama.cpp `b12776` (`e38ea719b`) on the same
+host and GGUF. That build includes the upstream
+[indexed relative-attention bias change](https://github.com/ggml-org/llama.cpp/pull/33053).
+Treat the `b12706` timings above as historical. Inkling awaits a verified
+vLLM-Metal runner. See the
+[vLLM-Metal support matrix](https://github.com/vllm-project/vllm-metal/blob/main/docs/supported_models.md).
+
 With the normal model directory and both backend override variables unset,
 the optimized HTTP server selected Metal. A mixed `/ml/v1/generate/batch`
 returned `4` and `Red` for valid items and an item-level error for an audio
@@ -1029,6 +1036,19 @@ order. BF16 and packed K/V probes matched every FP32 partial bit. The
 physical Metal test also checks that the penultimate query in a synthetic
 million-token span cannot see the value at the remapped final position.
 End-to-end latency for this change awaits a released-checkpoint rerun.
+
+Paired prefill now skips relative bias on pages older than both queries'
+bias range. When that page also fits both original split bounds, the
+same kernel drops the per-key visibility checks. A physical M4 Max probe
+with seven query rows at position 4,096 and shuffled pages matched all
+FP32 partial bits against the per-key visibility version for BF16 and
+packed Q4, with global and 257-token sliding attention. The Metal driver
+reported SIMD width 32, a 1,024-thread limit and zero static threadgroup
+bytes for all eight before and after entry points. The generated Metal
+source check and production HTTP build passed. The physical packed
+million-token attention test passed with 1,024 relative positions,
+remapped final pages, and distinct causal limits on adjacent queries.
+Serving latency and completed full-window HTTP requests remain pending.
 
 The public Metal route now selects the resident Inkling model automatically.
 It handles ordered images, sends idle SSE comments at prefill checkpoints,
@@ -1381,6 +1401,109 @@ temporary import only for inputs named by the selected host plan. A live
 Metal cache-branch operand uses the same ingress when the specialized
 frame owns it. The boolean selector is validated before dispatch and the
 fixture verifies that specialization eliminates its device binding.
+
+At `644591f1b8`, asynchronous scalar readback requires a backend to
+provide both finish and checked drain before submission. CUDA was the
+only production provider and already supplied both. The unchecked
+cancellation callback and its dispatch wrapper were removed. A failed
+CUDA event submission settles the compute stream and, for staged
+copies, the auxiliary copy stream before returning the error. The
+worker restarts if retirement itself fails. The successful path adds
+no synchronization.
+
+Three focused Native tests passed, covering reservation rollback,
+retirement and observation across an await failure. A simulated backend
+without checked drain declined before submission. On Spark GB10, both
+focused CUDA tests ran on the device. The ordinary test observed one
+event wait for readback and one for draining an abandoned handle, each
+on its own invocation. The failure fixture injected an event-record
+error after a real direct or staged copy, checked the required
+stream waits, and returned the original scalar on retry.
+
+The public Spark HTTP matrix compared `644591f1b8` with frozen main
+`20563ec50a`. It used the shared default checkpoints, the official E4B QAT
+GGUF and projector, identical request and media hashes, and two warmups
+and ten measurements per arm. Each engine contributed 20 crossover
+measurements per workload. All ten output digests matched the frozen
+reference and all 120 model-and-arm receipts selected CUDA. The same
+184 MiB external GPU context was present before and after the run.
+
+| Workload | Main p50 / p95 (ms) | Candidate p50 / p95 (ms) | Largest same-binary p50 difference |
+| --- | ---: | ---: | ---: |
+| Whisper | 382.73 / 384.00 | 383.51 / 384.63 | 0.20% |
+| EmbeddingGemma2 | 8.42 / 8.52 | 8.70 / 9.22 | 3.27% |
+| LightOnOCR | 322.24 / 324.56 | 319.37 / 321.03 | 0.76% |
+| GLiNER2.5 | 12.94 / 13.85 | 12.73 / 13.48 | 2.24% |
+| DECIDE | 39.98 / 40.85 | 40.06 / 41.26 | 0.46% |
+| Qwen3 | 86.59 / 87.59 | 85.90 / 86.71 | 0.89% |
+| Gemma 4 E4B text | 222.56 / 223.56 | 223.72 / 225.17 | 0.32% |
+| Gemma 4 E4B image | 279.79 / 281.56 | 280.68 / 282.02 | 0.36% |
+| Gemma 4 E4B audio | 218.01 / 220.85 | 216.88 / 218.88 | 0.99% |
+| Gemma 4 E4B video | 253.81 / 255.73 | 254.42 / 257.67 | 1.34% |
+
+All cases passed the 1.05 p50 and 1.10 p95 ratios, including both
+same-binary controls. EmbeddingGemma2 increased 3.36% at p50 and 8.17%
+at p95. The observed p50 increase was close to the 3.27% control
+difference. Whisper and Gemma 4 text also had small p50 increases.
+The cohort establishes output parity and the specified latency gates
+on a shared Spark GPU.
+
+The focused repeat used the same binaries, three warmups and 20
+measurements per arm. It matched all three prior output digests and
+verified all 36 CUDA model-and-arm receipts. EmbeddingGemma2 measured
++1.75% p50 and +2.67% p95, with a 4.60% same-binary p50 difference.
+Whisper measured +0.26% p50 and +0.70% p95, with a 0.29% control
+difference. Gemma 4 text measured +0.89% p50 and +1.30% p95, with
+a 0.07% control difference. All three passed the latency gates. The
+Gemma 4 text increase repeated above the measured control variation.
+
+An instrumented Spark crossover used streaming for both revisions so
+each emitted paired prefill and decode event reports. All four arms
+produced 11 complete reports per phase with no collection failures.
+After excluding three warmups per arm, the profiled HTTP p50 was
+225.67 ms on main and 227.75 ms on the candidate, with exact stream
+output parity. The candidate adds timing scopes for 24 assigned
+attention operations per prefill, so the new attention time is a
+coverage change and cannot be compared with the baseline's zero.
+Other common prefill categories moved by at most 29 µs at their
+medians. Learned arena high-water was 11,703,744 bytes on both
+revisions, with 1,100 slots on main and 1,099 on the candidate.
+These instrumented scopes do not account for the full HTTP increase.
+A separate host-stage crossover used uninstrumented CUDA kernels and
+the existing generation wall timers. The 24 warm responses per engine
+again matched exactly. Median prefill stayed at 92 ms. Median decode
+went from 123.0 to 124.5 ms, while total generation went from 215 to
+217 ms and HTTP p50 went from 224.30 to 225.83 ms. The whole-millisecond
+timers localize the observed difference to the decode interval.
+
+A separate graph trace reproduced exact outputs and the same direction
+of latency change. Each main arm began and instantiated 11 decode
+graphs across 11 requests, followed by 43 persistent replays. Each
+candidate arm began and instantiated 22 graphs and recorded 32
+persistent replays. The total number of graph executions stayed at 54
+per arm. In the trace, the candidate captured a second slot on the
+next token, then alternated persistent replays between the two slots.
+This identifies an extra capture per request as a candidate cause
+of the small decode increase. The source of the extra slot selection
+still needs qualification before changing the replay custody checks.
+
+Two follow-up probes preserved the outputs and still captured 22 graphs
+with 32 persistent replays in each arm. One released the owned token
+after its embedding gathers. The other preferred a ready graph over an
+unused compatible bank and ran with another CUDA context present. The
+capture counts still point to the conditions that require a second bank.
+The current serving path keeps its existing token lifetime and replay
+slot policy.
+
+The same Spark binaries also served grouped EmbeddingGemma2 image, audio,
+and video requests through the public embedding endpoint. Each crossover
+engine contributed 16 measurements per modality, with two warmups per
+arm. All embedding output digests matched and all 36 model-and-arm
+receipts selected CUDA. Image p50/p95 went from 125.07/125.72 to
+124.42/125.73 ms, audio from 26.49/27.76 to 26.40/28.13 ms, and video
+from 159.60/160.83 to 158.91/161.36 ms. The three same-binary control
+pairs and crossover cases passed the latency ratios. The data cover
+these grouped inputs with one item per request on shared Spark GB10.
 
 ### Whisper Small multi-window Metal serving
 

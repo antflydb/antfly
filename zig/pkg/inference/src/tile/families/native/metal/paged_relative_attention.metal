@@ -44,7 +44,7 @@ inline void antfly_store_relative_attention(
     }
 }
 
-template <bool compressed, uint heads, uint rows, bool with_relative>
+template <bool compressed, uint heads, uint rows, bool with_relative, bool clip_rows = true>
 inline void antfly_accumulate_relative_page(
     device const ushort *keys, device const ushort *values,
     device const bfloat *relative, constant PagedRelativeGqaParams &p,
@@ -59,7 +59,7 @@ inline void antfly_accumulate_relative_page(
         #pragma unroll
         for (uint h = 0u; h < heads * rows; ++h) {
             const uint r = h / heads;
-            if (rows > 1 && (pos < begin[r] || pos >= limit[r])) continue;
+            if (clip_rows && rows > 1 && (pos < begin[r] || pos >= limit[r])) continue;
             float dot = 0.0f;
             for (uint i = 0u; i < 4u; ++i) dot = fma(q[h][i], key[i], dot);
             const float reduced = simd_sum(dot);
@@ -107,11 +107,14 @@ inline void antfly_paged_relative_gqa_d128_partial(
     uint begin[rows], limit[rows];
     uint first_key = ~0u;
     uint last_key = 0u;
+    uint shared_first = 0u;
+    uint shared_limit = ~0u;
     // Each row retains its original split boundary and accumulation order.
     #pragma unroll
     for (uint r = 0u; r < rows; ++r) {
         if (r >= active_rows) {
             begin[r] = limit[r] = 0u;
+            shared_limit = 0u;
             continue;
         }
         const uint end = p.start + batch_row + r + 1u;
@@ -121,6 +124,8 @@ inline void antfly_paged_relative_gqa_d128_partial(
         const uint keys_per_split = (live - 1u) / row_splits + 1u;
         begin[r] = first + group.y * keys_per_split;
         limit[r] = min(end, begin[r] + keys_per_split);
+        shared_first = max(shared_first, begin[r]);
+        shared_limit = min(shared_limit, limit[r]);
         if (rows == 1u) {
             first_key = begin[r];
             last_key = limit[r];
@@ -156,9 +161,17 @@ inline void antfly_paged_relative_gqa_d128_partial(
         const uint last_in_page = next_key - 1u;
         if (rows > 1 && (p.relative_extent == 0u ||
             (earliest >= last_in_page && earliest - last_in_page >= p.relative_extent))) {
-            antfly_accumulate_relative_page<compressed, heads, rows, false>(
-                keys, values, relative, p, first, next_key, stored_head, batch_row,
-                row_head, lane, begin, limit, q, numerator, maximum, denominator);
+            // Interior pages are wholly visible to both queries. Boundary
+            // pages still honor each query's split, window and causal limit.
+            if (first >= shared_first && next_key <= shared_limit) {
+                antfly_accumulate_relative_page<compressed, heads, rows, false, false>(
+                    keys, values, relative, p, first, next_key, stored_head, batch_row,
+                    row_head, lane, begin, limit, q, numerator, maximum, denominator);
+            } else {
+                antfly_accumulate_relative_page<compressed, heads, rows, false>(
+                    keys, values, relative, p, first, next_key, stored_head, batch_row,
+                    row_head, lane, begin, limit, q, numerator, maximum, denominator);
+            }
         } else {
             antfly_accumulate_relative_page<compressed, heads, rows, true>(
                 keys, values, relative, p, first, next_key, stored_head, batch_row,
