@@ -1229,7 +1229,10 @@ existing cuDNN 9.19 CUDA 13 runtime, covering learning, cancelled capture,
 recapture and replay. The full cuDNN capture rerun passed 123 of 173
 selected tests. A subsequent opt-in CUDA check used the pinned LightOn/Qwen
 reader packet fixture and verified exact two-page token streams across
-capture and replay. The source still learns its audio workspace layout.
+capture and replay. With the same fixture and the pinned recurrent
+prefill library, standalone CUDA generation matched unmanaged raw control
+logits bitwise and verified that admission callbacks ran outside request
+gates. The source still learns its audio workspace layout.
 Replacing that learned layout and qualifying released-model performance
 remain open.
 
