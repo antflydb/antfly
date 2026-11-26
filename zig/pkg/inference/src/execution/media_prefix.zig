@@ -58,6 +58,16 @@ pub fn prepareDecoder(
     return decoder;
 }
 
+/// Execute one compiled generation step from the request's selected state.
+pub fn runStep(session: Session, decoder: ?*resident_decoder.Decoder, prefix: ?*const Prefix, phase: enum { prefill, decode }, history: []const i64, a: std.mem.Allocator, control: ?Control) ![]f32 {
+    if (decoder) |state| {
+        if (phase == .prefill) if (prefix) |media| return media.runCached(state, history, a, control);
+        return state.text(history, a, control);
+    }
+    if (prefix) |media| return media.run(session, history, a, control);
+    return runText(session, history, a, control);
+}
+
 /// Reuse the loaded session program for whole-prefix text decoding.
 pub fn runText(session: Session, history: []const i64, a: std.mem.Allocator, control: ?Control) ![]f32 {
     if (history.len == 0) return error.InvalidPreparedPrompt;

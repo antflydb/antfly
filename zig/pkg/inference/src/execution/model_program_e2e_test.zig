@@ -842,7 +842,7 @@ test "model program resident decoder matches full-prefix logits without per-toke
                 const exact = try prefix.run(session, history[0..rows], a, .{ .native_call_policy = .in_process });
                 defer a.free(exact);
                 const before = factory.getPjrtSpecializationCount(session).?;
-                const incremental = if (rows == first_rows) try prefix.runCached(&cached, history[0..rows], a, .{ .native_call_policy = .in_process }) else try cached.text(history[0..rows], a, .{ .native_call_policy = .in_process });
+                const incremental = try @import("media_prefix.zig").runStep(session, &cached, &prefix, if (rows == first_rows) .prefill else .decode, history[0..rows], a, .{ .native_call_policy = .in_process });
                 defer a.free(incremental);
                 if (rows == 5 or round == 1) try std.testing.expectEqual(before, factory.getPjrtSpecializationCount(session).?);
                 try std.testing.expectEqual(exact.len, incremental.len);

@@ -3663,12 +3663,8 @@ pub const NativeGenerationPipeline = struct {
                 self.pjrt_decoder_cache_used = true;
             }
         }
-        const prefill_output = if (self.compiled_decoder) |decoder|
-            PrefillOutput{ .last_logits = if (self.compiled_media_prefix) |prefix| try prefix.runCached(decoder, token_ids[0..seq_len], allocator, self.execution_control) else try decoder.text(token_ids[0..seq_len], allocator, self.execution_control) }
-        else if (self.compiled_media_prefix) |prefix|
-            PrefillOutput{ .last_logits = try prefix.run(self.session.?, token_ids[0..seq_len], allocator, self.execution_control) }
-        else if (self.usesPjrtSession())
-            PrefillOutput{ .last_logits = try @import("../execution/media_prefix.zig").runText(self.session.?, token_ids[0..seq_len], allocator, self.execution_control) }
+        const prefill_output = if (self.usesPjrtSession())
+            PrefillOutput{ .last_logits = try @import("../execution/media_prefix.zig").runStep(self.session.?, self.compiled_decoder, self.compiled_media_prefix, .prefill, token_ids[0..seq_len], allocator, self.execution_control) }
         else if (self.checkpoint_resume) |request|
             try self.resumeNativeCheckpoint(request, token_ids[0..seq_len], max_tokens, decode_state, config)
         else if (prepared_qwen3vl_prompt) |*prepared|
@@ -5564,18 +5560,9 @@ pub const NativeGenerationPipeline = struct {
                         }
                     }
 
-                    if (self.compiled_decoder) |decoder| {
-                        owns_last_logits = true;
-                        break :logits_blk try decoder.text(token_ids[0..seq_len.*], self.allocator, self.execution_control);
-                    }
-                    if (self.compiled_media_prefix) |prefix| {
-                        owns_last_logits = true;
-                        break :logits_blk try prefix.run(self.session.?, token_ids[0..seq_len.*], self.allocator, self.execution_control);
-                    }
-
                     if (self.usesPjrtSession()) {
                         owns_last_logits = true;
-                        break :logits_blk try @import("../execution/media_prefix.zig").runText(self.session.?, token_ids[0..seq_len.*], self.allocator, self.execution_control);
+                        break :logits_blk try @import("../execution/media_prefix.zig").runStep(self.session.?, self.compiled_decoder, self.compiled_media_prefix, .decode, token_ids[0..seq_len.*], self.allocator, self.execution_control);
                     }
 
                     if (self.scheduler) |scheduler| {
