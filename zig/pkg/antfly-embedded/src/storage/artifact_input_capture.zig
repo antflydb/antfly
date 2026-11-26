@@ -46,6 +46,8 @@ pub const Capture = struct {
     artifacts: std.StringHashMapUnmanaged(void) = .empty,
     artifact_owners: std.StringHashMapUnmanaged(void) = .empty,
     raft_marker: ?[16]u8 = null,
+    window_set_fenced: ?bool = null,
+    invalidate_empty_windows: std.AutoHashMapUnmanaged(@import("db/artifact_chunk_vector_publication.zig").EmptyWindowKey, void) = .empty,
     native_position: ?u64 = null,
     replay_sequence: ?u64 = null,
     replay_next: ?u64 = null,
@@ -85,6 +87,7 @@ pub const Capture = struct {
         var owners = self.artifact_owners.keyIterator();
         while (owners.next()) |key| alloc.free(key.*);
         self.artifact_owners.deinit(alloc);
+        self.invalidate_empty_windows.deinit(alloc);
     }
 
     fn rememberArtifact(self: *Capture, alloc: std.mem.Allocator, key: []const u8) !void {
@@ -92,6 +95,19 @@ pub const Capture = struct {
         const owned = try alloc.dupe(u8, key);
         errdefer alloc.free(owned);
         try self.artifacts.put(alloc, owned, {});
+    }
+
+    fn invalidateEmptyWindows(self: *Capture, alloc: std.mem.Allocator, txn: anytype, namespace: publication.Namespace, scalar: []const u8) !void {
+        const witness = @import("db/artifact_chunk_vector_publication.zig").emptyWindowKey(namespace, scalar);
+        if (self.window_set_fenced != true) {
+            // Markerless restored writers still invalidate any previously
+            // certified set. Legacy tables with no witness write nothing.
+            _ = txn.get(&witness) catch |err| switch (err) {
+                error.NotFound => return,
+                else => return err,
+            };
+        }
+        try self.invalidate_empty_windows.put(alloc, witness, {});
     }
 
     pub fn touch(self: *Capture, alloc: std.mem.Allocator, txn: anytype, key: []const u8, value: ?[]const u8) !void {
@@ -172,6 +188,18 @@ pub const Capture = struct {
             self.checked = true;
         }
         if (artifact) {
+            if (self.selected) |active| if (try keys.mediaWindowVectorParentAlloc(alloc, key)) |parent| {
+                defer alloc.free(parent);
+                if (self.window_set_fenced == null) self.window_set_fenced = try @import("db/artifact_catalog_activation.zig").windowSetFenced(txn, active);
+                if (self.window_set_fenced.?) try self.rememberArtifact(alloc, parent);
+                if (value != null) try self.invalidateEmptyWindows(alloc, txn, active.namespace, parent);
+            };
+            if (value == null) if (self.selected) |active| if (keys.derivedEmbeddingBaseKey(key)) |base| {
+                if (keys.isChunkArtifactRecordKey(base) and keys.mediaWindowIndex(base) == null) {
+                    if (self.window_set_fenced == null) self.window_set_fenced = try @import("db/artifact_catalog_activation.zig").windowSetFenced(txn, active);
+                    try self.invalidateEmptyWindows(alloc, txn, active.namespace, key);
+                }
+            };
             if (self.artifacts.contains(key)) return;
             const document = try @import("db/artifact_publication_owner.zig").documentAlloc(alloc, key);
             var owned = true;
@@ -334,6 +362,11 @@ pub const Capture = struct {
             try txn.put(&publication.materializationRevisionKey(expected.namespace, document.*), &materialization);
             _ = try @import("db/artifact_producer_obligations.zig").mark(self.allocator orelse return error.ArtifactCatalogCorrupt, txn, expected, document.*, position);
         }
+        var invalidated = self.invalidate_empty_windows.keyIterator();
+        while (invalidated.next()) |key| txn.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
         var artifacts = self.artifacts.keyIterator();
         while (artifacts.next()) |artifact| try txn.put(&publication.artifactRevisionKey(expected.namespace, artifact.*), &encoded);
         // A producer's closed result is invalidated by changes to that stream,

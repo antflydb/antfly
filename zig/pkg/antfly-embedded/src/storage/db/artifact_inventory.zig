@@ -52,7 +52,9 @@ pub fn requirePublicationDigest(txn: anytype, expected: [32]u8) !void {
 }
 
 pub const dense_artifact_flags_protocol: u16 = 19;
-pub const max_effect_protocol: u16 = dense_artifact_flags_protocol;
+/// One revision-bound scalar replacement may also retire its prior windows.
+pub const scalar_window_retirement_protocol: u16 = 20;
+pub const max_effect_protocol: u16 = scalar_window_retirement_protocol;
 
 pub const Binding = struct {
     epoch: u64,
@@ -83,7 +85,7 @@ pub const Catalogs = struct {
     /// Select capabilities from this immutable definition cut, independently
     /// of the database's monotonic reader floor. Resolver/producer receipts
     /// need protocol 15; grouped producer ownership needs protocol 16.
-    /// Base dense and sparse vectors need protocol 17; scoped chunk vectors need protocol 18.
+    /// Base vectors need protocol 17 and scoped chunk vectors need protocol 18.
     pub fn requiredEffectProtocol(self: Catalogs, alloc: std.mem.Allocator) !u16 {
         const enrichments = @import("catalog/enrichment_catalog.zig");
         const producers = if (self.enrichments.len != 0)
@@ -231,7 +233,9 @@ test "grouped sources production ordered artifact inventory compatibility binds 
     try std.testing.expect(extended.supportsProducerWitnesses());
     extended.effect_protocol = 19;
     try std.testing.expect(extended.supportsProducerWitnesses());
-    extended.effect_protocol = 20;
+    extended.effect_protocol = scalar_window_retirement_protocol;
+    try std.testing.expect(extended.supportsProducerWitnesses());
+    extended.effect_protocol = max_effect_protocol + 1;
     try std.testing.expect(!extended.supportsProducerWitnesses());
     try std.testing.expect(!extended.valid() and !extended.compatible(extended));
 }

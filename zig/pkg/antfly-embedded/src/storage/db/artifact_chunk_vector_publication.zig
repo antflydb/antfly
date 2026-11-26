@@ -29,8 +29,16 @@ pub const Input = struct {
     token: context.Token,
     value: ?[]const u8,
     output_key: []const u8,
+    previous_output_exists: bool = false,
+    effect_protocol: u16 = 18,
+    /// Empty when the replay cursor proves that the member has no windows.
+    old_window_outputs: ?[]const publication.ArtifactSource = null,
+    window_capture: ?*@import("artifact_chunk_window_capture.zig").MediaWindowCapture = null,
+    media_window_layout: bool = false,
+    large_window_capture: bool = false,
     pub fn deinit(self: *Input) void {
         self.token.deinit();
+        if (self.window_capture) |capture_| capture_.deinit();
         self.* = undefined;
     }
 };
@@ -52,7 +60,7 @@ pub fn CaptureSession(comptime Txn: type) type {
         effect_protocol: u16,
 
         pub fn capture(self: @This(), alloc: std.mem.Allocator, scope: []const u8) !Input {
-            return captureMember(alloc, self.txn, self.request, self.authority, self.generation, scope);
+            return captureMember(alloc, self.txn, self.request, self.authority, self.generation, self.effect_protocol, scope);
         }
     };
 }
@@ -79,7 +87,7 @@ pub fn captureSession(alloc: std.mem.Allocator, txn: anytype, request: @import("
     return .{ .txn = txn, .request = request, .authority = authority, .generation = generation, .effect_protocol = binding.effect_protocol };
 }
 
-fn captureMember(alloc: std.mem.Allocator, txn: anytype, request: @import("enrichment/enrichment_types.zig").GeneratedEnrichmentRequest, authority: publication.Authority, generation: u64, scope: []const u8) !Input {
+fn captureMember(alloc: std.mem.Allocator, txn: anytype, request: @import("enrichment/enrichment_types.zig").GeneratedEnrichmentRequest, authority: publication.Authority, generation: u64, effect_protocol: u16, scope: []const u8) !Input {
     var token: context.Token = .{
         .arena = std.heap.ArenaAllocator.init(alloc),
         .namespace = authority.namespace,
@@ -122,43 +130,225 @@ fn captureMember(alloc: std.mem.Allocator, txn: anytype, request: @import("enric
         else => return err,
     };
     try token.observePrecondition(output, previous, try publication.artifactRevision(txn, authority.namespace, output));
-    return .{ .token = token, .value = value, .output_key = output };
+    return .{ .token = token, .value = value, .output_key = output, .previous_output_exists = previous != null, .effect_protocol = effect_protocol };
 }
+
+const empty_window_prefix = "\x00\x00__artifact_publication__:empty-windows:v1:";
+pub const EmptyWindowKey = [empty_window_prefix.len + 32]u8;
+
+/// Only the physical writer certifies emptiness. A live child or scalar
+/// retirement invalidates that exact member and consumer. The physical fact
+/// is independent of changes to the catalog's logical configuration.
+pub fn emptyWindowKey(namespace: publication.Namespace, scalar: []const u8) EmptyWindowKey {
+    var key: EmptyWindowKey = undefined;
+    @memcpy(key[0..empty_window_prefix.len], empty_window_prefix);
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update(&namespace);
+    hash.update(scalar);
+    hash.final(key[empty_window_prefix.len..]);
+    return key;
+}
+
+const media_embedding_recipe = @import("media_embedding_recipe.zig");
 
 pub const Fence = struct {
     scope: []const u8,
     requires_member: bool,
     certificate: ?@import("artifact_producer_provenance.zig").ArtifactCertificate = null,
     prepared: bool = false,
+    dense: bool = false,
+    embedding_config: []const u8 = "",
+    chunker_config: ?[]const u8 = null,
+    inline_index_config: []const u8 = "",
+    dimensions: u32 = 0,
+    revalidate_window_plan: bool = false,
+    certify_empty: ?EmptyWindowKey = null,
     /// Resolve membership and decode inherited provenance before serialized
     /// apply. Published generation rows are immutable; the head/member guards
     /// plus this exact proof reference fence preserve the prepared observation.
-    pub fn bind(self: *Fence, alloc: std.mem.Allocator, txn: anytype, command: publication.Command) !void {
+    pub fn bind(self: *Fence, alloc: std.mem.Allocator, txn: anytype, command: publication.Command, window_protocol: bool) !void {
+        if (window_protocol and self.dense) {
+            // A restored binding without the compact marker cannot rely on
+            // the parent revision to fence a concurrent child insertion.
+            self.revalidate_window_plan = !try @import("artifact_catalog_activation.zig").windowSetFenced(txn, .{
+                .namespace = command.namespace,
+                .epoch = command.authority_epoch,
+                .catalog_digest = command.catalog_digest,
+            });
+            self.certify_empty = try self.checkWindowPlan(alloc, txn, command, !self.revalidate_window_plan);
+        }
         self.prepared = false;
         self.certificate = null;
         var input = try @import("artifact_chunk_generation.zig").captureInput(alloc, txn, self.scope);
         defer input.deinit();
         if (self.requires_member and input.value == null) return error.EnrichmentSourceChanged;
-        for (command.mutations) |mutation| if (mutation.value != null) {
-            const base = (try keys.derivedEmbeddingBaseKeyAlloc(alloc, mutation.key)) orelse return error.InvalidBatchRequest;
-            defer alloc.free(base);
-            if (keys.mediaWindowIndex(base)) |index| {
-                const metadata = try @import("../../chunking/chunk.zig").modelMetadataAlloc(alloc, input.value orelse return error.EnrichmentSourceChanged) orelse return error.InvalidBatchRequest;
-                defer metadata.deinit(alloc);
-                var results = try std.json.parseFromSlice([]@import("inference_chunker").outputs.Result, alloc, metadata.outputs_json orelse return error.InvalidBatchRequest, .{});
-                defer results.deinit();
-                const found = for (results.value) |result| {
-                    if (result.kind == .embedding and std.mem.eql(u8, result.name, "embedding") and result.sub_index == index and result.status == .complete) break true;
-                } else false;
-                if (!found) return error.EnrichmentSourceChanged;
-            }
-        };
+        if (window_protocol and self.dense) {
+            if (input.value) |payload| try self.validateFusedReceipts(alloc, command, payload);
+        } else {
+            var completed: ?std.AutoHashMapUnmanaged(u32, void) = null;
+            defer if (completed) |*indices| indices.deinit(alloc);
+            for (command.mutations) |mutation| if (mutation.value != null) {
+                const base = (try keys.derivedEmbeddingBaseKeyAlloc(alloc, mutation.key)) orelse return error.InvalidBatchRequest;
+                defer alloc.free(base);
+                if (keys.mediaWindowIndex(base)) |index| {
+                    if (completed == null) {
+                        completed = .empty;
+                        const metadata = try @import("../../chunking/chunk.zig").modelMetadataAlloc(alloc, input.value orelse return error.EnrichmentSourceChanged) orelse return error.InvalidBatchRequest;
+                        defer metadata.deinit(alloc);
+                        var results = try std.json.parseFromSlice([]@import("inference_chunker").outputs.Result, alloc, metadata.outputs_json orelse return error.InvalidBatchRequest, .{});
+                        defer results.deinit();
+                        for (results.value) |result| {
+                            if (result.kind != .embedding or !std.mem.eql(u8, result.name, "embedding") or result.status != .complete) continue;
+                            // Older single-effect wire shapes did not bind each
+                            // child receipt. All new multi-effect live windows do.
+                            if (command.mutations.len > 1) if (command.execution_identity) |revision| {
+                                var actual: publication.Digest = undefined;
+                                const decoded = std.fmt.hexToBytes(&actual, result.model_revision) catch continue;
+                                if (!std.mem.eql(u8, decoded, &revision)) continue;
+                            };
+                            try completed.?.put(alloc, result.sub_index, {});
+                        }
+                    }
+                    if (!completed.?.contains(index)) return error.EnrichmentSourceChanged;
+                }
+            };
+        }
         self.certificate = if (input.proofValue() != null) try @import("artifact_producer_provenance.zig").certifyInheritedArtifact(alloc, txn, input.proofKey(self.scope), input.proofValue(), command) else null;
         self.prepared = true;
     }
+    fn validateFusedReceipts(self: Fence, alloc: std.mem.Allocator, command: publication.Command, payload: []const u8) !void {
+        var live: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer live.deinit(alloc);
+        for (command.mutations) |mutation| {
+            if (mutation.value == null) continue;
+            const base = keys.derivedEmbeddingBaseKey(mutation.key) orelse return error.InvalidBatchRequest;
+            const index = keys.mediaWindowIndex(base) orelse return; // A real scalar result is a different computation.
+            try live.put(alloc, index, {});
+        }
+        const metadata = (@import("../../chunking/chunk.zig").modelMetadataAlloc(alloc, payload) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidBatchRequest,
+        }) orelse {
+            if (live.count() != 0) return error.EnrichmentSourceChanged;
+            return;
+        };
+        defer metadata.deinit(alloc);
+        const raw = metadata.outputs_json orelse {
+            if (live.count() != 0) return error.EnrichmentSourceChanged;
+            return;
+        };
+        const publishes_windows = live.count() != 0;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const owned = arena.allocator();
+        const consumer = (self.resolveFusedConsumer(owned) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidBatchRequest,
+        }) orelse {
+            if (publishes_windows) return error.EnrichmentSourceChanged;
+            return;
+        };
+        const O = @import("inference_chunker").outputs;
+        var receipts = std.json.parseFromSlice([]O.Result, alloc, raw, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidBatchRequest,
+        };
+        defer receipts.deinit();
+        var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer seen.deinit(alloc);
+        for (receipts.value) |receipt| {
+            if (receipt.kind != .embedding or !std.mem.eql(u8, receipt.name, "embedding")) continue;
+            // An unbound tombstone must still account for this consumer's receipts.
+            const revision_matches = (command.execution_identity == null and !publishes_windows) or
+                media_embedding_recipe.matchesRevision(receipt.model_revision, command.execution_identity);
+            const matches = revision_matches and (consumer.matches(alloc, receipt) catch |err| switch (err) {
+                error.InvalidChunkOutput, error.EmbeddingIdentityMismatch => return error.InvalidBatchRequest,
+                else => return err,
+            });
+            if (!matches) {
+                if (publishes_windows) return error.EnrichmentSourceChanged;
+                continue;
+            }
+            if ((try seen.getOrPut(alloc, receipt.sub_index)).found_existing) return error.EnrichmentSourceChanged;
+            switch (receipt.status) {
+                .complete => if (!live.remove(receipt.sub_index)) return error.EnrichmentSourceChanged,
+                .failed => if (!receipt.terminal) return error.EnrichmentSourceChanged,
+                else => return error.EnrichmentSourceChanged,
+            }
+        }
+        if (live.count() != 0) return error.EnrichmentSourceChanged;
+    }
+
+    fn resolveFusedConsumer(self: Fence, alloc: std.mem.Allocator) !?media_embedding_recipe.Recipe {
+        const chunker = self.chunker_config orelse if (self.inline_index_config.len != 0)
+            try manager.denseGeneratorChunkerJson(alloc, self.inline_index_config)
+        else
+            "";
+        return media_embedding_recipe.resolve(alloc, self.embedding_config, chunker, self.dimensions);
+    }
+
     pub fn requireCurrent(self: Fence, txn: anytype) !void {
         if (!self.prepared) return error.InvalidBatchRequest;
         if (self.certificate) |certificate| try certificate.requireCurrent(txn);
+    }
+
+    /// Validate the window plan outside the serialized writer. The scalar
+    /// precondition also fences the output set: physical child writes advance
+    /// the parent revision, even when the parent has no stored value.
+    pub fn validateWindowPlan(self: Fence, alloc: std.mem.Allocator, txn: anytype, command: publication.Command) !void {
+        _ = try self.checkWindowPlan(alloc, txn, command, false);
+    }
+
+    pub fn stageWindowWitness(self: Fence, txn: anytype) !void {
+        if (self.certify_empty) |key| try txn.put(&key, "1");
+    }
+
+    fn checkWindowPlan(self: Fence, alloc: std.mem.Allocator, txn: anytype, command: publication.Command, witness_enabled: bool) !?EmptyWindowKey {
+        if (!publication.isRevisionBoundChunkVectorSet(self.scope, command.producer_artifact_name, command.mutations))
+            return error.EnrichmentSourceChanged;
+        var scalar: ?publication.Mutation = null;
+        var live_window = false;
+        for (command.mutations) |effect| {
+            if (effect.key[self.scope.len] == keys.derived_embedding_kind) {
+                scalar = effect;
+            } else live_window = live_window or effect.value != null;
+        }
+        const parent = scalar orelse return error.EnrichmentSourceChanged;
+        const witness = emptyWindowKey(command.namespace, parent.key);
+        if (witness_enabled) {
+            const expected = for (command.mutation_preconditions) |guard| {
+                if (std.mem.eql(u8, parent.key, guard.key)) break guard.input_position;
+            } else return error.EnrichmentSourceChanged;
+            if (!std.meta.eql(expected, try publication.artifactRevision(txn, command.namespace, parent.key)))
+                return error.EnrichmentSourceChanged;
+            const previous = txn.get(&witness) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (previous) |raw| {
+                // Preview witnesses were tied to an epoch. Re-scan before
+                // replacing them with the physical empty-set certificate.
+                if (std.mem.eql(u8, raw, "1")) return null;
+            }
+        }
+        const first = try keys.mediaWindowChildKeyAlloc(alloc, self.scope, 0);
+        defer alloc.free(first);
+        const prefix = first[0 .. first.len - @sizeOf(u32)];
+        var cursor = try txn.openPhysicalCursorAdapter();
+        defer cursor.close();
+        cursor.setKeysOnly();
+        var row = try cursor.seekAtOrAfter(first);
+        var outputs: std.StringHashMapUnmanaged(void) = .empty;
+        defer outputs.deinit(alloc);
+        while (row) |entry| : (row = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            if (!keys.matchesDerivedEmbeddingArtifactName(entry.key, command.producer_artifact_name)) continue;
+            if (outputs.count() == 0) for (command.mutations) |mutation| try outputs.put(alloc, mutation.key, {});
+            if (!outputs.contains(entry.key)) return error.EnrichmentSourceChanged;
+        }
+        // Certify live scalars only. Historical or restored tables earn the
+        // first witness by scanning, and retired members need no new record.
+        return if (witness_enabled and parent.value != null and !live_window) witness else null;
     }
 };
 
@@ -185,6 +375,12 @@ pub fn prepare(alloc: std.mem.Allocator, command: publication.Command, catalogs:
     if (keys.derivedCoverageGenerationForConfig(producer.coverage_generation, producer.config_json) != command.producer_generation or
         !try manager.consumesGeneratedChunkVector(owned, producer, producers, scope.name, command.producer_artifact_name)) return error.EnrichmentSourceChanged;
     const dims = if (producer.kind == .dense_vector) try manager.denseConfigDimensions(owned, producer) else 0;
+    const model_config = for (producers) |entry| {
+        if (entry.kind == .embedding and std.mem.eql(u8, entry.name, command.producer_artifact_name)) break entry.producer_json;
+    } else "";
+    const chunker_config = for (producers) |entry| {
+        if (entry.kind == .chunk and std.mem.eql(u8, entry.name, scope.name)) break entry.chunker_json;
+    } else null;
     var dense: std.ArrayList(derived.DerivedDenseEmbeddingWrite) = .empty;
     var sparse: std.ArrayList(derived.DerivedSparseEmbeddingWrite) = .empty;
     var changed: std.ArrayList([]const u8) = .empty;
@@ -220,7 +416,7 @@ pub fn prepare(alloc: std.mem.Allocator, command: publication.Command, catalogs:
     // Finish allocations before copying the arena owner. Growing the arena
     // after that copy would leave its new allocation chain unowned.
     const owned_scope = try owned.dupe(u8, command.producer_scope_key);
-    return .{ .arena = arena, .chunk_vector_fence = .{ .scope = owned_scope, .requires_member = changed.items.len != 0 }, .batch = .{
+    return .{ .arena = arena, .chunk_vector_fence = .{ .scope = owned_scope, .requires_member = changed.items.len != 0, .dense = producer.kind == .dense_vector, .embedding_config = model_config, .chunker_config = chunker_config, .inline_index_config = producer.config_json, .dimensions = dims }, .batch = .{
         .dense_embeddings = dense.items,
         .sparse_embeddings = sparse.items,
         .changed_artifact_keys = changed.items,
@@ -329,4 +525,149 @@ fn testPreparation(sparse_kind: bool) !void {
 
 test "model aware media chunk vector windows share parent fences and project every vector" {
     try testPreparation(false);
+}
+
+test "model aware media current empty witness bypasses the child range cursor" {
+    const a = std.testing.allocator;
+    const Reader = struct {
+        witness: EmptyWindowKey,
+        raw: [1]u8,
+
+        pub fn get(self: *const @This(), key: []const u8) anyerror![]const u8 {
+            return if (std.mem.eql(u8, key, &self.witness)) &self.raw else error.NotFound;
+        }
+
+        pub fn openPhysicalCursorAdapter(_: @This()) !@import("../backend_erased.zig").Cursor {
+            return error.TestUnexpectedResult;
+        }
+    };
+    const scope = try keys.chunkArtifactKeyAlloc(a, "doc", "text", 0);
+    defer a.free(scope);
+    const scalar = try keys.derivedEmbeddingArtifactKeyAlloc(a, scope, "model");
+    defer a.free(scalar);
+    var command: publication.Command = .{
+        .namespace = @splat(1),
+        .authority_epoch = 2,
+        .catalog_digest = @splat(3),
+        .producer_name = "vectors",
+        .producer_kind = .index,
+        .producer_generation = 1,
+        .producer_artifact_name = "model",
+        .producer_scope_key = scope,
+        .sources = &.{},
+        .mutation_preconditions = &.{.{ .key = scalar, .content_digest = null, .input_position = null, .source_index = 0 }},
+        .mutations = &.{.{ .family = .derived_vector, .key = scalar, .value = "vector", .source_index = 0 }},
+        .publication_digest = @splat(0),
+    };
+    var reader: Reader = .{ .witness = emptyWindowKey(command.namespace, scalar), .raw = "1".* };
+    command.authority_epoch += 1;
+    command.catalog_digest = @splat(4);
+    const fence: Fence = .{ .scope = scope, .requires_member = true, .dense = true };
+    try std.testing.expect((try fence.checkWindowPlan(a, &reader, command, true)) == null);
+    reader.raw[0] ^= 1;
+    try std.testing.expectError(error.TestUnexpectedResult, fence.checkWindowPlan(a, &reader, command, true));
+}
+
+test "model aware media fused receipt validation covers tombstones and pending windows" {
+    const a = std.testing.allocator;
+    const O = @import("inference_chunker").outputs;
+    const scope = try keys.chunkArtifactKeyAlloc(a, "doc", "clips", 0);
+    defer a.free(scope);
+    const scalar = try keys.derivedEmbeddingArtifactKeyAlloc(a, scope, "model");
+    defer a.free(scalar);
+    const child = try keys.mediaWindowChildKeyAlloc(a, scope, 0);
+    defer a.free(child);
+    const child_key = try keys.derivedEmbeddingArtifactKeyAlloc(a, child, "model");
+    defer a.free(child_key);
+    var effects = [_]publication.Mutation{
+        .{ .family = .derived_vector, .key = scalar, .value = null, .source_index = 0 },
+        .{ .family = .derived_vector, .key = child_key, .value = "vector", .source_index = 0 },
+    };
+    var command: publication.Command = .{
+        .namespace = @splat(1),
+        .authority_epoch = 2,
+        .catalog_digest = @splat(3),
+        .producer_name = "vectors",
+        .producer_generation = 1,
+        .producer_artifact_name = "model",
+        .sources = &.{},
+        .mutations = effects[0..1],
+        .publication_digest = @splat(0),
+    };
+    const fence: Fence = .{
+        .scope = scope,
+        .requires_member = false,
+        .dense = true,
+        .dimensions = 2,
+        .embedding_config =
+        \\{"provider":"antfly","model":"model"}
+        ,
+        .chunker_config =
+        \\{"provider":"antfly","outputs":{"boundary_model":"model","targets":[{"name":"embedding","kind":"embedding","model":"model","dimensions":2}]}}
+        ,
+    };
+    const revision: publication.Digest = @splat(8);
+    const revision_hex = std.fmt.bytesToHex(revision, .lower);
+    const identity: [64]u8 = @splat('3');
+    var target: O.Target = .{ .name = "embedding", .kind = .embedding, .model = "model", .dimensions = 2 };
+    const matching_recipe = try target.recipeIdentity(a, &identity, &revision_hex);
+    target.task_type = "RETRIEVAL_QUERY";
+    const foreign_recipe = try target.recipeIdentity(a, &identity, &revision_hex);
+    const completed: O.Result = .{
+        .name = "embedding",
+        .kind = .embedding,
+        .required = true,
+        .model = "model",
+        .model_identity = &identity,
+        .model_revision = &revision_hex,
+        .recipe_id = &matching_recipe,
+        .status = .complete,
+    };
+    var pending = completed;
+    pending.sub_index = 1;
+    pending.status = .failed;
+    pending.code = "temporary";
+    var terminal = pending;
+    terminal.terminal = true;
+    terminal.sub_index = 0;
+    var foreign = completed;
+    foreign.recipe_id = &foreign_recipe;
+    const outcomes = [_][]const O.Result{ &.{completed}, &.{ completed, pending }, &.{terminal}, &.{foreign} };
+    for (outcomes, 0..) |outcome, scenario| {
+        const raw = try std.json.Stringify.valueAlloc(a, outcome, .{});
+        defer a.free(raw);
+        const Model = @import("inference_chunker").types.ModelMetadata;
+        const metadata: Model = .{
+            .descriptor = .{ .ordinal = 0, .input_tokens = 1, .coordinates = .{ .kind = .video } },
+            .inference_id = "plan:0",
+            .plan_id = "plan",
+            .source_fingerprint = "source",
+            .source_version = "v1",
+            .model = "model",
+            .model_identity = "",
+            .model_revision = "",
+            .task_type = "RETRIEVAL_DOCUMENT",
+            .dimensions = 2,
+            .policy = .{},
+            .outputs_json = raw,
+        };
+        const payload = try std.json.Stringify.valueAlloc(a, .{ ._chunk = metadata }, .{});
+        defer a.free(payload);
+        command.mutations = if (scenario == 1) &effects else effects[0..1];
+        command.execution_identity = revision;
+        if (scenario == 0) {
+            command.execution_identity = null;
+            try std.testing.expectError(error.EnrichmentSourceChanged, fence.validateFusedReceipts(a, command, payload));
+            command.execution_identity = revision;
+        }
+        if (scenario == 2 or scenario == 3) {
+            try fence.validateFusedReceipts(a, command, payload);
+        } else {
+            try std.testing.expectError(error.EnrichmentSourceChanged, fence.validateFusedReceipts(a, command, payload));
+        }
+        if (scenario == 3) {
+            command.mutations = &effects;
+            try std.testing.expectError(error.EnrichmentSourceChanged, fence.validateFusedReceipts(a, command, payload));
+        }
+    }
 }

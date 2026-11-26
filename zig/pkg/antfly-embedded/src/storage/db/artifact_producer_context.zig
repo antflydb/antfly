@@ -159,6 +159,39 @@ pub const Token = struct {
         return self.observeGuard(true, key, raw, position);
     }
 
+    /// Merge an ordered chunk window capture without duplicating its keys.
+    /// The owner must keep the incoming key storage alive through submission.
+    pub fn borrowWindowPreconditions(self: *Token, incoming: []const publication.ArtifactSource, key_bytes: usize) !void {
+        if (incoming.len == 0) return;
+        const previous = self.preconditions.items;
+        if (self.reads.items.len + previous.len + incoming.len > publication.max_source_documents or
+            self.read_key_bytes +| key_bytes > publication.max_identity_bytes) return error.ResourceBudgetExceeded;
+        const source_index = try self.sourceIndex(self.source.document_key);
+        const owned = self.arena.allocator();
+        const merged = try owned.alloc(publication.ArtifactSource, previous.len + incoming.len);
+        errdefer owned.free(merged);
+        var i: usize = 0;
+        var j: usize = 0;
+        for (merged) |*guard| {
+            const order: std.math.Order = if (i == previous.len) .gt else if (j == incoming.len) .lt else std.mem.order(u8, previous[i].key, incoming[j].key);
+            switch (order) {
+                .lt => {
+                    guard.* = previous[i];
+                    i += 1;
+                },
+                .gt => {
+                    guard.* = incoming[j];
+                    guard.source_index = source_index;
+                    j += 1;
+                },
+                .eq => return error.EnrichmentSourceChanged,
+            }
+        }
+        self.preconditions.deinit(owned);
+        self.preconditions = .{ .items = merged, .capacity = merged.len, .pointer_stability = .{} };
+        self.read_key_bytes += key_bytes;
+    }
+
     fn observeGuard(self: *Token, precondition: bool, key: []const u8, raw: ?[]const u8, position: ?publication.Position) !void {
         var digest: ?publication.Digest = null;
         if (raw) |value| {
