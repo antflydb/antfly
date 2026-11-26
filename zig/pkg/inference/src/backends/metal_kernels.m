@@ -73315,7 +73315,11 @@ int termite_metal_buffer_download(
         if (termite_metal_trace_frame_lifecycle_enabled()) {
             fprintf(stderr, "metal_frame_lifecycle: buffer_download storage=private length=%zu offset=%zu\n", length, offset);
         }
-        if (termite_metal_decode_runtime_flush_active_frame(runtime) != 0) return -8;
+        // A private read can be the final blit of the producer's frame.
+        // Workspace-budgeted paths retire their scratch before allocating the
+        // staging buffer, preserving their existing peak live allocation.
+        const bool append_to_active = runtime->active_frame_cb != nil && !runtime->embedding_workspace_owned;
+        if (!append_to_active && termite_metal_decode_runtime_flush_active_frame(runtime) != 0) return -8;
         void *receipt = NULL;
         id<MTLBuffer> staging __attribute__((objc_precise_lifetime)) = runtime->embedding_workspace_owned
             ? antfly_metal_workspace_buffer_impl(runtime, length, MTLResourceStorageModeShared, NULL, &receipt)
@@ -73324,16 +73328,23 @@ int termite_metal_buffer_download(
             .owner = runtime->embedding_workspace_owner, .receipt = receipt,
         };
         if (staging == nil) return -4;
-        id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
+        bool frame_owned = true;
+        id<MTLCommandBuffer> command_buffer = append_to_active
+            ? termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned)
+            : termite_metal_new_command_buffer(runtime->queue, __func__);
         if (command_buffer == nil) return -5;
-        id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder(command_buffer);
+        id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder_for_runtime(runtime, command_buffer);
         if (blit == nil) return -6;
         if ([blit respondsToSelector:@selector(setLabel:)]) {
             blit.label = @"buffer-download";
         }
         [blit copyFromBuffer:src sourceOffset:offset toBuffer:staging destinationOffset:0 size:length];
         [blit endEncoding];
-        if (termite_metal_commit_and_wait(command_buffer, __func__, -7) != 0) return -7;
+        if (frame_owned) {
+            if (termite_metal_commit_and_wait(command_buffer, __func__, -7) != 0) return -7;
+        } else if (termite_metal_decode_runtime_flush_active_frame(runtime) != 0) {
+            return -8;
+        }
         memcpy(dst, staging.contents, length);
         termite_metal_telemetry_copy(TERMITE_METAL_DOWNLOAD_BYTES, TERMITE_METAL_DOWNLOAD_CALLS, length);
         return 0;

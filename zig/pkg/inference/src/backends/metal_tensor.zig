@@ -567,7 +567,9 @@ extern fn termite_metal_buffer_download(
 ) c_int;
 fn downloadBuffer(runtime: *anyopaque, handle: *anyopaque, offset: usize, output: *anyopaque, bytes: usize) !void {
     try transfer_audit.checkDeviceHostAccess();
-    if (termite_metal_buffer_download(runtime, handle, offset, output, bytes) != 0) return error.MetalBufferDownloadFailed;
+    const status = termite_metal_buffer_download(runtime, handle, offset, output, bytes);
+    if (status == -8) return error.MetalFrameSyncFailed;
+    if (status != 0) return error.MetalBufferDownloadFailed;
     transfer_audit.download(bytes);
 }
 extern fn termite_metal_decode_runtime_flush_active_frame(runtime: *anyopaque) c_int;
@@ -1505,7 +1507,6 @@ pub const MetalTensor = struct {
         if (dev.ref.released or dev.ref.ref_count.load(.acquire) == 0) return error.ReleasedDeviceBuffer;
         if (offset > dev.byte_len or output.len > dev.byte_len - offset) return error.InvalidTensorShape;
         if (output.len == 0) return;
-        if (termite_metal_decode_runtime_flush_active_frame(dev.ref.runtime) != 0) return error.MetalFrameSyncFailed;
         try downloadBuffer(dev.ref.runtime, dev.ref.handle, dev.byte_offset + offset, @ptrCast(output.ptr), output.len);
     }
 

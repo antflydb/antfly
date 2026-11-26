@@ -57155,6 +57155,21 @@ test "Metal uniform observation counts real dispatch submission waits and rounde
     try std.testing.expect(interval.process.?.counters.physical_allocations > 0);
     try std.testing.expect(interval.process.?.owned_live_bytes >= actual_backing);
     try std.testing.expect(interval.process.?.owned_lifetime_peak_bytes >= interval.process.?.owned_live_bytes);
+
+    try metal_runtime_mod.beginFrame(raw);
+    defer if (metal_runtime_mod.hasActiveFrame(raw)) metal_runtime_mod.cancelFrame(raw) catch unreachable;
+    var download_scope = @import("../execution/runtime_observation.zig").Scope.init();
+    defer download_scope.deinit();
+    const framed = try backend.relu(input);
+    defer backend.free(framed);
+    try std.testing.expect(metal_runtime_mod.activeFrameHasWork(raw));
+    var selected: [2]f32 = undefined;
+    try std.testing.expect(try backend.readFloat32RangeInto(framed, 2, &selected));
+    try std.testing.expectEqualSlices(f32, &.{ 0, 4 }, &selected);
+    const readback = download_scope.snapshot();
+    try std.testing.expectEqual(@as(?u64, 1), readback.metal_command_submissions);
+    try std.testing.expectEqual(@as(?u64, 1), readback.metal_command_waits);
+    try std.testing.expect(metal_runtime_mod.hasActiveFrame(raw));
 }
 test "Metal decoder assigned outputs preserve all four tuned kernels without host access or output allocation" {
     if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
