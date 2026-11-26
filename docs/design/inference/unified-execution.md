@@ -1007,6 +1007,13 @@ automatic limits. Metal submitted the prompt frames. This verifies
 admission and start of execution. Full-window completion and latency
 remain unmeasured.
 
+The shared ByteLevel tokenizer now applies the checkpoint's exact
+Unicode Split expression, including casing, three-digit groups, and
+punctuation followed by newlines. With the released tokenizer, the
+short prompt still has 28 tokens and the long text prompt now matches
+the reference at 6,396 tokens. The earlier HTTP timings retain their
+original measured token counts.
+
 ### Official Gemma 4 E2B QAT serving comparison
 
 The decoder and projector came from Google's E2B QAT Q4_0 GGUF revision

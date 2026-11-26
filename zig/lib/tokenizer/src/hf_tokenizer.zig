@@ -95,10 +95,14 @@ const ByteLevelPretokenizer = enum {
     /// Qwen3-VL. ByteLevel itself has `use_regex=false`; the preceding Split
     /// owns the pretoken boundaries.
     qwen,
+    unicode_cased,
 };
 
 const qwen_byte_level_split_regex =
     "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+
+const unicode_cased_byte_level_split_regex =
+    "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 
 const MetaspacePrependScheme = enum {
     always,
@@ -1143,7 +1147,7 @@ pub const HfTokenizer = struct {
                     }
                 } else if (std.mem.eql(u8, t.string, "Sequence")) {
                     var saw_removed_inverted_split = false;
-                    var saw_qwen_byte_level_split = false;
+                    var byte_level_pretokenizer: ByteLevelPretokenizer = .gpt2;
                     // Preserve the Split semantics that precede ByteLevel. CLIP
                     // uses Removed+invert=true and intentionally discards the
                     // unmatched whitespace. Qwen and Llama use Isolated splits,
@@ -1156,12 +1160,10 @@ pub const HfTokenizer = struct {
                                         if (pt == .string) {
                                             if (std.mem.eql(u8, pt.string, "Split")) {
                                                 saw_removed_inverted_split = splitRemovesUnmatchedText(item.object);
-                                                saw_qwen_byte_level_split = splitUsesQwenByteLevelRegex(item.object);
+                                                byte_level_pretokenizer = splitByteLevelPretokenizer(item.object);
                                             } else if (std.mem.eql(u8, pt.string, "ByteLevel")) {
                                                 self.pre_tokenizer_type = if (saw_removed_inverted_split) .byte_level_split else .byte_level;
-                                                if (!saw_removed_inverted_split and saw_qwen_byte_level_split) {
-                                                    self.byte_level_pretokenizer = .qwen;
-                                                }
+                                                if (!saw_removed_inverted_split) self.byte_level_pretokenizer = byte_level_pretokenizer;
                                                 return;
                                             } else if (std.mem.eql(u8, pt.string, "Metaspace")) {
                                                 self.pre_tokenizer_type = .metaspace;
@@ -1190,20 +1192,22 @@ pub const HfTokenizer = struct {
             invert == .bool and invert.bool;
     }
 
-    fn splitUsesQwenByteLevelRegex(obj: std.json.ObjectMap) bool {
-        const behavior = obj.get("behavior") orelse return false;
-        const invert = obj.get("invert") orelse return false;
-        const pattern = obj.get("pattern") orelse return false;
+    fn splitByteLevelPretokenizer(obj: std.json.ObjectMap) ByteLevelPretokenizer {
+        const behavior = obj.get("behavior") orelse return .gpt2;
+        const invert = obj.get("invert") orelse return .gpt2;
+        const pattern = obj.get("pattern") orelse return .gpt2;
         if (behavior != .string or
             !std.mem.eql(u8, behavior.string, "Isolated") or
             invert != .bool or invert.bool or
             pattern != .object)
         {
-            return false;
+            return .gpt2;
         }
-        const regex = pattern.object.get("Regex") orelse return false;
-        return regex == .string and
-            std.mem.eql(u8, regex.string, qwen_byte_level_split_regex);
+        const regex = pattern.object.get("Regex") orelse return .gpt2;
+        if (regex != .string) return .gpt2;
+        if (std.mem.eql(u8, regex.string, qwen_byte_level_split_regex)) return .qwen;
+        if (std.mem.eql(u8, regex.string, unicode_cased_byte_level_split_regex)) return .unicode_cased;
+        return .gpt2;
     }
 
     fn inferModelType(obj: std.json.ObjectMap) ModelType {
@@ -4434,10 +4438,10 @@ pub const HfTokenizer = struct {
         scratch: *BpeScratch,
     ) !void {
         try ids.ensureUnusedCapacity(allocator, (text.len / 3) + 8);
-        if (self.byte_level_pretokenizer == .qwen) {
+        if (self.byte_level_pretokenizer != .gpt2) {
             var start: usize = 0;
             while (start < text.len) {
-                const end = qwenPreTokenEnd(text, start);
+                const end = byteLevelSplitEnd(self.byte_level_pretokenizer, text, start);
                 try self.bpeEncodeWord(allocator, text[start..end], ids, scratch);
                 start = end;
             }
@@ -5726,9 +5730,9 @@ pub const HfTokenizer = struct {
         }
         var count: usize = 0;
         var start: usize = 0;
-        if (self.byte_level_pretokenizer == .qwen) {
+        if (self.byte_level_pretokenizer != .gpt2) {
             while (start < text.len) {
-                start = qwenPreTokenEnd(text, start);
+                start = byteLevelSplitEnd(self.byte_level_pretokenizer, text, start);
                 count +|= 1;
             }
             return count;
@@ -8544,7 +8548,11 @@ fn qwenPreTokenEnd(text: []const u8, start: usize) usize {
     // \p{N} intentionally matches exactly one Unicode numeric codepoint.
     if (first.class == .number) return next_start;
 
-    //  ?[^\s\p{L}\p{N}]+[\r\n]*
+    return splitPunctuationOrSpaceEnd(text, start, first, false);
+}
+
+fn splitPunctuationOrSpaceEnd(text: []const u8, start: usize, first: Gpt2Char, slash_tail: bool) usize {
+    const next_start = start + first.len;
     var punctuation_start = start;
     if (text[start] == ' ' and next_start < text.len and
         gpt2CharAt(text, next_start).class == .other)
@@ -8558,7 +8566,7 @@ fn qwenPreTokenEnd(text: []const u8, start: usize) usize {
             if (punctuation.class != .other) break;
             end += punctuation.len;
         }
-        while (end < text.len and (text[end] == '\r' or text[end] == '\n')) {
+        while (end < text.len and (text[end] == '\r' or text[end] == '\n' or (slash_tail and text[end] == '/'))) {
             end += 1;
         }
         return end;
@@ -8596,6 +8604,126 @@ fn qwenPreTokenEnd(text: []const u8, start: usize) usize {
     // Invalid UTF-8 is classified as punctuation above. Retain an explicit
     // progress fallback so malformed inputs can never stall tokenization.
     return next_start;
+}
+
+const UnicodeLetterCase = enum { upper, lower, either, neither };
+
+fn unicodeLetterCase(codepoint: u21) UnicodeLetterCase {
+    if (codepoint < 0x80) {
+        const c: u8 = @intCast(codepoint);
+        if (std.ascii.isUpper(c)) return .upper;
+        if (std.ascii.isLower(c)) return .lower;
+        return .neither;
+    }
+    return switch (unicode_classes.caseOverride(codepoint)) {
+        .lower => .lower,
+        .upper => .upper,
+        .mark => .either,
+        .none => if (unicode_classes.classify(codepoint) == .letter) .either else .neither,
+    };
+}
+
+fn casedCharAt(text: []const u8, pos: usize) struct { case: UnicodeLetterCase, len: usize } {
+    const first = text[pos];
+    if (first < 0x80) return .{ .case = unicodeLetterCase(first), .len = 1 };
+    const len: usize = std.unicode.utf8ByteSequenceLength(first) catch
+        return .{ .case = .neither, .len = 1 };
+    if (len > text.len - pos) return .{ .case = .neither, .len = 1 };
+    const codepoint = std.unicode.utf8Decode(text[pos..][0..len]) catch
+        return .{ .case = .neither, .len = 1 };
+    return .{ .case = unicodeLetterCase(codepoint), .len = len };
+}
+
+const CasedWord = struct {
+    ending_in_lower: ?usize = null,
+    beginning_in_upper: ?usize = null,
+};
+
+// The regex tries upper* lower+ before upper+ lower*. Uncased letters and
+// marks are in both classes, so the first arm can backtrack to the last one.
+fn casedWordEnds(text: []const u8, start: usize) CasedWord {
+    var end = start;
+    var ambiguous_end: ?usize = null;
+    var saw_upper = false;
+    while (end < text.len) {
+        const c = casedCharAt(text, end);
+        const kind = c.case;
+        if (kind != .upper and kind != .either) break;
+        end += c.len;
+        if (kind == .either) ambiguous_end = end;
+        saw_upper = true;
+    }
+    const lower_start = end;
+    while (end < text.len) {
+        const c = casedCharAt(text, end);
+        const kind = c.case;
+        if (kind != .lower and kind != .either) break;
+        end += c.len;
+    }
+    return .{
+        .ending_in_lower = if (end > lower_start) end else ambiguous_end,
+        .beginning_in_upper = if (saw_upper) end else null,
+    };
+}
+
+fn unicodeCasedPreTokenEnd(text: []const u8, start: usize) usize {
+    const first = gpt2CharAt(text, start);
+    const next_start = start + first.len;
+    const prefixed = if (first.class != .letter and first.class != .number and
+        text[start] != '\r' and text[start] != '\n')
+        casedWordEnds(text, next_start)
+    else
+        CasedWord{};
+    const word_end = prefixed.ending_in_lower orelse blk: {
+        const unprefixed = casedWordEnds(text, start);
+        break :blk unprefixed.ending_in_lower orelse
+            prefixed.beginning_in_upper orelse unprefixed.beginning_in_upper;
+    };
+    if (word_end) |end| return end + (qwenContractionLen(text[end..]) orelse 0);
+
+    if (first.class == .number) {
+        var end = next_start;
+        for (0..2) |_| {
+            if (end == text.len) break;
+            const next = gpt2CharAt(text, end);
+            if (next.class != .number) break;
+            end += next.len;
+        }
+        return end;
+    }
+    return splitPunctuationOrSpaceEnd(text, start, first, true);
+}
+
+fn byteLevelSplitEnd(mode: ByteLevelPretokenizer, text: []const u8, start: usize) usize {
+    return switch (mode) {
+        .gpt2 => gpt2PreTokenEnd(text, start),
+        .qwen => qwenPreTokenEnd(text, start),
+        .unicode_cased => unicodeCasedPreTokenEnd(text, start),
+    };
+}
+
+test "ByteLevel cased Unicode split preserves checkpoint regex priority" {
+    const a = std.testing.allocator;
+    const spec = try std.json.Stringify.valueAlloc(a, .{
+        .behavior = "Isolated",
+        .invert = false,
+        .pattern = .{ .Regex = unicode_cased_byte_level_split_regex },
+    }, .{});
+    defer a.free(spec);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, spec, .{});
+    defer parsed.deinit();
+    const mode = HfTokenizer.splitByteLevelPretokenizer(parsed.value.object);
+    try std.testing.expectEqual(ByteLevelPretokenizer.unicode_cased, mode);
+    const input = "HTTPServer helloWorld 中文ABC 1234567 isn't!?\r\n/after";
+    const expected = [_][]const u8{ "HTTPServer", " hello", "World", " 中文", "ABC", " ", "123", "456", "7", " isn't", "!?\r\n/", "after" };
+    var start: usize = 0;
+    for (expected) |piece| {
+        try std.testing.expect(start < input.len);
+        const end = byteLevelSplitEnd(mode, input, start);
+        try std.testing.expectEqualStrings(piece, input[start..end]);
+        start = end;
+    }
+    try std.testing.expectEqual(input.len, start);
 }
 
 const Gpt2AsciiClassMasks = struct {
@@ -11962,6 +12090,27 @@ fn bpeNfcAllocationFailure(a: std.mem.Allocator) !void {
 
 test "BPE NFC normalization releases every failed allocation" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, bpeNfcAllocationFailure, .{});
+}
+
+test "Inkling 2 Mini released ByteLevel tokenizer matches the reference prompt lengths" {
+    const a = std.testing.allocator;
+    const path = @import("antfly_platform").env.getenv("ANTFLY_INKLING2_TOKENIZER_JSON") orelse return error.SkipZigTest;
+    const tokenizer = try HfTokenizer.loadFromDir(a, std.Io.Dir.cwd(), std.testing.io, path);
+    defer tokenizer.deinitSelf();
+    try std.testing.expectEqual(ByteLevelPretokenizer.unicode_cased, tokenizer.byte_level_pretokenizer);
+    const prefix = "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>";
+    const suffix = "<|end_message|><|message_model|><|content_text|>";
+    const short = try tokenizer.encode(a, prefix ++ "What is 2 plus 2? Answer with one number." ++ suffix);
+    defer a.free(short);
+    try std.testing.expectEqual(@as(usize, 28), short.len);
+    var prompt: std.ArrayList(u8) = .empty;
+    defer prompt.deinit(a);
+    try prompt.appendSlice(a, prefix ++ "Remember that the lookup key is 271.\n");
+    for (0..530) |_| try prompt.appendSlice(a, "The sky is blue today. The grass is green.\n");
+    try prompt.appendSlice(a, "\nWhat is the lookup key? Answer with one number." ++ suffix);
+    const long = try tokenizer.encode(a, prompt.items);
+    defer a.free(long);
+    try std.testing.expectEqual(@as(usize, 6396), long.len);
 }
 
 test "GLiNER2.5 family pinned full tokenizers match multilingual golden IDs" {
