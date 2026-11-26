@@ -149,7 +149,6 @@ pub const Decoder = struct {
 };
 
 const Temp = enum {
-    query,
     key,
     value,
     raw,
@@ -157,7 +156,6 @@ const Temp = enum {
     convolved_expert,
     normalized,
     mix,
-    shared_mix,
     message,
     pair,
     rank,
@@ -173,7 +171,7 @@ const Temp = enum {
 
 fn tempDtype(kind: Temp) tensors.DType {
     return switch (kind) {
-        .mix, .shared_mix, .message, .gates, .router, .route_weights, .logits => .f32,
+        .mix, .message, .gates, .router, .route_weights, .logits => .f32,
         .selected => .i32,
         else => .i16,
     };
@@ -228,7 +226,6 @@ const WorkPlan = struct {
         const experts = model.layers[0].experts.geometry(text, rows);
         const shape = try experts.scratchShape();
         const elements = std.EnumArray(Temp, usize).init(.{
-            .query = count,
             .key = count,
             .value = count,
             .raw = count,
@@ -236,7 +233,6 @@ const WorkPlan = struct {
             .convolved_expert = count,
             .normalized = count,
             .mix = count,
-            .shared_mix = count,
             .message = count,
             .pair = count * 2,
             .rank = @as(usize, rows) * text.loop_config.gate_rank,
@@ -465,7 +461,9 @@ pub const Request = struct {
         const looped = op.pass != 0;
         try work.stack.advance(op, text.loop_config.core_start);
 
-        const destinations = [_]*Tensor{ work.get(.query), work.get(.key), work.get(.value) };
+        // The expert and final normalization reuse the query input after
+        // attention has consumed it. Both controllers also reuse the F32 mix.
+        const destinations = [_]*Tensor{ work.get(.normalized), work.get(.key), work.get(.value) };
         for ([_]checkpoint.ControllerStream{ .attn, .k, .v }, [_]Layer.Weight{ .q_norm, .k_norm, .v_norm }, destinations, 0..) |stream, norm, dest, index| {
             if (local and !looped and index != 0) break;
             const gamma = layer.weight(if (local) .q_norm else norm);
@@ -477,10 +475,10 @@ pub const Request = struct {
                 var query = try row(layer.weight(.attn_query), index, text.hidden_size);
                 defer query.deinit();
                 if (looped) {
-                    try work.stack.mix(runtime, eps, &query, null, work.get(.shared_mix));
+                    try work.stack.mix(runtime, eps, &query, null, work.get(.mix));
                 } else try work.stack.mix(runtime, eps, &query, gamma, dest);
             }
-            if (looped) try self.control(work, layer, op.weight_layer, stream, work.get(.shared_mix), gamma, dest);
+            if (looped) try self.control(work, layer, op.weight_layer, stream, work.get(.mix), gamma, dest);
         }
         const binding = try self.state.binding(pending, .{ .group = op.group, .slot = op.slot });
         try layer.attention.encode(runtime, text, pending, .{
