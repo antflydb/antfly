@@ -327,7 +327,7 @@ pub const State = struct {
             else => {},
         };
         // The logits readback has finished the invocation's numerical use.
-        if (!fresh or outputs.backend.kind() == .native) try self.migrateDependentCaches(slots, updated, fresh, control);
+        try self.migrateDependentCaches(slots, updated, fresh, control);
         if (control) |active| try active.check();
         for (slots, updated) |*old, new| if (new) |value| {
             if (old.*) |previous| previous.pin.release();
@@ -432,8 +432,8 @@ pub const State = struct {
         }
         for (self.roles, previous, updated, 0..) |role, old, slot, index| switch (role) {
             .past => |past| if (fresh or (past.cross and slot == null)) {
-                // CPU prefill can publish a slice of a larger transient bank.
-                // Detach it synchronously before keeping that bank for decode.
+                // Prefill can publish a slice of a transient bank. Detach
+                // eligible slots before keeping them for decode.
                 const source = (if (fresh) slot else old) orelse return error.InvalidDecoderOutput;
                 if (source.independent or source.input.backend.ptr != backend.ptr or source.input.backend.vtable != backend.vtable) continue;
                 if (control) |active| try active.check();
