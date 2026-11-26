@@ -51476,14 +51476,19 @@ fn verifyDenseMediaAcknowledgementDrain() !void {
         .config = .{},
         .ownership = undefined,
     };
-    const prefix = try media_pass.scope(a, "doc", "clips", "body");
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .dense_embedding, .index_name = "vectors", .doc_key = "doc", .source_field = "body", .sequence = 7 };
+    const embedding = indexes.getEnrichment(.embedding, requestEmbeddingName(request)) orelse return error.MissingTestEmbedding;
+    const chunks = indexes.getEnrichment(.chunk, embedding.source_artifact_name) orelse return error.MissingTestChunker;
+    const prefix = try media_pass.scope(a, request.doc_key, chunks.name, chunks.source_field);
     defer a.free(prefix);
     const key = try media_pass.key(a, prefix, null);
     defer a.free(key);
-    const cursor = try media_pass.encode(a, media_pass.Cursor{ .input_digest = @splat(1), .source_sequence = 7, .complete = true });
+    const cursor = try media_pass.encode(a, media_pass.Cursor{ .input_digest = @splat(1), .source_sequence = request.sequence, .complete = true });
     defer a.free(cursor);
     try storePutWithRetry(&runtime, key, cursor);
-    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .dense_embedding, .index_name = "vectors", .doc_key = "doc", .source_field = "body", .sequence = 7 };
+    const stored = (try storeGetOptionalAllocWithRetry(&runtime, key)) orelse return error.MissingTestMediaCursor;
+    defer a.free(stored);
+    try std.testing.expectEqualSlices(u8, cursor, stored);
     const owned = try enrichment_types.cloneGeneratedRequests(a, &.{request});
     const lane = a.create(DenseExecutionLane) catch |err| {
         enrichment_types.deinitGeneratedRequests(a, owned);
@@ -51492,13 +51497,16 @@ fn verifyDenseMediaAcknowledgementDrain() !void {
     lane.* = .{ .runtime = &runtime, .plain_dense = &.{}, .chunked_dense = owned, .chunk_cache = &lane.chunk_cache_storage, .window = .{ .alloc = a }, .applied_sequence = 0, .group = null };
 
     const Lock = struct {
-        fn begin(_: Allocator, _: *anyopaque, _: @import("../../backend_types.zig").BatchOptions) anyerror!backend_erased.Batch {
+        fn acquire(_: *anyopaque, _: ?GeneratedWriteFence, _: u64) anyerror!GeneratedStoreLease {
             return error.WriterLocked;
         }
     };
-    var failing = runtime.store.vtable.*;
-    failing.begin_batch_with_options = Lock.begin;
-    runtime.store.vtable = &failing;
+    runtime.generated_publication = .{
+        .ptr = &runtime,
+        .commit = undefined,
+        .heartbeat = undefined,
+        .acquire_store = Lock.acquire,
+    };
     const future = std.testing.io.concurrent(DenseExecutionLane.finishPublishedQuantum, .{lane}) catch |err| {
         lane.deinitOwned();
         a.destroy(lane);
