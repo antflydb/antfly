@@ -267,11 +267,10 @@ pub const Decoder = struct {
         // Language detection can expose several already-known forced tokens.
         // Submit the complete new suffix; never drop those intermediate rows.
         const ids = suffix.tokens;
-        const staging_bytes = try std.math.mul(usize, ids.len, @sizeOf(i64));
-        var staging = try self.source.withAdmissionControl(control).admitRetainedMedia(staging_bytes, 0);
-        defer staging.deinit();
-        const positions = try a.alloc(i64, ids.len);
-        defer a.free(positions);
+        var local: [16]i64 = undefined;
+        var staging = try InputStaging.init(self.source, a, &local, ids.len, control);
+        defer staging.deinit(a);
+        const positions = staging.values;
         for (positions, 0..) |*position, index| position.* = @intCast(self.position + index);
         const suffix_shape = [_]i64{ 1, @intCast(ids.len) };
         const mask_shape = [_]i64{ 1, @intCast(mask.len) };
@@ -357,11 +356,10 @@ pub const Decoder = struct {
         // Only the two optional, invocation-owned arrays consume staging
         // quota. Caller history and stack operands are borrowed synchronously.
         const staging_elements = try std.math.add(usize, padded_count, position_count);
-        const staging_bytes = try std.math.mul(usize, staging_elements, @sizeOf(i64));
-        var staging = if (staging_bytes != 0) try self.source.withAdmissionControl(control).admitRetainedMedia(staging_bytes, 0) else null;
-        defer if (staging) |*permit| permit.deinit();
-        const padded = if (padded_count != 0) try a.alloc(i64, padded_count) else null;
-        defer if (padded) |values| a.free(values);
+        var local: [16]i64 = undefined;
+        var staging = try InputStaging.init(self.source, a, &local, staging_elements, control);
+        defer staging.deinit(a);
+        const padded = if (padded_count != 0) staging.values[0..padded_count] else null;
         if (padded) |values| {
             @memcpy(values[0..ids.len], ids);
             @memset(values[ids.len..], 0);
@@ -369,8 +367,7 @@ pub const Decoder = struct {
         const input_shape = [_]i64{ 1, @intCast(rows) };
         const position_shape = [_]i64{ 3, @intCast(rows) };
         const logits_row = [_]i64{@intCast(ids.len - 1)};
-        const positions = if (position_count != 0) try a.alloc(i64, position_count) else null;
-        defer if (positions) |values| a.free(values);
+        const positions = if (position_count != 0) staging.values[padded_count..] else null;
         var declared: [3]Tensor = undefined;
         declared[0] = Tensor.borrowInt64(a, "input_ids", &input_shape, padded orelse ids);
         var count: usize = 1;
@@ -392,6 +389,28 @@ pub const Decoder = struct {
         if (outputs.len != 1 or outputs[0].dtype != .f32 or outputs[0].data.len % @sizeOf(f32) != 0 or
             !outputs[0].isAlignedFor(f32)) return error.InvalidResidentDecoderOutput;
         return outputs[0].takeOrCopyFloat32(a);
+    }
+};
+
+/// A synchronous decoder call may borrow small operands from its caller's
+/// stack. Larger suffixes use one admitted allocation for all operands.
+const InputStaging = struct {
+    values: []i64,
+    permit: ?@import("../backends/session.zig").RunPermit = null,
+
+    fn init(source: Session, allocator: std.mem.Allocator, local: []i64, count: usize, control: ?Control) !InputStaging {
+        if (count <= local.len) return .{ .values = local[0..count] };
+        const bytes = try std.math.mul(usize, count, @sizeOf(i64));
+        var permit = try source.withAdmissionControl(control).admitRetainedMedia(bytes, 0);
+        errdefer permit.deinit();
+        return .{ .values = try allocator.alloc(i64, count), .permit = permit };
+    }
+
+    fn deinit(self: *InputStaging, allocator: std.mem.Allocator) void {
+        if (self.permit) |*permit| {
+            allocator.free(self.values);
+            permit.deinit();
+        }
     }
 };
 
