@@ -1161,6 +1161,16 @@ EmbeddingGemma2, LightOnOCR, GLiNER2.5/DECIDE, Inkling 2 Mini and the
 representative Qwen3 routes. Spark GB10, local Metal and CPU are the
 available physical targets. L4 and A100 remain the user-deferred targets.
 
+At `34296ffb5a`, five Native CPU fixtures passed for resident handoff and
+task output custody. The incremental decoder matched host-reference logits
+after the encoder and destination session handles closed, and allocation
+failure preserved the resident source for retry. The CLIP and CLAP fixtures
+exercised quota lifetime and cancellation. The BERT head fixtures checked
+resident input, final-logit materialization and the unknown-dtype fallback.
+A separate seven-test CPU cohort passed for pending submission, readback,
+retirement and observation. These use fixture models and do not establish
+released-model or GPU coverage.
+
 The Metal integer-gather compatibility guard now applies to the actual
 axis-zero column-bias fusion. An axis-one I32 gather after a live F32 add
 uses two assigned dispatches and retains both results independently across
