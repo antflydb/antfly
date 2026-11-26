@@ -74,18 +74,14 @@ pub const Scope = struct {
         try self.finishUsing(self.backend.vtable.regions.commands.submitAndWaitFrame.?);
     }
 
-    pub fn submit(self: *Scope) !void {
-        if (!self.owns) return;
-        try self.finishUsing(self.backend.vtable.regions.commands.submitFrame orelse return error.UnsupportedOperation);
-    }
-
     pub fn submitInto(self: *Scope, pending: *Pending) !void {
         if (!self.owns or pending.active or pending.backend != self.backend) return error.InvalidFrameSubmissionOwner;
         const commands = self.backend.vtable.regions.commands;
         const has_submitted = commands.hasSubmittedFrame orelse return error.UnsupportedOperation;
         if (commands.waitSubmittedFrame == null) return error.UnsupportedOperation;
         if (has_submitted(self.backend.ptr)) return error.InvalidFrameSubmissionOwner;
-        self.submit() catch |err| {
+        const submit_frame = commands.submitFrame orelse return error.UnsupportedOperation;
+        self.finishUsing(submit_frame) catch |err| {
             // A provider error can arrive after the frame was queued.
             pending.active = has_submitted(self.backend.ptr);
             return err;

@@ -484,14 +484,17 @@ pub const Executor = struct {
         errdefer self.context.allocator.free(rest);
         var second_logits: ?ops.CT = null;
         var previous_hidden: ?ops.CT = null;
+        var pending: @import("submission.zig").Pending = .{ .backend = self.context.cb };
         defer {
             // No resource or page borrow can retire before its producer.
-            self.context.cb.decoderRuntimeWaitSubmittedFrame() catch {};
+            pending.wait() catch {
+                if (pending.active) platform.inference_process_supervisor.restartWorker();
+            };
             if (previous_hidden) |hidden| self.context.cb.free(hidden);
             if (second_logits) |logits| self.context.cb.free(logits);
         }
         try M.encodeLightOnBurstArgmax(self.context.cb, first_logits, claimed.len, self.context.gpt_config.vocab_size, self.context.gpt_config.suppressTokenIds());
-        try first_frame.submit();
+        try first_frame.submitInto(&pending);
         for (1..steps) |step| {
             var frame = try @import("submission.zig").Scope.beginPipelined(self.context.cb);
             defer frame.deinit();
@@ -535,16 +538,15 @@ pub const Executor = struct {
             try M.encodeLightOnBurstArgmax(self.context.cb, logits, claimed.len, self.context.gpt_config.vocab_size, self.context.gpt_config.suppressTokenIds());
             // Copy the previous token buffer before the next producer may
             // overwrite it. GPU embedding already captured its dependency.
-            try self.context.cb.decoderRuntimeWaitSubmittedFrame();
+            try pending.wait();
             const output_tokens = if (step == 1) first else rest[(step - 2) * claimed.len ..][0..claimed.len];
             try M.readLightOnBurstTokens(self.context.cb, output_tokens);
             if (previous_hidden) |old| self.context.cb.free(old);
-            previous_hidden = null;
-            try frame.submit();
             previous_hidden = hidden.hidden;
             hidden_owned = false;
+            try frame.submitInto(&pending);
         }
-        try self.context.cb.decoderRuntimeWaitSubmittedFrame();
+        try pending.wait();
         try M.readLightOnBurstTokens(self.context.cb, rest[(steps - 2) * claimed.len ..][0..claimed.len]);
         try self.context.cb.checkExecutionControl();
         M.noteLightOnBurst(self.context.cb, self.context.cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits -| before_frames, M.argmaxOnFrameCount(self.context.cb) -| before_argmax, steps, claimed.len);
