@@ -3678,11 +3678,10 @@ pub const ComputeBackend = struct {
         exportTensorData: ?*const fn (ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror!?ExportTensorData = null,
 
         /// Enqueue a backend-side i32 scalar download without blocking the
-        /// caller. The returned handle must be finished or canceled before the
+        /// caller. The returned handle must be finished or drained before the
         /// backend is destroyed. Backends return null when unsupported.
         beginI32ScalarDownload: ?*const fn (ctx: *anyopaque, tensor: CT) anyerror!?PendingI32ScalarDownload = null,
         finishI32ScalarDownload: ?*const fn (ctx: *anyopaque, pending: PendingI32ScalarDownload) anyerror!i32 = null,
-        cancelI32ScalarDownload: ?*const fn (ctx: *anyopaque, pending: PendingI32ScalarDownload) void = null,
         drainI32ScalarDownload: ?*const fn (ctx: *anyopaque, pending: PendingI32ScalarDownload) anyerror!void = null,
 
         /// Clone a tensor into a new backend handle with the requested logical
@@ -6191,6 +6190,7 @@ pub const ComputeBackend = struct {
     }
 
     pub fn beginI32ScalarDownload(self: *const ComputeBackend, tensor: CT) !?PendingI32ScalarDownload {
+        if (self.vtable.finishI32ScalarDownload == null or self.vtable.drainI32ScalarDownload == null) return null;
         if (self.vtable.beginI32ScalarDownload) |begin_i32_scalar_download| {
             return begin_i32_scalar_download(self.ptr, tensor);
         }
@@ -6204,14 +6204,9 @@ pub const ComputeBackend = struct {
         return error.UnsupportedBackendOp;
     }
 
-    pub fn cancelI32ScalarDownload(self: *const ComputeBackend, pending: PendingI32ScalarDownload) void {
-        if (self.vtable.drainI32ScalarDownload) |drain| {
-            drain(self.ptr, pending) catch {};
-            return;
-        }
-        if (self.vtable.cancelI32ScalarDownload) |cancel_i32_scalar_download| {
-            cancel_i32_scalar_download(self.ptr, pending);
-        }
+    pub fn drainI32ScalarDownload(self: *const ComputeBackend, pending: PendingI32ScalarDownload) !void {
+        const drain = self.vtable.drainI32ScalarDownload orelse return error.UnsupportedBackendOp;
+        try drain(self.ptr, pending);
     }
 
     pub fn readFloat32Into(self: *const ComputeBackend, tensor: CT, output: []f32) !bool {

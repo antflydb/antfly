@@ -156,26 +156,12 @@ pub const Readback = struct {
         }
         if (self.pending) |pending| {
             const backend = self.context.backend;
-            if (backend.vtable.drainI32ScalarDownload != null) {
-                // A failed fence leaves the provider's pinned scalar slot
-                // in use. Releasing the request cannot make it reusable.
-                self.observation.call(backend, .drain, .driver_await_returned, drainReadback, .{ backend, pending }) catch
-                    @import("antfly_platform").inference_process_supervisor.restartWorker();
-            } else {
-                self.observation.call(backend, .cancel, .unavailable, cancelReadback, .{ backend, pending }) catch {};
-            }
+            // A failed fence leaves the provider's pinned scalar slot
+            // in use. Releasing the request cannot make it reusable.
+            self.observation.call(backend, .drain, .driver_await_returned, ops.ComputeBackend.drainI32ScalarDownload, .{ backend, pending }) catch
+                @import("antfly_platform").inference_process_supervisor.restartWorker();
         }
         self.pending = null;
-    }
-    fn drainReadback(backend: *const ops.ComputeBackend, pending: ops.PendingI32ScalarDownload) !void {
-        const drain = backend.vtable.drainI32ScalarDownload orelse return error.UnsupportedBackendOp;
-        try drain(backend.ptr, pending);
-    }
-
-    fn cancelReadback(backend: *const ops.ComputeBackend, pending: ops.PendingI32ScalarDownload) !void {
-        // This legacy callback has no failure/completion result. Record only
-        // return from a cancellation request, never successful GPU drain.
-        backend.cancelI32ScalarDownload(pending);
     }
 };
 
@@ -294,7 +280,7 @@ test "pending readback failed atomic reservation preserves paired KV owners and 
     const a = std.testing.allocator;
     const Probe = struct {
         cancelled: usize = 0,
-        fn cancel(raw: *anyopaque, _: ops.PendingI32ScalarDownload) void {
+        fn cancel(raw: *anyopaque, _: ops.PendingI32ScalarDownload) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.cancelled += 1;
         }
@@ -322,7 +308,7 @@ test "pending readback failed atomic reservation preserves paired KV owners and 
             defer a.free(ids);
             var probe = Probe{};
             var table = @import("../ops/native_compute.zig").vtable_impl;
-            table.cancelI32ScalarDownload = Probe.cancel;
+            table.drainI32ScalarDownload = Probe.cancel;
             const backend = ops.ComputeBackend{ .ptr = &probe, .vtable = &table };
             const model = model_mod.Config{};
             const context = Context{ .allocator = a, .backend = &backend, .model = &model, .state = &state };
@@ -380,7 +366,7 @@ test "pending readback owns download lookahead and real KV reservation across ac
             if (self.fail_finish) return error.InjectedReadbackFailure;
             return 7;
         }
-        fn cancel(raw: *anyopaque, pending: ops.PendingI32ScalarDownload) void {
+        fn cancel(raw: *anyopaque, pending: ops.PendingI32ScalarDownload) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             std.debug.assert(pending.handle == 11 and self.state.total_tokens == 4);
             self.note(.cancel);
@@ -404,7 +390,7 @@ test "pending readback owns download lookahead and real KV reservation across ac
         var table = @import("../ops/native_compute.zig").vtable_impl;
         table.beginI32ScalarDownload = Probe.begin;
         table.finishI32ScalarDownload = Probe.finish;
-        table.cancelI32ScalarDownload = Probe.cancel;
+        table.drainI32ScalarDownload = Probe.cancel;
         table.evalTensor = Probe.evaluate;
         table.freeTensor = Probe.free;
         const backend = ops.ComputeBackend{ .ptr = &probe, .vtable = &table };
@@ -627,7 +613,7 @@ const PendingObservationFixture = struct {
             @import("transfer_audit.zig").download(4);
             return 7;
         }
-        fn cancel(raw: *anyopaque, handle: ops.PendingI32ScalarDownload) void {
+        fn cancel(raw: *anyopaque, handle: ops.PendingI32ScalarDownload) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             std.debug.assert(handle.handle == 42 and !destroyed);
             self.cancelled += 1;
@@ -651,10 +637,17 @@ test "pending readback observations retain publication only and separate submiss
         var table = @import("../ops/native_compute.zig").vtable_impl;
         table.beginI32ScalarDownload = F.Probe.begin;
         table.finishI32ScalarDownload = F.Probe.finish;
-        table.cancelI32ScalarDownload = F.Probe.cancel;
+        table.drainI32ScalarDownload = F.Probe.cancel;
         table.registerRuntimeObservation = null;
         table.debugTimingSnapshot = null;
         const backend = ops.ComputeBackend{ .ptr = &probe, .vtable = &table };
+        if (mode == 0) {
+            var incomplete = table;
+            incomplete.drainI32ScalarDownload = null;
+            const unsupported = ops.ComputeBackend{ .ptr = &probe, .vtable = &incomplete };
+            try std.testing.expect((try unsupported.beginI32ScalarDownload(@ptrFromInt(8))) == null);
+            try std.testing.expectEqual(@as(usize, 0), probe.calls);
+        }
         const config = model_mod.Config{};
         var state = state_mod.NativeDecodeState.initContiguous(std.testing.allocator);
         defer state.deinit();
@@ -716,8 +709,8 @@ test "pending readback observations retain publication only and separate submiss
             if (mode == 1) try std.testing.expectEqualStrings("PendingAwaitFailure", retained_report.pending_interval.?.prior_failure.?.view());
             if (mode == 1) try std.testing.expectEqualStrings("PendingAwaitFailure", latest.pending_interval.?.prior_failure.?.view());
             if (mode == 1 or mode == 2) {
-                try std.testing.expect(latest.pending_interval.?.phase == .cancel);
-                try std.testing.expect(latest.pending_interval.?.completion == .unavailable);
+                try std.testing.expect(latest.pending_interval.?.phase == .drain);
+                try std.testing.expect(latest.pending_interval.?.completion == .driver_await_returned);
                 const callbacks = latest.pending_interval.?.observed_phases.?.backend_callback_returns.native;
                 try std.testing.expectEqual(@as(u64, 1), callbacks.successful);
                 try std.testing.expectEqual(@as(u64, 1), callbacks.declined);
