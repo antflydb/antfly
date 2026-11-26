@@ -16695,6 +16695,19 @@ const PreparedDocumentSourceCache = struct {
         poll_ns.* = @min(poll_ns.* * 2, 100 * std.time.ns_per_ms);
     }
 
+    fn recheckWaitingOwnerAssumeLocked(self: *@This(), owner: asset_producer_mod.InvocationContext) !void {
+        // Keep the cache alive while dropping the mutex. Recheck before
+        // claiming the flight so a checkpoint can re-enter the same key.
+        self.active_waiters += 1;
+        self.mutex.unlock(self.io);
+        defer {
+            self.mutex.lockUncancelable(self.io);
+            self.active_waiters -= 1;
+            if (self.shutting_down and self.active_waiters == 0) self.drained.broadcast(self.io);
+        }
+        try checkPreparedSourceOwner(owner);
+    }
+
     fn fetch(
         self: *@This(),
         source_url: []const u8,
@@ -16719,6 +16732,7 @@ const PreparedDocumentSourceCache = struct {
         if (cancellation) |token| owner.cancellation = token;
         try checkPreparedSourceOwner(owner);
         var poll_ns: u64 = 10 * std.time.ns_per_ms;
+        var waited = false;
         self.mutex.lockUncancelable(self.io);
         while (true) {
             checkPreparedSourcePoll(owner) catch |err| {
@@ -16746,6 +16760,15 @@ const PreparedDocumentSourceCache = struct {
                     self.mutex.unlock(self.io);
                     return err;
                 };
+                waited = true;
+                continue;
+            }
+            if (waited) {
+                self.recheckWaitingOwnerAssumeLocked(owner) catch |err| {
+                    self.mutex.unlock(self.io);
+                    return err;
+                };
+                waited = false;
                 continue;
             }
             const owned_credential = if (credential_name) |value|
@@ -16776,12 +16799,7 @@ const PreparedDocumentSourceCache = struct {
         const alloc = self.allocator();
         const fetch_timer = pipeline_metrics.start(.source_fetch);
         defer fetch_timer.finish();
-        // Another caller may have held the keyed flight while we waited.
-        // Reconfirm authority before starting transport, outside the mutex.
-        const fetched = if (checkPreparedSourceOwner(owner)) |_|
-            template_remote.downloadRemoteContentOutcomeAllocWithRenderConfig(alloc, config, source_url, credential_name)
-        else |err|
-            err;
+        const fetched = template_remote.downloadRemoteContentOutcomeAllocWithRenderConfig(alloc, config, source_url, credential_name);
         if (fetched) |outcome| switch (outcome) {
             .http_error => |http_error| {
                 self.mutex.lockUncancelable(self.io);
@@ -16959,6 +16977,7 @@ const PreparedDocumentSourceCache = struct {
         const entry = source.entry();
         try checkPreparedSourceOwner(owner);
         var poll_ns: u64 = 10 * std.time.ns_per_ms;
+        var waited = false;
         self.mutex.lockUncancelable(self.io);
         while (true) {
             checkPreparedSourcePoll(owner) catch |err| {
@@ -16986,6 +17005,15 @@ const PreparedDocumentSourceCache = struct {
                     self.mutex.unlock(self.io);
                     return err;
                 };
+                waited = true;
+                continue;
+            }
+            if (waited) {
+                self.recheckWaitingOwnerAssumeLocked(owner) catch |err| {
+                    self.mutex.unlock(self.io);
+                    return err;
+                };
+                waited = false;
                 continue;
             }
             self.pending_pdfs.append(@import("antfly_platform").allocator.concurrentFallback(), .{
@@ -17018,10 +17046,7 @@ const PreparedDocumentSourceCache = struct {
             variant.deadline.owner = .{ .context = &owner, .is_cancelled_fn = preparedSourceOwnerCanceled };
         const prepare_timer = pipeline_metrics.start(.pdf_prepare);
         defer prepare_timer.finish();
-        const prepared = if (checkPreparedSourceOwner(owner)) |_|
-            self.prepare_pdf_session_fn(alloc, entry.content.data, decode_limits, &variant.deadline)
-        else |err|
-            err;
+        const prepared = self.prepare_pdf_session_fn(alloc, entry.content.data, decode_limits, &variant.deadline);
         if (prepared) |session| {
             variant.session = session;
             // A retained parser must never refer to the preparing caller.
