@@ -1527,7 +1527,23 @@ repeat matched both historical output digests and all 24 provider receipts
 selected CUDA. EmbeddingGemma2 p50 was 9.00 → 8.88 ms and p95 was
 10.18 → 9.56 ms. Its control and crossover gates passed. GLiNER's
 crossover passed, while its repeated-main p50 spread was 5.22%, above
-the 5% control limit. The full cuDNN matrix is separate.
+the 5% control limit.
+
+The complete matched-cuDNN run of the same binary reproduced all ten
+historical output digests. All 120 model-and-arm receipts selected CUDA,
+and all crossover latency ratios passed. The initial repeated-main
+controls exceeded the limits for GLiNER p50 (6.71%), DECIDE p95
+(16.06%), and Qwen3 p95 (11.27%). Each isolated 96-sample-per-engine
+repeat matched the historical output, passed the unchanged 1.05 p50
+and 1.10 p95 control and crossover ratios, and recorded 12 CUDA
+backend receipts. A separate 184 MiB CUDA context was present during
+the matrix and repeats.
+
+| Isolated workload | Main p50 / p95 (ms) | Candidate p50 / p95 (ms) | Largest same-binary p50 difference |
+| --- | ---: | ---: | ---: |
+| GLiNER2.5 | 12.66 / 13.71 | 12.89 / 14.02 | 2.61% |
+| DECIDE | 40.04 / 40.85 | 40.13 / 40.96 | 0.41% |
+| Qwen3 | 85.69 / 86.70 | 85.23 / 86.45 | 0.56% |
 
 The same Spark binaries also served grouped EmbeddingGemma2 image, audio,
 and video requests through the public embedding endpoint. Each crossover
