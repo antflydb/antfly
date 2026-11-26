@@ -449,7 +449,7 @@ test "resident owner observations preserve the disabled raw path and unwind sour
             return 7;
         }
     };
-    const Input = struct { backend: *const ops.ComputeBackend, value: ops.CT };
+    const Input = @import("../backends/session.zig").ResidentInput;
     var probe = Probe{};
     var table = @import("../ops/native_compute.zig").vtable_impl;
     const kernels = ops.KernelBackend{ .implementation_table = &table, .registerTensorOwnershipObservation = &Probe.register };
@@ -462,12 +462,16 @@ test "resident owner observations preserve the disabled raw path and unwind sour
     try std.testing.expectEqual(@as(usize, 7), try callResident(binding, &unread, Probe.dispatch, .{&probe}));
     try std.testing.expectEqual(@as(usize, 0), probe.registrations);
     try std.testing.expect(diagnostics.snapshot() == null);
-    const input = [_]Input{.{ .backend = &backend, .value = &probe }};
+    const input = [_]Input{
+        .{ .backend = &backend, .value = &probe },
+        .{ .backend = &backend, .value = &probe, .binding = .omitted },
+    };
     diagnostics.configure(true);
     probe.expected_enabled = true;
     try std.testing.expectEqual(@as(usize, 7), try callResident(binding, &input, Probe.dispatch, .{&probe}));
     var measured = diagnostics.snapshot().?;
     try std.testing.expectEqual(@as(usize, 1), measured.runtime.device_owners.?.owners);
+    try std.testing.expectEqual(@as(usize, 1), probe.registrations);
     try std.testing.expectEqual(@as(usize, 32), measured.runtime.device_owners.?.reports[0].physical_live_bytes);
     try std.testing.expectEqual(@as(usize, 1), probe.references);
     probe.fail = true;
