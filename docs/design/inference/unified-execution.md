@@ -1182,6 +1182,17 @@ covered submit, await and cancel on the physical provider. The workspace
 tests covered sealed event drift, publication and disjoint output storage.
 The legacy decoder and audio recipe gates remain open.
 
+At `41237da4cc`, both the BERT and stateful decoder fixtures passed shared
+preparation and output parity on Native CPU and physical Metal using ONNX,
+Safetensors, GGUF and Q8 artifacts. The corresponding CUDA cases were
+skipped in this local run.
+
+A Spark GB10 loopback HTTP run at the same revision selected CUDA using
+the default Inkling checkpoint directory. With execution diagnostics
+enabled, the 28-token text prompt returned `4` and the 33-token image
+prompt returned `Blue`. The common exporter emitted encoder, prefill
+and decode-step reports. This run covers serial HTTP requests.
+
 The Metal integer-gather compatibility guard now applies to the actual
 axis-zero column-bias fusion. An axis-one I32 gather after a live F32 add
 uses two assigned dispatches and retains both results independently across
