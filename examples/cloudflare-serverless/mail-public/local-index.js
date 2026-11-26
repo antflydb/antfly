@@ -82,6 +82,48 @@ export async function localConfig() {
   return config;
 }
 
+export async function createMailClassifier(config, onProgress, signal) {
+  const response = await fetch(config.classifier.catalog, { cache: "no-cache", signal });
+  if (!response.ok) throw Error("On-device classification is not installed");
+  const catalog = await response.json();
+  const web = await import(config.runtime.web);
+  const client = await web.Inference.create({ assets: config.runtime.inference });
+  try {
+    const files = await web.downloadCatalogModel(catalog, { assets: config.runtime.inference, sameOriginCredentials: true, onProgress, signal });
+    signal?.throwIfAborted();
+    const model = await client.loadModel(files, { backend: "auto", precision: catalog.precision, onProgress });
+    if (!model.execution.tasks.includes("decide")) throw Error("The model does not support on-device decisions");
+    return {
+      async classify(message) {
+        const { value } = await client.decide({
+          model: catalog.id,
+          input: ("From: " + message.from + "\nSubject: " + message.subject + "\n\n" + (message.text ?? "")).slice(0, 2300),
+          questions: [
+            {
+              name: "category", type: "choice", instructions: "What is the main purpose of this message?",
+              choices: [
+                { value: "Primary", description: "A direct personal or work conversation" },
+                { value: "Updates", description: "A transaction, reservation, or account notice" },
+                { value: "Promotions", description: "An advertisement or discount" },
+                { value: "Social", description: "A notification from a social network" },
+                { value: "Forums", description: "A group discussion or mailing list" },
+              ],
+            },
+            { name: "important", type: "predicate", instructions: "Does this message require timely attention from its recipient?" },
+          ],
+        });
+        const category = value.answers.find(answer => answer.name === "category");
+        const important = value.answers.find(answer => answer.name === "important");
+        return { category: category?.confidence >= 0.45 ? category.choice : "Primary", important: important?.probability >= 0.8 };
+      },
+      close: () => client.dispose(),
+    };
+  } catch (error) {
+    client.dispose();
+    throw error;
+  }
+}
+
 export function supported() {
   return (
     typeof Worker !== "undefined" &&

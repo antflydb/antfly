@@ -327,3 +327,46 @@ receive external mail. Select the inbox in the web app before composing.
    destination. If the Outbox says **Not sent**, check the recipient and
    sender-domain setup before composing a new test. Rejected messages are
    not resent automatically.
+
+### On-device GLiDE classification
+
+Enable **On-device classification** for each mailbox you want categorized.
+GLiDE classifies existing and newly received messages in the background.
+Inbox tabs show Primary, Promotions, Social, Updates, and Forums, and
+**Important** shows messages flagged for attention. Uncertain categories
+stay in Primary.
+
+Labels and sync progress are saved in this browser alongside the on-device
+search data. Turning classification off pauses it and keeps saved labels.
+**Clear local labels** removes the mailbox's labels and turns classification
+off. GLiDE-0.4B uses message text. Image-bearing decision requests require a
+vision-capable model.
+
+Prepare the licensed checkpoint and enable the optional UI in the runtime build:
+
+```sh
+npm run publish:local-model -- --glide --model-dir ./glide-0.4b --out dist/glide-model
+LOCAL_GLIDE=1 npm run build:local
+```
+
+Upload the pinned files from the resulting catalog to
+`local-models/glide/` in the private model bucket using R2 S3 multipart.
+Publish `catalog.json` last. The first use downloads about 756 MiB. The app
+shows the Fastino attribution, and the model bundle includes the upstream
+license and notices. Check the commercial terms before enabling production use.
+
+For browser parity, set `GLIDE_MODEL` to the checkpoint directory. The
+built-in oracle uses Fastino revision
+`16fb9d63cc34d1b4b5a1fb7cbf2d9d4a3dd5ad71` with native Antfly CPU and covers
+choice, score and predicate decisions. Set `GLIDE_NATIVE_CASES` to override
+the oracle with JSON `{request, response}` pairs from
+`antfly inference decisions --backend native`. From the repository root, run:
+
+```sh
+EXTRACTION_WASM="$PWD/zig/zig-out/antfly-extraction-cpu.wasm" \
+  node --test zig/pkg/inference/web/test-glide-runtime.mjs
+EXTRACTION_GPU=1 node --test ts/packages/web/test/browser/glide-runtime.test.mjs
+```
+
+The WebGPU test requires a Chromium hardware adapter, both prepared WASM
+backends and a built `@antfly/web` client. It fails if execution falls back to CPU.

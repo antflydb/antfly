@@ -134,6 +134,7 @@ const config = {
     },
   },
   model: { catalog: "/local/models/catalog.json" },
+  ...(process.env.LOCAL_GLIDE === "1" ? { classifier: { catalog: "/local/models/glide/catalog.json" } } : {}),
   embedding,
 };
 await writeFile(join(local, "config.json"), JSON.stringify(config, null, 2) + "\n");

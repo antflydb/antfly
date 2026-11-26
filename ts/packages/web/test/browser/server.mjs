@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { extname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-export async function startRuntimeServer() {
+export async function startRuntimeServer(handleRequest) {
   const root = fileURLToPath(new URL("../../../../../", import.meta.url));
   const types = { ".js": "text/javascript", ".wasm": "application/wasm", ".wgsl": "text/plain" };
   const server = createServer(async (req, res) => {
@@ -14,6 +14,7 @@ export async function startRuntimeServer() {
     };
     try {
       const path = decodeURIComponent(new URL(req.url, "http://localhost").pathname);
+      if (await handleRequest?.(path, req, res, headers)) return;
       if (path === "/") {
         res.writeHead(200, { ...headers, "Content-Type": "text/html" });
         res.end("<!doctype html><title>Antfly runtime tests</title>");

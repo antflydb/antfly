@@ -451,13 +451,12 @@ const GpuWeightStore = struct {
         const gpu_buf = if (weight.quant_raw) |raw| blk: {
             const id = try createUploadedQuantStorageBuffer(self.allocator, raw);
             break :blk id;
-        } else if (weight.f16_data) |f16d| blk: {
-            const out = try self.allocator.alloc(f32, f16d.len);
-            defer self.allocator.free(out);
-            for (f16d, 0..) |v, i| out[i] = @floatCast(v);
-            const byte_len: usize = out.len * @sizeOf(f32);
-            const id = wasm_extern.createBuffer(@intCast(byte_len));
-            wasm_extern.upload(id, @as([*]const u8, @ptrCast(out.ptr))[0..byte_len]);
+        } else if (weight.f16_data != null or weight.bf16_data != null) blk: {
+            const view = try weight.viewF32(self.allocator);
+            defer if (view.allocated) self.allocator.free(view.data);
+            const bytes = std.mem.sliceAsBytes(view.data);
+            const id = wasm_extern.createBuffer(@intCast(bytes.len));
+            wasm_extern.upload(id, bytes);
             break :blk id;
         } else blk: {
             const byte_len: usize = weight.data.len * @sizeOf(f32);
@@ -1263,7 +1262,7 @@ pub const WasmCompute = struct {
 
     fn shouldPreferGpuLinear(self: *WasmCompute, inp: *WasmBuf, weight: *WasmBuf, rows: usize, out_dim: usize) bool {
         if (!(build_options.enable_webgpu and self.use_gpu)) return false;
-        if (weight.bf16_data != null) return false;
+        if (weight.bf16_data != null and !self.resident_dense_gpu) return false;
         return self.resident_dense_gpu or inp.gpu_tensor != null or self.gpu_weights.hasResident(weight) or rows * out_dim >= WEBGPU_MATMUL_THRESHOLD;
     }
 

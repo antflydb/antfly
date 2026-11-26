@@ -209,6 +209,11 @@ function env(overrides = {}) {
             files: [{ path: "model.safetensors", url: "/local/models/model.safetensors", sha256: "a".repeat(64), size_bytes: 4 }],
           }),
           "local-models/model.safetensors": "wgts",
+          "local-models/glide/catalog.json": JSON.stringify({
+            id: "glide",
+            files: [{ path: "model.safetensors", sha256: "b".repeat(64), size_bytes: 5 }],
+          }),
+          "local-models/glide/model.safetensors": "glide",
         };
         return key in objects ? { body: objects[key], size: objects[key].length } : null;
       },
@@ -221,6 +226,17 @@ function env(overrides = {}) {
   };
 }
 const get = (path, e, headers = {}) => worker.fetch(new Request("https://mail.example.test" + path, { headers }), e);
+
+test("classifier catalog requires sign-in and file grants are namespaced", async () => {
+  const e = env();
+  const anonymous = env({ AUTH_SERVICE: { session: async () => ({ session: null, cookies: [] }) } });
+  const path = "/local/models/glide/catalog.json";
+  assert.equal((await get(path, anonymous)).status, 401);
+  const [file] = (await (await get(path, e)).json()).files;
+  assert.match(file.url, /^\/local\/models\/glide\/model\.safetensors\?grant=/);
+  assert.equal(await (await get(file.url, anonymous)).text(), "glide");
+  assert.equal((await get(file.url.replace("/glide/", "/"), anonymous)).status, 401);
+});
 
 test("sync and model routes are scoped to the signed-in mailbox", async () => {
   const e = env();
@@ -870,4 +886,62 @@ test("a sync page already being embedded cannot reinsert a locally forgotten mes
     ["forget", { ids: [id] }],
     ["apply", { messages: [], vectors: [], deleted: [id], cursor: "2" }],
   ]);
+});
+
+
+test("classification resumes from the saved mailbox cursor and clearing leaves other mailboxes intact", async () => {
+  const { LocalClassification } = await import("../mail-public/local-classification.js");
+  const files = new Map();
+  const missing = () => new DOMException("Missing file", "NotFoundError");
+  const localCopy = async (scope) => {
+    const copy = await LocalClassification.open(scope);
+    copy.lock = (action) => action();
+    copy.directory = async () => ({
+      async getFileHandle(name, { create } = {}) {
+        if (!create && !files.has(name)) throw missing();
+        return {
+          getFile: async () => new Blob([files.get(name)]),
+          async createWritable() {
+            let text;
+            return {
+              write: async (value) => { text = value; },
+              close: async () => { files.set(name, text); },
+            };
+          },
+        };
+      },
+      async removeEntry(name) {
+        if (!files.delete(name)) throw missing();
+      },
+    });
+    return copy;
+  };
+  const label = { category: "Updates", important: true };
+  const classifier = async () => ({ classify: async () => label, close() {} });
+  const run = (copy, page, signal = new AbortController().signal) =>
+    copy.sync({ page, classifier, signal, onChange() {} });
+  const firstPage = async (cursor) => {
+    assert.equal(cursor, "");
+    return { cursor: "1", messages: [{ id: "first", text: "Your receipt" }], more: false };
+  };
+  const team = await localCopy("team");
+  await run(team, firstPage);
+  const personal = await localCopy("personal");
+  await run(personal, firstPage);
+  const reopened = await localCopy("personal");
+  const cancelled = new AbortController();
+  await assert.rejects(run(reopened, async (cursor) => {
+    assert.equal(cursor, "1");
+    cancelled.abort();
+    return { cursor: "2", messages: [], deleted: ["first"], more: false };
+  }, cancelled.signal), { name: "AbortError" });
+  assert.deepEqual(await reopened.read(), { cursor: "1", labels: { first: label } });
+  await run(reopened, async (cursor) => {
+    assert.equal(cursor, "1");
+    return { cursor: "2", messages: [], deleted: ["first"], more: false };
+  });
+  assert.deepEqual(await reopened.read(), { cursor: "2", labels: {} });
+  await reopened.clear();
+  assert.deepEqual(await reopened.read(), { cursor: "", labels: {} });
+  assert.deepEqual(await team.read(), { cursor: "1", labels: { first: label } });
 });
