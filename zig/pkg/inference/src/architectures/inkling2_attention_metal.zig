@@ -284,11 +284,16 @@ pub const RequestWorkspace = struct {
         }
     };
 
-    pub fn init(a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, plan: Plan) !RequestWorkspace {
+    pub const ReductionStorage = struct { arena: *const Tensor, offset: usize };
+
+    pub fn init(a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, plan: Plan, supplied_reduction: ?ReductionStorage) !RequestWorkspace {
         const size = std.math.cast(i32, plan.bytes / 2) orelse return error.InvalidShape;
         var backing = try Tensor.deviceAllocateTyped(a, runtime, .i16, .private, &.{size});
         errdefer backing.deinit();
-        var reduction = try Tensor.deviceAllocateTyped(a, runtime, .f32, .private, &.{plan.reduction_elements});
+        var reduction = if (supplied_reduction) |storage|
+            try storage.arena.retainedTypedView(storage.offset, &.{plan.reduction_elements}, .f32)
+        else
+            try Tensor.deviceAllocateTyped(a, runtime, .f32, .private, &.{plan.reduction_elements});
         errdefer reduction.deinit();
         var views: [plane_count]Tensor = undefined;
         var count: usize = 0;
@@ -486,7 +491,7 @@ test "Inkling Metal attention weights drive local and global visits across commi
 
         var source = try allocate(a, runtime, 1);
         defer source.deinit();
-        var workspace = try RequestWorkspace.init(a, runtime, try .init(text, 1, 2, 1));
+        var workspace = try RequestWorkspace.init(a, runtime, try .init(text, 1, 2, 1), null);
         defer workspace.deinit();
         var output = try allocate(a, runtime, 1);
         defer output.deinit();

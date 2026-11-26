@@ -200,13 +200,18 @@ const TempArena = struct {
         return offset;
     }
 
-    fn init(elements: [@typeInfo(Temp).@"enum".field_names.len]usize, groups: usize) !TempArena {
+    fn init(elements: [@typeInfo(Temp).@"enum".field_names.len]usize, groups: usize, reduction_elements: usize) !TempArena {
         var arena: TempArena = .{};
         for (std.enums.values(Temp), elements, &arena.offsets) |kind, count, *offset| {
             if (kind == .logits) break;
             offset.* = try arena.reserve(count, tempDtype(kind));
         }
         if (groups > 0) arena.groups_offset = try arena.reserve(groups, .i32);
+        // Router through expert reduction runs after attention has retired
+        // its partials. Both phases can use the same arena tail.
+        const reduction_bytes = try std.math.mul(usize, reduction_elements, @sizeOf(f32));
+        const reduction_end = try std.math.add(usize, arena.offsets[@backingInt(Temp.router)], reduction_bytes);
+        arena.bytes = @max(arena.bytes, reduction_end);
         return arena;
     }
 };
@@ -246,20 +251,20 @@ const WorkPlan = struct {
             .logits = if (rows == 1) text.unpadded_vocab_size else 0,
         });
         const groups = if (rows > 1 and groupedPrefillEnabled()) try experts.groupElements() else 0;
+        const attention_plan = try attention.RequestWorkspace.Plan.init(text, rows, max_tokens, reduction_rows);
         return .{
             .rows = rows,
             .reduction_rows = reduction_rows,
             .elements = elements.values,
-            .attention = try .init(text, rows, max_tokens, reduction_rows),
+            .attention = attention_plan,
             .group_elements = groups,
-            .temps = try .init(elements.values, groups),
+            .temps = try .init(elements.values, groups, @intCast(attention_plan.reduction_elements)),
         };
     }
 
     fn deviceBytes(self: WorkPlan, width: u32) !usize {
         var bytes = try Stack.deviceBytes(width, self.rows);
         bytes = try std.math.add(usize, bytes, self.attention.bytes);
-        bytes = try std.math.add(usize, bytes, @as(usize, @intCast(self.attention.reduction_elements)) * @sizeOf(f32));
         bytes = try std.math.add(usize, bytes, self.temps.bytes);
         return std.math.add(usize, bytes, try std.math.mul(usize, self.elements[@backingInt(Temp.logits)], @sizeOf(f32)));
     }
@@ -345,10 +350,10 @@ const Work = struct {
         var result: Work = undefined;
         result.stack = try Stack.init(a, runtime, width, plan.rows);
         errdefer result.stack.deinit();
-        result.attention = try .init(a, runtime, plan.attention);
-        errdefer result.attention.deinit();
         var arena = try allocate(a, runtime, .u8, plan.temps.bytes, .private);
         defer arena.deinit();
+        result.attention = try .init(a, runtime, plan.attention, .{ .arena = &arena, .offset = plan.temps.offsets[@backingInt(Temp.router)] });
+        errdefer result.attention.deinit();
         var initialized: usize = 0;
         errdefer for (result.temps[0..initialized]) |*tensor| tensor.deinit();
         for (&result.temps, std.enums.values(Temp), plan.elements, 0..) |*tensor, kind, elements, index| {
@@ -1027,9 +1032,9 @@ test "Inkling Metal resident decoder executes the full visit schedule on a synth
     try request.init(a, &model, 3);
     defer request.deinit();
     const request_memory = @import("../backends/metal_tensor.zig").memoryStatsSnapshot();
-    // Six state buffers, one residual buffer, two attention buffers,
+    // Six state buffers, one residual buffer, one attention buffer,
     // a private temporary arena, and a shared logits buffer.
-    try std.testing.expectEqual(@as(u64, 11), request_memory.device_owned_buffers_created - before_request.device_owned_buffers_created);
+    try std.testing.expectEqual(@as(u64, 10), request_memory.device_owned_buffers_created - before_request.device_owned_buffers_created);
     try std.testing.expectEqual(try short_plan.deviceBytes(), request_memory.device_owned_live_bytes - before_request.device_owned_live_bytes);
     var image_row = try upload(a, runtime, .i16, std.mem.sliceAsBytes(embeddings[0..width]));
     defer image_row.deinit();
@@ -1083,6 +1088,8 @@ test "Inkling Metal resident decoder executes the full visit schedule on a synth
         defer group_request.deinit();
         const work = &group_request.prefill.?;
         const groups = work.groups orelse return error.InvalidFixture;
+        try std.testing.expectEqual(work.get(.router).deviceHandle(), work.attention.reduction.deviceHandle());
+        try std.testing.expectEqual(work.get(.router).deviceByteOffset(), work.attention.reduction.deviceByteOffset());
         try std.testing.expectEqual(work.get(.selected).deviceHandle(), groups.deviceHandle());
         try std.testing.expect(groups.deviceByteOffset() >= work.get(.selected).deviceByteOffset() + work.get(.selected).deviceByteLen());
         try group_request.appendTokens(&@as([16]i32, @splat(1)));
