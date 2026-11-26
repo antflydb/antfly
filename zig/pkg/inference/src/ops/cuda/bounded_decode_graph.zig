@@ -132,6 +132,7 @@ pub const Snapshot = struct {
     plan: usize,
     peak: usize,
     events: usize,
+    arena_recipe: ?u64,
     metadata_quota: quota_mod.Quota,
     arena_quota: quota_mod.Quota,
 };
@@ -170,6 +171,16 @@ pub const GraphPhase = struct {
         _ = try descriptor.layout();
         self.* = .{ .descriptor = descriptor };
     }
+    fn arenaRequest(self: *const GraphPhase, bytes: usize, events: usize, recipe: u64) funding_mod.Request {
+        return .{ .captured_arena = .{
+            .epoch = self.descriptor.epoch,
+            .key_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(self.descriptor.key)),
+            .bytes = bytes,
+            .events = events,
+            .recipe = recipe,
+        } };
+    }
+
     /// Caller has dropped EVERY model/provider/reader lane but retains the
     /// exact model lifetime and SAME worker step. All callback-capable quota,
     /// Domain and process metadata ownership is created here.
@@ -181,7 +192,7 @@ pub const GraphPhase = struct {
         const cold = try allocator.create(ColdPhase);
         cold.* = .{ .allocator = allocator };
         errdefer cold.destroyOutside();
-        const request = if (self.mode == .storage) try self.descriptor.storageRequest() else funding_mod.Request{ .captured_arena = .{ .epoch = self.descriptor.epoch, .key_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(self.descriptor.key)), .bytes = self.old.peak, .events = self.old.events } };
+        const request = if (self.mode == .storage) try self.descriptor.storageRequest() else self.arenaRequest(self.old.peak, self.old.events, self.old.arena_recipe orelse return error.InvalidPreparedCacheState);
         const amounts = switch (request) {
             .captured_storage => |value| try value.amounts(),
             .captured_arena => |value| value.amounts(),
@@ -322,7 +333,11 @@ pub const Module = struct {
         self.invalidations += 1;
     }
     pub fn snapshot(self: *const Module) Snapshot {
-        return .{ .invalidations = self.invalidations, .epoch = self.epoch_id, .phase = self.phase, .metadata = self.metadata.ptr, .arena = self.arena.ptr, .head = self.head.ptr, .graph = if (self.graph) |value| @intFromPtr(value) else 0, .pending_graph = if (self.pending_graph) |value| @intFromPtr(value) else 0, .plan = if (self.plan) |value| @intFromPtr(value) else 0, .peak = if (self.plan) |value| value.peak else 0, .events = if (self.plan) |value| value.event_count else 0, .metadata_quota = self.metadata_quota, .arena_quota = self.arena_quota };
+        const missing_arena_recipe = if (self.phase == .capture and self.arena.ptr == 0)
+            if (self.plan) |plan| if (plan.sealed) plan.fingerprint(0) else null else null
+        else
+            null;
+        return .{ .invalidations = self.invalidations, .epoch = self.epoch_id, .phase = self.phase, .metadata = self.metadata.ptr, .arena = self.arena.ptr, .head = self.head.ptr, .graph = if (self.graph) |value| @intFromPtr(value) else 0, .pending_graph = if (self.pending_graph) |value| @intFromPtr(value) else 0, .plan = if (self.plan) |value| @intFromPtr(value) else 0, .peak = if (self.plan) |value| value.peak else 0, .events = if (self.plan) |value| value.event_count else 0, .arena_recipe = missing_arena_recipe, .metadata_quota = self.metadata_quota, .arena_quota = self.arena_quota };
     }
     pub fn invalidate(self: *Module, ctx: *context.CudaContext) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -381,7 +396,9 @@ pub const Module = struct {
         if (self.arena.ptr != 0) return;
         const layout = try self.arenaLayout();
         if (!phase.bound or phase.mode != .arena or layout.bytes != phase.old.peak or layout.events != phase.old.events) return error.InvalidPreparedCacheState;
-        const request = funding_mod.Request{ .captured_arena = .{ .epoch = phase.descriptor.epoch, .key_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(phase.descriptor.key)), .bytes = layout.bytes, .events = layout.events } };
+        const recipe = self.plan.?.fingerprint(0);
+        if (phase.old.arena_recipe != recipe) return error.PreparedCachePlanChanged;
+        const request = phase.arenaRequest(layout.bytes, layout.events, recipe);
         var lease = try phase.cold.?.funding.?.take(request, request.captured_arena.amounts());
         errdefer lease.releaseAfterSdkDeath();
         const arena = try buffer.DeviceBuffer.alloc(ctx, layout.bytes);
@@ -746,6 +763,15 @@ test "captured graph wide head and learned arena consume separate exact prefunde
     var b = try current.retainEpoch();
     defer b.release();
     try arena.bind(.{ .boundary = &b });
+    const plan = owner.plan.?;
+    plan.* = .{};
+    try plan.declareScratch(1023);
+    try std.testing.expectEqual(arena.old.peak, plan.peak);
+    try std.testing.expectEqual(arena.old.events, plan.event_count);
+    try std.testing.expectError(error.PreparedCachePlanChanged, owner.reserveArenaPrepared(&ctx, &arena));
+    try std.testing.expectEqual(@as(usize, 2), GraphTestDriver.allocations);
+    plan.* = .{};
+    try plan.declareScratch(1024);
     try owner.reserveArenaPrepared(&ctx, &arena);
     const pointer = owner.arena.ptr;
     try owner.reserveArenaPrepared(&ctx, &arena); // warm path consumes no token twice

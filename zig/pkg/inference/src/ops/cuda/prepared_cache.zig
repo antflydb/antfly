@@ -113,6 +113,7 @@ pub const CapturedArena = struct {
     key_hash: u64,
     bytes: usize,
     events: usize,
+    recipe: u64,
     pub fn amounts(self: CapturedArena) memory.AdmissionAmounts {
         return .{ .backend_scratch_bytes = self.bytes };
     }
