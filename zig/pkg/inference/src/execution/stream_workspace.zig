@@ -245,7 +245,7 @@ pub const Plan = struct {
     }
 };
 pub const Scope = struct {
-    plan: *Plan,
+    recipe: union(enum) { observing: *Plan, bound: *const Plan },
     base: DevicePointer = 0,
     empty_backing: bool = false,
     cursor: usize = 0,
@@ -258,40 +258,41 @@ pub const Scope = struct {
     /// This scope has no authority to return addresses from the plan.
     pub fn observe(plan: *Plan) Scope {
         std.debug.assert(!plan.sealed);
-        return .{ .plan = plan };
+        return .{ .recipe = .{ .observing = plan } };
     }
 
     pub fn recordAllocation(self: *Scope, bytes: usize, pointer: DevicePointer) void {
         std.debug.assert(!self.isBound());
-        self.plan.allocate(bytes, pointer);
+        self.recipe.observing.allocate(bytes, pointer);
     }
 
     /// Bind the funded byte range before recording or submitting any kernels.
-    pub fn bind(plan: *Plan, layout: Layout, backing: DevicePointer, backing_bytes: usize) !Scope {
+    pub fn bind(plan: *const Plan, layout: Layout, backing: DevicePointer, backing_bytes: usize) !Scope {
         if (!std.meta.eql(layout, try plan.layoutImpl(layout.scratch_offset, layout.external_output))) return error.InvalidExecutionPlan;
         if (layout.bytes == 0) {
             if (backing != 0 or backing_bytes != 0) return error.InvalidExecutionPlan;
-            return .{ .plan = plan, .empty_backing = true, .requires_published_output = layout.external_output };
+            return .{ .recipe = .{ .bound = plan }, .empty_backing = true, .requires_published_output = layout.external_output };
         }
         if (backing == 0 or backing % alignment != 0 or layout.bytes > backing_bytes or
             backing > @as(DevicePointer, std.math.maxInt(DevicePointer)) - @as(DevicePointer, backing_bytes)) return error.InvalidExecutionPlan;
-        return .{ .plan = plan, .base = backing + layout.scratch_offset, .bound_start = backing, .bound_end = backing + backing_bytes, .requires_published_output = layout.external_output };
+        return .{ .recipe = .{ .bound = plan }, .base = backing + layout.scratch_offset, .bound_start = backing, .bound_end = backing + backing_bytes, .requires_published_output = layout.external_output };
     }
 
     pub inline fn isBound(self: *const Scope) bool {
-        return self.base != 0 or self.empty_backing;
+        return self.recipe == .bound;
     }
 
     pub fn complete(self: *const Scope) bool {
-        return self.isBound() and self.valid and self.cursor == self.plan.event_count;
+        return self.isBound() and self.valid and self.cursor == self.recipe.bound.event_count;
     }
 
     /// Bind the actual backing span before execution or capture. The sealed
     /// event retains its exact write size even when the backing is larger.
     pub fn bindPublishedOutput(self: *Scope, pointer: DevicePointer, backing_bytes: usize) !void {
-        const slot = self.plan.output orelse return error.InvalidExecutionPlan;
+        if (!self.isBound()) return error.InvalidExecutionPlan;
+        const slot = self.recipe.bound.output orelse return error.InvalidExecutionPlan;
         if (!self.valid or self.cursor != 0 or self.published_ptr != 0 or pointer % alignment != 0 or
-            backing_bytes < self.plan.allocations[slot].bytes or !self.disjointBacking(pointer, backing_bytes)) return error.InvalidExecutionPlan;
+            backing_bytes < self.recipe.bound.allocations[slot].bytes or !self.disjointBacking(pointer, backing_bytes)) return error.InvalidExecutionPlan;
         self.published_ptr = pointer;
     }
 
@@ -302,39 +303,40 @@ pub const Scope = struct {
     }
 
     pub fn owns(self: *const Scope, pointer: DevicePointer) bool {
-        const peak = if (self.requires_published_output) self.plan.scratch_peak else self.plan.peak;
-        return self.isBound() and ((self.published_ptr != 0 and pointer == self.published_ptr) or
-            (pointer >= self.base and pointer - self.base < peak));
+        if (!self.isBound()) return false;
+        const peak = if (self.requires_published_output) self.recipe.bound.scratch_peak else self.recipe.bound.peak;
+        return (self.published_ptr != 0 and pointer == self.published_ptr) or
+            (pointer >= self.base and pointer - self.base < peak);
     }
     pub fn allocate(self: *Scope, bytes: usize) !DevicePointer {
         // Observation scopes register real allocations through Plan.allocate.
         // Only an admitted backing may issue addresses from a sealed recipe.
-        if (!self.isBound() or !self.valid or self.cursor >= self.plan.event_count or
+        if (!self.isBound() or !self.valid or self.cursor >= self.recipe.bound.event_count or
             (self.requires_published_output and self.published_ptr == 0))
         {
             self.valid = false;
             return error.AudioPlanChanged;
         }
-        const e = self.plan.events[self.cursor];
-        if (!e.allocate or self.plan.allocations[e.slot].bytes != bytes) {
+        const e = self.recipe.bound.events[self.cursor];
+        if (!e.allocate or self.recipe.bound.allocations[e.slot].bytes != bytes) {
             self.valid = false;
             return error.AudioPlanChanged;
         }
         self.cursor += 1;
-        if (self.published_ptr != 0 and self.plan.output == e.slot) return self.published_ptr;
-        return self.base + self.plan.allocations[e.slot].offset;
+        if (self.published_ptr != 0 and self.recipe.bound.output == e.slot) return self.published_ptr;
+        return self.base + self.recipe.bound.allocations[e.slot].offset;
     }
     pub fn release(self: *Scope, pointer: DevicePointer) void {
         if (!self.isBound()) {
-            self.plan.release(pointer);
+            self.recipe.observing.release(pointer);
             return;
         }
-        if (!self.valid or self.cursor == self.plan.event_count) {
+        if (!self.valid or self.cursor == self.recipe.bound.event_count) {
             self.valid = false;
             return;
         }
-        const e = self.plan.events[self.cursor];
-        if (e.allocate or self.base + self.plan.allocations[e.slot].offset != pointer) {
+        const e = self.recipe.bound.events[self.cursor];
+        if (e.allocate or self.base + self.recipe.bound.allocations[e.slot].offset != pointer) {
             self.valid = false;
             return;
         }
@@ -357,10 +359,13 @@ test "stream workspace rejects live buffers and event drift" {
     p.release(3000);
     try std.testing.expect(p.finishNoOutput());
     try std.testing.expectEqual(@as(usize, 768), p.peak);
-    var observing = Scope{ .plan = p };
+    var open_plan: Plan = .{};
+    var observing = Scope.observe(&open_plan);
+    try std.testing.expect(!observing.owns(0x1000));
+    try std.testing.expectError(error.InvalidExecutionPlan, observing.bindPublishedOutput(0x1000, alignment));
     try std.testing.expectError(error.AudioPlanChanged, observing.allocate(256));
     try std.testing.expectEqual(@as(usize, 0), observing.cursor);
-    var scope = Scope{ .plan = p, .base = 10000 };
+    var scope = Scope{ .recipe = .{ .bound = p }, .base = 10000 };
     const a = try scope.allocate(256);
     const b = try scope.allocate(512);
     scope.release(a);
@@ -371,7 +376,7 @@ test "stream workspace rejects live buffers and event drift" {
     try std.testing.expect(scope.complete());
     try std.testing.expectError(error.AudioPlanChanged, scope.allocate(256));
     try std.testing.expect(!scope.complete());
-    var changed = Scope{ .plan = p, .base = 10000 };
+    var changed = Scope{ .recipe = .{ .bound = p }, .base = 10000 };
     _ = try changed.allocate(256);
     try std.testing.expectError(error.AudioPlanChanged, changed.allocate(256));
 }
@@ -456,7 +461,7 @@ test "CUDA arena preserves device addresses wider than a 32-bit host pointer" {
     const address: u64 = 0x1_0000_1000;
     plan.allocate(256, address);
     try std.testing.expect(plan.finish(address));
-    var scope: Scope = .{ .plan = &plan, .base = address };
+    var scope: Scope = .{ .recipe = .{ .bound = &plan }, .base = address };
     const allocated = try scope.allocate(256);
     try std.testing.expectEqual(address, allocated);
     try std.testing.expect(scope.owns(allocated));

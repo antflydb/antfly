@@ -223,14 +223,14 @@ test "embeddinggemma2 CUDA audio lifetime plan reuses dead regions and rejects a
     p.release(2000);
     try std.testing.expect(p.finish(3000));
     try std.testing.expectEqual(@as(usize, 768), p.peak);
-    var s = Scope{ .plan = p, .base = 10000 };
+    var s = Scope{ .recipe = .{ .bound = p }, .base = 10000 };
     try std.testing.expectEqual(@as(usize, 10000), try s.allocate(256));
     try std.testing.expectEqual(@as(usize, 10256), try s.allocate(512));
     s.release(10000);
     try std.testing.expectEqual(@as(usize, 10000), try s.allocate(128));
     s.release(10256);
     try std.testing.expect(s.valid and s.cursor == p.event_count);
-    var wrong = Scope{ .plan = p, .base = 10000 };
+    var wrong = Scope{ .recipe = .{ .bound = p }, .base = 10000 };
     try std.testing.expectError(error.AudioPlanChanged, wrong.allocate(128));
     p.* = .{};
     p.allocate(limit + 1, 1);

@@ -39436,7 +39436,7 @@ test "embeddinggemma2 CUDA active audio plan declines recursion and cache reclam
     try std.testing.expect(try audioExecutionOp(&compute, 0, undefined, undefined, undefined, .{}, false) == null);
     try std.testing.expectError(error.ResourceTemporarilyUnavailable, compute.evictEmbeddingGemma2Caches());
     var plan: @import("audio_execution_plan.zig").Plan = undefined;
-    var scope = @import("../../execution/stream_workspace.zig").Scope{ .plan = &plan, .base = 1 };
+    var scope = @import("../../execution/stream_workspace.zig").Scope{ .recipe = .{ .bound = &plan }, .base = 1 };
     compute.execution_scope = &scope;
     var bytes = [_]u8{0};
     const device = buffer_mod.DeviceBuffer{ .ptr = 1, .len = bytes.len };
@@ -45733,7 +45733,7 @@ test "LightOnOCR3 CUDA wide graph head projection writes its assigned buffer" {
     owner.hidden = 2;
     owner.vocab = 2;
     var plan: @import("../../execution/stream_workspace.zig").Plan = .{};
-    var workspace = @import("../../execution/stream_workspace.zig").Scope{ .plan = &plan };
+    var workspace = @import("../../execution/stream_workspace.zig").Scope.observe(&plan);
     try std.testing.expect(owner.mutex.tryLock());
     owner.active = true;
     compute.execution_scope = &workspace;
@@ -60784,7 +60784,7 @@ test "source linear bank metadata reuses only its audio owner or exact captured 
     plan.allocate(layout.bytes, 0x1000);
     plan.release(0x1000);
     try std.testing.expect(plan.finishNoOutput());
-    var scope = @import("../../execution/stream_workspace.zig").Scope{ .plan = &plan, .base = 0x10000000 };
+    var scope = @import("../../execution/stream_workspace.zig").Scope{ .recipe = .{ .bound = &plan }, .base = 0x10000000 };
     compute.source_linear_scratch = .{};
     compute.execution_scope = &scope;
     var captured = try SourceLinearTemporary.acquireKnownCapture(&compute, layout.bytes, layout.bytes, false);
@@ -60795,7 +60795,7 @@ test "source linear bank metadata reuses only its audio owner or exact captured 
 
 test "source linear arena precondition refuses retained ordinary storage before any opaque CUDA access" {
     const plan_mod = @import("audio_execution_plan.zig");
-    var scope = plan_mod.Scope{ .plan = undefined, .base = 0x8000 };
+    var scope = plan_mod.Scope{ .recipe = .{ .bound = undefined }, .base = 0x8000 };
     var compute = metadataOnlyTestCompute();
     compute.execution_scope = &scope;
     compute.source_linear_scratch = .{ .active = true, .buffer = .{ .ptr = 16, .len = 256 } };
@@ -61217,7 +61217,7 @@ test "source local relative temporary follows the actual learned and captured ba
     plan.allocate(layout.bytes, 0x1000);
     plan.release(0x1000);
     try std.testing.expect(plan.finishNoOutput());
-    var scope = @import("../../execution/stream_workspace.zig").Scope{ .plan = &plan, .base = 0x10000000 };
+    var scope = @import("../../execution/stream_workspace.zig").Scope{ .recipe = .{ .bound = &plan }, .base = 0x10000000 };
     compute.source_linear_scratch = .{};
     compute.execution_scope = &scope;
     var temporary = try SourceLinearTemporary.acquireKnownCapture(&compute, layout.bytes, layout.bytes, false);
@@ -61283,7 +61283,7 @@ test "source local relative actual external capture rejects before module or out
     plan.allocate(256, 0x1000);
     plan.release(0x1000);
     try std.testing.expect(plan.finishNoOutput());
-    var scope = @import("../../execution/stream_workspace.zig").Scope{ .plan = &plan, .base = 0x10000000 };
+    var scope = @import("../../execution/stream_workspace.zig").Scope{ .recipe = .{ .bound = &plan }, .base = 0x10000000 };
     compute.execution_scope = &scope;
     compute.source_linear_scratch = .{};
     compute.embedding_gemma2 = null;
