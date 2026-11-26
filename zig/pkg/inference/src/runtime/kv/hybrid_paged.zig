@@ -308,21 +308,34 @@ pub const RowSpans = struct {
         };
     }
 
-    pub fn next(self: *RowSpans) !?Span {
-        if (self.position == self.end) return null;
-        const tokens = self.sequence.layout.page_tokens;
-        const logical = self.position / tokens;
-        const within = self.position % tokens;
+    fn physicalPage(self: *const RowSpans, logical: usize) !usize {
         const page = (if (self.append) |staged| staged.pageId(self.group, logical) else self.sequence.pageId(self.group, logical)) orelse
             return error.InvalidKvRange;
         if (page >= self.physical_pages) return error.InvalidKvRange;
-        const rows = @min(self.end - self.position, tokens - within);
-        const span: Span = .{
+        return page;
+    }
+
+    /// Extend the copy only across consecutive physical pages. Partial pages
+    /// and recycled slots retain the same logical-to-physical boundaries.
+    pub fn next(self: *RowSpans) !?Span {
+        if (self.position == self.end) return null;
+        const tokens = self.sequence.layout.page_tokens;
+        const within = self.position % tokens;
+        const page = try self.physicalPage(self.position / tokens);
+        var span: Span = .{
             .linear_row = self.position - self.start,
-            .physical_row = @as(usize, page) * tokens + within,
-            .rows = rows,
+            .physical_row = page * tokens + within,
+            .rows = @min(self.end - self.position, tokens - within),
         };
-        self.position += rows;
+        var frontier = self.position + span.rows;
+        while (frontier < self.end) {
+            const next_page = try self.physicalPage(frontier / tokens);
+            if (next_page * tokens != span.physical_row + span.rows) break;
+            const count = @min(self.end - frontier, tokens);
+            span.rows += count;
+            frontier += count;
+        }
+        self.position = frontier;
         return span;
     }
 };
@@ -339,6 +352,29 @@ fn testPool(layer_count: u16) !storage.KvStorage {
         .head_dim = 128,
         .store_cpu_bytes = false,
     });
+}
+
+test "hybrid paged KV coalesces contiguous rows and splits at a physical gap" {
+    const a = std.testing.allocator;
+    var full = try testPool(8);
+    defer full.deinit(a);
+    var sliding = try testPool(40);
+    defer sliding.deinit(a);
+    var sequence = try Sequence.init(a, inkling_test_layout, &full, &sliding);
+    defer sequence.deinit();
+    var initial = try sequence.prepareAppend(16);
+    defer initial.abort();
+    initial.commit();
+
+    const pool = full.hostPool().?;
+    const gap = try pool.acquire(a);
+    defer _ = pool.releaseRef(a, gap) catch unreachable;
+    var suffix = try sequence.prepareAppend(31);
+    defer suffix.abort();
+    var spans = try RowSpans.init(&sequence, &suffix, .full, 3, 47);
+    try std.testing.expectEqual(RowSpans.Span{ .linear_row = 0, .physical_row = 3, .rows = 13 }, (try spans.next()).?);
+    try std.testing.expectEqual(RowSpans.Span{ .linear_row = 13, .physical_row = 32, .rows = 31 }, (try spans.next()).?);
+    try std.testing.expectEqual(null, try spans.next());
 }
 
 test "hybrid paged KV bounds sliding pages through long and misaligned prefills" {

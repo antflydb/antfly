@@ -1022,6 +1022,14 @@ The physical Metal suite passed 83 tests, including bitwise parity for
 tiled and untiled output. The released-checkpoint test was deferred while
 the full-window HTTP scan held the resident model.
 
+The generated Metal attention program shares K/V loads across two adjacent
+queries and their three query heads on eligible global spans. It reads the
+page table once per visited page and preserves each query's accumulation
+order. BF16 and packed K/V probes matched every FP32 partial bit. The
+physical Metal test also checks that the penultimate query in a synthetic
+million-token span cannot see the value at the remapped final position.
+End-to-end latency for this change awaits a released-checkpoint rerun.
+
 ### Official Gemma 4 E2B QAT serving comparison
 
 The decoder and projector came from Google's E2B QAT Q4_0 GGUF revision
