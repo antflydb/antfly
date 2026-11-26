@@ -509,10 +509,10 @@ pub const Plan = struct {
     /// A constant used elsewhere in the tape remains a required input.
     pub fn resolveRequiredConstants(self: *Plan) void {
         var required: std.StaticBitSet(capacity) = .empty;
-        for (self.nodes[0..self.count]) |node| {
+        for (self.nodes[0..self.count]) |*node| {
             const prepared_weight: ?u16 = if (node.prepared_slot != null) switch (node.args) {
-                .linearNoBias => |a| a.weight,
-                .clippedLinear => |a| a.weight,
+                .linearNoBias => |a| if (a.input != a.weight) a.weight else null,
+                .clippedLinear => |a| if (a.input != a.weight) a.weight else null,
                 else => null,
             } else null;
             for (node.inputs[0..node.input_count]) |id|
@@ -1103,6 +1103,10 @@ test "audio schedule keeps constants shared by prepared and ordinary operands" {
     nodes[1].prepared_slot = 2;
     plan.resolveRequiredConstants();
     try std.testing.expect(!constants[0].required);
+    nodes[1].args.linearNoBias.input = 1;
+    nodes[1].inputs[0] = 1;
+    plan.resolveRequiredConstants();
+    try std.testing.expect(constants[0].required);
 }
 
 test "audio schedule keys track geometry and aliasing across different input owners" {
