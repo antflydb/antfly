@@ -979,6 +979,19 @@ test "Inkling Metal resident decoder executes the full visit schedule on a synth
     try std.testing.expect(weights_before > 0);
     const short_plan = try RequestPlan.init(&model, 3);
     const expanded_plan = try RequestPlan.init(&model, 17);
+    // Each bank has a shared history allocation and its own page table.
+    // The key and value planes keep separate capacity for every visit.
+    const before_state = @import("../backends/metal_tensor.zig").memoryStatsSnapshot();
+    {
+        var state: State = undefined;
+        try state.init(a, runtime, short_plan.bank, short_plan.width);
+        defer state.deinit();
+        const live_state = @import("../backends/metal_tensor.zig").memoryStatsSnapshot();
+        try std.testing.expectEqual(@as(u64, 2 * checkpoint.visit_count + 4), live_state.device_owned_buffers_created - before_state.device_owned_buffers_created);
+        try std.testing.expectEqual(try State.deviceBytes(short_plan.bank, short_plan.width), live_state.device_owned_live_bytes - before_state.device_owned_live_bytes);
+    }
+    const retired_state = @import("../backends/metal_tensor.zig").memoryStatsSnapshot();
+    try std.testing.expectEqual(before_state.device_owned_live_bytes, retired_state.device_owned_live_bytes);
     const new_page_bytes = checkpoint.visit_count * 16 * width * 2 * @sizeOf(u16) + 2 * @sizeOf(u32);
     try std.testing.expectEqual(@as(usize, new_page_bytes), (try expanded_plan.deviceBytes()) - (try short_plan.deviceBytes()));
     var request: Request = undefined;

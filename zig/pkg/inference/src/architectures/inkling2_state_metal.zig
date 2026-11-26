@@ -22,16 +22,52 @@ const tensors = @import("../backends/metal_tensor.zig");
 const attention = @import("inkling2_attention_metal.zig");
 const Tensor = tensors.MetalTensor;
 
-const Slot = struct {
-    buffers: [10]Tensor,
+const HistoryLayout = struct {
+    const views_per_kind = 4;
+    const view_count = 2 * views_per_kind;
+    const alignment = 256;
 
-    fn init(a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, plane: i32, history: i32, residual: i32) !Slot {
+    payload: [2]usize,
+    stride: [2]usize,
+
+    fn init(config: kv.BankConfig, width: u32) !HistoryLayout {
+        if (width == 0) return error.InvalidKvShape;
+        const payload: [2]usize = .{
+            try std.math.mul(usize, try config.rowBytes(), 3),
+            try std.math.mul(usize, width, 3 * @sizeOf(u16)),
+        };
+        var stride: [2]usize = undefined;
+        for (payload, &stride) |payload_bytes, *span| {
+            span.* = (try std.math.add(usize, payload_bytes, alignment - 1)) & ~@as(usize, alignment - 1);
+        }
+        return .{ .payload = payload, .stride = stride };
+    }
+
+    fn bytes(self: HistoryLayout, slots: usize) !usize {
+        const per_kind = try std.math.add(usize, self.stride[0], self.stride[1]);
+        return std.math.mul(usize, per_kind, try std.math.mul(usize, slots, views_per_kind));
+    }
+};
+
+const Slot = struct {
+    buffers: [2 + HistoryLayout.view_count]Tensor,
+
+    fn init(a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, plane: i32, history: *const Tensor, layout: HistoryLayout, start: usize) !Slot {
         var result: Slot = undefined;
         var initialized: usize = 0;
         errdefer for (result.buffers[0..initialized]) |*buffer| buffer.deinit();
-        for (&result.buffers, [_]i32{ plane, plane, history, history, history, history, residual, residual, residual, residual }) |*buffer, count| {
-            buffer.* = try Tensor.deviceAllocateTyped(a, runtime, .i16, .private, &.{count});
+        for (result.buffers[0..2]) |*buffer| {
+            buffer.* = try Tensor.deviceAllocateTyped(a, runtime, .i16, .private, &.{plane});
             initialized += 1;
+        }
+        var offset = start;
+        for (result.buffers[2..], 0..) |*buffer, index| {
+            const kind = index / HistoryLayout.views_per_kind;
+            const bytes = layout.payload[kind];
+            const elements = std.math.cast(i32, bytes / @sizeOf(u16)) orelse return error.InvalidKvShape;
+            buffer.* = try history.retainedView(offset, bytes, &.{elements});
+            initialized += 1;
+            offset += layout.stride[kind];
         }
         return result;
     }
@@ -54,9 +90,8 @@ const Bank = struct {
         const count = config.slots(group);
         if (count == 0) return error.InvalidKvShape;
         const plane = std.math.cast(i32, (try config.planeBytes(group)) / 2) orelse return error.InvalidKvShape;
-        const history = std.math.cast(i32, try std.math.mul(usize, (try config.rowBytes()) / 2, 3)) orelse return error.InvalidKvShape;
-        const residual = std.math.cast(i32, @as(usize, hidden_width) * 3) orelse return error.InvalidKvShape;
-        if (residual == 0) return error.InvalidKvShape;
+        const layout = try HistoryLayout.init(config, hidden_width);
+        const history_elements = std.math.cast(i32, (try layout.bytes(count)) / @sizeOf(u16)) orelse return error.InvalidKvShape;
         var pool = try storage.initHost(a, .{
             .backend = .metal,
             .dtype = if (config.format(group) == .bf16) .bf16 else .int4,
@@ -72,8 +107,14 @@ const Bank = struct {
         errdefer a.free(slots);
         var initialized: usize = 0;
         errdefer for (slots[0..initialized]) |*slot| slot.deinit();
-        for (slots) |*slot| {
-            slot.* = try Slot.init(a, runtime, plane, history, residual);
+        // History has the same lifetime for every visit in the bank. Keep
+        // planes separate so their context capacity is not limited by the
+        // maximum single Metal buffer size.
+        var history = try Tensor.deviceAllocateTyped(a, runtime, .i16, .private, &.{history_elements});
+        defer history.deinit();
+        const slot_bytes = try layout.bytes(1);
+        for (slots, 0..) |*slot, index| {
+            slot.* = try Slot.init(a, runtime, plane, &history, layout, index * slot_bytes);
             initialized += 1;
         }
         const host_ids = try a.alloc(u32, pages);
@@ -159,7 +200,7 @@ pub const State = struct {
         const full = try config.deviceBytes(.full);
         const sliding = try config.deviceBytes(.sliding);
         const visit_count = @as(usize, config.full_slots) + config.sliding_slots;
-        const history = try std.math.mul(usize, 12 * @sizeOf(u16), try std.math.mul(usize, visit_count, @as(usize, width) + (try config.rowBytes()) / @sizeOf(u16)));
+        const history = try (try HistoryLayout.init(config, width)).bytes(visit_count);
         const pages = try std.math.add(usize, try config.layout.pageCapacity(.full), try config.layout.pageCapacity(.sliding));
         const tables = try std.math.mul(usize, pages, @sizeOf(u32));
         return std.math.add(usize, try std.math.add(usize, full, sliding), try std.math.add(usize, history, tables));
