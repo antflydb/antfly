@@ -820,7 +820,15 @@ test "Inkling Metal resident decoder runs the released text checkpoint" {
         var large: Request = undefined;
         const wide = try RequestPlan.initPrefill(decoder, tokens.len + 1, grouped_prefill_chunk_rows);
         const tiled = try RequestPlan.initWithReductionRows(decoder, tokens.len + 1, grouped_prefill_chunk_rows, 16, .bf16);
-        try std.testing.expect(try tiled.deviceBytes() < try wide.deviceBytes());
+        const wide_bytes = try wide.deviceBytes();
+        const tiled_bytes = try tiled.deviceBytes();
+        // Short prompts may fit both attention variants in the same arena
+        // tail already reserved for the router and expert reductions.
+        std.debug.print("Inkling Metal grouped prefill workspace bytes wide={d} tiled={d}\n", .{ wide_bytes, tiled_bytes });
+        try std.testing.expect(tiled_bytes <= wide_bytes);
+        const long_wide = try RequestPlan.initPrefill(decoder, 32_768, grouped_prefill_chunk_rows);
+        const long_tiled = try RequestPlan.initWithReductionRows(decoder, 32_768, grouped_prefill_chunk_rows, 16, .bf16);
+        try std.testing.expect(try long_tiled.prefillWorkspaceBytes() < try long_wide.prefillWorkspaceBytes());
         const wide_tail = try tiled.withPrefillTail(decoder, tail_rows);
         try std.testing.expectEqual(try tiled.deviceBytes(), try wide_tail.deviceBytes());
         try large.initWithPlan(a, decoder, wide_tail);
