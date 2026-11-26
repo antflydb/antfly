@@ -3827,14 +3827,10 @@ pub const CudaCompute = struct {
             var host: [@import("bounded_decode_graph.zig").StorageLayout.max_readback_words]u32 = undefined;
             const layout = owner.storage_layout orelse return error.InvalidExecutionPlan;
             const source = layout.readback(owner.metadata);
-            try copyToHostTrackedAndSync(self.compute, source, std.mem.sliceAsBytes(host[0 .. source.len / @sizeOf(u32)]));
+            const readback_words = host[0 .. source.len / @sizeOf(u32)];
+            try copyToHostTrackedAndSync(self.compute, source, std.mem.sliceAsBytes(readback_words));
             burst_value.drained = true;
-            const expected = try std.math.add(u32, owner.progress, 2);
-            if (host[layout.readbackProgressIndex()] != expected) return error.InvalidExecutionPlan;
-            const position_offset = layout.readbackPositionIndex();
-            for (owner.next_positions[0 .. owner.rows * 3], 0..) |position, i|
-                if (host[position_offset + i] != try std.math.add(u32, position, 2)) return error.InvalidExecutionPlan;
-            @memcpy(tokens, host[0..tokens.len]);
+            try layout.publishReadback(readback_words, owner.next_positions[0 .. owner.rows * 3], owner.progress, tokens);
             try owner.notePair();
         }
         pub fn noteKvTokens(self: *@This(), storage: *kv_storage_runtime.KvStorageRuntime, max_tokens: usize) void {

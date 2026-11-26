@@ -67,6 +67,19 @@ pub const StorageLayout = struct {
         return (self.counter.offset - self.tokens.offset) / @sizeOf(u32);
     }
 
+    /// Check the device receipt before any tokens or position changes escape.
+    pub fn publishReadback(self: StorageLayout, host: []const u32, previous_positions: []const u32, progress: u32, tokens: []u32) !void {
+        const counter_word = self.readbackProgressIndex();
+        const position_word = self.readbackPositionIndex();
+        if (host.len != counter_word + 1 or tokens.len != self.tokens.bytes / @sizeOf(u32) or
+            previous_positions.len != self.positions.bytes / @sizeOf(u32))
+            return error.InvalidExecutionPlan;
+        if (host[counter_word] != try std.math.add(u32, progress, 2)) return error.InvalidExecutionPlan;
+        for (previous_positions, host[position_word..][0..previous_positions.len]) |position, actual|
+            if (actual != try std.math.add(u32, position, 2)) return error.InvalidExecutionPlan;
+        @memcpy(tokens, host[0..tokens.len]);
+    }
+
     pub fn init(rows: usize, hidden: usize, vocab: usize, key_words: usize) !StorageLayout {
         if (rows < 2 or rows > max_rows or hidden == 0 or vocab == 0 or key_words == 0) return error.InvalidShape;
         const input_bytes = try std.math.mul(usize, try std.math.mul(usize, rows, hidden), @sizeOf(f32));
@@ -526,6 +539,17 @@ test "captured sequence storage layout preserves existing narrow wide and aligne
         if (value.rows == max_rows) try std.testing.expectEqual(StorageLayout.max_readback_words, actual.readbackProgressIndex() + 1);
         try std.testing.expectEqual(@sizeOf(plan_mod.Plan) + 196608, actual.host_bytes);
     }
+    const paired = try StorageLayout.init(2, 1024, 8, 1);
+    var receipt: [StorageLayout.max_readback_words]u32 = @splat(0);
+    const words = receipt[0 .. paired.readbackProgressIndex() + 1];
+    words[0..4].* = .{ 11, 22, 33, 44 };
+    words[paired.readbackPositionIndex()..][0..6].* = .{ 3, 4, 5, 6, 7, 8 };
+    words[paired.readbackProgressIndex()] = 10;
+    var tokens: [4]u32 = @splat(0);
+    try std.testing.expectError(error.InvalidExecutionPlan, paired.publishReadback(words, &.{ 1, 2, 3, 4, 5, 9 }, 8, &tokens));
+    try std.testing.expectEqualSlices(u32, &.{ 0, 0, 0, 0 }, &tokens);
+    try paired.publishReadback(words, &.{ 1, 2, 3, 4, 5, 6 }, 8, &tokens);
+    try std.testing.expectEqualSlices(u32, &.{ 11, 22, 33, 44 }, &tokens);
     try std.testing.expectError(error.InvalidShape, StorageLayout.init(1, 1024, 8, 1));
     try std.testing.expectError(error.Overflow, StorageLayout.init(128, std.math.maxInt(usize), 8, 1));
     try std.testing.expectError(error.Overflow, StorageLayout.init(128, 1024, std.math.maxInt(usize), 1));
