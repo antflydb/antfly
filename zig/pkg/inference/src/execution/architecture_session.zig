@@ -9348,11 +9348,12 @@ fn archRunImplWithContext(ptr: *anyopaque, inputs: []const Tensor, allocator: st
             // round-trip the legacy []f32-typed APIs do. One Metal frame
             // amortizes command-buffer commits across the resident head;
             // host-reading ops such as the label GRU drain and reopen it.
-            var head_frame_active = false;
-            if (cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame()) {
-                head_frame_active = cb.decoderRuntimeBeginFrame() catch false;
-            }
-            errdefer if (head_frame_active) cb.decoderRuntimeCancelFrame() catch {};
+            const Submission = @import("submission.zig").Scope;
+            var head_frame: Submission = if (cb.kind() == .metal)
+                Submission.begin(&cb) catch .{ .backend = &cb }
+            else
+                .{ .backend = &cb };
+            defer head_frame.deinit();
             const head_result = try gliner_head.forwardCtWithLabelMarkers(&cb, allocator, hidden, input_ids, words_mask, span_idx, batch, seq_len, cfg.hidden_size, .{
                 .classification = cfg.classification_token_id,
                 .entity = cfg.entity_token_id,
@@ -9363,10 +9364,7 @@ fn archRunImplWithContext(ptr: *anyopaque, inputs: []const Tensor, allocator: st
                 },
             });
             defer cb.free(head_result.logits);
-            if (head_frame_active) {
-                try cb.decoderRuntimeSubmitAndWaitFrame();
-                head_frame_active = false;
-            }
+            try head_frame.finish();
 
             const logits_f32 = if (head_result.num_labels == 0)
                 try allocator.alloc(f32, 0)
