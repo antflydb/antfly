@@ -27,6 +27,7 @@ const appendOwnedKey = @import("owned_keys.zig").appendOwnedKey;
 const appendUniqueOwnedKey = @import("owned_keys.zig").appendUniqueOwnedKey;
 const apply_state = @import("derived/apply_state.zig");
 const artifact_ids = @import("artifact_ids.zig");
+const artifact_seeds = @import("artifact_seeds.zig");
 const asset_producer_mod = @import("enrichment/asset_producer.zig");
 const backend_types = @import("../backend_types.zig");
 const build_options = @import("build_options");
@@ -1944,6 +1945,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .authored => try enrichment_artifact_codec.encodeAuthoredDenseEmbeddingAlloc(alloc, vector),
                 .generated => |hash| try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, hash, vector),
                 .generated_text => |hash| try enrichment_artifact_codec.encodeProducedDenseEmbeddingAlloc(alloc, hash, true, vector),
+                .seeded => |hash| try enrichment_artifact_codec.encodeSeededDenseEmbeddingAlloc(alloc, hash, vector),
             };
             var payload_owned = true;
             errdefer if (payload_owned) alloc.free(payload);
@@ -3083,7 +3085,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             errdefer if (key_owned) alloc.free(key);
             const payload = switch (origin) {
                 .authored => try enrichment_artifact_codec.encodeAuthoredSparseEmbeddingAlloc(alloc, indices, values),
-                .generated, .generated_text => |hash| try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(alloc, hash, indices, values),
+                .generated, .generated_text, .seeded => |hash| try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(alloc, hash, indices, values),
             };
             var payload_owned = true;
             errdefer if (payload_owned) alloc.free(payload);
@@ -7924,6 +7926,339 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             );
             defer alloc.free(artifact_key);
             try appendForConsumers(alloc, dense_embeddings, request.doc_key, null, artifact_key, vector, consumer_indexes);
+        }
+
+        // ---- Artifact seeds (`artifact_seeds.zig`) ------------------------
+        //
+        // A seed replaces exactly one producer invocation. Everything else is
+        // the generated path: the same input identity (source hash or asset
+        // state), the same artifact keys and codecs, the same consumer and
+        // coverage effects. Reuse checks therefore treat seeded output as
+        // accepted output for that input, and any later input change
+        // invalidates it like generated output.
+
+        fn seedEmbedder(db: anytype, artifact_writes: anytype) !struct { runtime: *enrichment_runtime_mod.EnrichmentRuntime, embedder: embedder_mod.DenseEmbedder } {
+            // The seeded hash binds the embedding contract's current provider
+            // generation, exactly as generated output does. Without a configured
+            // embedder the contract cannot be identified; never drop silently.
+            const runtime = S.ownerField(db, "enrichment_runtime").* orelse return error.ArtifactSeedNotAccepted;
+            const embedder = (runtime.config.dense_embedder orelse return error.ArtifactSeedNotAccepted).withRequestContext(requestContext(artifact_writes));
+            return .{ .runtime = runtime, .embedder = embedder };
+        }
+
+        /// Seeded document-level dense vector for a producer-backed embedding.
+        pub fn computeSeededDenseRequestDerived(
+            alloc: Allocator,
+            db: anytype,
+            doc_value: []const u8,
+            request: enrichment_types.GeneratedEnrichmentRequest,
+            seed_value: std.json.Value,
+            artifact_writes: anytype,
+            dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
+            memo: ?*GeneratedEmbeddingMemo,
+        ) !void {
+            if (requestUsesChunkSource(request)) return error.InvalidArgument;
+            const resolved = try seedEmbedder(db, artifact_writes);
+            const embedding_name = requestEmbeddingName(request);
+            const consumer_indexes: []const []const u8 = request.consumer_indexes;
+            if (consumer_indexes.len == 0) return error.ArtifactSeedNotAccepted;
+            const vector = try artifact_seeds.decodeDenseVectorAlloc(alloc, seed_value, request.expected_dims);
+            defer alloc.free(vector);
+            const generation = if (memo) |cache_memo| try cache_memo.generation(resolved.embedder, embedding_name) else try resolved.embedder.captureTextGeneration(alloc, embedding_name);
+
+            // Mirror computeDenseRequestImpl's input identity for each source form.
+            const source_hash: u64 = hash: {
+                if (request.source_template.len > 0 and resolved.embedder.supportsParts()) {
+                    if (try renderSourceParts(alloc, db, doc_value, request, resolved.embedder.mediaPartLimit(embedding_name))) |parts| {
+                        defer template_mod.freeContentParts(alloc, parts);
+                        break :hash if (parts.len == 1 and parts[0] == .text and resolved.embedder.textPartsEquivalent(embedding_name))
+                            enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, parts[0].text, generation.revision)
+                        else
+                            try enrichment_runtime_mod.densePartsSourceHash(alloc, request, parts, generation.revision);
+                    }
+                }
+                const source_text = if (request.source_template.len > 0)
+                    renderSourceTemplateText(alloc, db, request.source_template, doc_value) catch |err| switch (err) {
+                        error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                        else => null,
+                    }
+                else
+                    try extractStringField(alloc, doc_value, request.source_field);
+                // No input means the producer would not run: there is nothing
+                // for the seed to bind to.
+                const text = source_text orelse return error.ArtifactSeedNotAccepted;
+                defer alloc.free(text);
+                if (text.len == 0) return error.ArtifactSeedNotAccepted;
+                break :hash enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, text, generation.revision);
+            };
+            const artifact_key = try appendEmbeddingArtifactWrite(alloc, artifact_writes, request.doc_key, request.doc_key, embedding_name, request.source_field, null, .{ .seeded = source_hash }, vector);
+            defer alloc.free(artifact_key);
+            try appendDerivedDenseEmbeddingForConsumers(alloc, dense_embeddings, request.doc_key, null, artifact_key, vector, consumer_indexes);
+        }
+
+        fn seededChunkIdentity(key: []const u8) ?struct { chunk_id: u32, window: u32 } {
+            const parent = internal_keys.mediaWindowParent(key);
+            if (parent.len < 5 or parent[parent.len - 5] != internal_keys.chunk_record_kind) return null;
+            return .{
+                .chunk_id = std.mem.readInt(u32, parent[parent.len - 4 ..][0..4], .big),
+                .window = internal_keys.mediaWindowIndex(key) orelse 0,
+            };
+        }
+
+        /// Seeded chunk-derived vectors. Chunks without a seeded vector are
+        /// embedded as usual; seeded ones are not.
+        pub fn computeSeededDenseChunkRequestDerived(
+            alloc: Allocator,
+            db: anytype,
+            doc_value: []const u8,
+            request: enrichment_types.GeneratedEnrichmentRequest,
+            seed_value: std.json.Value,
+            artifact_writes: anytype,
+            dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
+            cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
+            memo: ?*GeneratedEmbeddingMemo,
+        ) !void {
+            if (!requestUsesChunkSource(request)) return error.InvalidArgument;
+            const resolved = try seedEmbedder(db, artifact_writes);
+            const embedding_name = requestEmbeddingName(request);
+            const consumer_indexes: []const []const u8 = request.consumer_indexes;
+            if (consumer_indexes.len == 0) return error.ArtifactSeedNotAccepted;
+            const seeds = try artifact_seeds.decodeChunkVectorsAlloc(alloc, seed_value, request.expected_dims);
+            defer artifact_seeds.freeChunkVectors(alloc, seeds);
+            const generation = if (memo) |cache_memo| try cache_memo.generation(resolved.embedder, embedding_name) else try resolved.embedder.captureTextGeneration(alloc, embedding_name);
+            const pinned_embedder = resolved.embedder.withTextGeneration(generation);
+
+            // Each vector binds to its chunk's text in this same write: inline
+            // chunks of this document revision, or materialized chunk rows
+            // prepared in this batch (seeded or generated). Stored rows of an
+            // earlier revision cannot establish that binding.
+            var sources = std.ArrayListUnmanaged(ChunkEmbeddingSource).empty;
+            defer {
+                for (sources.items) |source| {
+                    alloc.free(source.key);
+                    alloc.free(source.text);
+                }
+                sources.deinit(alloc);
+            }
+            switch (request.input_kind) {
+                .inline_chunks => {
+                    var created: usize = 0;
+                    const inline_sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, cache, &created);
+                    defer alloc.free(inline_sources);
+                    sources.appendSlice(alloc, inline_sources) catch |err| {
+                        for (inline_sources) |source| {
+                            alloc.free(source.key);
+                            alloc.free(source.text);
+                        }
+                        return err;
+                    };
+                },
+                .materialized_chunks => {
+                    const artifact_name = requestArtifactName(request);
+                    const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "chunk", artifact_name);
+                    defer alloc.free(prefix);
+                    var seen = std.StringHashMapUnmanaged(void).empty;
+                    defer seen.deinit(alloc);
+                    var bytes: usize = 0;
+                    var i = artifact_writes.items.len;
+                    while (i > 0) {
+                        i -= 1;
+                        const write = artifact_writes.items[i];
+                        if (!std.mem.startsWith(u8, write.key, prefix) or !internal_keys.matchesChunkArtifactName(write.key, artifact_name)) continue;
+                        if (seededChunkIdentity(write.key) == null) continue;
+                        const entry = try seen.getOrPut(alloc, write.key);
+                        if (entry.found_existing) continue;
+                        _ = try appendMaterializedChunkSourceToBatch(alloc, &sources, &bytes, write.key, write.value, request.source_field);
+                    }
+                },
+                .document => unreachable,
+            }
+
+            const used = try alloc.alloc(bool, seeds.len);
+            defer alloc.free(used);
+            @memset(used, false);
+            var chunk_texts = std.ArrayListUnmanaged([]const u8).empty;
+            defer chunk_texts.deinit(alloc);
+            var source_indexes = std.ArrayListUnmanaged(usize).empty;
+            defer source_indexes.deinit(alloc);
+            for (sources.items, 0..) |source, source_index| {
+                const identity = seededChunkIdentity(source.key) orelse return error.InvalidArtifactSeed;
+                var window_count: usize = 0;
+                for (sources.items) |other| {
+                    const other_identity = seededChunkIdentity(other.key) orelse continue;
+                    if (other_identity.chunk_id == identity.chunk_id) window_count += 1;
+                }
+                var seeded_vector: ?[]const f32 = null;
+                var group_len: usize = 0;
+                var unsplit = false;
+                for (seeds, 0..) |seed, seed_index| {
+                    if (seed.chunk_id != identity.chunk_id) continue;
+                    group_len += 1;
+                    if (seed.window_index == null) unsplit = true;
+                    if ((seed.window_index orelse 0) == identity.window) {
+                        seeded_vector = seed.vector;
+                        used[seed_index] = true;
+                    }
+                }
+                if (group_len == 0) {
+                    try chunk_texts.append(alloc, source.text);
+                    try source_indexes.append(alloc, source_index);
+                    continue;
+                }
+                // An unsplit seed is the chunk's only vector (window 0); a
+                // windowed seed must supply every window the chunk has.
+                if (unsplit and identity.window != 0) continue;
+                if (!unsplit and group_len != window_count) return error.InvalidArtifactSeed;
+                const vector = seeded_vector orelse return error.InvalidArtifactSeed;
+                const source_hash = if (!source.has_metadata)
+                    enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, source.text, generation.revision)
+                else
+                    enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
+                const artifact_key = try appendEmbeddingArtifactWrite(alloc, artifact_writes, source.key, request.doc_key, embedding_name, request.source_field, source.key, .{ .seeded = source_hash }, vector);
+                defer alloc.free(artifact_key);
+                try appendDerivedDenseEmbeddingForConsumers(alloc, dense_embeddings, source.key, request.doc_key, artifact_key, vector, consumer_indexes);
+            }
+            // A vector for a chunk this revision does not have is invalid.
+            for (used) |accepted| if (!accepted) return error.InvalidArtifactSeed;
+
+            const max_batch_items = generatedEmbedBatchItems();
+            var start: usize = 0;
+            while (start < chunk_texts.items.len) {
+                const end = @min(chunk_texts.items.len, start + max_batch_items);
+                var batch_texts = std.ArrayListUnmanaged([]const u8).empty;
+                defer batch_texts.deinit(alloc);
+                var batch_indexes = std.ArrayListUnmanaged(usize).empty;
+                defer batch_indexes.deinit(alloc);
+                try batch_texts.appendSlice(alloc, chunk_texts.items[start..end]);
+                try batch_indexes.appendSlice(alloc, source_indexes.items[start..end]);
+                try flushGeneratedDenseChunkBatch(alloc, resolved.runtime, pinned_embedder, embedding_name, request, artifact_writes, dense_embeddings, sources.items, &batch_indexes, &batch_texts, consumer_indexes, appendDerivedDenseEmbeddingForConsumers);
+                start = end;
+            }
+            try resolved.embedder.requireTextGeneration(alloc, embedding_name, generation);
+        }
+
+        /// Installs seeded chunks as this document revision's chunker output
+        /// for `request`, so chunk records, full-text consumers and inline
+        /// chunk embeddings all consume exactly the seeded set.
+        pub fn installSeededChunks(
+            alloc: Allocator,
+            db: anytype,
+            doc_value: []const u8,
+            request: enrichment_types.GeneratedEnrichmentRequest,
+            items: []const std.json.Value,
+            cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
+        ) !void {
+            if (!requestHasChunking(request)) return error.ArtifactSeedNotAccepted;
+            const source_text = if (request.source_template.len > 0)
+                renderSourceTemplateText(alloc, db, request.source_template, doc_value) catch |err| switch (err) {
+                    error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                    else => null,
+                }
+            else
+                try extractStringField(alloc, doc_value, request.source_field);
+            defer if (source_text) |text| alloc.free(text);
+            // Seeded chunks bind to this revision's source text; with none the
+            // chunk producer would publish an empty set instead.
+            const text = source_text orelse return error.ArtifactSeedNotAccepted;
+            const fields = try artifact_seeds.decodeChunksAlloc(alloc, items, text.len);
+            defer alloc.free(fields);
+            const chunks = try alloc.alloc(chunker_mod.Chunk, fields.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (chunks[0..initialized]) |*chunk| chunk.deinit(alloc);
+                alloc.free(chunks);
+            }
+            for (fields, chunks) |field, *chunk| {
+                chunk.* = .{
+                    .chunk_id = field.chunk_id,
+                    .text = try alloc.dupe(u8, field.content),
+                    .start_offset = field.start_char,
+                    .end_offset = field.end_char,
+                    .start_time_ms = field.start_time_ms,
+                    .end_time_ms = field.end_time_ms,
+                };
+                initialized += 1;
+            }
+            const cache_key = try makeChunkCacheKey(alloc, request);
+            errdefer alloc.free(cache_key);
+            for (cache.items) |*entry| {
+                if (!std.mem.eql(u8, entry.key, cache_key)) continue;
+                alloc.free(cache_key);
+                chunker_mod.freeChunks(alloc, entry.chunks);
+                entry.chunks = chunks;
+                return;
+            }
+            try cache.append(alloc, .{ .key = cache_key, .chunks = chunks });
+        }
+
+        /// Seeded generic asset. Its state row binds the seed to the same
+        /// producer input fingerprint the producer would record.
+        pub fn computeSeededAssetRequestDerived(
+            alloc: Allocator,
+            db: anytype,
+            doc_value: []const u8,
+            request: enrichment_types.GeneratedEnrichmentRequest,
+            seed_value: std.json.Value,
+            artifact_writes: anytype,
+            artifact_delete_keys: anytype,
+            documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+            coverage_outcomes: *std.ArrayListUnmanaged(PrecomputedCoverageOutcome),
+        ) !void {
+            var producer_cfg = try asset_producer_mod.parseProducerConfig(alloc, request.producer_json);
+            defer producer_cfg.deinit(alloc);
+            // `copy` is free to regenerate. Document extraction publishes a
+            // manifest, units and children; its seed adapter is separate.
+            if (producer_cfg.type == .copy or producer_cfg.type == .document_extraction) return error.ArtifactSeedNotAccepted;
+            // The async producer folds prior context into its input state.
+            if (request.prior_context_json.len != 0) return error.ArtifactSeedNotAccepted;
+            const artifact_name = requestArtifactName(request);
+            const key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", artifact_name);
+            defer alloc.free(key);
+
+            // Downstream seeds bind to upstream content: the upstream asset's
+            // bytes from this batch (seeded or generated), else the stored row.
+            const source_text: ?[]u8 = if (request.upstream_artifact_name.len > 0) blk: {
+                if (@import("../../privacy/document.zig").isProtectedArtifactName(request.upstream_artifact_name)) return error.ArtifactSeedNotAccepted;
+                const upstream_key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", request.upstream_artifact_name);
+                defer alloc.free(upstream_key);
+                for (artifact_delete_keys.items) |delete_key| {
+                    if (std.mem.eql(u8, delete_key, upstream_key)) break :blk null;
+                }
+                const upstream: ?[]u8 = upstream: {
+                    var i = artifact_writes.items.len;
+                    while (i > 0) {
+                        i -= 1;
+                        const write = artifact_writes.items[i];
+                        if (std.mem.eql(u8, write.key, upstream_key)) break :upstream try alloc.dupe(u8, write.value);
+                    }
+                    break :upstream try S.ownerField(db, "core").*.getStoreValue(alloc, upstream_key);
+                };
+                const bytes = upstream orelse break :blk null;
+                if (request.source_field.len == 0 and request.source_template.len == 0) break :blk bytes;
+                defer alloc.free(bytes);
+                break :blk try extractAssetSourceValue(alloc, db, bytes, request);
+            } else try extractAssetSourceValue(alloc, db, doc_value, request);
+            const text = source_text orelse return error.ArtifactSeedNotAccepted;
+            defer alloc.free(text);
+            if (text.len == 0) return error.ArtifactSeedNotAccepted;
+
+            const source_parts_json = if (request.source_template.len > 0)
+                try renderSourcePartsJson(alloc, db, doc_value, request)
+            else
+                null;
+            defer if (source_parts_json) |value| alloc.free(value);
+            const state_key = try assetStateKeyAlloc(alloc, request.doc_key, artifact_name);
+            defer alloc.free(state_key);
+            const state_value = try assetStateValueAlloc(alloc, text, source_parts_json, request.producer_json);
+            defer alloc.free(state_value);
+
+            const json_content = @import("document_collectors.zig").assetContentTypeIsJson(request.content_type);
+            const bytes = try artifact_seeds.assetBytesAlloc(alloc, seed_value, json_content);
+            defer alloc.free(bytes);
+            try appendPreparedArtifactCopy(alloc, artifact_writes, key, bytes);
+            try appendInlineFullTextDocument(alloc, documents, key, bytes, request.consumer_indexes);
+            try appendPrecomputedArtifactCoverageOutcomes(db, alloc, coverage_outcomes, request, .produced);
+            try appendPreparedArtifactCopy(alloc, artifact_writes, state_key, state_value);
         }
 
         fn reuseDocumentExtractionByFingerprint(

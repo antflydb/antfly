@@ -361,6 +361,101 @@ pub fn graphProjectionPath(path: []const u8) !?GraphProjectionPath {
     };
 }
 
+/// DB-owned reserved document fields addressed by transforms with exactly
+/// `<field>.<name>`: explicit vectors (`_embeddings.<index>`) and artifact
+/// seeds (`_artifacts.<name>`, `_chunks.<name>`). They are stripped from the
+/// stored row, so resolving them as ordinary JSON against the stored document
+/// would be meaningless. Only `$set` (write) and `$unset` (delete, the same
+/// as a `null` value in an insert) are defined; every other operator fails
+/// closed, as for `_edges`.
+pub const ReservedProjectionPath = struct {
+    field: Field,
+    name: []const u8,
+
+    pub const Field = enum {
+        embeddings,
+        artifacts,
+        chunks,
+
+        pub fn jsonName(self: Field) []const u8 {
+            return switch (self) {
+                .embeddings => "_embeddings",
+                .artifacts => "_artifacts",
+                .chunks => "_chunks",
+            };
+        }
+    };
+};
+
+pub fn reservedProjectionPath(path: []const u8) !?ReservedProjectionPath {
+    const normalized = try normalizeJsonPath(path);
+    const parts = normalized.slice();
+    if (parts.len == 0) return null;
+    const field: ReservedProjectionPath.Field = inline for (@typeInfo(ReservedProjectionPath.Field).@"enum".field_names) |name| {
+        const candidate = @field(ReservedProjectionPath.Field, name);
+        if (std.mem.eql(u8, parts[0], candidate.jsonName())) break candidate;
+    } else return null;
+    if (parts.len != 2) return error.InvalidArgument;
+    return .{ .field = field, .name = parts[1] };
+}
+
+pub const ReservedProjectionOperation = struct {
+    path: ReservedProjectionPath,
+    /// Null deletes; otherwise the operand JSON of `$set`.
+    value_json: ?[]const u8,
+};
+
+/// Classifies one reserved-path operation, rejecting undefined operators.
+pub fn reservedProjectionOperation(op: types.TransformOp) !?ReservedProjectionOperation {
+    const path = try reservedProjectionPath(op.path) orelse return null;
+    return switch (op.op) {
+        .set => .{ .path = path, .value_json = op.value_json orelse return error.InvalidArgument },
+        .unset => .{ .path = path, .value_json = null },
+        else => error.UnsupportedTransformOperation,
+    };
+}
+
+/// Folds reserved-path operations into a resolved document so the ordinary
+/// document mapper extracts them exactly as it does for an insert. Later
+/// operations for the same path win. Returns an owned JSON object.
+pub fn applyReservedProjectionOperationsAlloc(alloc: Allocator, resolved: []const u8, operations: []const ReservedProjectionOperation) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var root = std.json.parseFromSliceLeaky(std.json.Value, a, resolved, .{ .parse_numbers = false }) catch return error.InvalidArgument;
+    if (root != .object) return error.InvalidArgument;
+    for (operations) |operation| {
+        const field_name = operation.path.field.jsonName();
+        const holder = try root.object.getOrPut(a, field_name);
+        if (!holder.found_existing or holder.value_ptr.* != .object) holder.value_ptr.* = .{ .object = .empty };
+        const value: std.json.Value = if (operation.value_json) |json|
+            std.json.parseFromSliceLeaky(std.json.Value, a, json, .{ .parse_numbers = false }) catch return error.InvalidArgument
+        else
+            .null;
+        try holder.value_ptr.object.put(a, operation.path.name, value);
+    }
+    return try std.json.Stringify.valueAlloc(alloc, root, .{});
+}
+
+/// `resolveDocumentTransform` with reserved-path operations classified the
+/// same way as in mutation coalescing: they fold into the resolved document
+/// as reserved fields rather than resolving as ordinary JSON.
+pub fn resolveDocumentTransformWithReservedFields(alloc: Allocator, existing_json: ?[]const u8, transform: types.DocumentTransform) !?[]u8 {
+    var reserved = std.ArrayListUnmanaged(ReservedProjectionOperation).empty;
+    defer reserved.deinit(alloc);
+    var document = std.ArrayListUnmanaged(types.TransformOp).empty;
+    defer document.deinit(alloc);
+    for (transform.operations) |operation| {
+        if (try reservedProjectionOperation(operation)) |classified| {
+            try reserved.append(alloc, classified);
+        } else try document.append(alloc, operation);
+    }
+    if (reserved.items.len == 0) return resolveDocumentTransform(alloc, existing_json, transform);
+    const resolved = try resolveDocumentTransform(alloc, existing_json, .{ .key = transform.key, .operations = document.items, .upsert = transform.upsert }) orelse return null;
+    defer alloc.free(resolved);
+    return try applyReservedProjectionOperationsAlloc(alloc, resolved, reserved.items);
+}
+
 const NumericTransform = enum { add, min, max };
 
 fn applyNumericOp(
@@ -1040,4 +1135,23 @@ test "commit requirements transform cancellation precedes allocation" {
     var canceled = std.atomic.Value(bool).init(true);
     try std.testing.expectError(error.Canceled, resolveDocumentTransformWithCancellation(failed.allocator(), "{}", .{ .key = "doc", .operations = &.{.{ .op = .unset, .path = "x" }} }, @import("antfly_cancellation").CancellationToken.fromAtomic(&canceled)));
     try std.testing.expect(!failed.has_induced_failure);
+}
+
+test "reserved field transforms fold into the resolved document instead of resolving as JSON" {
+    const a = std.testing.allocator;
+    const resolved = (try resolveDocumentTransformWithReservedFields(a, "{\"title\":\"t\",\"n\":1}", .{ .key = "doc", .operations = &.{
+        .{ .op = .inc, .path = "n", .value_json = "2" },
+        .{ .op = .set, .path = "_artifacts.summary", .value_json = "{\"value\":\"s\"}" },
+        .{ .op = .unset, .path = "_embeddings.vec" },
+    } })).?;
+    defer a.free(resolved);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, resolved, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 3), parsed.value.object.get("n").?.integer);
+    try std.testing.expect(parsed.value.object.get("_embeddings").?.object.get("vec").? == .null);
+    try std.testing.expectEqualStrings("s", parsed.value.object.get("_artifacts").?.object.get("summary").?.object.get("value").?.string);
+    try std.testing.expectError(error.UnsupportedTransformOperation, resolveDocumentTransformWithReservedFields(a, "{}", .{ .key = "doc", .operations = &.{.{ .op = .push, .path = "_embeddings.vec", .value_json = "1" }} }));
+    try std.testing.expectError(error.InvalidArgument, reservedProjectionPath("_chunks"));
+    try std.testing.expect((try reservedProjectionPath("_edges.g.R")) == null);
+    try std.testing.expect((try reservedProjectionPath("title")) == null);
 }

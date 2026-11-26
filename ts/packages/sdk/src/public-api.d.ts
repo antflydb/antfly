@@ -11679,12 +11679,99 @@ export interface components {
         TransformOp: {
             op: components["schemas"]["TransformOpType"];
             /**
-             * @description JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name")
+             * @description JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name").
+             *
+             *     Reserved DB-owned paths take exactly two segments and accept only
+             *     `$set` and `$unset` (`$unset` deletes, like a `null` value in an
+             *     insert); every other operator is rejected:
+             *     - `_embeddings.<index>`: explicit vectors for an external index.
+             *     - `_artifacts.<name>`: an artifact seed for an asset or embedding
+             *       enrichment (see `ArtifactSeed`).
+             *     - `_chunks.<name>`: an artifact seed for a chunk enrichment.
+             *
+             *     `_edges.<index>.<type>` accepts `$push`, `$pull` and `$addToSet`.
              * @example $.views
              */
             path: string;
             /** @description Value for operation (not required for $unset). Type depends on the supported operator. `$pull` removes every array element exactly equal to this JSON value; projected graph-edge values identify the relationship by `target`. */
             value?: unknown;
+        };
+        /**
+         * @description An already computed result for a named enrichment, written as
+         *     `_artifacts.<name>` in a document or transform. The enrichment defines
+         *     the output contract (content type, dimensions, vector space); the seed
+         *     does not repeat it. `"<name>": null` drops the accepted output so its
+         *     producer regenerates it; omitting a name leaves it unchanged.
+         *
+         *     `value` by enrichment kind:
+         *     - Text asset: a string (`""` is a valid, complete empty result), or
+         *       `{ "text": "..." }`.
+         *     - JSON asset: any JSON value.
+         *     - Document embedding: an array of finite numbers.
+         *     - Chunk-derived embedding: an array of `ChunkVectorSeed`.
+         *
+         *     Descriptive read fields (`artifact_id`, `artifact_ref`, `kind`,
+         *     `status`, `dims`, `items`, `content_type`) and internal routing
+         *     fields are rejected.
+         * @example {
+         *       "value": [
+         *         0.12,
+         *         0.34,
+         *         0.56
+         *       ]
+         *     }
+         */
+        ArtifactSeed: {
+            /** @description The seeded result; its shape follows the enrichment kind. */
+            value: unknown;
+            /** @description Optional identity of the remote content the result was computed from. */
+            source?: {
+                /** @description Immutable object generation or version. */
+                generation?: string;
+                /** @description Hex SHA-256 of the fetched bytes. */
+                sha256?: string;
+                /** @description The `source_hash` of an Antfly artifact read, `xxh64:<hex>`. */
+                source_hash?: string;
+            };
+            /** @description Optional caller assertion about the producer; never proof that Antfly ran it. */
+            provenance?: {
+                producer?: string;
+                model?: string;
+                revision?: string;
+            };
+        };
+        /**
+         * @description One seeded vector of a chunk-derived embedding. An entry without
+         *     `window_index` is the chunk's only vector, stored unsplit (window 0).
+         *     If any entry for a chunk has a `window_index`, that chunk's windows
+         *     must be supplied contiguously from 0. Chunks without a seeded vector
+         *     are embedded as usual.
+         */
+        ChunkVectorSeed: {
+            /** Format: int64 */
+            chunk_id: number;
+            /** Format: int64 */
+            window_index?: number;
+            vector: number[];
+        };
+        /**
+         * @description One chunk of a seeded chunk collection (`_chunks.<name>`), the plain
+         *     shape a `_chunks` read returns minus internal fields. Chunk ids must be
+         *     unique and ascending; character spans must lie within the source text.
+         */
+        ChunkSeed: {
+            /**
+             * Format: int64
+             * @description Chunk ordinal. `_id` is accepted as an alias and must agree.
+             */
+            _chunk_id?: number;
+            _content: string;
+            /** Format: int64 */
+            _start_char?: number;
+            /** Format: int64 */
+            _end_char?: number;
+            _start_time_ms?: number;
+            _end_time_ms?: number;
         };
         /**
          * @description In-place document transformation using MongoDB-style operators. Transforms are applied atomically
@@ -11715,10 +11802,23 @@ export interface components {
             /** @description List of operations to apply in sequence */
             operations: components["schemas"]["TransformOp"][];
             /**
-             * @description If true, create document if it doesn't exist (like MongoDB upsert)
+             * @description If true, create document if it doesn't exist (like MongoDB upsert).
+             *     A transform that only writes artifact seeds never creates a
+             *     document: it is rejected for a missing key with or without
+             *     `upsert`.
              * @default false
              */
             upsert?: boolean;
+            /**
+             * @description Optional precondition: the document's current version, as returned
+             *     in the `X-Antfly-Version` header of a lookup. The whole batch is
+             *     rejected when the stored version differs. Required for a transform
+             *     whose operations only write artifact seeds (`_artifacts.<name>`,
+             *     `_chunks.<name>`), which binds those seeds to the source version
+             *     they were computed from.
+             * @example 4182
+             */
+            expected_version?: string;
         };
         /**
          * @description Request to scan keys in a table within a key range.
@@ -11942,6 +12042,18 @@ export interface components {
              *     - Use consistent key naming schemes (e.g., "user:123", "article:456")
              *     - Key length affects storage and performance - keep them reasonably short
              *     - Keys are sorted lexicographically, so choose prefixes that support range scans
+             *
+             *     Artifact seeds: a document may carry existing results for its named
+             *     enrichments beside its source fields, under `_artifacts.<name>`
+             *     (assets and embeddings, see `ArtifactSeed`) and `_chunks.<name>`
+             *     (chunk collections, an array of `ChunkSeed`). Seeds are stripped
+             *     from the stored document, bound atomically to this source version,
+             *     and published as that enrichment's accepted output without invoking
+             *     its producer. Unseeded outputs are generated as usual. Invalid
+             *     seeds, names that match no enrichment of the document, and seeds a
+             *     producer cannot accept reject the batch; they never fall back to
+             *     inference silently. A document carrying only seeds is rejected; use
+             *     a transform with `expected_version` to seed an existing document.
              * @example {
              *       "user:123": {
              *         "name": "John Doe",

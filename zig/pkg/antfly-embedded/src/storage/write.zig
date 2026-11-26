@@ -1585,7 +1585,7 @@ pub fn resolveWritesForSchemaValidation(
         const existing_from_db = if (!has_request_state) try db.get(alloc, transform.key) else null;
         defer if (existing_from_db) |body| alloc.free(body);
         const existing = existing_from_request orelse existing_from_db;
-        const resolved = db_mod.transform.resolveDocumentTransform(alloc, existing, transform) catch |err| switch (err) {
+        const resolved = db_mod.transform.resolveDocumentTransformWithReservedFields(alloc, existing, transform) catch |err| switch (err) {
             error.InvalidArgument, error.UnsupportedTransformOperation => return error.InvalidBatchRequest,
             else => return err,
         } orelse continue;

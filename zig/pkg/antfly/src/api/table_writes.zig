@@ -23041,6 +23041,11 @@ pub const ProvisionedTableWriteSource = struct {
             error.InvalidArgument,
             error.InvalidGraphEdges,
             error.UnsupportedTransformOperation,
+            error.InvalidArtifactSeed,
+            error.UnknownArtifactSeed,
+            error.ArtifactSeedNotAccepted,
+            error.ArtifactSeedDocumentNotFound,
+            error.ArtifactSeedSourceBindingRequired,
             => return error.InvalidBatchRequest,
             else => return err,
         };

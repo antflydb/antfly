@@ -10314,7 +10314,7 @@ pub fn isEmptySessionCommitBody(body: []const u8) bool {
 fn parseTableBatch(alloc: std.mem.Allocator, value: std.json.Value) !batch_api.OwnedBatchRequest {
     var owned = try batch_api.public_codec.parseBatchValue(alloc, value);
     errdefer owned.deinit(alloc);
-    return batch_api.takePublic(&owned);
+    return try batch_api.takePublic(alloc, &owned);
 }
 
 fn applyReadSetPredicates(alloc: std.mem.Allocator, req: *OwnedTransactionCommitRequest) !void {

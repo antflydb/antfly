@@ -2891,6 +2891,8 @@ pub const EmbeddingArtifactOrigin = union(enum) {
     /// (dense artifacts carry `text_input`; sparse ones treat it as
     /// `generated`).
     generated_text: ?u64,
+    /// Caller-supplied artifact seed bound to the producer input identity.
+    seeded: ?u64,
 };
 
 pub const StoreWritePositions = std.StringHashMapUnmanaged(usize);

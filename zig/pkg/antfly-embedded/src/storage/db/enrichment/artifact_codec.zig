@@ -53,7 +53,12 @@ pub const Flags = packed struct(u8) {
     /// Elided stub that keeps an int8 copy of the vector (LEANN
     /// `media_vectors: int8`), read back instead of re-embedding.
     int8_payload: bool = false,
-    _reserved: u1 = 0,
+    /// Descriptive origin: the caller supplied this vector as an artifact seed
+    /// for a producer-backed embedding (`artifact_seeds.zig`). It is bound to
+    /// the producer's input identity like generated output, but re-embedding
+    /// the source does not reproduce it, so it never carries `text_input`.
+    /// Older readers ignore the bit and treat the vector as generated.
+    seeded: bool = false,
 };
 
 pub const Header = struct {
@@ -110,6 +115,16 @@ pub fn encodeDenseEmbeddingAlloc(alloc: Allocator, source_hash: ?u64, vector: []
 /// alone (see `Flags.text_input`).
 pub fn encodeProducedDenseEmbeddingAlloc(alloc: Allocator, source_hash: ?u64, text_input: bool, vector: []const f32) ![]u8 {
     return encodeDenseEmbeddingWithOriginAlloc(alloc, source_hash, false, text_input, vector);
+}
+
+/// A caller-supplied seed accepted for a producer-backed embedding. It binds
+/// to the producer input identity (`source_hash`) like generated output.
+pub fn encodeSeededDenseEmbeddingAlloc(alloc: Allocator, source_hash: ?u64, vector: []const f32) ![]u8 {
+    const out = try encodeDenseEmbeddingWithOriginAlloc(alloc, source_hash, false, false, vector);
+    var header_flags: Flags = @bitCast(out[magic.len + @sizeOf(u16) + @sizeOf(u8)]);
+    header_flags.seeded = true;
+    out[magic.len + @sizeOf(u16) + @sizeOf(u8)] = @bitCast(header_flags);
+    return out;
 }
 
 /// Only explicit user-vector ingress may set this origin. In particular, an
@@ -764,6 +779,7 @@ pub fn decodeHeaderPrefix(data: []const u8) !Header {
         flags.has_graph_generation or flags.portable_unbound_graph_generation or
         (kind != .dense_embedding and kind != .sparse_embedding))) return error.InvalidArtifactHeader;
     if (flags.text_input and (flags.authored or kind != .dense_embedding)) return error.InvalidArtifactHeader;
+    if (flags.seeded and (flags.authored or flags.text_input or kind != .dense_embedding)) return error.InvalidArtifactHeader;
 
     const payload_len = std.mem.readInt(u32, data[pos..][0..4], .little);
     pos += @sizeOf(u32);
@@ -1101,4 +1117,21 @@ test "elided dense embeddings keep the header and refuse vector reads" {
     try std.testing.expectEqual(@as(u32, 3), try decodeDenseEmbeddingDims(stub));
     var out: [3]f32 = undefined;
     try std.testing.expectError(error.VectorElided, decodeDenseEmbeddingViewOrInto(stub, &out));
+}
+
+test "seeded dense embeddings keep their input identity and origin" {
+    const alloc = std.testing.allocator;
+    const vector = [_]f32{ 0.5, -1 };
+    const seeded = try encodeSeededDenseEmbeddingAlloc(alloc, 99, &vector);
+    defer alloc.free(seeded);
+    const header = try decodeHeader(seeded);
+    try std.testing.expect(header.flags.seeded);
+    try std.testing.expect(!header.flags.authored and !header.flags.text_input);
+    try std.testing.expectEqual(@as(?u64, 99), try sourceHash(seeded));
+    const decoded = try decodeDenseEmbeddingAlloc(alloc, seeded);
+    defer alloc.free(decoded);
+    try std.testing.expectEqualSlices(f32, &vector, decoded);
+    const generated = try encodeDenseEmbeddingAlloc(alloc, 99, &vector);
+    defer alloc.free(generated);
+    try std.testing.expect(!(try decodeHeader(generated)).flags.seeded);
 }

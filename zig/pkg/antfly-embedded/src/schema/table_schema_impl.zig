@@ -1052,7 +1052,7 @@ fn validateRelationalExpressions(alloc: std.mem.Allocator, schema: TableSchema) 
         // AST walk that would mistake literal JSON payloads for column reads.
         for (expressions.table.relational_columns, expressions.read_columns) |column, read| {
             if (!read) continue;
-            for ([_][]const u8{ "_id", "_doc", "_version", "_edges", "_embeddings", "_summaries" }) |name| {
+            for ([_][]const u8{ "_id", "_doc", "_version", "_edges", "_embeddings", "_summaries", "_artifacts", "_chunks" }) |name| {
                 if (std.mem.eql(u8, column.name, name)) return error.InvalidSchemaUpdateRequest;
             }
         }
@@ -3491,7 +3491,7 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
             for (generated.value.array.items) |entry| {
                 const target = if (entry == .object) entry.object.get("column") orelse return error.InvalidSchemaUpdateRequest else return error.InvalidSchemaUpdateRequest;
                 if (target != .string) return error.InvalidSchemaUpdateRequest;
-                inline for (.{ "_id", "_doc", "_version", "_type", "_edges", "_embeddings", "_summaries" }) |reserved| {
+                inline for (.{ "_id", "_doc", "_version", "_type", "_edges", "_embeddings", "_summaries", "_artifacts", "_chunks" }) |reserved| {
                     if (std.mem.eql(u8, target.string, reserved)) return error.InvalidSchemaUpdateRequest;
                 }
             }

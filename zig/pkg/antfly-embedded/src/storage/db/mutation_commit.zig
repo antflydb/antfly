@@ -2650,7 +2650,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Producer admission is independent of the replay representation.
             // A write/propose gate commits prepared effects with the usual thin
             // journal instead of constructing a vector-bearing derived batch.
-            const prepare_generated = !use_thin_replay_fast_path or effective_req.commit_requires == .direct_enrichments;
+            // Artifact seeds are accepted in producer preparation, which needs no
+            // inference for the seeded outputs; their effects then commit with
+            // the source like any prepared producer result.
+            const carries_artifact_seeds = for (extracted[0..extracted_initialized]) |row| {
+                if (row.artifact_seeds_json != null) break true;
+            } else false;
+            const prepare_generated = !use_thin_replay_fast_path or effective_req.commit_requires == .direct_enrichments or carries_artifact_seeds;
 
             var precomputed_generated: PrecomputedGeneratedBatch = .{};
             defer precomputed_generated.deinit(preparation_alloc);

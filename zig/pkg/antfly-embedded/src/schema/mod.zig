@@ -4616,7 +4616,7 @@ test "document generated producers preserve artifact-only commands and reject re
     defer extracted.deinit(a);
     try std.testing.expect(!extracted.hasDocument());
     try std.testing.expectError(error.InvalidRelationalGeneratedValue, mapper.PreparedDocumentBatch.init(a, prepared.writes[0..1], validator, true));
-    for ([_][]const u8{ "_id", "_doc", "_version", "_type", "_edges", "_embeddings", "_summaries" }) |name| {
+    for ([_][]const u8{ "_id", "_doc", "_version", "_type", "_edges", "_embeddings", "_summaries", "_artifacts", "_chunks" }) |name| {
         var proposed = try std.json.parseFromSlice(std.json.Value, a, definition, .{});
         defer proposed.deinit();
         const r = proposed.arena.allocator();
@@ -4662,7 +4662,7 @@ test "document generated dependencies require persisted sources and unwind rejec
     const definition =
         \\{"enforce_types":true,"default_type":"doc","generated_columns":[{"column":"g","expression":{"op":"literal","type":"string","value":"constant"}}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"g":{"type":"keyword"}},"additionalProperties":true}}}}
     ;
-    for ([_][]const u8{ "_id", "_doc", "_version", "_edges", "_embeddings", "_summaries", "_type" }) |name| {
+    for ([_][]const u8{ "_id", "_doc", "_version", "_edges", "_embeddings", "_summaries", "_artifacts", "_chunks", "_type" }) |name| {
         var proposed = try std.json.parseFromSlice(std.json.Value, a, definition, .{});
         defer proposed.deinit();
         const region = proposed.arena.allocator();

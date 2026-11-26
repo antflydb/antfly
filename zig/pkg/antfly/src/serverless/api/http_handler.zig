@@ -5974,7 +5974,18 @@ pub const HttpHandler = struct {
             const fetched = if (live) |session| try session.lookupAlloc(transform.key) else null;
             defer if (fetched) |body| self.alloc.free(body);
             const existing_body = if (live != null) fetched else findMaterializedDocumentBody(latest_docs, transform.key);
-            const resolved = try db_transform.resolveDocumentTransformWithCancellation(self.alloc, existing_body, transform, cancellation) orelse continue;
+            // Reserved fields classify exactly as in the storage coalescer.
+            // Serverless publication has no artifact-seed acceptance yet, so
+            // seed paths fail visibly instead of landing as document JSON.
+            var reserved_paths = false;
+            for (transform.operations) |operation| if (try db_transform.reservedProjectionOperation(operation)) |reserved| {
+                if (reserved.path.field != .embeddings) return error.ArtifactSeedNotAccepted;
+                reserved_paths = true;
+            };
+            const resolved = (if (reserved_paths)
+                try db_transform.resolveDocumentTransformWithReservedFields(self.alloc, existing_body, transform)
+            else
+                try db_transform.resolveDocumentTransformWithCancellation(self.alloc, existing_body, transform, cancellation)) orelse continue;
             errdefer self.alloc.free(resolved);
 
             removeDocumentMutationById(self.alloc, &deletes, transform.key);

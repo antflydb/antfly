@@ -31,12 +31,24 @@ class Transform:
         Attributes:
             key (str): Document key (must be a string, not an object like inserts)
             operations (list[TransformOp]): List of operations to apply in sequence
-            upsert (bool | Unset): If true, create document if it doesn't exist (like MongoDB upsert) Default: False.
+            upsert (bool | Unset): If true, create document if it doesn't exist (like MongoDB upsert).
+                A transform that only writes artifact seeds never creates a
+                document: it is rejected for a missing key with or without
+                `upsert`.
+                 Default: False.
+            expected_version (str | Unset): Optional precondition: the document's current version, as returned
+                in the `X-Antfly-Version` header of a lookup. The whole batch is
+                rejected when the stored version differs. Required for a transform
+                whose operations only write artifact seeds (`_artifacts.<name>`,
+                `_chunks.<name>`), which binds those seeds to the source version
+                they were computed from.
+                 Example: 4182.
     """
 
     key: str
     operations: list[TransformOp]
     upsert: bool | Unset = False
+    expected_version: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -49,6 +61,8 @@ class Transform:
 
         upsert = self.upsert
 
+        expected_version = self.expected_version
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -59,6 +73,8 @@ class Transform:
         )
         if upsert is not UNSET:
             field_dict["upsert"] = upsert
+        if expected_version is not UNSET:
+            field_dict["expected_version"] = expected_version
 
         return field_dict
 
@@ -78,10 +94,13 @@ class Transform:
 
         upsert = d.pop("upsert", UNSET)
 
+        expected_version = d.pop("expected_version", UNSET)
+
         transform = cls(
             key=key,
             operations=operations,
             upsert=upsert,
+            expected_version=expected_version,
         )
 
         transform.additional_properties = d

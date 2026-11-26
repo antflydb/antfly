@@ -754,14 +754,22 @@ test "internal batch commit requirements survive native owner and forwarded code
     }
 }
 
-pub fn takePublic(owned: *public_codec.OwnedBatchRequest) OwnedBatchRequest {
-    const result_value: OwnedBatchRequest = .{ .writes = owned.writes, .deletes = owned.deletes, .transforms = owned.transforms, .graph_writes = owned.graph_writes, .graph_deletes = owned.graph_deletes, .req = fromPublic(owned.req) };
+pub fn takePublic(alloc: std.mem.Allocator, owned: *public_codec.OwnedBatchRequest) !OwnedBatchRequest {
+    // Public `expected_version` preconditions become the batch version
+    // predicates checked atomically with commit. Keys transfer ownership.
+    const predicates: []db_types.TransactionVersionPredicate = if (owned.expected_versions.len == 0) &.{} else try alloc.alloc(db_types.TransactionVersionPredicate, owned.expected_versions.len);
+    for (owned.expected_versions, predicates) |expected, *predicate| predicate.* = .{ .key = expected.key, .expected_version = expected.version };
+    if (owned.expected_versions.len > 0) alloc.free(owned.expected_versions);
+    owned.expected_versions = &.{};
+    var result_value: OwnedBatchRequest = .{ .writes = owned.writes, .deletes = owned.deletes, .transforms = owned.transforms, .graph_writes = owned.graph_writes, .graph_deletes = owned.graph_deletes, .predicates = predicates, .req = fromPublic(owned.req) };
+    result_value.req.predicates = predicates;
     owned.* = .{};
     return result_value;
 }
 pub fn parseBatchRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedBatchRequest {
     var owned = try public_codec.parseBatchRequest(alloc, body);
-    return takePublic(&owned);
+    errdefer owned.deinit(alloc);
+    return try takePublic(alloc, &owned);
 }
 
 const exact_prepare_envelope = "exact-prepare-batch-v1";
@@ -1430,15 +1438,21 @@ noinline fn parseBatchRowsAndControls(alloc: std.mem.Allocator, root: std.json.O
     }
 
     out.predicates = predicates: {
-        const value = root.get("_predicates") orelse break :predicates &.{};
-        if (!allow_internal or value != .array) return error.InvalidBatchRequest;
-        const items = try alloc.alloc(db_types.TransactionVersionPredicate, value.array.items.len);
+        // Public per-transform `expected_version` lowers to the same version
+        // predicate as the private wire, checked atomically with the batch.
+        const public_count = try countTransformExpectedVersions(root, !allow_internal);
+        const internal_items: []const std.json.Value = if (root.get("_predicates")) |value| internal: {
+            if (!allow_internal or value != .array) return error.InvalidBatchRequest;
+            break :internal value.array.items;
+        } else &.{};
+        if (internal_items.len + public_count == 0) break :predicates &.{};
+        const items = try alloc.alloc(db_types.TransactionVersionPredicate, internal_items.len + public_count);
         var initialized: usize = 0;
         errdefer {
             for (items[0..initialized]) |predicate| alloc.free(@constCast(predicate.key));
             alloc.free(items);
         }
-        for (value.array.items, 0..) |item, i| {
+        for (internal_items, 0..) |item, i| {
             if (item != .object) return error.InvalidBatchRequest;
             const key_value = item.object.get("key") orelse return error.InvalidBatchRequest;
             const version_value = item.object.get("expected_version") orelse return error.InvalidBatchRequest;
@@ -1465,6 +1479,19 @@ noinline fn parseBatchRowsAndControls(alloc: std.mem.Allocator, root: std.json.O
             };
             initialized += 1;
         }
+        if (public_count != 0) for (root.get("transforms").?.array.items) |item| {
+            const version_value = item.object.get("expected_version") orelse continue;
+            if (version_value == .null) continue;
+            const version = try parseInternalU64(version_value);
+            // A public precondition names an existing version; absence is
+            // expressed by inserting, not by version zero.
+            if (version == 0) return error.InvalidBatchRequest;
+            items[initialized] = .{
+                .key = try alloc.dupe(u8, item.object.get("key").?.string),
+                .expected_version = version,
+            };
+            initialized += 1;
+        };
         break :predicates items;
     };
 }
@@ -3423,6 +3450,37 @@ fn parseGraphDeletes(alloc: std.mem.Allocator, value: std.json.Value) ![]db_type
     return deletes;
 }
 
+/// Counts public `expected_version` preconditions on transforms. A transform
+/// whose every operation writes an artifact seed has no source fields of its
+/// own, so it must name the source version the seeds were computed from.
+fn countTransformExpectedVersions(root: std.json.ObjectMap, require_seed_binding: bool) !usize {
+    const transforms = root.get("transforms") orelse return 0;
+    if (transforms != .array) return 0;
+    var count: usize = 0;
+    for (transforms.array.items) |item| {
+        if (item != .object) return error.InvalidBatchRequest;
+        const key = item.object.get("key") orelse return error.InvalidBatchRequest;
+        if (key != .string) return error.InvalidBatchRequest;
+        const expected = item.object.get("expected_version");
+        if (expected != null and expected.? != .null) {
+            count += 1;
+            continue;
+        }
+        const operations = item.object.get("operations") orelse continue;
+        if (operations != .array or operations.array.items.len == 0) continue;
+        const seed_only = for (operations.array.items) |operation| {
+            if (operation != .object) break false;
+            const path = operation.object.get("path") orelse break false;
+            if (path != .string) break false;
+            const normalized = if (std.mem.startsWith(u8, path.string, "$.")) path.string[2..] else path.string;
+            if (!std.mem.startsWith(u8, normalized, "_artifacts.") and !std.mem.startsWith(u8, normalized, "_chunks.")) break false;
+        } else true;
+        // Internal encodings carry the lowered precondition in `_predicates`.
+        if (seed_only and require_seed_binding) return error.ArtifactSeedSourceBindingRequired;
+    }
+    return count;
+}
+
 fn parseTransforms(alloc: std.mem.Allocator, value: std.json.Value) ![]db_types.DocumentTransform {
     if (value != .array) return error.InvalidBatchRequest;
     const values = value.array.items;
@@ -4641,7 +4699,7 @@ test "distributed txn public mutation promotion borrows exact values and transfe
     const a = std.testing.allocator;
     var owned = try public_codec.parseBatchRequest(a, "{\"inserts\":{\"row\":{\"n\":9007199254740993}}}");
     const original = owned.req.writes[0].value.ptr;
-    var internal = takePublic(&owned);
+    var internal = try takePublic(a, &owned);
     defer internal.deinit(a);
     owned.deinit(a);
     try std.testing.expectEqual(original, internal.req.writes[0].value.ptr);

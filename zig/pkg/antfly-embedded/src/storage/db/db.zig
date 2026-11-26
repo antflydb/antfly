@@ -34124,7 +34124,7 @@ pub const DB = struct {
                 var specials = std.json.ObjectMap.empty;
                 defer specials.deinit(scratch);
                 const root = row.parsedValue();
-                for ([_][]const u8{ "_edges", "_embeddings" }) |field|
+                for ([_][]const u8{ "_edges", "_embeddings", "_artifacts", "_chunks" }) |field|
                     if (root.object.get(field)) |special| try specials.put(scratch, field, special);
                 const sidecar = try std.json.Stringify.valueAlloc(ctx.alloc, std.json.Value{ .object = specials }, .{});
                 intent.prepared_row = row.takePackedRow();
@@ -62993,7 +62993,7 @@ fn testEmbeddingArtifactOrigins(alloc: Allocator) !void {
             try std.testing.expectEqual(origin == .authored, header.flags.authored);
             try std.testing.expectEqual(switch (origin) {
                 .authored => @as(?u64, null),
-                .generated, .generated_text => |hash| hash,
+                .generated, .generated_text, .seeded => |hash| hash,
             }, try enrichment_artifact_codec.sourceHash(write.value));
         }
     }
@@ -108519,6 +108519,129 @@ fn testDenseSourceHashReuse(settings: table_storage_mod.Settings, sync_level: ty
     try std.testing.expectEqual(@as(u64, 0), stats.enrichment.codec_decode_failures);
     if (sync_level == .write) try std.testing.expect(stats.enrichment.dense_artifact_bytes_written >= @as(u64, @intCast(artifacts[0].value.len * 2)));
     try std.testing.expectEqual(stats.enrichment.dense_artifact_bytes_written, stats.enrichment.artifact_bytes_written);
+}
+
+fn addSeededDenseTestIndex(db: *DB) !void {
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
+    });
+}
+
+fn expectSeededDenseVector(alloc: Allocator, db: *DB, doc_key: []const u8, source: []const u8, expected: []const f32) !void {
+    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, doc_key, "body_dense_v1");
+    defer alloc.free(artifact_key);
+    const artifacts = try db.core.store.scanPrefix(alloc, artifact_key);
+    defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+    try std.testing.expectEqual(@as(usize, 1), artifacts.len);
+    // The seed carries exactly the identity a generated vector would, so
+    // every reuse check accepts it for this input.
+    try expectDenseEmbeddingArtifactValue(alloc, artifacts[0].value, enrichment_artifact_codec.hashSource(source), expected.len);
+    try std.testing.expect((try enrichment_artifact_codec.decodeHeader(artifacts[0].value)).flags.seeded);
+    const vector = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, artifacts[0].value);
+    defer alloc.free(vector);
+    try std.testing.expectEqualSlices(f32, expected, vector);
+}
+
+test "db artifact seeds publish a document vector without invoking its producer" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var counting = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = counting.interface(),
+        },
+    });
+    defer db.close();
+    try addSeededDenseTestIndex(&db);
+
+    for ([_]types.SyncLevel{ .write, .enrichments }) |sync_level| {
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"same source\",\"_artifacts\":{\"body_dense_v1\":{\"value\":[0.5,0.25,1],\"provenance\":{\"producer\":\"legacy\"}}}}" }},
+            .sync_level = sync_level,
+        });
+        try db.runUntilIdle();
+        try std.testing.expectEqual(@as(usize, 0), counting.calls);
+        try expectSeededDenseVector(alloc, &db, "doc:a", "same source", &.{ 0.5, 0.25, 1 });
+    }
+    try std.testing.expectEqual(@as(u64, 1), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+
+    // Seeds never reach the primary row.
+    const stored = (try db.get(alloc, "doc:a")).?;
+    defer alloc.free(stored);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "_artifacts") == null);
+
+    // An unrelated edit keeps the accepted seed.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"changed\",\"body\":\"same source\"}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 0), counting.calls);
+    try expectSeededDenseVector(alloc, &db, "doc:a", "same source", &.{ 0.5, 0.25, 1 });
+
+    // A changed input invalidates it like generated output.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"changed\",\"body\":\"new source\"}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 1), counting.calls);
+}
+
+test "db artifact seeds bind through transforms and reject unusable seeds" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var counting = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = counting.interface(),
+        },
+    });
+    defer db.close();
+    try addSeededDenseTestIndex(&db);
+
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"same source\"}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 1), counting.calls);
+
+    // A seed-only transform replaces accepted output for the stored input.
+    try db.batch(.{
+        .transforms = &.{.{ .key = "doc:a", .operations = &.{.{ .op = .set, .path = "_artifacts.body_dense_v1", .value_json = "{\"value\":[1,2,3]}" }} }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 1), counting.calls);
+    try expectSeededDenseVector(alloc, &db, "doc:a", "same source", &.{ 1, 2, 3 });
+
+    const rejected = [_]struct { value: []const u8, err: anyerror }{
+        // Wrong dimensions for the embedding contract.
+        .{ .value = "{\"body\":\"x\",\"_artifacts\":{\"body_dense_v1\":{\"value\":[1,2]}}}", .err = error.InvalidArtifactSeed },
+        // A name that no enrichment declares.
+        .{ .value = "{\"body\":\"x\",\"_artifacts\":{\"missing_v1\":{\"value\":[1,2,3]}}}", .err = error.UnknownArtifactSeed },
+        // The right name through the wrong reserved field.
+        .{ .value = "{\"body\":\"x\",\"_chunks\":{\"body_dense_v1\":[]}}", .err = error.UnknownArtifactSeed },
+        // A descriptive read shape is not a write shape.
+        .{ .value = "{\"body\":\"x\",\"_artifacts\":{\"body_dense_v1\":{\"value\":null,\"dims\":3}}}", .err = error.InvalidArtifactSeed },
+        // No source to bind to.
+        .{ .value = "{\"_artifacts\":{\"body_dense_v1\":{\"value\":[1,2,3]}}}", .err = error.InvalidArtifactSeed },
+    };
+    for (rejected) |case| {
+        if (db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = case.value }}, .sync_level = .write })) |_| {
+            return error.TestUnexpectedResult;
+        } else |err| try std.testing.expect(err == case.err or err == error.InvalidBatchRequest);
+    }
+    try std.testing.expect((try db.get(alloc, "doc:b")) == null);
+    // There are no pending seeds: a seed for a missing document is reported.
+    if (db.batch(.{
+        .transforms = &.{.{ .key = "doc:missing", .upsert = true, .operations = &.{.{ .op = .set, .path = "_artifacts.body_dense_v1", .value_json = "{\"value\":[1,2,3]}" }} }},
+        .sync_level = .write,
+    })) |_| return error.TestUnexpectedResult else |err| try std.testing.expect(err == error.ArtifactSeedDocumentNotFound or err == error.InvalidBatchRequest);
+    try std.testing.expect((try db.get(alloc, "doc:missing")) == null);
+    try std.testing.expectEqual(@as(usize, 1), counting.calls);
 }
 
 test "db dense enrichment republishes unchanged source hash from cached artifact after index reset" {

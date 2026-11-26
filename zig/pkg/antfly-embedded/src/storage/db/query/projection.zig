@@ -169,9 +169,10 @@ fn parseSpecialFieldSelection(fields: []const []const u8) SpecialFieldSelection 
         if (field.len == 0 or field[0] == '-') continue;
         if (std.mem.eql(u8, field, "_artifacts") or std.mem.startsWith(u8, field, "_artifacts.")) {
             special.all_artifacts = true;
-        } else if (std.mem.eql(u8, field, "_chunks") or std.mem.eql(u8, field, "_chunks.*")) {
+        } else if (std.mem.eql(u8, field, "_chunks") or std.mem.startsWith(u8, field, "_chunks.")) {
+            // `_chunks.<name>` selects one collection; loading is per document.
             special.all_chunks = true;
-        } else if (std.mem.eql(u8, field, "_embeddings") or std.mem.eql(u8, field, "_embeddings.*")) {
+        } else if (std.mem.eql(u8, field, "_embeddings") or std.mem.startsWith(u8, field, "_embeddings.")) {
             special.all_embeddings = true;
         }
     }
@@ -701,4 +702,14 @@ test "public graph metric borrowed wire streamed embeddings bound slabs and pres
     try std.testing.expectEqual(@as(usize, 1609735), body.len);
     try std.testing.expectEqual(@as(usize, 0), budget.live);
     std.debug.print("STREAMED_EMBEDDINGS output_bytes={d} scratch_peak={d}\n", .{ body.len, budget.peak });
+}
+
+test "named chunk and embedding selections load their reserved projections" {
+    const named = parseSpecialFieldSelection(&.{ "title", "_chunks.body_chunks" });
+    try std.testing.expect(named.all_chunks and !named.all_embeddings and !named.all_artifacts);
+    const vectors = parseSpecialFieldSelection(&.{"_embeddings.dense_idx"});
+    try std.testing.expect(vectors.all_embeddings and !vectors.all_chunks);
+    const excluded = parseSpecialFieldSelection(&.{"-_chunks.body_chunks"});
+    try std.testing.expect(!excluded.all_chunks);
+    try std.testing.expect(!parseSpecialFieldSelection(&.{"_chunksx"}).all_chunks);
 }

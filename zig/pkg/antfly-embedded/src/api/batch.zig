@@ -29,7 +29,12 @@ pub const BatchResult = struct {
     transformed: u32 = 0,
     failure: ?BatchFailure = null,
 };
+/// Public per-transform `expected_version`, lowered to a batch version
+/// predicate when the request is promoted (`batch_internal.takePublic`).
+pub const ExpectedVersion = struct { key: []const u8, version: u64 };
+
 pub const OwnedBatchRequest = struct {
+    expected_versions: []ExpectedVersion = &.{},
     writes: []mutation.BatchWrite = &.{},
     deletes: [][]const u8 = &.{},
     transforms: []mutation.DocumentTransform = &.{},
@@ -42,6 +47,8 @@ pub const OwnedBatchRequest = struct {
         freeTransforms(alloc, self.transforms);
         freeGraphWrites(alloc, self.graph_writes);
         freeGraphDeletes(alloc, self.graph_deletes);
+        for (self.expected_versions) |expected| alloc.free(expected.key);
+        if (self.expected_versions.len > 0) alloc.free(self.expected_versions);
         self.* = undefined;
     }
     pub fn result(self: OwnedBatchRequest) BatchResult {
@@ -97,6 +104,7 @@ pub fn parseBatchValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedBa
     };
     if (root.get("transforms")) |item| if (item != .null) {
         owned.transforms = try parseTransforms(alloc, item);
+        owned.expected_versions = try parseExpectedVersions(alloc, item);
     };
     if (root.get("graph_writes")) |item| if (item != .null) {
         owned.graph_writes = try parseGraphWrites(alloc, item);
@@ -363,6 +371,60 @@ fn parseGraphDeletes(alloc: std.mem.Allocator, value: std.json.Value) ![]mutatio
         initialized += 1;
     }
     return deletes;
+}
+
+/// `expected_version` preconditions of already validated transforms. A
+/// transform whose every operation writes an artifact seed has no source
+/// fields of its own and must name the source version its seeds bind to.
+fn parseExpectedVersions(alloc: std.mem.Allocator, value: std.json.Value) ![]ExpectedVersion {
+    var out = std.ArrayListUnmanaged(ExpectedVersion).empty;
+    errdefer {
+        for (out.items) |expected| alloc.free(expected.key);
+        out.deinit(alloc);
+    }
+    for (value.array.items) |item| {
+        const key = item.object.get("key").?.string;
+        if (item.object.get("expected_version")) |raw| if (raw != .null) {
+            const version: u64 = switch (raw) {
+                .integer => |number| std.math.cast(u64, number) orelse return error.InvalidBatchRequest,
+                .number_string, .string => |text| std.fmt.parseUnsigned(u64, text, 10) catch return error.InvalidBatchRequest,
+                else => return error.InvalidBatchRequest,
+            };
+            // A precondition names an existing version; absence is an insert.
+            if (version == 0) return error.InvalidBatchRequest;
+            try out.ensureUnusedCapacity(alloc, 1);
+            out.appendAssumeCapacity(.{ .key = try alloc.dupe(u8, key), .version = version });
+            continue;
+        };
+        const operations = item.object.get("operations").?.array.items;
+        if (operations.len == 0) continue;
+        const seed_only = for (operations) |operation| {
+            const path = operation.object.get("path").?.string;
+            const normalized = if (std.mem.startsWith(u8, path, "$.")) path[2..] else path;
+            if (!std.mem.startsWith(u8, normalized, "_artifacts.") and !std.mem.startsWith(u8, normalized, "_chunks.")) break false;
+        } else true;
+        if (seed_only) return error.ArtifactSeedSourceBindingRequired;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+test "public transforms lower expected_version and require it for seed-only writes" {
+    const a = std.testing.allocator;
+    var bound = try parseBatchRequest(a,
+        \\{"transforms":[{"key":"doc:a","expected_version":"4182","operations":[{"op":"$set","path":"_artifacts.summary","value":{"value":"s"}}]},{"key":"doc:b","operations":[{"op":"$set","path":"title","value":"t"}]}]}
+    );
+    defer bound.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), bound.expected_versions.len);
+    try std.testing.expectEqualStrings("doc:a", bound.expected_versions[0].key);
+    try std.testing.expectEqual(@as(u64, 4182), bound.expected_versions[0].version);
+    try std.testing.expectError(error.ArtifactSeedSourceBindingRequired, parseBatchRequest(a,
+        \\{"transforms":[{"key":"doc:a","operations":[{"op":"$set","path":"_chunks.body","value":[]}]}]}
+    ));
+    for ([_][]const u8{
+        \\{"transforms":[{"key":"doc:a","expected_version":"0","operations":[{"op":"$set","path":"title","value":1}]}]}
+        ,
+        \\{"transforms":[{"key":"doc:a","expected_version":"v1","operations":[{"op":"$set","path":"title","value":1}]}]}
+    }) |body| try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(a, body));
 }
 
 fn parseTransforms(alloc: std.mem.Allocator, value: std.json.Value) ![]mutation.DocumentTransform {

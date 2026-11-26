@@ -182,7 +182,15 @@ pub fn coalesceKeyValueRequest(
             value_json: []const u8,
         }).empty;
         defer graph_operations.deinit(alloc);
+        var reserved_operations = std.ArrayListUnmanaged(transform_mod.ReservedProjectionOperation).empty;
+        defer reserved_operations.deinit(alloc);
+        var seeds_artifacts = false;
         for (transform.operations) |operation| {
+            if (try transform_mod.reservedProjectionOperation(operation)) |reserved| {
+                if (reserved.path.field != .embeddings) seeds_artifacts = true;
+                try reserved_operations.append(alloc, reserved);
+                continue;
+            }
             const graph_path = try transform_mod.graphProjectionPath(operation.path);
             if (graph_path) |path| {
                 switch (operation.op) {
@@ -233,6 +241,11 @@ pub fn coalesceKeyValueRequest(
         // document is a no-op, but malformed document operations remain
         // errors independent of state. Graph operands were validated while
         // constructing their pending deltas above.
+        // Seeds bind to an existing source version or to source fields set in
+        // this same transform. There are no pending seeds and no seed-only
+        // rows: a seed for a missing document is reported, never discarded.
+        if (base_json == null and seeds_artifacts and (!transform.upsert or document_operations.items.len == 0))
+            return error.ArtifactSeedDocumentNotFound;
         if (base_json == null and !transform.upsert) {
             try transform_mod.validateDocumentTransform(alloc, document_transform);
             for (result.graph_writes.items[graph_writes_start..]) |*write| {
@@ -251,7 +264,11 @@ pub fn coalesceKeyValueRequest(
         // while applying the projected edge as a delta. The mapper sees
         // the unchanged stripped document and therefore does not clear
         // the graph generation.
-        const resolved = try transform_mod.resolveDocumentTransform(alloc, base_json, document_transform);
+        const resolved_base = try transform_mod.resolveDocumentTransform(alloc, base_json, document_transform);
+        const resolved = if (reserved_operations.items.len == 0) resolved_base else if (resolved_base) |document| folded: {
+            defer alloc.free(document);
+            break :folded try transform_mod.applyReservedProjectionOperationsAlloc(alloc, document, reserved_operations.items);
+        } else null;
 
         const resolved_document = resolved orelse continue;
         const before_flags: []const []const u8 = if (maybe_index) |index| order.items[index].json_null_fields else if (transform_snapshot) |snapshot| snapshot.nullFieldsFor(transform.key) else &.{};
@@ -597,4 +614,61 @@ test "shared mutation coalescing retains typed JSON nulls and invalidates transf
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "transforms address reserved vector and seed paths with set and unset only" {
+    const a = std.testing.allocator;
+    var snapshot = TransformReadSnapshot{};
+    defer snapshot.deinit(a);
+    try snapshot.positions.put(a, "doc", 0);
+    snapshot.entries = try a.alloc(TransformReadSnapshot.Entry, 1);
+    snapshot.entries[0] = .{ .key = "doc", .value = try a.dupe(u8, "{\"title\":\"t\"}"), .expected_version = 3 };
+
+    var result = try coalesceKeyValueRequest(CapturedOnlyReader{}, a, types.TransactionWrite, &.{}, &.{}, &.{.{ .key = "doc", .operations = &.{
+        .{ .op = .set, .path = "_artifacts.summary", .value_json = "{\"value\":\"short\"}" },
+        .{ .op = .set, .path = "_chunks.body", .value_json = "[{\"_chunk_id\":0,\"_content\":\"t\"}]" },
+        .{ .op = .unset, .path = "_embeddings.vec" },
+    } }}, &snapshot);
+    defer result.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), result.writes.len);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, result.writes[0].value, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("t", parsed.value.object.get("title").?.string);
+    try std.testing.expectEqualStrings("short", parsed.value.object.get("_artifacts").?.object.get("summary").?.object.get("value").?.string);
+    try std.testing.expect(parsed.value.object.get("_chunks").?.object.get("body").? == .array);
+    try std.testing.expect(parsed.value.object.get("_embeddings").?.object.get("vec").? == .null);
+
+    for ([_]types.TransformOp{
+        .{ .op = .inc, .path = "_embeddings.vec", .value_json = "1" },
+        .{ .op = .push, .path = "_embeddings.vec", .value_json = "1" },
+        .{ .op = .set_on_insert, .path = "_artifacts.summary", .value_json = "{\"value\":\"x\"}" },
+        .{ .op = .max, .path = "_chunks.body", .value_json = "1" },
+    }) |operation| {
+        try std.testing.expectError(error.UnsupportedTransformOperation, coalesceKeyValueRequest(CapturedOnlyReader{}, a, types.TransactionWrite, &.{}, &.{}, &.{.{ .key = "doc", .operations = &.{operation} }}, &snapshot));
+    }
+    try std.testing.expectError(error.InvalidArgument, coalesceKeyValueRequest(CapturedOnlyReader{}, a, types.TransactionWrite, &.{}, &.{}, &.{.{ .key = "doc", .operations = &.{.{ .op = .set, .path = "_artifacts.summary.value", .value_json = "1" }} }}, &snapshot));
+}
+
+test "seed transforms for a missing document are rejected with or without upsert" {
+    const a = std.testing.allocator;
+    var snapshot = TransformReadSnapshot{};
+    defer snapshot.deinit(a);
+    const seed: types.TransformOp = .{ .op = .set, .path = "_artifacts.summary", .value_json = "{\"value\":\"x\"}" };
+    for ([_]bool{ false, true }) |upsert| {
+        try std.testing.expectError(error.ArtifactSeedDocumentNotFound, coalesceKeyValueRequest(CapturedOnlyReader{}, a, types.TransactionWrite, &.{}, &.{}, &.{.{ .key = "absent", .operations = &.{seed}, .upsert = upsert }}, &snapshot));
+    }
+    // Source fields and seeds created together bind to the first version.
+    var created = try coalesceKeyValueRequest(CapturedOnlyReader{}, a, types.TransactionWrite, &.{}, &.{}, &.{.{ .key = "absent", .operations = &.{ .{ .op = .set, .path = "title", .value_json = "\"new\"" }, seed }, .upsert = true }}, &snapshot);
+    defer created.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), created.writes.len);
+    try std.testing.expect(std.mem.indexOf(u8, created.writes[0].value, "_artifacts") != null);
+
+    // A same-batch insert is the transform base; the seed binds to it.
+    var coalesced = try coalesceKeyValueRequest(CapturedOnlyReader{}, a, types.TransactionWrite, &.{.{ .key = "absent", .value = "{\"title\":\"inserted\",\"_artifacts\":{\"other\":{\"value\":\"o\"}}}" }}, &.{}, &.{.{ .key = "absent", .operations = &.{seed} }}, &snapshot);
+    defer coalesced.deinit(a);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, coalesced.writes[0].value, .{});
+    defer parsed.deinit();
+    const artifacts = parsed.value.object.get("_artifacts").?.object;
+    try std.testing.expect(artifacts.get("other") != null and artifacts.get("summary") != null);
+    try std.testing.expectEqualStrings("inserted", parsed.value.object.get("title").?.string);
 }

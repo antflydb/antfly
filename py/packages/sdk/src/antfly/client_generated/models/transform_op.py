@@ -17,7 +17,18 @@ class TransformOp:
     """
     Attributes:
         op (TransformOpType): MongoDB-style update operator
-        path (str): JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name") Example: $.views.
+        path (str): JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name").
+
+            Reserved DB-owned paths take exactly two segments and accept only
+            `$set` and `$unset` (`$unset` deletes, like a `null` value in an
+            insert); every other operator is rejected:
+            - `_embeddings.<index>`: explicit vectors for an external index.
+            - `_artifacts.<name>`: an artifact seed for an asset or embedding
+              enrichment (see `ArtifactSeed`).
+            - `_chunks.<name>`: an artifact seed for a chunk enrichment.
+
+            `_edges.<index>.<type>` accepts `$push`, `$pull` and `$addToSet`.
+             Example: $.views.
         value (Any | Unset): Value for operation (not required for $unset). Type depends on the supported operator.
             `$pull` removes every array element exactly equal to this JSON value; projected graph-edge values identify the
             relationship by `target`.

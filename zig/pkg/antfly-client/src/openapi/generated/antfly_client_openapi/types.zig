@@ -2827,6 +2827,46 @@ pub const ArtifactRepairReason = enum {
     }
 };
 
+/// An already computed result for a named enrichment, written as `_artifacts.<name>` in a document or transform. The enrichment defines the output contract (content type, dimensions, vector space); the seed does not repeat it. `"<name>": null` drops the accepted output so its producer regenerates it; omitting a name leaves it unchanged. `value` by enrichment kind: - Text asset: a string (`""` is a valid, complete empty result), or `{ "text": "..." }`. - JSON asset: any JSON value. - Document embedding: an array of finite numbers. - Chunk-derived embedding: an array of `ChunkVectorSeed`. Descriptive read fields (`artifact_id`, `artifact_ref`, `kind`, `status`, `dims`, `items`, `content_type`) and internal routing fields are rejected.
+pub const ArtifactSeed = struct {
+    /// The seeded result; its shape follows the enrichment kind.
+    value: std.json.Value,
+    /// Optional identity of the remote content the result was computed from.
+    source: ?std.json.Value = null,
+    /// Optional caller assertion about the producer; never proof that Antfly ran it.
+    provenance: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "value", "value", false },
+        .{ "source", "source", true },
+        .{ "provenance", "provenance", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("value");
+        try jw.write(self.value);
+        if (self.source) |value| {
+            try jw.objectField("source");
+            try jw.write(value);
+        }
+        if (self.provenance) |value| {
+            try jw.objectField("provenance");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Whether artifact-backed index mutations are accepted now, temporarily fenced during a distributed rolling upgrade, or permanently unsupported by this deployment.
 pub const ArtifactSourcesCapabilityState = enum {
     available,
@@ -3274,7 +3314,7 @@ pub const BatchCommittedFailure = struct {
 
 /// Batch insert, delete, and transform operations in a single request. **Atomicity**: - **Single shard**: Operations are atomic within shard boundaries - **Multiple shards**: Uses distributed 2-phase commit (2PC) for atomic cross-shard writes **How distributed transactions work**: 1. Metadata server allocates HLC timestamp and selects coordinator shard 2. Coordinator writes transaction record, participants write intents 3. After all intents succeed, coordinator commits transaction 4. Participants are notified asynchronously to resolve intents 5. Recovery loop ensures notifications complete even after coordinator failure **Performance**: - Single-shard batches: < 5ms latency - Cross-shard transactions: ~20ms latency - Intent resolution: < 30 seconds worst-case (via recovery loop) **Guarantees**: - All writes succeed or all fail (atomicity across all shards) - Coordinator failure is recoverable (new leader resumes notifications) - Idempotent resolution (duplicate notifications are safe) **Benefits**: - Reduces network overhead compared to individual requests - More efficient indexing (updates are batched) - Automatic distributed transactions when operations span shards The inserts are upserts - existing keys are overwritten, new keys are created.
 pub const BatchRequest = struct {
-    /// Map of document IDs to document objects. Each key is the unique identifier for the document. Best practices: - Use consistent key naming schemes (e.g., "user:123", "article:456") - Key length affects storage and performance - keep them reasonably short - Keys are sorted lexicographically, so choose prefixes that support range scans
+    /// Map of document IDs to document objects. Each key is the unique identifier for the document. Best practices: - Use consistent key naming schemes (e.g., "user:123", "article:456") - Key length affects storage and performance - keep them reasonably short - Keys are sorted lexicographically, so choose prefixes that support range scans Artifact seeds: a document may carry existing results for its named enrichments beside its source fields, under `_artifacts.<name>` (assets and embeddings, see `ArtifactSeed`) and `_chunks.<name>` (chunk collections, an array of `ChunkSeed`). Seeds are stripped from the stored document, bound atomically to this source version, and published as that enrichment's accepted output without invoking its producer. Unseeded outputs are generated as usual. Invalid seeds, names that match no enrichment of the document, and seeds a producer cannot accept reject the batch; they never fall back to inference silently. A document carrying only seeds is rejected; use a transform with `expected_version` to seed an existing document.
     inserts: ?std.json.ArrayHashMap(std.json.ArrayHashMap(std.json.Value)) = null,
     /// Array of document IDs to delete. Documents are removed from all indexes. Notes: - Non-existent keys are silently ignored - Deletions take precedence over inserts for the same key in one batch - Keys are permanently removed from storage and indexes
     deletes: ?[]const []const u8 = null,
@@ -5829,6 +5869,62 @@ pub const ChunkOutputs = struct {
     targets: []const ChunkOutputTarget,
 };
 
+/// One chunk of a seeded chunk collection (`_chunks.<name>`), the plain shape a `_chunks` read returns minus internal fields. Chunk ids must be unique and ascending; character spans must lie within the source text.
+pub const ChunkSeed = struct {
+    /// Chunk ordinal. `_id` is accepted as an alias and must agree.
+    _chunk_id: ?i64 = null,
+    _content: []const u8,
+    _start_char: ?i64 = null,
+    _end_char: ?i64 = null,
+    _start_time_ms: ?f64 = null,
+    _end_time_ms: ?f64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "_chunk_id", "_chunk_id", true },
+        .{ "_content", "_content", false },
+        .{ "_start_char", "_start_char", true },
+        .{ "_end_char", "_end_char", true },
+        .{ "_start_time_ms", "_start_time_ms", true },
+        .{ "_end_time_ms", "_end_time_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self._chunk_id) |value| {
+            try jw.objectField("_chunk_id");
+            try jw.write(value);
+        }
+        try jw.objectField("_content");
+        try jw.write(self._content);
+        if (self._start_char) |value| {
+            try jw.objectField("_start_char");
+            try jw.write(value);
+        }
+        if (self._end_char) |value| {
+            try jw.objectField("_end_char");
+            try jw.write(value);
+        }
+        if (self._start_time_ms) |value| {
+            try jw.objectField("_start_time_ms");
+            try jw.write(value);
+        }
+        if (self._end_time_ms) |value| {
+            try jw.objectField("_end_time_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const ChunkSourceReference = struct {
     type: []const u8,
     /// HTTP(S), S3, or absolute file:// URI resolved through configured content security and credentials. Local files require an explicit remote_content.security.allowed_paths allowlist.
@@ -5949,6 +6045,41 @@ pub const ChunkTranscriptSpan = struct {
             try jw.objectField("speaker_index");
             try jw.write(value);
         }
+        try jw.endObject();
+    }
+};
+
+/// One seeded vector of a chunk-derived embedding. An entry without `window_index` is the chunk's only vector, stored unsplit (window 0). If any entry for a chunk has a `window_index`, that chunk's windows must be supplied contiguously from 0. Chunks without a seeded vector are embedded as usual.
+pub const ChunkVectorSeed = struct {
+    chunk_id: i64,
+    window_index: ?i64 = null,
+    vector: []const f32,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "chunk_id", "chunk_id", false },
+        .{ "window_index", "window_index", true },
+        .{ "vector", "vector", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("chunk_id");
+        try jw.write(self.chunk_id);
+        if (self.window_index) |value| {
+            try jw.objectField("window_index");
+            try jw.write(value);
+        }
+        try jw.objectField("vector");
+        try jw.write(self.vector);
         try jw.endObject();
     }
 };
@@ -64446,14 +64577,17 @@ pub const Transform = struct {
     key: []const u8,
     /// List of operations to apply in sequence
     operations: []const TransformOp,
-    /// If true, create document if it doesn't exist (like MongoDB upsert)
+    /// If true, create document if it doesn't exist (like MongoDB upsert). A transform that only writes artifact seeds never creates a document: it is rejected for a missing key with or without `upsert`.
     upsert: ?bool = null,
+    /// Optional precondition: the document's current version, as returned in the `X-Antfly-Version` header of a lookup. The whole batch is rejected when the stored version differs. Required for a transform whose operations only write artifact seeds (`_artifacts.<name>`, `_chunks.<name>`), which binds those seeds to the source version they were computed from.
+    expected_version: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "key", "key", false },
         .{ "operations", "operations", false },
         .{ "upsert", "upsert", true },
+        .{ "expected_version", "expected_version", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -64474,13 +64608,17 @@ pub const Transform = struct {
             try jw.objectField("upsert");
             try jw.write(value);
         }
+        if (self.expected_version) |value| {
+            try jw.objectField("expected_version");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
 
 pub const TransformOp = struct {
     op: TransformOpType,
-    /// JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name")
+    /// JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name"). Reserved DB-owned paths take exactly two segments and accept only `$set` and `$unset` (`$unset` deletes, like a `null` value in an insert); every other operator is rejected: - `_embeddings.<index>`: explicit vectors for an external index. - `_artifacts.<name>`: an artifact seed for an asset or embedding enrichment (see `ArtifactSeed`). - `_chunks.<name>`: an artifact seed for a chunk enrichment. `_edges.<index>.<type>` accepts `$push`, `$pull` and `$addToSet`.
     path: []const u8,
     /// Value for operation (not required for $unset). Type depends on the supported operator. `$pull` removes every array element exactly equal to this JSON value; projected graph-edge values identify the relationship by `target`.
     value: OpenApiOptionalNullable(std.json.Value) = .absent,

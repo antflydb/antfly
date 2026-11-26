@@ -63,6 +63,18 @@ class BatchRequest:
                 - Use consistent key naming schemes (e.g., "user:123", "article:456")
                 - Key length affects storage and performance - keep them reasonably short
                 - Keys are sorted lexicographically, so choose prefixes that support range scans
+
+                Artifact seeds: a document may carry existing results for its named
+                enrichments beside its source fields, under `_artifacts.<name>`
+                (assets and embeddings, see `ArtifactSeed`) and `_chunks.<name>`
+                (chunk collections, an array of `ChunkSeed`). Seeds are stripped
+                from the stored document, bound atomically to this source version,
+                and published as that enrichment's accepted output without invoking
+                its producer. Unseeded outputs are generated as usual. Invalid
+                seeds, names that match no enrichment of the document, and seeds a
+                producer cannot accept reject the batch; they never fall back to
+                inference silently. A document carrying only seeds is rejected; use
+                a transform with `expected_version` to seed an existing document.
                  Example: {'user:123': {'name': 'John Doe', 'email': 'john@example.com', 'age': 30, 'tags': ['customer',
                 'premium']}, 'user:456': {'name': 'Jane Smith', 'email': 'jane@example.com', 'age': 25, 'tags': ['customer']}}.
             deletes (list[str] | Unset): Array of document IDs to delete. Documents are removed from all indexes.

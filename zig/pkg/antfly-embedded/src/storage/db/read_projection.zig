@@ -511,6 +511,12 @@ pub fn artifactProjectionValue(
             if (enrichment_artifact_codec.decodeDenseEmbeddingDims(raw) catch null) |dims| {
                 try putOwnedValue(alloc, &obj, "dims", .{ .integer = @intCast(dims) });
             }
+            // Readers can tell imported vectors from vectors Antfly produced.
+            // The header records origin descriptively; it is never proof.
+            if (enrichment_artifact_codec.decodeHeaderPrefix(raw) catch null) |header| {
+                const origin = if (header.flags.authored) "external" else if (header.flags.seeded) "seeded" else "generated";
+                try putClonedValue(alloc, &obj, "origin", .{ .string = origin });
+            }
             try putOwnedValue(alloc, &obj, "value", .null);
         },
     }

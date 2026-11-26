@@ -72,6 +72,9 @@ from .artifact_not_current import ArtifactNotCurrent
 from .artifact_not_current_error import ArtifactNotCurrentError
 from .artifact_repair_kind import ArtifactRepairKind
 from .artifact_repair_reason import ArtifactRepairReason
+from .artifact_seed import ArtifactSeed
+from .artifact_seed_provenance import ArtifactSeedProvenance
+from .artifact_seed_source import ArtifactSeedSource
 from .artifact_sources_capability_state import ArtifactSourcesCapabilityState
 from .audio_chunk_options import AudioChunkOptions
 from .audio_read_options import AudioReadOptions
@@ -189,11 +192,13 @@ from .chunk_output_target import ChunkOutputTarget
 from .chunk_output_target_kind import ChunkOutputTargetKind
 from .chunk_output_target_skip_windows_item import ChunkOutputTargetSkipWindowsItem
 from .chunk_outputs import ChunkOutputs
+from .chunk_seed import ChunkSeed
 from .chunk_source_reference import ChunkSourceReference
 from .chunk_source_reference_type import ChunkSourceReferenceType
 from .chunk_source_reference_version_kind import ChunkSourceReferenceVersionKind
 from .chunk_speaker_span import ChunkSpeakerSpan
 from .chunk_transcript_span import ChunkTranscriptSpan
+from .chunk_vector_seed import ChunkVectorSeed
 from .chunker_config import ChunkerConfig
 from .chunker_config_full_text_index import ChunkerConfigFullTextIndex
 from .chunker_provider import ChunkerProvider
@@ -2913,6 +2918,9 @@ __all__ = (
     "ArtifactNotCurrentError",
     "ArtifactRepairKind",
     "ArtifactRepairReason",
+    "ArtifactSeed",
+    "ArtifactSeedProvenance",
+    "ArtifactSeedSource",
     "ArtifactSourcesCapabilityState",
     "AudioChunkOptions",
     "AudioReadOptions",
@@ -3033,11 +3041,13 @@ __all__ = (
     "ChunkOutputTarget",
     "ChunkOutputTargetKind",
     "ChunkOutputTargetSkipWindowsItem",
+    "ChunkSeed",
     "ChunkSourceReference",
     "ChunkSourceReferenceType",
     "ChunkSourceReferenceVersionKind",
     "ChunkSpeakerSpan",
     "ChunkTranscriptSpan",
+    "ChunkVectorSeed",
     "ClassificationStepConfig",
     "ClassificationTransformationResult",
     "ClosePreparedSQLResponse200",

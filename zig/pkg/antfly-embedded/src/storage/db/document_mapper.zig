@@ -28,6 +28,7 @@ const runtime_schema = @import("../schema.zig");
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 const document_content_hash = @import("document_content_hash.zig");
 const types = @import("types.zig");
+const artifact_seeds = @import("artifact_seeds.zig");
 
 pub const schema_less_exact_field_suffix = ".keyword";
 pub const schema_less_exact_max_bytes: usize = 1024;
@@ -102,6 +103,10 @@ pub const ExtractedWrite = struct {
     sparse_embeddings: []SparseEmbeddingWrite,
     /// Explicit null directives; omission leaves caller-owned vectors intact.
     deleted_embedding_indexes: [][]u8 = &.{},
+    /// Canonical `_artifacts`/`_chunks` seed JSON (see `artifact_seeds.zig`).
+    /// Envelope-validated at extraction; producer preparation accepts each
+    /// seed against its enrichment. Owned like the other extracted fields.
+    artifact_seeds_json: ?[]u8 = null,
     /// Transient logical source for immediate full-text application. The tree
     /// borrows `prepared_region` and is deliberately never cloned or serialized;
     /// durable replay reconstructs the typed root from the committed AROW.
@@ -195,6 +200,7 @@ pub const ExtractedWrite = struct {
         };
         out.mentioned_graph_indexes = try cloneNames(alloc, self.mentioned_graph_indexes);
         out.deleted_embedding_indexes = try cloneNames(alloc, self.deleted_embedding_indexes);
+        if (self.artifact_seeds_json) |seeds| out.artifact_seeds_json = try alloc.dupe(u8, seeds);
         out.dense_embeddings = entries: {
             const items = try alloc.alloc(DenseEmbeddingWrite, self.dense_embeddings.len);
             errdefer alloc.free(items);
@@ -312,6 +318,7 @@ pub const ExtractedWrite = struct {
         if (self.dense_embeddings.len > 0) alloc.free(self.dense_embeddings);
         for (self.sparse_embeddings) |embedding| freeSparseEmbedding(alloc, embedding);
         if (self.sparse_embeddings.len > 0) alloc.free(self.sparse_embeddings);
+        if (self.artifact_seeds_json) |seeds| alloc.free(seeds);
         self.* = undefined;
     }
 };
@@ -610,6 +617,8 @@ pub const PreparedRelationalWrite = struct {
             error.InvalidVectorValue,
             error.InvalidSparseVector,
             error.UnsupportedReservedField,
+            error.InvalidArtifactSeed,
+            error.ArtifactSeedNotAccepted,
             error.InvalidCharacter,
             error.Overflow,
             error.InvalidNumber,
@@ -2640,8 +2649,15 @@ fn extractWriteFromParsedPrepared(
         }
     }
 
-    const has_special_fields = root.object.contains("_edges") or root.object.contains("_embeddings");
+    // Seeds bind to the source version in the same write. A write carrying
+    // only seeds has no source to bind to; seed-only updates of an existing
+    // document go through transforms, which supply the stored source fields.
+    const artifact_seeds_json = try artifact_seeds.extractCanonicalAlloc(alloc, root.object);
+    var artifact_seeds_moved = false;
+    errdefer if (!artifact_seeds_moved) if (artifact_seeds_json) |seeds| alloc.free(seeds);
+    const has_special_fields = root.object.contains("_edges") or root.object.contains("_embeddings") or artifact_seeds_json != null;
     const has_non_special_fields = hasNonSpecialFields(root);
+    if (artifact_seeds_json != null and !has_non_special_fields) return error.InvalidArtifactSeed;
     const cleaned_value = if (has_special_fields) blk: {
         if (!has_non_special_fields) break :blk null;
         if (logical_without_special_fields) |logical|
@@ -2658,6 +2674,8 @@ fn extractWriteFromParsedPrepared(
         .sparse_embeddings = &.{},
     };
     errdefer result.deinit(alloc);
+    result.artifact_seeds_json = artifact_seeds_json;
+    artifact_seeds_moved = true;
     result.graph_writes = try graph_writes.toOwnedSlice(alloc);
     result.mentioned_graph_indexes = try mentioned_indexes.toOwnedSlice(alloc);
     result.deleted_embedding_indexes = try deleted_embedding_indexes.toOwnedSlice(alloc);
@@ -2725,7 +2743,7 @@ fn extractWriteFastDenseEmbeddingsOnlyImpl(alloc: Allocator, key: []const u8, da
             continue;
         }
         if (std.mem.eql(u8, field_name, "_summaries")) return error.UnsupportedReservedField;
-        if (std.mem.eql(u8, field_name, "_edges")) return null;
+        if (std.mem.eql(u8, field_name, "_edges") or artifact_seeds.isSeedField(field_name)) return null;
         if (!(try appendFastScalarField(alloc, &scanner, field_name, &json_writer))) return null;
         has_non_special_fields = true;
     }
@@ -2878,6 +2896,8 @@ fn canUseOpaqueJsonFastPath(data: []const u8) bool {
     if (std.mem.indexOf(u8, data, "_edges") != null) return false;
     if (std.mem.indexOf(u8, data, "_embeddings") != null) return false;
     if (std.mem.indexOf(u8, data, "_summaries") != null) return false;
+    if (std.mem.indexOf(u8, data, artifact_seeds.artifacts_field) != null) return false;
+    if (std.mem.indexOf(u8, data, artifact_seeds.chunks_field) != null) return false;
     return true;
 }
 
@@ -4753,7 +4773,8 @@ pub fn freeJsonValue(alloc: Allocator, value: *std.json.Value) void {
 
 fn isSpecialField(field_name: []const u8) bool {
     return std.mem.eql(u8, field_name, "_edges") or
-        std.mem.eql(u8, field_name, "_embeddings");
+        std.mem.eql(u8, field_name, "_embeddings") or
+        artifact_seeds.isSeedField(field_name);
 }
 
 fn appendUniqueString(alloc: Allocator, list: *std.ArrayListUnmanaged([]u8), value: []const u8) !void {
