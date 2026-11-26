@@ -1152,6 +1152,23 @@ pub const MetalTensor = struct {
         return ownedCloneFrom(self.data[start .. start + count], dims);
     }
 
+    /// Retain a typed, bounded region of a device arena. The byte view
+    /// stays pinned to the original backing even when the arena handle retires.
+    pub fn retainedTypedView(self: *const MetalTensor, offset: usize, dims: []const i32, dtype: DType) !MetalTensor {
+        const device = self.device orelse return error.UnsupportedTensorType;
+        if (dims.len > max_dims) return error.InvalidTensorShape;
+        var elements: usize = 1;
+        for (dims) |extent| {
+            if (extent < 0) return error.InvalidTensorShape;
+            elements = try std.math.mul(usize, elements, @intCast(extent));
+        }
+        const bytes = try std.math.mul(usize, elements, dtype.byteSize());
+        if (offset > device.byte_len or bytes > device.byte_len - offset) return error.InvalidTensorShape;
+        const start = try std.math.add(usize, device.byte_offset, offset);
+        if (start % dtype.byteSize() != 0) return error.InvalidTensorShape;
+        return deviceView(try retainDeviceBuffer(device.ref), start, bytes, dims, dtype);
+    }
+
     pub fn retainedStorageView(
         self: *const MetalTensor,
         byte_offset_delta: usize,

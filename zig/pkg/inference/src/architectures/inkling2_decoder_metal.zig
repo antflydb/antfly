@@ -190,12 +190,36 @@ pub fn preferredPrefillRows() u32 {
     return if (groupedPrefillEnabled()) grouped_prefill_chunk_rows else prefill_chunk_rows;
 }
 
+const TempArena = struct {
+    const alignment = 256;
+    offsets: [@typeInfo(Temp).@"enum".field_names.len]usize = undefined,
+    groups_offset: usize = 0,
+    bytes: usize = 0,
+
+    fn reserve(self: *TempArena, elements: usize, dtype: tensors.DType) !usize {
+        const offset = (try std.math.add(usize, self.bytes, alignment - 1)) & ~@as(usize, alignment - 1);
+        self.bytes = try std.math.add(usize, offset, try std.math.mul(usize, elements, dtype.byteSize()));
+        return offset;
+    }
+
+    fn init(elements: [@typeInfo(Temp).@"enum".field_names.len]usize, groups: usize) !TempArena {
+        var arena: TempArena = .{};
+        for (std.enums.values(Temp), elements, &arena.offsets) |kind, count, *offset| {
+            if (kind == .logits) break;
+            offset.* = try arena.reserve(count, tempDtype(kind));
+        }
+        if (groups > 0) arena.groups_offset = try arena.reserve(groups, .i32);
+        return arena;
+    }
+};
+
 const WorkPlan = struct {
     rows: u32,
     reduction_rows: u32,
     elements: [@typeInfo(Temp).@"enum".field_names.len]usize,
     attention: attention.RequestWorkspace.Plan,
     group_elements: usize,
+    temps: TempArena,
 
     fn init(model: *const Decoder, rows: u32, max_tokens: u32, reduction_rows: u32) !WorkPlan {
         const text = model.text;
@@ -225,15 +249,14 @@ const WorkPlan = struct {
             .projected = @intCast(shape.projected),
             .logits = if (rows == 1) text.unpadded_vocab_size else 0,
         });
+        const groups = if (rows > 1 and groupedPrefillEnabled()) try experts.groupElements() else 0;
         return .{
             .rows = rows,
             .reduction_rows = reduction_rows,
             .elements = elements.values,
             .attention = try .init(text, rows, max_tokens, reduction_rows),
-            .group_elements = if (rows > 1 and groupedPrefillEnabled())
-                try experts.groupElements()
-            else
-                0,
+            .group_elements = groups,
+            .temps = try .init(elements.values, groups),
         };
     }
 
@@ -241,9 +264,8 @@ const WorkPlan = struct {
         var bytes = try Stack.deviceBytes(width, self.rows);
         bytes = try std.math.add(usize, bytes, self.attention.bytes);
         bytes = try std.math.add(usize, bytes, @as(usize, @intCast(self.attention.reduction_elements)) * @sizeOf(f32));
-        for (std.enums.values(Temp), self.elements) |kind, count|
-            bytes = try std.math.add(usize, bytes, try std.math.mul(usize, count, tempDtype(kind).byteSize()));
-        return std.math.add(usize, bytes, try std.math.mul(usize, self.group_elements, @sizeOf(u32)));
+        bytes = try std.math.add(usize, bytes, self.temps.bytes);
+        return std.math.add(usize, bytes, try std.math.mul(usize, self.elements[@backingInt(Temp.logits)], @sizeOf(f32)));
     }
 };
 
@@ -329,14 +351,23 @@ const Work = struct {
         errdefer result.stack.deinit();
         result.attention = try .init(a, runtime, plan.attention);
         errdefer result.attention.deinit();
+        var arena = try allocate(a, runtime, .u8, plan.temps.bytes, .private);
+        defer arena.deinit();
         var initialized: usize = 0;
         errdefer for (result.temps[0..initialized]) |*tensor| tensor.deinit();
-        for (&result.temps, std.enums.values(Temp), plan.elements) |*tensor, kind, elements| {
+        for (&result.temps, std.enums.values(Temp), plan.elements, 0..) |*tensor, kind, elements, index| {
             if (elements == 0) break;
-            tensor.* = try allocate(a, runtime, tempDtype(kind), elements, if (kind == .logits) .shared else .private);
+            const dtype = tempDtype(kind);
+            tensor.* = if (kind == .logits)
+                try allocate(a, runtime, dtype, elements, .shared)
+            else
+                try arena.retainedTypedView(plan.temps.offsets[index], &.{std.math.cast(i32, elements) orelse return error.InvalidShape}, dtype);
             initialized += 1;
         }
-        result.groups = if (plan.group_elements > 0) try allocate(a, runtime, .i32, plan.group_elements, .private) else null;
+        result.groups = if (plan.group_elements > 0)
+            try arena.retainedTypedView(plan.temps.groups_offset, &.{std.math.cast(i32, plan.group_elements) orelse return error.InvalidShape}, .i32)
+        else
+            null;
         return result;
     }
 
@@ -994,8 +1025,14 @@ test "Inkling Metal resident decoder executes the full visit schedule on a synth
     const new_page_bytes = checkpoint.visit_count * 16 * width * 2 * @sizeOf(u16) + 2 * @sizeOf(u32);
     try std.testing.expectEqual(@as(usize, new_page_bytes), (try expanded_plan.deviceBytes()) - (try short_plan.deviceBytes()));
     var request: Request = undefined;
+    const before_request = @import("../backends/metal_tensor.zig").memoryStatsSnapshot();
     try request.init(a, &model, 3);
     defer request.deinit();
+    const request_memory = @import("../backends/metal_tensor.zig").memoryStatsSnapshot();
+    // Six state buffers, one residual buffer, two attention buffers,
+    // a private temporary arena, and a shared logits buffer.
+    try std.testing.expectEqual(@as(u64, 11), request_memory.device_owned_buffers_created - before_request.device_owned_buffers_created);
+    try std.testing.expectEqual(try short_plan.deviceBytes(), request_memory.device_owned_live_bytes - before_request.device_owned_live_bytes);
     var image_row = try upload(a, runtime, .i16, std.mem.sliceAsBytes(embeddings[0..width]));
     defer image_row.deinit();
     try std.testing.expectError(error.InvalidShape, request.appendEmbeddings(&model.controller_queries[0], 1));
@@ -1041,6 +1078,19 @@ test "Inkling Metal resident decoder executes the full visit schedule on a synth
     try std.testing.expect(tail_request.prefill == null);
     try tail_request.appendTokens(&.{ 1, 0 });
     try std.testing.expectEqual(@as(usize, 5), tail_request.state.sequence.committed_tokens);
+    if (groupedPrefillEnabled()) {
+        var group_request: Request = undefined;
+        const grouped_plan = (try RequestPlan.initPrefill(&model, 17, 16)).withDeviceSelection();
+        try group_request.initWithPlan(a, &model, grouped_plan);
+        defer group_request.deinit();
+        const work = &group_request.prefill.?;
+        const groups = work.groups orelse return error.InvalidFixture;
+        try std.testing.expectEqual(work.get(.selected).deviceHandle(), groups.deviceHandle());
+        try std.testing.expect(groups.deviceByteOffset() >= work.get(.selected).deviceByteOffset() + work.get(.selected).deviceByteLen());
+        try group_request.appendTokens(&@as([16]i32, @splat(1)));
+        _ = try group_request.stepGreedy(0);
+        try std.testing.expectEqual(@as(usize, 17), group_request.state.sequence.committed_tokens);
+    }
     const hf_tokenizer = @import("inference_hf_tokenizer");
     var hf = try hf_tokenizer.HfTokenizer.loadFromBytes(a,
         \\{"version":"1.0","added_tokens":[{"id":14,"content":"<|end_message|>"}],"model":{"type":"BPE","unk_token":"<unk>","vocab":{"x":0,"y":1,"<unk>":2,"<|end_message|>":14},"merges":[]}}
