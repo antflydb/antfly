@@ -1039,6 +1039,14 @@ retirement, and retry after a failed tail allocation. A separate
 physical Metal fixture writes and reads packed KV through nonzero offsets
 in the same backing buffer before publishing the append.
 
+At `17d928a106`, Metal stages both KV planes in one dispatch per visit for
+BF16 and Q4. Staging and attention share the request's device page table.
+The previous Metal path walked host page spans and encoded copies or packing
+for each span. Physical tests verified a reversed page mapping across the
+append boundary, untouched BF16 rows outside the suffix, matching packed
+attention output, and the complete synthetic decoder visit schedule.
+The dispatch reduction has no measured released-checkpoint latency yet.
+
 On the M4 Max, the combined cohort at `f2e941c98c` passed 32 of 33 selected
 tests. The released-checkpoint test was deferred while the full-window
 request ran. At `ab3b1e1693`, 20 of 21 retirement and preparation checks
