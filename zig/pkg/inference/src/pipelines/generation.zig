@@ -7599,6 +7599,11 @@ pub const NativeGenerationPipeline = struct {
         };
     }
 
+    fn selectCompiledPrefillGreedyToken(self: *const NativeGenerationPipeline, output: *graph_mod.model_runtime.ModelOutput) !usize {
+        const token = try output.greedyTokenSuppress(self.allocator, self.gpt_config.vocab_size, self.gpt_config.suppressTokenIds());
+        return std.math.cast(usize, token) orelse error.InvalidModelOutput;
+    }
+
     /// Run the prefill phase: process prompt tokens through the model,
     /// either chunked (for paged KV) or in one pass. Returns the logits
     /// for the last prompt position, or null if handled by the scheduler.
@@ -7767,6 +7772,7 @@ pub const NativeGenerationPipeline = struct {
                     1,
                     total_chunk_end,
                     &decode_context,
+                    is_last_chunk,
                 ) catch |err| {
                     debugGenerationStage(
                         "executePrefill whole-model chunk failed chunk_start={d} chunk_end={d} err={s}",
@@ -7784,15 +7790,14 @@ pub const NativeGenerationPipeline = struct {
                 if (is_last_chunk and allow_resident_greedy_token and
                     isPureGreedyConfig(config) and config.grammar == null)
                 {
-                    const token = try output.greedyToken(allocator, self.gpt_config.vocab_size);
-                    if (token < 0) return error.InvalidModelOutput;
+                    const token = try self.selectCompiledPrefillGreedyToken(&output);
                     if (self.scheduler) |scheduler| {
                         if (self.scheduler_lease) |lease| {
                             scheduler.notePrefillProgress(lease, total_chunk_end, seq_len);
                             scheduler.finishTurn(lease, .prefill);
                         }
                     }
-                    return .{ .greedy_token = @intCast(token) };
+                    return .{ .greedy_token = token };
                 } else if (is_last_chunk) {
                     prefill_last_logits = try output.takeHostLogits(allocator);
                 }
@@ -18206,6 +18211,24 @@ test "admitted prefill never enlarges scheduler geometry" {
     try std.testing.expectEqual(@as(usize, 128), schedulerChunkForPrefillIteration(128, 449, false));
     try std.testing.expectEqual(@as(usize, 449), schedulerChunkForPrefillIteration(128, 449, true));
     try std.testing.expectEqual(@as(usize, 449), schedulerChunkForPrefillIteration(0, 449, false));
+}
+
+test "HTTP compiled prefill skips a suppressed EOS with the highest logit" {
+    const allocator = std.testing.allocator;
+    var model_config = gpt_mod.Config{ .vocab_size = 3, .eos_token_id = 1, .suppress_token_ids_len = 1 };
+    model_config.suppress_token_ids[0] = 1;
+    const pipeline = NativeGenerationPipeline{
+        .allocator = allocator,
+        .cb = undefined,
+        .tokenizer = undefined,
+        .gpt_config = model_config,
+    };
+    var output = graph_mod.model_runtime.ModelOutput{ .logits = try allocator.dupe(f32, &.{ 0, 9, 8 }) };
+    defer output.deinit(allocator);
+
+    const token = try pipeline.selectCompiledPrefillGreedyToken(&output);
+    try std.testing.expectEqual(@as(usize, 2), token);
+    try std.testing.expect(!pipeline.shouldStopOnEos(.{}, token));
 }
 
 test "whole-model prefill stays bounded and speculative width is validated" {
