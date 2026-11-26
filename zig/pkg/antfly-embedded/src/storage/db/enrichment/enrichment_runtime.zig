@@ -30733,23 +30733,44 @@ const GraphAssetExpectation = union(enum) {
     observed: ?[]const u8,
 };
 
+const PreparedGraphPublication = struct {
+    bytes: []u8,
+    flight: PublicationFlights.Flight,
+};
+
 fn publishOrderedGraphForRuntime(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, expected_asset: GraphAssetExpectation, failure_scope: ?*FailureScope) !bool {
+    const owner = logicalRequestFingerprint(request);
+    // A prior dispatch owns the replay cut until its outcome is visible.
+    // Avoid planning and encoding the same graph effects while it applies.
+    if (try runtime.publication_flights.reconcile(runtime, owner)) return error.ArtifactPublicationPending;
     var budget = if (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) |manager|
         runtime.media_window_capture.budget(manager, runtime.alloc)
     else
         null;
     defer if (budget) |*tracked| tracked.deinit();
     const alloc = if (budget) |*tracked| tracked.allocator() else runtime.alloc;
-    return publishOrderedGraphWithAllocator(runtime, alloc, request, expected_asset, failure_scope) catch |err| {
-        if (err == error.OutOfMemory) if (budget) |*tracked| if (tracked.denied()) return error.ResourceBudgetExceeded;
+    var encoded: std.ArrayList(PreparedGraphPublication) = .empty;
+    defer {
+        for (encoded.items) |item| alloc.free(item.bytes);
+        encoded.deinit(alloc);
+    }
+    const options: ProducerPublicationOptions = .{ .budget_error = error.PublicationEncoderAdmissionDenied };
+    const denial_before = publicationDenialGeneration(alloc);
+    const ordered = prepareOrderedGraphPublications(runtime, alloc, request, expected_asset, owner, &encoded) catch |err| {
+        if (options.encodingError(alloc, denial_before, err) == error.PublicationEncoderAdmissionDenied)
+            return publicationAdmissionOutcome(runtime, owner);
         return err;
     };
+    if (!ordered or encoded.items.len == 0) return ordered;
+    const dispatcher = runtime.artifact_publication_dispatcher orelse return error.ArtifactCatalogDrift;
+    for (encoded.items) |item| runtime.publication_flights.submit(runtime, dispatcher, item.flight, item.bytes, null) catch |err|
+        return FailureScope.assetPublicationFailure(failure_scope, err);
+    return error.ArtifactPublicationPending;
 }
 
-fn publishOrderedGraphWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, expected_asset: GraphAssetExpectation, failure_scope: ?*FailureScope) !bool {
+fn prepareOrderedGraphPublications(runtime: *EnrichmentRuntime, alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, expected_asset: GraphAssetExpectation, owner: u64, encoded: *std.ArrayList(PreparedGraphPublication)) !bool {
     var read = try runtime.store.beginRead();
-    var read_open = true;
-    defer if (read_open) read.abort();
+    defer read.abort();
     if (try ordered_publication.authority(&read) == null) return false;
     const fence = try requiredRuntimeStoreWriteFence(runtime, replayWriteGeneration(runtime));
     try validateRuntimeStoreWriteFenceTxn(runtime, &read, fence);
@@ -30793,26 +30814,17 @@ fn publishOrderedGraphWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocato
         defer alloc.free(logical);
         try materializeGraphAssetForRuntime(context, request, value, logical, &window, null);
     } else try materializeGraphAssetDeleteForRuntime(context, request, &window, null);
-    // Serialization owns all bytes before the snapshot is released. Queue
-    // admission cannot itself credit replay or coverage; accepted retries use
-    // the same logical-input receipt and skip mutable-state planning.
-    var encoded: std.ArrayList([]u8) = .empty;
-    defer {
-        for (encoded.items) |bytes| alloc.free(bytes);
-        encoded.deinit(alloc);
-    }
+    // Own the bytes and receipt keys before closing the snapshot. Queue
+    // admission must run after the graph planning state is released.
+    try encoded.ensureTotalCapacity(alloc, context.commands.items.len);
     for (context.commands.items) |command| {
         const bytes = try @import("../artifact_publication_transport_codec.zig").encodeAlloc(alloc, command);
         errdefer alloc.free(bytes);
-        try encoded.append(alloc, bytes);
+        const source = command.sources[command.mutations[0].source_index];
+        const flight = try PublicationFlights.prepare(&read, owner, command, source, bytes.len, null);
+        encoded.appendAssumeCapacity(.{ .bytes = bytes, .flight = flight });
     }
-    read.abort();
-    read_open = false;
-    if (encoded.items.len == 0) return true;
-    const dispatcher = runtime.artifact_publication_dispatcher orelse return error.ArtifactCatalogDrift;
-    for (encoded.items) |bytes| dispatcher.submit(context.base.namespace, bytes) catch |err|
-        return FailureScope.assetPublicationFailure(failure_scope, err);
-    return error.ArtifactPublicationPending;
+    return true;
 }
 
 fn queueGraphNeighborMutation(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, key: []const u8, next: ?[]const u8) !void {
@@ -33125,12 +33137,40 @@ const PublicationFlights = struct {
         const io = concurrencyIo(runtime);
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        return self.reconcileLocked(runtime, owner);
+        return self.reconcileLocked(runtime, if (owner) |value| .{ .owner = value } else .all);
     }
 
-    fn reconcileLocked(self: *PublicationFlights, runtime: *EnrichmentRuntime, owner: ?u64) !bool {
+    fn reconcileAdmissionDenial(self: *PublicationFlights, runtime: *EnrichmentRuntime, owner: ?u64) !bool {
+        const io = concurrencyIo(runtime);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        // Completed appends for other owners can still be holding the
+        // working-set credit this request needs. Only this owner's live
+        // flights affect whether it can be parked.
+        return self.reconcileLocked(runtime, .{ .pressure = owner });
+    }
+
+    const Selection = union(enum) {
+        all,
+        owner: u64,
+        pressure: ?u64,
+
+        fn owns(self: Selection, flight_owner: u64) bool {
+            return switch (self) {
+                .all => true,
+                .owner => |owner| owner == flight_owner,
+                .pressure => |owner| owner == flight_owner,
+            };
+        }
+
+        fn includes(self: Selection, flight: Flight) bool {
+            return self.owns(flight.owner) or (self == .pressure and flight.append_key != null);
+        }
+    };
+
+    fn reconcileLocked(self: *PublicationFlights, runtime: *EnrichmentRuntime, selection: Selection) !bool {
         for (self.items.items) |flight| {
-            if (owner == null or flight.owner == owner.?) break;
+            if (selection.includes(flight)) break;
         } else return false;
         // Read the host watermark before opening the store snapshot. An
         // upload whose last chunk has applied must be visible in this read.
@@ -33147,12 +33187,12 @@ const PublicationFlights = struct {
         var index: usize = 0;
         while (index < self.items.items.len) {
             const flight = self.items.items[index];
-            if (owner == null or flight.owner == owner.?) {
+            if (selection.includes(flight)) {
                 if (try flight.settled(&read, authority, applied)) {
                     self.items.swapRemove(index).deinit(runtime.alloc);
                     continue;
                 }
-                pending = true;
+                pending = pending or selection.owns(flight.owner);
             }
             index += 1;
         }
@@ -33226,7 +33266,7 @@ const PublicationFlights = struct {
                 const previous = &self.items.items[index];
                 if (previous.submitting) return error.ArtifactPublicationPending;
                 if (previous.dispatch.observe_fn != null) {
-                    _ = try self.reconcileLocked(runtime, prepared.owner);
+                    _ = try self.reconcileLocked(runtime, .{ .owner = prepared.owner });
                     if (self.find(prepared) != null) return error.ArtifactPublicationPending;
                 } else {
                     previous.submitting = true;
@@ -33234,7 +33274,7 @@ const PublicationFlights = struct {
                 }
             }
             if (self.items.items.len == max_flights) {
-                _ = try self.reconcileLocked(runtime, null);
+                _ = try self.reconcileLocked(runtime, .all);
                 if (self.items.items.len == max_flights) return error.ArtifactPublicationPending;
             }
             try self.items.ensureUnusedCapacity(runtime.alloc, 1);
@@ -33869,10 +33909,10 @@ fn processOrderedChunkVectorTracked(runtime: *EnrichmentRuntime, alloc: Allocato
     };
 }
 
-fn publicationAdmissionOutcome(runtime: *EnrichmentRuntime, owner: u64) anyerror {
+fn publicationAdmissionOutcome(runtime: *EnrichmentRuntime, owner: ?u64) anyerror {
     // An admission ticket lets the scanner continue to the next source.
     // An unresolved dispatch still owns this cut, including across passes.
-    const pending = runtime.publication_flights.reconcile(runtime, owner) catch |err| return err;
+    const pending = runtime.publication_flights.reconcileAdmissionDenial(runtime, owner) catch |err| return err;
     return if (pending) error.ArtifactPublicationPending else error.ResourceTemporarilyUnavailable;
 }
 
@@ -35081,9 +35121,9 @@ fn submitProducerCommand(runtime: *EnrichmentRuntime, token: *@import("../artifa
     const command = (switch (publication) {
         .effects => |effects| token.command(effects),
         .command => |command| @as(anyerror!ordered_publication.Command, command),
-    }) catch |err| return options.encodingError(transport, denial_before, err);
+    }) catch |err| return producerEncodingOutcome(runtime, transport, denial_before, options, err);
     const bytes = @import("../artifact_publication_transport_codec.zig").encodeAlloc(transport, command) catch |err|
-        return options.encodingError(transport, denial_before, err);
+        return producerEncodingOutcome(runtime, transport, denial_before, options, err);
     defer transport.free(bytes);
     if (options.flight_owner) |owner| {
         const flight = blk: {
@@ -35098,6 +35138,11 @@ fn submitProducerCommand(runtime: *EnrichmentRuntime, token: *@import("../artifa
             return FailureScope.assetPublicationFailure(failure_scope, err);
     }
     options.dispatched();
+}
+
+fn producerEncodingOutcome(runtime: *EnrichmentRuntime, alloc: Allocator, denial_before: u64, options: ProducerPublicationOptions, err: anyerror) anyerror {
+    const outcome = options.encodingError(alloc, denial_before, err);
+    return if (outcome == error.ResourceTemporarilyUnavailable) publicationAdmissionOutcome(runtime, options.flight_owner) else outcome;
 }
 
 fn captureProducerInput(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, source_key: []const u8, logical_input: []const u8) !?producer_input.Token {
@@ -36704,6 +36749,8 @@ fn processOrderedChunkText(runtime: *EnrichmentRuntime, request: enrichment_type
     };
     defer captured.token.deinit();
     if (captured.accepted) {
+        if (try runtime.publication_flights.reconcile(runtime, logicalRequestFingerprint(request)))
+            return error.ArtifactPublicationPending;
         try pruneOrderedChunkGenerations(runtime, &captured.token, captured.manifest_key);
         return true;
     }
@@ -48826,6 +48873,16 @@ fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !v
         } else try std.testing.expect(decoded.command.mutations[0].value == null);
         try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = pass * entries_per_pass + 4 });
         if (graph) {
+            var manager = resource_manager_mod.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 1 } });
+            defer manager.deinit(alloc);
+            const previous_manager = runtime.config.resource_manager;
+            if (pass == 0) {
+                runtime.config.resource_manager = &manager;
+                defer runtime.config.resource_manager = previous_manager;
+                try std.testing.expectError(error.ResourceTemporarilyUnavailable, processAsset(runtime, request, &batch, &prepared_sources, &window, &scope));
+                try std.testing.expect(!scope.publication_failed);
+                try std.testing.expectEqual(pass * calls_per_pass + 1, harness.calls);
+            }
             harness.refuse_next = true;
             try std.testing.expectError(error.QueueFull, processAsset(runtime, request, &batch, &prepared_sources, &window, &scope));
             try std.testing.expectEqual(pass * calls_per_pass + 1, harness.calls);
@@ -48833,6 +48890,16 @@ fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !v
             var graph_command = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
             defer graph_command.deinit();
             try std.testing.expect(graph_command.command.producer_kind == .graph);
+            if (pass == 0) {
+                // An earlier dispatch keeps graph replay pending even if
+                // this retry has no working-set credit to encode a command.
+                runtime.config.resource_manager = &manager;
+                defer runtime.config.resource_manager = previous_manager;
+                const calls_before = harness.calls;
+                try std.testing.expectError(error.ArtifactPublicationPending, processAsset(runtime, request, &batch, &prepared_sources, &window, &scope));
+                try std.testing.expectEqual(calls_before, harness.calls);
+                try std.testing.expectEqual(@as(usize, 1), runtime.publication_flights.items.items.len);
+            }
             try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = graph_command.command }, .{ .term = 1, .index = pass * entries_per_pass + 5 });
             const edge_key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, "doc", "g", "mentions", "other", "doc");
             defer alloc.free(edge_key);
@@ -52385,7 +52452,31 @@ test "model aware media ordered generation publishes beyond 4095 chunks and resu
             defer competing.release();
             try std.testing.expectError(error.PublicationEncoderAdmissionDenied, runtime.publication_flights.retainAppendKey(runtime, "distinct generation key", null));
         }
-        try std.testing.expect(!try runtime.publication_flights.reconcile(runtime, logicalRequestFingerprint(request)));
+        // Reuse a settled append witness below to also exercise admission
+        // for a different request when this owner has not been revisited.
+        var settled_append = for (runtime.publication_flights.items.items) |flight| {
+            if (flight.append_key != null) break flight;
+        } else return error.TestUnexpectedResult;
+        settled_append.dispatch = .{};
+        const append_key = try a.dupe(u8, settled_append.completion.append.key);
+        defer a.free(append_key);
+        var cache: std.ArrayListUnmanaged(WorkerChunkCacheEntry) = .empty;
+        defer cache.deinit(a);
+        const calls_before = harness.calls;
+        try std.testing.expect(try processOrderedChunkText(runtime, request, &cache, null));
+        try std.testing.expectEqual(calls_before, harness.calls);
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(slice).used_bytes);
+        settled_append.append_key = try runtime.publication_flights.retainAppendKey(runtime, append_key, null);
+        settled_append.completion.append.key = settled_append.append_key.?.bytes;
+        runtime.publication_flights.items.appendAssumeCapacity(settled_append);
+        {
+            var competing = try manager.reserve(slice, limit - charged_bytes);
+            defer competing.release();
+            try std.testing.expectError(error.PublicationEncoderAdmissionDenied, runtime.publication_flights.retainAppendKey(runtime, "unrelated generation key", null));
+            var unrelated = request;
+            unrelated.doc_key = "unrelated";
+            try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, publicationAdmissionOutcome(runtime, logicalRequestFingerprint(unrelated)));
+        }
         try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(slice).used_bytes);
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
