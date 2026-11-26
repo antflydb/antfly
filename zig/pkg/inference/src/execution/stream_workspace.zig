@@ -33,7 +33,19 @@ pub const Layout = struct {
 };
 // A live allocation has a nonzero observed address or declared slot ID.
 
-const Allocation = struct { live_id: u64, bytes: u32, offset: u32 };
+const Slot = u12;
+const no_slot = std.math.maxInt(Slot);
+const Allocation = struct {
+    live_id: u64,
+    bytes: u32,
+    // Arena offsets are always aligned. Store the cold live-list link in
+    // the spare bits so a cached recipe needs no separate index array.
+    placement: packed struct(u32) { offset_blocks: u20, next_live: Slot },
+
+    fn offset(self: Allocation) u32 {
+        return @as(u32, self.placement.offset_blocks) * alignment;
+    }
+};
 // A trace is kept per cached shape. Slot indices fit in the fixed plan and
 // never need pointer-width storage or an independently padded flag.
 const max_allocations = 2048;
@@ -45,18 +57,16 @@ const Event = packed struct(u16) {
 comptime {
     if (limit > std.math.maxInt(u32)) @compileError("stream workspace geometry overflow");
 
-    if (max_allocations - 1 > std.math.maxInt(u15)) @compileError("stream workspace event slot overflow");
+    if (max_allocations > no_slot or max_allocations - 1 > std.math.maxInt(u15)) @compileError("stream workspace event slot overflow");
+    if (limit / alignment > std.math.maxInt(u20)) @compileError("stream workspace placement overflow");
 }
 pub const Origin = enum { observed, declared };
-const no_slot = std.math.maxInt(u16);
 
 pub const Plan = struct {
     origin: Origin = .observed,
     allocations: [max_allocations]Allocation = undefined,
     events: [max_allocations * 2]Event = undefined,
-    // Active slots are linked in offset order. Sealed dispatch uses only events.
-    next_live: [max_allocations]u16 = undefined,
-    first_live: u16 = no_slot,
+    first_live: Slot = no_slot,
     count: usize = 0,
     event_count: usize = 0,
     peak: usize = 0,
@@ -85,58 +95,75 @@ pub const Plan = struct {
         }
         const extent = std.mem.alignForward(usize, bytes, alignment);
         var offset: usize = 0;
-        var link = &self.first_live;
-        var insertion: ?*u16 = null;
-        while (link.* != no_slot) {
-            const slot = link.*;
+        var previous: Slot = no_slot;
+        var slot = self.first_live;
+        var insert_after: ?Slot = null;
+        while (slot != no_slot) {
             const allocation = self.allocations[slot];
             if (allocation.live_id == live_id) {
                 self.valid = false;
                 return;
             }
-            if (insertion == null) {
-                if (offset + extent <= allocation.offset) {
-                    insertion = link;
+            if (insert_after == null) {
+                if (offset + extent <= allocation.offset()) {
+                    insert_after = previous;
                 } else {
-                    offset = allocation.offset + std.mem.alignForward(usize, allocation.bytes, alignment);
+                    offset = allocation.offset() + std.mem.alignForward(usize, allocation.bytes, alignment);
                 }
             }
-            link = &self.next_live[slot];
+            previous = slot;
+            slot = allocation.placement.next_live;
         }
         if (offset > limit - extent) {
             self.valid = false;
             return;
         }
-        self.allocations[self.count] = .{ .bytes = @intCast(bytes), .offset = @intCast(offset), .live_id = live_id };
-        const insert_at = insertion orelse link;
-        self.next_live[self.count] = insert_at.*;
-        insert_at.* = @intCast(self.count);
+        const predecessor = insert_after orelse previous;
+        self.allocations[self.count] = .{
+            .bytes = @intCast(bytes),
+            .placement = .{ .offset_blocks = @intCast(offset / alignment), .next_live = self.nextLive(predecessor) },
+            .live_id = live_id,
+        };
+        self.setNextLive(predecessor, @intCast(self.count));
         self.event(self.count, true);
         self.count += 1;
         self.peak = @max(self.peak, offset + extent);
     }
     pub fn release(self: *Plan, pointer: DevicePointer) void {
         if (!self.valid or self.sealed or pointer == 0) return;
-        var link = &self.first_live;
-        while (link.* != no_slot) : (link = &self.next_live[link.*]) {
-            if (self.allocations[link.*].live_id == pointer) {
-                self.unlinkLive(link);
+        var previous: Slot = no_slot;
+        var slot = self.first_live;
+        while (slot != no_slot) {
+            if (self.allocations[slot].live_id == pointer) {
+                self.unlinkLive(previous, slot);
                 return;
             }
+            previous = slot;
+            slot = self.nextLive(slot);
         }
     }
 
-    fn releaseSlot(self: *Plan, slot: usize) void {
-        var link = &self.first_live;
-        while (link.* != slot) : (link = &self.next_live[link.*]) {
-            std.debug.assert(link.* != no_slot);
-        }
-        self.unlinkLive(link);
+    fn nextLive(self: *const Plan, predecessor: Slot) Slot {
+        return if (predecessor == no_slot) self.first_live else self.allocations[predecessor].placement.next_live;
     }
 
-    fn unlinkLive(self: *Plan, link: *u16) void {
-        const slot = link.*;
-        link.* = self.next_live[slot];
+    fn setNextLive(self: *Plan, predecessor: Slot, next: Slot) void {
+        if (predecessor == no_slot) self.first_live = next else self.allocations[predecessor].placement.next_live = next;
+    }
+
+    fn releaseSlot(self: *Plan, target: Slot) void {
+        var previous: Slot = no_slot;
+        var slot = self.first_live;
+        while (slot != target) {
+            std.debug.assert(slot != no_slot);
+            previous = slot;
+            slot = self.nextLive(slot);
+        }
+        self.unlinkLive(previous, slot);
+    }
+
+    fn unlinkLive(self: *Plan, predecessor: Slot, slot: Slot) void {
+        self.setNextLive(predecessor, self.nextLive(slot));
         self.allocations[slot].live_id = 0;
         self.event(slot, false);
     }
@@ -157,7 +184,7 @@ pub const Plan = struct {
             },
             .release => |slot| {
                 if (slot >= self.count or self.allocations[slot].live_id == 0) return error.InvalidExecutionPlan;
-                self.releaseSlot(slot);
+                self.releaseSlot(@intCast(slot));
                 if (!self.valid) return error.InvalidExecutionPlan;
             },
         };
@@ -194,7 +221,7 @@ pub const Plan = struct {
         self.valid = self.valid and (expected == null) == (self.output == null);
         if (self.valid) for (self.allocations[0..self.count], 0..) |allocation, index| {
             if (self.output == index) continue;
-            self.scratch_peak = @max(self.scratch_peak, allocation.offset + std.mem.alignForward(usize, allocation.bytes, alignment));
+            self.scratch_peak = @max(self.scratch_peak, allocation.offset() + std.mem.alignForward(usize, allocation.bytes, alignment));
         };
         self.first_live = no_slot;
         self.sealed = self.valid;
@@ -219,7 +246,8 @@ pub const Plan = struct {
             hash.update(std.mem.asBytes(&encoded));
             const allocation = self.allocations[entry.slot];
             hash.update(std.mem.asBytes(&allocation.bytes));
-            hash.update(std.mem.asBytes(&allocation.offset));
+            const offset = allocation.offset();
+            hash.update(std.mem.asBytes(&offset));
         }
         return hash.final();
     }
@@ -239,7 +267,7 @@ pub const Plan = struct {
             .scratch_offset = prefix_bytes,
             .events = self.event_count,
             .recipe = self.recipe,
-            .output = if (output) |region| .{ .offset = if (external) 0 else prefix_bytes + region.offset, .bytes = region.bytes } else null,
+            .output = if (output) |region| .{ .offset = if (external) 0 else prefix_bytes + region.offset(), .bytes = region.bytes } else null,
             .external_output = external,
         };
     }
@@ -324,7 +352,7 @@ pub const Scope = struct {
         }
         self.cursor += 1;
         if (self.published_ptr != 0 and self.recipe.bound.output == e.slot) return self.published_ptr;
-        return self.base + self.recipe.bound.allocations[e.slot].offset;
+        return self.base + self.recipe.bound.allocations[e.slot].offset();
     }
     pub fn release(self: *Scope, pointer: DevicePointer) void {
         if (!self.isBound()) {
@@ -336,7 +364,7 @@ pub const Scope = struct {
             return;
         }
         const e = self.recipe.bound.events[self.cursor];
-        if (e.allocate or self.base + self.recipe.bound.allocations[e.slot].offset != pointer) {
+        if (e.allocate or self.base + self.recipe.bound.allocations[e.slot].offset() != pointer) {
             self.valid = false;
             return;
         }
@@ -597,6 +625,6 @@ test "stream workspace chooses the earliest gap among out-of-order slots" {
         .{ .release = 2 },
     }, null);
     try std.testing.expectEqual(@as(usize, 768), plan.peak);
-    try std.testing.expectEqual(@as(u32, 0), plan.allocations[2].offset);
-    try std.testing.expectEqual(@as(u32, 256), plan.allocations[3].offset);
+    try std.testing.expectEqual(@as(u32, 0), plan.allocations[2].offset());
+    try std.testing.expectEqual(@as(u32, 256), plan.allocations[3].offset());
 }
