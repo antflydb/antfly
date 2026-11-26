@@ -124,28 +124,46 @@ operations queries, deletions and merge planning use, with the encoded
 (merges, cursors, native navigation, integrity checks) asks for `encoded()`.
 A level-0 buffer reader (4) becomes a second variant. No behavior change.
 
-### 4. Level-0 as a memtable
+### 4. Cheap level-0 publication (replaces the memtable)
 
-Measured (Debug, 8 threads): of ~340 µs of inline preparation per write,
-~200 µs encodes the level-0 segment and ~57 µs analyzes the text; install
-adds ~90 µs of catalog-mirror sync and ~90 µs publishing the segment; and
-every write's segment is merged again later.
+A CPU sample of the ReleaseFast 8-thread run put most of the install time in
+`nanosleep`: both install steps opened a read transaction to read back
+values their own commit had decided (the mirror's dead buckets, and the doc
+map versions behind the deletion bitmap), and a Lite read transaction waited
+for the store's publication mutex behind the next group's apply.
 
-Design (the LSM memtable, as FTS5's pending-terms buffer):
+The read-backs existed because installs run out of commit order (the leader
+installs only if the index guard is free; otherwise the writer installs after
+its wait). Instead:
 
-- Per full-text index, an in-memory mutable buffer of postings
-  (term -> (doc, version, frequency, positions)) and stored-field refs.
-  A write tokenizes into it: no segment is encoded.
-- The commit records only `l0/<version> -> (key, version)` lists. Recovery
-  and cross-process refresh rebuild the buffer from them, re-analyzing each
-  listed document from the primary store when its version is still current
-  at the tip (an overwritten version is dead and skipped).
-- Queries read the buffer beside the segments: a buffer reader implementing
-  the segment reader interface over the mutable postings, snapshotted per
-  query by a generation counter.
-- A bounded flush (size or count) encodes the buffer into one segment and
-  deletes the records it covers in the same commit, replacing per-write
-  level-0 segments and most merges.
+- Every resolver run takes a decision stamp from its backend when it runs
+  inside its group's apply (`Resolver.run`), so among committed decisions
+  stamp order is commit order. An install applies a decided key only if no
+  newer stamp has been applied to it (`Backend.applyDecided`); merges'
+  `mirrorResolved` does the same. Stamps are recorded per key only at
+  install time and only while level-0 decisions are pending
+  (`beginPendingDecision`), and dropped with the last one, so a resolver
+  that never commits records nothing and the map holds no historical keys.
+- A level-0 copy is deleted at install when it was dead at its own commit
+  (`VersionResolution.collectDeadAtCommit`) or a later commit's install
+  killed it first: that death waits in `VersionLocations.parked` while
+  level-0 publications are pending.
+- The segment is parsed once at prepare and handed to the snapshot.
+
+A queryable in-memory buffer (the memtable this section used to describe)
+would need an abstract postings interface across the query layer, which
+reads postings through concrete encoded types. FTS5 also writes a segment
+per commit; what made ours expensive was publishing it.
+
+A peer delta (`refreshPeerDelta`) is refused while this process's own
+inline installs are pending: a delayed install could otherwise publish a
+segment the peer already retired. The refresh runs once they land, and
+then forgets the recorded stamps.
+
+On the shared write path, a Lite read whose pin takes no reader fence (the
+generation already holds it, or a nested read under the writer's lease) is
+admitted under `read_mutex` alone instead of the publication mutex, and a
+write without graph indexes skips its endpoint-cleanup read.
 
 ### 5. Bounded merges outside the lease
 
@@ -184,6 +202,63 @@ Installing it is now the largest serialized cost: 99 µs syncing the catalog
 mirror and 93 µs publishing the segment. That is what the memtable (4)
 removes.
 
+## Measured after 4
+
+ReleaseFast, 8 writers, 10 s runs interleaved with main (`81e1d96af5`) at
+load average 9-11:
+
+| | main | after |
+|---|---|---|
+| full text, 8 threads | 1,049–1,309/s | 1,486–1,870/s |
+| plain, 8 threads | 4,859–6,746/s | 8,527–10,777/s |
+| full text, 8 processes | 5 of 10 runs stalled | 0 of 10 stalled |
+| plain, 8 processes | 3,760–4,589/s | 2,974–5,889/s (noise) |
+
+Per full-text write (8 threads): installing the level-0 segment went from
+99 + 93 µs to 3 + 5 µs. The 8-process stalls were
+`TextMergeBackpressureTimeout`: a merge refused at the tip
+(`IndexScopeChanged`) was planned again from the same stale view while a
+producer waited for it; it now refreshes the index from the tip first.
+
+Next, from the same profile: groups now average about one write (each pays
+both redo barriers), full_index catch-up runs for writes not served inline,
+and merges run about once per six writes.
+
+## Measured after the review fixes and lane work
+
+ReleaseFast, 8 writers, 10 s full-text runs, each change interleaved with
+the build before it:
+
+| | 8 threads | 8 processes |
+|---|---|---|
+| after 4 | 1,486–1,870/s | 0 of 10 stalled |
+| merges ahead of the cap, small segments folded | 3,511–3,903/s | 2,445–2,838/s |
+| maintenance ride-alongs drive their group | 4,804–5,516/s | 2,487–2,790/s |
+| store mutex parks on a futex | 6,027–6,247/s | 2,393–2,830/s |
+| unverified ledger rebases | 5,662–6,271/s | 2,533–2,568/s |
+
+Merges kept the inline producer under its cap: level-0 records fold at a
+quarter of it, pressure starts at three quarters, and a pressured level-0
+merge also takes every segment below the floor size. Before that, tiered
+tiny segments filled the cap and about 15% of writes fell to replay.
+
+The writer lane was then 92% occupied. Maintenance turns held it about
+10 ms each: a maintenance snapshot forwards its writes to the foreground
+store, where its ride-along bookkeeping commits waited for a foreground
+leader that could not run while the turn held the lane. Forwarded
+ride-alongs now drive their own group, and turns hold the lane about 1 ms.
+Inside a writer's 167 µs hold, a third was the store mutex sleeping in
+100 µs steps behind a group apply; waiters now park on a futex.
+
+8 processes are bounded by the cross-process lease, which a process hands
+off only once its writes are durable. Summed over processes, holders keep
+it 78% of wall time: writes under it (180 µs each, 80 of them the fsync
+wait) take 49%, serving-runtime refreshes 18%, and the rest is handoff.
+Most refreshes reopen the runtime, because the 512 KiB redo log folds about
+every 180 full-text writes and a fold changes the physical roots. A 4 MiB
+log folded 8 times less often and did not change throughput, so the
+handoff rule, not the reopen, is the limit.
+
 ## Status
 
 | change | state |
@@ -193,6 +268,6 @@ removes.
 | 3. indexed writes overlap their wait (group commit) | committed |
 | 4a. level-0 encoding: CRC shortcut, profile split | committed |
 | 4b. `SegmentView` interface | committed |
-| 4. level-0 memtable | designed |
-| 5. bounded merges outside the lease | after 4 (the flush is the bounded merge) |
-| 6. incremental writer refresh | after 4 (the buffer rebuild is the refresh) |
+| 4. cheap level-0 publication, read admission | committed |
+| 5. bounded merges outside the lease | designed |
+| 6. incremental writer refresh | #1830; peer deltas wait for pending inline installs |

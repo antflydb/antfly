@@ -47,6 +47,10 @@ pub const Plan = struct {
     fingerprint: [32]u8,
     /// Borrow executable definitions from the pinned source; own only this directory.
     named_types: []const named_types.Record,
+    /// True when a covered column retains a NUMERIC precision/scale modifier.
+    /// This synthetic schema must declare the same flag the source table does,
+    /// or schema validation rejects the modifier it is carrying.
+    requires_numeric_modifiers: bool,
 
     pub fn init(alloc: Allocator, source_table: schema.TableSchema, source_layout: *const codec.PhysicalLayout, keys: []const native.RelationalIndexKey, includes: []const []const u8) !Plan {
         if (includes.len == 0 or includes.len > 256 or keys.len + includes.len > 288) return error.InvalidRelationalIndexDefinition;
@@ -140,10 +144,12 @@ pub const Plan = struct {
         }.less);
         const registry = try type_records.toOwnedSlice(alloc);
         errdefer alloc.free(registry);
-        const layout = try codec.PhysicalLayout.init(alloc, .{ .version = 1, .storage_mode = .relational, .requires_public_schema = registry.len != 0, .named_types = registry, .relational_columns = columns });
+        // A NUMERIC modifier is only legal on a schema that declares it is
+        // present; carrying the modifier without the flag fails validation.
+        const layout = try codec.PhysicalLayout.init(alloc, .{ .version = 1, .storage_mode = .relational, .requires_public_schema = registry.len != 0 or has_modifiers, .requires_numeric_modifiers = has_modifiers, .named_types = registry, .relational_columns = columns });
         var fingerprint: [32]u8 = undefined;
         hash.final(&fingerprint);
-        return .{ .alloc = alloc, .columns = columns, .ordinals = ordinals, .source_layout = source_layout, .layout = layout, .fingerprint = fingerprint, .named_types = registry };
+        return .{ .alloc = alloc, .columns = columns, .ordinals = ordinals, .source_layout = source_layout, .layout = layout, .fingerprint = fingerprint, .named_types = registry, .requires_numeric_modifiers = has_modifiers };
     }
 
     pub fn deinit(self: *Plan) void {
@@ -155,7 +161,7 @@ pub const Plan = struct {
     }
 
     pub fn table(self: *const Plan) schema.TableSchema {
-        return .{ .version = 1, .storage_mode = .relational, .requires_public_schema = self.named_types.len != 0, .named_types = self.named_types, .relational_columns = self.columns };
+        return .{ .version = 1, .storage_mode = .relational, .requires_public_schema = self.named_types.len != 0 or self.requires_numeric_modifiers, .requires_numeric_modifiers = self.requires_numeric_modifiers, .named_types = self.named_types, .relational_columns = self.columns };
     }
 
     pub fn contains(self: *const Plan, name: []const u8) bool {
@@ -241,7 +247,8 @@ test "relational index system NUMERIC modifiers fence cover payloads without cha
         .{ .name = "k", .path = "k", .column_type = .integer },
         .{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric, .numeric_modifier = .{ .precision = 4, .scale = 2 } },
     };
-    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    // A schema carrying a NUMERIC modifier declares it, as a SQL table does.
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_numeric_modifiers = true, .relational_columns = &columns };
     var layout = try codec.PhysicalLayout.init(a, table);
     defer layout.deinit();
     var first = try Plan.init(a, table, &layout, &.{.{ .column = "k" }}, &.{"n"});

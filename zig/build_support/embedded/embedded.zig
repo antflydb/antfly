@@ -622,6 +622,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi native close bounds proof work",
         "capi native text queries",
         "capi native replacement wait",
+        "capi native full-text index recreated",
         "capi graph replacement retains indexed serving edges",
         "capi native resolver maintenance retries",
         "capi native idle maintenance",

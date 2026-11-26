@@ -4792,6 +4792,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // connection gate) already released, so this call's fsync can
             // share a group with whatever other writers staged while this
             // one ran its own apply-lock-protected bookkeeping above.
+            var committed_primary_sequence: u64 = 0;
             if (primary_ticket) |ticket| {
                 const ticket_span = write_stage_profile.begin(.ticket_wait);
                 defer ticket_span.end();
@@ -4803,21 +4804,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // the first time (success or failure).
                 primary_ticket = null;
                 var owned_ticket = ticket;
-                // Regression-B test hook: a caller that wants this write's
-                // own commit sequence (`opts.committed_sequence_out`) waits
-                // via `waitSequence` instead of `wait` -- same contract,
-                // same one-shot free of the ticket's owned heap state,
-                // just also reporting which commit this was. See
-                // `execution_resources.zig`'s `committed_sequence_out` doc
-                // comment.
-                if (opts.committed_sequence_out) |sequence_out| {
-                    sequence_out.* = owned_ticket.waitSequence() catch |err| {
-                        // See the plain `wait()` branch below for why
-                        // `primary_committed` is corrected here too.
-                        if (opts.primary_committed) |committed| committed.* = false;
-                        return err;
-                    };
-                } else owned_ticket.wait() catch |err| {
+                // `waitSequence`: the same contract and one-shot free as
+                // `wait`, reporting which commit this was, for
+                // `opts.committed_sequence_out` (see `execution_resources.zig`)
+                // and for a resume on a replacement runtime.
+                committed_primary_sequence = owned_ticket.waitSequence() catch |err| {
                     // `opts.primary_committed` was set true as soon as this
                     // write was staged into the group (above), before this
                     // wait -- the one place that actually confirms the
@@ -4834,6 +4825,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (opts.primary_committed) |committed| committed.* = false;
                     return err;
                 };
+                if (opts.committed_sequence_out) |sequence_out| sequence_out.* = committed_primary_sequence;
             }
             // Relational/transactional surface counterpart: the hot-path
             // transaction-resolution commit (every ordinary commitTransaction/
@@ -4942,7 +4934,30 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     !S.ownerField(self, "core").*.index_manager.leann_replication and
                     (effective_req.sync_level != .full_index or S.ownerField(self, "text_merge_runtime").* != null) and
                     !S.ownerField(self, "core").*.hasGraphIndexes();
-                if (!finish_without_lane) _ = try hook.resume_after_indexed_wait.?(hook.ptr, false);
+                // Only a write whose remaining work is the derived visibility
+                // wait can finish on a replacement runtime; everything else
+                // below is owed to this one.
+                const replacement_shape: execution_resources.ReplacementShape = .{
+                    .shadow_apply = split_shadow_ticket != null,
+                    .child_range_dispatch = opts.document_child_range_dispatcher != null,
+                    .transaction_resolution = opts.transaction_resolution != null,
+                    .replication = durable_replication_batch_payload != null or durable_replication_replay_payload != null or
+                        deferred_replication_gates.gate_count != 0 or
+                        (!opts.bypass_replication_write_gate and S.ownerField(self, "local_execution").*.replication_write_gate != null),
+                    .caller_visibility_completion = opts.visibility_completion != null,
+                    .materialized_apply = append_derived_replay and !S.ownerField(self, "executor").*.hasWorkers(),
+                };
+                const replacement_continuation: execution_resources.ReplacementContinuation = .{
+                    .replay_sequence = if (append_derived_replay) sequence else 0,
+                    .sync_level = if (opts.wait_for_sync_level) effective_req.sync_level else .write,
+                    .enrichment_fully_precomputed = enrichment_fully_precomputed,
+                    .refresh_identity_visibility = queued_index_publication and pending_identity_visibility_summary != null,
+                    .targets = sync_targets,
+                };
+                const continuation = if (execution_resources.replacementContinuationEligible(replacement_shape)) &replacement_continuation else null;
+                if (comptime @import("builtin").is_test) if (!finish_without_lane) if (execution_resources.test_before_indexed_resume) |test_hook|
+                    test_hook.run(test_hook.ptr, continuation, committed_primary_sequence);
+                if (!finish_without_lane) _ = try hook.resume_after_indexed_wait.?(hook.ptr, false, continuation);
             }
             if (queued_index_publication and pending_identity_visibility_summary != null) {
                 try self.lockApplyForPortableRuntime();

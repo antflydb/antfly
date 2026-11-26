@@ -893,6 +893,13 @@ pub const HandleGuard = struct {
     /// Tracked separately from `guard.handle` because that field can be
     /// reassigned to a child table handle later in the same entry.
     lane_pinned_root: ?*Handle = null,
+    /// The runtime a resumed write continued on, when it was not the one it
+    /// was admitted on (`resumeWriterLaneAfterIndexedWait`).
+    resumed_root: ?*Handle = null,
+    /// What the resumed write still owes, when a replacement runtime can
+    /// finish it (`resumeWriterLaneAfterIndexedWait`).
+    /// Owned (`std.heap.c_allocator`); freed when the guard leaves.
+    replacement_continuation: ?@import("../storage/db/execution_resources.zig").ReplacementContinuation = null,
     /// Busy-wait budget left for this export call. The busy timeout bounds
     /// total admission waiting across every re-entry of one call (for
     /// example after inference), not each admission separately. Null means
@@ -1003,7 +1010,7 @@ pub const HandleGuard = struct {
         return true;
     }
 
-    fn resumeWriterLaneAfterIndexedWait(self: *HandleGuard, allow_new_runtime: bool) !bool {
+    fn resumeWriterLaneAfterIndexedWait(self: *HandleGuard, allow_new_runtime: bool, continuation: ?*const @import("../storage/db/execution_resources.zig").ReplacementContinuation) !bool {
         std.debug.assert(self.lane_managed and self.writer_lane_released);
         const connection = self.connection.?;
         const io = handleLockIo();
@@ -1020,11 +1027,32 @@ pub const HandleGuard = struct {
         // old runtime makes that a failure.
         if (!same_runtime and !allow_new_runtime) {
             lane.checkin(connection, root.owned_lite_backend.?.native_docstore.?);
+            // Kept past the commit path's frame for the export to finish the
+            // write on the replacement; without it the write reports stalled.
+            if (continuation) |owed| {
+                if (self.replacement_continuation) |*old| old.deinit(std.heap.c_allocator);
+                self.replacement_continuation = owed.clone(std.heap.c_allocator) catch null;
+            }
             return error.EnrichmentSourceChanged;
         }
         self.connection_gate_held = true;
         self.writer_lane_released = false;
+        if (!same_runtime) self.resumed_root = root;
         return same_runtime;
+    }
+
+    /// A committed write's remaining work was owed to the runtime it was
+    /// admitted on, which was replaced while it waited
+    /// (`EnrichmentSourceChanged` from the resume). When that work is only
+    /// the derived visibility wait (`ReplacementContinuation`), the
+    /// replacement, opened after the outgoing store drained and so holding
+    /// this commit, finishes it instead of the call reporting a stall.
+    pub fn finishCommittedOnCurrentRuntime(self: *HandleGuard, req: db_mod.types.BatchRequest) !void {
+        const continuation = if (self.replacement_continuation) |*owed| owed else return error.EnrichmentSourceChanged;
+        if (!self.lane_managed or !self.writer_lane_released) return error.EnrichmentSourceChanged;
+        _ = try self.resumeWriterLaneAfterIndexedWait(true, null);
+        const root = self.resumed_root orelse self.lane_pinned_root orelse return error.EnrichmentSourceChanged;
+        try root.database().finishBatchOnReplacementRuntime(req, continuation);
     }
 
     pub fn releaseWriterLaneBeforeWait(self: *HandleGuard) void {
@@ -1136,6 +1164,8 @@ pub const HandleGuard = struct {
 
     fn leaveWithRegistry(self: HandleGuard, comptime release_registry: bool) void {
         var guard = self;
+        if (guard.replacement_continuation) |*owed| owed.deinit(std.heap.c_allocator);
+        guard.replacement_continuation = null;
         defer if (release_registry) {
             if (guard.parent_slot) |slot| HandleRegistry.leave(slot);
             HandleRegistry.leave(guard.slot);
@@ -1293,9 +1323,9 @@ pub fn writerLaneHookFromGuard(guard: *HandleGuard) @import("../storage/db/execu
             }
         }.run,
         .resume_after_indexed_wait = struct {
-            fn run(ptr: *anyopaque, allow_new_runtime: bool) anyerror!bool {
+            fn run(ptr: *anyopaque, allow_new_runtime: bool, continuation: ?*const @import("../storage/db/execution_resources.zig").ReplacementContinuation) anyerror!bool {
                 const typed: *HandleGuard = @ptrCast(@alignCast(ptr));
-                return typed.resumeWriterLaneAfterIndexedWait(allow_new_runtime);
+                return typed.resumeWriterLaneAfterIndexedWait(allow_new_runtime, continuation);
             }
         }.run,
     };
@@ -1761,6 +1791,15 @@ pub fn trackedBatchWithWriterLaneHook(
             writer.retire(marker, if (named) |name| .{ .name = name, .id = database.core.identity_namespace.table_id } else null);
         return err;
     };
+}
+
+/// Whether a batch that failed after its primary write committed, because
+/// its runtime was replaced while it waited, reached its sync level on the
+/// replacement. Table handles keep the stalled report.
+fn committedOnReplacedRuntime(guard: *HandleGuard, handle: *Handle, err: anyerror, primary_committed: bool, req: db_mod.types.BatchRequest) bool {
+    if (!primary_committed or err != error.EnrichmentSourceChanged or handle.selected_db != null) return false;
+    guard.finishCommittedOnCurrentRuntime(req) catch return false;
+    return true;
 }
 
 /// C result for a failed batch, classified by the batch's own state: an
@@ -5560,7 +5599,9 @@ pub fn antfly_db_batch_json(
     defer receipt_scope.end();
     var primary_committed = false;
     // A table handle commits to its table's database, which holds the marker.
-    trackedBatchWithWriterLaneHook(handle.database(), db_mod.types.fromPublicMutation(owned.req), &primary_committed, handle.selected_table_name, writerLaneHookFromGuard(&guard)) catch |err| return batchFailureCode(err, primary_committed);
+    trackedBatchWithWriterLaneHook(handle.database(), db_mod.types.fromPublicMutation(owned.req), &primary_committed, handle.selected_table_name, writerLaneHookFromGuard(&guard)) catch |err| {
+        if (!committedOnReplacedRuntime(&guard, handle, err, primary_committed, db_mod.types.fromPublicMutation(owned.req))) return batchFailureCode(err, primary_committed);
+    };
     // Committed: a response failure must not read as a failed batch.
     const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch
         return capi.recordError(.stalled, "batch committed; its response could not be encoded; do not retry the batch");
@@ -5602,7 +5643,9 @@ pub fn antfly_db_batch_wire(
     defer receipt_scope.end();
     var primary_committed = false;
     const req = decoded.asRequest();
-    trackedBatchWithWriterLaneHook(handle.database(), db_mod.types.fromPublicMutation(req), &primary_committed, handle.selected_table_name, writerLaneHookFromGuard(&guard)) catch |err| return batchFailureCode(err, primary_committed);
+    trackedBatchWithWriterLaneHook(handle.database(), db_mod.types.fromPublicMutation(req), &primary_committed, handle.selected_table_name, writerLaneHookFromGuard(&guard)) catch |err| {
+        if (!committedOnReplacedRuntime(&guard, handle, err, primary_committed, db_mod.types.fromPublicMutation(req))) return batchFailureCode(err, primary_committed);
+    };
     const response = batch_api.encodeBatchResponse(std.heap.c_allocator, .{
         .inserted = @as(u32, @intCast(decoded.writes.len)),
         .deleted = @as(u32, @intCast(decoded.deletes.len)),
@@ -10785,6 +10828,8 @@ test "issue1015 concurrent Lite handles sustain primary writes and full-text cat
         const path = try std.fmt.allocPrintSentinel(alloc, "{s}/db-{d}.aflite", .{ directory.path(), ordinal }, 0);
         errdefer alloc.free(path);
         worker.* = .{ .path = path, .ordinal = ordinal, .start = &start };
+        // 8 MiB, like a default thread: a write that reopens the serving
+        // runtime opens it on a thread of its own (`callOnOpenStack`).
         thread.* = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Worker.run, .{worker});
         spawned += 1;
     }
@@ -11339,6 +11384,16 @@ fn testWriterLaneDurabilityWait(indexed: bool) !void {
             self.proceed.waitUncancelable(handleLockIo());
         }
     };
+    if (indexed) {
+        // A table's first row also writes its catalog's empty-to-populated
+        // transition, which keeps that one write off queued index
+        // publication (it installs the catalog under the apply lock). Seed
+        // a row so the probed write is an ordinary one.
+        const seed = "{\"inserts\":{\"seed\":{\"v\":\"seed\"}},\"sync_level\":\"write\"}";
+        var seed_output: capi.Buffer = .{};
+        defer antfly_buffer_free(&seed_output);
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(handle, .{ .ptr = seed.ptr, .len = seed.len }, &seed_output));
+    }
     var probe: Probe = .{};
     test_writer_lane_release_hook = .{ .ptr = &probe, .notify = Probe.notify };
     defer test_writer_lane_release_hook = null;
