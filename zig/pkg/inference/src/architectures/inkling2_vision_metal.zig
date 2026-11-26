@@ -54,13 +54,46 @@ fn workspaceCounts(geometry: Geometry) std.EnumArray(Temp, usize) {
     });
 }
 
+const WorkspacePlan = struct {
+    elements: std.EnumArray(Temp, usize),
+    offsets: std.EnumArray(Temp, usize) = .initFill(0),
+    bytes: usize = 0,
+
+    fn reserve(self: *WorkspacePlan, key: Temp, cursor: *usize) void {
+        const offset = std.mem.alignForward(usize, cursor.*, 256);
+        self.offsets.set(key, offset);
+        cursor.* = offset + self.elements.get(key) * @sizeOf(u16);
+        self.bytes = @max(self.bytes, cursor.*);
+    }
+
+    fn init(geometry: Geometry) WorkspacePlan {
+        var plan: WorkspacePlan = .{ .elements = workspaceCounts(geometry) };
+        var fixed: usize = 0;
+        plan.reserve(.hidden, &fixed);
+        plan.reserve(.normalized, &fixed);
+        plan.offsets.set(.update, plan.offsets.get(.normalized));
+
+        // These phases run in order in each frame. Keep their live operands
+        // disjoint within a phase and reuse the same space between phases.
+        var cursor = fixed;
+        plan.reserve(.patches, &cursor);
+        plan.reserve(.embedded, &cursor);
+        cursor = fixed;
+        for ([_]Temp{ .q, .k, .v, .attention }) |key| plan.reserve(key, &cursor);
+        cursor = fixed;
+        plan.reserve(.wide, &cursor);
+        plan.reserve(.merged, &cursor);
+        return plan;
+    }
+};
+
 pub const AdmissionBytes = struct { host: usize = 0, device: usize = 0 };
 
 pub fn admissionBytes(x: u32, y: u32) AdmissionBytes {
     const geometry = Geometry.fromDimensions(x, y);
     const rgb = @as(usize, x) * y * 3;
-    var device = rgb + @as(usize, geometry.mergedRows()) * schema.text_width * @sizeOf(u16);
-    for (workspaceCounts(geometry).values) |count| device += count * @sizeOf(u16);
+    const device = rgb + WorkspacePlan.init(geometry).bytes +
+        @as(usize, geometry.mergedRows()) * schema.text_width * @sizeOf(u16);
     // RGBA decoding and the composited RGB image can be live together.
     return .{ .host = @as(usize, x) * y * 4 + rgb, .device = device };
 }
@@ -141,11 +174,14 @@ pub const Vision = struct {
         var rgb_buffer = try Tensor.deviceAllocateTyped(a, runtime, .u8, .shared, &.{@intCast(rgb.len)});
         defer rgb_buffer.deinit();
         try rgb_buffer.uploadBytes(rgb);
+        const plan = WorkspacePlan.init(geometry);
+        var arena = try allocate(a, runtime, plan.bytes / @sizeOf(u16), .private);
+        defer arena.deinit();
         var scratch: Buffers(Temp) = undefined;
         var initialized: usize = 0;
         defer for (scratch.values[0..initialized]) |*tensor| tensor.deinit();
-        for (&scratch.values, workspaceCounts(geometry).values) |*tensor, elements| {
-            tensor.* = try allocate(a, runtime, elements, .private);
+        for (&scratch.values, plan.elements.values, plan.offsets.values) |*tensor, elements, offset| {
+            tensor.* = try arena.retainedTypedView(offset, &.{@intCast(elements)}, .i16);
             initialized += 1;
         }
         var output = try allocate(a, runtime, @as(usize, merged_rows) * schema.text_width, .private);
@@ -203,4 +239,69 @@ pub const Vision = struct {
 fn project(runtime: *Runtime, rows: u32, in: u32, out: u32, input: *const Tensor, weights: *const Tensor, bias: ?*const Tensor, output: *Tensor) !void {
     const projection: metal.DenseBf16Projection = .{ .rows = rows, .input_width = in, .output_width = out };
     try projection.encodeWithBias(runtime, input, weights, bias, output);
+}
+
+test "Inkling Metal vision publishes projected rows from its admitted arena" {
+    if (!@import("build_options").enable_metal or !metal.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var provider = try @import("../backends/metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+
+    const Fixture = struct {
+        fn view(backing: *const Tensor, shape: []const i64) !Tensor {
+            var elements: i32 = 1;
+            for (shape) |extent| elements *= @intCast(extent);
+            return backing.retainedTypedView(0, &.{elements}, .i16);
+        }
+    };
+    const elements = inner * width * 4;
+    const data = try a.alloc(u16, elements);
+    defer a.free(data);
+    @memset(data, 0);
+    var zeros = try allocate(a, runtime, elements, .shared);
+    defer zeros.deinit();
+    try zeros.uploadBytes(std.mem.sliceAsBytes(data));
+    var marker = try allocate(a, runtime, elements, .shared);
+    defer marker.deinit();
+    data[0] = 0x3f80;
+    try marker.uploadBytes(std.mem.sliceAsBytes(data));
+
+    var vision: Vision = undefined;
+    var loaded: usize = 0;
+    defer for (vision.weights.values[0..loaded]) |*value| value.deinit();
+    for (std.enums.values(Weight), &vision.weights.values) |key, *value| {
+        const source = switch (key) {
+            .pre_bias, .in, .out => &marker,
+            else => &zeros,
+        };
+        value.* = try Fixture.view(source, schema.model_tensors.get(key).shape);
+        loaded += 1;
+    }
+    var layers_loaded: usize = 0;
+    defer for (vision.layers[0..layers_loaded]) |*layer| for (&layer.values) |*weight| weight.deinit();
+    for (&vision.layers) |*layer| {
+        var count: usize = 0;
+        errdefer for (layer.values[0..count]) |*weight| weight.deinit();
+        for (&layer.values, schema.layer_tensors.values) |*value, definition| {
+            value.* = try Fixture.view(&zeros, definition.shape);
+            count += 1;
+        }
+        layers_loaded += 1;
+    }
+
+    const rgb: [40 * 40 * 3]u8 = @splat(64);
+    const before = tensors.memoryStatsSnapshot();
+    var output = try vision.encodeRgb(a, runtime, &rgb, 40, 40);
+    defer output.tensor.deinit();
+    const after = tensors.memoryStatsSnapshot();
+    // RGB ingress and transient arena retire after the frame. The returned
+    // embedding has independent storage and does not retain either one.
+    try std.testing.expectEqual(@as(u64, 3), after.device_owned_buffers_created - before.device_owned_buffers_created);
+    try std.testing.expectEqual(@as(u32, 1), output.rows);
+    try std.testing.expectEqual(@as(u64, schema.text_width * @sizeOf(u16)), after.device_owned_live_bytes - before.device_owned_live_bytes);
+    var values: [schema.text_width]u16 = undefined;
+    try output.tensor.downloadBytesInto(std.mem.asBytes(&values));
+    try std.testing.expectEqual(@as(u16, 0x3f57), values[0]); // GELU(1), rounded to BF16.
+    try std.testing.expectEqual(@as([schema.text_width - 1]u16, @splat(0)), values[1..].*);
 }

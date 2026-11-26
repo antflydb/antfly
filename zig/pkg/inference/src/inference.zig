@@ -513,4 +513,6 @@ test {
     _ = @import("architectures/inkling2_endpoints_metal.zig");
     _ = @import("architectures/inkling2_residual_metal.zig");
     _ = @import("architectures/inkling2_decoder_metal.zig");
+    _ = @import("architectures/inkling2_session_metal.zig");
+    _ = @import("architectures/inkling2_vision_metal.zig");
 }
