@@ -1653,8 +1653,21 @@ fn runConcreteObservedWithOutputs(
         break :declared inputs;
     } else null;
     const host_count = if (declared_inputs) |values| values.len else 0;
-    const dynamic_inputs = try allocator.alloc(RuntimeInput, live_dynamic_count - host_count);
-    defer allocator.free(dynamic_inputs);
+    const dynamic_count = live_dynamic_count - host_count;
+    const static_count = self.static_runtime_inputs.len;
+    var stack_inputs: [32]RuntimeInput = undefined;
+    var heap_inputs: ?[]RuntimeInput = null;
+    defer if (heap_inputs) |inputs| allocator.free(inputs);
+    const merged_inputs: ?[]RuntimeInput = if (dynamic_count == 0) null else merged: {
+        const count = try std.math.add(usize, static_count, dynamic_count);
+        const inputs = if (count <= stack_inputs.len) stack_inputs[0..count] else heap: {
+            heap_inputs = try allocator.alloc(RuntimeInput, count);
+            break :heap heap_inputs.?;
+        };
+        @memcpy(inputs[0..static_count], self.static_runtime_inputs);
+        break :merged inputs;
+    };
+    const dynamic_inputs = if (merged_inputs) |inputs| inputs[static_count..] else stack_inputs[0..0];
 
     var imported_count: usize = 0;
     errdefer {
@@ -1679,12 +1692,6 @@ fn runConcreteObservedWithOutputs(
         imported_count += 1;
     }
 
-    const merged_inputs = if (dynamic_inputs.len == 0) null else try allocator.alloc(RuntimeInput, self.static_runtime_inputs.len + dynamic_inputs.len);
-    defer if (merged_inputs) |inputs| allocator.free(inputs);
-    if (merged_inputs) |inputs| {
-        @memcpy(inputs[0..self.static_runtime_inputs.len], self.static_runtime_inputs);
-        @memcpy(inputs[self.static_runtime_inputs.len..], dynamic_inputs);
-    }
     const runtime_inputs: []const RuntimeInput = merged_inputs orelse self.static_runtime_inputs;
     const sdpa_mask = if (host_inputs) |inputs| findSdpaMask(inputs) else null;
 

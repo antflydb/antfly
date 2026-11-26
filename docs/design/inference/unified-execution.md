@@ -1569,6 +1569,13 @@ same-binary controls exceeded the allowed drift.
 | Gemma 4 audio | −15.3% | −12.5% | Yes |
 | Gemma 4 video | −25.5% | −11.1% | Yes |
 
+The isolated GLiNER2.5 and DECIDE repeat used 40 warm observations per
+binary and mode. All outputs matched and all 24 receipts selected
+Native. DECIDE passed, with p50 594.79 → 610.92 ms and p95
+611.90 → 628.19 ms. GLiNER2.5 measured p50 81.84 → 72.35 ms and p95
+86.16 → 87.09 ms. Its main control drifted 7.98% at p50, so the
+reversal of the initial median increase remains inconclusive.
+
 The default library path selected EmbeddingGemma2's F32 audio fallback.
 The previous reference used the source BF16 recipe with cuDNN 9.19.
 On frozen main, the same text request returned all 768 coordinates
