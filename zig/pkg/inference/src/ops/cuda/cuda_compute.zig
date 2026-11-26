@@ -23117,8 +23117,22 @@ fn allocUninitF32ShapeOp(ctx: *anyopaque, shape_i32: []const i32) anyerror!?CT {
     }
     const byte_len = try checkedMul(elem_count, @sizeOf(f32));
     var device = try allocDeviceBuffer(self, byte_len);
-    errdefer device.free(&self.ctx);
+    errdefer releaseDeviceBuffer(self, &device);
     return try createTensor(self, device, shape, elem_count);
+}
+
+test "CUDA uninitialized output retires scoped scratch when tensor metadata allocation fails" {
+    const workspace = @import("../../execution/stream_workspace.zig");
+    var plan: workspace.Plan = .{};
+    try plan.declareScratch(32);
+    const layout = try plan.layout(0);
+    var scope = try workspace.Scope.bind(&plan, layout, 0x1000, layout.bytes);
+    var allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var compute = metadataOnlyTestCompute();
+    compute.allocator = allocator.allocator();
+    compute.execution_scope = &scope;
+    try std.testing.expectError(error.OutOfMemory, allocUninitF32ShapeOp(&compute, &.{ 2, 4 }));
+    try std.testing.expect(scope.complete());
 }
 
 fn gatherDeviceColumnsOp(ctx: *anyopaque, columns: []const ops.KernelBackend.DeviceRowColumn) !bool {
