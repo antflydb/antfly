@@ -32393,6 +32393,7 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
     }
     const chunk128 = module.useChunk128(self.lighton_attention_chunk128, heads);
     const planned_tokens = if (self.bounded_decode_graph.active) self.bounded_decode_graph.future_tokens else max_tokens;
+    if (planned_tokens < max_tokens) return error.InvalidExecutionPlan;
     const scratch_layout = module.ScratchLayout.init(views.len, heads, kv_heads, dim, planned_tokens, chunk128) catch return null;
     params.chunks = scratch_layout.chunks;
     if (self.bounded_decode_graph.active) {
@@ -32404,7 +32405,7 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
     try self.lighton_attention.init(&self.ctx);
     const shape = try allocShape2(self.allocator, views.len, width);
     errdefer self.allocator.free(shape);
-    var output = try allocDeviceBuffer(self, views.len * width * 4);
+    var output = try allocDeviceBuffer(self, scratch_layout.output_elements * @sizeOf(f32));
     errdefer releaseDeviceBuffer(self, &output);
     var scratch = try allocDeviceBuffer(self, scratch_layout.bytes);
     defer releaseDeviceBuffer(self, &scratch);
@@ -32482,7 +32483,7 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
     self.stats.device_kv_batch_steps += 1;
     self.stats.device_kv_batch_items += views.len;
     self.stats.device_kv_successes += 1;
-    return createTensor(self, output, shape, views.len * width);
+    return createTensor(self, output, shape, scratch_layout.output_elements);
 }
 
 /// Ordinary F32 singleton into a batch parent's exact output subspan. The

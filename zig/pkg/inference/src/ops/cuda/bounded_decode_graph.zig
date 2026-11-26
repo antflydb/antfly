@@ -997,6 +997,7 @@ test "batched CUDA attention scratch packs exact chunk values and statistics" {
         const layout = try ScratchLayout.init(64, 8, 2, 256, 129, chunk128);
         const partial_rows = 64 * 8 * chunks;
         try std.testing.expectEqual(chunks, layout.chunks);
+        try std.testing.expectEqual(@as(usize, 64 * 8 * 256), layout.output_elements);
         try std.testing.expectEqual(partial_rows * 256 * 4, layout.statistics_offset);
         try std.testing.expectEqual(partial_rows * 258 * 4, layout.bytes);
         try std.testing.expectEqual(@as(usize, 0), layout.statistics_offset % 256);

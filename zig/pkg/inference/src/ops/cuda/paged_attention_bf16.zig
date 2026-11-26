@@ -41,6 +41,7 @@ pub fn useChunk128(requested: ?bool, heads: usize) bool {
 /// The partial values and their softmax statistics have the same lifetime.
 pub const ScratchLayout = struct {
     chunks: u32,
+    output_elements: usize,
     statistics_offset: usize,
     bytes: usize,
 
@@ -53,6 +54,7 @@ pub const ScratchLayout = struct {
         const bytes = try std.math.mul(usize, partial_rows, (dim + 2) * @sizeOf(f32));
         return .{
             .chunks = @intCast(chunks),
+            .output_elements = rows * heads * dim,
             .statistics_offset = partial_rows * dim * @sizeOf(f32),
             .bytes = bytes,
         };
