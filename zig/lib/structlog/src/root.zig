@@ -63,17 +63,7 @@ pub fn logFn(
 
     // Format the message into the log line directly
     switch (global_formatter) {
-        .json => {
-            writer.writeAll("{\"ts\":\"") catch return;
-            writeTimestamp(writer) catch return;
-            writer.writeAll("\",\"level\":\"") catch return;
-            writer.writeAll(@tagName(message_level)) catch return;
-            writer.writeAll("\",\"scope\":\"") catch return;
-            writer.writeAll(scope_name) catch return;
-            writer.writeAll("\",\"msg\":\"") catch return;
-            writer.print(format, args) catch return;
-            writer.writeAll("\"}\n") catch return;
-        },
+        .json => writeJsonLog(writer, message_level, scope_name, format, args) catch return,
         .text => {
             writeTimestamp(writer) catch return;
             writer.writeByte(' ') catch return;
@@ -90,6 +80,32 @@ pub fn logFn(
             writer.writeByte('\n') catch return;
         },
     }
+}
+
+fn writeJsonLog(writer: *std.Io.Writer, level: std.log.Level, scope: []const u8, comptime pattern: []const u8, args: anytype) !void {
+    try writer.writeAll("{\"ts\":\"");
+    try writeTimestamp(writer);
+    try writer.writeAll("\",\"level\":\"");
+    try writer.writeAll(@tagName(level));
+    try writer.writeAll("\",\"scope\":\"");
+    try json_formatter.writeJsonEscaped(writer, scope);
+    try writer.writeAll("\",\"msg\":\"");
+    try json_formatter.printEscaped(writer, pattern, args);
+    try writer.writeAll("\"}\n");
+}
+
+test "JSON log compatibility keeps structured diagnostic messages on one valid line" {
+    var buffer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer buffer.deinit();
+    const scope = "diagnostics\"scope";
+    const payload = "{\"decoded\":\"turn\\end\"}\n\x01";
+    try writeJsonLog(&buffer.writer, .info, scope, "execution_diagnostics {s} {d:0>4}", .{ payload, 3 });
+    const line = buffer.written();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, line, "\n"));
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, line, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(scope, parsed.value.object.get("scope").?.string);
+    try std.testing.expectEqualStrings("execution_diagnostics " ++ payload ++ " 0003", parsed.value.object.get("msg").?.string);
 }
 
 fn writeTimestamp(writer: *std.Io.Writer) !void {
@@ -178,15 +194,15 @@ pub const Logger = struct {
         try writer.writeAll("\",\"level\":\"");
         try writer.writeAll(@tagName(level));
         try writer.writeAll("\",\"scope\":\"");
-        try writer.writeAll(self.scope_name);
+        try json_formatter.writeJsonEscaped(writer, self.scope_name);
         try writer.writeAll("\",\"msg\":\"");
-        try writer.writeAll(msg);
+        try json_formatter.writeJsonEscaped(writer, msg);
         try writer.writeByte('"');
 
         // Write base fields
         for (self.fields) |f| {
             try writer.writeAll(",\"");
-            try writer.writeAll(f.key);
+            try json_formatter.writeJsonEscaped(writer, f.key);
             try writer.writeAll("\":");
             try f.writeJsonValue(writer);
         }
@@ -196,10 +212,10 @@ pub const Logger = struct {
         const extra_info = @typeInfo(ExtraType);
         switch (extra_info) {
             .@"struct" => |s| {
-                inline for (s.fields) |f| {
-                    const field = structFieldToLogField(f.name, @field(extra_fields, f.name));
+                inline for (s.field_names) |field_name| {
+                    const field = structFieldToLogField(field_name, @field(extra_fields, field_name));
                     try writer.writeAll(",\"");
-                    try writer.writeAll(field.key);
+                    try json_formatter.writeJsonEscaped(writer, field.key);
                     try writer.writeAll("\":");
                     try field.writeJsonValue(writer);
                 }
@@ -208,7 +224,7 @@ pub const Logger = struct {
                 .array => {
                     for (extra_fields) |f| {
                         try writer.writeAll(",\"");
-                        try writer.writeAll(f.key);
+                        try json_formatter.writeJsonEscaped(writer, f.key);
                         try writer.writeAll("\":");
                         try f.writeJsonValue(writer);
                     }
@@ -248,8 +264,8 @@ pub const Logger = struct {
         const extra_info = @typeInfo(ExtraType);
         switch (extra_info) {
             .@"struct" => |s| {
-                inline for (s.fields) |f| {
-                    const field = structFieldToLogField(f.name, @field(extra_fields, f.name));
+                inline for (s.field_names) |field_name| {
+                    const field = structFieldToLogField(field_name, @field(extra_fields, field_name));
                     try writer.writeByte(' ');
                     try writer.writeAll(field.key);
                     try writer.writeByte('=');

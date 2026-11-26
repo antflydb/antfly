@@ -84,8 +84,12 @@ fn civilFromDays(z_arg: i32) CivilDate {
     return .{ .year = if (m <= 2) y + 1 else y, .month = m, .day = d };
 }
 
-fn writeJsonEscaped(writer: *std.Io.Writer, s: []const u8) !void {
-    for (s) |c| {
+pub fn writeJsonEscaped(writer: *std.Io.Writer, s: []const u8) !void {
+    var start: usize = 0;
+    for (s, 0..) |c, index| {
+        if (c >= 0x20 and c != '"' and c != '\\') continue;
+        try writer.writeAll(s[start..index]);
+        start = index + 1;
         switch (c) {
             '"' => try writer.writeAll("\\\""),
             '\\' => try writer.writeAll("\\\\"),
@@ -93,15 +97,35 @@ fn writeJsonEscaped(writer: *std.Io.Writer, s: []const u8) !void {
             '\r' => try writer.writeAll("\\r"),
             '\t' => try writer.writeAll("\\t"),
             else => {
-                if (c < 0x20) {
-                    try writer.print("\\u{x:0>4}", .{c});
-                } else {
-                    try writer.writeByte(c);
-                }
+                try writer.print("\\u{x:0>4}", .{c});
             },
         }
     }
+    try writer.writeAll(s[start..]);
 }
+
+/// Format and escape a JSON string body without an intermediate allocation.
+pub fn printEscaped(writer: *std.Io.Writer, comptime pattern: []const u8, args: anytype) !void {
+    var escaping: EscapingWriter = .{ .target = writer };
+    try escaping.writer.print(pattern, args);
+}
+
+const EscapingWriter = struct {
+    target: *std.Io.Writer,
+    writer: std.Io.Writer = .{ .buffer = &.{}, .vtable = &.{ .drain = drain } },
+
+    fn drain(writer: *std.Io.Writer, chunks: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *EscapingWriter = @fieldParentPtr("writer", writer);
+        var consumed: usize = 0;
+        for (chunks[0 .. chunks.len - 1]) |bytes| {
+            try writeJsonEscaped(self.target, bytes);
+            consumed += bytes.len;
+        }
+        const pattern = chunks[chunks.len - 1];
+        for (0..splat) |_| try writeJsonEscaped(self.target, pattern);
+        return consumed + pattern.len * splat;
+    }
+};
 
 test "json_formatter: basic output" {
     var w: std.Io.Writer.Allocating = .init(std.testing.allocator);
