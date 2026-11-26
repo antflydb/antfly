@@ -1184,8 +1184,8 @@ The legacy decoder and audio recipe gates remain open.
 
 At `41237da4cc`, both the BERT and stateful decoder fixtures passed shared
 preparation and output parity on Native CPU and physical Metal using ONNX,
-Safetensors, GGUF and Q8 artifacts. The corresponding CUDA cases were
-skipped in this local run.
+Safetensors, GGUF and Q8 artifacts. The two CUDA fixtures also passed on
+Spark GB10 at `35c208ee25`, completing this cross-provider fixture cohort.
 
 A Spark GB10 loopback HTTP run at the same revision selected CUDA using
 the default Inkling checkpoint directory. With execution diagnostics
