@@ -53477,12 +53477,12 @@ test "Metal paged relative attention resolves the final token of a packed millio
     const pages = context / page_tokens;
     const words = 33;
     const attention: PagedRelativeBf16Attention = .{
-        .query = .{ .rows = 1, .start = context - 1, .q_heads = 3, .kv_heads = 1, .relative_extent = 0, .score_scale = 1.0 / @sqrt(128.0) },
+        .query = .{ .rows = 2, .start = context - 2, .q_heads = 3, .kv_heads = 1, .relative_extent = 0, .score_scale = 1.0 / @sqrt(128.0) },
         .range = .{ .first_page = 0, .page_count = pages, .physical_pages = pages, .page_tokens = page_tokens, .visible_start = 0, .visible_end = context },
         .format = .q4_head128,
     };
     const dtypes: [8]metal_tensor.DType = .{ .i16, .i16, .i16, .i32, .i16, .i16, .f32, .i16 };
-    const sizes: [8]i32 = .{ 384, context * words, context * words, pages, 3, 384, try attention.scratchElements(), 384 };
+    const sizes: [8]i32 = .{ 768, context * words, context * words, pages, 6, 768, try attention.scratchElements(), 768 };
     var tensors: [8]MetalTensor = undefined;
     var initialized: usize = 0;
     defer for (tensors[0..initialized]) |*tensor| tensor.deinit();
@@ -53490,10 +53490,10 @@ test "Metal paged relative attention resolves the final token of a packed millio
         tensor.* = try MetalTensor.deviceAllocateTyped(a, runtime, dtype, .shared, &.{size});
         initialized += 1;
     }
-    const zero: [384]u16 = @splat(0);
-    const query: [384]u16 = @splat(0x3f80);
+    const zero: [768]u16 = @splat(0);
+    const query: [768]u16 = @splat(0x3f80);
     try tensors[0].uploadBytes(std.mem.asBytes(&query));
-    try tensors[4].uploadBytes(std.mem.asBytes(&[_]u16{ 0, 0, 0 }));
+    try tensors[4].uploadBytes(std.mem.asBytes(&[_]u16{ 0, 0, 0, 0, 0, 0 }));
     try tensors[5].uploadBytes(std.mem.asBytes(&zero));
 
     // Reverse the final two physical pages and put the only strong key at the
@@ -53526,9 +53526,10 @@ test "Metal paged relative attention resolves the final token of a packed millio
     }, &tensors[6], &tensors[7]);
     try submitFrame(runtime);
     try waitFrame(runtime);
-    var output: [384]u16 = undefined;
+    var output: [768]u16 = undefined;
     try tensors[7].downloadBytesInto(std.mem.asBytes(&output));
-    try std.testing.expectEqual(@as([384]u16, @splat(0x4040)), output);
+    try std.testing.expectEqual(@as([384]u16, @splat(0)), output[0..384].*);
+    try std.testing.expectEqual(@as([384]u16, @splat(0x4040)), output[384..].*);
 }
 
 /// Runs the projected attention operands through the causal K/V stencils and

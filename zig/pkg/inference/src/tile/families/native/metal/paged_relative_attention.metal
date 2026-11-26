@@ -33,7 +33,7 @@ inline float4 antfly_relative_kv_head(device const ushort *storage, ulong head, 
     return float4(float(values[0]), float(values[32]), float(values[64]), float(values[96]));
 }
 
-template <bool compressed, uint heads>
+template <bool compressed, uint heads, uint rows = 1>
 inline void antfly_paged_relative_gqa_d128_partial(
     device const bfloat *query,
     device const ushort *keys,
@@ -45,58 +45,77 @@ inline void antfly_paged_relative_gqa_d128_partial(
     uint2 group,
     uint lane
 ) {
-    const uint row_head = group.x * heads;
+    const uint groups_per_row = p.q_heads / heads;
+    const uint row_head = rows == 1u ? group.x * heads :
+        (group.x / groups_per_row) * rows * p.q_heads + (group.x % groups_per_row) * heads;
+    const uint batch_row = row_head / p.q_heads;
     const uint head = row_head % p.q_heads;
     const uint kv_head = head / (p.q_heads / p.kv_heads);
-    const uint position = p.start + row_head / p.q_heads;
-    const uint end = position + 1u;
-    const uint first = max(p.visible_start, p.window != 0u && end > p.window ? end - p.window : 0u);
-    // Give a query identical reduction boundaries when its row is run
-    // alone or in any prefill batch. The dispatch still uses the maximum
-    // split count so every row has the same scratch stride.
-    const uint live = max(end - first, 1u);
-    const uint row_splits = min(p.splits, (live - 1u) / 128u + 1u);
-    const uint keys_per_split = (live - 1u) / row_splits + 1u;
-    const uint begin = first + group.y * keys_per_split;
-    const uint limit = min(end, begin + keys_per_split);
-    float4 q[heads], numerator[heads];
-    float maximum[heads], denominator[heads];
+    uint begin[rows], limit[rows];
+    uint first_key = ~0u;
+    uint last_key = 0u;
+    // Each row retains its original split boundary and accumulation order.
     #pragma unroll
-    for (uint h = 0u; h < heads; ++h) {
-        const ulong q_base = ulong(row_head + h) * 128u + lane;
+    for (uint r = 0u; r < rows; ++r) {
+        const uint end = p.start + batch_row + r + 1u;
+        const uint first = max(p.visible_start, p.window != 0u && end > p.window ? end - p.window : 0u);
+        const uint live = max(end - first, 1u);
+        const uint row_splits = min(p.splits, (live - 1u) / 128u + 1u);
+        const uint keys_per_split = (live - 1u) / row_splits + 1u;
+        begin[r] = first + group.y * keys_per_split;
+        limit[r] = min(end, begin[r] + keys_per_split);
+        if (rows == 1u) {
+            first_key = begin[r];
+            last_key = limit[r];
+        } else if (begin[r] < limit[r]) {
+            first_key = min(first_key, begin[r]);
+            last_key = max(last_key, limit[r]);
+        }
+    }
+    float4 q[heads * rows], numerator[heads * rows];
+    float maximum[heads * rows], denominator[heads * rows];
+    #pragma unroll
+    for (uint h = 0u; h < heads * rows; ++h) {
+        const ulong q_base = ulong(row_head + (h / heads) * p.q_heads + h % heads) * 128u + lane;
         for (uint i = 0; i < 4; ++i) q[h][i] = float(query[q_base + i * 32u]);
         numerator[h] = float4(0.0f);
         maximum[h] = -INFINITY;
         denominator[h] = 0.0f;
     }
-    for (uint pos = begin; pos < limit; ++pos) {
-        const uint index = pos / p.page_tokens - p.first_page;
+    for (uint next_key = first_key; next_key < last_key;) {
+        const uint index = next_key / p.page_tokens - p.first_page;
+        const uint in_page = next_key % p.page_tokens;
+        const uint first = next_key;
+        next_key = min(last_key, first + p.page_tokens - in_page);
         if (index >= p.page_count) continue;
         const uint page = page_ids[index];
         if (page >= p.physical_pages) continue;
-        const ulong row = ulong(page) * p.page_tokens + pos % p.page_tokens;
-        const ulong stored_head = row * p.kv_heads + kv_head;
-        const float4 key = antfly_relative_kv_head<compressed>(keys, stored_head, lane);
-        const float4 value = antfly_relative_kv_head<compressed>(values, stored_head, lane);
-        const uint distance = position - pos;
-        #pragma unroll
-        for (uint h = 0u; h < heads; ++h) {
-            float dot = 0.0f;
-            for (uint i = 0u; i < 4u; ++i) dot = fma(q[h][i], key[i], dot);
-            const float reduced = simd_sum(dot);
-            const float bias = distance < p.relative_extent ? float(relative[ulong(row_head + h) * p.relative_extent + distance]) : 0.0f;
-            const float score = reduced * p.score_scale + bias;
-            const float next_max = max(maximum[h], score);
-            const float retain = exp(maximum[h] - next_max);
-            const float add = exp(score - next_max);
-            denominator[h] = fma(denominator[h], retain, add);
-            numerator[h] = fma(float4(add), value, numerator[h] * retain);
-            maximum[h] = next_max;
+        ulong stored_head = (ulong(page) * p.page_tokens + in_page) * p.kv_heads + kv_head;
+        for (uint pos = first; pos < next_key; ++pos, stored_head += p.kv_heads) {
+            const float4 key = antfly_relative_kv_head<compressed>(keys, stored_head, lane);
+            const float4 value = antfly_relative_kv_head<compressed>(values, stored_head, lane);
+            #pragma unroll
+            for (uint h = 0u; h < heads * rows; ++h) {
+                const uint r = h / heads;
+                if (rows > 1 && (pos < begin[r] || pos >= limit[r])) continue;
+                const uint distance = p.start + batch_row + r - pos;
+                float dot = 0.0f;
+                for (uint i = 0u; i < 4u; ++i) dot = fma(q[h][i], key[i], dot);
+                const float reduced = simd_sum(dot);
+                const float bias = distance < p.relative_extent ? float(relative[ulong(row_head + (h / heads) * p.q_heads + h % heads) * p.relative_extent + distance]) : 0.0f;
+                const float score = reduced * p.score_scale + bias;
+                const float next_max = max(maximum[h], score);
+                const float retain = exp(maximum[h] - next_max);
+                const float add = exp(score - next_max);
+                denominator[h] = fma(denominator[h], retain, add);
+                numerator[h] = fma(float4(add), value, numerator[h] * retain);
+                maximum[h] = next_max;
+            }
         }
     }
     #pragma unroll
-    for (uint h = 0u; h < heads; ++h) {
-        const ulong dst = (ulong(row_head + h) * p.splits + group.y) * 130u;
+    for (uint h = 0u; h < heads * rows; ++h) {
+        const ulong dst = (ulong(row_head + (h / heads) * p.q_heads + h % heads) * p.splits + group.y) * 130u;
         for (uint i = 0u; i < 4u; ++i) partials[dst + i * 32u + lane] = numerator[h][i];
         if (lane == 0u) {
             partials[dst + 128u] = maximum[h];
@@ -219,4 +238,34 @@ kernel void antfly_paged_relative_gqa_d128_q4_partial_reuse3(
     uint lane [[thread_index_in_simdgroup]]
 ) {
     antfly_paged_relative_gqa_d128_partial<true, 3>(query, keys, values, relative, page_ids, partials, p, group, lane);
+}
+
+// native-program:entry antfly_paged_relative_gqa_d128_bf16_partial_reuse3_rows2
+kernel void antfly_paged_relative_gqa_d128_bf16_partial_reuse3_rows2(
+    device const bfloat *query [[buffer(0)]],
+    device const ushort *keys [[buffer(1)]],
+    device const ushort *values [[buffer(2)]],
+    device const bfloat *relative [[buffer(3)]],
+    device const uint *page_ids [[buffer(4)]],
+    device float *partials [[buffer(5)]],
+    constant PagedRelativeGqaParams &p [[buffer(6)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    antfly_paged_relative_gqa_d128_partial<false, 3, 2>(query, keys, values, relative, page_ids, partials, p, group, lane);
+}
+
+// native-program:entry antfly_paged_relative_gqa_d128_q4_partial_reuse3_rows2
+kernel void antfly_paged_relative_gqa_d128_q4_partial_reuse3_rows2(
+    device const bfloat *query [[buffer(0)]],
+    device const ushort *keys [[buffer(1)]],
+    device const ushort *values [[buffer(2)]],
+    device const bfloat *relative [[buffer(3)]],
+    device const uint *page_ids [[buffer(4)]],
+    device float *partials [[buffer(5)]],
+    constant PagedRelativeGqaParams &p [[buffer(6)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    antfly_paged_relative_gqa_d128_partial<true, 3, 2>(query, keys, values, relative, page_ids, partials, p, group, lane);
 }
