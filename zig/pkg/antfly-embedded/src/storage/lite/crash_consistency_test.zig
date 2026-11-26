@@ -311,6 +311,7 @@ pub fn runCrashSweep(allocator: Allocator, scenario: Scenario, opts: SweepOption
         for (combos) |combo| {
             report.runs += 1;
             const maybe_failure = runOneCrash(allocator, scenario, std.testing.io, combo.barrier_seq, combo.when, combo.power_loss) catch |err| blk: {
+                dumpHarnessErrorTrace(scenario, combo.barrier_seq, err, @errorReturnTrace());
                 const placeholder = Barrier{ .sequence = combo.barrier_seq, .kind = .file_sync, .path = "" };
                 break :blk try makeFailure(allocator, placeholder, combo.when, combo.power_loss, "scenario={s} harness error: {s}", .{ scenario.name, @errorName(err) });
             };
@@ -461,10 +462,19 @@ const ReplayTask = struct {
 
         self.result.failure = runOneCrash(self.allocator, self.scenario, threaded.io(), self.combo.barrier_seq, self.combo.when, self.combo.power_loss) catch |err| {
             self.result.harness_err = err;
+            dumpHarnessErrorTrace(self.scenario, self.combo.barrier_seq, err, @errorReturnTrace());
             return;
         };
     }
 };
+
+/// A harness error is not a crash outcome, so the report names only the
+/// error; print where it came from, since that thread's trace is gone once
+/// the sweep moves on.
+fn dumpHarnessErrorTrace(scenario: Scenario, barrier_seq: u64, err: anyerror, trace: ?*std.builtin.StackTrace) void {
+    std.debug.print("crash sweep harness error: scenario={s} barrier={d} err={s}\n", .{ scenario.name, barrier_seq, @errorName(err) });
+    if (trace) |t| std.debug.dumpErrorReturnTrace(t);
+}
 
 fn updatePeak(peak: *std.atomic.Value(usize), candidate: usize) void {
     var current = peak.load(.monotonic);
@@ -1111,13 +1121,26 @@ fn openDbWithIo(allocator: Allocator, path: []const u8, io: std.Io, create: bool
 /// everything requested). `is_owner = true` matches this harness's own
 /// single-writer, no-Raft setup, where the caller asserting ownership is
 /// exactly the Lite path-lease holder driving the scenario.
+///
+/// A chunk that finds the store's writer slot taken by its own background
+/// work (a merge or idle redo fold) refuses with `FileBusy`. The owner's
+/// maintenance turn retries such a chunk on a later turn; so does this.
 fn runRetirementTurn(allocator: Allocator, handle: *DbHandle) !void {
     _ = allocator;
     const store = handle.backend.native_docstore orelse return error.CrashConsistencyMissingDocstore;
     const up_to = store.lastReplaySequence(0);
     store.requestRetirement(up_to);
+    const platform_time = @import("antfly_platform").time;
+    const deadline_ns = platform_time.monotonicNs() +| (30 * std.time.ns_per_s);
     while (true) {
-        const stats = try store.serviceRetirement(true, .{});
+        const stats = store.serviceRetirement(true, .{}) catch |err| switch (err) {
+            error.FileBusy => {
+                if (platform_time.monotonicNs() >= deadline_ns) return err;
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                continue;
+            },
+            else => return err,
+        };
         if (stats.done) break;
     }
 }

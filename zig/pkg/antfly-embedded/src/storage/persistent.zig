@@ -1634,6 +1634,15 @@ pub const PersistentIndex = struct {
         }
     }
 
+    /// Deletes every record a `.native_catalog` main store keeps for the
+    /// index at `path`: `open` scopes that store under `{path}/index`, and its
+    /// WAL stays in memory.
+    pub fn deleteNativeCatalogStorage(alloc: Allocator, sink: NativeCatalogSink, path: []const u8) !void {
+        const scope = try std.fmt.allocPrint(alloc, "{s}/index", .{path});
+        defer alloc.free(scope);
+        try native_catalog_backend.deleteAllForScope(alloc, sink, scope);
+    }
+
     /// Open or create a persistent index. Recovers existing state + replays WAL.
     pub fn open(alloc: Allocator, opts: PersistentIndexOptions) !PersistentIndex {
         // The new owner is unpublished until recovery completes.

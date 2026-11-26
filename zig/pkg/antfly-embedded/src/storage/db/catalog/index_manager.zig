@@ -1470,7 +1470,8 @@ pub const IndexManager = struct {
     /// into `openConfiguredIndexWithAuthorization`, and cleared
     /// immediately after. `openConfiguredIndexDetached`'s dense_vector
     /// branch reads it to tell a genuinely fresh admission apart from a
-    /// normal reopen -- `self.get(cfg.name)` cannot make that distinction
+    /// normal reopen (the full_text branch reads it the same way) --
+    /// `self.get(cfg.name)` cannot make that distinction
     /// from inside the shared open path, since the index being opened is,
     /// by construction, absent from the open-indexes list in *either*
     /// case at that point. Must be set/read/cleared only while
@@ -25010,6 +25011,20 @@ pub const IndexManager = struct {
 
                 const zpath = try self.alloc.dupeSentinel(u8, path, 0);
                 defer self.alloc.free(zpath);
+
+                // Index removal deletes a generation's directories, not the
+                // records a native-catalog text backend keeps under its path
+                // scope. A fresh same-name admission would otherwise open the
+                // retired generation's segments and provenance. As for dense
+                // indexes below, only a fresh admission may clear them.
+                if (self.text_main_backend == .native_catalog and
+                    self.fresh_admission_name != null and
+                    std.mem.eql(u8, self.fresh_admission_name.?, cfg.name))
+                {
+                    if (self.text_main_native_catalog_sink) |sink| {
+                        try persistent_mod.PersistentIndex.deleteNativeCatalogStorage(self.alloc, sink, path);
+                    }
+                }
 
                 const persistent_opts = persistent_mod.PersistentIndexOptions{
                     .path = zpath,

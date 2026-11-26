@@ -8739,6 +8739,50 @@ test "capi native refresh during a lane-pinned write does not mark that generati
     owner.collectRetired();
 }
 
+test "capi native full-text index recreated under its old name starts empty and indexes new writes" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("recreate-full-text");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true, .busy_timeout_ms = 10_000 }, true);
+    const id = try api.publishHandle(wrapper);
+    defer api.antfly_db_close(id);
+    const index_json = "{\"name\":\"recreated_text\",\"kind\":\"full_text\",\"config_json\":\"{}\"}";
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(index_json)));
+    const Batch = struct {
+        fn run(handle: anytype, body: []const u8) !void {
+            var out: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free_zero(&out);
+            try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(handle, .fromSlice(body), &out));
+        }
+        fn hits(handle: anytype, term: []const u8, doc: []const u8) !bool {
+            var query_buf: [256]u8 = undefined;
+            const query = try std.fmt.bufPrint(&query_buf, "{{\"full_text_search\":{{\"match\":{{\"field\":\"text\",\"text\":\"{s}\"}}}},\"limit\":5}}", .{term});
+            var out: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free_zero(&out);
+            try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_search_json(handle, .fromSlice(query), &out));
+            return std.mem.indexOf(u8, out.ptr.?[0..out.len], doc) != null;
+        }
+    };
+    try Batch.run(id, "{\"inserts\":{\"old-doc\":{\"text\":\"quokka recreation\"}},\"sync_level\":\"full_index\"}");
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(id));
+    try std.testing.expect(try Batch.hits(id, "quokka", "old-doc"));
+
+    var deleted = false;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_delete_index(id, .fromSlice("recreated_text"), &deleted));
+    try std.testing.expect(deleted);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(index_json)));
+    try Batch.run(id, "{\"inserts\":{\"new-doc\":{\"text\":\"wombat recreation\"}},\"sync_level\":\"full_index\"}");
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(id));
+    try std.testing.expect(try Batch.hits(id, "wombat", "new-doc"));
+    // The new generation backfills the old document from its row.
+    try std.testing.expect(try Batch.hits(id, "quokka", "old-doc"));
+}
+
 test "capi native replacement wait finishes a write at its replay sequence and stalls it when its index was recreated" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     const a = std.testing.allocator;
