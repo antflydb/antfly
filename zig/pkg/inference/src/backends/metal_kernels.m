@@ -1784,6 +1784,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> causal_depthwise4_bf16_pipeline;
     id<MTLComputePipelineState> dense_bf16_projection_pipeline;
     id<MTLComputePipelineState> dense_bf16_projection_reuse4_pipeline;
+    id<MTLComputePipelineState> dense_bf16_projection_full4_pipeline;
     id<MTLComputePipelineState> patch_transformer_pipeline[8];
     id<MTLComputePipelineState> head_norm_bf16_pipeline;
     id<MTLComputePipelineState> residual_mix_bf16_pipeline;
@@ -13394,19 +13395,18 @@ static NSString *termite_metal_shader_source(void) {
            "    if (lane == 0u) antfly_dense_bf16_store(output, bias, p, group.y, column, dot);\n"
            "}\n"
            "\n"
-           // tile-codegen:end projection.dense_bf16.0 family
-           // tile-codegen:begin projection.dense_bf16.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
-           "kernel void antfly_dense_bf16_projection_reuse4(\n"
-           "    device const bfloat *input [[buffer(0)]], device const bfloat *weight [[buffer(1)]],\n"
-           "    device uchar *output [[buffer(2)]], device const bfloat *bias [[buffer(3)]],\n"
-           "    constant DenseBf16ProjectionParams &p [[buffer(4)]],\n"
-           "    uint2 group [[threadgroup_position_in_grid]], uint warp [[simdgroup_index_in_threadgroup]],\n"
-           "    uint lane [[thread_index_in_simdgroup]]\n"
+           "template<bool complete>\n"
+           "inline void antfly_dense_bf16_projection_four_rows(\n"
+           "    device const bfloat *input, device const bfloat *weight,\n"
+           "    device uchar *output, device const bfloat *bias,\n"
+           "    constant DenseBf16ProjectionParams &p,\n"
+           "    uint2 group, uint warp,\n"
+           "    uint lane\n"
            ") {\n"
            "    const uint column = group.x * 4u + warp;\n"
            "    const uint first = group.y * 4u;\n"
            "    if (column >= p.output_width) return;\n"
-           "    const uint count = min(4u, p.rows - first);\n"
+           "    const uint count = complete ? 4u : min(4u, p.rows - first);\n"
            "    const device bfloat *a = input + ulong(first) * p.input_width;\n"
            "    const device bfloat *w = weight + ulong(column) * p.input_width;\n"
            "    float4 product = 0.0f;\n"
@@ -13424,7 +13424,31 @@ static NSString *termite_metal_shader_source(void) {
            "        }\n"
            "    }\n"
            "}\n"
+           "\n"
+           // tile-codegen:end projection.dense_bf16.0 family
+           // tile-codegen:begin projection.dense_bf16.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "kernel void antfly_dense_bf16_projection_reuse4(\n"
+           "    device const bfloat *input [[buffer(0)]], device const bfloat *weight [[buffer(1)]],\n"
+           "    device uchar *output [[buffer(2)]], device const bfloat *bias [[buffer(3)]],\n"
+           "    constant DenseBf16ProjectionParams &p [[buffer(4)]],\n"
+           "    uint2 group [[threadgroup_position_in_grid]], uint warp [[simdgroup_index_in_threadgroup]],\n"
+           "    uint lane [[thread_index_in_simdgroup]]\n"
+           ") {\n"
+           "    antfly_dense_bf16_projection_four_rows<false>(input, weight, output, bias, p, group, warp, lane);\n"
+           "}\n"
+           "\n"
            // tile-codegen:end projection.dense_bf16.1 family
+           // tile-codegen:begin projection.dense_bf16.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "kernel void antfly_dense_bf16_projection_reuse4_full(\n"
+           "    device const bfloat *input [[buffer(0)]], device const bfloat *weight [[buffer(1)]],\n"
+           "    device uchar *output [[buffer(2)]], device const bfloat *bias [[buffer(3)]],\n"
+           "    constant DenseBf16ProjectionParams &p [[buffer(4)]],\n"
+           "    uint2 group [[threadgroup_position_in_grid]], uint warp [[simdgroup_index_in_threadgroup]],\n"
+           "    uint lane [[thread_index_in_simdgroup]]\n"
+           ") {\n"
+           "    antfly_dense_bf16_projection_four_rows<true>(input, weight, output, bias, p, group, warp, lane);\n"
+           "}\n"
+           // tile-codegen:end projection.dense_bf16.2 family
            // tile-codegen:begin convolution.causal_depthwise4_bf16 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "struct CausalDepthwise4Bf16Params {\n"
            "    uint channels, rows, valid_history, dynamic, normalize;\n"
@@ -34530,6 +34554,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->causal_depthwise4_bf16_pipeline = nil;
     runtime->dense_bf16_projection_pipeline = nil;
     runtime->dense_bf16_projection_reuse4_pipeline = nil;
+    runtime->dense_bf16_projection_full4_pipeline = nil;
     for (size_t i = 0; i < 8; ++i) runtime->patch_transformer_pipeline[i] = nil;
     runtime->head_norm_bf16_pipeline = nil;
     runtime->residual_mix_bf16_pipeline = nil;
@@ -37858,6 +37883,13 @@ int antfly_metal_dispatch_dense_bf16_projection(
         !termite_metal_size_mul(p->rows, (size_t)p->output_width * output_size, &required[2])) return -1;
     const size_t alignment[4] = {2, 2, output_size, 2};
     if (p->rows >= 4 && p->input_width >= 256) {
+        if (p->rows % 4u == 0 && p->output_width >= 1024u) {
+            const int full = antfly_metal_encode_typed_stage(runtime, @"antfly_dense_bf16_projection_reuse4_full",
+                &runtime->dense_bf16_projection_full4_pipeline, views, required, alignment, 4, 1u << 2,
+                p, sizeof(*p), MTLSizeMake(((size_t)p->output_width + 3u) / 4u, p->rows / 4u, 1),
+                MTLSizeMake(128, 1, 1));
+            if (full != -3) return full;
+        }
         const int shared = antfly_metal_encode_typed_stage(runtime, @"antfly_dense_bf16_projection_reuse4",
             &runtime->dense_bf16_projection_reuse4_pipeline, views, required, alignment, 4, 1u << 2,
             p, sizeof(*p), MTLSizeMake(((size_t)p->output_width + 3u) / 4u, ((size_t)p->rows + 3u) / 4u, 1),

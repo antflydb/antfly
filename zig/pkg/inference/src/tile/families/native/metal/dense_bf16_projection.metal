@@ -52,18 +52,18 @@ kernel void antfly_dense_bf16_projection_simd4(
     if (lane == 0u) antfly_dense_bf16_store(output, bias, p, group.y, column, dot);
 }
 
-// native-program:entry antfly_dense_bf16_projection_reuse4
-kernel void antfly_dense_bf16_projection_reuse4(
-    device const bfloat *input [[buffer(0)]], device const bfloat *weight [[buffer(1)]],
-    device uchar *output [[buffer(2)]], device const bfloat *bias [[buffer(3)]],
-    constant DenseBf16ProjectionParams &p [[buffer(4)]],
-    uint2 group [[threadgroup_position_in_grid]], uint warp [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]
+template<bool complete>
+inline void antfly_dense_bf16_projection_four_rows(
+    device const bfloat *input, device const bfloat *weight,
+    device uchar *output, device const bfloat *bias,
+    constant DenseBf16ProjectionParams &p,
+    uint2 group, uint warp,
+    uint lane
 ) {
     const uint column = group.x * 4u + warp;
     const uint first = group.y * 4u;
     if (column >= p.output_width) return;
-    const uint count = min(4u, p.rows - first);
+    const uint count = complete ? 4u : min(4u, p.rows - first);
     const device bfloat *a = input + ulong(first) * p.input_width;
     const device bfloat *w = weight + ulong(column) * p.input_width;
     float4 product = 0.0f;
@@ -80,4 +80,26 @@ kernel void antfly_dense_bf16_projection_reuse4(
             if (lane == 0u) antfly_dense_bf16_store(output, bias, p, first + i, column, dot);
         }
     }
+}
+
+// native-program:entry antfly_dense_bf16_projection_reuse4
+kernel void antfly_dense_bf16_projection_reuse4(
+    device const bfloat *input [[buffer(0)]], device const bfloat *weight [[buffer(1)]],
+    device uchar *output [[buffer(2)]], device const bfloat *bias [[buffer(3)]],
+    constant DenseBf16ProjectionParams &p [[buffer(4)]],
+    uint2 group [[threadgroup_position_in_grid]], uint warp [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    antfly_dense_bf16_projection_four_rows<false>(input, weight, output, bias, p, group, warp, lane);
+}
+
+// native-program:entry antfly_dense_bf16_projection_reuse4_full
+kernel void antfly_dense_bf16_projection_reuse4_full(
+    device const bfloat *input [[buffer(0)]], device const bfloat *weight [[buffer(1)]],
+    device uchar *output [[buffer(2)]], device const bfloat *bias [[buffer(3)]],
+    constant DenseBf16ProjectionParams &p [[buffer(4)]],
+    uint2 group [[threadgroup_position_in_grid]], uint warp [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    antfly_dense_bf16_projection_four_rows<true>(input, weight, output, bias, p, group, warp, lane);
 }

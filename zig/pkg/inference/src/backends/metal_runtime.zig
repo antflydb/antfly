@@ -53932,6 +53932,54 @@ test "Metal dense BF16 projection publishes typed rows and router logits" {
     try std.testing.expectEqual([4]f32{ 4, 1.5, 0, -1.5 }, logits);
 }
 
+test "Metal dense BF16 projection full tiles match the ragged route" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const rows = 8;
+    const width = 256;
+    const columns = 1025;
+    var input: [rows + 1][width]u16 = undefined;
+    for (&input, 0..) |*row, r| {
+        for (row, 0..) |*v, k| v.* = if ((r + k) % 3 == 0) 0xbf80 else 0x4000;
+    }
+    var weights: [columns][width]u16 = undefined;
+    for (&weights, 0..) |*column, column_index| {
+        for (column, 0..) |*v, k| v.* = if ((k + column_index) % 5 == 0) 0x3f00 else 0xbf00;
+    }
+    const bias: [columns]u16 = @splat(0xbf80);
+    var source = try MetalTensor.deviceAllocateTyped(a, runtime, .i16, .shared, &.{(rows + 1) * width});
+    defer source.deinit();
+    try source.uploadBytes(std.mem.asBytes(&input));
+    var matrix = try MetalTensor.deviceAllocateTyped(a, runtime, .i16, .shared, &.{columns * width});
+    defer matrix.deinit();
+    try matrix.uploadBytes(std.mem.asBytes(&weights));
+    var offset = try MetalTensor.deviceAllocateTyped(a, runtime, .i16, .shared, &.{columns});
+    defer offset.deinit();
+    try offset.uploadBytes(std.mem.asBytes(&bias));
+    var full = try MetalTensor.deviceAllocateTyped(a, runtime, .f32, .shared, &.{rows * columns});
+    defer full.deinit();
+    var ragged = try MetalTensor.deviceAllocateTyped(a, runtime, .f32, .shared, &.{(rows + 1) * columns});
+    defer ragged.deinit();
+
+    try beginFrame(runtime);
+    errdefer cancelFrame(runtime) catch {};
+    var projection: DenseBf16Projection = .{ .rows = rows, .input_width = width, .output_width = columns, .softcap = 12 };
+    try projection.encodeWithBias(runtime, &source, &matrix, &offset, &full);
+    projection.rows += 1;
+    try projection.encodeWithBias(runtime, &source, &matrix, &offset, &ragged);
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+
+    var expected: [(rows + 1) * columns]f32 = undefined;
+    var actual: [rows * columns]f32 = undefined;
+    try ragged.downloadF32Into(&expected);
+    try full.downloadF32Into(&actual);
+    try std.testing.expectEqualSlices(f32, expected[0..actual.len], &actual);
+}
+
 /// BF16 boundary between weighted clipping/RMS and optional position scaling.
 pub const HeadNormBf16 = struct {
     rows: u32,
