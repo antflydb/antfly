@@ -3455,25 +3455,28 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
     errdefer if (layer0_k_pending) |override| cb.free(override);
     errdefer if (layer0_v_pending) |override| cb.free(override);
 
-    // Own one frame across the full A4B stack. Once every expert arena layer is
-    // warm, checkpoint/replay removes the router completion point: the first
-    // pass maps routes on-device and records only per-layer miss counts. The
-    // terminal frame wait decides whether the token is accepted or replayed
-    // once through synchronized bounded repair.
-    var owns_a4b_forward_frame = false;
-    if (cb.kind() == .metal and
-        isDecodeStep(decode_context) and
+    // A long-lived Metal frame may recycle a released buffer immediately for
+    // a later encoded layer even though an earlier command still reads it.
+    // Keep prior hidden tensors owned until frame completion; this retains the
+    // no-blit cross-layer path without allowing same-frame storage reuse.
+    var deferred_a4b_hidden_frees = std.ArrayListUnmanaged(CT).empty;
+    defer {
+        for (deferred_a4b_hidden_frees.items) |tensor| cb.free(tensor);
+        deferred_a4b_hidden_frees.deinit(allocator);
+    }
+    var a4b_replay_checkpoint: ?CT = null;
+    defer if (a4b_replay_checkpoint) |checkpoint| cb.free(checkpoint);
+
+    // A4B keeps one frame across the stack so routing misses can be
+    // resolved from a checkpoint after the terminal wait.
+    const Submission = @import("../execution/submission.zig").Scope;
+    const frame_needed = cb.kind() == .metal and isDecodeStep(decode_context) and
         gemma4_runtime.isQualifiedA4bArchitecture(config) and
         !getenvBool("TERMITE_METAL_DISABLE_A4B_LAYER_FRAME") and
-        !getenvBool("TERMITE_METAL_DISABLE_A4B_FORWARD_FRAME") and
-        !cb.decoderRuntimeHasActiveFrame())
-    {
-        owns_a4b_forward_frame = try cb.decoderRuntimeBeginFrame();
-        if (owns_a4b_forward_frame) {
-            try cb.decoderRuntimeSetActiveFrameRegime(.decode);
-        }
-    }
-    defer if (owns_a4b_forward_frame) cb.decoderRuntimeCancelFrame() catch {};
+        !getenvBool("TERMITE_METAL_DISABLE_A4B_FORWARD_FRAME");
+    var a4b_frame: Submission = if (frame_needed) try Submission.begin(cb) else .{ .backend = cb };
+    defer a4b_frame.deinit();
+    if (a4b_frame.owns) try cb.decoderRuntimeSetActiveFrameRegime(.decode);
 
     // Keep a frame active across eager Qwen3-VL decode layers. This coalesces
     // adjacent work around required runtime drains while preserving mRoPE,
@@ -3528,16 +3531,7 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
     // submitted prefix on every exit before releasing any borrowed context.
     defer if (stream_first_layers != 0) cb.decoderRuntimeWaitSubmittedFrame() catch {};
 
-    // A long-lived Metal frame may recycle a released buffer immediately for
-    // a later encoded layer even though an earlier command still reads it.
-    // Keep prior hidden tensors owned until frame completion; this retains the
-    // no-blit cross-layer path without allowing same-frame storage reuse.
-    var deferred_a4b_hidden_frees = std.ArrayListUnmanaged(CT).empty;
-    defer {
-        for (deferred_a4b_hidden_frees.items) |tensor| cb.free(tensor);
-        deferred_a4b_hidden_frees.deinit(allocator);
-    }
-    if (owns_a4b_forward_frame) {
+    if (a4b_frame.owns) {
         try deferred_a4b_hidden_frees.ensureTotalCapacity(
             allocator,
             config.num_hidden_layers * 2 + 2,
@@ -3545,9 +3539,7 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
     }
 
     var a4b_moe_checkpoint_started = false;
-    var a4b_replay_checkpoint: ?CT = null;
-    defer if (a4b_replay_checkpoint) |checkpoint| cb.free(checkpoint);
-    if (owns_a4b_forward_frame and pre_norm_out == null and trace_sink == null and
+    if (a4b_frame.owns and pre_norm_out == null and trace_sink == null and
         layer0DecoderOverridesEmpty(effective_overrides))
     {
         const top_k: usize = @intCast(config.num_experts_per_tok);
@@ -3567,7 +3559,7 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
     // buffers. Those copies are useful for per-layer frames, but inside this
     // cross-layer frame they add one blit and a long dependency chain per
     // layer. Let the naturally device-resident result flow directly instead.
-    var reserved_hidden: ?ReservedHiddenCarrier = if (owns_a4b_forward_frame)
+    var reserved_hidden: ?ReservedHiddenCarrier = if (a4b_frame.owns)
         null
     else
         try ReservedHiddenCarrier.init(cb, hidden, total, hidden_size);
@@ -3651,7 +3643,7 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
             owns_hidden = false;
         } else {
             if (new_hidden != hidden) {
-                if (owns_a4b_forward_frame)
+                if (a4b_frame.owns)
                     deferred_a4b_hidden_frees.appendAssumeCapacity(hidden)
                 else
                     cb.free(hidden);
@@ -3663,7 +3655,7 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
         if (cb.kind() == .metal and forceLayerCloneDebug()) {
             const cloned_hidden = try cloneTensorMaterialized(cb, allocator, hidden);
             if (owns_hidden) {
-                if (owns_a4b_forward_frame)
+                if (a4b_frame.owns)
                     deferred_a4b_hidden_frees.appendAssumeCapacity(hidden)
                 else
                     cb.free(hidden);
@@ -3746,7 +3738,7 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
         reserved_hidden = null;
         owns_hidden = true;
     } else if (final_hidden != hidden) {
-        if (owns_a4b_forward_frame)
+        if (a4b_frame.owns)
             deferred_a4b_hidden_frees.appendAssumeCapacity(hidden)
         else
             cb.free(hidden);
@@ -3771,9 +3763,8 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
     }
     try cb.debugCudaTraceTensor("gpt.final_hidden", hidden);
     try maybeCaptureActivationTrace(trace_sink, cb, allocator, "final_norm", null, hidden, hidden_size);
-    if (owns_a4b_forward_frame) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        owns_a4b_forward_frame = false;
+    if (a4b_frame.owns) {
+        try a4b_frame.finish();
         for (deferred_a4b_hidden_frees.items) |tensor| cb.free(tensor);
         deferred_a4b_hidden_frees.clearRetainingCapacity();
         const replay_required = if (a4b_moe_checkpoint_started)
