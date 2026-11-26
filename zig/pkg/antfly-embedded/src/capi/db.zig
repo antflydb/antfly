@@ -860,6 +860,9 @@ pub const HandleGuard = struct {
     // Cancellation after backoff can return registry pins without API locks.
     access_held: bool = true,
     connection: ?*@import("lite_connection.zig").Connection = null,
+    /// The store this mutation counts as a foreground request on, until
+    /// leave.
+    foreground_store: ?*@import("../storage/lite/docstore.zig").Store = null,
     path_lease: ?lite_backend.native.PathWriterLock = null,
     connection_gate_held: bool = false,
     entry_error: ?capi.ErrorCode = null,
@@ -1164,6 +1167,8 @@ pub const HandleGuard = struct {
 
     fn leaveWithRegistry(self: HandleGuard, comptime release_registry: bool) void {
         var guard = self;
+        if (guard.foreground_store) |store| store.endForegroundRequest();
+        guard.foreground_store = null;
         if (guard.replacement_continuation) |*owed| owed.deinit(std.heap.c_allocator);
         guard.replacement_continuation = null;
         defer if (release_registry) {
@@ -1372,9 +1377,9 @@ fn enterWithAdmissionRetry(initial: HandleEntry, ptr: ?*anyopaque, access: Handl
 /// `budget_ns` is what is left of the call's busy timeout (null: the full
 /// timeout). The guard records what remains after this admission.
 fn enterWithAdmissionBudget(initial: HandleEntry, ptr: ?*anyopaque, access: HandleAccess, intent: StorageIntent, comptime retain_entry: bool, budget_ns: ?i96) ?HandleGuard {
-    const connection = initial.lock_handle.lite_connection orelse return enterCapturedHandle(initial, access, intent, false);
+    const connection = initial.lock_handle.lite_connection orelse return countForegroundRequest(enterCapturedHandle(initial, access, intent, false), intent);
     const timeout_ms = connection.options.busy_timeout_ms;
-    if (timeout_ms == 0) return enterCapturedHandle(initial, access, intent, false);
+    if (timeout_ms == 0) return countForegroundRequest(enterCapturedHandle(initial, access, intent, false), intent);
     const io = handleLockIo();
     const deadline = std.Io.Clock.awake.now(io).nanoseconds + @max(0, budget_ns orelse @as(i96, timeout_ms) * std.time.ns_per_ms);
     // This call's own proof work, credited only through its own admission
@@ -1384,6 +1389,19 @@ fn enterWithAdmissionBudget(initial: HandleEntry, ptr: ?*anyopaque, access: Hand
     // Only waiting consumes the budget: add back this call's own proof work.
     const active: i96 = @intCast(active_ns);
     guard.admission_budget_ns = @max(0, deadline - std.Io.Clock.awake.now(io).nanoseconds + active);
+    return countForegroundRequest(guard, intent);
+}
+
+/// An admitted Lite mutation is a foreground request on the store it entered
+/// until its guard leaves: that store does not fold its redo log meanwhile.
+fn countForegroundRequest(admitted: HandleGuard, intent: StorageIntent) HandleGuard {
+    var guard = admitted;
+    if (intent != .mutation or guard.entry_error != null or !guard.access_held) return guard;
+    const root = guard.handle.parent_handle orelse guard.handle;
+    const backend = root.owned_lite_backend orelse return guard;
+    const store = backend.native_docstore orelse return guard;
+    store.beginForegroundRequest();
+    guard.foreground_store = store;
     return guard;
 }
 

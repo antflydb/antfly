@@ -4953,6 +4953,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .enrichment_fully_precomputed = enrichment_fully_precomputed,
                     .refresh_identity_visibility = queued_index_publication and pending_identity_visibility_summary != null,
                     .targets = sync_targets,
+                    .obligation_digest = if (opts.wait_for_sync_level and (effective_req.sync_level == .enrichments or effective_req.sync_level == .full_index))
+                        try S.ownerField(self, "core").*.index_manager.visibilityObligationDigest()
+                    else
+                        null,
                 };
                 const continuation = if (execution_resources.replacementContinuationEligible(replacement_shape)) &replacement_continuation else null;
                 if (comptime @import("builtin").is_test) if (!finish_without_lane) if (execution_resources.test_before_indexed_resume) |test_hook|

@@ -1171,6 +1171,9 @@ pub const ReplacementContinuation = struct {
     /// refresh from the committed store; the replacement repeats it.
     refresh_identity_visibility: bool = false,
     targets: ManagedSyncTargets,
+    /// `IndexManager.visibilityObligationDigest` at admission, for a wait
+    /// that reads group sources, enrichment templates or LEANN coverage.
+    obligation_digest: ?u64 = null,
 
     pub fn clone(self: *const ReplacementContinuation, alloc: Allocator) !ReplacementContinuation {
         var copy = self.*;

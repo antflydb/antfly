@@ -762,7 +762,10 @@ pub const Backend = struct {
         }
 
         pub fn publishDurable(self: *@This()) void {
-            self.inner.publishMirror();
+            // A bound batch stages no resolver, so it publishes no stamps,
+            // and publishing without stamps allocates nothing.
+            std.debug.assert(self.inner.staged_stamps.items.len == 0);
+            self.inner.publishMirror() catch unreachable;
         }
 
         pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
@@ -895,7 +898,7 @@ pub const Backend = struct {
         defer arena.deinit();
         const a = arena.allocator();
         var latest = std.ArrayListUnmanaged(Mutation).empty;
-        var keys = std.ArrayListUnmanaged([]const u8).empty;
+        var staged = std.ArrayListUnmanaged(StagedStamp).empty;
         const record = stamp != 0 and self.decisionsPending();
         {
             lockBackend(self);
@@ -905,13 +908,89 @@ pub const Backend = struct {
                 if (stamp != 0 and epochTracked(m.namespace)) {
                     const key = try epochKeyAlloc(a, m.namespace, m.key);
                     if ((self.applied_stamps.get(key) orelse 0) > stamp) continue;
-                    if (record) try keys.append(a, key);
+                    if (record) try staged.append(a, .{ .key = key, .stamp = stamp });
                 }
                 try latest.append(a, m);
             }
         }
+        // Everything the stamps need is allocated before the mirror changes.
+        var owned = try self.ownStamps(staged.items);
+        defer owned.deinit(self.allocator);
+        {
+            lockBackend(self);
+            defer self.mutex.unlock();
+            try self.applied_stamps.ensureUnusedCapacity(self.allocator, @intCast(owned.keys.len));
+        }
         try self.applyExternallyCommittedMutations(latest.items);
-        if (keys.items.len != 0) try self.recordStamps(keys.items, stamp);
+        lockBackend(self);
+        defer self.mutex.unlock();
+        // Callers hold the index's apply guard, so nothing else records
+        // stamps in between; a failure here still leaves the mirror ahead of
+        // its stamps, which only a reload can repair.
+        self.insertStampsLocked(&owned) catch |err| {
+            self.invalidateMirror();
+            return err;
+        };
+    }
+
+    /// A key whose mirror value a decision at `stamp` set, staged with the
+    /// tree or mutations that apply it.
+    const StagedStamp = struct {
+        key: []const u8,
+        stamp: u64,
+    };
+
+    /// Backend-owned copies of staged stamp keys.
+    const OwnedStamps = struct {
+        keys: [][]u8 = &.{},
+        stamps: []u64 = &.{},
+
+        fn deinit(self: *OwnedStamps, allocator: Allocator) void {
+            for (self.keys) |key| allocator.free(key);
+            allocator.free(self.keys);
+            allocator.free(self.stamps);
+            self.* = .{};
+        }
+    };
+
+    fn ownStamps(self: *Backend, staged: []const StagedStamp) !OwnedStamps {
+        if (staged.len == 0) return .{};
+        var owned: OwnedStamps = .{};
+        errdefer owned.deinit(self.allocator);
+        owned.keys = try self.allocator.alloc([]u8, staged.len);
+        var made: usize = 0;
+        errdefer {
+            for (owned.keys[0..made]) |key| self.allocator.free(key);
+            self.allocator.free(owned.keys);
+            owned.keys = &.{};
+        }
+        for (staged, owned.keys) |item, *slot| {
+            slot.* = try self.allocator.dupe(u8, item.key);
+            made += 1;
+        }
+        owned.stamps = try self.allocator.alloc(u64, staged.len);
+        for (staged, owned.stamps) |item, *slot| slot.* = item.stamp;
+        return owned;
+    }
+
+    /// Under `mutex`. On success the map owns every key and `owned` is
+    /// empty; on failure the map is unchanged and `owned` keeps its keys.
+    fn insertStampsLocked(self: *Backend, owned: *OwnedStamps) !void {
+        if (owned.keys.len == 0) return;
+        try self.applied_stamps.ensureUnusedCapacity(self.allocator, @intCast(owned.keys.len));
+        for (owned.keys, owned.stamps) |key, stamp| {
+            const entry = self.applied_stamps.getOrPutAssumeCapacity(key);
+            if (entry.found_existing) {
+                self.allocator.free(key);
+                entry.value_ptr.* = @max(entry.value_ptr.*, stamp);
+            } else {
+                entry.key_ptr.* = key;
+                entry.value_ptr.* = stamp;
+            }
+        }
+        self.allocator.free(owned.keys);
+        self.allocator.free(owned.stamps);
+        owned.* = .{};
     }
 
     /// Whether mutations from a decision at `stamp` may overwrite `m`'s key.
@@ -926,28 +1005,14 @@ pub const Backend = struct {
     /// Owned keys and capacity are allocated before the map changes, so a
     /// failure leaves it as it was.
     fn recordStamps(self: *Backend, keys: []const []const u8, stamp: u64) !void {
-        const owned = try self.allocator.alloc([]u8, keys.len);
-        defer self.allocator.free(owned);
-        var made: usize = 0;
-        errdefer for (owned[0..made]) |key| self.allocator.free(key);
-        for (keys, owned) |key, *slot| {
-            slot.* = try self.allocator.dupe(u8, key);
-            made += 1;
-        }
+        const staged = try self.allocator.alloc(StagedStamp, keys.len);
+        defer self.allocator.free(staged);
+        for (keys, staged) |key, *item| item.* = .{ .key = key, .stamp = stamp };
+        var owned = try self.ownStamps(staged);
+        defer owned.deinit(self.allocator);
         lockBackend(self);
         defer self.mutex.unlock();
-        try self.applied_stamps.ensureUnusedCapacity(self.allocator, @intCast(keys.len));
-        for (owned) |key| {
-            const entry = self.applied_stamps.getOrPutAssumeCapacity(key);
-            if (entry.found_existing) {
-                self.allocator.free(key);
-                entry.value_ptr.* = @max(entry.value_ptr.*, stamp);
-            } else {
-                entry.key_ptr.* = key;
-                entry.value_ptr.* = stamp;
-            }
-        }
-        made = 0;
+        try self.insertStampsLocked(&owned);
     }
 
     /// No install can still be older than a recorded decision: drop them.
@@ -1072,6 +1137,10 @@ pub const Backend = struct {
         // transaction ends, which is as long as a `get` result may be used.
         read_since_write: bool = false,
         borrowed_trees: std.ArrayListUnmanaged(ordered.Tree) = .empty,
+        // Stamps of the decisions this transaction's tree applies, keyed in
+        // `pending_arena`. They reach the backend only with the tree, in
+        // `publishMirror`: a tree that is never published leaves none.
+        staged_stamps: std.ArrayListUnmanaged(StagedStamp) = .empty,
 
         fn open(backend: *Backend, read_only: bool) !NamespaceTxn {
             if (backend.mirror_invalid.load(.acquire)) return error.IndexMirrorInvalid;
@@ -1237,18 +1306,30 @@ pub const Backend = struct {
                 // publishes, and that publish is what gets counted.
             }
 
+            // Committed: a mirror that cannot take this commit no longer
+            // matches the catalog, and must be reloaded before it serves.
+            errdefer self.backend.invalidateMirror();
+
             // The sink resolved at the tip: its decisions join the mirror.
             if (self.backend.sink.resolves) for (self.pending.items) |m| {
                 if (!isResolution(m.namespace)) continue;
                 try self.mirrorResolved(try resolverOf(m));
             };
 
-            self.publishMirror();
+            try self.publishMirror();
         }
 
-        fn publishMirror(self: *NamespaceTxn) void {
+        /// Swaps in this transaction's tree together with the stamps of the
+        /// decisions it applies, or neither.
+        fn publishMirror(self: *NamespaceTxn) !void {
             const rc = self.rc.?;
+            var owned = try self.backend.ownStamps(self.staged_stamps.items);
+            defer owned.deinit(self.allocator);
             lockBackend(self.backend);
+            self.backend.insertStampsLocked(&owned) catch |err| {
+                self.backend.mutex.unlock();
+                return err;
+            };
             const old = self.backend.state;
             self.backend.state = rc;
             releaseState(self.allocator, old);
@@ -1273,11 +1354,8 @@ pub const Backend = struct {
         }
 
         fn mirrorResolved(self: *NamespaceTxn, resolver: *Resolver) !void {
-            var arena = std.heap.ArenaAllocator.init(self.allocator);
-            defer arena.deinit();
-            var keys = std.ArrayListUnmanaged([]const u8).empty;
+            const arena = self.pending_arena.allocator();
             const record = resolver.stamp_backend != null and resolver.stamp != 0 and self.backend.decisionsPending();
-            defer if (keys.items.len != 0) self.backend.recordStamps(keys.items, resolver.stamp) catch self.backend.invalidateMirror();
             for (resolver.outputs.items) |m| {
                 if ((self.backend.tipReads() and isTipNamespace(m.namespace)) or isStagedOnly(m.namespace)) continue;
                 if (resolver.stamp_backend != null) {
@@ -1285,7 +1363,12 @@ pub const Backend = struct {
                     const latest = self.backend.decidedLatestLocked(m, resolver.stamp);
                     self.backend.mutex.unlock();
                     if (!latest) continue;
-                    if (record and epochTracked(m.namespace)) try keys.append(arena.allocator(), try epochKeyAlloc(arena.allocator(), m.namespace, m.key));
+                    if (epochTracked(m.namespace)) {
+                        const key = try epochKeyAlloc(arena, m.namespace, m.key);
+                        // A newer decision earlier in this commit set the key.
+                        if (self.stagedStampNewer(key, resolver.stamp)) continue;
+                        if (record) try self.staged_stamps.append(arena, .{ .key = key, .stamp = resolver.stamp });
+                    }
                 }
                 if (self.read_since_write) try self.borrowed_trees.ensureUnusedCapacity(self.allocator, 1);
                 const namespace: backend_types.Namespace = .{ .name = m.namespace };
@@ -1294,6 +1377,13 @@ pub const Backend = struct {
                 else
                     try self.rc.?.state.tree.put(self.allocator, namespace.name, m.key, m.value));
             }
+        }
+
+        fn stagedStampNewer(self: *const NamespaceTxn, key: []const u8, stamp: u64) bool {
+            for (self.staged_stamps.items) |staged| {
+                if (staged.stamp > stamp and std.mem.eql(u8, staged.key, key)) return true;
+            }
+            return false;
         }
 
         /// For a sink that does not resolve: runs each resolver against the
@@ -1636,6 +1726,87 @@ test "native catalog backend records a key's first decision stamp as is and keep
     try backend.recordStamps(&.{"b"}, 2);
     try std.testing.expectEqual(@as(?u64, 5), backend.applied_stamps.get("a"));
     try std.testing.expectEqual(@as(?u64, 3), backend.applied_stamps.get("b"));
+}
+
+/// A `TestSink` that runs each commit's resolvers against its entries, as
+/// Lite's sink does at the file's tip, so the mirror applies them after the
+/// commit.
+const ResolvingTestSink = struct {
+    inner: TestSink,
+
+    fn submit(ptr: *anyopaque, scope: []const u8, mutations: []const Mutation, durable: bool) anyerror!void {
+        const self: *ResolvingTestSink = @ptrCast(@alignCast(ptr));
+        for (mutations) |m| {
+            if (isResolution(m.namespace)) {
+                const resolver = try resolverOf(m);
+                try resolver.run(.{ .ptr = self, .getFn = tipGet });
+                try TestSink.submit(&self.inner, scope, resolver.outputs.items, durable);
+                continue;
+            }
+            try TestSink.submit(&self.inner, scope, &.{m}, durable);
+        }
+    }
+
+    fn tipGet(ptr: *anyopaque, allocator: Allocator, namespace: ?[]const u8, key: []const u8) anyerror!?[]u8 {
+        const self: *ResolvingTestSink = @ptrCast(@alignCast(ptr));
+        const i = self.inner.findIndex(namespace, key) orelse return null;
+        return try allocator.dupe(u8, self.inner.entries.items[i].value);
+    }
+
+    fn loadAllAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]Entry {
+        const self: *ResolvingTestSink = @ptrCast(@alignCast(ptr));
+        return TestSink.loadAllAlloc(&self.inner, allocator, scope);
+    }
+
+    fn sink(self: *ResolvingTestSink) Sink {
+        return .{ .ptr = self, .submit = submit, .loadAllAlloc = loadAllAlloc, .resolves = true };
+    }
+};
+
+// Stamps describe published mirror state only. Whatever allocation fails
+// once the sink has committed a resolver's decision, the backend records no
+// stamp for the discarded tree, and a mirror left behind the catalog fails
+// closed. With no failure the decision's stamp lands with its value.
+test "native catalog backend publishes decision stamps only with the mirror that applies them" {
+    const a = std.testing.allocator;
+    const Decide = struct {
+        fn resolve(_: *anyopaque, _: TipReader, resolver: *Resolver) anyerror!void {
+            try resolver.put("doc_map", "doc:a", "v2");
+        }
+    };
+    var context: u8 = 0;
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+        var sink_impl = ResolvingTestSink{ .inner = .{ .allocator = a } };
+        defer sink_impl.inner.deinit();
+        var backend = Backend.init(failing.allocator(), .{ .sink = sink_impl.sink(), .scope = "idx1" }) catch continue;
+        defer backend.close();
+        backend.beginPendingDecision();
+        defer backend.finishPendingDecision();
+        var resolver = Resolver.init(a, &context, Decide.resolve);
+        defer resolver.deinit();
+        resolver.stamp_backend = &backend;
+        var txn = backend.beginWrite() catch continue;
+        txn.stageResolver(&resolver) catch {
+            txn.abort();
+            continue;
+        };
+        txn.commit() catch {
+            txn.abort();
+            try std.testing.expectEqual(@as(u32, 0), backend.applied_stamps.count());
+            if (sink_impl.inner.findIndex("doc_map", "doc:a") != null) {
+                try std.testing.expect(backend.mirror_invalid.load(.acquire));
+            }
+            continue;
+        };
+        try std.testing.expectEqual(@as(?u64, resolver.stamp), backend.applied_stamps.get("doc_map\x00doc:a"));
+        var read = try backend.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings("v2", try read.get(.{ .name = "doc_map" }, "doc:a"));
+        break;
+    }
+    try std.testing.expect(fail_index > 0);
 }
 
 test "native catalog backend supports prefix cursors over a namespace" {

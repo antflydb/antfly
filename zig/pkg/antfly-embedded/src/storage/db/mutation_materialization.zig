@@ -3542,6 +3542,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             fn finish(self: *InlineTextPublication) void {
                 _ = self.entry.persistent.inline_in_flight.fetchSub(1, .acq_rel);
+                self.index_manager.noteInlineTextPublicationFinished(self.entry);
                 // Segments neither installed nor aborted (an install that
                 // could not retake the guard) are released here.
                 for (self.segments[0..self.segment_count]) |*seg| seg.abort(self.alloc);

@@ -950,12 +950,18 @@ const TextMergeScheduler = struct {
         entry.compaction_pending.store(false, .release);
     }
 
-    fn select(self: *TextMergeScheduler, entries: []IndexManager.TextIndex) ?usize {
+    /// Keeps the index pending, retried no earlier than `delay_ns` from now.
+    fn scheduleAfter(entry: *IndexManager.TextIndex, now_ns: u64, delay_ns: u64) void {
+        entry.merge_retry_after_ns.store(now_ns +| delay_ns, .release);
+        entry.compaction_pending.store(true, .release);
+    }
+
+    fn select(self: *TextMergeScheduler, entries: []IndexManager.TextIndex, now_ns: u64) ?usize {
         if (entries.len == 0) return null;
         const start = if (self.next_index < entries.len) self.next_index else 0;
         for (0..entries.len) |offset| {
             const idx = (start + offset) % entries.len;
-            if (entries[idx].compaction_pending.load(.acquire)) {
+            if (entries[idx].compaction_pending.load(.acquire) and entries[idx].merge_retry_after_ns.load(.acquire) <= now_ns) {
                 self.next_index = (idx + 1) % entries.len;
                 return idx;
             }
@@ -1981,6 +1987,12 @@ pub const IndexManager = struct {
         // producer admission sample this bit without taking every index's
         // apply mutex, so it must not be a plain concurrently-mutated bool.
         compaction_pending: std.atomic.Value(bool) = .init(false),
+        // A merge refused at the tip whose refresh could not run keeps the
+        // index pending; the scheduler skips it until this monotonic time.
+        // An inline publication that finishes clears it, so a deferred
+        // refresh is retried as soon as the view can advance.
+        merge_retry_after_ns: std.atomic.Value(u64) = .init(0),
+        merge_refresh_failures: std.atomic.Value(u32) = .init(0),
         // A merge's byte reservation is sized from a point-in-time estimate,
         // but deletion deltas that commit while the merge builds also compete
         // inside that same fixed ceiling (see TextMergeBudgetAllocator). Under
@@ -15580,6 +15592,16 @@ pub const IndexManager = struct {
             if (!std.mem.eql(u8, path, canonical_path)) try self.deleteIndexDirUsingIoIfPresentFallible(path);
         }
         try self.deleteIndexDirUsingIoIfPresentFallible(canonical_path);
+        // A native-catalog text backend keeps its records in the database
+        // file under the index path's scope, not in these directories. The
+        // deletion is a new commit: reads pinned at an earlier checkpoint
+        // keep the retired generation until they end.
+        if (self.text_main_backend == .native_catalog) if (self.text_main_native_catalog_sink) |sink| {
+            if (active_path) |path| {
+                if (!std.mem.eql(u8, path, canonical_path)) try persistent_mod.PersistentIndex.deleteNativeCatalogStorage(self.alloc, sink, path);
+            }
+            try persistent_mod.PersistentIndex.deleteNativeCatalogStorage(self.alloc, sink, canonical_path);
+        };
     }
 
     fn removeWithAtomicMutation(
@@ -18271,6 +18293,37 @@ pub const IndexManager = struct {
 
     /// A replicated LEANN index's write position at the time a `full_index`
     /// wait started.
+    /// Fingerprints the catalog inputs a `full_index` or `enrichments` wait
+    /// reads from the serving runtime rather than from the write's own
+    /// targets: group sources, whether a generated template is rooted in
+    /// primary documents, and the replicated LEANN graphs. A write admitted
+    /// under one fingerprint cannot prove its obligations under another.
+    pub fn visibilityObligationDigest(self: *IndexManager) !u64 {
+        var hash = std.hash.Wyhash.init(0x5649534f424c4947);
+        var pinned = try self.acquireWritePlanSnapshot();
+        defer pinned.release();
+        const plan = pinned.plan();
+        if (plan.group_sources) |group_plan| for (group_plan.entries) |entry| {
+            hash.update(entry.name);
+            hash.update(&entry.configuration);
+        };
+        var primary_rooted = false;
+        for (plan.generated_templates) |request| {
+            if (request.group_source_json.len == 0 and request.group_artifact_name.len == 0) primary_rooted = true;
+        }
+        hash.update(&.{ @intFromBool(self.hasGroupSources()), @intFromBool(primary_rooted), @intFromBool(self.leann_replication) });
+        if (self.leann_replication) {
+            self.catalog_mutex.lockShared();
+            defer self.catalog_mutex.unlockShared();
+            for (self.dense_indexes.items) |*entry| {
+                if (entry.index.leann == null) continue;
+                hash.update(entry.config.name);
+                hash.update(std.mem.asBytes(&internal_keys.derivedCoverageGenerationForConfig(entry.config.coverage_generation, entry.config.config_json)));
+            }
+        }
+        return hash.final();
+    }
+
     pub const LeannCoverageTarget = struct { name: []u8, seq: u64 };
 
     pub fn freeLeannCoverageTargets(alloc: Allocator, targets: []LeannCoverageTarget) void {
@@ -27413,7 +27466,7 @@ pub const IndexManager = struct {
         }
         var attempts: usize = 0;
         while (attempts < self.text_indexes.items.len) : (attempts += 1) {
-            const idx = self.text_merge_scheduler.select(self.text_indexes.items) orelse return null;
+            const idx = self.text_merge_scheduler.select(self.text_indexes.items, now_ns) orelse return null;
             const entry = &self.text_indexes.items[idx];
             const has_in_flight = self.text_merge_scheduler.indexHasInFlight(entry.config.name);
             const maybe_task = self.beginTextMergeTaskForEntryWithPressure(entry, segment_cap, producer_waiting) catch |err| switch (err) {
@@ -27794,32 +27847,30 @@ pub const IndexManager = struct {
         // merge of these inputs). Planned again from this view, the merge
         // would fail the same way while a producer waits for it: take the
         // index as committed first. The index is held here, by this merge or
-        // by the producer lending it. While this process's own inline
-        // installs are pending the refresh is refused; the view advances
-        // when they land, and their install schedules the next merge
-        // (`noteInlineTextPublicationSegments`), so none is scheduled here.
-        var replan = true;
+        // by the producer lending it.
+        var refresh: TextMergeRefresh = .current;
         if (scope_changed) {
             write_stage_profile.add(.merge_scope_changed, 0);
-            entry.persistent.refreshFromTip() catch |err| switch (err) {
-                error.UnsupportedRefresh => replan = false,
-                else => {
-                    logTextMergeFailure("refresh", task.index_name, err);
-                    replan = false;
-                },
-            };
+            refresh = refreshTextIndexForReplan(entry, task.index_name);
         }
         entry.merge_delta_mutex.unlock(entry.io);
         merge_delta_locked = false;
         if (index_apply_locked) entry.apply_mutex.unlock();
         index_apply_locked = false;
 
-        if (applied and !try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy())) {
-            TextMergeScheduler.noteComplete(entry);
-        } else if (replan) {
-            TextMergeScheduler.schedule(entry);
-        } else {
-            TextMergeScheduler.noteComplete(entry);
+        switch (refresh) {
+            .current => if (applied and !try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy())) {
+                TextMergeScheduler.noteComplete(entry);
+            } else {
+                TextMergeScheduler.schedule(entry);
+            },
+            // The view stays stale, so the index stays pending: planned
+            // again now, the merge would be refused the same way.
+            .deferred => TextMergeScheduler.scheduleAfter(entry, platform_time.monotonicNs(), text_merge_refresh_deferred_retry_ns),
+            .failed => |failures| TextMergeScheduler.scheduleAfter(entry, platform_time.monotonicNs(), textMergeRefreshFailureBackoffNs(failures)),
+            // Only a versioned native-catalog index can refresh from the
+            // tip; any other sees no peer commits to catch up with.
+            .unsupported => TextMergeScheduler.noteComplete(entry),
         }
         if (applied) {
             self.text_merge_scheduler.noteAppliedMerge(
@@ -27837,6 +27888,38 @@ pub const IndexManager = struct {
             entry.merge_segment_cap.store(std.math.maxInt(u32), .release);
         }
         return applied;
+    }
+
+    const TextMergeRefresh = union(enum) {
+        current,
+        /// This process's inline installs are between commit and install;
+        /// the view advances when they land.
+        deferred,
+        /// The refresh itself failed; the payload counts consecutive failures.
+        failed: u32,
+        unsupported,
+    };
+
+    const text_merge_refresh_deferred_retry_ns: u64 = 10 * std.time.ns_per_ms;
+    const text_merge_refresh_max_backoff_ns: u64 = std.time.ns_per_s;
+
+    fn textMergeRefreshFailureBackoffNs(failures: u32) u64 {
+        const shift: u6 = @intCast(@min(failures -| 1, 7));
+        return @min(text_merge_refresh_deferred_retry_ns << shift, text_merge_refresh_max_backoff_ns);
+    }
+
+    fn refreshTextIndexForReplan(entry: *TextIndex, index_name: []const u8) TextMergeRefresh {
+        entry.persistent.refreshFromTip() catch |err| {
+            if (err == error.UnsupportedRefresh) {
+                if (entry.persistent.inlinePublicationsPending()) return .deferred;
+                if (!entry.persistent.refreshesFromTip()) return .unsupported;
+            }
+            logTextMergeFailure("refresh", index_name, err);
+            return .{ .failed = entry.merge_refresh_failures.fetchAdd(1, .acq_rel) +| 1 };
+        };
+        entry.merge_refresh_failures.store(0, .release);
+        entry.merge_retry_after_ns.store(0, .release);
+        return .current;
     }
 
     pub fn cancelTextMergeTask(self: *IndexManager, task: *const TextMergeTask) void {
@@ -27950,6 +28033,7 @@ pub const IndexManager = struct {
         };
         // Waiting level-0 records stay out of the tiered and forced plans,
         // which would otherwise fold them a few at a time.
+        var waiting_level0: usize = 0;
         if (level0_plan == null and !pressure) {
             var kept: usize = 0;
             for (infos.items) |info| {
@@ -27957,6 +28041,7 @@ pub const IndexManager = struct {
                 infos.items[kept] = info;
                 kept += 1;
             }
+            waiting_level0 = infos.items.len - kept;
             infos.shrinkRetainingCapacity(kept);
             if (infos.items.len < 2) return null;
         }
@@ -27970,9 +28055,11 @@ pub const IndexManager = struct {
             // segments so producer admission always has a merge in flight to
             // wait on instead of retrying TextMergeBackpressureTimeout
             // against a scheduler that gave up.
-            // Count only what the plan may take: waiting level-0 records would
-            // otherwise keep re-draining the same few merged segments.
-            if (!pressure and infos.items.len <= policy.max_segments_per_tier) return null;
+            // Debt is the index's live segment count, less waiting level-0
+            // records, which would otherwise keep re-draining the same few
+            // merged segments. Segments in flight or quarantined still count:
+            // the healthy rest is what can drain it.
+            if (!pressure and snap.segments.len - waiting_level0 <= policy.max_segments_per_tier) return null;
             self.text_merge_scheduler.forced_drains += 1;
             break :blk try text_index_maintenance.planForceDrainFromInfos(
                 self.alloc,
@@ -28471,11 +28558,22 @@ pub const IndexManager = struct {
     /// sequence; never compacts synchronously here, since that would
     /// defeat the inline path's whole point.
     pub fn noteInlineTextPublicationSegments(self: *IndexManager, entry: *TextIndex) !void {
+        // The view advanced: a merge waiting on it may plan again now.
+        entry.merge_retry_after_ns.store(0, .release);
         if (try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy())) {
             TextMergeScheduler.schedule(entry);
         } else {
             TextMergeScheduler.noteComplete(entry);
         }
+    }
+
+    /// An inline publication finished, installed or not. A merge whose
+    /// refresh it deferred may retry now; an aborted publication leaves no
+    /// install to schedule that retry.
+    pub fn noteInlineTextPublicationFinished(_: *IndexManager, entry: *TextIndex) void {
+        if (entry.merge_retry_after_ns.load(.acquire) == 0) return;
+        if (entry.persistent.inlinePublicationsPending()) return;
+        entry.merge_retry_after_ns.store(0, .release);
     }
 
     fn forceCompactTextIndexWithOptions(
@@ -43980,6 +44078,39 @@ test "shorthand chunk and embedding enrichment compatibility includes source_tem
     }));
 }
 
+// A committed write that finishes on a replacement runtime compares this
+// digest with the one it was admitted under. An unrelated index leaves it
+// alone; a generated enrichment the wait would now include changes it.
+test "visibility obligation digest covers generated enrichment templates and nothing else" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "visibility-obligation-digest");
+    defer cleanupIndexManagerDir(path);
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    const empty = try manager.visibilityObligationDigest();
+    try manager.addAllNoBackfill(&store, &.{.{ .name = "body_text", .kind = .full_text, .config_json = "{\"field\":\"body\"}" }});
+    try std.testing.expectEqual(empty, try manager.visibilityObligationDigest());
+
+    try std.testing.expect(try manager.ensureEmbeddingEnrichment(.{
+        .name = "sparse_terms_v1",
+        .kind = .embedding,
+        .source_field = "title",
+        .vector_space = "test:sparse-terms-v1",
+    }));
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "sparse_union",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"embedding\",\"sources\":[{\"artifact\":\"sparse_terms_v1\"}]}",
+    }});
+    try std.testing.expect(manager.hasGeneratedEnrichmentTargets());
+    try std.testing.expect(empty != try manager.visibilityObligationDigest());
+}
+
 test "generated target cache detects sparse and graph artifact consumers independently" {
     const alloc = std.testing.allocator;
 
@@ -50730,6 +50861,173 @@ test "text merge task carries concurrent deletes into publication" {
     const published = text_entry.persistent.snapshot();
     try std.testing.expect(published.segments.len < 12);
     try std.testing.expectEqual(@as(u64, 11), published.liveDocCount());
+}
+
+const StaleTextMergeFixture = struct {
+    alloc: Allocator,
+    sink: persistent_mod.InlinePublicationTestSink,
+    path_z: [:0]u8,
+    store: docstore_mod.DocStore,
+    manager: IndexManager,
+    peer: persistent_mod.PersistentIndex,
+
+    /// One native-catalog text index with four single-document segments,
+    /// plus a second index on the same catalog standing in for a peer
+    /// process. The merge policy merges two segments at a time.
+    fn init(self: *StaleTextMergeFixture, alloc: Allocator, tmp: *std.testing.TmpDir) !void {
+        self.alloc = alloc;
+        self.sink = .{ .allocator = alloc };
+        errdefer self.sink.deinit(alloc);
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        self.path_z = try alloc.dupeSentinel(u8, path, 0);
+        errdefer alloc.free(self.path_z);
+        self.store = try docstore_mod.DocStore.open(alloc, self.path_z, .{});
+        errdefer self.store.close();
+        self.manager = try IndexManager.initWithOptions(alloc, path, .{
+            .text_main_backend = .native_catalog,
+            .text_main_native_catalog_sink = self.sink.resolvingSink(),
+        });
+        errdefer self.manager.deinit();
+        self.manager.updateRange(.{ .start = "", .end = "" });
+        try self.manager.addAllNoBackfill(&self.store, &.{.{ .name = "ft", .kind = .full_text, .config_json = "{\"field\":\"title\"}" }});
+        const opts: IndexBatchOptions = .{ .compact_text = false, .defer_text_compaction = true };
+        for (0..4) |i| {
+            var key_buf: [32]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+            var value_buf: [64]u8 = undefined;
+            const value = try std.fmt.bufPrint(&value_buf, "{{\"title\":\"stale merge {d}\"}}", .{i});
+            try self.store.putBatch(&.{.{ .key = key, .value = value }}, &.{});
+            try self.manager.indexTextBatchByNameWithOptions(&self.store, "ft", &.{.{ .key = key, .value = value }}, opts);
+        }
+        const entry = self.textEntry();
+        try std.testing.expect(entry.persistent.refreshesFromTip());
+        try std.testing.expectEqual(@as(usize, 4), entry.persistent.snapshot().segments.len);
+        var peer_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const peer_path = try std.fmt.bufPrintSentinel(&peer_path_buf, "{s}/peer", .{path}, 0);
+        self.peer = try persistent_mod.PersistentIndex.open(alloc, .{
+            .path = peer_path,
+            .main_backend = .native_catalog,
+            .main_native_catalog_sink = self.sink.resolvingSink(),
+        });
+        errdefer self.peer.close();
+        try self.peer.refreshFromTip();
+    }
+
+    fn deinit(self: *StaleTextMergeFixture) void {
+        self.peer.close();
+        self.manager.deinit();
+        self.store.close();
+        self.alloc.free(self.path_z);
+        self.sink.deinit(self.alloc);
+    }
+
+    fn textEntry(self: *StaleTextMergeFixture) *IndexManager.TextIndex {
+        return self.manager.textIndexEntry("ft").?;
+    }
+
+    /// The peer retires the task's inputs, as its own merge of them would.
+    fn peerRetiresInputs(self: *StaleTextMergeFixture, task: *const IndexManager.TextMergeTask) !void {
+        const ids = try IndexManager.textMergeSourceIds(self.alloc, task.source);
+        defer self.alloc.free(ids);
+        try std.testing.expect(try self.peer.removeSegmentsIfActive(ids));
+    }
+
+    /// The index serves exactly the peer's active segments.
+    fn expectPeerActiveSet(self: *StaleTextMergeFixture) !void {
+        const ours = self.textEntry().persistent.snapshot();
+        const theirs = self.peer.snapshot();
+        try std.testing.expectEqual(theirs.segments.len, ours.segments.len);
+        for (ours.segments, theirs.segments) |a, b| try std.testing.expectEqual(b.id, a.id);
+    }
+};
+
+// A merge whose inputs a peer retired is refused at the tip. Its completion
+// takes the index from the tip, so the next plan starts from the peer's
+// segments instead of the stale inputs.
+test "text merge refused at a peer-advanced tip replans from the peer's segments" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    setBenchmarkTextMergePolicyOverride(.{ .max_segments_per_tier = 2, .max_segment_size = 5 * 1024 * 1024 * 1024, .floor_segment_size = 0 });
+    defer setBenchmarkTextMergePolicyOverride(null);
+    var fixture: StaleTextMergeFixture = undefined;
+    try fixture.init(alloc, &tmp);
+    defer fixture.deinit();
+
+    var task = (try fixture.manager.beginTextMergeTask()) orelse return error.TestExpectedMergeTask;
+    defer task.deinit(alloc);
+    const stale_inputs = try IndexManager.textMergeSourceIds(alloc, task.source);
+    defer alloc.free(stale_inputs);
+    try fixture.peerRetiresInputs(&task);
+
+    // Built from the stale inputs, the output is refused at the tip.
+    var result = try IndexManager.executeTextMergeTask(alloc, &task);
+    defer result.deinit(alloc);
+    try std.testing.expect(!try fixture.manager.finishTextMergeTask(&task, &result));
+    try fixture.expectPeerActiveSet();
+    try std.testing.expectEqual(@as(u64, 0), fixture.textEntry().merge_retry_after_ns.load(.acquire));
+
+    // The next plan names only segments the peer still serves.
+    if (try fixture.manager.beginTextMergeTask()) |next_value| {
+        var next = next_value;
+        defer next.deinit(alloc);
+        const next_inputs = try IndexManager.textMergeSourceIds(alloc, next.source);
+        defer alloc.free(next_inputs);
+        for (next_inputs) |id| for (stale_inputs) |stale| try std.testing.expect(id != stale);
+        fixture.manager.cancelTextMergeTask(&next);
+    }
+}
+
+// While this process's own inline writes are between commit and install the
+// refresh is refused. The index stays pending behind a short backoff, and a
+// finished publication, installed or aborted, lets the retry run.
+test "text merge whose tip refresh is deferred stays pending until the inline publication finishes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    setBenchmarkTextMergePolicyOverride(.{ .max_segments_per_tier = 2, .max_segment_size = 5 * 1024 * 1024 * 1024, .floor_segment_size = 0 });
+    defer setBenchmarkTextMergePolicyOverride(null);
+    var fixture: StaleTextMergeFixture = undefined;
+    try fixture.init(alloc, &tmp);
+    defer fixture.deinit();
+    const entry = fixture.textEntry();
+
+    {
+        var task = (try fixture.manager.beginTextMergeTask()) orelse return error.TestExpectedMergeTask;
+        defer task.deinit(alloc);
+        try fixture.peerRetiresInputs(&task);
+        _ = entry.persistent.inline_in_flight.fetchAdd(1, .acq_rel);
+        var result = try IndexManager.executeTextMergeTask(alloc, &task);
+        defer result.deinit(alloc);
+        try std.testing.expect(!try fixture.manager.finishTextMergeTask(&task, &result));
+    }
+    // Still stale, still pending, and not planned again during the backoff.
+    try std.testing.expect(entry.compaction_pending.load(.acquire));
+    try std.testing.expect(entry.merge_retry_after_ns.load(.acquire) > platform_time.monotonicNs());
+    try std.testing.expectEqual(@as(usize, 4), entry.persistent.snapshot().segments.len);
+    try std.testing.expect((try fixture.manager.beginTextMergeTask()) == null);
+    try std.testing.expect(entry.compaction_pending.load(.acquire));
+
+    // The publication is dropped without installing anything.
+    _ = entry.persistent.inline_in_flight.fetchSub(1, .acq_rel);
+    fixture.manager.noteInlineTextPublicationFinished(entry);
+    try std.testing.expectEqual(@as(u64, 0), entry.merge_retry_after_ns.load(.acquire));
+
+    // The retry plans from the same stale view, is refused again, and this
+    // time takes the index from the tip.
+    var retry = (try fixture.manager.beginTextMergeTask()) orelse return error.TestExpectedMergeTask;
+    defer retry.deinit(alloc);
+    var result = try IndexManager.executeTextMergeTask(alloc, &retry);
+    defer result.deinit(alloc);
+    try std.testing.expect(!try fixture.manager.finishTextMergeTask(&retry, &result));
+    try fixture.expectPeerActiveSet();
+}
+
+test "text merge refresh failures back off exponentially up to a second" {
+    try std.testing.expectEqual(IndexManager.text_merge_refresh_deferred_retry_ns, IndexManager.textMergeRefreshFailureBackoffNs(1));
+    try std.testing.expectEqual(4 * IndexManager.text_merge_refresh_deferred_retry_ns, IndexManager.textMergeRefreshFailureBackoffNs(3));
+    try std.testing.expectEqual(IndexManager.text_merge_refresh_max_backoff_ns, IndexManager.textMergeRefreshFailureBackoffNs(40));
 }
 
 test "text merge file provenance resolves deletion races off lock and retries read failures" {
