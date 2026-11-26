@@ -85,7 +85,6 @@ const Bank = struct {
     pool: storage.KvStorage,
     slots: []Slot,
     page_ids: Tensor,
-    host_ids: []u32,
     format: kv.PlaneFormat,
     staged_first_page: ?usize = null,
 
@@ -138,15 +137,12 @@ const Bank = struct {
                 initialized += 1;
             }
         }
-        const host_ids = try a.alloc(u32, pages);
-        errdefer a.free(host_ids);
         const page_ids = try Tensor.deviceAllocateTyped(a, runtime, .i32, .shared, &.{std.math.cast(i32, pages) orelse return error.InvalidKvShape});
-        return .{ .pool = pool, .slots = slots, .page_ids = page_ids, .host_ids = host_ids, .format = config.format(group) };
+        return .{ .pool = pool, .slots = slots, .page_ids = page_ids, .format = config.format(group) };
     }
 
     fn deinit(self: *Bank, a: std.mem.Allocator) void {
         self.page_ids.deinit();
-        a.free(self.host_ids);
         for (self.slots) |*slot| slot.deinit();
         a.free(self.slots);
         self.pool.deinit(a);
@@ -164,14 +160,21 @@ const Bank = struct {
         if (prefix == range.page_count) return;
 
         self.staged_first_page = null;
-        const changed = self.host_ids[prefix..range.page_count];
-        for (changed, range.first_page + prefix..) |*id, logical|
-            id.* = append.pageId(group, logical) orelse return error.InvalidKvRange;
+        // The sequence owns the canonical host page IDs. Stage only the
+        // changed suffix without retaining a second host table per bank.
+        var ids: [256]u32 = undefined;
+        var offset = prefix;
+        while (offset < range.page_count) {
+            const changed = ids[0..@min(ids.len, range.page_count - offset)];
+            for (changed, range.first_page + offset..) |*id, logical|
+                id.* = append.pageId(group, logical) orelse return error.InvalidKvRange;
 
-        const bytes = std.mem.sliceAsBytes(changed);
-        var patch = try self.page_ids.retainedView(prefix * @sizeOf(u32), bytes.len, &.{@intCast(changed.len)});
-        defer patch.deinit();
-        try patch.uploadBytes(bytes);
+            const bytes = std.mem.sliceAsBytes(changed);
+            var patch = try self.page_ids.retainedView(offset * @sizeOf(u32), bytes.len, &.{@intCast(changed.len)});
+            defer patch.deinit();
+            try patch.uploadBytes(bytes);
+            offset += changed.len;
+        }
         self.staged_first_page = range.first_page;
     }
 };
