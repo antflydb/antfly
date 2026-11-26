@@ -13385,8 +13385,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (elements == 0 or shape.dtype != .f32) continue;
                 var deferred: [2]bool = undefined;
                 for (node.getInputs(), &deferred) |input, *allow| {
-                    allow.* = schedule.deferredAddConsumer(graph, input, request.reachable, last_use, uses) == add and
-                        schedule.deferredProducerInputsLiveUntilConsumer(graph, input, add, last_use);
+                    allow.* = schedule.deferredAddConsumer(graph, input, request.reachable, last_use, uses) == add;
                 }
                 const scaled = descriptor.F32ScaledAdd.match(graph, node.getInputs(), shape, deferred);
                 const recipe = if (scaled == null) descriptor.F32ProductAdd.match(graph, node.getInputs(), shape, deferred) orelse continue else null;

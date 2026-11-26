@@ -44,6 +44,7 @@ pub fn deferredAddConsumer(graph: *const ml.graph.Graph, node_id: NodeId, reacha
     if (consumer.num_inputs < 2 or (consumer.inputs[0] != node_id and consumer.inputs[1] != node_id)) return null;
     if (std.mem.indexOfScalar(NodeId, graph.outputs.items, node_id) != null) return null;
     if (!hasSingleReachableConsumer(graph, node_id, reachable, use_counts)) return null;
+    if (!deferredProducerInputsLiveUntilConsumer(graph, node_id, consumer_id, last_use)) return null;
     return consumer_id;
 }
 

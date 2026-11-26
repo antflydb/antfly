@@ -16233,14 +16233,12 @@ const computeReachableUseCountsCapped = region_schedule.computeReachableUseCount
 
 fn shouldDeferScaleMulForAdd(graph: *const Graph, node_id: NodeId, reachable: []const bool, last_use: []const u32, use_counts: ?[]const u8) bool {
     const consumer = region_schedule.deferredAddConsumer(graph, node_id, reachable, last_use, use_counts) orelse return false;
-    return deferredScaleMul(graph, node_id, graph.node(consumer).output_shape) != null and
-        deferredProducerInputsLiveUntilConsumer(graph, node_id, consumer, last_use);
+    return deferredScaleMul(graph, node_id, graph.node(consumer).output_shape) != null;
 }
 
 fn shouldDeferElementwiseMulForAdd(graph: *const Graph, node_id: NodeId, reachable: []const bool, last_use: []const u32, use_counts: ?[]const u8) bool {
     const consumer = region_schedule.deferredAddConsumer(graph, node_id, reachable, last_use, use_counts) orelse return false;
-    return deferredElementwiseMul(graph, node_id, graph.node(consumer).output_shape) != null and
-        deferredProducerInputsLiveUntilConsumer(graph, node_id, consumer, last_use);
+    return deferredElementwiseMul(graph, node_id, graph.node(consumer).output_shape) != null;
 }
 
 fn shapesEqual(lhs: ml.graph.Shape, rhs: ml.graph.Shape) bool {
