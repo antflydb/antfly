@@ -13,6 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const Submission = @import("../execution/submission.zig").Scope;
+const PendingSubmission = @import("../execution/submission.zig").Pending;
 const std = @import("std");
 const audio = @import("../pipelines/audio.zig");
 const inference_audio = @import("inference_audio");
@@ -1333,8 +1335,8 @@ pub fn encodeVideoBatchInput(cb: *const ComputeBackend, allocator: std.mem.Alloc
             if (shape.len != 3 or shape[0] != 2 or shape[1] <= 0 or shape[2] != 768) return error.InvalidPositionEmbeddingShape;
             try @import("../ops/metal_compute.zig").MetalCompute.prepareVideoInput(cb, weight, positions, @intCast(shape[1]));
         }
-        var input_frame = if (cb.kind() == .metal) try beginVisionBoundary(cb, &store, cfg) else false;
-        defer if (input_frame) cb.decoderRuntimeCancelFrame() catch {};
+        var input_frame = try beginVisionBoundary(cb, &store, cfg);
+        defer input_frame.deinit();
         const input = switch (source) {
             .tensor => |ct| ct,
             .gather => |sources| try @import("../ops/metal_compute.zig").MetalCompute.gatherVideoInputs(cb, sources, g.grid_x * g.grid_y, 768),
@@ -1344,9 +1346,8 @@ pub fn encodeVideoBatchInput(cb: *const ComputeBackend, allocator: std.mem.Alloc
         defer cb.free(projected);
         const positioned = if (try sourceVisionSequence(cb, cfg, singleGeometry(g))) |_| try addPositionEmbeddingsBatchTensor(cb, allocator, &store, cfg, projected, singleGeometry(g), frames) else try addPositionEmbeddingsDevice(cb, allocator, projected, positions, cfg.vision_hidden, g);
         errdefer cb.free(positioned);
-        if (input_frame) {
-            try cb.decoderRuntimeSubmitAndWaitFrame();
-            input_frame = false;
+        if (input_frame.owns) {
+            try input_frame.finish();
             try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
         }
         break :input_phase positioned;
@@ -2231,7 +2232,6 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
     // runtime submits once instead of committing and waiting after every
     // op. The frame is owned only here; a caller that already composes one
     // keeps it.
-    const Submission = @import("../execution/submission.zig").Scope;
     var frame = try Submission.beginIfNeeded(cb, !cohort and cb.kind() == .metal and gemma4AudioEncoderFrameEnabled());
     errdefer frame.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
 
@@ -2304,7 +2304,7 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
         };
     }
     const pipelined = grouped_frames and frame_plan.in_flight == 2 and cb.decoderRuntimeSetWhisperPipelinedFrames(true);
-    var pending: @import("../execution/submission.zig").Pending = .{ .backend = cb };
+    var pending: PendingSubmission = .{ .backend = cb };
     var frame_snapshot: ?CT = null;
     errdefer if (frame_snapshot) |snapshot| cb.free(snapshot);
     // Drain before publishing or releasing a snapshot, layer inputs, or cached weights.
@@ -4289,11 +4289,13 @@ fn encodePositionedBatchResidentInto(cb: *const ComputeBackend, allocator: std.m
         cb.decoderRuntimeSetWhisperPipelinedFrames(true);
     const group = if (pipeline) @max(@as(usize, 1), admitted_layers / 2) else if (can_group) policy.layerCapacity(@intCast(geometry.width), @intCast(geometry.height), batch, admitted_layers) else 1;
     const started = platform.time.monotonicNs();
-    var frame = false;
-    var pending = false;
+    var frame: Submission = .{ .backend = cb };
+    var pending: PendingSubmission = .{ .backend = cb };
     defer {
-        if (frame) cb.decoderRuntimeCancelFrame() catch {};
-        if (pending) cb.decoderRuntimeWaitSubmittedFrame() catch {};
+        frame.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
+        pending.wait() catch {
+            if (pending.active) platform.inference_process_supervisor.restartWorker();
+        };
         if (pipeline) {
             _ = cb.decoderRuntimeSetWhisperPipelinedFrames(false);
             @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb) catch {};
@@ -4310,27 +4312,18 @@ fn encodePositionedBatchResidentInto(cb: *const ComputeBackend, allocator: std.m
         if (source_sequence != null) return error.SourceStorageUnavailable;
         for (0..cfg.block_count) |layer| {
             try cb.checkExecutionControl();
-            if (can_group and !frame) frame = try cb.decoderRuntimeBeginFrame();
+            if (can_group and !frame.owns) frame = if (pipeline) try Submission.beginPipelined(cb) else try Submission.begin(cb);
             const next = try encoderBlockBatch(cb, allocator, store, cfg, hidden, geometry, layer, batch);
             cb.free(hidden);
             hidden = next;
-            if (frame and ((layer + 1) % group == 0 or layer + 1 == cfg.block_count)) {
+            if (frame.owns and ((layer + 1) % group == 0 or layer + 1 == cfg.block_count)) {
                 if (pipeline and layer + 1 < cfg.block_count) {
                     try @import("../ops/metal_compute.zig").MetalCompute.detachEmbeddingGemma2ActivationViews(cb);
-                    if (pending) {
-                        try cb.decoderRuntimeWaitSubmittedFrame();
-                        pending = false;
-                    }
-                    try cb.decoderRuntimeSubmitFrame();
-                    frame = false;
-                    pending = true;
+                    try pending.wait();
+                    try frame.submitInto(&pending);
                 } else {
-                    if (pending) {
-                        try cb.decoderRuntimeWaitSubmittedFrame();
-                        pending = false;
-                    }
-                    try cb.decoderRuntimeSubmitAndWaitFrame();
-                    frame = false;
+                    try pending.wait();
+                    try frame.finish();
                     if (store.gguf == null) try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
                 }
             }
@@ -4343,7 +4336,7 @@ fn encodePositionedBatchResidentInto(cb: *const ComputeBackend, allocator: std.m
     }
     if (can_group and !pipeline) policy.layerCompleted(@intCast(geometry.width), @intCast(geometry.height), batch, group, cfg.block_count, platform.time.monotonicNs() - started);
     var projector_frame = try beginVisionBoundary(cb, store, cfg);
-    defer if (projector_frame) cb.decoderRuntimeCancelFrame() catch {};
+    defer projector_frame.deinit();
     // Preserve the source GEMM's physical reduction extent until pooling.
     const source_bf16 = sourcePixelStorage(cb.kind(), cfg) == .bf16 and sourceSpatialPoolSelected(cb.kind(), cfg, try cb.sourceScalarStorage(.linear));
     if (@import("build_options").enable_cuda and !source_bf16) if (source_sequence) |physical| {
@@ -4362,9 +4355,8 @@ fn encodePositionedBatchResidentInto(cb: *const ComputeBackend, allocator: std.m
     const projection_w = try projectorLinearWeightCt(cb, allocator, store, "mm.input_projection.weight", cfg.vision_hidden, cfg.text_hidden);
     const projected = try projectSpatialTensor(cb, allocator, normed_pooled, projection_w, output, batch * geometry.tokenCount(), cfg.vision_hidden, cfg.text_hidden, source_bf16);
     errdefer if (output == null) cb.free(projected);
-    if (projector_frame) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        projector_frame = false;
+    if (projector_frame.owns) {
+        try projector_frame.finish();
         try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
     }
     if (store.gguf == null) try embeddingGemma2StageTensor(cb, allocator, "image_projected", projected);
@@ -6514,9 +6506,9 @@ test "embeddinggemma2 resident position rows preserve asymmetric x y order" {
 
 /// HF positions are axis-first. Gather only the x/y rows needed by this
 /// frame and add their sum on device, preserving the host addition order.
-fn beginVisionBoundary(cb: *const ComputeBackend, store: *const ProjectorWeights, cfg: Config) !bool {
-    if (!visionFollowup(cb, store, cfg) or platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_BOUNDARY_FRAMES") or cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame()) return false;
-    return cb.decoderRuntimeBeginFrame();
+fn beginVisionBoundary(cb: *const ComputeBackend, store: *const ProjectorWeights, cfg: Config) !Submission {
+    return Submission.beginIfNeeded(cb, cb.kind() == .metal and visionFollowup(cb, store, cfg) and
+        !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_BOUNDARY_FRAMES"));
 }
 
 fn addPositionEmbeddingsDevice(cb: *const ComputeBackend, allocator: std.mem.Allocator, patches: CT, positions: CT, hidden: usize, geometry: Geometry) !CT {
@@ -6557,8 +6549,10 @@ fn addPositionEmbeddingsDevice(cb: *const ComputeBackend, allocator: std.mem.All
         x[i] = @intCast(i % geometry.grid_x);
         y[i] = std.math.cast(i64, per_axis + (i / geometry.grid_x) % geometry.grid_y) orelse return error.InvalidPositionEmbeddingShape;
     }
-    var frame = if (cb.kind() == .metal and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_FOLLOWUP") and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_BOUNDARY_FRAMES") and !cb.decoderRuntimeHasActiveFrame() and !cb.decoderRuntimeHasSubmittedFrame()) try cb.decoderRuntimeBeginFrame() else false;
-    defer if (frame) cb.decoderRuntimeCancelFrame() catch {};
+    var frame = try Submission.beginIfNeeded(cb, cb.kind() == .metal and
+        !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_FOLLOWUP") and
+        !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_BOUNDARY_FRAMES"));
+    defer frame.deinit();
     const xp = try cb.embeddingLookup(positions, x, rows, hidden);
     defer cb.free(xp);
     const yp = try cb.embeddingLookup(positions, y, rows, hidden);
@@ -6567,9 +6561,8 @@ fn addPositionEmbeddingsDevice(cb: *const ComputeBackend, allocator: std.mem.All
     defer cb.free(offsets);
     const result = try cb.add(patches, offsets);
     errdefer cb.free(result);
-    if (frame) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        frame = false;
+    if (frame.owns) {
+        try frame.finish();
         try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
     }
     return result;
@@ -6800,9 +6793,9 @@ fn encoderBlockBatch(
     // One owned command frame per vision layer amortizes dispatch/wait costs.
     // Existing active-frame owners retain their boundary. Runtime frame leases
     // keep freed producer buffers alive until completion or cancellation.
-    var frame = false;
-    if (cb.kind() == .metal and !platform.env.getenvBool("TERMITE_METAL_DISABLE_GEMMA4_VISION_FRAMES") and !cb.decoderRuntimeHasActiveFrame()) frame = try cb.decoderRuntimeBeginFrame();
-    defer if (frame) cb.decoderRuntimeCancelFrame() catch {};
+    var frame = try Submission.beginIfNeeded(cb, cb.kind() == .metal and
+        !platform.env.getenvBool("TERMITE_METAL_DISABLE_GEMMA4_VISION_FRAMES"));
+    defer frame.deinit();
     var profile = VisionProfile.init(cb, layer);
 
     const normed1 = try visionNorm(cb, cfg, store, input, null, layer * 4);
@@ -6824,9 +6817,8 @@ fn encoderBlockBatch(
     const res2 = try visionNorm(cb, cfg, store, ffn, res1, layer * 4 + 3);
     errdefer cb.free(res2);
     try profile.phase(cb, "ffn_post_norm_residual");
-    if (frame) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        frame = false;
+    if (frame.owns) {
+        try frame.finish();
         // HF model-owned slots retain immutable weights, not each completed
         // layer's activations. Retire MPS views at the same boundary as the
         // backbone; otherwise every vision layer pins its large MLP buffers.
