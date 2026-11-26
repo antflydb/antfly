@@ -32270,6 +32270,12 @@ fn ensureMediaWindowOutputs(runtime: *EnrichmentRuntime, a: Allocator, input: *@
     try captureMediaWindowOutputs(a, &read, input);
 }
 
+fn scalarWindowRetirementPending(input: *const @import("../artifact_chunk_vector_publication.zig").Input) bool {
+    const children = input.old_window_outputs orelse return false;
+    return children.len != 0 and input.token.execution_identity != null and
+        input.effect_protocol < @import("../artifact_inventory.zig").scalar_window_retirement_protocol;
+}
+
 /// A scalar publication also replaces this consumer's previously published
 /// windows. Bind each child deletion to the same source and write command.
 fn enqueueScalarChunkVector(runtime: *EnrichmentRuntime, input: *@import("../artifact_chunk_vector_publication.zig").Input, value: ?[]const u8, retire_windows: bool) !void {
@@ -32281,8 +32287,7 @@ fn enqueueScalarChunkVector(runtime: *EnrichmentRuntime, input: *@import("../art
     const children = input.old_window_outputs.?;
     if (children.len == 0)
         return enqueueProducerEffects(runtime, &input.token, &.{scalar}, null);
-    if (input.token.execution_identity != null and input.effect_protocol < ordered_publication.executionIdentityEffectProtocol(input.token.producer_scope_key, children.len + 1))
-        return error.ArtifactCatalogDrift;
+    if (scalarWindowRetirementPending(input)) return error.ArtifactPublicationPending;
     const effects = try a.alloc(ordered_publication.Mutation, children.len + 1);
     defer a.free(effects);
     effects[0] = scalar;
@@ -33017,8 +33022,15 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
             if (!exhausted) return error.ArtifactPublicationPending;
         }
         if (dense) |provider| for (items.items) |*item| {
-            if (item.carried != null) continue;
-            if (try publishMediaWindowVectors(runtime, alloc, request, provider, execution_revision, &item.input, item.input.value, &staged_vectors)) item.failed = true;
+            const published = item.carried == null and try publishMediaWindowVectors(runtime, alloc, request, provider, execution_revision, &item.input, item.input.value, &staged_vectors);
+            if (published) {
+                item.failed = true;
+            } else if (scalarWindowRetirementPending(&item.input)) {
+                // The catalog upgrade is outstanding. Process other members
+                // without recomputing a scalar that cannot publish yet.
+                item.failed = true;
+                deferred_output_error = error.ArtifactPublicationPending;
+            }
         };
         if (dense) |provider| for (items.items) |*item| if (!item.failed and item.carried == null) if (item.input.value) |payload| {
             item.precomputed = storedModelChunkVectorCached(runtime, item.input.token.arena.allocator(), provider, request, payload, &staged_vectors) catch |err| {
@@ -50947,7 +50959,7 @@ test "model aware media ordered vector windows are searchable with exact clocks 
             defer a.free(vector);
             input.token.execution_identity = scalar_revision;
             input.effect_protocol = retirement_protocol - 1;
-            try std.testing.expectError(error.ArtifactCatalogDrift, enqueueScalarChunkVector(runtime, &input, vector, true));
+            try std.testing.expectError(error.ArtifactPublicationPending, enqueueScalarChunkVector(runtime, &input, vector, true));
             try std.testing.expectEqual(calls, harness.calls);
             input.effect_protocol = retirement_protocol;
             enqueueScalarChunkVector(runtime, &input, vector, true) catch |err| switch (err) {
