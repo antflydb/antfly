@@ -487,6 +487,7 @@ pub const TextPipeline = struct {
         if (rgb.width != input.width or rgb.height != input.height) return error.InvalidInkling2Image;
         var embeddings = try encoder.encodeRgb(self.allocator, model.runtime, rgb.data, rgb.width, rgb.height);
         errdefer embeddings.tensor.deinit();
+        try self.check();
         if (embeddings.rows != input.rows()) return error.InvalidInkling2Image;
         return embeddings;
     }
