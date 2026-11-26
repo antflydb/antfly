@@ -255,6 +255,19 @@ pub fn loadHead(allocator: std.mem.Allocator, model_dir: []const u8, hidden_size
     if (!c_file.fileExists(allocator, path)) return error.GlideReadoutNotFound;
     var reader = try safetensors.MMapReader.openFileAbsolute(allocator, path);
     defer reader.deinit();
+    return headFromReader(allocator, config, hidden_size, &reader);
+}
+
+/// Load the same readout used by native sessions from browser-provided bytes.
+pub fn loadHeadBytes(allocator: std.mem.Allocator, config_json: []const u8, readout_bytes: []const u8, hidden_size: usize) !*Head {
+    var config = try parseDecisionConfig(allocator, config_json);
+    errdefer config.deinit(allocator);
+    var reader = try safetensors.MMapReader.fromBorrowedBytesLimited(allocator, readout_bytes, 64 * 1024);
+    defer reader.deinit();
+    return headFromReader(allocator, config, hidden_size, &reader);
+}
+
+fn headFromReader(allocator: std.mem.Allocator, config: DecisionConfig, hidden_size: usize, reader: *const safetensors.MMapReader) !*Head {
     var weight = reader.readTensor("weight") catch return error.InvalidGlideReadout;
     defer weight.deinit();
     if (weight.shape.len != 2 or weight.shape[0] != max_options or weight.shape[1] != @as(i64, @intCast(hidden_size)))
@@ -315,6 +328,22 @@ test "GLiDE decision config parses encoder and decoder checkpoints" {
     try std.testing.expectEqual(@as(usize, 7999), encoder.max_len);
     try std.testing.expectEqual(@as(usize, 98), try encoder.readoutIndex(100));
     try std.testing.expectEqualStrings("AA", encoder.codes[26]);
+
+    // Browser loading exercises the same BF16 readout as filesystem loading.
+    const header = "{\"weight\":{\"dtype\":\"BF16\",\"shape\":[255,1],\"data_offsets\":[0,510]}}";
+    var file: [8 + header.len + max_options * 2]u8 = undefined;
+    std.mem.writeInt(u64, file[0..8], header.len, .little);
+    @memcpy(file[8..][0..header.len], header);
+    for (0..max_options) |index| {
+        std.mem.writeInt(u16, file[8 + header.len + index * 2 ..][0..2], 0x3f80, .little);
+    }
+    const head = try loadHeadBytes(allocator, encoder_json, &file, 1);
+    defer allocator.destroy(head);
+    defer head.deinit();
+    var logits: [max_options]f32 = undefined;
+    try head.apply(&.{2}, 1, &logits);
+    for (logits) |logit| try std.testing.expectEqual(@as(f32, 2), logit);
+    try std.testing.expectError(error.InvalidGlideReadout, loadHeadBytes(allocator, encoder_json, &file, 2));
 
     // Descriptive fields the runtime does not use never reject a checkpoint.
     const decoder_json = try std.fmt.allocPrint(allocator,

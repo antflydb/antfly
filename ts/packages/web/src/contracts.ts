@@ -2,7 +2,14 @@
 export type WeightPrecision = "q8_0" | "q4_k" | "q4_0" | "fp32" | "fp16_encoder" | "fp16" | "bf16";
 export type Backend = "auto" | "wasm" | "webgpu";
 export type RuntimeArchitecture = "span" | "boundary" | "modernbert" | "embedding";
-export type ModelFamily = "gliner2" | "gliner25" | "decide" | "laya" | "opendecider" | "embedding";
+export type ModelFamily =
+  | "gliner2"
+  | "gliner25"
+  | "decide"
+  | "laya"
+  | "opendecider"
+  | "embedding"
+  | "glide";
 export type InferenceTask = "extract" | "decide" | "embed";
 export type DecisionKind = "choice" | "multi_choice" | "score" | "predicate";
 export type ModelCapabilities = Readonly<{

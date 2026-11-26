@@ -18865,6 +18865,7 @@ fn resubmitPendingAssetOutputs(
     outcome: *AssetBatchOutcome,
     claimed: *std.ArrayListUnmanaged([32]u8),
 ) !usize {
+    if (comptime builtin.os.tag == .freestanding) return 0;
     var served: usize = 0;
     for (items, 0..) |*item, index| {
         const key = (try submittedOutputKey(item)) orelse continue;
@@ -18935,7 +18936,7 @@ fn flushAssetProducerBatchItems(
     // it; only the rest reach a provider.
     var claimed: std.ArrayListUnmanaged([32]u8) = .empty;
     defer {
-        for (claimed.items) |key| runtime.submitted_outputs.release(key);
+        if (comptime builtin.os.tag != .freestanding) for (claimed.items) |key| runtime.submitted_outputs.release(key);
         claimed.deinit(runtime.alloc);
     }
     const pending_count = try resubmitPendingAssetOutputs(runtime, items, window, scope, &outcome, &claimed);
@@ -20107,12 +20108,12 @@ fn applyAssetProducerBatchOutput(
         // Until the owner applies it, a replay retry resubmits these bytes
         // rather than invoking the provider again for the same input.
         const submitted = try submittedOutputKey(item);
-        if (submitted) |key| try runtime.submitted_outputs.put(runtime.alloc, key, produced);
+        if (comptime builtin.os.tag != .freestanding) if (submitted) |key| try runtime.submitted_outputs.put(runtime.alloc, key, produced);
         // Keep the output across retries (pending, catalog activation drift,
         // owner rejections); only acceptance retires it. The output depends
         // on the producer input alone, and every resubmission is validated.
         try enqueueAssetProducerOutput(runtime, item.request, value, item.artifact_key, validated);
-        if (submitted) |key| runtime.submitted_outputs.remove(runtime.alloc, key);
+        if (comptime builtin.os.tag != .freestanding) if (submitted) |key| runtime.submitted_outputs.remove(runtime.alloc, key);
         return;
     }
     var writes: std.ArrayListUnmanaged(KVPair) = .empty;
@@ -20171,9 +20172,9 @@ fn applyAssetProducerBatchOutput(
     // the provider ran), the ordered retry publishes these bytes instead of
     // producing them again.
     const recorded = try submittedOutputKey(item);
-    if (recorded) |key| try runtime.submitted_outputs.put(runtime.alloc, key, produced);
+    if (comptime builtin.os.tag != .freestanding) if (recorded) |key| try runtime.submitted_outputs.put(runtime.alloc, key, produced);
     try storePutBatchGuarded(runtime, writes.items, &.{}, .{ .doc_key = item.request.doc_key, .digest = sourceRecordDigest(item.raw_doc), .upstream_name = item.request.upstream_artifact_name, .upstream_digest = item.upstream_digest, .producer_name = requestArtifactName(item.request), .producer_recipe = producer_recipe, .dependency = if (item.context_publish) |publish| .{ .artifact = requestArtifactName(item.request), .publish = publish, .new_version = true, .producer_recipe = producer_recipe } else null });
-    if (recorded) |key| runtime.submitted_outputs.remove(runtime.alloc, key);
+    if (comptime builtin.os.tag != .freestanding) if (recorded) |key| runtime.submitted_outputs.remove(runtime.alloc, key);
 
     try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, item.artifact_key);
 

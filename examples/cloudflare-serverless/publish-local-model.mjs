@@ -155,12 +155,56 @@ export async function prepare({ modelDir, out, urlBase = "/local/models/", id, n
   return catalog;
 }
 
+export async function prepareGlide({ modelDir, out }) {
+  const config = JSON.parse(await readFile(join(modelDir, "config.json"), "utf8"));
+  const decision = JSON.parse(await readFile(join(modelDir, "decision_config.json"), "utf8"));
+  if (config.model_type !== "modernbert" || decision.backbone !== "encoder" || decision.format_version !== 1)
+    throw Error("Expected an encoder GLiDE decision checkpoint");
+  const index = JSON.parse(await readFile(join(modelDir, "model.safetensors.index.json"), "utf8"));
+  const weights = [...new Set(Object.values(index.weight_map ?? {}))];
+  if (weights.length !== 1 || !/^model-\d+-of-\d+\.safetensors$/.test(weights[0]))
+    throw Error("Expected one GLiDE SafeTensors shard");
+  const paths = [
+    "config.json", "decision_config.json", "tokenizer.json", "tokenizer_config.json",
+    "model.safetensors.index.json", weights[0], "readout.safetensors",
+    "LICENSE", "NOTICE", "licenses/Ettin-encoder-400m-LICENSE",
+  ];
+  const files = [];
+  for (const path of paths) {
+    const source = join(modelDir, path);
+    const size = (await stat(source)).size;
+    if (size < 1 || size > 1024 ** 3) throw Error(`Invalid GLiDE artifact size: ${path}`);
+    const target = join(out, path);
+    await mkdir(dirname(target), { recursive: true });
+    if (resolve(source) !== resolve(target)) await copyFile(source, target);
+    files.push({ path, url: "/local/models/glide/" + path, sha256: await sha256(target), size_bytes: size });
+  }
+  const catalog = {
+    id: "glide-0.4b-" + files.find(file => file.path === weights[0]).sha256.slice(0, 12),
+    name: "GLiDE 0.4B (BF16)",
+    family: "glide",
+    architecture: "modernbert",
+    tasks: ["decide"],
+    capabilities: ["typed_decisions"],
+    precision: "bf16",
+    qualification: "pending",
+    license: "Fastino Community License",
+    files,
+  };
+  await writeFile(join(out, "catalog.json"), JSON.stringify(catalog, null, 2) + "\n");
+  return catalog;
+}
+
 function upload(out, catalog, { bucket, prefix, local }) {
   // Weights first, catalog last: browsers only see a catalog whose files exist.
   for (const path of [...catalog.files.map((f) => f.path), "catalog.json"]) {
     const result = spawnSync(
       "npx",
-      ["wrangler", "r2", "object", "put", `${bucket}/${prefix}${path}`, "--file", join(out, path), local ? "--local" : "--remote"],
+      [
+        "wrangler", "r2", "object", "put", `${bucket}/${prefix}${path}`, "--file", join(out, path),
+        // --local writes where `npm run dev:mail` keeps the app Worker's R2 state.
+        ...(local ? ["--local", "--persist-to", join(import.meta.dirname, "dist/mail-local/app/.wrangler/state")] : ["--remote"]),
+      ],
       { stdio: "inherit" }
     );
     if (result.status !== 0) throw Error(`upload failed: ${path}`);
@@ -179,13 +223,14 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
     process.exit(2);
   }
   const out = resolve(args.out ?? "dist/local-model");
-  const catalog = await prepare({ modelDir: resolve(args["model-dir"]), out });
+  const catalog = await (args.glide ? prepareGlide : prepare)({ modelDir: resolve(args["model-dir"]), out });
   const total = catalog.files.reduce((sum, f) => sum + f.size_bytes, 0);
   console.log(`prepared ${catalog.files.length} files (${(total / 1024 ** 2).toFixed(0)} MiB) in ${out}`);
+  if (args.upload && args.glide && !args.local) throw Error("Upload GLiDE through R2 S3 multipart and publish its catalog last");
   if (args.upload)
     upload(out, catalog, {
       bucket: args.bucket ?? "antfly-mail-models",
-      prefix: args.prefix ?? "local-models/",
+      prefix: args.prefix ?? (args.glide ? "local-models/glide/" : "local-models/"),
       local: args.local === true,
     });
 }

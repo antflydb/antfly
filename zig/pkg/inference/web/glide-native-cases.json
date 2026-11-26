@@ -1,0 +1,130 @@
+[
+  {
+    "request": {
+      "model": "glide-0.4b",
+      "input": "Subject: Your flight moved\nYour flight leaves at 6 AM instead of 9 AM tomorrow. Please confirm the change.",
+      "questions": [
+        {
+          "name": "category",
+          "type": "choice",
+          "instructions": "What is the main purpose of this email?",
+          "choices": [
+            {
+              "value": "primary",
+              "description": "A direct personal or work conversation"
+            },
+            {
+              "value": "updates",
+              "description": "A transaction, reservation, or account notice"
+            },
+            {
+              "value": "promotions",
+              "description": "An advertisement or discount"
+            },
+            {
+              "value": "social",
+              "description": "A notification from a social network"
+            },
+            {
+              "value": "forums",
+              "description": "A discussion list or forum message"
+            }
+          ]
+        },
+        {
+          "name": "important",
+          "type": "predicate",
+          "instructions": "Does this message require timely attention from the recipient?"
+        },
+        {
+          "name": "urgency",
+          "type": "score",
+          "instructions": "How soon must the recipient act?",
+          "levels": [
+            {
+              "label": "routine"
+            },
+            {
+              "label": "soon"
+            },
+            {
+              "label": "immediate"
+            }
+          ]
+        }
+      ]
+    },
+    "response": {
+      "model": "glide-0.4b",
+      "usage": {
+        "input_tokens": 382,
+        "output_tokens": 0
+      },
+      "answers": [
+        {
+          "confidence": 0.7603576591018497,
+          "confidence_method": "normalized_inverse_entropy",
+          "choice": "updates",
+          "name": "category",
+          "type": "choice",
+          "decision_method": "typed",
+          "probabilities": [
+            {
+              "probability": 0.10201141472319274,
+              "value": "primary"
+            },
+            {
+              "probability": 0.8895635694854425,
+              "value": "updates"
+            },
+            {
+              "probability": 0.0018046709975180577,
+              "value": "promotions"
+            },
+            {
+              "probability": 0.0045520353979044146,
+              "value": "social"
+            },
+            {
+              "probability": 0.0020683093959422477,
+              "value": "forums"
+            }
+          ]
+        },
+        {
+          "confidence": 0.35569138066254824,
+          "confidence_method": "normalized_inverse_entropy",
+          "name": "important",
+          "type": "predicate",
+          "decision_method": "typed",
+          "probability": 0.8357806837748689
+        },
+        {
+          "confidence": 0.23934736330447481,
+          "confidence_method": "normalized_inverse_entropy",
+          "score": 0.8212381947287745,
+          "name": "urgency",
+          "type": "score",
+          "decision_method": "typed",
+          "probabilities": [
+            {
+              "probability": 0.26217519765233327,
+              "value": 0,
+              "label": "routine"
+            },
+            {
+              "probability": 0.654411409966559,
+              "value": 1,
+              "label": "soon"
+            },
+            {
+              "probability": 0.08341339238110772,
+              "value": 2,
+              "label": "immediate"
+            }
+          ]
+        }
+      ]
+    }
+  }
+]

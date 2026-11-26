@@ -3854,7 +3854,7 @@ const ExperimentalPostingReadGeneration = struct {
     wal_committed_bytes: @import("antfly_platform").atomic.Value(u64),
     // Zero denotes a boundary with no WAL batch. Read and replace under
     // index mutation admission along with the durable cursor.
-    peer_last_batch: std.atomic.Value(u64) = .init(0),
+    peer_last_batch: AtomicU64 = .init(0),
     /// Query-visible topology owned by this exact immutable posting
     /// generation. It is initialized before publication and never changes.
     search_view: SearchViewToken = .{},

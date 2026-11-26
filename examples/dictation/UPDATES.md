@@ -214,6 +214,25 @@ Feed URLs:
 - `https://releases.antfly.io/antfly-dictation/channels/stable/appcast.xml`
 - `https://releases.antfly.io/antfly-dictation/channels/beta/appcast.xml`
 
+Permanent installation link:
+`https://releases.antfly.io/antfly-dictation/download.html`
+
+This small HTML page redirects to the immutable Apple Silicon ZIP and provides a
+normal download link if automatic refresh is disabled. It follows successful beta
+releases until the first stable app release; after that it follows stable only,
+even if a beta has a higher version. It is promoted only after exact release
+verification and feed publication. Conditional writes prevent concurrent releases
+from downgrading it, and retries repair partial feed/download promotion. Failed
+builds, signing, notarization, or uploads leave the previous download intact.
+The page uses `Cache-Control: no-cache, no-transform`; do not override it at the CDN.
+The signed Sparkle feeds remain the app updater’s authority.
+
+To initialize this link for an already published release after merging the
+publisher change, run the existing **Dictation release recovery** workflow with
+that release’s tag, original source commit, and trusted ledger SHA-256. It verifies
+and reuses the original signed bytes; no retagging or rebuilding is needed.
+Initialize it before deploying documentation that uses the permanent link.
+
 Archive URL:
 `https://releases.antfly.io/antfly-dictation/releases/<version>/Antfly-Dictation-<version>-arm64.zip`
 
@@ -317,7 +336,7 @@ archive paths and links, and verifies the staged payload, including licenses.
 Cached downloads are verified before reuse. It never follows a mutable latest URL
 at app startup and never invokes Zig or builds Antfly from source.
 
-The current pin is **v0.3.1**, the published stable release used for
+The current pin is **v0.3.4**, the published stable release used for
 this app's compatibility qualification. The app and runtime require macOS 15 and
 Apple Silicon. Intel app builds and runtime fallbacks are not supported.
 The signed app contains the released CLI and its notices, not a separately built

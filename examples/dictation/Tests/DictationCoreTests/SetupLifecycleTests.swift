@@ -277,6 +277,10 @@ extension SetupLifecycleTests {
     let store = Store(
       directory: root, registerHotkey: false, clientFactory: { _ in connection },
       managedAppleSupport: { true })
+    // The mock inventory below installs only en-US. This test exercises setup
+    // state transitions, so keep language selection independent of the runner.
+    store.config.presets[0].languageChoice = .custom
+    store.config.presets[0].language = "en-US"
     store.config.presets[0].automaticallySelectLocalTranscriber = false
     store.runModelSetup(.whisper) {
       if terminal == "failed" { throw DictationError.invalid("Synthetic failure") }
