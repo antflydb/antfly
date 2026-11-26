@@ -30,6 +30,8 @@ const MetalNativeProvider = @import("../backends/metal_native_provider.zig").Met
 const State = @import("inkling2_state_metal.zig").State;
 const memory = @import("../runtime/tier/memory.zig");
 const Scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler;
+const observation = @import("../execution/invocation_observation.zig");
+const diagnostics = @import("../execution/diagnostics.zig");
 
 // The resident decoder records frames against a single Metal runtime.
 pub const max_active_requests = 1;
@@ -107,6 +109,7 @@ pub const Runtime = struct {
     vision: vision_model.Vision,
     eos: u32,
     resident_bytes: usize,
+    invocation_diagnostics: diagnostics.Diagnostics = .{},
     scheduler: Scheduler = .{},
     gate: std.atomic.Mutex = .unlocked,
 
@@ -133,7 +136,15 @@ pub const Runtime = struct {
         errdefer self.model.deinit();
         self.vision = try .load(a, raw, source);
         self.resident_bytes = self.model.residentBytes() + self.vision.residentBytes();
-        return .{ .ptr = self, .vtable = &vtable };
+        return .{
+            .ptr = self,
+            .vtable = &vtable,
+            .invocation_diagnostics = .{
+                .diagnostics = &self.invocation_diagnostics,
+                .model_allocator = a,
+                .context_runtime_scope = .unavailable,
+            },
+        };
     }
 
     /// Widen only the automatically chosen KV bucket, and only when the
@@ -184,7 +195,7 @@ pub const Runtime = struct {
         var waiter: Scheduler.Waiter = .{};
         try self.scheduler.enter(&waiter, &self.gate, pipeline.control);
         defer Scheduler.leave(&waiter);
-        return pipeline.generateWithPlan(&self.model, &self.vision, self.eos, config, callbacks, plan);
+        return pipeline.generateWithPlan(&self.model, &self.vision, self.eos, config, callbacks, plan, session.invocation_diagnostics);
     }
 
     const vtable: backends.Session.VTable = .{
@@ -283,11 +294,11 @@ pub const TextPipeline = struct {
 
     /// The caller owns the runtime execution gate and memory admission for
     /// the complete request, including prompt prefill and streaming callbacks.
-    pub fn generate(self: *const TextPipeline, model: *const decoder.Decoder, eos: u32, config: generation.GenerationConfig, callbacks: Callbacks) !generation.GenerationResult {
-        return self.generateWithPlan(model, null, eos, config, callbacks, try self.requestPlan(model, config));
+    pub fn generate(self: *const TextPipeline, model: *const decoder.Decoder, eos: u32, config: generation.GenerationConfig, callbacks: Callbacks, binding: ?observation.Binding) !generation.GenerationResult {
+        return self.generateWithPlan(model, null, eos, config, callbacks, try self.requestPlan(model, config), binding);
     }
 
-    fn generateWithPlan(self: *const TextPipeline, model: *const decoder.Decoder, vision: ?*const vision_model.Vision, eos: u32, config: generation.GenerationConfig, callbacks: Callbacks, plan: decoder.RequestPlan) !generation.GenerationResult {
+    fn generateWithPlan(self: *const TextPipeline, model: *const decoder.Decoder, vision: ?*const vision_model.Vision, eos: u32, config: generation.GenerationConfig, callbacks: Callbacks, plan: decoder.RequestPlan, binding: ?observation.Binding) !generation.GenerationResult {
         try self.check();
         var request: decoder.Request = undefined;
         try request.initWithPlan(self.allocator, model, plan);
@@ -298,7 +309,7 @@ pub const TextPipeline = struct {
         const greedy = chat.usesUnpenalizedGreedy(config);
         const after = self.prompt.suffix;
         const chunk_rows: u32 = @intCast(plan.bank.layout.max_append_tokens);
-        try self.prefillPrompt(&request, model, vision, after[0 .. after.len - 1], chunk_rows);
+        try observation.callOperation(binding, .prefill, prefillPrompt, .{ self, &request, model, vision, after[0 .. after.len - 1], chunk_rows, binding });
         if (!greedy) {
             for (self.prompt.media) |item| {
                 for (item.prefix) |id| try history.append(self.allocator, id);
@@ -328,9 +339,9 @@ pub const TextPipeline = struct {
         while (output.tokens.items.len < limit) {
             try self.check();
             if (greedy) {
-                token = try request.stepGreedy(token);
+                token = try observation.callOperation(binding, .decode_step, decoder.Request.stepGreedy, .{ &request, token });
             } else {
-                const logits = try request.step(token);
+                const logits = try observation.callOperation(binding, .decode_step, decoder.Request.step, .{ &request, token });
                 try history.append(self.allocator, token);
                 token = @intCast(generation.sampleTokenFromLogits(self.allocator, logits, config, history.items));
             }
@@ -341,7 +352,7 @@ pub const TextPipeline = struct {
         return output.finalize(self.options, self.prompt.count(), limit);
     }
 
-    fn prefillPrompt(self: *const TextPipeline, request: *decoder.Request, model: *const decoder.Decoder, vision: ?*const vision_model.Vision, after: []const i32, chunk_rows: u32) !void {
+    fn prefillPrompt(self: *const TextPipeline, request: *decoder.Request, model: *const decoder.Decoder, vision: ?*const vision_model.Vision, after: []const i32, chunk_rows: u32, binding: ?observation.Binding) !void {
         const media = self.prompt.media;
         const count = media.len * 2 + 1;
         var local_images: [1]?vision_model.Vision.Embeddings = undefined;
@@ -376,7 +387,7 @@ pub const TextPipeline = struct {
                     const stored = &image_rows[index];
                     if (stored.* == null) {
                         const encoder = vision orelse return error.UnsupportedInkling2Request;
-                        stored.* = try self.encodeImage(model, encoder, media[index].image);
+                        stored.* = try observation.callOperation(binding, .encoder, encodeImage, .{ self, model, encoder, media[index].image });
                     }
                     const values = &stored.*.?;
                     break :blk .{ .embeddings = .{ .tensor = &values.tensor, .start = 0, .count = values.rows } };

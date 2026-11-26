@@ -1000,10 +1000,17 @@ test "Inkling Metal resident decoder executes the full visit schedule on a synth
         .options = .{},
     };
     defer pipeline.deinit();
-    var generated = try pipeline.generate(&model, 1, .{ .max_tokens = 2, .ignore_eos = true }, .{});
+    var diagnostics = @import("../execution/diagnostics.zig").Diagnostics{};
+    diagnostics.configure(true);
+    var generated = try pipeline.generate(&model, 1, .{ .max_tokens = 2, .ignore_eos = true }, .{}, .{ .diagnostics = &diagnostics });
     defer generated.deinit();
     try std.testing.expectEqualSlices(i32, &.{ 0, 1 }, generated.token_ids.?);
     try std.testing.expectEqualStrings("length", generated.finish_reason);
     try std.testing.expectEqual(@as(usize, 1), generated.prompt_tokens);
+    const measured = diagnostics.snapshot().?;
+    try std.testing.expectEqual(.decode_step, measured.operation);
+    try std.testing.expectEqual(.success, measured.outcome);
+    try std.testing.expect(measured.runtime.submission.?.metal_encoded_dispatches.? > 0);
+    try std.testing.expectEqual(.unavailable, measured.context_runtime_scope);
     try std.testing.expectEqual(weights_before, model.residentBytes());
 }
