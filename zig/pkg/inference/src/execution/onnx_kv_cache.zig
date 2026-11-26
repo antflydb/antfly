@@ -33,13 +33,18 @@ pub fn presentNameMatchesPastInput(past_input_name: []const u8, present_output_n
     return std.mem.eql(u8, past_suffix, present_suffix);
 }
 
-const CacheRole = enum { self_attention, cross_attention };
+pub const CacheRole = enum { self_attention, cross_attention };
 
 /// Exported cache slots are keyed by the exact layer/owner/component suffix.
-fn cacheRole(suffix: []const u8) ?CacheRole {
+pub fn cacheRole(suffix: []const u8) ?CacheRole {
+    return parseRole(suffix, false);
+}
+
+fn parseRole(suffix: []const u8, compact_self: bool) ?CacheRole {
     const dot = std.mem.indexOfScalar(u8, suffix, '.') orelse return null;
     const ending = suffix[dot..];
-    const role: CacheRole = if (std.mem.eql(u8, ending, ".decoder.key") or std.mem.eql(u8, ending, ".decoder.value"))
+    const role: CacheRole = if (std.mem.eql(u8, ending, ".decoder.key") or std.mem.eql(u8, ending, ".decoder.value") or
+        (compact_self and (std.mem.eql(u8, ending, ".key") or std.mem.eql(u8, ending, ".value"))))
         .self_attention
     else if (std.mem.eql(u8, ending, ".encoder.key") or std.mem.eql(u8, ending, ".encoder.value"))
         .cross_attention
@@ -57,6 +62,11 @@ pub fn isCrossCacheSuffix(suffix: []const u8) bool {
     return cacheRole(suffix) == .cross_attention;
 }
 
+/// Decoder-only artifacts also publish the compact `present.<layer>.key` form.
+pub fn presentOutputRole(name: []const u8) ?CacheRole {
+    return parseRole(presentOutputSuffix(name) orelse return null, true);
+}
+
 test "ONNX cache roles use the same suffix for past and present" {
     try std.testing.expect(presentNameMatchesPastInput("past_key_values.2.encoder.key", "present.2.encoder.key"));
     try std.testing.expect(!presentNameMatchesPastInput("past_key_values.2.encoder.key", "present.2.decoder.key"));
@@ -68,5 +78,7 @@ test "ONNX cache roles use the same suffix for past and present" {
         try std.testing.expect(!validCacheSuffix(malformed));
         try std.testing.expect(!isCrossCacheSuffix(malformed));
     }
+    try std.testing.expect(!validCacheSuffix("2.key"));
+    try std.testing.expectEqual(CacheRole.self_attention, presentOutputRole("present.2.key").?);
     try std.testing.expect(presentOutputSuffix("logits") == null);
 }

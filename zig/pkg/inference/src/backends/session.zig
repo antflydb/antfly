@@ -1012,12 +1012,13 @@ pub const CachedDecoderGeometry = struct {
                 bytes = try addBytes(bytes, try mulBytes(try mulBytes(try mulBytes(batch, tokens), self.vocab_size), output.dtype.byteSize()));
             } else {
                 const suffix = onnx_cache.presentOutputSuffix(output.name) orelse return error.UnresolvedOutputGeometry;
+                const role = onnx_cache.cacheRole(suffix) orelse return error.UnresolvedOutputGeometry;
                 if (output.shape.len != 4) return error.UnresolvedOutputGeometry;
                 const preferred = if (index < self.past_input_indices.len) self.past_input_indices[index] else null;
                 const cached = findPastInput(inputs, suffix, preferred) orelse return error.MissingInputs;
                 if (cached.shape.len != 4 or cached.shape[1] <= 0 or cached.shape[2] < 0 or cached.shape[3] <= 0) return error.InvalidInputShape;
                 const past_length: usize = @intCast(cached.shape[2]);
-                const time = if (onnx_cache.isCrossCacheSuffix(suffix)) cross: {
+                const time = if (role == .cross_attention) cross: {
                     if (past_length != 0 and past_length != context) return error.InvalidDecoderPosition;
                     break :cross context;
                 } else self: {
@@ -1054,6 +1055,11 @@ test "ONNX cache geometry prebinds exact names across reordered inputs and outpu
     try std.testing.expectEqual(expected, try geometry.resolve(.{ .shapes = &.{ ids, encoder, self_cache, cross_cache } }, &.{ logits, self_output, cross_output }, 2));
     try std.testing.expectEqual(expected, try geometry.resolve(.{ .shapes = &.{ cross_cache, encoder, ids, self_cache } }, &.{ self_output, logits, cross_output }, 2));
     try std.testing.expectError(error.MissingInputs, geometry.resolve(.{ .shapes = &.{ ids, encoder, cross_cache } }, &.{ logits, self_output, cross_output }, 2));
+    var malformed_past = self_cache;
+    malformed_past.name = "past_key_values.0.extra.encoder.key";
+    var malformed_present = self_output;
+    malformed_present.name = "present.0.extra.encoder.key";
+    try std.testing.expectError(error.UnresolvedOutputGeometry, geometry.resolve(.{ .shapes = &.{ ids, encoder, malformed_past } }, &.{ logits, malformed_present }, 2));
 }
 
 test "ONNX cache geometry rejects inconsistent decoder positions before admission" {
@@ -1187,14 +1193,16 @@ const OutputAdmission = struct {
     }
 };
 
+fn addRetainedOutput(amounts: *memory.AdmissionAmounts, output: Tensor, is_cache: bool) !void {
+    const bytes = try addBytes(output.data.len, try mulBytes(output.shape.len, @sizeOf(i64)));
+    const category = if (is_cache) &amounts.host_kv_bytes else &amounts.host_scratch_bytes;
+    category.* = try addBytes(category.*, bytes);
+}
+
 pub fn retainedOutputAmounts(outputs: []const Tensor, cache_qualified: bool) !memory.AdmissionAmounts {
     var amounts = memory.AdmissionAmounts{};
-    for (outputs) |output| {
-        const bytes = try addBytes(output.data.len, try mulBytes(output.shape.len, @sizeOf(i64)));
-        if (cache_qualified and onnx_cache.presentOutputSuffix(output.name) != null) {
-            amounts.host_kv_bytes = try addBytes(amounts.host_kv_bytes, bytes);
-        } else amounts.host_scratch_bytes = try addBytes(amounts.host_scratch_bytes, bytes);
-    }
+    for (outputs) |output|
+        try addRetainedOutput(&amounts, output, cache_qualified and onnx_cache.presentOutputRole(output.name) != null);
     return amounts;
 }
 
@@ -1208,10 +1216,6 @@ pub const OutputCredits = struct {
     covered: bool,
     const Entry = struct { group: usize = 0, remaining: usize = 0, amounts: memory.AdmissionAmounts = .{} };
 
-    fn cacheGroup(name: []const u8) ?bool {
-        return onnx_cache.isCrossCacheSuffix(onnx_cache.presentOutputSuffix(name) orelse return null);
-    }
-
     pub fn init(allocator: std.mem.Allocator, outputs: []const Tensor, cache_qualified: bool, covered: bool) !OutputCredits {
         const entries = try allocator.alloc(Entry, outputs.len);
         errdefer allocator.free(entries);
@@ -1220,17 +1224,16 @@ pub const OutputCredits = struct {
         var cache_groups: [2]?usize = .{ null, null };
         for (outputs, 0..) |output, index| {
             var group = index;
-            if (cacheGroup(output.name)) |kind| {
-                const slot = &cache_groups[@intFromBool(kind)];
+            const role = onnx_cache.presentOutputRole(output.name);
+            if (role) |kind| {
+                const slot = &cache_groups[@backingInt(kind)];
                 group = slot.* orelse index;
                 slot.* = group;
             }
             entries[index].group = group;
             if (group == index) groups += 1;
             entries[group].remaining += 1;
-            const amounts = try retainedOutputAmounts(&.{output}, cache_qualified);
-            entries[group].amounts.host_scratch_bytes = try addBytes(entries[group].amounts.host_scratch_bytes, amounts.host_scratch_bytes);
-            entries[group].amounts.host_kv_bytes = try addBytes(entries[group].amounts.host_kv_bytes, amounts.host_kv_bytes);
+            try addRetainedOutput(&entries[group].amounts, output, cache_qualified and role != null);
         }
         return .{ .entries = entries, .remaining_groups = groups, .covered = covered };
     }
@@ -6732,6 +6735,19 @@ test "session output admission coalesces cache column callbacks" {
     permit.deinit();
     try std.testing.expectEqual(@as(usize, 1), probe.releases);
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
+
+    var malformed = outputs[0];
+    malformed.name = "present.0.decoder.encoder.key";
+    var compact = outputs[0];
+    compact.name = "present.0.key";
+    const mixed = [_]Tensor{ outputs[0], malformed, outputs[64], compact };
+    const total = try retainedOutputAmounts(&mixed, true);
+    try std.testing.expectEqual(@as(usize, 36), total.host_kv_bytes);
+    try std.testing.expectEqual(@as(usize, 12), total.host_scratch_bytes);
+    var separate = try OutputCredits.init(std.testing.allocator, &mixed, true, true);
+    defer separate.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 3), separate.remaining_groups);
+    try std.testing.expectEqual(@as(usize, 12), separate.retire(1).?.host_scratch_bytes);
 }
 
 test "session output admission releases obsolete outputs independently" {
