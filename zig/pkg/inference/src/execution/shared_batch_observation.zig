@@ -21,13 +21,17 @@ const diagnostics = @import("diagnostics.zig");
 const invocation = @import("invocation_observation.zig");
 var next_identity: std.atomic.Value(u64) = .init(1);
 
-pub inline fn call(binding: ?invocation.Binding, backend: ops.ComputeBackend, kind: diagnostics.Batch.Kind, items: anytype, comptime describe: anytype, callback: anytype, args: anytype) @TypeOf(@call(.auto, callback, args)) {
+pub inline fn call(binding: ?invocation.Binding, backend: ?ops.ComputeBackend, kind: diagnostics.Batch.Kind, items: anytype, comptime describe: anytype, callback: anytype, args: anytype) @TypeOf(@call(.auto, callback, args)) {
     const source = binding orelse return @call(.auto, callback, args);
     if (!source.diagnostics.isEnabled()) return @call(.auto, callback, args);
     return observed(source, backend, kind, items, describe, callback, args);
 }
-noinline fn observed(binding: invocation.Binding, backend: ops.ComputeBackend, kind: diagnostics.Batch.Kind, items: anytype, comptime describe: anytype, callback: anytype, args: anytype) @TypeOf(@call(.auto, callback, args)) {
-    var selected = binding.forBackend(backend);
+noinline fn observed(binding: invocation.Binding, backend: ?ops.ComputeBackend, kind: diagnostics.Batch.Kind, items: anytype, comptime describe: anytype, callback: anytype, args: anytype) @TypeOf(@call(.auto, callback, args)) {
+    var selected = if (backend) |value| binding.forBackend(value) else binding;
+    if (backend == null) {
+        selected.stable_backend = null;
+        selected.context_runtime_scope = .unavailable;
+    }
     selected.capture_programs = true;
     selected.publication_scope = .shared_batch_numerical_dispatch;
     const cohort = metadata(kind, items, describe);
@@ -124,6 +128,12 @@ test "shared cohort observation is owned by model sink with exact participants a
     try std.testing.expectEqualDeep(rejected.batch.?, rejected.report.?.batch.?);
     try std.testing.expect(rejected.report.?.backend == null);
     try std.testing.expectEqual(@as(usize, 3), Probe.calls);
+    _ = try call(binding.forBackend(backend), null, .scheduled_step, &ids, Probe.describe, Probe.run, .{false});
+    const raw = owner.snapshot().?;
+    try std.testing.expectEqual(.shared_batch_numerical_dispatch, raw.scope);
+    try std.testing.expectEqual(.unavailable, raw.context_runtime_scope);
+    try std.testing.expect(raw.report.?.backend == null);
+    try std.testing.expectEqual(@as(usize, 2), raw.batch.?.participant_count);
     var many: [40]u64 = @splat(303);
     _ = try call(binding, backend, .scheduled_step, &many, Probe.describe, Probe.run, .{false});
     many[0] = 999;

@@ -37,6 +37,10 @@ const sync = @import("antfly_platform").sync;
 
 pub const max_active_requests = decoder.decode_batch_rows;
 
+const observation = @import("../execution/invocation_observation.zig");
+const diagnostics = @import("../execution/diagnostics.zig");
+const batch_observation = @import("../execution/shared_batch_observation.zig");
+
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
     ctx: Context,
@@ -46,6 +50,7 @@ pub const Runtime = struct {
     eos: u32,
     fast_matvec: bool,
     resident_bytes: usize,
+    invocation_diagnostics: diagnostics.Diagnostics,
     execution_gate: std.atomic.Mutex,
     steps: StepScheduler,
     batch_lock: std.atomic.Mutex,
@@ -69,6 +74,7 @@ pub const Runtime = struct {
         self.unmatched_decode = null;
         self.active_greedy = .init(0);
         self.batch_steps = @splat(.init(0));
+        self.invocation_diagnostics = .{};
         self.ctx = try Context.initDefault();
         errdefer self.ctx.deinit();
         self.fast_matvec = self.ctx.info.compute_major == 12 and self.ctx.info.compute_minor == 1;
@@ -93,7 +99,15 @@ pub const Runtime = struct {
             self.model.sharedDraftWeights(),
         );
         self.resident_bytes = self.ctx.device_allocations.snapshot().physical_live;
-        return .{ .ptr = self, .vtable = &vtable };
+        return .{
+            .ptr = self,
+            .vtable = &vtable,
+            .invocation_diagnostics = .{
+                .diagnostics = &self.invocation_diagnostics,
+                .model_allocator = allocator,
+                .context_runtime_scope = .unavailable,
+            },
+        };
     }
 
     pub fn fromSession(session: backends.Session) ?*Runtime {
@@ -132,14 +146,18 @@ pub const Runtime = struct {
         return tokens;
     }
 
-    fn decodeGreedy(self: *Runtime, request: *decoder.Request, token: u32, control: Control) !u32 {
+    fn describeDecode(request: *decoder.Request) diagnostics.Batch.Participant {
+        return .{ .phase = .decode, .query_rows = 1, .total_rows = request.position() + 1 };
+    }
+
+    fn decodeGreedy(self: *Runtime, request: *decoder.Request, token: u32, control: Control, binding: ?observation.Binding) !u32 {
         try control.check();
         const lanes = @min(request.append_capacity, max_active_requests, self.active_greedy.load(.acquire));
         if (!self.fast_matvec or !request.canBatchGreedy() or control.io == null or lanes < 2) {
             var turn: StepScheduler.Waiter = .{};
             try self.enterStep(&turn, control);
             defer StepScheduler.leave(&turn);
-            return request.stepGreedy(token);
+            return observation.callOperation(binding, .decode_step, decoder.Request.stepGreedy, .{ request, token });
         }
 
         var step: DecodeStep = .{ .request = request, .token = token, .io = control.io.?, .peer_limit = lanes - 1 };
@@ -178,7 +196,7 @@ pub const Runtime = struct {
             entered catch |err| break :blk err;
             if (peers.len == 0) {
                 try control.check();
-                return request.stepGreedy(token);
+                return observation.callOperation(binding, .decode_step, decoder.Request.stepGreedy, .{ request, token });
             }
             var requests: [max_active_requests]*decoder.Request = undefined;
             var tokens: [max_active_requests]u32 = undefined;
@@ -188,7 +206,7 @@ pub const Runtime = struct {
                 member.* = follower.request;
                 id.* = follower.token;
             }
-            break :blk decoder.Request.stepGreedyBatch(requests[0..count], tokens[0..count], results[0..count]);
+            break :blk batch_observation.call(binding, null, .scheduled_step, requests[0..count], describeDecode, decoder.Request.stepGreedyBatch, .{ requests[0..count], tokens[0..count], results[0..count] });
         };
         if (completed) |_| {
             _ = self.batch_steps[count - 2].fetchAdd(1, .monotonic);
@@ -340,7 +358,11 @@ pub const Pipeline = struct {
             var turn: StepScheduler.Waiter = .{};
             try self.model.enterStep(&turn, self.control);
             defer StepScheduler.leave(&turn);
-            if (count == 1) try request.append(tokens[0]) else try request.appendTokens(tokens[0..count]);
+            const binding = self.session.invocation_diagnostics;
+            if (count == 1)
+                try observation.callOperation(binding, .prefill, decoder.Request.append, .{ request, tokens[0] })
+            else
+                try observation.callOperation(binding, .prefill, decoder.Request.appendTokens, .{ request, tokens[0..count] });
             offset += count;
         }
     }
@@ -372,7 +394,7 @@ pub const Pipeline = struct {
         var turn: StepScheduler.Waiter = .{};
         try self.model.enterStep(&turn, self.control);
         defer StepScheduler.leave(&turn);
-        return self.model.encoder.encodeRgb(&self.model.model.blas, rgb.data, rgb.width, rgb.height);
+        return observation.callOperation(self.session.invocation_diagnostics, .encoder, vision.Vision.encodeRgb, .{ &self.model.encoder, &self.model.model.blas, rgb.data, rgb.width, rgb.height });
     }
 
     fn prefillImage(self: *Pipeline, request: *decoder.Request, image: Prompt.Image) !void {
@@ -394,22 +416,23 @@ pub const Pipeline = struct {
             var turn: StepScheduler.Waiter = .{};
             try self.model.enterStep(&turn, self.control);
             defer StepScheduler.leave(&turn);
-            try request.appendEmbeddings(.{
+            const input: @import("../ops/cuda/buffer.zig").DeviceBuffer = .{
                 .ptr = embeddings.device.ptr + @as(usize, offset) * row_bytes,
                 .len = @as(usize, rows) * row_bytes,
                 .borrowed = true,
-            }, rows);
+            };
+            try observation.callOperation(self.session.invocation_diagnostics, .prefill, decoder.Request.appendEmbeddings, .{ request, input, rows });
             offset += rows;
         }
     }
 
     fn next(self: *Pipeline, request: *decoder.Request, config: generation.GenerationConfig, history: *std.ArrayList(i64), token: u32) !u32 {
-        if (usesGreedy(config)) return self.model.decodeGreedy(request, token, self.control);
+        if (usesGreedy(config)) return self.model.decodeGreedy(request, token, self.control, self.session.invocation_diagnostics);
         const logits = blk: {
             var turn: StepScheduler.Waiter = .{};
             try self.model.enterStep(&turn, self.control);
             defer StepScheduler.leave(&turn);
-            break :blk try request.step(token);
+            break :blk try observation.callOperation(self.session.invocation_diagnostics, .decode_step, decoder.Request.step, .{ request, token });
         };
         try history.append(self.allocator, token);
         return @intCast(generation.sampleTokenFromLogits(self.allocator, logits, config, history.items));
