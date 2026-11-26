@@ -3482,7 +3482,6 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
     // adjacent work around required runtime drains while preserving mRoPE,
     // barriers, and the alternating hidden-state carrier. Disabling the decode
     // gate restores per-layer boundaries; prepared prefill remains an opt-in.
-    var owns_qwen3vl_forward_frame = false;
     const qwen3vl_forward_context = decode_context;
     const qwen3vl_eager_decode_frame = isDecodeStep(decode_context) and
         qwen3VlMetalDecodeFrameEnabled() and
@@ -3497,21 +3496,15 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
     const qwen35_forward_frame = config.hasQwen35VisionArchitectureContract() and
         qwen3vl_forward_context != null and
         !getenvBool("TERMITE_METAL_DISABLE_QWEN35_FORWARD_FRAME");
-    if (cb.kind() == .metal and
-        trace_sink == null and
-        ((config.family == .qwen3_vl and (qwen3vl_eager_decode_frame or qwen3vl_prepared_prefill_frame)) or qwen35_forward_frame) and
-        !cb.decoderRuntimeHasActiveFrame())
-    {
-        owns_qwen3vl_forward_frame = try cb.decoderRuntimeBeginFrame();
-        if (owns_qwen3vl_forward_frame) {
-            try cb.decoderRuntimeSetActiveFrameRegime(if (isDecodeStep(decode_context)) .decode else .prefill);
-        }
-    }
-    defer if (owns_qwen3vl_forward_frame) cb.decoderRuntimeCancelFrame() catch {};
+    const qwen_frame_needed = cb.kind() == .metal and trace_sink == null and
+        ((config.family == .qwen3_vl and (qwen3vl_eager_decode_frame or qwen3vl_prepared_prefill_frame)) or qwen35_forward_frame);
+    var qwen_frame: Submission = if (qwen_frame_needed) try Submission.begin(cb) else .{ .backend = cb };
+    defer qwen_frame.deinit();
+    if (qwen_frame.owns) try cb.decoderRuntimeSetActiveFrameRegime(if (isDecodeStep(decode_context)) .decode else .prefill);
 
     const prefill_stream_layers: usize = if (comptime build_options.enable_metal) blk: {
         const layers = metal_compute_mod.MetalCompute.lightOnPrefillStreamLayers(cb);
-        break :blk if (lightOnPrefillSplitEligible(config, batch, query_seq_len, decode_context != null and decode_context.?.attention_mode == .paged_prefill, owns_qwen3vl_forward_frame, layers) and trace_sink == null and
+        break :blk if (lightOnPrefillSplitEligible(config, batch, query_seq_len, decode_context != null and decode_context.?.attention_mode == .paged_prefill, qwen_frame.owns, layers) and trace_sink == null and
             !prefillTraceEnabled() and !forceLayerCloneDebug() and !debugLastRowEnabled() and
             !debugTensorStatsEnabled()) layers else 0;
     } else 0;
@@ -3519,7 +3512,7 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
         const layers = metal_compute_mod.MetalCompute.lightOnStreamFirstLayers(cb);
         // Only the explicit native greedy-stream owner may lend its frame.
         // Ordinary borrowed frames retain the existing no-submit contract.
-        const can_stream_frame = owns_qwen3vl_forward_frame or
+        const can_stream_frame = qwen_frame.owns or
             (metal_compute_mod.MetalCompute.lightOnGpuGreedyStreamEnabled(cb) and
                 cb.decoderRuntimeHasActiveFrame() and !metal_compute_mod.MetalCompute.lightOnHasSubmittedFrame(cb));
         break :blk if (lightOnForwardSplitEligible(config, batch, isDecodeStep(decode_context), can_stream_frame, layers) and
@@ -3529,7 +3522,14 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
     if (comptime build_options.enable_metal) metal_compute_mod.MetalCompute.setLightOnExpectedStreamFrames(cb, @intCast(lightOnStreamFrameCount(config.num_hidden_layers, stream_first_layers, stream_chunks)));
     // At most one submitted prefix and one active suffix exist. Drain the
     // submitted prefix on every exit before releasing any borrowed context.
-    defer if (stream_first_layers != 0) cb.decoderRuntimeWaitSubmittedFrame() catch {};
+    var qwen_pending: @import("../execution/submission.zig").Pending = .{ .backend = cb };
+    const borrowed_stream = stream_first_layers != 0 and !qwen_frame.owns;
+    defer {
+        qwen_pending.wait() catch {
+            if (qwen_pending.active) platform.inference_process_supervisor.restartWorker();
+        };
+        if (borrowed_stream) cb.decoderRuntimeWaitSubmittedFrame() catch {};
+    }
 
     if (a4b_frame.owns) {
         try deferred_a4b_hidden_frees.ensureTotalCapacity(
@@ -3667,10 +3667,16 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
             try cb.checkExecutionControl();
             // Finish the prior submitted group before promoting this active
             // group. Only the existing two storage banks can be in flight.
-            try cb.decoderRuntimeWaitSubmittedFrame();
-            try cb.decoderRuntimeSubmitFrame();
-            errdefer cb.decoderRuntimeWaitSubmittedFrame() catch {};
-            if (!try cb.decoderRuntimeBeginFrame()) return error.StreamedForwardFrameUnavailable;
+            if (borrowed_stream) {
+                try cb.decoderRuntimeWaitSubmittedFrame();
+                try cb.decoderRuntimeSubmitFrame();
+                if (!try cb.decoderRuntimeBeginFrame()) return error.StreamedForwardFrameUnavailable;
+            } else {
+                try qwen_pending.wait();
+                try qwen_frame.submitInto(&qwen_pending);
+                qwen_frame = try Submission.beginPipelined(cb);
+                if (!qwen_frame.owns) return error.StreamedForwardFrameUnavailable;
+            }
             // Preserve the prefill BF16 input policy across every new group.
             try cb.decoderRuntimeSetActiveFrameRegime(if (prefill_stream_layers != 0) .prefill else .decode);
             if (comptime build_options.enable_metal) {
@@ -3744,10 +3750,9 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
             cb.free(hidden);
     }
     hidden = final_hidden;
-    if (owns_qwen3vl_forward_frame) {
-        if (stream_first_layers != 0) try cb.decoderRuntimeWaitSubmittedFrame();
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        owns_qwen3vl_forward_frame = false;
+    if (qwen_frame.owns) {
+        try qwen_pending.wait();
+        try qwen_frame.finish();
         if (comptime build_options.enable_metal) {
             if (lightOnPrefillSplitEligible(config, batch, query_seq_len, decode_context != null and decode_context.?.attention_mode == .paged_prefill, true, 1))
                 metal_compute_mod.MetalCompute.noteLightOnPrefillComplete(cb);
