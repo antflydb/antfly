@@ -553,7 +553,12 @@ pub const StorageOwnerRuntimeHooks = struct {
 
     pub fn artifactPublicationDispatcher(self: *StorageOwnerRuntimeHooks) ?db_mod.ArtifactPublicationDispatcher {
         if (self.config.artifact_publication_enqueue_fn == null) return null;
-        return .{ .ptr = self, .enqueue_status = enqueueArtifactPublicationStatus, .upload_recovery = .{ .recover = recoverArtifactUploads, .should_poll = shouldRecoverArtifactUploads } };
+        return .{
+            .ptr = self,
+            .enqueue_status = enqueueArtifactPublicationStatus,
+            .enqueue_tracked_status = if (self.config.artifact_publication_enqueue_tracked_fn != null) enqueueTrackedArtifactPublicationStatus else null,
+            .upload_recovery = .{ .recover = recoverArtifactUploads, .should_poll = shouldRecoverArtifactUploads },
+        };
     }
 
     fn shouldRecoverArtifactUploads(ptr: *anyopaque, tick: @import("antfly_local_sources").storage_db_artifact_publication.UploadRecoveryTick) bool {
@@ -574,6 +579,12 @@ pub const StorageOwnerRuntimeHooks = struct {
         const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
         const enqueue = self.config.artifact_publication_enqueue_fn orelse return .artifact_catalog_drift;
         return enqueue(self.config.artifact_publication_ctx, self.group_id, namespace, .fromSlice(command[0..command_len]));
+    }
+
+    fn enqueueTrackedArtifactPublicationStatus(ptr: *anyopaque, namespace: *const [24]u8, command: [*]const u8, command_len: usize, receipt: *kernel_owner_abi.ArtifactDispatchReceipt) callconv(.c) kernel_owner_abi.Status {
+        const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        const enqueue = self.config.artifact_publication_enqueue_tracked_fn orelse return .artifact_catalog_drift;
+        return enqueue(self.config.artifact_publication_ctx, self.group_id, namespace, .fromSlice(command[0..command_len]), receipt);
     }
 
     const CandidateCapture = struct {
@@ -3782,7 +3793,9 @@ pub fn storageOwnerOpen(
             return .invalid_argument;
     }
     const runtime_hooks_config = request.runtime_hooks;
-    if ((runtime_hooks_config.artifact_publication_ctx == null) != (runtime_hooks_config.artifact_publication_enqueue_fn == null)) return .invalid_argument;
+    if ((runtime_hooks_config.artifact_publication_ctx == null) != (runtime_hooks_config.artifact_publication_enqueue_fn == null) or
+        (runtime_hooks_config.artifact_publication_enqueue_tracked_fn != null and runtime_hooks_config.artifact_publication_enqueue_fn == null))
+        return .invalid_argument;
     if ((runtime_hooks_config.coordinated_ttl_ctx == null) != (runtime_hooks_config.coordinated_ttl_enqueue_fn == null))
         return .invalid_argument;
     const candidate_configured = runtime_hooks_config.resolution_candidates.native_view.len != 0 or runtime_hooks_config.resolution_candidates.native_view_contract.len != 0 or runtime_hooks_config.resolution_candidates.get_fn != null or

@@ -25,7 +25,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Version 91 fences selected-role merge-readiness projection responses.
 // Version 92 requires native batch decoders to preserve commit prerequisites.
 // Version 93 adds capture-only direct preparation and immutable effect replay.
-pub const abi_version: u32 = 94;
+// The high bit distinguishes the v0.3.x owner layout from main.
+pub const abi_version: u32 = 0x8000_005f;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -965,11 +966,31 @@ pub const CoordinatedTtlRequest = extern struct {
 /// The receiver must clone all borrowed bytes before returning acceptance.
 pub const CoordinatedTtlEnqueueFn = *const fn (?*anyopaque, *const CoordinatedTtlRequest) callconv(.c) u8;
 
+pub const ArtifactDispatchReceipt = extern struct {
+    pub const State = enum(u8) { active, awaiting_apply, abandoned, _ };
+
+    ctx: ?*anyopaque = null,
+    state_fn: ?*const fn (?*anyopaque) callconv(.c) u8 = null,
+    release_fn: ?*const fn (?*anyopaque) callconv(.c) void = null,
+
+    pub fn abandoned(self: ArtifactDispatchReceipt) bool {
+        const state = self.state_fn orelse return false;
+        return state(self.ctx) == @backingInt(State.abandoned);
+    }
+
+    pub fn release(self: ArtifactDispatchReceipt) void {
+        if (self.release_fn) |callback| callback(self.ctx);
+    }
+};
+
 pub const RuntimeHooksConfig = extern struct {
     artifact_publication_ctx: ?*anyopaque = null,
     /// Zero means queue admission only. Native producers must observe their
     /// durable receipt before reporting output or coverage as complete.
     artifact_publication_enqueue_fn: ?*const fn (?*anyopaque, u64, *const [24]u8, BorrowedBytes) callconv(.c) Status = null,
+    /// Returns an owned handle to this exact queue attempt. It does not
+    /// certify ordered apply. A null handle leaves the result unknown.
+    artifact_publication_enqueue_tracked_fn: ?*const fn (?*anyopaque, u64, *const [24]u8, BorrowedBytes, *ArtifactDispatchReceipt) callconv(.c) Status = null,
     native_authority_ctx: ?*const anyopaque = null,
     native_authority_fn: ?NativeAuthorityFn = null,
     resolution_candidates: ResolutionCandidateConfig = .{},
