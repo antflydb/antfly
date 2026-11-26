@@ -3831,7 +3831,7 @@ pub const CudaCompute = struct {
             const layout = owner.storage_layout orelse return error.InvalidExecutionPlan;
             const source = layout.readback(owner.metadata);
             const readback_words = host[0 .. source.len / @sizeOf(u32)];
-            copyToHostTrackedAndSync(self.compute, source, std.mem.sliceAsBytes(readback_words)) catch |err| {
+            copyBoundedGraphReceipt(self.compute, source, std.mem.sliceAsBytes(readback_words)) catch |err| {
                 // A driver error can surface after earlier stream work was
                 // queued. Drain before returning this stack-backed receipt.
                 if (err == error.CudaDriverError) {
@@ -14983,6 +14983,28 @@ fn copyToPinnedScalarDownloadAndSync(self: *CudaCompute, device: buffer_mod.Devi
     self.stats.pinned_scalar_downloads += 1;
     self.stats.pinned_scalar_download_bytes += bytes.len;
     return true;
+}
+
+fn copyBoundedGraphReceipt(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []u8) !void {
+    if (self.ctx.video_cache_budget.admission == null)
+        return copyToHostTrackedAndSync(self, device, bytes);
+
+    if (!cudaPinnedScalarDownloadsDisabled() and bytes.len <= @import("burst_readback.zig").capacity) {
+        if (try self.acquireBurstReadbackSlot()) |slot| {
+            // The reader lane owns this slot through the synchronous copy.
+            // Reuse its admitted host backing without recording another event.
+            slot.busy = true;
+            defer slot.busy = false;
+            const staging = slot.host.bytes()[0..bytes.len];
+            try copyToHostTracked(self, device, staging);
+            try finishHostDownload(self);
+            @memcpy(bytes, staging);
+            return;
+        }
+    }
+    // Without a prepared token, the caller's receipt is the only backing.
+    try copyToHostTracked(self, device, bytes);
+    try finishHostDownload(self);
 }
 
 fn copyToHostTrackedAndSync(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []u8) !void {
@@ -45756,11 +45778,18 @@ test "CUDA bounded decoder drains a failed receipt transfer before returning" {
     const Fake = struct {
         var copies: usize = 0;
         var waits: usize = 0;
+        var destination: ?*anyopaque = null;
         fn current(_: driver_mod.CUcontext) callconv(.c) driver_mod.CUresult {
             return driver_mod.CUDA_SUCCESS;
         }
-        fn copy(_: ?*anyopaque, _: driver_mod.CUdeviceptr, _: usize, _: driver_mod.CUstream) callconv(.c) driver_mod.CUresult {
+        fn copy(dst: ?*anyopaque, _: driver_mod.CUdeviceptr, bytes: usize, _: driver_mod.CUstream) callconv(.c) driver_mod.CUresult {
             copies += 1;
+            if (destination) |expected| {
+                std.debug.assert(expected == dst);
+                const output: [*]u8 = @ptrCast(expected);
+                @memset(output[0..bytes], 42);
+                return driver_mod.CUDA_SUCCESS;
+            }
             return 1;
         }
         fn sync(_: driver_mod.CUstream) callconv(.c) driver_mod.CUresult {
@@ -45792,6 +45821,7 @@ test "CUDA bounded decoder drains a failed receipt transfer before returning" {
     burst.drained = false;
     var first: [rows]u32 = @splat(11);
     var second: [rows]u32 = @splat(22);
+    Fake.destination = null;
     Fake.copies = 0;
     Fake.waits = 0;
     @import("../../test_error_logs.zig").expectErrorLogs(1);
@@ -45803,6 +45833,27 @@ test "CUDA bounded decoder drains a failed receipt transfer before returning" {
     try std.testing.expectEqual(@as([rows * 3]u32, @splat(7)), owner.next_positions[0 .. rows * 3].*);
     try std.testing.expectEqual(@as([rows]u32, @splat(11)), first);
     try std.testing.expectEqual(@as([rows]u32, @splat(22)), second);
+
+    const memory = @import("../../runtime/tier/memory.zig");
+    var controller: memory.AdmissionController = .{};
+    defer controller.deinit();
+    const capacity = @import("burst_readback.zig").capacity;
+    var lease = try controller.tryAcquire(.gpu, .{}, .{ .host_scratch_bytes = capacity }, false);
+    defer lease.release();
+    compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{}, .check_live_memory = false };
+    var staging: [capacity]u8 = undefined;
+    compute.lighton_burst_readback = .{
+        .host = .{ .ptr = &staging, .len = capacity },
+        .event = @ptrFromInt(1),
+        .quota = .{ .raw = lease },
+    };
+    var out: [44]u8 = undefined;
+    Fake.destination = if (cudaPinnedScalarDownloadsDisabled()) &out else &staging;
+    try copyBoundedGraphReceipt(&compute, .{ .ptr = 0x2000, .len = out.len }, &out);
+    try std.testing.expectEqual(@as([44]u8, @splat(42)), out);
+    try std.testing.expectEqual(@as(usize, 2), Fake.waits);
+    try std.testing.expect(!compute.lighton_burst_readback.busy);
+    try std.testing.expect(compute.pinned_scalar_download_buffer.host.ptr == null);
 }
 
 test "LightOnOCR3 CUDA wide graph head projection writes its assigned buffer" {
