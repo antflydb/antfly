@@ -296,33 +296,23 @@ pub const Plan = struct {
         if (self.count > self.nodes.len or self.count > instruction_capacity or self.output >= capacity) return error.AudioScheduleInvalid;
         var ends: [capacity]u32 = undefined;
         for (self.last_use, &ends) |end, *target| target.* = end;
+        // The returned tensor and every backing view ancestor outlive replay.
+        const escapes = std.math.maxInt(u32);
+        ends[self.output] = escapes;
         var sources: [capacity]u32 = @splat(@import("ml").graph.null_node);
-        for (self.nodes[0..self.count]) |node| {
+        for (self.nodes[0..self.count]) |*node| {
             if (node.output >= capacity or node.input_count > node.inputs.len) return error.AudioScheduleInvalid;
             for (node.inputs[0..node.input_count]) |input| if (input >= capacity) return error.AudioScheduleInvalid;
             if (node.args == .sliceLastDim) sources[node.output] = node.args.sliceLastDim.tensor;
         }
         try memory.computeAliasLastUseInto(&ends, &ends, &sources, &.{}, .{ .propagation = .sources });
-        var escaping: [capacity]bool = @splat(false);
-        escaping[self.output] = true;
-        var n = self.count;
-        while (n > 0) {
-            n -= 1;
-            const node = &self.nodes[n];
-            switch (node.args) {
-                .sliceLastDim => |a| {
-                    if (escaping[node.output]) escaping[a.tensor] = true;
-                },
-                else => {},
-            }
-        }
         const Range = struct { offset: usize, bytes: usize, end: u16 };
         var ranges: [instruction_capacity]Range = undefined;
         var used: usize = 0;
         var peak: usize = 0;
         for (self.nodes[0..self.count], 0..) |*node, i| {
             node.arena_offset = null;
-            if (escaping[node.output] or (self.linear_only and node.prepared_slot == null)) continue;
+            if (ends[node.output] == escapes or (self.linear_only and node.prepared_slot == null)) continue;
             const d = node.outputDimensions() orelse continue;
             const bytes = try std.math.mul(usize, try std.math.mul(usize, d.rows, d.out_dim), 4);
             const size = (try std.math.add(usize, bytes, 4095)) & ~@as(usize, 4095);
