@@ -147,6 +147,16 @@ pub const Runtime = struct {
         };
     }
 
+    fn requestAmounts(plan: decoder.RequestPlan, vision: vision_model.AdmissionBytes) !memory.AdmissionAmounts {
+        const retained = try State.deviceBytes(plan.bank, plan.width);
+        const device = try plan.deviceBytes();
+        return .{
+            .backend_kv_bytes = retained,
+            .backend_scratch_bytes = try std.math.add(usize, device - retained, vision.device),
+            .host_scratch_bytes = try std.math.add(usize, plan.hostLogitBytes(), vision.host),
+        };
+    }
+
     /// Widen only the automatically chosen KV bucket, and only when the
     /// complete plan fits both of the existing physical envelopes.
     pub fn widenCacheBudget(self: *const Runtime, limits: memory.Limits) memory.Limits {
@@ -155,16 +165,10 @@ pub const Runtime = struct {
         var shape = PrefillShape.preferred(context);
         while (true) {
             const plan = decoder.RequestPlan.initWithReductionRows(&self.model, context, shape.rows, shape.reduction_rows, .q4_head128) catch return limits;
-            const retained = State.deviceBytes(plan.bank, plan.width) catch return limits;
-            const physical = plan.deviceBytes() catch return limits;
+            var required = requestAmounts(plan, .{ .host = 0, .device = 0 }) catch return limits;
+            required.backend_weight_bytes = self.resident_bytes;
             var candidate = limits;
-            candidate.kv_limit_bytes = @max(limits.kv_limit_bytes, retained);
-            const required: memory.AdmissionAmounts = .{
-                .backend_weight_bytes = self.resident_bytes,
-                .backend_kv_bytes = retained,
-                .backend_scratch_bytes = physical - retained,
-                .host_scratch_bytes = plan.hostLogitBytes(),
-            };
+            candidate.kv_limit_bytes = @max(limits.kv_limit_bytes, required.backend_kv_bytes);
             if (required.fitsLimits(candidate) catch false) return candidate;
             shape = shape.smaller() orelse return limits;
         }
@@ -183,18 +187,15 @@ pub const Runtime = struct {
         defer Scheduler.leave(&waiter);
         var shape = PrefillShape.preferred(pipeline.prompt.count() -| 1);
         var plan: decoder.RequestPlan = undefined;
-        const retained, const workspace, const host = while (true) {
+        const amounts = while (true) {
             plan = try pipeline.requestPlanWithShape(&self.model, config, shape);
-            const kv_bytes = try State.deviceBytes(plan.bank, plan.width);
-            const device_bytes = try plan.deviceBytes();
-            const vision_bytes = try imageAdmission(pipeline.prompt, shape.rows, self.model.text.hidden_size);
-            const host_bytes = try std.math.add(usize, plan.hostLogitBytes(), vision_bytes.host);
-            const scratch = try std.math.add(usize, device_bytes - kv_bytes, vision_bytes.device);
-            if (shape.rows == 1 or try guarded.fitsRetainedStateWithWorkspace(host_bytes, kv_bytes, scratch))
-                break .{ kv_bytes, scratch, host_bytes };
+            const vision = try imageAdmission(pipeline.prompt, shape.rows, self.model.text.hidden_size);
+            const required = try requestAmounts(plan, vision);
+            if (shape.rows == 1 or try guarded.fitsRetainedStateWithWorkspace(required.host_scratch_bytes, required.backend_kv_bytes, required.backend_scratch_bytes))
+                break required;
             shape = shape.smaller().?;
         };
-        var permit = try guarded.admitRetainedStateWithWorkspace(host, retained, workspace);
+        var permit = try guarded.admitRetainedStateWithWorkspace(amounts.host_scratch_bytes, amounts.backend_kv_bytes, amounts.backend_scratch_bytes);
         defer permit.deinit();
         try Scheduler.acquireSelected(&waiter, pipeline.control);
         defer Scheduler.releaseGate(&waiter);
