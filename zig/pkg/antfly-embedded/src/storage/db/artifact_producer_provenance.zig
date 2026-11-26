@@ -129,11 +129,11 @@ pub const Proof = struct {
 
     /// Proofs that may name an execution identity: index vectors (the
     /// deployed model revision) and enrichment assets built from context
-    /// sources (the rendered context). A scalar chunk can also retire its
-    /// prior windows as part of the same revision-bound publication.
+    /// sources (the rendered context). A revision-bound chunk vector set
+    /// can publish or retire the windows of one consumer and parent.
     fn executionBound(self: Proof) bool {
         if (self.effects.len > 1)
-            return self.producer_kind == .index and publication.isRevisionBoundScalarWindowReplacement(self.producer_scope_key, self.producer_artifact_name, self.effects);
+            return self.producer_kind == .index and publication.isRevisionBoundChunkVectorSet(self.producer_scope_key, self.producer_artifact_name, self.effects);
         if (self.effects.len != 1) return false;
         return switch (self.producer_kind) {
             .index => (self.producer_scope_key.len != 0 or self.sources.len == 1) and

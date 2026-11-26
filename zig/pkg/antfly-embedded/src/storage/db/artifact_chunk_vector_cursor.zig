@@ -43,6 +43,8 @@ pub fn Cursor(comptime Txn: type) type {
         output: ?[]u8 = null,
         output_entry: ?@import("../backend_erased.zig").Entry = null,
         started: bool = false,
+        output_has_windows: bool = false,
+        member_has_windows: bool = false,
         result: ?[]u8 = null,
         logical_resume: ?[]u8 = null,
 
@@ -154,11 +156,13 @@ pub fn Cursor(comptime Txn: type) type {
                     const base = (try keys.derivedEmbeddingBaseKeyAlloc(self.alloc, row.key)).?;
                     defer self.alloc.free(base);
                     self.output = try self.alloc.dupe(u8, keys.mediaWindowParent(base));
+                    self.output_has_windows = keys.mediaWindowIndex(base) != null;
                 }
                 self.output_entry = try self.outputs.next();
             }
             if (self.chunk == null and self.output == null) return .end;
             const order = if (self.chunk == null) std.math.Order.gt else if (self.output == null) std.math.Order.lt else std.mem.order(u8, self.chunk.?, self.output.?);
+            self.member_has_windows = order != .lt and self.output_has_windows;
             if (order != .gt) {
                 self.result = self.chunk;
                 self.chunk = null;
@@ -166,20 +170,36 @@ pub fn Cursor(comptime Txn: type) type {
                     self.alloc.free(self.output.?);
                     self.output = null;
                 }
-                if (self.output_entry) |row| if (std.mem.startsWith(u8, row.key, self.result.?)) {
-                    const upper = try keys.nextPrefixAlloc(self.alloc, self.result.?);
-                    defer if (upper) |value| self.alloc.free(value);
-                    self.output_entry = if (upper) |value| try self.outputs.seekAtOrAfter(value) else null;
-                };
             } else {
                 self.result = self.output;
                 self.output = null;
             }
-            if (self.output_entry) |row| if (std.mem.startsWith(u8, row.key, self.result.?)) {
-                const upper = try keys.nextPrefixAlloc(self.alloc, self.result.?);
-                defer if (upper) |value| self.alloc.free(value);
-                self.output_entry = if (upper) |value| try self.outputs.seekAtOrAfter(value) else null;
-            };
+            const member = self.result.?;
+            // Use the existing ordered output scan to prove absence. Most
+            // text members have at most their scalar row to step over.
+            var visits: usize = 0;
+            while (self.output_entry) |row| {
+                if (!std.mem.startsWith(u8, row.key, member)) break;
+                const window = row.key.len > member.len and row.key[member.len] == keys.media_window_kind;
+                self.member_has_windows = self.member_has_windows or window;
+                visits += 1;
+                budget.visits +|= 1;
+                budget.bytes +|= row.key.len +| row.value.len;
+                if (self.member_has_windows or visits == 3) {
+                    if (!self.member_has_windows and row.key.len > member.len and row.key[member.len] < keys.media_window_kind) {
+                        const lower = try keys.mediaWindowChildKeyAlloc(self.alloc, member, 0);
+                        defer self.alloc.free(lower);
+                        if (try self.outputs.seekAtOrAfter(lower)) |found| {
+                            self.member_has_windows = std.mem.startsWith(u8, found.key, lower[0 .. lower.len - @sizeOf(u32)]);
+                        }
+                    }
+                    const upper = try keys.nextPrefixAlloc(self.alloc, member);
+                    defer if (upper) |value| self.alloc.free(value);
+                    self.output_entry = if (upper) |value| try self.outputs.seekAtOrAfter(value) else null;
+                    break;
+                }
+                self.output_entry = try self.outputs.next();
+            }
             budget.visits +|= 1;
             budget.bytes +|= self.result.?.len;
             return .{ .member = self.result.? };

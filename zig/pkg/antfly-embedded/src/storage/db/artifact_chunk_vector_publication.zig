@@ -31,8 +31,9 @@ pub const Input = struct {
     output_key: []const u8,
     previous_output_exists: bool = false,
     effect_protocol: u16 = 18,
-    /// Captured only for a dense member that needs publication.
+    /// Empty when the replay cursor proves that the member has no windows.
     old_window_outputs: ?[]const []const u8 = null,
+    media_window_layout: bool = false,
     pub fn deinit(self: *Input) void {
         self.token.deinit();
         self.* = undefined;
@@ -134,6 +135,7 @@ pub const Fence = struct {
     requires_member: bool,
     certificate: ?@import("artifact_producer_provenance.zig").ArtifactCertificate = null,
     prepared: bool = false,
+    dense: bool = false,
     /// Resolve membership and decode inherited provenance before serialized
     /// apply. Published generation rows are immutable; the head/member guards
     /// plus this exact proof reference fence preserve the prepared observation.
@@ -143,18 +145,31 @@ pub const Fence = struct {
         var input = try @import("artifact_chunk_generation.zig").captureInput(alloc, txn, self.scope);
         defer input.deinit();
         if (self.requires_member and input.value == null) return error.EnrichmentSourceChanged;
+        var completed: ?std.AutoHashMapUnmanaged(u32, void) = null;
+        defer if (completed) |*indices| indices.deinit(alloc);
         for (command.mutations) |mutation| if (mutation.value != null) {
             const base = (try keys.derivedEmbeddingBaseKeyAlloc(alloc, mutation.key)) orelse return error.InvalidBatchRequest;
             defer alloc.free(base);
             if (keys.mediaWindowIndex(base)) |index| {
-                const metadata = try @import("../../chunking/chunk.zig").modelMetadataAlloc(alloc, input.value orelse return error.EnrichmentSourceChanged) orelse return error.InvalidBatchRequest;
-                defer metadata.deinit(alloc);
-                var results = try std.json.parseFromSlice([]@import("inference_chunker").outputs.Result, alloc, metadata.outputs_json orelse return error.InvalidBatchRequest, .{});
-                defer results.deinit();
-                const found = for (results.value) |result| {
-                    if (result.kind == .embedding and std.mem.eql(u8, result.name, "embedding") and result.sub_index == index and result.status == .complete) break true;
-                } else false;
-                if (!found) return error.EnrichmentSourceChanged;
+                if (completed == null) {
+                    completed = .empty;
+                    const metadata = try @import("../../chunking/chunk.zig").modelMetadataAlloc(alloc, input.value orelse return error.EnrichmentSourceChanged) orelse return error.InvalidBatchRequest;
+                    defer metadata.deinit(alloc);
+                    var results = try std.json.parseFromSlice([]@import("inference_chunker").outputs.Result, alloc, metadata.outputs_json orelse return error.InvalidBatchRequest, .{});
+                    defer results.deinit();
+                    for (results.value) |result| {
+                        if (result.kind != .embedding or !std.mem.eql(u8, result.name, "embedding") or result.status != .complete) continue;
+                        // Older single-effect wire shapes did not bind each
+                        // child receipt. All new multi-effect live windows do.
+                        if (command.mutations.len > 1) if (command.execution_identity) |revision| {
+                            var actual: publication.Digest = undefined;
+                            const decoded = std.fmt.hexToBytes(&actual, result.model_revision) catch continue;
+                            if (!std.mem.eql(u8, decoded, &revision)) continue;
+                        };
+                        try completed.?.put(alloc, result.sub_index, {});
+                    }
+                }
+                if (!completed.?.contains(index)) return error.EnrichmentSourceChanged;
             }
         };
         self.certificate = if (input.proofValue() != null) try @import("artifact_producer_provenance.zig").certifyInheritedArtifact(alloc, txn, input.proofKey(self.scope), input.proofValue(), command) else null;
@@ -163,6 +178,37 @@ pub const Fence = struct {
     pub fn requireCurrent(self: Fence, txn: anytype) !void {
         if (!self.prepared) return error.InvalidBatchRequest;
         if (self.certificate) |certificate| try certificate.requireCurrent(txn);
+    }
+
+    /// Per-key CAS alone cannot observe a newly created sibling. Ordered
+    /// protocols with window support validate the entire preimage under the
+    /// same writer that installs the vector projection and its proof.
+    pub fn requireCurrentOutputs(self: Fence, alloc: std.mem.Allocator, txn: anytype, command: publication.Command) !void {
+        if (!self.dense) return;
+        if (!publication.isRevisionBoundChunkVectorSet(self.scope, command.producer_artifact_name, command.mutations))
+            return error.EnrichmentSourceChanged;
+        var scalar_effect = false;
+        var window_effect = false;
+        for (command.mutations) |effect| {
+            scalar_effect = scalar_effect or effect.key[self.scope.len] == keys.derived_embedding_kind;
+            window_effect = window_effect or effect.key[self.scope.len] == keys.media_window_kind;
+        }
+        if (window_effect and !scalar_effect) return error.EnrichmentSourceChanged;
+        const first = try keys.mediaWindowChildKeyAlloc(alloc, self.scope, 0);
+        defer alloc.free(first);
+        const prefix = first[0 .. first.len - @sizeOf(u32)];
+        var cursor = try txn.openPhysicalCursorAdapter();
+        defer cursor.close();
+        cursor.setKeysOnly();
+        var row = try cursor.seekAtOrAfter(first);
+        var outputs: std.StringHashMapUnmanaged(void) = .empty;
+        defer outputs.deinit(alloc);
+        while (row) |entry| : (row = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            if (!keys.matchesDerivedEmbeddingArtifactName(entry.key, command.producer_artifact_name)) continue;
+            if (outputs.count() == 0) for (command.mutations) |mutation| try outputs.put(alloc, mutation.key, {});
+            if (!outputs.contains(entry.key)) return error.EnrichmentSourceChanged;
+        }
     }
 };
 
@@ -224,7 +270,7 @@ pub fn prepare(alloc: std.mem.Allocator, command: publication.Command, catalogs:
     // Finish allocations before copying the arena owner. Growing the arena
     // after that copy would leave its new allocation chain unowned.
     const owned_scope = try owned.dupe(u8, command.producer_scope_key);
-    return .{ .arena = arena, .chunk_vector_fence = .{ .scope = owned_scope, .requires_member = changed.items.len != 0 }, .batch = .{
+    return .{ .arena = arena, .chunk_vector_fence = .{ .scope = owned_scope, .requires_member = changed.items.len != 0, .dense = producer.kind == .dense_vector }, .batch = .{
         .dense_embeddings = dense.items,
         .sparse_embeddings = sparse.items,
         .changed_artifact_keys = changed.items,
