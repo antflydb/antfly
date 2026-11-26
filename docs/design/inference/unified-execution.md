@@ -1220,8 +1220,13 @@ On Spark GB10 at `41465abfe9`, the CUDA retirement cohort passed 124 of
 suffixes after encoder retirement using the same ONNX artifact as the
 local runs. Physical CUDA checks also covered bank-free failure, audio
 arena output custody and detached NVDEC retirement. The 16 skips were
-15 Metal cases and the CUDA-disabled video fixture. The broader
-released-model performance matrix remains open.
+15 Metal cases and the CUDA-disabled video fixture. The separate Spark
+capture cohort at the same revision passed 122 of 173 selected tests.
+The packed-row and dequantized vendor recipes passed physical capture,
+held output and eviction checks. The public BF16 audio learning and
+replay fixture skipped when its vendor arithmetic prerequisites were
+unavailable. Audio recipe replacement and the broader released-model
+performance matrix remain open.
 
 At `552aba3e45`, the focused Spark GB10 cohort passed all 15 capture and
 workspace tests with zero skips. The physical tests covered immutable
