@@ -285,6 +285,8 @@ pub const Module = struct {
     // steps reuse this independently admitted output after their argmax.
     head: buffer.DeviceBuffer = .{},
     future_tokens: usize = 0,
+    attention_layers: usize = 0,
+    recurrent_layers: usize = 0,
     expected_attention_calls: usize = 0,
     expected_ragged_packets: usize = 0,
     bank_offset: usize = 0,
@@ -358,10 +360,13 @@ pub const Module = struct {
         defer self.mutex.unlock();
         self.clear(ctx) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
     }
-    pub fn matches(self: *const Module, key: []const u64, host_positions: []const u32) bool {
-        return self.key.len != 0 and std.mem.eql(u64, self.key, key) and
-            host_positions.len == 3 * self.rows and
-            std.mem.eql(u32, self.next_positions[0..host_positions.len], host_positions);
+    pub fn matches(self: *const Module, descriptor: Descriptor) bool {
+        return self.epoch_id == descriptor.epoch and self.rows == descriptor.rows and
+            self.hidden == descriptor.hidden and self.vocab == descriptor.vocab and
+            self.attention_layers == descriptor.attention_layers and self.recurrent_layers == descriptor.recurrent_layers and
+            self.key.len != 0 and std.mem.eql(u64, self.key, descriptor.key) and
+            descriptor.positions.len == 3 * self.rows and
+            std.mem.eql(u32, self.next_positions[0..descriptor.positions.len], descriptor.positions);
     }
     fn installStorageGeometry(self: *Module, layout: StorageLayout, rows: usize, hidden: usize, vocab: usize, positions_: []const u32) void {
         self.rows = rows;
@@ -385,6 +390,7 @@ pub const Module = struct {
     pub fn resetPrepared(self: *Module, ctx: *context.CudaContext, phase: *GraphPhase) !void {
         const descriptor = phase.descriptor;
         const layout = try descriptor.layout();
+        const dispatch = try descriptor.dispatchCounts();
         if (!phase.bound or phase.mode != .storage or self.metadata.ptr != 0 or self.head.ptr != 0 or self.arena.ptr != 0 or self.graph != null or self.pending_graph != null or self.plan != null or self.key.len != 0) return error.InvalidPreparedCacheState;
         const cold = phase.cold orelse return error.InvalidPreparedCacheState;
         if (cold.plan == null or !std.mem.eql(u64, cold.key, descriptor.key)) return error.PreparedCachePlanChanged;
@@ -405,6 +411,11 @@ pub const Module = struct {
         self.plan = cold.plan;
         cold.plan = null;
         self.installStorageGeometry(layout, descriptor.rows, descriptor.hidden, descriptor.vocab, descriptor.positions);
+        self.epoch_id = descriptor.epoch;
+        self.attention_layers = descriptor.attention_layers;
+        self.recurrent_layers = descriptor.recurrent_layers;
+        self.expected_attention_calls = dispatch.attention;
+        self.expected_ragged_packets = dispatch.ragged_recurrent;
     }
     pub fn reserveArenaPrepared(self: *Module, ctx: *context.CudaContext, phase: *GraphPhase) !void {
         if (self.admitted_arena_layout != null) {
@@ -852,4 +863,38 @@ test "CUDA bounded decoder validates dispatch geometry before preparing storage"
     descriptor.recurrent_layers = std.math.maxInt(usize);
     var phase: GraphPhase = undefined;
     try std.testing.expectError(error.Overflow, phase.initInto(descriptor));
+}
+
+test "bounded decoder graph reuse requires the prepared dispatch geometry" {
+    var owner: Module = .{};
+    var key = [_]u64{9};
+    const positions: [6]u32 = @splat(7);
+    const descriptor: Descriptor = .{
+        .epoch = 1,
+        .key = &key,
+        .positions = &positions,
+        .rows = 2,
+        .hidden = 1024,
+        .vocab = 100,
+        .future_tokens = 9,
+        .attention_layers = 4,
+        .recurrent_layers = 3,
+    };
+    owner.installStorageGeometry(try descriptor.layout(), descriptor.rows, descriptor.hidden, descriptor.vocab, descriptor.positions);
+    owner.epoch_id = descriptor.epoch;
+    owner.key = &key;
+    owner.attention_layers = descriptor.attention_layers;
+    owner.recurrent_layers = descriptor.recurrent_layers;
+    try std.testing.expect(owner.matches(descriptor));
+    var changed = descriptor;
+    changed.future_tokens += 2;
+    try std.testing.expect(owner.matches(changed));
+    changed.attention_layers += 1;
+    try std.testing.expect(!owner.matches(changed));
+    changed = descriptor;
+    changed.recurrent_layers += 1;
+    try std.testing.expect(!owner.matches(changed));
+    changed = descriptor;
+    changed.vocab += 1;
+    try std.testing.expect(!owner.matches(changed));
 }

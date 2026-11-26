@@ -4047,7 +4047,7 @@ pub const CudaCompute = struct {
         phase.expected_compute = @intFromPtr(self);
         phase.admission = self.ctx.video_cache_budget.admission;
         phase.old = owner.snapshot();
-        if (owner.epoch_id != descriptor.epoch or !owner.matches(descriptor.key, descriptor.positions)) {
+        if (!owner.matches(descriptor)) {
             if (try self.ctx.streamCaptureActive()) return .unsupported;
             // Exact invalid graph dies under the ACTUAL B before outside
             // reservation, so its quota returns when this caller parks.
@@ -4081,7 +4081,7 @@ pub const CudaCompute = struct {
         if (!owner.mutex.tryLock()) return error.ReaderEpochBackendBusy;
         defer owner.mutex.unlock();
         if (!std.meta.eql(owner.snapshot(), phase.old)) return error.PreparedCachePlanChanged;
-        if (phase.mode == .arena and (owner.epoch_id != phase.descriptor.epoch or !owner.matches(phase.descriptor.key, phase.descriptor.positions))) return error.PreparedCachePlanChanged;
+        if (phase.mode == .arena and !owner.matches(phase.descriptor)) return error.PreparedCachePlanChanged;
         try phase.bind(current);
     }
     pub fn clearCapturedGraphWithCleanup(self: *CudaCompute, current: CacheCleanup) !void {
@@ -4106,13 +4106,12 @@ pub const CudaCompute = struct {
         if (self.execution_scope != null or try self.ctx.streamCaptureActive()) return null;
         const descriptor = graph_phase.descriptor;
         if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions)) return error.PreparedCachePlanChanged;
-        const dispatch_counts = try descriptor.dispatchCounts();
         const owner = &self.bounded_decode_graph;
         while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
         var claimed = false;
         defer if (!claimed) owner.mutex.unlock();
         if (owner.disabled_epoch == epoch) return null;
-        if (owner.epoch_id != epoch or !owner.matches(key, positions)) {
+        if (!owner.matches(descriptor)) {
             if (owner.resets_logged < 12 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
                 var mismatch: usize = 0;
                 while (mismatch < @min(owner.key.len, key.len) and owner.key[mismatch] == key[mismatch]) : (mismatch += 1) {}
@@ -4129,7 +4128,6 @@ pub const CudaCompute = struct {
                 },
                 else => return err,
             };
-            owner.epoch_id = epoch;
         }
         if (owner.phase == .disabled) return null;
         if (owner.phase == .capture) {
@@ -4158,8 +4156,6 @@ pub const CudaCompute = struct {
             _ = try blas.reserveTensorCorePlanSlots(&self.ctx, 64);
         };
         owner.future_tokens = future_tokens;
-        owner.expected_attention_calls = dispatch_counts.attention;
-        owner.expected_ragged_packets = dispatch_counts.ragged_recurrent;
         claimed = true;
         return .{ .compute = self, .future_tokens = future_tokens };
     }
