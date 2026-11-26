@@ -1070,6 +1070,15 @@ while rejecting the unsupported streaming item. The execution report
 recorded three serial items and one rejected item. These were shared-device
 correctness runs.
 
+A subsequent Spark run at `b047fa328f` used the shared checkpoint's registered
+name `thinkingmachines/Inkling-2-Mini`. Three warmed samples per case gave
+267.7 ms for 28-token text, 362.7 ms for a 33-token blue image, 56.64 s
+for 6,396-token text, and 56.75 s for a 6,403-token image lookup. Short image
+streaming and the mixed batch passed. The long image stream returned `271`
+and `[DONE]` but did not emit an idle comment before its first content at
+56.86 s. That result leaves long-stream liveness unqualified at this revision.
+These are shared-device correctness samples with measured wall time.
+
 ### Official Gemma 4 E2B QAT serving comparison
 
 The decoder and projector came from Google's E2B QAT Q4_0 GGUF revision
