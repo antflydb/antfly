@@ -220,7 +220,16 @@ pub const DecoderRoute = struct {
     requested_rows: enum { final_available, full_prefix },
 };
 
+/// Selected geometry for the prefill request. Physical submissions and
+/// counters still describe the work actually observed in the interval.
+pub const PrefillGeometry = struct {
+    max_append_rows: u32,
+    attention_workspace_rows: u32,
+    cache_capacity_tokens: u32,
+};
+
 pub const Snapshot = struct {
+    planned_prefill: ?PrefillGeometry = null,
     decoder_route: ?DecoderRoute = null,
     stage_placement: ?StagePlacement = null,
     native_program_construction: ?NativeProgramConstruction = null,

@@ -22,6 +22,7 @@ pub const Report = struct {
     schema_version: u8 = 1,
     stage_placement: ?@import("diagnostics.zig").StagePlacement = null,
     decoder_route: ?@import("diagnostics.zig").DecoderRoute = null,
+    planned_prefill: ?@import("diagnostics.zig").PrefillGeometry = null,
     operation: []const u8,
     publication_scope: []const u8,
     synchronous_interval: enum { invocation_body, pending_phase_only } = .invocation_body,
@@ -143,6 +144,7 @@ pub const Report = struct {
         report.pending_interval = value.pending_interval;
         report.stage_placement = value.stage_placement;
         report.decoder_route = value.decoder_route;
+        report.planned_prefill = value.planned_prefill;
         report.device_memory = value.runtime.device_memory;
         report.cuda_periodic_workspace = value.runtime.cuda_periodic_workspace;
         report.metal_serial_workspace = value.runtime.metal_serial_workspace;

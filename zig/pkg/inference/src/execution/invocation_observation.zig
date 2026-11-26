@@ -40,6 +40,7 @@ pub const Binding = struct {
     batch_ingress: ?*const @import("runtime_telemetry.zig").BatchIngress = null,
     native_definition_templates: ?diagnostics_mod.NativeDefinitionTemplates = null,
     native_program_construction: ?diagnostics_mod.NativeProgramConstruction = null,
+    planned_prefill: ?diagnostics_mod.PrefillGeometry = null,
     model_allocator: ?std.mem.Allocator = null,
     stable_backend: ?ops.ComputeBackend = null,
     /// Shared providers require their own short metadata exclusion. Raw/private
@@ -139,6 +140,28 @@ inline fn contextBinding(context: anytype, operation: diagnostics_mod.Operation)
 }
 pub fn recordContextAcquisitionFailure(context: anytype, operation: diagnostics_mod.Operation, failure: anyerror) void {
     recordFailureWithoutBackendSample(context.diagnosticsBinding(), operation, failure);
+}
+
+test "planned prefill geometry is exported separately from observed GPU work" {
+    const Work = struct {
+        fn run() !void {}
+    };
+    var owner = diagnostics_mod.Diagnostics{};
+    owner.configure(true);
+    var binding = Binding{ .diagnostics = &owner };
+    binding.planned_prefill = .{
+        .max_append_rows = 256,
+        .attention_workspace_rows = 32,
+        .cache_capacity_tokens = 1_048_576,
+    };
+    try callOperation(binding, .prefill, Work.run, .{});
+    const report = owner.snapshot().?.report.?;
+    try std.testing.expectEqualStrings("prefill", report.operation);
+    try std.testing.expectEqual(binding.planned_prefill, report.planned_prefill);
+    try std.testing.expectEqual(@as(?u64, if (build_options.enable_metal) 0 else null), report.metal_encoded_dispatches);
+    binding.planned_prefill = null;
+    try callOperation(binding, .decode_step, Work.run, .{});
+    try std.testing.expect(owner.snapshot().?.report.?.planned_prefill == null);
 }
 
 test "classified physical retries and declines preserve results and replace success only while enabled" {
@@ -284,6 +307,7 @@ const Invocation = struct {
         snapshot.runtime.recordKernelInterval(&self.kernels);
         if (self.binding.native_definition_templates) |value| snapshot.native_definition_templates = value;
         if (self.binding.native_program_construction) |value| snapshot.native_program_construction = value;
+        if (self.binding.planned_prefill) |value| snapshot.planned_prefill = value;
         _ = self.kernels.finish();
         snapshot.runtime.submission = self.scope.snapshot();
         snapshot.runtime.allocation_owners = self.owners.finish();

@@ -326,7 +326,15 @@ pub const TextPipeline = struct {
         const greedy = chat.usesUnpenalizedGreedy(config);
         const after = self.prompt.suffix;
         const chunk_rows: u32 = @intCast(plan.bank.layout.max_append_tokens);
-        try observation.callOperation(binding, .prefill, prefillPrompt, .{ self, &request, model, vision, after[0 .. after.len - 1], chunk_rows, binding });
+        var prefill_observation = binding;
+        if (prefill_observation) |*selected| {
+            selected.planned_prefill = .{
+                .max_append_rows = chunk_rows,
+                .attention_workspace_rows = if (plan.prefill) |work| work.reduction_rows else 1,
+                .cache_capacity_tokens = @intCast(plan.bank.layout.max_tokens),
+            };
+        }
+        try observation.callOperation(prefill_observation, .prefill, prefillPrompt, .{ self, &request, model, vision, after[0 .. after.len - 1], chunk_rows, binding });
         request.releasePrefill();
         if (!greedy) {
             for (self.prompt.media) |item| {
