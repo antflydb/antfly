@@ -641,6 +641,46 @@ pub const ModelOutput = struct {
         return @intCast(best_idx);
     }
 
+    pub fn greedyTokenSuppress(self: *ModelOutput, allocator: std.mem.Allocator, vocab_size: usize, suppressed: []const i32) !i64 {
+        return self.greedyTokenSuppressWithCleanup(allocator, vocab_size, suppressed, .{ .outside_execution = true });
+    }
+
+    pub fn greedyTokenSuppressWithCleanup(self: *ModelOutput, allocator: std.mem.Allocator, vocab_size: usize, suppressed: []const i32, cleanup_context: CleanupContext) !i64 {
+        if (suppressed.len == 0) return self.greedyTokenWithCleanup(allocator, vocab_size, cleanup_context);
+        if (vocab_size == 0) return error.InvalidModelOutput;
+        if (self.prepared_tail) |tail| {
+            if (tail.greedy_token_id) |id| {
+                if (id >= 0 and id < vocab_size and !tokenIsSuppressed(id, suppressed)) return id;
+            }
+        }
+        if (self.device_logits) |logits| {
+            const backend = self.device_logits_backend orelse return error.InvalidModelOutput;
+            if (try backend.argmaxLastRowSuppressTensor(logits, 1, vocab_size, suppressed)) |token| {
+                var cleanup = if (self.owner) |owner| owner.beginCleanup() else CloseScope{};
+                defer cleanup.deinit();
+                defer backend.freeWithCleanup(token, cleanup_context);
+                const data = try backend.toFloat32(token, allocator);
+                defer allocator.free(data);
+                if (data.len != 1 or !std.math.isFinite(data[0]) or data[0] < 0 or data[0] >= @as(f32, @floatFromInt(vocab_size))) return error.InvalidModelOutput;
+                const id: i64 = @intFromFloat(data[0]);
+                if (!tokenIsSuppressed(id, suppressed)) return id;
+            }
+        }
+        const logits = try self.hostLogitsWithCleanup(allocator, cleanup_context);
+        if (logits.len < vocab_size) return error.InvalidModelOutput;
+        var best: ?usize = null;
+        for (logits[0..vocab_size], 0..) |value, index| {
+            if (best) |current| if (!(value > logits[current])) continue;
+            if (!tokenIsSuppressed(@intCast(index), suppressed)) best = index;
+        }
+        return @intCast(best orelse return error.InvalidModelOutput);
+    }
+
+    fn tokenIsSuppressed(token: i64, suppressed: []const i32) bool {
+        const id = std.math.cast(i32, token) orelse return false;
+        return std.mem.indexOfScalar(i32, suppressed, id) != null;
+    }
+
     pub fn deinit(self: *ModelOutput, allocator: std.mem.Allocator) void {
         self.deinitWithCleanup(allocator, .{ .outside_execution = true });
     }

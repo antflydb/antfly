@@ -2986,19 +2986,30 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithLayer0OverridesAndTrace(
 pub const SharedKvPrefillOutput = enum { all, last, kv_only };
 
 fn sharedKvPrefillBoundary(config: Config, dc: DecodeContext) ?usize {
-    const donor_layers = config.sharedKvPrefillDonorLayers() orelse return null;
+    if (!sharedKvPrefillContextEligible(dc)) return null;
+    return config.sharedKvPrefillDonorLayers();
+}
+
+pub fn metalE2bSharedKvPrefillBoundary(config: Config, dc: DecodeContext) ?usize {
+    // Shorter prompts exceeded the singleton suffix logit-error budget.
+    if (dc.attention_mode != .paged_prefill or dc.total_sequence_len < 512 or dc.attn_or_mask != null or
+        dc.packed_query_lengths != null or !sharedKvPrefillContextEligible(dc)) return null;
+    return config.metalE2bSharedKvPrefillDonorLayers();
+}
+
+fn sharedKvPrefillContextEligible(dc: DecodeContext) bool {
     const functional = dc.attention_mode == .full_recompute and dc.forward_kv_reuse != null and dc.kv_cache == null;
     if ((!functional and (dc.attention_mode != .paged_prefill or dc.kv_cache == null)) or dc.query_sequence_len <= 1 or
         dc.query_sequence_len > dc.total_sequence_len or
         dc.kv_batch != null or dc.selection_query_capture != null or
         dc.mrope_positions != null or dc.qwen3vl_visual_mask != null or
-        dc.qwen3vl_deepstack_embeddings != null) return null;
+        dc.qwen3vl_deepstack_embeddings != null) return false;
     if (dc.attn_or_mask) |mask| {
         if (dc.query_sequence_len != dc.total_sequence_len or
-            mask.len != (std.math.mul(usize, dc.total_sequence_len, dc.total_sequence_len) catch return null)) return null;
+            mask.len != (std.math.mul(usize, dc.total_sequence_len, dc.total_sequence_len) catch return false)) return false;
     }
-    if (dc.input_ids) |ids| if (ids.len == 0) return null;
-    return donor_layers;
+    if (dc.input_ids) |ids| if (ids.len == 0) return false;
+    return true;
 }
 
 fn preparedSharedKvPrefillEligible(config: Config, overrides: Layer0DecoderOverrides, batch: usize, seq_len: usize, context: ?*const DecodeContext) bool {
@@ -3006,6 +3017,44 @@ fn preparedSharedKvPrefillEligible(config: Config, overrides: Layer0DecoderOverr
     const dc = context orelse return false;
     if (dc.total_sequence_len != seq_len) return false;
     return sharedKvPrefillBoundary(config, dc.*) != null;
+}
+
+test "Metal E2B shared KV prefill requires exact text geometry and a long prompt" {
+    var config: Config = .{
+        .family = .gemma,
+        .gemma4_channel_protocol = true,
+        .hidden_size = 1536,
+        .num_hidden_layers = 35,
+        .vocab_size = 262144,
+        .ple_hidden_size = 256,
+        .num_kv_shared_layers = 20,
+        .intermediate_size = 6144,
+        .shared_layer_intermediate_size = 12288,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .position_encoding = .rope,
+        .sliding_window = 512,
+        .sliding_window_pattern = 5,
+    };
+    var dc: DecodeContext = .{
+        .attention_mode = .paged_prefill,
+        .total_sequence_len = 512,
+        .query_sequence_len = 256,
+        .kv_sequence_len = 512,
+        .kv_cache = .{ .sequence_id = 1, .pool_id = 0, .logical_block_count = 32, .tail_tokens = 0 },
+    };
+    try std.testing.expectEqual(@as(?usize, 15), metalE2bSharedKvPrefillBoundary(config, dc));
+    try std.testing.expectEqual(@as(?usize, null), sharedKvPrefillBoundary(config, dc));
+    dc.total_sequence_len = 511;
+    try std.testing.expectEqual(@as(?usize, null), metalE2bSharedKvPrefillBoundary(config, dc));
+    dc.total_sequence_len = 512;
+    dc.attn_or_mask = &.{0};
+    try std.testing.expectEqual(@as(?usize, null), metalE2bSharedKvPrefillBoundary(config, dc));
+    dc.attn_or_mask = null;
+    config.shared_layer_intermediate_size = 6144;
+    try std.testing.expectEqual(@as(?usize, null), metalE2bSharedKvPrefillBoundary(config, dc));
 }
 
 test "E4B shared KV prefill prepared rows preserve context and decline other consumers" {
@@ -3136,6 +3185,35 @@ test "E4B shared KV prefill excludes query capture and unsupported contexts" {
     try std.testing.expect(sharedKvPrefillBoundary(model, dc) == null);
 }
 
+/// Evaluate the E2B shared suffix with the ordinary decoder math and the
+/// donor pages that the preceding Metal frame has already published.
+pub fn forwardE2bSharedKvSuffix(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    donor_hidden: CT,
+    context: DecodeContext,
+    ple: CT,
+    donor_layers: usize,
+) !CT {
+    var decode = sharedKvLastRowContext(context);
+    decode.attention_mode = .paged_decode;
+    const overrides = decoderOverridesWithCleanup(.{}, &decode);
+    try validateDecoderForwardCleanup(cb, overrides.cleanup, &decode);
+    const last_row = context.query_sequence_len - 1;
+    const width = try std.math.mul(usize, config.ple_hidden_size, config.num_hidden_layers);
+    const last_ple = try cb.sliceRows2D(allocator, ple, last_row, 1, width);
+    defer freeTensorWithCleanup(cb, last_ple, overrides.cleanup);
+    var hidden = try cb.sliceRows2D(allocator, donor_hidden, last_row, 1, config.hidden_size);
+    errdefer freeTensorWithCleanup(cb, hidden, overrides.cleanup);
+    for (donor_layers..config.num_hidden_layers) |layer| {
+        const next = try decoderBlock(cb, allocator, config, hidden, 1, context.total_sequence_len, config.effectiveKVHeadsForLayer(layer), config.effectiveHeadDimForLayer(layer), layer, &decode, last_ple, overrides, null, null, null, null, null, null);
+        if (next != hidden) freeTensorWithCleanup(cb, hidden, overrides.cleanup);
+        hidden = next;
+    }
+    return hidden;
+}
+
 test "E4B shared KV last row retains absolute positions and full donor KV extent" {
     const ids = [_]i64{ 11, 22, 33 };
     const dc: DecodeContext = .{
@@ -3208,8 +3286,27 @@ pub fn trySharedKvPrefill(
             (config.video_token_index >= 0 and token == config.video_token_index) or
             (config.boi_token_index >= 0 and token == config.boi_token_index)) return null;
     }
-    _ = sharedKvPrefillBoundary(config, dc.*) orelse return null;
     if (input_ids.len != dc.query_sequence_len or seq_len != dc.total_sequence_len) return null;
+    if (cb.kind() == .metal and config.isGemma4E2bDenseLayout()) {
+        const decoder = @import("../backends/decoder_gated_runtime.zig");
+        if (!decoder.metalE2bSharedKvPrefillEligible(cb, config, input_ids, seq_len, dc)) return null;
+        // The eager decoder hands off through paged storage. A gathered
+        // runtime view cannot outlive this attempt or a chunk-size retry.
+        try cb.decoderRuntimeResetState();
+        errdefer cb.decoderRuntimeResetState() catch {};
+        const layers = config.num_hidden_layers;
+        const prepared = try cb.decoderRuntimePrepareOrReuseFamily(allocator, config, dc.kv_sequence_len, layers);
+        const result = if (prepared.prepared)
+            try decoder.tryMetalE2bSharedKvPrefill(cb, allocator, config, layers, input_ids, seq_len, dc, intent)
+        else
+            null;
+        errdefer if (result) |value| {
+            if (value.last_logits) |logits| allocator.free(logits);
+        };
+        try cb.decoderRuntimeResetState();
+        return result;
+    }
+    _ = sharedKvPrefillBoundary(config, dc.*) orelse return null;
     if (cb.kind() == .metal) {
         if (want_last_row) return null;
         const prepared = cb.decoderRuntimePrepareOrReuseFamily(allocator, config, seq_len, config.num_hidden_layers) catch return null;

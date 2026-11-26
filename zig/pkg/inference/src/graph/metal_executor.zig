@@ -2614,7 +2614,7 @@ fn runtimePrefill(
     if (decoderRuntimePrefillTraceRequested()) {
         std.debug.print("prefill-trace: runtimePrefill qlen={d} seq={d} ready={}\n", .{ request.query_seq_len, request.seq_len, decoder_runtime_ready });
     }
-    if (decoder_runtime_ready and request.query_seq_len == 1 and request.prepared_rows == null) {
+    if (decoder_runtime_ready and !request.kv_only and request.query_seq_len == 1 and request.prepared_rows == null) {
         try request.check();
         const token_id = request.input_ids[request.input_ids.len - 1];
         const direct_started_at = monotonicNowNs();
@@ -2633,6 +2633,22 @@ fn runtimePrefill(
         const timing_before = runtime_ctx.cb.directFamilyTimingSnapshot();
         const direct_started_at = monotonicNowNs();
         const config = runtime_ctx.definition.configuration.value;
+        if (request.prepared_rows == null) {
+            if (try decoder_gated_runtime.tryMetalE2bSharedKvPrefill(
+                &runtime_ctx.cb,
+                allocator,
+                config,
+                configured_layer_count,
+                request.input_ids,
+                request.seq_len,
+                &decode_context,
+                if (request.kv_only) .kv_only else .last_logits,
+            )) |output| {
+                recordPrefillFamilyTiming(&runtime_ctx.cb, direct_started_at, timing_before, true);
+                runtime_ctx.noteDecoderRuntimeStateFromCurrentView();
+                return .{ .logits = output.last_logits };
+            }
+        }
         if (request.prepared_rows) |rows| {
             if (request.kv_only) {
                 var hidden_rows = (try decoder_gated_runtime.forwardFinalHiddenRowsFromEmbeddings(&runtime_ctx.cb, allocator, config, configured_layer_count, rows.tensor, request.input_ids, request.seq_len, &decode_context, if (request.query_seq_len > 1 and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_METAL_SHARED_KV_PREFILL", true)) .kv_only else .all)) orelse return error.PreparedRowsExecutionUnavailable;
@@ -2894,6 +2910,16 @@ fn runtimeDecodeGreedy(
     if (try runtime_ctx.forwardDecoderRuntimeLastLogits(allocator, request.token_id, step.seq_len, &step.decode_context)) |output| {
         var owned_output = output;
         defer owned_output.deinitWithCleanup(allocator, .{ .boundary = request.cleanup_epoch, .operation = request.backend_operation });
+        const model = &runtime_ctx.definition.configuration.value;
+        if (model.isGemma4E2bDenseLayout() and model.suppressTokenIds().len != 0) {
+            const token = try owned_output.greedyTokenSuppressWithCleanup(allocator, model.vocab_size, model.suppressTokenIds(), .{
+                .boundary = request.cleanup_epoch,
+                .operation = request.backend_operation,
+            });
+            try runtime_ctx.seedGreedyDeviceToken(token);
+            timing_stats.decode_greedy_direct_nanos += @intCast(monotonicNowNs() - direct_started_at);
+            return .{ .token_id = token };
+        }
         if (owned_output.device_logits) |device_logits| {
             const backend = owned_output.device_logits_backend orelse return error.InvalidModelOutput;
             if (try backend.argmaxLastRow(device_logits, 1, runtime_ctx.definition.configuration.value.vocab_size)) |token_id| {
