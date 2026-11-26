@@ -10224,9 +10224,9 @@ pub const Node = struct {
         const backend: runtime.kv.pool.BackendKind = if (model.session.backend() == .cuda) .cuda else .metal;
         cfg.qwen35_device_only_state = cfg.hasQwen35VisionArchitectureContract() and
             ((backend == .cuda and cfg.qwen35_device_only_state) or
-                (metal_runtime.appleSimdgroupDeviceDefault() and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_DEVICE_RECURRENT_STATE")));
+                (metal_runtime.appleSimdgroupDeviceDefault() and metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_DEVICE_RECURRENT_STATE")));
         cfg.qwen35_metal_resident_vision = metal_runtime.appleSimdgroupDeviceDefault() and cfg.hasQwen35VisionArchitectureContract() and
-            qwen3vl_projector.supportsResidentVisionBudget(cfg) and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_RESIDENT_VISION_BUDGET");
+            qwen3vl_projector.supportsResidentVisionBudget(cfg) and metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_RESIDENT_VISION_BUDGET");
         const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend);
         const messages = [_]generation.Message{.{ .role = "user", .content = prompt, .image_bytes = &.{image}, .content_parts = &.{ .{ .image = 0 }, .{ .text = prompt } } }};
         const estimate = try self.countAdmittedPromptTokens(model_path, model, cfg, &messages, max_tokens, control);
