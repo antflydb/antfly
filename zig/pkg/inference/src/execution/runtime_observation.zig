@@ -373,6 +373,7 @@ pub const KernelScope = struct {
     native_program_bank: ?NativeProgramBank = null,
     metal_serial_workspace: ?SerialWorkspaceObservation = null,
     cuda_audio_workspace: ?CudaAudioWorkspace = null,
+    cuda_decoder_workspace: ?CudaDecoderWorkspace = null,
     attached: bool = false,
     /// Must be called only after the owner reaches final address-stable storage.
     pub fn begin(self: *KernelScope) void {
@@ -460,6 +461,26 @@ pub const CudaAudioWorkspace = struct {
 pub inline fn cudaAudioWorkspace(workspace: CudaAudioWorkspace) void {
     var active = active_kernels;
     while (active) |scope| : (active = scope.previous) scope.cuda_audio_workspace = workspace;
+}
+
+/// Latest bounded CUDA graph whose device readback and publication succeeded.
+pub const CudaDecoderWorkspace = struct {
+    route: Route,
+    plan_origin: @import("stream_workspace.zig").Origin,
+    planned_events: usize,
+    planned_scratch_bytes: usize,
+    bound_scratch_bytes: usize,
+    metadata_bytes: usize,
+    head_bytes: usize,
+    readback_bytes: usize,
+    rows: usize,
+
+    pub const Route = enum { recorded_and_launched, replayed };
+};
+
+pub inline fn cudaDecoderWorkspace(workspace: CudaDecoderWorkspace) void {
+    var active = active_kernels;
+    while (active) |scope| : (active = scope.previous) scope.cuda_decoder_workspace = workspace;
 }
 
 threadlocal var cuda_audio: CudaAudio = .{};

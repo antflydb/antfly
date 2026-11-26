@@ -116,6 +116,7 @@ pub const Report = struct {
     metal_region_policy: ?MetalRegionPolicy = null,
     metal_serial_workspace: ?@import("runtime_observation.zig").SerialWorkspaceObservation = null,
     cuda_audio_workspace: ?@import("runtime_observation.zig").CudaAudioWorkspace = null,
+    cuda_decoder_workspace: ?@import("runtime_observation.zig").CudaDecoderWorkspace = null,
     /// Available from the corresponding successfully published physical Frame.
     assigned_regions: ?@import("stats.zig").AssignedRegions = null,
     owned_program_fallbacks: ?ProgramFallbacks = null,
@@ -151,6 +152,7 @@ pub const Report = struct {
         report.cuda_periodic_workspace = value.runtime.cuda_periodic_workspace;
         report.metal_serial_workspace = value.runtime.metal_serial_workspace;
         report.cuda_audio_workspace = value.runtime.cuda_audio_workspace;
+        report.cuda_decoder_workspace = value.runtime.cuda_decoder_workspace;
         if (value.pending_interval != null) report.synchronous_interval = .pending_phase_only;
         if (value.error_name) |failure| report.failure = @import("runtime_observation.zig").FailureText.init(failure.view());
         if (value.program_error) |failure| {
@@ -402,6 +404,34 @@ test "uniform report retains the observed CUDA audio workspace across publicatio
     sample.recordKernelInterval(&scope);
     source.publish(.{ .runtime = sample.since(.{}) });
     try std.testing.expectEqual(workspace, source.snapshot().?.report.?.cuda_audio_workspace.?);
+}
+
+test "uniform report retains bounded CUDA decoder workspace after completed publication" {
+    const std = @import("std");
+    const observation = @import("runtime_observation.zig");
+    var source = @import("diagnostics.zig").Diagnostics{};
+    source.configure(true);
+    source.publish(.{});
+    try std.testing.expect(source.snapshot().?.report.?.cuda_decoder_workspace == null);
+    const workspace: observation.CudaDecoderWorkspace = .{
+        .route = .replayed,
+        .plan_origin = .observed,
+        .planned_events = 12,
+        .planned_scratch_bytes = 4096,
+        .bound_scratch_bytes = 4096,
+        .metadata_bytes = 512,
+        .head_bytes = 0,
+        .readback_bytes = 44,
+        .rows = 2,
+    };
+    var scope: observation.KernelScope = undefined;
+    scope.begin();
+    observation.cudaDecoderWorkspace(workspace);
+    _ = scope.finish();
+    var sample: runtime.Snapshot = .{};
+    sample.recordKernelInterval(&scope);
+    source.publish(.{ .runtime = sample.since(.{}) });
+    try std.testing.expectEqual(workspace, source.snapshot().?.report.?.cuda_decoder_workspace.?);
 }
 
 test "uniform report separates planned literal publication from opaque Metal output copies" {

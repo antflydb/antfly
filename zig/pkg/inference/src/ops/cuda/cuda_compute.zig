@@ -3709,6 +3709,7 @@ pub const CudaCompute = struct {
     pub const BoundedDecodeClaim = struct {
         compute: *CudaCompute,
         future_tokens: usize,
+        launch_route: ?@import("../../execution/runtime_observation.zig").CudaDecoderWorkspace.Route = null,
         pub fn deinit(self: *@This()) void {
             self.compute.bounded_decode_graph.active = false;
             self.compute.execution_scope = null;
@@ -3757,6 +3758,7 @@ pub const CudaCompute = struct {
             const owner = &compute.bounded_decode_graph;
             if (owner.phase == .replay) {
                 try compute.ctx.launchGraph(owner.graph);
+                self.launch_route = .replayed;
                 owner.replays += 1;
                 owner.wide_replays += @intFromBool(owner.rows > 64);
                 owner.max_replay_rows = @max(owner.max_replay_rows, owner.rows);
@@ -3817,6 +3819,7 @@ pub const CudaCompute = struct {
                 owner.graph = try compute.ctx.instantiateGraph(owner.pending_graph);
                 try compute.ctx.destroyGraphChecked(&owner.pending_graph);
                 try compute.ctx.launchGraph(owner.graph);
+                self.launch_route = .recorded_and_launched;
                 owner.captures += 1;
                 owner.phase = .replay;
             } else owner.phase = .learn;
@@ -3831,6 +3834,22 @@ pub const CudaCompute = struct {
             try copyToHostTrackedAndSync(self.compute, source, std.mem.sliceAsBytes(readback_words));
             burst_value.drained = true;
             try layout.publishReadback(readback_words, owner.next_positions[0 .. owner.rows * 3], &owner.progress, tokens);
+            const observation = @import("../../execution/runtime_observation.zig");
+            if (observation.kernelObservationActive()) if (self.launch_route) |route| {
+                const plan = owner.plan.?;
+                const arena = owner.admitted_arena_layout.?;
+                observation.cudaDecoderWorkspace(.{
+                    .route = route,
+                    .plan_origin = plan.origin,
+                    .planned_events = arena.events,
+                    .planned_scratch_bytes = arena.bytes,
+                    .bound_scratch_bytes = owner.arena.len,
+                    .metadata_bytes = layout.metadata_bytes,
+                    .head_bytes = layout.head_bytes,
+                    .readback_bytes = source.len,
+                    .rows = owner.rows,
+                });
+            };
         }
         pub fn noteKvTokens(self: *@This(), storage: *kv_storage_runtime.KvStorageRuntime, max_tokens: usize) void {
             const hook = storage.device_write_hook orelse return;
