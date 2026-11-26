@@ -935,12 +935,15 @@ pub const Runtime = struct {
         };
     }
 
-    /// Own the complete whole-model physical window before its first chunk.
-    /// Scheduler turn/progress publication remains in the caller.
-    pub fn prepareCompiledPrompt(self: *Runtime, request: CompiledPromptRequest) !CompiledPromptPlan {
-        if (request.prefilled_tokens != 0) return error.UnsupportedShape;
+    fn planCompiledPrompt(self: *const Runtime, request: CompiledPromptRequest) CompiledPromptPlan {
         const context = self.forward.context;
-        const route: decoder_storage.Route = if (context.compiled_partition_backend == .metal and context.cb.kind() == .metal and self.state.isPaged() and context.kv_dtype != null) .metal_whole_model else .standard;
+        const route = (decoder_storage.ActiveRoute{
+            .backend = context.cb.kind(),
+            .compiled_backend = context.compiled_partition_backend,
+            .whole_model = context.compiled_attachment_target == .whole_model,
+            .has_graph = self.forward.graph_cache != null,
+            .dtype = context.kv_dtype,
+        }).storageRoute(self.state);
         const policy = decoder_storage.routeCapacityPolicy(route, context.gpt_config.*, request.storage, context.kv_dtype orelse .f16, request.sampled_ring_qualified);
         const bounded = policy == .split_swa_ring;
         // Reuse the admitted native schedule default instead of substituting the
@@ -950,8 +953,24 @@ pub const Runtime = struct {
         else
             0;
         const rows = decoder_routes.wholeModelExecutionPrefillChunkSize(context.compiled_partition_backend, configured_rows, request.scheduler_chunk_rows, request.query_tokens, bounded);
-        self.state.configureKvMaxInflightTokens(inflightRows(rows, request.speculative_k), bounded);
         return .{ .chunk_rows = rows, .bounded_swa = bounded };
+    }
+
+    /// Prepare the same executable shape the first numerical chunk can use.
+    pub fn compiledPreparationRows(self: *const Runtime, request: CompiledPromptRequest) usize {
+        const context = self.forward.context;
+        if (context.compiled_partition_backend == null or context.compiled_attachment_target != .whole_model or self.forward.graph_cache == null)
+            return request.query_tokens;
+        return self.planCompiledPrompt(request).chunk_rows;
+    }
+
+    /// Own the complete whole-model physical window before its first chunk.
+    /// Scheduler turn/progress publication remains in the caller.
+    pub fn prepareCompiledPrompt(self: *Runtime, request: CompiledPromptRequest) !CompiledPromptPlan {
+        if (request.prefilled_tokens != 0) return error.UnsupportedShape;
+        const plan = self.planCompiledPrompt(request);
+        self.state.configureKvMaxInflightTokens(inflightRows(plan.chunk_rows, request.speculative_k), plan.bounded_swa);
+        return plan;
     }
 
     pub fn prepareChunkWindow(self: *Runtime, request: PromptRequest, chunk_rows: usize) void {
@@ -2166,6 +2185,17 @@ fn checkMetalCompiledChunk(cb: ComputeBackend, native_reference: ComputeBackend)
                 .has_draft = false,
                 .needs_host_logits = false,
             };
+            const compiled: CompiledPromptRequest = .{
+                .storage = embedding.route.storage,
+                .query_tokens = ids.len,
+                .configured_chunk_rows = 1,
+                .scheduler_chunk_rows = 0,
+                .speculative_k = 0,
+                .sampled_ring_qualified = false,
+            };
+            try std.testing.expectEqual(@as(usize, 1), physical.compiledPreparationRows(compiled));
+            try std.testing.expectEqual(physical.planCompiledPrompt(compiled).chunk_rows, physical.compiledPreparationRows(compiled));
+            try std.testing.expectEqual(@as(usize, 0), state.total_tokens);
             const planned = try physical.planEmbeddingPrompt(embedding, null);
             try std.testing.expectEqual(.greedy_token, planned.output_intent);
             try std.testing.expectEqual(@as(usize, 1), planned.chunk_rows);

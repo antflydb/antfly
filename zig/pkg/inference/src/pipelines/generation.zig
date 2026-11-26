@@ -3578,24 +3578,14 @@ pub const NativeGenerationPipeline = struct {
         if (self.failure_trace) |trace| trace.mark(.runtime_prepare);
         var selected_request = try decoder_storage.SelectedRequest.begin(config.kv_cache_mode == .select_v1, &self.cb, self.scheduler != null, decode_state, &self.gpt_config, self.kv_dtype, config.kv_selection_peak_limit_bytes, select_v1_gpu_oracle, config.kv_protected_spans);
         defer selected_request.deinit();
-        const whole_model_kv_policy = generationKvCapacityPolicyForRoute(
-            (decoder_storage.ActiveRoute{ .backend = self.cb.kind(), .compiled_backend = self.compiled_partition_backend, .whole_model = self.compiled_attachment_target == .whole_model, .has_graph = self.graph_cache != null, .dtype = self.kv_dtype }).storageRoute(decode_state),
-            self.gpt_config,
-            config,
-            self.kv_dtype orelse .f16,
-        );
-        const runtime_prepare_token_hint = if (self.compiled_partition_backend != null and
-            self.compiled_attachment_target == .whole_model and
-            self.graph_cache != null)
-            wholeModelExecutionPrefillChunkSize(
-                self.compiled_partition_backend,
-                config.prefill_chunk_size,
-                if (self.scheduler_lease) |lease| lease.prefill_chunk_size else 0,
-                prompt_token_count,
-                whole_model_kv_policy == .split_swa_ring,
-            )
-        else
-            prompt_token_count;
+        const runtime_prepare_token_hint = self.prefillRuntime(decode_state, null).compiledPreparationRows(.{
+            .storage = decoderStorageRequest(config),
+            .query_tokens = prompt_token_count,
+            .configured_chunk_rows = config.prefill_chunk_size,
+            .scheduler_chunk_rows = if (self.scheduler_lease) |lease| lease.prefill_chunk_size else 0,
+            .speculative_k = config.speculative_k,
+            .sampled_ring_qualified = exact_hybrid_sampled_ring_qualification_override,
+        });
         debugGenerationStage("prepare compiled generation runtime begin prompt_token_count={d} token_hint={d}", .{ prompt_token_count, runtime_prepare_token_hint });
         const runtime_prepared = try self.prepareCompiledGenerationRuntime(runtime_prepare_token_hint);
         debugGenerationStage("prepare compiled generation runtime end prepared={}", .{runtime_prepared});
