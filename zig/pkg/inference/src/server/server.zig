@@ -48701,6 +48701,35 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
         const previous_models_root = node.config.models_dir;
         node.config.models_dir = std.fs.path.dirname(model_dir) orelse ".";
         defer node.config.models_dir = previous_models_root;
+        const WorkspaceEvidence = struct {
+            owner: u64 = 0,
+            completed: ?@import("../execution/runtime_observation.zig").CudaDecoderWorkspace = null,
+            fn collect(self: *@This(), record: @import("../execution/diagnostic_export.zig").Record) void {
+                if (record.owner != self.owner) return;
+                const report = record.snapshot.report orelse return;
+                if (report.cuda_decoder_workspace) |workspace| self.completed = workspace;
+            }
+        };
+        const verify_workspace = platform.env.getenvBool("ANTFLY_TEST_LIGHTONOCR3_CUDA_WORKSPACE_REPORT");
+        const diagnostics_export = @import("../execution/diagnostic_export.zig");
+        var workspace_evidence: WorkspaceEvidence = .{};
+        var observed_model = if (verify_workspace)
+            node.model_manager.acquireLoadedModel(model_dir) orelse return error.ModelNotFound
+        else
+            null;
+        defer if (observed_model) |*model| model.release();
+        if (observed_model) |*model| {
+            const session = model.get().session;
+            try std.testing.expect(session.backend() == .cuda);
+            try std.testing.expect(session.configureExecutionDiagnostics(true));
+            const binding = session.invocation_diagnostics orelse return error.TestUnexpectedResult;
+            binding.diagnostics.configureExport();
+            workspace_evidence.owner = binding.diagnostics.export_owner;
+        }
+        defer if (observed_model) |*model| {
+            _ = model.get().session.configureExecutionDiagnostics(false);
+            diagnostics_export.drain(WorkspaceEvidence.collect, &workspace_evidence);
+        };
         const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(fixture.len));
         defer allocator.free(encoded);
         _ = std.base64.standard.Encoder.encode(encoded, fixture);
@@ -48726,6 +48755,15 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
         if (platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_BATCH", true) and effectiveLightOnReadRows() > 1 and effectiveLightOnReadWindow() > 1) {
             const execution = decoded.value.object.get("execution").?.object;
             try std.testing.expectEqual(@as(i64, 2), execution.get("native_items").?.integer);
+        }
+        if (verify_workspace) {
+            diagnostics_export.drain(WorkspaceEvidence.collect, &workspace_evidence);
+            const report = workspace_evidence.completed orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(usize, 2), report.rows);
+            try std.testing.expectEqual((report.rows * 5 + 1) * @sizeOf(u32), report.readback_bytes);
+            try std.testing.expectEqual(report.planned_scratch_bytes, report.bound_scratch_bytes);
+            try std.testing.expect(report.planned_events != 0 and report.metadata_bytes != 0);
+            std.debug.print("LIGHTONOCR3 observed_cuda_workspace rows={d} readback_bytes={d} route={s}\n", .{ report.rows, report.readback_bytes, @tagName(report.route) });
         }
         std.debug.print("LIGHTONOCR3 http_batch_pages=2 parity=true\n", .{});
     }
