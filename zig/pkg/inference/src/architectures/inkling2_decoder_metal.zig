@@ -276,11 +276,26 @@ const WorkPlan = struct {
         };
     }
 
+    const Storage = struct {
+        attention_offset: usize,
+        temp_offset: usize,
+        bytes: usize,
+    };
+
+    fn storage(self: WorkPlan, width: u32) !Storage {
+        const stack_bytes = try Stack.deviceBytes(width, self.rows);
+        const attention_offset = std.mem.alignForward(usize, stack_bytes, 256);
+        const attention_end = try std.math.add(usize, attention_offset, self.attention.bytes);
+        const temp_offset = std.mem.alignForward(usize, attention_end, 256);
+        return .{
+            .attention_offset = attention_offset,
+            .temp_offset = temp_offset,
+            .bytes = try std.math.add(usize, temp_offset, self.temps.bytes),
+        };
+    }
+
     fn deviceBytes(self: WorkPlan, width: u32) !usize {
-        var bytes = try Stack.deviceBytes(width, self.rows);
-        bytes = try std.math.add(usize, bytes, self.attention.bytes);
-        bytes = try std.math.add(usize, bytes, self.temps.bytes);
-        return std.math.add(usize, bytes, try std.math.mul(usize, self.elements[@backingInt(Temp.logits)], @sizeOf(f32)));
+        return std.math.add(usize, (try self.storage(width)).bytes, try std.math.mul(usize, self.elements[@backingInt(Temp.logits)], @sizeOf(f32)));
     }
 };
 
@@ -359,18 +374,28 @@ pub const RequestPlan = struct {
 };
 
 const Work = struct {
+    storage: Tensor,
     stack: Stack,
     attention: attention.RequestWorkspace,
     groups: ?Tensor,
     temps: [@typeInfo(Temp).@"enum".field_names.len]Tensor,
 
-    fn init(a: std.mem.Allocator, runtime: *Runtime, width: u32, plan: WorkPlan) !Work {
+    fn init(a: std.mem.Allocator, runtime: *Runtime, width: u32, plan: WorkPlan, tail: ?WorkPlan) !Work {
+        const tail_bytes = if (tail) |short| (try short.storage(width)).bytes else 0;
+        var storage = try allocate(a, runtime, .u8, @max((try plan.storage(width)).bytes, tail_bytes), .private);
+        defer storage.deinit();
+        return bind(a, runtime, width, plan, &storage);
+    }
+
+    fn bind(a: std.mem.Allocator, runtime: *Runtime, width: u32, plan: WorkPlan, backing: *const Tensor) !Work {
         var result: Work = undefined;
-        result.stack = try Stack.init(a, runtime, width, plan.rows);
+        const layout = try plan.storage(width);
+        result.storage = try backing.retainedTypedView(0, &.{std.math.cast(i32, backing.deviceByteLen()) orelse return error.InvalidShape}, .u8);
+        errdefer result.storage.deinit();
+        if (layout.bytes > result.storage.deviceByteLen()) return error.InvalidShape;
+        result.stack = try Stack.bind(&result.storage, 0, width, plan.rows);
         errdefer result.stack.deinit();
-        var arena = try allocate(a, runtime, .u8, plan.temps.bytes, .private);
-        defer arena.deinit();
-        result.attention = try .init(a, runtime, plan.attention, .{ .arena = &arena, .offset = plan.temps.offsets[@backingInt(Temp.router)] });
+        result.attention = try .init(a, runtime, plan.attention, .{ .arena = &result.storage, .offset = layout.attention_offset }, .{ .arena = &result.storage, .offset = layout.temp_offset + plan.temps.offsets[@backingInt(Temp.router)] });
         errdefer result.attention.deinit();
         var initialized: usize = 0;
         errdefer for (result.temps[0..initialized]) |*tensor| tensor.deinit();
@@ -380,11 +405,11 @@ const Work = struct {
             tensor.* = if (kind == .logits)
                 try allocate(a, runtime, dtype, elements, .shared)
             else
-                try arena.retainedTypedView(plan.temps.offsets[index], &.{std.math.cast(i32, elements) orelse return error.InvalidShape}, dtype);
+                try result.storage.retainedTypedView(layout.temp_offset + plan.temps.offsets[index], &.{std.math.cast(i32, elements) orelse return error.InvalidShape}, dtype);
             initialized += 1;
         }
         result.groups = if (plan.group_elements > 0)
-            try arena.retainedTypedView(plan.temps.groups_offset, &.{std.math.cast(i32, plan.group_elements) orelse return error.InvalidShape}, .i32)
+            try result.storage.retainedTypedView(layout.temp_offset + plan.temps.groups_offset, &.{std.math.cast(i32, plan.group_elements) orelse return error.InvalidShape}, .i32)
         else
             null;
         return result;
@@ -396,6 +421,7 @@ const Work = struct {
         for (self.temps[0..count]) |*tensor| tensor.deinit();
         self.attention.deinit();
         self.stack.deinit();
+        self.storage.deinit();
     }
 
     fn get(self: *Work, key: Temp) *Tensor {
@@ -447,9 +473,9 @@ pub const Request = struct {
         self.* = .{ .model = model, .state = undefined, .decode = undefined, .prefill = null, .prefill_tail = plan.prefill_tail, .host_logits = null, .allocator = a };
         if (plan.host_logit_count != 0) self.host_logits = try a.alloc(f32, plan.host_logit_count);
         errdefer if (self.host_logits) |logits| a.free(logits);
-        self.decode = try .init(a, runtime, plan.width, plan.decode);
+        self.decode = try .init(a, runtime, plan.width, plan.decode, null);
         errdefer self.decode.deinit();
-        if (plan.prefill) |batch| self.prefill = try .init(a, runtime, plan.width, batch);
+        if (plan.prefill) |batch| self.prefill = try .init(a, runtime, plan.width, batch, plan.prefill_tail);
         errdefer if (self.prefill) |*batch| batch.deinit();
         try self.state.init(a, runtime, plan.bank, plan.width);
     }
@@ -631,12 +657,12 @@ pub const Request = struct {
         }
         const tail = self.prefill_tail orelse return error.InvalidShape;
         if (rows != tail.rows) return error.InvalidShape;
-        // Completed frames have released their bindings. Retire the wide
-        // workspace before allocating the shorter tail, keeping its plan
-        // available if allocation fails.
-        if (self.prefill) |*current| current.deinit();
-        self.prefill = null;
-        self.prefill = try .init(self.allocator, self.model.runtime, self.model.text.hidden_size, tail);
+        // Completed frames have released their bindings. Rebind the same
+        // arena to the shorter row layout before retiring the wide views.
+        const current = if (self.prefill) |*work| work else return error.InvalidShape;
+        const next = try Work.bind(self.allocator, self.model.runtime, self.model.text.hidden_size, tail, &current.storage);
+        current.deinit();
+        self.prefill = next;
         self.prefill_tail = null;
         try self.run(&self.prefill.?, .{ .prefix = parts }, output);
     }
@@ -1143,7 +1169,8 @@ test "Inkling Metal resident decoder executes the full visit schedule on a synth
     const request_memory = @import("../backends/metal_tensor.zig").memoryStatsSnapshot();
     // Six state buffers, one residual buffer, one attention buffer,
     // a private temporary arena, and a shared logits buffer.
-    try std.testing.expectEqual(@as(u64, 10), request_memory.device_owned_buffers_created - before_request.device_owned_buffers_created);
+    // Six state buffers, one private workspace, and one shared logits buffer.
+    try std.testing.expectEqual(@as(u64, 8), request_memory.device_owned_buffers_created - before_request.device_owned_buffers_created);
     try std.testing.expectEqual(try short_plan.deviceBytes(), request_memory.device_owned_live_bytes - before_request.device_owned_live_bytes);
     var image_row = try upload(a, runtime, .i16, std.mem.sliceAsBytes(embeddings[0..width]));
     defer image_row.deinit();
@@ -1191,16 +1218,11 @@ test "Inkling Metal resident decoder executes the full visit schedule on a synth
     try tail_request.initWithPlan(a, &model, try wide_plan.withPrefillTail(&model, 2));
     defer tail_request.deinit();
     try tail_request.appendTokens(&.{ 0, 1, 0 });
-    {
-        var failure = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
-        tail_request.allocator = failure.allocator();
-        defer tail_request.allocator = a;
-        try std.testing.expectError(error.OutOfMemory, tail_request.appendTokens(&.{ 1, 0 }));
-        try std.testing.expect(failure.has_induced_failure);
-    }
-    try std.testing.expectEqual(@as(usize, 3), tail_request.state.sequence.committed_tokens);
-    try std.testing.expect(tail_request.prefill == null);
+    const wide_storage = tail_request.prefill.?.storage.deviceHandle();
+    const buffers_before_tail = @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created;
     try tail_request.appendTokens(&.{ 1, 0 });
+    try std.testing.expectEqual(wide_storage, tail_request.prefill.?.storage.deviceHandle());
+    try std.testing.expectEqual(buffers_before_tail, @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created);
     try std.testing.expectEqual(@as(usize, 5), tail_request.state.sequence.committed_tokens);
     if (groupedPrefillEnabled()) {
         var group_request: Request = undefined;

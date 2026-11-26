@@ -40,8 +40,16 @@ pub const Stack = struct {
         if (width == 0 or rows == 0) return error.InvalidShape;
         const count = try std.math.mul(usize, width, rows);
         const total = try std.math.mul(usize, count, capacity + 2);
-        const extent = std.math.cast(i32, count) orelse return error.InvalidShape;
         var backing = try allocate(a, runtime, total);
+        defer backing.deinit();
+        return bind(&backing, 0, width, rows);
+    }
+
+    pub fn bind(storage: *const Tensor, offset: usize, width: u32, rows: u32) !Stack {
+        const count = try std.math.mul(usize, width, rows);
+        const total = try std.math.mul(usize, count, capacity + 2);
+        const extent = std.math.cast(i32, count) orelse return error.InvalidShape;
+        var backing = try storage.retainedTypedView(offset, &.{std.math.cast(i32, total) orelse return error.InvalidShape}, .i16);
         errdefer backing.deinit();
         const row_bytes = count * @sizeOf(u16);
         var bank = try backing.retainedView(capacity * row_bytes, 2 * row_bytes, &.{@intCast(2 * count)});

@@ -301,11 +301,14 @@ pub const RequestWorkspace = struct {
         }
     };
 
-    pub const ReductionStorage = struct { arena: *const Tensor, offset: usize };
+    pub const Storage = struct { arena: *const Tensor, offset: usize };
 
-    pub fn init(a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, plan: Plan, supplied_reduction: ?ReductionStorage) !RequestWorkspace {
+    pub fn init(a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, plan: Plan, supplied: ?Storage, supplied_reduction: ?Storage) !RequestWorkspace {
         const size = std.math.cast(i32, plan.bytes / 2) orelse return error.InvalidShape;
-        var backing = try Tensor.deviceAllocateTyped(a, runtime, .i16, .private, &.{size});
+        var backing = if (supplied) |storage|
+            try storage.arena.retainedTypedView(storage.offset, &.{size}, .i16)
+        else
+            try Tensor.deviceAllocateTyped(a, runtime, .i16, .private, &.{size});
         errdefer backing.deinit();
         var reduction: ?Tensor = if (plan.reduction_elements == 0)
             null
@@ -455,7 +458,7 @@ test "Inkling Metal attention weights preserve packed offsets and local/global l
 
         var separate_source = try upload(std.testing.allocator, runtime, &Fixture.data_b);
         defer separate_source.deinit();
-        var work = try RequestWorkspace.init(std.testing.allocator, runtime, try .init(text, 1, 2, 1), null);
+        var work = try RequestWorkspace.init(std.testing.allocator, runtime, try .init(text, 1, 2, 1), null, null);
         defer work.deinit();
         for ([_]*const Tensor{ &source, &separate_source }) |kv_source| {
             var counters = @import("../execution/runtime_observation.zig").Scope.init();
@@ -533,7 +536,7 @@ test "Inkling Metal attention weights drive local and global visits across commi
 
         var source = try allocate(a, runtime, 1);
         defer source.deinit();
-        var workspace = try RequestWorkspace.init(a, runtime, try .init(text, 1, 2, 1), null);
+        var workspace = try RequestWorkspace.init(a, runtime, try .init(text, 1, 2, 1), null, null);
         defer workspace.deinit();
         var output = try allocate(a, runtime, 1);
         defer output.deinit();
