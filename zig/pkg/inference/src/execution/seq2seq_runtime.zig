@@ -315,7 +315,7 @@ pub const State = struct {
             else => {},
         };
         // The logits readback has finished the invocation's numerical use.
-        try self.migrateDependentCaches(slots, updated, fresh, control);
+        try self.migrateDependentCaches(slots, updated, control);
         if (control) |active| try active.check();
         for (slots, updated) |*old, new| if (new) |value| {
             if (old.*) |previous| previous.pin.release();
@@ -403,7 +403,7 @@ pub const State = struct {
         rejected: bool = false,
     };
 
-    fn migrateDependentCaches(self: *State, previous: []const ?ResidentSlot, updated: []?ResidentSlot, fresh: bool, control: ?Control) !void {
+    fn migrateDependentCaches(self: *State, previous: []const ?ResidentSlot, updated: []?ResidentSlot, control: ?Control) !void {
         const shared = self.session.shared_compute_context orelse return;
         const backend = shared.stableBackend();
         if (self.session.model_lifetime == null) return;
@@ -422,10 +422,10 @@ pub const State = struct {
             reservations.deinit(self.allocator);
         }
         for (self.roles, previous, updated, 0..) |role, old, slot, index| switch (role) {
-            .past => |past| if (fresh or (past.cross and slot == null)) {
-                // Prefill can publish a slice of a transient bank. Detach
-                // eligible slots before keeping them for decode.
-                const source = (if (fresh) slot else old) orelse return error.InvalidDecoderOutput;
+            .past => |past| {
+                // A suffix can publish a transient view just like prefill.
+                // An omitted cross output can also retry after admission pressure.
+                const source = slot orelse (if (past.cross) old else null) orelse continue;
                 if (source.independent or source.input.backend.ptr != backend.ptr or source.input.backend.vtable != backend.vtable) continue;
                 if (control) |active| try active.check();
                 const item = self.reserveCacheCopy(backend, source, index) catch |err| switch (err) {
@@ -895,7 +895,7 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
                 defer for (targets) |target| if (target) |value| value.pin.release();
                 const before_denial = controller.snapshot();
                 const copy_control: Control = .{ .native_call_policy = .in_process };
-                try copy_state.migrateDependentCaches(&previous, &targets, false, copy_control);
+                try copy_state.migrateDependentCaches(&previous, &targets, copy_control);
                 try std.testing.expect(targets[0] == null and targets[1] == null);
                 try std.testing.expectEqualDeep(before_denial, controller.snapshot());
                 copy_state.session.run_admission.?.limits = original_limits;
@@ -908,7 +908,7 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
                 {
                     var observation = @import("runtime_observation.zig").Scope.init();
                     defer observation.deinit();
-                    try copy_state.migrateDependentCaches(&previous, &targets, false, copy_control);
+                    try copy_state.migrateDependentCaches(&previous, &targets, copy_control);
                     if (backend == .metal) {
                         const counters = observation.snapshot();
                         try std.testing.expectEqual(@as(?u64, 1), counters.metal_command_submissions);
@@ -918,6 +918,16 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
                 if (comptime @import("build_options").enable_cuda) {
                     if (before_waits) |count| try std.testing.expectEqual(count + 1, shared.ctx.cuda.ctx.runtimeObservation().?.counters.?.host_event_synchronizations);
                 }
+                // A dependent self cache published after prefill must get
+                // the same independent copy as the initial cache.
+                cross_roles[0].past.cross = false;
+                var suffix_targets: [2]?ResidentSlot = .{ source, null };
+                suffix_targets[0].?.pin = source.pin.retain() orelse return error.MissingIndependentResidentCache;
+                defer for (suffix_targets) |target| if (target) |value| value.pin.release();
+                try copy_state.migrateDependentCaches(&previous, &suffix_targets, copy_control);
+                try std.testing.expect(suffix_targets[0].?.independent);
+                cross_roles[0].past.cross = true;
+
                 const detached = targets[0] orelse return error.MissingIndependentResidentCache;
                 const other = targets[1] orelse return error.MissingIndependentResidentCache;
                 try std.testing.expect(other.independent and other.input.value != detached.input.value);
@@ -930,7 +940,7 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
                 mixed[1].?.input.value = malformed;
                 var partial_targets: [2]?ResidentSlot = @splat(null);
                 defer for (partial_targets) |target| if (target) |value| value.pin.release();
-                try copy_state.migrateDependentCaches(&mixed, &partial_targets, false, copy_control);
+                try copy_state.migrateDependentCaches(&mixed, &partial_targets, copy_control);
                 try std.testing.expect(partial_targets[0] != null and partial_targets[1] == null);
                 const partial_cache = try partial_targets[0].?.input.backend.toFloat32(partial_targets[0].?.input.value, a);
                 defer a.free(partial_cache);
@@ -950,7 +960,7 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
                 var cancelled_targets: [2]?ResidentSlot = @splat(null);
                 defer for (cancelled_targets) |target| if (target) |value| value.pin.release();
                 const before_cancel = controller.snapshot();
-                try std.testing.expectError(error.Cancelled, copy_state.migrateDependentCaches(&previous, &cancelled_targets, false, .{
+                try std.testing.expectError(error.Cancelled, copy_state.migrateDependentCaches(&previous, &cancelled_targets, .{
                     .ptr = &cancellation,
                     .check_fn = CancelBeforePublication.check,
                     .native_call_policy = .in_process,
