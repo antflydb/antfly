@@ -552,8 +552,8 @@ const default_sync_wait_timeout_ms: u64 = 5 * std.time.ms_per_min;
 const authority_retry_initial_ms: u64 = 2;
 const authority_retry_max_ms: u64 = 32;
 const parked_authority_check_ms: u64 = 30_000;
-const borrowed_cancellation_poll_min_ns: i64 = 25 * std.time.ns_per_ms;
-const borrowed_cancellation_poll_max_ns: i64 = 250 * std.time.ns_per_ms;
+const borrowed_cancellation_poll_min_ns: u64 = 25 * std.time.ns_per_ms;
+const borrowed_cancellation_poll_max_ns: u64 = 250 * std.time.ns_per_ms;
 
 const ForegroundCatchUpGuard = struct {
     cancellation: CancellationToken = .none,
@@ -8239,12 +8239,12 @@ fn acknowledgeMediaPassConsumer(runtime: *EnrichmentRuntime, request: enrichment
                     failed = true;
                     terminal = terminal or value.terminal;
                     required = required or value.required;
+                    required_embedding_failure = required_embedding_failure or (value.required and value.terminal);
                 };
             } else failed = chunk.metadata.?.embedding_error != null;
             if (failed) embedding_values.failed += 1 else embedding_values.complete += 1;
             if (terminal) embedding_values.terminal += 1;
             if (failed and !required) embedding_values.degraded += 1;
-            required_embedding_failure = required_embedding_failure or required;
         }
     };
     // A distinct repair acknowledgement keeps legacy consumer acknowledgements
@@ -8257,7 +8257,8 @@ fn acknowledgeMediaPassConsumer(runtime: *EnrichmentRuntime, request: enrichment
     if (needs_settlement) {
         try acknowledgements.append(a, repair_receipt.?);
         // Keep the failed receipt discoverable until its repair debt is durable.
-        try recordIsolatedRequestErrorFor(runtime, null, request, error.RequiredMediaOutputFailed, requestAttemptNumberFor(runtime, requestFailureFingerprint(request)));
+        if (!try skipPersistedRequestFailure(runtime, null, request))
+            try recordIsolatedRequestErrorFor(runtime, null, request, error.RequiredMediaOutputFailed, requestAttemptNumberFor(runtime, requestFailureFingerprint(request)));
     }
     if (!already or needs_settlement) {
         cursor.acknowledged_consumers = acknowledgements.items;
@@ -9770,7 +9771,6 @@ const PlatformEnrichmentRuntime = struct {
         const guard: ForegroundCatchUpGuard = .{ .cancellation = cancellation, .deadline_ns = effective_deadline_ns, .clock = self.deadline_clock };
 
         while (true) {
-            cancellation.check() catch |err| return callerCheckpointFailure(err);
             self.mutex.lockUncancelable(io);
             if (self.applied_sequence >= sequence) {
                 const cut: ReplayCut = .{ .applied = self.applied_sequence, .generation = self.replay_generation };
@@ -9825,26 +9825,29 @@ const PlatformEnrichmentRuntime = struct {
             _ = self.sync_waiter_count.fetchAdd(1, .release);
             self.mutex.unlock(io);
 
-            // Borrowed transport cancellation is a callback rather than an
-            // Io future cancellation. Poll only this post-commit barrier at a
-            // short interval; the ordinary no-token path keeps its single
-            // hard-deadline futex wait.
-            const wait_deadline = if (cancellation.ptr != null)
-                Io.Clock.Timestamp.fromNow(io, .{
-                    .clock = .awake,
-                    .raw = .fromNanoseconds(@intCast(@min(@as(u64, @intCast(cancellation_poll_ns)), effective_deadline_ns - now))),
-                })
-            else
-                deadline;
-            const wait_result = Io.futexWaitTimeout(
-                io,
-                u32,
-                &self.sync_wait_epoch.raw,
-                observed_epoch,
-                .{ .deadline = wait_deadline },
-            );
-            const previous_waiters = self.sync_waiter_count.fetchSub(1, .release);
-            std.debug.assert(previous_waiters > 0);
+            const wait_result = wait: {
+                defer {
+                    const previous_waiters = self.sync_waiter_count.fetchSub(1, .release);
+                    std.debug.assert(previous_waiters > 0);
+                }
+                // The checkpoint can perform I/O. The epoch captured under
+                // the mutex prevents a lost wakeup while it runs.
+                cancellation.check() catch |err| return callerCheckpointFailure(err);
+                const wait_deadline = if (cancellation.ptr != null)
+                    Io.Clock.Timestamp.fromNow(io, .{
+                        .clock = .awake,
+                        .raw = .fromNanoseconds(@min(cancellation_poll_ns, effective_deadline_ns -| self.deadline_clock.nowRealtimeNs())),
+                    })
+                else
+                    deadline;
+                break :wait Io.futexWaitTimeout(
+                    io,
+                    u32,
+                    &self.sync_wait_epoch.raw,
+                    observed_epoch,
+                    .{ .deadline = wait_deadline },
+                );
+            };
             wait_result catch |err| switch (err) {
                 error.Canceled => return self.resolveCanceledVisibilityWait(io, sequence, wait_cut),
             };
@@ -11334,7 +11337,7 @@ fn failureIdentityForRequest(request: enrichment_types.GeneratedEnrichmentReques
 /// and process restarts without adding a point lookup to the healthy hot path.
 fn skipPersistedRequestFailure(
     runtime: *EnrichmentRuntime,
-    window: *GeneratedReplayWindow,
+    window: ?*GeneratedReplayWindow,
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !bool {
     const pending_fn = runtime.failure_pending_fn orelse return false;
@@ -11362,9 +11365,8 @@ fn skipPersistedRequestFailure(
         markIsolatedFailedSource(runtime, index_name, failure_identity.artifact_name);
     };
 
-    if (runtime.coverage_apply_mutex != null) {
-        try queueDerivedCoverageOutcome(runtime, window, request, indexes, .terminal_failed);
-    }
+    if (window) |pending_window| if (runtime.coverage_apply_mutex != null)
+        try queueDerivedCoverageOutcome(runtime, pending_window, request, indexes, .terminal_failed);
     return true;
 }
 
@@ -50127,6 +50129,7 @@ test "model aware media preparation retires only after independent output consum
         .config = .{},
         .ownership = undefined,
     };
+    defer clearIsolatedFailedIndexes(&runtime);
     // Exercise the public catalog contract and installation order before the
     // independent publication/recovery assertions below.
     const index_api = @import("../../../api/indexes.zig");
@@ -50220,6 +50223,17 @@ test "model aware media preparation retires only after independent output consum
     const retained = (try storeGetOptionalAllocWithRetry(&runtime, page_key)).?;
     defer alloc.free(retained);
     try std.testing.expectEqualSlices(u8, page_bytes, retained);
+    // Simulate an older worker that counted and acknowledged the failure
+    // before returning its terminal error, leaving the failed page to repair.
+    const consumer = try mediaPassConsumerIdentity(&runtime, alloc, "clips", "embedding", "vectors");
+    defer alloc.free(consumer);
+    var old_acknowledgement = try std.json.parseFromSlice(media_pass.Cursor, alloc, try media_pass.payload(failed_cursor), .{});
+    defer old_acknowledgement.deinit();
+    old_acknowledgement.value.acknowledged_consumers = &.{consumer};
+    const legacy_cursor = try media_pass.encode(alloc, old_acknowledgement.value);
+    defer alloc.free(legacy_cursor);
+    try mutateMediaPassControlled(&runtime, key, failed_cursor, &.{.{ .key = key, .value = legacy_cursor }}, &.{}, null, null, .{ .embedding = .{ .failed = 1, .terminal = 1 } });
+
     recorder.blocked = false;
     lane.scope = .{};
     for (0..2) |_| try lane.finishPublishedQuantum();
