@@ -23,6 +23,26 @@ const jsonschema = @import("antfly_jsonschema");
 
 const tooling = @import("../pipelines/tool_parser.zig");
 
+/// The final generated token is published without appending it to the cache.
+pub fn contextCapacity(prompt_tokens: usize, max_new_tokens: i32, limit: u32) !u32 {
+    if (prompt_tokens == 0 or max_new_tokens <= 0) return error.InvalidInkling2Context;
+    const suffix: usize = @intCast(max_new_tokens - 1);
+    if (prompt_tokens > limit or suffix > limit - prompt_tokens) return error.InvalidInkling2Context;
+    return @intCast(prompt_tokens + suffix);
+}
+
+test "Inkling context capacity includes only cache-resident tokens" {
+    const full = 1_048_576;
+    try std.testing.expectEqual(@as(u32, full), try contextCapacity(full, 1, full));
+    try std.testing.expectEqual(@as(u32, full), try contextCapacity(full - 7, 8, full));
+    try std.testing.expectError(error.InvalidInkling2Context, contextCapacity(full, 2, full));
+    try std.testing.expectError(error.InvalidInkling2Context, contextCapacity(full + 1, 1, full));
+    try std.testing.expectError(error.InvalidInkling2Context, contextCapacity(std.math.maxInt(usize), 2, full));
+    try std.testing.expectError(error.InvalidInkling2Context, contextCapacity(0, 1, full));
+    try std.testing.expectError(error.InvalidInkling2Context, contextCapacity(1, 0, full));
+    try std.testing.expectError(error.InvalidInkling2Context, contextCapacity(1, -1, full));
+}
+
 pub fn usesUnpenalizedGreedy(config: generation.GenerationConfig) bool {
     return config.temperature == 0 and config.repetition_penalty == 1 and
         config.frequency_penalty == 0 and config.presence_penalty == 0;

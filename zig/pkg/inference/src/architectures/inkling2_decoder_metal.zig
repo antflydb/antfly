@@ -810,7 +810,7 @@ test "Inkling Metal resident decoder runs the released text checkpoint" {
         .content_parts = &.{ .{ .text = "What color is this image? Answer with one word." }, .{ .image = 0 } },
     }};
     const Pipeline = @import("inkling2_session_metal.zig").TextPipeline;
-    var pipeline = try Pipeline.init(a, tokenizer.tokenizer(), .{}, messages, config, null, .{});
+    var pipeline = try Pipeline.init(a, tokenizer.tokenizer(), .{}, messages, config, null, decoder.text.model_max_length, .{});
     defer pipeline.deinit();
     var result = try resident.generate(session, &pipeline, config, .{});
     defer result.deinit();

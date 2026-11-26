@@ -252,11 +252,12 @@ pub const TextPipeline = struct {
         reasoning: ?generation.TokenCallback = null,
     };
 
-    pub fn init(a: std.mem.Allocator, tokenizer: Tokenizer, control: Control, messages: []const generation.Message, config: generation.GenerationConfig, input_limit: ?usize, options: chat.ChatOptions) !TextPipeline {
+    pub fn init(a: std.mem.Allocator, tokenizer: Tokenizer, control: Control, messages: []const generation.Message, config: generation.GenerationConfig, input_limit: ?usize, context_limit: u32, options: chat.ChatOptions) !TextPipeline {
         try control.check();
         const prompt = try chat.Prompt.init(a, tokenizer, messages, options, config.enable_thinking);
         errdefer prompt.deinit(a);
         if (input_limit) |limit| if (prompt.count() > limit) return error.InferenceInputTokensExceeded;
+        _ = try chat.contextCapacity(prompt.count(), config.max_tokens, context_limit);
         return .{ .allocator = a, .tokenizer = tokenizer, .control = control, .prompt = prompt, .options = options };
     }
 
@@ -281,7 +282,7 @@ pub const TextPipeline = struct {
             config.cache_compaction_ratio != null or config.prompt_cache_enabled or config.draft_model != null or
             config.token_observer != null or (config.speculation_requested and config.speculation_policy == .force))
             return error.UnsupportedInkling2Request;
-        const tokens = try std.math.add(usize, self.prompt.count(), @as(usize, @intCast(config.max_tokens)) - 1);
+        const tokens = try chat.contextCapacity(self.prompt.count(), config.max_tokens, model.text.model_max_length);
         const prefix = self.prompt.count() - 1;
         const format: @import("../runtime/kv/hybrid_paged.zig").PlaneFormat = if (config.cache_dtype) |dtype| blk: {
             const parsed = @import("../runtime/kv/pool.zig").parseKvDType(dtype) orelse return error.UnsupportedInkling2Request;
@@ -291,7 +292,7 @@ pub const TextPipeline = struct {
                 else => return error.UnsupportedInkling2Request,
             };
         } else .bf16;
-        var plan = try decoder.RequestPlan.initWithReductionRows(model, std.math.cast(u32, tokens) orelse return error.InvalidInkling2Context, shape.rows, shape.reduction_rows, format);
+        var plan = try decoder.RequestPlan.initWithReductionRows(model, tokens, shape.rows, shape.reduction_rows, format);
         if (chat.usesUnpenalizedGreedy(config)) plan = plan.withDeviceSelection();
         return plan.withPrefillTail(model, @intCast(prefix % shape.rows));
     }

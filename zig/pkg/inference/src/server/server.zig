@@ -6526,7 +6526,7 @@ pub const Node = struct {
                     .{ .metal = .{
                         .resident = resident,
                         .session = model.session,
-                        .text = try InklingMetal.TextPipeline.init(allocator, model.getTokenizer(), control, input, config, limit, .{}),
+                        .text = try InklingMetal.TextPipeline.init(allocator, model.getTokenizer(), control, input, config, limit, resident.model.text.model_max_length, .{}),
                     } }
                 else
                     unreachable,
@@ -17968,7 +17968,7 @@ pub const Node = struct {
                 var pipeline: inkling.ServingPipeline = .{
                     .resident = resident,
                     .session = model.session,
-                    .text = inkling.TextPipeline.init(ctx.allocator, model.getTokenizer(), execution_control, messages.items, config, executor_contract.batch.max_input_tokens_per_item, .{
+                    .text = inkling.TextPipeline.init(ctx.allocator, model.getTokenizer(), execution_control, messages.items, config, executor_contract.batch.max_input_tokens_per_item, resident.model.text.model_max_length, .{
                         .effort = effort,
                         .tools = inkling_tools.items,
                         .choice = parsed_tool_choice,

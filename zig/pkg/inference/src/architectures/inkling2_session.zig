@@ -294,8 +294,7 @@ pub const Pipeline = struct {
         const prompt = try Prompt.init(allocator, tokenizer, messages, options, config.enable_thinking);
         errdefer prompt.deinit(allocator);
         if (input_limit) |limit| if (prompt.count() > limit) return error.InferenceInputTokensExceeded;
-        const context = prompt.count() +| @as(usize, @intCast(config.max_tokens)) - 1;
-        if (context > model.model.text.model_max_length) return error.InvalidInkling2Context;
+        const context = try chat.contextCapacity(prompt.count(), config.max_tokens, model.model.text.model_max_length);
         const speculation_requested = config.speculation_requested and config.speculation_policy != .off;
         const block_verification = decoder.speculativeBlockContextSupported(model.model.text, context);
         const auto_context_disabled = speculation_requested and config.speculation_policy == .auto and
