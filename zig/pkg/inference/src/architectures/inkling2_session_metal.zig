@@ -176,6 +176,11 @@ pub const Runtime = struct {
 
     pub fn generate(self: *Runtime, session: backends.Session, pipeline: *const TextPipeline, config: generation.GenerationConfig, callbacks: TextPipeline.Callbacks) !generation.GenerationResult {
         const guarded = session.withAdmissionControl(pipeline.control);
+        // Only the ready owner sizes and reserves workspace. Keep the ready
+        // turn through retirement so the next request sees the available budget.
+        var waiter: Scheduler.Waiter = .{};
+        try self.scheduler.selectReady(&waiter, &self.gate, pipeline.control);
+        defer Scheduler.leave(&waiter);
         var shape = PrefillShape.preferred(pipeline.prompt.count() -| 1);
         var plan: decoder.RequestPlan = undefined;
         const retained, const workspace, const host = while (true) {
@@ -191,9 +196,8 @@ pub const Runtime = struct {
         };
         var permit = try guarded.admitRetainedStateWithWorkspace(host, retained, workspace);
         defer permit.deinit();
-        var waiter: Scheduler.Waiter = .{};
-        try self.scheduler.enter(&waiter, &self.gate, pipeline.control);
-        defer Scheduler.leave(&waiter);
+        try Scheduler.acquireSelected(&waiter, pipeline.control);
+        defer Scheduler.releaseGate(&waiter);
         return pipeline.generateWithPlan(&self.model, &self.vision, self.eos, config, callbacks, plan, session.invocation_diagnostics);
     }
 

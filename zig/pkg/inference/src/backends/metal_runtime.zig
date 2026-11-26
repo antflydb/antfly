@@ -6265,7 +6265,8 @@ pub fn decoderRuntimeApplyAttentionOutputResidualDevice(self: anytype, request: 
 
 pub fn decoderRuntimeReadTokenId(self: anytype) !?usize {
     const runtime = self.raw_decode_runtime orelse return null;
-    return readDecoderTokenId(runtime);
+    const token_id = readDecoderTokenId(runtime) orelse return null;
+    return @as(usize, token_id);
 }
 
 /// Read the one published token from shared storage after the caller has
