@@ -45,6 +45,19 @@ pub const Owner = struct {
 
     pub fn seal(self: *Owner, output: u64, key: u64, input_bytes: usize, output_bytes: usize) bool {
         if (output_bytes == 0 or !self.plan.finish(output)) return false;
+        return self.publishLayout(key, input_bytes, output_bytes);
+    }
+
+    /// Build the same executable layout from the route's declared allocation
+    /// events before any numerical invocation or CUDA address exists.
+    pub fn declare(self: *Owner, declarations: []const Plan.Declaration, published_slot: u15, key: u64, input_bytes: usize, output_bytes: usize) !void {
+        if (self.executable != null or output_bytes == 0) return error.InvalidExecutionPlan;
+        try self.plan.declare(declarations, published_slot);
+        errdefer self.plan = .{};
+        if (!self.publishLayout(key, input_bytes, output_bytes)) return error.InvalidExecutionPlan;
+    }
+
+    fn publishLayout(self: *Owner, key: u64, input_bytes: usize, output_bytes: usize) bool {
         const storage = self.plan.layoutWithExternalOutput(input_bytes) catch self.plan.layout(input_bytes) catch return false;
         const publication = storage.output orelse return false;
         if (output_bytes > publication.bytes) return false;
@@ -170,6 +183,27 @@ test "CUDA audio rejects a terminal allocation smaller than the logical output" 
     owner.plan.allocate(256, 0x1000);
     try std.testing.expect(!owner.seal(0x1000, 42, arena.alignment, 257));
     try std.testing.expect(owner.executableFor(arena.alignment, 257) == null);
+}
+
+test "CUDA declared audio workspace matches the observed capture layout" {
+    const input_bytes = arena.alignment;
+    const output_bytes = 64;
+    const declarations = &[_]Plan.Declaration{
+        .{ .allocate = 256 },
+        .{ .release = 0 },
+        .{ .allocate = output_bytes },
+    };
+    var declared: Owner = .{ .allocator = std.testing.allocator };
+    try std.testing.expectError(error.InvalidExecutionPlan, declared.declare(declarations, 1, 13, input_bytes, output_bytes + 1));
+    try declared.declare(declarations, 1, 13, input_bytes, output_bytes);
+    try std.testing.expectEqual(arena.Origin.declared, declared.plan.origin);
+
+    var observed: Owner = .{ .allocator = std.testing.allocator };
+    observed.plan.allocate(256, 0x1000);
+    observed.plan.release(0x1000);
+    observed.plan.allocate(output_bytes, 0x2000);
+    try std.testing.expect(observed.seal(0x2000, 13, input_bytes, output_bytes));
+    try std.testing.expectEqualDeep(observed.executable.?, declared.executable.?);
 }
 
 test "embeddinggemma2 CUDA audio lifetime plan reuses dead regions and rejects allocation drift" {
