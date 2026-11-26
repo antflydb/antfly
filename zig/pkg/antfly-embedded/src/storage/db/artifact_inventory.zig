@@ -252,7 +252,9 @@ test "grouped sources production ordered artifact inventory compatibility binds 
     try std.testing.expect(extended.supportsProducerWitnesses());
     extended.effect_protocol = 19;
     try std.testing.expect(extended.supportsProducerWitnesses());
-    extended.effect_protocol = 20;
+    extended.effect_protocol = scalar_window_retirement_protocol;
+    try std.testing.expect(extended.supportsProducerWitnesses());
+    extended.effect_protocol = max_effect_protocol + 1;
     try std.testing.expect(!extended.supportsProducerWitnesses());
     try std.testing.expect(!extended.valid() and !extended.compatible(extended));
 }
