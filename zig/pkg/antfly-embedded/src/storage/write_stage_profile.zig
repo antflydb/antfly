@@ -59,6 +59,37 @@ pub const Stage = enum(u8) {
     merge,
     /// A merge commit waiting for the writer lease.
     merge_lease_wait,
+    /// A merge refused at the tip (`IndexScopeChanged`) and the index
+    /// refreshed from it before planning again.
+    merge_scope_changed,
+    /// Diagnostics (counts; the "time" is a quantity, in thousandths):
+    /// an inline full-text write refused at the level-0 cap,
+    inline_refused_cap,
+    /// refused by merge producer admission,
+    inline_refused_permit,
+    /// a merge planned from level-0 records (value: inputs),
+    merge_plan_level0,
+    /// a tiered or forced merge (value: inputs).
+    merge_plan_tiered,
+    /// segments an inline full-text write found at prepare (value: count).
+    inline_segments_seen,
+    /// The writer lane held by a writer's checkout, a maintenance turn, a
+    /// local peer handoff, or parked-lease maintenance; and a writer's wait
+    /// in checkout.
+    lane_hold_writer,
+    lane_hold_maintenance,
+    lane_hold_peer,
+    lane_hold_parked,
+    lane_checkout_wait,
+    /// `Owner.refreshImpl` outcomes (counts): unchanged redo tip, unchanged
+    /// header, unchanged runtime metadata, delta adopted in place, and a
+    /// replacement open; and the writer promotion's time (`refresh_promote`).
+    refresh_path_tip,
+    refresh_path_header,
+    refresh_path_metadata,
+    refresh_path_in_place,
+    refresh_path_reopen,
+    refresh_promote,
     /// Within `text_segment_build` (from `BuildTextProfile`): tokenizing
     /// and accumulating terms.
     text_build_analyze,
@@ -116,6 +147,11 @@ pub fn add(stage: Stage, ns: u64) void {
     const i = @backingInt(stage);
     _ = total_ns[i].fetchAdd(ns, .monotonic);
     _ = counts[i].fetchAdd(1, .monotonic);
+}
+
+/// Records a count-like `value` for a diagnostic stage.
+pub fn count(stage: Stage, value: u64) void {
+    add(stage, value *| 1000);
 }
 
 pub fn begin(stage: Stage) Span {

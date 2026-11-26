@@ -3507,15 +3507,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const mirror_span = write_stage_profile.begin(.text_install_mirror);
                 const mutations = try self.mutationsAlloc(self.alloc);
                 defer self.alloc.free(mutations);
-                try self.entry.persistent.applyExternallyCommittedMutationsIfNativeCatalog(mutations);
-                try self.entry.persistent.reconcileInlineCommittedMutations(self.resolution.decidedMutations());
+                // The decisions themselves, not a read of the file: keys a
+                // later committed decision set since keep its value.
+                try self.resolution.applyToMirror(mutations);
                 mirror_span.end();
                 const segment_span = write_stage_profile.begin(.text_install_segment);
                 defer segment_span.end();
                 // Consume every segment, including after a failed install.
                 var install_error: ?anyerror = null;
                 for (self.segments[0..self.segment_count]) |*seg| {
-                    self.entry.persistent.installInlineSegmentPublication(seg) catch |err| {
+                    self.entry.persistent.installInlineSegmentPublication(seg, &self.resolution) catch |err| {
                         if (install_error == null) install_error = err;
                     };
                 }
@@ -3612,7 +3613,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (runtime.config.enabled and cap != 0) {
                         const snap = precheck_entry.persistent.acquireSnapshot();
                         defer snap.release();
-                        if (snap.segments.len >= cap) return error.InlineTextPublicationUnsupported;
+                        write_stage_profile.count(.inline_segments_seen, snap.segments.len);
+                        if (snap.segments.len >= cap) {
+                            write_stage_profile.count(.inline_refused_cap, 1);
+                            return error.InlineTextPublicationUnsupported;
+                        }
                     }
                 }
             }
@@ -3660,7 +3665,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const estimate = prepared_publication.estimate();
             var merge_permit = if (merge_runtime) |runtime|
-                try runtime.acquireProducerPermitAssumeApply(index_ref.name, estimate.segment_count, estimate.byte_count)
+                runtime.acquireProducerPermitAssumeApply(index_ref.name, estimate.segment_count, estimate.byte_count) catch |err| {
+                    write_stage_profile.count(.inline_refused_permit, 1);
+                    return err;
+                }
             else
                 null;
             errdefer if (merge_permit) |*permit| permit.release();

@@ -873,6 +873,54 @@ test "lite allocator v4 peer certificate validates a rebased cache before reuse"
     try std.testing.expect((try verifier.check()).valid);
 }
 
+test "lite allocator v4 cached ledger keeps naming its own header across two adoptions" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "rebase-marker.aflite");
+    defer a.free(path);
+    var writer = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    // A cache rebases across commits whose ledger roots it can
+    // authenticate: certified roots carry their binding and fingerprint.
+    writer.allocator_certificate_on_commit = true;
+    writer.incremental_checkpoints = true;
+    try writer.putDocument("doc", "original");
+    try std.testing.expect(try writer.certifyAllocator());
+    var viewer = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true, .internal_reader = true });
+    defer viewer.close();
+    // Only a ledger loaded with its digest can rebase (`State.rebase`), as
+    // a certifying writer's is.
+    viewer.allocator_certificate_on_commit = true;
+    _ = try viewer.allocatorStats();
+    try std.testing.expect(viewer.ledger != null);
+    // Two allocator-changing commits (each retires the previous value).
+    try writer.putDocument("doc", "first rewrite");
+    try std.testing.expect(try writer.certifyAllocator());
+    const first = writer.header;
+    try writer.putDocument("doc", "second rewrite");
+    try std.testing.expect(try writer.certifyAllocator());
+    const second = writer.header;
+    // Adopting both before any load leaves the ledger describing the
+    // header it was loaded at; the second adoption must not relabel it as
+    // the first, whose delta it never applied.
+    const full_loads = viewer.allocator_work.full_loads;
+    const rebases = viewer.allocator_work.journal_rebases;
+    try viewer.adoptIndexPublicationHeader(first);
+    try viewer.adoptIndexPublicationHeader(second);
+    const stats = (try viewer.allocatorStats()).?;
+    // Correct is not enough: an unconditional reload would also be. The
+    // eligible cache rebased across both commits instead.
+    try std.testing.expectEqual(full_loads, viewer.allocator_work.full_loads);
+    try std.testing.expectEqual(rebases + 1, viewer.allocator_work.journal_rebases);
+    var independent = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true, .internal_reader = true });
+    defer independent.close();
+    const expected = (try independent.allocatorStats()).?;
+    try std.testing.expectEqual(expected.reusable_pages, stats.reusable_pages);
+    try std.testing.expectEqual(expected.pending_objects, stats.pending_objects);
+    try std.testing.expectEqual(try independent.ledger.?.fingerprint(), try viewer.ledger.?.fingerprint());
+}
+
 test "lite allocator v4 copied cache certifies independently and leaves the donor warm" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -10994,10 +11042,21 @@ pub const NativeFile = struct {
         // `free_pages_verified`/`allocator_verification_base`, nothing for
         // a pending verification to lose.
         const identity_unchanged = std.meta.eql(allocatorProofIdentity(self.header), allocatorProofIdentity(header));
-        if (identity_unchanged) {
-            self.allocator_rebase_header = null;
-        } else {
-            self.allocator_rebase_header = if (self.free_pages_verified and self.ledger != null) self.header else null;
+        // `allocator_rebase_header` names the header the cached ledger
+        // describes, and only a rebase or an invalidation resolves it. A
+        // pending one survives later adoptions: replacing it with the header
+        // being superseded, or clearing it because that header's identity
+        // did not move, would claim the ledger describes a header it was
+        // never rebased to (`loadLedgerForDigest` trusts it for cache hits
+        // and ancestry).
+        if (!identity_unchanged) {
+            // Rebase the cached ledger whether or not its free pages were
+            // verified: the rebase authenticates its result against the
+            // new root (or its retained ancestry), and verification is
+            // cleared below either way. Without it, every foreign commit
+            // under writer contention, where pages are rarely verified,
+            // reloads and re-digests the whole ledger on the next handoff.
+            if (self.allocator_rebase_header == null) self.allocator_rebase_header = if (self.ledger != null) self.header else null;
             if (self.allocator_rebase_header == null) self.invalidateLedger();
             self.free_pages_verified = false;
             self.allocator_verification_base = null;

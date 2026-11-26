@@ -301,6 +301,21 @@ const force_merge_max_segments_at_once = 16;
 /// than encoding them. Below the minimum, level-0 records wait for the fold
 /// (writers merge at the producer cap regardless).
 const level0_fold_min_records = 32;
+
+/// Merging must keep an index's steady state well below its producer cap
+/// (`max_pending_segments`): within it, an inline write's producer admission
+/// fails and the write falls to the replay path, which holds the writer lane
+/// through its catch-up. Waiting level-0 records fold at a quarter of the cap,
+/// and eager (pressure) merging starts at three quarters, before admission
+/// blocks.
+fn level0FoldMinRecords(segment_cap: u64) usize {
+    if (segment_cap == 0) return level0_fold_min_records;
+    return @intCast(std.math.clamp(segment_cap / 4, 2, level0_fold_min_records));
+}
+
+fn mergePressureSegments(segment_cap: u64) u64 {
+    return segment_cap - segment_cap / 4;
+}
 const level0_fold_max_records = 256;
 const level0_fold_max_bytes: u64 = 8 * 1024 * 1024;
 
@@ -1455,7 +1470,8 @@ pub const IndexManager = struct {
     /// into `openConfiguredIndexWithAuthorization`, and cleared
     /// immediately after. `openConfiguredIndexDetached`'s dense_vector
     /// branch reads it to tell a genuinely fresh admission apart from a
-    /// normal reopen -- `self.get(cfg.name)` cannot make that distinction
+    /// normal reopen (the full_text branch reads it the same way) --
+    /// `self.get(cfg.name)` cannot make that distinction
     /// from inside the shared open path, since the index being opened is,
     /// by construction, absent from the open-indexes list in *either*
     /// case at that point. Must be set/read/cleared only while
@@ -25005,6 +25021,20 @@ pub const IndexManager = struct {
                 const zpath = try self.alloc.dupeSentinel(u8, path, 0);
                 defer self.alloc.free(zpath);
 
+                // Index removal deletes a generation's directories, not the
+                // records a native-catalog text backend keeps under its path
+                // scope. A fresh same-name admission would otherwise open the
+                // retired generation's segments and provenance. As for dense
+                // indexes below, only a fresh admission may clear them.
+                if (self.text_main_backend == .native_catalog and
+                    self.fresh_admission_name != null and
+                    std.mem.eql(u8, self.fresh_admission_name.?, cfg.name))
+                {
+                    if (self.text_main_native_catalog_sink) |sink| {
+                        try persistent_mod.PersistentIndex.deleteNativeCatalogStorage(self.alloc, sink, path);
+                    }
+                }
+
                 const persistent_opts = persistent_mod.PersistentIndexOptions{
                     .path = zpath,
                     .io = self.io,
@@ -27385,7 +27415,7 @@ pub const IndexManager = struct {
                 const snapshot = entry.persistent.acquireSnapshot();
                 defer snapshot.release();
                 const segment_count = snapshot.segments.len;
-                if (segment_count >= 2 and (producer_waiting or (segment_cap != 0 and segment_count >= segment_cap))) {
+                if (segment_count >= 2 and (producer_waiting or (segment_cap != 0 and segment_count >= mergePressureSegments(segment_cap)))) {
                     TextMergeScheduler.schedule(entry);
                 }
             }
@@ -27638,6 +27668,16 @@ pub const IndexManager = struct {
         return self.finishTextMergeTaskImpl(task, result, false);
     }
 
+    /// A merge whose output is empty removes its inputs instead. Removal
+    /// fails when an input already left the tip, which is stale like a
+    /// refused replacement (`IndexScopeChanged`): the caller refreshes
+    /// before planning again.
+    fn removeMergeInputs(entry: anytype, old_ids: []const u64, scope_changed: *bool) !bool {
+        const removed = try entry.persistent.removeSegmentsIfActive(old_ids);
+        if (!removed) scope_changed.* = true;
+        return removed;
+    }
+
     fn finishTextMergeTaskImpl(self: *IndexManager, task: *const TextMergeTask, result: *TextMergeResult, borrowed_apply_lease: bool) !bool {
         var retire_task = true;
         defer if (retire_task) self.completeTextMergeTaskTracking(task);
@@ -27710,9 +27750,10 @@ pub const IndexManager = struct {
 
         const input_bytes = textMergeTaskInputBytes(task);
         const output_stats = textMergeResultOutputStats(result);
-        const applied = if (result.prepared_segments.len == 0 and result.segments.len == 0) blk: {
-            break :blk try entry.persistent.removeSegmentsIfActive(old_ids);
-        } else if (result.prepared_segments.len > 0) blk: {
+        var scope_changed = false;
+        const applied = if (result.prepared_segments.len == 0 and result.segments.len == 0)
+            try removeMergeInputs(entry, old_ids, &scope_changed)
+        else if (result.prepared_segments.len > 0) blk: {
             const prepared_segments = result.prepared_segments;
             result.prepared_segments = &.{};
             result.prepared_owner = null;
@@ -27722,10 +27763,13 @@ pub const IndexManager = struct {
                 prepared_segments,
                 publication_deletes.bitmaps,
             ) catch |err| switch (err) {
-                error.EmptySegment => try entry.persistent.removeSegmentsIfActive(old_ids),
+                error.EmptySegment => try removeMergeInputs(entry, old_ids, &scope_changed),
                 // At the tip an input was no longer active, or a live key had
                 // two copies: stale, like any other; it is planned again.
-                error.IndexScopeChanged => false,
+                error.IndexScopeChanged => scope: {
+                    scope_changed = true;
+                    break :scope false;
+                },
                 else => {
                     const mapped_err = task.deletion_state.allocationError(err);
                     logTextMergeFailure("apply", task.index_name, mapped_err);
@@ -27741,10 +27785,13 @@ pub const IndexManager = struct {
                 segments,
                 publication_deletes.bitmaps,
             ) catch |err| switch (err) {
-                error.EmptySegment => try entry.persistent.removeSegmentsIfActive(old_ids),
+                error.EmptySegment => try removeMergeInputs(entry, old_ids, &scope_changed),
                 // At the tip an input was no longer active, or a live key had
                 // two copies: stale, like any other; it is planned again.
-                error.IndexScopeChanged => false,
+                error.IndexScopeChanged => scope: {
+                    scope_changed = true;
+                    break :scope false;
+                },
                 else => {
                     const mapped_err = task.deletion_state.allocationError(err);
                     logTextMergeFailure("apply", task.index_name, mapped_err);
@@ -27752,6 +27799,25 @@ pub const IndexManager = struct {
                 },
             };
         };
+        // Another process committed under this index (most often its own
+        // merge of these inputs). Planned again from this view, the merge
+        // would fail the same way while a producer waits for it: take the
+        // index as committed first. The index is held here, by this merge or
+        // by the producer lending it. While this process's own inline
+        // installs are pending the refresh is refused; the view advances
+        // when they land, and their install schedules the next merge
+        // (`noteInlineTextPublicationSegments`), so none is scheduled here.
+        var replan = true;
+        if (scope_changed) {
+            write_stage_profile.add(.merge_scope_changed, 0);
+            entry.persistent.refreshFromTip() catch |err| switch (err) {
+                error.UnsupportedRefresh => replan = false,
+                else => {
+                    logTextMergeFailure("refresh", task.index_name, err);
+                    replan = false;
+                },
+            };
+        }
         entry.merge_delta_mutex.unlock(entry.io);
         merge_delta_locked = false;
         if (index_apply_locked) entry.apply_mutex.unlock();
@@ -27759,8 +27825,10 @@ pub const IndexManager = struct {
 
         if (applied and !try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy())) {
             TextMergeScheduler.noteComplete(entry);
-        } else {
+        } else if (replan) {
             TextMergeScheduler.schedule(entry);
+        } else {
+            TextMergeScheduler.noteComplete(entry);
         }
         if (applied) {
             self.text_merge_scheduler.noteAppliedMerge(
@@ -27858,10 +27926,15 @@ pub const IndexManager = struct {
         if (infos.items.len < 2) return null;
 
         const policy = activeTextMergePolicy();
-        const pressure = producer_waiting or (segment_cap != 0 and snap.segments.len >= segment_cap);
+        const pressure = producer_waiting or (segment_cap != 0 and snap.segments.len >= mergePressureSegments(segment_cap));
         // Inline writes publish one small level-0 record each. Fold them
         // wide and first: a tier-sized merge of ten cannot keep up with
         // them, and producer admission counts every one.
+        // Under pressure the fold also takes every other segment below the
+        // floor size: a merge's fixed cost (commit, lease) dominates for
+        // these, and one fold of all of them keeps the segment count well
+        // below the producer cap, where folding only level-0 records left
+        // their tiny outputs to tiered merges ten at a time.
         const level0_plan = level0: {
             var picked = std.ArrayListUnmanaged(usize).empty;
             errdefer picked.deinit(self.alloc);
@@ -27872,7 +27945,13 @@ pub const IndexManager = struct {
                 try picked.append(self.alloc, info.index);
                 bytes += info.size;
             }
-            if (picked.items.len < (if (pressure) @as(usize, 2) else level0_fold_min_records)) {
+            if (pressure) for (infos.items) |info| {
+                if (persistent_mod.isL0SegmentId(snap.segments[info.index].id) or info.size >= policy.floor_segment_size) continue;
+                if (picked.items.len >= level0_fold_max_records or bytes + info.size > level0_fold_max_bytes) break;
+                try picked.append(self.alloc, info.index);
+                bytes += info.size;
+            };
+            if (picked.items.len < (if (pressure) @as(usize, 2) else level0FoldMinRecords(segment_cap))) {
                 picked.deinit(self.alloc);
                 break :level0 null;
             }
@@ -27890,6 +27969,7 @@ pub const IndexManager = struct {
             infos.shrinkRetainingCapacity(kept);
             if (infos.items.len < 2) return null;
         }
+        if (level0_plan) |picked| write_stage_profile.count(.merge_plan_level0, picked.len);
         const planned = level0_plan orelse (try policy.plan(self.alloc, infos.items)) orelse blk: {
             // The tiered policy found nothing to merge (for example every
             // eligible segment floors to the same effective size under
@@ -27911,6 +27991,7 @@ pub const IndexManager = struct {
         };
         defer self.alloc.free(planned);
         if (planned.len < 2) return null;
+        if (level0_plan == null) write_stage_profile.count(.merge_plan_tiered, planned.len);
 
         // The tier policy optimizes write amplification by selecting a wider
         // group, but that group may exceed the merge-buffer slice even though

@@ -1110,8 +1110,152 @@ pub const WriterLaneReleaseHook = struct {
     /// Takes the lane back after an indexed wait. False when it came back on
     /// a newer runtime than the write ran on, which `allow_new_runtime`
     /// permits only for a write with nothing left to do on its own runtime.
-    resume_after_indexed_wait: ?*const fn (ptr: *anyopaque, allow_new_runtime: bool) anyerror!bool = null,
+    /// `continuation`: what the write still owes, when a replacement runtime
+    /// can finish it (`ReplacementContinuation`, borrowed for the call);
+    /// null when it cannot.
+    resume_after_indexed_wait: ?*const fn (ptr: *anyopaque, allow_new_runtime: bool, continuation: ?*const ReplacementContinuation) anyerror!bool = null,
 };
+
+/// Test hook: runs on a writer just before it takes the lane back after an
+/// indexed wait, with what it would hand a replacement runtime and its
+/// physical (Lite commit) sequence.
+pub const TestIndexedResumeHook = struct {
+    ptr: *anyopaque,
+    run: *const fn (ptr: *anyopaque, continuation: ?*const ReplacementContinuation, physical_sequence: u64) void,
+};
+pub var test_before_indexed_resume: if (@import("builtin").is_test) ?TestIndexedResumeHook else void = if (@import("builtin").is_test) null else {};
+
+/// What a committed write still owes after its indexed wait, apart from the
+/// derived visibility wait itself. Each of these is owed to the runtime the
+/// write ran on: a replacement runtime has no way to finish it, so a write
+/// needing any of them has no `ReplacementContinuation`.
+pub const ReplacementShape = struct {
+    /// Applying the committed batch to a split shadow.
+    shadow_apply: bool = false,
+    /// Draining document child ranges through the caller's dispatcher.
+    child_range_dispatch: bool = false,
+    /// Resolving a transaction (outbox clears and its own sync).
+    transaction_resolution: bool = false,
+    /// Replication payloads, deferred gates or the write gate.
+    replication: bool = false,
+    /// A visibility completion the caller waits on itself.
+    caller_visibility_completion: bool = false,
+    /// A derived replay with no workers: the wait applies the materialized
+    /// batch, which only the write's own runtime holds.
+    materialized_apply: bool = false,
+};
+
+pub fn replacementContinuationEligible(shape: ReplacementShape) bool {
+    inline for (@typeInfo(ReplacementShape).@"struct".field_names) |name| {
+        if (@field(shape, name)) return false;
+    }
+    return true;
+}
+
+/// A committed write whose only remaining work is its derived visibility
+/// wait. A replacement runtime opened after the write's commit holds its
+/// replay record, so it can wait for that record's coverage, but only of the
+/// write's own targets: `targets` are the ones the write computed, with each
+/// index's incarnation and configuration, never recomputed from the
+/// replacement's catalog. If any of them was dropped, recreated or
+/// reconfigured while the write waited, the obligation cannot be shown met
+/// and the write is reported stalled (`DB.finishBatchOnReplacementRuntime`).
+/// Handed to the writer lane hook borrowed; `clone` to keep it.
+pub const ReplacementContinuation = struct {
+    /// The derived replay sequence the write appended, which its own
+    /// visibility wait targets; 0 when it appended none.
+    replay_sequence: u64,
+    sync_level: types.SyncLevel,
+    enrichment_fully_precomputed: bool,
+    /// A queued publication's identity-visibility summary still owed a
+    /// refresh from the committed store; the replacement repeats it.
+    refresh_identity_visibility: bool = false,
+    targets: ManagedSyncTargets,
+
+    pub fn clone(self: *const ReplacementContinuation, alloc: Allocator) !ReplacementContinuation {
+        var copy = self.*;
+        copy.targets = try cloneManagedSyncTargets(alloc, self.targets);
+        return copy;
+    }
+
+    pub fn deinit(self: *ReplacementContinuation, alloc: Allocator) void {
+        self.targets.deinit(alloc);
+    }
+};
+
+fn cloneNames(alloc: Allocator, names: []const []const u8) ![]const []const u8 {
+    if (names.len == 0) return &.{};
+    const out = try alloc.alloc([]const u8, names.len);
+    var made: usize = 0;
+    errdefer {
+        for (out[0..made]) |name| alloc.free(@constCast(name));
+        alloc.free(out);
+    }
+    for (names, out) |name, *slot| {
+        slot.* = try alloc.dupe(u8, name);
+        made += 1;
+    }
+    return out;
+}
+
+pub fn cloneManagedSyncTargets(alloc: Allocator, targets: ManagedSyncTargets) !ManagedSyncTargets {
+    const full_text = try cloneNames(alloc, targets.full_text_indexes);
+    errdefer {
+        for (full_text) |name| alloc.free(@constCast(name));
+        if (full_text.len > 0) alloc.free(full_text);
+    }
+    const all = try cloneNames(alloc, targets.all_indexes);
+    errdefer {
+        for (all) |name| alloc.free(@constCast(name));
+        if (all.len > 0) alloc.free(all);
+    }
+    var identities: []types.IndexTargetVisibility = &.{};
+    if (targets.target_identities.len != 0) identities = try alloc.alloc(types.IndexTargetVisibility, targets.target_identities.len);
+    var made: usize = 0;
+    errdefer {
+        for (identities[0..made]) |identity| alloc.free(@constCast(identity.index_name));
+        if (identities.len > 0) alloc.free(identities);
+    }
+    for (targets.target_identities, identities) |identity, *slot| {
+        slot.* = identity;
+        slot.index_name = try alloc.dupe(u8, identity.index_name);
+        made += 1;
+    }
+    return .{
+        .full_text_indexes = full_text,
+        .all_indexes = all,
+        .target_identities = identities,
+        .target_scope_known = targets.target_scope_known,
+        .served_inline = targets.served_inline,
+    };
+}
+
+test "a replacement continuation exists only when nothing but the visibility wait remains" {
+    try std.testing.expect(replacementContinuationEligible(.{}));
+    inline for (@typeInfo(ReplacementShape).@"struct".field_names) |name| {
+        var shape: ReplacementShape = .{};
+        @field(shape, name) = true;
+        try std.testing.expect(!replacementContinuationEligible(shape));
+    }
+}
+
+test "a cloned replacement continuation owns its targets" {
+    const a = std.testing.allocator;
+    const names: []const []const u8 = &.{"text"};
+    const identities: []const types.IndexTargetVisibility = &.{.{ .index_name = "text", .kind = .full_text, .incarnation = 7, .config_hash = 9 }};
+    const borrowed: ReplacementContinuation = .{
+        .replay_sequence = 42,
+        .sync_level = .full_text,
+        .enrichment_fully_precomputed = true,
+        .targets = .{ .full_text_indexes = names, .all_indexes = names, .target_identities = identities, .target_scope_known = true },
+    };
+    var owned = try borrowed.clone(a);
+    defer owned.deinit(a);
+    try std.testing.expect(owned.targets.all_indexes[0].ptr != names[0].ptr);
+    try std.testing.expectEqualStrings("text", owned.targets.target_identities[0].index_name);
+    try std.testing.expectEqual(@as(u64, 7), owned.targets.target_identities[0].incarnation);
+    try std.testing.expectEqual(@as(u64, 42), owned.replay_sequence);
+}
 
 /// One synchronous prepared attempt's irreversible disposition. It is separate
 /// from the caller's cumulative progress marker: optimistic preparation may

@@ -3280,6 +3280,11 @@ pub const DB = struct {
         schema_version: ?u32,
     };
     query_schema_identity: std.atomic.Value(u64) = .init(0),
+    /// Endpoint cleanup jobs come from graph topology. False only while this
+    /// runtime has never had a graph index nor found a cleanup job (checked
+    /// at open): then a foreground write need not open a read to look for
+    /// jobs. Sticky once true; explicit drains never consult it.
+    graph_endpoint_jobs_possible: std.atomic.Value(bool) = .init(true),
     resolver_query_schema_mutex: std.atomic.Mutex = .unlocked,
     resolver_query_schema_epoch: ?ResolverQuerySchemaEpoch = null,
     resolver_query_schema_digest: [32]u8 = undefined,
@@ -4872,6 +4877,8 @@ pub const DB = struct {
                 if (opts.defer_index_backfill_on_open) try db.core.loadIndexesDeferredBackfill() else try db.core.loadIndexes();
                 profile.load_indexes_ns = elapsedSince(load_indexes_started_ns);
             }
+            if (!openModeRequiresReadOnlyBackends(opts.open_mode))
+                db.graph_endpoint_jobs_possible.store(db.core.hasGraphIndexes() or (db.core.store.hasGraphEndpointCleanup() catch true), .release);
             if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
                 for (db.core.index_manager.graph_indexes.items) |entry| if (entry.ttl_duration_ns != 0) {
                     try db.core.index_manager.aggregateAuthoritativeReaderVersion(db.core.store, resolver_catalog_mod.graph_expiration_namespace_reader_version);
@@ -8278,6 +8285,59 @@ pub const DB = struct {
     /// batches, after the serialized primary apply section has finished.
     /// Replicated apply must only execute its exact command; its owner drives
     /// cleanup independently through subsequent ordered Raft entries.
+    /// A batch committed while its runtime was replaced, owing only its
+    /// derived visibility wait (`ReplacementContinuation`). This runtime (the
+    /// replacement, opened after the outgoing store drained, so it holds the
+    /// batch's replay record) waits for that record's coverage of the batch's
+    /// own targets, then runs the batch's graph endpoint cleanup. A target
+    /// dropped, recreated or reconfigured while the batch waited has no
+    /// coverage that answers for the batch, and an unknown target scope
+    /// cannot be checked: both leave the batch stalled
+    /// (`error.EnrichmentSourceChanged`).
+    pub fn finishBatchOnReplacementRuntime(self: *DB, req: types.BatchRequest, continuation: *const execution_resources.ReplacementContinuation) !void {
+        const level = continuation.sync_level;
+        const sequence = continuation.replay_sequence;
+        if (continuation.refresh_identity_visibility) {
+            // The same refresh the write owed its own runtime, from the
+            // committed store this runtime opened on.
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            self.core.identity_visibility.summary = doc_identity.visibilitySummaryFromStore(self.core.store) catch null;
+            self.core.identity_visibility.clearLive();
+            self.core.identity_visibility.clearNonvisible();
+        }
+        if (sequence != 0 and level != .propose and level != .write) {
+            if (!self.executor.hasWorkers()) return error.EnrichmentSourceChanged;
+            if (!self.replacementTargetsCurrent(continuation.targets)) return error.EnrichmentSourceChanged;
+            try self.executor.checkSyncLevelHealth(level);
+            try self.markPrecomputedEnrichmentAppliedForSync(level, sequence);
+            notifyExecutorForSyncLevelWithDenseBulkDeferral(self.async_context, self.executor, level, sequence, continuation.targets);
+            if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
+            self.notifyResolverReplayRuntimes(sequence);
+            try self.waitForSyncLevelWithCancellation(level, sequence, continuation.targets, .none, continuation.enrichment_fully_precomputed);
+        }
+        try self.finishBatchGraphEndpointCleanup(req, .{});
+    }
+
+    /// Whether every index the batch targeted is the same index here:
+    /// present, with the incarnation and configuration it had at commit.
+    fn replacementTargetsCurrent(self: *DB, targets: ManagedSyncTargets) bool {
+        if (!targets.target_scope_known) return false;
+        for (targets.target_identities) |identity| {
+            const cfg = self.core.index_manager.get(identity.index_name) orelse return false;
+            const fingerprint = cfg.coverage_config_fingerprint orelse return false;
+            if (cfg.kind != identity.kind or fingerprint != identity.config_hash or
+                internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json) != identity.incarnation) return false;
+        }
+        // Every wait target must be one of the checked identities.
+        for ([_][]const []const u8{ targets.all_indexes, targets.full_text_indexes }) |names| for (names) |name| {
+            for (targets.target_identities) |identity| {
+                if (std.mem.eql(u8, identity.index_name, name)) break;
+            } else return false;
+        };
+        return true;
+    }
+
     pub fn finishBatchGraphEndpointCleanup(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
         if (req.graph_endpoint_cleanup or !opts.wait_for_sync_level or
             opts.ordered_apply_receipt != null or opts.replication_applied_lsn_marker != null or
@@ -8287,7 +8347,13 @@ pub const DB = struct {
         // Durable jobs continue through the resident scheduler; full_index
         // and explicit maintenance retain complete cleanup guarantees.
         const max_pages: usize = if (req.sync_level == .full_index) std.math.maxInt(usize) else 1;
-        const drained = try self.drainStandaloneGraphEndpointCleanupWithOptions(opts, max_pages);
+        // Without a graph index ever, and no job found at open, there is no
+        // queue to probe (`graph_endpoint_jobs_possible`).
+        if (self.core.hasGraphIndexes()) self.graph_endpoint_jobs_possible.store(true, .release);
+        const drained = if (self.graph_endpoint_jobs_possible.load(.acquire))
+            try self.drainStandaloneGraphEndpointCleanupWithOptions(opts, max_pages)
+        else
+            false;
         // Without a graph index there is no endpoint cleanup to include, and
         // the write already waited for its own sync level.
         if (!drained and !self.core.hasGraphIndexes()) return;
@@ -33381,11 +33447,19 @@ pub const DB = struct {
                 if (context.graph_writes.len != 0 or context.graph_deletes.len != 0 or request.graph_writes.len != 0 or request.graph_deletes.len != 0) {
                     var graph_admission = try owner_db.core.store.beginReadTxn();
                     defer graph_admission.abort();
-                    // Server-owned roots require the actual protected preparation
-                    // envelope. Public transform JSON cannot opt into a newer reader.
-                    // Embedded roots without a server authority use the atomic ATBL5
-                    // decoder fence in the vote batch instead of pretending metadata.
-                    if (try @import("../source_authority.zig").load(&graph_admission) != null and (request.trigger_receipts.len == 0 or request.graph_preparation == null)) return error.SqlTriggerCoordinationRequired;
+                    // Server-owned (Raft) roots require the actual protected
+                    // preparation envelope. Public transform JSON cannot opt into
+                    // a newer reader. Every embedded Lite root also binds a
+                    // `.native` source authority (its own non-Raft source cut
+                    // clock, used by full-text/derived catch-up), so testing for
+                    // "any bound authority" would wrongly demand this envelope
+                    // from ordinary local embedded graph writes. Only a genuine
+                    // Raft-replicated root needs it; embedded roots without that
+                    // server authority use the atomic ATBL5 decoder fence in the
+                    // vote batch instead of pretending metadata.
+                    if (try @import("../source_authority.zig").load(&graph_admission)) |authority_state| {
+                        if (authority_state.kind == .raft and (request.trigger_receipts.len == 0 or request.graph_preparation == null)) return error.SqlTriggerCoordinationRequired;
+                    }
                 }
                 if (request.graph_preparation) |proof| {
                     try @import("prepared_graph_effects.zig").requireDefinitions(plan_alloc, owner_db.core.index_manager, proof);
