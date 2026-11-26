@@ -32784,7 +32784,7 @@ fn fusedMediaVectorReceiptsMatch(arena: Allocator, scratch: Allocator, provider:
 /// One parent remains one causal publication, with an atomic set of independently
 /// indexed sub-window vectors. Child keys sort under the parent, so the ordinary
 /// stream census and source guards cover every vector and its retirement.
-fn publishMediaWindowVectors(runtime: *EnrichmentRuntime, a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, provider: embedder_mod.DenseEmbedder, revision: ?[32]u8, input: *@import("../artifact_chunk_vector_publication.zig").Input, payload: ?[]const u8, cache: *MediaPassVectorCache) !bool {
+fn publishMediaWindowVectors(runtime: *EnrichmentRuntime, a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, provider: embedder_mod.DenseEmbedder, revision: ?[32]u8, input: *@import("../artifact_chunk_vector_publication.zig").Input, payload: ?[]const u8, cache: *MediaPassVectorCache, receipt_pending: ?*bool) !bool {
     const O = @import("inference_chunker").outputs;
     const metadata = if (payload) |raw| try @import("../../../chunking/chunk.zig").modelMetadataAlloc(a, raw) else null;
     defer if (metadata) |value| value.deinit(a);
@@ -32851,7 +32851,7 @@ fn publishMediaWindowVectors(runtime: *EnrichmentRuntime, a: Allocator, request:
     for (old_keys.items) |old| if (!wanted.contains(old)) try effects.append(scratch, .{ .family = .derived_vector, .key = old, .value = null, .source_index = 0 });
     if (effects.items.len == 0) return false;
     if (pending) return error.IncompleteChunkCoverage;
-    enqueueProducerEffectsWithBudgetError(runtime, &input.token, effects.items, null, error.ResourceTemporarilyUnavailable) catch |err| switch (err) {
+    enqueueProducerEffectsScoped(runtime, &input.token, effects.items, null, .{ .receipt_pending = receipt_pending }) catch |err| switch (err) {
         error.ArtifactPublicationPending => {},
         else => return err,
     };
@@ -32990,7 +32990,7 @@ fn ensureMediaWindowOutputsAt(runtime: *EnrichmentRuntime, a: Allocator, input: 
 
 /// Only real window work raises the catalog floor. Publish the normal
 /// catalog proposal so the server enforces the all-member Raft barrier.
-fn requestMediaWindowProtocol(runtime: *EnrichmentRuntime) !void {
+fn requestMediaWindowProtocol(runtime: *EnrichmentRuntime, receipt_pending: ?*bool) !void {
     const inventory = @import("../artifact_inventory.zig");
     const dispatcher = runtime.artifact_publication_dispatcher orelse return error.ArtifactCatalogDrift;
     const a = runtime.alloc;
@@ -33011,6 +33011,7 @@ fn requestMediaWindowProtocol(runtime: *EnrichmentRuntime) !void {
     }
     defer a.free(encoded);
     try dispatcher.submit(namespace, encoded);
+    if (receipt_pending) |pending| pending.* = true;
 }
 
 fn scalarWindowRetirementPending(input: *const @import("../artifact_chunk_vector_publication.zig").Input) bool {
@@ -33020,29 +33021,36 @@ fn scalarWindowRetirementPending(input: *const @import("../artifact_chunk_vector
 
 /// A scalar publication also replaces this consumer's previously published
 /// windows. Bind each child deletion to the same source and write command.
-const PublicationBudgetError = error{ ResourceBudgetExceeded, ResourceTemporarilyUnavailable, PublicationEncoderAdmissionDenied };
+const PublicationBudgetError = error{ ResourceTemporarilyUnavailable, PublicationEncoderAdmissionDenied };
+
+const ProducerPublicationOptions = struct {
+    budget_error: PublicationBudgetError = error.ResourceTemporarilyUnavailable,
+    /// Sticky for the replay group, including when a later member fails
+    /// before its request can return ArtifactPublicationPending.
+    receipt_pending: ?*bool = null,
+};
 
 const ScalarChunkPublication = struct {
     retire_windows: bool,
-    budget_error: PublicationBudgetError = error.ResourceTemporarilyUnavailable,
+    publication: ProducerPublicationOptions = .{},
 };
 
 fn enqueueScalarChunkVector(runtime: *EnrichmentRuntime, input: *@import("../artifact_chunk_vector_publication.zig").Input, value: ?[]const u8, options: ScalarChunkPublication) !void {
     const scalar: ordered_publication.Mutation = .{ .family = .derived_vector, .key = input.output_key, .value = value, .source_index = 0 };
     if (!options.retire_windows)
-        return enqueueProducerEffectsWithBudgetError(runtime, &input.token, &.{scalar}, null, options.budget_error);
+        return enqueueProducerEffectsScoped(runtime, &input.token, &.{scalar}, null, options.publication);
     const a = runtime.alloc;
     try ensureMediaWindowOutputs(runtime, a, input);
     const children = input.old_window_outputs.?;
     if (scalarWindowRetirementPending(input)) return error.ArtifactPublicationPending;
     if (children.len == 0)
-        return enqueueProducerEffectsWithBudgetError(runtime, &input.token, &.{scalar}, null, options.budget_error);
+        return enqueueProducerEffectsScoped(runtime, &input.token, &.{scalar}, null, options.publication);
     const effects = try a.alloc(ordered_publication.Mutation, children.len + 1);
     defer a.free(effects);
     effects[0] = scalar;
     for (children, effects[1..]) |child, *effect|
         effect.* = .{ .family = .derived_vector, .key = child.key, .value = null, .source_index = 0 };
-    try enqueueProducerEffectsWithBudgetError(runtime, &input.token, effects, null, options.budget_error);
+    try enqueueProducerEffectsScoped(runtime, &input.token, effects, null, options.publication);
 }
 
 fn processOrderedChunkVectorRequest(
@@ -33071,7 +33079,7 @@ fn processOrderedChunkVectorRequest(
 /// projection obligations retain their independent completion witnesses.
 const OrderedChunkVectorProgress = enum { materialize, pending, complete };
 
-fn driveOrderedChunkVectorCensus(runtime: *EnrichmentRuntime, alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, limits: @import("../artifact_stream_census.zig").Limits) !OrderedChunkVectorProgress {
+fn driveOrderedChunkVectorCensus(runtime: *EnrichmentRuntime, alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, limits: @import("../artifact_stream_census.zig").Limits, receipt_pending: ?*bool) !OrderedChunkVectorProgress {
     const progress = @import("../artifact_stream_progress.zig");
     var encoded: ?[]u8 = null;
     defer if (encoded) |bytes| alloc.free(bytes);
@@ -33112,6 +33120,7 @@ fn driveOrderedChunkVectorCensus(runtime: *EnrichmentRuntime, alloc: Allocator, 
     // touching the dispatcher. Queue refusal leaves durable progress unchanged.
     const dispatcher = runtime.artifact_publication_dispatcher orelse return error.ArtifactCatalogDrift;
     try dispatcher.submit(namespace, encoded.?);
+    if (receipt_pending) |pending| pending.* = true;
     return .pending;
 }
 
@@ -33508,8 +33517,8 @@ const OrderedDenseTextBatch = struct {
                     if (self.failed_requests.contains(fingerprint) or transport_waiting.contains(fingerprint)) continue;
                     const value = enrichment_artifact_codec.encodeDenseEmbeddingAlloc(runtime.alloc, item.source_hash, vector) catch |err| return self.scope.publicationFailure(err);
                     defer runtime.alloc.free(value);
-                    enqueueScalarChunkVector(runtime, &item.input, value, .{ .retire_windows = true, .budget_error = error.PublicationEncoderAdmissionDenied }) catch |err| switch (err) {
-                        error.ArtifactPublicationPending => self.publication_pending = true,
+                    enqueueScalarChunkVector(runtime, &item.input, value, .{ .retire_windows = true, .publication = .{ .budget_error = error.PublicationEncoderAdmissionDenied, .receipt_pending = &self.publication_pending } }) catch |err| switch (err) {
+                        error.ArtifactPublicationPending => {},
                         error.PublicationEncoderAdmissionDenied => {
                             // This output never reached the dispatcher. A
                             // storage or submission failure still belongs to
@@ -33554,6 +33563,7 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
 }
 
 fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, dense: ?embedder_mod.DenseEmbedder, sparse: ?embedder_mod.SparseEmbedder, consumers: []const []const u8, shared: ?*OrderedDenseTextBatch) !bool {
+    const receipt_pending = if (shared) |batch| &batch.publication_pending else null;
     var staged_vectors = MediaPassVectorCache{ .allocator = alloc };
     defer staged_vectors.deinit();
     // Capture once, outside any storage snapshot. Every accepted member must
@@ -33766,7 +33776,7 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
         }
         if (validated_complete) {
             try requireChunkProviderRevision(runtime, alloc, request, dense, sparse, text_generation, sparse_revision, context);
-            return switch (try driveOrderedChunkVectorCensus(runtime, alloc, request, .{})) {
+            return switch (try driveOrderedChunkVectorCensus(runtime, alloc, request, .{}, receipt_pending)) {
                 .complete => true,
                 .pending => error.ArtifactPublicationPending,
                 .materialize => error.EnrichmentSourceChanged,
@@ -33805,7 +33815,7 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
                 else => return err,
             };
             var item_waits_for_protocol = false;
-            const published = item.carried == null and (publishMediaWindowVectors(runtime, alloc, request, provider, execution_revision, &item.input, item.input.value, &staged_vectors) catch |err| switch (err) {
+            const published = item.carried == null and (publishMediaWindowVectors(runtime, alloc, request, provider, execution_revision, &item.input, item.input.value, &staged_vectors, receipt_pending) catch |err| switch (err) {
                 error.ArtifactPublicationPending => blk: {
                     item_waits_for_protocol = true;
                     break :blk false;
@@ -33916,7 +33926,7 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
                 break :blk encoded;
             } else null;
             defer if (value) |bytes| alloc.free(bytes);
-            enqueueScalarChunkVector(runtime, &item.input, value, .{ .retire_windows = dense != null }) catch |err| switch (err) {
+            enqueueScalarChunkVector(runtime, &item.input, value, .{ .retire_windows = dense != null, .publication = .{ .receipt_pending = receipt_pending } }) catch |err| switch (err) {
                 error.ArtifactPublicationPending => {},
                 else => return err,
             };
@@ -33924,7 +33934,7 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
         if (exhausted or large_window_page) break;
     }
     if (window_protocol_pending) {
-        requestMediaWindowProtocol(runtime) catch |err| switch (err) {
+        requestMediaWindowProtocol(runtime, receipt_pending) catch |err| switch (err) {
             error.ResourceTemporarilyUnavailable, error.ArtifactPublicationPending, error.ArtifactCatalogDrift => {},
             else => return err,
         };
@@ -33936,7 +33946,7 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
     // before permitting the census driver to certify these proofs.
     if (!publishing) {
         try requireChunkProviderRevision(runtime, alloc, request, dense, sparse, text_generation, sparse_revision, context);
-        if (try driveOrderedChunkVectorCensus(runtime, alloc, request, .{}) == .complete) return true;
+        if (try driveOrderedChunkVectorCensus(runtime, alloc, request, .{}, receipt_pending) == .complete) return true;
     }
     // Enumerating members is not an exact-input stream-completion certificate.
     // Keep replay/obligations pending until the ordered reconciliation driver
@@ -34715,10 +34725,10 @@ fn enqueueAssetProducerOutput(runtime: *EnrichmentRuntime, request: enrichment_t
 }
 
 fn enqueueProducerEffects(runtime: *EnrichmentRuntime, token: *@import("../artifact_producer_context.zig").Token, effects: []const ordered_publication.Mutation, failure_scope: ?*FailureScope) !void {
-    return enqueueProducerEffectsWithBudgetError(runtime, token, effects, failure_scope, error.ResourceBudgetExceeded);
+    return enqueueProducerEffectsScoped(runtime, token, effects, failure_scope, .{});
 }
 
-fn enqueueProducerEffectsWithBudgetError(runtime: *EnrichmentRuntime, token: *@import("../artifact_producer_context.zig").Token, effects: []const ordered_publication.Mutation, failure_scope: ?*FailureScope, budget_error: PublicationBudgetError) !void {
+fn enqueueProducerEffectsScoped(runtime: *EnrichmentRuntime, token: *@import("../artifact_producer_context.zig").Token, effects: []const ordered_publication.Mutation, failure_scope: ?*FailureScope, options: ProducerPublicationOptions) !void {
     {
         const fence = try requiredRuntimeStoreWriteFence(runtime, replayWriteGeneration(runtime));
         var read = try runtime.store.beginProbe();
@@ -34728,6 +34738,18 @@ fn enqueueProducerEffectsWithBudgetError(runtime: *EnrichmentRuntime, token: *@i
         if (try token.accepted(runtime.alloc, &read)) return;
         try token.validate(runtime.alloc, &read);
     }
+    try submitProducerCommand(runtime, token, .{ .effects = effects }, failure_scope, options);
+    // Provider completion is not owner acceptance; hold replay progress until
+    // the next attempt observes the durable semantic receipt.
+    return error.ArtifactPublicationPending;
+}
+
+const ProducerPublication = union(enum) {
+    effects: []const ordered_publication.Mutation,
+    command: ordered_publication.Command,
+};
+
+fn submitProducerCommand(runtime: *EnrichmentRuntime, token: *@import("../artifact_producer_context.zig").Token, publication: ProducerPublication, failure_scope: ?*FailureScope, options: ProducerPublicationOptions) !void {
     const dispatcher = runtime.artifact_publication_dispatcher orelse return error.ArtifactCatalogDrift;
     // Use the replay allocator that already accounts for the inputs and
     // payloads. The codec measures the full wire buffer before allocating.
@@ -34744,20 +34766,22 @@ fn enqueueProducerEffectsWithBudgetError(runtime: *EnrichmentRuntime, token: *@i
     const transport = if (transport_budget) |*budget| budget.allocator() else backing;
     const tracked = if (transport_budget) |*budget| budget else replay_budget;
     const denial_before = if (tracked) |budget| budget.denialGeneration() else 0;
-    const bytes = encodeProducerEffects(token, effects, transport) catch |err| {
-        if (err == error.OutOfMemory) if (tracked) |budget| if (budget.denialGeneration() != denial_before) return budget_error;
+    const bytes = encodeProducerPublication(token, publication, transport) catch |err| {
+        if (err == error.OutOfMemory) if (tracked) |budget| if (budget.denialGeneration() != denial_before) return options.budget_error;
         return err;
     };
     defer transport.free(bytes);
     dispatcher.submit(token.namespace, bytes) catch |err|
         return FailureScope.assetPublicationFailure(failure_scope, err);
-    // Provider completion is not owner acceptance; hold replay progress until
-    // the next attempt observes the durable semantic receipt.
-    return error.ArtifactPublicationPending;
+    if (options.receipt_pending) |pending| pending.* = true;
 }
 
-fn encodeProducerEffects(token: *@import("../artifact_producer_context.zig").Token, effects: []const ordered_publication.Mutation, alloc: Allocator) ![]u8 {
-    return @import("../artifact_publication_transport_codec.zig").encodeAlloc(alloc, try token.command(effects));
+fn encodeProducerPublication(token: *@import("../artifact_producer_context.zig").Token, publication: ProducerPublication, alloc: Allocator) ![]u8 {
+    const command = switch (publication) {
+        .effects => |effects| try token.command(effects),
+        .command => |command| command,
+    };
+    return @import("../artifact_publication_transport_codec.zig").encodeAlloc(alloc, command);
 }
 
 fn captureProducerInput(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, source_key: []const u8, logical_input: []const u8) !?producer_input.Token {
@@ -36404,11 +36428,7 @@ fn submitChunkGenerationCommand(runtime: *EnrichmentRuntime, token: *@import("..
     }
     try runtime.active_provider_guard.check();
     command.publication_digest = command.digest();
-    try command.validate(runtime.alloc);
-    const bytes = try @import("../artifact_publication_transport_codec.zig").encodeAlloc(runtime.alloc, command.*);
-    defer runtime.alloc.free(bytes);
-    const dispatcher = runtime.artifact_publication_dispatcher orelse return error.ArtifactCatalogDrift;
-    try dispatcher.submit(token.namespace, bytes);
+    try submitProducerCommand(runtime, token, .{ .command = command.* }, null, .{});
 }
 
 fn pruneOrderedChunkGenerations(runtime: *EnrichmentRuntime, token: *@import("../artifact_producer_context.zig").Token, scope: []const u8) !void {
@@ -36547,8 +36567,9 @@ fn driveOrderedChunkInventoryScoped(runtime: *EnrichmentRuntime, request: enrich
         defer prepared.deinit();
         const command = prepared.command(requestArtifactName(request));
         namespace = command.namespace;
+        const denial_before = if (budget) |*tracked| tracked.denialGeneration() else 0;
         encoded = @import("../artifact_publication_transport_codec.zig").encodeAlloc(alloc, command) catch |err| {
-            if (err == error.OutOfMemory) if (budget) |*tracked| if (tracked.denied()) return error.ResourceBudgetExceeded;
+            if (err == error.OutOfMemory) if (budget) |*tracked| if (tracked.denialGeneration() != denial_before) return error.ResourceTemporarilyUnavailable;
             return err;
         };
     }
@@ -45969,6 +45990,7 @@ test "ordered materialized chunk embeddings recover from shared transport pressu
 
 test "ordered materialized chunk embeddings keep the receipt barrier under transport pressure" {
     try testOrderedChunkVectorCarry(true, .transport_barrier);
+    try testOrderedChunkVectorCarry(true, .local_transport_barrier);
 }
 
 test "ordered materialized chunk embeddings use bounded parallel provider batches" {
@@ -46006,7 +46028,7 @@ test "ordered materialized chunk embeddings retain owners across planning failur
     try testOrderedChunkVectorCarry(true, .planning_retry);
 }
 
-const ChunkVectorBatchTest = enum { carry, items, bytes, revision, legacy, legacy_bytes, terminal, metadata_retry, metadata_tail_retry, relational_retry, legacy_budget, legacy_boundary_terminal, legacy_metadata_retry, legacy_metadata_terminal, parallel, parallel_bytes, legacy_preparation_retry, legacy_preparation_retry_cached, mixed_publication_pending, parallel_oversize, parallel_terminal, parallel_retry, collection_pressure, collection_too_large, parallel_cancel, cancel_first, cancel_second, cancel_global, source_first, source_second, abort_first, abort_second, mixed_retry_first, mixed_retry_second, memo_serial, memo_parallel, memo_unused, parallel_capacity, parallel_capacity_cancel, planning_terminal, planning_retry, collection_multi, collection_contention, legacy_cleanup_terminal, legacy_cleanup_terminal_empty, legacy_cleanup_terminal_current, transport_pressure, transport_barrier };
+const ChunkVectorBatchTest = enum { carry, items, bytes, revision, legacy, legacy_bytes, terminal, metadata_retry, metadata_tail_retry, relational_retry, legacy_budget, legacy_boundary_terminal, legacy_metadata_retry, legacy_metadata_terminal, parallel, parallel_bytes, legacy_preparation_retry, legacy_preparation_retry_cached, mixed_publication_pending, parallel_oversize, parallel_terminal, parallel_retry, collection_pressure, collection_too_large, parallel_cancel, cancel_first, cancel_second, cancel_global, source_first, source_second, abort_first, abort_second, mixed_retry_first, mixed_retry_second, memo_serial, memo_parallel, memo_unused, parallel_capacity, parallel_capacity_cancel, planning_terminal, planning_retry, collection_multi, collection_contention, legacy_cleanup_terminal, legacy_cleanup_terminal_empty, legacy_cleanup_terminal_current, transport_pressure, transport_barrier, local_transport_barrier };
 
 fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !void {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
@@ -46512,6 +46534,16 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
     var window: GeneratedReplayWindow = .{ .alloc = runtime.alloc };
     defer window.deinit();
 
+    if (batching == .transport_pressure) {
+        var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc, .memory_budget = .{ .hard_limit_bytes = 128 } });
+        defer manager.deinit(alloc);
+        const previous = runtime.config.resource_manager;
+        runtime.config.resource_manager = &manager;
+        defer runtime.config.resource_manager = previous;
+        const before = harness.publications;
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, processChunkText(runtime, chunk_request, &cache, &window, null));
+        try std.testing.expectEqual(before, harness.publications);
+    }
     try std.testing.expectError(error.ArtifactPublicationPending, processChunkText(runtime, chunk_request, &cache, &window, null));
     try harness.apply(&db, 4);
     if (batching == .transport_pressure) {
@@ -46594,8 +46626,9 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
         var initialized: usize = 0;
         defer for (keys[0..initialized]) |key| alloc.free(key);
         var index: u64 = 5;
-        for (&requests, &keys, 0..) |*request, *key, i| {
-            key.* = if (batching == .collection_pressure or batching == .collection_multi or (batching == .transport_barrier and i == 0))
+        const test_count: usize = if (batching == .transport_barrier or batching == .local_transport_barrier) 2 else count;
+        for (requests[0..test_count], keys[0..test_count], 0..) |*request, *key, i| {
+            key.* = if (batching == .collection_pressure or batching == .collection_multi or (batching == .transport_barrier and i == 0) or (batching == .local_transport_barrier and i == 1))
                 try std.fmt.allocPrint(alloc, "batch-doc-{d}-{s}", .{ i, &@as([2048]u8, @splat('k')) })
             else
                 try std.fmt.allocPrint(alloc, "batch-doc-{d}", .{i});
@@ -46677,7 +46710,7 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
             try std.testing.expectEqual(@as(usize, 0), harness.provider_calls);
             return;
         }
-        if (batching == .transport_barrier) {
+        if (batching == .transport_barrier or batching == .local_transport_barrier) {
             var scheduler = try ScopedReplay.load(runtime);
             defer scheduler.deinit(runtime.alloc);
             runtime.retry_scheduler = &scheduler;
@@ -46686,33 +46719,55 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
             defer runtime.config.resource_manager = null;
             harness.transport_pressure = &pressure_manager;
             defer if (harness.transport_reservation) |*reservation| reservation.release();
+            const local = batching == .local_transport_barrier;
+            if (local) {
+                const member = try internal_keys.chunkArtifactKeyAlloc(alloc, keys[0], "chunks", 0);
+                defer alloc.free(member);
+                const key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, member, "model");
+                defer alloc.free(key);
+                const hash = retainedTextEmbeddingHashAtRevision(requests[0], "hello 00000", @splat(1));
+                const value = try enrichment_artifact_codec.encodeProducedDenseEmbeddingAlloc(alloc, hash, true, &.{ 1, 2 });
+                defer alloc.free(value);
+                // Seed legacy retained bytes without a producer receipt.
+                var write = try db.core.store.beginWriteTxn();
+                errdefer write.abort();
+                try write.put(key, value);
+                const receipts = @import("../apply_receipts.zig");
+                var receipt_bytes: [receipts.ordered_apply_receipt_value_len]u8 = undefined;
+                const marker = receipts.orderedApplyReceiptWrite(.{ .term = 1, .index = index }, &receipt_bytes);
+                try write.put(marker.key, marker.value);
+                try write.commit();
+                index += 1;
+            }
             for (requests[0..2]) |*request| request.sequence = index;
             const before = harness.queued.items.len;
             var scope: FailureScope = .{};
             const result = processChunkedDenseWindow(runtime, requests[0..2], &cache, &window, &scope);
             try std.testing.expectError(error.ArtifactPublicationPending, result);
             try std.testing.expectError(error.ArtifactPublicationPending, LaneOutcome.of(&scope, result).result);
-            try std.testing.expectEqual(@as(usize, 2), harness.provider_calls);
+            try std.testing.expectEqual(@as(usize, if (local) 1 else 2), harness.provider_calls);
             try std.testing.expect(harness.transport_reservation != null);
             try std.testing.expectEqual(before + 1, harness.queued.items.len);
-            const source = try ScopedReplay.observeSource(runtime, keys[0], null, true);
-            const parked = try scheduler.state.priorLogical(runtime.alloc, logicalRequestFingerprint(requests[0]), source.logical_digest);
+            const denied: usize = if (local) 1 else 0;
+            const healthy: usize = if (local) 0 else 1;
+            const source = try ScopedReplay.observeSource(runtime, keys[denied], null, true);
+            const parked = try scheduler.state.priorLogical(runtime.alloc, logicalRequestFingerprint(requests[denied]), source.logical_digest);
             try std.testing.expectEqual(@as(u32, 1), parked.waits);
             try std.testing.expectEqual(@as(u32, 0), parked.failures);
 
             var submitted = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.queued.items[before]);
             defer submitted.deinit();
-            try std.testing.expectEqualStrings(keys[1], submitted.command.sources[0].document_key);
+            try std.testing.expectEqualStrings(keys[healthy], submitted.command.sources[0].document_key);
             {
                 var read = try runtime.store.beginRead();
                 defer read.abort();
-                try std.testing.expectError(error.NotFound, read.get(submitted.command.mutations[0].key));
+                try std.testing.expect((try ordered_publication.ReceiptSet.init(submitted.command).read(&read, submitted.command.sources[0])) == null);
             }
             try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = submitted.command }, .{ .term = 1, .index = index });
             {
                 var read = try runtime.store.beginRead();
                 defer read.abort();
-                _ = try read.get(submitted.command.mutations[0].key);
+                try std.testing.expect((try ordered_publication.ReceiptSet.init(submitted.command).read(&read, submitted.command.sources[0])) != null);
             }
             return;
         }
@@ -47543,7 +47598,7 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
                     break :blk (try stream_progress.prepare(alloc, &snapshot, db.root_incarnation, vector_request, plan.plan(), .{ .visits = 1 }, null)) orelse break;
                 };
                 defer prepared.deinit();
-                try std.testing.expectEqual(OrderedChunkVectorProgress.pending, try driveOrderedChunkVectorCensus(runtime, alloc, vector_request, .{ .visits = 1 }));
+                try std.testing.expectEqual(OrderedChunkVectorProgress.pending, try driveOrderedChunkVectorCensus(runtime, alloc, vector_request, .{ .visits = 1 }, null));
                 {
                     var queued = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, progress_harness.encoded.?);
                     defer queued.deinit();
@@ -47597,7 +47652,7 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
             }
             try std.testing.expect(committed_pages != 0);
             try std.testing.expectEqual(committed_pages, progress_harness.calls);
-            try std.testing.expectEqual(OrderedChunkVectorProgress.complete, try driveOrderedChunkVectorCensus(runtime, alloc, vector_request, .{ .visits = 1 }));
+            try std.testing.expectEqual(OrderedChunkVectorProgress.complete, try driveOrderedChunkVectorCensus(runtime, alloc, vector_request, .{ .visits = 1 }, null));
             try std.testing.expectEqual(committed_pages, progress_harness.calls);
         }
         {
@@ -52304,7 +52359,7 @@ test "model aware media ordered vector windows are searchable with exact clocks 
                     var wide = effects;
                     wide[1].value = payload;
                     const index = harness.next_index;
-                    try std.testing.expectError(error.ResourceBudgetExceeded, enqueueProducerEffects(runtime, &partial.token, &wide, null));
+                    try std.testing.expectError(error.ResourceTemporarilyUnavailable, enqueueProducerEffects(runtime, &partial.token, &wide, null));
                     try std.testing.expectEqual(index, harness.next_index);
                     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.relational_preparation_working_set).used_bytes);
                 }
@@ -52369,7 +52424,7 @@ test "model aware media ordered vector windows are searchable with exact clocks 
                 var prepared = MediaPassVectorCache{ .allocator = a };
                 defer prepared.deinit();
                 const before = harness.calls;
-                try std.testing.expectError(error.ResourceTemporarilyUnavailable, publishMediaWindowVectors(runtime, a, vector_request, provider, @as([32]u8, @splat(marker)), &input, input.value.?, &prepared));
+                try std.testing.expectError(error.ResourceTemporarilyUnavailable, publishMediaWindowVectors(runtime, a, vector_request, provider, @as([32]u8, @splat(marker)), &input, input.value.?, &prepared, null));
                 var scalar = blk: {
                     var read = try runtime.store.beginRead();
                     defer read.abort();
@@ -52424,17 +52479,17 @@ test "model aware media ordered vector windows are searchable with exact clocks 
             const active_floor = input.effect_protocol;
             input.effect_protocol = 18;
             input.old_window_outputs = &.{};
-            try std.testing.expect(!try publishMediaWindowVectors(runtime, a, independent, provider, @as([32]u8, @splat(marker)), &input, failed_payload, &cache));
+            try std.testing.expect(!try publishMediaWindowVectors(runtime, a, independent, provider, @as([32]u8, @splat(marker)), &input, failed_payload, &cache, null));
             try std.testing.expect(!scalarWindowRetirementPending(&input));
             input.effect_protocol = active_floor;
             input.old_window_outputs = null;
-            try std.testing.expect(!try publishMediaWindowVectors(runtime, a, vector_request, provider, @as([32]u8, @splat(0x22)), &input, failed_payload, &cache));
+            try std.testing.expect(!try publishMediaWindowVectors(runtime, a, vector_request, provider, @as([32]u8, @splat(0x22)), &input, failed_payload, &cache, null));
             try std.testing.expectEqual(calls, harness.calls);
         }
         if (round == 1) {
             const scalar_revision: [32]u8 = @splat(0x22);
             const calls = harness.calls;
-            try std.testing.expect(!try publishMediaWindowVectors(runtime, a, vector_request, provider, scalar_revision, &input, input.value.?, &cache));
+            try std.testing.expect(!try publishMediaWindowVectors(runtime, a, vector_request, provider, scalar_revision, &input, input.value.?, &cache, null));
             try std.testing.expectEqual(calls, harness.calls);
             const vector = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, retainedTextEmbeddingHashAtRevision(vector_request, "source 1", scalar_revision), &.{ 0.8, 0.6 });
             defer a.free(vector);
@@ -52565,7 +52620,7 @@ test "model aware media ordered vector windows are searchable with exact clocks 
             try harness.writeForeignWindows(a, member, 650, null);
         } else if (round != 0) {
             input.token.execution_identity = @splat(marker);
-            try std.testing.expect(try publishMediaWindowVectors(runtime, a, vector_request, provider, @as([32]u8, @splat(marker)), &input, input.value.?, &cache));
+            try std.testing.expect(try publishMediaWindowVectors(runtime, a, vector_request, provider, @as([32]u8, @splat(marker)), &input, input.value.?, &cache, null));
         }
         try db.runUntilIdle();
         {
@@ -52983,7 +53038,7 @@ test "model aware media terminal scalar output acknowledges failure without mode
         defer input.deinit();
         var cache = MediaPassVectorCache{ .allocator = a };
         defer cache.deinit();
-        try std.testing.expect(try publishMediaWindowVectors(runtime, a, vector_request, provider, @as([32]u8, @splat(marker)), &input, input.value.?, &cache));
+        try std.testing.expect(try publishMediaWindowVectors(runtime, a, vector_request, provider, @as([32]u8, @splat(marker)), &input, input.value.?, &cache, null));
         {
             var read = try runtime.store.beginRead();
             defer read.abort();
