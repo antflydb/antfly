@@ -307,6 +307,13 @@ pub const Shadow = struct {
         if (runner.context.backend.kind() != .cuda or dtype != .f16) return error.UnsupportedCompactionQueryRoute;
         var execution_scope = try runner.context.execution.acquireScope();
         defer if (execution_scope) |*scope| scope.deinit();
+        try self.initUnderExecution(runner, dtype);
+    }
+
+    /// Provision the private owner in its final location while the caller
+    /// holds the model execution scope. Cleanup precedes scope retirement.
+    fn initUnderExecution(self: *@This(), runner: *Runtime, dtype: runtime.kv.pool.KvDType) !void {
+        std.debug.assert(self.manager == null and self.storage == null and self.state == null);
         self.manager = runtime.kv.manager.KvManager.init(runner.context.allocator);
         errdefer self.deinit();
         const config = decoder_storage.checkpointPool(dtype, runner.context.model.*);
@@ -337,24 +344,16 @@ pub const Shadow = struct {
         }
         var execution_scope = try runner.context.execution.acquireScope();
         defer if (execution_scope) |*scope| scope.deinit();
-        self.manager = runtime.kv.manager.KvManager.init(runner.context.allocator);
+        try self.initUnderExecution(runner, dtype);
         errdefer self.deinit();
-        const config = decoder_storage.checkpointPool(dtype, runner.context.model.*);
-        const pool = try self.manager.?.addPool(config);
-        self.storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(runner.context.allocator, config);
-        try runner.context.backend.provisionKvDeviceWriteHook(&self.storage.?);
         const hook = self.storage.?.device_write_hook orelse return error.UnsupportedCompactionQueryRoute;
-        self.state = NativeDecodeState.initPaged(runner.context.allocator, &self.manager.?, pool, null);
-        self.state.?.kv_storage = &self.storage.?;
-        self.state.?.configureForGptConfig(runner.context.model.*);
-        self.state.?.allow_swa_ring = false;
         try self.state.?.notePrefill(source.total_tokens);
         const clone_request: runtime.kv.device_clone.Request = .{
             .source_sequence = view.sequence_id,
             .destination_sequence = self.state.?.sequence_id.?,
             .tokens = source.total_tokens,
             .capacity = std.mem.alignForward(usize, capacity, 16),
-            .page_size = config.page_size_tokens,
+            .page_size = self.storage.?.storage.config.page_size_tokens,
             .source_blocks = view.logical_blocks orelse return error.UnsupportedDeviceKvCloneLayout,
             .destination_blocks = self.state.?.kv_block_ids.items,
             .donors = donors[0..donor_count],
@@ -1108,20 +1107,13 @@ pub const Runtime = struct {
         errdefer collector.deinit();
         var execution_scope = try self.context.execution.acquireScope();
         defer if (execution_scope) |*scope| scope.deinit();
-        var manager = runtime.kv.manager.KvManager.init(self.context.allocator);
-        defer manager.deinit();
-        const pool_config = decoder_storage.checkpointPool(dtype, self.context.model.*);
-        const pool_id = try manager.addPool(pool_config);
-        var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(self.context.allocator, pool_config);
-        defer storage.deinit();
+        var shadow_owner = Shadow{};
         // Provisioning a separate hook does not begin/reset the model request.
-        try self.context.backend.provisionKvDeviceWriteHook(&storage);
-        if (storage.device_write_hook == null) return error.UnsupportedCompactionQueryRoute;
-        var shadow = NativeDecodeState.initPaged(self.context.allocator, &manager, pool_id, null);
-        shadow.kv_storage = &storage;
-        shadow.configureForGptConfig(self.context.model.*);
-        shadow.allow_swa_ring = false;
-        defer shadow.deinit();
+        try shadow_owner.initUnderExecution(self, dtype);
+        defer shadow_owner.deinit();
+        const storage = &shadow_owner.storage.?;
+        const shadow = &shadow_owner.state.?;
+        const shadow_hook = storage.device_write_hook orelse return error.UnsupportedCompactionQueryRoute;
         if (options.stats) |stats| stats.setup_ns = mtpProfileElapsedNs(true, self.context.io, collection_started);
         const prefix_started = mtpProfileTimestamp(true, self.context.io);
         var ragged_shadow = false;
@@ -1135,10 +1127,10 @@ pub const Runtime = struct {
                 source.sequence_id != source_view.sequence_id) return error.UnsupportedDeviceKvCloneLayout;
             const source_blocks = source_view.logical_blocks orelse return error.UnsupportedDeviceKvCloneLayout;
             try shadow.notePrefill(source_tokens.len);
-            const clone_request: runtime.kv.device_clone.Request = .{ .source_sequence = source_view.sequence_id, .destination_sequence = shadow.sequence_id.?, .tokens = source_tokens.len, .capacity = shadow_rows, .page_size = pool_config.page_size_tokens, .source_blocks = source_blocks, .destination_blocks = shadow.kv_block_ids.items, .donors = donors[0..donor_count], .max_bytes = options.max_shadow_kv_bytes, .check_ctx = self, .check_fn = checkAttentionMatchQueryWork };
+            const clone_request: runtime.kv.device_clone.Request = .{ .source_sequence = source_view.sequence_id, .destination_sequence = shadow.sequence_id.?, .tokens = source_tokens.len, .capacity = shadow_rows, .page_size = storage.storage.config.page_size_tokens, .source_blocks = source_blocks, .destination_blocks = shadow.kv_block_ids.items, .donors = donors[0..donor_count], .max_bytes = options.max_shadow_kv_bytes, .check_ctx = self, .check_fn = checkAttentionMatchQueryWork };
             const fitted_clone = if (comptime build_options.enable_cuda) blk: {
                 const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.context.backend.ptr));
-                break :blk try cuda_compute.cloneInstalledAttentionMatch(compute, &storage, source_storage, clone_request);
+                break :blk try cuda_compute.cloneInstalledAttentionMatch(compute, storage, source_storage, clone_request);
             } else null;
             const clone = if (fitted_clone) |value| blk: {
                 // The reference mode follows the installed bias/coverage-aware
@@ -1146,7 +1138,7 @@ pub const Runtime = struct {
                 if (options.repeat_mode != .reference) return error.UnsupportedCompactionQueryRoute;
                 ragged_shadow = true;
                 break :blk value;
-            } else try storage.device_write_hook.?.cloneExactPrefix(source_storage.device_write_hook orelse return error.DeviceKvCloneUnsupported, clone_request);
+            } else try shadow_hook.cloneExactPrefix(source_storage.device_write_hook orelse return error.DeviceKvCloneUnsupported, clone_request);
             if (options.stats) |stats| {
                 stats.prefix_ns = mtpProfileElapsedNs(true, self.context.io, prefix_started);
                 stats.cloned_bytes = clone.copied_bytes;
@@ -1194,7 +1186,7 @@ pub const Runtime = struct {
             if (comptime build_options.enable_cuda) {
                 if (ragged_shadow) {
                     const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.context.backend.ptr));
-                    const activity = (try cuda_compute.installedAttentionMatchActivity(compute, &storage, shadow.sequence_id.?)) orelse return error.UnsupportedCompactionQueryRoute;
+                    const activity = (try cuda_compute.installedAttentionMatchActivity(compute, storage, shadow.sequence_id.?)) orelse return error.UnsupportedCompactionQueryRoute;
                     if (activity.invalid or activity.attention_calls == 0 or activity.donor_appends == 0) return error.UnsupportedCompactionQueryRoute;
                     if (options.stats) |stats| stats.ragged_repeat_calls = activity.attention_calls;
                 }
@@ -1246,26 +1238,29 @@ test "checkpoint shadow provisioning failure retires metadata and execution owne
     if (comptime !build_options.enable_native) return error.SkipZigTest;
     const native = @import("../ops/native_compute.zig");
     const Case = struct {
-        fn run(allocator: std.mem.Allocator) !void {
+        fn run(allocator: std.mem.Allocator, caller_owns_scope: bool) !void {
             var lane = execution_control.ExecutionLane{};
             var mutex = std.atomic.Mutex.unlocked;
             defer std.testing.expect(!lane.owned) catch @panic("checkpoint execution lane leaked");
             const Probe = struct {
                 lane: *execution_control.ExecutionLane,
                 mutex: *std.atomic.Mutex,
+                dtype: runtime.kv.pool.KvDType,
                 entered: bool = false,
                 fn kind(_: *anyopaque) ops.BackendKind {
                     return .cuda;
                 }
-                fn provision(raw: *anyopaque, _: *runtime.kv.storage_runtime.KvStorageRuntime) !void {
+                fn provision(raw: *anyopaque, storage: *runtime.kv.storage_runtime.KvStorageRuntime) !void {
                     const self: *@This() = @ptrCast(@alignCast(raw));
                     self.entered = true;
                     try std.testing.expect(self.lane.owned);
+                    try std.testing.expectEqual(self.dtype, storage.storage.config.dtype);
                     try std.testing.expect(!self.mutex.tryLock());
                     return error.InjectedCheckpointProvisionFailure;
                 }
             };
-            var probe = Probe{ .lane = &lane, .mutex = &mutex };
+            const dtype: runtime.kv.pool.KvDType = if (caller_owns_scope) .f32 else .f16;
+            var probe = Probe{ .lane = &lane, .mutex = &mutex, .dtype = dtype };
             var vtable = native.vtable_impl;
             vtable.backendKind = Probe.kind;
             vtable.provisionKvDeviceWriteHook = Probe.provision;
@@ -1274,10 +1269,21 @@ test "checkpoint shadow provisioning failure retires metadata and execution owne
             var executor = Runtime{ .context = .{ .allocator = allocator, .io = std.testing.io, .backend = &backend, .model = &config, .kv_dtype = .f16, .identity = null, .execution = .{ .mutex = &mutex, .gate = &lane, .io = std.testing.io } } };
             var shadow = Shadow{};
             defer shadow.deinit();
-            shadow.initEmpty(&executor) catch |err| switch (err) {
-                error.InjectedCheckpointProvisionFailure => {},
-                else => return err,
-            };
+            if (caller_owns_scope) {
+                var scope = (try executor.context.execution.acquireScope()).?;
+                defer scope.deinit();
+                shadow.initUnderExecution(&executor, dtype) catch |err| switch (err) {
+                    error.InjectedCheckpointProvisionFailure => {},
+                    else => return err,
+                };
+                try std.testing.expect(lane.owned);
+                try std.testing.expect(shadow.manager == null and shadow.storage == null and shadow.state == null);
+            } else {
+                shadow.initEmpty(&executor) catch |err| switch (err) {
+                    error.InjectedCheckpointProvisionFailure => {},
+                    else => return err,
+                };
+            }
             try std.testing.expect(probe.entered);
             try std.testing.expect(!lane.owned);
             try std.testing.expect(mutex.tryLock());
@@ -1285,7 +1291,8 @@ test "checkpoint shadow provisioning failure retires metadata and execution owne
             try std.testing.expect(shadow.manager == null and shadow.storage == null and shadow.state == null);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    for ([_]bool{ false, true }) |caller_owns_scope|
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{caller_owns_scope});
 }
 
 test "checkpoint shadow CUDA owners retain independent positions without retaining the execution lane" {
