@@ -2284,7 +2284,7 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
                     self.store.deinit();
                 }
             };
-            var boundary = Boundary{ .cb = cb, .store = store, .frame = &frame.owns };
+            var boundary = Boundary{ .store = store, .frame = &frame };
             const restart_frame = frame.owns;
             var keys: [audio_schedule.retained_plan_capacity]u64 = undefined;
             const recipe = audioCacheConfig(cfg);
