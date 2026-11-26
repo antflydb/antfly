@@ -467,6 +467,7 @@ pub const Executor = struct {
         self: *Executor,
         claimed: []const runtime.scheduler.native_generate.StepItem,
         items: []MixedBatchDecodeItem,
+        first_frame: *@import("submission.zig").Scope,
         first_logits: ops.CT,
         head: ops.CT,
         embedding_slot: usize,
@@ -490,7 +491,7 @@ pub const Executor = struct {
             if (second_logits) |logits| self.context.cb.free(logits);
         }
         try M.encodeLightOnBurstArgmax(self.context.cb, first_logits, claimed.len, self.context.gpt_config.vocab_size, self.context.gpt_config.suppressTokenIds());
-        try self.context.cb.decoderRuntimeSubmitFrame();
+        try first_frame.submit();
         for (1..steps) |step| {
             var frame = try @import("submission.zig").Scope.beginPipelined(self.context.cb);
             defer frame.deinit();
@@ -1639,8 +1640,9 @@ pub const Executor = struct {
                         defer self.context.cb.free(embedding);
                         burst_slot = try M.lightOnBurstEmbeddingSlot(self.context.cb, embedding, self.context.gpt_config.hidden_size, self.context.gpt_config.vocab_size);
                     }
-                    if (try self.context.cb.decoderRuntimeBeginFrame()) {
-                        defer self.context.cb.decoderRuntimeCancelFrame() catch {};
+                    var frame = try @import("submission.zig").Scope.begin(self.context.cb);
+                    defer frame.deinit();
+                    if (frame.owns) {
                         try self.context.cb.decoderRuntimeSetActiveFrameRegime(.decode);
                         M.setLightOnExpectedStreamFrames(self.context.cb, 1);
                         const before_frames = self.context.cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits;
@@ -1656,12 +1658,14 @@ pub const Executor = struct {
                         defer self.context.cb.free(hidden);
                         const logits = try self.context.cb.linearNoBias(hidden, head, claimed.len, self.context.gpt_config.hidden_size, self.context.gpt_config.vocab_size);
                         defer self.context.cb.free(logits);
-                        if (burst_slot) |slot| return self.finishLightOnGpuTokenBurst(claimed, items, logits, head, slot, burst_steps, before_frames, before_argmax);
+                        if (burst_slot) |slot| return self.finishLightOnGpuTokenBurst(claimed, items, &frame, logits, head, slot, burst_steps, before_frames, before_argmax);
                         try M.ensureFrameArgmaxScope(self.context.cb);
                         // Never replay a forward after it has updated recurrent/KV
                         // state. A failure must fail this claimed step instead.
                         const tokens = try self.context.cb.decoderRuntimeArgmaxRowsSuppress(logits, 0, claimed.len, self.context.gpt_config.vocab_size, self.context.gpt_config.suppressTokenIds(), self.context.allocator) orelse return error.ResidentImageOperationUnavailable;
                         errdefer self.context.allocator.free(tokens);
+                        if (self.context.cb.decoderRuntimeHasActiveFrame()) return error.ResidentImageOperationUnavailable;
+                        frame.owns = false;
                         if (tokens.len != claimed.len) return error.InvalidBatchDecodeState;
                         const frames = self.context.cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits -| before_frames;
                         const on_frame = M.argmaxOnFrameCount(self.context.cb) -| before_argmax;
