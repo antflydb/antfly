@@ -464,14 +464,23 @@ pub const State = struct {
         var staged = false;
         for (reservations.items) |*item| {
             item.output = self.prepareCacheCopy(backend, kernels, item) catch |err| switch (err) {
-                error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.QueueFull, error.InvalidPhysicalTransferSize => null,
+                // This optional copy has submitted no commands. Keep the
+                // published cache under its existing residency charge.
+                error.ResourceLimitExceeded,
+                error.ResourceTemporarilyUnavailable,
+                error.QueueFull,
+                error.InvalidPhysicalTransferSize,
+                error.CudaMemoryLimitExceeded,
+                error.MetalBufferAllocFailed,
+                => null,
                 else => return err,
             };
             staged = staged or item.output != null;
         }
         if (!staged) return scope.finish();
         // Keep the Metal copies in one frame and publish only after retirement.
-        const metal_frame = backend.kind() == .metal and try backend.decoderRuntimeBeginFrame();
+        const metal_frame = backend.kind() == .metal;
+        if (metal_frame and !try backend.decoderRuntimeBeginFrame()) return scope.finish();
         errdefer if (metal_frame and backend.decoderRuntimeHasActiveFrame())
             backend.decoderRuntimeCancelFrame() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         const completion = if (kernels.createPhysicalCompletion) |create| try create(backend.ptr) else null;

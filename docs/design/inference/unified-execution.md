@@ -1002,6 +1002,15 @@ After disconnecting a longer stream, the next text request returned `4`
 in 0.84 s. These requests use existing model selection, memory admission
 and the GPU runtime's execution gate.
 
+On the pinned Metal HTTP build at `25ec163bbd`, the same-binary
+A–B–B–A comparison measured the opt-in final-frame greedy selection.
+With 12 measured requests per configuration and case, median latency
+fell from 0.590 to 0.543 s for 28-token text and from 0.678 to 0.643 s
+for a 33-token image. Both 257-token tail cases varied by less than 0.3%
+between configurations. The before/after and repeated candidate medians
+varied by less than 0.4% in each case. The requests checked answer and
+token counts. The head-to-head llama.cpp comparison remains open.
+
 A wider Metal prefill batch increased capacity from 64 to 256 rows, compacted
 the final partial batch into a separately sized workspace, and gave each
 query its own context-dependent attention reduction boundaries. All 84
