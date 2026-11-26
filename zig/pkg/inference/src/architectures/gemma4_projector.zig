@@ -1748,18 +1748,15 @@ pub fn encodePreparedEmbeddingGemma2AudioBatchResident(cb: *const ComputeBackend
 
 fn audioFeatureCohort(cb: *const ComputeBackend, a: std.mem.Allocator, prepared: []const *const PreparedAudio, features: *[4]AudioFeatures) !usize {
     if (prepared.len == 0 or prepared.len > 4) return error.InvalidInputShape;
-    var frame = cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame() and try cb.decoderRuntimeBeginFrame();
-    defer if (frame) cb.decoderRuntimeCancelFrame() catch {};
+    var frame = try @import("../execution/submission.zig").Scope.beginIfNeeded(cb, cb.kind() == .metal);
+    defer frame.deinit();
     var count: usize = 0;
     errdefer for (features[0..count]) |*feature| feature.deinit();
     for (prepared) |item| {
         features[count] = try audioFeaturesFromPrepared(cb, a, @constCast(item));
         count += 1;
     }
-    if (frame) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        frame = false;
-    }
+    try frame.finish();
     return count;
 }
 
@@ -3029,14 +3026,11 @@ fn audioFeaturesFromPrepared(cb: *const ComputeBackend, allocator: std.mem.Alloc
     errdefer allocator.free(out);
     const mask = try allocator.dupe(bool, prepared.mask);
     errdefer allocator.free(mask);
-    var owned_frame = cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame() and try cb.decoderRuntimeBeginFrame();
-    defer if (owned_frame) cb.decoderRuntimeCancelFrame() catch {};
+    var frame = try @import("../execution/submission.zig").Scope.beginIfNeeded(cb, cb.kind() == .metal);
+    defer frame.deinit();
     const tensor = try gemma4LogMelTensor(cb, allocator, prepared.samples, prepared.frames, 160, 320, 512, prepared.window, prepared.filters, prepared.mel_bins, 1e-3, mask);
     errdefer cb.free(tensor);
-    if (owned_frame) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        owned_frame = false;
-    }
+    try frame.finish();
     return .{ .allocator = allocator, .data = out, .resident = tensor, .backend = cb, .mask = mask, .frames = prepared.frames, .mel_bins = prepared.mel_bins };
 }
 
@@ -3425,8 +3419,8 @@ fn audioSubsampleCohort(cb: *const ComputeBackend, a: std.mem.Allocator, store: 
             count += 1;
             done[i] = true;
         }
-        var frame = cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame() and try cb.decoderRuntimeBeginFrame();
-        defer if (frame) cb.decoderRuntimeCancelFrame() catch {};
+        var frame = try @import("../execution/submission.zig").Scope.beginIfNeeded(cb, cb.kind() == .metal);
+        defer frame.deinit();
         var singleton: ?SubsampledAudio = null;
         defer if (singleton) |*clip| {
             cb.free(clip.hidden);
@@ -3442,9 +3436,8 @@ fn audioSubsampleCohort(cb: *const ComputeBackend, a: std.mem.Allocator, store: 
             for (0..span) |t| valid[offsets[index] + t] = features[index].mask[t * 4];
             if (!try cb.copyRows2D(a, hidden, offsets[index], batch_hidden, slot * audio_schedule.subsampledRows(padded_frames), span, cfg.audio_hidden)) return error.UnsupportedResidentGemma4Audio;
         }
-        if (frame) {
-            try cb.decoderRuntimeSubmitAndWaitFrame();
-            frame = false;
+        if (frame.owns) {
+            try frame.finish();
             try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
         }
     }
