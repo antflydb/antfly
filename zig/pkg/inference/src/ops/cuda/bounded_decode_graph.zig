@@ -91,9 +91,11 @@ pub const StorageLayout = struct {
         const bank_offset = try aligned(input_bytes);
         const token_bytes = rows * 2 * @sizeOf(u32);
         const position_bytes = rows * 3 * @sizeOf(u32);
-        const positions_offset = try std.math.add(usize, bank_offset, try aligned(token_bytes));
-        const progress_offset = try aligned(try std.math.add(usize, positions_offset, position_bytes));
-        const metadata_bytes = try std.math.add(usize, progress_offset, 256);
+        // Keep the input and token bank at CUDA allocation alignment. The
+        // position plane only needs vector alignment and progress is scalar.
+        const positions_offset = try std.math.add(usize, bank_offset, std.mem.alignForward(usize, token_bytes, 16));
+        const progress_offset = try std.math.add(usize, positions_offset, position_bytes);
+        const metadata_bytes = try aligned(try std.math.add(usize, progress_offset, @sizeOf(u32)));
         const host_bytes = try std.math.add(usize, @sizeOf(plan_mod.Plan), try std.math.mul(usize, key_words, @sizeOf(u64)));
         const head_bytes = if (rows > 64) try std.math.mul(usize, try std.math.mul(usize, rows, vocab), @sizeOf(f32)) else 0;
         if (head_bytes > plan_mod.limit) return error.InvalidShape;
@@ -531,9 +533,10 @@ pub const Module = struct {
     }
 };
 
-test "captured sequence storage layout preserves existing narrow wide and aligned physical planes" {
+test "captured sequence storage layout packs narrow and wide readbacks with aligned physical planes" {
     const cases = [_]struct { rows: usize, hidden: usize, vocab: usize, bank: usize, positions: usize, progress: usize, bytes: usize, head: usize }{
-        .{ .rows = 2, .hidden = 1024, .vocab = 8, .bank = 8192, .positions = 8448, .progress = 8704, .bytes = 8960, .head = 0 },
+        .{ .rows = 2, .hidden = 1024, .vocab = 8, .bank = 8192, .positions = 8208, .progress = 8232, .bytes = 8448, .head = 0 },
+        .{ .rows = 3, .hidden = 1024, .vocab = 8, .bank = 12288, .positions = 12320, .progress = 12356, .bytes = 12544, .head = 0 },
         .{ .rows = 64, .hidden = 1024, .vocab = 151936, .bank = 262144, .positions = 262656, .progress = 263424, .bytes = 263680, .head = 0 },
         .{ .rows = 128, .hidden = 2560, .vocab = 151936, .bank = 1310720, .positions = 1311744, .progress = 1313280, .bytes = 1313536, .head = 77791232 },
     };
