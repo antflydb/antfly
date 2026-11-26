@@ -208,6 +208,16 @@ CPU PJRT plugin v0.117.2 passed both released Whisper Small fixtures:
 public-loader encoder and decoder parity with Native, and full-window
 resident bank and first decode parity with the full-prefix path.
 
+The shared PJRT capture policy at `59d19fe609` applies the same portable
+graph pipeline before specialization for all captured stages. The Apple
+Silicon CPU cohort passed seven released-checkpoint tests. EmbeddingGemma2
+passed public text parity and the vision, composition and embedding
+stages in F32 and BF16. The measured final image embedding cosine was
+0.99988–0.99992 across the two cases. GLiNER2.5 passed DeBERTa backbone
+parity. Both Whisper Small fixtures passed again. Gemma 4 E4B QAT GGUF
+passed positional-table HLO serialization, which exercises compilation
+input construction but leaves numerical execution to a separate fixture.
+
 Whisper compiled requests use the resident PJRT bank publication owner. Prefill
 produces self K/V and immutable encoder cross K/V; subsequent single-token
 programs consume those banks and runtime learned positions. Decode reachability
