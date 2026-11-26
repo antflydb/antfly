@@ -67,6 +67,10 @@ test "dense projection cache metadata declarations compile" {
     _ = @import("backends/dense_projection_pack.zig");
 }
 
+test {
+    _ = @import("ops/cuda/local_relative_source.zig");
+}
+
 test "Gemma4 CUDA host PLE declarations compile" {
     _ = @import("backends/admitted_allocator.zig");
     _ = @import("ops/cuda/host_retirement.zig");

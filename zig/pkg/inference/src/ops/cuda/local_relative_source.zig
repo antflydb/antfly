@@ -60,9 +60,11 @@ pub const Plan = struct {
             if (v > std.math.maxInt(u32)) return error.InvalidShape;
         var cursor: usize = 0;
         const query = try append(&cursor, matrix);
-        // Q's packed copy dies before relative GEMM writes this same bank.
-        const shared = try append(&cursor, @max(if (blocks > 1) matrix else 0, relative_logits));
-        const key = try append(&cursor, contexts);
+        // Content GEMM is the final consumer of packed Q and K. One
+        // block has no packed Q, so relative GEMM can write into K's bank.
+        const packed_bank = if (blocks > 1) try append(&cursor, @max(matrix, relative_logits)) else null;
+        const key_bank = try append(&cursor, if (blocks > 1) contexts else @max(contexts, relative_logits));
+        const shared = packed_bank orelse key_bank;
         const value = try append(&cursor, contexts);
         const scores = try append(&cursor, logits);
         const workspace = try append(&cursor, workspace_bytes / 4);
@@ -77,7 +79,7 @@ pub const Plan = struct {
             .padded = padded,
             .query = query,
             .packed_query = if (blocks > 1) .{ .offset = shared.offset, .bytes = matrix * 4 } else query,
-            .key = key,
+            .key = .{ .offset = key_bank.offset, .bytes = contexts * 4 },
             .value = value,
             .scores = scores,
             .relative_scores = .{ .offset = shared.offset, .bytes = relative_logits * 4 },
@@ -141,6 +143,8 @@ test "local relative source single block keeps original head-interleaved operand
     const pv = p.contextLayout();
     try std.testing.expect(ac.transpose_a and !ac.transpose_b);
     try std.testing.expectEqualDeep(p.query, p.packed_query);
+    try std.testing.expectEqual(p.key.offset, p.relative_scores.offset);
+    try std.testing.expectEqual(@as(usize, 2 * 6 * 3 * 4), p.key.bytes);
     for (0..2) |head| for (0..4) |query| for (0..6) |key| for (0..3) |d| {
         // The reference starts from contiguous [N,W,H,D] and [N,C,H,D]
         // before permuting; one-block views need no materialized transpose.
