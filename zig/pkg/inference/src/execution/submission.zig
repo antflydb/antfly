@@ -23,6 +23,7 @@ pub const Scope = struct {
     backend: *const ops.ComputeBackend,
     owns: bool = false,
     foreign: bool = false,
+    submit_attempted: bool = false,
 
     pub fn begin(backend: *const ops.ComputeBackend) !Scope {
         return beginIfNeeded(backend, true);
@@ -42,6 +43,8 @@ pub const Scope = struct {
 
     pub fn finish(self: *Scope) !void {
         if (!self.owns) return;
+        if (self.submit_attempted) return error.FrameSubmissionAlreadyAttempted;
+        self.submit_attempted = true;
         self.owns = false;
         const commands = self.backend.vtable.regions.commands;
         commands.submitAndWaitFrame.?(self.backend.ptr) catch |err| {
@@ -68,6 +71,7 @@ test "submission scopes preserve foreign batches unwind encoding and never repla
         active: bool = false,
         decline: bool = false,
         fail_submit: bool = false,
+        fail_before_commit: bool = false,
         starts: usize = 0,
         commits: usize = 0,
         cancels: usize = 0,
@@ -84,6 +88,7 @@ test "submission scopes preserve foreign batches unwind encoding and never repla
         }
         fn submit(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fail_before_commit) return error.SubmissionFailed;
             self.commits += 1;
             self.active = false;
             if (self.fail_submit) return error.SubmissionFailed;
@@ -129,4 +134,16 @@ test "submission scopes preserve foreign batches unwind encoding and never repla
     try declined.finish();
     declined.deinit();
     try std.testing.expectEqual(@as(usize, 3), probe.starts);
+    probe.decline = false;
+    probe.fail_submit = false;
+    probe.fail_before_commit = true;
+    var unsubmitted = try Scope.begin(&backend);
+    try std.testing.expectError(error.SubmissionFailed, unsubmitted.finish());
+    try std.testing.expect(unsubmitted.owns and probe.active);
+    probe.fail_before_commit = false;
+    try std.testing.expectError(error.FrameSubmissionAlreadyAttempted, unsubmitted.finish());
+    try unsubmitted.deinitChecked();
+    try std.testing.expect(!probe.active);
+    try std.testing.expectEqual(@as(usize, 2), probe.commits);
+    try std.testing.expectEqual(@as(usize, 2), probe.cancels);
 }
