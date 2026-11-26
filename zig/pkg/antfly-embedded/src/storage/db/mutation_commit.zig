@@ -4579,11 +4579,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try S.ownerField(self, "core").*.index_manager.visibilityObligationDigest()
             else
                 null;
-            const leann_cut: []index_manager_mod.IndexManager.LeannCoverageTarget = if (continuation_possible)
-                try S.ownerField(self, "core").*.index_manager.prepareLeannCoverageCut(S.ownerField(self, "alloc").*)
-            else
-                &.{};
-            defer if (leann_cut.len != 0) index_manager_mod.IndexManager.freeLeannCoverageTargets(S.ownerField(self, "alloc").*, leann_cut);
             if (comptime @import("builtin").is_test) if (test_before_primary_commit) |hook| {
                 test_before_primary_commit = null;
                 try hook.run(hook.ptr);
@@ -4792,9 +4787,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if ((primary_ticket != null or txn_ticket != null) and !commits_after_wait) {
                 if (opts.writer_lane_release_before_wait) |hook| hook.release(hook.ptr);
             }
-            // This write's LEANN positions, before the lane lets another write
-            // move them.
-            S.ownerField(self, "core").*.index_manager.fillLeannCoverageCut(leann_cut);
             var indexed_lane_yielded = false;
             if (primary_ticket != null and (inline_text_publication_count != 0 or inline_graph_publication != null or
                 inline_sparse_publication != null or inline_dense_publication != null))
@@ -4964,6 +4956,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         (!opts.bypass_replication_write_gate and S.ownerField(self, "local_execution").*.replication_write_gate != null),
                     .caller_visibility_completion = opts.visibility_completion != null,
                     .materialized_apply = append_derived_replay and !S.ownerField(self, "executor").*.hasWorkers(),
+                    .leann_coverage = S.ownerField(self, "core").*.index_manager.leann_replication,
                 };
                 const replacement_continuation: execution_resources.ReplacementContinuation = .{
                     .replay_sequence = if (append_derived_replay) sequence else 0,
@@ -4972,7 +4965,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .refresh_identity_visibility = queued_index_publication and pending_identity_visibility_summary != null,
                     .targets = sync_targets,
                     .obligation_digest = admitted_obligation_digest,
-                    .leann_cut = leann_cut,
                 };
                 const continuation = if (execution_resources.replacementContinuationEligible(replacement_shape)) &replacement_continuation else null;
                 if (comptime @import("builtin").is_test) if (!finish_without_lane) if (execution_resources.test_before_indexed_resume) |test_hook|

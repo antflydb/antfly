@@ -641,6 +641,9 @@ const PlatformTextMergeRuntime = struct {
         // during a gap. The deadline still degrades to the same
         // idle_interval_ms-cadence retry as a plain failed tryLockExclusive
         // when it cannot get in.
+        // A refused merge's reload of its index from the tip runs here,
+        // before the database-wide lock, never under it.
+        self.index_manager.refreshTextIndexesBehindTip();
         self.apply_mutex.lockExclusiveDeadlineIo(io, .fromNow(io, .{
             .raw = .fromMilliseconds(@intCast(self.config.idle_interval_ms)),
             .clock = .awake,

@@ -736,9 +736,6 @@ pub const TtlCleanupContext = struct {
 
 pub const ManagedSyncTargets = struct {
     full_text_indexes: []const []const u8 = &.{},
-    /// Borrowed: LEANN positions to wait for instead of the graphs' current
-    /// ones (`ReplacementContinuation.leann_cut`). Never cloned or freed here.
-    leann_cut: ?[]const index_manager_mod.IndexManager.LeannCoverageTarget = null,
     all_indexes: []const []const u8 = &.{},
     // Visibility targets are broader than synchronous wait targets: a record
     // with a missing dependency, or source work that schedules a generated
@@ -1146,6 +1143,11 @@ pub const ReplacementShape = struct {
     /// A derived replay with no workers: the wait applies the materialized
     /// batch, which only the write's own runtime holds.
     materialized_apply: bool = false,
+    /// Replicated LEANN coverage. Its write positions are in-memory counters
+    /// that a reopened graph renumbers, and the write's own LEANN work is
+    /// numbered only during derived replay, so no position this write could
+    /// carry means the same thing on another runtime.
+    leann_coverage: bool = false,
 };
 
 pub fn replacementContinuationEligible(shape: ReplacementShape) bool {
@@ -1177,39 +1179,17 @@ pub const ReplacementContinuation = struct {
     /// `IndexManager.visibilityObligationDigest` at admission, for a wait
     /// that reads group sources, enrichment templates or LEANN coverage.
     obligation_digest: ?u64 = null,
-    /// Each replicated LEANN graph's write position as of this write's own
-    /// commit. A replacement waits for these, not for the graphs' current
-    /// positions, which later writes move.
-    leann_cut: []const index_manager_mod.IndexManager.LeannCoverageTarget = &.{},
 
     pub fn clone(self: *const ReplacementContinuation, alloc: Allocator) !ReplacementContinuation {
         var copy = self.*;
         copy.targets = try cloneManagedSyncTargets(alloc, self.targets);
-        errdefer copy.targets.deinit(alloc);
-        copy.leann_cut = try cloneLeannCut(alloc, self.leann_cut);
         return copy;
     }
 
     pub fn deinit(self: *ReplacementContinuation, alloc: Allocator) void {
         self.targets.deinit(alloc);
-        if (self.leann_cut.len != 0) index_manager_mod.IndexManager.freeLeannCoverageTargets(alloc, @constCast(self.leann_cut));
     }
 };
-
-fn cloneLeannCut(alloc: Allocator, cut: []const index_manager_mod.IndexManager.LeannCoverageTarget) ![]const index_manager_mod.IndexManager.LeannCoverageTarget {
-    if (cut.len == 0) return &.{};
-    const out = try alloc.alloc(index_manager_mod.IndexManager.LeannCoverageTarget, cut.len);
-    var made: usize = 0;
-    errdefer {
-        for (out[0..made]) |target| alloc.free(target.name);
-        alloc.free(out);
-    }
-    for (cut, out) |target, *slot| {
-        slot.* = .{ .name = try alloc.dupe(u8, target.name), .seq = target.seq };
-        made += 1;
-    }
-    return out;
-}
 
 fn cloneNames(alloc: Allocator, names: []const []const u8) ![]const []const u8 {
     if (names.len == 0) return &.{};
@@ -1276,7 +1256,6 @@ test "a cloned replacement continuation owns its targets" {
         .sync_level = .full_text,
         .enrichment_fully_precomputed = true,
         .targets = .{ .full_text_indexes = names, .all_indexes = names, .target_identities = identities, .target_scope_known = true },
-        .leann_cut = &.{.{ .name = @constCast("vectors"), .seq = 41 }},
     };
     var owned = try borrowed.clone(a);
     defer owned.deinit(a);
@@ -1284,10 +1263,6 @@ test "a cloned replacement continuation owns its targets" {
     try std.testing.expectEqualStrings("text", owned.targets.target_identities[0].index_name);
     try std.testing.expectEqual(@as(u64, 7), owned.targets.target_identities[0].incarnation);
     try std.testing.expectEqual(@as(u64, 42), owned.replay_sequence);
-    // The write's own LEANN positions travel with it, not the graphs'.
-    try std.testing.expect(owned.leann_cut[0].name.ptr != borrowed.leann_cut[0].name.ptr);
-    try std.testing.expectEqualStrings("vectors", owned.leann_cut[0].name);
-    try std.testing.expectEqual(@as(u64, 41), owned.leann_cut[0].seq);
 }
 
 /// One synchronous prepared attempt's irreversible disposition. It is separate
