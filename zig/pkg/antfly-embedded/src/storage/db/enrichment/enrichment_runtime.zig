@@ -34697,11 +34697,11 @@ fn enqueueProducerEffects(runtime: *EnrichmentRuntime, token: *@import("../artif
         try token.validate(runtime.alloc, &read);
     }
     const dispatcher = runtime.artifact_publication_dispatcher orelse return error.ArtifactCatalogDrift;
-    const command = try token.command(effects);
     // Use the replay allocator that already accounts for the inputs and
     // payloads. The codec measures the full wire buffer before allocating.
     const backing = token.arena.child_allocator;
-    var transport_budget = if (resource_manager_mod.BudgetedAllocator.fromAllocator(backing) == null)
+    const replay_budget = resource_manager_mod.BudgetedAllocator.fromAllocator(backing);
+    var transport_budget = if (replay_budget == null)
         if (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) |manager|
             runtime.media_window_capture.budget(manager, backing)
         else
@@ -34710,8 +34710,10 @@ fn enqueueProducerEffects(runtime: *EnrichmentRuntime, token: *@import("../artif
         null;
     defer if (transport_budget) |*budget| budget.deinit();
     const transport = if (transport_budget) |*budget| budget.allocator() else backing;
-    const bytes = @import("../artifact_publication_transport_codec.zig").encodeAlloc(transport, command) catch |err| {
-        if (err == error.OutOfMemory) if (transport_budget) |*budget| if (budget.denied()) return error.ResourceBudgetExceeded;
+    const tracked = if (transport_budget) |*budget| budget else replay_budget;
+    const denial_before = if (tracked) |budget| budget.denialGeneration() else 0;
+    const bytes = encodeProducerEffects(token, effects, transport) catch |err| {
+        if (err == error.OutOfMemory) if (tracked) |budget| if (budget.denialGeneration() != denial_before) return error.ResourceBudgetExceeded;
         return err;
     };
     defer transport.free(bytes);
@@ -34720,6 +34722,10 @@ fn enqueueProducerEffects(runtime: *EnrichmentRuntime, token: *@import("../artif
     // Provider completion is not owner acceptance; hold replay progress until
     // the next attempt observes the durable semantic receipt.
     return error.ArtifactPublicationPending;
+}
+
+fn encodeProducerEffects(token: *@import("../artifact_producer_context.zig").Token, effects: []const ordered_publication.Mutation, alloc: Allocator) ![]u8 {
+    return @import("../artifact_publication_transport_codec.zig").encodeAlloc(alloc, try token.command(effects));
 }
 
 fn captureProducerInput(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, source_key: []const u8, logical_input: []const u8) !?producer_input.Token {
@@ -45919,6 +45925,10 @@ test "ordered materialized chunk embeddings drain collection under memory pressu
     try testOrderedChunkVectorCarry(true, .collection_contention);
 }
 
+test "ordered materialized chunk embeddings recover from shared transport pressure" {
+    try testOrderedChunkVectorCarry(true, .transport_pressure);
+}
+
 test "ordered materialized chunk embeddings use bounded parallel provider batches" {
     try testOrderedChunkVectorCarry(true, .parallel);
     try testOrderedChunkVectorCarry(true, .parallel_bytes);
@@ -45954,7 +45964,7 @@ test "ordered materialized chunk embeddings retain owners across planning failur
     try testOrderedChunkVectorCarry(true, .planning_retry);
 }
 
-const ChunkVectorBatchTest = enum { carry, items, bytes, revision, legacy, legacy_bytes, terminal, metadata_retry, metadata_tail_retry, relational_retry, legacy_budget, legacy_boundary_terminal, legacy_metadata_retry, legacy_metadata_terminal, parallel, parallel_bytes, legacy_preparation_retry, legacy_preparation_retry_cached, mixed_publication_pending, parallel_oversize, parallel_terminal, parallel_retry, collection_pressure, collection_too_large, parallel_cancel, cancel_first, cancel_second, cancel_global, source_first, source_second, abort_first, abort_second, mixed_retry_first, mixed_retry_second, memo_serial, memo_parallel, memo_unused, parallel_capacity, parallel_capacity_cancel, planning_terminal, planning_retry, collection_multi, collection_contention, legacy_cleanup_terminal, legacy_cleanup_terminal_empty, legacy_cleanup_terminal_current };
+const ChunkVectorBatchTest = enum { carry, items, bytes, revision, legacy, legacy_bytes, terminal, metadata_retry, metadata_tail_retry, relational_retry, legacy_budget, legacy_boundary_terminal, legacy_metadata_retry, legacy_metadata_terminal, parallel, parallel_bytes, legacy_preparation_retry, legacy_preparation_retry_cached, mixed_publication_pending, parallel_oversize, parallel_terminal, parallel_retry, collection_pressure, collection_too_large, parallel_cancel, cancel_first, cancel_second, cancel_global, source_first, source_second, abort_first, abort_second, mixed_retry_first, mixed_retry_second, memo_serial, memo_parallel, memo_unused, parallel_capacity, parallel_capacity_cancel, planning_terminal, planning_retry, collection_multi, collection_contention, legacy_cleanup_terminal, legacy_cleanup_terminal_empty, legacy_cleanup_terminal_current, transport_pressure };
 
 fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !void {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
@@ -46450,6 +46460,69 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
 
     try std.testing.expectError(error.ArtifactPublicationPending, processChunkText(runtime, chunk_request, &cache, &window, null));
     try harness.apply(&db, 4);
+    if (batching == .transport_pressure) {
+        const slice: resource_manager_mod.Slice = .relational_preparation_working_set;
+        const limit = 64 * 1024;
+        var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc, .memory_budget = .{ .hard_limit_bytes = limit } });
+        defer manager.deinit(alloc);
+        var failing = std.testing.FailingAllocator.init(alloc, .{});
+        var budget = runtime.media_window_capture.budget(&manager, failing.allocator());
+        defer budget.deinit();
+        const shared_alloc = budget.allocator();
+        const provider: embedder_mod.DenseEmbedder = .{ .ptr = &harness, .dense_embed_fn = Harness.embedDense, .dense_embed_batch_with_context_fn = Harness.embedDenseBatch, .cache_revision_fn = Harness.revision, .capabilities_fn = Harness.caps, .dense_embed_batch_planned_fn = Harness.planned };
+        const generation = try captureDenseGeneration(runtime, provider, alloc, "model", null);
+        const member = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc", "chunks", 0);
+        defer alloc.free(member);
+        const before = harness.publications;
+        for ([_]enum { admission, backing, recovered }{ .admission, .backing, .recovered }) |attempt| {
+            var scope: FailureScope = .{};
+            var batch: OrderedDenseTextBatch = .{ .scope = &scope, .alloc = shared_alloc, .generation = generation };
+            defer batch.deinit();
+            try batch.items.ensureUnusedCapacity(shared_alloc, 1);
+            var input = blk: {
+                var read = try runtime.store.beginRead();
+                defer read.abort();
+                break :blk (try @import("../artifact_chunk_vector_publication.zig").capture(shared_alloc, &read, vector_request, plan.plan(), member)).?;
+            };
+            var owned = true;
+            defer if (owned) input.deinit();
+            input.old_window_outputs = &.{};
+            input.token.execution_bound = true;
+            input.token.execution_identity = generation.revision;
+            // Prewarm the token so the command's mutation descriptor fits
+            // when the encoder itself has to request more host credit.
+            const warm = try input.token.command(&.{.{ .family = .derived_vector, .key = input.output_key, .value = null, .source_index = 0 }});
+            input.token.arena.allocator().free(warm.mutations);
+            batch.items.appendAssumeCapacity(.{ .request = vector_request, .input = input, .text = "hello world", .artifact_key = input.output_key, .source_hash = 0 });
+            owned = false;
+            _ = budget.releaseUnusedCredit();
+
+            const denial_before = budget.denialGeneration();
+            switch (attempt) {
+                .admission => {
+                    var competing = try manager.reserve(slice, limit - manager.sliceStats(slice).used_bytes);
+                    defer competing.release();
+                    try std.testing.expectError(error.ResourceBudgetExceeded, batch.flush(runtime, provider, &.{"vector"}));
+                    try std.testing.expect(budget.denialGeneration() != denial_before);
+                    try std.testing.expectEqual(EnrichmentErrorDisposition.retryable_request, enrichmentErrorDisposition(error.ResourceBudgetExceeded));
+                    try std.testing.expect(scope.publication_failed);
+                    try std.testing.expectEqual(before, harness.publications);
+                },
+                .backing => {
+                    // A previous denial must not mask genuine allocator failure.
+                    failing.fail_index = failing.alloc_index;
+                    defer failing.fail_index = std.math.maxInt(usize);
+                    try std.testing.expectError(error.OutOfMemory, batch.flush(runtime, provider, &.{"vector"}));
+                    try std.testing.expectEqual(denial_before, budget.denialGeneration());
+                    try std.testing.expectEqual(before, harness.publications);
+                },
+                .recovered => try batch.flush(runtime, provider, &.{"vector"}),
+            }
+        }
+        try std.testing.expectEqual(before + 1, harness.publications);
+        try harness.apply(&db, 5);
+        return;
+    }
     if (batching != .carry) {
         const count = 65;
         var requests: [count]enrichment_types.GeneratedEnrichmentRequest = undefined;
