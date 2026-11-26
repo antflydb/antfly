@@ -633,3 +633,86 @@ test "Inkling Metal attention weights drive local and global visits across commi
         }
     }
 }
+
+test "Inkling Metal grouped decoder projections match separate released weights" {
+    if (!@import("build_options").enable_metal or !metal.metalDeviceAvailable()) return error.SkipZigTest;
+    const dir = @import("antfly_platform").env.getenv("ANTFLY_INKLING2_METAL_MODEL_DIR") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var source = try checkpoint.Checkpoint.open(a, dir);
+    defer source.deinit();
+    var provider = try @import("../backends/metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const text = source.config.value.text_config;
+
+    const rows = 5;
+    const columns: usize = text.hidden_size;
+    const input_values = try a.alloc(u16, rows * columns);
+    defer a.free(input_values);
+    var input: [3]Tensor = undefined;
+    var initialized: usize = 0;
+    defer for (input[0..initialized]) |*tensor| tensor.deinit();
+    for (&input, 0..) |*tensor, stream| {
+        for (input_values, 0..) |*value, i| {
+            const x = @as(f32, @floatFromInt((i * 19 + stream * 7) % 31)) / 16.0 - 1.0;
+            value.* = @truncate(@as(u32, @bitCast(x)) >> 16);
+        }
+        tensor.* = try upload(a, runtime, std.mem.sliceAsBytes(input_values));
+        initialized += 1;
+    }
+
+    for ([_]bool{ true, false }) |local| {
+        const index = for (0..checkpoint.layer_count) |i| {
+            if ((try layout.isLocal(text, i)) == local) break i;
+        } else return error.InvalidInkling2Layer;
+        var layer = try Layer.load(a, runtime, &source, index);
+        defer layer.deinit();
+
+        const plan = try RequestWorkspace.Plan.init(text, rows, rows, rows);
+        var grouped = try RequestWorkspace.init(a, runtime, plan, null, null);
+        defer grouped.deinit();
+        var separate = try RequestWorkspace.init(a, runtime, plan, null, null);
+        defer separate.deinit();
+        const packed_outputs = grouped.bind(local).projected;
+        var separate_outputs = separate.bind(local).projected;
+        separate_outputs.packed_projection = null;
+        separate_outputs.packed_kv = null;
+        const inputs: Layer.Inputs = .{
+            .query = &input[0],
+            .key = if (local) &input[0] else &input[1],
+            .value = if (local) &input[0] else &input[2],
+        };
+        try metal.beginFrame(runtime);
+        errdefer metal.cancelFrame(runtime) catch {};
+        try layer.projectInputs(runtime, text, rows, inputs, separate_outputs);
+        try layer.projectInputs(runtime, text, rows, inputs, packed_outputs);
+        try metal.submitFrame(runtime);
+        try metal.waitFrame(runtime);
+
+        const planes = [_][]const u8{ "query", "relative", "gate", "sink", "key", "value", "key_taps", "value_taps" };
+        inline for (planes) |name| {
+            const Pair = struct { expected: *Tensor, actual: *Tensor };
+            const pair: ?Pair = if (comptime @TypeOf(@field(separate_outputs, name)) == ?*Tensor)
+                if (@field(separate_outputs, name)) |expected| .{ .expected = expected, .actual = @field(packed_outputs, name).? } else null
+            else
+                .{ .expected = @field(separate_outputs, name), .actual = @field(packed_outputs, name) };
+            if (pair) |view| {
+                const expected = try a.alloc(u8, view.expected.deviceByteLen());
+                defer a.free(expected);
+                const actual = try a.alloc(u8, view.actual.deviceByteLen());
+                defer a.free(actual);
+                try view.expected.downloadBytesInto(expected);
+                try view.actual.downloadBytesInto(actual);
+                try std.testing.expectEqualSlices(u8, expected, actual);
+            }
+        }
+        if (!local) {
+            const key_taps = layer.get(.k_dynamic) orelse return error.MissingWeight;
+            const raw = try source.layerTensor(index, layout.tensorName(.k_dynamic, false));
+            const actual = try a.alloc(u8, raw.len);
+            defer a.free(actual);
+            try key_taps.downloadBytesInto(actual);
+            try std.testing.expectEqualSlices(u8, raw, actual);
+        }
+    }
+}
