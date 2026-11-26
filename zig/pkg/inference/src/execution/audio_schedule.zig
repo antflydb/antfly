@@ -505,6 +505,23 @@ pub const Plan = struct {
         return .{ .outputs_bytes = outputs, .input_workspace_bytes = scratch, .total_bytes = try std.math.add(usize, outputs, scratch) };
     }
 
+    /// Weight operands supplied by prepared slots do not need tensor bindings.
+    /// A constant used elsewhere in the tape remains a required input.
+    pub fn resolveRequiredConstants(self: *Plan) void {
+        var required: std.StaticBitSet(capacity) = .empty;
+        for (self.nodes[0..self.count]) |node| {
+            const prepared_weight: ?u16 = if (node.prepared_slot != null) switch (node.args) {
+                .linearNoBias => |a| a.weight,
+                .clippedLinear => |a| a.weight,
+                else => null,
+            } else null;
+            for (node.inputs[0..node.input_count]) |id|
+                if (prepared_weight != id) required.set(id);
+        }
+        for (self.constants[0..self.constant_count]) |*constant|
+            constant.required = required.isSet(constant.id);
+    }
+
     pub fn replay(self: *Plan, cb: *const ops.ComputeBackend, inputs: []const CT, cleanup: @import("cleanup_context.zig").Context) !CT {
         var values: [capacity]?CT = @splat(null);
         var owned: [capacity]bool = @splat(false);
@@ -1071,6 +1088,21 @@ test "Metal audio frame groups bound two live groups and avoid overflow" {
         if (plan.in_flight == 2) try std.testing.expect(rows * (1024 * 12 + 4096 * 4) * 4 * plan.layers * 2 <= 384 * 1024 * 1024);
     }
     try std.testing.expectEqual(AudioFramePlan{}, audioFramePlan(std.math.maxInt(usize), 1024, 4096));
+}
+
+test "audio schedule keeps constants shared by prepared and ordinary operands" {
+    var nodes = [_]Node{
+        .{ .prepared_slot = 1, .inputs = @splat(0), .input_count = 2, .args = .{ .linearNoBias = .{ .input = 0, .weight = 1, .rows = 1, .in_dim = 1, .out_dim = 1 } } },
+        .{ .inputs = @splat(0), .input_count = 2, .args = .{ .linearNoBias = .{ .input = 0, .weight = 1, .rows = 1, .in_dim = 1, .out_dim = 1 } } },
+    };
+    for (&nodes) |*node| node.inputs[1] = 1;
+    var constants = [_]Constant{.{ .id = 1, .model = false, .name = undefined, .len = 0 }};
+    var plan: Plan = .{ .nodes = &nodes, .count = nodes.len, .constants = &constants, .constant_count = constants.len };
+    plan.resolveRequiredConstants();
+    try std.testing.expect(constants[0].required);
+    nodes[1].prepared_slot = 2;
+    plan.resolveRequiredConstants();
+    try std.testing.expect(!constants[0].required);
 }
 
 test "audio schedule keys track geometry and aliasing across different input owners" {

@@ -23866,17 +23866,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 else => {},
             }
         }
-        for (plan.constants[0..plan.constant_count]) |*c| {
-            c.required = false;
-            for (plan.nodes[0..plan.count]) |node| for (node.inputs[0..node.input_count]) |id| if (id == c.id) {
-                const is_prepared_weight = node.prepared_slot != null and switch (node.args) {
-                    .linearNoBias => |a| a.weight == id,
-                    .clippedLinear => |a| a.weight == id,
-                    else => false,
-                };
-                if (!is_prepared_weight) c.required = true;
-            };
-        }
+        plan.resolveRequiredConstants();
         var offsets: [512]usize = @splat(0);
         var counts: [512]usize = @splat(0);
         var total: usize = 0;
