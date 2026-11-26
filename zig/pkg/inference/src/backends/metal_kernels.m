@@ -73333,6 +73333,11 @@ int termite_metal_buffer_download(
             ? termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned)
             : termite_metal_new_command_buffer(runtime->queue, __func__);
         if (command_buffer == nil) return -5;
+        // An unretained frame can outlive this call if a prior submission
+        // fails to retire. Keep both blit endpoints with the frame.
+        if (!frame_owned && !command_buffer.retainedReferences &&
+            (termite_metal_decode_runtime_retain_frame_resource(runtime, src) != 0 ||
+             termite_metal_decode_runtime_retain_frame_resource(runtime, staging) != 0)) return -4;
         id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder_for_runtime(runtime, command_buffer);
         if (blit == nil) return -6;
         if ([blit respondsToSelector:@selector(setLabel:)]) {
