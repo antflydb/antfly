@@ -333,7 +333,14 @@ pub const Cache = struct {
             allocator.destroy(parameters);
         };
     }
-    fn acquire(self: *Cache, allocator: std.mem.Allocator, provider: Provider, forward: capture.Forward, inputs: []const capture.Input, control: ?Control) !*Entry {
+    fn acquire(self: *Cache, allocator: std.mem.Allocator, provider: Provider, requested: capture.Forward, inputs: []const capture.Input, control: ?Control) !*Entry {
+        var forward = requested;
+        if (provider.compiled_context) |context| {
+            // Retain the portable graph for XLA to fuse. The default graph
+            // pass can introduce backend operations outside its lowering ABI.
+            if (context.requested_backend == .pjrt and forward.optimization == .general)
+                forward.optimization = .provider_fusion;
+        }
         // Precision belongs to the program specialization, not model/provider
         // identity: F32 task heads can follow a BF16 encoder on one client.
         if (provider.compiled_context) |context| if (context.requested_backend == .pjrt and context.pjrt_precision != forward.precision) return error.ModelProgramPrecisionMismatch;
