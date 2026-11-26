@@ -159,6 +159,10 @@ pub const Token = struct {
         return self.observeGuard(true, key, raw, position);
     }
 
+    pub fn observePreconditionDigest(self: *Token, key: []const u8, digest: ?publication.Digest, position: ?publication.Position) !void {
+        try self.observeDigest(true, key, digest, position, try self.sourceIndex(self.source.document_key));
+    }
+
     fn observeGuard(self: *Token, precondition: bool, key: []const u8, raw: ?[]const u8, position: ?publication.Position) !void {
         var digest: ?publication.Digest = null;
         if (raw) |value| {
