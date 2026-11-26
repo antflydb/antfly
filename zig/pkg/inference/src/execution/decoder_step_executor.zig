@@ -1261,9 +1261,10 @@ pub const Executor = struct {
         // them in one bounded producer frame. The qualified shared-frame path
         // lends that frame to the model and closes it after the F32 head.
         try cb.decoderRuntimeWaitSubmittedFrame();
-        var input_frame_active = if (cuda_packed) false else try cb.decoderRuntimeBeginFrame();
-        if (!cuda_packed and !input_frame_active) return error.ResidentImageOperationUnavailable;
-        defer if (input_frame_active) cb.decoderRuntimeCancelFrame() catch {};
+        const Submission = @import("submission.zig").Scope;
+        var input_frame = if (cuda_packed) null else try Submission.begin(cb);
+        defer if (input_frame) |*frame| frame.deinit();
+        if (input_frame) |frame| if (!frame.owns) return error.ResidentImageOperationUnavailable;
         try cb.decoderRuntimeSetActiveFrameRegime(.prefill);
         const combined = (try cb.allocUninitF32Shape(&.{ @intCast(total), @intCast(cfg.hidden_size) })) orelse return error.UnsupportedTensorType;
         var consumed = false;
@@ -1292,9 +1293,9 @@ pub const Executor = struct {
                 input_index += count;
             }
         }
-        if (input_frame_active and !shared_frame) {
-            try cb.decoderRuntimeSubmitAndWaitFrame();
-            input_frame_active = false;
+        if (!shared_frame) {
+            if (input_frame) |*frame| try frame.finish();
+            input_frame = null;
         }
         consumed = true;
         const hidden = try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(cb, a, cfg, combined, .{}, 1, total, &owned.context, null);
@@ -1315,17 +1316,17 @@ pub const Executor = struct {
         defer cb.free(head);
         // Decode regime preserves the established F32 head inputs. The shared
         // path transfers ownership instead of opening a separate head frame.
-        var head_frame_active = false;
-        defer if (head_frame_active) cb.decoderRuntimeCancelFrame() catch {};
+        var head_frame: ?Submission = null;
+        defer if (head_frame) |*frame| frame.deinit();
         if (gpu_choices and !cuda_packed) {
             if (shared_frame) {
                 // Transfer the producer/model frame's sole cancellation owner.
                 // The head still uses F32 inputs under the decode regime.
-                head_frame_active = true;
-                input_frame_active = false;
+                head_frame = input_frame;
+                input_frame = null;
             } else {
-                head_frame_active = try cb.decoderRuntimeBeginFrame();
-                if (!head_frame_active) return error.ResidentImageOperationUnavailable;
+                head_frame = try Submission.begin(cb);
+                if (!head_frame.?.owns) return error.ResidentImageOperationUnavailable;
             }
             try cb.decoderRuntimeSetActiveFrameRegime(.decode);
         }
@@ -1350,7 +1351,8 @@ pub const Executor = struct {
             if (gpu_choices) {
                 try @import("../ops/metal_compute.zig").MetalCompute.ensureFrameArgmaxScope(cb);
                 tokens = try cb.decoderRuntimeArgmaxRowsSuppress(logits, 0, claimed.len, cfg.vocab_size, cfg.suppressTokenIds(), a) orelse return error.ResidentImageOperationUnavailable;
-                head_frame_active = false;
+                if (cb.decoderRuntimeHasActiveFrame()) return error.ResidentImageOperationUnavailable;
+                head_frame = null;
                 if (tokens.?.len != claimed.len) return error.InvalidBatchDecodeState;
             }
         }
