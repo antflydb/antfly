@@ -194,6 +194,8 @@ pub const Snapshot = struct {
     graph: usize,
     pending_graph: usize,
     plan: usize,
+    storage_layout: ?StorageLayout,
+    admitted_arena_layout: ?plan_mod.Layout,
     arena_layout: ?plan_mod.Layout,
     metadata_quota: quota_mod.Quota,
     arena_quota: quota_mod.Quota,
@@ -404,7 +406,22 @@ pub const Module = struct {
             self.arenaLayout() catch null
         else
             null;
-        return .{ .invalidations = self.invalidations, .epoch = self.epoch_id, .phase = self.phase, .metadata = self.metadata.ptr, .arena = self.arena.ptr, .head = self.head.ptr, .graph = if (self.graph) |value| @intFromPtr(value) else 0, .pending_graph = if (self.pending_graph) |value| @intFromPtr(value) else 0, .plan = if (self.plan) |value| @intFromPtr(value) else 0, .arena_layout = missing_arena_layout, .metadata_quota = self.metadata_quota, .arena_quota = self.arena_quota };
+        return .{
+            .invalidations = self.invalidations,
+            .epoch = self.epoch_id,
+            .phase = self.phase,
+            .metadata = self.metadata.ptr,
+            .arena = self.arena.ptr,
+            .head = self.head.ptr,
+            .graph = if (self.graph) |value| @intFromPtr(value) else 0,
+            .pending_graph = if (self.pending_graph) |value| @intFromPtr(value) else 0,
+            .plan = if (self.plan) |value| @intFromPtr(value) else 0,
+            .storage_layout = self.storage_layout,
+            .admitted_arena_layout = self.admitted_arena_layout,
+            .arena_layout = missing_arena_layout,
+            .metadata_quota = self.metadata_quota,
+            .arena_quota = self.arena_quota,
+        };
     }
     pub fn invalidate(self: *Module, ctx: *context.CudaContext) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -919,6 +936,9 @@ test "CUDA bounded decoder binds zero scratch without reserving a device arena" 
     try std.testing.expect(owner.admitted_arena_layout == null);
     phase.old = owner.snapshot();
     try owner.reserveArenaPrepared(&ctx, &phase);
+    const admitted = owner.snapshot();
+    try std.testing.expectEqualDeep(phase.old.arena_layout, admitted.admitted_arena_layout);
+    try std.testing.expect(admitted.arena_layout == null);
     try owner.reserveArenaPrepared(&ctx, &phase);
     try std.testing.expectEqual(@as(usize, 0), owner.arena.len);
     try std.testing.expect(owner.arena_quota == .none);
