@@ -48,11 +48,15 @@ comptime {
     if (max_allocations - 1 > std.math.maxInt(u15)) @compileError("stream workspace event slot overflow");
 }
 pub const Origin = enum { observed, declared };
+const no_slot = std.math.maxInt(u16);
 
 pub const Plan = struct {
     origin: Origin = .observed,
     allocations: [max_allocations]Allocation = undefined,
     events: [max_allocations * 2]Event = undefined,
+    // Active slots are linked in offset order. Sealed dispatch uses only events.
+    next_live: [max_allocations]u16 = undefined,
+    first_live: u16 = no_slot,
     count: usize = 0,
     event_count: usize = 0,
     peak: usize = 0,
@@ -81,38 +85,58 @@ pub const Plan = struct {
         }
         const extent = std.mem.alignForward(usize, bytes, alignment);
         var offset: usize = 0;
-        while (true) {
-            var next = offset;
-            for (self.allocations[0..self.count]) |a| {
-                if (a.live_id == 0) continue;
-                if (a.live_id == live_id) {
-                    self.valid = false;
-                    return;
-                }
-                const end = a.offset + std.mem.alignForward(usize, a.bytes, alignment);
-                if (offset < end and a.offset < offset + extent) next = @max(next, end);
+        var link = &self.first_live;
+        var insertion: ?*u16 = null;
+        while (link.* != no_slot) {
+            const slot = link.*;
+            const allocation = self.allocations[slot];
+            if (allocation.live_id == live_id) {
+                self.valid = false;
+                return;
             }
-            if (next == offset) break;
-            offset = next;
+            if (insertion == null) {
+                if (offset + extent <= allocation.offset) {
+                    insertion = link;
+                } else {
+                    offset = allocation.offset + std.mem.alignForward(usize, allocation.bytes, alignment);
+                }
+            }
+            link = &self.next_live[slot];
         }
         if (offset > limit - extent) {
             self.valid = false;
             return;
         }
         self.allocations[self.count] = .{ .bytes = @intCast(bytes), .offset = @intCast(offset), .live_id = live_id };
+        const insert_at = insertion orelse link;
+        self.next_live[self.count] = insert_at.*;
+        insert_at.* = @intCast(self.count);
         self.event(self.count, true);
         self.count += 1;
         self.peak = @max(self.peak, offset + extent);
     }
     pub fn release(self: *Plan, pointer: DevicePointer) void {
         if (!self.valid or self.sealed or pointer == 0) return;
-        for (self.allocations[0..self.count], 0..) |a, i| if (a.live_id == pointer) {
-            self.releaseSlot(i);
-            return;
-        };
+        var link = &self.first_live;
+        while (link.* != no_slot) : (link = &self.next_live[link.*]) {
+            if (self.allocations[link.*].live_id == pointer) {
+                self.unlinkLive(link);
+                return;
+            }
+        }
     }
 
     fn releaseSlot(self: *Plan, slot: usize) void {
+        var link = &self.first_live;
+        while (link.* != slot) : (link = &self.next_live[link.*]) {
+            std.debug.assert(link.* != no_slot);
+        }
+        self.unlinkLive(link);
+    }
+
+    fn unlinkLive(self: *Plan, link: *u16) void {
+        const slot = link.*;
+        link.* = self.next_live[slot];
         self.allocations[slot].live_id = 0;
         self.event(slot, false);
     }
@@ -172,6 +196,7 @@ pub const Plan = struct {
             if (self.output == index) continue;
             self.scratch_peak = @max(self.scratch_peak, allocation.offset + std.mem.alignForward(usize, allocation.bytes, alignment));
         };
+        self.first_live = no_slot;
         self.sealed = self.valid;
         if (self.sealed) self.recipe = self.hashEvents(0);
         return self.valid;
@@ -552,4 +577,21 @@ test "declared stream workspace can publish into its only backing" {
     try std.testing.expectEqual(@as(DevicePointer, 0x1000), try scope.allocate(64));
     try std.testing.expect(scope.complete());
     try std.testing.expect(scope.owns(0x1000));
+}
+
+test "stream workspace chooses the earliest gap among out-of-order slots" {
+    var plan: Plan = .{};
+    try plan.declare(&.{
+        .{ .allocate = 512 },
+        .{ .allocate = 256 },
+        .{ .release = 0 },
+        .{ .allocate = 256 },
+        .{ .allocate = 256 },
+        .{ .release = 1 },
+        .{ .release = 3 },
+        .{ .release = 2 },
+    }, null);
+    try std.testing.expectEqual(@as(usize, 768), plan.peak);
+    try std.testing.expectEqual(@as(u32, 0), plan.allocations[2].offset);
+    try std.testing.expectEqual(@as(u32, 256), plan.allocations[3].offset);
 }
