@@ -505,6 +505,7 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     }
     const inference_unit = ctx.step("test-inference-unit", "Run inference unit tests with optional filters, without independent library suites");
     inference_unit.dependOn(&run_tests.step);
+    ctx.step("test-inference-focused", "Run the inference test executable with -Dtest-filter, without standalone executor suites").dependOn(&run_tests.step);
     inference_unit.dependOn(&run_microbatch_tests.step);
     inference_unit.dependOn(&run_lifecycle_tests.step);
     inference_unit.dependOn(&run_batch_tests.step);
