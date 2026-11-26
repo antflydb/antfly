@@ -54,7 +54,7 @@ threadlocal var on_open_stack: bool = false;
 /// A thread with `runtime_open_stack_size` that runs one runtime open at a
 /// time for its owner, so a writer's refresh does not create a thread per
 /// reopen. Started on first use and stopped when the owner goes.
-const OpenWorker = struct {
+pub const OpenWorker = struct {
     thread: ?std.Thread = null,
     /// Held by one submitter from posting a job until it completes.
     submit: std.Io.Mutex = .init,
@@ -117,7 +117,7 @@ fn OpenResult(comptime Func: type) type {
 /// stack opens inline. The helper acts for the caller's lane checkout
 /// (`open_delegate_for`). If no thread can be started, the open fails with
 /// the spawn error rather than running on a stack it may overflow.
-fn callOnOpenStack(worker: ?*OpenWorker, comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) OpenResult(@TypeOf(func)) {
+pub fn callOnOpenStack(worker: ?*OpenWorker, comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) OpenResult(@TypeOf(func)) {
     if (comptime h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return @call(.auto, func, args);
     if (on_open_stack) return @call(.auto, func, args);
     const Result = @typeInfo(@TypeOf(func)).@"fn".return_type.?;

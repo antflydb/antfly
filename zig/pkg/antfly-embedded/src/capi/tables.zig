@@ -53,7 +53,11 @@ fn openTable(handle: *h.Handle, name: []const u8, id: u64) !*Table {
     // start a temporary providerless runtime against a persisted replay tail.
     if (handle.embedded_native_providers) options.enrichment = null;
     if (handle.owned_lite_backend) |*backend| try backend.configureDbOpenOptionsForNamespace(&options, namespace);
-    table.* = .{ .name = owned_name, .id = id, .namespace = namespace, .db = try h.db_mod.DB.open(alloc, path, options) };
+    // Any C API caller's thread can open a table; its stack is not ours.
+    // Opens are rare (tables stay open), so each gets its own thread rather
+    // than queueing behind the owner's runtime opens.
+    const opened = try @import("lite_connection.zig").callOnOpenStack(null, h.db_mod.DB.open, .{ alloc, path, options });
+    table.* = .{ .name = owned_name, .id = id, .namespace = namespace, .db = opened };
     table.db.local_execution.row_policy_table_name = table.name;
     errdefer {
         table.db.close();
