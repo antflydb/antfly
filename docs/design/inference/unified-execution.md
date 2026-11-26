@@ -1045,7 +1045,12 @@ The previous Metal path walked host page spans and encoded copies or packing
 for each span. Physical tests verified a reversed page mapping across the
 append boundary, untouched BF16 rows outside the suffix, matching packed
 attention output, and the complete synthetic decoder visit schedule.
-The dispatch reduction has no measured released-checkpoint latency yet.
+At `d8758959ca`, the single-row Metal attention path also consumed
+one contiguous projection slab. Physical counters measured one dispatch
+for the six base projections with shared input and three with separate
+KV inputs. Both produced bitwise-identical BF16 outputs to the independent
+projections. The production HTTP semantic check passed. Released-checkpoint
+latency for these dispatch changes remains open.
 
 On the M4 Max, the combined cohort at `f2e941c98c` passed 32 of 33 selected
 tests. The released-checkpoint test was deferred while the full-window
