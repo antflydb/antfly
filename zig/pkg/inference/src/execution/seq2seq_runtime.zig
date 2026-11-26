@@ -401,8 +401,7 @@ pub const State = struct {
         bound: usize,
         dimensions: [4]i32,
         permit: sessions.RunPermit,
-        output: ?sessions.ResidentOutputs = null,
-        publication_pin: ?sessions.Session.ModelLifetime.ResourcePin = null,
+        target: union(enum) { empty, unpromoted: sessions.ResidentOutputs, ready: ResidentSlot } = .empty,
         rejected: bool = false,
     };
 
@@ -420,8 +419,11 @@ pub const State = struct {
         std.debug.assert(reservations.items.len == 0);
         defer {
             for (reservations.items) |*item| {
-                if (item.publication_pin) |pin| pin.release();
-                if (item.output) |*output| output.deinit();
+                switch (item.target) {
+                    .empty => {},
+                    .unpromoted => |*output| output.deinit(),
+                    .ready => |target| target.pin.release(),
+                }
                 item.permit.deinit();
             }
             reservations.clearRetainingCapacity();
@@ -459,7 +461,7 @@ pub const State = struct {
 
         var staged = false;
         for (reservations.items) |*item| {
-            item.output = self.prepareCacheCopy(backend, kernels, item) catch |err| switch (err) {
+            const output = self.prepareCacheCopy(backend, kernels, item) catch |err| switch (err) {
                 // This optional copy has submitted no commands. Keep the
                 // published cache under its existing residency charge.
                 error.ResourceLimitExceeded,
@@ -471,10 +473,17 @@ pub const State = struct {
                 => null,
                 else => return err,
             };
-            if (item.output) |*output| {
-                // Reserve publication ownership before enqueueing any copies.
-                // The staged owner and pin both survive backend completion.
-                item.publication_pin = try output.retainResources(self.allocator);
+            if (output) |owner| {
+                item.target = .{ .unpromoted = owner };
+                const pending = &item.target.unpromoted;
+                const target: ResidentSlot = .{
+                    .pin = try pending.retainResources(self.allocator),
+                    .input = .{ .value = pending.outputs[0], .backend = backend, .estimated_bytes = item.source.input.estimated_bytes },
+                    .shape = item.source.shape,
+                    .independent = true,
+                };
+                pending.deinit();
+                item.target = .{ .ready = target };
                 staged = true;
             }
         }
@@ -494,8 +503,9 @@ pub const State = struct {
                 event.wait() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
             };
             for (reservations.items) |*item| {
-                const output = item.output orelse continue;
-                copy(backend.ptr, output.outputs[0], item.source.input.value) catch |err| switch (err) {
+                if (item.target != .ready) continue;
+                const target = item.target.ready;
+                copy(backend.ptr, target.input.value, item.source.input.value) catch |err| switch (err) {
                     error.InvalidPhysicalTransferSize, error.InvalidShape => item.rejected = true,
                     else => return err,
                 };
@@ -508,15 +518,10 @@ pub const State = struct {
         if (control) |active| try active.check();
         for (reservations.items) |*item| {
             if (item.rejected) continue;
-            if (item.publication_pin) |pin| {
-                item.publication_pin = null;
+            if (item.target == .ready) {
                 if (updated[item.index]) |prior| prior.pin.release();
-                updated[item.index] = .{
-                    .pin = pin,
-                    .input = .{ .value = item.output.?.outputs[0], .backend = backend, .estimated_bytes = item.source.input.estimated_bytes },
-                    .shape = item.source.shape,
-                    .independent = true,
-                };
+                updated[item.index] = item.target.ready;
+                item.target = .empty;
             }
         }
     }
