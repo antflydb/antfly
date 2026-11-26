@@ -107,21 +107,23 @@ fn resolveDonorGeometry(model: *const gpt_mod.Config, donors: anytype, layer_don
     var count: usize = 0;
     for (0..model.num_hidden_layers) |layer| {
         const geometry = try model.kvDonorGeometry(layer);
-        if (model.isKvDonorLayer(layer)) {
+        if (geometry.donor_layer == layer) {
             donors[count] = .{
                 .layer = @intCast(layer),
-                .window = if (model.layerUsesSlidingAttention(layer)) model.sliding_window else 0,
+                .window = if (geometry.sliding) model.sliding_window else 0,
                 .heads = geometry.num_kv_heads,
                 .dim = geometry.head_dim,
             };
+            layer_donors[layer] = @intCast(count);
             count += 1;
+        } else {
+            // Earlier entries are initialized in layer order. A borrower
+            // must name a physical donor directly, without an alias chain.
+            if (geometry.donor_layer >= layer) return error.UnsupportedKvSnapshotLayout;
+            const donor_index = layer_donors[geometry.donor_layer];
+            if (donors[donor_index].layer != geometry.donor_layer) return error.UnsupportedKvSnapshotLayout;
+            layer_donors[layer] = donor_index;
         }
-        for (donors[0..count], 0..) |donor, index| {
-            if (donor.layer == geometry.donor_layer) {
-                layer_donors[layer] = @intCast(index);
-                break;
-            }
-        } else return error.UnsupportedKvSnapshotLayout;
     }
     return count;
 }
@@ -1404,6 +1406,10 @@ test "checkpoint donor geometry agrees across export and restore for shared Gemm
         global += @intFromBool(exported.window == 0);
     }
     try std.testing.expectEqual(@as(usize, 4), global);
+    // The final local and global layers both borrow from the final group
+    // of physical donors, preserving local/global geometry across aliases.
+    try std.testing.expectEqual(@as(u32, 22), export_donors[export_mapping[40]].layer);
+    try std.testing.expectEqual(@as(u32, 23), export_donors[export_mapping[41]].layer);
     try std.testing.expectError(error.UnsupportedKvSnapshotLayout, resolveDonorGeometry(&config, export_donors[0..23], &export_mapping));
 }
 
