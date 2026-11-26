@@ -32865,8 +32865,8 @@ fn publishMediaWindowVectors(runtime: *EnrichmentRuntime, a: Allocator, request:
     if (count == 0) return false;
     const computation = mediaEmbeddingComputationRequest(runtime, request);
     const member_set = count > 1 or child_receipt or terminal;
-    input.media_window_layout = count > 1 or child_receipt;
     if (member_set and !try fusedMediaVectorReceiptsMatch(scratch, a, provider, computation, revision, receipts)) return false;
+    input.media_window_layout = count > 1 or child_receipt;
     if (scalarWindowRetirementPending(input)) return error.ArtifactPublicationPending;
 
     try ensureMediaWindowOutputs(runtime, a, input);
@@ -51888,7 +51888,13 @@ test "model aware media ordered vector windows are searchable with exact clocks 
             var independent = vector_request;
             independent.embedding_name = "independent";
             independent.producer_json = "{\"provider\":\"antfly\",\"model\":\"independent\"}";
+            const active_floor = input.effect_protocol;
+            input.effect_protocol = 18;
+            input.old_window_outputs = &.{};
             try std.testing.expect(!try publishMediaWindowVectors(runtime, a, independent, provider, @as([32]u8, @splat(marker)), &input, failed_payload, &cache));
+            try std.testing.expect(!scalarWindowRetirementPending(&input));
+            input.effect_protocol = active_floor;
+            input.old_window_outputs = null;
             try std.testing.expect(!try publishMediaWindowVectors(runtime, a, vector_request, provider, @as([32]u8, @splat(0x22)), &input, failed_payload, &cache));
             try std.testing.expectEqual(calls, harness.calls);
         }
@@ -51928,6 +51934,40 @@ test "model aware media ordered vector windows are searchable with exact clocks 
             defer if (remaining) |value| runtime.alloc.free(value);
             try std.testing.expect(remaining == null);
             try std.testing.expectEqual(calls + 2, harness.calls);
+
+            // A scalar-only proposal has no physical preflight scan. An
+            // insertion into its previously empty set must invalidate the
+            // captured scalar revision without changing its stored bytes.
+            var formerly_empty = blk: {
+                var read = try runtime.store.beginRead();
+                defer read.abort();
+                var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+                defer plan.release();
+                break :blk (try @import("../artifact_chunk_vector_publication.zig").capture(a, &read, vector_request, plan.plan(), member)).?;
+            };
+            defer formerly_empty.deinit();
+            try ensureMediaWindowOutputs(runtime, a, &formerly_empty);
+            try std.testing.expectEqual(@as(usize, 0), formerly_empty.old_window_outputs.?.len);
+            formerly_empty.token.execution_identity = @splat(0x33);
+            formerly_empty.token.execution_bound = true;
+            harness.stale_vector = false;
+            harness.phantom_key = phantom;
+            try std.testing.expectError(error.ArtifactPublicationPending, enqueueScalarChunkVector(runtime, &formerly_empty, vector, true));
+            try std.testing.expect(harness.stale_vector);
+            var final = blk: {
+                var read = try runtime.store.beginRead();
+                defer read.abort();
+                var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+                defer plan.release();
+                break :blk (try @import("../artifact_chunk_vector_publication.zig").capture(a, &read, vector_request, plan.plan(), member)).?;
+            };
+            defer final.deinit();
+            final.token.execution_identity = @splat(0x33);
+            final.token.execution_bound = true;
+            try std.testing.expectError(error.ArtifactPublicationPending, enqueueScalarChunkVector(runtime, &final, vector, true));
+            const retired = try storeGetOptionalAllocWithRetry(runtime, phantom);
+            defer if (retired) |value| runtime.alloc.free(value);
+            try std.testing.expect(retired == null);
         } else if (round != 0) {
             input.token.execution_identity = @splat(marker);
             try std.testing.expect(try publishMediaWindowVectors(runtime, a, vector_request, provider, @as([32]u8, @splat(marker)), &input, input.value.?, &cache));

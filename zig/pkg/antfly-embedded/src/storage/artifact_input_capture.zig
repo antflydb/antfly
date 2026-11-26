@@ -46,6 +46,7 @@ pub const Capture = struct {
     artifacts: std.StringHashMapUnmanaged(void) = .empty,
     artifact_owners: std.StringHashMapUnmanaged(void) = .empty,
     raft_marker: ?[16]u8 = null,
+    window_set_fenced: ?bool = null,
     native_position: ?u64 = null,
     replay_sequence: ?u64 = null,
     replay_next: ?u64 = null,
@@ -205,6 +206,11 @@ pub const Capture = struct {
                 for (sentinels) |sentinel| try self.rememberArtifact(alloc, sentinel);
             }
             try self.rememberArtifact(alloc, key);
+            if (try keys.mediaWindowVectorParentAlloc(alloc, key)) |parent| {
+                defer alloc.free(parent);
+                if (self.window_set_fenced == null) self.window_set_fenced = try @import("db/artifact_catalog_activation.zig").windowSetFenced(alloc, txn, self.selected.?);
+                if (self.window_set_fenced.?) try self.rememberArtifact(alloc, parent);
+            }
             return;
         }
         if (self.selected == null) return;

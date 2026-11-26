@@ -1678,7 +1678,7 @@ pub const DocStore = struct {
                 return try wrapPayloadCursor(self.alloc, physical, self.payload_session, self.row_heap_active, row_heap.Reader.from(backend_erased.Batch, self.runtime.?));
             }
 
-            pub fn openPhysicalCursorAdapter(self: @This()) !backend_erased.Cursor {
+            fn openPhysicalCursorAdapter(self: @This()) !backend_erased.Cursor {
                 return self.runtime.?.openCursor();
             }
 
