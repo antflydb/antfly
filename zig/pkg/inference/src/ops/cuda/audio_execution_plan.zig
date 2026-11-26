@@ -37,18 +37,25 @@ pub const Owner = struct {
     retiring: bool = false,
     node: retirement.Node = undefined,
 
-    pub const Executable = struct { key: u64, storage: arena.Layout };
+    pub const Executable = struct {
+        key: u64,
+        storage: arena.Layout,
+        output_bytes: usize,
+    };
 
-    pub fn seal(self: *Owner, output: u64, key: u64, input_bytes: usize) bool {
-        if (!self.plan.finish(output)) return false;
+    pub fn seal(self: *Owner, output: u64, key: u64, input_bytes: usize, output_bytes: usize) bool {
+        if (output_bytes == 0 or !self.plan.finish(output)) return false;
         const storage = self.plan.layoutWithExternalOutput(input_bytes) catch self.plan.layout(input_bytes) catch return false;
-        self.executable = .{ .key = self.plan.fingerprint(key), .storage = storage };
+        const publication = storage.output orelse return false;
+        if (output_bytes > publication.bytes) return false;
+        self.executable = .{ .key = self.plan.fingerprint(key), .storage = storage, .output_bytes = output_bytes };
         return true;
     }
 
-    pub fn executableFor(self: *const Owner, input_bytes: usize) ?Executable {
+    pub fn executableFor(self: *const Owner, input_bytes: usize, output_bytes: usize) ?Executable {
         const executable = self.executable orelse return null;
-        return if (executable.storage.scratch_offset == input_bytes) executable else null;
+        if (executable.storage.scratch_offset != input_bytes or executable.output_bytes != output_bytes) return null;
+        return executable;
     }
 
     pub fn create(a: std.mem.Allocator) !*Owner {
@@ -155,6 +162,14 @@ test "CUDA audio plan retirement keeps custody when cleanup authority is missing
     try entry.retireOwner(.{ .outside_execution = true });
     try std.testing.expectEqual(@as(?*Owner, null), entry.owner);
     try std.testing.expect(entry.warmed);
+}
+
+test "CUDA audio rejects a terminal allocation smaller than the logical output" {
+    const owner = try Owner.create(std.testing.allocator);
+    defer owner.destroyUnusedOutsideExecution();
+    owner.plan.allocate(256, 0x1000);
+    try std.testing.expect(!owner.seal(0x1000, 42, arena.alignment, 257));
+    try std.testing.expect(owner.executableFor(arena.alignment, 257) == null);
 }
 
 test "embeddinggemma2 CUDA audio lifetime plan reuses dead regions and rejects allocation drift" {
