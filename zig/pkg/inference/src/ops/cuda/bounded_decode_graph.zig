@@ -32,24 +32,57 @@ pub const max_rows = 128;
 /// Pure geometry is available to cold admission before any SDK teardown or
 /// allocation. It contains no page/key/weight pointer and grants no byte credit.
 pub const StorageLayout = struct {
-    bank_offset: usize,
-    positions_offset: usize,
-    progress_offset: usize,
+    input: Span,
+    tokens: Span,
+    positions: Span,
+    counter: Span,
     metadata_bytes: usize,
     host_bytes: usize,
     head_bytes: usize,
+
+    const Span = struct {
+        offset: usize,
+        bytes: usize,
+
+        fn bind(self: Span, backing: buffer.DeviceBuffer) buffer.DeviceBuffer {
+            std.debug.assert(self.offset <= backing.len and self.bytes <= backing.len - self.offset);
+            return .{ .ptr = backing.ptr + self.offset, .len = self.bytes, .borrowed = true };
+        }
+    };
+
+    pub fn readback(self: StorageLayout, backing: buffer.DeviceBuffer) buffer.DeviceBuffer {
+        return (Span{ .offset = self.tokens.offset, .bytes = self.counter.offset + self.counter.bytes - self.tokens.offset }).bind(backing);
+    }
+
+    pub fn readbackPositionIndex(self: StorageLayout) usize {
+        return (self.positions.offset - self.tokens.offset) / @sizeOf(u32);
+    }
+
+    pub fn readbackProgressIndex(self: StorageLayout) usize {
+        return (self.counter.offset - self.tokens.offset) / @sizeOf(u32);
+    }
 
     pub fn init(rows: usize, hidden: usize, vocab: usize, key_words: usize) !StorageLayout {
         if (rows < 2 or rows > max_rows or hidden == 0 or vocab == 0 or key_words == 0) return error.InvalidShape;
         const input_bytes = try std.math.mul(usize, try std.math.mul(usize, rows, hidden), @sizeOf(f32));
         const bank_offset = try aligned(input_bytes);
-        const positions_offset = try std.math.add(usize, bank_offset, try aligned(rows * 2 * @sizeOf(u32)));
-        const progress_offset = try aligned(try std.math.add(usize, positions_offset, rows * 3 * @sizeOf(u32)));
+        const token_bytes = rows * 2 * @sizeOf(u32);
+        const position_bytes = rows * 3 * @sizeOf(u32);
+        const positions_offset = try std.math.add(usize, bank_offset, try aligned(token_bytes));
+        const progress_offset = try aligned(try std.math.add(usize, positions_offset, position_bytes));
         const metadata_bytes = try std.math.add(usize, progress_offset, 256);
         const host_bytes = try std.math.add(usize, @sizeOf(plan_mod.Plan), try std.math.mul(usize, key_words, @sizeOf(u64)));
         const head_bytes = if (rows > 64) try std.math.mul(usize, try std.math.mul(usize, rows, vocab), @sizeOf(f32)) else 0;
         if (head_bytes > plan_mod.limit) return error.InvalidShape;
-        return .{ .bank_offset = bank_offset, .positions_offset = positions_offset, .progress_offset = progress_offset, .metadata_bytes = metadata_bytes, .host_bytes = host_bytes, .head_bytes = head_bytes };
+        return .{
+            .input = .{ .offset = 0, .bytes = input_bytes },
+            .tokens = .{ .offset = bank_offset, .bytes = token_bytes },
+            .positions = .{ .offset = positions_offset, .bytes = position_bytes },
+            .counter = .{ .offset = progress_offset, .bytes = @sizeOf(u32) },
+            .metadata_bytes = metadata_bytes,
+            .host_bytes = host_bytes,
+            .head_bytes = head_bytes,
+        };
     }
     fn aligned(bytes: usize) !usize {
         return (try std.math.add(usize, bytes, 255)) & ~@as(usize, 255);
@@ -287,9 +320,7 @@ pub const Module = struct {
     recurrent_layers: usize = 0,
     expected_attention_calls: usize = 0,
     expected_ragged_packets: usize = 0,
-    bank_offset: usize = 0,
-    positions_offset: usize = 0,
-    progress_offset: usize = 0,
+    storage_layout: ?StorageLayout = null,
     base_positions: [3 * max_rows]u32 = @splat(0),
     next_positions: [3 * max_rows]u32 = @splat(0),
     progress: u32 = 0,
@@ -340,6 +371,7 @@ pub const Module = struct {
         try self.arena_quota.releaseAfterSdkDeath(current);
         try self.metadata_quota.releaseAfterSdkDeath(current);
         self.captured_roots_identity = 0;
+        self.storage_layout = null;
         self.rows = 0;
         self.hidden = 0;
         self.vocab = 0;
@@ -370,9 +402,7 @@ pub const Module = struct {
         self.rows = rows;
         self.hidden = hidden;
         self.vocab = vocab;
-        self.bank_offset = layout.bank_offset;
-        self.positions_offset = layout.positions_offset;
-        self.progress_offset = layout.progress_offset;
+        self.storage_layout = layout;
         @memcpy(self.base_positions[0..positions_.len], positions_);
         @memcpy(self.next_positions[0..positions_.len], positions_);
         self.phase = .warm;
@@ -448,16 +478,16 @@ pub const Module = struct {
     }
 
     pub fn input(self: *const Module) buffer.DeviceBuffer {
-        return .{ .ptr = self.metadata.ptr, .len = self.rows * self.hidden * 4, .borrowed = true };
+        return self.storage_layout.?.input.bind(self.metadata);
     }
     pub fn bank(self: *const Module) buffer.DeviceBuffer {
-        return .{ .ptr = self.metadata.ptr + self.bank_offset, .len = self.rows * 2 * 4, .borrowed = true };
+        return self.storage_layout.?.tokens.bind(self.metadata);
     }
     pub fn positions(self: *const Module) buffer.DeviceBuffer {
-        return .{ .ptr = self.metadata.ptr + self.positions_offset, .len = self.rows * 3 * 4, .borrowed = true };
+        return self.storage_layout.?.positions.bind(self.metadata);
     }
     pub fn counter(self: *const Module) buffer.DeviceBuffer {
-        return .{ .ptr = self.metadata.ptr + self.progress_offset, .len = 4, .borrowed = true };
+        return self.storage_layout.?.counter.bind(self.metadata);
     }
     pub fn notePair(self: *Module) !void {
         const next = try std.math.add(u32, self.progress, 2);
@@ -475,11 +505,18 @@ test "captured sequence storage layout preserves existing narrow wide and aligne
     };
     for (cases) |value| {
         const actual = try StorageLayout.init(value.rows, value.hidden, value.vocab, 24576);
-        try std.testing.expectEqual(value.bank, actual.bank_offset);
-        try std.testing.expectEqual(value.positions, actual.positions_offset);
-        try std.testing.expectEqual(value.progress, actual.progress_offset);
+        try std.testing.expectEqual(value.bank, actual.tokens.offset);
+        try std.testing.expectEqual(value.positions, actual.positions.offset);
+        try std.testing.expectEqual(value.progress, actual.counter.offset);
         try std.testing.expectEqual(value.bytes, actual.metadata_bytes);
         try std.testing.expectEqual(value.head, actual.head_bytes);
+        const backing: buffer.DeviceBuffer = .{ .ptr = 0x10000, .len = value.bytes };
+        try std.testing.expectEqual(@as(u64, 0x10000 + value.bank), actual.tokens.bind(backing).ptr);
+        try std.testing.expectEqual(value.rows * 2 * @sizeOf(u32), actual.tokens.bytes);
+        try std.testing.expectEqual(value.rows * 3 * @sizeOf(u32), actual.positions.bytes);
+        try std.testing.expectEqual(value.progress + @sizeOf(u32) - value.bank, actual.readback(backing).len);
+        try std.testing.expectEqual((value.positions - value.bank) / @sizeOf(u32), actual.readbackPositionIndex());
+        try std.testing.expectEqual((value.progress - value.bank) / @sizeOf(u32), actual.readbackProgressIndex());
         try std.testing.expectEqual(@sizeOf(plan_mod.Plan) + 196608, actual.host_bytes);
     }
     try std.testing.expectError(error.InvalidShape, StorageLayout.init(1, 1024, 8, 1));

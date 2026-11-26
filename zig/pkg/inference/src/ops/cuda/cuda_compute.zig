@@ -3825,13 +3825,13 @@ pub const CudaCompute = struct {
             const owner = &self.compute.bounded_decode_graph;
             if (tokens.len != 2 * owner.rows) return error.InvalidShape;
             var host: [768]u32 = undefined;
-            const bytes = owner.progress_offset + 4 - owner.bank_offset;
-            const source = buffer_mod.DeviceBuffer{ .ptr = owner.bank().ptr, .len = bytes, .borrowed = true };
-            try copyToHostTrackedAndSync(self.compute, source, std.mem.sliceAsBytes(host[0 .. bytes / 4]));
+            const layout = owner.storage_layout orelse return error.InvalidExecutionPlan;
+            const source = layout.readback(owner.metadata);
+            try copyToHostTrackedAndSync(self.compute, source, std.mem.sliceAsBytes(host[0 .. source.len / @sizeOf(u32)]));
             burst_value.drained = true;
             const expected = try std.math.add(u32, owner.progress, 2);
-            if (host[(owner.progress_offset - owner.bank_offset) / 4] != expected) return error.InvalidExecutionPlan;
-            const position_offset = (owner.positions_offset - owner.bank_offset) / 4;
+            if (host[layout.readbackProgressIndex()] != expected) return error.InvalidExecutionPlan;
+            const position_offset = layout.readbackPositionIndex();
             for (owner.next_positions[0 .. owner.rows * 3], 0..) |position, i|
                 if (host[position_offset + i] != try std.math.add(u32, position, 2)) return error.InvalidExecutionPlan;
             @memcpy(tokens, host[0..tokens.len]);
