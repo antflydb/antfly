@@ -48,8 +48,16 @@ pub fn residentDraftSupported(kind: ops.BackendKind) bool {
     return kind == .cuda or kind == .metal;
 }
 
-pub fn draftEmbeddingCacheCapacity() usize {
-    return @import("antfly_platform").env.getenvUsize("ANTFLY_GEMMA4_MTP_DRAFT_EMBED_CACHE") orelse 256;
+fn deferredTargetActivationRow(cached_first: bool, logit_base_row: usize, accepted: usize) ?usize {
+    if (cached_first) return if (accepted >= 2) accepted - 2 else null;
+    return if (accepted != 0) logit_base_row + accepted - 1 else null;
+}
+
+test "Gemma4 MTP deferred target activation maps cached verify rows" {
+    try std.testing.expectEqual(@as(?usize, null), deferredTargetActivationRow(true, 0, 1));
+    try std.testing.expectEqual(@as(?usize, 0), deferredTargetActivationRow(true, 0, 2));
+    try std.testing.expectEqual(@as(?usize, 2), deferredTargetActivationRow(true, 0, 4));
+    try std.testing.expectEqual(@as(?usize, 3), deferredTargetActivationRow(false, 1, 3));
 }
 
 pub const State = struct {
@@ -159,6 +167,21 @@ pub const State = struct {
                 self.next_host = self.host_steps[index] orelse return error.MissingGemma4MtpActivation;
                 self.host_steps[index] = null;
             }
+        }
+
+        pub const DeferredTarget = struct {
+            cached_first: bool,
+            logit_base_row: usize,
+            accepted: usize,
+            source: decoder_forward.HiddenSource,
+            resident: bool,
+            sync: bool,
+        };
+
+        pub fn captureDeferredTarget(self: *@This(), value: decoder_forward.DeviceHiddenRows, request: DeferredTarget) !void {
+            const row = deferredTargetActivationRow(request.cached_first, request.logit_base_row, request.accepted) orelse return error.InvalidTensorShape;
+            if (row >= value.rows) return error.InvalidTensorShape;
+            try self.captureDevice(value, row, request.source, request.resident, request.sync);
         }
 
         pub fn captureDevice(self: *@This(), value: decoder_forward.DeviceHiddenRows, row: usize, source: decoder_forward.HiddenSource, resident: bool, sync: bool) !void {
@@ -398,7 +421,12 @@ pub const State = struct {
 
     /// The returned tensor is borrowed from this owner. Cache storage uses the
     /// draft backend; source model scaling and layout remain canonical.
-    pub fn cachedTargetEmbedding(self: *State, target_runtime: decoder_forward.Runtime, draft_model: *const gpt_mod.Config, token_id: i64, limit: usize) !?ops.CT {
+    pub fn cachedTargetEmbedding(self: *State, target_runtime: decoder_forward.Runtime, draft_model: *const gpt_mod.Config, token_id: i64) !?ops.CT {
+        const limit = @import("antfly_platform").env.getenvUsize("ANTFLY_GEMMA4_MTP_DRAFT_EMBED_CACHE") orelse 256;
+        return self.cachedTargetEmbeddingWithLimit(target_runtime, draft_model, token_id, limit);
+    }
+
+    fn cachedTargetEmbeddingWithLimit(self: *State, target_runtime: decoder_forward.Runtime, draft_model: *const gpt_mod.Config, token_id: i64, limit: usize) !?ops.CT {
         self.cache_event = .{};
         if (limit == 0) {
             self.cache_event.status = .disabled;
@@ -478,13 +506,27 @@ fn checkActualActivationOwner(draft_value: ComputeBackend, reference_value: Comp
     try std.testing.expect(!try state.replaceFromPrefillHidden(target, hidden, 2, .pre_norm, false, draft));
     try std.testing.expectEqualSlices(f32, &.{ -2, 4, 6, 8 }, state.host.?);
 
-    try std.testing.expect((try state.cachedTargetEmbedding(target, &draft_config, 1, 0)) == null);
+    {
+        var round = state.beginRound(target, target, true);
+        defer round.deinit();
+        const input = decoder_forward.DeviceHiddenRows{ .backend = target_cb, .hidden = hidden, .pre_norm_hidden = null, .rows = 2 };
+        var request = State.Round.DeferredTarget{ .cached_first = true, .logit_base_row = 0, .accepted = 1, .source = .final, .resident = false, .sync = false };
+        try std.testing.expectError(error.InvalidTensorShape, round.captureDeferredTarget(input, request));
+        request.accepted = 4;
+        try std.testing.expectError(error.InvalidTensorShape, round.captureDeferredTarget(input, request));
+        try std.testing.expect(round.next_host == null and round.next_device == null);
+        request.accepted = 3;
+        try round.captureDeferredTarget(input, request);
+        try std.testing.expectEqualSlices(f32, &.{ -2, 4, 6, 8 }, round.next_host.?);
+    }
+
+    try std.testing.expect((try state.cachedTargetEmbeddingWithLimit(target, &draft_config, 1, 0)) == null);
     try std.testing.expectEqual(.disabled, state.cache_event.status);
-    const copied = try state.cachedTargetEmbedding(target, &draft_config, 1, 2);
+    const copied = try state.cachedTargetEmbeddingWithLimit(target, &draft_config, 1, 2);
     if (draft.kind() == .metal) try std.testing.expect(copied != null);
     if (copied) |tensor| {
         try std.testing.expectEqual(.inserted, state.cache_event.status);
-        const hit = try state.cachedTargetEmbedding(target, &draft_config, 1, 2);
+        const hit = try state.cachedTargetEmbeddingWithLimit(target, &draft_config, 1, 2);
         try std.testing.expectEqual(.hit, state.cache_event.status);
         try std.testing.expectEqual(tensor, hit.?);
         const source_weight = try gpt_arch.getEmbeddingWeight(reference_cb, config);

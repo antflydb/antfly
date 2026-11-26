@@ -1989,11 +1989,6 @@ fn shouldEnterSpeculativeDecodeLoop(callback_allows_generation: bool, first_is_e
     return callback_allows_generation and !first_is_eos and !grammar_complete;
 }
 
-fn gemma4MtpDeferredTargetActivationRow(cached_first: bool, logit_base_row: usize, accepted: usize) ?usize {
-    if (cached_first) return if (accepted >= 2) accepted - 2 else null;
-    return if (accepted != 0) logit_base_row + accepted - 1 else null;
-}
-
 pub fn gemma4MtpMetalAutoEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_ENABLE_METAL_AUTO", false);
 }
@@ -6337,7 +6332,7 @@ pub const NativeGenerationPipeline = struct {
                 },
             };
         };
-        return activation.cachedTargetEmbedding(self.physicalDecoder(), &draft_pipeline.gpt_config, token_id, speculative_activation.draftEmbeddingCacheCapacity());
+        return activation.cachedTargetEmbedding(self.physicalDecoder(), &draft_pipeline.gpt_config, token_id);
     }
 
     fn forwardAllLogitsAndHiddenHost(
@@ -7081,14 +7076,15 @@ pub const NativeGenerationPipeline = struct {
                 {
                     // Option C: the verify already produced the target hidden
                     // that scored the pending token, so reuse it directly.
-                    const row = gemma4MtpDeferredTargetActivationRow(
-                        cached_first_target_choice != null,
-                        logit_base_row,
-                        verify_result.accepted,
-                    ) orelse return error.InvalidTensorShape;
-                    if (row >= target_hidden.rows) return error.InvalidTensorShape;
                     const activation_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
-                    try draft_round.captureDevice(target_hidden.hiddenRows(), row, hidden_source, use_resident_draft, mtp_profile.sync_enabled);
+                    try draft_round.captureDeferredTarget(target_hidden.hiddenRows(), .{
+                        .cached_first = cached_first_target_choice != null,
+                        .logit_base_row = logit_base_row,
+                        .accepted = verify_result.accepted,
+                        .source = hidden_source,
+                        .resident = use_resident_draft,
+                        .sync = mtp_profile.sync_enabled,
+                    });
                     if (mtp_profile.enabled) {
                         mtp_profile.activation_copies += 1;
                         mtp_profile.accepted_hidden_reuse_rows += 1;
@@ -12045,13 +12041,6 @@ test "Gemma4 MTP cached first choice covers single draft" {
     try std.testing.expectEqual(false, gemma4MtpCachedFirstChoiceAllowed(1, false));
     try std.testing.expectEqual(true, gemma4MtpCachedFirstChoiceAllowed(1, true));
     try std.testing.expectEqual(true, gemma4MtpCachedFirstChoiceAllowed(2, true));
-}
-
-test "Gemma4 MTP deferred target activation maps cached verify rows" {
-    try std.testing.expectEqual(@as(?usize, null), gemma4MtpDeferredTargetActivationRow(true, 0, 1));
-    try std.testing.expectEqual(@as(?usize, 0), gemma4MtpDeferredTargetActivationRow(true, 0, 2));
-    try std.testing.expectEqual(@as(?usize, 2), gemma4MtpDeferredTargetActivationRow(true, 0, 4));
-    try std.testing.expectEqual(@as(?usize, 3), gemma4MtpDeferredTargetActivationRow(false, 1, 3));
 }
 
 test "Gemma4 Metal direct greedy is default" {
