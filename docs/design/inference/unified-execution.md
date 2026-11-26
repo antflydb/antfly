@@ -1052,6 +1052,16 @@ KV inputs. Both produced bitwise-identical BF16 outputs to the independent
 projections. The production HTTP semantic check passed. Released-checkpoint
 latency for these dispatch changes remains open.
 
+The later Metal decoder groups its prefill projections in one launch for
+a shared input and three for separate K and V inputs. The focused cohort
+at `00a9b69a12` passed 11 of 12 checks, with the full released decoder
+deferred. The vision encoder now dispatches one Q/K/V projection per
+layer and takes its intermediate views from a single arena. At
+`3ca1ebbb1a`, the grouped encoder produced bitwise-identical projected
+image rows to separate projections on the released checkpoint. The
+workspace receipt at `86ec14fea1` checks that planned prefill storage
+matches the physical binding, including a final partial batch.
+
 On the M4 Max, the combined cohort at `f2e941c98c` passed 32 of 33 selected
 tests. The released-checkpoint test was deferred while the full-window
 request ran. At `ab3b1e1693`, 20 of 21 retirement and preparation checks
@@ -1252,6 +1262,16 @@ qualified omitted cross-cache columns. Exact and omitted cache shape
 validation also passed on both hosts. These checks exercise the resident
 provider path and the batching contract. The declared host route remains
 available for provider pairs without resident handoff support.
+
+At `86ec14fea1`, six focused checks passed with zero skips on Spark GB10.
+They covered imported ONNX cache handoff, retirement of an actual captured
+KV lease outside its physical frame, BF16 projection replay against
+frozen schedules, and source-audio learning, capture, and replay with
+cuDNN. The same run checked publication of prefill geometry and CUDA
+audio workspace provenance. The ONNX graph target and all 94 Wasm
+compute tests passed locally, and the browser wasm32 build succeeded.
+Released-model performance and replacement of the learned audio layout
+remain open.
 
 At `3e6bcf05c5`, both physical GPU fixtures passed the incremental
 ONNX cache handoff and output-retirement regression. The shared role
