@@ -194,6 +194,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "ordered materialized chunk embeddings keep the receipt barrier under transport pressure",
         "ordered standalone sparse chunks keep the receipt barrier under transport pressure",
         "ordered artifact inventory chunk vector callback publishes and retires without reinference after acceptance",
+        "ordered artifact inventory accepted asset callback waits for graph publication including absence",
+        "ordered artifact inventory deferred asset callback completes graph without reinference",
         "model aware media ordered generation publishes beyond 4095 chunks and resumes private pages after reopen",
         "#1210",
         "relational prepared writes validate orphan vector receipts",

@@ -395,6 +395,7 @@ const DataRaftBatchRoute = struct {
     /// Local structural commands must not be forwarded into a successor term.
     required_local_term: ?u64 = null,
     allow_remote_forward: bool = true,
+    fail_on_remote_leader: bool = false,
     /// Borrowed only by local publication jobs. Once Raft assigns an index,
     /// even an unknown synchronous outcome must retain that position.
     local_proposal: ?*artifact_publication_dispatch.Receipt.Observation = null,
@@ -7269,6 +7270,8 @@ pub const DataServer = struct {
         const self = job.server;
         if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
         if (self.hotStandbyWriteGate()) |gate| try gate.check();
+        if (self.group_leadership_source) |leadership|
+            if (!leadership.isLocalLeader(job.proposal.group_id)) return error.NotLeader;
         const publication = @import("antfly_local_sources").storage_db_artifact_publication;
         const codec = @import("antfly_local_sources").storage_db_artifact_publication_transport_codec;
         const transport = @import("antfly_local_sources").storage_db_artifact_publication_transport;
@@ -7333,6 +7336,7 @@ pub const DataServer = struct {
         }
         const local_route: DataRaftBatchRoute = .{
             .allow_remote_forward = false,
+            .fail_on_remote_leader = true,
             .campaign_allowed = false,
             .discovery = .cached,
             .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown),
@@ -13745,6 +13749,8 @@ pub const DataServer = struct {
                     local_status_missing = status == null;
                     local_status_is_voter = localRaftStatusIsVoter(status, local_node_id);
                     leader_node_id = if (status) |raft_status| raft_status.soft.leader_id else null;
+                    if (route.fail_on_remote_leader and leader_node_id != null and leader_node_id.? != local_node_id)
+                        return error.NotLeader;
                     if (leader_node_id == null and local_status_is_voter) {
                         // Ownership is monotonic for this request even if a
                         // later reconciliation removes or temporarily hides
@@ -49740,6 +49746,17 @@ fn implementationTests() type {
             try std.testing.expectError(error.InvalidBatchRequest, DataServer.enqueueArtifactPublication(&server, 17, recovery.namespace, hint[0..99]));
             const completed = lane.pending.?;
             lane.pending = null;
+            // The queued job belonged to the former leader. It must release
+            // its slot without reaching catalog resolution or leader wait.
+            const Leadership = struct {
+                fn owns(_: *anyopaque, group_id: u64) bool {
+                    std.debug.assert(group_id == 17);
+                    return false;
+                }
+            };
+            server.group_leadership_source = .{ .ptr = &lane, .vtable = &.{ .is_local_leader = Leadership.owns } };
+            try std.testing.expectError(error.NotLeader, completed.run(completed.ptr));
+            server.group_leadership_source = null;
             completed.deinit(completed.ptr);
             try std.testing.expect(receipt.abandoned());
             var producers: [6]*artifact_publication_dispatch.Queue.Job = undefined;
