@@ -1771,8 +1771,8 @@ pub const StepOutput = union(enum) {
     /// the device from the logits row, so only sixteen floats come back.
     stats: StatsRequest,
     /// Like `stats`, but the step is only encoded: the frame stays open
-    /// for `decoderStepSubmit`, the device chooses the token itself, and
-    /// `decoderStepAwait` collects the statistics.
+    /// for caller submission, the device chooses the token itself, and
+    /// the caller collects the statistics.
     pipelined: PipelinedRequest,
 };
 
@@ -1793,7 +1793,7 @@ pub const StepResult = union(enum) {
     logits: []f32,
     none,
     stats: ops.WhisperLogitsStatsRaw,
-    /// The step is encoded in the open frame, waiting for `decoderStepSubmit`.
+    /// The step is encoded in the open frame, waiting for caller submission.
     encoded,
 };
 
@@ -1818,21 +1818,6 @@ pub fn setPipelinedDecode(cb: *const ComputeBackend, cache: *const DecodeCache, 
     if (cb.kind() != .metal or !whisperMetalFramesEnabled() or !whisperPipelinedDecodeEnabled()) return false;
     if (!cache.preallocated() or whisperMetalProfileEnabled()) return false;
     return cb.decoderRuntimeSetWhisperPipelinedFrames(true);
-}
-
-/// Submit the frame a `.pipelined` step left open. The backend keeps one
-/// submitted frame, so the previous step must have been awaited.
-pub fn decoderStepSubmit(cb: *const ComputeBackend) !void {
-    try cb.decoderRuntimeSubmitFrame();
-}
-
-/// Wait for the step submitted by `decoderStepSubmit` and read the
-/// statistics it left in `slot`. Null when nothing could be read.
-pub fn decoderStepAwait(cb: *const ComputeBackend, slot: usize) !?ops.WhisperLogitsStatsRaw {
-    try cb.decoderRuntimeWaitSubmittedFrame();
-    var stats: ops.WhisperLogitsStatsRaw = undefined;
-    if (!cb.whisperLogitsStatsRead(slot, &stats)) return null;
-    return stats;
 }
 
 /// Decode `tokens` at positions `[cache.positions, cache.positions + len)`.

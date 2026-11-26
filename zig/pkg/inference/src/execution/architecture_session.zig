@@ -5287,6 +5287,7 @@ pub const WhisperNativeDecoder = struct {
     diagnostics_binding: ?incremental_observation.Binding = null,
     pending_observation: @import("pending_observation.zig").Span = .{},
     encoded_position_pending: bool = false,
+    submitted_step: bool = false,
     fn ensurePendingObservation(self: *WhisperNativeDecoder) void {
         if (self.pending_observation.source != null) return;
         const binding = self.diagnostics_binding orelse return;
@@ -5356,7 +5357,13 @@ pub const WhisperNativeDecoder = struct {
     /// Submit the step the last `.pipelined` call encoded.
     pub fn submit(self: *WhisperNativeDecoder) !void {
         self.ensurePendingObservation();
-        try self.pending_observation.call(&self.cb.backend, .submit, .unavailable, whisper_arch.decoderStepSubmit, .{&self.cb.backend});
+        try self.pending_observation.call(&self.cb.backend, .submit, .unavailable, submitStep, .{self});
+    }
+
+    fn submitStep(self: *WhisperNativeDecoder) !void {
+        var pending: @import("submission.zig").Pending = .{ .backend = &self.cb.backend, .active = self.submitted_step };
+        defer self.submitted_step = pending.active;
+        try pending.submitBorrowed();
         if (self.encoded_position_pending) {
             self.cache.positions += 1;
             self.encoded_position_pending = false;
@@ -5373,7 +5380,16 @@ pub const WhisperNativeDecoder = struct {
     /// Collect the statistics of the step in flight from `slot`.
     pub fn awaitStats(self: *WhisperNativeDecoder, slot: usize) !?ops.WhisperLogitsStatsRaw {
         self.ensurePendingObservation();
-        return self.pending_observation.call(&self.cb.backend, .await_readback, .readback_returned, whisper_arch.decoderStepAwait, .{ &self.cb.backend, slot });
+        return self.pending_observation.call(&self.cb.backend, .await_readback, .readback_returned, awaitStep, .{ self, slot });
+    }
+
+    fn awaitStep(self: *WhisperNativeDecoder, slot: usize) !?ops.WhisperLogitsStatsRaw {
+        if (!self.submitted_step) return null;
+        var pending: @import("submission.zig").Pending = .{ .backend = &self.cb.backend, .active = true };
+        defer self.submitted_step = pending.active;
+        try pending.wait();
+        var stats: ops.WhisperLogitsStatsRaw = undefined;
+        return if (self.cb.backend.whisperLogitsStatsRead(slot, &stats)) stats else null;
     }
 
     /// Wait for any step still in flight and drop any step still encoded;
@@ -5388,6 +5404,7 @@ pub const WhisperNativeDecoder = struct {
         // Preserve process fail-closed policy instead of unlocking/replaying.
         self.pending_observation.call(&self.cb.backend, .drain, .unavailable, retirePending, .{&self.cb.backend}) catch platform.inference_process_supervisor.restartWorker();
         self.encoded_position_pending = false;
+        self.submitted_step = false;
     }
 
     pub fn positions(self: *const WhisperNativeDecoder) usize {
@@ -12242,6 +12259,7 @@ const WhisperPendingObservationFixture = struct {
             self.submits += 1;
             if (self.fail_submit) return error.WhisperSubmitFailure;
             self.submitted = true;
+            self.active = false;
         }
         fn wait(raw: *anyopaque) !void {
             const self = get(raw);
@@ -12249,6 +12267,9 @@ const WhisperPendingObservationFixture = struct {
             self.waits += 1;
             if (self.fail_wait) return error.WhisperAwaitFailure;
             self.submitted = false;
+        }
+        fn submittedFrame(raw: *anyopaque) bool {
+            return get(raw).submitted;
         }
         fn activeFrame(raw: *anyopaque) bool {
             return get(raw).active;
@@ -12277,7 +12298,7 @@ test "Whisper pending owner observes submit await cancel failures and disabled p
     const F = WhisperPendingObservationFixture;
     for (0..5) |mode| {
         const enabled = mode != 0;
-        var probe = F.Probe{ .observed = enabled, .fail_submit = mode == 2, .fail_wait = mode == 3, .fail_cancel = mode == 4 };
+        var probe = F.Probe{ .observed = enabled, .active = true, .fail_submit = mode == 2, .fail_wait = mode == 3, .fail_cancel = mode == 4 };
         var lifetime = Session.ModelLifetime{ .owner = &probe, .destroy_fn = F.Probe.destroy };
         var original_model = true;
         defer if (original_model) lifetime.release();
@@ -12290,6 +12311,7 @@ test "Whisper pending owner observes submit await cancel failures and disabled p
         table.regions.commands.submitFrame = F.Probe.submit;
         table.regions.commands.waitSubmittedFrame = F.Probe.wait;
         table.regions.commands.hasActiveFrame = F.Probe.activeFrame;
+        table.regions.commands.hasSubmittedFrame = F.Probe.submittedFrame;
         table.regions.commands.cancelFrame = F.Probe.cancel;
         table.regions.token_selection.readLogitsStats = F.Probe.stats;
         const backend = ops.ComputeBackend{ .ptr = &probe, .vtable = &table };
