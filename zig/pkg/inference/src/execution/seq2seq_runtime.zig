@@ -136,6 +136,7 @@ pub const State = struct {
     roles: []InputRole,
     resident_slots: ?[]?ResidentSlot = null,
     stage_inputs: []sessions.StageInput = &.{},
+    cache_copy_reservations: std.ArrayList(CacheCopyReservation) = .empty,
     logits_index: usize,
     /// Encoder buffers and mask are pinned by the enclosing generation request.
     encoder: sessions.StageInput,
@@ -204,6 +205,7 @@ pub const State = struct {
     }
 
     pub fn deinit(self: *State) void {
+        self.cache_copy_reservations.deinit(self.allocator);
         if (self.resident_slots) |slots| {
             for (slots) |slot| if (slot) |owned| owned.pin.release();
             self.allocator.free(slots);
@@ -414,14 +416,15 @@ pub const State = struct {
         if (kernels.physicalTensorView == null) return;
         if (backend.kind() != .native and backend.kind() != .metal and kernels.createPhysicalCompletion == null) return;
 
-        var reservations: std.ArrayList(CacheCopyReservation) = .empty;
+        const reservations = &self.cache_copy_reservations;
+        std.debug.assert(reservations.items.len == 0);
         defer {
             for (reservations.items) |*item| {
                 if (item.publication_pin) |pin| pin.release();
                 if (item.output) |*output| output.deinit();
                 item.permit.deinit();
             }
-            reservations.deinit(self.allocator);
+            reservations.clearRetainingCapacity();
         }
         for (self.roles, previous, updated, 0..) |role, old, slot, index| switch (role) {
             .past => |past| {
@@ -891,6 +894,8 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
                 try checkPooledSelfAdoption(state, owned, &controller, expected_cache);
                 const bound = try @import("../ops/physical_storage.zig").reservationBytes(owned.input.backend.*, .{ .byte_size = owned.input.estimated_bytes });
                 var copy_state = state.*;
+                copy_state.cache_copy_reservations = .empty;
+                defer copy_state.cache_copy_reservations.deinit(a);
                 var cross_roles: [2]InputRole = @splat(.{ .past = .{ .output_index = 0, .empty_shape = undefined, .cross = true } });
                 copy_state.roles = &cross_roles;
                 const original_limits = copy_state.session.run_admission.?.limits;
