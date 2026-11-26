@@ -946,7 +946,10 @@ pub fn inputRevisionKey(namespace: Namespace, document: []const u8) [input_prefi
 }
 
 pub fn inputRevision(txn: anytype, namespace: Namespace, document: []const u8) !?Position {
-    const key = inputRevisionKey(namespace, document);
+    return inputRevisionAt(txn, namespace, inputRevisionKey(namespace, document));
+}
+
+pub fn inputRevisionAt(txn: anytype, namespace: Namespace, key: @TypeOf(inputRevisionKey(@splat(0), ""))) !?Position {
     const raw = txn.get(&key) catch |err| switch (err) {
         error.NotFound => return null,
         else => return err,
@@ -962,7 +965,10 @@ fn positionBytes(position: ?Position) [Position.encoded_len]u8 {
 
 /// One slot per namespace/producer incarnation/document, not one slot per
 /// attempt. Retrying a lost response does not grow an unbounded receipt log.
-pub fn receiptKey(command: Command, source: Source) [receipt_prefix.len + 32]u8 {
+pub const ReceiptKey = [receipt_prefix.len + 32]u8;
+pub const RejectionKey = [receipt_prefix.len + 33]u8;
+
+pub fn receiptKey(command: Command, source: Source) ReceiptKey {
     var hash = std.crypto.hash.Blake3.init(.{});
     hash.update("antfly-artifact-publication-receipt-v1\x00");
     hash.update(&command.namespace);
@@ -979,7 +985,7 @@ pub fn receiptKey(command: Command, source: Source) [receipt_prefix.len + 32]u8 
     return result;
 }
 
-fn rejectionKey(command: Command) [receipt_prefix.len + 33]u8 {
+pub fn rejectionKey(command: Command) RejectionKey {
     const source: Source = if (command.sources.len != 0) command.sources[0] else .{
         .document_key = "",
         .content_digest = @splat(0),
@@ -1006,7 +1012,11 @@ pub fn stageRejection(txn: anytype, command: Command, index: u64, reason: Reject
 }
 
 pub fn rejected(txn: anytype, command: Command) !?Rejected {
-    const raw = txn.get(&rejectionKey(command)) catch |err| switch (err) {
+    return rejectedAt(txn, rejectionKey(command), command.publication_digest);
+}
+
+pub fn rejectedAt(txn: anytype, key: RejectionKey, publication_digest: Digest) !?Rejected {
+    const raw = txn.get(&key) catch |err| switch (err) {
         error.NotFound => return null,
         else => return err,
     };
@@ -1017,7 +1027,7 @@ pub fn rejected(txn: anytype, command: Command) !?Rejected {
     const reason = std.enums.fromInt(Rejection, raw[4]) orelse return error.ArtifactCatalogCorrupt;
     const index = std.mem.readInt(u64, raw[37..45], .little);
     if (index == 0) return error.ArtifactCatalogCorrupt;
-    if (!std.mem.eql(u8, &command.publication_digest, raw[5..37])) return null;
+    if (!std.mem.eql(u8, &publication_digest, raw[5..37])) return null;
     return .{ .publication_digest = raw[5..37].*, .applied_index = index, .reason = reason };
 }
 
@@ -1042,7 +1052,20 @@ pub const ReceiptSet = struct {
 };
 
 fn readReceiptWithDigest(txn: anytype, command: Command, source: Source, input_digest: Digest) !?Receipt {
-    const key = receiptKey(command, source);
+    const raw = (try verifiedReceiptBytes(txn, receiptKey(command, source))) orelse return null;
+    if (!std.mem.eql(u8, raw[36..68], &source.content_digest) or
+        std.mem.readInt(u64, raw[68..76], .little) != source.timestamp or
+        !std.mem.eql(u8, raw[84 .. 84 + Position.encoded_len], &positionBytes(source.input_position)) or
+        !std.mem.eql(u8, raw[84 + Position.encoded_len ..][0..32], &input_digest)) return null;
+    return try receiptFromVerifiedBytes(raw);
+}
+
+pub fn receiptAt(txn: anytype, key: ReceiptKey) !?Receipt {
+    const raw = (try verifiedReceiptBytes(txn, key)) orelse return null;
+    return try receiptFromVerifiedBytes(raw);
+}
+
+fn verifiedReceiptBytes(txn: anytype, key: ReceiptKey) !?[]const u8 {
     const raw = txn.get(&key) catch |err| switch (err) {
         error.NotFound => return null,
         else => return err,
@@ -1051,10 +1074,10 @@ fn readReceiptWithDigest(txn: anytype, command: Command, source: Source, input_d
     var digest: Digest = undefined;
     std.crypto.hash.Blake3.hash(raw[0 .. receipt_bytes - 32], &digest, .{});
     if (!std.mem.eql(u8, raw[receipt_bytes - 32 ..], &digest)) return error.ArtifactCatalogCorrupt;
-    if (!std.mem.eql(u8, raw[36..68], &source.content_digest) or
-        std.mem.readInt(u64, raw[68..76], .little) != source.timestamp or
-        !std.mem.eql(u8, raw[84 .. 84 + Position.encoded_len], &positionBytes(source.input_position)) or
-        !std.mem.eql(u8, raw[84 + Position.encoded_len ..][0..32], &input_digest)) return null;
+    return raw;
+}
+
+fn receiptFromVerifiedBytes(raw: []const u8) !Receipt {
     const sequence = std.mem.readInt(u64, raw[76..84], .little);
     if (sequence == 0) return error.ArtifactCatalogCorrupt;
     return .{ .publication_digest = raw[4..36].*, .sequence = sequence };
@@ -1159,6 +1182,8 @@ pub const UploadRecovery = struct {
     recover: *const fn (*anyopaque, UploadRecoveryInvocation) anyerror!bool,
 };
 
+pub const DispatchReceipt = @import("kernel_owner_abi").ArtifactDispatchReceipt;
+
 pub const Dispatcher = struct {
     const named = @import("../named_callback.zig");
     const native = @import("antfly_runtime_abi").native_abi;
@@ -1185,6 +1210,26 @@ pub const Dispatcher = struct {
     /// Compiled owner callbacks must transport stable semantic statuses.
     /// Zig's process-local error integers cannot cross compilation units.
     enqueue_status: ?*const fn (*anyopaque, *const Namespace, [*]const u8, usize) callconv(.c) @import("kernel_error_identity").Status = null,
+    enqueue_tracked_status: ?*const fn (*anyopaque, *const Namespace, [*]const u8, usize, *DispatchReceipt) callconv(.c) @import("kernel_error_identity").Status = null,
+    applied_fn: ?*const fn (*anyopaque, *DispatchReceipt.Applied) callconv(.c) void = null,
+
+    pub fn appliedPosition(self: Dispatcher) DispatchReceipt.Applied {
+        var applied: DispatchReceipt.Applied = .{};
+        if (self.applied_fn) |observe| observe(self.ptr, &applied);
+        return applied;
+    }
+
+    pub fn submitTracked(self: Dispatcher, namespace: Namespace, command: []const u8) !DispatchReceipt {
+        const enqueue = self.enqueue_tracked_status orelse {
+            try self.submit(namespace, command);
+            return .{};
+        };
+        var receipt: DispatchReceipt = .{};
+        errdefer receipt.release();
+        @import("kernel_error_identity").statusToError(enqueue(self.ptr, &namespace, command.ptr, command.len, &receipt)) catch |err|
+            return submissionError(err);
+        return receipt;
+    }
 
     pub fn enqueueCommand(self: Dispatcher, namespace: Namespace, command: []const u8) !void {
         if (self.enqueue_status) |enqueue|
@@ -1206,10 +1251,14 @@ pub const Dispatcher = struct {
     /// that inference failed or that this stream completed. Keep that boundary
     /// shared across asset, vector, graph and resolver callbacks.
     pub fn submit(self: Dispatcher, namespace: Namespace, command: []const u8) !void {
-        self.enqueueCommand(namespace, command) catch |err| switch (err) {
-            error.ResourceLimitExceeded, error.ResourceBudgetExceeded, error.ResourceTemporarilyUnavailable, error.NotLeader => return error.ArtifactPublicationPending,
-            error.Canceled => return error.EnrichmentRetryAborted,
-            else => return err,
+        self.enqueueCommand(namespace, command) catch |err| return submissionError(err);
+    }
+
+    fn submissionError(err: anyerror) anyerror {
+        return switch (err) {
+            error.ResourceLimitExceeded, error.ResourceBudgetExceeded, error.ResourceTemporarilyUnavailable, error.NotLeader => error.ArtifactPublicationPending,
+            error.Canceled => error.EnrichmentRetryAborted,
+            else => err,
         };
     }
 };

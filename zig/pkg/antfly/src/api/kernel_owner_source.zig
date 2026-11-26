@@ -4993,6 +4993,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         return .{
             .artifact_publication_ctx = if (self.artifact_publications != null) self else null,
             .artifact_publication_enqueue_fn = if (self.artifact_publications != null) enqueueArtifactPublication else null,
+            .artifact_publication_enqueue_tracked_fn = if (self.artifact_publications) |port| if (port.enqueue_tracked_fn != null) enqueueTrackedArtifactPublication else null else null,
+            .artifact_publication_applied_fn = if (self.artifact_publications) |port| if (port.applied_fn != null) artifactPublicationApplied else null else null,
             .coordinated_ttl_ctx = if (self.coordinated_ttl != null) self else null,
             .coordinated_ttl_enqueue_fn = if (self.coordinated_ttl != null) enqueueCoordinatedTtl else null,
             .native_authority_ctx = if (self.native_migration_policy != null) self else null,
@@ -5048,6 +5050,23 @@ pub const ProvisionedKernelOwnerSource = struct {
             return kernel_error_identity.statusFromError(err);
         };
         return .ok;
+    }
+
+    fn enqueueTrackedArtifactPublication(ptr: ?*anyopaque, group_id: u64, namespace: *const [24]u8, command: abi.BorrowedBytes, receipt: *abi.ArtifactDispatchReceipt) callconv(.c) abi.Status {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+        const port = self.artifact_publications orelse return .invalid_argument;
+        const enqueue = port.enqueue_tracked_fn orelse return .invalid_argument;
+        if (command.len == 0 or command.ptr == null) return .invalid_argument;
+        enqueue(port.ptr, group_id, namespace.*, command.slice(), receipt) catch |err|
+            return kernel_error_identity.statusFromError(err);
+        return .ok;
+    }
+
+    fn artifactPublicationApplied(ptr: ?*anyopaque, group_id: u64, out: *abi.ArtifactDispatchReceipt.Applied) callconv(.c) void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return));
+        const port = self.artifact_publications orelse return;
+        const observe = port.applied_fn orelse return;
+        observe(port.ptr, group_id, out);
     }
 
     fn enqueueCoordinatedTtl(ptr: ?*anyopaque, request: *const abi.CoordinatedTtlRequest) callconv(.c) u8 {

@@ -205,6 +205,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-storage-repair-activation-test", "Run bounded index activation, coverage, and candidate-resume regressions")
         .dependOn(&addFilteredTestRunArtifact(b, repair_activation_tests).step);
     const db_enrichment_filters: []const []const u8 = selectTestFilters(b, &.{
+        "ordered materialized chunk embeddings recover from shared transport pressure",
+        "ordered materialized chunk embeddings keep the receipt barrier under transport pressure",
+        "ordered standalone sparse chunks keep the receipt barrier under transport pressure",
+        "ordered artifact inventory chunk vector callback publishes and retires without reinference after acceptance",
+        "ordered artifact inventory accepted asset callback waits for graph publication including absence",
+        "ordered artifact inventory deferred asset callback completes graph without reinference",
+        "model aware media ordered generation publishes beyond 4095 chunks and resumes private pages after reopen",
         "#1210",
         "relational prepared writes validate orphan vector receipts",
         "db public artifact reprocess accepts durable work despite unrelated provider retries",
