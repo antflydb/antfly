@@ -32398,7 +32398,7 @@ const PublicationFlights = struct {
             }
         }
 
-        fn settled(self: Flight, read: anytype, authority: ?ordered_publication.Authority, applied_index: u64) !bool {
+        fn settled(self: Flight, read: anytype, authority: ?ordered_publication.Authority, applied: ordered_publication.DispatchReceipt.Applied) !bool {
             if (self.submitting) return false;
             if (!std.meta.eql(authority, @as(?ordered_publication.Authority, self.authority))) return true;
             if (self.input) |input| {
@@ -32409,8 +32409,8 @@ const PublicationFlights = struct {
             // cannot resolve a queue admission at a newer Raft position.
             if (self.dispatch.observe()) |attempt| return switch (attempt.state) {
                 .abandoned => !self.uploaded or !try upload.isReady(read, self.authority.namespace, self.digest),
-                .ordered => attempt.index != 0 and applied_index >= attempt.index,
-                .upload => attempt.index != 0 and applied_index >= attempt.index and
+                .ordered => attempt.resolvedBy(applied),
+                .upload => attempt.resolvedBy(applied) and
                     (try upload.terminal(read, self.authority.namespace, self.digest) != null or
                         !try upload.isReady(read, self.authority.namespace, self.digest)),
                 else => false,
@@ -32462,18 +32462,21 @@ const PublicationFlights = struct {
         } else return false;
         // Read the host watermark before opening the store snapshot. An
         // upload whose last chunk has applied must be visible in this read.
-        const host_index = if (runtime.artifact_publication_dispatcher) |dispatcher| dispatcher.appliedIndex() else 0;
+        const host: ordered_publication.DispatchReceipt.Applied = if (runtime.artifact_publication_dispatcher) |dispatcher| dispatcher.appliedPosition() else .{};
         var read = try runtime.store.beginProbe();
         defer read.abort();
         const local_marker = try @import("../apply_receipts.zig").readOrderedApplyReceiptTxn(&read);
-        const applied_index = @max(host_index, if (local_marker) |marker| marker.index else 0);
+        const applied: ordered_publication.DispatchReceipt.Applied = if (local_marker) |marker| .{
+            .index = @max(host.index, marker.index),
+            .term = @max(host.term, marker.term),
+        } else host;
         const authority = try ordered_publication.authority(&read);
         var pending = false;
         var index: usize = 0;
         while (index < self.items.items.len) {
             const flight = self.items.items[index];
             if (owner == null or flight.owner == owner.?) {
-                if (try flight.settled(&read, authority, applied_index)) {
+                if (try flight.settled(&read, authority, applied)) {
                     self.items.swapRemove(index).deinit(runtime.alloc);
                     continue;
                 }
@@ -46442,7 +46445,7 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
                     const Observation = ordered_publication.DispatchReceipt.Observation;
                     observations: [5]Observation = @splat(.{}),
                     submitted: usize = 0,
-                    applied: u64 = 0,
+                    applied: ordered_publication.DispatchReceipt.Applied = .{},
 
                     fn enqueue(ptr: *anyopaque, _: *const ordered_publication.Namespace, _: [*]const u8, _: usize, out: *ordered_publication.DispatchReceipt) callconv(.c) @import("kernel_error_identity").Status {
                         const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -46457,16 +46460,16 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
                         out.* = observation.*;
                     }
 
-                    fn appliedIndex(ptr: *anyopaque) callconv(.c) u64 {
+                    fn observeApplied(ptr: *anyopaque, out: *ordered_publication.DispatchReceipt.Applied) callconv(.c) void {
                         const self: *@This() = @ptrCast(@alignCast(ptr));
-                        return self.applied;
+                        out.* = self.applied;
                     }
                 };
-                var dispatch: Dispatch = .{ .applied = index };
+                var dispatch: Dispatch = .{ .applied = .{ .index = index, .term = 1 } };
                 const dispatcher: ordered_publication.Dispatcher = .{
                     .ptr = &dispatch,
                     .enqueue_tracked_status = Dispatch.enqueue,
-                    .applied_index_fn = Dispatch.appliedIndex,
+                    .applied_fn = Dispatch.observeApplied,
                 };
                 const previous_dispatcher = runtime.artifact_publication_dispatcher;
                 runtime.artifact_publication_dispatcher = dispatcher;
@@ -46477,7 +46480,7 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
                 witness.dispatch = .{};
                 try runtime.publication_flights.submit(runtime, dispatcher, witness, "attempt A", null);
                 const rejected_index = index + 10;
-                dispatch.observations[0] = .{ .state = .ordered, .index = rejected_index };
+                dispatch.observations[0] = .{ .state = .ordered, .index = rejected_index, .term = 1 };
                 try std.testing.expectError(error.ArtifactPublicationPending, runtime.publication_flights.submit(runtime, dispatcher, witness, "early retry", null));
                 try std.testing.expectEqual(@as(usize, 1), dispatch.submitted);
                 {
@@ -46486,15 +46489,15 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
                     try ordered_publication.stageRejection(&write, command, rejected_index, .baseline_pending);
                     try write.commit();
                 }
-                dispatch.applied = rejected_index;
+                dispatch.applied.index = rejected_index;
                 try runtime.publication_flights.submit(runtime, dispatcher, witness, "attempt B", null);
                 try std.testing.expectEqual(@as(usize, 2), dispatch.submitted);
                 try std.testing.expectEqual(error.ArtifactPublicationPending, publicationAdmissionOutcome(runtime, owner));
-                dispatch.observations[1] = .{ .state = .ordered, .index = rejected_index + 1 };
+                dispatch.observations[1] = .{ .state = .ordered, .index = rejected_index + 2, .term = 1 };
                 try std.testing.expectEqual(error.ArtifactPublicationPending, publicationAdmissionOutcome(runtime, owner));
-                // Raft applied through B's position without a new producer
-                // response. This also covers a superseding log entry.
-                dispatch.applied = rejected_index + 1;
+                // A newer committed term replaced the suffix before B's
+                // index. The old position need not be reached to rule it out.
+                dispatch.applied = .{ .index = rejected_index + 1, .term = 2 };
                 try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, publicationAdmissionOutcome(runtime, owner));
 
                 var other = command;
@@ -46504,8 +46507,8 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
                 witness.digest = other.publication_digest;
                 witness.completion.append.count = 256;
                 try runtime.publication_flights.submit(runtime, dispatcher, witness, "append B", null);
-                dispatch.observations[2] = .{ .state = .ordered, .index = rejected_index + 2 };
-                dispatch.observations[3] = .{ .state = .ordered, .index = rejected_index + 3 };
+                dispatch.observations[2] = .{ .state = .ordered, .index = rejected_index + 2, .term = 2 };
+                dispatch.observations[3] = .{ .state = .ordered, .index = rejected_index + 3, .term = 2 };
                 {
                     var write = try db.core.store.beginWriteTxn();
                     errdefer write.abort();
@@ -46519,7 +46522,7 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
                     try std.testing.expect((try ordered_publication.rejected(&read, command)) == null);
                     try std.testing.expect((try ordered_publication.rejected(&read, other)) != null);
                 }
-                dispatch.applied = rejected_index + 3;
+                dispatch.applied.index = rejected_index + 3;
                 try std.testing.expect(!try runtime.publication_flights.reconcile(runtime, owner));
 
                 const upload = @import("../artifact_publication_transport.zig");
@@ -46527,7 +46530,7 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
                 witness.uploaded = true;
                 try runtime.publication_flights.submit(runtime, dispatcher, witness, "upload", null);
                 const upload_index = rejected_index + 4;
-                dispatch.observations[4] = .{ .state = .upload, .index = upload_index + 1 };
+                dispatch.observations[4] = .{ .state = .upload, .index = upload_index + 1, .term = 2 };
                 {
                     var write = try db.core.store.beginWriteTxn();
                     errdefer write.abort();
@@ -46549,7 +46552,7 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
                     try std.testing.expect(try upload.pruneOneExpired(&write, std.math.maxInt(u64)));
                     try write.commit();
                 }
-                dispatch.applied = upload_index + 1;
+                dispatch.applied.index = upload_index + 1;
                 try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, publicationAdmissionOutcome(runtime, owner));
             }
             return;

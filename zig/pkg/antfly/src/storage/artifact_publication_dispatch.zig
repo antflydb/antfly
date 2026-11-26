@@ -24,7 +24,7 @@ pub const Port = struct {
     ptr: *anyopaque,
     enqueue_fn: *const fn (*anyopaque, u64, Namespace, []const u8) anyerror!void,
     enqueue_tracked_fn: ?*const fn (*anyopaque, u64, Namespace, []const u8, *Receipt) anyerror!void = null,
-    applied_index_fn: ?*const fn (*anyopaque, u64) u64 = null,
+    applied_fn: ?*const fn (*anyopaque, u64, *Receipt.Applied) void = null,
 
     pub fn enqueue(self: Port, group_id: u64, namespace: Namespace, command: []const u8) !void {
         try self.enqueue_fn(self.ptr, group_id, namespace, command);
@@ -38,6 +38,7 @@ pub const Queue = struct {
         refs: std.atomic.Value(usize) = .init(1),
         state: std.atomic.Value(u8) = .init(@backingInt(Receipt.State.active)),
         index: u64 = 0,
+        term: u64 = 0,
 
         fn receipt(self: *Attempt) Receipt {
             _ = self.refs.fetchAdd(1, .monotonic);
@@ -46,7 +47,7 @@ pub const Queue = struct {
         fn observeState(raw: ?*anyopaque, out: *Receipt.Observation) callconv(.c) void {
             const self: *Attempt = @ptrCast(@alignCast(raw.?));
             const state: Receipt.State = @fromBackingInt(@intCast(self.state.load(.acquire)));
-            out.* = .{ .state = state, .index = if (state == .active) 0 else self.index };
+            out.* = if (state == .active) .{} else .{ .state = state, .index = self.index, .term = self.term };
         }
         fn releaseReceipt(raw: ?*anyopaque) callconv(.c) void {
             const self: *Attempt = @ptrCast(@alignCast(raw.?));
@@ -150,6 +151,7 @@ pub const Queue = struct {
         if (!self.slots[slot].reserved) self.producer_bytes -= bytes;
         if (self.slots[slot].attempt) |attempt| {
             attempt.index = outcome.index;
+            attempt.term = outcome.term;
             attempt.state.store(@backingInt(outcome.state), .release);
             Attempt.releaseReceipt(attempt);
         }
@@ -198,8 +200,8 @@ test "ordered artifact inventory publication queue reports definite abandonment 
     defer queue.deinit();
     for ([_]Receipt.Observation{
         .{ .state = .abandoned },
-        .{ .state = .ordered, .index = 19 },
-        .{ .state = .upload, .index = 23 },
+        .{ .state = .ordered, .index = 19, .term = 3 },
+        .{ .state = .upload, .index = 23, .term = 4 },
     }) |outcome| {
         var first: Receipt = .{};
         defer first.release();

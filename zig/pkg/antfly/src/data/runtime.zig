@@ -397,7 +397,7 @@ const DataRaftBatchRoute = struct {
     allow_remote_forward: bool = true,
     /// Borrowed only by local publication jobs. Once Raft assigns an index,
     /// even an unknown synchronous outcome must retain that position.
-    local_proposal_index: ?*u64 = null,
+    local_proposal: ?*artifact_publication_dispatch.Receipt.Observation = null,
     discovery: DataRaftMutationDiscovery,
     /// Local-only provenance. A forwarded target may follow an exact Raft
     /// leader, but must not choose another blind placement and bounce the
@@ -6324,7 +6324,7 @@ pub const DataServer = struct {
         // dispatcher there fences local production behind an unavailable
         // replicated authority, even for an empty index.
         if (owner_source.online_source_authority == .raft)
-            _ = owner_source.withArtifactPublications(.{ .ptr = self, .enqueue_fn = enqueueArtifactPublication, .enqueue_tracked_fn = enqueueTrackedArtifactPublication, .applied_index_fn = artifactPublicationAppliedIndex });
+            _ = owner_source.withArtifactPublications(.{ .ptr = self, .enqueue_fn = enqueueArtifactPublication, .enqueue_tracked_fn = enqueueTrackedArtifactPublication, .applied_fn = artifactPublicationApplied });
         _ = owner_source.withSecretStore(self.api_server_cfg.secret_store);
         if (comptime linked_storage) {
             if (self.storageKernelContextHandle()) |handle|
@@ -7229,15 +7229,19 @@ pub const DataServer = struct {
         try runtime.durable_jobs.submit(.{ .owner_id = try self.dataServerBackgroundOwnerId(runtime), .class = .maintenance, .ptr = job, .run = runArtifactPublicationJob, .deinit = deinitArtifactPublicationJob });
     }
 
-    fn artifactPublicationAppliedIndex(ptr: *anyopaque, group_id: u64) u64 {
+    fn artifactPublicationApplied(ptr: *anyopaque, group_id: u64, out: *artifact_publication_dispatch.Receipt.Applied) void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         // A receipt poll must never wait on the Raft apply owner while the
         // storage replay worker is reconciling its own state.
-        if (!self.data_raft_mutex.tryLock()) return 0;
+        if (!self.data_raft_mutex.tryLock()) return;
         defer self.data_raft_mutex.unlock();
-        const raft = self.data_raft orelse return 0;
-        const status = raft.host.http_host.host.raftStatus(group_id) orelse return 0;
-        return status.applied_index;
+        const raft = self.data_raft orelse return;
+        const host = &raft.host.http_host.host;
+        const status = host.raftStatus(group_id) orelse return;
+        out.* = .{
+            .index = status.applied_index,
+            .term = host.raftTermAt(group_id, status.applied_index) catch 0,
+        };
     }
 
     const ArtifactPublicationJob = struct {
@@ -7348,7 +7352,7 @@ pub const DataServer = struct {
             if (!std.mem.eql(u8, &command.namespace, &job.proposal.namespace)) return error.IdentityNamespaceMismatch;
             if (job.proposal.command.len <= codec.chunk_bytes) {
                 var route = local_route;
-                route.local_proposal_index = &job.observed.index;
+                route.local_proposal = &job.observed;
                 defer if (job.observed.index != 0) {
                     job.observed.state = .ordered;
                 };
@@ -7391,7 +7395,7 @@ pub const DataServer = struct {
             const chunk = job.proposal.command[offset..@min(offset + codec.chunk_bytes, job.proposal.command.len)];
             const encoded = std.base64.standard.Encoder.encode(base64, chunk);
             var route = local_route;
-            if (ordinal + 1 == count) route.local_proposal_index = &job.observed.index;
+            if (ordinal + 1 == count) route.local_proposal = &job.observed;
             defer if (job.observed.index != 0) {
                 // The final chunk may make this upload recoverable without
                 // another proposal from this job.
@@ -7402,7 +7406,7 @@ pub const DataServer = struct {
             slice_chunks += 1;
         }
         var finalize_route = local_route;
-        finalize_route.local_proposal_index = &job.observed.index;
+        finalize_route.local_proposal = &job.observed;
         try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication_transport = .{ .action = .finalize, .namespace = job.proposal.namespace, .publication_digest = job.publication_digest, .manifest_root = root }, .sync_level = .write }, finalize_route);
     }
 
@@ -13718,7 +13722,10 @@ pub const DataServer = struct {
                         };
                         target_index = target_index orelse accepted_index orelse
                             return error.RaftBatchWriteOutcomeUnknown;
-                        if (route.local_proposal_index) |observed| observed.* = target_index.?;
+                        if (route.local_proposal) |observed| {
+                            observed.index = target_index.?;
+                            observed.term = proposal_term;
+                        }
                         if (proposal_req.sync_level != .propose) {
                             const index = target_index.?;
                             const apply_sm = self.data_raft_apply orelse

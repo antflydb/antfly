@@ -3511,7 +3511,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .artifact_publication_ctx = if (self.artifact_publications != null) self else null,
             .artifact_publication_enqueue_fn = if (self.artifact_publications != null) enqueueArtifactPublication else null,
             .artifact_publication_enqueue_tracked_fn = if (self.artifact_publications) |port| if (port.enqueue_tracked_fn != null) enqueueTrackedArtifactPublication else null else null,
-            .artifact_publication_applied_index_fn = if (self.artifact_publications) |port| if (port.applied_index_fn != null) artifactPublicationAppliedIndex else null else null,
+            .artifact_publication_applied_fn = if (self.artifact_publications) |port| if (port.applied_fn != null) artifactPublicationApplied else null else null,
             .coordinated_ttl_ctx = if (self.coordinated_ttl != null) self else null,
             .coordinated_ttl_enqueue_fn = if (self.coordinated_ttl != null) enqueueCoordinatedTtl else null,
             .native_authority_ctx = if (self.native_migration_policy != null) self else null,
@@ -3561,11 +3561,11 @@ pub const ProvisionedKernelOwnerSource = struct {
         return .ok;
     }
 
-    fn artifactPublicationAppliedIndex(ptr: ?*anyopaque, group_id: u64) callconv(.c) u64 {
-        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return 0));
-        const port = self.artifact_publications orelse return 0;
-        const observe = port.applied_index_fn orelse return 0;
-        return observe(port.ptr, group_id);
+    fn artifactPublicationApplied(ptr: ?*anyopaque, group_id: u64, out: *abi.ArtifactDispatchReceipt.Applied) callconv(.c) void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return));
+        const port = self.artifact_publications orelse return;
+        const observe = port.applied_fn orelse return;
+        observe(port.ptr, group_id, out);
     }
 
     fn enqueueCoordinatedTtl(ptr: ?*anyopaque, request: *const abi.CoordinatedTtlRequest) callconv(.c) u8 {
