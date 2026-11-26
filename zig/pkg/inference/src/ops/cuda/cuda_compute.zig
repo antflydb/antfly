@@ -21851,10 +21851,16 @@ const SourceLinearTemporary = struct {
     fn deinit(value: *@This(), self: *CudaCompute) void {
         switch (value.kind) {
             .audio => self.source_linear_scratch.in_use = false,
-            .captured => releaseDeviceBuffer(self, &value.bank),
-            .learned => {
+            .learned, .captured => {
                 const scope = self.execution_scope orelse platform.inference_process_supervisor.restartWorker();
+                const bound = value.kind == .captured;
+                if (scope.isBound() != bound or (bound and !scope.owns(value.bank.ptr)))
+                    platform.inference_process_supervisor.restartWorker();
                 scope.release(value.bank.ptr);
+                if (bound) {
+                    value.bank = .{};
+                    return;
+                }
                 _ = value.bank.freeChecked(&self.ctx) catch platform.inference_process_supervisor.restartWorker();
                 self.stats.device_free_calls += 1;
             },
