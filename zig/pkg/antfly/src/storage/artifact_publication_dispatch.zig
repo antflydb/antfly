@@ -18,9 +18,13 @@
 //! recovery; this queue borrows no DB, cache lease, or worker pointer.
 const std = @import("std");
 pub const Namespace = [24]u8;
+pub const Receipt = @import("kernel_owner_abi").ArtifactDispatchReceipt;
+
 pub const Port = struct {
     ptr: *anyopaque,
     enqueue_fn: *const fn (*anyopaque, u64, Namespace, []const u8) anyerror!void,
+    enqueue_tracked_fn: ?*const fn (*anyopaque, u64, Namespace, []const u8, *Receipt) anyerror!void = null,
+
     pub fn enqueue(self: Port, group_id: u64, namespace: Namespace, command: []const u8) !void {
         try self.enqueue_fn(self.ptr, group_id, namespace, command);
     }
@@ -28,7 +32,25 @@ pub const Port = struct {
 pub const Queue = struct {
     const capacity = 8;
     pub const Class = enum { producer, control };
-    const Slot = struct { occupied: bool = false, group_id: u64 = 0, digest: [32]u8 = @splat(0), class: Class = .producer, namespace: Namespace = @splat(0), baseline: bool = false, reserved: bool = false };
+    const Attempt = struct {
+        alloc: std.mem.Allocator,
+        refs: std.atomic.Value(usize) = .init(1),
+        state: std.atomic.Value(u8) = .init(@backingInt(Receipt.State.active)),
+
+        fn receipt(self: *Attempt) Receipt {
+            _ = self.refs.fetchAdd(1, .monotonic);
+            return .{ .ctx = self, .state_fn = readState, .release_fn = releaseReceipt };
+        }
+        fn readState(raw: ?*anyopaque) callconv(.c) u8 {
+            const self: *Attempt = @ptrCast(@alignCast(raw.?));
+            return self.state.load(.acquire);
+        }
+        fn releaseReceipt(raw: ?*anyopaque) callconv(.c) void {
+            const self: *Attempt = @ptrCast(@alignCast(raw.?));
+            if (self.refs.fetchSub(1, .acq_rel) == 1) self.alloc.destroy(self);
+        }
+    };
+    const Slot = struct { attempt: ?*Attempt = null, occupied: bool = false, group_id: u64 = 0, digest: [32]u8 = @splat(0), class: Class = .producer, namespace: Namespace = @splat(0), baseline: bool = false, reserved: bool = false };
     mutex: std.Io.Mutex = .init,
     slots: [capacity]Slot = @splat(.{}),
     bytes: usize = 0,
@@ -49,6 +71,10 @@ pub const Queue = struct {
     }
 
     pub fn reserveClass(self: *Queue, io: std.Io, alloc: std.mem.Allocator, group_id: u64, namespace: Namespace, command: []const u8, class: Class) !?*Job {
+        return self.reserveTracked(io, alloc, group_id, namespace, command, class, null);
+    }
+
+    pub fn reserveTracked(self: *Queue, io: std.Io, alloc: std.mem.Allocator, group_id: u64, namespace: Namespace, command: []const u8, class: Class, out: ?*Receipt) !?*Job {
         if (group_id == 0 or std.mem.allEqual(u8, &namespace, 0) or command.len == 0) return error.InvalidBatchRequest;
         const reserved = class == .control and self.control_slots != 0 and command.len <= self.control_bytes / self.control_slots;
         const baseline = class == .control and @import("antfly_local_sources").storage_db_artifact_publication_transport_codec.baselineAdmissionHint(command);
@@ -57,6 +83,8 @@ pub const Queue = struct {
         hash.update(command);
         var digest: [32]u8 = undefined;
         hash.final(&digest);
+        var observed: Receipt = .{};
+        errdefer observed.release();
         self.mutex.lockUncancelable(io);
         const slot = blk: {
             defer self.mutex.unlock(io);
@@ -64,7 +92,11 @@ pub const Queue = struct {
             var producer_jobs: usize = 0;
             for (self.slots, 0..) |entry, i| {
                 if (entry.occupied and entry.group_id == group_id) {
-                    if (std.mem.eql(u8, &entry.digest, &digest) or (baseline and entry.baseline and std.mem.eql(u8, &entry.namespace, &namespace))) return null;
+                    if (std.mem.eql(u8, &entry.digest, &digest)) {
+                        if (out) |receipt| receipt.* = try self.observe(alloc, i);
+                        return null;
+                    }
+                    if (baseline and entry.baseline and std.mem.eql(u8, &entry.namespace, &namespace)) return null;
                 }
                 if (entry.occupied and !entry.reserved) producer_jobs += 1;
                 if (!entry.occupied and free == null) free = i;
@@ -80,33 +112,58 @@ pub const Queue = struct {
             // Large control identities borrow shared capacity; the reservation
             // remains available to ordinary small control messages.
             self.slots[index] = .{ .occupied = true, .group_id = group_id, .digest = digest, .class = class, .namespace = namespace, .baseline = baseline, .reserved = reserved };
+            if (out != null) observed = self.observe(alloc, index) catch |err| {
+                self.slots[index] = .{};
+                return err;
+            };
             self.bytes += command.len;
             if (!reserved) self.producer_bytes += command.len;
             self.jobs += 1;
             break :blk index;
         };
-        errdefer self.releaseSlot(io, slot, command.len);
+        errdefer self.releaseSlot(io, slot, command.len, .abandoned);
         const job = try alloc.create(Job);
         errdefer alloc.destroy(job);
         job.* = .{ .alloc = alloc, .group_id = group_id, .namespace = namespace, .command = try alloc.dupe(u8, command), .slot = slot };
+        if (out) |receipt| receipt.* = observed;
         return job;
     }
-    fn releaseSlot(self: *Queue, io: std.Io, slot: usize, bytes: usize) void {
+    // Called under the queue mutex. Even a duplicate of an originally
+    // untracked admission can observe the same live owner's outcome.
+    fn observe(self: *Queue, alloc: std.mem.Allocator, index: usize) !Receipt {
+        const entry = &self.slots[index];
+        if (entry.attempt == null) {
+            const attempt = try alloc.create(Attempt);
+            attempt.* = .{ .alloc = alloc };
+            entry.attempt = attempt;
+        }
+        return entry.attempt.?.receipt();
+    }
+
+    fn releaseSlot(self: *Queue, io: std.Io, slot: usize, bytes: usize, state: Receipt.State) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         std.debug.assert(self.slots[slot].occupied);
         if (!self.slots[slot].reserved) self.producer_bytes -= bytes;
+        if (self.slots[slot].attempt) |attempt| {
+            attempt.state.store(@backingInt(state), .release);
+            Attempt.releaseReceipt(attempt);
+        }
         self.slots[slot] = .{};
         self.bytes -= bytes;
         self.jobs -= 1;
     }
     pub fn release(self: *Queue, io: std.Io, job: *Job) void {
+        self.finish(io, job, .abandoned);
+    }
+
+    pub fn finish(self: *Queue, io: std.Io, job: *Job, state: Receipt.State) void {
         const slot = job.slot;
         const len = job.command.len;
         const alloc = job.alloc;
         alloc.free(job.command);
         alloc.destroy(job);
-        self.releaseSlot(io, slot, len);
+        self.releaseSlot(io, slot, len, state);
     }
     pub fn deinit(self: *Queue) void {
         std.debug.assert(self.jobs == 0 and self.bytes == 0 and self.producer_bytes == 0);
@@ -128,6 +185,26 @@ test "ordered artifact inventory publication queue owns bounded bytes and exact 
     queue.release(io, first);
     queue.release(io, second);
     try std.testing.expectEqual(@as(usize, 0), queue.bytes);
+}
+
+test "ordered artifact inventory publication queue reports definite abandonment to deduplicated observers" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var queue: Queue = .{};
+    defer queue.deinit();
+    for ([_]Receipt.State{ .abandoned, .awaiting_apply }) |outcome| {
+        var first: Receipt = .{};
+        defer first.release();
+        const job = (try queue.reserveTracked(io, a, 9, @splat(1), "command", .producer, &first)).?;
+        var duplicate: Receipt = .{};
+        defer duplicate.release();
+        try std.testing.expect((try queue.reserveTracked(io, a, 9, @splat(1), "command", .producer, &duplicate)) == null);
+        try std.testing.expectEqual(first.ctx, duplicate.ctx);
+        try std.testing.expect(!first.abandoned());
+        queue.finish(io, job, outcome);
+        try std.testing.expectEqual(outcome == .abandoned, first.abandoned());
+        try std.testing.expectEqual(outcome == .abandoned, duplicate.abandoned());
+    }
 }
 
 test "ordered artifact inventory publication queue reserves control slots under producer saturation" {

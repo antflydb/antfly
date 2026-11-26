@@ -6874,7 +6874,7 @@ pub const DataServer = struct {
         // dispatcher there fences local production behind an unavailable
         // replicated authority, even for an empty index.
         if (owner_source.online_source_authority == .raft)
-            _ = owner_source.withArtifactPublications(.{ .ptr = self, .enqueue_fn = enqueueArtifactPublication });
+            _ = owner_source.withArtifactPublications(.{ .ptr = self, .enqueue_fn = enqueueArtifactPublication, .enqueue_tracked_fn = enqueueTrackedArtifactPublication });
         owner_source.schema_snapshot_retention = .{ .ptr = self, .retain = retainSchemaSnapshot, .reopen = reopenSchemaSnapshot, .release = releaseSchemaSnapshot };
         _ = owner_source.withSecretStore(self.api_server_cfg.secret_store);
         if (comptime linked_storage) {
@@ -9304,6 +9304,14 @@ pub const DataServer = struct {
     }
 
     fn enqueueArtifactPublication(ptr: *anyopaque, group_id: u64, namespace: [24]u8, command: []const u8) !void {
+        return enqueueArtifactPublicationObserved(ptr, group_id, namespace, command, null);
+    }
+
+    fn enqueueTrackedArtifactPublication(ptr: *anyopaque, group_id: u64, namespace: [24]u8, command: []const u8, receipt: *artifact_publication_dispatch.Receipt) !void {
+        return enqueueArtifactPublicationObserved(ptr, group_id, namespace, command, receipt);
+    }
+
+    fn enqueueArtifactPublicationObserved(ptr: *anyopaque, group_id: u64, namespace: [24]u8, command: []const u8, receipt: ?*artifact_publication_dispatch.Receipt) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
         const runtime = self.backend_runtime orelse return error.ArtifactCatalogDrift;
@@ -9318,8 +9326,12 @@ pub const DataServer = struct {
         }
         const recovery = try @import("antfly_local_sources").storage_db_artifact_publication_transport.RecoveryHint.decode(command);
         const class: artifact_publication_dispatch.Queue.Class = if (@import("antfly_local_sources").storage_db_artifact_catalog_proposal.isProposal(command) or recovery != null or @import("antfly_local_sources").storage_db_artifact_publication_transport_codec.controlAdmissionHint(command)) .control else .producer;
-        const proposal = (try self.artifact_publication_queue.reserveClass(io, self.alloc, group_id, namespace, command, class)) orelse return;
+        const proposal = (try self.artifact_publication_queue.reserveTracked(io, self.alloc, group_id, namespace, command, class, receipt)) orelse return;
         errdefer self.artifact_publication_queue.release(io, proposal);
+        errdefer if (receipt) |out| {
+            out.release();
+            out.* = .{};
+        };
         const job = try self.alloc.create(ArtifactPublicationJob);
         errdefer self.alloc.destroy(job);
         job.* = .{ .server = self, .proposal = proposal, .io = io };
@@ -9331,6 +9343,7 @@ pub const DataServer = struct {
         proposal: *artifact_publication_dispatch.Queue.Job,
         io: std.Io,
         owns_proposal: bool = true,
+        may_apply: bool = false,
         upload_root: ?[32]u8 = null,
         publication_digest: [32]u8 = @splat(0),
         next_chunk: usize = 0,
@@ -9422,7 +9435,11 @@ pub const DataServer = struct {
             // instead of hashing a maximum-size payload two more times here.
             if (!std.mem.eql(u8, &command.namespace, &job.proposal.namespace)) return error.IdentityNamespaceMismatch;
             if (job.proposal.command.len <= codec.chunk_bytes) {
-                try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication = command, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
+                self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication = command, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) }) catch |err| {
+                    job.may_apply = err == error.RaftBatchWriteOutcomeUnknown;
+                    return err;
+                };
+                job.may_apply = true;
                 return;
             }
             var hashes: [codec.max_chunks]transport.Digest = undefined;
@@ -9460,7 +9477,13 @@ pub const DataServer = struct {
             const offset = ordinal * codec.chunk_bytes;
             const chunk = job.proposal.command[offset..@min(offset + codec.chunk_bytes, job.proposal.command.len)];
             const encoded = std.base64.standard.Encoder.encode(base64, chunk);
-            try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication_transport = .{ .action = .chunk, .namespace = job.proposal.namespace, .publication_digest = job.publication_digest, .manifest_root = root, .ordinal = @intCast(ordinal), .chunk_base64 = encoded }, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
+            self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication_transport = .{ .action = .chunk, .namespace = job.proposal.namespace, .publication_digest = job.publication_digest, .manifest_root = root, .ordinal = @intCast(ordinal), .chunk_base64 = encoded }, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) }) catch |err| {
+                job.may_apply = ordinal + 1 == count and err == error.RaftBatchWriteOutcomeUnknown;
+                return err;
+            };
+            // A complete durable upload can finalize after this worker
+            // exits. Preserve the apply barrier even if finalize fails.
+            job.may_apply = ordinal + 1 == count;
             job.next_chunk += 1;
             slice_chunks += 1;
         }
@@ -9491,7 +9514,7 @@ pub const DataServer = struct {
         const self = job.server;
         if (job.owns_proposal) {
             if (job.table_name) |name| self.alloc.free(name);
-            self.artifact_publication_queue.release(job.io, job.proposal);
+            self.artifact_publication_queue.finish(job.io, job.proposal, if (job.may_apply) .awaiting_apply else .abandoned);
         }
         self.alloc.destroy(job);
     }
@@ -60817,7 +60840,10 @@ fn implementationTests() type {
             };
             defer server.deinit();
             runtime.durable_jobs = .{ .ptr = &lane, .vtable = &.{ .submit = Lane.submit, .drain_owner = Lane.drain, .close_owner = Lane.drain, .poll = Lane.poll } };
-            try DataServer.enqueueArtifactPublication(&server, 17, @splat(1), "owned command");
+            var receipt: artifact_publication_dispatch.Receipt = .{};
+            defer receipt.release();
+            try DataServer.enqueueTrackedArtifactPublication(&server, 17, @splat(1), "owned command", &receipt);
+            try std.testing.expect(!receipt.abandoned());
             const queued: *DataServer.ArtifactPublicationJob = @ptrCast(@alignCast(lane.pending.?.ptr));
             queued.upload_root = @splat(2);
             queued.publication_digest = @splat(3);
@@ -60847,6 +60873,7 @@ fn implementationTests() type {
             try std.testing.expectEqualDeep(queued.upload_root, successor.upload_root);
             try std.testing.expectEqualDeep(queued.publication_digest, successor.publication_digest);
             previous.deinit(previous.ptr);
+            try std.testing.expect(!receipt.abandoned());
             try std.testing.expectEqual(@as(usize, 1), server.artifact_publication_queue.jobs);
             try std.testing.expectEqualStrings("owned command", successor.proposal.command);
             try std.testing.expectEqualStrings("items", successor.table_name.?);
@@ -60860,6 +60887,7 @@ fn implementationTests() type {
             const completed = lane.pending.?;
             lane.pending = null;
             completed.deinit(completed.ptr);
+            try std.testing.expect(receipt.abandoned());
             var producers: [6]*artifact_publication_dispatch.Queue.Job = undefined;
             var producer_count: usize = 0;
             defer for (producers[0..producer_count]) |producer| server.artifact_publication_queue.release(std.testing.io, producer);

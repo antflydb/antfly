@@ -4993,6 +4993,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         return .{
             .artifact_publication_ctx = if (self.artifact_publications != null) self else null,
             .artifact_publication_enqueue_fn = if (self.artifact_publications != null) enqueueArtifactPublication else null,
+            .artifact_publication_enqueue_tracked_fn = if (self.artifact_publications) |port| if (port.enqueue_tracked_fn != null) enqueueTrackedArtifactPublication else null else null,
             .coordinated_ttl_ctx = if (self.coordinated_ttl != null) self else null,
             .coordinated_ttl_enqueue_fn = if (self.coordinated_ttl != null) enqueueCoordinatedTtl else null,
             .native_authority_ctx = if (self.native_migration_policy != null) self else null,
@@ -5047,6 +5048,16 @@ pub const ProvisionedKernelOwnerSource = struct {
             std.log.debug("artifact publication admission deferred group_id={d} error={s}", .{ group_id, @errorName(err) });
             return kernel_error_identity.statusFromError(err);
         };
+        return .ok;
+    }
+
+    fn enqueueTrackedArtifactPublication(ptr: ?*anyopaque, group_id: u64, namespace: *const [24]u8, command: abi.BorrowedBytes, receipt: *abi.ArtifactDispatchReceipt) callconv(.c) abi.Status {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+        const port = self.artifact_publications orelse return .invalid_argument;
+        const enqueue = port.enqueue_tracked_fn orelse return .invalid_argument;
+        if (command.len == 0 or command.ptr == null) return .invalid_argument;
+        enqueue(port.ptr, group_id, namespace.*, command.slice(), receipt) catch |err|
+            return kernel_error_identity.statusFromError(err);
         return .ok;
     }
 

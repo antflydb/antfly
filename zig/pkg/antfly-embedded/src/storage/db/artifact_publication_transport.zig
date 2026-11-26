@@ -631,6 +631,17 @@ pub const RecoveryHint = struct {
     }
 };
 
+/// An earlier attempt may have staged every byte before a replacement
+/// dispatcher job stopped early. Recovery can still finalize that upload.
+pub fn isReady(txn: anytype, namespace: Namespace, digest: Digest) !bool {
+    const raw = (try optionalGet(txn, &manifestKey(namespace, digest))) orelse return false;
+    const manifest = try decodeManifest(raw);
+    if (!std.mem.eql(u8, &namespace, &manifest.namespace) or
+        !std.mem.eql(u8, &digest, &manifest.publication_digest)) return error.ArtifactCatalogCorrupt;
+    const progress = try Progress.load(txn, manifest);
+    return progress.received == Progress.mask(manifest);
+}
+
 /// At most eight manifest/progress pairs, no payload reads or allocations.
 /// Wrap the ordered begin-index cursor for fairness when a ready upload is
 /// temporarily blocked on coverage. The cursor is local scheduling state,

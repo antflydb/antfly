@@ -1182,6 +1182,8 @@ pub const UploadRecovery = struct {
     recover: *const fn (*anyopaque, UploadRecoveryInvocation) anyerror!bool,
 };
 
+pub const DispatchReceipt = @import("kernel_owner_abi").ArtifactDispatchReceipt;
+
 pub const Dispatcher = struct {
     const named = @import("../named_callback.zig");
     const native = @import("antfly_runtime_abi").native_abi;
@@ -1208,6 +1210,19 @@ pub const Dispatcher = struct {
     /// Compiled owner callbacks must transport stable semantic statuses.
     /// Zig's process-local error integers cannot cross compilation units.
     enqueue_status: ?*const fn (*anyopaque, *const Namespace, [*]const u8, usize) callconv(.c) @import("kernel_error_identity").Status = null,
+    enqueue_tracked_status: ?*const fn (*anyopaque, *const Namespace, [*]const u8, usize, *DispatchReceipt) callconv(.c) @import("kernel_error_identity").Status = null,
+
+    pub fn submitTracked(self: Dispatcher, namespace: Namespace, command: []const u8) !DispatchReceipt {
+        const enqueue = self.enqueue_tracked_status orelse {
+            try self.submit(namespace, command);
+            return .{};
+        };
+        var receipt: DispatchReceipt = .{};
+        errdefer receipt.release();
+        @import("kernel_error_identity").statusToError(enqueue(self.ptr, &namespace, command.ptr, command.len, &receipt)) catch |err|
+            return submissionError(err);
+        return receipt;
+    }
 
     pub fn enqueueCommand(self: Dispatcher, namespace: Namespace, command: []const u8) !void {
         if (self.enqueue_status) |enqueue|
@@ -1229,10 +1244,14 @@ pub const Dispatcher = struct {
     /// that inference failed or that this stream completed. Keep that boundary
     /// shared across asset, vector, graph and resolver callbacks.
     pub fn submit(self: Dispatcher, namespace: Namespace, command: []const u8) !void {
-        self.enqueueCommand(namespace, command) catch |err| switch (err) {
-            error.ResourceLimitExceeded, error.ResourceBudgetExceeded, error.ResourceTemporarilyUnavailable, error.NotLeader => return error.ArtifactPublicationPending,
-            error.Canceled => return error.EnrichmentRetryAborted,
-            else => return err,
+        self.enqueueCommand(namespace, command) catch |err| return submissionError(err);
+    }
+
+    fn submissionError(err: anyerror) anyerror {
+        return switch (err) {
+            error.ResourceLimitExceeded, error.ResourceBudgetExceeded, error.ResourceTemporarilyUnavailable, error.NotLeader => error.ArtifactPublicationPending,
+            error.Canceled => error.EnrichmentRetryAborted,
+            else => err,
         };
     }
 };

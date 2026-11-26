@@ -9522,8 +9522,7 @@ const PlatformEnrichmentRuntime = struct {
     /// the owner applies the publication resubmits these bytes instead of
     /// invoking the provider again.
     submitted_outputs: SubmittedOutputs = .{},
-    // The standalone ordered producers run on the serialized scanner/retry
-    // path. Shared execution lanes continue to own their pass-local barriers.
+    /// Shared by the scanner and the dense execution lane.
     publication_flights: PublicationFlights = .{},
     scoped_retry_has_tail: bool = false,
     scoped_retry_wait: bool = false,
@@ -33037,6 +33036,11 @@ const PublicationFlights = struct {
         census: struct { key: stream_progress.Key, previous: ?ordered_publication.Digest },
     };
 
+    const AppendKey = struct {
+        bytes: []const u8,
+        refs: usize = 1,
+    };
+
     const Flight = struct {
         owner: u64,
         authority: ordered_publication.Authority,
@@ -33049,12 +33053,23 @@ const PublicationFlights = struct {
         rejected_at: u64,
         completion: Completion,
         uploaded: bool,
+        append_key: ?*AppendKey = null,
+        dispatch: ordered_publication.DispatchReceipt = .{},
+        submitting: bool = false,
 
         fn deinit(self: Flight, a: Allocator) void {
-            if (self.completion == .append) a.free(self.completion.append.key);
+            self.dispatch.release();
+            if (self.append_key) |key| {
+                key.refs -= 1;
+                if (key.refs == 0) {
+                    a.free(key.bytes);
+                    a.destroy(key);
+                }
+            }
         }
 
         fn settled(self: Flight, read: anytype, authority: ?ordered_publication.Authority) !bool {
+            if (self.submitting) return false;
             if (!std.meta.eql(authority, @as(?ordered_publication.Authority, self.authority))) return true;
             if (self.input) |input| {
                 if (!std.meta.eql(input.revision, try ordered_publication.inputRevisionAt(read, self.authority.namespace, input.key))) return true;
@@ -33063,6 +33078,8 @@ const PublicationFlights = struct {
                 if (rejected.applied_index > self.rejected_at) return true;
             }
             if (self.uploaded and try upload.terminal(read, self.authority.namespace, self.digest) != null) return true;
+            if (self.dispatch.abandoned() and
+                (!self.uploaded or !try upload.isReady(read, self.authority.namespace, self.digest))) return true;
             switch (self.completion) {
                 .receipt => |watch| {
                     const receipt = (try ordered_publication.receiptAt(read, watch.key)) orelse return false;
@@ -33082,6 +33099,7 @@ const PublicationFlights = struct {
         }
     };
 
+    mutex: Io.Mutex = .init,
     items: std.ArrayList(Flight) = .empty,
 
     fn deinit(self: *PublicationFlights, a: Allocator) void {
@@ -33093,7 +33111,16 @@ const PublicationFlights = struct {
     /// parkable. A full tracker also reconciles all entries before deciding
     /// whether there is room to accept another dispatch.
     fn reconcile(self: *PublicationFlights, runtime: *EnrichmentRuntime, owner: ?u64) !bool {
-        if (self.items.items.len == 0) return false;
+        const io = concurrencyIo(runtime);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.reconcileLocked(runtime, owner);
+    }
+
+    fn reconcileLocked(self: *PublicationFlights, runtime: *EnrichmentRuntime, owner: ?u64) !bool {
+        for (self.items.items) |flight| {
+            if (owner == null or flight.owner == owner.?) break;
+        } else return false;
         var read = try runtime.store.beginProbe();
         defer read.abort();
         const authority = try ordered_publication.authority(&read);
@@ -33113,13 +33140,10 @@ const PublicationFlights = struct {
         return pending;
     }
 
-    fn prepare(a: Allocator, read: anytype, owner: u64, command: ordered_publication.Command, source: ?ordered_publication.Source, encoded_len: usize, supplied: ?Completion) !Flight {
+    fn prepare(read: anytype, owner: u64, command: ordered_publication.Command, source: ?ordered_publication.Source, encoded_len: usize, supplied: ?Completion) !Flight {
         const rejection = ordered_publication.rejectionKey(command);
         const rejected = try ordered_publication.rejectedAt(read, rejection, command.publication_digest);
-        const completion: Completion = if (supplied) |watch| switch (watch) {
-            .append => |append| .{ .append = .{ .key = try a.dupe(u8, append.key), .count = append.count } },
-            else => watch,
-        } else blk: {
+        const completion: Completion = supplied orelse blk: {
             std.debug.assert(command.mode == .publish);
             const key = ordered_publication.receiptKey(command, source.?);
             const previous = try ordered_publication.receiptAt(read, key);
@@ -33137,29 +33161,69 @@ const PublicationFlights = struct {
         };
     }
 
-    fn submit(self: *PublicationFlights, runtime: *EnrichmentRuntime, dispatcher: ordered_publication.Dispatcher, flight: Flight, bytes: []const u8) !void {
-        var owned = true;
-        defer if (owned) flight.deinit(runtime.alloc);
-        for (self.items.items) |*previous| {
-            if (previous.owner != flight.owner or !std.mem.eql(u8, &previous.digest, &flight.digest)) continue;
-            // Resubmissions after a lost reply keep the original witness. A
-            // newer rejection has settled it, so establish a new watch.
-            try dispatcher.submit(flight.authority.namespace, bytes);
-            if (flight.rejected_at > previous.rejected_at) {
-                previous.deinit(runtime.alloc);
-                previous.* = flight;
-                owned = false;
+    fn retainAppendKey(self: *PublicationFlights, a: Allocator, bytes: []const u8) !*AppendKey {
+        for (self.items.items) |flight| if (flight.append_key) |key| {
+            if (std.mem.eql(u8, key.bytes, bytes)) {
+                key.refs += 1;
+                return key;
+            }
+        };
+        const key = try a.create(AppendKey);
+        errdefer a.destroy(key);
+        key.* = .{ .bytes = try a.dupe(u8, bytes) };
+        return key;
+    }
+
+    fn submit(self: *PublicationFlights, runtime: *EnrichmentRuntime, dispatcher: ordered_publication.Dispatcher, prepared: Flight, bytes: []const u8) !void {
+        const io = concurrencyIo(runtime);
+        const fresh = reserve: {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            for (self.items.items) |*previous| {
+                if (previous.owner != prepared.owner or !std.mem.eql(u8, &previous.digest, &prepared.digest)) continue;
+                if (previous.submitting) return error.ArtifactPublicationPending;
+                previous.submitting = true;
+                break :reserve false;
+            }
+            if (self.items.items.len == max_flights) {
+                _ = try self.reconcileLocked(runtime, null);
+                if (self.items.items.len == max_flights) return error.ArtifactPublicationPending;
+            }
+            try self.items.ensureUnusedCapacity(runtime.alloc, 1);
+            var flight = prepared;
+            if (flight.completion == .append) {
+                const key = try self.retainAppendKey(runtime.alloc, flight.completion.append.key);
+                flight.append_key = key;
+                flight.completion.append.key = key.bytes;
+            }
+            flight.submitting = true;
+            self.items.appendAssumeCapacity(flight);
+            break :reserve true;
+        };
+
+        // Queue admission may copy a large command. Neither replay lane
+        // holds the witness mutex across the dispatcher callback.
+        const result = dispatcher.submitTracked(prepared.authority.namespace, bytes);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        for (self.items.items, 0..) |*flight, index| {
+            if (flight.owner != prepared.owner or !std.mem.eql(u8, &flight.digest, &prepared.digest)) continue;
+            flight.submitting = false;
+            const dispatched = result catch |err| {
+                if (fresh) self.items.swapRemove(index).deinit(runtime.alloc);
+                return err;
+            };
+            // A later admission does not erase an earlier ambiguous apply.
+            if (fresh or flight.dispatch.abandoned() or prepared.rejected_at > flight.rejected_at) {
+                flight.dispatch.release();
+                flight.dispatch = dispatched;
+                flight.rejected_at = prepared.rejected_at;
+            } else {
+                dispatched.release();
             }
             return;
         }
-        if (self.items.items.len == max_flights) {
-            _ = try self.reconcile(runtime, null);
-            if (self.items.items.len == max_flights) return error.ArtifactPublicationPending;
-        }
-        try self.items.ensureUnusedCapacity(runtime.alloc, 1);
-        try dispatcher.submit(flight.authority.namespace, bytes);
-        self.items.appendAssumeCapacity(flight);
-        owned = false;
+        unreachable; // A submitting entry cannot be reconciled away.
     }
 };
 
@@ -33283,7 +33347,7 @@ fn driveOrderedChunkVectorCensus(runtime: *EnrichmentRuntime, alloc: Allocator, 
         namespace = command.namespace;
         encoded = try encodeOrderedPublication(alloc, command, publication);
         if (publication.flight_owner) |owner|
-            flight = try PublicationFlights.prepare(runtime.alloc, &read, owner, command, null, encoded.?.len, .{ .census = .{ .key = prepared.selected, .previous = prepared.expected } });
+            flight = try PublicationFlights.prepare(&read, owner, command, null, encoded.?.len, .{ .census = .{ .key = prepared.selected, .previous = prepared.expected } });
     }
     // Release the pinned read, immutable plan and ownership/apply fence before
     // touching the dispatcher. Queue refusal leaves durable progress unchanged.
@@ -33689,7 +33753,7 @@ const OrderedDenseTextBatch = struct {
                     if (self.failed_requests.contains(fingerprint) or transport_waiting.contains(fingerprint)) continue;
                     const value = enrichment_artifact_codec.encodeDenseEmbeddingAlloc(runtime.alloc, item.source_hash, vector) catch |err| return self.scope.publicationFailure(err);
                     defer runtime.alloc.free(value);
-                    enqueueScalarChunkVector(runtime, &item.input, value, .{ .retire_windows = true, .publication = .{ .budget_error = error.PublicationEncoderAdmissionDenied, .receipt_pending = &self.publication_pending } }) catch |err| switch (err) {
+                    enqueueScalarChunkVector(runtime, &item.input, value, .{ .retire_windows = true, .publication = .{ .budget_error = error.PublicationEncoderAdmissionDenied, .receipt_pending = &self.publication_pending, .flight_owner = logicalRequestFingerprint(item.request) } }) catch |err| switch (err) {
                         error.ArtifactPublicationPending => {},
                         error.PublicationEncoderAdmissionDenied => {
                             // This output never reached the dispatcher. A
@@ -33699,7 +33763,18 @@ const OrderedDenseTextBatch = struct {
                             any_failed = true;
                             const owner = items[offset..][0..1];
                             self.scope.enterOwned(fingerprint, .{ .ordered_text = owner });
-                            self.fail(runtime, owner, error.ResourceTemporarilyUnavailable) catch |classified| {
+                            const admission = publicationAdmissionOutcome(runtime, logicalRequestFingerprint(item.request));
+                            if (admission == error.ArtifactPublicationPending) {
+                                try transport_waiting.put(runtime.alloc, fingerprint, {});
+                                if (failure == null or !isEnrichmentControlError(failure.?)) {
+                                    failure = admission;
+                                    failed_scope = self.scope.*;
+                                }
+                                continue;
+                            }
+                            if (admission != error.ResourceTemporarilyUnavailable)
+                                return self.scope.publicationFailure(admission);
+                            self.fail(runtime, owner, admission) catch |classified| {
                                 if (self.scope.publication_failed or enrichmentErrorDisposition(classified) == .fatal_worker) return classified;
                                 try transport_waiting.put(runtime.alloc, fingerprint, {});
                                 if (failure == null) {
@@ -33731,9 +33806,17 @@ const OrderedDenseTextBatch = struct {
 };
 
 fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, dense: ?embedder_mod.DenseEmbedder, sparse: ?embedder_mod.SparseEmbedder, consumers: []const []const u8) !bool {
+    return processOrderedChunkVectorTracked(runtime, alloc, request, dense, sparse, consumers, null);
+}
+
+fn processOrderedChunkVectorTracked(runtime: *EnrichmentRuntime, alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, dense: ?embedder_mod.DenseEmbedder, sparse: ?embedder_mod.SparseEmbedder, consumers: []const []const u8, shared: ?*OrderedDenseTextBatch) !bool {
     const owner = logicalRequestFingerprint(request);
-    const submission: ProducerPublicationOptions = .{ .budget_error = error.PublicationEncoderAdmissionDenied, .flight_owner = owner };
-    return processOrderedChunkVectorWithBatch(runtime, alloc, request, dense, sparse, consumers, null, submission) catch |err| {
+    const submission: ProducerPublicationOptions = .{
+        .budget_error = error.PublicationEncoderAdmissionDenied,
+        .flight_owner = owner,
+        .receipt_pending = if (shared) |batch| &batch.publication_pending else null,
+    };
+    return processOrderedChunkVectorWithBatch(runtime, alloc, request, dense, sparse, consumers, shared, submission) catch |err| {
         if (err == error.PublicationEncoderAdmissionDenied) return publicationAdmissionOutcome(runtime, owner);
         return err;
     };
@@ -34198,7 +34281,7 @@ fn processMaterializedChunkDenseRequestWithBatch(
     shared: ?*MaterializedDenseBatch,
 ) !void {
     if (ordered_batch) |batch| {
-        if (try processOrderedChunkVectorWithBatch(runtime, batch.alloc, request, dense_embedder, null, consumer_indexes, batch, .{ .receipt_pending = &batch.publication_pending })) return;
+        if (try processOrderedChunkVectorTracked(runtime, batch.alloc, request, dense_embedder, null, consumer_indexes, batch)) return;
     } else if (try processOrderedChunkVectorRequest(runtime, request, dense_embedder, null, consumer_indexes)) return;
     const generation = try captureDenseGeneration(runtime, dense_embedder, runtime.alloc, embedding_artifact_name, assetProviderRequestContext(runtime));
     const pinned_embedder = dense_embedder.withTextGeneration(generation);
@@ -34959,7 +35042,7 @@ fn submitProducerCommand(runtime: *EnrichmentRuntime, token: *@import("../artifa
         const flight = blk: {
             var read = try runtime.store.beginProbe();
             defer read.abort();
-            break :blk try PublicationFlights.prepare(runtime.alloc, &read, owner, command, token.source, bytes.len, options.completion);
+            break :blk try PublicationFlights.prepare(&read, owner, command, token.source, bytes.len, options.completion);
         };
         runtime.publication_flights.submit(runtime, dispatcher, flight, bytes) catch |err|
             return FailureScope.assetPublicationFailure(failure_scope, err);
@@ -35717,6 +35800,11 @@ fn processChunkedDenseWindow(
     }
     if (deferred_retry_error) |err| {
         try flushGeneratedReplayWindowWithIdentity(runtime, window, scope.completedFingerprint());
+        if (isRetryableEnrichmentError(err) and !isEnrichmentControlError(err)) {
+            for (requests) |request| {
+                if (try runtime.publication_flights.reconcile(runtime, logicalRequestFingerprint(request))) return error.ArtifactPublicationPending;
+            }
+        }
         return err;
     }
 }
@@ -47010,11 +47098,82 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
                 defer read.abort();
                 try std.testing.expect((try ordered_publication.ReceiptSet.init(submitted.command).read(&read, submitted.command.sources[0])) == null);
             }
+            if (!local) {
+                harness.transport_reservation.?.release();
+                harness.transport_reservation = null;
+                harness.transport_pressure = null;
+                var budget = runtime.media_window_capture.budget(&pressure_manager, alloc);
+                defer budget.deinit();
+                const a = budget.allocator();
+                const request = requests[healthy];
+                const provider = runtime.config.dense_embedder.?;
+                const generation = try captureDenseGeneration(runtime, provider, alloc, "model", null);
+                var retry_scope: FailureScope = .{};
+                var retry_batch: OrderedDenseTextBatch = .{ .scope = &retry_scope, .alloc = a, .generation = generation };
+                defer retry_batch.deinit();
+                try retry_batch.items.ensureUnusedCapacity(a, 1);
+                const member = try internal_keys.chunkArtifactKeyAlloc(alloc, request.doc_key, "chunks", 0);
+                defer alloc.free(member);
+                var input = blk: {
+                    var read = try runtime.store.beginRead();
+                    defer read.abort();
+                    break :blk (try @import("../artifact_chunk_vector_publication.zig").capture(a, &read, request, plan.plan(), member)).?;
+                };
+                input.old_window_outputs = &.{};
+                input.token.execution_bound = true;
+                input.token.execution_identity = generation.revision;
+                const warm = input.token.command(&.{.{ .family = .derived_vector, .key = input.output_key, .value = null, .source_index = 0 }}) catch |err| {
+                    input.deinit();
+                    return err;
+                };
+                input.token.arena.allocator().free(warm.mutations);
+                retry_batch.items.appendAssumeCapacity(.{ .request = request, .input = input, .text = "hello 00001", .artifact_key = input.output_key, .source_hash = 0 });
+                // The new batch starts empty. Leave no credit for the encoder
+                // while the earlier command still has no ordered receipt.
+                _ = budget.releaseUnusedCredit();
+                const slice: resource_manager_mod.Slice = .relational_preparation_working_set;
+                var competing = try pressure_manager.reserve(slice, pressure_manager.memoryHardLimitForSlice(slice) - pressure_manager.sliceStats(slice).used_bytes);
+                defer competing.release();
+                const denial_before = budget.denialGeneration();
+                const result_retry = retry_batch.flush(runtime, provider, &.{"vector"});
+                try std.testing.expectError(error.ArtifactPublicationPending, result_retry);
+                try std.testing.expectError(error.ArtifactPublicationPending, LaneOutcome.of(&retry_scope, result_retry).result);
+                try std.testing.expect(budget.denialGeneration() != denial_before);
+                try std.testing.expectEqual(before + 1, harness.queued.items.len);
+            }
             try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = submitted.command }, .{ .term = 1, .index = index });
             {
                 var read = try runtime.store.beginRead();
                 defer read.abort();
                 try std.testing.expect((try ordered_publication.ReceiptSet.init(submitted.command).read(&read, submitted.command.sources[0])) != null);
+            }
+            if (!local) {
+                const owner = logicalRequestFingerprint(requests[healthy]);
+                try std.testing.expect(!try runtime.publication_flights.reconcile(runtime, owner));
+                const Abandoned = struct {
+                    fn state(_: ?*anyopaque) callconv(.c) u8 {
+                        return @backingInt(ordered_publication.DispatchReceipt.State.abandoned);
+                    }
+                };
+                var witness = blk: {
+                    var read = try runtime.store.beginRead();
+                    defer read.abort();
+                    break :blk try PublicationFlights.prepare(&read, owner, submitted.command, submitted.command.sources[0], harness.queued.items[before].len, null);
+                };
+                // Use unpublished digests with a current source. There are no
+                // ordered responses that could otherwise clear these entries.
+                for (0..PublicationFlights.max_flights) |i| {
+                    witness.digest = @splat(@intCast(i));
+                    witness.dispatch = .{ .state_fn = Abandoned.state };
+                    try runtime.publication_flights.items.append(runtime.alloc, witness);
+                }
+                {
+                    var next = witness;
+                    next.digest = submitted.command.publication_digest;
+                    next.dispatch = .{};
+                    try runtime.publication_flights.submit(runtime, runtime.artifact_publication_dispatcher.?, next, harness.queued.items[before]);
+                    try std.testing.expectEqual(@as(usize, 1), runtime.publication_flights.items.items.len);
+                }
             }
             return;
         }
@@ -52037,6 +52196,16 @@ test "model aware media ordered generation publishes beyond 4095 chunks and resu
         var token = try Harness.capture(runtime, request, scope);
         defer token.deinit();
         try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedChunkGeneration(runtime, request, &token, scope, desired, true));
+        var shared_key: ?*PublicationFlights.AppendKey = null;
+        var page_witnesses: usize = 0;
+        for (runtime.publication_flights.items.items) |flight| {
+            const key = flight.append_key orelse continue;
+            if (shared_key) |first| try std.testing.expectEqual(first, key) else shared_key = key;
+            page_witnesses += 1;
+        }
+        try std.testing.expect(page_witnesses > 1);
+        try std.testing.expectEqual(page_witnesses, shared_key.?.refs);
+        try std.testing.expect(!try runtime.publication_flights.reconcile(runtime, logicalRequestFingerprint(request)));
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
         try std.testing.expectEqual(@as(u32, 5000), (try manifests.Manifest.decode(try read.get(scope))).count);
