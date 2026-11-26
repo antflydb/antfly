@@ -451,12 +451,11 @@ fn readResidentVocabularyRow(allocator: std.mem.Allocator, backend: *const @impo
     var destination: ?[]f32 = null;
     defer if (destination) |buffer| allocator.free(buffer);
     if (rows > 1 and knows_dtype) {
-        if (kernels) |table| if (table.readFloat32RangeInto) |read| {
+        if (kernels) |table| if (table.readFloat32Into != null) {
             const offset = try std.math.mul(usize, rows - 1, vocab);
-            try backend.checkExecutionControl();
             const buffer = try allocator.alloc(f32, vocab);
             destination = buffer;
-            if (try read(backend.ptr, logits, offset, buffer)) {
+            if (try backend.readFloat32RangeInto(logits, offset, buffer)) {
                 destination = null;
                 return buffer;
             }

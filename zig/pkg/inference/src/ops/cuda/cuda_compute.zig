@@ -20570,17 +20570,12 @@ fn writePhysicalFloat32Op(ctx: *anyopaque, output: CT, input: []const f32) anyer
     try copyFromHostTracked(self, target.buffer, std.mem.sliceAsBytes(input));
 }
 
-fn readFloat32IntoOp(ctx: *anyopaque, tensor: CT, output: []f32) anyerror!bool {
-    const source = tensorFromCt(tensor);
-    if (source.dtype != .f32 or source.quant_type != null) return false;
-    if (source.elem_count != output.len) return error.InvalidTensorShape;
-    return readFloat32RangeIntoOp(ctx, tensor, 0, output);
-}
-
-fn readFloat32RangeIntoOp(ctx: *anyopaque, tensor: CT, offset: usize, output: []f32) anyerror!bool {
+fn readFloat32IntoOp(ctx: *anyopaque, tensor: CT, start: ?usize, output: []f32) anyerror!bool {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const source = tensorFromCt(tensor);
     if (source.dtype != .f32 or source.quant_type != null) return false;
+    if (start == null and source.elem_count != output.len) return error.InvalidTensorShape;
+    const offset = start orelse 0;
     if (offset > source.elem_count or output.len > source.elem_count - offset) return error.InvalidTensorShape;
     const bytes = std.mem.sliceAsBytes(output);
     if (bytes.len == 0) return true;
@@ -36989,7 +36984,6 @@ const kernel_backend_impl: ops.KernelBackend = .{
     .prepareKernelRoute = &prepareKernelRouteOp,
     .createPhysicalCompletion = &createPhysicalCompletionOp,
     .readFloat32Into = &readFloat32IntoOp,
-    .readFloat32RangeInto = &readFloat32RangeIntoOp,
     .writePhysicalFloat32 = &writePhysicalFloat32Op,
     .writePhysicalIntegerLiteral = &writePhysicalIntegerLiteralOp,
     .retainImmutableTensor = &retainImmutableTensorOp,
@@ -41385,7 +41379,7 @@ test "CUDA planned transfers reject host copies during capture before device sub
     try std.testing.expect(compute.debug_cuda_graph_capture_disabled);
     compute.debug_cuda_graph_capture_disabled = false;
     var output = [_]f32{99};
-    try std.testing.expectError(error.CudaGraphCaptureUnsafeHostCopy, readFloat32IntoOp(&compute, &tensor, &output));
+    try std.testing.expectError(error.CudaGraphCaptureUnsafeHostCopy, readFloat32IntoOp(&compute, &tensor, null, &output));
     try std.testing.expect(compute.debug_cuda_graph_capture_disabled);
     try std.testing.expectEqual(@as(f32, 99), output[0]);
     compute.debug_cuda_graph_capture_disabled = false;

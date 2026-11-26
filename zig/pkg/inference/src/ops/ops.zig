@@ -6210,10 +6210,18 @@ pub const ComputeBackend = struct {
     }
 
     pub fn readFloat32Into(self: *const ComputeBackend, tensor: CT, output: []f32) !bool {
+        return self.readFloat32SelectionInto(tensor, null, output);
+    }
+
+    pub fn readFloat32RangeInto(self: *const ComputeBackend, tensor: CT, offset: usize, output: []f32) !bool {
+        return self.readFloat32SelectionInto(tensor, offset, output);
+    }
+
+    fn readFloat32SelectionInto(self: *const ComputeBackend, tensor: CT, offset: ?usize, output: []f32) !bool {
         try self.checkExecutionControl();
         const functions = self.vtable.kernels orelse return false;
         const read = functions.readFloat32Into orelse return false;
-        return read(self.ptr, tensor, output);
+        return read(self.ptr, tensor, offset, output);
     }
 
     pub fn retainImmutableTensor(self: *const ComputeBackend, tensor: CT, allocator: std.mem.Allocator) !?CT {

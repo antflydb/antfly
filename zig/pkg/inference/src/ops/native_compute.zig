@@ -7908,7 +7908,6 @@ const kernel_backend_impl: ops.KernelBackend = .{
     .writePhysicalIntegerLiteral = &writePhysicalIntegerLiteralOp,
     .copyPhysicalInput = &copyPhysicalInputOp,
     .readFloat32Into = &readFloat32IntoOp,
-    .readFloat32RangeInto = &readFloat32RangeIntoOp,
     .retainImmutableTensor = &retainImmutableTensorOp,
     .standaloneOutputBytes = &standaloneOutputBytesOp,
     .pooledOutputStorage = &pooledOutputStorageOp,
@@ -40698,19 +40697,17 @@ fn cloneTensorShapeOp(ctx: *anyopaque, input: CT, shape: []const i32) anyerror!?
     return try copyDenseSourceTensorWithShape(self, source, logical_shape[0..shape.len]);
 }
 
-fn readFloat32RangeIntoOp(_: *anyopaque, tensor: CT, offset: usize, output: []f32) anyerror!bool {
-    const source = toBuf(tensor);
-    if (source.declared_dtype != null and source.declared_dtype != .f32) return false;
-    if (source.view_strides != null or source.source_tensor != null or source.quantized_storage != null or source.lazy_entry != null) return false;
-    if (offset > source.data.len or output.len > source.data.len - offset) return error.InvalidTensorShape;
-    @memcpy(output, source.data[offset..][0..output.len]);
-    return true;
-}
-
-fn readFloat32IntoOp(ctx: *anyopaque, tensor: CT, output: []f32) anyerror!bool {
+fn readFloat32IntoOp(ctx: *anyopaque, tensor: CT, start: ?usize, output: []f32) anyerror!bool {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const source = toBuf(tensor);
     if (source.quantized_storage != null or source.lazy_entry != null) return false;
+    if (start) |offset| {
+        if ((source.declared_dtype != null and source.declared_dtype != .f32) or
+            source.view_strides != null or source.source_tensor != null) return false;
+        if (offset > source.data.len or output.len > source.data.len - offset) return error.InvalidTensorShape;
+        @memcpy(output, source.data[offset..][0..output.len]);
+        return true;
+    }
     const view = try denseTensorView(self, tensor);
     defer view.deinit(self.allocator);
     if (output.len != view.data.len) return error.InvalidTensorShape;

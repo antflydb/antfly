@@ -14600,18 +14600,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return true;
     }
 
-    fn readFloat32IntoOp(ctx: *anyopaque, tensor: CT, output: []f32) anyerror!bool {
-        const source = toBuf(tensor).metal_tensor orelse return false;
-        if (source.deviceByteLen() != std.mem.sliceAsBytes(output).len) return false;
-        return readFloat32RangeIntoOp(ctx, tensor, 0, output);
-    }
-
-    fn readFloat32RangeIntoOp(_: *anyopaque, tensor: CT, offset: usize, output: []f32) anyerror!bool {
+    fn readFloat32IntoOp(_: *anyopaque, tensor: CT, start: ?usize, output: []f32) anyerror!bool {
         const buf = toBuf(tensor);
         if (buf.integer_storage or hasHostView(buf) or buf.lazy_multiply != null or buf.quantized_storage != null or buf.runtime_quantized_storage != null or buf.owned_quantized_storage != null) return false;
         const source = buf.metal_tensor orelse return false;
         if (!source.isDevice() or source.dtype != .f32) return false;
-        try source.downloadByteRangeInto(try std.math.mul(usize, offset, @sizeOf(f32)), std.mem.sliceAsBytes(output));
+        const bytes = std.mem.sliceAsBytes(output);
+        if (start == null and source.deviceByteLen() != bytes.len) return false;
+        try source.downloadByteRangeInto(try std.math.mul(usize, start orelse 0, @sizeOf(f32)), bytes);
         return true;
     }
 
@@ -42864,7 +42860,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return supportsAssignedDescriptor(descriptor);
     }
 
-    const kernel_backend_impl: ops.KernelBackend = .{ .denseDecoder = &dense_decoder_services, .ownedPayloadServices = &owned_payload_services, .retainImmutableTensor = retainImmutableTensorOp, .standaloneOutputBytes = standaloneOutputBytesOp, .pooledOutputStorage = pooledOutputStorageOp, .gatherDeviceRows = gatherDeviceRowsOp, .regionPolicyKey = denseRegionPolicyKey, .claimRegionExecutionProfile = claimDenseProjectionProfile, .prepareRegionRoutes = prepareDenseProjectionRegions, .regionRoutesInOrdinaryFrame = true, .hostInputRequirements = hostInputRequirementsOp, .createHostInput = createHostInputOp, .hostInputViewExclusive = hostInputViewExclusiveOp, .createMetadataAlias = createMetadataAliasOp, .materializesOutput = materializesOutputOp, .physicalReplayReshapeViews = true, .implementation_table = &vtable_impl, .acceptsImplementation = acceptsPhysicalImplementation, .storageOwnership = storageOwnershipOp, .physicalLiteralBindingSupported = physicalLiteralBindingSupportedOp, .writePhysicalFloat32 = writePhysicalFloat32Op, .physicalLiteralInitializer = physicalLiteralInitializerOp, .copyPhysicalInput = copyPhysicalInputOp, .copyPhysicalIndexInput = copyPhysicalIndexInputOp, .validatePhysicalIndexInput = validatePhysicalIndexInputOp, .readFloat32Into = readFloat32IntoOp, .readFloat32RangeInto = readFloat32RangeIntoOp, .physical_storage_policy = &physical_storage_policy, .physicalTensorView = physicalTensorViewOp, .assignedKernelSupported = assignedKernelSupportedOp, .runAssignedKernel = runAssignedKernelOp, .assignedKernelWorkspace = assignedKernelWorkspaceOp, .prepareKernelRoute = prepareKernelRouteOp };
+    const kernel_backend_impl: ops.KernelBackend = .{ .denseDecoder = &dense_decoder_services, .ownedPayloadServices = &owned_payload_services, .retainImmutableTensor = retainImmutableTensorOp, .standaloneOutputBytes = standaloneOutputBytesOp, .pooledOutputStorage = pooledOutputStorageOp, .gatherDeviceRows = gatherDeviceRowsOp, .regionPolicyKey = denseRegionPolicyKey, .claimRegionExecutionProfile = claimDenseProjectionProfile, .prepareRegionRoutes = prepareDenseProjectionRegions, .regionRoutesInOrdinaryFrame = true, .hostInputRequirements = hostInputRequirementsOp, .createHostInput = createHostInputOp, .hostInputViewExclusive = hostInputViewExclusiveOp, .createMetadataAlias = createMetadataAliasOp, .materializesOutput = materializesOutputOp, .physicalReplayReshapeViews = true, .implementation_table = &vtable_impl, .acceptsImplementation = acceptsPhysicalImplementation, .storageOwnership = storageOwnershipOp, .physicalLiteralBindingSupported = physicalLiteralBindingSupportedOp, .writePhysicalFloat32 = writePhysicalFloat32Op, .physicalLiteralInitializer = physicalLiteralInitializerOp, .copyPhysicalInput = copyPhysicalInputOp, .copyPhysicalIndexInput = copyPhysicalIndexInputOp, .validatePhysicalIndexInput = validatePhysicalIndexInputOp, .readFloat32Into = readFloat32IntoOp, .physical_storage_policy = &physical_storage_policy, .physicalTensorView = physicalTensorViewOp, .assignedKernelSupported = assignedKernelSupportedOp, .runAssignedKernel = runAssignedKernelOp, .assignedKernelWorkspace = assignedKernelWorkspaceOp, .prepareKernelRoute = prepareKernelRouteOp };
 
     const vtable_impl: ops.ComputeBackend.VTable = blk: {
         var vt = native_compute_mod.vtable_impl;
