@@ -69539,6 +69539,19 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
     return &result;
 }
 
+test "scalar window retirement ordered catalog requires the all-member protocol" {
+    const protocol = @import("../common/data_raft_protocol.zig");
+    const inventory = @import("antfly_local_sources").storage_db_artifact_inventory;
+    var request: antfly.db.types.BatchRequest = .{ .artifact_catalog = .{
+        .namespace = @splat(1),
+        .catalogs = .{},
+        .binding = .{ .epoch = 1, .digest = @splat(2), .semantic_digest = @splat(3), .effect_protocol = inventory.dense_artifact_flags_protocol },
+    } };
+    try std.testing.expectEqual(protocol.batch_dense_artifact_flags_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, request));
+    request.artifact_catalog.?.binding.effect_protocol = inventory.scalar_window_retirement_protocol;
+    try std.testing.expectEqual(protocol.batch_scalar_window_retirement_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, request));
+}
+
 test "grouped source protocol dominates coexisting graph envelope features" {
     const protocol = @import("../common/data_raft_protocol.zig");
     var request: antfly.db.types.BatchRequest = .{ .artifact_catalog = .{
@@ -69549,9 +69562,6 @@ test "grouped source protocol dominates coexisting graph envelope features" {
     try std.testing.expectEqual(protocol.batch_group_source_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, request));
     request.artifact_catalog.?.binding.effect_protocol = 17;
     try std.testing.expectEqual(protocol.batch_execution_identity_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, request));
-    request.artifact_catalog.?.binding.effect_protocol = @import("antfly_local_sources").storage_db_artifact_inventory.scalar_window_retirement_protocol;
-    try std.testing.expectEqual(protocol.batch_scalar_window_retirement_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, request));
-    request.artifact_catalog.?.binding.effect_protocol = 17;
     // Independently added SQL and execution payloads share one batch. Even a
     // malformed private command must not lower the decoder chosen before
     // native validation; admission must use the newer decoder.
