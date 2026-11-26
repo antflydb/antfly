@@ -2354,6 +2354,8 @@ test "lite write amplification: sparse_vector inline fast path engages every wri
     const updates: usize = 20;
 
     const sparse = try measureSingleWriterVector(alloc, "lite-write-amp-sparse-inline-steady", true, updates);
+    // Over budget, say which stage paid the extra commits.
+    if (sparse.durableCommitsPerWrite() > 1.35) printStageTable("sparse_vector inline fast path, steady state", sparse);
     try expectAtMost(sparse.durableCommitsPerWrite(), 1.35, "sparse_vector inline fast path steady-state durable commits/write");
 }
 
