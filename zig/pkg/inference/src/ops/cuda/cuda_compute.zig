@@ -4106,6 +4106,7 @@ pub const CudaCompute = struct {
         if (self.execution_scope != null or try self.ctx.streamCaptureActive()) return null;
         const descriptor = graph_phase.descriptor;
         if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions)) return error.PreparedCachePlanChanged;
+        const dispatch_counts = try descriptor.dispatchCounts();
         const owner = &self.bounded_decode_graph;
         while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
         var claimed = false;
@@ -4131,8 +4132,7 @@ pub const CudaCompute = struct {
             owner.epoch_id = epoch;
         }
         if (owner.phase == .disabled) return null;
-        if (self.captured_cache_roots) |roots| try roots.beginGeneration(self, current);
-        if (owner.phase == .capture) arena: {
+        if (owner.phase == .capture) {
             owner.reserveArenaPrepared(&self.ctx, graph_phase) catch |err| switch (err) {
                 error.CudaMemoryLimitExceeded => {
                     owner.admission_denials += 1;
@@ -4141,8 +4141,8 @@ pub const CudaCompute = struct {
                 },
                 else => return err,
             };
-            break :arena;
         }
+        if (self.captured_cache_roots) |roots| try roots.beginGeneration(self, current);
         try self.lighton_attention.init(&self.ctx);
         if (owner.phase != .replay) {
             owner.progress = 0;
@@ -4158,8 +4158,8 @@ pub const CudaCompute = struct {
             _ = try blas.reserveTensorCorePlanSlots(&self.ctx, 64);
         };
         owner.future_tokens = future_tokens;
-        owner.expected_attention_calls = try checkedMul(try checkedMul(2, expected.attention_layers), (rows + 63) / 64);
-        owner.expected_ragged_packets = if (rows > 64) try checkedMul(try checkedMul(2, expected.recurrent_layers), (rows + 63) / 64) else 0;
+        owner.expected_attention_calls = dispatch_counts.attention;
+        owner.expected_ragged_packets = dispatch_counts.ragged_recurrent;
         claimed = true;
         return .{ .compute = self, .future_tokens = future_tokens };
     }

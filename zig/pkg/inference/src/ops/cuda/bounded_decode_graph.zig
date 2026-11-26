@@ -114,6 +114,17 @@ pub const Descriptor = struct {
         if (self.epoch == 0 or self.positions.len != self.rows * 3) return error.InvalidShape;
         return value;
     }
+    pub const DispatchCounts = struct { attention: usize, ragged_recurrent: usize };
+
+    pub fn dispatchCounts(self: Descriptor) !DispatchCounts {
+        if (self.rows < 2 or self.rows > max_rows) return error.InvalidShape;
+        const tiles = (self.rows + 63) / 64;
+        return .{
+            .attention = try std.math.mul(usize, self.attention_layers, 2 * tiles),
+            .ragged_recurrent = if (self.rows > 64) try std.math.mul(usize, self.recurrent_layers, 2 * tiles) else 0,
+        };
+    }
+
     pub fn storageRequest(self: Descriptor) !funding_mod.Request {
         const value = try self.layout();
         return .{ .captured_storage = .{ .epoch = self.epoch, .key_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(self.key)), .key_words = self.key.len, .rows = self.rows, .hidden = self.hidden, .vocab = self.vocab, .metadata_bytes = value.metadata_bytes, .host_bytes = value.host_bytes, .head_bytes = value.head_bytes } };
@@ -169,6 +180,7 @@ pub const GraphPhase = struct {
     bound: bool = false,
     pub fn initInto(self: *GraphPhase, descriptor: Descriptor) !void {
         _ = try descriptor.layout();
+        _ = try descriptor.dispatchCounts();
         self.* = .{ .descriptor = descriptor };
     }
     fn arenaRequest(self: *const GraphPhase, bytes: usize, events: usize, recipe: u64) funding_mod.Request {
@@ -821,4 +833,16 @@ test "CUDA bounded decoder binds zero scratch without reserving a device arena" 
     try std.testing.expectEqual(@as(usize, 0), owner.arena.len);
     try std.testing.expect(owner.arena_quota == .none);
     try std.testing.expect((try owner.bindArena()).complete());
+}
+
+test "CUDA bounded decoder validates dispatch geometry before preparing storage" {
+    const positions: [384]u32 = @splat(0);
+    var descriptor: Descriptor = .{ .epoch = 1, .key = &.{1}, .positions = positions[0 .. 64 * 3], .rows = 64, .hidden = 1024, .vocab = 8, .future_tokens = 16, .attention_layers = 3, .recurrent_layers = 5 };
+    try std.testing.expectEqual(Descriptor.DispatchCounts{ .attention = 6, .ragged_recurrent = 0 }, try descriptor.dispatchCounts());
+    descriptor.rows = 128;
+    descriptor.positions = &positions;
+    try std.testing.expectEqual(Descriptor.DispatchCounts{ .attention = 12, .ragged_recurrent = 20 }, try descriptor.dispatchCounts());
+    descriptor.recurrent_layers = std.math.maxInt(usize);
+    var phase: GraphPhase = undefined;
+    try std.testing.expectError(error.Overflow, phase.initInto(descriptor));
 }
