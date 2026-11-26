@@ -1549,6 +1549,26 @@ per engine, its isolated repeat measured 12.68 → 12.58 ms at p50 and
 13.51 → 13.62 ms at p95, with 1.91% same-binary median spread. Both
 control and crossover thresholds passed on the repeat.
 
+The Spark CPU crossover used the same two source revisions with 20
+warm observations per binary and mode. Every response matched the
+frozen Native output and all 120 model-and-arm receipts selected Native.
+Only Gemma 4 audio and video passed both the control and latency gates.
+The other crossover results remain provisional because their
+same-binary controls exceeded the allowed drift.
+
+| Workload | Candidate p50 change | Candidate p95 change | Controls within limits |
+| --- | ---: | ---: | --- |
+| Whisper | −1.9% | −36.0% | No |
+| EmbeddingGemma2 | −6.5% | −5.6% | No |
+| LightOnOCR | −0.3% | +33.6% | No |
+| GLiNER2.5 | +14.4% | +17.9% | No |
+| DECIDE | +2.7% | +5.4% | No |
+| Qwen3 | −4.4% | −6.0% | No |
+| Gemma 4 text | −46.6% | −61.9% | No |
+| Gemma 4 image | −25.7% | −18.4% | No |
+| Gemma 4 audio | −15.3% | −12.5% | Yes |
+| Gemma 4 video | −25.5% | −11.1% | Yes |
+
 The default library path selected EmbeddingGemma2's F32 audio fallback.
 The previous reference used the source BF16 recipe with cuDNN 9.19.
 On frozen main, the same text request returned all 768 coordinates

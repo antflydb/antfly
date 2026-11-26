@@ -45,18 +45,6 @@ pub fn create(a: std.mem.Allocator, graph: *const ml.graph.Graph, reachable: []c
 pub fn createWithBindings(a: std.mem.Allocator, graph: *const ml.graph.Graph, reachable: []const bool, physical: *const buffers.BufferPlan, owners: []const *const region.Owned, facts: []const @import("kernel_route.zig").Binding) !Plan {
     const n = graph.nodeCount();
     if (reachable.len != n or physical.node_positions.len != n or (facts.len != 0 and facts.len != n)) return error.InvalidRegionOrder;
-    const order = try a.alloc(ml.graph.NodeId, n);
-    defer a.free(order);
-    var live: usize = 0;
-    for (reachable, 0..) |active, id| if (active) {
-        order[live] = @intCast(id);
-        live += 1;
-    };
-    std.mem.sort(ml.graph.NodeId, order[0..live], physical, struct {
-        fn less(plan: *const buffers.BufferPlan, left: ml.graph.NodeId, right: ml.graph.NodeId) bool {
-            return plan.positionForNode(left) < plan.positionForNode(right);
-        }
-    }.less);
     try @import("region_schedule.zig").validateReachableBoundaries(a, graph, reachable, owners);
     const first = try a.alloc(u32, n);
     errdefer a.free(first);
@@ -80,17 +68,16 @@ pub fn createWithBindings(a: std.mem.Allocator, graph: *const ml.graph.Graph, re
     }
     const runtime = try interpreter.computeLastUse(a, graph, reachable);
     errdefer a.free(runtime);
-    const scheduled = try a.alloc(u32, n);
+    const scheduled = try ml.graph.passes.memory.computeLastUse(a, graph, .{
+        .reachable = reachable,
+        .positions = physical.node_positions,
+    });
     defer a.free(scheduled);
-    @memset(scheduled, none);
-    for (order[0..live]) |node| for (graph.node(node).getInputs()) |input| {
-        if (input != ml.graph.null_node) scheduled[input] = node;
-    };
-    // Match the existing partition executor's conservative treatment of a
-    // graph whose actual submission order differs from canonical NodeId order.
-    for (runtime, scheduled) |*value, actual| if (value.* != actual) {
-        value.* = none;
-    };
+    // The executor retires handles by graph NodeId. If the physical last
+    // consumer differs, conservatively keep the handle until frame retirement.
+    for (runtime, scheduled) |*value, actual| {
+        if (value.* != none and physical.positionForNode(value.*) != actual) value.* = none;
+    }
     for (owners) |owner| {
         const entry = physical.positionForNode(owner.entry_node);
         for (owner.input_nodes) |input| {
