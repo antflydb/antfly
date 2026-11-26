@@ -244,9 +244,9 @@ pub const Scope = struct {
     /// Bind the funded byte range before recording or submitting any kernels.
     pub fn bind(plan: *Plan, layout: Layout, backing: DevicePointer, backing_bytes: usize) !Scope {
         if (!std.meta.eql(layout, try plan.layoutImpl(layout.scratch_offset, layout.external_output))) return error.InvalidExecutionPlan;
-        if (layout.bytes == 0 and !layout.external_output) {
+        if (layout.bytes == 0) {
             if (backing != 0 or backing_bytes != 0) return error.InvalidExecutionPlan;
-            return .{ .plan = plan, .empty_backing = true };
+            return .{ .plan = plan, .empty_backing = true, .requires_published_output = layout.external_output };
         }
         if (backing == 0 or backing % alignment != 0 or layout.bytes > backing_bytes or
             backing > @as(DevicePointer, std.math.maxInt(DevicePointer)) - @as(DevicePointer, backing_bytes)) return error.InvalidExecutionPlan;
@@ -271,9 +271,9 @@ pub const Scope = struct {
     }
 
     pub fn disjointBacking(self: *const Scope, pointer: DevicePointer, bytes: usize) bool {
-        if (self.bound_start == 0 or pointer == 0 or bytes == 0) return false;
+        if (!self.isBound() or pointer == 0 or bytes == 0) return false;
         const end = std.math.add(DevicePointer, pointer, bytes) catch return false;
-        return end <= self.bound_start or pointer >= self.bound_end;
+        return self.empty_backing or end <= self.bound_start or pointer >= self.bound_end;
     }
 
     pub fn owns(self: *const Scope, pointer: DevicePointer) bool {
@@ -538,4 +538,18 @@ test "stream workspace binds a declared zero-scratch recipe without a device add
     try std.testing.expect(!scope.owns(alignment));
     try std.testing.expectError(error.AudioPlanChanged, scope.allocate(alignment));
     try std.testing.expect(!scope.complete());
+}
+
+test "declared stream workspace can publish into its only backing" {
+    var plan: Plan = .{};
+    try plan.declare(&.{.{ .allocate = 64 }}, 0);
+    const layout = try plan.layoutWithExternalOutput(0);
+    try std.testing.expectEqual(@as(usize, 0), layout.bytes);
+    var scope = try Scope.bind(&plan, layout, 0, 0);
+    try std.testing.expectError(error.InvalidExecutionPlan, scope.bindPublishedOutput(0, alignment));
+    try std.testing.expectError(error.InvalidExecutionPlan, scope.bindPublishedOutput(0x1000, 63));
+    try scope.bindPublishedOutput(0x1000, alignment);
+    try std.testing.expectEqual(@as(DevicePointer, 0x1000), try scope.allocate(64));
+    try std.testing.expect(scope.complete());
+    try std.testing.expect(scope.owns(0x1000));
 }
