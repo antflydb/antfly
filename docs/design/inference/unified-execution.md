@@ -1246,6 +1246,12 @@ Both branches matched text, stop reason, and token count. The fixture also
 checked cancellation and confirmed that separate Native contexts can
 share resident storage while foreign GPU contexts take the host route.
 
+At `3e6bcf05c5`, both physical GPU fixtures passed the incremental
+ONNX cache handoff and output-retirement regression. The shared role
+parser now drives declared geometry and retained quota for self and cross
+cache. The admission fixture rejects malformed merged-cache names while
+decoder-only artifact outputs retain their compact self-cache spelling.
+
 At `61adc44649`, the M4 Max retirement cohort passed 129 of 142
 selected tests in each run with the released T5-small merged decoder
 enabled on Native CPU and Metal. On both providers, the released decoder
