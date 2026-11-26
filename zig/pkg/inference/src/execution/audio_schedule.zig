@@ -552,6 +552,12 @@ pub const Plan = struct {
                     owned[id] = false;
                 }
             }
+            // An unconsumed result has no later retirement edge.
+            if (node.output != self.output and self.last_use[node.output] <= i and owned[node.output]) {
+                cb.freeWithCleanup(result, cleanup);
+                values[node.output] = null;
+                owned[node.output] = false;
+            }
         }
         try cb.checkExecutionControl();
         if (!owned[self.output]) return error.AudioScheduleInvalid;
@@ -600,13 +606,20 @@ pub const Capture = struct {
     }
     pub fn append(self: *Capture, node: Node, ct: CT) void {
         if (self.failed) return;
-        if (self.plan.count == self.nodes.len or self.plan.next_id == capacity) {
+        if (self.plan.count == self.nodes.len or self.plan.next_id == capacity or node.input_count > node.inputs.len) {
             self.failed = true;
             return;
+        }
+        for (node.inputs[0..node.input_count]) |id| {
+            if (id >= self.plan.next_id) {
+                self.failed = true;
+                return;
+            }
         }
         var n = node;
         n.output = self.plan.next_id;
         self.plan.next_id += 1;
+        self.plan.last_use[n.output] = @intCast(self.plan.count);
         for (n.inputs[0..n.input_count]) |id| self.plan.last_use[id] = @intCast(self.plan.count);
         self.handles[n.output] = ct;
         self.plan.nodes = &self.nodes;
