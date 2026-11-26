@@ -53094,7 +53094,9 @@ test "Metal routed block-scaled projection groups frequent experts and preserves
     var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
     defer provider.deinitOwned();
     const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
-    const rows, const width, const columns, const experts = .{ 1040, 32, 8, 5 };
+    // The complete group consumes 64 columns through the unrolled loop
+    // and the remaining 32 through the scalar loop.
+    const rows, const width, const columns, const experts = .{ 1040, 96, 8, 5 };
     const valid_ids = [_]u32{ 0, 1, 0, 2, 3, 0, 3, 3, 1, 0, 0, 3, 1, 2, 1, 0 };
     var ids: [rows]u32 = undefined;
     @memcpy(ids[0..valid_ids.len], &valid_ids);
