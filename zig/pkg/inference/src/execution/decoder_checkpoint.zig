@@ -108,12 +108,14 @@ fn resolveDonorGeometry(model: *const gpt_mod.Config, donors: anytype, layer_don
     for (0..model.num_hidden_layers) |layer| {
         const geometry = try model.kvDonorGeometry(layer);
         if (geometry.donor_layer == layer) {
-            donors[count] = .{
-                .layer = @intCast(layer),
-                .window = if (geometry.sliding) model.sliding_window else 0,
-                .heads = geometry.num_kv_heads,
-                .dim = geometry.head_dim,
-            };
+            const Donor = @TypeOf(donors[count]);
+            var donor: Donor = undefined;
+            donor.layer = @intCast(layer);
+            donor.heads = geometry.num_kv_heads;
+            donor.dim = geometry.head_dim;
+            if (@hasField(Donor, "window"))
+                donor.window = if (geometry.sliding) model.sliding_window else 0;
+            donors[count] = donor;
             layer_donors[layer] = @intCast(count);
             count += 1;
         } else {
@@ -334,14 +336,9 @@ pub const Shadow = struct {
         const view = source.kv_view orelse return error.UnsupportedCompactionQueryRoute;
         if (view.position_offset != 0 or view.token_count != source.total_tokens or source.sequence_id != view.sequence_id or capacity < source.total_tokens or capacity > native_kv_checkpoint.max_context_tokens) return error.InvalidCompactionProbe;
         var donors: [256]runtime.kv.device_clone.Donor = undefined;
-        var donor_count: usize = 0;
         if (runner.context.model.num_hidden_layers > donors.len) return error.UnsupportedCompactionQueryRoute;
-        for (0..runner.context.model.num_hidden_layers) |layer| {
-            if (!runner.context.model.isKvDonorLayer(layer)) continue;
-            const geometry = try runner.context.model.kvDonorGeometry(layer);
-            donors[donor_count] = .{ .layer = @intCast(layer), .heads = geometry.num_kv_heads, .dim = geometry.head_dim };
-            donor_count += 1;
-        }
+        var layer_donors: [256]u32 = undefined;
+        const donor_count = try resolveDonorGeometry(runner.context.model, &donors, &layer_donors);
         var execution_scope = try runner.context.execution.acquireScope();
         defer if (execution_scope) |*scope| scope.deinit();
         try self.initUnderExecution(runner, dtype);
@@ -1078,23 +1075,23 @@ pub const Runtime = struct {
         if (options.stats) |stats| stats.* = .{};
         var consumers: [256]queries.Consumer = undefined;
         var donors: [256]runtime.kv.device_clone.Donor = undefined;
-        var donor_count: usize = 0;
-        var count: usize = 0;
+        var layer_donors: [256]u32 = undefined;
+        const model = self.context.model;
+        const donor_count = try resolveDonorGeometry(model, &donors, &layer_donors);
         var kv_row_bytes: usize = 0;
-        for (0..self.context.model.num_hidden_layers) |layer| {
-            const geometry = try self.context.model.kvDonorGeometry(layer);
-            if (self.context.model.isKvDonorLayer(layer)) {
-                kv_row_bytes = try std.math.add(usize, kv_row_bytes, try dtype.bytesForTokenPairChecked(geometry.num_kv_heads, geometry.head_dim));
-                donors[donor_count] = .{ .layer = @intCast(layer), .heads = geometry.num_kv_heads, .dim = geometry.head_dim };
-                donor_count += 1;
-            }
-            if (self.context.model.layerUsesSlidingAttention(layer)) continue;
+        for (donors[0..donor_count]) |donor| {
+            kv_row_bytes = try std.math.add(usize, kv_row_bytes, try dtype.bytesForTokenPairChecked(donor.heads, donor.dim));
+        }
+        var count: usize = 0;
+        for (layer_donors[0..model.num_hidden_layers], 0..) |donor_index, layer| {
+            if (model.layerUsesSlidingAttention(layer)) continue;
+            const donor = donors[donor_index];
             consumers[count] = .{
                 .layer = @intCast(layer),
-                .donor = @intCast(geometry.donor_layer),
-                .query_heads = self.context.model.num_attention_heads,
-                .kv_heads = geometry.num_kv_heads,
-                .dim = geometry.head_dim,
+                .donor = donor.layer,
+                .query_heads = model.num_attention_heads,
+                .kv_heads = donor.heads,
+                .dim = donor.dim,
             };
             count += 1;
         }
@@ -1396,18 +1393,25 @@ test "checkpoint donor geometry agrees across export and restore for shared Gemm
     };
     var export_donors: [42]runtime.kv.attention_match_snapshot.Donor = undefined;
     var restore_donors: [42]runtime.kv.attention_match_resume.Geometry = undefined;
+    var clone_donors: [42]runtime.kv.device_clone.Donor = undefined;
+    var clone_mapping: [42]u32 = undefined;
     var export_mapping: [42]u32 = undefined;
     var restore_mapping: [42]u32 = undefined;
     const count = try resolveDonorGeometry(&config, &export_donors, &export_mapping);
     try std.testing.expectEqual(@as(usize, 24), count);
     try std.testing.expectEqual(count, try resolveDonorGeometry(&config, &restore_donors, &restore_mapping));
     try std.testing.expectEqualSlices(u32, &export_mapping, &restore_mapping);
+    try std.testing.expectEqual(count, try resolveDonorGeometry(&config, &clone_donors, &clone_mapping));
+    try std.testing.expectEqualSlices(u32, &export_mapping, &clone_mapping);
     var global: usize = 0;
-    for (export_donors[0..count], restore_donors[0..count]) |exported, restored| {
+    for (export_donors[0..count], restore_donors[0..count], clone_donors[0..count]) |exported, restored, cloned| {
         try std.testing.expectEqual(exported.layer, restored.layer);
         try std.testing.expectEqual(exported.window, restored.window);
         try std.testing.expectEqual(exported.heads, restored.heads);
         try std.testing.expectEqual(exported.dim, restored.dim);
+        try std.testing.expectEqual(exported.layer, cloned.layer);
+        try std.testing.expectEqual(exported.heads, cloned.heads);
+        try std.testing.expectEqual(exported.dim, cloned.dim);
         try std.testing.expectEqual(@as(u32, 2), exported.heads);
         try std.testing.expectEqual(@as(u32, if (exported.window == 0) 512 else 256), exported.dim);
         global += @intFromBool(exported.window == 0);
