@@ -3246,14 +3246,9 @@ test "reading default imported stages keep encoder resident and preserve host re
         const independent = stage_runtime.residentPairPlacement(encoder, reference_decoder, true);
         const expected_independent: @TypeOf(independent) = if (kind == .native) .resident_pair else .foreign_context;
         try std.testing.expectEqual(expected_independent, independent);
-        // Native storage can cross compute-context boundaries. Withdraw the
-        // test reference's residency capability to exercise the host path.
-        var host_reference = reference_decoder;
-        host_reference.shared_compute_context = null;
-        try std.testing.expectEqual(.foreign_context, stage_runtime.residentPairPlacement(encoder, host_reference, true));
         const config = ReadConfig{ .image_size = 1, .image_mean = .{ 0, 0, 0 }, .image_std = .{ 1, 1, 1 }, .max_length = 2, .decoder_start_token_id = 0, .eos_token_id = 1 };
         var candidate = ReadingPipeline.init(a, encoder, shared_decoder, tokenizer, config, null);
-        var reference = ReadingPipeline.init(a, encoder, host_reference, tokenizer, config, null);
+        var reference = ReadingPipeline.init(a, encoder, reference_decoder, tokenizer, config, null);
         var candidate_audit = audit_mod.Audit{};
         const actual = blk: {
             try audit_mod.begin(&candidate_audit);
@@ -3266,7 +3261,20 @@ test "reading default imported stages keep encoder resident and preserve host re
         const expected = blk: {
             try audit_mod.begin(&reference_audit);
             defer audit_mod.end();
-            break :blk try reference.readDecoded(.{ .data = &pixels, .width = 1, .height = 1, .channels = 4 });
+            // Request host encoder output explicitly while preserving the
+            // original session's provider and retirement identity.
+            var preparation = reference.preparationScope();
+            defer preparation.deinit();
+            const work = try preparation.allocator();
+            const normalized_pixels = try work.dupe(f32, &.{ 1, 0, 0 });
+            defer work.free(normalized_pixels);
+            var tensor = try preparation.tensor(f32, "pixel_values", &.{ 1, 3, 1, 1 }, normalized_pixels);
+            defer tensor.deinit();
+            var encoder_outputs: stage_runtime.EncoderOutputs = .{
+                .host = try preparation.run(encoder, &.{tensor}, a, null),
+            };
+            defer encoder_outputs.deinit(a);
+            break :blk try reference.decodeFromEncoderOutputs(&encoder_outputs, null, &preparation);
         };
         var owned_expected = expected;
         defer owned_expected.deinit();
