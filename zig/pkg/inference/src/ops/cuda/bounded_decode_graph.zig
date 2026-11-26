@@ -179,8 +179,7 @@ pub const Descriptor = struct {
         };
     }
 
-    pub fn storageRequest(self: Descriptor) !funding_mod.Request {
-        const value = try self.layout();
+    fn storageRequestFor(self: Descriptor, value: StorageLayout) funding_mod.Request {
         return .{ .captured_storage = .{ .epoch = self.epoch, .key_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(self.key)), .key_words = self.key.len, .rows = self.rows, .hidden = self.hidden, .vocab = self.vocab, .metadata_bytes = value.metadata_bytes, .host_bytes = value.host_bytes, .head_bytes = value.head_bytes } };
     }
 };
@@ -224,6 +223,7 @@ const ColdPhase = struct {
 
 pub const GraphPhase = struct {
     descriptor: Descriptor,
+    storage_layout: StorageLayout = undefined,
     mode: enum { none, storage, arena } = .none,
     expected_compute: usize = 0,
     old: Snapshot = undefined,
@@ -231,9 +231,9 @@ pub const GraphPhase = struct {
     cold: ?*ColdPhase = null,
     bound: bool = false,
     pub fn initInto(self: *GraphPhase, descriptor: Descriptor) !void {
-        _ = try descriptor.layout();
+        const layout = try descriptor.layout();
         _ = try descriptor.dispatchCounts();
-        self.* = .{ .descriptor = descriptor };
+        self.* = .{ .descriptor = descriptor, .storage_layout = layout };
     }
     fn arenaRequest(self: *const GraphPhase, layout: plan_mod.Layout) funding_mod.Request {
         return .{ .captured_arena = .{
@@ -256,7 +256,7 @@ pub const GraphPhase = struct {
         const cold = try allocator.create(ColdPhase);
         cold.* = .{ .allocator = allocator };
         errdefer cold.destroyOutside();
-        const request = if (self.mode == .storage) try self.descriptor.storageRequest() else self.arenaRequest(self.old.arena_layout orelse return error.InvalidPreparedCacheState);
+        const request = if (self.mode == .storage) self.descriptor.storageRequestFor(self.storage_layout) else self.arenaRequest(self.old.arena_layout orelse return error.InvalidPreparedCacheState);
         const amounts = switch (request) {
             .captured_storage => |value| try value.amounts(),
             .captured_arena => |value| value.amounts(),
@@ -438,12 +438,12 @@ pub const Module = struct {
 
     pub fn resetPrepared(self: *Module, ctx: *context.CudaContext, phase: *GraphPhase) !void {
         const descriptor = phase.descriptor;
-        const layout = try descriptor.layout();
+        const layout = phase.storage_layout;
         const dispatch = try descriptor.dispatchCounts();
         if (!phase.bound or phase.mode != .storage or self.metadata.ptr != 0 or self.head.ptr != 0 or self.arena.ptr != 0 or self.graph != null or self.pending_graph != null or self.plan != null or self.key.len != 0) return error.InvalidPreparedCacheState;
         const cold = phase.cold orelse return error.InvalidPreparedCacheState;
         if (cold.plan == null or !std.mem.eql(u64, cold.key, descriptor.key)) return error.PreparedCachePlanChanged;
-        const request = try descriptor.storageRequest();
+        const request = descriptor.storageRequestFor(layout);
         var lease = try cold.funding.?.take(request, try request.captured_storage.amounts());
         errdefer lease.releaseAfterSdkDeath();
         var metadata = try buffer.DeviceBuffer.alloc(ctx, layout.metadata_bytes);
@@ -692,7 +692,7 @@ test "captured graph exact funding precedes host plan allocation and quota final
     const key = [_]u64{ 3, 5, 7 };
     const positions = [_]u32{ 1, 2, 3, 4, 5, 6 };
     const descriptor = Descriptor{ .epoch = 1, .key = &key, .positions = &positions, .rows = 2, .hidden = 1024, .vocab = 8, .future_tokens = 16, .attention_layers = 1, .recurrent_layers = 1 };
-    const request = try descriptor.storageRequest();
+    const request = descriptor.storageRequestFor(try descriptor.layout());
     const exact = try request.captured_storage.amounts();
     var phase: GraphPhase = undefined;
     try phase.initInto(descriptor);
@@ -827,7 +827,7 @@ test "captured graph wide head and learned arena consume separate exact prefunde
     const positions: [384]u32 = @splat(1);
     const key = [_]u64{ 17, 23 };
     const descriptor = Descriptor{ .epoch = 42, .key = &key, .positions = &positions, .rows = 128, .hidden = 1024, .vocab = 8, .future_tokens = 16, .attention_layers = 1, .recurrent_layers = 1 };
-    const request = try descriptor.storageRequest();
+    const request = descriptor.storageRequestFor(try descriptor.layout());
     const exact = try request.captured_storage.amounts();
     var storage: GraphPhase = undefined;
     try storage.initInto(descriptor);

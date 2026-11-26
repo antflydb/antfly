@@ -4028,7 +4028,6 @@ pub const CudaCompute = struct {
         if (!acceptsPhysicalImplementation(cb.vtable)) return error.UnsupportedReaderEpochBackend;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         const descriptor = phase.descriptor;
-        _ = try descriptor.layout();
         if (phase.cold != null or phase.bound) return error.InvalidPreparedCacheState;
         if (current.outside_execution or current.boundary == null or try current.boundary.?.isSealed()) return error.MissingCurrentCleanupEpoch;
         if (!lightOnDecodeGraphEnabled(cb) or descriptor.rows > (if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128")) @as(usize, 128) else 64) or
