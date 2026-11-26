@@ -993,7 +993,7 @@ test "Inkling Metal resident decoder executes the full visit schedule on a synth
         .allocator = a,
         .tokenizer = hf.tokenizer(),
         .control = .{},
-        .prompt = .{ .before_image = &.{}, .after_image = try a.dupe(i32, &.{1}), .image = null, .initial_channel = null },
+        .prompt = .{ .media = &.{}, .suffix = try a.dupe(i32, &.{1}), .initial_channel = null },
         .options = .{},
     };
     defer pipeline.deinit();

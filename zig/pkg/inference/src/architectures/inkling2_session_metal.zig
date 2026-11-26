@@ -55,6 +55,51 @@ const PrefillShape = struct {
     }
 };
 
+// Decoded RGB is transient. Only the projected rows used by the current
+// decoder batch and a partially consumed preceding image can remain live.
+fn imageAdmission(prompt: chat.Prompt, chunk_rows: usize, hidden_size: usize) !vision_model.AdmissionBytes {
+    var peak: vision_model.AdmissionBytes = .{};
+    var position: usize = 0;
+    var batch_start: usize = 0;
+    var live: usize = 0;
+    var previous_bytes: usize = 0;
+    for (prompt.media) |item| {
+        const start = try std.math.add(usize, position, item.prefix.len);
+        const next_batch = start - start % chunk_rows;
+        if (next_batch != batch_start) {
+            live = if (position > next_batch) previous_bytes else 0;
+            batch_start = next_batch;
+        }
+        const need = vision_model.admissionBytes(item.image.width, item.image.height);
+        peak.host = @max(peak.host, need.host);
+        peak.device = @max(peak.device, try std.math.add(usize, live, need.device));
+        const image_rows = item.image.rows();
+        previous_bytes = try std.math.mul(usize, image_rows, hidden_size * @sizeOf(u16));
+        live = try std.math.add(usize, live, previous_bytes);
+        position = try std.math.add(usize, start, image_rows);
+    }
+    return peak;
+}
+
+test "Inkling chat frontend accounts for overlapping resident image rows" {
+    const input: chat.Prompt.Image = .{ .bytes = &.{}, .width = 80, .height = 80 };
+    var marker = [_]i32{0};
+    var separator: [32]i32 = @splat(0);
+    var media = [_]chat.Prompt.Media{
+        .{ .prefix = &marker, .image = input },
+        .{ .prefix = &marker, .image = input },
+    };
+    const prompt: chat.Prompt = .{ .media = &media, .suffix = &marker, .initial_channel = null };
+    const width = @import("inkling2_vision.zig").text_width;
+    const vision = vision_model.admissionBytes(input.width, input.height);
+    const projected_bytes = input.rows() * width * @sizeOf(u16);
+    try std.testing.expectEqual(vision.host, (try imageAdmission(prompt, 16, width)).host);
+    try std.testing.expectEqual(vision.device + projected_bytes, (try imageAdmission(prompt, 16, width)).device);
+    try std.testing.expectEqual(vision.device + projected_bytes, (try imageAdmission(prompt, 4, width)).device);
+    media[1].prefix = &separator;
+    try std.testing.expectEqual(vision.device, (try imageAdmission(prompt, 4, width)).device);
+}
+
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
     provider: MetalNativeProvider,
@@ -120,21 +165,18 @@ pub const Runtime = struct {
 
     pub fn generate(self: *Runtime, session: backends.Session, pipeline: *const TextPipeline, config: generation.GenerationConfig, callbacks: TextPipeline.Callbacks) !generation.GenerationResult {
         const logit_bytes = @as(usize, self.model.text.unpadded_vocab_size) * @sizeOf(f32);
-        const vision_bytes: vision_model.AdmissionBytes = if (pipeline.prompt.image != null)
-            vision_model.admissionBytes(pipeline.prompt.image_width, pipeline.prompt.image_height)
-        else
-            .{ .host = 0, .device = 0 };
-        const host = logit_bytes + vision_bytes.host;
         const guarded = session.withAdmissionControl(pipeline.control);
         var shape = PrefillShape.preferred(pipeline.prompt.count() -| 1);
         var plan: decoder.RequestPlan = undefined;
-        const retained, const workspace = while (true) {
+        const retained, const workspace, const host = while (true) {
             plan = try pipeline.requestPlanWithShape(&self.model, config, shape);
             const kv_bytes = try State.deviceBytes(plan.bank, plan.width);
             const device_bytes = try plan.deviceBytes();
-            const scratch = device_bytes - kv_bytes + vision_bytes.device;
-            if (shape.rows == 1 or try guarded.fitsRetainedStateWithWorkspace(host, kv_bytes, scratch))
-                break .{ kv_bytes, scratch };
+            const vision_bytes = try imageAdmission(pipeline.prompt, shape.rows, self.model.text.hidden_size);
+            const host_bytes = try std.math.add(usize, logit_bytes, vision_bytes.host);
+            const scratch = try std.math.add(usize, device_bytes - kv_bytes, vision_bytes.device);
+            if (shape.rows == 1 or try guarded.fitsRetainedStateWithWorkspace(host_bytes, kv_bytes, scratch))
+                break .{ kv_bytes, scratch, host_bytes };
             shape = shape.smaller().?;
         };
         var permit = try guarded.admitRetainedStateWithWorkspace(host, retained, workspace);
@@ -220,7 +262,7 @@ pub const TextPipeline = struct {
     }
 
     fn requestPlanWithShape(self: *const TextPipeline, model: *const decoder.Decoder, config: generation.GenerationConfig, shape: PrefillShape) !decoder.RequestPlan {
-        if (config.max_tokens <= 0 or self.prompt.after_image.len == 0 or
+        if (config.max_tokens <= 0 or self.prompt.suffix.len == 0 or
             config.grammar != null or config.kv_cache_mode != .exact_hybrid or
             config.cache_compaction_ratio != null or config.prompt_cache_enabled or config.draft_model != null or
             config.token_observer != null or (config.speculation_requested and config.speculation_policy == .force))
@@ -254,13 +296,14 @@ pub const TextPipeline = struct {
         var history: std.ArrayList(i64) = .empty;
         defer history.deinit(self.allocator);
         const greedy = chat.usesUnpenalizedGreedy(config);
-        const after = self.prompt.after_image;
+        const after = self.prompt.suffix;
         const chunk_rows: u32 = @intCast(plan.bank.layout.max_append_tokens);
         try self.prefillPrompt(&request, model, vision, after[0 .. after.len - 1], chunk_rows);
         if (!greedy) {
-            for ([_][]const i32{ self.prompt.before_image, after[0 .. after.len - 1] }) |prefix| {
-                for (prefix) |id| try history.append(self.allocator, id);
+            for (self.prompt.media) |item| {
+                for (item.prefix) |id| try history.append(self.allocator, id);
             }
+            for (after[0 .. after.len - 1]) |id| try history.append(self.allocator, id);
         }
 
         const turn_end = try chat.turnEndToken(self.allocator, self.tokenizer);
@@ -299,32 +342,45 @@ pub const TextPipeline = struct {
     }
 
     fn prefillPrompt(self: *const TextPipeline, request: *decoder.Request, model: *const decoder.Decoder, vision: ?*const vision_model.Vision, after: []const i32, chunk_rows: u32) !void {
-        var image_rows: ?vision_model.Vision.Embeddings = null;
-        defer if (image_rows) |*values| values.tensor.deinit();
-        var parts: [3]decoder.PrefixPart = undefined;
-        parts[0] = .{ .tokens = self.prompt.before_image };
-        var count: usize = 1;
-        if (self.prompt.image) |data| {
-            const encoder = vision orelse return error.UnsupportedInkling2Request;
-            image_rows = try self.encodeImage(model, encoder, data);
-            parts[count] = .{ .embeddings = .{ .tensor = &image_rows.?.tensor, .start = 0, .count = image_rows.?.rows } };
-            count += 1;
-        }
-        parts[count] = .{ .tokens = after };
-        count += 1;
+        const media = self.prompt.media;
+        const count = media.len * 2 + 1;
+        var local_images: [1]?vision_model.Vision.Embeddings = undefined;
+        const image_rows = if (media.len <= local_images.len) local_images[0..media.len] else try self.allocator.alloc(?vision_model.Vision.Embeddings, media.len);
+        defer if (media.len > local_images.len) self.allocator.free(image_rows);
+        @memset(image_rows, null);
+        defer for (image_rows) |*value| if (value.*) |*item| item.tensor.deinit();
+
+        // Any nonempty part consumes at least one row of a batch.
+        const part_capacity = @min(count, chunk_rows);
+        var local_batch: [3]decoder.PrefixPart = undefined;
+        const batch = if (part_capacity <= local_batch.len) local_batch[0..part_capacity] else try self.allocator.alloc(decoder.PrefixPart, part_capacity);
+        defer if (part_capacity > local_batch.len) self.allocator.free(batch);
 
         const total = self.prompt.count() - 1;
         var position: usize = 0;
         var part_index: usize = 0;
         var part_position: usize = 0;
+        var retired: usize = 0;
         while (position < total) {
             try self.check();
             const rows = @min(total - position, chunk_rows);
             var pending = rows;
-            var batch: [3]decoder.PrefixPart = undefined;
             var active: usize = 0;
             while (pending > 0 and part_index < count) {
-                const part = parts[part_index];
+                const index = part_index / 2;
+                const part: decoder.PrefixPart = if (index == media.len)
+                    .{ .tokens = after }
+                else if (part_index % 2 == 0)
+                    .{ .tokens = media[index].prefix }
+                else blk: {
+                    const stored = &image_rows[index];
+                    if (stored.* == null) {
+                        const encoder = vision orelse return error.UnsupportedInkling2Request;
+                        stored.* = try self.encodeImage(model, encoder, media[index].image);
+                    }
+                    const values = &stored.*.?;
+                    break :blk .{ .embeddings = .{ .tensor = &values.tensor, .start = 0, .count = values.rows } };
+                };
                 const take = @min(pending, part.rows() - part_position);
                 if (take > 0) {
                     batch[active] = part.slice(part_position, take);
@@ -339,21 +395,25 @@ pub const TextPipeline = struct {
             }
             if (pending != 0) return error.InvalidShape;
             try request.appendPrefix(batch[0..active]);
+            while (retired < part_index / 2) : (retired += 1) {
+                if (image_rows[retired]) |*item| item.tensor.deinit();
+                image_rows[retired] = null;
+            }
             position += rows;
         }
     }
 
-    fn encodeImage(self: *const TextPipeline, model: *const decoder.Decoder, encoder: *const vision_model.Vision, data: []const u8) !vision_model.Vision.Embeddings {
+    fn encodeImage(self: *const TextPipeline, model: *const decoder.Decoder, encoder: *const vision_model.Vision, input: chat.Prompt.Image) !vision_model.Vision.Embeddings {
         try self.check();
-        const rgb = image.decodeRgb(self.allocator, data) catch |err| switch (err) {
+        const rgb = image.decodeRgb(self.allocator, input.bytes) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return error.InvalidInkling2Image,
         };
         defer rgb.deinit(self.allocator);
-        if (rgb.width != self.prompt.image_width or rgb.height != self.prompt.image_height) return error.InvalidInkling2Image;
+        if (rgb.width != input.width or rgb.height != input.height) return error.InvalidInkling2Image;
         var embeddings = try encoder.encodeRgb(self.allocator, model.runtime, rgb.data, rgb.width, rgb.height);
         errdefer embeddings.tensor.deinit();
-        if (embeddings.rows != self.prompt.imageRows()) return error.InvalidInkling2Image;
+        if (embeddings.rows != input.rows()) return error.InvalidInkling2Image;
         return embeddings;
     }
 };

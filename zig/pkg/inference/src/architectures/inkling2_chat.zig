@@ -67,11 +67,25 @@ const end_marker = "<|end_message|>";
 const sampling_end_marker = "<|content_model_end_sampling|>";
 
 pub const Prompt = struct {
-    before_image: []i32,
-    after_image: []i32,
-    image: ?[]const u8,
-    image_width: u32 = 0,
-    image_height: u32 = 0,
+    pub const Image = struct {
+        bytes: []const u8,
+        width: u32,
+        height: u32,
+
+        pub fn rows(self: Image) usize {
+            return vision.Geometry.fromDimensions(self.width, self.height).mergedRows();
+        }
+    };
+
+    pub const Media = struct {
+        prefix: []i32,
+        image: Image,
+    };
+
+    const Marker = struct { offset: usize, image: Image };
+
+    media: []Media,
+    suffix: []i32,
     initial_channel: ?Channel,
 
     pub fn init(allocator: std.mem.Allocator, tok: Tokenizer, messages: []const generation.Message, options: ChatOptions, enable_thinking: ?bool) !Prompt {
@@ -82,8 +96,8 @@ pub const Prompt = struct {
         defer text.deinit(allocator);
         if (options.tools.len != 0) try appendTools(&text, allocator, options);
         var effort_written = false;
-        var image_data: ?[]const u8 = null;
-        var image_offset: usize = 0;
+        var markers: std.ArrayList(Marker) = .empty;
+        defer markers.deinit(allocator);
         for (messages, 0..) |message, message_index| {
             var tool_role: ?[]u8 = null;
             defer if (tool_role) |role| allocator.free(role);
@@ -110,16 +124,16 @@ pub const Prompt = struct {
                     .text => |content| try appendText(&text, allocator, role, content),
                     .image => |index| {
                         const attached = message.image_bytes orelse return error.InvalidInkling2Image;
-                        if (index >= attached.len or !std.mem.eql(u8, message.role, "user"))
+                        if (index >= attached.len or !imageRole(message.role))
                             return error.InvalidInkling2Image;
-                        try appendImage(&text, allocator, role, attached[index], &image_data, &image_offset);
+                        try appendImage(&text, allocator, role, attached[index], &markers);
                     },
                     .audio => return error.UnsupportedInkling2Request,
                 };
             } else {
                 for (message.image_bytes orelse &.{}) |data| {
-                    if (!std.mem.eql(u8, message.role, "user")) return error.InvalidInkling2Image;
-                    try appendImage(&text, allocator, role, data, &image_data, &image_offset);
+                    if (!imageRole(message.role)) return error.InvalidInkling2Image;
+                    try appendImage(&text, allocator, role, data, &markers);
                 }
                 if (!message.content_is_null) try appendText(&text, allocator, role, message.content);
             }
@@ -136,18 +150,23 @@ pub const Prompt = struct {
             try text.appendSlice(allocator, model_marker);
             try text.appendSlice(allocator, if (initial_channel == .reasoning) reasoning_marker else text_marker);
         }
-        const before = try tok.encode(allocator, text.items[0..image_offset]);
-        errdefer allocator.free(before);
-        const after = try tok.encode(allocator, text.items[image_offset..]);
-        errdefer allocator.free(after);
-        if (after.len == 0) return error.InvalidInkling2Tokenizer;
-        var prompt = Prompt{ .before_image = before, .after_image = after, .image = image_data, .initial_channel = initial_channel };
-        if (image_data) |data| {
-            const info = images.inspectEncodedForInference(data, vision.max_image_side) catch return error.InvalidInkling2Image;
-            prompt.image_width = info.width;
-            prompt.image_height = info.height;
+        const media = try allocator.alloc(Media, markers.items.len);
+        errdefer allocator.free(media);
+        var initialized: usize = 0;
+        errdefer for (media[0..initialized]) |item| allocator.free(item.prefix);
+        var offset: usize = 0;
+        for (markers.items, media) |marker, *item| {
+            item.* = .{
+                .prefix = try tok.encode(allocator, text.items[offset..marker.offset]),
+                .image = marker.image,
+            };
+            initialized += 1;
+            offset = marker.offset;
         }
-        return prompt;
+        const suffix = try tok.encode(allocator, text.items[offset..]);
+        errdefer allocator.free(suffix);
+        if (suffix.len == 0) return error.InvalidInkling2Tokenizer;
+        return .{ .media = media, .suffix = suffix, .initial_channel = initial_channel };
     }
 
     fn appendTools(text: *std.ArrayList(u8), allocator: std.mem.Allocator, options: ChatOptions) !void {
@@ -208,26 +227,31 @@ pub const Prompt = struct {
         try text.appendSlice(allocator, "<|end_message|>");
     }
 
-    fn appendImage(text: *std.ArrayList(u8), allocator: std.mem.Allocator, role: []const u8, data: []const u8, image_data: *?[]const u8, offset: *usize) !void {
-        if (image_data.* != null) return error.InvalidInkling2Image;
+    fn imageRole(role: []const u8) bool {
+        return std.mem.eql(u8, role, "user") or std.mem.eql(u8, role, "tool");
+    }
+
+    fn appendImage(text: *std.ArrayList(u8), allocator: std.mem.Allocator, role: []const u8, data: []const u8, markers: *std.ArrayList(Marker)) !void {
+        const info = images.inspectEncodedForInference(data, vision.max_image_side) catch return error.InvalidInkling2Image;
         try text.appendSlice(allocator, role);
         try text.appendSlice(allocator, "<|content_image|>");
-        offset.* = text.items.len;
-        image_data.* = data;
+        try markers.append(allocator, .{
+            .offset = text.items.len,
+            .image = .{ .bytes = data, .width = info.width, .height = info.height },
+        });
         try text.appendSlice(allocator, "<|end_message|>");
     }
 
     pub fn deinit(self: Prompt, allocator: std.mem.Allocator) void {
-        allocator.free(self.before_image);
-        allocator.free(self.after_image);
-    }
-
-    pub fn imageRows(self: Prompt) usize {
-        return vision.Geometry.fromDimensions(self.image_width, self.image_height).mergedRows();
+        for (self.media) |item| allocator.free(item.prefix);
+        allocator.free(self.media);
+        allocator.free(self.suffix);
     }
 
     pub fn count(self: Prompt) usize {
-        return self.before_image.len + self.after_image.len + self.imageRows();
+        var rows = self.suffix.len;
+        for (self.media) |item| rows += item.prefix.len + item.image.rows();
+        return rows;
     }
 };
 
@@ -428,6 +452,24 @@ test "Inkling chat frontend builds prompts and publishes tokens without a device
     try std.testing.expectEqual(Channel.reasoning, prompt.initial_channel.?);
     try std.testing.expect(prompt.count() > 0);
     try std.testing.expectEqual(@as(u32, 14), try turnEndToken(allocator, tokenizer));
+    const first = @embedFile("../pipelines/testdata/wide-rgba8.png");
+    const second = @embedFile("../pipelines/testdata/wide-rgba16.png");
+    const mixed = try Prompt.init(allocator, tokenizer, &.{.{
+        .role = "user",
+        .content = "",
+        .image_bytes = &.{ first, second },
+        .content_parts = &.{ .{ .image = 1 }, .{ .text = "x" }, .{ .image = 0 } },
+    }}, .{}, false);
+    defer mixed.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), mixed.media.len);
+    try std.testing.expectEqualStrings(second, mixed.media[0].image.bytes);
+    try std.testing.expectEqualStrings(first, mixed.media[1].image.bytes);
+    try std.testing.expect(std.mem.indexOfScalar(i32, mixed.media[1].prefix, 1) != null);
+    try std.testing.expectEqual(
+        mixed.suffix.len + mixed.media[0].prefix.len + mixed.media[0].image.rows() +
+            mixed.media[1].prefix.len + mixed.media[1].image.rows(),
+        mixed.count(),
+    );
     var output: Output = .{
         .allocator = allocator,
         .tokenizer = tokenizer,

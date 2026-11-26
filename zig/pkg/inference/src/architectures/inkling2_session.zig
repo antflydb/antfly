@@ -375,15 +375,17 @@ pub const Pipeline = struct {
         return self.model.encoder.encodeRgb(&self.model.model.blas, rgb.data, rgb.width, rgb.height);
     }
 
-    fn prefillImage(self: *Pipeline, request: *decoder.Request, data: []const u8) !void {
-        const rgb = try @import("../pipelines/inkling2_image.zig").decodeRgb(self.allocator, data);
+    fn prefillImage(self: *Pipeline, request: *decoder.Request, image: Prompt.Image) !void {
+        const rgb = try @import("../pipelines/inkling2_image.zig").decodeRgb(self.allocator, image.bytes);
         defer rgb.deinit(self.allocator);
+        if (rgb.width != image.width or rgb.height != image.height) return error.InvalidInkling2Image;
         var embeddings = try self.encodeImage(rgb);
         defer {
             self.model.enterCleanup();
             embeddings.deinit(&self.model.ctx);
             self.model.execution_gate.unlock();
         }
+        if (embeddings.rows != image.rows()) return error.InvalidInkling2Image;
         const row_bytes = @as(usize, self.model.model.text.hidden_size) * 2;
         var offset: u32 = 0;
         while (offset < embeddings.rows) {
@@ -425,13 +427,18 @@ pub const Pipeline = struct {
         try self.check();
         const model = self.model;
         const session = self.session.withAdmissionControl(self.control);
-        const pixels = @as(usize, self.prompt.image_width) * self.prompt.image_height;
+        var image_pixels: usize = 0;
+        var image_workspace: usize = 0;
+        for (self.prompt.media) |item| {
+            const pixels = @as(usize, item.image.width) * item.image.height;
+            image_pixels = @max(image_pixels, pixels);
+            image_workspace = @max(image_workspace, vision.requestWorkspaceBytes(item.image.rows(), pixels));
+        }
         const plan = try decoder.RequestPlan.init(&model.model, self.context_tokens, self.chunk_rows);
         const amount = try plan.memory(self.speculate, self.draft_verification == .batched);
         const draft_kv = if (self.speculate) dspark.Draft.requestKvBytes(self.context_tokens) else 0;
-        const image_workspace = if (self.prompt.image != null) vision.requestWorkspaceBytes(self.prompt.imageRows(), pixels) else 0;
         var admission = try session.admitRetainedStateWithWorkspace(
-            try std.math.add(usize, amount.host, try std.math.mul(usize, pixels, 11)),
+            try std.math.add(usize, amount.host, try std.math.mul(usize, image_pixels, 11)),
             try std.math.add(usize, amount.kv, draft_kv),
             try std.math.add(usize, amount.workspace, image_workspace),
         );
@@ -441,14 +448,18 @@ pub const Pipeline = struct {
         const draft: ?*dspark.Draft = if (self.speculate) &model.draft.? else null;
         try self.initializeRequest(&request, plan, draft);
         defer self.deinitializeRequest(&request, draft);
-        try self.prefill(&request, self.prompt.before_image);
-        if (self.prompt.image) |data| try self.prefillImage(&request, data);
-        const after = self.prompt.after_image;
+        for (self.prompt.media) |item| {
+            try self.prefill(&request, item.prefix);
+            try self.prefillImage(&request, item.image);
+        }
+        const after = self.prompt.suffix;
         try self.prefill(&request, after[0 .. after.len - 1]);
         var history: std.ArrayList(i64) = .empty;
         defer history.deinit(self.allocator);
         if (!usesGreedy(config)) {
-            for (self.prompt.before_image) |id| try history.append(self.allocator, id);
+            for (self.prompt.media) |item| {
+                for (item.prefix) |id| try history.append(self.allocator, id);
+            }
             for (after[0 .. after.len - 1]) |id| try history.append(self.allocator, id);
         }
         const turn_end = try chat.turnEndToken(self.allocator, self.tokenizer);
