@@ -12734,6 +12734,8 @@ pub const DataServer = struct {
     pub fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
         if (req.commit_requires == .direct_enrichments or req.prepared_enrichments_json != null)
             return @import("../common/data_raft_protocol.zig").batch_prepared_enrichments_protocol_version;
+        if (antfly.db.types.requiresScalarWindowRetirementProtocol(req))
+            return @import("../common/data_raft_protocol.zig").batch_scalar_window_retirement_protocol_version;
         if (antfly.db.types.requiresDenseArtifactFlagsProtocol(req))
             return @import("../common/data_raft_protocol.zig").batch_dense_artifact_flags_protocol_version;
         if (req.graph_endpoint_cleanup) return @import("../common/data_raft_protocol.zig").batch_graph_cleanup_neutral_protocol_version;
@@ -58323,6 +58325,9 @@ test "grouped source protocol dominates coexisting graph envelope features" {
     try std.testing.expectEqual(protocol.batch_group_source_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
     request.artifact_catalog.?.binding.effect_protocol = 17;
     try std.testing.expectEqual(protocol.batch_execution_identity_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+    request.artifact_catalog.?.binding.effect_protocol = @import("antfly_local_sources").storage_db_artifact_inventory.scalar_window_retirement_protocol;
+    try std.testing.expectEqual(protocol.batch_scalar_window_retirement_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+    request.artifact_catalog.?.binding.effect_protocol = 17;
     request = .{ .group_source = .{ .action = .activate, .artifact = "turns", .definition = .{ .table_incarnation = 1, .configuration = @splat(2) }, .namespace = @splat(1), .backfill = .{ .route = .{ .value = "" } } } };
     try std.testing.expectEqual(protocol.batch_group_source_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
     request.group_source.?.action = .activate_catalog;
