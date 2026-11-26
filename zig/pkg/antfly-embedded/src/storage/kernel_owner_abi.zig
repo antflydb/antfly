@@ -78,7 +78,8 @@ pub const merged_main_owner_abi_version: u32 = 123;
 // Version 132 combines CDC and SQL native-owner request and projection layouts.
 // Version 133 adds an optional lifetime receipt for artifact dispatch.
 // Version 134 carries accepted Raft positions in artifact dispatch receipts.
-pub const abi_version: u32 = 134;
+// Version 135 certifies superseded suffixes using the applied Raft term.
+pub const abi_version: u32 = 135;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1086,9 +1087,22 @@ pub const ContextHooksConfig = extern struct {
 
 pub const ArtifactDispatchReceipt = extern struct {
     pub const State = enum(u8) { active, abandoned, ordered, upload, _ };
+    pub const Applied = extern struct {
+        index: u64 = 0,
+        term: u64 = 0,
+    };
     pub const Observation = extern struct {
         index: u64 = 0,
+        term: u64 = 0,
         state: State = .active,
+
+        pub fn resolvedBy(self: Observation, applied: Applied) bool {
+            // Advancing through the index settles the attempt regardless of
+            // which entry won. An applied higher-term prefix also rules out
+            // an older suffix even when it ends before the old index.
+            return self.index != 0 and applied.index != 0 and (applied.index >= self.index or
+                (self.term != 0 and applied.term > self.term));
+        }
     };
 
     ctx: ?*anyopaque = null,
@@ -1121,7 +1135,7 @@ pub const RuntimeHooksConfig = extern struct {
     /// certify ordered apply. A null handle leaves the result unknown.
     artifact_publication_enqueue_tracked_fn: ?*const fn (?*anyopaque, u64, *const [24]u8, BorrowedBytes, *ArtifactDispatchReceipt) callconv(.c) Status = null,
     /// Nonblocking local Raft apply watermark for the dispatcher's group.
-    artifact_publication_applied_index_fn: ?*const fn (?*anyopaque, u64) callconv(.c) u64 = null,
+    artifact_publication_applied_fn: ?*const fn (?*anyopaque, u64, *ArtifactDispatchReceipt.Applied) callconv(.c) void = null,
     native_authority_ctx: ?*const anyopaque = null,
     native_authority_fn: ?NativeAuthorityFn = null,
     resolution_candidates: ResolutionCandidateConfig = .{},
