@@ -3769,13 +3769,12 @@ pub const CudaCompute = struct {
             const plan = owner.plan orelse return error.InvalidExecutionPlan;
             const WorkspaceScope = @import("../../execution/stream_workspace.zig").Scope;
             const capture = phase == .capture;
-            var scope = if (capture)
+            var scope: ?WorkspaceScope = if (capture)
                 try WorkspaceScope.bind(plan, try owner.arenaLayout(), owner.arena.ptr, owner.arena.len)
-            else
-                WorkspaceScope{ .plan = plan };
+            else if (phase == .learn) WorkspaceScope.observe(plan) else null;
             var capture_active = false;
             errdefer {
-                std.log.warn("LightOn decoder graph aborted: phase={s} event={d}/{d}", .{ @tagName(phase), scope.cursor, plan.event_count });
+                std.log.warn("LightOn decoder graph aborted: phase={s} event={d}/{d}", .{ @tagName(phase), if (scope) |value| value.cursor else 0, plan.event_count });
                 compute.execution_scope = null;
                 owner.active = false;
                 if (capture_active) {
@@ -3792,7 +3791,7 @@ pub const CudaCompute = struct {
             const d2h = compute.stats.d2h_bytes;
             const attention_calls = compute.lighton_attention.calls;
             const ragged_calls = compute.lighton_recurrent.ragged_batch_calls;
-            if (phase == .learn or capture) compute.execution_scope = &scope;
+            if (scope) |*active_scope| compute.execution_scope = active_scope;
             owner.active = true;
             callback(context, self) catch |failure| {
                 std.log.warn("LightOn decoder graph forward failed: phase={s} error={s}", .{ @tagName(phase), @errorName(failure) });
@@ -3811,7 +3810,7 @@ pub const CudaCompute = struct {
                     owner.phase = .disabled;
                 } else owner.phase = .capture;
             } else if (capture) {
-                const matches = scope.complete() and compute.stats.h2d_bytes == h2d and compute.stats.d2h_bytes == d2h and compute.lighton_attention.calls - attention_calls == owner.expected_attention_calls;
+                const matches = scope.?.complete() and compute.stats.h2d_bytes == h2d and compute.stats.d2h_bytes == d2h and compute.lighton_attention.calls - attention_calls == owner.expected_attention_calls;
                 capture_active = false;
                 owner.pending_graph = try graph_mod.endRecording(&compute.ctx);
                 if (!matches) return error.InvalidExecutionPlan;
@@ -17758,7 +17757,7 @@ fn allocDeviceBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
     var result = try allocDeviceBufferOrdinary(self, len);
     if (self.execution_scope) |scope| {
         result.len = len;
-        scope.plan.allocate(len, result.ptr);
+        scope.recordAllocation(len, result.ptr);
     }
     return result;
 }
@@ -20868,7 +20867,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         } else try plan_mod.Owner.create(std.heap.c_allocator);
         entry.owner = owner;
         const plan = &owner.plan;
-        var scope = plan_mod.Scope{ .plan = plan };
+        var scope = plan_mod.Scope.observe(plan);
         const h2d_before = self.stats.h2d_bytes;
         const d2h_before = self.stats.d2h_bytes;
         self.execution_scope = &scope;
@@ -21813,7 +21812,7 @@ const SourceLinearTemporary = struct {
             if (self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return error.CudaGraphCaptureUnsafeTempAlloc;
             retireSourceLinearScratch(self);
             const bank = try allocate(self, bytes);
-            scope.plan.allocate(bytes, bank.ptr);
+            scope.recordAllocation(bytes, bank.ptr);
             return .{ .bank = bank, .kind = .learned };
         }
         if (self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return error.CudaGraphCaptureUnsafeTempAlloc;

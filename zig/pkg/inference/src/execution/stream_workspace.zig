@@ -220,6 +220,18 @@ pub const Scope = struct {
     requires_published_output: bool = false,
     bound_start: DevicePointer = 0,
     bound_end: DevicePointer = 0,
+    /// Observe ordinary device allocations while learning a cold recipe.
+    /// This scope has no authority to return addresses from the plan.
+    pub fn observe(plan: *Plan) Scope {
+        std.debug.assert(!plan.sealed);
+        return .{ .plan = plan };
+    }
+
+    pub fn recordAllocation(self: *Scope, bytes: usize, pointer: DevicePointer) void {
+        std.debug.assert(!self.isBound());
+        self.plan.allocate(bytes, pointer);
+    }
+
     /// Bind the funded byte range before recording or submitting any kernels.
     pub fn bind(plan: *Plan, layout: Layout, backing: DevicePointer, backing_bytes: usize) !Scope {
         if (backing == 0 or backing % alignment != 0 or layout.bytes > backing_bytes or
@@ -257,11 +269,11 @@ pub const Scope = struct {
             (pointer >= self.base and pointer - self.base < peak));
     }
     pub fn allocate(self: *Scope, bytes: usize) !DevicePointer {
-        if (!self.valid or self.cursor == self.plan.event_count) {
-            self.valid = false;
-            return error.AudioPlanChanged;
-        }
-        if (self.requires_published_output and self.published_ptr == 0) {
+        // Observation scopes register real allocations through Plan.allocate.
+        // Only an admitted backing may issue addresses from a sealed recipe.
+        if (!self.isBound() or !self.valid or self.cursor >= self.plan.event_count or
+            (self.requires_published_output and self.published_ptr == 0))
+        {
             self.valid = false;
             return error.AudioPlanChanged;
         }
@@ -307,6 +319,9 @@ test "stream workspace rejects live buffers and event drift" {
     p.release(3000);
     try std.testing.expect(p.finishNoOutput());
     try std.testing.expectEqual(@as(usize, 768), p.peak);
+    var observing = Scope{ .plan = p };
+    try std.testing.expectError(error.AudioPlanChanged, observing.allocate(256));
+    try std.testing.expectEqual(@as(usize, 0), observing.cursor);
     var scope = Scope{ .plan = p, .base = 10000 };
     const a = try scope.allocate(256);
     const b = try scope.allocate(512);
