@@ -24,7 +24,6 @@ pub const Stack = struct {
 
     backing: Tensor,
     blocks: [capacity]Tensor,
-    prelude: Tensor,
     bank: Tensor,
     bank_blocks: [2]Tensor,
     width: u32,
@@ -34,20 +33,18 @@ pub const Stack = struct {
 
     pub fn deviceBytes(width: u32, rows: u32) !usize {
         const count = try std.math.mul(usize, width, rows);
-        return std.math.mul(usize, count, (capacity + 3) * @sizeOf(u16));
+        return std.math.mul(usize, count, (capacity + 2) * @sizeOf(u16));
     }
 
     pub fn init(a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, width: u32, rows: u32) !Stack {
         if (width == 0 or rows == 0) return error.InvalidShape;
         const count = try std.math.mul(usize, width, rows);
-        const total = try std.math.mul(usize, count, capacity + 3);
+        const total = try std.math.mul(usize, count, capacity + 2);
         const extent = std.math.cast(i32, count) orelse return error.InvalidShape;
         var backing = try allocate(a, runtime, total);
         errdefer backing.deinit();
         const row_bytes = count * @sizeOf(u16);
-        var prelude = try backing.retainedView(capacity * row_bytes, row_bytes, &.{extent});
-        errdefer prelude.deinit();
-        var bank = try backing.retainedView((capacity + 1) * row_bytes, 2 * row_bytes, &.{@intCast(2 * count)});
+        var bank = try backing.retainedView(capacity * row_bytes, 2 * row_bytes, &.{@intCast(2 * count)});
         errdefer bank.deinit();
         var blocks: [capacity]Tensor = undefined;
         var initialized: usize = 0;
@@ -62,7 +59,6 @@ pub const Stack = struct {
         return .{
             .backing = backing,
             .blocks = blocks,
-            .prelude = prelude,
             .bank = bank,
             .bank_blocks = .{ first, second },
             .width = width,
@@ -78,7 +74,6 @@ pub const Stack = struct {
         for (&self.bank_blocks) |*block| block.deinit();
         for (&self.blocks) |*block| block.deinit();
         self.bank.deinit();
-        self.prelude.deinit();
         self.backing.deinit();
     }
 
@@ -92,11 +87,14 @@ pub const Stack = struct {
         return &self.blocks[self.depth];
     }
 
-    pub fn advance(self: *Stack, visit: checkpoint.Visit, core_start: usize) !void {
-        switch (visit.preludeAction(core_start)) {
+    pub fn advance(self: *Stack, visit: checkpoint.Visit, core_start: usize, boundary: bool) !void {
+        const action = visit.preludeAction(core_start);
+        // Each core pass starts a fresh block. The saved block is read-only
+        // while the pass writes the two blocks that follow it.
+        if (action != .none and !boundary) return error.InvalidInkling2Schedule;
+        switch (action) {
             .none => {},
             .save => {
-                try self.current().copyInto(&self.prelude);
                 self.saved_depth = self.depth;
             },
             .restore => {
@@ -110,7 +108,6 @@ pub const Stack = struct {
                 );
                 defer loop.deinit();
                 try loop.copyInto(&self.bank);
-                try self.prelude.copyInto(&self.blocks[saved]);
                 self.depth = saved;
             },
         }
@@ -176,12 +173,13 @@ test "Inkling Metal residual stack restores the prelude and retains both cross-p
     try metal.beginFrame(runtime);
     errdefer metal.cancelFrame(runtime) catch {};
     const visit: checkpoint.Visit = .{ .weight_layer = 6, .pass = 0, .group = .sliding, .slot = 0 };
-    try stack.advance(visit, 6);
+    try std.testing.expectError(error.InvalidInkling2Schedule, stack.advance(visit, 6, false));
+    try stack.advance(visit, 6, true);
     try stack.finish(runtime, true, &partial, &partial);
     try stack.finish(runtime, true, &partial, &partial);
     var replay = visit;
     replay.pass = 1;
-    try stack.advance(replay, 6);
+    try stack.advance(replay, 6, true);
     try stack.mixBank(runtime, 0.000001, &query, &message);
     try metal.submitFrame(runtime);
     try metal.waitFrame(runtime);

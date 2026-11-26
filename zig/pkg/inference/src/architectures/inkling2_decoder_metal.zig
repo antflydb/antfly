@@ -467,7 +467,8 @@ pub const Request = struct {
         const layer = &self.model.layers[op.weight_layer];
         const local = layer.attention.local;
         const looped = op.pass != 0;
-        try work.stack.advance(op, text.loop_config.core_start);
+        const boundary = op.weight_layer % text.n_layers_per_attn_res_block == 0;
+        try work.stack.advance(op, text.loop_config.core_start, boundary);
 
         // The expert and final normalization reuse the query input after
         // attention has consumed it. Both controllers also reuse the F32 mix.
@@ -496,7 +497,6 @@ pub const Request = struct {
         }, binding.page_ids, binding.planes, binding.history, work.attention.bind(local), work.get(.raw));
         try self.state.convolveResidual(pending, text.hidden_size, work.get(.raw), layer.weight(.attn_taps), binding.attention_residual, work.get(.convolved_attention));
 
-        const boundary = op.weight_layer % text.n_layers_per_attn_res_block == 0;
         const completed = work.stack.depth + @intFromBool(boundary);
         const previous = if (boundary) null else work.stack.current();
         const gamma = layer.weight(.mlp_norm);
