@@ -457,7 +457,9 @@ pub const State = struct {
             else => return err,
         };
         defer scope.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
-        if (backend.kind() == .metal and (backend.decoderRuntimeHasActiveFrame() or backend.decoderRuntimeHasSubmittedFrame())) return scope.finish();
+        const submission = @import("submission.zig");
+        const metal_frame = backend.kind() == .metal;
+        if (metal_frame and (try submission.Scope.beginIfNeeded(backend, false)).foreign) return scope.finish();
 
         var staged = false;
         for (reservations.items) |*item| {
@@ -489,10 +491,9 @@ pub const State = struct {
         }
         if (!staged) return scope.finish();
         // Keep the Metal copies in one frame and publish only after retirement.
-        const metal_frame = backend.kind() == .metal;
-        if (metal_frame and !try backend.decoderRuntimeBeginFrame()) return scope.finish();
-        errdefer if (metal_frame and backend.decoderRuntimeHasActiveFrame())
-            backend.decoderRuntimeCancelFrame() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        var frame = if (metal_frame) try submission.Scope.begin(backend) else null;
+        defer if (frame) |*owned| owned.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        if (frame) |owned| if (!owned.owns) return scope.finish();
         const completion = if (kernels.createPhysicalCompletion) |create| try create(backend.ptr) else null;
         defer if (completion) |event| event.deinit();
         {
@@ -511,7 +512,7 @@ pub const State = struct {
                 };
             }
         }
-        if (metal_frame) try backend.decoderRuntimeSubmitAndWaitFrame();
+        if (frame) |*owned| try owned.finish();
         try scope.finish();
         // Publish only completed copies. All ownership is already staged;
         // rejection and cancellation leave the prior slots authoritative.

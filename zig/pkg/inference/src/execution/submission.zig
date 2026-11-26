@@ -43,13 +43,23 @@ pub const Scope = struct {
     pub fn finish(self: *Scope) !void {
         if (!self.owns) return;
         self.owns = false;
-        try self.backend.vtable.regions.commands.submitAndWaitFrame.?(self.backend.ptr);
+        const commands = self.backend.vtable.regions.commands;
+        commands.submitAndWaitFrame.?(self.backend.ptr) catch |err| {
+            // A failed submit can leave an unsubmitted encoding active.
+            self.owns = commands.hasActiveFrame.?(self.backend.ptr);
+            return err;
+        };
+    }
+
+    pub fn deinitChecked(self: *Scope) !void {
+        if (!self.owns) return;
+        self.owns = false;
+        const commands = self.backend.vtable.regions.commands;
+        if (commands.hasActiveFrame.?(self.backend.ptr)) try commands.cancelFrame.?(self.backend.ptr);
     }
 
     pub fn deinit(self: *Scope) void {
-        if (!self.owns) return;
-        self.owns = false;
-        self.backend.vtable.regions.commands.cancelFrame.?(self.backend.ptr) catch {};
+        self.deinitChecked() catch {};
     }
 };
 
