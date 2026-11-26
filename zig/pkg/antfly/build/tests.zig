@@ -654,6 +654,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         auth.addImport("antfly_platform", platform_mod);
         module.addImport("usermgr_storage", auth);
     }
+    const publication_dispatch_tests = b.step("antfly-publication-dispatch-test", "Run exact artifact publication queue and job lifecycle regressions");
+    for ([_]*std.Build.Module{ antfly_test_mod, data_implementation_module }, [_][]const u8{ "publication queue", "data runtime ordered artifact upload handoff" }) |module, filter| {
+        const tests = b.addTest(.{
+            .root_module = module,
+            .filters = b.allocator.dupe([]const u8, &.{filter}) catch @panic("OOM"),
+            .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        });
+        publication_dispatch_tests.dependOn(&addFilteredTestRunArtifact(b, tests).step);
+    }
+
     const cypher_remote_routing_tests = b.addTest(.{
         .root_module = data_consumer_module,
         .filters = &.{"remote graph"},

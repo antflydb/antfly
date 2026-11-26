@@ -45,6 +45,19 @@ pub fn readOrderedApplyReceipt(
         else => return err,
     };
     defer alloc.free(raw);
+    return try decodeOrderedReceipt(raw);
+}
+
+/// Read the watermark from the same snapshot as the artifact records.
+pub fn readOrderedApplyReceiptTxn(txn: anytype) !?OrderedApplyReceipt {
+    const raw = txn.get(&internal_keys.ordered_document_applied_entry_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    return try decodeOrderedReceipt(raw);
+}
+
+fn decodeOrderedReceipt(raw: []const u8) !OrderedApplyReceipt {
     if (raw.len != ordered_apply_receipt_value_len) return error.CorruptOrderedApplyReceipt;
     const identity: OrderedApplyReceipt = .{
         .term = std.mem.readInt(u64, raw[0..8], .little),
