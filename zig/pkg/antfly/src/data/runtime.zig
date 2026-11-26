@@ -9348,7 +9348,7 @@ pub const DataServer = struct {
         if (!self.data_raft_mutex.tryLock()) return;
         defer self.data_raft_mutex.unlock();
         const raft = self.data_raft orelse return;
-        const host = &raft.host.http_host.host;
+        const host = raft.host.http_host.host;
         const status = host.raftStatus(group_id) orelse return;
         out.* = .{
             .index = status.applied_index,
