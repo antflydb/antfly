@@ -17,6 +17,7 @@
 struct DenseBf16ProjectionParams {
     uint rows, input_width, output_width, f32_output, has_bias, plane_width;
     float softcap;
+    uint plane_count, plane_ends[6];
 };
 
 inline void antfly_dense_bf16_store(
@@ -24,8 +25,19 @@ inline void antfly_dense_bf16_store(
     constant DenseBf16ProjectionParams &p, uint row, uint column, float dot
 ) {
     const uint plane = p.plane_width;
-    const ulong index = plane == 0u ? ulong(row) * p.output_width + column
+    ulong index = plane == 0u ? ulong(row) * p.output_width + column
         : (ulong(column / plane) * p.rows + row) * plane + column % plane;
+    if (p.plane_count != 0u) {
+        uint begin = 0u;
+        for (uint i = 0u; i < p.plane_count; ++i) {
+            const uint end = p.plane_ends[i];
+            if (column < end) {
+                index = ulong(begin) * p.rows + ulong(row) * (end - begin) + column - begin;
+                break;
+            }
+            begin = end;
+        }
+    }
     const float value = p.has_bias ? dot + float(bias[column]) : dot;
     if (p.f32_output)
         reinterpret_cast<device float *>(output)[index] = p.softcap > 0.0f ? tanh(value / p.softcap) * p.softcap : value;

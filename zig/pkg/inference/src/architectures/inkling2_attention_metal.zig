@@ -78,13 +78,19 @@ pub const Layer = struct {
         const sources = [_]*const Tensor{ inputs.query, inputs.query, inputs.query, inputs.query, inputs.key, inputs.value };
         var projected: usize = 0;
         if (outputs.packed_projection) |packed_output| {
-            if (rows != 1) return error.InvalidShape;
             const shared_input = inputs.query == inputs.key and inputs.query == inputs.value;
             projected = if (shared_input) layout.projection_weights.len else layout.query_weights.len;
+            var ends: [layout.projection_weights.len]u32 = undefined;
+            var width: u32 = 0;
+            for (layout.projection_weights[0..projected], ends[0..projected]) |key, *end| {
+                width += layout.projectionWidth(text, key);
+                end.* = width;
+            }
             const projection: metal.DenseBf16Projection = .{
-                .rows = 1,
+                .rows = rows,
                 .input_width = text.hidden_size,
-                .output_width = layout.projectionSize(text, layout.projection_weights[0..projected]),
+                .output_width = width,
+                .plane_ends = if (rows == 1) &.{} else ends[0..projected],
             };
             try projection.encode(runtime, inputs.query, &self.projections, packed_output);
         }
@@ -242,14 +248,12 @@ pub const RequestWorkspace = struct {
     backing: Tensor,
     views: [plane_count]Tensor,
     reduction: ?Tensor,
-    packed_rows: bool,
 
     pub const Plan = struct {
         offsets: [plane_count]usize,
         elements: [plane_count]i32,
         bytes: usize,
         reduction_elements: i32,
-        packed_rows: bool,
 
         pub fn init(text: checkpoint.TextConfig, rows: u32, max_tokens: u32, reduction_rows: u32) !Plan {
             if (rows == 0 or rows > max_tokens or rows > 256 or reduction_rows == 0 or reduction_rows > rows)
@@ -285,13 +289,12 @@ pub const RequestWorkspace = struct {
                 .elements = undefined,
                 .bytes = 0,
                 .reduction_elements = try attention.scratchElements(),
-                .packed_rows = rows == 1,
             };
             for (widths, &result.offsets, &result.elements, 0..) |width, *offset, *elements, index| {
                 if (width == 0) return error.InvalidShape;
                 const count = @as(usize, rows) * width;
                 elements.* = std.math.cast(i32, count) orelse return error.InvalidShape;
-                offset.* = if (result.packed_rows and index < layout.projection_weights.len)
+                offset.* = if (index < layout.projection_weights.len)
                     result.bytes
                 else
                     std.mem.alignForward(usize, result.bytes, 256);
@@ -324,7 +327,7 @@ pub const RequestWorkspace = struct {
             view.* = try backing.retainedView(offset, @as(usize, @intCast(elements)) * 2, &.{elements});
             count += 1;
         }
-        return .{ .backing = backing, .views = views, .reduction = reduction, .packed_rows = plan.packed_rows };
+        return .{ .backing = backing, .views = views, .reduction = reduction };
     }
 
     pub fn deinit(self: *RequestWorkspace) void {
@@ -350,7 +353,7 @@ pub const RequestWorkspace = struct {
                 .value_taps = if (local) null else self.plane(.value_taps),
                 // Output width limits the write to the contiguous projection
                 // prefix, leaving downstream work planes alone.
-                .packed_projection = if (self.packed_rows) &self.backing else null,
+                .packed_projection = &self.backing,
             },
             .normalized_query = self.plane(.normalized_query),
             .normalized_relative = self.plane(.normalized_relative),
@@ -456,25 +459,33 @@ test "Inkling Metal attention weights preserve packed offsets and local/global l
             try std.testing.expectEqual(bits, actual);
         }
 
-        var separate_source = try upload(std.testing.allocator, runtime, &Fixture.data_b);
-        defer separate_source.deinit();
-        var work = try RequestWorkspace.init(std.testing.allocator, runtime, try .init(text, 1, 2, 1), null, null);
-        defer work.deinit();
-        for ([_]*const Tensor{ &source, &separate_source }) |kv_source| {
-            var counters = @import("../execution/runtime_observation.zig").Scope.init();
-            defer counters.deinit();
-            try metal.beginFrame(runtime);
-            errdefer metal.cancelFrame(runtime) catch {};
-            try layer.projectInputs(runtime, text, 1, .{ .query = &source, .key = kv_source, .value = kv_source }, work.bind(layer.local).projected);
-            try metal.submitFrame(runtime);
-            try metal.waitFrame(runtime);
-            const projection_dispatches: u64 = if (kv_source == &source) 1 else 3;
-            const tap_dispatches: u64 = if (layer.local) 0 else 2;
-            try std.testing.expectEqual(projection_dispatches + tap_dispatches, counters.snapshot().metal_encoded_dispatches.?);
-            for (work.views[0..layout.projection_weights.len], expected[0..layout.projection_weights.len]) |*output, bits| {
-                var actual: u16 = undefined;
-                try output.downloadBytesInto(std.mem.asBytes(&actual));
-                try std.testing.expectEqual(bits, actual);
+        // The second row uses a different input so the packed ABI must
+        // publish separate feature planes, each with row-major values.
+        const payload = Fixture.data_b ++ Fixture.data_a;
+        for ([_]u32{ 1, 2 }) |rows| {
+            var batch_source = try upload(std.testing.allocator, runtime, payload[0 .. rows * 2]);
+            defer batch_source.deinit();
+            var separate_source = try upload(std.testing.allocator, runtime, payload[0 .. rows * 2]);
+            defer separate_source.deinit();
+            var work = try RequestWorkspace.init(std.testing.allocator, runtime, try .init(text, rows, 2, rows), null, null);
+            defer work.deinit();
+            for ([_]*const Tensor{ &batch_source, &separate_source }) |kv_source| {
+                var counters = @import("../execution/runtime_observation.zig").Scope.init();
+                defer counters.deinit();
+                try metal.beginFrame(runtime);
+                errdefer metal.cancelFrame(runtime) catch {};
+                try layer.projectInputs(runtime, text, rows, .{ .query = &batch_source, .key = kv_source, .value = kv_source }, work.bind(layer.local).projected);
+                try metal.submitFrame(runtime);
+                try metal.waitFrame(runtime);
+                const projection_dispatches: u64 = if (kv_source == &batch_source) 1 else 3;
+                const tap_dispatches: u64 = if (layer.local) 0 else 2;
+                try std.testing.expectEqual(projection_dispatches + tap_dispatches, counters.snapshot().metal_encoded_dispatches.?);
+                for (work.views[0..layout.projection_weights.len], expected[0..layout.projection_weights.len]) |*output, bits| {
+                    var actual: [2]u16 = undefined;
+                    try output.downloadBytesInto(std.mem.sliceAsBytes(actual[0..rows]));
+                    try std.testing.expectEqual(bits, actual[0]);
+                    if (rows == 2) try std.testing.expectEqual(bits - 0x80, actual[1]);
+                }
             }
         }
     }

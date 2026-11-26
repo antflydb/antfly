@@ -13360,6 +13360,7 @@ static NSString *termite_metal_shader_source(void) {
            "struct DenseBf16ProjectionParams {\n"
            "    uint rows, input_width, output_width, f32_output, has_bias, plane_width;\n"
            "    float softcap;\n"
+           "    uint plane_count, plane_ends[6];\n"
            "};\n"
            "\n"
            "inline void antfly_dense_bf16_store(\n"
@@ -13367,8 +13368,19 @@ static NSString *termite_metal_shader_source(void) {
            "    constant DenseBf16ProjectionParams &p, uint row, uint column, float dot\n"
            ") {\n"
            "    const uint plane = p.plane_width;\n"
-           "    const ulong index = plane == 0u ? ulong(row) * p.output_width + column\n"
+           "    ulong index = plane == 0u ? ulong(row) * p.output_width + column\n"
            "        : (ulong(column / plane) * p.rows + row) * plane + column % plane;\n"
+           "    if (p.plane_count != 0u) {\n"
+           "        uint begin = 0u;\n"
+           "        for (uint i = 0u; i < p.plane_count; ++i) {\n"
+           "            const uint end = p.plane_ends[i];\n"
+           "            if (column < end) {\n"
+           "                index = ulong(begin) * p.rows + ulong(row) * (end - begin) + column - begin;\n"
+           "                break;\n"
+           "            }\n"
+           "            begin = end;\n"
+           "        }\n"
+           "    }\n"
            "    const float value = p.has_bias ? dot + float(bias[column]) : dot;\n"
            "    if (p.f32_output)\n"
            "        reinterpret_cast<device float *>(output)[index] = p.softcap > 0.0f ? tanh(value / p.softcap) * p.softcap : value;\n"
@@ -38011,6 +38023,7 @@ int antfly_metal_dispatch_causal_depthwise4_bf16(
 typedef struct {
     uint32_t rows, input_width, output_width, f32_output, has_bias, plane_width;
     float softcap;
+    uint32_t plane_count, plane_ends[6];
 } antfly_metal_dense_bf16_projection_params;
 
 int antfly_metal_dispatch_dense_bf16_projection(
@@ -38019,7 +38032,14 @@ int antfly_metal_dispatch_dense_bf16_projection(
 ) {
     if (!runtime || !views || !p || !p->rows || !p->input_width || !p->output_width ||
         !isfinite(p->softcap) || p->softcap < 0 || (!p->f32_output && p->softcap != 0) ||
-        (p->plane_width && p->output_width % p->plane_width)) return -1;
+        (p->plane_width && (p->plane_count || p->output_width % p->plane_width)) ||
+        p->plane_count > 6u) return -1;
+    uint32_t end = 0;
+    for (uint32_t plane = 0; plane < p->plane_count; ++plane) {
+        if (p->plane_ends[plane] <= end) return -1;
+        end = p->plane_ends[plane];
+    }
+    if (p->plane_count && end != p->output_width) return -1;
     const size_t output_size = p->f32_output ? 4u : 2u;
     size_t required[4] = {0, 0, 0, p->has_bias ? (size_t)p->output_width * 2u : 0};
     if (!termite_metal_size_mul(p->rows, (size_t)p->input_width * 2u, &required[0]) ||

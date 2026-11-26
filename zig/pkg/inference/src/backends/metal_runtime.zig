@@ -53893,9 +53893,21 @@ pub const DenseBf16Projection = struct {
     softcap: f32 = 0,
     /// Optional equal-width feature planes stored consecutively, each row major.
     plane_width: u32 = 0,
+    /// Cumulative feature ends for unequal planes in checkpoint order.
+    plane_ends: []const u32 = &.{},
 
     const Buffer = RoutedBlockScaledProjection.Buffer;
-    const Wire = extern struct { rows: u32, input_width: u32, output_width: u32, f32_output: u32, has_bias: u32, plane_width: u32, softcap: f32 };
+    const Wire = extern struct {
+        rows: u32,
+        input_width: u32,
+        output_width: u32,
+        f32_output: u32,
+        has_bias: u32,
+        plane_width: u32,
+        softcap: f32,
+        plane_count: u32,
+        plane_ends: [6]u32,
+    };
     extern fn antfly_metal_dispatch_dense_bf16_projection(runtime: *RawMetalDecodeRuntime, views: *const [4]Buffer, params: *const Wire) c_int;
 
     pub fn encode(self: DenseBf16Projection, runtime: *RawMetalDecodeRuntime, input: *const MetalTensor, weight: *const MetalTensor, output: *MetalTensor) !void {
@@ -53910,7 +53922,7 @@ pub const DenseBf16Projection = struct {
             try .fromTensor(input, .i16),                              try .fromTensor(weight, .i16), try .fromTensor(output, output.dtype),
             if (bias) |values| try .fromTensor(values, .i16) else .{},
         };
-        if (antfly_metal_dispatch_dense_bf16_projection(runtime, &views, &.{
+        var parameters: Wire = .{
             .rows = self.rows,
             .input_width = self.input_width,
             .output_width = self.output_width,
@@ -53918,7 +53930,12 @@ pub const DenseBf16Projection = struct {
             .has_bias = @intFromBool(bias != null),
             .plane_width = self.plane_width,
             .softcap = self.softcap,
-        }) != 0) return error.MetalKernelDispatchFailed;
+            .plane_count = @intCast(self.plane_ends.len),
+            .plane_ends = @splat(0),
+        };
+        if (self.plane_ends.len > parameters.plane_ends.len) return error.InvalidShape;
+        @memcpy(parameters.plane_ends[0..self.plane_ends.len], self.plane_ends);
+        if (antfly_metal_dispatch_dense_bf16_projection(runtime, &views, &parameters) != 0) return error.MetalKernelDispatchFailed;
         output.invalidateHostMirror();
     }
 };
