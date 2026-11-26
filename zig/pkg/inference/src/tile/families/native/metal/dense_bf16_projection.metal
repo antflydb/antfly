@@ -67,7 +67,23 @@ inline void antfly_dense_bf16_projection_four_rows(
     const device bfloat *a = input + ulong(first) * p.input_width;
     const device bfloat *w = weight + ulong(column) * p.input_width;
     float4 product = 0.0f;
-    for (uint k = lane; k < p.input_width; k += 32u) {
+    uint k = lane;
+    if (complete) {
+        // Keep each accumulator's FMA order while amortizing the loop
+        // branch across four SIMD-width steps.
+        const uint full_width = p.input_width & ~127u;
+        for (; k < full_width; k += 128u) {
+            #pragma unroll
+            for (uint step = 0u; step < 4u; ++step) {
+                const uint index = k + step * 32u;
+                const float b = float(w[index]);
+                #pragma unroll
+                for (uint i = 0u; i < 4u; ++i)
+                    product[i] = fma(float(a[ulong(i) * p.input_width + index]), b, product[i]);
+            }
+        }
+    }
+    for (; k < p.input_width; k += 32u) {
         const float b = float(w[k]);
         #pragma unroll
         for (uint i = 0u; i < 4u; ++i)
