@@ -247,7 +247,23 @@ inline void antfly_routed_group_dot(
         rows[i] = (full_group || i < count) ? entry[1u + i] : 0u;
         offsets[i] = ulong(rows[i] / p.input_repeat) * p.input_width;
     }
-    for (uint k = lane; k < p.input_width; k += 32u) {
+    uint k = lane;
+    if (full_group && fp4 && p.input_repeat == 1u) {
+        // Amortize loop overhead for independently routed rows. Each
+        // accumulator still consumes its two weight steps in order.
+        const uint full_width = p.input_width & ~63u;
+        for (; k < full_width; k += 64u) {
+            #pragma unroll
+            for (uint step = 0u; step < 2u; ++step) {
+                const uint index = k + step * 32u;
+                const float w = float(antfly_routed_weight(weight, weight_scales, index, fp4, outer));
+                #pragma unroll
+                for (uint i = 0u; i < 8u; ++i)
+                    accum[i] = fma(float(input[offsets[i] + index]), w, accum[i]);
+            }
+        }
+    }
+    for (; k < p.input_width; k += 32u) {
         const float w = float(antfly_routed_weight(weight, weight_scales, k, fp4, outer));
         // Keep the per-lane accumulation and reduction order of the one-row
         // kernel. Only the decoded weight is shared across grouped rows.
