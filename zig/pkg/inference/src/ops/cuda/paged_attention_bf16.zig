@@ -38,6 +38,27 @@ pub fn useChunk128(requested: ?bool, heads: usize) bool {
     return requested orelse (heads == 16);
 }
 
+/// The partial values and their softmax statistics have the same lifetime.
+pub const ScratchLayout = struct {
+    chunks: u32,
+    statistics_offset: usize,
+    bytes: usize,
+
+    pub fn init(rows: usize, heads: usize, kv_heads: usize, dim: usize, tokens: usize, chunk128: bool) !ScratchLayout {
+        if (rows < 2 or rows > 64 or !geometrySupported(heads, kv_heads, dim) or tokens == 0 or tokens > std.math.maxInt(u32))
+            return error.InvalidShape;
+        const chunk_size: usize = if (chunk128) 128 else 32;
+        const chunks = (tokens - 1) / chunk_size + 1;
+        const partial_rows = try std.math.mul(usize, rows * heads, chunks);
+        const bytes = try std.math.mul(usize, partial_rows, (dim + 2) * @sizeOf(f32));
+        return .{
+            .chunks = @intCast(chunks),
+            .statistics_offset = partial_rows * dim * @sizeOf(f32),
+            .bytes = bytes,
+        };
+    }
+};
+
 test "LightOnOCR3 batched attention policy checks artifact support and preserves chunk override" {
     try std.testing.expect(!packetSupported(7, 13000));
     try std.testing.expect(!packetSupported(8, 12900));

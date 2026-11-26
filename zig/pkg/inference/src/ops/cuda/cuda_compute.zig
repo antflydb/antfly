@@ -32380,9 +32380,9 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
         max_tokens = @max(max_tokens, tokens);
     }
     const chunk128 = module.useChunk128(self.lighton_attention_chunk128, heads);
-    const chunk_size: usize = if (chunk128) 128 else 32;
     const planned_tokens = if (self.bounded_decode_graph.active) self.bounded_decode_graph.future_tokens else max_tokens;
-    params.chunks = @intCast((planned_tokens + chunk_size - 1) / chunk_size);
+    const scratch_layout = module.ScratchLayout.init(views.len, heads, kv_heads, dim, planned_tokens, chunk128) catch return null;
+    params.chunks = scratch_layout.chunks;
     if (self.bounded_decode_graph.active) {
         params.graph_progress = self.bounded_decode_graph.counter().ptr;
         params.graph_step = self.bounded_decode_graph.capture_step;
@@ -32394,14 +32394,11 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
     errdefer self.allocator.free(shape);
     var output = try allocDeviceBuffer(self, views.len * width * 4);
     errdefer releaseDeviceBuffer(self, &output);
-    const partial_count = views.len * heads * @as(usize, params.chunks);
-    var partials = try allocDeviceBuffer(self, partial_count * dim * 4);
-    defer releaseDeviceBuffer(self, &partials);
-    var statistics = try allocDeviceBuffer(self, partial_count * 2 * 4);
-    defer releaseDeviceBuffer(self, &statistics);
+    var scratch = try allocDeviceBuffer(self, scratch_layout.bytes);
+    defer releaseDeviceBuffer(self, &scratch);
     params.out = output.ptr;
-    params.partials = partials.ptr;
-    params.statistics = statistics.ptr;
+    params.partials = scratch.ptr;
+    params.statistics = scratch.ptr + scratch_layout.statistics_offset;
     const shared_key = try device_storage.layerKey(views[0].kv_cache.sequence_id, attention.layer_index);
     // An existing physical allocation covers most decode steps. Retain the
     // general storage path for growth, first writes, or shared-prefix tails.

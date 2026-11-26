@@ -990,3 +990,16 @@ test "bounded decoder graph reuse requires the prepared dispatch geometry" {
     changed.vocab += 1;
     try std.testing.expect(!owner.matches(changed));
 }
+
+test "batched CUDA attention scratch packs exact chunk values and statistics" {
+    const ScratchLayout = @import("paged_attention_bf16.zig").ScratchLayout;
+    for ([_]bool{ false, true }, [_]usize{ 5, 2 }) |chunk128, chunks| {
+        const layout = try ScratchLayout.init(64, 8, 2, 256, 129, chunk128);
+        const partial_rows = 64 * 8 * chunks;
+        try std.testing.expectEqual(chunks, layout.chunks);
+        try std.testing.expectEqual(partial_rows * 256 * 4, layout.statistics_offset);
+        try std.testing.expectEqual(partial_rows * 258 * 4, layout.bytes);
+        try std.testing.expectEqual(@as(usize, 0), layout.statistics_offset % 256);
+    }
+    try std.testing.expectError(error.InvalidShape, ScratchLayout.init(2, 8, 2, 256, 0, false));
+}
