@@ -567,16 +567,16 @@ pub fn Program(comptime Recipe: type) type {
                 return self.arenaFor(ctx, .vision, batch, sequence, 1, grid_x, grid_y, sizes);
             }
 
-            pub fn audioArena(self: *Cache, ctx: *Context, key: u64, sizes: [11]usize) !?*Arena {
-                return self.arenaFor(ctx, .audio, 1, 1, 0, @intCast(key), 0, sizes);
-            }
             pub const ArenaSelection = struct { index: usize, hit: bool, victims: u8, bytes: usize };
             pub fn selectArena(self: *const Cache, request: prepared.Arena) !?ArenaSelection {
                 return selectArenaLayout(self, request);
             }
             fn arenaFor(self: *Cache, ctx: *Context, kind: @FieldType(Arena, "kind"), batch: usize, sequence: usize, mask_kind: u8, grid_x: usize, grid_y: usize, sizes: [11]usize) !?*Arena {
-                const request: prepared.Arena = .{ .kind = @fromBackingInt(@intCast(@backingInt(kind))), .batch = batch, .sequence = sequence, .mask_kind = mask_kind, .grid_x = grid_x, .grid_y = grid_y, .sizes = sizes };
-                if (!Recipe.acceptsArena(kind, batch, sequence)) return null;
+                return self.bindArenaRequest(ctx, .{ .kind = @fromBackingInt(@intCast(@backingInt(kind))), .batch = batch, .sequence = sequence, .mask_kind = mask_kind, .grid_x = grid_x, .grid_y = grid_y, .sizes = sizes });
+            }
+            pub fn bindArenaRequest(self: *Cache, ctx: *Context, request: prepared.Arena) !?*Arena {
+                const kind: @FieldType(Arena, "kind") = @fromBackingInt(@intCast(@backingInt(request.kind)));
+                if (!Recipe.acceptsArena(kind, request.batch, request.sequence)) return null;
                 const preview = self.selectArena(request) catch |err| {
                     self.clock +|= 1;
                     return err;
@@ -599,13 +599,13 @@ pub fn Program(comptime Recipe: type) type {
                 };
                 var lease = prepared.acquire(ctx, .{ .arena = request }, .{ .backend_scratch_bytes = selected.bytes, .host_scratch_bytes = logicalUploadHostBytes(request.kind) }) catch return null;
                 errdefer lease.releaseAfterSdkDeath();
-                var candidate = Arena{ .kind = kind, .grid_x = grid_x, .grid_y = grid_y, .sequence = sequence, .batch = batch, .mask_kind = mask_kind };
+                var candidate = Arena{ .kind = kind, .grid_x = request.grid_x, .grid_y = request.grid_y, .sequence = request.sequence, .batch = request.batch, .mask_kind = request.mask_kind };
                 errdefer for (&candidate.buffers) |*buffer| {
                     if (lease.funded()) {
                         _ = buffer.freeChecked(ctx) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
                     } else buffer.free(ctx);
                 };
-                for (&candidate.buffers, sizes) |*buffer, size| {
+                for (&candidate.buffers, request.sizes) |*buffer, size| {
                     buffer.* = Buffer.allocWithPurpose(ctx, size, .model_cache) catch {
                         for (&candidate.buffers) |*allocated| {
                             if (lease.funded()) {
@@ -665,12 +665,19 @@ test "retained CUDA execution accepts an independent typed recipe without model 
         }
     };
     const P = Program(Other);
-    const cache: P.Cache = .{};
+    var cache: P.Cache = .{};
     var request = prepared.Arena{ .kind = .encoder, .batch = 1, .sequence = 8, .sizes = @splat(0) };
     request.sizes[0] = 64;
     try std.testing.expectEqual(@as(usize, 64), (try cache.selectArena(request)).?.bytes);
     request.sizes[0] = 65;
     try std.testing.expect((try cache.selectArena(request)) == null);
+    var binding_context: Context = undefined;
+    request.sizes[0] = 64;
+    cache.arenas[0] = .{ .kind = .encoder, .batch = 1, .sequence = 8 };
+    cache.arenas[0].buffers[0] = .{ .ptr = 0x1000, .len = 64 };
+    try std.testing.expectEqual(&cache.arenas[0], (try cache.bindArenaRequest(&binding_context, request)).?);
+    request.sizes[0] = 63;
+    try std.testing.expectError(error.InvalidCudaState, cache.bindArenaRequest(&binding_context, request));
     var upload: P.LogicalUpload = .{};
     var arena = P.Arena{ .batch = 1, .sequence = 8, .logical_upload = &upload, .warm = true };
     var context: Context = undefined;

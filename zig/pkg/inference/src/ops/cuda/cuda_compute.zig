@@ -20883,7 +20883,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     const output = storage.output orelse return null;
     // The same complete event ABI drives preflight and actual arena lookup.
     const cache_request = CudaCompute.audioArenaRequest(executable);
-    const arena = (try self.embedding_gemma2_execution.audioArena(&self.ctx, @intCast(cache_request.arena.grid_x), cache_request.arena.sizes)) orelse return null;
+    const arena = (try self.embedding_gemma2_execution.bindArenaRequest(&self.ctx, cache_request.arena)) orelse return null;
     arena.pollTiming(&self.ctx);
     // The sealed allocation plan above is the audio route's capture proof.
     const existing_output: ?*CudaTensor = if (arena.retained_output) |retained| @ptrCast(@alignCast(retained.owner)) else null;
