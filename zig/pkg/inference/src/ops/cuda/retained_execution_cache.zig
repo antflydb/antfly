@@ -366,7 +366,7 @@ pub fn Program(comptime Recipe: type) type {
             }
         };
         fn selectArenaLayout(self: anytype, request: prepared.Arena) !?Cache.ArenaSelection {
-            if (!Recipe.acceptsArena(request.kind, request.batch, request.sequence)) return null;
+            if (!Recipe.acceptsArena(request.kind, request.batch, request.sequence) or !try Recipe.validateArena(request)) return null;
             for (self.arenas, 0..) |entry, index| if (@backingInt(entry.kind) == @backingInt(request.kind) and entry.grid_x == request.grid_x and entry.grid_y == request.grid_y and entry.sequence == request.sequence and entry.batch == request.batch and entry.mask_kind == request.mask_kind) {
                 if (!entry.sizesMatch(request.sizes)) return error.InvalidCudaState;
                 return .{ .index = index, .hit = true, .victims = 0, .bytes = entry.bytes() };
@@ -640,6 +640,9 @@ test "retained CUDA execution accepts an independent typed recipe without model 
         pub fn validateCapture(_: Capture) !void {}
         pub fn compatible(_: Geometry, _: anytype, _: anytype, a: Capture, b: Capture, _: i32) !bool {
             return std.meta.eql(a, b);
+        }
+        pub fn validateArena(_: prepared.Arena) !bool {
+            return true;
         }
         pub fn extraEntryBytes(_: prepared.Arena) !usize {
             return 0;

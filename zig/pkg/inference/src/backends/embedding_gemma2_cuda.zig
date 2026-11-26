@@ -63,6 +63,19 @@ const Recipe = struct {
     pub fn acceptsArena(kind: anytype, batch: usize, sequence: usize) bool {
         return batch != 0 and batch <= (if (kind == .encoder) @as(usize, 4) else 8) and sequence != 0 and sequence <= model.official_max_input_tokens and batch <= @This().graph_rows_limit / sequence;
     }
+    pub fn validateArena(request: prepared.Arena) !bool {
+        if (request.kind != .vision) return true;
+        const logical = try std.math.mul(usize, request.grid_x, request.grid_y);
+        return switch (request.mask_kind) {
+            0 => logical != 0 and request.sequence == logical,
+            1 => source: {
+                _ = @import("../ops/kernel_geometry.zig").SourceGemmRows.resolve(logical, request.sequence) catch
+                    return error.InvalidEmbeddingGemma2VisionShape;
+                break :source true;
+            },
+            else => false,
+        };
+    }
     pub fn encoderGeometry(kind: anytype, batch: usize, sequence: usize) !Geometry {
         if (kind != .encoder or !acceptsArena(kind, batch, sequence)) return invalid_geometry;
         return .{ .batch = std.math.cast(u32, batch) orelse return invalid_geometry, .sequence = std.math.cast(u32, sequence) orelse return invalid_geometry };
@@ -854,6 +867,13 @@ test "source vision fixed attention plane extends only its entry and preserves t
     try std.testing.expect((try preview.select(malformed)) == null);
     malformed = request;
     malformed.grid_x = 0;
+    try std.testing.expectError(error.InvalidEmbeddingGemma2VisionShape, preview.select(malformed));
+    // Geometry is checked even when there is no fixed attention plane.
+    malformed.sizes[10] = 0;
+    try std.testing.expectError(error.InvalidEmbeddingGemma2VisionShape, preview.select(malformed));
+    malformed = request;
+    malformed.sizes = @splat(0);
+    malformed.sequence = 2339;
     try std.testing.expectError(error.InvalidEmbeddingGemma2VisionShape, preview.select(malformed));
     // One independently retained arena cannot provide free source-bank credit.
     preview.arenas[0] = .{ .sequence = 1, .batch = 1, .sizes = .{ 4 * arena_limit, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, .has_backing = true, .uses = 2, .last_used = 0 };
