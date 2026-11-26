@@ -51690,8 +51690,15 @@ test "model aware media ordered vector windows are searchable with exact clocks 
             if (inject) {
                 var write = try self.db.?.core.store.beginWriteTxn();
                 errdefer write.abort();
+                // Give the intervening write its own ordered position while
+                // leaving the captured parent and sibling guards unchanged.
+                const receipts = @import("../apply_receipts.zig");
+                var receipt_bytes: [receipts.ordered_apply_receipt_value_len]u8 = undefined;
+                const receipt = receipts.orderedApplyReceiptWrite(.{ .term = 1, .index = self.next_index }, &receipt_bytes);
                 try write.put(self.phantom_key.?, decoded.command.mutations[0].value.?);
+                try write.put(receipt.key, receipt.value);
                 try write.commit();
+                self.next_index += 1;
                 self.phantom_key = null;
             }
             try server_test_adapter.applyOrdered(self.db.?, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = self.next_index });
