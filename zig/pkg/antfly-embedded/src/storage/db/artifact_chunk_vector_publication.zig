@@ -32,11 +32,13 @@ pub const Input = struct {
     previous_output_exists: bool = false,
     effect_protocol: u16 = 18,
     /// Empty when the replay cursor proves that the member has no windows.
-    old_window_outputs: ?[]const []const u8 = null,
+    old_window_outputs: ?[]const publication.ArtifactSource = null,
+    window_capture: ?*@import("artifact_chunk_window_capture.zig").MediaWindowCapture = null,
     media_window_layout: bool = false,
     large_window_capture: bool = false,
     pub fn deinit(self: *Input) void {
         self.token.deinit();
+        if (self.window_capture) |capture_| capture_.deinit();
         self.* = undefined;
     }
 };
@@ -223,7 +225,10 @@ pub const Fence = struct {
             const index = keys.mediaWindowIndex(base) orelse return; // A real scalar result is a different computation.
             try live.put(alloc, index, {});
         }
-        const metadata = try @import("../../chunking/chunk.zig").modelMetadataAlloc(alloc, payload) orelse {
+        const metadata = (@import("../../chunking/chunk.zig").modelMetadataAlloc(alloc, payload) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidBatchRequest,
+        }) orelse {
             if (live.count() != 0) return error.EnrichmentSourceChanged;
             return;
         };
@@ -245,7 +250,10 @@ pub const Fence = struct {
             return;
         };
         const O = @import("inference_chunker").outputs;
-        var receipts = try std.json.parseFromSlice([]O.Result, alloc, raw, .{});
+        var receipts = std.json.parseFromSlice([]O.Result, alloc, raw, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidBatchRequest,
+        };
         defer receipts.deinit();
         var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
         defer seen.deinit(alloc);
@@ -254,7 +262,11 @@ pub const Fence = struct {
             // An unbound tombstone must still account for this consumer's receipts.
             const revision_matches = (command.execution_identity == null and !publishes_windows) or
                 media_embedding_recipe.matchesRevision(receipt.model_revision, command.execution_identity);
-            if (!revision_matches or !try consumer.matches(alloc, receipt)) {
+            const matches = revision_matches and (consumer.matches(alloc, receipt) catch |err| switch (err) {
+                error.InvalidChunkOutput, error.EmbeddingIdentityMismatch => return error.InvalidBatchRequest,
+                else => return err,
+            });
+            if (!matches) {
                 if (publishes_windows) return error.EnrichmentSourceChanged;
                 continue;
             }
