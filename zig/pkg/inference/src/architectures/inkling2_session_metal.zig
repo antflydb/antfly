@@ -34,6 +34,27 @@ const Scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler;
 // The resident decoder records frames against a single Metal runtime.
 pub const max_active_requests = 1;
 
+const PrefillShape = struct {
+    rows: u32,
+    reduction_rows: u32,
+
+    fn preferred(prefix: usize) PrefillShape {
+        const rows: u32 = @intCast(@max(1, @min(prefix, decoder.preferredPrefillRows())));
+        return .{ .rows = rows, .reduction_rows = rows };
+    }
+
+    fn smaller(self: PrefillShape) ?PrefillShape {
+        if (self.reduction_rows > 16) {
+            // Preserve the wider projection batch while there is still
+            // attention workspace that can be reused across query tiles.
+            return .{ .rows = self.rows, .reduction_rows = self.reduction_rows / 2 };
+        }
+        if (self.rows == 1) return null;
+        const rows = self.rows / 2;
+        return .{ .rows = rows, .reduction_rows = @min(rows, self.reduction_rows) };
+    }
+};
+
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
     provider: MetalNativeProvider,
@@ -75,9 +96,9 @@ pub const Runtime = struct {
     pub fn widenCacheBudget(self: *const Runtime, limits: memory.Limits) memory.Limits {
         if (limits.kv_limit_bytes == 0) return limits;
         const context = self.model.text.model_max_length;
-        var rows = @min(context, decoder.preferredPrefillRows());
+        var shape = PrefillShape.preferred(context);
         while (true) {
-            const plan = decoder.RequestPlan.initWithFormat(&self.model, context, rows, .q4_head128) catch return limits;
+            const plan = decoder.RequestPlan.initWithReductionRows(&self.model, context, shape.rows, shape.reduction_rows, .q4_head128) catch return limits;
             const retained = State.deviceBytes(plan.bank, plan.width) catch return limits;
             const physical = plan.deviceBytes() catch return limits;
             var candidate = limits;
@@ -89,8 +110,7 @@ pub const Runtime = struct {
                 .host_scratch_bytes = @as(usize, self.model.text.unpadded_vocab_size) * @sizeOf(f32),
             };
             if (required.fitsLimits(candidate) catch false) return candidate;
-            if (rows == 1) return limits;
-            rows /= 2;
+            shape = shape.smaller() orelse return limits;
         }
     }
 
@@ -106,16 +126,16 @@ pub const Runtime = struct {
             .{ .host = 0, .device = 0 };
         const host = logit_bytes + vision_bytes.host;
         const guarded = session.withAdmissionControl(pipeline.control);
-        var rows = decoder.preferredPrefillRows();
-        var plan = try pipeline.requestPlanWithRowLimit(&self.model, config, rows);
+        var shape = PrefillShape.preferred(pipeline.prompt.count() -| 1);
+        var plan: decoder.RequestPlan = undefined;
         const retained, const workspace = while (true) {
+            plan = try pipeline.requestPlanWithShape(&self.model, config, shape);
             const kv_bytes = try State.deviceBytes(plan.bank, plan.width);
             const device_bytes = try plan.deviceBytes();
             const scratch = device_bytes - kv_bytes + vision_bytes.device;
-            if (plan.bank.layout.max_append_tokens == 1 or try guarded.fitsRetainedStateWithWorkspace(host, kv_bytes, scratch))
+            if (shape.rows == 1 or try guarded.fitsRetainedStateWithWorkspace(host, kv_bytes, scratch))
                 break .{ kv_bytes, scratch };
-            rows = @intCast(plan.bank.layout.max_append_tokens / 2);
-            plan = try pipeline.requestPlanWithRowLimit(&self.model, config, rows);
+            shape = shape.smaller().?;
         };
         var permit = try guarded.admitRetainedStateWithWorkspace(host, retained, workspace);
         defer permit.deinit();
@@ -196,10 +216,10 @@ pub const TextPipeline = struct {
     }
 
     pub fn requestPlan(self: *const TextPipeline, model: *const decoder.Decoder, config: generation.GenerationConfig) !decoder.RequestPlan {
-        return self.requestPlanWithRowLimit(model, config, decoder.preferredPrefillRows());
+        return self.requestPlanWithShape(model, config, PrefillShape.preferred(self.prompt.count() -| 1));
     }
 
-    fn requestPlanWithRowLimit(self: *const TextPipeline, model: *const decoder.Decoder, config: generation.GenerationConfig, row_limit: u32) !decoder.RequestPlan {
+    fn requestPlanWithShape(self: *const TextPipeline, model: *const decoder.Decoder, config: generation.GenerationConfig, shape: PrefillShape) !decoder.RequestPlan {
         if (config.max_tokens <= 0 or self.prompt.after_image.len == 0 or
             config.grammar != null or config.kv_cache_mode != .exact_hybrid or
             config.cache_compaction_ratio != null or config.prompt_cache_enabled or config.draft_model != null or
@@ -207,7 +227,6 @@ pub const TextPipeline = struct {
             return error.UnsupportedInkling2Request;
         const tokens = try std.math.add(usize, self.prompt.count(), @as(usize, @intCast(config.max_tokens)) - 1);
         const prefix = self.prompt.count() - 1;
-        const prefill_rows: u32 = @intCast(@max(1, @min(prefix, row_limit)));
         const format: @import("../runtime/kv/hybrid_paged.zig").PlaneFormat = if (config.cache_dtype) |dtype| blk: {
             const parsed = @import("../runtime/kv/pool.zig").parseKvDType(dtype) orelse return error.UnsupportedInkling2Request;
             break :blk switch (parsed) {
@@ -216,8 +235,8 @@ pub const TextPipeline = struct {
                 else => return error.UnsupportedInkling2Request,
             };
         } else .bf16;
-        const plan = try decoder.RequestPlan.initWithFormat(model, std.math.cast(u32, tokens) orelse return error.InvalidInkling2Context, prefill_rows, format);
-        return plan.withPrefillTail(model, @intCast(prefix % prefill_rows));
+        const plan = try decoder.RequestPlan.initWithReductionRows(model, std.math.cast(u32, tokens) orelse return error.InvalidInkling2Context, shape.rows, shape.reduction_rows, format);
+        return plan.withPrefillTail(model, @intCast(prefix % shape.rows));
     }
 
     /// The caller owns the runtime execution gate and memory admission for

@@ -53333,7 +53333,9 @@ pub const PagedRelativeBf16Attention = struct {
         if (self.query.relative_extent != 0 and input.relative == null) return error.InvalidShape;
         const coverage = try self.query.coverage(self.range.visible_start, self.range.visible_end);
         const physical_rows = try self.range.physicalRows();
-        const split_count = splits(coverage);
+        const scratch_row_bytes = @as(usize, self.query.q_heads) * splits(coverage) * 130 * @sizeOf(f32);
+        const rows_per_dispatch: u32 = @intCast(@min(self.query.rows, scratch.deviceByteLen() / scratch_row_bytes));
+        if (rows_per_dispatch == 0) return error.InvalidShape;
         const views: [9]Buffer = .{
             try .fromTensor(input.query, .i16),
             try .fromTensor(input.keys, .i16),
@@ -53345,23 +53347,51 @@ pub const PagedRelativeBf16Attention = struct {
             try .fromTensor(input.gates, .i16),
             try .fromTensor(output, .i16),
         };
-        if (antfly_metal_dispatch_paged_relative_bf16(runtime, &views, &.{
-            .start = self.query.start,
+        // Reuse the same partials buffer once each tile has reduced it.
+        // Query/key split boundaries are determined by the absolute query
+        // position, independent of the GPU dispatch's row grouping.
+        if (rows_per_dispatch == self.query.rows) {
+            try self.encodeQueryTile(runtime, self.query, coverage, physical_rows, &views);
+        } else {
+            const head_bytes = @as(usize, self.query.q_heads) * @sizeOf(u16);
+            const hidden_bytes = head_bytes * 128;
+            var offset: u32 = 0;
+            while (offset < self.query.rows) {
+                var query = self.query;
+                query.start += offset;
+                query.rows = @min(rows_per_dispatch, self.query.rows - offset);
+                var tile = views;
+                inline for (.{ 0, 3, 6, 7, 8 }, .{ hidden_bytes, head_bytes * self.query.relative_extent, head_bytes, hidden_bytes, hidden_bytes }) |index, stride| {
+                    const skip = try std.math.mul(usize, offset, stride);
+                    if (skip > tile[index].bytes) return error.InvalidShape;
+                    tile[index].offset = try std.math.add(usize, tile[index].offset, skip);
+                    tile[index].bytes -= skip;
+                }
+                const tile_coverage = try query.coverage(self.range.visible_start, self.range.visible_end);
+                try self.encodeQueryTile(runtime, query, tile_coverage, physical_rows, &tile);
+                offset += query.rows;
+            }
+        }
+        scratch.invalidateHostMirror();
+        output.invalidateHostMirror();
+    }
+
+    fn encodeQueryTile(self: PagedRelativeBf16Attention, runtime: *RawMetalDecodeRuntime, query: geometry.Query, coverage: geometry.Query.Coverage, physical_rows: usize, views: *const [9]Buffer) !void {
+        if (antfly_metal_dispatch_paged_relative_bf16(runtime, views, &.{
+            .start = query.start,
             .visible_start = @intCast(self.range.visible_start),
             .page_tokens = self.range.page_tokens,
             .first_page = @intCast(self.range.first_page),
             .page_count = @intCast(self.range.page_count),
             .physical_pages = @intCast(self.range.physical_pages),
-            .q_heads = self.query.q_heads,
-            .kv_heads = self.query.kv_heads,
-            .window = self.query.window,
-            .relative_extent = self.query.relative_extent,
-            .splits = split_count,
+            .q_heads = query.q_heads,
+            .kv_heads = query.kv_heads,
+            .window = query.window,
+            .relative_extent = query.relative_extent,
+            .splits = splits(coverage),
             .q4 = @intFromBool(self.format == .q4_head128),
-            .score_scale = self.query.score_scale,
+            .score_scale = query.score_scale,
         }, coverage.row_heads, physical_rows) != 0) return error.MetalKernelDispatchFailed;
-        scratch.invalidateHostMirror();
-        output.invalidateHostMirror();
     }
 };
 
@@ -53403,9 +53433,7 @@ test "Metal paged relative attention resolves shuffled pages with sink and gate"
         count += 1;
         if (index < payloads.len) try tensor.uploadBytes(payloads[index]);
     }
-    try beginFrame(runtime);
-    errdefer cancelFrame(runtime) catch {};
-    try attention.encode(runtime, .{
+    const inputs: PagedRelativeBf16Attention.Inputs = .{
         .query = &tensors[0],
         .keys = &tensors[1],
         .values = &tensors[2],
@@ -53413,7 +53441,10 @@ test "Metal paged relative attention resolves shuffled pages with sink and gate"
         .page_ids = &tensors[4],
         .sinks = &tensors[5],
         .gates = &tensors[6],
-    }, &tensors[7], &tensors[8]);
+    };
+    try beginFrame(runtime);
+    errdefer cancelFrame(runtime) catch {};
+    try attention.encode(runtime, inputs, &tensors[7], &tensors[8]);
     try submitFrame(runtime);
     try waitFrame(runtime);
     var output: [512]u16 = undefined;
@@ -53422,6 +53453,17 @@ test "Metal paged relative attention resolves shuffled pages with sink and gate"
     const expected = [4]u16{ 0x3f80, 0x4000, 0x3f83, 0x4080 };
     for (expected, 0..) |bits, head|
         for (output[head * 128 ..][0..128]) |value| try std.testing.expectEqual(bits, value);
+
+    const one_row: i32 = @divExact(try attention.scratchElements(), 2);
+    var limited = try tensors[7].retainedView(0, @as(usize, @intCast(one_row)) * @sizeOf(f32), &.{one_row});
+    defer limited.deinit();
+    try beginFrame(runtime);
+    try attention.encode(runtime, inputs, &limited, &tensors[8]);
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+    var tiled_output: [512]u16 = undefined;
+    try tensors[8].downloadBytesInto(std.mem.asBytes(&tiled_output));
+    try std.testing.expectEqual(output, tiled_output);
 }
 
 test "Metal paged relative attention resolves the final token of a packed million-token window" {

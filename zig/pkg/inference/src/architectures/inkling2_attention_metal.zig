@@ -242,8 +242,9 @@ pub const RequestWorkspace = struct {
         bytes: usize,
         reduction_elements: i32,
 
-        pub fn init(text: checkpoint.TextConfig, rows: u32, max_tokens: u32) !Plan {
-            if (rows == 0 or rows > max_tokens or rows > 256) return error.InvalidShape;
+        pub fn init(text: checkpoint.TextConfig, rows: u32, max_tokens: u32, reduction_rows: u32) !Plan {
+            if (rows == 0 or rows > max_tokens or rows > 256 or reduction_rows == 0 or reduction_rows > rows)
+                return error.InvalidShape;
             const query = layout.projectionWidth(text, .q);
             const key = layout.projectionWidth(text, .k);
             const relative = layout.projectionWidth(text, .r);
@@ -255,8 +256,8 @@ pub const RequestWorkspace = struct {
             };
             const attention: metal.PagedRelativeBf16Attention = .{
                 .query = .{
-                    .rows = rows,
-                    .start = max_tokens - rows,
+                    .rows = reduction_rows,
+                    .start = max_tokens - reduction_rows,
                     .q_heads = text.num_attention_heads,
                     .kv_heads = text.num_key_value_heads,
                     .relative_extent = text.rel_extent,
@@ -485,7 +486,7 @@ test "Inkling Metal attention weights drive local and global visits across commi
 
         var source = try allocate(a, runtime, 1);
         defer source.deinit();
-        var workspace = try RequestWorkspace.init(a, runtime, try .init(text, 1, 2));
+        var workspace = try RequestWorkspace.init(a, runtime, try .init(text, 1, 2, 1));
         defer workspace.deinit();
         var output = try allocate(a, runtime, 1);
         defer output.deinit();

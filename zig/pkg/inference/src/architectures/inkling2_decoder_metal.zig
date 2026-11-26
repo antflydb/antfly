@@ -192,11 +192,12 @@ pub fn preferredPrefillRows() u32 {
 
 const WorkPlan = struct {
     rows: u32,
+    reduction_rows: u32,
     elements: [@typeInfo(Temp).@"enum".field_names.len]usize,
     attention: attention.RequestWorkspace.Plan,
     group_elements: usize,
 
-    fn init(model: *const Decoder, rows: u32, max_tokens: u32) !WorkPlan {
+    fn init(model: *const Decoder, rows: u32, max_tokens: u32, reduction_rows: u32) !WorkPlan {
         const text = model.text;
         const width: usize = text.hidden_size;
         const count = @as(usize, rows) * width;
@@ -226,8 +227,9 @@ const WorkPlan = struct {
         });
         return .{
             .rows = rows,
+            .reduction_rows = reduction_rows,
             .elements = elements.values,
-            .attention = try .init(text, rows, max_tokens),
+            .attention = try .init(text, rows, max_tokens, reduction_rows),
             .group_elements = if (rows > 1 and groupedPrefillEnabled())
                 try experts.groupElements()
             else
@@ -263,8 +265,13 @@ pub const RequestPlan = struct {
     }
 
     pub fn initWithFormat(model: *const Decoder, max_tokens: u32, prefill_rows: u32, format: kv.PlaneFormat) !RequestPlan {
+        return initWithReductionRows(model, max_tokens, prefill_rows, prefill_rows, format);
+    }
+
+    pub fn initWithReductionRows(model: *const Decoder, max_tokens: u32, prefill_rows: u32, reduction_rows: u32, format: kv.PlaneFormat) !RequestPlan {
         const text = model.text;
         if (max_tokens == 0 or max_tokens > text.model_max_length or prefill_rows == 0 or
+            reduction_rows == 0 or reduction_rows > prefill_rows or
             prefill_rows > @min(grouped_prefill_chunk_rows, max_tokens)) return error.InvalidInkling2Context;
         return .{
             .width = text.hidden_size,
@@ -276,8 +283,8 @@ pub const RequestPlan = struct {
                 .head_dim = text.head_dim,
                 .full_format = format,
             },
-            .decode = try .init(model, 1, max_tokens),
-            .prefill = if (prefill_rows == 1) null else try .init(model, prefill_rows, max_tokens),
+            .decode = try .init(model, 1, max_tokens, 1),
+            .prefill = if (prefill_rows == 1) null else try .init(model, prefill_rows, max_tokens, reduction_rows),
         };
     }
 
@@ -286,7 +293,7 @@ pub const RequestPlan = struct {
         const main = self.prefill orelse return error.InvalidShape;
         if (tail_rows >= main.rows) return error.InvalidShape;
         var result = self;
-        result.prefill_tail = try .init(model, tail_rows, @intCast(self.bank.layout.max_tokens));
+        result.prefill_tail = try .init(model, tail_rows, @intCast(self.bank.layout.max_tokens), @min(tail_rows, main.reduction_rows));
         return result;
     }
 
@@ -673,8 +680,10 @@ test "Inkling Metal resident decoder runs the released text checkpoint" {
 
         var large: Request = undefined;
         const wide = try RequestPlan.initPrefill(decoder, tokens.len + 1, grouped_prefill_chunk_rows);
-        const wide_tail = try wide.withPrefillTail(decoder, tail_rows);
-        try std.testing.expectEqual(try wide.deviceBytes(), try wide_tail.deviceBytes());
+        const tiled = try RequestPlan.initWithReductionRows(decoder, tokens.len + 1, grouped_prefill_chunk_rows, 16, .bf16);
+        try std.testing.expect(try tiled.deviceBytes() < try wide.deviceBytes());
+        const wide_tail = try tiled.withPrefillTail(decoder, tail_rows);
+        try std.testing.expectEqual(try tiled.deviceBytes(), try wide_tail.deviceBytes());
         try large.initWithPlan(a, decoder, wide_tail);
         defer large.deinit();
         const started = time.monotonicNs();
@@ -706,7 +715,8 @@ test "Inkling Metal resident decoder runs the released text checkpoint" {
     const thin = try RequestPlan.initWithFormat(decoder, full_context, thin_rows, .q4_head128);
     const thin_bytes = resident.resident_bytes + try thin.deviceBytes() + @as(usize, decoder.text.unpadded_vocab_size) * @sizeOf(f32);
     const widened_under_tight_limit = resident.widenCacheBudget(.{ .kv_limit_bytes = default_kv_budget, .combined_limit_bytes = thin_bytes });
-    try std.testing.expectEqual(try State.deviceBytes(thin.bank, thin.width), widened_under_tight_limit.kv_limit_bytes);
+    try std.testing.expect(widened_under_tight_limit.kv_limit_bytes >= try State.deviceBytes(thin.bank, thin.width));
+    try std.testing.expect(widened_under_tight_limit.kv_limit_bytes <= retained_at_full);
     if (platform.env.getenvBool("ANTFLY_INKLING2_METAL_FULL_LAYOUT")) {
         const allocation_start = time.monotonicNs();
         var maximum: Request = undefined;
