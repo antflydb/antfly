@@ -20,10 +20,14 @@ const layout = @import("inkling2_attention_weights.zig");
 const metal = @import("../backends/metal_runtime.zig");
 const Tensor = @import("../backends/metal_tensor.zig").MetalTensor;
 const Weight = layout.Weight;
+const key_weights = [_]Weight{ .k, .k_dynamic };
+const value_weights = [_]Weight{ .v, .v_dynamic };
+const dynamic_projection_weights = layout.query_weights ++ key_weights ++ value_weights;
 
 pub const Layer = struct {
     local: bool,
     projections: Tensor,
+    kv_groups: ?[2]Tensor = null,
     weights: [@typeInfo(Weight).@"enum".field_names.len]?Tensor = @splat(null),
 
     pub fn load(a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, source: *const checkpoint.Checkpoint, layer: usize) !Layer {
@@ -33,11 +37,12 @@ pub const Layer = struct {
     pub fn loadTensors(a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, source: anytype, text: checkpoint.TextConfig, layer: usize) !Layer {
         const local = try layout.isLocal(text, layer);
         const hidden: usize = text.hidden_size;
-        const elements = try std.math.mul(usize, hidden, layout.projectionSize(text, &layout.projection_weights));
+        const keys: []const Weight = if (local) &layout.projection_weights else &dynamic_projection_weights;
+        const elements = try std.math.mul(usize, hidden, layout.projectionSize(text, keys));
         var result: Layer = .{ .local = local, .projections = try allocate(a, runtime, elements) };
         errdefer result.deinit();
         var offset: usize = 0;
-        for (layout.projection_weights) |key| {
+        for (keys) |key| {
             const count = hidden * layout.projectionWidth(text, key);
             const bytes = count * 2;
             var destination = try result.projections.retainedView(offset, bytes, &.{@intCast(count)});
@@ -46,8 +51,16 @@ pub const Layer = struct {
             result.weights[@backingInt(key)] = destination;
             offset += bytes;
         }
-        for ([_]Weight{ .out, .q_scale, .r_scale, .k_taps, .v_taps, .k_dynamic, .v_dynamic }) |key| {
-            if (local and (key == .k_dynamic or key == .v_dynamic)) continue;
+        if (!local) {
+            const query_bytes = hidden * layout.projectionSize(text, &layout.query_weights) * 2;
+            const key_elements = hidden * layout.projectionSize(text, &key_weights);
+            const value_elements = hidden * layout.projectionSize(text, &value_weights);
+            var key_group = try result.projections.retainedView(query_bytes, key_elements * 2, &.{@intCast(key_elements)});
+            errdefer key_group.deinit();
+            const value_group = try result.projections.retainedView(query_bytes + key_elements * 2, value_elements * 2, &.{@intCast(value_elements)});
+            result.kv_groups = .{ key_group, value_group };
+        }
+        for ([_]Weight{ .out, .q_scale, .r_scale, .k_taps, .v_taps }) |key| {
             result.weights[@backingInt(key)] = try upload(a, runtime, try source.layerTensor(layer, layout.tensorName(key, local)));
         }
         const basis = try source.layerTensor(layer, layout.tensorName(.relative_basis, local));
@@ -68,6 +81,7 @@ pub const Layer = struct {
         key_taps: ?*Tensor = null,
         value_taps: ?*Tensor = null,
         packed_projection: ?*Tensor = null,
+        packed_kv: ?[2]*Tensor = null,
     };
 
     /// Project normalized visit inputs into the operands for paged attention.
@@ -79,20 +93,15 @@ pub const Layer = struct {
         var projected: usize = 0;
         if (outputs.packed_projection) |packed_output| {
             const shared_input = inputs.query == inputs.key and inputs.query == inputs.value;
-            projected = if (shared_input) layout.projection_weights.len else layout.query_weights.len;
-            var ends: [layout.projection_weights.len]u32 = undefined;
-            var width: u32 = 0;
-            for (layout.projection_weights[0..projected], ends[0..projected]) |key, *end| {
-                width += layout.projectionWidth(text, key);
-                end.* = width;
+            projected = if (self.local and shared_input) layout.projection_weights.len else layout.query_weights.len;
+            try projectGroup(runtime, text, rows, layout.projection_weights[0..projected], inputs.query, &self.projections, packed_output);
+            if (!self.local) {
+                const destinations_kv = outputs.packed_kv orelse return error.InvalidShape;
+                const groups = if (self.kv_groups) |*groups| groups else return error.MissingWeight;
+                try projectGroup(runtime, text, rows, &key_weights, inputs.key, &groups[0], destinations_kv[0]);
+                try projectGroup(runtime, text, rows, &value_weights, inputs.value, &groups[1], destinations_kv[1]);
+                return;
             }
-            const projection: metal.DenseBf16Projection = .{
-                .rows = rows,
-                .input_width = text.hidden_size,
-                .output_width = width,
-                .plane_ends = if (rows == 1) &.{} else ends[0..projected],
-            };
-            try projection.encode(runtime, inputs.query, &self.projections, packed_output);
         }
         for (layout.projection_weights[projected..], sources[projected..], destinations[projected..]) |key, input, output| {
             try self.project(runtime, key, rows, text.hidden_size, layout.projectionWidth(text, key), input, output);
@@ -102,6 +111,22 @@ pub const Layer = struct {
             try self.project(runtime, .k_dynamic, rows, text.hidden_size, width, inputs.key, outputs.key_taps.?);
             try self.project(runtime, .v_dynamic, rows, text.hidden_size, width, inputs.value, outputs.value_taps.?);
         }
+    }
+
+    fn projectGroup(runtime: *metal.RawMetalDecodeRuntime, text: checkpoint.TextConfig, rows: u32, keys: []const Weight, input: *const Tensor, weights: *const Tensor, output: *Tensor) !void {
+        var ends: [layout.projection_weights.len]u32 = undefined;
+        var width: u32 = 0;
+        for (keys, ends[0..keys.len]) |key, *end| {
+            width += layout.projectionWidth(text, key);
+            end.* = width;
+        }
+        const projection: metal.DenseBf16Projection = .{
+            .rows = rows,
+            .input_width = text.hidden_size,
+            .output_width = width,
+            .plane_ends = if (rows == 1) &.{} else ends[0..keys.len],
+        };
+        try projection.encode(runtime, input, weights, output);
     }
 
     pub fn normalizeHeads(self: *const Layer, runtime: *metal.RawMetalDecodeRuntime, text: checkpoint.TextConfig, rows: u32, position: u32, query: *const Tensor, relative: *const Tensor, output_query: *Tensor, output_relative: *Tensor) !void {
@@ -210,13 +235,14 @@ pub const Layer = struct {
 
     pub fn residentBytes(self: *const Layer) usize {
         var bytes = self.projections.allocatedDeviceBytes() orelse self.projections.deviceByteLen();
-        for ([_]Weight{ .out, .q_scale, .r_scale, .k_taps, .v_taps, .k_dynamic, .v_dynamic, .relative_basis }) |key| {
+        for ([_]Weight{ .out, .q_scale, .r_scale, .k_taps, .v_taps, .relative_basis }) |key| {
             if (self.get(key)) |weight| bytes += weight.allocatedDeviceBytes() orelse weight.deviceByteLen();
         }
         return bytes;
     }
 
     pub fn deinit(self: *Layer) void {
+        if (self.kv_groups) |*groups| for (groups) |*group| group.deinit();
         for (&self.weights) |*entry| {
             if (entry.*) |*weight| weight.deinit();
         }
@@ -236,17 +262,19 @@ pub const RequestWorkspace = struct {
         gate,
         sink,
         key,
+        key_taps,
         value,
+        value_taps,
         normalized_query,
         normalized_relative,
         relative_logits,
         heads,
-        key_taps,
-        value_taps,
     };
     const plane_count = @typeInfo(Plane).@"enum".field_names.len;
     backing: Tensor,
     views: [plane_count]Tensor,
+    kv_groups: [2]Tensor,
+    local_value: Tensor,
     reduction: ?Tensor,
 
     pub const Plan = struct {
@@ -263,8 +291,8 @@ pub const RequestWorkspace = struct {
             const relative = layout.projectionWidth(text, .r);
             const tap_width = @as(u32, text.num_key_value_heads) * text.sconv_kernel_size;
             const widths: [plane_count]u32 = .{
-                query, relative, query,                                                text.num_attention_heads, key,       key,
-                query, relative, @as(u32, text.num_attention_heads) * text.rel_extent, query,                    tap_width, tap_width,
+                query, relative, query,                                                text.num_attention_heads, key, tap_width, key, tap_width,
+                query, relative, @as(u32, text.num_attention_heads) * text.rel_extent, query,
             };
             const attention: metal.PagedRelativeBf16Attention = .{
                 .query = .{
@@ -294,7 +322,7 @@ pub const RequestWorkspace = struct {
                 if (width == 0) return error.InvalidShape;
                 const count = @as(usize, rows) * width;
                 elements.* = std.math.cast(i32, count) orelse return error.InvalidShape;
-                offset.* = if (index < layout.projection_weights.len)
+                offset.* = if (index < dynamic_projection_weights.len)
                     result.bytes
                 else
                     std.mem.alignForward(usize, result.bytes, 256);
@@ -327,10 +355,23 @@ pub const RequestWorkspace = struct {
             view.* = try backing.retainedView(offset, @as(usize, @intCast(elements)) * 2, &.{elements});
             count += 1;
         }
-        return .{ .backing = backing, .views = views, .reduction = reduction };
+        const key = @backingInt(Plane.key);
+        const key_taps = @backingInt(Plane.key_taps);
+        const value = @backingInt(Plane.value);
+        const value_taps = @backingInt(Plane.value_taps);
+        var key_group = try backing.retainedTypedView(plan.offsets[key], &.{plan.elements[key] + plan.elements[key_taps]}, .i16);
+        errdefer key_group.deinit();
+        var value_group = try backing.retainedTypedView(plan.offsets[value], &.{plan.elements[value] + plan.elements[value_taps]}, .i16);
+        errdefer value_group.deinit();
+        // Local layers have static taps. Their value plane starts directly
+        // after K so a shared input publishes all six projections together.
+        const local_value = try backing.retainedTypedView(plan.offsets[key_taps], &.{plan.elements[value]}, .i16);
+        return .{ .backing = backing, .views = views, .kv_groups = .{ key_group, value_group }, .local_value = local_value, .reduction = reduction };
     }
 
     pub fn deinit(self: *RequestWorkspace) void {
+        self.local_value.deinit();
+        for (&self.kv_groups) |*group| group.deinit();
         for (&self.views) |*view| view.deinit();
         if (self.reduction) |*storage| storage.deinit();
         self.backing.deinit();
@@ -348,12 +389,13 @@ pub const RequestWorkspace = struct {
                 .gate = self.plane(.gate),
                 .sink = self.plane(.sink),
                 .key = self.plane(.key),
-                .value = self.plane(.value),
+                .value = if (local) &self.local_value else self.plane(.value),
                 .key_taps = if (local) null else self.plane(.key_taps),
                 .value_taps = if (local) null else self.plane(.value_taps),
                 // Output width limits the write to the contiguous projection
                 // prefix, leaving downstream work planes alone.
                 .packed_projection = &self.backing,
+                .packed_kv = if (local) null else .{ &self.kv_groups[0], &self.kv_groups[1] },
             },
             .normalized_query = self.plane(.normalized_query),
             .normalized_relative = self.plane(.normalized_relative),
@@ -477,10 +519,12 @@ test "Inkling Metal attention weights preserve packed offsets and local/global l
                 try layer.projectInputs(runtime, text, rows, .{ .query = &batch_source, .key = kv_source, .value = kv_source }, work.bind(layer.local).projected);
                 try metal.submitFrame(runtime);
                 try metal.waitFrame(runtime);
-                const projection_dispatches: u64 = if (kv_source == &batch_source) 1 else 3;
-                const tap_dispatches: u64 = if (layer.local) 0 else 2;
-                try std.testing.expectEqual(projection_dispatches + tap_dispatches, counters.snapshot().metal_encoded_dispatches.?);
-                for (work.views[0..layout.projection_weights.len], expected[0..layout.projection_weights.len]) |*output, bits| {
+                const projection_dispatches: u64 = if (layer.local and kv_source == &batch_source) 1 else 3;
+                try std.testing.expectEqual(projection_dispatches, counters.snapshot().metal_encoded_dispatches.?);
+                const planes = work.bind(layer.local).projected;
+                const actual_planes = [_]?*Tensor{ planes.query, planes.relative, planes.gate, planes.sink, planes.key, planes.value, planes.key_taps, planes.value_taps };
+                for (actual_planes, expected[0..actual_planes.len]) |maybe_output, bits| {
+                    const output = maybe_output orelse continue;
                     var actual: [2]u16 = undefined;
                     try output.downloadBytesInto(std.mem.sliceAsBytes(actual[0..rows]));
                     try std.testing.expectEqual(bits, actual[0]);

@@ -27,6 +27,7 @@ pub fn projectionWidth(text: model.TextConfig, weight: Weight) u32 {
         .r => @as(u32, text.num_attention_heads) * text.d_rel,
         .sink => text.num_attention_heads,
         .k, .v => @as(u32, text.num_key_value_heads) * text.head_dim,
+        .k_dynamic, .v_dynamic => @as(u32, text.num_key_value_heads) * text.sconv_kernel_size,
         else => unreachable,
     };
 }
