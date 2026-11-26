@@ -465,11 +465,16 @@ test "Inkling Metal attention weights preserve packed offsets and local/global l
         var work = try RequestWorkspace.init(std.testing.allocator, runtime, try .init(text, 1, 2, 1), null);
         defer work.deinit();
         for ([_]*const Tensor{ &source, &separate_source }) |kv_source| {
+            var counters = @import("../execution/runtime_observation.zig").Scope.init();
+            defer counters.deinit();
             try metal.beginFrame(runtime);
             errdefer metal.cancelFrame(runtime) catch {};
             try layer.projectInputs(runtime, text, 1, .{ .query = &source, .key = kv_source, .value = kv_source }, work.bind(layer.local).projected);
             try metal.submitFrame(runtime);
             try metal.waitFrame(runtime);
+            const projection_dispatches: u64 = if (kv_source == &source) 1 else 3;
+            const tap_dispatches: u64 = if (layer.local) 0 else 2;
+            try std.testing.expectEqual(projection_dispatches + tap_dispatches, counters.snapshot().metal_encoded_dispatches.?);
             for (work.views[0..layout.projection_weights.len], expected[0..layout.projection_weights.len]) |*output, bits| {
                 var actual: u16 = undefined;
                 try output.downloadBytesInto(std.mem.asBytes(&actual));
