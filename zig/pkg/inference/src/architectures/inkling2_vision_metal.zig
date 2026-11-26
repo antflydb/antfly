@@ -212,6 +212,10 @@ pub const Vision = struct {
     };
 
     pub fn encodeRgb(self: *const Vision, a: std.mem.Allocator, runtime: *Runtime, rgb: []const u8, x: u32, y: u32) !Embeddings {
+        return self.encodeRgbWithProjection(a, runtime, rgb, x, y, true);
+    }
+
+    fn encodeRgbWithProjection(self: *const Vision, a: std.mem.Allocator, runtime: *Runtime, rgb: []const u8, x: u32, y: u32, comptime grouped: bool) !Embeddings {
         const geometry = try Geometry.fromRgb(rgb, x, y);
         const patch_rows = geometry.patchRows();
         const rows = patch_rows + 1;
@@ -263,7 +267,21 @@ pub const Vision = struct {
         try Program.encode(.norm, runtime, params, .{ hidden, normalized, weights.getPtrConst(.pre), weights.getPtrConst(.pre_bias) });
         for (&self.layers) |*layer| {
             try Program.encode(.norm, runtime, params, .{ normalized, hidden, layer.weights.getPtrConst(.ln1), layer.weights.getPtrConst(.bias1) });
-            try projection.encodeWithBias(runtime, normalized, &layer.qkv, &layer.qkv_bias, &qkv);
+            if (grouped) {
+                try projection.encodeWithBias(runtime, normalized, &layer.qkv, &layer.qkv_bias, &qkv);
+            } else {
+                // The separate projections are the hardware fixture oracle.
+                const weight_elements = width * width;
+                const weight_bytes = weight_elements * @sizeOf(u16);
+                const bias_bytes = width * @sizeOf(u16);
+                for ([_]*Tensor{ q, k, v }, 0..) |destination, i| {
+                    var weight = try layer.qkv.retainedView(i * weight_bytes, weight_bytes, &.{weight_elements});
+                    defer weight.deinit();
+                    var bias = try layer.qkv_bias.retainedView(i * bias_bytes, bias_bytes, &.{width});
+                    defer bias.deinit();
+                    try project(runtime, rows, width, width, normalized, &weight, &bias, destination);
+                }
+            }
             try Program.encode(.rotary, runtime, params, .{ q, k });
             try Program.encode(.attention, runtime, params, .{ attention, q, k, v });
             try project(runtime, rows, width, width, attention, layer.weights.getPtrConst(.out), layer.weights.getPtrConst(.out_bias), update);
@@ -361,4 +379,42 @@ test "Inkling Metal vision publishes projected rows from its admitted arena" {
     try output.tensor.downloadBytesInto(std.mem.asBytes(&values));
     try std.testing.expectEqual(@as(u16, 0x3f57), values[0]); // GELU(1), rounded to BF16.
     try std.testing.expectEqual(@as([schema.text_width - 1]u16, @splat(0)), values[1..].*);
+}
+
+test "Inkling Metal grouped vision matches separate projections on the released checkpoint" {
+    if (!@import("build_options").enable_metal or !metal.metalDeviceAvailable()) return error.SkipZigTest;
+    const dir = @import("antfly_platform").env.getenv("ANTFLY_INKLING2_METAL_MODEL_DIR") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var source = try checkpoint.Checkpoint.open(a, dir);
+    defer source.deinit();
+    var provider = try @import("../backends/metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    var vision = try Vision.load(a, runtime, &source);
+    defer vision.deinit();
+
+    // Check the released K slab directly against the checkpoint, independent
+    // of the two projection paths' agreement on their shared packed storage.
+    var k = try vision.layers[0].qkv.retainedView(width * width * 2, width * width * 2, &.{width * width});
+    defer k.deinit();
+    const reference = try checkpointBytes(&source, "model.visual.backbone.layers.0.self_attn.k_proj.weight", &.{ width, width });
+    const unpacked = try a.alloc(u8, reference.len);
+    defer a.free(unpacked);
+    try k.downloadBytesInto(unpacked);
+    try std.testing.expectEqualSlices(u8, reference, unpacked);
+
+    const side = 80;
+    var rgb: [side * side * 3]u8 = undefined;
+    for (&rgb, 0..) |*value, i| value.* = @truncate(i * 179 + i / 17);
+    var separate = try vision.encodeRgbWithProjection(a, runtime, &rgb, side, side, false);
+    defer separate.tensor.deinit();
+    var grouped = try vision.encodeRgb(a, runtime, &rgb, side, side);
+    defer grouped.tensor.deinit();
+    try std.testing.expectEqual(@as(u32, 4), grouped.rows);
+    try std.testing.expectEqual(separate.rows, grouped.rows);
+    var expected: [4 * schema.text_width]u16 = undefined;
+    var actual: [expected.len]u16 = undefined;
+    try separate.tensor.downloadBytesInto(std.mem.asBytes(&expected));
+    try grouped.tensor.downloadBytesInto(std.mem.asBytes(&actual));
+    try std.testing.expectEqualSlices(u16, &expected, &actual);
 }
