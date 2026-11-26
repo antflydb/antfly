@@ -19,6 +19,22 @@
 const std = @import("std");
 const ops = @import("../ops/ops.zig");
 
+/// One asynchronous submission belonging to the caller's operation.
+pub const Pending = struct {
+    backend: *const ops.ComputeBackend,
+    active: bool = false,
+
+    pub fn wait(self: *Pending) !void {
+        if (!self.active) return;
+        const commands = self.backend.vtable.regions.commands;
+        commands.waitSubmittedFrame.?(self.backend.ptr) catch |err| {
+            self.active = commands.hasSubmittedFrame.?(self.backend.ptr);
+            return err;
+        };
+        self.active = false;
+    }
+};
+
 pub const Scope = struct {
     backend: *const ops.ComputeBackend,
     owns: bool = false,
@@ -63,6 +79,20 @@ pub const Scope = struct {
         try self.finishUsing(self.backend.vtable.regions.commands.submitFrame orelse return error.UnsupportedOperation);
     }
 
+    pub fn submitInto(self: *Scope, pending: *Pending) !void {
+        if (!self.owns or pending.active or pending.backend != self.backend) return error.InvalidFrameSubmissionOwner;
+        const commands = self.backend.vtable.regions.commands;
+        const has_submitted = commands.hasSubmittedFrame orelse return error.UnsupportedOperation;
+        if (commands.waitSubmittedFrame == null) return error.UnsupportedOperation;
+        if (has_submitted(self.backend.ptr)) return error.InvalidFrameSubmissionOwner;
+        self.submit() catch |err| {
+            // A provider error can arrive after the frame was queued.
+            pending.active = has_submitted(self.backend.ptr);
+            return err;
+        };
+        pending.active = true;
+    }
+
     fn finishUsing(self: *Scope, submit_frame: *const fn (*anyopaque) anyerror!void) !void {
         if (self.submit_attempted) return error.FrameSubmissionAlreadyAttempted;
         self.submit_attempted = true;
@@ -94,6 +124,7 @@ test "submission scopes preserve foreign batches unwind encoding and never repla
         decline: bool = false,
         fail_submit: bool = false,
         fail_before_commit: bool = false,
+        fail_after_queue: bool = false,
         starts: usize = 0,
         commits: usize = 0,
         cancels: usize = 0,
@@ -123,6 +154,12 @@ test "submission scopes preserve foreign batches unwind encoding and never repla
             self.active = false;
             if (self.fail_submit) return error.SubmissionFailed;
         }
+        fn submitAsync(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try submit(ptr);
+            self.submitted = true;
+            if (self.fail_after_queue) return error.SubmissionFailed;
+        }
         fn cancel(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.cancels += 1;
@@ -131,7 +168,7 @@ test "submission scopes preserve foreign batches unwind encoding and never repla
     };
     var probe = Probe{};
     var table: ops.ComputeBackend.VTable = undefined;
-    table.regions = .{ .commands = .{ .beginFrame = Probe.begin, .hasActiveFrame = Probe.activeFrame, .submitAndWaitFrame = Probe.submit, .submitFrame = Probe.submit, .waitSubmittedFrame = Probe.wait, .hasSubmittedFrame = Probe.submittedFrame, .cancelFrame = Probe.cancel } };
+    table.regions = .{ .commands = .{ .beginFrame = Probe.begin, .hasActiveFrame = Probe.activeFrame, .submitAndWaitFrame = Probe.submit, .submitFrame = Probe.submitAsync, .waitSubmittedFrame = Probe.wait, .hasSubmittedFrame = Probe.submittedFrame, .cancelFrame = Probe.cancel } };
     const backend = ops.ComputeBackend{ .ptr = &probe, .vtable = &table };
     var completed = try Scope.begin(&backend);
     try completed.finish();
@@ -184,7 +221,11 @@ test "submission scopes preserve foreign batches unwind encoding and never repla
     defer pipelined.deinit();
     try std.testing.expect(pipelined.owns and probe.submitted);
     try Probe.wait(&probe);
-    try pipelined.submit();
-    try std.testing.expect(!pipelined.owns and !probe.active);
+    var pending: Pending = .{ .backend = &backend };
+    probe.fail_after_queue = true;
+    try std.testing.expectError(error.SubmissionFailed, pipelined.submitInto(&pending));
+    try std.testing.expect(!pipelined.owns and !probe.active and pending.active and probe.submitted);
+    try pending.wait();
+    try std.testing.expect(!pending.active and !probe.submitted);
     try std.testing.expectEqual(@as(usize, 3), probe.commits);
 }

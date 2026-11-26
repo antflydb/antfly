@@ -2304,14 +2304,14 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
         };
     }
     const pipelined = grouped_frames and frame_plan.in_flight == 2 and cb.decoderRuntimeSetWhisperPipelinedFrames(true);
-    var pending_frame = false;
+    var pending: @import("../execution/submission.zig").Pending = .{ .backend = cb };
     var frame_snapshot: ?CT = null;
     errdefer if (frame_snapshot) |snapshot| cb.free(snapshot);
     // Drain before publishing or releasing a snapshot, layer inputs, or cached weights.
     defer {
         frame.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
-        if (pending_frame) cb.decoderRuntimeWaitSubmittedFrame() catch {
-            if (cb.decoderRuntimeHasSubmittedFrame()) platform.inference_process_supervisor.restartWorker();
+        pending.wait() catch {
+            if (pending.active) platform.inference_process_supervisor.restartWorker();
         };
         if (pipelined) _ = cb.decoderRuntimeSetWhisperPipelinedFrames(false);
     }
@@ -2334,12 +2334,8 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
         if (cohort and frame.owns and (layer % frame_plan.layers == 0 or layer == cfg.block_count)) {
             if (pipelined) {
                 try @import("../ops/metal_compute.zig").MetalCompute.detachEmbeddingGemma2ActivationViews(cb);
-                if (pending_frame) {
-                    try cb.decoderRuntimeWaitSubmittedFrame();
-                    pending_frame = false;
-                }
-                try frame.submit();
-                pending_frame = true;
+                try pending.wait();
+                try frame.submitInto(&pending);
             } else {
                 try frame.finish();
                 try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
@@ -2403,10 +2399,9 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
             }
         }
     }
-    if (pending_frame) {
+    if (pending.active) {
         if (frame.owns) try @import("../ops/metal_compute.zig").MetalCompute.detachEmbeddingGemma2ActivationViews(cb);
-        try cb.decoderRuntimeWaitSubmittedFrame();
-        pending_frame = false;
+        try pending.wait();
     }
     if (frame.owns) {
         try frame.finish();
