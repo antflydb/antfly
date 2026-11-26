@@ -1079,6 +1079,16 @@ and `[DONE]` but did not emit an idle comment before its first content at
 56.86 s. That result leaves long-stream liveness unqualified at this revision.
 These are shared-device correctness samples with measured wall time.
 
+The optimized Spark HTTP server at `1cc84f1aa2` emitted SSE comments at
+15.03, 30.07, and 45.13 s before the long image stream returned its first
+content at 56.53 s. It returned the expected answer and final usage.
+The prefill receipt recorded 6,402 committed input tokens in 402 chunks.
+The 28-token text and 33-token image requests recorded 27 committed
+tokens in two chunks and 32 in four chunks, respectively. One report covers
+each prefill phase, so the bounded diagnostics queue can retain its counts
+even when the request needs hundreds of chunks. These counts exclude the
+last prompt token handled by the first decode step.
+
 ### Official Gemma 4 E2B QAT serving comparison
 
 The decoder and projector came from Google's E2B QAT Q4_0 GGUF revision
