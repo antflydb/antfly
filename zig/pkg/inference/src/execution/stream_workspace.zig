@@ -172,28 +172,49 @@ pub const Plan = struct {
     /// slot of an earlier allocation. Only the published slot may escape.
     pub const Declaration = union(enum) { allocate: usize, release: u15 };
 
-    pub fn declare(self: *Plan, declarations: []const Declaration, published_slot: ?u15) !void {
+    /// Incremental declaration lets operation contracts compose directly into
+    /// the destination plan without storing a second, flat event recipe.
+    pub const Builder = struct {
+        plan: *Plan,
+
+        pub fn allocate(self: Builder, bytes: usize) !u15 {
+            const slot = self.plan.count;
+            self.plan.allocateLive(bytes, slot + 1);
+            if (!self.plan.valid or self.plan.count == slot) return error.InvalidExecutionPlan;
+            return @intCast(slot);
+        }
+
+        pub fn release(self: Builder, slot: u15) !void {
+            if (!self.plan.valid or self.plan.sealed or slot >= self.plan.count or self.plan.allocations[slot].live_id == 0)
+                return error.InvalidExecutionPlan;
+            self.plan.releaseSlot(@intCast(slot));
+            if (!self.plan.valid) return error.InvalidExecutionPlan;
+        }
+
+        pub fn finish(self: Builder, published_slot: ?u15) !void {
+            const published: ?u64 = if (published_slot) |slot| p: {
+                if (slot >= self.plan.count or self.plan.allocations[slot].live_id == 0) return error.InvalidExecutionPlan;
+                break :p self.plan.allocations[slot].live_id;
+            } else null;
+            if (!self.plan.seal(published)) return error.InvalidExecutionPlan;
+            self.plan.origin = .declared;
+        }
+    };
+
+    pub fn declarationBuilder(self: *Plan) !Builder {
         if (!self.valid or self.sealed or self.event_count != 0 or self.count != 0)
             return error.InvalidExecutionPlan;
+        return .{ .plan = self };
+    }
+
+    pub fn declare(self: *Plan, declarations: []const Declaration, published_slot: ?u15) !void {
+        const builder = try self.declarationBuilder();
         errdefer self.* = .{};
         for (declarations) |declaration| switch (declaration) {
-            .allocate => |bytes| {
-                // Logical slot IDs are local to the recipe and clear at seal.
-                self.allocateLive(bytes, self.count + 1);
-                if (!self.valid) return error.InvalidExecutionPlan;
-            },
-            .release => |slot| {
-                if (slot >= self.count or self.allocations[slot].live_id == 0) return error.InvalidExecutionPlan;
-                self.releaseSlot(@intCast(slot));
-                if (!self.valid) return error.InvalidExecutionPlan;
-            },
+            .allocate => |bytes| _ = try builder.allocate(bytes),
+            .release => |slot| try builder.release(slot),
         };
-        const published: ?u64 = if (published_slot) |slot| p: {
-            if (slot >= self.count or self.allocations[slot].live_id == 0) return error.InvalidExecutionPlan;
-            break :p self.allocations[slot].live_id;
-        } else null;
-        if (!self.seal(published)) return error.InvalidExecutionPlan;
-        self.origin = .declared;
+        try builder.finish(published_slot);
     }
 
     /// Both ordinary execution and recording consume the same interval.
@@ -483,6 +504,17 @@ test "declared CUDA workspace reuses dead slots and redirects its sole published
     try std.testing.expectEqual(learned.fingerprint(0), plan.fingerprint(0));
     try std.testing.expectEqual(Origin.observed, learned.origin);
     try std.testing.expectEqual(Origin.declared, plan.origin);
+
+    var composed: Plan = .{};
+    const builder = try composed.declarationBuilder();
+    const intermediate = try builder.allocate(64);
+    const residual = try builder.allocate(192);
+    try builder.release(intermediate);
+    const publication = try builder.allocate(128);
+    try builder.release(residual);
+    try builder.finish(publication);
+    try std.testing.expectEqual(layout, try composed.layoutWithExternalOutput(alignment));
+    try std.testing.expectEqual(plan.fingerprint(0), composed.fingerprint(0));
 }
 
 test "CUDA arena preserves device addresses wider than a 32-bit host pointer" {
