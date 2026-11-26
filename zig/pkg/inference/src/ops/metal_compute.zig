@@ -13305,10 +13305,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         const table: region.Owned.VTable = .{ .matches = matches, .validate = validate, .dispatch = dispatch, .deinit = destroyRegion };
 
-        fn isPartitionMember(node: NodeId, partition_nodes: []const NodeId, positions: []const u32) bool {
-            const index = std.math.sub(u32, positions[node], positions[partition_nodes[0]]) catch return false;
-            return index < partition_nodes.len and partition_nodes[index] == node;
-        }
+        const isPartitionMember = @import("../execution/region_schedule.zig").isPartitionMember;
 
         fn appendGather(compute: *MetalCompute, request: region.Prepare, positions: []const u32, uses: []const u8, entry: NodeId, gather: ops.kernel_descriptor.GatherAddBias, result: *std.ArrayList(region.Owned)) !void {
             const graph = request.graph;

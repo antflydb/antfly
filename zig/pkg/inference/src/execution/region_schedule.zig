@@ -45,6 +45,25 @@ pub const DeferralAnalysis = struct {
     }
 };
 
+/// Partition members are ordered by submission position. Other partitions
+/// can occupy positions between them.
+pub fn isPartitionMember(node: NodeId, members: []const NodeId, positions: []const u32) bool {
+    if (members.len == 0 or node >= positions.len) return false;
+    const position = positions[node];
+    if (position == std.math.maxInt(u32)) return false;
+    const dense_index = std.math.sub(u32, position, positions[members[0]]) catch return false;
+    if (dense_index < members.len and members[dense_index] == node) return true;
+    const Context = struct {
+        wanted: u32,
+        positions: []const u32,
+
+        fn compare(self: @This(), member: NodeId) std.math.Order {
+            return std.math.order(self.wanted, self.positions[member]);
+        }
+    };
+    return std.sort.binarySearch(NodeId, members, Context{ .wanted = position, .positions = positions }, Context.compare) != null;
+}
+
 /// Keep deferred producer legality shared by the legacy executor and cold
 /// region selection. Last use is expressed in graph NodeIds in this proof.
 pub fn deferredAddConsumer(graph: *const ml.graph.Graph, node_id: NodeId, reachable: []const bool, last_use: []const u32, use_counts: ?[]const u8) ?NodeId {
@@ -297,4 +316,14 @@ test "frozen region boundary proof preserves independent packed outputs and adva
     owner.input_nodes = &.{input};
     try std.testing.expectError(error.OverlappingRegionBoundary, validateBoundaries(a, &graph, &.{ &owner, &owner }));
     try std.testing.expectError(error.InvalidRegionOrder, firstUseOverrides(a, &graph, &.{ input, right, left }, &.{&owner}));
+}
+
+test "region partition membership follows interleaved submission order" {
+    const positions = [_]u32{ 0, 2, 1, 3, std.math.maxInt(u32) };
+    const members: []const NodeId = &.{ 0, 1, 3 };
+    try std.testing.expect(isPartitionMember(0, members, &positions));
+    try std.testing.expect(isPartitionMember(1, members, &positions));
+    try std.testing.expect(isPartitionMember(3, members, &positions));
+    try std.testing.expect(!isPartitionMember(2, members, &positions));
+    try std.testing.expect(!isPartitionMember(4, members, &positions));
 }
