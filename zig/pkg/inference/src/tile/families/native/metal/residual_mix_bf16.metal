@@ -15,7 +15,7 @@
 
 // native-program:entry antfly_residual_mix_bf16
 struct ResidualMixBf16Params {
-    uint rows, width, sources, add_last, normalize;
+    uint rows, width, sources, add_last, normalize, block_stride_rows;
     float epsilon, norm_epsilon;
 };
 
@@ -47,7 +47,7 @@ kernel void antfly_residual_mix_bf16(
     const float scale = rsqrt(float(p.width));
     for (uint source = 0; source < p.sources; ++source) {
         const bool final = source + 1u == p.sources;
-        const device bfloat *buf = final ? last + base : blocks + ulong(source) * p.rows * p.width + base;
+        const device bfloat *buf = final ? last + base : blocks + ulong(source) * p.block_stride_rows * p.width + base;
         float dot = 0.0f, square = 0.0f;
         for (uint column = tid; column < p.width; column += 128u) {
             const float x = float(buf[column]) + (final && p.add_last ? float(add[base + column]) : 0.0f);
@@ -79,7 +79,7 @@ kernel void antfly_residual_mix_bf16(
             const bool final = source + 1u == p.sources;
             const ulong index = base + column;
             const float x = final ? float(last[index]) + (p.add_last ? float(add[index]) : 0.0f)
-                                  : float(blocks[ulong(source) * p.rows * p.width + index]);
+                                  : float(blocks[ulong(source) * p.block_stride_rows * p.width + index]);
             result = fma(x, weights[source], result);
         }
         if (p.normalize) {

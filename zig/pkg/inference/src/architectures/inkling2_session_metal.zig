@@ -185,7 +185,7 @@ pub const Runtime = struct {
         var waiter: Scheduler.Waiter = .{};
         try self.scheduler.selectReady(&waiter, &self.gate, pipeline.control);
         defer Scheduler.leave(&waiter);
-        var shape = PrefillShape.preferred(pipeline.prompt.count() -| 1);
+        var shape = PrefillShape.preferred(pipeline.prefillTokenCount(config));
         var plan: decoder.RequestPlan = undefined;
         const amounts = while (true) {
             plan = try pipeline.requestPlanWithShape(&self.model, config, shape);
@@ -296,15 +296,24 @@ pub const TextPipeline = struct {
         self.prompt.deinit(self.allocator);
     }
 
+    fn selectsInPrefill(config: generation.GenerationConfig) bool {
+        return chat.usesUnpenalizedGreedy(config) and
+            @import("antfly_platform").env.getenvBoolDefault("ANTFLY_METAL_PREFILL_GREEDY_SELECTION", false);
+    }
+
+    fn prefillTokenCount(self: *const TextPipeline, config: generation.GenerationConfig) usize {
+        return self.prompt.count() -| @intFromBool(!selectsInPrefill(config));
+    }
+
     pub fn requestPlan(self: *const TextPipeline, model: *const decoder.Decoder, config: generation.GenerationConfig) !decoder.RequestPlan {
-        return self.requestPlanWithShape(model, config, PrefillShape.preferred(self.prompt.count() -| 1));
+        return self.requestPlanWithShape(model, config, PrefillShape.preferred(self.prefillTokenCount(config)));
     }
 
     fn requestPlanWithShape(self: *const TextPipeline, model: *const decoder.Decoder, config: generation.GenerationConfig, shape: PrefillShape) !decoder.RequestPlan {
         if (self.prompt.suffix.len == 0) return error.UnsupportedInkling2Request;
         const format = try requestCacheFormat(config);
         const tokens = try chat.contextCapacity(self.prompt.count(), config.max_tokens, model.text.model_max_length);
-        const prefix = self.prompt.count() - 1;
+        const prefix = self.prefillTokenCount(config);
         var plan = try decoder.RequestPlan.initWithReductionRows(model, tokens, shape.rows, shape.reduction_rows, format);
         if (chat.usesUnpenalizedGreedy(config)) plan = plan.withDeviceSelection();
         return plan.withPrefillTail(model, @intCast(prefix % shape.rows));
@@ -335,7 +344,10 @@ pub const TextPipeline = struct {
                 .cache_capacity_tokens = @intCast(plan.bank.layout.max_tokens),
             };
         }
-        try observation.callOperation(prefill_observation, .prefill, prefillPrompt, .{ self, &request, model, vision, after[0 .. after.len - 1], chunk_rows, binding });
+        const select = selectsInPrefill(config);
+        var first_token = try observation.callOperation(prefill_observation, .prefill, prefillPrompt, .{
+            self, &request, model, vision, if (select) after else after[0 .. after.len - 1], chunk_rows, select, binding,
+        });
         request.releasePrefill();
         if (!greedy) {
             for (self.prompt.media) |item| {
@@ -365,7 +377,10 @@ pub const TextPipeline = struct {
         var token = std.math.cast(u32, after[after.len - 1]) orelse return error.InvalidInkling2Token;
         while (output.tokens.items.len < limit) {
             try self.check();
-            if (greedy) {
+            if (first_token) |selected| {
+                token = selected;
+                first_token = null;
+            } else if (greedy) {
                 token = try observation.callOperation(binding, .decode_step, decoder.Request.stepGreedy, .{ &request, token });
             } else {
                 const logits = try observation.callOperation(binding, .decode_step, decoder.Request.step, .{ &request, token });
@@ -379,7 +394,7 @@ pub const TextPipeline = struct {
         return output.finalize(self.options, self.prompt.count(), limit);
     }
 
-    fn prefillPrompt(self: *const TextPipeline, request: *decoder.Request, model: *const decoder.Decoder, vision: ?*const vision_model.Vision, after: []const i32, chunk_rows: u32, binding: ?observation.Binding) !void {
+    fn prefillPrompt(self: *const TextPipeline, request: *decoder.Request, model: *const decoder.Decoder, vision: ?*const vision_model.Vision, after: []const i32, chunk_rows: u32, select: bool, binding: ?observation.Binding) !?u32 {
         const media = self.prompt.media;
         const count = media.len * 2 + 1;
         var local_images: [1]?vision_model.Vision.Embeddings = undefined;
@@ -394,7 +409,7 @@ pub const TextPipeline = struct {
         const batch = if (part_capacity <= local_batch.len) local_batch[0..part_capacity] else try self.allocator.alloc(decoder.PrefixPart, part_capacity);
         defer if (part_capacity > local_batch.len) self.allocator.free(batch);
 
-        const total = self.prompt.count() - 1;
+        const total = self.prompt.count() - @intFromBool(!select);
         var position: usize = 0;
         var part_index: usize = 0;
         var part_position: usize = 0;
@@ -432,6 +447,11 @@ pub const TextPipeline = struct {
                 }
             }
             if (pending != 0) return error.InvalidShape;
+            if (select and position + rows == total) {
+                // The last row supplies the head in the same frame that
+                // publishes its KV. Held image rows retire via the defer.
+                return try request.appendPrefixGreedy(batch[0..active]);
+            }
             try request.appendPrefix(batch[0..active]);
             while (retired < part_index / 2) : (retired += 1) {
                 if (image_rows[retired]) |*item| item.tensor.deinit();
@@ -439,6 +459,7 @@ pub const TextPipeline = struct {
             }
             position += rows;
         }
+        return null;
     }
 
     fn encodeImage(self: *const TextPipeline, model: *const decoder.Decoder, encoder: *const vision_model.Vision, input: chat.Prompt.Image) !vision_model.Vision.Embeddings {

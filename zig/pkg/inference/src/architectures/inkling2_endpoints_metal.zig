@@ -77,12 +77,13 @@ pub const Endpoints = struct {
         try metal.indexedRowRmsBf16(runtime, ids, self.vocab, self.width, self.epsilon, &self.weights[0], &self.weights[1], output);
     }
 
-    pub fn logits(self: *const Endpoints, runtime: *metal.RawMetalDecodeRuntime, blocks: ?*const Tensor, last: *const Tensor, sources: u32, normalized: *Tensor, output: *Tensor) !void {
+    pub fn logits(self: *const Endpoints, runtime: *metal.RawMetalDecodeRuntime, blocks: ?*const Tensor, last: *const Tensor, sources: u32, block_stride_rows: u32, normalized: *Tensor, output: *Tensor) !void {
         if (output.dtype != .f32) return error.UnsupportedTensorType;
         const mix: metal.ResidualMixBf16 = .{
             .rows = 1,
             .width = self.width,
             .sources = sources,
+            .block_stride_rows = block_stride_rows,
             .epsilon = self.epsilon,
             .norm_epsilon = self.epsilon,
         };
@@ -128,7 +129,7 @@ test "Inkling Metal decoder endpoints embed and project vocabulary logits in one
     try std.testing.expectError(error.InvalidInkling2Token, endpoints.embedRows(runtime, &.{ 1, -1 }, &batch));
     try endpoints.embedRows(runtime, &.{ 1, 0, 1 }, &batch);
     try endpoints.embed(runtime, 1, &embedded);
-    try endpoints.logits(runtime, null, &embedded, 1, &normalized, &logits);
+    try endpoints.logits(runtime, null, &embedded, 1, 1, &normalized, &logits);
     try metal.submitFrame(runtime);
     try metal.waitFrame(runtime);
 

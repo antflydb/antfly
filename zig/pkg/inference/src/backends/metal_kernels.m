@@ -12952,7 +12952,7 @@ static NSString *termite_metal_shader_source(void) {
            // tile-codegen:end residual.sum_bf16 family
            // tile-codegen:begin residual.mix_bf16 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "struct ResidualMixBf16Params {\n"
-           "    uint rows, width, sources, add_last, normalize;\n"
+           "    uint rows, width, sources, add_last, normalize, block_stride_rows;\n"
            "    float epsilon, norm_epsilon;\n"
            "};\n"
            "\n"
@@ -12984,7 +12984,7 @@ static NSString *termite_metal_shader_source(void) {
            "    const float scale = rsqrt(float(p.width));\n"
            "    for (uint source = 0; source < p.sources; ++source) {\n"
            "        const bool final = source + 1u == p.sources;\n"
-           "        const device bfloat *buf = final ? last + base : blocks + ulong(source) * p.rows * p.width + base;\n"
+           "        const device bfloat *buf = final ? last + base : blocks + ulong(source) * p.block_stride_rows * p.width + base;\n"
            "        float dot = 0.0f, square = 0.0f;\n"
            "        for (uint column = tid; column < p.width; column += 128u) {\n"
            "            const float x = float(buf[column]) + (final && p.add_last ? float(add[base + column]) : 0.0f);\n"
@@ -13016,7 +13016,7 @@ static NSString *termite_metal_shader_source(void) {
            "            const bool final = source + 1u == p.sources;\n"
            "            const ulong index = base + column;\n"
            "            const float x = final ? float(last[index]) + (p.add_last ? float(add[index]) : 0.0f)\n"
-           "                                  : float(blocks[ulong(source) * p.rows * p.width + index]);\n"
+           "                                  : float(blocks[ulong(source) * p.block_stride_rows * p.width + index]);\n"
            "            result = fma(x, weights[source], result);\n"
            "        }\n"
            "        if (p.normalize) {\n"
@@ -38069,7 +38069,7 @@ int antfly_metal_dispatch_head_norm_bf16(
 }
 
 typedef struct {
-    uint32_t rows, width, sources, add_last, normalize;
+    uint32_t rows, width, sources, add_last, normalize, block_stride_rows;
     float epsilon, norm_epsilon;
 } antfly_metal_residual_mix_bf16_params;
 
@@ -38078,13 +38078,18 @@ int antfly_metal_dispatch_residual_mix_bf16(
     const antfly_metal_residual_mix_bf16_params *p
 ) {
     if (!runtime || !views || !p || !p->rows || !p->width || p->width > 4096 ||
-        !p->sources || p->sources > 8 || !isfinite(p->epsilon) || p->epsilon <= 0 ||
+        !p->sources || p->sources > 8 || p->block_stride_rows < p->rows || !isfinite(p->epsilon) || p->epsilon <= 0 ||
         (p->normalize && (!isfinite(p->norm_epsilon) || p->norm_epsilon <= 0))) return -1;
     const size_t row_bytes = (size_t)p->width * 2;
-    size_t bf16_bytes, blocks, output_bytes;
+    size_t bf16_bytes, stride_bytes, blocks = 0, output_bytes;
     if (!termite_metal_size_mul(row_bytes, p->rows, &bf16_bytes) ||
-        !termite_metal_size_mul(bf16_bytes, p->sources - 1, &blocks) ||
+        !termite_metal_size_mul(row_bytes, p->block_stride_rows, &stride_bytes) ||
         !termite_metal_size_mul(bf16_bytes, p->normalize ? 1 : 2, &output_bytes)) return -1;
+    if (p->sources > 1) {
+        if (!termite_metal_size_mul(stride_bytes, p->sources - 2, &blocks) ||
+            blocks > SIZE_MAX - bf16_bytes) return -1;
+        blocks += bf16_bytes;
+    }
     const size_t required[6] = {blocks, bf16_bytes, p->add_last ? bf16_bytes : 0,
         (size_t)p->width * 4, p->normalize ? row_bytes : 0, output_bytes};
     const size_t alignment[6] = {2, 2, 2, 4, 2, p->normalize ? 2 : 4};

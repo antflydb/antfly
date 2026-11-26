@@ -54029,6 +54029,7 @@ pub const ResidualMixBf16 = struct {
     sources: u32,
     epsilon: f32,
     norm_epsilon: f32 = 0,
+    block_stride_rows: ?u32 = null,
 
     const Buffer = RoutedBlockScaledProjection.Buffer;
     const Wire = extern struct {
@@ -54037,6 +54038,7 @@ pub const ResidualMixBf16 = struct {
         sources: u32,
         add_last: u32,
         normalize: u32,
+        block_stride_rows: u32,
         epsilon: f32,
         norm_epsilon: f32,
     };
@@ -54069,6 +54071,7 @@ pub const ResidualMixBf16 = struct {
             .sources = self.sources,
             .add_last = @intFromBool(input.add_last != null),
             .normalize = @intFromBool(input.gamma != null),
+            .block_stride_rows = self.block_stride_rows orelse self.rows,
             .epsilon = self.epsilon,
             .norm_epsilon = self.norm_epsilon,
         }) != 0) return error.MetalKernelDispatchFailed;

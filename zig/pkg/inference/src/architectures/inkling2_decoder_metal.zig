@@ -534,8 +534,21 @@ pub const Request = struct {
         }
         for (self.model.schedule) |op| try self.visit(work, &pending, op);
         if (output != .none) {
-            const logits = work.get(.logits);
-            try self.model.endpoints.logits(runtime, &work.stack.backing, work.stack.current(), @intCast(work.stack.depth + 1), work.get(.normalized), logits);
+            const logits = self.decode.get(.logits);
+            const stack = &work.stack;
+            const sources: u32 = @intCast(stack.depth + 1);
+            if (stack.rows == 1) {
+                try self.model.endpoints.logits(runtime, &stack.backing, stack.current(), sources, 1, self.decode.get(.normalized), logits);
+            } else {
+                const bytes = @as(usize, stack.width) * @sizeOf(u16);
+                const offset = @as(usize, stack.rows - 1) * bytes;
+                const extent: i32 = @intCast(stack.width);
+                var blocks = try stack.backing.retainedView(offset, stack.backing.deviceByteLen() - offset, &.{@intCast((stack.backing.deviceByteLen() - offset) / @sizeOf(u16))});
+                defer blocks.deinit();
+                var last = try stack.current().retainedView(offset, bytes, &.{extent});
+                defer last.deinit();
+                try self.model.endpoints.logits(runtime, &blocks, &last, sources, stack.rows, self.decode.get(.normalized), logits);
+            }
             if (output == .greedy and metal.termite_metal_decode_runtime_encode_argmax_from_logits_device(
                 runtime,
                 logits.deviceHandle(),
@@ -588,11 +601,20 @@ pub const Request = struct {
     }
 
     pub fn appendPrefix(self: *Request, parts: []const PrefixPart) !void {
+        return self.runPrefix(parts, .none);
+    }
+
+    pub fn appendPrefixGreedy(self: *Request, parts: []const PrefixPart) !u32 {
+        try self.runPrefix(parts, .greedy);
+        return metal.readDecoderTokenId(self.model.runtime) orelse error.MetalKernelDispatchFailed;
+    }
+
+    fn runPrefix(self: *Request, parts: []const PrefixPart, output: Output) !void {
         var rows: usize = 0;
         for (parts) |part| rows = try std.math.add(usize, rows, part.rows());
-        if (rows == 1) return self.run(&self.decode, .{ .prefix = parts }, .none);
+        if (rows == 1) return self.run(&self.decode, .{ .prefix = parts }, output);
         if (self.prefill) |*current| {
-            if (rows == current.stack.rows) return self.run(current, .{ .prefix = parts }, .none);
+            if (rows == current.stack.rows) return self.run(current, .{ .prefix = parts }, output);
         }
         const tail = self.prefill_tail orelse return error.InvalidShape;
         if (rows != tail.rows) return error.InvalidShape;
@@ -603,7 +625,7 @@ pub const Request = struct {
         self.prefill = null;
         self.prefill = try .init(self.allocator, self.model.runtime, self.model.text.hidden_size, tail);
         self.prefill_tail = null;
-        try self.run(&self.prefill.?, .{ .prefix = parts }, .none);
+        try self.run(&self.prefill.?, .{ .prefix = parts }, output);
     }
 
     pub fn appendTokens(self: *Request, tokens: []const i32) !void {
@@ -1095,6 +1117,18 @@ test "Inkling Metal resident decoder executes the full visit schedule on a synth
     try std.testing.expectEqual(@as(usize, 2), batched.state.sequence.committed_tokens);
     const expected_after_prefix = try request.stepGreedy(0);
     try std.testing.expectEqual(expected_after_prefix, try batched.stepGreedy(0));
+    var fused: Request = undefined;
+    try fused.initWithPlan(a, &model, greedy_plan);
+    defer fused.deinit();
+    const before_fused = metal.runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(@as(u32, 0), try fused.appendPrefixGreedy(&.{
+        .{ .embeddings = .{ .tensor = &image_row, .start = 0, .count = 1 } },
+        .{ .tokens = &.{1} },
+    }));
+    try std.testing.expectEqual(before_fused.frame_submit_count + 1, metal.runtimeMemorySnapshot(runtime).frame_submit_count);
+    try std.testing.expectEqual(@as(usize, 2), fused.state.sequence.committed_tokens);
+    fused.releasePrefill();
+    try std.testing.expectEqual(expected_after_prefix, try fused.stepGreedy(0));
     var tail_request: Request = undefined;
     const wide_plan = try RequestPlan.initPrefill(&model, 6, 3);
     try tail_request.initWithPlan(a, &model, try wide_plan.withPrefillTail(&model, 2));
