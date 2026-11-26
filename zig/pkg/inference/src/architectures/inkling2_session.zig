@@ -263,6 +263,10 @@ pub const Runtime = struct {
 };
 
 pub const Pipeline = struct {
+    // The scheduler may batch numerical submissions. Continuation and
+    // output callbacks still run on this request's serving thread.
+    pub const serial_stream_checkpoints = true;
+
     allocator: std.mem.Allocator,
     model: *Runtime,
     session: backends.Session,
@@ -344,7 +348,9 @@ pub const Pipeline = struct {
 
     fn check(self: *const Pipeline) !void {
         try self.control.check();
-        if (self.continue_fn) |keep_going| if (!keep_going(self.continue_ctx.?)) return error.Cancelled;
+        if (self.continue_fn) |keep_going| {
+            if (!keep_going(self.continue_ctx orelse return error.Cancelled)) return error.Cancelled;
+        }
     }
 
     fn prefillPrompt(self: *Pipeline, request: *decoder.Request, suffix: []const i32, progress: ?*diagnostics.PrefillProgress) !void {
