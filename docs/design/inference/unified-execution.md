@@ -1171,6 +1171,17 @@ A separate seven-test CPU cohort passed for pending submission, readback,
 retirement and observation. These use fixture models and do not establish
 released-model or GPU coverage.
 
+At `552aba3e45`, the focused Spark GB10 cohort passed all 15 capture and
+workspace tests with zero skips. The physical tests covered immutable
+integer gather, F32 vendor GEMM capture, held outputs across eviction,
+and address-bank retirement after a launch error. Capture-initialization
+failure and vendor-cache invalidation exercised fallback before submission.
+The ingress fixture recorded one capture and three replays, with one
+32-byte upload and zero downloads on each replay. Pending scalar observation
+covered submit, await and cancel on the physical provider. The workspace
+tests covered sealed event drift, publication and disjoint output storage.
+The legacy decoder and audio recipe gates remain open.
+
 The Metal integer-gather compatibility guard now applies to the actual
 axis-zero column-bias fusion. An axis-one I32 gather after a live F32 add
 uses two assigned dispatches and retains both results independently across
