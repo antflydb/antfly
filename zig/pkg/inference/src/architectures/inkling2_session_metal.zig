@@ -236,6 +236,28 @@ pub const Runtime = struct {
     }
 };
 
+fn requestCacheFormat(config: generation.GenerationConfig) !@import("../runtime/kv/hybrid_paged.zig").PlaneFormat {
+    if (config.grammar != null or config.kv_cache_mode != .exact_hybrid or
+        config.cache_compaction_ratio != null or config.prompt_cache_enabled or config.draft_model != null or
+        config.token_observer != null or (config.speculation_requested and config.speculation_policy == .force))
+        return error.UnsupportedInkling2Request;
+    const requested = config.cache_dtype orelse return .bf16;
+    const dtype = @import("../runtime/kv/pool.zig").parseKvDType(requested) orelse return error.UnsupportedInkling2Request;
+    return switch (dtype) {
+        .bf16 => .bf16,
+        .int4 => .q4_head128,
+        else => error.UnsupportedInkling2Request,
+    };
+}
+
+test "Inkling Metal rejects unsupported streaming configuration during preflight" {
+    try std.testing.expectEqual(.bf16, try requestCacheFormat(.{}));
+    try std.testing.expectEqual(.q4_head128, try requestCacheFormat(.{ .cache_dtype = "int4" }));
+    try std.testing.expectError(error.UnsupportedInkling2Request, requestCacheFormat(.{ .cache_dtype = "int8" }));
+    try std.testing.expectError(error.UnsupportedInkling2Request, requestCacheFormat(.{ .prompt_cache_enabled = true }));
+    try std.testing.expectError(error.UnsupportedInkling2Request, requestCacheFormat(.{ .speculation_requested = true, .speculation_policy = .force }));
+}
+
 pub const TextPipeline = struct {
     allocator: std.mem.Allocator,
     tokenizer: Tokenizer,
@@ -254,6 +276,7 @@ pub const TextPipeline = struct {
 
     pub fn init(a: std.mem.Allocator, tokenizer: Tokenizer, control: Control, messages: []const generation.Message, config: generation.GenerationConfig, input_limit: ?usize, context_limit: u32, options: chat.ChatOptions) !TextPipeline {
         try control.check();
+        _ = try requestCacheFormat(config);
         const prompt = try chat.Prompt.init(a, tokenizer, messages, options, config.enable_thinking);
         errdefer prompt.deinit(a);
         if (input_limit) |limit| if (prompt.count() > limit) return error.InferenceInputTokensExceeded;
@@ -277,21 +300,10 @@ pub const TextPipeline = struct {
     }
 
     fn requestPlanWithShape(self: *const TextPipeline, model: *const decoder.Decoder, config: generation.GenerationConfig, shape: PrefillShape) !decoder.RequestPlan {
-        if (config.max_tokens <= 0 or self.prompt.suffix.len == 0 or
-            config.grammar != null or config.kv_cache_mode != .exact_hybrid or
-            config.cache_compaction_ratio != null or config.prompt_cache_enabled or config.draft_model != null or
-            config.token_observer != null or (config.speculation_requested and config.speculation_policy == .force))
-            return error.UnsupportedInkling2Request;
+        if (self.prompt.suffix.len == 0) return error.UnsupportedInkling2Request;
+        const format = try requestCacheFormat(config);
         const tokens = try chat.contextCapacity(self.prompt.count(), config.max_tokens, model.text.model_max_length);
         const prefix = self.prompt.count() - 1;
-        const format: @import("../runtime/kv/hybrid_paged.zig").PlaneFormat = if (config.cache_dtype) |dtype| blk: {
-            const parsed = @import("../runtime/kv/pool.zig").parseKvDType(dtype) orelse return error.UnsupportedInkling2Request;
-            break :blk switch (parsed) {
-                .bf16 => .bf16,
-                .int4 => .q4_head128,
-                else => return error.UnsupportedInkling2Request,
-            };
-        } else .bf16;
         var plan = try decoder.RequestPlan.initWithReductionRows(model, tokens, shape.rows, shape.reduction_rows, format);
         if (chat.usesUnpenalizedGreedy(config)) plan = plan.withDeviceSelection();
         return plan.withPrefillTail(model, @intCast(prefix % shape.rows));
