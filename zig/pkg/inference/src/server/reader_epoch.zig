@@ -1446,6 +1446,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
         /// satisfy the callback's exact backend/Model proof before SDK work.
         pub fn configureGraphAdmission(ctx: *LightOnStreamContext, executor: *@import("../execution/decoder_step_executor.zig").Executor) void {
             executor.context.cleanup_owner = &ctx.cleanup_owner;
+            executor.batch_diagnostics = ctx.model.session.invocation_diagnostics;
             executor.context.before_owned_forward = if (comptime build_options.enable_cuda) .{ .ptr = ctx, .prepare_fn = preparePackedHost } else null;
             executor.context.graph_preparation = if (comptime build_options.enable_cuda) .{ .ptr = ctx, .prepare_fn = prepareCapturedGraph } else null;
             executor.context.external_prefill_preparation = if (comptime build_options.enable_cuda) .{ .ptr = ctx, .prepare_fn = prepareExternalPrefill } else null;
@@ -1615,8 +1616,9 @@ fn coldCreatorPageCase(a: std.mem.Allocator, cancel_after_reserve: bool, transie
         const table = @import("../backends/session.zig").Session.VTable{ .backend = backend, .run = run, .inputInfo = info, .outputInfo = info, .close = close };
     };
     var marker: u8 = 0;
+    var diagnostics: @import("../execution/diagnostics.zig").Diagnostics = .{};
     var model: model_manager_mod.LoadedModel = undefined;
-    model.session = .{ .ptr = &marker, .vtable = &ColdSession.table };
+    model.session = .{ .ptr = &marker, .vtable = &ColdSession.table, .invocation_diagnostics = .{ .diagnostics = &diagnostics } };
     model.native_generate_lock = .unlocked;
     model.native_reader_execution_lane = .{};
     model.native_reader_stream = .{};
@@ -1694,6 +1696,7 @@ fn coldCreatorPageCase(a: std.mem.Allocator, cancel_after_reserve: bool, transie
         var configured: @import("../execution/decoder_step_executor.zig").Executor = undefined;
         ctx.configureGraphAdmission(&configured);
         try std.testing.expect(configured.context.cleanup_owner == &ctx.cleanup_owner);
+        try std.testing.expect(configured.batch_diagnostics.?.diagnostics == &diagnostics);
         if (comptime build_options.enable_cuda) {
             const graph_hook = configured.context.graph_preparation orelse return error.MissingReaderGraphPreparation;
             const prefill_hook = configured.context.external_prefill_preparation orelse return error.MissingReaderPrefillPreparation;
