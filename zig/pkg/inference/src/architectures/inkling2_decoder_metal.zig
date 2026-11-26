@@ -255,6 +255,7 @@ pub const RequestPlan = struct {
     decode: WorkPlan,
     prefill: ?WorkPlan,
     prefill_tail: ?WorkPlan = null,
+    host_logit_count: u32,
 
     pub fn init(model: *const Decoder, max_tokens: u32) !RequestPlan {
         return initPrefill(model, max_tokens, 1);
@@ -275,6 +276,7 @@ pub const RequestPlan = struct {
             prefill_rows > @min(grouped_prefill_chunk_rows, max_tokens)) return error.InvalidInkling2Context;
         return .{
             .width = text.hidden_size,
+            .host_logit_count = text.unpadded_vocab_size,
             .bank = .{
                 .layout = .{ .page_tokens = 16, .window_tokens = text.sliding_window_size, .max_tokens = max_tokens, .max_append_tokens = prefill_rows },
                 .full_slots = checkpoint.full_slot_count,
@@ -295,6 +297,16 @@ pub const RequestPlan = struct {
         var result = self;
         result.prefill_tail = try .init(model, tail_rows, @intCast(self.bank.layout.max_tokens), @min(tail_rows, main.reduction_rows));
         return result;
+    }
+
+    pub fn withDeviceSelection(self: RequestPlan) RequestPlan {
+        var result = self;
+        result.host_logit_count = 0;
+        return result;
+    }
+
+    pub fn hostLogitBytes(self: RequestPlan) usize {
+        return @as(usize, self.host_logit_count) * @sizeOf(f32);
     }
 
     pub fn deviceBytes(self: RequestPlan) !usize {
@@ -371,7 +383,7 @@ pub const Request = struct {
     decode: Work,
     prefill: ?Work,
     prefill_tail: ?WorkPlan,
-    host_logits: []f32,
+    host_logits: ?[]f32,
     allocator: std.mem.Allocator,
 
     /// Initialize the request in its final storage so that KV's metadata pools
@@ -382,9 +394,9 @@ pub const Request = struct {
 
     pub fn initWithPlan(self: *Request, a: std.mem.Allocator, model: *const Decoder, plan: RequestPlan) !void {
         const runtime = model.runtime;
-        self.* = .{ .model = model, .state = undefined, .decode = undefined, .prefill = null, .prefill_tail = plan.prefill_tail, .host_logits = undefined, .allocator = a };
-        self.host_logits = try a.alloc(f32, model.text.unpadded_vocab_size);
-        errdefer a.free(self.host_logits);
+        self.* = .{ .model = model, .state = undefined, .decode = undefined, .prefill = null, .prefill_tail = plan.prefill_tail, .host_logits = null, .allocator = a };
+        if (plan.host_logit_count != 0) self.host_logits = try a.alloc(f32, plan.host_logit_count);
+        errdefer if (self.host_logits) |logits| a.free(logits);
         self.decode = try .init(a, runtime, plan.width, plan.decode);
         errdefer self.decode.deinit();
         if (plan.prefill) |batch| self.prefill = try .init(a, runtime, plan.width, batch);
@@ -394,9 +406,9 @@ pub const Request = struct {
 
     pub fn deinit(self: *Request) void {
         self.state.deinit();
-        if (self.prefill) |*batch| batch.deinit();
+        self.releasePrefill();
         self.decode.deinit();
-        self.allocator.free(self.host_logits);
+        if (self.host_logits) |logits| self.allocator.free(logits);
     }
 
     fn control(self: *Request, work: *Work, layer: *const Layer, layer_index: usize, stream: checkpoint.ControllerStream, dest: *const Tensor, gamma: *const Tensor, output: *Tensor) !void {
@@ -566,10 +578,17 @@ pub const Request = struct {
         return self.appendPrefix(&.{.{ .embeddings = .{ .tensor = image_rows, .start = 0, .count = rows } }});
     }
 
+    pub fn releasePrefill(self: *Request) void {
+        if (self.prefill) |*batch| batch.deinit();
+        self.prefill = null;
+        self.prefill_tail = null;
+    }
+
     pub fn step(self: *Request, token: u32) ![]const f32 {
+        const logits = self.host_logits orelse return error.HostLogitsNotAdmitted;
         try self.run(&self.decode, .{ .token = token }, .logits);
-        try self.decode.get(.logits).downloadF32Into(self.host_logits);
-        return self.host_logits;
+        try self.decode.get(.logits).downloadF32Into(logits);
+        return logits;
     }
 
     pub fn stepGreedy(self: *Request, token: u32) !u32 {
@@ -976,11 +995,20 @@ test "Inkling Metal resident decoder executes the full visit schedule on a synth
     try std.testing.expectApproxEqAbs(@as(f32, -0.76159416), logits[1], 0.00001);
     try std.testing.expectEqual(@as(usize, 2), request.state.sequence.committed_tokens);
     var batched: Request = undefined;
-    try batched.initWithPlan(a, &model, try RequestPlan.initPrefill(&model, 3, 2));
+    const batch_plan = try RequestPlan.initPrefill(&model, 3, 2);
+    try std.testing.expectEqual(@as(usize, 2 * @sizeOf(f32)), batch_plan.hostLogitBytes());
+    const greedy_plan = batch_plan.withDeviceSelection();
+    try std.testing.expectEqual(@as(usize, 0), greedy_plan.hostLogitBytes());
+    try std.testing.expectEqual(try batch_plan.deviceBytes(), try greedy_plan.deviceBytes());
+    try batched.initWithPlan(a, &model, greedy_plan);
     defer batched.deinit();
     try std.testing.expectError(error.InvalidInkling2Token, batched.appendTokens(&.{ 0, -1 }));
     try std.testing.expectEqual(@as(usize, 0), batched.state.sequence.committed_tokens);
     try batched.appendTokens(&.{ 0, 1 });
+    try std.testing.expectEqual(@as(usize, 2), batched.state.sequence.committed_tokens);
+    batched.releasePrefill();
+    try std.testing.expect(batched.prefill == null);
+    try std.testing.expectError(error.HostLogitsNotAdmitted, batched.step(0));
     try std.testing.expectEqual(@as(usize, 2), batched.state.sequence.committed_tokens);
     const expected_after_prefix = try request.stepGreedy(0);
     try std.testing.expectEqual(expected_after_prefix, try batched.stepGreedy(0));

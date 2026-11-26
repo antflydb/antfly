@@ -163,7 +163,7 @@ pub const Runtime = struct {
                 .backend_weight_bytes = self.resident_bytes,
                 .backend_kv_bytes = retained,
                 .backend_scratch_bytes = physical - retained,
-                .host_scratch_bytes = @as(usize, self.model.text.unpadded_vocab_size) * @sizeOf(f32),
+                .host_scratch_bytes = plan.hostLogitBytes(),
             };
             if (required.fitsLimits(candidate) catch false) return candidate;
             shape = shape.smaller() orelse return limits;
@@ -175,7 +175,6 @@ pub const Runtime = struct {
     }
 
     pub fn generate(self: *Runtime, session: backends.Session, pipeline: *const TextPipeline, config: generation.GenerationConfig, callbacks: TextPipeline.Callbacks) !generation.GenerationResult {
-        const logit_bytes = @as(usize, self.model.text.unpadded_vocab_size) * @sizeOf(f32);
         const guarded = session.withAdmissionControl(pipeline.control);
         var shape = PrefillShape.preferred(pipeline.prompt.count() -| 1);
         var plan: decoder.RequestPlan = undefined;
@@ -184,7 +183,7 @@ pub const Runtime = struct {
             const kv_bytes = try State.deviceBytes(plan.bank, plan.width);
             const device_bytes = try plan.deviceBytes();
             const vision_bytes = try imageAdmission(pipeline.prompt, shape.rows, self.model.text.hidden_size);
-            const host_bytes = try std.math.add(usize, logit_bytes, vision_bytes.host);
+            const host_bytes = try std.math.add(usize, plan.hostLogitBytes(), vision_bytes.host);
             const scratch = try std.math.add(usize, device_bytes - kv_bytes, vision_bytes.device);
             if (shape.rows == 1 or try guarded.fitsRetainedStateWithWorkspace(host_bytes, kv_bytes, scratch))
                 break .{ kv_bytes, scratch, host_bytes };
@@ -288,7 +287,8 @@ pub const TextPipeline = struct {
                 else => return error.UnsupportedInkling2Request,
             };
         } else .bf16;
-        const plan = try decoder.RequestPlan.initWithReductionRows(model, std.math.cast(u32, tokens) orelse return error.InvalidInkling2Context, shape.rows, shape.reduction_rows, format);
+        var plan = try decoder.RequestPlan.initWithReductionRows(model, std.math.cast(u32, tokens) orelse return error.InvalidInkling2Context, shape.rows, shape.reduction_rows, format);
+        if (chat.usesUnpenalizedGreedy(config)) plan = plan.withDeviceSelection();
         return plan.withPrefillTail(model, @intCast(prefix % shape.rows));
     }
 
@@ -310,6 +310,7 @@ pub const TextPipeline = struct {
         const after = self.prompt.suffix;
         const chunk_rows: u32 = @intCast(plan.bank.layout.max_append_tokens);
         try observation.callOperation(binding, .prefill, prefillPrompt, .{ self, &request, model, vision, after[0 .. after.len - 1], chunk_rows, binding });
+        request.releasePrefill();
         if (!greedy) {
             for (self.prompt.media) |item| {
                 for (item.prefix) |id| try history.append(self.allocator, id);
