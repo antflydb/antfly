@@ -134,6 +134,9 @@ pub const VTable = struct {
     prepareKernelRoute: ?*const fn (*anyopaque, @import("../execution/kernel_route.zig").Prepare) anyerror!?@import("../execution/kernel_route.zig").Owned = null,
     runAssignedKernel: ?*const fn (ctx: *anyopaque, request: kernel_descriptor.Invocation) anyerror!bool = null,
     createPhysicalCompletion: ?*const fn (ctx: *anyopaque) anyerror!physical_storage.Completion = null,
+    /// Read an F32 element range from a resident backing into the caller's
+    /// slice without creating a tensor view. False leaves the slice untouched.
+    readFloat32RangeInto: ?*const fn (ctx: *anyopaque, tensor: CT, offset: usize, output: []f32) anyerror!bool = null,
     readFloat32Into: ?*const fn (ctx: *anyopaque, tensor: CT, output: []f32) anyerror!bool = null,
     /// Metadata-only gate for borrowing shared literals in this invocation.
     /// Metal declines foreign active frames whose quota lifetime is unowned.

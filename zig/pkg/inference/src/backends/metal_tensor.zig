@@ -1496,10 +1496,17 @@ pub const MetalTensor = struct {
     /// passing through an f32 host mirror or mutating resident storage.
     pub fn downloadBytesInto(self: *const MetalTensor, output: []u8) !void {
         const dev = self.device orelse return error.UnsupportedTensorType;
-        if (dev.ref.released or dev.ref.ref_count.load(.acquire) == 0) return error.ReleasedDeviceBuffer;
         if (output.len != dev.byte_len) return error.InvalidTensorShape;
+        return self.downloadByteRangeInto(0, output);
+    }
+
+    pub fn downloadByteRangeInto(self: *const MetalTensor, offset: usize, output: []u8) !void {
+        const dev = self.device orelse return error.UnsupportedTensorType;
+        if (dev.ref.released or dev.ref.ref_count.load(.acquire) == 0) return error.ReleasedDeviceBuffer;
+        if (offset > dev.byte_len or output.len > dev.byte_len - offset) return error.InvalidTensorShape;
+        if (output.len == 0) return;
         if (termite_metal_decode_runtime_flush_active_frame(dev.ref.runtime) != 0) return error.MetalFrameSyncFailed;
-        try downloadBuffer(dev.ref.runtime, dev.ref.handle, dev.byte_offset, @ptrCast(output.ptr), dev.byte_len);
+        try downloadBuffer(dev.ref.runtime, dev.ref.handle, dev.byte_offset + offset, @ptrCast(output.ptr), output.len);
     }
 
     pub fn uploadBytes(self: *MetalTensor, input: []const u8) !void {

@@ -432,6 +432,23 @@ pub fn residentVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Ses
     const values = readback: {
         var guard = if (control) |active| try active.enterUninterruptible(decoder.interruption()) else null;
         defer if (guard) |*scope| scope.deinit();
+        if (query_rows > 1 and knows_dtype) {
+            if (outputs.backend.vtable.kernels) |kernels| {
+                if (kernels.accepts(outputs.backend.vtable)) {
+                    if (kernels.readFloat32RangeInto) |read| {
+                        try outputs.backend.checkExecutionControl();
+                        const destination = try allocator.alloc(f32, vocab);
+                        errdefer allocator.free(destination);
+                        const offset = try std.math.mul(usize, query_rows - 1, vocab);
+                        if (try read(outputs.backend.ptr, logits, offset, destination)) {
+                            if (control) |active| try active.check();
+                            break :readback destination;
+                        }
+                        allocator.free(destination);
+                    }
+                }
+            }
+        }
         // A single suffix row is already the complete requested output.
         // Keep the producer's ownership and read it without a temporary view.
         const direct = query_rows == 1 and knows_dtype;

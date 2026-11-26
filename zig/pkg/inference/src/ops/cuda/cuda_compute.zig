@@ -20571,12 +20571,22 @@ fn writePhysicalFloat32Op(ctx: *anyopaque, output: CT, input: []const f32) anyer
 }
 
 fn readFloat32IntoOp(ctx: *anyopaque, tensor: CT, output: []f32) anyerror!bool {
-    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const source = tensorFromCt(tensor);
     if (source.dtype != .f32 or source.quant_type != null) return false;
     if (source.elem_count != output.len) return error.InvalidTensorShape;
-    try copyToHostTrackedAndSync(self, source.buffer, std.mem.sliceAsBytes(output));
-    noteFloat32Download(self, output.len * @sizeOf(f32));
+    return readFloat32RangeIntoOp(ctx, tensor, 0, output);
+}
+
+fn readFloat32RangeIntoOp(ctx: *anyopaque, tensor: CT, offset: usize, output: []f32) anyerror!bool {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const source = tensorFromCt(tensor);
+    if (source.dtype != .f32 or source.quant_type != null) return false;
+    if (offset > source.elem_count or output.len > source.elem_count - offset) return error.InvalidTensorShape;
+    const bytes = std.mem.sliceAsBytes(output);
+    if (bytes.len == 0) return true;
+    const view = try borrowBufferRange(source.buffer, try checkedMul(offset, @sizeOf(f32)), bytes.len);
+    try copyToHostTrackedAndSync(self, view, bytes);
+    noteFloat32Download(self, bytes.len);
     return true;
 }
 
@@ -20692,11 +20702,9 @@ fn supportsLinearPackedNamedOp(ctx: *anyopaque) bool {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     return self.capability_profile == .embedding_gemma2 and self.embedding_gemma2_policy.packed_projections;
 }
-/// One actual warm invocation initializes caches; the next learns lifetimes.
-/// Capture uses only bounded arena addresses and validates every allocation/free.
-fn audioBufferView(buffer: buffer_mod.DeviceBuffer, offset: usize, bytes: usize) !buffer_mod.DeviceBuffer {
+fn borrowBufferRange(buffer: buffer_mod.DeviceBuffer, offset: usize, bytes: usize) !buffer_mod.DeviceBuffer {
     if (offset > buffer.len or bytes > buffer.len - offset) return error.InvalidShape;
-    return .{ .ptr = buffer.ptr + offset, .len = bytes, .borrowed = true };
+    return .{ .ptr = try std.math.add(u64, buffer.ptr, offset), .len = bytes, .borrowed = true };
 }
 fn audioOutputMatches(input: *const CudaTensor, output: *const CudaTensor, bytes: usize) bool {
     return output.dtype == .f32 and output.elem_count == input.elem_count and
@@ -20725,7 +20733,7 @@ fn stageAudioGraphInputs(self: *CudaCompute, input_bank: buffer_mod.DeviceBuffer
         var bytes: usize = 0;
         for (inputs, spans) |ct, span| {
             if (span.bytes == 0) continue;
-            destinations[count] = (try audioBufferView(input_bank, span.offset, span.bytes)).ptr;
+            destinations[count] = (try borrowBufferRange(input_bank, span.offset, span.bytes)).ptr;
             sources[count] = tensorFromCt(ct).buffer.ptr;
             sizes[count] = span.bytes;
             count += 1;
@@ -20743,7 +20751,7 @@ fn stageAudioGraphInputs(self: *CudaCompute, input_bank: buffer_mod.DeviceBuffer
     }
     for (inputs, spans) |ct, span| {
         if (span.bytes == 0) continue;
-        const destination = try audioBufferView(input_bank, span.offset, span.bytes);
+        const destination = try borrowBufferRange(input_bank, span.offset, span.bytes);
         const source = tensorFromCt(ct).buffer;
         if (debug_copy) {
             try copyFromDeviceTracked(self, destination, source, span.bytes);
@@ -20808,6 +20816,8 @@ fn retainAudioGraphBacking(self: *CudaCompute, bank: *buffer_mod.DeviceBuffer, q
     };
 }
 
+/// One actual warm invocation initializes caches; the next learns lifetimes.
+/// Capture uses only bounded arena addresses and validates every allocation/free.
 fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: CacheCleanup, _: bool) anyerror!?CT {
     const plan_mod = @import("audio_execution_plan.zig");
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
@@ -20949,11 +20959,11 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     } else try self.createEmbeddingGemma2TensorWithBacking(first_input.shape, first_input.elem_count, .f32, backing_bytes);
     var out_owned = true;
     defer if (out_owned) freeTensor(self, out);
-    const output_bank = if (published_directly) tensorFromCt(out).buffer else if (storage.external_output) arena.buffers[1] else try audioBufferView(arena.buffers[0], output.offset, output.bytes);
+    const output_bank = if (published_directly) tensorFromCt(out).buffer else if (storage.external_output) arena.buffers[1] else try borrowBufferRange(arena.buffers[0], output.offset, output.bytes);
     if (published_directly or storage.external_output) {
         if (execution_scope) |*scope| try scope.bindPublishedOutput(output_bank.ptr, output_bank.len);
     }
-    const input_bank = if (replay or capture) try audioBufferView(arena.buffers[0], 0, storage.scratch_offset) else buffer_mod.DeviceBuffer{};
+    const input_bank = if (replay or capture) try borrowBufferRange(arena.buffers[0], 0, storage.scratch_offset) else buffer_mod.DeviceBuffer{};
     defer arena.noteUse(&self.ctx);
     const timing = try arena.beginTiming(&self.ctx);
     if (!replay) {
@@ -20967,7 +20977,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
             const input = tensorFromCt(ct);
             const source = if (capture) input_bank else input.buffer;
             const offset = if (capture) span.offset else 0;
-            const buffer = try audioBufferView(source, offset, span.bytes);
+            const buffer = try borrowBufferRange(source, offset, span.bytes);
             const borrowed = try createTensor(self, buffer, input.shape, input.elem_count);
             const view = tensorFromCt(borrowed);
             view.owns_buffer = false;
@@ -21022,7 +21032,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         if (replay) self.audio_graph_replays += 1;
     }
     if (!published_directly and retained_output == null) {
-        const result = try audioBufferView(output_bank, 0, output_bytes);
+        const result = try borrowBufferRange(output_bank, 0, output_bytes);
         try copyFromDeviceTracked(self, tensorFromCt(out).buffer, result, output_bytes);
     }
     // Include the publication copy in replay samples. The direct ordinary
@@ -36979,6 +36989,7 @@ const kernel_backend_impl: ops.KernelBackend = .{
     .prepareKernelRoute = &prepareKernelRouteOp,
     .createPhysicalCompletion = &createPhysicalCompletionOp,
     .readFloat32Into = &readFloat32IntoOp,
+    .readFloat32RangeInto = &readFloat32RangeIntoOp,
     .writePhysicalFloat32 = &writePhysicalFloat32Op,
     .writePhysicalIntegerLiteral = &writePhysicalIntegerLiteralOp,
     .retainImmutableTensor = &retainImmutableTensorOp,
@@ -60919,7 +60930,7 @@ test "public source audio linear recreates input bank through actual learning ca
         const replays_before = compute.audio_graph_replays;
         for (arena.buffers[0..2]) |bank| {
             var alias: CudaTensor = .{
-                .buffer = try audioBufferView(bank, 0, @sizeOf([4]f32)),
+                .buffer = try borrowBufferRange(bank, 0, @sizeOf([4]f32)),
                 .shape = @constCast(&[_]i64{ 2, 2 }),
                 .elem_count = 4,
                 .dtype = .f32,
