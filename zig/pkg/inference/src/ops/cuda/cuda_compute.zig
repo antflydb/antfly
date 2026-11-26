@@ -20842,31 +20842,39 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     };
     const entry = try self.audio_plans.getWithCleanup(base_key, plan_cleanup);
     if (entry.disabled) return null;
-    var canonical: [20]CT = undefined;
-    var canonical_count: usize = 0;
-    defer for (canonical[0..canonical_count]) |ct| freeTensor(self, ct);
-    if (!entry.warmed or entry.owner == null) {
+    if (entry.owner == null) {
+        // A warmed signature needs a learning lease before creating any
+        // numerical bindings. Declined admission leaves the eager caller in
+        // charge of its original inputs.
+        const funding = if (entry.warmed) self.ctx.prepared_cache_funding else null;
+        var learning = if (funding) |prepared| prepared.take(
+            .{ .audio_learning = .{ .key = base_key } },
+            .{ .host_scratch_bytes = @sizeOf(plan_mod.Owner) },
+        ) catch |err| switch (err) {
+            error.UnpreparedCacheAdmission => return null,
+            else => return err,
+        } else null;
+        errdefer if (learning) |*token| if (token.owner != null)
+            token.cancelBeforeSdk() catch platform.inference_process_supervisor.restartWorker();
+
+        var canonical: [20]CT = undefined;
+        var canonical_count: usize = 0;
+        defer for (canonical[0..canonical_count]) |ct| freeTensor(self, ct);
         for (inputs, spans) |ct, span| {
             const alias = try borrowModelConstant(self, tensorFromCt(ct));
             tensorFromCt(alias).buffer.len = span.bytes;
             canonical[canonical_count] = alias;
             canonical_count += 1;
         }
-    }
-    if (!entry.warmed) {
-        const out = try run(context, canonical[0..canonical_count]);
-        entry.warmed = true;
-        return out;
-    }
-    if (entry.owner == null) {
-        const owner = if (self.ctx.prepared_cache_funding) |funding| prepared: {
-            var token = funding.take(.{ .audio_learning = .{ .key = base_key } }, .{ .host_scratch_bytes = @sizeOf(plan_mod.Owner) }) catch |err| {
-                if (err == error.UnpreparedCacheAdmission) return null; // same ordinary body, before layer execution
-                return err;
-            };
-            errdefer if (token.owner != null) token.cancelBeforeSdk() catch platform.inference_process_supervisor.restartWorker();
-            break :prepared try token.publishAudioLearning();
-        } else try plan_mod.Owner.create(std.heap.c_allocator);
+        if (!entry.warmed) {
+            const out = try run(context, canonical[0..canonical_count]);
+            entry.warmed = true;
+            return out;
+        }
+        const owner = if (learning) |*token|
+            try token.publishAudioLearning()
+        else
+            try plan_mod.Owner.create(std.heap.c_allocator);
         entry.owner = owner;
         const plan = &owner.plan;
         var scope = plan_mod.Scope.observe(plan);
@@ -58198,6 +58206,29 @@ test "CUDA audio learning cache state uses actual warm no-plan eligibility and o
     compute.audio_plans.entries[0].owner = null;
     compute.audio_plans.entries[0].disabled = true;
     try std.testing.expect(!(try compute.cacheRequestState(request)).miss);
+}
+
+test "CUDA warmed audio declines unfunded learning before borrowing inputs" {
+    var compute = metadataOnlyTestCompute();
+    compute.capability_profile = .embedding_gemma2;
+    compute.embedding_gemma2_policy = .{ .audio_graph = true };
+    compute.ctx.driver.fns.cuStreamIsCapturing = null;
+    var funding: @import("prepared_cache.zig").Funding = .{ .allocator = std.testing.allocator, .entries = &.{}, .state = .bound };
+    compute.ctx.prepared_cache_funding = &funding;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    compute.allocator = failing.allocator();
+
+    var shape = [_]i64{4};
+    var input: CudaTensor = .{ .buffer = .{ .ptr = 0x1000, .len = 16 }, .shape = &shape, .elem_count = 4, .dtype = .f32 };
+    const base = try compute.audioCacheBase(71, &.{.{ .shape = &shape, .elements = 4 }}, null);
+    compute.audio_plans.entries[0] = .{ .key = base.key, .stamp = 1, .warmed = true };
+    const Run = struct {
+        fn call(_: *anyopaque, _: []const CT) !CT {
+            return error.UnexpectedAudioExecution;
+        }
+    };
+    try std.testing.expect(try audioExecutionOp(&compute, 71, &.{@ptrCast(&input)}, &compute, Run.call, .{}, false) == null);
+    try std.testing.expect(compute.audio_plans.entries[0].owner == null and !compute.audio_execution_active);
 }
 
 test "CUDA warm raw frontend five owners upgrade exact SDK addresses at full cap despite optional miss denial" {
