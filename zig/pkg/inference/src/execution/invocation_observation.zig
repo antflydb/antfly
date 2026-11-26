@@ -160,6 +160,7 @@ test "planned prefill geometry is exported separately from observed GPU work" {
         .max_append_rows = 256,
         .attention_workspace_rows = 32,
         .cache_capacity_tokens = 1_048_576,
+        .workspace = .{ .planned_bytes = 32768, .bound_bytes = 32768 },
     };
     try callOperation(binding, .prefill, Work.run, .{});
     const report = owner.snapshot().?.report.?;

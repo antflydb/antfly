@@ -343,12 +343,16 @@ pub const TextPipeline = struct {
             if (selected.diagnostics.isEnabled()) {
                 progress_target = &progress;
                 selected.prefill_progress = &progress;
+                selected.planned_prefill = .{
+                    .max_append_rows = chunk_rows,
+                    .attention_workspace_rows = if (plan.prefill) |work| work.reduction_rows else 1,
+                    .cache_capacity_tokens = @intCast(plan.bank.layout.max_tokens),
+                    .workspace = .{
+                        .planned_bytes = try plan.prefillWorkspaceBytes(),
+                        .bound_bytes = request.prefillWorkspaceBytes(),
+                    },
+                };
             }
-            selected.planned_prefill = .{
-                .max_append_rows = chunk_rows,
-                .attention_workspace_rows = if (plan.prefill) |work| work.reduction_rows else 1,
-                .cache_capacity_tokens = @intCast(plan.bank.layout.max_tokens),
-            };
         }
         const select = selectsInPrefill(config);
         var first_token = try observation.callOperation(prefill_observation, .prefill, prefillPrompt, .{

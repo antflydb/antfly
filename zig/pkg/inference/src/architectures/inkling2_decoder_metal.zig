@@ -294,6 +294,11 @@ const WorkPlan = struct {
         };
     }
 
+    fn storageCapacity(self: WorkPlan, width: u32, tail: ?WorkPlan) !usize {
+        const tail_bytes = if (tail) |short| (try short.storage(width)).bytes else 0;
+        return @max((try self.storage(width)).bytes, tail_bytes);
+    }
+
     fn deviceBytes(self: WorkPlan, width: u32) !usize {
         return std.math.add(usize, (try self.storage(width)).bytes, try std.math.mul(usize, self.elements[@backingInt(Temp.logits)], @sizeOf(f32)));
     }
@@ -365,11 +370,14 @@ pub const RequestPlan = struct {
         return @as(usize, self.host_logit_count) * @sizeOf(f32);
     }
 
+    pub fn prefillWorkspaceBytes(self: RequestPlan) !usize {
+        const main = self.prefill orelse return 0;
+        return main.storageCapacity(self.width, self.prefill_tail);
+    }
+
     pub fn deviceBytes(self: RequestPlan) !usize {
         const bytes = try std.math.add(usize, try State.deviceBytes(self.bank, self.width), try self.decode.deviceBytes(self.width));
-        const main_bytes = if (self.prefill) |plan| try plan.deviceBytes(self.width) else 0;
-        const tail_bytes = if (self.prefill_tail) |plan| try plan.deviceBytes(self.width) else 0;
-        return std.math.add(usize, bytes, @max(main_bytes, tail_bytes));
+        return std.math.add(usize, bytes, try self.prefillWorkspaceBytes());
     }
 };
 
@@ -381,8 +389,7 @@ const Work = struct {
     temps: [@typeInfo(Temp).@"enum".field_names.len]Tensor,
 
     fn init(a: std.mem.Allocator, runtime: *Runtime, width: u32, plan: WorkPlan, tail: ?WorkPlan) !Work {
-        const tail_bytes = if (tail) |short| (try short.storage(width)).bytes else 0;
-        var storage = try allocate(a, runtime, .u8, @max((try plan.storage(width)).bytes, tail_bytes), .private);
+        var storage = try allocate(a, runtime, .u8, try plan.storageCapacity(width, tail), .private);
         defer storage.deinit();
         return bind(a, runtime, width, plan, &storage);
     }
@@ -675,6 +682,10 @@ pub const Request = struct {
         if (image_rows.deviceByteLen() != @as(usize, rows) * self.model.text.hidden_size * @sizeOf(u16))
             return error.InvalidShape;
         return self.appendPrefix(&.{.{ .embeddings = .{ .tensor = image_rows, .start = 0, .count = rows } }});
+    }
+
+    pub fn prefillWorkspaceBytes(self: *const Request) usize {
+        return if (self.prefill) |*work| work.storage.deviceByteLen() else 0;
     }
 
     pub fn releasePrefill(self: *Request) void {
@@ -1215,13 +1226,16 @@ test "Inkling Metal resident decoder executes the full visit schedule on a synth
     try std.testing.expectEqual(expected_after_prefix, try fused.stepGreedy(0));
     var tail_request: Request = undefined;
     const wide_plan = try RequestPlan.initPrefill(&model, 6, 3);
-    try tail_request.initWithPlan(a, &model, try wide_plan.withPrefillTail(&model, 2));
+    const tail_plan = try wide_plan.withPrefillTail(&model, 2);
+    try tail_request.initWithPlan(a, &model, tail_plan);
     defer tail_request.deinit();
     try tail_request.appendTokens(&.{ 0, 1, 0 });
     const wide_storage = tail_request.prefill.?.storage.deviceHandle();
+    try std.testing.expectEqual(try tail_plan.prefillWorkspaceBytes(), tail_request.prefillWorkspaceBytes());
     const buffers_before_tail = @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created;
     try tail_request.appendTokens(&.{ 1, 0 });
     try std.testing.expectEqual(wide_storage, tail_request.prefill.?.storage.deviceHandle());
+    try std.testing.expectEqual(try tail_plan.prefillWorkspaceBytes(), tail_request.prefillWorkspaceBytes());
     try std.testing.expectEqual(buffers_before_tail, @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created);
     try std.testing.expectEqual(@as(usize, 5), tail_request.state.sequence.committed_tokens);
     if (groupedPrefillEnabled()) {

@@ -226,6 +226,9 @@ pub const PrefillGeometry = struct {
     max_append_rows: u32,
     attention_workspace_rows: u32,
     cache_capacity_tokens: u32,
+    /// Dedicated prefill scratch payload. The decode arena, cache, and
+    /// opaque provider allocations are outside this measure.
+    workspace: ?struct { planned_bytes: usize, bound_bytes: usize } = null,
 };
 
 /// State published by a managed prefill callback, including work retired
