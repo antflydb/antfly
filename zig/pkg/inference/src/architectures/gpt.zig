@@ -4085,10 +4085,10 @@ pub fn tryDenseQwen3Prefill(
     defer if (scores) |value| freeTensorWithCleanup(cb, value, options.cleanup);
     var normalized: ?CT = null;
     defer if (normalized) |value| freeTensorWithCleanup(cb, value, options.cleanup);
-    var active = try cb.decoderRuntimeBeginFrame();
-    if (!active) return null;
+    var frame = try @import("../execution/submission.zig").Scope.begin(cb);
+    if (!frame.owns) return null;
     // Runs before any tensor defer, including when execution returned false.
-    defer if (active) cb.decoderRuntimeCancelFrame() catch {};
+    defer frame.deinit();
     if (options.profile) try cb.decoderRuntimeSetActiveFrameRegime(.prefill);
     if (!try cb.decoderRuntimeExecuteGraphCommandPlanFrame(&.{
         .cleanup = options.cleanup,
@@ -4132,8 +4132,7 @@ pub fn tryDenseQwen3Prefill(
         }
     }
     try cb.checkExecutionControl();
-    try cb.decoderRuntimeSubmitAndWaitFrame();
-    active = false;
+    try frame.finish();
     try cb.checkExecutionControl();
     if (scores) |value| {
         scores = null;
@@ -12267,17 +12266,11 @@ fn runGroupedExpertBatchTensor(
     // the pair projection, activation/multiply, down projection, and scatter
     // in one command buffer instead of paying a synchronous submission for
     // every operation. Other MoE layouts retain their existing scheduling.
-    var a4b_frame_active = false;
-    if (cb.kind() == .metal and
-        gemma4_runtime.supportsRuntimeConfig(config) and
-        !cb.decoderRuntimeHasActiveFrame())
-    {
-        a4b_frame_active = try cb.decoderRuntimeBeginFrame();
-        if (a4b_frame_active) {
-            try cb.decoderRuntimeSetActiveFrameRegime(if (total_rows > 1) .prefill else .decode);
-        }
-    }
-    defer if (a4b_frame_active) cb.decoderRuntimeCancelFrame() catch {};
+    const Submission = @import("../execution/submission.zig").Scope;
+    const frame_needed = cb.kind() == .metal and gemma4_runtime.supportsRuntimeConfig(config);
+    var frame: Submission = if (frame_needed) try Submission.begin(cb) else .{ .backend = cb };
+    defer frame.deinit();
+    if (frame.owns) try cb.decoderRuntimeSetActiveFrameRegime(if (total_rows > 1) .prefill else .decode);
 
     const batch_size = grouped.rows.len;
     const input_upload_started_at = monotonicNowNs();
@@ -12401,10 +12394,8 @@ fn runGroupedExpertBatchTensor(
 
     const scattered_ct = (try cb.moeScatterAdd(output_ct, grouped.rows, grouped.route_weights, expert_out_ct, batch_size, hidden_size)) orelse return null;
     debug_timing_stats.moe_grouped_scatter_nanos += @intCast(monotonicNowNs() - scatter_started_at);
-    if (a4b_frame_active) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        a4b_frame_active = false;
-    }
+    errdefer cb.free(scattered_ct);
+    try frame.finish();
     if (enableMoeSyncProfileDebug()) {
         const sync_started_at = monotonicNowNs();
         try cb.evalTensor(scattered_ct);

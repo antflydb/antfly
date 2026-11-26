@@ -333,8 +333,9 @@ const Forward = struct {
         else
             self.config.num_hidden_layers;
         const layers_per_frame = platform.env.getenvUsize("ANTFLY_GLIDE_DECODER_FRAME_LAYERS") orelse default_layers_per_frame;
-        var frame = false;
-        defer if (frame) cb.decoderRuntimeCancelFrame() catch {};
+        const Submission = @import("../execution/submission.zig").Scope;
+        var frame: Submission = .{ .backend = cb };
+        defer frame.deinit();
         // Debug: append the first row's readout hidden state after every layer
         // (raw f32) for layer-by-layer comparison against the reference.
         const dump_file: ?*std.c.FILE = if (comptime !@import("builtin").link_libc) null else if (platform.env.getenvZ("ANTFLY_GLIDE_DECODER_DUMP")) |path| std.c.fopen(path, "ab") else null;
@@ -346,9 +347,9 @@ const Forward = struct {
 
         for (0..self.config.num_hidden_layers) |layer| {
             const layer_started = if (profile.enabled) Profile.now() else 0;
-            if (cb.kind() == .metal and !frame and layers_per_frame != 0) {
-                frame = try cb.decoderRuntimeBeginFrame();
-                if (frame) try cb.decoderRuntimeSetActiveFrameRegime(.prefill);
+            if (cb.kind() == .metal and !frame.owns and layers_per_frame != 0) {
+                frame = try Submission.begin(cb);
+                if (frame.owns) try cb.decoderRuntimeSetActiveFrameRegime(.prefill);
             }
             const last = layer + 1 == self.config.num_hidden_layers;
             // The readout needs only the final layer's readout rows: its
@@ -358,16 +359,15 @@ const Forward = struct {
             cb.free(hidden);
             hidden = next;
             hidden_rows = if (prune) self.plan.batch else n;
-            if (frame and (last or (layer + 1) % layers_per_frame == 0)) {
+            if (frame.owns and (last or (layer + 1) % layers_per_frame == 0)) {
                 const wait_started = if (profile.enabled) Profile.now() else 0;
-                try cb.decoderRuntimeSubmitAndWaitFrame();
-                frame = false;
+                try frame.finish();
                 if (profile.enabled) profile.wait_ns += Profile.now() - wait_started;
                 if (!last) try cb.checkExecutionControl();
             }
             if (dump_file) |file| try self.dumpRow(file, hidden, hidden_rows);
             if (profile.enabled) {
-                if (!frame) {
+                if (!frame.owns) {
                     const elapsed = Profile.now() - layer_started;
                     if (self.config.layerUsesQwen35LinearAttention(layer)) profile.linear_ns += elapsed else profile.full_ns += elapsed;
                 }
