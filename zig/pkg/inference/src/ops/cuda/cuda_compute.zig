@@ -45732,6 +45732,59 @@ test "LightOnOCR3 CUDA optional BF16 prefill scratch preserves admission across 
     try std.testing.expectEqual(@as(usize, 0), prefill.calls);
 }
 
+test "CUDA bounded decoder drains a failed receipt transfer before returning" {
+    const Fake = struct {
+        var copies: usize = 0;
+        var waits: usize = 0;
+        fn current(_: driver_mod.CUcontext) callconv(.c) driver_mod.CUresult {
+            return driver_mod.CUDA_SUCCESS;
+        }
+        fn copy(_: ?*anyopaque, _: driver_mod.CUdeviceptr, _: usize, _: driver_mod.CUstream) callconv(.c) driver_mod.CUresult {
+            copies += 1;
+            return 1;
+        }
+        fn sync(_: driver_mod.CUstream) callconv(.c) driver_mod.CUresult {
+            waits += 1;
+            return driver_mod.CUDA_SUCCESS;
+        }
+        fn describe(_: driver_mod.CUresult, name: *?[*:0]const u8) callconv(.c) driver_mod.CUresult {
+            name.* = "injected decoder receipt transfer failure";
+            return driver_mod.CUDA_SUCCESS;
+        }
+    };
+    const rows = 4;
+    const layout = try @import("bounded_decode_graph.zig").StorageLayout.init(rows, 1024, 8, 1);
+    var compute = metadataOnlyTestCompute();
+    compute.ctx.ctx = @ptrFromInt(1);
+    compute.ctx.driver.fns.cuCtxSetCurrent = Fake.current;
+    compute.ctx.driver.fns.cuMemcpyDtoHAsync = Fake.copy;
+    compute.ctx.driver.fns.cuStreamSynchronize = Fake.sync;
+    compute.ctx.driver.fns.cuGetErrorName = Fake.describe;
+    compute.ctx.driver.fns.cuGetErrorString = Fake.describe;
+    const owner = &compute.bounded_decode_graph;
+    owner.rows = rows;
+    owner.storage_layout = layout;
+    owner.metadata = .{ .ptr = 0x1000, .len = layout.metadata_bytes };
+    owner.progress = 2;
+    owner.next_positions[0 .. rows * 3].* = @splat(7);
+    var claim = CudaCompute.BoundedDecodeClaim{ .compute = &compute, .future_tokens = 16 };
+    var burst: CudaCompute.LightOnTokenBurst = undefined;
+    burst.drained = false;
+    var first: [rows]u32 = @splat(11);
+    var second: [rows]u32 = @splat(22);
+    Fake.copies = 0;
+    Fake.waits = 0;
+    @import("../../test_error_logs.zig").expectErrorLogs(1);
+    try std.testing.expectError(error.CudaDriverError, claim.read(&burst, &first, &second));
+    try std.testing.expect(burst.drained);
+    try std.testing.expectEqual(@as(usize, 1), Fake.copies);
+    try std.testing.expectEqual(@as(usize, 1), Fake.waits);
+    try std.testing.expectEqual(@as(u32, 2), owner.progress);
+    try std.testing.expectEqual(@as([rows * 3]u32, @splat(7)), owner.next_positions[0 .. rows * 3].*);
+    try std.testing.expectEqual(@as([rows]u32, @splat(11)), first);
+    try std.testing.expectEqual(@as([rows]u32, @splat(22)), second);
+}
+
 test "LightOnOCR3 CUDA wide graph head projection writes its assigned buffer" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;
