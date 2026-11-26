@@ -1079,11 +1079,8 @@ pub const Executor = struct {
         try self.context.cb.checkExecutionControl();
         try graph.run(&render, Render.run);
         graph.noteKvTokens(storage, render.max_tokens);
-        var host: [256]u32 = undefined;
-        try graph.read(&burst, host[0 .. 2 * claimed.len]);
+        try graph.read(&burst, first, second);
         try self.context.cb.checkExecutionControl();
-        @memcpy(first, host[0..claimed.len]);
-        @memcpy(second, host[claimed.len .. 2 * claimed.len]);
         burst.noteCompleted();
         return .{ .logits = null, .greedy_tokens = first, .second_greedy_tokens = second, .max_query_seq_len = 1 };
     }

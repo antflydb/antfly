@@ -3824,16 +3824,16 @@ pub const CudaCompute = struct {
                 owner.phase = .replay;
             } else owner.phase = .learn;
         }
-        pub fn read(self: *@This(), burst_value: *LightOnTokenBurst, tokens: []u32) !void {
+        pub fn read(self: *@This(), burst_value: *LightOnTokenBurst, first: []u32, second: []u32) !void {
             const owner = &self.compute.bounded_decode_graph;
-            if (tokens.len != 2 * owner.rows) return error.InvalidShape;
+            if (first.len != owner.rows or second.len != owner.rows) return error.InvalidShape;
             var host: [@import("bounded_decode_graph.zig").StorageLayout.max_readback_words]u32 = undefined;
             const layout = owner.storage_layout orelse return error.InvalidExecutionPlan;
             const source = layout.readback(owner.metadata);
             const readback_words = host[0 .. source.len / @sizeOf(u32)];
             try copyToHostTrackedAndSync(self.compute, source, std.mem.sliceAsBytes(readback_words));
             burst_value.drained = true;
-            try layout.publishReadback(readback_words, owner.next_positions[0 .. owner.rows * 3], &owner.progress, tokens);
+            try layout.publishReadback(readback_words, owner.next_positions[0 .. owner.rows * 3], &owner.progress, first, second);
             const observation = @import("../../execution/runtime_observation.zig");
             if (observation.kernelObservationActive()) if (self.launch_route) |route| {
                 const plan = owner.plan.?;
