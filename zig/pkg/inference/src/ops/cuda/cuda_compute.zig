@@ -4058,11 +4058,13 @@ pub const CudaCompute = struct {
             return .outside;
         }
         if (owner.phase == .disabled) return .unsupported;
-        if (owner.phase == .capture and owner.arena.ptr == 0) {
+        if (owner.phase == .capture and owner.admitted_arena_layout == null) {
             if (try self.ctx.streamCaptureActive()) return .unsupported;
-            _ = try owner.arenaLayout();
-            phase.mode = .arena;
-            return .outside;
+            const layout = try owner.arenaLayout();
+            if (layout.bytes != 0) {
+                phase.mode = .arena;
+                return .outside;
+            }
         }
         phase.mode = .none;
         return .ready;

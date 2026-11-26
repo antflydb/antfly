@@ -122,7 +122,7 @@ pub const Plan = struct {
     pub const Declaration = union(enum) { allocate: usize, release: u15 };
 
     pub fn declare(self: *Plan, declarations: []const Declaration, published_slot: ?u15) !void {
-        if (!self.valid or self.sealed or self.event_count != 0 or self.count != 0 or declarations.len == 0)
+        if (!self.valid or self.sealed or self.event_count != 0 or self.count != 0)
             return error.InvalidExecutionPlan;
         errdefer self.* = .{};
         for (declarations) |declaration| switch (declaration) {
@@ -204,7 +204,7 @@ pub const Plan = struct {
     }
 
     fn layoutImpl(self: *const Plan, prefix_bytes: usize, external: bool) !Layout {
-        if (!self.sealed or !self.valid or self.peak == 0 or prefix_bytes % alignment != 0 or prefix_bytes > limit) return error.InvalidExecutionPlan;
+        if (!self.sealed or !self.valid or prefix_bytes % alignment != 0 or prefix_bytes > limit) return error.InvalidExecutionPlan;
         const output = if (self.output) |index| self.allocations[index] else null;
         const peak = if (external) self.scratch_peak else self.peak;
         const external_bytes = if (external) std.mem.alignForward(usize, (output orelse return error.InvalidExecutionPlan).bytes, alignment) else 0;
@@ -222,6 +222,7 @@ pub const Plan = struct {
 pub const Scope = struct {
     plan: *Plan,
     base: DevicePointer = 0,
+    empty_backing: bool = false,
     cursor: usize = 0,
     valid: bool = true,
     published_ptr: DevicePointer = 0,
@@ -242,14 +243,18 @@ pub const Scope = struct {
 
     /// Bind the funded byte range before recording or submitting any kernels.
     pub fn bind(plan: *Plan, layout: Layout, backing: DevicePointer, backing_bytes: usize) !Scope {
+        if (!std.meta.eql(layout, try plan.layoutImpl(layout.scratch_offset, layout.external_output))) return error.InvalidExecutionPlan;
+        if (layout.bytes == 0 and !layout.external_output) {
+            if (backing != 0 or backing_bytes != 0) return error.InvalidExecutionPlan;
+            return .{ .plan = plan, .empty_backing = true };
+        }
         if (backing == 0 or backing % alignment != 0 or layout.bytes > backing_bytes or
-            backing > @as(DevicePointer, std.math.maxInt(DevicePointer)) - @as(DevicePointer, backing_bytes) or
-            !std.meta.eql(layout, try plan.layoutImpl(layout.scratch_offset, layout.external_output))) return error.InvalidExecutionPlan;
+            backing > @as(DevicePointer, std.math.maxInt(DevicePointer)) - @as(DevicePointer, backing_bytes)) return error.InvalidExecutionPlan;
         return .{ .plan = plan, .base = backing + layout.scratch_offset, .bound_start = backing, .bound_end = backing + backing_bytes, .requires_published_output = layout.external_output };
     }
 
     pub inline fn isBound(self: *const Scope) bool {
-        return self.base != 0;
+        return self.base != 0 or self.empty_backing;
     }
 
     pub fn complete(self: *const Scope) bool {
@@ -520,4 +525,17 @@ test "stream workspace keeps the shared layout when a separate output would exce
     const shared = try plan.layout(prefix);
     try std.testing.expectEqual(limit, shared.bytes);
     try std.testing.expectEqual(prefix, shared.output.?.offset);
+}
+
+test "stream workspace binds a declared zero-scratch recipe without a device address" {
+    var plan: Plan = .{};
+    try plan.declare(&.{}, null);
+    const layout = try plan.layout(0);
+    try std.testing.expectEqual(@as(usize, 0), layout.bytes);
+    try std.testing.expectError(error.InvalidExecutionPlan, Scope.bind(&plan, layout, alignment, alignment));
+    var scope = try Scope.bind(&plan, layout, 0, 0);
+    try std.testing.expect(scope.complete());
+    try std.testing.expect(!scope.owns(alignment));
+    try std.testing.expectError(error.AudioPlanChanged, scope.allocate(alignment));
+    try std.testing.expect(!scope.complete());
 }

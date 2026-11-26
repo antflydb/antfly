@@ -177,6 +177,7 @@ test {
     if (!build_options.enable_wasm) {
         _ = @import("ops/cuda/embedded_module.zig");
         _ = @import("ops/cuda/audio_execution_plan.zig");
+        _ = @import("ops/cuda/bounded_decode_graph.zig");
     }
     _ = @import("ops/kernel_geometry.zig");
     _ = @import("backends/onnx_projection_pack.zig");

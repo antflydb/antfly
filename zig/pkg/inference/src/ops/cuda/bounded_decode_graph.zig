@@ -335,7 +335,7 @@ pub const Module = struct {
         self.invalidations += 1;
     }
     pub fn snapshot(self: *const Module) Snapshot {
-        const missing_arena_recipe = if (self.phase == .capture and self.arena.ptr == 0)
+        const missing_arena_recipe = if (self.phase == .capture and self.admitted_arena_layout == null)
             if (self.plan) |plan| if (plan.sealed) plan.fingerprint(0) else null else null
         else
             null;
@@ -395,11 +395,16 @@ pub const Module = struct {
         self.installStorageGeometry(layout, descriptor.rows, descriptor.hidden, descriptor.vocab, descriptor.positions);
     }
     pub fn reserveArenaPrepared(self: *Module, ctx: *context.CudaContext, phase: *GraphPhase) !void {
-        if (self.arena.ptr != 0) {
+        if (self.admitted_arena_layout != null) {
             _ = try self.bindArena();
             return;
         }
         const layout = try self.arenaLayout();
+        if (layout.bytes == 0) {
+            if (!phase.bound or phase.mode != .none) return error.InvalidPreparedCacheState;
+            self.admitted_arena_layout = layout;
+            return;
+        }
         if (!phase.bound or phase.mode != .arena or layout.bytes != phase.old.peak or layout.events != phase.old.events) return error.InvalidPreparedCacheState;
         const recipe = layout.recipe;
         if (phase.old.arena_recipe != recipe) return error.PreparedCachePlanChanged;
@@ -803,4 +808,17 @@ test "captured graph wide head and learned arena consume separate exact prefunde
     current.finish();
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, domain.controller.snapshot());
     try std.testing.expect(ctx.prepared_cache_funding == null); // norm binding never overridden
+}
+
+test "CUDA bounded decoder binds zero scratch without reserving a device arena" {
+    var plan: plan_mod.Plan = .{};
+    try plan.declare(&.{}, null);
+    var owner: Module = .{ .plan = &plan, .phase = .capture };
+    var phase: GraphPhase = .{ .descriptor = undefined, .bound = true, .mode = .none };
+    var ctx = GraphTestDriver.contextValue();
+    try owner.reserveArenaPrepared(&ctx, &phase);
+    try owner.reserveArenaPrepared(&ctx, &phase);
+    try std.testing.expectEqual(@as(usize, 0), owner.arena.len);
+    try std.testing.expect(owner.arena_quota == .none);
+    try std.testing.expect((try owner.bindArena()).complete());
 }
