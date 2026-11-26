@@ -185,11 +185,11 @@ fn encoderForwardOutput(
     defer allocator.free(pos_ids);
     const total = pos_ids.len;
 
-    var frame_active = try beginWhisperMetalFrame(cb, .prefill);
-    errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
+    var frame = try beginWhisperMetalFrame(cb, .prefill, false);
+    errdefer frame.deinit();
     const MetalCompute = @import("../ops/metal_compute.zig").MetalCompute;
     const linear_scope = if (comptime @import("build_options").enable_metal)
-        if (frame_active and qualifiedMetalSmall(config))
+        if (frame.owns and qualifiedMetalSmall(config))
             MetalCompute.beginDenseLinearScope(cb, platform.env.getenvBoolDefault("TERMITE_WHISPER_METAL_LOSSLESS_F16_LINEAR", true))
         else
             null
@@ -197,9 +197,9 @@ fn encoderForwardOutput(
     defer if (comptime @import("build_options").enable_metal) {
         if (linear_scope) |scope| scope.deinit();
     };
-    const scope_active = frame_active and (cb.decoderRuntimeBeginPlannedComputeScope() catch false);
+    const scope_active = frame.owns and (cb.decoderRuntimeBeginPlannedComputeScope() catch false);
     defer if (scope_active) cb.decoderRuntimeEndPlannedComputeScope();
-    var profile = EncoderProfile{ .enabled = frame_active and whisperMetalProfileEnabled(), .frame_active = &frame_active };
+    var profile = EncoderProfile{ .enabled = frame.owns and whisperMetalProfileEnabled(), .frame_active = &frame.owns };
     profile.start();
     defer profile.finish();
 
@@ -331,10 +331,7 @@ fn encoderForwardOutput(
     defer if (comptime !resident) cb.free(normed);
     errdefer if (comptime resident) cb.free(normed);
     profile.mark(cb, "final_norm");
-    if (frame_active) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        frame_active = false;
-    }
+    try frame.finish();
     if (comptime resident) return normed;
     const result = try cb.toFloat32(normed, allocator);
     profile.mark(cb, "readback");
@@ -750,17 +747,14 @@ const StepProfile = struct {
     }
 };
 
-/// Open one backend-owned command submission for a decoder step. Every
-/// device op issued until `decoderRuntimeSubmitAndWaitFrame` joins it, so a
-/// token costs one dispatch and one wait instead of one per op. Returns
-/// false on backends without frames; callers then run eagerly.
-fn beginWhisperMetalFrame(cb: *const ComputeBackend, regime: ops.DecoderRuntimeFrameRegime) !bool {
-    if (cb.kind() != .metal or !whisperMetalFramesEnabled() or cb.decoderRuntimeHasActiveFrame()) return false;
-    const active = try cb.decoderRuntimeBeginFrame();
-    if (!active) return false;
-    errdefer cb.decoderRuntimeCancelFrame() catch {};
-    try cb.decoderRuntimeSetActiveFrameRegime(regime);
-    return true;
+const Submission = @import("../execution/submission.zig").Scope;
+
+fn beginWhisperMetalFrame(cb: *const ComputeBackend, regime: ops.DecoderRuntimeFrameRegime, pipelined: bool) !Submission {
+    if (cb.kind() != .metal or !whisperMetalFramesEnabled()) return .{ .backend = cb };
+    var frame = if (pipelined) try Submission.beginPipelined(cb) else try Submission.begin(cb);
+    errdefer frame.deinit();
+    if (frame.owns) try cb.decoderRuntimeSetActiveFrameRegime(regime);
+    return frame;
 }
 
 /// Replace `tensor` with a device-resident copy when the backend can make
@@ -1631,12 +1625,12 @@ pub const DecodeCache = struct {
         if (native) |program| try PreparedSingleToken.validateCrossDestinations(cb, program.source_data, config, encoder_hidden, enc_seq, prepared, program.self_slabs);
         // The cross projections are one batched pass over the encoder
         // output; on Metal they share a single submission.
-        var frame_active = try beginWhisperMetalFrame(cb, .prefill);
-        errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
+        var frame = try beginWhisperMetalFrame(cb, .prefill, false);
+        errdefer frame.deinit();
         // Assigned projections share the active encoder when their Metal
         // schedule supports it. Vendor GEMM can close it before encoding on
         // the same command buffer, and the caller still owns the terminal wait.
-        const scope_active = native != null and frame_active and (cb.decoderRuntimeBeginPlannedComputeScope() catch false);
+        const scope_active = native != null and frame.owns and (cb.decoderRuntimeBeginPlannedComputeScope() catch false);
         defer if (scope_active) cb.decoderRuntimeEndPlannedComputeScope();
         for (0..config.decoder_layers) |layer| {
             try cb.checkExecutionControl();
@@ -1681,10 +1675,7 @@ pub const DecodeCache = struct {
             built += 1;
         }
         try cb.checkExecutionControl();
-        if (frame_active) {
-            try cb.decoderRuntimeSubmitAndWaitFrame();
-            frame_active = false;
-        }
+        try frame.finish();
 
         // Preallocated self-cache slabs, when the backend supports them.
         var capacity: usize = 0;
@@ -2018,21 +2009,20 @@ fn decodeBlockCached(
 
     // One submission for the whole step. Registered before any tensor so a
     // failure cancels the frame after the intermediates are released.
-    var frame_active = try beginWhisperMetalFrame(cb, if (start == 0) .prefill else .decode);
-    errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
-    // A pipelined step must run inside a frame: the caller submits it later
-    // instead of waiting for it here.
+    // A pipelined step returns the active frame to the caller for submission.
     const pipelined = output == .pipelined;
-    if (pipelined and (!frame_active or n != 1)) {
-        pipelineTrace("step declined: frame_active={} tokens={d}", .{ frame_active, n });
+    var frame = try beginWhisperMetalFrame(cb, if (start == 0) .prefill else .decode, pipelined);
+    errdefer frame.deinit();
+    if (pipelined and (!frame.owns or n != 1)) {
+        pipelineTrace("step declined: frame_active={} tokens={d}", .{ frame.owns, n });
         return error.UnsupportedOperation;
     }
     // One compute encoder for the whole step: every runtime op joins it, so
     // the GPU sees a single command sequence rather than an encoder per op.
     // Submitting the frame closes it; the end call only releases the scope.
-    const scope_active = frame_active and (cb.decoderRuntimeBeginPlannedComputeScope() catch false);
+    const scope_active = frame.owns and (cb.decoderRuntimeBeginPlannedComputeScope() catch false);
     defer if (scope_active) cb.decoderRuntimeEndPlannedComputeScope();
-    var profile = StepProfile{ .enabled = frame_active and !pipelined and whisperMetalProfileEnabled(), .frame_active = &frame_active };
+    var profile = StepProfile{ .enabled = frame.owns and !pipelined and whisperMetalProfileEnabled(), .frame_active = &frame.owns };
     if (n == 1 and start > 0 and !pipelined) if (cache.native_program) |*program| {
         try program.beginStep(tokens[0], start);
         profile.assigned = program.schedule;
@@ -2070,10 +2060,7 @@ fn decodeBlockCached(
 
     if (output == .none) {
         // Cache-only token: the residual stream is not needed past here.
-        if (frame_active) {
-            try cb.decoderRuntimeSubmitAndWaitFrame();
-            frame_active = false;
-        }
+        try frame.finish();
         cache.positions += n;
         return .none;
     }
@@ -2104,16 +2091,13 @@ fn decodeBlockCached(
         }
         // The frame stays open; the caller submits it once the previous
         // step has been awaited (the backend keeps one frame in flight).
-        frame_active = false;
+        frame.owns = false;
         return .encoded;
     }
     if (output == .stats) {
         const request = output.stats;
         if (try cb.whisperLogitsStatsEncode(logits, &request.params, request.suppress)) {
-            if (frame_active) {
-                try cb.decoderRuntimeSubmitAndWaitFrame();
-                frame_active = false;
-            }
+            try frame.finish();
             var stats: ops.WhisperLogitsStatsRaw = undefined;
             if (cb.whisperLogitsStatsRead(request.params.stats_slot, &stats)) {
                 profile.device_choice = true;
@@ -2124,10 +2108,7 @@ fn decodeBlockCached(
             }
         }
     }
-    if (frame_active) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        frame_active = false;
-    }
+    try frame.finish();
     const result = try cb.toFloat32(logits, allocator);
     profile.mark(cb, .readback);
     profile.report(start, n);
