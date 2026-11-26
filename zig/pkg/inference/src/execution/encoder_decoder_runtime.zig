@@ -432,44 +432,7 @@ pub fn residentVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Ses
     const values = readback: {
         var guard = if (control) |active| try active.enterUninterruptible(decoder.interruption()) else null;
         defer if (guard) |*scope| scope.deinit();
-        if (query_rows > 1 and knows_dtype) {
-            if (outputs.backend.vtable.kernels) |kernels| {
-                if (kernels.accepts(outputs.backend.vtable)) {
-                    if (kernels.readFloat32RangeInto) |read| {
-                        try outputs.backend.checkExecutionControl();
-                        const destination = try allocator.alloc(f32, vocab);
-                        errdefer allocator.free(destination);
-                        const offset = try std.math.mul(usize, query_rows - 1, vocab);
-                        if (try read(outputs.backend.ptr, logits, offset, destination)) {
-                            if (control) |active| try active.check();
-                            break :readback destination;
-                        }
-                        allocator.free(destination);
-                    }
-                }
-            }
-        }
-        // A single suffix row is already the complete requested output.
-        // Keep the producer's ownership and read it without a temporary view.
-        const direct = query_rows == 1 and knows_dtype;
-        const row = if (direct) logits else selected: {
-            const slice = outputs.backend.vtable.sliceRows2D orelse return error.UnexpectedResidentStageDecline;
-            break :selected try slice(outputs.backend.ptr, logits, query_rows - 1, 1, vocab);
-        };
-        defer if (!direct) outputs.backend.free(row);
-        const result = downloaded: {
-            if (outputs.backend.vtable.kernels) |kernels| {
-                if (kernels.accepts(outputs.backend.vtable) and kernels.readFloat32Into != null) {
-                    // Write directly into the caller's row. Device providers
-                    // can avoid making a persistent host mirror of logits.
-                    const destination = try allocator.alloc(f32, vocab);
-                    errdefer allocator.free(destination);
-                    if (try outputs.backend.readFloat32Into(row, destination)) break :downloaded destination;
-                    allocator.free(destination);
-                }
-            }
-            break :downloaded try outputs.backend.toFloat32(row, allocator);
-        };
+        const result = try readResidentVocabularyRow(allocator, outputs.backend, logits, query_rows, vocab, knows_dtype);
         errdefer allocator.free(result);
         if (result.len != vocab) return error.InvalidDecoderOutput;
         if (control) |active| try active.check();
@@ -478,6 +441,46 @@ pub fn residentVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Ses
     errdefer allocator.free(values);
     try operation_scope.finish();
     return values;
+}
+
+fn readResidentVocabularyRow(allocator: std.mem.Allocator, backend: *const @import("../ops/ops.zig").ComputeBackend, logits: @import("../ops/ops.zig").CT, rows: usize, vocab: usize, knows_dtype: bool) ![]f32 {
+    const kernels = if (backend.vtable.kernels) |table|
+        if (table.accepts(backend.vtable)) table else null
+    else
+        null;
+    var destination: ?[]f32 = null;
+    defer if (destination) |buffer| allocator.free(buffer);
+    if (rows > 1 and knows_dtype) {
+        if (kernels) |table| if (table.readFloat32RangeInto) |read| {
+            const offset = try std.math.mul(usize, rows - 1, vocab);
+            try backend.checkExecutionControl();
+            const buffer = try allocator.alloc(f32, vocab);
+            destination = buffer;
+            if (try read(backend.ptr, logits, offset, buffer)) {
+                destination = null;
+                return buffer;
+            }
+        };
+    }
+
+    // A single typed row already describes the complete requested output.
+    const direct = rows == 1 and knows_dtype;
+    const row = if (direct) logits else selected: {
+        const slice = backend.vtable.sliceRows2D orelse return error.UnexpectedResidentStageDecline;
+        break :selected try slice(backend.ptr, logits, rows - 1, 1, vocab);
+    };
+    defer if (!direct) backend.free(row);
+    if (kernels) |table| if (table.readFloat32Into != null) {
+        const buffer = destination orelse try allocator.alloc(f32, vocab);
+        destination = buffer;
+        if (try backend.readFloat32Into(row, buffer)) {
+            destination = null;
+            return buffer;
+        }
+    };
+    if (destination) |buffer| allocator.free(buffer);
+    destination = null;
+    return backend.toFloat32(row, allocator);
 }
 
 test "encoder decoder resident stages retain hidden state and materialize only the final vocabulary row" {
