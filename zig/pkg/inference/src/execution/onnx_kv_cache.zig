@@ -33,17 +33,28 @@ pub fn presentNameMatchesPastInput(past_input_name: []const u8, present_output_n
     return std.mem.eql(u8, past_suffix, present_suffix);
 }
 
+const CacheRole = enum { self_attention, cross_attention };
+
 /// Exported cache slots are keyed by the exact layer/owner/component suffix.
+fn cacheRole(suffix: []const u8) ?CacheRole {
+    const dot = std.mem.indexOfScalar(u8, suffix, '.') orelse return null;
+    const ending = suffix[dot..];
+    const role: CacheRole = if (std.mem.eql(u8, ending, ".decoder.key") or std.mem.eql(u8, ending, ".decoder.value"))
+        .self_attention
+    else if (std.mem.eql(u8, ending, ".encoder.key") or std.mem.eql(u8, ending, ".encoder.value"))
+        .cross_attention
+    else
+        return null;
+    _ = std.fmt.parseInt(usize, suffix[0..dot], 10) catch return null;
+    return role;
+}
+
 pub fn validCacheSuffix(suffix: []const u8) bool {
-    const dot = std.mem.indexOfScalar(u8, suffix, '.') orelse return false;
-    _ = std.fmt.parseInt(usize, suffix[0..dot], 10) catch return false;
-    for ([_][]const u8{ ".decoder.key", ".decoder.value", ".encoder.key", ".encoder.value" }) |ending|
-        if (std.mem.eql(u8, suffix[dot..], ending)) return true;
-    return false;
+    return cacheRole(suffix) != null;
 }
 
 pub fn isCrossCacheSuffix(suffix: []const u8) bool {
-    return std.mem.indexOf(u8, suffix, ".encoder.") != null;
+    return cacheRole(suffix) == .cross_attention;
 }
 
 test "ONNX cache roles use the same suffix for past and present" {
@@ -53,6 +64,9 @@ test "ONNX cache roles use the same suffix for past and present" {
     const decoder = pastInputSuffix("past_key_values.2.decoder.value").?;
     try std.testing.expect(validCacheSuffix(encoder) and isCrossCacheSuffix(encoder));
     try std.testing.expect(validCacheSuffix(decoder) and !isCrossCacheSuffix(decoder));
-    try std.testing.expect(!validCacheSuffix("2.encoder.key.extra"));
+    for ([_][]const u8{ "2.encoder.key.extra", "decoder.encoder.value", "2.decoder.encoder.key" }) |malformed| {
+        try std.testing.expect(!validCacheSuffix(malformed));
+        try std.testing.expect(!isCrossCacheSuffix(malformed));
+    }
     try std.testing.expect(presentOutputSuffix("logits") == null);
 }
