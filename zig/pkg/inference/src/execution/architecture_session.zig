@@ -8239,7 +8239,13 @@ fn resolveArchModelProgram(ptr: *anyopaque, stage: @import("model_frontend.zig")
     };
     if (stage == .readout and self.arch_config == .gliner_boundary) return @import("../architectures/frontends/boundary_head.zig").resolve(&self.arch_config.gliner_boundary);
     if ((self.task != .generic and !(self.task == .extractor and self.arch_config == .gliner_boundary)) or self.glide_head != null) return null;
-    if (self.arch_config == .whisper) return @import("../architectures/frontends/whisper.zig").resolve(&self.arch_config.whisper, stage);
+    if (self.arch_config == .whisper) {
+        var forward = @import("../architectures/frontends/whisper.zig").resolve(&self.arch_config.whisper, stage) orelse return null;
+        // XLA lowers the attention contractions and visibility directly.
+        // Keep the portable graph so host-oriented SDPA fusion cannot split it.
+        if (self.backend_type == .pjrt) forward.optimization = .provider_fusion;
+        return forward;
+    }
     if (stage == .audio_projection and self.arch_config == .gpt) {
         if (auxiliaryProjectorStore(self)) |metadata| return @import("../architectures/frontends/projector.zig").audio(metadata);
         return null;

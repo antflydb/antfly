@@ -202,6 +202,12 @@ consumers, before removing unsafe aliases. Exact frame dispatch reuses the same
 index; warm alias lookup does not scan the graph or alias table. The existing
 monotone selection fixed point and provider validation remain authoritative.
 
+Whisper's ordinary PJRT stages preserve portable attention through model
+program capture so XLA owns its lowering. On Apple Silicon, the GoMLX
+CPU PJRT plugin v0.117.2 passed both released Whisper Small fixtures:
+public-loader encoder and decoder parity with Native, and full-window
+resident bank and first decode parity with the full-prefix path.
+
 Whisper compiled requests use the resident PJRT bank publication owner. Prefill
 produces self K/V and immutable encoder cross K/V; subsequent single-token
 programs consume those banks and runtime learned positions. Decode reachability
