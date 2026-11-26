@@ -8309,6 +8309,12 @@ pub const DB = struct {
         if (sequence != 0 and level != .propose and level != .write) {
             if (!self.executor.hasWorkers()) return error.EnrichmentSourceChanged;
             if (!self.replacementTargetsCurrent(continuation.targets)) return error.EnrichmentSourceChanged;
+            // Group sources, enrichment templates and LEANN graphs come from
+            // this runtime's catalog: they must be the ones the write was
+            // admitted under, or its wait could owe work it never had.
+            if (continuation.obligation_digest) |digest| {
+                if (digest != try self.core.index_manager.visibilityObligationDigest()) return error.EnrichmentSourceChanged;
+            }
             try self.executor.checkSyncLevelHealth(level);
             try self.markPrecomputedEnrichmentAppliedForSync(level, sequence);
             notifyExecutorForSyncLevelWithDenseBulkDeferral(self.async_context, self.executor, level, sequence, continuation.targets);

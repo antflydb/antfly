@@ -47,14 +47,79 @@ fn actsForLaneHolder(holder: std.Thread.Id) bool {
     return if (open_delegate_for) |caller| caller == holder else false;
 }
 
+/// Set on a thread whose stack is `runtime_open_stack_size`: it opens a
+/// runtime inline instead of handing the open to another thread.
+threadlocal var on_open_stack: bool = false;
+
+/// A thread with `runtime_open_stack_size` that runs one runtime open at a
+/// time for its owner, so a writer's refresh does not create a thread per
+/// reopen. Started on first use and stopped when the owner goes.
+const OpenWorker = struct {
+    thread: ?std.Thread = null,
+    /// Held by one submitter from posting a job until it completes.
+    submit: std.Io.Mutex = .init,
+    posted: std.Io.Event = .unset,
+    job: ?*Job = null,
+    stopping: bool = false,
+
+    const Job = struct {
+        ctx: *anyopaque,
+        run: *const fn (*anyopaque) void,
+        done: std.Io.Event = .unset,
+    };
+
+    fn loop(self: *OpenWorker) void {
+        on_open_stack = true;
+        const io = h.handleLockIo();
+        while (true) {
+            self.posted.waitUncancelable(io);
+            self.posted.reset();
+            if (self.stopping) return;
+            const job = self.job.?;
+            self.job = null;
+            job.run(job.ctx);
+            job.done.set(io);
+        }
+    }
+
+    fn run(self: *OpenWorker, job: *Job) std.Thread.SpawnError!void {
+        const io = h.handleLockIo();
+        self.submit.lockUncancelable(io);
+        defer self.submit.unlock(io);
+        if (self.thread == null) self.thread = try std.Thread.spawn(.{ .stack_size = runtime_open_stack_size }, loop, .{self});
+        self.job = job;
+        self.posted.set(io);
+        job.done.waitUncancelable(io);
+    }
+
+    fn stop(self: *OpenWorker) void {
+        const io = h.handleLockIo();
+        self.submit.lockUncancelable(io);
+        const thread = self.thread;
+        self.thread = null;
+        self.stopping = true;
+        self.posted.set(io);
+        self.submit.unlock(io);
+        if (thread) |t| t.join();
+    }
+};
+
+fn OpenResult(comptime Func: type) type {
+    const info = @typeInfo(@typeInfo(Func).@"fn".return_type.?).error_union;
+    return (info.error_set || std.Thread.SpawnError)!info.payload;
+}
+
 /// Runs a runtime open (`DB.open` and the index opens under it) on a thread
 /// with `runtime_open_stack_size`, while the caller waits. Opens run on any
 /// C API caller's thread, whose stack the library does not control, and
-/// their Debug frames alone are megabytes. The helper acts for the caller's
-/// lane checkout (`open_delegate_for`). If no thread can be started, the
-/// open runs here.
-fn callOnOpenStack(comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) @typeInfo(@TypeOf(func)).@"fn".return_type.? {
+/// their Debug frames alone are megabytes. The open runs on `worker` when
+/// given, or on a thread started for it; a thread that already has the
+/// stack opens inline. The helper acts for the caller's lane checkout
+/// (`open_delegate_for`). If no thread can be started, the open fails with
+/// the spawn error rather than running on a stack it may overflow.
+fn callOnOpenStack(worker: ?*OpenWorker, comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) OpenResult(@TypeOf(func)) {
     if (comptime h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return @call(.auto, func, args);
+    if (on_open_stack) return @call(.auto, func, args);
     const Result = @typeInfo(@TypeOf(func)).@"fn".return_type.?;
     const receipts = @import("outcome_receipts.zig");
     const backend_types = @import("../storage/backend_types.zig");
@@ -72,6 +137,9 @@ fn callOnOpenStack(comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func
         error_detail: [2048]u8 = undefined,
         error_detail_len: usize = 0,
         fn run(job: *@This()) void {
+            const was_on_open_stack = on_open_stack;
+            on_open_stack = true;
+            defer on_open_stack = was_on_open_stack;
             open_delegate_for = job.caller;
             defer open_delegate_for = null;
             const scope = if (job.receipts) |writer| receipts.begin(writer) else null;
@@ -87,6 +155,9 @@ fn callOnOpenStack(comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func
                 @memcpy(job.error_detail[0..job.error_detail_len], detail[0..job.error_detail_len]);
             }
         }
+        fn runErased(ctx: *anyopaque) void {
+            run(@ptrCast(@alignCast(ctx)));
+        }
     };
     var job: Job = .{
         .args = args,
@@ -94,8 +165,13 @@ fn callOnOpenStack(comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func
         .receipts = receipts.activeWriter(),
         .progress = backend_types.commit_progress,
     };
-    const thread = std.Thread.spawn(.{ .stack_size = runtime_open_stack_size }, Job.run, .{&job}) catch return @call(.auto, func, args);
-    thread.join();
+    if (worker) |open_worker| {
+        var posted: OpenWorker.Job = .{ .ctx = &job, .run = Job.runErased };
+        try open_worker.run(&posted);
+    } else {
+        const thread = try std.Thread.spawn(.{ .stack_size = runtime_open_stack_size }, Job.run, .{&job});
+        thread.join();
+    }
     if (job.error_code != .ok) _ = h.capi.recordError(job.error_code, job.error_detail[0..job.error_detail_len]);
     return job.result;
 }
@@ -2399,6 +2475,8 @@ pub const Owner = struct {
     maintenance_schedules: std.AutoHashMapUnmanaged(MaintenanceKey, MaintenanceSchedule) = .empty,
     maintenance_root_incarnation: ?u128 = null,
     wake: std.Io.Event = .unset,
+    /// Runs this owner's runtime opens on a stack that fits them.
+    open_worker: OpenWorker = .{},
     maintenance_activity: @import("maintenance_activity.zig").Activity = .{},
     current: ?*h.Handle = null,
     redo_recovery_cursor: ?native.RedoRecoveryCursor = null,
@@ -2882,7 +2960,7 @@ pub const Owner = struct {
                 if (!retained_turn) return error.MaintenanceTurnBusy;
             }
         }
-        const replacement = try callOnOpenStack(api.openLiteHandleAllocWithSharedInference, .{ alloc, self.path, options, false, h.handleLockIo(), null, self.current });
+        const replacement = try callOnOpenStack(&self.open_worker, api.openLiteHandleAllocWithSharedInference, .{ alloc, self.path, options, false, h.handleLockIo(), null, self.current });
         errdefer h.closeHandle(replacement);
         try self.bindGroupSourceState(replacement);
         if (self.current) |previous| {
@@ -4738,6 +4816,8 @@ pub const Owner = struct {
     }
 
     fn maintenanceLoop(self: *Owner) void {
+        // Spawned with `runtime_open_stack_size`: its turns open inline.
+        on_open_stack = true;
         const io = h.handleLockIo();
         // No durable consumer is known yet at spawn, so start parked; the
         // first notifyMutation()/notifyDemand() with a non-zero mask (or an
@@ -5111,6 +5191,7 @@ pub const Owner = struct {
 
     fn deinit(self: *Owner) void {
         if (self.worker) |worker| worker.join();
+        self.open_worker.stop();
         // `WriterLane.checkin` parks the kernel-level path lease
         // (`native.PathWriterLock`, a `flock`-style advisory lock held open
         // on its own file descriptor) between writers instead of releasing
@@ -5871,7 +5952,7 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
     if (create) {
         var resolved = resolved_options;
         resolved.externally_locked = true;
-        initial = try callOnOpenStack(api.openLiteHandleAllocWithRuntime, .{ alloc, path, resolved, true, h.handleLockIo(), null });
+        initial = try callOnOpenStack(null, api.openLiteHandleAllocWithRuntime, .{ alloc, path, resolved, true, h.handleLockIo(), null });
         try initial.?.owned_lite_backend.?.native_docstore.?.file.releaseWriterOwnership();
         // Marks this instance subject to the `active_writer` backstop
         // (native.zig's `publishCheckpoint`/inode_lock.zig's own doc
@@ -8737,6 +8818,95 @@ test "capi native refresh during a lane-pinned write does not mark that generati
     try std.testing.expect(store.file.read_only);
     pinned_root.query_borrows -= 1;
     owner.collectRetired();
+}
+
+// A slow write can go longer than the idle window without enqueueing. The
+// store is not idle while it runs: an idle redo fold waits for the write to
+// finish and for the window to pass after it.
+test "capi native idle redo fold waits for a foreground write in flight" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("idle-fold-foreground");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true, .busy_timeout_ms = 10_000 }, true);
+    const id = try api.publishHandle(wrapper);
+    defer api.antfly_db_close(id);
+    {
+        var out: h.capi.Buffer = .{};
+        defer api.antfly_buffer_free_zero(&out);
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(id, .fromSlice(
+            "{\"inserts\":{\"doc\":{\"text\":\"unfolded\"}},\"sync_level\":\"write\"}",
+        ), &out));
+    }
+    const store = wrapper.lite_connection.?.owner.current.?.owned_lite_backend.?.native_docstore.?;
+
+    // A write past its commit, waiting on its indexes: it no longer holds
+    // the writer lane, so nothing but its request keeps the store busy.
+    var guard = api.enterHandle(id, .write) orelse return error.TestUnexpectedResult;
+    var guard_left = false;
+    defer if (!guard_left) guard.leave();
+    try std.testing.expect(guard.entry_error == null);
+    guard.releaseWriterLaneBeforeWait();
+    const folded_before = store.last_redo_fold_ns;
+    store.redo_idle_checkpoint_ns = std.time.ns_per_ms;
+    try std.Io.sleep(io, .fromMilliseconds(20), .awake);
+    store.foldIdleRedoLog();
+    try std.testing.expectEqual(folded_before, store.last_redo_fold_ns);
+
+    guard.leave();
+    guard_left = true;
+    try std.Io.sleep(io, .fromMilliseconds(20), .awake);
+    store.foldIdleRedoLog();
+    try std.testing.expect(store.last_redo_fold_ns != folded_before);
+}
+
+test "capi native full-text index dropped and never recreated leaves no records in the database file" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("drop-full-text");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true, .busy_timeout_ms = 10_000 }, true);
+    const id = try api.publishHandle(wrapper);
+    defer api.antfly_db_close(id);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(
+        "{\"name\":\"dropped_text\",\"kind\":\"full_text\",\"config_json\":\"{}\"}",
+    )));
+    {
+        var out: h.capi.Buffer = .{};
+        defer api.antfly_buffer_free_zero(&out);
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(id, .fromSlice(
+            "{\"inserts\":{\"doc\":{\"text\":\"quokka\"}},\"sync_level\":\"full_index\"}",
+        ), &out));
+    }
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(id));
+
+    const Records = struct {
+        fn count(connection: *Connection) !usize {
+            const root = try connection.owner.writer_lane.checkout(connection, .mutation);
+            defer _ = root.lane_pins.fetchSub(1, .release);
+            defer connection.owner.writer_lane.checkin(connection, root.owned_lite_backend.?.native_docstore.?);
+            const sink = root.owned_lite_backend.?.native_catalog_sink.?.sink();
+            const records = try sink.loadKeysAlloc.?(sink.ptr, std.testing.allocator, "__antfly_lite/indexes/dropped_text/index");
+            defer @import("../storage/native_catalog_backend.zig").Backend.freeEntries(std.testing.allocator, records);
+            return records.len;
+        }
+    };
+    const connection = wrapper.lite_connection.?;
+    try std.testing.expect(try Records.count(connection) != 0);
+
+    var deleted = false;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_delete_index(id, .fromSlice("dropped_text"), &deleted));
+    try std.testing.expect(deleted);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(id));
+    try std.testing.expectEqual(@as(usize, 0), try Records.count(connection));
 }
 
 test "capi native full-text index recreated under its old name starts empty and indexes new writes" {
