@@ -53597,7 +53597,7 @@ test "Metal paged relative attention reads convolved KV staged in the same frame
     const a = std.testing.allocator;
     const metadata = @import("../runtime/kv/hybrid_paged.zig");
     const kv_storage = @import("../runtime/kv/storage.zig");
-    const layout: metadata.Layout = .{ .page_tokens = 2, .max_tokens = 4, .window_tokens = 4, .max_append_tokens = 2 };
+    const layout: metadata.Layout = .{ .page_tokens = 2, .max_tokens = 6, .window_tokens = 1, .max_append_tokens = 2 };
     const pool_config: @import("../runtime/kv/pool.zig").KvPoolConfig = .{
         .backend = .metal,
         .dtype = .bf16,
@@ -53613,15 +53613,15 @@ test "Metal paged relative attention reads convolved KV staged in the same frame
     defer sliding.deinit(a);
     var sequence = try metadata.Sequence.init(a, layout, &full, &sliding);
     defer sequence.deinit();
-    {
-        var prefix = try sequence.prepareAppend(1);
+    for ([_]usize{ 2, 1 }) |rows| {
+        var prefix = try sequence.prepareAppend(rows);
         defer prefix.abort();
         prefix.commit();
     }
     var append = try sequence.prepareAppend(2);
     defer append.abort();
     var ids: [2]u32 = undefined;
-    try std.testing.expectEqual(ids.len, try append.stagedPageIds(.full, &ids));
+    try std.testing.expectEqual(ids.len, try append.stagedPageIds(.sliding, &ids));
     // Exercise a reverse mapping across the append's page boundary. Both
     // staging and attention must consume the same physical page table.
     std.mem.swap(u32, &ids[0], &ids[1]);
@@ -53630,9 +53630,10 @@ test "Metal paged relative attention reads convolved KV staged in the same frame
     defer provider.deinitOwned();
     const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
     const attention: PagedRelativeBf16Attention = .{
-        .query = .{ .rows = 2, .start = 1, .q_heads = 1, .kv_heads = 1, .relative_extent = 0, .score_scale = 1 },
-        .range = try append.stagedRange(.full),
+        .query = .{ .rows = 2, .start = 3, .q_heads = 1, .kv_heads = 1, .relative_extent = 0, .score_scale = 1 },
+        .range = try append.stagedRange(.sliding),
     };
+    try std.testing.expectEqual(@as(usize, 1), attention.range.first_page);
     const zeros: [512]u16 = @splat(0);
     var values: [256]u16 = undefined;
     @memset(values[0..128], 0x4000);
@@ -53690,18 +53691,18 @@ test "Metal paged relative attention reads convolved KV staged in the same frame
     const stencil: CausalDepthwise4Bf16 = .{
         .channels = 128,
         .rows = 2,
-        .valid_history = 1,
+        .valid_history = 3,
         .output_scale = 1,
         .clip = 1,
         .epsilon = 0.000001,
     };
-    try CausalPagedRelativeBf16.encode(runtime, &append, .full, attention.query, operands, .{ .key = &tensors[1], .value = &tensors[2] }, key, value_operand, stencil, &tensors[7], &tensors[8]);
-    try CausalPagedRelativeBf16.encode(runtime, &append, .full, attention.query, operands, .{ .key = &packed_key, .value = &packed_value, .format = .q4_head128 }, key, value_operand, stencil, &tensors[7], &packed_output);
-    try std.testing.expectEqual(@as(usize, 1), sequence.committed_tokens);
+    try CausalPagedRelativeBf16.encode(runtime, &append, .sliding, attention.query, operands, .{ .key = &tensors[1], .value = &tensors[2] }, key, value_operand, stencil, &tensors[7], &tensors[8]);
+    try CausalPagedRelativeBf16.encode(runtime, &append, .sliding, attention.query, operands, .{ .key = &packed_key, .value = &packed_value, .format = .q4_head128 }, key, value_operand, stencil, &tensors[7], &packed_output);
+    try std.testing.expectEqual(@as(usize, 3), sequence.committed_tokens);
     try submitFrame(runtime);
     try waitFrame(runtime);
     append.commit();
-    try std.testing.expectEqual(@as(usize, 3), sequence.committed_tokens);
+    try std.testing.expectEqual(@as(usize, 5), sequence.committed_tokens);
 
     var output: [256]u16 = undefined;
     try tensors[8].downloadBytesInto(std.mem.asBytes(&output));
