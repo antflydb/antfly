@@ -13411,7 +13411,7 @@ static NSString *termite_metal_shader_source(void) {
            "    const device bfloat *w = weight + ulong(column) * p.input_width;\n"
            "    float4 product = 0.0f;\n"
            "    uint k = lane;\n"
-           "    if (complete) {\n"
+           "    if (complete || (count == 4u && p.output_width >= 256u)) {\n"
            "        // Keep each accumulator's FMA order while amortizing the loop\n"
            "        // branch across four SIMD-width steps.\n"
            "        const uint full_width = p.input_width & ~127u;\n"
