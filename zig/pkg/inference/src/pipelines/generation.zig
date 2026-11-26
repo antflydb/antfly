@@ -2953,14 +2953,16 @@ pub const NativeGenerationPipeline = struct {
         defer if (self.native_prefix_binding) |*binding| binding.deinit();
         try validateKvCachePolicy(config);
         const native_checkpoint = self.checkpoint_prepare != null or self.checkpoint_resume != null;
-        if (native_checkpoint and (self.checkpoint_prepare != null and self.checkpoint_resume != null or
-            self.cb.kind() != .cuda or self.kv_dtype != .f16 or self.gpt_config.family != .gemma or
-            !self.gpt_config.usesGemma4Channels() or self.gpt_config.gemma4_mtp_assistant or
-            self.attention_match_identity == null or self.scheduler != null or self.scheduler_lease != null or
-            self.graph_cache != null or self.compiled_partition_backend != null or self.draft_cb != null or self.prompt_cache != null or
-            messagesHaveImages(messages) or messagesHaveAudio(messages) or config.kv_cache_mode != .exact_hybrid or
-            config.cache_compaction_ratio != null or config.prompt_cache_enabled or config.speculation_requested))
-            return error.UnsupportedAttentionMatchRoute;
+        if (native_checkpoint) try decoder_checkpoint.validateAdmission(self.checkpointRuntime().context, .{
+            .prepare = self.checkpoint_prepare != null,
+            .restoring = self.checkpoint_resume != null,
+            .scheduled = self.scheduler != null or self.scheduler_lease != null,
+            .has_media = messagesHaveImages(messages) or messagesHaveAudio(messages),
+            .exact_hybrid = config.kv_cache_mode == .exact_hybrid,
+            .compaction = config.cache_compaction_ratio != null,
+            .prompt_cache_requested = config.prompt_cache_enabled,
+            .speculation = config.speculation_requested,
+        });
         try decoder_storage.validateSelectedRoute(config.kv_cache_mode == .select_v1, self.cb.kind(), self.scheduler != null);
         try decoder_storage.validateSampledRingExecution(
             decoderStorageRequest(config),
@@ -3566,7 +3568,7 @@ pub const NativeGenerationPipeline = struct {
         defer if (native_work_enabled and !native_work_closed) {
             std.debug.print("native_work_incomplete: pipeline={d}\n", .{@intFromPtr(self)});
         };
-        if (native_checkpoint and (seq_len > native_kv_checkpoint.max_context_tokens or max_tokens > native_kv_checkpoint.max_context_tokens - seq_len)) return error.KvCheckpointAppendLimit;
+        if (native_checkpoint) try decoder_checkpoint.validateAppendCapacity(seq_len, max_tokens);
         debugGenerationStage(
             "starting prefill prompt_token_count={d} seq_len={d} multimodal={}",
             .{ prompt_token_count, seq_len, prepared_multimodal_prompt != null or prepared_qwen3vl_prompt != null },

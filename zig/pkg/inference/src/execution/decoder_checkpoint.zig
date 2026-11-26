@@ -72,6 +72,66 @@ pub const Context = struct {
     work_control: runtime.kv.attention_match.Control = .{},
 };
 
+pub const AdmissionRequest = struct {
+    prepare: bool,
+    restoring: bool,
+    scheduled: bool,
+    has_media: bool,
+    exact_hybrid: bool,
+    compaction: bool,
+    prompt_cache_requested: bool,
+    speculation: bool,
+};
+
+fn hasForeignRoute(context: Context) bool {
+    return context.routes.graph_runtime or context.routes.compiled_partition or context.routes.draft or context.routes.prompt_cache;
+}
+
+fn supportsPhysicalRoute(context: Context) bool {
+    return context.backend.kind() == .cuda and context.kv_dtype == .f16 and context.model.family == .gemma and
+        context.model.usesGemma4Channels() and !context.model.gemma4_mtp_assistant and !hasForeignRoute(context);
+}
+
+/// Validate the loaded route before tokenization, allocation or KV mutation.
+pub fn validateAdmission(context: Context, request: AdmissionRequest) !void {
+    if (!supportsPhysicalRoute(context) or context.identity == null or
+        request.prepare == request.restoring or request.scheduled or request.has_media or !request.exact_hybrid or
+        request.compaction or request.prompt_cache_requested or request.speculation)
+        return error.UnsupportedAttentionMatchRoute;
+}
+
+fn resolveDonorGeometry(model: *const gpt_mod.Config, donors: anytype, layer_donors: []u32) !usize {
+    if (model.num_hidden_layers > donors.len or model.num_hidden_layers > layer_donors.len)
+        return error.UnsupportedKvSnapshotLayout;
+
+    var count: usize = 0;
+    for (0..model.num_hidden_layers) |layer| {
+        const geometry = try model.kvDonorGeometry(layer);
+        if (model.isKvDonorLayer(layer)) {
+            donors[count] = .{
+                .layer = @intCast(layer),
+                .window = if (model.layerUsesSlidingAttention(layer)) model.sliding_window else 0,
+                .heads = geometry.num_kv_heads,
+                .dim = geometry.head_dim,
+            };
+            count += 1;
+        }
+        for (donors[0..count], 0..) |donor, index| {
+            if (donor.layer == geometry.donor_layer) {
+                layer_donors[layer] = @intCast(index);
+                break;
+            }
+        } else return error.UnsupportedKvSnapshotLayout;
+    }
+    return count;
+}
+
+pub fn validateAppendCapacity(prompt_tokens: usize, append_tokens: usize) !void {
+    if (prompt_tokens > native_kv_checkpoint.max_context_tokens or
+        append_tokens > native_kv_checkpoint.max_context_tokens - prompt_tokens)
+        return error.KvCheckpointAppendLimit;
+}
+
 /// The native checkpoint request owns its output until the transport finishes.
 /// A savings rejection returns an exact checkpoint with an explicit outcome.
 pub const PrepareRequest = struct {
@@ -116,23 +176,8 @@ pub const PrepareRequest = struct {
         options.retention_divisor = options.min_retention_divisor.?;
         var donors: [256]snapshot.Donor = undefined;
         var mapping: [256]u32 = undefined;
-        var count: usize = 0;
+        const count = try resolveDonorGeometry(&config, &donors, &mapping);
         var heads: usize = 0;
-        for (0..config.num_hidden_layers) |layer| {
-            const geometry = try config.kvDonorGeometry(layer);
-            if (config.isKvDonorLayer(layer)) {
-                donors[count] = .{ .layer = @intCast(layer), .window = if (config.layerUsesSlidingAttention(layer)) config.sliding_window else 0, .heads = geometry.num_kv_heads, .dim = geometry.head_dim };
-                count += 1;
-            }
-            var index: ?u32 = null;
-            for (donors[0..count], 0..) |donor, i| {
-                if (donor.layer == geometry.donor_layer) {
-                    index = @intCast(i);
-                    break;
-                }
-            }
-            mapping[layer] = index orelse return error.UnsupportedKvSnapshotLayout;
-        }
         const source_bytes = try snapshot.geometryBytes(tokens, config.vocab_size, mapping[0..config.num_hidden_layers], donors[0..count], options.checkpoint_limits);
         const samples = @min(@min(tokens, max_repeat_tokens), collection_options.samples_per_consumer);
         const heldout = (samples - 1) / collection_options.heldout_stride + 1;
@@ -381,26 +426,14 @@ pub const Runtime = struct {
         const checkpoint = runtime.kv.attention_match_checkpoint;
         const resume_contract = runtime.kv.attention_match_resume;
         if (self.context.model.num_hidden_layers == 0 or self.context.model.num_hidden_layers > 256) return error.UnsupportedAttentionMatchRoute;
-        if (full_prompt.len > native_kv_checkpoint.max_context_tokens or max_new_tokens == 0 or max_new_tokens > native_kv_checkpoint.max_context_tokens - full_prompt.len) return error.KvCheckpointAppendLimit;
+        if (max_new_tokens == 0) return error.KvCheckpointAppendLimit;
+        try validateAppendCapacity(full_prompt.len, max_new_tokens);
         const identity = self.context.identity orelse return error.UnsupportedKvIdentity;
         const limits: checkpoint.Limits = native_kv_checkpoint.serving_limits;
         const control = self.context.work_control;
         var donors: [256]resume_contract.Geometry = undefined;
         var mapping: [256]u32 = undefined;
-        var count: usize = 0;
-        for (0..self.context.model.num_hidden_layers) |layer| {
-            const geometry = try self.context.model.kvDonorGeometry(layer);
-            if (self.context.model.isKvDonorLayer(layer)) {
-                donors[count] = .{ .layer = @intCast(layer), .window = if (self.context.model.layerUsesSlidingAttention(layer)) self.context.model.sliding_window else 0, .heads = geometry.num_kv_heads, .dim = geometry.head_dim };
-                count += 1;
-            }
-            var index: ?u32 = null;
-            for (donors[0..count], 0..) |donor, i| if (donor.layer == geometry.donor_layer) {
-                index = @intCast(i);
-                break;
-            };
-            mapping[layer] = index orelse return error.UnsupportedKvSnapshotLayout;
-        }
+        const count = try resolveDonorGeometry(self.context.model, &donors, &mapping);
         _ = try resume_contract.validateWithControl(saved, .{ .identity = identity, .vocab_size = self.context.model.vocab_size, .max_logical_tokens = native_kv_checkpoint.max_context_tokens, .max_appended_tokens = 8192, .layer_donors = mapping[0..self.context.model.num_hidden_layers], .donors = donors[0..count] }, full_prompt, limits, control);
         _ = try @import("../ops/cuda/attention_match_storage.zig").allocationBytesWithControl(saved, .f16, limits, control);
     }
@@ -409,10 +442,7 @@ pub const Runtime = struct {
         if (comptime !build_options.enable_cuda) return error.UnsupportedAttentionMatchRoute;
         const checkpoint = runtime.kv.attention_match_checkpoint;
         const device_storage = @import("../ops/cuda/attention_match_storage.zig");
-        if (self.context.backend.kind() != .cuda or self.context.kv_dtype != .f16 or self.context.model.family != .gemma or
-            !self.context.model.usesGemma4Channels() or self.context.model.gemma4_mtp_assistant or
-            self.context.routes.graph_runtime or self.context.routes.compiled_partition or self.context.routes.draft or self.context.routes.prompt_cache or
-            !destination.isPaged() or destination.isKvCompacted() or destination.total_tokens != 0 or destination.sequence_id != null or
+        if (!supportsPhysicalRoute(self.context) or !destination.isPaged() or destination.isKvCompacted() or destination.total_tokens != 0 or destination.sequence_id != null or
             self.context.model.num_hidden_layers == 0 or self.context.model.num_hidden_layers > 256)
             return error.UnsupportedAttentionMatchRoute;
         try self.validateAttentionMatchResume(saved, full_prompt, max_new_tokens);
@@ -968,8 +998,7 @@ pub const Runtime = struct {
         max_host_bytes: usize,
     ) !runtime.kv.attention_match_checkpoint.Owned {
         if (self.context.backend.kind() != .cuda or self.context.model.family != .gemma or !self.context.model.usesGemma4Channels() or
-            self.context.routes.graph_runtime or self.context.routes.compiled_partition or self.context.routes.draft or self.context.routes.prompt_cache or
-            !source.isPaged() or source.isKvCompacted() or source.total_tokens != tokens.len or
+            hasForeignRoute(self.context) or !source.isPaged() or source.isKvCompacted() or source.total_tokens != tokens.len or
             logits.len != self.context.model.vocab_size or self.context.model.num_hidden_layers > 256)
             return error.UnsupportedKvSnapshotLayout;
         const storage = source.kv_storage orelse return error.DeviceReadUnsupported;
@@ -979,22 +1008,7 @@ pub const Runtime = struct {
             return error.UnsupportedKvSnapshotLayout;
         var donors: [256]runtime.kv.attention_match_snapshot.Donor = undefined;
         var layer_donors: [256]u32 = undefined;
-        var count: usize = 0;
-        for (0..self.context.model.num_hidden_layers) |layer| {
-            const geometry = try self.context.model.kvDonorGeometry(layer);
-            if (self.context.model.isKvDonorLayer(layer)) {
-                donors[count] = .{ .layer = @intCast(layer), .window = if (self.context.model.layerUsesSlidingAttention(layer)) self.context.model.sliding_window else 0, .heads = geometry.num_kv_heads, .dim = geometry.head_dim };
-                count += 1;
-            }
-            var index: ?u32 = null;
-            for (donors[0..count], 0..) |donor, i| {
-                if (donor.layer == geometry.donor_layer) {
-                    index = @intCast(i);
-                    break;
-                }
-            }
-            layer_donors[layer] = index orelse return error.UnsupportedKvSnapshotLayout;
-        }
+        const count = try resolveDonorGeometry(self.context.model, &donors, &layer_donors);
         const request: runtime.kv.attention_match_snapshot.Request = .{
             .identity = identity,
             .sequence = source.sequence_id orelse return error.UnsupportedKvSnapshotLayout,
@@ -1322,6 +1336,75 @@ test "checkpoint shadow queries reject typed automatic replay before reading sou
     // No KV/allocator callback is permitted before the replay exclusion.
     var source: NativeDecodeState = undefined;
     try std.testing.expectError(error.UnsupportedCompactionQueryReplay, executor.collectAttentionMatchQueries(&.{ 1, 2 }, &source, .{}));
+}
+
+test "checkpoint request admission validates the actual route and exact append boundary" {
+    const Probe = struct {
+        fn kind(_: *anyopaque) ops.BackendKind {
+            return .cuda;
+        }
+    };
+    var state: u8 = 0;
+    var table = @import("../ops/native_compute.zig").vtable_impl;
+    table.backendKind = Probe.kind;
+    const backend = ops.ComputeBackend{ .ptr = &state, .vtable = &table };
+    const config = gpt_mod.Config{ .family = .gemma, .ple_hidden_size = 256 };
+    const id = native_kv_checkpoint.Identity{ .weights = @splat(1), .tokenizer = @splat(2), .template = @splat(3), .layout = @splat(4) };
+    var context = Context{ .allocator = std.testing.allocator, .backend = &backend, .model = &config, .kv_dtype = .f16, .identity = id };
+    var request = AdmissionRequest{ .prepare = true, .restoring = false, .scheduled = false, .has_media = false, .exact_hybrid = true, .compaction = false, .prompt_cache_requested = false, .speculation = false };
+    try validateAdmission(context, request);
+    request.restoring = true;
+    try std.testing.expectError(error.UnsupportedAttentionMatchRoute, validateAdmission(context, request));
+    request.prepare = false;
+    try validateAdmission(context, request);
+    request.has_media = true;
+    try std.testing.expectError(error.UnsupportedAttentionMatchRoute, validateAdmission(context, request));
+    request.has_media = false;
+    context.routes.compiled_partition = true;
+    try std.testing.expectError(error.UnsupportedAttentionMatchRoute, validateAdmission(context, request));
+    context.routes.compiled_partition = false;
+    context.kv_dtype = .f32;
+    try std.testing.expectError(error.UnsupportedAttentionMatchRoute, validateAdmission(context, request));
+
+    const max = native_kv_checkpoint.max_context_tokens;
+    try validateAppendCapacity(max - 1, 1);
+    try std.testing.expectError(error.KvCheckpointAppendLimit, validateAppendCapacity(max - 1, 2));
+    try std.testing.expectError(error.KvCheckpointAppendLimit, validateAppendCapacity(max + 1, 0));
+    try std.testing.expectError(error.KvCheckpointAppendLimit, validateAppendCapacity(1, std.math.maxInt(usize)));
+}
+
+test "checkpoint donor geometry agrees across export and restore for shared Gemma4 layers" {
+    const config = gpt_mod.Config{
+        .family = .gemma,
+        .num_hidden_layers = 42,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .sliding_window = 512,
+        .num_kv_shared_layers = 18,
+        .ple_hidden_size = 256,
+    };
+    var export_donors: [42]runtime.kv.attention_match_snapshot.Donor = undefined;
+    var restore_donors: [42]runtime.kv.attention_match_resume.Geometry = undefined;
+    var export_mapping: [42]u32 = undefined;
+    var restore_mapping: [42]u32 = undefined;
+    const count = try resolveDonorGeometry(&config, &export_donors, &export_mapping);
+    try std.testing.expectEqual(@as(usize, 24), count);
+    try std.testing.expectEqual(count, try resolveDonorGeometry(&config, &restore_donors, &restore_mapping));
+    try std.testing.expectEqualSlices(u32, &export_mapping, &restore_mapping);
+    var global: usize = 0;
+    for (export_donors[0..count], restore_donors[0..count]) |exported, restored| {
+        try std.testing.expectEqual(exported.layer, restored.layer);
+        try std.testing.expectEqual(exported.window, restored.window);
+        try std.testing.expectEqual(exported.heads, restored.heads);
+        try std.testing.expectEqual(exported.dim, restored.dim);
+        try std.testing.expectEqual(@as(u32, 2), exported.heads);
+        try std.testing.expectEqual(@as(u32, if (exported.window == 0) 512 else 256), exported.dim);
+        global += @intFromBool(exported.window == 0);
+    }
+    try std.testing.expectEqual(@as(usize, 4), global);
+    try std.testing.expectError(error.UnsupportedKvSnapshotLayout, resolveDonorGeometry(&config, export_donors[0..23], &export_mapping));
 }
 
 test "checkpoint suffix admission preserves the funded scratch and fairness bounds" {

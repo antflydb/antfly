@@ -591,6 +591,12 @@ preparation API do not by themselves complete these remaining requirements:
   compiled routes and selects cooperative KV metadata scopes. The decoder
   runtime checks Metal driver-frame eligibility. Generation supplies the
   request's grammar, scheduling and output intent.
+  The checkpoint runtime validates the loaded route and append limit before
+  KV mutation. Preparation, snapshot export and restore share the donor
+  geometry builder while retaining their existing serialization contracts.
+  The checkpoint cohort passed 152 selected host tests with 62 skips, including
+  the E4B donor geometry, conflicting requests and exact append boundary.
+  The hosted-audio fixture required loopback access for the same binary.
   Incremental encoder-decoder callers supply new tokens and their absolute
   starting position. Native, compiled and merged decoders validate the position
   before submission and advance it only on success. Merged seq2seq ONNX
