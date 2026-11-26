@@ -328,6 +328,37 @@ pub const Shadow = struct {
         self.state.?.allow_swa_ring = false;
     }
 
+    const CloneResult = struct {
+        result: runtime.kv.device_clone.Result,
+        fitted: bool,
+    };
+
+    /// The caller holds the model execution scope and owns the reserved
+    /// destination. A fitted prefix needs a bias-aware reference consumer.
+    fn clonePrefix(
+        self: *@This(),
+        runner: *Runtime,
+        source: *runtime.kv.storage_runtime.KvStorageRuntime,
+        request: runtime.kv.device_clone.Request,
+        allow_fitted: bool,
+        missing_source_hook: error{ UnsupportedCompactionQueryRoute, DeviceKvCloneUnsupported },
+    ) !CloneResult {
+        const destination = &self.storage.?;
+        const hook = destination.device_write_hook orelse return error.UnsupportedCompactionQueryRoute;
+        if (comptime build_options.enable_cuda) {
+            try request.check();
+            const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(runner.context.backend.ptr));
+            if ((try cuda_compute.installedAttentionMatchActivity(compute, source, request.source_sequence)) != null) {
+                if (!allow_fitted) return error.UnsupportedCompactionQueryRoute;
+                const result = (try cuda_compute.cloneInstalledAttentionMatch(compute, destination, source, request)) orelse
+                    return error.UnsupportedAttentionMatchRoute;
+                return .{ .result = result, .fitted = true };
+            }
+        }
+        const result = try hook.cloneExactPrefix(source.device_write_hook orelse return missing_source_hook, request);
+        return .{ .result = result, .fitted = false };
+    }
+
     pub fn init(self: *@This(), runner: *Runtime, source: *const NativeDecodeState, capacity: usize) !void {
         if (self.manager != null or self.storage != null or self.state != null) return error.InvalidCompactionProbe;
         const dtype = runner.context.kv_dtype orelse return error.UnsupportedCompactionQueryDType;
@@ -343,7 +374,7 @@ pub const Shadow = struct {
         defer if (execution_scope) |*scope| scope.deinit();
         try self.initUnderExecution(runner, dtype);
         errdefer self.deinit();
-        const hook = self.storage.?.device_write_hook orelse return error.UnsupportedCompactionQueryRoute;
+        if (self.storage.?.device_write_hook == null) return error.UnsupportedCompactionQueryRoute;
         try self.state.?.notePrefill(source.total_tokens);
         const clone_request: runtime.kv.device_clone.Request = .{
             .source_sequence = view.sequence_id,
@@ -358,12 +389,7 @@ pub const Shadow = struct {
             .check_ctx = runner,
             .check_fn = checkAttentionMatchQueryWork,
         };
-        const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(runner.context.backend.ptr));
-        if ((try cuda_compute.installedAttentionMatchActivity(compute, source_storage, view.sequence_id)) != null) {
-            _ = (try cuda_compute.cloneInstalledAttentionMatch(compute, &self.storage.?, source_storage, clone_request)) orelse return error.UnsupportedAttentionMatchRoute;
-        } else {
-            _ = try hook.cloneExactPrefix(source_storage.device_write_hook orelse return error.UnsupportedCompactionQueryRoute, clone_request);
-        }
+        _ = try self.clonePrefix(runner, source_storage, clone_request, true, error.UnsupportedCompactionQueryRoute);
     }
 };
 
@@ -1110,7 +1136,7 @@ pub const Runtime = struct {
         defer shadow_owner.deinit();
         const storage = &shadow_owner.storage.?;
         const shadow = &shadow_owner.state.?;
-        const shadow_hook = storage.device_write_hook orelse return error.UnsupportedCompactionQueryRoute;
+        if (storage.device_write_hook == null) return error.UnsupportedCompactionQueryRoute;
         if (options.stats) |stats| stats.setup_ns = mtpProfileElapsedNs(true, self.context.io, collection_started);
         const prefix_started = mtpProfileTimestamp(true, self.context.io);
         var ragged_shadow = false;
@@ -1125,17 +1151,9 @@ pub const Runtime = struct {
             const source_blocks = source_view.logical_blocks orelse return error.UnsupportedDeviceKvCloneLayout;
             try shadow.notePrefill(source_tokens.len);
             const clone_request: runtime.kv.device_clone.Request = .{ .source_sequence = source_view.sequence_id, .destination_sequence = shadow.sequence_id.?, .tokens = source_tokens.len, .capacity = shadow_rows, .page_size = storage.storage.config.page_size_tokens, .source_blocks = source_blocks, .destination_blocks = shadow.kv_block_ids.items, .donors = donors[0..donor_count], .max_bytes = options.max_shadow_kv_bytes, .check_ctx = self, .check_fn = checkAttentionMatchQueryWork };
-            const fitted_clone = if (comptime build_options.enable_cuda) blk: {
-                const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.context.backend.ptr));
-                break :blk try cuda_compute.cloneInstalledAttentionMatch(compute, storage, source_storage, clone_request);
-            } else null;
-            const clone = if (fitted_clone) |value| blk: {
-                // The reference mode follows the installed bias/coverage-aware
-                // backend. Dense exact-repeat kernel options cannot describe it.
-                if (options.repeat_mode != .reference) return error.UnsupportedCompactionQueryRoute;
-                ragged_shadow = true;
-                break :blk value;
-            } else try shadow_hook.cloneExactPrefix(source_storage.device_write_hook orelse return error.DeviceKvCloneUnsupported, clone_request);
+            const cloned = try shadow_owner.clonePrefix(self, source_storage, clone_request, options.repeat_mode == .reference, error.DeviceKvCloneUnsupported);
+            const clone = cloned.result;
+            ragged_shadow = cloned.fitted;
             if (options.stats) |stats| {
                 stats.prefix_ns = mtpProfileElapsedNs(true, self.context.io, prefix_started);
                 stats.cloned_bytes = clone.copied_bytes;
