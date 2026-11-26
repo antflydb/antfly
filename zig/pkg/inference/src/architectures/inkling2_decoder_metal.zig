@@ -224,11 +224,10 @@ const WorkPlan = struct {
     group_elements: usize,
     temps: TempArena,
 
-    fn init(model: *const Decoder, rows: u32, max_tokens: u32, reduction_rows: u32) !WorkPlan {
-        const text = model.text;
+    fn init(text: checkpoint.TextConfig, format: checkpoint.ExpertFormat, rows: u32, max_tokens: u32, reduction_rows: u32) !WorkPlan {
         const width: usize = text.hidden_size;
         const count = @as(usize, rows) * width;
-        const experts = model.layers[0].experts.geometry(text, rows);
+        const experts = moe.geometryForShape(text, format, rows);
         const shape = try experts.scratchShape();
         const elements = std.EnumArray(Temp, usize).init(.{
             .key = count,
@@ -293,7 +292,11 @@ pub const RequestPlan = struct {
     }
 
     pub fn initWithReductionRows(model: *const Decoder, max_tokens: u32, prefill_rows: u32, reduction_rows: u32, format: kv.PlaneFormat) !RequestPlan {
-        const text = model.text;
+        return initForGeometry(model.text, model.layers[0].experts.format, max_tokens, prefill_rows, reduction_rows, format);
+    }
+
+    /// Admission depends only on checkpoint geometry and representation.
+    fn initForGeometry(text: checkpoint.TextConfig, experts: checkpoint.ExpertFormat, max_tokens: u32, prefill_rows: u32, reduction_rows: u32, format: kv.PlaneFormat) !RequestPlan {
         if (max_tokens == 0 or max_tokens > text.model_max_length or prefill_rows == 0 or
             reduction_rows == 0 or reduction_rows > prefill_rows or
             prefill_rows > @min(grouped_prefill_chunk_rows, max_tokens)) return error.InvalidInkling2Context;
@@ -308,8 +311,8 @@ pub const RequestPlan = struct {
                 .head_dim = text.head_dim,
                 .full_format = format,
             },
-            .decode = try .init(model, 1, max_tokens, 1),
-            .prefill = if (prefill_rows == 1) null else try .init(model, prefill_rows, max_tokens, reduction_rows),
+            .decode = try .init(text, experts, 1, max_tokens, 1),
+            .prefill = if (prefill_rows == 1) null else try .init(text, experts, prefill_rows, max_tokens, reduction_rows),
         };
     }
 
@@ -318,7 +321,7 @@ pub const RequestPlan = struct {
         const main = self.prefill orelse return error.InvalidShape;
         if (tail_rows >= main.rows) return error.InvalidShape;
         var result = self;
-        result.prefill_tail = try .init(model, tail_rows, @intCast(self.bank.layout.max_tokens), @min(tail_rows, main.reduction_rows));
+        result.prefill_tail = try .init(model.text, model.layers[0].experts.format, tail_rows, @intCast(self.bank.layout.max_tokens), @min(tail_rows, main.reduction_rows));
         return result;
     }
 
@@ -906,6 +909,15 @@ test "Inkling Metal resident decoder executes the full visit schedule on a synth
         .quantization_config = .{ .quant_method = "modelopt", .quant_algo = "NVFP4" },
     };
     const schedule = try config.visits();
+    // Quote released geometry while the model is still absent. The same
+    // plan feeds the physical allocations exercised below at fixture sizes.
+    const full = (try RequestPlan.initForGeometry(text, .nvfp4, text.model_max_length, 256, 32, .q4_head128)).withDeviceSelection();
+    const physical = try full.deviceBytes();
+    try std.testing.expectEqual(@as(usize, 256), full.bank.layout.max_append_tokens);
+    try std.testing.expectEqual(@as(u32, 32), full.prefill.?.reduction_rows);
+    try std.testing.expect(19_517_813_920 + physical < 28_991_029_248);
+    const exact = try RequestPlan.initForGeometry(text, .nvfp4, text.model_max_length, 256, 32, .bf16);
+    try std.testing.expect(19_517_813_920 + try exact.deviceBytes() > 28_991_029_248);
     const width = 128;
     const intermediate = 32;
     text.hidden_size = width;

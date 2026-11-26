@@ -74,6 +74,20 @@ const PackedWeights = struct {
     }
 };
 
+pub fn geometryForShape(text: checkpoint.TextConfig, format: checkpoint.ExpertFormat, rows: u32) Ffn {
+    return .{
+        .rows = rows,
+        .hidden = text.hidden_size,
+        .intermediate = text.intermediate_size,
+        .experts = text.n_routed_experts,
+        .top_k = text.num_experts_per_tok,
+        .format = format,
+        .route_scale = text.route_scale,
+        .gate_cap = text.mlp_gate_softcap,
+        .up_cap = text.mlp_up_softcap,
+    };
+}
+
 pub const Layer = struct {
     router_weight: Tensor,
     router_bias: Tensor,
@@ -116,17 +130,7 @@ pub const Layer = struct {
     }
 
     pub fn geometry(self: *const Layer, text: checkpoint.TextConfig, rows: u32) Ffn {
-        return .{
-            .rows = rows,
-            .hidden = text.hidden_size,
-            .intermediate = text.intermediate_size,
-            .experts = text.n_routed_experts,
-            .top_k = text.num_experts_per_tok,
-            .format = self.format,
-            .route_scale = text.route_scale,
-            .gate_cap = text.mlp_gate_softcap,
-            .up_cap = text.mlp_up_softcap,
-        };
+        return geometryForShape(text, self.format, rows);
     }
 
     pub fn encode(self: *const Layer, runtime: *metal.RawMetalDecodeRuntime, text: checkpoint.TextConfig, rows: u32, input: *const Tensor, logits: *Tensor, scratch: Ffn.Workspace, output: *Tensor) !void {
