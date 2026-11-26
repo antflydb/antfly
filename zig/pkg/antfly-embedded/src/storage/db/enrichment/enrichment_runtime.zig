@@ -33587,6 +33587,7 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
             const captures = (try publication.captureSession(alloc, &read, request, plan.plan())) orelse return error.ArtifactCatalogDrift;
             var cursor = try Candidates.open(alloc, &borrowed, request.doc_key, request.artifact_name, requestEmbeddingName(request));
             defer cursor.close();
+            if (dense != null) cursor.enableWindowHints();
             if (after) |key| try cursor.seekAfter(key);
             if (scan_after) |key| try cursor.resumePhysical(key);
             if (logical_after) |key| try cursor.resumeLogical(key);
