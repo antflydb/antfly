@@ -300,7 +300,7 @@ fn appendDerivedEdgesAlloc(a: Allocator, edges: *std.ArrayListUnmanaged(notices.
     }
 }
 
-var marker_counter = std.atomic.Value(u64).init(0);
+var marker_counter = std.atomic.Value(usize).init(0);
 
 pub const pending_prefix = "\x00\x00__metadata__:context_dependency:generated_pending:";
 /// A follower's single crash intent (see `markGeneratedPending`).
