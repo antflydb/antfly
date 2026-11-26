@@ -34,6 +34,7 @@ pub const Input = struct {
     /// Empty when the replay cursor proves that the member has no windows.
     old_window_outputs: ?[]const []const u8 = null,
     media_window_layout: bool = false,
+    large_window_capture: bool = false,
     pub fn deinit(self: *Input) void {
         self.token.deinit();
         self.* = undefined;
@@ -130,6 +131,21 @@ fn captureMember(alloc: std.mem.Allocator, txn: anytype, request: @import("enric
     return .{ .token = token, .value = value, .output_key = output, .previous_output_exists = previous != null, .effect_protocol = effect_protocol };
 }
 
+const empty_window_prefix = "\x00\x00__artifact_publication__:empty-windows:v1:";
+pub const EmptyWindowKey = [empty_window_prefix.len + 32]u8;
+
+/// Only the physical writer certifies emptiness. A live child invalidates the
+/// same member and consumer, and a catalog epoch change invalidates old facts.
+pub fn emptyWindowKey(namespace: publication.Namespace, scalar: []const u8) EmptyWindowKey {
+    var key: EmptyWindowKey = undefined;
+    @memcpy(key[0..empty_window_prefix.len], empty_window_prefix);
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update(&namespace);
+    hash.update(scalar);
+    hash.final(key[empty_window_prefix.len..]);
+    return key;
+}
+
 pub const Fence = struct {
     scope: []const u8,
     requires_member: bool,
@@ -137,12 +153,12 @@ pub const Fence = struct {
     prepared: bool = false,
     dense: bool = false,
     revalidate_window_plan: bool = false,
+    certify_empty: ?EmptyWindowKey = null,
     /// Resolve membership and decode inherited provenance before serialized
     /// apply. Published generation rows are immutable; the head/member guards
     /// plus this exact proof reference fence preserve the prepared observation.
     pub fn bind(self: *Fence, alloc: std.mem.Allocator, txn: anytype, command: publication.Command, window_protocol: bool) !void {
         if (window_protocol and self.dense) {
-            try self.validateWindowPlan(alloc, txn, command);
             // A restored binding without the compact marker cannot rely on
             // the parent revision to fence a concurrent child insertion.
             self.revalidate_window_plan = !try @import("artifact_catalog_activation.zig").windowSetFenced(txn, .{
@@ -150,6 +166,7 @@ pub const Fence = struct {
                 .epoch = command.authority_epoch,
                 .catalog_digest = command.catalog_digest,
             });
+            self.certify_empty = try self.checkWindowPlan(alloc, txn, command, !self.revalidate_window_plan);
         }
         self.prepared = false;
         self.certificate = null;
@@ -174,14 +191,26 @@ pub const Fence = struct {
                         // child receipt. All new multi-effect live windows do.
                         if (command.mutations.len > 1) if (command.execution_identity) |revision| {
                             var actual: publication.Digest = undefined;
-                            const decoded = std.fmt.hexToBytes(&actual, result.model_revision) catch continue;
-                            if (!std.mem.eql(u8, decoded, &revision)) continue;
+                            const decoded = std.fmt.hexToBytes(&actual, result.model_revision) catch {
+                                if (window_protocol) return error.EnrichmentSourceChanged;
+                                continue;
+                            };
+                            if (!std.mem.eql(u8, decoded, &revision)) {
+                                if (window_protocol) return error.EnrichmentSourceChanged;
+                                continue;
+                            }
                         };
-                        try completed.?.put(alloc, result.sub_index, {});
+                        const entry = try completed.?.getOrPut(alloc, result.sub_index);
+                        if (window_protocol and entry.found_existing) return error.EnrichmentSourceChanged;
                     }
                 }
-                if (!completed.?.contains(index)) return error.EnrichmentSourceChanged;
+                if (window_protocol) {
+                    if (!completed.?.remove(index)) return error.EnrichmentSourceChanged;
+                } else if (!completed.?.contains(index)) return error.EnrichmentSourceChanged;
             }
+        };
+        if (window_protocol) if (completed) |indices| {
+            if (indices.count() != 0) return error.EnrichmentSourceChanged;
         };
         self.certificate = if (input.proofValue() != null) try @import("artifact_producer_provenance.zig").certifyInheritedArtifact(alloc, txn, input.proofKey(self.scope), input.proofValue(), command) else null;
         self.prepared = true;
@@ -195,14 +224,46 @@ pub const Fence = struct {
     /// precondition also fences the output set: physical child writes advance
     /// the parent revision, even when the parent has no stored value.
     pub fn validateWindowPlan(self: Fence, alloc: std.mem.Allocator, txn: anytype, command: publication.Command) !void {
-        if (!self.dense) return;
+        _ = try self.checkWindowPlan(alloc, txn, command, false);
+    }
+
+    pub fn stageWindowWitness(self: Fence, txn: anytype, command: publication.Command) !void {
+        if (self.certify_empty) |key| {
+            var raw: [40]u8 = undefined;
+            std.mem.writeInt(u64, raw[0..8], command.authority_epoch, .big);
+            @memcpy(raw[8..40], &command.catalog_digest);
+            try txn.put(&key, &raw);
+        }
+    }
+
+    fn checkWindowPlan(self: Fence, alloc: std.mem.Allocator, txn: anytype, command: publication.Command, witness_enabled: bool) !?EmptyWindowKey {
         if (!publication.isRevisionBoundChunkVectorSet(self.scope, command.producer_artifact_name, command.mutations))
             return error.EnrichmentSourceChanged;
-        var scalar_effect = false;
+        var scalar: ?publication.Mutation = null;
+        var live_window = false;
         for (command.mutations) |effect| {
-            scalar_effect = scalar_effect or effect.key[self.scope.len] == keys.derived_embedding_kind;
+            if (effect.key[self.scope.len] == keys.derived_embedding_kind) {
+                scalar = effect;
+            } else live_window = live_window or effect.value != null;
         }
-        if (!scalar_effect) return error.EnrichmentSourceChanged;
+        const parent = scalar orelse return error.EnrichmentSourceChanged;
+        const witness = emptyWindowKey(command.namespace, parent.key);
+        if (witness_enabled) {
+            const expected = for (command.mutation_preconditions) |guard| {
+                if (std.mem.eql(u8, parent.key, guard.key)) break guard.input_position;
+            } else return error.EnrichmentSourceChanged;
+            if (!std.meta.eql(expected, try publication.artifactRevision(txn, command.namespace, parent.key)))
+                return error.EnrichmentSourceChanged;
+            const previous = txn.get(&witness) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (previous) |raw| {
+                if (raw.len != 40) return error.ArtifactCatalogCorrupt;
+                if (std.mem.readInt(u64, raw[0..8], .big) == command.authority_epoch and
+                    std.mem.eql(u8, raw[8..40], &command.catalog_digest)) return null;
+            }
+        }
         const first = try keys.mediaWindowChildKeyAlloc(alloc, self.scope, 0);
         defer alloc.free(first);
         const prefix = first[0 .. first.len - @sizeOf(u32)];
@@ -218,6 +279,9 @@ pub const Fence = struct {
             if (outputs.count() == 0) for (command.mutations) |mutation| try outputs.put(alloc, mutation.key, {});
             if (!outputs.contains(entry.key)) return error.EnrichmentSourceChanged;
         }
+        // Certify live scalars only. Historical or restored tables earn the
+        // first witness by scanning, and retired members need no new record.
+        return if (witness_enabled and parent.value != null and !live_window) witness else null;
     }
 };
 
@@ -388,4 +452,45 @@ fn testPreparation(sparse_kind: bool) !void {
 
 test "model aware media chunk vector windows share parent fences and project every vector" {
     try testPreparation(false);
+}
+
+test "model aware media current empty witness bypasses the child range cursor" {
+    const a = std.testing.allocator;
+    const Reader = struct {
+        witness: EmptyWindowKey,
+        raw: [40]u8,
+
+        pub fn get(self: *const @This(), key: []const u8) anyerror![]const u8 {
+            return if (std.mem.eql(u8, key, &self.witness)) &self.raw else error.NotFound;
+        }
+
+        pub fn openPhysicalCursorAdapter(_: @This()) !@import("../backend_erased.zig").Cursor {
+            return error.TestUnexpectedResult;
+        }
+    };
+    const scope = try keys.chunkArtifactKeyAlloc(a, "doc", "text", 0);
+    defer a.free(scope);
+    const scalar = try keys.derivedEmbeddingArtifactKeyAlloc(a, scope, "model");
+    defer a.free(scalar);
+    const command: publication.Command = .{
+        .namespace = @splat(1),
+        .authority_epoch = 2,
+        .catalog_digest = @splat(3),
+        .producer_name = "vectors",
+        .producer_kind = .index,
+        .producer_generation = 1,
+        .producer_artifact_name = "model",
+        .producer_scope_key = scope,
+        .sources = &.{},
+        .mutation_preconditions = &.{.{ .key = scalar, .content_digest = null, .input_position = null, .source_index = 0 }},
+        .mutations = &.{.{ .family = .derived_vector, .key = scalar, .value = "vector", .source_index = 0 }},
+        .publication_digest = @splat(0),
+    };
+    var reader: Reader = .{ .witness = emptyWindowKey(command.namespace, scalar), .raw = undefined };
+    std.mem.writeInt(u64, reader.raw[0..8], command.authority_epoch, .big);
+    @memcpy(reader.raw[8..40], &command.catalog_digest);
+    const fence: Fence = .{ .scope = scope, .requires_member = true, .dense = true };
+    try std.testing.expect((try fence.checkWindowPlan(a, &reader, command, true)) == null);
+    reader.raw[39] ^= 1;
+    try std.testing.expectError(error.TestUnexpectedResult, fence.checkWindowPlan(a, &reader, command, true));
 }

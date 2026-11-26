@@ -36622,6 +36622,7 @@ pub const DB = struct {
                 if (guard.chunk_vector_fence) |fence| {
                     try fence.requireCurrent(txn);
                     if (fence.revalidate_window_plan) try fence.validateWindowPlan(alloc, txn, guard.command);
+                    try fence.stageWindowWitness(txn, guard.command);
                 }
                 for (guard.asset_upstream_fences) |fence| try fence.requireCurrent(txn);
                 try publication.stageCoverage(alloc, txn, guard.command, guard.coverage);

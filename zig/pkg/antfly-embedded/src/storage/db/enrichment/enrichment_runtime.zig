@@ -8906,6 +8906,7 @@ const UnsupportedEnrichmentRuntime = struct {
     status_hook: ?StatusHook = null,
     dense_result_cache: ?embedder_mod.DenseResultCache = null,
     vector_label_cache: @import("vector_label_cache.zig").Cache = .{},
+    media_window_capture: MediaWindowCaptureCache = .{},
     /// Invocation-local runtimes borrow the lifecycle owner's cache.
     shared_vector_label_cache: ?*@import("vector_label_cache.zig").Cache = null,
     generated_publication: ?GeneratedPublicationPort = null,
@@ -9611,6 +9612,7 @@ const PlatformEnrichmentRuntime = struct {
     status_hook: ?StatusHook = null,
     dense_result_cache: ?embedder_mod.DenseResultCache = null,
     vector_label_cache: @import("vector_label_cache.zig").Cache = .{},
+    media_window_capture: MediaWindowCaptureCache = .{},
     /// Invocation-local runtimes borrow the lifecycle owner's cache.
     shared_vector_label_cache: ?*@import("vector_label_cache.zig").Cache = null,
     generated_publication: ?GeneratedPublicationPort = null,
@@ -9726,6 +9728,7 @@ const PlatformEnrichmentRuntime = struct {
     pub fn deinit(self: *EnrichmentRuntime) void {
         self.stop();
         self.vector_label_cache.deinit();
+        self.media_window_capture.deinit();
         clearIndexEmbeddingActivity(self);
         clearPublishedGeneratedArtifacts(self);
         clearIsolatedFailedIndexes(self);
@@ -32919,6 +32922,73 @@ fn publishMediaWindowVectors(runtime: *EnrichmentRuntime, a: Allocator, request:
     return true;
 }
 
+// Retain one bounded, interrupted scan on the lifecycle runtime. The key
+// includes the ordered authority and the exact parent revision, so an epoch
+// or child-set change cannot reuse a partial observation.
+const MediaWindowCapture = struct {
+    arena: std.heap.ArenaAllocator,
+    identity: ordered_publication.Digest,
+    member: [32]u8,
+    resume_key: std.ArrayList(u8) = .empty,
+    records: std.ArrayList(ordered_publication.ArtifactSource) = .empty,
+    key_bytes: usize = 0,
+    revision_fenced: bool = false,
+
+    fn canResume(self: MediaWindowCapture) bool {
+        return self.revision_fenced and self.resume_key.items.len != 0 and
+            self.key_bytes +| self.resume_key.items.len <= 2 * 1024 * 1024;
+    }
+
+    fn deinit(self: *MediaWindowCapture, alloc: Allocator) void {
+        self.resume_key.deinit(alloc);
+        self.arena.deinit();
+    }
+};
+
+const MediaWindowCaptureCache = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    saved: ?MediaWindowCapture = null,
+    saved_at_ns: u64 = 0,
+
+    fn take(self: *MediaWindowCaptureCache, alloc: Allocator, member: [32]u8, identity: ordered_publication.Digest) ?MediaWindowCapture {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        var previous: ?MediaWindowCapture = null;
+        if (self.saved) |saved| {
+            if (std.mem.eql(u8, &saved.member, &member)) {
+                previous = saved;
+                self.saved = null;
+            }
+        }
+        self.mutex.unlock();
+        if (previous) |*old| {
+            if (std.mem.eql(u8, &old.identity, &identity)) return old.*;
+            old.deinit(alloc);
+        }
+        return null;
+    }
+
+    fn save(self: *MediaWindowCaptureCache, scan: MediaWindowCapture) bool {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        const now = platform.time.monotonicNs();
+        // Keep the existing member's continuation while handling unrelated
+        // documents. Expire abandoned members so they cannot hold the slot.
+        if (self.saved != null and now -| self.saved_at_ns < 60 * std.time.ns_per_s) {
+            self.mutex.unlock();
+            return false;
+        }
+        var previous = self.saved;
+        self.saved = scan;
+        self.saved_at_ns = now;
+        self.mutex.unlock();
+        if (previous) |*old| old.deinit(old.arena.child_allocator);
+        return true;
+    }
+
+    fn deinit(self: *MediaWindowCaptureCache) void {
+        if (self.saved) |*saved| saved.deinit(saved.arena.child_allocator);
+    }
+};
+
 fn ensureMediaWindowOutputs(runtime: *EnrichmentRuntime, a: Allocator, input: *@import("../artifact_chunk_vector_publication.zig").Input) !void {
     if (input.old_window_outputs != null) return;
     const first_child = try internal_keys.mediaWindowChildKeyAlloc(a, input.token.producer_scope_key, 0);
@@ -32929,48 +32999,91 @@ fn ensureMediaWindowOutputs(runtime: *EnrichmentRuntime, a: Allocator, input: *@
     } else return error.InvalidBatchRequest;
     const owner = assetProviderRequestContext(runtime);
     const owned = input.token.arena.allocator();
-    var output_keys: std.ArrayList([]const u8) = .empty;
-    var resume_key: ?[]u8 = null;
-    defer if (resume_key) |key| a.free(key);
-    // A logical page may already have used its budget when its cursor reports
-    // a possible child. Exact capture runs in separate bounded read snapshots,
-    // resuming inclusively and retaining only keys owned by this consumer.
-    while (true) {
-        try checkEnrichmentExecutionContext(runtime, owner);
+    const authority: ordered_publication.Authority = .{ .namespace = input.token.namespace, .epoch = input.token.epoch, .catalog_digest = input.token.catalog_digest };
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update(&authority.namespace);
+    hash.update(&std.mem.toBytes(authority.epoch));
+    hash.update(&authority.catalog_digest);
+    hash.update(&.{@intFromBool(parent_revision != null)});
+    if (parent_revision) |position| hash.update(&(try position.encode()));
+    hash.update(input.output_key);
+    var identity: ordered_publication.Digest = undefined;
+    hash.final(&identity);
+    const backing = runtime.alloc;
+    var member: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(input.output_key, &member, .{});
+    var scan = runtime.media_window_capture.take(backing, member, identity) orelse MediaWindowCapture{
+        .arena = .init(backing),
+        .identity = identity,
+        .member = member,
+    };
+    input.large_window_capture = scan.resume_key.items.len != 0;
+    var retained = false;
+    defer if (!retained) scan.deinit(backing);
+    // Release the snapshot between pages. Preserve revision-fenced progress
+    // across deadlines and voluntarily yield wide scans back to replay.
+    var pages: usize = 0;
+    while (true) : (pages += 1) {
+        if (pages == 4 and scan.canResume() and runtime.media_window_capture.save(scan)) {
+            retained = true;
+            return error.ArtifactPublicationPending;
+        }
+        checkEnrichmentExecutionContext(runtime, owner) catch |err| {
+            if (scan.canResume() and (isEnrichmentControlError(err) or isOperationInterruption(err))) {
+                retained = runtime.media_window_capture.save(scan);
+            }
+            return err;
+        };
         var read = try runtime.store.beginRead();
         defer read.abort();
         if (!std.meta.eql(parent_revision, try ordered_publication.artifactRevision(&read, input.token.namespace, input.output_key)))
             return error.EnrichmentSourceChanged;
+        if (scan.resume_key.items.len == 0)
+            scan.revision_fenced = try @import("../artifact_catalog_activation.zig").windowSetFenced(&read, authority);
         var cursor = try read.openCursor();
         defer cursor.close();
         cursor.setKeysOnly();
         var budget: @import("../artifact_scan_budget.zig").Budget = .{
             .deadline_ns = platform.time.monotonicNs() +| 2 * std.time.ns_per_ms,
         };
-        var row = try cursor.seekAtOrAfter(resume_key orelse first_child);
+        var row = try cursor.seekAtOrAfter(if (scan.resume_key.items.len == 0) first_child else scan.resume_key.items);
         while (row) |entry| : (row = try cursor.next()) {
             if (!std.mem.startsWith(u8, entry.key, child_prefix)) break;
             if (budget.exhausted()) {
-                const next = try a.dupe(u8, entry.key);
-                if (resume_key) |old| a.free(old);
-                resume_key = next;
+                try scan.resume_key.resize(backing, entry.key.len);
+                @memcpy(scan.resume_key.items, entry.key);
                 break;
             }
             budget.visit(entry.key.len);
             if (!internal_keys.matchesDerivedEmbeddingArtifactName(entry.key, input.token.artifact_name)) continue;
+            if (scan.records.items.len + input.token.preconditions.items.len + input.token.reads.items.len >= ordered_publication.max_source_documents or
+                scan.key_bytes +| entry.key.len +| input.token.read_key_bytes > ordered_publication.max_identity_bytes)
+                return error.ResourceBudgetExceeded;
             const raw = try read.get(entry.key);
             budget.bytes +|= raw.len;
-            const key = try owned.dupe(u8, entry.key);
-            const revision = try ordered_publication.artifactRevision(&read, input.token.namespace, key);
-            try input.token.observePrecondition(key, raw, revision);
-            try output_keys.append(owned, key);
+            var content: ordered_publication.Digest = undefined;
+            std.crypto.hash.sha2.Sha256.hash(raw, &content, .{});
+            const memory = scan.arena.allocator();
+            try scan.records.append(memory, .{
+                .key = try memory.dupe(u8, entry.key),
+                .content_digest = content,
+                .input_position = try ordered_publication.artifactRevision(&read, input.token.namespace, entry.key),
+                .source_index = 0,
+            });
+            scan.key_bytes += entry.key.len;
         }
-        // The loop only leaves an in-range row unprocessed when it has
-        // recorded that row as the next snapshot's starting point.
-        if (row) |entry| if (std.mem.startsWith(u8, entry.key, child_prefix)) continue;
-        input.old_window_outputs = output_keys.items;
-        return;
+        if (row) |entry| if (std.mem.startsWith(u8, entry.key, child_prefix)) {
+            input.large_window_capture = true;
+            continue;
+        };
+        break;
     }
+    const outputs = try owned.alloc([]const u8, scan.records.items.len);
+    for (scan.records.items, outputs) |guard, *key| {
+        try input.token.observePreconditionDigest(guard.key, guard.content_digest, guard.input_position);
+        key.* = try owned.dupe(u8, guard.key);
+    }
+    input.old_window_outputs = outputs;
 }
 
 /// Only real window work raises the catalog floor. Publish the normal
@@ -33715,6 +33828,9 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
                 if (carried == null) bytes +|= if (text) |value| value.len else 0;
                 try items.append(alloc, .{ .input = input, .text = text, .carried = carried });
                 input_owned = false;
+                // Let a potentially large child scan finish and publish
+                // before another candidate can yield this logical page.
+                if (dense != null and cursor.member_has_windows) break;
             }
             if (!publishing) try observation.?.requireCurrent(&read, request.doc_key);
         }
@@ -33782,7 +33898,10 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
                 item.model_hash = try orderedPrecomputedVectorHash(alloc, payload, mediaEmbeddingComputationRequest(runtime, request));
             }
         };
-        if (shared) |batch| {
+        const large_window_page = for (items.items) |item| {
+            if (item.input.large_window_capture) break true;
+        } else false;
+        if (if (large_window_page) null else shared) |batch| {
             const provider = dense.?;
             for (items.items) |*item| {
                 if (item.failed or item.carried != null or item.precomputed != null) continue;
@@ -33866,7 +33985,7 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
                 else => return err,
             };
         }
-        if (exhausted) break;
+        if (exhausted or large_window_page) break;
     }
     if (window_protocol_pending) {
         requestMediaWindowProtocol(runtime) catch |err| switch (err) {
@@ -51893,6 +52012,38 @@ test "model aware media ordered vector windows are searchable with exact clocks 
                 defer token.deinit();
                 try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedChunkGeneration(runtime, parent_request, &token, scope, &chunks, true));
             }
+            // First try a structurally valid fused command that silently
+            // drops receipt 1. The accepted proof cannot credit that set.
+            {
+                var partial = blk: {
+                    var read = try runtime.store.beginRead();
+                    defer read.abort();
+                    var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+                    defer plan.release();
+                    break :blk (try @import("../artifact_chunk_vector_publication.zig").capture(a, &read, vector_request, plan.plan(), member)).?;
+                };
+                defer partial.deinit();
+                partial.token.execution_identity = @splat(marker);
+                partial.token.execution_bound = true;
+                const child = try internal_keys.mediaWindowChildKeyAlloc(a, member, 0);
+                defer a.free(child);
+                const key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(a, child, "model");
+                defer a.free(key);
+                try partial.token.observePrecondition(key, null, null);
+                const vector = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, 0, &.{ 1, 0 });
+                defer a.free(vector);
+                const effects = [_]ordered_publication.Mutation{
+                    .{ .family = .derived_vector, .key = partial.output_key, .value = null, .source_index = 0 },
+                    .{ .family = .derived_vector, .key = key, .value = vector, .source_index = 0 },
+                };
+                const incomplete = try partial.token.command(&effects);
+                try std.testing.expectError(error.ArtifactPublicationPending, enqueueProducerEffects(runtime, &partial.token, &effects, null));
+                var read = try runtime.store.beginRead();
+                defer read.abort();
+                const rejected = (try ordered_publication.rejected(&read, incomplete)) orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(ordered_publication.Rejection.stale_source, rejected.reason);
+                try std.testing.expectError(error.NotFound, read.get(key));
+            }
             const published_parent = harness.calls;
             try std.testing.expectError(error.ArtifactPublicationPending, processOrderedChunkVectorWithAllocator(runtime, a, vector_request, provider, null, &.{"vectors"}));
             try std.testing.expectEqual(published_parent + 1, harness.calls);
@@ -52016,7 +52167,24 @@ test "model aware media ordered vector windows are searchable with exact clocks 
                 try std.testing.expectEqual(ordered_publication.Rejection.stale_source, rejected.reason);
                 _ = try read.get(phantom);
             }
+            {
+                const Deadline = struct {
+                    calls: usize = 0,
+                    fn check(raw: *const anyopaque) !void {
+                        const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+                        self.calls += 1;
+                        if (self.calls > 1) return error.DeadlineExceeded;
+                    }
+                };
+                var deadline: Deadline = .{};
+                const previous = runtime.active_provider_guard;
+                defer runtime.active_provider_guard = previous;
+                runtime.active_provider_guard.cancellation = .{ .ptr = &deadline, .check_fn = Deadline.check };
+                try std.testing.expectError(error.EnrichmentWaitTimeout, ensureMediaWindowOutputs(runtime, a, &final));
+                try std.testing.expect(runtime.media_window_capture.saved.?.resume_key.items.len != 0);
+            }
             try std.testing.expectError(error.ArtifactPublicationPending, enqueueScalarChunkVector(runtime, &final, vector, true));
+            try std.testing.expect(runtime.media_window_capture.saved == null);
             const retired = try storeGetOptionalAllocWithRetry(runtime, phantom);
             defer if (retired) |value| runtime.alloc.free(value);
             try std.testing.expect(retired == null);
