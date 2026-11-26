@@ -2992,7 +2992,7 @@ fn sharedKvPrefillBoundary(config: Config, dc: DecodeContext) ?usize {
 
 pub fn metalE2bSharedKvPrefillBoundary(config: Config, dc: DecodeContext) ?usize {
     // Shorter prompts exceeded the singleton suffix logit-error budget.
-    if (dc.attention_mode != .paged_prefill or dc.total_sequence_len < 512 or dc.attn_or_mask != null or
+    if (disableSharedKvDebug() or dc.attention_mode != .paged_prefill or dc.total_sequence_len < 512 or dc.attn_or_mask != null or
         dc.packed_query_lengths != null or !sharedKvPrefillContextEligible(dc)) return null;
     return config.metalE2bSharedKvPrefillDonorLayers();
 }
@@ -3047,9 +3047,14 @@ test "Metal E2B shared KV prefill requires exact text geometry and a long prompt
     };
     try std.testing.expectEqual(@as(?usize, 15), metalE2bSharedKvPrefillBoundary(config, dc));
     try std.testing.expectEqual(@as(?usize, null), sharedKvPrefillBoundary(config, dc));
-    dc.total_sequence_len = 511;
-    try std.testing.expectEqual(@as(?usize, null), metalE2bSharedKvPrefillBoundary(config, dc));
+    dc.query_sequence_len = 2;
+    for ([_]usize{ 511, 512, 513 }) |len| {
+        dc.total_sequence_len = len;
+        dc.kv_sequence_len = len;
+        try std.testing.expectEqual(@as(?usize, if (len < 512) null else 15), metalE2bSharedKvPrefillBoundary(config, dc));
+    }
     dc.total_sequence_len = 512;
+    dc.kv_sequence_len = 512;
     dc.attn_or_mask = &.{0};
     try std.testing.expectEqual(@as(?usize, null), metalE2bSharedKvPrefillBoundary(config, dc));
     dc.attn_or_mask = null;

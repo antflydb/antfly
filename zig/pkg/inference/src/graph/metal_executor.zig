@@ -2633,7 +2633,7 @@ fn runtimePrefill(
         const timing_before = runtime_ctx.cb.directFamilyTimingSnapshot();
         const direct_started_at = monotonicNowNs();
         const config = runtime_ctx.definition.configuration.value;
-        if (request.prepared_rows == null) {
+        if (request.prepared_rows == null and request.kv_only) {
             if (try decoder_gated_runtime.tryMetalE2bSharedKvPrefill(
                 &runtime_ctx.cb,
                 allocator,
@@ -2642,11 +2642,11 @@ fn runtimePrefill(
                 request.input_ids,
                 request.seq_len,
                 &decode_context,
-                if (request.kv_only) .kv_only else .last_logits,
-            )) |output| {
+                .kv_only,
+            ) != null) {
                 recordPrefillFamilyTiming(&runtime_ctx.cb, direct_started_at, timing_before, true);
                 runtime_ctx.noteDecoderRuntimeStateFromCurrentView();
-                return .{ .logits = output.last_logits };
+                return .{};
             }
         }
         if (request.prepared_rows) |rows| {
@@ -2678,7 +2678,11 @@ fn runtimePrefill(
             request.input_ids,
             request.seq_len,
             &decode_context,
-            .{ .prefer_greedy_token = request.prefer_greedy_token, .input_embeddings = if (request.prepared_rows) |rows| rows.tensor else null },
+            .{
+                .prefer_greedy_token = request.prefer_greedy_token,
+                .prefer_shared_kv_last_row = !request.kv_only,
+                .input_embeddings = if (request.prepared_rows) |rows| rows.tensor else null,
+            },
         );
         if (prepared_tail) |tail| {
             recordPrefillFamilyTiming(&runtime_ctx.cb, direct_started_at, timing_before, true);

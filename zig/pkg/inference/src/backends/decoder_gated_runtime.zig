@@ -6579,6 +6579,7 @@ pub const PrefillPreparedTail = struct {
 };
 
 pub const PrefillTailOptions = struct {
+    prefer_shared_kv_last_row: bool = false,
     prefer_greedy_token: bool = false,
     /// Borrowed scaled rows from the same prepared provider. Token IDs retain
     /// their PLE semantics; every later transformer/tail stage is shared.
@@ -6597,6 +6598,11 @@ pub fn forwardPrefillLastPreparedTail(
     decode_context: *const gpt_arch.DecodeContext,
     options: PrefillTailOptions,
 ) !?PrefillPreparedTail {
+    if (options.prefer_shared_kv_last_row and options.execution == .compatible and options.input_embeddings == null and
+        metalE2bSharedKvPrefillEligible(cb, gpt_config, input_ids, seq_len, decode_context))
+    {
+        if (try forwardPrefillPreparedTail(cb, allocator, gpt_config, configured_layer_count, input_ids, seq_len, decode_context, options, .shared_last)) |tail| return tail;
+    }
     return forwardPrefillPreparedTail(cb, allocator, gpt_config, configured_layer_count, input_ids, seq_len, decode_context, options, .all);
 }
 
@@ -7255,9 +7261,10 @@ pub fn metalE2bSharedKvPrefillEligible(
     seq_len: usize,
     context: *const gpt_arch.DecodeContext,
 ) bool {
+    // The singleton suffix requires checkpoint-logit qualification near the cutoff.
     if (cb.kind() != .metal or
         !platform.env.getenvBoolDefault("ANTFLY_INFERENCE_METAL_SHARED_KV_PREFILL", true) or
-        !platform.env.getenvBoolDefault("ANTFLY_INFERENCE_METAL_E2B_SHARED_KV_LAST_ROW", true) or
+        !platform.env.getenvBoolDefault("ANTFLY_INFERENCE_METAL_E2B_SHARED_KV_LAST_ROW", false) or
         gpt_arch.metalE2bSharedKvPrefillBoundary(config, context.*) == null or
         context.query_sequence_len != input_ids.len or context.total_sequence_len != seq_len or
         gatedFamilyCompareRequested() or gatedFamilyDumpLayer() != null)
