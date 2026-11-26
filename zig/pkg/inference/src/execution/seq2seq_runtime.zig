@@ -55,15 +55,15 @@ pub fn qualifiedSignature(inputs: []const backends.TensorInfo, outputs: []const 
             if (info.dtype != .bool_ or info.shape.len > 1 or (info.shape.len == 1 and info.shape[0] != 1)) return false;
             branch = true;
         } else if (kv.pastInputSuffix(info.name)) |suffix| {
-            if (!kv.validCacheSuffix(suffix) or info.dtype != .f32 or info.shape.len != 4 or info.shape[0] == 0 or info.shape[0] > 1 or info.shape[1] <= 0 or info.shape[2] >= 0 or info.shape[3] <= 0) return false;
+            const role = kv.cacheRole(suffix) orelse return false;
+            if (info.dtype != .f32 or info.shape.len != 4 or info.shape[0] == 0 or info.shape[0] > 1 or info.shape[1] <= 0 or info.shape[2] >= 0 or info.shape[3] <= 0) return false;
             const present = for (outputs) |output| {
                 if (kv.presentNameMatchesPastInput(info.name, output.name)) break output;
             } else return false;
             if (present.shape.len != 4 or
                 (present.shape[1] >= 0 and present.shape[1] != info.shape[1]) or
                 (present.shape[3] >= 0 and present.shape[3] != info.shape[3])) return false;
-            const cross = kv.isCrossCacheSuffix(suffix);
-            if (!cross and present.shape[2] >= 0) return false;
+            if (role == .self_attention and present.shape[2] >= 0) return false;
             past_count += 1;
         } else return false;
     }
@@ -76,7 +76,7 @@ pub fn qualifiedSignature(inputs: []const backends.TensorInfo, outputs: []const 
                 info.shape[1] >= 0 or (info.shape[2] >= 0 and info.shape[2] != vocab)) return false;
             logits = true;
         } else if (kv.presentOutputSuffix(info.name)) |suffix| {
-            if (!kv.validCacheSuffix(suffix) or info.dtype != .f32 or info.shape.len != 4 or info.shape[0] == 0 or info.shape[0] > 1) return false;
+            if (kv.cacheRole(suffix) == null or info.dtype != .f32 or info.shape.len != 4 or info.shape[0] == 0 or info.shape[0] > 1) return false;
             present_count += 1;
         } else return false;
     }
@@ -87,7 +87,8 @@ fn cacheBound(session: backends.Session, batch: usize, tokens: usize, context: u
     var total: usize = 0;
     for (session.inputInfo()) |info| {
         const suffix = kv.pastInputSuffix(info.name) orelse continue;
-        const time = if (kv.isCrossCacheSuffix(suffix)) context else tokens;
+        const role = kv.cacheRole(suffix) orelse return error.UnresolvedOutputGeometry;
+        const time = if (role == .cross_attention) context else tokens;
         const rows = try std.math.mul(usize, batch, time);
         const features = try std.math.mul(usize, @intCast(info.shape[1]), @intCast(info.shape[3]));
         const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, features), info.dtype.byteSize());
@@ -166,13 +167,14 @@ pub const State = struct {
         @memset(past_indices, std.math.maxInt(usize));
         for (input_info, roles, 0..) |info, *role, input_index| {
             role.* = if (kv.pastInputSuffix(info.name)) |suffix| cache: {
+                const cache_role = kv.cacheRole(suffix) orelse unreachable;
                 for (output_info, 0..) |output, index| {
                     if (kv.presentNameMatchesPastInput(info.name, output.name)) {
                         past_indices[index] = input_index;
                         break :cache .{ .past = .{
                             .output_index = index,
                             .empty_shape = .{ 1, info.shape[1], 0, info.shape[3] },
-                            .cross = kv.isCrossCacheSuffix(suffix),
+                            .cross = cache_role == .cross_attention,
                         } };
                     }
                 }

@@ -42,8 +42,7 @@ const ResidentBatch = struct {
 
     fn omittedCrossCache(session: session_mod.Session, name: []const u8, shape: []const i64, total: usize) bool {
         if (session.cached_decoder_geometry == null or shape.len != 4) return false;
-        const suffix = onnx_cache.presentOutputSuffix(name) orelse return false;
-        if (!onnx_cache.isCrossCacheSuffix(suffix)) return false;
+        if (onnx_cache.presentOutputRole(name) != .cross_attention) return false;
         if (shape[0] != 0 and shape[0] != total) return false;
         var empty = false;
         for (shape) |dim| {
@@ -1160,7 +1159,7 @@ fn executeGroupMode(comptime placement: OutputPlacement, items: []const micro.Ex
     if (outputs.len == 0 or outputs.len != first.session.outputInfo().len) return error.InvalidFusedOutputShape;
     for (outputs, first.session.outputInfo()) |tensor, info| {
         const empty_cross_cache = first.session.cached_decoder_geometry != null and
-            onnx_cache.isCrossCacheSuffix(onnx_cache.presentOutputSuffix(tensor.name) orelse "") and
+            onnx_cache.presentOutputRole(tensor.name) == .cross_attention and
             tensor.data.len == 0 and tensor.shape.len == 4 and tensor.shape[0] == 0;
         if (!validTensor(tensor) or tensor.dtype != info.dtype or tensor.shape.len == 0 or (tensor.shape[0] != rows and !empty_cross_cache)) return error.InvalidFusedOutputShape;
         // Native multi-entry sessions qualify concrete stages independently

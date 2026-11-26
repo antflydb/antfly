@@ -54,14 +54,6 @@ fn parseRole(suffix: []const u8, compact_self: bool) ?CacheRole {
     return role;
 }
 
-pub fn validCacheSuffix(suffix: []const u8) bool {
-    return cacheRole(suffix) != null;
-}
-
-pub fn isCrossCacheSuffix(suffix: []const u8) bool {
-    return cacheRole(suffix) == .cross_attention;
-}
-
 /// Decoder-only artifacts also publish the compact `present.<layer>.key` form.
 pub fn presentOutputRole(name: []const u8) ?CacheRole {
     return parseRole(presentOutputSuffix(name) orelse return null, true);
@@ -72,13 +64,10 @@ test "ONNX cache roles use the same suffix for past and present" {
     try std.testing.expect(!presentNameMatchesPastInput("past_key_values.2.encoder.key", "present.2.decoder.key"));
     const encoder = presentOutputSuffix("present.2.encoder.key").?;
     const decoder = pastInputSuffix("past_key_values.2.decoder.value").?;
-    try std.testing.expect(validCacheSuffix(encoder) and isCrossCacheSuffix(encoder));
-    try std.testing.expect(validCacheSuffix(decoder) and !isCrossCacheSuffix(decoder));
-    for ([_][]const u8{ "2.encoder.key.extra", "decoder.encoder.value", "2.decoder.encoder.key" }) |malformed| {
-        try std.testing.expect(!validCacheSuffix(malformed));
-        try std.testing.expect(!isCrossCacheSuffix(malformed));
-    }
-    try std.testing.expect(!validCacheSuffix("2.key"));
+    try std.testing.expectEqual(CacheRole.cross_attention, cacheRole(encoder).?);
+    try std.testing.expectEqual(CacheRole.self_attention, cacheRole(decoder).?);
+    for ([_][]const u8{ "2.encoder.key.extra", "decoder.encoder.value", "2.decoder.encoder.key", "2.key" }) |malformed|
+        try std.testing.expect(cacheRole(malformed) == null);
     try std.testing.expectEqual(CacheRole.self_attention, presentOutputRole("present.2.key").?);
     try std.testing.expect(presentOutputSuffix("logits") == null);
 }
