@@ -574,10 +574,7 @@ pub const Request = struct {
 
     pub fn stepGreedy(self: *Request, token: u32) !u32 {
         try self.run(&self.decode, .{ .token = token }, .greedy);
-        var next: u32 = 0;
-        if (metal.termite_metal_decode_runtime_read_token_id(self.model.runtime, &next) != 0)
-            return error.MetalKernelDispatchFailed;
-        return next;
+        return metal.readDecoderTokenId(self.model.runtime) orelse error.MetalKernelDispatchFailed;
     }
 };
 
@@ -1011,6 +1008,8 @@ test "Inkling Metal resident decoder executes the full visit schedule on a synth
     try std.testing.expectEqual(.decode_step, measured.operation);
     try std.testing.expectEqual(.success, measured.outcome);
     try std.testing.expect(measured.runtime.submission.?.metal_encoded_dispatches.? > 0);
+    try std.testing.expectEqual(@as(u64, 1), measured.runtime.transfers.?.download_calls);
+    try std.testing.expectEqual(@as(u64, @sizeOf(u32)), measured.runtime.transfers.?.download_bytes);
     try std.testing.expectEqual(.unavailable, measured.context_runtime_scope);
     try std.testing.expectEqual(weights_before, model.residentBytes());
 }

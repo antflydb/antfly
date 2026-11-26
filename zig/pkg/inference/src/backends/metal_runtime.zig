@@ -6265,9 +6265,16 @@ pub fn decoderRuntimeApplyAttentionOutputResidualDevice(self: anytype, request: 
 
 pub fn decoderRuntimeReadTokenId(self: anytype) !?usize {
     const runtime = self.raw_decode_runtime orelse return null;
+    return readDecoderTokenId(runtime);
+}
+
+/// Read the one published token from shared storage after the caller has
+/// finished the frame. Count the wrapper's logical read, not a DMA transfer.
+pub fn readDecoderTokenId(runtime: *RawMetalDecodeRuntime) ?u32 {
     var token_id: u32 = 0;
     const rc = termite_metal_decode_runtime_read_token_id(runtime, &token_id);
     if (rc != 0) return null;
+    @import("../execution/transfer_audit.zig").download(@sizeOf(u32));
     return token_id;
 }
 
