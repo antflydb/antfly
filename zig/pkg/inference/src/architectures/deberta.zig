@@ -603,11 +603,9 @@ pub fn forwardCtProfiled(
     if (cb.kind() == .metal and config.metal_require_f32_weight_mirrors and !resident_slots)
         return error.RequiredDebertaF32MirrorsUnavailable;
 
-    var encoder_frame_active = false;
-    if (cb.kind() == .metal and metalEncoderFrameEnabled() and !cb.decoderRuntimeHasActiveFrame()) {
-        encoder_frame_active = try cb.decoderRuntimeBeginFrame();
-    }
-    errdefer if (encoder_frame_active) cb.decoderRuntimeCancelFrame() catch {};
+    const Submission = @import("../execution/submission.zig").Scope;
+    var frame = try Submission.beginIfNeeded(cb, cb.kind() == .metal and metalEncoderFrameEnabled());
+    errdefer frame.deinit();
 
     var timer = profileStart(profile);
     var hidden = try embeddings(cb, allocator, config, input_ids, attention_mask, total, H);
@@ -629,21 +627,17 @@ pub fn forwardCtProfiled(
         hidden = new_hidden;
         if (profile) |p| p.layer_total_ns += profileElapsed(timer);
         pending_work += layer_work;
-        if (cb.execution_control != null and encoder_frame_active and
+        if (cb.execution_control != null and frame.owns and
             pending_work >= cancellation_frame_work and layer + 1 < config.num_hidden_layers)
         {
             pending_work = 0;
-            try cb.decoderRuntimeSubmitAndWaitFrame();
-            encoder_frame_active = false;
+            try frame.finish();
             try cb.checkExecutionControl();
-            encoder_frame_active = try cb.decoderRuntimeBeginFrame();
+            frame = try Submission.begin(cb);
         }
     }
     // No post-encoder LayerNorm in DeBERTa-v3 (encoder.LayerNorm is norm_rel_ebd).
-    if (encoder_frame_active) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        encoder_frame_active = false;
-    }
+    try frame.finish();
     try cb.checkExecutionControl();
     return hidden;
 }

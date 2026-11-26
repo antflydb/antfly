@@ -286,13 +286,11 @@ fn forwardCTImpl(
     const resident_slots = try preplanMetalEncoder(cb, allocator, config);
     if (embedding_normalize != null and !resident_slots) return null;
     phase_started_at = traceMetalEncoderPhase("preplan", phase_started_at);
-    var frame_active = false;
-    if (resident_slots and cb.kind() == .metal and metalEncoderFrameEnabled() and !cb.decoderRuntimeHasActiveFrame()) {
-        frame_active = try cb.decoderRuntimeBeginFrame();
-    }
-    if (embedding_normalize != null and !frame_active) return null;
+    const Submission = @import("../execution/submission.zig").Scope;
+    var frame = try Submission.beginIfNeeded(cb, resident_slots and cb.kind() == .metal and metalEncoderFrameEnabled());
+    errdefer frame.deinit();
+    if (embedding_normalize != null and !frame.owns) return null;
     phase_started_at = traceMetalEncoderPhase("begin_frame", phase_started_at);
-    errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
     var hidden = try embeddings(cb, allocator, config, input_ids, token_type_ids, total);
     phase_started_at = traceMetalEncoderPhase("embeddings", phase_started_at);
     errdefer cb.free(hidden);
@@ -301,13 +299,12 @@ fn forwardCTImpl(
         const next = try encoderLayer(cb, config, hidden, attention_mask, batch, seq_len, layer, resident_slots);
         cb.free(hidden);
         hidden = next;
-        if (cb.execution_control != null and frame_active and
+        if (cb.execution_control != null and frame.owns and
             (layer + 1) % 2 == 0 and layer + 1 < config.num_hidden_layers)
         {
-            try cb.decoderRuntimeSubmitAndWaitFrame();
-            frame_active = false;
+            try frame.finish();
             try cb.checkExecutionControl();
-            frame_active = try cb.decoderRuntimeBeginFrame();
+            frame = try Submission.begin(cb);
         }
     }
     phase_started_at = traceMetalEncoderPhase("layers", phase_started_at);
@@ -326,10 +323,7 @@ fn forwardCTImpl(
         phase_started_at = traceMetalEncoderPhase("pool_normalize", phase_started_at);
     }
 
-    if (frame_active) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        frame_active = false;
-    }
+    try frame.finish();
     try cb.checkExecutionControl();
     _ = traceMetalEncoderPhase("submit_wait", phase_started_at);
     return hidden;
