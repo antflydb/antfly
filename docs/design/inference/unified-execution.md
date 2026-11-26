@@ -1206,6 +1206,13 @@ A separate seven-test CPU cohort passed for pending submission, readback,
 retirement and observation. These use fixture models and do not establish
 released-model or GPU coverage.
 
+At `71377082a5`, the M4 Max retirement cohort passed 128 of 142
+selected tests. The physical KV reservation followed actual Metal buffer
+aliases until the SDK retired their backing. The 14 skips comprise
+12 CUDA fixtures, the released T5-small fixture and the opt-in Metal
+pipelined-runtime fixture. This run covers local retirement and quota
+lifetimes. Cross-provider and released-model qualification remain open.
+
 At `552aba3e45`, the focused Spark GB10 cohort passed all 15 capture and
 workspace tests with zero skips. The physical tests covered immutable
 integer gather, F32 vendor GEMM capture, held outputs across eviction,
