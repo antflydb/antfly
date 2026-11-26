@@ -1014,6 +1014,14 @@ short prompt still has 28 tokens and the long text prompt now matches
 the reference at 6,396 tokens. The earlier HTTP timings retain their
 original measured token counts.
 
+Metal now reuses attention reduction storage across query tiles when the
+combined memory budget would otherwise shrink the projection batch. With
+24 query heads and 64 key splits, a 256-row batch can use about 25.6 MB
+of reduction storage with 32-row query tiles instead of about 204.5 MB.
+The physical Metal suite passed 83 tests, including bitwise parity for
+tiled and untiled output. The released-checkpoint test was deferred while
+the full-window HTTP scan held the resident model.
+
 ### Official Gemma 4 E2B QAT serving comparison
 
 The decoder and projector came from Google's E2B QAT Q4_0 GGUF revision
