@@ -53660,8 +53660,12 @@ test "Metal paged relative attention reads convolved KV written directly in the 
         .clip = 1,
         .epsilon = 0.000001,
     };
+    var counters = @import("../execution/runtime_observation.zig").Scope.init();
+    defer counters.deinit();
     try CausalPagedRelativeBf16.encode(runtime, &append, .sliding, attention.query, operands, .{ .key = &tensors[1], .value = &tensors[2] }, key, value_operand, stencil, &tensors[7], &tensors[8]);
     try CausalPagedRelativeBf16.encode(runtime, &append, .sliding, attention.query, operands, .{ .key = &packed_key, .value = &packed_value, .format = .q4_head128 }, key, value_operand, stencil, &tensors[7], &packed_output);
+    // Each format writes two KV planes and dispatches one fused attention.
+    try std.testing.expectEqual(@as(?u64, 6), counters.snapshot().metal_encoded_dispatches);
     try std.testing.expectEqual(@as(usize, 3), sequence.committed_tokens);
     try submitFrame(runtime);
     try waitFrame(runtime);

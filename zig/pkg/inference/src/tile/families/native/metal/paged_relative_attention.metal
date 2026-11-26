@@ -33,7 +33,18 @@ inline float4 antfly_relative_kv_head(device const ushort *storage, ulong head, 
     return float4(float(values[0]), float(values[32]), float(values[64]), float(values[96]));
 }
 
-template <bool compressed, uint heads, uint rows = 1>
+inline void antfly_store_relative_attention(
+    device const bfloat *gates, device bfloat *output,
+    ulong row_head, uint lane, float4 numerator, float denominator
+) {
+    const ulong base = row_head * 128u + lane;
+    for (uint i = 0; i < 4; ++i) {
+        const ulong index = base + i * 32u;
+        output[index] = bfloat((numerator[i] / denominator) / (1.0f + exp(-float(gates[index]))));
+    }
+}
+
+template <bool compressed, uint heads, uint rows = 1, bool direct = false>
 inline void antfly_paged_relative_gqa_d128_partial(
     device const bfloat *query,
     device const ushort *keys,
@@ -43,7 +54,10 @@ inline void antfly_paged_relative_gqa_d128_partial(
     device float *partials,
     constant PagedRelativeGqaParams &p,
     uint2 group,
-    uint lane
+    uint lane,
+    device const bfloat *sinks = nullptr,
+    device const bfloat *gates = nullptr,
+    device bfloat *output = nullptr
 ) {
     const uint groups_per_row = p.q_heads / heads;
     const uint row_head = rows == 1u ? group.x * heads :
@@ -122,7 +136,21 @@ inline void antfly_paged_relative_gqa_d128_partial(
     #pragma unroll
     for (uint h = 0u; h < heads * rows; ++h) {
         if (h / heads >= active_rows) continue;
-        const ulong dst = (ulong(row_head + (h / heads) * p.q_heads + h % heads) * p.splits + group.y) * 130u;
+        const ulong output_head = ulong(row_head + (h / heads) * p.q_heads + h % heads);
+        if (direct) {
+            const float sink = float(sinks[output_head]);
+            const float final_max = max(sink, maximum[h]);
+            float final_denominator = exp(sink - final_max);
+            float4 final_numerator = 0.0f;
+            if (denominator[h] != 0.0f) {
+                const float weight = exp(maximum[h] - final_max);
+                final_denominator = fma(weight, denominator[h], final_denominator);
+                final_numerator = fma(float4(weight), numerator[h], final_numerator);
+            }
+            antfly_store_relative_attention(gates, output, output_head, lane, final_numerator, final_denominator);
+            continue;
+        }
+        const ulong dst = (output_head * p.splits + group.y) * 130u;
         for (uint i = 0u; i < 4u; ++i) partials[dst + i * 32u + lane] = numerator[h][i];
         if (lane == 0u) {
             partials[dst + 128u] = maximum[h];
@@ -170,11 +198,7 @@ kernel void antfly_paged_relative_gqa_d128_bf16_reduce(
         for (uint i = 0; i < 4; ++i)
             numerator[i] = fma(weight, partials[src + i * 32u + lane], numerator[i]);
     }
-    const ulong base = ulong(row_head) * 128u + lane;
-    for (uint i = 0; i < 4; ++i) {
-        const ulong index = base + i * 32u;
-        output[index] = bfloat((numerator[i] / denominator) / (1.0f + exp(-float(gates[index]))));
-    }
+    antfly_store_relative_attention(gates, output, row_head, lane, numerator, denominator);
 }
 
 // native-program:entry antfly_paged_relative_gqa_d128_q4_partial
@@ -250,4 +274,25 @@ kernel void antfly_paged_relative_gqa_d128_q4_partial_reuse3_rows2(
     uint lane [[thread_index_in_simdgroup]]
 ) {
     antfly_paged_relative_gqa_d128_partial<true, 3, 2>(query, keys, values, relative, page_ids, partials, p, group, lane);
+}
+
+
+// native-program:entry antfly_paged_relative_gqa_d128_direct
+kernel void antfly_paged_relative_gqa_d128_direct(
+    device const bfloat *query [[buffer(0)]],
+    device const ushort *keys [[buffer(1)]],
+    device const ushort *values [[buffer(2)]],
+    device const bfloat *relative [[buffer(3)]],
+    device const uint *page_ids [[buffer(4)]],
+    device const bfloat *sinks [[buffer(5)]],
+    device const bfloat *gates [[buffer(6)]],
+    device bfloat *output [[buffer(7)]],
+    constant PagedRelativeGqaParams &p [[buffer(8)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    if (p.q4)
+        antfly_paged_relative_gqa_d128_partial<true, 1, 1, true>(query, keys, values, relative, page_ids, nullptr, p, group, lane, sinks, gates, output);
+    else
+        antfly_paged_relative_gqa_d128_partial<false, 1, 1, true>(query, keys, values, relative, page_ids, nullptr, p, group, lane, sinks, gates, output);
 }
