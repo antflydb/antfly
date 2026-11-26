@@ -5572,13 +5572,11 @@ fn assetProviderRequestContext(runtime: *EnrichmentRuntime) inference_request_co
         runtime.config.cancellation;
     // Inference RequestContext still consumes native monotonic deadlines,
     // even when its I/O and this runtime borrow another executor clock.
-    const native_now = platform_time.monotonicNs();
-    const runtime_now = runtime.deadline_clock.nowRealtimeNs();
-    const deadline = guard.deadline_ns orelse
-        runtime_now +| @max(runtime.config.sync_wait_timeout_ms, 1) *| std.time.ns_per_ms;
+    const deadline = guard.nativeDeadlineNs(null) orelse
+        platform_time.monotonicNs() +| @max(runtime.config.sync_wait_timeout_ms, 1) *| std.time.ns_per_ms;
     return .{
         .io = concurrencyIo(runtime),
-        .deadline_ns = native_now +| (deadline -| runtime_now),
+        .deadline_ns = deadline,
         .cancellation = if (cancellation.ptr != null) cancellation else null,
         .progress = .{ .ptr = runtime, .update_fn = noteInferenceProgress },
     };
@@ -51469,12 +51467,12 @@ fn verifyDenseMediaAcknowledgementDrain() !void {
     lane.* = .{ .runtime = &runtime, .plain_dense = &.{}, .chunked_dense = owned, .chunk_cache = &lane.chunk_cache_storage, .window = .{ .alloc = a }, .applied_sequence = 0, .group = null };
 
     const Lock = struct {
-        fn begin(_: Allocator, _: *anyopaque) anyerror!backend_erased.WriteTxn {
+        fn begin(_: Allocator, _: *anyopaque, _: @import("../../backend_types.zig").BatchOptions) anyerror!backend_erased.Batch {
             return error.WriterLocked;
         }
     };
     var failing = runtime.store.vtable.*;
-    failing.begin_write = Lock.begin;
+    failing.begin_batch_with_options = Lock.begin;
     runtime.store.vtable = &failing;
     const future = std.testing.io.concurrent(DenseExecutionLane.finishPublishedQuantum, .{lane}) catch |err| {
         lane.deinitOwned();
@@ -51672,7 +51670,7 @@ test "model aware media URL fields fetch bounded binary input and preserve plain
     defer sibling.deinit(a);
     try std.testing.expect(source.input.?.binary.data.ptr == sibling.input.?.binary.data.ptr);
     try std.testing.expectEqual(@as(usize, 1), app.calls.load(.monotonic));
-    try std.testing.expectError(error.Timeout, extractModelChunkSource(a, config, raw, request, .{ .io = std.testing.io, .deadline_ns = 0 }));
+    try std.testing.expectError(error.EnrichmentWaitTimeout, extractModelChunkSource(a, config, raw, request, .{ .io = std.testing.io, .deadline_ns = 0 }));
     {
         const metadata: @import("inference_chunker").types.ModelMetadata = .{
             .descriptor = .{ .ordinal = 0, .coordinates = .{ .kind = .video, .start_ns = 0, .end_ns = 100 }, .input_tokens = 1 },
