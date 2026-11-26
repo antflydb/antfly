@@ -2515,7 +2515,7 @@ fn runtimePrefill(
     if (decoderRuntimePrefillTraceRequested()) {
         std.debug.print("prefill-trace: runtimePrefill qlen={d} seq={d} ready={}\n", .{ request.query_seq_len, request.seq_len, decoder_runtime_ready });
     }
-    if (decoder_runtime_ready and request.query_seq_len == 1) {
+    if (decoder_runtime_ready and request.want_last_logits and request.query_seq_len == 1) {
         try request.check();
         const token_id = request.input_ids[request.input_ids.len - 1];
         const direct_started_at = monotonicNowNs();
@@ -2527,6 +2527,20 @@ fn runtimePrefill(
     }
     if (decoder_runtime_ready) {
         try request.check();
+        if (try @import("../backends/decoder_gated_runtime.zig").tryE2bSharedKvPrefill(
+            &runtime_ctx.cb,
+            allocator,
+            runtime_ctx.gpt_config,
+            runtime_ctx.decoderRuntimeConfiguredLayerCount(),
+            request.input_ids,
+            request.seq_len,
+            &decode_context,
+            request.want_last_logits,
+        )) |output| {
+            runtime_ctx.noteDecoderRuntimeStateFromCurrentView();
+            if (!request.want_last_logits) return .{};
+            return .{ .logits = output.last_logits orelse return error.InvalidModelOutput };
+        }
         if (decoderRuntimePrefillTraceRequested()) {
             std.debug.print("prefill-trace: runtimePrefill entering direct family path\n", .{});
         }
@@ -2541,7 +2555,7 @@ fn runtimePrefill(
             request.input_ids,
             request.seq_len,
             &decode_context,
-            request.prefer_greedy_token,
+            request.want_last_logits and request.prefer_greedy_token,
         )) |tail| {
             const timing_after = runtime_ctx.cb.directFamilyTimingSnapshot();
             const delta = timing_after.delta(timing_before);
@@ -2785,22 +2799,12 @@ fn runtimeDecodeGreedy(
     if (try runtime_ctx.forwardDecoderRuntimeLastLogits(allocator, request.token_id, step.seq_len, &step.decode_context)) |output| {
         var owned_output = output;
         defer owned_output.deinit(allocator);
-        if (owned_output.device_logits) |device_logits| {
-            const backend = owned_output.device_logits_backend orelse return error.InvalidModelOutput;
-            if (try backend.argmaxLastRow(device_logits, 1, runtime_ctx.gpt_config.vocab_size)) |token_id| {
-                try runtime_ctx.seedGreedyDeviceToken(@intCast(token_id));
-                timing_stats.decode_greedy_direct_nanos += @intCast(monotonicNowNs() - direct_started_at);
-                return .{ .token_id = @intCast(token_id) };
-            }
-        }
-        const logits = try owned_output.hostLogits(allocator);
-        var best_idx: usize = 0;
-        for (logits[1..], 1..) |value, idx| {
-            if (value > logits[best_idx]) best_idx = idx;
-        }
-        try runtime_ctx.seedGreedyDeviceToken(@intCast(best_idx));
+        const model = runtime_ctx.gpt_config;
+        const suppressed = if (model.isGemma4E2bDenseLayout()) model.suppressTokenIds() else &.{};
+        const token = try owned_output.greedyTokenSuppress(allocator, model.vocab_size, suppressed);
+        try runtime_ctx.seedGreedyDeviceToken(token);
         timing_stats.decode_greedy_direct_nanos += @intCast(monotonicNowNs() - direct_started_at);
-        return .{ .token_id = @intCast(best_idx) };
+        return .{ .token_id = token };
     }
     timing_stats.decode_greedy_direct_nanos += @intCast(monotonicNowNs() - direct_started_at);
 
@@ -2820,6 +2824,13 @@ fn runtimeDecodeGreedy(
     return .{
         .token_id = @intCast(token_id),
     };
+}
+
+test "metal executor honors E2B token suppression on the greedy logits fallback" {
+    const a = std.testing.allocator;
+    var output = model_runtime.ModelOutput{ .logits = try a.dupe(f32, &.{ 0, 9, 8 }) };
+    defer output.deinit(a);
+    try std.testing.expectEqual(@as(i64, 2), try output.greedyTokenSuppress(a, 3, &.{ 1, -1, 99 }));
 }
 
 fn forwardLastLogits(

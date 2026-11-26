@@ -7599,6 +7599,11 @@ pub const NativeGenerationPipeline = struct {
         };
     }
 
+    fn selectCompiledPrefillGreedyToken(self: *const NativeGenerationPipeline, output: *graph_mod.model_runtime.ModelOutput) !usize {
+        const token = try output.greedyTokenSuppress(self.allocator, self.gpt_config.vocab_size, self.gpt_config.suppressTokenIds());
+        return std.math.cast(usize, token) orelse error.InvalidModelOutput;
+    }
+
     /// Run the prefill phase: process prompt tokens through the model,
     /// either chunked (for paged KV) or in one pass. Returns the logits
     /// for the last prompt position, or null if handled by the scheduler.
@@ -7661,7 +7666,10 @@ pub const NativeGenerationPipeline = struct {
             capture_last_hidden,
         );
         const can_use_typed_prefill_outputs = self.graph_cache == null and self.compiled_partition_backend == null;
+        // A cache hit attaches existing pages to a new sequence. The Metal
+        // donor frame needs to own the prefix it consumes.
         const allow_shared_kv_prefill = can_use_typed_prefill_outputs and
+            (self.cb.kind() != .metal or prefilled_tokens == 0) and
             self.checkpoint_prepare == null and self.checkpoint_resume == null and
             !capture_last_hidden and config.kv_cache_mode == .exact_hybrid;
         // Admission already covers prompt + output KV. Reserve the prompt and
@@ -7764,6 +7772,7 @@ pub const NativeGenerationPipeline = struct {
                     1,
                     total_chunk_end,
                     &decode_context,
+                    is_last_chunk,
                 ) catch |err| {
                     debugGenerationStage(
                         "executePrefill whole-model chunk failed chunk_start={d} chunk_end={d} err={s}",
@@ -7781,15 +7790,14 @@ pub const NativeGenerationPipeline = struct {
                 if (is_last_chunk and allow_resident_greedy_token and
                     isPureGreedyConfig(config) and config.grammar == null)
                 {
-                    const token = try output.greedyToken(allocator, self.gpt_config.vocab_size);
-                    if (token < 0) return error.InvalidModelOutput;
+                    const token = try self.selectCompiledPrefillGreedyToken(&output);
                     if (self.scheduler) |scheduler| {
                         if (self.scheduler_lease) |lease| {
                             scheduler.notePrefillProgress(lease, total_chunk_end, seq_len);
                             scheduler.finishTurn(lease, .prefill);
                         }
                     }
-                    return .{ .greedy_token = @intCast(token) };
+                    return .{ .greedy_token = token };
                 } else if (is_last_chunk) {
                     prefill_last_logits = try output.takeHostLogits(allocator);
                 }
@@ -8000,11 +8008,19 @@ pub const NativeGenerationPipeline = struct {
                     try gpt_arch.tryCudaSharedKvPrefill(&self.cb, allocator, self.gpt_config, chunk, total_chunk_end, &decode_context, output_intent != .kv_only)
                 else
                     null;
-                const metal_prepared: ?PrefillOutput = if (shared_prefill == null and processed == 0 and total_chunk_end == seq_len and use_metal_prefill_greedy_token)
+                const e2b_shared = if (allow_shared_kv_prefill and
+                    (output_intent == .kv_only or output_intent == .last_logits))
+                    self.tryMetalE2bSharedKvPrefill(chunk, total_chunk_end, &decode_context, output_intent == .last_logits) catch |err| {
+                        if (try retryDirectPrefillAfterMemoryBudgetExceeded(&decode_runtime, chunk.len, chunk_size, &current_chunk_size, admitted_plan == null, err)) continue;
+                        return err;
+                    }
+                else
+                    null;
+                const metal_prepared: ?PrefillOutput = if (shared_prefill == null and e2b_shared == null and processed == 0 and total_chunk_end == seq_len and use_metal_prefill_greedy_token)
                     try self.tryMetalPreparedTailPrefillGreedy(chunk, total_chunk_end, &decode_context, capture_last_hidden)
                 else
                     null;
-                if (shared_prefill) |prepared| {
+                if (e2b_shared orelse shared_prefill) |prepared| {
                     prefill_last_logits = prepared.last_logits;
                     debugGenerationStage("executePrefill shared_kv_pruned rows={d} output={s}", .{ chunk.len, @tagName(output_intent) });
                 } else if (metal_prepared) |prepared| {
@@ -10430,6 +10446,45 @@ pub const NativeGenerationPipeline = struct {
             .pre_norm_hidden = hidden_result.pre_norm_hidden,
             .rows = hidden_result.total_rows,
         };
+    }
+
+    fn tryMetalE2bSharedKvPrefill(
+        self: *NativeGenerationPipeline,
+        ids: []const i64,
+        seq_len: usize,
+        context: *const gpt_arch.DecodeContext,
+        want_last_logits: bool,
+    ) !?gpt_arch.SharedKvPrefillResult {
+        if (self.cb.kind() != .metal or !self.gpt_config.isGemma4E2bDenseLayout() or
+            !platform.env.getenvBoolDefault("ANTFLY_INFERENCE_METAL_E2B_SHARED_KV_LAST_ROW", true) or
+            context.total_sequence_len < 512)
+            return null;
+
+        const Attempt = struct {
+            pipeline: *NativeGenerationPipeline,
+            ids: []const i64,
+            seq_len: usize,
+            context: *const gpt_arch.DecodeContext,
+            want_last_logits: bool,
+            output: ?gpt_arch.SharedKvPrefillResult = null,
+
+            fn run(raw: *anyopaque) !bool {
+                const self_: *@This() = @ptrCast(@alignCast(raw));
+                const pipeline = self_.pipeline;
+                const layers = pipeline.gpt_config.num_hidden_layers;
+                const ready = try pipeline.cb.decoderRuntimePrepareOrReuseFamily(pipeline.allocator, pipeline.gpt_config, self_.context.kv_sequence_len, layers);
+                if (!ready.prepared) return false;
+                self_.output = try decoder_gated_runtime.tryE2bSharedKvPrefill(&pipeline.cb, pipeline.allocator, pipeline.gpt_config, layers, self_.ids, self_.seq_len, self_.context, self_.want_last_logits);
+                return self_.output != null;
+            }
+        };
+
+        var attempt = Attempt{ .pipeline = self, .ids = ids, .seq_len = seq_len, .context = context, .want_last_logits = want_last_logits };
+        errdefer if (attempt.output) |output| {
+            if (output.last_logits) |logits| self.allocator.free(logits);
+        };
+        if (!try runWithDecoderRuntimeResetBoundary(&self.cb, @ptrCast(&attempt), Attempt.run)) return null;
+        return attempt.output;
     }
 
     fn tryMetalGemmaFinalHiddenFrame(
@@ -14420,9 +14475,9 @@ pub const NativeGenerationPipeline = struct {
             if (work.allow_shared_kv_prefill and !work.wants_last_logits) {
                 var decode_runtime = BorrowedDecodeStateRuntime.init(work.decode_state);
                 const context = decode_runtime.makeDecodeContext(work.seq_len, work.query_seq_len);
-                if (try gpt_arch.tryCudaSharedKvPrefill(&self.cb, self.allocator, self.gpt_config, work.token_ids, work.seq_len, &context, false)) |_| {
+                if (try self.tryMetalE2bSharedKvPrefill(work.token_ids, work.seq_len, &context, false) != null or
+                    try gpt_arch.tryCudaSharedKvPrefill(&self.cb, self.allocator, self.gpt_config, work.token_ids, work.seq_len, &context, false) != null)
                     return .{ .logits = null, .max_query_seq_len = max_query_seq_len };
-                }
             }
         }
 
@@ -18156,6 +18211,24 @@ test "admitted prefill never enlarges scheduler geometry" {
     try std.testing.expectEqual(@as(usize, 128), schedulerChunkForPrefillIteration(128, 449, false));
     try std.testing.expectEqual(@as(usize, 449), schedulerChunkForPrefillIteration(128, 449, true));
     try std.testing.expectEqual(@as(usize, 449), schedulerChunkForPrefillIteration(0, 449, false));
+}
+
+test "HTTP compiled prefill skips a suppressed EOS with the highest logit" {
+    const allocator = std.testing.allocator;
+    var model_config = gpt_mod.Config{ .vocab_size = 3, .eos_token_id = 1, .suppress_token_ids_len = 1 };
+    model_config.suppress_token_ids[0] = 1;
+    const pipeline = NativeGenerationPipeline{
+        .allocator = allocator,
+        .cb = undefined,
+        .tokenizer = undefined,
+        .gpt_config = model_config,
+    };
+    var output = graph_mod.model_runtime.ModelOutput{ .logits = try allocator.dupe(f32, &.{ 0, 9, 8 }) };
+    defer output.deinit(allocator);
+
+    const token = try pipeline.selectCompiledPrefillGreedyToken(&output);
+    try std.testing.expectEqual(@as(usize, 2), token);
+    try std.testing.expect(!pipeline.shouldStopOnEos(.{}, token));
 }
 
 test "whole-model prefill stays bounded and speculative width is validated" {
