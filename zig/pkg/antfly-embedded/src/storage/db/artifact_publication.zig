@@ -1211,6 +1211,12 @@ pub const Dispatcher = struct {
     /// Zig's process-local error integers cannot cross compilation units.
     enqueue_status: ?*const fn (*anyopaque, *const Namespace, [*]const u8, usize) callconv(.c) @import("kernel_error_identity").Status = null,
     enqueue_tracked_status: ?*const fn (*anyopaque, *const Namespace, [*]const u8, usize, *DispatchReceipt) callconv(.c) @import("kernel_error_identity").Status = null,
+    applied_index_fn: ?*const fn (*anyopaque) callconv(.c) u64 = null,
+
+    pub fn appliedIndex(self: Dispatcher) u64 {
+        const callback = self.applied_index_fn orelse return 0;
+        return callback(self.ptr);
+    }
 
     pub fn submitTracked(self: Dispatcher, namespace: Namespace, command: []const u8) !DispatchReceipt {
         const enqueue = self.enqueue_tracked_status orelse {

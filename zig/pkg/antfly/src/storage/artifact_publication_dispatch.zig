@@ -24,6 +24,7 @@ pub const Port = struct {
     ptr: *anyopaque,
     enqueue_fn: *const fn (*anyopaque, u64, Namespace, []const u8) anyerror!void,
     enqueue_tracked_fn: ?*const fn (*anyopaque, u64, Namespace, []const u8, *Receipt) anyerror!void = null,
+    applied_index_fn: ?*const fn (*anyopaque, u64) u64 = null,
 
     pub fn enqueue(self: Port, group_id: u64, namespace: Namespace, command: []const u8) !void {
         try self.enqueue_fn(self.ptr, group_id, namespace, command);
@@ -36,14 +37,16 @@ pub const Queue = struct {
         alloc: std.mem.Allocator,
         refs: std.atomic.Value(usize) = .init(1),
         state: std.atomic.Value(u8) = .init(@backingInt(Receipt.State.active)),
+        index: u64 = 0,
 
         fn receipt(self: *Attempt) Receipt {
             _ = self.refs.fetchAdd(1, .monotonic);
-            return .{ .ctx = self, .state_fn = readState, .release_fn = releaseReceipt };
+            return .{ .ctx = self, .observe_fn = observeState, .release_fn = releaseReceipt };
         }
-        fn readState(raw: ?*anyopaque) callconv(.c) u8 {
+        fn observeState(raw: ?*anyopaque, out: *Receipt.Observation) callconv(.c) void {
             const self: *Attempt = @ptrCast(@alignCast(raw.?));
-            return self.state.load(.acquire);
+            const state: Receipt.State = @fromBackingInt(@intCast(self.state.load(.acquire)));
+            out.* = .{ .state = state, .index = if (state == .active) 0 else self.index };
         }
         fn releaseReceipt(raw: ?*anyopaque) callconv(.c) void {
             const self: *Attempt = @ptrCast(@alignCast(raw.?));
@@ -121,7 +124,7 @@ pub const Queue = struct {
             self.jobs += 1;
             break :blk index;
         };
-        errdefer self.releaseSlot(io, slot, command.len, .abandoned);
+        errdefer self.releaseSlot(io, slot, command.len, .{ .state = .abandoned });
         const job = try alloc.create(Job);
         errdefer alloc.destroy(job);
         job.* = .{ .alloc = alloc, .group_id = group_id, .namespace = namespace, .command = try alloc.dupe(u8, command), .slot = slot };
@@ -140,13 +143,14 @@ pub const Queue = struct {
         return entry.attempt.?.receipt();
     }
 
-    fn releaseSlot(self: *Queue, io: std.Io, slot: usize, bytes: usize, state: Receipt.State) void {
+    fn releaseSlot(self: *Queue, io: std.Io, slot: usize, bytes: usize, outcome: Receipt.Observation) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         std.debug.assert(self.slots[slot].occupied);
         if (!self.slots[slot].reserved) self.producer_bytes -= bytes;
         if (self.slots[slot].attempt) |attempt| {
-            attempt.state.store(@backingInt(state), .release);
+            attempt.index = outcome.index;
+            attempt.state.store(@backingInt(outcome.state), .release);
             Attempt.releaseReceipt(attempt);
         }
         self.slots[slot] = .{};
@@ -154,16 +158,16 @@ pub const Queue = struct {
         self.jobs -= 1;
     }
     pub fn release(self: *Queue, io: std.Io, job: *Job) void {
-        self.finish(io, job, .abandoned);
+        self.finish(io, job, .{ .state = .abandoned });
     }
 
-    pub fn finish(self: *Queue, io: std.Io, job: *Job, state: Receipt.State) void {
+    pub fn finish(self: *Queue, io: std.Io, job: *Job, outcome: Receipt.Observation) void {
         const slot = job.slot;
         const len = job.command.len;
         const alloc = job.alloc;
         alloc.free(job.command);
         alloc.destroy(job);
-        self.releaseSlot(io, slot, len, state);
+        self.releaseSlot(io, slot, len, outcome);
     }
     pub fn deinit(self: *Queue) void {
         std.debug.assert(self.jobs == 0 and self.bytes == 0 and self.producer_bytes == 0);
@@ -192,7 +196,11 @@ test "ordered artifact inventory publication queue reports definite abandonment 
     const io = std.testing.io;
     var queue: Queue = .{};
     defer queue.deinit();
-    for ([_]Receipt.State{ .abandoned, .awaiting_apply }) |outcome| {
+    for ([_]Receipt.Observation{
+        .{ .state = .abandoned },
+        .{ .state = .ordered, .index = 19 },
+        .{ .state = .upload, .index = 23 },
+    }) |outcome| {
         var first: Receipt = .{};
         defer first.release();
         const job = (try queue.reserveTracked(io, a, 9, @splat(1), "command", .producer, &first)).?;
@@ -202,8 +210,8 @@ test "ordered artifact inventory publication queue reports definite abandonment 
         try std.testing.expectEqual(first.ctx, duplicate.ctx);
         try std.testing.expect(!first.abandoned());
         queue.finish(io, job, outcome);
-        try std.testing.expectEqual(outcome == .abandoned, first.abandoned());
-        try std.testing.expectEqual(outcome == .abandoned, duplicate.abandoned());
+        try std.testing.expectEqual(outcome, first.observe().?);
+        try std.testing.expectEqual(outcome, duplicate.observe().?);
     }
 }
 
