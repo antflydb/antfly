@@ -1087,6 +1087,7 @@ pub fn forwardGreedyLastTokenFromTokenTensor(
     batch: usize,
     seq_len: usize,
     decode_context: ?*const DecodeContext,
+    owned_input: ?*?CT,
 ) !?GreedyDeviceTokenResult {
     const hidden_size = config.hidden_size;
     const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
@@ -1097,9 +1098,20 @@ pub fn forwardGreedyLastTokenFromTokenTensor(
     defer cb.free(embed_w);
     const hidden = (try lookupScaledTokenEmbeddingsTensor(cb, allocator, config, embed_w, input_token, total, hidden_size)) orelse return null;
 
-    const ple_vectors = try computePleVectorsFromTokenTensor(cb, allocator, config, input_token, hidden, total);
+    const ple_vectors = computePleVectorsFromTokenTensor(cb, allocator, config, input_token, hidden, total) catch |err| {
+        cb.free(hidden);
+        return err;
+    };
     defer if (ple_vectors) |pv| cb.free(pv);
 
+    // Both token gathers have been queued on the decode stream. A request
+    // that owns this token can now retire its graph-output lease before the
+    // next graph selects an output bank. Foreign references still pin it.
+    if (owned_input) |owner| {
+        std.debug.assert(owner.* == input_token);
+        owner.* = null;
+        cb.free(input_token);
+    }
     return try forwardGreedyLastTokenTensorFromEmbeddings(cb, allocator, config, hidden, batch, seq_len, decode_context, ple_vectors);
 }
 

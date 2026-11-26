@@ -5584,7 +5584,7 @@ pub const NativeGenerationPipeline = struct {
                             token_table,
                             json_grammar,
                             gbnf_grammar,
-                            device_token.tensor,
+                            &device_token.tensor,
                         );
                     };
                     if (direct_token) |token| {
@@ -6219,7 +6219,7 @@ pub const NativeGenerationPipeline = struct {
         token_table: ?*const grammar_mod.TokenByteTable,
         json_grammar: *const ?grammar_mod.JsonGrammar,
         gbnf_grammar: ?*const grammar_mod.GbnfGrammar,
-        input_token_tensor: ?ops.CT,
+        input_token: *?ops.CT,
     ) !?DeviceDecodeOutcome {
         decoder_runtime_debug_stats.forward_attempts += 1;
         var numerical = self.physicalDecoder();
@@ -6235,7 +6235,7 @@ pub const NativeGenerationPipeline = struct {
         const outcome = try numerical.forwardDeviceStep(decode_state, .{
             .token_ids = token_ids,
             .sequence_length = seq_len,
-            .input_token_tensor = input_token_tensor,
+            .owned_input_token = input_token,
             .sampling = if (sampled) .{
                 .temperature = config.temperature,
                 .top_p = config.top_p,
