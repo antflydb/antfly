@@ -983,6 +983,16 @@ Treat the `b12706` timings above as historical. Inkling awaits a verified
 vLLM-Metal runner. See the
 [vLLM-Metal support matrix](https://github.com/vllm-project/vllm-metal/blob/main/docs/supported_models.md).
 
+The full-window HTTP comparison uses exactly 1,048,576 prompt tokens
+and one completion token. Its image case asks for an early lookup key
+for a blue image and supplies a different answer for a red image.
+The comparison checks the prompt and image hashes, reported token counts,
+expected answer, and cache reuse. It records the comparator's actual GPU
+layer placement. Only completed requests with all layers offloaded count
+toward the Metal latency target. The Antfly stream must return final usage
+and `[DONE]`, and a request reserving one additional output token must
+return HTTP 400 before opening the stream.
+
 With the normal model directory and both backend override variables unset,
 the optimized HTTP server selected Metal. A mixed `/ml/v1/generate/batch`
 returned `4` and `Red` for valid items and an item-level error for an audio
