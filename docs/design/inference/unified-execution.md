@@ -1030,6 +1030,33 @@ physical Metal test also checks that the penultimate query in a synthetic
 million-token span cannot see the value at the remapped final position.
 End-to-end latency for this change awaits a released-checkpoint rerun.
 
+The public Metal route now selects the resident Inkling model automatically.
+It handles ordered images, sends idle SSE comments at prefill checkpoints,
+and validates context and cache options before starting the stream. The
+short-context decoder fixture uses six Metal state buffers after packing
+history and KV planes into bounded arenas. It verifies capacity accounting,
+retirement, and retry after a failed tail allocation. A separate
+physical Metal fixture writes and reads packed KV through nonzero offsets
+in the same backing buffer before publishing the append.
+
+On the M4 Max, the combined cohort at `f2e941c98c` passed 32 of 33 selected
+tests. The released-checkpoint test was deferred while the full-window
+request ran. At `ab3b1e1693`, 20 of 21 retirement and preparation checks
+passed, including real Metal KV buffer aliases and shared stateful decoder
+preparation from ONNX, Safetensors, GGUF, and Q8. The CUDA fixture was
+skipped in that build. The production Metal HTTP executable passed semantic
+checking. Live current-head HTTP latency and full-window completion remain
+open.
+
+On Spark GB10, the CUDA HTTP binary at `31623aefd4` automatically selected
+CUDA and returned `4`, `Blue`, and `271` for the 28-token text, 33-token image,
+and 6,403-token mixed requests, respectively. The over-limit streaming
+request returned HTTP 400 before opening the stream. A separate public
+batch returned red image, text, and blue image results in submission order
+while rejecting the unsupported streaming item. The execution report
+recorded three serial items and one rejected item. These were shared-device
+correctness runs.
+
 ### Official Gemma 4 E2B QAT serving comparison
 
 The decoder and projector came from Google's E2B QAT Q4_0 GGUF revision
