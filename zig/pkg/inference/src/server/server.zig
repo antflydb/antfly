@@ -33158,7 +33158,6 @@ pub fn resolvedExecutorBatchImplementation(
         .per_item_failures = std.mem.eql(u8, resolved_task, "generate") or executor_kind == .grouped_dense_embedding,
         .max_media_parts_per_item = switch (executor_kind) {
             .grouped_dense_embedding => 64,
-            .inkling2_generation => 1,
             else => null,
         },
     };
@@ -33494,8 +33493,7 @@ fn resolvedInferenceExecutorContract(
             manifest_video,
         );
     }
-    const inkling_generation = manifest.isInkling2() and std.mem.eql(u8, resolved_task, "generate");
-    const max_images: usize = if (!modalities.image) 0 else if (inkling_generation) 1 else executorMaxImages(resolved_task);
+    const max_images: usize = if (modalities.image) executorMaxImages(resolved_task) else 0;
     var implementation = resolvedExecutorBatchImplementation(resolved_task, executor_kind);
     const cuda_decide_batch = build_options.enable_cuda and node.session_manager.required_backend == .cuda;
     const metal_decide_batch = build_options.enable_metal and node.session_manager.required_backend == .metal;
@@ -36963,6 +36961,26 @@ test "accepted multimodal routes reject tiny high-pixel batches before model loa
         node.embedDenseJsonInputDirect(allocator, "owner/embed", parsed_input.value),
     );
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+}
+
+test "Inkling generation admits ordered images under shared generation limits" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{});
+    defer node.deinit();
+    var inputs = [_][]const u8{ "text", "image" };
+    const manifest: manifest_mod.ModelManifest = .{
+        .allocator = a,
+        .config_model_arch = @import("../architectures/inkling2_checkpoint.zig").architecture,
+        .inputs = &inputs,
+    };
+    const contract = try resolvedGenerateExecutorContract(&node, &manifest);
+    try std.testing.expectEqual(max_generate_media_parts_per_item, contract.batch.max_media_parts_per_item);
+    try std.testing.expectEqual(requestMediaMaxDecodedPixels(&node, executorMaxImages("generate")), contract.batch.max_decoded_pixels.?);
+    try validateGenerateExecutorInvocation(contract, .{ .has_image = true, .media_parts_per_item = 2 });
+    try std.testing.expectError(error.InferenceMediaPartLimitExceeded, validateGenerateExecutorInvocation(contract, .{
+        .has_image = true,
+        .media_parts_per_item = max_generate_media_parts_per_item + 1,
+    }));
 }
 
 test "generate HTTP enforces resolved manifest media limits before model loading" {

@@ -976,11 +976,21 @@ The packed-cache image lookup also returned `271`. The streaming image
 request returned `Blue`, a stop reason, usage and `[DONE]` in 0.833 s.
 No comparable vLLM Metal run was available for this checkpoint.
 
-The next comparison uses llama.cpp `b12776` (`e38ea719b`) on the same
-host and GGUF. That build includes the upstream
-[indexed relative-attention bias change](https://github.com/ggml-org/llama.cpp/pull/33053).
-Treat the `b12706` timings above as historical. Inkling awaits a verified
-vLLM-Metal runner. See the
+The follow-up used llama.cpp `b12776` (`e38ea719b`) on the same host and
+GGUF, with explicit M4 Max Metal offload. Three warm HTTP observations
+per text case matched answer and token count. Antfly and llama.cpp p50
+were 0.591 s and 0.292 s at 28 prompt tokens, and 80.035 s and 17.546 s
+at 6,396 tokens. The image comparisons failed parity. llama.cpp emitted
+`<|message_model|>` and counted 31 and 6,401 prompt tokens where Antfly
+counted 33 and 6,403, so those latencies do not qualify image performance.
+
+The patched Antfly HTTP server also accepted two ordered images in
+both red-first and blue-first order. Each Metal request returned the
+first image's color, 50 prompt tokens, one completion token, a stop
+reason, and `[DONE]`. The shared generation media, byte, and pixel
+limits still apply.
+
+Inkling awaits a verified vLLM-Metal runner. See the
 [vLLM-Metal support matrix](https://github.com/vllm-project/vllm-metal/blob/main/docs/supported_models.md).
 
 The full-window HTTP comparison uses exactly 1,048,576 prompt tokens
