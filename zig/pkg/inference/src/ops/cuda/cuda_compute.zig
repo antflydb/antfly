@@ -60822,8 +60822,9 @@ test "source linear arena precondition refuses retained ordinary storage before 
     try std.testing.expect(scope.complete());
     try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0x7000), compute.source_linear_scratch.buffer.ptr);
     compute.source_linear_scratch.buffer.ptr = 16;
-    // A malformed learning scope may not allocate/free while capture is active.
-    scope.base = 0;
+    // A learning scope may not allocate/free while capture is active.
+    var learning: plan_mod.Plan = .{};
+    scope = plan_mod.Scope.observe(&learning);
     compute.debug_cuda_graph_capture_active = true;
     try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, SourceLinearTemporary.acquireKnownCapture(&compute, 256, 256, false));
     try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 16), compute.source_linear_scratch.buffer.ptr);

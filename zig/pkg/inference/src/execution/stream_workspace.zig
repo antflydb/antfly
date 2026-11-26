@@ -325,7 +325,7 @@ pub const Scope = struct {
     }
 
     pub fn disjointBacking(self: *const Scope, pointer: DevicePointer, bytes: usize) bool {
-        if (!self.isBound() or pointer == 0 or bytes == 0) return false;
+        if (!self.isBound() or (!self.empty_backing and self.bound_start == 0) or pointer == 0 or bytes == 0) return false;
         const end = std.math.add(DevicePointer, pointer, bytes) catch return false;
         return self.empty_backing or end <= self.bound_start or pointer >= self.bound_end;
     }
@@ -394,6 +394,7 @@ test "stream workspace rejects live buffers and event drift" {
     try std.testing.expectError(error.AudioPlanChanged, observing.allocate(256));
     try std.testing.expectEqual(@as(usize, 0), observing.cursor);
     var scope = Scope{ .recipe = .{ .bound = p }, .base = 10000 };
+    try std.testing.expect(!scope.disjointBacking(0x1000, alignment));
     const a = try scope.allocate(256);
     const b = try scope.allocate(512);
     scope.release(a);
