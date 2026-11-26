@@ -1120,8 +1120,12 @@ pub const DocStore = struct {
                 return try self.runtime.?.hasPrefix(prefix);
             }
 
+            pub fn openPhysicalCursorAdapter(self: @This()) !backend_erased.Cursor {
+                return self.runtime.?.openCursor();
+            }
+
             pub fn openCursor(self: @This()) !backend_erased.Cursor {
-                var physical = try self.runtime.?.openCursor();
+                var physical = try self.openPhysicalCursorAdapter();
                 errdefer physical.close();
                 return try wrapPayloadCursor(self.alloc, physical, self.payload_session, false);
             }

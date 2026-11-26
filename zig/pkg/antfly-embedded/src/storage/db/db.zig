@@ -28207,7 +28207,7 @@ pub const DB = struct {
             var owned = catalogs;
             owned.deinit(alloc);
         }
-        const command = try inventory.desiredCommandForProposal(alloc, &txn, namespace, catalogs, observed, minimum);
+        const command = try inventory.desiredCommand(alloc, &txn, namespace, catalogs, observed, minimum);
         // Reused commands retain their historical `previous` field. Only the
         // current ordered binding on this exact read can authorize activation.
         return .{ .command = command, .activatable = observed.ready and observed.ordered != null and std.meta.eql(observed.ordered.?, command.binding) };
@@ -29131,6 +29131,7 @@ pub const DB = struct {
             coverage: []const publication.Coverage,
             chunk_fence: ?@import("artifact_chunk_publication.zig").Fence,
             chunk_vector_fence: ?@import("artifact_chunk_vector_publication.zig").Fence,
+            check_vector_set: bool,
             asset_upstream_fences: []const @import("artifact_asset_publication.zig").UpstreamFence,
             position: publication.Position,
             proof: []const u8,
@@ -29142,7 +29143,10 @@ pub const DB = struct {
                 try publication.validateArtifactSources(alloc, txn, guard.command.namespace, guard.command.sources, guard.command.artifact_sources);
                 try publication.validateArtifactSources(alloc, txn, guard.command.namespace, guard.command.sources, guard.command.mutation_preconditions);
                 if (guard.chunk_fence) |fence| try fence.requireCurrent(txn);
-                if (guard.chunk_vector_fence) |fence| try fence.requireCurrent(txn);
+                if (guard.chunk_vector_fence) |fence| {
+                    try fence.requireCurrent(txn);
+                    if (guard.check_vector_set) try fence.requireCurrentOutputs(alloc, txn, guard.command);
+                }
                 for (guard.asset_upstream_fences) |fence| try fence.requireCurrent(txn);
                 try publication.stageCoverage(alloc, txn, guard.command, guard.coverage);
                 try publication.stageReceipts(txn, guard.command, guard.sequence);
@@ -29153,7 +29157,7 @@ pub const DB = struct {
                 try guard.db.stageRestoreStagingReplicationOutbox(txn, guard.replication_payload);
             }
         };
-        var guard: Guard = .{ .db = self, .replication_payload = replication_payload, .command = command, .sequence = sequence, .coverage = prepared_value.coverage, .chunk_fence = prepared_value.chunk_fence, .chunk_vector_fence = prepared_value.chunk_vector_fence, .asset_upstream_fences = prepared_value.asset_upstream_fences, .position = .{ .raft = .{ .term = entry.term, .index = entry.index } }, .proof = prepared_proof orelse return error.ArtifactCatalogCorrupt, .document_references = if (prepared_document_refs) |*value| value else return error.ArtifactCatalogCorrupt, .upload = opts.artifact_upload_finalize };
+        var guard: Guard = .{ .db = self, .replication_payload = replication_payload, .command = command, .sequence = sequence, .coverage = prepared_value.coverage, .chunk_fence = prepared_value.chunk_fence, .chunk_vector_fence = prepared_value.chunk_vector_fence, .check_vector_set = ordered_value.value.command.binding.effect_protocol >= inventory.scalar_window_retirement_protocol, .asset_upstream_fences = prepared_value.asset_upstream_fences, .position = .{ .raft = .{ .term = entry.term, .index = entry.index } }, .proof = prepared_proof orelse return error.ArtifactCatalogCorrupt, .document_references = if (prepared_document_refs) |*value| value else return error.ArtifactCatalogCorrupt, .upload = opts.artifact_upload_finalize };
         _ = self.core.store.putBatchWithPromotionsReplayAndBuiltWrite(batch_ctx.io, writes.items, deletes.items, &.{}, .{ .sequence = sequence, .payload = replay }, null, .{ .ptr = &guard, .validate = Guard.validate }) catch |err| switch (err) {
             error.EnrichmentSourceChanged => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .stale_source, &apply_held),
             error.ArtifactCoverageBaselinePending, error.ArtifactPublicationPending => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .baseline_pending, &apply_held),

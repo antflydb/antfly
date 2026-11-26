@@ -87,10 +87,6 @@ pub const Catalogs = struct {
     /// need protocol 15; grouped producer ownership needs protocol 16.
     /// Base vectors need protocol 17 and scoped chunk vectors need protocol 18.
     pub fn requiredEffectProtocol(self: Catalogs, alloc: std.mem.Allocator) !u16 {
-        return self.requiredEffectProtocolFor(alloc, dense_artifact_flags_protocol);
-    }
-
-    fn requiredEffectProtocolFor(self: Catalogs, alloc: std.mem.Allocator, ceiling: u16) !u16 {
         const enrichments = @import("catalog/enrichment_catalog.zig");
         const producers = if (self.enrichments.len != 0)
             try enrichments.deserializeCatalog(alloc, self.enrichments)
@@ -109,14 +105,8 @@ pub const Catalogs = struct {
             const configs = try indexes.deserializeCatalog(alloc, self.indexes);
             defer @import("types.zig").freeIndexConfigs(alloc, configs);
             for (configs) |cfg| {
-                if (try indexes.denseArtifactFlagsRequired(alloc, cfg)) {
-                    if (ceiling == dense_artifact_flags_protocol) return dense_artifact_flags_protocol;
-                    required = @max(required, dense_artifact_flags_protocol);
-                }
-                if (try indexes.onlineGeneratedChunkVectorConfig(alloc, cfg, producers)) {
-                    if (cfg.kind == .dense_vector and ceiling >= scalar_window_retirement_protocol) return scalar_window_retirement_protocol;
-                    required = @max(required, 18);
-                }
+                if (try indexes.denseArtifactFlagsRequired(alloc, cfg)) return dense_artifact_flags_protocol;
+                if (try indexes.onlineGeneratedChunkVectorConfig(alloc, cfg, producers)) required = @max(required, 18);
                 if (try indexes.onlineBaseGeneratedVectorConfig(alloc, cfg, producers)) required = @max(required, 17);
             }
         }
@@ -204,21 +194,7 @@ pub const Status = struct { ordered: ?Binding, applied_index: u64, local: LocalB
 /// Plan against one immutable catalog observation. Catalog bytes are borrowed
 /// from the caller; this function never changes their ownership.
 pub fn desiredCommand(alloc: std.mem.Allocator, txn: anytype, namespace: [24]u8, catalogs_value: Catalogs, observed: Status, minimum: u16) !Command {
-    // This planner is also used to replay legacy grouped activation commands.
-    // Feature discovery for those commands must stay deterministic.
     const effect_protocol = try catalogs_value.effectProtocolFor(alloc, observed.ordered, minimum);
-    return desiredCommandAtProtocol(alloc, txn, namespace, catalogs_value, observed, effect_protocol);
-}
-
-/// Explicit ordered proposals may negotiate new effects across the replica
-/// set. Legacy activation controls never infer those effects during apply.
-pub fn desiredCommandForProposal(alloc: std.mem.Allocator, txn: anytype, namespace: [24]u8, catalogs_value: Catalogs, observed: Status, minimum: u16) !Command {
-    const floor = @max(minimum, if (observed.ordered) |binding| binding.effect_protocol else 14);
-    const effect_protocol = if (floor == max_effect_protocol) floor else @max(floor, try catalogs_value.requiredEffectProtocolFor(alloc, max_effect_protocol));
-    return desiredCommandAtProtocol(alloc, txn, namespace, catalogs_value, observed, effect_protocol);
-}
-
-fn desiredCommandAtProtocol(alloc: std.mem.Allocator, txn: anytype, namespace: [24]u8, catalogs_value: Catalogs, observed: Status, effect_protocol: u16) !Command {
     if (observed.ready and observed.ordered.?.effect_protocol == effect_protocol) {
         var installed = (try load(alloc, txn)).?;
         defer installed.deinit();

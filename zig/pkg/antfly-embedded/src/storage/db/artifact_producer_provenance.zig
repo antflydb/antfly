@@ -137,7 +137,7 @@ pub const Proof = struct {
         if (self.execution_identity != null) {
             if (self.producer_kind != .index) return error.ArtifactCatalogCorrupt;
             if (self.effects.len > 1) {
-                if (!publication.isRevisionBoundScalarWindowReplacement(self.producer_scope_key, self.producer_artifact_name, self.effects)) return error.ArtifactCatalogCorrupt;
+                if (!publication.isRevisionBoundChunkVectorSet(self.producer_scope_key, self.producer_artifact_name, self.effects)) return error.ArtifactCatalogCorrupt;
             } else if ((self.producer_scope_key.len == 0 and self.sources.len != 1) or
                 self.effects[0].family != (if (self.producer_scope_key.len == 0) @as(@FieldType(Effect, "family"), .base_vector) else @as(@FieldType(Effect, "family"), .derived_vector))) return error.ArtifactCatalogCorrupt;
         }
