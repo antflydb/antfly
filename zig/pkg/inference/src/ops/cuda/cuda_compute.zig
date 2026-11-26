@@ -14960,6 +14960,16 @@ fn copyToHostTracked(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes:
     self.stats.d2h_bytes += bytes.len;
 }
 
+/// The destination may be caller-owned. Preserve the original error only
+/// after confirming that the async write can no longer reach its storage.
+fn finishHostDownload(self: *CudaCompute) !void {
+    synchronizeAndDrainDeferredDeviceFrees(self) catch |err| {
+        self.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
+        return err;
+    };
+    self.stats.download_syncs += 1;
+}
+
 fn copyToPinnedScalarDownloadAndSync(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []u8) !bool {
     if (bytes.len == 0) return true;
     if (!pinnedScalarDownloadEligible(self, bytes)) return false;
@@ -14977,8 +14987,7 @@ fn copyToPinnedScalarDownloadAndSync(self: *CudaCompute, device: buffer_mod.Devi
     const slot = host_bytes[0..bytes.len];
     try device.copyToHost(&self.ctx, slot);
     self.stats.d2h_bytes += bytes.len;
-    try synchronizeAndDrainDeferredDeviceFrees(self);
-    self.stats.download_syncs += 1;
+    try finishHostDownload(self);
     @memcpy(bytes, slot);
     self.stats.pinned_scalar_downloads += 1;
     self.stats.pinned_scalar_download_bytes += bytes.len;
@@ -14996,8 +15005,7 @@ fn copyToHostTrackedAndSync(self: *CudaCompute, device: buffer_mod.DeviceBuffer,
     if (tried_pinned_scalar_download) self.stats.pinned_scalar_download_fallbacks += 1;
     if (try copyToPinnedBulkDownloadAndSync(self, device, bytes)) return;
     try copyToHostTracked(self, device, bytes);
-    try synchronizeAndDrainDeferredDeviceFrees(self);
-    self.stats.download_syncs += 1;
+    try finishHostDownload(self);
 }
 
 // Large synchronous downloads into pageable memory run at a fraction of PCIe
@@ -15030,10 +15038,9 @@ fn copyToPinnedBulkDownloadAndSync(self: *CudaCompute, device: buffer_mod.Device
     const staging = self.pinned_bulk_download_buffer.bytes()[0..bytes.len];
     const logical = buffer_mod.DeviceBuffer{ .ptr = device.ptr, .len = bytes.len };
     try logical.copyToHost(&self.ctx, staging);
-    try synchronizeAndDrainDeferredDeviceFrees(self);
+    try finishHostDownload(self);
     @memcpy(bytes, staging);
     self.stats.d2h_bytes += bytes.len;
-    self.stats.download_syncs += 1;
     self.stats.pinned_bulk_downloads += 1;
     return true;
 }
@@ -46332,6 +46339,37 @@ test "CUDA pinned bulk readback capacity is bounded and follows demand" {
         .{ .bytes = 4194305, .capacity = null },
         .{ .bytes = std.math.maxInt(usize), .capacity = null },
     }) |case| try std.testing.expectEqual(case.capacity, pinnedBulkDownloadCapacity(case.bytes));
+}
+
+test "CUDA host readback checks stream retirement before returning a wait failure" {
+    const Fake = struct {
+        var waits: usize = 0;
+        fn current(_: driver_mod.CUcontext) callconv(.c) driver_mod.CUresult {
+            return driver_mod.CUDA_SUCCESS;
+        }
+        fn sync(_: driver_mod.CUstream) callconv(.c) driver_mod.CUresult {
+            waits += 1;
+            return if (waits == 1) 1 else driver_mod.CUDA_SUCCESS;
+        }
+        fn describe(_: driver_mod.CUresult, name: *?[*:0]const u8) callconv(.c) driver_mod.CUresult {
+            name.* = "injected readback wait failure";
+            return driver_mod.CUDA_SUCCESS;
+        }
+    };
+    var compute = metadataOnlyTestCompute();
+    compute.ctx.ctx = @ptrFromInt(1);
+    compute.ctx.driver.fns.cuCtxSetCurrent = Fake.current;
+    compute.ctx.driver.fns.cuStreamSynchronize = Fake.sync;
+    compute.ctx.driver.fns.cuGetErrorName = Fake.describe;
+    compute.ctx.driver.fns.cuGetErrorString = Fake.describe;
+    Fake.waits = 0;
+    @import("../../test_error_logs.zig").expectErrorLogs(1);
+    try std.testing.expectError(error.CudaDriverError, finishHostDownload(&compute));
+    try std.testing.expectEqual(@as(usize, 2), Fake.waits);
+    try std.testing.expectEqual(@as(u64, 0), compute.stats.download_syncs);
+    try finishHostDownload(&compute);
+    try std.testing.expectEqual(@as(usize, 3), Fake.waits);
+    try std.testing.expectEqual(@as(u64, 1), compute.stats.download_syncs);
 }
 
 test "CUDA pinned bulk readback audit denies before staging or driver access" {
