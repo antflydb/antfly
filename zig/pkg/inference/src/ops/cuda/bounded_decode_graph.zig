@@ -260,6 +260,7 @@ pub const Module = struct {
     phase: Phase = .warm,
     metadata: buffer.DeviceBuffer = .{},
     arena: buffer.DeviceBuffer = .{},
+    admitted_arena_layout: ?plan_mod.Layout = null,
     metadata_quota: quota_mod.Quota = .none,
     arena_quota: quota_mod.Quota = .none,
     graph: driver.CUgraphExec = null,
@@ -318,6 +319,7 @@ pub const Module = struct {
         try ctx.destroyGraphChecked(&self.pending_graph);
         _ = try self.head.freeChecked(ctx);
         _ = try self.arena.freeChecked(ctx);
+        self.admitted_arena_layout = null;
         _ = try self.metadata.freeChecked(ctx);
         if (self.plan) |plan| self.host_allocator.destroy(plan);
         self.plan = null;
@@ -393,7 +395,10 @@ pub const Module = struct {
         self.installStorageGeometry(layout, descriptor.rows, descriptor.hidden, descriptor.vocab, descriptor.positions);
     }
     pub fn reserveArenaPrepared(self: *Module, ctx: *context.CudaContext, phase: *GraphPhase) !void {
-        if (self.arena.ptr != 0) return;
+        if (self.arena.ptr != 0) {
+            _ = try self.bindArena();
+            return;
+        }
         const layout = try self.arenaLayout();
         if (!phase.bound or phase.mode != .arena or layout.bytes != phase.old.peak or layout.events != phase.old.events) return error.InvalidPreparedCacheState;
         const recipe = layout.recipe;
@@ -403,7 +408,14 @@ pub const Module = struct {
         errdefer lease.releaseAfterSdkDeath();
         const arena = try buffer.DeviceBuffer.alloc(ctx, layout.bytes);
         self.arena = arena;
+        self.admitted_arena_layout = layout;
         self.arena_quota = lease.publishQuota();
+    }
+
+    pub fn bindArena(self: *const Module) !plan_mod.Scope {
+        const plan = self.plan orelse return error.InvalidExecutionPlan;
+        const layout = self.admitted_arena_layout orelse return error.InvalidExecutionPlan;
+        return plan_mod.Scope.bind(plan, layout, self.arena.ptr, self.arena.len);
     }
 
     pub fn input(self: *const Module) buffer.DeviceBuffer {
@@ -775,6 +787,12 @@ test "captured graph wide head and learned arena consume separate exact prefunde
     try owner.reserveArenaPrepared(&ctx, &arena);
     const pointer = owner.arena.ptr;
     try owner.reserveArenaPrepared(&ctx, &arena); // warm path consumes no token twice
+    plan.* = .{};
+    try plan.declareScratch(1023);
+    try std.testing.expectError(error.InvalidExecutionPlan, owner.bindArena());
+    plan.* = .{};
+    try plan.declareScratch(1024);
+    _ = try owner.bindArena();
     try std.testing.expectEqual(pointer, owner.arena.ptr);
     try std.testing.expectEqual(@as(usize, 3), GraphTestDriver.allocations);
     try arena.close(.{ .boundary = &b });

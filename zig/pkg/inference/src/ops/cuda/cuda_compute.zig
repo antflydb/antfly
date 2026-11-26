@@ -3770,7 +3770,7 @@ pub const CudaCompute = struct {
             const WorkspaceScope = @import("../../execution/stream_workspace.zig").Scope;
             const capture = phase == .capture;
             var scope: ?WorkspaceScope = if (capture)
-                try WorkspaceScope.bind(plan, try owner.arenaLayout(), owner.arena.ptr, owner.arena.len)
+                try owner.bindArena()
             else if (phase == .learn) WorkspaceScope.observe(plan) else null;
             var capture_active = false;
             errdefer {
