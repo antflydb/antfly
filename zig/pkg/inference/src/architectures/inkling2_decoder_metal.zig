@@ -507,16 +507,13 @@ pub const Request = struct {
         }, output);
     }
 
-    fn visit(self: *Request, work: *Work, pending: *kv.Append, op: checkpoint.Visit) !void {
+    fn visit(self: *Request, work: *Work, pending: *kv.Append, op: checkpoint.Visit, boundary: bool) !void {
         const text = self.model.text;
         const runtime = self.model.runtime;
         const eps = text.rms_norm_eps;
         const layer = &self.model.layers[op.weight_layer];
         const local = layer.attention.local;
         const looped = op.pass != 0;
-        const boundary = op.weight_layer % text.n_layers_per_attn_res_block == 0;
-        try work.stack.advance(op, text.loop_config.core_start, boundary);
-
         // The expert and final normalization reuse the query input after
         // attention has consumed it. Both controllers also reuse the F32 mix.
         const destinations = [_]*Tensor{ work.get(.normalized), work.get(.key), work.get(.value) };
@@ -578,7 +575,23 @@ pub const Request = struct {
             .token => |token| try self.model.endpoints.embed(runtime, token, hidden),
             .prefix => |parts| try self.encodePrefix(parts, hidden),
         }
-        for (self.model.schedule) |op| try self.visit(work, &pending, op);
+        // The typed visit kernels register their physical read/write spans.
+        // Keep the scope outside prefix blits and the final scalar readback.
+        const text = self.model.text;
+        const core_start = text.loop_config.core_start;
+        // The backend still inserts barriers if the encoder is concurrent.
+        try metal.pushPlannedComputeBarrierSuppression(runtime);
+        try metal.beginPlannedComputeScope(runtime, @backingInt(metal.ComputeSource.layer), .layer);
+        for (self.model.schedule) |op| {
+            const boundary = op.weight_layer % text.n_layers_per_attn_res_block == 0;
+            const restores = op.preludeAction(core_start) == .restore;
+            if (restores) try metal.endPlannedComputeScope(runtime);
+            try work.stack.advance(op, core_start, boundary);
+            if (restores) try metal.beginPlannedComputeScope(runtime, @backingInt(metal.ComputeSource.layer), .layer);
+            try self.visit(work, &pending, op, boundary);
+        }
+        try metal.endPlannedComputeScope(runtime);
+        try metal.popPlannedComputeBarrierSuppression(runtime);
         if (output != .none) {
             const logits = self.decode.get(.logits);
             const stack = &work.stack;
@@ -1220,7 +1233,10 @@ test "Inkling Metal resident decoder executes the full visit schedule on a synth
         .{ .embeddings = .{ .tensor = &image_row, .start = 0, .count = 1 } },
         .{ .tokens = &.{1} },
     }));
-    try std.testing.expectEqual(before_fused.frame_submit_count + 1, metal.runtimeMemorySnapshot(runtime).frame_submit_count);
+    const after_fused = metal.runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(before_fused.frame_submit_count + 1, after_fused.frame_submit_count);
+    try std.testing.expectEqual(@as(u64, 3), after_fused.last_frame_planned_compute_scope_count);
+    try std.testing.expect(after_fused.last_frame_compute_encoder_count < 12);
     try std.testing.expectEqual(@as(usize, 2), fused.state.sequence.committed_tokens);
     fused.releasePrefill();
     try std.testing.expectEqual(expected_after_prefix, try fused.stepGreedy(0));

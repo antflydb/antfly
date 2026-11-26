@@ -254,6 +254,9 @@ pub const Vision = struct {
         const params: Program.Params = .{ .rows = rows, .width = width, .gx = geometry.grid_x, .gy = geometry.grid_y, .epsilon = schema.eps };
         try metal.beginFrame(runtime);
         errdefer metal.cancelFrame(runtime) catch {};
+        // The backend still inserts barriers if the encoder is concurrent.
+        try metal.pushPlannedComputeBarrierSuppression(runtime);
+        try metal.beginPlannedComputeScope(runtime, @backingInt(metal.ComputeSource.layer), .layer);
         try Program.encode(.patches, runtime, .{
             .rows = patch_rows,
             .width = width,
@@ -296,6 +299,8 @@ pub const Vision = struct {
         try project(runtime, merged_rows, width * 4, inner, merged, weights.getPtrConst(.in), null, wide);
         try Program.encode(.gelu, runtime, .{ .rows = merged_rows, .width = inner }, .{wide});
         try project(runtime, merged_rows, inner, schema.text_width, wide, weights.getPtrConst(.out), null, &output);
+        try metal.endPlannedComputeScope(runtime);
+        try metal.popPlannedComputeBarrierSuppression(runtime);
         try metal.submitFrame(runtime);
         try metal.waitFrame(runtime);
         return .{ .tensor = output, .rows = merged_rows };
@@ -369,6 +374,9 @@ test "Inkling Metal vision publishes projected rows from its admitted arena" {
     // Four patch stages, eleven dispatches per layer with packed QKV,
     // and four stages to merge and project the language-model rows.
     try std.testing.expectEqual(@as(?u64, 8 + 11 * schema.layers), counters.snapshot().metal_encoded_dispatches);
+    const frame = metal.runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(@as(u64, 1), frame.last_frame_planned_compute_scope_count);
+    try std.testing.expectEqual(@as(u64, 1), frame.last_frame_compute_encoder_count);
     const after = tensors.memoryStatsSnapshot();
     // RGB ingress and transient arena retire after the frame. The returned
     // embedding has independent storage and does not retain either one.
