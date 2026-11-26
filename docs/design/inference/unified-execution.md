@@ -1246,6 +1246,13 @@ Both branches matched text, stop reason, and token count. The fixture also
 checked cancellation and confirmed that separate Native contexts can
 share resident storage while foreign GPU contexts take the host route.
 
+At `60468a11d5`, the shared cache-role parser passed the focused physical
+Metal and Spark CUDA checks for imported ONNX handoff and recognition of
+qualified omitted cross-cache columns. Exact and omitted cache shape
+validation also passed on both hosts. These checks exercise the resident
+provider path and the batching contract. The declared host route remains
+available for provider pairs without resident handoff support.
+
 At `3e6bcf05c5`, both physical GPU fixtures passed the incremental
 ONNX cache handoff and output-retirement regression. The shared role
 parser now drives declared geometry and retained quota for self and cross
