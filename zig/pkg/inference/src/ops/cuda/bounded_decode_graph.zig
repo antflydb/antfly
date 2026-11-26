@@ -141,9 +141,7 @@ pub const Snapshot = struct {
     graph: usize,
     pending_graph: usize,
     plan: usize,
-    peak: usize,
-    events: usize,
-    arena_recipe: ?u64,
+    arena_layout: ?plan_mod.Layout,
     metadata_quota: quota_mod.Quota,
     arena_quota: quota_mod.Quota,
 };
@@ -183,13 +181,13 @@ pub const GraphPhase = struct {
         _ = try descriptor.dispatchCounts();
         self.* = .{ .descriptor = descriptor };
     }
-    fn arenaRequest(self: *const GraphPhase, bytes: usize, events: usize, recipe: u64) funding_mod.Request {
+    fn arenaRequest(self: *const GraphPhase, layout: plan_mod.Layout) funding_mod.Request {
         return .{ .captured_arena = .{
             .epoch = self.descriptor.epoch,
             .key_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(self.descriptor.key)),
-            .bytes = bytes,
-            .events = events,
-            .recipe = recipe,
+            .bytes = layout.bytes,
+            .events = layout.events,
+            .recipe = layout.recipe,
         } };
     }
 
@@ -204,7 +202,7 @@ pub const GraphPhase = struct {
         const cold = try allocator.create(ColdPhase);
         cold.* = .{ .allocator = allocator };
         errdefer cold.destroyOutside();
-        const request = if (self.mode == .storage) try self.descriptor.storageRequest() else self.arenaRequest(self.old.peak, self.old.events, self.old.arena_recipe orelse return error.InvalidPreparedCacheState);
+        const request = if (self.mode == .storage) try self.descriptor.storageRequest() else self.arenaRequest(self.old.arena_layout orelse return error.InvalidPreparedCacheState);
         const amounts = switch (request) {
             .captured_storage => |value| try value.amounts(),
             .captured_arena => |value| value.amounts(),
@@ -349,11 +347,11 @@ pub const Module = struct {
         self.invalidations += 1;
     }
     pub fn snapshot(self: *const Module) Snapshot {
-        const missing_arena_recipe = if (self.phase == .capture and self.admitted_arena_layout == null)
-            if (self.plan) |plan| if (plan.sealed) plan.fingerprint(0) else null else null
+        const missing_arena_layout = if (self.phase == .capture and self.admitted_arena_layout == null)
+            self.arenaLayout() catch null
         else
             null;
-        return .{ .invalidations = self.invalidations, .epoch = self.epoch_id, .phase = self.phase, .metadata = self.metadata.ptr, .arena = self.arena.ptr, .head = self.head.ptr, .graph = if (self.graph) |value| @intFromPtr(value) else 0, .pending_graph = if (self.pending_graph) |value| @intFromPtr(value) else 0, .plan = if (self.plan) |value| @intFromPtr(value) else 0, .peak = if (self.plan) |value| value.peak else 0, .events = if (self.plan) |value| value.event_count else 0, .arena_recipe = missing_arena_recipe, .metadata_quota = self.metadata_quota, .arena_quota = self.arena_quota };
+        return .{ .invalidations = self.invalidations, .epoch = self.epoch_id, .phase = self.phase, .metadata = self.metadata.ptr, .arena = self.arena.ptr, .head = self.head.ptr, .graph = if (self.graph) |value| @intFromPtr(value) else 0, .pending_graph = if (self.pending_graph) |value| @intFromPtr(value) else 0, .plan = if (self.plan) |value| @intFromPtr(value) else 0, .arena_layout = missing_arena_layout, .metadata_quota = self.metadata_quota, .arena_quota = self.arena_quota };
     }
     pub fn invalidate(self: *Module, ctx: *context.CudaContext) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -431,10 +429,10 @@ pub const Module = struct {
             self.admitted_arena_layout = layout;
             return;
         }
-        if (!phase.bound or phase.mode != .arena or layout.bytes != phase.old.peak or layout.events != phase.old.events) return error.InvalidPreparedCacheState;
-        const recipe = layout.recipe;
-        if (phase.old.arena_recipe != recipe) return error.PreparedCachePlanChanged;
-        const request = phase.arenaRequest(layout.bytes, layout.events, recipe);
+        if (!phase.bound or phase.mode != .arena) return error.InvalidPreparedCacheState;
+        const admitted = phase.old.arena_layout orelse return error.InvalidPreparedCacheState;
+        if (!std.meta.eql(layout, admitted)) return error.PreparedCachePlanChanged;
+        const request = phase.arenaRequest(admitted);
         var lease = try phase.cold.?.funding.?.take(request, request.captured_arena.amounts());
         errdefer lease.releaseAfterSdkDeath();
         const arena = try buffer.DeviceBuffer.alloc(ctx, layout.bytes);
@@ -809,8 +807,10 @@ test "captured graph wide head and learned arena consume separate exact prefunde
     const plan = owner.plan.?;
     plan.* = .{};
     try plan.declareScratch(1023);
-    try std.testing.expectEqual(arena.old.peak, plan.peak);
-    try std.testing.expectEqual(arena.old.events, plan.event_count);
+    const changed = try plan.layout(0);
+    try std.testing.expectEqual(arena.old.arena_layout.?.bytes, changed.bytes);
+    try std.testing.expectEqual(arena.old.arena_layout.?.events, changed.events);
+    try std.testing.expect(arena.old.arena_layout.?.recipe != changed.recipe);
     try std.testing.expectError(error.PreparedCachePlanChanged, owner.reserveArenaPrepared(&ctx, &arena));
     try std.testing.expectEqual(@as(usize, 2), GraphTestDriver.allocations);
     plan.* = .{};
