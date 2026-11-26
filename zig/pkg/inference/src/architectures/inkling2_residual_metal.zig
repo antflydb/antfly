@@ -40,13 +40,14 @@ pub const Stack = struct {
     pub fn init(a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, width: u32, rows: u32) !Stack {
         if (width == 0 or rows == 0) return error.InvalidShape;
         const count = try std.math.mul(usize, width, rows);
-        const total = try std.math.mul(usize, count, capacity);
+        const total = try std.math.mul(usize, count, capacity + 3);
         const extent = std.math.cast(i32, count) orelse return error.InvalidShape;
         var backing = try allocate(a, runtime, total);
         errdefer backing.deinit();
-        var prelude = try allocate(a, runtime, count);
+        const row_bytes = count * @sizeOf(u16);
+        var prelude = try backing.retainedView(capacity * row_bytes, row_bytes, &.{extent});
         errdefer prelude.deinit();
-        var bank = try allocate(a, runtime, 2 * count);
+        var bank = try backing.retainedView((capacity + 1) * row_bytes, 2 * row_bytes, &.{@intCast(2 * count)});
         errdefer bank.deinit();
         var blocks: [capacity]Tensor = undefined;
         var initialized: usize = 0;
@@ -101,8 +102,14 @@ pub const Stack = struct {
             .restore => {
                 const saved = self.saved_depth orelse return error.InvalidInkling2Schedule;
                 if (self.depth != saved + self.bank_blocks.len) return error.InvalidInkling2Schedule;
-                for (&self.bank_blocks, self.blocks[saved + 1 ..][0..self.bank_blocks.len]) |*destination, *source|
-                    try source.copyInto(destination);
+                const bytes = self.bank.deviceByteLen();
+                var loop = try self.backing.retainedView(
+                    (saved + 1) * self.blocks[0].deviceByteLen(),
+                    bytes,
+                    &.{@intCast(bytes / @sizeOf(u16))},
+                );
+                defer loop.deinit();
+                try loop.copyInto(&self.bank);
                 try self.prelude.copyInto(&self.blocks[saved]);
                 self.depth = saved;
             },
