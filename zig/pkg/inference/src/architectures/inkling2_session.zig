@@ -347,6 +347,26 @@ pub const Pipeline = struct {
         if (self.continue_fn) |keep_going| if (!keep_going(self.continue_ctx.?)) return error.Cancelled;
     }
 
+    fn observePrefill(self: *const Pipeline, request: *decoder.Request, comptime append: anytype, args: anytype) !void {
+        var binding = self.session.invocation_diagnostics orelse return @call(.auto, append, .{request} ++ args);
+        if (!binding.diagnostics.isEnabled()) return @call(.auto, append, .{request} ++ args);
+        var progress: diagnostics.PrefillProgress = .{};
+        binding.planned_prefill = .{
+            .max_append_rows = self.prefill_rows,
+            .attention_workspace_rows = request.append_capacity,
+            .cache_capacity_tokens = request.max_tokens,
+        };
+        binding.prefill_progress = &progress;
+        const Observe = struct {
+            fn run(target: *decoder.Request, actual: *diagnostics.PrefillProgress, values: @TypeOf(args)) !void {
+                const start = target.position();
+                defer actual.commitThrough(@intCast(target.position() - start));
+                return @call(.auto, append, .{target} ++ values);
+            }
+        };
+        return observation.callOperation(binding, .prefill, Observe.run, .{ request, &progress, args });
+    }
+
     fn prefill(self: *Pipeline, request: *decoder.Request, input: []const i32) !void {
         var offset: usize = 0;
         while (offset < input.len) {
@@ -357,11 +377,10 @@ pub const Pipeline = struct {
             var turn: StepScheduler.Waiter = .{};
             try self.model.enterStep(&turn, self.control);
             defer StepScheduler.leave(&turn);
-            const binding = self.session.invocation_diagnostics;
             if (count == 1)
-                try observation.callOperation(binding, .prefill, decoder.Request.append, .{ request, tokens[0] })
+                try self.observePrefill(request, decoder.Request.append, .{tokens[0]})
             else
-                try observation.callOperation(binding, .prefill, decoder.Request.appendTokens, .{ request, tokens[0..count] });
+                try self.observePrefill(request, decoder.Request.appendTokens, .{tokens[0..count]});
             offset += count;
         }
     }
@@ -420,7 +439,7 @@ pub const Pipeline = struct {
                 .len = @as(usize, rows) * row_bytes,
                 .borrowed = true,
             };
-            try observation.callOperation(self.session.invocation_diagnostics, .prefill, decoder.Request.appendEmbeddings, .{ request, input, rows });
+            try self.observePrefill(request, decoder.Request.appendEmbeddings, .{ input, rows });
             offset += rows;
         }
     }
