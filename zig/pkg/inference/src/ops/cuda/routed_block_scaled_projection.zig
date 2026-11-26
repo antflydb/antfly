@@ -35,6 +35,7 @@ const medium_grouped_routes = 512;
 const wide_grouped_routes = 4096;
 const max_grouped_routes = 32_768;
 const min_grouped_input_rows = 16;
+const min_grouped_bf16_ffn_rows = 8;
 const routes_per_group = 8;
 const routes_per_wide_group = 32;
 const routes_per_large_group = 64;
@@ -202,7 +203,7 @@ const FfnLayout = struct {
         const largest = try std.math.mul(usize, routed_rows, @max(r.hidden, r.intermediate));
         const expert_intermediate = try std.math.mul(usize, routed_rows, r.intermediate);
         const expert_hidden = try std.math.mul(usize, routed_rows, r.hidden);
-        const group_rows = r.rows >= min_grouped_input_rows and routed_rows <= max_grouped_routes;
+        const group_rows = r.rows >= min_grouped_bf16_ffn_rows and routed_rows <= max_grouped_routes;
         const width: u32 = if (routed_rows <= medium_grouped_routes) routes_per_group else if (routed_rows <= wide_grouped_routes) routes_per_wide_group else routes_per_large_group;
         // The extra bucket collects invalid expert IDs and preserves zero output.
         // Each nonempty bucket contributes at most width - 1 padding slots.
@@ -430,6 +431,7 @@ pub const Module = struct {
 
     fn groupRoutes(self: *Module, ctx: *Context, r: FfnRequest, layout: FfnLayout, ids: DeviceBuffer) !GroupedRoutes {
         if (self.use_single_route or !r.gate_up.interleaved or !r.down.interleaved or layout.groups.len == 0 or
+            (r.activation_precision != .bf16 and r.rows < min_grouped_input_rows) or
             ctx.info.compute_major != 12 or ctx.info.compute_minor != 1) return .{};
         const groups: GroupedRoutes = .{ .table = layout.groups.view(r.scratch), .count = layout.group_count.view(r.scratch), .width = layout.group_width };
         try self.matvec.init(ctx);

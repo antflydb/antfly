@@ -454,6 +454,20 @@ test "CUDA paged relative attention shares page translations with exact scalar G
                 try std.testing.expectApproxEqAbs(expected, @as(f64, actual), 0.0005);
             }
         };
+        // Both single-row production schedules keep the scalar dot product,
+        // key order, and split layout, including after the window wraps.
+        const row_bytes = q_heads * head_dim * @sizeOf(u16);
+        request.geometry.rows = 1;
+        request.geometry.start = @intCast(end - 1);
+        request.use_native_prefill = false;
+        request.relative_projection = null;
+        for ([_]bool{ true, false }, 0..) |serial, i| {
+            module.use_serial_chunks = serial;
+            try module.run(&ctx, request);
+            try deviceSlice(result, 0, row_bytes).copyToHost(&ctx, host.bytes()[i * row_bytes ..][0..row_bytes]);
+        }
+        try ctx.synchronize();
+        try std.testing.expectEqualSlices(u8, host.constBytes()[0..row_bytes], host.constBytes()[row_bytes..][0..row_bytes]);
     }
 }
 

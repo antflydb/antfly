@@ -29,6 +29,8 @@ const Program = embedded.EmbeddedModule(struct {
 const head_dim = 128;
 const partial_width = head_dim + 2;
 const keys_per_split = 128;
+const shared_decode_min_position = 4096;
+const shared_decode_window = 1024;
 const shared_query_rows = 4;
 const shared_query_min_position = 8192;
 const page_rows_min_queries = 16;
@@ -256,11 +258,13 @@ pub const Module = struct {
         var args = [_]?*anyopaque{&params};
         const tuned = !self.use_serial_chunks and ctx.info.compute_major == 12 and ctx.info.compute_minor <= 1;
         const parallel = tuned and q.rows == 1 and g.key_tile <= keys_per_split;
-        const prefill = tuned and ctx.info.compute_minor == 1 and replay_bytes == 0;
-        const page_rows = prefill and self.use_page_rows and page_tokens == 16 and q.rows >= page_rows_min_queries and q.start >= page_rows_min_position and
+        const eager_sm121 = tuned and ctx.info.compute_minor == 1 and replay_bytes == 0;
+        const shared_decode = eager_sm121 and q.rows == 1 and q.start >= shared_decode_min_position and
+            page_tokens == 16 and q.q_heads / q.kv_heads == 3 and (q.window == 0 or q.window == shared_decode_window);
+        const page_rows = eager_sm121 and self.use_page_rows and page_tokens == 16 and q.rows >= page_rows_min_queries and q.start >= page_rows_min_position and
             q.rows % shared_query_rows == 0;
-        const share_rows = prefill and q.window == 0 and q.start >= shared_query_min_position and q.rows % shared_query_rows == 0;
-        const mma = r.use_native_prefill and prefill and page_tokens == 16 and q.rows >= wide_query_rows and (r.query.ptr | r.kv.planes.key.ptr | r.kv.planes.value.ptr) % 16 == 0;
+        const share_rows = eager_sm121 and q.window == 0 and q.start >= shared_query_min_position and q.rows % shared_query_rows == 0;
+        const mma = r.use_native_prefill and eager_sm121 and page_tokens == 16 and q.rows >= wide_query_rows and (r.query.ptr | r.kv.planes.key.ptr | r.kv.planes.value.ptr) % 16 == 0;
         if (fuse_relative and (!mma or q.window == 0 or q.relative_extent == 0 or
             !self.supportsRelativeProjection(ctx, q.rows, q.q_heads, q.kv_heads))) return error.InvalidAttentionGeometry;
         if (mma) {
@@ -288,6 +292,12 @@ pub const Module = struct {
             try self.program.launch(ctx, entry, g.splits, g.rows_by_heads / shared_query_rows, 32, &args);
         } else if (share_rows) {
             try self.program.launch(ctx, .global_rows4_chunks, g.splits, g.rows_by_heads / shared_query_rows, 32, &args);
+        } else if (shared_decode) {
+            if (q.window == 0) {
+                try self.program.launch(ctx, .page16_global_decode_chunks, q.kv_heads, g.splits, 384, &args);
+            } else {
+                try self.program.launch(ctx, .page16_sliding_decode_chunks, g.splits, q.kv_heads, 768, &args);
+            }
         } else {
             try self.program.launch(ctx, if (parallel) .parallel_chunks else .chunks, g.splits, g.rows_by_heads, if (parallel) 256 else 32, &args);
         }

@@ -443,10 +443,16 @@ pub const Draft = struct {
         const feature = region(input, (2 * rank + width) * 2, width * 2);
         try state.copyFromDevice(self.ctx, self.zero_state, rank * 2);
         try feature.copyFromDevice(self.ctx, rows(self.get(.context_rnn), self.rnn_side, 1, width), width * 2);
-        var last = anchor;
-        var proposed: [proposal_rows]u32 = @splat(0);
+        const tokens = self.get(.token);
+        const previous = self.weight(.previous);
+        try prev.copyFromDevice(self.ctx, rows(previous, anchor, 1, rank), rank * 2);
         for (0..count) |i| {
-            try prev.copyFromDevice(self.ctx, rows(self.weight(.previous), last, 1, rank), rank * 2);
+            if (i != 0) {
+                var addresses = [_]u64{ prev.ptr, previous.ptr, tokens.ptr + (i - 1) * @sizeOf(u32) };
+                var valid_tokens = self.shared.vocab;
+                var row_width: u32 = rank;
+                try self.launch(.gather_row, (rank + 127) / 128, 1, 128, .{ &addresses[0], &addresses[1], &addresses[2], &valid_tokens, &row_width });
+            }
             try hidden.copyFromDevice(self.ctx, rows(normed, i + 1, 1, width), width * 2);
             const raw = self.get(.rnn_raw);
             try blas.matmulBf16WeightBiasF32Out(self.ctx, raw, input, self.weight(.rnn), self.weight(.rnn_bias), self.get(.blas), 1, rnn_input_width, 3 * rank);
@@ -456,10 +462,12 @@ pub const Draft = struct {
             try self.launch(.recurrent, 1, 1, rank, .{ &ptrs[0], &ptrs[1], &ptrs[2], &state_rank });
             const correction = self.get(.correction);
             try blas.matmulBf16WeightBiasBf16Out(self.ctx, correction, latent, self.folded, self.fold_bias, self.get(.blas), 1, rank, vocab);
-            last = try self.select(rows(base, i, 1, vocab), correction);
-            proposed[i] = last;
+            try self.select(rows(base, i, 1, vocab), correction, region(tokens, i * @sizeOf(u32), @sizeOf(u32)));
         }
-        return proposed;
+        // The stream owns the intermediate token indices. Download the
+        // complete proposal once before the target begins verification.
+        const proposed = try self.readIndices(count);
+        return proposed[0..proposal_rows].*;
     }
 
     /// Run the target vocabulary projection for all speculative input rows
@@ -476,7 +484,11 @@ pub const Draft = struct {
         try blas.matmulBf16WeightF32Out(self.ctx, logits, normalized, self.shared.unembed, self.get(.blas), count, width, stride);
         try self.launch(.target_argmax_tiles, tiles, count, 256, .{ &ptrs[0], &ptrs[1], &vocab, &stride, &cap });
         try self.launch(.argmax_merge, 1, count, 256, .{ &ptrs[2], &ptrs[0], &tiles });
-        try token.copyIndexMetadataToHost(self.ctx, self.result.bytes()[0 .. count * 4]);
+        return self.readIndices(count);
+    }
+
+    fn readIndices(self: *Draft, count: u32) ![block_rows]u32 {
+        try self.get(.token).copyIndexMetadataToHost(self.ctx, self.result.bytes()[0 .. count * 4]);
         try self.ctx.synchronize();
         var ids: [block_rows]u32 = @splat(0);
         for (ids[0..count], 0..) |*id, i| {
@@ -486,18 +498,12 @@ pub const Draft = struct {
         return ids;
     }
 
-    fn select(self: *Draft, base: DeviceBuffer, correction: DeviceBuffer) !u32 {
-        const token = self.get(.token);
+    fn select(self: *Draft, base: DeviceBuffer, correction: DeviceBuffer, token: DeviceBuffer) !void {
         var ptrs = [_]u64{ self.get(.tiles).ptr, base.ptr, correction.ptr, token.ptr };
         var vocab = self.shared.vocab;
         var cap = self.shared.logit_cap;
         var tiles = (vocab - 1) / argmax_tile + 1;
         try self.launch(.argmax_tiles, tiles, 1, 256, .{ &ptrs[0], &ptrs[1], &ptrs[2], &vocab, &cap });
         try self.launch(.argmax_merge, 1, 1, 256, .{ &ptrs[3], &ptrs[0], &tiles });
-        try token.copyIndexMetadataToHost(self.ctx, self.result.bytes()[0..4]);
-        try self.ctx.synchronize();
-        const id = std.mem.readInt(u32, self.result.constBytes()[0..4], .little);
-        if (id >= self.shared.vocab) return error.NonFiniteInkling2DraftLogit;
-        return id;
     }
 };

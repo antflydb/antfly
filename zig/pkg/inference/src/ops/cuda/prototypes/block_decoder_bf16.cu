@@ -148,6 +148,16 @@ extern "C" __global__ void antfly_bshd_block_gqa_d128_bf16(
     output[qbase + tid] = rounded(out / running_sum);
 }
 
+extern "C" __global__ void antfly_gather_indexed_row_bf16(
+    __nv_bfloat16* out, const __nv_bfloat16* table, const uint32_t* index,
+    unsigned row_count, unsigned width
+) {
+    const unsigned column = blockIdx.x * blockDim.x + threadIdx.x;
+    if (column >= width) return;
+    const unsigned row = *index;
+    out[column] = row < row_count ? table[(size_t)row * width + column] : __float2bfloat16_rn(0.0f);
+}
+
 extern "C" __global__ void antfly_low_rank_recurrent_gate_bf16(
     Bf16* state, Bf16* latent, const float* raw, unsigned rank
 ) {

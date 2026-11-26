@@ -395,6 +395,8 @@
       "antfly_paged_relative_gqa_d128_bf16_page16_m128n64_pipeline",
       "antfly_paged_relative_gqa_d128_bf16_page16_m128n64_fused_relative",
       "antfly_paged_relative_gqa_d128_bf16_parallel_chunks",
+      "antfly_paged_relative_gqa3_d128_bf16_page16_global_decode_chunks",
+      "antfly_paged_relative_gqa3_d128_bf16_page16_sliding_decode_chunks",
       "antfly_paged_relative_gqa_d128_bf16_reduce_sink_gate",
       "antfly_paged_kv_append_bf16",
       "antfly_paged_kv_append_rows_bf16"
@@ -600,6 +602,7 @@
       "antfly_swiglu_separate_bf16",
       "antfly_bshd_block_gqa_d128_bf16",
       "antfly_low_rank_recurrent_gate_bf16",
+      "antfly_gather_indexed_row_bf16",
       "antfly_softcapped_sum_argmax_bf16_tiles",
       "antfly_softcapped_argmax_rows_f32_tiles",
       "antfly_argmax_merge_tiles_f32"

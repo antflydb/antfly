@@ -118,7 +118,7 @@ test "CUDA Inkling 2 loads and executes same-expert groups with identical BF16 o
         var layer = try moe.Layer.load(&ctx, &source, &staging, number);
         defer layer.deinit(&ctx);
         try forward.prepareResident(&ctx, config, &layer);
-        for ([_]u32{ 16, 32, 64, 128, 256, 512, 1024, 2048 }) |rows| {
+        for ([_]u32{ 8, 16, 32, 64, 128, 256, 512, 1024, 2048 }) |rows| {
             const bytes = rows * row_bytes;
             var host = try buffer.HostBuffer.alloc(&ctx, bytes * 2);
             defer host.free(&ctx);

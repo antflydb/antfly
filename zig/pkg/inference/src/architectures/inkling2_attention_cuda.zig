@@ -347,10 +347,12 @@ pub const Forward = struct {
         if (!fuse_relative)
             try blas.matmulBf16WeightBf16Out(ctx, r.workspace.get(.rel_logits), r.workspace.get(.r_norm), layer.get(.relative_basis), r.blas_space, @as(usize, rows) * text.num_attention_heads, text.d_rel, text.rel_extent);
         const staged: cache.Planes = .{ .key = r.workspace.get(.k_norm), .value = r.workspace.get(.v_norm) };
+        const decode_append = rows == 1 and position >= text.sliding_window_size and
+            ctx.info.compute_major == 12 and ctx.info.compute_minor == 1;
         const binding = if (replay) |binding| blk: {
             try self.attention.appendReplay(ctx, binding, r.replay_position, r.page_ids_device, staged, text.num_key_value_heads);
             break :blk binding;
-        } else if (rows >= 16 and ctx.info.compute_major >= 8) blk: {
+        } else if (decode_append or (rows >= 16 and ctx.info.compute_major >= 8)) blk: {
             break :blk try r.cache_owner.queueWriteWithPages(r.visit, staged, r.page_ids_device, &self.attention);
         } else blk: {
             try r.cache_owner.queueWrite(r.visit, staged);

@@ -984,6 +984,102 @@ accepted 36 of 84 proposals with the wide policy.
 With the 2,304-row policy, greedy and forced DSpark matched on the
 70-token response, with 54 of 105 proposals accepted.
 
+### Global attention and DSpark on GB10
+
+For eager single-row global attention at positions of 4,096 or more, one
+CUDA block shares each K/V load across three query heads. The kernel keeps
+the scalar dot-product and ascending-key softmax order. At position 32,866,
+one attention visit took 0.717 ms, down from 0.852 ms, with bit-identical FP32
+partials and BF16 output. The global Tensor Core prefill path caches the page
+IDs for both K/V buffers and packs probability and residual BF16 pairs.
+At position 32,768 with 2,304 query rows, one visit took 27.74 ms, down from
+29.36 ms, with bit-identical BF16 output.
+
+The warm HTTP comparison used the checkpoint and pinned vLLM build above,
+matched prompt tokens per workload, and a 3 GiB KV budget for Antfly. Greedy
+decode numbers exclude the first of 128 generated tokens. Medians cover
+three short and two long decode runs per prompt. Every Antfly completion
+matched the corresponding pre-change response, and the worker returned
+its request reservations.
+
+| Workload | Earlier Antfly | Antfly | vLLM |
+| --- | ---: | ---: | ---: |
+| 31-token story TTFT | 213 ms | 170 ms | 91 ms |
+| 37-token code TTFT | 227 ms | 230 ms | 108 ms |
+| 10,586-token retrieval TTFT | 3.717 s | 3.756 s | 3.296 s |
+| 32,848-token retrieval TTFT | 11.632 s | 11.647 s | 10.375 s |
+| 31-token story decode | 39.86 tok/s | 39.68 tok/s | 37.38 tok/s |
+| 37-token code decode | 39.84 tok/s | 39.13 tok/s | 37.02 tok/s |
+| 10,604-token decode | 31.93 tok/s | 32.40 tok/s | 34.21 tok/s |
+| 32,866-token decode | 28.03 tok/s | 28.77 tok/s | 31.37 tok/s |
+
+A one-batch short-prefill trial with fused greedy selection reached 91 ms
+on the story and 101 ms on the code prompt in the warm CLI. Both first
+tokens matched. The story diverged during the 128-token completion, so
+the serving worker keeps the qualified chunk schedule.
+
+The DSpark recurrent proposal keeps selected indices on the GPU for the
+next embedding lookup and downloads up to seven indices at once. The BF16
+expert path groups the eight verification rows by expert so matched routes
+share weight loads. Native eight-row FFN timings for distinct embeddings
+fell from 1.08 to 0.78 ms for NVFP4 and from 2.34 to 1.67 ms for MXFP8.
+Both outputs were bit-identical with distinct and mixed repeated rows.
+The same grouped path sped up the story prompt's 14-row prefill tail.
+Forced DSpark code decode rose from 37.58 to 46.82 tok/s, with identical
+greedy output. vLLM DSpark reached 61.86 tok/s. Forced Antfly DSpark
+story decode rose from 19.32 to 24.43 tok/s and kept the existing block
+verifier's divergence from greedy. vLLM DSpark reached 28.40 tok/s on
+the story. An experimental row-wise verifier matched greedy at
+31.78 tok/s on that prompt.
+
+At 10,604 and 32,866 prompt tokens, forced row-wise DSpark matched the
+128-token greedy completions at 25.60 and 22.14 tok/s respectively.
+The automatic policy used regular greedy decode at 32.04 and 28.59 tok/s
+on the same prompts. The worker recorded each policy outcome and released
+all request reservations.
+
+All 42 saved logit vectors matched the pre-grouping run bit for bit. The
+CUDA replay comparison covered 1,024 tokens, and eager decode crossed
+position 8,192 and completed through 8,194 tokens.
+
+### Long greedy decode on GB10
+
+Starting at position 4,096, the single-row global and 1,024-token sliding
+schedules compute softmax weights from warp prefix maxima and retain the
+scalar ascending-key FMA order. The global launch schedules neighboring K/V
+heads together. After it reaches the rolling window, the decoder writes
+both K/V planes with one paged scatter per visit.
+
+At position 32,866, the regenerated kernels reduced a global visit from
+0.716 to 0.663 ms and a sliding visit from 43 to 25 µs. The sweep matched
+FP32 split records and BF16 outputs through 128K positions, including
+sparse page tables and a nonzero sliding page origin. The paired K/V
+scatter took 0.197 ms across 48 visits, down from 0.391 ms for two copies
+per visit, with identical bytes in both planes. Parallel split combining
+and dividing output features between warps produced smaller or
+inconsistent gains in the operator sweep.
+
+On the 32K full-model profile, the eight global attention visits fell
+from 5.69 to 5.34 ms per token and the 40 sliding visits fell from 1.99 to
+1.37 ms. The 10K and 32K fixtures produced identical token IDs for all
+128 generated tokens. All 42 saved full-vocabulary logit vectors were
+bit-identical, and both new SM121 entries used 40 registers with zero
+spills.
+
+Warm single-stream HTTP runs on Spark used the 3 GiB Antfly KV budget
+with prefix reuse and speculation disabled. Each Antfly median covers
+three 128-token greedy completions. The pinned vLLM medians cover two.
+The six updated responses matched the frozen completions, and the worker
+released its request reservations.
+
+| Prompt tokens | Frozen Antfly | Current Antfly | vLLM |
+| ---: | ---: | ---: | ---: |
+| 10,604 | 32.64 tok/s | 33.51 tok/s | 34.21 tok/s |
+| 32,866 | 28.92 tok/s | 29.92 tok/s | 31.37 tok/s |
+
+The paged attention, hybrid KV, and decoder suites passed all 10 CUDA
+tests, including rollover and eager decode through position 8,194.
+
 `/ai/v1/chat/completions` and `/ai/v1/generate` accept
 `chat_template_kwargs.enable_thinking` and `reasoning_effort`. Set
 `reasoning_effort` to `none`, `minimal`, `low`, `medium`, `high`, `xhigh`,

@@ -334,12 +334,13 @@ using RelativeTile = __nv_bfloat16[mma_keys][head_dim];
 
 __device__ void prefetch_kv_tile(const PagedRelativeAttentionParams& p,
                                   unsigned tile, unsigned end, unsigned kv_head,
-                                  RelativeTile& keys, RelativeTile& values) {
+                                  RelativeTile& keys, RelativeTile& values, uint32_t* page_cache) {
     #pragma unroll
     for (unsigned index = threadIdx.x * mma_vector; index < mma_keys * head_dim; index += 256 * mma_vector) {
         const unsigned row = index / head_dim;
         const unsigned feature = index % head_dim;
         const unsigned page = cache_page16(p, tile + row);
+        if (feature == 0 && row % 16 == 0) page_cache[row / 16] = page;
         const bool present = page != UINT32_MAX && tile + row < end;
         const size_t offset = present ? ((size_t(page) * 16 + row % 16) * p.kv_heads + kv_head) * head_dim + feature : 0;
         const unsigned column = cache_tile_column(row, feature);
@@ -371,15 +372,23 @@ __device__ float query_score(float dot, const PagedRelativeAttentionParams& p,
     return dot * p.score_scale + bias;
 }
 
-__device__ uint32_t probability_pair(const float (&prob)[4], unsigned i, bool residual) {
-    const auto a = __float2bfloat16_rn(prob[i]);
-    const auto b = __float2bfloat16_rn(prob[i + 1]);
-    if (!residual) return pack_pair(a, b);
-    return pack_pair(__float2bfloat16_rn(prob[i] - __bfloat162float(a)),
-                     __float2bfloat16_rn(prob[i + 1] - __bfloat162float(b)));
-}
 constexpr unsigned rel_width = 16;
 constexpr unsigned relative_columns = 72; // 64 keys plus one tile column for the within-warp shear
+struct ProbabilityPair {
+    uint32_t high;
+    uint32_t low;
+};
+__device__ ProbabilityPair probability_pair(const float (&prob)[4], unsigned i) {
+    const float a = prob[i];
+    const float b = prob[i + 1];
+    uint32_t high, low;
+    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(high) : "f"(a), "f"(b));
+    const float da = a - __uint_as_float(high << 16);
+    const float db = b - __uint_as_float(high & 0xffff0000u);
+    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(low) : "f"(da), "f"(db));
+    return {high, low};
+}
+
 template<bool Pipeline = false, bool FusedRelative = false>
 __device__ __forceinline__ void paged_relative_tile(
     const PagedRelativeAttentionParams& p, unsigned query_rows,
@@ -414,6 +423,7 @@ __device__ __forceinline__ void paged_relative_tile(
     auto* double_buffer = reinterpret_cast<RelativeTile*>(double_buffer_storage);
     auto* bias = reinterpret_cast<__nv_bfloat16 (*)[relative_columns]>(double_buffer + (Pipeline ? 4 : 2));
     __shared__ uint32_t pages[mma_keys / 16];
+    __shared__ uint32_t pipeline_pages[2][mma_keys / 16];
     uint32_t q[head_dim / 16][4];
     #pragma unroll
     for (unsigned d = 0; d < head_dim / 16; ++d) {
@@ -447,7 +457,7 @@ __device__ __forceinline__ void paged_relative_tile(
     const unsigned stride = p.splits * mma_keys;
     unsigned buffer = 0;
     if constexpr (Pipeline) {
-        if (first_tile < end) prefetch_kv_tile(p, first_tile, end, kv_head, double_buffer[0], double_buffer[1]);
+        if (first_tile < end) prefetch_kv_tile(p, first_tile, end, kv_head, double_buffer[0], double_buffer[1], pipeline_pages[0]);
     }
     for (unsigned tile = first_tile; tile < end; tile += stride) {
         auto& keys = (Pipeline || FusedRelative) ? double_buffer[buffer * 2] : single_keys;
@@ -459,7 +469,7 @@ __device__ __forceinline__ void paged_relative_tile(
             const unsigned next_tile = tile + stride;
             if (next_tile < end) {
                 const unsigned next_buffer = (buffer ^ 1) * 2;
-                prefetch_kv_tile(p, next_tile, end, kv_head, double_buffer[next_buffer], double_buffer[next_buffer + 1]);
+                prefetch_kv_tile(p, next_tile, end, kv_head, double_buffer[next_buffer], double_buffer[next_buffer + 1], pipeline_pages[buffer ^ 1]);
                 asm volatile("cp.async.wait_group 1;" ::: "memory");
             } else {
                 asm volatile("cp.async.wait_group 0;" ::: "memory");
@@ -519,7 +529,7 @@ __device__ __forceinline__ void paged_relative_tile(
         #pragma unroll
         for (unsigned n = 0; n < mma_keys / 8; ++n) {
             const unsigned key = tile + n * 8 + pair;
-            const bool present = (Pipeline ? cache_page16(p, key) : pages[n / 2]) != UINT32_MAX;
+            const bool present = (Pipeline ? pipeline_pages[buffer][n / 2] : pages[n / 2]) != UINT32_MAX;
             #pragma unroll
             for (unsigned r = 0; r < 2; ++r) {
                 if constexpr (FusedRelative) {
@@ -570,21 +580,17 @@ __device__ __forceinline__ void paged_relative_tile(
         }
         #pragma unroll
         for (unsigned n = 0; n < mma_keys / 8; n += 2) {
-            const uint32_t a0 = probability_pair(scores[n], 0, false);
-            const uint32_t a1 = probability_pair(scores[n], 2, false);
-            const uint32_t a2 = probability_pair(scores[n + 1], 0, false);
-            const uint32_t a3 = probability_pair(scores[n + 1], 2, false);
-            const uint32_t r0 = probability_pair(scores[n], 0, true);
-            const uint32_t r1 = probability_pair(scores[n], 2, true);
-            const uint32_t r2 = probability_pair(scores[n + 1], 0, true);
-            const uint32_t r3 = probability_pair(scores[n + 1], 2, true);
+            const ProbabilityPair p0 = probability_pair(scores[n], 0);
+            const ProbabilityPair p1 = probability_pair(scores[n], 2);
+            const ProbabilityPair p2 = probability_pair(scores[n + 1], 0);
+            const ProbabilityPair p3 = probability_pair(scores[n + 1], 2);
             #pragma unroll
             for (unsigned d = 0; d < head_dim / 8; ++d) {
                 uint32_t b0, b1;
                 const unsigned row = n * 8 + (lane & 15);
                 load_matrix_pair<true>(&values[row][cache_tile_column(row, d * 8)], b0, b1);
-                relative_mma(output[d], a0, a1, a2, a3, b0, b1);
-                relative_mma(output[d], r0, r1, r2, r3, b0, b1);
+                relative_mma(output[d], p0.high, p1.high, p2.high, p3.high, b0, b1);
+                relative_mma(output[d], p0.low, p1.low, p2.low, p3.low, b0, b1);
             }
         }
         __syncthreads();
@@ -713,6 +719,111 @@ extern "C" __global__ void antfly_paged_relative_gqa_d128_bf16_parallel_chunks(
         maximum = updated_max;
     }
     store_partial(dst, lane, value, maximum, denom);
+}
+
+// Each block shares a paged K/V tile across three query heads.
+template<unsigned tile_keys, unsigned warps, bool HeadsFirst>
+__device__ __forceinline__ void page16_shared_decode(const PagedRelativeAttentionParams& p) {
+    constexpr unsigned heads = 3;
+    const unsigned lane = threadIdx.x & 31;
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned split = HeadsFirst ? blockIdx.y : blockIdx.x;
+    const unsigned kv_head = HeadsFirst ? blockIdx.x : blockIdx.y;
+    const unsigned first_head = kv_head * heads;
+    const Chunk chunk = chunk_range(p, split, 0);
+    __shared__ float scores[heads][tile_keys];
+    __shared__ __nv_bfloat16 values[tile_keys][head_dim];
+    __shared__ bool valid[tile_keys];
+    __shared__ float2 weights[heads][tile_keys];
+    float q[heads][4];
+    #pragma unroll
+    for (unsigned h = 0; h < heads; ++h) {
+        #pragma unroll
+        for (unsigned i = 0; i < 4; ++i)
+            q[h][i] = __bfloat162float(p.query[(first_head + h) * head_dim + i * 32 + lane]);
+    }
+    float maximum = -INFINITY, denom = 0.0f, value[4] = {};
+    for (unsigned begin = chunk.begin; begin < chunk.end; begin += tile_keys) {
+        const unsigned count = min(tile_keys, chunk.end - begin);
+        for (unsigned i = warp; i < count; i += warps) {
+            const unsigned key_pos = begin + i;
+            const uint32_t page = cache_page16(p, key_pos);
+            const bool present = page != UINT32_MAX;
+            if (lane == 0) valid[i] = present;
+            if (!present) continue;
+            const size_t row = (size_t(page) << 4) + (key_pos & 15u);
+            const size_t base = (row * p.kv_heads + kv_head) * head_dim;
+            float dot[heads] = {};
+            #pragma unroll
+            for (unsigned j = 0; j < 4; ++j) {
+                const unsigned component = j * 32 + lane;
+                const float key = __bfloat162float(p.keys[base + component]);
+                values[i][component] = p.values[base + component];
+                #pragma unroll
+                for (unsigned h = 0; h < heads; ++h) dot[h] = __fmaf_rn(q[h][j], key, dot[h]);
+            }
+            #pragma unroll
+            for (unsigned h = 0; h < heads; ++h) {
+                const float sum = antfly_row_warp_sum(dot[h]);
+                if (lane == 0) {
+                    const unsigned distance = chunk.position - key_pos;
+                    const float bias = distance < p.relative_extent ?
+                        __bfloat162float(p.relative[(first_head + h) * p.relative_extent + distance]) : 0.0f;
+                    scores[h][i] = sum * p.score_scale + bias;
+                }
+            }
+        }
+        __syncthreads();
+        if (warp < heads) {
+            // Prefix maxima give each key the same two exponential weights
+            // as the scalar online softmax. Each lane computes one key.
+            constexpr unsigned full_warp = 0xffffffffu;
+            for (unsigned block = 0; block < count; block += 32u) {
+                const unsigned key = block + lane;
+                const bool present = key < count && valid[key];
+                const float score = present ? scores[warp][key] : -INFINITY;
+                float prefix = fmaxf(score, maximum);
+                #pragma unroll
+                for (unsigned distance = 1; distance < 32; distance *= 2) {
+                    const float prior = __shfl_up_sync(full_warp, prefix, distance);
+                    if (lane >= distance) prefix = fmaxf(prefix, prior);
+                }
+                const float prior = __shfl_up_sync(full_warp, prefix, 1);
+                const float before = lane == 0 ? maximum : prior;
+                if (present) weights[warp][key] = make_float2(expf(before - prefix), expf(score - prefix));
+                maximum = __shfl_sync(full_warp, prefix, 31);
+            }
+            __syncwarp();
+
+            // Preserve the ascending-key FMA order for each output feature.
+            #pragma unroll 4
+            for (unsigned i = 0; i < count; ++i) {
+                if (!valid[i]) continue;
+                const float2 w = weights[warp][i];
+                denom = __fmaf_rn(denom, w.x, w.y);
+                #pragma unroll
+                for (unsigned j = 0; j < 4; ++j)
+                    value[j] = __fmaf_rn(w.y, __bfloat162float(values[i][j * 32 + lane]), value[j] * w.x);
+            }
+        }
+        __syncthreads();
+    }
+    if (warp < heads) {
+        float* dst = p.partials + (size_t(first_head + warp) * p.splits + split) * partial_width;
+        store_partial(dst, lane, value, maximum, denom);
+    }
+}
+
+extern "C" __global__ void antfly_paged_relative_gqa3_d128_bf16_page16_global_decode_chunks(
+    const __grid_constant__ PagedRelativeAttentionParams p
+) {
+    page16_shared_decode<48, 12, true>(p);
+}
+
+extern "C" __global__ void antfly_paged_relative_gqa3_d128_bf16_page16_sliding_decode_chunks(
+    const __grid_constant__ PagedRelativeAttentionParams p
+) {
+    page16_shared_decode<64, 24, false>(p);
 }
 
 extern "C" __global__ void antfly_paged_relative_gqa_d128_bf16_reduce_sink_gate(
