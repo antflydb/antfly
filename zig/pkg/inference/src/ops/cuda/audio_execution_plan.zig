@@ -116,6 +116,11 @@ pub const Entry = struct {
     disabled: bool = false,
     owner: ?*Owner = null,
 
+    pub fn executableFor(self: *const Entry, input_bytes: usize, output_bytes: usize) ?Owner.Executable {
+        const owner = self.owner orelse return null;
+        return owner.executableFor(input_bytes, output_bytes);
+    }
+
     pub fn retireOwner(self: *Entry, current: Cleanup) !void {
         const owner = self.owner orelse return;
         self.owner = null;
