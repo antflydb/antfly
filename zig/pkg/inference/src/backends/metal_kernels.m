@@ -12952,7 +12952,7 @@ static NSString *termite_metal_shader_source(void) {
            // tile-codegen:end residual.sum_bf16 family
            // tile-codegen:begin residual.mix_bf16 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "struct ResidualMixBf16Params {\n"
-           "    uint rows, width, sources, add_last, normalize, block_stride_rows;\n"
+           "    uint rows, width, sources, add_last, normalize, block_stride_rows, block_indices;\n"
            "    float epsilon, norm_epsilon;\n"
            "};\n"
            "\n"
@@ -12984,7 +12984,7 @@ static NSString *termite_metal_shader_source(void) {
            "    const float scale = rsqrt(float(p.width));\n"
            "    for (uint source = 0; source < p.sources; ++source) {\n"
            "        const bool final = source + 1u == p.sources;\n"
-           "        const device bfloat *buf = final ? last + base : blocks + ulong(source) * p.block_stride_rows * p.width + base;\n"
+           "        const device bfloat *buf = final ? last + base : blocks + ulong((p.block_indices >> (4u * source)) & 15u) * p.block_stride_rows * p.width + base;\n"
            "        float dot = 0.0f, square = 0.0f;\n"
            "        for (uint column = tid; column < p.width; column += 128u) {\n"
            "            const float x = float(buf[column]) + (final && p.add_last ? float(add[base + column]) : 0.0f);\n"
@@ -13016,7 +13016,7 @@ static NSString *termite_metal_shader_source(void) {
            "            const bool final = source + 1u == p.sources;\n"
            "            const ulong index = base + column;\n"
            "            const float x = final ? float(last[index]) + (p.add_last ? float(add[index]) : 0.0f)\n"
-           "                                  : float(blocks[ulong(source) * p.block_stride_rows * p.width + index]);\n"
+           "                                  : float(blocks[ulong((p.block_indices >> (4u * source)) & 15u) * p.block_stride_rows * p.width + index]);\n"
            "            result = fma(x, weights[source], result);\n"
            "        }\n"
            "        if (p.normalize) {\n"
@@ -38157,7 +38157,7 @@ int antfly_metal_dispatch_head_norm_bf16(
 }
 
 typedef struct {
-    uint32_t rows, width, sources, add_last, normalize, block_stride_rows;
+    uint32_t rows, width, sources, add_last, normalize, block_stride_rows, block_indices;
     float epsilon, norm_epsilon;
 } antfly_metal_residual_mix_bf16_params;
 
@@ -38174,7 +38174,12 @@ int antfly_metal_dispatch_residual_mix_bf16(
         !termite_metal_size_mul(row_bytes, p->block_stride_rows, &stride_bytes) ||
         !termite_metal_size_mul(bf16_bytes, p->normalize ? 1 : 2, &output_bytes)) return -1;
     if (p->sources > 1) {
-        if (!termite_metal_size_mul(stride_bytes, p->sources - 2, &blocks) ||
+        uint32_t max_slot = 0;
+        for (uint32_t source = 0; source + 1 < p->sources; ++source) {
+            uint32_t slot = (p->block_indices >> (4u * source)) & 15u;
+            if (slot > max_slot) max_slot = slot;
+        }
+        if (!termite_metal_size_mul(stride_bytes, max_slot, &blocks) ||
             blocks > SIZE_MAX - bf16_bytes) return -1;
         blocks += bf16_bytes;
     }

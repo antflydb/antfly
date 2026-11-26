@@ -54085,6 +54085,8 @@ pub const ResidualMixBf16 = struct {
     epsilon: f32,
     norm_epsilon: f32 = 0,
     block_stride_rows: ?u32 = null,
+    /// Four bits per logical source, in reduction order.
+    block_indices: u32 = 0x76543210,
 
     const Buffer = RoutedBlockScaledProjection.Buffer;
     const Wire = extern struct {
@@ -54094,6 +54096,7 @@ pub const ResidualMixBf16 = struct {
         add_last: u32,
         normalize: u32,
         block_stride_rows: u32,
+        block_indices: u32,
         epsilon: f32,
         norm_epsilon: f32,
     };
@@ -54127,6 +54130,7 @@ pub const ResidualMixBf16 = struct {
             .add_last = @intFromBool(input.add_last != null),
             .normalize = @intFromBool(input.gamma != null),
             .block_stride_rows = self.block_stride_rows orelse self.rows,
+            .block_indices = self.block_indices,
             .epsilon = self.epsilon,
             .norm_epsilon = self.norm_epsilon,
         }) != 0) return error.MetalKernelDispatchFailed;
@@ -54169,6 +54173,19 @@ test "Metal BF16 residual mixing preserves F32 and normalized output boundaries"
     var bf16: [128]u16 = undefined;
     try tensors[5].downloadBytesInto(std.mem.asBytes(&bf16));
     try std.testing.expectEqual(twos, bf16);
+
+    var blocks = try MetalTensor.deviceAllocateTyped(a, runtime, .i16, .shared, &.{256});
+    defer blocks.deinit();
+    try blocks.uploadBytes(std.mem.asBytes(&(minus ++ ones)));
+    var rotated = mixed;
+    rotated.block_indices = 1;
+    try beginFrame(runtime);
+    errdefer cancelFrame(runtime) catch {};
+    try rotated.encode(runtime, .{ .blocks = &blocks, .last = &tensors[1], .query = &tensors[2] }, &tensors[4]);
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+    try tensors[4].downloadF32Into(&raw);
+    for (raw) |value| try std.testing.expectApproxEqAbs(@as(f32, 1), value, 0.00001);
 }
 
 /// Normalize the destination/message pair, project the gain and forget gates,

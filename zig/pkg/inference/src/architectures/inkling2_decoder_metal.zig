@@ -584,10 +584,7 @@ pub const Request = struct {
         try metal.beginPlannedComputeScope(runtime, @backingInt(metal.ComputeSource.layer), .layer);
         for (self.model.schedule) |op| {
             const boundary = op.weight_layer % text.n_layers_per_attn_res_block == 0;
-            const restores = op.preludeAction(core_start) == .restore;
-            if (restores) try metal.endPlannedComputeScope(runtime);
             try work.stack.advance(op, core_start, boundary);
-            if (restores) try metal.beginPlannedComputeScope(runtime, @backingInt(metal.ComputeSource.layer), .layer);
             try self.visit(work, &pending, op, boundary);
         }
         try metal.endPlannedComputeScope(runtime);
@@ -597,7 +594,7 @@ pub const Request = struct {
             const stack = &work.stack;
             const sources: u32 = @intCast(stack.depth + 1);
             if (stack.rows == 1) {
-                try self.model.endpoints.logits(runtime, &stack.backing, stack.current(), sources, 1, self.decode.get(.normalized), logits);
+                try self.model.endpoints.logits(runtime, &stack.backing, stack.current(), sources, 1, stack.indices, self.decode.get(.normalized), logits);
             } else {
                 const bytes = @as(usize, stack.width) * @sizeOf(u16);
                 const offset = @as(usize, stack.rows - 1) * bytes;
@@ -606,7 +603,7 @@ pub const Request = struct {
                 defer blocks.deinit();
                 var last = try stack.current().retainedView(offset, bytes, &.{extent});
                 defer last.deinit();
-                try self.model.endpoints.logits(runtime, &blocks, &last, sources, stack.rows, self.decode.get(.normalized), logits);
+                try self.model.endpoints.logits(runtime, &blocks, &last, sources, stack.rows, stack.indices, self.decode.get(.normalized), logits);
             }
             if (output == .greedy and metal.termite_metal_decode_runtime_encode_argmax_from_logits_device(
                 runtime,
@@ -1235,7 +1232,8 @@ test "Inkling Metal resident decoder executes the full visit schedule on a synth
     }));
     const after_fused = metal.runtimeMemorySnapshot(runtime);
     try std.testing.expectEqual(before_fused.frame_submit_count + 1, after_fused.frame_submit_count);
-    try std.testing.expectEqual(@as(u64, 3), after_fused.last_frame_planned_compute_scope_count);
+    try std.testing.expectEqual(@as(u64, 1), after_fused.last_frame_planned_compute_scope_count);
+    try std.testing.expectEqual(@as(u64, 1), after_fused.last_frame_blit_encoder_count);
     try std.testing.expect(after_fused.last_frame_compute_encoder_count < 12);
     try std.testing.expectEqual(@as(usize, 2), fused.state.sequence.committed_tokens);
     fused.releasePrefill();

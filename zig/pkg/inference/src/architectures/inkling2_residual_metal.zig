@@ -21,11 +21,12 @@ const Tensor = @import("../backends/metal_tensor.zig").MetalTensor;
 
 pub const Stack = struct {
     const capacity = 8;
+    const identity_indices: u32 = 0x76543210;
 
     backing: Tensor,
-    blocks: [capacity]Tensor,
-    bank: Tensor,
-    bank_blocks: [2]Tensor,
+    blocks: [capacity + 2]Tensor,
+    prior_slots: [2]u4 = .{ capacity, capacity + 1 },
+    indices: u32 = identity_indices,
     width: u32,
     rows: u32,
     depth: usize = 0,
@@ -52,23 +53,16 @@ pub const Stack = struct {
         var backing = try storage.retainedTypedView(offset, &.{std.math.cast(i32, total) orelse return error.InvalidShape}, .i16);
         errdefer backing.deinit();
         const row_bytes = count * @sizeOf(u16);
-        var bank = try backing.retainedView(capacity * row_bytes, 2 * row_bytes, &.{@intCast(2 * count)});
-        errdefer bank.deinit();
-        var blocks: [capacity]Tensor = undefined;
+        var blocks: [capacity + 2]Tensor = undefined;
         var initialized: usize = 0;
         errdefer for (blocks[0..initialized]) |*block| block.deinit();
         for (&blocks, 0..) |*block, index| {
-            block.* = try backing.retainedView(index * count * 2, count * 2, &.{extent});
+            block.* = try backing.retainedView(index * row_bytes, row_bytes, &.{extent});
             initialized += 1;
         }
-        var first = try bank.retainedView(0, count * 2, &.{extent});
-        errdefer first.deinit();
-        const second = try bank.retainedView(count * 2, count * 2, &.{extent});
         return .{
             .backing = backing,
             .blocks = blocks,
-            .bank = bank,
-            .bank_blocks = .{ first, second },
             .width = width,
             .rows = rows,
         };
@@ -79,20 +73,24 @@ pub const Stack = struct {
     }
 
     pub fn deinit(self: *Stack) void {
-        for (&self.bank_blocks) |*block| block.deinit();
         for (&self.blocks) |*block| block.deinit();
-        self.bank.deinit();
         self.backing.deinit();
     }
 
     pub fn reset(self: *Stack) *Tensor {
         self.depth = 0;
         self.saved_depth = null;
+        self.indices = identity_indices;
+        self.prior_slots = .{ capacity, capacity + 1 };
         return &self.blocks[0];
     }
 
+    fn physical(self: *const Stack, logical: usize) u4 {
+        return @truncate(self.indices >> @as(u5, @intCast(logical * 4)));
+    }
+
     pub fn current(self: *const Stack) *const Tensor {
-        return &self.blocks[self.depth];
+        return &self.blocks[self.physical(self.depth)];
     }
 
     pub fn advance(self: *Stack, visit: checkpoint.Visit, core_start: usize, boundary: bool) !void {
@@ -107,15 +105,15 @@ pub const Stack = struct {
             },
             .restore => {
                 const saved = self.saved_depth orelse return error.InvalidInkling2Schedule;
-                if (self.depth != saved + self.bank_blocks.len) return error.InvalidInkling2Schedule;
-                const bytes = self.bank.deviceByteLen();
-                var loop = try self.backing.retainedView(
-                    (saved + 1) * self.blocks[0].deviceByteLen(),
-                    bytes,
-                    &.{@intCast(bytes / @sizeOf(u16))},
-                );
-                defer loop.deinit();
-                try loop.copyInto(&self.bank);
+                if (self.depth != saved + self.prior_slots.len) return error.InvalidInkling2Schedule;
+                // Rotate the two completed blocks into the cross-pass bank.
+                // A new pass overwrites only the preceding bank's old slots.
+                for (&self.prior_slots, saved + 1..) |*prior, logical| {
+                    const old = self.physical(logical);
+                    const shift: u5 = @intCast(logical * 4);
+                    self.indices = (self.indices & ~(@as(u32, 15) << shift)) | (@as(u32, prior.*) << shift);
+                    prior.* = old;
+                }
                 self.depth = saved;
             },
         }
@@ -133,6 +131,7 @@ pub const Stack = struct {
             .sources = @intCast(completed + 1),
             .epsilon = epsilon,
             .norm_epsilon = epsilon,
+            .block_indices = self.indices,
         };
         try mixer.encode(runtime, .{
             .blocks = &self.backing,
@@ -146,14 +145,14 @@ pub const Stack = struct {
     pub fn mixBank(self: *const Stack, runtime: *metal.RawMetalDecodeRuntime, epsilon: f32, query: *const Tensor, output: *Tensor) !void {
         if (self.saved_depth == null) return error.InvalidInkling2Schedule;
         const mixer: metal.ResidualMixBf16 = .{ .rows = self.rows, .width = self.width, .sources = 2, .epsilon = epsilon };
-        try mixer.encode(runtime, .{ .blocks = &self.bank_blocks[0], .last = &self.bank_blocks[1], .query = query }, output);
+        try mixer.encode(runtime, .{ .blocks = &self.blocks[self.prior_slots[0]], .last = &self.blocks[self.prior_slots[1]], .query = query }, output);
     }
 
     pub fn finish(self: *Stack, runtime: *metal.RawMetalDecodeRuntime, boundary: bool, attention: *const Tensor, expert: *const Tensor) !void {
         const next = self.depth + @intFromBool(boundary);
         if (next >= capacity) return error.InvalidInkling2Schedule;
         const size = try std.math.mul(u32, self.width, self.rows);
-        try metal.residualSumBf16(runtime, size, if (boundary) null else self.current(), attention, expert, &self.blocks[next]);
+        try metal.residualSumBf16(runtime, size, if (boundary) null else self.current(), attention, expert, &self.blocks[self.physical(next)]);
         self.depth = next;
     }
 };
@@ -188,6 +187,16 @@ test "Inkling Metal residual stack restores the prelude and retains both cross-p
     var replay = visit;
     replay.pass = 1;
     try stack.advance(replay, 6, true);
+    try std.testing.expectEqual([2]u4{ 1, 2 }, stack.prior_slots);
+    try std.testing.expectEqual(@as(u4, 8), stack.physical(1));
+    try std.testing.expectEqual(@as(u4, 9), stack.physical(2));
+    try stack.finish(runtime, true, &partial, &partial);
+    try stack.finish(runtime, true, &partial, &partial);
+    replay.pass = 2;
+    try stack.advance(replay, 6, true);
+    try std.testing.expectEqual([2]u4{ 8, 9 }, stack.prior_slots);
+    try std.testing.expectEqual(@as(u4, 1), stack.physical(1));
+    try std.testing.expectEqual(@as(u4, 2), stack.physical(2));
     try stack.mixBank(runtime, 0.000001, &query, &message);
     try metal.submitFrame(runtime);
     try metal.waitFrame(runtime);
