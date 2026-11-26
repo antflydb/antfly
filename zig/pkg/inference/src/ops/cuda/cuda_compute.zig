@@ -3830,8 +3830,7 @@ pub const CudaCompute = struct {
             const readback_words = host[0 .. source.len / @sizeOf(u32)];
             try copyToHostTrackedAndSync(self.compute, source, std.mem.sliceAsBytes(readback_words));
             burst_value.drained = true;
-            try layout.publishReadback(readback_words, owner.next_positions[0 .. owner.rows * 3], owner.progress, tokens);
-            try owner.notePair();
+            try layout.publishReadback(readback_words, owner.next_positions[0 .. owner.rows * 3], &owner.progress, tokens);
         }
         pub fn noteKvTokens(self: *@This(), storage: *kv_storage_runtime.KvStorageRuntime, max_tokens: usize) void {
             const hook = storage.device_write_hook orelse return;

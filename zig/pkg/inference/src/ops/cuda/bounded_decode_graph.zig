@@ -68,16 +68,19 @@ pub const StorageLayout = struct {
     }
 
     /// Check the device receipt before any tokens or position changes escape.
-    pub fn publishReadback(self: StorageLayout, host: []const u32, previous_positions: []const u32, progress: u32, tokens: []u32) !void {
+    pub fn publishReadback(self: StorageLayout, host: []const u32, previous_positions: []u32, progress: *u32, tokens: []u32) !void {
         const counter_word = self.readbackProgressIndex();
         const position_word = self.readbackPositionIndex();
         if (host.len != counter_word + 1 or tokens.len != self.tokens.bytes / @sizeOf(u32) or
             previous_positions.len != self.positions.bytes / @sizeOf(u32))
             return error.InvalidExecutionPlan;
-        if (host[counter_word] != try std.math.add(u32, progress, 2)) return error.InvalidExecutionPlan;
-        for (previous_positions, host[position_word..][0..previous_positions.len]) |position, actual|
+        if (host[counter_word] != try std.math.add(u32, progress.*, 2)) return error.InvalidExecutionPlan;
+        const positions = host[position_word..][0..previous_positions.len];
+        for (previous_positions, positions) |position, actual|
             if (actual != try std.math.add(u32, position, 2)) return error.InvalidExecutionPlan;
         @memcpy(tokens, host[0..tokens.len]);
+        @memcpy(previous_positions, positions);
+        progress.* = host[counter_word];
     }
 
     pub fn init(rows: usize, hidden: usize, vocab: usize, key_words: usize) !StorageLayout {
@@ -507,12 +510,6 @@ pub const Module = struct {
     pub fn counter(self: *const Module) buffer.DeviceBuffer {
         return self.storage_layout.?.counter.bind(self.metadata);
     }
-    pub fn notePair(self: *Module) !void {
-        const next = try std.math.add(u32, self.progress, 2);
-        for (self.next_positions[0 .. self.rows * 3]) |*position|
-            position.* = try std.math.add(u32, position.*, 2);
-        self.progress = next;
-    }
 };
 
 test "captured sequence storage layout preserves existing narrow wide and aligned physical planes" {
@@ -546,9 +543,16 @@ test "captured sequence storage layout preserves existing narrow wide and aligne
     words[paired.readbackPositionIndex()..][0..6].* = .{ 3, 4, 5, 6, 7, 8 };
     words[paired.readbackProgressIndex()] = 10;
     var tokens: [4]u32 = @splat(0);
-    try std.testing.expectError(error.InvalidExecutionPlan, paired.publishReadback(words, &.{ 1, 2, 3, 4, 5, 9 }, 8, &tokens));
+    var progress: u32 = 8;
+    var positions = [_]u32{ 1, 2, 3, 4, 5, 9 };
+    try std.testing.expectError(error.InvalidExecutionPlan, paired.publishReadback(words, &positions, &progress, &tokens));
     try std.testing.expectEqualSlices(u32, &.{ 0, 0, 0, 0 }, &tokens);
-    try paired.publishReadback(words, &.{ 1, 2, 3, 4, 5, 6 }, 8, &tokens);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5, 9 }, &positions);
+    try std.testing.expectEqual(@as(u32, 8), progress);
+    positions[5] = 6;
+    try paired.publishReadback(words, &positions, &progress, &tokens);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 4, 5, 6, 7, 8 }, &positions);
+    try std.testing.expectEqual(@as(u32, 10), progress);
     try std.testing.expectEqualSlices(u32, &.{ 11, 22, 33, 44 }, &tokens);
     try std.testing.expectError(error.InvalidShape, StorageLayout.init(1, 1024, 8, 1));
     try std.testing.expectError(error.Overflow, StorageLayout.init(128, std.math.maxInt(usize), 8, 1));
