@@ -902,8 +902,8 @@ fn runTextEncoderLayersTensor(
     defer allocator.free(attn_mask);
     @memset(attn_mask, 1);
 
-    var frame_active = try beginFlorenceMetalFrame(cb, .prefill);
-    errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
+    var frame = try beginFlorenceMetalFrame(cb, .prefill);
+    errdefer frame.deinit();
 
     var buf: [256]u8 = undefined;
     for (0..config.encoder_layers) |layer| {
@@ -922,10 +922,9 @@ fn runTextEncoderLayersTensor(
         if (debug_cuda_session) std.log.info("florence: text encoder layer done {d}", .{layer});
     }
 
-    if (frame_active) {
+    if (frame.owns) {
         const submit_start = nowNs();
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        frame_active = false;
+        try frame.finish();
         if (profile) logFlorenceProfile("text_encoder_frame_submit", submit_start);
     }
 
@@ -1203,8 +1202,8 @@ fn decoderForwardIncrementalBatchStepWithWeights(
     const active_mask_len = std.math.mul(usize, batch, new_len) catch return error.InvalidInputShape;
     if (active_mask_len > cache.self_mask.len) return error.InvalidInputShape;
 
-    var frame_active = try beginFlorenceMetalFrame(cb, .decode);
-    errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
+    var frame = try beginFlorenceMetalFrame(cb, .decode);
+    errdefer frame.deinit();
     var hidden = try applyDecoderEmbeddingsAtAssigned(cb, allocator, config, token_ids, batch, 1, old_len, assigned, held);
     var hidden_live = true;
     errdefer if (hidden_live) stepRelease(cb, assigned, hidden);
@@ -1249,10 +1248,7 @@ fn decoderForwardIncrementalBatchStepWithWeights(
         hidden = normed;
     }
 
-    if (frame_active) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        frame_active = false;
-    }
+    try frame.finish();
 
     hidden_live = false;
     return hidden;
@@ -1424,8 +1420,8 @@ pub fn buildDecoderCrossCache(
 
     const d_model = config.d_model;
     const enc_total = batch * enc_seq;
-    var frame_active = try beginFlorenceMetalFrame(cb, .prefill);
-    errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
+    var frame = try beginFlorenceMetalFrame(cb, .prefill);
+    errdefer frame.deinit();
     var buf: [256]u8 = undefined;
     for (0..config.decoder_layers) |layer| {
         try control_cb.checkExecutionControl();
@@ -1451,10 +1447,7 @@ pub fn buildDecoderCrossCache(
         filled += 1;
     }
 
-    if (frame_active) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        frame_active = false;
-    }
+    try frame.finish();
 
     return .{ .keys = keys, .values = values };
 }
@@ -1713,11 +1706,11 @@ fn visionEncoderForward(
             var hidden_owned = true;
             errdefer if (hidden_owned) cb.free(hidden);
 
-            var stage_frame_active = if (florenceMetalStageFramesEnabled())
+            var stage_frame: Submission = if (florenceMetalStageFramesEnabled())
                 try beginFlorenceMetalFrame(cb, .prefill)
             else
-                false;
-            errdefer if (stage_frame_active) cb.decoderRuntimeCancelFrame() catch {};
+                .{ .backend = cb };
+            errdefer stage_frame.deinit();
 
             for (0..depth) |layer| {
                 try control_cb.checkExecutionControl();
@@ -1728,10 +1721,9 @@ fn visionEncoderForward(
                 hidden = next;
                 if (debug_cuda_session) std.log.info("florence: stage {d} davit layer {d} done", .{ stage, layer });
             }
-            if (stage_frame_active) {
+            if (stage_frame.owns) {
                 const submit_start = nowNs();
-                try cb.decoderRuntimeSubmitAndWaitFrame();
-                stage_frame_active = false;
+                try stage_frame.finish();
                 if (profile) logFlorenceProfileStage("vision_stage_frame_submit", stage, submit_start);
             }
 
@@ -1899,11 +1891,11 @@ fn visionEncoderForwardTensorTail(
         var hidden_owned = true;
         errdefer if (hidden_owned) cb.free(hidden);
 
-        var stage_frame_active = if (florenceMetalStageFramesEnabled())
+        var stage_frame: Submission = if (florenceMetalStageFramesEnabled())
             try beginFlorenceMetalFrame(cb, .prefill)
         else
-            false;
-        errdefer if (stage_frame_active) cb.decoderRuntimeCancelFrame() catch {};
+            .{ .backend = cb };
+        errdefer stage_frame.deinit();
 
         for (0..depth) |layer| {
             try control_cb.checkExecutionControl();
@@ -1914,10 +1906,9 @@ fn visionEncoderForwardTensorTail(
             hidden = next;
             if (debug_cuda_session) std.log.info("florence: stage {d} davit layer {d} done", .{ stage, layer });
         }
-        if (stage_frame_active) {
+        if (stage_frame.owns) {
             const submit_start = nowNs();
-            try cb.decoderRuntimeSubmitAndWaitFrame();
-            stage_frame_active = false;
+            try stage_frame.finish();
             if (profile) logFlorenceProfileStage("vision_stage_frame_submit", stage, submit_start);
         }
 
@@ -2579,18 +2570,15 @@ fn daViTBlockFramed(
     stage: usize,
     layer: usize,
 ) !CT {
-    var frame_active = try beginFlorenceMetalFrame(cb, .prefill);
-    errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
+    var frame = try beginFlorenceMetalFrame(cb, .prefill);
+    errdefer frame.deinit();
 
     const owns_encoder_scope = try MetalCompute.beginOcrEncoderScope(cb, .florence);
     defer if (owns_encoder_scope) cb.decoderRuntimeEndPlannedComputeScope();
 
     const output = try daViTBlock(cb, allocator, config, input, batch, height, width, stage, layer);
     errdefer cb.free(output);
-    if (frame_active) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        frame_active = false;
-    }
+    try frame.finish();
     return output;
 }
 
@@ -4327,13 +4315,14 @@ fn florenceMetalStageFramesEnabled() bool {
     return !platform.env.getenvBool("TERMITE_FLORENCE2_METAL_DISABLE_STAGE_FRAMES");
 }
 
-fn beginFlorenceMetalFrame(cb: *const ComputeBackend, regime: ops.DecoderRuntimeFrameRegime) !bool {
-    if (cb.kind() != .metal or !florenceMetalFramesEnabled() or debugStatsEnabled() or cb.decoderRuntimeHasActiveFrame()) return false;
-    const active = try cb.decoderRuntimeBeginFrame();
-    if (!active) return false;
-    errdefer cb.decoderRuntimeCancelFrame() catch {};
-    try cb.decoderRuntimeSetActiveFrameRegime(regime);
-    return true;
+const Submission = @import("../execution/submission.zig").Scope;
+
+fn beginFlorenceMetalFrame(cb: *const ComputeBackend, regime: ops.DecoderRuntimeFrameRegime) !Submission {
+    if (cb.kind() != .metal or !florenceMetalFramesEnabled() or debugStatsEnabled()) return .{ .backend = cb };
+    var frame = try Submission.begin(cb);
+    errdefer frame.deinit();
+    if (frame.owns) try cb.decoderRuntimeSetActiveFrameRegime(regime);
+    return frame;
 }
 
 fn florenceDecoderStageFrameProfilingEnabled(cb: *const ComputeBackend) bool {
@@ -4371,7 +4360,8 @@ fn profileFlorenceVisionOpFrameBoundary(
             @as(f64, @floatFromInt(gpu_ns)) / @as(f64, std.time.ns_per_ms),
         },
     );
-    if (!try beginFlorenceMetalFrame(cb, .prefill)) return error.UnsupportedOperation;
+    // The surrounding stage still owns the replacement encoding.
+    if (!(try beginFlorenceMetalFrame(cb, .prefill)).owns) return error.UnsupportedOperation;
 }
 
 fn profileFlorenceDecoderStageFrameBoundary(
@@ -4395,7 +4385,8 @@ fn profileFlorenceDecoderStageFrameBoundary(
             @as(f64, @floatFromInt(gpu_ns)) / @as(f64, std.time.ns_per_ms),
         },
     );
-    if (!try beginFlorenceMetalFrame(cb, .decode)) return error.UnsupportedOperation;
+    // The surrounding stage still owns the replacement encoding.
+    if (!(try beginFlorenceMetalFrame(cb, .decode)).owns) return error.UnsupportedOperation;
     return nowNs();
 }
 
