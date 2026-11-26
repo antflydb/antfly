@@ -1326,6 +1326,14 @@ EmbeddingGemma2, LightOnOCR, GLiNER2.5/DECIDE, Inkling 2 Mini and the
 representative Qwen3 routes. Spark GB10, local Metal and CPU are the
 available physical targets. L4 and A100 remain the user-deferred targets.
 
+Subsequent scoped qualification covers these production paths:
+
+| Revision | Backend and workload | Result | Remaining evidence |
+| --- | --- | --- | --- |
+| `676b75ffb9` | Spark GB10 CUDA, released merged T5-small | Batched suffix decoding completed after encoder retirement. The grouped CUDA suite passed 16 of 16 checks with no skips. | A current-head throughput comparison against merged main. |
+| `ae601982e2` | Spark GB10 CUDA, audio input contract and cache fixtures | All six checks passed, including physical audio capture and replay. | The composite scratch recipe still comes from an observed allocation schedule. Released-model performance remains unqualified. |
+| `a4d50e41a0` | M4 Max Metal, released LightOnOCR-3-0.8B and audio cohorts | Both HTTP pages matched the single-image OCR output. Five four-token bursts completed with zero frame topology mismatches. The three-clip audio test used 108,101,632 incremental device bytes within its 134,217,728-byte ceiling. Managed audio prepared two arenas in one pause. | Frozen-main latency and throughput comparisons. These tests establish parity, submission topology, and the measured memory bound. |
+
 At `34296ffb5a`, five Native CPU fixtures passed for resident handoff and
 task output custody. The incremental decoder matched host-reference logits
 after the encoder and destination session handles closed, and allocation
