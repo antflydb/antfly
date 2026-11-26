@@ -20704,6 +20704,20 @@ fn audioOutputMatches(input: *const CudaTensor, output: *const CudaTensor, bytes
         std.mem.eql(i64, output.shape, input.shape) and output.buffer.len >= bytes;
 }
 
+test "CUDA unusable audio learning drops its owner and preserves retry policy" {
+    const audio = @import("audio_execution_plan.zig");
+    for ([_]bool{ false, true }) |retry| {
+        var entry: audio.Entry = .{
+            .warmed = true,
+            .stamp = 1,
+            .owner = try audio.Owner.create(std.testing.allocator),
+        };
+        retireUnusableAudioPlan(&entry, .{}, retry);
+        try std.testing.expect(entry.owner == null and entry.warmed);
+        try std.testing.expectEqual(!retry, entry.disabled);
+    }
+}
+
 test "CUDA audio replay output contract rejects changed logical geometry" {
     const input: CudaTensor = .{ .buffer = .{ .ptr = 256, .len = 16 }, .shape = @constCast(&[_]i64{ 2, 2 }), .elem_count = 4, .dtype = .f32 };
     const padded: CudaTensor = .{ .buffer = .{ .ptr = 512, .len = 32 }, .shape = input.shape, .elem_count = 4, .dtype = .f32 };
@@ -20809,6 +20823,16 @@ fn retainAudioGraphBacking(self: *CudaCompute, bank: *buffer_mod.DeviceBuffer, q
     };
 }
 
+fn retireUnusableAudioPlan(entry: *@import("audio_execution_plan.zig").Entry, current: CacheCleanup, retry: bool) void {
+    entry.disabled = !retry;
+    entry.retireOwner(current) catch |err| {
+        // Custody has not transferred. Keep the backing for normal eviction
+        // but decline a retry with an unfinished recipe.
+        entry.disabled = true;
+        std.log.warn("CUDA unusable audio plan retirement failed: {s}", .{@errorName(err)});
+    };
+}
+
 /// One actual warm invocation initializes caches; the next learns lifetimes.
 /// Capture uses only bounded arena addresses and validates every allocation/free.
 fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: CacheCleanup, _: bool) anyerror!?CT {
@@ -20887,21 +20911,14 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         self.execution_scope = &scope;
         const out = run(context, canonical[0..canonical_count]) catch |err| {
             self.execution_scope = null;
-            if (err == error.Cancelled or err == error.Timeout) {
-                entry.retireOwner(plan_cleanup) catch |retire_err| {
-                    // Registration failed before custody transferred. Keep the
-                    // owner for eviction without reusing an unfinished plan.
-                    entry.disabled = true;
-                    std.log.warn("CUDA audio plan retirement after {s} failed: {s}", .{ @errorName(err), @errorName(retire_err) });
-                };
-            } else entry.disabled = true;
+            retireUnusableAudioPlan(entry, plan_cleanup, err == error.Cancelled or err == error.Timeout);
             return err;
         };
         self.execution_scope = null;
         const result = tensorFromCt(out);
         if (!audioOutputMatches(first_input, result, output_bytes) or
             self.stats.h2d_bytes != h2d_before or self.stats.d2h_bytes != d2h_before or
-            !owner.seal(result.buffer.ptr, base_key, input_bytes, output_bytes)) entry.disabled = true;
+            !owner.seal(result.buffer.ptr, base_key, input_bytes, output_bytes)) retireUnusableAudioPlan(entry, plan_cleanup, false);
         return out;
     }
     const owner = entry.owner.?;
