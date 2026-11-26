@@ -53250,8 +53250,17 @@ pub const PagedRelativeBf16Attention = struct {
 
     extern fn antfly_metal_dispatch_paged_relative_bf16(runtime: *RawMetalDecodeRuntime, views: *const [9]Buffer, wire: *const Wire, row_heads: u32, physical_rows: usize) c_int;
 
-    const Pack = extern struct { rows: u32, kv_heads: u32 };
-    extern fn antfly_metal_dispatch_pack_kv_q4(runtime: *RawMetalDecodeRuntime, views: *const [4]Buffer, params: *const Pack) c_int;
+    const Stage = extern struct {
+        rows: u32,
+        kv_heads: u32,
+        start: u32,
+        page_tokens: u32,
+        first_page: u32,
+        page_count: u32,
+        physical_pages: u32,
+        q4: u32,
+    };
+    extern fn antfly_metal_dispatch_stage_paged_kv(runtime: *RawMetalDecodeRuntime, views: *const [5]Buffer, params: *const Stage) c_int;
 
     query: geometry.Query,
     range: StagedRange,
@@ -53267,55 +53276,37 @@ pub const PagedRelativeBf16Attention = struct {
         append: *@import("../runtime/kv/hybrid_paged.zig").Append,
         group: @import("../runtime/kv/hybrid_paged.zig").Group,
         kv_heads: u32,
+        page_ids: *const MetalTensor,
         source: SourcePlanes,
         destination: Planes,
     ) !void {
         if (!hasActiveFrame(runtime)) return error.MetalFrameRequired;
         if (kv_heads == 0 or kv_heads > 64) return error.InvalidShape;
-        const row_bytes = try metadata.PlaneFormat.bf16.rowBytes(kv_heads, 128);
-        const stored_row_bytes = try destination.format.rowBytes(kv_heads, 128);
         const range = try append.stagedRange(group);
-        const plane_bytes = try std.math.mul(usize, try range.physicalRows(), stored_row_bytes);
         const start = append.sequence.committed_tokens;
-        const input_bytes = try std.math.mul(usize, range.visible_end - start, row_bytes);
-        for ([_]*const MetalTensor{ source.key, source.value }, [_]*MetalTensor{ destination.key, destination.value }) |src, dst| {
-            if (dst.isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
-            if (src.dtype != .i16 or dst.dtype != .i16 or src.deviceHandle() == null or dst.deviceHandle() == null)
-                return error.UnsupportedTensorType;
-            if (src.deviceByteLen() < input_bytes or dst.deviceByteLen() < plane_bytes)
-                return error.InvalidShape;
-        }
-
-        var spans = try @import("../runtime/kv/hybrid_paged.zig").RowSpans.init(append.sequence, append, group, start, range.visible_end);
-        while (try spans.next()) |span| {
-            const source_bytes = span.rows * row_bytes;
-            const destination_bytes = span.rows * stored_row_bytes;
-            const source_offset = span.linear_row * row_bytes;
-            const destination_offset = span.physical_row * stored_row_bytes;
-            const source_elements = std.math.cast(i32, source_bytes / 2) orelse return error.InvalidShape;
-            const destination_elements = std.math.cast(i32, destination_bytes / 2) orelse return error.InvalidShape;
-            var key = try source.key.retainedView(source_offset, source_bytes, &.{source_elements});
-            defer key.deinit();
-            var value = try source.value.retainedView(source_offset, source_bytes, &.{source_elements});
-            defer value.deinit();
-            var key_out = try destination.key.retainedView(destination_offset, destination_bytes, &.{destination_elements});
-            defer key_out.deinit();
-            var value_out = try destination.value.retainedView(destination_offset, destination_bytes, &.{destination_elements});
-            defer value_out.deinit();
-            destination.key.invalidateHostMirror();
-            destination.value.invalidateHostMirror();
-            if (destination.format == .bf16) {
-                try key.copyInto(&key_out);
-                try value.copyInto(&value_out);
-            } else {
-                const views: [4]Buffer = .{
-                    try .fromTensor(&key, .i16),     try .fromTensor(&value, .i16),
-                    try .fromTensor(&key_out, .i16), try .fromTensor(&value_out, .i16),
-                };
-                if (antfly_metal_dispatch_pack_kv_q4(runtime, &views, &.{ .rows = @intCast(span.rows), .kv_heads = kv_heads }) != 0)
-                    return error.MetalKernelDispatchFailed;
-            }
-        }
+        if (destination.key.isReadOnlyPhysical() or destination.value.isReadOnlyPhysical())
+            return error.ReadOnlyPhysicalStorage;
+        const views: [5]Buffer = .{
+            try .fromTensor(source.key, .i16),
+            try .fromTensor(source.value, .i16),
+            try .fromTensor(destination.key, .i16),
+            try .fromTensor(destination.value, .i16),
+            try .fromTensor(page_ids, .i32),
+        };
+        const params: Stage = .{
+            .rows = std.math.cast(u32, range.visible_end - start) orelse return error.InvalidShape,
+            .kv_heads = kv_heads,
+            .start = std.math.cast(u32, start) orelse return error.InvalidShape,
+            .page_tokens = range.page_tokens,
+            .first_page = std.math.cast(u32, range.first_page) orelse return error.InvalidShape,
+            .page_count = std.math.cast(u32, range.page_count) orelse return error.InvalidShape,
+            .physical_pages = std.math.cast(u32, range.physical_pages) orelse return error.InvalidShape,
+            .q4 = @intFromBool(destination.format == .q4_head128),
+        };
+        if (antfly_metal_dispatch_stage_paged_kv(runtime, &views, &params) != 0)
+            return error.MetalKernelDispatchFailed;
+        destination.key.invalidateHostMirror();
+        destination.value.invalidateHostMirror();
     }
 
     pub const Inputs = struct {
@@ -53585,7 +53576,7 @@ pub const CausalPagedRelativeBf16 = struct {
         var value_convolution = convolution;
         value_convolution.clip = 0;
         try value_convolution.encode(runtime, value.input, value.staged, value.next_history);
-        try PagedRelativeBf16Attention.stageRows(runtime, append, group, query.kv_heads, .{
+        try PagedRelativeBf16Attention.stageRows(runtime, append, group, query.kv_heads, input.page_ids, .{
             .key = key.staged,
             .value = value.staged,
         }, planes);
@@ -53631,6 +53622,9 @@ test "Metal paged relative attention reads convolved KV staged in the same frame
     defer append.abort();
     var ids: [2]u32 = undefined;
     try std.testing.expectEqual(ids.len, try append.stagedPageIds(.full, &ids));
+    // Exercise a reverse mapping across the append's page boundary. Both
+    // staging and attention must consume the same physical page table.
+    std.mem.swap(u32, &ids[0], &ids[1]);
 
     var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
     defer provider.deinitOwned();
@@ -53714,6 +53708,10 @@ test "Metal paged relative attention reads convolved KV staged in the same frame
     var packed_result: [256]u16 = undefined;
     try packed_output.downloadBytesInto(std.mem.asBytes(&packed_result));
     try std.testing.expectEqual(output, packed_result);
+    var stored: [512]u16 = undefined;
+    try tensors[2].downloadBytesInto(std.mem.asBytes(&stored));
+    for ([_]usize{ ids[0] * 2, ids[1] * 2 + 1 }) |row_index|
+        try std.testing.expectEqual(@as([128]u16, @splat(0)), stored[row_index * 128 ..][0..128].*);
     // Visible values are [0, 1] then [0, 1, 1], plus one zero-valued sink.
     for (output[0..128]) |value| try std.testing.expectEqual(@as(u16, 0x3e2b), value);
     for (output[128..]) |value| try std.testing.expectEqual(@as(u16, 0x3e80), value);

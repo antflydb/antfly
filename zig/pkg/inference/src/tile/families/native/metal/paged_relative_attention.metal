@@ -185,18 +185,33 @@ kernel void antfly_paged_relative_gqa_d128_q4_partial(
     antfly_paged_relative_gqa_d128_partial<true, 1>(query, keys, values, relative, page_ids, partials, p, group, lane);
 }
 
-// native-program:entry antfly_pack_bf16_kv_d128_q4
-kernel void antfly_pack_bf16_kv_d128_q4(
+// native-program:entry antfly_stage_paged_bf16_kv_d128
+struct PagedKvStageParams { uint rows, kv_heads, start, page_tokens, first_page, page_count, physical_pages, q4; };
+
+kernel void antfly_stage_paged_bf16_kv_d128(
     device const bfloat *key [[buffer(0)]], device const bfloat *value [[buffer(1)]],
     device ushort *key_out [[buffer(2)]], device ushort *value_out [[buffer(3)]],
-    constant uint2 &geometry [[buffer(4)]],
+    device const uint *page_ids [[buffer(4)]],
+    constant PagedKvStageParams &p [[buffer(5)]],
     uint2 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]
 ) {
     const uint head = group.x;
-    if (head >= geometry.x * geometry.y) return;
+    const uint position = p.start + head / p.kv_heads;
+    const uint page = position / p.page_tokens - p.first_page;
+    if (page >= p.page_count) return;
+    const uint physical = page_ids[page];
+    if (physical >= p.physical_pages) return;
+    const ulong target = (ulong(physical) * p.page_tokens + position % p.page_tokens)
+        * p.kv_heads + head % p.kv_heads;
     const device bfloat *src = group.y == 0u ? key : value;
     device ushort *dst = group.y == 0u ? key_out : value_out;
     const ulong begin = ulong(head) * 128u + lane;
+    if (!p.q4) {
+        const ulong offset = target * 128u + lane;
+        const device ushort *bits = reinterpret_cast<const device ushort *>(src);
+        for (uint i = 0; i < 128u; i += 32u) dst[offset + i] = bits[begin + i];
+        return;
+    }
     const float4 values = float4(float(src[begin]), float(src[begin + 32u]),
         float(src[begin + 64u]), float(src[begin + 96u]));
     const float4 magnitude = abs(values);
@@ -204,7 +219,7 @@ kernel void antfly_pack_bf16_kv_d128_q4(
     const half scale = half(maximum / 7.0f);
     const float inverse = scale == half(0.0f) ? 0.0f : 1.0f / float(scale);
     const uint4 q = uint4(int4(clamp(rint(values * inverse), -8.0f, 7.0f)) + 8);
-    const ulong offset = ulong(head) * 33u;
+    const ulong offset = target * 33u;
     dst[offset + lane] = ushort(q.x | (q.y << 4u) | (q.z << 8u) | (q.w << 12u));
     if (lane == 0u) dst[offset + 32u] = as_type<ushort>(scale);
 }

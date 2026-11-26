@@ -1780,7 +1780,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> routed_group_build_pipeline, routed_group_projection_pipeline;
     id<MTLComputePipelineState> routed_group_projection_wide_pipeline;
     id<MTLComputePipelineState> paged_relative_bf16_pipelines[7];
-    id<MTLComputePipelineState> pack_kv_q4_pipeline;
+    id<MTLComputePipelineState> stage_paged_kv_pipeline;
     id<MTLComputePipelineState> causal_depthwise4_bf16_pipeline;
     id<MTLComputePipelineState> dense_bf16_projection_pipeline;
     id<MTLComputePipelineState> dense_bf16_projection_reuse4_pipeline;
@@ -13687,17 +13687,32 @@ static NSString *termite_metal_shader_source(void) {
            "\n"
            // tile-codegen:end attention.paged_relative_bf16.2 family
            // tile-codegen:begin attention.paged_relative_bf16.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
-           "kernel void antfly_pack_bf16_kv_d128_q4(\n"
+           "struct PagedKvStageParams { uint rows, kv_heads, start, page_tokens, first_page, page_count, physical_pages, q4; };\n"
+           "\n"
+           "kernel void antfly_stage_paged_bf16_kv_d128(\n"
            "    device const bfloat *key [[buffer(0)]], device const bfloat *value [[buffer(1)]],\n"
            "    device ushort *key_out [[buffer(2)]], device ushort *value_out [[buffer(3)]],\n"
-           "    constant uint2 &geometry [[buffer(4)]],\n"
+           "    device const uint *page_ids [[buffer(4)]],\n"
+           "    constant PagedKvStageParams &p [[buffer(5)]],\n"
            "    uint2 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]\n"
            ") {\n"
            "    const uint head = group.x;\n"
-           "    if (head >= geometry.x * geometry.y) return;\n"
+           "    const uint position = p.start + head / p.kv_heads;\n"
+           "    const uint page = position / p.page_tokens - p.first_page;\n"
+           "    if (page >= p.page_count) return;\n"
+           "    const uint physical = page_ids[page];\n"
+           "    if (physical >= p.physical_pages) return;\n"
+           "    const ulong target = (ulong(physical) * p.page_tokens + position % p.page_tokens)\n"
+           "        * p.kv_heads + head % p.kv_heads;\n"
            "    const device bfloat *src = group.y == 0u ? key : value;\n"
            "    device ushort *dst = group.y == 0u ? key_out : value_out;\n"
            "    const ulong begin = ulong(head) * 128u + lane;\n"
+           "    if (!p.q4) {\n"
+           "        const ulong offset = target * 128u + lane;\n"
+           "        const device ushort *bits = reinterpret_cast<const device ushort *>(src);\n"
+           "        for (uint i = 0; i < 128u; i += 32u) dst[offset + i] = bits[begin + i];\n"
+           "        return;\n"
+           "    }\n"
            "    const float4 values = float4(float(src[begin]), float(src[begin + 32u]),\n"
            "        float(src[begin + 64u]), float(src[begin + 96u]));\n"
            "    const float4 magnitude = abs(values);\n"
@@ -13705,7 +13720,7 @@ static NSString *termite_metal_shader_source(void) {
            "    const half scale = half(maximum / 7.0f);\n"
            "    const float inverse = scale == half(0.0f) ? 0.0f : 1.0f / float(scale);\n"
            "    const uint4 q = uint4(int4(clamp(rint(values * inverse), -8.0f, 7.0f)) + 8);\n"
-           "    const ulong offset = ulong(head) * 33u;\n"
+           "    const ulong offset = target * 33u;\n"
            "    dst[offset + lane] = ushort(q.x | (q.y << 4u) | (q.z << 8u) | (q.w << 12u));\n"
            "    if (lane == 0u) dst[offset + 32u] = as_type<ushort>(scale);\n"
            "}\n"
@@ -34550,7 +34565,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->routed_group_projection_pipeline = nil;
     runtime->routed_group_projection_wide_pipeline = nil;
     for (size_t index = 0; index < 7; ++index) runtime->paged_relative_bf16_pipelines[index] = nil;
-    runtime->pack_kv_q4_pipeline = nil;
+    runtime->stage_paged_kv_pipeline = nil;
     runtime->causal_depthwise4_bf16_pipeline = nil;
     runtime->dense_bf16_projection_pipeline = nil;
     runtime->dense_bf16_projection_reuse4_pipeline = nil;
@@ -37819,21 +37834,30 @@ int antfly_metal_dispatch_paged_relative_bf16(
         &p->splits, sizeof(p->splits), MTLSizeMake(row_heads, 1, 1), threads);
 }
 
-typedef struct { uint32_t rows, kv_heads; } antfly_metal_pack_kv_q4_params;
+typedef struct {
+    uint32_t rows, kv_heads, start, page_tokens, first_page, page_count, physical_pages, q4;
+} antfly_metal_stage_paged_kv_params;
 
-int antfly_metal_dispatch_pack_kv_q4(
-    termite_metal_decode_runtime *runtime, const antfly_metal_routed_buffer views[4],
-    const antfly_metal_pack_kv_q4_params *p
+int antfly_metal_dispatch_stage_paged_kv(
+    termite_metal_decode_runtime *runtime, const antfly_metal_routed_buffer views[5],
+    const antfly_metal_stage_paged_kv_params *p
 ) {
-    if (!runtime || !views || !p || !p->rows || !p->kv_heads || p->kv_heads > 64) return -1;
+    if (!runtime || !views || !p || !p->rows || !p->kv_heads || p->kv_heads > 64 ||
+        !p->page_tokens || !p->page_count || !p->physical_pages || p->q4 > 1 ||
+        p->rows - 1 > UINT32_MAX - p->start) return -1;
+    const uint32_t first = p->start / p->page_tokens;
+    const uint32_t last = (p->start + (p->rows - 1)) / p->page_tokens;
+    if (first < p->first_page || last - p->first_page >= p->page_count) return -1;
     size_t heads, input, output;
-    if (!termite_metal_size_mul(p->rows, p->kv_heads, &heads) ||
+    if (!termite_metal_size_mul(p->rows, p->kv_heads, &heads) || heads > UINT32_MAX ||
         !termite_metal_size_mul(heads, 256, &input) ||
-        !termite_metal_size_mul(heads, 66, &output)) return -1;
-    const size_t required[4] = {input, input, output, output};
-    const size_t alignment[4] = {2, 2, 2, 2};
-    return antfly_metal_encode_typed_stage(runtime, @"antfly_pack_bf16_kv_d128_q4",
-        &runtime->pack_kv_q4_pipeline, views, required, alignment, 4, (1u << 2) | (1u << 3),
+        !termite_metal_size_mul(p->physical_pages, p->page_tokens, &output) ||
+        !termite_metal_size_mul(output, p->kv_heads, &output) ||
+        !termite_metal_size_mul(output, p->q4 ? 66 : 256, &output)) return -1;
+    const size_t required[5] = {input, input, output, output, (size_t)p->page_count * sizeof(uint32_t)};
+    const size_t alignment[5] = {2, 2, 2, 2, 4};
+    return antfly_metal_encode_typed_stage(runtime, @"antfly_stage_paged_bf16_kv_d128",
+        &runtime->stage_paged_kv_pipeline, views, required, alignment, 5, (1u << 2) | (1u << 3),
         p, sizeof(*p), MTLSizeMake(heads, 2, 1), MTLSizeMake(32, 1, 1));
 }
 
