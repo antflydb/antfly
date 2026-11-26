@@ -347,9 +347,17 @@ pub const Pipeline = struct {
         if (self.continue_fn) |keep_going| if (!keep_going(self.continue_ctx.?)) return error.Cancelled;
     }
 
-    fn observePrefill(self: *const Pipeline, request: *decoder.Request, comptime append: anytype, args: anytype) !void {
-        var binding = self.session.invocation_diagnostics orelse return @call(.auto, append, .{request} ++ args);
-        if (!binding.diagnostics.isEnabled()) return @call(.auto, append, .{request} ++ args);
+    fn prefillPrompt(self: *Pipeline, request: *decoder.Request, suffix: []const i32, progress: ?*diagnostics.PrefillProgress) !void {
+        for (self.prompt.media) |item| {
+            try self.prefill(request, item.prefix, progress);
+            try self.prefillImage(request, item.image, progress);
+        }
+        try self.prefill(request, suffix, progress);
+    }
+
+    fn publishPrefill(self: *Pipeline, request: *decoder.Request, suffix: []const i32) !void {
+        var binding = self.session.invocation_diagnostics orelse return self.prefillPrompt(request, suffix, null);
+        if (!binding.diagnostics.isEnabled()) return self.prefillPrompt(request, suffix, null);
         var progress: diagnostics.PrefillProgress = .{};
         binding.planned_prefill = .{
             .max_append_rows = self.prefill_rows,
@@ -357,17 +365,10 @@ pub const Pipeline = struct {
             .cache_capacity_tokens = request.max_tokens,
         };
         binding.prefill_progress = &progress;
-        const Observe = struct {
-            fn run(target: *decoder.Request, actual: *diagnostics.PrefillProgress, values: @TypeOf(args)) !void {
-                const start = target.position();
-                defer actual.commitThrough(@intCast(target.position() - start));
-                return @call(.auto, append, .{target} ++ values);
-            }
-        };
-        return observation.callOperation(binding, .prefill, Observe.run, .{ request, &progress, args });
+        return observation.callOperation(binding, .prefill, prefillPrompt, .{ self, request, suffix, &progress });
     }
 
-    fn prefill(self: *Pipeline, request: *decoder.Request, input: []const i32) !void {
+    fn prefill(self: *Pipeline, request: *decoder.Request, input: []const i32, progress: ?*diagnostics.PrefillProgress) !void {
         var offset: usize = 0;
         while (offset < input.len) {
             try self.check();
@@ -377,10 +378,11 @@ pub const Pipeline = struct {
             var turn: StepScheduler.Waiter = .{};
             try self.model.enterStep(&turn, self.control);
             defer StepScheduler.leave(&turn);
+            defer if (progress) |actual| actual.commitThrough(@intCast(request.position()));
             if (count == 1)
-                try self.observePrefill(request, decoder.Request.append, .{tokens[0]})
+                try request.append(tokens[0])
             else
-                try self.observePrefill(request, decoder.Request.appendTokens, .{tokens[0..count]});
+                try request.appendTokens(tokens[0..count]);
             offset += count;
         }
     }
@@ -415,7 +417,7 @@ pub const Pipeline = struct {
         return observation.callOperation(self.session.invocation_diagnostics, .encoder, vision.Vision.encodeRgb, .{ &self.model.encoder, &self.model.model.blas, rgb.data, rgb.width, rgb.height });
     }
 
-    fn prefillImage(self: *Pipeline, request: *decoder.Request, image: Prompt.Image) !void {
+    fn prefillImage(self: *Pipeline, request: *decoder.Request, image: Prompt.Image, progress: ?*diagnostics.PrefillProgress) !void {
         const rgb = try @import("../pipelines/inkling2_image.zig").decodeRgb(self.allocator, image.bytes);
         defer rgb.deinit(self.allocator);
         if (rgb.width != image.width or rgb.height != image.height) return error.InvalidInkling2Image;
@@ -439,7 +441,8 @@ pub const Pipeline = struct {
                 .len = @as(usize, rows) * row_bytes,
                 .borrowed = true,
             };
-            try self.observePrefill(request, decoder.Request.appendEmbeddings, .{ input, rows });
+            defer if (progress) |actual| actual.commitThrough(@intCast(request.position()));
+            try request.appendEmbeddings(input, rows);
             offset += rows;
         }
     }
@@ -489,12 +492,8 @@ pub const Pipeline = struct {
         const draft: ?*dspark.Draft = if (self.speculate) &model.draft.? else null;
         try self.initializeRequest(&request, plan, draft);
         defer self.deinitializeRequest(&request, draft);
-        for (self.prompt.media) |item| {
-            try self.prefill(&request, item.prefix);
-            try self.prefillImage(&request, item.image);
-        }
         const after = self.prompt.suffix;
-        try self.prefill(&request, after[0 .. after.len - 1]);
+        try self.publishPrefill(&request, after[0 .. after.len - 1]);
         var history: std.ArrayList(i64) = .empty;
         defer history.deinit(self.allocator);
         if (!usesGreedy(config)) {
