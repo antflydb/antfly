@@ -2515,7 +2515,7 @@ fn runtimePrefill(
     if (decoderRuntimePrefillTraceRequested()) {
         std.debug.print("prefill-trace: runtimePrefill qlen={d} seq={d} ready={}\n", .{ request.query_seq_len, request.seq_len, decoder_runtime_ready });
     }
-    if (decoder_runtime_ready and request.query_seq_len == 1) {
+    if (decoder_runtime_ready and request.want_last_logits and request.query_seq_len == 1) {
         try request.check();
         const token_id = request.input_ids[request.input_ids.len - 1];
         const direct_started_at = monotonicNowNs();
@@ -2535,9 +2535,10 @@ fn runtimePrefill(
             request.input_ids,
             request.seq_len,
             &decode_context,
-            true,
+            request.want_last_logits,
         )) |output| {
             runtime_ctx.noteDecoderRuntimeStateFromCurrentView();
+            if (!request.want_last_logits) return .{};
             return .{ .logits = output.last_logits orelse return error.InvalidModelOutput };
         }
         if (decoderRuntimePrefillTraceRequested()) {
@@ -2554,7 +2555,7 @@ fn runtimePrefill(
             request.input_ids,
             request.seq_len,
             &decode_context,
-            request.prefer_greedy_token,
+            request.want_last_logits and request.prefer_greedy_token,
         )) |tail| {
             const timing_after = runtime_ctx.cb.directFamilyTimingSnapshot();
             const delta = timing_after.delta(timing_before);
@@ -2800,10 +2801,7 @@ fn runtimeDecodeGreedy(
         defer owned_output.deinit(allocator);
         const model = runtime_ctx.gpt_config;
         const suppressed = if (model.isGemma4E2bDenseLayout()) model.suppressTokenIds() else &.{};
-        const token = if (suppressed.len == 0)
-            try owned_output.greedyToken(allocator, model.vocab_size)
-        else
-            try suppressedGreedyToken(&owned_output, allocator, model.vocab_size, suppressed);
+        const token = try owned_output.greedyTokenSuppress(allocator, model.vocab_size, suppressed);
         try runtime_ctx.seedGreedyDeviceToken(token);
         timing_stats.decode_greedy_direct_nanos += @intCast(monotonicNowNs() - direct_started_at);
         return .{ .token_id = token };
@@ -2828,33 +2826,11 @@ fn runtimeDecodeGreedy(
     };
 }
 
-fn suppressedGreedyToken(output: *model_runtime.ModelOutput, allocator: std.mem.Allocator, vocab_size: usize, suppressed: []const i32) !i64 {
-    if (output.device_logits) |logits| {
-        const backend = output.device_logits_backend orelse return error.InvalidModelOutput;
-        if (try backend.argmaxLastRowSuppressTensor(logits, 1, vocab_size, suppressed)) |token| {
-            defer backend.free(token);
-            const data = try backend.toFloat32(token, allocator);
-            defer allocator.free(data);
-            if (data.len != 1 or !std.math.isFinite(data[0]) or data[0] < 0 or data[0] >= @as(f32, @floatFromInt(vocab_size))) return error.InvalidModelOutput;
-            return @intFromFloat(data[0]);
-        }
-    }
-
-    const logits = try output.takeHostLogits(allocator);
-    defer allocator.free(logits);
-    if (vocab_size == 0 or logits.len < vocab_size) return error.InvalidModelOutput;
-    const row = logits[0..vocab_size];
-    for (suppressed) |id| {
-        if (id >= 0 and id < row.len) row[@intCast(id)] = -std.math.inf(f32);
-    }
-    return @intCast(@import("../backends/activations.zig").argmax(row));
-}
-
 test "metal executor honors E2B token suppression on the greedy logits fallback" {
     const a = std.testing.allocator;
     var output = model_runtime.ModelOutput{ .logits = try a.dupe(f32, &.{ 0, 9, 8 }) };
     defer output.deinit(a);
-    try std.testing.expectEqual(@as(i64, 2), try suppressedGreedyToken(&output, a, 3, &.{ 1, -1, 99 }));
+    try std.testing.expectEqual(@as(i64, 2), try output.greedyTokenSuppress(a, 3, &.{ 1, -1, 99 }));
 }
 
 fn forwardLastLogits(

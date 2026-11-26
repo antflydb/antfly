@@ -696,7 +696,7 @@ pub const Config = struct {
         return false;
     }
 
-    pub fn suppressTokenIds(self: Config) []const i32 {
+    pub fn suppressTokenIds(self: *const Config) []const i32 {
         return self.suppress_token_ids[0..self.suppress_token_ids_len];
     }
 

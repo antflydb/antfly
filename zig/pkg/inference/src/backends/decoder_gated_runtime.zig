@@ -6584,6 +6584,8 @@ fn forwardPrefillPreparedTail(
 
     var started_at = monotonicNowNs();
     const hidden = try decoder_rms_runtime.embedTokens(cb, allocator, gpt_config, input_ids);
+    var owns_hidden = true;
+    defer if (owns_hidden) cb.free(hidden);
     var finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.prefill_embed_nanos += finished_at - started_at;
 
@@ -6646,45 +6648,23 @@ fn forwardPrefillPreparedTail(
     }
 
     started_at = monotonicNowNs();
-    const direct_hidden_result = if (output == .ordinary)
+    const direct_hidden = (if (output == .ordinary)
         try forwardFinalHiddenTensorDirect(cb, allocator, gpt_config, configured_layer_count, hidden, seq_len, decode_context, .prefill, ple_vectors)
     else
-        try forwardFinalHiddenTensorGemmaDirect(cb, allocator, gpt_config, configured_layer_count, hidden, seq_len, decode_context, .prefill, ple_vectors, output);
-    if (direct_hidden_result == null) {
+        try forwardFinalHiddenTensorGemmaDirect(cb, allocator, gpt_config, configured_layer_count, hidden, seq_len, decode_context, .prefill, ple_vectors, output)) orelse {
         cancelDecoderRuntimeFrame(cb, &ple_frame_active);
-        cb.free(hidden);
         return null;
-    }
-    var decoder_frame_active = if (direct_hidden_result) |direct_hidden|
-        direct_hidden.decoder_frame_active
-    else
-        false;
+    };
+    var decoder_frame_active = direct_hidden.decoder_frame_active;
     if (decoder_frame_active) ple_frame_active = false;
     defer finishDecoderRuntimeFrame(cb, &decoder_frame_active);
-    var final_hidden, var total_rows = if (direct_hidden_result) |direct_hidden|
-        .{ direct_hidden.hidden, direct_hidden.total_rows }
-    else blk: {
-        const overrides = buildOverrides(gpt_config, configured_layer_count);
-        const fallback = try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(
-            cb,
-            allocator,
-            gpt_config,
-            hidden,
-            overrides,
-            1,
-            seq_len,
-            decode_context,
-            ple_vectors,
-        );
-        break :blk .{ fallback.hidden, fallback.total_rows };
-    };
+    var final_hidden = direct_hidden.hidden;
+    var total_rows = direct_hidden.total_rows;
     finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.prefill_block_nanos += finished_at - started_at;
-    // The embedded rows were borrowed by the block stack (the direct paths
-    // copy them into their own hidden buffers); release them here.
     if (final_hidden != hidden) cb.free(hidden);
-    var owns_final_hidden = true;
-    errdefer if (owns_final_hidden) cb.free(final_hidden);
+    owns_hidden = false;
+    errdefer cb.free(final_hidden);
     if (output == .kv_only) {
         if (decoder_frame_active) {
             try cb.decoderRuntimeSubmitAndWaitFrame();
@@ -6699,7 +6679,7 @@ fn forwardPrefillPreparedTail(
             .norm_eps = gpt_config.norm_eps,
         };
     }
-    if (direct_hidden_result != null and compare_hidden_input != null) {
+    if (compare_hidden_input != null) {
         const compare_started_at = monotonicNowNs();
         const overrides = buildOverrides(gpt_config, configured_layer_count);
         const compare_fallback = try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(
@@ -6754,12 +6734,9 @@ fn forwardPrefillPreparedTail(
         try cb.sliceRows2D(allocator, final_hidden, total_rows - 1, 1, gpt_config.hidden_size);
     const slice_finished_at = monotonicNowNs();
     if (slice_finished_at > slice_started_at) timing_stats.prefill_last_hidden_slice_nanos += slice_finished_at - slice_started_at;
-    errdefer if (last_hidden != final_hidden) cb.free(last_hidden);
     if (last_hidden != final_hidden) {
         cb.free(final_hidden);
-        owns_final_hidden = false;
-    } else {
-        owns_final_hidden = false;
+        final_hidden = last_hidden;
     }
     const frame_finish_started_at = monotonicNowNs();
     finishDecoderRuntimeFrame(cb, &decoder_frame_active);
