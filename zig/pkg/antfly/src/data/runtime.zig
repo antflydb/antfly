@@ -58315,6 +58315,19 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
     return &result;
 }
 
+test "scalar window retirement ordered catalog requires the all-member protocol" {
+    const protocol = @import("../common/data_raft_protocol.zig");
+    const inventory = @import("antfly_local_sources").storage_db_artifact_inventory;
+    var request: antfly.db.types.BatchRequest = .{ .artifact_catalog = .{
+        .namespace = @splat(1),
+        .catalogs = .{},
+        .binding = .{ .epoch = 1, .digest = @splat(2), .semantic_digest = @splat(3), .effect_protocol = inventory.dense_artifact_flags_protocol },
+    } };
+    try std.testing.expectEqual(protocol.batch_dense_artifact_flags_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+    request.artifact_catalog.?.binding.effect_protocol = inventory.scalar_window_retirement_protocol;
+    try std.testing.expectEqual(protocol.batch_scalar_window_retirement_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+}
+
 test "grouped source protocol dominates coexisting graph envelope features" {
     const protocol = @import("../common/data_raft_protocol.zig");
     var request: antfly.db.types.BatchRequest = .{ .artifact_catalog = .{
@@ -58325,9 +58338,6 @@ test "grouped source protocol dominates coexisting graph envelope features" {
     try std.testing.expectEqual(protocol.batch_group_source_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
     request.artifact_catalog.?.binding.effect_protocol = 17;
     try std.testing.expectEqual(protocol.batch_execution_identity_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
-    request.artifact_catalog.?.binding.effect_protocol = @import("antfly_local_sources").storage_db_artifact_inventory.scalar_window_retirement_protocol;
-    try std.testing.expectEqual(protocol.batch_scalar_window_retirement_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
-    request.artifact_catalog.?.binding.effect_protocol = 17;
     request = .{ .group_source = .{ .action = .activate, .artifact = "turns", .definition = .{ .table_incarnation = 1, .configuration = @splat(2) }, .namespace = @splat(1), .backfill = .{ .route = .{ .value = "" } } } };
     try std.testing.expectEqual(protocol.batch_group_source_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
     request.group_source.?.action = .activate_catalog;
