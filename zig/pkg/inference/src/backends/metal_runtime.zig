@@ -54222,6 +54222,24 @@ pub fn rowRmsBf16(runtime: *RawMetalDecodeRuntime, rows: u32, width: u32, epsilo
 
 extern fn antfly_metal_dispatch_row_rms_bf16(runtime: *RawMetalDecodeRuntime, views: *const [3]RoutedBlockScaledProjection.Buffer, rows: u32, width: u32, epsilon: f32, input_f32: bool) c_int;
 
+/// Gather immutable BF16 rows and normalize each row in the same dispatch.
+pub fn indexedRowRmsBf16(runtime: *RawMetalDecodeRuntime, ids: []const i32, table_rows: u32, width: u32, epsilon: f32, table: *const MetalTensor, gamma: *const MetalTensor, output: *MetalTensor) !void {
+    if (!hasActiveFrame(runtime)) return error.MetalFrameRequired;
+    if (ids.len == 0 or ids.len > 256) return error.InvalidShape;
+    if (output.isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
+    const Buffer = RoutedBlockScaledProjection.Buffer;
+    const views: [3]Buffer = .{
+        try .fromTensor(table, .i16),
+        try .fromTensor(gamma, .i16),
+        try .fromTensor(output, .i16),
+    };
+    if (antfly_metal_dispatch_indexed_row_rms_bf16(runtime, &views, ids.ptr, @intCast(ids.len), width, table_rows, epsilon) != 0)
+        return error.MetalKernelDispatchFailed;
+    output.invalidateHostMirror();
+}
+
+extern fn antfly_metal_dispatch_indexed_row_rms_bf16(runtime: *RawMetalDecodeRuntime, views: *const [3]RoutedBlockScaledProjection.Buffer, ids: [*]const i32, rows: u32, width: u32, table_rows: u32, epsilon: f32) c_int;
+
 test "Metal full-width BF16 RMS accepts checkpoint rows and F32 residuals" {
     if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
     var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();

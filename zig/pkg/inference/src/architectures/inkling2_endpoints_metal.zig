@@ -69,6 +69,14 @@ pub const Endpoints = struct {
         try metal.rowRmsBf16(runtime, 1, self.width, self.epsilon, &source, &self.weights[1], output);
     }
 
+    pub fn embedRows(self: *const Endpoints, runtime: *metal.RawMetalDecodeRuntime, ids: []const i32, output: *Tensor) !void {
+        for (ids) |id| {
+            if (id < 0 or @as(u32, @intCast(id)) >= self.vocab) return error.InvalidInkling2Token;
+        }
+        if (ids.len == 1) return self.embed(runtime, @intCast(ids[0]), output);
+        try metal.indexedRowRmsBf16(runtime, ids, self.vocab, self.width, self.epsilon, &self.weights[0], &self.weights[1], output);
+    }
+
     pub fn logits(self: *const Endpoints, runtime: *metal.RawMetalDecodeRuntime, blocks: ?*const Tensor, last: *const Tensor, sources: u32, normalized: *Tensor, output: *Tensor) !void {
         if (output.dtype != .f32) return error.UnsupportedTensorType;
         const mix: metal.ResidualMixBf16 = .{
@@ -107,6 +115,8 @@ test "Inkling Metal decoder endpoints embed and project vocabulary logits in one
     defer endpoints.deinit();
     var embedded = try Tensor.deviceAllocateTyped(a, runtime, .i16, .private, &.{2});
     defer embedded.deinit();
+    var batch = try Tensor.deviceAllocateTyped(a, runtime, .i16, .private, &.{6});
+    defer batch.deinit();
     var normalized = try Tensor.deviceAllocateTyped(a, runtime, .i16, .private, &.{2});
     defer normalized.deinit();
     var logits = try Tensor.deviceAllocateTyped(a, runtime, .f32, .shared, &.{2});
@@ -115,6 +125,8 @@ test "Inkling Metal decoder endpoints embed and project vocabulary logits in one
     try metal.beginFrame(runtime);
     errdefer metal.cancelFrame(runtime) catch {};
     try std.testing.expectError(error.InvalidInkling2Token, endpoints.embed(runtime, 2, &embedded));
+    try std.testing.expectError(error.InvalidInkling2Token, endpoints.embedRows(runtime, &.{ 1, -1 }, &batch));
+    try endpoints.embedRows(runtime, &.{ 1, 0, 1 }, &batch);
     try endpoints.embed(runtime, 1, &embedded);
     try endpoints.logits(runtime, null, &embedded, 1, &normalized, &logits);
     try metal.submitFrame(runtime);
@@ -123,6 +135,9 @@ test "Inkling Metal decoder endpoints embed and project vocabulary logits in one
     var bits: [2]u16 = undefined;
     try embedded.downloadBytesInto(std.mem.asBytes(&bits));
     try std.testing.expectEqual(norm, bits);
+    var grouped: [6]u16 = undefined;
+    try batch.downloadBytesInto(std.mem.asBytes(&grouped));
+    try std.testing.expectEqual([_]u16{ 0x3f80, 0x3f80, 0xbf80, 0xbf80, 0x3f80, 0x3f80 }, grouped);
     var scores: [2]f32 = undefined;
     try logits.downloadF32Into(&scores);
     try std.testing.expectApproxEqAbs(@as(f32, 0.76159416), scores[0], 0.00001);

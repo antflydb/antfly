@@ -508,11 +508,14 @@ pub const Request = struct {
         var offset: usize = 0;
         for (parts) |part| {
             switch (part) {
-                .tokens => |tokens| for (tokens, offset..) |id, index| {
-                    var destination = try row(hidden, index, width);
-                    defer destination.deinit();
-                    const token = std.math.cast(u32, id) orelse return error.InvalidInkling2Token;
-                    try self.model.endpoints.embed(self.model.runtime, token, &destination);
+                .tokens => |tokens| {
+                    if (tokens.len > 0) {
+                        const bytes = tokens.len * row_bytes;
+                        const elements: i32 = @intCast(bytes / @sizeOf(u16));
+                        var destination = try hidden.retainedView(offset * row_bytes, bytes, &.{elements});
+                        defer destination.deinit();
+                        try self.model.endpoints.embedRows(self.model.runtime, tokens, &destination);
+                    }
                 },
                 .embeddings => |values| {
                     const source = values.tensor;
