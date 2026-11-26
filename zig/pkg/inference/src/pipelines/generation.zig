@@ -6145,13 +6145,17 @@ pub const NativeGenerationPipeline = struct {
                 .pure_greedy = isPureGreedyConfig(config),
                 .grammar_active = token_table != null or json_grammar.* != null or gbnf_grammar != null,
                 .prefetch_drain_budget = prefetch_drain_budget_per_step,
-            }, &lookahead_events) catch |err| {
+            }, &candidate_token.tensor, &lookahead_events) catch |err| {
                 notePendingCandidateEvents(work_trace, @intFromPtr(self), seq_len.*, true, lookahead_events);
                 return err;
             };
             notePendingCandidateEvents(work_trace, @intFromPtr(self), seq_len.*, true, lookahead_events);
             if (lookahead) |next| {
                 try pending.retainLookahead(next);
+            } else if (candidate_token.tensor == null) {
+                // The graph path retired its input after the gathers. The
+                // completed scalar can seed an ordinary continuation.
+                try candidate_token.seed(token);
             }
 
             try pending.commit();

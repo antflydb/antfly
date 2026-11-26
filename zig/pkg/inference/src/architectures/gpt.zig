@@ -1111,18 +1111,32 @@ pub fn forwardGreedyLastTokenTensorOnlyFromTokenTensor(
     batch: usize,
     seq_len: usize,
     decode_context: ?*const DecodeContext,
+    resolved_input_owner: ?*?CT,
 ) !?CT {
     const hidden_size = config.hidden_size;
     const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
     const total = batch * query_seq_len;
     if (batch != 1 or query_seq_len != 1 or total != 1) return null;
 
+    if (resolved_input_owner) |owner| {
+        if (owner.* != input_token) return error.InvalidTensorShape;
+    }
     const embed_w = try getEmbeddingWeight(cb, config);
     defer cb.free(embed_w);
     const hidden = (try lookupScaledTokenEmbeddingsTensor(cb, allocator, config, embed_w, input_token, total, hidden_size)) orelse return null;
 
-    const ple_vectors = try computePleVectorsFromTokenTensor(cb, allocator, config, input_token, hidden, total);
+    const ple_vectors = computePleVectorsFromTokenTensor(cb, allocator, config, input_token, hidden, total) catch |err| {
+        cb.free(hidden);
+        return err;
+    };
     defer if (ple_vectors) |pv| cb.free(pv);
+
+    // The CUDA caller has resolved the scalar. Both gathers that read its
+    // device copy have been queued on the same stream as the following graph.
+    if (resolved_input_owner) |owner| {
+        owner.* = null;
+        cb.free(input_token);
+    }
 
     return try forwardGreedyLastTokenTensorOnlyFromEmbeddings(cb, allocator, config, hidden, batch, seq_len, decode_context, ple_vectors);
 }

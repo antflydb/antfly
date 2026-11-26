@@ -343,7 +343,7 @@ pub const Runtime = struct {
     /// this selector neither wraps a second invocation nor publishes a token.
     pub fn pendingCandidate(self: *Runtime, state: *NativeDecodeState, request: PendingCandidateRequest, events: *PendingCandidateEvents) !PendingCandidate {
         if (!request.pure_greedy or request.grammar_active) return .declined;
-        if (try self.pendingTensorCandidate(state, request, events)) |tensor| return .{ .tensor = tensor };
+        if (try self.pendingTensorCandidate(state, request, null, events)) |tensor| return .{ .tensor = tensor };
         events.attempts += 1;
         events.scalar_route = self.deviceRoute(state, .{ .mode = .scalar, .generated_tokens = request.generated_tokens, .pure_greedy = request.pure_greedy, .grammar_active = request.grammar_active });
         if (events.scalar_route.? != .eligible) return .declined;
@@ -363,11 +363,11 @@ pub const Runtime = struct {
     /// physical forward after the pending position has been reserved. The
     /// regular pending selector shares this first attempt before its scalar
     /// fallback; actual route and partial callback events remain caller-owned.
-    pub fn pendingTensorCandidate(self: *Runtime, state: *NativeDecodeState, request: PendingCandidateRequest, events: *PendingCandidateEvents) !?ops.CT {
+    pub fn pendingTensorCandidate(self: *Runtime, state: *NativeDecodeState, request: PendingCandidateRequest, resolved_input_owner: ?*?ops.CT, events: *PendingCandidateEvents) !?ops.CT {
         events.attempts += 1;
         events.tensor_route = self.deviceRoute(state, .{ .mode = .tensor, .generated_tokens = request.generated_tokens, .pure_greedy = request.pure_greedy, .grammar_active = request.grammar_active });
         if (events.tensor_route.? != .eligible) return null;
-        return self.forwardDeviceTokenTensor(state, request.sequence_length, request.input_token_tensor, request.prefetch_drain_budget, &events.handoff);
+        return self.forwardDeviceTokenTensor(state, request.sequence_length, request.input_token_tensor, request.prefetch_drain_budget, resolved_input_owner, &events.handoff);
     }
 
     pub fn forwardDeviceStep(self: *Runtime, state: *NativeDecodeState, request: DeviceStepRequest, events: *DeviceStepEvents) !DeviceStepResult {
@@ -422,11 +422,11 @@ pub const Runtime = struct {
         return .{ .token = .{ .token = try gpt_arch.forwardGreedyLastToken(cb, allocator, model, ids, 1, request.sequence_length, &decode) } };
     }
 
-    pub fn forwardDeviceTokenTensor(self: *Runtime, state: *NativeDecodeState, sequence_length: usize, input: ops.CT, drain_budget: usize, events: *DeviceStepEvents) !?ops.CT {
-        return @import("invocation_observation.zig").callContextOperation(&self.context, .decode_step, @This().forwardDeviceTokenTensorUnobserved, .{ self, state, sequence_length, input, drain_budget, events });
+    pub fn forwardDeviceTokenTensor(self: *Runtime, state: *NativeDecodeState, sequence_length: usize, input: ops.CT, drain_budget: usize, resolved_input_owner: ?*?ops.CT, events: *DeviceStepEvents) !?ops.CT {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .decode_step, @This().forwardDeviceTokenTensorUnobserved, .{ self, state, sequence_length, input, drain_budget, resolved_input_owner, events });
     }
 
-    fn forwardDeviceTokenTensorUnobserved(self: *Runtime, state: *NativeDecodeState, sequence_length: usize, input: ops.CT, drain_budget: usize, events: *DeviceStepEvents) !?ops.CT {
+    fn forwardDeviceTokenTensorUnobserved(self: *Runtime, state: *NativeDecodeState, sequence_length: usize, input: ops.CT, drain_budget: usize, resolved_input_owner: ?*?ops.CT, events: *DeviceStepEvents) !?ops.CT {
         const cb = self.context.cb;
         const model = self.context.gpt_config.*;
         cb.drainPrefetchBudget(drain_budget);
@@ -434,13 +434,14 @@ pub const Runtime = struct {
         var decode = physical.makeDecodeContext(sequence_length, 1);
         try self.context.bindDecoderCleanup(&decode);
         events.handoff_attempts += 1;
-        if (gatedTokenTensorEnabled() and !gpt_arch.cudaDecodeGraphReplayPrefersGraph(self.context.cb)) {
+        const prefer_graph = gpt_arch.cudaDecodeGraphReplayPrefersGraph(cb);
+        if (gatedTokenTensorEnabled() and !prefer_graph) {
             if (try decoder_gated_runtime.forwardGreedyTokenTensorOnlyFromTokenTensor(cb, self.context.allocator, model, model.num_hidden_layers, 0, input, sequence_length, &decode)) |token| {
                 events.handoff_hits += 1;
                 return token;
             }
         }
-        if (try gpt_arch.forwardGreedyLastTokenTensorOnlyFromTokenTensor(cb, self.context.allocator, model, input, 1, sequence_length, &decode)) |token| {
+        if (try gpt_arch.forwardGreedyLastTokenTensorOnlyFromTokenTensor(cb, self.context.allocator, model, input, 1, sequence_length, &decode, if (prefer_graph) resolved_input_owner else null)) |token| {
             events.handoff_hits += 1;
             return token;
         }
@@ -2541,7 +2542,7 @@ fn checkActualPendingCandidate(cb_value: ComputeBackend, _: ComputeBackend) !voi
     var events = PendingCandidateEvents{};
     const request = PendingCandidateRequest{ .token_ids = &.{ 0, 1 }, .sequence_length = 2, .generated_tokens = 1, .input_token_tensor = input, .pure_greedy = true, .grammar_active = false };
     var tensor_events = PendingCandidateEvents{};
-    try std.testing.expect(try numerical.pendingTensorCandidate(&state, request, &tensor_events) == null);
+    try std.testing.expect(try numerical.pendingTensorCandidate(&state, request, null, &tensor_events) == null);
     try std.testing.expectEqual(@as(usize, 1), tensor_events.attempts);
     try std.testing.expectEqual(DeviceRoute.backend_not_device, tensor_events.tensor_route.?);
     try std.testing.expect(tensor_events.scalar_route == null);
@@ -2681,12 +2682,12 @@ fn checkActualCudaPendingCandidates(cb_value: ComputeBackend, _: ComputeBackend)
     var original_tensor_events = PendingCandidateEvents{ .attempts = 1 };
     original_tensor_events.tensor_route = numerical.deviceRoute(&state, .{ .mode = .tensor, .generated_tokens = 1, .pure_greedy = true, .grammar_active = false });
     const original_tensor = if (original_tensor_events.tensor_route.? == .eligible)
-        try numerical.forwardDeviceTokenTensor(&state, 2, input, request.prefetch_drain_budget, &original_tensor_events.handoff)
+        try numerical.forwardDeviceTokenTensor(&state, 2, input, request.prefetch_drain_budget, null, &original_tensor_events.handoff)
     else
         null;
     defer if (original_tensor) |tensor| cb.free(tensor);
     var lookahead_events = PendingCandidateEvents{};
-    const lookahead = try numerical.pendingTensorCandidate(&state, request, &lookahead_events);
+    const lookahead = try numerical.pendingTensorCandidate(&state, request, null, &lookahead_events);
     defer if (lookahead) |tensor| cb.free(tensor);
     try std.testing.expectEqualDeep(original_tensor_events, lookahead_events);
     try std.testing.expectEqual(@as(usize, 1), lookahead_events.attempts);
@@ -2704,7 +2705,7 @@ fn checkActualCudaPendingCandidates(cb_value: ComputeBackend, _: ComputeBackend)
     original_events.tensor_route = numerical.deviceRoute(&state, .{ .mode = .tensor, .generated_tokens = 1, .pure_greedy = true, .grammar_active = false });
     var original: PendingCandidate = .declined;
     if (original_events.tensor_route.? == .eligible) {
-        if (try numerical.forwardDeviceTokenTensor(&state, 2, input, request.prefetch_drain_budget, &original_events.handoff)) |tensor| original = .{ .tensor = tensor };
+        if (try numerical.forwardDeviceTokenTensor(&state, 2, input, request.prefetch_drain_budget, null, &original_events.handoff)) |tensor| original = .{ .tensor = tensor };
     }
     if (original == .declined) {
         original_events.attempts += 1;

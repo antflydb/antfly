@@ -2550,6 +2550,7 @@ fn runRawDecodeBench(
                     1,
                     seq_len,
                     &decode_context,
+                    null,
                 )) orelse return error.RawDecodeGreedyTokenTensorUnavailable;
                 continue;
             }
@@ -2617,6 +2618,7 @@ fn runRawDecodeBench(
                     1,
                     seq_len,
                     &decode_context,
+                    null,
                 )) orelse return error.RawDecodeGreedyTokenTensorUnavailable;
                 continue;
             }

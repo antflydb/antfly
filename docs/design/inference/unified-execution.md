@@ -1491,9 +1491,20 @@ Two follow-up probes preserved the outputs and still captured 22 graphs
 with 32 persistent replays in each arm. One released the owned token
 after its embedding gathers. The other preferred a ready graph over an
 unused compatible bank and ran with another CUDA context present. The
-capture counts still point to the conditions that require a second bank.
-The current serving path keeps its existing token lifetime and replay
-slot policy.
+trace showed that a matching graph had both input banks available and
+its output bank held by tensor-only lookahead. The lookahead now releases
+its owned CUDA token after both embedding gathers enqueue on the decode
+stream. If the tensor route declines after consuming the input, the
+already resolved scalar seeds continuation before the step commits.
+
+Across 11 requests per traced arm, the fix restored 11 captures and
+43 persistent replays from 22 and 32, with the same 54 graph executions
+and exact output parity. The uninstrumented comparison to frozen main
+`20563ec50a` used 40 warm samples per engine with same-binary controls.
+HTTP p50 was 223.14 → 223.59 ms (+0.20%) and p95 was 225.20 → 224.64 ms
+(−0.25%). Outputs matched exactly. All 16 trace and timing arms selected
+CUDA. Both control and latency gates passed. The median difference
+exceeded the observed 0.11% same-binary spread.
 
 The same Spark binaries also served grouped EmbeddingGemma2 image, audio,
 and video requests through the public embedding endpoint. Each crossover
