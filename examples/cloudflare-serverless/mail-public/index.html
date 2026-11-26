@@ -44,6 +44,7 @@
     <button id="compose" class="primary compose"><svg class="icon" aria-hidden="true"><use href="#i-pencil"/></svg>Compose</button>
     <nav aria-label="Folders">
       <button id="inbox" class="folder" aria-current="page"><svg class="icon" aria-hidden="true"><use href="#i-inbox"/></svg>Inbox</button>
+      <button id="important" class="folder important-folder" hidden>Important</button>
       <button id="outbox" class="folder"><svg class="icon" aria-hidden="true"><use href="#i-sent"/></svg>Outbox</button>
       <button id="trash" class="folder"><svg class="icon" aria-hidden="true"><use href="#i-trash"/></svg>Trash</button>
     </nav>
@@ -55,6 +56,14 @@
       <p id="local-help" class="tooltip" role="tooltip">Search your mail by meaning with a model that runs in this browser. Your messages and their embeddings stay on this device, and search keeps working offline. The model is a one-time download. Turning this off deletes the copy.</p>
       <progress id="local-progress" hidden></progress>
       <p class="device-status"><span id="local-status" role="status" aria-live="polite"></span> <button type="button" id="local-sync" class="link" hidden>Sync now</button></p>
+    </div>
+    <div id="classification" class="device" hidden>
+      <label class="switch device-row" aria-describedby="classification-help">
+        <span class="device-text"><span>On-device classification</span><small id="classification-badge">Off</small></span>
+        <input type="checkbox" role="switch" id="classification-toggle">
+      </label>
+      <p id="classification-help" class="tooltip" role="tooltip">Categorize this mailbox and identify important messages on this device. The first use downloads GLiDE (about 756 MiB).</p>
+      <p class="device-status classification-status"><span id="classification-status" role="status"></span> <button type="button" id="classification-clear" class="link" hidden>Clear local labels</button></p>
     </div>
     <footer class="account">
       <p class="label">Your address</p>
@@ -75,6 +84,7 @@
       <p id="search-note" class="credit"><svg class="mark" aria-hidden="true"><use href="#mark"/></svg><span id="search-note-text">Search by Antfly</span></p>
     </div>
     <h2 id="list-title">Inbox</h2>
+    <nav id="categories" class="categories" aria-label="Inbox categories" hidden></nav>
     <p id="trash-banner" hidden><span id="trash-retention"></span> <button type="button" id="empty-trash" class="link danger">Empty Trash now</button></p>
     <div id="messages"></div>
     <button id="next" class="more" hidden>Older messages</button>

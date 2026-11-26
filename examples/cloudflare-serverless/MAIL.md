@@ -330,12 +330,17 @@ receive external mail. Select the inbox in the web app before composing.
 
 ### On-device GLiDE classification
 
-GLiDE-0.4B is a separate, optional model. On a message with plain text, select
-**Classify on this device (model download)** to see a suggested category and
-a separate importance flag. The action keeps message text on the device and
-leaves inbox ordering and message state alone. Uncertain categories remain
-in Primary. Image-bearing decision requests require a separate vision-capable
-model. GLiDE-0.4B accepts text only.
+Enable **On-device classification** for each mailbox you want categorized.
+GLiDE classifies existing and newly received messages in the background.
+Inbox tabs show Primary, Promotions, Social, Updates, and Forums, and
+**Important** shows messages flagged for attention. Uncertain categories
+stay in Primary.
+
+Labels and sync progress are saved in this browser alongside the on-device
+search data. Turning classification off pauses it and keeps saved labels.
+**Clear local labels** removes the mailbox's labels and turns classification
+off. GLiDE-0.4B uses message text. Image-bearing decision requests require a
+vision-capable model.
 
 Prepare the licensed checkpoint and enable the optional UI in the runtime build:
 

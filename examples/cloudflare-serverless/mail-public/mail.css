@@ -330,3 +330,11 @@ pre { font: 15px/1.7 var(--font-sans); white-space: pre-wrap; overflow-wrap: any
   .back { display: inline-flex; }
   #message, #editor { padding: 1rem 1.25rem 4rem; }
 }
+
+.categories { display: flex; gap: 0.25rem; overflow-x: auto; border-bottom: 1px solid var(--border); }
+.categories button { flex: 0 0 auto; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--muted); padding: 0.6rem; font: inherit; cursor: pointer; }
+.categories button[aria-pressed="true"] { border-bottom-color: var(--foreground); color: var(--foreground); font-weight: 600; }
+.important-folder::before { content: "◆"; width: 1.25rem; text-align: center; color: #906319; }
+.tag.important-label { color: #805611; background: #f9ebc9; }
+.tag.classification-label { color: var(--foreground); background: var(--hover); }
+.device-status.classification-status:has(#classification-status:not(:empty)) { display: block; }

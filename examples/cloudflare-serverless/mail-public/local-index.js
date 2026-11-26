@@ -82,14 +82,15 @@ export async function localConfig() {
   return config;
 }
 
-export async function createMailClassifier(config, onProgress) {
-  const response = await fetch(config.classifier.catalog, { cache: "no-cache" });
+export async function createMailClassifier(config, onProgress, signal) {
+  const response = await fetch(config.classifier.catalog, { cache: "no-cache", signal });
   if (!response.ok) throw Error("On-device classification is not installed");
   const catalog = await response.json();
   const web = await import(config.runtime.web);
   const client = await web.Inference.create({ assets: config.runtime.inference });
   try {
-    const files = await web.downloadCatalogModel(catalog, { assets: config.runtime.inference, sameOriginCredentials: true, onProgress });
+    const files = await web.downloadCatalogModel(catalog, { assets: config.runtime.inference, sameOriginCredentials: true, onProgress, signal });
+    signal?.throwIfAborted();
     const model = await client.loadModel(files, { backend: "auto", precision: catalog.precision, onProgress });
     if (!model.execution.tasks.includes("decide")) throw Error("The model does not support on-device decisions");
     return {

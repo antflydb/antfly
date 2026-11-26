@@ -27,6 +27,7 @@ const LOCAL_FLAGS = "antfly-mail-local-v1";
 // usable so the switch survives a reload mid-setup. LOCAL_FLAGS stays the
 // record of a usable copy (offline start, sign-out wipe).
 const LOCAL_WANTED = "antfly-mail-local-wanted-v1";
+const CLASSIFICATION_WANTED = "antfly-mail-classification-wanted-v1";
 // Minimal identity for opening an opted-in copy offline; removed on sign-out.
 const OFFLINE_IDENTITY = "antfly-mail-offline-identity-v1";
 // Set while a sign-out wipe is unfinished, so the next load retries it.
@@ -43,13 +44,13 @@ function localFlags(key = LOCAL_FLAGS) {
     return {};
   }
 }
-function setLocalWanted(mailboxId, on) {
+function setLocalWanted(mailboxId, on, key = LOCAL_WANTED) {
   try {
-    const wanted = localFlags(LOCAL_WANTED);
+    const wanted = localFlags(key);
     if (on) wanted[mailboxId] = true;
     else delete wanted[mailboxId];
-    if (Object.keys(wanted).length) localStorage.setItem(LOCAL_WANTED, JSON.stringify(wanted));
-    else localStorage.removeItem(LOCAL_WANTED);
+    if (Object.keys(wanted).length) localStorage.setItem(key, JSON.stringify(wanted));
+    else localStorage.removeItem(key);
   } catch {
     /* Storage disabled: the switch lasts for this page only. */
   }
@@ -61,28 +62,41 @@ async function wipeLocal() {
   try {
     localStorage.removeItem(OFFLINE_IDENTITY);
     localStorage.removeItem(LOCAL_WANTED);
+    localStorage.removeItem(CLASSIFICATION_WANTED);
     localStorage.setItem(WIPE_PENDING, "1");
   } catch {
     /* Storage disabled: nothing was ever stored. */
   }
+  await pauseClassification();
+  classification = null;
+  classificationConfig = null;
+  $("classification").hidden = true;
+  classificationFilter = "All";
+  classificationViews();
   const current = local;
   local = null;
   localReady(null);
   // The open copy's worker holds exclusive OPFS handles: have it release them
   // and delete every copy before the worker is stopped.
-  if (current) {
-    try {
-      await current.wipeAll();
-    } finally {
-      await current.close();
+  const removeCopies = async () => {
+    if (current) {
+      try {
+        await current.wipeAll();
+      } finally {
+        await current.close();
+      }
+    } else if (typeof navigator.storage?.getDirectory === "function") {
+      try {
+        await (await navigator.storage.getDirectory()).removeEntry("antfly-mail-local", { recursive: true });
+      } catch (error) {
+        if (error?.name !== "NotFoundError") throw error;
+      }
     }
-  } else if (typeof navigator.storage?.getDirectory === "function") {
-    try {
-      await (await navigator.storage.getDirectory()).removeEntry("antfly-mail-local", { recursive: true });
-    } catch (error) {
-      if (error?.name !== "NotFoundError") throw error;
-    }
-  }
+  };
+  if (navigator.locks && localSupported()) {
+    const { classificationLock } = await import("./local-classification.js");
+    await navigator.locks.request(classificationLock, removeCopies);
+  } else await removeCopies();
   // Forget the opt-in only once the data is gone, so a failed wipe is retried.
   try {
     localStorage.removeItem(LOCAL_FLAGS);
@@ -106,9 +120,10 @@ function mailboxPath(path) {
   url.searchParams.set("mailbox", "personal");
   return url.pathname + url.search;
 }
-async function api(path, body, method = body ? "POST" : "GET") {
+async function api(path, body, method = body ? "POST" : "GET", signal) {
   const result = await fetch(mailboxPath(path), {
     method,
+    signal,
     headers: body ? { "Content-Type": "application/json" } : {},
     ...(body ? { body: JSON.stringify(body) } : {}),
   });
@@ -177,6 +192,126 @@ const outboundLabels = {
 const outboundTone = { accepted: "ok", unknown: "warn", rejected: "bad" };
 const folderPaths = { inbox: "/mail/messages", outbox: "/mail/outbox", trash: "/mail/trash" };
 const folderTitles = { inbox: "Inbox", outbox: "Outbox", trash: "Trash" };
+let classification = null;
+let classificationConfig = null;
+let classificationScope = null;
+let classificationJob = null;
+let classificationFilter = "All";
+let visibleMessages = [];
+
+function classificationViews() {
+  const available = !!classification &&
+    ($("classification-toggle").checked || Object.keys(classification.state.labels).length > 0);
+  $("important").hidden = !available;
+  $("categories").hidden = !available || !listPath?.startsWith("/mail/messages") || classificationFilter === "Important";
+  $("classification-clear").hidden = !classification ||
+    !(classification.state.cursor || Object.keys(classification.state.labels).length);
+  for (const button of $("categories").children)
+    button.setAttribute("aria-pressed", String(button.textContent === classificationFilter));
+  if (available && classificationFilter === "Important") $("important").setAttribute("aria-current", "page");
+  else $("important").removeAttribute("aria-current");
+  if (folder === "inbox" && classificationFilter !== "Important" && listPath?.startsWith("/mail/messages"))
+    $("inbox").setAttribute("aria-current", "page");
+  else $("inbox").removeAttribute("aria-current");
+}
+
+function renderClassification() {
+  classificationViews();
+  const readerLabel = $("message").querySelector("[data-classification-message]");
+  if (readerLabel) {
+    const label = classification?.state.labels[readerLabel.dataset.classificationMessage];
+    readerLabel.hidden = !label;
+    readerLabel.textContent = label ? label.category + (label.important ? " · Important" : "") : "";
+  }
+  if (listSnapshot !== null && folder === "inbox") {
+    const list = $("messages");
+    if (list.contains(document.activeElement)) return;
+    render(visibleMessages);
+  }
+}
+
+async function initClassification() {
+  if (!localSupported() || !navigator.locks || !me) return;
+  const identity = me;
+  const response = await fetch("/local/config.json", { cache: "no-cache" });
+  if (!response.ok) return;
+  const config = await response.json();
+  if (!config.classifier) return;
+  const { LocalClassification, categories } = await import("./local-classification.js");
+  const scope = JSON.stringify([identity.user.email, identity.mailbox.id]);
+  const copy = await LocalClassification.open(scope);
+  await copy.read();
+  if (me !== identity || localStorage.getItem(WIPE_PENDING) === "1") return;
+  classificationConfig = config;
+  classificationScope = scope;
+  classification = copy;
+  $("classification").hidden = false;
+  $("classification-toggle").checked = !!localFlags(CLASSIFICATION_WANTED)[classificationScope];
+  $("classification-badge").textContent = $("classification-toggle").checked ? "On" : "Off";
+  $("categories").replaceChildren(...["All", ...categories].map((category) => {
+    const button = text("button", category);
+    button.type = "button";
+    button.onclick = guarded(() => load("/mail/messages", category));
+    return button;
+  }));
+  renderClassification();
+  syncClassification();
+}
+
+function syncClassification() {
+  if (classificationJob || !classification || !$("classification-toggle").checked ||
+      !localFlags(CLASSIFICATION_WANTED)[classificationScope] || !navigator.onLine || document.hidden) return;
+  const controller = new AbortController();
+  const badge = $("classification-badge");
+  const feedback = $("classification-status");
+  let classificationChanged = false;
+  const job = classification.sync({
+    signal: controller.signal,
+    page: (cursor, signal) => {
+      if (!localFlags(CLASSIFICATION_WANTED)[classificationScope]) controller.abort();
+      signal.throwIfAborted();
+      return api("/mail/sync?cursor=" + encodeURIComponent(cursor), null, "GET", signal);
+    },
+    classifier: async () => {
+      badge.textContent = "Preparing GLiDE…";
+      const { createMailClassifier } = await localModule();
+      const model = await createMailClassifier(classificationConfig, ({ loaded, total }) => {
+        if (total && !controller.signal.aborted)
+          badge.textContent = "Downloading GLiDE · " + Math.round(loaded * 100 / total) + "%";
+      }, controller.signal);
+      badge.textContent = "Classifying…";
+      return model;
+    },
+    onChange: () => {
+      renderClassification();
+      classificationChanged = true;
+    },
+  }).then(() => {
+    feedback.textContent = "Built with Fastino GLiDE";
+    if (classificationChanged && classificationFilter !== "All" && listPath === "/mail/messages" &&
+        !$("messages").contains(document.activeElement))
+      return load(listPath, classificationFilter);
+  }).catch((error) => {
+    if (!controller.signal.aborted) feedback.textContent = error.message;
+  }).finally(() => {
+    badge.textContent = $("classification-toggle").checked ? "On" : "Off";
+    classificationJob = null;
+  });
+  classificationJob = { controller, job };
+}
+
+async function pauseClassification() {
+  classificationJob?.controller.abort();
+  await classificationJob?.job;
+}
+
+function matchesClassification(message) {
+  const label = classification?.state.labels[message.id];
+  if (classificationFilter === "Important") return label?.important === true;
+  if (classificationFilter === "All") return true;
+  return (label?.category ?? "Primary") === classificationFilter;
+}
+
 let selected = null;
 function showFolder(name, title = folderTitles[name]) {
   folder = name;
@@ -193,7 +328,7 @@ let refreshingList = false;
 async function refreshList() {
   if (!me || !navigator.onLine || document.hidden || refreshingList || !listPath || listSnapshot === null) return;
   // Keep older pages and search results stable while the user is browsing.
-  if (listPath.includes("?") || listPath === "/mail/trash") return;
+  if (listPath.includes("?") || listPath === "/mail/trash" || classificationFilter !== "All") return;
   const request = listRequest;
   const path = listPath;
   refreshingList = true;
@@ -212,16 +347,20 @@ async function refreshList() {
     refreshingList = false;
   }
 }
-async function load(path = "/mail/messages") {
+async function load(path = "/mail/messages", filter = "All") {
+  classificationFilter = filter;
   const request = ++listRequest;
   listPath = path;
   listSnapshot = null;
   const search = path.startsWith("/mail/search");
   showFolder(
     path.startsWith("/mail/outbox") ? "outbox" : path.startsWith("/mail/trash") ? "trash" : "inbox",
-    search ? "Results" : undefined
+    search ? "Results" : filter === "All" ? undefined : filter
   );
-  const result = await api(path);
+  classificationViews();
+  let result = await api(path);
+  while (request === listRequest && filter !== "All" && result.cursor && !result.messages.some(matchesClassification))
+    result = await api("/mail/messages?cursor=" + encodeURIComponent(result.cursor));
   if (request !== listRequest) return;
   listSnapshot = JSON.stringify(result);
   cursor = result.cursor;
@@ -235,6 +374,9 @@ async function load(path = "/mail/messages") {
 }
 const daysLeft = (time) => Math.max(0, Math.ceil((time - Date.now()) / 86400000));
 function render(messages) {
+  visibleMessages = messages;
+  if (folder === "inbox" && listPath?.startsWith("/mail/messages"))
+    messages = messages.filter(matchesClassification);
   $("next").hidden = !cursor;
   $("messages").replaceChildren();
   for (const message of messages) {
@@ -263,6 +405,10 @@ function render(messages) {
       tag(outboundLabels[message.state] ?? message.state, outboundTone[message.state]);
     if (message.delete_at) tag("Deleted forever in " + daysLeft(message.delete_at) + " days", "warn");
     if (message.local) tag("Matched by meaning", "local");
+    const label = classification?.state.labels[message.id];
+    if (!outbound && label?.important) tag("Important", "important-label");
+    if (!outbound && label && label.category !== "Primary" && classificationFilter !== label.category)
+      tag(label.category, "classification-label");
     if (message.id === selected) button.setAttribute("aria-current", "true");
     button.onclick = guarded(async () => {
       if (!discardDraft()) return;
@@ -337,32 +483,6 @@ function showOutbound(message) {
   notes.append(state);
   $("message").append(notes, text("pre", message.text));
 }
-async function addClassificationAction(message, toolbar) {
-  if (message.offline || !message.text?.trim()) return;
-  const response = await fetch("/local/config.json", { cache: "no-cache" });
-  if (!response.ok) return;
-  const config = await response.json();
-  if (!config.classifier || !toolbar.isConnected) return;
-  const button = text("button", "Classify on this device (model download)");
-  toolbar.append(button);
-  button.onclick = guarded(async () => {
-    button.disabled = true;
-    let classifier;
-    try {
-      const { createMailClassifier } = await import("./local-index.js");
-      classifier = await createMailClassifier(config, (progress) => {
-        if (progress.total) button.textContent = "Preparing classifier… " + Math.round(100 * progress.loaded / progress.total) + "%";
-      });
-      const label = await classifier.classify(message);
-      if (toolbar.isConnected) button.replaceWith(span("snippet", label.category + (label.important ? " · Important" : "") + " · Built with Fastino GLiDE"));
-    } finally {
-      classifier?.close();
-      button.disabled = false;
-      button.textContent = "Classify on this device (model download)";
-    }
-  });
-}
-
 async function openMessage(id) {
   let message;
   try {
@@ -405,7 +525,11 @@ async function openMessage(id) {
       "To " + message.to
     )
   );
-  if (me) addClassificationAction(message, toolbar).catch(() => {});
+  const label = classification?.state.labels[message.id];
+  const classificationLabel = span("tag classification-label", label ? label.category + (label.important ? " · Important" : "") : "");
+  classificationLabel.dataset.classificationMessage = message.id;
+  classificationLabel.hidden = !label;
+  toolbar.append(classificationLabel);
   const notes = document.createElement("div");
   notes.className = "notes";
   const note = (value, tone = "") => {
@@ -455,13 +579,13 @@ async function trashMessage(id) {
   await api("/mail/messages/" + encodeURIComponent(id) + "/trash", {});
   await dropLocal(id);
   placeholder("Message moved to Trash.");
-  await load(folderPaths[folder] ?? folderPaths.inbox);
+  await load(folderPaths[folder] ?? folderPaths.inbox, classificationFilter);
   statusWithAction("Message moved to Trash.", "Undo", () => restoreMessage(id));
 }
 async function restoreMessage(id) {
   await api("/mail/messages/" + encodeURIComponent(id) + "/restore", {});
   placeholder("Message restored to the inbox.");
-  await load(folderPaths[folder] ?? folderPaths.inbox);
+  await load(folderPaths[folder] ?? folderPaths.inbox, classificationFilter);
   status("Message restored to the inbox.");
   // The restored message is re-announced to devices; fetch and embed it now.
   if (local) syncLocal().catch((error) => localStatus(error.message));
@@ -596,7 +720,13 @@ async function refresh() {
       const note = text("p", "Offline. Use search to find messages on this device.");
       note.className = "list-empty";
       $("messages").replaceChildren(note);
-    } else await load();
+    } else {
+      await load();
+      if (!stillPending) initClassification().catch((error) => {
+        if ($("classification").hidden) return;
+        $("classification-status").textContent = error.message;
+      });
+    }
   }
 }
 function localStatus(message, progress) {
@@ -742,7 +872,7 @@ $("copy-address").onclick = async () => {
 };
 $("logout").onclick = guarded(async () => {
   let wipeError = null;
-  if (local || Object.keys(localFlags()).length) await wipeLocal().catch((error) => (wipeError = error));
+  if (classification || local || Object.keys(localFlags()).length || Object.keys(localFlags(CLASSIFICATION_WANTED)).length) await wipeLocal().catch((error) => (wipeError = error));
   // Always end the session, even if the on-device copy could not be removed.
   if (me?.auth === "access") {
     location.assign("/cdn-cgi/access/logout");
@@ -772,7 +902,9 @@ $("search").onsubmit = guarded(async (event) => {
   if (local && (e.where.value === "device" || !navigator.onLine)) {
     const request = ++listRequest;
     listPath = null;
+    classificationFilter = "All";
     showFolder("inbox", "Results by meaning, on this device");
+    classificationViews();
     $("trash-banner").hidden = true;
     cursor = null;
     const messages = await local.search(query);
@@ -786,11 +918,23 @@ $("local-toggle").onchange = guarded(async (event) => {
   else await stopLocal();
 });
 $("local-sync").onclick = guarded(syncLocal);
-const refreshVisibleList = () => refreshList().catch(() => {
-  // Keep the current list when a background request fails.
-});
+const refreshVisibleList = () => {
+  refreshList().catch(() => {
+    // Keep the current list when a background request fails.
+  });
+  syncClassification();
+};
 document.addEventListener("visibilitychange", refreshVisibleList);
 addEventListener("focus", refreshVisibleList);
+addEventListener("storage", (event) => {
+  if (event.key !== CLASSIFICATION_WANTED || !classification) return;
+  const enabled = !!localFlags(CLASSIFICATION_WANTED)[classificationScope];
+  $("classification-toggle").checked = enabled;
+  $("classification-badge").textContent = enabled ? "On" : "Off";
+  if (enabled) syncClassification();
+  else pauseClassification();
+  classificationViews();
+});
 if (typeof window !== "undefined") {
   const timer = window.setInterval(refreshVisibleList, 20_000);
   addEventListener("pagehide", (event) => {
@@ -805,11 +949,30 @@ if ("serviceWorker" in navigator)
   navigator.serviceWorker.register("/sw.js").catch(() => {
     /* The app still works online without the offline shell. */
   });
+$("classification-toggle").onchange = guarded(async (event) => {
+  const enabled = event.currentTarget.checked;
+  setLocalWanted(classificationScope, enabled, CLASSIFICATION_WANTED);
+  $("classification-badge").textContent = enabled ? "On" : "Off";
+  if (enabled) syncClassification();
+  else await pauseClassification();
+  renderClassification();
+});
+$("classification-clear").onclick = guarded(async () => {
+  $("classification-toggle").checked = false;
+  setLocalWanted(classificationScope, false, CLASSIFICATION_WANTED);
+  await pauseClassification();
+  await classification.clear();
+  $("classification-badge").textContent = "Off";
+  $("classification-status").textContent = "Local labels cleared.";
+  if (classificationFilter !== "All") await load();
+  else renderClassification();
+});
+$("important").onclick = guarded(() => load("/mail/messages", "Important"));
 $("inbox").onclick = guarded(() => load());
 $("outbox").onclick = guarded(() => load("/mail/outbox"));
 $("trash").onclick = guarded(() => load("/mail/trash"));
 $("empty-trash").onclick = guarded(emptyTrash);
-$("next").onclick = guarded(() => load((folderPaths[folder] ?? folderPaths.inbox) + "?cursor=" + encodeURIComponent(cursor)));
+$("next").onclick = guarded(() => load((folderPaths[folder] ?? folderPaths.inbox) + "?cursor=" + encodeURIComponent(cursor), classificationFilter));
 $("compose").onclick = () => edit();
 $("cancel").onclick = () => {
   closeEditor();
