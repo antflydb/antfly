@@ -11094,14 +11094,18 @@ pub fn installedAttentionMatchActivity(self: *CudaCompute, storage: *kv_storage_
     return .{ .attention_calls = binding.attention_calls, .donor_appends = binding.donor_appends, .invalid = binding.invalid };
 }
 
-/// Clone a fitted owner for isolated reference-query forwards. The dense
-/// clone contract remains exact-only; callers explicitly select this adapter.
-pub fn cloneInstalledAttentionMatch(self: *CudaCompute, destination_storage: *kv_storage_runtime.KvStorageRuntime, source_storage: *kv_storage_runtime.KvStorageRuntime, request: kv_storage_runtime.device_clone.Request) !?kv_storage_runtime.device_clone.Result {
+pub const AttentionMatchCloneMode = enum { exact_only, bias_aware };
+
+/// Select the fitted route under the owner's execution scope. An exact
+/// owner returns null so the caller can use its dense clone hook.
+pub fn cloneInstalledAttentionMatch(self: *CudaCompute, destination_storage: *kv_storage_runtime.KvStorageRuntime, source_storage: *kv_storage_runtime.KvStorageRuntime, request: kv_storage_runtime.device_clone.Request, mode: AttentionMatchCloneMode) !?kv_storage_runtime.device_clone.Result {
     try request.check();
     const source = try attentionMatchStorage(self, source_storage);
     const binding = source.match_binding orelse return null;
+    if (binding.sequence != request.source_sequence) return error.StaleKvCompaction;
+    if (mode == .exact_only) return error.UnsupportedCompactionQueryRoute;
     const destination = try attentionMatchStorage(self, destination_storage);
-    if (source == destination or binding.invalid or binding.sequence != request.source_sequence or
+    if (source == destination or binding.invalid or
         binding.device.logical_length != request.tokens or source.dtype != destination.dtype or
         source.layers.count() != 0 or destination.layers.count() != 0 or destination.match_binding != null or
         source.revision == std.math.maxInt(u64) or destination.revision == std.math.maxInt(u64)) return error.InvalidDeviceKvClone;
@@ -38333,29 +38337,32 @@ test "attention match CUDA live install preserves ownership on failure and retir
                     const clone_request: kv_storage_runtime.device_clone.Request = .{ .source_sequence = 7, .destination_sequence = 9, .tokens = 4, .capacity = 16, .page_size = 16, .source_blocks = &.{0}, .destination_blocks = &.{0}, .donors = &.{.{ .layer = 0, .heads = 1, .dim = 1 }}, .max_bytes = 128 * 1024 * 1024 };
                     const original_pointer = owner.match_binding.?.device.heads[0].keys.ptr;
                     const live_before_clone = compute.ctx.device_allocations.snapshot().live;
+                    try std.testing.expectError(error.UnsupportedCompactionQueryRoute, cloneInstalledAttentionMatch(&compute, &shadow_runtime, &runtime, clone_request, .exact_only));
+                    try std.testing.expect(shadow_owner.match_binding == null);
+                    try std.testing.expectEqual(live_before_clone, compute.ctx.device_allocations.snapshot().live);
                     var failed_clone = clone_request;
                     var clone_cancel: Cancellation = .{ .at = 5 };
                     failed_clone.check_ctx = &clone_cancel;
                     failed_clone.check_fn = Cancellation.check;
-                    try std.testing.expectError(error.CompactionCancelled, cloneInstalledAttentionMatch(&compute, &shadow_runtime, &runtime, failed_clone));
+                    try std.testing.expectError(error.CompactionCancelled, cloneInstalledAttentionMatch(&compute, &shadow_runtime, &runtime, failed_clone, .bias_aware));
                     try std.testing.expectEqual(@as(usize, 5), clone_cancel.calls);
                     try std.testing.expect(shadow_owner.match_binding == null);
                     try std.testing.expectEqual(live_before_clone, compute.ctx.device_allocations.snapshot().live);
                     var clone_stale: Cancellation = .{ .owner = owner };
                     failed_clone.check_ctx = &clone_stale;
-                    try std.testing.expectError(error.StaleKvCompaction, cloneInstalledAttentionMatch(&compute, &shadow_runtime, &runtime, failed_clone));
+                    try std.testing.expectError(error.StaleKvCompaction, cloneInstalledAttentionMatch(&compute, &shadow_runtime, &runtime, failed_clone, .bias_aware));
                     try std.testing.expect(shadow_owner.match_binding == null);
                     try std.testing.expectEqual(live_before_clone, compute.ctx.device_allocations.snapshot().live);
                     {
                         var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 1 });
                         shadow_owner.allocator = failing.allocator();
                         defer shadow_owner.allocator = a;
-                        try std.testing.expectError(error.OutOfMemory, cloneInstalledAttentionMatch(&compute, &shadow_runtime, &runtime, clone_request));
+                        try std.testing.expectError(error.OutOfMemory, cloneInstalledAttentionMatch(&compute, &shadow_runtime, &runtime, clone_request, .bias_aware));
                         try std.testing.expect(shadow_owner.match_binding == null);
                         try std.testing.expectEqual(live_before_clone, compute.ctx.device_allocations.snapshot().live);
                     }
                     const original_revision = owner.revision;
-                    const cloned = (try cloneInstalledAttentionMatch(&compute, &shadow_runtime, &runtime, clone_request)).?;
+                    const cloned = (try cloneInstalledAttentionMatch(&compute, &shadow_runtime, &runtime, clone_request, .bias_aware)).?;
                     try std.testing.expect(cloned.copied_bytes > 0 and cloned.allocation_bound_bytes <= clone_request.max_bytes);
                     try std.testing.expectEqual(original_pointer, owner.match_binding.?.device.heads[0].keys.ptr);
                     try std.testing.expectEqual(original_revision, owner.revision);

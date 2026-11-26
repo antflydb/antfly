@@ -346,14 +346,10 @@ pub const Shadow = struct {
         const destination = &self.storage.?;
         const hook = destination.device_write_hook orelse return error.UnsupportedCompactionQueryRoute;
         if (comptime build_options.enable_cuda) {
-            try request.check();
             const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(runner.context.backend.ptr));
-            if ((try cuda_compute.installedAttentionMatchActivity(compute, source, request.source_sequence)) != null) {
-                if (!allow_fitted) return error.UnsupportedCompactionQueryRoute;
-                const result = (try cuda_compute.cloneInstalledAttentionMatch(compute, destination, source, request)) orelse
-                    return error.UnsupportedAttentionMatchRoute;
+            const mode: cuda_compute.AttentionMatchCloneMode = if (allow_fitted) .bias_aware else .exact_only;
+            if (try cuda_compute.cloneInstalledAttentionMatch(compute, destination, source, request, mode)) |result|
                 return .{ .result = result, .fitted = true };
-            }
         }
         const result = try hook.cloneExactPrefix(source.device_write_hook orelse return missing_source_hook, request);
         return .{ .result = result, .fitted = false };
