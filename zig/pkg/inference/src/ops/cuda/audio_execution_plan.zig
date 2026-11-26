@@ -131,6 +131,14 @@ pub const Entry = struct {
 pub const Cache = struct {
     entries: [8]Entry = @splat(.{}),
     clock: u64 = 0,
+    /// Inspect eligible metadata without changing eviction order.
+    pub fn warmedFor(self: *const Cache, key: u64) ?*const Entry {
+        for (&self.entries) |*entry| {
+            if (entry.stamp != 0 and entry.key == key and entry.warmed and !entry.disabled) return entry;
+        }
+        return null;
+    }
+
     pub fn getWithCleanup(self: *Cache, key: u64, current: Cleanup) !*Entry {
         var oldest: usize = 0;
         for (&self.entries, 0..) |*entry, index| {
