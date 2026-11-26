@@ -554,17 +554,18 @@ pub const Request = struct {
         var rows: usize = 0;
         for (parts) |part| rows = try std.math.add(usize, rows, part.rows());
         if (rows == 1) return self.run(&self.decode, .{ .prefix = parts }, .none);
-        const current = if (self.prefill) |*batch| batch else return error.InvalidShape;
-        if (rows != current.stack.rows) {
-            const tail = self.prefill_tail orelse return error.InvalidShape;
-            if (rows != tail.rows) return error.InvalidShape;
-            // Completed frames have released their bindings. Replace the
-            // main workspace before allocating its shorter final shape.
-            current.deinit();
-            self.prefill = null;
-            self.prefill = try .init(self.allocator, self.model.runtime, self.model.text.hidden_size, tail);
-            self.prefill_tail = null;
+        if (self.prefill) |*current| {
+            if (rows == current.stack.rows) return self.run(current, .{ .prefix = parts }, .none);
         }
+        const tail = self.prefill_tail orelse return error.InvalidShape;
+        if (rows != tail.rows) return error.InvalidShape;
+        // Completed frames have released their bindings. Retire the wide
+        // workspace before allocating the shorter tail, keeping its plan
+        // available if allocation fails.
+        if (self.prefill) |*current| current.deinit();
+        self.prefill = null;
+        self.prefill = try .init(self.allocator, self.model.runtime, self.model.text.hidden_size, tail);
+        self.prefill_tail = null;
         try self.run(&self.prefill.?, .{ .prefix = parts }, .none);
     }
 
@@ -1012,6 +1013,22 @@ test "Inkling Metal resident decoder executes the full visit schedule on a synth
     try std.testing.expectEqual(@as(usize, 2), batched.state.sequence.committed_tokens);
     const expected_after_prefix = try request.stepGreedy(0);
     try std.testing.expectEqual(expected_after_prefix, try batched.stepGreedy(0));
+    var tail_request: Request = undefined;
+    const wide_plan = try RequestPlan.initPrefill(&model, 6, 3);
+    try tail_request.initWithPlan(a, &model, try wide_plan.withPrefillTail(&model, 2));
+    defer tail_request.deinit();
+    try tail_request.appendTokens(&.{ 0, 1, 0 });
+    {
+        var failure = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        tail_request.allocator = failure.allocator();
+        defer tail_request.allocator = a;
+        try std.testing.expectError(error.OutOfMemory, tail_request.appendTokens(&.{ 1, 0 }));
+        try std.testing.expect(failure.has_induced_failure);
+    }
+    try std.testing.expectEqual(@as(usize, 3), tail_request.state.sequence.committed_tokens);
+    try std.testing.expect(tail_request.prefill == null);
+    try tail_request.appendTokens(&.{ 1, 0 });
+    try std.testing.expectEqual(@as(usize, 5), tail_request.state.sequence.committed_tokens);
     const hf_tokenizer = @import("inference_hf_tokenizer");
     var hf = try hf_tokenizer.HfTokenizer.loadFromBytes(a,
         \\{"version":"1.0","added_tokens":[{"id":14,"content":"<|end_message|>"}],"model":{"type":"BPE","unk_token":"<unk>","vocab":{"x":0,"y":1,"<unk>":2,"<|end_message|>":14},"merges":[]}}
