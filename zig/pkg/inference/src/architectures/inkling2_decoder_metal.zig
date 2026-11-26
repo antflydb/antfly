@@ -50,6 +50,8 @@ const Layer = struct {
     experts: moe.Layer,
     weights: [8]?Tensor = @splat(null),
     controllers: [4]?Controller = @splat(null),
+    attention_queries: [3]?Tensor = @splat(null),
+    controller_query_rows: [4]?Tensor = @splat(null),
 
     const Weight = checkpoint.ResidualWeight;
 
@@ -77,7 +79,25 @@ const Layer = struct {
         return result;
     }
 
+    fn bindQueryRows(self: *Layer, text: checkpoint.TextConfig, banks: *const [2]Tensor, layer: usize) !void {
+        if (layer != 0) {
+            const count: usize = if (self.attention.local) 1 else self.attention_queries.len;
+            for (self.attention_queries[0..count], 0..) |*query, index|
+                query.* = try row(self.weight(.attn_query), index, text.hidden_size);
+        }
+        if (layer >= text.loop_config.core_start and layer < text.loop_config.core_end) {
+            const first_row = 2 * (layer - text.loop_config.core_start);
+            for (std.enums.values(checkpoint.ControllerStream), &self.controller_query_rows) |stream, *query| {
+                const bank: usize = @intFromBool(stream == .k or stream == .v);
+                const lane: usize = @intFromBool(stream == .v or stream == .mlp);
+                query.* = try row(&banks[bank], first_row + lane, text.hidden_size);
+            }
+        }
+    }
+
     fn deinit(self: *Layer) void {
+        for (&self.controller_query_rows) |*entry| if (entry.*) |*query| query.deinit();
+        for (&self.attention_queries) |*entry| if (entry.*) |*query| query.deinit();
         for (&self.controllers) |*entry| if (entry.*) |*controller| controller.deinit();
         for (&self.weights) |*entry| if (entry.*) |*weight_tensor| weight_tensor.deinit();
         self.experts.deinit();
@@ -114,6 +134,7 @@ pub const Decoder = struct {
         for (&result.layers, 0..) |*layer, index| {
             layer.* = try Layer.load(a, runtime, source, index);
             count += 1;
+            try layer.bindQueryRows(text, &result.controller_queries, index);
         }
         return result;
     }
@@ -139,12 +160,6 @@ pub const Decoder = struct {
             };
         }
         return bytes;
-    }
-
-    fn query(self: *const Decoder, layer: usize, stream: checkpoint.ControllerStream) !Tensor {
-        const bank: usize = @intFromBool(stream == .k or stream == .v);
-        const lane: usize = @intFromBool(stream == .v or stream == .mlp);
-        return row(&self.controller_queries[bank], 2 * (layer - self.text.loop_config.core_start) + lane, self.text.hidden_size);
     }
 };
 
@@ -446,12 +461,11 @@ pub const Request = struct {
         if (self.host_logits) |logits| self.allocator.free(logits);
     }
 
-    fn control(self: *Request, work: *Work, layer: *const Layer, layer_index: usize, stream: checkpoint.ControllerStream, dest: *const Tensor, gamma: *const Tensor, output: *Tensor) !void {
+    fn control(self: *Request, work: *Work, layer: *const Layer, stream: checkpoint.ControllerStream, dest: *const Tensor, gamma: *const Tensor, output: *Tensor) !void {
         const runtime = self.model.runtime;
         const eps = self.model.text.rms_norm_eps;
-        var query = try self.model.query(layer_index, stream);
-        defer query.deinit();
-        try work.stack.mixBank(runtime, eps, &query, work.get(.message));
+        const query = if (layer.controller_query_rows[@backingInt(stream)]) |*value| value else return error.InvalidInkling2Schedule;
+        try work.stack.mixBank(runtime, eps, query, work.get(.message));
         const ctrl = if (layer.controllers[@backingInt(stream)]) |*value| value else return error.InvalidInkling2Schedule;
         try ctrl.encode(runtime, work.stack.rows, eps, dest, work.get(.message), gamma, .{
             .pair = work.get(.pair),
@@ -481,13 +495,12 @@ pub const Request = struct {
                 continue;
             }
             if (!looped or !local or index == 0) {
-                var query = try row(layer.weight(.attn_query), index, text.hidden_size);
-                defer query.deinit();
+                const query = if (layer.attention_queries[index]) |*value| value else return error.InvalidInkling2Schedule;
                 if (looped) {
-                    try work.stack.mix(runtime, eps, &query, null, work.get(.mix));
-                } else try work.stack.mix(runtime, eps, &query, gamma, dest);
+                    try work.stack.mix(runtime, eps, query, null, work.get(.mix));
+                } else try work.stack.mix(runtime, eps, query, gamma, dest);
             }
-            if (looped) try self.control(work, layer, op.weight_layer, stream, work.get(.mix), gamma, dest);
+            if (looped) try self.control(work, layer, stream, work.get(.mix), gamma, dest);
         }
         const binding = try self.state.binding(pending, .{ .group = op.group, .slot = op.slot });
         try layer.attention.encode(runtime, text, pending, .{
@@ -501,7 +514,7 @@ pub const Request = struct {
         const previous = if (boundary) null else work.stack.current();
         const gamma = layer.weight(.mlp_norm);
         try work.stack.mixPartial(runtime, eps, completed, work.get(.convolved_attention), previous, layer.weight(.mlp_query), if (looped) null else gamma, work.get(if (looped) .mix else .normalized));
-        if (looped) try self.control(work, layer, op.weight_layer, .mlp, work.get(.mix), gamma, work.get(.normalized));
+        if (looped) try self.control(work, layer, .mlp, work.get(.mix), gamma, work.get(.normalized));
         try layer.experts.encode(runtime, text, work.stack.rows, work.get(.normalized), work.get(.router), .{
             .selected = work.get(.selected),
             .weights = work.get(.route_weights),
@@ -1096,6 +1109,14 @@ test "Inkling Metal resident decoder executes the full visit schedule on a synth
     for (&model.layers, 0..) |*layer, index| {
         layer.* = try Fixture.load(runtime, text, index);
         loaded += 1;
+        try layer.bindQueryRows(text, &model.controller_queries, index);
+    }
+    const query_bytes = width * @sizeOf(f32);
+    const looped = &model.layers[text.loop_config.core_start + 1];
+    for ([_]usize{ 0, 1, 1, 0 }, [_]usize{ 2, 2, 3, 3 }, looped.controller_query_rows) |bank, row_index, cached| {
+        const view = cached orelse return error.InvalidFixture;
+        try std.testing.expectEqual(model.controller_queries[bank].deviceHandle(), view.deviceHandle());
+        try std.testing.expectEqual(row_index * query_bytes, view.deviceByteOffset());
     }
     const weights_before = model.residentBytes();
     try std.testing.expect(weights_before > 0);
