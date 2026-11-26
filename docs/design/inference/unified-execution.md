@@ -1223,10 +1223,12 @@ arena output custody and detached NVDEC retirement. The 16 skips were
 15 Metal cases and the CUDA-disabled video fixture. The separate Spark
 capture cohort at the same revision passed 122 of 173 selected tests.
 The packed-row and dequantized vendor recipes passed physical capture,
-held output and eviction checks. The public BF16 audio learning and
-replay fixture skipped when its vendor arithmetic prerequisites were
-unavailable. Audio recipe replacement and the broader released-model
-performance matrix remain open.
+held output and eviction checks. The public BF16 audio fixture skipped in
+the default-library run. It passed on the same Spark executable with the
+existing cuDNN 9.19 CUDA 13 runtime, covering learning, cancelled capture,
+recapture and replay. The source still learns its audio workspace layout.
+Replacing that learned layout and qualifying released-model performance
+remain open.
 
 At `552aba3e45`, the focused Spark GB10 cohort passed all 15 capture and
 workspace tests with zero skips. The physical tests covered immutable
