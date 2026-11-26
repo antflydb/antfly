@@ -1061,6 +1061,7 @@ const ReclaimerSlot = struct {
     weight: u32 = 1,
     in_flight: u32 = 0,
     retiring: bool = false,
+    replay_publication: bool = false,
 };
 
 const ReclaimerInvocation = struct {
@@ -1073,6 +1074,9 @@ const ReclaimerInvocation = struct {
 
 pub const ReclaimerOptions = struct {
     weight: u32 = 1,
+    /// May read another group's store. Only run at a lock-free publication
+    /// boundary, never from an allocator that might hold a store snapshot.
+    replay_publication: bool = false,
 };
 
 test "dense aggregate resource manager bounds callers and helpers together" {
@@ -1433,6 +1437,7 @@ pub const ResourceManager = struct {
                 .context = context,
                 .reclaim = reclaim,
                 .weight = @max(@as(u32, 1), options.weight),
+                .replay_publication = options.replay_publication,
             };
             return identity;
         }
@@ -1445,6 +1450,7 @@ pub const ResourceManager = struct {
             .context = context,
             .reclaim = reclaim,
             .weight = @max(@as(u32, 1), options.weight),
+            .replay_publication = options.replay_publication,
         });
         return identity;
     }
@@ -1480,6 +1486,38 @@ pub const ResourceManager = struct {
         std.debug.assert(slot.in_flight > 0);
         slot.in_flight -= 1;
         if (slot.retiring and slot.in_flight == 0) slot.* = .{};
+    }
+
+    /// Run only after dropping storage snapshots and replay tracker locks.
+    /// A dormant group can still own credit after its publication settles.
+    pub fn reclaimReplayPublications(self: *ResourceManager) void {
+        lockAtomic(&self.reclaimer_mutex);
+        const scan_len = self.reclaimers.items.len;
+        const cutoff = self.next_reclaimer_identity -% 1;
+        self.reclaimer_mutex.unlock();
+
+        var reclaimed: u64 = 0;
+        for (0..scan_len) |index| {
+            lockAtomic(&self.reclaimer_mutex);
+            const slot = &self.reclaimers.items[index];
+            if (slot.identity == 0 or slot.identity > cutoff or slot.retiring or !slot.replay_publication) {
+                self.reclaimer_mutex.unlock();
+                continue;
+            }
+            const invocation: ReclaimerInvocation = .{
+                .slot_index = index,
+                .identity = slot.identity,
+                .context = slot.context.?,
+                .reclaim = slot.reclaim.?,
+                .weight = slot.weight,
+            };
+            slot.in_flight += 1;
+            self.reclaimer_mutex.unlock();
+
+            reclaimed +|= invocation.reclaim(invocation.context, std.math.maxInt(u64));
+            self.releaseReclaimerInvocation(invocation);
+        }
+        _ = self.reclaimed_bytes.fetchAdd(reclaimed, .monotonic);
     }
 
     // Callback return values can include logical slice credit. Only ledger
@@ -1568,7 +1606,7 @@ pub const ResourceManager = struct {
                     const index = (start_cursor + offset) % scan_len;
                     const slot = &self.reclaimers.items[index];
                     if (slot.identity == 0 or slot.identity > identity_cutoff or
-                        slot.retiring or slot.slice != candidate_slice) continue;
+                        slot.retiring or slot.replay_publication or slot.slice != candidate_slice) continue;
                     remaining_weight +|= slot.weight;
                 }
                 self.reclaimer_mutex.unlock();
@@ -1578,7 +1616,7 @@ pub const ResourceManager = struct {
                     const index = (start_cursor + offset) % scan_len;
                     const slot = &self.reclaimers.items[index];
                     if (slot.identity == 0 or slot.identity > identity_cutoff or
-                        slot.retiring or slot.slice != candidate_slice)
+                        slot.retiring or slot.replay_publication or slot.slice != candidate_slice)
                     {
                         self.reclaimer_mutex.unlock();
                         continue;

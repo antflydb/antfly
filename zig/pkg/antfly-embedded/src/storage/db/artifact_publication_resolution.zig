@@ -22,6 +22,7 @@ const catalog = @import("catalog/resolver_catalog.zig");
 const resolver_lib = @import("antfly_resolver");
 const runtime = @import("resolution_runtime.zig");
 const keys = @import("../internal_keys.zig");
+const resources = @import("../resource_manager.zig");
 
 pub const Token = @import("artifact_producer_context.zig").Token;
 
@@ -91,6 +92,7 @@ pub fn process(
     alloc: std.mem.Allocator,
     store: anytype,
     dispatcher: ?publication.Dispatcher,
+    resource_manager: ?*resources.ResourceManager,
     resolvers: []const catalog.ResolverConfig,
     fallback: resolver_lib.ArtifactStore,
     provider: ?resolver_lib.CandidateProvider,
@@ -191,13 +193,26 @@ pub fn process(
             }
 
             const port = dispatcher orelse return error.ArtifactCatalogDrift;
-            const bytes = try @import("artifact_publication_transport_codec.zig").encodeAlloc(work, command);
-
-            try port.submit(token.namespace, bytes);
+            try submitOrderedResolution(alloc, resource_manager, port, command);
             return error.ArtifactPublicationPending;
         }
     }
     return true;
+}
+
+fn submitOrderedResolution(alloc: std.mem.Allocator, manager: ?*resources.ResourceManager, port: publication.Dispatcher, command: publication.Command) !void {
+    var budget = if (manager) |owner| resources.BudgetedAllocator.init(owner, .relational_preparation_working_set, alloc, 1) else null;
+    defer if (budget) |*tracked| tracked.deinit();
+    const transport = if (budget) |*tracked| tracked.allocator() else alloc;
+    const bytes = @import("artifact_publication_transport_codec.zig").encodeAlloc(transport, command) catch |err| {
+        if (err == error.OutOfMemory) if (budget) |*tracked| if (tracked.allocationFailureThreadSafe()) |failure| if (failure.cause == .admission) {
+            manager.?.reclaimReplayPublications();
+            return error.ResourceTemporarilyUnavailable;
+        };
+        return err;
+    };
+    defer transport.free(bytes);
+    try port.submit(command.namespace, bytes);
 }
 
 /// Reads authored artifact inputs and their mutation position from the same
@@ -493,6 +508,31 @@ test "ordered resolver preparation binds output to exact source and configured g
         .publication_digest = @splat(0),
     };
     command.publication_digest = command.digest();
+    const Transport = struct {
+        manager: *resources.ResourceManager,
+        calls: usize = 0,
+
+        fn enqueue(ptr: *anyopaque, _: publication.Namespace, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.manager.sliceStats(.relational_preparation_working_set).used_bytes >= bytes.len);
+            self.calls += 1;
+        }
+    };
+    {
+        const limit = 1024 * 1024;
+        var manager = resources.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = limit } });
+        defer manager.deinit(alloc);
+        var transport: Transport = .{ .manager = &manager };
+        const port: publication.Dispatcher = .{ .ptr = &transport, .enqueue = Transport.enqueue };
+        var blocker = try manager.reserve(.relational_preparation_working_set, limit);
+        defer blocker.release();
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, submitOrderedResolution(alloc, &manager, port, command));
+        try std.testing.expectEqual(@as(usize, 0), transport.calls);
+        blocker.release();
+        try submitOrderedResolution(alloc, &manager, port, command);
+        try std.testing.expectEqual(@as(usize, 1), transport.calls);
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.relational_preparation_working_set).used_bytes);
+    }
     var prepared = try prepareResolution(alloc, command, .{ .resolvers = encoded });
     defer prepared.deinit();
     try std.testing.expectEqualStrings(output, prepared.batch.changed_artifact_keys[0]);

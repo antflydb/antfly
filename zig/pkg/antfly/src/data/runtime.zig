@@ -396,6 +396,7 @@ const DataRaftBatchRoute = struct {
     required_local_term: ?u64 = null,
     allow_remote_forward: bool = true,
     fail_on_remote_leader: bool = false,
+    owner_shutdown: ?*const std.atomic.Value(bool) = null,
     /// Borrowed only by local publication jobs. Once Raft assigns an index,
     /// even an unknown synchronous outcome must retain that position.
     local_proposal: ?*artifact_publication_dispatch.Receipt.Observation = null,
@@ -9377,6 +9378,17 @@ pub const DataServer = struct {
         };
     }
 
+    fn artifactPublicationRoute(self: *DataServer, local_only: bool) DataRaftBatchRoute {
+        return .{
+            .discovery = .cached,
+            .allow_remote_forward = !local_only,
+            .fail_on_remote_leader = local_only,
+            .campaign_allowed = !local_only,
+            .owner_shutdown = &self.background_jobs_shutdown,
+            .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown),
+        };
+    }
+
     fn runArtifactPublicationJobInner(ptr: *anyopaque) !void {
         const job: *ArtifactPublicationJob = @ptrCast(@alignCast(ptr));
         const self = job.server;
@@ -9408,10 +9420,7 @@ pub const DataServer = struct {
             job.table_name = try self.alloc.dupe(u8, table.name);
         }
         const table_name = job.table_name.?;
-        const control_route: DataRaftBatchRoute = .{
-            .discovery = .cached,
-            .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown),
-        };
+        const control_route = self.artifactPublicationRoute(false);
         // Until the native publication apply path is installed, do not
         // substitute a Raft-shaped receipt for a standalone owner's clock.
         if (self.data_raft == null) return error.ArtifactCatalogDrift;
@@ -9446,13 +9455,7 @@ pub const DataServer = struct {
             try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication = activation, .sync_level = .write }, control_route);
             return;
         }
-        const local_route: DataRaftBatchRoute = .{
-            .allow_remote_forward = false,
-            .fail_on_remote_leader = true,
-            .campaign_allowed = false,
-            .discovery = .cached,
-            .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown),
-        };
+        const local_route = self.artifactPublicationRoute(true);
         const count = (job.proposal.command.len + codec.chunk_bytes - 1) / codec.chunk_bytes;
         // The queue already owns the compact bytes. Hash and send one bounded
         // chunk at a time; no whole-command JSON/base64 expansion is allocated.
@@ -19187,6 +19190,7 @@ pub const DataServer = struct {
     }
 
     fn ensureDataRaftBatchRouteActive(route: DataRaftBatchRoute) !void {
+        if (route.owner_shutdown) |shutdown| if (shutdown.load(.acquire)) return error.Canceled;
         if (route.index_owner_permission) |permission| try permission.context.ensureActive();
         if (route.cancellation) |cancellation| {
             if (cancellation.isCancelled()) return error.Cancelled;
@@ -60953,7 +60957,10 @@ fn implementationTests() type {
             try DataServer.enqueueArtifactPublication(&server, 17, recovery.namespace, &hint); // deduplicated admission
             try std.testing.expectEqual(@as(usize, 7), server.artifact_publication_queue.jobs);
             try std.testing.expectEqual(@as(usize, 6), server.artifact_publication_queue.producer_bytes);
+            const route = server.artifactPublicationRoute(true);
+            try DataServer.ensureDataRaftBatchRouteActive(route);
             server.stopDataServerBackgroundJobs();
+            try std.testing.expectError(error.Canceled, DataServer.ensureDataRaftBatchRouteActive(route));
             try std.testing.expectEqual(@as(usize, 1), lane.drained);
             try std.testing.expectEqual(@as(usize, 6), server.artifact_publication_queue.jobs);
             for (producers) |producer| server.artifact_publication_queue.release(std.testing.io, producer);
