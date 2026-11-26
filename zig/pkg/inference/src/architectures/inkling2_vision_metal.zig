@@ -24,7 +24,7 @@ const Runtime = metal.RawMetalDecodeRuntime;
 const Program = metal.PatchTransformerBf16;
 const Geometry = schema.Geometry;
 const Weight = schema.Weight;
-const Layer = schema.Layer;
+const LayerWeight = enum { ln1, bias1, ln2, bias2, scale1, scale2, out, out_bias, up, up_bias, down, down_bias };
 const width = schema.width;
 const inner = schema.inner;
 const features = schema.patch_features;
@@ -102,20 +102,69 @@ fn allocate(a: std.mem.Allocator, runtime: *Runtime, count: usize, mode: tensors
     return Tensor.deviceAllocateTyped(a, runtime, .i16, mode, &.{std.math.cast(i32, count) orelse return error.InvalidShape});
 }
 
-fn upload(a: std.mem.Allocator, runtime: *Runtime, source: *const checkpoint.Checkpoint, name: []const u8, shape: []const i64) !Tensor {
+fn checkpointBytes(source: *const checkpoint.Checkpoint, name: []const u8, shape: []const i64) ![]const u8 {
     const entry = source.reader.header.tensors.get(name) orelse return error.MissingInkling2Weight;
     if (entry.dtype != .bf16 or entry.encoding != .dense or !std.mem.eql(i64, entry.shape, shape))
         return error.InvalidInkling2Weight;
-    const bytes = try source.reader.rawTensorBytes(name);
+    return source.reader.rawTensorBytes(name);
+}
+
+fn upload(a: std.mem.Allocator, runtime: *Runtime, source: *const checkpoint.Checkpoint, name: []const u8, shape: []const i64) !Tensor {
+    const bytes = try checkpointBytes(source, name, shape);
     var result = try allocate(a, runtime, bytes.len / @sizeOf(u16), .shared);
     errdefer result.deinit();
     try result.uploadBytes(bytes);
     return result;
 }
 
+const EncoderLayer = struct {
+    weights: Buffers(LayerWeight),
+    qkv: Tensor,
+    qkv_bias: Tensor,
+
+    fn load(a: std.mem.Allocator, runtime: *Runtime, source: *const checkpoint.Checkpoint, index: usize) !EncoderLayer {
+        var result: EncoderLayer = undefined;
+        var loaded: usize = 0;
+        errdefer for (result.weights.values[0..loaded]) |*weight| weight.deinit();
+        var name_buf: [128]u8 = undefined;
+        for (std.enums.values(LayerWeight), &result.weights.values) |key, *weight| {
+            const definition = schema.layer_tensors.get(std.meta.stringToEnum(schema.Layer, @tagName(key)).?);
+            const name = try std.fmt.bufPrint(&name_buf, "model.visual.backbone.layers.{d}.{s}", .{ index, definition.name });
+            weight.* = try upload(a, runtime, source, name, definition.shape);
+            loaded += 1;
+        }
+        result.qkv = try pack(a, runtime, source, index, .{ .q, .k, .v }, width * width);
+        errdefer result.qkv.deinit();
+        result.qkv_bias = try pack(a, runtime, source, index, .{ .q_bias, .k_bias, .v_bias }, width);
+        return result;
+    }
+
+    fn pack(a: std.mem.Allocator, runtime: *Runtime, source: *const checkpoint.Checkpoint, index: usize, keys: [3]schema.Layer, elements: usize) !Tensor {
+        var slab = try allocate(a, runtime, 3 * elements, .shared);
+        errdefer slab.deinit();
+        const bytes_per_plane = elements * @sizeOf(u16);
+        var name_buf: [128]u8 = undefined;
+        for (keys, 0..) |key, plane| {
+            const definition = schema.layer_tensors.get(key);
+            const name = try std.fmt.bufPrint(&name_buf, "model.visual.backbone.layers.{d}.{s}", .{ index, definition.name });
+            const bytes = try checkpointBytes(source, name, definition.shape);
+            var view = try slab.retainedView(plane * bytes_per_plane, bytes_per_plane, &.{@intCast(elements)});
+            defer view.deinit();
+            try view.uploadBytes(bytes);
+        }
+        return slab;
+    }
+
+    fn deinit(self: *EncoderLayer) void {
+        self.qkv_bias.deinit();
+        self.qkv.deinit();
+        for (&self.weights.values) |*weight| weight.deinit();
+    }
+};
+
 pub const Vision = struct {
     weights: Buffers(Weight),
-    layers: [schema.layers]Buffers(Layer),
+    layers: [schema.layers]EncoderLayer,
 
     pub fn load(a: std.mem.Allocator, runtime: *Runtime, source: *const checkpoint.Checkpoint) !Vision {
         var vision: Vision = undefined;
@@ -128,30 +177,26 @@ pub const Vision = struct {
             weights_loaded += 1;
         }
         var layers_loaded: usize = 0;
-        errdefer for (vision.layers[0..layers_loaded]) |*layer| {
-            for (&layer.values) |*tensor| tensor.deinit();
-        };
+        errdefer for (vision.layers[0..layers_loaded]) |*layer| layer.deinit();
         for (&vision.layers, 0..) |*layer, i| {
-            var loaded: usize = 0;
-            errdefer for (layer.values[0..loaded]) |*weight| weight.deinit();
-            for (&layer.values, schema.layer_tensors.values) |*weight, tensor| {
-                const name = try std.fmt.bufPrint(&name_buf, "model.visual.backbone.layers.{d}.{s}", .{ i, tensor.name });
-                weight.* = try upload(a, runtime, source, name, tensor.shape);
-                loaded += 1;
-            }
+            layer.* = try EncoderLayer.load(a, runtime, source, i);
             layers_loaded += 1;
         }
         return vision;
     }
 
     pub fn deinit(self: *Vision) void {
-        for (&self.layers) |*layer| for (&layer.values) |*tensor| tensor.deinit();
+        for (&self.layers) |*layer| layer.deinit();
         for (&self.weights.values) |*tensor| tensor.deinit();
     }
 
     pub fn residentBytes(self: *const Vision) usize {
         var bytes = tensorBytes(&self.weights.values);
-        for (&self.layers) |*layer| bytes += tensorBytes(&layer.values);
+        for (&self.layers) |*layer| {
+            bytes += tensorBytes(&layer.weights.values);
+            bytes += layer.qkv.allocatedDeviceBytes() orelse layer.qkv.deviceByteLen();
+            bytes += layer.qkv_bias.allocatedDeviceBytes() orelse layer.qkv_bias.deviceByteLen();
+        }
         return bytes;
     }
 
@@ -191,6 +236,10 @@ pub const Vision = struct {
         const normalized = scratch.getPtr(.normalized);
         const patches = scratch.getPtr(.patches);
         const embedded = scratch.getPtr(.embedded);
+        const qkv_elements = 3 * plan.elements.get(.q);
+        var qkv = try arena.retainedTypedView(plan.offsets.get(.q), &.{@intCast(qkv_elements)}, .i16);
+        defer qkv.deinit();
+        const projection: metal.DenseBf16Projection = .{ .rows = rows, .input_width = width, .output_width = 3 * width, .plane_width = width };
         const q = scratch.getPtr(.q);
         const k = scratch.getPtr(.k);
         const v = scratch.getPtr(.v);
@@ -213,18 +262,17 @@ pub const Vision = struct {
         try Program.encode(.positions, runtime, params, .{ normalized, embedded, weights.getPtrConst(.pos), weights.getPtrConst(.cls), weights.getPtrConst(.cls_pos) });
         try Program.encode(.norm, runtime, params, .{ hidden, normalized, weights.getPtrConst(.pre), weights.getPtrConst(.pre_bias) });
         for (&self.layers) |*layer| {
-            try Program.encode(.norm, runtime, params, .{ normalized, hidden, layer.getPtrConst(.ln1), layer.getPtrConst(.bias1) });
-            for ([_]*Tensor{ q, k, v }, [_]Layer{ .q, .k, .v }, [_]Layer{ .q_bias, .k_bias, .v_bias }) |destination, weight, bias|
-                try project(runtime, rows, width, width, normalized, layer.getPtrConst(weight), layer.getPtrConst(bias), destination);
+            try Program.encode(.norm, runtime, params, .{ normalized, hidden, layer.weights.getPtrConst(.ln1), layer.weights.getPtrConst(.bias1) });
+            try projection.encodeWithBias(runtime, normalized, &layer.qkv, &layer.qkv_bias, &qkv);
             try Program.encode(.rotary, runtime, params, .{ q, k });
             try Program.encode(.attention, runtime, params, .{ attention, q, k, v });
-            try project(runtime, rows, width, width, attention, layer.getPtrConst(.out), layer.getPtrConst(.out_bias), update);
-            try Program.encode(.residual, runtime, params, .{ hidden, update, layer.getPtrConst(.scale1) });
-            try Program.encode(.norm, runtime, params, .{ normalized, hidden, layer.getPtrConst(.ln2), layer.getPtrConst(.bias2) });
-            try project(runtime, rows, width, inner, normalized, layer.getPtrConst(.up), layer.getPtrConst(.up_bias), wide);
+            try project(runtime, rows, width, width, attention, layer.weights.getPtrConst(.out), layer.weights.getPtrConst(.out_bias), update);
+            try Program.encode(.residual, runtime, params, .{ hidden, update, layer.weights.getPtrConst(.scale1) });
+            try Program.encode(.norm, runtime, params, .{ normalized, hidden, layer.weights.getPtrConst(.ln2), layer.weights.getPtrConst(.bias2) });
+            try project(runtime, rows, width, inner, normalized, layer.weights.getPtrConst(.up), layer.weights.getPtrConst(.up_bias), wide);
             try Program.encode(.gelu, runtime, .{ .rows = rows, .width = inner }, .{wide});
-            try project(runtime, rows, inner, width, wide, layer.getPtrConst(.down), layer.getPtrConst(.down_bias), update);
-            try Program.encode(.residual, runtime, params, .{ hidden, update, layer.getPtrConst(.scale2) });
+            try project(runtime, rows, inner, width, wide, layer.weights.getPtrConst(.down), layer.weights.getPtrConst(.down_bias), update);
+            try Program.encode(.residual, runtime, params, .{ hidden, update, layer.weights.getPtrConst(.scale2) });
         }
         try Program.encode(.merge, runtime, .{ .rows = merged_rows, .width = width, .gx = geometry.grid_x, .gy = geometry.grid_y }, .{ merged, hidden });
         try project(runtime, merged_rows, width * 4, inner, merged, weights.getPtrConst(.in), null, wide);
@@ -279,21 +327,30 @@ test "Inkling Metal vision publishes projected rows from its admitted arena" {
         loaded += 1;
     }
     var layers_loaded: usize = 0;
-    defer for (vision.layers[0..layers_loaded]) |*layer| for (&layer.values) |*weight| weight.deinit();
+    defer for (vision.layers[0..layers_loaded]) |*layer| layer.deinit();
     for (&vision.layers) |*layer| {
         var count: usize = 0;
-        errdefer for (layer.values[0..count]) |*weight| weight.deinit();
-        for (&layer.values, schema.layer_tensors.values) |*value, definition| {
+        errdefer for (layer.weights.values[0..count]) |*weight| weight.deinit();
+        for (std.enums.values(LayerWeight), &layer.weights.values) |key, *value| {
+            const definition = schema.layer_tensors.get(std.meta.stringToEnum(schema.Layer, @tagName(key)).?);
             value.* = try Fixture.view(&zeros, definition.shape);
             count += 1;
         }
+        layer.qkv = try Fixture.view(&zeros, &.{ 3 * width, width });
+        errdefer layer.qkv.deinit();
+        layer.qkv_bias = try Fixture.view(&zeros, &.{3 * width});
         layers_loaded += 1;
     }
 
     const rgb: [40 * 40 * 3]u8 = @splat(64);
     const before = tensors.memoryStatsSnapshot();
+    var counters = @import("../execution/runtime_observation.zig").Scope.init();
+    defer counters.deinit();
     var output = try vision.encodeRgb(a, runtime, &rgb, 40, 40);
     defer output.tensor.deinit();
+    // Four patch stages, eleven dispatches per layer with packed QKV,
+    // and four stages to merge and project the language-model rows.
+    try std.testing.expectEqual(@as(?u64, 8 + 11 * schema.layers), counters.snapshot().metal_encoded_dispatches);
     const after = tensors.memoryStatsSnapshot();
     // RGB ingress and transient arena retire after the frame. The returned
     // embedding has independent storage and does not retain either one.

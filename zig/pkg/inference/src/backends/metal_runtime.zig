@@ -53891,9 +53891,11 @@ pub const DenseBf16Projection = struct {
     input_width: u32,
     output_width: u32,
     softcap: f32 = 0,
+    /// Optional equal-width feature planes stored consecutively, each row major.
+    plane_width: u32 = 0,
 
     const Buffer = RoutedBlockScaledProjection.Buffer;
-    const Wire = extern struct { rows: u32, input_width: u32, output_width: u32, f32_output: u32, has_bias: u32, softcap: f32 };
+    const Wire = extern struct { rows: u32, input_width: u32, output_width: u32, f32_output: u32, has_bias: u32, plane_width: u32, softcap: f32 };
     extern fn antfly_metal_dispatch_dense_bf16_projection(runtime: *RawMetalDecodeRuntime, views: *const [4]Buffer, params: *const Wire) c_int;
 
     pub fn encode(self: DenseBf16Projection, runtime: *RawMetalDecodeRuntime, input: *const MetalTensor, weight: *const MetalTensor, output: *MetalTensor) !void {
@@ -53914,6 +53916,7 @@ pub const DenseBf16Projection = struct {
             .output_width = self.output_width,
             .f32_output = @intFromBool(output.dtype == .f32),
             .has_bias = @intFromBool(bias != null),
+            .plane_width = self.plane_width,
             .softcap = self.softcap,
         }) != 0) return error.MetalKernelDispatchFailed;
         output.invalidateHostMirror();
@@ -53939,11 +53942,15 @@ test "Metal dense BF16 projection publishes typed rows and router logits" {
     var router = try MetalTensor.deviceAllocateTyped(a, runtime, .f32, .shared, &.{4});
     defer router.deinit();
 
+    var planes = try MetalTensor.deviceAllocateTyped(a, runtime, .i16, .shared, &.{4});
+    defer planes.deinit();
+    const grouped: DenseBf16Projection = .{ .rows = 2, .input_width = 3, .output_width = 2, .plane_width = 1 };
     const projection: DenseBf16Projection = .{ .rows = 2, .input_width = 3, .output_width = 2 };
     try beginFrame(runtime);
     errdefer cancelFrame(runtime) catch {};
     try projection.encode(runtime, &source, &matrix, &projected);
     try projection.encode(runtime, &source, &matrix, &router);
+    try grouped.encode(runtime, &source, &matrix, &planes);
     try submitFrame(runtime);
     try waitFrame(runtime);
 
@@ -53953,6 +53960,8 @@ test "Metal dense BF16 projection publishes typed rows and router logits" {
     try router.downloadF32Into(&logits);
     try std.testing.expectEqual([4]u16{ 0x4080, 0x3fc0, 0, 0xbfc0 }, bf16);
     try std.testing.expectEqual([4]f32{ 4, 1.5, 0, -1.5 }, logits);
+    try planes.downloadBytesInto(std.mem.asBytes(&bf16));
+    try std.testing.expectEqual([4]u16{ 0x4080, 0, 0x3fc0, 0xbfc0 }, bf16);
 }
 
 test "Metal dense BF16 projection full tiles match the ragged route" {

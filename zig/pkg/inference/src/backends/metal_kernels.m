@@ -13358,7 +13358,7 @@ static NSString *termite_metal_shader_source(void) {
            // tile-codegen:end vision.patch_transformer_bf16.7 family
            // tile-codegen:begin projection.dense_bf16.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "struct DenseBf16ProjectionParams {\n"
-           "    uint rows, input_width, output_width, f32_output, has_bias;\n"
+           "    uint rows, input_width, output_width, f32_output, has_bias, plane_width;\n"
            "    float softcap;\n"
            "};\n"
            "\n"
@@ -13366,7 +13366,9 @@ static NSString *termite_metal_shader_source(void) {
            "    device uchar *output, device const bfloat *bias,\n"
            "    constant DenseBf16ProjectionParams &p, uint row, uint column, float dot\n"
            ") {\n"
-           "    const ulong index = ulong(row) * p.output_width + column;\n"
+           "    const uint plane = p.plane_width;\n"
+           "    const ulong index = plane == 0u ? ulong(row) * p.output_width + column\n"
+           "        : (ulong(column / plane) * p.rows + row) * plane + column % plane;\n"
            "    const float value = p.has_bias ? dot + float(bias[column]) : dot;\n"
            "    if (p.f32_output)\n"
            "        reinterpret_cast<device float *>(output)[index] = p.softcap > 0.0f ? tanh(value / p.softcap) * p.softcap : value;\n"
@@ -38007,7 +38009,7 @@ int antfly_metal_dispatch_causal_depthwise4_bf16(
 }
 
 typedef struct {
-    uint32_t rows, input_width, output_width, f32_output, has_bias;
+    uint32_t rows, input_width, output_width, f32_output, has_bias, plane_width;
     float softcap;
 } antfly_metal_dense_bf16_projection_params;
 
@@ -38016,7 +38018,8 @@ int antfly_metal_dispatch_dense_bf16_projection(
     const antfly_metal_dense_bf16_projection_params *p
 ) {
     if (!runtime || !views || !p || !p->rows || !p->input_width || !p->output_width ||
-        !isfinite(p->softcap) || p->softcap < 0 || (!p->f32_output && p->softcap != 0)) return -1;
+        !isfinite(p->softcap) || p->softcap < 0 || (!p->f32_output && p->softcap != 0) ||
+        (p->plane_width && p->output_width % p->plane_width)) return -1;
     const size_t output_size = p->f32_output ? 4u : 2u;
     size_t required[4] = {0, 0, 0, p->has_bias ? (size_t)p->output_width * 2u : 0};
     if (!termite_metal_size_mul(p->rows, (size_t)p->input_width * 2u, &required[0]) ||
