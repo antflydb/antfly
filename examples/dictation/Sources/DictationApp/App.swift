@@ -715,7 +715,8 @@ struct SettingsView: View {
           ) {
             navigation.showServerHistory.toggle()
           }
-        }.frame(maxWidth: .infinity)
+        }.frame(
+          maxWidth: .infinity, maxHeight: store.history.isEmpty ? .infinity : nil)
         if !store.history.isEmpty {
           Text("Earlier local entries").font(.headline)
           historyEntries
@@ -723,6 +724,10 @@ struct SettingsView: View {
       } else {
         HStack {
           Text("History is on").font(.headline)
+          Button("Turn off history…") {
+            navigation.historyRetention = false
+            navigation.confirmRetention = true
+          }.disabled(store.state != .idle || store.settingsLocked || store.capturingShortcut)
           Spacer()
           Button("Upload local history") { store.syncHistory() }
             .disabled(store.history.isEmpty || store.historyWorking || store.settingsLocked)
@@ -756,13 +761,16 @@ struct SettingsView: View {
         }.disabled(store.historyWorking || store.settingsLocked)
       }
     }.padding()
+      .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
   }
   var historyEntries: some View {
     Group {
       if store.history.isEmpty {
         ContentUnavailableView(
           "No saved dictations yet", systemImage: "clock",
-          description: Text("New dictations will appear here while history is enabled."))
+          description: Text("New dictations will appear here while history is enabled.")
+        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
       } else {
         List(store.history) { entry in
           VStack(alignment: .leading) {
