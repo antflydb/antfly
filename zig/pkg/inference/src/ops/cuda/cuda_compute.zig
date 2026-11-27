@@ -3898,7 +3898,11 @@ pub const CudaCompute = struct {
                     std.log.warn("LightOn decoder graph plan declined: allocations={d} events={d} peak={d} h2d={d} d2h={d}", .{ plan.count, plan.event_count, plan.peak, compute.stats.h2d_bytes - h2d, compute.stats.d2h_bytes - d2h });
                     owner.disabled_epoch = owner.epoch_id;
                     owner.phase = .disabled;
-                } else owner.phase = .capture;
+                    self.launch_route = .learning_declined;
+                } else {
+                    owner.phase = .capture;
+                    self.launch_route = .learned;
+                }
             } else if (capture) {
                 const matches = scope.?.complete() and compute.stats.h2d_bytes == h2d and compute.stats.d2h_bytes == d2h and compute.lighton_attention.calls - attention_calls == owner.expected_attention_calls;
                 capture_active = false;
@@ -3910,7 +3914,10 @@ pub const CudaCompute = struct {
                 self.launch_route = .recorded_and_launched;
                 owner.captures += 1;
                 owner.phase = .replay;
-            } else owner.phase = .learn;
+            } else {
+                owner.phase = .learn;
+                self.launch_route = .warmed;
+            }
         }
         pub fn read(self: *@This(), burst_value: *LightOnTokenBurst, first: []u32, second: []u32) !void {
             const owner = &self.compute.bounded_decode_graph;
@@ -3932,19 +3939,22 @@ pub const CudaCompute = struct {
             try layout.publishReadback(readback_words, owner.next_positions[0 .. owner.rows * 3], &owner.progress, first, second);
             const observation = @import("../../execution/runtime_observation.zig");
             if (observation.kernelObservationActive()) if (self.launch_route) |route| {
-                const plan = owner.plan.?;
-                const arena = owner.admitted_arena_layout.?;
+                const arena = switch (route) {
+                    .recorded_and_launched, .replayed => owner.admitted_arena_layout.?,
+                    else => null,
+                };
+                const planned = if (route == .learned) owner.arenaLayout() catch null else arena;
                 observation.cudaDecoderWorkspace(.{
                     .route = route,
-                    .plan_origin = plan.origin,
-                    .planned_events = arena.events,
-                    .planned_scratch_bytes = arena.bytes,
-                    .bound_scratch_bytes = owner.arena.len,
+                    .plan_origin = if (planned != null) owner.plan.?.origin else null,
+                    .planned_events = if (planned) |value| value.events else 0,
+                    .planned_scratch_bytes = if (planned) |value| value.bytes else 0,
+                    .bound_scratch_bytes = if (arena != null) owner.arena.len else 0,
                     .metadata_bytes = if (layout.attention_workspace) |span| span.offset else layout.metadata_bytes,
                     .attention_scratch_bytes = if (layout.attention_workspace) |span| span.bytes else 0,
                     .head_bytes = layout.head_bytes,
                     .head_packet_rows = layout.headPacketRows(owner.rows, owner.vocab),
-                    .head_in_stream_arena = layout.head_bytes == 0,
+                    .head_in_stream_arena = layout.head_bytes == 0 and arena != null,
                     .readback_bytes = source.len,
                     .readback_backing = readback_backing,
                     .rows = owner.rows,

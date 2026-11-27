@@ -48728,7 +48728,10 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
             fn collect(self: *@This(), record: @import("../execution/diagnostic_export.zig").Record) void {
                 if (record.owner != self.owner) return;
                 const report = record.snapshot.report orelse return;
-                if (report.cuda_decoder_workspace) |workspace| self.completed = workspace;
+                if (report.cuda_decoder_workspace) |workspace| switch (workspace.route) {
+                    .recorded_and_launched, .replayed => self.completed = workspace,
+                    .warmed, .learned, .learning_declined => {},
+                };
             }
         };
         const verify_workspace = platform.env.getenvBool("ANTFLY_TEST_LIGHTONOCR3_CUDA_WORKSPACE_REPORT");
