@@ -116,6 +116,7 @@ pub const Report = struct {
     metal_region_policy: ?MetalRegionPolicy = null,
     metal_serial_workspace: ?@import("runtime_observation.zig").SerialWorkspaceObservation = null,
     cuda_audio_workspace: ?@import("runtime_observation.zig").CudaAudioWorkspace = null,
+    cuda_vendor_convolution: ?@import("runtime_observation.zig").CudaVendorConvolution = null,
     cuda_decoder_workspace: ?@import("runtime_observation.zig").CudaDecoderWorkspace = null,
     cuda_decoder_declines: ?@import("runtime_observation.zig").CudaDecoderDeclines = null,
     /// Available from the corresponding successfully published physical Frame.
@@ -153,6 +154,7 @@ pub const Report = struct {
         report.cuda_periodic_workspace = value.runtime.cuda_periodic_workspace;
         report.metal_serial_workspace = value.runtime.metal_serial_workspace;
         report.cuda_audio_workspace = value.runtime.cuda_audio_workspace;
+        report.cuda_vendor_convolution = value.runtime.cuda_vendor_convolution;
         report.cuda_decoder_workspace = value.runtime.cuda_decoder_workspace;
         report.cuda_decoder_declines = value.runtime.cuda_decoder_declines;
         if (value.pending_interval != null) report.synchronous_interval = .pending_phase_only;

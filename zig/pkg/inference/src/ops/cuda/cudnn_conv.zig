@@ -525,9 +525,12 @@ pub const Module = struct {
             .bf16 => m.bf16_calls += 1,
         }
         m.workspace_peak_bytes = @max(m.workspace_peak_bytes, p.workspace_bytes);
+        const observation = @import("../../execution/runtime_observation.zig").CudaVendorConvolution;
+        observation.record(p.workspace_bytes, if (p.source_workspace) |source| source.bytes else 0, false);
         if (p.key.bias == .add) {
             try check(m.f.cudnnAddTensor(m.handle, &one, p.bias, @ptrFromInt(bias), &one, p.y, @ptrFromInt(output)));
             m.bias_calls += 1;
+            observation.record(0, 0, true);
         }
     }
 };
@@ -643,6 +646,9 @@ test "vendor convolution reports actual successful SDK submissions and explicit 
     module.f.cudnnAddTensor = Fake.bias;
     var plan = Plan{ .key = .{ .storage = .bf16, .bias = .add, .batch = 1, .inputs = 1, .outputs = 2, .height = 3, .width = 3, .kernel = 3, .stride = 2, .padding = 1 }, .workspace_bytes = 256 };
     const buffers = Bindings{ .input = .{ .ptr = 0x1000, .bytes = 18 }, .weight = .{ .ptr = 0x2000, .bytes = 36 }, .bias = .{ .ptr = 0x2800, .bytes = 4 }, .output = .{ .ptr = 0x3000, .bytes = 16 }, .workspace = .{ .ptr = 0x4000, .bytes = 256 } };
+    var scope: @import("../../execution/runtime_observation.zig").KernelScope = undefined;
+    scope.begin();
+    defer _ = scope.finish();
     try plan.resolveSourceWorkspace();
     var short = buffers;
     short.output.bytes -= 1;
@@ -659,6 +665,11 @@ test "vendor convolution reports actual successful SDK submissions and explicit 
     try std.testing.expectError(error.CudnnFailure, module.run(&plan, buffers));
     try std.testing.expectEqual(@as(usize, 2), module.calls);
     try std.testing.expectEqual(@as(usize, 2), module.bf16_calls);
+    const receipt = scope.cuda_vendor_convolution.?;
+    try std.testing.expectEqual(@as(u64, 2), receipt.forward_calls);
+    try std.testing.expectEqual(@as(u64, 1), receipt.bias_calls);
+    try std.testing.expectEqual(plan.workspace_bytes, receipt.max_explicit_workspace_bytes);
+    try std.testing.expectEqual(plan.source_workspace.?.bytes, receipt.max_source_bank_bytes);
     try std.testing.expectEqual(@as(usize, 1), module.bias_calls);
     Fake.forward_status = 1;
     try std.testing.expectError(error.CudnnFailure, module.run(&plan, buffers));

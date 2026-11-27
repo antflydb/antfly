@@ -373,6 +373,7 @@ pub const KernelScope = struct {
     native_program_bank: ?NativeProgramBank = null,
     metal_serial_workspace: ?SerialWorkspaceObservation = null,
     cuda_audio_workspace: ?CudaAudioWorkspace = null,
+    cuda_vendor_convolution: ?CudaVendorConvolution = null,
     cuda_decoder_workspace: ?CudaDecoderWorkspace = null,
     cuda_decoder_declines: ?CudaDecoderDeclines = null,
     attached: bool = false,
@@ -486,6 +487,30 @@ pub inline fn cudaAudioWorkspace(workspace: CudaAudioWorkspace) void {
 /// Physical geometry for the last decoder burst that completed its receipt.
 /// Multiple bursts can share a diagnostic interval. Their workspace sizes
 /// describe stage backing and cannot be summed to obtain an invocation peak.
+/// Accepted host SDK calls, including capture recording. Graph replay and
+/// opaque vendor kernels do not increment these counters.
+pub const CudaVendorConvolution = struct {
+    forward_calls: u64 = 0,
+    bias_calls: u64 = 0,
+    max_explicit_workspace_bytes: usize = 0,
+    max_source_bank_bytes: usize = 0,
+
+    pub inline fn record(workspace_bytes: usize, source_bytes: usize, bias: bool) void {
+        var active = active_kernels;
+        while (active) |scope| : (active = scope.previous) {
+            if (scope.cuda_vendor_convolution == null) scope.cuda_vendor_convolution = .{};
+            const totals = &scope.cuda_vendor_convolution.?;
+            if (bias) {
+                totals.bias_calls +|= 1;
+            } else {
+                totals.forward_calls +|= 1;
+                totals.max_explicit_workspace_bytes = @max(totals.max_explicit_workspace_bytes, workspace_bytes);
+                totals.max_source_bank_bytes = @max(totals.max_source_bank_bytes, source_bytes);
+            }
+        }
+    }
+};
+
 pub const CudaDecoderWorkspace = struct {
     completed_bursts: u64 = 1,
     eager_bursts: u64 = 0,
