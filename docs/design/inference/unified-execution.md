@@ -2760,3 +2760,15 @@ separate comparison.
 The same build passed Florence batched prefix storage and admission
 retry, bounded decoder FFN and recurrent workspace fixtures, and merged
 T5-small decoder capture and replay at prefixes 1, 8, 32, and 64.
+
+### CPU HTTP regression comparison at `58b3917a89`
+
+The local M4 Max native CPU server compared the candidate against
+`9e4af7f847` using AA, ABBA and BB controls, with 16 measured requests per
+side and exact outputs on ten supported workloads. The only output
+failures were grouped EmbeddingGemma 2 audio, including the baseline-only
+repeat. That group requires separate qualification. The ABBA median
+latencies for Gemma 4 E4B were 7,944.50 to 3,052.69 ms (text),
+5,497.47 to 3,603.59 ms (image), 1,272.09 to 952.75 ms (audio), and
+5,118.14 to 2,995.43 ms (video). The six other passing workloads were
+within 1% at p50 except DECIDE, which improved from 126.82 to 122.46 ms.
