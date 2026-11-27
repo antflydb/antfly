@@ -60,6 +60,8 @@ pub const StorageLayout = struct {
     positions: Span,
     counter: Span,
     attention_workspace: ?Span = null,
+    recurrent_workspace: ?Span = null,
+    recurrent_scratch: ?@import("gated_delta.zig").PacketScratch = null,
     metadata_bytes: usize,
     host_bytes: usize,
     head_bytes: usize,
@@ -146,10 +148,14 @@ pub const StorageLayout = struct {
     }
     fn declareAttentionWorkspace(self: *StorageLayout, scratch: DecodeScratch) !void {
         const bytes = @max(scratch.full.bytes, if (scratch.tail) |tail| tail.bytes else 0);
-        if (bytes > plan_mod.limit) return error.InvalidShape;
+        self.attention_workspace = try self.declareLayerWorkspace(bytes);
+    }
+
+    fn declareLayerWorkspace(self: *StorageLayout, bytes: usize) !Span {
+        if (bytes == 0 or bytes > plan_mod.limit) return error.InvalidShape;
         const offset = try aligned(self.counter.offset + self.counter.bytes);
-        self.metadata_bytes = try std.math.add(usize, offset, bytes);
-        self.attention_workspace = .{ .offset = offset, .bytes = bytes };
+        self.metadata_bytes = @max(self.metadata_bytes, try std.math.add(usize, offset, bytes));
+        return .{ .offset = offset, .bytes = bytes };
     }
 
     fn aligned(bytes: usize) !usize {
@@ -210,6 +216,7 @@ pub const Descriptor = struct {
     future_tokens: usize,
     head_storage: HeadStorage = .full_bank,
     attention_geometry: ?DecodeScratch.Geometry = null,
+    recurrent_heads: ?struct { key: usize, value: usize } = null,
     attention_layers: usize,
     recurrent_layers: usize,
     pub const HeadStorage = union(enum) {
@@ -312,12 +319,23 @@ pub const GraphPhase = struct {
         self.attention_scratch = scratch;
     }
 
+    pub fn declareRecurrentScratch(self: *GraphPhase) !void {
+        const descriptor = self.descriptor;
+        if (descriptor.recurrent_layers == 0) return;
+        const heads = descriptor.recurrent_heads orelse return error.InvalidShape;
+        const scratch = try @import("gated_delta.zig").PacketScratch.forHeads(descriptor.rows, heads.key, heads.value);
+        self.storage_layout.recurrent_workspace = try self.storage_layout.declareLayerWorkspace(scratch.bytes);
+        self.storage_layout.recurrent_scratch = scratch;
+    }
+
     pub fn matchesOwner(self: *const GraphPhase, owner: *const Module) bool {
         const storage = owner.storage_layout orelse return false;
         const compatible_head = storage.head_bytes == self.storage_layout.head_bytes or
             (self.descriptor.head_storage == .adaptive_bank and storage.head_bytes > 0 and storage.head_bytes < self.storage_layout.head_bytes);
         return owner.matches(self.descriptor) and compatible_head and
             storage.arena_head_rows == self.storage_layout.arena_head_rows and
+            std.meta.eql(storage.recurrent_workspace, self.storage_layout.recurrent_workspace) and
+            std.meta.eql(storage.recurrent_scratch, self.storage_layout.recurrent_scratch) and
             std.meta.eql(owner.attention_scratch, self.attention_scratch);
     }
 
@@ -653,6 +671,17 @@ pub const Module = struct {
     pub fn bindAttentionWorkspace(self: *const Module, bytes: usize) !buffer.DeviceBuffer {
         const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
         const span = layout.attention_workspace orelse return error.InvalidExecutionPlan;
+        return self.bindLayerWorkspace(layout, span, bytes);
+    }
+
+    pub fn bindRecurrentWorkspace(self: *const Module, scratch: @import("gated_delta.zig").PacketScratch) !buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const span = layout.recurrent_workspace orelse return error.InvalidExecutionPlan;
+        if (!std.meta.eql(layout.recurrent_scratch orelse return error.InvalidExecutionPlan, scratch)) return error.InvalidExecutionPlan;
+        return self.bindLayerWorkspace(layout, span, scratch.bytes);
+    }
+
+    fn bindLayerWorkspace(self: *const Module, layout: StorageLayout, span: StorageLayout.Span, bytes: usize) !buffer.DeviceBuffer {
         if (bytes == 0 or bytes > span.bytes or self.metadata.len < layout.metadata_bytes)
             return error.InvalidExecutionPlan;
         return (StorageLayout.Span{ .offset = span.offset, .bytes = bytes }).bind(self.metadata);
@@ -690,6 +719,41 @@ test "bounded CUDA decoder funds one stable attention workspace for both packets
     try std.testing.expectError(error.InvalidExecutionPlan, owner.bindAttentionWorkspace(full.len + 1));
     owner.metadata.len -= 1;
     try std.testing.expectError(error.InvalidExecutionPlan, owner.bindAttentionWorkspace(tail.len));
+}
+
+test "bounded CUDA decoder shares declared attention and recurrent workspace" {
+    const rows = 67;
+    const positions: [rows * 3]u32 = @splat(0);
+    const descriptor: Descriptor = .{
+        .epoch = 1,
+        .key = &.{1},
+        .positions = &positions,
+        .rows = rows,
+        .hidden = 2560,
+        .vocab = 248320,
+        .future_tokens = 321,
+        .attention_geometry = .{ .heads = 8, .kv_heads = 2, .dim = 256 },
+        .recurrent_heads = .{ .key = 16, .value = 32 },
+        .attention_layers = 1,
+        .recurrent_layers = 1,
+    };
+    const base = try descriptor.layout();
+    var phase: GraphPhase = undefined;
+    try phase.initInto(descriptor);
+    try phase.declareRecurrentScratch();
+    try phase.declareAttentionScratch(false);
+    const layout = phase.storage_layout;
+    const attention = layout.attention_workspace.?;
+    const recurrent = layout.recurrent_workspace.?;
+    try std.testing.expectEqual(base.metadata_bytes, attention.offset);
+    try std.testing.expectEqual(attention.offset, recurrent.offset);
+    try std.testing.expectEqual(base.metadata_bytes + @max(attention.bytes, recurrent.bytes), layout.metadata_bytes);
+    const owner: Module = .{ .storage_layout = layout, .metadata = .{ .ptr = 0x10000, .len = layout.metadata_bytes } };
+    const scratch = layout.recurrent_scratch.?;
+    try std.testing.expectEqual((try owner.bindAttentionWorkspace(attention.bytes)).ptr, (try owner.bindRecurrentWorkspace(scratch)).ptr);
+    var changed = scratch;
+    changed.core_offset -= @sizeOf(f32);
+    try std.testing.expectError(error.InvalidExecutionPlan, owner.bindRecurrentWorkspace(changed));
 }
 
 test "captured graph head packets fund the exact smaller bank and invalidate a full-width binding" {

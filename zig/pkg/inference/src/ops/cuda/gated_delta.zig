@@ -180,6 +180,11 @@ pub const PacketScratch = struct {
     core_offset: usize,
     bytes: usize,
 
+    pub fn forHeads(rows: usize, key_heads: usize, value_heads: usize) !PacketScratch {
+        if (!packetGeometrySupported(key_heads, value_heads, 128, 128, 4)) return error.InvalidShape;
+        return init(rows, (2 * key_heads + value_heads) * 128, value_heads * 128);
+    }
+
     pub fn init(rows: usize, channels: usize, width: usize) !PacketScratch {
         const core_offset = try std.math.mul(usize, try std.math.mul(usize, rows, channels), @sizeOf(f32));
         const core_bytes = try std.math.mul(usize, try std.math.mul(usize, rows, width), @sizeOf(f32));

@@ -3950,8 +3950,9 @@ pub const CudaCompute = struct {
                     .planned_events = if (planned) |value| value.events else 0,
                     .planned_scratch_bytes = if (planned) |value| value.bytes else 0,
                     .bound_scratch_bytes = if (arena != null) owner.arena.len else 0,
-                    .metadata_bytes = if (layout.attention_workspace) |span| span.offset else layout.metadata_bytes,
+                    .metadata_bytes = if (layout.attention_workspace orelse layout.recurrent_workspace) |span| span.offset else layout.metadata_bytes,
                     .attention_scratch_bytes = if (layout.attention_workspace) |span| span.bytes else 0,
+                    .recurrent_scratch_bytes = if (layout.recurrent_workspace) |span| span.bytes else 0,
                     .head_bytes = layout.head_bytes,
                     .head_packet_rows = layout.headPacketRows(owner.rows, owner.vocab),
                     .head_in_stream_arena = layout.head_bytes == 0 and arena != null,
@@ -4170,6 +4171,10 @@ pub const CudaCompute = struct {
         phase.declareAttentionScratch(self.lighton_attention_chunk128) catch |err| switch (err) {
             error.InvalidShape, error.Overflow => return .unsupported,
         };
+        if (!self.lighton_fused_gdn_decode_enabled or self.ctx.info.compute_major < 8)
+            phase.declareRecurrentScratch() catch |err| switch (err) {
+                error.InvalidShape, error.Overflow => return .unsupported,
+            };
         const owner = &self.bounded_decode_graph;
         if (!owner.mutex.tryLock()) return error.ReaderEpochBackendBusy;
         defer owner.mutex.unlock();
@@ -4246,7 +4251,7 @@ pub const CudaCompute = struct {
         if (rows > @import("gated_delta.zig").max_packet_rows and !self.lighton_ragged_recurrent_enabled) return null;
         if (self.execution_scope != null or try self.ctx.streamCaptureActive()) return null;
         const descriptor = graph_phase.descriptor;
-        if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or !std.meta.eql(descriptor.attention_geometry, expected.attention_geometry) or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or !std.meta.eql(descriptor.head_storage, expected.head_storage) or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions)) return error.PreparedCachePlanChanged;
+        if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or !std.meta.eql(descriptor.attention_geometry, expected.attention_geometry) or !std.meta.eql(descriptor.recurrent_heads, expected.recurrent_heads) or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or !std.meta.eql(descriptor.head_storage, expected.head_storage) or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions)) return error.PreparedCachePlanChanged;
         const owner = &self.bounded_decode_graph;
         while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
         var claimed = false;
@@ -5357,12 +5362,12 @@ pub const CudaCompute = struct {
             }
             return output;
         }
-        const conv = (try allocUninitF32ShapeOp(self, &.{ @intCast(states.len), @intCast(channels) })).?;
-        defer cb.free(conv);
-        const core = (try allocUninitF32ShapeOp(self, &.{ @intCast(states.len), @intCast(width) })).?;
-        defer cb.free(core);
-        params.conv = tensorFromCt(conv).buffer.ptr;
-        params.core = tensorFromCt(core).buffer.ptr;
+        const scratch_layout = try @import("gated_delta.zig").PacketScratch.init(states.len, channels, width);
+        const planned = self.bounded_decode_graph.active;
+        var scratch = if (planned) try self.bounded_decode_graph.bindRecurrentWorkspace(scratch_layout) else try allocDeviceBuffer(self, scratch_layout.bytes);
+        defer if (!planned) releaseDeviceBuffer(self, &scratch);
+        params.conv = scratch.ptr;
+        params.core = scratch.ptr + scratch_layout.core_offset;
         params.out = tensorFromCt(output).buffer.ptr;
         for (states) |state| state.failed = true;
         try self.lighton_recurrent.runBatch(&self.ctx, &params, self.lighton_fused_batch_recurrent, self.lighton_cached_recurrent_gates);
@@ -5407,6 +5412,8 @@ pub const CudaCompute = struct {
             if (n == 0 or n > 4096 - rows) return error.InvalidTensorShape;
             rows += n;
         }
+        const planned = self.bounded_decode_graph.active;
+        if (planned and rows != states.len) return error.InvalidExecutionPlan;
         const inputs = [_]CT{ request.mixed, request.z, request.beta, request.a };
         const counts = [_]usize{ rows * channels, rows * width, rows * vh, rows * vh };
         for (inputs, counts) |input, count| {
@@ -5446,8 +5453,11 @@ pub const CudaCompute = struct {
         const fused_decode = self.lighton_fused_gdn_decode_enabled and self.ctx.info.compute_major >= 8;
         const only_decode = fused_decode and rows == states.len;
         const scratch_layout = if (only_decode) null else try @import("gated_delta.zig").PacketScratch.init(rows, channels, width);
-        var scratch = if (scratch_layout) |layout| try allocDeviceBuffer(self, layout.bytes) else buffer_mod.DeviceBuffer{};
-        defer releaseDeviceBuffer(self, &scratch);
+        var scratch = if (scratch_layout) |layout|
+            if (planned) try self.bounded_decode_graph.bindRecurrentWorkspace(layout) else try allocDeviceBuffer(self, layout.bytes)
+        else
+            buffer_mod.DeviceBuffer{};
+        defer if (!planned) releaseDeviceBuffer(self, &scratch);
         var packets: [2]@import("gated_delta.zig").RaggedParams = undefined;
         var packet_rows: [2]u32 = @splat(0);
         var packet_scratch: [2]usize = @splat(0);
@@ -5490,7 +5500,7 @@ pub const CudaCompute = struct {
             first = end;
         }
         var workspace_bytes: usize = 0;
-        if (!only_decode) {
+        if (!only_decode and !planned) {
             const admitted_prefill = self.managed_external_prefill_publication or self.ctx.video_cache_budget.admission != null;
             if (admitted_prefill and !self.lighton_recurrent.bf16_prefill_configured) {
                 // Managed entry cannot dlopen a new opaque runtime beneath
