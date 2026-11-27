@@ -20937,6 +20937,16 @@ fn audioOutputMatches(input: *const CudaTensor, output: *const CudaTensor, bytes
         std.mem.eql(i64, output.shape, input.shape) and output.buffer.len >= bytes;
 }
 
+test "CUDA audio retained views prove publication custody and byte bounds" {
+    var publication: CudaTensor = .{ .buffer = .{ .ptr = 0x1000, .len = 32 }, .shape = &.{}, .elem_count = 8, .dtype = .f32 };
+    var view: CudaTensor = .{ .buffer = .{ .ptr = 0x1010, .len = 16 }, .shape = &.{}, .elem_count = 4, .dtype = .f32, .resident_parent = &publication };
+    try std.testing.expect(audioInputRetainsPublication(&publication, &publication, 32));
+    try std.testing.expect(audioInputRetainsPublication(&view, &publication, 16));
+    try std.testing.expect(!audioInputRetainsPublication(&view, &publication, 20));
+    view.resident_parent = null;
+    try std.testing.expect(!audioInputRetainsPublication(&view, &publication, 16));
+}
+
 test "CUDA unusable audio learning drops its owner and preserves retry policy" {
     const audio = @import("audio_execution_plan.zig");
     for ([_]bool{ false, true }) |retry| {
@@ -21054,6 +21064,16 @@ fn retainAudioGraphBacking(self: *CudaCompute, bank: *buffer_mod.DeviceBuffer, q
         .retirement_slot = &tensor.cache_retirement_slot,
         .release = dropAudioGraphOutput,
     };
+}
+
+/// A held publication can feed eager execution through a retained view.
+/// Its owner must cover the entire read span, including the view's offset.
+fn audioInputRetainsPublication(input: *const CudaTensor, published: *const CudaTensor, bytes: usize) bool {
+    var origin = input;
+    while (origin != published) origin = origin.resident_parent orelse return false;
+    if (input.buffer.ptr < published.buffer.ptr) return false;
+    const offset = input.buffer.ptr - published.buffer.ptr;
+    return offset <= published.buffer.len and bytes <= published.buffer.len - offset;
 }
 
 fn retireUnusableAudioPlan(entry: *@import("audio_execution_plan.zig").Entry, current: CacheCleanup, retry: bool) void {
@@ -21194,9 +21214,9 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         if (span.bytes == 0) continue;
         const source: buffer_mod.DeviceBuffer = .{ .ptr = tensorFromCt(ct).buffer.ptr, .len = span.bytes };
         // A held publication forces eager execution into independent storage.
-        const retained_input = held and tensorFromCt(ct) == existing_output.?;
         if (source.ptr == 0 or CudaCompute.stageBufferOverlap(source, arena.buffers[0]) or
-            (!retained_input and CudaCompute.stageBufferOverlap(source, arena.buffers[1])))
+            (CudaCompute.stageBufferOverlap(source, arena.buffers[1]) and
+                !(held and audioInputRetainsPublication(tensorFromCt(ct), existing_output.?, span.bytes))))
         {
             observation.cudaAudioResult(.input_alias_declined);
             return null;
@@ -62343,7 +62363,11 @@ test "public source audio linear recreates input bank through actual learning ca
     const handoff = observed: {
         try transfer_audit.begin(&handoff_transfers);
         defer transfer_audit.end();
-        break :observed (try scoped.audioExecution(key, &.{ direct, identity }, &run, Run.call)) orelse return error.TestUnexpectedResult;
+        const view = try reshapeOp(&compute, direct, &.{ 2, 2 });
+        defer scoped.free(view);
+        try std.testing.expect(view != direct);
+        try std.testing.expectEqual(tensorFromCt(direct).buffer.ptr, tensorFromCt(view).buffer.ptr);
+        break :observed (try scoped.audioExecution(key, &.{ view, identity }, &run, Run.call)) orelse return error.TestUnexpectedResult;
     };
     defer cb.free(handoff);
     try std.testing.expect(tensorFromCt(handoff).buffer.ptr != tensorFromCt(direct).buffer.ptr);
