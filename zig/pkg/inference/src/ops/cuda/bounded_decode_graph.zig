@@ -308,6 +308,7 @@ pub const GraphPhase = struct {
     }
     fn prepareOutsideUsing(self: *GraphPhase, model: *const @import("../../backends/session.zig").Session.ModelLifetime, allocator: std.mem.Allocator) !void {
         if (self.cold != null or self.bound or self.mode == .none) return error.InvalidPreparedCacheState;
+        self.admission_pressure = null;
         const cold = try allocator.create(ColdPhase);
         cold.* = .{ .allocator = allocator };
         errdefer cold.destroyOutside();
@@ -326,7 +327,6 @@ pub const GraphPhase = struct {
         var pin: ?@import("../../runtime/tier/admission_domain.zig").Pin = null;
         if (self.admission) |policy| pin = model.retainAdmissionDomain(policy.controller) orelse return error.MissingCacheRetirementDomain;
         defer if (pin) |value| value.release();
-        self.admission_pressure = null;
         funding.fundOutsideExecution(if (pin) |*value| value else null) catch |err| {
             self.admission_pressure = funding.admission_pressure;
             if (self.admission) |policy| {
@@ -809,7 +809,10 @@ fn qualifyGraphPhaseOom(allocator: std.mem.Allocator) !void {
     phase.mode = .storage;
     phase.expected_compute = 1;
     phase.admission = .{ .controller = &domain.controller, .limits = .{}, .check_live_memory = false };
+    // An early allocation failure on retry must not inherit the prior denial.
+    phase.admission_pressure = .{ .domain_scratch = .gpu };
     phase.prepareOutsideUsing(&model, allocator) catch |err| {
+        try std.testing.expect(phase.admission_pressure == null);
         try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, domain.controller.snapshot());
         try std.testing.expect(phase.cold == null);
         return err;
