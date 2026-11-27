@@ -21204,9 +21204,8 @@ fn submitUnorderedDeviceCopies(self: *CudaCompute, submit: driver_mod.MemcpyBatc
 fn stageAudioGraphInputs(self: *CudaCompute, input_bank: buffer_mod.DeviceBuffer, inputs: []const CT, spans: []const CudaCompute.AudioInputSpan) !void {
     // The caller proves every source is outside the arena and the placement
     // gives each destination a separate slice. A batch has no internal order.
-    const debug_copy = self.debug_cuda_graph_capture_active;
-    if (!debug_copy) try self.ctx.makeCurrent();
-    if (!debug_copy and self.ctx.stream != null and inputs.len > 1) batch: {
+    try self.ctx.makeCurrent();
+    if (self.ctx.stream != null and inputs.len > 1) batch: {
         const submit = self.ctx.driver.fns.cuMemcpyBatchAsync orelse break :batch;
         var destinations: [CudaCompute.AudioPlan.max_inputs]driver_mod.CUdeviceptr = undefined;
         var sources: [CudaCompute.AudioPlan.max_inputs]driver_mod.CUdeviceptr = undefined;
@@ -21229,12 +21228,8 @@ fn stageAudioGraphInputs(self: *CudaCompute, input_bank: buffer_mod.DeviceBuffer
         if (span.bytes == 0) continue;
         const destination = try input_bank.borrowRange(span.offset, span.bytes);
         const source = tensorFromCt(ct).buffer;
-        if (debug_copy) {
-            try copyFromDeviceTracked(self, destination, source, span.bytes);
-        } else {
-            try destination.copyFromCurrentDevice(&self.ctx, source, span.bytes);
-            self.stats.d2d_bytes += span.bytes;
-        }
+        try destination.copyFromCurrentDevice(&self.ctx, source, span.bytes);
+        self.stats.d2d_bytes += span.bytes;
     }
 }
 
@@ -21331,7 +21326,10 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     const observation = @import("../../execution/runtime_observation.zig");
     const plan_mod = @import("audio_execution_plan.zig");
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
-    if (self.capability_profile != .embedding_gemma2 or !self.embedding_gemma2_policy.audio_graph or self.audio_execution_active or self.execution_scope != null or inputs.len == 0 or inputs.len > plan_mod.max_inputs or try self.ctx.streamCaptureActive()) return null;
+    if (self.capability_profile != .embedding_gemma2 or !self.embedding_gemma2_policy.audio_graph or
+        self.audio_execution_active or self.execution_scope != null or
+        self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
+        inputs.len == 0 or inputs.len > plan_mod.max_inputs or try self.ctx.streamCaptureActive()) return null;
     self.audio_execution_active = true;
     defer self.audio_execution_active = false;
     var input_metadata: [CudaCompute.AudioPlan.max_inputs]CudaCompute.AudioCacheInput = undefined;
@@ -60254,6 +60252,26 @@ test "CUDA audio learning cache state uses actual warm no-plan eligibility and o
     compute.audio_plans.entries[0].owner = null;
     compute.audio_plans.entries[0].disabled = true;
     try std.testing.expect(!(try compute.cacheRequestState(request)).miss);
+}
+
+test "CUDA audio declines local capture ownership before any SDK query" {
+    const Run = struct {
+        fn call(_: *anyopaque, _: []const CT) !CT {
+            return error.UnexpectedAudioDispatch;
+        }
+    };
+    var compute = metadataOnlyTestCompute();
+    compute.capability_profile = .embedding_gemma2;
+    compute.embedding_gemma2_policy = .{ .audio_graph = true };
+    compute.audio_execution_active = false;
+    compute.execution_scope = null;
+    const inputs = [_]CT{@ptrFromInt(16)};
+    for ([_]bool{ false, true }) |context_owned| {
+        compute.debug_cuda_graph_capture_active = !context_owned;
+        compute.ctx.debug_graph_capture_active = context_owned;
+        try std.testing.expect((try audioExecutionOp(&compute, 1, &inputs, &compute, Run.call, .{}, false)) == null);
+        try std.testing.expect(!compute.audio_execution_active);
+    }
 }
 
 test "CUDA audio rejects borrowed input as warm or learned publication" {
