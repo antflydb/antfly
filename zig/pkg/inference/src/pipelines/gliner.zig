@@ -1076,14 +1076,12 @@ pub const GlinerPipeline = struct {
         input_ids: []i64,
         attention_mask: []i64,
         words_mask: []i64,
-        span_idx: []i64,
         word_spans: []WordSpan,
 
         pub fn deinit(self: *PreparedGlinerInput, alloc: std.mem.Allocator) void {
             alloc.free(self.input_ids);
             alloc.free(self.attention_mask);
             alloc.free(self.words_mask);
-            alloc.free(self.span_idx);
             alloc.free(self.word_spans);
         }
     };
@@ -1301,7 +1299,6 @@ pub const GlinerPipeline = struct {
         @memset(input_ids_buf, 0);
         @memset(attention_mask_buf, 0);
         @memset(words_mask_buf, 0);
-        @memset(span_idx_buf, 0);
 
         for (row_to_prepared, 0..) |prepared_i, b| {
             const row = prepared[prepared_i];
@@ -1310,8 +1307,8 @@ pub const GlinerPipeline = struct {
             @memcpy(attention_mask_buf[input_off..][0..row.attention_mask.len], row.attention_mask);
             @memcpy(words_mask_buf[input_off..][0..row.words_mask.len], row.words_mask);
 
-            const span_off = b * batch_num_spans * 2;
-            @memcpy(span_idx_buf[span_off..][0..row.span_idx.len], row.span_idx);
+            const span_row_len = batch_num_spans * 2;
+            fillSpanIndices(span_idx_buf[b * span_row_len ..][0..span_row_len], row.word_spans.len, max_width);
         }
 
         const shape_2d = [_]i64{ try sizeToI64(batch), try sizeToI64(max_seq_len) };
@@ -1466,7 +1463,6 @@ pub const GlinerPipeline = struct {
         cache_word_tokens: bool,
     ) !PreparedGlinerInput {
         const alloc = self.allocator;
-        const max_width: usize = self.config.max_width;
         const max_len: usize = self.config.max_length;
 
         const TokenRange = struct { offset: usize, len: usize };
@@ -1482,6 +1478,7 @@ pub const GlinerPipeline = struct {
         defer lowercase.deinit(alloc);
 
         const schema_len = @min(schema.len, max_len);
+        const text_token_budget = max_len - schema_len;
         var seq_len = schema_len;
         var words = WordIterator{ .text = text };
         while (seq_len < max_len) {
@@ -1491,7 +1488,9 @@ pub const GlinerPipeline = struct {
                 const offset = unique_word_ids.items.len;
                 try encodeWord(alloc, self.tok, word, &lowercase, &unique_word_ids);
                 const range = TokenRange{ .offset = offset, .len = unique_word_ids.items.len - offset };
-                if (cache_word_tokens) try word_cache.put(alloc, word, range);
+                // Tokenless words can outnumber the encoder token budget.
+                if (cache_word_tokens and word_cache.count() < text_token_budget)
+                    try word_cache.put(alloc, word, range);
                 break :blk range;
             };
             // Normalization can remove a whole word. Only words represented in
@@ -1528,31 +1527,11 @@ pub const GlinerPipeline = struct {
         @memset(input_ids_buf[pos..], 0);
         @memset(words_mask_buf[pos..], 0);
 
-        const actual_num_words = word_spans.items.len;
-        const num_spans = try checkedSizeMul(actual_num_words, max_width);
-        const span_idx_buf = try alloc.alloc(i64, try checkedSizeMul(num_spans, 2));
-        errdefer alloc.free(span_idx_buf);
-
-        for (0..actual_num_words) |w| {
-            for (0..max_width) |wi| {
-                const span_i = (w * max_width + wi) * 2;
-                const end_word = w + wi;
-                if (end_word < actual_num_words) {
-                    span_idx_buf[span_i] = @intCast(w);
-                    span_idx_buf[span_i + 1] = @intCast(end_word);
-                } else {
-                    span_idx_buf[span_i] = 0;
-                    span_idx_buf[span_i + 1] = 0;
-                }
-            }
-        }
-
         return .{
             .text = text,
             .input_ids = input_ids_buf,
             .attention_mask = attention_mask_buf,
             .words_mask = words_mask_buf,
-            .span_idx = span_idx_buf,
             .word_spans = try word_spans.toOwnedSlice(alloc),
         };
     }
@@ -1599,6 +1578,7 @@ pub const GlinerPipeline = struct {
                         const char_start = row.word_spans[w].start;
                         const char_end = row.word_spans[end_word].end;
                         const entity_text = try alloc.dupe(u8, row.text[char_start..char_end]);
+                        errdefer alloc.free(entity_text);
 
                         try entities.append(alloc, .{
                             .text = entity_text,
@@ -1620,41 +1600,23 @@ pub const GlinerPipeline = struct {
                 }
             }.lessThan);
 
-            var keep = std.ArrayListUnmanaged(Entity).empty;
-            defer keep.deinit(alloc);
-
-            for (entities.items) |ent| {
-                var overlaps = false;
-                for (keep.items) |existing| {
-                    if (ent.start < existing.end and ent.end > existing.start) {
-                        overlaps = true;
-                        break;
-                    }
-                }
-                if (!overlaps) {
-                    try keep.append(alloc, ent);
+            var kept: usize = 0;
+            for (entities.items) |entity| {
+                for (entities.items[0..kept]) |existing| {
+                    if (!overlapsSpan(entity.start, entity.end, existing.start, existing.end)) continue;
+                    alloc.free(entity.text);
+                    break;
                 } else {
-                    alloc.free(ent.text);
+                    entities.items[kept] = entity;
+                    kept += 1;
                 }
             }
-
-            std.mem.sort(Entity, keep.items, {}, struct {
-                fn lessThan(_: void, a: Entity, b: Entity) bool {
-                    return if (a.start != b.start) a.start < b.start else a.end < b.end;
-                }
-            }.lessThan);
-
-            entities.deinit(alloc);
-            return try dedupEntitiesByLabelText(alloc, try keep.toOwnedSlice(alloc));
+            entities.shrinkRetainingCapacity(kept);
         }
 
-        std.mem.sort(Entity, entities.items, {}, struct {
-            fn lessThan(_: void, a: Entity, b: Entity) bool {
-                return if (a.start != b.start) a.start < b.start else a.end < b.end;
-            }
-        }.lessThan);
-
-        return try dedupEntitiesByLabelText(alloc, try entities.toOwnedSlice(alloc));
+        std.mem.sort(Entity, entities.items, {}, entitySpanLessThan);
+        dedupEntitiesByLabelText(alloc, &entities);
+        return entities.toOwnedSlice(alloc);
     }
 
     fn extractRelationsSingle(
@@ -1772,10 +1734,12 @@ pub const GlinerPipeline = struct {
 
         var prepared = try self.prepareGlinerInput(text, labels, label_token);
         defer prepared.deinit(alloc);
-        if (prepared.span_idx.len == 0) return scoreLabelsFromLogits(alloc, &.{}, labels.len);
+        const num_spans = try checkedSizeMul(prepared.word_spans.len, max_width);
+        if (num_spans == 0) return scoreLabelsFromLogits(alloc, &.{}, labels.len);
 
         const seq_len = prepared.input_ids.len;
-        const input_elements = try checkedSizeAdd(try checkedSizeMul(seq_len, 3), prepared.span_idx.len);
+        const span_values = try checkedSizeMul(num_spans, 2);
+        const input_elements = try checkedSizeAdd(try checkedSizeMul(seq_len, 3), span_values);
         const admitted_input_bytes = try checkedSizeMul(input_elements, @sizeOf(i64));
         var run_permit = try self.session.admit(.{
             .batch = 1,
@@ -1795,9 +1759,11 @@ pub const GlinerPipeline = struct {
         var words_mask_tensor = try Tensor.initInt64(alloc, "words_mask", &shape_2d, prepared.words_mask);
         defer words_mask_tensor.deinit();
 
-        const ns: i64 = @intCast(prepared.span_idx.len / 2);
-        const span_shape = [_]i64{ 1, ns, 2 };
-        var span_idx_tensor = try Tensor.initInt64(alloc, "span_idx", &span_shape, prepared.span_idx);
+        const span_idx = try alloc.alloc(i64, span_values);
+        defer alloc.free(span_idx);
+        fillSpanIndices(span_idx, prepared.word_spans.len, max_width);
+        const span_shape = [_]i64{ 1, try sizeToI64(num_spans), 2 };
+        var span_idx_tensor = try Tensor.initInt64(alloc, "span_idx", &span_shape, span_idx);
         defer span_idx_tensor.deinit();
 
         const outputs = try self.lockedSessionRun(&run_permit, &.{
@@ -1995,6 +1961,20 @@ fn appendOwnedRelationCandidateLabel(
     try out.append(alloc, owned_label);
 }
 
+fn fillSpanIndices(out: []i64, num_words: usize, max_width: usize) void {
+    const word_stride = max_width * 2;
+    for (0..num_words) |word| {
+        const indices = out[word * word_stride ..][0..word_stride];
+        const width = @min(max_width, num_words - word);
+        for (0..width) |delta| {
+            indices[delta * 2] = @intCast(word);
+            indices[delta * 2 + 1] = @intCast(word + delta);
+        }
+        @memset(indices[width * 2 ..], 0);
+    }
+    @memset(out[num_words * word_stride ..], 0);
+}
+
 fn scoreLabelsFromLogits(alloc: std.mem.Allocator, logits: []const f32, num_labels: usize) ![]f32 {
     const scores = try alloc.alloc(f32, num_labels);
     if (num_labels == 0) return scores;
@@ -2095,47 +2075,31 @@ fn sigmoid(x: f32) f32 {
     return 1.0 / (1.0 + @exp(-x));
 }
 
-fn dedupEntitiesByLabelText(alloc: std.mem.Allocator, input: []Entity) ![]Entity {
-    if (input.len <= 1) return input;
+fn entitySpanLessThan(_: void, a: Entity, b: Entity) bool {
+    return if (a.start != b.start) a.start < b.start else a.end < b.end;
+}
 
-    var keep = std.ArrayListUnmanaged(Entity).empty;
-    errdefer {
-        for (keep.items) |entity| alloc.free(entity.text);
-        keep.deinit(alloc);
-    }
-    keep.ensureTotalCapacity(alloc, input.len) catch |err| {
-        for (input) |entity| alloc.free(entity.text);
-        alloc.free(input);
-        return err;
-    };
-
-    for (input) |entity| {
-        var kept_duplicate = false;
-        for (keep.items) |*existing| {
-            if (std.ascii.eqlIgnoreCase(entity.label, existing.label) and std.ascii.eqlIgnoreCase(entity.text, existing.text)) {
-                kept_duplicate = true;
-                if (entity.score > existing.score) {
-                    alloc.free(existing.text);
-                    existing.* = entity;
-                } else {
-                    alloc.free(entity.text);
-                }
-                break;
+fn dedupEntitiesByLabelText(alloc: std.mem.Allocator, entities: *std.ArrayListUnmanaged(Entity)) void {
+    if (entities.items.len <= 1) return;
+    var kept: usize = 0;
+    for (entities.items) |entity| {
+        for (entities.items[0..kept]) |*existing| {
+            if (!std.ascii.eqlIgnoreCase(entity.label, existing.label) or
+                !std.ascii.eqlIgnoreCase(entity.text, existing.text)) continue;
+            if (entity.score > existing.score) {
+                alloc.free(existing.text);
+                existing.* = entity;
+            } else {
+                alloc.free(entity.text);
             }
-        }
-        if (!kept_duplicate) {
-            keep.appendAssumeCapacity(entity);
+            break;
+        } else {
+            entities.items[kept] = entity;
+            kept += 1;
         }
     }
-
-    std.mem.sort(Entity, keep.items, {}, struct {
-        fn lessThan(_: void, a: Entity, b: Entity) bool {
-            return if (a.start != b.start) a.start < b.start else a.end < b.end;
-        }
-    }.lessThan);
-
-    alloc.free(input);
-    return try keep.toOwnedSlice(alloc);
+    entities.shrinkRetainingCapacity(kept);
+    std.mem.sort(Entity, entities.items, {}, entitySpanLessThan);
 }
 
 fn glinerPipelineProfileEnabled() bool {
@@ -2459,6 +2423,17 @@ test "gliner classification microbatch matches singleton scores without padded-w
     }
     try std.testing.expect(probe.calls > before + 1);
     for (scores, bounded) |expected, row| try std.testing.expectEqualSlices(f32, expected, row);
+
+    // The shapes must be rejected by admission before either path allocates
+    // the span tensor, which is larger than this allocator's entire buffer.
+    var scratch: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+    pipeline.allocator = fixed.allocator();
+    pipeline.config.max_width = 1024;
+    const before_rejection = probe.calls;
+    try std.testing.expectError(error.ResourceLimitExceeded, pipeline.scoreLabels("short", &labels));
+    try std.testing.expectError(error.ResourceLimitExceeded, pipeline.scoreLabelsBatch(&.{"short"}, &labels));
+    try std.testing.expectEqual(before_rejection, probe.calls);
 }
 
 test "gliner preparation compacts tokenless words and stops at its token limit" {
@@ -2489,7 +2464,9 @@ test "gliner preparation compacts tokenless words and stops at its token limit" 
         try std.testing.expectEqualSlices(i64, &.{ 5, 6, 1, 1, 0 }, row.input_ids);
         try std.testing.expectEqualSlices(i64, &.{ 1, 1, 1, 1, 0 }, row.attention_mask);
         try std.testing.expectEqualSlices(i64, &.{ 0, 0, 1, 2, 0 }, row.words_mask);
-        try std.testing.expectEqualSlices(i64, &.{ 0, 0, 0, 1, 1, 1, 0, 0 }, row.span_idx);
+        var span_idx: [12]i64 = undefined;
+        fillSpanIndices(&span_idx, row.word_spans.len, pipeline.config.max_width);
+        try std.testing.expectEqualSlices(i64, &.{ 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0 }, &span_idx);
         try std.testing.expectEqualSlices(WordSpan, &.{ .{ .start = 5, .end = 10 }, .{ .start = 16, .end = 19 } }, row.word_spans);
         try std.testing.expectEqual(@as(usize, if (cache_word_tokens) 4 else 5), probe.calls);
     }
@@ -2498,7 +2475,6 @@ test "gliner preparation compacts tokenless words and stops at its token limit" 
     defer empty.deinit(allocator);
     try std.testing.expectEqualSlices(i64, &.{ 0, 0 }, empty.words_mask);
     try std.testing.expectEqual(@as(usize, 0), empty.word_spans.len);
-    try std.testing.expectEqual(@as(usize, 0), empty.span_idx.len);
 }
 
 test "gliner batch output validation rejects incomplete backend results" {
@@ -2561,6 +2537,32 @@ test "gliner word iterator preserves punctuation, emails, and UTF-8 word spans" 
     try std.testing.expectEqual(null, words.next());
 }
 
+test "gliner entity decoding releases allocations on failure" {
+    const Check = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var spans = [_]WordSpan{ .{ .start = 0, .end = 5 }, .{ .start = 6, .end = 11 }, .{ .start = 12, .end = 15 } };
+            var pipeline = GlinerPipeline{ .allocator = alloc, .session = undefined, .tok = undefined, .config = .{} };
+            const row = GlinerPipeline.PreparedGlinerInput{
+                .text = "Alice Alice Bob",
+                .input_ids = &.{},
+                .attention_mask = &.{},
+                .words_mask = &.{},
+                .word_spans = &spans,
+            };
+            const results = try pipeline.decodeEntitiesFromLogits(row, &.{"person"}, &.{ 3, 2, 4, -1, 3, -1 }, 3, 2, 1, 0.5, true, .word_major_logits);
+            defer {
+                for (results) |entity| alloc.free(entity.text);
+                alloc.free(results);
+            }
+            try std.testing.expectEqual(@as(usize, 2), results.len);
+            try std.testing.expectEqualStrings("Alice", results[0].text);
+            try std.testing.expectEqual(@as(usize, 6), results[0].start);
+            try std.testing.expectEqualStrings("Bob", results[1].text);
+        }
+    };
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
 test "gliner dedups repeated entity text per label" {
     const alloc = std.testing.allocator;
     var entities = try alloc.alloc(Entity, 4);
@@ -2569,17 +2571,17 @@ test "gliner dedups repeated entity text per label" {
     entities[2] = .{ .text = try alloc.dupe(u8, "Apple Inc."), .label = "location", .start = 40, .end = 50, .score = 0.8 };
     entities[3] = .{ .text = try alloc.dupe(u8, "Cupertino"), .label = "location", .start = 60, .end = 69, .score = 0.7 };
 
-    const deduped = try dedupEntitiesByLabelText(alloc, entities);
+    var list = std.ArrayListUnmanaged(Entity).fromOwnedSlice(entities);
+    dedupEntitiesByLabelText(alloc, &list);
     defer {
-        for (deduped) |entity| alloc.free(entity.text);
-        alloc.free(deduped);
+        for (list.items) |entity| alloc.free(entity.text);
+        list.deinit(alloc);
     }
 
-    try std.testing.expectEqual(@as(usize, 3), deduped.len);
-    try std.testing.expectEqual(@as(usize, 20), deduped[0].start);
-    try std.testing.expectEqualStrings("organization", deduped[0].label);
-    try std.testing.expectEqualStrings("location", deduped[1].label);
-    try std.testing.expectEqualStrings("Cupertino", deduped[2].text);
+    try std.testing.expectEqual(@as(usize, 3), list.items.len);
+    try std.testing.expectEqual(@as(usize, 20), list.items[0].start);
+    try std.testing.expectEqualStrings("organization", list.items[0].label);
+    try std.testing.expectEqualStrings("location", list.items[1].label);
 }
 
 test "gliner supportsClassification checks model type and capabilities" {
