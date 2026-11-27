@@ -851,31 +851,32 @@ fn gatherStageInputs(first: *const Ticket, items: []const micro.ExecuteItem, ten
         var audit: transfers.Audit = .{ .forbid_device_host_access = true };
         try transfers.begin(&audit);
         defer transfers.end();
-        const gathered_columns = columns: {
-            const gather = kernels.gatherDeviceColumns orelse break :columns false;
-            const Column = @import("../ops/kernel_backend.zig").VTable.DeviceRowColumn;
-            var columns: [64]Column = undefined;
-            var rows: [64][8]ops.CT = undefined;
+        const Column = @import("../ops/kernel_backend.zig").VTable.DeviceRowColumn;
+        var columns: [64]Column = undefined;
+        var sources: [64][8]ops.CT = undefined;
+        // Bound a packet to the CUDA driver request limit even for a full cohort.
+        const packet_capacity = @min(columns.len, 256 / items.len);
+        var next_column: usize = 0;
+        while (next_column < values.len) {
+            const start_column = next_column;
             var count: usize = 0;
-            for (values, 0..) |destination, column| {
+            while (next_column < values.len and count < packet_capacity) {
+                const index = next_column;
+                next_column += 1;
+                const destination = values[index];
                 if (destination != .resident) continue;
-                if (count == columns.len) break :columns false;
-                const sources = rows[count][0..items.len];
-                for (items, sources) |item, *source| source.* = item.payloadAs(Ticket).stage.?[column].resident.value;
-                columns[count] = .{ .output = destination.resident.value, .sources = sources };
+                const inputs = sources[count][0..items.len];
+                for (items, inputs) |item, *source| source.* = item.payloadAs(Ticket).stage.?[index].resident.value;
+                columns[count] = .{ .output = destination.resident.value, .sources = inputs };
                 count += 1;
             }
-            break :columns try gather(backend.ptr, columns[0..count]);
-        };
-        if (!gathered_columns) for (values, 0..) |destination, column| if (destination == .resident) {
-            const width = try denseBytes(destination.resident.shape[1..], 1);
-            if (backend.kind() == .metal) {
-                const gather = kernels.gatherDeviceColumns orelse return error.ResidentGatherUnavailable;
-                var sources: [8]ops.CT = undefined;
-                const inputs = sources[0..items.len];
-                for (items, inputs) |item, *source| source.* = item.payloadAs(Ticket).stage.?[column].resident.value;
-                if (!try gather(backend.ptr, &.{.{ .output = destination.resident.value, .sources = inputs }})) return error.ResidentGatherUnavailable;
-            } else {
+            if (count == 0) continue;
+            if (kernels.gatherDeviceColumns) |gather| {
+                if (try gather(backend.ptr, columns[0..count])) continue;
+            }
+            for (values[start_column..next_column], start_column..) |destination, index| {
+                if (destination != .resident) continue;
+                const width = try denseBytes(destination.resident.shape[1..], 1);
                 const target = if (backend.kind() == .native)
                     (kernels.pooledOutputStorage.?(backend.ptr, destination.resident.value) orelse return error.ResidentGatherUnavailable).tensor
                 else
@@ -883,12 +884,12 @@ fn gatherStageInputs(first: *const Ticket, items: []const micro.ExecuteItem, ten
                 var start: usize = 0;
                 for (items) |item| {
                     const ticket = item.payloadAs(Ticket);
-                    const source = ticket.stage.?[column].resident;
+                    const source = ticket.stage.?[index].resident;
                     if (!try backend.vtable.copyRows2D.?(backend.ptr, target, start, source.value, 0, ticket.rows, width)) return error.ResidentGatherUnavailable;
                     start += ticket.rows;
                 }
             }
-        };
+        }
         if (first.session.invocation_diagnostics) |binding| {
             if (binding.diagnostics.isEnabled()) result.transfers = audit.measurements();
         }
