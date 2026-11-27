@@ -1472,6 +1472,14 @@ The declared BF16 source convolution packs produced exact border values
 with and without bias in two cuDNN forwards. The released shared-head
 HTTP replay and the 128-page recurrent partition fixture passed again.
 
+A same-binary default/shared/shared/default comparison at
+`4492c73407` completed 64 pages per arm with exact serial parity.
+Rates were 18.6430, 19.1465, 19.6339 and 20.7716 pages/s. Timed
+replay widths were 7, 3, none and 64. Only the final default arm met
+the 64-row gate. In the second shared arm, page-state cleanup retired
+the 64-row graph before capture finished, after two tokens of progress.
+Throughput parity for the shared bank remains unqualified.
+
 At `ee3629cec0`, five scoped Metal audio tests passed without skips.
 The replay fixture rejected missing and excess input bindings before
 dispatch. The same run covered fresh inputs, held results, and
