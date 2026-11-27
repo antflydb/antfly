@@ -1436,6 +1436,12 @@ two-clip checkpoint reproduced exact vectors, two replays, and
 run covered segmented kernel parity and fused LightOnOCR HTTP replay.
 The production layout still comes from an observed allocation schedule.
 
+At `421cb0dba9`, Spark passed all 20 scoped CUDA checks without skips.
+Local-relative attention produced exact expected BF16 values for both
+single-block and multi-block inputs with three physical GEMM submissions
+per input and one workspace binding per sequence. The released grouped
+audio and fused LightOnOCR HTTP replay checks passed in the same run.
+
 At `ee3629cec0`, five scoped Metal audio tests passed without skips.
 The replay fixture rejected missing and excess input bindings before
 dispatch. The same run covered fresh inputs, held results, and
