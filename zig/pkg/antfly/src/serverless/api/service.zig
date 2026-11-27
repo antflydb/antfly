@@ -44,6 +44,18 @@ pub const Service = struct {
         };
 
         for (req.mutations) |mutation| try validatePublicMutation(self.alloc, mutation);
+        if (req.expected_latest_lsn) |expected| {
+            if (req.mutations.len > 1024) return error.CommitRequirementTooLarge;
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const temporary = arena.allocator();
+            const payloads = try temporary.alloc([]const u8, req.mutations.len);
+            for (req.mutations, payloads) |mutation, *payload| payload.* = try api_codec.encodeMutationAlloc(temporary, mutation);
+            var generated: [64]u8 = undefined;
+            const operation_id = req.operation_id orelse try std.fmt.bufPrint(&generated, "conditional/{d}/{d}", .{ expected, req.timestamp_ns });
+            const result = try self.wal.appendBatchIdempotentIfLatest(req.namespace, req.timestamp_ns, payloads, operation_id, expected);
+            return .{ .namespace = namespace, .mutation_count = req.mutations.len, .start_lsn = result.start_lsn, .end_lsn = result.end_lsn };
+        }
         if (req.operation_id) |operation_id| {
             var arena = std.heap.ArenaAllocator.init(self.alloc);
             defer arena.deinit();

@@ -138,17 +138,23 @@ pub const ServerlessHttpServer = struct {
             .body = try self.alloc.dupe(u8, resp.body),
         };
         errdefer response.deinit(self.alloc);
-        if (resp.retry_after_seconds) |seconds| {
-            const value = try std.fmt.allocPrint(self.alloc, "{d}", .{seconds});
-            defer self.alloc.free(value);
-            const name_owned = try self.alloc.dupe(u8, "Retry-After");
-            errdefer self.alloc.free(name_owned);
-            const value_owned = try self.alloc.dupe(u8, value);
-            errdefer self.alloc.free(value_owned);
-            const headers = try self.alloc.alloc(http_common.Header, 1);
-            headers[0] = .{
-                .name = name_owned,
-                .value = value_owned,
+        if (resp.retry_after_seconds != null or resp.version != null) {
+            const count: usize = @as(usize, @intFromBool(resp.retry_after_seconds != null)) + @intFromBool(resp.version != null);
+            const headers = try self.alloc.alloc(http_common.Header, count);
+            var filled: usize = 0;
+            errdefer {
+                for (headers[0..filled]) |header| {
+                    self.alloc.free(header.name);
+                    self.alloc.free(header.value);
+                }
+                self.alloc.free(headers);
+            }
+            inline for (.{ .{ "Retry-After", resp.retry_after_seconds }, .{ "X-Antfly-Version", resp.version } }) |entry| if (entry[1]) |number| {
+                const name_owned = try self.alloc.dupe(u8, entry[0]);
+                errdefer self.alloc.free(name_owned);
+                const value_owned = try std.fmt.allocPrint(self.alloc, "{d}", .{number});
+                headers[filled] = .{ .name = name_owned, .value = value_owned };
+                filled += 1;
             };
             response.headers = headers;
         }
@@ -278,6 +284,8 @@ pub const ServerlessHttpServer = struct {
             const value = try std.fmt.bufPrint(&retry_after_buf, "{d}", .{seconds});
             try ctx.setHeader("Retry-After", value);
         }
+        var version_buf: [20]u8 = undefined;
+        if (response.version) |version| try ctx.setHeader("X-Antfly-Version", try std.fmt.bufPrint(&version_buf, "{d}", .{version}));
         _ = ctx.response.body(response.body);
         return try ctx.response.build();
     }

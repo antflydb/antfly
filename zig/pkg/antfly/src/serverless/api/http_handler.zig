@@ -365,6 +365,7 @@ pub const HttpHandler = struct {
             .ingest_table_batch => |value| try self.handleIngestTableBatch(value.table_name, req.body),
             .table_batch => |value| try self.handleTableBatch(value.table_name, req.body, request_context),
             .table_enrichment_counts => |value| try self.handleTableEnrichmentCounts(value.table_name, req.body),
+            .table_lookup => |value| try self.handleTableLookup(value.table_name, value.key, req.cancellation),
             .build_namespace => |value| try self.handleBuildNamespace(value.namespace),
             .internal_table_build => |value| try self.handleBuildTable(value.table_name),
             .build_status => |value| try self.handleBuildStatus(value.namespace),
@@ -1273,6 +1274,48 @@ pub const HttpHandler = struct {
         };
         defer status.deinit(self.alloc);
         return try jsonResponse(self.alloc, 200, status);
+    }
+
+    /// The current document and its version (`X-Antfly-Version`), the
+    /// precondition a transform names in `expected_version`.
+    fn handleTableLookup(self: *HttpHandler, table_name: []const u8, key: []const u8, cancellation: CancellationToken) !HttpResponse {
+        const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch |err| switch (err) {
+            error.NamespaceNotFound => return try textResponse(self.alloc, 404, "not found"),
+            else => return err,
+        };
+        defer self.alloc.free(namespace);
+        // Read the version on both sides of the body so they agree.
+        for (0..3) |_| {
+            var before: u64 = 0;
+            const versions = try self.documentVersionsAlloc(namespace, &.{key}, &before);
+            const version = versions[0];
+            self.alloc.free(versions);
+            if (version == 0) return try textResponse(self.alloc, 404, "not found");
+            const body = (try self.currentDocumentBodyAlloc(namespace, key, cancellation)) orelse return try textResponse(self.alloc, 404, "not found");
+            errdefer self.alloc.free(body);
+            if (try self.api.wal.latestLsn(namespace) != before) {
+                self.alloc.free(body);
+                continue;
+            }
+            return .{ .status = 200, .content_type = try self.alloc.dupe(u8, "application/json"), .body = body, .version = version };
+        }
+        return try textResponse(self.alloc, 409, "document changed while reading; retry");
+    }
+
+    fn currentDocumentBodyAlloc(self: *HttpHandler, namespace: []const u8, key: []const u8, cancellation: CancellationToken) !?[]u8 {
+        if (self.live_read_options) |options| {
+            var configured = options;
+            configured.cancellation = cancellation;
+            configured.io = self.io;
+            if (query_mod.LiveSession.open(self.alloc, self.query, self.api.wal, namespace, configured)) |session| {
+                defer session.deinit();
+                return session.lookupAlloc(key);
+            } else |err| if (err != error.HostedDocumentFactsRequired) return err;
+        }
+        const latest = try self.allocLatestDocumentsAlloc(namespace);
+        defer query_materializer.freeDocuments(self.alloc, latest);
+        const body = findMaterializedDocumentBody(latest, key) orelse return null;
+        return try self.alloc.dupe(u8, body);
     }
 
     /// Named enrichment counts of the published HEAD, one page of documents
@@ -5990,6 +6033,84 @@ pub const HttpHandler = struct {
     /// outputs whose input is unchanged from the stored body, and records
     /// the per-item outcomes for the batch response. A table without named
     /// enrichments rejects seed fields instead of storing them as JSON.
+    /// A transform whose operations only write seeds (other than externally
+    /// maintained assets, which bind to nothing) must carry `expected_version`.
+    fn requireSeedSourceBindings(self: *HttpHandler, table_name: []const u8, req: db_types.BatchRequest) !void {
+        var declarations: ?catalog_mod.named_enrichments.Declarations = null;
+        defer if (declarations) |*value| value.deinit(self.alloc);
+        for (req.transforms) |transform| {
+            if (transform.operations.len == 0) continue;
+            var bound_required = false;
+            const seed_only = for (transform.operations) |operation| {
+                const reserved = (try db_transform.reservedProjectionPath(operation.path)) orelse break false;
+                switch (reserved.field) {
+                    .seed_conflict => {},
+                    .embeddings => break false,
+                    .artifacts, .chunks => {
+                        if (declarations == null) {
+                            var table = (try self.catalog.getTableAlloc(self.alloc, table_name)) orelse return error.NamespaceNotFound;
+                            defer table.deinit(self.alloc);
+                            declarations = try catalog_mod.named_enrichments.parseAlloc(self.alloc, table.indexes_json);
+                        }
+                        const external = reserved.field == .artifacts and if (declarations.?.find(reserved.name)) |cfg| catalog_mod.named_enrichments.externallyMaintained(cfg.*) else false;
+                        if (!external) bound_required = true;
+                    },
+                }
+            } else true;
+            if (!seed_only or !bound_required) continue;
+            for (req.predicates) |predicate| {
+                if (std.mem.eql(u8, predicate.key, transform.key)) break;
+            } else return error.ArtifactSeedSourceBindingRequired;
+        }
+    }
+
+    /// Each key's version: the LSN of its last WAL mutation (source writes and
+    /// enrichment output alike), or 0 when it does not exist. `latest`
+    /// receives the namespace LSN the versions were read at.
+    fn documentVersionsAlloc(self: *HttpHandler, namespace: []const u8, keys: []const []const u8, latest: *u64) ![]u64 {
+        const versions = try self.alloc.alloc(u64, keys.len);
+        errdefer self.alloc.free(versions);
+        @memset(versions, 0);
+        latest.* = try self.api.wal.latestLsn(namespace);
+        var published_lsn: u64 = 0;
+        const head = self.progress.getHead(namespace) catch |err| switch (err) {
+            error.FileNotFound => 0,
+            else => return err,
+        };
+        if (head != 0) {
+            var session = try self.query.openHeadSession(namespace);
+            defer session.deinit();
+            published_lsn = session.manifest.wal_end_lsn;
+            var remaining: u64 = 512 * 1024 * 1024;
+            if (try document_facts_reader.Reader.create(self.alloc, &session, &remaining)) |reader| {
+                defer reader.destroy();
+                for (keys, versions) |key, *version| {
+                    if (try reader.lookup(key)) |fact| version.* = fact.last_lsn;
+                }
+            } else {
+                const published = try self.allocPublishedDocumentsAlloc(&session);
+                defer query_materializer.freeDocuments(self.alloc, published);
+                for (published) |document| for (keys, versions) |key, *version| {
+                    if (std.mem.eql(u8, document.doc_id, key)) version.* = document.last_lsn;
+                };
+            }
+        }
+        if (latest.* > published_lsn) {
+            const records = try self.api.wal.readFromAlloc(namespace, published_lsn + 1);
+            defer wal_mod.freeRecords(self.alloc, records);
+            for (records) |record| {
+                if (record.lsn > latest.*) break;
+                var mutation = try @import("codec.zig").decodeMutationAlloc(self.alloc, record.payload);
+                defer mutation.deinit(self.alloc);
+                if (mutation.kind == .catalog) continue;
+                for (keys, versions) |key, *version| {
+                    if (std.mem.eql(u8, mutation.doc_id, key)) version.* = if (mutation.kind == .delete) 0 else record.lsn;
+                }
+            }
+        }
+        return versions;
+    }
+
     fn acceptNamedOutputs(self: *HttpHandler, table_name: []const u8, namespace: []const u8, mutations: []api_types.DocumentMutation, cancellation: CancellationToken) !void {
         var table = (try self.catalog.getTableAlloc(self.alloc, table_name)) orelse return error.NamespaceNotFound;
         defer table.deinit(self.alloc);
@@ -6206,6 +6327,32 @@ pub const HttpHandler = struct {
         if (gated) {
             for (req.transforms, read_documents) |transform, *document| document.* = transform.key;
         }
+        // Seed-only transforms bind to the source version their seeds were
+        // computed from; preconditions are checked against the namespace LSN
+        // they were read at, and the append is conditional on it (#1791).
+        self.requireSeedSourceBindings(table_name, req) catch |err| switch (err) {
+            error.ArtifactSeedSourceBindingRequired, error.InvalidArgument, error.UnsupportedTransformOperation => return error.InvalidBatchRequest,
+            else => {
+                std.log.err("serverless seed binding check failed table={s} err={}", .{ table_name, err });
+                return error.InternalFailure;
+            },
+        };
+        const version_fence: ?u64 = if (req.predicates.len == 0) null else fence: {
+            const keys = self.alloc.alloc([]const u8, req.predicates.len) catch return error.InternalFailure;
+            defer self.alloc.free(keys);
+            for (req.predicates, keys) |predicate, *key| key.* = predicate.key;
+            var latest: u64 = 0;
+            const versions = self.documentVersionsAlloc(namespace, keys, &latest) catch |err| switch (err) {
+                error.WalReadBudgetExceeded, error.WalVisibilityUnavailable, error.WalSnapshotExpired => return error.Backpressured,
+                else => {
+                    std.log.err("serverless version read failed table={s} err={}", .{ table_name, err });
+                    return error.InternalFailure;
+                },
+            };
+            defer self.alloc.free(versions);
+            for (req.predicates, versions) |predicate, version| if (predicate.expected_version != version) return error.Conflict;
+            break :fence latest;
+        };
         const mutations = (if (gated)
             self.resolveDirectTableBatchMutationsAlloc(namespace, req, request)
         else
@@ -6252,9 +6399,9 @@ pub const HttpHandler = struct {
         var result = (if (prepared) |values|
             self.api.ingestPreparedBatchWithReadSet(.{ .namespace = namespace, .timestamp_ns = timestamp, .operation_id = operation_id, .mutations = values }, catalog_fence, read_documents)
         else
-            self.api.ingestBatch(.{ .namespace = namespace, .timestamp_ns = timestamp, .mutations = mutations })) catch |err| {
+            self.api.ingestBatch(.{ .namespace = namespace, .timestamp_ns = timestamp, .mutations = mutations, .expected_latest_lsn = version_fence })) catch |err| {
             if (err == error.VersionConflict) return error.Conflict;
-            if (err == error.CommitRequirementUnavailable) return error.Unavailable;
+            if (err == error.CommitRequirementUnavailable or err == error.AtomicBatchAppendUnsupported) return error.Unavailable;
             if (err == error.CommitRequirementTooLarge or err == error.InvalidDocumentBody or err == error.InvalidDocumentMutation) return error.InvalidBatchRequest;
             std.log.err("serverless public table batch ingest failed table={s} namespace={s} err={}", .{ table_name, namespace, err });
             return error.InternalFailure;
@@ -14178,6 +14325,45 @@ test "http handler accepts named enrichment seeds on serverless table batches" {
             return error.TestUnexpectedResult;
         }
     }
+
+    // A seed-only transform of an output with an input binds to a version.
+    var looked_up = try handler.handle(.{ .method = .get, .path = "/tables/docs/lookup/doc:a" });
+    defer looked_up.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), looked_up.status);
+    const version = looked_up.version.?;
+    try std.testing.expect(std.mem.indexOf(u8, looked_up.body, "\"title\":\"t\"") != null);
+    var missing = try handler.handle(.{ .method = .get, .path = "/tables/docs/lookup/doc:none" });
+    defer missing.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 404), missing.status);
+    const seed_chunks = "{{\"transforms\":[{{\"key\":\"doc:a\",{s}\"operations\":[{{\"op\":\"$set\",\"path\":\"_chunks.passages\",\"value\":[{{\"_chunk_id\":0,\"_content\":\"alpha\"}}]}}]}}]}}";
+    const unbound_body = try std.fmt.allocPrint(alloc, seed_chunks, .{""});
+    defer alloc.free(unbound_body);
+    var unbound = try handler.handle(.{ .method = .post, .path = "/tables/docs/batch", .body = unbound_body });
+    defer unbound.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), unbound.status);
+    const stale_precondition = try std.fmt.allocPrint(alloc, "\"expected_version\":\"{d}\",", .{version + 100});
+    defer alloc.free(stale_precondition);
+    const stale_body = try std.fmt.allocPrint(alloc, seed_chunks, .{stale_precondition});
+    defer alloc.free(stale_body);
+    var stale = try handler.handle(.{ .method = .post, .path = "/tables/docs/batch", .body = stale_body });
+    defer stale.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), stale.status);
+    const precondition = try std.fmt.allocPrint(alloc, "\"expected_version\":\"{d}\",", .{version});
+    defer alloc.free(precondition);
+    const replacing = try std.fmt.allocPrint(alloc, seed_chunks, .{precondition});
+    defer alloc.free(replacing);
+    const bound_body = try std.fmt.allocPrint(alloc, "{{\"seed_conflict\":\"replace\",{s}", .{replacing[1..]});
+    defer alloc.free(bound_body);
+    var bound = try handler.handle(.{ .method = .post, .path = "/tables/docs/batch", .body = bound_body });
+    defer bound.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), bound.status);
+    if (std.mem.indexOf(u8, bound.body, "\"name\":\"passages\",\"outcome\":\"replaced\"") == null) {
+        std.debug.print("bound {s}\n", .{bound.body});
+        return error.TestUnexpectedResult;
+    }
+    var relooked = try handler.handle(.{ .method = .get, .path = "/tables/docs/lookup/doc:a" });
+    defer relooked.deinit(alloc);
+    try std.testing.expect(relooked.version.? > version);
 
     // Counts read the published HEAD: nothing before publication.
     var unpublished = try handler.handle(.{ .method = .post, .path = "/tables/docs/enrichments/counts" });

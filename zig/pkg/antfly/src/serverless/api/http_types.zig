@@ -62,6 +62,8 @@ pub const HttpResponse = struct {
     content_type: []u8,
     body: []u8,
     retry_after_seconds: ?u32 = null,
+    /// Document version for `X-Antfly-Version` (a lookup's precondition token).
+    version: ?u64 = null,
 
     pub fn deinit(self: *HttpResponse, alloc: Allocator) void {
         alloc.free(self.content_type);

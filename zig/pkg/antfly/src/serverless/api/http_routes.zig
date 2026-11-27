@@ -43,6 +43,8 @@ pub const Route = union(enum) {
     table_batch: TableRoute,
     /// POST /tables/{table}/enrichments/counts: named enrichment counts.
     table_enrichment_counts: TableRoute,
+    /// GET /tables/{table}/lookup/{key}: one document and its version.
+    table_lookup: TableKeyRoute,
     build_namespace: NamespaceRoute,
     build_status: NamespaceRoute,
     policy: NamespaceRoute,
@@ -80,6 +82,11 @@ pub const NamespaceRoute = struct {
 
 pub const TableRoute = struct {
     table_name: []const u8,
+};
+
+pub const TableKeyRoute = struct {
+    table_name: []const u8,
+    key: []const u8,
 };
 
 pub const TableIndexRoute = struct {
@@ -139,6 +146,7 @@ pub fn admissionClass(route: Route) AdmissionClass {
         .table_query_published,
         .table_query_latest,
         .table_enrichment_counts,
+        .table_lookup,
         .query_search,
         .table_query_search,
         .table_query_graph_neighbors,
@@ -404,6 +412,12 @@ fn matchTableRoute(method: HttpMethod, segments: *std.mem.SplitIterator(u8, .sca
         if (method != .post or segments.next() != null) return null;
         return .{ .table_batch = .{ .table_name = table_name } };
     }
+    if (std.mem.eql(u8, suffix, "lookup")) {
+        // The key is the rest of the path, slashes included.
+        const key = segments.rest();
+        if (method != .get or key.len == 0) return null;
+        return .{ .table_lookup = .{ .table_name = table_name, .key = key } };
+    }
     if (std.mem.eql(u8, suffix, "enrichments")) {
         const action = segments.next() orelse return null;
         if (!std.mem.eql(u8, action, "counts") or method != .post or segments.next() != null) return null;
@@ -568,6 +582,9 @@ test "http routes match the table public endpoints" {
     const counts = match(.post, "/tables/docs/enrichments/counts").?;
     try std.testing.expectEqualStrings("docs", counts.table_enrichment_counts.table_name);
     try std.testing.expect(match(.get, "/tables/docs/enrichments/counts") == null);
+    const lookup = match(.get, "/tables/docs/lookup/doc:a/b").?;
+    try std.testing.expectEqualStrings("doc:a/b", lookup.table_lookup.key);
+    try std.testing.expect(match(.get, "/tables/docs/lookup/") == null);
 
     try std.testing.expect(match(.post, "/tables/docs/build") == null);
     try std.testing.expect(match(.get, "/tables/docs/build-status") == null);

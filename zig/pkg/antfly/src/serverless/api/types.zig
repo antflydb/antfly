@@ -50,6 +50,10 @@ pub const IngestBatchRequest = struct {
     namespace: []const u8,
     timestamp_ns: u64,
     mutations: []const DocumentMutation,
+    /// Append only while the namespace's latest LSN is still this one
+    /// (`VersionConflict` otherwise): the cut its version preconditions
+    /// were checked at.
+    expected_latest_lsn: ?u64 = null,
 };
 
 pub const TableUpsertMutation = struct {

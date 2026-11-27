@@ -107,6 +107,65 @@ pub const FsStore = struct {
         );
     }
 
+    /// Appends `payloads` as one contiguous range exactly once, only while the
+    /// namespace's latest LSN is `expected_latest_lsn` (`VersionConflict`
+    /// otherwise). The first record carries the operation identity; a retry
+    /// returns the range it committed.
+    pub fn appendBatchIdempotentIfLatest(
+        self: *FsStore,
+        namespace: []const u8,
+        timestamp_ns: u64,
+        payloads: []const []const u8,
+        operation_id: []const u8,
+        expected_latest_lsn: u64,
+    ) !wal_types.BatchResult {
+        if (operation_id.len == 0 or operation_id.len > std.math.maxInt(u16))
+            return error.InvalidWalOperationId;
+        if (payloads.len == 0 or payloads.len > 1024) return error.InvalidWalBatch;
+        if (payloads[0].len > record_codec.idempotent_payload_max) return error.WalRecordTooLarge;
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        var lock_io_impl = threadedIo();
+        defer lock_io_impl.deinit();
+        const lock_io = lock_io_impl.io();
+        var namespace_lock = try openNamespaceLock(self.alloc, self.root_dir, namespace, lock_io);
+        defer namespace_lock.close(lock_io);
+        try namespace_lock.lock(lock_io, .exclusive);
+        defer namespace_lock.unlock(lock_io);
+        const log_path = try logPathAlloc(self.alloc, self.root_dir, namespace);
+        defer self.alloc.free(log_path);
+        const next_path = try nextLsnPathAlloc(self.alloc, self.root_dir, namespace);
+        defer self.alloc.free(next_path);
+        try ensureParentDir(log_path);
+        const current = if (fileExists(log_path)) try readFileAlloc(self.alloc, log_path) else null;
+        defer if (current) |raw| self.alloc.free(raw);
+        if (current) |raw| if (try record_codec.findOperation(raw, operation_id)) |existing| {
+            if (existing.timestamp_ns != timestamp_ns or !std.mem.eql(u8, existing.payload, payloads[0]))
+                return error.WalIdempotencyConflict;
+            return .{ .start_lsn = existing.lsn, .end_lsn = existing.lsn + payloads.len - 1 };
+        };
+        const first = if (current) |raw|
+            (try record_codec.lastLsn(raw)) + 1
+        else if (try readNextState(self.alloc, next_path)) |state|
+            state.next_lsn
+        else
+            1;
+        if (first - 1 != expected_latest_lsn) return error.VersionConflict;
+        var encoded = std.ArrayListUnmanaged(u8).empty;
+        defer encoded.deinit(self.alloc);
+        for (payloads, 0..) |payload, i| {
+            const record = if (i == 0)
+                try record_codec.encodeIdempotentRecordAlloc(self.alloc, first, timestamp_ns, payload, operation_id)
+            else
+                try record_codec.encodeRecordAlloc(self.alloc, first + i, timestamp_ns, payload);
+            defer self.alloc.free(record);
+            try encoded.appendSlice(self.alloc, record);
+        }
+        try writeAppendedLogAtomically(self.alloc, log_path, current, encoded.items);
+        try writeNextState(self.alloc, next_path, first + payloads.len, (if (current) |raw| raw.len else 0) + encoded.items.len);
+        return .{ .start_lsn = first, .end_lsn = first + payloads.len - 1 };
+    }
+
     fn appendIdempotentMaybeLatest(
         self: *FsStore,
         namespace: []const u8,
@@ -261,6 +320,7 @@ pub const FsStore = struct {
         .append = erasedAppend,
         .append_idempotent = erasedAppendIdempotent,
         .append_idempotent_if_latest = erasedAppendIdempotentIfLatest,
+        .append_batch_idempotent_if_latest = erasedAppendBatchIdempotentIfLatest,
         .read_from_alloc = erasedReadFromAlloc,
         .latest_lsn = erasedLatestLsn,
         .truncate_prefix = erasedTruncatePrefix,
@@ -279,6 +339,11 @@ pub const FsStore = struct {
     fn erasedAppendIdempotent(ptr: *anyopaque, namespace: []const u8, timestamp_ns: u64, payload: []const u8, operation_id: []const u8) !u64 {
         const self: *FsStore = @ptrCast(@alignCast(ptr));
         return try self.appendIdempotent(namespace, timestamp_ns, payload, operation_id);
+    }
+
+    fn erasedAppendBatchIdempotentIfLatest(ptr: *anyopaque, namespace: []const u8, timestamp_ns: u64, payloads: []const []const u8, operation_id: []const u8, expected_latest_lsn: u64) !wal_types.BatchResult {
+        const self: *FsStore = @ptrCast(@alignCast(ptr));
+        return self.appendBatchIdempotentIfLatest(namespace, timestamp_ns, payloads, operation_id, expected_latest_lsn);
     }
 
     fn erasedAppendIdempotentIfLatest(
