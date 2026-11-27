@@ -127,7 +127,7 @@ pub const AudioRecipe = struct {
     depthwise_cached: bool = false,
 
     pub fn validate(self: AudioRecipe) !void {
-        if (self.count == 0 or self.count > 4 or self.hidden == 0 or self.heads == 0 or self.hidden % self.heads != 0 or
+        if (self.count == 0 or self.count > GroupedRows.max_clips or self.hidden == 0 or self.heads == 0 or self.hidden % self.heads != 0 or
             self.output_hidden == 0 or self.intermediate == 0 or self.blocks != 12 or self.mel_bins != 128 or
             self.context_left == 0 or self.packed_layers >> 12 != 0) return error.InvalidPreparedAudioRecipe;
         for (self.frames[0..self.count]) |frames| if (frames == 0) return error.InvalidPreparedAudioRecipe;

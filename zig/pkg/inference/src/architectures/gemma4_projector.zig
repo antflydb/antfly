@@ -1492,7 +1492,7 @@ pub fn embeddingGemma2AudioCacheRecipe(cb: *const ComputeBackend, prepared: []co
     return audioCacheRecipe(cb, embeddingGemma2AudioConfig(), prepared);
 }
 fn audioCacheRecipe(cb: *const ComputeBackend, cfg: AudioConfig, prepared: []const *const PreparedAudio) !AudioCacheRecipe {
-    if (cb.kind() != .cuda or prepared.len == 0 or prepared.len > 4) return error.UnsupportedPreparedAudioCache;
+    if (cb.kind() != .cuda or prepared.len == 0 or prepared.len > audio_schedule.GroupedRows.max_clips) return error.UnsupportedPreparedAudioCache;
     var recipe = audioCacheConfig(try audioConfigForBackend(cb, cfg));
     recipe.count = @intCast(prepared.len);
     for (prepared, 0..) |audio_input, index| {
@@ -1727,7 +1727,7 @@ pub fn encodeEmbeddingGemma2AudioBounded(cb: *const ComputeBackend, allocator: s
 
 pub const ResidentEncodedAudio = struct { embeddings: CT, tokens: usize };
 pub fn encodePreparedEmbeddingGemma2AudioBatchResident(cb: *const ComputeBackend, a: std.mem.Allocator, prepared: []const *const PreparedAudio) !ResidentProjectedImages {
-    if (prepared.len == 0 or prepared.len > 4) return error.InvalidInputShape;
+    if (prepared.len == 0 or prepared.len > audio_schedule.GroupedRows.max_clips) return error.InvalidInputShape;
     var cache_scope = try beginAudioCache(cb, embeddingGemma2AudioConfig(), prepared);
     defer cache_scope.close();
     var storage = try ops.AudioStorageScope.begin(cb);
@@ -1738,8 +1738,8 @@ pub fn encodePreparedEmbeddingGemma2AudioBatchResident(cb: *const ComputeBackend
     const result = encode: {
         var weights = ProjectorWeights.initHuggingFace(cb, a);
         defer weights.deinit();
-        var features: [4]AudioFeatures = undefined;
-        var pointers: [4]*AudioFeatures = undefined;
+        var features: [audio_schedule.GroupedRows.max_clips]AudioFeatures = undefined;
+        var pointers: [audio_schedule.GroupedRows.max_clips]*AudioFeatures = undefined;
         defer for (features[0..count]) |*feature| feature.deinit();
         count = try audioFeatureCohort(cb, a, prepared, &features);
         for (pointers[0..count], 0..) |*pointer, i| pointer.* = &features[i];
@@ -1751,8 +1751,8 @@ pub fn encodePreparedEmbeddingGemma2AudioBatchResident(cb: *const ComputeBackend
     return .{ .allocator = a, .backend = cb, .embeddings = result.embeddings, .tokens_per_image = lengths, .hidden_size = 512, .batches_executed = 1, .max_batch_executed = count };
 }
 
-fn audioFeatureCohort(cb: *const ComputeBackend, a: std.mem.Allocator, prepared: []const *const PreparedAudio, features: *[4]AudioFeatures) !usize {
-    if (prepared.len == 0 or prepared.len > 4) return error.InvalidInputShape;
+fn audioFeatureCohort(cb: *const ComputeBackend, a: std.mem.Allocator, prepared: []const *const PreparedAudio, features: *[audio_schedule.GroupedRows.max_clips]AudioFeatures) !usize {
+    if (prepared.len == 0 or prepared.len > audio_schedule.GroupedRows.max_clips) return error.InvalidInputShape;
     var frame = try @import("../execution/submission.zig").Scope.beginIfNeeded(cb, cb.kind() == .metal);
     defer frame.deinit();
     var count: usize = 0;
@@ -3364,12 +3364,12 @@ fn audioSubsampleCohort(cb: *const ComputeBackend, a: std.mem.Allocator, store: 
     errdefer a.free(valid);
     const hidden = (try cb.allocUninitF32Shape(&.{ @intCast(rows), @intCast(cfg.audio_hidden) })) orelse return error.UnsupportedResidentGemma4Audio;
     errdefer cb.free(hidden);
-    var done: [4]bool = @splat(false);
+    var done: [Grouping.max_clips]bool = @splat(false);
     const can_batch = (cb.kind() == .cuda or cb.kind() == .metal) and cb.vtable.channelLayerNormRelu != null and std.meta.eql(audioHostOps(), AudioHostOps{});
     for (features, 0..) |feature, first| {
         if (done[first]) continue;
-        var indices: [4]usize = undefined;
-        var cohort: [4]*AudioFeatures = undefined;
+        var indices: [Grouping.max_clips]usize = undefined;
+        var cohort: [audio_schedule.GroupedRows.max_clips]*AudioFeatures = undefined;
         var count: usize = 0;
         var padded_frames = feature.frames;
         var min_frames = feature.frames;
@@ -10154,8 +10154,8 @@ fn checkSubsampleBatchGeometry(cb: ComputeBackend, _: ComputeBackend, base_frame
     const cfg = AudioConfig{ .text_hidden = 8, .audio_hidden = 16, .output_hidden = 24, .intermediate_size = 32, .block_count = 8, .head_count = 2, .mel_bins = 8, .conv_channels0 = 4, .conv_channels1 = 2, .layer_norm_eps = 1e-6 };
     var data: [4][15 * 8]f32 = undefined;
     var masks: [4][15]bool = @splat(@splat(true));
-    var features: [4]AudioFeatures = undefined;
-    var pointers: [4]*AudioFeatures = undefined;
+    var features: [audio_schedule.GroupedRows.max_clips]AudioFeatures = undefined;
+    var pointers: [audio_schedule.GroupedRows.max_clips]*AudioFeatures = undefined;
     for (&data, &features, &pointers, 0..) |*values, *f, *ptr, i| {
         for (values, 0..) |*x, j| x.* = @sin(@as(f32, @floatFromInt(j + i * 17)) * 0.13);
         masks[i][0] = false;
@@ -10939,7 +10939,7 @@ fn checkAudioFrontendCohort(cb: ComputeBackend, _: ComputeBackend) !void {
     for (&samples, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.13) * 0.4;
     var prepared = try prepareAudioPcm(a, .{ .samples = &samples, .sample_rate = 16000 }, 128, true, true);
     defer prepared.deinit();
-    var features: [4]AudioFeatures = undefined;
+    var features: [audio_schedule.GroupedRows.max_clips]AudioFeatures = undefined;
     const before = cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits;
     const count = try audioFeatureCohort(&cb, a, &.{ &prepared, &prepared, &prepared }, &features);
     defer for (features[0..count]) |*f| f.deinit();
@@ -10953,7 +10953,7 @@ fn checkAudioFrontendCohort(cb: ComputeBackend, _: ComputeBackend) !void {
     }
     try std.testing.expect(try cb.decoderRuntimeBeginFrame());
     defer cb.decoderRuntimeCancelFrame() catch {};
-    var external: [4]AudioFeatures = undefined;
+    var external: [audio_schedule.GroupedRows.max_clips]AudioFeatures = undefined;
     const n = try audioFeatureCohort(&cb, a, &.{ &prepared, &prepared }, &external);
     defer for (external[0..n]) |*f| f.deinit();
     try std.testing.expect(cb.decoderRuntimeHasActiveFrame());
