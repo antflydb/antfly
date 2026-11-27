@@ -21682,7 +21682,7 @@ fn sourceLocalRelativeAttention(self: *CudaCompute, q: CT, k: CT, v: CT, rel: CT
     try layout.validate(q_buffer, k_buffer, v_buffer, relative, scale, mask, output);
     const module = try self.encoderMultimodalModule();
     // Each clip's last consumer is submitted before the next clip reuses the bank.
-    var temporary = try SourceLinearTemporary.acquireKnownCapture(self, scratch_bytes, scratch_bytes, capture);
+    var temporary = try SourceLinearTemporary.acquireDeclared(self, scratch_bytes, scratch_bytes, capture);
     defer temporary.deinit(self);
     // The vendor workspace is the last span of the largest plan, so it
     // follows every clip's operands. Keep the handle bound across the group.
@@ -22305,6 +22305,18 @@ const SourceLinearTemporary = struct {
         if (self.execution_scope != null and self.source_linear_scratch.in_use) return error.SourceStorageInUse;
         return capture;
     }
+    fn acquireDeclared(self: *CudaCompute, bytes: usize, steady_bytes: usize, capture: bool) !@This() {
+        if (self.execution_scope) |scope| if (!scope.isBound()) {
+            try validateCaptureStorage(self, capture);
+            // All commands for the operation run within this interval, with
+            // no allocation from the outer scope. Borrow eager backing when
+            // present and add the exact planned size to the composite layout.
+            const storage = try acquireEager(self, bytes, steady_bytes);
+            scope.recordScratchInterval(bytes);
+            return storage;
+        };
+        return acquireKnownCapture(self, bytes, steady_bytes, capture);
+    }
     fn acquireKnownCapture(self: *CudaCompute, bytes: usize, steady_bytes: usize, actual_capture: bool) !@This() {
         try validateCaptureStorage(self, actual_capture);
         if (self.execution_scope) |scope| {
@@ -22318,6 +22330,10 @@ const SourceLinearTemporary = struct {
             scope.recordAllocation(bytes, bank.ptr);
             return .{ .bank = bank, .kind = .learned };
         }
+        return acquireEager(self, bytes, steady_bytes);
+    }
+
+    fn acquireEager(self: *CudaCompute, bytes: usize, steady_bytes: usize) !@This() {
         if (self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return error.CudaGraphCaptureUnsafeTempAlloc;
         if (self.source_linear_scratch.active) {
             if (self.source_linear_scratch.in_use) return error.SourceStorageInUse;
@@ -22423,7 +22439,7 @@ fn sourceLinear(self: *CudaCompute, request: @FieldType(ops.Bf16SourceOperation,
     const blas = if (self.bf16_blas) |*value| value else return error.CublasBf16Unavailable;
     const Layout = @import("libraries.zig").Bf16GemmProgram.TemporaryLayout;
     const layout = try Layout.resolveSourceRows(rows, request.width, request.columns, weight.dtype != .bf16, bias_epilogue and bias.?.dtype != .bf16, workspace_bytes);
-    const reuse_bytes = if (self.source_linear_scratch.active and self.execution_scope == null)
+    const reuse_bytes = if (self.source_linear_scratch.active and (self.execution_scope == null or !self.execution_scope.?.isBound()))
         if (request.reuse_projection) |geometry|
             (try Layout.resolveSourceRows(rows, geometry.width, geometry.columns, false, false, workspace_bytes)).bytes
         else
@@ -22433,7 +22449,7 @@ fn sourceLinear(self: *CudaCompute, request: @FieldType(ops.Bf16SourceOperation,
     const capture = try SourceLinearTemporary.preflightCapture(self);
     var output: ?OwnedF32Output = if (destination == null) try OwnedF32Output.alloc2(self, rows.physical, request.columns, output_count) else null;
     defer if (output) |*owned| owned.deinit();
-    var temporary = try SourceLinearTemporary.acquireKnownCapture(self, layout.bytes, reuse_bytes, capture);
+    var temporary = try SourceLinearTemporary.acquireDeclared(self, layout.bytes, reuse_bytes, capture);
     defer temporary.deinit(self);
     const workspace = temporary.span(layout.workspace);
     const bias_workspace = if (bias_epilogue) try sourceBiasWorkspaceView(self.embedding_gemma2_policy.source_bias_workspace, workspace) else workspace;

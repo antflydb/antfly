@@ -379,6 +379,21 @@ pub const Scope = struct {
         self.recipe.observing.allocate(bytes, pointer);
     }
 
+    /// Add scratch for an operation that declares its size and makes no other
+    /// scoped allocations before its final consumer is queued on this stream.
+    /// Its actual backing can come from an eager command workspace.
+    pub fn recordScratchInterval(self: *Scope, bytes: usize) void {
+        std.debug.assert(!self.isBound());
+        const plan = self.recipe.observing;
+        if (plan.origin != .observed) {
+            if (!plan.sealed) plan.valid = false;
+            return;
+        }
+        const slot = plan.count;
+        plan.allocateLive(bytes, null);
+        if (plan.count != slot) plan.releaseSlot(@intCast(slot));
+    }
+
     /// Bind the funded byte range before recording or submitting any kernels.
     pub fn bind(plan: *const Plan, layout: Layout, backing: DevicePointer, backing_bytes: usize) !Scope {
         if (!std.meta.eql(layout, try plan.layoutImpl(layout.scratch_offset, layout.external_output))) return error.InvalidExecutionPlan;
@@ -584,6 +599,27 @@ test "declared CUDA workspace reuses dead slots and redirects its sole published
     try builder.finish(publication);
     try std.testing.expectEqual(layout, try composed.layoutWithExternalOutput(alignment));
     try std.testing.expectEqual(plan.fingerprint(0), composed.fingerprint(0));
+}
+
+test "an operation can declare scratch inside an observed workspace" {
+    var plan: Plan = .{};
+    var scope = Scope.observe(&plan);
+    scope.recordAllocation(64, 0x1000);
+    scope.recordScratchInterval(512);
+    scope.release(0x1000);
+    scope.recordAllocation(128, 0x1000);
+    try std.testing.expect(plan.finish(0x1000));
+    try std.testing.expectEqual(Origin.observed, plan.origin);
+
+    const layout = try plan.layout(0);
+    var bound = try Scope.bind(&plan, layout, 0x2000, layout.bytes);
+    const input = try bound.allocate(64);
+    const scratch = try bound.allocate(512);
+    try std.testing.expectEqual(@as(DevicePointer, 0x2100), scratch);
+    bound.release(scratch);
+    bound.release(input);
+    try std.testing.expectEqual(input, try bound.allocate(128));
+    try std.testing.expect(bound.complete());
 }
 
 test "stream workspace keeps declared slots separate from observed addresses" {
