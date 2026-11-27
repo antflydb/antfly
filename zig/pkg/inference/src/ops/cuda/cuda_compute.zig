@@ -22506,14 +22506,12 @@ const SourceLinearTemporary = struct {
             if (scope.isBound()) {
                 return .{ .bank = try allocScopedDeviceBuffer(self, scope, bytes, .operation_scratch), .kind = .captured };
             }
-            // The operation holds this exact interval without nested scratch
-            // allocations. Eager backing need not match the recorded address.
             if (!self.source_linear_scratch.active) return .{
                 .bank = try allocScopedDeviceBuffer(self, scope, bytes, .operation_scratch),
                 .kind = .cached,
             };
             const storage = try acquireEager(self, bytes, steady_bytes);
-            scope.recordScratchInterval(bytes);
+            scope.recordScratchAllocation(bytes, storage.bank.ptr);
             return storage;
         }
         return acquireEager(self, bytes, steady_bytes);
@@ -22548,7 +22546,13 @@ const SourceLinearTemporary = struct {
     }
     fn deinit(value: *@This(), self: *CudaCompute) void {
         switch (value.kind) {
-            .audio => self.source_linear_scratch.in_use = false,
+            .audio => {
+                if (self.execution_scope) |scope| {
+                    std.debug.assert(!scope.isBound());
+                    scope.release(value.bank.ptr);
+                }
+                self.source_linear_scratch.in_use = false;
+            },
             .cached => releaseDeviceBuffer(self, &value.bank),
             .captured => {
                 const scope = self.execution_scope orelse platform.inference_process_supervisor.restartWorker();
