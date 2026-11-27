@@ -700,7 +700,7 @@ pub const ReadingPipeline = struct {
 
         // Direct compute bypasses Session.run, so retain its admission permit
         // through both encoder/decoder execution and backend cleanup.
-        const admitted = try FlorenceDecoder.admitBatchedRun(&preparation, self.vision_encoder.withAdmissionControl(self.execution_control), florence_cfg, .{
+        const admitted = try FlorenceDecoder.admitBatchedRun(preparation, self.vision_encoder.withAdmissionControl(self.execution_control), florence_cfg, .{
             .batch = batch,
             .pixel_count = pixel_values.len,
             .prompt_length = prompt_i32.len,
