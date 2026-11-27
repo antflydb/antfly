@@ -21337,29 +21337,18 @@ fn gemma4AudioLocalAttentionOp(
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (self.ctx.info.compute_major < 8) return null;
     if (params.arithmetic == .combined_f32 and params.publication != .f32) return null;
-    const derived_hidden = std.math.mul(usize, params.heads, params.head_dim) catch return error.InvalidTensorShape;
-    const count = std.math.mul(usize, params.rows, params.hidden) catch return error.InvalidTensorShape;
-    const relative_count = std.math.mul(usize, params.context_left, params.hidden) catch return error.InvalidTensorShape;
-    if (params.rows == 0 or params.hidden == 0 or params.heads == 0 or
-        params.head_dim == 0 or derived_hidden != params.hidden or
-        params.rows > std.math.maxInt(i32) or params.hidden > std.math.maxInt(u32) or
-        params.heads > 65535 or params.head_dim > std.math.maxInt(u32) or
-        params.chunk == 0 or params.chunk > std.math.maxInt(i32) or
-        params.context_left < 2 or params.context_left > params.context or params.context > 24 or
-        !std.math.isFinite(params.query_scale) or !std.math.isFinite(params.k_scale) or !std.math.isFinite(params.logit_cap) or
-        params.logit_cap <= 0 or !std.math.isFinite(params.invalid_value))
-        return error.InvalidTensorShape;
+    const layout = try embedding_gemma2_cuda.AudioAttentionLayout.init(params);
     inline for (.{ q, k, v, rel, q_dim_scales, valid }) |tensor| {
         if (tensorFromCt(tensor).dtype != .f32) return null;
     }
     const matrix_shape = [_]i64{ @intCast(params.rows), @intCast(params.hidden) };
     inline for (.{ q, k, v }) |tensor| {
         const actual = tensorFromCt(tensor);
-        if (actual.elem_count != count or !std.mem.eql(i64, actual.shape, &matrix_shape)) return error.InvalidTensorShape;
+        if (actual.elem_count != layout.matrix_elements or !std.mem.eql(i64, actual.shape, &matrix_shape)) return error.InvalidTensorShape;
     }
     const relative_shape = [_]i64{ @intCast(params.context_left), @intCast(params.hidden) };
     const relative = tensorFromCt(rel);
-    if (relative.elem_count != relative_count or !std.mem.eql(i64, relative.shape, &relative_shape)) return error.InvalidTensorShape;
+    if (relative.elem_count != layout.relative_elements or !std.mem.eql(i64, relative.shape, &relative_shape)) return error.InvalidTensorShape;
     const scale_shape = [_]i64{@intCast(params.head_dim)};
     const scales = tensorFromCt(q_dim_scales);
     if (scales.elem_count != params.head_dim or !std.mem.eql(i64, scales.shape, &scale_shape)) return error.InvalidTensorShape;
@@ -21391,6 +21380,7 @@ fn gemma4AudioLocalAttentionOp(
         tensorFromCt(rel).buffer,
         tensorFromCt(q_dim_scales).buffer,
         tensorFromCt(valid).buffer,
+        layout,
         params,
     );
     queued = false;
