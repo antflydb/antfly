@@ -3176,14 +3176,18 @@ fn gemma4LogMelFramesFft(
     mask: []const bool,
     out: []f32,
 ) !void {
+    if (filters.len != try std.math.mul(usize, 257, mel_bins) or
+        out.len != try std.math.mul(usize, frames, mel_bins) or mask.len != frames) return error.InvalidTensorShape;
     const mag = try allocator.alloc(f32, try std.math.mul(usize, frames, 257));
     defer allocator.free(mag);
     try fft512.magnitudes(samples, frames, hop_length, window, audio_frontend_recipe.fft(), mag);
-    const mel = try allocator.alloc(f32, try std.math.mul(usize, frames, mel_bins));
-    defer allocator.free(mel);
-    if (filters.len != 257 * mel_bins or out.len != frames * mel_bins or mask.len != frames) return error.InvalidTensorShape;
-    audio.blas.cblas_sgemm(audio.blas.row_major, audio.blas.no_trans, audio.blas.trans, @intCast(frames), @intCast(mel_bins), 257, 1, mag.ptr, 257, filters.ptr, 257, 0, mel.ptr, @intCast(mel_bins));
-    for (mel, out, 0..) |x, *y, i| y.* = if (mask[i / mel_bins]) @log(x + mel_floor) else 0;
+    audio.blas.cblas_sgemm(audio.blas.row_major, audio.blas.no_trans, audio.blas.trans, @intCast(frames), @intCast(mel_bins), 257, 1, mag.ptr, 257, filters.ptr, 257, 0, out.ptr, @intCast(mel_bins));
+    for (mask, 0..) |valid, frame| {
+        const row = out[frame * mel_bins ..][0..mel_bins];
+        if (valid) {
+            for (row) |*value| value.* = @log(value.* + mel_floor);
+        } else @memset(row, 0);
+    }
 }
 
 fn gemma4LogMelFramesReference(
