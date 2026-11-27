@@ -1327,8 +1327,10 @@ Current scoped serving evidence includes Spark Whisper multi-window,
 EmbeddingGemma 2 text and two-clip audio, LightOnOCR, GLiNER2.5, Qwen3,
 and all four official Gemma 4 E4B modalities. Local Metal Gemma 4 image and video improved in the isolated comparison.
 A later mixed-model control passed all four Gemma 4 modalities and DECIDE
-after prefill admission moved earlier. The latest isolated Metal two-clip
-audio control preserves exact outputs and still shows a p95 regression.
+after prefill admission moved earlier. In the latest isolated Metal
+two-clip audio comparison, deferring tuning probes preserved exact
+outputs and reduced candidate p95 to 36.74 ms versus 36.23 ms on the
+frozen baseline. Mixed-model performance qualification remains open.
 Isolated Native text embedding and GLiNER2.5 passed. Native two-clip audio reproduced a same-binary repeatability
 failure with the timing-based FFT/DFT selector. Fixing the arithmetic
 route stabilized outputs across all requests in each of the FFT and DFT
@@ -2138,3 +2140,21 @@ storage still enabled changed the two-clip output at the first
 warmup in every forced arm. The forced route fails exact parity;
 its receipt is
 `fa1de179cd234d41b583d04351276e4c98b72d21ec14d61581da873377ffdd5f`.
+
+Deferring new clipped-linear tuning probes until the Metal provider
+has no active or submitted frame preserved exact output parity and
+reduced the candidate tail in the 48-sample-per-side isolated
+comparison. A/B p50/p95 was 35.41/36.23 ms on the frozen baseline
+and 36.02/36.74 ms on the candidate. A/A p95 was 36.38/36.30 ms
+and B/B p95 was 36.89/36.81 ms. The prepared plan, retained buffer
+scope and previously qualified kernel choices remain available.
+The latest comparison receipt is
+`58620249381e551723dd5a3bfc41a270718de93097de621427e704af7db50866`.
+
+The post-tuning Metal candidate matched all 11 responses against the
+prior Metal admission repair in the original mixed-model request order.
+Both configurations completed every sampled request at the original
+memory limits. This A/B capacity and parity control used two measured
+responses per side per workload. It has insufficient samples to
+qualify mixed-model tail latency. The receipt is
+`bf161bc8e8cdc6f4960c5326f5f92cf4d968d75b46ab26e5fda19d056a614a77`.

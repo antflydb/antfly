@@ -24637,6 +24637,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const runtime = self.provider_impl.raw_decode_runtime;
         var choice = metal_runtime.antfly_metal_clipped_linear_choice(runtime, &p);
         if (audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_FORCE_FUSED_LINEAR")) choice = 1;
+        // The probe submits and waits on its own commands. Keep a pending
+        // trial eligible between frames while the active frame uses the
+        // staged implementation or an already qualified choice.
+        if (choice < 0 and (metal_runtime.hasActiveFrame(runtime) or metal_runtime.hasSubmittedFrame(runtime))) choice = 0;
         if (choice < 0 and self.data.tier_cache == null) return null;
         // The staged route consumes only an already-resident F32 activation.
         // Leave host ingress and extended layouts to the ordinary provider.
@@ -54140,15 +54144,25 @@ test "embeddinggemma2 Metal clipped linear selector reuses geometry across bound
         defer cb.free(input);
         const warm = try cb.linearNoBias(input, weight, 33, 35, 39);
         cb.free(warm);
-        const retained = store.tier_cache.?.backend_bytes;
         var p = ops.ClippedLinearParams{ .rows = 33, .in_dim = 35, .out_dim = 39, .flags = 31, .input_min = -1, .input_max = 1, .output_min = -1, .output_max = 1 };
+        if (request == 2) {
+            try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+            errdefer cb.decoderRuntimeCancelFrame() catch {};
+            const framed = (try cb.clippedLinear(input, weight, p)) orelse return error.ExpectedClippedLinear;
+            defer cb.free(framed);
+            try std.testing.expectEqual(@as(u64, 0), metal_runtime_mod.antfly_metal_audio_linear_tunes(compute.provider_impl.raw_decode_runtime));
+            try cb.decoderRuntimeCancelFrame();
+        }
+        // Framed intermediates can enter the separately charged audio
+        // buffer cache. The probe's scratch must leave no additional charge.
+        const retained_without_audio_cache = store.tier_cache.?.backend_bytes - compute.provider_impl.embeddinggemma2_audio_storage_bytes;
         if (try cb.clippedLinear(input, weight, p)) |out| cb.free(out);
         try std.testing.expectEqual(@as(u64, if (request < 2) 0 else 1), metal_runtime_mod.antfly_metal_audio_linear_tunes(compute.provider_impl.raw_decode_runtime));
         p.input_min = -0.5;
         p.input_max = 0.5;
         if (try cb.clippedLinear(input, weight, p)) |out| cb.free(out);
         try std.testing.expectEqual(@as(u64, if (request < 2) 0 else 1), metal_runtime_mod.antfly_metal_audio_linear_tunes(compute.provider_impl.raw_decode_runtime));
-        try std.testing.expectEqual(retained, store.tier_cache.?.backend_bytes);
+        try std.testing.expectEqual(retained_without_audio_cache, store.tier_cache.?.backend_bytes - compute.provider_impl.embeddinggemma2_audio_storage_bytes);
     }
 }
 
