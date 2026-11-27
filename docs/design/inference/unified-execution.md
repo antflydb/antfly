@@ -1388,6 +1388,15 @@ resident at the start and end.
 | Gemma 4 E4B audio | 217.47/221.51 | 215.84/222.66 |
 | Gemma 4 E4B video | 253.30/256.94 | 252.78/255.20 |
 
+On M4 Max at `da4dea80de`, all ten Metal HTTP workloads matched
+outputs and confirmed Metal selection against the frozen baseline.
+Eight workloads passed the timing gates. Gemma 4 E4B image p50 fell
+from 1085.83 to 737.17 ms and silent video from 1039.62 to 704.76 ms.
+Whisper p50 fell from 488.56 to 371.62 ms. The two-clip EmbeddingGemma 2
+audio p50 rose from 37.40 to 40.73 ms with valid same-binary controls.
+EmbeddingGemma 2 text had unstable timing controls. Both embedding
+cases require isolated repeats.
+
 At `34296ffb5a`, five Native CPU fixtures passed for resident handoff and
 task output custody. The incremental decoder matched host-reference logits
 after the encoder and destination session handles closed, and allocation
