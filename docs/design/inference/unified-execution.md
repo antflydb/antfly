@@ -1304,8 +1304,8 @@ implementation, deletion and qualification gates.
 | Requirement | State | Evidence and remaining gate |
 | --- | --- | --- |
 | Shared liveness and authoritative storage | Partial | Assigned execution and admitted storage share dependency analysis. Metal image and video bind workspaces through the vision region. CUDA grouped audio and the bounded decoder still learn their composite allocation schedules. The compatibility table identifies opaque vendor workspaces with separate accounting. |
-| Stable addresses and CUDA capture | Partial | Released T5-small replayed at prefixes 1, 8, 32 and 64. Released EmbeddingGemma 2 grouped audio captured and replayed using a 38,017,792-byte arena. The context-level projector guard declines unplanned cuBLASLt staging before allocation. Declared ordinary and capture workspace parity remains open for the learned composite routes. |
-| Runtime-owned state and physical policy | Partial | `decoder_storage.zig` owns Gemma 4 replay capacity and `decoder_prefill.zig` owns chunk selection, eager binding and scheduled cancellation. The shared frame owner now controls media view retirement. Residual task-bound state and cache policy need provider-specific verification and migration. |
+| Stable addresses and CUDA capture | Partial | Released T5-small replayed at prefixes 1, 8, 32 and 64. Released EmbeddingGemma 2 grouped audio captured and replayed using a 38,017,792-byte arena. The context-level projector guard declines unplanned cuBLASLt staging before allocation. LightOnOCR-3-4B replayed at 82 rows with exact parity in the 88-page reader-window control. Full-window capture admission and declared ordinary and capture workspace parity remain open. |
+| Runtime-owned state and physical policy | Partial | `decoder_storage.zig` owns Gemma 4 replay capacity and `decoder_prefill.zig` owns chunk selection, eager binding and scheduled cancellation. The shared frame owner controls media view retirement. Metal HTTP acquires and pins the existing per-layer input table before decoder state advances. Residual task-bound state and cache policy need provider-specific verification and migration. |
 | Resident placement | Partial | The released fused T5-small step retired its encoder activations before decoding on CPU, Metal and CUDA. Spark recorded 393,216 device-to-device gather bytes and zero gather downloads. Imported ONNX handoff tests exercise exact output custody and host fallback on all three providers. Other eligible stateful and opaque producer/consumer pairs still need qualification. |
 | Task orchestration | Partial | Media tasks call shared frame and projection retirement owners. Scheduled generation routes publish independent outputs through runtime callbacks. Some hardware-specific paths still choose or own physical transitions in model and task code. |
 | Ownership and deletion | Partial | Nine execution source moves, removal of the 34-line legacy ONNX KV file and 24-line CUDA coverage wrapper, and removal of direct Metal frame-view, projection-slot and vision-workspace wrappers. The remaining compatibility owners retain the deletion gates in the preceding table. |
@@ -1325,10 +1325,11 @@ branch footprint. The ownership rows above identify eliminated code paths.
 
 Current scoped serving evidence includes Spark Whisper multi-window,
 EmbeddingGemma 2 text and two-clip audio, LightOnOCR, GLiNER2.5, Qwen3,
-and all four official Gemma 4 E4B modalities. Local Metal image and video
-improved and the two-clip audio regression passed requalification after
-the completed-frame fix. Isolated Native text embedding and GLiNER2.5
-passed. Native two-clip audio reproduced a same-binary repeatability
+and all four official Gemma 4 E4B modalities. Local Metal Gemma 4 image and video improved in the isolated comparison.
+A later mixed-model control passed all four Gemma 4 modalities and DECIDE
+after prefill admission moved earlier. The latest isolated Metal two-clip
+audio control preserves exact outputs and still shows a p95 regression.
+Isolated Native text embedding and GLiNER2.5 passed. Native two-clip audio reproduced a same-binary repeatability
 failure with the timing-based FFT/DFT selector. Fixing the arithmetic
 route stabilized outputs across all requests in each of the FFT and DFT
 control and comparison arms. The 32-sample-per-side comparison measured
