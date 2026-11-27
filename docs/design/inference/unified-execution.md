@@ -1400,6 +1400,13 @@ one at mixed prefill, and eight at foreground cleanup. The first was
 cleanup label covers several reader paths, so the trace does not
 attribute all eight retirements to one resource.
 
+At `15ce74a806`, after separating the page-budget refund and profiling
+drain from graph retirement, all seven scoped CUDA tests passed. The
+64-page dense control still matched exact outputs and measured 18.39
+pages/s. The first graph learned on 21 rows. Foreground cleanup still
+retired nine graphs during learning and one at the replay phase, all
+after two tokens of progress, so the exact-width gate remained unmet.
+
 This audit reconciles the original `2f2438e67f` implementation review
 against merged main `4951ca13f9` with later evidence. Each serving
 measurement identifies the revision that ran.
