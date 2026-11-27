@@ -21356,7 +21356,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         }
         if (!entry.warmed) {
             const out = try run(context, canonical[0..canonical_count]);
-            if (std.mem.indexOfScalar(CT, canonical[0..canonical_count], out) != null) return error.AudioPlanChanged;
+            if (std.mem.indexOfScalar(CT, canonical[0..canonical_count], out) != null or std.mem.indexOfScalar(CT, inputs, out) != null) return error.AudioPlanChanged;
             entry.warmed = true;
             observation.cudaAudioResult(.warmed);
             return out;
@@ -21377,7 +21377,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
             return err;
         };
         self.execution_scope = null;
-        if (std.mem.indexOfScalar(CT, canonical[0..canonical_count], out) != null) {
+        if (std.mem.indexOfScalar(CT, canonical[0..canonical_count], out) != null or std.mem.indexOfScalar(CT, inputs, out) != null) {
             retireUnusableAudioPlan(entry, plan_cleanup, false);
             return error.AudioPlanChanged;
         }
@@ -21506,13 +21506,22 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
             return null;
         };
         self.execution_scope = null;
-        const result_tensor = tensorFromCt(result);
-        const expected_output = output_bank.ptr;
-        const matches = self.stats.h2d_bytes == h2d_before and self.stats.d2h_bytes == d2h_before and
-            scope.complete() and result_tensor.buffer.ptr == expected_output and audioOutputMatches(first_input, result_tensor, output_bytes);
+        // Callback inputs are borrowed stack views. Even a rejected result
+        // must never reach freeTensor if it aliases one of these handles.
+        const borrowed = std.mem.indexOfScalar(CT, stable[0..inputs.len], result) != null or
+            std.mem.indexOfScalar(CT, inputs, result) != null;
+        const matches = if (borrowed) false else valid: {
+            const result_tensor = tensorFromCt(result);
+            const valid = self.stats.h2d_bytes == h2d_before and self.stats.d2h_bytes == d2h_before and
+                scope.complete() and result_tensor.buffer.ptr == output_bank.ptr and audioOutputMatches(first_input, result_tensor, output_bytes);
+            break :valid valid;
+        };
         if (!matches and capture) graph_mod.discardRecording(&self.ctx);
-        if (scope.owns(result_tensor.buffer.ptr)) result_tensor.owns_buffer = false;
-        freeTensor(self, result);
+        if (!borrowed) {
+            const result_tensor = tensorFromCt(result);
+            if (scope.owns(result_tensor.buffer.ptr)) result_tensor.owns_buffer = false;
+            freeTensor(self, result);
+        }
         if (!matches) {
             entry.disabled = true;
             // The ordinary callback may already have submitted numerical work.
@@ -62914,6 +62923,16 @@ test "public source audio linear recreates input bank through actual learning ca
     const handoff_values = try cb.toFloat32(handoff, std.testing.allocator);
     defer std.testing.allocator.free(handoff_values);
     try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0, 1 }, handoff_values);
+
+    const Borrowed = struct {
+        fn call(_: *anyopaque, inputs: []const CT) !CT {
+            return inputs[0];
+        }
+    };
+    // Holding the captured publication selects assigned eager execution.
+    // A rejected callback must leave the borrowed view and source untouched.
+    try std.testing.expectError(error.AudioPlanChanged, scoped.audioExecution(key, &.{ updated, identity }, &run, Borrowed.call));
+    try std.testing.expect(compute.execution_scope == null and !compute.audio_execution_active);
 
     try compute.embedding_gemma2_execution.clear(compute.allocator, &compute.ctx);
     try std.testing.expectEqual(output_bytes, domain.controller.snapshot().backend_scratch_bytes);
