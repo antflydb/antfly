@@ -57912,7 +57912,7 @@ test "captured graph prefunded nonempty program and learned workspace replay aft
     defer epoch.release();
     const key = [_]u64{ 1, 2, 3 };
     const positions = [_]u32{ 1, 2, 3, 4, 5, 6 };
-    const descriptor = Graph.Descriptor{ .epoch = 1, .key = &key, .positions = &positions, .rows = 2, .hidden = 1024, .vocab = 8, .future_tokens = 16, .attention_layers = 1, .recurrent_layers = 1 };
+    const descriptor = Graph.Descriptor{ .epoch = 1, .key = &key, .positions = &positions, .sequences = &.{ 7, 8 }, .rows = 2, .hidden = 1024, .vocab = 8, .future_tokens = 16, .attention_layers = 1, .recurrent_layers = 1 };
     var storage: Graph.GraphPhase = undefined;
     try storage.initInto(descriptor);
     storage.mode = .storage;
@@ -57986,11 +57986,15 @@ test "captured graph prefunded nonempty program and learned workspace replay aft
     try std.testing.expectEqual(workspace_pointer, compute.cublaslt_workspace_scratch.buffer.ptr);
     try std.testing.expect(compute.run_budget == &budget);
     try std.testing.expectEqualDeep(exact_owned, domain.controller.snapshot());
+    try CudaCompute.invalidateLightOnDecodeGraphMatching(&raw, .{ .boundary = &epoch }, .page_state_cleanup, .{ .sequence = 9 });
+    try CudaCompute.invalidateLightOnDecodeGraphMatching(&raw, .{ .boundary = &epoch }, .state_mutation, .{ .recurrent = 0x7000 });
+    try std.testing.expectEqual(graph_pointer, owner.graph);
     try compute.ctx.launchGraph(owner.graph);
     try compute.ctx.synchronize();
     try owner.arena.copyToHost(&compute.ctx, &actual);
     try std.testing.expectEqualSlices(u8, &sentinel, &actual);
-    try compute.clearCapturedGraphWithCleanup(.{ .boundary = &epoch });
+    try CudaCompute.invalidateLightOnDecodeGraphMatching(&raw, .{ .boundary = &epoch }, .page_state_cleanup, .{ .sequence = 8 });
+    try std.testing.expect(owner.graph == null);
     try roots.unbind(&scoped, &compute);
     compute.configureRunBudget(null);
     _ = try compute.cublaslt_workspace_scratch.buffer.freeChecked(&compute.ctx);
