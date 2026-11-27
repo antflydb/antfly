@@ -3756,9 +3756,9 @@ pub const CudaCompute = struct {
         pub fn projectHead(self: *@This(), cb: *const ops.ComputeBackend, input_ct: CT, weight: CT) !CT {
             const owner = &self.compute.bounded_decode_graph;
             std.debug.assert(cb.ptr == @as(*anyopaque, @ptrCast(self.compute)));
-            if (owner.head.ptr == 0)
+            const destination = (try owner.headDestination()) orelse
                 return cb.linearNoBias(input_ct, weight, owner.rows, owner.hidden, owner.vocab);
-            return cb.observeBackendEntry(.linear_no_bias, &linearNoBiasWithDestination, .{ self.compute, input_ct, weight, owner.rows, owner.hidden, owner.vocab, false, @as(?buffer_mod.DeviceBuffer, owner.head) });
+            return cb.observeBackendEntry(.linear_no_bias, &linearNoBiasWithDestination, .{ self.compute, input_ct, weight, owner.rows, owner.hidden, owner.vocab, false, @as(?buffer_mod.DeviceBuffer, destination) });
         }
         pub fn embedInput(self: *@This(), embedding: CT, ids: []const i64) !void {
             const owner = &self.compute.bounded_decode_graph;
@@ -3790,6 +3790,7 @@ pub const CudaCompute = struct {
         pub fn run(self: *@This(), context: *anyopaque, callback: *const fn (*anyopaque, *@This()) anyerror!void) !void {
             const compute = self.compute;
             const owner = &compute.bounded_decode_graph;
+            _ = try owner.headDestination();
             if (owner.phase == .replay) {
                 try compute.ctx.launchGraph(owner.graph);
                 self.launch_route = .replayed;
@@ -46661,7 +46662,9 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
     owner.rows = 2;
     owner.hidden = 2;
     owner.vocab = 2;
-    const layout = try @import("bounded_decode_graph.zig").StorageLayout.init(2, 2, 2, 1);
+    var layout = try @import("bounded_decode_graph.zig").StorageLayout.init(2, 2, 2, 1);
+    // A compact physical fixture uses the same declared-head contract.
+    layout.head_bytes = backing.len;
     var metadata = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, layout.metadata_bytes);
     defer metadata.free(&compute.ctx);
     owner.storage_layout = layout;

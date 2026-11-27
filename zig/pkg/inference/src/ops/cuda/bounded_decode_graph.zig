@@ -519,6 +519,15 @@ pub const Module = struct {
         return plan_mod.Scope.bind(plan, layout, self.arena.ptr, self.arena.len);
     }
 
+    pub fn headDestination(self: *const Module) !?buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        if (layout.head_bytes == 0) return null;
+        try buffer.validateRegions(2, .{ self.metadata, self.head }, .{ layout.metadata_bytes, layout.head_bytes }, .{ 1, @alignOf(f32) }, 1);
+        var destination = self.head;
+        destination.len = layout.head_bytes;
+        return destination;
+    }
+
     pub fn input(self: *const Module) buffer.DeviceBuffer {
         return self.storage_layout.?.input.bind(self.metadata);
     }
@@ -548,6 +557,16 @@ test "captured sequence storage layout packs narrow and wide readbacks with alig
         try std.testing.expectEqual(value.bytes, actual.metadata_bytes);
         try std.testing.expectEqual(value.head, actual.head_bytes);
         const backing: buffer.DeviceBuffer = .{ .ptr = 0x10000, .len = value.bytes };
+        var owner = Module{ .storage_layout = actual, .metadata = backing };
+        if (value.head == 0) {
+            try std.testing.expect((try owner.headDestination()) == null);
+        } else {
+            try std.testing.expectError(error.InvalidShape, owner.headDestination());
+            owner.head = .{ .ptr = backing.ptr, .len = value.head };
+            try std.testing.expectError(error.InvalidShape, owner.headDestination());
+            owner.head = .{ .ptr = 0x10000000, .len = value.head + 256 };
+            try std.testing.expectEqual(value.head, (try owner.headDestination()).?.len);
+        }
         try std.testing.expectEqual(@as(u64, 0x10000 + value.bank), actual.tokens.bind(backing).ptr);
         try std.testing.expectEqual(value.rows * 2 * @sizeOf(u32), actual.tokens.bytes);
         try std.testing.expectEqual(value.rows * 3 * @sizeOf(u32), actual.positions.bytes);
