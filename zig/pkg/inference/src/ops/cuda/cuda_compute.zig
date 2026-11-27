@@ -22464,7 +22464,10 @@ const SourceLinearTemporary = struct {
             }
             // The operation holds this exact interval without nested scratch
             // allocations. Eager backing need not match the recorded address.
-            const storage = try acquireEager(self, bytes, steady_bytes);
+            const storage = if (self.source_linear_scratch.active)
+                try acquireEager(self, bytes, steady_bytes)
+            else
+                SourceLinearTemporary{ .bank = try allocDeviceBufferOrdinaryWithPolicy(self, bytes, .scoped), .kind = .cached };
             scope.recordScratchInterval(bytes);
             return storage;
         }
@@ -63371,12 +63374,14 @@ test "CUDA direct source convolution binds one declared conversion interval" {
     const Workspace = @import("../../execution/stream_workspace.zig");
     var plan: Workspace.Plan = .{};
     var observing = Workspace.Scope.observe(&plan);
+    const legacy_events = compute.temp_trace_seq;
     const eager = observed: {
         compute.execution_scope = &observing;
         defer compute.execution_scope = null;
         break :observed (try bf16SourceOperationOp(&compute, &request)) orelse return error.TestUnexpectedResult;
     };
     defer cb.free(eager);
+    try std.testing.expectEqual(legacy_events, compute.temp_trace_seq);
     try std.testing.expect(plan.finish(tensorFromCt(eager).buffer.ptr));
     try std.testing.expectEqual(@as(usize, 2), plan.count);
     try std.testing.expectEqual(@as(usize, 3), plan.event_count);
