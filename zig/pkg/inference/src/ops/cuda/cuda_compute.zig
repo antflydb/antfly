@@ -18184,17 +18184,31 @@ test "CUDA greedy graph output lease remains armed for retry and consumes on ten
 
 fn allocDeviceBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
     if (len == 0) return .{};
-    if (self.execution_scope) |scope| {
-        if (scope.isBound()) return .{ .ptr = try scope.allocate(len), .len = len, .borrowed = true };
-        // A composite recipe owns these lifetimes. Keep the ordinary device
-        // cache and mandatory admission, without feeding the legacy trace.
-        var result = try allocDeviceBufferOrdinaryWithPolicy(self, len, .scoped);
-        result.len = len;
-        scope.recordAllocation(len, result.ptr);
-        return result;
-    }
+    if (self.execution_scope) |scope| return allocScopedDeviceBuffer(self, scope, len, .tensor);
     return allocDeviceBufferOrdinary(self, len);
 }
+
+const ScopedBufferRole = enum { tensor, operation_scratch };
+
+fn allocScopedDeviceBuffer(self: *CudaCompute, scope: *@import("../../execution/stream_workspace.zig").Scope, len: usize, comptime role: ScopedBufferRole) !buffer_mod.DeviceBuffer {
+    if (scope.isBound()) return .{
+        .ptr = switch (role) {
+            .tensor => try scope.allocate(len),
+            .operation_scratch => try scope.allocateScratch(len),
+        },
+        .len = len,
+        .borrowed = true,
+    };
+    // The composite owns these lifetimes. Retain ordinary admission and
+    // device cache reuse without feeding the legacy ordinal trace.
+    var result = try allocDeviceBufferOrdinaryWithPolicy(self, len, .scoped);
+    if (role == .tensor) {
+        result.len = len;
+        scope.recordAllocation(len, result.ptr);
+    } else scope.recordScratchInterval(len);
+    return result;
+}
+
 fn allocDeviceBufferOrdinary(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
     return allocDeviceBufferOrdinaryWithPolicy(self, len, .required);
 }
@@ -22500,14 +22514,15 @@ const SourceLinearTemporary = struct {
         if (self.execution_scope) |scope| {
             if (self.source_linear_scratch.in_use) return error.SourceStorageInUse;
             if (scope.isBound()) {
-                return .{ .bank = .{ .ptr = try scope.allocateScratch(bytes), .len = bytes, .borrowed = true }, .kind = .captured };
+                return .{ .bank = try allocScopedDeviceBuffer(self, scope, bytes, .operation_scratch), .kind = .captured };
             }
             // The operation holds this exact interval without nested scratch
             // allocations. Eager backing need not match the recorded address.
-            const storage = if (self.source_linear_scratch.active)
-                try acquireEager(self, bytes, steady_bytes)
-            else
-                SourceLinearTemporary{ .bank = try allocDeviceBufferOrdinaryWithPolicy(self, bytes, .scoped), .kind = .cached };
+            if (!self.source_linear_scratch.active) return .{
+                .bank = try allocScopedDeviceBuffer(self, scope, bytes, .operation_scratch),
+                .kind = .cached,
+            };
+            const storage = try acquireEager(self, bytes, steady_bytes);
             scope.recordScratchInterval(bytes);
             return storage;
         }
@@ -27230,16 +27245,10 @@ const ProjectionArgmaxScratch = struct {
         if (suppressed.len != 0) {
             if (self.execution_scope) |scope| if (scope.isBound()) return error.CudaGraphCaptureUnsafeHostCopy;
         }
-        var bank = if (self.execution_scope) |scope| scoped: {
-            if (scope.isBound()) break :scoped buffer_mod.DeviceBuffer{
-                .ptr = try scope.allocateScratch(layout.bytes),
-                .len = layout.bytes,
-                .borrowed = true,
-            };
-            const backing = try allocDeviceBufferOrdinaryWithPolicy(self, layout.bytes, .scoped);
-            scope.recordScratchInterval(layout.bytes);
-            break :scoped backing;
-        } else try allocDeviceBuffer(self, layout.bytes);
+        var bank = if (self.execution_scope) |scope|
+            try allocScopedDeviceBuffer(self, scope, layout.bytes, .operation_scratch)
+        else
+            try allocDeviceBuffer(self, layout.bytes);
         errdefer releaseDeviceBuffer(self, &bank);
         const scratch = try bind(bank, layout);
         if (suppressed.len != 0) try copyFromHostTracked(self, scratch.suppression, std.mem.sliceAsBytes(suppressed));
