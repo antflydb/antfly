@@ -3506,6 +3506,7 @@ pub const CudaCompute = struct {
         hidden: usize,
         vocab: usize,
         drained: bool = false,
+        metadata_backing: buffer_mod.DeviceBuffer = .{},
         head_scratch: buffer_mod.DeviceBuffer = .{},
 
         pub fn deinit(burst: *@This()) void {
@@ -3514,7 +3515,7 @@ pub const CudaCompute = struct {
             if (!burst.drained) burst.owner.ctx.synchronize() catch {};
             const cb = burst.owner.computeBackend();
             cb.free(burst.bank);
-            releaseDeviceBuffer(burst.owner, &burst.suppress);
+            releaseDeviceBuffer(burst.owner, &burst.metadata_backing);
             releaseDeviceBuffer(burst.owner, &burst.head_scratch);
             burst.* = undefined;
         }
@@ -4338,16 +4339,22 @@ pub const CudaCompute = struct {
         const weight = tensorFromCt(embedding_weight);
         if (weight.dtype != .bf16 or weight.quant_type != null or !isImmutableResidentWeight(self, weight)) return null;
         try ensureCount(weight, try checkedMul(hidden, vocab));
-        var suppression = buffer_mod.DeviceBuffer{};
-        errdefer releaseDeviceBuffer(self, &suppression);
-        if (suppress_ids.len != 0) suppression = try allocDeviceBuffer(self, try checkedMul(suppress_ids.len, @sizeOf(i32)));
-        var device = try allocDeviceBuffer(self, try checkedMul(try checkedMul(rows, steps), @sizeOf(u32)));
-        errdefer releaseDeviceBuffer(self, &device);
+        const token_count = try checkedMul(rows, steps);
+        const token_bytes = try checkedMul(token_count, @sizeOf(u32));
+        const suppression_bytes = try checkedMul(suppress_ids.len, @sizeOf(i32));
+        // Token output and immutable suppression IDs stay live for the same
+        // burst. Give them disjoint views of one admitted allocation.
+        var metadata = try allocDeviceBuffer(self, try checkedAdd(token_bytes, suppression_bytes));
+        errdefer releaseDeviceBuffer(self, &metadata);
+        const tokens = try borrowBufferRange(metadata, 0, token_bytes);
+        const suppression = if (suppression_bytes != 0) try borrowBufferRange(metadata, token_bytes, suppression_bytes) else .{};
         const shape = try allocShape2(self.allocator, steps, rows);
         errdefer self.allocator.free(shape);
         errdefer self.ctx.synchronize() catch {};
-        if (suppress_ids.len != 0) try copyFromHostTracked(self, suppression, std.mem.sliceAsBytes(suppress_ids));
-        return .{ .owner = self, .bank = try createTensorWithDType(self, device, shape, rows * steps, .i32), .embedding_weight = embedding_weight, .suppress = suppression, .suppress_count = suppress_ids.len, .rows = rows, .steps = steps, .hidden = hidden, .vocab = vocab };
+        if (suppression_bytes != 0) try copyFromHostTracked(self, suppression, std.mem.sliceAsBytes(suppress_ids));
+        const bank = try createTensorWithDType(self, tokens, shape, token_count, .i32);
+        tensorFromCt(bank).owns_buffer = false;
+        return .{ .owner = self, .bank = bank, .metadata_backing = metadata, .embedding_weight = embedding_weight, .suppress = suppression, .suppress_count = suppress_ids.len, .rows = rows, .steps = steps, .hidden = hidden, .vocab = vocab };
     }
 
     pub fn lightOnCudaBurstStats(cb: *const ops.ComputeBackend) [5]u64 {
@@ -48216,6 +48223,12 @@ test "LightOnOCR3 CUDA fused head matches dense projection with suppressed ties 
             const ids: []const i32 = if (suppressed) &.{ 2, 17, -1, 300000 } else &.{};
             var burst = (try CudaCompute.beginLightOnTokenBurst(&cb, weight, rows, 2, hidden, vocab, ids)) orelse return error.UnsupportedOperation;
             defer burst.deinit();
+            if (suppressed) {
+                const tokens_view = tensorFromCt(burst.bank).buffer;
+                try std.testing.expectEqual(burst.metadata_backing.ptr, tokens_view.ptr);
+                try std.testing.expectEqual(tokens_view.ptr + tokens_view.len, burst.suppress.ptr);
+                try std.testing.expect(tokens_view.borrowed and burst.suppress.borrowed);
+            }
             compute.lighton_fused_head_disabled = true;
             const before = compute.lighton_head.calls;
             try burst.projectArgmax(input, weight, 0);
