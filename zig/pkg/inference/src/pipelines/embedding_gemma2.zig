@@ -3129,6 +3129,10 @@ pub fn audioRunRequest(backend: @import("../backends/backends.zig").BackendType,
     return .{ .batch = batch, .sequence = 1024, .input_bytes = input_bytes, .pre_admitted_host_bytes = retained_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = if (backend == .metal) 768 * 1024 * 1024 else 512 * 1024 * 1024, .output_bytes = batch * 768 * 4 };
 }
 
+pub fn preparedAudioRunRequest(backend: @import("../backends/backends.zig").BackendType, input_bytes: usize, retained_bytes: usize, batch: usize, sequence: usize) !@import("../backends/session.zig").RunRequest {
+    return preparedRunRequest(backend, input_bytes, retained_bytes, batch, sequence, audioRunRequest(backend, 0, 0, batch).workspace_bytes);
+}
+
 /// Audio-only clips: conformer context stays independent per clip; length-
 /// qualified cohorts share the downstream embedding encoder and final pooling.
 pub fn embedAudios(out: std.mem.Allocator, session: Session, tokenizer: Tokenizer, clips: []const @import("audio_preparation.zig").Clip, options: Options, lock: ?*std.atomic.Mutex, supplied: ?Control, errors: ?[]?anyerror) !AudioBatchResult {
@@ -3240,7 +3244,7 @@ fn consumePreparedAudios(out: std.mem.Allocator, slot: *@import("audio_preparati
     const a = slot.allocator();
     var sequence: usize = 1;
     for (slot.gemma[0..slot.retained]) |*prepared| sequence = @max(sequence, prepared.tokenCount() + 4);
-    const request = try preparedRunRequest(slot.session.backend(), slot.input_bytes, slot.retained_bytes, slot.retained, sequence, if (slot.session.backend() == .metal) 768 * 1024 * 1024 else 512 * 1024 * 1024);
+    const request = try preparedAudioRunRequest(slot.session.backend(), slot.input_bytes, slot.retained_bytes, slot.retained, sequence);
     if (slot.bounded.live > request.host_preprocess_bytes) return error.MemoryBudgetExceeded;
     slot.bounded.limit = request.host_preprocess_bytes;
     var permit = admitWithVisionCacheReclaim(slot.session, request, slot.control) catch |err| blk: {
