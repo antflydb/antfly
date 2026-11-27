@@ -48,13 +48,28 @@ pub const Owner = struct {
         return self.publishLayout(key, input_bytes, output_bytes);
     }
 
-    /// Build the same executable layout from the route's declared allocation
-    /// events before any numerical invocation or CUDA address exists.
-    pub fn declare(self: *Owner, declarations: []const Plan.Declaration, published_slot: u15, key: u64, input_bytes: usize, output_bytes: usize) !void {
+    pub const Declaration = struct {
+        owner: *Owner,
+        events: Plan.Builder,
+        key: u64,
+        input_bytes: usize,
+        output_bytes: usize,
+
+        pub fn finish(self: *Declaration, published_slot: u15) !void {
+            try self.events.finish(published_slot);
+            if (!self.owner.publishLayout(self.key, self.input_bytes, self.output_bytes)) return error.InvalidExecutionPlan;
+        }
+
+        pub fn abort(self: *Declaration) void {
+            std.debug.assert(self.owner.executable == null);
+            self.owner.plan = .{};
+        }
+    };
+
+    /// Describe variable-size stages directly in the admitted owner.
+    pub fn beginDeclaration(self: *Owner, key: u64, input_bytes: usize, output_bytes: usize) !Declaration {
         if (self.executable != null or output_bytes == 0) return error.InvalidExecutionPlan;
-        try self.plan.declare(declarations, published_slot);
-        errdefer self.plan = .{};
-        if (!self.publishLayout(key, input_bytes, output_bytes)) return error.InvalidExecutionPlan;
+        return .{ .owner = self, .events = try self.plan.declarationBuilder(), .key = key, .input_bytes = input_bytes, .output_bytes = output_bytes };
     }
 
     fn publishLayout(self: *Owner, key: u64, input_bytes: usize, output_bytes: usize) bool {
@@ -201,14 +216,21 @@ test "CUDA audio rejects a terminal allocation smaller than the logical output" 
 test "CUDA declared audio workspace matches the observed capture layout" {
     const input_bytes = arena.alignment;
     const output_bytes = 64;
-    const declarations = &[_]Plan.Declaration{
-        .{ .allocate = 256 },
-        .{ .release = 0 },
-        .{ .allocate = output_bytes },
-    };
     var declared: Owner = .{ .allocator = std.testing.allocator };
-    try std.testing.expectError(error.InvalidExecutionPlan, declared.declare(declarations, 1, 13, input_bytes, output_bytes + 1));
-    try declared.declare(declarations, 1, 13, input_bytes, output_bytes);
+    {
+        var builder = try declared.beginDeclaration(13, input_bytes, output_bytes + 1);
+        defer builder.abort();
+        const result = try builder.events.allocate(output_bytes);
+        try std.testing.expectError(error.InvalidExecutionPlan, builder.finish(result));
+    }
+    {
+        var builder = try declared.beginDeclaration(13, input_bytes, output_bytes);
+        errdefer builder.abort();
+        const scratch = try builder.events.allocate(256);
+        try builder.events.release(scratch);
+        const result = try builder.events.allocate(output_bytes);
+        try builder.finish(result);
+    }
     try std.testing.expectEqual(arena.Origin.declared, declared.plan.origin);
 
     var observed: Owner = .{ .allocator = std.testing.allocator };
