@@ -49,7 +49,7 @@ pub const AudioAttentionLayout = struct {
         return .{ .matrix_elements = matrix_elements, .relative_elements = relative_elements, .span_bytes = .{ matrix, matrix, matrix, relative, scale, mask, matrix } };
     }
 
-    fn validate(self: AudioAttentionLayout, q: Buffer, k: Buffer, v: Buffer, rel: Buffer, scales: Buffer, valid: Buffer, out: Buffer) !void {
+    pub fn validate(self: AudioAttentionLayout, q: Buffer, k: Buffer, v: Buffer, rel: Buffer, scales: Buffer, valid: Buffer, out: Buffer) !void {
         try @import("buffer.zig").validateRegions(7, .{ q, k, v, rel, scales, valid, out }, self.span_bytes, @splat(@alignOf(f32)), 6);
     }
 };

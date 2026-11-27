@@ -21362,7 +21362,7 @@ fn gemma4AudioLocalAttentionOp(
         // The existing architecture fallback has authoritative host clip spans
         // and submits each clip independently, without downloading validity.
         if (params.segmented) return null;
-        return try sourceLocalRelativeAttention(self, q, k, v, rel, q_dim_scales, valid, params);
+        return try sourceLocalRelativeAttention(self, q, k, v, rel, q_dim_scales, valid, layout, params);
     }
     const shape = [_]i64{ @intCast(params.rows), @intCast(params.hidden) };
     const out = try self.createEmbeddingGemma2Tensor(&shape, .f32);
@@ -21419,23 +21419,23 @@ test "CUDA audio validity accepts only a vector or contiguous one-column view" {
     try std.testing.expectError(error.InvalidTensorShape, gemma4AudioLocalAttentionOp(&compute, &source, &source, &source, &relative, &scale, &mask, params));
 }
 
-fn sourceLocalRelativeAttention(self: *CudaCompute, q: CT, k: CT, v: CT, rel: CT, scales: CT, valid: CT, params: ops.Gemma4AudioLocalAttentionParams) !CT {
+fn sourceLocalRelativeAttention(self: *CudaCompute, q: CT, k: CT, v: CT, rel: CT, scales: CT, valid: CT, layout: embedding_gemma2_cuda.AudioAttentionLayout, params: ops.Gemma4AudioLocalAttentionParams) !CT {
     const Source = @import("local_relative_source.zig");
     const plan = try Source.Plan.resolve(params.rows, params.heads, params.head_dim, params.chunk, params.context, params.context_left);
     const blas = if (self.bf16_blas) |*value| value else return error.CudaLibrariesUnavailable;
     try blas.requireF32Workspace();
-    const count = params.rows * params.hidden;
     inline for (.{ q, k, v }) |tensor| {
-        if ((try sourceScalarTensor(tensor, count)).dtype != .f32) return error.InvalidShape;
+        if ((try sourceScalarTensor(tensor, layout.matrix_elements)).dtype != .f32) return error.InvalidShape;
     }
-    if ((try sourceScalarTensor(rel, params.context_left * params.hidden)).dtype != .f32 or
+    if ((try sourceScalarTensor(rel, layout.relative_elements)).dtype != .f32 or
         (try sourceScalarTensor(scales, params.head_dim)).dtype != .f32 or
         (try sourceScalarTensor(valid, params.rows)).dtype != .f32) return error.InvalidShape;
     const capture = try SourceLinearTemporary.preflightCapture(self);
     if (capture and self.embedding_gemma2 == null) return error.CudaGraphCaptureUnsafeTempAlloc;
     const module = try self.encoderMultimodalModule();
-    var output = try OwnedF32Output.alloc2(self, params.rows, params.hidden, params.rows * params.hidden);
+    var output = try OwnedF32Output.alloc2(self, params.rows, params.hidden, layout.matrix_elements);
     defer output.deinit();
+    try layout.validate(tensorFromCt(q).buffer, tensorFromCt(k).buffer, tensorFromCt(v).buffer, tensorFromCt(rel).buffer, tensorFromCt(scales).buffer, tensorFromCt(valid).buffer, output.buffer);
     // The same one-bank lifetime joins existing learned/captured audio plans.
     var temporary = try SourceLinearTemporary.acquireKnownCapture(self, plan.bytes, plan.bytes, capture);
     defer temporary.deinit(self);
@@ -62168,9 +62168,9 @@ test "source vision cold geometry preserves legacy phase without actual Lt progr
 test "source local relative attention validates geometry and library before opaque CUDA ownership" {
     var compute = metadataOnlyTestCompute();
     var params = ops.Gemma4AudioLocalAttentionParams{ .arithmetic = .independent_f32, .publication = .bf16_values_f32, .rows = 0, .hidden = 6, .heads = 2, .head_dim = 3, .chunk = 4, .context_left = 3, .context = 6, .k_scale = 1, .logit_cap = 50, .invalid_value = -1e9 };
-    try std.testing.expectError(error.InvalidShape, sourceLocalRelativeAttention(&compute, undefined, undefined, undefined, undefined, undefined, undefined, params));
+    try std.testing.expectError(error.InvalidTensorShape, embedding_gemma2_cuda.AudioAttentionLayout.init(params));
     params.rows = 3;
-    try std.testing.expectError(error.CudaLibrariesUnavailable, sourceLocalRelativeAttention(&compute, undefined, undefined, undefined, undefined, undefined, undefined, params));
+    try std.testing.expectError(error.CudaLibrariesUnavailable, sourceLocalRelativeAttention(&compute, undefined, undefined, undefined, undefined, undefined, undefined, try embedding_gemma2_cuda.AudioAttentionLayout.init(params), params));
 }
 
 test "source local relative temporary follows the actual learned and captured bank lifetime" {
@@ -62241,7 +62241,7 @@ test "source local relative actual external capture rejects before module or out
     const params = ops.Gemma4AudioLocalAttentionParams{ .arithmetic = .independent_f32, .publication = .bf16_values_f32, .rows = 3, .hidden = 6, .heads = 2, .head_dim = 3, .chunk = 4, .context_left = 3, .context = 6, .k_scale = 1, .logit_cap = 50, .invalid_value = -1e9 };
     // Allocator, module cache and kernels stay poisoned. Reaching any of them
     // before rejecting externally active capture is a test failure.
-    try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, sourceLocalRelativeAttention(&compute, &tensor, &tensor, &tensor, &tensor, &scalar, &scalar, params));
+    try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, sourceLocalRelativeAttention(&compute, &tensor, &tensor, &tensor, &tensor, &scalar, &scalar, try embedding_gemma2_cuda.AudioAttentionLayout.init(params), params));
     try std.testing.expectEqual(@as(usize, 1), Fake.queries);
     try std.testing.expectEqual(@as(u64, 0), compute.stats.device_alloc_calls);
     // The shared preflight must use the same real driver query.
@@ -62264,7 +62264,7 @@ test "source local relative actual external capture rejects before module or out
     compute.execution_scope = &scope;
     compute.source_linear_scratch = .{};
     compute.embedding_gemma2 = null;
-    try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, sourceLocalRelativeAttention(&compute, &tensor, &tensor, &tensor, &tensor, &scalar, &scalar, params));
+    try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, sourceLocalRelativeAttention(&compute, &tensor, &tensor, &tensor, &tensor, &scalar, &scalar, try embedding_gemma2_cuda.AudioAttentionLayout.init(params), params));
     try std.testing.expectEqual(@as(usize, 5), Fake.queries);
     const capture = try SourceLinearTemporary.preflightCapture(&compute);
     try std.testing.expect(capture);
@@ -62277,7 +62277,7 @@ test "source local relative actual external capture rejects before module or out
     // Invalid public geometry must still fail without even querying the driver.
     var invalid = params;
     invalid.rows = 0;
-    try std.testing.expectError(error.InvalidShape, sourceLocalRelativeAttention(&compute, undefined, undefined, undefined, undefined, undefined, undefined, invalid));
+    try std.testing.expectError(error.InvalidTensorShape, embedding_gemma2_cuda.AudioAttentionLayout.init(invalid));
     try std.testing.expectEqual(@as(usize, 6), Fake.queries);
 }
 
