@@ -954,7 +954,7 @@ pub const Executor = struct {
             }
             var kv_words: [193]u64 = undefined;
             const kv_count = (try C.lightOnGraphKvWords(self.context.cb, storage, items[0].state.sequence_id.?, max_future, physical_tokens, attention_layers[0..attention_count], &kv_words)) orelse
-                return decline(decline_code, .context_or_page_capacity);
+                return decline(decline_code, .unbacked_kv_pages);
             for (kv_words[0..kv_count]) |word| try key.add(word);
             return .{ .max_future = max_future, .attention_count = attention_count };
         }
@@ -1036,7 +1036,7 @@ pub const Executor = struct {
             platform.sync.lockYielding(kv_lock);
             kv_held = true;
             var verified_key = CapturedGraphRecipe.Key{ .words = key.words, .verification_len = key.len };
-            const verified = (try CapturedGraphRecipe.build(self, &verified_key, claimed, items, manager, storage, &embedding_out, &head_out, false, &decline_code)) orelse return self.declineLightOnGraph(.admission_or_revalidation);
+            const verified = (try CapturedGraphRecipe.build(self, &verified_key, claimed, items, manager, storage, &embedding_out, &head_out, false, &decline_code)) orelse return self.declineLightOnGraph(decline_code);
             const current_positions = first_context.mrope_positions orelse return self.declineLightOnGraph(.admission_or_revalidation);
             if (verified.max_future != max_future or verified.attention_count != attention_count or (!verified_key.same or verified_key.len != key.len) or !std.mem.eql(u32, position_snapshot[0..positions.len], current_positions)) return self.declineLightOnGraph(.admission_or_revalidation);
         }

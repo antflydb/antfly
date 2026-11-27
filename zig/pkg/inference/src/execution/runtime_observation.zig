@@ -528,6 +528,7 @@ pub const CudaDecoderDeclines = struct {
     missing_kv_binding: u64 = 0,
     unsupported_lane_state: u64 = 0,
     context_or_page_capacity: u64 = 0,
+    unbacked_kv_pages: u64 = 0,
     unstable_weight_or_workspace: u64 = 0,
     incompatible_layer_state: u64 = 0,
     unstable_recurrent_state: u64 = 0,
