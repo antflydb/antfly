@@ -1327,6 +1327,12 @@ matched direct greedy tokens. Direct arm medians ranged from 9.88 to
 largest costs concentrated in the early fused arm. The comparison does
 not establish a consistent CUDA throughput improvement.
 
+At `f8277f474e`, the focused Metal and CPU run passed three checks with
+zero skips. At `c7ce931bae`, Spark passed all 39 selected CUDA checks.
+The physical Metal and CUDA fixtures each consumed 65 cache columns
+in two copy packets under the same completion boundary and verified
+the combined cache and logits against their expected values.
+
 ### Issue closure audit
 
 This audit reconciles the original `2f2438e67f` implementation review
