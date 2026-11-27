@@ -1622,12 +1622,16 @@ fn audioSourceChannelRms(
 ) !CT {
     if (cfg.source_scalar_storage != .bf16 or segments.len == 0)
         return audioSourceRms(cb, cfg, input, weight, rows, width, .channel_major, rows);
-    var total: usize = 0;
-    for (segments) |length| {
-        if (length == 0) return error.InvalidTensorShape;
-        total = try std.math.add(usize, total, length);
-    }
-    if (total != rows) return error.InvalidTensorShape;
+    audio_schedule.GroupedRows.validatePartition(segments, rows) catch return error.InvalidTensorShape;
+    if (try cb.tryBf16SourceOperation(&.{ .rms_norm = .{
+        .input = input,
+        .weight = weight,
+        .rows = rows,
+        .width = width,
+        .epsilon = cfg.layer_norm_eps,
+        .reference_layout = .channel_major,
+        .segments = segments,
+    } })) |output| return output;
     const output = (try cb.allocUninitF32Shape(&.{ @intCast(rows), @intCast(width) })) orelse return error.SourceArithmeticUnavailable;
     errdefer cb.free(output);
     var offset: usize = 0;

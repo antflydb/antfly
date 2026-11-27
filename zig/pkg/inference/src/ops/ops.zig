@@ -185,6 +185,8 @@ pub const Bf16SourceOperation = union(enum) {
         /// Original [batch,time,channels] time extent; channel-major reduction
         /// vectorization depends on this stride, not the flattened row count.
         reference_rows_per_batch: usize = 0,
+        /// Unequal channel-major clips partition the rows in source order.
+        segments: []const usize = &.{},
     },
     channel_layer_norm_relu: struct {
         input: CT,

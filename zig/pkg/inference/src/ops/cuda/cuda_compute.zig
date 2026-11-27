@@ -22819,24 +22819,44 @@ fn bf16SourceOperationOp(ctx: *anyopaque, request: *const ops.Bf16SourceOperatio
                 64, 256, 512, 768, 1024, 1536 => {},
                 else => return error.UnsupportedSourceArithmeticGeometry,
             }
-            const channel_plan = if (value.reference_layout == .channel_major and reference_rows != 1)
-                try kernels_mod.ChannelSourceRmsPlan.resolve(value.rows, reference_rows, value.width, self.ctx.info.multiprocessor_count, self.source_reduction_threads_per_sm)
-            else
-                null;
-            var operands = try SourceF32Operands(2).plan(self, .{ input, weight }, .{ false, false }, if (channel_plan) |plan| plan.partial_bytes else 0);
+            const GroupedRows = @import("../../execution/audio_schedule.zig").GroupedRows;
+            const whole = [_]usize{value.rows};
+            const segments = if (value.segments.len == 0) &whole else value.segments;
+            if (value.segments.len != 0) {
+                if (value.reference_layout != .channel_major or value.reference_rows_per_batch != 0) return error.InvalidShape;
+                GroupedRows.validatePartition(segments, value.rows) catch return error.InvalidShape;
+            }
+            var channel_plans: [GroupedRows.max_clips]?kernels_mod.ChannelSourceRmsPlan = undefined;
+            const plans = channel_plans[0..segments.len];
+            var partial_bytes: usize = 0;
+            for (segments, plans) |rows, *plan| {
+                const reference = if (value.segments.len == 0) reference_rows else rows;
+                plan.* = if (value.reference_layout == .channel_major and reference != 1)
+                    try kernels_mod.ChannelSourceRmsPlan.resolve(rows, reference, value.width, self.ctx.info.multiprocessor_count, self.source_reduction_threads_per_sm)
+                else
+                    null;
+                if (plan.*) |channel| partial_bytes = @max(partial_bytes, channel.partial_bytes);
+            }
+            var operands = try SourceF32Operands(2).plan(self, .{ input, weight }, .{ false, false }, partial_bytes);
             var output = try OwnedF32Output.alloc(self, input.shape, count);
             defer output.deinit();
             defer operands.deinit(self);
             try operands.bind(self);
             const values, const gamma = operands.buffers;
-            if (value.reference_layout == .contiguous or reference_rows == 1) {
-                try (try self.encoderMultimodalModule()).launchSourceRmsNormBf16ValuesF32(&self.ctx, output.buffer, values, if (weight != null) gamma else null, @intCast(value.rows), @intCast(value.width), value.epsilon);
-                self.stats.source_rms_contiguous_calls += 1;
-            } else {
-                const plan = channel_plan.?;
-                const partial = if (operands.temporary) |temporary| temporary.span(operands.layout.extra) else buffer_mod.DeviceBuffer{};
-                try self.kernels.launchSourceChannelRms(&self.ctx, output.buffer, values, gamma, partial, plan, value.epsilon);
-                self.stats.source_rms_channel_calls += 1;
+            const partial = if (operands.temporary) |temporary| temporary.span(operands.layout.extra) else buffer_mod.DeviceBuffer{};
+            var offset: usize = 0;
+            const row_bytes = value.width * @sizeOf(f32);
+            for (segments, plans) |rows, plan| {
+                const source = try values.borrowRange(offset, rows * row_bytes);
+                const destination = try output.buffer.borrowRange(offset, rows * row_bytes);
+                if (plan) |channel| {
+                    try self.kernels.launchSourceChannelRms(&self.ctx, destination, source, gamma, partial, channel, value.epsilon);
+                    self.stats.source_rms_channel_calls += 1;
+                } else {
+                    try (try self.encoderMultimodalModule()).launchSourceRmsNormBf16ValuesF32(&self.ctx, destination, source, if (weight != null) gamma else null, @intCast(rows), @intCast(value.width), value.epsilon);
+                    self.stats.source_rms_contiguous_calls += 1;
+                }
+                offset += rows * row_bytes;
             }
             break :result output.intoTensor();
         },
@@ -63617,6 +63637,70 @@ test "CUDA single-CTA source channel RMS needs no conversion or partial scratch"
     const actual = try cb.toFloat32(out, a);
     defer a.free(actual);
     for (actual) |value| try std.testing.expectEqual(@as(f32, 1), value);
+}
+
+test "CUDA grouped channel RMS publishes unequal source clips without copies" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.testing.init(a);
+    defer compute.deinit();
+    compute.bf16_blas = try @import("libraries.zig").Cublas.initWithLibrary(compute.ctx.stream, null);
+    compute.embedding_gemma2_policy.matmul_arithmetic = .bf16_reduced;
+    compute.source_reduction_threads_per_sm = try sourceReductionThreadsPerSm(&compute.ctx);
+    const cb = compute.computeBackend();
+    const Workspace = @import("../../execution/stream_workspace.zig");
+    const width = 1024;
+    const clips = [_]usize{ 1, 2, 13 };
+    const rows = 16;
+    var samples: [rows * width]f32 = undefined;
+    for (&samples, 0..) |*sample, index| {
+        const centered = @as(i32, @intCast((index * 17 + index / width) % 61)) - 30;
+        sample.* = @as(f32, @floatFromInt(centered)) / 32;
+    }
+    const input = try cb.fromFloat32Shape(&samples, &.{ rows, width });
+    defer cb.free(input);
+    var request: ops.Bf16SourceOperation = .{ .rms_norm = .{
+        .input = input,
+        .weight = null,
+        .rows = rows,
+        .width = width,
+        .epsilon = 1e-5,
+        .reference_layout = .channel_major,
+        .segments = &.{ 1, 14 },
+    } };
+    const copied_before = compute.stats.d2d_bytes;
+    const allocated_before = compute.stats.device_alloc_calls;
+    try std.testing.expectError(error.InvalidShape, bf16SourceOperationOp(&compute, &request));
+    try std.testing.expectEqual(allocated_before, compute.stats.device_alloc_calls);
+    request.rms_norm.segments = &clips;
+    var plan: Workspace.Plan = .{};
+    var observing = Workspace.Scope.observe(&plan);
+    const grouped = observed: {
+        compute.execution_scope = &observing;
+        defer compute.execution_scope = null;
+        break :observed (try bf16SourceOperationOp(&compute, &request)) orelse return error.TestUnexpectedResult;
+    };
+    defer cb.free(grouped);
+    try std.testing.expect(plan.finish(tensorFromCt(grouped).buffer.ptr));
+    try std.testing.expect(plan.declared_operation_scratch_intervals <= 1);
+    try std.testing.expectEqual(copied_before, compute.stats.d2d_bytes);
+    const actual = try cb.toFloat32(grouped, a);
+    defer a.free(actual);
+    var offset: usize = 0;
+    for (clips) |length| {
+        const view = try cb.sliceRows2D(a, input, offset, length, width);
+        defer cb.free(view);
+        request.rms_norm.input = view;
+        request.rms_norm.rows = length;
+        request.rms_norm.segments = &.{};
+        request.rms_norm.reference_rows_per_batch = length;
+        const single = (try bf16SourceOperationOp(&compute, &request)) orelse return error.TestUnexpectedResult;
+        defer cb.free(single);
+        const expected = try cb.toFloat32(single, a);
+        defer a.free(expected);
+        try std.testing.expectEqualSlices(f32, expected, actual[offset * width ..][0 .. length * width]);
+        offset += length;
+    }
 }
 
 test "CUDA source audio cold metadata requires retained convolution without probing SDK" {
