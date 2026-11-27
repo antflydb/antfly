@@ -289,6 +289,7 @@ _FUNCTIONS: list[tuple[str, list[object], object]] = [
     ("antfly_db_run_until_idle", [_VOID_P], _ERR),
     ("antfly_db_run_until_idle_json", [_VOID_P, _BUF_P], _ERR),
     ("antfly_db_pending_work_stats_json", [_VOID_P, _BUF_P], _ERR),
+    ("antfly_db_artifact_origin_counts_json", [_VOID_P, AntflySlice, ctypes.c_uint32, _BUF_P], _ERR),
     ("antfly_db_close", [_VOID_P], None),
     ("antfly_buffer_free", [_BUF_P], None),
     (

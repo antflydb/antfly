@@ -372,6 +372,22 @@ rows prepared in the write) and is stored with the identity the sparse
 producer records for that chunk text at its revision; unseeded chunks are
 embedded.
 
+### Migration progress
+
+`DB.artifactOriginCountsJson` (C: `antfly_db_artifact_origin_counts_json`;
+Go `ArtifactOriginCountsJSON`, Python `artifact_origin_counts`, TypeScript
+`artifactOriginCounts`, Rust `artifact_origin_counts_json`) counts each
+enrichment's outputs by origin over one page of documents: `seeded` (accepted
+from seeds for their current input), `generated`, `external` (externally
+maintained assets and authored vectors) and `pending` (absent and waiting for
+a seed through `on_missing: pending`). Callers page with `next` and sum; the
+counts are exact for each page rather than maintained counters that replays
+and deletes could skew. Vectors carry their origin in the artifact header and
+seeded chunks have acceptance records; a seeded asset records the digest of
+the asset state it was accepted for, so it counts as seeded only while that
+state stands and as generated once regenerated. Downstream indexing progress
+is the index status, as before.
+
 ### Raft: leader seed preparation
 
 On a Raft table the leader accepts a write's explicit seeds before proposing
@@ -446,9 +462,8 @@ subsystem features of their own:
   document extraction pipeline processes whole documents and has no page
   selection to merge with seeded units.
 - Chunk inventories beyond the 4,095-chunk atomic-mutation ceiling through
-  staged publication (`docs/design/media-pass.md`), and migration progress
-  counters (imported, generated, rejected, pending) beside per-write outcomes.
-- Readiness counters for `pending` outputs, and downstream consumers of
-  externally maintained assets.
+  staged publication (`docs/design/media-pass.md`); origin counts on the
+  distributed server's HTTP status (embedded and Lite have them).
+- Downstream consumers of externally maintained assets.
 - The serverless coordinator rejects seed paths until serverless publication
   accepts seeds; its fixed pipelines have no named enrichments to seed.

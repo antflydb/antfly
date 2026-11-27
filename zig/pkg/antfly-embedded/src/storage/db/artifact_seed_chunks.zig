@@ -172,6 +172,28 @@ test "seeded extraction bindings name their exact source" {
 }
 
 const unit_magic = "antfly-seeded-unit-chunks-v1\x00";
+const asset_record_name_prefix = "\x00seeded-asset\x00";
+
+/// Origin marker of a seeded asset: the digest of the asset state it was
+/// accepted for. The asset counts as seeded only while its state still
+/// matches; a later regeneration replaces the state and so the origin.
+pub fn assetKeyAlloc(alloc: Allocator, doc_key: []const u8, asset_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try internal_keys.appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, internal_keys.asset_state_kind);
+    const name = try std.mem.concat(alloc, u8, &.{ asset_record_name_prefix, asset_name });
+    defer alloc.free(name);
+    try internal_keys.appendEncodedComponent(&list, alloc, name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn assetStateDigest(state_value: []const u8) [32]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(state_value, &digest, .{});
+    return digest;
+}
+
 const unit_record_name_prefix = "\x00seeded-unit-chunks\x00";
 
 /// Record of the accepted unit-scoped chunks of one extraction consumer.

@@ -569,6 +569,19 @@ impl Database {
         self.read_buffer(|h, out| unsafe { sys::antfly_db_pending_work_stats_json(h, out) })
     }
 
+    /// Per-enrichment output counts by origin (seeded, generated, external,
+    /// pending) over at most `limit` documents from `from_key`; page with the
+    /// response's `next` key until it is null.
+    pub fn artifact_origin_counts_json(
+        &self,
+        from_key: impl AsRef<[u8]>,
+        limit: u32,
+    ) -> Result<Vec<u8>> {
+        self.with_input_output(from_key.as_ref(), |h, input, out| unsafe {
+            sys::antfly_db_artifact_origin_counts_json(h, input, limit, out)
+        })
+    }
+
     pub fn indexes_json(&self) -> Result<Vec<u8>> {
         self.read_buffer(|h, out| unsafe { sys::antfly_db_list_indexes_json(h, out) })
     }

@@ -900,6 +900,15 @@ func (db *DB) PendingWorkStatsJSON() ([]byte, error) {
 	})
 }
 
+// ArtifactOriginCountsJSON returns per-enrichment output counts by origin
+// (seeded, generated, external, pending) over at most limit documents from
+// fromKey; page with the response's "next" key until it is null.
+func (db *DB) ArtifactOriginCountsJSON(fromKey string, limit uint32) ([]byte, error) {
+	return db.withStringInputOutput(fromKey, func(handle unsafe.Pointer, input C.antfly_slice, out *C.antfly_buffer) C.antfly_error_code {
+		return C.antfly_db_artifact_origin_counts_json((*C.antfly_db)(handle), input, C.uint32_t(limit), out)
+	})
+}
+
 // IndexesJSON returns configured indexes as JSON.
 func (db *DB) IndexesJSON() ([]byte, error) {
 	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {

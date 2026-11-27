@@ -6182,6 +6182,29 @@ pub fn antfly_db_pending_work_stats_json(
     return .ok;
 }
 
+/// Migration progress (#1791): per-enrichment output counts by origin over
+/// one page of documents from `from_key` (`DB.artifactOriginCountsJson`).
+pub fn antfly_db_artifact_origin_counts_json(
+    handle_ptr: ?*anyopaque,
+    from_key: capi.Slice,
+    limit: u32,
+    out_buf_ptr: ?*capi.Buffer,
+) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_db_artifact_origin_counts_json), .{ .name = "antfly_db_artifact_origin_counts_json" }), .{ handle_ptr, from_key, limit, out_buf_ptr });
+    capi.clearLastError();
+    const out_buf = resetOutBuffer(out_buf_ptr) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return capi.ensureError(code, @src().fn_name);
+    }
+    defer guard.leave();
+    const json = guard.handle.database().*.artifactOriginCountsJson(std.heap.c_allocator, from_key.bytes(), limit) catch |err| return capi.mapErrorContext(err, @src().fn_name);
+    out_buf.* = .{ .ptr = json.ptr, .len = json.len };
+    return .ok;
+}
+
 pub fn antflyDbExtractEnrichmentsJson(
     handle_ptr: ?*anyopaque,
     request_json: capi.Slice,
@@ -11944,6 +11967,7 @@ comptime {
         "antfly_db_run_until_idle",
         "antfly_db_run_until_idle_json",
         "antfly_db_pending_work_stats_json",
+        "antfly_db_artifact_origin_counts_json",
         "antfly_db_update_range",
         "antfly_db_get_range_json",
         "antfly_db_get_split_state_json",

@@ -686,6 +686,12 @@ unsafe extern "C" {
         db: *mut antfly_db,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
+    pub fn antfly_db_artifact_origin_counts_json(
+        db: *mut antfly_db,
+        from_key: antfly_slice,
+        limit: u32,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
     pub fn antfly_db_replay_generated_enrichments_json(
         db: *mut antfly_db,
         out: *mut antfly_buffer,

@@ -8524,6 +8524,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try appendInlineFullTextDocument(alloc, documents, key, value, request.consumer_indexes);
             try appendPrecomputedArtifactCoverageOutcomes(db, alloc, coverage_outcomes, request, .produced);
             try appendPreparedArtifactCopy(alloc, artifact_writes, state_key, state_value);
+            if (decision.outcome == .accepted or decision.outcome == .replaced) {
+                const seed_records = @import("artifact_seed_chunks.zig");
+                const marker_key = try seed_records.assetKeyAlloc(alloc, request.doc_key, artifact_name);
+                defer alloc.free(marker_key);
+                const marker = seed_records.assetStateDigest(state_value);
+                try appendPreparedArtifactCopy(alloc, artifact_writes, marker_key, &marker);
+            }
             try appendSeededLocalPublicationReceipt(alloc, db, artifact_writes, request, key, if (S.ownerField(db, "core").*.index_manager.artifactFeedsGraph(artifact_name)) doc_value else text, value);
             return decision;
         }

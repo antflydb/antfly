@@ -548,6 +548,12 @@ antfly_error_code antfly_db_set_schema_json(antfly_db *db, antfly_slice schema_j
 antfly_error_code antfly_db_run_until_idle(antfly_db *db);
 antfly_error_code antfly_db_run_until_idle_json(antfly_db *db, antfly_buffer *out);
 antfly_error_code antfly_db_pending_work_stats_json(antfly_db *db, antfly_buffer *out);
+/* Migration progress for artifact seeding: per-enrichment output counts by
+ * origin (seeded, generated, external, pending) over one page of at most
+ * `limit` documents starting at `from_key` (inclusive). The response is
+ * {"documents":n,"next":key|null,"enrichments":[{name,kind,seeded,generated,
+ * external,pending}]}; page with `next` until it is null and sum. */
+antfly_error_code antfly_db_artifact_origin_counts_json(antfly_db *db, antfly_slice from_key, uint32_t limit, antfly_buffer *out);
 antfly_error_code antfly_db_replay_generated_enrichments_json(antfly_db *db, antfly_buffer *out);
 antfly_error_code antfly_db_list_indexes_json(antfly_db *db, antfly_buffer *out);
 /** Render a durable resolver's key without writes. Mention JSON: {"text","label"}.

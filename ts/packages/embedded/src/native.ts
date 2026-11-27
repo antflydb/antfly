@@ -624,6 +624,12 @@ function buildNative(): NativeLibrary {
       PAntflyDb,
       PAntflyBufferOut,
     ]),
+    dbArtifactOriginCountsJson: f("antfly_db_artifact_origin_counts_json", "uint32_t", [
+      PAntflyDb,
+      AntflySlice,
+      "uint32_t",
+      PAntflyBufferOut,
+    ]),
 
     dbBatch: f("antfly_db_batch", "uint32_t", [
       PAntflyDb,

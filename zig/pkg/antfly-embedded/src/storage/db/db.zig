@@ -8676,6 +8676,102 @@ pub const DB = struct {
         return capture.json;
     }
 
+    /// Migration progress (#1791): per-enrichment output counts by origin over
+    /// one page of documents, starting at `from_key` (inclusive). Counts are
+    /// exact for the page; callers page with `next` until it is null and sum.
+    /// `seeded` outputs were accepted from seeds for their current input,
+    /// `generated` ones were produced, `external` ones are externally
+    /// maintained or authored vectors, and `pending` outputs wait for a seed
+    /// (`on_missing: pending`). Returns
+    /// `{"documents":n,"next":key|null,"enrichments":[{name,kind,seeded,generated,external,pending}]}`.
+    pub fn artifactOriginCountsJson(self: *DB, alloc: Allocator, from_key: []const u8, limit: u32) ![]u8 {
+        const enrichment_catalog = @import("catalog/enrichment_catalog.zig");
+        const seed_records = @import("artifact_seed_chunks.zig");
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const Count = struct {
+            name: []const u8,
+            kind: []const u8,
+            external_asset: bool,
+            mapping: []const u8,
+            seeded: u64 = 0,
+            generated: u64 = 0,
+            external: u64 = 0,
+            pending: u64 = 0,
+        };
+        var counts = std.ArrayListUnmanaged(Count).empty;
+        {
+            self.core.index_manager.catalog_mutex.lockShared();
+            defer self.core.index_manager.catalog_mutex.unlockShared();
+            for (self.core.index_manager.enrichments.items) |entry| {
+                const kind: []const u8 = switch (entry.kind) {
+                    .asset => "asset",
+                    .chunk => "chunk",
+                    .embedding => "embedding",
+                };
+                try counts.append(a, .{ .name = try a.dupe(u8, entry.name), .kind = kind, .external_asset = enrichment_catalog.externallyMaintained(entry), .mapping = try a.dupe(u8, entry.seed_json) });
+            }
+        }
+        const page_limit = @max(limit, 1);
+        var page = try self.scan(a, from_key, "", .{ .limit = page_limit + 1, .include_documents = true });
+        defer page.deinit(a);
+        const documents = page.documents[0..@min(page.documents.len, page_limit)];
+        const next: ?[]const u8 = if (page.documents.len > page_limit) page.documents[page_limit].id else null;
+        for (documents) |document| {
+            var txn = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+            defer txn.abort();
+            // Chunk collections present for this document, by name.
+            var chunk_names = std.StringHashMapUnmanaged(void).empty;
+            {
+                var chunks = try @import("artifact_chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).open(a, &txn, document.id);
+                defer chunks.close();
+                while (try chunks.next()) |entry| {
+                    const name = (try internal_keys.artifactNameAlloc(a, entry.key)) orelse continue;
+                    try chunk_names.put(a, name, {});
+                }
+            }
+            for (counts.items) |*count| {
+                const Origin = enum { seeded, generated, external };
+                const origin: ?Origin = origin: {
+                    if (std.mem.eql(u8, count.kind, "asset")) {
+                        const key = try internal_keys.artifactNamedPrefixAlloc(a, document.id, "asset", count.name);
+                        _ = txn.get(key) catch |err| if (err == error.NotFound) break :origin null else return err;
+                        if (count.external_asset) break :origin .external;
+                        const extraction = try seed_records.extractionKeyAlloc(a, document.id, count.name);
+                        if (txn.get(extraction)) |_| break :origin .seeded else |err| if (err != error.NotFound) return err;
+                        const marker_key = try seed_records.assetKeyAlloc(a, document.id, count.name);
+                        const marker = txn.get(marker_key) catch |err| if (err == error.NotFound) break :origin .generated else return err;
+                        const state_key = try assetStateKeyAlloc(a, document.id, count.name);
+                        const state = txn.get(state_key) catch |err| if (err == error.NotFound) break :origin .generated else return err;
+                        break :origin if (std.mem.eql(u8, marker, &seed_records.assetStateDigest(state))) .seeded else .generated;
+                    }
+                    if (std.mem.eql(u8, count.kind, "chunk")) {
+                        if (!chunk_names.contains(count.name)) break :origin null;
+                        for ([_][]const u8{ try seed_records.keyAlloc(a, document.id, count.name), try seed_records.unitKeyAlloc(a, document.id, count.name) }) |record| {
+                            if (txn.get(record)) |_| break :origin .seeded else |err| if (err != error.NotFound) return err;
+                        }
+                        break :origin .generated;
+                    }
+                    const prefix = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, document.id, count.name);
+                    const rows = try self.core.store.scanPrefix(a, prefix);
+                    if (rows.len == 0) break :origin null;
+                    const header = enrichment_artifact_codec.decodeHeaderPrefix(rows[0].value) catch break :origin .generated;
+                    break :origin if (header.flags.authored) .external else if (header.flags.seeded) .seeded else .generated;
+                };
+                if (origin) |found| switch (found) {
+                    .seeded => count.seeded += 1,
+                    .generated => count.generated += 1,
+                    .external => count.external += 1,
+                } else if (try @import("artifact_seeds.zig").pendingMappingUnsatisfied(a, count.mapping, document.json)) count.pending += 1;
+            }
+        }
+        const Entry = struct { name: []const u8, kind: []const u8, seeded: u64, generated: u64, external: u64, pending: u64 };
+        const entries = try a.alloc(Entry, counts.items.len);
+        for (counts.items, entries) |count, *entry| entry.* = .{ .name = count.name, .kind = count.kind, .seeded = count.seeded, .generated = count.generated, .external = count.external, .pending = count.pending };
+        return try std.json.Stringify.valueAlloc(alloc, .{ .documents = documents.len, .next = next, .enrichments = entries }, .{});
+    }
+
     /// `planArtifactSeeds` for the `{inserts, transforms}` subset of a public
     /// batch (`artifact_seed_plan.zig`), as routed through private lookups.
     pub fn planArtifactSeedsJson(self: *DB, alloc: Allocator, plan_json: []const u8) ![]u8 {
@@ -108787,6 +108883,58 @@ test "db artifact seeds ride a direct enrichment packet" {
     try db.batch(prepared);
     try expectSeededDenseVector(alloc, &db, "doc:a", "same source", &.{ 1, 2, 3 });
     try std.testing.expectEqual(@as(usize, 1), counting.calls);
+}
+
+test "db artifact origin counts report seeded, generated, external and pending outputs" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var fake = TestAssetProducer{};
+    var counting = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a", .asset_producer = fake.producer(), .dense_embedder = counting.interface() } });
+    defer db.close();
+    try addSeededDenseTestIndex(&db);
+    try db.addEnrichment(.{
+        .name = "summary_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+        .seed_json = "{\"field\":\"legacy_summary\",\"format\":\"text\",\"on_missing\":\"pending\"}",
+    });
+    try db.addEnrichment(.{ .name = "notes", .kind = .asset, .content_type = "text/plain" });
+    try db.batch(.{
+        .writes = &.{
+            // Seeded vector and summary, external note.
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha\",\"legacy_summary\":\"a\",\"_artifacts\":{\"body_dense_v1\":{\"value\":[1,2,3]},\"notes\":{\"value\":\"n\"}}}" },
+            // Generated vector; summary waits for its seed.
+            .{ .key = "doc:b", .value = "{\"body\":\"beta\"}" },
+            // Generated vector; summary seeded through its mapping.
+            .{ .key = "doc:c", .value = "{\"body\":\"gamma\",\"legacy_summary\":\"c\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+
+    // Paged: two documents, then the rest.
+    const first = try db.artifactOriginCountsJson(alloc, "", 2);
+    defer alloc.free(first);
+    try std.testing.expect(std.mem.indexOf(u8, first, "\"documents\":2,\"next\":\"doc:c\"") != null);
+    const all = try db.artifactOriginCountsJson(alloc, "", 10);
+    defer alloc.free(all);
+    for ([_][]const u8{
+        "{\"name\":\"body_dense_v1\",\"kind\":\"embedding\",\"seeded\":1,\"generated\":2,\"external\":0,\"pending\":0}",
+        "{\"name\":\"summary_v1\",\"kind\":\"asset\",\"seeded\":2,\"generated\":0,\"external\":0,\"pending\":1}",
+        "{\"name\":\"notes\",\"kind\":\"asset\",\"seeded\":0,\"generated\":0,\"external\":1,\"pending\":0}",
+    }) |expected| {
+        if (std.mem.indexOf(u8, all, expected) == null) {
+            std.debug.print("counts {s} lack {s}\n", .{ all, expected });
+            return error.TestUnexpectedResult;
+        }
+    }
+    try std.testing.expect(std.mem.indexOf(u8, all, "\"documents\":3,\"next\":null") != null);
 }
 
 fn documentVersionForTest(alloc: Allocator, db: *DB, key: []const u8) !u64 {

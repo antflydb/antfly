@@ -112,6 +112,23 @@ function buildOpenOptionsStruct(native: NativeLibrary, opts: OpenOptions): Nativ
   return options;
 }
 
+/** Output counts of one enrichment by origin (`artifactOriginCounts`). */
+export interface ArtifactOriginCount {
+  name: string;
+  kind: "asset" | "chunk" | "embedding";
+  seeded: number;
+  generated: number;
+  external: number;
+  pending: number;
+}
+
+/** One page of `artifactOriginCounts`. */
+export interface ArtifactOriginCounts {
+  documents: number;
+  next: string | null;
+  enrichments: ArtifactOriginCount[];
+}
+
 function keySlice(key: string | Uint8Array): SliceArg {
   return typeof key === "string" ? stringSlice(key) : sliceOf(toRawBytes(key));
 }
@@ -366,6 +383,14 @@ export class Database implements AsyncDisposable {
   }
   async pendingWorkStats(): Promise<PendingWorkStatus> {
     return parseJson(await this.pendingWorkStatsRaw()) as PendingWorkStatus;
+  }
+  /**
+   * Per-enrichment output counts by origin (seeded, generated, external,
+   * pending) over at most `limit` documents from `fromKey`. Page with the
+   * response's `next` key until it is null and sum the counts.
+   */
+  async artifactOriginCounts(fromKey: string | Uint8Array = "", limit = 1000): Promise<ArtifactOriginCounts> {
+    return parseJson(await this.#invokeBuffer(this.#native.dbArtifactOriginCountsJson, keySlice(fromKey), limit)) as ArtifactOriginCounts;
   }
 
   /** Drains pending enrichment and index work; returns no result (see runUntilIdleStatus for the post-drain report). */

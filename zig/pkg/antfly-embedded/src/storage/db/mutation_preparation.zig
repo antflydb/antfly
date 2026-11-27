@@ -1196,6 +1196,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     try metadata.put(a, try seed_records.keyAlloc(a, producer.doc_key, name), {});
                     try metadata.put(a, try seed_records.unitKeyAlloc(a, producer.doc_key, name), {});
                     try metadata.put(a, try seed_records.extractionKeyAlloc(a, producer.doc_key, name), {});
+                    try metadata.put(a, try seed_records.assetKeyAlloc(a, producer.doc_key, name), {});
                 }
                 if (producer.kind != .asset) continue;
                 if (children.get(name)) |list| for (list.items) |child| {

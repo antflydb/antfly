@@ -386,6 +386,16 @@ class Database:
     def pending_work_stats(self, *, raw: bool = False) -> Any:
         return self._json_read(self._lib.antfly_db_pending_work_stats_json, raw=raw)
 
+    def artifact_origin_counts(self, from_key: str = "", limit: int = 1000, *, raw: bool = False) -> Any:
+        """Per-enrichment output counts by origin (seeded, generated, external,
+        pending) over at most ``limit`` documents from ``from_key``. Page with
+        the response's ``next`` key until it is None and sum the counts."""
+        fn = self._lib.antfly_db_artifact_origin_counts_json
+        data = self._with_input_output(
+            lambda handle, sl, out: fn(handle, sl, ctypes.c_uint32(limit), out), encode_text(from_key)
+        )
+        return decode_json_response(data, raw)
+
     def run_until_idle(self) -> None:
         """Drain pending enrichment and index work."""
         handle = self._acquire()
