@@ -28,7 +28,6 @@ const hf_weights = @import("gemma4_hf_weights.zig");
 const embedding_gemma2_resample = @import("embedding_gemma2_resample.zig");
 const logmel_plan = @import("audio_logmel_plan.zig");
 const fft512 = @import("audio_fft512.zig");
-const spectrum_policy = @import("audio_spectrum_policy.zig");
 const gemma4_mel_sparse = @import("gemma4_mel_sparse.zig");
 const tensor_store_mod = @import("../models/tensor_store.zig");
 const weight_source_mod = @import("../models/weight_source.zig");
@@ -3159,11 +3158,9 @@ fn gemma4LogMelFrames(
     use_blas: bool,
 ) !void {
     if (use_blas and audio.blas_available and frames > 0 and frames <= std.math.maxInt(c_int) and frame_length == 320 and fft_length == 512 and mel_bins == 128 and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_AUDIO_DFT")) {
-        const ticket = spectrum_policy.cpu.choose(frames);
-        const started = platform.time.monotonicNs();
-        if (ticket.fft) try gemma4LogMelFramesFft(allocator, samples, frames, hop_length, frame_length, fft_length, window, filters, mel_bins, mel_floor, mask, out) else try gemma4LogMelFramesReference(allocator, samples, frames, hop_length, frame_length, fft_length, window, filters, mel_bins, mel_floor, mask, out, true);
-        spectrum_policy.cpu.completed(ticket, platform.time.monotonicNs() - started);
-        return;
+        // Fix the arithmetic route for this geometry. A timing-based switch
+        // changes rounded log-mel values for otherwise identical requests.
+        return gemma4LogMelFramesFft(allocator, samples, frames, hop_length, window, filters, mel_bins, mel_floor, mask, out);
     }
     return gemma4LogMelFramesReference(allocator, samples, frames, hop_length, frame_length, fft_length, window, filters, mel_bins, mel_floor, mask, out, use_blas);
 }
@@ -3172,8 +3169,6 @@ fn gemma4LogMelFramesFft(
     samples: []const f32,
     frames: usize,
     hop_length: usize,
-    frame_length: usize,
-    fft_length: usize,
     window: []const f32,
     filters: []const f32,
     mel_bins: usize,
@@ -3181,8 +3176,6 @@ fn gemma4LogMelFramesFft(
     mask: []const bool,
     out: []f32,
 ) !void {
-    _ = frame_length;
-    _ = fft_length;
     const mag = try allocator.alloc(f32, try std.math.mul(usize, frames, 257));
     defer allocator.free(mag);
     try fft512.magnitudes(samples, frames, hop_length, window, audio_frontend_recipe.fft(), mag);
@@ -3312,7 +3305,7 @@ test "gemma4 blas log-mel matches the fft log-mel" {
     const via_fft = try allocator.alloc(f32, frames * mel_bins);
     defer allocator.free(via_fft);
     try gemma4LogMelFrames(allocator, samples, frames, hop_length, frame_length, fft_length, window, filters, mel_bins, 1e-3, mask, via_blas, true);
-    try gemma4LogMelFrames(allocator, samples, frames, hop_length, frame_length, fft_length, window, filters, mel_bins, 1e-3, mask, via_fft, false);
+    try gemma4LogMelFramesReference(allocator, samples, frames, hop_length, frame_length, fft_length, window, filters, mel_bins, 1e-3, mask, via_fft, false);
     for (via_blas, via_fft, 0..) |a, b, i| {
         if (i / mel_bins == 3) {
             try std.testing.expectEqual(@as(f32, 0.0), a);
@@ -10369,7 +10362,7 @@ fn measureSpectrum(cb: ComputeBackend, _: ComputeBackend) !void {
             var elapsed: u64 = 0;
             for (0..8) |iteration| {
                 const started = platform.time.monotonicNs();
-                if (route == 0) try gemma4LogMelFramesReference(a, samples, frames, 160, 320, 512, &window, filters, 128, 1e-3, mask, host, true) else try gemma4LogMelFramesFft(a, samples, frames, 160, 320, 512, &window, filters, 128, 1e-3, mask, host);
+                if (route == 0) try gemma4LogMelFramesReference(a, samples, frames, 160, 320, 512, &window, filters, 128, 1e-3, mask, host, true) else try gemma4LogMelFramesFft(a, samples, frames, 160, &window, filters, 128, 1e-3, mask, host);
                 if (iteration >= 3) elapsed += platform.time.monotonicNs() - started;
             }
             std.debug.print("spectrum_cpu frames={} fft={} completed_ns={}\n", .{ frames, route == 1, elapsed / 5 });

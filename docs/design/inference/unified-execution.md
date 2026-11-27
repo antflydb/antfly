@@ -1322,8 +1322,15 @@ EmbeddingGemma 2 text and two-clip audio, LightOnOCR, GLiNER2.5, Qwen3,
 and all four official Gemma 4 E4B modalities. Local Metal image and video
 improved and the two-clip audio regression passed requalification after
 the completed-frame fix. Isolated Native text embedding and GLiNER2.5
-passed. Native two-clip audio still has a candidate-only exact repeat
-failure even though matching request ordinals passed across revisions.
+passed. Native two-clip audio reproduced a same-binary repeatability
+failure with the timing-based FFT/DFT selector. Fixing the arithmetic
+route stabilized outputs across all requests in each of the FFT and DFT
+control and comparison arms. The 32-sample-per-side comparison measured
+224.28/227.19 ms for DFT and 223.67/227.30 ms for FFT (median/p95).
+The largest coordinate difference between routes was 2.98e-7 across
+the two 768-component vectors. The fixed FFT route passed the independent
+log-mel reference test. This comparison used one candidate server with
+the DFT override for the reference.
 Final closure requires the remaining tier-one coverage, including DECIDE
 on the remaining supported targets, Inkling 2 Mini, and the E2B comparative
 deficits above, as well as normal PR review and CI. L4 and A100 remain user-deferred.
