@@ -3486,8 +3486,7 @@ pub const CudaCompute = struct {
         hidden: usize,
         vocab: usize,
         drained: bool = false,
-        head_partial: buffer_mod.DeviceBuffer = .{},
-        head_indices: buffer_mod.DeviceBuffer = .{},
+        head_scratch: buffer_mod.DeviceBuffer = .{},
 
         pub fn deinit(burst: *@This()) void {
             // Cancellation and encoding failures must retain the token bank
@@ -3496,8 +3495,7 @@ pub const CudaCompute = struct {
             const cb = burst.owner.computeBackend();
             cb.free(burst.bank);
             releaseDeviceBuffer(burst.owner, &burst.suppress);
-            releaseDeviceBuffer(burst.owner, &burst.head_partial);
-            releaseDeviceBuffer(burst.owner, &burst.head_indices);
+            releaseDeviceBuffer(burst.owner, &burst.head_scratch);
             burst.* = undefined;
         }
         pub fn projectArgmax(burst: *@This(), hidden: CT, head: CT, step: usize) !void {
@@ -3515,27 +3513,21 @@ pub const CudaCompute = struct {
                 try ensureF32(input);
                 try ensureCount(input, try checkedMul(burst.rows, burst.hidden));
                 try ensureCount(weight, try checkedMul(burst.hidden, burst.vocab));
-                const bytes = try checkedMul(try checkedMul(burst.rows, fused.tiles), 4);
-                // Ordinary admitted temporary allocations, retained only for
-                // this burst. Allocation pressure takes the dense fallback.
-                if (burst.head_partial.ptr == 0) burst.head_partial = allocDeviceBuffer(self, bytes) catch .{};
-                if (burst.head_partial.ptr != 0 and burst.head_indices.ptr == 0)
-                    burst.head_indices = allocDeviceBuffer(self, bytes) catch .{};
-                if (burst.head_partial.ptr != 0 and burst.head_indices.ptr != 0) {
+                const layout = try fused.Scratch.forRows(burst.rows);
+                // Both planes stay live through the finish kernel. Use one
+                // admitted range and retain it through the whole burst.
+                if (burst.head_scratch.ptr == 0) burst.head_scratch = allocDeviceBuffer(self, layout.bytes) catch .{};
+                if (burst.head_scratch.ptr != 0) {
+                    const scratch = try layout.bind(burst.head_scratch);
                     const bank = tensorFromCt(burst.bank).buffer;
                     const output_bytes = burst.rows * @sizeOf(u32);
-                    const request = fused.Request{ .input = input.buffer, .weight = weight.buffer, .partial = burst.head_partial, .indices = burst.head_indices, .suppress = burst.suppress, .output = .{ .ptr = bank.ptr + step * output_bytes, .len = output_bytes }, .rows = burst.rows, .suppress_count = burst.suppress_count };
+                    const request = fused.Request{ .input = input.buffer, .weight = weight.buffer, .partial = scratch.partial, .indices = scratch.indices, .suppress = burst.suppress, .output = .{ .ptr = bank.ptr + step * output_bytes, .len = output_bytes }, .rows = burst.rows, .suppress_count = burst.suppress_count };
                     try fused.validate(request);
                     burst.drained = false;
                     try self.lighton_head.run(&self.ctx, request);
                     self.stats.launch_argmax += 1;
                     return;
                 }
-                // No fused launch has consumed these buffers if allocation
-                // was declined. Let the ordinary cache reclaim them before
-                // the dense fallback needs its larger logits allocation.
-                releaseDeviceBuffer(self, &burst.head_partial);
-                releaseDeviceBuffer(self, &burst.head_indices);
             }
             const logits = try cb.linearNoBias(hidden, head, burst.rows, burst.hidden, burst.vocab);
             defer cb.free(logits);
