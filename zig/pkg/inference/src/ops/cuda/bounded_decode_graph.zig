@@ -326,6 +326,7 @@ const ColdPhase = struct {
 pub const GraphPhase = struct {
     descriptor: Descriptor,
     storage_layout: StorageLayout = undefined,
+    vendor_workspace: buffer.DeviceBuffer = .{},
     attention_scratch: ?DecodeScratch = null,
     mode: enum { none, storage, arena } = .none,
     expected_compute: usize = 0,
@@ -413,7 +414,7 @@ pub const GraphPhase = struct {
             if (storage.head_bytes < 8 * row_bytes or storage.head_bytes % row_bytes != 0) return false;
             storage.head_bytes = expected.head_bytes;
         }
-        return std.meta.eql(storage, expected) and std.meta.eql(owner.attention_scratch, self.attention_scratch);
+        return std.meta.eql(storage, expected) and std.meta.eql(owner.attention_scratch, self.attention_scratch) and std.meta.eql(owner.vendor_workspace, self.vendor_workspace);
     }
 
     /// Only the optional packet bank changes. Input, token and attention spans
@@ -536,6 +537,7 @@ pub const Module = struct {
     key: []u64 = &.{},
     plan: ?*plan_mod.Plan = null,
     phase: Phase = .warm,
+    vendor_workspace: buffer.DeviceBuffer = .{},
     metadata: buffer.DeviceBuffer = .{},
     arena: buffer.DeviceBuffer = .{},
     admitted_arena_layout: ?plan_mod.Layout = null,
@@ -612,6 +614,7 @@ pub const Module = struct {
         self.captured_roots_identity = 0;
         self.storage_layout = null;
         self.attention_scratch = null;
+        self.vendor_workspace = .{};
         self.bound_recurrent_scratch_bytes = 0;
         self.rows = 0;
         self.hidden = 0;
@@ -712,6 +715,7 @@ pub const Module = struct {
         self.attention_layers = descriptor.attention_layers;
         self.recurrent_layers = descriptor.recurrent_layers;
         self.attention_scratch = phase.attention_scratch;
+        self.vendor_workspace = phase.vendor_workspace;
         self.expected_attention_calls = dispatch.attention;
         self.expected_ragged_packets = dispatch.ragged_recurrent;
     }

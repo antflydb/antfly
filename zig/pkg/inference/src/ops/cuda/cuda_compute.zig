@@ -3709,17 +3709,19 @@ pub const CudaCompute = struct {
         }
         return tensor.buffer.ptr;
     }
-    pub fn peekLightOnGraphWorkspacePointer(cb: *const ops.ComputeBackend) ?driver_mod.CUdeviceptr {
-        if (!acceptsPhysicalImplementation(cb.vtable)) return null;
-        const self: *const CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    fn currentGraphVendorWorkspace(self: *const CudaCompute) ?buffer_mod.DeviceBuffer {
         const bytes = self.runtime_policy.workspace_bytes;
-        if (bytes == 0) return 0;
-        if (self.cublaslt_workspace_scratch.buffer.ptr == 0 or self.cublaslt_workspace_scratch.buffer.len < bytes) return null;
-        return self.cublaslt_workspace_scratch.buffer.ptr;
+        if (bytes == 0) return .{};
+        const backing = self.cublaslt_workspace_scratch.buffer;
+        _ = buffer_mod.validateRegion(backing, bytes, buffer_mod.DeviceBuffer.allocation_alignment) catch return null;
+        return backing.borrowRange(0, bytes) catch null;
     }
-    pub fn lightOnGraphWorkspacePointer(cb: *const ops.ComputeBackend) driver_mod.CUdeviceptr {
+
+    pub fn lightOnGraphVendorWorkspace(cb: *const ops.ComputeBackend, reserve: bool) ?buffer_mod.DeviceBuffer {
+        if (!acceptsPhysicalImplementation(cb.vtable)) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
-        return cublasLtWorkspace(self).ptr;
+        if (reserve) _ = cublasLtWorkspace(self);
+        return self.currentGraphVendorWorkspace();
     }
     pub fn lightOnGraphStateOwned(cb: *const ops.ComputeBackend, state: *const @import("gated_delta.zig").State) bool {
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
@@ -4250,6 +4252,7 @@ pub const CudaCompute = struct {
             phase.declareProjectionStaging() catch |err| switch (err) {
                 error.InvalidShape, error.Overflow => return .unsupported,
             };
+        phase.vendor_workspace = self.currentGraphVendorWorkspace() orelse return .unsupported;
         const owner = &self.bounded_decode_graph;
         if (!owner.mutex.tryLock()) return error.ReaderEpochBackendBusy;
         defer owner.mutex.unlock();
@@ -4298,6 +4301,8 @@ pub const CudaCompute = struct {
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (current.outside_execution or current.boundary == null or try current.boundary.?.isSealed()) return error.MissingCurrentCleanupEpoch;
         if (self.execution_scope != null or try self.ctx.streamCaptureActive()) return error.ReaderEpochBackendBusy;
+        const vendor = self.currentGraphVendorWorkspace() orelse return error.PreparedCachePlanChanged;
+        if (!std.meta.eql(vendor, phase.vendor_workspace)) return error.PreparedCachePlanChanged;
         if (!sameCacheAdmission(self.ctx.video_cache_budget.admission, phase.admission)) return error.PreparedCachePlanChanged;
         const owner = &self.bounded_decode_graph;
         if (!owner.mutex.tryLock()) return error.ReaderEpochBackendBusy;
@@ -4325,6 +4330,8 @@ pub const CudaCompute = struct {
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (rows > @import("gated_delta.zig").max_packet_rows and !self.lighton_ragged_recurrent_enabled) return null;
         if (self.execution_scope != null or try self.ctx.streamCaptureActive()) return null;
+        const vendor = self.currentGraphVendorWorkspace() orelse return error.PreparedCachePlanChanged;
+        if (!std.meta.eql(vendor, graph_phase.vendor_workspace)) return error.PreparedCachePlanChanged;
         const descriptor = graph_phase.descriptor;
         if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or !std.meta.eql(descriptor.attention_geometry, expected.attention_geometry) or !std.meta.eql(descriptor.recurrent_heads, expected.recurrent_heads) or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or descriptor.ffn_intermediate != expected.ffn_intermediate or !std.meta.eql(descriptor.head_storage, expected.head_storage) or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions) or !std.mem.eql(u64, descriptor.sequences, expected.sequences)) return error.PreparedCachePlanChanged;
         const owner = &self.bounded_decode_graph;
@@ -15835,9 +15842,24 @@ fn cublasLtF32WorkspaceBytes(self: *const CudaCompute) usize {
 }
 
 fn cublasLtWorkspace(self: *CudaCompute) buffer_mod.DeviceBuffer {
+    if (self.bounded_decode_graph.active) return self.bounded_decode_graph.vendor_workspace;
     const bytes = self.runtime_policy.workspace_bytes;
     if (bytes == 0) return .{};
     return self.cublaslt_workspace_scratch.acquire(&self.ctx, bytes) catch .{};
+}
+
+test "bounded CUDA vendor workspace consumes only the admitted session span" {
+    var compute = metadataOnlyTestCompute();
+    compute.runtime_policy.workspace_bytes = 4096;
+    try std.testing.expect(compute.currentGraphVendorWorkspace() == null);
+    compute.cublaslt_workspace_scratch.buffer = .{ .ptr = 0x10000, .len = 8192 };
+    const admitted = compute.currentGraphVendorWorkspace().?;
+    try std.testing.expectEqual(@as(usize, 4096), admitted.len);
+    try std.testing.expect(admitted.borrowed);
+    compute.bounded_decode_graph.vendor_workspace = admitted;
+    compute.bounded_decode_graph.active = true;
+    compute.cublaslt_workspace_scratch.buffer = .{};
+    try std.testing.expectEqualDeep(admitted, cublasLtWorkspace(&compute));
 }
 
 const EncoderOperations = struct {

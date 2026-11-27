@@ -58139,7 +58139,7 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
                     const arena = compute.bounded_decode_graph.arena.ptr;
                     const metadata = compute.bounded_decode_graph.metadata.ptr;
                     const plan = compute.bounded_decode_graph.plan;
-                    const workspace = C.peekLightOnGraphWorkspacePointer(cb) orelse return error.MissingActualGraphWorkspace;
+                    const workspace = C.lightOnGraphVendorWorkspace(cb, false) orelse return error.MissingActualGraphWorkspace;
                     probe.phase = .peer;
                     probe.row = null;
                     var peer_pool = try model.native_reader_stream.joinBoundedMatching(factory.control, 4, 8, &factory, Context.create, Context.destroy, Context.compatible);
@@ -58159,7 +58159,7 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
                     try std.testing.expectEqual(arena, compute.bounded_decode_graph.arena.ptr);
                     try std.testing.expectEqual(metadata, compute.bounded_decode_graph.metadata.ptr);
                     try std.testing.expectEqual(plan, compute.bounded_decode_graph.plan);
-                    try std.testing.expectEqual(workspace, C.peekLightOnGraphWorkspacePointer(cb).?);
+                    try std.testing.expectEqualDeep(workspace, C.lightOnGraphVendorWorkspace(cb, false).?);
                     replay_before_peer = compute.bounded_decode_graph.replays;
                     if (resident_text_prefix) std.debug.print("UNIFIED_READER_MIXED_PEER count={d} remaining={d} replay_before_peer={d}\n", .{ count, tokens_per_page - count, replay_before_peer });
                     result.peer_replay = true;

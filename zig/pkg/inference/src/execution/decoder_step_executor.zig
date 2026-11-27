@@ -875,7 +875,9 @@ pub const Executor = struct {
             try key.add(self.context.gpt_config.vocab_size);
             try key.add(embedding_pointer);
             try key.add(head_pointer);
-            try key.add(if (reserve) C.lightOnGraphWorkspacePointer(self.context.cb) else C.peekLightOnGraphWorkspacePointer(self.context.cb) orelse return decline(decline_code, .unstable_weight_or_workspace));
+            const vendor_workspace = C.lightOnGraphVendorWorkspace(self.context.cb, reserve) orelse return decline(decline_code, .unstable_weight_or_workspace);
+            try key.add(vendor_workspace.ptr);
+            try key.add(vendor_workspace.len);
             var attention_layers: [128]usize = undefined;
             var attention_count: usize = 0;
             const first_cache = &items[0].state.qwen35_linear_cache.?;
