@@ -16235,7 +16235,7 @@ pub const SeedOutcome = struct {
     key: []const u8,
     /// Enrichment name. Absent for items rejected as a whole.
     name: ?[]const u8 = null,
-    /// - `accepted`: the seed becomes the output. - `unchanged`: identical output is already accepted for this input. - `conflict`: different output is already accepted (kept). - `replaced`: different output is replaced by the seed. - `deleted`: a `null` seed drops the accepted output. - `missing`: no seed was supplied; the producer will run. - `rejected`: the write would fail with `error`.
+    /// - `accepted`: the seed becomes the output. - `unchanged`: identical output is already accepted for this input. - `conflict`: different output is already accepted (kept). - `replaced`: different output is replaced by the seed. - `deleted`: a `null` seed drops the accepted output. - `missing`: no seed was supplied; the producer will run. - `pending`: no seed was supplied and the field mapping waits for one (`on_missing: pending`); nothing generates it. - `rejected`: the write would fail with `error`.
     outcome: []const u8,
     existing_origin: ?[]const u8 = null,
     /// Where the seed came from: an explicit `_artifacts`/`_chunks` seed in the write, which wins, or the enrichment's field mapping. Absent for `missing` and `rejected`.

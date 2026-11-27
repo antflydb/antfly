@@ -29,7 +29,11 @@ T = TypeVar("T", bound="EnrichmentConfig")
 @_attrs_define
 class EnrichmentConfig:
     """Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target
-    source rows or previously generated artifact streams.
+    source rows or previously generated artifact streams. An asset enrichment with no producer and no input (no field,
+    template or source artifact) is maintained outside Antfly: only artifact seeds write it (`_artifacts.<name>` or its
+    `seed` field mapping). Its seeds bind to no input, so they are accepted unconditionally, a differing value always
+    replaces the stored one, a seed-only transform needs no `expected_version`, and source rewrites keep it. Reads
+    report it with `origin: external`. No producer, chunk collection or full-text projection may consume it yet.
 
         Attributes:
             name (str): Stable generated artifact name.

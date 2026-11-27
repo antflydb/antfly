@@ -6502,7 +6502,7 @@ components:
           description: Enrichment name. Absent for items rejected as a whole.
         outcome:
           type: string
-          enum: [accepted, unchanged, conflict, replaced, deleted, missing, rejected]
+          enum: [accepted, unchanged, conflict, replaced, deleted, missing, pending, rejected]
           description: |
             - `accepted`: the seed becomes the output.
             - `unchanged`: identical output is already accepted for this input.
@@ -6510,10 +6510,12 @@ components:
             - `replaced`: different output is replaced by the seed.
             - `deleted`: a `null` seed drops the accepted output.
             - `missing`: no seed was supplied; the producer will run.
+            - `pending`: no seed was supplied and the field mapping waits for
+              one (`on_missing: pending`); nothing generates it.
             - `rejected`: the write would fail with `error`.
         existing_origin:
           type: string
-          enum: [generated, seeded]
+          enum: [generated, seeded, external]
         via:
           type: string
           enum: [explicit, mapping]

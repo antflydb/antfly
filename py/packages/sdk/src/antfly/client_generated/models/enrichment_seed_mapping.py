@@ -32,7 +32,10 @@ class EnrichmentSeedMapping:
                  Default: EnrichmentSeedMappingFormat.AUTO.
             on_missing (EnrichmentSeedMappingOnMissing | Unset): When the field is absent: `generate` runs the producer as
                 usual;
-                `fail` rejects the write (`ArtifactSeedMissing`).
+                `fail` rejects the write (`ArtifactSeedMissing`); `pending` runs no
+                producer, now or on later edits and replays, and the output stays
+                absent (reported `pending`) until a write supplies a seed,
+                explicitly or through this field.
                  Default: EnrichmentSeedMappingOnMissing.GENERATE.
     """
 

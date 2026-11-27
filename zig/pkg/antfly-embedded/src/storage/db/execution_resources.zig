@@ -2324,13 +2324,16 @@ pub const PreparedEnrichments = struct {
     mode: Mode = .direct,
     /// Per-item seed outcomes, reported to the proposing caller.
     seeds: []const @import("artifact_seeds.zig").OutcomeEntry = &.{},
+    /// Documents written only by seed-only transforms: replicas keep their
+    /// primary row and version (`artifact_seeds.seedOnlyDocumentsAlloc`).
+    seed_only_documents: []const []const u8 = &.{},
 
     pub const Mode = enum { direct, seeds };
 
     /// `direct` packets keep their original encoding (older decoders reject
     /// unknown members).
     pub fn nativeJsonSkipField(self: PreparedEnrichments, name: []const u8) bool {
-        return self.mode == .direct and (std.mem.eql(u8, name, "mode") or std.mem.eql(u8, name, "seeds"));
+        return self.mode == .direct and (std.mem.eql(u8, name, "mode") or std.mem.eql(u8, name, "seeds") or std.mem.eql(u8, name, "seed_only_documents"));
     }
 
     pub fn requestDigest(a: Allocator, req: types.BatchRequest) ![32]u8 {

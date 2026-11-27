@@ -21,6 +21,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("mutation_values.zig");
+const TransactionVersionPredicate = @import("types.zig").TransactionVersionPredicate;
 
 pub const max_plan_documents: usize = 1024;
 
@@ -28,6 +29,8 @@ pub const Request = struct {
     arena: std.heap.ArenaAllocator,
     writes: []types.BatchWrite = &.{},
     transforms: []types.DocumentTransform = &.{},
+    /// Lowered `expected_version` of each transform that names one.
+    predicates: []TransactionVersionPredicate = &.{},
 
     pub fn deinit(self: *Request) void {
         self.arena.deinit();
@@ -67,8 +70,19 @@ pub fn parse(alloc: Allocator, json: []const u8) !Request {
     if (root.object.get("transforms")) |transforms| if (transforms != .null) {
         if (transforms != .array or transforms.array.items.len > max_plan_documents) return error.InvalidArgument;
         const parsed = try a.alloc(types.DocumentTransform, transforms.array.items.len);
+        var predicates = std.ArrayListUnmanaged(TransactionVersionPredicate).empty;
         for (transforms.array.items, parsed) |item, *transform| {
             if (item != .object) return error.InvalidArgument;
+            if (item.object.get("expected_version")) |raw| if (raw != .null) {
+                const version: u64 = switch (raw) {
+                    .number_string, .string => |text| std.fmt.parseUnsigned(u64, text, 10) catch return error.InvalidArgument,
+                    else => return error.InvalidArgument,
+                };
+                if (version == 0) return error.InvalidArgument;
+                const target = item.object.get("key") orelse return error.InvalidArgument;
+                if (target != .string) return error.InvalidArgument;
+                try predicates.append(a, .{ .key = target.string, .expected_version = version });
+            };
             const key = item.object.get("key") orelse return error.InvalidArgument;
             const operations = item.object.get("operations") orelse return error.InvalidArgument;
             if (key != .string or operations != .array) return error.InvalidArgument;
@@ -92,6 +106,7 @@ pub fn parse(alloc: Allocator, json: []const u8) !Request {
             transform.* = .{ .key = key.string, .operations = ops, .upsert = upsert };
         }
         out.transforms = parsed;
+        out.predicates = predicates.items;
     };
     return out;
 }

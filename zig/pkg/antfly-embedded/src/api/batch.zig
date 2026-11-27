@@ -459,14 +459,9 @@ fn parseExpectedVersions(alloc: std.mem.Allocator, value: std.json.Value) ![]Exp
             out.appendAssumeCapacity(.{ .key = try alloc.dupe(u8, key), .version = version });
             continue;
         };
-        const operations = item.object.get("operations").?.array.items;
-        if (operations.len == 0) continue;
-        const seed_only = for (operations) |operation| {
-            const path = operation.object.get("path").?.string;
-            const normalized = if (std.mem.startsWith(u8, path, "$.")) path[2..] else path;
-            if (!std.mem.startsWith(u8, normalized, "_artifacts.") and !std.mem.startsWith(u8, normalized, "_chunks.") and !std.mem.eql(u8, normalized, "_seed_conflict")) break false;
-        } else true;
-        if (seed_only) return error.ArtifactSeedSourceBindingRequired;
+        // A seed-only transform without one is rejected by the database
+        // (`artifact_seeds.requireSeedOnlyTransformBindings`), which knows
+        // whether its seeds are externally maintained and bind to nothing.
     }
     return try out.toOwnedSlice(alloc);
 }
@@ -480,9 +475,11 @@ test "public transforms lower expected_version and require it for seed-only writ
     try std.testing.expectEqual(@as(usize, 1), bound.expected_versions.len);
     try std.testing.expectEqualStrings("doc:a", bound.expected_versions[0].key);
     try std.testing.expectEqual(@as(u64, 4182), bound.expected_versions[0].version);
-    try std.testing.expectError(error.ArtifactSeedSourceBindingRequired, parseBatchRequest(a,
+    var unbound = try parseBatchRequest(a,
         \\{"transforms":[{"key":"doc:a","operations":[{"op":"$set","path":"_chunks.body","value":[]}]}]}
-    ));
+    );
+    defer unbound.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), unbound.expected_versions.len);
     for ([_][]const u8{
         \\{"transforms":[{"key":"doc:a","expected_version":"0","operations":[{"op":"$set","path":"title","value":1}]}]}
         ,

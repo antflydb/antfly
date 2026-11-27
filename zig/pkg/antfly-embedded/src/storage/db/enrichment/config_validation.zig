@@ -74,6 +74,14 @@ pub fn validatePublicConfig(alloc: Allocator, cfg: types.EnrichmentConfig) !void
         defer producer.deinit(alloc);
         if (!producerConsumesPromptText(producer.type)) return error.InvalidEnrichmentConfig;
     }
+    // An asset with no producer and no input is externally maintained:
+    // only seeds write it (`enrichment_catalog.externallyMaintained`).
+    if (cfg.kind == .asset and cfg.field.len == 0 and cfg.template.len == 0 and cfg.source_artifact_name.len == 0 and
+        cfg.producer_json.len == 0 and cfg.prior_context == null and cfg.neighbor_context == null and cfg.context_sources_json.len == 0)
+    {
+        if (cfg.execution != null or cfg.full_text_index) return error.InvalidEnrichmentConfig;
+        return;
+    }
     const consumes_asset_artifact = cfg.source_artifact_name.len > 0;
     if (cfg.field.len == 0 and cfg.template.len == 0 and !consumes_asset_artifact)
         return error.InvalidEnrichmentConfig;
@@ -418,4 +426,11 @@ pub fn assetSourceChainEndsHere(alloc: Allocator, producer_json: []const u8) !bo
     var producer = try asset_producer.parseProducerConfig(alloc, producer_json);
     defer producer.deinit(alloc);
     return producer.type == .media_output;
+}
+
+test "public enrichment validation admits externally maintained assets" {
+    try validatePublicConfig(std.testing.allocator, .{ .name = "notes", .kind = .asset, .content_type = "text/plain" });
+    try std.testing.expectError(error.InvalidEnrichmentConfig, validatePublicConfig(std.testing.allocator, .{ .name = "notes", .kind = .asset, .full_text_index = true }));
+    // Other kinds still need an input.
+    try std.testing.expectError(error.InvalidEnrichmentConfig, validatePublicConfig(std.testing.allocator, .{ .name = "chunks", .kind = .chunk, .chunk_size = 8 }));
 }

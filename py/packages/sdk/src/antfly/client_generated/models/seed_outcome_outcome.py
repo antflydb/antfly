@@ -6,6 +6,7 @@ class SeedOutcomeOutcome(StrEnum):
     CONFLICT = "conflict"
     DELETED = "deleted"
     MISSING = "missing"
+    PENDING = "pending"
     REJECTED = "rejected"
     REPLACED = "replaced"
     UNCHANGED = "unchanged"

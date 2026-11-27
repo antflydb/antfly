@@ -2,6 +2,7 @@ from enum import StrEnum
 
 
 class SeedOutcomeExistingOrigin(StrEnum):
+    EXTERNAL = "external"
     GENERATED = "generated"
     SEEDED = "seeded"
 

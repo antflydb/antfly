@@ -554,6 +554,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 req.transforms,
                 &transform_snapshot,
             );
+            // After coalescing, so a missing document reports as such.
+            try @import("artifact_seeds.zig").requireSeedOnlyTransformBindings(S.ownerField(self, "core").*.index_manager, req.transforms, req.predicates);
             defer effective_ops.deinit(commit_alloc);
             if (req.commit_requires == .direct_enrichments)
                 _ = try @import("commit_requirements.zig").sourceBudget(effective_ops.writes, effective_ops.deletes);
@@ -2296,6 +2298,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // Keeping a semantically equal but arbitrarily larger old JSON
                 // value while updating TTL would violate that durable bound.
                 if (opts.transaction_resolution != null) continue;
+                // Capacity is reserved only when elision applies (no packet).
+                if (!can_elide_primary_noops) continue;
                 if (derived_changed_flags[entry.write_index]) continue;
                 if (internal_keys.isRelationalRowKey(entry.key)) continue;
                 semantic_noop_store_keys.putAssumeCapacity(entry.key, {});
@@ -2388,7 +2392,46 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
 
-            try write_buffers.store_writes.appendSlice(S.ownerField(self, "alloc").*, write_buffers.timestamp_writes.items);
+            {
+                // A document written only by seed-only transforms keeps its
+                // stored row and version (#1791): its primary value is the
+                // stored one, and neither it nor the timestamp is rewritten.
+                const computed_seed_only = if (decoded_prepared == null) try @import("artifact_seeds.zig").seedOnlyDocumentsAlloc(preparation_alloc, req) else &.{};
+                defer if (decoded_prepared == null) preparation_alloc.free(computed_seed_only);
+                const seed_only = if (decoded_prepared) |packet| packet.value.seed_only_documents else computed_seed_only;
+                if (seed_only.len == 0) {
+                    try write_buffers.store_writes.appendSlice(S.ownerField(self, "alloc").*, write_buffers.timestamp_writes.items);
+                } else {
+                    var skipped = std.StringHashMapUnmanaged(void).empty;
+                    defer {
+                        var keys = skipped.keyIterator();
+                        while (keys.next()) |key| preparation_alloc.free(key.*);
+                        skipped.deinit(preparation_alloc);
+                    }
+                    for (seed_only) |document| {
+                        const store_key = try encodeStoreLookupKeyAlloc(self, preparation_alloc, document);
+                        skipped.put(preparation_alloc, store_key, {}) catch |err| {
+                            preparation_alloc.free(store_key);
+                            return err;
+                        };
+                        const timestamp_key = try makeTimestampKey(preparation_alloc, document);
+                        skipped.put(preparation_alloc, timestamp_key, {}) catch |err| {
+                            preparation_alloc.free(timestamp_key);
+                            return err;
+                        };
+                    }
+                    var retained: usize = 0;
+                    for (write_buffers.store_writes.items) |write| {
+                        if (skipped.contains(write.key)) continue;
+                        write_buffers.store_writes.items[retained] = write;
+                        retained += 1;
+                    }
+                    write_buffers.store_writes.shrinkRetainingCapacity(retained);
+                    for (write_buffers.timestamp_writes.items) |write| {
+                        if (!skipped.contains(write.key)) try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, write);
+                    }
+                }
+            }
             // Scoped restore artifacts share the normal presence, source-index,
             // target-cardinality and journal transaction; extra control writes are
             // appended too late in the pipeline for those derived invariants.
@@ -2736,7 +2779,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     }
                     var plan = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
                     defer plan.release();
-                    try captureSeedPreparation(self, capture, effective_req, plan.plan(), &precomputed_generated);
+                    const seed_only = try @import("artifact_seeds.zig").seedOnlyDocumentsAlloc(preparation_alloc, req);
+                    defer preparation_alloc.free(seed_only);
+                    try captureSeedPreparation(self, capture, effective_req, plan.plan(), &precomputed_generated, seed_only);
                     return;
                 }
                 if (opts.seed_plan) |capture| {

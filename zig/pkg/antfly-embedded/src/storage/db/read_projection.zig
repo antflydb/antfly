@@ -506,6 +506,14 @@ pub fn artifactProjectionValue(
             errdefer freeJsonValue(alloc, &value);
             hierarchy_navigation.stripPublicInternalFieldsValue(alloc, &value);
             try putOwnedValue(alloc, &obj, "value", value);
+            // Only seeds write an externally maintained asset.
+            const external = if (artifact_catalog) |catalog|
+                catalog.isExternal(artifact_ref.name)
+            else if (self.core.index_manager.getEnrichment(.asset, artifact_ref.name)) |cfg|
+                @import("catalog/enrichment_catalog.zig").externallyMaintained(cfg.*)
+            else
+                false;
+            if (external) try putClonedValue(alloc, &obj, "origin", .{ .string = "external" });
         },
         .embedding => {
             if (enrichment_artifact_codec.decodeDenseEmbeddingDims(raw) catch null) |dims| {
@@ -661,7 +669,7 @@ fn seedViewAssetContract(ctx: *const anyopaque, alloc: Allocator, name: []const 
         .content_type = try alloc.dupe(u8, if (cfg.content_type.len > 0) cfg.content_type else "text/plain"),
         // A copy is free to regenerate and is never seeded. Document
         // extraction rows are manifests; their units' text is the seed.
-        .mode = switch (producer.type) {
+        .mode = if (@import("catalog/enrichment_catalog.zig").externallyMaintained(cfg.*)) .value else switch (producer.type) {
             .copy => .none,
             .document_extraction => .extraction_text,
             else => .value,

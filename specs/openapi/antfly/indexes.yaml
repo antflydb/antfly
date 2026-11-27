@@ -1327,7 +1327,7 @@ components:
           description: "Embedding producer batching for shorthand-created embedding enrichments."
     EnrichmentConfig:
       type: object
-      description: "Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams."
+      description: "Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams. An asset enrichment with no producer and no input (no field, template or source artifact) is maintained outside Antfly: only artifact seeds write it (`_artifacts.<name>` or its `seed` field mapping). Its seeds bind to no input, so they are accepted unconditionally, a differing value always replaces the stored one, a seed-only transform needs no `expected_version`, and source rewrites keep it. Reads report it with `origin: external`. No producer, chunk collection or full-text projection may consume it yet."
       required:
         - name
         - kind
@@ -1458,11 +1458,14 @@ components:
             `ChunkSeed`. `auto` infers the format from the enrichment kind.
         on_missing:
           type: string
-          enum: [generate, fail]
+          enum: [generate, fail, pending]
           default: generate
           description: |
             When the field is absent: `generate` runs the producer as usual;
-            `fail` rejects the write (`ArtifactSeedMissing`).
+            `fail` rejects the write (`ArtifactSeedMissing`); `pending` runs no
+            producer, now or on later edits and replays, and the output stays
+            absent (reported `pending`) until a write supplies a seed,
+            explicitly or through this field.
     GroupedArtifactSource:
       type: object
       additionalProperties: false

@@ -102,6 +102,16 @@ pub fn serializeCatalog(alloc: Allocator, enrichments: []const EnrichmentConfig)
     return try std.json.Stringify.valueAlloc(alloc, normalized orelse enrichments, .{ .emit_null_optional_fields = false });
 }
 
+/// An asset with no producer and no input (no field, template or upstream
+/// artifact) is maintained outside Antfly: only seeds write it (#1791). They
+/// bind to no input, are accepted unconditionally and survive source
+/// rewrites, like `_embeddings` on an external index.
+pub fn externallyMaintained(cfg: anytype) bool {
+    return cfg.kind == .asset and cfg.producer_json.len == 0 and cfg.source_field.len == 0 and cfg.source_template.len == 0 and
+        cfg.source_artifact_name.len == 0 and cfg.group_source_json.len == 0 and cfg.prior_context_json.len == 0 and
+        cfg.neighbor_context_json.len == 0 and cfg.context_sources_json.len == 0;
+}
+
 pub fn deserializeCatalog(alloc: Allocator, data: []const u8) ![]EnrichmentConfig {
     const parsed = try std.json.parseFromSlice([]EnrichmentConfig, alloc, data, .{
         .allocate = .alloc_always,

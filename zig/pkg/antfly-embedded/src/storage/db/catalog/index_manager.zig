@@ -6332,6 +6332,8 @@ pub const IndexManager = struct {
         const Entry = struct {
             name: []u8,
             content_type: []u8,
+            /// `enrichment_catalog.externallyMaintained`.
+            external: bool = false,
         };
 
         alloc: Allocator,
@@ -6358,6 +6360,11 @@ pub const IndexManager = struct {
                 }
             }
             return try alloc.dupe(u8, "application/octet-stream");
+        }
+
+        pub fn isExternal(self: AssetContentTypeSnapshot, name: []const u8) bool {
+            for (self.entries) |entry| if (std.mem.eql(u8, entry.name, name)) return entry.external;
+            return false;
         }
     };
 
@@ -6389,7 +6396,7 @@ pub const IndexManager = struct {
                 u8,
                 if (entry.content_type.len > 0) entry.content_type else "text/plain",
             );
-            entries[initialized] = .{ .name = name, .content_type = content_type };
+            entries[initialized] = .{ .name = name, .content_type = content_type, .external = enrichment_catalog.externallyMaintained(entry) };
             initialized += 1;
         }
         std.mem.sort(AssetContentTypeSnapshot.Entry, entries, {}, struct {
@@ -17113,6 +17120,11 @@ pub const IndexManager = struct {
                 const privacy = @import("../../../privacy/document.zig");
                 if (std.mem.eql(u8, entry.name, privacy.state_artifact_name) and
                     std.mem.eql(u8, entry.source_field, privacy.state_field)) continue;
+                // Externally maintained: only seeds write it.
+                if (enrichment_catalog.externallyMaintained(entry)) {
+                    asset_emitted[entry_index] = true;
+                    continue;
+                }
                 if (!emit_final_pass and entry.source_artifact_name.len > 0) {
                     var upstream_pending = false;
                     for (self.enrichments.items, 0..) |candidate, candidate_index| {
@@ -17482,6 +17494,20 @@ pub const IndexManager = struct {
             } orelse continue;
             if (cfg.seed_json.len == 0) continue;
             request.seed_mapping_json = try alloc.dupe(u8, cfg.seed_json);
+        }
+        // An output whose mapping waits for its seed (`on_missing: pending`)
+        // is never planned while the document lacks the mapped field.
+        if (doc_key.len > 0) {
+            var retained: usize = 0;
+            for (requests.items) |request| {
+                if (try @import("../artifact_seeds.zig").pendingMappingUnsatisfied(alloc, request.seed_mapping_json, doc_value)) {
+                    enrichment_types.freeGeneratedRequest(alloc, request);
+                    continue;
+                }
+                requests.items[retained] = request;
+                retained += 1;
+            }
+            requests.shrinkRetainingCapacity(retained);
         }
         try orderGeneratedArtifactDependencies(self.alloc, requests.items);
         return try requests.toOwnedSlice(alloc);
@@ -27157,6 +27183,17 @@ pub const IndexManager = struct {
             try enrichment_config_validation.validatePublicConfig(self.alloc, public);
             if (cfg.group_source_json.len > 0) return;
         }
+        if (enrichment_catalog.externallyMaintained(cfg)) {
+            // Nothing derives it: no producer options, generation policy or
+            // full-text projection apply.
+            if (cfg.execution_json.len > 0 or cfg.full_text_index) return error.InvalidEnrichmentConfig;
+            if (cfg.seed_json.len > 0) {
+                var arena = std.heap.ArenaAllocator.init(self.alloc);
+                defer arena.deinit();
+                _ = try @import("../artifact_seeds.zig").parseMapping(arena.allocator(), cfg.seed_json);
+            }
+            return;
+        }
         const consumes_asset_artifact = cfg.source_artifact_name.len > 0;
         if (cfg.source_field.len == 0 and cfg.source_template.len == 0 and !consumes_asset_artifact) return error.InvalidEnrichmentConfig;
         if (cfg.execution_json.len > 0) _ = try enrichment_types.parseExecutionPolicyJson(self.alloc, cfg.execution_json);
@@ -27167,6 +27204,9 @@ pub const IndexManager = struct {
                 if (cfg.source_artifact_name.len > 0 and self.getEnrichment(.asset, cfg.source_artifact_name) == null) {
                     return error.InvalidEnrichmentConfig;
                 }
+                // An externally maintained asset carries no publication
+                // receipt for a downstream producer to bind to.
+                if (self.getEnrichment(.asset, cfg.source_artifact_name)) |upstream| if (enrichment_catalog.externallyMaintained(upstream)) return error.InvalidEnrichmentConfig;
             },
             .embedding => {
                 if (cfg.source_artifact_name.len > 0 and self.getEnrichment(.chunk, cfg.source_artifact_name) == null and self.assetGroupRoot(cfg.source_artifact_name).len == 0) {
@@ -27183,6 +27223,7 @@ pub const IndexManager = struct {
                     try validateContextSourcesConfig(self.alloc, cfg);
                     try self.rejectContextSourceFeedback(cfg);
                 }
+                if (self.getEnrichment(.asset, cfg.source_artifact_name)) |upstream| if (enrichment_catalog.externallyMaintained(upstream)) return error.InvalidEnrichmentConfig;
                 if (cfg.source_artifact_name.len > 0) {
                     // Asset-consumes-asset: the upstream chain must resolve
                     // to admitted assets and terminate without revisiting

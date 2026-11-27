@@ -257,12 +257,15 @@ test "batch wire version 2 carries transforms with expected versions and seed pa
     try std.testing.expectEqual(@as(u64, 7), decoded.expectedVersions()[0].version);
 
     // The same transform rules as the JSON entry point: a seed-only
-    // transform without `expected_version` is rejected.
+    // transform without `expected_version` decodes; the database rejects
+    // it unless its seeds are externally maintained.
     const unbound = try encodeBatchRequestWithTransformsAlloc(alloc, &.{}, &.{},
         \\[{"key":"doc:b","operations":[{"op":"$set","path":"_artifacts.summary","value":{"value":"s"}}]}]
     , .write);
     defer alloc.free(unbound);
-    try std.testing.expectError(error.InvalidArgument, decodeBatchRequest(alloc, unbound));
+    var unbound_decoded = try decodeBatchRequest(alloc, unbound);
+    defer unbound_decoded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), unbound_decoded.expectedVersions().len);
     // An empty section is no transforms; a truncated one is malformed.
     const none = try encodeBatchRequestWithTransformsAlloc(alloc, &writes, &.{}, "", .write);
     defer alloc.free(none);

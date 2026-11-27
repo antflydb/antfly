@@ -11734,12 +11734,14 @@ export interface components {
              *     - `replaced`: different output is replaced by the seed.
              *     - `deleted`: a `null` seed drops the accepted output.
              *     - `missing`: no seed was supplied; the producer will run.
+             *     - `pending`: no seed was supplied and the field mapping waits for
+             *       one (`on_missing: pending`); nothing generates it.
              *     - `rejected`: the write would fail with `error`.
              * @enum {string}
              */
-            outcome: "accepted" | "unchanged" | "conflict" | "replaced" | "deleted" | "missing" | "rejected";
+            outcome: "accepted" | "unchanged" | "conflict" | "replaced" | "deleted" | "missing" | "pending" | "rejected";
             /** @enum {string} */
-            existing_origin?: "generated" | "seeded";
+            existing_origin?: "generated" | "seeded" | "external";
             /**
              * @description Where the seed came from: an explicit `_artifacts`/`_chunks` seed
              *     in the write, which wins, or the enrichment's field mapping.
@@ -19427,11 +19429,14 @@ export interface components {
             format?: "auto" | "text" | "json" | "vector" | "chunk_vectors" | "chunks";
             /**
              * @description When the field is absent: `generate` runs the producer as usual;
-             *     `fail` rejects the write (`ArtifactSeedMissing`).
+             *     `fail` rejects the write (`ArtifactSeedMissing`); `pending` runs no
+             *     producer, now or on later edits and replays, and the output stays
+             *     absent (reported `pending`) until a write supplies a seed,
+             *     explicitly or through this field.
              * @default generate
              * @enum {string}
              */
-            on_missing?: "generate" | "fail";
+            on_missing?: "generate" | "fail" | "pending";
         };
         /** @description Rebuild policy for context-source invalidation. Invalidation (stale freshness) is always reported immediately; debounce only coalesces rebuild work. */
         EnrichmentRefreshConfig: {
@@ -19523,7 +19528,7 @@ export interface components {
              */
             download_assets?: boolean;
         };
-        /** @description Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams. */
+        /** @description Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams. An asset enrichment with no producer and no input (no field, template or source artifact) is maintained outside Antfly: only artifact seeds write it (`_artifacts.<name>` or its `seed` field mapping). Its seeds bind to no input, so they are accepted unconditionally, a differing value always replaces the stored one, a seed-only transform needs no `expected_version`, and source rewrites keep it. Reads report it with `origin: external`. No producer, chunk collection or full-text projection may consume it yet. */
         EnrichmentConfig: {
             /** @description Stable generated artifact name. */
             name: string;

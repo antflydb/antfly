@@ -137,10 +137,16 @@ the bit.
 - **Same write as the source.** An insert, or an upsert transform that also
   sets source fields, binds its seeds to that version atomically.
 - **Seed-only transform.** Requires `expected_version` (the lookup's
-  `X-Antfly-Version`). It lowers to the batch version predicate checked
-  atomically with the commit; a mismatch rejects the batch. A seed-only
-  transform for a missing key is rejected with or without `upsert`
-  (`ArtifactSeedDocumentNotFound`), never silently discarded.
+  `X-Antfly-Version`) unless everything it seeds is externally maintained.
+  It lowers to the batch version predicate checked atomically with the
+  commit; a mismatch rejects the batch. The database enforces the
+  requirement (`ArtifactSeedSourceBindingRequired`), since only the catalog
+  knows which outputs bind to an input; validation-only planning honors
+  `expected_version` the same way. A seed-only transform for a missing key is
+  rejected with or without `upsert` (`ArtifactSeedDocumentNotFound`), never
+  silently discarded. It rewrites neither the primary row nor its version;
+  leader seed preparation carries those documents
+  (`seed_only_documents`) so replicas keep them too.
 - **Same batch.** An insert and a seed transform for one key coalesce: the
   pending insert is the transform base, and later seed values win per name.
 - **Distributed batches.** Seeds are document content, so 2PC intents and
@@ -218,6 +224,31 @@ wins. `on_missing: fail` rejects a write whose record lacks the field
 (`ArtifactSeedMissing`); `generate` runs the producer. The mapping is stored
 as `seed_json` and excluded from the enrichment's artifact identity, so adding
 or changing it never rebuilds existing output.
+
+`on_missing: pending` runs no producer for a record that lacks the field: the
+write reports the output `pending` (via `mapping`), and it stays absent through
+later edits and replays, because the shared planner drops a request whose
+mapping waits for a field the document does not have. A later write supplies
+it, through the field or explicitly.
+
+### Externally maintained artifacts
+
+An asset enrichment with no producer and no input (no `field`, `template` or
+source artifact) is maintained outside Antfly:
+
+```json
+{ "name": "notes", "kind": "asset", "content_type": "text/plain" }
+```
+
+Only seeds write it: `_artifacts.notes`, or its `seed` field mapping. Like
+`_embeddings` on an external index it binds to no input, so a seed is accepted
+unconditionally: identical is `unchanged`, a different value always replaces
+it (`replaced`, `existing_origin: external`, under either policy), and `null`
+deletes it. A seed-only transform needs no `expected_version`. Source
+rewrites, edits and replays keep it, deleting the document removes it, and
+reads report `origin: external`; the seed view exports it. No producer, chunk
+collection or full-text projection may consume one yet: nothing would publish
+the receipt a downstream producer binds to.
 
 ### Transforms
 
@@ -400,9 +431,9 @@ These fail with `ArtifactSeedNotAccepted` rather than regenerating:
   forwarding response to carry them. Until then, plan with `validate_only`.
 - Leader seed preparation for transactions and multi-shard 2PC batches, and
   for seeds that come only from enrichment field mappings.
-- `on_missing: pending` for field mappings (outputs that wait for a later seed
-  instead of generating or failing), with readiness that reports them.
-- Externally maintained artifacts declared without any producer.
+- Readiness counters for `pending` outputs (they are reported per write and
+  never generated, but not counted separately), and downstream consumers of
+  externally maintained assets.
 - Migration progress reporting, generation of only the missing pages of a
   rich extraction seed, and a streaming import path for chunk inventories
   beyond the 4,095-chunk atomic-mutation ceiling (staged publication,

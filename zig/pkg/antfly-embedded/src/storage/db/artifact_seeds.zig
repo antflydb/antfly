@@ -67,6 +67,9 @@ pub const Outcome = enum {
     /// An output of the seeded document without a seed: its producer
     /// generates it as usual.
     missing,
+    /// No seed, and its field mapping says `on_missing: pending`: nothing
+    /// generates it; it stays absent until a seed supplies it.
+    pending,
 };
 
 pub const Origin = enum { seeded, generated, external };
@@ -82,7 +85,7 @@ pub const Result = struct {
         const rank = struct {
             fn of(outcome: Outcome) u8 {
                 return switch (outcome) {
-                    .missing => 0,
+                    .missing, .pending => 0,
                     .unchanged => 0,
                     .accepted => 1,
                     .deleted => 2,
@@ -562,10 +565,77 @@ pub const Mapping = struct {
         generate,
         /// The write is rejected (`ArtifactSeedMissing`).
         fail,
+        /// No producer runs; the output stays absent until a later write
+        /// supplies a seed (explicitly or through this mapping).
+        pending,
     };
 };
 
 /// Validates a public `seed` mapping object and returns its canonical JSON.
+/// A transform whose every operation writes an artifact seed has no source
+/// fields of its own: unless all it seeds is externally maintained (bound to
+/// no input), it must name the source version its seeds bind to with
+/// `expected_version` (a version predicate on its key).
+/// Documents of this request written only by seed-only transforms: their
+/// primary row and version stay as stored (#1791). A key also inserted,
+/// deleted or transformed otherwise in the request is not seed-only.
+pub fn seedOnlyDocumentsAlloc(alloc: Allocator, req: anytype) ![]const []const u8 {
+    const transform_mod = @import("transform.zig");
+    var out = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer out.deinit(alloc);
+    outer: for (req.transforms) |transform| {
+        for (req.writes) |write| if (std.mem.eql(u8, write.key, transform.key)) continue :outer;
+        for (req.deletes) |key| if (std.mem.eql(u8, key, transform.key)) continue :outer;
+        for (req.transforms) |other| {
+            if (!std.mem.eql(u8, other.key, transform.key)) continue;
+            if (!try transformOnlySeeds(transform_mod, other)) continue :outer;
+        }
+        for (out.items) |known| if (std.mem.eql(u8, known, transform.key)) continue :outer;
+        try out.append(alloc, transform.key);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn transformOnlySeeds(transform_mod: anytype, transform: anytype) !bool {
+    var seeds = false;
+    for (transform.operations) |operation| {
+        const reserved = (transform_mod.reservedProjectionPath(operation.path) catch return false) orelse return false;
+        switch (reserved.field) {
+            .artifacts, .chunks => seeds = true,
+            .seed_conflict => {},
+            .embeddings => return false,
+        }
+    }
+    return seeds;
+}
+
+pub fn requireSeedOnlyTransformBindings(manager: anytype, transforms: anytype, predicates: anytype) !void {
+    const transform_mod = @import("transform.zig");
+    const enrichment_catalog = @import("catalog/enrichment_catalog.zig");
+    for (transforms) |transform| {
+        if (transform.operations.len == 0) continue;
+        var seeds = false;
+        var bound_required = false;
+        for (transform.operations) |operation| {
+            const reserved = (try transform_mod.reservedProjectionPath(operation.path)) orelse break;
+            switch (reserved.field) {
+                .artifacts, .chunks => {
+                    seeds = true;
+                    const external = if (reserved.field == .artifacts) if (manager.getEnrichment(.asset, reserved.name)) |entry| enrichment_catalog.externallyMaintained(entry.*) else false else false;
+                    if (!external) bound_required = true;
+                },
+                .seed_conflict => {},
+                .embeddings => break,
+            }
+        } else {
+            if (!seeds or !bound_required) continue;
+            for (predicates) |predicate| {
+                if (std.mem.eql(u8, predicate.key, transform.key)) break;
+            } else return error.ArtifactSeedSourceBindingRequired;
+        }
+    }
+}
+
 pub fn canonicalMappingAlloc(alloc: Allocator, value: std.json.Value) ![]u8 {
     if (value != .object) return error.InvalidArtifactSeed;
     var mapping: Mapping = .{ .field = "" };
@@ -586,6 +656,34 @@ pub fn canonicalMappingAlloc(alloc: Allocator, value: std.json.Value) ![]u8 {
     var parts = std.mem.splitScalar(u8, mapping.field, '.');
     while (parts.next()) |part| if (part.len == 0) return error.InvalidArtifactSeed;
     return try std.json.Stringify.valueAlloc(alloc, mapping, .{});
+}
+
+/// Whether a canonical mapping waits for its seed (`on_missing: pending`)
+/// and `document_json` lacks its field: no producer may generate the output.
+pub fn pendingMappingUnsatisfied(alloc: Allocator, canonical: []const u8, document_json: []const u8) !bool {
+    if (canonical.len == 0) return false;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const mapping = try parseMapping(a, canonical);
+    if (mapping.on_missing != .pending) return false;
+    const document = std.json.parseFromSliceLeaky(std.json.Value, a, document_json, .{ .parse_numbers = false }) catch return false;
+    return !mappedFieldPresent(mapping, document);
+}
+
+pub fn mappingWaitsForSeed(a: Allocator, canonical: []const u8) !bool {
+    if (canonical.len == 0) return false;
+    return (try parseMapping(a, canonical)).on_missing == .pending;
+}
+
+fn mappedFieldPresent(mapping: Mapping, document: std.json.Value) bool {
+    var current = document;
+    var parts = std.mem.splitScalar(u8, mapping.field, '.');
+    while (parts.next()) |part| {
+        if (current != .object) return false;
+        current = current.object.get(part) orelse return false;
+    }
+    return current != .null;
 }
 
 pub fn parseMapping(a: Allocator, canonical: []const u8) !Mapping {
@@ -648,7 +746,7 @@ test "enrichment field mappings derive typed seeds from record fields" {
         ,
         \\{"field":"a","format":"pdf"}
         ,
-        \\{"field":"a","on_missing":"pending"}
+        \\{"field":"a","on_missing":"later"}
         ,
         \\{"field":"a","template":"{{x}}"}
     }) |json| {

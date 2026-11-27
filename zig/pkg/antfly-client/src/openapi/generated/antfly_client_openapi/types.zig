@@ -16300,7 +16300,7 @@ pub const EmbeddingsIndexStats = struct {
     }
 };
 
-/// Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams.
+/// Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams. An asset enrichment with no producer and no input (no field, template or source artifact) is maintained outside Antfly: only artifact seeds write it (`_artifacts.<name>` or its `seed` field mapping). Its seeds bind to no input, so they are accepted unconditionally, a differing value always replaces the stored one, a seed-only transform needs no `expected_version`, and source rewrites keep it. Reads report it with `origin: external`. No producer, chunk collection or full-text projection may consume it yet.
 pub const EnrichmentConfig = struct {
     /// Stable generated artifact name.
     name: []const u8,
@@ -17219,7 +17219,7 @@ pub const EnrichmentSeedMapping = struct {
     field: []const u8,
     /// How the field value is read. `text` and `json` are asset values, `vector` is a dense document embedding, `chunk_vectors` is an array of per-chunk vectors in chunk order, and `chunks` is an array of `ChunkSeed`. `auto` infers the format from the enrichment kind.
     format: ?[]const u8 = null,
-    /// When the field is absent: `generate` runs the producer as usual; `fail` rejects the write (`ArtifactSeedMissing`).
+    /// When the field is absent: `generate` runs the producer as usual; `fail` rejects the write (`ArtifactSeedMissing`); `pending` runs no producer, now or on later edits and replays, and the output stays absent (reported `pending`) until a write supplies a seed, explicitly or through this field.
     on_missing: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -60363,7 +60363,7 @@ pub const SeedOutcome = struct {
     key: []const u8,
     /// Enrichment name. Absent for items rejected as a whole.
     name: ?[]const u8 = null,
-    /// - `accepted`: the seed becomes the output. - `unchanged`: identical output is already accepted for this input. - `conflict`: different output is already accepted (kept). - `replaced`: different output is replaced by the seed. - `deleted`: a `null` seed drops the accepted output. - `missing`: no seed was supplied; the producer will run. - `rejected`: the write would fail with `error`.
+    /// - `accepted`: the seed becomes the output. - `unchanged`: identical output is already accepted for this input. - `conflict`: different output is already accepted (kept). - `replaced`: different output is replaced by the seed. - `deleted`: a `null` seed drops the accepted output. - `missing`: no seed was supplied; the producer will run. - `pending`: no seed was supplied and the field mapping waits for one (`on_missing: pending`); nothing generates it. - `rejected`: the write would fail with `error`.
     outcome: []const u8,
     existing_origin: ?[]const u8 = null,
     /// Where the seed came from: an explicit `_artifacts`/`_chunks` seed in the write, which wins, or the enrichment's field mapping. Absent for `missing` and `rejected`.

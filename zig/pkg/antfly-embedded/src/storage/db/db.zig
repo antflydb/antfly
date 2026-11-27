@@ -8681,7 +8681,7 @@ pub const DB = struct {
     pub fn planArtifactSeedsJson(self: *DB, alloc: Allocator, plan_json: []const u8) ![]u8 {
         var request = try @import("artifact_seed_plan.zig").parse(alloc, plan_json);
         defer request.deinit();
-        return self.planArtifactSeeds(alloc, .{ .writes = request.writes, .transforms = request.transforms });
+        return self.planArtifactSeeds(alloc, .{ .writes = request.writes, .transforms = request.transforms, .predicates = request.predicates });
     }
 
     /// Leader seed preparation for an ordinary (non-transactional) write:
@@ -108706,6 +108706,7 @@ test "db artifact seeds bind through transforms and reject unusable seeds" {
     try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"same source\"}" }}, .sync_level = .write });
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(usize, 1), counting.calls);
+    const doc_a_version = try documentVersionForTest(alloc, &db, "doc:a");
 
     // Generated output for the same input is kept by default (reported as a
     // conflict, never applied); a seed-only transform replaces it only with
@@ -108713,6 +108714,7 @@ test "db artifact seeds bind through transforms and reject unusable seeds" {
     {
         const report = (try db.batchReportingSeeds(alloc, .{
             .transforms = &.{.{ .key = "doc:a", .operations = &.{.{ .op = .set, .path = "_artifacts.body_dense_v1", .value_json = "{\"value\":[1,2,3]}" }} }},
+            .predicates = &.{.{ .key = "doc:a", .expected_version = doc_a_version }},
             .sync_level = .write,
         })).?;
         defer alloc.free(report);
@@ -108726,11 +108728,14 @@ test "db artifact seeds bind through transforms and reject unusable seeds" {
             .{ .op = .set, .path = "_artifacts.body_dense_v1", .value_json = "{\"value\":[1,2,3]}" },
             .{ .op = .set, .path = "_seed_conflict", .value_json = "\"replace\"" },
         } }},
+        .predicates = &.{.{ .key = "doc:a", .expected_version = doc_a_version }},
         .sync_level = .write,
     });
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(usize, 1), counting.calls);
     try expectSeededDenseVector(alloc, &db, "doc:a", "same source", &.{ 1, 2, 3 });
+    // Seed-only writes leave the document's version as it was.
+    try std.testing.expectEqual(doc_a_version, try documentVersionForTest(alloc, &db, "doc:a"));
 
     const rejected = [_]struct { value: []const u8, err: anyerror }{
         // Wrong dimensions for the embedding contract.
@@ -108757,6 +108762,12 @@ test "db artifact seeds bind through transforms and reject unusable seeds" {
     })) |_| return error.TestUnexpectedResult else |err| try std.testing.expect(err == error.ArtifactSeedDocumentNotFound or err == error.InvalidBatchRequest);
     try std.testing.expect((try db.get(alloc, "doc:missing")) == null);
     try std.testing.expectEqual(@as(usize, 1), counting.calls);
+}
+
+fn documentVersionForTest(alloc: Allocator, db: *DB, key: []const u8) !u64 {
+    var result = (try db.lookup(alloc, key, .{ .include_primary_digest = true })).?;
+    defer result.deinit(alloc);
+    return result.version orelse error.TestUnexpectedResult;
 }
 
 fn expectSeedPlanOutcome(alloc: Allocator, db: *DB, plan_json: []const u8, expected: []const u8) !void {
@@ -108822,9 +108833,17 @@ test "db artifact seed planning reports outcomes and conflicts follow the policy
     try db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = "{\"body\":\"generated source\"}" }}, .sync_level = .write });
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(usize, 1), counting.calls);
-    try expectSeedPlanOutcome(alloc, &db,
-        \\{"transforms":[{"key":"doc:b","operations":[{"op":"$set","path":"_artifacts.body_dense_v1","value":{"value":[9,9,9]}}]}]}
-    , "\"outcome\":\"conflict\",\"existing_origin\":\"generated\"");
+    {
+        // A seed-only transform binds to the version it was planned against.
+        const plan_json = try std.fmt.allocPrint(alloc,
+            \\{{"transforms":[{{"key":"doc:b","expected_version":"{d}","operations":[{{"op":"$set","path":"_artifacts.body_dense_v1","value":{{"value":[9,9,9]}}}}]}}]}}
+        , .{try documentVersionForTest(alloc, &db, "doc:b")});
+        defer alloc.free(plan_json);
+        try expectSeedPlanOutcome(alloc, &db, plan_json, "\"outcome\":\"conflict\",\"existing_origin\":\"generated\"");
+        try std.testing.expectError(error.ArtifactSeedSourceBindingRequired, db.planArtifactSeedsJson(alloc,
+            \\{"transforms":[{"key":"doc:b","operations":[{"op":"$set","path":"_artifacts.body_dense_v1","value":{"value":[9,9,9]}}]}]}
+        ));
+    }
     try expectSeedPlanOutcome(alloc, &db,
         \\{"inserts":{"doc:b":{"body":"generated source","_artifacts":{"body_dense_v1":null}}}}
     , "\"outcome\":\"deleted\"");
@@ -108901,6 +108920,131 @@ test "db artifact seed preparation on the leader replicates without the replica'
     try std.testing.expectError(error.InvalidBatchRequest, replica.batch(direct));
 }
 
+test "db artifact seeds maintain an external asset with no producer" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var fake = TestAssetProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a", .asset_producer = fake.producer() } });
+    defer db.close();
+    // No producer and no input: maintained outside Antfly.
+    try db.addEnrichment(.{ .name = "notes", .kind = .asset, .content_type = "text/plain" });
+    try db.addEnrichment(.{ .name = "labels", .kind = .asset, .content_type = "application/json", .seed_json = "{\"field\":\"legacy_labels\",\"format\":\"json\",\"on_missing\":\"generate\"}" });
+    // Nothing derives it, so no producer may consume it yet.
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.addEnrichment(.{ .name = "notes_chunks", .kind = .chunk, .source_artifact_name = "notes", .field = "text", .chunk_size = 8 }));
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.addEnrichment(.{ .name = "bad", .kind = .asset, .content_type = "text/plain", .full_text_index = true }));
+
+    {
+        const report = (try db.batchReportingSeeds(alloc, .{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"x\",\"legacy_labels\":{\"tags\":[\"a\"]},\"_artifacts\":{\"notes\":{\"value\":\"human note\"}}}" }}, .sync_level = .write })).?;
+        defer alloc.free(report);
+        try std.testing.expect(std.mem.indexOf(u8, report, "\"name\":\"notes\",\"outcome\":\"accepted\",\"via\":\"explicit\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, report, "\"name\":\"labels\",\"outcome\":\"accepted\",\"via\":\"mapping\"") != null);
+    }
+    try db.runUntilIdle();
+    try expectStoredAssetForTest(alloc, &db, "doc:a", "notes", "human note");
+    try expectStoredAssetForTest(alloc, &db, "doc:a", "labels", "{\"tags\":[\"a\"]}");
+
+    // Identical is unchanged; a different value always replaces it, even
+    // under `keep`: an external system owns it.
+    {
+        const report = (try db.batchReportingSeeds(alloc, .{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"x\",\"_artifacts\":{\"notes\":{\"value\":\"human note\"}}}" }}, .sync_level = .write })).?;
+        defer alloc.free(report);
+        try std.testing.expect(std.mem.indexOf(u8, report, "\"name\":\"notes\",\"outcome\":\"unchanged\",\"existing_origin\":\"external\"") != null);
+    }
+    {
+        const report = (try db.batchReportingSeeds(alloc, .{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"x\",\"_artifacts\":{\"notes\":{\"value\":\"edited note\"}}}" }}, .sync_level = .write })).?;
+        defer alloc.free(report);
+        try std.testing.expect(std.mem.indexOf(u8, report, "\"name\":\"notes\",\"outcome\":\"replaced\",\"existing_origin\":\"external\"") != null);
+    }
+
+    // It binds to no input: source rewrites keep it, and no producer runs.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"rewritten\"}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try expectStoredAssetForTest(alloc, &db, "doc:a", "notes", "edited note");
+    try expectStoredAssetForTest(alloc, &db, "doc:a", "labels", "{\"tags\":[\"a\"]}");
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+
+    // A seed-only transform needs no expected_version for it, and keeps the
+    // document's version, also through leader preparation.
+    const version_before = try documentVersionForTest(alloc, &db, "doc:a");
+    const transform_ops = [_]types.TransformOp{.{ .op = .set, .path = "_artifacts.notes", .value_json = "{\"value\":\"from transform\"}" }};
+    try db.batch(.{ .transforms = &.{.{ .key = "doc:a", .operations = &transform_ops }}, .sync_level = .write });
+    try expectStoredAssetForTest(alloc, &db, "doc:a", "notes", "from transform");
+    try std.testing.expectEqual(version_before, try documentVersionForTest(alloc, &db, "doc:a"));
+    {
+        const prepared_ops = [_]types.TransformOp{.{ .op = .set, .path = "_artifacts.notes", .value_json = "{\"value\":\"prepared transform\"}" }};
+        const transform_req: types.BatchRequest = .{ .transforms = &.{.{ .key = "doc:a", .operations = &prepared_ops }}, .sync_level = .write };
+        const transform_packet = try db.prepareSeedEnrichments(alloc, transform_req);
+        defer alloc.free(transform_packet);
+        try std.testing.expect(std.mem.indexOf(u8, transform_packet, "\"seed_only_documents\":[\"doc:a\"]") != null);
+        var applied = transform_req;
+        applied.prepared_enrichments_json = transform_packet;
+        try db.batch(applied);
+        try expectStoredAssetForTest(alloc, &db, "doc:a", "notes", "prepared transform");
+        try std.testing.expectEqual(version_before, try documentVersionForTest(alloc, &db, "doc:a"));
+    }
+    try db.batch(.{ .transforms = &.{.{ .key = "doc:a", .operations = &transform_ops }}, .sync_level = .write });
+
+    // Reads report it as external, and the seed view exports it.
+    {
+        var result = (try db.lookup(alloc, "doc:a", .{ .fields = &.{"_artifacts"}, .include_all_fields = false })).?;
+        defer result.deinit(alloc);
+        if (std.mem.indexOf(u8, result.json, "\"notes\"") == null or std.mem.indexOf(u8, result.json, "\"external\"") == null) {
+            std.debug.print("descriptive view {s}\n", .{result.json});
+            return error.TestUnexpectedResult;
+        }
+        var view = (try db.lookup(alloc, "doc:a", .{ .fields = &.{"_artifacts"}, .include_all_fields = false, .artifact_view = .seed })).?;
+        defer view.deinit(alloc);
+        if (std.mem.indexOf(u8, view.json, "\"notes\":{\"value\":\"from transform\"}") == null) {
+            std.debug.print("seed view {s}\n", .{view.json});
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    // `null` removes it.
+    {
+        const report = (try db.batchReportingSeeds(alloc, .{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"rewritten\",\"_artifacts\":{\"notes\":null}}" }}, .sync_level = .write })).?;
+        defer alloc.free(report);
+        try std.testing.expect(std.mem.indexOf(u8, report, "\"name\":\"notes\",\"outcome\":\"deleted\"") != null);
+    }
+    const notes_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "notes");
+    defer alloc.free(notes_key);
+    try std.testing.expect((try db.core.getStoreValue(alloc, notes_key)) == null);
+
+    // Leader preparation carries it like any seed.
+    const req: types.BatchRequest = .{ .writes = &.{.{ .key = "doc:b", .value = "{\"body\":\"y\",\"_artifacts\":{\"notes\":{\"value\":\"prepared note\"}}}" }}, .sync_level = .write };
+    const packet = try db.prepareSeedEnrichments(alloc, req);
+    defer alloc.free(packet);
+    var prepared = req;
+    prepared.prepared_enrichments_json = packet;
+    try db.batch(prepared);
+    try expectStoredAssetForTest(alloc, &db, "doc:b", "notes", "prepared note");
+
+    // Deleting the document removes its outputs.
+    try db.batch(.{ .deletes = &.{"doc:b"}, .sync_level = .write });
+    try db.runUntilIdle();
+    const doc_b_notes = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:b", "asset", "notes");
+    defer alloc.free(doc_b_notes);
+    try std.testing.expect((try db.core.getStoreValue(alloc, doc_b_notes)) == null);
+}
+
+test "db artifact seed-only transforms still require expected_version for bound outputs" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var counting = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a", .dense_embedder = counting.interface() } });
+    defer db.close();
+    try addSeededDenseTestIndex(&db);
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"same source\"}" }}, .sync_level = .write });
+    const ops = [_]types.TransformOp{.{ .op = .set, .path = "_artifacts.body_dense_v1", .value_json = "{\"value\":[1,2,3]}" }};
+    try std.testing.expectError(error.ArtifactSeedSourceBindingRequired, db.batch(.{ .transforms = &.{.{ .key = "doc:a", .operations = &ops }}, .sync_level = .write }));
+}
+
 fn expectStoredAssetForTest(alloc: Allocator, db: *DB, doc_key: []const u8, name: []const u8, expected: []const u8) !void {
     const key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", name);
     defer alloc.free(key);
@@ -108967,6 +109111,51 @@ test "db artifact seed field mappings accept existing record results before gene
     try db.batch(.{ .writes = &.{.{ .key = "doc:d", .value = "{\"body\":\"memo\",\"legacy_labels\":[]}" }}, .sync_level = .write });
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(usize, 1), fake.generator_calls);
+}
+
+test "db artifact seed field mappings can leave missing outputs pending" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var fake = TestAssetProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a", .asset_producer = fake.producer() } });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "summary_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+        .seed_json = "{\"field\":\"legacy.summary\",\"format\":\"text\",\"on_missing\":\"pending\"}",
+    });
+    const key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "summary_v1");
+    defer alloc.free(key);
+
+    // No mapped result: nothing generates it, and the write says so.
+    {
+        const report = (try db.batchReportingSeeds(alloc, .{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"report\"}" }}, .sync_level = .write })).?;
+        defer alloc.free(report);
+        try std.testing.expect(std.mem.indexOf(u8, report, "\"name\":\"summary_v1\",\"outcome\":\"pending\",\"via\":\"mapping\"") != null);
+    }
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 0), fake.generator_calls);
+    try std.testing.expect((try db.core.getStoreValue(alloc, key)) == null);
+    // Later edits keep waiting rather than generating.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"report v2\"}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 0), fake.generator_calls);
+    try std.testing.expect((try db.core.getStoreValue(alloc, key)) == null);
+
+    // The result arrives through the mapping, or explicitly.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"report v2\",\"legacy\":{\"summary\":\"short\"}}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try expectStoredAssetForTest(alloc, &db, "doc:a", "summary_v1", "short");
+    try db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = "{\"body\":\"memo\",\"_artifacts\":{\"summary_v1\":{\"value\":\"explicit\"}}}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try expectStoredAssetForTest(alloc, &db, "doc:b", "summary_v1", "explicit");
+    try std.testing.expectEqual(@as(usize, 0), fake.generator_calls);
 }
 
 test "db artifact seeds accept extracted text for document extraction without fetching or OCR" {

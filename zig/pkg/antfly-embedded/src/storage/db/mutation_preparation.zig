@@ -962,18 +962,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn capturePreparedEnrichments(self: anytype, output: *execution_resources.PreparationCapture, req: types.BatchRequest, plan: *const index_manager_mod.IndexManager.WritePlanSnapshot, generated: *const PrecomputedGeneratedBatch) !void {
-            return capturePreparedEnrichmentsMode(self, output, req, plan, generated, .direct);
+            return capturePreparedEnrichmentsMode(self, output, req, plan, generated, .direct, &.{});
         }
 
         /// Leader seed preparation: the write's own (non-inferring)
         /// preparation becomes the packet replicas apply, so seed acceptance
         /// never depends on a replica's embedder configuration.
-        pub fn captureSeedPreparation(self: anytype, output: *execution_resources.PreparationCapture, req: types.BatchRequest, plan: *const index_manager_mod.IndexManager.WritePlanSnapshot, generated: *const PrecomputedGeneratedBatch) !void {
+        pub fn captureSeedPreparation(self: anytype, output: *execution_resources.PreparationCapture, req: types.BatchRequest, plan: *const index_manager_mod.IndexManager.WritePlanSnapshot, generated: *const PrecomputedGeneratedBatch, seed_only_documents: []const []const u8) !void {
             if (generated.prepared_producers.len != 0) return error.InvalidBatchRequest;
-            return capturePreparedEnrichmentsMode(self, output, req, plan, generated, .seeds);
+            return capturePreparedEnrichmentsMode(self, output, req, plan, generated, .seeds, seed_only_documents);
         }
 
-        fn capturePreparedEnrichmentsMode(self: anytype, output: *execution_resources.PreparationCapture, req: types.BatchRequest, plan: *const index_manager_mod.IndexManager.WritePlanSnapshot, generated: *const PrecomputedGeneratedBatch, mode: execution_resources.PreparedEnrichments.Mode) !void {
+        fn capturePreparedEnrichmentsMode(self: anytype, output: *execution_resources.PreparationCapture, req: types.BatchRequest, plan: *const index_manager_mod.IndexManager.WritePlanSnapshot, generated: *const PrecomputedGeneratedBatch, mode: execution_resources.PreparedEnrichments.Mode, seed_only_documents: []const []const u8) !void {
             const publication = @import("artifact_publication.zig");
             var arena = std.heap.ArenaAllocator.init(output.alloc);
             defer arena.deinit();
@@ -1022,6 +1022,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .pending_children = generated.pending_child_work,
                 .mode = mode,
                 .seeds = if (mode == .seeds) generated.seed_outcomes else &.{},
+                .seed_only_documents = seed_only_documents,
             };
             const json = try std.json.Stringify.valueAlloc(output.alloc, packet, .{});
             errdefer output.alloc.free(json);
@@ -1173,6 +1174,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             for (packet.producers) |produced| try owners.append(a, .{ .definition = produced.definition, .doc_key = produced.doc_key });
             if (seed_documents) |documents| for (documents) |document| for (plan.generated_templates) |request| {
                 try owners.append(a, .{ .definition = @import("artifact_producer_input.zig").definitionDigest(request), .doc_key = document });
+            };
+            // Externally maintained assets have no producer definition; their
+            // seeds write only the output itself.
+            if (seed_documents) |documents| if (plan.artifact_catalogs) |catalogs| if (catalogs.enrichments.len != 0) {
+                const enrichment_catalog = @import("catalog/enrichment_catalog.zig");
+                for (try enrichment_catalog.deserializeCatalog(a, catalogs.enrichments)) |entry| {
+                    if (!enrichment_catalog.externallyMaintained(entry)) continue;
+                    for (documents) |document| try allowed.put(a, preparedScope(document, entry.name), {});
+                }
             };
             for (owners.items) |produced| {
                 var producer = definitions.get(produced.definition) orelse return error.InvalidBatchRequest;
@@ -1445,8 +1455,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     );
                     break :blk owned_row_plan.?.rows[0].requests;
                 };
+                // Externally maintained assets have no producer request; their
+                // seeds are written here, unconditionally.
+                try applyExternalAssetSeeds(alloc, self, req.writes[i].key, &extracted[i], &artifact_writes, &artifact_delete_keys, &seed_outcomes);
                 if (generated_templates.len == 0) {
-                    if (extracted[i].artifact_seeds_json != null) return error.UnknownArtifactSeed;
+                    if (extracted[i].artifact_seeds_json) |json| {
+                        var seeds = try artifact_seeds.Seeds.parse(alloc, json);
+                        defer seeds.deinit();
+                        try requireEverySeedMatchesRequest(alloc, self, &seeds, &.{});
+                    }
                     continue;
                 }
                 const privacy_protected = for (generated_templates) |template| {
@@ -1494,19 +1511,25 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const request_seed_mapped = try alloc.alloc(bool, generated.len);
                 defer alloc.free(request_seed_mapped);
                 @memset(request_seed_mapped, false);
+                // Mapped outputs waiting for their seed (`on_missing: pending`).
+                const request_pending = try alloc.alloc(bool, generated.len);
+                defer alloc.free(request_pending);
+                @memset(request_pending, false);
                 // Each outcome of this row reports whether its seed was
                 // explicit or came from the enrichment's field mapping.
                 const row_outcomes_start = seed_outcomes.items.len;
                 defer markSeedOutcomesVia(seed_outcomes.items[row_outcomes_start..], generated, request_seed_mapped);
                 var seeded_row = row_seeds != null;
-                for (generated, request_seeds, request_seed_mapped) |request, *slot, *mapped| {
+                for (generated, request_seeds, request_seed_mapped, request_pending) |request, *slot, *mapped, *pending| {
                     slot.* = if (row_seeds) |*seeds| try requestSeed(seeds, request) else null;
                     if (slot.* == null and request.seed_mapping_json.len != 0) {
                         if (mapped_document == null) mapped_document = try std.json.parseFromSliceLeaky(std.json.Value, mapping_arena.allocator(), (try extracted[i].logicalJson()).?, .{ .parse_numbers = false });
                         slot.* = try mappedSeed(mapping_arena.allocator(), request, mapped_document.?);
-                        mapped.* = slot.* != null;
+                        mapped.* = true;
+                        pending.* = slot.* == null and try artifact_seeds.mappingWaitsForSeed(mapping_arena.allocator(), request.seed_mapping_json);
+                        if (slot.* == null and !pending.*) mapped.* = false;
                     }
-                    if (slot.* != null) seeded_row = true;
+                    if (slot.* != null or pending.*) seeded_row = true;
                 }
                 if (row_seeds) |*seeds| try requireUnitChunkSeedsBound(alloc, self, seeds, generated, request_seeds);
                 // Seeded chunks become this revision's chunker output before
@@ -1541,8 +1564,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // Seeded requests never dispatch a producer, so they are never
                 // part of the concurrent precommit execution set.
                 const filter_execution = precompute_mode == .direct or seeded_row;
-                if (filter_execution) for (generated, request_seeds) |request, request_seed| {
-                    if (request_seed != null) continue;
+                if (filter_execution) for (generated, request_seeds, request_pending) |request, request_seed, pending| {
+                    if (request_seed != null or pending) continue;
                     if (precompute_mode != .direct or @import("commit_requirements.zig").directEligibility(request) == .eligible)
                         try direct_execution_requests.append(alloc, request);
                 };
@@ -1580,6 +1603,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         }
                     }
                     const seed = request_seeds[request_index];
+                    // Waiting for its seed: nothing runs or is scheduled.
+                    if (request_pending[request_index]) {
+                        try appendSeedOutcome(alloc, &seed_outcomes, request, .{ .outcome = .pending });
+                        continue;
+                    }
                     // Planning a seeded document also names what it will generate.
                     if (seeded_row and seed == null) try appendSeedOutcome(alloc, &seed_outcomes, request, .{ .outcome = .missing });
                     const execution_position = unseeded_index;
@@ -2398,6 +2426,80 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try appendSeedOutcomeNamed(alloc, outcomes, request.doc_key, name, result);
         }
 
+        fn externalAsset(db: anytype, name: []const u8) ?*const @import("catalog/enrichment_catalog.zig").EnrichmentConfig {
+            const entry = S.ownerField(db, "core").*.index_manager.getEnrichment(.asset, name) orelse return null;
+            return if (@import("catalog/enrichment_catalog.zig").externallyMaintained(entry.*)) entry else null;
+        }
+
+        /// Externally maintained assets (`enrichment_catalog.externallyMaintained`):
+        /// an explicit `_artifacts` seed, else the enrichment's field mapping,
+        /// writes the output as is. Nothing binds or regenerates it, so a
+        /// differing value always replaces the stored one.
+        fn applyExternalAssetSeeds(
+            alloc: Allocator,
+            self: anytype,
+            doc_key: []const u8,
+            extracted: anytype,
+            artifact_writes: anytype,
+            artifact_delete_keys: anytype,
+            outcomes: *std.ArrayListUnmanaged(artifact_seeds.OutcomeEntry),
+        ) !void {
+            const enrichment_catalog = @import("catalog/enrichment_catalog.zig");
+            const manager = S.ownerField(self, "core").*.index_manager;
+            var any_external = false;
+            for (manager.enrichments.items) |entry| {
+                if (enrichment_catalog.externallyMaintained(entry)) any_external = true;
+            }
+            if (!any_external) return;
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            var seeds: ?artifact_seeds.Seeds = if (extracted.artifact_seeds_json) |json| try artifact_seeds.Seeds.parse(alloc, json) else null;
+            defer if (seeds) |*parsed| parsed.deinit();
+            var document: ?std.json.Value = null;
+            for (manager.enrichments.items) |entry| {
+                if (!enrichment_catalog.externallyMaintained(entry)) continue;
+                var via: artifact_seeds.Via = .explicit;
+                const seed: artifact_seeds.Entry = explicit: {
+                    if (seeds) |*parsed| {
+                        if (parsed.chunks(entry.name) != null) return error.UnknownArtifactSeed;
+                        if (parsed.artifact(entry.name)) |found| break :explicit found;
+                    }
+                    if (entry.seed_json.len == 0) continue;
+                    if (document == null) document = try std.json.parseFromSliceLeaky(std.json.Value, a, (try extracted.logicalJson()) orelse continue, .{ .parse_numbers = false });
+                    const mapping = try artifact_seeds.parseMapping(a, entry.seed_json);
+                    via = .mapping;
+                    break :explicit (try artifact_seeds.mappedEntry(mapping, document.?, false)) orelse {
+                        if (mapping.on_missing == .fail) return error.ArtifactSeedMissing;
+                        continue;
+                    };
+                };
+                const key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", entry.name);
+                var key_owned = true;
+                defer if (key_owned) alloc.free(key);
+                const stored = try S.ownerField(self, "core").*.getStoreValue(alloc, key);
+                defer if (stored) |bytes| alloc.free(bytes);
+                const result: artifact_seeds.Result = switch (seed) {
+                    .delete => result: {
+                        if (stored == null) continue;
+                        key_owned = false;
+                        try artifact_delete_keys.append(alloc, key);
+                        break :result .{ .outcome = .deleted, .existing_origin = .external };
+                    },
+                    .artifact => |envelope| result: {
+                        const bytes = try artifact_seeds.assetBytesAlloc(a, envelope.value, @import("document_collectors.zig").assetContentTypeIsJson(entry.content_type));
+                        if (stored) |existing| if (std.mem.eql(u8, existing, bytes))
+                            break :result .{ .outcome = .unchanged, .existing_origin = .external };
+                        try @import("result_collectors.zig").appendArtifact(alloc, artifact_writes, key, bytes);
+                        break :result if (stored != null) .{ .outcome = .replaced, .existing_origin = .external } else .{ .outcome = .accepted };
+                    },
+                    .chunks => return error.UnknownArtifactSeed,
+                };
+                try appendSeedOutcomeNamed(alloc, outcomes, doc_key, entry.name, result);
+                outcomes.items[outcomes.items.len - 1].via = via;
+            }
+        }
+
         fn appendSeedOutcomeNamed(alloc: Allocator, outcomes: *std.ArrayListUnmanaged(artifact_seeds.OutcomeEntry), doc_key: []const u8, name: []const u8, result: artifact_seeds.Result) !void {
             // One entry per output even when several consumers plan it.
             for (outcomes.items) |*existing| if (std.mem.eql(u8, existing.key, doc_key) and std.mem.eql(u8, existing.name, name)) {
@@ -2450,6 +2552,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     } else return error.UnknownArtifactSeed;
                     continue;
                 }
+                if (seeded.field == .artifacts and externalAsset(db, seeded.name) != null) continue;
                 const matched = for (requests) |request| {
                     const name = switch (request.kind) {
                         .chunk_text => if (seeded.field == .chunks) requestArtifactName(request) else continue,

@@ -25,6 +25,8 @@ class SeedOutcome:
             - `replaced`: different output is replaced by the seed.
             - `deleted`: a `null` seed drops the accepted output.
             - `missing`: no seed was supplied; the producer will run.
+            - `pending`: no seed was supplied and the field mapping waits for
+              one (`on_missing: pending`); nothing generates it.
             - `rejected`: the write would fail with `error`.
         name (str | Unset): Enrichment name. Absent for items rejected as a whole.
         existing_origin (SeedOutcomeExistingOrigin | Unset):
