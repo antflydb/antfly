@@ -2414,12 +2414,118 @@ pub const PersistentIndex = struct {
         self.lockStorage();
         defer self.unlockStorage();
         try backend.reloadMirror();
-
         var txn = try self.beginReadMainTxn();
         defer txn.abort();
+        var plan = try self.planTipRefresh(&txn);
+        defer plan.deinit(self.alloc);
+        try self.applyTipRefresh(&plan);
+    }
+
+    /// A refresh from the tip read and planned without any of this index's
+    /// locks (`prepareRefreshFromTip`), for `installPreparedRefreshFromTip`
+    /// to publish in a short critical section.
+    pub const PreparedTipRefresh = struct {
+        view: *native_catalog_backend.Backend,
+        view_store: backend_erased.NamespaceStore,
+        /// The live mirror's epoch when the view was taken.
+        mirror_epoch: u64,
+        plan: TipRefreshPlan,
+
+        pub fn deinit(self: *PreparedTipRefresh, alloc: Allocator) void {
+            self.plan.deinit(alloc);
+            self.view_store.deinit();
+            native_catalog_backend.Backend.closeTipView(alloc, self.view);
+            self.* = undefined;
+        }
+    };
+
+    /// Reads the file's tip into a private view and plans the refresh from
+    /// it: the long part (loading the scope, reading new segments and
+    /// deriving their deletions) holds no lock of this index. The caller
+    /// keeps the index alive.
+    pub fn prepareRefreshFromTip(self: *PersistentIndex) !PreparedTipRefresh {
+        if (!self.versioned) return error.UnsupportedRefresh;
+        if (self.inline_in_flight.load(.acquire) != 0) return error.UnsupportedRefresh;
+        const backend = switch (self.main_store_owner) {
+            .native_catalog => |backend| backend,
+            else => return error.UnsupportedRefresh,
+        };
+        // Taken before the view: anything published after it shows.
+        const mirror_epoch = backend.state_epoch.load(.acquire);
+        const view = try backend.openTipView(self.alloc);
+        errdefer native_catalog_backend.Backend.closeTipView(self.alloc, view);
+        var view_store = try view.runtimeNamespaceStore(self.alloc);
+        errdefer view_store.deinit();
+        var txn = try MainTxn.open(&view_store, true);
+        defer txn.abort();
+        const plan = try self.planTipRefresh(&txn);
+        return .{ .view = view, .view_store = view_store, .mirror_epoch = mirror_epoch, .plan = plan };
+    }
+
+    /// Publishes a prepared refresh if nothing reached this index since it
+    /// was prepared: the live mirror and the writer's snapshot are the ones
+    /// it was planned against. False when stale; prepare again. The caller
+    /// holds the index's apply lock, which excludes this index's appliers.
+    pub fn installPreparedRefreshFromTip(self: *PersistentIndex, prepared: *PreparedTipRefresh) !bool {
+        if (self.inline_in_flight.load(.acquire) != 0) return error.UnsupportedRefresh;
+        const backend = switch (self.main_store_owner) {
+            .native_catalog => |backend| backend,
+            else => return error.UnsupportedRefresh,
+        };
+        self.lockStorage();
+        defer self.unlockStorage();
+        {
+            const current = self.writer.acquireSnapshot();
+            defer current.release();
+            if (current != prepared.plan.snapshot) return false;
+        }
+        if (!backend.adoptTipView(prepared.view, prepared.mirror_epoch)) return false;
+        try self.applyTipRefresh(&prepared.plan);
+        return true;
+    }
+
+    /// What a refresh from the tip changes in the writer, planned against
+    /// one writer snapshot from one read of the tip.
+    pub const TipRefreshPlan = struct {
+        snapshot: *index_mod.IndexSnapshot,
+        removed: std.ArrayListUnmanaged(u64) = .empty,
+        added: std.ArrayListUnmanaged(index_mod.ReplacementSegmentData) = .empty,
+        /// Deletions of segments already loaded, set after publication as
+        /// an inline install marks its deletes after adding its copies.
+        present_deleted: std.ArrayListUnmanaged(PresentDeletion) = .empty,
+        next_segment_id: ?u64 = null,
+
+        const PresentDeletion = struct { id: u64, bitmap: ?roaring.RoaringBitmap };
+
+        /// The plan owns each added segment's deletions; the writer clones them.
+        fn freeDeleted(alloc: Allocator, replacement: *index_mod.ReplacementSegmentData) void {
+            const bitmap = replacement.deleted orelse return;
+            const owned: *roaring.RoaringBitmap = @constCast(bitmap);
+            owned.deinit();
+            alloc.destroy(owned);
+            replacement.deleted = null;
+        }
+
+        pub fn deinit(self: *TipRefreshPlan, alloc: Allocator) void {
+            for (self.added.items) |*replacement| {
+                replacement.data.deinit(alloc);
+                freeDeleted(alloc, replacement);
+            }
+            self.added.deinit(alloc);
+            for (self.present_deleted.items) |*item| if (item.bitmap) |*bitmap| bitmap.deinit();
+            self.present_deleted.deinit(alloc);
+            self.removed.deinit(alloc);
+            self.snapshot.release();
+            self.* = undefined;
+        }
+    };
+
+    fn planTipRefresh(self: *PersistentIndex, txn: *MainTxn) !TipRefreshPlan {
+        var plan: TipRefreshPlan = .{ .snapshot = self.writer.acquireSnapshot() };
+        errdefer plan.deinit(self.alloc);
         var tip = std.AutoHashMapUnmanaged(u64, void).empty;
         defer tip.deinit(self.alloc);
-        const active_ids = try self.loadActiveSegmentIds(&txn, self.alloc);
+        const active_ids = try self.loadActiveSegmentIds(txn, self.alloc);
         defer self.alloc.free(active_ids);
         for (active_ids) |seg_id| try tip.put(self.alloc, seg_id, {});
         {
@@ -2436,79 +2542,69 @@ pub const PersistentIndex = struct {
                 }
             }
         }
-
-        var removed = std.ArrayListUnmanaged(u64).empty;
-        defer removed.deinit(self.alloc);
         var present = std.AutoHashMapUnmanaged(u64, void).empty;
         defer present.deinit(self.alloc);
-        {
-            const snap = self.writer.acquireSnapshot();
-            defer snap.release();
-            for (snap.segments) |segment| {
-                try present.put(self.alloc, segment.id, {});
-                if (!tip.contains(segment.id)) try removed.append(self.alloc, segment.id);
-            }
-        }
-        var dead = try DeadVersions.load(self.alloc, &txn);
+        var dead = try DeadVersions.load(self.alloc, txn);
         defer dead.deinit();
-        // Segments new here are published with their deletions; ones
-        // already loaded get theirs replaced after, as an inline install
-        // marks its deletes after adding its copies.
-        var added = std.ArrayListUnmanaged(index_mod.ReplacementSegmentData).empty;
-        var added_deleted = std.ArrayListUnmanaged(?roaring.RoaringBitmap).empty;
-        defer {
-            for (added.items) |*replacement| replacement.data.deinit(self.alloc);
-            added.deinit(self.alloc);
-            for (added_deleted.items) |*bitmap| if (bitmap.*) |*b| b.deinit();
-            added_deleted.deinit(self.alloc);
+        for (plan.snapshot.segments) |*segment| {
+            try present.put(self.alloc, segment.id, {});
+            if (!tip.contains(segment.id)) {
+                try plan.removed.append(self.alloc, segment.id);
+                continue;
+            }
+            try plan.present_deleted.ensureUnusedCapacity(self.alloc, 1);
+            const bitmap = try derivedDeletionBitmap(self.alloc, segment.reader.encoded(), &dead);
+            if (bitmap != null or segment.shared.deleted_count.load(.acquire) != 0)
+                plan.present_deleted.appendAssumeCapacity(.{ .id = segment.id, .bitmap = bitmap });
         }
+        // Segments new here are published with their deletions.
         var tip_it = tip.keyIterator();
         while (tip_it.next()) |seg_id| {
             if (present.contains(seg_id.*)) continue;
-            try added.ensureUnusedCapacity(self.alloc, 1);
-            try added_deleted.ensureUnusedCapacity(self.alloc, 1);
-            const bytes = self.readSegmentBytesAlloc(&txn, self.alloc, seg_id.*) catch |err| switch (err) {
+            try plan.added.ensureUnusedCapacity(self.alloc, 1);
+            const bytes = self.readSegmentBytesAlloc(txn, self.alloc, seg_id.*) catch |err| switch (err) {
                 error.NotFound => continue,
                 else => return err,
             };
             var data = index_mod.SegmentData.fromOwnedHeap(bytes);
+            errdefer data.deinit(self.alloc);
             const deleted = deleted: {
-                errdefer data.deinit(self.alloc);
                 var reader = try segment_mod.SegmentReader.init(self.alloc, bytes);
                 defer reader.deinit();
-                break :deleted try derivedDeletionBitmap(self.alloc, &reader, &dead);
+                const bitmap = (try derivedDeletionBitmap(self.alloc, &reader, &dead)) orelse break :deleted null;
+                const owned = try self.alloc.create(roaring.RoaringBitmap);
+                owned.* = bitmap;
+                break :deleted owned;
             };
-            added.appendAssumeCapacity(.{ .id = seg_id.*, .data = data });
-            added_deleted.appendAssumeCapacity(deleted);
-        }
-        for (added.items, added_deleted.items) |*replacement, *bitmap| {
-            if (bitmap.*) |*b| replacement.deleted = b;
-        }
-        if (removed.items.len != 0 or added.items.len != 0) {
-            var prepared = try self.writer.prepareSegmentsManyData(removed.items, added.items);
-            defer prepared.abort();
-            prepared.publish();
-            // Published: the writer owns the data now.
-            added.clearRetainingCapacity();
-        }
-
-        const snap = self.writer.acquireSnapshot();
-        defer snap.release();
-        for (snap.segments) |*segment| {
-            if (!present.contains(segment.id)) continue;
-            if (try derivedDeletionBitmap(self.alloc, segment.reader.encoded(), &dead)) |bitmap| {
-                self.writer.setDeletionBitmap(segment.id, bitmap);
-            } else if (segment.shared.deleted_count.load(.acquire) != 0) {
-                self.writer.setDeletionBitmap(segment.id, roaring.RoaringBitmap.init(self.alloc));
-            }
+            plan.added.appendAssumeCapacity(.{ .id = seg_id.*, .data = data, .deleted = deleted });
         }
         const next_seg_id_bytes = txn.get(.meta, meta_next_seg_id) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
         };
         if (next_seg_id_bytes) |bytes| if (bytes.len >= @sizeOf(u64)) {
-            self.writer.next_segment_id = @max(self.writer.next_segment_id, std.mem.readInt(u64, bytes[0..@sizeOf(u64)], .little));
+            plan.next_segment_id = std.mem.readInt(u64, bytes[0..@sizeOf(u64)], .little);
         };
+        return plan;
+    }
+
+    /// Under `lockStorage`.
+    fn applyTipRefresh(self: *PersistentIndex, plan: *TipRefreshPlan) !void {
+        if (plan.removed.items.len != 0 or plan.added.items.len != 0) {
+            var prepared = try self.writer.prepareSegmentsManyData(plan.removed.items, plan.added.items);
+            defer prepared.abort();
+            prepared.publish();
+            // Published: the writer owns the data, and cloned the deletions.
+            for (plan.added.items) |*replacement| TipRefreshPlan.freeDeleted(self.alloc, replacement);
+            plan.added.clearRetainingCapacity();
+        }
+        for (plan.present_deleted.items) |*item| {
+            const bitmap = item.bitmap orelse roaring.RoaringBitmap.init(self.alloc);
+            item.bitmap = null;
+            self.writer.setDeletionBitmap(item.id, bitmap);
+        }
+        plan.present_deleted.clearRetainingCapacity();
+        if (plan.next_segment_id) |next| self.writer.next_segment_id = @max(self.writer.next_segment_id, next);
         self.version_locations.clear(self.alloc);
     }
 
@@ -9823,6 +9919,44 @@ test "persistent index refreshes another writer's segments, rewrites and merges 
 // input removal is refused, and the refresh it triggers
 // (`IndexManager.removeMergeInputs`, then `refreshFromTip`) leaves the next
 // plan the peer's output as its only input, never the retired inputs.
+// A refresh is read and planned without the index's locks, then installed
+// only if nothing reached the index meanwhile: a publication after the
+// preparation makes it stale, and a fresh preparation installs.
+test "persistent index installs a prepared tip refresh only while nothing moved" {
+    const alloc = std.testing.allocator;
+    var sink = InlinePublicationTestSink{ .allocator = alloc };
+    defer sink.deinit(alloc);
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+    var index = try openVersionedTestIndex(alloc, &sink, path);
+    defer index.close();
+    var peer_path_buf: [256]u8 = undefined;
+    const peer_path = try std.fmt.bufPrintSentinel(&peer_path_buf, "{s}-peer", .{path}, 0);
+    defer cleanupPersistDir(peer_path.ptr);
+    var peer = try openVersionedTestIndex(alloc, &sink, peer_path);
+    defer peer.close();
+
+    const peer_segment = try buildSimpleSegment(alloc, "doc:peer", "peer");
+    defer alloc.free(peer_segment);
+    try peer.indexSegment(peer_segment);
+
+    var stale = try index.prepareRefreshFromTip();
+    defer stale.deinit(alloc);
+    // This index publishes after the preparation read the tip.
+    const own_segment = try buildSimpleSegment(alloc, "doc:own", "own");
+    defer alloc.free(own_segment);
+    try index.indexSegment(own_segment);
+    try std.testing.expect(!try index.installPreparedRefreshFromTip(&stale));
+
+    var fresh = try index.prepareRefreshFromTip();
+    defer fresh.deinit(alloc);
+    try std.testing.expect(try index.installPreparedRefreshFromTip(&fresh));
+    const snapshot = index.writer.acquireSnapshot();
+    defer snapshot.release();
+    try std.testing.expectEqual(@as(usize, 2), snapshot.segments.len);
+}
+
 test "persistent index refreshed after a peer merge plans from the peer's output" {
     const alloc = std.testing.allocator;
     var sink = InlinePublicationTestSink{ .allocator = alloc };

@@ -4956,7 +4956,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         (!opts.bypass_replication_write_gate and S.ownerField(self, "local_execution").*.replication_write_gate != null),
                     .caller_visibility_completion = opts.visibility_completion != null,
                     .materialized_apply = append_derived_replay and !S.ownerField(self, "executor").*.hasWorkers(),
-                    .leann_coverage = S.ownerField(self, "core").*.index_manager.leann_replication,
+                    .leann_coverage = opts.wait_for_sync_level and S.ownerField(self, "core").*.index_manager.waitOwesLeannCoverage(effective_req.sync_level),
                 };
                 const replacement_continuation: execution_resources.ReplacementContinuation = .{
                     .replay_sequence = if (append_derived_replay) sequence else 0,

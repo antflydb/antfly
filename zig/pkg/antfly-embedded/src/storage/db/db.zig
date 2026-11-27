@@ -40991,13 +40991,37 @@ pub const DB = struct {
     }
 
     pub fn drainScheduledTextMerges(self: *DB) !void {
+        return self.drainScheduledTextMergesWithin(self.defaultVisibilityWait(.none));
+    }
+
+    /// Runs every scheduled text merge. A merge refused at the tip leaves
+    /// its index owing a refresh, which runs outside the apply lock; until
+    /// it lands nothing more is planned for that index, so the drain is not
+    /// done. Each pass releases the lock and retries within `wait`.
+    pub fn drainScheduledTextMergesWithin(self: *DB, wait: derived_executor_mod.VisibilityWait) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var snapshot_replay = try self.acquireSnapshotReplayMutation();
-        defer snapshot_replay.release();
-        self.core.index_manager.refreshTextIndexesBehindTip();
-        try self.lockApplyForPortableRuntime();
-        defer self.core.unlockApply();
-        try self.core.drainScheduledTextMerges();
+        while (true) {
+            {
+                var snapshot_replay = try self.acquireSnapshotReplayMutation();
+                defer snapshot_replay.release();
+                self.core.index_manager.refreshTextIndexesBehindTip();
+                try self.lockApplyForPortableRuntime();
+                defer self.core.unlockApply();
+                try self.core.drainScheduledTextMerges();
+            }
+            if (!self.core.index_manager.textTipRefreshPending()) return;
+            try wait.check();
+            const io = self.backend_runtime.controlIo() orelse self.backend_runtime.io() orelse return error.BackendRuntimeIoUnavailable;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+
+    /// The budget a visibility wait gets when its caller set none.
+    fn defaultVisibilityWait(self: *DB, cancellation: types.CancellationToken) derived_executor_mod.VisibilityWait {
+        const timeout_ms = if (self.enrichment_runtime) |runtime| runtime.syncWaitTimeoutMs() else defaultVisibilityWaitTimeoutMs();
+        const timeout_ns = std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
+        const clock = self.backend_runtime.monotonicClock();
+        return .{ .cancellation = cancellation, .deadline_ns = clock.nowRealtimeNs() +| timeout_ns, .clock = clock };
     }
 
     /// Internal search-kernel indexing boundary. Source documents are already
@@ -42359,7 +42383,7 @@ pub const DB = struct {
             // `.text_merge_drain` doc comment.
             const wal_trace_scope = wal_trace.scope(.text_merge_drain);
             defer wal_trace_scope.end();
-            try self.drainScheduledTextMerges();
+            try self.drainScheduledTextMergesWithin(self.defaultVisibilityWait(cancellation));
         }
     }
 
@@ -46834,7 +46858,7 @@ pub const DB = struct {
                     // to.
                     const wal_trace_scope = wal_trace.scope(.text_merge_drain);
                     defer wal_trace_scope.end();
-                    try self.drainScheduledTextMerges();
+                    try self.drainScheduledTextMergesWithin(wait);
                     try wait.check();
                 }
                 try self.waitForLeannGraphCoverage(wait);

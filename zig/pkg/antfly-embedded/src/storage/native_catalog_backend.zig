@@ -390,6 +390,9 @@ pub const Options = struct {
 pub const Backend = struct {
     serialized_write_mutex: std.atomic.Mutex = .unlocked,
     allocator: Allocator,
+    /// Advances each time the mirror's state is replaced, under `mutex`:
+    /// work prepared against one state can tell whether it is still current.
+    state_epoch: std.atomic.Value(u64) = .init(0),
     sink: Sink,
     scope: []const u8,
     open_options: backend_types.OpenOptions,
@@ -546,9 +549,49 @@ pub const Backend = struct {
         lockBackend(self);
         const old = self.state;
         self.state = rc;
+        _ = self.state_epoch.fetchAdd(1, .acq_rel);
         releaseState(self.allocator, old);
         self.mutex.unlock();
         self.mirror_invalid.store(false, .release);
+    }
+
+    /// A private, read-only backend over the same sink and scope, loaded
+    /// from the file's tip now. Reads of it never touch this mirror.
+    pub fn openTipView(self: *Backend, allocator: Allocator) !*Backend {
+        const view = try allocator.create(Backend);
+        errdefer allocator.destroy(view);
+        view.* = try Backend.init(allocator, .{ .sink = self.sink, .scope = self.scope, .backend = .{ .read_only = true } });
+        return view;
+    }
+
+    pub fn closeTipView(allocator: Allocator, view: *Backend) void {
+        view.close();
+        allocator.destroy(view);
+    }
+
+    /// Replaces this mirror's state with `view`'s, if the mirror is still
+    /// at `expected_epoch`: nothing was published into it since the view
+    /// was taken.
+    pub fn adoptTipView(self: *Backend, view: *Backend, expected_epoch: u64) bool {
+        lockBackend(view);
+        const next = view.state;
+        retainState(next);
+        view.mutex.unlock();
+        lockBackend(self);
+        if (self.state_epoch.load(.acquire) != expected_epoch) {
+            self.mutex.unlock();
+            lockBackend(view);
+            releaseState(view.allocator, next);
+            view.mutex.unlock();
+            return false;
+        }
+        const old = self.state;
+        self.state = next;
+        _ = self.state_epoch.fetchAdd(1, .acq_rel);
+        releaseState(self.allocator, old);
+        self.mutex.unlock();
+        self.mirror_invalid.store(false, .release);
+        return true;
     }
 
     pub fn close(self: *Backend) void {
@@ -1075,6 +1118,7 @@ pub const Backend = struct {
             lockBackend(self.backend);
             const old = self.backend.state;
             self.backend.state = replacement;
+            _ = self.backend.state_epoch.fetchAdd(1, .acq_rel);
             self.replacement = old;
             self.backend.mutex.unlock();
         }
@@ -1337,6 +1381,7 @@ pub const Backend = struct {
             };
             const old = self.backend.state;
             self.backend.state = rc;
+            _ = self.backend.state_epoch.fetchAdd(1, .acq_rel);
             releaseState(self.allocator, old);
             self.backend.mutex.unlock();
             self.rc = null;
