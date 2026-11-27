@@ -20969,6 +20969,17 @@ test "CUDA audio replay output contract rejects changed logical geometry" {
     try std.testing.expect(!audioOutputMatches(&input, &reshaped, 16));
 }
 
+/// Callers bind disjoint destination spans before submitting unordered copies.
+fn submitUnorderedDeviceCopies(self: *CudaCompute, submit: driver_mod.MemcpyBatchAsync, destinations: []driver_mod.CUdeviceptr, sources: []driver_mod.CUdeviceptr, sizes: []usize, bytes: usize) !void {
+    std.debug.assert(destinations.len == sources.len and sources.len == sizes.len);
+    var attributes = [_]driver_mod.MemcpyAttributes{.{}};
+    var attribute_indices = [_]usize{0};
+    // A driver error may reflect pending work. Never retry after submission.
+    try self.ctx.driver.check(submit(destinations.ptr, sources.ptr, sizes.ptr, sizes.len, &attributes, &attribute_indices, 1, self.ctx.stream));
+    @import("../../execution/transfer_audit.zig").deviceCopy(bytes);
+    self.stats.d2d_bytes += bytes;
+}
+
 fn stageAudioGraphInputs(self: *CudaCompute, input_bank: buffer_mod.DeviceBuffer, inputs: []const CT, spans: []const CudaCompute.AudioInputSpan) !void {
     // The caller proves every source is outside the arena and the placement
     // gives each destination a separate slice. A batch has no internal order.
@@ -20990,13 +21001,7 @@ fn stageAudioGraphInputs(self: *CudaCompute, input_bank: buffer_mod.DeviceBuffer
             bytes += span.bytes;
         }
         if (count <= 1) break :batch;
-        var attributes = [_]driver_mod.MemcpyAttributes{.{}};
-        var attribute_indices = [_]usize{0};
-        // An error may reflect pending work. Never retry a batch as separate
-        // submissions after calling the driver.
-        try self.ctx.driver.check(submit(&destinations, &sources, &sizes, count, &attributes, &attribute_indices, 1, self.ctx.stream));
-        @import("../../execution/transfer_audit.zig").deviceCopy(bytes);
-        self.stats.d2d_bytes += bytes;
+        try submitUnorderedDeviceCopies(self, submit, destinations[0..count], sources[0..count], sizes[0..count], bytes);
         return;
     }
     for (inputs, spans) |ct, span| {
@@ -23546,7 +23551,7 @@ fn gatherDeviceColumnsOp(ctx: *anyopaque, columns: []const ops.KernelBackend.Dev
             if (bytes > source.buffer.len or bytes > capacity - offset) return error.InvalidShape;
             if (bytes == 0) continue;
             if (count == sizes.len) return false;
-            destinations[count] = target.buffer.ptr + offset;
+            destinations[count] = (try borrowBufferRange(target.buffer, offset, bytes)).ptr;
             sources[count] = source.buffer.ptr;
             sizes[count] = bytes;
             count += 1;
@@ -23559,11 +23564,7 @@ fn gatherDeviceColumnsOp(ctx: *anyopaque, columns: []const ops.KernelBackend.Dev
     try self.ctx.makeCurrent();
     // Fresh admitted destinations are disjoint from the retained sources and
     // each other. No copy in the batch depends on the order of another.
-    var attributes = [_]driver_mod.MemcpyAttributes{.{}};
-    var attribute_indices = [_]usize{0};
-    try self.ctx.driver.check(submit(&destinations, &sources, &sizes, count, &attributes, &attribute_indices, 1, self.ctx.stream));
-    @import("../../execution/transfer_audit.zig").deviceCopy(total);
-    self.stats.d2d_bytes += total;
+    try submitUnorderedDeviceCopies(self, submit, destinations[0..count], sources[0..count], sizes[0..count], total);
     return true;
 }
 
