@@ -227,10 +227,6 @@ const AudioConfig = struct {
     fn headDim(self: AudioConfig) usize {
         return self.audio_hidden / self.head_count;
     }
-
-    fn attentionContextSize(self: AudioConfig) usize {
-        return self.attention_chunk_size + self.attention_context_left - 1 + self.attention_context_right;
-    }
 };
 
 pub const Geometry = struct {
@@ -5257,7 +5253,7 @@ fn audioSelfAttention(
         .interleaved => |interleaved| blk: {
             defer cb.free(interleaved.tensor);
             if (cfg.attention_context_right == 0 and (inputs.segments.len == 0 or inputs.segment_valid != null)) {
-                var params = audioLocalAttentionParams(cfg, rows);
+                var params = try audioLocalAttentionParams(cfg, rows);
                 params.segmented = inputs.segments.len != 0;
                 params.packed_qkv = true;
                 for (interleaved.specs, 0..) |spec, i| {
@@ -5334,7 +5330,7 @@ fn audioKeyScale() f32 {
 fn audioLocalAttention(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: AudioConfig, q: CT, k: CT, v: CT, rel: CT, layer: usize, inputs: *const AudioLayerInputs) !CT {
     if (inputs.segments.len == 0) return audioLocalAttentionSingle(cb, allocator, cfg, q, k, v, rel, layer, inputs);
     if (inputs.segment_valid) |validity| if (cfg.attention_context_right == 0 and !audioHostOps().attention) {
-        var params = audioLocalAttentionParams(cfg, inputs.valid_mask.len);
+        var params = try audioLocalAttentionParams(cfg, inputs.valid_mask.len);
         params.segmented = true;
         if (try cb.gemma4AudioLocalAttention(q, k, v, rel, inputs.scales[layer], validity, params)) |result| return result;
     };
@@ -5379,7 +5375,7 @@ fn audioLocalAttentionSingle(
     const rows = inputs.valid_mask.len;
     if (layer >= inputs.scales.len) return error.InvalidTensorShape;
     if (cfg.attention_context_right == 0 and !audioHostOps().attention) {
-        if (try cb.gemma4AudioLocalAttention(q, k, v, rel, inputs.scales[layer], inputs.valid_ct, audioLocalAttentionParams(cfg, rows))) |out| return out;
+        if (try cb.gemma4AudioLocalAttention(q, k, v, rel, inputs.scales[layer], inputs.valid_ct, try audioLocalAttentionParams(cfg, rows))) |out| return out;
     }
 
     if (cfg.source_scalar_storage == .bf16) return error.SourceArithmeticUnavailable;
@@ -5397,7 +5393,7 @@ fn audioLocalAttentionSingle(
     // host/reference fallback materializes them, alongside its Q/K/V reads.
     const downloaded_scale = if (inputs.scales_host[layer].len == 0) try cb.toFloat32(inputs.scales[layer], allocator) else null;
     defer if (downloaded_scale) |values| allocator.free(values);
-    const out = try audioLocalAttentionReference(allocator, audioLocalAttentionParams(cfg, rows), q_data, k_data, v_data, rel_data, downloaded_scale orelse inputs.scales_host[layer], inputs.valid_mask);
+    const out = try audioLocalAttentionReference(allocator, try audioLocalAttentionParams(cfg, rows), q_data, k_data, v_data, rel_data, downloaded_scale orelse inputs.scales_host[layer], inputs.valid_mask);
     defer allocator.free(out);
     const out_shape = [_]i32{ @intCast(rows), @intCast(cfg.audio_hidden) };
     return cb.fromFloat32Shape(out, &out_shape);
@@ -5922,7 +5918,7 @@ fn depthwiseConvWeightCt(
     return store.cached(name, Load{ .cb = cb, .allocator = allocator, .store = store, .name = name, .kernel_size = kernel_size, .hidden = hidden });
 }
 
-fn audioLocalAttentionParams(cfg: AudioConfig, rows: usize) ops.Gemma4AudioLocalAttentionParams {
+fn audioLocalAttentionParams(cfg: AudioConfig, rows: usize) !ops.Gemma4AudioLocalAttentionParams {
     return .{
         .rows = rows,
         .hidden = cfg.audio_hidden,
@@ -5933,7 +5929,7 @@ fn audioLocalAttentionParams(cfg: AudioConfig, rows: usize) ops.Gemma4AudioLocal
         .query_scale = if (cfg.source_scalar_storage == .bf16) audioSourceQueryScale(cfg.headDim()) else 1,
         .chunk = cfg.attention_chunk_size,
         .context_left = cfg.attention_context_left,
-        .context = cfg.attentionContextSize(),
+        .context = try audio_schedule.attentionContextRows(cfg.attention_chunk_size, cfg.attention_context_left, cfg.attention_context_right),
         .k_scale = if (cfg.source_scalar_storage == .bf16) audioSourceKeyScale() else audioKeyScale(),
         .logit_cap = cfg.attention_logit_cap,
         .invalid_value = cfg.attention_invalid_logits_value,
