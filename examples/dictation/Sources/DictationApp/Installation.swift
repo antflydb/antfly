@@ -50,7 +50,11 @@ import DictationCore
         .first { FileManager.default.fileExists(atPath: $0.path) }
       let target: URL
       if let existing {
-        try SignedApplicationInstaller.verify(existing)
+        try InstallationLocation.requireInstalled(existing, directories: directories)
+        _ = try InstallationProgress.run(title: "Checking installed app") { work in
+          try SignedApplicationInstaller.verify(existing, work: work)
+          return existing
+        }
         let alert = NSAlert()
         alert.messageText = "Antfly Dictation is already installed"
         alert.informativeText =
@@ -65,9 +69,13 @@ import DictationCore
             FileManager.default.isWritableFile(atPath: $0.path)
           }) ?? directories.last
         else { throw InstallationError.noDestination }
-        target = try SignedApplicationInstaller.copy(source: source, directory: directory)
+        target = try InstallationProgress.run(title: "Installing Antfly Dictation") { work in
+          try SignedApplicationInstaller.copy(source: source, directory: directory, work: work)
+        }
       }
       return target
+    } catch is CancellationError {
+      return nil
     } catch {
       let alert = NSAlert()
       alert.alertStyle = .warning
@@ -88,6 +96,7 @@ import DictationCore
 
   static func relaunch(_ target: URL) -> Bool {
     do {
+      try InstallationLocation.requireInstalled(target, directories: applicationsDirectories)
       if let running = NSWorkspace.shared.runningApplications.first(where: {
         $0.processIdentifier != ProcessInfo.processInfo.processIdentifier
           && $0.bundleURL?.resolvingSymlinksInPath().standardizedFileURL.path
@@ -95,7 +104,11 @@ import DictationCore
       }) {
         running.activate(options: [])
       } else {
-        try SignedApplicationInstaller.run("/usr/bin/open", arguments: ["-n", target.path])
+        _ = try InstallationProgress.run(title: "Opening installed app", cancellable: false) {
+          work in
+          try work.run("/usr/bin/open", arguments: ["-n", target.path])
+          return target
+        }
       }
       return true
     } catch {
@@ -111,6 +124,11 @@ import DictationCore
 }
 
 enum InstallationLocation {
+  static func requireInstalled(_ bundle: URL, directories: [URL]) throws {
+    guard isInstalled(bundle, directories: directories) else {
+      throw InstallationError.externalLink(bundle)
+    }
+  }
   static func isInstalled(_ bundle: URL, directories: [URL]) -> Bool {
     let parent = bundle.resolvingSymlinksInPath().deletingLastPathComponent().standardizedFileURL
     return directories.contains {
@@ -119,11 +137,15 @@ enum InstallationLocation {
   }
 }
 
-private enum InstallationError: LocalizedError {
+enum InstallationError: LocalizedError {
+  case externalLink(URL)
   case noDestination
   case command(String)
   var errorDescription: String? {
     switch self {
+    case .externalLink(let url):
+      return
+        "The item at \(url.path) links to an app outside Applications. Remove that link in Finder, then install the actual app bundle."
     case .noDestination: return "No writable Applications folder is available."
     case .command(let name):
       return "The \(name) operation failed. The existing installation has not been replaced."
@@ -134,39 +156,36 @@ private enum InstallationError: LocalizedError {
 enum SignedApplicationInstaller {
   private static let requirement =
     "anchor apple generic and certificate leaf[subject.OU] = \"8Z2RNB767D\" and identifier \"dev.antfly.dictation\""
-  static func verify(_ bundle: URL) throws {
-    try run(
+  static func verify(_ bundle: URL, work: InstallationWork = InstallationWork()) throws {
+    try work.run(
       "/usr/bin/codesign",
       arguments: ["--verify", "--deep", "--strict", "-R", "=" + requirement, bundle.path])
   }
-  static func run(_ executable: String, arguments: [String]) throws {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: executable)
-    process.arguments = arguments
-    process.standardOutput = FileHandle.nullDevice
-    process.standardError = FileHandle.nullDevice
-    try process.run()
-    process.waitUntilExit()
-    guard process.terminationReason == .exit, process.terminationStatus == 0 else {
-      throw InstallationError.command(URL(fileURLWithPath: executable).lastPathComponent)
-    }
-  }
   static func copy(
-    source: URL, directory: URL, verifyBundle: (URL) throws -> Void = verify
+    source: URL, directory: URL, work: InstallationWork = InstallationWork(),
+    verifyBundle: ((URL) throws -> Void)? = nil
   ) throws -> URL {
     let manager = FileManager.default
+    let verifyBundle = verifyBundle ?? { try verify($0, work: work) }
+    work.stage("Checking app signature…")
+    try work.checkCancellation()
     try verifyBundle(source)
+    try work.checkCancellation()
     try manager.createDirectory(at: directory, withIntermediateDirectories: true)
     let staging = directory.appendingPathComponent(".antfly-install-" + UUID().uuidString)
     try manager.createDirectory(at: staging, withIntermediateDirectories: false)
     defer { try? manager.removeItem(at: staging) }
     let staged = staging.appendingPathComponent("Antfly Dictation.app")
-    try run(
+    work.stage("Copying app…")
+    try work.run(
       "/usr/bin/ditto", arguments: ["--rsrc", "--extattr", "--acl", source.path, staged.path])
+    work.stage("Verifying installed copy…")
+    try work.checkCancellation()
     try verifyBundle(staged)
+    try work.checkCancellation()
     let destination = directory.appendingPathComponent("Antfly Dictation.app")
     // moveItem fails if another installer won the race. It never replaces a bundle.
-    try manager.moveItem(at: staged, to: destination)
+    try work.publish { try manager.moveItem(at: staged, to: destination) }
     return destination
   }
 }

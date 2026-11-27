@@ -101,3 +101,60 @@ struct InstallationTests {
     #expect(FileManager.default.fileExists(atPath: source.path))
   }
 }
+
+extension InstallationTests {
+  @Test func applicationsLinkToDownloadsIsAConflict() throws {
+    let (root, source, directory) = try fixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let link = directory.appendingPathComponent("Antfly Dictation.app")
+    try FileManager.default.createSymbolicLink(at: link, withDestinationURL: source)
+    #expect(!InstallationLocation.isInstalled(link, directories: [directory]))
+    #expect(throws: InstallationError.self) {
+      try InstallationLocation.requireInstalled(link, directories: [directory])
+    }
+    #expect(FileManager.default.fileExists(atPath: source.path))
+  }
+
+  @Test func canceledInstallationNeverPublishesAndRemovesItsStage() throws {
+    let (root, source, directory) = try fixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let work = InstallationWork()
+    #expect(throws: CancellationError.self) {
+      try SignedApplicationInstaller.copy(source: source, directory: directory, work: work) {
+        bundle in
+        if bundle != source { work.cancel() }
+      }
+    }
+    #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty)
+    #expect(FileManager.default.fileExists(atPath: source.path))
+  }
+
+  @Test func cancellationBeforeStartAndPublicationBoundaryAreExplicit() throws {
+    let canceled = InstallationWork()
+    canceled.cancel()
+    var published = false
+    #expect(throws: CancellationError.self) { try canceled.publish { published = true } }
+    #expect(!published)
+    #expect(throws: CancellationError.self) { try canceled.run("/usr/bin/true", arguments: []) }
+    let committed = InstallationWork()
+    try committed.publish { published = true }
+    committed.cancel()
+    #expect(published)
+    #expect(!committed.isCanceled)
+  }
+
+  @Test(.timeLimit(.minutes(1))) func cancellationStopsTheOwnedSubprocess() async throws {
+    let work = InstallationWork()
+    defer { work.cancel() }
+    let child = Task.detached { try work.run("/bin/sleep", arguments: ["60"]) }
+    let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+    while !work.hasRunningProcess, ContinuousClock.now < deadline {
+      try await Task.sleep(for: .milliseconds(10))
+    }
+    try #require(work.hasRunningProcess)
+    work.cancel()
+    await #expect(throws: CancellationError.self) { try await child.value }
+    #expect(!work.hasRunningProcess)
+  }
+}

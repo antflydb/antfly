@@ -86,8 +86,10 @@ import SwiftUI
   func installApplication() {
     guard canInstallApplication, let store else { return }
     installing = true
+    store.working = true
     Task {
       guard let target = AppInstallation.prepareInstallation() else {
+        store.working = false
         installing = false
         return
       }

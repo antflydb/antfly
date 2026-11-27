@@ -25,7 +25,11 @@ before and after copying. It uses `/Applications` when writable, otherwise
 **Not Now** suppresses later launch prompts; **Install in Applications…** remains
 available in Settings → General. The original downloaded copy is kept. No
 administrator password is requested; failures offer manual Finder installation.
-Development builds never prompt.
+Installation shows progress while copy and signature verification run on a worker.
+Cancel stops the owned subprocess and removes staging files before returning;
+after the verified bundle is published, installation completes. Applications
+symlinks pointing outside the installation folders are reported as conflicts and
+never relaunched as installed apps. Development builds never prompt.
 
 Use **Check for Updates…** in the application menu, menu-bar panel, or Settings.
 Settings also provides automatic checks, automatic downloads, and beta opt-in.
