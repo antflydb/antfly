@@ -21755,12 +21755,7 @@ fn localRelativeAttention(ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_s
     const whole = [_]usize{params.rows};
     const spans = if (destination) |assigned| if (!params.segmented and assigned.segments.len != 0) assigned.segments else &whole else &whole;
     if (destination) |assigned| if (assigned.segments.len != 0) {
-        var remaining = params.rows;
-        for (assigned.segments) |rows| {
-            if (rows == 0 or rows > remaining) return error.InvalidTensorShape;
-            remaining -= rows;
-        }
-        if (remaining != 0) return error.InvalidTensorShape;
+        @import("../../execution/audio_schedule.zig").GroupedRows.validatePartition(assigned.segments, params.rows) catch return error.InvalidTensorShape;
     };
     const input_buffers = [6]buffer_mod.DeviceBuffer{
         tensorFromCt(q).buffer, tensorFromCt(k).buffer, tensorFromCt(v).buffer,

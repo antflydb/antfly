@@ -4697,7 +4697,10 @@ const AudioLayerInputs = struct {
     fn bindMasks(cb: *const ComputeBackend, allocator: std.mem.Allocator, valid_mask: []const bool, segments: []const usize) !MaskBindings {
         const grouped = segments.len != 0 and (cb.kind() == .metal or cb.kind() == .cuda);
         const rows = valid_mask.len;
-        if (grouped and rows > 16777216) return error.InvalidTensorShape;
+        if (grouped) {
+            if (rows > 16777216) return error.InvalidTensorShape;
+            audio_schedule.GroupedRows.validatePartition(segments, rows) catch return error.InvalidTensorShape;
+        }
         const planes = try allocator.alloc(f32, if (grouped) rows * 3 else rows);
         defer allocator.free(planes);
         const valid = planes[0..rows];
@@ -4707,14 +4710,12 @@ const AudioLayerInputs = struct {
         const tags = planes[2 * rows ..];
         var offset: usize = 0;
         for (segments) |span| {
-            if (span == 0 or span > rows - offset) return error.InvalidTensorShape;
             for (offset..offset + span) |row| {
                 starts[row] = @floatFromInt(offset);
                 tags[row] = @as(f32, @floatFromInt(offset + 1)) * (2 * valid[row] - 1);
             }
             offset += span;
         }
-        if (offset != rows) return error.InvalidTensorShape;
         // These planes have one invocation lifetime and retain the same
         // upload, while individual kernels keep their original vector ABI.
         const bank = try deviceResidentFromFloat32(cb, planes, &.{ @intCast(planes.len), 1 });
@@ -5337,6 +5338,7 @@ fn audioKeyScale() f32 {
 fn audioLocalAttention(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: AudioConfig, q: CT, k: CT, v: CT, rel: CT, layer: usize, inputs: *const AudioLayerInputs) !CT {
     if (inputs.segments.len == 0) return audioLocalAttentionSingle(cb, allocator, cfg, q, k, v, rel, layer, inputs);
     if (layer >= inputs.scales.len) return error.InvalidTensorShape;
+    audio_schedule.GroupedRows.validatePartition(inputs.segments, inputs.valid_mask.len) catch return error.InvalidInputShape;
     const device_attention = cfg.attention_context_right == 0 and !audioHostOps().attention;
     const params = if (device_attention) try audioLocalAttentionParams(cfg, inputs.valid_mask.len) else null;
     if (inputs.segment_valid) |validity| if (params) |regular| {
@@ -5348,12 +5350,6 @@ fn audioLocalAttention(cb: *const ComputeBackend, allocator: std.mem.Allocator, 
             if (try cb.gemma4AudioLocalAttention(q, k, v, rel, inputs.scales[layer], validity, segmented)) |result| return result;
         }
     };
-    var remaining = inputs.valid_mask.len;
-    for (inputs.segments) |span| {
-        if (span == 0 or span > remaining) return error.InvalidInputShape;
-        remaining -= span;
-    }
-    if (remaining != 0) return error.InvalidInputShape;
     const output = (try cb.allocUninitF32Shape(&.{ @intCast(inputs.valid_mask.len), @intCast(cfg.audio_hidden) })) orelse return error.UnsupportedResidentGemma4Audio;
     errdefer cb.free(output);
     if (params) |regular| if (cb.vtable.regions.audio_attention.localRelativeInto != null) {

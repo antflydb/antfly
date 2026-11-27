@@ -29,6 +29,17 @@ pub fn subsampledRows(frames: usize) usize {
 pub const GroupedRows = struct {
     pub const max_clips = 4;
 
+    /// An existing compacted bank must be split into nonempty, exhaustive rows.
+    pub fn validatePartition(spans: []const usize, rows: usize) error{InvalidAudioPartition}!void {
+        if (spans.len == 0 or spans.len > max_clips) return error.InvalidAudioPartition;
+        var remaining = rows;
+        for (spans) |span| {
+            if (span == 0 or span > remaining) return error.InvalidAudioPartition;
+            remaining -= span;
+        }
+        if (remaining != 0) return error.InvalidAudioPartition;
+    }
+
     spans: [max_clips]usize = @splat(0),
     offsets: [max_clips]usize = @splat(0),
     total: usize = 0,
