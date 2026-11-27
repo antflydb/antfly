@@ -255,9 +255,11 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const flushTransactionReplicationOutbox = commit.flushTransactionReplicationOutbox;
         pub const generatedPrecomputeModeForSyncLevel = preparation.generatedPrecomputeModeForSyncLevel;
         pub const capturePreparedEnrichments = preparation.capturePreparedEnrichments;
+        pub const captureSeedPreparation = preparation.captureSeedPreparation;
         pub const validatePreparedEnrichments = preparation.validatePreparedEnrichments;
         pub const restorePreparedEnrichments = preparation.restorePreparedEnrichments;
         pub const restorePreparedEnrichmentsForRows = preparation.restorePreparedEnrichmentsForRows;
+        pub const restoreSeedPreparation = preparation.restoreSeedPreparation;
         pub const generatedPrecomputeMode = preparation.generatedPrecomputeMode;
         pub const graphMutationIdentityEql = materialization.graphMutationIdentityEql;
         pub const hasConfiguredResolvers = materialization.hasConfiguredResolvers;

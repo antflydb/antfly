@@ -962,6 +962,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn capturePreparedEnrichments(self: anytype, output: *execution_resources.PreparationCapture, req: types.BatchRequest, plan: *const index_manager_mod.IndexManager.WritePlanSnapshot, generated: *const PrecomputedGeneratedBatch) !void {
+            return capturePreparedEnrichmentsMode(self, output, req, plan, generated, .direct);
+        }
+
+        /// Leader seed preparation: the write's own (non-inferring)
+        /// preparation becomes the packet replicas apply, so seed acceptance
+        /// never depends on a replica's embedder configuration.
+        pub fn captureSeedPreparation(self: anytype, output: *execution_resources.PreparationCapture, req: types.BatchRequest, plan: *const index_manager_mod.IndexManager.WritePlanSnapshot, generated: *const PrecomputedGeneratedBatch) !void {
+            if (generated.prepared_producers.len != 0) return error.InvalidBatchRequest;
+            return capturePreparedEnrichmentsMode(self, output, req, plan, generated, .seeds);
+        }
+
+        fn capturePreparedEnrichmentsMode(self: anytype, output: *execution_resources.PreparationCapture, req: types.BatchRequest, plan: *const index_manager_mod.IndexManager.WritePlanSnapshot, generated: *const PrecomputedGeneratedBatch, mode: execution_resources.PreparedEnrichments.Mode) !void {
             const publication = @import("artifact_publication.zig");
             var arena = std.heap.ArenaAllocator.init(output.alloc);
             defer arena.deinit();
@@ -1008,6 +1020,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .coverage = generated.coverage_outcomes,
                 .producers = generated.prepared_producers,
                 .pending_children = generated.pending_child_work,
+                .mode = mode,
+                .seeds = if (mode == .seeds) generated.seed_outcomes else &.{},
             };
             const json = try std.json.Stringify.valueAlloc(output.alloc, packet, .{});
             errdefer output.alloc.free(json);
@@ -1041,6 +1055,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn restorePreparedEnrichmentsForRows(self: anytype, a: Allocator, req: types.BatchRequest, extracted: []const mapper.ExtractedWrite, plan: *const index_manager_mod.IndexManager.WritePlanSnapshot, packet: execution_resources.PreparedEnrichments) !PrecomputedGeneratedBatch {
+            if (packet.mode == .seeds) return restoreSeedPreparation(a, req, plan, packet);
             if (packet.version != 1 or !std.mem.eql(u8, &packet.catalog_digest, &(plan.artifact_catalogs orelse return error.VersionConflict).digest())) return error.VersionConflict;
             if (!@import("commit_requirements.zig").catalogSupported(plan.*)) return error.InvalidBatchRequest;
             var budget = try @import("commit_requirements.zig").sourceBudget(req.writes, req.deletes);
@@ -1069,6 +1084,45 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return restorePreparedEnrichments(a, packet);
         }
 
+        /// A leader's seed preparation ran no producer: its output is the
+        /// write's accepted seeds and their derived records, and the pending
+        /// work it left for the leader's worker. Every key must belong to an
+        /// output of a document this write touches.
+        pub fn restoreSeedPreparation(a: Allocator, req: types.BatchRequest, plan: *const index_manager_mod.IndexManager.WritePlanSnapshot, packet: execution_resources.PreparedEnrichments) !PrecomputedGeneratedBatch {
+            if (packet.version != 1 or !std.mem.eql(u8, &packet.catalog_digest, &(plan.artifact_catalogs orelse return error.VersionConflict).digest())) return error.VersionConflict;
+            if (packet.producers.len != 0 or req.transaction != null) return error.InvalidBatchRequest;
+            var documents = std.ArrayListUnmanaged([]const u8).empty;
+            defer documents.deinit(a);
+            for (req.writes) |write| try documents.append(a, write.key);
+            for (req.deletes) |key| try documents.append(a, key);
+            try validatePreparedKeysFor(a, plan, packet, documents.items);
+            var result = try restorePreparedEnrichments(a, packet);
+            errdefer result.deinit(a);
+            result.seed_outcomes = try cloneSeedOutcomes(a, packet.seeds);
+            return result;
+        }
+
+        fn cloneSeedOutcomes(a: Allocator, outcomes: []const artifact_seeds.OutcomeEntry) ![]artifact_seeds.OutcomeEntry {
+            const out = try a.alloc(artifact_seeds.OutcomeEntry, outcomes.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (out[0..initialized]) |entry| {
+                    a.free(entry.key);
+                    a.free(entry.name);
+                }
+                a.free(out);
+            }
+            for (outcomes, out) |entry, *copy| {
+                const key = try a.dupe(u8, entry.key);
+                errdefer a.free(key);
+                copy.* = entry;
+                copy.key = key;
+                copy.name = try a.dupe(u8, entry.name);
+                initialized += 1;
+            }
+            return out;
+        }
+
         fn producerIdentity(request: enrichment_types.GeneratedEnrichmentRequest) [32]u8 {
             var hash = std.crypto.hash.sha2.Sha256.init(.{});
             hash.update(&@import("artifact_producer_input.zig").definitionDigest(request));
@@ -1091,6 +1145,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         fn validatePreparedKeys(backing: Allocator, plan: *const index_manager_mod.IndexManager.WritePlanSnapshot, packet: execution_resources.PreparedEnrichments) !void {
+            return validatePreparedKeysFor(backing, plan, packet, null);
+        }
+
+        /// `seed_documents` null: the packet's producers own its keys. Set:
+        /// every catalog output of those documents may (seeds packets ran no
+        /// producer, so each seeded output is one of them).
+        fn validatePreparedKeysFor(backing: Allocator, plan: *const index_manager_mod.IndexManager.WritePlanSnapshot, packet: execution_resources.PreparedEnrichments, seed_documents: ?[]const []const u8) !void {
             var arena = std.heap.ArenaAllocator.init(backing);
             defer arena.deinit();
             const a = arena.allocator();
@@ -1107,14 +1168,35 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
             var definitions: std.AutoHashMapUnmanaged([32]u8, enrichment_types.GeneratedEnrichmentRequest) = .empty;
             for (plan.generated_templates) |request| try definitions.put(a, @import("artifact_producer_input.zig").definitionDigest(request), request);
-            for (packet.producers) |produced| {
+            const Owner = struct { definition: [32]u8, doc_key: []const u8 };
+            var owners = std.ArrayListUnmanaged(Owner).empty;
+            for (packet.producers) |produced| try owners.append(a, .{ .definition = produced.definition, .doc_key = produced.doc_key });
+            if (seed_documents) |documents| for (documents) |document| for (plan.generated_templates) |request| {
+                try owners.append(a, .{ .definition = @import("artifact_producer_input.zig").definitionDigest(request), .doc_key = document });
+            };
+            for (owners.items) |produced| {
                 var producer = definitions.get(produced.definition) orelse return error.InvalidBatchRequest;
                 producer.doc_key = produced.doc_key;
                 const name = if (producer.kind == .dense_embedding or producer.kind == .sparse_embedding) requestEmbeddingName(producer) else requestArtifactName(producer);
                 try allowed.put(a, preparedScope(producer.doc_key, name), {});
+                if (seed_documents != null) {
+                    // Acceptance records of seeded chunks, unit chunks and
+                    // extraction bindings (`artifact_seed_chunks.zig`).
+                    const seed_records = @import("artifact_seed_chunks.zig");
+                    try metadata.put(a, try seed_records.keyAlloc(a, producer.doc_key, name), {});
+                    try metadata.put(a, try seed_records.unitKeyAlloc(a, producer.doc_key, name), {});
+                    try metadata.put(a, try seed_records.extractionKeyAlloc(a, producer.doc_key, name), {});
+                }
                 if (producer.kind != .asset) continue;
-                if (children.get(name)) |list| for (list.items) |child| try retired.put(a, preparedScope(producer.doc_key, child), {});
+                if (children.get(name)) |list| for (list.items) |child| {
+                    try retired.put(a, preparedScope(producer.doc_key, child), {});
+                    // An extraction seed publishes its unit-scoped chunks.
+                    if (seed_documents != null) try allowed.put(a, preparedScope(producer.doc_key, child), {});
+                };
                 try metadata.put(a, try S.assetStateKeyAlloc(a, producer.doc_key, name), {});
+                // A seeded upstream output's local publication receipt binds
+                // its downstream chunks and vectors.
+                if (seed_documents != null) try metadata.put(a, try @import("artifact_local_publication.zig").key(a, try internal_keys.artifactNamedPrefixAlloc(a, producer.doc_key, "asset", name)), {});
                 try metadata.put(a, try internal_keys.documentUnitNavigationSummaryKeyAlloc(a, producer.doc_key, name), {});
                 const block = try internal_keys.documentUnitNavigationBlockKeyAlloc(a, producer.doc_key, name, 0);
                 try blocks.put(a, block[0 .. block.len - 4], {});

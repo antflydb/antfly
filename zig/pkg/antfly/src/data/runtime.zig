@@ -16358,6 +16358,33 @@ pub const DataServer = struct {
         return legacy_req;
     }
 
+    /// An ordinary write carrying explicit artifact seeds (#1791). Its leader
+    /// accepts the seeds before proposing (`DB.prepareSeedEnrichments`), so
+    /// replicas apply the accepted output instead of accepting the seeds
+    /// against their own embedder configuration. A false positive only costs
+    /// a preparation without seeds.
+    fn seedPreparationEligible(req: antfly.db.types.BatchRequest) bool {
+        if (req.transaction != null or req.prepared_enrichments_json != null or req.commit_requires == .direct_enrichments) return false;
+        switch (req.sync_level) {
+            .enrichments, .full_index => return false,
+            .propose, .write, .full_text => {},
+        }
+        for (req.writes) |write| {
+            if (std.mem.indexOf(u8, write.value, "\"_artifacts\"") != null or std.mem.indexOf(u8, write.value, "\"_chunks\"") != null) return true;
+        }
+        for (req.transforms) |transform| for (transform.operations) |operation| {
+            if (std.mem.indexOf(u8, operation.path, "_artifacts.") != null or std.mem.indexOf(u8, operation.path, "_chunks.") != null) return true;
+        };
+        return false;
+    }
+
+    /// Whether the proposal carries a leader's seed preparation. Packet
+    /// members are top-level JSON keys; document bytes inside it are escaped.
+    fn carriesSeedPreparation(req: antfly.db.types.BatchRequest) bool {
+        const json = req.prepared_enrichments_json orelse return false;
+        return std.mem.indexOf(u8, json, ",\"mode\":\"seeds\"") != null;
+    }
+
     fn preferredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest, minimum: u16, active: u16, probe_after_ns: u64, now_ns: u64) u16 {
         // Establish a command's mandatory floor first. An optional v27 probe
         // must not reject a v23 command that a mixed v26/v27 group can admit.
@@ -16419,6 +16446,7 @@ pub const DataServer = struct {
         if (req.merge_source_transition) |transition| if (transition.kind == .finalize)
             return @import("../common/data_raft_protocol.zig").batch_merge_history_cut_protocol_version;
         if (try @import("../common/data_raft_protocol.zig").completionProtocolVersion(alloc, req)) |required| return required;
+        if (carriesSeedPreparation(req)) return @import("../common/data_raft_protocol.zig").batch_seed_preparation_protocol_version;
         if (req.commit_requires == .direct_enrichments or req.prepared_enrichments_json != null)
             return @import("../common/data_raft_protocol.zig").batch_prepared_enrichments_protocol_version;
         if (antfly.db.types.requiresDenseArtifactFlagsProtocol(req))
@@ -18209,6 +18237,12 @@ pub const DataServer = struct {
                 }
                 const activation_entry = try self.dataRaftProtocolActivationEntry(group_id);
                 required_protocol_version = preferredRaftBatchProtocolVersion(req, minimum_protocol_version, activation_entry.protocol_version.load(.acquire), activation_entry.revision_probe_after_ns.load(.acquire), self.dataRaftMonotonicNs());
+                // Leader seed preparation is an optional upgrade: without it
+                // every replica accepts the seeds at apply, as before.
+                if (comptime linked_storage) {
+                    if (seedPreparationEligible(req))
+                        required_protocol_version = @max(required_protocol_version, @import("../common/data_raft_protocol.zig").batch_seed_preparation_protocol_version);
+                }
                 protocol_activation_entry = activation_entry;
                 if (activation_entry.protocol_version.load(.acquire) >= required_protocol_version) {
                     protocol_preflight.activatable_version = activation_entry.protocol_version.load(.acquire);
@@ -18322,6 +18356,27 @@ pub const DataServer = struct {
                     try ensureDataRaftBatchRouteActive(route);
                     if (self.dataRaftMonotonicNs() >= deadline_ns) return error.LeaderUnavailable;
                 }
+                // Leader seed preparation (#1791): accept the write's seeds once,
+                // here, without inference, and propose the accepted output.
+                // Only when every applying peer decodes the packet; otherwise
+                // replicas keep accepting the seeds at apply.
+                if (comptime linked_storage) if (seedPreparationEligible(req)) if (protocol_activation_entry) |activation| {
+                    const seed_version = @import("../common/data_raft_protocol.zig").batch_seed_preparation_protocol_version;
+                    if (activation.protocol_version.load(.acquire) >= seed_version or protocol_preflight.activatable_version >= seed_version or activation.pending_version.load(.acquire) >= seed_version) {
+                        if (batchMutatesDocuments(req)) req.document_version_scheme = .revision_v1;
+                        if (protocol_activation_lock_owned) {
+                            activation.activation_mutex.unlock();
+                            protocol_activation_lock_owned = false;
+                        }
+                        const remaining_ns = deadline_ns -| self.dataRaftMonotonicNs();
+                        if (remaining_ns == 0) return error.LeaderUnavailable;
+                        const native_deadline_ns = platform_time.monotonicNs() +| remaining_ns;
+                        prepared_json = try (try self.ensureKernelOwnerSource()).prepareEnrichments(alloc, group_id, table_name, req, native_deadline_ns, if (route.cancellation) |signal| signal.token() else route.visibility_cancellation);
+                        req.prepared_enrichments_json = prepared_json;
+                        try ensureDataRaftBatchRouteActive(route);
+                        if (self.dataRaftMonotonicNs() >= deadline_ns) return error.LeaderUnavailable;
+                    }
+                };
                 const admission_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
                 if (req.restore_staging_scope) |scope| {
                     if (comptime linked_storage) {
@@ -18521,6 +18576,11 @@ pub const DataServer = struct {
                             active_protocol_version,
                             proposal_time,
                         );
+                        // A peer that cannot decode a seed preparation accepts
+                        // the seeds at apply instead, exactly as before it.
+                        if (active_protocol_version < @import("../common/data_raft_protocol.zig").batch_seed_preparation_protocol_version and carriesSeedPreparation(proposal_req)) {
+                            proposal_req.prepared_enrichments_json = null;
+                        }
                         if (authorized_sql_lock) |authorized| {
                             var checked = authorized;
                             // Revalidate lease time at append, after all

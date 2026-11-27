@@ -341,6 +341,28 @@ rows prepared in the write) and is stored with the identity the sparse
 producer records for that chunk text at its revision; unseeded chunks are
 embedded.
 
+### Raft: leader seed preparation
+
+On a Raft table the leader accepts a write's explicit seeds before proposing
+it (`DB.prepareSeedEnrichments`). Preparation runs exactly as a commit
+would, under the apply lock and without inference, and yields a `seeds`-mode
+`prepared_enrichments_json` packet: the accepted artifact bytes, seeded chunk
+and unit records, pending work for unseeded outputs, guards on each touched
+document, and the per-item outcomes. Replicas, the leader included, apply that
+packet instead of accepting the seeds themselves, so seeded output never
+depends on a replica's embedder or producer configuration, and a replica
+without an embedder applies it byte for byte. Guards bind the packet to the
+state it was prepared against; a concurrent change fails the entry with
+`VersionConflict` on every replica alike.
+
+The packet requires Raft batch protocol 76. It is an optional upgrade: the
+leader prepares only once every applying peer can decode protocol 76, and
+drops the packet if the proposal is encoded at an older version, in which case
+replicas accept the seeds at apply as before. Transactions (including
+multi-shard 2PC batches), `direct_enrichments` writes, enrichment-level sync
+levels and seeds supplied only through field mappings keep apply-time
+acceptance.
+
 ### Late inference results
 
 Generated output that was planned before a seed was accepted or replaced must
@@ -372,12 +394,12 @@ These fail with `ArtifactSeedNotAccepted` rather than regenerating:
 
 ## Remaining work
 
-- Leader-prepared seed acceptance for Raft, and per-item outcomes in server
-  batch responses. Replicas accept seeds during deterministic apply (seed
-  errors are expected apply failures that advance the entry on every replica
-  alike); dense seeds resolve the embedder's provider generation there, as
-  synchronous generated preparation does. The proposer does not receive apply
-  outcomes, so server responses report counts only.
+- Per-item outcomes in server batch responses. The proposing leader holds
+  them in its seed preparation packet, but the table write source returns no
+  value to the HTTP handler, and forwarded writes would need the internal
+  forwarding response to carry them. Until then, plan with `validate_only`.
+- Leader seed preparation for transactions and multi-shard 2PC batches, and
+  for seeds that come only from enrichment field mappings.
 - `on_missing: pending` for field mappings (outputs that wait for a later seed
   instead of generating or failing), with readiness that reports them.
 - Externally maintained artifacts declared without any producer.

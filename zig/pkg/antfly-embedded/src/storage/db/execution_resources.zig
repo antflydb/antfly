@@ -1286,16 +1286,20 @@ pub const SeedPlanCapture = struct {
     json: ?[]u8 = null,
 };
 
-/// Per-item outcomes of the seeds a committed write carried (a JSON array),
-/// for a caller on this thread that reports them (`DB.batchReportingSeeds`,
-/// the C and HTTP batch entry points). Preparation runs on the caller's
-/// thread, as `backend_types.commit_progress` relies on too.
-pub threadlocal var seed_report: ?*SeedPlanCapture = null;
-
 pub const BatchExecutionOptions = struct {
     // Process-local checked plan, never serialized or derived from JSON.
     checked_native_atomic: ?*const CheckedNativeAtomic = null,
     seed_plan: ?*SeedPlanCapture = null,
+    /// Receives the per-item outcomes of the seeds a committed write carried
+    /// (a JSON array; left null when the write carried none). An explicit
+    /// option, not thread state: shared-core builds run preparation in the
+    /// storage engine's own compilation, which a consumer's thread-local
+    /// would never reach.
+    seed_report: ?*SeedPlanCapture = null,
+    /// Leader seed preparation: run the write's preparation under the apply
+    /// lock exactly as for a commit, then capture a `seeds` packet
+    /// (`PreparedEnrichments.mode`) and return before staging anything.
+    seed_preparation: ?*PreparationCapture = null,
     preparation_context: ?@import("antfly_inference_execution_context").RequestContext = null,
     preparation_capture: ?*PreparationCapture = null,
     resolver_review_command: ?*const @import("resolver_review.zig").Command = null,
@@ -2313,6 +2317,21 @@ pub const PreparedEnrichments = struct {
     coverage: []const PrecomputedCoverageOutcome,
     producers: []const PreparedProducer,
     pending_children: bool = false,
+    /// `seeds`: the leader accepted the write's artifact seeds and ran no
+    /// producer; replicas apply its output instead of accepting the seeds
+    /// against their own embedder configuration. Omitted from `direct`
+    /// packets, whose encoding predates it.
+    mode: Mode = .direct,
+    /// Per-item seed outcomes, reported to the proposing caller.
+    seeds: []const @import("artifact_seeds.zig").OutcomeEntry = &.{},
+
+    pub const Mode = enum { direct, seeds };
+
+    /// `direct` packets keep their original encoding (older decoders reject
+    /// unknown members).
+    pub fn nativeJsonSkipField(self: PreparedEnrichments, name: []const u8) bool {
+        return self.mode == .direct and (std.mem.eql(u8, name, "mode") or std.mem.eql(u8, name, "seeds"));
+    }
 
     pub fn requestDigest(a: Allocator, req: types.BatchRequest) ![32]u8 {
         const value = .{

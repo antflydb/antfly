@@ -66,7 +66,12 @@ pub const batch_merge_cutover_receipt_protocol_version: u16 = 74;
 /// change notices, and content outbox acknowledgements
 /// (`_context_dependency`). Older peers cannot apply them as empty batches.
 pub const batch_context_dependency_protocol_version: u16 = 75;
-pub const batch_protocol_version: u16 = batch_context_dependency_protocol_version;
+/// Version 76 carries a leader's artifact seed preparation: a write's
+/// `prepared_enrichments_json` in `seeds` mode, which replicas apply instead
+/// of accepting the seeds against their own embedder (#1791). Older peers
+/// reject the packet as a direct requirement they were not asked to meet.
+pub const batch_seed_preparation_protocol_version: u16 = 76;
+pub const batch_protocol_version: u16 = batch_seed_preparation_protocol_version;
 pub const maximum_decodable_batch_protocol_version: u16 = batch_protocol_version;
 pub const batch_split_origin_enrollment_protocol_version: u16 = 54;
 pub const batch_split_history_seed_protocol_version: u16 = 53;

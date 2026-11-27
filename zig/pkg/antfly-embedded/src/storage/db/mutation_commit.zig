@@ -186,9 +186,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const encodeDocumentTimestampValue = S.encodeDocumentTimestampValue;
         const freeOwnedKeySlice = S.freeOwnedKeySlice;
         const capturePreparedEnrichments = S.capturePreparedEnrichments;
+        const captureSeedPreparation = S.captureSeedPreparation;
         const validatePreparedEnrichments = S.validatePreparedEnrichments;
         const restorePreparedEnrichments = S.restorePreparedEnrichments;
         const restorePreparedEnrichmentsForRows = S.restorePreparedEnrichmentsForRows;
+        const restoreSeedPreparation = S.restoreSeedPreparation;
         const generatedPrecomputeMode = S.generatedPrecomputeMode;
         const graphCleanupReplayWritesAlloc = S.graphCleanupReplayWritesAlloc;
         const graphEndpointCleanupDeletesAlloc = S.graphEndpointCleanupDeletesAlloc;
@@ -399,7 +401,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer if (decoded_prepared) |*packet| packet.deinit();
             var req = incoming_req;
             if (decoded_prepared) |packet| {
-                if (req.commit_requires != .direct_enrichments) return error.InvalidBatchRequest;
+                // A seeds packet replaces apply-time seed acceptance for an
+                // ordinary write; a direct packet serves only its requirement.
+                const seeds_packet = packet.value.mode == .seeds;
+                if (seeds_packet == (req.commit_requires == .direct_enrichments)) return error.InvalidBatchRequest;
+                if (seeds_packet and (req.transaction != null or opts.transaction_resolution != null)) return error.InvalidBatchRequest;
                 if (opts.transaction_resolution == null) {
                     req.writes = packet.value.writes;
                     req.deletes = packet.value.deletes;
@@ -2695,10 +2701,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     precomputed_generated = preparation.document_generated.?;
                     preparation.document_generated = null;
                 } else if (decoded_prepared) |packet| {
-                    // Durable transaction resolution may deliberately bypass
-                    // current-generation speculative preparation. It must still
-                    // consume the frozen effects, never invoke a producer.
-                    precomputed_generated = try restorePreparedEnrichments(preparation_alloc, packet.value);
+                    if (packet.value.mode == .seeds) {
+                        // The leader's seed preparation: apply its accepted
+                        // output; this replica's embedder is never consulted.
+                        var plan = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
+                        defer plan.release();
+                        precomputed_generated = try restoreSeedPreparation(preparation_alloc, effective_req, plan.plan(), packet.value);
+                    } else {
+                        // Durable transaction resolution may deliberately bypass
+                        // current-generation speculative preparation. It must still
+                        // consume the frozen effects, never invoke a producer.
+                        precomputed_generated = try restorePreparedEnrichments(preparation_alloc, packet.value);
+                    }
                 } else {
                     precomputed_generated = try prepareGeneratedEnrichments(
                         self,
@@ -2713,6 +2727,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     );
                 }
 
+                if (opts.seed_preparation) |capture| {
+                    // The packet is this exact prepared write; nothing is
+                    // staged or committed here.
+                    defer {
+                        S.ownerField(self, "core").*.unlockApply();
+                        apply_mutex_held = false;
+                    }
+                    var plan = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
+                    defer plan.release();
+                    try captureSeedPreparation(self, capture, effective_req, plan.plan(), &precomputed_generated);
+                    return;
+                }
                 if (opts.seed_plan) |capture| {
                     // Planning reports outcomes for the exact prepared write
                     // and returns before anything is staged or committed.
@@ -2726,7 +2752,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // the item reports `conflict` (with the existing origin) to
                 // the caller collecting outcomes; the rest of the write
                 // commits. A transaction's resolution reports to no caller.
-                if (opts.transaction_resolution == null) if (execution_resources.seed_report) |capture| if (precomputed_generated.seed_outcomes.len > 0) {
+                if (opts.transaction_resolution == null) if (opts.seed_report) |capture| if (precomputed_generated.seed_outcomes.len > 0) {
                     if (capture.json) |previous| capture.alloc.free(previous);
                     capture.json = null;
                     capture.json = try std.json.Stringify.valueAlloc(capture.alloc, precomputed_generated.seed_outcomes, .{ .emit_null_optional_fields = false });

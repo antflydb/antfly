@@ -1779,14 +1779,27 @@ pub fn trackedBatchWithWriterLaneHook(
     table_name: ?[]const u8,
     writer_lane_release_before_wait: ?@import("../storage/db/execution_resources.zig").WriterLaneReleaseHook,
 ) anyerror!void {
+    return trackedBatchReportingSeeds(database, req, primary_committed, table_name, writer_lane_release_before_wait, null);
+}
+
+/// `trackedBatchWithWriterLaneHook` that also captures the per-item outcomes
+/// of the write's artifact seeds.
+pub fn trackedBatchReportingSeeds(
+    database: *db_mod.DB,
+    req: db_mod.types.BatchRequest,
+    primary_committed: *bool,
+    table_name: ?[]const u8,
+    writer_lane_release_before_wait: ?@import("../storage/db/execution_resources.zig").WriterLaneReleaseHook,
+    seed_report: ?*@import("../storage/db/execution_resources.zig").SeedPlanCapture,
+) anyerror!void {
     if ((req.source_producer != .unlabelled and req.source_producer != .ordinary) or req.transaction != null or req.online_source != null) return error.SourceTransactionIdentityConflict;
     var ordinary = req;
     ordinary.source_producer = .ordinary;
     const receipts = @import("outcome_receipts.zig");
-    const writer = receipts.activeWriter() orelse return database.batchTrackedWithMarkerAndWriterLaneHook(ordinary, primary_committed, null, writer_lane_release_before_wait);
+    const writer = receipts.activeWriter() orelse return database.batchTrackedReportingSeeds(ordinary, primary_committed, null, writer_lane_release_before_wait, seed_report);
     const named = if (table_name) |name| (if (std.mem.eql(u8, name, "default")) null else name) else null;
     const marker = writer.next(named);
-    database.batchTrackedWithMarkerAndWriterLaneHook(ordinary, primary_committed, marker, writer_lane_release_before_wait) catch |err| {
+    database.batchTrackedReportingSeeds(ordinary, primary_committed, marker, writer_lane_release_before_wait, seed_report) catch |err| {
         if (!primary_committed.* and antfly.capi_dependencies.sql_errors.isUnknownOutcome(err))
             writer.retire(marker, if (named) |name| .{ .name = name, .id = database.core.identity_namespace.table_id } else null);
         return err;
@@ -5609,11 +5622,8 @@ pub fn antfly_db_batch_json(
     const execution_resources = @import("../storage/db/execution_resources.zig");
     var seed_report = execution_resources.SeedPlanCapture{ .alloc = std.heap.c_allocator };
     defer if (seed_report.json) |json| std.heap.c_allocator.free(json);
-    const previous_seed_report = execution_resources.seed_report;
-    execution_resources.seed_report = &seed_report;
-    defer execution_resources.seed_report = previous_seed_report;
     // A table handle commits to its table's database, which holds the marker.
-    trackedBatchWithWriterLaneHook(handle.database(), req, &primary_committed, handle.selected_table_name, writerLaneHookFromGuard(&guard)) catch |err| {
+    trackedBatchReportingSeeds(handle.database(), req, &primary_committed, handle.selected_table_name, writerLaneHookFromGuard(&guard), &seed_report) catch |err| {
         if (!committedOnReplacedRuntime(&guard, handle, err, primary_committed, req)) return batchFailureCode(err, primary_committed);
     };
     // Committed: a response failure must not read as a failed batch.
@@ -5677,10 +5687,7 @@ pub fn antfly_db_batch_wire(
     const execution_resources = @import("../storage/db/execution_resources.zig");
     var seed_report = execution_resources.SeedPlanCapture{ .alloc = std.heap.c_allocator };
     defer if (seed_report.json) |json| std.heap.c_allocator.free(json);
-    const previous_seed_report = execution_resources.seed_report;
-    execution_resources.seed_report = &seed_report;
-    defer execution_resources.seed_report = previous_seed_report;
-    trackedBatchWithWriterLaneHook(handle.database(), req, &primary_committed, handle.selected_table_name, writerLaneHookFromGuard(&guard)) catch |err| {
+    trackedBatchReportingSeeds(handle.database(), req, &primary_committed, handle.selected_table_name, writerLaneHookFromGuard(&guard), &seed_report) catch |err| {
         if (!committedOnReplacedRuntime(&guard, handle, err, primary_committed, req)) return batchFailureCode(err, primary_committed);
     };
     const response = batchResponseWithSeedsAlloc(.{

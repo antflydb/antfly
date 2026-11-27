@@ -8671,11 +8671,8 @@ pub const DB = struct {
     /// output and are reported here; the rest of the write commits.
     pub fn batchReportingSeeds(self: *DB, alloc: Allocator, req: types.BatchRequest) !?[]u8 {
         var capture = execution_resources.SeedPlanCapture{ .alloc = alloc };
-        const previous = execution_resources.seed_report;
-        execution_resources.seed_report = &capture;
-        defer execution_resources.seed_report = previous;
         errdefer if (capture.json) |json| alloc.free(json);
-        try self.batch(req);
+        try self.batchInternal(req, null, .{ .seed_report = &capture });
         return capture.json;
     }
 
@@ -8687,12 +8684,35 @@ pub const DB = struct {
         return self.planArtifactSeeds(alloc, .{ .writes = request.writes, .transforms = request.transforms });
     }
 
+    /// Leader seed preparation for an ordinary (non-transactional) write:
+    /// runs its preparation exactly as a commit would, under the apply lock
+    /// and without inference, and returns the `seeds` packet
+    /// (`PreparedEnrichments.mode`) to propose as the write's
+    /// `prepared_enrichments_json`. Replicas then apply the accepted output
+    /// instead of accepting the seeds against their own embedder, and the
+    /// packet's `seeds` are the per-item outcomes for the proposer. Unseeded
+    /// outputs stay pending for the leader's worker, as for any write.
+    pub fn prepareSeedEnrichments(self: *DB, alloc: Allocator, req: types.BatchRequest) ![]u8 {
+        if (req.commit_requires == .direct_enrichments or req.prepared_enrichments_json != null or req.transaction != null) return error.InvalidBatchRequest;
+        switch (req.sync_level) {
+            .enrichments, .full_index => return error.InvalidBatchRequest,
+            .propose, .write, .full_text => {},
+        }
+        var output = execution_resources.PreparationCapture{ .alloc = alloc, .request_digest = try execution_resources.PreparedEnrichments.requestDigest(alloc, req) };
+        errdefer if (output.json) |json| alloc.free(json);
+        try self.batchInternal(req, null, .{ .seed_preparation = &output });
+        return output.json orelse error.InvalidBatchRequest;
+    }
+
     pub fn prepareDirectEnrichments(self: *DB, alloc: Allocator, req: types.BatchRequest) ![]u8 {
         return self.prepareDirectEnrichmentsWithContext(alloc, req, null);
     }
 
     pub fn prepareDirectEnrichmentsWithContext(self: *DB, alloc: Allocator, req: types.BatchRequest, context: ?@import("antfly_inference_execution_context").RequestContext) ![]u8 {
         if (context) |control| try control.check();
+        // An ordinary write carrying artifact seeds is prepared without
+        // inference; see `prepareSeedEnrichments`.
+        if (req.commit_requires != .direct_enrichments and req.prepared_enrichments_json == null) return self.prepareSeedEnrichments(alloc, req);
         if (req.commit_requires != .direct_enrichments or req.prepared_enrichments_json != null) return error.InvalidBatchRequest;
         try @import("commit_requirements.zig").validateRequestBounds(req);
         const digest = try execution_resources.PreparedEnrichments.requestDigest(alloc, req);
@@ -8744,6 +8764,19 @@ pub const DB = struct {
         marker: ?apply_receipts.OutcomeMarker,
         hook: ?execution_resources.WriterLaneReleaseHook,
     ) anyerror!void {
+        return self.batchTrackedReportingSeeds(req, primary_committed, marker, hook, null);
+    }
+
+    /// `batchTrackedWithMarkerAndWriterLaneHook` that also captures the
+    /// per-item outcomes of the write's artifact seeds into `seed_report`.
+    pub fn batchTrackedReportingSeeds(
+        self: *DB,
+        req: types.BatchRequest,
+        primary_committed: *bool,
+        marker: ?apply_receipts.OutcomeMarker,
+        hook: ?execution_resources.WriterLaneReleaseHook,
+        seed_report: ?*execution_resources.SeedPlanCapture,
+    ) anyerror!void {
         primary_committed.* = false;
         var marker_key: [apply_receipts.outcome_marker_key_len]u8 = undefined;
         var marker_value: [apply_receipts.outcome_marker_value_len]u8 = undefined;
@@ -8756,7 +8789,7 @@ pub const DB = struct {
         const previous = backend_types.commit_progress;
         backend_types.commit_progress = &progress;
         defer backend_types.commit_progress = previous;
-        self.batchTrackedProfiled(req, primary_committed, marker_write, hook) catch |err| {
+        self.batchTrackedProfiled(req, primary_committed, marker_write, hook, seed_report) catch |err| {
             if (progress.maybe_applied and !primary_committed.* and !isOutcomeUnknownError(err)) {
                 std.log.warn("batch failed after its write may have applied: {s}", .{@errorName(err)});
                 return error.OutcomeUnknown;
@@ -8822,11 +8855,13 @@ pub const DB = struct {
         primary_committed: *bool,
         marker_write: ?docstore_mod.KVPair,
         writer_lane_release_before_wait: ?execution_resources.WriterLaneReleaseHook,
+        seed_report: ?*execution_resources.SeedPlanCapture,
     ) anyerror!void {
         const opts: BatchExecutionOptions = .{
             .primary_committed = primary_committed,
             .outcome_marker_write = marker_write,
             .writer_lane_release_before_wait = writer_lane_release_before_wait,
+            .seed_report = seed_report,
         };
         if (benchMetricsEnabled()) {
             var profile = BatchProfile{};
@@ -108796,6 +108831,76 @@ test "db artifact seed planning reports outcomes and conflicts follow the policy
     try std.testing.expectEqual(@as(usize, 1), counting.calls);
 }
 
+fn seededDenseArtifactBytesForTest(alloc: Allocator, db: *DB, doc_key: []const u8) ![]u8 {
+    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, doc_key, "body_dense_v1");
+    defer alloc.free(artifact_key);
+    const artifacts = try db.core.store.scanPrefix(alloc, artifact_key);
+    defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+    try std.testing.expectEqual(@as(usize, 1), artifacts.len);
+    return try alloc.dupe(u8, artifacts[0].value);
+}
+
+test "db artifact seed preparation on the leader replicates without the replica's embedder" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var reference_tmp = try TestDirectory.init("db");
+    defer reference_tmp.cleanup();
+    const reference_path = reference_tmp.path().ptr;
+    defer cleanupTempDir(reference_path);
+    const req: types.BatchRequest = .{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"same source\",\"_artifacts\":{\"body_dense_v1\":{\"value\":[1,2,3]}}}" }}, .sync_level = .write };
+
+    // Apply-time acceptance, as on a node with the embedder configured.
+    var reference_counting = CountingDenseEmbedder{};
+    var reference = try DB.open(alloc, std.mem.span(reference_path), .{ .enrichment = .{ .owner_id = "worker-a", .dense_embedder = reference_counting.interface() } });
+    defer reference.close();
+    try addSeededDenseTestIndex(&reference);
+    try reference.batch(req);
+    const reference_bytes = try seededDenseArtifactBytesForTest(alloc, &reference, "doc:a");
+    defer alloc.free(reference_bytes);
+
+    // The leader prepares the write. Preparation stages nothing and reports
+    // the outcomes for the proposer.
+    var counting = CountingDenseEmbedder{};
+    const packet = packet: {
+        var leader = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a", .dense_embedder = counting.interface() } });
+        defer leader.close();
+        try addSeededDenseTestIndex(&leader);
+        const packet = try leader.prepareSeedEnrichments(alloc, req);
+        errdefer alloc.free(packet);
+        try std.testing.expect((try leader.get(alloc, "doc:a")) == null);
+        break :packet packet;
+    };
+    defer alloc.free(packet);
+    try std.testing.expect(std.mem.indexOf(u8, packet, "\"mode\":\"seeds\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, packet, "\"key\":\"doc:a\",\"name\":\"body_dense_v1\",\"outcome\":\"accepted\"") != null);
+
+    // A replica of the same state with no embedder configured: accepting the
+    // seed itself could not even identify the embedding contract, but it
+    // applies the leader's accepted bytes exactly.
+    var replica = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a" } });
+    defer replica.close();
+    try std.testing.expectError(error.ArtifactSeedNotAccepted, replica.batch(req));
+    var prepared = req;
+    prepared.prepared_enrichments_json = packet;
+    try replica.batch(prepared);
+    try expectSeededDenseVector(alloc, &replica, "doc:a", "same source", &.{ 1, 2, 3 });
+    const replica_bytes = try seededDenseArtifactBytesForTest(alloc, &replica, "doc:a");
+    defer alloc.free(replica_bytes);
+    try std.testing.expectEqualSlices(u8, reference_bytes, replica_bytes);
+    try std.testing.expectEqual(@as(usize, 0), counting.calls);
+    try std.testing.expectEqual(@as(usize, 0), reference_counting.calls);
+
+    // The packet binds the state it was prepared against.
+    try std.testing.expectError(error.VersionConflict, replica.batch(prepared));
+    // A seeds packet never stands in for a direct requirement.
+    var direct = prepared;
+    direct.commit_requires = .direct_enrichments;
+    try std.testing.expectError(error.InvalidBatchRequest, replica.batch(direct));
+}
+
 fn expectStoredAssetForTest(alloc: Allocator, db: *DB, doc_key: []const u8, name: []const u8, expected: []const u8) !void {
     const key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", name);
     defer alloc.free(key);
@@ -109052,6 +109157,52 @@ test "db artifact seeds chain an upstream asset, its chunks and their vectors in
         try std.testing.expect(err == error.ArtifactSeedNotAccepted);
 }
 
+test "db artifact seed preparation carries a chained migration to a replica without producers" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    const chained =
+        \\{"body":"memo","_artifacts":{"summary_v1":{"value":"silver submarine"},"summary_dense":{"value":[{"chunk_id":0,"vector":[1,0,0]},{"chunk_id":1,"vector":[0,1,0]}]}},
+        \\ "_chunks":{"summary_chunks":[{"_chunk_id":0,"_content":"silver ","_start_char":0,"_end_char":7},{"_chunk_id":1,"_content":"submarine","_start_char":7,"_end_char":16}]}}
+    ;
+    const req: types.BatchRequest = .{ .writes = &.{.{ .key = "doc:a", .value = chained }}, .sync_level = .write };
+    var fake = TestAssetProducer{};
+    var embedder = CountingDenseEmbedder{};
+    const packet = packet: {
+        var leader = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a", .asset_producer = fake.producer(), .dense_embedder = embedder.interface() } });
+        defer leader.close();
+        try leader.addEnrichment(.{
+            .name = "summary_v1",
+            .kind = .asset,
+            .field = "body",
+            .content_type = "text/plain",
+            .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+        });
+        try leader.addEnrichment(.{ .name = "summary_chunks", .kind = .chunk, .source_artifact_name = "summary_v1", .field = "text", .chunk_size = 8, .chunk_overlap = 0 });
+        try leader.addEnrichment(.{ .name = "summary_dense", .kind = .embedding, .field = "text", .source_artifact_name = "summary_chunks", .expected_dims = 3 });
+        try leader.addIndex(.{ .name = "summary_vectors", .kind = .dense_vector, .config_json = "{\"field\":\"dense\",\"dims\":3,\"embedding_name\":\"summary_dense\"}" });
+        break :packet try leader.prepareSeedEnrichments(alloc, req);
+    };
+    defer alloc.free(packet);
+    for ([_][]const u8{ "\"name\":\"summary_v1\",\"outcome\":\"accepted\"", "\"name\":\"summary_chunks\",\"outcome\":\"accepted\"", "\"name\":\"summary_dense\",\"outcome\":\"accepted\"" }) |expected|
+        try std.testing.expect(std.mem.indexOf(u8, packet, expected) != null);
+
+    // The replica has neither the producer nor the embedder.
+    var replica = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a" } });
+    defer replica.close();
+    var prepared = req;
+    prepared.prepared_enrichments_json = packet;
+    try replica.batch(prepared);
+    try replica.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(@as(usize, 0), embedder.calls);
+    try expectStoredAssetForTest(alloc, &replica, "doc:a", "summary_v1", "silver submarine");
+    try expectSeedViewChunksForTest(alloc, &replica, "doc:a", "summary_chunks", &.{ "silver ", "submarine" });
+    try std.testing.expectEqual(@as(u64, 2), replica.core.index_manager.denseIndex("summary_vectors").?.index.metadata.active_count);
+}
+
 test "db artifact seeds accept extracted units with pages, transcripts and unit-scoped chunks" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
@@ -109152,6 +109303,58 @@ test "db artifact seeds accept extracted units with pages, transcripts and unit-
         return error.TestUnexpectedResult
     else |err|
         try std.testing.expect(err == error.ArtifactSeedNotAccepted);
+}
+
+test "db artifact seed preparation carries extracted units and their chunk vectors to a replica" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    const units =
+        \\"units":[{"text":"Quarterly revenue grew.","page_number":1},{"text":"Margins improved.","page_number":2}]
+    ;
+    const seeded = "{\"url\":\"https://example.invalid/report.pdf\",\"_artifacts\":{\"extracted\":{\"value\":{" ++ units ++ "}}," ++
+        "\"passages_dense\":{\"value\":[{\"unit_id\":\"page:000001\",\"chunk_id\":0,\"vector\":[1,0,0]},{\"unit_id\":\"page:000002\",\"chunk_id\":0,\"vector\":[0,1,0]}]}," ++
+        "\"passages_sparse\":{\"value\":[{\"unit_id\":\"page:000001\",\"chunk_id\":0,\"indices\":[1,2],\"values\":[0.5,0.5]},{\"unit_id\":\"page:000002\",\"chunk_id\":0,\"indices\":[3],\"values\":[1]}]}}}";
+    const req: types.BatchRequest = .{ .writes = &.{.{ .key = "doc:a", .value = seeded }}, .sync_level = .write };
+    var fake = TestAssetProducer{};
+    var embedder = CountingDenseEmbedder{};
+    var sparse = CountingSparseEmbedder{};
+    const packet = packet: {
+        var leader = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a", .asset_producer = fake.producer(), .dense_embedder = embedder.interface(), .sparse_embedder = sparse.interface() } });
+        defer leader.close();
+        try leader.addEnrichment(.{
+            .name = "extracted",
+            .kind = .asset,
+            .template = "{{url}}",
+            .content_type = "application/json",
+            .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+        });
+        try leader.addEnrichment(.{ .name = "passages", .kind = .chunk, .source_artifact_name = "extracted", .field = "text", .chunk_size = 64, .chunk_overlap = 0 });
+        try leader.addEnrichment(.{ .name = "passages_dense", .kind = .embedding, .field = "text", .source_artifact_name = "passages", .expected_dims = 3 });
+        try leader.addIndex(.{ .name = "passages_vectors", .kind = .dense_vector, .config_json = "{\"field\":\"dense\",\"dims\":3,\"embedding_name\":\"passages_dense\"}" });
+        try leader.addEnrichment(.{ .name = "passages_sparse", .kind = .embedding, .field = "text", .source_artifact_name = "passages" });
+        try leader.addIndex(.{ .name = "passages_terms", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse\",\"embedding_name\":\"passages_sparse\"}" });
+        break :packet try leader.prepareSeedEnrichments(alloc, req);
+    };
+    defer alloc.free(packet);
+    try std.testing.expect(std.mem.indexOf(u8, packet, "\"name\":\"passages_dense\",\"outcome\":\"accepted\"") != null);
+
+    var replica = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a" } });
+    defer replica.close();
+    var prepared = req;
+    prepared.prepared_enrichments_json = packet;
+    try replica.batch(prepared);
+    try replica.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(@as(usize, 0), embedder.calls);
+    try std.testing.expectEqual(@as(usize, 0), sparse.calls);
+    try std.testing.expectEqual(@as(u64, 2), replica.core.index_manager.denseIndex("passages_vectors").?.index.metadata.active_count);
+    var view = (try replica.lookup(alloc, "doc:a", .{ .fields = &.{"_artifacts"}, .include_all_fields = false, .artifact_view = .seed })).?;
+    defer view.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, view.json, "Margins improved.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, view.json, "\"passages_sparse\"") != null);
 }
 
 test "db artifact seeds accept vectors of extraction unit chunks without embedding them" {
