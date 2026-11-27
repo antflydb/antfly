@@ -62769,29 +62769,6 @@ test "public source audio linear recreates input bank through actual learning ca
     };
     const transfer_audit = @import("../../execution/transfer_audit.zig");
     var run = Run{ .cb = cb };
-    {
-        const plan_mod = @import("audio_execution_plan.zig");
-        const cold_key = 0x304;
-        const inputs = [_]CT{ identity, identity };
-        const geometry: [2]CudaCompute.AudioCacheInput = @splat(.{ .shape = &.{ 2, 2 }, .elements = 4 });
-        const bindings = try compute.audioCacheBase(cold_key, &geometry, null);
-        const layout = try sourceLinearLayout(compute.ctx.info.compute_major, try kernel_geometry.SourceGemmRows.resolve(2, null), 2, 2, true, false);
-        const entry = try compute.audio_plans.getWithCleanup(bindings.key, .{});
-        const owner = try plan_mod.Owner.create(std.heap.c_allocator);
-        entry.owner = owner;
-        var declaration = try owner.beginDeclaration(bindings);
-        const output_slot = try declaration.events.allocate(bindings.output_bytes);
-        try declaration.events.scratchInterval(layout.bytes);
-        try declaration.finish(output_slot);
-
-        const first = (try cb.audioExecution(cold_key, &inputs, &run, Run.call)) orelse return error.TestUnexpectedResult;
-        defer cb.free(first);
-        const values = try cb.toFloat32(first, std.testing.allocator);
-        defer std.testing.allocator.free(values);
-        try std.testing.expectEqualSlices(f32, &identity_values, values);
-        try std.testing.expect(!entry.warmed);
-        try std.testing.expect(owner.plan.origin == .declared);
-    }
     var held: [2]?CT = @splat(null);
     defer for (held) |entry| if (entry) |output| cb.free(output);
     for (0..7) |iteration| {
@@ -63040,6 +63017,51 @@ test "public source audio linear recreates input bank through actual learning ca
         try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
     }
     try std.testing.expectEqual(@as(usize, 0), domain.controller.snapshot().backend_scratch_bytes);
+}
+
+test "CUDA cold audio declaration dispatches before any learning invocation" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    if (@import("libraries.zig").Policy.current() == .off) return error.SkipZigTest;
+    var compute = CudaCompute.initWithKernelJitForProfile(std.testing.allocator, .{}, .embedding_gemma2) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    if (try cb.sourceScalarStorage(.audio) != .bf16) return error.SkipZigTest;
+    compute.embedding_gemma2_policy.audio_graph = true;
+    const identity_values = [_]f32{ 1, 0, 0, 1 };
+    const identity = try cb.fromFloat32Shape(&identity_values, &.{ 2, 2 });
+    defer cb.free(identity);
+    const Run = struct {
+        fn call(raw: *anyopaque, inputs: []const CT) !CT {
+            const backend: *const ops.ComputeBackend = @ptrCast(@alignCast(raw));
+            return (try backend.tryBf16SourceOperation(&.{ .linear = .{ .input = inputs[0], .weight = inputs[1], .rows = 2, .width = 2, .columns = 2 } })) orelse error.SourceArithmeticUnavailable;
+        }
+    };
+    const plan_mod = @import("audio_execution_plan.zig");
+    const cold_key = 0x304;
+    const inputs = [_]CT{ identity, identity };
+    const geometry: [2]CudaCompute.AudioCacheInput = @splat(.{ .shape = &.{ 2, 2 }, .elements = 4 });
+    const bindings = try compute.audioCacheBase(cold_key, &geometry, null);
+    const layout = try sourceLinearLayout(compute.ctx.info.compute_major, try kernel_geometry.SourceGemmRows.resolve(2, null), 2, 2, true, false);
+    const entry = try compute.audio_plans.getWithCleanup(bindings.key, .{});
+    const owner = try plan_mod.Owner.create(std.heap.c_allocator);
+    entry.owner = owner;
+    var declaration = try owner.beginDeclaration(bindings);
+    const output_slot = try declaration.events.allocate(bindings.output_bytes);
+    try declaration.events.scratchInterval(layout.bytes);
+    try declaration.finish(output_slot);
+
+    const executes_before = compute.audio_arena_executes;
+    const first = (try cb.audioExecution(cold_key, &inputs, @constCast(&cb), Run.call)) orelse return error.TestUnexpectedResult;
+    defer cb.free(first);
+    const values = try cb.toFloat32(first, std.testing.allocator);
+    defer std.testing.allocator.free(values);
+    try std.testing.expectEqualSlices(f32, &identity_values, values);
+    try std.testing.expect(!entry.warmed);
+    try std.testing.expect(owner.plan.origin == .declared);
+    try std.testing.expectEqual(executes_before + 1, compute.audio_arena_executes);
 }
 
 test "source GEMM row descriptors reject missing physical input before opaque CUDA access" {
