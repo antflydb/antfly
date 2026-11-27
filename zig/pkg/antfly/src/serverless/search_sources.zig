@@ -893,6 +893,9 @@ pub fn selectVectorSource(
         if (projection.findNamedEmbedding(name)) |embedding| {
             return .{ .top_level = embedding };
         }
+        if (projection.findNamedChunkEmbeddings(name)) |chunks| {
+            return .{ .chunk_embeddings = chunks };
+        }
     }
     return switch (descriptor.document_source) {
         .top_level_embedding => if (projection.embedding) |embedding|

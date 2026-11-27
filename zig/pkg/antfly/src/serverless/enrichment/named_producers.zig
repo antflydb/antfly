@@ -38,6 +38,9 @@ pub const NamedProducers = struct {
     asset: ?asset_producer.Producer = null,
     /// Dimensions declared by the consuming index, keyed by declaration.
     dims: std.StringArrayHashMapUnmanaged(u32) = .empty,
+    sparse: ?embedder_mod.SparseEmbedder = null,
+    /// Declarations consumed by sparse indexes.
+    sparse_names: std.StringArrayHashMapUnmanaged(void) = .empty,
 
     /// Builds the embedders of the indexes that consume the table's named
     /// embedding declarations. Other indexes keep their own pipelines.
@@ -49,12 +52,19 @@ pub const NamedProducers = struct {
         if (parsed.value != .object) return self;
         var consumers = std.json.ObjectMap.empty;
         defer consumers.deinit(alloc);
+        var sparse_consumers = std.json.ObjectMap.empty;
+        defer sparse_consumers.deinit(alloc);
         for (declarations.configs) |cfg| {
             if (cfg.kind != .embedding) continue;
             const index = parsed.value.object.get(cfg.name) orelse continue;
             if (index != .object or index.object.get("embedder") == null) continue;
             const name = index.object.get("embedding_name") orelse continue;
             if (name != .string or !std.mem.eql(u8, name.string, cfg.name)) continue;
+            if (index.object.get("sparse")) |flag| if (flag == .bool and flag.bool) {
+                try sparse_consumers.put(alloc, cfg.name, index);
+                try self.sparse_names.put(alloc, cfg.name, {});
+                continue;
+            };
             try consumers.put(alloc, cfg.name, index);
             const dims: u32 = if (cfg.expected_dims != 0) cfg.expected_dims else dims: {
                 const value = index.object.get("dimension") orelse break :dims 0;
@@ -64,12 +74,16 @@ pub const NamedProducers = struct {
         }
         if (consumers.count() != 0)
             self.dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderFromIndexValueWithOptions(alloc, .{ .object = consumers }, options);
+        if (sparse_consumers.count() != 0)
+            self.sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderFromIndexValueWithOptions(alloc, .{ .object = sparse_consumers }, options);
         return self;
     }
 
     pub fn deinit(self: *NamedProducers) void {
         if (self.dense) |dense| dense.deinit(self.alloc);
+        if (self.sparse) |sparse| sparse.deinit(self.alloc);
         self.dims.deinit(self.alloc);
+        self.sparse_names.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -77,6 +91,7 @@ pub const NamedProducers = struct {
         return .{
             .ctx = self,
             .embed = if (self.dense != null) embed else null,
+            .embed_sparse = if (self.sparse_names.count() != 0) embedSparse else null,
             .asset = if (self.asset != null) produceAsset else null,
         };
     }
@@ -87,6 +102,18 @@ pub const NamedProducers = struct {
         const dims = self.dims.get(cfg.name) orelse return error.EmbedderUnavailable;
         const out = try a.alloc([]f32, texts.len);
         for (out, texts) |*vector, text| vector.* = try dense.embedDense(a, cfg.name, text, dims);
+        return out;
+    }
+
+    fn embedSparse(ctx: *anyopaque, a: Allocator, cfg: EnrichmentConfig, texts: []const []const u8) anyerror!?[]named_outputs.SparseVector {
+        const self: *NamedProducers = @ptrCast(@alignCast(ctx));
+        if (!self.sparse_names.contains(cfg.name)) return null;
+        const sparse = self.sparse orelse return error.EmbedderUnavailable;
+        const out = try a.alloc(named_outputs.SparseVector, texts.len);
+        for (out, texts) |*vector, text| {
+            const embedded = try sparse.embedSparse(a, cfg.name, text);
+            vector.* = .{ .indices = embedded.indices, .values = embedded.values };
+        }
         return out;
     }
 
@@ -141,6 +168,7 @@ test "serverless named producers bind only consuming embeddings indexes" {
     defer named.deinit();
     try std.testing.expectEqual(@as(usize, 1), named.dims.count());
     try std.testing.expectEqual(@as(u32, 3), named.dims.get("passages_vec").?);
+    try std.testing.expect(named.producers().embed_sparse == null);
     const hooks = named.producers();
     try std.testing.expect(hooks.asset == null);
 }

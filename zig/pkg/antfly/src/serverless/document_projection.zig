@@ -22,6 +22,9 @@ pub const Projection = struct {
     sparse_embedding: ?[]SparseTermWeight = null,
     named_embeddings: ?[]NamedEmbedding = null,
     named_sparse_embeddings: ?[]NamedSparseEmbedding = null,
+    /// Chunk-level named enrichment vectors (`_artifacts.<name>.value` rows
+    /// of `{chunk_id, vector}`), consumed like built-in chunk embeddings.
+    named_chunk_embeddings: ?[]NamedChunkEmbeddings = null,
     graph_edges_json: ?[]u8 = null,
     chunk_preview: ?[][]u8 = null,
     chunk_embeddings: ?[]ChunkEmbedding = null,
@@ -51,6 +54,10 @@ pub const Projection = struct {
             for (embeddings) |*embedding| embedding.deinit(alloc);
             alloc.free(embeddings);
         }
+        if (self.named_chunk_embeddings) |collections| {
+            for (collections) |*collection| collection.deinit(alloc);
+            alloc.free(collections);
+        }
         if (self.graph_edges_json) |value| alloc.free(value);
         if (self.chunk_preview) |chunks| {
             for (chunks) |chunk| alloc.free(chunk);
@@ -77,6 +84,14 @@ pub const Projection = struct {
         const embeddings = self.named_embeddings orelse return null;
         for (embeddings) |embedding| {
             if (std.mem.eql(u8, embedding.name, name)) return embedding.embedding;
+        }
+        return null;
+    }
+
+    pub fn findNamedChunkEmbeddings(self: *const Projection, name: []const u8) ?[]const ChunkEmbedding {
+        const collections = self.named_chunk_embeddings orelse return null;
+        for (collections) |collection| {
+            if (std.mem.eql(u8, collection.name, name)) return collection.chunks;
         }
         return null;
     }
@@ -153,6 +168,18 @@ pub const NamedSparseEmbedding = struct {
     }
 };
 
+pub const NamedChunkEmbeddings = struct {
+    name: []u8,
+    chunks: []ChunkEmbedding,
+
+    pub fn deinit(self: *NamedChunkEmbeddings, alloc: Allocator) void {
+        alloc.free(self.name);
+        for (self.chunks) |*chunk| chunk.deinit(alloc);
+        alloc.free(self.chunks);
+        self.* = undefined;
+    }
+};
+
 pub fn parseAlloc(alloc: Allocator, body: []const u8) !Projection {
     return parseAllocWithSourceFields(alloc, body, &.{});
 }
@@ -192,6 +219,11 @@ pub fn parseAllocWithSourceFields(alloc: Allocator, body: []const u8, source_fie
         for (value) |*entry| entry.deinit(alloc);
         alloc.free(value);
     };
+    const named_chunk_embeddings = try cloneNamedChunkEmbeddingsAlloc(alloc, obj);
+    errdefer if (named_chunk_embeddings) |value| {
+        for (value) |*entry| entry.deinit(alloc);
+        alloc.free(value);
+    };
     const graph_edges_json = try cloneGraphEdgesJsonAlloc(alloc, obj);
     errdefer if (graph_edges_json) |value| alloc.free(value);
     const chunk_preview = if (findStringArray(obj, "chunk_preview")) |value| try cloneStringArrayAlloc(alloc, value) else null;
@@ -211,6 +243,7 @@ pub fn parseAllocWithSourceFields(alloc: Allocator, body: []const u8, source_fie
         .sparse_embedding = sparse_embedding,
         .named_embeddings = named_embeddings,
         .named_sparse_embeddings = named_sparse_embeddings,
+        .named_chunk_embeddings = named_chunk_embeddings,
         .graph_edges_json = graph_edges_json,
         .chunk_preview = chunk_preview,
         .chunk_embeddings = chunk_embeddings,
@@ -282,46 +315,178 @@ fn appendNamedEmbedding(alloc: Allocator, out: *std.ArrayListUnmanaged(NamedEmbe
 }
 
 fn cloneNamedSparseEmbeddingsAlloc(alloc: Allocator, obj: std.json.ObjectMap) !?[]NamedSparseEmbedding {
-    const named = obj.get("_embeddings") orelse return null;
-    if (named != .object) return null;
+    var out = std.ArrayListUnmanaged(NamedSparseEmbedding).empty;
+    errdefer {
+        for (out.items) |*embedding| embedding.deinit(alloc);
+        out.deinit(alloc);
+    }
+    if (obj.get("_embeddings")) |named| if (named == .object) {
+        var iter = named.object.iterator();
+        while (iter.next()) |entry| {
+            const sparse = switch (entry.value_ptr.*) {
+                .object => true,
+                .array => entry.value_ptr.array.items.len > 0 and entry.value_ptr.array.items[0] == .object,
+                else => false,
+            };
+            if (!sparse) continue;
+            const weights = try cloneSparseEmbeddingAlloc(alloc, entry.value_ptr.*);
+            try appendNamedSparse(alloc, &out, entry.key_ptr.*, weights);
+        }
+    };
+    // Named enrichment sparse vectors (#1791): `_artifacts.<name>.value` as
+    // `{"indices":[...],"values":[...]}` or an index-to-weight map, in the
+    // feature terms (`f<index>`) the sparse indexes use.
+    if (obj.get("_artifacts")) |named| if (named == .object) {
+        var iter = named.object.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.* != .object) continue;
+            const value = entry.value_ptr.object.get("value") orelse continue;
+            const weights = (try namedSparseWeightsAlloc(alloc, value)) orelse continue;
+            try appendNamedSparse(alloc, &out, entry.key_ptr.*, weights);
+        }
+    };
+    if (out.items.len == 0) {
+        out.deinit(alloc);
+        return null;
+    }
+    return try out.toOwnedSlice(alloc);
+}
 
-    var count: usize = 0;
-    var iter = named.object.iterator();
-    while (iter.next()) |entry| {
-        switch (entry.value_ptr.*) {
-            .object => count += 1,
-            .array => {
-                if (entry.value_ptr.array.items.len > 0 and entry.value_ptr.array.items[0] == .object) count += 1;
-            },
-            else => {},
+/// Takes ownership of `weights`.
+fn appendNamedSparse(alloc: Allocator, out: *std.ArrayListUnmanaged(NamedSparseEmbedding), name: []const u8, weights: []SparseTermWeight) !void {
+    var owned: NamedSparseEmbedding = .{ .name = undefined, .weights = weights };
+    for (out.items) |known| if (std.mem.eql(u8, known.name, name)) {
+        for (weights) |weight| alloc.free(weight.term);
+        alloc.free(weights);
+        return;
+    };
+    owned.name = alloc.dupe(u8, name) catch |err| {
+        for (weights) |weight| alloc.free(weight.term);
+        alloc.free(weights);
+        return err;
+    };
+    errdefer owned.deinit(alloc);
+    try out.append(alloc, owned);
+}
+
+/// Null unless `value` is a sparse vector in the artifact seed shape.
+fn namedSparseWeightsAlloc(alloc: Allocator, value: std.json.Value) !?[]SparseTermWeight {
+    if (value != .object or value.object.count() == 0) return null;
+    var out = std.ArrayListUnmanaged(SparseTermWeight).empty;
+    errdefer {
+        for (out.items) |weight| alloc.free(weight.term);
+        out.deinit(alloc);
+    }
+    const indices = value.object.get("indices");
+    const values = value.object.get("values");
+    if (indices != null and values != null and value.object.count() == 2) {
+        if (indices.? != .array or values.? != .array or indices.?.array.items.len != values.?.array.items.len) return null;
+        for (indices.?.array.items, values.?.array.items) |index, weight| {
+            if (index != .integer or index.integer < 0) {
+                for (out.items) |item| alloc.free(item.term);
+                out.deinit(alloc);
+                return null;
+            }
+            const term = try std.fmt.allocPrint(alloc, "f{d}", .{index.integer});
+            errdefer alloc.free(term);
+            try out.append(alloc, .{ .term = term, .weight = jsonValueAsF32(weight) catch {
+                alloc.free(term);
+                for (out.items) |item| alloc.free(item.term);
+                out.deinit(alloc);
+                return null;
+            } });
+        }
+    } else {
+        var it = value.object.iterator();
+        while (it.next()) |entry| {
+            const index = std.fmt.parseUnsigned(u32, entry.key_ptr.*, 10) catch {
+                for (out.items) |item| alloc.free(item.term);
+                out.deinit(alloc);
+                return null;
+            };
+            const weight = jsonValueAsF32(entry.value_ptr.*) catch {
+                for (out.items) |item| alloc.free(item.term);
+                out.deinit(alloc);
+                return null;
+            };
+            const term = try std.fmt.allocPrint(alloc, "f{d}", .{index});
+            errdefer alloc.free(term);
+            try out.append(alloc, .{ .term = term, .weight = weight });
         }
     }
-    if (count == 0) return null;
+    return try out.toOwnedSlice(alloc);
+}
 
-    const out = try alloc.alloc(NamedSparseEmbedding, count);
-    errdefer alloc.free(out);
-    var initialized: usize = 0;
+/// `_artifacts.<name>.value` rows of `{chunk_id, vector}` (window 0 or
+/// unwindowed), labeled with the chunk's text when a chunk collection of the
+/// document has that chunk id.
+fn cloneNamedChunkEmbeddingsAlloc(alloc: Allocator, obj: std.json.ObjectMap) !?[]NamedChunkEmbeddings {
+    const named = obj.get("_artifacts") orelse return null;
+    if (named != .object) return null;
+    var out = std.ArrayListUnmanaged(NamedChunkEmbeddings).empty;
     errdefer {
-        for (out[0..initialized]) |*embedding| embedding.deinit(alloc);
+        for (out.items) |*entry| entry.deinit(alloc);
+        out.deinit(alloc);
     }
-
-    iter = named.object.iterator();
+    var iter = named.object.iterator();
     while (iter.next()) |entry| {
-        const weights = switch (entry.value_ptr.*) {
-            .object => try cloneSparseEmbeddingAlloc(alloc, entry.value_ptr.*),
-            .array => if (entry.value_ptr.array.items.len > 0 and entry.value_ptr.array.items[0] == .object)
-                try cloneSparseEmbeddingAlloc(alloc, entry.value_ptr.*)
-            else
-                continue,
-            else => continue,
-        };
-        out[initialized] = .{
-            .name = try alloc.dupe(u8, entry.key_ptr.*),
-            .weights = weights,
-        };
-        initialized += 1;
+        if (entry.value_ptr.* != .object) continue;
+        const value = entry.value_ptr.object.get("value") orelse continue;
+        if (value != .array or value.array.items.len == 0) continue;
+        const first = value.array.items[0];
+        if (first != .object or first.object.get("chunk_id") == null or first.object.get("vector") == null) continue;
+        var chunks = std.ArrayListUnmanaged(ChunkEmbedding).empty;
+        errdefer {
+            for (chunks.items) |*chunk| chunk.deinit(alloc);
+            chunks.deinit(alloc);
+        }
+        for (value.array.items) |row| {
+            if (row != .object) continue;
+            const id = row.object.get("chunk_id") orelse continue;
+            const vector = row.object.get("vector") orelse continue;
+            if (id != .integer or vector != .array or vector.array.items.len == 0) continue;
+            if (row.object.get("window_index")) |window| if (window == .integer and window.integer != 0) continue;
+            const embedding = try cloneEmbeddingAlloc(alloc, vector.array.items);
+            errdefer alloc.free(embedding);
+            const label = try alloc.dupe(u8, chunkText(obj, id.integer) orelse "");
+            errdefer alloc.free(label);
+            try chunks.append(alloc, .{ .chunk = label, .embedding = embedding });
+        }
+        if (chunks.items.len == 0) {
+            chunks.deinit(alloc);
+            continue;
+        }
+        const name = try alloc.dupe(u8, entry.key_ptr.*);
+        errdefer alloc.free(name);
+        const owned = try chunks.toOwnedSlice(alloc);
+        errdefer {
+            for (owned) |*chunk| chunk.deinit(alloc);
+            alloc.free(owned);
+        }
+        try out.append(alloc, .{ .name = name, .chunks = owned });
     }
-    return out;
+    if (out.items.len == 0) {
+        out.deinit(alloc);
+        return null;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn chunkText(obj: std.json.ObjectMap, chunk_id: i64) ?[]const u8 {
+    const collections = obj.get("_chunks") orelse return null;
+    if (collections != .object) return null;
+    var it = collections.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .array) continue;
+        for (entry.value_ptr.array.items) |item| {
+            if (item != .object) continue;
+            const id = item.object.get("_chunk_id") orelse continue;
+            if (id != .integer or id.integer != chunk_id) continue;
+            const content = item.object.get("_content") orelse continue;
+            if (content == .string) return content.string;
+        }
+    }
+    return null;
 }
 
 fn findString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -639,4 +804,24 @@ test "serverless projection reads named enrichment document vectors" {
     try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0.5 }, projection.findNamedEmbedding("body_vec").?);
     try std.testing.expectEqualSlices(f32, &.{ 0, 1, 0 }, projection.findNamedEmbedding("idx").?);
     try std.testing.expect(projection.findNamedEmbedding("notes") == null);
+}
+
+test "serverless projection reads named chunk and sparse enrichment vectors" {
+    const alloc = std.testing.allocator;
+    var projection = try parseAlloc(alloc,
+        \\{"body":"x","_chunks":{"passages":[{"_chunk_id":0,"_content":"alpha"},{"_chunk_id":1,"_content":"beta"}]},
+        \\ "_artifacts":{"passages_vec":{"value":[{"chunk_id":0,"vector":[1,0]},{"chunk_id":1,"vector":[0,1]}]},
+        \\  "terms":{"value":{"indices":[7,3],"values":[0.5,1.5]}},"map_terms":{"value":{"42":2}},"meta":{"value":{"kind":"x"}}}}
+    );
+    defer projection.deinit(alloc);
+    const chunks = projection.findNamedChunkEmbeddings("passages_vec").?;
+    try std.testing.expectEqual(@as(usize, 2), chunks.len);
+    try std.testing.expectEqualStrings("beta", chunks[1].chunk);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 1 }, chunks[1].embedding);
+    const terms = projection.findNamedSparseEmbedding("terms").?;
+    try std.testing.expectEqualStrings("f7", terms[0].term);
+    try std.testing.expectEqual(@as(f32, 1.5), terms[1].weight);
+    try std.testing.expectEqualStrings("f42", projection.findNamedSparseEmbedding("map_terms").?[0].term);
+    try std.testing.expect(projection.findNamedSparseEmbedding("meta") == null);
+    try std.testing.expect(projection.findNamedEmbedding("passages_vec") == null);
 }

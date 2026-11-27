@@ -289,9 +289,27 @@ pub const Producers = struct {
     ctx: *anyopaque = undefined,
     /// One vector per text for an embedding declaration.
     embed: ?*const fn (ctx: *anyopaque, a: Allocator, cfg: EnrichmentConfig, texts: []const []const u8) anyerror![][]f32 = null,
+    /// One sparse vector per text when the declaration's consuming index is
+    /// sparse; null otherwise (the dense `embed` applies).
+    embed_sparse: ?*const fn (ctx: *anyopaque, a: Allocator, cfg: EnrichmentConfig, texts: []const []const u8) anyerror!?[]SparseVector = null,
     /// An asset's value from its source text (and the whole record).
     asset: ?*const fn (ctx: *anyopaque, a: Allocator, cfg: EnrichmentConfig, source: []const u8, document_json: []const u8) anyerror!std.json.Value = null,
 };
+
+pub const SparseVector = struct { indices: []const u32, values: []const f32 };
+
+fn sparseValue(a: Allocator, vector: SparseVector) !std.json.Value {
+    var indices = std.json.Array.init(a);
+    var values = std.json.Array.init(a);
+    for (vector.indices, vector.values) |index, weight| {
+        try indices.append(.{ .integer = index });
+        try values.append(.{ .float = weight });
+    }
+    var object = std.json.ObjectMap.empty;
+    try object.put(a, "indices", .{ .array = indices });
+    try object.put(a, "values", .{ .array = values });
+    return .{ .object = object };
+}
 
 pub const Generated = struct {
     /// The body with generated outputs, or null when nothing was produced.
@@ -340,6 +358,15 @@ pub fn generateAlloc(alloc: Allocator, declarations: named_enrichments.Declarati
                 break :chunk .{ .array = array };
             },
             .embedding => embedding: {
+                if (producers.embed_sparse) |embed_sparse| sparse: {
+                    // Document-level sparse vectors: serverless sparse indexes
+                    // have no chunk-level rows.
+                    if (cfg.source_artifact_name.len != 0 and chunks.contains(cfg.source_artifact_name)) break :sparse;
+                    const text = (try sourceTextAlloc(a, cfg, document, artifacts)) orelse continue;
+                    const vectors = (embed_sparse(producers.ctx, a, cfg, &.{text}) catch |err| if (err == error.EmbedderUnavailable) break :embedding null else return err) orelse break :sparse;
+                    if (vectors.len != 1) return error.InvalidEmbeddingResponse;
+                    break :embedding try envelopeValue(a, try sparseValue(a, vectors[0]));
+                }
                 const embed = producers.embed orelse break :embedding null;
                 // Vectors of an upstream chunk collection: one per chunk.
                 if (cfg.source_artifact_name.len != 0) if (chunks.get(cfg.source_artifact_name)) |collection| {
@@ -353,7 +380,7 @@ pub fn generateAlloc(alloc: Allocator, declarations: named_enrichments.Declarati
                         text.* = if (content == .string) content.string else "";
                         id.* = if (chunk_id == .integer) chunk_id.integer else 0;
                     }
-                    const vectors = try embed(producers.ctx, a, cfg, texts);
+                    const vectors = embed(producers.ctx, a, cfg, texts) catch |err| if (err == error.EmbedderUnavailable) break :embedding null else return err;
                     if (vectors.len != texts.len) return error.InvalidEmbeddingResponse;
                     var rows = std.json.Array.init(a);
                     for (vectors, ids) |vector, id| {
@@ -365,7 +392,7 @@ pub fn generateAlloc(alloc: Allocator, declarations: named_enrichments.Declarati
                     break :embedding try envelopeValue(a, .{ .array = rows });
                 };
                 const text = (try sourceTextAlloc(a, cfg, document, artifacts)) orelse continue;
-                const vectors = try embed(producers.ctx, a, cfg, &.{text});
+                const vectors = embed(producers.ctx, a, cfg, &.{text}) catch |err| if (err == error.EmbedderUnavailable) break :embedding null else return err;
                 if (vectors.len != 1) return error.InvalidEmbeddingResponse;
                 break :embedding try envelopeValue(a, try vectorValue(a, vectors[0]));
             },
@@ -696,4 +723,30 @@ test "serverless named outputs generate chains in dependency order and leave una
     var edited = try acceptAlloc(alloc, declarations, "doc", out, "{\"body\":\"another report body\",\"title\":\"T\"}", .keep);
     defer edited.deinit(alloc);
     try std.testing.expect(try needsGeneration(alloc, declarations, edited.body));
+}
+
+test "serverless named outputs generate sparse vectors for sparse consumers" {
+    const alloc = std.testing.allocator;
+    var declarations = try named_enrichments.parseAlloc(alloc,
+        \\{"enrichments":[{"name":"terms","kind":"embedding","field":"body"},{"name":"dense","kind":"embedding","field":"body"}]}
+    );
+    defer declarations.deinit(alloc);
+    const Fake = struct {
+        fn sparse(_: *anyopaque, a: Allocator, cfg: EnrichmentConfig, texts: []const []const u8) anyerror!?[]SparseVector {
+            if (!std.mem.eql(u8, cfg.name, "terms")) return null;
+            const out = try a.alloc(SparseVector, texts.len);
+            for (out) |*vector| vector.* = .{ .indices = &.{ 3, 9 }, .values = &.{ 0.5, 0.25 } };
+            return out;
+        }
+        fn dense(_: *anyopaque, _: Allocator, _: EnrichmentConfig, _: []const []const u8) anyerror![][]f32 {
+            return error.EmbedderUnavailable;
+        }
+    };
+    var unused: u8 = 0;
+    const generated = try generateAlloc(alloc, declarations, "{\"body\":\"alpha\"}", .{ .ctx = &unused, .embed = Fake.dense, .embed_sparse = Fake.sparse });
+    defer if (generated.body) |bytes| alloc.free(bytes);
+    try std.testing.expectEqual(@as(usize, 1), generated.generated);
+    // The dense declaration's embedder is missing: pending, not failed.
+    try std.testing.expectEqual(@as(usize, 1), generated.unavailable);
+    try std.testing.expect(std.mem.indexOf(u8, generated.body.?, "\"terms\":{\"value\":{\"indices\":[3,9]") != null);
 }
