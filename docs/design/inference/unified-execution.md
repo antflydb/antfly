@@ -1333,6 +1333,18 @@ Subsequent scoped qualification covers these production paths:
 | `676b75ffb9` | Spark GB10 CUDA, released merged T5-small | Batched suffix decoding completed after encoder retirement. The grouped CUDA suite passed 16 of 16 checks with no skips. | A current-head throughput comparison against merged main. |
 | `ae601982e2` | Spark GB10 CUDA, audio input contract and cache fixtures | All six checks passed, including physical audio capture and replay. | The composite scratch recipe still comes from an observed allocation schedule. Released-model performance remains unqualified. |
 | `a4d50e41a0` | M4 Max Metal, released LightOnOCR-3-0.8B and audio cohorts | Both HTTP pages matched the single-image OCR output. Five four-token bursts completed with zero frame topology mismatches. The three-clip audio test used 108,101,632 incremental device bytes within its 134,217,728-byte ceiling. Managed audio prepared two arenas in one pause. | Frozen-main latency and throughput comparisons. These tests establish parity, submission topology, and the measured memory bound. |
+| `17a365c92d` | Spark GB10 CUDA, released LightOnOCR-3-0.8B and EmbeddingGemma2 | Ten checks passed with zero skips. The decoder reused the admitted input buffer for both steps, and the warm-up head fixture wrote to the assigned logits buffer. The released two-row LightOnOCR graph replay used 44 bytes of admitted pinned readback. Released EmbeddingGemma2 flat audio and mixed-input admission checks also passed. | Current-head performance and measured peak scratch. Legacy decoder and composite audio still obtain their full workspace layouts from observed lifetimes. |
+| `00609abb56` | M4 Max Metal, released Gemma 4 E2B QAT audio projector and segmented EmbeddingGemma2 audio | Three checks passed with zero skips. The Gemma 4 projector differed from the host reference by at most 0.000354 with all device operations enabled. Resident one- and two-clip prompt output matched the device reference exactly. | Peak scratch and latency on the final head. |
+
+At `6cf0c97584`, a controlled Whisper-small run used the released
+checkpoint and the checked-in audio fixture against issue #1771's pinned
+baseline `9e4af7f847`. Every run reached EOS on its selected backend, and
+the output payloads matched byte for byte. Baseline and candidate
+same-binary controls were within 0.9% in both directions at p50 and p95.
+CPU lifecycle p50/p95 changed from 661.44/664.68 ms to 661.23/663.56 ms.
+Metal changed from 460.49/462.25 ms to 344.22/345.35 ms. This comparison
+covers the single fixture on CPU and Metal. Multi-window and CUDA
+qualification remain open.
 
 At `34296ffb5a`, five Native CPU fixtures passed for resident handoff and
 task output custody. The incremental decoder matched host-reference logits
