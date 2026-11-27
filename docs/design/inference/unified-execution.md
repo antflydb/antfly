@@ -2815,3 +2815,11 @@ retryable capacity errors in baseline controls after loading other models.
 | Image | 1,088.10 / 1,089.87 | 738.62 / 740.04 |
 | Audio | 291.08 / 292.63 | 290.35 / 291.27 |
 | Video | 1,042.34 / 1,043.71 | 706.81 / 708.62 |
+
+At `94962f73b5`, five focused M4 Max fixtures passed with zero skips.
+Native and Metal matched the Florence full-prefix oracle with batched
+strides, retained results, and cancellation. Metal segmented audio used
+the production mask bank and matched isolated clips. The three-clip,
+1,000-frame admission fixture measured 108,101,632 incremental device
+bytes within its 134,217,728-byte ceiling. The frontend submission
+fixture preserved the caller's frame ownership.
