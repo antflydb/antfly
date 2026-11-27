@@ -89,6 +89,7 @@ pub const Owner = struct {
         bindings: Bindings,
 
         pub fn finish(self: *Declaration, published_slot: u15) !void {
+            errdefer self.abort();
             try self.events.finish(published_slot);
             if (!self.owner.publishLayout(self.bindings)) return error.InvalidExecutionPlan;
         }
@@ -101,7 +102,7 @@ pub const Owner = struct {
 
     /// Describe variable-size stages directly in the admitted owner.
     pub fn beginDeclaration(self: *Owner, bindings: Bindings) !Declaration {
-        if (self.executable != null or bindings.output_bytes == 0) return error.InvalidExecutionPlan;
+        if (self.executable != null or !bindings.fitsArena()) return error.InvalidExecutionPlan;
         return .{ .owner = self, .events = try self.plan.declarationBuilder(), .bindings = bindings };
     }
 
@@ -257,10 +258,11 @@ test "CUDA declared audio workspace matches the observed capture layout" {
     var declared: Owner = .{ .allocator = std.testing.allocator };
     {
         var builder = try declared.beginDeclaration(.{ .key = 13, .input_bytes = input_bytes, .output_bytes = output_bytes + 1 });
-        defer builder.abort();
         const result = try builder.events.allocate(output_bytes);
         try std.testing.expectError(error.InvalidExecutionPlan, builder.finish(result));
     }
+    try std.testing.expectEqual(arena.Origin.observed, declared.plan.origin);
+    try std.testing.expectEqual(@as(usize, 0), declared.plan.event_count);
     {
         var builder = try declared.beginDeclaration(bindings);
         errdefer builder.abort();
