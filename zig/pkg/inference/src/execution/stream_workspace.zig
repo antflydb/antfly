@@ -69,6 +69,7 @@ pub const Plan = struct {
     first_live: Slot = no_slot,
     count: usize = 0,
     event_count: usize = 0,
+    declared_operation_scratch_intervals: usize = 0,
     peak: usize = 0,
     scratch_peak: usize = 0,
     external_scratch_savings_bytes: usize = 0,
@@ -391,7 +392,10 @@ pub const Scope = struct {
         }
         const slot = plan.count;
         plan.allocateLive(bytes, null);
-        if (plan.count != slot) plan.releaseSlot(@intCast(slot));
+        if (plan.count != slot) {
+            plan.releaseSlot(@intCast(slot));
+            if (plan.valid) plan.declared_operation_scratch_intervals += 1;
+        }
     }
 
     /// Bind the funded byte range before recording or submitting any kernels.
@@ -610,6 +614,7 @@ test "an operation can declare scratch inside an observed workspace" {
     scope.recordAllocation(128, 0x1000);
     try std.testing.expect(plan.finish(0x1000));
     try std.testing.expectEqual(Origin.observed, plan.origin);
+    try std.testing.expectEqual(@as(usize, 1), plan.declared_operation_scratch_intervals);
 
     const layout = try plan.layout(0);
     var bound = try Scope.bind(&plan, layout, 0x2000, layout.bytes);

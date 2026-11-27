@@ -467,6 +467,8 @@ pub const CudaAudioWorkspace = struct {
     route: Route,
     plan_origin: @import("stream_workspace.zig").Origin,
     planned_events: usize,
+    /// Operation-local scratch declared inside a composite allocation recipe.
+    declared_operation_scratch_intervals: usize = 0,
     planned_arena_bytes: usize,
     /// Arena capacity saved by repacking the same scratch lifetimes with
     /// external publication. This excludes the separate output bank.

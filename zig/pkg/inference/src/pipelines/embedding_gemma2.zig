@@ -6651,6 +6651,7 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
         executions: u64 = 0,
         replays: u64 = 0,
         max_planned_arena_bytes: usize = 0,
+        max_declared_operation_scratch_intervals: usize = 0,
         max_captured_arena_bytes: usize = 0,
         max_repacked_scratch_savings_bytes: usize = 0,
         fn read(actual: Session, supplied: Control) !@This() {
@@ -6671,6 +6672,7 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
                 result.owners += 1;
                 if (entry.owner.?.executable) |executable| {
                     result.max_planned_arena_bytes = @max(result.max_planned_arena_bytes, executable.storage.bytes);
+                    result.max_declared_operation_scratch_intervals = @max(result.max_declared_operation_scratch_intervals, entry.owner.?.plan.declared_operation_scratch_intervals);
                     if (executable.storage.external_output)
                         result.max_repacked_scratch_savings_bytes = @max(result.max_repacked_scratch_savings_bytes, entry.owner.?.plan.external_scratch_savings_bytes);
                 }
@@ -6717,11 +6719,12 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
         try std.testing.expect(audio_after.replays > audio_before.replays);
         try std.testing.expect(audio_after.max_captured_arena_bytes > 0);
         try std.testing.expect(audio_after.max_planned_arena_bytes > 0);
-        std.debug.print("embeddinggemma2 CUDA grouped audio max_planned_arena_bytes={d} max_captured_arena_bytes={d} max_repacked_scratch_savings_bytes={d} replays={d}\n", .{
+        std.debug.print("embeddinggemma2 CUDA grouped audio max_planned_arena_bytes={d} max_captured_arena_bytes={d} max_repacked_scratch_savings_bytes={d} replays={d} declared_operation_scratch_intervals={d}\n", .{
             audio_after.max_planned_arena_bytes,
             audio_after.max_captured_arena_bytes,
             audio_after.max_repacked_scratch_savings_bytes,
             audio_after.replays - audio_before.replays,
+            audio_after.max_declared_operation_scratch_intervals,
         });
     }
     // Existing six-second closed.mp4 naturally selects six unique frames:
