@@ -46827,19 +46827,19 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
     var compute = try CudaCompute.testing.init(a);
     defer compute.deinit();
     const cb = compute.computeBackend();
-    const input = try cb.fromFloat32Shape(&.{ 2, 3, 5, 7 }, &.{ 2, 2 });
+    const input = try cb.fromFloat32Shape(&.{ 2, 3, 5, 7, 11, 13 }, &.{ 3, 2 });
     defer cb.free(input);
     const weight = try cb.fromFloat32Shape(&.{ 1, 0, 0, 1 }, &.{ 2, 2 });
     defer cb.free(weight);
-    var backing = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 4 * @sizeOf(f32));
+    var backing = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 6 * @sizeOf(f32));
     defer backing.free(&compute.ctx);
     const owner = &compute.bounded_decode_graph;
     owner.head = backing;
     defer owner.head = .{};
-    owner.rows = 2;
+    owner.rows = 3;
     owner.hidden = 2;
     owner.vocab = 2;
-    var layout = try @import("bounded_decode_graph.zig").StorageLayout.init(2, 2, 2, 1);
+    var layout = try @import("bounded_decode_graph.zig").StorageLayout.init(3, 2, 2, 1);
     // A compact physical fixture uses the same declared-head contract.
     layout.head_bytes = backing.len;
     var metadata = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, layout.metadata_bytes);
@@ -46857,15 +46857,15 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
     defer claim.deinit();
     const copied_before = compute.stats.d2d_bytes;
     const launched_before = compute.stats.launch_embedding;
-    try std.testing.expectError(error.InvalidTokenId, claim.embedInput(input, &.{ 1, 2 }));
+    try std.testing.expectError(error.InvalidTokenId, claim.embedInput(input, &.{ 1, 2, 3 }));
     try std.testing.expectEqual(launched_before, compute.stats.launch_embedding);
-    try claim.embedInput(input, &.{ 1, 0 });
+    try claim.embedInput(input, &.{ 1, 0, 2 });
     try std.testing.expectEqual(copied_before, compute.stats.d2d_bytes);
     const embedded = try claim.input();
     defer cb.free(embedded);
     const gathered = try cb.toFloat32(embedded, a);
     defer a.free(gathered);
-    try std.testing.expectEqualSlices(f32, &.{ 5, 7, 2, 3 }, gathered);
+    try std.testing.expectEqualSlices(f32, &.{ 5, 7, 2, 3, 11, 13 }, gathered);
 
     var burst = try claim.burst(input, 2);
     defer burst.deinit();
@@ -46876,11 +46876,11 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
     try std.testing.expect(!tensorFromCt(next).owns_buffer);
     const next_gathered = try cb.toFloat32(next, a);
     defer a.free(next_gathered);
-    try std.testing.expectEqualSlices(f32, &.{ 5, 7, 5, 7 }, next_gathered);
+    try std.testing.expectEqualSlices(f32, &.{ 5, 7, 5, 7, 5, 7 }, next_gathered);
 
     var observation = @import("../../execution/runtime_observation.zig").Scope.init();
     defer observation.deinit();
-    try std.testing.expectError(error.InvalidShape, linearNoBiasWithDestination(&compute, input, weight, 2, 2, 2, false, tensorFromCt(input).buffer));
+    try std.testing.expectError(error.InvalidShape, linearNoBiasWithDestination(&compute, input, weight, 3, 2, 2, false, tensorFromCt(input).buffer));
     const projected = try claim.projectHead(&cb, input, weight);
     const entries = observation.snapshot().backend_entries;
     for (entries.records[0..entries.count]) |entry| {
@@ -46895,19 +46895,19 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
     try std.testing.expect(!tensor.owns_buffer);
     const actual = try cb.toFloat32(projected, a);
     defer a.free(actual);
-    try std.testing.expectEqualSlices(f32, &.{ 2, 3, 5, 7 }, actual);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 3, 5, 7, 11, 13 }, actual);
 
-    // One row fits in the assigned bank. The two decisions must occupy
+    // Two rows fit in the assigned bank. All three decisions must occupy
     // different positions in the second token step after bank reuse.
-    claim.head_destination.?.len = 2 * @sizeOf(f32);
-    const packet_input = try cb.fromFloat32Shape(&.{ 3, 2, 5, 7 }, &.{ 2, 2 });
+    claim.head_destination.?.len = 4 * @sizeOf(f32);
+    const packet_input = try cb.fromFloat32Shape(&.{ 3, 2, 5, 7, 13, 11 }, &.{ 3, 2 });
     defer cb.free(packet_input);
     try claim.projectGreedyHead(&cb, &burst, packet_input, weight, 1);
     const packet_embeddings = try burst.embedding(1);
     defer cb.free(packet_embeddings);
     const packet_actual = try cb.toFloat32(packet_embeddings, a);
     defer a.free(packet_actual);
-    try std.testing.expectEqualSlices(f32, &.{ 2, 3, 5, 7 }, packet_actual);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 3, 5, 7, 2, 3 }, packet_actual);
 }
 
 test "LightOnOCR3 CUDA bounded GEMM refresh drains at an exclusive boundary and refuses capture" {
