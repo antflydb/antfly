@@ -46764,6 +46764,7 @@ fn checkAssignedDenseFfnCapture(compute: *CudaCompute, cb: *const ops.ComputeBac
     try std.testing.expectEqual(warm_address, tensorFromCt(output).buffer.ptr);
     var graph = try graph_mod.endRecording(&compute.ctx);
     recording = false;
+    compute.execution_scope = null;
     defer compute.ctx.destroyGraphChecked(&graph) catch unreachable;
     var executable = try compute.ctx.instantiateGraph(graph);
     defer compute.ctx.destroyGraphExecChecked(&executable) catch unreachable;
