@@ -2626,9 +2626,11 @@ pub const ChunkSeed = struct {
     }
 };
 
-/// One seeded vector of a chunk-derived embedding. An entry without `window_index` is the chunk's only vector, stored unsplit (window 0). If any entry for a chunk has a `window_index`, that chunk's windows must be supplied contiguously from 0. Chunks without a seeded vector are embedded as usual. Vectors of a document extraction's unit chunks name their unit with `parent_unit_id` (every entry, no `window_index`: unit chunks are embedded whole) and are accepted with the extraction seed in the same write; each must name a text chunk of an extracted unit.
+/// One seeded vector of a chunk-derived embedding. An entry without `window_index` is the chunk's only vector, stored unsplit (window 0). If any entry for a chunk has a `window_index`, that chunk's windows must be supplied contiguously from 0. Chunks without a seeded vector are embedded as usual. Vectors of a document extraction's unit chunks name their unit with `unit_id` or its alias `parent_unit_id` (every entry, no `window_index`: unit chunks are embedded whole) and are accepted with the extraction seed in the same write; each must name a text chunk of an extracted unit.
 pub const ChunkVectorSeed = struct {
     /// The extraction unit of the chunk, e.g. `page:000003`.
+    unit_id: ?[]const u8 = null,
+    /// Alias of `unit_id`; both may appear only when equal.
     parent_unit_id: ?[]const u8 = null,
     chunk_id: i64,
     window_index: ?i64 = null,
@@ -2636,6 +2638,7 @@ pub const ChunkVectorSeed = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "unit_id", "unit_id", true },
         .{ "parent_unit_id", "parent_unit_id", true },
         .{ "chunk_id", "chunk_id", false },
         .{ "window_index", "window_index", true },
@@ -2652,6 +2655,10 @@ pub const ChunkVectorSeed = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.unit_id) |value| {
+            try jw.objectField("unit_id");
+            try jw.write(value);
+        }
         if (self.parent_unit_id) |value| {
             try jw.objectField("parent_unit_id");
             try jw.write(value);
@@ -16783,7 +16790,7 @@ pub const SecretWriteRequest = struct {
     value: []const u8,
 };
 
-/// What a seed does when the enrichment already has accepted output for the same input (same source version, producer and configuration) that differs from the seed. `keep` rejects the batch (`ArtifactSeedConflict`); identical output is reported `unchanged`. `replace` publishes the seed. A document or transform may set its own policy with the reserved `_seed_conflict` member, which wins over the request. During distributed transaction resolution a conflict never fails: the existing output is kept.
+/// What a seed does when the enrichment already has accepted output for the same input (same source version, producer and configuration) that differs from the seed. `keep` leaves the accepted output in place and the rest of the write commits; the item is reported as `conflict` with the existing output's origin. Identical output is reported `unchanged`. `replace` publishes the seed. Embedded and Lite batches return these outcomes in the batch response (`seeds`); on a server, plan the batch with `validate_only` to see them before writing. A document or transform may set its own policy with the reserved `_seed_conflict` member, which wins over the request. During distributed transaction resolution a conflict never fails: the existing output is kept.
 pub const SeedConflictPolicy = enum {
     keep,
     replace,
@@ -16816,6 +16823,8 @@ pub const SeedOutcome = struct {
     /// - `accepted`: the seed becomes the output. - `unchanged`: identical output is already accepted for this input. - `conflict`: different output is already accepted (kept). - `replaced`: different output is replaced by the seed. - `deleted`: a `null` seed drops the accepted output. - `missing`: no seed was supplied; the producer will run. - `rejected`: the write would fail with `error`.
     outcome: []const u8,
     existing_origin: ?[]const u8 = null,
+    /// Where the seed came from: an explicit `_artifacts`/`_chunks` seed in the write, which wins, or the enrichment's field mapping. Absent for `missing` and `rejected`.
+    via: ?[]const u8 = null,
     @"error": ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -16824,6 +16833,7 @@ pub const SeedOutcome = struct {
         .{ "name", "name", true },
         .{ "outcome", "outcome", false },
         .{ "existing_origin", "existing_origin", true },
+        .{ "via", "via", true },
         .{ "error", "error", true },
     };
 
@@ -16847,6 +16857,10 @@ pub const SeedOutcome = struct {
         try jw.write(self.outcome);
         if (self.existing_origin) |value| {
             try jw.objectField("existing_origin");
+            try jw.write(value);
+        }
+        if (self.via) |value| {
+            try jw.objectField("via");
             try jw.write(value);
         }
         if (self.@"error") |value| {
@@ -17125,9 +17139,11 @@ pub const SortProfile = struct {
     }
 };
 
-/// One seeded sparse vector of a chunk. Sparse chunk vectors are never windowed. Vectors of a document extraction's unit chunks name their unit with `parent_unit_id` (every entry) and are accepted with the extraction seed in the same write; plain chunk vectors must not name one. Every entry must name a chunk of this revision; chunks without a seeded vector are embedded as usual.
+/// One seeded sparse vector of a chunk. Sparse chunk vectors are never windowed. Vectors of a document extraction's unit chunks name their unit with `unit_id` or its alias `parent_unit_id` (every entry) and are accepted with the extraction seed in the same write; plain chunk vectors must not name one. Every entry must name a chunk of this revision; chunks without a seeded vector are embedded as usual.
 pub const SparseChunkVectorSeed = struct {
     chunk_id: i64,
+    unit_id: ?[]const u8 = null,
+    /// Alias of `unit_id`; both may appear only when equal.
     parent_unit_id: ?[]const u8 = null,
     indices: []const i64,
     values: []const f64,
@@ -17135,6 +17151,7 @@ pub const SparseChunkVectorSeed = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "chunk_id", "chunk_id", false },
+        .{ "unit_id", "unit_id", true },
         .{ "parent_unit_id", "parent_unit_id", true },
         .{ "indices", "indices", false },
         .{ "values", "values", false },
@@ -17152,6 +17169,10 @@ pub const SparseChunkVectorSeed = struct {
         try jw.beginObject();
         try jw.objectField("chunk_id");
         try jw.write(self.chunk_id);
+        if (self.unit_id) |value| {
+            try jw.objectField("unit_id");
+            try jw.write(value);
+        }
         if (self.parent_unit_id) |value| {
             try jw.objectField("parent_unit_id");
             try jw.write(value);

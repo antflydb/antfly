@@ -17,18 +17,23 @@
 //! `antfly_db_batch_json` path in `api/batch.zig`. Same wire-codec shape as
 //! `capi/search_wire.zig` (fixed-width little-endian header, length-prefixed
 //! byte strings), but scoped to exactly what a batch needs: writes, deletes,
-//! and the sync-level option. Transforms and graph writes/deletes stay
-//! JSON-only.
+//! transforms and the sync-level option. Graph writes/deletes stay JSON-only.
 //!
 //! Format (all integers little-endian, fixed width):
 //!   magic: u32 = 0x41464257 ("AFBW")
-//!   version: u16 = 1
+//!   version: u16 = 1 or 2
 //!   sync_level: u8 (0=propose 1=write 2=full_text 3=enrichments 4=full_index)
 //!   reserved: u8 = 0
 //!   write_count: u32
 //!   delete_count: u32
 //!   write_count * { key_len: u32, key: [key_len]u8, value_len: u32, value: [value_len]u8 }
 //!   delete_count * { key_len: u32, key: [key_len]u8 }
+//!   version 2 only: transforms_len: u32, transforms: [transforms_len]u8
+//!
+//! Version 2 transforms are the public batch `transforms` JSON array, with
+//! per-transform `expected_version`, parsed by the same codec as the JSON
+//! entry point so both accept exactly the same transforms (including
+//! artifact-seed paths and `_seed_conflict`). A zero length means none.
 //!
 //! `decodeBatchRequest` is zero-copy: every write/delete key and write value
 //! borrows directly from the caller's `buf` rather than being duplicated.
@@ -44,26 +49,41 @@ const batch_api = @import("../api/batch.zig");
 
 pub const magic: u32 = 0x41464257; // "AFBW"
 pub const version: u16 = 1;
+/// Adds the transforms section.
+pub const transforms_version: u16 = 2;
 
 pub const DecodedBatch = struct {
     writes: []mutation.BatchWrite = &.{},
     deletes: [][]const u8 = &.{},
     sync_level: mutation.SyncLevel = .propose,
+    /// Version 2 transforms, parsed (and owned) by the public batch codec.
+    transforms: ?batch_api.OwnedBatchRequest = null,
 
     pub fn deinit(self: *DecodedBatch, alloc: std.mem.Allocator) void {
         if (self.writes.len != 0) alloc.free(self.writes);
         if (self.deletes.len != 0) alloc.free(self.deletes);
+        if (self.transforms) |*owned| owned.deinit(alloc);
         self.* = undefined;
     }
 
     pub fn asRequest(self: DecodedBatch) mutation.PublicBatchRequest {
-        return .{ .writes = self.writes, .deletes = self.deletes, .sync_level = self.sync_level };
+        return .{
+            .writes = self.writes,
+            .deletes = self.deletes,
+            .transforms = if (self.transforms) |owned| owned.transforms else &.{},
+            .sync_level = self.sync_level,
+        };
+    }
+
+    /// Per-transform `expected_version` preconditions.
+    pub fn expectedVersions(self: DecodedBatch) []const batch_api.ExpectedVersion {
+        return if (self.transforms) |owned| owned.expected_versions else &.{};
     }
 };
 
 pub fn decodeBatchRequest(alloc: std.mem.Allocator, buf: []const u8) !DecodedBatch {
     var reader = Reader{ .buf = buf };
-    try reader.expectMagicAndVersion();
+    const wire_version = try reader.expectMagicAndVersion();
     const sync_level = syncLevelFromTag(try reader.readInt(u8)) orelse return error.InvalidArgument;
     _ = try reader.readInt(u8); // reserved
     const write_count = try reader.readInt(u32);
@@ -91,8 +111,21 @@ pub fn decodeBatchRequest(alloc: std.mem.Allocator, buf: []const u8) !DecodedBat
         if (batch_api.isReservedControlKey(key)) return error.InvalidArgument;
         del.* = key;
     }
+    var transforms: ?batch_api.OwnedBatchRequest = null;
+    errdefer if (transforms) |*owned| owned.deinit(alloc);
+    if (wire_version == transforms_version) {
+        const json = try reader.readBytes(try reader.readInt(u32));
+        if (json.len != 0) {
+            const body = try std.mem.concat(alloc, u8, &.{ "{\"transforms\":", json, "}" });
+            defer alloc.free(body);
+            transforms = batch_api.parseBatchRequest(alloc, body) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidArgument,
+            };
+        }
+    }
     if (!reader.done()) return error.InvalidArgument;
-    return .{ .writes = writes, .deletes = deletes, .sync_level = sync_level };
+    return .{ .writes = writes, .deletes = deletes, .sync_level = sync_level, .transforms = transforms };
 }
 
 fn syncLevelFromTag(tag: u8) ?mutation.SyncLevel {
@@ -120,9 +153,11 @@ const Reader = struct {
     buf: []const u8,
     pos: usize = 0,
 
-    fn expectMagicAndVersion(self: *Reader) !void {
+    fn expectMagicAndVersion(self: *Reader) !u16 {
         if (try self.readInt(u32) != magic) return error.InvalidArgument;
-        if (try self.readInt(u16) != version) return error.InvalidArgument;
+        const found = try self.readInt(u16);
+        if (found != version and found != transforms_version) return error.InvalidArgument;
+        return found;
     }
 
     fn readBytes(self: *Reader, len: usize) ![]const u8 {
@@ -181,6 +216,60 @@ pub fn encodeBatchRequestAlloc(
     }
     std.debug.assert(cursor == total);
     return out;
+}
+
+/// Test/bench helper: the version 2 encoding, with `transforms_json` (the
+/// public batch `transforms` array) after the deletes.
+pub fn encodeBatchRequestWithTransformsAlloc(
+    alloc: std.mem.Allocator,
+    writes: []const mutation.BatchWrite,
+    deletes: []const []const u8,
+    transforms_json: []const u8,
+    sync_level: mutation.SyncLevel,
+) ![]u8 {
+    const v1 = try encodeBatchRequestAlloc(alloc, writes, deletes, sync_level);
+    defer alloc.free(v1);
+    const out = try alloc.alloc(u8, v1.len + 4 + transforms_json.len);
+    @memcpy(out[0..v1.len], v1);
+    std.mem.writeInt(u16, out[4..6], transforms_version, .little);
+    var cursor = v1.len;
+    writeInt(out, &cursor, u32, @intCast(transforms_json.len));
+    @memcpy(out[cursor..][0..transforms_json.len], transforms_json);
+    return out;
+}
+
+test "batch wire version 2 carries transforms with expected versions and seed paths" {
+    const alloc = std.testing.allocator;
+    const writes = [_]mutation.BatchWrite{.{ .key = "doc:a", .value = "{\"x\":1}" }};
+    const transforms =
+        \\[{"key":"doc:b","expected_version":"7","operations":[{"op":"$set","path":"_artifacts.summary","value":{"value":"s"}}]},
+        \\ {"key":"doc:c","operations":[{"op":"$inc","path":"$.n","value":1}]}]
+    ;
+    const buf = try encodeBatchRequestWithTransformsAlloc(alloc, &writes, &.{}, transforms, .write);
+    defer alloc.free(buf);
+    var decoded = try decodeBatchRequest(alloc, buf);
+    defer decoded.deinit(alloc);
+    const req = decoded.asRequest();
+    try std.testing.expectEqual(@as(usize, 1), req.writes.len);
+    try std.testing.expectEqual(@as(usize, 2), req.transforms.len);
+    try std.testing.expectEqualStrings("_artifacts.summary", req.transforms[0].operations[0].path);
+    try std.testing.expectEqual(@as(usize, 1), decoded.expectedVersions().len);
+    try std.testing.expectEqual(@as(u64, 7), decoded.expectedVersions()[0].version);
+
+    // The same transform rules as the JSON entry point: a seed-only
+    // transform without `expected_version` is rejected.
+    const unbound = try encodeBatchRequestWithTransformsAlloc(alloc, &.{}, &.{},
+        \\[{"key":"doc:b","operations":[{"op":"$set","path":"_artifacts.summary","value":{"value":"s"}}]}]
+    , .write);
+    defer alloc.free(unbound);
+    try std.testing.expectError(error.InvalidArgument, decodeBatchRequest(alloc, unbound));
+    // An empty section is no transforms; a truncated one is malformed.
+    const none = try encodeBatchRequestWithTransformsAlloc(alloc, &writes, &.{}, "", .write);
+    defer alloc.free(none);
+    var plain = try decodeBatchRequest(alloc, none);
+    defer plain.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), plain.asRequest().transforms.len);
+    try std.testing.expectError(error.InvalidArgument, decodeBatchRequest(alloc, buf[0 .. buf.len - 1]));
 }
 
 test "batch wire round-trips writes, deletes and sync level" {

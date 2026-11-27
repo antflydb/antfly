@@ -14,21 +14,23 @@ T = TypeVar("T", bound="SparseChunkVectorSeed")
 class SparseChunkVectorSeed:
     """One seeded sparse vector of a chunk. Sparse chunk vectors are never
     windowed. Vectors of a document extraction's unit chunks name their
-    unit with `parent_unit_id` (every entry) and are accepted with the
-    extraction seed in the same write; plain chunk vectors must not name
-    one. Every entry must name a chunk of this revision; chunks without a
+    unit with `unit_id` or its alias `parent_unit_id` (every entry) and
+    are accepted with the extraction seed in the same write; plain chunk
+    vectors must not name one. Every entry must name a chunk of this revision; chunks without a
     seeded vector are embedded as usual.
 
         Attributes:
             chunk_id (int):
             indices (list[int]):
             values (list[float]):
-            parent_unit_id (str | Unset):
+            unit_id (str | Unset):
+            parent_unit_id (str | Unset): Alias of `unit_id`; both may appear only when equal.
     """
 
     chunk_id: int
     indices: list[int]
     values: list[float]
+    unit_id: str | Unset = UNSET
     parent_unit_id: str | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
@@ -37,6 +39,8 @@ class SparseChunkVectorSeed:
         indices = self.indices
 
         values = self.values
+
+        unit_id = self.unit_id
 
         parent_unit_id = self.parent_unit_id
 
@@ -49,6 +53,8 @@ class SparseChunkVectorSeed:
                 "values": values,
             }
         )
+        if unit_id is not UNSET:
+            field_dict["unit_id"] = unit_id
         if parent_unit_id is not UNSET:
             field_dict["parent_unit_id"] = parent_unit_id
 
@@ -63,12 +69,15 @@ class SparseChunkVectorSeed:
 
         values = cast(list[float], d.pop("values"))
 
+        unit_id = d.pop("unit_id", UNSET)
+
         parent_unit_id = d.pop("parent_unit_id", UNSET)
 
         sparse_chunk_vector_seed = cls(
             chunk_id=chunk_id,
             indices=indices,
             values=values,
+            unit_id=unit_id,
             parent_unit_id=parent_unit_id,
         )
 

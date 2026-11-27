@@ -8,6 +8,7 @@ from attrs import field as _attrs_field
 
 from ..models.seed_outcome_existing_origin import SeedOutcomeExistingOrigin
 from ..models.seed_outcome_outcome import SeedOutcomeOutcome
+from ..models.seed_outcome_via import SeedOutcomeVia
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="SeedOutcome")
@@ -27,6 +28,9 @@ class SeedOutcome:
             - `rejected`: the write would fail with `error`.
         name (str | Unset): Enrichment name. Absent for items rejected as a whole.
         existing_origin (SeedOutcomeExistingOrigin | Unset):
+        via (SeedOutcomeVia | Unset): Where the seed came from: an explicit `_artifacts`/`_chunks` seed
+            in the write, which wins, or the enrichment's field mapping.
+            Absent for `missing` and `rejected`.
         error (str | Unset):
     """
 
@@ -34,6 +38,7 @@ class SeedOutcome:
     outcome: SeedOutcomeOutcome
     name: str | Unset = UNSET
     existing_origin: SeedOutcomeExistingOrigin | Unset = UNSET
+    via: SeedOutcomeVia | Unset = UNSET
     error: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -47,6 +52,10 @@ class SeedOutcome:
         existing_origin: str | Unset = UNSET
         if not isinstance(self.existing_origin, Unset):
             existing_origin = self.existing_origin.value
+
+        via: str | Unset = UNSET
+        if not isinstance(self.via, Unset):
+            via = self.via.value
 
         error = self.error
 
@@ -62,6 +71,8 @@ class SeedOutcome:
             field_dict["name"] = name
         if existing_origin is not UNSET:
             field_dict["existing_origin"] = existing_origin
+        if via is not UNSET:
+            field_dict["via"] = via
         if error is not UNSET:
             field_dict["error"] = error
 
@@ -83,6 +94,13 @@ class SeedOutcome:
         else:
             existing_origin = SeedOutcomeExistingOrigin(_existing_origin)
 
+        _via = d.pop("via", UNSET)
+        via: SeedOutcomeVia | Unset
+        if isinstance(_via, Unset):
+            via = UNSET
+        else:
+            via = SeedOutcomeVia(_via)
+
         error = d.pop("error", UNSET)
 
         seed_outcome = cls(
@@ -90,6 +108,7 @@ class SeedOutcome:
             outcome=outcome,
             name=name,
             existing_origin=existing_origin,
+            via=via,
             error=error,
         )
 

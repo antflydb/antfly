@@ -2563,6 +2563,7 @@ from .seed_conflict_policy import SeedConflictPolicy
 from .seed_outcome import SeedOutcome
 from .seed_outcome_existing_origin import SeedOutcomeExistingOrigin
 from .seed_outcome_outcome import SeedOutcomeOutcome
+from .seed_outcome_via import SeedOutcomeVia
 from .seed_plan_response import SeedPlanResponse
 from .semantic_query_mode import SemanticQueryMode
 from .serper_search_config import SerperSearchConfig
@@ -5193,6 +5194,7 @@ __all__ = (
     "SeedOutcome",
     "SeedOutcomeExistingOrigin",
     "SeedOutcomeOutcome",
+    "SeedOutcomeVia",
     "SeedPlanResponse",
     "SemanticQueryMode",
     "SerperSearchConfig",

@@ -5594,16 +5594,30 @@ pub fn antfly_db_batch_json(
     const handle = guard.handle;
     var owned = batch_api.parseBatchRequest(handle.alloc, request_json.bytes()) catch |err| return capi.mapError(err);
     defer owned.deinit(handle.alloc);
+    // Public `expected_version` preconditions are the batch version
+    // predicates, checked atomically with the commit.
+    const predicates = handle.alloc.alloc(db_mod.types.TransactionVersionPredicate, owned.expected_versions.len) catch |err| return capi.mapError(err);
+    defer handle.alloc.free(predicates);
+    for (owned.expected_versions, predicates) |expected, *predicate| predicate.* = .{ .key = expected.key, .expected_version = expected.version };
+    var req = db_mod.types.fromPublicMutation(owned.req);
+    req.predicates = predicates;
 
     const receipt_scope = beginOutcomeReceipts(guard.lock_handle);
     defer receipt_scope.end();
     var primary_committed = false;
+    // Per-item outcomes of the write's artifact seeds, for the response.
+    const execution_resources = @import("../storage/db/execution_resources.zig");
+    var seed_report = execution_resources.SeedPlanCapture{ .alloc = std.heap.c_allocator };
+    defer if (seed_report.json) |json| std.heap.c_allocator.free(json);
+    const previous_seed_report = execution_resources.seed_report;
+    execution_resources.seed_report = &seed_report;
+    defer execution_resources.seed_report = previous_seed_report;
     // A table handle commits to its table's database, which holds the marker.
-    trackedBatchWithWriterLaneHook(handle.database(), db_mod.types.fromPublicMutation(owned.req), &primary_committed, handle.selected_table_name, writerLaneHookFromGuard(&guard)) catch |err| {
-        if (!committedOnReplacedRuntime(&guard, handle, err, primary_committed, db_mod.types.fromPublicMutation(owned.req))) return batchFailureCode(err, primary_committed);
+    trackedBatchWithWriterLaneHook(handle.database(), req, &primary_committed, handle.selected_table_name, writerLaneHookFromGuard(&guard)) catch |err| {
+        if (!committedOnReplacedRuntime(&guard, handle, err, primary_committed, req)) return batchFailureCode(err, primary_committed);
     };
     // Committed: a response failure must not read as a failed batch.
-    const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch
+    const response = batchResponseWithSeedsAlloc(owned.result(), seed_report.json) catch
         return capi.recordError(.stalled, "batch committed; its response could not be encoded; do not retry the batch");
     out_buf.* = .{
         .ptr = response.ptr,
@@ -5612,14 +5626,25 @@ pub fn antfly_db_batch_json(
     return .ok;
 }
 
+/// The batch response, with the per-item outcomes of its artifact seeds
+/// (`seeds`) when the write carried any.
+fn batchResponseWithSeedsAlloc(result: batch_api.BatchResult, seeds_json: ?[]const u8) ![]u8 {
+    const response = try batch_api.encodeBatchResponse(std.heap.c_allocator, result);
+    const seeds = seeds_json orelse return response;
+    defer std.heap.c_allocator.free(response);
+    if (response.len == 0 or response[response.len - 1] != '}') return error.InvalidBatchResponse;
+    return try std.mem.concat(std.heap.c_allocator, u8, &.{ response[0 .. response.len - 1], ",\"seeds\":", seeds, "}" });
+}
+
 /// Binary counterpart to `antfly_db_batch_json`: `request_buf` is the
 /// length-prefixed wire encoding documented in `capi/batch_wire.zig` and the
 /// public header, instead of a JSON object. Parsing is zero-copy (every write
 /// key/value and delete key borrows directly from `request_buf`, which the
 /// `antfly_slice` contract already requires stay valid for the call) and does
 /// no per-field allocation, unlike the JSON path's `std.json` tree plus one
-/// `dupe` per field. Transforms and graph writes/deletes are JSON-only; this
-/// entry point only carries writes, deletes, and the sync-level option.
+/// `dupe` per field. Version 2 adds transforms, parsed by the JSON codec so
+/// both entry points accept the same transforms; graph writes/deletes are
+/// JSON-only.
 pub fn antfly_db_batch_wire(
     handle_ptr: ?*anyopaque,
     request_buf: capi.Slice,
@@ -5639,17 +5664,30 @@ pub fn antfly_db_batch_wire(
     var decoded = batch_wire.decodeBatchRequest(handle.alloc, request_buf.bytes()) catch |err| return capi.mapError(err);
     defer decoded.deinit(handle.alloc);
 
+    const expected_versions = decoded.expectedVersions();
+    const predicates = handle.alloc.alloc(db_mod.types.TransactionVersionPredicate, expected_versions.len) catch |err| return capi.mapError(err);
+    defer handle.alloc.free(predicates);
+    for (expected_versions, predicates) |expected, *predicate| predicate.* = .{ .key = expected.key, .expected_version = expected.version };
+    var req = db_mod.types.fromPublicMutation(decoded.asRequest());
+    req.predicates = predicates;
+
     const receipt_scope = beginOutcomeReceipts(guard.lock_handle);
     defer receipt_scope.end();
     var primary_committed = false;
-    const req = decoded.asRequest();
-    trackedBatchWithWriterLaneHook(handle.database(), db_mod.types.fromPublicMutation(req), &primary_committed, handle.selected_table_name, writerLaneHookFromGuard(&guard)) catch |err| {
-        if (!committedOnReplacedRuntime(&guard, handle, err, primary_committed, db_mod.types.fromPublicMutation(req))) return batchFailureCode(err, primary_committed);
+    const execution_resources = @import("../storage/db/execution_resources.zig");
+    var seed_report = execution_resources.SeedPlanCapture{ .alloc = std.heap.c_allocator };
+    defer if (seed_report.json) |json| std.heap.c_allocator.free(json);
+    const previous_seed_report = execution_resources.seed_report;
+    execution_resources.seed_report = &seed_report;
+    defer execution_resources.seed_report = previous_seed_report;
+    trackedBatchWithWriterLaneHook(handle.database(), req, &primary_committed, handle.selected_table_name, writerLaneHookFromGuard(&guard)) catch |err| {
+        if (!committedOnReplacedRuntime(&guard, handle, err, primary_committed, req)) return batchFailureCode(err, primary_committed);
     };
-    const response = batch_api.encodeBatchResponse(std.heap.c_allocator, .{
+    const response = batchResponseWithSeedsAlloc(.{
         .inserted = @as(u32, @intCast(decoded.writes.len)),
         .deleted = @as(u32, @intCast(decoded.deletes.len)),
-    }) catch
+        .transformed = @as(u32, @intCast(req.transforms.len)),
+    }, seed_report.json) catch
         return capi.recordError(.stalled, "batch committed; its response could not be encoded; do not retry the batch");
     out_buf.* = .{
         .ptr = response.ptr,

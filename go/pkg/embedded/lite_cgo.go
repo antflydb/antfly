@@ -28,6 +28,7 @@ import "C"
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"runtime"
 	"strings"
 	"sync"
@@ -248,6 +249,27 @@ func EncodeBatchWire(writes []WriteIntent, syncLevel SyncLevel) ([]byte, error) 
 		putU32(uint32(len(w.Key)))
 		putBytes([]byte(w.Key))
 	}
+	return buf, nil
+}
+
+// EncodeBatchWireWithTransforms is EncodeBatchWire in wire version 2, which
+// adds transforms: transformsJSON is the JSON batch "transforms" array (with
+// per-transform "expected_version", and artifact-seed paths), parsed by the
+// same codec as the JSON batch API. A nil or empty transformsJSON encodes no
+// transforms.
+func EncodeBatchWireWithTransforms(writes []WriteIntent, transformsJSON []byte, syncLevel SyncLevel) ([]byte, error) {
+	base, err := EncodeBatchWire(writes, syncLevel)
+	if err != nil {
+		return nil, err
+	}
+	if uint64(len(transformsJSON)) > math.MaxUint32 {
+		return nil, fmt.Errorf("embedded: transforms exceed the wire length limit")
+	}
+	buf := make([]byte, len(base)+4+len(transformsJSON))
+	copy(buf, base)
+	binary.LittleEndian.PutUint16(buf[4:], 2) // version 2: transforms section
+	binary.LittleEndian.PutUint32(buf[len(base):], uint32(len(transformsJSON)))
+	copy(buf[len(base)+4:], transformsJSON)
 	return buf, nil
 }
 

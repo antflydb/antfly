@@ -2721,12 +2721,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     apply_mutex_held = false;
                     return;
                 }
-                // `keep` never drops a differing seed silently: the write is
-                // rejected and planning names the conflicting items. A
-                // committed transaction's resolution cannot be rejected; its
-                // participants voted at prepare, and preparation kept the
-                // existing output for any later conflict.
-                if (opts.transaction_resolution == null) for (precomputed_generated.seed_outcomes) |entry| if (entry.outcome == .conflict) return error.ArtifactSeedConflict;
+                // Under `keep` a differing seed is never applied and never
+                // dropped silently: preparation kept the accepted output and
+                // the item reports `conflict` (with the existing origin) to
+                // the caller collecting outcomes; the rest of the write
+                // commits. A transaction's resolution reports to no caller.
+                if (opts.transaction_resolution == null) if (execution_resources.seed_report) |capture| if (precomputed_generated.seed_outcomes.len > 0) {
+                    if (capture.json) |previous| capture.alloc.free(previous);
+                    capture.json = null;
+                    capture.json = try std.json.Stringify.valueAlloc(capture.alloc, precomputed_generated.seed_outcomes, .{ .emit_null_optional_fields = false });
+                };
                 if (opts.transaction_resolution != null) if (decoded_prepared) |packet| {
                     var plan = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
                     defer plan.release();

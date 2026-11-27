@@ -171,9 +171,17 @@ Each seeded output has one outcome:
 The public batch lowers a request-level `seed_conflict: replace` into a
 reserved per-document `_seed_conflict` member (a document's own wins), so the
 policy travels with the seeds through replication and 2PC. Under `keep`, a
-conflict rejects the batch with `ArtifactSeedConflict`. During distributed
-transaction resolution a conflict never fails: the existing output is kept,
-because the coordinator has already committed. Conflicts are detected only
+conflict is not applied: the accepted output stays, the rest of the write
+commits, and the item is reported as `conflict` with the existing output's
+origin. Each outcome except `missing` also reports `via: explicit | mapping`:
+an explicit seed in the write wins over the enrichment's field mapping.
+
+Embedded batches report outcomes per item: `DB.batchReportingSeeds`, and the
+C API's `antfly_db_batch_json` and `antfly_db_batch_wire` responses carry a
+`seeds` array when any write was seeded. Server batch responses do not carry
+apply outcomes yet (see remaining work); plan with `validate_only` first.
+During distributed transaction resolution the existing output is kept the
+same way. Conflicts are detected only
 against output accepted for the same input; a changed input is a fresh
 `accepted`.
 
@@ -333,6 +341,24 @@ rows prepared in the write) and is stored with the identity the sparse
 producer records for that chunk text at its revision; unseeded chunks are
 embedded.
 
+### Late inference results
+
+Generated output that was planned before a seed was accepted or replaced must
+not overwrite it. A deferred asset result records the accepted output's
+digest (or its absence) when its work is planned; publication rechecks it in
+the guarded commit and drops the result with `EnrichmentSourceChanged` when a
+seed changed it meanwhile. Chunk and vector results are fenced by their
+source digest and per-chunk recipe identity as before.
+
+### Lite and the binary wire
+
+Lite uses the DB batch parser and coalescer, so seeds, transforms and
+`seed_conflict` behave identically. Public `expected_version` predicates are
+lowered on both C entry points. `antfly_db_batch_wire` version 2 appends the
+JSON `transforms` array (with `expected_version` and seed paths) after the
+binary writes; version 1 bodies are still accepted
+(`go/pkg/embedded`: `EncodeBatchWireWithTransforms`).
+
 ## Not yet accepted
 
 These fail with `ArtifactSeedNotAccepted` rather than regenerating:
@@ -346,12 +372,18 @@ These fail with `ArtifactSeedNotAccepted` rather than regenerating:
 
 ## Remaining work
 
-- Leader-prepared seed acceptance for Raft. Replicas accept seeds during
-  deterministic apply (seed errors are expected apply failures that advance
-  the entry on every replica alike); dense seeds resolve the embedder's
-  provider generation there, as synchronous generated preparation does.
-- Migration progress reporting and a streaming import path beyond the
-  4,095-chunk atomic-mutation ceiling and request bounds (#1354).
-- The binary `antfly_db_batch_wire` entry point does not carry transforms;
-  seed-only writes use the JSON batch path. The serverless coordinator rejects
-  seed paths until serverless publication accepts seeds.
+- Leader-prepared seed acceptance for Raft, and per-item outcomes in server
+  batch responses. Replicas accept seeds during deterministic apply (seed
+  errors are expected apply failures that advance the entry on every replica
+  alike); dense seeds resolve the embedder's provider generation there, as
+  synchronous generated preparation does. The proposer does not receive apply
+  outcomes, so server responses report counts only.
+- `on_missing: pending` for field mappings (outputs that wait for a later seed
+  instead of generating or failing), with readiness that reports them.
+- Externally maintained artifacts declared without any producer.
+- Migration progress reporting, generation of only the missing pages of a
+  rich extraction seed, and a streaming import path for chunk inventories
+  beyond the 4,095-chunk atomic-mutation ceiling (staged publication,
+  `docs/design/media-pass.md`).
+- The serverless coordinator rejects seed paths until serverless publication
+  accepts seeds; its fixed pipelines have no named enrichments to seed.

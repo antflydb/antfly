@@ -101,7 +101,12 @@ pub const OutcomeEntry = struct {
     outcome: Outcome,
     /// Origin of the output that existed before this write, when any did.
     existing_origin: ?Origin = null,
+    /// Where the seed came from: an explicit `_artifacts`/`_chunks` seed in
+    /// the write, or the enrichment's field mapping. Absent for `missing`.
+    via: ?Via = null,
 };
+
+pub const Via = enum { explicit, mapping };
 
 /// Upper bound on one seeded chunk collection inside a single atomic write.
 /// Larger inventories belong to staged publication (`docs/design/media-pass.md`).
@@ -745,6 +750,19 @@ pub fn freeUnitChunkVectors(alloc: Allocator, vectors: []UnitChunkVector) void {
     if (vectors.len > 0) alloc.free(vectors);
 }
 
+/// A chunk vector names its extraction unit as `unit_id` (the internal
+/// identity `(chunk_id, window_index, unit_id)`) or `parent_unit_id` (the
+/// chunk row's `_parent_unit_id`). Both may appear only when they agree.
+fn isUnitIdKey(key: []const u8) bool {
+    return std.mem.eql(u8, key, "unit_id") or std.mem.eql(u8, key, "parent_unit_id");
+}
+
+fn unitIdField(field: std.json.Value, prior: ?[]const u8) ![]const u8 {
+    if (field != .string or field.string.len == 0 or field.string.len > max_name_bytes) return error.InvalidArtifactSeed;
+    if (prior) |seen| if (!std.mem.eql(u8, seen, field.string)) return error.InvalidArtifactSeed;
+    return field.string;
+}
+
 /// `[{parent_unit_id, chunk_id, vector}]`, each (unit, chunk) at most once.
 /// Unit ids borrow from `value`.
 pub fn decodeUnitChunkVectorsAlloc(alloc: Allocator, value: std.json.Value, expected_dims: u32) ![]UnitChunkVector {
@@ -763,9 +781,8 @@ pub fn decodeUnitChunkVectorsAlloc(alloc: Allocator, value: std.json.Value, expe
         while (it.next()) |entry| {
             const key = entry.key_ptr.*;
             const field = entry.value_ptr.*;
-            if (std.mem.eql(u8, key, "parent_unit_id")) {
-                if (field != .string or field.string.len == 0 or field.string.len > max_name_bytes) return error.InvalidArtifactSeed;
-                unit_id = field.string;
+            if (isUnitIdKey(key)) {
+                unit_id = try unitIdField(field, unit_id);
             } else if (std.mem.eql(u8, key, "chunk_id")) {
                 chunk_id = try jsonU32(field);
             } else if (std.mem.eql(u8, key, "vector")) {
@@ -800,6 +817,14 @@ test "artifact seed unit chunk vectors name their unit and never window" {
     const vectors = try decodeUnitChunkVectorsAlloc(alloc, ok.value, 2);
     defer freeUnitChunkVectors(alloc, vectors);
     try std.testing.expectEqualStrings("page:000002", vectors[1].parent_unit_id);
+    var aliased = try parseForTest(alloc, "[{\"unit_id\":\"page:000003\",\"parent_unit_id\":\"page:000003\",\"chunk_id\":0,\"vector\":[1,2]}]");
+    defer aliased.deinit();
+    const aliased_vectors = try decodeUnitChunkVectorsAlloc(alloc, aliased.value, 2);
+    defer freeUnitChunkVectors(alloc, aliased_vectors);
+    try std.testing.expectEqualStrings("page:000003", aliased_vectors[0].parent_unit_id);
+    var disagreeing = try parseForTest(alloc, "[{\"unit_id\":\"a\",\"parent_unit_id\":\"b\",\"chunk_id\":0,\"vector\":[1,2]}]");
+    defer disagreeing.deinit();
+    try std.testing.expectError(error.InvalidArtifactSeed, decodeUnitChunkVectorsAlloc(alloc, disagreeing.value, 2));
     try std.testing.expectError(error.ArtifactSeedNotAccepted, decodeChunkVectorsAlloc(alloc, ok.value, 2));
     for ([_][]const u8{
         "[{\"chunk_id\":0,\"vector\":[1,2]}]",
@@ -854,10 +879,9 @@ pub fn decodeSparseChunkVectorsAlloc(alloc: Allocator, value: std.json.Value, sc
             const field = entry.value_ptr.*;
             if (std.mem.eql(u8, key, "chunk_id")) {
                 chunk_id = try jsonU32(field);
-            } else if (std.mem.eql(u8, key, "parent_unit_id")) {
+            } else if (isUnitIdKey(key)) {
                 if (scope == .plain) return error.ArtifactSeedNotAccepted;
-                if (field != .string or field.string.len == 0 or field.string.len > max_name_bytes) return error.InvalidArtifactSeed;
-                unit_id = field.string;
+                unit_id = try unitIdField(field, unit_id);
             } else if (std.mem.eql(u8, key, "indices") or std.mem.eql(u8, key, "values")) {
                 try weights.put(alloc, key, field);
             } else if (std.mem.eql(u8, key, "window_index")) {

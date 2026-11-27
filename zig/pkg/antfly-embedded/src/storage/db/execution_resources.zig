@@ -1286,6 +1286,12 @@ pub const SeedPlanCapture = struct {
     json: ?[]u8 = null,
 };
 
+/// Per-item outcomes of the seeds a committed write carried (a JSON array),
+/// for a caller on this thread that reports them (`DB.batchReportingSeeds`,
+/// the C and HTTP batch entry points). Preparation runs on the caller's
+/// thread, as `backend_types.commit_progress` relies on too.
+pub threadlocal var seed_report: ?*SeedPlanCapture = null;
+
 pub const BatchExecutionOptions = struct {
     // Process-local checked plan, never serialized or derived from JSON.
     checked_native_atomic: ?*const CheckedNativeAtomic = null,

@@ -108,9 +108,13 @@ class BatchRequest:
                 '$addToSet', 'path': '$.tags', 'value': 'vip'}]}].
             seed_conflict (SeedConflictPolicy | Unset): What a seed does when the enrichment already has accepted output for
                 the same input (same source version, producer and configuration)
-                that differs from the seed. `keep` rejects the batch
-                (`ArtifactSeedConflict`); identical output is reported `unchanged`.
-                `replace` publishes the seed. A document or transform may set its own
+                that differs from the seed. `keep` leaves the accepted output in
+                place and the rest of the write commits; the item is reported as
+                `conflict` with the existing output's origin. Identical output is
+                reported `unchanged`. `replace` publishes the seed. Embedded and Lite
+                batches return these outcomes in the batch response (`seeds`); on a
+                server, plan the batch with `validate_only` to see them before
+                writing. A document or transform may set its own
                 policy with the reserved `_seed_conflict` member, which wins over the
                 request. During distributed transaction resolution a conflict never
                 fails: the existing output is kept.

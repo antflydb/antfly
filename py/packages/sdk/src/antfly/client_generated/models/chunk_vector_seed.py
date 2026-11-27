@@ -20,19 +20,21 @@ class ChunkVectorSeed:
     are embedded as usual.
 
     Vectors of a document extraction's unit chunks name their unit with
-    `parent_unit_id` (every entry, no `window_index`: unit chunks are
-    embedded whole) and are accepted with the extraction seed in the
+    `unit_id` or its alias `parent_unit_id` (every entry, no
+    `window_index`: unit chunks are embedded whole) and are accepted with the extraction seed in the
     same write; each must name a text chunk of an extracted unit.
 
         Attributes:
             chunk_id (int):
             vector (list[float]):
-            parent_unit_id (str | Unset): The extraction unit of the chunk, e.g. `page:000003`.
+            unit_id (str | Unset): The extraction unit of the chunk, e.g. `page:000003`.
+            parent_unit_id (str | Unset): Alias of `unit_id`; both may appear only when equal.
             window_index (int | Unset):
     """
 
     chunk_id: int
     vector: list[float]
+    unit_id: str | Unset = UNSET
     parent_unit_id: str | Unset = UNSET
     window_index: int | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -41,6 +43,8 @@ class ChunkVectorSeed:
         chunk_id = self.chunk_id
 
         vector = self.vector
+
+        unit_id = self.unit_id
 
         parent_unit_id = self.parent_unit_id
 
@@ -54,6 +58,8 @@ class ChunkVectorSeed:
                 "vector": vector,
             }
         )
+        if unit_id is not UNSET:
+            field_dict["unit_id"] = unit_id
         if parent_unit_id is not UNSET:
             field_dict["parent_unit_id"] = parent_unit_id
         if window_index is not UNSET:
@@ -68,6 +74,8 @@ class ChunkVectorSeed:
 
         vector = cast(list[float], d.pop("vector"))
 
+        unit_id = d.pop("unit_id", UNSET)
+
         parent_unit_id = d.pop("parent_unit_id", UNSET)
 
         window_index = d.pop("window_index", UNSET)
@@ -75,6 +83,7 @@ class ChunkVectorSeed:
         chunk_vector_seed = cls(
             chunk_id=chunk_id,
             vector=vector,
+            unit_id=unit_id,
             parent_unit_id=parent_unit_id,
             window_index=window_index,
         )

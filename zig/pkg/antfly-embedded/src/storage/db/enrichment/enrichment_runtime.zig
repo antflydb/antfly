@@ -6403,6 +6403,10 @@ const AssetProducerBatchItem = struct {
     producer_context: ?@import("../artifact_producer_context.zig").Token = null,
     /// Captured context dependencies published atomically with the output.
     context_publish: ?*ContextPublish = null,
+    /// Late-result fence: this producer's output row as observed when the
+    /// item was planned. A concurrent writer of that output (an accepted
+    /// artifact seed) makes the produced result stale.
+    artifact_fence: ?ArtifactOutputFence = null,
     /// Output already produced for exactly this input (matching skip state),
     /// e.g. on the local path before ordered authority was installed. The
     /// ordered flush publishes it instead of invoking the provider again.
@@ -18005,6 +18009,8 @@ fn processAsset(
         .producer_context = context,
         .context_publish = context_publish,
         .retained_output = retained_output,
+        // The local path publishes directly; ordered publication fences itself.
+        .artifact_fence = if (context == null) try artifactOutputFence(runtime, key) else null,
     }, scope);
     retained_output = null;
     context_publish = null;
@@ -20204,7 +20210,7 @@ fn applyAssetProducerBatchOutput(
     // producing them again.
     const recorded = try submittedOutputKey(item);
     if (comptime builtin.os.tag != .freestanding) if (recorded) |key| try runtime.submitted_outputs.put(runtime.alloc, key, produced);
-    try storePutBatchGuarded(runtime, writes.items, &.{}, .{ .doc_key = item.request.doc_key, .digest = sourceRecordDigest(item.raw_doc), .upstream_name = item.request.upstream_artifact_name, .upstream_digest = item.upstream_digest, .producer_name = requestArtifactName(item.request), .producer_recipe = producer_recipe, .dependency = if (item.context_publish) |publish| .{ .artifact = requestArtifactName(item.request), .publish = publish, .new_version = true, .producer_recipe = producer_recipe } else null });
+    try storePutBatchGuarded(runtime, writes.items, &.{}, .{ .doc_key = item.request.doc_key, .digest = sourceRecordDigest(item.raw_doc), .artifact_key = item.artifact_key, .artifact_fence = item.artifact_fence, .upstream_name = item.request.upstream_artifact_name, .upstream_digest = item.upstream_digest, .producer_name = requestArtifactName(item.request), .producer_recipe = producer_recipe, .dependency = if (item.context_publish) |publish| .{ .artifact = requestArtifactName(item.request), .publish = publish, .new_version = true, .producer_recipe = producer_recipe } else null });
     if (comptime builtin.os.tag != .freestanding) if (recorded) |key| runtime.submitted_outputs.remove(runtime.alloc, key);
 
     try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, item.artifact_key);
@@ -41506,9 +41512,23 @@ fn storePut(runtime: *EnrichmentRuntime, key: []const u8, value: []const u8) !vo
     try txn.commit();
 }
 
+/// The digest of an output row (null: absent) a producer planned against.
+const ArtifactOutputFence = struct { digest: ?[32]u8 };
+
+fn artifactOutputFence(runtime: *EnrichmentRuntime, key: []const u8) !ArtifactOutputFence {
+    const current = try storeGetOptionalAllocWithRetry(runtime, key);
+    defer if (current) |bytes| runtime.alloc.free(bytes);
+    return .{ .digest = if (current) |bytes| sourceRecordDigest(bytes) else null };
+}
+
 const LocalSourceFence = struct {
     doc_key: []const u8,
     digest: ?[32]u8,
+    /// Late-result fence on the producer's own output row (`artifact_key`):
+    /// publication fails as a source change if the row no longer holds what
+    /// the producer planned against, e.g. a seed accepted meanwhile.
+    artifact_key: []const u8 = "",
+    artifact_fence: ?ArtifactOutputFence = null,
     upstream_name: []const u8 = "",
     upstream_digest: ?[32]u8 = null,
     upstream_absent: bool = false,
@@ -41628,6 +41648,11 @@ fn requireLocalAssetSourceWithAllocator(runtime: *EnrichmentRuntime, alloc: Allo
 
 fn validateLocalSourceFence(runtime: *EnrichmentRuntime, txn: anytype, guard: LocalSourceFence) !void {
     if (try @import("../../source_authority.zig").maintenanceMode(txn) != .local) return error.ArtifactPublicationPending;
+    if (guard.artifact_fence) |fence| {
+        const current = txn.get(guard.artifact_key) catch |err| if (err == error.NotFound) null else return err;
+        const digest: ?[32]u8 = if (current) |bytes| sourceRecordDigest(bytes) else null;
+        if (!std.meta.eql(digest, fence.digest)) return error.EnrichmentSourceChanged;
+    }
     if (guard.producer_recipe) |expected| {
         const entry = runtime.index_manager.getEnrichment(.asset, guard.producer_name) orelse return error.EnrichmentSourceChanged;
         if (!std.mem.eql(u8, &expected, &@import("../artifact_local_publication.zig").recipe(entry))) return error.EnrichmentSourceChanged;
@@ -51762,6 +51787,57 @@ test "document preparation copy admission failure discards optional state withou
     try std.testing.expectEqualStrings("native text", units[0].text);
     try std.testing.expectEqualStrings("pending_ocr", units[0].extraction_status.?);
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.document_extraction_working_set).used_bytes);
+}
+
+test "a late asset result is fenced by output accepted while it was produced" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/late-asset-fence", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &index_manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .failure_ctx = undefined,
+        .failure_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+    defer clearIndexEmbeddingActivity(&runtime);
+    const artifact_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "summary");
+    defer alloc.free(artifact_key);
+
+    // Planned against an absent output; a seed accepted meanwhile fences it.
+    const planned_absent = try artifactOutputFence(&runtime, artifact_key);
+    try storePutWithRetry(&runtime, artifact_key, "seeded summary");
+    try std.testing.expectError(error.EnrichmentSourceChanged, storePutBatchGuarded(&runtime, &.{.{ .key = artifact_key, .value = "late generated summary" }}, &.{}, .{ .doc_key = "doc", .digest = null, .artifact_key = artifact_key, .artifact_fence = planned_absent }));
+    const kept = (try storeGetOptionalAllocWithRetry(&runtime, artifact_key)).?;
+    defer alloc.free(kept);
+    try std.testing.expectEqualStrings("seeded summary", kept);
+
+    // Planned against the current output, the result publishes.
+    const planned_current = try artifactOutputFence(&runtime, artifact_key);
+    try storePutBatchGuarded(&runtime, &.{.{ .key = artifact_key, .value = "regenerated summary" }}, &.{}, .{ .doc_key = "doc", .digest = null, .artifact_key = artifact_key, .artifact_fence = planned_current });
+    const published = (try storeGetOptionalAllocWithRetry(&runtime, artifact_key)).?;
+    defer alloc.free(published);
+    try std.testing.expectEqualStrings("regenerated summary", published);
 }
 
 test "generic scalar chunks reject stale upstream and fence publication" {

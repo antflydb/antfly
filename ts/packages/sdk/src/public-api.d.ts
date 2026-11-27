@@ -11709,9 +11709,13 @@ export interface components {
         /**
          * @description What a seed does when the enrichment already has accepted output for
          *     the same input (same source version, producer and configuration)
-         *     that differs from the seed. `keep` rejects the batch
-         *     (`ArtifactSeedConflict`); identical output is reported `unchanged`.
-         *     `replace` publishes the seed. A document or transform may set its own
+         *     that differs from the seed. `keep` leaves the accepted output in
+         *     place and the rest of the write commits; the item is reported as
+         *     `conflict` with the existing output's origin. Identical output is
+         *     reported `unchanged`. `replace` publishes the seed. Embedded and Lite
+         *     batches return these outcomes in the batch response (`seeds`); on a
+         *     server, plan the batch with `validate_only` to see them before
+         *     writing. A document or transform may set its own
          *     policy with the reserved `_seed_conflict` member, which wins over the
          *     request. During distributed transaction resolution a conflict never
          *     fails: the existing output is kept.
@@ -11736,6 +11740,13 @@ export interface components {
             outcome: "accepted" | "unchanged" | "conflict" | "replaced" | "deleted" | "missing" | "rejected";
             /** @enum {string} */
             existing_origin?: "generated" | "seeded";
+            /**
+             * @description Where the seed came from: an explicit `_artifacts`/`_chunks` seed
+             *     in the write, which wins, or the enrichment's field mapping.
+             *     Absent for `missing` and `rejected`.
+             * @enum {string}
+             */
+            via?: "explicit" | "mapping";
             error?: string;
         };
         SeedPlanResponse: {
@@ -11805,12 +11816,14 @@ export interface components {
          *     are embedded as usual.
          *
          *     Vectors of a document extraction's unit chunks name their unit with
-         *     `parent_unit_id` (every entry, no `window_index`: unit chunks are
-         *     embedded whole) and are accepted with the extraction seed in the
+         *     `unit_id` or its alias `parent_unit_id` (every entry, no
+         *     `window_index`: unit chunks are embedded whole) and are accepted with the extraction seed in the
          *     same write; each must name a text chunk of an extracted unit.
          */
         ChunkVectorSeed: {
             /** @description The extraction unit of the chunk, e.g. `page:000003`. */
+            unit_id?: string;
+            /** @description Alias of `unit_id`; both may appear only when equal. */
             parent_unit_id?: string;
             /** Format: int64 */
             chunk_id: number;
@@ -11821,14 +11834,16 @@ export interface components {
         /**
          * @description One seeded sparse vector of a chunk. Sparse chunk vectors are never
          *     windowed. Vectors of a document extraction's unit chunks name their
-         *     unit with `parent_unit_id` (every entry) and are accepted with the
-         *     extraction seed in the same write; plain chunk vectors must not name
-         *     one. Every entry must name a chunk of this revision; chunks without a
+         *     unit with `unit_id` or its alias `parent_unit_id` (every entry) and
+         *     are accepted with the extraction seed in the same write; plain chunk
+         *     vectors must not name one. Every entry must name a chunk of this revision; chunks without a
          *     seeded vector are embedded as usual.
          */
         SparseChunkVectorSeed: {
             /** Format: int64 */
             chunk_id: number;
+            unit_id?: string;
+            /** @description Alias of `unit_id`; both may appear only when equal. */
             parent_unit_id?: string;
             indices: number[];
             values: number[];

@@ -180,6 +180,7 @@ test {
     _ = durable_outbox;
     _ = @import("artifact_seed_plan.zig");
     _ = @import("artifact_seed_chunks.zig");
+    _ = @import("../../capi/batch_wire.zig");
     _ = durable_outbox_store;
     _ = apply_receipts;
     _ = graph_edge_ttl_expiration;
@@ -8662,6 +8663,20 @@ pub const DB = struct {
         errdefer if (capture.json) |json| alloc.free(json);
         try self.batchInternal(req, null, .{ .seed_plan = &capture, .wait_for_sync_level = false });
         return capture.json orelse try alloc.dupe(u8, "{\"seeds\":[]}");
+    }
+
+    /// `batch` that returns the per-item outcomes of the seeds it carried
+    /// (`[{key, name, outcome, existing_origin?}]`, owned by `alloc`), or
+    /// null when it carried none. Conflicts under `keep` keep the accepted
+    /// output and are reported here; the rest of the write commits.
+    pub fn batchReportingSeeds(self: *DB, alloc: Allocator, req: types.BatchRequest) !?[]u8 {
+        var capture = execution_resources.SeedPlanCapture{ .alloc = alloc };
+        const previous = execution_resources.seed_report;
+        execution_resources.seed_report = &capture;
+        defer execution_resources.seed_report = previous;
+        errdefer if (capture.json) |json| alloc.free(json);
+        try self.batch(req);
+        return capture.json;
     }
 
     /// `planArtifactSeeds` for the `{inserts, transforms}` subset of a public
@@ -108657,12 +108672,20 @@ test "db artifact seeds bind through transforms and reject unusable seeds" {
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(usize, 1), counting.calls);
 
-    // Generated output for the same input is kept by default; a seed-only
-    // transform replaces it only with `replace`.
-    try std.testing.expectError(error.ArtifactSeedConflict, db.batch(.{
-        .transforms = &.{.{ .key = "doc:a", .operations = &.{.{ .op = .set, .path = "_artifacts.body_dense_v1", .value_json = "{\"value\":[1,2,3]}" }} }},
-        .sync_level = .write,
-    }));
+    // Generated output for the same input is kept by default (reported as a
+    // conflict, never applied); a seed-only transform replaces it only with
+    // `replace`.
+    {
+        const report = (try db.batchReportingSeeds(alloc, .{
+            .transforms = &.{.{ .key = "doc:a", .operations = &.{.{ .op = .set, .path = "_artifacts.body_dense_v1", .value_json = "{\"value\":[1,2,3]}" }} }},
+            .sync_level = .write,
+        })).?;
+        defer alloc.free(report);
+        try std.testing.expect(std.mem.indexOf(u8, report, "\"outcome\":\"conflict\",\"existing_origin\":\"generated\"") != null);
+        var view = (try db.lookup(alloc, "doc:a", .{ .fields = &.{"_artifacts"}, .include_all_fields = false, .artifact_view = .seed })).?;
+        defer view.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, view.json, "[1,2,3]") == null);
+    }
     try db.batch(.{
         .transforms = &.{.{ .key = "doc:a", .operations = &.{
             .{ .op = .set, .path = "_artifacts.body_dense_v1", .value_json = "{\"value\":[1,2,3]}" },
@@ -108740,10 +108763,12 @@ test "db artifact seed planning reports outcomes and conflicts follow the policy
     // `keep`: never dropped silently, and the accepted output stays.
     const differing = "{\"body\":\"same source\",\"_artifacts\":{\"body_dense_v1\":{\"value\":[3,2,1]}}}";
     try expectSeedPlanOutcome(alloc, &db, "{\"inserts\":{\"doc:a\":" ++ differing ++ "}}", "\"outcome\":\"conflict\",\"existing_origin\":\"seeded\"");
-    if (db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = differing }}, .sync_level = .write })) |_|
-        return error.TestUnexpectedResult
-    else |err|
-        try std.testing.expect(err == error.ArtifactSeedConflict);
+    {
+        // The write commits; the conflicting seed is reported, not applied.
+        const report = (try db.batchReportingSeeds(alloc, .{ .writes = &.{.{ .key = "doc:a", .value = differing }}, .sync_level = .write })).?;
+        defer alloc.free(report);
+        try std.testing.expect(std.mem.indexOf(u8, report, "\"key\":\"doc:a\",\"name\":\"body_dense_v1\",\"outcome\":\"conflict\",\"existing_origin\":\"seeded\"") != null);
+    }
     try expectSeededDenseVector(alloc, &db, "doc:a", "same source", &.{ 1, 2, 3 });
 
     // `replace` overwrites it and reports the replacement.
@@ -108815,7 +108840,13 @@ test "db artifact seed field mappings accept existing record results before gene
 
     // An explicit seed in the same write wins over the mapping; the empty
     // string is a complete result, distinct from missing.
-    try db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = "{\"body\":\"memo\",\"legacy\":{\"summary\":\"mapped\"},\"legacy_labels\":[],\"_artifacts\":{\"summary_v1\":{\"value\":\"\"}}}" }}, .sync_level = .write });
+    {
+        // Each item reports which one was used.
+        const report = (try db.batchReportingSeeds(alloc, .{ .writes = &.{.{ .key = "doc:b", .value = "{\"body\":\"memo\",\"legacy\":{\"summary\":\"mapped\"},\"legacy_labels\":[],\"_artifacts\":{\"summary_v1\":{\"value\":\"\"}}}" }}, .sync_level = .write })).?;
+        defer alloc.free(report);
+        try std.testing.expect(std.mem.indexOf(u8, report, "\"name\":\"summary_v1\",\"outcome\":\"accepted\",\"via\":\"explicit\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, report, "\"name\":\"labels_v1\",\"outcome\":\"accepted\",\"via\":\"mapping\"") != null);
+    }
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(usize, 0), fake.generator_calls);
     try expectStoredAssetForTest(alloc, &db, "doc:b", "summary_v1", "");

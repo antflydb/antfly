@@ -420,6 +420,13 @@ antfly_error_code antfly_db_batch(
     uint64_t timestamp_ns,
     uint8_t sync_level
 );
+/* request_json is the public batch body ("inserts", "deletes", "transforms"
+ * with per-transform "expected_version", "seed_conflict", "sync_level").
+ * The response reports the committed counts and, when the batch carried
+ * artifact seeds, "seeds": [{key, name, outcome, existing_origin?}], one per
+ * seeded output. Under the default "keep" a differing seed for output that is
+ * already accepted is not applied and reports "conflict"; the rest of the
+ * batch commits. */
 antfly_error_code antfly_db_batch_json(
     antfly_db *db,
     antfly_slice request_json,
@@ -428,15 +435,20 @@ antfly_error_code antfly_db_batch_json(
 /*
  * Binary counterpart to antfly_db_batch_json: request_buf is one length-
  * prefixed buffer instead of a JSON object (format in capi/batch_wire.zig),
- * carrying only writes, deletes, and the sync_level option -- no transforms
- * or graph writes/deletes, which remain JSON-only. All integers are little-
+ * carrying writes, deletes, transforms (version 2) and the sync_level
+ * option; graph writes/deletes remain JSON-only. All integers are little-
  * endian and fixed width:
- *   u32 magic ("AFBW" = 0x41464257), u16 version (1),
+ *   u32 magic ("AFBW" = 0x41464257), u16 version (1 or 2),
  *   u8 sync_level (0 propose, 1 write, 2 full_text, 3 enrichments,
  *     4 full_index), u8 reserved (0),
  *   u32 write_count, u32 delete_count,
  *   write_count * { u32 key_len, key bytes, u32 value_len, value bytes },
- *   delete_count * { u32 key_len, key bytes }.
+ *   delete_count * { u32 key_len, key bytes },
+ *   version 2 only: u32 transforms_len, transforms bytes -- the JSON batch
+ *     "transforms" array (with per-transform "expected_version"), parsed by
+ *     the same codec as antfly_db_batch_json; 0 means none.
+ * As with antfly_db_batch_json, the response carries "seeds", the per-item
+ * outcomes of any artifact seeds the batch carried.
  * Decoding never copies key/value bytes out of request_buf, so, like every
  * antfly_slice, it must stay valid for the duration of this call; out is an
  * ordinary owned antfly_buffer the caller frees with antfly_buffer_free.

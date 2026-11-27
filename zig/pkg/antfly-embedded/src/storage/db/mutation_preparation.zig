@@ -1409,12 +1409,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 var mapped_document: ?std.json.Value = null;
                 const request_seeds = try alloc.alloc(?artifact_seeds.Entry, generated.len);
                 defer alloc.free(request_seeds);
+                const request_seed_mapped = try alloc.alloc(bool, generated.len);
+                defer alloc.free(request_seed_mapped);
+                @memset(request_seed_mapped, false);
+                // Each outcome of this row reports whether its seed was
+                // explicit or came from the enrichment's field mapping.
+                const row_outcomes_start = seed_outcomes.items.len;
+                defer markSeedOutcomesVia(seed_outcomes.items[row_outcomes_start..], generated, request_seed_mapped);
                 var seeded_row = row_seeds != null;
-                for (generated, request_seeds) |request, *slot| {
+                for (generated, request_seeds, request_seed_mapped) |request, *slot, *mapped| {
                     slot.* = if (row_seeds) |*seeds| try requestSeed(seeds, request) else null;
                     if (slot.* == null and request.seed_mapping_json.len != 0) {
                         if (mapped_document == null) mapped_document = try std.json.parseFromSliceLeaky(std.json.Value, mapping_arena.allocator(), (try extracted[i].logicalJson()).?, .{ .parse_numbers = false });
                         slot.* = try mappedSeed(mapping_arena.allocator(), request, mapped_document.?);
+                        mapped.* = slot.* != null;
                     }
                     if (slot.* != null) seeded_row = true;
                 }
@@ -2291,6 +2299,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 };
             }
             return null;
+        }
+
+        fn markSeedOutcomesVia(entries: []artifact_seeds.OutcomeEntry, generated: []const enrichment_types.GeneratedEnrichmentRequest, mapped: []const bool) void {
+            for (entries) |*entry| {
+                if (entry.outcome == .missing) continue;
+                entry.via = .explicit;
+                for (generated, mapped) |request, was_mapped| {
+                    if (was_mapped and std.mem.eql(u8, requestArtifactName(request), entry.name)) entry.via = .mapping;
+                }
+            }
         }
 
         fn appendSeedOutcome(alloc: Allocator, outcomes: *std.ArrayListUnmanaged(artifact_seeds.OutcomeEntry), request: enrichment_types.GeneratedEnrichmentRequest, result: artifact_seeds.Result) !void {
