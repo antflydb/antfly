@@ -2772,3 +2772,23 @@ latencies for Gemma 4 E4B were 7,944.50 to 3,052.69 ms (text),
 5,497.47 to 3,603.59 ms (image), 1,272.09 to 952.75 ms (audio), and
 5,118.14 to 2,995.43 ms (video). The six other passing workloads were
 within 1% at p50 except DECIDE, which improved from 126.82 to 122.46 ms.
+
+### Paired EmbeddingGemma 2 HTTP comparisons
+
+Against the frozen `9e4af7f847` baseline, the listed comparisons matched
+outputs exactly in AA, ABBA, and BB. CUDA measured 40 requests per side.
+CPU and Metal measured 16 per side. The Spark run shared the GPU with a
+184 MiB context. The CPU grouped-audio run pinned the DFT implementation
+on both builds after default CPU audio had baseline repeatability drift.
+
+| Candidate | Backend and workload | Baseline p50 / p95 (ms) | Candidate p50 / p95 (ms) |
+| --- | --- | ---: | ---: |
+| `109f9b5c9e` | CUDA text | 8.63 / 9.15 | 8.64 / 9.48 |
+| `109f9b5c9e` | CUDA grouped audio, default settings | 50.12 / 50.65 | 47.81 / 48.28 |
+| `58b3917a89` | Metal grouped audio | 39.66 / 43.08 | 36.31 / 41.53 |
+| `58b3917a89` | CPU grouped audio, pinned DFT | 228.44 / 230.23 | 227.45 / 229.17 |
+
+CUDA text's ABBA p95 difference was smaller than the spread between
+the two baseline-only p95 controls. Default CUDA grouped audio's
+candidate-only p50 range was 48.28–48.49 ms versus 50.10–50.44 ms in
+the baseline controls.
