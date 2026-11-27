@@ -191,15 +191,20 @@ pub const Plan = struct {
         self.event(slot, false);
     }
 
-    fn appendOperationScratch(self: *Plan, bytes: usize) bool {
+    fn allocateOperationScratch(self: *Plan, bytes: usize, address: ?DevicePointer) bool {
         const slot = self.count;
-        self.allocateLive(bytes, null);
+        self.allocateLive(bytes, address);
         if (!self.valid or self.count == slot) return false;
         self.events[self.event_count - 1].operation_scratch = true;
-        self.releaseSlot(@intCast(slot));
-        if (!self.valid) return false;
         self.declared_operation_scratch_intervals += 1;
         return true;
+    }
+
+    fn appendOperationScratch(self: *Plan, bytes: usize) bool {
+        const slot = self.count;
+        if (!self.allocateOperationScratch(bytes, null)) return false;
+        self.releaseSlot(@intCast(slot));
+        return self.valid;
     }
 
     /// Allocations receive slots in declaration order. A release names the
@@ -399,6 +404,14 @@ pub const Scope = struct {
     pub fn recordAllocation(self: *Scope, bytes: usize, pointer: DevicePointer) void {
         std.debug.assert(!self.isBound());
         self.recipe.observing.allocate(bytes, pointer);
+    }
+
+    /// Observe scratch that stays live across other scoped allocations.
+    pub fn recordScratchAllocation(self: *Scope, bytes: usize, pointer: DevicePointer) void {
+        std.debug.assert(!self.isBound());
+        const plan = self.recipe.observing;
+        std.debug.assert(plan.origin == .observed);
+        _ = plan.allocateOperationScratch(bytes, pointer);
     }
 
     /// Add scratch for an operation that declares its size and makes no other
@@ -670,6 +683,22 @@ test "an operation can declare scratch inside an observed workspace" {
     bound.release(scratch);
     bound.release(input);
     try std.testing.expectEqual(input, try bound.allocate(128));
+    try std.testing.expect(bound.complete());
+}
+
+test "observed operation scratch cannot alias a concurrently live token" {
+    var plan: Plan = .{};
+    var observing = Scope.observe(&plan);
+    observing.recordScratchAllocation(256, 0x1000);
+    observing.recordAllocation(4, 0x2000);
+    observing.release(0x1000);
+    try std.testing.expect(plan.finish(0x2000));
+    const layout = try plan.layout(0);
+    var bound = try Scope.bind(&plan, layout, 0x3000, layout.bytes);
+    const scratch = try bound.allocateScratch(256);
+    const token = try bound.allocate(4);
+    try std.testing.expect(token >= scratch + 256);
+    bound.release(scratch);
     try std.testing.expect(bound.complete());
 }
 

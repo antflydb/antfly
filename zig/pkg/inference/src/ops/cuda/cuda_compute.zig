@@ -18211,7 +18211,7 @@ fn allocScopedDeviceBuffer(self: *CudaCompute, scope: *@import("../../execution/
     if (role == .tensor) {
         result.len = len;
         scope.recordAllocation(len, result.ptr);
-    } else scope.recordScratchInterval(len);
+    } else scope.recordScratchAllocation(len, result.ptr);
     return result;
 }
 
