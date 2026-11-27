@@ -4347,7 +4347,7 @@ pub const CudaCompute = struct {
         var metadata = try allocDeviceBuffer(self, try checkedAdd(token_bytes, suppression_bytes));
         errdefer releaseDeviceBuffer(self, &metadata);
         const tokens = try borrowBufferRange(metadata, 0, token_bytes);
-        const suppression = if (suppression_bytes != 0) try borrowBufferRange(metadata, token_bytes, suppression_bytes) else .{};
+        const suppression: buffer_mod.DeviceBuffer = if (suppression_bytes != 0) try borrowBufferRange(metadata, token_bytes, suppression_bytes) else .{};
         const shape = try allocShape2(self.allocator, steps, rows);
         errdefer self.allocator.free(shape);
         errdefer self.ctx.synchronize() catch {};
