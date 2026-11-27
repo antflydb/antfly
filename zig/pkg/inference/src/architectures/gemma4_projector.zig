@@ -2698,21 +2698,18 @@ pub const PreparedAudio = struct {
     mask: []bool,
     frames: usize,
     mel_bins: usize,
-    packed_frames: []f32 = &.{},
-    basis: []const f32 = &.{},
     owns_frontend: bool = true,
     pub fn deinit(self: *PreparedAudio) void {
         self.allocator.free(self.samples);
         if (self.owns_frontend) {
             self.allocator.free(self.window);
             self.allocator.free(self.filters);
-            self.allocator.free(self.basis);
         }
         self.allocator.free(self.mask);
-        self.allocator.free(self.packed_frames);
     }
     pub fn retainedBytes(self: PreparedAudio) usize {
-        return (self.samples.len + self.window.len + self.filters.len + self.packed_frames.len + self.basis.len) * 4 + self.mask.len;
+        const owned_frontend = if (self.owns_frontend) self.window.len + self.filters.len else 0;
+        return (self.samples.len + owned_frontend) * @sizeOf(f32) + self.mask.len;
     }
     pub fn tokenCount(self: PreparedAudio) usize {
         var count: usize = 0;
@@ -2898,20 +2895,12 @@ fn prepareAudioPcmBounded(allocator: std.mem.Allocator, pcm: audio.PcmAudio, mel
         const frame_end = frame * hop_length + frame_size_for_unfold - 1;
         mask[frame] = frame_end >= pad_left and frame_end < pad_left + real_samples;
     }
-    var prepared = PreparedAudio{ .allocator = allocator, .samples = samples, .window = window, .filters = filters, .mask = mask, .frames = frames, .mel_bins = mel_bins, .owns_frontend = recipe == null, .basis = if (recipe) |plan| plan.basis else &.{} };
+    const prepared = PreparedAudio{ .allocator = allocator, .samples = samples, .window = window, .filters = filters, .mask = mask, .frames = frames, .mel_bins = mel_bins, .owns_frontend = recipe == null };
     // The two stride-two subsampling layers retain every fourth mask row.
     // Padded frames alone do not guarantee any usable projected audio tokens.
     // Reject these clips before GPU execution so preparation can attribute the
     // error to one item rather than aborting its entire encoder cohort.
     if (prepared.tokenCount() == 0) return error.EmptyEmbeddingInput;
-    if (pack_gpu and frames > 0) {
-        const bins = fft_length / 2 + 1;
-        if (recipe == null) {
-            const basis = try allocator.alloc(f32, 2 * bins * frame_length);
-            fillAudioDftBasis(basis, frame_length, fft_length);
-            prepared.basis = basis;
-        }
-    }
     return prepared;
 }
 fn prepareGemma4AudioFeatures(cb: *const ComputeBackend, allocator: std.mem.Allocator, bytes: []const u8, cfg: AudioConfig) !AudioFeatures {
@@ -8760,8 +8749,7 @@ test "gemma4 prepared audio preserves encoded PCM geometry and drains allocation
             try std.testing.expectEqual(encoded.tokenCount(), pcm.tokenCount());
             try std.testing.expect(encoded.tokenCount() > 0);
             try std.testing.expectEqualSlices(bool, encoded.mask, pcm.mask);
-            try std.testing.expectEqualSlices(f32, encoded.packed_frames, pcm.packed_frames);
-            try std.testing.expectEqualSlices(f32, encoded.basis, pcm.basis);
+            try std.testing.expectEqualSlices(f32, encoded.samples, pcm.samples);
             try std.testing.expectError(error.UnsupportedAudioFormat, prepareEmbeddingGemma2AudioPcm(a, .{ .samples = &samples, .sample_rate = 0 }));
         }
     };
@@ -9869,13 +9857,15 @@ test "embeddinggemma2 audio frontend recipe builds once under concurrent prepara
     var second = try prepareEmbeddingGemma2AudioPcm(a, .{ .samples = &samples, .sample_rate = 16000 });
     defer second.deinit();
     try std.testing.expect(!first.owns_frontend and !second.owns_frontend);
-    try std.testing.expect(first.window.ptr == second.window.ptr and first.filters.ptr == second.filters.ptr and first.basis.ptr == second.basis.ptr);
+    try std.testing.expect(first.window.ptr == second.window.ptr and first.filters.ptr == second.filters.ptr);
     first.deinit();
     try std.testing.expectEqualSlices(f32, reference_filters, second.filters);
-    const reference_basis = try a.alloc(f32, second.basis.len);
+    try std.testing.expectEqual(second.samples.len * @sizeOf(f32) + second.mask.len, second.retainedBytes());
+    const basis = recipe.get(128, true).?.basis;
+    const reference_basis = try a.alloc(f32, basis.len);
     defer a.free(reference_basis);
     fillAudioDftBasis(reference_basis, 320, 512);
-    try std.testing.expectEqualSlices(f32, reference_basis, second.basis);
+    try std.testing.expectEqualSlices(f32, reference_basis, basis);
 }
 
 fn populateBf16DepthwiseWeight(store: *@import("../ops/native_compute.zig").WeightStore) !void {
