@@ -701,8 +701,11 @@ pub const Module = struct {
     }
 
     fn bindLayerWorkspace(self: *const Module, layout: StorageLayout, span: StorageLayout.Span, bytes: usize) !buffer.DeviceBuffer {
-        if (bytes == 0 or bytes > span.bytes or self.metadata.len < layout.metadata_bytes)
-            return error.InvalidExecutionPlan;
+        const prefix_end = layout.counter.offset + layout.counter.bytes;
+        if (bytes == 0 or bytes > span.bytes or span.offset < prefix_end or
+            span.offset % plan_mod.alignment != 0 or span.offset > layout.metadata_bytes or
+            span.bytes > layout.metadata_bytes - span.offset) return error.InvalidExecutionPlan;
+        _ = buffer.validateRegion(self.metadata, layout.metadata_bytes, plan_mod.alignment) catch return error.InvalidExecutionPlan;
         return (StorageLayout.Span{ .offset = span.offset, .bytes = bytes }).bind(self.metadata);
     }
 
@@ -737,6 +740,12 @@ test "bounded CUDA decoder funds one stable attention workspace for both packets
     try std.testing.expectEqual(base.readback(owner.metadata), layout.readback(owner.metadata));
     try std.testing.expectError(error.InvalidExecutionPlan, owner.bindAttentionWorkspace(full.len + 1));
     owner.metadata.len -= 1;
+    try std.testing.expectError(error.InvalidExecutionPlan, owner.bindAttentionWorkspace(tail.len));
+    owner.metadata.len = layout.metadata_bytes;
+    owner.storage_layout.?.attention_workspace.?.offset = 0;
+    try std.testing.expectError(error.InvalidExecutionPlan, owner.bindAttentionWorkspace(tail.len));
+    owner.storage_layout = layout;
+    owner.metadata.ptr += 1;
     try std.testing.expectError(error.InvalidExecutionPlan, owner.bindAttentionWorkspace(tail.len));
 }
 
