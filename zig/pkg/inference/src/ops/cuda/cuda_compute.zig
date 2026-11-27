@@ -3790,7 +3790,7 @@ pub const CudaCompute = struct {
         pub fn run(self: *@This(), context: *anyopaque, callback: *const fn (*anyopaque, *@This()) anyerror!void) !void {
             const compute = self.compute;
             const owner = &compute.bounded_decode_graph;
-            _ = try owner.headDestination();
+            try owner.validateExecutionStorage();
             if (owner.phase == .replay) {
                 try compute.ctx.launchGraph(owner.graph);
                 self.launch_route = .replayed;

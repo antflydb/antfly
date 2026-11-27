@@ -519,6 +519,17 @@ pub const Module = struct {
         return plan_mod.Scope.bind(plan, layout, self.arena.ptr, self.arena.len);
     }
 
+    pub fn validateExecutionStorage(self: *const Module) !void {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        try buffer.validateRegions(
+            3,
+            .{ self.metadata, self.head, self.arena },
+            .{ layout.metadata_bytes, layout.head_bytes, self.arena.len },
+            .{ plan_mod.alignment, @alignOf(f32), plan_mod.alignment },
+            1,
+        );
+    }
+
     pub fn headDestination(self: *const Module) !?buffer.DeviceBuffer {
         const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
         if (layout.head_bytes == 0) return null;
@@ -566,6 +577,11 @@ test "captured sequence storage layout packs narrow and wide readbacks with alig
             try std.testing.expectError(error.InvalidShape, owner.headDestination());
             owner.head = .{ .ptr = 0x10000000, .len = value.head + 256 };
             try std.testing.expectEqual(value.head, (try owner.headDestination()).?.len);
+            try owner.validateExecutionStorage();
+            owner.arena = .{ .ptr = owner.head.ptr, .len = 256 };
+            try std.testing.expectError(error.InvalidShape, owner.validateExecutionStorage());
+            owner.arena.ptr = owner.head.ptr + value.head;
+            try owner.validateExecutionStorage();
         }
         try std.testing.expectEqual(@as(u64, 0x10000 + value.bank), actual.tokens.bind(backing).ptr);
         try std.testing.expectEqual(value.rows * 2 * @sizeOf(u32), actual.tokens.bytes);
