@@ -20,6 +20,7 @@ const CudaContext = @import("ops/cuda/context.zig").CudaContext;
 
 test {
     _ = @import("runtime/kv/hybrid_paged.zig");
+    _ = @import("runtime/kv/storage_runtime.zig");
     _ = @import("runtime/kv/writable_blocks.zig");
 }
 
