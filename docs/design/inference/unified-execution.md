@@ -2745,3 +2745,18 @@ repeat is required to resolve the mixed-load tail. The test covered
 EmbeddingGemma 2 text and Gemma 4 audio. Grouped EmbeddingGemma 2 audio
 needs its own comparison, including the workspace changes after this
 candidate.
+
+### Spark grouped audio and decoder qualification at `109f9b5c9e`
+
+The GB10 focused run passed 71 selected checks with zero skips. It covered
+grouped audio attention against isolated clips, flat and mixed serving
+admission, renewed input staging, and the released EmbeddingGemma 2
+checkpoint. The original grouped Stage fixture captured and replayed
+twice. Its planned and captured arenas were both 38,017,792 bytes and
+included 132 operation scratch intervals. The composite still uses
+observed tensor lifetimes. Grouped HTTP latency and throughput are a
+separate comparison.
+
+The same build passed Florence batched prefix storage and admission
+retry, bounded decoder FFN and recurrent workspace fixtures, and merged
+T5-small decoder capture and replay at prefixes 1, 8, 32, and 64.
