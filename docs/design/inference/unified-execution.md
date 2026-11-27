@@ -2800,3 +2800,18 @@ and candidate p50/p95 were 49.06/49.43 ms. Candidate-only p50 controls were
 Actual capture and replay counts come from the separate released-checkpoint
 fixture. The default-mode and graph-enabled runs were separate comparisons,
 so their latency difference does not isolate graph replay overhead.
+
+### Isolated Metal E4B HTTP comparison at `58b3917a89`
+
+The local M4 Max used the same pinned binaries as the mixed serving
+comparison and loaded only the official E4B QAT GGUF. All four modalities
+matched outputs exactly in AA, ABBA, and BB, with 16 samples per side.
+The isolated run had zero capacity errors. The mixed run had returned
+retryable capacity errors in baseline controls after loading other models.
+
+| Modality | Baseline p50 / p95 (ms) | Candidate p50 / p95 (ms) |
+| --- | ---: | ---: |
+| Text | 452.49 / 470.01 | 453.21 / 453.89 |
+| Image | 1,088.10 / 1,089.87 | 738.62 / 740.04 |
+| Audio | 291.08 / 292.63 | 290.35 / 291.27 |
+| Video | 1,042.34 / 1,043.71 | 706.81 / 708.62 |
