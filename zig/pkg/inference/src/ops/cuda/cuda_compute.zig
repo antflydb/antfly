@@ -21732,18 +21732,16 @@ fn localRelativeAttention(ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_s
         if (params.segmented) return null;
         return try sourceLocalRelativeAttention(self, q, k, v, rel, q_dim_scales, valid, layout, params, destination, control);
     }
-    if (destination) |assigned| {
-        // Without segmented mask encoding this kernel has no clip boundary.
-        if (assigned.segments.len > 1 and !params.segmented) return null;
-        if (assigned.segments.len != 0) {
-            var remaining = params.rows;
-            for (assigned.segments) |rows| {
-                if (rows == 0 or rows > remaining) return error.InvalidTensorShape;
-                remaining -= rows;
-            }
-            if (remaining != 0) return error.InvalidTensorShape;
+    const whole = [_]usize{params.rows};
+    const spans = if (destination) |assigned| if (!params.segmented and assigned.segments.len != 0) assigned.segments else &whole else &whole;
+    if (destination) |assigned| if (assigned.segments.len != 0) {
+        var remaining = params.rows;
+        for (assigned.segments) |rows| {
+            if (rows == 0 or rows > remaining) return error.InvalidTensorShape;
+            remaining -= rows;
         }
-    }
+        if (remaining != 0) return error.InvalidTensorShape;
+    };
     const input_buffers = [6]buffer_mod.DeviceBuffer{
         tensorFromCt(q).buffer, tensorFromCt(k).buffer, tensorFromCt(v).buffer,
         relative.buffer,        scales.buffer,          validity.buffer,
@@ -21762,19 +21760,27 @@ fn localRelativeAttention(ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_s
     var queued = false;
     errdefer if (queued) synchronizeAndDrainDeferredDeviceFrees(self) catch {};
     const module = try self.encoderMultimodalModule();
-    queued = true;
-    try module.launchAudioAttention(
-        &self.ctx,
-        output,
-        input_buffers[0],
-        input_buffers[1],
-        input_buffers[2],
-        input_buffers[3],
-        input_buffers[4],
-        input_buffers[5],
-        layout,
-        params,
-    );
+    const row_bytes = layout.span_bytes[6] / params.rows;
+    var offset: usize = 0;
+    for (spans) |rows| {
+        var clip = params;
+        clip.rows = rows;
+        var inputs = input_buffers;
+        var target = output;
+        var clip_layout = layout;
+        if (rows != params.rows) {
+            clip_layout = try embedding_gemma2_cuda.AudioAttentionLayout.init(clip);
+            const first = offset * row_bytes;
+            const bytes = rows * row_bytes;
+            for (inputs[0..3]) |*operand| operand.* = try operand.borrowRange(first, bytes);
+            inputs[5] = try inputs[5].borrowRange(offset * @sizeOf(f32), rows * @sizeOf(f32));
+            target = try output.borrowRange(first, bytes);
+        }
+        if (offset != 0) if (control) |active| try active.check();
+        queued = true;
+        try module.launchAudioAttention(&self.ctx, target, inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], inputs[5], clip_layout, clip);
+        offset += rows;
+    }
     queued = false;
     if (owned) |*value| return value.intoTensor();
     return destination.?.tensor;

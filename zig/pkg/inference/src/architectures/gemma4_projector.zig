@@ -5344,7 +5344,7 @@ fn audioLocalAttention(cb: *const ComputeBackend, allocator: std.mem.Allocator, 
     if (remaining != 0) return error.InvalidInputShape;
     const output = (try cb.allocUninitF32Shape(&.{ @intCast(inputs.valid_mask.len), @intCast(cfg.audio_hidden) })) orelse return error.UnsupportedResidentGemma4Audio;
     errdefer cb.free(output);
-    if (cfg.source_scalar_storage == .bf16 and device_attention) {
+    if (device_attention and cb.vtable.regions.audio_attention.localRelativeInto != null) {
         try cb.checkExecutionControl();
         const params = try audioLocalAttentionParams(cfg, inputs.valid_mask.len);
         if (try cb.localRelativeAttentionInto(q, k, v, rel, inputs.scales[layer], inputs.valid_ct, params, .{
@@ -5365,16 +5365,6 @@ fn audioLocalAttention(cb: *const ComputeBackend, allocator: std.mem.Allocator, 
         // Views reuse the one admitted mask upload across all tower layers.
         const valid_ct = try cb.sliceRows2D(allocator, inputs.valid_ct, offset, span, 1);
         defer cb.free(valid_ct);
-        if (device_attention and cb.vtable.regions.audio_attention.localRelativeInto != null) {
-            const params = try audioLocalAttentionParams(cfg, span);
-            if (try cb.localRelativeAttentionInto(qs, ks, vs, rel, inputs.scales[layer], valid_ct, params, .{
-                .tensor = output,
-                .first_row = offset,
-            })) {
-                offset += span;
-                continue;
-            }
-        }
         var clip = inputs.*;
         clip.valid_mask = inputs.valid_mask[offset..][0..span];
         clip.valid_ct = valid_ct;
