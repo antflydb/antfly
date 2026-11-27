@@ -11824,6 +11824,23 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return error.InvalidPhysicalTransferSize;
         try original.uploadBytes(bytes);
     }
+    fn describeGatherColumn(output: CT, sources: []const CT, spans: []metal_runtime_mod.BufferCopySpan) !void {
+        const target = toBuf(output).metal_tensor orelse return error.InvalidPhysicalTransferSize;
+        if (target.dtype != .f32 or target.physicalLease() == null or target.isReadOnlyPhysical()) return error.InvalidPhysicalTransferSize;
+        const destination = target.deviceHandle() orelse return error.InvalidPhysicalTransferSize;
+        var cursor = target.deviceByteOffset();
+        const end = try std.math.add(usize, cursor, target.deviceByteLen());
+        for (sources, spans) |source, *span| {
+            const value = toBuf(source).metal_tensor orelse return error.InvalidPhysicalTransferSize;
+            const device = value.deviceHandle() orelse return error.InvalidPhysicalTransferSize;
+            const bytes = value.deviceByteLen();
+            if (device == destination or value.dtype != .f32 or bytes == 0 or bytes > end - cursor) return error.InvalidPhysicalTransferSize;
+            span.* = .{ .source = device, .destination = destination, .source_offset = value.deviceByteOffset(), .destination_offset = cursor, .length = bytes };
+            cursor += bytes;
+        }
+        if (cursor != end) return error.InvalidPhysicalTransferSize;
+    }
+
     fn gatherDeviceColumnsOp(ctx: *anyopaque, columns: []const ops.KernelBackend.DeviceRowColumn) !bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const runtime = self.provider_impl.raw_decode_runtime;
@@ -11832,20 +11849,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var count: usize = 0;
         for (columns) |column| {
             if (column.sources.len == 0 or column.sources.len > spans.len - count) return false;
-            const target = toBuf(column.output).metal_tensor orelse return error.InvalidPhysicalTransferSize;
-            if (target.dtype != .f32 or target.physicalLease() == null or target.isReadOnlyPhysical()) return error.InvalidPhysicalTransferSize;
-            const destination = target.deviceHandle() orelse return error.InvalidPhysicalTransferSize;
-            var cursor = target.deviceByteOffset();
-            const end = try std.math.add(usize, cursor, target.deviceByteLen());
-            for (column.sources, spans[count..][0..column.sources.len]) |source, *span| {
-                const value = toBuf(source).metal_tensor orelse return error.InvalidPhysicalTransferSize;
-                const device = value.deviceHandle() orelse return error.InvalidPhysicalTransferSize;
-                const bytes = value.deviceByteLen();
-                if (device == destination or value.dtype != .f32 or bytes == 0 or bytes > end - cursor) return error.InvalidPhysicalTransferSize;
-                span.* = .{ .source = device, .destination = destination, .source_offset = value.deviceByteOffset(), .destination_offset = cursor, .length = bytes };
-                cursor += bytes;
-            }
-            if (cursor != end) return error.InvalidPhysicalTransferSize;
+            try describeGatherColumn(column.output, column.sources, spans[count..][0..column.sources.len]);
             count += column.sources.len;
         }
         if (count == 0) return false;
@@ -11856,22 +11860,24 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn gatherDeviceRowsOp(ctx: *anyopaque, output: CT, sources: []const CT) !void {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        const target = toBuf(output).metal_tensor orelse return error.InvalidPhysicalTransferSize;
-        if (target.dtype != .f32 or target.physicalLease() == null or target.isReadOnlyPhysical() or sources.len == 0 or sources.len > 8) return error.InvalidPhysicalTransferSize;
-        const destination = target.deviceHandle() orelse return error.InvalidPhysicalTransferSize;
-        var spans: [8]metal_runtime_mod.BufferGatherSource = undefined;
-        var cursor = target.deviceByteOffset();
-        const end = try std.math.add(usize, cursor, target.deviceByteLen());
-        for (sources, spans[0..sources.len]) |source, *span| {
-            const value = toBuf(source).metal_tensor orelse return error.InvalidPhysicalTransferSize;
-            const device = value.deviceHandle() orelse return error.InvalidPhysicalTransferSize;
-            if (device == destination or value.dtype != .f32 or value.deviceByteLen() == 0 or value.deviceByteLen() > end - cursor) return error.InvalidPhysicalTransferSize;
-            span.* = .{ .device = device, .source_offset = value.deviceByteOffset(), .destination_offset = cursor, .length = value.deviceByteLen() };
-            cursor += span.length;
+        const runtime = self.provider_impl.raw_decode_runtime;
+        var backing: [8]metal_runtime_mod.BufferCopySpan = undefined;
+        if (sources.len == 0 or sources.len > backing.len) return error.InvalidPhysicalTransferSize;
+        const spans = backing[0..sources.len];
+        try describeGatherColumn(output, sources, spans);
+        if (metal_runtime_mod.hasActiveFrame(runtime)) {
+            if (metal_runtime_mod.termite_metal_buffer_copy_spans(runtime, spans.ptr, spans.len) != 0) return error.MetalBufferCopyFailed;
+        } else {
+            var gather: [8]metal_runtime_mod.BufferGatherSource = undefined;
+            for (spans, gather[0..spans.len]) |span, *source| source.* = .{
+                .device = span.source,
+                .source_offset = span.source_offset,
+                .destination_offset = span.destination_offset,
+                .length = span.length,
+            };
+            if (metal_runtime_mod.termite_metal_buffer_gather(runtime, spans[0].destination, &gather, spans.len) != 0) return error.MetalBufferCopyFailed;
         }
-        if (cursor != end) return error.InvalidPhysicalTransferSize;
-        if (metal_runtime_mod.termite_metal_buffer_gather(self.provider_impl.raw_decode_runtime, destination, &spans, sources.len) != 0) return error.MetalBufferCopyFailed;
-        for (spans[0..sources.len]) |span| @import("../execution/transfer_audit.zig").deviceCopy(span.length);
+        for (spans) |span| @import("../execution/transfer_audit.zig").deviceCopy(span.length);
     }
 
     fn copyPhysicalInputOp(_: *anyopaque, destination: CT, source: CT) anyerror!void {

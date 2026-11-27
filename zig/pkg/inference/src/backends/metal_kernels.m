@@ -73463,6 +73463,7 @@ int termite_metal_buffer_copy_spans(termite_metal_decode_runtime *runtime,
                 span->source_offset > src.length || span->length > src.length - span->source_offset ||
                 span->destination_offset > dst.length || span->length > dst.length - span->destination_offset) return -3;
         }
+        termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
         id<MTLCommandBuffer> command_buffer = runtime->active_frame_cb;
         termite_metal_record_active_frame_blit_source_for_runtime(runtime, command_buffer, TERMITE_METAL_BLIT_SOURCE_BUFFER_COPY);
         id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder_for_runtime(runtime, command_buffer);

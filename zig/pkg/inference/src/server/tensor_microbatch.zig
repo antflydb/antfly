@@ -2470,7 +2470,7 @@ test "tensor microbatch released T5-small fuses suffixes after encoder retiremen
     defer broker.deinit();
     const Runtime = @import("../execution/seq2seq_runtime.zig");
     const control: Control = .{ .native_call_policy = .in_process };
-    const DispatchContext = struct { broker: *micro.Broker, gate: std.atomic.Mutex = .unlocked, wait_us: u64 = 20_000 };
+    const DispatchContext = struct { broker: *micro.Broker, gate: std.atomic.Mutex = .unlocked, wait_us: ?u64 = 20_000 };
     var dispatch_context: DispatchContext = .{ .broker = &broker };
     const Peer = struct {
         state: Runtime.State,
@@ -2563,6 +2563,18 @@ test "tensor microbatch released T5-small fuses suffixes after encoder retiremen
     const report = broker.snapshot(std.testing.io);
     try std.testing.expectEqual(@as(u64, 1), report.native_batches);
     try std.testing.expectEqual(@as(u64, peers.len), report.native_items);
+
+    if (!platform.env.getenvBool("ANTFLY_ONNX_T5_BENCH_ABBA") and (kind == .native or kind == .metal)) {
+        // Exercise the production unset policy through the same dispatcher.
+        // Advancing the detached state must skip the broker entirely.
+        dispatch_context.wait_us = null;
+        for (&peers) |*peer| {
+            const row = try Peer.step(&peer.state, 5, peer.token, &dispatch_context);
+            defer shared_allocator.free(row);
+            try std.testing.expectEqual(@as(usize, 32128), row.len);
+        }
+        try std.testing.expectEqualDeep(report, broker.snapshot(std.testing.io));
+    }
 
     if (platform.env.getenvBool("ANTFLY_ONNX_T5_BENCH_ABBA")) {
         _ = session.configureExecutionDiagnostics(false);
