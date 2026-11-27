@@ -2119,6 +2119,33 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/enrichments/counts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Count enrichment outputs by origin
+         * @description Counts each enrichment's outputs by origin (seeded, generated,
+         *     external, pending) over one page of documents in key order, for
+         *     migration and readiness tracking (#1791). Page with `next`. Range
+         *     owners count their own documents; counts are exact per page rather
+         *     than maintained counters. Relational tables are not supported.
+         */
+        post: operations["countEnrichmentOutputs"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables/{tableName}/repair/issues": {
         parameters: {
             query?: never;
@@ -9819,6 +9846,75 @@ export interface components {
             document_id: string;
             artifacts: components["schemas"]["DocumentArtifactManifest"][];
         };
+        /** @description One page of an enrichment output count walk. */
+        EnrichmentCountsRequest: {
+            /**
+             * @description Document key to resume from (a previous response's `next`); empty starts at the first key.
+             * @default
+             */
+            from?: string;
+            /**
+             * Format: uint32
+             * @description Documents to count in this page.
+             * @default 1000
+             */
+            limit?: number;
+        };
+        EnrichmentOriginCount: {
+            name: string;
+            /** @description `asset`, `chunk` or `embedding`. */
+            kind: string;
+            /**
+             * Format: uint64
+             * @description Outputs accepted from artifact seeds for their current input.
+             */
+            seeded: number;
+            /**
+             * Format: uint64
+             * @description Outputs Antfly's producers generated.
+             */
+            generated: number;
+            /**
+             * Format: uint64
+             * @description Externally maintained assets and authored vectors.
+             */
+            external: number;
+            /**
+             * Format: uint64
+             * @description Outputs held waiting for a seed (`on_missing: pending`), or, on serverless tables, awaiting generation.
+             */
+            pending: number;
+            /**
+             * Format: uint64
+             * @description Serverless only. Outputs whose generation failed its bounded retries for the current input.
+             */
+            failed?: number;
+        };
+        /**
+         * @description Enrichment output counts by origin over one page of documents, for
+         *     migration and readiness. Counts are exact for the page; page with
+         *     `next` and sum. They are not a snapshot across ranges.
+         */
+        EnrichmentCounts: {
+            /**
+             * Format: uint64
+             * @description Documents counted in this page.
+             */
+            documents: number;
+            /** @description Key to resume from, or null when the walk is complete. */
+            next?: string | null;
+            enrichments: components["schemas"]["EnrichmentOriginCount"][];
+            /**
+             * Format: uint64
+             * @description Serverless only. The published version counted.
+             */
+            head_version?: number;
+            /**
+             * Format: uint64
+             * @description Serverless only. Documents awaiting named enrichment generation (table-wide).
+             */
+            pending_documents?: number;
+        };
         /** @description Table-level generated artifact enrichments configured for a table. */
         TableArtifactEnrichmentList: {
             /** @description Table containing the configured artifact enrichments. */
@@ -11769,7 +11865,12 @@ export interface components {
          *       extracted plain text, or `{ "units": [ExtractionUnitSeed] }`, the
          *       extracted units themselves with their pages, layout and transcript
          *       phrases. No fetch, OCR or transcription runs; `source` identifies
-         *       the remote object it was extracted from.
+         *       the remote object it was extracted from. With `"partial": true`
+         *       the units are some pages of the document (each with its
+         *       `page_number`, once): the producer extracts the document after the
+         *       write and uses these pages in place of its own, so only the other
+         *       pages are extracted, OCRed or transcribed. Unit-scoped chunks and
+         *       vectors cannot be seeded in that write.
          *     - Document embedding: an array of finite numbers.
          *     - Chunk-derived embedding: an array of `ChunkVectorSeed`.
          *     - Sparse embedding: `{ "indices": [...], "values": [...] }` with
@@ -19534,7 +19635,7 @@ export interface components {
              */
             download_assets?: boolean;
         };
-        /** @description Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams. An asset enrichment with no producer and no input (no field, template or source artifact) is maintained outside Antfly: only artifact seeds write it (`_artifacts.<name>` or its `seed` field mapping). Its seeds bind to no input, so they are accepted unconditionally, a differing value always replaces the stored one, a seed-only transform needs no `expected_version`, and source rewrites keep it. Reads report it with `origin: external`. No producer, chunk collection or full-text projection may consume it yet. */
+        /** @description Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams. An asset enrichment with no producer and no input (no field, template or source artifact) is maintained outside Antfly: only artifact seeds write it (`_artifacts.<name>` or its `seed` field mapping). Its seeds bind to no input, so they are accepted unconditionally, a differing value always replaces the stored one, a seed-only transform needs no `expected_version`, and source rewrites keep it. Reads report it with `origin: external`. Chunk collections may consume it: they bind to its seeded bytes and are regenerated when a seed changes them. Asset producers and full-text projection of the asset itself may not. */
         EnrichmentConfig: {
             /** @description Stable generated artifact name. */
             name: string;
@@ -38544,6 +38645,37 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    countEnrichmentOutputs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["EnrichmentCountsRequest"];
+            };
+        };
+        responses: {
+            /** @description Enrichment output counts */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EnrichmentCounts"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
             500: components["responses"]["InternalServerError"];
         };
     };

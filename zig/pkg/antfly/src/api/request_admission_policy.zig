@@ -230,6 +230,7 @@ pub const public_operation_policies = [_]PublicOperationPolicy{
     .{ .operation_id = "createTable", .class = .none },
     .{ .operation_id = "dropTable", .class = .none },
     .{ .operation_id = "listArtifactEnrichments", .class = .none },
+    .{ .operation_id = "countEnrichmentOutputs", .class = .query },
     .{ .operation_id = "putArtifactEnrichment", .class = .none },
     .{ .operation_id = "deleteArtifactEnrichment", .class = .none },
     .{ .operation_id = "reprocessDocumentArtifactRange", .class = .none },

@@ -513,9 +513,12 @@ from .enrichment_context_source import EnrichmentContextSource
 from .enrichment_context_source_overflow import EnrichmentContextSourceOverflow
 from .enrichment_context_source_tracking import EnrichmentContextSourceTracking
 from .enrichment_context_sql import EnrichmentContextSql
+from .enrichment_counts import EnrichmentCounts
+from .enrichment_counts_request import EnrichmentCountsRequest
 from .enrichment_kind import EnrichmentKind
 from .enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
 from .enrichment_neighbor_context_config_direction import EnrichmentNeighborContextConfigDirection
+from .enrichment_origin_count import EnrichmentOriginCount
 from .enrichment_producer_config import EnrichmentProducerConfig
 from .enrichment_producer_config_config_type_2 import EnrichmentProducerConfigConfigType2
 from .enrichment_producer_config_type import EnrichmentProducerConfigType
@@ -3372,9 +3375,12 @@ __all__ = (
     "EnrichmentContextSourceOverflow",
     "EnrichmentContextSourceTracking",
     "EnrichmentContextSql",
+    "EnrichmentCounts",
+    "EnrichmentCountsRequest",
     "EnrichmentKind",
     "EnrichmentNeighborContextConfig",
     "EnrichmentNeighborContextConfigDirection",
+    "EnrichmentOriginCount",
     "EnrichmentProducerConfig",
     "EnrichmentProducerConfigConfigType2",
     "EnrichmentProducerConfigType",

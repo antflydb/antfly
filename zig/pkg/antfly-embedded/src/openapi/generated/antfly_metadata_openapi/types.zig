@@ -1501,7 +1501,7 @@ pub const ArtifactRepairReason = enum {
     }
 };
 
-/// An already computed result for a named enrichment, written as `_artifacts.<name>` in a document or transform. The enrichment defines the output contract (content type, dimensions, vector space); the seed does not repeat it. `"<name>": null` drops the accepted output so its producer regenerates it; omitting a name leaves it unchanged. `value` by enrichment kind: - Text asset: a string (`""` is a valid, complete empty result), or `{ "text": "..." }`. - JSON asset: any JSON value. - Document extraction asset: `{ "text": "..." }`, the already extracted plain text, or `{ "units": [ExtractionUnitSeed] }`, the extracted units themselves with their pages, layout and transcript phrases. No fetch, OCR or transcription runs; `source` identifies the remote object it was extracted from. - Document embedding: an array of finite numbers. - Chunk-derived embedding: an array of `ChunkVectorSeed`. - Sparse embedding: `{ "indices": [...], "values": [...] }` with unique indices. - Chunk-derived sparse embedding: an array of `SparseChunkVectorSeed`. For chunk-derived vectors (dense or sparse, including those of a document extraction's unit chunks), `null` embeds the chunks again in the same write; an embedder must be configured. Descriptive read fields (`artifact_id`, `artifact_ref`, `kind`, `status`, `dims`, `items`, `content_type`) and internal routing fields are rejected.
+/// An already computed result for a named enrichment, written as `_artifacts.<name>` in a document or transform. The enrichment defines the output contract (content type, dimensions, vector space); the seed does not repeat it. `"<name>": null` drops the accepted output so its producer regenerates it; omitting a name leaves it unchanged. `value` by enrichment kind: - Text asset: a string (`""` is a valid, complete empty result), or `{ "text": "..." }`. - JSON asset: any JSON value. - Document extraction asset: `{ "text": "..." }`, the already extracted plain text, or `{ "units": [ExtractionUnitSeed] }`, the extracted units themselves with their pages, layout and transcript phrases. No fetch, OCR or transcription runs; `source` identifies the remote object it was extracted from. With `"partial": true` the units are some pages of the document (each with its `page_number`, once): the producer extracts the document after the write and uses these pages in place of its own, so only the other pages are extracted, OCRed or transcribed. Unit-scoped chunks and vectors cannot be seeded in that write. - Document embedding: an array of finite numbers. - Chunk-derived embedding: an array of `ChunkVectorSeed`. - Sparse embedding: `{ "indices": [...], "values": [...] }` with unique indices. - Chunk-derived sparse embedding: an array of `SparseChunkVectorSeed`. For chunk-derived vectors (dense or sparse, including those of a document extraction's unit chunks), `null` embeds the chunks again in the same write; an embedder must be configured. Descriptive read fields (`artifact_id`, `artifact_ref`, `kind`, `status`, `dims`, `items`, `content_type`) and internal routing fields are rejected.
 pub const ArtifactSeed = struct {
     /// The seeded result; its shape follows the enrichment kind.
     value: std.json.Value,
@@ -4790,6 +4790,155 @@ pub const EmbedderConfig = antfly_embeddings_openapi.EmbedderConfig;
 pub const EmbedderProvider = antfly_embeddings_openapi.EmbedderProvider;
 
 pub const Embedding = std.json.Value;
+
+/// Enrichment output counts by origin over one page of documents, for migration and readiness. Counts are exact for the page; page with `next` and sum. They are not a snapshot across ranges.
+pub const EnrichmentCounts = struct {
+    /// Documents counted in this page.
+    documents: u64,
+    /// Key to resume from, or null when the walk is complete.
+    next: OpenApiOptionalNullable([]const u8) = .absent,
+    enrichments: []const EnrichmentOriginCount,
+    /// Serverless only. The published version counted.
+    head_version: ?u64 = null,
+    /// Serverless only. Documents awaiting named enrichment generation (table-wide).
+    pending_documents: ?u64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "documents", "documents", false },
+        .{ "next", "next", false },
+        .{ "enrichments", "enrichments", false },
+        .{ "head_version", "head_version", true },
+        .{ "pending_documents", "pending_documents", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("documents");
+        try jw.write(self.documents);
+        switch (self.next) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("next");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("next");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("enrichments");
+        try jw.write(self.enrichments);
+        if (self.head_version) |value| {
+            try jw.objectField("head_version");
+            try jw.write(value);
+        }
+        if (self.pending_documents) |value| {
+            try jw.objectField("pending_documents");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// One page of an enrichment output count walk.
+pub const EnrichmentCountsRequest = struct {
+    /// Document key to resume from (a previous response's `next`); empty starts at the first key.
+    from: ?[]const u8 = null,
+    /// Documents to count in this page.
+    limit: ?u32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "from", "from", true },
+        .{ "limit", "limit", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.from) |value| {
+            try jw.objectField("from");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const EnrichmentOriginCount = struct {
+    name: []const u8,
+    /// `asset`, `chunk` or `embedding`.
+    kind: []const u8,
+    /// Outputs accepted from artifact seeds for their current input.
+    seeded: u64,
+    /// Outputs Antfly's producers generated.
+    generated: u64,
+    /// Externally maintained assets and authored vectors.
+    external: u64,
+    /// Outputs held waiting for a seed (`on_missing: pending`), or, on serverless tables, awaiting generation.
+    pending: u64,
+    /// Serverless only. Outputs whose generation failed its bounded retries for the current input.
+    failed: ?u64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "kind", "kind", false },
+        .{ "seeded", "seeded", false },
+        .{ "generated", "generated", false },
+        .{ "external", "external", false },
+        .{ "pending", "pending", false },
+        .{ "failed", "failed", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("seeded");
+        try jw.write(self.seeded);
+        try jw.objectField("generated");
+        try jw.write(self.generated);
+        try jw.objectField("external");
+        try jw.write(self.external);
+        try jw.objectField("pending");
+        try jw.write(self.pending);
+        if (self.failed) |value| {
+            try jw.objectField("failed");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
 
 pub const Error = antfly_usermgr_openapi.Error;
 

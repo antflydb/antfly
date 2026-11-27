@@ -425,6 +425,19 @@ the asset state it was accepted for, so it counts as seeded only while that
 state stands and as generated once regenerated. Downstream indexing progress
 is the index status, as before.
 
+A distributed table serves the same counts at
+`POST /tables/{tableName}/enrichments/counts` (body `{"from", "limit"}`, the
+serverless shape; `api/enrichment_counts.zig`). The coordinator visits the
+table's ranges in key order from `from`; each range owner counts a page of
+its own documents through the private seed-plan lookup
+(`{"origin_counts": {"from", "end", "limit"}}`, dispatched to
+`DB.artifactOriginCountsRangeJson`, which stops at the range end so split or
+merge residue is not counted twice), and the coordinator sums them until
+`limit` documents are counted. `next` resumes the walk; a range boundary that
+ends a page resumes at the next range. Counts are exact per page, not a
+snapshot across ranges, and tables with row policies or relational storage
+are refused.
+
 ### Raft: leader seed preparation
 
 On a Raft table the leader accepts a write's explicit seeds before proposing
@@ -595,7 +608,6 @@ subsystem features of their own:
   is compiled out of the DB unit tests; the overlay and the write path are
   tested separately).
 - Vector seeds for seeded chunk collections above 4,095 chunks; unit-scoped
-  (extraction) chunk inventories above that bound. Origin counts on the
-  distributed server's HTTP status (embedded and Lite have them).
+  (extraction) chunk inventories above that bound.
 - Asset producers consuming externally maintained assets (they need an
   upstream producer receipt); an ordered-authority test of chunk consumers.

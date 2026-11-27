@@ -4676,6 +4676,22 @@ pub const Client = struct {
         return ApiResponse(types.DocumentArtifactReprocessResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Count enrichment outputs by origin
+    /// POST /db/v1/tables/{tableName}/enrichments/counts
+    pub fn countEnrichmentOutputs(self: *@This(), table_name: []const u8, body: ?types.EnrichmentCountsRequest) !ApiResponse(types.EnrichmentCounts) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/enrichments/counts", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = if (body) |value| try httpx.json.Json.stringifyRequest(self.allocator, value) else null;
+        defer if (json_body) |value| self.allocator.free(value);
+        var resp = if (json_body) |value|
+            try self.http.post(url, .{ .json = value, .headers = self.authHeaders() })
+        else
+            try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.EnrichmentCounts).fromResponse(self.allocator, &resp);
+    }
+
     /// List a bounded page of entity consumer replay progress
     /// GET /db/v1/tables/{tableName}/entities/{key}/progress
     pub fn listEntityResolverProgress(self: *@This(), table_name: []const u8, key: []const u8, params: ListEntityResolverProgressParams) !ApiResponse(types.EntityConsumerProgressPage) {

@@ -3864,6 +3864,79 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/DocumentArtifactManifest"
+    EnrichmentCountsRequest:
+      type: object
+      additionalProperties: false
+      description: One page of an enrichment output count walk.
+      properties:
+        from:
+          type: string
+          description: Document key to resume from (a previous response's `next`); empty starts at the first key.
+          default: ""
+        limit:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 100000
+          default: 1000
+          description: Documents to count in this page.
+    EnrichmentOriginCount:
+      type: object
+      required: [name, kind, seeded, generated, external, pending]
+      properties:
+        name:
+          type: string
+        kind:
+          type: string
+          description: "`asset`, `chunk` or `embedding`."
+        seeded:
+          type: integer
+          format: uint64
+          description: Outputs accepted from artifact seeds for their current input.
+        generated:
+          type: integer
+          format: uint64
+          description: Outputs Antfly's producers generated.
+        external:
+          type: integer
+          format: uint64
+          description: Externally maintained assets and authored vectors.
+        pending:
+          type: integer
+          format: uint64
+          description: "Outputs held waiting for a seed (`on_missing: pending`), or, on serverless tables, awaiting generation."
+        failed:
+          type: integer
+          format: uint64
+          description: Serverless only. Outputs whose generation failed its bounded retries for the current input.
+    EnrichmentCounts:
+      type: object
+      required: [documents, enrichments]
+      description: |
+        Enrichment output counts by origin over one page of documents, for
+        migration and readiness. Counts are exact for the page; page with
+        `next` and sum. They are not a snapshot across ranges.
+      properties:
+        documents:
+          type: integer
+          format: uint64
+          description: Documents counted in this page.
+        next:
+          type: string
+          nullable: true
+          description: Key to resume from, or null when the walk is complete.
+        enrichments:
+          type: array
+          items:
+            $ref: "#/components/schemas/EnrichmentOriginCount"
+        head_version:
+          type: integer
+          format: uint64
+          description: Serverless only. The published version counted.
+        pending_documents:
+          type: integer
+          format: uint64
+          description: Serverless only. Documents awaiting named enrichment generation (table-wide).
     TableArtifactEnrichmentList:
       type: object
       description: Table-level generated artifact enrichments configured for a table.
@@ -17959,6 +18032,46 @@ paths:
                 $ref: "#/components/schemas/TableArtifactEnrichmentList"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/enrichments/counts:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+    post:
+      summary: Count enrichment outputs by origin
+      description: |
+        Counts each enrichment's outputs by origin (seeded, generated,
+        external, pending) over one page of documents in key order, for
+        migration and readiness tracking (#1791). Page with `next`. Range
+        owners count their own documents; counts are exact per page rather
+        than maintained counters. Relational tables are not supported.
+      tags:
+        - index_management
+      operationId: countEnrichmentOutputs
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EnrichmentCountsRequest"
+      responses:
+        "200":
+          description: Enrichment output counts
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnrichmentCounts"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /tables/{tableName}/repair/issues:

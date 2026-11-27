@@ -1500,6 +1500,17 @@ pub const ReprocessDocumentArtifactPathParams = struct {
     artifact_name: []const u8,
 };
 
+/// Count enrichment outputs by origin
+pub const CountEnrichmentOutputsPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for countEnrichmentOutputs.
+pub fn parseCountEnrichmentOutputsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.EnrichmentCountsRequest) {
+    return std.json.parseFromSlice(types.EnrichmentCountsRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// List a bounded page of entity consumer replay progress
 pub const ListEntityResolverProgressPathParams = struct {
     table_name: []const u8,
@@ -2403,6 +2414,7 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}", .operation_id = "getDocumentArtifactManifest", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}/dependencies", .operation_id = "getArtifactDependencies", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifact", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/enrichments/counts", .operation_id = "countEnrichmentOutputs", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/entities/{key}/progress", .operation_id = "listEntityResolverProgress", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/entities/{key}/redirects", .operation_id = "listEntityResolverState", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/entities/{key}:distinct", .operation_id = "pinEntitiesDistinct", .request_body = .buffered, .streaming_response = false },
@@ -2656,6 +2668,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "getDocumentArtifactManifest")) @compileError("ServerRouter: Impl missing required method 'getDocumentArtifactManifest'");
         if (!@hasDecl(Impl, "getArtifactDependencies")) @compileError("ServerRouter: Impl missing required method 'getArtifactDependencies'");
         if (!@hasDecl(Impl, "reprocessDocumentArtifact")) @compileError("ServerRouter: Impl missing required method 'reprocessDocumentArtifact'");
+        if (!@hasDecl(Impl, "countEnrichmentOutputs")) @compileError("ServerRouter: Impl missing required method 'countEnrichmentOutputs'");
         if (!@hasDecl(Impl, "listEntityResolverProgress")) @compileError("ServerRouter: Impl missing required method 'listEntityResolverProgress'");
         if (!@hasDecl(Impl, "listEntityResolverState")) @compileError("ServerRouter: Impl missing required method 'listEntityResolverState'");
         if (!@hasDecl(Impl, "pinEntitiesDistinct")) @compileError("ServerRouter: Impl missing required method 'pinEntitiesDistinct'");
@@ -2907,6 +2920,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.get("/tables/:tableName/documents/:key/artifacts/:artifactName", httpx.Handler.bind(self.impl, getDocumentArtifactManifest));
             try server.get("/tables/:tableName/documents/:key/artifacts/:artifactName/dependencies", httpx.Handler.bind(self.impl, getArtifactDependencies));
             try server.post("/tables/:tableName/documents/:key/artifacts/:artifactName/reprocess", httpx.Handler.bind(self.impl, reprocessDocumentArtifact));
+            try server.post("/tables/:tableName/enrichments/counts", httpx.Handler.bind(self.impl, countEnrichmentOutputs));
             try server.get("/tables/:tableName/entities/:key/progress", httpx.Handler.bind(self.impl, listEntityResolverProgress));
             try server.get("/tables/:tableName/entities/:key/redirects", httpx.Handler.bind(self.impl, listEntityResolverState));
             try server.post("/tables/:tableName/entities/:key:distinct", httpx.Handler.bind(self.impl, pinEntitiesDistinct));
@@ -4343,6 +4357,13 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.reprocessDocumentArtifact(ctx, table_name, key, artifact_name);
         }
 
+        /// Count enrichment outputs by origin
+        /// POST /tables/{tableName}/enrichments/counts
+        fn countEnrichmentOutputs(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.countEnrichmentOutputs(ctx, table_name);
+        }
+
         /// List a bounded page of entity consumer replay progress
         /// GET /tables/{tableName}/entities/{key}/progress
         fn listEntityResolverProgress(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -5148,6 +5169,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn getDocumentArtifactManifest(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8, params: GetDocumentArtifactManifestParams) !httpx.Response
 //   fn getArtifactDependencies(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8, params: GetArtifactDependenciesParams) !httpx.Response
 //   fn reprocessDocumentArtifact(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response
+//   fn countEnrichmentOutputs(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn listEntityResolverProgress(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: ListEntityResolverProgressParams) !httpx.Response
 //   fn listEntityResolverState(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn pinEntitiesDistinct(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response

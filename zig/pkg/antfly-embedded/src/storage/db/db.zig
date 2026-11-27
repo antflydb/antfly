@@ -8685,6 +8685,13 @@ pub const DB = struct {
     /// (`on_missing: pending`). Returns
     /// `{"documents":n,"next":key|null,"enrichments":[{name,kind,seeded,generated,external,pending}]}`.
     pub fn artifactOriginCountsJson(self: *DB, alloc: Allocator, from_key: []const u8, limit: u32) ![]u8 {
+        return self.artifactOriginCountsRangeJson(alloc, from_key, "", limit);
+    }
+
+    /// `artifactOriginCountsJson` over documents in `[from_key, end_key)`
+    /// (`end_key` empty: unbounded), so a range owner never counts residue
+    /// outside its range.
+    pub fn artifactOriginCountsRangeJson(self: *DB, alloc: Allocator, from_key: []const u8, end_key: []const u8, limit: u32) ![]u8 {
         const enrichment_catalog = @import("catalog/enrichment_catalog.zig");
         const seed_records = @import("artifact_seed_chunks.zig");
         var arena = std.heap.ArenaAllocator.init(alloc);
@@ -8714,10 +8721,18 @@ pub const DB = struct {
             }
         }
         const page_limit = @max(limit, 1);
-        var page = try self.scan(a, from_key, "", .{ .limit = page_limit + 1, .include_documents = true });
+        var page = try self.scan(a, from_key, end_key, .{ .limit = page_limit + 1, .include_documents = true });
         defer page.deinit(a);
-        const documents = page.documents[0..@min(page.documents.len, page_limit)];
-        const next: ?[]const u8 = if (page.documents.len > page_limit) page.documents[page_limit].id else null;
+        // The scan includes its end key; a range ends before it.
+        var in_range = page.documents.len;
+        if (end_key.len != 0) {
+            for (page.documents, 0..) |document, i| if (std.mem.order(u8, document.id, end_key) != .lt) {
+                in_range = i;
+                break;
+            };
+        }
+        const documents = page.documents[0..@min(in_range, page_limit)];
+        const next: ?[]const u8 = if (in_range > page_limit) page.documents[page_limit].id else null;
         for (documents) |document| {
             var txn = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
             defer txn.abort();
@@ -25326,7 +25341,19 @@ pub const DB = struct {
             try @import("restore_staging.zig").requireScope(alloc, &staging_read, opts.restore_staging_scope, false);
         }
         if (opts.group_source_query_json.len != 0) return self.lookupGroupSource(alloc, opts.group_source_query_json);
-        if (opts.seed_plan_json.len != 0) return .{ .json = try self.planArtifactSeedsJson(alloc, opts.seed_plan_json) };
+        if (opts.seed_plan_json.len != 0) {
+            // Origin counts share the private seed-plan lookup (#1791):
+            // `{"origin_counts":{"from","end","limit"}}`.
+            if (std.mem.startsWith(u8, opts.seed_plan_json, "{\"origin_counts\":")) {
+                const Request = struct { origin_counts: struct { from: []const u8 = "", end: []const u8 = "", limit: u32 = 1000 } };
+                const parsed = std.json.parseFromSlice(Request, alloc, opts.seed_plan_json, .{}) catch return error.InvalidArgument;
+                defer parsed.deinit();
+                const request = parsed.value.origin_counts;
+                if (request.limit == 0 or request.limit > 100_000) return error.InvalidArgument;
+                return .{ .json = try self.artifactOriginCountsRangeJson(alloc, request.from, request.end, request.limit) };
+            }
+            return .{ .json = try self.planArtifactSeedsJson(alloc, opts.seed_plan_json) };
+        }
         if (std.mem.eql(u8, opts.relational_topology_json, @import("native_empty_origin.zig").finalization_selector) and
             !@import("native_empty_origin.zig").finalizationLookupMatches(key, opts)) return error.RestoreStagingScopeChanged;
         if (opts.relational_topology_json.len != 0) return self.lookupRelationalTopology(alloc, opts.relational_topology_json, opts);
@@ -108935,6 +108962,17 @@ test "db artifact origin counts report seeded, generated, external and pending o
         }
     }
     try std.testing.expect(std.mem.indexOf(u8, all, "\"documents\":3,\"next\":null") != null);
+
+    // Range owners count only their range, through the private lookup.
+    {
+        var bounded = (try db.lookup(alloc, "", .{ .seed_plan_json = "{\"origin_counts\":{\"from\":\"\",\"end\":\"doc:b\",\"limit\":10}}", .include_all_fields = false })).?;
+        defer bounded.deinit(alloc);
+        if (std.mem.indexOf(u8, bounded.json, "\"documents\":1,\"next\":null") == null) {
+            std.debug.print("bounded counts {s}\n", .{bounded.json});
+            return error.TestUnexpectedResult;
+        }
+    }
+    try std.testing.expectError(error.InvalidArgument, db.lookup(alloc, "", .{ .seed_plan_json = "{\"origin_counts\":{\"limit\":0}}", .include_all_fields = false }));
 }
 
 fn documentVersionForTest(alloc: Allocator, db: *DB, key: []const u8) !u64 {

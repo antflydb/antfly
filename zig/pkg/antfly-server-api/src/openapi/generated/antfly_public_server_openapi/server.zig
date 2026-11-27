@@ -1743,6 +1743,17 @@ pub const ReprocessDocumentArtifactPathParams = struct {
     artifact_name: []const u8,
 };
 
+/// Count enrichment outputs by origin
+pub const CountEnrichmentOutputsPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for countEnrichmentOutputs.
+pub fn parseCountEnrichmentOutputsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.EnrichmentCountsRequest) {
+    return std.json.parseFromSlice(types.EnrichmentCountsRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// List a bounded page of entity consumer replay progress
 pub const ListEntityResolverProgressPathParams = struct {
     table_name: []const u8,
@@ -2670,6 +2681,7 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}", .operation_id = "getDocumentArtifactManifest", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}/dependencies", .operation_id = "getArtifactDependencies", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifact", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/enrichments/counts", .operation_id = "countEnrichmentOutputs", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/entities/{key}/progress", .operation_id = "listEntityResolverProgress", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/entities/{key}/redirects", .operation_id = "listEntityResolverState", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/entities/{key}:distinct", .operation_id = "pinEntitiesDistinct", .request_body = .buffered, .streaming_response = false },
@@ -2938,6 +2950,7 @@ pub const routes = [_]Route{
 //   fn getDocumentArtifactManifest(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8, params: GetDocumentArtifactManifestParams) !httpx.Response
 //   fn getArtifactDependencies(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8, params: GetArtifactDependenciesParams) !httpx.Response
 //   fn reprocessDocumentArtifact(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response
+//   fn countEnrichmentOutputs(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn listEntityResolverProgress(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: ListEntityResolverProgressParams) !httpx.Response
 //   fn listEntityResolverState(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn pinEntitiesDistinct(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response

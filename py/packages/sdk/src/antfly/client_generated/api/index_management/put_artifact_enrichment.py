@@ -119,8 +119,9 @@ def sync_detailed(
             (`_artifacts.<name>` or its `seed` field mapping). Its seeds bind to no input, so they are
             accepted unconditionally, a differing value always replaces the stored one, a seed-only
             transform needs no `expected_version`, and source rewrites keep it. Reads report it with
-            `origin: external`. No producer, chunk collection or full-text projection may consume it
-            yet.
+            `origin: external`. Chunk collections may consume it: they bind to its seeded bytes and
+            are regenerated when a seed changes them. Asset producers and full-text projection of the
+            asset itself may not.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -176,8 +177,9 @@ def sync(
             (`_artifacts.<name>` or its `seed` field mapping). Its seeds bind to no input, so they are
             accepted unconditionally, a differing value always replaces the stored one, a seed-only
             transform needs no `expected_version`, and source rewrites keep it. Reads report it with
-            `origin: external`. No producer, chunk collection or full-text projection may consume it
-            yet.
+            `origin: external`. Chunk collections may consume it: they bind to its seeded bytes and
+            are regenerated when a seed changes them. Asset producers and full-text projection of the
+            asset itself may not.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -228,8 +230,9 @@ async def asyncio_detailed(
             (`_artifacts.<name>` or its `seed` field mapping). Its seeds bind to no input, so they are
             accepted unconditionally, a differing value always replaces the stored one, a seed-only
             transform needs no `expected_version`, and source rewrites keep it. Reads report it with
-            `origin: external`. No producer, chunk collection or full-text projection may consume it
-            yet.
+            `origin: external`. Chunk collections may consume it: they bind to its seeded bytes and
+            are regenerated when a seed changes them. Asset producers and full-text projection of the
+            asset itself may not.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -283,8 +286,9 @@ async def asyncio(
             (`_artifacts.<name>` or its `seed` field mapping). Its seeds bind to no input, so they are
             accepted unconditionally, a differing value always replaces the stored one, a seed-only
             transform needs no `expected_version`, and source rewrites keep it. Reads report it with
-            `origin: external`. No producer, chunk collection or full-text projection may consume it
-            yet.
+            `origin: external`. Chunk collections may consume it: they bind to its seeded bytes and
+            are regenerated when a seed changes them. Asset producers and full-text projection of the
+            asset itself may not.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

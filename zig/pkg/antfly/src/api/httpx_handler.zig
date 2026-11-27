@@ -12106,6 +12106,46 @@ pub const AntflyApiHandler = struct {
         return self.scanKeysImpl(ctx, table_name, true);
     }
 
+    /// Enrichment output counts by origin, one page of documents across the
+    /// table's ranges (#1791).
+    pub fn countEnrichmentOutputs(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const alloc = ctx.allocator;
+        const binding = (try self.resolvePublicTableBinding(ctx, table_name, &identity)) orelse return ctx.response.build();
+        defer binding.deinit(alloc);
+        // Counts expose per-document coverage; like constraint diagnostics,
+        // they are not offered through a row-policy-protected table.
+        if (binding.logical) |logical| {
+            const target = try system_catalog.Target.parse(logical);
+            const principal: ?*const AuthenticatedIdentity = if (identity) |*value| value else null;
+            const proof = self.api_server.rowPolicyReadProof(alloc, principal, operationContext(ctx, identity), binding.table_id orelse return error.RowPolicyCatalogChanged, binding.physical, target.database, null) catch |err| return switch (err) {
+                error.RowPolicyAuthenticationRequired, error.RowPolicyDenied => jsonErrorResponse(ctx, 403, "row policy authentication required"),
+                error.RowPolicyCatalogChanged, error.RowPolicyUnsupported => jsonErrorResponse(ctx, 409, "row policy publication changed"),
+                error.RowPolicyAuthorityUnavailable => jsonErrorResponse(ctx, 503, "row policy authority unavailable"),
+                else => err,
+            };
+            defer if (proof) |token| alloc.free(token);
+            if (proof != null) return jsonErrorResponse(ctx, 409, "enrichment counts are unavailable while row policies are active");
+        }
+        const body_data = (try ctx.body()) orelse "";
+        if (try self.acquirePublicOperation(ctx, "countEnrichmentOutputs")) |response| return response;
+        defer self.releasePublicOperation("countEnrichmentOutputs");
+        const reads = self.api_server.table_reads orelse return jsonErrorResponse(ctx, 503, "range owners unavailable");
+        const body = @import("enrichment_counts.zig").collect(alloc, self.api_server.source, reads, binding.physical, body_data) catch |err| switch (err) {
+            error.InvalidArgument => return jsonErrorResponse(ctx, 400, "limit must be between 1 and 100000"),
+            error.TableNotFound => return jsonErrorResponse(ctx, 404, "not found"),
+            error.RelationalTableUnsupported => return jsonErrorResponse(ctx, 400, "relational tables have no enrichment outputs"),
+            error.TopologyChanged => return jsonErrorResponse(ctx, 409, "range ownership changed; retry from the last next"),
+            error.Canceled, error.Cancelled => return error.Canceled,
+            error.OutOfMemory => return err,
+            else => return jsonErrorResponse(ctx, 503, "range owners unavailable"),
+        };
+        defer alloc.free(body);
+        return jsonResponse(ctx, 200, body);
+    }
+
     pub fn getRelationalConstraintStatus(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
         var identity: ?AuthenticatedIdentity = null;
         defer if (identity) |*value| value.deinit(self.api_server.alloc);

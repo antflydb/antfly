@@ -1471,6 +1471,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = api_public_table_http_docid_test_mod,
         .filters = &.{
             "public artifact enrichment",
+            "seed planning",
+            "enrichment counts",
             "public table batch handler maps doc identity unavailable errors",
             "public table batch handler maps write unavailable errors",
             "public table batch handler exposes pending HA durability without claiming rollback",
