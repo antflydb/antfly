@@ -15,7 +15,6 @@
         "path",
         "content",
         "revision",
-        "indexed_at",
         "permissions"
       ],
       "properties": {

@@ -387,8 +387,9 @@ partial-result error rather than an invented ordering.
 
 Each source document follows [document-v1.json](schema/document-v1.json): a `grep`
 object contains `version: 1`, canonical source `uri`, logical `path`, extracted UTF-8
-`content`, nonempty `revision`, `indexed_at` in UTC Unix seconds, and
-`permissions: {public: boolean, readers: [principal, ...]}`. Optional `metadata`,
+`content`, nonempty `revision`, and
+`permissions: {public: boolean, readers: [principal, ...]}`. When known, provide
+`indexed_at` in UTC Unix seconds. Optional `metadata`,
 `regions` (one-based inclusive line ranges), and source timestamps preserve
 provider details. The configured `document_field` can point to a different dotted
 object path with the same contract. S3, Box, Dropbox, GCS, R2 and GitHub ingestion

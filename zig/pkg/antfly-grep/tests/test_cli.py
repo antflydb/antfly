@@ -1977,6 +1977,13 @@ class CliTests(unittest.TestCase):
             )
         )
 
+    def test_indexed_search_accepts_unknown_index_timestamp(self):
+        doc = self.indexed_doc("a.py")
+        del doc["indexed_at"]
+        config = self.table_config([doc])
+        result = self.raw_cli("--table-config", config, "-l", "STOP")
+        self.assertEqual(result.stdout, b"a.py\n")
+
     def test_indexed_nested_contract_and_timestamp_sorting(self):
         docs = [self.indexed_doc("a.py"), self.indexed_doc("b.py")]
         docs[0]["modified_at"] = 200
