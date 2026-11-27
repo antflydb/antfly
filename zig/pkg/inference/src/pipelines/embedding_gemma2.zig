@@ -3248,10 +3248,21 @@ fn consumePreparedAudios(out: std.mem.Allocator, slot: *@import("audio_preparati
     if (slot.bounded.live > request.host_preprocess_bytes) return error.MemoryBudgetExceeded;
     slot.bounded.limit = request.host_preprocess_bytes;
     var permit = admitWithVisionCacheReclaim(slot.session, request, slot.control) catch |err| blk: {
-        const next = future orelse return err;
         if (!@import("audio_preparation.zig").pressure(err)) return err;
-        next.deinit();
-        next.failure = err;
+        var denied = err;
+        if (future) |next| {
+            next.deinit();
+            next.failure = err;
+            if (admitWithVisionCacheReclaim(slot.session, request, slot.control)) |permit|
+                break :blk permit
+            else |failure|
+                denied = failure;
+        }
+        // Staged Metal takes its model and provider locks after admission. An
+        // idle peer can release residency before any clips start projection.
+        if (denied != error.ResourceTemporarilyUnavailable or slot.session.backend() != .metal or !audioUsesStagedExecution(slot.session, lock)) return denied;
+        try slot.control.check();
+        if (!slot.session.reclaimIdleForRunOutsideExecution()) return denied;
         break :blk try admitWithVisionCacheReclaim(slot.session, request, slot.control);
     };
     defer permit.deinit();

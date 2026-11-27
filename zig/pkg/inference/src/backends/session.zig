@@ -442,8 +442,14 @@ pub const RunAdmission = struct {
         record: *const fn (*anyopaque, anyerror, ?memory.AdmissionPressure, memory.AdmissionRequest) void,
     };
 
+    pub const IdleReclaimer = struct {
+        context: *anyopaque,
+        reclaim: *const fn (*anyopaque, BackendType) bool,
+    };
+
     controller: *memory.AdmissionController,
     denial_observer: ?DenialObserver = null,
+    idle_reclaimer: ?IdleReclaimer = null,
     failure: ?*memory.AdmissionFailure = null,
     backend_class: memory.BackendClass,
     limits: memory.Limits,
@@ -2887,6 +2893,13 @@ pub const Session = struct {
         const admission = self.run_admission orelse return self.retainPermit(.{ .session = self, .lease = null });
         if (std.meta.eql(extra, memory.AdmissionAmounts{})) return self.retainPermit(.{ .session = self, .lease = null });
         return self.retainPermit(.{ .session = self, .lease = try admission.acquireAmountsWithPressure(extra, pressure) });
+    }
+
+    /// Call after a retryable admission denial, before taking execution locks.
+    pub fn reclaimIdleForRunOutsideExecution(self: Session) bool {
+        const admission = self.run_admission orelse return false;
+        const reclaimer = admission.idle_reclaimer orelse return false;
+        return reclaimer.reclaim(reclaimer.context, self.backend());
     }
 
     /// Preserve the exact denial constraint for bounded batch planning. A

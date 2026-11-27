@@ -7386,10 +7386,18 @@ const SessionLoadHost = struct {
         return manager.prepareSessionClose(backend_runtime);
     }
 
+    fn reclaimIdleForRun(context: *anyopaque, backend: backends.BackendType) bool {
+        const manager: *ModelManager = @ptrCast(@alignCast(context));
+        return manager.reclaimIdleForRun(backend);
+    }
+
     fn attachAdmission(context: *anyopaque, session: *backends.Session, backend_runtime: backends.BackendRuntime, resident: runtime.tier.memory.AdmissionAmounts, man: ?*const manifest_mod.ModelManifest) !void {
         const manager: *ModelManager = @ptrCast(@alignCast(context));
         try attachSessionRunAdmission(manager.allocator, session, manager.admissionController(), backend_runtime, try manager.admissionLimitsForSession(backend_runtime, session.*), resident, man);
-        if (session.run_admission) |*admission| admission.denial_observer = .{ .context = manager, .record = ModelManager.observeSessionAdmissionDenied };
+        if (session.run_admission) |*admission| {
+            admission.denial_observer = .{ .context = manager, .record = ModelManager.observeSessionAdmissionDenied };
+            admission.idle_reclaimer = .{ .context = manager, .reclaim = reclaimIdleForRun };
+        }
         try manager.attachSessionResourcePin(session);
     }
 };
