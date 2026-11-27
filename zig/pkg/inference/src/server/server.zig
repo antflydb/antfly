@@ -10330,6 +10330,9 @@ pub const Node = struct {
                         denial.admitted_backend_bytes, denial.host_limit_bytes,        denial.backend_limit_bytes,
                         denial.combined_limit_bytes,   limits.scratch_limit_bytes,
                     });
+                    if (denial.scratch_domain) |domain| std.debug.print("LIGHTONOCR3 scratch_domain={s} requested_bytes={d} sampled_admitted_bytes={d} limit_bytes={d}\n", .{
+                        @tagName(domain.backend), domain.requested_bytes, domain.admitted_bytes, domain.limit_bytes,
+                    });
                     logged_wait = true;
                 }
                 platform.time.sleepNs(admission_wait.nextRetryDelayNs());

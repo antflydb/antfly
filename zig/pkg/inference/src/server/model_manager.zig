@@ -3263,7 +3263,21 @@ pub const ModelManager = struct {
             .admitted_host_bytes = admitted.hostTotalBytes(),
             .admitted_backend_bytes = admitted.backendTotalBytes(),
         };
+        if (pressure) |reason| switch (reason) {
+            .domain_scratch => |backend| diagnostic.scratch_domain = .{
+                .backend = backend,
+                .admitted_bytes = self.admissionController().snapshotBackend(backend).scratchTotalBytes(),
+            },
+            else => {},
+        };
         for (requests) |request| {
+            if (diagnostic.scratch_domain) |*domain| {
+                if (request.backend_class == domain.backend) {
+                    domain.requested_bytes +|= request.amounts.scratchTotalBytes();
+                    const limit = request.limits.scratch_limit_bytes;
+                    if (limit != 0 and (domain.limit_bytes == 0 or limit < domain.limit_bytes)) domain.limit_bytes = limit;
+                }
+            }
             diagnostic.requested_host_bytes +|= request.amounts.hostTotalBytes();
             diagnostic.requested_backend_bytes +|= request.amounts.backendTotalBytes();
             diagnostic.requested_kv_bytes +|= request.amounts.kvTotalBytes();
@@ -11778,6 +11792,21 @@ test "memory admission diagnostics retain pressure and recover after release" {
     // The last denial remains observable after recovery; its timestamp/count
     // distinguish it from the current request and survive DB snapshot refresh.
     try std.testing.expectEqual(@as(u64, 65), manager.memoryAdmissionDiagnostic().denied_count);
+
+    const scratch_limits = memory.Limits{ .scratch_limit_bytes = 100 };
+    var cpu = try manager.acquireAmountsWithEviction(.cpu, scratch_limits, .{ .host_scratch_bytes = 70 });
+    defer cpu.release();
+    var gpu = try manager.acquireAmountsWithEviction(.gpu, scratch_limits, .{ .backend_scratch_bytes = 80 });
+    defer gpu.release();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.acquireAmountsWithEviction(.gpu, scratch_limits, .{ .host_scratch_bytes = 30 }));
+    const scratch = manager.memoryAdmissionDiagnostic();
+    try std.testing.expectEqualStrings("domain_scratch", scratch.pressure);
+    try std.testing.expectEqual(ModelManager.MemoryAdmissionDiagnostic.ScratchDomain{
+        .backend = .gpu,
+        .requested_bytes = 30,
+        .admitted_bytes = 80,
+        .limit_bytes = 100,
+    }, scratch.scratch_domain.?);
 }
 
 /// Planning does not construct a device. Execution validates its actual identity
