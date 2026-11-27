@@ -329,3 +329,16 @@ test "embeddinggemma2 CUDA audio lifetime plan reuses dead regions and rejects a
     p.allocate(256, 2);
     try std.testing.expect(!p.finish(2));
 }
+
+test "CUDA audio bindings reject more inputs than capture staging can hold" {
+    const input: Input = .{ .shape = &.{1}, .elements = 1 };
+    const inputs: [max_inputs + 1]Input = @splat(input);
+    var spans: [max_inputs]InputSpan = undefined;
+    var hash = std.hash.Wyhash.init(0);
+    const full = try Bindings.resolve(&hash, inputs[0..max_inputs], &spans);
+    try std.testing.expectEqual(max_inputs * arena.alignment, full.input_bytes);
+    try std.testing.expectEqual(@sizeOf(f32), full.output_bytes);
+    try std.testing.expectEqual((max_inputs - 1) * arena.alignment, spans[max_inputs - 1].offset);
+    hash = std.hash.Wyhash.init(0);
+    try std.testing.expectError(error.InvalidShape, Bindings.resolve(&hash, &inputs, null));
+}
