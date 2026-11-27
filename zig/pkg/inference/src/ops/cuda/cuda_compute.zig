@@ -63391,18 +63391,28 @@ test "CUDA source local relative attention shares workspace across three physica
             const grouped_value = try cb.fromFloat32Shape(&grouped_values, &shape);
             defer cb.free(grouped_value);
             const Workspace = @import("../../execution/stream_workspace.zig");
+            const Source = @import("local_relative_source.zig");
+            const clips = [_]usize{ 7, 12 };
+            var clip_plans: [clips.len]Source.Plan = undefined;
+            const scratch = try Source.planGroup(&clip_plans, &clips, params.rows, params.heads, params.head_dim, params.chunk, params.context, params.context_left);
             var plan: Workspace.Plan = .{};
-            var scope = Workspace.Scope.observe(&plan);
+            try plan.declareScratch(scratch.bytes);
+            const layout = try plan.layout(0);
+            var bank = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, layout.bytes);
+            defer bank.free(&compute.ctx);
+            var scope = try Workspace.Scope.bind(&plan, layout, bank.ptr, bank.len);
+            const grouped_allocations = compute.stats.device_alloc_calls;
             {
                 compute.execution_scope = &scope;
                 defer compute.execution_scope = null;
                 try std.testing.expect(try cb.localRelativeAttentionInto(query, query, grouped_value, relative, scale, valid, params, .{
                     .tensor = target,
                     .first_row = 1,
-                    .segments = &.{ 7, 12 },
+                    .segments = &clips,
                 }));
             }
-            try std.testing.expect(plan.finishNoOutput());
+            try std.testing.expect(scope.complete());
+            try std.testing.expectEqual(grouped_allocations, compute.stats.device_alloc_calls);
             try std.testing.expectEqual(@as(usize, 1), plan.count);
             try std.testing.expectEqual(copies, compute.stats.d2d_bytes);
             try std.testing.expectEqual(before + 12, compute.bf16_blas.?.calls);
