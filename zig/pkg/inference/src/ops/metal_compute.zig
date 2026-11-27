@@ -24179,14 +24179,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             defer if (owned_scratch) |*tensor| self.retireTemporaryWorkspaceValue(tensor);
             // Outside a caller-owned frame, submit the dependent clamp and
             // projection kernels together instead of waiting after each one.
-            var owns_frame = false;
-            errdefer if (owns_frame) metal_runtime.cancelFrame(runtime) catch {};
-            if (clip) |p| {
-                if (p.flags & 31 != 0 and !metal_runtime.hasActiveFrame(runtime) and !metal_runtime.hasSubmittedFrame(runtime)) {
-                    try metal_runtime.beginFrame(runtime);
-                    owns_frame = true;
-                }
-            }
+            const cb = self.computeBackend();
+            const Submission = @import("../execution/submission.zig").Scope;
+            var frame = try Submission.beginIfNeeded(&cb, if (clip) |p| p.flags & 31 != 0 else false);
+            errdefer frame.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
             var operand = x;
             if (clip) |p| if (p.flags & 3 != 0) {
                 const bytes = try std.math.mul(usize, input_elements, @sizeOf(f32));
@@ -24217,14 +24213,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (clip) |p| if (p.flags & 28 != 0) {
                 if (!metal_runtime.decoderRuntimeAudioClampInto(self.provider_impl, mt, mt, (p.flags >> 2) & 3, p.output_min, p.output_max, p.flags & 16 != 0)) return error.AudioScheduleRouteChanged;
             };
-            if (owns_frame) {
-                // Hand scratch to the frame's retirement path so an audio
-                // storage scope can reuse it after this submission completes.
+            if (frame.owns) {
+                // Scratch retires on the frame that last consumed it.
                 if (owned_scratch) |*tensor| self.retireTemporaryWorkspaceValue(tensor);
                 owned_scratch = null;
-                try metal_runtime.submitFrame(runtime);
-                owns_frame = false;
-                try metal_runtime.waitFrame(runtime);
+                try frame.finish();
             }
         }
         published = true;
