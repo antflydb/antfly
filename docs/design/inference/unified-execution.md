@@ -2663,3 +2663,11 @@ capture after two tokens during page cleanup. B1 recorded no replay.
 Both final arms replayed at 64 rows and retired the captured binding
 after ten tokens. The measured throughputs do not establish a reliable
 default/shared difference because replay eligibility differed across arms.
+
+At `6d4977de07` on Spark, all 34 selected CUDA checks passed without
+skips. Source local-relative attention wrote into assigned output rows
+with exact single- and multi-block outputs, unchanged sentinel rows,
+and zero device-to-device copy bytes. The released grouped checkpoint
+still matched repeated vectors exactly and replayed twice with
+38,017,792 planned and captured arena bytes. The test log hash is
+`a079da40a732781946571f5ce5979d3d17c8b8bd6ada5284597e43c116f94616`.

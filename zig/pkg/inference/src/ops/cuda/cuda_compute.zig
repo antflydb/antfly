@@ -3579,7 +3579,7 @@ pub const CudaCompute = struct {
         pub fn embedding(burst: *@This(), step: usize) !CT {
             return burst.embeddingWithDestination(step, null);
         }
-        fn embeddingWithDestination(burst: *@This(), step: usize, destination: ?buffer_mod.DeviceBuffer) !CT {
+        fn embeddingWithDestination(burst: *@This(), step: usize, destination: ?CT) !CT {
             if (step >= burst.steps) return error.InvalidShape;
             var ids = tensorFromCt(burst.bank).*;
             const bytes = try checkedMul(burst.rows, @sizeOf(u32));
@@ -3839,16 +3839,30 @@ pub const CudaCompute = struct {
             const device_ids = try prepareEmbeddingLookup(self.compute, weight, ids, owner.rows, owner.hidden);
             try launchEmbeddingLookupInto(self.compute, destination, weight, device_ids, owner.rows, owner.hidden, 1.0);
         }
-        pub fn embedNext(self: *@This(), burst_value: *LightOnTokenBurst, step: usize) !CT {
-            return burst_value.embeddingWithDestination(step, self.compute.bounded_decode_graph.input());
+        pub const InputView = struct {
+            shape: [2]i64,
+            tensor: CudaTensor,
+        };
+
+        pub fn embedNext(self: *@This(), burst_value: *LightOnTokenBurst, step: usize, view: *InputView) !CT {
+            if (burst_value.owner != self.compute) return error.ForeignComputeBackend;
+            return burst_value.embeddingWithDestination(step, try self.input(view));
         }
-        pub fn input(self: *@This()) !CT {
+        pub fn input(self: *@This(), view: *InputView) !CT {
             const owner = &self.compute.bounded_decode_graph;
-            const shape = try allocShape2(self.compute.allocator, owner.rows, owner.hidden);
-            errdefer self.compute.allocator.free(shape);
-            const tensor = try createTensor(self.compute, owner.input(), shape, owner.rows * owner.hidden);
-            tensorFromCt(tensor).owns_buffer = false;
-            return tensor;
+            const count = try checkedMul(owner.rows, owner.hidden);
+            const bytes = try checkedMul(count, @sizeOf(f32));
+            view.shape = .{ @intCast(owner.rows), @intCast(owner.hidden) };
+            view.tensor = .{
+                .buffer = try owner.input().borrowRange(0, bytes),
+                .shape = &view.shape,
+                .elem_count = count,
+                .dtype = .f32,
+                .owns_buffer = false,
+                .owns_shape = false,
+                .owned_by_tensor = false,
+            };
+            return @ptrCast(&view.tensor);
         }
         pub fn beginStep(self: *@This(), step: usize) void {
             self.compute.bounded_decode_graph.capture_step = @intCast(step);
@@ -24794,7 +24808,7 @@ fn embeddingLookupScaled(ctx: *anyopaque, weight: CT, ids: []const i64, total: u
     return try embeddingLookupScaledCommon(ctx, weight, ids, total, dim, scale);
 }
 
-fn embeddingLookupTensorScaledCommon(ctx: *anyopaque, weight: CT, ids: CT, total: usize, dim: usize, scale: f32, destination: ?buffer_mod.DeviceBuffer) anyerror!?CT {
+fn embeddingLookupTensorScaledCommon(ctx: *anyopaque, weight: CT, ids: CT, total: usize, dim: usize, scale: f32, destination: ?CT) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const weight_tensor = tensorFromCt(weight);
     const ids_tensor = tensorFromCt(ids);
@@ -24811,13 +24825,19 @@ fn embeddingLookupTensorScaledCommon(ctx: *anyopaque, weight: CT, ids: CT, total
 
     const out_count = try checkedMul(total, dim);
     const bytes = try checkedMul(out_count, @sizeOf(f32));
-    if (destination) |assigned| {
-        const regions = [3]buffer_mod.DeviceBuffer{ weight_tensor.buffer, ids_tensor.buffer, assigned };
+    var output: ?OwnedF32Output = null;
+    defer if (output) |*owned| owned.deinit();
+    const device = if (destination) |assigned| direct: {
+        const target = tensorFromCt(assigned);
+        try ensureF32(target);
+        if (target.elem_count != out_count) return error.InvalidShape;
+        const regions = [3]buffer_mod.DeviceBuffer{ weight_tensor.buffer, ids_tensor.buffer, target.buffer };
         try buffer_mod.validateRegions(3, regions, .{ regions[0].len, try checkedMul(total, @sizeOf(i32)), bytes }, .{ 1, @alignOf(i32), @alignOf(f32) }, 2);
-    }
-    var output = try OwnedF32Output.fromOwnedShapeDestination(self, try allocShape2(self.allocator, total, dim), out_count, bytes, destination);
-    defer output.deinit();
-    const device = output.buffer;
+        break :direct target.buffer;
+    } else owned: {
+        output = try OwnedF32Output.fromOwnedShapeBytes(self, try allocShape2(self.allocator, total, dim), out_count, bytes);
+        break :owned output.?.buffer;
+    };
     var embedding_profile_scope = beginPrefillProfile(self, .embedding, total);
     defer if (embedding_profile_scope) |*scope| scope.end();
     if (weight_tensor.quant_type) |quant_type| {
@@ -24839,7 +24859,7 @@ fn embeddingLookupTensorScaledCommon(ctx: *anyopaque, weight: CT, ids: CT, total
         try self.kernels.launchEmbeddingLookupI32F32(&self.ctx, device, weight_tensor.buffer, ids_tensor.buffer, total, dim, scale);
     }
     self.stats.launch_embedding += 1;
-    return output.intoTensor();
+    return destination orelse output.?.intoTensor();
 }
 
 fn embeddingLookupTensor(ctx: *anyopaque, weight: CT, ids: CT, total: usize, dim: usize) anyerror!?CT {
@@ -47142,7 +47162,13 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
     try std.testing.expectEqual(launched_before, compute.stats.launch_embedding);
     try claim.embedInput(input, &.{ 1, 0, 2 });
     try std.testing.expectEqual(copied_before, compute.stats.d2d_bytes);
-    const embedded = try claim.input();
+    var embedded_view: CudaCompute.BoundedDecodeClaim.InputView = undefined;
+    var fail = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    const embedded = direct: {
+        compute.allocator = fail.allocator();
+        defer compute.allocator = a;
+        break :direct try claim.input(&embedded_view);
+    };
     defer cb.free(embedded);
     const gathered = try cb.toFloat32(embedded, a);
     defer a.free(gathered);
@@ -47151,8 +47177,14 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
     var burst = try claim.burst(input, 2);
     defer burst.deinit();
     try burst.argmax(input, 0);
-    const next = try claim.embedNext(&burst, 0);
+    var next_view: CudaCompute.BoundedDecodeClaim.InputView = undefined;
+    const next = direct: {
+        compute.allocator = fail.allocator();
+        defer compute.allocator = a;
+        break :direct try claim.embedNext(&burst, 0, &next_view);
+    };
     defer cb.free(next);
+    try std.testing.expect(!fail.has_induced_failure);
     try std.testing.expectEqual(owner.input().ptr, tensorFromCt(next).buffer.ptr);
     try std.testing.expect(!tensorFromCt(next).owns_buffer);
     const next_gathered = try cb.toFloat32(next, a);

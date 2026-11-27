@@ -1085,7 +1085,8 @@ pub const Executor = struct {
                     try pipeline.context.bindDecoderCleanup(&context);
                     context.prepared_lighton_decode = true;
                     claim.beginStep(step);
-                    const input = if (step == 0) try claim.input() else try claim.embedNext(render.burst, 0);
+                    var input_view: C.BoundedDecodeClaim.InputView = undefined;
+                    const input = if (step == 0) try claim.input(&input_view) else try claim.embedNext(render.burst, 0, &input_view);
                     render.state_may_have_advanced.* = true;
                     const hidden = try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(pipeline.context.cb, pipeline.context.allocator, pipeline.context.gpt_config.*, input, .{}, if (render.items.len > 64) 1 else render.items.len, if (render.items.len > 64) render.items.len else 1, &context, null);
                     defer pipeline.context.cb.free(hidden.hidden);
