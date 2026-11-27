@@ -3838,13 +3838,7 @@ pub const CudaCompute = struct {
                 owner.wide_replays += @intFromBool(owner.rows > 64);
                 owner.max_replay_rows = @max(owner.max_replay_rows, owner.rows);
                 if (owner.progress == 2 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
-                    const arena_head_rows = owner.storage_layout.?.arena_head_rows;
-                    const packet_rows = if (owner.head.len != 0)
-                        owner.head.len / (owner.vocab * @sizeOf(f32))
-                    else if (arena_head_rows != 0)
-                        arena_head_rows
-                    else
-                        owner.rows;
+                    const packet_rows = owner.storage_layout.?.headPacketRows(owner.rows, owner.vocab);
                     std.debug.print("LIGHTONOCR3 cuda_model_graph_first_replay_rows={d} capture={d} head_packet_rows={d} head_bank_bytes={d}\n", .{
                         owner.rows, owner.captures, packet_rows, owner.head.len,
                     });
@@ -3940,6 +3934,8 @@ pub const CudaCompute = struct {
                     .metadata_bytes = if (layout.attention_workspace) |span| span.offset else layout.metadata_bytes,
                     .attention_scratch_bytes = if (layout.attention_workspace) |span| span.bytes else 0,
                     .head_bytes = layout.head_bytes,
+                    .head_packet_rows = layout.headPacketRows(owner.rows, owner.vocab),
+                    .head_in_stream_arena = layout.head_bytes == 0,
                     .readback_bytes = source.len,
                     .readback_backing = readback_backing,
                     .rows = owner.rows,

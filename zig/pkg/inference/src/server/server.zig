@@ -48780,6 +48780,9 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
             diagnostics_export.drain(WorkspaceEvidence.collect, &workspace_evidence);
             const report = workspace_evidence.completed orelse return error.TestUnexpectedResult;
             try std.testing.expectEqual(@as(usize, 2), report.rows);
+            try std.testing.expectEqual(report.rows, report.head_packet_rows);
+            try std.testing.expectEqual(@as(usize, 0), report.head_bytes);
+            try std.testing.expect(report.head_in_stream_arena);
             // At two rows the position plane starts on the first 16-byte boundary.
             try std.testing.expectEqual(@as(usize, 44), report.readback_bytes);
             try std.testing.expectEqual(report.planned_scratch_bytes, report.bound_scratch_bytes);

@@ -432,6 +432,8 @@ test "uniform report retains bounded CUDA decoder workspace after completed publ
         .metadata_bytes = 512,
         .attention_scratch_bytes = 2048,
         .head_bytes = 0,
+        .head_packet_rows = 2,
+        .head_in_stream_arena = true,
         .readback_bytes = 44,
         .readback_backing = .admitted_pinned,
         .rows = 2,

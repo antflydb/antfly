@@ -65,6 +65,12 @@ pub const StorageLayout = struct {
     head_bytes: usize,
     arena_head_rows: usize = 0,
 
+    pub fn headPacketRows(self: StorageLayout, rows: usize, vocab: usize) usize {
+        if (self.arena_head_rows != 0) return self.arena_head_rows;
+        if (self.head_bytes != 0) return self.head_bytes / @sizeOf(f32) / vocab;
+        return rows;
+    }
+
     const Span = struct {
         offset: usize,
         bytes: usize,
@@ -711,6 +717,7 @@ test "captured graph head packets fund the exact smaller bank and invalidate a f
     for ([_]usize{ 16, 8 }) |packet_rows| {
         try std.testing.expect(phase.reduceHeadPacketAfterDenial());
         try std.testing.expectEqual(packet_rows * packet.vocab * 4, phase.storage_layout.head_bytes);
+        try std.testing.expectEqual(packet_rows, phase.storage_layout.headPacketRows(packet.rows, packet.vocab));
         try std.testing.expectEqual(layout.metadata_bytes, phase.storage_layout.metadata_bytes);
     }
     try std.testing.expect(!phase.reduceHeadPacketAfterDenial());
@@ -724,6 +731,7 @@ test "captured graph head packets fund the exact smaller bank and invalidate a f
     shared.head_in_arena = true;
     try phase.initInto(shared);
     try std.testing.expectEqual(@as(usize, 32), phase.storage_layout.arena_head_rows);
+    try std.testing.expectEqual(@as(usize, 32), phase.storage_layout.headPacketRows(shared.rows, shared.vocab));
     try std.testing.expectEqual(@as(usize, 0), phase.storage_layout.head_bytes);
     const shared_request = shared.storageRequestFor(phase.storage_layout);
     try std.testing.expectEqual(layout.metadata_bytes, (try shared_request.captured_storage.amounts()).backend_scratch_bytes);

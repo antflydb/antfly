@@ -2216,3 +2216,16 @@ assertions passed. The wrapper then incorrectly started its optional
 deep comparison, which was stopped. The receipt
 `c7bba56cd68a9265359cdef735961a84ed9862e54fe9927ae5fa2d04befdcf60`
 covers the completed short requests only.
+
+On Spark at `cf1373be37`, all 29 focused CUDA checks passed. A
+same-binary LightOnOCR 4B run compared adaptive standalone logits packets
+with 16-row logits packets allocated through the existing stream arena.
+Both arms matched the serial output on all 256 pages under the unchanged
+128-page window and 24 GiB scratch cap. Each arm replayed above 64 rows
+three times without admission denials. The standalone arm reached 97
+rows with a 31,784,960-byte logits bank and 7.2579 pages/s. The arena arm
+reached 98 rows with zero separate logits-bank bytes and 7.3020 pages/s.
+This first pair establishes successful wide replay with shared backing.
+The order-reversed comparison is pending. The two receipts are
+`2396762cc6393a5db9357cc672d44ec99cc94371ca918cb48cc01d256f63318a`
+and `9472fbacb69c92dcdd5db7d60d3969bc373e3024ad04c120ea873459c9620de1`.

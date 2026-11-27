@@ -488,7 +488,11 @@ pub const CudaDecoderWorkspace = struct {
     bound_scratch_bytes: usize,
     metadata_bytes: usize,
     attention_scratch_bytes: usize,
+    /// Bytes in the independently admitted bank. Arena-backed packets are
+    /// already accounted for by bound_scratch_bytes.
     head_bytes: usize,
+    head_packet_rows: usize,
+    head_in_stream_arena: bool,
     readback_bytes: usize,
     readback_backing: ReadbackBacking,
     rows: usize,
