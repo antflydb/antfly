@@ -22648,8 +22648,8 @@ fn sourceLinear(self: *CudaCompute, request: @FieldType(ops.Bf16SourceOperation,
     const blas = if (self.bf16_blas) |*value| value else return error.CublasBf16Unavailable;
     const layout = try sourceLinearLayout(self.ctx.info.compute_major, rows, request.width, request.columns, weight.dtype != .bf16, bias_epilogue and bias.?.dtype != .bf16);
     const reuse_bytes = if (self.source_linear_scratch.active and (self.execution_scope == null or !self.execution_scope.?.isBound()))
-        if (request.reuse_projection) |geometry|
-            (try sourceLinearLayout(self.ctx.info.compute_major, rows, geometry.width, geometry.columns, false, false)).bytes
+        if (request.reuse_projection) |reuse|
+            (try sourceLinearLayout(self.ctx.info.compute_major, rows, reuse.width, reuse.columns, false, false)).bytes
         else
             layout.bytes
     else
