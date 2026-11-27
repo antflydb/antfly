@@ -2713,3 +2713,35 @@ widths were 64, 3, 8 and 0 rows. Foreground steps retired learning
 graphs at widths 61 and 56, and retired a 63-row graph in the capture
 phase. Since only the first arm passed the exact 64-row gate, this
 comparison leaves throughput parity open.
+
+### Spark HTTP regression comparison at `c35ca1e482`
+
+The native CUDA HTTP server on the GB10 compared the candidate against the
+frozen `9e4af7f847` baseline. AA, ABBA and BB used three warmups per arm,
+then 16 measured requests per side per workload. The receipt pinned both
+binaries, fixture and request hashes. Another process held a 184 MiB GPU
+context at startup, so these are shared-GPU timings. Exact outputs matched
+on all nine workloads supported by both builds in all sampled arms.
+DECIDE returned the expected unsupported response on the baseline and
+passed all candidate arms. These six baseline responses were the only
+failures reported by the harness.
+
+| Workload | Baseline p50 / p95 (ms) | Candidate p50 / p95 (ms) |
+| --- | ---: | ---: |
+| Whisper Small | 383.71 / 385.55 | 383.22 / 383.99 |
+| EmbeddingGemma 2 text | 8.73 / 9.23 | 8.85 / 9.76 |
+| LightOnOCR 3 | 325.02 / 326.99 | 323.12 / 325.64 |
+| GLiNER 2.5 | 13.03 / 13.97 | 10.57 / 11.76 |
+| DECIDE | Unsupported | 40.10 / 41.54 |
+| Qwen 3 | 85.46 / 86.75 | 85.77 / 87.21 |
+| Gemma 4 E4B text | 221.34 / 223.16 | 221.16 / 224.87 |
+| Gemma 4 E4B image | 279.51 / 299.54 | 277.94 / 279.14 |
+| Gemma 4 E4B audio | 215.95 / 223.94 | 212.64 / 218.29 |
+| Gemma 4 E4B video | 254.30 / 256.27 | 251.48 / 253.30 |
+
+EmbeddingGemma 2 text p95 rose in the mixed comparison. The p95 controls
+span 9.00–9.27 ms on baseline and 9.10–9.38 ms on candidate. An isolated
+repeat is required to resolve the mixed-load tail. The test covered
+EmbeddingGemma 2 text and Gemma 4 audio. Grouped EmbeddingGemma 2 audio
+needs its own comparison, including the workspace changes after this
+candidate.
