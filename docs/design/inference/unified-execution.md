@@ -1333,6 +1333,13 @@ The physical Metal and CUDA fixtures each consumed 65 cache columns
 in two copy packets under the same completion boundary and verified
 the combined cache and logits against their expected values.
 
+On physical Metal at `72360bb3bb`, all four focused grouped-audio
+checks passed. The mixed-length fixture read both vectors from the
+shared metadata bank after releasing the upload handle. Segmented
+kernel results matched isolated clips. The admitted three-clip,
+1,000-frame fixture measured 108,101,632 bytes of incremental device
+storage against its unchanged 134,217,728-byte ceiling.
+
 ### Issue closure audit
 
 This audit reconciles the original `2f2438e67f` implementation review
