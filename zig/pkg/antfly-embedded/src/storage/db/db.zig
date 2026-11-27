@@ -109105,8 +109105,8 @@ test "db artifact seeds maintain an external asset with no producer" {
     // No producer and no input: maintained outside Antfly.
     try db.addEnrichment(.{ .name = "notes", .kind = .asset, .content_type = "text/plain" });
     try db.addEnrichment(.{ .name = "labels", .kind = .asset, .content_type = "application/json", .seed_json = "{\"field\":\"legacy_labels\",\"format\":\"json\",\"on_missing\":\"generate\"}" });
-    // Nothing derives it, so no producer may consume it yet.
-    try std.testing.expectError(error.InvalidEnrichmentConfig, db.addEnrichment(.{ .name = "notes_chunks", .kind = .chunk, .source_artifact_name = "notes", .field = "text", .chunk_size = 8 }));
+    // Asset producers may not consume it (they need a producer receipt).
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.addEnrichment(.{ .name = "notes_summary", .kind = .asset, .source_artifact_name = "notes", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"g\"}}" }));
     try std.testing.expectError(error.InvalidEnrichmentConfig, db.addEnrichment(.{ .name = "bad", .kind = .asset, .content_type = "text/plain", .full_text_index = true }));
 
     {
@@ -109201,6 +109201,46 @@ test "db artifact seeds maintain an external asset with no producer" {
     const doc_b_notes = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:b", "asset", "notes");
     defer alloc.free(doc_b_notes);
     try std.testing.expect((try db.core.getStoreValue(alloc, doc_b_notes)) == null);
+}
+
+test "db artifact chunks of an external asset follow its seeds" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var fake = TestAssetProducer{};
+    var embedder = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a", .asset_producer = fake.producer(), .dense_embedder = embedder.interface() } });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "notes", .kind = .asset, .content_type = "text/plain" });
+    // Its chunks bind to the seeded bytes; no producer receipt exists.
+    try db.addEnrichment(.{ .name = "notes_chunks", .kind = .chunk, .source_artifact_name = "notes", .field = "text", .chunk_size = 8, .chunk_overlap = 0 });
+    try db.addEnrichment(.{ .name = "notes_dense", .kind = .embedding, .field = "text", .source_artifact_name = "notes_chunks", .expected_dims = 3 });
+    try db.addIndex(.{ .name = "notes_vectors", .kind = .dense_vector, .config_json = "{\"field\":\"dense\",\"dims\":3,\"embedding_name\":\"notes_dense\"}" });
+
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"x\",\"_artifacts\":{\"notes\":{\"value\":\"silver submarine\"}}}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try expectSeedViewChunksForTest(alloc, &db, "doc:a", "notes_chunks", &.{ "silver s", "ubmarine" });
+
+    // Source rewrites keep the asset and its chunks.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"rewritten\"}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try expectSeedViewChunksForTest(alloc, &db, "doc:a", "notes_chunks", &.{ "silver s", "ubmarine" });
+
+    // A new seed regenerates them.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"rewritten\",\"_artifacts\":{\"notes\":{\"value\":\"copper kettle\"}}}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try expectSeedViewChunksForTest(alloc, &db, "doc:a", "notes_chunks", &.{ "copper k", "ettle" });
+
+    // Also through a seed-only transform.
+    const ops = [_]types.TransformOp{.{ .op = .set, .path = "_artifacts.notes", .value_json = "{\"value\":\"golden whale\"}" }};
+    try db.batch(.{ .transforms = &.{.{ .key = "doc:a", .operations = &ops }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try expectSeedViewChunksForTest(alloc, &db, "doc:a", "notes_chunks", &.{ "golden w", "hale" });
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expect(embedder.calls > 0);
+    try std.testing.expectEqual(@as(u64, 2), db.core.index_manager.denseIndex("notes_vectors").?.index.metadata.active_count);
 }
 
 test "db artifact seed-only transforms still require expected_version for bound outputs" {

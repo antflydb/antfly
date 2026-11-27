@@ -187,6 +187,17 @@ pub fn readUpstream(alloc: std.mem.Allocator, token: *context.Token, txn: anytyp
     return if (raw) |value| try alloc.dupe(u8, value) else null;
 }
 
+/// An externally maintained upstream (written only by seeds) has no producer
+/// provenance: the consumer observes its bytes, and the observation's guard
+/// fences them at publication.
+pub fn readExternalUpstream(alloc: std.mem.Allocator, token: *context.Token, txn: anytype, key: []const u8) !?[]u8 {
+    var input = try @import("artifact_extraction_generation.zig").captureInput(alloc, txn, key);
+    defer input.deinit();
+    const raw = input.value;
+    try input.observe(token, txn, key);
+    return if (raw) |value| try alloc.dupe(u8, value) else null;
+}
+
 pub fn prepare(alloc: std.mem.Allocator, command: publication.Command, catalogs: inventory.Catalogs) !publication.PreparedEffects {
     try command.validate(alloc);
     if (command.mode != .publish or command.producer_kind != .enrichment or

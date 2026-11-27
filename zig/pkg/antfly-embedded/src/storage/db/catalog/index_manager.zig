@@ -27204,9 +27204,9 @@ pub const IndexManager = struct {
                 if (cfg.source_artifact_name.len > 0 and self.getEnrichment(.asset, cfg.source_artifact_name) == null) {
                     return error.InvalidEnrichmentConfig;
                 }
-                // An externally maintained asset carries no publication
-                // receipt for a downstream producer to bind to.
-                if (self.getEnrichment(.asset, cfg.source_artifact_name)) |upstream| if (enrichment_catalog.externallyMaintained(upstream)) return error.InvalidEnrichmentConfig;
+                // An externally maintained asset has no publication receipt;
+                // its chunks bind to the output's content digest instead
+                // (`requireLocalAssetSource`, `readExternalUpstream`).
             },
             .embedding => {
                 if (cfg.source_artifact_name.len > 0 and self.getEnrichment(.chunk, cfg.source_artifact_name) == null and self.assetGroupRoot(cfg.source_artifact_name).len == 0) {

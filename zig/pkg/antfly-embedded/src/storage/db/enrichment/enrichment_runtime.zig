@@ -7304,7 +7304,7 @@ fn getOrCreateRequestChunksWithProvider(runtime: *EnrichmentRuntime, alloc: Allo
         if (!privacy.isProtectedArtifactName(request.upstream_artifact_name) and privacy.consumerPolicyVersion(request.upstream_artifact_name) == null) {
             var read = try runtime.store.beginProbe();
             defer read.abort();
-            if (try ordered_publication.authority(&read) == null) {
+            if (try ordered_publication.authority(&read) == null and !externalAsset(runtime, request.upstream_artifact_name)) {
                 const upstream_source_text = try declaredSourceTextAlloc(runtime, request.doc_key, parent, request.upstream_artifact_name);
                 defer runtime.alloc.free(upstream_source_text);
                 try requireLocalAssetSourceWithAllocator(runtime, alloc, &read, request.doc_key, request.upstream_artifact_name, upstream_source_text, bytes);
@@ -34511,7 +34511,11 @@ fn processOrderedChunkText(runtime: *EnrichmentRuntime, request: enrichment_type
         if (request.upstream_artifact_name.len != 0) {
             const upstream_key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "asset", request.upstream_artifact_name);
             defer runtime.alloc.free(upstream_key);
-            const upstream = try @import("../artifact_asset_publication.zig").readUpstream(runtime.alloc, &token, &read, upstream_key);
+            const assets = @import("../artifact_asset_publication.zig");
+            const upstream = if (externalAsset(runtime, request.upstream_artifact_name))
+                try assets.readExternalUpstream(runtime.alloc, &token, &read, upstream_key)
+            else
+                try assets.readUpstream(runtime.alloc, &token, &read, upstream_key);
             defer if (upstream) |bytes| runtime.alloc.free(bytes);
             if (token.source.exists and upstream == null) return error.ArtifactPublicationPending;
         }
@@ -41633,6 +41637,13 @@ fn declaredSourceTextAlloc(runtime: *EnrichmentRuntime, doc_key: []const u8, raw
     return try std.mem.join(runtime.alloc, "\n", &.{ base, block });
 }
 
+/// An asset only seeds write (no producer, no input). Consumers bind to its
+/// output bytes, since there is no producer receipt or provenance to name.
+fn externalAsset(runtime: *EnrichmentRuntime, name: []const u8) bool {
+    const entry = runtime.index_manager.getEnrichment(.asset, name) orelse return false;
+    return @import("../catalog/enrichment_catalog.zig").externallyMaintained(entry.*);
+}
+
 fn requireLocalAssetSource(runtime: *EnrichmentRuntime, txn: anytype, doc_key: []const u8, name: []const u8, parent: []const u8, output: []const u8) !void {
     return requireLocalAssetSourceWithAllocator(runtime, runtime.alloc, txn, doc_key, name, parent, output);
 }
@@ -41674,6 +41685,9 @@ fn validateLocalSourceFence(runtime: *EnrichmentRuntime, txn: anytype, guard: Lo
         defer runtime.alloc.free(upstream_key);
         const output = txn.get(upstream_key) catch |err| if (err == error.NotFound) return error.EnrichmentSourceChanged else return err;
         if (!std.mem.eql(u8, &expected, &sourceRecordDigest(output))) return error.EnrichmentSourceChanged;
+        // Only seeds write an externally maintained asset: its output digest,
+        // checked above, is the whole binding.
+        if (externalAsset(runtime, guard.upstream_name)) return;
         const upstream_source_text = try declaredSourceTextAlloc(runtime, guard.doc_key, logical orelse return error.EnrichmentSourceChanged, guard.upstream_name);
         defer runtime.alloc.free(upstream_source_text);
         try requireLocalAssetSource(runtime, txn, guard.doc_key, guard.upstream_name, upstream_source_text, output);

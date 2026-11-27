@@ -246,9 +246,17 @@ unconditionally: identical is `unchanged`, a different value always replaces
 it (`replaced`, `existing_origin: external`, under either policy), and `null`
 deletes it. A seed-only transform needs no `expected_version`. Source
 rewrites, edits and replays keep it, deleting the document removes it, and
-reads report `origin: external`; the seed view exports it. No producer, chunk
-collection or full-text projection may consume one yet: nothing would publish
-the receipt a downstream producer binds to.
+reads report `origin: external`; the seed view exports it.
+
+Chunk collections may consume one (`source_artifact_name`). With no producer
+there is no publication receipt or provenance to bind to, so the chunks bind
+to the asset's output bytes: the local authority skips the receipt check and
+fences the upstream by its content digest, and the ordered authority observes
+the upstream without a producer proof (`readExternalUpstream`). A write
+carrying seeds always replays its derived requests, so a seed that changes the
+asset (also through a seed-only transform) regenerates its chunks and their
+vectors even when the logical row is unchanged. Asset producers may not
+consume one, and full-text projection of the asset itself stays refused.
 
 ### Transforms
 
@@ -560,4 +568,5 @@ subsystem features of their own:
 - Chunk inventories beyond the 4,095-chunk atomic-mutation ceiling through
   staged publication (`docs/design/media-pass.md`); origin counts on the
   distributed server's HTTP status (embedded and Lite have them).
-- Downstream consumers of externally maintained assets.
+- Asset producers consuming externally maintained assets (they need an
+  upstream producer receipt); an ordered-authority test of chunk consumers.

@@ -2280,7 +2280,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         extracted_write.sparse_embeddings.len == 0 and
                         extracted_write.deleted_embedding_indexes.len == 0 and
                         extracted_write.graph_writes.len == 0 and
-                        extracted_write.mentioned_graph_indexes.len == 0)
+                        extracted_write.mentioned_graph_indexes.len == 0 and
+                        // Seeds change outputs outside the logical row: an
+                        // externally maintained asset's consumers replay.
+                        extracted_write.artifact_seeds_json == null)
                     {
                         derived_changed_flags[entry.write_index] = false;
                     }
