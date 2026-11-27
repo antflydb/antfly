@@ -3476,7 +3476,13 @@ pub const CudaCompute = struct {
     pub fn boundedFusedHeadAvailable(cb: *const ops.ComputeBackend, head: CT, rows: usize, hidden: usize, vocab: usize) bool {
         if (!acceptsPhysicalImplementation(cb.vtable)) return false;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
-        return self.fusedHeadAvailable(tensorFromCt(head), rows, hidden, vocab);
+        const weight = tensorFromCt(head);
+        if (!self.fusedHeadAvailable(weight, rows, hidden, vocab)) return false;
+        // Shape eligibility bounds both dimensions before multiplying.
+        const elements = hidden * vocab;
+        if (weight.elem_count != elements) return false;
+        _ = buffer_mod.validateRegion(weight.buffer, elements * @sizeOf(u16), 16) catch return false;
+        return true;
     }
 
     fn fusedHeadAvailable(self: *const CudaCompute, weight: *const CudaTensor, rows: usize, hidden: usize, vocab: usize) bool {
@@ -4291,6 +4297,8 @@ pub const CudaCompute = struct {
         const capture_scope = if (owner.phase == .capture) try owner.bindArena() else null;
         if (self.captured_cache_roots) |roots| try roots.beginGeneration(self, current);
         try self.lighton_attention.init(&self.ctx);
+        if (owner.phase == .warm and owner.storage_layout.?.fused_head_workspace != null)
+            try self.lighton_head.init(&self.ctx);
         if (owner.phase != .replay) {
             owner.progress = 0;
             @memcpy(owner.base_positions[0..positions.len], positions);
