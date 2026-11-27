@@ -56676,6 +56676,29 @@ test "LightOnOCR3 decoder weight descriptor allocation failures unwind owners an
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, checkLightOnWeightDescriptors, .{false});
 }
 
+test "Metal argmax fallback reads only the final device row" {
+    if (!build_options.enable_metal or !@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var weights = testMetalWeightStoreInit(allocator);
+    defer weights.lazy_weights.deinit(allocator);
+    var compute = try MetalCompute.init(allocator, &weights, null);
+    defer compute.deinit();
+    const logits = try compute.importResidentF32(&.{ 100, 0, 0, 1, 9, 3 }, &.{ 1, 2, 3 });
+    defer compute.computeBackend().free(logits);
+
+    // Keep the tensor's actual Metal backing live while the selection
+    // runtime declines. This exercises the physical fallback readback.
+    const runtime = compute.provider_impl.raw_decode_runtime;
+    compute.provider_impl.raw_decode_runtime = null;
+    defer compute.provider_impl.raw_decode_runtime = runtime;
+    const transfer = @import("../execution/transfer_audit.zig");
+    var audit: transfer.Audit = .{};
+    try transfer.begin(&audit);
+    defer transfer.end();
+    try std.testing.expectEqual(@as(?u32, 1), try MetalCompute.argmaxLastRowOp(&compute, logits, 2, 3));
+    try std.testing.expectEqual(@as(u64, 3 * @sizeOf(f32)), audit.host_access_bytes);
+}
+
 test "Florence host argmax matches device nonfinite and tie semantics" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     const nan = std.math.nan(f32);
