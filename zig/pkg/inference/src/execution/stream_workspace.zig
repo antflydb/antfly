@@ -36,7 +36,7 @@ pub const Layout = struct {
 const Slot = u12;
 const no_slot = std.math.maxInt(Slot);
 const Allocation = struct {
-    live_id: u64,
+    lifetime: extern union { live_id: u64, external_offset: u64 },
     bytes: u32,
     // Arena offsets are always aligned. Store the cold live-list link in
     // the spare bits so a cached recipe needs no separate index array.
@@ -100,7 +100,7 @@ pub const Plan = struct {
         var insert_after: ?Slot = null;
         while (slot != no_slot) {
             const allocation = self.allocations[slot];
-            if (allocation.live_id == live_id) {
+            if (allocation.lifetime.live_id == live_id) {
                 self.valid = false;
                 return;
             }
@@ -122,7 +122,7 @@ pub const Plan = struct {
         self.allocations[self.count] = .{
             .bytes = @intCast(bytes),
             .placement = .{ .offset_blocks = @intCast(offset / alignment), .next_live = self.nextLive(predecessor) },
-            .live_id = live_id,
+            .lifetime = .{ .live_id = live_id },
         };
         self.setNextLive(predecessor, @intCast(self.count));
         self.event(self.count, true);
@@ -134,7 +134,7 @@ pub const Plan = struct {
         var previous: Slot = no_slot;
         var slot = self.first_live;
         while (slot != no_slot) {
-            if (self.allocations[slot].live_id == pointer) {
+            if (self.allocations[slot].lifetime.live_id == pointer) {
                 self.unlinkLive(previous, slot);
                 return;
             }
@@ -164,7 +164,7 @@ pub const Plan = struct {
 
     fn unlinkLive(self: *Plan, predecessor: Slot, slot: Slot) void {
         self.setNextLive(predecessor, self.nextLive(slot));
-        self.allocations[slot].live_id = 0;
+        self.allocations[slot].lifetime.live_id = 0;
         self.event(slot, false);
     }
 
@@ -185,7 +185,7 @@ pub const Plan = struct {
         }
 
         pub fn release(self: Builder, slot: u15) !void {
-            if (!self.plan.valid or self.plan.sealed or slot >= self.plan.count or self.plan.allocations[slot].live_id == 0)
+            if (!self.plan.valid or self.plan.sealed or slot >= self.plan.count or self.plan.allocations[slot].lifetime.live_id == 0)
                 return error.InvalidExecutionPlan;
             self.plan.releaseSlot(@intCast(slot));
             if (!self.plan.valid) return error.InvalidExecutionPlan;
@@ -193,8 +193,8 @@ pub const Plan = struct {
 
         pub fn finish(self: Builder, published_slot: ?u15) !void {
             const published: ?u64 = if (published_slot) |slot| p: {
-                if (slot >= self.plan.count or self.plan.allocations[slot].live_id == 0) return error.InvalidExecutionPlan;
-                break :p self.plan.allocations[slot].live_id;
+                if (slot >= self.plan.count or self.plan.allocations[slot].lifetime.live_id == 0) return error.InvalidExecutionPlan;
+                break :p self.plan.allocations[slot].lifetime.live_id;
             } else null;
             if (!self.plan.seal(published)) return error.InvalidExecutionPlan;
             self.plan.origin = .declared;
@@ -233,21 +233,46 @@ pub const Plan = struct {
     fn seal(self: *Plan, expected: ?u64) bool {
         if (self.sealed) return false;
         for (self.allocations[0..self.count], 0..) |*allocation, index| {
-            if (allocation.live_id == 0) continue;
-            if (expected != allocation.live_id or self.output != null) self.valid = false;
+            if (allocation.lifetime.live_id == 0) continue;
+            if (expected != allocation.lifetime.live_id or self.output != null) self.valid = false;
             // The published layout keeps slot geometry, never a learning-run address.
-            allocation.live_id = 0;
+            allocation.lifetime.live_id = 0;
             self.output = index;
         }
         self.valid = self.valid and (expected == null) == (self.output == null);
-        if (self.valid) for (self.allocations[0..self.count], 0..) |allocation, index| {
-            if (self.output == index) continue;
-            self.scratch_peak = @max(self.scratch_peak, allocation.offset() + std.mem.alignForward(usize, allocation.bytes, alignment));
-        };
+        if (self.valid) if (self.output) |output| self.packExternalScratch(output);
         self.first_live = no_slot;
         self.sealed = self.valid;
         if (self.sealed) self.recipe = self.hashEvents(0);
         return self.valid;
+    }
+
+    fn packExternalScratch(self: *Plan, output: usize) void {
+        var inline_peak: usize = 0;
+        for (self.allocations[0..self.count], 0..) |*allocation, index| {
+            if (index == output) continue;
+            allocation.lifetime.external_offset = allocation.offset();
+            inline_peak = @max(inline_peak, allocation.offset() + std.mem.alignForward(usize, allocation.bytes, alignment));
+        }
+        self.scratch_peak = inline_peak;
+        if (output + 1 == self.count) return;
+
+        // Replay only scratch intervals through the same first-fit planner.
+        // Keep the inline placement if the alternate packing costs more.
+        var scratch: Plan = .{};
+        for (self.events[0..self.event_count]) |entry| {
+            if (entry.slot == output) continue;
+            const id = @as(u64, entry.slot) + 1;
+            if (entry.allocate) {
+                scratch.allocateLive(self.allocations[entry.slot].bytes, id);
+                if (!scratch.valid or scratch.peak > inline_peak) return;
+            } else scratch.release(id);
+        }
+        for (self.allocations[0..output], scratch.allocations[0..output]) |*allocation, packed_slot|
+            allocation.lifetime.external_offset = packed_slot.offset();
+        for (self.allocations[output + 1 .. self.count], scratch.allocations[output..scratch.count]) |*allocation, packed_slot|
+            allocation.lifetime.external_offset = packed_slot.offset();
+        self.scratch_peak = scratch.peak;
     }
 
     pub fn layout(self: *const Plan, prefix_bytes: usize) !Layout {
@@ -357,6 +382,11 @@ pub const Scope = struct {
         return (self.published_ptr != 0 and pointer == self.published_ptr) or
             (pointer >= self.base and pointer - self.base < peak);
     }
+    fn offset(self: *const Scope, slot: u15) DevicePointer {
+        const allocation = self.recipe.bound.allocations[slot];
+        return if (self.requires_published_output) allocation.lifetime.external_offset else allocation.offset();
+    }
+
     pub fn allocate(self: *Scope, bytes: usize) !DevicePointer {
         // Observation scopes register real allocations through Plan.allocate.
         // Only an admitted backing may issue addresses from a sealed recipe.
@@ -373,7 +403,7 @@ pub const Scope = struct {
         }
         self.cursor += 1;
         if (self.published_ptr != 0 and self.recipe.bound.output == e.slot) return self.published_ptr;
-        return self.base + self.recipe.bound.allocations[e.slot].offset();
+        return self.base + self.offset(e.slot);
     }
     pub fn release(self: *Scope, pointer: DevicePointer) void {
         if (!self.isBound()) {
@@ -385,7 +415,7 @@ pub const Scope = struct {
             return;
         }
         const e = self.recipe.bound.events[self.cursor];
-        if (e.allocate or self.base + self.recipe.bound.allocations[e.slot].offset() != pointer) {
+        if (e.allocate or self.base + self.offset(e.slot) != pointer) {
             self.valid = false;
             return;
         }
@@ -534,7 +564,7 @@ test "stream workspace redirects only the sealed publication slot" {
     plan.release(0x1000);
     plan.allocate(64, 0x2000);
     try std.testing.expect(plan.finish(0x2000));
-    for (plan.allocations[0..plan.count]) |allocation| try std.testing.expectEqual(@as(DevicePointer, 0), allocation.live_id);
+    for (plan.allocations[0..plan.count]) |allocation| try std.testing.expectEqual(@as(DevicePointer, 0), allocation.lifetime.live_id);
     const layout = try plan.layout(alignment);
     var scope = try Scope.bind(&plan, layout, 0x1000, layout.bytes + alignment);
     try std.testing.expectError(error.InvalidExecutionPlan, scope.bindPublishedOutput(0x1000, 64));
@@ -660,4 +690,57 @@ test "stream workspace chooses the earliest gap among out-of-order slots" {
     try std.testing.expectEqual(@as(usize, 768), plan.peak);
     try std.testing.expectEqual(@as(u32, 0), plan.allocations[2].offset());
     try std.testing.expectEqual(@as(u32, 256), plan.allocations[3].offset());
+}
+
+test "external workspace packs scratch across a live inline publication" {
+    var plan: Plan = .{};
+    try plan.declare(&.{
+        .{ .allocate = 256 },
+        .{ .allocate = 2048 },
+        .{ .release = 0 },
+        .{ .allocate = 512 },
+        .{ .release = 2 },
+    }, 1);
+    const inline_layout = try plan.layout(0);
+    const external = try plan.layoutWithExternalOutput(0);
+    try std.testing.expectEqual(@as(usize, 2816), inline_layout.bytes);
+    try std.testing.expectEqual(@as(usize, 512), external.bytes);
+    var scope = try Scope.bind(&plan, external, 0x1000, external.bytes);
+    try scope.bindPublishedOutput(0x2000, 2048);
+    try std.testing.expectEqual(@as(u64, 0x1000), try scope.allocate(256));
+    try std.testing.expectEqual(@as(u64, 0x2000), try scope.allocate(2048));
+    scope.release(0x1000);
+    try std.testing.expectEqual(@as(u64, 0x1000), try scope.allocate(512));
+    scope.release(0x1000);
+    try std.testing.expect(scope.complete());
+}
+
+test "external workspace retains inline offsets when repacking increases peak" {
+    var plan: Plan = .{};
+    try plan.declare(&.{
+        .{ .allocate = 5 * alignment },
+        .{ .allocate = alignment },
+        .{ .release = 0 },
+        .{ .allocate = 3 * alignment },
+        .{ .allocate = 3 * alignment },
+        .{ .release = 2 },
+        .{ .allocate = 4 * alignment },
+        .{ .release = 3 },
+        .{ .release = 4 },
+    }, 1);
+    const layout = try plan.layoutWithExternalOutput(0);
+    try std.testing.expectEqual(9 * alignment, layout.bytes);
+    var scope = try Scope.bind(&plan, layout, 0x1000, layout.bytes);
+    try scope.bindPublishedOutput(0x2000, alignment);
+    const first = try scope.allocate(5 * alignment);
+    _ = try scope.allocate(alignment);
+    scope.release(first);
+    const second = try scope.allocate(3 * alignment);
+    const third = try scope.allocate(3 * alignment);
+    try std.testing.expectEqual(@as(u64, 0x1600), third);
+    scope.release(second);
+    const fourth = try scope.allocate(4 * alignment);
+    scope.release(third);
+    scope.release(fourth);
+    try std.testing.expect(scope.complete());
 }
