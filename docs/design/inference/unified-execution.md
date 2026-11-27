@@ -1426,6 +1426,9 @@ workspace receipt preserves the submission route. At `fcdf226536`,
 all 14 selected CUDA tests passed, including the audio key regression
 and physical route receipts across capture, replay and held outputs.
 The released model reproduced the same arena size and replay count.
+At `20d6f40954`, after unifying the grouped clip limit and geometry
+check, all 14 tests again passed without skips. The released checkpoint
+still matched vectors exactly and replayed twice with the same arena.
 The production layout still comes from an observed allocation schedule.
 
 At `ee3629cec0`, five scoped Metal audio tests passed without skips.
