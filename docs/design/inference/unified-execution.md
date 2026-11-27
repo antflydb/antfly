@@ -2687,3 +2687,14 @@ All four arms failed the exact 64-row replay gate. A separate process
 held a GPU context when inspected after the run. These receipts
 establish output parity for this comparison, with throughput and
 consistent 64-row replay still unqualified.
+
+On Spark GB10 at `211c80a1f9`, all 39 selected CUDA checks passed
+without skips. The released LightOnOCR HTTP fixture replayed two rows
+and matched the serial text exactly. It reported 44 pinned readback
+bytes, 297,216 attention scratch bytes, 16,384 attention output bytes,
+16,384 recurrent output bytes, and 2,002,944 bytes in the shared layer
+bank. Separate physical fixtures passed for both F32 and compact BF16
+FFN arithmetic against independent references. Released grouped audio
+matched exactly across repeats and recorded two replays with
+38,017,792 planned and captured arena bytes. The test log hash is
+`313a207f8120d6a30c4210c55ecd4d1b52bc74c5ed6ec31b9e52d9456dd58b66`.
