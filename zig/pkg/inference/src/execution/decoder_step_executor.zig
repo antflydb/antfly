@@ -1053,7 +1053,8 @@ pub const Executor = struct {
             graph.compute.bounded_decode_graph.disabled_epoch = graph.compute.bounded_decode_graph.epoch_id;
             graph.compute.clearCapturedGraphWithCleanup(.{ .boundary = self.context.cleanupEpoch() }) catch platform.inference_process_supervisor.restartWorker();
         }
-        var burst = try graph.burst(embedding, self.context.gpt_config.vocab_size);
+        var token_view: C.BoundedDecodeClaim.TensorView = undefined;
+        var burst = try graph.burst(embedding, self.context.gpt_config.vocab_size, &token_view);
         defer burst.deinit();
         const first = try self.context.allocator.alloc(u32, claimed.len);
         errdefer self.context.allocator.free(first);
@@ -1090,7 +1091,7 @@ pub const Executor = struct {
                     try pipeline.context.bindDecoderCleanup(&context);
                     context.prepared_lighton_decode = true;
                     claim.beginStep(step);
-                    var input_view: C.BoundedDecodeClaim.InputView = undefined;
+                    var input_view: C.BoundedDecodeClaim.TensorView = undefined;
                     const input = if (step == 0) try claim.input(&input_view) else try claim.embedNext(render.burst, 0, &input_view);
                     render.state_may_have_advanced.* = true;
                     const hidden = try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(pipeline.context.cb, pipeline.context.allocator, pipeline.context.gpt_config.*, input, .{}, if (render.items.len > 64) 1 else render.items.len, if (render.items.len > 64) render.items.len else 1, &context, null);

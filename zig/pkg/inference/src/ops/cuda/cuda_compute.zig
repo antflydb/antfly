@@ -3768,13 +3768,31 @@ pub const CudaCompute = struct {
             self.compute.execution_scope = null;
             self.compute.bounded_decode_graph.mutex.unlock();
         }
-        pub fn burst(self: *@This(), embedding: CT, vocab: usize) !LightOnTokenBurst {
+        pub const TensorView = struct {
+            shape: [2]i64,
+            tensor: CudaTensor,
+
+            fn bind(view: *TensorView, backing: buffer_mod.DeviceBuffer, rows: usize, cols: usize, dtype: tensor_mod.DType) !CT {
+                const count = try checkedMul(rows, cols);
+                const bytes = try checkedMul(count, dtype.byteSize());
+                view.shape = .{ @intCast(rows), @intCast(cols) };
+                view.tensor = .{
+                    .buffer = try backing.borrowRange(0, bytes),
+                    .dtype = dtype,
+                    .shape = &view.shape,
+                    .elem_count = count,
+                    .owns_buffer = false,
+                    .owns_shape = false,
+                    .owned_by_tensor = false,
+                };
+                return @ptrCast(&view.tensor);
+            }
+        };
+
+        pub fn burst(self: *@This(), embedding: CT, vocab: usize, view: *TensorView) !LightOnTokenBurst {
             const owner = &self.compute.bounded_decode_graph;
             if (vocab != owner.vocab) return error.InvalidShape;
-            const shape = try allocShape2(self.compute.allocator, 2, owner.rows);
-            errdefer self.compute.allocator.free(shape);
-            const bank = try createTensorWithDType(self.compute, owner.bank(), shape, 2 * owner.rows, .i32);
-            tensorFromCt(bank).owns_buffer = false;
+            const bank = try view.bind(owner.bank(), 2, owner.rows, .i32);
             return .{ .owner = self.compute, .bank = bank, .embedding_weight = embedding, .suppress = .{}, .suppress_count = 0, .rows = owner.rows, .steps = 2, .hidden = owner.hidden, .vocab = vocab };
         }
         pub fn projectGreedyHead(self: *@This(), cb: *const ops.ComputeBackend, burst_value: *LightOnTokenBurst, input_ct: CT, weight: CT, step: usize) !void {
@@ -3841,30 +3859,13 @@ pub const CudaCompute = struct {
             const device_ids = try prepareEmbeddingLookup(self.compute, weight, ids, owner.rows, owner.hidden);
             try launchEmbeddingLookupInto(self.compute, destination, weight, device_ids, owner.rows, owner.hidden, 1.0);
         }
-        pub const InputView = struct {
-            shape: [2]i64,
-            tensor: CudaTensor,
-        };
-
-        pub fn embedNext(self: *@This(), burst_value: *LightOnTokenBurst, step: usize, view: *InputView) !CT {
+        pub fn embedNext(self: *@This(), burst_value: *LightOnTokenBurst, step: usize, view: *TensorView) !CT {
             if (burst_value.owner != self.compute) return error.ForeignComputeBackend;
             return burst_value.embeddingWithDestination(step, try self.input(view));
         }
-        pub fn input(self: *@This(), view: *InputView) !CT {
+        pub fn input(self: *@This(), view: *TensorView) !CT {
             const owner = &self.compute.bounded_decode_graph;
-            const count = try checkedMul(owner.rows, owner.hidden);
-            const bytes = try checkedMul(count, @sizeOf(f32));
-            view.shape = .{ @intCast(owner.rows), @intCast(owner.hidden) };
-            view.tensor = .{
-                .buffer = try owner.input().borrowRange(0, bytes),
-                .shape = &view.shape,
-                .elem_count = count,
-                .dtype = .f32,
-                .owns_buffer = false,
-                .owns_shape = false,
-                .owned_by_tensor = false,
-            };
-            return @ptrCast(&view.tensor);
+            return view.bind(owner.input(), owner.rows, owner.hidden, .f32);
         }
         pub fn beginStep(self: *@This(), step: usize) void {
             self.compute.bounded_decode_graph.capture_step = @intCast(step);
@@ -47291,6 +47292,20 @@ test "CUDA bounded decoder drains a failed receipt transfer before returning" {
     try std.testing.expect(compute.pinned_scalar_download_buffer.host.ptr == null);
 }
 
+test "bounded CUDA graph borrows token and embedding tensors without storage custody" {
+    var token_view: CudaCompute.BoundedDecodeClaim.TensorView = undefined;
+    const token = tensorFromCt(try token_view.bind(.{ .ptr = 0x1000, .len = 16 }, 2, 2, .i32));
+    try std.testing.expectEqualSlices(i64, &.{ 2, 2 }, token.shape);
+    try std.testing.expectEqual(@as(usize, 4), token.elem_count);
+    try std.testing.expect(token.buffer.borrowed and !token.owns_buffer and !token.owns_shape and !token.owned_by_tensor);
+    var embedding_view: CudaCompute.BoundedDecodeClaim.TensorView = undefined;
+    try std.testing.expectError(error.InvalidShape, embedding_view.bind(.{ .ptr = 0x2000, .len = 23 }, 2, 3, .f32));
+    const embedding = tensorFromCt(try embedding_view.bind(.{ .ptr = 0x2000, .len = 24 }, 2, 3, .f32));
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, embedding.shape);
+    try std.testing.expectEqual(@as(usize, 6), embedding.elem_count);
+    try std.testing.expect(embedding.buffer.borrowed and !embedding.owned_by_tensor);
+}
+
 test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffers" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -47333,7 +47348,7 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
     try std.testing.expectEqual(launched_before, compute.stats.launch_embedding);
     try claim.embedInput(input, &.{ 1, 0, 2 });
     try std.testing.expectEqual(copied_before, compute.stats.d2d_bytes);
-    var embedded_view: CudaCompute.BoundedDecodeClaim.InputView = undefined;
+    var embedded_view: CudaCompute.BoundedDecodeClaim.TensorView = undefined;
     var fail = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
     const embedded = direct: {
         compute.allocator = fail.allocator();
@@ -47345,10 +47360,15 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
     defer a.free(gathered);
     try std.testing.expectEqualSlices(f32, &.{ 5, 7, 2, 3, 11, 13 }, gathered);
 
-    var burst = try claim.burst(input, 2);
+    var token_view: CudaCompute.BoundedDecodeClaim.TensorView = undefined;
+    var burst = direct: {
+        compute.allocator = fail.allocator();
+        defer compute.allocator = a;
+        break :direct try claim.burst(input, 2, &token_view);
+    };
     defer burst.deinit();
     try burst.argmax(input, 0);
-    var next_view: CudaCompute.BoundedDecodeClaim.InputView = undefined;
+    var next_view: CudaCompute.BoundedDecodeClaim.TensorView = undefined;
     const next = direct: {
         compute.allocator = fail.allocator();
         defer compute.allocator = a;
