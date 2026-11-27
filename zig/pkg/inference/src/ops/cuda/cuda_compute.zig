@@ -22500,7 +22500,7 @@ const SourceLinearTemporary = struct {
         if (self.execution_scope) |scope| {
             if (self.source_linear_scratch.in_use) return error.SourceStorageInUse;
             if (scope.isBound()) {
-                return .{ .bank = .{ .ptr = try scope.allocate(bytes), .len = bytes, .borrowed = true }, .kind = .captured };
+                return .{ .bank = .{ .ptr = try scope.allocateScratch(bytes), .len = bytes, .borrowed = true }, .kind = .captured };
             }
             // The operation holds this exact interval without nested scratch
             // allocations. Eager backing need not match the recorded address.
@@ -23859,7 +23859,7 @@ fn allocUninitF32ShapeOp(ctx: *anyopaque, shape_i32: []const i32) anyerror!?CT {
 test "CUDA uninitialized output retires scoped scratch when tensor metadata allocation fails" {
     const workspace = @import("../../execution/stream_workspace.zig");
     var plan: workspace.Plan = .{};
-    try plan.declareScratch(32);
+    try plan.declare(&.{ .{ .allocate = 32 }, .{ .release = 0 } }, null);
     const layout = try plan.layout(0);
     var scope = try workspace.Scope.bind(&plan, layout, 0x1000, layout.bytes);
     var allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
@@ -27230,7 +27230,16 @@ const ProjectionArgmaxScratch = struct {
         if (suppressed.len != 0) {
             if (self.execution_scope) |scope| if (scope.isBound()) return error.CudaGraphCaptureUnsafeHostCopy;
         }
-        var bank = try allocDeviceBuffer(self, layout.bytes);
+        var bank = if (self.execution_scope) |scope| scoped: {
+            if (scope.isBound()) break :scoped buffer_mod.DeviceBuffer{
+                .ptr = try scope.allocateScratch(layout.bytes),
+                .len = layout.bytes,
+                .borrowed = true,
+            };
+            const backing = try allocDeviceBufferOrdinaryWithPolicy(self, layout.bytes, .scoped);
+            scope.recordScratchInterval(layout.bytes);
+            break :scoped backing;
+        } else try allocDeviceBuffer(self, layout.bytes);
         errdefer releaseDeviceBuffer(self, &bank);
         const scratch = try bind(bank, layout);
         if (suppressed.len != 0) try copyFromHostTracked(self, scratch.suppression, std.mem.sliceAsBytes(suppressed));
@@ -43992,7 +44001,7 @@ test "CUDA projection argmax shares the temporary arena admission ceiling" {
 test "CUDA unpublished F32 outputs retire through their declared workspace" {
     const workspace = @import("../../execution/stream_workspace.zig");
     var plan: workspace.Plan = .{};
-    try plan.declareScratch(32);
+    try plan.declare(&.{ .{ .allocate = 32 }, .{ .release = 0 } }, null);
     const layout = try plan.layout(0);
     var scope = try workspace.Scope.bind(&plan, layout, 0x10000, layout.bytes);
     var compute = metadataOnlyTestCompute();

@@ -50,14 +50,15 @@ const Allocation = struct {
 // never need pointer-width storage or an independently padded flag.
 const max_allocations = 2048;
 const Event = packed struct(u16) {
-    slot: u15,
+    slot: u14,
     allocate: bool,
+    operation_scratch: bool = false,
 };
 
 comptime {
     if (limit > std.math.maxInt(u32)) @compileError("stream workspace geometry overflow");
 
-    if (max_allocations > no_slot or max_allocations - 1 > std.math.maxInt(u15)) @compileError("stream workspace event slot overflow");
+    if (max_allocations > no_slot or max_allocations - 1 > std.math.maxInt(u14)) @compileError("stream workspace event slot overflow");
     if (limit / alignment > std.math.maxInt(u20)) @compileError("stream workspace placement overflow");
 }
 pub const Origin = enum { observed, declared };
@@ -193,7 +194,8 @@ pub const Plan = struct {
     fn appendOperationScratch(self: *Plan, bytes: usize) bool {
         const slot = self.count;
         self.allocateLive(bytes, null);
-        if (self.count == slot) return false;
+        if (!self.valid or self.count == slot) return false;
+        self.events[self.event_count - 1].operation_scratch = true;
         self.releaseSlot(@intCast(slot));
         if (!self.valid) return false;
         self.declared_operation_scratch_intervals += 1;
@@ -454,12 +456,20 @@ pub const Scope = struct {
         return (self.published_ptr != 0 and pointer == self.published_ptr) or
             (pointer >= self.base and pointer - self.base < peak);
     }
-    fn offset(self: *const Scope, slot: u15) DevicePointer {
+    fn offset(self: *const Scope, slot: u14) DevicePointer {
         const allocation = self.recipe.bound.allocations[slot];
         return if (self.requires_published_output) allocation.lifetime.external_offset else allocation.offset();
     }
 
     pub fn allocate(self: *Scope, bytes: usize) !DevicePointer {
+        return self.allocateRole(bytes, false);
+    }
+
+    pub fn allocateScratch(self: *Scope, bytes: usize) !DevicePointer {
+        return self.allocateRole(bytes, true);
+    }
+
+    fn allocateRole(self: *Scope, bytes: usize, operation_scratch: bool) !DevicePointer {
         // Observation scopes register real allocations through Plan.allocate.
         // Only an admitted backing may issue addresses from a sealed recipe.
         if (!self.isBound() or !self.valid or self.cursor >= self.recipe.bound.event_count or
@@ -469,7 +479,7 @@ pub const Scope = struct {
             return error.InvalidExecutionPlan;
         }
         const e = self.recipe.bound.events[self.cursor];
-        if (!e.allocate or self.recipe.bound.allocations[e.slot].bytes != bytes) {
+        if (!e.allocate or e.operation_scratch != operation_scratch or self.recipe.bound.allocations[e.slot].bytes != bytes) {
             self.valid = false;
             return error.InvalidExecutionPlan;
         }
@@ -560,7 +570,7 @@ test "sealed workspace identity excludes learning addresses and distinguishes ge
     try std.testing.expect(identity != plan.fingerprint(17));
 }
 
-test "declared scratch is identical to a sealed allocation interval" {
+test "declared scratch retains its role independently of allocation geometry" {
     var declared: Plan = .{};
     var learned: Plan = .{};
     try std.testing.expectError(error.InvalidExecutionPlan, declared.declareScratch(0));
@@ -569,8 +579,19 @@ test "declared scratch is identical to a sealed allocation interval" {
     learned.allocate(257, 1024);
     learned.release(1024);
     try std.testing.expect(learned.finishNoOutput());
-    try std.testing.expectEqual(try learned.layout(0), try declared.layout(0));
-    try std.testing.expectEqual(learned.fingerprint(17), declared.fingerprint(17));
+    const scratch = try declared.layout(0);
+    const ordinary = try learned.layout(0);
+    try std.testing.expectEqual(ordinary.bytes, scratch.bytes);
+    try std.testing.expect(learned.fingerprint(17) != declared.fingerprint(17));
+    var wrong_role = try Scope.bind(&declared, scratch, 0x1000, scratch.bytes);
+    try std.testing.expectError(error.InvalidExecutionPlan, wrong_role.allocate(257));
+    try std.testing.expectEqual(@as(usize, 0), wrong_role.cursor);
+    var wrong_scratch = try Scope.bind(&learned, ordinary, 0x1000, ordinary.bytes);
+    try std.testing.expectError(error.InvalidExecutionPlan, wrong_scratch.allocateScratch(257));
+    try std.testing.expectEqual(@as(usize, 0), wrong_scratch.cursor);
+    var bound = try Scope.bind(&declared, scratch, 0x1000, scratch.bytes);
+    bound.release(try bound.allocateScratch(257));
+    try std.testing.expect(bound.complete());
 }
 
 test "declared CUDA workspace reuses dead slots and redirects its sole published output" {
@@ -644,7 +665,7 @@ test "an operation can declare scratch inside an observed workspace" {
     const layout = try plan.layout(0);
     var bound = try Scope.bind(&plan, layout, 0x2000, layout.bytes);
     const input = try bound.allocate(64);
-    const scratch = try bound.allocate(512);
+    const scratch = try bound.allocateScratch(512);
     try std.testing.expectEqual(@as(DevicePointer, 0x2100), scratch);
     bound.release(scratch);
     bound.release(input);
