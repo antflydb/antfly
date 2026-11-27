@@ -2407,3 +2407,12 @@ advance the owning scope and that retiring the actual allocation
 completed the declared event sequence. The released LightOnOCR HTTP
 fixture still replayed with a 44-byte pinned receipt. The log hash is
 `a60570abdc1ddfa254285f5f92c5d67bd32983d9bfc5937b78d7ab3aaabc2971`.
+
+At `62444a7607`, the released GLiNER2.5 Decide 1B checkpoint passed
+the HTTP classification fixture on Native and Metal using the same
+local test binary and shared model directory. The same build passed
+Metal Whisper initial/decode parity, Native Whisper cross-cache
+cancellation, and the physical Metal final-row fallback. The four-test
+cohort and the separate Metal DECIDE run had zero skips. The log hashes
+are `74585bc7af2b4e285d343d27adc82ccf447220a953f0fd2fccf0e732afd6b84f`
+and `01f5dbce8f54d7d75e684a28218bd97bae85e5ba7faa9e7f0c6ba1ffefedddbc`.
