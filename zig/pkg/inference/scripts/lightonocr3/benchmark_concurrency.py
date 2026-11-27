@@ -57,6 +57,23 @@ def graph_funding_denials(text):
     ]
 
 
+def graph_first_replays(text):
+    replays = re.findall(
+        r"LIGHTONOCR3 cuda_model_graph_first_replay_rows=(\d+)"
+        r"(?: capture=\d+ head_packet_rows=(\d+) head_bank_bytes=(\d+)"
+        r"(?: fused_head_scratch_bytes=(\d+))?)?",
+        text,
+    )
+    banks = []
+    for rows, packet, bank, fused in replays:
+        if packet:
+            entry = dict(rows=int(rows), packet_rows=int(packet), bank_bytes=int(bank))
+            if fused:
+                entry["fused_head_scratch_bytes"] = int(fused)
+            banks.append(entry)
+    return [int(rows) for rows, _, _, _ in replays], banks
+
+
 def graph_retirements(text):
     return [
         dict(reason=reason, phase=phase, epoch=int(epoch), rows=int(rows), progress=int(progress))
@@ -698,21 +715,8 @@ def run(args, model, label, mode, concurrency, output):
                 prior_snapshots = re.findall(snapshot_pattern, pieces[0])
                 previous_snapshots = int(prior_snapshots[-1]) if prior_snapshots else 0
                 for sample, section in zip(result["policy_rounds"], sections):
-                    replays = re.findall(
-                        r"LIGHTONOCR3 cuda_model_graph_first_replay_rows=(\d+)"
-                        r"(?: capture=\d+ head_packet_rows=(\d+) head_bank_bytes=(\d+)"
-                        r"(?: fused_head_scratch_bytes=(\d+))?)?",
-                        section,
-                    )
-                    replay_rows = [int(rows) for rows, _, _, _ in replays]
-                    if banks := [
-                        dict(
-                            rows=int(rows), packet_rows=int(packet), bank_bytes=int(bank),
-                            fused_head_scratch_bytes=int(fused) if fused else None,
-                        )
-                        for rows, packet, bank, fused in replays
-                        if packet
-                    ]:
+                    replay_rows, banks = graph_first_replays(section)
+                    if banks:
                         sample["model_graph_replay_head_banks"] = banks
                     sample["model_graph_replay_cohort_rows"] = sorted(set(replay_rows))
                     sample["model_graph_first_replay_events"] = len(replay_rows)

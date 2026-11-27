@@ -19,6 +19,7 @@ import unittest
 
 from benchmark_concurrency import (
     apply_token_burst_overrides,
+    graph_first_replays,
     graph_funding_denials,
     graph_retirements,
     recurrent_placement_observation,
@@ -43,6 +44,22 @@ class GraphFundingTests(unittest.TestCase):
                   policy_scratch_limit=900)],
         )
         self.assertEqual(graph_funding_denials(text.splitlines()[0]), [])
+
+
+class GraphReplayTests(unittest.TestCase):
+    def test_distinguishes_dense_fused_and_uninstrumented_scratch(self):
+        prefix = "LIGHTONOCR3 cuda_model_graph_first_replay_rows="
+        text = "\n".join((
+            prefix + "2",
+            prefix + "8 capture=1 head_packet_rows=8 head_bank_bytes=128",
+            prefix + "64 capture=1 head_packet_rows=64 head_bank_bytes=0 fused_head_scratch_bytes=0",
+            prefix + "64 capture=1 head_packet_rows=64 head_bank_bytes=0 fused_head_scratch_bytes=496640",
+        ))
+        rows, banks = graph_first_replays(text)
+        self.assertEqual(rows, [2, 8, 64, 64])
+        self.assertNotIn("fused_head_scratch_bytes", banks[0])
+        self.assertEqual(banks[1]["fused_head_scratch_bytes"], 0)
+        self.assertEqual(banks[2]["fused_head_scratch_bytes"], 496640)
 
 
 class GraphRetirementTests(unittest.TestCase):
