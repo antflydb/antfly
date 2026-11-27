@@ -963,6 +963,18 @@ pub const Selection = struct {
         self.recordWithCooldown(replayed, ns, 8);
     }
 
+    /// Completed device frames can reject a clearly losing replay early.
+    /// Noisy samples still use the five-pair median.
+    pub fn recordCompletedFrame(self: *Selection, replayed: bool, ns: u64, cooldown: u8) void {
+        self.recordWithCooldown(replayed, ns, cooldown);
+        if (self.eager_count != 3 or self.replay_count != 3) return;
+        const slowest_eager = std.mem.max(u64, self.eager[0..3]);
+        const fastest_replay = std.mem.min(u64, self.replay[0..3]);
+        if (fastest_replay > slowest_eager and fastest_replay - slowest_eager > slowest_eager / 4) {
+            self.* = .{ .cooldown = cooldown };
+        }
+    }
+
     pub fn recordWithCooldown(self: *Selection, replayed: bool, ns: u64, cooldown: u8) void {
         if (ns == 0 or !self.sampling) return;
         if (replayed and self.replay_count < 5) {
@@ -982,11 +994,11 @@ pub const Selection = struct {
 
 test "Metal completed audio frames keep a losing route out of the warm tail" {
     var selection: Selection = .{};
-    for (0..5) |_| {
+    for (0..3) |_| {
         try std.testing.expect(!selection.useReplay());
-        selection.recordWithCooldown(false, 4_000_000, 255);
+        selection.recordCompletedFrame(false, 4_000_000, 255);
         try std.testing.expect(selection.useReplay());
-        selection.recordWithCooldown(true, 6_000_000, 255);
+        selection.recordCompletedFrame(true, 6_000_000, 255);
     }
     for (0..255) |_| {
         try std.testing.expect(!selection.useReplay());
@@ -994,6 +1006,17 @@ test "Metal completed audio frames keep a losing route out of the warm tail" {
     }
     try std.testing.expect(!selection.useReplay());
     try std.testing.expect(selection.sampling);
+}
+
+test "Metal completed audio frames keep sampling when the ranges overlap" {
+    var selection: Selection = .{};
+    for (0..5) |i| {
+        try std.testing.expect(!selection.useReplay());
+        selection.recordCompletedFrame(false, 4_000_000, 255);
+        try std.testing.expect(selection.useReplay());
+        selection.recordCompletedFrame(true, if (i == 0) 3_000_000 else 6_000_000, 255);
+    }
+    try std.testing.expectEqual(@as(u8, 255), selection.cooldown);
 }
 
 test "embeddinggemma2 audio selection rejects isolated outliers and retries after cooldown" {

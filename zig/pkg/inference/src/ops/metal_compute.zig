@@ -24344,7 +24344,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 const gpu_ns = metal_runtime.lastFrameGpuNanos(runtime);
                 // Keep a measured loss out of the request tail while still
                 // rechecking long-lived frame recipes periodically.
-                plan.frame_selection.recordWithCooldown(sample.replay, gpu_ns, 255);
+                plan.frame_selection.recordCompletedFrame(sample.replay, gpu_ns, 255);
                 if (audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_AUDIO_STATS"))
                     std.debug.print("metal_audio_schedule completed_frame replay={} gpu_ns={d} eager_samples={d} replay_samples={d}\n", .{ sample.replay, gpu_ns, plan.frame_selection.eager_count, plan.frame_selection.replay_count });
                 break;
