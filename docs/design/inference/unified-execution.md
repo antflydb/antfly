@@ -1345,8 +1345,17 @@ the output payloads matched byte for byte. Baseline and candidate
 same-binary controls were within 0.9% in both directions at p50 and p95.
 CPU lifecycle p50/p95 changed from 661.44/664.68 ms to 661.23/663.56 ms.
 Metal changed from 460.49/462.25 ms to 344.22/345.35 ms. This comparison
-covers the single fixture on CPU and Metal. Multi-window and CUDA
-qualification remain open.
+covers the single fixture on CPU and Metal. CUDA qualification remains
+open.
+
+At `918e1c597c`, the public HTTP route compared the same pinned baseline
+against a 71.49-second Whisper-small recording containing three speech
+windows. On both backends the exact transcript and segment timestamps
+matched across all arms. Baseline and candidate same-binary controls
+were within 0.4% at p50 and p95 in both directions. CPU HTTP p50/p95
+changed from 2049.20/2057.71 ms to 2049.89/2055.17 ms. Metal changed from
+1410.80/1422.07 ms to 1065.45/1075.19 ms. These are whole-request timings
+with the selected backend confirmed in each server log.
 
 At `34296ffb5a`, five Native CPU fixtures passed for resident handoff and
 task output custody. The incremental decoder matched host-reference logits
