@@ -3762,9 +3762,9 @@ pub const CudaCompute = struct {
             if (burst_value.owner != self.compute or cb.ptr != @as(*anyopaque, @ptrCast(self.compute))) return error.ForeignComputeBackend;
             const owner = &self.compute.bounded_decode_graph;
             if (burst_value.rows != owner.rows or burst_value.vocab != owner.vocab or step >= burst_value.steps) return error.InvalidShape;
-            const input = tensorFromCt(input_ct);
-            try ensureF32(input);
-            try ensureCount(input, try checkedMul(owner.rows, owner.hidden));
+            const input_tensor = tensorFromCt(input_ct);
+            try ensureF32(input_tensor);
+            try ensureCount(input_tensor, try checkedMul(owner.rows, owner.hidden));
             const layout = owner.storage_layout orelse return error.InvalidExecutionPlan;
             const head_rows = layout.headPacketRows(owner.rows, owner.vocab);
             if (head_rows == 0) return error.InvalidExecutionPlan;
@@ -3778,7 +3778,7 @@ pub const CudaCompute = struct {
                 const rows = @min(head_rows, owner.rows - first);
                 const count = try checkedMul(rows, owner.hidden);
                 const byte_offset = try checkedMul(try checkedMul(first, owner.hidden), @sizeOf(f32));
-                const buffer = try borrowBufferRange(input.buffer, byte_offset, try checkedMul(count, @sizeOf(f32)));
+                const buffer = try borrowBufferRange(input_tensor.buffer, byte_offset, try checkedMul(count, @sizeOf(f32)));
                 var shape = [_]i64{ @intCast(rows), @intCast(owner.hidden) };
                 // The entire input remains owned by the caller through both
                 // submission and any deferred use of its device storage.
@@ -3787,7 +3787,7 @@ pub const CudaCompute = struct {
                     .dtype = .f32,
                     .shape = &shape,
                     .elem_count = count,
-                    .bf16_mirror = f32MirrorView(input, buffer, count) orelse .{},
+                    .bf16_mirror = f32MirrorView(input_tensor, buffer, count) orelse .{},
                     .owns_buffer = false,
                     .owns_shape = false,
                     .owns_bf16_mirror = false,
