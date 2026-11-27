@@ -3230,13 +3230,15 @@ fn unlockRuntime(runtime: *EnrichmentRuntime, maybe_io: ?std.Io) void {
 
 /// Retained reads freeze committed publications, including pending/failed
 /// request state. Provider retries are future mutations, not read barriers.
-/// Pipeline failure and incomplete graph recovery still require repair.
-fn requireEnrichmentHealthyForQueryCapture(runtime: *EnrichmentRuntime) !void {
+/// The committed cut cannot observe private graph preparation. Graph statement
+/// admission and write visibility can still demand that recovery has finished.
+fn requireEnrichmentHealthyForQueryCapture(runtime: *EnrichmentRuntime, require_graph_recovery: bool) !void {
     const maybe_io = lockRuntime(runtime);
     defer unlockRuntime(runtime, maybe_io);
     if (runtime.worker_failed) return RuntimeError.EnrichmentWorkerFailed;
-    if (comptime @hasField(EnrichmentRuntime, "graph_stage_recovery_pending"))
-        if (runtime.graph_stage_recovery_pending) return RuntimeError.EnrichmentRetryInProgress;
+    if (comptime @hasField(EnrichmentRuntime, "graph_stage_recovery_pending")) {
+        if (require_graph_recovery and runtime.graph_stage_recovery_pending) return RuntimeError.EnrichmentRetryInProgress;
+    }
 }
 
 fn setActiveFailureFingerprint(runtime: *EnrichmentRuntime, fingerprint: u64) void {

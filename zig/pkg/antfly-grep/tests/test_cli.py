@@ -282,6 +282,11 @@ class DecisionHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        if mode == "unavailable":
+            self.send_response(503)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if mode.startswith("embedded-retry-") and len(self.server.index_requests) == 2:
             encoded = json.dumps(
                 {
@@ -1804,7 +1809,17 @@ class CliTests(unittest.TestCase):
             "--table-config", config, "--retries", "0", "-l", "STOP", code=2
         )
         self.assertEqual(result.stdout, b"a.py\n")
+        self.assertIn(b"IndexTemporarilyUnavailable", result.stderr)
         self.assertEqual(len(self.server.index_requests), 2)
+
+        self.server.index_mode = "unavailable"
+        self.server.index_requests = []
+        result = self.raw_cli(
+            "--table-config", config, "--retries", "0", "-l", "STOP", code=2
+        )
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"IndexTemporarilyUnavailable", result.stderr)
+        self.assertEqual(len(self.server.index_requests), 1)
 
         config = self.table_config(
             [self.indexed_doc(f"{i}.py") for i in range(4)], page_size=2

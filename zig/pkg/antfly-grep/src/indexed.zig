@@ -1388,7 +1388,8 @@ const Fetch = struct {
                 };
                 if (status == 401 or status == 403) return error.IndexAuthorizationFailed;
                 if (!response.ok()) {
-                    if ((status != 429 and status != 408 and status < 500) or attempt >= self.options.retries) return error.IndexQueryFailed;
+                    if (attempt >= self.options.retries) return if (status == 503) error.IndexTemporarilyUnavailable else error.IndexQueryFailed;
+                    if (status != 429 and status != 408 and status < 500) return error.IndexQueryFailed;
                     const delay = if (response.header("retry-after")) |raw| @import("http_date.zig").retryMilliseconds(raw, std.Io.Clock.real.now(self.io).toSeconds(), 30000) orelse 0 else 0;
                     try backoff(self, attempt, delay);
                     attempt += 1;
@@ -1450,6 +1451,7 @@ const Fetch = struct {
                     attempt += 1;
                     continue;
                 }
+                if (result_status == 503) return error.IndexTemporarilyUnavailable;
                 if (request.snapshot == null and self.options.sourced()) {
                     const result = envelope.array.items[0];
                     const pinned = try document.string(result, "remote_snapshot");
