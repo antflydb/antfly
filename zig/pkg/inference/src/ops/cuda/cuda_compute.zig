@@ -22742,6 +22742,22 @@ fn SourceF32Operands(comptime count: usize) type {
     };
 }
 
+test "CUDA source conversion layout resolves mixed operands before device binding" {
+    const Layout = SourceF32Operands(3).Layout;
+    const alignment = buffer_mod.DeviceBuffer.allocation_alignment;
+    const layout = try Layout.resolve(.{ 3, null, 9 }, 24);
+    try std.testing.expectEqual(buffer_mod.ByteSpan{ .offset = 0, .bytes = 12 }, layout.spans[0]);
+    try std.testing.expectEqual(buffer_mod.ByteSpan{}, layout.spans[1]);
+    try std.testing.expectEqual(buffer_mod.ByteSpan{ .offset = alignment, .bytes = 36 }, layout.spans[2]);
+    try std.testing.expectEqual(buffer_mod.ByteSpan{ .offset = 2 * alignment, .bytes = 24 }, layout.extra);
+    try std.testing.expectEqual(2 * alignment + 24, layout.bytes);
+
+    const empty = try Layout.resolve(.{ 3, null, 0 }, 0);
+    try std.testing.expectEqual(buffer_mod.ByteSpan{ .offset = alignment, .bytes = 0 }, empty.spans[2]);
+    try std.testing.expectEqual(alignment, empty.bytes);
+    try std.testing.expectError(error.InvalidShape, Layout.resolve(.{ std.math.maxInt(usize), null, null }, 0));
+}
+
 fn bf16SourceOperationOp(ctx: *anyopaque, request: *const ops.Bf16SourceOperation) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (sourceScalarStorageOp(ctx, .linear) != .bf16) return null;
