@@ -3919,6 +3919,7 @@ pub const CudaCompute = struct {
             const ragged_calls = compute.lighton_recurrent.ragged_batch_calls;
             if (scope) |*active_scope| compute.execution_scope = active_scope;
             owner.bound_recurrent_scratch_bytes = 0;
+            owner.next_ffn_output = 0;
             owner.active = true;
             callback(context, self) catch |failure| {
                 std.log.warn("LightOn decoder graph forward failed: phase={s} error={s}", .{ @tagName(phase), @errorName(failure) });
@@ -3994,6 +3995,7 @@ pub const CudaCompute = struct {
                     .declared_attention_output_bytes = if (layout.attention_output) |span| span.bytes else 0,
                     .declared_recurrent_output_bytes = if (layout.recurrent_output) |span| span.bytes else 0,
                     .declared_ffn_scratch_bytes = if (layout.ffn_workspace) |span| span.bytes else 0,
+                    .declared_ffn_output_bank_bytes = if (layout.ffn_outputs) |span| span.bytes else 0,
                     .head_bytes = layout.head_bytes,
                     .shared_head_scratch_bytes = if (layout.shared_head_workspace) |span| span.bytes else 0,
                     .head_packet_rows = layout.headPacketRows(owner.rows, owner.vocab),
@@ -16121,12 +16123,19 @@ fn runCapturedDenseFfn(self: *CudaCompute, request: CudaCompute.DenseSiluFfnBloc
     const activated = try scratch.borrowRange(0, wide_count * @sizeOf(u16));
     const gate = try scratch.borrowRange(layout.gate_offset, wide_count * @sizeOf(f32));
     const up = try scratch.borrowRange(layout.up_offset, wide_count * @sizeOf(f32));
-    var output = try OwnedF32Output.alloc2(self, layout.rows, layout.hidden, narrow_count);
-    defer output.deinit();
+    const output = try capturedFfnOutput(self, request, input, norm, weights, layout);
+    errdefer freeTensor(self, output);
     errdefer self.ctx.synchronize() catch {};
     try runDenseFfnGateUp(self, request, input, norm, weights, normalized, gate, up, null);
-    try runDenseFfnDown(self, .{ .separate = .{ .gate = gate, .up = up } }, weights[2], layout.rows, layout.hidden, layout.intermediate, input, activated, output.buffer, null);
-    return output.intoTensor();
+    try runDenseFfnDown(self, .{ .separate = .{ .gate = gate, .up = up } }, weights[2], layout.rows, layout.hidden, layout.intermediate, input, activated, tensorFromCt(output).buffer, null);
+    return output;
+}
+
+fn capturedFfnOutput(self: *CudaCompute, request: CudaCompute.DenseSiluFfnBlockRequest, input: *const CudaTensor, norm: *const CudaTensor, weights: [3]*const CudaTensor, layout: CudaCompute.DenseFfnProgram.Layout) !CT {
+    const sources = [_]buffer_mod.DeviceBuffer{ input.buffer, norm.buffer, weights[0].buffer, weights[1].buffer, weights[2].buffer };
+    const output = try self.bounded_decode_graph.bindFfnOutput(layout, &sources);
+    const bytes = try checkedMul(try checkedMul(layout.rows, layout.hidden), @sizeOf(f32));
+    return try self.graphLayerOutputTensor(try output.borrowRange(0, bytes), request.rows, request.hidden);
 }
 
 fn lightOnCompactBf16FfnBlock(self: *CudaCompute, request: CudaCompute.DenseSiluFfnBlockRequest, input: *const CudaTensor, norm: *const CudaTensor, weights: [3]*const CudaTensor) !CT {
@@ -16152,10 +16161,11 @@ fn lightOnCompactBf16FfnBlock(self: *CudaCompute, request: CudaCompute.DenseSilu
     const gate = try scratch.borrowRange(layout.gate_offset, wide_count * @sizeOf(u16));
     const up = try scratch.borrowRange(layout.up_offset, wide_count * @sizeOf(u16));
     const projected = try scratch.borrowRange(layout.gate_offset, narrow_count * @sizeOf(u16));
-    var output = try allocDeviceBuffer(self, try checkedMul(narrow_count, 4));
-    errdefer releaseDeviceBuffer(self, &output);
-    const shape = try allocShape2(self.allocator, rows, hidden);
-    errdefer self.allocator.free(shape);
+    const output = if (assigned != null)
+        try capturedFfnOutput(self, request, input, norm, weights, layout)
+    else
+        (try allocUninitF32ShapeOp(self, &.{ @intCast(rows), @intCast(hidden) })).?;
+    errdefer freeTensor(self, output);
     errdefer self.ctx.synchronize() catch {};
     try self.lighton_activation.runRms(&self.ctx, .{ normalized.ptr, input.buffer.ptr, norm.buffer.ptr }, @intCast(rows), @intCast(hidden), request.eps, if (std.math.approxEqAbs(f32, request.weight_offset, 0, 1e-6)) 0 else request.weight_offset);
     self.stats.launch_norm += 1;
@@ -16166,11 +16176,11 @@ fn lightOnCompactBf16FfnBlock(self: *CudaCompute, request: CudaCompute.DenseSilu
     _ = try blas.matmulBf16WeightBf16OutWithTuning(&self.ctx, up, normalized, weights[1].buffer, workspace, rows, hidden, intermediate, .{});
     try self.lighton_activation.runSeparateBf16Inputs(&self.ctx, .{ activated.ptr, gate.ptr, up.ptr }, @intCast(wide_count));
     _ = try blas.matmulBf16WeightBf16OutWithTuning(&self.ctx, projected, activated, weights[2].buffer, workspace, rows, intermediate, hidden, .{});
-    try self.lighton_activation.runBf16Residual(&self.ctx, .{ output.ptr, projected.ptr, input.buffer.ptr }, @intCast(narrow_count));
+    try self.lighton_activation.runBf16Residual(&self.ctx, .{ tensorFromCt(output).buffer.ptr, projected.ptr, input.buffer.ptr }, @intCast(narrow_count));
     self.stats.launch_elementwise += 2;
     self.stats.bf16_cublaslt_linear_calls += 3;
     self.stats.bf16_decode_output_calls += 3;
-    return createTensor(self, output, shape, narrow_count);
+    return output;
 }
 
 fn lightOnFfnBf16Down(self: *CudaCompute, sources: LightOnActivationSources, down: *const CudaTensor, rows: usize, hidden: usize, intermediate: usize, residual: ?*const CudaTensor) !CT {
