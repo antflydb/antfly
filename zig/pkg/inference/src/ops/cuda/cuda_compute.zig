@@ -43730,7 +43730,21 @@ test "LightOnOCR3 CUDA batched attention preserves page bindings and validates b
         const parent = try cb.fromFloat32Shape(initial, &.{ 4, @intCast(width) });
         defer cb.free(parent);
         const assigned: PackedAttentionDestination = .{ .parent = parent, .row_offset = 1 };
-        try std.testing.expectEqual(parent, (try tryLightOnBatchedAttention(&compute, qt, kt, vt, attention, &views, heads, kv_heads, 256, assigned)).?);
+        {
+            const Workspace = @import("../../execution/stream_workspace.zig");
+            const module = @import("paged_attention_bf16.zig");
+            const bytes = (try module.ScratchLayout.init(views.len, heads, kv_heads, 256, lengths[1], module.useChunk128(compute.lighton_attention_chunk128, heads))).bytes;
+            var plan: Workspace.Plan = .{};
+            try plan.declareScratch(bytes);
+            const layout = try plan.layout(0);
+            var bank = try allocDeviceBufferOrdinary(&compute, layout.bytes);
+            defer releaseDeviceBuffer(&compute, &bank);
+            var scope = try Workspace.Scope.bind(&plan, layout, bank.ptr, bank.len);
+            compute.execution_scope = &scope;
+            defer compute.execution_scope = null;
+            try std.testing.expectEqual(parent, (try tryLightOnBatchedAttention(&compute, qt, kt, vt, attention, &views, heads, kv_heads, 256, assigned)).?);
+            try std.testing.expect(scope.complete());
+        }
         const joined = try cb.toFloat32(parent, a);
         defer a.free(joined);
         try std.testing.expectEqualSlices(f32, got, joined[width .. 3 * width]);
