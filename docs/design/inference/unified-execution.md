@@ -1330,7 +1330,10 @@ control and comparison arms. The 32-sample-per-side comparison measured
 The largest coordinate difference between routes was 2.98e-7 across
 the two 768-component vectors. The fixed FFT route passed the independent
 log-mel reference test. This comparison used one candidate server with
-the DFT override for the reference.
+the DFT override for the reference. The same 32-sample controls passed
+after eliminating the intermediate mel buffer at `843757726b`. DFT
+measured 225.93/228.53 ms and FFT measured 225.99/228.62 ms. Both routes
+again repeated bitwise, with a maximum cross-route difference of 2.98e-7.
 Final closure requires the remaining tier-one coverage, including DECIDE
 on the remaining supported targets, Inkling 2 Mini, and the E2B comparative
 deficits above, as well as normal PR review and CI. L4 and A100 remain user-deferred.
