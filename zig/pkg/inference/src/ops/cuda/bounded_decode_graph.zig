@@ -197,12 +197,17 @@ pub const Descriptor = struct {
     hidden: usize,
     vocab: usize,
     future_tokens: usize,
+    head_row_limit: ?usize = null,
     attention_geometry: ?DecodeScratch.Geometry = null,
     attention_layers: usize,
     recurrent_layers: usize,
     pub fn layout(self: Descriptor) !StorageLayout {
-        const value = try StorageLayout.init(self.rows, self.hidden, self.vocab, self.key.len);
+        var value = try StorageLayout.init(self.rows, self.hidden, self.vocab, self.key.len);
         if (self.epoch == 0 or self.positions.len != self.rows * 3) return error.InvalidShape;
+        if (self.head_row_limit) |rows| {
+            if (rows == 0) return error.InvalidShape;
+            if (value.head_bytes != 0) value.head_bytes = (value.head_bytes / self.rows) * @min(rows, self.rows);
+        }
         return value;
     }
     pub const DispatchCounts = struct { attention: usize, ragged_recurrent: usize };
@@ -287,7 +292,8 @@ pub const GraphPhase = struct {
     }
 
     pub fn matchesOwner(self: *const GraphPhase, owner: *const Module) bool {
-        return owner.matches(self.descriptor) and std.meta.eql(owner.attention_scratch, self.attention_scratch);
+        const storage = owner.storage_layout orelse return false;
+        return owner.matches(self.descriptor) and storage.head_bytes == self.storage_layout.head_bytes and std.meta.eql(owner.attention_scratch, self.attention_scratch);
     }
 
     fn arenaRequest(self: *const GraphPhase, layout: plan_mod.Layout) funding_mod.Request {
@@ -640,6 +646,33 @@ test "bounded CUDA decoder funds one stable attention workspace for both packets
     try std.testing.expectError(error.InvalidExecutionPlan, owner.bindAttentionWorkspace(full.len + 1));
     owner.metadata.len -= 1;
     try std.testing.expectError(error.InvalidExecutionPlan, owner.bindAttentionWorkspace(tail.len));
+}
+
+test "captured graph head packets fund the exact smaller bank and invalidate a full-width binding" {
+    var key = [_]u64{1};
+    const positions: [97 * 3]u32 = @splat(0);
+    const descriptor = Descriptor{ .epoch = 1, .key = &key, .positions = &positions, .rows = 97, .hidden = 2560, .vocab = 248320, .future_tokens = 128, .attention_layers = 0, .recurrent_layers = 1 };
+    const full = try descriptor.layout();
+    var owner: Module = .{};
+    owner.installStorageGeometry(full, descriptor.rows, descriptor.hidden, descriptor.vocab, descriptor.positions);
+    owner.epoch_id = descriptor.epoch;
+    owner.key = &key;
+    owner.recurrent_layers = descriptor.recurrent_layers;
+    var phase: GraphPhase = undefined;
+    try phase.initInto(descriptor);
+    try std.testing.expect(phase.matchesOwner(&owner));
+
+    var packet = descriptor;
+    packet.head_row_limit = 32;
+    try phase.initInto(packet);
+    const layout = phase.storage_layout;
+    const request = packet.storageRequestFor(layout);
+    try std.testing.expectEqual(@as(usize, 32 * 248320 * 4), layout.head_bytes);
+    try std.testing.expectEqual(full.metadata_bytes, layout.metadata_bytes);
+    try std.testing.expectEqual(layout.metadata_bytes + layout.head_bytes, (try request.captured_storage.amounts()).backend_scratch_bytes);
+    try std.testing.expect(!phase.matchesOwner(&owner));
+    owner.storage_layout = layout;
+    try std.testing.expect(phase.matchesOwner(&owner));
 }
 
 test "captured sequence storage layout packs narrow and wide readbacks with aligned physical planes" {

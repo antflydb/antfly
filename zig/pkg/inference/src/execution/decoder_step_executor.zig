@@ -1001,7 +1001,7 @@ pub const Executor = struct {
         var position_snapshot: [384]u32 = undefined;
         @memcpy(position_snapshot[0..positions.len], positions);
         const graph_owner = @import("../ops/cuda/bounded_decode_graph.zig");
-        const descriptor = graph_owner.Descriptor{ .epoch = self.lighton_cuda_execution_id, .key = key.words[0..key.len], .positions = position_snapshot[0..positions.len], .rows = claimed.len, .hidden = self.context.gpt_config.hidden_size, .vocab = self.context.gpt_config.vocab_size, .future_tokens = max_future, .attention_geometry = .{ .heads = self.context.gpt_config.num_attention_heads, .kv_heads = self.context.gpt_config.effectiveKVHeads(), .dim = self.context.gpt_config.headDim() }, .attention_layers = attention_count, .recurrent_layers = self.context.gpt_config.num_hidden_layers - attention_count };
+        const descriptor = graph_owner.Descriptor{ .epoch = self.lighton_cuda_execution_id, .key = key.words[0..key.len], .positions = position_snapshot[0..positions.len], .rows = claimed.len, .hidden = self.context.gpt_config.hidden_size, .vocab = self.context.gpt_config.vocab_size, .future_tokens = max_future, .head_row_limit = if (platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_HEAD_PACKETS")) 32 else null, .attention_geometry = .{ .heads = self.context.gpt_config.num_attention_heads, .kv_heads = self.context.gpt_config.effectiveKVHeads(), .dim = self.context.gpt_config.headDim() }, .attention_layers = attention_count, .recurrent_layers = self.context.gpt_config.num_hidden_layers - attention_count };
         var funding_phase: graph_owner.GraphPhase = undefined;
         try funding_phase.initInto(descriptor);
         defer funding_phase.close(.{ .boundary = self.context.cleanupEpoch() }) catch platform.inference_process_supervisor.restartWorker();
@@ -1083,9 +1083,7 @@ pub const Executor = struct {
                     const input = if (step == 0) try claim.input() else try claim.embedNext(render.burst, 0);
                     const hidden = try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(pipeline.context.cb, pipeline.context.allocator, pipeline.context.gpt_config.*, input, .{}, if (render.items.len > 64) 1 else render.items.len, if (render.items.len > 64) render.items.len else 1, &context.context, null);
                     defer pipeline.context.cb.free(hidden.hidden);
-                    const logits = try claim.projectHead(pipeline.context.cb, hidden.hidden, render.head);
-                    defer pipeline.context.cb.free(logits);
-                    try render.burst.argmax(logits, step);
+                    try claim.projectGreedyHead(pipeline.context.cb, render.burst, hidden.hidden, render.head, step);
                     try claim.advance();
                 }
             }

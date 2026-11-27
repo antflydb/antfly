@@ -3542,19 +3542,22 @@ pub const CudaCompute = struct {
             try burst.argmax(logits, step);
         }
         pub fn argmax(burst: *@This(), logits: CT, step: usize) !void {
-            if (step >= burst.steps) return error.InvalidShape;
+            return burst.argmaxRange(logits, step, 0, burst.rows);
+        }
+        fn argmaxRange(burst: *@This(), logits: CT, step: usize, first: usize, rows: usize) !void {
+            if (step >= burst.steps or first > burst.rows or rows > burst.rows - first) return error.InvalidShape;
             const self = burst.owner;
             const input = tensorFromCt(logits);
             try ensureF32(input);
-            try ensureCount(input, try checkedMul(burst.rows, burst.vocab));
+            try ensureCount(input, try checkedMul(rows, burst.vocab));
             const bank = tensorFromCt(burst.bank).buffer;
-            const bytes = try checkedMul(burst.rows, @sizeOf(u32));
-            const output = buffer_mod.DeviceBuffer{ .ptr = bank.ptr + step * bytes, .len = bytes };
+            const bytes = try checkedMul(rows, @sizeOf(u32));
+            const output = buffer_mod.DeviceBuffer{ .ptr = bank.ptr + (step * burst.rows + first) * @sizeOf(u32), .len = bytes };
             burst.drained = false;
             const launched = if (burst.suppress_count == 0)
-                try self.kernels.launchArgmaxRowsF32(&self.ctx, output, input.buffer, 0, burst.rows, burst.vocab)
+                try self.kernels.launchArgmaxRowsF32(&self.ctx, output, input.buffer, 0, rows, burst.vocab)
             else
-                try self.kernels.launchArgmaxRowsSuppressF32(&self.ctx, output, input.buffer, burst.suppress, 0, burst.rows, burst.vocab, burst.suppress_count);
+                try self.kernels.launchArgmaxRowsSuppressF32(&self.ctx, output, input.buffer, burst.suppress, 0, rows, burst.vocab, burst.suppress_count);
             if (!launched) return error.UnsupportedOperation;
             self.stats.launch_argmax += 1;
         }
@@ -3755,7 +3758,31 @@ pub const CudaCompute = struct {
             tensorFromCt(bank).owns_buffer = false;
             return .{ .owner = self.compute, .bank = bank, .embedding_weight = embedding, .suppress = .{}, .suppress_count = 0, .rows = owner.rows, .steps = 2, .hidden = owner.hidden, .vocab = vocab };
         }
-        pub fn projectHead(self: *@This(), cb: *const ops.ComputeBackend, input_ct: CT, weight: CT) !CT {
+        pub fn projectGreedyHead(self: *@This(), cb: *const ops.ComputeBackend, burst_value: *LightOnTokenBurst, input_ct: CT, weight: CT, step: usize) !void {
+            if (burst_value.owner != self.compute or cb.ptr != @as(*anyopaque, @ptrCast(self.compute))) return error.ForeignComputeBackend;
+            const owner = &self.compute.bounded_decode_graph;
+            if (burst_value.rows != owner.rows or burst_value.vocab != owner.vocab or step >= burst_value.steps) return error.InvalidShape;
+            try ensureCount(tensorFromCt(input_ct), try checkedMul(owner.rows, owner.hidden));
+            const head_rows = if (self.head_destination) |bank| bank.len / try checkedMul(owner.vocab, @sizeOf(f32)) else owner.rows;
+            if (head_rows == 0) return error.InvalidExecutionPlan;
+            if (head_rows >= owner.rows) {
+                const logits = try self.projectHead(cb, input_ct, weight);
+                defer cb.free(logits);
+                return burst_value.argmax(logits, step);
+            }
+            var first: usize = 0;
+            while (first < owner.rows) {
+                const rows = @min(head_rows, owner.rows - first);
+                const packet_input = try sliceRows2DOp(self.compute, input_ct, first, rows, owner.hidden);
+                defer cb.free(packet_input);
+                const logits = try cb.observeBackendEntry(.linear_no_bias, &linearNoBiasWithDestination, .{ self.compute, packet_input, weight, rows, owner.hidden, owner.vocab, false, self.head_destination });
+                defer cb.free(logits);
+                try burst_value.argmaxRange(logits, step, first, rows);
+                first += rows;
+            }
+        }
+
+        fn projectHead(self: *@This(), cb: *const ops.ComputeBackend, input_ct: CT, weight: CT) !CT {
             const owner = &self.compute.bounded_decode_graph;
             std.debug.assert(cb.ptr == @as(*anyopaque, @ptrCast(self.compute)));
             const destination = self.head_destination orelse
@@ -46869,6 +46896,18 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
     const actual = try cb.toFloat32(projected, a);
     defer a.free(actual);
     try std.testing.expectEqualSlices(f32, &.{ 2, 3, 5, 7 }, actual);
+
+    // One row fits in the assigned bank. The two decisions must occupy
+    // different positions in the second token step after bank reuse.
+    claim.head_destination.?.len = 2 * @sizeOf(f32);
+    const packet_input = try cb.fromFloat32Shape(&.{ 3, 2, 5, 7 }, &.{ 2, 2 });
+    defer cb.free(packet_input);
+    try claim.projectGreedyHead(&cb, &burst, packet_input, weight, 1);
+    const packet_embeddings = try burst.embedding(1);
+    defer cb.free(packet_embeddings);
+    const packet_actual = try cb.toFloat32(packet_embeddings, a);
+    defer a.free(packet_actual);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 3, 5, 7 }, packet_actual);
 }
 
 test "LightOnOCR3 CUDA bounded GEMM refresh drains at an exclusive boundary and refuses capture" {
