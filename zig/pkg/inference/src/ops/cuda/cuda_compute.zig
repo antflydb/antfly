@@ -16354,7 +16354,7 @@ fn tryCublasLtProjectorLinear(
     terms: usize,
 ) !bool {
     const blas = &(self.cublaslt orelse return false);
-    if (self.execution_scope != null or self.debug_cuda_graph_capture_active) return false;
+    if (self.execution_scope != null or self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return false;
     if (!cudaCublasLtEnabled() or self.ctx.info.compute_major < 8) return false;
     const count = try checkedMul(rows, in_dim);
     if (input.dtype != .f32 or input.elem_count != count) return false;
@@ -64280,6 +64280,21 @@ test "Gemma4 CUDA projector required scratch reclaims the quota deficit and pres
     defer large.free(&compute.ctx);
     try std.testing.expectEqual(evictions + 3, compute.stats.temp_buffer_evictions);
 }
+test "CUDA projector declines optional workspace during context capture" {
+    var compute = metadataOnlyTestCompute();
+    compute.ctx.info.compute_major = 8;
+    compute.ctx.debug_graph_capture_active = true;
+    compute.cublaslt = @as(cublaslt_mod.CublasLt, undefined);
+    const allocator = std.testing.allocator;
+    var enabled = try TestEnvGuard.captureAndClear(allocator, "ANTFLY_INFERENCE_CUDA_CUBLASLT");
+    defer enabled.restore(allocator);
+
+    // Overflow would be the first result if the receiver tried to size scratch.
+    const input: CudaTensor = .{ .buffer = .{}, .shape = &.{}, .elem_count = 0, .dtype = .f32 };
+    try std.testing.expect(!try tryCublasLtProjectorLinear(&compute, .{}, &input, .{}, std.math.maxInt(usize), 2, 1, true, 1));
+    try std.testing.expectEqual(@as(u64, 0), compute.stats.device_alloc_calls);
+}
+
 test "Gemma4 CUDA projector optional scratch leaves graph slots available after admission and denial" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     var compute = try CudaCompute.initWithKernelJitForProfile(std.testing.allocator, .{}, .gemma4);
