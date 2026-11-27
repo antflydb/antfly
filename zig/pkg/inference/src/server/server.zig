@@ -10391,7 +10391,7 @@ pub const Node = struct {
         // unwind follows the same page/pool lifetime and never reserves twice.
         try control.check();
         try admission.prepareDenseFfn(factory.limits, control);
-        try ctx.lockStep(control);
+        try ctx.lockPageSetup(control);
         const before = ctx.budget;
         const chunk = runtime.tier.memory.reserveGptGenerationAtLargestChunk(&ctx.budget, &components, estimate.token_count, @intCast(max_tokens), ceiling) catch |err| {
             ctx.unlockStep();

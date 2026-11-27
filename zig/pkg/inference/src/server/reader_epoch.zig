@@ -723,6 +723,12 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             return .{};
         }
 
+        /// Page setup can reserve budget and bind independently prepared
+        /// storage. Numerical foreground phases acquire lockStep separately.
+        pub fn lockPageSetup(ctx: *LightOnStreamContext, control: InferenceExecutionControl) !void {
+            try ctx.pageAccess(control, true).acquire();
+        }
+
         pub fn lockStep(ctx: *LightOnStreamContext, control: InferenceExecutionControl) !void {
             try ctx.pageAccess(control, true).acquire();
             ctx.invalidateCudaDecodeGraph(.foreground_step);
