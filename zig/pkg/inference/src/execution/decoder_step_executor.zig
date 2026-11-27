@@ -1207,7 +1207,7 @@ pub const Executor = struct {
                 defer context.deinit();
                 context.context.prepared_lighton_decode = true;
                 if (try self.tryLightOnCudaDecodeGraph(claimed, mixed[0..claimed.len], ids[0..claimed.len], &context.context)) |result| return result;
-                try @import("../ops/cuda/cuda_compute.zig").CudaCompute.invalidateLightOnDecodeGraphWithCleanup(self.context.cb, .{ .boundary = self.context.cleanupEpoch(), .operation = self.context.cb.operationToken() });
+                try @import("../ops/cuda/cuda_compute.zig").CudaCompute.invalidateLightOnDecodeGraphWithCleanup(self.context.cb, .{ .boundary = self.context.cleanupEpoch(), .operation = self.context.cb.operationToken() }, .eager_decode);
                 // Eager decode introduces shapes absent from a mixed prefix
                 // frame; reserve bounded plan slots before enqueueing them.
                 try @import("../ops/cuda/cuda_compute.zig").CudaCompute.prepareLightOnMatmulFrame(self.context.cb);
@@ -1514,7 +1514,7 @@ pub const Executor = struct {
                 }
                 if (!pure_decode) {
                     const C = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
-                    try C.invalidateLightOnDecodeGraphWithCleanup(self.context.cb, .{ .boundary = self.context.cleanupEpoch(), .operation = self.context.cb.operationToken() });
+                    try C.invalidateLightOnDecodeGraphWithCleanup(self.context.cb, .{ .boundary = self.context.cleanupEpoch(), .operation = self.context.cb.operationToken() }, .mixed_prefill);
                     prepare_cuda_matmul = true;
                 }
             }
@@ -1651,7 +1651,7 @@ pub const Executor = struct {
             if (comptime build_options.enable_cuda) {
                 if (cuda_lighton and self.lighton_cuda_execution_id != 0) {
                     if (try self.tryLightOnCudaDecodeGraph(claimed, items, input_ids, &owned_ctx.context)) |result| return result;
-                    try @import("../ops/cuda/cuda_compute.zig").CudaCompute.invalidateLightOnDecodeGraphWithCleanup(self.context.cb, .{ .boundary = self.context.cleanupEpoch(), .operation = self.context.cb.operationToken() });
+                    try @import("../ops/cuda/cuda_compute.zig").CudaCompute.invalidateLightOnDecodeGraphWithCleanup(self.context.cb, .{ .boundary = self.context.cleanupEpoch(), .operation = self.context.cb.operationToken() }, .eager_decode);
                 }
                 if (cuda_lighton) try @import("../ops/cuda/cuda_compute.zig").CudaCompute.prepareLightOnMatmulFrame(self.context.cb);
                 if (cuda_lighton) if (try self.tryLightOnCudaTokenBurst(claimed, items, input_ids, &owned_ctx.context)) |result| return result;

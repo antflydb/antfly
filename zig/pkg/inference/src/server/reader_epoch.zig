@@ -560,7 +560,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             // not ctx's now-empty getter. Destroy captured addresses BEFORE KV
             // teardown invokes strict raw recycle callbacks.
             if (comptime build_options.enable_cuda) if (ctx.cb) |*cb| if (cb.kind() == .cuda) {
-                @import("../ops/cuda/cuda_compute.zig").CudaCompute.invalidateLightOnDecodeGraphWithCleanup(cb, .{ .boundary = cleanup_epoch, .operation = cb.operationToken() }) catch platform.inference_process_supervisor.restartWorker();
+                @import("../ops/cuda/cuda_compute.zig").CudaCompute.invalidateLightOnDecodeGraphWithCleanup(cb, .{ .boundary = cleanup_epoch, .operation = cb.operationToken() }, .reader_epoch) catch platform.inference_process_supervisor.restartWorker();
             };
             if (ctx.cb != null) ctx.storage.deinitWithBoundary(cleanup_epoch);
             ctx.manager.deinit();
@@ -723,7 +723,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
 
         pub fn lockStep(ctx: *LightOnStreamContext, control: InferenceExecutionControl) !void {
             try ctx.pageAccess(control, true).acquire();
-            ctx.invalidateCudaDecodeGraph();
+            ctx.invalidateCudaDecodeGraph(.foreground_step);
         }
         // Private park/restore owner only: it already owns the pause reservation.
         // This method neither invalidates the graph nor waits on its OWN pause.
@@ -737,16 +737,16 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             access.pause = null;
             access.acquireForCleanup();
         }
-        fn invalidateCudaDecodeGraph(ctx: *LightOnStreamContext) void {
+        fn invalidateCudaDecodeGraph(ctx: *LightOnStreamContext, reason: @import("../ops/cuda/cuda_compute.zig").CudaCompute.GraphRetirement) void {
             // Vision and other foreground phases may resize shared CUDA
             // scratch. Retire captured addresses before that phase executes.
             if (comptime build_options.enable_cuda) if (ctx.cb) |*cb| if (cb.kind() == .cuda) {
-                @import("../ops/cuda/cuda_compute.zig").CudaCompute.invalidateLightOnDecodeGraphWithCleanup(cb, .{ .boundary = ctx.cleanup_owner.epoch(), .operation = cb.operationToken() }) catch platform.inference_process_supervisor.restartWorker();
+                @import("../ops/cuda/cuda_compute.zig").CudaCompute.invalidateLightOnDecodeGraphWithCleanup(cb, .{ .boundary = ctx.cleanup_owner.epoch(), .operation = cb.operationToken() }, reason) catch platform.inference_process_supervisor.restartWorker();
             };
         }
         pub fn lockStepForCleanup(ctx: *LightOnStreamContext) void {
             ctx.pageAccess(.{}, true).acquireForCleanup();
-            ctx.invalidateCudaDecodeGraph();
+            ctx.invalidateCudaDecodeGraph(.foreground_cleanup);
         }
         pub fn unlockStep(ctx: *LightOnStreamContext) void {
             ctx.step_mutex.unlock();

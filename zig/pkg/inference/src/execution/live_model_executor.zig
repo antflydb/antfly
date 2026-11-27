@@ -115,7 +115,7 @@ const RuntimeContext = struct {
     fn resetStateWithCleanup(self: *RuntimeContext, current: @import("cleanup_context.zig").Context) !void {
         if (comptime @import("build_options").enable_cuda) if (self.cb.kind() == .cuda) {
             const C = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
-            if (current.boundary != null or current.outside_execution) try C.invalidateLightOnDecodeGraphWithCleanup(&self.cb, current) else C.invalidateLightOnDecodeGraph(&self.cb);
+            if (current.boundary != null or current.outside_execution) try C.invalidateLightOnDecodeGraphWithCleanup(&self.cb, current, .state_mutation) else C.invalidateLightOnDecodeGraph(&self.cb);
         };
         // Recurrent storage belongs to this immutable model/runtime, not one
         // prefill call. Reset its contents while retaining the same warmed

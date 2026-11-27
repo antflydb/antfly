@@ -4000,7 +4000,9 @@ pub const CudaCompute = struct {
         if (!acceptsPhysicalImplementation(cb.vtable)) return error.UnsupportedReaderEpochBackend;
         try beginRequestUsing(cb.ptr, current);
     }
-    pub fn invalidateLightOnDecodeGraphWithCleanup(cb: *const ops.ComputeBackend, current: CacheCleanup) !void {
+    pub const GraphRetirement = enum { state_mutation, reader_epoch, foreground_step, foreground_cleanup, mixed_prefill, eager_decode };
+
+    pub fn invalidateLightOnDecodeGraphWithCleanup(cb: *const ops.ComputeBackend, current: CacheCleanup, reason: GraphRetirement) !void {
         if (!acceptsPhysicalImplementation(cb.vtable)) return error.UnsupportedReaderEpochBackend;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (!self.lighton_decode_graph_enabled and self.bounded_decode_graph.metadata.ptr == 0 and self.bounded_decode_graph.arena.ptr == 0 and self.bounded_decode_graph.head.ptr == 0 and self.bounded_decode_graph.graph == null and self.bounded_decode_graph.pending_graph == null) return;
@@ -4009,10 +4011,15 @@ pub const CudaCompute = struct {
             var local = try @import("../../execution/cleanup_owner.zig").Owner.beginOutsideCleanup();
             defer local.finishAfterUnlock();
             const scoped: CacheCleanup = .{ .boundary = try local.outsideCleanupEpoch() };
-            return invalidateLightOnDecodeGraphWithCleanup(cb, scoped);
+            return invalidateLightOnDecodeGraphWithCleanup(cb, scoped, reason);
         }
         if (!self.bounded_decode_graph.mutex.tryLock()) return error.ReaderEpochBackendBusy;
         defer self.bounded_decode_graph.mutex.unlock();
+        const owner = &self.bounded_decode_graph;
+        if (owner.phase != .disabled and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+            std.debug.print("LIGHTONOCR3 cuda_model_graph_retired reason={s} phase={s} epoch={d} rows={d} progress={d}\n", .{
+                @tagName(reason), @tagName(owner.phase), owner.epoch_id, owner.rows, owner.progress,
+            });
         try self.clearCapturedGraphWithCleanup(current);
     }
     pub fn externalPrefillEnabled(cb: *const ops.ComputeBackend) bool {
@@ -18233,7 +18240,7 @@ fn allocLightOnStateBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuf
 
 fn invalidateCapturedGraphForMutation(self: *CudaCompute, backend: *const ops.ComputeBackend, current: CacheCleanup) !void {
     if (current.boundary != null or current.outside_execution) {
-        try CudaCompute.invalidateLightOnDecodeGraphWithCleanup(backend, current);
+        try CudaCompute.invalidateLightOnDecodeGraphWithCleanup(backend, current, .state_mutation);
     } else if (self.lighton_decode_graph_enabled) {
         // Legacy raw/empty custody only. No inferred outside authority.
         self.bounded_decode_graph.invalidate(&self.ctx);
