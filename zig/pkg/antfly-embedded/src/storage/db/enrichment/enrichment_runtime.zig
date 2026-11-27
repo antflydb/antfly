@@ -22730,6 +22730,32 @@ pub fn runNativePdfOcrCoordinatorIntegration(
     ));
     coordinator.beginOperation(30_000);
 
+    const DelayedSink = struct {
+        pages: usize = 0,
+
+        fn unit(raw: *anyopaque, _: *document_extraction_mod.Unit) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            platform_time.sleepNs(std.time.ns_per_ms);
+            self.pages += 1;
+        }
+    };
+    var delayed_sink = DelayedSink{};
+    var inspection = document_extraction_mod.PdfOperationDeadline.init(30_000);
+    inspection.timeout_error = error.PdfInspectionTimeout;
+    const initial_deadline = inspection.deadline_ns;
+    try document_extraction_mod.extractPreparedPdfStreamingWithTextCache(
+        alloc,
+        &coordinator.session,
+        "application/pdf",
+        .{},
+        .always,
+        .{ .ptr = &delayed_sink, .on_begin = CancelSink.begin, .on_unit = DelayedSink.unit, .on_end = CancelSink.end },
+        null,
+        &inspection,
+    );
+    try std.testing.expectEqual(@as(usize, 2), delayed_sink.pages);
+    try std.testing.expect(inspection.deadline_ns > initial_deadline);
+
     const persistent_bytes = coordinator.reservation.live_bytes;
     if (persistent_bytes == 0) return error.PdfCoordinatorDidNotRetainParsedState;
     try std.testing.expect(resources.sliceStats(.document_extraction_working_set).used_bytes >= persistent_bytes);

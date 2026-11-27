@@ -684,7 +684,11 @@ pub const PdfOperationDeadline = struct {
 
     pub fn classifyError(self: *const @This(), err: anyerror) anyerror {
         if (err != error.Canceled and err != error.Cancelled) return err;
-        self.owner.check() catch |owner_err| return self.owner.classifyError(owner_err);
+        const owner_outcome = self.owner.classifyError(err);
+        if (owner_outcome != err) return owner_outcome;
+        // A cancellation that outlived its operation must keep the owner's
+        // identity even when both clocks are now expired.
+        self.owner.check() catch return err;
         return if (platform_time.monotonicNs() >= self.deadline_ns) self.timeout_error else err;
     }
 
