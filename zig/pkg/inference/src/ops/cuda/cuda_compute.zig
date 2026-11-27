@@ -3533,6 +3533,9 @@ pub const CudaCompute = struct {
             self.stats.launch_argmax += 1;
         }
         pub fn embedding(burst: *@This(), step: usize) !CT {
+            return burst.embeddingWithDestination(step, null);
+        }
+        fn embeddingWithDestination(burst: *@This(), step: usize, destination: ?buffer_mod.DeviceBuffer) !CT {
             if (step >= burst.steps) return error.InvalidShape;
             var ids = tensorFromCt(burst.bank).*;
             const bytes = try checkedMul(burst.rows, @sizeOf(u32));
@@ -3543,7 +3546,7 @@ pub const CudaCompute = struct {
             burst.drained = false;
             // The descriptor is borrowed only for this launch. The bank and
             // immutable model embedding outlive every consumer on this stream.
-            return (try embeddingLookupTensor(burst.owner, burst.embedding_weight, @ptrCast(&ids), burst.rows, burst.hidden)) orelse error.UnsupportedOperation;
+            return (try embeddingLookupTensorScaledCommon(burst.owner, burst.embedding_weight, @ptrCast(&ids), burst.rows, burst.hidden, 1.0, destination)) orelse error.UnsupportedOperation;
         }
         pub fn beginRead(burst: *@This(), count: usize) !?@import("burst_readback.zig").Pending {
             if (count != try checkedMul(burst.steps, burst.rows)) return error.InvalidShape;
@@ -3739,6 +3742,9 @@ pub const CudaCompute = struct {
             try buffer_mod.validateRegions(2, .{ weight.buffer, destination }, .{ weight.buffer.len, bytes }, .{ 1, @alignOf(f32) }, 1);
             const device_ids = try prepareEmbeddingLookup(self.compute, weight, ids, owner.rows, owner.hidden);
             try launchEmbeddingLookupInto(self.compute, destination, weight, device_ids, owner.rows, owner.hidden, 1.0);
+        }
+        pub fn embedNext(self: *@This(), burst_value: *LightOnTokenBurst, step: usize) !CT {
+            return burst_value.embeddingWithDestination(step, self.compute.bounded_decode_graph.input());
         }
         pub fn input(self: *@This()) !CT {
             const owner = &self.compute.bounded_decode_graph;
@@ -24332,7 +24338,7 @@ fn embeddingLookupScaled(ctx: *anyopaque, weight: CT, ids: []const i64, total: u
     return try embeddingLookupScaledCommon(ctx, weight, ids, total, dim, scale);
 }
 
-fn embeddingLookupTensorScaledCommon(ctx: *anyopaque, weight: CT, ids: CT, total: usize, dim: usize, scale: f32) anyerror!?CT {
+fn embeddingLookupTensorScaledCommon(ctx: *anyopaque, weight: CT, ids: CT, total: usize, dim: usize, scale: f32, destination: ?buffer_mod.DeviceBuffer) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const weight_tensor = tensorFromCt(weight);
     const ids_tensor = tensorFromCt(ids);
@@ -24348,7 +24354,12 @@ fn embeddingLookupTensorScaledCommon(ctx: *anyopaque, weight: CT, ids: CT, total
     }
 
     const out_count = try checkedMul(total, dim);
-    var output = try OwnedF32Output.alloc2(self, total, dim, out_count);
+    const bytes = try checkedMul(out_count, @sizeOf(f32));
+    if (destination) |assigned| {
+        const regions = [3]buffer_mod.DeviceBuffer{ weight_tensor.buffer, ids_tensor.buffer, assigned };
+        try buffer_mod.validateRegions(3, regions, .{ regions[0].len, try checkedMul(total, @sizeOf(i32)), bytes }, .{ 1, @alignOf(i32), @alignOf(f32) }, 2);
+    }
+    var output = try OwnedF32Output.fromOwnedShapeDestination(self, try allocShape2(self.allocator, total, dim), out_count, bytes, destination);
     defer output.deinit();
     const device = output.buffer;
     var embedding_profile_scope = beginPrefillProfile(self, .embedding, total);
@@ -24372,15 +24383,17 @@ fn embeddingLookupTensorScaledCommon(ctx: *anyopaque, weight: CT, ids: CT, total
         try self.kernels.launchEmbeddingLookupI32F32(&self.ctx, device, weight_tensor.buffer, ids_tensor.buffer, total, dim, scale);
     }
     self.stats.launch_embedding += 1;
-    return output.intoTensor();
+    const result = output.intoTensor();
+    if (destination != null) tensorFromCt(result).owns_buffer = false;
+    return result;
 }
 
 fn embeddingLookupTensor(ctx: *anyopaque, weight: CT, ids: CT, total: usize, dim: usize) anyerror!?CT {
-    return embeddingLookupTensorScaledCommon(ctx, weight, ids, total, dim, 1.0);
+    return embeddingLookupTensorScaledCommon(ctx, weight, ids, total, dim, 1.0, null);
 }
 
 fn embeddingLookupTensorScaled(ctx: *anyopaque, weight: CT, ids: CT, total: usize, dim: usize, scale: f32) anyerror!?CT {
-    return embeddingLookupTensorScaledCommon(ctx, weight, ids, total, dim, scale);
+    return embeddingLookupTensorScaledCommon(ctx, weight, ids, total, dim, scale, null);
 }
 
 fn addWeightedEmbeddingTensor(ctx: *anyopaque, weight: CT, ids: CT, rhs: CT, total: usize, dim: usize, lhs_scale: f32, rhs_scale: f32) anyerror!?CT {
@@ -45914,6 +45927,17 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
     const gathered = try cb.toFloat32(embedded, a);
     defer a.free(gathered);
     try std.testing.expectEqualSlices(f32, &.{ 5, 7, 2, 3 }, gathered);
+
+    var burst = try claim.burst(input, 2);
+    defer burst.deinit();
+    try burst.argmax(input, 0);
+    const next = try claim.embedNext(&burst, 0);
+    defer cb.free(next);
+    try std.testing.expectEqual(owner.input().ptr, tensorFromCt(next).buffer.ptr);
+    try std.testing.expect(!tensorFromCt(next).owns_buffer);
+    const next_gathered = try cb.toFloat32(next, a);
+    defer a.free(next_gathered);
+    try std.testing.expectEqualSlices(f32, &.{ 5, 7, 5, 7 }, next_gathered);
 
     var observation = @import("../../execution/runtime_observation.zig").Scope.init();
     defer observation.deinit();

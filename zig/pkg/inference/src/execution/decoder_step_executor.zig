@@ -1062,7 +1062,7 @@ pub const Executor = struct {
                     defer context.deinit();
                     context.context.prepared_lighton_decode = true;
                     claim.beginStep(step);
-                    const input = if (step == 0) try claim.input() else try render.burst.embedding(0);
+                    const input = if (step == 0) try claim.input() else try claim.embedNext(render.burst, 0);
                     const hidden = try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(pipeline.context.cb, pipeline.context.allocator, pipeline.context.gpt_config.*, input, .{}, if (render.items.len > 64) 1 else render.items.len, if (render.items.len > 64) render.items.len else 1, &context.context, null);
                     defer pipeline.context.cb.free(hidden.hidden);
                     const logits = try claim.projectHead(pipeline.context.cb, hidden.hidden, render.head);
