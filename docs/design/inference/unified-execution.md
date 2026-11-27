@@ -1358,6 +1358,14 @@ changed from 2049.20/2057.71 ms to 2049.89/2055.17 ms. Metal changed from
 1410.80/1422.07 ms to 1065.45/1075.19 ms. These are whole-request timings
 with the selected backend confirmed in each server log.
 
+On Spark GB10 at `5be5fbf2a3`, the same 71.49-second Whisper-small
+HTTP fixture matched the frozen `9e4af7f847` transcript and all three
+segment timestamps exactly. All 12 arms verified CUDA selection.
+Baseline/candidate p50 was 1370.54/1370.02 ms and p95 was
+1372.55/1375.61 ms. Baseline-only and candidate-only controls differed
+by at most 0.11% at p50 or p95. The run shared Spark with a separate
+184 MiB CUDA context.
+
 At `34296ffb5a`, five Native CPU fixtures passed for resident handoff and
 task output custody. The incremental decoder matched host-reference logits
 after the encoder and destination session handles closed, and allocation
