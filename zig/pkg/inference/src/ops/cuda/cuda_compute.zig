@@ -62750,6 +62750,9 @@ test "CUDA source convolution binds declared BF16 packs and preserves border val
     defer cb.free(weights);
     const bias = try cb.fromFloat32Shape(&.{0.5}, &.{1});
     defer cb.free(bias);
+    var scope: @import("../../execution/runtime_observation.zig").KernelScope = undefined;
+    scope.begin();
+    defer _ = scope.finish();
     for ([_]?CT{ null, bias }) |bias_value| {
         const out = try sourceConvolutionF32(&compute, .{
             .input = input,
@@ -62768,6 +62771,10 @@ test "CUDA source convolution binds declared BF16 packs and preserves border val
         const expected: []const f32 = if (bias_value == null) &.{ 4, 6, 6, 9 } else &.{ 4.5, 6.5, 6.5, 9.5 };
         try std.testing.expectEqualSlices(f32, expected, actual);
     }
+    const receipt = scope.cuda_vendor_convolution orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 2), receipt.forward_calls);
+    try std.testing.expectEqual(@as(u64, 1), receipt.bias_calls);
+    try std.testing.expect(receipt.max_source_bank_bytes > receipt.max_explicit_workspace_bytes);
 }
 
 test "CUDA source audio cold metadata requires retained convolution without probing SDK" {
