@@ -3762,7 +3762,9 @@ pub const CudaCompute = struct {
             if (burst_value.owner != self.compute or cb.ptr != @as(*anyopaque, @ptrCast(self.compute))) return error.ForeignComputeBackend;
             const owner = &self.compute.bounded_decode_graph;
             if (burst_value.rows != owner.rows or burst_value.vocab != owner.vocab or step >= burst_value.steps) return error.InvalidShape;
-            try ensureCount(tensorFromCt(input_ct), try checkedMul(owner.rows, owner.hidden));
+            const input = tensorFromCt(input_ct);
+            try ensureF32(input);
+            try ensureCount(input, try checkedMul(owner.rows, owner.hidden));
             const layout = owner.storage_layout orelse return error.InvalidExecutionPlan;
             const head_rows = layout.headPacketRows(owner.rows, owner.vocab);
             if (head_rows == 0) return error.InvalidExecutionPlan;
@@ -3774,15 +3776,30 @@ pub const CudaCompute = struct {
             var first: usize = 0;
             while (first < owner.rows) {
                 const rows = @min(head_rows, owner.rows - first);
-                const packet_input = try sliceRows2DOp(self.compute, input_ct, first, rows, owner.hidden);
-                defer cb.free(packet_input);
+                const count = try checkedMul(rows, owner.hidden);
+                const byte_offset = try checkedMul(try checkedMul(first, owner.hidden), @sizeOf(f32));
+                const buffer = try borrowBufferRange(input.buffer, byte_offset, try checkedMul(count, @sizeOf(f32)));
+                var shape = [_]i64{ @intCast(rows), @intCast(owner.hidden) };
+                // The entire input remains owned by the caller through both
+                // submission and any deferred use of its device storage.
+                var packet_input: CudaTensor = .{
+                    .buffer = buffer,
+                    .dtype = .f32,
+                    .shape = &shape,
+                    .elem_count = count,
+                    .bf16_mirror = f32MirrorView(input, buffer, count) orelse .{},
+                    .owns_buffer = false,
+                    .owns_shape = false,
+                    .owns_bf16_mirror = false,
+                    .owned_by_tensor = false,
+                };
                 // With no separate bank the existing stream scope records
                 // this projection's exact lifetime and binds it on capture.
                 const destination: ?buffer_mod.DeviceBuffer = if (self.head_destination) |bank| .{
                     .ptr = bank.ptr,
                     .len = try checkedMul(try checkedMul(rows, owner.vocab), @sizeOf(f32)),
                 } else null;
-                const logits = try cb.observeBackendEntry(.linear_no_bias, &linearNoBiasWithDestination, .{ self.compute, packet_input, weight, rows, owner.hidden, owner.vocab, false, destination });
+                const logits = try cb.observeBackendEntry(.linear_no_bias, &linearNoBiasWithDestination, .{ self.compute, @as(CT, @ptrCast(&packet_input)), weight, rows, owner.hidden, owner.vocab, false, destination });
                 defer cb.free(logits);
                 try burst_value.argmaxRange(logits, step, first, rows);
                 first += rows;
@@ -42006,6 +42023,16 @@ fn createPhysicalCompletionOp(ctx: *anyopaque) anyerror!ops.physical_storage.Com
 
 /// The view owns its metadata and retains storage without issuing a device
 /// copy. Borrowed backend slot records remain scoped to their backend owner.
+fn f32MirrorView(source: *const CudaTensor, buffer: buffer_mod.DeviceBuffer, count: usize) ?buffer_mod.DeviceBuffer {
+    if (source.quant_type != null or source.dtype != .f32 or source.bf16_mirror.ptr == 0 or buffer.ptr < source.buffer.ptr) return null;
+    const offset = buffer.ptr - source.buffer.ptr;
+    if (offset % @sizeOf(f32) != 0) return null;
+    const mirror_offset = offset / @sizeOf(f32) * @sizeOf(u16);
+    const mirror_bytes = checkedMul(count, @sizeOf(u16)) catch return null;
+    if (mirror_offset > source.bf16_mirror.len or mirror_bytes > source.bf16_mirror.len - mirror_offset) return null;
+    return .{ .ptr = source.bf16_mirror.ptr + mirror_offset, .len = mirror_bytes };
+}
+
 fn makeRetainedTensorView(self: *CudaCompute, source: *CudaTensor, buffer: buffer_mod.DeviceBuffer, shape: []i64, count: usize) !CT {
     const cache_parent = if (source.physical_lease == null and !source.owned_by_tensor) try pinCachedStorageRoot(self, source) else null;
     if (source.quant_type == null and try checkedMul(count, source.dtype.byteSize()) > buffer.len) return error.InvalidShape;
@@ -42036,20 +42063,15 @@ fn makeRetainedTensorView(self: *CudaCompute, source: *CudaTensor, buffer: buffe
     }
     // Dense reshapes and row slices preserve the corresponding representation
     // range. Pin its owner separately from the primary F32 allocation.
-    if (source.quant_type == null and source.dtype == .f32 and source.bf16_mirror.ptr != 0 and buffer.ptr >= source.buffer.ptr) {
-        const offset = buffer.ptr - source.buffer.ptr;
-        const mirror_offset = offset / @sizeOf(f32) * @sizeOf(u16);
-        const mirror_bytes = count * @sizeOf(u16);
-        if (offset % @sizeOf(f32) == 0 and mirror_offset <= source.bf16_mirror.len and mirror_bytes <= source.bf16_mirror.len - mirror_offset) {
-            tensor.bf16_mirror = .{ .ptr = source.bf16_mirror.ptr + mirror_offset, .len = mirror_bytes };
-            for (source.auxiliary_leases, 0..) |maybe_lease, i| if (maybe_lease) |lease| {
-                lease.retain();
-                tensor.auxiliary_leases[i] = lease;
-            };
-            if (source.physical_lease != null and source.owns_bf16_mirror and source.owned_by_tensor) {
-                retainResidentTensor(source);
-                tensor.resident_parent = source;
-            }
+    if (f32MirrorView(source, buffer, count)) |mirror| {
+        tensor.bf16_mirror = mirror;
+        for (source.auxiliary_leases, 0..) |maybe_lease, i| if (maybe_lease) |lease| {
+            lease.retain();
+            tensor.auxiliary_leases[i] = lease;
+        };
+        if (source.physical_lease != null and source.owns_bf16_mirror and source.owned_by_tensor) {
+            retainResidentTensor(source);
+            tensor.resident_parent = source;
         }
     }
     // Device leases do not own a training tensor's host index proof.
