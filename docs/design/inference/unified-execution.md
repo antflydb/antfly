@@ -1460,6 +1460,13 @@ The released two-row LightOnOCR HTTP graph replay reported a
 297,216-byte shared layer workspace and a 44-byte admitted pinned
 readback. The reported workspace equals the largest stage bound.
 
+At `e208032e8d`, all 26 scoped Spark CUDA checks passed without skips.
+With the declared shared logits bank enabled, released LightOnOCR
+replayed two rows with exact HTTP output parity. The shared stage bank
+was 1,986,560 bytes, including the logits span, with a 44-byte admitted
+pinned readback. The assigned-buffer fixture also matched the separate
+bank path while consuming an empty stream workspace for the head.
+
 At `ee3629cec0`, five scoped Metal audio tests passed without skips.
 The replay fixture rejected missing and excess input bindings before
 dispatch. The same run covered fresh inputs, held results, and
