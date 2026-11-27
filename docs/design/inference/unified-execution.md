@@ -1391,6 +1391,15 @@ at 18.80 pages/s. It attempted decoder graphs at widths up to 22 and
 recorded zero captures and replays. The 64-row gate stopped the comparison
 before the fused arms, leaving fused-head throughput unqualified.
 
+The instrumented repeat at `c8c7788b34` passed the same seven CUDA
+tests and a separate fused-head HTTP correctness run. Its 64-page dense
+control matched exact outputs at 18.13 pages/s. Ten live graphs retired
+in the learn phase after one two-token burst: one at a foreground step,
+one at mixed prefill, and eight at foreground cleanup. The first was
+22 rows. This identifies work that interrupts learning. The foreground
+cleanup label covers several reader paths, so the trace does not
+attribute all eight retirements to one resource.
+
 This audit reconciles the original `2f2438e67f` implementation review
 against merged main `4951ca13f9` with later evidence. Each serving
 measurement identifies the revision that ran.
