@@ -16363,7 +16363,7 @@ fn lightOnGatedFfnNoBias(ctx: *anyopaque, request: *const ops.GatedFfnNoBiasRequ
         const staged = (try stageBf16ActivationForCublasLt(self, input, rows, hidden)) orelse return null;
         const bytes = try checkedMul(try checkedMul(rows, intermediate), 4);
         const layout = try CudaCompute.DenseFfnProgram.Layout.init(rows, hidden, intermediate, 0);
-        var scratch = try allocDeviceBuffer(self, layout.scratch_bytes);
+        var scratch = try allocOperationScratch(self, layout.scratch_bytes);
         defer releaseDeviceBuffer(self, &scratch);
         const gate_values = try scratch.borrowRange(layout.gate_offset, bytes);
         const up_values = try scratch.borrowRange(layout.up_offset, bytes);
@@ -16405,7 +16405,7 @@ fn lightOnGatedFfnNoBias(ctx: *anyopaque, request: *const ops.GatedFfnNoBiasRequ
     var scratch_bytes = projected_bytes;
     const activation_bytes = projected_bytes / @as(usize, if (self.lighton_ffn_bf16_inputs) 4 else 2);
     const activation_span = try buffer_mod.ByteSpan.append(&scratch_bytes, activation_bytes, buffer_mod.DeviceBuffer.allocation_alignment);
-    var scratch = try allocDeviceBuffer(self, scratch_bytes);
+    var scratch = try allocOperationScratch(self, scratch_bytes);
     defer releaseDeviceBuffer(self, &scratch);
     const projected = try scratch.borrowRange(0, projected_bytes);
     if (!try runCublasLtBf16Matmul(self, projected, staged, pair, cublasLtWorkspace(self), rows, hidden, two_intermediate)) return null;
@@ -33373,7 +33373,7 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
     var scratch = if (captured)
         try self.bounded_decode_graph.bindAttentionWorkspace(scratch_layout.bytes)
     else
-        try allocDeviceBuffer(self, scratch_layout.bytes);
+        try allocOperationScratch(self, scratch_layout.bytes);
     defer if (!captured) releaseDeviceBuffer(self, &scratch);
     params.out = output.ptr;
     params.partials = scratch.ptr;
