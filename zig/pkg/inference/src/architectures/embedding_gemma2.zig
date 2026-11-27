@@ -728,8 +728,7 @@ const LayerFrameBatch = struct {
 
     fn deinit(self: *LayerFrameBatch, cb: *const ComputeBackend) void {
         for (self.slices[0..self.count]) |slice| {
-            @import("../ops/metal_compute.zig").MetalCompute.releaseDynamicSlotsForTensor(cb, slice);
-            cb.free(slice);
+            cb.freeProjectionInput(slice, .transient);
         }
     }
 };
@@ -747,8 +746,7 @@ fn encoderLayer(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Co
     defer if (frame_batch == null) if (slice) |value| {
         // The identity-keyed transient slot expires after the layer's frame
         // completes (or is cancelled), before this address can be reused.
-        if (cb.kind() == .metal) @import("../ops/metal_compute.zig").MetalCompute.releaseDynamicSlotsForTensor(cb, value);
-        cb.free(value);
+        cb.freeProjectionInput(value, .transient);
     };
     // Batch the layer's device operations into one owned frame. A frame per
     // layer bounds retained GPU intermediates and preserves cancellation

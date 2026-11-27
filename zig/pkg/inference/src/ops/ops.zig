@@ -2740,7 +2740,10 @@ pub const ComputeBackend = struct {
         layer: ?*const fn (ctx: *anyopaque, request: *const DebertaEncoderLayerRequest) anyerror!?CT = null,
     };
 
+    pub const ProjectionInputRetention = enum { transient, provider_backing };
+
     pub const SequenceProjectionRegion = struct {
+        retireInput: ?*const fn (ctx: *anyopaque, tensor: CT, retention: ProjectionInputRetention) void = null,
         /// Null hook retains legacy unfold policy. A present false decision
         /// declines before dense-slot preparation or any numerical submission.
         unfold1dReady: ?*const fn (ctx: *anyopaque, request: *const Conv1dUnfoldRequest) anyerror!bool = null,
@@ -4033,6 +4036,12 @@ pub const ComputeBackend = struct {
             }
         };
         self.deinit();
+    }
+
+    /// Retire identity-keyed projection bindings before releasing their input.
+    pub fn freeProjectionInput(self: *const ComputeBackend, tensor: CT, retention: ProjectionInputRetention) void {
+        if (self.vtable.regions.sequence_projection.retireInput) |retire| retire(self.ptr, tensor, retention);
+        self.free(tensor);
     }
 
     pub fn free(self: *const ComputeBackend, tensor: CT) void {

@@ -5378,16 +5378,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         ) != 0) return error.MetalLinearViewReleaseFailed;
     }
 
-    /// Integrated LightOn vision weights already have a provider-owned dense
-    /// cache. Its source bytes and lazy-store pin outlive projector wrappers,
-    /// so prepared slots keyed by those bytes can survive another page. Every
-    /// other tensor must retire its slots before allocator addresses are reused.
-    pub fn releaseProjectorSlotsForTensor(cb: *const ops.ComputeBackend, tensor: CT) void {
-        if (cb.kind() != .metal) return;
-        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+    fn retireProjectionInputOp(ctx: *anyopaque, tensor: CT, retention: ops.ComputeBackend.ProjectionInputRetention) void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const buf = toBuf(tensor);
-        if (self.lightOnProjectorSlotBackingRetained(buf)) return;
-        releaseDynamicSlotsForTensor(cb, tensor);
+        if (retention == .provider_backing and self.lightOnProjectorSlotBackingRetained(buf)) return;
+        self.releaseDynamicSlotsForBuffer(buf);
     }
 
     fn lightOnProjectorSlotBackingRetained(self: *const MetalCompute, buf: *const Buf) bool {
@@ -5407,10 +5402,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     /// Release slots keyed by a transient tensor after its GPU work completes,
     /// immediately before freeing the tensor wrapper and its identity.
-    pub fn releaseDynamicSlotsForTensor(cb: *const ops.ComputeBackend, tensor: CT) void {
-        if (cb.kind() != .metal) return;
-        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
-        const buf = toBuf(tensor);
+    fn releaseDynamicSlotsForBuffer(self: *MetalCompute, buf: *const Buf) void {
         const dense_identity = dynamicLinearDenseBufferKey(buf);
         const quantized_storage = buf.quantized_storage orelse buf.runtime_quantized_storage;
         const quantized_identity = if (quantized_storage) |storage| @intFromPtr(storage) else 0;
@@ -43097,6 +43089,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.embeddingLookupDeviceToken = embeddingLookupDeviceTokenOp;
         vt.regions.commands.setPipelinedFrames = decoderRuntimeSetPipelinedFramesOp;
         vt.regions.commands.detachActivationViews = detachFrameActivationViewsOp;
+        vt.regions.sequence_projection.retireInput = retireProjectionInputOp;
         vt.regions.commands.releaseActivationViews = releaseFrameActivationViewsOp;
         vt.regions.commands.submitFrame = decoderRuntimeSubmitFrameOp;
         vt.regions.commands.waitSubmittedFrame = decoderRuntimeWaitSubmittedFrameOp;
@@ -43251,8 +43244,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return @splat(0);
     }
 
-    pub fn releaseProjectorSlotsForTensor(_: *const ops.ComputeBackend, _: CT) void {}
-
     fn lightOnPreparedConfigEligible(config: @import("../models/gpt.zig").Config) bool {
         return config.norm_type == .rms_norm and config.activation == .silu and
             config.norm_weight_offset == 1 and config.norm_eps == 1e-6 and config.qwen35_linear_num_key_heads == 16 and
@@ -43340,7 +43331,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     pub fn preparedParameterIdentity(_: *const ops.ComputeBackend, _: CT) ?ParameterIdentity {
         return null;
     }
-    pub fn releaseDynamicSlotsForTensor(_: *const ops.ComputeBackend, _: CT) void {}
 
     pub fn takeQuantizedStorage(
         _: *const ops.ComputeBackend,
@@ -43714,7 +43704,7 @@ test "metal_compute: transient component slots are retired and reclaimed" {
     const first_weight = try cb.fromFloat32Shape(&weight_values, &weight_shape);
     const first_bias = try cb.fromFloat32Shape(&bias_values, &bias_shape);
     try std.testing.expectEqual(@as(?usize, 0), try metal_compute.ensureDynamicLinearSlot(first_weight, first_bias, 4, 4));
-    MetalCompute.releaseDynamicSlotsForTensor(&cb, first_weight);
+    MetalCompute.retireProjectionInputOp(cb.ptr, first_weight, .transient);
     try std.testing.expectEqual(@as(usize, 0), metal_compute.dynamic_linear_slots.count());
     try std.testing.expect(!metal_compute.provider_impl.raw_linear_slots_prepared[0]);
     cb.free(first_bias);
@@ -43730,7 +43720,7 @@ test "metal_compute: transient component slots are retired and reclaimed" {
     const first_gamma = try cb.fromFloat32Shape(weight_values[0..4], &bias_shape);
     const first_beta = try cb.fromFloat32Shape(&bias_values, &bias_shape);
     try std.testing.expectEqual(@as(?usize, 0), try metal_compute.ensureDynamicLayerNormSlot(first_gamma, first_beta, 4));
-    MetalCompute.releaseDynamicSlotsForTensor(&cb, first_gamma);
+    MetalCompute.retireProjectionInputOp(cb.ptr, first_gamma, .transient);
     try std.testing.expectEqual(@as(usize, 0), metal_compute.dynamic_layer_norm_slots.count());
     try std.testing.expect(!metal_compute.provider_impl.raw_layer_norm_slots_prepared[0]);
     cb.free(first_beta);
@@ -50945,7 +50935,7 @@ fn exerciseEmbeddingGemma2ProjectionCache(name: []const u8, denied_name: []const
         try std.testing.expectEqual(@as(usize, if (vision) slot_bytes else 0), compute.provider_impl.embeddinggemma2_vision_linear_cache_bytes);
         // ProjectorWeights tears down request tensors after every cohort.
         // A model-owned snapshot must survive that exact release path.
-        MetalCompute.releaseDynamicSlotsForTensor(&cb, weight);
+        MetalCompute.retireProjectionInputOp(cb.ptr, weight, .transient);
         try std.testing.expectEqual(@as(usize, slot_bytes), store.tier_cache.?.backend_bytes);
         try std.testing.expectEqual(@as(usize, slot_bytes), controller.snapshot().backend_weight_bytes);
         // Additional immutable projections cannot grow past the admitted cap.
@@ -56436,7 +56426,7 @@ test "Metal layer norm keeps distinct immutable resident parameter sets and reti
     const retained = try cb.toFloat32(held.?, a);
     defer a.free(retained);
     try std.testing.expectEqualSlices(f32, &first, retained);
-    MetalCompute.releaseDynamicSlotsForTensor(&cb, weights[0]);
+    MetalCompute.retireProjectionInputOp(cb.ptr, weights[0], .transient);
     try std.testing.expectEqual(@as(usize, 1), compute.dynamic_layer_norm_slots.count());
     const again = try cb.layerNorm(input, weights[1], biases[1], 4, 1e-5);
     defer cb.free(again);
@@ -56551,7 +56541,7 @@ test "LightOnOCR3 vision slots retain cache owners across page handles and retir
             slots = compute.dynamic_linear_slots.count();
             try std.testing.expect(slots > 0);
         }
-        MetalCompute.releaseProjectorSlotsForTensor(&cb, weight);
+        MetalCompute.retireProjectionInputOp(cb.ptr, weight, .provider_backing);
         try std.testing.expectEqual(slots, compute.dynamic_linear_slots.count());
     }
     // Address reuse is safe only for provider-cache-backed identities. An
@@ -56564,12 +56554,12 @@ test "LightOnOCR3 vision slots retain cache owners across page handles and retir
     defer allocator.free(values);
     try std.testing.expectEqualSlices(f32, &.{ 2, 1, 5, 4 }, values);
     try std.testing.expect(compute.dynamic_linear_slots.count() > slots);
-    MetalCompute.releaseProjectorSlotsForTensor(&cb, transient);
+    MetalCompute.retireProjectionInputOp(cb.ptr, transient, .provider_backing);
     try std.testing.expectEqual(slots, compute.dynamic_linear_slots.count());
     // The ordinary release remains available for explicit cache retirement.
     const weight = try cb.getWeight(name);
     defer cb.free(weight);
-    MetalCompute.releaseDynamicSlotsForTensor(&cb, weight);
+    MetalCompute.retireProjectionInputOp(cb.ptr, weight, .transient);
     try std.testing.expectEqual(@as(usize, 0), compute.dynamic_linear_slots.count());
 }
 

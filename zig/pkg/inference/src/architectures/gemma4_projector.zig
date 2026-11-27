@@ -1035,13 +1035,9 @@ const ProjectorWeights = struct {
     }
 
     pub fn deinit(self: *ProjectorWeights) void {
-        const metal_compute_mod = @import("../ops/metal_compute.zig");
         var it = self.entries.iterator();
         while (it.next()) |entry| {
-            if (self.cb.kind() == .metal) {
-                metal_compute_mod.MetalCompute.releaseDynamicSlotsForTensor(self.cb, entry.value_ptr.*);
-            }
-            self.cb.free(entry.value_ptr.*);
+            self.cb.freeProjectionInput(entry.value_ptr.*, .transient);
             self.allocator.free(entry.key_ptr.*);
         }
         self.entries.deinit(self.allocator);

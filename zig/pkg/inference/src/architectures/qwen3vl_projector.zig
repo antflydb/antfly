@@ -546,10 +546,7 @@ const WeightCache = struct {
     pub fn deinit(self: *WeightCache) void {
         var value_it = self.tensors.valueIterator();
         while (value_it.next()) |tensor| {
-            if (self.cb.kind() == .metal) {
-                metal_compute_mod.MetalCompute.releaseProjectorSlotsForTensor(self.cb, tensor.*);
-            }
-            self.cb.free(tensor.*);
+            self.cb.freeProjectionInput(tensor.*, .provider_backing);
         }
         var key_it = self.tensors.keyIterator();
         while (key_it.next()) |key| self.allocator.free(key.*);

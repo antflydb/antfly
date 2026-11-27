@@ -4393,8 +4393,7 @@ pub fn qwen3RerankerLogits(
         defer {
             // The synchronous helper submits or cancels before returning.
             // Retire its temporary head slot before the buffer can be reused.
-            metal_compute_mod.MetalCompute.releaseDynamicSlotsForTensor(cb, difference_weight);
-            cb.free(difference_weight);
+            cb.freeProjectionInput(difference_weight, .transient);
         }
         if (try tryDenseQwen3Prefill(cb, allocator, config, input_ids, attention_mask, batch, seq_len, .{
             .output_rows = active_rows,
@@ -4613,8 +4612,7 @@ fn qwen3RerankerLogitsFromHiddenRows(
 
     const difference_weight = try qwen3RerankerDifferenceWeight(cb, allocator, config);
     defer {
-        metal_compute_mod.MetalCompute.releaseDynamicSlotsForTensor(cb, difference_weight);
-        cb.free(difference_weight);
+        cb.freeProjectionInput(difference_weight, .transient);
     }
 
     const logits = try cb.linearNoBias(
