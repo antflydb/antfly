@@ -24,7 +24,7 @@ const runtime = @import("resolution_runtime.zig");
 const keys = @import("../internal_keys.zig");
 const resources = @import("../resource_manager.zig");
 const transport_codec = @import("artifact_publication_transport_codec.zig");
-const platform_time = @import("antfly_platform").time;
+const Clock = @import("antfly_platform").clock.Clock;
 
 pub const Token = @import("artifact_producer_context.zig").Token;
 
@@ -94,29 +94,34 @@ pub const EncodingAdmission = struct {
         upstream_revision: ?publication.Position,
     };
     const refresh_interval_ns = 5 * std.time.ns_per_s;
+    clock: Clock = Clock.real(),
     denied: ?struct { input: Input, bytes: usize, refresh_at_ns: u64 } = null,
 
-    fn reserve(self: *EncodingAdmission, budget: *resources.BudgetedAllocator, input: Input, minimum: usize, now_ns: u64) !resources.BudgetedAllocator.ScratchReservation {
+    fn preflight(self: *EncodingAdmission, manager: *resources.ResourceManager, input: Input, minimum: usize) !void {
         // The estimate does not describe the complete causal read set. Let
         // one fresh attempt observe changed candidates, overrides and
         // siblings even if the primary and upstream revisions stayed fixed.
         if (self.denied) |old| {
-            if (now_ns >= old.refresh_at_ns or !std.meta.eql(old.input, input))
+            if (!std.meta.eql(old.input, input) or self.clock.nowRealtimeNs() >= old.refresh_at_ns)
                 self.denied = null;
         }
         const required = if (self.denied) |old| @max(old.bytes, minimum) else minimum;
-        return budget.reserveScratch(required) catch |err|
+        // This is a capacity check only. Candidate search and inference
+        // admit their own working sets, so never overlap their memory with
+        // the encoder reservation.
+        var credit = manager.reserveWithoutReclaim(.relational_preparation_working_set, required) catch |err|
             return if (err == error.ResourceBudgetExceeded) error.ResourceTemporarilyUnavailable else err;
+        credit.release();
     }
 
-    fn encode(self: *EncodingAdmission, budget: *resources.BudgetedAllocator, input: Input, command: publication.Command, now_ns: u64) ![]u8 {
+    fn encode(self: *EncodingAdmission, budget: *resources.BudgetedAllocator, input: Input, command: publication.Command) ![]u8 {
         const bytes = transport_codec.encodeAlloc(budget.allocator(), command) catch |err| {
             if (err == error.OutOfMemory) if (budget.allocationFailureThreadSafe()) |failure| if (failure.cause == .admission) {
                 const previous = if (self.denied) |old| if (std.meta.eql(old.input, input)) old.bytes else 0 else 0;
                 self.denied = .{
                     .input = input,
                     .bytes = @max(previous, failure.requested_bytes +| @as(usize, @intCast(failure.live_bytes))),
-                    .refresh_at_ns = now_ns +| refresh_interval_ns,
+                    .refresh_at_ns = self.clock.nowRealtimeNs() +| refresh_interval_ns,
                 };
                 return error.ResourceTemporarilyUnavailable;
             };
@@ -209,19 +214,10 @@ pub fn process(
                 };
             };
 
-            // The first attempt admits the command header. If serialization
-            // needed more capacity, reserve that measured demand before
-            // repeating candidate lookup or inference for the same input.
-            var budget = if (resource_manager) |owner|
-                resources.BudgetedAllocator.init(owner, .relational_preparation_working_set, alloc, 1)
-            else
-                null;
-            defer if (budget) |*tracked| tracked.deinit();
-            var credit = if (budget) |*tracked|
-                try encoding_admission.reserve(tracked, input, try transport_codec.encodedLength(selector), platform_time.monotonicNs())
-            else
-                null;
-            defer if (credit) |*reservation| reservation.release();
+            // Check the measured demand on retry before provider work.
+            // Reserve the actual encoder memory after candidate search.
+            if (resource_manager) |owner|
+                try encoding_admission.preflight(owner, input, try transport_codec.encodedLength(selector));
 
             const output_key = try keys.resolutionArtifactKeyAlloc(work, parsed.resolution_scope_key, config.resolution_artifact);
             const control_key = try runtime.reviewOverrideArtifactKeyAlloc(work, parsed.resolution_scope_key, config.source_artifact, config.resolution_artifact);
@@ -255,9 +251,14 @@ pub fn process(
             }
 
             const port = dispatcher orelse return error.ArtifactCatalogDrift;
+            var budget = if (resource_manager) |owner|
+                resources.BudgetedAllocator.init(owner, .relational_preparation_working_set, alloc, 1)
+            else
+                null;
+            defer if (budget) |*tracked| tracked.deinit();
             const transport = if (budget) |*tracked| tracked.allocator() else alloc;
             const bytes = if (budget) |*tracked|
-                try encoding_admission.encode(tracked, input, command, platform_time.monotonicNs())
+                try encoding_admission.encode(tracked, input, command)
             else
                 try transport_codec.encodeAlloc(transport, command);
             defer transport.free(bytes);
@@ -566,7 +567,8 @@ test "ordered resolver preparation binds output to exact source and configured g
         const slice: resources.Slice = .relational_preparation_working_set;
         var manager = resources.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = limit } });
         defer manager.deinit(alloc);
-        var admission: EncodingAdmission = .{};
+        var clock: @import("antfly_platform").clock.ManualClock = .{};
+        var admission: EncodingAdmission = .{ .clock = clock.clock() };
         const admission_input: EncodingAdmission.Input = .{
             .receipt = publication.receiptKey(command, command.sources[0]),
             .primary_revision = null,
@@ -586,25 +588,36 @@ test "ordered resolver preparation binds output to exact source and configured g
         {
             var budget = resources.BudgetedAllocator.init(&manager, slice, alloc, 1);
             defer budget.deinit();
-            var credit = try admission.reserve(&budget, admission_input, 1, 0);
-            defer credit.release();
-            try std.testing.expectError(error.ResourceTemporarilyUnavailable, admission.encode(&budget, admission_input, large_command, 0));
+            try admission.preflight(&manager, admission_input, 1);
+            try std.testing.expectError(error.ResourceTemporarilyUnavailable, admission.encode(&budget, admission_input, large_command));
         }
         {
             var budget = resources.BudgetedAllocator.init(&manager, slice, alloc, 1);
             defer budget.deinit();
             const refresh = EncodingAdmission.refresh_interval_ns;
-            try std.testing.expectError(error.ResourceTemporarilyUnavailable, admission.reserve(&budget, admission_input, 1, refresh - 1));
+            clock.advanceNs(refresh - 1);
+            try std.testing.expectError(error.ResourceTemporarilyUnavailable, admission.preflight(&manager, admission_input, 1));
             // Identical input stamps and available bytes. Only the untracked
             // dependency changed, so the refreshed provider output is smaller.
-            var credit = try admission.reserve(&budget, admission_input, 1, refresh);
-            defer credit.release();
-            const wire = try admission.encode(&budget, admission_input, command, refresh);
+            clock.advanceNs(1);
+            try admission.preflight(&manager, admission_input, 1);
+            const wire = try admission.encode(&budget, admission_input, command);
             defer budget.allocator().free(wire);
             try std.testing.expect(manager.sliceStats(slice).used_bytes >= limit - available + wire.len);
             try std.testing.expect(admission.denied == null);
         }
         blocker.release();
+        const encoder_demand = limit / 2;
+        admission.denied = .{
+            .input = admission_input,
+            .bytes = encoder_demand,
+            .refresh_at_ns = clock.clock().nowRealtimeNs() + EncodingAdmission.refresh_interval_ns,
+        };
+        try admission.preflight(&manager, admission_input, 1);
+        // ANN and serialization each fit on their own. The capacity check
+        // must leave room for a candidate query larger than half the budget.
+        var ann = try manager.reserveWithoutReclaim(.dense_search_working_set, encoder_demand + 1);
+        ann.release();
         try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(slice).used_bytes);
     }
     var prepared = try prepareResolution(alloc, command, .{ .resolvers = encoded });

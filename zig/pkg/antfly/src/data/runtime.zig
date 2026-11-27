@@ -6878,7 +6878,7 @@ pub const DataServer = struct {
         // dispatcher there fences local production behind an unavailable
         // replicated authority, even for an empty index.
         if (owner_source.online_source_authority == .raft)
-            _ = owner_source.withArtifactPublications(.{ .ptr = self, .enqueue_fn = enqueueArtifactPublication, .enqueue_tracked_fn = enqueueTrackedArtifactPublication, .applied_fn = artifactPublicationApplied });
+            _ = try owner_source.withArtifactPublications(.{ .ptr = self, .enqueue_fn = enqueueArtifactPublication, .enqueue_tracked_fn = enqueueTrackedArtifactPublication, .applied_fn = artifactPublicationApplied });
         owner_source.schema_snapshot_retention = .{ .ptr = self, .retain = retainSchemaSnapshot, .reopen = reopenSchemaSnapshot, .release = releaseSchemaSnapshot };
         _ = owner_source.withSecretStore(self.api_server_cfg.secret_store);
         if (comptime linked_storage) {
@@ -9318,6 +9318,7 @@ pub const DataServer = struct {
     fn enqueueArtifactPublicationObserved(ptr: *anyopaque, group_id: u64, namespace: [24]u8, command: []const u8, receipt: ?*artifact_publication_dispatch.Receipt) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+        try self.write_source.catalog.requireArtifactPublicationRouting();
         const runtime = self.backend_runtime orelse return error.ArtifactCatalogDrift;
         if (runtime.durable_jobs.executesInline()) return error.ArtifactCatalogDrift;
         const io = runtime.io() orelse return error.ArtifactCatalogDrift;
@@ -60926,11 +60927,6 @@ fn implementationTests() type {
             };
             defer server.deinit();
             runtime.durable_jobs = .{ .ptr = &lane, .vtable = &.{ .submit = Lane.submit, .drain_owner = Lane.drain, .close_owner = Lane.drain, .poll = Lane.poll } };
-            var receipt: artifact_publication_dispatch.Receipt = .{};
-            defer receipt.release();
-            try DataServer.enqueueTrackedArtifactPublication(&server, 17, @splat(1), "owned command", &receipt);
-            try std.testing.expect(!receipt.abandoned());
-            const queued: *DataServer.ArtifactPublicationJob = @ptrCast(@alignCast(lane.pending.?.ptr));
             const CatalogProbe = struct {
                 const catalog = antfly.public_api.table_catalog;
                 shutdown: *std.atomic.Value(bool),
@@ -60959,17 +60955,38 @@ fn implementationTests() type {
                 fn free(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
             };
             var probe: CatalogProbe = .{ .shutdown = &server.background_jobs_shutdown };
-            const catalog_before = server.write_source.catalog;
             server.write_source.catalog = .{
                 .ptr = &probe,
                 .vtable = &.{ .admin_snapshot = CatalogProbe.admin, .free_admin_snapshot = CatalogProbe.free },
             };
-            try std.testing.expectError(error.CatalogRoutingUnavailable, DataServer.runArtifactPublicationJobInner(queued));
+            const dispatch_port: artifact_publication_dispatch.Port = .{
+                .ptr = &server,
+                .enqueue_fn = DataServer.enqueueArtifactPublication,
+            };
+            {
+                var owner_source = antfly.public_api.ProvisionedKernelOwnerSource.init(
+                    alloc,
+                    server.write_source.replica_root_dir,
+                    server.write_source.catalog,
+                    server.read_source.read_safety_barrier,
+                );
+                defer owner_source.deinit();
+                try std.testing.expectError(error.CatalogRoutingUnavailable, owner_source.withArtifactPublications(dispatch_port));
+            }
+            var receipt: artifact_publication_dispatch.Receipt = .{};
+            defer receipt.release();
+            try std.testing.expectError(error.CatalogRoutingUnavailable, DataServer.enqueueTrackedArtifactPublication(&server, 17, @splat(1), "owned command", &receipt));
+            try std.testing.expectEqual(@as(usize, 0), server.artifact_publication_queue.jobs);
+            try std.testing.expect(lane.pending == null);
             server.write_source.catalog.vtable = &.{
                 .admin_snapshot = CatalogProbe.admin,
                 .free_admin_snapshot = CatalogProbe.free,
                 .admin_snapshot_with_budget = CatalogProbe.adminWithBudget,
             };
+            const catalog_before = server.write_source.catalog;
+            try DataServer.enqueueTrackedArtifactPublication(&server, 17, @splat(1), "owned command", &receipt);
+            try std.testing.expect(!receipt.abandoned());
+            const queued: *DataServer.ArtifactPublicationJob = @ptrCast(@alignCast(lane.pending.?.ptr));
             try std.testing.expectError(error.Canceled, DataServer.runArtifactPublicationJobInner(queued));
             try std.testing.expect(queued.table_name == null);
             server.background_jobs_shutdown.store(false, .release);

@@ -9701,6 +9701,9 @@ const PlatformEnrichmentRuntime = struct {
         // allocations without releasing another worker's durable lease.
         errdefer runtime.ownership.deinitPreserveLease(alloc);
         if (config.recovery_only) return runtime;
+        if (borrowed_io != null)
+            runtime.publication_flights.cleanup_owner = .{ .backend = backend_runtime, .id = try backend_runtime.allocOwnerId() };
+        errdefer runtime.publication_flights.deinit(alloc);
         const observed = try enrichment_state.loadRuntimeObservation(alloc, store, scope_name);
         runtime.applied_sequence = observed.applied;
         runtime.status_revision = observed.revision;
@@ -33042,7 +33045,7 @@ const PublicationFlights = struct {
     const stream_progress = @import("../artifact_stream_progress.zig");
     const upload = @import("../artifact_publication_transport.zig");
     const inventory_progress = @import("../artifact_chunk_inventory_progress.zig");
-    const cleanup_delay_ms = 250;
+    const cleanup_retry_delay_ns = std.time.ns_per_s;
 
     const Completion = union(enum) {
         receipt: struct { key: ordered_publication.ReceiptKey, previous: u64 },
@@ -33135,13 +33138,17 @@ const PublicationFlights = struct {
         return previous == null or !std.mem.eql(u8, &previous.?, raw[raw.len - 32 ..]);
     }
 
+    const CleanupOwner = struct { backend: *background_runtime_mod.BackendRuntime, id: u64 };
+
     mutex: Io.Mutex = .init,
     items: std.ArrayList(Flight) = .empty,
-    cleanup: ?background_runtime_mod.MaintenanceScheduler.Handle = null,
+    cleanup_owner: ?CleanupOwner = null,
+    cleanup_armed: bool = false,
+    cleanup_active: bool = false,
     cleanup_retry_ns: u64 = 0,
 
     fn deinit(self: *PublicationFlights, a: Allocator) void {
-        if (self.cleanup) |*task| task.join();
+        if (self.cleanup_owner) |owner| owner.backend.durable_jobs.closeOwner(owner.id);
         for (self.items.items) |flight| flight.deinit(a);
         self.items.deinit(a);
     }
@@ -33166,16 +33173,60 @@ const PublicationFlights = struct {
         return self.reconcileLocked(runtime, .{ .pressure = owner });
     }
 
-    // Attached to the storage owner's lifetime, even when replay is paused
-    // or no publisher is denied. A group has one runnable cleanup task
-    // regardless of the number of requests competing for shared memory.
-    fn cleanupStep(runtime: *EnrichmentRuntime) ?u64 {
+    // The durable lane's allocation-free probe stays armed across transient
+    // executor refusals. It only admits one cleanup job at a time and never
+    // reads storage from the threaded reaper.
+    fn cleanupProbe(ptr: *anyopaque) void {
+        const runtime: *EnrichmentRuntime = @ptrCast(@alignCast(ptr));
+        const self = &runtime.publication_flights;
+        const owner = self.cleanup_owner.?;
+        const io = concurrencyIo(runtime);
+        if (!self.mutex.tryLock()) return;
+        if (!self.cleanup_armed or self.cleanup_active or runtime.deadline_clock.nowRealtimeNs() < self.cleanup_retry_ns) {
+            self.mutex.unlock(io);
+            return;
+        }
+        self.cleanup_active = true;
+        self.mutex.unlock(io);
+        owner.backend.durable_jobs.submit(.{
+            .owner_id = owner.id,
+            .class = .maintenance,
+            .ptr = runtime,
+            .run = cleanupJob,
+            .deinit = finishCleanupJob,
+        }) catch {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            self.cleanup_active = false;
+            self.cleanup_retry_ns = runtime.deadline_clock.nowRealtimeNs() +| cleanup_retry_delay_ns;
+        };
+    }
+
+    fn cleanupJob(ptr: *anyopaque) !void {
+        const runtime: *EnrichmentRuntime = @ptrCast(@alignCast(ptr));
         const self = &runtime.publication_flights;
         const io = concurrencyIo(runtime);
-        if (!self.mutex.tryLock()) return cleanup_delay_ms;
+        if (!self.mutex.tryLock()) return;
         defer self.mutex.unlock(io);
-        const pending = self.reconcileLocked(runtime, .retained) catch return cleanup_delay_ms;
-        return if (pending) cleanup_delay_ms else null;
+        const pending = self.reconcileLocked(runtime, .retained) catch {
+            self.cleanup_retry_ns = runtime.deadline_clock.nowRealtimeNs() +| cleanup_retry_delay_ns;
+            return;
+        };
+        if (!pending) {
+            const owner = self.cleanup_owner.?;
+            self.cleanup_armed = false;
+            self.cleanup_retry_ns = 0;
+            owner.backend.disarmOwnerMaintenanceProbe(owner.id);
+        }
+    }
+
+    fn finishCleanupJob(ptr: *anyopaque) void {
+        const runtime: *EnrichmentRuntime = @ptrCast(@alignCast(ptr));
+        const self = &runtime.publication_flights;
+        const io = concurrencyIo(runtime);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.cleanup_active = false;
     }
 
     const Selection = union(enum) {
@@ -33254,26 +33305,10 @@ const PublicationFlights = struct {
     }
 
     fn wakeCleanup(self: *PublicationFlights, runtime: *EnrichmentRuntime) void {
-        if (self.cleanup) |task| {
-            task.wake();
-            return;
-        }
-        const backend = runtime.backend_runtime orelse return;
-        const now = platform_time.monotonicNs();
-        if (now < self.cleanup_retry_ns) return;
-        self.cleanup = registerCleanup(backend, runtime) catch |err| {
-            // Reduced inline backends can run publication with no scheduler.
-            // Normal receipt reconciliation still releases their reservations.
-            self.cleanup_retry_ns = switch (err) {
-                error.InvalidMaintenanceCapacity, error.MissingBackendRuntimeIo, error.BackendRuntimeShuttingDown => std.math.maxInt(u64),
-                else => now +| std.time.ns_per_s,
-            };
-            return;
-        };
-    }
-
-    fn registerCleanup(backend: *background_runtime_mod.BackendRuntime, runtime: *EnrichmentRuntime) !background_runtime_mod.MaintenanceScheduler.Handle {
-        return (try backend.maintenanceScheduler()).registerClass(.maintenance, runtime, cleanupStep);
+        if (self.cleanup_armed) return;
+        const owner = self.cleanup_owner orelse return;
+        owner.backend.armOwnerMaintenanceProbe(owner.id, .{ .ptr = runtime, .run = cleanupProbe }) catch return;
+        self.cleanup_armed = true;
     }
 
     fn retainProgressKey(self: *PublicationFlights, runtime: *EnrichmentRuntime, bytes: []const u8, encoding_budget: ?*resource_manager_mod.BudgetedAllocator) !*RetainedKey {
@@ -52681,18 +52716,22 @@ test "model aware media ordered generation publishes beyond 4095 chunks and resu
             runtime.publication_flights = .{};
             runtime.config.resource_manager = original_manager;
         }
-        const backend = runtime.backend_runtime;
         var reduced = try background_runtime_mod.BackendRuntime.init(a, .{
             .backend = .manual,
             .borrowed_io = .{ .general = std.testing.io },
             .lane_limits = .{ .durable_background = 2 },
         });
         defer reduced.deinit();
-        runtime.backend_runtime = &reduced;
-        defer runtime.backend_runtime = backend;
         try std.testing.expectError(error.InvalidMaintenanceCapacity, reduced.maintenanceScheduler());
+        const original_cleanup_owner = runtime.publication_flights.cleanup_owner;
+        const reduced_owner = try reduced.allocOwnerId();
+        runtime.publication_flights.cleanup_owner = .{ .backend = &reduced, .id = reduced_owner };
+        defer if (runtime.publication_flights.cleanup_owner.?.backend == &reduced) {
+            reduced.durable_jobs.closeOwner(reduced_owner);
+            runtime.publication_flights.cleanup_owner = original_cleanup_owner;
+        };
         try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedChunkGeneration(runtime, request, &token, scope, desired, true));
-        try std.testing.expect(runtime.publication_flights.cleanup == null);
+        try std.testing.expect(runtime.publication_flights.cleanup_armed);
         var shared_key: ?*PublicationFlights.RetainedKey = null;
         var page_witnesses: usize = 0;
         for (runtime.publication_flights.items.items) |flight| {
@@ -52723,8 +52762,61 @@ test "model aware media ordered generation publishes beyond 4095 chunks and resu
         try std.testing.expect(try processOrderedChunkText(runtime, request, &cache, null));
         try std.testing.expectEqual(calls_before, harness.calls);
         try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(slice).used_bytes);
-        runtime.backend_runtime = backend;
-        runtime.publication_flights.cleanup_retry_ns = 0;
+        const TestLane = struct {
+            original: background_runtime_mod.DurableJobLane,
+            submissions: usize = 0,
+
+            fn submit(ptr: *anyopaque, job: background_runtime_mod.Job) !void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.submissions += 1;
+                if (self.submissions == 1) return error.ConcurrencyUnavailable;
+                try self.original.submit(job);
+            }
+            fn drain(ptr: *anyopaque, owner: u64) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.original.drainOwner(owner);
+            }
+            fn close(ptr: *anyopaque, owner: u64) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.original.closeOwner(owner);
+            }
+            fn poll(ptr: *anyopaque, max_jobs: usize) !usize {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                return self.original.poll(max_jobs);
+            }
+        };
+        {
+            var test_lane: TestLane = .{ .original = reduced.durable_jobs };
+            reduced.durable_jobs = .{
+                .ptr = &test_lane,
+                .vtable = &.{ .submit = TestLane.submit, .drain_owner = TestLane.drain, .close_owner = TestLane.close, .poll = TestLane.poll, .executes_inline = true },
+            };
+            defer reduced.durable_jobs = test_lane.original;
+            var clock: platform_clock.ManualClock = .{};
+            const original_clock = runtime.deadline_clock;
+            runtime.deadline_clock = clock.clock();
+            defer runtime.deadline_clock = original_clock;
+            {
+                const io = concurrencyIo(runtime);
+                runtime.publication_flights.mutex.lockUncancelable(io);
+                defer runtime.publication_flights.mutex.unlock(io);
+                settled_append.retained_key = try runtime.publication_flights.retainProgressKey(runtime, append_key, null);
+                settled_append.completion.append.key = settled_append.retained_key.?.bytes;
+                runtime.publication_flights.items.appendAssumeCapacity(settled_append);
+            }
+            try std.testing.expectEqual(@as(usize, 1), try reduced.durable_jobs.poll(1));
+            try std.testing.expectEqual(charged_bytes, manager.sliceStats(slice).used_bytes);
+            clock.advanceNs(PublicationFlights.cleanup_retry_delay_ns - 1);
+            try std.testing.expectEqual(@as(usize, 1), try reduced.durable_jobs.poll(1));
+            try std.testing.expectEqual(@as(usize, 1), test_lane.submissions);
+            clock.advanceNs(1);
+            try std.testing.expectEqual(@as(usize, 1), try reduced.durable_jobs.poll(1));
+            try std.testing.expectEqual(@as(usize, 2), test_lane.submissions);
+            try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(slice).used_bytes);
+            try std.testing.expectEqual(@as(usize, 0), try reduced.durable_jobs.poll(1));
+        }
+        reduced.durable_jobs.closeOwner(reduced_owner);
+        runtime.publication_flights.cleanup_owner = original_cleanup_owner;
         {
             const io = concurrencyIo(runtime);
             runtime.publication_flights.mutex.lockUncancelable(io);

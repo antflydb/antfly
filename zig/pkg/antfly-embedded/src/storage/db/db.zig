@@ -6585,6 +6585,7 @@ pub const DB = struct {
         const resources = self.core.batchExecutionResources();
         const context_value: EnrichmentAppendContext = .{
             .cache_source = self.resolution_candidate_source,
+            .resolution_encoding_admission = .{ .clock = self.backend_runtime.monotonicClock() },
             .alloc = self.runtime_alloc,
             .root_incarnation = self.root_incarnation,
             .artifact_publication_dispatcher = self.local_execution.artifact_publication_dispatcher,

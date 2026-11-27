@@ -5035,7 +5035,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         return self;
     }
 
-    pub fn withArtifactPublications(self: *ProvisionedKernelOwnerSource, port: @import("../storage/artifact_publication_dispatch.zig").Port) *ProvisionedKernelOwnerSource {
+    pub fn withArtifactPublications(self: *ProvisionedKernelOwnerSource, port: @import("../storage/artifact_publication_dispatch.zig").Port) !*ProvisionedKernelOwnerSource {
+        try self.catalog.requireArtifactPublicationRouting();
         std.debug.assert(self.entries.items.len == 0);
         self.artifact_publications = port;
         return self;

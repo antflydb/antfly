@@ -240,6 +240,11 @@ pub const CatalogSource = struct {
         fence.native_participant = pin;
     }
 
+    pub fn requireArtifactPublicationRouting(self: CatalogSource) !void {
+        if (self.vtable.acquire_routing_generation == null and self.vtable.admin_snapshot_with_budget == null)
+            return error.CatalogRoutingUnavailable;
+    }
+
     pub fn adminSnapshot(self: CatalogSource) !metadata_api.AdminSnapshot {
         return try self.vtable.admin_snapshot(self.ptr);
     }
