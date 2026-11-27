@@ -6534,8 +6534,10 @@ components:
           `{ "text": "..." }`.
         - JSON asset: any JSON value.
         - Document extraction asset: `{ "text": "..." }`, the already
-          extracted plain text. No fetch, OCR or transcription runs; `source`
-          identifies the remote object it was extracted from.
+          extracted plain text, or `{ "units": [ExtractionUnitSeed] }`, the
+          extracted units themselves with their pages, layout and transcript
+          phrases. No fetch, OCR or transcription runs; `source` identifies
+          the remote object it was extracted from.
         - Document embedding: an array of finite numbers.
         - Chunk-derived embedding: an array of `ChunkVectorSeed`.
         - Sparse embedding: `{ "indices": [...], "values": [...] }` with
@@ -6607,6 +6609,16 @@ components:
         One chunk of a seeded chunk collection (`_chunks.<name>`), the plain
         shape a `_chunks` read returns minus internal fields. Chunk ids must be
         unique and ascending; character spans must lie within the source text.
+
+        Chunks of a document extraction's chunk consumer are unit-scoped: each
+        names its unit with `_parent_unit_id` (ids ascend within a unit) and
+        may carry its `_speaker`. They are accepted together with the
+        extraction seed in the same write and must name one of its units.
+        A collection is either entirely unit-scoped or not at all.
+
+        The accepted collection is kept for its input: later edits and replays
+        that leave the source text (or unit text) and the chunker
+        configuration unchanged keep it; a changed input is chunked again.
       required:
         - _content
       properties:
@@ -6631,6 +6643,76 @@ components:
         _end_time_ms:
           type: number
           minimum: 0
+        _parent_unit_id:
+          type: string
+          description: The extraction unit this chunk belongs to, e.g. `page:000003`.
+        _speaker:
+          description: Diarized speaker, `SPEAKER_NN` as reads label it, or its index.
+          oneOf:
+            - type: string
+              pattern: "^SPEAKER_[0-9]{1,3}$"
+            - type: integer
+              minimum: 0
+              maximum: 254
+    ExtractionUnitSeed:
+      type: object
+      additionalProperties: false
+      required: [text]
+      description: |
+        One unit of a rich document extraction seed. Only data the caller has
+        is recorded; nothing absent (coordinates, timing) is fabricated. Unit
+        ids are `<unit_type>:<ordinal>`, numbered from 000001 in order.
+      properties:
+        text:
+          type: string
+        unit_type:
+          type: string
+          pattern: "^[a-z0-9_]{1,64}$"
+          description: Defaults to `page` with a page number, `transcript` with spans, else `document` (the plain text route's unit).
+        page_number:
+          type: integer
+          minimum: 1
+        page_label:
+          type: string
+        page_bbox:
+          type: array
+          minItems: 4
+          maxItems: 4
+          items:
+            type: number
+        page_rotation:
+          type: integer
+          enum: [0, 90, 180, 270]
+        spans:
+          type: array
+          description: Ordered, disjoint transcript phrases in unit text coordinates.
+          items:
+            $ref: "#/components/schemas/TranscriptSpanSeed"
+    TranscriptSpanSeed:
+      type: object
+      additionalProperties: false
+      required: [char_start, char_end, start_ms, end_ms]
+      properties:
+        char_start:
+          type: integer
+          minimum: 0
+        char_end:
+          type: integer
+          minimum: 0
+        start_ms:
+          type: integer
+          minimum: 0
+        end_ms:
+          type: integer
+          minimum: 0
+        speaker:
+          description: "`SPEAKER_NN` or a speaker index."
+          oneOf:
+            - type: string
+              pattern: "^SPEAKER_[0-9]{1,3}$"
+            - type: integer
+              minimum: 0
+              maximum: 254
     Transform:
       type: object
       required:
@@ -6965,6 +7047,11 @@ components:
             producer cannot accept reject the batch; they never fall back to
             inference silently. A document carrying only seeds is rejected; use
             a transform with `expected_version` to seed an existing document.
+
+            Chains seed in one write: an asset, the chunks of that asset (bound
+            to the seeded output) and the vectors of those chunks are all
+            accepted together, as are a document extraction and the
+            unit-scoped chunks of its units.
           additionalProperties:
             type: object # map[string]any
             description: Document object with arbitrary fields matching your table schema.

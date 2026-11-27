@@ -2827,7 +2827,7 @@ pub const ArtifactRepairReason = enum {
     }
 };
 
-/// An already computed result for a named enrichment, written as `_artifacts.<name>` in a document or transform. The enrichment defines the output contract (content type, dimensions, vector space); the seed does not repeat it. `"<name>": null` drops the accepted output so its producer regenerates it; omitting a name leaves it unchanged. `value` by enrichment kind: - Text asset: a string (`""` is a valid, complete empty result), or `{ "text": "..." }`. - JSON asset: any JSON value. - Document extraction asset: `{ "text": "..." }`, the already extracted plain text. No fetch, OCR or transcription runs; `source` identifies the remote object it was extracted from. - Document embedding: an array of finite numbers. - Chunk-derived embedding: an array of `ChunkVectorSeed`. - Sparse embedding: `{ "indices": [...], "values": [...] }` with strictly ascending indices. Descriptive read fields (`artifact_id`, `artifact_ref`, `kind`, `status`, `dims`, `items`, `content_type`) and internal routing fields are rejected.
+/// An already computed result for a named enrichment, written as `_artifacts.<name>` in a document or transform. The enrichment defines the output contract (content type, dimensions, vector space); the seed does not repeat it. `"<name>": null` drops the accepted output so its producer regenerates it; omitting a name leaves it unchanged. `value` by enrichment kind: - Text asset: a string (`""` is a valid, complete empty result), or `{ "text": "..." }`. - JSON asset: any JSON value. - Document extraction asset: `{ "text": "..." }`, the already extracted plain text, or `{ "units": [ExtractionUnitSeed] }`, the extracted units themselves with their pages, layout and transcript phrases. No fetch, OCR or transcription runs; `source` identifies the remote object it was extracted from. - Document embedding: an array of finite numbers. - Chunk-derived embedding: an array of `ChunkVectorSeed`. - Sparse embedding: `{ "indices": [...], "values": [...] }` with strictly ascending indices. Descriptive read fields (`artifact_id`, `artifact_ref`, `kind`, `status`, `dims`, `items`, `content_type`) and internal routing fields are rejected.
 pub const ArtifactSeed = struct {
     /// The seeded result; its shape follows the enrichment kind.
     value: std.json.Value,
@@ -2896,7 +2896,7 @@ pub const ArtifactSourcesCapabilityState = enum {
     }
 };
 
-/// Rendering of selected `_artifacts` and `_chunks`. `seed` emits exactly the artifact seed write shapes, vectors included, and omits descriptive and internal fields. Outputs without a seed write shape (explicit external vectors, sparse vectors, unit-scoped extraction children) are omitted.
+/// Rendering of selected `_artifacts` and `_chunks`. `seed` emits exactly the artifact seed write shapes, vectors included, and omits descriptive and internal fields. Document extraction assets export their extracted text. Outputs without a seed write shape (explicit external vectors, unit-scoped extraction children) are omitted.
 pub const ArtifactView = enum {
     descriptive,
     seed,
@@ -3340,7 +3340,7 @@ pub const BatchCommittedFailure = struct {
 
 /// Batch insert, delete, and transform operations in a single request. **Atomicity**: - **Single shard**: Operations are atomic within shard boundaries - **Multiple shards**: Uses distributed 2-phase commit (2PC) for atomic cross-shard writes **How distributed transactions work**: 1. Metadata server allocates HLC timestamp and selects coordinator shard 2. Coordinator writes transaction record, participants write intents 3. After all intents succeed, coordinator commits transaction 4. Participants are notified asynchronously to resolve intents 5. Recovery loop ensures notifications complete even after coordinator failure **Performance**: - Single-shard batches: < 5ms latency - Cross-shard transactions: ~20ms latency - Intent resolution: < 30 seconds worst-case (via recovery loop) **Guarantees**: - All writes succeed or all fail (atomicity across all shards) - Coordinator failure is recoverable (new leader resumes notifications) - Idempotent resolution (duplicate notifications are safe) **Benefits**: - Reduces network overhead compared to individual requests - More efficient indexing (updates are batched) - Automatic distributed transactions when operations span shards The inserts are upserts - existing keys are overwritten, new keys are created.
 pub const BatchRequest = struct {
-    /// Map of document IDs to document objects. Each key is the unique identifier for the document. Best practices: - Use consistent key naming schemes (e.g., "user:123", "article:456") - Key length affects storage and performance - keep them reasonably short - Keys are sorted lexicographically, so choose prefixes that support range scans Artifact seeds: a document may carry existing results for its named enrichments beside its source fields, under `_artifacts.<name>` (assets and embeddings, see `ArtifactSeed`) and `_chunks.<name>` (chunk collections, an array of `ChunkSeed`). Seeds are stripped from the stored document, bound atomically to this source version, and published as that enrichment's accepted output without invoking its producer. Unseeded outputs are generated as usual. Invalid seeds, names that match no enrichment of the document, and seeds a producer cannot accept reject the batch; they never fall back to inference silently. A document carrying only seeds is rejected; use a transform with `expected_version` to seed an existing document.
+    /// Map of document IDs to document objects. Each key is the unique identifier for the document. Best practices: - Use consistent key naming schemes (e.g., "user:123", "article:456") - Key length affects storage and performance - keep them reasonably short - Keys are sorted lexicographically, so choose prefixes that support range scans Artifact seeds: a document may carry existing results for its named enrichments beside its source fields, under `_artifacts.<name>` (assets and embeddings, see `ArtifactSeed`) and `_chunks.<name>` (chunk collections, an array of `ChunkSeed`). Seeds are stripped from the stored document, bound atomically to this source version, and published as that enrichment's accepted output without invoking its producer. Unseeded outputs are generated as usual. Invalid seeds, names that match no enrichment of the document, and seeds a producer cannot accept reject the batch; they never fall back to inference silently. A document carrying only seeds is rejected; use a transform with `expected_version` to seed an existing document. Chains seed in one write: an asset, the chunks of that asset (bound to the seeded output) and the vectors of those chunks are all accepted together, as are a document extraction and the unit-scoped chunks of its units.
     inserts: ?std.json.ArrayHashMap(std.json.ArrayHashMap(std.json.Value)) = null,
     /// Array of document IDs to delete. Documents are removed from all indexes. Notes: - Non-existent keys are silently ignored - Deletions take precedence over inserts for the same key in one batch - Keys are permanently removed from storage and indexes
     deletes: ?[]const []const u8 = null,
@@ -5908,7 +5908,7 @@ pub const ChunkOutputs = struct {
     targets: []const ChunkOutputTarget,
 };
 
-/// One chunk of a seeded chunk collection (`_chunks.<name>`), the plain shape a `_chunks` read returns minus internal fields. Chunk ids must be unique and ascending; character spans must lie within the source text.
+/// One chunk of a seeded chunk collection (`_chunks.<name>`), the plain shape a `_chunks` read returns minus internal fields. Chunk ids must be unique and ascending; character spans must lie within the source text. Chunks of a document extraction's chunk consumer are unit-scoped: each names its unit with `_parent_unit_id` (ids ascend within a unit) and may carry its `_speaker`. They are accepted together with the extraction seed in the same write and must name one of its units. A collection is either entirely unit-scoped or not at all. The accepted collection is kept for its input: later edits and replays that leave the source text (or unit text) and the chunker configuration unchanged keep it; a changed input is chunked again.
 pub const ChunkSeed = struct {
     /// Chunk ordinal. `_id` is accepted as an alias and must agree.
     _chunk_id: ?i64 = null,
@@ -5917,6 +5917,10 @@ pub const ChunkSeed = struct {
     _end_char: ?i64 = null,
     _start_time_ms: ?f64 = null,
     _end_time_ms: ?f64 = null,
+    /// The extraction unit this chunk belongs to, e.g. `page:000003`.
+    _parent_unit_id: ?[]const u8 = null,
+    /// Diarized speaker, `SPEAKER_NN` as reads label it, or its index.
+    _speaker: ?std.json.Value = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -5926,6 +5930,8 @@ pub const ChunkSeed = struct {
         .{ "_end_char", "_end_char", true },
         .{ "_start_time_ms", "_start_time_ms", true },
         .{ "_end_time_ms", "_end_time_ms", true },
+        .{ "_parent_unit_id", "_parent_unit_id", true },
+        .{ "_speaker", "_speaker", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -5958,6 +5964,14 @@ pub const ChunkSeed = struct {
         }
         if (self._end_time_ms) |value| {
             try jw.objectField("_end_time_ms");
+            try jw.write(value);
+        }
+        if (self._parent_unit_id) |value| {
+            try jw.objectField("_parent_unit_id");
+            try jw.write(value);
+        }
+        if (self._speaker) |value| {
+            try jw.objectField("_speaker");
             try jw.write(value);
         }
         try jw.endObject();
@@ -21052,6 +21066,69 @@ pub const ExtractionToken = struct {
         try jw.write(self.text);
         if (self.box) |value| {
             try jw.objectField("box");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// One unit of a rich document extraction seed. Only data the caller has is recorded; nothing absent (coordinates, timing) is fabricated. Unit ids are `<unit_type>:<ordinal>`, numbered from 000001 in order.
+pub const ExtractionUnitSeed = struct {
+    text: []const u8,
+    /// Defaults to `page` with a page number, `transcript` with spans, else `document` (the plain text route's unit).
+    unit_type: ?[]const u8 = null,
+    page_number: ?i64 = null,
+    page_label: ?[]const u8 = null,
+    page_bbox: ?[]const f64 = null,
+    page_rotation: ?i64 = null,
+    /// Ordered, disjoint transcript phrases in unit text coordinates.
+    spans: ?[]const TranscriptSpanSeed = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "text", "text", false },
+        .{ "unit_type", "unit_type", true },
+        .{ "page_number", "page_number", true },
+        .{ "page_label", "page_label", true },
+        .{ "page_bbox", "page_bbox", true },
+        .{ "page_rotation", "page_rotation", true },
+        .{ "spans", "spans", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("text");
+        try jw.write(self.text);
+        if (self.unit_type) |value| {
+            try jw.objectField("unit_type");
+            try jw.write(value);
+        }
+        if (self.page_number) |value| {
+            try jw.objectField("page_number");
+            try jw.write(value);
+        }
+        if (self.page_label) |value| {
+            try jw.objectField("page_label");
+            try jw.write(value);
+        }
+        if (self.page_bbox) |value| {
+            try jw.objectField("page_bbox");
+            try jw.write(value);
+        }
+        if (self.page_rotation) |value| {
+            try jw.objectField("page_rotation");
+            try jw.write(value);
+        }
+        if (self.spans) |value| {
+            try jw.objectField("spans");
             try jw.write(value);
         }
         try jw.endObject();
@@ -64734,6 +64811,49 @@ pub const TranscriberEnrichmentConfig = struct {
         }
         if (self.download_assets) |value| {
             try jw.objectField("download_assets");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const TranscriptSpanSeed = struct {
+    char_start: i64,
+    char_end: i64,
+    start_ms: i64,
+    end_ms: i64,
+    /// `SPEAKER_NN` or a speaker index.
+    speaker: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "char_start", "char_start", false },
+        .{ "char_end", "char_end", false },
+        .{ "start_ms", "start_ms", false },
+        .{ "end_ms", "end_ms", false },
+        .{ "speaker", "speaker", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("char_start");
+        try jw.write(self.char_start);
+        try jw.objectField("char_end");
+        try jw.write(self.char_end);
+        try jw.objectField("start_ms");
+        try jw.write(self.start_ms);
+        try jw.objectField("end_ms");
+        try jw.write(self.end_ms);
+        if (self.speaker) |value| {
+            try jw.objectField("speaker");
             try jw.write(value);
         }
         try jw.endObject();

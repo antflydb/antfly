@@ -7398,7 +7398,10 @@ fn getOrCreateRequestChunksWithProvider(runtime: *EnrichmentRuntime, alloc: Allo
             defer alloc.free(document);
             const text = try extractSourceText(alloc, runtime.config, document, request);
             defer if (text) |value| alloc.free(value);
-            const chunks = if (text) |value|
+            const seeded = if (text) |value| try storedSeededChunksAlloc(runtime, alloc, request, value) else null;
+            const chunks = if (seeded) |value|
+                value
+            else if (text) |value|
                 if (request.chunker_json.len > 0)
                     try chunker_mod.chunkTextWithConfigJsonAndProvider(alloc, value, request.chunker_json, provider)
                 else
@@ -7466,6 +7469,12 @@ fn getOrCreateRequestChunksWithProvider(runtime: *EnrichmentRuntime, alloc: Allo
     };
     defer alloc.free(source_text);
 
+    if (try storedSeededChunksAlloc(runtime, alloc, request, source_text)) |seeded| {
+        errdefer chunker_mod.freeChunks(alloc, seeded);
+        try cache.append(alloc, .{ .key = cache_key, .chunks = seeded, .source_record_digest = sourceRecordDigest(raw.?) });
+        return .{ .chunks = seeded, .source_record_digest = source_digest };
+    }
+
     const activity_indexes = runtime.index_manager.vectorIndexesForChunk(alloc, requestArtifactName(request)) catch null;
     defer if (activity_indexes) |names| freeOwnedIndexNames(alloc, names);
     var chunks_created: usize = 0;
@@ -7487,6 +7496,28 @@ fn getOrCreateRequestChunksWithProvider(runtime: *EnrichmentRuntime, alloc: Allo
         .source_record_digest = sourceRecordDigest(raw.?),
     });
     return .{ .chunks = chunks, .source_record_digest = source_digest };
+}
+
+/// Accepted unit-scoped chunk seeds of an extraction consumer, for exactly
+/// this unit text and chunker (`artifact_seed_chunks.zig`).
+fn storedSeededUnitChunksAlloc(runtime: *EnrichmentRuntime, alloc: Allocator, doc_key: []const u8, chunk_name: []const u8, unit: document_extraction_mod.Unit, config: anytype) !?[]chunker_mod.Chunk {
+    const seed_chunks = @import("../artifact_seed_chunks.zig");
+    const key = try seed_chunks.unitKeyAlloc(alloc, doc_key, chunk_name);
+    defer alloc.free(key);
+    const record = try storeGetOptionalAllocWithRetry(runtime, key);
+    defer if (record) |bytes| runtime.alloc.free(bytes);
+    return try seed_chunks.unitChunksForAlloc(chunker_mod, alloc, record, unit.unit_id, unit.text, config);
+}
+
+/// An accepted chunk seed is the chunk producer's output while its input is
+/// unchanged (`artifact_seed_chunks.zig`): replays keep the seeded set.
+fn storedSeededChunksAlloc(runtime: *EnrichmentRuntime, alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, source_text: []const u8) !?[]chunker_mod.Chunk {
+    const seed_chunks = @import("../artifact_seed_chunks.zig");
+    const key = try seed_chunks.keyAlloc(alloc, request.doc_key, requestArtifactName(request));
+    defer alloc.free(key);
+    const record = try storeGetOptionalAllocWithRetry(runtime, key);
+    defer if (record) |bytes| runtime.alloc.free(bytes);
+    return try seed_chunks.chunksForInputAlloc(chunker_mod, alloc, record, source_text, request);
 }
 
 /// Settled pages retain coordinates and receipts, while the accepted artifact
@@ -26465,7 +26496,7 @@ fn collectRuntimeDocumentExtractionDesiredKeysForUnit(
     for (runtime.index_manager.enrichments.items) |entry| {
         if (entry.kind != .chunk) continue;
         if (!std.mem.eql(u8, entry.source_artifact_name, artifact_name)) continue;
-        const chunks = if (entry.chunker_json.len > 0)
+        const chunks = (try storedSeededUnitChunksAlloc(runtime, alloc, doc_key, entry.name, unit, entry)) orelse if (entry.chunker_json.len > 0)
             try chunker_mod.chunkTextWithConfigJsonAndProvider(alloc, unit.text, entry.chunker_json, runtime.config.chunk_provider)
         else
             try chunker_mod.chunkText(alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
@@ -28999,11 +29030,12 @@ fn publishOrderedUnitChunksGenerationWithAllocator(runtime: *EnrichmentRuntime, 
         if (parsed_unit.?.route.owner_group_id != 0 or !std.mem.eql(u8, parsed_unit.?.route.route_status, "local_committed")) return error.OnlineMergeArtifactTailsUnsupported;
         unit = parsed_unit.?.unit;
         fingerprint = parsed_unit.?.fingerprint;
-        desired = if (config.chunker_json.len != 0)
+        const seeded_unit_chunks = try storedSeededUnitChunksAlloc(runtime, alloc, parent_request.doc_key, producer_name, unit, config);
+        desired = seeded_unit_chunks orelse if (config.chunker_json.len != 0)
             try chunker_mod.chunkTextWithConfigJsonAndProvider(alloc, unit.text, config.chunker_json, runtime.config.chunk_provider)
         else
             try chunker_mod.chunkText(alloc, unit.text, config.chunk_size, config.chunk_overlap);
-        document_extraction_mod.applyTranscriptTiming(unit, desired);
+        if (seeded_unit_chunks == null) document_extraction_mod.applyTranscriptTiming(unit, desired);
     }
     const count = @max(input.previous.count, desired.len);
     if (count >= ordered_publication.max_mutations) return error.ResourceBudgetExceeded;
@@ -29039,13 +29071,14 @@ fn appendRuntimeDocumentUnitChunkWrites(
     for (context.runtime.index_manager.enrichments.items) |entry| {
         if (entry.kind != .chunk) continue;
         if (!std.mem.eql(u8, entry.source_artifact_name, context.artifact_name)) continue;
-        const chunks = if (entry.chunker_json.len > 0)
+        const seeded_unit_chunks = try storedSeededUnitChunksAlloc(context.runtime, working_alloc, context.doc_key, entry.name, unit, entry);
+        const chunks = seeded_unit_chunks orelse if (entry.chunker_json.len > 0)
             try chunker_mod.chunkTextWithConfigJsonAndProvider(working_alloc, unit.text, entry.chunker_json, context.runtime.config.chunk_provider)
         else
             try chunker_mod.chunkText(working_alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
         defer chunker_mod.freeChunks(working_alloc, chunks);
         if (chunks.len == 0) continue;
-        document_extraction_mod.applyTranscriptTiming(unit, chunks);
+        if (seeded_unit_chunks == null) document_extraction_mod.applyTranscriptTiming(unit, chunks);
 
         const include_default_full_text = entry.full_text_index or
             try chunking_types_mod.parseHasFullTextIndexFromSlice(working_alloc, entry.chunker_json);
@@ -44310,7 +44343,9 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
     var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
     try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
-    try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
+    // The harness drives the lane by hand, with no heartbeat; a debug build of
+    // the long-key pressure cases can outlive the default lease.
+    try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true, .lease_ttl_ms = 600_000 });
     const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
     try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
     var plan = try db.core.index_manager.acquireWritePlanSnapshot();

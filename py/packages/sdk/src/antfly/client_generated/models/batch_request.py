@@ -76,6 +76,11 @@ class BatchRequest:
                 producer cannot accept reject the batch; they never fall back to
                 inference silently. A document carrying only seeds is rejected; use
                 a transform with `expected_version` to seed an existing document.
+
+                Chains seed in one write: an asset, the chunks of that asset (bound
+                to the seeded output) and the vectors of those chunks are all
+                accepted together, as are a document extraction and the
+                unit-scoped chunks of its units.
                  Example: {'user:123': {'name': 'John Doe', 'email': 'john@example.com', 'age': 30, 'tags': ['customer',
                 'premium']}, 'user:456': {'name': 'Jane Smith', 'email': 'jane@example.com', 'age': 25, 'tags': ['customer']}}.
             deletes (list[str] | Unset): Array of document IDs to delete. Documents are removed from all indexes.

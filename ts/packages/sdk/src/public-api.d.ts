@@ -11699,9 +11699,9 @@ export interface components {
         /**
          * @description Rendering of selected `_artifacts` and `_chunks`. `seed` emits exactly
          *     the artifact seed write shapes, vectors included, and omits descriptive
-         *     and internal fields. Outputs without a seed write shape (explicit
-         *     external vectors, sparse vectors, unit-scoped extraction children) are
-         *     omitted.
+         *     and internal fields. Document extraction assets export their extracted
+         *     text. Outputs without a seed write shape (explicit external vectors,
+         *     unit-scoped extraction children) are omitted.
          * @default descriptive
          * @enum {string}
          */
@@ -11753,8 +11753,10 @@ export interface components {
          *       `{ "text": "..." }`.
          *     - JSON asset: any JSON value.
          *     - Document extraction asset: `{ "text": "..." }`, the already
-         *       extracted plain text. No fetch, OCR or transcription runs; `source`
-         *       identifies the remote object it was extracted from.
+         *       extracted plain text, or `{ "units": [ExtractionUnitSeed] }`, the
+         *       extracted units themselves with their pages, layout and transcript
+         *       phrases. No fetch, OCR or transcription runs; `source` identifies
+         *       the remote object it was extracted from.
          *     - Document embedding: an array of finite numbers.
          *     - Chunk-derived embedding: an array of `ChunkVectorSeed`.
          *     - Sparse embedding: `{ "indices": [...], "values": [...] }` with
@@ -11808,6 +11810,16 @@ export interface components {
          * @description One chunk of a seeded chunk collection (`_chunks.<name>`), the plain
          *     shape a `_chunks` read returns minus internal fields. Chunk ids must be
          *     unique and ascending; character spans must lie within the source text.
+         *
+         *     Chunks of a document extraction's chunk consumer are unit-scoped: each
+         *     names its unit with `_parent_unit_id` (ids ascend within a unit) and
+         *     may carry its `_speaker`. They are accepted together with the
+         *     extraction seed in the same write and must name one of its units.
+         *     A collection is either entirely unit-scoped or not at all.
+         *
+         *     The accepted collection is kept for its input: later edits and replays
+         *     that leave the source text (or unit text) and the chunker
+         *     configuration unchanged keep it; a changed input is chunked again.
          */
         ChunkSeed: {
             /**
@@ -11822,6 +11834,35 @@ export interface components {
             _end_char?: number;
             _start_time_ms?: number;
             _end_time_ms?: number;
+            /** @description The extraction unit this chunk belongs to, e.g. `page:000003`. */
+            _parent_unit_id?: string;
+            /** @description Diarized speaker, `SPEAKER_NN` as reads label it, or its index. */
+            _speaker?: string | number;
+        };
+        /**
+         * @description One unit of a rich document extraction seed. Only data the caller has
+         *     is recorded; nothing absent (coordinates, timing) is fabricated. Unit
+         *     ids are `<unit_type>:<ordinal>`, numbered from 000001 in order.
+         */
+        ExtractionUnitSeed: {
+            text: string;
+            /** @description Defaults to `page` with a page number, `transcript` with spans, else `document` (the plain text route's unit). */
+            unit_type?: string;
+            page_number?: number;
+            page_label?: string;
+            page_bbox?: number[];
+            /** @enum {integer} */
+            page_rotation?: 0 | 90 | 180 | 270;
+            /** @description Ordered, disjoint transcript phrases in unit text coordinates. */
+            spans?: components["schemas"]["TranscriptSpanSeed"][];
+        };
+        TranscriptSpanSeed: {
+            char_start: number;
+            char_end: number;
+            start_ms: number;
+            end_ms: number;
+            /** @description `SPEAKER_NN` or a speaker index. */
+            speaker?: string | number;
         };
         /**
          * @description In-place document transformation using MongoDB-style operators. Transforms are applied atomically
@@ -12105,6 +12146,11 @@ export interface components {
              *     producer cannot accept reject the batch; they never fall back to
              *     inference silently. A document carrying only seeds is rejected; use
              *     a transform with `expected_version` to seed an existing document.
+             *
+             *     Chains seed in one write: an asset, the chunks of that asset (bound
+             *     to the seeded output) and the vectors of those chunks are all
+             *     accepted together, as are a document extraction and the
+             *     unit-scoped chunks of its units.
              * @example {
              *       "user:123": {
              *         "name": "John Doe",

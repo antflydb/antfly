@@ -28,6 +28,7 @@ const appendUniqueOwnedKey = @import("owned_keys.zig").appendUniqueOwnedKey;
 const apply_state = @import("derived/apply_state.zig");
 const artifact_ids = @import("artifact_ids.zig");
 const artifact_seeds = @import("artifact_seeds.zig");
+const artifact_seed_chunks = @import("artifact_seed_chunks.zig");
 const asset_producer_mod = @import("enrichment/asset_producer.zig");
 const backend_types = @import("../backend_types.zig");
 const build_options = @import("build_options");
@@ -1766,6 +1767,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try out.append(alloc, '}');
         }
 
+        /// The chunks of one extraction unit for one consumer: the accepted
+        /// unit-scoped seed when it was accepted for exactly this unit text
+        /// and chunker, else the chunker with transcript timing. Every site
+        /// that derives unit chunk keys or payloads goes through here, so
+        /// they always agree.
+        pub fn documentUnitChunksAlloc(alloc: Allocator, entry: DocumentExtractionChunkView, unit: document_extraction_mod.Unit) ![]chunker_mod.Chunk {
+            if (try artifact_seed_chunks.unitChunksForAlloc(chunker_mod, alloc, entry.unit_seed_record, unit.unit_id, unit.text, entry)) |seeded| return seeded;
+            const chunks = if (entry.chunker_json.len > 0)
+                try chunker_mod.chunkTextWithConfigJson(alloc, unit.text, entry.chunker_json)
+            else
+                try chunker_mod.chunkText(alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
+            document_extraction_mod.applyTranscriptTiming(unit, chunks);
+            return chunks;
+        }
+
         pub fn appendDocumentUnitChunkWrites(
             alloc: Allocator,
             db: anytype,
@@ -1785,13 +1801,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             preparation_memo: *GeneratedEmbeddingMemo,
         ) !void {
             for (view.chunks) |entry| {
-                const chunks = if (entry.chunker_json.len > 0)
-                    try chunker_mod.chunkTextWithConfigJson(alloc, unit.text, entry.chunker_json)
-                else
-                    try chunker_mod.chunkText(alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
+                const chunks = try documentUnitChunksAlloc(alloc, entry, unit);
                 defer chunker_mod.freeChunks(alloc, chunks);
                 if (chunks.len == 0) continue;
-                document_extraction_mod.applyTranscriptTiming(unit, chunks);
 
                 const text_indexes = entry.text_indexes;
 
@@ -1892,12 +1904,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             for (view.chunks) |entry| {
                 if (entry.text_indexes.len == 0) continue;
 
-                const chunks = if (entry.chunker_json.len > 0)
-                    try chunker_mod.chunkTextWithConfigJson(alloc, unit.text, entry.chunker_json)
-                else
-                    try chunker_mod.chunkText(alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
+                const chunks = try documentUnitChunksAlloc(alloc, entry, unit);
                 defer chunker_mod.freeChunks(alloc, chunks);
-                document_extraction_mod.applyTranscriptTiming(unit, chunks);
 
                 for (chunks) |chunk| {
                     if (!chunk.isText()) continue;
@@ -6389,10 +6397,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try desired_unit_keys.append(alloc, try internal_keys.documentUnitArtifactKeyAlloc(alloc, doc_key, artifact_name, unit.unit_id));
                 try desired_unit_fingerprints.append(alloc, try documentExtractionUnitFingerprintAlloc(alloc, unit));
                 for (view.chunks) |entry| {
-                    const chunks = if (entry.chunker_json.len > 0)
-                        try chunker_mod.chunkTextWithConfigJson(alloc, unit.text, entry.chunker_json)
-                    else
-                        try chunker_mod.chunkText(alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
+                    const chunks = try documentUnitChunksAlloc(alloc, entry, unit);
                     defer chunker_mod.freeChunks(alloc, chunks);
                     for (chunks) |chunk| {
                         try desired_chunk_keys.append(alloc, try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id)));
@@ -8274,6 +8279,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             request: enrichment_types.GeneratedEnrichmentRequest,
             items: []const std.json.Value,
             cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
+            artifact_writes: anytype,
         ) !void {
             if (!requestHasChunking(request)) return error.ArtifactSeedNotAccepted;
             const source_text = if (request.source_template.len > 0)
@@ -8289,22 +8295,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const text = source_text orelse return error.ArtifactSeedNotAccepted;
             const fields = try artifact_seeds.decodeChunksAlloc(alloc, items, text.len);
             defer alloc.free(fields);
-            const chunks = try alloc.alloc(chunker_mod.Chunk, fields.len);
-            var initialized: usize = 0;
-            errdefer {
-                for (chunks[0..initialized]) |*chunk| chunk.deinit(alloc);
-                alloc.free(chunks);
-            }
-            for (fields, chunks) |field, *chunk| {
-                chunk.* = .{
-                    .chunk_id = field.chunk_id,
-                    .text = try alloc.dupe(u8, field.content),
-                    .start_offset = field.start_char,
-                    .end_offset = field.end_char,
-                    .start_time_ms = field.start_time_ms,
-                    .end_time_ms = field.end_time_ms,
-                };
-                initialized += 1;
+            const chunks = try artifact_seed_chunks.chunksFromFieldsAlloc(chunker_mod, alloc, fields);
+            errdefer chunker_mod.freeChunks(alloc, chunks);
+            // The chunk producer records no input identity of its own: keep
+            // the accepted set with the input it was accepted for, so later
+            // preparations and replays of this same input reuse it.
+            {
+                const record_key = try artifact_seed_chunks.keyAlloc(alloc, request.doc_key, requestArtifactName(request));
+                defer alloc.free(record_key);
+                const record = try artifact_seed_chunks.encodeAlloc(alloc, artifact_seed_chunks.inputDigest(text, request), items);
+                defer alloc.free(record);
+                try appendPreparedArtifactCopy(alloc, artifact_writes, record_key, record);
             }
             const cache_key = try makeChunkCacheKey(alloc, request);
             errdefer alloc.free(cache_key);
@@ -8428,11 +8429,66 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         /// Plain-text seed for a document extraction asset.
         pub const ExtractionSeed = struct {
+            /// The seed's identity: the plain text, or the canonical rich
+            /// value when `units` is set.
             text: []const u8,
+            /// Rich form: the extracted units themselves (pages, layout,
+            /// transcript phrases), used as the extraction result.
+            units: []const artifact_seeds.ExtractionUnit = &.{},
+            /// The write's seeds, for unit-scoped chunks of this extraction's
+            /// chunk consumers.
+            chunk_seeds: ?*const artifact_seeds.Seeds = null,
             source: ?artifact_seeds.Source = null,
             policy: artifact_seeds.ConflictPolicy = .keep,
             result: *artifact_seeds.Result,
         };
+
+        /// A rich extraction seed as the extraction result: exactly the
+        /// caller's units, with no fetch, decode, OCR or transcription.
+        fn seededExtractionResultAlloc(alloc: Allocator, units: []const artifact_seeds.ExtractionUnit) !document_extraction_mod.Result {
+            const out = try alloc.alloc(document_extraction_mod.Unit, units.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (out[0..initialized]) |*unit| unit.deinit(alloc);
+                alloc.free(out);
+            }
+            for (units, out, 0..) |seed, *unit, index| {
+                const unit_id = try std.fmt.allocPrint(alloc, "{s}:{d:0>6}", .{ seed.unit_type, index + 1 });
+                errdefer alloc.free(unit_id);
+                const unit_type = try alloc.dupe(u8, seed.unit_type);
+                errdefer alloc.free(unit_type);
+                const text = try alloc.dupe(u8, seed.text);
+                errdefer alloc.free(text);
+                const method = try alloc.dupe(u8, "seeded");
+                errdefer alloc.free(method);
+                const page_label: ?[]u8 = if (seed.page_label) |label| try alloc.dupe(u8, label) else null;
+                errdefer if (page_label) |label| alloc.free(label);
+                const spans = try alloc.alloc(document_extraction_mod.TranscriptSpan, seed.spans.len);
+                for (seed.spans, spans) |span, *slot| slot.* = .{
+                    .char_start = span.char_start,
+                    .char_end = span.char_end,
+                    .start_ms = span.start_ms,
+                    .end_ms = span.end_ms,
+                    .speaker_index = span.speaker,
+                };
+                unit.* = .{
+                    .unit_id = unit_id,
+                    .unit_type = unit_type,
+                    .text = text,
+                    .method = method,
+                    .page_number = seed.page_number,
+                    .page_label = page_label,
+                    .page_bbox = seed.page_bbox,
+                    .page_rotation = seed.page_rotation,
+                    .transcript_used = spans.len > 0,
+                    .transcript_spans = spans,
+                };
+                initialized += 1;
+            }
+            const content_type = try alloc.dupe(u8, "text/plain");
+            errdefer alloc.free(content_type);
+            return .{ .content_type = content_type, .route_type = try alloc.dupe(u8, "seeded"), .units = out };
+        }
 
         fn seededExtractionFingerprintAlloc(alloc: Allocator, source_url: []const u8, config_json: []const u8, seed: ExtractionSeed) ![]u8 {
             var hasher = std.crypto.hash.sha2.Sha256.init(.{});
@@ -8491,7 +8547,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn computeDocumentExtractionAssetRequestDerived(
             alloc: Allocator,
             db: anytype,
-            view: *const DocumentExtractionCatalogView,
+            catalog_view: *const DocumentExtractionCatalogView,
             doc_value: []const u8,
             source_url: []const u8,
             request: enrichment_types.GeneratedEnrichmentRequest,
@@ -8508,6 +8564,30 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             extraction_seed: ?ExtractionSeed,
         ) !void {
             const artifact_name = requestArtifactName(request);
+            // Accepted unit-scoped chunk seeds of this document's consumers:
+            // stored records, replaced below by seeds in this write.
+            const seeded_chunk_views = try alloc.dupe(DocumentExtractionChunkView, catalog_view.chunks);
+            defer alloc.free(seeded_chunk_views);
+            var seeded_unit_records = std.ArrayListUnmanaged([]u8).empty;
+            defer {
+                for (seeded_unit_records.items) |record| alloc.free(record);
+                seeded_unit_records.deinit(alloc);
+            }
+            var has_unit_chunk_seeds = false;
+            for (seeded_chunk_views) |*entry| {
+                if (extraction_seed) |seed| if (seed.chunk_seeds) |seeds| if (seeds.chunks(entry.name) != null) {
+                    has_unit_chunk_seeds = true;
+                };
+                const record_key = try artifact_seed_chunks.unitKeyAlloc(alloc, request.doc_key, entry.name);
+                defer alloc.free(record_key);
+                const record = (try S.ownerField(db, "core").*.getStoreValue(alloc, record_key)) orelse continue;
+                errdefer alloc.free(record);
+                try seeded_unit_records.append(alloc, record);
+                entry.unit_seed_record = record;
+            }
+            var seeded_view = catalog_view.*;
+            seeded_view.chunks = seeded_chunk_views;
+            const view: *const DocumentExtractionCatalogView = &seeded_view;
             var config = try document_extraction_mod.parseConfig(alloc, config_json);
             defer config.deinit(alloc);
             enrichment_runtime_mod.applyDocumentExtractionRuntimePolicy(&config);
@@ -8552,7 +8632,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // identity: a seed keeps it (`keep`, reported as conflict)
                     // or replaces it; generation simply reuses it.
                     const keep = if (extraction_seed) |seed| seed.policy == .keep else true;
-                    if (keep and try reuseDocumentExtractionByFingerprint(alloc, db, request.doc_key, artifact_name, fingerprint, existing_state, existing_manifest, manifest_key, from_generation, artifact_writes, artifact_delete_keys)) {
+                    if (keep and !has_unit_chunk_seeds and try reuseDocumentExtractionByFingerprint(alloc, db, request.doc_key, artifact_name, fingerprint, existing_state, existing_manifest, manifest_key, from_generation, artifact_writes, artifact_delete_keys)) {
                         if (extraction_seed) |seed| seed.result.* = .{ .outcome = .conflict, .existing_origin = .generated };
                         return;
                     }
@@ -8660,7 +8740,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer if (byte_source_fingerprint) |fingerprint| alloc.free(fingerprint);
             const source_fingerprint = metadata_fingerprint orelse byte_source_fingerprint.?;
 
-            if (metadata_fingerprint == null and !must_force and (extraction_seed == null or extraction_seed.?.policy == .keep) and
+            if (metadata_fingerprint == null and !must_force and !has_unit_chunk_seeds and (extraction_seed == null or extraction_seed.?.policy == .keep) and
                 try reuseDocumentExtractionByFingerprint(alloc, db, request.doc_key, artifact_name, source_fingerprint, existing_state, existing_manifest, manifest_key, from_generation, artifact_writes, artifact_delete_keys))
             {
                 // The same seeded text was accepted before: unchanged.
@@ -8702,7 +8782,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var extraction_failure: runtime_failure_abi.FailureIdentity = .{};
             // Seeded text needs no isolated PDF/media decoder: the in-process
             // text route builds its units, with no URL-based routing.
-            var extraction = (if (extraction_seed != null)
+            var extraction = (if (extraction_seed != null and extraction_seed.?.units.len > 0)
+                seededExtractionResultAlloc(document_extraction_alloc, extraction_seed.?.units)
+            else if (extraction_seed != null)
                 document_extraction_mod.extractDownloadedAlloc(document_extraction_alloc, downloaded_mut, "", extraction_config)
             else
                 extractDocumentDownloadedAlloc(document_extraction_alloc, downloaded_mut, source_url, extraction_config, config_json, doc_value, &extraction_failure, preparation_memo.context)) catch |raw_err| {
@@ -8756,6 +8838,50 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 return error.MissingAssetProducer;
             }
             document_extraction_mod.rebaseUnitCharOffsets(extraction.units);
+            // Unit-scoped chunk seeds of this extraction's consumers become
+            // those units' chunks, recorded with the unit text they were
+            // accepted for so later replays of the same units keep them.
+            if (extraction_seed) |seed| if (seed.chunk_seeds) |seeds| for (seeded_chunk_views) |*entry| {
+                const chunk_entry = seeds.chunks(entry.name) orelse continue;
+                const record_key = try artifact_seed_chunks.unitKeyAlloc(alloc, request.doc_key, entry.name);
+                defer alloc.free(record_key);
+                switch (chunk_entry) {
+                    .delete => {
+                        try artifact_delete_keys.append(alloc, try alloc.dupe(u8, record_key));
+                        entry.unit_seed_record = null;
+                    },
+                    .artifact => return error.UnknownArtifactSeed,
+                    .chunks => |items| {
+                        for (items) |item| {
+                            const fields = try artifact_seeds.parseChunkObject(item);
+                            const parent = fields.parent_unit_id orelse return error.InvalidArtifactSeed;
+                            for (extraction.units) |unit| {
+                                if (std.mem.eql(u8, unit.unit_id, parent)) break;
+                            } else return error.InvalidArtifactSeed;
+                        }
+                        var unit_arena = std.heap.ArenaAllocator.init(alloc);
+                        defer unit_arena.deinit();
+                        var unit_seeds = std.ArrayListUnmanaged(artifact_seed_chunks.UnitSeed).empty;
+                        for (extraction.units) |unit| {
+                            var unit_items = std.ArrayListUnmanaged(std.json.Value).empty;
+                            for (items) |item| {
+                                const parent = item.object.get("_parent_unit_id").?.string;
+                                if (std.mem.eql(u8, parent, unit.unit_id)) try unit_items.append(unit_arena.allocator(), item);
+                            }
+                            if (unit_items.items.len == 0) continue;
+                            // Validate spans against the unit now: a bad seed fails the write.
+                            const fields = try artifact_seeds.decodeUnitChunksAlloc(alloc, unit_items.items, unit.unit_id, unit.text.len);
+                            alloc.free(fields);
+                            try unit_seeds.append(unit_arena.allocator(), .{ .unit_id = unit.unit_id, .text = unit.text, .items = unit_items.items });
+                        }
+                        const record = try artifact_seed_chunks.encodeUnitRecordAlloc(alloc, entry.*, unit_seeds.items);
+                        errdefer alloc.free(record);
+                        try seeded_unit_records.append(alloc, record);
+                        entry.unit_seed_record = record;
+                        try appendPreparedArtifactCopy(alloc, artifact_writes, record_key, record);
+                    },
+                }
+            };
 
             var desired_unit_keys = std.ArrayListUnmanaged([]const u8).empty;
             defer {
@@ -10289,12 +10415,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (!(try storeKeyExists(alloc, db, unit_key))) return false;
 
             for (view.chunks) |entry| {
-                const chunks = if (entry.chunker_json.len > 0)
-                    try chunker_mod.chunkTextWithConfigJson(alloc, unit.text, entry.chunker_json)
-                else
-                    try chunker_mod.chunkText(alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
+                const chunks = try documentUnitChunksAlloc(alloc, entry, unit);
                 defer chunker_mod.freeChunks(alloc, chunks);
-                document_extraction_mod.applyTranscriptTiming(unit, chunks);
 
                 var arena_state = std.heap.ArenaAllocator.init(alloc);
                 defer arena_state.deinit();
@@ -11108,6 +11230,56 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return true;
         }
 
+        /// The accepted chunk seed stored for `request` when it was accepted
+        /// for exactly `source_text` and this chunker configuration.
+        pub fn storedSeededChunksAlloc(alloc: Allocator, db: anytype, request: enrichment_types.GeneratedEnrichmentRequest, source_text: []const u8) !?[]chunker_mod.Chunk {
+            const key = try artifact_seed_chunks.keyAlloc(alloc, request.doc_key, requestArtifactName(request));
+            defer alloc.free(key);
+            const record = try S.ownerField(db, "core").*.getStoreValue(alloc, key);
+            defer if (record) |bytes| alloc.free(bytes);
+            return try artifact_seed_chunks.chunksForInputAlloc(chunker_mod, alloc, record, source_text, request);
+        }
+
+        /// Drops an accepted chunk seed: the chunker output for this input
+        /// becomes the collection again, in this same write.
+        pub fn installGeneratedChunks(
+            alloc: Allocator,
+            db: anytype,
+            doc_value: []const u8,
+            request: enrichment_types.GeneratedEnrichmentRequest,
+            cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
+            artifact_delete_keys: anytype,
+        ) !void {
+            const record_key = try artifact_seed_chunks.keyAlloc(alloc, request.doc_key, requestArtifactName(request));
+            errdefer alloc.free(record_key);
+            try artifact_delete_keys.append(alloc, record_key);
+            const source_text = if (request.source_template.len > 0)
+                renderSourceTemplateText(alloc, db, request.source_template, doc_value) catch |err| switch (err) {
+                    error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                    else => null,
+                }
+            else
+                try extractStringField(alloc, doc_value, request.source_field);
+            defer if (source_text) |text| alloc.free(text);
+            const chunks = if (source_text == null or source_text.?.len == 0)
+                try alloc.alloc(chunker_mod.Chunk, 0)
+            else if (request.chunker_json.len > 0)
+                try chunker_mod.chunkTextWithConfigJsonControlled(alloc, source_text.?, request.chunker_json, null)
+            else
+                try chunker_mod.chunkText(alloc, source_text.?, request.chunk_size, request.chunk_overlap);
+            errdefer chunker_mod.freeChunks(alloc, chunks);
+            const cache_key = try makeChunkCacheKey(alloc, request);
+            errdefer alloc.free(cache_key);
+            for (cache.items) |*entry| {
+                if (!std.mem.eql(u8, entry.key, cache_key)) continue;
+                alloc.free(cache_key);
+                chunker_mod.freeChunks(alloc, entry.chunks);
+                entry.chunks = chunks;
+                return;
+            }
+            try cache.append(alloc, .{ .key = cache_key, .chunks = chunks });
+        }
+
         pub fn getOrCreateChunks(
             alloc: Allocator,
             db: anytype,
@@ -11142,6 +11314,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 return cache.items[cache.items.len - 1].chunks;
             }
             defer alloc.free(source_text.?);
+
+            // An accepted chunk seed is this producer's output while its input
+            // is unchanged (`artifact_seed_chunks.zig`).
+            if (try storedSeededChunksAlloc(alloc, db, request, source_text.?)) |seeded| {
+                errdefer chunker_mod.freeChunks(alloc, seeded);
+                try cache.append(alloc, .{ .key = cache_key, .chunks = seeded });
+                return cache.items[cache.items.len - 1].chunks;
+            }
 
             const context = if (@hasField(@TypeOf(db.*), "preparation_context")) db.preparation_context else null;
             if (context) |control| try control.check();

@@ -29,8 +29,10 @@ class ArtifactSeed:
       `{ "text": "..." }`.
     - JSON asset: any JSON value.
     - Document extraction asset: `{ "text": "..." }`, the already
-      extracted plain text. No fetch, OCR or transcription runs; `source`
-      identifies the remote object it was extracted from.
+      extracted plain text, or `{ "units": [ExtractionUnitSeed] }`, the
+      extracted units themselves with their pages, layout and transcript
+      phrases. No fetch, OCR or transcription runs; `source` identifies
+      the remote object it was extracted from.
     - Document embedding: an array of finite numbers.
     - Chunk-derived embedding: an array of `ChunkVectorSeed`.
     - Sparse embedding: `{ "indices": [...], "values": [...] }` with

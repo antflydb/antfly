@@ -92,6 +92,8 @@ pub fn loadTxn(alloc: Allocator, doc_key: []const u8, txn: *docstore_mod.DocStor
         const prefix = try internal_keys.artifactTypePrefixAlloc(a, doc_key, "asset");
         const rows = try docstore_mod.DocStore.scanPrefixTxn(a, txn, prefix);
         var extraction_text = std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged(u8)).empty;
+        var extraction_units = std.StringArrayHashMapUnmanaged(std.json.Value).empty;
+        var rich_extraction = false;
         for (rows) |row| {
             const ref = (try decodeRef(a, row.key)) orelse continue;
             if (ref.kind != .asset or ref.chunk_id != null) continue;
@@ -100,12 +102,27 @@ pub fn loadTxn(alloc: Allocator, doc_key: []const u8, txn: *docstore_mod.DocStor
             if (asset.mode == .extraction_text) {
                 const text = try extraction_text.getOrPut(a, ref.name);
                 if (!text.found_existing) text.value_ptr.* = .empty;
+                const units = try extraction_units.getOrPut(a, ref.name);
+                if (!units.found_existing) units.value_ptr.* = .{ .array = std.json.Array.init(a) };
                 if (ref.unit_id == null) continue;
                 const unit = std.json.parseFromSliceLeaky(std.json.Value, a, row.value, .{}) catch continue;
                 const unit_text = if (unit == .object) unit.object.get("text") else null;
                 if (unit_text == null or unit_text.? != .string) continue;
                 if (text.value_ptr.items.len != 0) try text.value_ptr.appendSlice(a, "\n\n");
                 try text.value_ptr.appendSlice(a, unit_text.?.string);
+                // The rich form keeps each unit's type and page data.
+                var exported = std.json.ObjectMap.empty;
+                try exported.put(a, "text", unit_text.?);
+                const unit_type = unit.object.get("unit_type");
+                if (unit_type) |value| if (value == .string) try exported.put(a, "unit_type", value);
+                if (unit.object.get("provenance")) |provenance| if (provenance == .object) {
+                    inline for (.{ "page_number", "page_label", "page_bbox", "page_rotation" }) |field| {
+                        if (provenance.object.get(field)) |value| if (value != .null) try exported.put(a, field, value);
+                    }
+                };
+                // The plain text route's single `document` unit is the text form.
+                if (!(unit_type != null and unit_type.? == .string and std.mem.eql(u8, unit_type.?.string, "document")) or exported.count() > 2) rich_extraction = true;
+                try units.value_ptr.array.append(.{ .object = exported });
                 continue;
             }
             if (asset.mode != .value or ref.unit_id != null) continue;
@@ -118,7 +135,14 @@ pub fn loadTxn(alloc: Allocator, doc_key: []const u8, txn: *docstore_mod.DocStor
         var texts = extraction_text.iterator();
         while (texts.next()) |entry| {
             var object = std.json.ObjectMap.empty;
-            try object.put(a, "text", .{ .string = entry.value_ptr.items });
+            // One plain text unit exports as text; anything richer (pages,
+            // typed or several units) exports its units.
+            const units = extraction_units.get(entry.key_ptr.*).?;
+            if (rich_extraction or units.array.items.len > 1) {
+                try object.put(a, "units", units);
+            } else {
+                try object.put(a, "text", .{ .string = entry.value_ptr.items });
+            }
             try artifacts.put(a, entry.key_ptr.*, try envelope(a, .{ .object = object }));
         }
     }
@@ -157,12 +181,14 @@ pub fn loadTxn(alloc: Allocator, doc_key: []const u8, txn: *docstore_mod.DocStor
         defer cursor.close();
         while (try cursor.next()) |entry| {
             const ref = (try decodeRef(a, entry.key)) orelse continue;
-            if (ref.unit_id != null) continue;
             if (@import("../../privacy/document.zig").isManagedArtifactName(ref.name)) continue;
             var parsed = std.json.parseFromSliceLeaky(std.json.Value, a, entry.value, .{ .parse_numbers = false }) catch continue;
             if (parsed != .object) continue;
-            // Unit-scoped chunks belong to a document extraction manifest.
-            if (parsed.object.get("_parent_unit_id") != null or parsed.object.get("_parent_unit_key") != null) continue;
+            // Unit-scoped chunks of a document extraction export their unit
+            // and speaker; every other chunk names neither.
+            const unit_id = ref.unit_id;
+            if (unit_id == null and (parsed.object.get("_parent_unit_id") != null or parsed.object.get("_parent_unit_key") != null)) continue;
+            const speaker = parsed.object.get("_speaker");
             try db_query_projection.normalizeChunkArtifactForQuery(a, &parsed);
             var chunk = std.json.ObjectMap.empty;
             try chunk.put(a, "_chunk_id", .{ .integer = ref.chunk_id orelse continue });
@@ -183,6 +209,10 @@ pub fn loadTxn(alloc: Allocator, doc_key: []const u8, txn: *docstore_mod.DocStor
             if (chunk.contains("_start_time_ms") != chunk.contains("_end_time_ms")) {
                 _ = chunk.swapRemove("_start_time_ms");
                 _ = chunk.swapRemove("_end_time_ms");
+            }
+            if (unit_id) |id| {
+                try chunk.put(a, "_parent_unit_id", .{ .string = id });
+                if (speaker) |label| if (label == .string) try chunk.put(a, "_speaker", label);
             }
             const set = try chunk_sets.getOrPut(a, ref.name);
             if (!set.found_existing) set.value_ptr.* = .{ .array = std.json.Array.init(a) };

@@ -93,6 +93,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const computeSeededDenseRequestDerived = S.computeSeededDenseRequestDerived;
         const computeSeededDenseChunkRequestDerived = S.computeSeededDenseChunkRequestDerived;
         const installSeededChunks = S.installSeededChunks;
+        const installGeneratedChunks = S.installGeneratedChunks;
         const computeSeededSparseRequestDerived = S.computeSeededSparseRequestDerived;
         const computeSparseRequestDerived = S.computeSparseRequestDerived;
         const containsName = S.containsName;
@@ -1400,7 +1401,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // field mappings (`seed: {field, ...}`) for the same output.
                 var row_seeds: ?artifact_seeds.Seeds = if (extracted[i].artifact_seeds_json) |json| try artifact_seeds.Seeds.parse(alloc, json) else null;
                 defer if (row_seeds) |*seeds| seeds.deinit();
-                if (row_seeds) |*seeds| try requireEverySeedMatchesRequest(alloc, seeds, generated);
+                if (row_seeds) |*seeds| try requireEverySeedMatchesRequest(alloc, self, seeds, generated);
                 const row_policy: artifact_seeds.ConflictPolicy = if (row_seeds) |*seeds| seeds.conflictPolicy() else .keep;
                 var mapping_arena = std.heap.ArenaAllocator.init(alloc);
                 defer mapping_arena.deinit();
@@ -1416,19 +1417,28 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     }
                     if (slot.* != null) seeded_row = true;
                 }
+                if (row_seeds) |*seeds| try requireUnitChunkSeedsBound(alloc, self, seeds, generated, request_seeds);
                 // Seeded chunks become this revision's chunker output before
                 // any chunk record, text or inline-embedding consumer runs.
                 if (seeded_row) for (generated) |request| {
                     const consumes_chunks = request.kind == .chunk_text or (request.kind == .dense_embedding and request.input_kind == .inline_chunks);
                     if (!consumes_chunks) continue;
+                    // Chunks of an upstream output bind to that output, which
+                    // is prepared in order below.
+                    if (request.upstream_artifact_name.len != 0) continue;
+                    const source = (if (request.source_template.len > 0) try extracted[i].logicalJson() else try extracted[i].logicalJsonForField(request.source_field)).?;
+                    if (chunkSeedDeleted(generated, request_seeds, requestArtifactName(request))) {
+                        // A dropped collection is chunked again in this write.
+                        try installGeneratedChunks(alloc, self, source, request, &chunk_cache, &artifact_delete_keys);
+                        continue;
+                    }
                     const explicit_chunks: ?[]const std.json.Value = if (row_seeds) |*seeds| if (seeds.chunks(requestArtifactName(request))) |explicit| switch (explicit) {
                         .chunks => |items| items,
                         .delete, .artifact => null,
                     } else null else null;
                     const entry = explicit_chunks orelse chunkSeedFor(generated, request_seeds, requestArtifactName(request)) orelse continue;
                     try requireSeedableRequest(request);
-                    const source = (if (request.source_template.len > 0) try extracted[i].logicalJson() else try extracted[i].logicalJsonForField(request.source_field)).?;
-                    try installSeededChunks(alloc, self, source, request, entry, &chunk_cache);
+                    try installSeededChunks(alloc, self, source, request, entry, &chunk_cache, &artifact_writes);
                 };
                 var inline_embedding_cleanup = InlineChunkEmbeddingCleanup{};
                 defer inline_embedding_cleanup.deinit(alloc);
@@ -1485,10 +1495,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (seed == null) unseeded_index += 1;
                     if (seed) |entry| {
                         try requireSeedableRequest(request);
-                        if (entry == .delete and request.kind == .dense_embedding and request.input_kind != .document) {
+                        if (entry == .delete and ((request.kind == .dense_embedding and request.input_kind != .document) or request.kind == .chunk_text)) {
                             // Chunk-derived vectors live beneath each chunk
-                            // and keep their index entries; they are
+                            // and keep their index entries, and a chunk
+                            // collection was chunked again above: both are
                             // regenerated below, in this write, without reuse.
+                            if (request.upstream_artifact_name.len != 0) return error.ArtifactSeedNotAccepted;
                             try appendSeedOutcome(alloc, &seed_outcomes, request, .{ .outcome = .deleted });
                         } else if (entry == .delete) {
                             // Drop the accepted output so its producer
@@ -1554,8 +1566,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                 // Document extraction seeds run the native text
                                 // route in place of fetching and OCR.
                                 var extraction_result: artifact_seeds.Result = .{ .outcome = .accepted };
+                                // Rich seeds carry the units themselves; the
+                                // canonical value is their identity.
+                                const extraction_units: []artifact_seeds.ExtractionUnit = if (seed) |entry| try artifact_seeds.decodeExtractionUnitsAlloc(alloc, entry.artifact.value) else &.{};
+                                defer artifact_seeds.freeExtractionUnits(alloc, extraction_units);
+                                const extraction_identity: ?[]u8 = if (extraction_units.len > 0) try std.json.Stringify.valueAlloc(alloc, seed.?.artifact.value, .{}) else null;
+                                defer if (extraction_identity) |bytes| alloc.free(bytes);
                                 const extraction_seed: ?S.ExtractionSeed = if (seed) |entry| .{
-                                    .text = try artifact_seeds.assetText(entry.artifact.value),
+                                    .text = extraction_identity orelse try artifact_seeds.assetText(entry.artifact.value),
+                                    .units = extraction_units,
+                                    .chunk_seeds = if (row_seeds) |*seeds| seeds else null,
                                     .source = entry.artifact.source,
                                     .policy = row_policy,
                                     .result = &extraction_result,
@@ -1588,16 +1608,37 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             }
                         },
                         .chunk_text => {
-                            // Chunk collections have no input-identity record:
-                            // the seeded set becomes this revision's chunks.
-                            if (seed != null) try appendSeedOutcome(alloc, &seed_outcomes, request, .{ .outcome = .accepted });
+                            // The seeded set becomes this revision's chunks
+                            // and is kept for this input (`artifact_seed_chunks`).
+                            if (seed != null and seed.? != .delete) try appendSeedOutcome(alloc, &seed_outcomes, request, .{ .outcome = .accepted });
+                            if (seed != null and request.upstream_artifact_name.len != 0 and try upstreamIsDocumentExtraction(alloc, self, request.upstream_artifact_name)) {
+                                // Unit-scoped chunks of a document extraction
+                                // are accepted by that extraction, which must
+                                // be seeded in this same write.
+                                if (seed.? != .chunks or !assetSeededInWrite(generated, request_seeds, request.upstream_artifact_name)) return error.ArtifactSeedNotAccepted;
+                                try appendGeneratedEnrichmentRef(alloc, &planned, request);
+                                continue;
+                            }
+                            // Chunks of an upstream output bind to the output
+                            // prepared earlier in this write.
+                            const upstream_document: ?[]u8 = if (seed != null and request.upstream_artifact_name.len != 0) upstream: {
+                                const items = switch (seed.?) {
+                                    .chunks => |items| items,
+                                    .delete, .artifact => return error.ArtifactSeedNotAccepted,
+                                };
+                                const document = try upstreamChunkDocumentAlloc(alloc, self, request, &artifact_writes);
+                                errdefer alloc.free(document);
+                                try installSeededChunks(alloc, self, document, request, items, &chunk_cache, &artifact_writes);
+                                break :upstream document;
+                            } else null;
+                            defer if (upstream_document) |document| alloc.free(document);
                             const writes_before = artifact_writes.items.len;
                             const docs_before = documents.items.len;
                             const deletes_before = artifact_delete_keys.items.len;
                             try computeChunkRequestDerived(
                                 alloc,
                                 self,
-                                cleaned,
+                                upstream_document orelse cleaned,
                                 request,
                                 &artifact_writes,
                                 &artifact_delete_keys,
@@ -2127,6 +2168,79 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
         }
 
+        /// The document extraction a chunk enrichment consumes, if any.
+        fn extractionConsumerSource(alloc: Allocator, db: anytype, chunk_name: []const u8) !?[]const u8 {
+            const chunk = S.ownerField(db, "core").*.index_manager.getEnrichment(.chunk, chunk_name) orelse return null;
+            if (chunk.source_artifact_name.len == 0) return null;
+            return if (try upstreamIsDocumentExtraction(alloc, db, chunk.source_artifact_name)) chunk.source_artifact_name else null;
+        }
+
+        /// Unit-scoped chunk seeds bind to units of the extraction seeded in
+        /// the same write; without that seed nothing would accept them.
+        fn requireUnitChunkSeedsBound(alloc: Allocator, db: anytype, seeds: *const artifact_seeds.Seeds, requests: []const enrichment_types.GeneratedEnrichmentRequest, request_seeds: []const ?artifact_seeds.Entry) !void {
+            const names = try seeds.names(alloc);
+            defer alloc.free(names);
+            for (names) |seeded| {
+                if (seeded.field != .chunks) continue;
+                const source = (try extractionConsumerSource(alloc, db, seeded.name)) orelse continue;
+                if (!assetSeededInWrite(requests, request_seeds, source)) return error.ArtifactSeedNotAccepted;
+            }
+        }
+
+        fn upstreamIsDocumentExtraction(alloc: Allocator, db: anytype, name: []const u8) !bool {
+            const upstream = S.ownerField(db, "core").*.index_manager.getEnrichment(.asset, name) orelse return false;
+            var producer = try @import("enrichment/asset_producer.zig").parseProducerConfig(alloc, upstream.producer_json);
+            defer producer.deinit(alloc);
+            return producer.type == .document_extraction;
+        }
+
+        fn assetSeededInWrite(requests: []const enrichment_types.GeneratedEnrichmentRequest, seeds: []const ?artifact_seeds.Entry, name: []const u8) bool {
+            for (requests, seeds) |request, seed| {
+                if (request.kind != .asset or !std.mem.eql(u8, requestArtifactName(request), name)) continue;
+                const entry = seed orelse return false;
+                return entry == .artifact;
+            }
+            return false;
+        }
+
+        /// Whether the chunk request named `name` drops its accepted seed.
+        fn chunkSeedDeleted(requests: []const enrichment_types.GeneratedEnrichmentRequest, seeds: []const ?artifact_seeds.Entry, name: []const u8) bool {
+            for (requests, seeds) |request, seed| {
+                if (request.kind != .chunk_text or !std.mem.eql(u8, requestArtifactName(request), name)) continue;
+                const entry = seed orelse return false;
+                return entry == .delete;
+            }
+            return false;
+        }
+
+        /// The document an upstream chunk request reads: the upstream asset
+        /// output prepared earlier in this write (seeded, or generated
+        /// synchronously), in the shape the replay worker chunks. An upstream
+        /// whose output is not in this write cannot bind a chunk seed.
+        fn upstreamChunkDocumentAlloc(alloc: Allocator, db: anytype, request: enrichment_types.GeneratedEnrichmentRequest, artifact_writes: anytype) ![]u8 {
+            const privacy = @import("../../privacy/document.zig");
+            if (privacy.isProtectedArtifactName(request.upstream_artifact_name) or privacy.consumerPolicyVersion(request.upstream_artifact_name) != null) return error.ArtifactSeedNotAccepted;
+            const upstream = S.ownerField(db, "core").*.index_manager.getEnrichment(.asset, request.upstream_artifact_name) orelse return error.ArtifactSeedNotAccepted;
+            var producer = try @import("enrichment/asset_producer.zig").parseProducerConfig(alloc, upstream.producer_json);
+            defer producer.deinit(alloc);
+            // Extraction units and transcripts chunk inside their producer.
+            if (producer.type == .media_output or producer.type == .document_extraction) return error.ArtifactSeedNotAccepted;
+            const key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", request.upstream_artifact_name);
+            defer alloc.free(key);
+            const bytes = bytes: {
+                var i = artifact_writes.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    if (std.mem.eql(u8, artifact_writes.items[i].key, key)) break :bytes artifact_writes.items[i].value;
+                }
+                return error.ArtifactSeedNotAccepted;
+            };
+            return if (std.mem.eql(u8, upstream.content_type, "text/plain"))
+                try std.json.Stringify.valueAlloc(alloc, .{ .text = bytes }, .{})
+            else
+                try alloc.dupe(u8, bytes);
+        }
+
         /// The seeded chunk set for `name`: the chunk request's seed, which
         /// inline chunk embeddings of the same name consume too.
         fn chunkSeedFor(requests: []const enrichment_types.GeneratedEnrichmentRequest, seeds: []const ?artifact_seeds.Entry, name: []const u8) ?[]const std.json.Value {
@@ -2177,10 +2291,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         /// Every seeded name must address a producer request of this row.
         /// Names that match no declared, applicable enrichment fail visibly.
-        pub fn requireEverySeedMatchesRequest(alloc: Allocator, seeds: *const artifact_seeds.Seeds, requests: []const enrichment_types.GeneratedEnrichmentRequest) !void {
+        pub fn requireEverySeedMatchesRequest(alloc: Allocator, db: anytype, seeds: *const artifact_seeds.Seeds, requests: []const enrichment_types.GeneratedEnrichmentRequest) !void {
             const names = try seeds.names(alloc);
             defer alloc.free(names);
             for (names) |seeded| {
+                // Unit-scoped chunks of a document extraction's consumer are
+                // accepted by that extraction (checked against its seed below).
+                if (seeded.field == .chunks) if (try extractionConsumerSource(alloc, db, seeded.name)) |source| {
+                    for (requests) |request| {
+                        if (request.kind == .asset and std.mem.eql(u8, requestArtifactName(request), source)) break;
+                    } else return error.UnknownArtifactSeed;
+                    continue;
+                };
                 const matched = for (requests) |request| {
                     const name = switch (request.kind) {
                         .chunk_text => if (seeded.field == .chunks) requestArtifactName(request) else continue,
@@ -2207,7 +2329,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             if (request.requires_committed_graph or request.neighbor_context_json.len != 0 or request.context_sources_json.len != 0) return error.ArtifactSeedNotAccepted;
             if (request.group_source_json.len != 0) return error.ArtifactSeedNotAccepted;
-            if (request.kind != .asset and request.upstream_artifact_name.len != 0) return error.ArtifactSeedNotAccepted;
+            // Chunks and chunk-derived vectors of an upstream asset bind to the
+            // upstream output prepared in the same write; sparse vectors of
+            // chunks bind per chunk and are not seedable.
+            if (request.kind == .sparse_embedding and request.upstream_artifact_name.len != 0) return error.ArtifactSeedNotAccepted;
             if (request.embedding_input == .pdf_page_images) return error.ArtifactSeedNotAccepted;
         }
 
@@ -2231,8 +2356,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     errdefer alloc.free(key);
                     try artifact_delete_keys.append(alloc, key);
                 },
-                // The chunk producer re-chunks every source revision.
-                .chunk_text => {},
+                // Chunk collections are chunked again in preparation.
+                .chunk_text => return error.ArtifactSeedNotAccepted,
                 .sparse_embedding => {
                     if (request.input_kind != .document) return error.ArtifactSeedNotAccepted;
                     const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, request.doc_key, requestEmbeddingName(request));

@@ -1083,6 +1083,10 @@ pub fn resolveJsonNullFields(a: Allocator, before: []const []const u8, json_colu
     for (json_columns) |column| try columns.put(a, column, {});
     var flags: std.StringHashMapUnmanaged(void) = .empty;
     defer flags.deinit(a);
+    // Rename destinations become flag keys; their parsed bytes must outlive
+    // every later lookup in this loop.
+    var rename_arena = std.heap.ArenaAllocator.init(a);
+    defer rename_arena.deinit();
     for (before) |field| if (columns.contains(field)) try flags.put(a, field, {});
     for (transform.operations) |operation| {
         if (operation.op == .set_on_insert and !is_insert) continue;
@@ -1091,10 +1095,9 @@ pub fn resolveJsonNullFields(a: Allocator, before: []const []const u8, json_colu
         const root = path.parts[0];
         if (operation.op == .rename) {
             const bytes = operation.value_json orelse return error.InvalidArgument;
-            var parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
-            defer parsed.deinit();
-            if (parsed.value != .string) return error.InvalidArgument;
-            const destination = try normalizeJsonPath(parsed.value.string);
+            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, rename_arena.allocator(), bytes, .{});
+            if (parsed != .string) return error.InvalidArgument;
+            const destination = try normalizeJsonPath(parsed.string);
             if (destination.len == 0) return error.InvalidArgument;
             const retained_null = path.len == 1 and flags.contains(root);
             _ = flags.remove(root);

@@ -7425,7 +7425,9 @@ pub const IndexManager = struct {
         return manager.hbcCachePolicy().target_bytes > 0;
     }
 
-    fn reopenDenseIndexStorage(self: *IndexManager, entry: *DenseIndex, path: []const u8) !void {
+    const DenseReopen = enum { existing, fresh };
+
+    fn reopenDenseIndexStorage(self: *IndexManager, entry: *DenseIndex, path: []const u8, reopen: DenseReopen) !void {
         const zpath = try self.alloc.dupeSentinel(u8, path, 0);
         defer self.alloc.free(zpath);
 
@@ -7469,7 +7471,7 @@ pub const IndexManager = struct {
             .cache = self.lsm_cache,
             .root_generation = self.lsm_root_generation,
             .native_catalog_sink = self.dense_main_native_catalog_sink,
-            .require_native_posting_authority = entry.native_physical_v2,
+            .require_native_posting_authority = entry.native_physical_v2 and reopen == .existing,
         });
         errdefer entry.index.close();
 
@@ -7545,7 +7547,10 @@ pub const IndexManager = struct {
         deleteIndexDirIfPresent(path);
         entry.ordinal_vector_ids.clearRetainingCapacity();
         entry.vector_ordinals.clearRetainingCapacity();
-        try self.reopenDenseIndexStorage(entry, path);
+        // The directory, and with it any native posting authority, is gone:
+        // a v2 index rebuilds that authority from this empty root, through
+        // the compatibility store, like any repair candidate.
+        try self.reopenDenseIndexStorage(entry, path, .fresh);
     }
 
     pub fn resetSparseIndexForArtifactRebuild(self: *IndexManager, index_name: []const u8) !void {

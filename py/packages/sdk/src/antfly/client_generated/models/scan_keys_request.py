@@ -76,9 +76,9 @@ class ScanKeysRequest:
                  Example: ['title', 'author', 'metadata.tags'].
             artifact_view (ArtifactView | Unset): Rendering of selected `_artifacts` and `_chunks`. `seed` emits exactly
                 the artifact seed write shapes, vectors included, and omits descriptive
-                and internal fields. Outputs without a seed write shape (explicit
-                external vectors, sparse vectors, unit-scoped extraction children) are
-                omitted.
+                and internal fields. Document extraction assets export their extracted
+                text. Outputs without a seed write shape (explicit external vectors,
+                unit-scoped extraction children) are omitted.
             filter_query (AutocompleteQuery | BooleanQuery | BoolFieldQuery | BoolQuery | ConjunctionQuery | ContainsQuery |
                 DateRangeStringQuery | DisjunctionQuery | DocIdQuery | EqualsQuery | FuzzyQuery | GeoBoundingBoxQuery |
                 GeoBoundingPolygonQuery | GeoDistanceQuery | GeoShapeQuery | IPRangeQuery | MatchAllQuery | MatchesQuery |

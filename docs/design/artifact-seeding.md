@@ -50,11 +50,11 @@ Seeds travel in the document, under reserved fields keyed by enrichment name:
 | --- | --- |
 | Text asset | String, or `{ "text": ... }`. `""` is a valid complete result, distinct from missing. |
 | JSON asset | Any JSON value. |
-| Document extraction asset | `{ "text": ... }`: already extracted plain text. No fetch, OCR or transcription runs. |
+| Document extraction asset | `{ "text": ... }`: already extracted plain text, or `{ "units": [...] }`: the extracted units with pages, layout and transcript phrases (see Rich document extraction). No fetch, OCR or transcription runs. |
 | Document embedding | Array of finite numbers; length must match the enrichment's dimensions. |
 | Chunk-derived embedding | `[{ chunk_id, window_index?, vector }]`. |
 | Sparse embedding | `{ "indices": [...], "values": [...] }` with strictly ascending indices, or a token-weight map. |
-| Chunk collection | `_chunks.<name>`: `[{ _chunk_id (or _id), _content, _start_char?, _end_char?, _start_time_ms?, _end_time_ms? }]`. |
+| Chunk collection | `_chunks.<name>`: `[{ _chunk_id (or _id), _content, _start_char?, _end_char?, _start_time_ms?, _end_time_ms?, _parent_unit_id?, _speaker? }]`. Unit-scoped fields only for chunks of a document extraction's units. |
 
 `"<name>": null` drops accepted output so the producer regenerates it
 (chunk-derived vectors are embedded again in the same write; with no embedder
@@ -236,28 +236,87 @@ extraction assets export their text; explicit external vectors (exported
 through `_embeddings`) and unit-scoped extraction children are omitted. The
 view is forwarded through the storage kernel wire, routed lookups and scans.
 
+### Chains
+
+Seeds chain through upstream outputs in one write. Chunks of an asset
+(`source_artifact_name`) bind to that asset's output prepared earlier in the
+same write, seeded or generated synchronously, read in the same shape the
+replay worker chunks; vectors of those chunks bind to the chunk rows prepared
+in the write. An upstream whose output is not in the write cannot bind a
+chunk seed (`ArtifactSeedNotAccepted`). A document extraction and the chunks
+of its units chain the same way (see below).
+
+### Chunk retention
+
+The chunk producer records no input identity of its own and re-chunks every
+revision it processes. An accepted chunk collection is therefore recorded
+with the input it was accepted for (`artifact_seed_chunks.zig`): the
+digest of the producer's source text and chunker configuration, beside the
+seeded chunks, in the document's asset-state family (so deletion, backup
+and restore carry it). Synchronous preparation (`getOrCreateChunks`) and the
+replay worker (`getOrCreateRequestChunksWithProvider`, including chunks of an
+upstream output) consult it before chunking: while the input is unchanged
+the seeded set is the output, so unrelated edits and replays keep it. A
+changed input or chunker configuration falls back to the chunker. `null`
+chunks the input again in that same write and deletes the record.
+
+### Rich document extraction
+
+Besides `{ "text": ... }`, a document extraction seed may carry the
+extracted units themselves:
+
+```json
+{
+  "url": "gs://bucket/interview.pdf",
+  "_artifacts": { "extracted": { "value": { "units": [
+    { "text": "Quarterly revenue grew.", "page_number": 3, "page_label": "iii", "page_bbox": [0, 0, 612, 792] },
+    { "text": "Hello there. Hi.", "spans": [
+      { "char_start": 0, "char_end": 12, "start_ms": 0, "end_ms": 900, "speaker": "SPEAKER_00" },
+      { "char_start": 13, "char_end": 16, "start_ms": 1000, "end_ms": 1400, "speaker": "SPEAKER_01" } ] }
+  ] }, "source": { "generation": "42" } } },
+  "_chunks": { "passages": [
+    { "_chunk_id": 0, "_content": "Quarterly revenue", "_start_char": 0, "_end_char": 17, "_parent_unit_id": "page:000001" },
+    { "_chunk_id": 0, "_content": "Hello there.", "_start_char": 0, "_end_char": 12,
+      "_start_time_ms": 0, "_end_time_ms": 900, "_parent_unit_id": "transcript:000002", "_speaker": "SPEAKER_00" }
+  ] }
+}
+```
+
+Each unit becomes an extraction unit exactly as given (`unit_type` defaults to
+`page` with a page number, `transcript` with spans, else `document`, the
+plain text route's unit; ids are `<unit_type>:<ordinal>`). Page number, label,
+bounding box and rotation, and transcript phrases with their speakers, are
+recorded when present; nothing absent is fabricated. Units go through the
+ordinary manifest, unit and child materialization with no fetch, decode, OCR
+or transcription; the canonical seed value is the input identity, so a
+resumed import is `unchanged`.
+
+Chunks of an extraction's chunk consumers are unit-scoped: each names its
+unit (`_parent_unit_id`) and may carry its speaker (`_speaker`). They are
+accepted by the extraction seeded in the same write, must name one of its
+units, and are recorded per unit with the digest of that unit's text, so
+every site that derives unit chunks (desired keys, writes, skip checks,
+full-text rebuilds, worker materialization) uses the seeded chunks while the
+unit text and chunker are unchanged. A plain chunk producer refuses
+unit-scoped chunks. The seed view exports both: the units form whenever the
+extraction has pages, typed or several units, and unit-scoped chunks with
+their unit and speaker.
+
 ## Not yet accepted
 
 These fail with `ArtifactSeedNotAccepted` rather than regenerating:
 
-- Chunk and vector seeds downstream of an upstream asset (for example
-  extraction → chunks → vectors in one write). Chunk rows over an upstream
-  asset are materialized only after commit, with the upstream causal witness;
-  seed the upstream asset and let its descendants generate, or seed chunks of
-  a source field.
-- Rich document extraction seeds (pages, layout, unit-scoped
-  `_parent_unit_id` and diarized `_speaker` chunks). Text seeds produce a
-  native text manifest; page coordinates are never fabricated.
+- Vectors of extraction unit chunks. The extraction producer embeds them; a
+  seed would need a unit-qualified vector shape.
+- Text blocks and regions (OCR layout below the page) of extraction units.
 - Producers whose input is outside the write: neighbor or context sources,
   committed graph adjacency, grouped sources, prior context, privacy-managed
-  artifacts, PDF page-image embeddings, chunk-derived sparse vectors.
+  artifacts, PDF page-image embeddings, chunk-derived sparse vectors, chunks
+  of transcription (`media_output`) assets.
 - `copy` assets (free to regenerate).
 
 ## Remaining work
 
-- Retaining seeded chunk collections across later source-unchanged replays.
-  The chunk producer has no input-identity record in local mode and re-chunks
-  each processed revision, which replaces seeded chunks with generated ones.
 - Leader-prepared seed acceptance for Raft. Replicas accept seeds during
   deterministic apply (seed errors are expected apply failures that advance
   the entry on every replica alike); dense seeds resolve the embedder's

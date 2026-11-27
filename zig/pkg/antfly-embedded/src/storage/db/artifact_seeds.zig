@@ -302,11 +302,19 @@ pub fn validateChunkCollection(value: std.json.Value) !void {
         else => return error.InvalidArtifactSeed,
     }
     if (value.array.items.len > max_seed_chunks) return error.InvalidArtifactSeed;
-    var previous: ?u32 = null;
+    var previous: ?ChunkFields = null;
+    var scoped: ?bool = null;
     for (value.array.items) |item| {
         const parsed = try parseChunkObject(item);
-        if (previous) |prior| if (parsed.chunk_id <= prior) return error.InvalidArtifactSeed;
-        previous = parsed.chunk_id;
+        const is_scoped = parsed.parent_unit_id != null;
+        if (scoped) |known| if (known != is_scoped) return error.InvalidArtifactSeed;
+        scoped = is_scoped;
+        if (previous) |prior| {
+            // Unit-scoped collections list each unit's chunks contiguously.
+            const same_unit = !is_scoped or std.mem.eql(u8, prior.parent_unit_id.?, parsed.parent_unit_id.?);
+            if (same_unit and parsed.chunk_id <= prior.chunk_id) return error.InvalidArtifactSeed;
+        }
+        previous = parsed;
     }
 }
 
@@ -317,7 +325,30 @@ pub const ChunkFields = struct {
     end_char: ?u32 = null,
     start_time_ms: ?f32 = null,
     end_time_ms: ?f32 = null,
+    /// Unit-scoped chunk of a document extraction (`_parent_unit_id`).
+    parent_unit_id: ?[]const u8 = null,
+    /// Diarized speaker index (`_speaker`: `SPEAKER_NN` or an index).
+    speaker: ?u8 = null,
 };
+
+pub const max_speakers: u16 = 255;
+
+/// A speaker as chunk reads label it (`SPEAKER_00`, ...) or as a bare index.
+pub fn parseSpeaker(value: std.json.Value) !u8 {
+    const index: u64 = switch (value) {
+        .integer => |i| std.math.cast(u64, i) orelse return error.InvalidArtifactSeed,
+        .number_string => |text| std.fmt.parseInt(u64, text, 10) catch return error.InvalidArtifactSeed,
+        .string => |text| blk: {
+            const prefix = "SPEAKER_";
+            if (!std.mem.startsWith(u8, text, prefix) or text.len == prefix.len or text.len > prefix.len + 3) return error.InvalidArtifactSeed;
+            for (text[prefix.len..]) |c| if (!std.ascii.isDigit(c)) return error.InvalidArtifactSeed;
+            break :blk std.fmt.parseInt(u64, text[prefix.len..], 10) catch return error.InvalidArtifactSeed;
+        },
+        else => return error.InvalidArtifactSeed,
+    };
+    if (index >= max_speakers) return error.InvalidArtifactSeed;
+    return @intCast(index);
+}
 
 fn jsonU32(value: std.json.Value) !u32 {
     return switch (value) {
@@ -376,11 +407,12 @@ pub fn parseChunkObject(value: std.json.Value) !ChunkFields {
             out.start_time_ms = try jsonTimeMs(item);
         } else if (std.mem.eql(u8, key, "_end_time_ms")) {
             out.end_time_ms = try jsonTimeMs(item);
-        } else if (std.mem.eql(u8, key, "_parent_unit_id") or std.mem.eql(u8, key, "_speaker")) {
-            // Unit-scoped and diarized chunk seeds bind to a document
-            // extraction manifest; they are not accepted by plain chunk
-            // producers yet and must not be dropped silently.
-            return error.ArtifactSeedNotAccepted;
+        } else if (std.mem.eql(u8, key, "_parent_unit_id")) {
+            // Unit-scoped chunks bind to one unit of a document extraction.
+            if (item != .string or item.string.len == 0 or item.string.len > max_name_bytes) return error.InvalidArtifactSeed;
+            out.parent_unit_id = item.string;
+        } else if (std.mem.eql(u8, key, "_speaker")) {
+            out.speaker = try parseSpeaker(item);
         } else return error.InvalidArtifactSeed;
     }
     if (chunk_id == null and alias_id == null) return error.InvalidArtifactSeed;
@@ -774,12 +806,188 @@ pub fn decodeChunksAlloc(alloc: Allocator, items: []const std.json.Value, source
     var previous: ?u32 = null;
     for (items, out) |item, *slot| {
         const fields = try parseChunkObject(item);
+        // Unit-scoped and diarized chunks belong to a document extraction
+        // consumer; a plain chunk producer cannot accept them.
+        if (fields.parent_unit_id != null or fields.speaker != null) return error.ArtifactSeedNotAccepted;
         if (previous) |prior| if (fields.chunk_id <= prior) return error.InvalidArtifactSeed;
         previous = fields.chunk_id;
         if (source_len) |len| if (fields.end_char) |end| if (end > len) return error.InvalidArtifactSeed;
         slot.* = fields;
     }
     return out;
+}
+
+/// The seeded chunks of one extraction unit, in order. Every item of a
+/// unit-scoped collection names its unit; spans lie within the unit text.
+pub fn decodeUnitChunksAlloc(alloc: Allocator, items: []const std.json.Value, unit_id: []const u8, unit_text_len: usize) ![]ChunkFields {
+    var out = std.ArrayListUnmanaged(ChunkFields).empty;
+    errdefer out.deinit(alloc);
+    var previous: ?u32 = null;
+    for (items) |item| {
+        const fields = try parseChunkObject(item);
+        const parent = fields.parent_unit_id orelse return error.InvalidArtifactSeed;
+        if (!std.mem.eql(u8, parent, unit_id)) continue;
+        if (previous) |prior| if (fields.chunk_id <= prior) return error.InvalidArtifactSeed;
+        previous = fields.chunk_id;
+        if (fields.end_char) |end| if (end > unit_text_len) return error.InvalidArtifactSeed;
+        try out.append(alloc, fields);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+/// One phrase of a seeded transcript unit, in unit text coordinates.
+pub const TranscriptSpan = struct {
+    char_start: u32,
+    char_end: u32,
+    start_ms: u64,
+    end_ms: u64,
+    speaker: ?u8 = null,
+};
+
+/// One unit of a rich document extraction seed (`{"units": [...]}`): a page,
+/// a transcript or any other unit with the layout data the caller has.
+/// Nothing absent is fabricated.
+pub const ExtractionUnit = struct {
+    text: []const u8,
+    unit_type: []const u8,
+    page_number: ?u32 = null,
+    page_label: ?[]const u8 = null,
+    page_bbox: ?[4]f64 = null,
+    page_rotation: ?i32 = null,
+    spans: []TranscriptSpan = &.{},
+};
+
+pub const max_extraction_units: usize = 65536;
+pub const max_transcript_spans: usize = 1 << 20;
+
+pub fn freeExtractionUnits(alloc: Allocator, units: []ExtractionUnit) void {
+    for (units) |unit| if (unit.spans.len > 0) alloc.free(unit.spans);
+    if (units.len > 0) alloc.free(units);
+}
+
+fn validUnitType(text: []const u8) bool {
+    if (text.len == 0 or text.len > 64) return false;
+    for (text) |c| if (!(std.ascii.isLower(c) or std.ascii.isDigit(c) or c == '_')) return false;
+    return true;
+}
+
+/// Units of a document extraction seed. `{"text": ...}` (or a string) is the
+/// plain-text form and returns no units; `{"units": [...]}` is the rich form.
+/// Strings borrow from `value`.
+pub fn decodeExtractionUnitsAlloc(alloc: Allocator, value: std.json.Value) ![]ExtractionUnit {
+    if (value == .string) return &.{};
+    if (value != .object) return error.InvalidArtifactSeed;
+    if (value.object.get("text") != null) {
+        _ = try assetText(value);
+        return &.{};
+    }
+    if (value.object.count() != 1) return error.InvalidArtifactSeed;
+    const units_value = value.object.get("units") orelse return error.InvalidArtifactSeed;
+    if (units_value != .array or units_value.array.items.len == 0 or units_value.array.items.len > max_extraction_units) return error.InvalidArtifactSeed;
+    const out = try alloc.alloc(ExtractionUnit, units_value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |unit| if (unit.spans.len > 0) alloc.free(unit.spans);
+        alloc.free(out);
+    }
+    for (units_value.array.items, out) |item, *unit| {
+        if (item != .object) return error.InvalidArtifactSeed;
+        var text: ?[]const u8 = null;
+        var unit_type: ?[]const u8 = null;
+        var parsed: ExtractionUnit = .{ .text = "", .unit_type = "" };
+        var spans_value: ?std.json.Value = null;
+        var it = item.object.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const field = entry.value_ptr.*;
+            if (std.mem.eql(u8, key, "text")) {
+                if (field != .string) return error.InvalidArtifactSeed;
+                text = field.string;
+            } else if (std.mem.eql(u8, key, "unit_type")) {
+                if (field != .string or !validUnitType(field.string)) return error.InvalidArtifactSeed;
+                unit_type = field.string;
+            } else if (std.mem.eql(u8, key, "page_number")) {
+                const page = try jsonU32(field);
+                if (page == 0) return error.InvalidArtifactSeed;
+                parsed.page_number = page;
+            } else if (std.mem.eql(u8, key, "page_label")) {
+                if (field != .string or field.string.len == 0 or field.string.len > max_name_bytes) return error.InvalidArtifactSeed;
+                parsed.page_label = field.string;
+            } else if (std.mem.eql(u8, key, "page_bbox")) {
+                if (field != .array or field.array.items.len != 4) return error.InvalidArtifactSeed;
+                var bbox: [4]f64 = undefined;
+                for (field.array.items, &bbox) |coordinate, *slot| slot.* = try jsonF64(coordinate);
+                parsed.page_bbox = bbox;
+            } else if (std.mem.eql(u8, key, "page_rotation")) {
+                const rotation: i64 = switch (field) {
+                    .integer => |i| i,
+                    .number_string => |raw| std.fmt.parseInt(i64, raw, 10) catch return error.InvalidArtifactSeed,
+                    else => return error.InvalidArtifactSeed,
+                };
+                if (rotation != 0 and rotation != 90 and rotation != 180 and rotation != 270) return error.InvalidArtifactSeed;
+                parsed.page_rotation = @intCast(rotation);
+            } else if (std.mem.eql(u8, key, "spans")) {
+                spans_value = field;
+            } else return error.InvalidArtifactSeed;
+        }
+        parsed.text = text orelse return error.InvalidArtifactSeed;
+        if (spans_value) |spans| {
+            if (spans != .array or spans.array.items.len > max_transcript_spans) return error.InvalidArtifactSeed;
+            const decoded = try alloc.alloc(TranscriptSpan, spans.array.items.len);
+            errdefer alloc.free(decoded);
+            var covered: u32 = 0;
+            for (spans.array.items, decoded) |raw, *span| {
+                if (raw != .object) return error.InvalidArtifactSeed;
+                var char_start: ?u32 = null;
+                var char_end: ?u32 = null;
+                var start_ms: ?u64 = null;
+                var end_ms: ?u64 = null;
+                var speaker: ?u8 = null;
+                var span_it = raw.object.iterator();
+                while (span_it.next()) |entry| {
+                    const key = entry.key_ptr.*;
+                    const field = entry.value_ptr.*;
+                    if (std.mem.eql(u8, key, "char_start")) {
+                        char_start = try jsonU32(field);
+                    } else if (std.mem.eql(u8, key, "char_end")) {
+                        char_end = try jsonU32(field);
+                    } else if (std.mem.eql(u8, key, "start_ms")) {
+                        start_ms = try jsonU64(field);
+                    } else if (std.mem.eql(u8, key, "end_ms")) {
+                        end_ms = try jsonU64(field);
+                    } else if (std.mem.eql(u8, key, "speaker")) {
+                        speaker = try parseSpeaker(field);
+                    } else return error.InvalidArtifactSeed;
+                }
+                span.* = .{
+                    .char_start = char_start orelse return error.InvalidArtifactSeed,
+                    .char_end = char_end orelse return error.InvalidArtifactSeed,
+                    .start_ms = start_ms orelse return error.InvalidArtifactSeed,
+                    .end_ms = end_ms orelse return error.InvalidArtifactSeed,
+                    .speaker = speaker,
+                };
+                // Disjoint, ordered phrases within the unit text.
+                if (span.char_start > span.char_end or span.char_end > parsed.text.len or span.char_start < covered) return error.InvalidArtifactSeed;
+                if (span.start_ms > span.end_ms) return error.InvalidArtifactSeed;
+                covered = span.char_end;
+            }
+            parsed.spans = decoded;
+        }
+        // `document` is the plain text route's unit type, so a single plain
+        // unit is the same output as the `{"text": ...}` form.
+        parsed.unit_type = unit_type orelse if (parsed.page_number != null) "page" else if (parsed.spans.len > 0) "transcript" else "document";
+        unit.* = parsed;
+        initialized += 1;
+    }
+    return out;
+}
+
+fn jsonU64(value: std.json.Value) !u64 {
+    return switch (value) {
+        .integer => |i| std.math.cast(u64, i) orelse error.InvalidArtifactSeed,
+        .number_string => |text| std.fmt.parseInt(u64, text, 10) catch error.InvalidArtifactSeed,
+        else => error.InvalidArtifactSeed,
+    };
 }
 
 /// Asset seed bytes as stored for the enrichment's content type: a JSON
@@ -881,11 +1089,34 @@ test "artifact seeds reject descriptive and internal read fields" {
         defer doc.deinit();
         try std.testing.expectError(error.InvalidArtifactSeed, extractCanonicalAlloc(alloc, doc.value.object));
     }
+    // Unit-scoped collections validate per unit and never mix with plain
+    // chunks; plain chunk producers refuse them when decoding.
     var unit = try parseForTest(alloc,
-        \\{"_chunks":{"c":[{"_chunk_id":0,"_content":"x","_parent_unit_id":"page:1"}]}}
+        \\{"_chunks":{"c":[{"_chunk_id":0,"_content":"x","_parent_unit_id":"page:000001","_speaker":"SPEAKER_01"},{"_chunk_id":0,"_content":"y","_parent_unit_id":"page:000002"}]}}
     );
     defer unit.deinit();
-    try std.testing.expectError(error.ArtifactSeedNotAccepted, extractCanonicalAlloc(alloc, unit.value.object));
+    const unit_canonical = (try extractCanonicalAlloc(alloc, unit.value.object)).?;
+    alloc.free(unit_canonical);
+    const unit_items = unit.value.object.get("_chunks").?.object.get("c").?.array.items;
+    try std.testing.expectError(error.ArtifactSeedNotAccepted, decodeChunksAlloc(alloc, unit_items, null));
+    const second = try decodeUnitChunksAlloc(alloc, unit_items, "page:000002", 1);
+    defer alloc.free(second);
+    try std.testing.expectEqual(@as(usize, 1), second.len);
+    try std.testing.expectEqualStrings("y", second[0].content);
+    const first = try decodeUnitChunksAlloc(alloc, unit_items, "page:000001", 1);
+    defer alloc.free(first);
+    try std.testing.expectEqual(@as(?u8, 1), first[0].speaker);
+    for ([_][]const u8{
+        \\{"_chunks":{"c":[{"_chunk_id":0,"_content":"x","_parent_unit_id":"page:000001"},{"_chunk_id":1,"_content":"y"}]}}
+        ,
+        \\{"_chunks":{"c":[{"_chunk_id":1,"_content":"x","_parent_unit_id":"p"},{"_chunk_id":0,"_content":"y","_parent_unit_id":"p"}]}}
+        ,
+        \\{"_chunks":{"c":[{"_chunk_id":0,"_content":"x","_speaker":"SPEAKER_X"}]}}
+    }) |bad| {
+        var doc = try parseForTest(alloc, bad);
+        defer doc.deinit();
+        try std.testing.expectError(error.InvalidArtifactSeed, extractCanonicalAlloc(alloc, doc.value.object));
+    }
 
     var plain = try parseForTest(alloc,
         \\{"title":"no seeds"}
@@ -974,4 +1205,48 @@ test "artifact seed conflict policy travels with the seeds" {
         defer bad.deinit();
         try std.testing.expectError(error.InvalidArtifactSeed, extractCanonicalAlloc(alloc, bad.value.object));
     }
+}
+
+test "artifact seed extraction units carry pages and transcript phrases" {
+    const alloc = std.testing.allocator;
+    var text_form = try parseForTest(alloc, "{\"text\":\"plain\"}");
+    defer text_form.deinit();
+    try std.testing.expectEqual(@as(usize, 0), (try decodeExtractionUnitsAlloc(alloc, text_form.value)).len);
+
+    var rich = try parseForTest(alloc,
+        \\{"units":[{"text":"Page one.","page_number":1,"page_label":"i","page_bbox":[0,0,612,792],"page_rotation":90},
+        \\ {"text":"Hello there. Hi.","spans":[{"char_start":0,"char_end":12,"start_ms":0,"end_ms":900,"speaker":"SPEAKER_00"},{"char_start":13,"char_end":16,"start_ms":1000,"end_ms":1400,"speaker":1}]},
+        \\ {"text":"Notes","unit_type":"slide"}]}
+    );
+    defer rich.deinit();
+    const units = try decodeExtractionUnitsAlloc(alloc, rich.value);
+    defer freeExtractionUnits(alloc, units);
+    try std.testing.expectEqual(@as(usize, 3), units.len);
+    try std.testing.expectEqualStrings("page", units[0].unit_type);
+    try std.testing.expectEqual(@as(?u32, 1), units[0].page_number);
+    try std.testing.expectEqual(@as(?i32, 90), units[0].page_rotation);
+    try std.testing.expectEqualStrings("transcript", units[1].unit_type);
+    try std.testing.expectEqual(@as(?u8, 1), units[1].spans[1].speaker);
+    try std.testing.expectEqualStrings("slide", units[2].unit_type);
+
+    for ([_][]const u8{
+        "{\"units\":[]}",
+        "{\"units\":[{\"page_number\":1}]}",
+        "{\"units\":[{\"text\":\"x\",\"ocr_bbox\":[0,0,1,1]}]}",
+        "{\"units\":[{\"text\":\"x\",\"page_number\":0}]}",
+        "{\"units\":[{\"text\":\"x\",\"unit_type\":\"Page!\"}]}",
+        "{\"units\":[{\"text\":\"ab\",\"spans\":[{\"char_start\":0,\"char_end\":3,\"start_ms\":0,\"end_ms\":1}]}]}",
+        "{\"units\":[{\"text\":\"abcd\",\"spans\":[{\"char_start\":0,\"char_end\":2,\"start_ms\":0,\"end_ms\":1},{\"char_start\":1,\"char_end\":3,\"start_ms\":1,\"end_ms\":2}]}]}",
+        "{\"units\":[{\"text\":\"x\"}],\"extra\":1}",
+    }) |bad| {
+        var doc = try parseForTest(alloc, bad);
+        defer doc.deinit();
+        try std.testing.expectError(error.InvalidArtifactSeed, decodeExtractionUnitsAlloc(alloc, doc.value));
+    }
+    var speakers = try parseForTest(alloc, "[\"SPEAKER_07\",3,\"SPEAKER_255\",255]");
+    defer speakers.deinit();
+    try std.testing.expectEqual(@as(u8, 7), try parseSpeaker(speakers.value.array.items[0]));
+    try std.testing.expectEqual(@as(u8, 3), try parseSpeaker(speakers.value.array.items[1]));
+    try std.testing.expectError(error.InvalidArtifactSeed, parseSpeaker(speakers.value.array.items[2]));
+    try std.testing.expectError(error.InvalidArtifactSeed, parseSpeaker(speakers.value.array.items[3]));
 }

@@ -4040,13 +4040,14 @@ test "shared lock region: closing one of two same-process handles does not drop 
     if (child_pid == 0) {
         _ = std.posix.system.close(pipe_fds[0]);
         const raw_fd = std.posix.openat(std.posix.AT.FDCWD, region_path, .{ .ACCMODE = .RDWR }, 0) catch std.c._exit(1);
-        var fl: std.c.Flock = .{
-            .start = Region.livenessByteOffset(max_readers, second_slot),
-            .len = 1,
-            .pid = 0,
-            .type = std.c.F.WRLCK,
-            .whence = std.c.SEEK.SET,
-        };
+        // Zeroed, then named: libc layouts differ in padding fields
+        // (Linux has `_unused`), which a struct literal must spell out.
+        var fl = std.mem.zeroes(std.c.Flock);
+        fl.start = Region.livenessByteOffset(max_readers, second_slot);
+        fl.len = 1;
+        fl.pid = 0;
+        fl.type = std.c.F.WRLCK;
+        fl.whence = std.c.SEEK.SET;
         // `second`'s own slot should still be held: this trylock must
         // fail. If `first.close()` wrongly dropped it, this succeeds
         // instead, and the report below catches that.
@@ -4096,13 +4097,14 @@ test "shared lock region: opening a second same-process handle does not drop the
     if (child_pid == 0) {
         _ = std.posix.system.close(pipe_fds[0]);
         const raw_fd = std.posix.openat(std.posix.AT.FDCWD, region_path, .{ .ACCMODE = .RDWR }, 0) catch std.c._exit(1);
-        var fl: std.c.Flock = .{
-            .start = Region.livenessByteOffset(max_readers, first_slot),
-            .len = 1,
-            .pid = 0,
-            .type = std.c.F.WRLCK,
-            .whence = std.c.SEEK.SET,
-        };
+        // Zeroed, then named: libc layouts differ in padding fields
+        // (Linux has `_unused`), which a struct literal must spell out.
+        var fl = std.mem.zeroes(std.c.Flock);
+        fl.start = Region.livenessByteOffset(max_readers, first_slot);
+        fl.len = 1;
+        fl.pid = 0;
+        fl.type = std.c.F.WRLCK;
+        fl.whence = std.c.SEEK.SET;
         const still_held: u8 = if (std.c.fcntl(raw_fd, std.c.F.SETLK, &fl) == -1) 1 else 0;
         var report: [1]u8 = .{still_held};
         _ = std.c.write(pipe_fds[1], @ptrCast(&report), 1);

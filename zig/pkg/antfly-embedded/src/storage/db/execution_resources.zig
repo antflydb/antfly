@@ -1597,6 +1597,9 @@ pub const DocumentExtractionChunkView = struct {
     text_indexes: [][]u8 = &.{},
     dense_embeddings: []DocumentExtractionEmbeddingView = &.{},
     sparse_embeddings: []DocumentExtractionEmbeddingView = &.{},
+    /// Borrowed record of accepted unit-scoped chunk seeds for one document
+    /// (`artifact_seed_chunks.zig`); set per extraction, never owned here.
+    unit_seed_record: ?[]const u8 = null,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         if (self.name.len > 0) alloc.free(@constCast(self.name));

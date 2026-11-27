@@ -715,6 +715,8 @@ from .extraction_structure_schema_fields import ExtractionStructureSchemaFields
 from .extraction_structure_schema_mode import ExtractionStructureSchemaMode
 from .extraction_structure_schema_occurrence_policy import ExtractionStructureSchemaOccurrencePolicy
 from .extraction_token import ExtractionToken
+from .extraction_unit_seed import ExtractionUnitSeed
+from .extraction_unit_seed_page_rotation import ExtractionUnitSeedPageRotation
 from .failed_operation import FailedOperation
 from .failed_operation_operation import FailedOperationOperation
 from .fetch_config import FetchConfig
@@ -2801,6 +2803,7 @@ from .transaction_stage_write_request_document import TransactionStageWriteReque
 from .transaction_status_response import TransactionStatusResponse
 from .transaction_write_error import TransactionWriteError
 from .transcriber_enrichment_config import TranscriberEnrichmentConfig
+from .transcript_span_seed import TranscriptSpanSeed
 from .transform import Transform
 from .transform_op import TransformOp
 from .transform_op_type import TransformOpType
@@ -3562,6 +3565,8 @@ __all__ = (
     "ExtractionStructureSchemaMode",
     "ExtractionStructureSchemaOccurrencePolicy",
     "ExtractionToken",
+    "ExtractionUnitSeed",
+    "ExtractionUnitSeedPageRotation",
     "FailedOperation",
     "FailedOperationOperation",
     "FetchConfig",
@@ -5426,6 +5431,7 @@ __all__ = (
     "TransactionStatusResponse",
     "TransactionWriteError",
     "TranscriberEnrichmentConfig",
+    "TranscriptSpanSeed",
     "Transform",
     "TransformOp",
     "TransformOpType",

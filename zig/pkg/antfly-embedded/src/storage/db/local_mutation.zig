@@ -479,6 +479,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const computeSeededDenseRequestDerived = materialization.computeSeededDenseRequestDerived;
         pub const computeSeededDenseChunkRequestDerived = materialization.computeSeededDenseChunkRequestDerived;
         pub const installSeededChunks = materialization.installSeededChunks;
+        pub const installGeneratedChunks = materialization.installGeneratedChunks;
         pub const ExtractionSeed = materialization.ExtractionSeed;
         pub const computeSeededSparseRequestDerived = materialization.computeSeededSparseRequestDerived;
         pub const computeDocumentExtractionAssetRequestDerived = materialization.computeDocumentExtractionAssetRequestDerived;

@@ -179,6 +179,7 @@ const json_helpers = @import("../../api/json_helpers.zig");
 test {
     _ = durable_outbox;
     _ = @import("artifact_seed_plan.zig");
+    _ = @import("artifact_seed_chunks.zig");
     _ = durable_outbox_store;
     _ = apply_receipts;
     _ = graph_edge_ttl_expiration;
@@ -108871,6 +108872,230 @@ test "db artifact seeds accept extracted text for document extraction without fe
     try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = seeded }}, .sync_level = .write });
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
+}
+
+fn seedViewChunkContentsForTest(alloc: Allocator, db: *DB, doc_key: []const u8, name: []const u8) ![][]u8 {
+    var view = (try db.lookup(alloc, doc_key, .{ .fields = &.{"_chunks"}, .include_all_fields = false, .artifact_view = .seed })).?;
+    defer view.deinit(alloc);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, view.json, .{});
+    defer parsed.deinit();
+    const chunks = parsed.value.object.get("_chunks") orelse return error.TestUnexpectedResult;
+    const items = (chunks.object.get(name) orelse return error.TestUnexpectedResult).array.items;
+    const out = try alloc.alloc([]u8, items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |content| alloc.free(content);
+        alloc.free(out);
+    }
+    for (items, out) |item, *content| {
+        content.* = try alloc.dupe(u8, item.object.get("_content").?.string);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn expectSeedViewChunksForTest(alloc: Allocator, db: *DB, doc_key: []const u8, name: []const u8, expected: []const []const u8) !void {
+    const contents = try seedViewChunkContentsForTest(alloc, db, doc_key, name);
+    defer {
+        for (contents) |content| alloc.free(content);
+        alloc.free(contents);
+    }
+    try std.testing.expectEqual(expected.len, contents.len);
+    for (expected, contents) |want, got| try std.testing.expectEqualStrings(want, got);
+}
+
+test "db artifact seeded chunk collections survive unrelated edits and replays of the same input" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var embedder = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a", .dense_embedder = embedder.interface() } });
+    defer db.close();
+    try addSeedRoundTripTestIndexes(&db);
+
+    const seeded =
+        \\{"title":"a","body":"abcdefghijklmno","_chunks":{"body_chunks_v1":[{"_chunk_id":0,"_content":"abcdefghij","_start_char":0,"_end_char":10},{"_chunk_id":1,"_content":"klmno","_start_char":10,"_end_char":15}]}}
+    ;
+    const seeded_contents = [_][]const u8{ "abcdefghij", "klmno" };
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = seeded }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try expectSeedViewChunksForTest(alloc, &db, "doc:a", "body_chunks_v1", &seeded_contents);
+
+    // Unrelated edits, synchronous or replayed, keep the accepted set: the
+    // chunker does not run again for the same input.
+    for ([_]types.SyncLevel{ .write, .enrichments }) |sync_level| {
+        try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"b\",\"body\":\"abcdefghijklmno\"}" }}, .sync_level = sync_level });
+        try db.runUntilIdle();
+        try expectSeedViewChunksForTest(alloc, &db, "doc:a", "body_chunks_v1", &seeded_contents);
+    }
+
+    // A changed input is chunked again.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"b\",\"body\":\"abcdefghijklmnop\"}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    {
+        const contents = try seedViewChunkContentsForTest(alloc, &db, "doc:a", "body_chunks_v1");
+        defer {
+            for (contents) |content| alloc.free(content);
+            alloc.free(contents);
+        }
+        try std.testing.expect(contents.len > 0);
+        try std.testing.expect(!std.mem.eql(u8, contents[0], "abcdefghij"));
+    }
+
+    // Seeding again, then `null`, returns to the chunker in that same write.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = seeded }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try expectSeedViewChunksForTest(alloc, &db, "doc:a", "body_chunks_v1", &seeded_contents);
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"c\",\"body\":\"abcdefghijklmno\",\"_chunks\":{\"body_chunks_v1\":null}}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    {
+        const contents = try seedViewChunkContentsForTest(alloc, &db, "doc:a", "body_chunks_v1");
+        defer {
+            for (contents) |content| alloc.free(content);
+            alloc.free(contents);
+        }
+        try std.testing.expect(contents.len > 0);
+        try std.testing.expect(!std.mem.eql(u8, contents[0], "abcdefghij"));
+    }
+}
+
+test "db artifact seeds chain an upstream asset, its chunks and their vectors in one write" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var fake = TestAssetProducer{};
+    var embedder = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a", .asset_producer = fake.producer(), .dense_embedder = embedder.interface() } });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "summary_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+    });
+    try db.addEnrichment(.{ .name = "summary_chunks", .kind = .chunk, .source_artifact_name = "summary_v1", .field = "text", .chunk_size = 8, .chunk_overlap = 0 });
+    try db.addEnrichment(.{ .name = "summary_dense", .kind = .embedding, .field = "text", .source_artifact_name = "summary_chunks", .expected_dims = 3 });
+    try db.addIndex(.{ .name = "summary_vectors", .kind = .dense_vector, .config_json = "{\"field\":\"dense\",\"dims\":3,\"embedding_name\":\"summary_dense\"}" });
+
+    // Extraction-to-vectors migration: the upstream output, the chunks of
+    // that output and their vectors are all accepted in one write.
+    const chained =
+        \\{"body":"memo","_artifacts":{"summary_v1":{"value":"silver submarine"},"summary_dense":{"value":[{"chunk_id":0,"vector":[1,0,0]},{"chunk_id":1,"vector":[0,1,0]}]}},
+        \\ "_chunks":{"summary_chunks":[{"_chunk_id":0,"_content":"silver ","_start_char":0,"_end_char":7},{"_chunk_id":1,"_content":"submarine","_start_char":7,"_end_char":16}]}}
+    ;
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = chained }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(@as(usize, 0), embedder.calls);
+    try expectStoredAssetForTest(alloc, &db, "doc:a", "summary_v1", "silver submarine");
+    try expectSeedViewChunksForTest(alloc, &db, "doc:a", "summary_chunks", &.{ "silver ", "submarine" });
+    try std.testing.expectEqual(@as(u64, 2), db.core.index_manager.denseIndex("summary_vectors").?.index.metadata.active_count);
+
+    // Replays of the same input keep the whole chain.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"memo\",\"title\":\"edited\"}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(@as(usize, 0), embedder.calls);
+    try expectSeedViewChunksForTest(alloc, &db, "doc:a", "summary_chunks", &.{ "silver ", "submarine" });
+
+    // A chunk seed needs its upstream output in the same write.
+    if (db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = "{\"body\":\"memo\",\"_chunks\":{\"summary_chunks\":[{\"_chunk_id\":0,\"_content\":\"x\"}]}}" }}, .sync_level = .write })) |_|
+        return error.TestUnexpectedResult
+    else |err|
+        try std.testing.expect(err == error.ArtifactSeedNotAccepted);
+}
+
+test "db artifact seeds accept extracted units with pages, transcripts and unit-scoped chunks" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var fake = TestAssetProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a", .asset_producer = fake.producer() } });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "extracted",
+        .kind = .asset,
+        .template = "{{url}}",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{ .name = "passages", .kind = .chunk, .source_artifact_name = "extracted", .field = "text", .chunk_size = 64, .chunk_overlap = 0 });
+
+    // A page with its layout, and a diarized transcript, extracted elsewhere;
+    // the chunks of each unit, with their speaker, come along unchanged.
+    const seeded =
+        \\{"url":"https://example.invalid/interview.pdf",
+        \\ "_artifacts":{"extracted":{"value":{"units":[
+        \\   {"text":"Quarterly revenue grew.","page_number":3,"page_label":"iii","page_bbox":[0,0,612,792]},
+        \\   {"text":"Hello there. Hi.","spans":[{"char_start":0,"char_end":12,"start_ms":0,"end_ms":900,"speaker":"SPEAKER_00"},{"char_start":13,"char_end":16,"start_ms":1000,"end_ms":1400,"speaker":"SPEAKER_01"}]}]},
+        \\   "source":{"generation":"42"}}},
+        \\ "_chunks":{"passages":[
+        \\   {"_chunk_id":0,"_content":"Quarterly revenue","_start_char":0,"_end_char":17,"_parent_unit_id":"page:000001"},
+        \\   {"_chunk_id":1,"_content":"grew.","_start_char":18,"_end_char":23,"_parent_unit_id":"page:000001"},
+        \\   {"_chunk_id":0,"_content":"Hello there.","_start_char":0,"_end_char":12,"_start_time_ms":0,"_end_time_ms":900,"_parent_unit_id":"transcript:000002","_speaker":"SPEAKER_00"},
+        \\   {"_chunk_id":1,"_content":"Hi.","_start_char":13,"_end_char":16,"_start_time_ms":1000,"_end_time_ms":1400,"_parent_unit_id":"transcript:000002","_speaker":"SPEAKER_01"}]}}
+    ;
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = seeded }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+
+    var view = (try db.lookup(alloc, "doc:a", .{ .fields = &.{ "_artifacts", "_chunks" }, .include_all_fields = false, .artifact_view = .seed })).?;
+    defer view.deinit(alloc);
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, view.json, .{});
+        defer parsed.deinit();
+        const units = parsed.value.object.get("_artifacts").?.object.get("extracted").?.object.get("value").?.object.get("units").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), units.len);
+        try std.testing.expectEqual(@as(i64, 3), units[0].object.get("page_number").?.integer);
+        try std.testing.expectEqualStrings("iii", units[0].object.get("page_label").?.string);
+        try std.testing.expectEqualStrings("transcript", units[1].object.get("unit_type").?.string);
+        const chunks = parsed.value.object.get("_chunks").?.object.get("passages").?.array.items;
+        try std.testing.expectEqual(@as(usize, 4), chunks.len);
+        var speakers: usize = 0;
+        for (chunks) |chunk| {
+            try std.testing.expect(chunk.object.get("_parent_unit_id") != null);
+            if (chunk.object.get("_speaker")) |speaker| {
+                speakers += 1;
+                const content = chunk.object.get("_content").?.string;
+                try std.testing.expectEqualStrings(if (std.mem.eql(u8, content, "Hi.")) "SPEAKER_01" else "SPEAKER_00", speaker.string);
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 2), speakers);
+        var contents = std.ArrayListUnmanaged([]const u8).empty;
+        defer contents.deinit(alloc);
+        for (chunks) |chunk| try contents.append(alloc, chunk.object.get("_content").?.string);
+        try std.testing.expect(std.mem.indexOf(u8, view.json, "\"Quarterly revenue\"") != null);
+    }
+
+    // The export imports into another table unchanged, and re-importing it
+    // here is a no-op.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = seeded }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    var again = (try db.lookup(alloc, "doc:a", .{ .fields = &.{ "_artifacts", "_chunks" }, .include_all_fields = false, .artifact_view = .seed })).?;
+    defer again.deinit(alloc);
+    try std.testing.expectEqualStrings(view.json, again.json);
+
+    // Unit chunks must name an extracted unit, and need the extraction seed.
+    const orphan =
+        \\{"url":"https://example.invalid/b.pdf","_artifacts":{"extracted":{"value":{"units":[{"text":"x"}]}}},
+        \\ "_chunks":{"passages":[{"_chunk_id":0,"_content":"x","_parent_unit_id":"page:000009"}]}}
+    ;
+    if (db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = orphan }}, .sync_level = .write })) |_|
+        return error.TestUnexpectedResult
+    else |err|
+        try std.testing.expect(err == error.InvalidArtifactSeed);
+    if (db.batch(.{ .writes = &.{.{ .key = "doc:c", .value = "{\"url\":\"https://example.invalid/c.pdf\",\"_chunks\":{\"passages\":[{\"_chunk_id\":0,\"_content\":\"x\",\"_parent_unit_id\":\"text:000001\"}]}}" }}, .sync_level = .write })) |_|
+        return error.TestUnexpectedResult
+    else |err|
+        try std.testing.expect(err == error.ArtifactSeedNotAccepted);
 }
 
 fn addSeedRoundTripTestIndexes(db: *DB) !void {
