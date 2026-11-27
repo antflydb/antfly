@@ -22600,6 +22600,13 @@ fn sourceBiasWorkspaceView(policy: embedding_gemma2_policy_mod.SourceBiasWorkspa
     return .{ .ptr = funded.ptr, .len = policy.bytes(funded.len), .borrowed = true };
 }
 
+const source_linear_arithmetic: @import("libraries.zig").MatmulArithmetic = .bf16_reduced;
+const SourceLinearLayout = @import("libraries.zig").Bf16GemmProgram.TemporaryLayout;
+
+fn sourceLinearLayout(compute_major: i32, rows: kernel_geometry.SourceGemmRows, width: usize, columns: usize, pack_weight: bool, pack_bias: bool) !SourceLinearLayout {
+    return SourceLinearLayout.resolveSourceRows(rows, width, columns, pack_weight, pack_bias, try source_linear_arithmetic.workspaceBytes(compute_major));
+}
+
 fn sourceLinear(self: *CudaCompute, request: @FieldType(ops.Bf16SourceOperation, "linear")) !CT {
     const rows = try @import("../kernel_geometry.zig").SourceGemmRows.resolve(request.rows, request.source_rows);
     if (request.width == 0 or request.columns == 0) return error.InvalidShape;
@@ -22624,14 +22631,11 @@ fn sourceLinear(self: *CudaCompute, request: @FieldType(ops.Bf16SourceOperation,
     const bias_epilogue = bias != null and request.bias_addition == .lt_epilogue;
     if (bias_epilogue and request.reference_input_layout != .row_major) return error.UnsupportedSourceArithmeticGeometry;
     if (bias_epilogue and self.cublaslt == null) return error.CudaLibrariesUnavailable;
-    const arithmetic: @import("libraries.zig").MatmulArithmetic = .bf16_reduced;
-    const workspace_bytes = try arithmetic.workspaceBytes(self.ctx.info.compute_major);
     const blas = if (self.bf16_blas) |*value| value else return error.CublasBf16Unavailable;
-    const Layout = @import("libraries.zig").Bf16GemmProgram.TemporaryLayout;
-    const layout = try Layout.resolveSourceRows(rows, request.width, request.columns, weight.dtype != .bf16, bias_epilogue and bias.?.dtype != .bf16, workspace_bytes);
+    const layout = try sourceLinearLayout(self.ctx.info.compute_major, rows, request.width, request.columns, weight.dtype != .bf16, bias_epilogue and bias.?.dtype != .bf16);
     const reuse_bytes = if (self.source_linear_scratch.active and (self.execution_scope == null or !self.execution_scope.?.isBound()))
         if (request.reuse_projection) |geometry|
-            (try Layout.resolveSourceRows(rows, geometry.width, geometry.columns, false, false, workspace_bytes)).bytes
+            (try sourceLinearLayout(self.ctx.info.compute_major, rows, geometry.width, geometry.columns, false, false)).bytes
         else
             layout.bytes
     else
@@ -22667,7 +22671,7 @@ fn sourceLinear(self: *CudaCompute, request: @FieldType(ops.Bf16SourceOperation,
         try self.cublaslt.?.matmulBf16WeightBiasBf16Out(&self.ctx, packed_output, packed_input, weight_buffer, bias_buffer, bias_workspace, rows.physical, request.width, request.columns);
         self.stats.source_bf16_bias_epilogues += 1;
         self.stats.bf16_cublaslt_linear_calls += 1;
-    } else try blas.linearBf16(self.ctx.stream, @ptrFromInt(packed_output.ptr), @ptrFromInt(packed_input.ptr), @ptrFromInt(weight_buffer.ptr), rows.physical, request.width, request.columns, arithmetic, @ptrFromInt(workspace.ptr), workspace.len, self.ctx.info.compute_major, .{
+    } else try blas.linearBf16(self.ctx.stream, @ptrFromInt(packed_output.ptr), @ptrFromInt(packed_input.ptr), @ptrFromInt(weight_buffer.ptr), rows.physical, request.width, request.columns, source_linear_arithmetic, @ptrFromInt(workspace.ptr), workspace.len, self.ctx.info.compute_major, .{
         .input_layout = if (request.reference_input_layout == .column_major) .column_major else .row_major,
         .addend = if (bias != null) .output else .zero,
     });
@@ -62771,14 +62775,7 @@ test "public source audio linear recreates input bank through actual learning ca
         const inputs = [_]CT{ identity, identity };
         const geometry: [2]CudaCompute.AudioCacheInput = @splat(.{ .shape = &.{ 2, 2 }, .elements = 4 });
         const bindings = try compute.audioCacheBase(cold_key, &geometry, null);
-        const layout = try @import("libraries.zig").Bf16GemmProgram.TemporaryLayout.resolveSourceRows(
-            try kernel_geometry.SourceGemmRows.resolve(2, null),
-            2,
-            2,
-            true,
-            false,
-            try @as(@import("libraries.zig").MatmulArithmetic, .bf16_reduced).workspaceBytes(compute.ctx.info.compute_major),
-        );
+        const layout = try sourceLinearLayout(compute.ctx.info.compute_major, try kernel_geometry.SourceGemmRows.resolve(2, null), 2, 2, true, false);
         const entry = try compute.audio_plans.getWithCleanup(bindings.key, .{});
         const owner = try plan_mod.Owner.create(std.heap.c_allocator);
         entry.owner = owner;
