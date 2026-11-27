@@ -48798,9 +48798,17 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
             try std.testing.expect(report.planned_events != 0 and report.metadata_bytes != 0 and report.attention_scratch_bytes != 0);
             if (platform.env.getenvBool("ANTFLY_TEST_LIGHTONOCR3_CUDA_UNFUSED_RECURRENT"))
                 try std.testing.expect(report.recurrent_scratch_bytes != 0);
-            const shared_bytes = @max(report.attention_scratch_bytes, report.recurrent_scratch_bytes, report.fused_head_scratch_bytes, report.shared_head_scratch_bytes);
+            const alignment = @import("../execution/stream_workspace.zig").alignment;
+            const geometry = session_factory.getGptConfig(observed_model.?.get().session) orelse return error.UnsupportedGeneratorProvider;
+            const attention_output = report.rows * geometry.num_attention_heads * geometry.headDim() * @sizeOf(f32);
+            const recurrent_output = report.rows * geometry.qwen35_linear_num_value_heads * geometry.qwen35_linear_value_head_dim * @sizeOf(f32);
+            try std.testing.expectEqual(attention_output, report.declared_attention_output_bytes);
+            try std.testing.expectEqual(recurrent_output, report.declared_recurrent_output_bytes);
+            const attention_bytes = std.mem.alignForward(usize, report.attention_scratch_bytes, alignment) + report.declared_attention_output_bytes;
+            const recurrent_bytes = std.mem.alignForward(usize, report.recurrent_scratch_bytes, alignment) + report.declared_recurrent_output_bytes;
+            const shared_bytes = @max(attention_bytes, recurrent_bytes, report.fused_head_scratch_bytes, report.shared_head_scratch_bytes);
             try std.testing.expectEqual(shared_bytes, report.shared_layer_workspace_bytes);
-            std.debug.print("LIGHTONOCR3 observed_cuda_workspace rows={d} readback_bytes={d} backing={s} route={s} attention_scratch_bytes={d} recurrent_scratch_bytes={d} shared_layer_workspace_bytes={d}\n", .{ report.rows, report.readback_bytes, @tagName(report.readback_backing), @tagName(report.route), report.attention_scratch_bytes, report.recurrent_scratch_bytes, report.shared_layer_workspace_bytes });
+            std.debug.print("LIGHTONOCR3 observed_cuda_workspace rows={d} readback_bytes={d} backing={s} route={s} attention_scratch_bytes={d} recurrent_scratch_bytes={d} shared_layer_workspace_bytes={d} attention_output_bytes={d} recurrent_output_bytes={d}\n", .{ report.rows, report.readback_bytes, @tagName(report.readback_backing), @tagName(report.route), report.attention_scratch_bytes, report.recurrent_scratch_bytes, report.shared_layer_workspace_bytes, report.declared_attention_output_bytes, report.declared_recurrent_output_bytes });
         }
         std.debug.print("LIGHTONOCR3 http_batch_pages=2 parity=true\n", .{});
     }
