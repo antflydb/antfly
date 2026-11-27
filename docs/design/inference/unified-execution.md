@@ -1359,7 +1359,15 @@ replayed a two-row HTTP decode using 15,520 bytes of shared top-1
 scratch, zero standalone logits-bank bytes, and an unchanged 44-byte
 pinned receipt. The earlier capture failure at `a1b392f5bf` was
 caused by applying ordinary capture exclusion to the prebound launch.
-The comparative throughput run is separate from this correctness result.
+A same-binary 64-page serving comparison on GB10 obtained 17.52,
+20.73, 20.41 and 20.51 pages/s in dense/fused/fused/dense order.
+All arms matched serial outputs. The first dense arm replayed only
+two rows, while the other arms reached 64. The two fused arms each
+used 496,640 bytes of declared top-1 scratch. The reverse-order
+control reached 14.09 pages/s fused and 18.92 pages/s dense, both
+with 64-row replay. Its next dense arm reached 14.07 pages/s with
+no replay and failed the replay gate. These controls leave throughput
+parity unqualified, so the captured fused head stays opt-in.
 
 ### Issue closure audit
 
