@@ -436,8 +436,9 @@ pub const Module = struct {
     rows: usize = 0,
     hidden: usize = 0,
     vocab: usize = 0,
-    // Wide logits live outside the bounded temporary arena. Both dependent
-    // steps reuse this independently admitted output after their argmax.
+    // Both graph steps reuse this independently admitted logits bank after
+    // argmax when the plan assigns a separate head buffer. Arena-backed
+    // packets instead allocate their logits through the stream workspace.
     head: buffer.DeviceBuffer = .{},
     attention_scratch: ?DecodeScratch = null,
     attention_layers: usize = 0,

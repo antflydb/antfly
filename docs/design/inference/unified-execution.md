@@ -2206,3 +2206,13 @@ execution. Sustained wide replay requires admission for the capture
 arena alongside the available graph storage. The receipts are
 `0d1ba7c3a48ab289777ba7fcf95f1f689b60c069d355feb4689f6f407e5e1bf8`
 and `5c00f2d9967ee6b4f6ba142ab9938f54d3979f0c435fabdeefe3fb19b94cc7f8`.
+
+On the Metal HTTP build for `ad8622b63f`, Inkling 2 Mini selected Metal
+automatically with the greedy-prefill override unset. The warmed 28-token
+text and 33-token blue-image requests returned `4` and `Blue`, each
+with one completion token, in 545 and 673 ms respectively. An unsupported
+INT8 cache request returned HTTP 400 before streaming. The short-case
+assertions passed. The wrapper then incorrectly started its optional
+deep comparison, which was stopped. The receipt
+`c7bba56cd68a9265359cdef735961a84ed9862e54fe9927ae5fa2d04befdcf60`
+covers the completed short requests only.
