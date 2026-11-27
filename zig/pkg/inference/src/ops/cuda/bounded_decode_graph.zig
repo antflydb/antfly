@@ -110,7 +110,11 @@ pub const StorageLayout = struct {
     }
 
     pub fn init(rows: usize, hidden: usize, vocab: usize, key_words: usize) !StorageLayout {
-        if (rows < 2 or rows > max_rows or hidden == 0 or vocab == 0 or key_words == 0) return error.InvalidShape;
+        return initWithHeadLimit(rows, hidden, vocab, key_words, rows);
+    }
+
+    fn initWithHeadLimit(rows: usize, hidden: usize, vocab: usize, key_words: usize, max_head_rows: usize) !StorageLayout {
+        if (rows < 2 or rows > max_rows or hidden == 0 or vocab == 0 or key_words == 0 or max_head_rows == 0) return error.InvalidShape;
         const input_bytes = try std.math.mul(usize, try std.math.mul(usize, rows, hidden), @sizeOf(f32));
         const bank_offset = try aligned(input_bytes);
         const token_bytes = rows * 2 * @sizeOf(u32);
@@ -121,7 +125,7 @@ pub const StorageLayout = struct {
         const progress_offset = try std.math.add(usize, positions_offset, position_bytes);
         const metadata_bytes = try aligned(try std.math.add(usize, progress_offset, @sizeOf(u32)));
         const host_bytes = try std.math.add(usize, @sizeOf(plan_mod.Plan), try std.math.mul(usize, key_words, @sizeOf(u64)));
-        const head_bytes = if (rows > 64) try std.math.mul(usize, try std.math.mul(usize, rows, vocab), @sizeOf(f32)) else 0;
+        const head_bytes = if (rows > 64) try std.math.mul(usize, try std.math.mul(usize, @min(rows, max_head_rows), vocab), @sizeOf(f32)) else 0;
         if (head_bytes > plan_mod.limit) return error.InvalidShape;
         return .{
             .input = .{ .offset = 0, .bytes = input_bytes },
@@ -202,13 +206,8 @@ pub const Descriptor = struct {
     attention_layers: usize,
     recurrent_layers: usize,
     pub fn layout(self: Descriptor) !StorageLayout {
-        var value = try StorageLayout.init(self.rows, self.hidden, self.vocab, self.key.len);
-        if (self.epoch == 0 or self.positions.len != self.rows * 3) return error.InvalidShape;
-        if (self.head_row_limit) |rows| {
-            if (rows == 0) return error.InvalidShape;
-            if (value.head_bytes != 0) value.head_bytes = (value.head_bytes / self.rows) * @min(rows, self.rows);
-        }
-        return value;
+        if (self.epoch == 0 or self.rows > max_rows or self.positions.len != self.rows * 3) return error.InvalidShape;
+        return StorageLayout.initWithHeadLimit(self.rows, self.hidden, self.vocab, self.key.len, self.head_row_limit orelse self.rows);
     }
     pub const DispatchCounts = struct { attention: usize, ragged_recurrent: usize };
 
@@ -673,6 +672,11 @@ test "captured graph head packets fund the exact smaller bank and invalidate a f
     try std.testing.expect(!phase.matchesOwner(&owner));
     owner.storage_layout = layout;
     try std.testing.expect(phase.matchesOwner(&owner));
+
+    packet.vocab = 400_000;
+    try std.testing.expectEqual(@as(usize, 32 * 400_000 * 4), (try packet.layout()).head_bytes);
+    packet.head_row_limit = null;
+    try std.testing.expectError(error.InvalidShape, packet.layout());
 }
 
 test "captured sequence storage layout packs narrow and wide readbacks with aligned physical planes" {
