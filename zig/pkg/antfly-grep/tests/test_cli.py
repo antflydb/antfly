@@ -1983,6 +1983,21 @@ class CliTests(unittest.TestCase):
         config = self.table_config([doc])
         result = self.raw_cli("--table-config", config, "-l", "STOP")
         self.assertEqual(result.stdout, b"a.py\n")
+        self.server.mode = "exploration"
+        rendered = self.raw_cli(
+            "ask",
+            "retry enforcement",
+            "--table-config",
+            config,
+            "--model",
+            "fixture",
+            "--endpoint",
+            f"http://127.0.0.1:{self.server.server_port}/decisions",
+            "--broad",
+            "--no-cache",
+        ).stdout
+        self.assertIn(b" (indexed snapshot)", rendered)
+        self.assertNotIn(b"indexed_at=", rendered)
 
     def test_indexed_nested_contract_and_timestamp_sorting(self):
         docs = [self.indexed_doc("a.py"), self.indexed_doc("b.py")]

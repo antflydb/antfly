@@ -15746,6 +15746,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
     }
 
     if (text_session) |session| {
+        try session.prepareForBatchRendering();
         {
             const coordinator = try RuntimePdfOcrCoordinator.createFromPrepared(alloc, @import("antfly_platform").allocator.concurrentFallback(), null, 30_000, config, session);
             defer coordinator.destroy();
@@ -16595,7 +16596,7 @@ const PreparedDocumentSourceCache = struct {
         cache: *PreparedDocumentSourceCache,
         variant: ?*PreparedPdfVariant,
 
-        fn session(self: *const @This()) *document_extraction_mod.PdfRenderSession {
+        fn session(self: *const @This()) *const document_extraction_mod.PdfRenderSession {
             return &self.variant.?.session.?;
         }
 
@@ -17804,7 +17805,7 @@ test "prepared document cache single-flights concurrent PDF variants and drains 
         start: std.atomic.Value(bool) = .init(false),
         lease_ready: std.atomic.Value(usize) = .init(0),
         release: std.atomic.Value(bool) = .init(false),
-        sessions: [2]?*document_extraction_mod.PdfRenderSession = .{ null, null },
+        sessions: [2]?*const document_extraction_mod.PdfRenderSession = .{ null, null },
         errors: [2]?anyerror = .{ null, null },
 
         fn run(self: *@This(), index: usize) void {
@@ -21984,7 +21985,7 @@ fn processDocumentExtractionAsset(
                 if (config.content_type.len > 0) config.content_type else downloaded.content_type,
                 @errorName(err),
                 "PDF preparation failed",
-                document_extraction_mod.failureStage(err, "pdf_inspection"),
+                document_extraction_mod.failureStage(err, "pdf_preparation"),
                 manifest_key,
                 previous_child_ranges,
                 existing_state,
@@ -22017,20 +22018,8 @@ fn processDocumentExtractionAsset(
     var pdf_inspection_reservation = ReservedWorkingSetAllocator.init(collection_alloc, pdf_inspection_bytes);
     const document_extraction_alloc = if (source_is_pdf) pdf_inspection_reservation.allocator() else runtime.alloc;
     const inspection_owner = pdfPreparationOwner(runtime, &preparation_cancellation);
-    const inspection_budget_ms = runtime.syncWaitTimeoutMs();
-    const inspection_started_ns = platform_time.monotonicNs();
-    var pdf_inspection_deadline = document_extraction_mod.PdfOperationDeadline.init(inspection_budget_ms);
-    pdf_inspection_deadline.timeout_error = error.PdfInspectionTimeout;
-    pdf_inspection_deadline.owner = preparedSourceOwnerProbe(&inspection_owner);
-    var prepared_pdf_session: ?document_extraction_mod.PdfRenderSession = if (prepared_pdf_source) |source|
-        document_extraction_mod.PdfRenderSession.initFromPrepared(
-            document_extraction_alloc,
-            source,
-            pdf_inspection_deadline.probe(),
-        ) catch |err| return pdf_inspection_deadline.classifyError(err)
-    else
-        null;
-    if (prepared_pdf_session) |*session| try session.setDecodeLimits(extraction_config.pdf_decode_limits);
+    var pdf_inspection_deadline: document_extraction_mod.PdfOperationDeadline = undefined;
+    var prepared_pdf_session: ?document_extraction_mod.PdfRenderSession = null;
     defer if (prepared_pdf_session) |*session| session.deinit();
 
     var desired_unit_keys = std.ArrayListUnmanaged([]const u8).empty;
@@ -22101,12 +22090,26 @@ fn processDocumentExtractionAsset(
         .unit_spool = if (unit_spool) |*spool| spool else null,
         .page_text_spool = if (page_text_spool) |*spool| spool else null,
         .pdf_inspection_reserved = source_is_pdf,
-        .prepared_pdf_session = if (prepared_pdf_session) |*session| session else null,
+        .prepared_pdf_session = prepared_pdf_source,
     };
     defer collect_ctx.deinit();
     var prepared_marking = document_extraction_mod.UnconfiguredGeneratedTextSink{ .alloc = document_extraction_alloc, .config = &extraction_config, .inner = collect_ctx.sink() };
-    const extraction_result = if (prepared_pdf_session) |*session|
-        document_extraction_mod.extractPreparedPdfStreamingWithTextCache(
+    const inspection_budget_ms = runtime.syncWaitTimeoutMs();
+    const inspection_started_ns = if (source_is_pdf) platform_time.monotonicNs() else 0;
+    pdf_inspection_deadline = .{
+        .deadline_ns = inspection_started_ns +| (inspection_budget_ms *| std.time.ns_per_ms),
+        .timeout_error = error.PdfInspectionTimeout,
+        .owner = preparedSourceOwnerProbe(&inspection_owner),
+    };
+    const extraction_result = if (prepared_pdf_source) |source| pdf: {
+        prepared_pdf_session = document_extraction_mod.PdfRenderSession.initFromFrozen(
+            document_extraction_alloc,
+            source,
+            pdf_inspection_deadline.probe(),
+        ) catch |err| break :pdf pdf_inspection_deadline.classifyError(err);
+        const session = &prepared_pdf_session.?;
+        session.setDecodeLimits(extraction_config.pdf_decode_limits) catch |err| break :pdf err;
+        break :pdf document_extraction_mod.extractPreparedPdfStreamingWithTextCache(
             document_extraction_alloc,
             session,
             if (extraction_config.content_type.len > 0) extraction_config.content_type else downloaded.content_type,
@@ -22115,9 +22118,8 @@ fn processDocumentExtractionAsset(
             prepared_marking.sink(),
             if (page_text_spool) |*spool| spool.cache() else null,
             &pdf_inspection_deadline,
-        )
-    else
-        document_extraction_mod.extractDownloadedStreaming(document_extraction_alloc, downloaded.*, source_url, extraction_config, collect_ctx.sink());
+        );
+    } else document_extraction_mod.extractDownloadedStreaming(document_extraction_alloc, downloaded.*, source_url, extraction_config, collect_ctx.sink());
     // Publish the final short neutral-text segment before a later consumer
     // traverses this source. Errors abandon buffered rows via deinit instead.
     if (extraction_result) |_| {
@@ -23247,7 +23249,7 @@ const RuntimePdfOcrCoordinator = struct {
         manager: ?*resource_manager_mod.ResourceManager,
         timeout_ms: u64,
         config: document_extraction_mod.Config,
-        source: *document_extraction_mod.PdfRenderSession,
+        source: *const document_extraction_mod.PdfRenderSession,
     ) !*@This() {
         const self = try owner_alloc.create(@This());
         errdefer owner_alloc.destroy(self);
@@ -23259,7 +23261,7 @@ const RuntimePdfOcrCoordinator = struct {
         self.deadline.timeout_error = error.PdfPreparationTimeout;
         self.admitAllocator(backing_alloc, manager);
         errdefer if (self.budgeted) |*budgeted| budgeted.deinit();
-        self.session = document_extraction_mod.PdfRenderSession.initFromPrepared(
+        self.session = document_extraction_mod.PdfRenderSession.initFromFrozen(
             self.reservation.allocator(),
             source,
             self.deadline.probe(),
@@ -23407,11 +23409,17 @@ pub fn runNativePdfOcrCoordinatorIntegration(
 
     const DelayedSink = struct {
         pages: usize = 0,
+        cancel_on_end: std.atomic.Value(bool) = .init(false),
 
         fn unit(raw: *anyopaque, _: *document_extraction_mod.Unit) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             platform_time.sleepNs(std.time.ns_per_ms);
             self.pages += 1;
+        }
+
+        fn cancelOnEnd(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.cancel_on_end.store(true, .release);
         }
     };
     var delayed_sink = DelayedSink{};
@@ -23430,6 +23438,21 @@ pub fn runNativePdfOcrCoordinatorIntegration(
     );
     try std.testing.expectEqual(@as(usize, 2), delayed_sink.pages);
     try std.testing.expect(inspection.deadline_ns > initial_deadline);
+
+    const inspection_owner: asset_producer_mod.InvocationContext = .{
+        .cancellation = CancellationToken.fromAtomic(&delayed_sink.cancel_on_end),
+    };
+    inspection.owner = preparedSourceOwnerProbe(&inspection_owner);
+    try std.testing.expectError(error.EnrichmentWaitCanceled, document_extraction_mod.extractPreparedPdfStreamingWithTextCache(
+        alloc,
+        &coordinator.session,
+        "application/pdf",
+        .{},
+        .always,
+        .{ .ptr = &delayed_sink, .on_begin = CancelSink.begin, .on_unit = DelayedSink.unit, .on_end = DelayedSink.cancelOnEnd },
+        null,
+        &inspection,
+    ));
 
     const persistent_bytes = coordinator.reservation.live_bytes;
     if (persistent_bytes == 0) return error.PdfCoordinatorDidNotRetainParsedState;
@@ -24431,7 +24454,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithBackingAllocator(
     units: []document_extraction_mod.Unit,
     kind: RuntimeGeneratedUnitTextKind,
     pdf_coordinator_slot: *?*RuntimePdfOcrCoordinator,
-    prepared_pdf_session: ?*document_extraction_mod.PdfRenderSession,
+    prepared_pdf_session: ?*const document_extraction_mod.PdfRenderSession,
 ) !void {
     const uses_pdf_decoder_reservation = kind == .ocr and std.mem.eql(u8, route_type, "pdf");
     if (uses_pdf_decoder_reservation) if (runtime.document_prefetch) |pipeline| {
@@ -28413,7 +28436,7 @@ const RuntimeDocumentExtractionCollectContext = struct {
     ocr_failed_page_numbers: std.ArrayListUnmanaged(u32) = .empty,
     ocr_failure_summaries: std.ArrayListUnmanaged(RuntimeOcrFailureSummary) = .empty,
     pdf_coordinator: ?*RuntimePdfOcrCoordinator = null,
-    prepared_pdf_session: ?*document_extraction_mod.PdfRenderSession = null,
+    prepared_pdf_session: ?*const document_extraction_mod.PdfRenderSession = null,
     resolved_char_cursor: usize = 0,
 
     fn sink(self: *@This()) document_extraction_mod.UnitSink {
@@ -28511,9 +28534,7 @@ const RuntimeDocumentExtractionCollectContext = struct {
     fn onEnd(ptr: *anyopaque) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         try self.flushPendingGeneratedText();
-        // A render coordinator created from the prepared inspection session
-        // borrows its immutable document metadata. Tear it down before the
-        // extraction call returns and releases that source session.
+        // The coordinator borrows the prepared document's immutable metadata.
         self.releasePdfCoordinator();
     }
 
