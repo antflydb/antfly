@@ -3651,7 +3651,9 @@ pub const CudaCompute = struct {
         if (!self.lighton_state_pool_enabled) return .state_pool_disabled;
         if (self.cublaslt == null or self.cublaslt.?.allocator == null) return .cublaslt_unavailable;
         if (self.cublaslt.?.plan_cache_capacity < 64) return .plan_cache_too_small;
-        if (self.lighton_gemm_bucket_rows or self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
+        // The eager lane can keep its buckets. Every phase of the bounded
+        // program uses the exact admitted rows through lightOnGemmPhysicalRows.
+        if (self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
             self.resident_training_cache or self.lazy_host_store != null) return .execution_not_capturable;
         return .enabled;
     }
@@ -48786,6 +48788,12 @@ test "LightOn CUDA graph capability has no benchmark GPU allowlist and explains 
         compute.ctx.info.compute_minor = cc[1];
         try std.testing.expectEqual(Decision.enabled, compute.lightOnGraphDecision());
     }
+    compute.lighton_gemm_bucket_rows = true;
+    try std.testing.expectEqual(Decision.enabled, compute.lightOnGraphDecision());
+    try std.testing.expectEqual(@as(usize, 32), lightOnGemmPhysicalRows(&compute, 17));
+    compute.bounded_decode_graph.active = true;
+    try std.testing.expectEqual(@as(usize, 17), lightOnGemmPhysicalRows(&compute, 17));
+    compute.bounded_decode_graph.active = false;
     compute.ctx.info.driver_version = 12090;
     try std.testing.expectEqual(Decision.driver_unsupported, compute.lightOnGraphDecision());
     compute.ctx.info.driver_version = 13000;
