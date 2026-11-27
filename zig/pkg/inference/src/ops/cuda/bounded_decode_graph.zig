@@ -255,6 +255,7 @@ const ColdPhase = struct {
 pub const GraphPhase = struct {
     descriptor: Descriptor,
     storage_layout: StorageLayout = undefined,
+    attention_scratch: ?DecodeScratch = null,
     mode: enum { none, storage, arena } = .none,
     expected_compute: usize = 0,
     old: Snapshot = undefined,
@@ -266,6 +267,17 @@ pub const GraphPhase = struct {
         _ = try descriptor.dispatchCounts();
         self.* = .{ .descriptor = descriptor, .storage_layout = layout };
     }
+    pub fn declareAttentionScratch(self: *GraphPhase, chunk128_override: ?bool) !void {
+        const descriptor = self.descriptor;
+        if (descriptor.attention_layers == 0) return;
+        const geometry = descriptor.attention_geometry orelse return error.InvalidShape;
+        self.attention_scratch = try DecodeScratch.init(descriptor.rows, descriptor.future_tokens, geometry, paged_attention.useChunk128(chunk128_override, geometry.heads));
+    }
+
+    pub fn matchesOwner(self: *const GraphPhase, owner: *const Module) bool {
+        return owner.matches(self.descriptor) and std.meta.eql(owner.attention_scratch, self.attention_scratch);
+    }
+
     fn arenaRequest(self: *const GraphPhase, layout: plan_mod.Layout) funding_mod.Request {
         return .{ .captured_arena = .{
             .epoch = self.descriptor.epoch,
@@ -510,6 +522,7 @@ pub const Module = struct {
         self.epoch_id = descriptor.epoch;
         self.attention_layers = descriptor.attention_layers;
         self.recurrent_layers = descriptor.recurrent_layers;
+        self.attention_scratch = phase.attention_scratch;
         self.expected_attention_calls = dispatch.attention;
         self.expected_ragged_packets = dispatch.ragged_recurrent;
     }
@@ -543,17 +556,6 @@ pub const Module = struct {
         const plan = self.plan orelse return error.InvalidExecutionPlan;
         const layout = self.admitted_arena_layout orelse return error.InvalidExecutionPlan;
         return plan_mod.Scope.bind(plan, layout, self.arena.ptr, self.arena.len);
-    }
-
-    pub fn prepareAttentionScratch(self: *Module, descriptor: Descriptor, chunk128: bool) !void {
-        if (descriptor.attention_layers == 0) return;
-        const geometry = descriptor.attention_geometry orelse return error.InvalidExecutionPlan;
-        if (self.attention_scratch) |*scratch| {
-            if (scratch.tokens != descriptor.future_tokens or scratch.full_rows + scratch.tail_rows != descriptor.rows or
-                !std.meta.eql(scratch.geometry, geometry) or scratch.full.chunk128 != chunk128) return error.PreparedCachePlanChanged;
-            return;
-        }
-        self.attention_scratch = try DecodeScratch.init(descriptor.rows, descriptor.future_tokens, geometry, chunk128);
     }
 
     pub fn bindExecutionStorage(self: *const Module) !?buffer.DeviceBuffer {
@@ -1055,13 +1057,22 @@ test "bounded decoder graph reuse requires the prepared dispatch geometry" {
     var changed = descriptor;
     changed.future_tokens += 2;
     try std.testing.expect(owner.matches(changed));
-    var scratch_descriptor = descriptor;
-    scratch_descriptor.attention_geometry = .{ .heads = 8, .kv_heads = 2, .dim = 256 };
-    try owner.prepareAttentionScratch(scratch_descriptor, false);
-    try owner.prepareAttentionScratch(scratch_descriptor, false);
-    try std.testing.expectError(error.PreparedCachePlanChanged, owner.prepareAttentionScratch(scratch_descriptor, true));
-    scratch_descriptor.future_tokens += 2;
-    try std.testing.expectError(error.PreparedCachePlanChanged, owner.prepareAttentionScratch(scratch_descriptor, false));
+    var phase: GraphPhase = undefined;
+    changed = descriptor;
+    changed.attention_geometry = .{ .heads = 8, .kv_heads = 2, .dim = 256 };
+    try phase.initInto(changed);
+    try phase.declareAttentionScratch(false);
+    try std.testing.expect(!phase.matchesOwner(&owner));
+    owner.attention_scratch = phase.attention_scratch;
+    try std.testing.expect(phase.matchesOwner(&owner));
+    try phase.declareAttentionScratch(true);
+    try std.testing.expect(!phase.matchesOwner(&owner));
+    phase.descriptor.future_tokens += 2;
+    try phase.declareAttentionScratch(false);
+    try std.testing.expect(!phase.matchesOwner(&owner));
+    phase.descriptor.attention_geometry = null;
+    try std.testing.expectError(error.InvalidShape, phase.declareAttentionScratch(false));
+    changed = descriptor;
     changed.attention_layers += 1;
     try std.testing.expect(!owner.matches(changed));
     changed = descriptor;

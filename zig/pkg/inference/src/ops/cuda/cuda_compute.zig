@@ -4102,6 +4102,9 @@ pub const CudaCompute = struct {
             descriptor.future_tokens == 0 or descriptor.future_tokens > @import("paged_attention_bf16.zig").max_native_context_tokens or
             (descriptor.hidden != 1024 and descriptor.hidden != 2560) or (descriptor.rows > @import("gated_delta.zig").max_packet_rows and !self.lighton_ragged_recurrent_enabled)) return .unsupported;
         if (self.execution_scope != null) return .unsupported;
+        phase.declareAttentionScratch(self.lighton_attention_chunk128) catch |err| switch (err) {
+            error.InvalidShape, error.Overflow => return .unsupported,
+        };
         const owner = &self.bounded_decode_graph;
         if (!owner.mutex.tryLock()) return error.ReaderEpochBackendBusy;
         defer owner.mutex.unlock();
@@ -4109,7 +4112,7 @@ pub const CudaCompute = struct {
         phase.expected_compute = @intFromPtr(self);
         phase.admission = self.ctx.video_cache_budget.admission;
         phase.old = owner.snapshot();
-        if (!owner.matches(descriptor)) {
+        if (!phase.matchesOwner(owner)) {
             if (try self.ctx.streamCaptureActive()) return .unsupported;
             // Exact invalid graph dies under the ACTUAL B before outside
             // reservation, so its quota returns when this caller parks.
@@ -4143,7 +4146,7 @@ pub const CudaCompute = struct {
         if (!owner.mutex.tryLock()) return error.ReaderEpochBackendBusy;
         defer owner.mutex.unlock();
         if (!std.meta.eql(owner.snapshot(), phase.old)) return error.PreparedCachePlanChanged;
-        if (phase.mode == .arena and !owner.matches(phase.descriptor)) return error.PreparedCachePlanChanged;
+        if (phase.mode == .arena and !phase.matchesOwner(owner)) return error.PreparedCachePlanChanged;
         try phase.bind(current);
     }
     pub fn clearCapturedGraphWithCleanup(self: *CudaCompute, current: CacheCleanup) !void {
@@ -4172,7 +4175,7 @@ pub const CudaCompute = struct {
         var claimed = false;
         defer if (!claimed) owner.mutex.unlock();
         if (owner.disabled_epoch == epoch) return null;
-        if (!owner.matches(descriptor)) {
+        if (!graph_phase.matchesOwner(owner)) {
             if (owner.resets_logged < 12 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
                 var mismatch: usize = 0;
                 while (mismatch < @min(owner.key.len, key.len) and owner.key[mismatch] == key[mismatch]) : (mismatch += 1) {}
@@ -4202,10 +4205,6 @@ pub const CudaCompute = struct {
             };
         }
         const head_destination = try owner.bindExecutionStorage();
-        if (expected.attention_geometry) |geometry| {
-            const chunk128 = @import("paged_attention_bf16.zig").useChunk128(self.lighton_attention_chunk128, geometry.heads);
-            try owner.prepareAttentionScratch(expected, chunk128);
-        } else if (expected.attention_layers != 0) return error.InvalidExecutionPlan;
         const capture_scope = if (owner.phase == .capture) try owner.bindArena() else null;
         if (self.captured_cache_roots) |roots| try roots.beginGeneration(self, current);
         try self.lighton_attention.init(&self.ctx);
