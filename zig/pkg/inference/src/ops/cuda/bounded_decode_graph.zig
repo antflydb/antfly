@@ -330,7 +330,8 @@ pub const GraphPhase = struct {
         const descriptor = self.descriptor;
         if (descriptor.recurrent_layers == 0) return;
         const heads = descriptor.recurrent_heads orelse return error.InvalidShape;
-        const scratch = try @import("gated_delta.zig").PacketScratch.forHeads(descriptor.rows, heads.key, heads.value);
+        const recurrent = @import("gated_delta.zig");
+        const scratch = try recurrent.PacketScratch.forHeads(@min(descriptor.rows, recurrent_packet_rows), heads.key, heads.value);
         self.storage_layout.recurrent_workspace = try self.storage_layout.declareLayerWorkspace(scratch.bytes);
         self.storage_layout.recurrent_scratch = scratch;
     }
@@ -768,6 +769,9 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
     try std.testing.expectEqual(base.metadata_bytes + @max(attention.bytes, recurrent.bytes), layout.metadata_bytes);
     var owner: Module = .{ .storage_layout = layout, .metadata = .{ .ptr = 0x10000, .len = layout.metadata_bytes } };
     const scratch = layout.recurrent_scratch.?;
+    const recurrent_module = @import("gated_delta.zig");
+    try std.testing.expectEqualDeep(try recurrent_module.PacketScratch.forHeads(recurrent_module.max_packet_rows, 16, 32), scratch);
+    try std.testing.expect(scratch.bytes < (try recurrent_module.PacketScratch.forHeads(rows, 16, 32)).bytes);
     try std.testing.expectEqual((try owner.bindAttentionWorkspace(attention.bytes)).ptr, (try owner.bindRecurrentWorkspace(scratch)).ptr);
     try std.testing.expectEqual(scratch.bytes, owner.bound_recurrent_scratch_bytes);
     var changed = scratch;

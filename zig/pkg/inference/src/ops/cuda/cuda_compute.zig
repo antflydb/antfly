@@ -5446,10 +5446,16 @@ pub const CudaCompute = struct {
         const vh = request.value_heads;
         const channels = (2 * kh + vh) * 128;
         const width = vh * 128;
+        const packet_rows_limit = @import("gated_delta.zig").max_packet_rows;
         var rows: usize = 0;
-        for (lengths) |n| {
+        var largest_packet_rows: usize = 0;
+        var current_packet_rows: usize = 0;
+        for (lengths, 0..) |n, index| {
             if (n == 0 or n > 4096 - rows) return error.InvalidTensorShape;
+            if (index % packet_rows_limit == 0) current_packet_rows = 0;
             rows += n;
+            current_packet_rows += n;
+            largest_packet_rows = @max(largest_packet_rows, current_packet_rows);
         }
         const planned = self.bounded_decode_graph.active;
         if (planned and rows != states.len) return error.InvalidExecutionPlan;
@@ -5491,7 +5497,9 @@ pub const CudaCompute = struct {
         errdefer cb.free(output);
         const fused_decode = self.lighton_fused_gdn_decode_enabled and self.ctx.info.compute_major >= 8;
         const only_decode = fused_decode and rows == states.len;
-        const scratch_layout = if (only_decode) null else try @import("gated_delta.zig").PacketScratch.init(rows, channels, width);
+        // Packets submit in stream order. Each packet consumes its own
+        // intermediate results before the next can overwrite the bank.
+        const scratch_layout = if (only_decode) null else try @import("gated_delta.zig").PacketScratch.init(largest_packet_rows, channels, width);
         var scratch = if (scratch_layout) |layout|
             if (planned) try self.bounded_decode_graph.bindRecurrentWorkspace(layout) else try allocDeviceBuffer(self, layout.bytes)
         else
@@ -5504,19 +5512,19 @@ pub const CudaCompute = struct {
         var first: usize = 0;
         var row_offset: usize = 0;
         while (first < states.len) {
-            const end: usize = @min(first + @import("gated_delta.zig").max_packet_rows, states.len);
+            const end: usize = @min(first + packet_rows_limit, states.len);
             var group_rows: usize = 0;
             for (lengths[first..end]) |length| group_rows += length;
             var params = @import("gated_delta.zig").RaggedParams{ .base = .{
                 .mixed = tensorFromCt(request.mixed).buffer.ptr + row_offset * channels * 4,
                 .conv_weight = states[first].weights[0].ptr,
-                .conv = if (scratch_layout != null) scratch.ptr + row_offset * channels * 4 else 0,
+                .conv = scratch.ptr,
                 .z = tensorFromCt(request.z).buffer.ptr + row_offset * width * 4,
                 .beta = tensorFromCt(request.beta).buffer.ptr + row_offset * vh * 4,
                 .a = tensorFromCt(request.a).buffer.ptr + row_offset * vh * 4,
                 .a_log = states[first].weights[1].ptr,
                 .dt_bias = states[first].weights[2].ptr,
-                .core = if (scratch_layout) |layout| scratch.ptr + layout.core_offset + row_offset * width * 4 else 0,
+                .core = if (scratch_layout) |layout| scratch.ptr + layout.core_offset else 0,
                 .norm_weight = states[first].weights[3].ptr,
                 .out = tensorFromCt(output).buffer.ptr + row_offset * width * 4,
                 .key_heads = @intCast(kh),
