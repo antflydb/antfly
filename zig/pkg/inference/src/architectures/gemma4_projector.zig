@@ -9761,7 +9761,6 @@ fn checkAudioSegmentKernels(cb: ComputeBackend, _: ComputeBackend) !void {
     var rel: [13 * hidden]f32 = undefined;
     var scales: [dim]f32 = @splat(0.25);
     var starts: [rows]f32 = undefined;
-    var tags: [rows]f32 = undefined;
     var mask: [rows]bool = undefined;
     for (&data, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.17) * 0.1;
     for (&rel, 0..) |*x, i| x.* = @cos(@as(f32, @floatFromInt(i)) * 0.13) * 0.1;
@@ -9770,7 +9769,6 @@ fn checkAudioSegmentKernels(cb: ComputeBackend, _: ComputeBackend) !void {
         for (offset..offset + span) |row| {
             starts[row] = @floatFromInt(offset);
             mask[row] = row % 7 != 0;
-            tags[row] = @as(f32, @floatFromInt(offset + 1)) * @as(f32, if (mask[row]) 1 else -1);
         }
         offset += span;
     }
@@ -9780,10 +9778,23 @@ fn checkAudioSegmentKernels(cb: ComputeBackend, _: ComputeBackend) !void {
     defer cb.free(relative);
     const scale = try cb.fromFloat32Shape(&scales, &.{dim});
     defer cb.free(scale);
-    const validity = try cb.fromFloat32Shape(&tags, &.{rows});
+    const transfer_audit = @import("../execution/transfer_audit.zig");
+    var mask_transfers: transfer_audit.Audit = .{};
+    const masks = bind: {
+        try transfer_audit.begin(&mask_transfers);
+        defer transfer_audit.end();
+        break :bind try AudioLayerInputs.bindMasks(&cb, a, &mask, &spans);
+    };
+    defer cb.free(masks.valid);
+    const validity = masks.tags.?;
     defer cb.free(validity);
-    const metadata = try cb.fromFloat32Shape(&starts, &.{rows});
+    const metadata = masks.starts.?;
     defer cb.free(metadata);
+    if (cb.kind() == .cuda) {
+        try std.testing.expectEqual(@as(u64, 1), mask_transfers.upload_calls);
+        try std.testing.expectEqual(@as(u64, 3 * rows * @sizeOf(f32)), mask_transfers.upload_bytes);
+        try std.testing.expectEqual(@as(u64, 0), mask_transfers.device_copy_calls);
+    }
     for ([_]f32{ -1e9, -3 }) |invalid| {
         var params = ops.Gemma4AudioLocalAttentionParams{ .rows = rows, .hidden = hidden, .heads = 2, .head_dim = dim, .chunk = 12, .context_left = 13, .context = 24, .k_scale = audioKeyScale(), .logit_cap = 50, .invalid_value = invalid, .exclude_farthest_key = true, .segmented = true };
         const before = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
@@ -9793,17 +9804,13 @@ fn checkAudioSegmentKernels(cb: ComputeBackend, _: ComputeBackend) !void {
         const actual = try cb.toFloat32(result, a);
         defer a.free(actual);
         if (cb.kind() == .cuda) {
-            var valid_values: [rows]f32 = undefined;
-            for (&valid_values, mask) |*entry, present| entry.* = if (present) 1 else 0;
-            const plain_mask = try cb.fromFloat32Shape(&valid_values, &.{rows});
-            defer cb.free(plain_mask);
             var scale_handles = [_]CT{scale};
             const inputs: AudioLayerInputs = .{
                 .allocator = a,
                 .valid_mask = &mask,
                 .segments = &spans,
                 .rel_in = relative,
-                .valid_ct = plain_mask,
+                .valid_ct = masks.valid,
                 .ones = scale,
                 .scales_host = &.{},
                 .scales = &scale_handles,
