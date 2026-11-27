@@ -1500,6 +1500,12 @@ with direct Metal access. The run covered prepared audio replay with
 fresh inputs, selector eviction, held results and admission recovery,
 plus pending cuDNN receipt aggregation and both CUDA workspace reports.
 
+Spark at `bb2c665e11` passed all 31 selected CUDA checks without skips.
+The source convolution fixture matched exact BF16 values and recorded
+two accepted forwards, one accepted bias call and a source bank larger
+than the explicit SDK workspace. The physical graph convolution and
+pending receipt aggregation checks passed in the same run.
+
 This audit reconciles the original `2f2438e67f` implementation review
 against merged main `4951ca13f9` with later evidence. Each serving
 measurement identifies the revision that ran.
