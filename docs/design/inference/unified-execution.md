@@ -2251,3 +2251,12 @@ EmbeddingGemma 2 test failed during fixture loading because the
 launcher lacked the image and audio links. The next run reuses those
 fixtures from the successful earlier cohort. The receipt is
 `abb67ac065507756723c05d2b474d2b6f73dd6ed9f6cc87e4148ce0f3a60b018`.
+
+The typed storage-layout revision `e535ad9229` passed all 29
+focused CUDA tests on Spark with both media fixtures present.
+In the subsequent same-binary full-window pair, both arms matched all
+256 outputs. The arena arm reached 97 rows with 16-row logits packets,
+zero separate bank bytes, and 7.3876 pages/s. The standalone arm reached
+61 rows and 7.4161 pages/s, missing the wide-replay gate. Neither
+arm reported an admission denial. The focused test log hash is
+`d46028559514a8cb03c0f36c7b95a0bda0cfec483810d9b4b0dd4720290acb5f`.
