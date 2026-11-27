@@ -1366,8 +1366,12 @@ two rows, while the other arms reached 64. The two fused arms each
 used 496,640 bytes of declared top-1 scratch. The reverse-order
 control reached 14.09 pages/s fused and 18.92 pages/s dense, both
 with 64-row replay. Its next dense arm reached 14.07 pages/s with
-no replay and failed the replay gate. These controls leave throughput
-parity unqualified, so the captured fused head stays opt-in.
+no replay and failed the replay gate. Its graph key first changed at
+word 5600 of 5618 with identical positions. For this six-attention-layer
+checkpoint that word is the first K-plane pointer in the 19-word
+backing suffix. The reset preserved address safety. These controls
+leave throughput parity unqualified, so the captured fused head stays
+opt-in.
 
 ### Issue closure audit
 
