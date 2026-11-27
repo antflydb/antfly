@@ -1340,6 +1340,13 @@ kernel results matched isolated clips. The admitted three-clip,
 1,000-frame fixture measured 108,101,632 bytes of incremental device
 storage against its unchanged 134,217,728-byte ceiling.
 
+On Spark GB10 at `779c5b983a`, all 43 focused CUDA checks passed.
+The mixed-length fixture recorded exactly one metadata upload and
+verified both retained vectors after the upload handle was released.
+Released EmbeddingGemma 2 grouped audio recorded one graph and replayed
+it twice. Its maximum planned and captured arena sizes both measured
+38,017,792 bytes.
+
 ### Issue closure audit
 
 This audit reconciles the original `2f2438e67f` implementation review
