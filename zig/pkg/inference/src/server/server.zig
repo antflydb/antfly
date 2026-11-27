@@ -48752,8 +48752,16 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
         const objects = decoded.value.object.get("data").?.array.items;
         try std.testing.expectEqual(@as(usize, 2), objects.len);
         for (objects) |object| try std.testing.expectEqualStrings(result.items[0].text, object.object.get("text").?.string);
-        if (platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_BATCH", true) and effectiveLightOnReadRows() > 1 and effectiveLightOnReadWindow() > 1) {
-            const execution = decoded.value.object.get("execution").?.object;
+        const routed_backend = backend: {
+            var loaded = node.model_manager.acquireLoadedModel(model_dir) orelse return error.ModelNotFound;
+            defer loaded.release();
+            break :backend loaded.get().session.backend();
+        };
+        const execution = decoded.value.object.get("execution").?.object;
+        if (routed_backend == .native) {
+            try std.testing.expectEqual(@as(i64, 0), execution.get("native_items").?.integer);
+            try std.testing.expectEqual(@as(i64, 2), execution.get("serial_items").?.integer);
+        } else if (platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_BATCH", true) and effectiveLightOnReadRows() > 1 and effectiveLightOnReadWindow() > 1) {
             try std.testing.expectEqual(@as(i64, 2), execution.get("native_items").?.integer);
         }
         if (verify_workspace) {
