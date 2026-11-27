@@ -15363,6 +15363,15 @@ const DocumentPreparationPipeline = struct {
             const manifest = try storeGetOptionalAllocWithRetry(self.runtime, key);
             defer if (manifest) |v| self.runtime.alloc.free(v);
             if (manifest != null) continue; // Preserve the zero-fetch replay/repair fast paths.
+            // Speculative OCR would render seeded pages of a partial
+            // extraction seed; the foreground pass skips them (#1791).
+            {
+                const partial_key = try @import("../artifact_seed_chunks.zig").partialExtractionKeyAlloc(self.runtime.alloc, next.doc_key, requestArtifactName(request));
+                defer self.runtime.alloc.free(partial_key);
+                const partial = try storeGetOptionalAllocWithRetry(self.runtime, partial_key);
+                defer if (partial) |v| self.runtime.alloc.free(v);
+                if (partial != null) continue;
+            }
             const source_key = try documentSourceStoreKeyAlloc(self.runtime, next.doc_key);
             defer self.runtime.alloc.free(source_key);
             const raw = try storeGetOptionalDocumentAllocWithRetry(self.runtime, source_key) orelse continue;

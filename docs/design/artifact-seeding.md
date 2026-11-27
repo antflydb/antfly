@@ -370,7 +370,8 @@ with the seeded unit under the producer's own unit id (`page:<number>`),
 rebasing character offsets over the combined text
 (`enrichment/seeded_extraction_units.zig` `SeededPagesSink`). Seeded pages
 carry no pending OCR or transcription status, so completion skips them: only
-the other pages are OCRed. The record stands until a complete seed or `null`
+the other pages are OCRed; speculative OCR look-ahead skips documents with
+seeded pages. The record stands until a complete seed or `null`
 replaces it, so later regenerations keep the seeded pages. Unit-scoped chunk
 and vector seeds cannot bind in a partial write (`ArtifactSeedNotAccepted`):
 the units they name do not exist yet. Pages the source does not have are
@@ -592,8 +593,7 @@ subsystem features of their own:
   proposing). A cross-shard 2PC seed transform test.
 - Partial extraction seeds: an end-to-end test with a real PDF (PDF reading
   is compiled out of the DB unit tests; the overlay and the write path are
-  tested separately), and the OCR prefetch path, which still renders seeded
-  pages before the overlay discards them.
+  tested separately).
 - Vector seeds for seeded chunk collections above 4,095 chunks; unit-scoped
   (extraction) chunk inventories above that bound. Origin counts on the
   distributed server's HTTP status (embedded and Lite have them).
