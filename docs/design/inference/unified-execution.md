@@ -1304,7 +1304,7 @@ implementation, deletion and qualification gates.
 | Requirement | State | Evidence and remaining gate |
 | --- | --- | --- |
 | Shared liveness and authoritative storage | Partial | Assigned execution and admitted storage share dependency analysis. Metal image and video bind workspaces through the vision region. CUDA grouped audio and the bounded decoder still learn their composite allocation schedules. The compatibility table identifies opaque vendor workspaces with separate accounting. |
-| Stable addresses and CUDA capture | Partial | Released T5-small replayed at prefixes 1, 8, 32 and 64. Released EmbeddingGemma 2 grouped audio captured and replayed using a 38,017,792-byte arena. The context-level projector guard declines unplanned cuBLASLt staging before allocation. LightOnOCR-3-4B replayed at 97 rows with exact parity in the original 128-page, 24 GiB comparison. Physical contraction under denial and declared ordinary and capture workspace parity remain open. |
+| Stable addresses and CUDA capture | Partial | Released T5-small replayed at prefixes 1, 8, 32 and 64. Released EmbeddingGemma 2 grouped audio captured and replayed using a 38,017,792-byte arena. The context-level projector guard declines unplanned cuBLASLt staging before allocation. LightOnOCR-3-4B replayed at 97 rows with exact parity in the original 128-page, 24 GiB comparison. A repeat exercised physical contraction but denied the separately learned capture arena. Sustained wide replay and declared ordinary and capture workspace parity remain open. |
 | Runtime-owned state and physical policy | Partial | `decoder_storage.zig` owns Gemma 4 replay capacity and `decoder_prefill.zig` owns chunk selection, eager binding and scheduled cancellation. The shared frame owner controls media view retirement. Metal HTTP acquires and pins the existing per-layer input table before decoder state advances. Residual task-bound state and cache policy need provider-specific verification and migration. |
 | Resident placement | Partial | The released fused T5-small step retired its encoder activations before decoding on CPU, Metal and CUDA. Spark recorded 393,216 device-to-device gather bytes and zero gather downloads. Imported ONNX handoff tests exercise exact output custody and host fallback on all three providers. Other eligible stateful and opaque producer/consumer pairs still need qualification. |
 | Task orchestration | Partial | Media tasks call shared frame and projection retirement owners. Scheduled generation routes publish independent outputs through runtime callbacks. Some hardware-specific paths still choose or own physical transitions in model and task code. |
@@ -2192,3 +2192,17 @@ unsupported INT8 streaming request returned HTTP 400 before opening
 a stream. These are single-request correctness witnesses. The
 current-head long-prompt speed gap remains open. The JSONL receipt is
 `3f5a0d3a8c077a49b495e9063c8d6d2e234449d31d2fd82c7dcf004a86d2867c`.
+
+The repeat on `36543cc485` passed all 29 focused CUDA tests and
+matched every output in both full-window serving arms. It physically
+exercised contraction at 98 rows. Scratch admission denied the
+38,074,368-byte and 22,181,888-byte backend banks. The smaller
+bank advanced to the arena phase, where the separate 20,808,192-byte
+reservation was denied under the unchanged 24 GiB cap. The packet
+arm therefore failed the required wide-replay gate in this repeat.
+Full-width and packet throughput was 7.3997 and 7.1971 pages/s.
+This witnesses precommit pressure and recovery to ordinary
+execution. Sustained wide replay requires admission for the capture
+arena alongside the available graph storage. The receipts are
+`0d1ba7c3a48ab289777ba7fcf95f1f689b60c069d355feb4689f6f407e5e1bf8`
+and `5c00f2d9967ee6b4f6ba142ab9938f54d3979f0c435fabdeefe3fb19b94cc7f8`.
