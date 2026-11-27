@@ -22630,14 +22630,6 @@ const SourceF32ValueBuffer = struct {
     }
 };
 
-fn sourceRoundedF32Buffer(self: *CudaCompute, tensor: *CudaTensor) !SourceF32ValueBuffer {
-    if (tensor.dtype == .bf16) return SourceF32ValueBuffer.init(self, tensor);
-    var result = try allocDeviceBuffer(self, try checkedMul(tensor.elem_count, 4));
-    errdefer releaseDeviceBuffer(self, &result);
-    try self.kernels.launchRoundBf16F32(&self.ctx, result, tensor.buffer, tensor.elem_count);
-    return .{ .buffer = result, .owned = true };
-}
-
 fn bf16SourceOperationOp(ctx: *anyopaque, request: *const ops.Bf16SourceOperation) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (sourceScalarStorageOp(ctx, .linear) != .bf16) return null;
@@ -22751,22 +22743,39 @@ fn bf16SourceOperationOp(ctx: *anyopaque, request: *const ops.Bf16SourceOperatio
             const weight = try sourceScalarTensor(value.weight, weight_count);
             if (value.reduction == .vendor_f32) break :result try sourceConvolutionF32(self, value);
             const bias = try sourceScalarTensor(value.bias orelse return error.InvalidShape, value.outputs);
-            // Explicit source narrowing precedes a direct-FMA convolution;
-            // the TensorCore route also accepts these truthful F32 values.
-            // TensorCore loads already narrow each input/weight. Avoid a
-            // redundant full convolution-input clone on that source route.
-            var values = if (value.reduction == .direct_fma) try sourceRoundedF32Buffer(self, input) else try SourceF32ValueBuffer.init(self, input);
-            defer values.deinit(self);
-            var weights = if (value.reduction == .direct_fma) try sourceRoundedF32Buffer(self, weight) else try SourceF32ValueBuffer.init(self, weight);
-            defer weights.deinit(self);
-            var biases = try sourceRoundedF32Buffer(self, bias);
-            defer biases.deinit(self);
+            const capture = try SourceLinearTemporary.preflightCapture(self);
+            const operands = [_]*CudaTensor{ input, weight, bias };
+            // TensorCore loads already narrow input and weights. Direct FMA
+            // needs explicit rounding, and both routes use a rounded bias.
+            const direct = value.reduction == .direct_fma;
+            const round = [_]bool{ direct, direct, true };
+            var scratch_bytes: usize = 0;
+            var spans: [operands.len]buffer_mod.ByteSpan = @splat(.{});
+            for (operands, round, &spans) |tensor, rounds, *span| {
+                if (rounds or tensor.dtype == .bf16) {
+                    span.* = try buffer_mod.ByteSpan.append(&scratch_bytes, try checkedMul(tensor.elem_count, @sizeOf(f32)), buffer_mod.DeviceBuffer.allocation_alignment);
+                }
+            }
             const shape = [_]i64{ @intCast(value.batch), @intCast(value.outputs), @intCast(oh), @intCast(ow) };
             var output = try OwnedF32Output.alloc(self, &shape, count);
             defer output.deinit();
+            var temporary = try SourceLinearTemporary.acquireDeclared(self, scratch_bytes, scratch_bytes, capture);
+            defer temporary.deinit(self);
+            var buffers: [operands.len]buffer_mod.DeviceBuffer = undefined;
+            for (operands, spans, &buffers) |tensor, span, *device_buffer| {
+                device_buffer.* = tensor.buffer;
+                if (span.bytes == 0) continue;
+                device_buffer.* = temporary.span(span);
+                if (tensor.dtype == .bf16) {
+                    try self.kernels.launchSourceWidenBf16(&self.ctx, device_buffer.*, tensor.buffer, tensor.elem_count);
+                } else {
+                    try self.kernels.launchRoundBf16F32(&self.ctx, device_buffer.*, tensor.buffer, tensor.elem_count);
+                }
+            }
+            const values, const weights, const biases = buffers;
             switch (value.reduction) {
-                .direct_fma => try self.kernels.launchConv2dF32(&self.ctx, output.buffer, values.buffer, weights.buffer, biases.buffer, value.batch, value.inputs, value.outputs, value.height, value.width, 3, 3, 2, 2, 1, 1, 1, oh, ow),
-                .tensorcore => try (try self.encoderMultimodalModule()).launchAudioConv(&self.ctx, output.buffer, values.buffer, weights.buffer, biases.buffer, value.batch, value.inputs, value.outputs, value.height, value.width, true),
+                .direct_fma => try self.kernels.launchConv2dF32(&self.ctx, output.buffer, values, weights, biases, value.batch, value.inputs, value.outputs, value.height, value.width, 3, 3, 2, 2, 1, 1, 1, oh, ow),
+                .tensorcore => try (try self.encoderMultimodalModule()).launchAudioConv(&self.ctx, output.buffer, values, weights, biases, value.batch, value.inputs, value.outputs, value.height, value.width, true),
                 .vendor_f32 => unreachable,
             }
             // Each word is independent: publish in the already-owned result
@@ -63296,6 +63305,65 @@ test "CUDA source convolution binds declared BF16 packs and preserves border val
     try std.testing.expectEqual(@as(u64, 4), receipt.forward_calls);
     try std.testing.expectEqual(@as(u64, 2), receipt.bias_calls);
     try std.testing.expect(receipt.max_source_bank_bytes > receipt.max_explicit_workspace_bytes);
+}
+
+test "CUDA direct source convolution binds one declared conversion interval" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.testing.init(a);
+    defer compute.deinit();
+    compute.bf16_blas = try @import("libraries.zig").Cublas.initWithLibrary(compute.ctx.stream, null);
+    compute.embedding_gemma2_policy.matmul_arithmetic = .bf16_reduced;
+    const cb = compute.computeBackend();
+    const input = try cb.fromFloat32Shape(&@as([16]f32, @splat(1)), &.{ 1, 1, 4, 4 });
+    defer cb.free(input);
+    const weights = try cb.fromFloat32Shape(&@as([9]f32, @splat(1)), &.{ 1, 1, 3, 3 });
+    defer cb.free(weights);
+    const bias = try cb.fromFloat32Shape(&.{0.5001}, &.{1});
+    defer cb.free(bias);
+    const request: ops.Bf16SourceOperation = .{ .conv3x3_stride2 = .{
+        .input = input,
+        .weight = weights,
+        .bias = bias,
+        .batch = 1,
+        .inputs = 1,
+        .outputs = 1,
+        .height = 4,
+        .width = 4,
+        .reduction = .direct_fma,
+    } };
+    const Workspace = @import("../../execution/stream_workspace.zig");
+    var plan: Workspace.Plan = .{};
+    var observing = Workspace.Scope.observe(&plan);
+    const eager = observed: {
+        compute.execution_scope = &observing;
+        defer compute.execution_scope = null;
+        break :observed (try bf16SourceOperationOp(&compute, &request)) orelse return error.TestUnexpectedResult;
+    };
+    defer cb.free(eager);
+    try std.testing.expect(plan.finish(tensorFromCt(eager).buffer.ptr));
+    try std.testing.expectEqual(@as(usize, 2), plan.count);
+    try std.testing.expectEqual(@as(usize, 3), plan.event_count);
+    const eager_values = try cb.toFloat32(eager, a);
+    defer a.free(eager_values);
+    try std.testing.expectEqualSlices(f32, &.{ 4.5, 6.5, 6.5, 9.5 }, eager_values);
+
+    const layout = try plan.layout(0);
+    var bank = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, layout.bytes);
+    defer bank.free(&compute.ctx);
+    var bound = try Workspace.Scope.bind(&plan, layout, bank.ptr, bank.len);
+    const allocations = compute.stats.device_alloc_calls;
+    const assigned = submitted: {
+        compute.execution_scope = &bound;
+        defer compute.execution_scope = null;
+        break :submitted (try bf16SourceOperationOp(&compute, &request)) orelse return error.TestUnexpectedResult;
+    };
+    defer cb.free(assigned);
+    try std.testing.expect(bound.complete());
+    try std.testing.expectEqual(allocations, compute.stats.device_alloc_calls);
+    const actual = try cb.toFloat32(assigned, a);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(f32, eager_values, actual);
 }
 
 test "CUDA source audio cold metadata requires retained convolution without probing SDK" {
