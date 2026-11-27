@@ -22425,7 +22425,7 @@ fn sourceAudioStorageOp(ctx: *anyopaque, begin: bool) anyerror!bool {
 /// its exact bank after the SDK consumes it and output widening completes.
 const SourceLinearTemporary = struct {
     bank: buffer_mod.DeviceBuffer,
-    kind: enum { owned, audio, captured },
+    kind: enum { owned, cached, audio, captured },
     fn allocate(self: *CudaCompute, bytes: usize) !buffer_mod.DeviceBuffer {
         const bank = try buffer_mod.DeviceBuffer.allocWithPurpose(&self.ctx, bytes, .command_workspace);
         self.stats.device_alloc_calls += 1;
@@ -22492,6 +22492,7 @@ const SourceLinearTemporary = struct {
     fn deinit(value: *@This(), self: *CudaCompute) void {
         switch (value.kind) {
             .audio => self.source_linear_scratch.in_use = false,
+            .cached => releaseDeviceBuffer(self, &value.bank),
             .captured => {
                 const scope = self.execution_scope orelse platform.inference_process_supervisor.restartWorker();
                 if (!scope.isBound() or !scope.owns(value.bank.ptr)) platform.inference_process_supervisor.restartWorker();
@@ -22615,20 +22616,58 @@ fn sourceLinear(self: *CudaCompute, request: @FieldType(ops.Bf16SourceOperation,
     return request.output orelse output.?.intoTensor();
 }
 
-const SourceF32ValueBuffer = struct {
-    buffer: buffer_mod.DeviceBuffer,
-    owned: bool = false,
-    fn init(self: *CudaCompute, tensor: *CudaTensor) !@This() {
-        if (tensor.dtype == .f32) return .{ .buffer = tensor.buffer };
-        var result = try allocDeviceBuffer(self, try checkedMul(tensor.elem_count, 4));
-        errdefer releaseDeviceBuffer(self, &result);
-        try self.kernels.launchSourceWidenBf16(&self.ctx, result, tensor.buffer, tensor.elem_count);
-        return .{ .buffer = result, .owned = true };
-    }
-    fn deinit(value: *@This(), self: *CudaCompute) void {
-        if (value.owned) releaseDeviceBuffer(self, &value.buffer);
-    }
-};
+fn SourceF32Operands(comptime count: usize) type {
+    return struct {
+        const Self = @This();
+        const Span = buffer_mod.ByteSpan;
+        tensors: [count]?*CudaTensor,
+        spans: [count]Span = @splat(.{}),
+        buffers: [count]buffer_mod.DeviceBuffer = @splat(.{}),
+        extra: Span = .{},
+        bytes: usize = 0,
+        temporary: ?SourceLinearTemporary = null,
+        capture: bool = false,
+
+        fn plan(self: *CudaCompute, tensors: [count]?*CudaTensor, round: [count]bool, extra_bytes: usize) !Self {
+            var result: Self = .{ .tensors = tensors };
+            const alignment = buffer_mod.DeviceBuffer.allocation_alignment;
+            for (tensors, round, &result.spans, &result.buffers) |tensor_opt, rounds, *span, *buffer| {
+                const tensor = tensor_opt orelse continue;
+                buffer.* = tensor.buffer;
+                if (rounds or tensor.dtype == .bf16) {
+                    span.* = try Span.append(&result.bytes, try checkedMul(tensor.elem_count, @sizeOf(f32)), alignment);
+                }
+            }
+            if (extra_bytes != 0) result.extra = try Span.append(&result.bytes, extra_bytes, alignment);
+            if (result.bytes != 0) result.capture = try SourceLinearTemporary.preflightCapture(self);
+            return result;
+        }
+
+        fn bind(self: *Self, compute: *CudaCompute) !void {
+            if (self.bytes == 0) return;
+            // Outside a planned or retained audio scope, keep the ordinary
+            // temporary cache hot while using the same operand offsets.
+            self.temporary = if (compute.execution_scope == null and !compute.source_linear_scratch.active and !self.capture)
+                .{ .bank = try allocDeviceBuffer(compute, self.bytes), .kind = .cached }
+            else
+                try SourceLinearTemporary.acquireDeclared(compute, self.bytes, self.bytes, self.capture);
+            for (self.tensors, self.spans, &self.buffers) |tensor_opt, span, *buffer| {
+                if (span.bytes == 0) continue;
+                const tensor = tensor_opt.?;
+                buffer.* = self.temporary.?.span(span);
+                if (tensor.dtype == .bf16) {
+                    try compute.kernels.launchSourceWidenBf16(&compute.ctx, buffer.*, tensor.buffer, tensor.elem_count);
+                } else {
+                    try compute.kernels.launchRoundBf16F32(&compute.ctx, buffer.*, tensor.buffer, tensor.elem_count);
+                }
+            }
+        }
+
+        fn deinit(self: *Self, compute: *CudaCompute) void {
+            if (self.temporary) |*temporary| temporary.deinit(compute);
+        }
+    };
+}
 
 fn bf16SourceOperationOp(ctx: *anyopaque, request: *const ops.Bf16SourceOperation) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
@@ -22639,11 +22678,12 @@ fn bf16SourceOperationOp(ctx: *anyopaque, request: *const ops.Bf16SourceOperatio
             const count = try elementCountFromShape(input_tensor.shape);
             if (count > std.math.maxInt(u32)) return error.InvalidShape;
             const input = try sourceScalarTensor(value.input, count);
-            var values = try SourceF32ValueBuffer.init(self, input);
-            defer values.deinit(self);
+            var operands = try SourceF32Operands(1).plan(self, .{input}, .{false}, 0);
             var output = try OwnedF32Output.alloc(self, input.shape, count);
             defer output.deinit();
-            try self.kernels.launchSourceClampBf16ValuesF32(&self.ctx, output.buffer, values.buffer, count, value.min, value.max);
+            defer operands.deinit(self);
+            try operands.bind(self);
+            try self.kernels.launchSourceClampBf16ValuesF32(&self.ctx, output.buffer, operands.buffers[0], count, value.min, value.max);
             self.stats.launch_elementwise += 1;
             break :result output.intoTensor();
         },
@@ -22668,11 +22708,12 @@ fn bf16SourceOperationOp(ctx: *anyopaque, request: *const ops.Bf16SourceOperatio
             const count = try elementCountFromShape(input_tensor.shape);
             if (count > std.math.maxInt(u32)) return error.InvalidShape;
             const input = try sourceScalarTensor(value.input, count);
-            var values = try SourceF32ValueBuffer.init(self, input);
-            defer values.deinit(self);
+            var operands = try SourceF32Operands(1).plan(self, .{input}, .{false}, 0);
             var output = try OwnedF32Output.alloc(self, input.shape, count);
             defer output.deinit();
-            try self.kernels.launchSourceSoftplusBf16ValuesF32(&self.ctx, output.buffer, values.buffer, count);
+            defer operands.deinit(self);
+            try operands.bind(self);
+            try self.kernels.launchSourceSoftplusBf16ValuesF32(&self.ctx, output.buffer, operands.buffers[0], count);
             self.stats.source_softplus_calls += 1;
             self.stats.launch_elementwise += 1;
             break :result output.intoTensor();
@@ -22693,20 +22734,19 @@ fn bf16SourceOperationOp(ctx: *anyopaque, request: *const ops.Bf16SourceOperatio
                 try kernels_mod.ChannelSourceRmsPlan.resolve(value.rows, reference_rows, value.width, self.ctx.info.multiprocessor_count, self.source_reduction_threads_per_sm)
             else
                 null;
-            var values = try SourceF32ValueBuffer.init(self, input);
-            defer values.deinit(self);
-            var gamma = if (weight) |tensor| try SourceF32ValueBuffer.init(self, tensor) else SourceF32ValueBuffer{ .buffer = .{} };
-            defer gamma.deinit(self);
+            var operands = try SourceF32Operands(2).plan(self, .{ input, weight }, .{ false, false }, if (channel_plan) |plan| plan.partial_bytes else 0);
             var output = try OwnedF32Output.alloc(self, input.shape, count);
             defer output.deinit();
+            defer operands.deinit(self);
+            try operands.bind(self);
+            const values, const gamma = operands.buffers;
             if (value.reference_layout == .contiguous or reference_rows == 1) {
-                try (try self.encoderMultimodalModule()).launchSourceRmsNormBf16ValuesF32(&self.ctx, output.buffer, values.buffer, if (weight != null) gamma.buffer else null, @intCast(value.rows), @intCast(value.width), value.epsilon);
+                try (try self.encoderMultimodalModule()).launchSourceRmsNormBf16ValuesF32(&self.ctx, output.buffer, values, if (weight != null) gamma else null, @intCast(value.rows), @intCast(value.width), value.epsilon);
                 self.stats.source_rms_contiguous_calls += 1;
             } else {
                 const plan = channel_plan.?;
-                var partial = try allocDeviceBuffer(self, plan.partial_bytes);
-                defer releaseDeviceBuffer(self, &partial);
-                try self.kernels.launchSourceChannelRms(&self.ctx, output.buffer, values.buffer, gamma.buffer, partial, plan, value.epsilon);
+                const partial = if (operands.temporary) |temporary| temporary.span(operands.extra) else buffer_mod.DeviceBuffer{};
+                try self.kernels.launchSourceChannelRms(&self.ctx, output.buffer, values, gamma, partial, plan, value.epsilon);
                 self.stats.source_rms_channel_calls += 1;
             }
             break :result output.intoTensor();
@@ -22718,16 +22758,16 @@ fn bf16SourceOperationOp(ctx: *anyopaque, request: *const ops.Bf16SourceOperatio
             if (count > std.math.maxInt(u32)) return error.InvalidShape;
             const input = try sourceScalarTensor(value.input, count);
             const weight = try sourceScalarTensor(value.weight, value.channels);
-            var values = try SourceF32ValueBuffer.init(self, input);
-            defer values.deinit(self);
-            var gamma = try SourceF32ValueBuffer.init(self, weight);
-            defer gamma.deinit(self);
+            var operands = try SourceF32Operands(2).plan(self, .{ input, weight }, .{ false, false }, 0);
             var output = try OwnedF32Output.alloc(self, input.shape, count);
             defer output.deinit();
+            defer operands.deinit(self);
+            try operands.bind(self);
+            const values, const gamma = operands.buffers;
             const bytes = try checkedMul(per_batch, 4);
             for (0..value.batch) |batch| {
                 const offset = try checkedMul(batch, bytes);
-                try self.kernels.launchSourceLayerNormRelu(&self.ctx, .{ .ptr = output.buffer.ptr + offset, .len = bytes }, .{ .ptr = values.buffer.ptr + offset, .len = bytes }, gamma.buffer, value.positions, value.channels, value.epsilon, true, true);
+                try self.kernels.launchSourceLayerNormRelu(&self.ctx, .{ .ptr = output.buffer.ptr + offset, .len = bytes }, .{ .ptr = values.ptr + offset, .len = bytes }, gamma, value.positions, value.channels, value.epsilon, true, true);
             }
             break :result output.intoTensor();
         },
@@ -22743,36 +22783,16 @@ fn bf16SourceOperationOp(ctx: *anyopaque, request: *const ops.Bf16SourceOperatio
             const weight = try sourceScalarTensor(value.weight, weight_count);
             if (value.reduction == .vendor_f32) break :result try sourceConvolutionF32(self, value);
             const bias = try sourceScalarTensor(value.bias orelse return error.InvalidShape, value.outputs);
-            const capture = try SourceLinearTemporary.preflightCapture(self);
-            const operands = [_]*CudaTensor{ input, weight, bias };
             // TensorCore loads already narrow input and weights. Direct FMA
             // needs explicit rounding, and both routes use a rounded bias.
             const direct = value.reduction == .direct_fma;
-            const round = [_]bool{ direct, direct, true };
-            var scratch_bytes: usize = 0;
-            var spans: [operands.len]buffer_mod.ByteSpan = @splat(.{});
-            for (operands, round, &spans) |tensor, rounds, *span| {
-                if (rounds or tensor.dtype == .bf16) {
-                    span.* = try buffer_mod.ByteSpan.append(&scratch_bytes, try checkedMul(tensor.elem_count, @sizeOf(f32)), buffer_mod.DeviceBuffer.allocation_alignment);
-                }
-            }
+            var operands = try SourceF32Operands(3).plan(self, .{ input, weight, bias }, .{ direct, direct, true }, 0);
             const shape = [_]i64{ @intCast(value.batch), @intCast(value.outputs), @intCast(oh), @intCast(ow) };
             var output = try OwnedF32Output.alloc(self, &shape, count);
             defer output.deinit();
-            var temporary = try SourceLinearTemporary.acquireDeclared(self, scratch_bytes, scratch_bytes, capture);
-            defer temporary.deinit(self);
-            var buffers: [operands.len]buffer_mod.DeviceBuffer = undefined;
-            for (operands, spans, &buffers) |tensor, span, *device_buffer| {
-                device_buffer.* = tensor.buffer;
-                if (span.bytes == 0) continue;
-                device_buffer.* = temporary.span(span);
-                if (tensor.dtype == .bf16) {
-                    try self.kernels.launchSourceWidenBf16(&self.ctx, device_buffer.*, tensor.buffer, tensor.elem_count);
-                } else {
-                    try self.kernels.launchRoundBf16F32(&self.ctx, device_buffer.*, tensor.buffer, tensor.elem_count);
-                }
-            }
-            const values, const weights, const biases = buffers;
+            defer operands.deinit(self);
+            try operands.bind(self);
+            const values, const weights, const biases = operands.buffers;
             switch (value.reduction) {
                 .direct_fma => try self.kernels.launchConv2dF32(&self.ctx, output.buffer, values, weights, biases, value.batch, value.inputs, value.outputs, value.height, value.width, 3, 3, 2, 2, 1, 1, 1, oh, ow),
                 .tensorcore => try (try self.encoderMultimodalModule()).launchAudioConv(&self.ctx, output.buffer, values, weights, biases, value.batch, value.inputs, value.outputs, value.height, value.width, true),
@@ -63364,6 +63384,44 @@ test "CUDA direct source convolution binds one declared conversion interval" {
     const actual = try cb.toFloat32(assigned, a);
     defer a.free(actual);
     try std.testing.expectEqualSlices(f32, eager_values, actual);
+}
+
+test "CUDA single-CTA source channel RMS needs no conversion or partial scratch" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.testing.init(a);
+    defer compute.deinit();
+    compute.bf16_blas = try @import("libraries.zig").Cublas.initWithLibrary(compute.ctx.stream, null);
+    compute.embedding_gemma2_policy.matmul_arithmetic = .bf16_reduced;
+    compute.source_reduction_threads_per_sm = try sourceReductionThreadsPerSm(&compute.ctx);
+    const cb = compute.computeBackend();
+    const rows = 2;
+    const width = 1024;
+    const input = try cb.fromFloat32Shape(&@as([rows * width]f32, @splat(1)), &.{ rows, width });
+    defer cb.free(input);
+    const request: ops.Bf16SourceOperation = .{ .rms_norm = .{
+        .input = input,
+        .weight = null,
+        .rows = rows,
+        .width = width,
+        .epsilon = 1e-5,
+        .reference_layout = .channel_major,
+        .reference_rows_per_batch = rows,
+    } };
+    var plan: @import("../../execution/stream_workspace.zig").Plan = .{};
+    var observing = @import("../../execution/stream_workspace.zig").Scope.observe(&plan);
+    const out = observed: {
+        compute.execution_scope = &observing;
+        defer compute.execution_scope = null;
+        break :observed (try bf16SourceOperationOp(&compute, &request)) orelse return error.TestUnexpectedResult;
+    };
+    defer cb.free(out);
+    try std.testing.expect(plan.finish(tensorFromCt(out).buffer.ptr));
+    try std.testing.expectEqual(@as(usize, 1), plan.count);
+    try std.testing.expectEqual(@as(usize, 0), plan.declared_operation_scratch_intervals);
+    const actual = try cb.toFloat32(out, a);
+    defer a.free(actual);
+    for (actual) |value| try std.testing.expectEqual(@as(f32, 1), value);
 }
 
 test "CUDA source audio cold metadata requires retained convolution without probing SDK" {
