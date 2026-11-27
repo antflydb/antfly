@@ -2231,16 +2231,61 @@ pub const PersistentIndex = struct {
     /// Refused while inline writes of this process are between commit and
     /// install: a peer may have retired or merged what they will publish.
     pub fn refreshPeerDelta(self: *PersistentIndex, changed: []const native_catalog_backend.Mutation) !void {
+        // Built outside `lockStorage`; a publication landing meanwhile (a
+        // merge) makes it stale, and it is built again.
+        for (0..4) |_| {
+            var prepared = (try self.preparePeerDelta(changed)) orelse return;
+            defer prepared.deinit(self.alloc);
+            self.lockStorage();
+            defer self.unlockStorage();
+            if (try self.installPeerDelta(&prepared)) return;
+        }
+        return error.UnsupportedRefresh;
+    }
+
+    /// A peer delta read and built without this index's locks: the
+    /// replacement snapshot against a pinned writer snapshot, the new
+    /// segments with their deletions, and where each newly dead version
+    /// sits among the segments kept. `installPeerDelta` validates and
+    /// publishes it.
+    pub const PreparedPeerDelta = struct {
+        arena: std.heap.ArenaAllocator,
+        keys: []native_catalog_backend.Mutation,
+        /// The writer snapshot it was built against, retained.
+        base: *index_mod.IndexSnapshot,
+        /// The mirror's epoch before anything was read from it.
+        mirror_epoch: u64,
+        removed: []u64 = &.{},
+        additions: std.ArrayListUnmanaged(index_mod.ReplacementSegmentData) = .empty,
+        replacement: ?index_mod.IndexWriter.PreparedSegmentReplacement = null,
+        /// Newly dead versions in kept segments, located against `base`.
+        dead: []VersionLocations.Location = &.{},
+        dead_versions: []u64 = &.{},
+
+        pub fn deinit(self: *PreparedPeerDelta, alloc: Allocator) void {
+            if (self.replacement) |*prepared| prepared.abort();
+            for (self.additions.items) |*entry| {
+                if (entry.prepared_reader) |*reader| reader.deinit();
+                if (entry.deleted_owned) |*bitmap| bitmap.deinit();
+                entry.data.deinit(alloc);
+            }
+            self.additions.deinit(alloc);
+            self.base.release();
+            self.arena.deinit();
+            self.* = undefined;
+        }
+    };
+
+    /// Null when the delta changes nothing this index serves.
+    pub fn preparePeerDelta(self: *PersistentIndex, changed: []const native_catalog_backend.Mutation) !?PreparedPeerDelta {
         if (!self.versioned or self.inline_in_flight.load(.acquire) != 0 or
             self.inline_segments_pending.load(.acquire) != 0) return error.UnsupportedRefresh;
         const backend = switch (self.main_store_owner) {
             .native_catalog => |backend| backend,
             else => return error.UnsupportedRefresh,
         };
-        var arena = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena.deinit();
-        const alloc = arena.allocator();
         var keys = std.ArrayListUnmanaged(native_catalog_backend.Mutation).empty;
+        defer keys.deinit(self.alloc);
         for (changed) |key| {
             const namespace = key.namespace orelse return error.UnsupportedRefresh;
             if (std.mem.eql(u8, namespace, native_catalog_backend.tip_namespace)) continue;
@@ -2250,30 +2295,37 @@ pub const PersistentIndex = struct {
                 !std.mem.eql(u8, namespace, runtimeNamespace(.segments).name.?) and
                 !std.mem.eql(u8, namespace, runtimeNamespace(.meta).name.?))
                 return error.UnsupportedRefresh;
-            try keys.append(alloc, key);
-        }
-        if (keys.items.len == 0) return;
-
-        for (keys.items) |key| {
-            if (std.mem.eql(u8, key.namespace.?, runtimeNamespace(.meta).name.?) and std.mem.eql(u8, key.key, meta_text_storage_format)) {
+            if (std.mem.eql(u8, namespace, runtimeNamespace(.meta).name.?) and std.mem.eql(u8, key.key, meta_text_storage_format)) {
                 if (key.is_delete or key.value.len != 4 or std.mem.readInt(u32, key.value[0..4], .little) != text_storage_format_versions)
                     return error.UnsupportedRefresh;
             }
             // Versioned segments derive liveness from the dead set. Merge
             // and reset still emit tombstones for legacy deletion bitmaps.
-            if (!key.is_delete and std.mem.eql(u8, key.namespace.?, runtimeNamespace(.deletions).name.?))
+            if (!key.is_delete and std.mem.eql(u8, namespace, runtimeNamespace(.deletions).name.?))
                 return error.UnsupportedRefresh;
+            try keys.append(self.alloc, key);
         }
+        if (keys.items.len == 0) return null;
 
-        self.lockStorage();
-        defer self.unlockStorage();
+        const mirror_epoch = backend.state_epoch.load(.acquire);
+        var prepared: PreparedPeerDelta = .{
+            .arena = std.heap.ArenaAllocator.init(self.alloc),
+            .keys = &.{},
+            .base = self.writer.acquireSnapshot(),
+            .mirror_epoch = mirror_epoch,
+        };
+        errdefer prepared.deinit(self.alloc);
+        const alloc = prepared.arena.allocator();
+        prepared.keys = try alloc.dupe(native_catalog_backend.Mutation, keys.items);
+        const base = prepared.base;
+
         var read = try self.beginReadMainTxn();
         defer read.abort();
         var changed_dead = std.AutoHashMapUnmanaged(u32, ?[]const u8).empty;
         var dead_tip: DeadVersions = .{ .alloc = alloc };
         defer dead_tip.deinit();
         var newly_dead = std.ArrayListUnmanaged(u64).empty;
-        for (keys.items) |key| {
+        for (prepared.keys) |key| {
             if (!std.mem.eql(u8, key.namespace.?, dead_namespace)) continue;
             if (key.key.len != 4) return error.InvalidDeadVersions;
             const bucket = std.mem.readInt(u32, key.key[0..4], .big);
@@ -2294,28 +2346,14 @@ pub const PersistentIndex = struct {
         }
 
         var regular_segment_bytes = std.AutoHashMapUnmanaged(u64, []const u8).empty;
-        for (keys.items) |key| {
+        for (prepared.keys) |key| {
             if (key.is_delete or !std.mem.eql(u8, key.namespace.?, runtimeNamespace(.segments).name.?)) continue;
             if (key.key.len != 8) return error.InvalidSegmentCounter;
             const id = std.mem.readInt(u64, key.key[0..8], .big);
             try regular_segment_bytes.put(alloc, id, key.value);
         }
         var removed = std.ArrayListUnmanaged(u64).empty;
-        var additions = std.ArrayListUnmanaged(index_mod.ReplacementSegmentData).empty;
-        var bitmaps = std.ArrayListUnmanaged(?roaring.RoaringBitmap).empty;
-        defer {
-            for (additions.items) |*entry| entry.data.deinit(self.alloc);
-            for (bitmaps.items) |*bitmap| if (bitmap.*) |*owned| owned.deinit();
-        }
-        const has_segment_changes = for (keys.items) |key| {
-            const namespace = key.namespace.?;
-            if (std.mem.eql(u8, namespace, l0_namespace) or
-                (std.mem.eql(u8, namespace, runtimeNamespace(.meta).name.?) and
-                    std.mem.startsWith(u8, key.key, meta_active_segment_prefix))) break true;
-        } else false;
-        const current = if (has_segment_changes) self.writer.acquireSnapshot() else null;
-        defer if (current) |snap| snap.release();
-        for (keys.items) |key| {
+        for (prepared.keys) |key| {
             const namespace = key.namespace.?;
             const segment_id = if (std.mem.eql(u8, namespace, l0_namespace)) id: {
                 if (key.key.len != 8) return error.InvalidLevel0Segment;
@@ -2325,42 +2363,110 @@ pub const PersistentIndex = struct {
                 if (encoded.len != 8) return error.InvalidSegmentCounter;
                 break :id std.mem.readInt(u64, encoded[0..8], .big);
             } else continue;
-            const exists = (try current.?.segmentIndex(segment_id)) != null;
+            const exists = (try base.segmentIndex(segment_id)) != null;
             if (key.is_delete) {
                 if (exists) try removed.append(alloc, segment_id);
                 continue;
             }
             if (exists) continue;
             const bytes = if (isL0SegmentId(segment_id)) key.value else regular_segment_bytes.get(segment_id) orelse return error.UnsupportedRefresh;
-            try additions.ensureUnusedCapacity(alloc, 1);
-            try bitmaps.ensureUnusedCapacity(alloc, 1);
-            var reader = try segment_mod.SegmentReader.init(alloc, bytes);
-            defer reader.deinit();
+            try prepared.additions.ensureUnusedCapacity(self.alloc, 1);
+            var data = index_mod.SegmentData.fromOwnedHeap(try self.alloc.dupe(u8, bytes));
+            errdefer data.deinit(self.alloc);
+            var reader = try data.initReader(self.writer.alloc);
+            errdefer reader.deinit();
             const versions = try reader.docVersionsAlloc(alloc);
             const bitmap = try self.peerDeletionBitmap(&read, &dead_tip, &changed_dead, reader.doc_count, versions);
-            errdefer if (bitmap) |value| {
-                var owned = value;
-                owned.deinit();
+            prepared.additions.appendAssumeCapacity(.{ .id = segment_id, .data = data, .prepared_reader = reader, .deleted_owned = bitmap });
+        }
+        prepared.removed = removed.items;
+        if (newly_dead.items.len != 0) {
+            prepared.dead_versions = newly_dead.items;
+            prepared.dead = try self.locateKeptVersions(alloc, base, removed.items, newly_dead.items);
+        }
+        if (removed.items.len != 0 or prepared.additions.items.len != 0)
+            prepared.replacement = try self.writer.prepareSegmentsAgainst(base, self.alloc, prepared.removed, prepared.additions.items);
+        return prepared;
+    }
+
+    /// Where each of `versions` sits among `base`'s segments other than
+    /// `removed`. Version columns not yet indexed are decoded here, outside
+    /// every lock, and added to the index for later deaths.
+    fn locateKeptVersions(self: *PersistentIndex, alloc: Allocator, base: *const index_mod.IndexSnapshot, removed: []const u64, versions: []const u64) ![]VersionLocations.Location {
+        const locations = &self.version_locations;
+        var found = std.ArrayListUnmanaged(VersionLocations.Location).empty;
+        var missing = std.AutoHashMapUnmanaged(u64, void).empty;
+        var unindexed = std.ArrayListUnmanaged(u64).empty;
+        {
+            @import("antfly_platform").sync.lockYielding(&locations.mutex);
+            defer locations.mutex.unlock();
+            for (versions) |version| {
+                if (locations.map.get(version)) |location| if ((try base.segmentIndex(location.seg_id)) != null and
+                    std.mem.indexOfScalar(u64, removed, location.seg_id) == null)
+                {
+                    try found.append(alloc, location);
+                    continue;
+                };
+                try missing.put(alloc, version, {});
+            }
+            if (missing.count() != 0) for (base.segments) |*segment| {
+                if (locations.indexed.contains(segment.id) or std.mem.indexOfScalar(u64, removed, segment.id) != null) continue;
+                try unindexed.append(alloc, segment.id);
             };
-            additions.appendAssumeCapacity(.{ .id = segment_id, .data = index_mod.SegmentData.fromOwnedHeap(try self.alloc.dupe(u8, bytes)) });
-            bitmaps.appendAssumeCapacity(bitmap);
         }
-        for (additions.items, bitmaps.items) |*entry, *bitmap| {
-            if (bitmap.*) |*value| entry.deleted = value;
+        if (missing.count() == 0) return try found.toOwnedSlice(alloc);
+        for (unindexed.items) |seg_id| {
+            const index = (try base.segmentIndex(seg_id)).?;
+            const column = (try base.segments[index].reader.docVersionsAlloc(self.alloc)) orelse try self.alloc.alloc(u64, 0);
+            var owned = true;
+            defer if (owned) self.alloc.free(column);
+            for (column, 0..) |version, local| {
+                if (version == 0 or !missing.contains(version)) continue;
+                try found.append(alloc, .{ .seg_id = seg_id, .local_id = @intCast(local) });
+            }
+            @import("antfly_platform").sync.lockYielding(&locations.mutex);
+            defer locations.mutex.unlock();
+            if (locations.indexed.contains(seg_id)) continue;
+            try locations.map.ensureUnusedCapacity(self.alloc, @intCast(column.len));
+            try locations.indexed.put(self.alloc, seg_id, column);
+            owned = false;
+            for (column, 0..) |version, local| {
+                if (version != 0) locations.map.putAssumeCapacity(version, .{ .seg_id = seg_id, .local_id = @intCast(local) });
+            }
         }
-        if (removed.items.len != 0 or additions.items.len != 0) {
-            var prepared = try self.writer.prepareSegmentsManyData(removed.items, additions.items);
-            defer prepared.abort();
-            prepared.publish();
-            additions.clearRetainingCapacity();
+        return try found.toOwnedSlice(alloc);
+    }
+
+    /// Publishes a prepared delta if neither the mirror nor the writer moved
+    /// since it was prepared; false when stale. The caller holds
+    /// `lockStorage`, under which this index's writers publish.
+    pub fn installPeerDelta(self: *PersistentIndex, prepared: *PreparedPeerDelta) !bool {
+        const backend = switch (self.main_store_owner) {
+            .native_catalog => |backend| backend,
+            else => return error.UnsupportedRefresh,
+        };
+        if (backend.state_epoch.load(.acquire) != prepared.mirror_epoch) return false;
+        if (prepared.replacement) |*replacement| {
+            const published = replacement.publishIfCurrent();
+            prepared.replacement = null;
+            if (!published) return false;
+            // Published: the writer owns the data, readers and deletions.
+            prepared.additions.clearRetainingCapacity();
+        } else if (@atomicLoad(*index_mod.IndexSnapshot, &self.writer.current, .acquire) != prepared.base) return false;
+        for (prepared.dead) |location| try self.writer.applyCommittedDeletes(location.seg_id, &.{location.local_id});
+        if (prepared.dead_versions.len != 0) {
+            const locations = &self.version_locations;
+            @import("antfly_platform").sync.lockYielding(&locations.mutex);
+            defer locations.mutex.unlock();
+            for (prepared.dead_versions) |version| _ = locations.map.remove(version);
         }
-        if (newly_dead.items.len != 0) try self.installDeadVersionsOrError(newly_dead.items);
         backend.forgetDecisions();
-        try backend.applyExternallyCommittedMutations(keys.items);
-        for (keys.items) |key| {
+        try backend.applyExternallyCommittedMutations(prepared.keys);
+        for (prepared.keys) |key| {
             if (key.is_delete or !std.mem.eql(u8, key.namespace.?, runtimeNamespace(.meta).name.?) or !std.mem.eql(u8, key.key, meta_next_seg_id)) continue;
             self.writer.next_segment_id = @max(self.writer.next_segment_id, try decodeNextSegmentId(key.value));
         }
+        return true;
     }
 
     fn peerDeletionBitmap(
@@ -2421,38 +2527,63 @@ pub const PersistentIndex = struct {
         _ = try self.applyTipRefresh(&plan);
     }
 
-    pub const PreparedChangeRefresh = native_catalog_backend.Backend.SyncedChanges;
+    /// A refresh from the records other writers changed since the mirror
+    /// last synced, read at one cut and built without this index's locks.
+    pub const PreparedChangeRefresh = struct {
+        changes: native_catalog_backend.Backend.SyncedChanges,
+        /// Null when nothing this index serves changed.
+        delta: ?PreparedPeerDelta,
+        /// The changes are ones only a refresh from the tip can apply.
+        needs_tip: bool = false,
+
+        pub fn deinit(self: *PreparedChangeRefresh, alloc: Allocator) void {
+            if (self.delta) |*delta| delta.deinit(alloc);
+            self.changes.deinit();
+            self.* = undefined;
+        }
+    };
 
     /// The records other writers committed to this index since its mirror
-    /// last synced, read without any lock of this index: a refresh sized by
-    /// the change. Null when the history is incomplete or this index keeps
-    /// none, so only a refresh from the tip can bring it current.
+    /// last synced, read and built into a publication without any lock of
+    /// this index: a refresh sized by the change. Null when the history is
+    /// incomplete or this index keeps none, so only a refresh from the tip
+    /// can bring it current.
     pub fn prepareRefreshFromChanges(self: *PersistentIndex) !?PreparedChangeRefresh {
         if (!self.versioned or self.inline_in_flight.load(.acquire) != 0) return null;
         const backend = switch (self.main_store_owner) {
             .native_catalog => |backend| backend,
             else => return null,
         };
-        return try backend.changesSinceSync(self.alloc);
+        var changes = (try backend.changesSinceSync(self.alloc)) orelse return null;
+        errdefer changes.deinit();
+        var delta = self.preparePeerDelta(changes.mutations) catch |err| switch (err) {
+            error.UnsupportedRefresh => return .{ .changes = changes, .delta = null, .needs_tip = true },
+            else => return err,
+        };
+        // Checked against the epoch from before the cut was read.
+        if (delta) |*prepared| prepared.mirror_epoch = changes.mirror_epoch;
+        return .{ .changes = changes, .delta = delta };
     }
 
     pub const ChangeRefreshOutcome = enum { installed, stale, needs_tip };
 
-    /// Applies prepared changes if nothing reached the mirror since they
-    /// were read. The caller holds the index's apply lock, as for
-    /// `installPreparedRefreshFromTip`.
-    pub fn installRefreshFromChanges(self: *PersistentIndex, changes: *PreparedChangeRefresh) !ChangeRefreshOutcome {
+    /// Publishes a prepared change refresh if nothing reached the index
+    /// since it was read. The caller holds the index's apply lock, as for
+    /// `installPreparedRefreshFromTip`; only validation and the swap run
+    /// under it.
+    pub fn installRefreshFromChanges(self: *PersistentIndex, prepared: *PreparedChangeRefresh) !ChangeRefreshOutcome {
+        if (prepared.needs_tip) return .needs_tip;
         const backend = switch (self.main_store_owner) {
             .native_catalog => |backend| backend,
             else => return .needs_tip,
         };
-        if (backend.state_epoch.load(.acquire) != changes.mirror_epoch) return .stale;
-        self.refreshPeerDelta(changes.mutations) catch |err| switch (err) {
-            // Checked before anything is applied.
-            error.UnsupportedRefresh => return .needs_tip,
-            else => return err,
-        };
-        backend.noteSyncedThrough(changes.through);
+        if (backend.state_epoch.load(.acquire) != prepared.changes.mirror_epoch) return .stale;
+        if (prepared.delta) |*delta| {
+            self.lockStorage();
+            defer self.unlockStorage();
+            if (!try self.installPeerDelta(delta)) return .stale;
+        }
+        backend.noteSyncedThrough(prepared.changes.through);
         return .installed;
     }
 
@@ -6827,7 +6958,7 @@ pub const InlinePublicationTestSink = struct {
                 .loadTipAlloc = feedLoadTip,
                 .resolves = true,
                 .committedSequence = feedCommitted,
-                .changedKeysBetween = feedChanged,
+                .changesSince = feedChanges,
             };
         }
 
@@ -6859,17 +6990,23 @@ pub const InlinePublicationTestSink = struct {
             return of(ptr).sequence;
         }
 
-        fn feedChanged(ptr: *anyopaque, allocator: Allocator, scope: []const u8, since: u64, through: u64) anyerror!?[]native_catalog_backend.Mutation {
-            _ = scope;
+        /// Values are read as the keys are listed: one cut, as in Lite.
+        fn feedChanges(ptr: *anyopaque, allocator: Allocator, scope: []const u8, since: u64) anyerror!?native_catalog_backend.Changes {
             const self: *Feed = @ptrCast(@alignCast(ptr));
             const feed = self.sink;
             if (feed.reclaimed_through > since) return null;
             var out = std.ArrayListUnmanaged(native_catalog_backend.Mutation).empty;
             for (feed.changes.items) |change| {
-                if (change.sequence <= since or change.sequence > through or change.origin == self.origin) continue;
-                try out.append(allocator, .{ .namespace = change.namespace, .key = change.key });
+                if (change.sequence <= since or change.origin == self.origin) continue;
+                const seen = for (out.items) |listed| {
+                    if (std.mem.eql(u8, listed.key, change.key) and std.meta.eql(listed.namespace == null, change.namespace == null) and
+                        (change.namespace == null or std.mem.eql(u8, listed.namespace.?, change.namespace.?))) break true;
+                } else false;
+                if (seen) continue;
+                const value = try loadOneAlloc(feed, allocator, scope, change.namespace, change.key);
+                try out.append(allocator, .{ .namespace = change.namespace, .key = change.key, .value = value orelse "", .is_delete = value == null });
             }
-            return try out.toOwnedSlice(allocator);
+            return .{ .through = feed.sequence, .mutations = try out.toOwnedSlice(allocator) };
         }
     };
 
@@ -10117,8 +10254,8 @@ test "persistent index refreshes from changed records and falls back to the tip"
     const loads = sink.full_loads;
     {
         var changes = (try index.prepareRefreshFromChanges()).?;
-        defer changes.deinit();
-        try std.testing.expect(changes.mutations.len != 0);
+        defer changes.deinit(alloc);
+        try std.testing.expect(changes.changes.mutations.len != 0);
         try std.testing.expectEqual(PersistentIndex.ChangeRefreshOutcome.installed, try index.installRefreshFromChanges(&changes));
     }
     {
@@ -10134,7 +10271,7 @@ test "persistent index refreshes from changed records and falls back to the tip"
     try peer.indexSegment(second);
     {
         var changes = (try index.prepareRefreshFromChanges()).?;
-        defer changes.deinit();
+        defer changes.deinit(alloc);
         try std.testing.expectEqual(PersistentIndex.ChangeRefreshOutcome.installed, try index.installRefreshFromChanges(&changes));
     }
     {
@@ -10146,8 +10283,8 @@ test "persistent index refreshes from changed records and falls back to the tip"
     // Nothing changed since: an empty refresh.
     {
         var changes = (try index.prepareRefreshFromChanges()).?;
-        defer changes.deinit();
-        try std.testing.expectEqual(@as(usize, 0), changes.mutations.len);
+        defer changes.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), changes.changes.mutations.len);
         try std.testing.expectEqual(PersistentIndex.ChangeRefreshOutcome.installed, try index.installRefreshFromChanges(&changes));
     }
     try std.testing.expectEqual(loads, sink.full_loads);
@@ -10157,7 +10294,7 @@ test "persistent index refreshes from changed records and falls back to the tip"
     try peer.indexSegment(third);
     {
         var stale = (try index.prepareRefreshFromChanges()).?;
-        defer stale.deinit();
+        defer stale.deinit(alloc);
         const own = try buildSimpleSegment(alloc, "doc:own", "own");
         defer alloc.free(own);
         try index.indexSegment(own);
@@ -10182,14 +10319,91 @@ test "persistent index refreshes from changed records and falls back to the tip"
     defer alloc.free(fourth);
     try peer.indexSegment(fourth);
     var changes = (try index.prepareRefreshFromChanges()).?;
-    defer changes.deinit();
+    defer changes.deinit(alloc);
     // The records of one publication, not the index's.
-    try std.testing.expect(changes.mutations.len != 0 and changes.mutations.len < sink.entries.items.len);
+    try std.testing.expect(changes.changes.mutations.len != 0 and changes.changes.mutations.len < sink.entries.items.len);
     try std.testing.expectEqual(PersistentIndex.ChangeRefreshOutcome.installed, try index.installRefreshFromChanges(&changes));
     const snap = index.writer.acquireSnapshot();
     defer snap.release();
     try std.testing.expectEqual(@as(usize, 5), snap.segments.len);
     try std.testing.expectEqual(@as(u32, 4), snap.liveDocCount());
+}
+
+// The change refresh's heavy work (reading the new segment, building the
+// replacement and its statistics, locating newly dead versions in kept
+// segments) is done before any lock of the index: it finishes with the
+// index's storage and writer locks held elsewhere, and the install that
+// follows takes them only to validate and swap.
+test "persistent index prepares a change refresh without its locks" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var sink = InlinePublicationTestSink{ .allocator = alloc };
+    defer sink.deinit(alloc);
+    var own_feed: InlinePublicationTestSink.Feed = .{ .sink = &sink, .origin = 1 };
+    var peer_feed: InlinePublicationTestSink.Feed = .{ .sink = &sink, .origin = 2 };
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+    var peer_path_buf: [256]u8 = undefined;
+    const peer_path = try std.fmt.bufPrintSentinel(&peer_path_buf, "{s}-peer", .{path}, 0);
+    defer cleanupPersistDir(peer_path.ptr);
+    var index = try PersistentIndex.open(alloc, .{ .path = path, .main_backend = .native_catalog, .main_native_catalog_sink = own_feed.catalogSink() });
+    defer index.close();
+    var peer = try PersistentIndex.open(alloc, .{ .path = peer_path, .main_backend = .native_catalog, .main_native_catalog_sink = peer_feed.catalogSink() });
+    defer peer.close();
+
+    const first = try buildSimpleSegment(alloc, "doc:a", "alpha");
+    defer alloc.free(first);
+    try peer.indexSegment(first);
+    {
+        var changes = (try index.prepareRefreshFromChanges()).?;
+        defer changes.deinit(alloc);
+        try std.testing.expectEqual(PersistentIndex.ChangeRefreshOutcome.installed, try index.installRefreshFromChanges(&changes));
+    }
+    // A rewrite: a new segment, and the first copy, in a kept segment whose
+    // versions this index has not indexed, dies.
+    const second = try buildSimpleSegment(alloc, "doc:a", "beta");
+    defer alloc.free(second);
+    try peer.indexSegment(second);
+    try std.testing.expectEqual(@as(usize, 0), index.version_locations.indexed.count());
+
+    const Prepare = struct {
+        index: *PersistentIndex,
+        result: ?anyerror!?PersistentIndex.PreparedChangeRefresh = null,
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.result = self.index.prepareRefreshFromChanges();
+            self.done.store(true, .release);
+        }
+    };
+    var prepare: Prepare = .{ .index = &index };
+    index.lockStorage();
+    index.writer.lockMutex();
+    var held = true;
+    defer if (held) {
+        index.writer.mu.unlock();
+        index.unlockStorage();
+    };
+    const thread = try std.Thread.spawn(.{}, Prepare.run, .{&prepare});
+    var waited_ms: usize = 0;
+    while (!prepare.done.load(.acquire) and waited_ms < 30_000) : (waited_ms += 5) std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake) catch {};
+    const finished = prepare.done.load(.acquire);
+    index.writer.mu.unlock();
+    index.unlockStorage();
+    held = false;
+    thread.join();
+    try std.testing.expect(finished);
+
+    var changes = (try prepare.result.?).?;
+    defer changes.deinit(alloc);
+    try std.testing.expect(changes.delta.?.replacement != null);
+    try std.testing.expectEqual(@as(usize, 1), changes.delta.?.dead.len);
+    try std.testing.expectEqual(PersistentIndex.ChangeRefreshOutcome.installed, try index.installRefreshFromChanges(&changes));
+    const snap = index.writer.acquireSnapshot();
+    defer snap.release();
+    try std.testing.expectEqual(@as(usize, 2), snap.segments.len);
+    try std.testing.expectEqual(@as(u32, 1), snap.liveDocCount());
 }
 
 test "persistent index refreshed after a peer merge plans from the peer's output" {

@@ -8926,6 +8926,14 @@ test "capi native text merge drain waits for a required tip refresh" {
         try std.testing.expectError(error.EnrichmentWaitTimeout, db.drainScheduledTextMergesWithin(blocked));
         try std.testing.expect(entry.tipRefreshRequired());
     }
+    // Without an Io the lock is retried, not waited on: a held apply lock
+    // still ends at the deadline.
+    {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        const held: @import("../storage/db/derived/derived_executor.zig").VisibilityWait = .{ .deadline_ns = clock.nowRealtimeNs() + 50 * std.time.ns_per_ms, .clock = clock };
+        try std.testing.expectError(error.EnrichmentWaitTimeout, db.lockApplyForPortableRuntimeWithin(null, held));
+    }
     // A spent budget starts no pass, even with the refresh now able to run.
     const spent: @import("../storage/db/derived/derived_executor.zig").VisibilityWait = .{ .deadline_ns = clock.nowRealtimeNs(), .clock = clock };
     try std.testing.expectError(error.EnrichmentWaitTimeout, db.drainScheduledTextMergesWithin(spent));

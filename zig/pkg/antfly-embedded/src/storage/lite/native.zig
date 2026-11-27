@@ -15574,6 +15574,13 @@ pub const NativeFile = struct {
         return try self.getIndexCatalogRecordLimitedAtCheckpointAlloc(allocator, key, std.math.maxInt(usize), checkpoint);
     }
 
+    /// At an overlay mark the caller captured once (`readMark`), so many
+    /// reads, and a change enumeration through the same mark, see one cut
+    /// even while commits land.
+    pub fn getIndexCatalogRecordAtMarkAlloc(self: *NativeFile, allocator: Allocator, key: []const u8, checkpoint: CheckpointSlot, mark: u64) !?[]u8 {
+        return try self.getCatalogRecordFromRootAtMarkAlloc(allocator, .index, key, checkpoint, mark, std.math.maxInt(usize));
+    }
+
     /// Enforce the caller's limit against catalog metadata before allocating
     /// or reading any external payload, within the same pinned checkpoint.
     pub fn getIndexCatalogRecordLimitedAtCheckpointAlloc(self: *NativeFile, allocator: Allocator, key: []const u8, max_bytes: usize, checkpoint: CheckpointSlot) !?[]u8 {
@@ -15631,7 +15638,19 @@ pub const NativeFile = struct {
         checkpoint: CheckpointSlot,
         max_bytes: usize,
     ) !?[]u8 {
-        if (try self.redoOverlayEntry(if (root == .metadata) .metadata else .index, checkpoint, key)) |entry| {
+        return try self.getCatalogRecordFromRootAtMarkAlloc(allocator, root, key, checkpoint, self.readMark(checkpoint), max_bytes);
+    }
+
+    fn getCatalogRecordFromRootAtMarkAlloc(
+        self: *NativeFile,
+        allocator: Allocator,
+        root: CatalogRoot,
+        key: []const u8,
+        checkpoint: CheckpointSlot,
+        mark: u64,
+        max_bytes: usize,
+    ) !?[]u8 {
+        if (try self.redoOverlayEntryAt(if (root == .metadata) .metadata else .index, mark, checkpoint.redo_folded_through, key)) |entry| {
             defer self.allocator.free(entry.value);
             if (entry.is_delete) return null;
             const value_len = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;

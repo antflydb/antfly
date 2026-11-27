@@ -41029,18 +41029,17 @@ pub const DB = struct {
         }
     }
 
-    /// `lockApplyForPortableRuntime`, waiting for the lock in short slices
-    /// that each recheck `wait`.
-    fn lockApplyForPortableRuntimeWithin(self: *DB, maybe_io: ?std.Io, wait: derived_executor_mod.VisibilityWait) !void {
-        const io = maybe_io orelse {
-            try self.lockApplyForPortableRuntime();
-            errdefer self.core.unlockApply();
-            try wait.check();
-            return;
-        };
+    /// `lockApplyForPortableRuntime`, retrying the lock in short slices
+    /// that each recheck `wait` (timed waits with an Io, yields without),
+    /// and failing rather than holding the lock past it.
+    pub fn lockApplyForPortableRuntimeWithin(self: *DB, maybe_io: ?std.Io, wait: derived_executor_mod.VisibilityWait) !void {
         try self.enforcePortableRuntimeGate();
         while (!self.core.tryLockApplyExclusive()) {
             try wait.check();
+            const io = maybe_io orelse {
+                std.Thread.yield() catch {};
+                continue;
+            };
             self.core.apply_mutex.lockExclusiveDeadlineIo(io, .fromNow(io, .{ .raw = .fromMilliseconds(10), .clock = .awake })) catch |err| switch (err) {
                 error.Timeout => continue,
                 else => return err,

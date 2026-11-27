@@ -1208,6 +1208,13 @@ pub const SharedRedoOverlay = struct {
     /// while `reclaimedThrough() <= min_sequence_exclusive` (a reclaim drops
     /// versions at or below its floor). Keys only, each owned by the caller.
     pub fn changedKeysBetweenAlloc(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, root: u8, min_sequence_exclusive: u64, max_sequence_inclusive: u64, own_origin: u32) ![][]u8 {
+        return self.changedKeysWithPrefixBetweenAlloc(allocator, io, root, "", min_sequence_exclusive, max_sequence_inclusive, own_origin);
+    }
+
+    /// `changedKeysBetweenAlloc`, keeping only keys under `prefix`: only
+    /// those are copied, so one scope's refresh allocates for its own
+    /// changes, not every writer's.
+    pub fn changedKeysWithPrefixBetweenAlloc(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, root: u8, prefix: []const u8, min_sequence_exclusive: u64, max_sequence_inclusive: u64, own_origin: u32) ![][]u8 {
         std.debug.assert(root < 3);
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -1223,6 +1230,7 @@ pub const SharedRedoOverlay = struct {
         for (&self.changes) |*history| {
             for (history.entries.items[history.end(min_sequence_exclusive)..history.end(max_sequence_inclusive)]) |change| {
                 if (change.root != root or (change.origin != 0 and change.origin == own_origin)) continue;
+                if (!std.mem.startsWith(u8, change.key, prefix)) continue;
                 const slot = try seen.getOrPut(allocator, change.key);
                 if (slot.found_existing) continue;
                 try list.ensureUnusedCapacity(allocator, 1);

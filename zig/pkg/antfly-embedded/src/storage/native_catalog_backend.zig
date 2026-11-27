@@ -67,6 +67,12 @@ pub const Mutation = struct {
     is_delete: bool = false,
 };
 
+/// `Sink.changesSince`'s result: every changed record's state at `through`.
+pub const Changes = struct {
+    through: u64,
+    mutations: []Mutation,
+};
+
 /// An outstanding, not-yet-waited-on commit of a `.ride_along` `Sink.submit`
 /// (see `Sink.submitDeferred`). Opaque: `Backend` never needs to know what
 /// concrete thing `ptr` is (a `lite/docstore.zig` `Store.Ticket`'s container,
@@ -131,13 +137,14 @@ pub const Sink = struct {
     /// Like loadAllAlloc, with empty values allocated by the same allocator.
     loadKeysAlloc: ?*const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]Entry = null,
     deleteScope: ?*const fn (ptr: *anyopaque, scope: []const u8) anyerror!void = null,
-    /// Optional, with `changedKeysBetween`: the file's committed sequence
-    /// now. A load issued after this call reads at least through it.
+    /// Optional, with `changesSince`: the file's committed sequence now. A
+    /// load issued after this call reads at least through it.
     committedSequence: ?*const fn (ptr: *anyopaque) u64 = null,
-    /// Optional: the keys of `scope` that other writers changed after
-    /// committed sequence `since` through `through`, values empty; null when
-    /// that history is no longer complete (a full load is needed).
-    changedKeysBetween: ?*const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8, since: u64, through: u64) anyerror!?[]Mutation = null,
+    /// Optional: the records of `scope` other writers changed after
+    /// committed sequence `since`, with their values, enumerated and read
+    /// at one cut, and that cut's sequence. Null when the history from
+    /// `since` is no longer complete (a full load is needed).
+    changesSince: ?*const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8, since: u64) anyerror!?Changes = null,
     /// Optional (`null` for a `Sink` with no deferred path, e.g. the test
     /// fakes below): like `submit`, but for `durable = false` only, and
     /// never blocks waiting for the underlying group commit to apply --
@@ -468,7 +475,7 @@ pub const Backend = struct {
 
     fn sinkCommittedSequence(sink: Sink) ?u64 {
         const committed = sink.committedSequence orelse return null;
-        if (sink.changedKeysBetween == null) return null;
+        if (sink.changesSince == null) return null;
         return committed(sink.ptr);
     }
 
@@ -491,35 +498,19 @@ pub const Backend = struct {
     };
 
     pub fn changesSinceSync(self: *Backend, allocator: Allocator) !?SyncedChanges {
-        const committed = self.sink.committedSequence orelse return null;
-        const changed = self.sink.changedKeysBetween orelse return null;
+        const changes_since = self.sink.changesSince orelse return null;
         if (!self.synced_known) return null;
         const since = self.synced_through.load(.acquire);
+        // Before the read: anything published into the mirror after it
+        // makes these changes stale.
         const mirror_epoch = self.state_epoch.load(.acquire);
-        const through = committed(self.sink.ptr);
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
-        const a = arena.allocator();
-        const keys = (try changed(self.sink.ptr, a, self.scope, since, through)) orelse {
+        const changes = (try changes_since(self.sink.ptr, arena.allocator(), self.scope, since)) orelse {
             arena.deinit();
             return null;
         };
-        if (keys.len != 0) {
-            const values = try a.alloc(?[]const u8, keys.len);
-            if (self.sink.loadMany) |load| {
-                try load(self.sink.ptr, a, self.scope, keys, values);
-            } else if (self.sink.loadOneAlloc) |load| {
-                for (keys, values) |key, *value| value.* = try load(self.sink.ptr, a, self.scope, key.namespace, key.key);
-            } else {
-                arena.deinit();
-                return null;
-            }
-            for (keys, values) |*key, value| {
-                key.is_delete = value == null;
-                key.value = value orelse "";
-            }
-        }
-        return .{ .arena = arena, .mutations = keys, .through = through, .mirror_epoch = mirror_epoch };
+        return .{ .arena = arena, .mutations = changes.mutations, .through = changes.through, .mirror_epoch = mirror_epoch };
     }
 
     /// The mirror now holds other writers' records through `through`.

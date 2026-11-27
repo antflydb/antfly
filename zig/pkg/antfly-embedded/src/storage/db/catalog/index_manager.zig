@@ -27976,7 +27976,7 @@ pub const IndexManager = struct {
         // tip is read whole only when it is not.
         if (entry.persistent.prepareRefreshFromChanges()) |maybe_changes| changes: {
             var changes = maybe_changes orelse break :changes;
-            defer changes.deinit();
+            defer changes.deinit(entry.persistent.alloc);
             if (builtin.is_test) if (test_after_tip_refresh_prepared) |hook| hook(entry);
             if (!entry.apply_mutex.tryLock()) {
                 entry.merge_retry_after_ns.store(now_ns +| text_merge_refresh_deferred_retry_ns, .release);
