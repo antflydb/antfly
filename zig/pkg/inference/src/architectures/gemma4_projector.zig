@@ -4679,10 +4679,11 @@ const AudioLayerInputs = struct {
         self.segments = segments;
         if (segments.len == 0 or (cb.kind() != .metal and cb.kind() != .cuda)) return;
         if (self.valid_mask.len > 16777216) return error.InvalidTensorShape;
-        const starts = try self.allocator.alloc(f32, self.valid_mask.len);
-        defer self.allocator.free(starts);
-        const tags = try self.allocator.alloc(f32, starts.len);
-        defer self.allocator.free(tags);
+        const rows = self.valid_mask.len;
+        const planes = try self.allocator.alloc(f32, rows * 2);
+        defer self.allocator.free(planes);
+        const starts = planes[0..rows];
+        const tags = planes[rows..];
         var offset: usize = 0;
         for (segments) |span| {
             if (span == 0 or span > starts.len - offset) return error.InvalidTensorShape;
@@ -4693,12 +4694,29 @@ const AudioLayerInputs = struct {
             offset += span;
         }
         if (offset != starts.len) return error.InvalidTensorShape;
+        if (cb.kind() == .cuda) {
+            // Both planes have the same invocation lifetime. The slices
+            // retain the uploaded bank and keep the vector ABI of each op.
+            const bank = try deviceResidentFromFloat32(cb, planes, &.{ @intCast(planes.len), 1 });
+            defer cb.free(bank);
+            const starts_ct = try self.segmentVector(cb, bank, 0, rows);
+            errdefer cb.free(starts_ct);
+            self.segment_valid = try self.segmentVector(cb, bank, rows, rows);
+            self.segment_starts = starts_ct;
+            return;
+        }
         const shape = [_]i32{@intCast(starts.len)};
         const starts_ct = try deviceResidentFromFloat32(cb, starts, &shape);
         errdefer cb.free(starts_ct);
         const tags_ct = try deviceResidentFromFloat32(cb, tags, &shape);
         self.segment_valid = tags_ct;
         self.segment_starts = starts_ct;
+    }
+
+    fn segmentVector(self: *const AudioLayerInputs, cb: *const ComputeBackend, bank: CT, offset: usize, rows: usize) !CT {
+        const view = try cb.sliceRows2D(self.allocator, bank, offset, rows, 1);
+        defer cb.free(view);
+        return cb.primReshape(view, &.{@intCast(rows)});
     }
 
     pub fn deinit(self: *AudioLayerInputs, cb: *const ComputeBackend) void {
