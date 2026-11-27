@@ -305,7 +305,19 @@ pub const Plan = struct {
             self.output = slot;
         }
         self.valid = self.valid and (expected == null) == (self.output == null);
-        if (self.valid) if (self.output) |output| self.packExternalScratch(output);
+        if (self.valid) if (self.output) |output| {
+            // Scratch is private to an operation even when its lifetime spans
+            // other events. Only a tensor allocation can become a publication.
+            if (self.declared_operation_scratch_intervals != 0) {
+                for (self.events[0..self.event_count]) |entry| {
+                    if (entry.slot == output and entry.operation_scratch) {
+                        self.valid = false;
+                        break;
+                    }
+                }
+            }
+            if (self.valid) self.packExternalScratch(output);
+        };
         self.first_live = no_slot;
         self.sealed = self.valid;
         if (self.sealed) self.recipe = self.hashEvents(0);
@@ -517,6 +529,22 @@ pub const Scope = struct {
         self.cursor += 1;
     }
 };
+
+test "stream workspace rejects scratch as a published tensor" {
+    const p = try std.testing.allocator.create(Plan);
+    defer std.testing.allocator.destroy(p);
+    p.* = .{};
+    const builder = try p.declarationBuilder();
+    const scratch = try builder.allocateScratch(256);
+    try std.testing.expectError(error.InvalidExecutionPlan, builder.finish(scratch));
+    try std.testing.expectError(error.InvalidExecutionPlan, p.layout(0));
+
+    p.* = .{};
+    var scope = Scope.observe(p);
+    scope.recordScratchAllocation(256, 0x1000);
+    try std.testing.expect(!p.finish(0x1000));
+    try std.testing.expectError(error.InvalidExecutionPlan, p.layout(0));
+}
 
 test "stream workspace rejects live buffers and event drift" {
     const p = try std.testing.allocator.create(Plan);
