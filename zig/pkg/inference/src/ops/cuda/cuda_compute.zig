@@ -32992,7 +32992,52 @@ pub fn tryCapturedPackedAttentionInto(cb: *const ops.ComputeBackend, q: CT, k: C
     const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
     if (!self.bounded_decode_graph.active) return false;
     const views = attention.kv_batch orelse return false;
-    return (try tryLightOnBatchedAttention(self, q, k, v, attention, views, heads, kv_heads, dim, .{ .parent = parent, .row_offset = row_offset })) != null;
+    const width = try checkedMul(heads, dim);
+    const kv_width = try checkedMul(kv_heads, dim);
+    var query_shape = [_]i64{ @intCast(views.len), @intCast(width) };
+    var kv_shape = [_]i64{ @intCast(views.len), @intCast(kv_width) };
+    var query = try attentionPacketView(q, row_offset, views.len, width, &query_shape);
+    var key = try attentionPacketView(k, row_offset, views.len, kv_width, &kv_shape);
+    var value = try attentionPacketView(v, row_offset, views.len, kv_width, &kv_shape);
+    return (try tryLightOnBatchedAttention(self, @ptrCast(&query), @ptrCast(&key), @ptrCast(&value), attention, views, heads, kv_heads, dim, .{ .parent = parent, .row_offset = row_offset })) != null;
+}
+
+/// The caller retains the source tensors throughout submission. A packed
+/// kernel needs a bounded address view with no independently owned metadata.
+fn attentionPacketView(input: CT, row_offset: usize, rows: usize, width: usize, shape: *[2]i64) !CudaTensor {
+    const source = tensorFromCt(input);
+    try ensureF32(source);
+    if (width == 0 or source.elem_count % width != 0) return error.InvalidShape;
+    const source_rows = source.elem_count / width;
+    if (row_offset > source_rows or rows > source_rows - row_offset) return error.InvalidShape;
+    const count = try checkedMul(rows, width);
+    const byte_offset = try checkedMul(try checkedMul(row_offset, width), @sizeOf(f32));
+    const bytes = try checkedMul(count, @sizeOf(f32));
+    return .{
+        .buffer = try source.buffer.borrowRange(byte_offset, bytes),
+        .dtype = .f32,
+        .shape = shape,
+        .elem_count = count,
+        .owns_buffer = false,
+        .owns_shape = false,
+        .owned_by_tensor = false,
+    };
+}
+
+test "CUDA packed attention borrows exact packet rows without taking input ownership" {
+    var source_shape = [_]i64{ 8, 4 };
+    var packet_shape = [_]i64{ 2, 4 };
+    var source: CudaTensor = .{
+        .buffer = .{ .ptr = 0x1000, .len = 8 * 4 * @sizeOf(f32) },
+        .shape = &source_shape,
+        .elem_count = 32,
+        .dtype = .f32,
+    };
+    const view = try attentionPacketView(&source, 6, 2, 4, &packet_shape);
+    try std.testing.expectEqual(@as(u64, 0x1060), view.buffer.ptr);
+    try std.testing.expectEqual(@as(usize, 32), view.buffer.len);
+    try std.testing.expect(view.buffer.borrowed and !view.owns_buffer and !view.owns_shape);
+    try std.testing.expectError(error.InvalidShape, attentionPacketView(&source, 7, 2, 4, &packet_shape));
 }
 
 fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention: ops.AttentionContext, views: []const ops.KvBatchView, heads: usize, kv_heads: usize, dim: usize, assigned: ?PackedAttentionDestination) !?CT {

@@ -10497,12 +10497,6 @@ fn runPackedQwenAttention(
             while ((cb.kind() != .cuda or count < max_cuda_packet_rows) and index + count < lengths.len and lengths[index + count] == 1 and views[index + count].per_item_mode == .paged_decode) : (count += 1) {}
         }
         const rows = if (count > 1) count else len;
-        const q = try cb.sliceRows2D(a, Q, offset, rows, width);
-        defer cb.free(q);
-        const k = try cb.sliceRows2D(a, K, offset, rows, kv_width);
-        defer cb.free(k);
-        const v = try cb.sliceRows2D(a, V, offset, rows, kv_width);
-        defer cb.free(v);
         var item = attention;
         if (count > 1) {
             // Every query is one token, so this contiguous subrange has the
@@ -10532,8 +10526,14 @@ fn runPackedQwenAttention(
             item.kv_position_offset = view.per_item_kv_position_offset.?;
         }
         const assigned = cb.kind() == .cuda and count > 1 and !sink.hasMetadata() and
-            try @import("../ops/cuda/cuda_compute.zig").tryCapturedPackedAttentionInto(cb, q, k, v, item, num_heads, num_kv_heads, head_dim, result, offset);
+            try @import("../ops/cuda/cuda_compute.zig").tryCapturedPackedAttentionInto(cb, Q, K, V, item, num_heads, num_kv_heads, head_dim, result, offset);
         if (!assigned) {
+            const q = try cb.sliceRows2D(a, Q, offset, rows, width);
+            defer cb.free(q);
+            const k = try cb.sliceRows2D(a, K, offset, rows, kv_width);
+            defer cb.free(k);
+            const v = try cb.sliceRows2D(a, V, offset, rows, kv_width);
+            defer cb.free(v);
             const output = try runPreparedAttentionWithSinkMetadata(cb, q, k, v, item, sink, count, num_heads, num_kv_heads, head_dim);
             defer cb.free(output);
             if (!try cb.copyRows2D(a, result, offset, output, 0, rows, width)) return error.UnsupportedTensorType;
