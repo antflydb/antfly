@@ -4930,7 +4930,14 @@ fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store
 }
 
 fn audioExecutionEligible(cb: *const ComputeBackend, store: *const ProjectorWeights, cfg: AudioConfig, inputs: *const AudioLayerInputs) bool {
-    return !((cb.kind() != .cuda and cb.kind() != .metal) or !cb.supportsAudioExecution() or !store.huggingface or !std.meta.eql(audioHostOps(), AudioHostOps{}) or cfg.block_count != 12 or inputs.scales.len != 12 or (cb.kind() == .cuda and (inputs.segment_starts == null or inputs.segment_valid == null)) or platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") != null);
+    switch (cb.kind()) {
+        .cuda => if (!audio_schedule.supportsCudaGroupedGraph(inputs.segments.len, cfg.attention_context_right) or
+            inputs.segment_starts == null or inputs.segment_valid == null) return false,
+        .metal => {},
+        else => return false,
+    }
+    return cb.supportsAudioExecution() and store.huggingface and std.meta.eql(audioHostOps(), AudioHostOps{}) and
+        cfg.block_count == 12 and inputs.scales.len == 12 and platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") == null;
 }
 
 fn audioExecutionInputs(hidden: CT, inputs: *const AudioLayerInputs) [audio_schedule.ExecutionInputs.count]CT {

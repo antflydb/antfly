@@ -45,6 +45,11 @@ pub const GroupedRows = struct {
     }
 };
 
+/// Grouped CUDA attention needs per-clip validity and its left-context kernel.
+pub fn supportsCudaGroupedGraph(clips: usize, right_context: usize) bool {
+    return clips >= 2 and clips <= GroupedRows.max_clips and right_context == 0;
+}
+
 /// Ordered inputs shared by audio projection and workspace admission.
 pub const ExecutionInputs = struct {
     pub const hidden = 0;

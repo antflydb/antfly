@@ -7909,10 +7909,12 @@ pub const CudaCompute = struct {
                 try appendAudioConstant(builder, try CacheFunding.AudioRecipe.frontendKey(&key, "filters", 512, 320, recipe.mel_bins), try checkedMul(257, recipe.mel_bins));
             }
         }
-        if (recipe.count < 2 or !recipe.graph_allowed or !recipe.host_ops_empty or !self.embedding_gemma2_policy.audio_graph) return;
+        const audio_schedule = @import("../../execution/audio_schedule.zig");
+        if (!audio_schedule.supportsCudaGroupedGraph(recipe.count, recipe.context_right) or
+            !recipe.graph_allowed or !recipe.host_ops_empty or !self.embedding_gemma2_policy.audio_graph) return;
         var segments: [4]usize = undefined;
         const rows = try recipe.rowsAndSegments(segments[0..recipe.count]);
-        const Inputs = @import("../../execution/audio_schedule.zig").ExecutionInputs;
+        const Inputs = audio_schedule.ExecutionInputs;
         var shapes: [Inputs.count][2]i64 = undefined;
         const inputs = try Inputs.describe(&shapes, rows, recipe.hidden, recipe.context_left, recipe.heads);
         const execution_key = recipe.key(segments[0..recipe.count], 0, recipe.blocks);
