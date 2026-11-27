@@ -41002,7 +41002,9 @@ pub const DB = struct {
     /// lock, and after each merge, so no pass starts past it.
     pub fn drainScheduledTextMergesWithin(self: *DB, wait: derived_executor_mod.VisibilityWait) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        const io = self.backend_runtime.controlIo() orelse self.backend_runtime.io() orelse return error.BackendRuntimeIoUnavailable;
+        // A runtime without an Io still drains: it waits for the lock, and
+        // yields between passes, without timed slices.
+        const io = self.backend_runtime.controlIo() orelse self.backend_runtime.io();
         while (true) {
             try wait.check();
             {
@@ -41015,13 +41017,14 @@ pub const DB = struct {
                 while (try self.core.index_manager.runTextMergeScheduler(1) > 0) try wait.check();
             }
             if (!self.core.index_manager.textTipRefreshPending()) return;
-            try io.sleep(.fromMilliseconds(1), .awake);
+            if (io) |runtime_io| try runtime_io.sleep(.fromMilliseconds(1), .awake) else std.Thread.yield() catch {};
         }
     }
 
     /// `lockApplyForPortableRuntime`, waiting for the lock in short slices
     /// that each recheck `wait`.
-    fn lockApplyForPortableRuntimeWithin(self: *DB, io: std.Io, wait: derived_executor_mod.VisibilityWait) !void {
+    fn lockApplyForPortableRuntimeWithin(self: *DB, maybe_io: ?std.Io, wait: derived_executor_mod.VisibilityWait) !void {
+        const io = maybe_io orelse return self.lockApplyForPortableRuntime();
         try self.enforcePortableRuntimeGate();
         while (!self.core.tryLockApplyExclusive()) {
             try wait.check();
