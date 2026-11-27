@@ -21689,6 +21689,18 @@ fn localRelativeAttentionIntoOp(ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, s
     return (try localRelativeAttention(ctx, q, k, v, rel, scales, valid, params, destination, control)) != null;
 }
 
+fn localRelativeDestination(assigned: ops.ComputeBackend.LocalRelativeDestination, rows: usize, hidden: usize, bytes: usize) !buffer_mod.DeviceBuffer {
+    const tensor = tensorFromCt(assigned.tensor);
+    try ensureF32(tensor);
+    if (tensor.immutable_cache_backing or tensor.resident_parent != null or tensor.model_constant or
+        tensor.shape.len != 2 or tensor.shape[1] != hidden) return error.InvalidTensorShape;
+    const target_rows = std.math.cast(usize, tensor.shape[0]) orelse return error.InvalidTensorShape;
+    if (assigned.first_row > target_rows or rows > target_rows - assigned.first_row or
+        tensor.elem_count != try checkedMul(target_rows, hidden)) return error.InvalidTensorShape;
+    const offset = try checkedMul(try checkedMul(assigned.first_row, hidden), @sizeOf(f32));
+    return tensor.buffer.borrowRange(offset, bytes);
+}
+
 fn localRelativeAttention(ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: ops.Gemma4AudioLocalAttentionParams, destination: ?ops.ComputeBackend.LocalRelativeDestination, control: ?InferenceExecutionControl) !?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (self.ctx.info.compute_major < 8) return null;
@@ -21720,22 +21732,40 @@ fn localRelativeAttention(ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_s
         if (params.segmented) return null;
         return try sourceLocalRelativeAttention(self, q, k, v, rel, q_dim_scales, valid, layout, params, destination, control);
     }
-    if (destination != null) return null;
+    if (destination) |assigned| {
+        // Without segmented mask encoding this kernel has no clip boundary.
+        if (assigned.segments.len > 1 and !params.segmented) return null;
+        if (assigned.segments.len != 0) {
+            var remaining = params.rows;
+            for (assigned.segments) |rows| {
+                if (rows == 0 or rows > remaining) return error.InvalidTensorShape;
+                remaining -= rows;
+            }
+            if (remaining != 0) return error.InvalidTensorShape;
+        }
+    }
     const input_buffers = [6]buffer_mod.DeviceBuffer{
         tensorFromCt(q).buffer, tensorFromCt(k).buffer, tensorFromCt(v).buffer,
         relative.buffer,        scales.buffer,          validity.buffer,
     };
     try layout.validateInputs(input_buffers);
-    const shape = [_]i64{ @intCast(params.rows), @intCast(params.hidden) };
-    const out = try self.createEmbeddingGemma2TensorWithBacking(&shape, layout.matrix_elements, .f32, layout.span_bytes[6]);
-    errdefer freeTensor(self, out);
+    if (control) |active| try active.check();
+    var owned: ?OwnedF32Output = null;
+    defer if (owned) |*value| value.deinit();
+    const output = if (destination) |assigned|
+        try localRelativeDestination(assigned, params.rows, params.hidden, layout.span_bytes[6])
+    else block: {
+        owned = try OwnedF32Output.alloc2(self, params.rows, params.hidden, layout.matrix_elements);
+        break :block owned.?.buffer;
+    };
+    if (destination != null) try layout.validate(input_buffers[0], input_buffers[1], input_buffers[2], input_buffers[3], input_buffers[4], input_buffers[5], output);
     var queued = false;
     errdefer if (queued) synchronizeAndDrainDeferredDeviceFrees(self) catch {};
     const module = try self.encoderMultimodalModule();
     queued = true;
     try module.launchAudioAttention(
         &self.ctx,
-        tensorFromCt(out).buffer,
+        output,
         input_buffers[0],
         input_buffers[1],
         input_buffers[2],
@@ -21746,7 +21776,8 @@ fn localRelativeAttention(ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_s
         params,
     );
     queued = false;
-    return out;
+    if (owned) |*value| return value.intoTensor();
+    return destination.?.tensor;
 }
 
 test "CUDA audio validity accepts only a vector or contiguous one-column view" {
@@ -21820,17 +21851,9 @@ fn sourceLocalRelativeAttention(self: *CudaCompute, q: CT, k: CT, v: CT, rel: CT
     if (capture and self.embedding_gemma2 == null) return error.CudaGraphCaptureUnsafeTempAlloc;
     var owned: ?OwnedF32Output = null;
     defer if (owned) |*output| output.deinit();
-    const output = if (destination) |assigned| block: {
-        const tensor = tensorFromCt(assigned.tensor);
-        try ensureF32(tensor);
-        if (tensor.immutable_cache_backing or tensor.resident_parent != null or tensor.model_constant or
-            tensor.shape.len != 2 or tensor.shape[1] != params.hidden) return error.InvalidTensorShape;
-        const rows = std.math.cast(usize, tensor.shape[0]) orelse return error.InvalidTensorShape;
-        if (assigned.first_row > rows or params.rows > rows - assigned.first_row or
-            tensor.elem_count != try checkedMul(rows, params.hidden)) return error.InvalidTensorShape;
-        const offset = try checkedMul(try checkedMul(assigned.first_row, params.hidden), @sizeOf(f32));
-        break :block try tensor.buffer.borrowRange(offset, layout.span_bytes[6]);
-    } else block: {
+    const output = if (destination) |assigned|
+        try localRelativeDestination(assigned, params.rows, params.hidden, layout.span_bytes[6])
+    else block: {
         owned = try OwnedF32Output.alloc2(self, params.rows, params.hidden, layout.matrix_elements);
         break :block owned.?.buffer;
     };
@@ -63156,6 +63179,22 @@ test "CUDA source local relative attention shares workspace across three physica
         try std.testing.expectEqualSlices(f32, sentinel[0..hidden], assigned[0..hidden]);
         try std.testing.expectEqualSlices(f32, output, assigned[hidden .. (rows + 1) * hidden]);
         try std.testing.expectEqualSlices(f32, sentinel[0..hidden], assigned[(rows + 1) * hidden ..]);
+
+        var combined_params = params;
+        combined_params.arithmetic = .combined_f32;
+        combined_params.publication = .f32;
+        const combined_result = (try cb.gemma4AudioLocalAttention(query, query, value, relative, scale, valid, combined_params)) orelse return error.TestUnexpectedResult;
+        defer cb.free(combined_result);
+        const combined_values = try cb.toFloat32(combined_result, a);
+        defer a.free(combined_values);
+        const allocations = compute.stats.device_alloc_calls;
+        try std.testing.expect(try cb.localRelativeAttentionInto(query, query, value, relative, scale, valid, combined_params, .{ .tensor = target, .first_row = 1 }));
+        try std.testing.expectEqual(allocations, compute.stats.device_alloc_calls);
+        const combined_assigned = try cb.toFloat32(target, a);
+        defer a.free(combined_assigned);
+        try std.testing.expectEqualSlices(f32, sentinel[0..hidden], combined_assigned[0..hidden]);
+        try std.testing.expectEqualSlices(f32, combined_values, combined_assigned[hidden .. (rows + 1) * hidden]);
+        try std.testing.expectEqualSlices(f32, sentinel[0..hidden], combined_assigned[(rows + 1) * hidden ..]);
 
         if (rows == 19) {
             var grouped_values = values;
