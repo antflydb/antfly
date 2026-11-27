@@ -40998,22 +40998,41 @@ pub const DB = struct {
     /// its index owing a refresh, which runs outside the apply lock; until
     /// it lands nothing more is planned for that index, so the drain is not
     /// done. Each pass releases the lock and retries within `wait`.
+    /// The budget is checked before each pass, while waiting for the apply
+    /// lock, and after each merge, so no pass starts past it.
     pub fn drainScheduledTextMergesWithin(self: *DB, wait: derived_executor_mod.VisibilityWait) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        const io = self.backend_runtime.controlIo() orelse self.backend_runtime.io() orelse return error.BackendRuntimeIoUnavailable;
         while (true) {
+            try wait.check();
             {
                 var snapshot_replay = try self.acquireSnapshotReplayMutation();
                 defer snapshot_replay.release();
                 self.core.index_manager.refreshTextIndexesBehindTip();
-                try self.lockApplyForPortableRuntime();
+                try wait.check();
+                try self.lockApplyForPortableRuntimeWithin(io, wait);
                 defer self.core.unlockApply();
-                try self.core.drainScheduledTextMerges();
+                while (try self.core.index_manager.runTextMergeScheduler(1) > 0) try wait.check();
             }
             if (!self.core.index_manager.textTipRefreshPending()) return;
-            try wait.check();
-            const io = self.backend_runtime.controlIo() orelse self.backend_runtime.io() orelse return error.BackendRuntimeIoUnavailable;
             try io.sleep(.fromMilliseconds(1), .awake);
         }
+    }
+
+    /// `lockApplyForPortableRuntime`, waiting for the lock in short slices
+    /// that each recheck `wait`.
+    fn lockApplyForPortableRuntimeWithin(self: *DB, io: std.Io, wait: derived_executor_mod.VisibilityWait) !void {
+        try self.enforcePortableRuntimeGate();
+        while (!self.core.tryLockApplyExclusive()) {
+            try wait.check();
+            self.core.apply_mutex.lockExclusiveDeadlineIo(io, .fromNow(io, .{ .raw = .fromMilliseconds(10), .clock = .awake })) catch |err| switch (err) {
+                error.Timeout => continue,
+                else => return err,
+            };
+            break;
+        }
+        errdefer self.core.unlockApply();
+        try self.enforcePortableRuntimeGate();
     }
 
     /// The budget a visibility wait gets when its caller set none.

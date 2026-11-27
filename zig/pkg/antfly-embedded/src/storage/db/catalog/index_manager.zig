@@ -948,7 +948,7 @@ const TextMergeScheduler = struct {
 
     fn noteComplete(entry: *IndexManager.TextIndex) void {
         // Merge debt measured on a stale view says nothing about the tip.
-        if (entry.tip_refresh_required.load(.acquire)) return;
+        if (entry.tipRefreshRequired()) return;
         entry.compaction_pending.store(false, .release);
     }
 
@@ -1992,7 +1992,13 @@ pub const IndexManager = struct {
         // The view is behind the tip: a merge was refused there and its
         // refresh did not run. The next plan refreshes first, and the index
         // stays pending until a refresh succeeds.
-        tip_refresh_required: std.atomic.Value(bool) = .init(false),
+        //
+        // Requests and coverage are generations: a refused merge adds a
+        // request, and a refresh covers the requests made before it read the
+        // tip. A request made while a refresh prepares stays pending.
+        tip_refresh_requested: std.atomic.Value(u64) = .init(0),
+        tip_refresh_covered: std.atomic.Value(u64) = .init(0),
+
         // A merge's byte reservation is sized from a point-in-time estimate,
         // but deletion deltas that commit while the merge builds also compete
         // inside that same fixed ceiling (see TextMergeBudgetAllocator). Under
@@ -2004,6 +2010,18 @@ pub const IndexManager = struct {
         // and has a narrower window to accumulate deltas in, and let it grow
         // back on success so steady state is unaffected.
         merge_segment_cap: std.atomic.Value(u32) = .init(std.math.maxInt(u32)),
+
+        pub fn tipRefreshRequired(self: *const TextIndex) bool {
+            return self.tip_refresh_requested.load(.acquire) > self.tip_refresh_covered.load(.acquire);
+        }
+
+        pub fn requestTipRefresh(self: *TextIndex) void {
+            _ = self.tip_refresh_requested.fetchAdd(1, .acq_rel);
+        }
+
+        fn coverTipRefresh(self: *TextIndex, generation: u64) void {
+            _ = self.tip_refresh_covered.fetchMax(generation, .acq_rel);
+        }
 
         /// Default projections retain a native identity for every primary row,
         /// including rows with no text. Field and artifact projections have
@@ -27877,7 +27895,7 @@ pub const IndexManager = struct {
         // lock, and nothing is planned for the index until it has.
         const refresh: TextMergeRefresh = if (scope_changed) refresh: {
             write_stage_profile.add(.merge_scope_changed, 0);
-            entry.tip_refresh_required.store(true, .release);
+            entry.requestTipRefresh();
             break :refresh .deferred;
         } else .current;
         entry.merge_delta_mutex.unlock(entry.io);
@@ -27937,14 +27955,17 @@ pub const IndexManager = struct {
     /// Takes the index from the tip in two steps: the tip is read and the
     /// refresh planned with none of the index's locks held, then validated
     /// and installed under its apply and merge-delta locks. Until that
-    /// succeeds the index keeps `tip_refresh_required`, behind a retry
+    /// succeeds the index keeps its refresh request, behind a retry
     /// backoff: 10 ms while this process's inline installs are in flight or
     /// the index moved during preparation, exponential up to 1 s for a
     /// refresh that failed. The catalog pins the index throughout.
     fn refreshTextIndexForReplan(entry: *TextIndex, index_name: []const u8) TextMergeRefresh {
         const now_ns = platform_time.monotonicNs();
-        var prepared = entry.persistent.prepareRefreshFromTip() catch |err| return recordTipRefreshFailure(entry, index_name, err, now_ns);
+        // The requests this refresh answers: those made before it reads the tip.
+        const covers = entry.tip_refresh_requested.load(.acquire);
+        var prepared = entry.persistent.prepareRefreshFromTip() catch |err| return recordTipRefreshFailure(entry, index_name, err, now_ns, covers);
         defer prepared.deinit(entry.persistent.alloc);
+        if (builtin.is_test) if (test_after_tip_refresh_prepared) |hook| hook(entry);
         // A busy index is not waited on: the plan is discarded and retried.
         if (!entry.apply_mutex.tryLock()) {
             entry.merge_retry_after_ns.store(now_ns +| text_merge_refresh_deferred_retry_ns, .release);
@@ -27954,7 +27975,7 @@ pub const IndexManager = struct {
         // As at merge publication: in-flight merges see one deletion state.
         entry.merge_delta_mutex.lockUncancelable(entry.io);
         defer entry.merge_delta_mutex.unlock(entry.io);
-        const installed = entry.persistent.installPreparedRefreshFromTip(&prepared) catch |err| return recordTipRefreshFailure(entry, index_name, err, now_ns);
+        const installed = entry.persistent.installPreparedRefreshFromTip(&prepared) catch |err| return recordTipRefreshFailure(entry, index_name, err, now_ns, covers);
         if (!installed) {
             // Something reached the index while the plan was built.
             entry.merge_retry_after_ns.store(now_ns +| text_merge_refresh_deferred_retry_ns, .release);
@@ -27962,16 +27983,19 @@ pub const IndexManager = struct {
         }
         entry.merge_refresh_failures.store(0, .release);
         entry.merge_retry_after_ns.store(0, .release);
-        entry.tip_refresh_required.store(false, .release);
+        entry.coverTipRefresh(covers);
         return .current;
     }
 
-    fn recordTipRefreshFailure(entry: *TextIndex, index_name: []const u8, err: anyerror, now_ns: u64) TextMergeRefresh {
+    /// Runs between a refresh's preparation and its install.
+    pub var test_after_tip_refresh_prepared: ?*const fn (entry: *TextIndex) void = null;
+
+    fn recordTipRefreshFailure(entry: *TextIndex, index_name: []const u8, err: anyerror, now_ns: u64, covers: u64) TextMergeRefresh {
         if (err == error.UnsupportedRefresh and !entry.persistent.inlinePublicationsPending() and !entry.persistent.refreshesFromTip()) {
-            entry.tip_refresh_required.store(false, .release);
+            // No refresh can ever run: nothing it would answer stays owed.
+            entry.coverTipRefresh(covers);
             return .unsupported;
         }
-        entry.tip_refresh_required.store(true, .release);
         if (err == error.UnsupportedRefresh and entry.persistent.inlinePublicationsPending()) {
             entry.merge_retry_after_ns.store(now_ns +| text_merge_refresh_deferred_retry_ns, .release);
             return .deferred;
@@ -27992,7 +28016,7 @@ pub const IndexManager = struct {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
         for (self.text_indexes.items) |*entry| {
-            if (!entry.tip_refresh_required.load(.acquire)) continue;
+            if (!entry.tipRefreshRequired()) continue;
             if (entry.merge_retry_after_ns.load(.acquire) > now_ns) continue;
             switch (refreshTextIndexForReplan(entry, entry.config.name)) {
                 .current, .unsupported => TextMergeScheduler.schedule(entry),
@@ -28006,7 +28030,7 @@ pub const IndexManager = struct {
     pub fn textTipRefreshPending(self: *IndexManager) bool {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
-        for (self.text_indexes.items) |*entry| if (entry.tip_refresh_required.load(.acquire)) return true;
+        for (self.text_indexes.items) |*entry| if (entry.tipRefreshRequired()) return true;
         return false;
     }
 
@@ -28069,7 +28093,7 @@ pub const IndexManager = struct {
         // refused there again. The planner runs under the database-wide
         // apply lock, so the reload is not done here but by
         // `refreshTextIndexesBehindTip` first; until then, plan nothing.
-        if (entry.tip_refresh_required.load(.acquire)) return null;
+        if (entry.tipRefreshRequired()) return null;
 
         const snap = entry.persistent.acquireSnapshot();
         defer snap.release();
@@ -51086,13 +51110,13 @@ test "text merge refused at a peer-advanced tip replans from the peer's segments
     defer result.deinit(alloc);
     try std.testing.expect(!try fixture.manager.finishTextMergeTask(&task, &result));
     const entry = fixture.textEntry();
-    try std.testing.expect(entry.tip_refresh_required.load(.acquire));
+    try std.testing.expect(entry.tipRefreshRequired());
     try std.testing.expect(entry.compaction_pending.load(.acquire));
     try std.testing.expectEqual(@as(usize, 4), entry.persistent.snapshot().segments.len);
     try std.testing.expect((try fixture.manager.beginTextMergeTask()) == null);
 
     fixture.manager.refreshTextIndexesBehindTip();
-    try std.testing.expect(!entry.tip_refresh_required.load(.acquire));
+    try std.testing.expect(!entry.tipRefreshRequired());
     try fixture.expectPeerActiveSet();
     try std.testing.expectEqual(@as(u64, 0), entry.merge_retry_after_ns.load(.acquire));
 
@@ -51135,7 +51159,7 @@ test "text merge whose tip refresh is deferred refreshes before it plans again" 
         defer result.deinit(alloc);
         try std.testing.expect(!try fixture.manager.finishTextMergeTask(&task, &result));
     }
-    try std.testing.expect(entry.tip_refresh_required.load(.acquire));
+    try std.testing.expect(entry.tipRefreshRequired());
     try std.testing.expect(entry.compaction_pending.load(.acquire));
     try std.testing.expectEqual(@as(usize, 4), entry.persistent.snapshot().segments.len);
 
@@ -51148,7 +51172,7 @@ test "text merge whose tip refresh is deferred refreshes before it plans again" 
     fixture.manager.refreshTextIndexesBehindTip();
     try std.testing.expect(entry.merge_retry_after_ns.load(.acquire) > platform_time.monotonicNs());
     try std.testing.expect((try fixture.manager.beginTextMergeTask()) == null);
-    try std.testing.expect(entry.tip_refresh_required.load(.acquire));
+    try std.testing.expect(entry.tipRefreshRequired());
     try std.testing.expect(entry.compaction_pending.load(.acquire));
     try std.testing.expectEqual(@as(usize, 4), entry.persistent.snapshot().segments.len);
 
@@ -51161,7 +51185,7 @@ test "text merge whose tip refresh is deferred refreshes before it plans again" 
     // starts there.
     fixture.manager.refreshTextIndexesBehindTip();
     const next = try fixture.manager.beginTextMergeTask();
-    try std.testing.expect(!entry.tip_refresh_required.load(.acquire));
+    try std.testing.expect(!entry.tipRefreshRequired());
     try fixture.expectPeerActiveSet();
     if (next) |planned_value| {
         var planned = planned_value;
@@ -51194,19 +51218,50 @@ test "text merge tip refresh never waits on the index apply lock" {
         defer result.deinit(alloc);
         try std.testing.expect(!try fixture.manager.finishTextMergeTask(&task, &result));
     }
-    try std.testing.expect(entry.tip_refresh_required.load(.acquire));
+    try std.testing.expect(entry.tipRefreshRequired());
 
     // An applier holds the index.
     try std.testing.expect(entry.apply_mutex.tryLock());
     fixture.manager.refreshTextIndexesBehindTip();
-    try std.testing.expect(entry.tip_refresh_required.load(.acquire));
+    try std.testing.expect(entry.tipRefreshRequired());
     try std.testing.expectEqual(@as(usize, 4), entry.persistent.snapshot().segments.len);
     entry.apply_mutex.unlock();
 
     entry.merge_retry_after_ns.store(0, .release);
     fixture.manager.refreshTextIndexesBehindTip();
-    try std.testing.expect(!entry.tip_refresh_required.load(.acquire));
+    try std.testing.expect(!entry.tipRefreshRequired());
     try fixture.expectPeerActiveSet();
+}
+
+// A merge refused while a refresh prepares asks for a refresh of a newer
+// tip. The older plan can still install, but it answers only the requests
+// made before it read the tip: the newer one stays owed until a refresh
+// prepared after it lands.
+test "text merge tip refresh answers only the requests made before it read the tip" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    setBenchmarkTextMergePolicyOverride(.{ .max_segments_per_tier = 2, .max_segment_size = 5 * 1024 * 1024 * 1024, .floor_segment_size = 0 });
+    defer setBenchmarkTextMergePolicyOverride(null);
+    var fixture: StaleTextMergeFixture = undefined;
+    try fixture.init(alloc, &tmp);
+    defer fixture.deinit();
+    const entry = fixture.textEntry();
+    entry.requestTipRefresh();
+
+    const Refusal = struct {
+        fn during(index: *IndexManager.TextIndex) void {
+            index.requestTipRefresh();
+        }
+    };
+    IndexManager.test_after_tip_refresh_prepared = Refusal.during;
+    fixture.manager.refreshTextIndexesBehindTip();
+    IndexManager.test_after_tip_refresh_prepared = null;
+    try std.testing.expect(entry.tipRefreshRequired());
+
+    entry.merge_retry_after_ns.store(0, .release);
+    fixture.manager.refreshTextIndexesBehindTip();
+    try std.testing.expect(!entry.tipRefreshRequired());
 }
 
 test "text merge refresh failures back off exponentially up to a second" {

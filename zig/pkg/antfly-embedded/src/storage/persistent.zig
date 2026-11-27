@@ -2485,35 +2485,29 @@ pub const PersistentIndex = struct {
     }
 
     /// What a refresh from the tip changes in the writer, planned against
-    /// one writer snapshot from one read of the tip.
+    /// one writer snapshot from one read of the tip. Everything index-sized
+    /// is done here, outside the writer lock: new segments' readers and
+    /// deletions, and the retained segments' deletions with their coverage
+    /// counts, so publication is one pass.
     pub const TipRefreshPlan = struct {
         snapshot: *index_mod.IndexSnapshot,
         removed: std.ArrayListUnmanaged(u64) = .empty,
         added: std.ArrayListUnmanaged(index_mod.ReplacementSegmentData) = .empty,
         /// Deletions of segments already loaded, set after publication as
-        /// an inline install marks its deletes after adding its copies.
-        present_deleted: std.ArrayListUnmanaged(PresentDeletion) = .empty,
+        /// an inline install marks its deletes after adding its copies; each
+        /// at its position in the published snapshot.
+        retained: std.ArrayListUnmanaged(index_mod.RetainedDeletion) = .empty,
         next_segment_id: ?u64 = null,
-
-        const PresentDeletion = struct { id: u64, bitmap: ?roaring.RoaringBitmap };
-
-        /// The plan owns each added segment's deletions; the writer clones them.
-        fn freeDeleted(alloc: Allocator, replacement: *index_mod.ReplacementSegmentData) void {
-            const bitmap = replacement.deleted orelse return;
-            const owned: *roaring.RoaringBitmap = @constCast(bitmap);
-            owned.deinit();
-            alloc.destroy(owned);
-            replacement.deleted = null;
-        }
 
         pub fn deinit(self: *TipRefreshPlan, alloc: Allocator) void {
             for (self.added.items) |*replacement| {
+                if (replacement.prepared_reader) |*reader| reader.deinit();
+                if (replacement.deleted_owned) |*bitmap| bitmap.deinit();
                 replacement.data.deinit(alloc);
-                freeDeleted(alloc, replacement);
             }
             self.added.deinit(alloc);
-            for (self.present_deleted.items) |*item| if (item.bitmap) |*bitmap| bitmap.deinit();
-            self.present_deleted.deinit(alloc);
+            for (self.retained.items) |*item| item.deinit(alloc);
+            self.retained.deinit(alloc);
             self.removed.deinit(alloc);
             self.snapshot.release();
             self.* = undefined;
@@ -2546,18 +2540,28 @@ pub const PersistentIndex = struct {
         defer present.deinit(self.alloc);
         var dead = try DeadVersions.load(self.alloc, txn);
         defer dead.deinit();
-        for (plan.snapshot.segments) |*segment| {
+        // Publication keeps the retained segments in order ahead of the
+        // added ones, so a retained segment's position there is its position
+        // here less the removed segments before it.
+        var removed_before: usize = 0;
+        for (plan.snapshot.segments, 0..) |*segment, i| {
             try present.put(self.alloc, segment.id, {});
             if (!tip.contains(segment.id)) {
                 try plan.removed.append(self.alloc, segment.id);
+                removed_before += 1;
                 continue;
             }
-            try plan.present_deleted.ensureUnusedCapacity(self.alloc, 1);
-            const bitmap = try derivedDeletionBitmap(self.alloc, segment.reader.encoded(), &dead);
-            if (bitmap != null or segment.shared.deleted_count.load(.acquire) != 0)
-                plan.present_deleted.appendAssumeCapacity(.{ .id = segment.id, .bitmap = bitmap });
+            const derived = try derivedDeletionBitmap(self.writer.alloc, segment.reader.encoded(), &dead);
+            if (derived == null and segment.shared.deleted_count.load(.acquire) == 0) continue;
+            var bitmap = derived orelse roaring.RoaringBitmap.init(self.writer.alloc);
+            try plan.retained.ensureUnusedCapacity(self.alloc, 1);
+            const item = index_mod.prepareRetainedDeletion(self.alloc, segment, i - removed_before, bitmap) catch |err| {
+                bitmap.deinit();
+                return err;
+            };
+            plan.retained.appendAssumeCapacity(item);
         }
-        // Segments new here are published with their deletions.
+        // Segments new here are published with their deletions and readers.
         var tip_it = tip.keyIterator();
         while (tip_it.next()) |seg_id| {
             if (present.contains(seg_id.*)) continue;
@@ -2568,15 +2572,10 @@ pub const PersistentIndex = struct {
             };
             var data = index_mod.SegmentData.fromOwnedHeap(bytes);
             errdefer data.deinit(self.alloc);
-            const deleted = deleted: {
-                var reader = try segment_mod.SegmentReader.init(self.alloc, bytes);
-                defer reader.deinit();
-                const bitmap = (try derivedDeletionBitmap(self.alloc, &reader, &dead)) orelse break :deleted null;
-                const owned = try self.alloc.create(roaring.RoaringBitmap);
-                owned.* = bitmap;
-                break :deleted owned;
-            };
-            plan.added.appendAssumeCapacity(.{ .id = seg_id.*, .data = data, .deleted = deleted });
+            var reader = try data.initReader(self.writer.alloc);
+            errdefer reader.deinit();
+            const deleted = try derivedDeletionBitmap(self.writer.alloc, &reader, &dead);
+            plan.added.appendAssumeCapacity(.{ .id = seg_id.*, .data = data, .prepared_reader = reader, .deleted_owned = deleted });
         }
         const next_seg_id_bytes = txn.get(.meta, meta_next_seg_id) catch |err| switch (err) {
             error.NotFound => null,
@@ -2588,22 +2587,17 @@ pub const PersistentIndex = struct {
         return plan;
     }
 
-    /// Under `lockStorage`.
+    /// Under `lockStorage`: one publication, then one pass over the
+    /// retained segments' prepared deletions.
     fn applyTipRefresh(self: *PersistentIndex, plan: *TipRefreshPlan) !void {
         if (plan.removed.items.len != 0 or plan.added.items.len != 0) {
             var prepared = try self.writer.prepareSegmentsManyData(plan.removed.items, plan.added.items);
             defer prepared.abort();
             prepared.publish();
-            // Published: the writer owns the data, and cloned the deletions.
-            for (plan.added.items) |*replacement| TipRefreshPlan.freeDeleted(self.alloc, replacement);
+            // Published: the writer owns the data, readers and deletions.
             plan.added.clearRetainingCapacity();
         }
-        for (plan.present_deleted.items) |*item| {
-            const bitmap = item.bitmap orelse roaring.RoaringBitmap.init(self.alloc);
-            item.bitmap = null;
-            self.writer.setDeletionBitmap(item.id, bitmap);
-        }
-        plan.present_deleted.clearRetainingCapacity();
+        self.writer.installRetainedDeletions(plan.retained.items);
         if (plan.next_segment_id) |next| self.writer.next_segment_id = @max(self.writer.next_segment_id, next);
         self.version_locations.clear(self.alloc);
     }
