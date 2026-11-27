@@ -88,14 +88,17 @@ pub const Plan = struct {
         self.allocateLive(bytes, pointer);
     }
 
-    fn allocateLive(self: *Plan, bytes: usize, live_id: u64) void {
+    fn allocateLive(self: *Plan, bytes: usize, observed_address: ?u64) void {
         if (!self.valid or self.sealed) return;
+        // Declared slot identities are monotonic and cannot duplicate a live
+        // slot. Only observation needs to check every remaining live address.
+        const live_id = observed_address orelse self.count + 1;
         if (self.count == self.allocations.len or bytes == 0 or bytes > limit or live_id == 0) {
             self.valid = false;
             return;
         }
         const extent = std.mem.alignForward(usize, bytes, alignment);
-        const placement = self.findPlacement(false, extent, live_id) orelse {
+        const placement = self.findPlacement(false, extent, observed_address) orelse {
             self.valid = false;
             return;
         };
@@ -111,19 +114,19 @@ pub const Plan = struct {
         self.count += 1;
         self.peak = @max(self.peak, offset + extent);
     }
-    fn findPlacement(self: *const Plan, comptime external: bool, extent: usize, live_id: u64) ?struct { offset: usize, predecessor: Slot } {
+    fn findPlacement(self: *const Plan, comptime external: bool, extent: usize, observed_address: ?u64) ?struct { offset: usize, predecessor: Slot } {
         var offset: usize = 0;
         var previous: Slot = no_slot;
         var slot = self.first_live;
         var insert_after: ?Slot = null;
         while (slot != no_slot) {
             const allocation = self.allocations[slot];
-            if (!external and allocation.lifetime.live_id == live_id) return null;
+            if (observed_address) |address| if (allocation.lifetime.live_id == address) return null;
             if (insert_after == null) {
                 const start = if (external) @as(usize, @intCast(allocation.lifetime.external_offset)) else allocation.offset();
                 if (offset + extent <= start) {
                     insert_after = previous;
-                    if (external) break;
+                    if (observed_address == null) break;
                 } else {
                     offset = start + std.mem.alignForward(usize, allocation.bytes, alignment);
                 }
@@ -189,7 +192,7 @@ pub const Plan = struct {
 
         pub fn allocate(self: Builder, bytes: usize) !u15 {
             const slot = self.plan.count;
-            self.plan.allocateLive(bytes, slot + 1);
+            self.plan.allocateLive(bytes, null);
             if (!self.plan.valid or self.plan.count == slot) return error.InvalidExecutionPlan;
             return @intCast(slot);
         }
@@ -272,7 +275,7 @@ pub const Plan = struct {
             if (entry.allocate) {
                 const allocation = &self.allocations[slot];
                 const extent = std.mem.alignForward(usize, allocation.bytes, alignment);
-                const placement = self.findPlacement(true, extent, 0) orelse break;
+                const placement = self.findPlacement(true, extent, null) orelse break;
                 const end = placement.offset + extent;
                 if (end > inline_peak) break;
                 allocation.lifetime.external_offset = placement.offset;
