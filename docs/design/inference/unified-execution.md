@@ -1407,6 +1407,17 @@ pages/s. The first graph learned on 21 rows. Foreground cleanup still
 retired nine graphs during learning and one at the replay phase, all
 after two tokens of progress, so the exact-width gate remained unmet.
 
+At `c143fe6b85`, Spark passed all nine scoped CUDA checks without
+skips, including checked sequence release, invocation telemetry, and
+released fused-head HTTP parity with two-row replay. A same-binary
+dense/fused/fused/dense comparison used two concurrent 32-page
+requests per arm. Each timed arm replayed at 64 rows and exactly
+matched the serial outputs. Dense arms measured 20.65 and 20.93
+pages/s. Fused arms measured 20.55 and 20.03 pages/s and bound
+496,640 bytes of fused-head scratch. The pooled fused throughput
+was about 2.4% lower, so the result supports leaving fusion opt-in.
+The single 64-page-request cohort remains a separate serving case.
+
 This audit reconciles the original `2f2438e67f` implementation review
 against merged main `4951ca13f9` with later evidence. Each serving
 measurement identifies the revision that ran.
