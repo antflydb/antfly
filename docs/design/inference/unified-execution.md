@@ -2291,3 +2291,13 @@ released Native DECIDE HTTP fixture, idle VAD reclamation, required
 residency, optional staging, permanent failure accounting and
 failure propagation to load waiters. The log hash is
 `e923c9835550d7c67a8641261dfeebaddcf041426ee9ae06211981c867c40abb`.
+
+The borrowed logits-row revision `af26d3f4b6` passed all 30 focused
+CUDA checks, including the retained-view regression. Both full-window
+serving arms matched all 256 pages. The shared arena reached 97 rows
+and delivered 7.3831 pages/s. The standalone packet arm delivered
+7.3691 pages/s and missed the replay gate. The arms use the same
+binary, so this pair verifies each storage route and does not
+isolate the impact of removing the host view allocations. The
+receipts are `81dc942657692251dc137447d5bf1c6151a422ce974b6e8d1174816b184415a7`
+and `e00230dabf8ce8f2fab7ea26460d02b3461579b7fd61267a8da429ea9fc5d57e`.
