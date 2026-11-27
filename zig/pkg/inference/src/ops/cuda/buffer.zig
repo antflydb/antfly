@@ -147,6 +147,12 @@ pub const DeviceBuffer = struct {
     /// CUDA cuMemAlloc base guarantee, also used by canonical cuBLASLt profiles.
     /// Borrowed private KV slots preserve this base selection contract.
     pub const allocation_alignment: usize = 256;
+
+    /// A byte view borrows storage without inheriting allocation custody.
+    pub fn borrowRange(self: DeviceBuffer, offset: usize, bytes: usize) !DeviceBuffer {
+        if (offset > self.len or bytes > self.len - offset) return error.InvalidShape;
+        return .{ .ptr = try std.math.add(u64, self.ptr, offset), .len = bytes, .borrowed = true };
+    }
     ptr: driver_mod.CUdeviceptr = 0,
     len: usize = 0,
     /// Original allocation size, independent of a logical view's length.

@@ -3549,7 +3549,7 @@ pub const CudaCompute = struct {
             const layout = try fused.Scratch.forRows(burst.rows);
             const scratch = try layout.bind(backing);
             const bytes = burst.rows * @sizeOf(u32);
-            const output = try borrowBufferRange(tensorFromCt(burst.bank).buffer, step * bytes, bytes);
+            const output = try tensorFromCt(burst.bank).buffer.borrowRange(step * bytes, bytes);
             const request = fused.Request{ .input = input.buffer, .weight = weight.buffer, .partial = scratch.partial, .indices = scratch.indices, .suppress = burst.suppress, .output = output, .rows = burst.rows, .suppress_count = burst.suppress_count };
             burst.drained = false;
             try self.lighton_head.run(&self.ctx, request);
@@ -3797,7 +3797,7 @@ pub const CudaCompute = struct {
                 const rows = @min(head_rows, owner.rows - first);
                 const count = try checkedMul(rows, owner.hidden);
                 const byte_offset = try checkedMul(try checkedMul(first, owner.hidden), @sizeOf(f32));
-                const buffer = try borrowBufferRange(input_tensor.buffer, byte_offset, try checkedMul(count, @sizeOf(f32)));
+                const buffer = try input_tensor.buffer.borrowRange(byte_offset, try checkedMul(count, @sizeOf(f32)));
                 var shape = [_]i64{ @intCast(rows), @intCast(owner.hidden) };
                 // The entire input remains owned by the caller through both
                 // submission and any deferred use of its device storage.
@@ -3827,7 +3827,7 @@ pub const CudaCompute = struct {
             const bank = self.head_destination orelse
                 return cb.linearNoBias(input_ct, weight, rows, owner.hidden, owner.vocab);
             const bytes = try lightOnLinearOutputBytes(self.compute, tensorFromCt(weight), rows, owner.vocab);
-            const destination = try borrowBufferRange(bank, 0, bytes);
+            const destination = try bank.borrowRange(0, bytes);
             return cb.observeBackendEntry(.linear_no_bias, &linearNoBiasWithDestination, .{ self.compute, input_ct, weight, rows, owner.hidden, owner.vocab, false, @as(?buffer_mod.DeviceBuffer, destination) });
         }
         pub fn embedInput(self: *@This(), embedding: CT, ids: []const i64) !void {
@@ -4357,8 +4357,8 @@ pub const CudaCompute = struct {
         // burst. Give them disjoint views of one admitted allocation.
         var metadata = try allocDeviceBuffer(self, try checkedAdd(token_bytes, suppression_bytes));
         errdefer releaseDeviceBuffer(self, &metadata);
-        const tokens = try borrowBufferRange(metadata, 0, token_bytes);
-        const suppression: buffer_mod.DeviceBuffer = if (suppression_bytes != 0) try borrowBufferRange(metadata, token_bytes, suppression_bytes) else .{};
+        const tokens = try metadata.borrowRange(0, token_bytes);
+        const suppression: buffer_mod.DeviceBuffer = if (suppression_bytes != 0) try metadata.borrowRange(token_bytes, suppression_bytes) else .{};
         const shape = try allocShape2(self.allocator, steps, rows);
         errdefer self.allocator.free(shape);
         errdefer self.ctx.synchronize() catch {};
@@ -20854,7 +20854,7 @@ fn readFloat32IntoOp(ctx: *anyopaque, tensor: CT, start: ?usize, output: []f32) 
     if (offset > source.elem_count or output.len > source.elem_count - offset) return error.InvalidTensorShape;
     const bytes = std.mem.sliceAsBytes(output);
     if (bytes.len == 0) return true;
-    const view = try borrowBufferRange(source.buffer, try checkedMul(offset, @sizeOf(f32)), bytes.len);
+    const view = try source.buffer.borrowRange(try checkedMul(offset, @sizeOf(f32)), bytes.len);
     try copyToHostTrackedAndSync(self, view, bytes);
     noteFloat32Download(self, bytes.len);
     return true;
@@ -20972,10 +20972,6 @@ fn supportsLinearPackedNamedOp(ctx: *anyopaque) bool {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     return self.capability_profile == .embedding_gemma2 and self.embedding_gemma2_policy.packed_projections;
 }
-fn borrowBufferRange(buffer: buffer_mod.DeviceBuffer, offset: usize, bytes: usize) !buffer_mod.DeviceBuffer {
-    if (offset > buffer.len or bytes > buffer.len - offset) return error.InvalidShape;
-    return .{ .ptr = try std.math.add(u64, buffer.ptr, offset), .len = bytes, .borrowed = true };
-}
 fn audioOutputMatches(input: *const CudaTensor, output: *const CudaTensor, bytes: usize) bool {
     return output.dtype == .f32 and output.elem_count == input.elem_count and
         std.mem.eql(i64, output.shape, input.shape) and output.buffer.len >= bytes;
@@ -21038,7 +21034,7 @@ fn stageAudioGraphInputs(self: *CudaCompute, input_bank: buffer_mod.DeviceBuffer
         var bytes: usize = 0;
         for (inputs, spans) |ct, span| {
             if (span.bytes == 0) continue;
-            destinations[count] = (try borrowBufferRange(input_bank, span.offset, span.bytes)).ptr;
+            destinations[count] = (try input_bank.borrowRange(span.offset, span.bytes)).ptr;
             sources[count] = tensorFromCt(ct).buffer.ptr;
             sizes[count] = span.bytes;
             count += 1;
@@ -21050,7 +21046,7 @@ fn stageAudioGraphInputs(self: *CudaCompute, input_bank: buffer_mod.DeviceBuffer
     }
     for (inputs, spans) |ct, span| {
         if (span.bytes == 0) continue;
-        const destination = try borrowBufferRange(input_bank, span.offset, span.bytes);
+        const destination = try input_bank.borrowRange(span.offset, span.bytes);
         const source = tensorFromCt(ct).buffer;
         if (debug_copy) {
             try copyFromDeviceTracked(self, destination, source, span.bytes);
@@ -21298,11 +21294,11 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     } else try self.createEmbeddingGemma2TensorWithBacking(first_input.shape, first_input.elem_count, .f32, backing_bytes);
     var out_owned = true;
     defer if (out_owned) freeTensor(self, out);
-    const output_bank = if (published_directly) tensorFromCt(out).buffer else if (storage.external_output) arena.buffers[1] else try borrowBufferRange(arena.buffers[0], output.offset, output.bytes);
+    const output_bank = if (published_directly) tensorFromCt(out).buffer else if (storage.external_output) arena.buffers[1] else try arena.buffers[0].borrowRange(output.offset, output.bytes);
     if (published_directly or storage.external_output) {
         if (execution_scope) |*scope| try scope.bindPublishedOutput(output_bank.ptr, output_bank.len);
     }
-    const input_bank = if (replay or capture) try borrowBufferRange(arena.buffers[0], 0, storage.scratch_offset) else buffer_mod.DeviceBuffer{};
+    const input_bank = if (replay or capture) try arena.buffers[0].borrowRange(0, storage.scratch_offset) else buffer_mod.DeviceBuffer{};
     defer arena.noteUse(&self.ctx);
     const timing = try arena.beginTiming(&self.ctx);
     if (!replay) {
@@ -21316,7 +21312,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
             const source = if (capture) input_bank else input.buffer;
             const offset = if (capture) span.offset else 0;
             view.* = .{
-                .buffer = try borrowBufferRange(source, offset, span.bytes),
+                .buffer = try source.borrowRange(offset, span.bytes),
                 .shape = input.shape,
                 .elem_count = input.elem_count,
                 .dtype = .f32,
@@ -21379,7 +21375,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         if (replay) self.audio_graph_replays += 1;
     }
     if (!published_directly and retained_output == null) {
-        const result = try borrowBufferRange(output_bank, 0, output_bytes);
+        const result = try output_bank.borrowRange(0, output_bytes);
         try copyFromDeviceTracked(self, tensorFromCt(out).buffer, result, output_bytes);
     }
     // Include the publication copy in replay samples. The direct ordinary
@@ -23596,7 +23592,7 @@ fn gatherDeviceColumnsOp(ctx: *anyopaque, columns: []const ops.KernelBackend.Dev
             if (bytes > source.buffer.len or bytes > capacity - offset) return error.InvalidShape;
             if (bytes == 0) continue;
             if (count == sizes.len) return false;
-            destinations[count] = (try borrowBufferRange(target.buffer, offset, bytes)).ptr;
+            destinations[count] = (try target.buffer.borrowRange(offset, bytes)).ptr;
             sources[count] = source.buffer.ptr;
             sizes[count] = bytes;
             count += 1;
@@ -62338,7 +62334,7 @@ test "public source audio linear recreates input bank through actual learning ca
         const replays_before = compute.audio_graph_replays;
         for (arena.buffers[0..2]) |bank| {
             var alias: CudaTensor = .{
-                .buffer = try borrowBufferRange(bank, 0, @sizeOf([4]f32)),
+                .buffer = try bank.borrowRange(0, @sizeOf([4]f32)),
                 .shape = @constCast(&[_]i64{ 2, 2 }),
                 .elem_count = 4,
                 .dtype = .f32,

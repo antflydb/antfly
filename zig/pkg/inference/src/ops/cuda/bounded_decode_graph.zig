@@ -79,8 +79,7 @@ pub const StorageLayout = struct {
         bytes: usize,
 
         fn bind(self: Span, backing: buffer.DeviceBuffer) buffer.DeviceBuffer {
-            std.debug.assert(self.offset <= backing.len and self.bytes <= backing.len - self.offset);
-            return .{ .ptr = backing.ptr + self.offset, .len = self.bytes, .borrowed = true };
+            return backing.borrowRange(self.offset, self.bytes) catch unreachable;
         }
     };
 
@@ -714,7 +713,7 @@ pub const Module = struct {
             span.offset % plan_mod.alignment != 0 or span.offset > layout.metadata_bytes or
             span.bytes > layout.metadata_bytes - span.offset) return error.InvalidExecutionPlan;
         _ = buffer.validateRegion(self.metadata, layout.metadata_bytes, plan_mod.alignment) catch return error.InvalidExecutionPlan;
-        return (StorageLayout.Span{ .offset = span.offset, .bytes = bytes }).bind(self.metadata);
+        return self.metadata.borrowRange(span.offset, bytes) catch return error.InvalidExecutionPlan;
     }
 
     pub fn input(self: *const Module) buffer.DeviceBuffer {
