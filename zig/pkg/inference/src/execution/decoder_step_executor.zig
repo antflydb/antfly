@@ -1001,7 +1001,10 @@ pub const Executor = struct {
         var position_snapshot: [384]u32 = undefined;
         @memcpy(position_snapshot[0..positions.len], positions);
         const graph_owner = @import("../ops/cuda/bounded_decode_graph.zig");
-        const head_storage: graph_owner.Descriptor.HeadStorage = if (platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_SHARE_HEAD_ARENA"))
+        const head_storage: graph_owner.Descriptor.HeadStorage = if (platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_FUSED_HEAD") and
+            C.boundedFusedHeadAvailable(self.context.cb, head, claimed.len, self.context.gpt_config.hidden_size, self.context.gpt_config.vocab_size))
+            .fused_top1
+        else if (platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_SHARE_HEAD_ARENA"))
             .{ .arena_packets = 16 }
         else if (platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_HEAD_PACKETS"))
             .{ .adaptive_bank = 32 }

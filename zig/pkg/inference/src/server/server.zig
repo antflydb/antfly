@@ -48796,7 +48796,9 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
             try std.testing.expectEqual(@as(usize, 2), report.rows);
             try std.testing.expectEqual(report.rows, report.head_packet_rows);
             try std.testing.expectEqual(@as(usize, 0), report.head_bytes);
-            try std.testing.expect(report.head_in_stream_arena);
+            const fused_head = platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_FUSED_HEAD");
+            try std.testing.expectEqual(!fused_head, report.head_in_stream_arena);
+            try std.testing.expectEqual(fused_head, report.fused_head_scratch_bytes != 0);
             // At two rows the position plane starts on the first 16-byte boundary.
             try std.testing.expectEqual(@as(usize, 44), report.readback_bytes);
             try std.testing.expectEqual(report.planned_scratch_bytes, report.bound_scratch_bytes);

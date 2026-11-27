@@ -3473,6 +3473,20 @@ pub const CudaCompute = struct {
         return tryReducedVisionCudnnInput(self, input, input, input, null, .{ .qkv = input, .positions = positions, .theta = theta }, batch, rows / batch, heads, dim);
     }
 
+    pub fn boundedFusedHeadAvailable(cb: *const ops.ComputeBackend, head: CT, rows: usize, hidden: usize, vocab: usize) bool {
+        if (!acceptsPhysicalImplementation(cb.vtable)) return false;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.fusedHeadAvailable(tensorFromCt(head), rows, hidden, vocab);
+    }
+
+    fn fusedHeadAvailable(self: *const CudaCompute, weight: *const CudaTensor, rows: usize, hidden: usize, vocab: usize) bool {
+        const fused = @import("projection_top1_bf16.zig");
+        return !self.lighton_fused_head_disabled and fused.supported(self.ctx.info.compute_major, self.ctx.info.compute_minor, rows, hidden, vocab) and
+            weight.dtype == .bf16 and weight.quant_type == null and !weight.strict_resident_training and
+            !self.resident_training_cache and self.lazy_host_store == null and
+            !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active;
+    }
+
     /// Token IDs stay on the CUDA stream until the complete bounded burst
     /// drains. No page state or caller-owned input is captured by this object.
     pub const LightOnTokenBurst = struct {
@@ -3505,34 +3519,34 @@ pub const CudaCompute = struct {
             const input = tensorFromCt(hidden);
             const weight = tensorFromCt(head);
             const fused = @import("projection_top1_bf16.zig");
-            if (!self.lighton_fused_head_disabled and fused.supported(self.ctx.info.compute_major, self.ctx.info.compute_minor, burst.rows, burst.hidden, burst.vocab) and
-                weight.dtype == .bf16 and weight.quant_type == null and !weight.strict_resident_training and
-                !input.strict_resident_training and !self.resident_training_cache and self.lazy_host_store == null and
-                !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active)
-            {
-                try ensureF32(input);
-                try ensureCount(input, try checkedMul(burst.rows, burst.hidden));
-                try ensureCount(weight, try checkedMul(burst.hidden, burst.vocab));
+            if (self.fusedHeadAvailable(weight, burst.rows, burst.hidden, burst.vocab) and !input.strict_resident_training) {
                 const layout = try fused.Scratch.forRows(burst.rows);
                 // Both planes stay live through the finish kernel. Use one
                 // admitted range and retain it through the whole burst.
                 if (burst.head_scratch.ptr == 0) burst.head_scratch = allocDeviceBuffer(self, layout.bytes) catch .{};
-                if (burst.head_scratch.ptr != 0) {
-                    const scratch = try layout.bind(burst.head_scratch);
-                    const bank = tensorFromCt(burst.bank).buffer;
-                    const output_bytes = burst.rows * @sizeOf(u32);
-                    const request = fused.Request{ .input = input.buffer, .weight = weight.buffer, .partial = scratch.partial, .indices = scratch.indices, .suppress = burst.suppress, .output = .{ .ptr = bank.ptr + step * output_bytes, .len = output_bytes }, .rows = burst.rows, .suppress_count = burst.suppress_count };
-                    try fused.validate(request);
-                    burst.drained = false;
-                    try self.lighton_head.run(&self.ctx, request);
-                    self.stats.launch_argmax += 1;
-                    return;
-                }
+                if (burst.head_scratch.ptr != 0) return burst.runFusedHead(input, weight, step, burst.head_scratch);
             }
             const logits = try cb.linearNoBias(hidden, head, burst.rows, burst.hidden, burst.vocab);
             defer cb.free(logits);
             try burst.argmax(logits, step);
         }
+        fn runFusedHead(burst: *@This(), input: *const CudaTensor, weight: *const CudaTensor, step: usize, backing: buffer_mod.DeviceBuffer) !void {
+            const self = burst.owner;
+            const fused = @import("projection_top1_bf16.zig");
+            if (step >= burst.steps or input.strict_resident_training or !self.fusedHeadAvailable(weight, burst.rows, burst.hidden, burst.vocab)) return error.InvalidExecutionPlan;
+            try ensureF32(input);
+            try ensureCount(input, try checkedMul(burst.rows, burst.hidden));
+            try ensureCount(weight, try checkedMul(burst.hidden, burst.vocab));
+            const layout = try fused.Scratch.forRows(burst.rows);
+            const scratch = try layout.bind(backing);
+            const bytes = burst.rows * @sizeOf(u32);
+            const output = try borrowBufferRange(tensorFromCt(burst.bank).buffer, step * bytes, bytes);
+            const request = fused.Request{ .input = input.buffer, .weight = weight.buffer, .partial = scratch.partial, .indices = scratch.indices, .suppress = burst.suppress, .output = output, .rows = burst.rows, .suppress_count = burst.suppress_count };
+            burst.drained = false;
+            try self.lighton_head.run(&self.ctx, request);
+            self.stats.launch_argmax += 1;
+        }
+
         pub fn argmax(burst: *@This(), logits: CT, step: usize) !void {
             return burst.argmaxRange(logits, step, 0, burst.rows);
         }
@@ -3757,6 +3771,8 @@ pub const CudaCompute = struct {
             try ensureF32(input_tensor);
             try ensureCount(input_tensor, try checkedMul(owner.rows, owner.hidden));
             const layout = owner.storage_layout orelse return error.InvalidExecutionPlan;
+            if (layout.fused_head_workspace != null)
+                return burst_value.runFusedHead(input_tensor, tensorFromCt(weight), step, try owner.bindFusedHeadWorkspace());
             const head_rows = layout.headPacketRows(owner.rows, owner.vocab);
             if (head_rows == 0) return error.InvalidExecutionPlan;
             if (head_rows >= owner.rows) {
@@ -3943,12 +3959,13 @@ pub const CudaCompute = struct {
                     .planned_events = if (planned) |value| value.events else 0,
                     .planned_scratch_bytes = if (planned) |value| value.bytes else 0,
                     .bound_scratch_bytes = if (arena != null) owner.arena.len else 0,
-                    .metadata_bytes = if (layout.attention_workspace orelse layout.recurrent_workspace) |span| span.offset else layout.metadata_bytes,
+                    .metadata_bytes = if (layout.attention_workspace orelse layout.recurrent_workspace orelse layout.fused_head_workspace) |span| span.offset else layout.metadata_bytes,
                     .attention_scratch_bytes = if (layout.attention_workspace) |span| span.bytes else 0,
                     .recurrent_scratch_bytes = owner.bound_recurrent_scratch_bytes,
                     .head_bytes = layout.head_bytes,
                     .head_packet_rows = layout.headPacketRows(owner.rows, owner.vocab),
-                    .head_in_stream_arena = layout.head_bytes == 0 and arena != null,
+                    .head_in_stream_arena = layout.head_bytes == 0 and layout.fused_head_workspace == null and arena != null,
+                    .fused_head_scratch_bytes = if (layout.fused_head_workspace) |span| span.bytes else 0,
                     .readback_bytes = source.len,
                     .readback_backing = readback_backing,
                     .rows = owner.rows,

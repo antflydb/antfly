@@ -61,6 +61,7 @@ pub const StorageLayout = struct {
     counter: Span,
     attention_workspace: ?Span = null,
     recurrent_workspace: ?Span = null,
+    fused_head_workspace: ?Span = null,
     recurrent_scratch: ?@import("gated_delta.zig").PacketScratch = null,
     metadata_bytes: usize,
     host_bytes: usize,
@@ -223,17 +224,23 @@ pub const Descriptor = struct {
         full_bank,
         adaptive_bank: usize,
         arena_packets: usize,
+        fused_top1,
     };
 
     pub fn layout(self: Descriptor) !StorageLayout {
         if (self.epoch == 0 or self.rows > max_rows or self.positions.len != self.rows * 3) return error.InvalidShape;
         const packet_rows = switch (self.head_storage) {
-            .full_bank => self.rows,
+            .full_bank, .fused_top1 => self.rows,
             .adaptive_bank, .arena_packets => |rows| rows,
         };
         var storage = try StorageLayout.initWithHeadLimit(self.rows, self.hidden, self.vocab, self.key.len, packet_rows);
         if (self.head_storage == .arena_packets and storage.head_bytes != 0) {
             storage.arena_head_rows = @min(self.rows, packet_rows);
+            storage.head_bytes = 0;
+        }
+        if (self.head_storage == .fused_top1) {
+            const scratch = try @import("projection_top1_bf16.zig").Scratch.forRows(self.rows);
+            storage.fused_head_workspace = try storage.declareLayerWorkspace(scratch.bytes);
             storage.head_bytes = 0;
         }
         return storage;
@@ -334,6 +341,7 @@ pub const GraphPhase = struct {
             (self.descriptor.head_storage == .adaptive_bank and storage.head_bytes > 0 and storage.head_bytes < self.storage_layout.head_bytes);
         return owner.matches(self.descriptor) and compatible_head and
             storage.arena_head_rows == self.storage_layout.arena_head_rows and
+            std.meta.eql(storage.fused_head_workspace, self.storage_layout.fused_head_workspace) and
             std.meta.eql(storage.recurrent_workspace, self.storage_layout.recurrent_workspace) and
             std.meta.eql(storage.recurrent_scratch, self.storage_layout.recurrent_scratch) and
             std.meta.eql(owner.attention_scratch, self.attention_scratch);
@@ -685,6 +693,12 @@ pub const Module = struct {
         return bound;
     }
 
+    pub fn bindFusedHeadWorkspace(self: *const Module) !buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const span = layout.fused_head_workspace orelse return error.InvalidExecutionPlan;
+        return self.bindLayerWorkspace(layout, span, span.bytes);
+    }
+
     fn bindLayerWorkspace(self: *const Module, layout: StorageLayout, span: StorageLayout.Span, bytes: usize) !buffer.DeviceBuffer {
         if (bytes == 0 or bytes > span.bytes or self.metadata.len < layout.metadata_bytes)
             return error.InvalidExecutionPlan;
@@ -759,6 +773,22 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
     var changed = scratch;
     changed.core_offset -= @sizeOf(f32);
     try std.testing.expectError(error.InvalidExecutionPlan, owner.bindRecurrentWorkspace(changed));
+
+    var fused = descriptor;
+    fused.hidden = 1024;
+    fused.head_storage = .fused_top1;
+    try phase.initInto(fused);
+    try phase.declareRecurrentScratch();
+    try phase.declareAttentionScratch(false);
+    const fused_layout = phase.storage_layout;
+    const head = fused_layout.fused_head_workspace.?;
+    try std.testing.expectEqual(@as(usize, 0), fused_layout.head_bytes);
+    try std.testing.expectEqual(fused_layout.attention_workspace.?.offset, head.offset);
+    try std.testing.expectEqual(fused_layout.recurrent_workspace.?.offset, head.offset);
+    try std.testing.expectEqual(head.offset + @max(head.bytes, attention.bytes, recurrent.bytes), fused_layout.metadata_bytes);
+    owner.storage_layout = fused_layout;
+    owner.metadata.len = fused_layout.metadata_bytes;
+    try std.testing.expectEqual(owner.metadata.ptr + head.offset, (try owner.bindFusedHeadWorkspace()).ptr);
 }
 
 test "captured graph head packets fund the exact smaller bank and invalidate a full-width binding" {
