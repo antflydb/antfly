@@ -2064,3 +2064,14 @@ B/B p95s were 40.56 and 40.16 ms. The tail regression persists after
 the shorter replay trial. The isolated and instrumented receipts are
 `e9a92dcbc09d4e57462e6cc0aa6be465e0593861ad841adb703915906de09c7e`
 and `d8832063947beef6731cd738b1892bb68b9c6f4e6f7259f29b71f65370ec3935`.
+
+A separate Spark headroom diagnostic used the same binary and workload
+with a 25 GiB scratch cap. Both arms again completed all 256 pages with
+exact reference parity. Full-width and packet arms measured 7.3623 and
+7.0856 pages/s, with maximum replay widths of 38 and zero. At the packet
+arm's 109-row denial, existing host and backend scratch left 7,434,236
+bytes before the cap, while storage requested 38,326,008 bytes across
+both tiers. A larger cap let the serving workload admit more rows and
+did not establish wide replay. The full-width and packet receipts are
+`09c3bfec79832465d4baedc49c1adbfdc0245db5ec42c224342cd6fcb333b852`
+and `46975f03aacb65d34bb9c7561007bd9fb0456858d31cffa2ddbe4955164c083d`.
