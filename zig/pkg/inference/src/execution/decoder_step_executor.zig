@@ -933,10 +933,14 @@ pub const Executor = struct {
                 } else if (try manager.reservedTokenCapacity(sequence) < future[i]) return decline(decline_code, .context_or_page_capacity);
                 const manager_table = manager.blockTable(sequence) orelse return decline(decline_code, .missing_kv_binding);
                 if (manager_table.shared_prefix_blocks != 0) return decline(decline_code, .context_or_page_capacity);
-                const blocks: []const u32 = if (reserve) try storage.logicalBlocksWithReservations(sequence) else &.{};
-                const owned_sequence: ?*@import("../runtime/kv/storage_runtime.zig").SequenceState = if (!reserve) try storage.sequenceMut(sequence) else null;
-                const block_count = if (owned_sequence) |value| try std.math.add(usize, value.block_table.blocks.items.len, value.reserved_tail_blocks.items.len) else blocks.len;
-                if (storage.storage.config.page_size_tokens == 0 or try std.math.mul(usize, block_count, storage.storage.config.page_size_tokens) < future[i]) return decline(decline_code, .context_or_page_capacity);
+                const owned_sequence = try storage.sequenceMut(sequence);
+                const spans = [_][]const u32{
+                    owned_sequence.block_table.blocks.items,
+                    owned_sequence.reserved_tail_blocks.items,
+                };
+                const block_count = try std.math.add(usize, spans[0].len, spans[1].len);
+                const required_blocks = try std.math.divCeil(usize, future[i], page_size);
+                if (block_count < required_blocks) return decline(decline_code, .context_or_page_capacity);
                 const packet_limit = attention.max_blocks;
                 if (block_count == 0 or block_count > packet_limit - packet_blocks) return decline(decline_code, .context_or_page_capacity);
                 if (key.len > key.words.len - 3 or block_count > key.words.len - key.len - 3) return decline(decline_code, .context_or_page_capacity);
@@ -944,10 +948,6 @@ pub const Executor = struct {
                 try key.add(sequence);
                 try key.add(future[i]);
                 try key.add(block_count);
-                const primary = if (owned_sequence) |value| value.block_table.blocks.items else blocks;
-                const tail = if (owned_sequence) |value| value.reserved_tail_blocks.items else &.{};
-                const spans = [_][]const u32{ primary, tail };
-                const required_blocks = try std.math.divCeil(usize, future[i], page_size);
                 const capacity = try @import("../runtime/kv/block.zig").physicalTokenCapacity(&spans, required_blocks, page_size);
                 physical_tokens = @max(physical_tokens, capacity);
                 for (spans) |span| for (span) |block| try key.add(block);
