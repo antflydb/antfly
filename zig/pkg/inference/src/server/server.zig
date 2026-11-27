@@ -57090,6 +57090,7 @@ test "LightOn reader actual public CUDA loader prepares immutable norm caches be
         var peer_registered = true;
         defer if (peer_registered) ctx.unregister(peer_index);
         const before_warm = domain.controller.snapshot();
+        const before_pages = ctx.admitted_pages;
         const before_reentries = probe.numerical_reentries;
         const raw_page = try ctx.admitRegisteredPage(&factory, peer_index, null, 0, .{ .backend_scratch_bytes = 64, .host_scratch_bytes = 16 });
         var owned_page = ctx.bindPageLease(raw_page);
@@ -57101,6 +57102,8 @@ test "LightOn reader actual public CUDA loader prepares immutable norm caches be
             owned_page.release(&peer_pool);
             peer_pool_live = false;
         };
+        try std.testing.expectEqual(before_pages + 1, ctx.admitted_pages);
+        try std.testing.expect(ctx.admitted_controls[peer_index]);
         try std.testing.expect(probe.numerical_reentries > before_reentries);
         try std.testing.expect(probe.failure == null);
         // Retire an actual per-page state under NOW's step/cohort and B;
@@ -57118,6 +57121,7 @@ test "LightOn reader actual public CUDA loader prepares immutable norm caches be
         ctx.unlockStep();
         ctx.unregister(peer_index);
         peer_registered = false;
+        try std.testing.expectEqual(before_pages, ctx.admitted_pages);
         const before_refund_reentries = probe.numerical_reentries;
         owned_page.release(&peer_pool);
         peer_pool_live = false;

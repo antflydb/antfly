@@ -1122,13 +1122,13 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             const needs_peak = if (peak) |bytes| ctx.phase_wait_ns == 0 or bytes > ctx.published_vision_peak.load(.acquire) else false;
             const needs_host_peak = host_peak > 0 and (ctx.phase_wait_ns == 0 or host_peak > ctx.published_vision_host_peak.load(.acquire));
             const needs_decoder_peak = factory.decoder_workspace != null or (factory.decoder_peak != 0 and (ctx.phase_wait_ns == 0 or factory.decoder_peak > ctx.published_decoder_peak.load(.acquire)));
-            if (needs_auxiliary or needs_peak or needs_host_peak or needs_decoder_peak or factory.dynamic_vision_batch_items != 0) {
+            const lease = if (needs_auxiliary or needs_peak or needs_host_peak or needs_decoder_peak or factory.dynamic_vision_batch_items != 0) admitted: {
                 const vision_mark = if (peak != null) ctx.vision_peak.mark() else null;
                 const host_mark = if (host_peak != 0) ctx.vision_host_peak.mark() else null;
                 const decoder_mark = if (factory.decoder_peak != 0 or factory.decoder_workspace != null) ctx.decoder_peak.mark() else null;
-                const old_workspace = if (factory.decoder_workspace != null) ctx.decoder_workspace else null;
-                const old_vision = if (factory.dynamic_vision_batch_items != 0) ctx.vision_per_item_peak else 0;
-                const old_host = if (factory.dynamic_vision_batch_items != 0) ctx.vision_host_per_item_peak else 0;
+                const old_workspace = ctx.decoder_workspace;
+                const old_vision = ctx.vision_per_item_peak;
+                const old_host = ctx.vision_host_per_item_peak;
                 var committed = false;
                 defer if (!committed) {
                     // No GPU consumer can use these increments before this
@@ -1192,12 +1192,12 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                     try ctx.vision_host_peak.grow(bytes, factory, acquireVisionHostPeak);
                     if (ctx.phase_wait_ns != 0) ctx.published_vision_host_peak.store(ctx.vision_host_peak.bytes, .release);
                 }
-                const lease = try ctx.acquirePageOutside(factory, amounts, unpublished);
-                if (index) |slot| ctx.noteAdmitted(slot, peak, host_peak, factory.decoder_workspace);
+                const page_lease = try ctx.acquirePageOutside(factory, amounts, unpublished);
                 committed = true;
-                return lease;
-            }
-            return ctx.acquirePageOutside(factory, amounts, unpublished);
+                break :admitted page_lease;
+            } else try ctx.acquirePageOutside(factory, amounts, unpublished);
+            if (index) |slot| ctx.noteAdmitted(slot, peak, host_peak, factory.decoder_workspace);
+            return lease;
         }
 
         fn noteAdmitted(ctx: *LightOnStreamContext, slot: usize, peak: ?usize, host_peak: usize, workspace: ?@import("reader_workspace.zig").Decoder) void {
