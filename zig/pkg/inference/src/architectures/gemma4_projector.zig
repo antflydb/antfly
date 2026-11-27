@@ -1445,6 +1445,11 @@ test "audio cache recipe shares exact execution key and original HF packed names
     var right_context = cfg;
     right_context.attention_context_right = 1;
     try std.testing.expect(recipe.key(&segments, start, end) != audioCacheConfig(right_context).key(&segments, start, end));
+    try std.testing.expect(audio_schedule.supportsCudaGroupedGraph(2, cfg.attention_context_right));
+    try std.testing.expect(audio_schedule.supportsCudaGroupedGraph(4, cfg.attention_context_right));
+    try std.testing.expect(!audio_schedule.supportsCudaGroupedGraph(1, cfg.attention_context_right));
+    try std.testing.expect(!audio_schedule.supportsCudaGroupedGraph(5, cfg.attention_context_right));
+    try std.testing.expect(!audio_schedule.supportsCudaGroupedGraph(2, right_context.attention_context_right));
     // Cold workspace admission describes exactly the tensor geometry of the
     // segmented producer, including odd frame counts and rank-one masks.
     var batch = recipe;
