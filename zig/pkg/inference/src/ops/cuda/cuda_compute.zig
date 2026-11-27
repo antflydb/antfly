@@ -7983,7 +7983,7 @@ pub const CudaCompute = struct {
         var shapes: [Inputs.count][2]i64 = undefined;
         const inputs = try Inputs.describe(&shapes, rows, recipe.hidden, recipe.context_left, recipe.heads);
         const execution_key = recipe.key(segments[0..recipe.count], 0, recipe.blocks);
-        const base = try self.audioCacheBase(execution_key, &inputs, null);
+        const base = try self.audioCacheBase(execution_key, inputs[0..Inputs.activeCount(!recipe.source_bf16)], null);
         const entry = self.audioPlanFor(base) orelse return;
         if (entry.owner == null or !entry.owner.?.managed)
             try builder.add(.{ .audio_learning = .{ .key = base.key } });

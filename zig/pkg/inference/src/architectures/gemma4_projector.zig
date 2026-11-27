@@ -1477,10 +1477,13 @@ test "audio cache recipe shares exact execution key and original HF packed names
         try std.testing.expectEqualSlices(i64, &.{33}, mask.shape);
         try std.testing.expectEqual(rows, mask.elements);
     }
-    for (metadata[Inputs.scales..]) |scale| {
+    for (metadata[Inputs.scales..Inputs.segment_valid]) |scale| {
         try std.testing.expectEqualSlices(i64, &.{@intCast(batch.hidden / batch.heads)}, scale.shape);
         try std.testing.expectEqual(batch.hidden / batch.heads, scale.elements);
     }
+    try std.testing.expectEqualSlices(i64, &.{33}, metadata[Inputs.segment_valid].shape);
+    try std.testing.expectEqual(rows, metadata[Inputs.segment_valid].elements);
+    try std.testing.expectEqual(Inputs.scales + Inputs.scale_count, Inputs.activeCount(false));
     for (0..12) |layer| for ([_][]const u8{ "q", "k", "v" }, 0..) |component, index| {
         var original: [128]u8 = undefined;
         const logical = try std.fmt.bufPrint(&original, "a.blk.{d}.attn_{s}.weight", .{ layer, component });
@@ -4609,7 +4612,9 @@ const AudioLayerInputs = struct {
         const rel_in = if (cached) (try cb.modelConstant(rel_key, null)) orelse try prepareAudioRelative(cb, allocator, cfg, rel_key) else try prepareAudioRelative(cb, allocator, cfg, null);
         errdefer cb.free(rel_in);
 
-        const mask = try bindMasks(cb, allocator, valid_mask, segments);
+        // Independent CUDA source attention receives clip spans and plain
+        // validity. Only the combined segmented kernel reads a tagged mask.
+        const mask = try bindMasks(cb, allocator, valid_mask, segments, cb.kind() != .cuda or cfg.source_scalar_storage != .bf16);
         errdefer {
             cb.free(mask.valid);
             if (mask.starts) |tensor| cb.free(tensor);
@@ -4698,14 +4703,14 @@ const AudioLayerInputs = struct {
 
     const MaskBindings = struct { valid: CT, starts: ?CT = null, tags: ?CT = null };
 
-    fn bindMasks(cb: *const ComputeBackend, allocator: std.mem.Allocator, valid_mask: []const bool, segments: []const usize) !MaskBindings {
+    fn bindMasks(cb: *const ComputeBackend, allocator: std.mem.Allocator, valid_mask: []const bool, segments: []const usize, include_tags: bool) !MaskBindings {
         const grouped = segments.len != 0 and (cb.kind() == .metal or cb.kind() == .cuda);
         const rows = valid_mask.len;
         if (grouped) {
             if (rows > 16777216) return error.InvalidTensorShape;
             audio_schedule.GroupedRows.validatePartition(segments, rows) catch return error.InvalidTensorShape;
         }
-        const planes = try allocator.alloc(f32, if (grouped) rows * 3 else rows);
+        const planes = try allocator.alloc(f32, if (grouped) rows * @as(usize, if (include_tags) 3 else 2) else rows);
         defer allocator.free(planes);
         const valid = planes[0..rows];
         for (valid, valid_mask) |*value, flag| value.* = if (flag) 1 else 0;
@@ -4716,7 +4721,7 @@ const AudioLayerInputs = struct {
         for (segments) |span| {
             for (offset..offset + span) |row| {
                 starts[row] = @floatFromInt(offset);
-                tags[row] = @as(f32, @floatFromInt(offset + 1)) * (2 * valid[row] - 1);
+                if (include_tags) tags[row] = @as(f32, @floatFromInt(offset + 1)) * (2 * valid[row] - 1);
             }
             offset += span;
         }
@@ -4730,7 +4735,7 @@ const AudioLayerInputs = struct {
             errdefer cb.free(valid_ct);
             const starts_ct = try cb.primSlice(bank, &.{@intCast(rows)}, &.{@intCast(2 * rows)}, &.{1}, &shape);
             errdefer cb.free(starts_ct);
-            const tags_ct = try cb.primSlice(bank, &.{@intCast(2 * rows)}, &shape, &.{1}, &shape);
+            const tags_ct = if (include_tags) try cb.primSlice(bank, &.{@intCast(2 * rows)}, &shape, &.{1}, &shape) else null;
             return .{ .valid = valid_ct, .starts = starts_ct, .tags = tags_ct };
         }
         const bank = try deviceResidentFromFloat32(cb, planes, &.{ @intCast(planes.len), 1 });
@@ -4739,7 +4744,7 @@ const AudioLayerInputs = struct {
         errdefer cb.free(valid_ct);
         const starts_ct = try segmentVector(cb, allocator, bank, rows, rows);
         errdefer cb.free(starts_ct);
-        return .{ .valid = valid_ct, .starts = starts_ct, .tags = try segmentVector(cb, allocator, bank, 2 * rows, rows) };
+        return .{ .valid = valid_ct, .starts = starts_ct, .tags = if (include_tags) try segmentVector(cb, allocator, bank, 2 * rows, rows) else null };
     }
 
     fn segmentVector(cb: *const ComputeBackend, allocator: std.mem.Allocator, bank: CT, offset: usize, rows: usize) !CT {
@@ -4953,20 +4958,20 @@ fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store
             layer_inputs.segment_starts = if (self.inputs.segment_starts != null) values[audio_schedule.ExecutionInputs.segment_start] else null;
             layer_inputs.segment_valid = if (self.inputs.segment_valid != null) values[audio_schedule.ExecutionInputs.segment_valid] else null;
             var scales: [audio_schedule.ExecutionInputs.scale_count]CT = undefined;
-            @memcpy(&scales, values[audio_schedule.ExecutionInputs.scales..]);
+            @memcpy(&scales, values[audio_schedule.ExecutionInputs.scales..audio_schedule.ExecutionInputs.segment_valid]);
             layer_inputs.scales = &scales;
             return runAudioLayers(self.cb, self.a, self.store, self.cfg, values[audio_schedule.ExecutionInputs.hidden], &layer_inputs, self.start, self.end);
         }
     };
     var run = Run{ .cb = cb, .a = a, .store = store, .cfg = cfg, .inputs = inputs, .start = start, .end = end };
     const values = audioExecutionInputs(hidden, inputs);
-    return cb.audioExecutionWithArenaFunding(audioCacheConfig(cfg).key(inputs.segments, start, end), &values, &run, Run.call, defer_arena);
+    return cb.audioExecutionWithArenaFunding(audioCacheConfig(cfg).key(inputs.segments, start, end), values[0..audio_schedule.ExecutionInputs.activeCount(cb.kind() != .cuda or inputs.segment_valid != null)], &run, Run.call, defer_arena);
 }
 
 fn audioExecutionEligible(cb: *const ComputeBackend, store: *const ProjectorWeights, cfg: AudioConfig, inputs: *const AudioLayerInputs) bool {
     switch (cb.kind()) {
         .cuda => if (!audio_schedule.supportsCudaGroupedGraph(inputs.segments.len, cfg.attention_context_right) or
-            inputs.segment_starts == null or inputs.segment_valid == null) return false,
+            inputs.segment_starts == null or (cfg.source_scalar_storage != .bf16 and inputs.segment_valid == null)) return false,
         .metal => {},
         else => return false,
     }
@@ -4981,7 +4986,7 @@ fn audioExecutionInputs(hidden: CT, inputs: *const AudioLayerInputs) [audio_sche
     values[audio_schedule.ExecutionInputs.valid] = inputs.valid_ct;
     values[audio_schedule.ExecutionInputs.segment_start] = inputs.segment_starts orelse inputs.valid_ct;
     values[audio_schedule.ExecutionInputs.segment_valid] = inputs.segment_valid orelse inputs.valid_ct;
-    @memcpy(values[audio_schedule.ExecutionInputs.scales..], inputs.scales);
+    @memcpy(values[audio_schedule.ExecutionInputs.scales..audio_schedule.ExecutionInputs.segment_valid], inputs.scales);
     return values;
 }
 fn audioLayer(
@@ -9787,7 +9792,7 @@ fn checkAudioSegmentKernels(cb: ComputeBackend, _: ComputeBackend) !void {
     const masks = bind: {
         try transfer_audit.begin(&mask_transfers);
         defer transfer_audit.end();
-        break :bind try AudioLayerInputs.bindMasks(&cb, a, &mask, &spans);
+        break :bind try AudioLayerInputs.bindMasks(&cb, a, &mask, &spans, true);
     };
     defer cb.free(masks.valid);
     const validity = masks.tags.?;
@@ -9798,6 +9803,18 @@ fn checkAudioSegmentKernels(cb: ComputeBackend, _: ComputeBackend) !void {
         try std.testing.expectEqual(@as(u64, 1), mask_transfers.upload_calls);
         try std.testing.expectEqual(@as(u64, 3 * rows * @sizeOf(f32)), mask_transfers.upload_bytes);
         try std.testing.expectEqual(@as(u64, 0), mask_transfers.device_copy_calls);
+        var compact_transfers: transfer_audit.Audit = .{};
+        const compact = bind: {
+            try transfer_audit.begin(&compact_transfers);
+            defer transfer_audit.end();
+            break :bind try AudioLayerInputs.bindMasks(&cb, a, &mask, &spans, false);
+        };
+        defer cb.free(compact.valid);
+        defer cb.free(compact.starts.?);
+        try std.testing.expect(compact.tags == null);
+        try std.testing.expectEqual(@as(u64, 1), compact_transfers.upload_calls);
+        try std.testing.expectEqual(@as(u64, 2 * rows * @sizeOf(f32)), compact_transfers.upload_bytes);
+        try std.testing.expectEqual(@as(u64, 0), compact_transfers.device_copy_calls);
     }
     for ([_]f32{ -1e9, -3 }) |invalid| {
         var params = ops.Gemma4AudioLocalAttentionParams{ .rows = rows, .hidden = hidden, .heads = 2, .head_dim = dim, .chunk = 12, .context_left = 13, .context = 24, .k_scale = audioKeyScale(), .logit_cap = 50, .invalid_value = invalid, .exclude_farthest_key = true, .segmented = true };
@@ -10271,7 +10288,7 @@ fn checkSubsampleBatchGeometry(cb: ComputeBackend, _: ComputeBackend, base_frame
         const inputs = bound: {
             try transfers.begin(&audit);
             defer transfers.end();
-            break :bound try AudioLayerInputs.bindMasks(&cb, a, batch.valid_mask, batch.segments);
+            break :bound try AudioLayerInputs.bindMasks(&cb, a, batch.valid_mask, batch.segments, true);
         };
         defer cb.free(inputs.valid);
         defer cb.free(inputs.starts.?);

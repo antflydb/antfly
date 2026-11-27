@@ -73,10 +73,14 @@ pub const ExecutionInputs = struct {
     pub const relative = 1;
     pub const valid = 2;
     pub const segment_start = 3;
-    pub const segment_valid = 4;
-    pub const scales = 5;
+    pub const scales = 4;
     pub const scale_count = 12;
-    pub const count = scales + scale_count;
+    pub const segment_valid = scales + scale_count;
+    pub const count = segment_valid + 1;
+
+    pub fn activeCount(tagged: bool) usize {
+        return if (tagged) count else segment_valid;
+    }
 
     pub const Metadata = struct {
         shape: []const i64,
@@ -105,7 +109,7 @@ pub const ExecutionInputs = struct {
         inputs[hidden] = .{ .shape = &shapes[hidden], .elements = try std.math.mul(usize, rows, width) };
         inputs[relative] = .{ .shape = &shapes[relative], .elements = try std.math.mul(usize, context_left, width) };
         for (valid..count) |slot| {
-            const elements = if (slot < scales) rows else head_dim;
+            const elements = if (slot < scales or slot == segment_valid) rows else head_dim;
             shapes[slot][0] = @intCast(elements);
             inputs[slot] = .{ .shape = shapes[slot][0..1], .elements = elements };
         }
