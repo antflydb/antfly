@@ -1296,20 +1296,20 @@ and finish reasons. Both engines passed all four fixture fact checks with
 
 ### Issue closure audit
 
-This audit covers implementation head `dec232d868` and merged main
-`451f3add98`. The serving measurements below identify the revisions that
-actually ran. The seven remaining #1166 requirements map to the #1771
-implementation, deletion and qualification gates.
+This audit covers implementation head `2f2438e67f` and merged main
+`4951ca13f9`. Each serving measurement identifies the revision that ran.
+The seven remaining #1166 requirements map to the #1771 implementation,
+deletion and qualification gates.
 
 | Requirement | State | Evidence and remaining gate |
 | --- | --- | --- |
 | Shared liveness and authoritative storage | Partial | Assigned execution and admitted storage share dependency analysis. Metal image and video bind workspaces through the vision region. CUDA grouped audio and the bounded decoder still learn their composite allocation schedules. The compatibility table identifies opaque vendor workspaces with separate accounting. |
-| Stable addresses and CUDA capture | Partial | Released T5-small replayed at prefixes 1, 8, 32 and 64. Released EmbeddingGemma 2 grouped audio captured and replayed using a 38,017,792-byte arena. The context-level projector guard declines unplanned cuBLASLt staging before allocation. LightOnOCR-3-4B replayed at 97 rows with exact parity in the original 128-page, 24 GiB comparison. A repeat exercised physical contraction but denied the separately learned capture arena. Sustained wide replay and declared ordinary and capture workspace parity remain open. |
+| Stable addresses and CUDA capture | Partial | Released T5-small replayed at prefixes 1, 8, 32 and 64. Released EmbeddingGemma 2 grouped audio captured and replayed using a 38,017,792-byte arena. The context-level projector guard declines unplanned cuBLASLt staging before allocation. LightOnOCR-3-4B shared logits backing replayed at up to 98 rows with exact parity across repeated 128-page, 24 GiB runs. The full-width default had no wide replay in the ABBA pair, while the shared arena was 1.55% slower on average. Default throughput and declared ordinary and capture workspace parity remain open. |
 | Runtime-owned state and physical policy | Partial | `decoder_storage.zig` owns Gemma 4 replay capacity and `decoder_prefill.zig` owns chunk selection, eager binding and scheduled cancellation. The shared frame owner controls media view retirement. Metal HTTP acquires and pins the existing per-layer input table before decoder state advances. Residual task-bound state and cache policy need provider-specific verification and migration. |
 | Resident placement | Partial | The released fused T5-small step retired its encoder activations before decoding on CPU, Metal and CUDA. Spark recorded 393,216 device-to-device gather bytes and zero gather downloads. Imported ONNX handoff tests exercise exact output custody and host fallback on all three providers. Other eligible stateful and opaque producer/consumer pairs still need qualification. |
 | Task orchestration | Partial | Media tasks call shared frame and projection retirement owners. Scheduled generation routes publish independent outputs through runtime callbacks. Some hardware-specific paths still choose or own physical transitions in model and task code. |
 | Ownership and deletion | Partial | Nine execution source moves, removal of the 34-line legacy ONNX KV file and 24-line CUDA coverage wrapper, and removal of direct Metal frame-view, projection-slot and vision-workspace wrappers. The remaining compatibility owners retain the deletion gates in the preceding table. |
-| Common telemetry | Partial | Invocation reports distinguish gather transfers and ordering, CUDA audio learning and replay outcomes, and actual workspace bindings. The Metal audio selector uses completed GPU timing through existing frame retirement. Cross-provider lifetime attribution and coverage of opaque and pending routes remain open. |
+| Common telemetry | Partial | Invocation reports distinguish gather transfers and ordering, CUDA audio learning and replay outcomes, and actual workspace bindings. Real LightOnOCR replay reports pinned readback and attributes logits and attention scratch to their physical backing. The nested reporting fixture also verifies completed-burst counting. The Metal audio selector uses completed GPU timing through existing frame retirement. Cross-provider lifetime attribution and coverage of opaque and pending routes remain open. |
 
 At `f61c0c11f4`, a rename-aware source diff against merged main
 `4951ca13f9` shows 11,153 removed and 51,938 added lines across non-renamed
