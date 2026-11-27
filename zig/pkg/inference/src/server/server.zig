@@ -47805,7 +47805,11 @@ test "Decide extraction v2 serves classifications through HTTP handler" {
     defer ctx.deinit();
     var response = try node.extractJSON(&ctx);
     defer response.deinit();
-    errdefer std.debug.print("Decide HTTP response: status={d} body={s}\n", .{ response.status.code, response.body orelse "<absent>" });
+    errdefer {
+        std.debug.print("Decide HTTP response: status={d} body={s}\n", .{ response.status.code, response.body orelse "<absent>" });
+        const admission = node.model_manager.memoryAdmissionDiagnostic();
+        std.debug.print("Decide admission: {any}\n", .{admission});
+    }
     try std.testing.expectEqual(@as(u16, 200), response.status.code);
     var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body orelse return error.MissingResponseBody, .{});
     defer parsed.deinit();

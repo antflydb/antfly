@@ -2423,8 +2423,8 @@ zero skips. The captured audio fixture reshaped a held output into a
 retained device view, consumed it through eager execution, and wrote
 an independent result with zero device copies. The ONNX cache-input
 gather fixture also passed using the shared CUDA batch-copy submission.
-Its single synthetic 48-row timing was 1.92 ms serial and 0.97 ms
-fused. Controlled serving comparisons are still required. The log hash
+Its synthetic 48-row fixture accumulated 1.92 ms serial and 0.97 ms
+fused across 12 interleaved samples per route. Controlled serving comparisons are still required. The log hash
 is `372d4c9b65963e47f58e9a587255cae2990fd169ac2cf4c424587c78c8d7d12d`.
 
 A same-binary Metal ABBA test on top of `7fac50bbb4` compared a

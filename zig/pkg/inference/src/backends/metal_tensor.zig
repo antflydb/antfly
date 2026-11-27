@@ -746,16 +746,22 @@ pub const MetalTensor = struct {
     /// shares that pin. The original backing reference remains independent.
     /// Allocate the ownership record before taking the pin so OOM is atomic.
     pub fn deviceLeasedView(allocator: std.mem.Allocator, source: *const MetalTensor, lease: *@import("../ops/physical_storage.zig").Lease, dims: []const i32, dtype: DType) !MetalTensor {
+        return deviceLeasedViewAt(allocator, source, lease, 0, dims, dtype);
+    }
+
+    pub fn deviceLeasedViewAt(allocator: std.mem.Allocator, source: *const MetalTensor, lease: *@import("../ops/physical_storage.zig").Lease, offset: usize, dims: []const i32, dtype: DType) !MetalTensor {
         const device = source.device orelse return error.UnsupportedTensorType;
         const handle = source.deviceHandle() orelse return error.ReleasedDeviceBuffer;
-        if (dims.len > max_dims or device.byte_offset % dtype.byteSize() != 0) return error.UnsupportedTensorType;
+        const start = try std.math.add(usize, device.byte_offset, offset);
+        if (dims.len > max_dims or start % dtype.byteSize() != 0) return error.UnsupportedTensorType;
         var elements: usize = 1;
         for (dims) |extent| {
             if (extent < 0) return error.InvalidTensorShape;
             elements = try std.math.mul(usize, elements, @intCast(extent));
         }
         const bytes = try std.math.mul(usize, elements, dtype.byteSize());
-        if (bytes > device.byte_len) return error.InvalidTensorShape;
+        if (offset > device.byte_len or bytes > device.byte_len - offset or
+            offset > lease.byte_size or bytes > lease.byte_size - offset) return error.InvalidTensorShape;
         const ref = try allocator.create(DeviceBufferRef);
         ref.* = .{
             .handle = handle,
@@ -771,7 +777,7 @@ pub const MetalTensor = struct {
         };
         lease.retain();
         memoryAdd(.device_borrowed_tensors_created, 1);
-        return deviceView(ref, device.byte_offset, bytes, dims, dtype);
+        return deviceView(ref, start, bytes, dims, dtype);
     }
 
     /// True only for storage whose execution-plan lease pins every view and

@@ -11824,6 +11824,36 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return error.InvalidPhysicalTransferSize;
         try original.uploadBytes(bytes);
     }
+    fn gatherDeviceColumnsOp(ctx: *anyopaque, columns: []const ops.KernelBackend.DeviceRowColumn) !bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const runtime = self.provider_impl.raw_decode_runtime;
+        if (!metal_runtime_mod.hasActiveFrame(runtime) or metal_runtime_mod.hasSubmittedFrame(runtime)) return false;
+        var spans: [512]metal_runtime_mod.BufferCopySpan = undefined;
+        var count: usize = 0;
+        for (columns) |column| {
+            if (column.sources.len == 0 or column.sources.len > spans.len - count) return false;
+            const target = toBuf(column.output).metal_tensor orelse return error.InvalidPhysicalTransferSize;
+            if (target.dtype != .f32 or target.physicalLease() == null or target.isReadOnlyPhysical()) return error.InvalidPhysicalTransferSize;
+            const destination = target.deviceHandle() orelse return error.InvalidPhysicalTransferSize;
+            var cursor = target.deviceByteOffset();
+            const end = try std.math.add(usize, cursor, target.deviceByteLen());
+            for (column.sources, spans[count..][0..column.sources.len]) |source, *span| {
+                const value = toBuf(source).metal_tensor orelse return error.InvalidPhysicalTransferSize;
+                const device = value.deviceHandle() orelse return error.InvalidPhysicalTransferSize;
+                const bytes = value.deviceByteLen();
+                if (device == destination or value.dtype != .f32 or bytes == 0 or bytes > end - cursor) return error.InvalidPhysicalTransferSize;
+                span.* = .{ .source = device, .destination = destination, .source_offset = value.deviceByteOffset(), .destination_offset = cursor, .length = bytes };
+                cursor += bytes;
+            }
+            if (cursor != end) return error.InvalidPhysicalTransferSize;
+            count += column.sources.len;
+        }
+        if (count == 0) return false;
+        if (metal_runtime_mod.termite_metal_buffer_copy_spans(runtime, &spans, count) != 0) return error.MetalBufferCopyFailed;
+        for (spans[0..count]) |span| @import("../execution/transfer_audit.zig").deviceCopy(span.length);
+        return true;
+    }
+
     fn gatherDeviceRowsOp(ctx: *anyopaque, output: CT, sources: []const CT) !void {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const target = toBuf(output).metal_tensor orelse return error.InvalidPhysicalTransferSize;
@@ -11936,7 +11966,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn physicalTensorViewOp(ctx: *anyopaque, request: ops.physical_storage.View) anyerror!?CT {
-        if (request.byte_offset != 0) return null;
+        if (request.byte_offset != 0 and (request.dtype != .f32 or request.layout_source != null)) return null;
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const dtype = hostInputMetalDType(request.dtype) orelse return null;
         if (request.storage.backend.ptr != ctx or request.storage.backend.kind() != .metal) return error.InvalidPhysicalStorageBackend;
@@ -11963,7 +11993,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         if (bufHasAnyQuantizedStorage(storage) or hasHostView(storage)) return null;
         const source = if (storage.metal_tensor) |*tensor| tensor else return null;
-        var view = try MetalTensor.deviceLeasedView(self.allocator, source, request.storage, request.shape, dtype);
+        var view = try MetalTensor.deviceLeasedViewAt(self.allocator, source, request.storage, request.byte_offset, request.shape, dtype);
         errdefer self.retireTemporaryWorkspaceValue(&view);
         return self.ctFromOwnedMetalTensor(view);
     }
@@ -42895,7 +42925,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return supportsAssignedDescriptor(descriptor);
     }
 
-    const kernel_backend_impl: ops.KernelBackend = .{ .denseDecoder = &dense_decoder_services, .ownedPayloadServices = &owned_payload_services, .retainImmutableTensor = retainImmutableTensorOp, .standaloneOutputBytes = standaloneOutputBytesOp, .pooledOutputStorage = pooledOutputStorageOp, .gatherDeviceRows = gatherDeviceRowsOp, .regionPolicyKey = denseRegionPolicyKey, .claimRegionExecutionProfile = claimDenseProjectionProfile, .prepareRegionRoutes = prepareDenseProjectionRegions, .regionRoutesInOrdinaryFrame = true, .hostInputRequirements = hostInputRequirementsOp, .createHostInput = createHostInputOp, .hostInputViewExclusive = hostInputViewExclusiveOp, .createMetadataAlias = createMetadataAliasOp, .materializesOutput = materializesOutputOp, .physicalReplayReshapeViews = true, .implementation_table = &vtable_impl, .acceptsImplementation = acceptsPhysicalImplementation, .storageOwnership = storageOwnershipOp, .physicalLiteralBindingSupported = physicalLiteralBindingSupportedOp, .writePhysicalFloat32 = writePhysicalFloat32Op, .physicalLiteralInitializer = physicalLiteralInitializerOp, .copyPhysicalInput = copyPhysicalInputOp, .copyPhysicalIndexInput = copyPhysicalIndexInputOp, .validatePhysicalIndexInput = validatePhysicalIndexInputOp, .readFloat32Into = readFloat32IntoOp, .physical_storage_policy = &physical_storage_policy, .physicalTensorView = physicalTensorViewOp, .assignedKernelSupported = assignedKernelSupportedOp, .runAssignedKernel = runAssignedKernelOp, .assignedKernelWorkspace = assignedKernelWorkspaceOp, .prepareKernelRoute = prepareKernelRouteOp };
+    const kernel_backend_impl: ops.KernelBackend = .{ .denseDecoder = &dense_decoder_services, .ownedPayloadServices = &owned_payload_services, .retainImmutableTensor = retainImmutableTensorOp, .standaloneOutputBytes = standaloneOutputBytesOp, .pooledOutputStorage = pooledOutputStorageOp, .gatherDeviceRows = gatherDeviceRowsOp, .gatherDeviceColumns = gatherDeviceColumnsOp, .regionPolicyKey = denseRegionPolicyKey, .claimRegionExecutionProfile = claimDenseProjectionProfile, .prepareRegionRoutes = prepareDenseProjectionRegions, .regionRoutesInOrdinaryFrame = true, .hostInputRequirements = hostInputRequirementsOp, .createHostInput = createHostInputOp, .hostInputViewExclusive = hostInputViewExclusiveOp, .createMetadataAlias = createMetadataAliasOp, .materializesOutput = materializesOutputOp, .physicalReplayReshapeViews = true, .implementation_table = &vtable_impl, .acceptsImplementation = acceptsPhysicalImplementation, .storageOwnership = storageOwnershipOp, .physicalLiteralBindingSupported = physicalLiteralBindingSupportedOp, .writePhysicalFloat32 = writePhysicalFloat32Op, .physicalLiteralInitializer = physicalLiteralInitializerOp, .copyPhysicalInput = copyPhysicalInputOp, .copyPhysicalIndexInput = copyPhysicalIndexInputOp, .validatePhysicalIndexInput = validatePhysicalIndexInputOp, .readFloat32Into = readFloat32IntoOp, .physical_storage_policy = &physical_storage_policy, .physicalTensorView = physicalTensorViewOp, .assignedKernelSupported = assignedKernelSupportedOp, .runAssignedKernel = runAssignedKernelOp, .assignedKernelWorkspace = assignedKernelWorkspaceOp, .prepareKernelRoute = prepareKernelRouteOp };
 
     const vtable_impl: ops.ComputeBackend.VTable = blk: {
         var vt = native_compute_mod.vtable_impl;

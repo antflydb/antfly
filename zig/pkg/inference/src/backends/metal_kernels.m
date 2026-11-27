@@ -73441,6 +73441,44 @@ int termite_metal_buffer_copy(
     }
 }
 
+typedef struct {
+    void *source;
+    void *destination;
+    size_t source_offset;
+    size_t destination_offset;
+    size_t length;
+} termite_metal_buffer_copy_span;
+
+// The caller retains every span through retirement of this active frame.
+int termite_metal_buffer_copy_spans(termite_metal_decode_runtime *runtime,
+    const termite_metal_buffer_copy_span *spans, size_t count) {
+    if (!runtime || !runtime->active_frame_cb || runtime->submitted_frame_cb || !spans || !count || count > 512) return -1;
+    @autoreleasepool {
+        for (size_t i = 0; i < count; ++i) {
+            const termite_metal_buffer_copy_span *span = spans + i;
+            if (!span->source || !span->destination || !span->length || span->source == span->destination) return -2;
+            id<MTLBuffer> src = (__bridge id<MTLBuffer>)span->source;
+            id<MTLBuffer> dst = (__bridge id<MTLBuffer>)span->destination;
+            if (src.device != runtime->device || dst.device != runtime->device ||
+                span->source_offset > src.length || span->length > src.length - span->source_offset ||
+                span->destination_offset > dst.length || span->length > dst.length - span->destination_offset) return -3;
+        }
+        id<MTLCommandBuffer> command_buffer = runtime->active_frame_cb;
+        termite_metal_record_active_frame_blit_source_for_runtime(runtime, command_buffer, TERMITE_METAL_BLIT_SOURCE_BUFFER_COPY);
+        id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder_for_runtime(runtime, command_buffer);
+        if (blit == nil) return -4;
+        blit.label = @"buffer-copy-spans";
+        for (size_t i = 0; i < count; ++i) {
+            const termite_metal_buffer_copy_span *span = spans + i;
+            [blit copyFromBuffer:(__bridge id<MTLBuffer>)span->source sourceOffset:span->source_offset
+                toBuffer:(__bridge id<MTLBuffer>)span->destination destinationOffset:span->destination_offset size:span->length];
+            termite_metal_telemetry_copy(TERMITE_METAL_COPY_BYTES, TERMITE_METAL_COPY_CALLS, span->length);
+        }
+        [blit endEncoding];
+        return 0;
+    }
+}
+
 // A bounded gather owns every staging buffer until its single completion
 // fence. Host memory is copied once, directly into Shared upload storage.
 typedef struct {

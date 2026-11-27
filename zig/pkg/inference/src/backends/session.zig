@@ -3299,6 +3299,16 @@ pub const Session = struct {
     /// A mixed stage has one admission boundary. Resident activations stay with
     /// their producer; only host controls are imported into the selected context.
     pub fn runStageInputsWithControl(self: Session, inputs: []const StageInput, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !?ResidentOutputs {
+        return self.runStageInputsAdmitted(inputs, allocator, control, false);
+    }
+
+    /// Direct callers holding no numerical or provider gate can retire an
+    /// evicted specialization before acquiring the next stage's admission.
+    pub fn runStageInputsBeforeExecution(self: Session, inputs: []const StageInput, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !?ResidentOutputs {
+        return self.runStageInputsAdmitted(inputs, allocator, control, true);
+    }
+
+    fn runStageInputsAdmitted(self: Session, inputs: []const StageInput, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, comptime before_execution: bool) !?ResidentOutputs {
         if (!self.supportsStageInputs(inputs)) return null;
         if (control != null and self.vtable.runResidentInputsWithControl == null) return null;
         if (control) |active| try active.check();
@@ -3319,7 +3329,12 @@ pub const Session = struct {
             };
         }
         const batch = if (info.len > 0) positiveDimension(info[0].shape, 0) else 1;
-        var permit = try self.admitShapeRequest(.{ .stage_inputs = .{ .info = info, .values = inputs } }, try self.planShapes(info, batch), allocator, control);
+        const shapes: ShapeInputs = .{ .stage_inputs = .{ .info = info, .values = inputs } };
+        const request = try self.planShapes(info, batch);
+        var permit = if (before_execution)
+            try self.admitShapeRequestBeforeExecution(shapes, request, allocator, control)
+        else
+            try self.admitShapeRequest(shapes, request, allocator, control);
         defer permit.deinit();
         try permit.prepareResidentOutputRetirement();
         var outputs = (try @import("../execution/invocation_observation.zig").callStage(self.invocation_diagnostics, inputs, RunPermit.runStageInputsWithinBoundary, .{ &permit, inputs, allocator, control })) orelse return null;

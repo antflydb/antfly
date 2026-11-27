@@ -735,13 +735,24 @@ fn gatherStageInputs(first: *const Ticket, items: []const micro.ExecuteItem, ten
     const prepared_storage = @import("../execution/prepared_storage_admission.zig");
     var requirements: std.ArrayList(prepared_storage.Requirement) = .empty;
     defer requirements.deinit(allocator);
+    const shared_bank = backend.kind() == .metal;
+    const alignment = if (shared_bank) try storage.minimumAlignment(backend.*) else 1;
+    var bank_bytes: usize = 0;
     var bytes: usize = 0;
     for (first.stage.?, tensors) |source, tensor| if (source == .resident) {
         const size = try denseBytes(tensor.shape, @sizeOf(f32));
+        if (shared_bank) {
+            bank_bytes = try std.math.add(usize, try alignedGatherOffset(bank_bytes, alignment), size);
+            continue;
+        }
         const bound = try storage.reservationBytes(backend.*, .{ .byte_size = size, .admitted = true });
         bytes = try std.math.add(usize, bytes, bound);
         try requirements.append(allocator, .{ .backend = backend.kind(), .class = .activation, .bytes = bound });
     };
+    if (bank_bytes != 0) {
+        bytes = try storage.reservationBytes(backend.*, .{ .byte_size = bank_bytes, .admitted = true });
+        try requirements.append(allocator, .{ .backend = .metal, .class = .activation, .bytes = bytes });
+    }
     const storage_admission = @import("../execution/storage_admission.zig");
     const Reserve = struct {
         lease: *@import("../runtime/tier/memory.zig").AdmissionLease,
@@ -797,15 +808,23 @@ fn gatherStageInputs(first: *const Ticket, items: []const micro.ExecuteItem, ten
     defer scope.deinitChecked() catch fatal();
     if (backend.kind() == .metal and (backend.decoderRuntimeHasActiveFrame() or backend.decoderRuntimeHasSubmittedFrame())) return error.ResidentGatherUnavailable;
 
+    const bank = if (shared_bank)
+        (try storage.Lease.createAdmitted(allocator, backend.*, bank_bytes, null, .activation, capability)) orelse return error.ResidentGatherUnavailable
+    else
+        null;
+    defer if (bank) |lease| lease.releaseWithBoundary(epoch);
+    var bank_offset: usize = 0;
     for (first.stage.?, tensors, values) |source, tensor, *value| {
         value.* = if (source == .resident) blk: {
             const size = try denseBytes(tensor.shape, @sizeOf(f32));
-            const lease = (try storage.Lease.createAdmitted(allocator, backend.*, size, null, .activation, capability)) orelse return error.ResidentGatherUnavailable;
-            defer lease.releaseWithBoundary(epoch);
+            const lease = bank orelse (try storage.Lease.createAdmitted(allocator, backend.*, size, null, .activation, capability)) orelse return error.ResidentGatherUnavailable;
+            defer if (bank == null) lease.releaseWithBoundary(epoch);
+            const offset = if (bank != null) try alignedGatherOffset(bank_offset, alignment) else 0;
+            bank_offset = try std.math.add(usize, offset, size);
             if (lease.backing_byte_size == null) return error.ResidentGatherUnavailable;
             var dims: [8]i32 = undefined;
             for (tensor.shape, dims[0..tensor.shape.len]) |dim, *dest| dest.* = std.math.cast(i32, dim) orelse return error.ResidentGatherUnavailable;
-            const ct = (try kernels.physicalTensorView.?(backend.ptr, .{ .storage = lease, .shape = dims[0..tensor.shape.len] })) orelse return error.ResidentGatherUnavailable;
+            const ct = (try kernels.physicalTensorView.?(backend.ptr, .{ .storage = lease, .shape = dims[0..tensor.shape.len], .byte_offset = offset })) orelse return error.ResidentGatherUnavailable;
             break :blk .{ .resident = .{ .value = ct, .backend = backend, .shape = tensor.shape, .estimated_bytes = size } };
         } else .{ .host = tensor };
         result.initialized += 1;
@@ -881,6 +900,10 @@ fn gatherStageInputs(first: *const Ticket, items: []const micro.ExecuteItem, ten
     }
     try scope.finish();
     return result;
+}
+
+fn alignedGatherOffset(offset: usize, alignment: usize) !usize {
+    return std.mem.alignBackward(usize, try std.math.add(usize, offset, alignment - 1), alignment);
 }
 
 fn denseBytes(shape: []const i64, element_bytes: usize) !usize {
@@ -2444,18 +2467,19 @@ test "tensor microbatch released T5-small fuses suffixes after encoder retiremen
     defer broker.deinit();
     const Runtime = @import("../execution/seq2seq_runtime.zig");
     const control: Control = .{ .native_call_policy = .in_process };
-    const DispatchContext = struct { broker: *micro.Broker, gate: std.atomic.Mutex = .unlocked };
+    const DispatchContext = struct { broker: *micro.Broker, gate: std.atomic.Mutex = .unlocked, wait_us: u64 = 20_000 };
     var dispatch_context: DispatchContext = .{ .broker = &broker };
     const Peer = struct {
         state: Runtime.State,
         token: i64,
+        position: usize = 4,
         dispatch: *DispatchContext,
         row: ?[]f32 = null,
         failure: ?anyerror = null,
 
         fn stage(raw: *anyopaque, task: micro.Task, allocator: std.mem.Allocator, target: session_mod.Session, inputs: []const StageInput, active: ?Control) !session_mod.ResidentOutputs {
             const dispatch: *DispatchContext = @ptrCast(@alignCast(raw));
-            return runStage(dispatch.broker, allocator, std.testing.io, task, target, target.execution_gate orelse &dispatch.gate, inputs, active, null, 20_000) catch |err| {
+            return runStage(dispatch.broker, allocator, std.testing.io, task, target, target.execution_gate orelse &dispatch.gate, inputs, active, null, dispatch.wait_us) catch |err| {
                 std.debug.print("T5 stage dispatch failed: {s}\n", .{@errorName(err)});
                 return err;
             };
@@ -2465,14 +2489,18 @@ test "tensor microbatch released T5-small fuses suffixes after encoder retiremen
             return error.UnexpectedHostDispatch;
         }
 
-        fn run(peer: *@This()) void {
-            peer.row = peer.state.stepResidentDispatched(.{ .position = 4, .tokens = &.{peer.token} }, control, .{
-                .ptr = peer.dispatch,
+        fn step(state: *Runtime.State, position: usize, token: i64, dispatch: *DispatchContext) ![]f32 {
+            return state.stepResidentDispatched(.{ .position = position, .tokens = &.{token} }, control, .{
+                .ptr = dispatch,
                 .task = .rewrite,
                 .run_fn = host,
                 .run_stage_fn = stage,
                 .accepts_shape_only_stage_inputs = true,
-            }) catch |err| {
+            });
+        }
+
+        fn run(peer: *@This()) void {
+            peer.row = step(&peer.state, peer.position, peer.token, peer.dispatch) catch |err| {
                 peer.failure = err;
                 return;
             };
@@ -2532,4 +2560,80 @@ test "tensor microbatch released T5-small fuses suffixes after encoder retiremen
     const report = broker.snapshot(std.testing.io);
     try std.testing.expectEqual(@as(u64, 1), report.native_batches);
     try std.testing.expectEqual(@as(u64, peers.len), report.native_items);
+
+    if (platform.env.getenvBool("ANTFLY_ONNX_T5_BENCH_ABBA")) {
+        _ = session.configureExecutionDiagnostics(false);
+        var serial_states: [peers.len]Runtime.State = undefined;
+        var serial_ready: usize = 0;
+        defer for (serial_states[0..serial_ready]) |*state| state.deinit();
+        for (&serial_states, 0..) |*slot, index| {
+            var hidden = try Tensor.initFloat32(a, "encoder_hidden_states", &.{ 1, 4, 512 }, &(@as([2048]f32, @splat(0.01))));
+            defer hidden.deinit();
+            slot.* = (try Runtime.State.init(a, session, .{ .host = hidden }, &.{ 1, 1, 1, 1 }, 32128)) orelse return error.UnqualifiedMergedDecoder;
+            serial_ready += 1;
+            const initial = [_]i64{ 0, 1, 2, @intCast(3 + index), @intCast(8 + index) };
+            const row = try slot.stepResident(.{ .position = 0, .tokens = &initial }, control);
+            a.free(row);
+            try std.testing.expect(slot.detachEncoderPayload());
+        }
+        for (&peers) |*peer| {
+            shared_allocator.free(peer.row.?);
+            peer.row = null;
+        }
+        const direct_serial = platform.env.getenvBool("ANTFLY_ONNX_T5_BENCH_DIRECT_SERIAL");
+        const samples_per_arm = 8;
+        var positions = [2]usize{ 5, 5 };
+        var serial_ids: [2 * samples_per_arm][peers.len]usize = undefined;
+        for ([_]bool{ false, true, true, false }, 0..) |fused, arm| {
+            const route: usize = @intFromBool(fused);
+            dispatch_context.wait_us = if (fused) 20_000 else 0;
+            for (0..samples_per_arm) |sample| {
+                const position = positions[route];
+                const tokens = [2]i64{ @intCast(position + 10), @intCast(position + 20) };
+                var selected: [peers.len]usize = undefined;
+                var serial_rows: [peers.len]?[]f32 = @splat(null);
+                defer for (serial_rows) |row| if (row) |values| a.free(values);
+                const start = platform.time.monotonicNs();
+                if (fused) {
+                    var batch_group = std.Io.Group.init;
+                    defer batch_group.cancel(std.testing.io);
+                    for (&peers, tokens) |*peer, token| {
+                        peer.position = position;
+                        peer.token = token;
+                        try batch_group.concurrent(std.testing.io, Peer.run, .{peer});
+                    }
+                    try batch_group.await(std.testing.io);
+                } else {
+                    for (&serial_states, tokens, &serial_rows) |*state, token, *row| {
+                        row.* = if (direct_serial)
+                            try state.stepResident(.{ .position = position, .tokens = &.{token} }, control)
+                        else
+                            try Peer.step(state, position, token, &dispatch_context);
+                    }
+                }
+                const elapsed = platform.time.monotonicNs() - start;
+                for (&peers, serial_rows, &selected) |*peer, serial_row, *id| {
+                    if (peer.failure) |err| return err;
+                    const row = (if (fused) peer.row else serial_row) orelse return error.MissingMergedDecoderResult;
+                    id.* = std.mem.indexOfMax(f32, row);
+                    if (fused) {
+                        shared_allocator.free(row);
+                        peer.row = null;
+                    }
+                }
+                const index = position - 5;
+                if (arm == 0) {
+                    serial_ids[index] = selected;
+                } else if (arm == 3) {
+                    try std.testing.expectEqualDeep(serial_ids[index], selected);
+                } else if (index < samples_per_arm) {
+                    try std.testing.expectEqualDeep(serial_ids[index], selected);
+                } else {
+                    serial_ids[index] = selected;
+                }
+                positions[route] += 1;
+                std.debug.print("T5 release suffix arm={d} fused={} sample={d} position={d} ns={d}\n", .{ arm, fused, sample, position, elapsed });
+            }
+        }
+    }
 }

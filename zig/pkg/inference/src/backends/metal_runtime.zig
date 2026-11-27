@@ -20208,6 +20208,14 @@ pub extern fn termite_metal_buffer_copy(
     dst_offset: usize,
     length: usize,
 ) c_int;
+pub const BufferCopySpan = extern struct {
+    source: *anyopaque,
+    destination: *anyopaque,
+    source_offset: usize,
+    destination_offset: usize,
+    length: usize,
+};
+pub extern fn termite_metal_buffer_copy_spans(runtime: ?*RawMetalDecodeRuntime, spans: [*]const BufferCopySpan, count: usize) c_int;
 pub const BufferGatherSource = extern struct {
     device: ?*anyopaque = null,
     host: ?*const anyopaque = null,
