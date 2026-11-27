@@ -2336,3 +2336,11 @@ pages/s and reached 97-row replay. GPU-domain scratch pressure still
 occurred under the unchanged cap. The test and serving receipts are
 `52d4ce2752af428fca04d736afee3462b2ac223ac34608b2d70fb7daef5eb73d`
 and `eeac946d572505a2902d3cb7c2bd5398aa9e25f87005cce8d6ac87c557053561`.
+
+The order-controlled repeat compared `25f946f673` with `0af60f7b4d`
+using the same shared-arena configuration and 24 GiB scratch cap.
+All four runs matched all 256 pages and reached 97-row replay. In
+ABBA order, the rates were 7.2905, 7.3832, 7.1901 and 7.2756 pages/s.
+Mean rates differed by 0.05%. The pair supports throughput parity
+for this reader repair. The number of wide replays varied from two
+to six per arm, and sustained wide replay remains a separate gate.
