@@ -5338,10 +5338,15 @@ fn audioLocalAttention(cb: *const ComputeBackend, allocator: std.mem.Allocator, 
     if (inputs.segments.len == 0) return audioLocalAttentionSingle(cb, allocator, cfg, q, k, v, rel, layer, inputs);
     if (layer >= inputs.scales.len) return error.InvalidTensorShape;
     const device_attention = cfg.attention_context_right == 0 and !audioHostOps().attention;
-    if (inputs.segment_valid) |validity| if (device_attention) {
-        var params = try audioLocalAttentionParams(cfg, inputs.valid_mask.len);
-        params.segmented = true;
-        if (try cb.gemma4AudioLocalAttention(q, k, v, rel, inputs.scales[layer], validity, params)) |result| return result;
+    const params = if (device_attention) try audioLocalAttentionParams(cfg, inputs.valid_mask.len) else null;
+    if (inputs.segment_valid) |validity| if (params) |regular| {
+        // CUDA's independent source schedule takes explicit clip spans and
+        // one destination, using the ordinary validity plane for each clip.
+        if (!(cb.kind() == .cuda and regular.arithmetic == .independent_f32 and regular.publication == .bf16_values_f32)) {
+            var segmented = regular;
+            segmented.segmented = true;
+            if (try cb.gemma4AudioLocalAttention(q, k, v, rel, inputs.scales[layer], validity, segmented)) |result| return result;
+        }
     };
     var remaining = inputs.valid_mask.len;
     for (inputs.segments) |span| {
@@ -5351,15 +5356,14 @@ fn audioLocalAttention(cb: *const ComputeBackend, allocator: std.mem.Allocator, 
     if (remaining != 0) return error.InvalidInputShape;
     const output = (try cb.allocUninitF32Shape(&.{ @intCast(inputs.valid_mask.len), @intCast(cfg.audio_hidden) })) orelse return error.UnsupportedResidentGemma4Audio;
     errdefer cb.free(output);
-    if (device_attention and cb.vtable.regions.audio_attention.localRelativeInto != null) {
+    if (params) |regular| if (cb.vtable.regions.audio_attention.localRelativeInto != null) {
         try cb.checkExecutionControl();
-        const params = try audioLocalAttentionParams(cfg, inputs.valid_mask.len);
-        if (try cb.localRelativeAttentionInto(q, k, v, rel, inputs.scales[layer], inputs.valid_ct, params, .{
+        if (try cb.localRelativeAttentionInto(q, k, v, rel, inputs.scales[layer], inputs.valid_ct, regular, .{
             .tensor = output,
             .first_row = 0,
             .segments = inputs.segments,
         })) return output;
-    }
+    };
     var offset: usize = 0;
     for (inputs.segments) |span| {
         try cb.checkExecutionControl();
