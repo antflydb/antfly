@@ -696,7 +696,7 @@ test "captured graph head packets fund the exact smaller bank and invalidate a f
     phase.mode = .storage;
     phase.admission_pressure = .live_host;
     try std.testing.expect(!phase.reduceHeadPacketAfterDenial());
-    phase.admission_pressure = .domain_scratch;
+    phase.admission_pressure = .{ .domain_scratch = .gpu };
     for ([_]usize{ 16, 8 }) |packet_rows| {
         try std.testing.expect(phase.reduceHeadPacketAfterDenial());
         try std.testing.expectEqual(packet_rows * packet.vocab * 4, phase.storage_layout.head_bytes);
