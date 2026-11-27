@@ -841,7 +841,12 @@ pub const Executor = struct {
         }
         fn build(self: *Executor, key: *Key, claimed: []const runtime.scheduler.native_generate.StepItem, items: []MixedBatchDecodeItem, manager: *@import("../runtime/kv/manager.zig").KvManager, storage: *@import("../runtime/kv/storage_runtime.zig").KvStorageRuntime, embedding_out: *?ops.CT, head_out: *?ops.CT, comptime reserve: bool, decline_code: *CudaGraphDecline) !?Info {
             const C = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
-            var future: [128]usize = undefined;
+            const attention = @import("../ops/cuda/paged_attention_bf16.zig");
+            const graph = @import("../ops/cuda/bounded_decode_graph.zig");
+            const page_size = storage.storage.config.page_size_tokens;
+            if (page_size == 0) return decline(decline_code, .context_or_page_capacity);
+            var future: [graph.max_rows]usize = undefined;
+            var minimum_packet_blocks: usize = 0;
             var max_future: usize = 0;
             for (claimed, items, 0..) |item, mixed, i| {
                 const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
@@ -853,9 +858,16 @@ pub const Executor = struct {
                     mixed.state.qwen35_linear_cache == null) return decline(decline_code, .unsupported_lane_state);
                 const remaining = work.remaining_tokens;
                 future[i] = try std.math.add(usize, item.total_sequence_len, remaining);
-                if (future[i] > @import("../ops/cuda/paged_attention_bf16.zig").max_native_context_tokens) return decline(decline_code, .context_or_page_capacity);
+                if (future[i] > attention.max_native_context_tokens) return decline(decline_code, .context_or_page_capacity);
                 if (storage.storage.config.sliding_window_size) |window|
                     if (future[i] > window) return decline(decline_code, .context_or_page_capacity);
+                // Reject a packet that cannot fit before growing either KV owner.
+                if (i % attention.max_packet_rows == 0) minimum_packet_blocks = 0;
+                const owned = storage.sequenceMut(mixed.state.sequence_id.?) catch return decline(decline_code, .missing_kv_binding);
+                const existing = try std.math.add(usize, owned.block_table.blocks.items.len, owned.reserved_tail_blocks.items.len);
+                const required = @max(existing, try std.math.divCeil(usize, future[i], page_size));
+                if (required > attention.max_blocks - minimum_packet_blocks) return decline(decline_code, .context_or_page_capacity);
+                minimum_packet_blocks += required;
                 max_future = @max(max_future, future[i]);
             }
             if (reserve) {
@@ -890,7 +902,7 @@ pub const Executor = struct {
                     if (cache.layers.len != first_cache.layers.len) return decline(decline_code, .incompatible_layer_state);
                     const state = &cache.layers[layer_index].cuda_device;
                     if (!C.lightOnGraphStateOwned(self.context.cb, state)) return decline(decline_code, .incompatible_layer_state);
-                    if (row % 64 == 0) for (state.weights) |weight| try key.add(weight.ptr);
+                    if (row % @import("../ops/cuda/gated_delta.zig").max_packet_rows == 0) for (state.weights) |weight| try key.add(weight.ptr);
                     // BF16 convolution filters are widened into independently
                     // owned page copies. The batch kernel already uses the first
                     // page's copy for all peers; prove the immutable source IDs,
@@ -906,7 +918,7 @@ pub const Executor = struct {
             // This adds physical capacity without making a future token visible.
             // Each captured launch snapshots a bounded flat block table, so long
             // pages share its capacity instead of each being capped at 64 blocks.
-            const packet_rows = @import("../ops/kernel_geometry.zig").cuda_paged_decode_packet_rows;
+            const packet_rows = attention.max_packet_rows;
             var packet_blocks: usize = 0;
             for (items, 0..) |item, i| {
                 if (i % packet_rows == 0) packet_blocks = 0;
@@ -924,7 +936,7 @@ pub const Executor = struct {
                 const owned_sequence: ?*@import("../runtime/kv/storage_runtime.zig").SequenceState = if (!reserve) try storage.sequenceMut(sequence) else null;
                 const block_count = if (owned_sequence) |value| try std.math.add(usize, value.block_table.blocks.items.len, value.reserved_tail_blocks.items.len) else blocks.len;
                 if (storage.storage.config.page_size_tokens == 0 or try std.math.mul(usize, block_count, storage.storage.config.page_size_tokens) < future[i]) return decline(decline_code, .context_or_page_capacity);
-                const packet_limit = @import("../ops/cuda/paged_attention_bf16.zig").max_blocks;
+                const packet_limit = attention.max_blocks;
                 if (block_count == 0 or block_count > packet_limit - packet_blocks) return decline(decline_code, .context_or_page_capacity);
                 if (key.len > key.words.len - 3 or block_count > key.words.len - key.len - 3) return decline(decline_code, .context_or_page_capacity);
                 packet_blocks += block_count;
