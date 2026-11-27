@@ -905,9 +905,10 @@ pub const Executor = struct {
             // This adds physical capacity without making a future token visible.
             // Each captured launch snapshots a bounded flat block table, so long
             // pages share its capacity instead of each being capped at 64 blocks.
+            const packet_rows = @import("../ops/kernel_geometry.zig").cuda_paged_decode_packet_rows;
             var packet_blocks: usize = 0;
             for (items, 0..) |item, i| {
-                if (i % 64 == 0) packet_blocks = 0;
+                if (i % packet_rows == 0) packet_blocks = 0;
                 const state = item.state;
                 const sequence = state.sequence_id.?;
                 const table = storage.blockTable(sequence) orelse return decline(decline_code, .missing_kv_binding);

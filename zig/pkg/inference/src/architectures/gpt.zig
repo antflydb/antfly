@@ -10488,12 +10488,13 @@ fn runPackedQwenAttention(
     errdefer cb.free(result);
     var offset: usize = 0;
     var index: usize = 0;
+    const max_cuda_packet_rows = @import("../ops/kernel_geometry.zig").cuda_paged_decode_packet_rows;
     while (index < lengths.len) {
         const view = views[index];
         const len = lengths[index];
         var count: usize = 1;
         if (len == 1 and view.per_item_mode == .paged_decode) {
-            while ((cb.kind() != .cuda or count < 64) and index + count < lengths.len and lengths[index + count] == 1 and views[index + count].per_item_mode == .paged_decode) : (count += 1) {}
+            while ((cb.kind() != .cuda or count < max_cuda_packet_rows) and index + count < lengths.len and lengths[index + count] == 1 and views[index + count].per_item_mode == .paged_decode) : (count += 1) {}
         }
         const rows = if (count > 1) count else len;
         const q = try cb.sliceRows2D(a, Q, offset, rows, width);

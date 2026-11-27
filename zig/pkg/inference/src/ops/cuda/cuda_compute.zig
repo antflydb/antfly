@@ -32733,13 +32733,13 @@ fn gqaAttentionMatch(self: *CudaCompute, owner: *CudaKvDeviceStorage, binding: *
 // Snapshot every page table in the launch packet so peers never observe the
 // mutable per-sequence upload table used by the singleton fallback.
 fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention: ops.AttentionContext, views: []const ops.KvBatchView, heads: usize, kv_heads: usize, dim: usize) !?CT {
+    const module = @import("paged_attention_bf16.zig");
     if (!self.lighton_attention_enabled or self.capability_profile != .lightonocr3 or
-        !@import("paged_attention_bf16.zig").packetSupported(self.ctx.info.compute_major, self.ctx.info.driver_version) or
+        !module.packetSupported(self.ctx.info.compute_major, self.ctx.info.driver_version) or
         attention.query_sequence_len != 1 or attention.skip_kv_write or
         attention.sliding_window != 0 or attention.attn_or_mask != null or attention.attention_sink.hasMetadata() or
-        views.len < 2 or views.len > 64 or !@import("paged_attention_bf16.zig").geometrySupported(heads, kv_heads, dim) or
+        views.len < 2 or views.len > module.max_packet_rows or !module.geometrySupported(heads, kv_heads, dim) or
         ((self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) and !lightOnOwnedDecodeCapture(self))) return null;
-    const module = @import("paged_attention_bf16.zig");
     const storage = views[0].kv_storage orelse return null;
     if (storage.storage.config.dtype != .f16 or storage.storage.config.page_size_tokens == 0) return null;
     const hook = storage.device_write_hook orelse return null;

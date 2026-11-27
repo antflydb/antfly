@@ -17,6 +17,7 @@ const std = @import("std");
 const context = @import("context.zig");
 const driver = @import("driver.zig");
 
+pub const max_packet_rows = @import("../kernel_geometry.zig").cuda_paged_decode_packet_rows;
 pub const max_blocks = 4096;
 // Native decoder KV pages contain 16 tokens. The packet bounds aggregate
 // table ownership; individual request/context ceilings remain independent.
@@ -47,7 +48,7 @@ pub const ScratchLayout = struct {
     bytes: usize,
 
     pub fn init(rows: usize, heads: usize, kv_heads: usize, dim: usize, tokens: usize, chunk128: bool) !ScratchLayout {
-        if (rows < 2 or rows > 64 or !geometrySupported(heads, kv_heads, dim) or tokens == 0 or tokens > std.math.maxInt(u32))
+        if (rows < 2 or rows > max_packet_rows or !geometrySupported(heads, kv_heads, dim) or tokens == 0 or tokens > std.math.maxInt(u32))
             return error.InvalidShape;
         const chunk_size: usize = if (chunk128) 128 else 32;
         const chunks = (tokens - 1) / chunk_size + 1;
@@ -76,8 +77,8 @@ pub const DecodeScratch = struct {
     tail: ?ScratchLayout,
 
     pub fn init(rows: usize, tokens: usize, geometry: Geometry, chunk128: bool) !DecodeScratch {
-        if (rows > 128) return error.InvalidShape;
-        const full_rows = @min(rows, 64);
+        if (rows > 2 * max_packet_rows) return error.InvalidShape;
+        const full_rows = @min(rows, max_packet_rows);
         const tail_rows = rows - full_rows;
         return .{
             .geometry = geometry,
@@ -140,7 +141,7 @@ pub const Params = extern struct {
     page_size: u32 = 0,
     row_values: u32 = 0,
     capacity: u32 = 0,
-    pages: [64]Page = @splat(.{}),
+    pages: [max_packet_rows]Page = @splat(.{}),
     blocks: [max_blocks]u32 = @splat(0),
     graph_progress: driver.CUdeviceptr = 0,
     graph_step: u32 = 0,
