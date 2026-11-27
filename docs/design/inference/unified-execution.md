@@ -2283,3 +2283,11 @@ fixture with automatic host budgeting. The expected labels were
 returned and all request admission units were released. This check
 uses the same host budget policy as the earlier timing comparison.
 The log hash is `8261b1bf7b8525a785fbcf07316d1e1d01cccd1371b112604cf242f91ada2490`.
+
+At `426ced9422`, single-request and batched model admission share the
+retry, eviction and terminal diagnostics path. The change deletes 45
+authored lines and adds 14. Six focused tests passed, covering the
+released Native DECIDE HTTP fixture, idle VAD reclamation, required
+residency, optional staging, permanent failure accounting and
+failure propagation to load waiters. The log hash is
+`e923c9835550d7c67a8641261dfeebaddcf041426ee9ae06211981c867c40abb`.
