@@ -151,7 +151,10 @@ pub const DeviceBuffer = struct {
     /// A byte view borrows storage without inheriting allocation custody.
     pub fn borrowRange(self: DeviceBuffer, offset: usize, bytes: usize) !DeviceBuffer {
         if (offset > self.len or bytes > self.len - offset) return error.InvalidShape;
-        return .{ .ptr = try std.math.add(u64, self.ptr, offset), .len = bytes, .borrowed = true };
+        if (bytes != 0 and self.ptr == 0) return error.InvalidShape;
+        const view: DeviceBuffer = .{ .ptr = try std.math.add(u64, self.ptr, offset), .len = bytes, .borrowed = true };
+        _ = try validateRegion(view, bytes, 1);
+        return view;
     }
     ptr: driver_mod.CUdeviceptr = 0,
     len: usize = 0,
@@ -344,6 +347,11 @@ pub inline fn validateRegions(comptime count: usize, regions: [count]DeviceBuffe
 }
 
 test "CUDA region admission permits readonly aliases and rejects output overlap overflow and truncation" {
+    const owner: DeviceBuffer = .{ .ptr = 4096, .len = 64, .allocation_bytes = 128 };
+    try std.testing.expectEqualDeep(DeviceBuffer{ .ptr = 4128, .len = 32, .borrowed = true }, try owner.borrowRange(32, 32));
+    try std.testing.expectError(error.InvalidShape, owner.borrowRange(32, 33));
+    try std.testing.expectError(error.Overflow, (DeviceBuffer{ .ptr = std.math.maxInt(u64) - 3, .len = 64 }).borrowRange(1, 3));
+    try std.testing.expectError(error.InvalidShape, (DeviceBuffer{ .len = 64 }).borrowRange(1, 3));
     var regions = [_]DeviceBuffer{ .{ .ptr = 4096, .len = 64 }, .{ .ptr = 4096, .len = 64 }, .{}, .{ .ptr = 8192, .len = 64 } };
     const lengths = [4]usize{ 64, 64, 0, 64 };
     try validateRegions(4, regions, lengths, @splat(4), 3);
