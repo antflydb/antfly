@@ -2260,3 +2260,20 @@ zero separate bank bytes, and 7.3876 pages/s. The standalone arm reached
 61 rows and 7.4161 pages/s, missing the wide-replay gate. Neither
 arm reported an admission denial. The focused test log hash is
 `d46028559514a8cb03c0f36c7b95a0bda0cfec483810d9b4b0dd4720290acb5f`.
+
+A same-binary ABBA run at `e535ad9229` compared the full-width
+default with the shared arena for LightOnOCR 4B. All four arms matched
+all 256 outputs. The full-width control measured 7.3536 and 7.3555
+pages/s with no wide replay. The arena measured 7.2213 and 7.2596
+pages/s, reached 98 rows in both arms, and recorded three and four
+wide replays. Its mean throughput was 1.55% below the control in this
+pair. The shared arena remains opt-in while the latency cost is open.
+
+At `264a27fffd`, the released DECIDE-1B checkpoint passed the
+required-Metal HTTP classification and admission-release fixture.
+The same fixture requested Native CPU and hit retryable model-load
+admission under its explicit 6 GiB host budget. The earlier timed
+Native serving comparison used the runtime's automatic host budget.
+The Metal and restricted Native test log hashes are respectively
+`2700b8422b66c14cbf0d416d6d3cd2da6a46a590b12004b0e44d87a40c471c95`
+and `05ca4aa530c437663ddd83d0a04acbb3d40564986e92aa00d57ac839a690b77d`.
