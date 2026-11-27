@@ -22758,6 +22758,49 @@ test "CUDA source conversion layout resolves mixed operands before device bindin
     try std.testing.expectError(error.InvalidShape, Layout.resolve(.{ std.math.maxInt(usize), null, null }, 0));
 }
 
+const SourceRmsGeometry = struct {
+    const GroupedRows = @import("../../execution/audio_schedule.zig").GroupedRows;
+    const Clip = struct { rows: usize, channel: ?kernels_mod.ChannelSourceRmsPlan };
+
+    clips: [GroupedRows.max_clips]Clip = undefined,
+    count: usize,
+    partial_bytes: usize = 0,
+
+    const Shape = struct {
+        rows: usize,
+        width: usize,
+        reference_layout: ops.SourceRmsLayout,
+        reference_rows_per_batch: usize,
+        segments: []const usize,
+    };
+
+    fn resolve(value: Shape, multiprocessors: i32, threads_per_sm: u32) !SourceRmsGeometry {
+        switch (value.width) {
+            64, 256, 512, 768, 1024, 1536 => {},
+            else => return error.UnsupportedSourceArithmeticGeometry,
+        }
+        const reference_rows = if (value.reference_rows_per_batch == 0) value.rows else value.reference_rows_per_batch;
+        if (reference_rows == 0 or value.rows % reference_rows != 0) return error.InvalidShape;
+        if (value.segments.len != 0) {
+            if (value.reference_layout != .channel_major or value.reference_rows_per_batch != 0) return error.InvalidShape;
+            GroupedRows.validatePartition(value.segments, value.rows) catch return error.InvalidShape;
+        }
+        const whole = [_]usize{value.rows};
+        const segments = if (value.segments.len == 0) &whole else value.segments;
+        var result: SourceRmsGeometry = .{ .count = segments.len };
+        for (segments, result.clips[0..result.count]) |rows, *clip| {
+            const reference = if (value.segments.len == 0) reference_rows else rows;
+            const channel = if (value.reference_layout == .channel_major and reference != 1)
+                try kernels_mod.ChannelSourceRmsPlan.resolve(rows, reference, value.width, multiprocessors, threads_per_sm)
+            else
+                null;
+            clip.* = .{ .rows = rows, .channel = channel };
+            if (channel) |plan| result.partial_bytes = @max(result.partial_bytes, plan.partial_bytes);
+        }
+        return result;
+    }
+};
+
 fn bf16SourceOperationOp(ctx: *anyopaque, request: *const ops.Bf16SourceOperation) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (sourceScalarStorageOp(ctx, .linear) != .bf16) return null;
@@ -22813,31 +22856,14 @@ fn bf16SourceOperationOp(ctx: *anyopaque, request: *const ops.Bf16SourceOperatio
             if (count > std.math.maxInt(u32)) return error.InvalidShape;
             const input = try sourceScalarTensor(value.input, count);
             const weight = if (value.weight) |gamma| try sourceScalarTensor(gamma, value.width) else null;
-            const reference_rows = if (value.reference_rows_per_batch == 0) value.rows else value.reference_rows_per_batch;
-            if (reference_rows == 0 or value.rows % reference_rows != 0) return error.InvalidShape;
-            switch (value.width) {
-                64, 256, 512, 768, 1024, 1536 => {},
-                else => return error.UnsupportedSourceArithmeticGeometry,
-            }
-            const GroupedRows = @import("../../execution/audio_schedule.zig").GroupedRows;
-            const whole = [_]usize{value.rows};
-            const segments = if (value.segments.len == 0) &whole else value.segments;
-            if (value.segments.len != 0) {
-                if (value.reference_layout != .channel_major or value.reference_rows_per_batch != 0) return error.InvalidShape;
-                GroupedRows.validatePartition(segments, value.rows) catch return error.InvalidShape;
-            }
-            var channel_plans: [GroupedRows.max_clips]?kernels_mod.ChannelSourceRmsPlan = undefined;
-            const plans = channel_plans[0..segments.len];
-            var partial_bytes: usize = 0;
-            for (segments, plans) |rows, *plan| {
-                const reference = if (value.segments.len == 0) reference_rows else rows;
-                plan.* = if (value.reference_layout == .channel_major and reference != 1)
-                    try kernels_mod.ChannelSourceRmsPlan.resolve(rows, reference, value.width, self.ctx.info.multiprocessor_count, self.source_reduction_threads_per_sm)
-                else
-                    null;
-                if (plan.*) |channel| partial_bytes = @max(partial_bytes, channel.partial_bytes);
-            }
-            var operands = try SourceF32Operands(2).plan(self, .{ input, weight }, .{ false, false }, partial_bytes);
+            const geometry = try SourceRmsGeometry.resolve(.{
+                .rows = value.rows,
+                .width = value.width,
+                .reference_layout = value.reference_layout,
+                .reference_rows_per_batch = value.reference_rows_per_batch,
+                .segments = value.segments,
+            }, self.ctx.info.multiprocessor_count, self.source_reduction_threads_per_sm);
+            var operands = try SourceF32Operands(2).plan(self, .{ input, weight }, .{ false, false }, geometry.partial_bytes);
             var output = try OwnedF32Output.alloc(self, input.shape, count);
             defer output.deinit();
             defer operands.deinit(self);
@@ -22846,10 +22872,11 @@ fn bf16SourceOperationOp(ctx: *anyopaque, request: *const ops.Bf16SourceOperatio
             const partial = if (operands.temporary) |temporary| temporary.span(operands.layout.extra) else buffer_mod.DeviceBuffer{};
             var offset: usize = 0;
             const row_bytes = value.width * @sizeOf(f32);
-            for (segments, plans) |rows, plan| {
+            for (geometry.clips[0..geometry.count]) |clip| {
+                const rows = clip.rows;
                 const source = try values.borrowRange(offset, rows * row_bytes);
                 const destination = try output.buffer.borrowRange(offset, rows * row_bytes);
-                if (plan) |channel| {
+                if (clip.channel) |channel| {
                     try self.kernels.launchSourceChannelRms(&self.ctx, destination, source, gamma, partial, channel, value.epsilon);
                     self.stats.source_rms_channel_calls += 1;
                 } else {
@@ -63673,15 +63700,31 @@ test "CUDA grouped channel RMS publishes unequal source clips without copies" {
     try std.testing.expectError(error.InvalidShape, bf16SourceOperationOp(&compute, &request));
     try std.testing.expectEqual(allocated_before, compute.stats.device_alloc_calls);
     request.rms_norm.segments = &clips;
+    const geometry = try SourceRmsGeometry.resolve(.{
+        .rows = rows,
+        .width = width,
+        .reference_layout = .channel_major,
+        .reference_rows_per_batch = 0,
+        .segments = &clips,
+    }, compute.ctx.info.multiprocessor_count, compute.source_reduction_threads_per_sm);
+    const temporary = try SourceF32Operands(2).Layout.resolve(.{ null, null }, geometry.partial_bytes);
     var plan: Workspace.Plan = .{};
-    var observing = Workspace.Scope.observe(&plan);
-    const grouped = observed: {
-        compute.execution_scope = &observing;
+    const builder = try plan.declarationBuilder();
+    const publication = try builder.allocate(rows * width * @sizeOf(f32));
+    if (temporary.bytes != 0) try builder.scratchInterval(temporary.bytes);
+    try builder.finish(publication);
+    const layout = try plan.layout(0);
+    var bank = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, layout.bytes);
+    defer bank.free(&compute.ctx);
+    var scope = try Workspace.Scope.bind(&plan, layout, bank.ptr, bank.len);
+    const grouped = submitted: {
+        compute.execution_scope = &scope;
         defer compute.execution_scope = null;
-        break :observed (try bf16SourceOperationOp(&compute, &request)) orelse return error.TestUnexpectedResult;
+        break :submitted (try bf16SourceOperationOp(&compute, &request)) orelse return error.TestUnexpectedResult;
     };
     defer cb.free(grouped);
-    try std.testing.expect(plan.finish(tensorFromCt(grouped).buffer.ptr));
+    try std.testing.expect(scope.complete());
+    try std.testing.expectEqual(allocated_before, compute.stats.device_alloc_calls);
     try std.testing.expect(plan.declared_operation_scratch_intervals <= 1);
     try std.testing.expectEqual(copied_before, compute.stats.d2d_bytes);
     const actual = try cb.toFloat32(grouped, a);
