@@ -1373,6 +1373,14 @@ backing suffix. The reset preserved address safety. These controls
 leave throughput parity unqualified, so the captured fused head stays
 opt-in.
 
+At `a1dad54754`, Spark passed all four focused checks for shared
+decoder scratch, released LightOnOCR HTTP replay, grouped audio
+metadata and eager fused projection with suppression. The latter
+verified that both token and suppression views borrow the same backing
+at 7, 65 and 128 rows. A separate single-request 64-page control
+finished with serial parity at 20.04 pages/s, but replayed only five
+rows and therefore failed its fixed 64-row gate before the fused arm.
+
 ### Issue closure audit
 
 This audit reconciles the original `2f2438e67f` implementation review
