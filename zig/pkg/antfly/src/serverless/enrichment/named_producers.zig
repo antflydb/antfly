@@ -117,9 +117,12 @@ pub const NamedProducers = struct {
         return out;
     }
 
-    fn produceAsset(ctx: *anyopaque, a: Allocator, cfg: EnrichmentConfig, source: []const u8, _: []const u8) anyerror!std.json.Value {
+    fn produceAsset(ctx: *anyopaque, a: Allocator, cfg: EnrichmentConfig, source: []const u8, _: []const u8, cancellation: @import("antfly_cancellation").CancellationToken) anyerror!std.json.Value {
         const self: *NamedProducers = @ptrCast(@alignCast(ctx));
-        const producer = self.asset orelse return error.AssetProducerUnavailable;
+        var producer = self.asset orelse return error.AssetProducerUnavailable;
+        var context = producer.invocation_context;
+        context.cancellation = cancellation;
+        producer = producer.withInvocationContext(context);
         var config = try asset_producer.parseProducerConfig(a, cfg.producer_json);
         defer config.deinit(a);
         const bytes = try producer.produce(a, .{
@@ -132,14 +135,7 @@ pub const NamedProducers = struct {
     }
 };
 
-/// Produced bytes as an asset value: JSON content types hold JSON values,
-/// anything else is text.
-pub fn outputValue(a: Allocator, content_type: []const u8, bytes: []const u8) !std.json.Value {
-    const media = std.mem.trim(u8, if (std.mem.indexOfScalar(u8, content_type, ';')) |end| content_type[0..end] else content_type, " ");
-    if (std.ascii.eqlIgnoreCase(media, "application/json") or std.ascii.endsWithIgnoreCase(media, "+json"))
-        return std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{ .allocate = .alloc_always }) catch error.InvalidProducerOutput;
-    return .{ .string = bytes };
-}
+pub const outputValue = named_outputs.outputValue;
 
 test "serverless named producers read JSON assets by content type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

@@ -228,11 +228,20 @@ export default {
           if (!await enqueue(env,"publish",publication)) throw new Error("maintenance queue is not configured");
         } else if (publication && (await takeRpcData(stub.finishPublication(publication,result.wal_end_lsn))).has_more) {
           if(!await enqueue(env,"publish",publication))throw new Error("maintenance queue is not configured");
-        } else if (env.EMBEDDING_MODEL) {
-          const enriched = await run(env, {op: "enrich"});
-          // A bounded scan may checkpoint before reaching a pending document.
-          // Continue from that checkpoint even when this scan appended nothing.
-          const pending = enriched.wal_appends || BigInt((await run(env, {op: "status"})).pending_embeddings ?? "0") > 0n;
+        } else {
+          let pending = false;
+          if (env.EMBEDDING_MODEL) {
+            const enriched = await run(env, {op: "enrich"});
+            // A bounded scan may checkpoint before reaching a pending document.
+            // Continue from that checkpoint even when this scan appended nothing.
+            pending = enriched.wal_appends || BigInt((await run(env, {op: "status"})).pending_embeddings ?? "0") > 0n;
+          }
+          // Named enrichments (#1791) run after built-in embeddings; a table
+          // without declarations reports itself idle.
+          if (!pending && env.NAMED_ENRICHMENTS === "true") {
+            const named = await run(env, {op: "enrich", named_enrichment: true});
+            pending = Boolean(named.wal_appends);
+          }
           if (pending && !await enqueue(env,"publish",undefined,0,undefined,true)) throw new Error("maintenance queue is not configured");
         }
         message.ack();

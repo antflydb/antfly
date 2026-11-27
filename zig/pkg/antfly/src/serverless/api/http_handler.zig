@@ -14375,7 +14375,7 @@ test "http handler accepts named enrichment seeds on serverless table batches" {
     var counts = try handler.handle(.{ .method = .post, .path = "/tables/docs/enrichments/counts", .body = "{\"limit\":10}" });
     defer counts.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), counts.status);
-    for ([_][]const u8{ "\"documents\":1,\"next\":null,\"pending_documents\":0", "{\"name\":\"passages\",\"kind\":\"chunk\",\"seeded\":1,\"generated\":0,\"external\":0,\"pending\":0}" }) |expected| {
+    for ([_][]const u8{ "\"documents\":1,\"next\":null,\"pending_documents\":0", "{\"name\":\"passages\",\"kind\":\"chunk\",\"seeded\":1,\"generated\":0,\"external\":0,\"pending\":0,\"failed\":0}" }) |expected| {
         if (std.mem.indexOf(u8, counts.body, expected) == null) {
             std.debug.print("counts {s} lack {s}\n", .{ counts.body, expected });
             return error.TestUnexpectedResult;

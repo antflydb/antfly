@@ -2618,7 +2618,7 @@ fn namedEnrichmentCountsJsonImpl(self: *CatalogService, alloc: Allocator, namesp
         try json.write(cfg.name);
         try json.objectField("kind");
         try json.write(@tagName(cfg.kind));
-        inline for (.{ "seeded", "generated", "external", "pending" }) |field| {
+        inline for (.{ "seeded", "generated", "external", "pending", "failed" }) |field| {
             try json.objectField(field);
             try json.write(@field(count, field));
         }

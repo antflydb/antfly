@@ -171,6 +171,40 @@ test("native serverless artifacts publish and search through the WASM host", asy
   assert.deepEqual(search.hits.map(x => x.doc_id), ["a"]);
 });
 
+test("hosted named enrichments accept seeds and generate assets through the host", async () => {
+  const { host } = await setup();
+  const indexes_json = JSON.stringify({ enrichments: [
+    { name: "summary", kind: "asset", field: "text", content_type: "text/plain", producer: { type: "generator", config: { provider: "antfly", model: "g" } } },
+    { name: "notes", kind: "asset", content_type: "text/plain" },
+  ] });
+  await assert.rejects(host.request(request("mutate", { indexes_json, operation_id: "undeclared", mutations: [
+    { kind: "upsert", doc_id: "x", body: JSON.stringify({ text: "x", _artifacts: { other: { value: "v" } } }) },
+  ] })), /UnknownArtifactSeed/);
+  await host.request(request("mutate", { indexes_json, operation_id: "named", mutations: [
+    { kind: "upsert", doc_id: "a", body: JSON.stringify({ text: "alpha report", _artifacts: { notes: { value: "seeded note" } } }) },
+  ] }));
+  await host.request(request("publish", { indexes_json }));
+  assert.equal((await host.request(request("status"))).pending_named, "1");
+  let calls = 0;
+  const enriched = await host.request(request("enrich", { named_enrichment: true, indexes_json }), { inference: async req => {
+    assert.equal(req.task, "asset");
+    assert.equal(req.source, "alpha report");
+    calls++;
+    return { json: { output: "generated summary" } };
+  } });
+  assert.equal(enriched.wal_appends, 1);
+  assert.equal(calls, 1);
+  await host.request(request("publish", { indexes_json }));
+  assert.equal((await host.request(request("status"))).pending_named, "0");
+  const body = JSON.parse((await host.request(request("lookup", { doc_id: "a" }))).body);
+  assert.equal(body._artifacts.summary.value, "generated summary");
+  assert.equal(body._artifacts.notes.value, "seeded note");
+  assert.equal(body._enrichment.named.summary.origin, "generated");
+  // Nothing remains to generate.
+  const idle = await host.request(request("enrich", { named_enrichment: true, indexes_json }), { inference: async () => { throw new Error("unexpected"); } });
+  assert.equal(idle.wal_appends, 0);
+});
+
 test("fresh lookup, text search and stable pages merge WAL mutations before publication", async () => {
   const { host } = await setup();
   const mutate = (id, mutations) => host.request(request("mutate", { operation_id: id, mutations }));

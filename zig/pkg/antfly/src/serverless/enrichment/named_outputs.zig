@@ -32,6 +32,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const local = @import("antfly_local_sources");
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const artifact_seeds = local.storage_db_artifact_seeds;
 const named_enrichments = @import("../catalog/named_enrichments.zig");
 const EnrichmentConfig = named_enrichments.EnrichmentConfig;
@@ -199,6 +200,9 @@ pub fn acceptAlloc(
             // Unchanged input: the accepted output stays.
             try outputs.put(a, name, prior_value.?);
             if (prior_marker) |marker| try markers.put(a, name, .{ .object = marker }) else try markers.put(a, name, .{ .object = try markerObject(a, .external, input) });
+        } else if (prior_marker != null and failedAttempts(prior_marker.?) != null and markerInputMatches(prior_marker.?, input)) {
+            // Failed generation attempts stand while their input does.
+            try markers.put(a, name, .{ .object = prior_marker.? });
         } else if (!external and (incoming_artifacts != null or incoming_chunks != null)) {
             try appendOutcome(alloc, &outcomes, doc_key, name, .{ .outcome = .missing }, null);
         }
@@ -233,7 +237,7 @@ pub fn needsGeneration(alloc: Allocator, declarations: named_enrichments.Declara
         const input = (try inputDigestHexAlloc(a, cfg, document, artifacts, chunks)) orelse continue;
         const marker = if (markers) |map| if (map.get(cfg.name)) |found| if (found == .object) found.object else null else null else null;
         if (marker) |record| {
-            if (markerInputMatches(record, input)) continue;
+            if (markerSatisfied(record, input)) continue;
         }
         return true;
     }
@@ -248,6 +252,8 @@ pub const Tally = struct {
     /// Declared with a computable input but not yet accepted for it: awaiting
     /// generation, or a seed held `pending` by its mapping.
     pending: u64 = 0,
+    /// Generation failed `max_generation_attempts` times for the input.
+    failed: u64 = 0,
 };
 
 /// Adds one document's outputs to `tallies` (parallel to the declarations).
@@ -271,6 +277,10 @@ pub fn tally(alloc: Allocator, declarations: named_enrichments.Declarations, bod
                 count.pending += 1;
                 continue;
             }
+            if (failedAttempts(record)) |attempts| {
+                if (attempts >= max_generation_attempts) count.failed += 1 else count.pending += 1;
+                continue;
+            }
             const origin = record.get("origin") orelse continue;
             if (origin != .string) continue;
             if (std.mem.eql(u8, origin.string, "seeded")) count.seeded += 1 else if (std.mem.eql(u8, origin.string, "generated")) count.generated += 1 else if (std.mem.eql(u8, origin.string, "external")) count.external += 1;
@@ -287,14 +297,25 @@ pub fn tally(alloc: Allocator, declarations: named_enrichments.Declarations, bod
 /// pending (`Generated.unavailable`) rather than failing the document.
 pub const Producers = struct {
     ctx: *anyopaque = undefined,
+    /// Checked before each output; asset producers receive it too.
+    cancellation: CancellationToken = .none,
     /// One vector per text for an embedding declaration.
     embed: ?*const fn (ctx: *anyopaque, a: Allocator, cfg: EnrichmentConfig, texts: []const []const u8) anyerror![][]f32 = null,
     /// One sparse vector per text when the declaration's consuming index is
     /// sparse; null otherwise (the dense `embed` applies).
     embed_sparse: ?*const fn (ctx: *anyopaque, a: Allocator, cfg: EnrichmentConfig, texts: []const []const u8) anyerror!?[]SparseVector = null,
     /// An asset's value from its source text (and the whole record).
-    asset: ?*const fn (ctx: *anyopaque, a: Allocator, cfg: EnrichmentConfig, source: []const u8, document_json: []const u8) anyerror!std.json.Value = null,
+    asset: ?*const fn (ctx: *anyopaque, a: Allocator, cfg: EnrichmentConfig, source: []const u8, document_json: []const u8, cancellation: CancellationToken) anyerror!std.json.Value = null,
 };
+
+/// Produced bytes as an asset value: JSON content types hold JSON values,
+/// anything else is text.
+pub fn outputValue(a: Allocator, content_type: []const u8, bytes: []const u8) !std.json.Value {
+    const media = std.mem.trim(u8, if (std.mem.indexOfScalar(u8, content_type, ';')) |end| content_type[0..end] else content_type, " ");
+    if (std.ascii.eqlIgnoreCase(media, "application/json") or std.ascii.endsWithIgnoreCase(media, "+json"))
+        return std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{ .allocate = .alloc_always }) catch error.InvalidProducerOutput;
+    return .{ .string = bytes };
+}
 
 pub const SparseVector = struct { indices: []const u32, values: []const f32 };
 
@@ -317,7 +338,111 @@ pub const Generated = struct {
     generated: usize = 0,
     /// Outputs whose producer is not available to this runtime.
     unavailable: usize = 0,
+    /// Outputs whose producer failed; recorded for bounded retries.
+    failed: usize = 0,
 };
+
+const Production = union(enum) {
+    /// No computable input yet (an upstream output is missing).
+    skip,
+    unavailable,
+    value: std.json.Value,
+};
+
+fn produceOutput(a: Allocator, cfg: EnrichmentConfig, document: std.json.Value, artifacts: std.json.ObjectMap, chunks: std.json.ObjectMap, producers: Producers, body: []const u8) !Production {
+    const output: ?std.json.Value = switch (cfg.kind) {
+        .chunk => chunk: {
+            if (cfg.chunk_size == 0) break :chunk null;
+            const text = (try sourceTextAlloc(a, cfg, document, artifacts)) orelse return .skip;
+            const pieces = try local.storage_db_enrichment_chunker.chunkText(a, text, cfg.chunk_size, cfg.chunk_overlap);
+            var array = std.json.Array.init(a);
+            for (pieces) |piece| {
+                var item = std.json.ObjectMap.empty;
+                try item.put(a, "_chunk_id", .{ .integer = piece.chunk_id });
+                try item.put(a, "_content", .{ .string = piece.text orelse "" });
+                if (piece.start_offset) |offset| try item.put(a, "_start_char", .{ .integer = offset });
+                if (piece.end_offset) |offset| try item.put(a, "_end_char", .{ .integer = offset });
+                try array.append(.{ .object = item });
+            }
+            break :chunk .{ .array = array };
+        },
+        .embedding => embedding: {
+            if (producers.embed_sparse) |embed_sparse| sparse: {
+                // Document-level sparse vectors: serverless sparse indexes
+                // have no chunk-level rows.
+                if (cfg.source_artifact_name.len != 0 and chunks.contains(cfg.source_artifact_name)) break :sparse;
+                const text = (try sourceTextAlloc(a, cfg, document, artifacts)) orelse return .skip;
+                const vectors = (embed_sparse(producers.ctx, a, cfg, &.{text}) catch |err| if (err == error.EmbedderUnavailable) break :embedding null else return err) orelse break :sparse;
+                if (vectors.len != 1) return error.InvalidEmbeddingResponse;
+                break :embedding try envelopeValue(a, try sparseValue(a, vectors[0]));
+            }
+            const embed = producers.embed orelse break :embedding null;
+            // Vectors of an upstream chunk collection: one per chunk.
+            if (cfg.source_artifact_name.len != 0) if (chunks.get(cfg.source_artifact_name)) |collection| {
+                if (collection != .array) return .skip;
+                const texts = try a.alloc([]const u8, collection.array.items.len);
+                const ids = try a.alloc(i64, collection.array.items.len);
+                for (collection.array.items, texts, ids) |item, *text, *id| {
+                    if (item != .object) continue;
+                    const content = item.object.get("_content") orelse return .skip;
+                    const chunk_id = item.object.get("_chunk_id") orelse return .skip;
+                    text.* = if (content == .string) content.string else "";
+                    id.* = if (chunk_id == .integer) chunk_id.integer else 0;
+                }
+                const vectors = embed(producers.ctx, a, cfg, texts) catch |err| if (err == error.EmbedderUnavailable) break :embedding null else return err;
+                if (vectors.len != texts.len) return error.InvalidEmbeddingResponse;
+                var rows = std.json.Array.init(a);
+                for (vectors, ids) |vector, id| {
+                    var row = std.json.ObjectMap.empty;
+                    try row.put(a, "chunk_id", .{ .integer = id });
+                    try row.put(a, "vector", try vectorValue(a, vector));
+                    try rows.append(.{ .object = row });
+                }
+                break :embedding try envelopeValue(a, .{ .array = rows });
+            };
+            const text = (try sourceTextAlloc(a, cfg, document, artifacts)) orelse return .skip;
+            const vectors = embed(producers.ctx, a, cfg, &.{text}) catch |err| if (err == error.EmbedderUnavailable) break :embedding null else return err;
+            if (vectors.len != 1) return error.InvalidEmbeddingResponse;
+            break :embedding try envelopeValue(a, try vectorValue(a, vectors[0]));
+        },
+        .asset => asset: {
+            // A field asset without a producer copies its source.
+            if (cfg.producer_json.len == 0) {
+                const source = sourceValue(cfg, document, artifacts) orelse return .skip;
+                break :asset try envelopeValue(a, source);
+            }
+            const produce = producers.asset orelse break :asset null;
+            const text = (try sourceTextAlloc(a, cfg, document, artifacts)) orelse return .skip;
+            break :asset try envelopeValue(a, try produce(producers.ctx, a, cfg, text, body, producers.cancellation));
+        },
+        .group => return .skip,
+    };
+    return if (output) |value| .{ .value = value } else .unavailable;
+}
+
+/// Errors that end the pass instead of failing one output.
+fn propagates(err: anyerror) bool {
+    return switch (err) {
+        error.OutOfMemory, error.Canceled, error.Cancelled, error.Timeout, error.DeadlineExceeded, error.HostedEmbeddingYield => true,
+        else => false,
+    };
+}
+
+/// Generation attempts per output and input before it stops being pending.
+pub const max_generation_attempts: u32 = 3;
+
+fn failedAttempts(marker: std.json.ObjectMap) ?u32 {
+    const failed = marker.get("failed") orelse return null;
+    return if (failed == .integer and failed.integer >= 0) std.math.cast(u32, failed.integer) orelse max_generation_attempts else 0;
+}
+
+/// A record satisfies its declaration while its input stands, unless it
+/// records failed attempts that may still be retried.
+fn markerSatisfied(marker: std.json.ObjectMap, input: ?[]const u8) bool {
+    if (!markerInputMatches(marker, input)) return false;
+    const attempts = failedAttempts(marker) orelse return true;
+    return attempts >= max_generation_attempts;
+}
 
 /// Generates every declared output of `body` that has no acceptance record
 /// for its current input, in dependency order so chains (extraction, chunks,
@@ -340,73 +465,25 @@ pub fn generateAlloc(alloc: Allocator, declarations: named_enrichments.Declarati
     for (ordered) |cfg| {
         if (named_enrichments.externallyMaintained(cfg)) continue;
         const input = (try inputDigestHexAlloc(a, cfg, document, artifacts, chunks)) orelse continue;
-        if (markers.get(cfg.name)) |marker| if (marker == .object and markerInputMatches(marker.object, input)) continue;
-        const output: ?std.json.Value = switch (cfg.kind) {
-            .chunk => chunk: {
-                if (cfg.chunk_size == 0) break :chunk null;
-                const text = (try sourceTextAlloc(a, cfg, document, artifacts)) orelse continue;
-                const pieces = try local.storage_db_enrichment_chunker.chunkText(a, text, cfg.chunk_size, cfg.chunk_overlap);
-                var array = std.json.Array.init(a);
-                for (pieces) |piece| {
-                    var item = std.json.ObjectMap.empty;
-                    try item.put(a, "_chunk_id", .{ .integer = piece.chunk_id });
-                    try item.put(a, "_content", .{ .string = piece.text orelse "" });
-                    if (piece.start_offset) |offset| try item.put(a, "_start_char", .{ .integer = offset });
-                    if (piece.end_offset) |offset| try item.put(a, "_end_char", .{ .integer = offset });
-                    try array.append(.{ .object = item });
-                }
-                break :chunk .{ .array = array };
-            },
-            .embedding => embedding: {
-                if (producers.embed_sparse) |embed_sparse| sparse: {
-                    // Document-level sparse vectors: serverless sparse indexes
-                    // have no chunk-level rows.
-                    if (cfg.source_artifact_name.len != 0 and chunks.contains(cfg.source_artifact_name)) break :sparse;
-                    const text = (try sourceTextAlloc(a, cfg, document, artifacts)) orelse continue;
-                    const vectors = (embed_sparse(producers.ctx, a, cfg, &.{text}) catch |err| if (err == error.EmbedderUnavailable) break :embedding null else return err) orelse break :sparse;
-                    if (vectors.len != 1) return error.InvalidEmbeddingResponse;
-                    break :embedding try envelopeValue(a, try sparseValue(a, vectors[0]));
-                }
-                const embed = producers.embed orelse break :embedding null;
-                // Vectors of an upstream chunk collection: one per chunk.
-                if (cfg.source_artifact_name.len != 0) if (chunks.get(cfg.source_artifact_name)) |collection| {
-                    if (collection != .array) continue;
-                    const texts = try a.alloc([]const u8, collection.array.items.len);
-                    const ids = try a.alloc(i64, collection.array.items.len);
-                    for (collection.array.items, texts, ids) |item, *text, *id| {
-                        if (item != .object) continue;
-                        const content = item.object.get("_content") orelse continue;
-                        const chunk_id = item.object.get("_chunk_id") orelse continue;
-                        text.* = if (content == .string) content.string else "";
-                        id.* = if (chunk_id == .integer) chunk_id.integer else 0;
-                    }
-                    const vectors = embed(producers.ctx, a, cfg, texts) catch |err| if (err == error.EmbedderUnavailable) break :embedding null else return err;
-                    if (vectors.len != texts.len) return error.InvalidEmbeddingResponse;
-                    var rows = std.json.Array.init(a);
-                    for (vectors, ids) |vector, id| {
-                        var row = std.json.ObjectMap.empty;
-                        try row.put(a, "chunk_id", .{ .integer = id });
-                        try row.put(a, "vector", try vectorValue(a, vector));
-                        try rows.append(.{ .object = row });
-                    }
-                    break :embedding try envelopeValue(a, .{ .array = rows });
-                };
-                const text = (try sourceTextAlloc(a, cfg, document, artifacts)) orelse continue;
-                const vectors = embed(producers.ctx, a, cfg, &.{text}) catch |err| if (err == error.EmbedderUnavailable) break :embedding null else return err;
-                if (vectors.len != 1) return error.InvalidEmbeddingResponse;
-                break :embedding try envelopeValue(a, try vectorValue(a, vectors[0]));
-            },
-            .asset => asset: {
-                // A field asset without a producer copies its source.
-                if (cfg.producer_json.len == 0) {
-                    const source = sourceValue(cfg, document, artifacts) orelse continue;
-                    break :asset try envelopeValue(a, source);
-                }
-                const produce = producers.asset orelse break :asset null;
-                const text = (try sourceTextAlloc(a, cfg, document, artifacts)) orelse continue;
-                break :asset try envelopeValue(a, try produce(producers.ctx, a, cfg, text, body));
-            },
-            .group => continue,
+        if (markers.get(cfg.name)) |marker| if (marker == .object and markerSatisfied(marker.object, input)) continue;
+        try producers.cancellation.check();
+        const production = produceOutput(a, cfg, document, artifacts, chunks, producers, body) catch |err| {
+            if (propagates(err)) return err;
+            // Bounded retries: the record counts attempts for this input,
+            // and a changed input starts over.
+            const previous: u32 = if (markers.get(cfg.name)) |marker| if (marker == .object and markerInputMatches(marker.object, input)) failedAttempts(marker.object) orelse 0 else 0 else 0;
+            var marker = std.json.ObjectMap.empty;
+            try marker.put(a, "failed", .{ .integer = previous + 1 });
+            try marker.put(a, "input", .{ .string = input });
+            try marker.put(a, "error", .{ .string = @errorName(err) });
+            try markers.put(a, cfg.name, .{ .object = marker });
+            result.failed += 1;
+            continue;
+        };
+        const output: ?std.json.Value = switch (production) {
+            .skip => continue,
+            .unavailable => null,
+            .value => |value| value,
         };
         const value = output orelse {
             result.unavailable += 1;
@@ -416,7 +493,7 @@ pub fn generateAlloc(alloc: Allocator, declarations: named_enrichments.Declarati
         try markers.put(a, cfg.name, .{ .object = try markerObject(a, .generated, input) });
         result.generated += 1;
     }
-    if (result.generated == 0) return result;
+    if (result.generated == 0 and result.failed == 0) return result;
     if (artifacts.count() != 0) try document.object.put(a, "_artifacts", .{ .object = artifacts });
     if (chunks.count() != 0) try document.object.put(a, "_chunks", .{ .object = chunks });
     try state.put(a, marker_key, .{ .object = markers });
@@ -678,7 +755,7 @@ test "serverless named outputs generate chains in dependency order and leave una
             }
             return out;
         }
-        fn asset(ctx: *anyopaque, _: Allocator, _: EnrichmentConfig, source: []const u8, _: []const u8) anyerror!std.json.Value {
+        fn asset(ctx: *anyopaque, _: Allocator, _: EnrichmentConfig, source: []const u8, _: []const u8, _: CancellationToken) anyerror!std.json.Value {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.produced += 1;
             return .{ .string = if (std.mem.eql(u8, source, "a long report body")) "silver submarine" else "other" };
@@ -749,4 +826,48 @@ test "serverless named outputs generate sparse vectors for sparse consumers" {
     // The dense declaration's embedder is missing: pending, not failed.
     try std.testing.expectEqual(@as(usize, 1), generated.unavailable);
     try std.testing.expect(std.mem.indexOf(u8, generated.body.?, "\"terms\":{\"value\":{\"indices\":[3,9]") != null);
+}
+
+test "serverless named outputs retry failed producers a bounded number of times" {
+    const alloc = std.testing.allocator;
+    var declarations = try named_enrichments.parseAlloc(alloc,
+        \\{"enrichments":[
+        \\  {"name":"summary","kind":"asset","field":"body","content_type":"text/plain","producer":{"type":"generator","config":{"provider":"antfly","model":"g"}}},
+        \\  {"name":"copy","kind":"asset","field":"title","content_type":"text/plain"}
+        \\]}
+    );
+    defer declarations.deinit(alloc);
+    const Failing = struct {
+        fn asset(_: *anyopaque, _: Allocator, _: EnrichmentConfig, _: []const u8, _: []const u8, _: CancellationToken) anyerror!std.json.Value {
+            return error.ProviderUnavailable;
+        }
+    };
+    var unused: u8 = 0;
+    const producers: Producers = .{ .ctx = &unused, .asset = Failing.asset };
+    var body = try alloc.dupe(u8, "{\"body\":\"report\",\"title\":\"T\"}");
+    defer alloc.free(body);
+    for (1..max_generation_attempts + 1) |attempt| {
+        try std.testing.expect(try needsGeneration(alloc, declarations, body));
+        const pass = try generateAlloc(alloc, declarations, body, producers);
+        try std.testing.expectEqual(@as(usize, 1), pass.failed);
+        // The copy succeeds once and is kept; only the failure is retried.
+        try std.testing.expectEqual(@as(usize, if (attempt == 1) 1 else 0), pass.generated);
+        alloc.free(body);
+        body = pass.body.?;
+        const expected = try std.fmt.allocPrint(alloc, "\"failed\":{d}", .{attempt});
+        defer alloc.free(expected);
+        try std.testing.expect(std.mem.indexOf(u8, body, expected) != null);
+    }
+    // Exhausted for this input: no longer pending, reported as failed.
+    try std.testing.expect(!try needsGeneration(alloc, declarations, body));
+    var counts: [2]Tally = @splat(.{});
+    try tally(alloc, declarations, body, &counts);
+    try std.testing.expectEqual(Tally{ .failed = 1 }, counts[0]);
+    // An unrelated write keeps the attempts; a changed input starts over.
+    var unrelated = try acceptAlloc(alloc, declarations, "doc", body, "{\"body\":\"report\",\"title\":\"T\",\"x\":1}", .keep);
+    defer unrelated.deinit(alloc);
+    try std.testing.expect(!try needsGeneration(alloc, declarations, unrelated.body));
+    var changed = try acceptAlloc(alloc, declarations, "doc", body, "{\"body\":\"new report\",\"title\":\"T\"}", .keep);
+    defer changed.deinit(alloc);
+    try std.testing.expect(try needsGeneration(alloc, declarations, changed.body));
 }

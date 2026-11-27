@@ -463,12 +463,50 @@ producer runtime; a host without one, and outputs whose embedder is missing,
 stay pending rather than failing. A producer error skips the document until
 the next cycle.
 
+A producer error is recorded on the output's acceptance record
+(`{"failed": n, "input": ..., "error": ...}`) instead of failing the
+document: the output stays pending and is retried on later cycles until it
+has failed `max_generation_attempts` (3) times for that input, after which it
+is no longer pending and counts report it as `failed`. Unrelated writes keep
+the attempts; a changed input starts over. Producers receive the stage's
+cancellation (the pinned source, its lease and the caller's token), and it is
+checked before each output.
+
+Embeddings indexes consume named vectors at both levels: a document vector
+(`{"value": [numbers]}`), chunk-level rows (`{"value": [{"chunk_id",
+"vector"}]}`, labeled with the chunk's text from the document's chunk
+collections, consumed like built-in chunk embeddings), and on a sparse index
+(`"sparse": true`) a sparse vector (`{"indices": [...], "values": [...]}` or
+an index-to-weight map, as `f<index>` features). The stage generates sparse
+vectors with the consuming sparse index's embedder; serverless sparse indexes
+are document-level, so chunk-level sparse vectors are not indexed.
+
+Seed-only transforms bind to a version as on the other engines: a serverless
+document's version is the LSN of its last WAL mutation (its source writes and
+enrichment outputs alike), returned as `X-Antfly-Version` by
+`GET /tables/{table}/lookup/{key}`. `expected_version` preconditions are
+checked against the namespace LSN they were read at and the batch is appended
+only while that LSN is still the latest (`409` otherwise), and a transform
+that only writes seeds for outputs with an input must carry one (`400`).
+
+The hosted (wasm) runtime runs the same stage with `enrich` and
+`"named_enrichment": true`. Requests carry the table's `indexes_json`; with it,
+`mutate` accepts seeds for the written body (hosted writes are blind, so
+outputs a write does not carry are regenerated) and `publish` records the
+declarations. Document vectors use the host's embedding task and assets the
+host's `asset` inference task (`{"task": "asset", "name", "producer",
+"content_type", "source"}` answered with `{"output": text}`); `status`
+reports `pending_named`. The Cloudflare example serves assets with a Workers
+AI text model (`ASSET_MODEL`) and runs the stage after publication when
+`NAMED_ENRICHMENTS` is `true`.
+
 `POST /tables/{table}/enrichments/counts` (body `{"from": key, "limit": n}`,
 both optional) reports migration and readiness for the published HEAD:
 `pending_documents` (the documents awaiting generation, from the facts) and,
 over one page of documents in key order, each declaration's `seeded`,
-`generated`, `external` and `pending` counts (pending: an input without an
-acceptance record for it, or a seed held by `on_missing: pending`). Page with
+`generated`, `external`, `pending` and `failed` counts (pending: an input
+without an acceptance record for it, a seed held by `on_missing: pending`, or
+generation being retried). Page with
 `next`. Writes not yet published are not counted.
 
 ### Late inference results
@@ -523,8 +561,3 @@ subsystem features of their own:
   staged publication (`docs/design/media-pass.md`); origin counts on the
   distributed server's HTTP status (embedded and Lite have them).
 - Downstream consumers of externally maintained assets.
-- Serverless: sparse named vectors and chunk-level named vectors in
-  serverless indexes (the stage generates chunk vectors, but indexes consume
-  only document vectors), a wasm host asset producer, and `expected_version`
-  on serverless seed-only transforms (they bind to the body read at request
-  time).

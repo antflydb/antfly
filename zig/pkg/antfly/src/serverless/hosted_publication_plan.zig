@@ -170,6 +170,8 @@ pub const Context = struct {
     io: std.Io,
     cancellation: @import("maintenance_cancellation.zig").Token,
     policy: Policy,
+    /// The table's index definitions; a change takes the full publication.
+    indexes_json: []const u8 = "",
     force: bool = false,
     /// Borrowed prepared-slice lease; the outer transaction owns release.
     prepared_lease: ?*lease.HeldLease = null,
@@ -349,7 +351,8 @@ pub const Context = struct {
         if (source) |s| {
             if (s.stats.graph_segment_count != 0 or !builder.allArtifactsPagedOrAbsent(s, .text_segment) or !builder.allArtifactsPagedOrAbsent(s, .sparse_segment) or !builder.allArtifactsPagedOrAbsent(s, .vector_segment)) return error.PublicationReindexRequired;
             if (!std.meta.eql(s.stats.policy, self.policy)) return null;
-        }
+            if (!std.mem.eql(u8, s.stats.indexes_json, self.indexes_json)) return null;
+        } else if (self.indexes_json.len != 0) return null;
         const cutoff = if (source) |s| s.wal_end_lsn else 0;
         if ((try self.wal.latestLsn(self.registry.namespace)) <= cutoff) return null;
         const records = try self.wal.readRangeAlloc(self.registry.namespace, .{ .start_lsn = cutoff + 1, .end_lsn = cutoff + 1, .max_records = 1, .max_bytes = 4 * 1024 * 1024 });

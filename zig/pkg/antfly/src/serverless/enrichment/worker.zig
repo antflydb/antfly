@@ -624,6 +624,10 @@ pub const SparseEnricher = struct {
         }
         self.named_declarations = &declarations;
         defer self.named_declarations = null;
+        // Producers observe the pinned source, lease and caller cancellation.
+        const named_cancellation = self.named_producers.cancellation;
+        self.named_producers.cancellation = pin.token();
+        defer self.named_producers.cancellation = named_cancellation;
         const stage_index: usize = if (named_stage) 0 else @backingInt(cfg.stage) - 1;
         const pending_count = if (named_stage) facts.named_pending_count else facts.counts[3 + stage_index];
         const media_scan = cfg.stage == .chunk_embeddings and self.model_chunker != null;
@@ -3710,7 +3714,7 @@ test "serverless enricher generates named enrichments and clears their pending f
 
     const Generator = struct {
         calls: usize = 0,
-        fn asset(ctx: *anyopaque, _: Allocator, _: named_enrichments.EnrichmentConfig, _: []const u8, _: []const u8) anyerror!std.json.Value {
+        fn asset(ctx: *anyopaque, _: Allocator, _: named_enrichments.EnrichmentConfig, _: []const u8, _: []const u8, _: CancellationToken) anyerror!std.json.Value {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.calls += 1;
             return .{ .string = "a generated summary" };

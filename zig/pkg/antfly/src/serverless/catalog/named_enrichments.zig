@@ -67,17 +67,15 @@ pub fn parseAlloc(alloc: Allocator, indexes_json: []const u8) !Declarations {
     if (declared == .null) return .{};
     if (declared != .array) return error.InvalidEnrichmentConfig;
     if (declared.array.items.len == 0) return .{};
-    // Hand the collector only the reserved array: index objects (embedding
-    // indexes with an embedder) drive the built-in pipeline, not these.
-    var only = std.json.ObjectMap.empty;
-    defer only.deinit(alloc);
-    try only.put(alloc, reserved_key, declared);
+    // Parse only the reserved array: index objects (embedding indexes with
+    // an embedder) drive the built-in pipeline, not these. This needs no
+    // embedder configuration, so the hosted runtime parses it too.
     var out = std.ArrayListUnmanaged(EnrichmentConfig).empty;
     errdefer {
         for (out.items) |*cfg| cfg.deinit(alloc);
         out.deinit(alloc);
     }
-    try local.api_local_indexes.collectArtifactEnrichmentsFromValueWithOptions(alloc, .{ .object = only }, .{}, &out);
+    try local.api_local_indexes.collectArtifactEnrichmentArray(alloc, declared, null, &out);
     try local.api_local_indexes.validateArtifactEnrichmentConfigs(alloc, out.items);
     for (out.items) |cfg| try requireServerlessSupported(cfg);
     return .{ .configs = try out.toOwnedSlice(alloc) };

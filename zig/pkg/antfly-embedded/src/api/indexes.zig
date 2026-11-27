@@ -81,6 +81,106 @@ pub fn sortArtifactEnrichmentsByDependency(alloc: std.mem.Allocator, configs: []
     @memcpy(configs, ordered);
 }
 
+/// Parses one `enrichments` array of public configs. `embedding_producer_json`
+/// is the enclosing embeddings index's semantic producer, inherited by its
+/// embedding enrichments. Needs no embedder configuration, so engines without
+/// managed embedders (the hosted serverless runtime) can parse declarations.
+pub fn collectArtifactEnrichmentArray(
+    alloc: std.mem.Allocator,
+    enrichments: std.json.Value,
+    embedding_producer_json: ?[]const u8,
+    out: *std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig),
+) !void {
+    if (enrichments != .array) return error.InvalidEnrichmentConfig;
+    for (enrichments.array.items) |item| {
+        if (item != .object) return error.InvalidEnrichmentConfig;
+        const parsed = std.json.parseFromValue(db_mod.types.EnrichmentConfig, alloc, item, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidEnrichmentConfig,
+        };
+        defer parsed.deinit();
+        var owned = try db_mod.types.EnrichmentConfig.clone(alloc, parsed.value);
+        errdefer owned.deinit(alloc);
+        if (item.object.get("chunker")) |chunker| {
+            const legacy_chunker = item.object.get("chunker_json");
+            if (owned.kind != .chunk or chunker != .object or (legacy_chunker != null and legacy_chunker.? != .null))
+                return error.InvalidEnrichmentConfig;
+            owned.chunker_json = try document_content_hash.canonicalJsonValueAlloc(alloc, chunker);
+        }
+        if (item.object.get("producer")) |producer| {
+            const legacy_producer = item.object.get("producer_json");
+            const transcriber = item.object.get("transcriber");
+            if (producer != .object or (legacy_producer != null and legacy_producer.? != .null) or (transcriber != null and transcriber.? != .null))
+                return error.InvalidEnrichmentConfig;
+            owned.producer_json = try document_content_hash.canonicalJsonValueAlloc(alloc, producer);
+        }
+        if (item.object.get("transcriber")) |transcriber| {
+            // The typed shorthand replaces producer_json rather
+            // than layering on it, and only an asset stream can
+            // hold transcripts.
+            if (owned.kind != .asset or owned.producer_json.len > 0) return error.InvalidEnrichmentConfig;
+            owned.producer_json = enrichment_config_validation.transcriberShorthandProducerJsonAlloc(alloc, transcriber) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidEnrichmentConfig,
+            };
+            if (owned.content_type.len == 0) owned.content_type = try alloc.dupe(u8, "application/json");
+        }
+        if (item.object.get("context_sources")) |sources| {
+            if (sources != .null) {
+                // Public objects are canonicalized here; the raw
+                // stored form is never accepted alongside them.
+                if (owned.context_sources_json.len > 0) return error.InvalidEnrichmentConfig;
+                owned.context_sources_json = context_sources.canonicalFromPublicAlloc(alloc, sources, item.object.get("refresh"), null, contextFilterLowering()) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return error.InvalidEnrichmentConfig,
+                };
+            }
+        } else if (item.object.get("refresh")) |refresh| {
+            if (refresh != .null) return error.InvalidEnrichmentConfig;
+        } else if (owned.context_sources_json.len > 0) {
+            // Stored form (backup/restore): validate the grammar;
+            // hosts re-resolve table identities before admission.
+            var stored = context_sources.parseStoredJson(alloc, owned.context_sources_json) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidEnrichmentConfig,
+            };
+            stored.deinit();
+        }
+        if (item.object.get("seed")) |seed| {
+            if (seed != .null) {
+                // The public mapping object is canonicalized; the
+                // stored form is never accepted alongside it.
+                if (owned.seed_json.len > 0 or owned.kind == .group) return error.InvalidEnrichmentConfig;
+                owned.seed_json = @import("../storage/db/artifact_seeds.zig").canonicalMappingAlloc(alloc, seed) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return error.InvalidEnrichmentConfig,
+                };
+            }
+        } else if (owned.seed_json.len > 0) {
+            // Stored form (backup/restore): validate the grammar.
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            const stored = std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), owned.seed_json, .{}) catch return error.InvalidEnrichmentConfig;
+            const canonical = @import("../storage/db/artifact_seeds.zig").canonicalMappingAlloc(alloc, stored) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidEnrichmentConfig,
+            };
+            alloc.free(owned.seed_json);
+            owned.seed_json = canonical;
+        }
+        if (owned.kind == .embedding) {
+            if (embedding_producer_json) |raw| {
+                if (owned.producer_json.len > 0) alloc.free(owned.producer_json);
+                owned.producer_json = try alloc.dupe(u8, raw);
+            }
+        }
+        try out.append(alloc, owned);
+    }
+}
+
 pub fn collectArtifactEnrichmentsFromValueWithOptions(
     alloc: std.mem.Allocator,
     value: std.json.Value,
@@ -99,96 +199,7 @@ pub fn collectArtifactEnrichmentsFromValueWithOptions(
                 };
             };
             defer if (embedding_producer_json) |raw| alloc.free(raw);
-            if (object.get("enrichments")) |enrichments| {
-                if (enrichments != .array) return error.InvalidEnrichmentConfig;
-                for (enrichments.array.items) |item| {
-                    if (item != .object) return error.InvalidEnrichmentConfig;
-                    const parsed = std.json.parseFromValue(db_mod.types.EnrichmentConfig, alloc, item, .{
-                        .allocate = .alloc_always,
-                        .ignore_unknown_fields = true,
-                    }) catch |err| switch (err) {
-                        error.OutOfMemory => return err,
-                        else => return error.InvalidEnrichmentConfig,
-                    };
-                    defer parsed.deinit();
-                    var owned = try db_mod.types.EnrichmentConfig.clone(alloc, parsed.value);
-                    errdefer owned.deinit(alloc);
-                    if (item.object.get("chunker")) |chunker| {
-                        const legacy_chunker = item.object.get("chunker_json");
-                        if (owned.kind != .chunk or chunker != .object or (legacy_chunker != null and legacy_chunker.? != .null))
-                            return error.InvalidEnrichmentConfig;
-                        owned.chunker_json = try document_content_hash.canonicalJsonValueAlloc(alloc, chunker);
-                    }
-                    if (item.object.get("producer")) |producer| {
-                        const legacy_producer = item.object.get("producer_json");
-                        const transcriber = item.object.get("transcriber");
-                        if (producer != .object or (legacy_producer != null and legacy_producer.? != .null) or (transcriber != null and transcriber.? != .null))
-                            return error.InvalidEnrichmentConfig;
-                        owned.producer_json = try document_content_hash.canonicalJsonValueAlloc(alloc, producer);
-                    }
-                    if (item.object.get("transcriber")) |transcriber| {
-                        // The typed shorthand replaces producer_json rather
-                        // than layering on it, and only an asset stream can
-                        // hold transcripts.
-                        if (owned.kind != .asset or owned.producer_json.len > 0) return error.InvalidEnrichmentConfig;
-                        owned.producer_json = enrichment_config_validation.transcriberShorthandProducerJsonAlloc(alloc, transcriber) catch |err| switch (err) {
-                            error.OutOfMemory => return err,
-                            else => return error.InvalidEnrichmentConfig,
-                        };
-                        if (owned.content_type.len == 0) owned.content_type = try alloc.dupe(u8, "application/json");
-                    }
-                    if (item.object.get("context_sources")) |sources| {
-                        if (sources != .null) {
-                            // Public objects are canonicalized here; the raw
-                            // stored form is never accepted alongside them.
-                            if (owned.context_sources_json.len > 0) return error.InvalidEnrichmentConfig;
-                            owned.context_sources_json = context_sources.canonicalFromPublicAlloc(alloc, sources, item.object.get("refresh"), null, contextFilterLowering()) catch |err| switch (err) {
-                                error.OutOfMemory => return err,
-                                else => return error.InvalidEnrichmentConfig,
-                            };
-                        }
-                    } else if (item.object.get("refresh")) |refresh| {
-                        if (refresh != .null) return error.InvalidEnrichmentConfig;
-                    } else if (owned.context_sources_json.len > 0) {
-                        // Stored form (backup/restore): validate the grammar;
-                        // hosts re-resolve table identities before admission.
-                        var stored = context_sources.parseStoredJson(alloc, owned.context_sources_json) catch |err| switch (err) {
-                            error.OutOfMemory => return err,
-                            else => return error.InvalidEnrichmentConfig,
-                        };
-                        stored.deinit();
-                    }
-                    if (item.object.get("seed")) |seed| {
-                        if (seed != .null) {
-                            // The public mapping object is canonicalized; the
-                            // stored form is never accepted alongside it.
-                            if (owned.seed_json.len > 0 or owned.kind == .group) return error.InvalidEnrichmentConfig;
-                            owned.seed_json = @import("../storage/db/artifact_seeds.zig").canonicalMappingAlloc(alloc, seed) catch |err| switch (err) {
-                                error.OutOfMemory => return err,
-                                else => return error.InvalidEnrichmentConfig,
-                            };
-                        }
-                    } else if (owned.seed_json.len > 0) {
-                        // Stored form (backup/restore): validate the grammar.
-                        var scratch = std.heap.ArenaAllocator.init(alloc);
-                        defer scratch.deinit();
-                        const stored = std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), owned.seed_json, .{}) catch return error.InvalidEnrichmentConfig;
-                        const canonical = @import("../storage/db/artifact_seeds.zig").canonicalMappingAlloc(alloc, stored) catch |err| switch (err) {
-                            error.OutOfMemory => return err,
-                            else => return error.InvalidEnrichmentConfig,
-                        };
-                        alloc.free(owned.seed_json);
-                        owned.seed_json = canonical;
-                    }
-                    if (owned.kind == .embedding) {
-                        if (embedding_producer_json) |raw| {
-                            if (owned.producer_json.len > 0) alloc.free(owned.producer_json);
-                            owned.producer_json = try alloc.dupe(u8, raw);
-                        }
-                    }
-                    try out.append(alloc, owned);
-                }
-            }
+            if (object.get("enrichments")) |enrichments| try collectArtifactEnrichmentArray(alloc, enrichments, embedding_producer_json, out);
             var it = object.iterator();
             while (it.next()) |entry| {
                 if (std.mem.eql(u8, entry.key_ptr.*, "enrichments") or index_metadata.isOpaqueEntry(entry.key_ptr.*)) continue;

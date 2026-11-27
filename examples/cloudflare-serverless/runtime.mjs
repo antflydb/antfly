@@ -251,6 +251,13 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
       compaction_max_documents: Number(env.COMPACTION_MAX_DOCUMENTS ?? 1000),
       compaction_max_artifact_bytes: Number(env.COMPACTION_MAX_ARTIFACT_BYTES ?? 4 * 1024 * 1024) };
     const inference = async request => {
+      // Named enrichment assets (#1791): a Workers AI text model serves
+      // generator-style producers; anything else stays pending in Antfly.
+      if (request.task === "asset") {
+        if (!env.ASSET_MODEL?.startsWith("@cf/") || !env.AI_GATEWAY || typeof request.source !== "string" || request.source.length > 65536) throw new Error("HostedAssetCapabilityUnsupported");
+        const result = await env.AI.run(env.ASSET_MODEL, {prompt: request.source}, {gateway: {id: env.AI_GATEWAY}});
+        return {json: {output: typeof result?.response === "string" ? result.response : JSON.stringify(result ?? null)}};
+      }
       if (request.task !== "embedding" || !env.EMBEDDING_MODEL?.startsWith("@cf/") || !env.AI_GATEWAY ||
         request.dimensions !== Number(env.EMBEDDING_DIMENSIONS ?? 384) || !Array.isArray(request.texts) || request.texts.length < 1 || request.texts.length > 64 || request.texts.some(text => typeof text !== "string" || text.length > 16384)) throw new Error("HostedEmbeddingCapabilityUnsupported");
       return {json: await env.AI.run(env.EMBEDDING_MODEL, {text: request.texts}, {gateway: {id: env.AI_GATEWAY}})};
