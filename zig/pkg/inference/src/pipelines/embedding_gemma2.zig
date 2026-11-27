@@ -6520,6 +6520,8 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
     const model_path = platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_MODEL") orelse return error.SkipZigTest;
     const oracle = platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_MEDIA_ORACLE") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
+    var stage: []const u8 = "load fixtures";
+    errdefer std.debug.print("embeddinggemma2 CUDA grouped Stage failed during {s}\n", .{stage});
     const memory = @import("../runtime/tier/memory.zig");
     const file = @import("../util/c_file.zig");
     const image_path = try std.fs.path.join(a, &.{ std.fs.path.dirname(oracle).?, "image.png" });
@@ -6604,9 +6606,11 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
     const options: Options = .{};
     // FIRST numerical inference uses the real ordered group and the SAME
     // instruction, projected buffers, token order and resident Stage body.
+    stage = "publish mixed text, image and audio";
     var owned = try embedOwned(session, hf.tokenizer(), group, options, session.execution_gate, control, .{ .outside_execution = true });
     defer owned.vectors.deinitOutsideExecution();
     try std.testing.expectEqual(@as(usize, 1), owned.vectors.len());
+    stage = "evaluate mixed reference";
     const raw = try embed(a, session, hf.tokenizer(), group, options, session.execution_gate, control);
     defer a.free(raw.vector);
     try std.testing.expectEqual(raw.input_tokens, owned.input_tokens);
@@ -6622,6 +6626,9 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
         graphs: usize = 0,
         executions: u64 = 0,
         replays: u64 = 0,
+        max_planned_arena_bytes: usize = 0,
+        max_captured_arena_bytes: usize = 0,
+        max_repacked_scratch_savings_bytes: usize = 0,
         fn read(actual: Session, supplied: Control) !@This() {
             // Metadata only, under the SAME actual model cohort. Attest the
             // canonical full published CUDA table before inspecting its ctx;
@@ -6638,15 +6645,22 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
             var result = @This(){ .executions = compute.audio_arena_executes, .replays = compute.audio_graph_replays };
             for (compute.audio_plans.entries) |entry| if (entry.owner != null and entry.owner.?.managed and !entry.disabled) {
                 result.owners += 1;
+                if (entry.owner.?.executable) |executable| {
+                    result.max_planned_arena_bytes = @max(result.max_planned_arena_bytes, executable.storage.bytes);
+                    if (executable.storage.external_output)
+                        result.max_repacked_scratch_savings_bytes = @max(result.max_repacked_scratch_savings_bytes, entry.owner.?.plan.external_scratch_savings_bytes);
+                }
             };
             for (compute.embedding_gemma2_execution.arenas) |arena| if (arena.kind == .audio and arena.graph != null) {
                 result.graphs += 1;
+                result.max_captured_arena_bytes = @max(result.max_captured_arena_bytes, arena.buffers[0].len);
             };
             return result;
         }
     };
     const audio_optin = platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_AUDIO_GRAPH");
     const audio_before = try AudioWitness.read(session, control);
+    stage = "prepare first audio cohort";
     const first_audio = try embedAudios(a, session, hf.tokenizer(), &clips, options, session.execution_gate, control, null);
     defer {
         for (first_audio.vectors) |vector| a.free(vector);
@@ -6654,6 +6668,7 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
         a.free(first_audio.input_tokens);
     }
     try std.testing.expectEqual(@as(usize, 2), first_audio.vectors.len);
+    stage = "replay repeated audio cohorts";
     for (0..if (audio_optin) @as(usize, 6) else @as(usize, 2)) |_| {
         const repeated_audio = try embedAudios(a, session, hf.tokenizer(), &clips, options, session.execution_gate, control, null);
         defer {
@@ -6670,13 +6685,24 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
     }
     const audio_after = try AudioWitness.read(session, control);
     if (audio_optin) {
+        stage = "verify captured audio ownership and replay";
+        std.debug.print("embeddinggemma2 CUDA grouped audio before={any} after={any}\n", .{ audio_before, audio_after });
         try std.testing.expect(audio_after.owners > audio_before.owners);
         try std.testing.expect(audio_after.graphs > audio_before.graphs);
         try std.testing.expect(audio_after.executions >= audio_before.executions + 2);
         try std.testing.expect(audio_after.replays > audio_before.replays);
+        try std.testing.expect(audio_after.max_captured_arena_bytes > 0);
+        try std.testing.expect(audio_after.max_planned_arena_bytes > 0);
+        std.debug.print("embeddinggemma2 CUDA grouped audio max_planned_arena_bytes={d} max_captured_arena_bytes={d} max_repacked_scratch_savings_bytes={d} replays={d}\n", .{
+            audio_after.max_planned_arena_bytes,
+            audio_after.max_captured_arena_bytes,
+            audio_after.max_repacked_scratch_savings_bytes,
+            audio_after.replays - audio_before.replays,
+        });
     }
     // Existing six-second closed.mp4 naturally selects six unique frames:
     // image_batch uses one full4 +one final2 flush, without changing cadence.
+    stage = "prepare video and qualify replay";
     const video_group: Group = .{ .content = &.{.{ .video = @embedFile("../testdata/video/closed.mp4") }} };
     const video_inspection = try @import("../ops/cuda/video.zig").inspectEmbedding(a, @embedFile("../testdata/video/closed.mp4"), .{});
     const video_geometry = @import("../architectures/gemma4_projector.zig").embeddingGemma2VideoGeometry(video_inspection.width, video_inspection.height);

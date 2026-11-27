@@ -22450,6 +22450,12 @@ fn convertDTypeOp(ctx: *anyopaque, tensor_ct: CT, target: ops.GraphDType) anyerr
         try copyFromDeviceTracked(self, device, tensor.buffer, byte_len);
         return createTensorWithDType(self, device, shape, tensor.elem_count, .i32);
     }
+    if (target == .f32 and tensor.dtype == .bf16 and tensor.quant_type == null) {
+        var output = try OwnedF32Output.alloc(self, tensor.shape, tensor.elem_count);
+        defer output.deinit();
+        try self.kernels.launchSourceWidenBf16(&self.ctx, output.buffer, tensor.buffer, tensor.elem_count);
+        return output.intoTensor();
+    }
     try ensureF32(tensor);
     const shape = try dupeShape(self.allocator, tensor.shape);
     errdefer self.allocator.free(shape);

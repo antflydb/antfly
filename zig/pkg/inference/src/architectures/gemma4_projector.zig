@@ -5858,9 +5858,35 @@ fn depthwiseConvWeightCt(
             const key = try AudioCacheRecipe.depthwiseKey(&key_buf, self.name, self.kernel_size, self.hidden);
             const cache = self.store.huggingface and !audioHostOps().resident and (self.cb.kind() == .metal or self.cb.kind() == .cuda);
             if (cache) if (try self.cb.modelConstant(key, null)) |hit| return hit;
-            // CUDA resident checkpoint weights can be BF16, but transpose and
-            // the prepared-constant cache require F32. Use tensorF32 below to
-            // materialize and transpose these small constants once.
+            if (cache and self.cb.kind() == .cuda) {
+                if (self.store.residentWeight(self.name)) |resident| {
+                    defer self.cb.free(resident);
+                    const hidden_dim: i64 = @intCast(self.hidden);
+                    const kernel: i64 = @intCast(self.kernel_size);
+                    const kernel_first = (try self.cb.tensorShapeMatches(resident, &.{ kernel, hidden_dim })) orelse false;
+                    const hidden_first = ((try self.cb.tensorShapeMatches(resident, &.{ hidden_dim, kernel })) orelse false) or
+                        ((try self.cb.tensorShapeMatches(resident, &.{ hidden_dim, 1, kernel })) orelse false);
+                    if (kernel_first or hidden_first) {
+                        const values = switch (try self.cb.tensorDType(resident)) {
+                            .f32 => resident,
+                            .bf16 => try self.cb.tryConvertDType(resident, .f32),
+                            else => null,
+                        };
+                        if (values) |f32_values| {
+                            if (kernel_first) {
+                                const source = if (f32_values == resident)
+                                    try self.cb.primReshape(resident, &.{ kernel, hidden_dim })
+                                else
+                                    f32_values;
+                                return publishAudioConstant(self.cb, key, source, true);
+                            }
+                            defer if (f32_values != resident) self.cb.free(f32_values);
+                            const transposed = try self.cb.primTranspose(f32_values, &.{ 1, 0 }, &.{ hidden_dim, kernel });
+                            return publishAudioConstant(self.cb, key, transposed, true);
+                        }
+                    }
+                } else |err| if (err != error.MissingWeight) return err;
+            }
             if (!audioHostOps().resident and self.cb.kind() != .cuda) {
                 if (self.store.residentWeight(self.name)) |resident| {
                     const expected = [_]i64{ @intCast(self.kernel_size), @intCast(self.hidden) };
