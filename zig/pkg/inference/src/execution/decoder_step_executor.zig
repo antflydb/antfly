@@ -1106,7 +1106,10 @@ pub const Executor = struct {
             .state_may_have_advanced = &state_may_have_advanced,
         };
         try self.context.cb.checkExecutionControl();
-        if (graph.compute.bounded_decode_graph.phase == .replay) try render.advanceCpu();
+        if (graph.compute.bounded_decode_graph.phase == .replay) {
+            try render.advanceCpu();
+            try self.context.cb.checkExecutionControl();
+        }
         try graph.run(&render, Render.run);
         graph.noteKvTokens(storage, render.max_tokens);
         try graph.read(&burst, first, second);
