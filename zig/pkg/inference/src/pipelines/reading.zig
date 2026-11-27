@@ -1677,13 +1677,28 @@ pub const ReadingPipeline = struct {
 
         var numerical = try decoder_stage.Decoder.initWithOptions(allocator, self.decoder, encoder_outputs, enc_seq_len, encoder_attention_mask, stage_runtime.outputVocabulary(self.decoder) orelse 0, self.execution_control, .{ .allow_native = false, .allow_merged = false, .output_rows = .full_prefix });
         defer numerical.deinit();
+        const GreedyPolicy = struct {
+            prefix: []const i64,
+            no_repeat: usize,
+
+            fn accepts(raw: *const anyopaque, token: u32) bool {
+                const self_policy: *const @This() = @ptrCast(@alignCast(raw));
+                return !wouldRepeatNgram(self_policy.prefix, @intCast(token), self_policy.no_repeat);
+            }
+        };
         const decode_loop_start = nowNs();
         var decoder_run_total_ns: u64 = 0;
         var decoder_steps: usize = 0;
         while (dec_len < max_len) {
             const decoder_run_start = nowNs();
             if (self.execution_control) |control| try control.update(.executing, @intCast(dec_len), @intCast(max_len));
-            var row = try numerical.stepFullPrefix(dec_ids[0..dec_len], null);
+            const prefix = dec_ids[0..dec_len];
+            const policy = GreedyPolicy{ .prefix = prefix, .no_repeat = self.config.no_repeat_ngram_size };
+            const needs_debug_logits = decoder_steps < 4 and florenceDebugStats();
+            var row = try numerical.stepFullPrefixSelecting(prefix, null, if (needs_debug_logits) null else .{
+                .context = &policy,
+                .accepts = GreedyPolicy.accepts,
+            });
             defer row.deinit();
             const decoder_run_ns = nowNs() - decoder_run_start;
             decoder_run_total_ns += decoder_run_ns;
@@ -1693,7 +1708,7 @@ pub const ReadingPipeline = struct {
             if (decoder_steps <= 4) logTopLogits("logits(session)", decoder_steps, last_logits);
 
             // Greedy: argmax
-            const best_id = selectGreedyToken(last_logits, dec_ids[0..dec_len], self.config.no_repeat_ngram_size);
+            const best_id: usize = row.token orelse selectGreedyToken(last_logits, prefix, self.config.no_repeat_ngram_size);
 
             // Check for EOS
             if (@as(i32, @intCast(best_id)) == self.config.eos_token_id) break;

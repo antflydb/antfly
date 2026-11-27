@@ -395,17 +395,32 @@ fn finalGreedyToken(allocator: std.mem.Allocator, decoder: backends.Session, enc
     return std.math.cast(i32, best) orelse error.LogitsSizeMismatch;
 }
 
+pub const FinalTokenPolicy = struct {
+    context: *const anyopaque,
+    accepts: *const fn (*const anyopaque, u32) bool,
+};
+
+pub const VocabularyResult = union(enum) { row: []f32, token: u32 };
+
 pub fn finalVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Session, inputs: []const session_mod.StageInput, query_rows: usize, vocab: usize, control: ?Control, dispatch: ?@import("tensor_dispatch.zig").Dispatch) ![]f32 {
+    return (try finalVocabularyResult(allocator, decoder, inputs, query_rows, vocab, control, dispatch, null)).row;
+}
+
+pub fn finalVocabularyResult(allocator: std.mem.Allocator, decoder: backends.Session, inputs: []const session_mod.StageInput, query_rows: usize, vocab: usize, control: ?Control, dispatch: ?@import("tensor_dispatch.zig").Dispatch, token_policy: ?FinalTokenPolicy) !VocabularyResult {
     if (query_rows == 0 or vocab == 0) return error.InvalidInputShape;
     var outputs = try @import("tensor_dispatch.zig").runStage(allocator, decoder, inputs, control, dispatch);
     defer outputs.deinit();
     if (outputs.outputs.len != 1) return error.InvalidDecoderOutput;
-    return residentVocabularyRow(allocator, decoder, &outputs, 0, query_rows, vocab, control, dispatch != null);
+    return residentVocabularyResult(allocator, decoder, &outputs, 0, query_rows, vocab, control, dispatch != null, token_policy);
 }
 
 /// The result retains the provider's admission and tensor custody across the
 /// readback. Only the requested row crosses the device boundary.
 pub fn residentVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Session, outputs: *const session_mod.ResidentOutputs, logits_index: usize, query_rows: usize, vocab: usize, control: ?Control, published: bool) ![]f32 {
+    return (try residentVocabularyResult(allocator, decoder, outputs, logits_index, query_rows, vocab, control, published, null)).row;
+}
+
+fn residentVocabularyResult(allocator: std.mem.Allocator, decoder: backends.Session, outputs: *const session_mod.ResidentOutputs, logits_index: usize, query_rows: usize, vocab: usize, control: ?Control, published: bool, token_policy: ?FinalTokenPolicy) !VocabularyResult {
     if (query_rows == 0 or vocab == 0 or logits_index >= outputs.outputs.len) return error.InvalidDecoderOutput;
     const expected = [_]i64{
         1,
@@ -429,6 +444,27 @@ pub fn residentVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Ses
     const knows_dtype = outputs.backend.vtable.tensorDType != null;
     if (knows_dtype and try outputs.backend.tensorDType(logits) != .f32) return error.InvalidDecoderOutput;
     if (control) |active| try active.check();
+    if (token_policy) |policy| {
+        const backend = outputs.backend;
+        if (knows_dtype and (backend.kind() == .cuda or backend.kind() == .metal)) {
+            const candidate = candidate: {
+                var guard = if (control) |active| try active.enterUninterruptible(decoder.interruption()) else null;
+                defer if (guard) |*scope| scope.deinit();
+                break :candidate try backend.argmaxLastRow(logits, query_rows, vocab);
+            };
+            if (control) |active| try active.check();
+            if (candidate) |token| {
+                if (token >= vocab) return error.InvalidDecoderOutput;
+                // Both GPU reductions can return zero as their sentinel. The
+                // task's host scan decides ambiguous or disallowed winners
+                // from this same resident result without running the decoder again.
+                if (token != 0 and policy.accepts(policy.context, token)) {
+                    try operation_scope.finish();
+                    return .{ .token = token };
+                }
+            }
+        }
+    }
     const values = readback: {
         var guard = if (control) |active| try active.enterUninterruptible(decoder.interruption()) else null;
         defer if (guard) |*scope| scope.deinit();
@@ -440,7 +476,7 @@ pub fn residentVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Ses
     };
     errdefer allocator.free(values);
     try operation_scope.finish();
-    return values;
+    return .{ .row = values };
 }
 
 fn readResidentVocabularyRow(allocator: std.mem.Allocator, backend: *const @import("../ops/ops.zig").ComputeBackend, logits: @import("../ops/ops.zig").CT, rows: usize, vocab: usize, knows_dtype: bool) ![]f32 {
@@ -613,6 +649,33 @@ test "encoder decoder resident stages retain hidden state and materialize only t
         try std.testing.expectEqual(@as(usize, 1), broker.calls);
         try std.testing.expectEqual(@as(usize, 4), row.logits.len);
         try std.testing.expect(row.logits[1] > row.logits[0]);
+        const Policy = struct {
+            fn accepts(raw: *const anyopaque, token: u32) bool {
+                const expected: *const u32 = @ptrCast(@alignCast(raw));
+                return token == expected.*;
+            }
+        };
+        const accepted: u32 = 1;
+        const rejected: u32 = 2;
+        var choice = try numerical.stepFullPrefixSelecting(&.{ 0, 1 }, dispatch, .{
+            .context = &accepted,
+            .accepts = Policy.accepts,
+        });
+        defer choice.deinit();
+        if (kind == .native) {
+            try std.testing.expectEqualSlices(f32, row.logits, choice.logits);
+        } else {
+            try std.testing.expectEqual(@as(?u32, 1), choice.token);
+            try std.testing.expectEqual(@as(usize, 0), choice.logits.len);
+        }
+        var fallback = try numerical.stepFullPrefixSelecting(&.{ 0, 1 }, dispatch, .{
+            .context = &rejected,
+            .accepts = Policy.accepts,
+        });
+        defer fallback.deinit();
+        try std.testing.expectEqual(@as(?u32, null), fallback.token);
+        try std.testing.expectEqualSlices(f32, row.logits, fallback.logits);
+        try std.testing.expectEqual(@as(usize, 3), broker.calls);
         const retained = try encoded.resident.values.backend.toFloat32(encoded.resident.values.outputs[0], a);
         defer a.free(retained);
         try std.testing.expectEqualSlices(f32, &.{ 0, 1, 2, 0, 3, 0, 1, 0 }, retained);

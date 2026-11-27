@@ -29,6 +29,7 @@ pub const Row = struct {
     logits: []const f32 = &.{},
     vocab_size: usize = 0,
     stats: ?ops.WhisperLogitsStatsRaw = null,
+    token: ?u32 = null,
     owned_logits: ?[]f32 = null,
     host_outputs: []backends.Tensor = &.{},
     host_logits: ?backends.Tensor = null,
@@ -249,6 +250,10 @@ pub const Decoder = struct {
     }
 
     pub fn stepFullPrefix(self: *Decoder, prefix: []const i64, dispatch: anytype) !Row {
+        return self.stepFullPrefixSelecting(prefix, dispatch, null);
+    }
+
+    pub fn stepFullPrefixSelecting(self: *Decoder, prefix: []const i64, dispatch: anytype, token_policy: ?stages.FinalTokenPolicy) !Row {
         var row = Row{ .allocator = self.allocator, .vocab_size = self.vocab_size };
         errdefer row.deinit();
         var inputs: stages.DecoderInputs = undefined;
@@ -260,8 +265,13 @@ pub const Decoder = struct {
                 const adapters = @import("tensor_dispatch.zig");
                 const stage = adapters.stageDispatcher(dispatch);
                 if (adapters.hasDispatcher(dispatch) and stage == null) return error.DecoderDispatchChanged;
-                row.owned_logits = try stages.finalVocabularyRow(self.allocator, self.session, inputs.stageInputs(), prefix.len, self.vocab_size, self.control, stage);
-                row.logits = row.owned_logits.?;
+                switch (try stages.finalVocabularyResult(self.allocator, self.session, inputs.stageInputs(), prefix.len, self.vocab_size, self.control, stage, token_policy)) {
+                    .row => |logits| {
+                        row.owned_logits = logits;
+                        row.logits = logits;
+                    },
+                    .token => |token| row.token = token,
+                }
             },
             .host => {
                 const host_inputs = try inputs.hostInputs();
