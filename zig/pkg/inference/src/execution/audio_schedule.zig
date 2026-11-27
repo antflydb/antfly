@@ -305,6 +305,7 @@ pub const Plan = struct {
     constant_count: usize = 0,
     last_use: [capacity]u16 = @splat(0),
     next_id: u16 = 0,
+    input_count: u16 = 0,
     output: u16 = 0,
     /// Exact retained request for the learned schedule. Publication happens
     /// after every array is allocated so a failed reservation can be retried.
@@ -614,6 +615,7 @@ pub const Plan = struct {
     }
 
     pub fn replay(self: *Plan, cb: *const ops.ComputeBackend, inputs: []const CT, cleanup: @import("cleanup_context.zig").Context) !CT {
+        if (inputs.len != self.input_count or inputs.len > capacity) return error.AudioScheduleInvalid;
         var values: [capacity]?CT = @splat(null);
         var owned: [capacity]bool = @splat(false);
         defer for (values, owned) |value, own| {
@@ -679,7 +681,9 @@ pub const Capture = struct {
         plan.last_use = @splat(0);
         plan.count = 0;
         plan.constant_count = 0;
-        plan.next_id = @intCast(inputs.len);
+        std.debug.assert(inputs.len <= capacity);
+        plan.input_count = @intCast(inputs.len);
+        plan.next_id = plan.input_count;
         var self = Capture{ .plan = plan };
         for (inputs, 0..) |ct, i| self.handles[i] = ct;
         return self;
