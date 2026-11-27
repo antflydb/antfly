@@ -3727,16 +3727,18 @@ pub const CudaCompute = struct {
         pub fn projectHead(self: *@This(), cb: *const ops.ComputeBackend, input_ct: CT, weight: CT) !CT {
             const owner = &self.compute.bounded_decode_graph;
             std.debug.assert(cb.ptr == @as(*anyopaque, @ptrCast(self.compute)));
-            if (owner.head.ptr == 0 or self.compute.execution_scope == null)
+            if (owner.head.ptr == 0)
                 return cb.linearNoBias(input_ct, weight, owner.rows, owner.hidden, owner.vocab);
             return cb.observeBackendEntry(.linear_no_bias, &linearNoBiasWithDestination, .{ self.compute, input_ct, weight, owner.rows, owner.hidden, owner.vocab, false, @as(?buffer_mod.DeviceBuffer, owner.head) });
         }
-        pub fn setInput(self: *@This(), input_ct: CT) !void {
+        pub fn embedInput(self: *@This(), embedding: CT, ids: []const i64) !void {
             const owner = &self.compute.bounded_decode_graph;
-            const source = tensorFromCt(input_ct);
-            try ensureF32(source);
-            try ensureCount(source, owner.rows * owner.hidden);
-            try copyFromDeviceTracked(self.compute, owner.input(), source.buffer, source.elem_count * 4);
+            const weight = tensorFromCt(embedding);
+            const destination = owner.input();
+            const bytes = try checkedMul(try checkedMul(owner.rows, owner.hidden), @sizeOf(f32));
+            try buffer_mod.validateRegions(2, .{ weight.buffer, destination }, .{ weight.buffer.len, bytes }, .{ 1, @alignOf(f32) }, 1);
+            const device_ids = try prepareEmbeddingLookup(self.compute, weight, ids, owner.rows, owner.hidden);
+            try launchEmbeddingLookupInto(self.compute, destination, weight, device_ids, owner.rows, owner.hidden, 1.0);
         }
         pub fn input(self: *@This()) !CT {
             const owner = &self.compute.bounded_decode_graph;
@@ -24266,9 +24268,7 @@ fn uploadTempU8(self: *CudaCompute, data: []const u8) !buffer_mod.DeviceBuffer {
     return device;
 }
 
-fn embeddingLookupScaledCommon(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, dim: usize, scale: f32) anyerror!CT {
-    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
-    const weight_tensor = tensorFromCt(weight);
+fn prepareEmbeddingLookup(self: *CudaCompute, weight_tensor: *const CudaTensor, ids: []const i64, total: usize, dim: usize) !buffer_mod.DeviceBuffer {
     try ensureF32F16Bf16OrQuantized(weight_tensor);
     if (ids.len != total) {
         if (cudaLazyProfileEnabled()) std.log.err("cuda_invalid_shape: op=embedding ids_len={d} total={d}", .{ ids.len, total });
@@ -24284,11 +24284,10 @@ fn embeddingLookupScaledCommon(ctx: *anyopaque, weight: CT, ids: []const i64, to
         const id: usize = @intCast(raw_id);
         if (id >= vocab) return error.InvalidTokenId;
     }
-    const ids_device = try uploadTempI64(self, ids);
-    const out_count = try checkedMul(total, dim);
-    var output = try OwnedF32Output.alloc2(self, total, dim, out_count);
-    defer output.deinit();
-    const device = output.buffer;
+    return uploadTempI64(self, ids);
+}
+
+fn launchEmbeddingLookupInto(self: *CudaCompute, device: buffer_mod.DeviceBuffer, weight_tensor: *const CudaTensor, ids_device: buffer_mod.DeviceBuffer, total: usize, dim: usize, scale: f32) !void {
     // Token embedding lookup was previously unattributed at prefill. `total` is
     // the number of tokens gathered (>1 at prefill).
     var embedding_profile_scope = beginPrefillProfile(self, .embedding, total);
@@ -24312,6 +24311,16 @@ fn embeddingLookupScaledCommon(ctx: *anyopaque, weight: CT, ids: []const i64, to
         try self.kernels.launchEmbeddingLookupF32(&self.ctx, device, weight_tensor.buffer, ids_device, total, dim, scale);
     }
     self.stats.launch_embedding += 1;
+}
+
+fn embeddingLookupScaledCommon(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, dim: usize, scale: f32) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const weight_tensor = tensorFromCt(weight);
+    const ids_device = try prepareEmbeddingLookup(self, weight_tensor, ids, total, dim);
+    const out_count = try checkedMul(total, dim);
+    var output = try OwnedF32Output.alloc2(self, total, dim, out_count);
+    defer output.deinit();
+    try launchEmbeddingLookupInto(self, output.buffer, weight_tensor, ids_device, total, dim, scale);
     return output.intoTensor();
 }
 
@@ -45863,7 +45872,7 @@ test "CUDA bounded decoder drains a failed receipt transfer before returning" {
     try std.testing.expect(compute.pinned_scalar_download_buffer.host.ptr == null);
 }
 
-test "LightOnOCR3 CUDA wide graph head projection writes its assigned buffer" {
+test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffers" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;
     var compute = try CudaCompute.testing.init(a);
@@ -45881,13 +45890,31 @@ test "LightOnOCR3 CUDA wide graph head projection writes its assigned buffer" {
     owner.rows = 2;
     owner.hidden = 2;
     owner.vocab = 2;
-    var plan: @import("../../execution/stream_workspace.zig").Plan = .{};
-    var workspace = @import("../../execution/stream_workspace.zig").Scope.observe(&plan);
+    const layout = try @import("bounded_decode_graph.zig").StorageLayout.init(2, 2, 2, 1);
+    var metadata = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, layout.metadata_bytes);
+    defer metadata.free(&compute.ctx);
+    owner.storage_layout = layout;
+    owner.metadata = metadata;
+    defer {
+        owner.metadata = .{};
+        owner.storage_layout = null;
+    }
     try std.testing.expect(owner.mutex.tryLock());
     owner.active = true;
-    compute.execution_scope = &workspace;
     var claim = CudaCompute.BoundedDecodeClaim{ .compute = &compute, .future_tokens = 0 };
     defer claim.deinit();
+    const copied_before = compute.stats.d2d_bytes;
+    const launched_before = compute.stats.launch_embedding;
+    try std.testing.expectError(error.InvalidTokenId, claim.embedInput(input, &.{ 1, 2 }));
+    try std.testing.expectEqual(launched_before, compute.stats.launch_embedding);
+    try claim.embedInput(input, &.{ 1, 0 });
+    try std.testing.expectEqual(copied_before, compute.stats.d2d_bytes);
+    const embedded = try claim.input();
+    defer cb.free(embedded);
+    const gathered = try cb.toFloat32(embedded, a);
+    defer a.free(gathered);
+    try std.testing.expectEqualSlices(f32, &.{ 5, 7, 2, 3 }, gathered);
+
     var observation = @import("../../execution/runtime_observation.zig").Scope.init();
     defer observation.deinit();
     try std.testing.expectError(error.InvalidShape, linearNoBiasWithDestination(&compute, input, weight, 2, 2, 2, false, tensorFromCt(input).buffer));

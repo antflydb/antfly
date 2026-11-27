@@ -1029,9 +1029,7 @@ pub const Executor = struct {
         errdefer self.context.allocator.free(first);
         const second = try self.context.allocator.alloc(u32, claimed.len);
         errdefer self.context.allocator.free(second);
-        const embedded = try self.context.cb.embeddingLookup(embedding, input_ids, claimed.len, self.context.gpt_config.hidden_size);
-        defer self.context.cb.free(embedded);
-        try graph.setInput(embedded);
+        try graph.embedInput(embedding, input_ids);
         const Render = struct {
             pipeline: *Executor,
             items: []MixedBatchDecodeItem,
