@@ -16,7 +16,7 @@ import SwiftUI
   private weak var store: Store?
   private var configuration: UpdateConfiguration?
   private var installHandler: (() -> Void)?
-  private var installing = false
+  @Published private var installing = false
   private var installAttempt = UUID()
   private var installationTask: Task<Void, Never>?
   private let defaults: UserDefaults
@@ -56,15 +56,13 @@ import SwiftUI
       .sink { [weak self] _ in
         // @Published emits before assigning. Inspect the settled state on the
         // next actor turn so a transition into recording cannot look idle.
-        Task { @MainActor in self?.resumeInstallationIfIdle() }
+        Task { @MainActor in
+          self?.objectWillChange.send()
+          self?.resumeInstallationIfIdle()
+        }
       }.store(in: &observations)
     let bundle = Bundle.main
-    let applications =
-      FileManager.default.urls(for: .applicationDirectory, in: .localDomainMask)
-      + FileManager.default.urls(for: .applicationDirectory, in: .userDomainMask)
-    let installed = applications.contains {
-      bundle.bundleURL.deletingLastPathComponent().standardizedFileURL == $0.standardizedFileURL
-    }
+    let installed = AppInstallation.installed
     guard let config = UpdateConfiguration(info: bundle.infoDictionary ?? [:], installed: installed)
     else {
       if bundle.object(forInfoDictionaryKey: "AntflyUpdatesEnabled") as? Bool == true {
@@ -83,6 +81,26 @@ import SwiftUI
     enabled = true
     status = "Updates preserve your settings, dictionary, credentials, and retained history."
     controller.startUpdater()
+  }
+  var canInstallApplication: Bool { AppInstallation.available && idle && !installing }
+  func installApplication() {
+    guard canInstallApplication, let store else { return }
+    installing = true
+    store.working = true
+    Task {
+      guard let target = AppInstallation.prepareInstallation() else {
+        store.working = false
+        installing = false
+        return
+      }
+      await store.prepareToQuit()
+      if AppInstallation.relaunch(target) {
+        NSApp.terminate(nil)
+      } else {
+        store.resumeAfterFailedUpdate()
+        installing = false
+      }
+    }
   }
   func check() { controller?.checkForUpdates(nil) }
   func feedURLString(for updater: SPUUpdater) -> String? {
@@ -161,9 +179,15 @@ struct UpdateSettings: View {
       Toggle("Download updates automatically", isOn: $updates.automaticallyDownloads)
         .disabled(!updates.enabled)
       Toggle("Include beta releases", isOn: $updates.includeBeta).disabled(!updates.enabled)
+      if AppInstallation.available {
+        Button("Install in Applications…") { updates.installApplication() }
+          .disabled(!updates.canInstallApplication)
+      }
       Text(updates.status).font(.caption).foregroundStyle(.secondary)
-      Text("App updates include the bundled Antfly engine. Downloaded models, local server data, and external servers are preserved.")
-        .font(.caption).foregroundStyle(.secondary)
+      Text(
+        "App updates include the bundled Antfly engine. Downloaded models, local server data, and external servers are preserved."
+      )
+      .font(.caption).foregroundStyle(.secondary)
     }
   }
 }

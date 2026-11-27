@@ -26,7 +26,9 @@ available for reproducible installs.
 After downloading:
 
 1. Quit any development copy and unzip the download.
-2. Move **Antfly Dictation.app** into `/Applications` or `~/Applications`, then open it.
+2. Open **Antfly Dictation.app** and choose **Move to Applications**, or move it
+   into `/Applications` or `~/Applications` yourself. If you choose **Not Now**,
+   Settings → General → **Install in Applications…** remains available.
 3. Allow microphone access and enable the app in Accessibility for Fn/Globe and paste.
 4. Keep **On this Mac** selected. Automatic presets use ready Apple speech on
    macOS 26+, otherwise select **Download Whisper Tiny…**. No server address or
@@ -759,3 +761,35 @@ detection is respected, and English-only Whisper backends do not infer detection
 Unknown advertised formats retain the full identifier instead of guessing. These
 fields are optional: existing released catalogs already supply backend identity,
 and older known canonical Whisper identifiers retain compatibility.
+
+### History storage and browser editors
+
+Enabling and saving history retention automatically checks/creates the selected
+Antfly table, including before the first dictation. Uploads write directly to
+their original destination, so an existing table needs only write permission.
+A missing-table response triggers shared preparation and one upload retry.
+Canceling setup removes that caller; when its last caller leaves, the underlying
+request is canceled too. Authentication and service failures preserve local
+history and pending uploads rather than being treated as a missing table.
+Disabling retention never creates storage or enables new uploads. External
+servers must grant the configured credential permission to create a missing table.
+
+A history entry’s **Not pasted** label describes delivery into the destination app,
+not whether the entry was saved. Local retention and server-sync status are shown
+separately. Dictation still works while optional server history is unavailable.
+
+For Chrome and other rich web editors, click inside the message body before using
+the global shortcut. Foreground activation warms the application’s accessibility
+tree with bounded background requests. Field capture snapshots the original focused element at shortcut time. Background retries
+resolve only that element’s advertised editor chain; they cannot choose a newly
+focused field. A slow or unavailable initial snapshot fails safely to copy.
+Capture never searches a page for an arbitrary field.
+Secure/disabled fields, changed focus, and unresponsive accessibility providers
+keep the result available to copy; automatic Enter still requires confirmed paste.
+A test inside Antfly Dictation does not capture an external editor.
+
+Native browser qualification: open a local page containing an autofocus input,
+textarea, and `contenteditable` message body in a fresh Chrome window/profile.
+Verify capture before a screen reader has activated browser accessibility, then
+verify switching fields/windows, secure fields, and toggling Accessibility access.
+Use synthetic text; Gmail compose should also be rechecked on an affected Mac.

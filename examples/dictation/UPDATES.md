@@ -16,6 +16,21 @@ migration from an ad hoc development build to Developer ID signing may require
 re-enabling Accessibility for the installed app. Test permission continuity when
 qualifying subsequent releases; macOS owns those permissions.
 
+Official releases opened outside Applications offer **Move to Applications** before
+starting the engine or permission onboarding. The installer copies the complete
+running bundle (including from an App Translocation mount), preserves extended
+attributes and framework symlinks, and verifies Antfly’s Developer ID signature
+before and after copying. It uses `/Applications` when writable, otherwise
+`~/Applications`. An existing installation is opened rather than overwritten.
+**Not Now** suppresses later launch prompts; **Install in Applications…** remains
+available in Settings → General. The original downloaded copy is kept. No
+administrator password is requested; failures offer manual Finder installation.
+Installation shows progress while copy and signature verification run on a worker.
+Cancel stops the owned subprocess and removes staging files before returning;
+after the verified bundle is published, installation completes. Applications
+symlinks pointing outside the installation folders are reported as conflicts and
+never relaunched as installed apps. Development builds never prompt.
+
 Use **Check for Updates…** in the application menu, menu-bar panel, or Settings.
 Settings also provides automatic checks, automatic downloads, and beta opt-in.
 Automatic checks and downloads are initially off. Sparkle owns the update
