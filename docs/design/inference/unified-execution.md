@@ -2325,3 +2325,14 @@ pages/s, with one two-row replay. One page admission requested
 observed 25,768,492,592 admitted bytes against the 25,769,803,776-byte
 cap. This is a domain-local snapshot and does not attribute the
 admitted bytes to individual owners.
+
+The reader publication repair at `0af60f7b4d` passed all 31 focused
+CUDA tests. The physical warm-follower fixture verified that a page
+using existing workspace enters the admitted cohort and that
+unregistering it restores the prior count. The local rollback test
+also verified that denied batch growth preserves existing metadata.
+The initial full-window serving run matched all 256 pages at 7.1570
+pages/s and reached 97-row replay. GPU-domain scratch pressure still
+occurred under the unchanged cap. The test and serving receipts are
+`52d4ce2752af428fca04d736afee3462b2ac223ac34608b2d70fb7daef5eb73d`
+and `eeac946d572505a2902d3cb7c2bd5398aa9e25f87005cce8d6ac87c557053561`.
