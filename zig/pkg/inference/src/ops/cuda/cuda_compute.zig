@@ -3739,6 +3739,7 @@ pub const CudaCompute = struct {
         compute: *CudaCompute,
         future_tokens: usize,
         head_destination: ?buffer_mod.DeviceBuffer,
+        capture_scope: ?@import("../../execution/stream_workspace.zig").Scope = null,
         launch_route: ?@import("../../execution/runtime_observation.zig").CudaDecoderWorkspace.Route = null,
         pub fn deinit(self: *@This()) void {
             self.compute.bounded_decode_graph.active = false;
@@ -3807,7 +3808,7 @@ pub const CudaCompute = struct {
             const WorkspaceScope = @import("../../execution/stream_workspace.zig").Scope;
             const capture = phase == .capture;
             var scope: ?WorkspaceScope = if (capture)
-                try owner.bindArena()
+                self.capture_scope orelse return error.InvalidExecutionPlan
             else if (phase == .learn) WorkspaceScope.observe(plan) else null;
             var capture_active = false;
             errdefer {
@@ -4198,6 +4199,7 @@ pub const CudaCompute = struct {
             };
         }
         const head_destination = try owner.bindExecutionStorage();
+        const capture_scope = if (owner.phase == .capture) try owner.bindArena() else null;
         if (self.captured_cache_roots) |roots| try roots.beginGeneration(self, current);
         try self.lighton_attention.init(&self.ctx);
         if (owner.phase != .replay) {
@@ -4215,7 +4217,12 @@ pub const CudaCompute = struct {
         };
         owner.future_tokens = future_tokens;
         claimed = true;
-        return .{ .compute = self, .future_tokens = future_tokens, .head_destination = head_destination };
+        return .{
+            .compute = self,
+            .future_tokens = future_tokens,
+            .head_destination = head_destination,
+            .capture_scope = capture_scope,
+        };
     }
 
     pub fn beginLightOnTokenBurst(cb: *const ops.ComputeBackend, embedding_weight: CT, rows: usize, steps: usize, hidden: usize, vocab: usize, suppress_ids: []const i32) !?LightOnTokenBurst {
