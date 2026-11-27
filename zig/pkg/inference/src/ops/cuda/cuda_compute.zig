@@ -4226,10 +4226,16 @@ pub const CudaCompute = struct {
         phase.declareAttentionScratch(self.lighton_attention_chunk128) catch |err| switch (err) {
             error.InvalidShape, error.Overflow => return .unsupported,
         };
+        phase.declareAttentionOutput() catch |err| switch (err) {
+            error.InvalidShape, error.Overflow => return .unsupported,
+        };
         if (!self.lighton_fused_gdn_decode_enabled or self.ctx.info.compute_major < 8)
             phase.declareRecurrentScratch() catch |err| switch (err) {
                 error.InvalidShape, error.Overflow => return .unsupported,
             };
+        phase.declareRecurrentOutput() catch |err| switch (err) {
+            error.InvalidShape, error.Overflow => return .unsupported,
+        };
         const owner = &self.bounded_decode_graph;
         if (!owner.mutex.tryLock()) return error.ReaderEpochBackendBusy;
         defer owner.mutex.unlock();
@@ -5400,7 +5406,7 @@ pub const CudaCompute = struct {
         }
         if (!initialized) return null;
         try self.lighton_recurrent.init(&self.ctx);
-        const output = (try allocUninitF32ShapeOp(self, &.{ @intCast(states.len), @intCast(width) })).?;
+        const output = try recurrentLayerOutput(self, states.len, width, inputs);
         errdefer cb.free(output);
         const fused_decode = self.lighton_fused_gdn_decode_enabled and !self.resident_training_cache and
             self.lazy_host_store == null and self.ctx.info.compute_major >= 8 and safe_tensors: {
@@ -5439,6 +5445,27 @@ pub const CudaCompute = struct {
             state.failed = false;
         }
         return output;
+    }
+
+    fn recurrentLayerOutput(self: *CudaCompute, rows: usize, width: usize, inputs: [4]CT) !CT {
+        if (!self.bounded_decode_graph.active)
+            return (try allocUninitF32ShapeOp(self, &.{ @intCast(rows), @intCast(width) })).?;
+        // Both bounded recurrent forms immediately project this result into
+        // independent hidden storage. The next layer may then reuse the span.
+        const destination = try self.bounded_decode_graph.bindLayerOutput(.recurrent, rows, width);
+        for (inputs) |input| {
+            const source = tensorFromCt(input).buffer;
+            if (kernel_geometry.byteRangesOverlap(destination.ptr, destination.len, source.ptr, source.len)) return error.InvalidAssignedAlias;
+        }
+        return graphLayerOutputTensor(self, destination, rows, width);
+    }
+
+    fn graphLayerOutputTensor(self: *CudaCompute, destination: buffer_mod.DeviceBuffer, rows: usize, width: usize) !CT {
+        const shape = try allocShape2(self.allocator, rows, width);
+        errdefer self.allocator.free(shape);
+        const result = try createTensor(self, destination, shape, try checkedMul(rows, width));
+        tensorFromCt(result).owns_buffer = false;
+        return result;
     }
 
     pub fn lightOnRaggedCoreEnabled(cb: *const ops.ComputeBackend) bool {
@@ -5527,7 +5554,7 @@ pub const CudaCompute = struct {
         try self.lighton_recurrent.init(&self.ctx);
         const pre_admitted = if (@hasField(@TypeOf(request), "device_state_admitted")) request.device_state_admitted else false;
         for (states) |state| try self.prepareLightOnRecurrentState(state, weights, weight_counts, kh, vh, pre_admitted);
-        const output = (try allocUninitF32ShapeOp(self, &.{ @intCast(rows), @intCast(width) })).?;
+        const output = try recurrentLayerOutput(self, rows, width, inputs);
         errdefer cb.free(output);
         var scratch = assigned orelse if (scratch_layout) |layout| try allocDeviceBuffer(self, layout.bytes) else buffer_mod.DeviceBuffer{};
         defer if (!planned) releaseDeviceBuffer(self, &scratch);
@@ -33035,6 +33062,15 @@ const PackedAttentionDestination = struct { parent: CT, row_offset: usize };
 
 /// Capture's packed attention writes each packet directly to the caller's
 /// joined output, keeping the same packet and per-page K/V contract.
+/// Packed attention publishes directly into the layer's admitted output.
+pub fn tryCapturedPackedAttentionOutput(cb: *const ops.ComputeBackend, rows: usize, width: usize) !?CT {
+    if (!acceptsPhysicalImplementation(cb.vtable)) return null;
+    const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    if (!self.bounded_decode_graph.active) return null;
+    const destination = try self.bounded_decode_graph.bindLayerOutput(.attention, rows, width);
+    return try self.graphLayerOutputTensor(destination, rows, width);
+}
+
 pub fn tryCapturedPackedAttentionInto(cb: *const ops.ComputeBackend, q: CT, k: CT, v: CT, attention: ops.AttentionContext, heads: usize, kv_heads: usize, dim: usize, parent: CT, row_offset: usize) !bool {
     if (!acceptsPhysicalImplementation(cb.vtable) or attention.forward_kv_reuse != null) return false;
     const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
@@ -33153,12 +33189,9 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
         if (offset > parent.buffer.len or output_bytes > parent.buffer.len - offset) return error.InvalidAssignedOutputAuthority;
         const destination: buffer_mod.DeviceBuffer = .{ .ptr = try std.math.add(u64, parent.buffer.ptr, offset), .len = output_bytes, .borrowed = true };
         _ = try buffer_mod.validateRegion(destination, output_bytes, @alignOf(f32));
-        for ([_]buffer_mod.DeviceBuffer{ qt.buffer, kt.buffer, vt.buffer }) |source| {
-            if (kernel_geometry.byteRangesOverlap(destination.ptr, output_bytes, source.ptr, source.len)) return error.InvalidAssignedAlias;
-        }
         break :bound destination;
-    } else try allocDeviceBuffer(self, output_bytes);
-    errdefer if (assigned == null) releaseDeviceBuffer(self, &output);
+    } else if (captured) try self.bounded_decode_graph.bindLayerOutput(.attention, views.len, width) else try allocDeviceBuffer(self, output_bytes);
+    errdefer if (assigned == null and !captured) releaseDeviceBuffer(self, &output);
     var scratch = if (captured)
         try self.bounded_decode_graph.bindAttentionWorkspace(scratch_layout.bytes)
     else
@@ -33168,7 +33201,10 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
     params.partials = scratch.ptr;
     params.statistics = scratch.ptr + scratch_layout.statistics_offset;
     const shared_key = try device_storage.layerKey(views[0].kv_cache.sequence_id, attention.layer_index);
-    if (assigned != null) {
+    if (assigned != null or captured) {
+        for ([_]buffer_mod.DeviceBuffer{ qt.buffer, kt.buffer, vt.buffer }) |source| {
+            if (kernel_geometry.byteRangesOverlap(output.ptr, output.len, source.ptr, source.len)) return error.InvalidAssignedAlias;
+        }
         if (kernel_geometry.byteRangesOverlap(output.ptr, output.len, scratch.ptr, scratch.len)) return error.InvalidAssignedAlias;
         if (device_storage.layers.getPtr(shared_key)) |layer| {
             for ([_]buffer_mod.DeviceBuffer{ layer.k, layer.v }) |source| {
@@ -33237,7 +33273,9 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
     self.stats.device_kv_batch_items += views.len;
     self.stats.device_kv_successes += 1;
     if (assigned) |target| return target.parent;
-    return createTensor(self, output, shape.?, scratch_layout.output_elements);
+    const result = try createTensor(self, output, shape.?, scratch_layout.output_elements);
+    tensorFromCt(result).owns_buffer = !captured;
+    return result;
 }
 
 /// Ordinary F32 singleton into a batch parent's exact output subspan. The

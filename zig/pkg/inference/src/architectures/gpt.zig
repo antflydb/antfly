@@ -10484,7 +10484,11 @@ fn runPackedQwenAttention(
     const a = std.heap.page_allocator;
     const width = num_heads * head_dim;
     const kv_width = num_kv_heads * head_dim;
-    const result = (try cb.allocUninitF32Shape(&.{ @intCast(total), @intCast(width) })) orelse return error.UnsupportedTensorType;
+    const assigned_output = if (cb.kind() == .cuda and !sink.hasMetadata())
+        try @import("../ops/cuda/cuda_compute.zig").tryCapturedPackedAttentionOutput(cb, total, width)
+    else
+        null;
+    const result = assigned_output orelse (try cb.allocUninitF32Shape(&.{ @intCast(total), @intCast(width) })) orelse return error.UnsupportedTensorType;
     errdefer cb.free(result);
     var offset: usize = 0;
     var index: usize = 0;
@@ -10528,6 +10532,7 @@ fn runPackedQwenAttention(
         const assigned = cb.kind() == .cuda and count > 1 and !sink.hasMetadata() and
             try @import("../ops/cuda/cuda_compute.zig").tryCapturedPackedAttentionInto(cb, Q, K, V, item, num_heads, num_kv_heads, head_dim, result, offset);
         if (!assigned) {
+            if (assigned_output != null) return error.InvalidExecutionPlan;
             const q = try cb.sliceRows2D(a, Q, offset, rows, width);
             defer cb.free(q);
             const k = try cb.sliceRows2D(a, K, offset, rows, kv_width);

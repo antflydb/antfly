@@ -24,6 +24,7 @@ const memory = @import("../../runtime/tier/memory.zig");
 const plan_mod = @import("../../execution/stream_workspace.zig");
 const paged_attention = @import("paged_attention_bf16.zig");
 const DecodeScratch = paged_attention.DecodeScratch;
+const recurrent_value_dim = 128;
 const recurrent_packet_rows = @import("gated_delta.zig").max_packet_rows;
 const quota_mod = @import("cache_quota.zig");
 const funding_mod = @import("prepared_cache.zig");
@@ -60,7 +61,9 @@ pub const StorageLayout = struct {
     positions: Span,
     counter: Span,
     attention_workspace: ?Span = null,
+    attention_output: ?Span = null,
     recurrent_workspace: ?Span = null,
+    recurrent_output: ?Span = null,
     fused_head_workspace: ?Span = null,
     recurrent_scratch: ?@import("gated_delta.zig").PacketScratch = null,
     metadata_bytes: usize,
@@ -152,8 +155,12 @@ pub const StorageLayout = struct {
     }
 
     fn declareLayerWorkspace(self: *StorageLayout, bytes: usize) !Span {
-        if (bytes == 0 or bytes > plan_mod.limit) return error.InvalidShape;
-        const offset = try self.layerWorkspaceOffset();
+        return self.declareLayerRegion(0, bytes);
+    }
+
+    fn declareLayerRegion(self: *StorageLayout, relative_offset: usize, bytes: usize) !Span {
+        if (bytes == 0 or relative_offset > plan_mod.limit or bytes > plan_mod.limit - relative_offset) return error.InvalidShape;
+        const offset = try std.math.add(usize, try self.layerWorkspaceOffset(), relative_offset);
         self.metadata_bytes = @max(self.metadata_bytes, try std.math.add(usize, offset, bytes));
         return .{ .offset = offset, .bytes = bytes };
     }
@@ -345,6 +352,25 @@ pub const GraphPhase = struct {
         const scratch = try recurrent.PacketScratch.forHeads(@min(descriptor.rows, recurrent_packet_rows), heads.key, heads.value);
         self.storage_layout.recurrent_workspace = try self.storage_layout.declareLayerWorkspace(scratch.bytes);
         self.storage_layout.recurrent_scratch = scratch;
+    }
+
+    pub fn declareAttentionOutput(self: *GraphPhase) !void {
+        if (self.descriptor.attention_layers == 0) return;
+        const geometry = self.descriptor.attention_geometry orelse return error.InvalidShape;
+        const width = try std.math.mul(usize, geometry.heads, geometry.dim);
+        const bytes = try std.math.mul(usize, self.descriptor.rows * @sizeOf(f32), width);
+        const scratch = self.storage_layout.attention_workspace orelse return error.InvalidShape;
+        self.storage_layout.attention_output = try self.storage_layout.declareLayerRegion(try StorageLayout.aligned(scratch.bytes), bytes);
+    }
+
+    pub fn declareRecurrentOutput(self: *GraphPhase) !void {
+        const descriptor = self.descriptor;
+        if (descriptor.recurrent_layers == 0) return;
+        const heads = descriptor.recurrent_heads orelse return error.InvalidShape;
+        const width = try std.math.mul(usize, heads.value, recurrent_value_dim);
+        const bytes = try std.math.mul(usize, descriptor.rows * @sizeOf(f32), width);
+        const scratch_bytes = if (self.storage_layout.recurrent_workspace) |span| span.bytes else 0;
+        self.storage_layout.recurrent_output = try self.storage_layout.declareLayerRegion(try StorageLayout.aligned(scratch_bytes), bytes);
     }
 
     pub fn matchesOwner(self: *const GraphPhase, owner: *const Module) bool {
@@ -722,6 +748,26 @@ pub const Module = struct {
         return bound;
     }
 
+    pub const LayerOutput = enum { attention, recurrent };
+
+    pub fn bindLayerOutput(self: *const Module, kind: LayerOutput, rows: usize, width: usize) !buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const span = (switch (kind) {
+            .attention => layout.attention_output,
+            .recurrent => layout.recurrent_output,
+        }) orelse return error.InvalidExecutionPlan;
+        const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, width), @sizeOf(f32));
+        if (rows != self.rows or bytes != span.bytes) return error.InvalidExecutionPlan;
+        const workspace = switch (kind) {
+            .attention => layout.attention_workspace,
+            .recurrent => layout.recurrent_workspace,
+        };
+        if (workspace) |scratch| {
+            if (span.offset < try std.math.add(usize, scratch.offset, scratch.bytes)) return error.InvalidExecutionPlan;
+        }
+        return self.bindLayerWorkspace(layout, span, bytes);
+    }
+
     pub fn bindFusedHeadWorkspace(self: *const Module) !buffer.DeviceBuffer {
         const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
         const span = layout.fused_head_workspace orelse return error.InvalidExecutionPlan;
@@ -816,6 +862,30 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
     var changed = scratch;
     changed.core_offset -= @sizeOf(f32);
     try std.testing.expectError(error.InvalidExecutionPlan, owner.bindRecurrentWorkspace(changed));
+
+    try phase.declareRecurrentOutput();
+    const with_output = phase.storage_layout;
+    const output = with_output.recurrent_output.?;
+    var output_owner: Module = .{
+        .rows = rows,
+        .storage_layout = with_output,
+        .metadata = .{ .ptr = 0x20000, .len = with_output.metadata_bytes },
+    };
+    const destination = try output_owner.bindLayerOutput(.recurrent, rows, 32 * recurrent_value_dim);
+    try std.testing.expectEqual(@as(usize, rows * 32 * recurrent_value_dim * @sizeOf(f32)), destination.len);
+    try std.testing.expect(output.offset >= recurrent.offset + recurrent.bytes);
+    try std.testing.expectEqual(base.metadata_bytes + @max(attention.bytes, output.offset - base.metadata_bytes + output.bytes), with_output.metadata_bytes);
+    try std.testing.expectError(error.InvalidExecutionPlan, output_owner.bindLayerOutput(.recurrent, rows - 1, 32 * recurrent_value_dim));
+    try std.testing.expectError(error.InvalidExecutionPlan, output_owner.bindLayerOutput(.recurrent, rows, 16 * recurrent_value_dim));
+    output_owner.storage_layout.?.recurrent_output.?.offset = recurrent.offset;
+    try std.testing.expectError(error.InvalidExecutionPlan, output_owner.bindLayerOutput(.recurrent, rows, 32 * recurrent_value_dim));
+
+    try phase.declareAttentionOutput();
+    output_owner.storage_layout = phase.storage_layout;
+    output_owner.metadata.len = phase.storage_layout.metadata_bytes;
+    const attention_output = try output_owner.bindLayerOutput(.attention, rows, 8 * 256);
+    try std.testing.expectEqual(@as(usize, rows * 8 * 256 * @sizeOf(f32)), attention_output.len);
+    try std.testing.expect(attention_output.ptr >= output_owner.metadata.ptr + attention.offset + attention.bytes);
 
     var fused = descriptor;
     fused.hidden = 1024;
