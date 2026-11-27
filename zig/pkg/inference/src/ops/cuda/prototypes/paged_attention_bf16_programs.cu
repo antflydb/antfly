@@ -65,7 +65,7 @@ const uint32_t progress = p.graph_progress ? *p.graph_progress : 0; \
 if (p.graph_progress && progress < p.graph_step) \
 return; \
 const uint32_t delta = p.graph_progress ? progress - p.graph_step : 0; \
-if (page.tokens == 0 || page.tokens > 1024 || delta > 1024 - page.tokens) \
+if (!valid_page(p, page, delta)) \
 return;
 
 // Each page owns an exclusive writable tail. Host validation proves bounds,
@@ -83,6 +83,8 @@ extern "C" __global__ void lighton_attention_write_suffix(
     return;
   const uint32_t physical =
       p.blocks[page.block_offset + token / p.page_size] * p.page_size + token % p.page_size;
+  if (physical >= p.capacity)
+    return;
   const uint32_t destination = physical * p.row_values + d;
   const uint32_t source = item * p.row_values + d;
   const_cast<__half *>(p.k)[destination] = __float2half_rn(p.new_k[source]);

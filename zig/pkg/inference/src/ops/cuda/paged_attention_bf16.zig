@@ -52,6 +52,8 @@ pub const ScratchLayout = struct {
             return error.InvalidShape;
         const chunk_size: usize = if (chunk128) 128 else 32;
         const chunks = (tokens - 1) / chunk_size + 1;
+        // The split kernel maps packet rows and context chunks to grid.y.
+        if (chunks > 65535 / rows) return error.InvalidShape;
         const partial_rows = try std.math.mul(usize, rows * heads, chunks);
         const bytes = try std.math.mul(usize, partial_rows, (dim + 2) * @sizeOf(f32));
         return .{
@@ -97,6 +99,12 @@ pub const DecodeScratch = struct {
         return error.InvalidExecutionPlan;
     }
 };
+
+test "bounded CUDA decoder attention admits contexts above 1024 within its launch geometry" {
+    try std.testing.expectEqual(@as(u32, 33), (try ScratchLayout.init(2, 8, 2, 256, 1025, false)).chunks);
+    try std.testing.expectError(error.InvalidShape, ScratchLayout.init(64, 8, 2, 256, 32768, false));
+    try std.testing.expectEqual(@as(u32, 256), (try ScratchLayout.init(64, 8, 2, 256, 32768, true)).chunks);
+}
 
 test "bounded CUDA decoder declares the full and tail paged attention scratch" {
     const geometry: DecodeScratch.Geometry = .{ .heads = 8, .kv_heads = 2, .dim = 256 };

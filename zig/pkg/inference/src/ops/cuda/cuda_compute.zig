@@ -43116,7 +43116,7 @@ test "LightOnOCR3 CUDA batched attention preserves page bindings and validates b
         defer storage.deinit();
         try cb.provisionKvDeviceWriteHook(&storage);
         var views: [2]ops.KvBatchView = undefined;
-        const lengths = [_]usize{ 17, 65 };
+        const lengths = [_]usize{ 17, 1025 };
         const query = try a.alloc(f32, 2 * width);
         defer a.free(query);
         const keys = try a.alloc(f32, 2 * kv_width);
@@ -43149,7 +43149,7 @@ test "LightOnOCR3 CUDA batched attention preserves page bindings and validates b
         defer cb.free(kt);
         const vt = try cb.fromFloat32Shape(values, &.{ 2, @intCast(kv_width) });
         defer cb.free(vt);
-        var attention = ops.AttentionContext{ .mode = .paged_decode, .total_sequence_len = 65, .query_sequence_len = 1, .kv_sequence_len = 65, .kv_batch = &views };
+        var attention = ops.AttentionContext{ .mode = .paged_decode, .total_sequence_len = lengths[1], .query_sequence_len = 1, .kv_sequence_len = lengths[1], .kv_batch = &views };
         compute.lighton_attention_enabled = false;
         const expected = try cb.gqaPagedAttention(qt, kt, vt, null, attention, 2, heads, kv_heads, 256);
         defer cb.free(expected);
@@ -43191,8 +43191,8 @@ test "LightOnOCR3 CUDA batched attention preserves page bindings and validates b
         try std.testing.expectError(error.InvalidPagedKvBatch, cb.gqaPagedAttention(qt, kt, vt, null, attention, 2, heads, kv_heads, 256));
         try std.testing.expectEqual(writes, compute.stats.device_kv_writes);
         invalid = views;
-        invalid[1].per_item_kv_len = 1025;
-        invalid[1].per_item_total_len = 1025;
+        invalid[1].per_item_kv_len = 1041;
+        invalid[1].per_item_total_len = 1041;
         try std.testing.expect((try tryLightOnBatchedAttention(&compute, qt, kt, vt, attention, &invalid, heads, kv_heads, 256, null)) == null);
         try std.testing.expectEqual(writes, compute.stats.device_kv_writes);
     }
