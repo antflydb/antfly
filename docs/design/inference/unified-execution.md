@@ -1347,6 +1347,12 @@ Released EmbeddingGemma 2 grouped audio recorded one graph and replayed
 it twice. Its maximum planned and captured arena sizes both measured
 38,017,792 bytes.
 
+The released T5-small CPU comparison on the existing `961bcaa6c3`
+binary used the same advancing positions and 200 µs collection
+control. All intended pairs coalesced and greedy tokens matched.
+Serial arm medians were 6.70 and 6.58 ms. Fused medians were 9.22
+and 9.35 ms. CPU retains direct resident execution by default.
+
 ### Issue closure audit
 
 This audit reconciles the original `2f2438e67f` implementation review
