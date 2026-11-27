@@ -1220,6 +1220,7 @@ const EnrichmentAppendContext = struct {
     identity_visibility: ?*db_core.IdentityVisibilityState = null,
     cache_source: ?resolution_runtime_mod.CandidateSource = null,
     resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
+    resolution_encoding_admission: @import("artifact_publication_resolution.zig").EncodingAdmission = .{},
     promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
 
     fn batchContext(self: *const EnrichmentAppendContext) BatchExecutionContext {
@@ -6584,6 +6585,7 @@ pub const DB = struct {
         const resources = self.core.batchExecutionResources();
         const context_value: EnrichmentAppendContext = .{
             .cache_source = self.resolution_candidate_source,
+            .resolution_encoding_admission = .{ .clock = self.backend_runtime.monotonicClock() },
             .alloc = self.runtime_alloc,
             .root_incarnation = self.root_incarnation,
             .artifact_publication_dispatcher = self.local_execution.artifact_publication_dispatcher,
@@ -67706,7 +67708,8 @@ const NoopResolutionHandoffPublishHook = struct {
 
 fn processOrderedResolutions(ctx_ptr: *anyopaque, alloc: Allocator, resolvers: []const resolution_runtime_mod.ResolverConfig, store: resolver_lib.ArtifactStore, provider: ?resolver_lib.CandidateProvider, changed_keys: []const []const u8, candidate_source: ?resolution_runtime_mod.CandidateSource, embedder: ?embedder_mod.DenseEmbedder) !bool {
     const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
-    return @import("artifact_publication_resolution.zig").process(alloc, ctx.store, ctx.artifact_publication_dispatcher, resolvers, store, provider, changed_keys, candidate_source, embedder);
+    defer if (ctx.resolution_runtime) |runtime| runtime.notePublicationLimit(ctx.resolution_encoding_admission.hard_limit_blocked);
+    return @import("artifact_publication_resolution.zig").process(alloc, ctx.store, ctx.artifact_publication_dispatcher, ctx.index_manager.resource_manager, &ctx.resolution_encoding_admission, resolvers, store, provider, changed_keys, candidate_source, embedder);
 }
 
 fn appendResolutionRecord(ctx_ptr: *anyopaque, write: resolution_runtime_mod.RecordWrite) !u64 {

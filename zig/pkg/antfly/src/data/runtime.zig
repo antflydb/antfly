@@ -9318,6 +9318,7 @@ pub const DataServer = struct {
     fn enqueueArtifactPublicationObserved(ptr: *anyopaque, group_id: u64, namespace: [24]u8, command: []const u8, receipt: ?*artifact_publication_dispatch.Receipt) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+        try self.write_source.catalog.requireArtifactPublicationRouting();
         const runtime = self.backend_runtime orelse return error.ArtifactCatalogDrift;
         if (runtime.durable_jobs.executesInline()) return error.ArtifactCatalogDrift;
         const io = runtime.io() orelse return error.ArtifactCatalogDrift;
@@ -9377,6 +9378,77 @@ pub const DataServer = struct {
         };
     }
 
+    fn artifactPublicationRoute(cancellation: *const antfly.raft.transport.http_common.RequestCancellation, local_only: bool) DataRaftBatchRoute {
+        return .{
+            .discovery = .cached,
+            .allow_remote_forward = !local_only,
+            .fail_on_remote_leader = local_only,
+            .campaign_allowed = !local_only,
+            .cancellation = cancellation,
+            .visibility_cancellation = cancellation.token(),
+        };
+    }
+
+    fn resolveArtifactPublicationTable(job: *ArtifactPublicationJob, cancellation: *const antfly.raft.transport.http_common.RequestCancellation) !void {
+        const self = job.server;
+        const catalog = self.write_source.catalog;
+        var budget = catalog.budget(null);
+        budget.deadline_ns = budget.nowNs() +| data_raft_batch_leader_wait_ns;
+        budget.cancellation = cancellation.token();
+        try budget.checkpoint();
+
+        const publication = @import("antfly_local_sources").storage_db_artifact_publication;
+        const expected = publication.namespaceFromBytes(job.proposal.namespace);
+        if (catalog.vtable.acquire_routing_generation) |capture| {
+            // Both initial jobs and successors need only the compact route.
+            // A missed or changed binding on an eventual view gets one fresh
+            // read. The same cancellation and deadline cover both captures.
+            for ([_]bool{ false, true }) |authoritative| {
+                const generation = try capture(catalog.ptr, budget, authoritative);
+                defer generation.release();
+                const session = &generation.indexed;
+                const range = session.rangeForGroup(expected.table_id, job.proposal.group_id, budget) catch |err| switch (err) {
+                    error.TopologyChanged => continue,
+                    else => return err,
+                };
+                if (!identityNamespaceFromRange(range.*).eql(expected)) continue;
+                const index = session.table_id_indexes.get(expected.table_id) orelse {
+                    if (authoritative) return error.TableNotFound;
+                    continue;
+                };
+                const table = session.snapshot.value.tables[index];
+                if (job.table_name) |name| {
+                    if (!std.mem.eql(u8, table.name, name)) continue;
+                }
+                try budget.checkpoint();
+                if (job.table_name == null) job.table_name = try self.alloc.dupe(u8, table.name);
+                return;
+            }
+            return error.IdentityNamespaceMismatch;
+        }
+
+        // Catalog adapters without a compact projection can supply the same
+        // budgeted admin capture. Avoid the generic legacy fallback, which
+        // cannot observe shutdown while its callback is running.
+        if (catalog.vtable.admin_snapshot_with_budget == null) return error.CatalogRoutingUnavailable;
+        var snapshot = try catalog.adminSnapshotWithBudget(budget);
+        defer catalog.freeAdminSnapshot(&snapshot);
+        const range = for (snapshot.ranges, 0..) |range, index| {
+            try budget.checkpointIndex(index);
+            if (range.group_id == job.proposal.group_id) break range;
+        } else return error.IdentityNamespaceMismatch;
+        if (!identityNamespaceFromRange(range).eql(expected)) return error.IdentityNamespaceMismatch;
+        const table = for (snapshot.tables, 0..) |table, index| {
+            try budget.checkpointIndex(index);
+            if (table.table_id == expected.table_id) break table;
+        } else return error.TableNotFound;
+        if (job.table_name) |name| {
+            if (!std.mem.eql(u8, table.name, name)) return error.IdentityNamespaceMismatch;
+        }
+        try budget.checkpoint();
+        if (job.table_name == null) job.table_name = try self.alloc.dupe(u8, table.name);
+    }
+
     fn runArtifactPublicationJobInner(ptr: *anyopaque) !void {
         const job: *ArtifactPublicationJob = @ptrCast(@alignCast(ptr));
         const self = job.server;
@@ -9387,31 +9459,10 @@ pub const DataServer = struct {
         const publication = @import("antfly_local_sources").storage_db_artifact_publication;
         const codec = @import("antfly_local_sources").storage_db_artifact_publication_transport_codec;
         const transport = @import("antfly_local_sources").storage_db_artifact_publication_transport;
-        // Resolve from current authoritative routing only after leaving the
-        // producer stack. The job owns no resident DB or cache lease.
-        const expected_namespace = publication.namespaceFromBytes(job.proposal.namespace);
-        if (job.table_name) |table_name| {
-            // Successor slices revalidate one compact route, not an entire
-            // admin catalog per pair of chunks. No routing snapshot is kept
-            // across network waits or a scheduling handoff.
-            const route_snapshot = try antfly.public_api.table_catalog.routedGroupIdSnapshotUntil(self.alloc, self.write_source.catalog, table_name, job.proposal.group_id, null);
-            const route = route_snapshot.route orelse return error.IdentityNamespaceMismatch;
-            if (route.identity_namespace.table_id != expected_namespace.table_id or
-                route.identity_namespace.shard_id != expected_namespace.shard_id or
-                route.identity_namespace.range_id != expected_namespace.range_id) return error.IdentityNamespaceMismatch;
-        } else {
-            var snapshot = try self.write_source.catalog.adminSnapshot();
-            defer self.write_source.catalog.freeAdminSnapshot(&snapshot);
-            const range = findRangeByGroupId(snapshot.ranges, job.proposal.group_id) orelse return error.IdentityNamespaceMismatch;
-            if (!identityNamespaceFromRange(range).eql(expected_namespace)) return error.IdentityNamespaceMismatch;
-            const table = findTableById(snapshot.tables, range.table_id) orelse return error.TableNotFound;
-            job.table_name = try self.alloc.dupe(u8, table.name);
-        }
+        const cancellation: antfly.raft.transport.http_common.RequestCancellation = .{ .borrowed = &self.background_jobs_shutdown };
+        try resolveArtifactPublicationTable(job, &cancellation);
         const table_name = job.table_name.?;
-        const control_route: DataRaftBatchRoute = .{
-            .discovery = .cached,
-            .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown),
-        };
+        const control_route = artifactPublicationRoute(&cancellation, false);
         // Until the native publication apply path is installed, do not
         // substitute a Raft-shaped receipt for a standalone owner's clock.
         if (self.data_raft == null) return error.ArtifactCatalogDrift;
@@ -9446,13 +9497,7 @@ pub const DataServer = struct {
             try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication = activation, .sync_level = .write }, control_route);
             return;
         }
-        const local_route: DataRaftBatchRoute = .{
-            .allow_remote_forward = false,
-            .fail_on_remote_leader = true,
-            .campaign_allowed = false,
-            .discovery = .cached,
-            .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown),
-        };
+        const local_route = artifactPublicationRoute(&cancellation, true);
         const count = (job.proposal.command.len + codec.chunk_bytes - 1) / codec.chunk_bytes;
         // The queue already owns the compact bytes. Hash and send one bounded
         // chunk at a time; no whole-command JSON/base64 expansion is allocated.
@@ -60882,15 +60927,83 @@ fn implementationTests() type {
             };
             defer server.deinit();
             runtime.durable_jobs = .{ .ptr = &lane, .vtable = &.{ .submit = Lane.submit, .drain_owner = Lane.drain, .close_owner = Lane.drain, .poll = Lane.poll } };
+            const CatalogProbe = struct {
+                const catalog = antfly.public_api.table_catalog;
+                shutdown: *std.atomic.Value(bool),
+                calls: usize = 0,
+
+                fn checkpoint(ptr: *anyopaque, budget: catalog.RoutingBudget) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expect(budget.deadline_ns != null);
+                    try budget.checkpoint();
+                    self.calls += 1;
+                    self.shutdown.store(true, .release);
+                    try budget.checkpoint();
+                    return error.TestUnexpectedResult;
+                }
+                fn capture(ptr: *anyopaque, budget: catalog.RoutingBudget, _: bool) !*catalog.RoutingGeneration {
+                    try checkpoint(ptr, budget);
+                    unreachable;
+                }
+                fn adminWithBudget(ptr: *anyopaque, budget: catalog.RoutingBudget) !antfly.metadata_api.AdminSnapshot {
+                    try checkpoint(ptr, budget);
+                    unreachable;
+                }
+                fn admin(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+                    return error.TestUnexpectedResult;
+                }
+                fn free(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+            };
+            var probe: CatalogProbe = .{ .shutdown = &server.background_jobs_shutdown };
+            server.write_source.catalog = .{
+                .ptr = &probe,
+                .vtable = &.{ .admin_snapshot = CatalogProbe.admin, .free_admin_snapshot = CatalogProbe.free },
+            };
+            const dispatch_port: artifact_publication_dispatch.Port = .{
+                .ptr = &server,
+                .enqueue_fn = DataServer.enqueueArtifactPublication,
+            };
+            {
+                var owner_source = antfly.public_api.ProvisionedKernelOwnerSource.init(
+                    alloc,
+                    server.write_source.replica_root_dir,
+                    server.write_source.catalog,
+                    server.read_source.read_safety_barrier,
+                );
+                defer owner_source.deinit();
+                _ = owner_source.withArtifactPublications(dispatch_port);
+                try std.testing.expect(owner_source.artifact_publications != null);
+            }
             var receipt: artifact_publication_dispatch.Receipt = .{};
             defer receipt.release();
+            try std.testing.expectError(error.CatalogRoutingUnavailable, DataServer.enqueueTrackedArtifactPublication(&server, 17, @splat(1), "owned command", &receipt));
+            try std.testing.expectEqual(@as(usize, 0), server.artifact_publication_queue.jobs);
+            try std.testing.expect(lane.pending == null);
+            server.write_source.catalog.vtable = &.{
+                .admin_snapshot = CatalogProbe.admin,
+                .free_admin_snapshot = CatalogProbe.free,
+                .admin_snapshot_with_budget = CatalogProbe.adminWithBudget,
+            };
+            const catalog_before = server.write_source.catalog;
             try DataServer.enqueueTrackedArtifactPublication(&server, 17, @splat(1), "owned command", &receipt);
             try std.testing.expect(!receipt.abandoned());
             const queued: *DataServer.ArtifactPublicationJob = @ptrCast(@alignCast(lane.pending.?.ptr));
+            try std.testing.expectError(error.Canceled, DataServer.runArtifactPublicationJobInner(queued));
+            try std.testing.expect(queued.table_name == null);
+            server.background_jobs_shutdown.store(false, .release);
+
             queued.upload_root = @splat(2);
             queued.publication_digest = @splat(3);
             queued.next_chunk = 4;
             queued.table_name = try alloc.dupe(u8, "items");
+            server.write_source.catalog = .{
+                .ptr = &probe,
+                .vtable = &.{ .admin_snapshot = CatalogProbe.admin, .free_admin_snapshot = CatalogProbe.free, .acquire_routing_generation = CatalogProbe.capture },
+            };
+            try std.testing.expectError(error.Canceled, DataServer.runArtifactPublicationJobInner(queued));
+            try std.testing.expectEqual(@as(usize, 2), probe.calls);
+            server.background_jobs_shutdown.store(false, .release);
+            server.write_source.catalog = catalog_before;
             const proposal = queued.proposal;
             {
                 var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
@@ -60953,7 +61066,13 @@ fn implementationTests() type {
             try DataServer.enqueueArtifactPublication(&server, 17, recovery.namespace, &hint); // deduplicated admission
             try std.testing.expectEqual(@as(usize, 7), server.artifact_publication_queue.jobs);
             try std.testing.expectEqual(@as(usize, 6), server.artifact_publication_queue.producer_bytes);
+            const cancellation: antfly.raft.transport.http_common.RequestCancellation = .{ .borrowed = &server.background_jobs_shutdown };
+            const route = DataServer.artifactPublicationRoute(&cancellation, false);
+            try DataServer.ensureDataRaftBatchRouteActive(route);
+            try std.testing.expect(!route.cancellation.?.isCancelled());
             server.stopDataServerBackgroundJobs();
+            try std.testing.expect(route.cancellation.?.isCancelled());
+            try std.testing.expectError(error.Cancelled, DataServer.ensureDataRaftBatchRouteActive(route));
             try std.testing.expectEqual(@as(usize, 1), lane.drained);
             try std.testing.expectEqual(@as(usize, 6), server.artifact_publication_queue.jobs);
             for (producers) |producer| server.artifact_publication_queue.release(std.testing.io, producer);
