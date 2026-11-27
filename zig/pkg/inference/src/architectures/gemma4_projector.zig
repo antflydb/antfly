@@ -3343,8 +3343,8 @@ fn audioSubsampleWorkspacePerClip(cfg: AudioConfig, frames: usize, direct: bool,
 fn audioSubsampleCohort(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, features: []const *AudioFeatures) !SubsampledAudio {
     if (features.len == 1) return audioSubsample(cb, a, store, cfg, features[0]);
     const Grouping = audio_schedule.GroupedRows;
-    if (features.len == 0 or features.len > Grouping.capacity) return error.InvalidInputShape;
-    var frames: [Grouping.capacity]usize = undefined;
+    if (features.len == 0 or features.len > Grouping.max_clips) return error.InvalidInputShape;
+    var frames: [Grouping.max_clips]usize = undefined;
     for (features, frames[0..features.len]) |feature, *count| count.* = feature.frames;
     const grouping = try Grouping.resolve(frames[0..features.len]);
     const segments = try a.dupe(usize, grouping.spans[0..features.len]);

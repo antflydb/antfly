@@ -25,17 +25,16 @@ pub fn subsampledRows(frames: usize) usize {
     return frames / 4 + @intFromBool(frames % 4 != 0);
 }
 
-/// Ordered inputs shared by audio projection and workspace admission.
 /// Exact compacted row boundaries shared by admission and the projector.
 pub const GroupedRows = struct {
-    pub const capacity = 4;
+    pub const max_clips = 4;
 
-    spans: [capacity]usize = @splat(0),
-    offsets: [capacity]usize = @splat(0),
+    spans: [max_clips]usize = @splat(0),
+    offsets: [max_clips]usize = @splat(0),
     total: usize = 0,
 
     pub fn resolve(frames: []const usize) !GroupedRows {
-        if (frames.len > capacity) return error.InvalidPreparedAudioRecipe;
+        if (frames.len > max_clips) return error.InvalidPreparedAudioRecipe;
         var result: GroupedRows = .{};
         for (frames, result.spans[0..frames.len], result.offsets[0..frames.len]) |count, *span, *offset| {
             offset.* = result.total;
@@ -46,6 +45,7 @@ pub const GroupedRows = struct {
     }
 };
 
+/// Ordered inputs shared by audio projection and workspace admission.
 pub const ExecutionInputs = struct {
     pub const hidden = 0;
     pub const relative = 1;
@@ -96,7 +96,7 @@ pub const ExecutionInputs = struct {
 pub const AudioRecipe = struct {
     source_bf16: bool = false,
     gradient_clipping_bits: u32 = 0,
-    frames: [GroupedRows.capacity]usize = @splat(0),
+    frames: [GroupedRows.max_clips]usize = @splat(0),
     count: u3,
     hidden: usize,
     output_hidden: usize,
