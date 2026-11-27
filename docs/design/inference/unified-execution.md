@@ -1347,6 +1347,14 @@ Batch 1 remains unqualified for latency because candidate-only median
 controls differed by 13.13%. Its measured A/B median was 339.54 to
 320.10 ms.
 
+The M4 Max Metal serving comparison at `843757726b` used the earlier
+locally installed server (SHA-256 prefix `6bdc45d90ad9`). All five cases
+matched outputs exactly. Two-clip EmbeddingGemma 2, Whisper, GLiNER2.5,
+and DECIDE-1B passed 16-sample-per-side latency gates. Text EmbeddingGemma
+2 initially had noisy baseline p95 controls and passed the isolated
+48-sample-per-side rerun. Its median/p95 changed from 10.68/11.15 to
+10.59/11.01 ms. This was a branch-to-branch regression check.
+
 Subsequent scoped qualification covers these production paths:
 
 | Revision | Backend and workload | Result | Remaining evidence |
