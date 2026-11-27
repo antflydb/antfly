@@ -1467,6 +1467,11 @@ was 1,986,560 bytes, including the logits span, with a 44-byte admitted
 pinned readback. The assigned-buffer fixture also matched the separate
 bank path while consuming an empty stream workspace for the head.
 
+At `4492c73407`, all 28 scoped Spark CUDA checks passed without skips.
+The declared BF16 source convolution packs produced exact border values
+with and without bias in two cuDNN forwards. The released shared-head
+HTTP replay and the 128-page recurrent partition fixture passed again.
+
 At `ee3629cec0`, five scoped Metal audio tests passed without skips.
 The replay fixture rejected missing and excess input bindings before
 dispatch. The same run covered fresh inputs, held results, and
