@@ -777,7 +777,7 @@ fn createGlinerCudaSessionWithLoadPolicy(allocator: std.mem.Allocator, model_pat
 }
 
 test "GLiNER CUDA managed reduced precision remains release gated" {
-    for ([_]GlinerCudaPrecision{ .fp16, .bf16 }) |precision| {
+    for ([_]GlinerCudaPrecision{ .fp16, .bf16, .bf16_full }) |precision| {
         try std.testing.expectError(error.UnqualifiedGlinerCudaPrecision, createCudaSessionWithGlinerPrecision(std.testing.allocator, "/nonexistent-gliner-model", .{}, .dynamic, precision));
     }
 }
@@ -858,7 +858,7 @@ pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
         load_context,
         a4b_request,
         null,
-        .fp32,
+        .auto,
         null,
     );
 }
@@ -4775,6 +4775,15 @@ pub fn getEmbeddingGemma2CudaPolicy(session: Session) ?@import("../ops/cuda/embe
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     if (self.backend_type != .cuda or self.arch_config != .embedding_gemma2) return null;
     return self.backend_data.cuda.compute.embedding_gemma2_policy;
+}
+
+/// Immutable load-time precision, for admission before the execution lock.
+/// A remote/foreign session returns null so callers reserve conservatively.
+pub fn glinerCudaBf16Enabled(session: Session) ?bool {
+    if (comptime !build_options.enable_cuda) return null;
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    return if (self.backend_type == .cuda) self.backend_data.cuda.compute.gliner_bf16_reference else null;
 }
 
 pub fn getCudaRuntimeStats(session: Session) ?CudaRuntimeStats {
@@ -22147,7 +22156,7 @@ test "Native Whisper wrong initial declaration declines before ingress while ini
 }
 
 fn requireQualifiedGlinerCudaPrecision(precision: GlinerCudaPrecision, allow_unqualified: bool) !void {
-    if ((precision == .fp16 or precision == .bf16) and !(@import("builtin").is_test and allow_unqualified)) return error.UnqualifiedGlinerCudaPrecision;
+    if ((precision == .fp16 or precision == .bf16 or precision == .bf16_full) and !(@import("builtin").is_test and allow_unqualified)) return error.UnqualifiedGlinerCudaPrecision;
 }
 
 fn requireGlinerCudaPrecisionManifest(manifest: *const manifest_mod.ModelManifest) !void {
@@ -22201,7 +22210,7 @@ pub fn createSessionFromManifestWithCudaOptions(
                 try requireQualifiedGlinerCudaPrecision(value, allow_unqualified_precision);
                 try requireGlinerCudaPrecisionManifest(manifest);
             }
-            break :blk createCudaSessionWithRequiredProfileAndOptions(allocator, model_path, null, jit, load_context, a4b, null, precision orelse .fp32, manifest, cuda_options);
+            break :blk createCudaSessionWithRequiredProfileAndOptions(allocator, model_path, null, jit, load_context, a4b, null, precision orelse .auto, manifest, cuda_options);
         },
         else => error.UnsupportedBackend,
     };
@@ -22212,7 +22221,7 @@ pub const validateJinaRetrievalAdapter = host_weights.validateJinaRetrievalAdapt
 
 test "GLiNER CUDA bound source retains reduced precision release gates" {
     const manifest = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
-    for ([_]GlinerCudaPrecision{ .fp16, .bf16 }) |precision| {
+    for ([_]GlinerCudaPrecision{ .fp16, .bf16, .bf16_full }) |precision| {
         try std.testing.expectError(error.UnqualifiedGlinerCudaPrecision, createSessionFromManifest(std.testing.allocator, "/never-opened", &manifest, .cuda, .{}, .dynamic, null, precision, false));
         try std.testing.expectError(error.UnsupportedGlinerCudaPrecision, createSessionFromManifest(std.testing.allocator, "/never-opened", &manifest, .cuda, .{}, .dynamic, null, precision, true));
     }

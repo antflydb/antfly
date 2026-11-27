@@ -27,6 +27,9 @@ const Control = @import("../../execution_control.zig").InferenceExecutionControl
 const CT = ops.CT;
 
 pub const Options = struct {
+    backend: ops.BackendKind = .metal,
+    /// Offline qualification only: the session must own BF16 encoder matrices.
+    experimental_bf16_encoder: bool = false,
     /// Must come from the authenticated artifact identity, never from a model
     /// name or an assumption about a loader's preferred compute dtype.
     precision: artifact.Precision = .fp32,
@@ -76,11 +79,16 @@ pub fn plan(config: *const model.Config, prepared: *const processor.PreparedBatc
     const tokens = try mul(admitted.batch, prepared.sequence_length);
     const transient = try mul(tokens, @max(try mul(12, h), try mul(3, i)));
     const relative = try mul(4, try mul(e.max_position_embeddings, h));
-    const activation_bytes = try add(try mul(try add(transient, relative), 4), admitted.routed_bytes);
+    const attention_workspace: usize = if (options.backend == .cuda) (if (options.experimental_bf16_encoder) @import("../../ops/cuda/gliner25_bf16_attention.zig").workspace_limit else @import("../../ops/cuda/gliner25_fp32_attention.zig").workspace_limit) else 0;
+    const reduced_staging = if (options.experimental_bf16_encoder) try mul(try mul(tokens, @max(h, i)), 2) else 0;
+    const activation_bytes = try add(try add(try add(try mul(try add(transient, relative), 4), admitted.routed_bytes), attention_workspace), reduced_staging);
     // One metadata upload may overlap its staging buffer. Mask and relative
     // IDs persist while each routing index buffer is temporary.
     const route_width = @max(@max(prepared.word_width, prepared.query_width), @max(@max(prepared.classification_width, prepared.group_width), admitted.relation_width));
-    const metadata_bytes = try mul(try add(try add(tokens, try mul(prepared.sequence_length, 2)), try mul(try mul(admitted.batch, route_width), 2)), 4);
+    // Compact CUDA preparation may temporarily own a padded table-index
+    // upload and its staging copy before the persistent relative map exists.
+    const compact_metadata = if (options.backend == .cuda) try mul(e.max_position_embeddings, 8) else 0;
+    const metadata_bytes = try add(try mul(try add(try add(tokens, try mul(prepared.sequence_length, 2)), try mul(try mul(admitted.batch, route_width), 2)), 4), compact_metadata);
     const largest_linear = @max(try precision.byteLen(h, h), @max(try precision.byteLen(i, h), try precision.byteLen(h, i)));
     const late_scratch = @max(try add(largest_linear, if (precision == .f32) 0 else try mul(@max(h, i), 4)), try mul(try mul(e.max_position_embeddings, h), 4));
     // The vocabulary upload happens before other encoder weights are loaded.
@@ -148,7 +156,7 @@ pub const Result = struct {
     }
 
     pub fn asHeadInput(self: *const Result, control: ?Control) !head.Input {
-        return .{ .batch = self.prepared.samples.len, .text_length = self.prepared.word_width, .queries = self.prepared.query_width, .text_states = self.text_states, .query_states = self.query_states orelse return error.NoBoundaryQueries, .text_lengths = self.text_lengths, .query_mask = self.prepared.query_marker_mask, .execution_policy = if (self.math.resident_weights) .optimized_v2 else .reference_v1, .control = control };
+        return .{ .batch = self.prepared.samples.len, .text_length = self.prepared.word_width, .queries = self.prepared.query_width, .experimental_bf16_linears = self.math.experimental_bf16_heads, .text_states = self.text_states, .query_states = self.query_states orelse return error.NoBoundaryQueries, .text_lengths = self.text_lengths, .query_mask = self.prepared.query_marker_mask, .execution_policy = if (self.math.resident_weights) .optimized_v2 else .reference_v1, .control = control };
     }
 
     pub fn download(self: *Result, tensor: CT, elements: usize) ![]f32 {
@@ -179,29 +187,73 @@ fn route(math: *math_mod.Context, hidden: CT, prepared: *const processor.Prepare
     return math.kernel(.gather_i32, &.{ prepared.input_ids.len, hidden_size, indices.len }, &.{ hidden, tensor }, 0);
 }
 
-fn encoderLayer(math: *math_mod.Context, hidden: CT, relative: CT, relative_ids: CT, mask: CT, config: *const model.Config, batch: usize, sequence: usize, layer: usize) !CT {
+const CompactRelativeLayout = struct {
+    buckets: [512]i32 = undefined,
+    offsets: [1023]i32 = undefined,
+    rows: usize = 0,
+};
+
+fn compactRelativeLayout(sequence: usize, buckets: u32, maximum: usize) ?CompactRelativeLayout {
+    if (sequence == 0 or sequence > 512 or buckets != 256 or maximum != 512) return null;
+    var layout = CompactRelativeLayout{};
+    var lookup: [512]i32 = @splat(-1);
+    for (layout.offsets[0 .. 2 * sequence - 1], 0..) |*offset, i| {
+        const bucket = @import("../../models/deberta.zig").relativePositionBucket(@as(i64, @intCast(i)) - @as(i64, @intCast(sequence - 1)), buckets, @intCast(maximum));
+        if (lookup[bucket] < 0) {
+            lookup[bucket] = @intCast(layout.rows);
+            layout.buckets[layout.rows] = @intCast(bucket);
+            layout.rows += 1;
+        }
+        offset.* = lookup[bucket];
+    }
+    // Keep the GEMM leading dimension aligned. Padded duplicates are never
+    // referenced by the offset map and introduce no new relative positions.
+    const padded = std.mem.alignForward(usize, layout.rows, 32);
+    @memset(layout.buckets[layout.rows..padded], layout.buckets[layout.rows - 1]);
+    layout.rows = padded;
+    return layout;
+}
+
+test "GLiNER FP32 attention boundary compact rows preserve every bucket" {
+    for ([_]usize{ 1, 31, 128, 129, 511, 512 }) |sequence| {
+        const compact = compactRelativeLayout(sequence, 256, 512).?;
+        try std.testing.expect(compact.rows > 0 and compact.rows <= 512 and compact.rows % 32 == 0);
+        for (compact.offsets[0 .. 2 * sequence - 1], 0..) |offset, i| {
+            const expected = @import("../../models/deberta.zig").relativePositionBucket(@as(i64, @intCast(i)) - @as(i64, @intCast(sequence - 1)), 256, 512);
+            try std.testing.expect(offset >= 0 and offset < compact.rows);
+            try std.testing.expectEqual(expected, @as(u32, @intCast(compact.buckets[@intCast(offset)])));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 256), compactRelativeLayout(128, 256, 512).?.rows);
+    try std.testing.expect(compactRelativeLayout(513, 256, 512) == null);
+    try std.testing.expect(compactRelativeLayout(128, 128, 512) == null);
+}
+
+fn encoderLayer(math: *math_mod.Context, hidden: CT, relative: CT, relative_ids: CT, mask: CT, config: *const model.Config, batch: usize, sequence: usize, relative_rows: usize, layer: usize) !CT {
     const e = config.encoder;
     const h = e.hidden_size;
     const rows = batch * sequence;
     var name: [192]u8 = undefined;
     var stage_started_ns = math.traceNow();
     var stage_started_dispatches = math.stats.device_dispatches;
-    const packed_qkv = try math.linearQkv(hidden, rows, h, layer);
+    const direct_qkv = try math.bf16AttentionProjections(hidden, rows, h, layer, batch, sequence, 3, null);
+    const packed_qkv = if (direct_qkv) |p| @as(?ops.gliner_boundary_device.PackedQkvResult, .{ .query = p[0].?, .key = p[1].?, .value = p[2].? }) else try math.linearQkv(hidden, rows, h, layer);
     const q = if (packed_qkv) |result| result.query else try math.linear(hidden, rows, h, h, try std.fmt.bufPrint(&name, "encoder.layer.{d}.attention.self.query_proj", .{layer}));
     const k = if (packed_qkv) |result| result.key else try math.linear(hidden, rows, h, h, try std.fmt.bufPrint(&name, "encoder.layer.{d}.attention.self.key_proj", .{layer}));
     const v = if (packed_qkv) |result| result.value else try math.linear(hidden, rows, h, h, try std.fmt.bufPrint(&name, "encoder.layer.{d}.attention.self.value_proj", .{layer}));
-    const qr = if (math.resident_weights)
-        try math.derived(.{ .relative_query = @intCast(layer) }, &.{ e.max_position_embeddings, h })
+    const direct_relative = try math.bf16AttentionProjections(relative, relative_rows, h, layer, batch, sequence, 2, .{ .layout = .boundary_padded_v1, .normalization_eps = e.layer_norm_eps, .position_buckets = e.position_buckets, .max_position = e.max_position_embeddings });
+    const qr = if (direct_relative) |p| p[0].? else if (math.resident_weights)
+        try math.derived(.{ .relative_query = @intCast(layer) }, &.{ @intCast(relative_rows), h })
     else
-        try math.linear(relative, e.max_position_embeddings, h, h, try std.fmt.bufPrint(&name, "encoder.layer.{d}.attention.self.query_proj", .{layer}));
-    const kr = if (math.resident_weights)
-        try math.derived(.{ .relative_key = @intCast(layer) }, &.{ e.max_position_embeddings, h })
+        try math.linear(relative, relative_rows, h, h, try std.fmt.bufPrint(&name, "encoder.layer.{d}.attention.self.query_proj", .{layer}));
+    const kr = if (direct_relative) |p| p[1].? else if (math.resident_weights)
+        try math.derived(.{ .relative_key = @intCast(layer) }, &.{ @intCast(relative_rows), h })
     else
-        try math.linear(relative, e.max_position_embeddings, h, h, try std.fmt.bufPrint(&name, "encoder.layer.{d}.attention.self.key_proj", .{layer}));
+        try math.linear(relative, relative_rows, h, h, try std.fmt.bufPrint(&name, "encoder.layer.{d}.attention.self.key_proj", .{layer}));
     try math.traceLayerStage(layer, .qkv, stage_started_ns, stage_started_dispatches);
     stage_started_ns = math.traceNow();
     stage_started_dispatches = math.stats.device_dispatches;
-    const attended = try math.kernel(.deberta_attention, &.{ batch, sequence, e.num_attention_heads, h / e.num_attention_heads, e.max_position_embeddings }, &.{ q, k, v, qr, kr, relative_ids, mask }, 0);
+    const attended = try math.kernel(.deberta_attention, &.{ batch, sequence, e.num_attention_heads, h / e.num_attention_heads, relative_rows }, &.{ q, k, v, qr, kr, relative_ids, mask }, 0);
     try math.traceLayerStage(layer, .attention, stage_started_ns, stage_started_dispatches);
     stage_started_ns = math.traceNow();
     stage_started_dispatches = math.stats.device_dispatches;
@@ -267,10 +319,14 @@ pub fn encodeDevice(cb: *const ops.ComputeBackend, allocator: std.mem.Allocator,
     if (cb.decoderRuntimeHasActiveFrame()) return error.GlinerBoundaryExternalFrame;
     try cb.checkExecutionControl();
     if (options.control) |control| try control.check();
-    const resource_plan = try plan(config, prepared, options);
+    var planning_options = options;
+    planning_options.backend = cb.kind();
+    const resource_plan = try plan(config, prepared, planning_options);
     const math = try math_mod.Context.create(allocator, cb, .{ .max_device_bytes = options.max_device_bytes, .max_result_download_bytes = options.max_result_download_bytes }, options.control);
     errdefer math.destroy();
-    math.encoder_precision = physicalPrecision(options.precision);
+    if (options.experimental_bf16_encoder and (cb.kind() != .cuda or options.precision != .fp32 or options.execution_policy != .reference_v1)) return error.UnsupportedGlinerBoundaryPrecision;
+    math.encoder_precision = if (options.experimental_bf16_encoder) .bf16 else physicalPrecision(options.precision);
+    math.experimental_bf16_heads = options.experimental_bf16_encoder;
     math.configure(options.execution_policy);
     math.setTraceRole(.encoder);
     const e = config.encoder;
@@ -292,7 +348,7 @@ pub fn encodeDevice(cb: *const ops.ComputeBackend, allocator: std.mem.Allocator,
     var hidden = try math.kernel(.mask_rows, &.{ rows, h }, &.{ normed, mask }, 0);
     math.drop(normed);
     math.traceStage(.embedding, embedding_started_ns);
-    const relative = if (math.resident_weights)
+    var relative = if (math.resident_weights)
         try math.derived(.relative_normalized, &.{ e.max_position_embeddings, h })
     else blk: {
         const relative_weight = try math.weight("encoder.rel_embeddings.weight", &.{ e.max_position_embeddings, h });
@@ -301,13 +357,24 @@ pub fn encodeDevice(cb: *const ops.ComputeBackend, allocator: std.mem.Allocator,
     defer math.drop(relative);
     const relative_values = try allocator.alloc(i32, sequence * 2 - 1);
     defer allocator.free(relative_values);
-    for (relative_values, 0..) |*value, i| value.* = @intCast(@import("../../models/deberta.zig").relativePositionBucket(@as(i64, @intCast(i)) - @as(i64, @intCast(sequence - 1)), e.position_buckets, e.max_position_embeddings));
+    var relative_rows: usize = e.max_position_embeddings;
+    const compact = if (!math.resident_weights and cb.kind() == .cuda and cb.compactDebertaRelativeProjectionEnabled(sequence)) compactRelativeLayout(sequence, e.position_buckets, e.max_position_embeddings) else null;
+    if (compact != null and compact.?.rows < e.max_position_embeddings) {
+        const layout = compact.?;
+        @memcpy(relative_values, layout.offsets[0..relative_values.len]);
+        const indices = try math.uploadIntegers(layout.buckets[0..layout.rows]);
+        defer math.drop(indices);
+        const gathered = try math.kernel(.gather_i32, &.{ e.max_position_embeddings, h, layout.rows }, &.{ relative, indices }, 0);
+        math.drop(relative);
+        relative = gathered;
+        relative_rows = layout.rows;
+    } else for (relative_values, 0..) |*value, i| value.* = @intCast(@import("../../models/deberta.zig").relativePositionBucket(@as(i64, @intCast(i)) - @as(i64, @intCast(sequence - 1)), e.position_buckets, e.max_position_embeddings));
     const relative_ids = try math.uploadIntegers(relative_values);
     defer math.drop(relative_ids);
     const encoder_started_ns = math.traceNow();
     for (0..e.num_hidden_layers) |layer| {
         try math.check();
-        const output = try encoderLayer(math, hidden, relative, relative_ids, mask, config, batch, sequence, layer);
+        const output = try encoderLayer(math, hidden, relative, relative_ids, mask, config, batch, sequence, relative_rows, layer);
         math.drop(hidden);
         hidden = output;
         if ((layer + 1) % 2 == 0) try math.finishSegment();

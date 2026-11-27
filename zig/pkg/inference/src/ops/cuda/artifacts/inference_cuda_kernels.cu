@@ -15550,6 +15550,7 @@ extern "C" __global__ void antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1(
 #include "../kernels/training_welford_layer_norm.cuh"
 #include "../kernels/training_row_softmax.cuh"
 #include "../kernels/relative_attention_training.cuh"
+#include "../kernels/gliner25_attention_fp32.cuh"
 
 // Laya inference kernels. Keep outside compiler-owned generated regions.
 // tile-codegen:begin attention.block.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
