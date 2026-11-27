@@ -3326,21 +3326,25 @@ fn subsampleBatchCapacity(cfg: AudioConfig, frames: usize, maximum: usize) usize
     return subsampleBatchCapacityFor(cfg, frames, maximum, false, false);
 }
 fn subsampleBatchCapacityFor(cfg: AudioConfig, frames: usize, maximum: usize, direct: bool, masked: bool) usize {
+    const bytes = audioSubsampleWorkspacePerClip(cfg, frames, direct, masked) catch return 1;
+    if (bytes == 0) return 1;
+    return @max(1, @min(maximum, (128 * 1024 * 1024) / bytes));
+}
+
+fn audioSubsampleWorkspacePerClip(cfg: AudioConfig, frames: usize, direct: bool, masked: bool) !usize {
     const Mul = std.math.mul;
     const Add = std.math.add;
     const h0 = frames / 2 + frames % 2;
     const h1 = h0 / 2 + h0 % 2;
     const w0 = cfg.mel_bins / 2 + cfg.mel_bins % 2;
     const w1 = w0 / 2 + w0 % 2;
-    const input = Mul(usize, frames, cfg.mel_bins) catch return 1;
-    const conv0 = Mul(usize, Mul(usize, h0, w0) catch return 1, cfg.conv_channels0) catch return 1;
-    const conv1 = Mul(usize, Mul(usize, h1, w1) catch return 1, cfg.conv_channels1) catch return 1;
-    const output = Mul(usize, h1, cfg.audio_hidden) catch return 1;
+    const input = try Mul(usize, frames, cfg.mel_bins);
+    const conv0 = try Mul(usize, try Mul(usize, h0, w0), cfg.conv_channels0);
+    const conv1 = try Mul(usize, try Mul(usize, h1, w1), cfg.conv_channels1);
+    const output = try Mul(usize, h1, cfg.audio_hidden);
     var floats: usize = 0;
-    for ([_]usize{ input, conv0, conv1, output }, (if (direct) [_]usize{ 3, if (masked) 3 else 2, 3, 3 } else [_]usize{ 3, 4, 5, 3 })) |n, copies| floats = Add(usize, floats, Mul(usize, n, copies) catch return 1) catch return 1;
-    const bytes = Mul(usize, floats, 4) catch return 1;
-    if (bytes == 0) return 1;
-    return @max(1, @min(maximum, (128 * 1024 * 1024) / bytes));
+    for ([_]usize{ input, conv0, conv1, output }, (if (direct) [_]usize{ 3, if (masked) 3 else 2, 3, 3 } else [_]usize{ 3, 4, 5, 3 })) |n, copies| floats = try Add(usize, floats, try Mul(usize, n, copies));
+    return Mul(usize, floats, @sizeOf(f32));
 }
 
 // Equal-length clips share convolutions and projection, with no artificial
@@ -10742,7 +10746,9 @@ fn checkAdmittedAudioPeak(cb: ComputeBackend, _: ComputeBackend) !void {
     // encoding footprint includes all buffers whose lifetimes admission counts.
     const retained = runtime.currentAllocatedSize(compute.provider_impl.raw_decode_runtime) -| before;
     std.debug.print("audio_batch_peak frames={} batch={} incremental_device_bytes={} ceiling={}\n", .{ frames, batch, retained, 128 * 1024 * 1024 });
-    try std.testing.expect(retained <= 128 * 1024 * 1024);
+    const planned = try std.math.mul(usize, batch, try audioSubsampleWorkspacePerClip(cfg, frames, true, false));
+    try std.testing.expect(planned <= 128 * 1024 * 1024);
+    try std.testing.expect(retained <= planned);
     try cb.decoderRuntimeSubmitAndWaitFrame();
     active = false;
     try std.testing.expectEqual(@as(usize, 3), out.segments.len);
