@@ -5628,7 +5628,11 @@ pub const ColdNativeFlorence = struct {
 /// Optional pre-encoder preparation. Unknown providers, raw callers, reduced
 /// sources and unsupported policy keep the entire original path BEFORE work.
 pub fn prepareColdNativeFlorence(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, config: florence_arch.Config, encoder_rows: usize, capacity: usize, base: *const @import("../backends/session.zig").RunPermit) !?*ColdNativeFlorence {
-    return prepareColdNativeFlorenceImpl(session, allocator, control, config, encoder_rows, capacity, base) catch |err| switch (err) {
+    return prepareColdNativeFlorenceWithHostFloor(session, allocator, control, config, encoder_rows, capacity, base, 0);
+}
+
+pub fn prepareColdNativeFlorenceWithHostFloor(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, config: florence_arch.Config, encoder_rows: usize, capacity: usize, base: *const @import("../backends/session.zig").RunPermit, host_floor_bytes: usize) !?*ColdNativeFlorence {
+    return prepareColdNativeFlorenceImpl(session, allocator, control, config, encoder_rows, capacity, base, host_floor_bytes) catch |err| switch (err) {
         // This entire optional cold attempt, including the literal Owner/header
         // reservation, unwinds before any encoder/decoder numerical work. The
         // unchanged original full task permit remains available to compatibility.
@@ -5636,7 +5640,7 @@ pub fn prepareColdNativeFlorence(session: Session, allocator: std.mem.Allocator,
         else => return err,
     };
 }
-fn prepareColdNativeFlorenceImpl(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, config: florence_arch.Config, encoder_rows: usize, capacity: usize, base: *const @import("../backends/session.zig").RunPermit) !?*ColdNativeFlorence {
+fn prepareColdNativeFlorenceImpl(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, config: florence_arch.Config, encoder_rows: usize, capacity: usize, base: *const @import("../backends/session.zig").RunPermit, host_floor_bytes: usize) !?*ColdNativeFlorence {
     const Dense = @import("dense_decoder_schedule.zig");
     if (control) |active| try active.check();
     if (!Dense.preparationBackingSupported(allocator) or capacity == 0 or encoder_rows == 0) return null;
@@ -5652,7 +5656,7 @@ fn prepareColdNativeFlorenceImpl(session: Session, allocator: std.mem.Allocator,
     const original = base.lease orelse return null;
     const request = base.request orelse return null;
     if (request.output_kv_bytes < kv or original.amounts.host_kv_bytes < kv) return error.IncompleteFlorenceCacheAdmission;
-    const metadata = try @import("cold_metadata.zig").Owner.create(allocator, session, &.{base});
+    const metadata = try @import("cold_metadata.zig").Owner.createWithBorrowedHostFloor(allocator, session, &.{base}, host_floor_bytes);
     var metadata_owned = true;
     defer if (metadata_owned) metadata.deinitOutsideExecution();
     const self = try metadata.allocator().create(ColdNativeFlorence);

@@ -4006,6 +4006,12 @@ pub const PreparedSource = struct {
     /// The receiving task must attest its cold owner against the returned
     /// dispatch permit's exact session, not merely a shared controller/Domain.
     pub fn initOwningSynchronousTaskPermitBeforeExecutionInto(self: *PreparedSource, original: *RunPermit, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !bool {
+        return self.initOwningSynchronousTaskPermitWithHostStorage(original, null, allocator, control);
+    }
+
+    /// Borrow a live preprocessing owner for this synchronous handoff. The
+    /// caller keeps its payload and leases alive until Source has drained.
+    pub fn initOwningSynchronousTaskPermitWithHostStorage(self: *PreparedSource, original: *RunPermit, host_storage: ?*const @import("admitted_allocator.zig").AdmittedAllocator, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !bool {
         if (self.phase != .empty) return error.SourceInvocationAlreadyInitialized;
         const source = original.session;
         const model = @import("../execution/architecture_session.zig").nativeSynchronousTaskPermitModel(source) orelse return false;
@@ -4018,11 +4024,20 @@ pub const PreparedSource = struct {
             !std.meta.eql(original.physical_credit, memory.AdmissionAmounts{})) return false;
         const held = original.lease orelse return false;
         const request = original.request orelse return false;
-        if (request.workspace_planned or request.retained_backend_workspace_bytes != 0 or request.pre_admitted_host_bytes != 0) return false;
+        if (request.workspace_planned or request.retained_backend_workspace_bytes != 0) return false;
         const policy = source.run_admission.?; // exact Model/Domain proof above
         if (held.controller != policy.controller or held.retain_backend_class != policy.backend_class) return error.ForeignAdmissionDomain;
+        const borrowed_pin = if (request.pre_admitted_host_bytes != 0) pin: {
+            const storage = host_storage orelse return false;
+            const owner = storage.session orelse return false;
+            if (owner.ptr != source.ptr or owner.vtable != source.vtable or owner.model_lifetime != source.model_lifetime or
+                (owner.run_admission orelse return false).controller != policy.controller or
+                request.pre_admitted_host_bytes > storage.live_bytes or
+                request.pre_admitted_host_bytes > try storage.ownedHostBytesFor(policy.controller)) return false;
+            break :pin storage.resource_pin;
+        } else null;
         if (source.resourcePin()) |expected| {
-            const actual = original.resource_pin orelse return false;
+            const actual = original.resource_pin orelse borrowed_pin orelse return false;
             if (actual.ptr != expected.ptr or actual.retain_fn != expected.retain_fn or actual.release_fn != expected.release_fn or
                 actual.release_with_boundary_fn != expected.release_with_boundary_fn or actual.payload_charge_fn != expected.payload_charge_fn) return false;
         } else if (original.resource_pin != null) return false;

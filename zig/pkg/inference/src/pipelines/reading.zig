@@ -1303,7 +1303,7 @@ pub const ReadingPipeline = struct {
             var source = session_mod.PreparedSource{};
             defer source.deinit();
             const rows = try florence_arch.encoderSequenceLength(florence_cfg, prompt_i64.len);
-            if (try @import("../execution/architecture_session.zig").prepareColdNativeFlorence(self.vision_encoder, allocator, self.execution_control, florence_cfg, rows, self.config.max_length, &run_permit.?)) |cold| {
+            if (try @import("../execution/architecture_session.zig").prepareColdNativeFlorenceWithHostFloor(self.vision_encoder, allocator, self.execution_control, florence_cfg, rows, self.config.max_length, &run_permit.?, try preparation.ownedHostBytesFor(self.vision_encoder))) |cold| {
                 // Frame/provider work retires under actual B; Model/lane then
                 // leave before AA/cache callbacks, and B drains only afterbody.
                 defer {
@@ -1316,7 +1316,7 @@ pub const ReadingPipeline = struct {
                 const initial_token = self.config.decoder_start_token_id;
                 const first_supported = initial_token >= 0 and @as(u64, @intCast(initial_token)) < token_rows;
                 const forced_supported = if (self.config.forced_bos_token_id) |token| self.config.max_length <= 1 or (token >= 0 and @as(u64, @intCast(token)) < token_rows) else true;
-                if (first_supported and forced_supported and try source.initOwningSynchronousTaskPermitBeforeExecutionInto(&run_permit.?, allocator, self.execution_control)) {
+                if (first_supported and forced_supported and try source.initOwningSynchronousTaskPermitWithHostStorage(&run_permit.?, &preparation.owner, allocator, self.execution_control)) {
                     try cold.finishConstructionBeforeExecution(&source);
                     try source.bindExecutionLaneBeforeExecution(self.native_execution_lane, false);
                     try source.enter();
@@ -3337,13 +3337,6 @@ fn nativeFlorencePublicScheduleCase(a: std.mem.Allocator, cold_only: bool, tight
     ;
     const hf = try tokenizer_mod.hf.HfTokenizer.loadFromBytes(std.testing.allocator, tokenizer_data);
     defer hf.deinitSelf();
-    if (tight) {
-        const prompt = try buildFlorencePromptIds(std.testing.allocator, hf.tokenizer(), Fixture.config, "one");
-        defer std.testing.allocator.free(prompt);
-        const request = try nativeFlorenceRunRequest(Fixture.config, 1, 12, prompt.len, 4);
-        const plan = try session.run_admission.?.planRequest(request, session.outputInfo());
-        session.run_admission.?.limits.host_limit_bytes = plan.required.hostTotalBytes();
-    }
     const cfg = ReadConfig{ .image_size = 2, .image_mean = .{ 0, 0, 0 }, .image_std = .{ 1, 1, 1 }, .prompt = "one", .max_length = 4, .decoder_start_token_id = 0, .eos_token_id = 7, .no_repeat_ngram_size = 2 };
     var lane = @import("../execution_control.zig").ExecutionLane{};
     var candidate = ReadingPipeline.init(a, session, session, hf.tokenizer(), cfg, null);
@@ -3356,6 +3349,26 @@ fn nativeFlorencePublicScheduleCase(a: std.mem.Allocator, cold_only: bool, tight
     var expected = try reference.readDecoded(img);
     defer expected.deinit();
     try std.testing.expect(lastReadTelemetry().native_decoder_program == null);
+    if (tight) {
+        // Measure the actual base floor, including the live allocation headers
+        // produced by the public preparation path.
+        const prompt = try buildFlorencePromptIds(a, hf.tokenizer(), Fixture.config, "one");
+        defer a.free(prompt);
+        var request = try nativeFlorenceRunRequest(Fixture.config, 1, 12, prompt.len, cfg.max_length);
+        request.pre_admitted_host_bytes = request.input_bytes;
+        const base = try session.run_admission.?.estimateRequest(request, session.outputInfo());
+        candidate.vision_encoder.run_admission.?.limits.host_limit_bytes = base.hostTotalBytes();
+        var failure = admission_memory.AdmissionFailure{};
+        candidate.execution_control.?.admission_failure = &failure;
+        try std.testing.expectError(error.ResourceLimitExceeded, candidate.readDecoded(img));
+        candidate.execution_control.?.admission_failure = null;
+        const floor = failure.snapshot() orelse return error.MissingFlorenceAdmissionFloor;
+        try std.testing.expectEqual(.host, floor.limit);
+        try std.testing.expectEqual(base.hostTotalBytes(), floor.limit_bytes);
+        try std.testing.expect(floor.requested_bytes > base.hostTotalBytes() + request.input_bytes);
+        candidate.vision_encoder.run_admission.?.limits.host_limit_bytes = floor.requested_bytes;
+        candidate.decoder.run_admission.?.limits.host_limit_bytes = floor.requested_bytes;
+    }
     if (cold_only) {
         const CancelAtModel = struct {
             gate: *std.atomic.Mutex,
