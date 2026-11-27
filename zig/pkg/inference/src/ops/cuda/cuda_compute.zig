@@ -4005,6 +4005,10 @@ pub const CudaCompute = struct {
     pub const GraphRetirement = enum { state_mutation, reader_epoch, foreground_step, page_state_cleanup, projected_image_cleanup, mixed_prefill, eager_decode };
 
     pub fn invalidateLightOnDecodeGraphWithCleanup(cb: *const ops.ComputeBackend, current: CacheCleanup, reason: GraphRetirement) !void {
+        return invalidateLightOnDecodeGraphMatching(cb, current, reason, null);
+    }
+
+    fn invalidateLightOnDecodeGraphMatching(cb: *const ops.ComputeBackend, current: CacheCleanup, reason: GraphRetirement, dependency: ?union(enum) { recurrent: u64, sequence: u64 }) !void {
         if (!acceptsPhysicalImplementation(cb.vtable)) return error.UnsupportedReaderEpochBackend;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (!self.lighton_decode_graph_enabled and self.bounded_decode_graph.metadata.ptr == 0 and self.bounded_decode_graph.arena.ptr == 0 and self.bounded_decode_graph.head.ptr == 0 and self.bounded_decode_graph.graph == null and self.bounded_decode_graph.pending_graph == null) return;
@@ -4013,11 +4017,15 @@ pub const CudaCompute = struct {
             var local = try @import("../../execution/cleanup_owner.zig").Owner.beginOutsideCleanup();
             defer local.finishAfterUnlock();
             const scoped: CacheCleanup = .{ .boundary = try local.outsideCleanupEpoch() };
-            return invalidateLightOnDecodeGraphWithCleanup(cb, scoped, reason);
+            return invalidateLightOnDecodeGraphMatching(cb, scoped, reason, dependency);
         }
         if (!self.bounded_decode_graph.mutex.tryLock()) return error.ReaderEpochBackendBusy;
         defer self.bounded_decode_graph.mutex.unlock();
         const owner = &self.bounded_decode_graph;
+        if (dependency) |value| switch (value) {
+            .recurrent => |address| if (!owner.referencesRecurrentAddress(address)) return,
+            .sequence => |sequence| if (!owner.referencesSequence(sequence)) return,
+        };
         if (owner.phase != .disabled and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_model_graph_retired reason={s} phase={s} epoch={d} rows={d} progress={d}\n", .{
                 @tagName(reason), @tagName(owner.phase), owner.epoch_id, owner.rows, owner.progress,
@@ -11958,7 +11966,11 @@ const CudaKvDeviceStorage = struct {
     fn releaseSequenceWithCleanup(ctx: *anyopaque, sequence_id: kv_storage_runtime.SequenceId, current: CacheCleanup) !void {
         const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
         const backend = self.compute.computeBackend();
-        try invalidateCapturedGraphForMutation(self.compute, &backend, current);
+        if (current.boundary != null or current.outside_execution) {
+            try CudaCompute.invalidateLightOnDecodeGraphMatching(&backend, current, .page_state_cleanup, .{ .sequence = sequence_id });
+        } else if (self.compute.lighton_decode_graph_enabled) {
+            self.compute.bounded_decode_graph.invalidate(&self.compute.ctx);
+        }
         self.releaseSequenceStorage(sequence_id);
     }
 
@@ -18257,10 +18269,14 @@ fn invalidateCapturedGraphForMutation(self: *CudaCompute, backend: *const ops.Co
     }
 }
 
-fn prepareLightOnStateReleaseWithCleanup(context: *anyopaque, current: CacheCleanup) !void {
+fn prepareLightOnStateReleaseWithCleanup(context: *anyopaque, state: *const @import("gated_delta.zig").State, current: CacheCleanup) !void {
     const self: *CudaCompute = @ptrCast(@alignCast(context));
     const backend = self.computeBackend();
-    try invalidateCapturedGraphForMutation(self, &backend, current);
+    if (current.boundary != null or current.outside_execution) {
+        try CudaCompute.invalidateLightOnDecodeGraphMatching(&backend, current, .state_mutation, .{ .recurrent = state.recurrent.ptr });
+    } else if (self.lighton_decode_graph_enabled) {
+        self.bounded_decode_graph.invalidate(&self.ctx);
+    }
 }
 fn recycleLightOnStateBufferWithCleanup(context: *anyopaque, buffer: *buffer_mod.DeviceBuffer, recycle: bool, current: CacheCleanup) !void {
     _ = current; // caller prepared the actual owner once before all descriptors

@@ -1004,6 +1004,8 @@ pub const Executor = struct {
         const attention_count = recipe.attention_count;
         var position_snapshot: [384]u32 = undefined;
         @memcpy(position_snapshot[0..positions.len], positions);
+        var sequence_snapshot: [128]u64 = undefined;
+        for (items, sequence_snapshot[0..items.len]) |item, *sequence| sequence.* = item.state.sequence_id.?;
         const graph_owner = @import("../ops/cuda/bounded_decode_graph.zig");
         const head_storage: graph_owner.Descriptor.HeadStorage = if (platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_FUSED_HEAD") and
             C.boundedFusedHeadAvailable(self.context.cb, head, claimed.len, self.context.gpt_config.hidden_size, self.context.gpt_config.vocab_size))
@@ -1014,7 +1016,7 @@ pub const Executor = struct {
             .{ .adaptive_bank = 32 }
         else
             .full_bank;
-        const descriptor = graph_owner.Descriptor{ .epoch = self.lighton_cuda_execution_id, .key = key.words[0..key.len], .positions = position_snapshot[0..positions.len], .rows = claimed.len, .hidden = self.context.gpt_config.hidden_size, .vocab = self.context.gpt_config.vocab_size, .future_tokens = max_future, .head_storage = head_storage, .attention_geometry = .{ .heads = self.context.gpt_config.num_attention_heads, .kv_heads = self.context.gpt_config.effectiveKVHeads(), .dim = self.context.gpt_config.headDim() }, .recurrent_heads = .{ .key = self.context.gpt_config.qwen35_linear_num_key_heads, .value = self.context.gpt_config.qwen35_linear_num_value_heads }, .attention_layers = attention_count, .recurrent_layers = self.context.gpt_config.num_hidden_layers - attention_count };
+        const descriptor = graph_owner.Descriptor{ .epoch = self.lighton_cuda_execution_id, .key = key.words[0..key.len], .positions = position_snapshot[0..positions.len], .sequences = sequence_snapshot[0..items.len], .rows = claimed.len, .hidden = self.context.gpt_config.hidden_size, .vocab = self.context.gpt_config.vocab_size, .future_tokens = max_future, .head_storage = head_storage, .attention_geometry = .{ .heads = self.context.gpt_config.num_attention_heads, .kv_heads = self.context.gpt_config.effectiveKVHeads(), .dim = self.context.gpt_config.headDim() }, .recurrent_heads = .{ .key = self.context.gpt_config.qwen35_linear_num_key_heads, .value = self.context.gpt_config.qwen35_linear_num_value_heads }, .attention_layers = attention_count, .recurrent_layers = self.context.gpt_config.num_hidden_layers - attention_count };
         var funding_phase: graph_owner.GraphPhase = undefined;
         try funding_phase.initInto(descriptor);
         defer funding_phase.close(.{ .boundary = self.context.cleanupEpoch() }) catch platform.inference_process_supervisor.restartWorker();

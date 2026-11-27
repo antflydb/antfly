@@ -217,6 +217,7 @@ pub const Phase = enum { warm, learn, capture, replay, disabled };
 pub const Descriptor = struct {
     epoch: u64,
     key: []const u64,
+    sequences: []const u64 = &.{},
     positions: []const u32,
     rows: usize,
     hidden: usize,
@@ -236,6 +237,7 @@ pub const Descriptor = struct {
 
     pub fn layout(self: Descriptor) !StorageLayout {
         if (self.epoch == 0 or self.rows > max_rows or self.positions.len != self.rows * 3) return error.InvalidShape;
+        if (self.sequences.len != 0 and self.sequences.len != self.rows) return error.InvalidShape;
         const packet_rows = switch (self.head_storage) {
             .full_bank, .fused_top1 => self.rows,
             .adaptive_bank, .shared_layer_packets => |rows| rows,
@@ -470,6 +472,8 @@ pub const GraphPhase = struct {
 pub const Module = struct {
     mutex: std.atomic.Mutex = .unlocked,
     epoch_id: u64 = 0,
+    sequences: [max_rows]u64 = undefined,
+    sequence_count: usize = 0,
     captured_roots_identity: usize = 0,
     disabled_epoch: u64 = 0,
     key: []u64 = &.{},
@@ -544,6 +548,7 @@ pub const Module = struct {
         self.plan = null;
         if (self.key.len != 0) self.host_allocator.free(self.key);
         self.key = &.{};
+        self.sequence_count = 0;
         try self.arena_quota.releaseAfterSdkDeath(current);
         try self.metadata_quota.releaseAfterSdkDeath(current);
         self.captured_roots_identity = 0;
@@ -583,11 +588,22 @@ pub const Module = struct {
         defer self.mutex.unlock();
         self.clear(ctx) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
     }
+    /// Production keys include the recurrent address of every bound layer.
+    /// A matching word elsewhere in a key can only cause conservative retirement.
+    pub fn referencesSequence(self: *const Module, sequence: u64) bool {
+        return self.sequence_count == 0 or std.mem.indexOfScalar(u64, self.sequences[0..self.sequence_count], sequence) != null;
+    }
+
+    pub fn referencesRecurrentAddress(self: *const Module, address: u64) bool {
+        return self.sequence_count == 0 or (address != 0 and std.mem.indexOfScalar(u64, self.key, address) != null);
+    }
+
     pub fn matches(self: *const Module, descriptor: Descriptor) bool {
         return self.epoch_id == descriptor.epoch and self.rows == descriptor.rows and
             self.hidden == descriptor.hidden and self.vocab == descriptor.vocab and
             self.attention_layers == descriptor.attention_layers and self.recurrent_layers == descriptor.recurrent_layers and
             self.key.len != 0 and std.mem.eql(u64, self.key, descriptor.key) and
+            std.mem.eql(u64, self.sequences[0..self.sequence_count], descriptor.sequences) and
             descriptor.positions.len == 3 * self.rows and
             std.mem.eql(u32, self.next_positions[0..descriptor.positions.len], descriptor.positions);
     }
@@ -628,6 +644,8 @@ pub const Module = struct {
         self.metadata_quota = lease.publishQuota(); // SAME preallocated cold shell
         self.host_allocator = cold.allocator;
         self.key = cold.key;
+        self.sequence_count = descriptor.sequences.len;
+        @memcpy(self.sequences[0..self.sequence_count], descriptor.sequences);
         cold.key = &.{};
         self.plan = cold.plan;
         cold.plan = null;
@@ -1355,6 +1373,13 @@ test "bounded decoder graph reuse requires the prepared dispatch geometry" {
     owner.key = &key;
     owner.attention_layers = descriptor.attention_layers;
     owner.recurrent_layers = descriptor.recurrent_layers;
+    try std.testing.expect(owner.referencesSequence(19));
+    owner.sequences[0..2].* = .{ 7, 8 };
+    owner.sequence_count = 2;
+    try std.testing.expect(owner.referencesSequence(7));
+    try std.testing.expect(!owner.referencesSequence(19));
+    try std.testing.expect(!owner.matches(descriptor));
+    owner.sequence_count = 0;
     try std.testing.expect(owner.matches(descriptor));
     var changed = descriptor;
     changed.future_tokens += 2;

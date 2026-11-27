@@ -748,7 +748,8 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
         }
         pub fn lockStepForCleanup(ctx: *LightOnStreamContext, reason: @import("../ops/cuda/cuda_compute.zig").CudaCompute.GraphRetirement) void {
             ctx.pageAccess(.{}, true).acquireForCleanup();
-            ctx.invalidateCudaDecodeGraph(reason);
+            // Managed page retirement invalidates its actual recurrent and KV bindings.
+            if (reason != .page_state_cleanup) ctx.invalidateCudaDecodeGraph(reason);
         }
         pub fn releasePageBudget(ctx: *LightOnStreamContext, reserved: runtime.tier.memory.AdmissionAmounts) void {
             ctx.pageAccess(.{}, true).acquireForCleanup();
