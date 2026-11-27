@@ -21208,9 +21208,9 @@ fn stageAudioGraphInputs(self: *CudaCompute, input_bank: buffer_mod.DeviceBuffer
     if (!debug_copy) try self.ctx.makeCurrent();
     if (!debug_copy and self.ctx.stream != null and inputs.len > 1) batch: {
         const submit = self.ctx.driver.fns.cuMemcpyBatchAsync orelse break :batch;
-        var destinations: [20]driver_mod.CUdeviceptr = undefined;
-        var sources: [20]driver_mod.CUdeviceptr = undefined;
-        var sizes: [20]usize = undefined;
+        var destinations: [CudaCompute.AudioPlan.max_inputs]driver_mod.CUdeviceptr = undefined;
+        var sources: [CudaCompute.AudioPlan.max_inputs]driver_mod.CUdeviceptr = undefined;
+        var sizes: [CudaCompute.AudioPlan.max_inputs]usize = undefined;
         var count: usize = 0;
         var bytes: usize = 0;
         for (inputs, spans) |ct, span| {
@@ -21331,16 +21331,16 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     const observation = @import("../../execution/runtime_observation.zig");
     const plan_mod = @import("audio_execution_plan.zig");
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
-    if (self.capability_profile != .embedding_gemma2 or !self.embedding_gemma2_policy.audio_graph or self.audio_execution_active or self.execution_scope != null or inputs.len == 0 or inputs.len > 20 or try self.ctx.streamCaptureActive()) return null;
+    if (self.capability_profile != .embedding_gemma2 or !self.embedding_gemma2_policy.audio_graph or self.audio_execution_active or self.execution_scope != null or inputs.len == 0 or inputs.len > plan_mod.max_inputs or try self.ctx.streamCaptureActive()) return null;
     self.audio_execution_active = true;
     defer self.audio_execution_active = false;
-    var input_metadata: [20]CudaCompute.AudioCacheInput = undefined;
+    var input_metadata: [CudaCompute.AudioPlan.max_inputs]CudaCompute.AudioCacheInput = undefined;
     for (inputs, input_metadata[0..inputs.len]) |ct, *metadata| {
         const tensor = tensorFromCt(ct);
         try ensureF32(tensor);
         metadata.* = .{ .shape = tensor.shape, .elements = tensor.elem_count };
     }
-    var input_spans: [20]CudaCompute.AudioInputSpan = undefined;
+    var input_spans: [CudaCompute.AudioPlan.max_inputs]CudaCompute.AudioInputSpan = undefined;
     const spans = input_spans[0..inputs.len];
     const cache_base = try self.audioCacheBase(key, input_metadata[0..inputs.len], spans);
     for (inputs, spans) |ct, span| {
@@ -21376,7 +21376,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         errdefer if (learning) |*token| if (token.owner != null)
             token.cancelBeforeSdk() catch platform.inference_process_supervisor.restartWorker();
 
-        var canonical: [20]CT = undefined;
+        var canonical: [CudaCompute.AudioPlan.max_inputs]CT = undefined;
         var canonical_count: usize = 0;
         defer for (canonical[0..canonical_count]) |ct| freeTensor(self, ct);
         for (inputs, spans) |ct, span| {
@@ -21496,8 +21496,8 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         // Eager execution borrows the same logical input spans from the caller.
         // Recording binds them to the cache's fixed addresses.
         const scope = &execution_scope.?;
-        var views: [20]CudaTensor = undefined;
-        var stable: [20]CT = undefined;
+        var views: [CudaCompute.AudioPlan.max_inputs]CudaTensor = undefined;
+        var stable: [CudaCompute.AudioPlan.max_inputs]CT = undefined;
         for (inputs, spans, views[0..inputs.len], stable[0..inputs.len]) |ct, span, *view, *handle| {
             const input = tensorFromCt(ct);
             const source = if (capture) input_bank else input.buffer;

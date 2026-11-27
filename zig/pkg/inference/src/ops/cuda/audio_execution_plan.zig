@@ -26,7 +26,12 @@ const Quota = @import("cache_quota.zig").Quota;
 const retirement = @import("../../execution/resource_retirement.zig");
 const platform = @import("antfly_platform");
 
-pub const Input = @import("../../execution/audio_schedule.zig").ExecutionInputs.Metadata;
+const ExecutionInputs = @import("../../execution/audio_schedule.zig").ExecutionInputs;
+pub const Input = ExecutionInputs.Metadata;
+pub const max_inputs = 20;
+comptime {
+    if (ExecutionInputs.count > max_inputs) @compileError("CUDA audio staging cannot hold the execution inputs");
+}
 pub const InputSpan = @import("buffer.zig").ByteSpan;
 
 /// The graph's input prefix is independent of how scratch is scheduled.
@@ -42,6 +47,7 @@ pub const Bindings = struct {
     }
 
     pub fn resolve(hash: *std.hash.Wyhash, inputs: []const Input, spans: ?[]InputSpan) !Bindings {
+        if (inputs.len > max_inputs) return error.InvalidShape;
         if (spans) |output| if (output.len != inputs.len) return error.InvalidShape;
         hash.update(std.mem.asBytes(&inputs.len));
         var input_bytes: usize = 0;
