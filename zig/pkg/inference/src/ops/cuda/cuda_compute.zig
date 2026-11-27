@@ -3775,7 +3775,9 @@ pub const CudaCompute = struct {
                 const rows = @min(head_rows, owner.rows - first);
                 const packet_input = try sliceRows2DOp(self.compute, input_ct, first, rows, owner.hidden);
                 defer cb.free(packet_input);
-                const logits = try cb.observeBackendEntry(.linear_no_bias, &linearNoBiasWithDestination, .{ self.compute, packet_input, weight, rows, owner.hidden, owner.vocab, false, self.head_destination });
+                var destination = self.head_destination.?;
+                destination.len = try checkedMul(try checkedMul(rows, owner.vocab), @sizeOf(f32));
+                const logits = try cb.observeBackendEntry(.linear_no_bias, &linearNoBiasWithDestination, .{ self.compute, packet_input, weight, rows, owner.hidden, owner.vocab, false, @as(?buffer_mod.DeviceBuffer, destination) });
                 defer cb.free(logits);
                 try burst_value.argmaxRange(logits, step, first, rows);
                 first += rows;
