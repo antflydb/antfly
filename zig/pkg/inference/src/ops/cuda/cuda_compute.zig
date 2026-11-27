@@ -62765,6 +62765,36 @@ test "public source audio linear recreates input bank through actual learning ca
     };
     const transfer_audit = @import("../../execution/transfer_audit.zig");
     var run = Run{ .cb = cb };
+    {
+        const plan_mod = @import("audio_execution_plan.zig");
+        const cold_key = 0x304;
+        const inputs = [_]CT{ identity, identity };
+        const geometry: [2]CudaCompute.AudioCacheInput = @splat(.{ .shape = &.{ 2, 2 }, .elements = 4 });
+        const bindings = try compute.audioCacheBase(cold_key, &geometry, null);
+        const layout = try @import("libraries.zig").Bf16GemmProgram.TemporaryLayout.resolveSourceRows(
+            try kernel_geometry.SourceGemmRows.resolve(2, null),
+            2,
+            2,
+            true,
+            false,
+            try @as(@import("libraries.zig").MatmulArithmetic, .bf16_reduced).workspaceBytes(compute.ctx.info.compute_major),
+        );
+        const entry = try compute.audio_plans.getWithCleanup(bindings.key, .{});
+        const owner = try plan_mod.Owner.create(std.heap.c_allocator);
+        entry.owner = owner;
+        var declaration = try owner.beginDeclaration(bindings);
+        const output_slot = try declaration.events.allocate(bindings.output_bytes);
+        try declaration.events.scratchInterval(layout.bytes);
+        try declaration.finish(output_slot);
+
+        const first = (try cb.audioExecution(cold_key, &inputs, &run, Run.call)) orelse return error.TestUnexpectedResult;
+        defer cb.free(first);
+        const values = try cb.toFloat32(first, std.testing.allocator);
+        defer std.testing.allocator.free(values);
+        try std.testing.expectEqualSlices(f32, &identity_values, values);
+        try std.testing.expect(!entry.warmed);
+        try std.testing.expect(owner.plan.origin == .declared);
+    }
     var held: [2]?CT = @splat(null);
     defer for (held) |entry| if (entry) |output| cb.free(output);
     for (0..7) |iteration| {
