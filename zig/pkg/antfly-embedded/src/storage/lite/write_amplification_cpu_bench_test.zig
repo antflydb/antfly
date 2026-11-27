@@ -62,6 +62,7 @@ const capi_types = @import("../../capi/types.zig");
 const db_mod = api.db_mod;
 const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
 const native = @import("native.zig");
+const wa_bench = @import("write_amplification_bench_test.zig");
 
 const default_updates: usize = 128;
 const default_writers: usize = 8;
@@ -283,7 +284,8 @@ var counted_vtable_ready = std.atomic.Value(bool).init(false);
 const CountingShim = struct {
     fn fileSync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
         _ = userdata;
-        try std.testing.io.vtable.fileSync(std.testing.io.userdata, file);
+        // Counted, not performed, as in the counting harness.
+        if (wa_bench.realSyncs()) try std.testing.io.vtable.fileSync(std.testing.io.userdata, file);
         _ = syscalls.fsync.fetchAdd(1, .monotonic);
     }
     fn fileWritePositional(
@@ -766,6 +768,7 @@ const ReportJson = struct {
 };
 
 test "lite write amplification cpu report" {
+    if (!wa_bench.reportsRequested()) return error.SkipZigTest;
     // `cpu_gpa` is a single process-wide global shared with the "ceilings"
     // test below (and, if the test runner batches both into one process,
     // this is sequential, not concurrent use) -- it is intentionally never
@@ -812,6 +815,7 @@ test "lite write amplification cpu report" {
 // filtered into `lite-write-amplification-cpu`'s default run; invoke
 // directly with `--test-filter "lite write amplification cpu profile loop"`.
 test "lite write amplification cpu profile loop" {
+    if (!wa_bench.reportsRequested()) return error.SkipZigTest;
     const alloc = cpuAllocator();
     const profile_updates: usize = 6000;
     const report = try measureSingleWriter(alloc, "lite-write-amp-cpu-profile", .primary_only, profile_updates, false);
@@ -828,6 +832,7 @@ test "lite write amplification cpu profile loop" {
 // checkpoint-slot page). Not filtered into the default run; invoke with
 // `--test-filter "lite write amplification cpu attribution"`.
 test "lite write amplification cpu attribution" {
+    if (!wa_bench.reportsRequested()) return error.SkipZigTest;
     const alloc = cpuAllocator();
     const updates: usize = 2000;
 
@@ -977,6 +982,7 @@ test "lite write amplification cpu attribution" {
 // one commit's document-index writes actually take" answer. Invoke with
 // `--test-filter "lite write amplification cpu document index keys"`.
 test "lite write amplification cpu document index keys" {
+    if (!wa_bench.reportsRequested()) return error.SkipZigTest;
     const alloc = cpuAllocator();
     var fixture = try Fixture.open(alloc, "lite-write-amp-cpu-docidx", .primary_only, false);
     defer fixture.close();
@@ -1039,6 +1045,7 @@ test "lite write amplification cpu ceilings" {
 // is the default, and to make the comparison visible to anyone reading the
 // harness output rather than needing two separate runs.
 test "lite write amplification cpu redo vs legacy" {
+    if (!wa_bench.reportsRequested()) return error.SkipZigTest;
     // See "lite write amplification cpu report" above: shared global GPA.
     const alloc = cpuAllocator();
     const updates = default_updates;

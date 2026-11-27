@@ -23839,6 +23839,10 @@ pub const NativeFile = struct {
             var wal_republish = false;
             if (self.redo) |*redo| {
                 if (self.pendingPhysicalRedoCheckpoint(checkpoint)) {
+                    // A deferred fold's own publication, made by whichever
+                    // barrier runs next: the fold's cost, not that caller's.
+                    const fold_scope = wal_trace.scope(.redo_checkpoint_fold);
+                    defer fold_scope.end();
                     try self.syncIfRequired(null);
                     // This sequence belongs to a physical checkpoint.
                     // Publish the roots and the fold floor together.

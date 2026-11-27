@@ -25,7 +25,12 @@ zig build lite-write-amplification       # Debug; prints the report to stderr
 ```
 
 Sync/write/op counts do not depend on build mode, so Debug is the default and
-the fast option during iteration. The build step also accepts `-Doptimize`
+the fast option during iteration. The step performs real barriers
+(`ANTFLY_LITE_WA_REAL_SYNC=1`) and also runs the report-only diagnostics
+(`ANTFLY_LITE_WA_REPORTS=1`). The unit gate (the C API contract suite) runs
+only the asserting tests, and counts each barrier without issuing the
+syscall: the commit path is unchanged, so the counts are the same, and the
+harness no longer spends most of its time waiting on the disk. The build step also accepts `-Doptimize`
 for a one-liner final throughput run against an optimized build, e.g.:
 
 ```bash
@@ -35,11 +40,9 @@ zig build lite-write-amplification -Doptimize=ReleaseFast
 (the counts should not change; only wall-clock timings inside the report's
 JSON, if you add any, would.)
 
-To run only the regression-ceiling test (no full report printed), or only
-the report test:
+To run only the report test, which also carries the regression ceilings:
 
 ```bash
-zig build lite-write-amplification -- --test-filter "lite write amplification ceilings"
 zig build lite-write-amplification -- --test-filter "lite write amplification report"
 ```
 
@@ -205,8 +208,8 @@ at `write-amplification-baseline.json` wraps this same shape with
 
 ### Regression gate
 
-`zig build lite-write-amplification` also compiles and runs
-`test "lite write amplification ceilings"`, which asserts calling-thread
+`test "lite write amplification report"` asserts, over the modes it has
+just measured, that calling-thread
 syncs/update stay under the measured baseline plus 25% slack (3.75 for
 primary-only, ~83.75 for indexed), and applies the same two ceilings to the
 matching primary-only/indexed 8-writer modes so a regression specific to

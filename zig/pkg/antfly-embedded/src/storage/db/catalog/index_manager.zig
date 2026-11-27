@@ -17805,18 +17805,36 @@ pub const IndexManager = struct {
             return .not_loaded;
         };
         defer self.alloc.free(name);
-        var guard = try self.lockManagedIndexApply(.{ .name = name, .kind = .full_text });
-        defer guard.unlock();
+        // The delta is read and built with only the catalog held, as the
+        // index's appliers hold it; the apply guard is taken to validate and
+        // install, and a delta made stale meanwhile is built again.
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
         const entry = self.textIndexEntry(name) orelse return .reopen;
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const delta = try readScopeDelta(arena.allocator(), file, scope, keys);
-        entry.persistent.refreshPeerDelta(delta) catch |err| switch (err) {
-            error.UnsupportedRefresh => return .reopen,
-            else => return err,
-        };
-        return .refreshed;
+        for (0..4) |_| {
+            var prepared = (entry.persistent.preparePeerDelta(delta) catch |err| switch (err) {
+                error.UnsupportedRefresh => return .reopen,
+                else => return err,
+            }) orelse return .refreshed;
+            defer prepared.deinit(entry.persistent.alloc);
+            if (builtin.is_test) if (test_after_peer_delta_prepared) |hook| hook(entry);
+            self.lockAtomicWithBackoff(entry.apply_mutex);
+            defer entry.apply_mutex.unlock();
+            const installed = entry.persistent.installPeerDelta(&prepared) catch |err| switch (err) {
+                error.UnsupportedRefresh => return .reopen,
+                else => return err,
+            };
+            if (installed) return .refreshed;
+        }
+        return .reopen;
     }
+
+    /// Runs between a connection refresh's preparation and its install,
+    /// with no lock of the index held.
+    pub var test_after_peer_delta_prepared: ?*const fn (entry: *TextIndex) void = null;
 
     /// Caller holds the catalog shared; this takes the index's own mutex.
     fn refreshSparseIndexFromTipCatalogLocked(self: *IndexManager, name: []const u8, scope: []const u8, keys: []const native_catalog_backend.Mutation, file: *RefreshFile) !ScopeRefresh {

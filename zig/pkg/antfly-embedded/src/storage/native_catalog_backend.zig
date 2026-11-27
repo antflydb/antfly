@@ -1185,6 +1185,20 @@ pub const Backend = struct {
             return state.state.get(namespace, key);
         }
 
+        /// `publish`, if the mirror is still at `expected_epoch`: the
+        /// replacement was built from that state.
+        pub fn publishIfEpoch(self: *PreparedMirror, expected_epoch: u64) bool {
+            const replacement = self.replacement orelse return self.backend.state_epoch.load(.acquire) == expected_epoch;
+            lockBackend(self.backend);
+            defer self.backend.mutex.unlock();
+            if (self.backend.state_epoch.load(.acquire) != expected_epoch) return false;
+            const old = self.backend.state;
+            self.backend.state = replacement;
+            _ = self.backend.state_epoch.fetchAdd(1, .acq_rel);
+            self.replacement = old;
+            return true;
+        }
+
         pub fn publish(self: *PreparedMirror) void {
             const replacement = self.replacement orelse return;
             lockBackend(self.backend);

@@ -9806,6 +9806,18 @@ test "capi native separate writer processes refresh full-text in place" {
 
     const in_place_before = owner.test_in_place_refresh_count.load(.acquire);
     const runtime_before = owner.current.?;
+    // The refresh reads and builds the child's delta before taking the
+    // index's apply guard.
+    const PreparedOffGuard = struct {
+        var count = std.atomic.Value(usize).init(0);
+        var guard_free = std.atomic.Value(bool).init(true);
+        fn during(entry: *@import("../storage/db/catalog/index_manager.zig").IndexManager.TextIndex) void {
+            _ = count.fetchAdd(1, .monotonic);
+            if (entry.apply_mutex.tryLock()) entry.apply_mutex.unlock() else guard_free.store(false, .monotonic);
+        }
+    };
+    @import("../storage/db/catalog/index_manager.zig").IndexManager.test_after_peer_delta_prepared = PreparedOffGuard.during;
+    defer @import("../storage/db/catalog/index_manager.zig").IndexManager.test_after_peer_delta_prepared = null;
     xprocReleaseWithoutFold(owner);
     var environment = std.process.Environ.Map.init(a);
     defer environment.deinit();
@@ -9819,6 +9831,8 @@ test "capi native separate writer processes refresh full-text in place" {
     try std.testing.expect(!try Search.found(id, "parentfirst", "\"doc-0\""));
     try std.testing.expect(owner.test_in_place_refresh_count.load(.acquire) > in_place_before);
     try std.testing.expect(owner.current.? == runtime_before);
+    try std.testing.expect(PreparedOffGuard.count.load(.monotonic) > 0);
+    try std.testing.expect(PreparedOffGuard.guard_free.load(.monotonic));
     // This runtime still writes, and its write supersedes the child's. No
     // version the child overwrote comes back.
     try Search.write(id, "doc-0", "parentagain");
