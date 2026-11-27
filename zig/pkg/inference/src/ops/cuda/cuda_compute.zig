@@ -62594,7 +62594,7 @@ test "CUDA source local relative attention shares workspace across three physica
         const zeros: [19 * hidden]f32 = @splat(0);
         const values: [19 * hidden]f32 = @splat(3);
         const mask: [19]f32 = @splat(1);
-        const shape = [_]i64{ @intCast(rows), hidden };
+        const shape = [_]i32{ @intCast(rows), hidden };
         const query = try cb.fromFloat32Shape(zeros[0 .. rows * hidden], &shape);
         defer cb.free(query);
         const value = try cb.fromFloat32Shape(values[0 .. rows * hidden], &shape);
