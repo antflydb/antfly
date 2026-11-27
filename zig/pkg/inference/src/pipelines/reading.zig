@@ -3298,7 +3298,7 @@ test "reading default imported stages keep encoder resident and preserve host re
         try std.testing.expectEqual(expected.completion_tokens, actual.completion_tokens);
         try std.testing.expectEqualStrings("", actual.text);
         if (kind != .native) {
-            try std.testing.expectEqual(@as(u64, 3 * @sizeOf(f32)), candidate_audit.download_bytes);
+            try std.testing.expectEqual(@as(u64, @sizeOf(u32)), candidate_audit.download_bytes);
             try std.testing.expect(reference_audit.download_bytes > candidate_audit.download_bytes);
         }
         const Cancel = struct {

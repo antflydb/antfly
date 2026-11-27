@@ -41557,16 +41557,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         return error.MetalFrameSyncFailed;
                     }
                 }
-                var last_row = if (rows == 1)
-                    try metal_tensor.retainedCopy()
-                else blk: {
-                    const byte_offset = (rows - 1) * dim * @sizeOf(f32);
-                    const byte_len = dim * @sizeOf(f32);
-                    const shape = [_]i32{ 1, @intCast(dim) };
-                    break :blk try metal_tensor.retainedView(byte_offset, byte_len, &shape);
-                };
+                const byte_len = try std.math.mul(usize, dim, @sizeOf(f32));
+                const byte_offset = try std.math.mul(usize, rows - 1, byte_len);
+                const shape = [_]i32{ 1, std.math.cast(i32, dim) orelse return error.InvalidTensorShape };
+                // Imported logits can retain a leading batch axis even when
+                // rows is one. Bind the two-dimensional kernel view directly.
+                var last_row = try metal_tensor.retainedView(byte_offset, byte_len, &shape);
                 defer self.retireTemporaryWorkspaceValue(&last_row);
-                if (try metal_runtime.argmaxLogitsDevice(self.provider_impl, last_row, dim)) |token_id| return @intCast(token_id);
+                if (try metal_runtime.argmaxLogitsDevice(self.provider_impl, last_row, dim)) |token_id| {
+                    @import("../execution/transfer_audit.zig").download(@sizeOf(u32));
+                    return @intCast(token_id);
+                }
             }
         }
         const data = if (buf.metal_tensor) |*metal_tensor|
