@@ -209,7 +209,11 @@ pub const Plan = struct {
 
     /// Allocations receive slots in declaration order. A release names the
     /// slot of an earlier allocation. Only the published slot may escape.
-    pub const Declaration = union(enum) { allocate: usize, release: u15 };
+    pub const Declaration = union(enum) {
+        allocate: usize,
+        allocate_scratch: usize,
+        release: u15,
+    };
 
     /// Incremental declaration lets operation contracts compose directly into
     /// the destination plan without storing a second, flat event recipe.
@@ -268,6 +272,7 @@ pub const Plan = struct {
         errdefer self.* = .{};
         for (declarations) |declaration| switch (declaration) {
             .allocate => |bytes| _ = try builder.allocate(bytes),
+            .allocate_scratch => |bytes| _ = try builder.allocateScratch(bytes),
             .release => |slot| try builder.release(slot),
         };
         try builder.finish(published_slot);
@@ -691,11 +696,11 @@ test "observed operation scratch cannot alias a concurrently live token" {
     try std.testing.expect(plan.finish(0x2000));
 
     var declared: Plan = .{};
-    const builder = try declared.declarationBuilder();
-    const scratch_slot = try builder.allocateScratch(256);
-    const token_slot = try builder.allocate(4);
-    try builder.release(scratch_slot);
-    try builder.finish(token_slot);
+    try declared.declare(&.{
+        .{ .allocate_scratch = 256 },
+        .{ .allocate = 4 },
+        .{ .release = 0 },
+    }, 1);
     const layout = try declared.layout(0);
     try std.testing.expectEqual(try plan.layout(0), layout);
     var bound = try Scope.bind(&declared, layout, 0x3000, layout.bytes);
