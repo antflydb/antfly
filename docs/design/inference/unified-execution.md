@@ -2096,3 +2096,14 @@ Enabled A/A p95 was 40.58/40.48 ms; disabled B/B p95 was
 plan path on this binary. It leaves the cause within the plan path
 and its storage lifetime unqualified. The receipt is
 `64b4ee11047e3bb0293d2bf5e1e8a80abe080c0e408d1c3bf8047b9caeb66fe8`.
+
+Two further same-binary audio controls preserved exact outputs in every
+arm. Restricting the prepared arena to linear outputs kept p95 at
+40.43/40.22 ms in A/B. Keeping the prepared plan enabled and disabling
+only its separate Metal storage scope moved A/B p95 from 40.52 to
+37.27 ms, with p50 from 35.96 to 36.20 ms. The enabled A/A p95s were
+40.30/40.74 ms; disabled B/B p95s were 36.84/36.94 ms. The scope also
+affects linear tuning, so this comparison is evidence about the
+scope as a whole. The linear-only and storage-scope receipts are
+`bba80c62489419b3dced779a19eadb94da222b48d9ef6e3af23ed98890d7a3ff`
+and `99a9b8d2c24b0d943308d3d3bd2e09bdea715bc87c2d57205f06319508050124`.
