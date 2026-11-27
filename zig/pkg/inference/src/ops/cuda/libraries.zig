@@ -491,19 +491,6 @@ pub const Cublas = struct {
         if (self.library.fns.setWorkspace == null) return error.CublasWorkspaceUnavailable;
     }
 
-    /// Same F32 GEMM ABI with explicit caller-funded source workspace. Neither
-    /// the handle nor this adapter retains the address after submission; actual
-    /// queued/captured use remains covered by the caller's stream/graph owner.
-    pub fn stridedBatchedF32WithWorkspace(self: *Cublas, stream: ?*anyopaque, output: *anyopaque, a: *const anyopaque, b: *const anyopaque, layout: F32StridedBatchedLayout, workspace: *anyopaque, workspace_bytes: usize) !void {
-        return self.f32WithWorkspace(stream, output, a, b, layout, workspace, workspace_bytes, false);
-    }
-
-    /// Actual single-GEMM submission is a distinct SDK schedule from a batch
-    /// of one. Both adapters share checked physical spans and workspace custody.
-    pub fn singleF32WithWorkspace(self: *Cublas, stream: ?*anyopaque, output: *anyopaque, a: *const anyopaque, b: *const anyopaque, layout: F32StridedBatchedLayout, workspace: *anyopaque, workspace_bytes: usize) !void {
-        return self.f32WithWorkspace(stream, output, a, b, layout, workspace, workspace_bytes, true);
-    }
-
     pub const F32Workspace = struct {
         blas: *Cublas,
         occupied: F32StridedBatchedLayout.AddressSpan,
@@ -547,18 +534,17 @@ pub const Cublas = struct {
         return scope;
     }
 
-    fn f32WithWorkspace(self: *Cublas, stream: ?*anyopaque, output: *anyopaque, a: *const anyopaque, b: *const anyopaque, layout: F32StridedBatchedLayout, workspace: *anyopaque, workspace_bytes: usize, comptime single: bool) !void {
-        if (single and layout.batches != 1) return error.InvalidCublasShape;
+    /// Single GEMM preserves the SDK schedule and checks spans before binding.
+    pub fn singleF32WithWorkspace(self: *Cublas, stream: ?*anyopaque, output: *anyopaque, a: *const anyopaque, b: *const anyopaque, layout: F32StridedBatchedLayout, workspace: *anyopaque, workspace_bytes: usize) !void {
+        if (layout.batches != 1) return error.InvalidCublasShape;
         const occupied = try workspaceSpan(workspace, workspace_bytes);
         try checkWorkspaceOperands(occupied, output, a, b, layout);
         var scope = try self.bindF32Workspace(stream, workspace, occupied);
         defer scope.deinit();
-        if (single) {
-            const alpha: f32 = 1;
-            const beta: f32 = 0;
-            try check(self.library.fns.sgemm(self.handle, if (layout.transpose_a) CUBLAS_OP_T else CUBLAS_OP_N, if (layout.transpose_b) CUBLAS_OP_T else CUBLAS_OP_N, @intCast(layout.m), @intCast(layout.n), @intCast(layout.k), &alpha, a, @intCast(layout.lda), b, @intCast(layout.ldb), &beta, output, @intCast(layout.ldc)));
-            self.calls +|= 1;
-        } else try self.submitStridedF32(output, a, b, layout);
+        const alpha: f32 = 1;
+        const beta: f32 = 0;
+        try check(self.library.fns.sgemm(self.handle, if (layout.transpose_a) CUBLAS_OP_T else CUBLAS_OP_N, if (layout.transpose_b) CUBLAS_OP_T else CUBLAS_OP_N, @intCast(layout.m), @intCast(layout.n), @intCast(layout.k), &alpha, a, @intCast(layout.lda), b, @intCast(layout.ldb), &beta, output, @intCast(layout.ldc)));
+        self.calls +|= 1;
     }
 
     fn submitStridedF32(self: *Cublas, output: *anyopaque, a: *const anyopaque, b: *const anyopaque, layout: F32StridedBatchedLayout) !void {
@@ -1302,15 +1288,15 @@ test "F32 strided source workspace validates before SDK publication and clears f
     Probe.active = false;
     const layout = try F32StridedBatchedLayout.packedRowMajor(1, 1, 1, 1, false, false);
     const workspace: *anyopaque = @ptrFromInt(0x10000000);
-    try std.testing.expectError(error.InvalidCublasWorkspace, blas.stridedBatchedF32WithWorkspace(@ptrFromInt(1), @ptrFromInt(0x1000), @ptrFromInt(0x2000), @ptrFromInt(0x3000), layout, workspace, Cublas.f32_source_workspace_bytes - 1));
-    try std.testing.expectError(error.InvalidCublasWorkspace, blas.stridedBatchedF32WithWorkspace(@ptrFromInt(1), @ptrFromInt(0x1000), @ptrFromInt(0x2000), @ptrFromInt(0x3000), layout, @ptrFromInt(0x10000004), Cublas.f32_source_workspace_bytes));
-    try std.testing.expectError(error.InvalidCublasWorkspace, blas.stridedBatchedF32WithWorkspace(@ptrFromInt(1), @ptrFromInt(0x10000000), @ptrFromInt(0x2000), @ptrFromInt(0x3000), layout, workspace, Cublas.f32_source_workspace_bytes));
-    try std.testing.expectError(error.InvalidCublasShape, blas.stridedBatchedF32WithWorkspace(@ptrFromInt(1), @ptrFromInt(0x2000), @ptrFromInt(0x2000), @ptrFromInt(0x3000), layout, workspace, Cublas.f32_source_workspace_bytes));
+    try std.testing.expectError(error.InvalidCublasWorkspace, blas.singleF32WithWorkspace(@ptrFromInt(1), @ptrFromInt(0x1000), @ptrFromInt(0x2000), @ptrFromInt(0x3000), layout, workspace, Cublas.f32_source_workspace_bytes - 1));
+    try std.testing.expectError(error.InvalidCublasWorkspace, blas.singleF32WithWorkspace(@ptrFromInt(1), @ptrFromInt(0x1000), @ptrFromInt(0x2000), @ptrFromInt(0x3000), layout, @ptrFromInt(0x10000004), Cublas.f32_source_workspace_bytes));
+    try std.testing.expectError(error.InvalidCublasWorkspace, blas.singleF32WithWorkspace(@ptrFromInt(1), @ptrFromInt(0x10000000), @ptrFromInt(0x2000), @ptrFromInt(0x3000), layout, workspace, Cublas.f32_source_workspace_bytes));
+    try std.testing.expectError(error.InvalidCublasShape, blas.singleF32WithWorkspace(@ptrFromInt(1), @ptrFromInt(0x2000), @ptrFromInt(0x2000), @ptrFromInt(0x3000), layout, workspace, Cublas.f32_source_workspace_bytes));
     try std.testing.expectEqual(@as(usize, 0), Probe.calls);
     try std.testing.expectEqual(@as(usize, 0), StridedGemmProbe.streams);
     try std.testing.expectEqual(@as(usize, 0), StridedGemmProbe.calls);
     Probe.fail_binding = true;
-    try std.testing.expectError(error.CublasError, blas.stridedBatchedF32WithWorkspace(@ptrFromInt(1), @ptrFromInt(0x1000), @ptrFromInt(0x2000), @ptrFromInt(0x3000), layout, workspace, Cublas.f32_source_workspace_bytes));
+    try std.testing.expectError(error.CublasError, blas.singleF32WithWorkspace(@ptrFromInt(1), @ptrFromInt(0x1000), @ptrFromInt(0x2000), @ptrFromInt(0x3000), layout, workspace, Cublas.f32_source_workspace_bytes));
     try std.testing.expectEqual(@as(usize, 2), Probe.calls);
     try std.testing.expectEqual(@as(usize, 1), Probe.clears);
     try std.testing.expect(!Probe.active);
@@ -1346,11 +1332,19 @@ test "F32 strided source workspace survives submission and clears after SDK fail
     var b = [_]f32{3};
     var c: [1]f32 = undefined;
     const layout = try F32StridedBatchedLayout.packedRowMajor(1, 1, 1, 1, false, false);
-    try blas.stridedBatchedF32WithWorkspace(null, @ptrCast(&c), @ptrCast(&a), @ptrCast(&b), layout, @ptrFromInt(0x10000000), Cublas.f32_source_workspace_bytes);
+    {
+        var scope = try blas.beginF32Workspace(null, @ptrFromInt(0x10000000), Cublas.f32_source_workspace_bytes);
+        defer scope.deinit();
+        try scope.stridedBatched(@ptrCast(&c), @ptrCast(&a), @ptrCast(&b), layout);
+    }
     try std.testing.expectEqual(@as(f32, 6), c[0]);
     try std.testing.expect(!Probe.active and Probe.clears == 1);
     StridedGemmProbe.fail = true;
-    try std.testing.expectError(error.CublasError, blas.stridedBatchedF32WithWorkspace(null, @ptrCast(&c), @ptrCast(&a), @ptrCast(&b), layout, @ptrFromInt(0x10000000), Cublas.f32_source_workspace_bytes));
+    {
+        var scope = try blas.beginF32Workspace(null, @ptrFromInt(0x10000000), Cublas.f32_source_workspace_bytes);
+        defer scope.deinit();
+        try std.testing.expectError(error.CublasError, scope.stridedBatched(@ptrCast(&c), @ptrCast(&a), @ptrCast(&b), layout));
+    }
     try std.testing.expect(!Probe.active and Probe.clears == 2);
     try std.testing.expectEqual(@as(u64, 1), blas.calls);
 
