@@ -215,23 +215,29 @@ Feed URLs:
 - `https://releases.antfly.io/antfly-dictation/channels/beta/appcast.xml`
 
 Permanent installation link:
-`https://releases.antfly.io/antfly-dictation/download.html`
+`https://antfly.io/download/dictation`
 
-This small HTML page redirects to the immutable Apple Silicon ZIP and provides a
-normal download link if automatic refresh is disabled. It follows successful beta
+The website returns an HTTP 302 directly to the immutable Apple Silicon ZIP;
+no intermediate page is rendered. Its Worker resolves the publisher-owned version
+marker at `https://releases.antfly.io/antfly-dictation/download.html` with a bounded
+fetch, validates the version, and constructs the ZIP URL on the fixed release host.
+The redirect is not cached, and upstream failures return a retryable 503. It follows successful beta
 releases until the first stable app release; after that it follows stable only,
 even if a beta has a higher version. It is promoted only after exact release
 verification and feed publication. Conditional writes prevent concurrent releases
 from downgrading it, and retries repair partial feed/download promotion. Failed
 builds, signing, notarization, or uploads leave the previous download intact.
-The page uses `Cache-Control: no-cache, no-transform`; do not override it at the CDN.
+The publisher-owned pointer uses `Cache-Control: no-cache, no-transform`; do not
+override it at the CDN. The website redirect uses `Cache-Control: no-store`.
 The signed Sparkle feeds remain the app updater’s authority.
 
 To initialize this link for an already published release after merging the
 publisher change, run the existing **Dictation release recovery** workflow with
 that release’s tag, original source commit, and trusted ledger SHA-256. It verifies
 and reuses the original signed bytes; no retagging or rebuilding is needed.
-Initialize it before deploying documentation that uses the permanent link.
+Deploy the website Worker route before deploying documentation that uses the
+permanent installation link. The underlying release pointer must be initialized
+once; it already exists for currently published Dictation releases.
 
 Archive URL:
 `https://releases.antfly.io/antfly-dictation/releases/<version>/Antfly-Dictation-<version>-arm64.zip`
