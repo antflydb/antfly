@@ -3768,7 +3768,7 @@ pub const CudaCompute = struct {
             const head_rows = layout.headPacketRows(owner.rows, owner.vocab);
             if (head_rows == 0) return error.InvalidExecutionPlan;
             if (head_rows >= owner.rows) {
-                const logits = try self.projectHead(cb, input_ct, weight);
+                const logits = try self.projectHead(cb, input_ct, weight, owner.rows);
                 defer cb.free(logits);
                 return burst_value.argmax(logits, step);
             }
@@ -3792,25 +3792,23 @@ pub const CudaCompute = struct {
                     .owns_bf16_mirror = false,
                     .owned_by_tensor = false,
                 };
-                // With no separate bank the existing stream scope records
-                // this projection's exact lifetime and binds it on capture.
-                const destination: ?buffer_mod.DeviceBuffer = if (self.head_destination) |bank| .{
-                    .ptr = bank.ptr,
-                    .len = try checkedMul(try checkedMul(rows, owner.vocab), @sizeOf(f32)),
-                } else null;
-                const logits = try cb.observeBackendEntry(.linear_no_bias, &linearNoBiasWithDestination, .{ self.compute, @as(CT, @ptrCast(&packet_input)), weight, rows, owner.hidden, owner.vocab, false, destination });
+                const logits = try self.projectHead(cb, @ptrCast(&packet_input), weight, rows);
                 defer cb.free(logits);
                 try burst_value.argmaxRange(logits, step, first, rows);
                 first += rows;
             }
         }
 
-        fn projectHead(self: *@This(), cb: *const ops.ComputeBackend, input_ct: CT, weight: CT) !CT {
+        fn projectHead(self: *@This(), cb: *const ops.ComputeBackend, input_ct: CT, weight: CT, rows: usize) !CT {
             const owner = &self.compute.bounded_decode_graph;
             std.debug.assert(cb.ptr == @as(*anyopaque, @ptrCast(self.compute)));
-            const destination = self.head_destination orelse
-                return cb.linearNoBias(input_ct, weight, owner.rows, owner.hidden, owner.vocab);
-            return cb.observeBackendEntry(.linear_no_bias, &linearNoBiasWithDestination, .{ self.compute, input_ct, weight, owner.rows, owner.hidden, owner.vocab, false, @as(?buffer_mod.DeviceBuffer, destination) });
+            // Without a separate bank, the stream workspace owns the
+            // projection's allocation and release in both execution modes.
+            const bank = self.head_destination orelse
+                return cb.linearNoBias(input_ct, weight, rows, owner.hidden, owner.vocab);
+            const bytes = try lightOnLinearOutputBytes(self.compute, tensorFromCt(weight), rows, owner.vocab);
+            const destination = try borrowBufferRange(bank, 0, bytes);
+            return cb.observeBackendEntry(.linear_no_bias, &linearNoBiasWithDestination, .{ self.compute, input_ct, weight, rows, owner.hidden, owner.vocab, false, @as(?buffer_mod.DeviceBuffer, destination) });
         }
         pub fn embedInput(self: *@This(), embedding: CT, ids: []const i64) !void {
             const owner = &self.compute.bounded_decode_graph;
@@ -46914,7 +46912,7 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
     var observation = @import("../../execution/runtime_observation.zig").Scope.init();
     defer observation.deinit();
     try std.testing.expectError(error.InvalidShape, linearNoBiasWithDestination(&compute, input, weight, 3, 2, 2, false, tensorFromCt(input).buffer));
-    const projected = try claim.projectHead(&cb, input, weight);
+    const projected = try claim.projectHead(&cb, input, weight, 3);
     const entries = observation.snapshot().backend_entries;
     for (entries.records[0..entries.count]) |entry| {
         if (entry.family == .linear_no_bias and entry.backend == .cuda) {
@@ -46934,6 +46932,7 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
     // different positions in the second token step after bank reuse.
     owner.storage_layout.?.head_bytes = 4 * @sizeOf(f32);
     claim.head_destination = try owner.bindExecutionStorage();
+    try std.testing.expectError(error.InvalidShape, claim.projectHead(&cb, input, weight, 3));
     const packet_input = try cb.fromFloat32Shape(&.{ 3, 2, 5, 7, 13, 11 }, &.{ 3, 2 });
     defer cb.free(packet_input);
     try claim.projectGreedyHead(&cb, &burst, packet_input, weight, 1);
