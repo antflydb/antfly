@@ -96,6 +96,24 @@ pub const Scheduler = struct {
             self.finish(true);
         }
 
+        pub fn join(self: *Handle) void {
+            self.finish(false);
+        }
+
+        /// The caller owns the handle and serializes this operation with its
+        /// retirement. Unlike a context broadcast this wakes one task.
+        pub fn wake(self: Handle) void {
+            const scheduler = self.task.scheduler;
+            scheduler.mutex.lockUncancelable(scheduler.io);
+            defer scheduler.mutex.unlock(scheduler.io);
+            // An already scheduled poll covers newly added work. Only make
+            // idle tasks eligible again, keeping active work coalesced.
+            if (self.task.future != null or self.task.due_ms == std.math.maxInt(u64)) {
+                self.task.notified = true;
+                scheduler.changed.set(scheduler.io);
+            }
+        }
+
         fn finish(self: *Handle, cancel_active: bool) void {
             const task = self.task;
             const scheduler = task.scheduler;

@@ -3228,8 +3228,8 @@ pub const ResolutionRuntime = struct {
             // states keep the replay cursor pending and retry without turning
             // normal Raft/catalog convergence into a warning on every poll.
             switch (err) {
+                error.ResourceTemporarilyUnavailable => return 250,
                 error.ArtifactPublicationPending,
-                error.ResourceTemporarilyUnavailable,
                 error.ArtifactCatalogDrift,
                 error.EnrichmentSourceChanged,
                 error.Timeout,

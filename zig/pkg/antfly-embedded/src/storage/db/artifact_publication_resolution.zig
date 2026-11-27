@@ -23,6 +23,7 @@ const resolver_lib = @import("antfly_resolver");
 const runtime = @import("resolution_runtime.zig");
 const keys = @import("../internal_keys.zig");
 const resources = @import("../resource_manager.zig");
+const transport_codec = @import("artifact_publication_transport_codec.zig");
 
 pub const Token = @import("artifact_producer_context.zig").Token;
 
@@ -85,6 +86,37 @@ fn setSourceScope(self: *Token, source_key: []const u8) !void {
     self.producer_scope_key = if (std.mem.eql(u8, parsed.resolution_scope_key, parsed.doc_key)) "" else try alloc.dupe(u8, source_key);
 }
 
+pub const EncodingAdmission = struct {
+    const Input = struct {
+        receipt: publication.ReceiptKey,
+        primary_revision: ?publication.Position,
+        upstream_revision: ?publication.Position,
+    };
+    denied: ?struct { input: Input, bytes: usize } = null,
+
+    fn reserve(self: *const EncodingAdmission, budget: *resources.BudgetedAllocator, input: Input, minimum: usize) !resources.BudgetedAllocator.ScratchReservation {
+        const required = if (self.denied) |old|
+            if (std.meta.eql(old.input, input)) @max(old.bytes, minimum) else minimum
+        else
+            minimum;
+        return budget.reserveScratch(required) catch |err|
+            return if (err == error.ResourceBudgetExceeded) error.ResourceTemporarilyUnavailable else err;
+    }
+
+    fn encode(self: *EncodingAdmission, budget: *resources.BudgetedAllocator, input: Input, command: publication.Command) ![]u8 {
+        const bytes = transport_codec.encodeAlloc(budget.allocator(), command) catch |err| {
+            if (err == error.OutOfMemory) if (budget.allocationFailureThreadSafe()) |failure| if (failure.cause == .admission) {
+                const previous = if (self.denied) |old| if (std.meta.eql(old.input, input)) old.bytes else 0 else 0;
+                self.denied = .{ .input = input, .bytes = @max(previous, failure.requested_bytes +| @as(usize, @intCast(failure.live_bytes))) };
+                return error.ResourceTemporarilyUnavailable;
+            };
+            return err;
+        };
+        self.denied = null;
+        return bytes;
+    }
+};
+
 /// Process one replay window through the ordered owner. A successful enqueue
 /// never advances the resolver watermark. Each sibling starts only after the
 /// previous resolver's input-bound receipt is locally durable.
@@ -93,6 +125,7 @@ pub fn process(
     store: anytype,
     dispatcher: ?publication.Dispatcher,
     resource_manager: ?*resources.ResourceManager,
+    encoding_admission: *EncodingAdmission,
     resolvers: []const catalog.ResolverConfig,
     fallback: resolver_lib.ArtifactStore,
     provider: ?resolver_lib.CandidateProvider,
@@ -141,7 +174,8 @@ pub fn process(
             defer token.deinit();
 
             try setSourceScope(&token, key);
-            {
+            const selector = try token.command(&.{});
+            const input: EncodingAdmission.Input = blk: {
                 // Discover the accepted input set by stable stream identity
                 // before candidate lookup or provider execution. Comparing a
                 // freshly empty recorder with the receipt cannot find an
@@ -150,7 +184,6 @@ pub fn process(
                 var read = try store.beginReadTxnWithBlockCacheAdmission(.transient);
                 defer read.abort();
 
-                const selector = try token.command(&.{});
                 var accepted = @import("artifact_producer_provenance.zig").readCurrentForSource(alloc, &read, selector, token.source) catch |err| switch (err) {
                     error.EnrichmentSourceChanged => null,
                     else => return err,
@@ -159,7 +192,26 @@ pub fn process(
                     value.deinit();
                     continue;
                 }
-            }
+                break :blk .{
+                    .receipt = publication.receiptKey(selector, token.source),
+                    .primary_revision = token.source.input_position,
+                    .upstream_revision = try publication.artifactRevision(&read, token.namespace, key),
+                };
+            };
+
+            // The first attempt admits the command header. If serialization
+            // needed more capacity, reserve that measured demand before
+            // repeating candidate lookup or inference for the same input.
+            var budget = if (resource_manager) |owner|
+                resources.BudgetedAllocator.init(owner, .relational_preparation_working_set, alloc, 1)
+            else
+                null;
+            defer if (budget) |*tracked| tracked.deinit();
+            var credit = if (budget) |*tracked|
+                try encoding_admission.reserve(tracked, input, try transport_codec.encodedLength(selector))
+            else
+                null;
+            defer if (credit) |*reservation| reservation.release();
 
             const output_key = try keys.resolutionArtifactKeyAlloc(work, parsed.resolution_scope_key, config.resolution_artifact);
             const control_key = try runtime.reviewOverrideArtifactKeyAlloc(work, parsed.resolution_scope_key, config.source_artifact, config.resolution_artifact);
@@ -193,26 +245,17 @@ pub fn process(
             }
 
             const port = dispatcher orelse return error.ArtifactCatalogDrift;
-            try submitOrderedResolution(alloc, resource_manager, port, command);
+            const transport = if (budget) |*tracked| tracked.allocator() else alloc;
+            const bytes = if (budget) |*tracked|
+                try encoding_admission.encode(tracked, input, command)
+            else
+                try transport_codec.encodeAlloc(transport, command);
+            defer transport.free(bytes);
+            try port.submit(command.namespace, bytes);
             return error.ArtifactPublicationPending;
         }
     }
     return true;
-}
-
-fn submitOrderedResolution(alloc: std.mem.Allocator, manager: ?*resources.ResourceManager, port: publication.Dispatcher, command: publication.Command) !void {
-    var budget = if (manager) |owner| resources.BudgetedAllocator.init(owner, .relational_preparation_working_set, alloc, 1) else null;
-    defer if (budget) |*tracked| tracked.deinit();
-    const transport = if (budget) |*tracked| tracked.allocator() else alloc;
-    const bytes = @import("artifact_publication_transport_codec.zig").encodeAlloc(transport, command) catch |err| {
-        if (err == error.OutOfMemory) if (budget) |*tracked| if (tracked.allocationFailureThreadSafe()) |failure| if (failure.cause == .admission) {
-            manager.?.reclaimReplayPublications();
-            return error.ResourceTemporarilyUnavailable;
-        };
-        return err;
-    };
-    defer transport.free(bytes);
-    try port.submit(command.namespace, bytes);
 }
 
 /// Reads authored artifact inputs and their mutation position from the same
@@ -508,30 +551,44 @@ test "ordered resolver preparation binds output to exact source and configured g
         .publication_digest = @splat(0),
     };
     command.publication_digest = command.digest();
-    const Transport = struct {
-        manager: *resources.ResourceManager,
-        calls: usize = 0,
-
-        fn enqueue(ptr: *anyopaque, _: publication.Namespace, bytes: []const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expect(self.manager.sliceStats(.relational_preparation_working_set).used_bytes >= bytes.len);
-            self.calls += 1;
-        }
-    };
     {
         const limit = 1024 * 1024;
+        const slice: resources.Slice = .relational_preparation_working_set;
         var manager = resources.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = limit } });
         defer manager.deinit(alloc);
-        var transport: Transport = .{ .manager = &manager };
-        const port: publication.Dispatcher = .{ .ptr = &transport, .enqueue = Transport.enqueue };
-        var blocker = try manager.reserve(.relational_preparation_working_set, limit);
+        var admission: EncodingAdmission = .{};
+        const admission_input: EncodingAdmission.Input = .{
+            .receipt = publication.receiptKey(command, command.sources[0]),
+            .primary_revision = null,
+            .upstream_revision = null,
+        };
+        var blocker = try manager.reserve(slice, limit - 1);
         defer blocker.release();
-        try std.testing.expectError(error.ResourceTemporarilyUnavailable, submitOrderedResolution(alloc, &manager, port, command));
-        try std.testing.expectEqual(@as(usize, 0), transport.calls);
+        {
+            var budget = resources.BudgetedAllocator.init(&manager, slice, alloc, 1);
+            defer budget.deinit();
+            var credit = try admission.reserve(&budget, admission_input, 1);
+            defer credit.release();
+            try std.testing.expectError(error.ResourceTemporarilyUnavailable, admission.encode(&budget, admission_input, command));
+        }
+        {
+            var budget = resources.BudgetedAllocator.init(&manager, slice, alloc, 1);
+            defer budget.deinit();
+            // A failed preflight returns before the provider is called.
+            try std.testing.expectError(error.ResourceTemporarilyUnavailable, admission.reserve(&budget, admission_input, 1));
+        }
         blocker.release();
-        try submitOrderedResolution(alloc, &manager, port, command);
-        try std.testing.expectEqual(@as(usize, 1), transport.calls);
-        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.relational_preparation_working_set).used_bytes);
+        {
+            var budget = resources.BudgetedAllocator.init(&manager, slice, alloc, 1);
+            defer budget.deinit();
+            var credit = try admission.reserve(&budget, admission_input, 1);
+            defer credit.release();
+            const wire = try admission.encode(&budget, admission_input, command);
+            defer budget.allocator().free(wire);
+            try std.testing.expect(manager.sliceStats(slice).used_bytes >= wire.len);
+            try std.testing.expect(admission.denied == null);
+        }
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(slice).used_bytes);
     }
     var prepared = try prepareResolution(alloc, command, .{ .resolvers = encoded });
     defer prepared.deinit();
