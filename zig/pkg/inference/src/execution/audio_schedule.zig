@@ -729,6 +729,12 @@ pub const Capture = struct {
                 return;
             }
         }
+        // Recorded nodes publish a new owned handle. Recording a live alias
+        // as a second result would give the same tensor two release edges.
+        if (self.find(ct) != null) {
+            self.failed = true;
+            return;
+        }
         var n = node;
         n.output = self.plan.next_id;
         self.plan.next_id += 1;
@@ -917,6 +923,29 @@ test "embeddinggemma2 audio schedule rejects an unrecorded output without retain
     capture.finish(@ptrFromInt(1));
     try std.testing.expect(plan.disabled);
     try std.testing.expect(!plan.ready);
+}
+
+test "audio schedule rejects live output aliases and accepts retired handle reuse" {
+    const a = std.testing.allocator;
+    const plan = try a.create(Plan);
+    defer a.destroy(plan);
+    plan.* = .{};
+    const input: CT = @ptrFromInt(16);
+    const result: CT = @ptrFromInt(32);
+    const node: Node = .{ .args = .{ .silu = .{ .input = 0 } }, .inputs = @splat(0), .input_count = 1 };
+    var capture = Capture.init(plan, &.{input});
+    capture.append(node, result);
+    capture.append(node, result);
+    capture.finish(result);
+    try std.testing.expect(!plan.ready);
+
+    capture = Capture.init(plan, &.{input});
+    capture.append(node, result);
+    capture.forget(result);
+    capture.append(node, result);
+    capture.finish(result);
+    try std.testing.expect(plan.ready);
+    try std.testing.expectEqual(@as(u16, 2), plan.output);
 }
 
 test "audio schedule only publishes a value produced by the captured stage" {
