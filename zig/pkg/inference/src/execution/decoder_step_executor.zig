@@ -764,7 +764,7 @@ pub const Executor = struct {
     /// Execute only inside the reader epoch's model lane. The two-step graph
     /// returns through the existing bounded-burst publication contract.
     fn declineLightOnGraph(self: *Executor, reason: CudaGraphDecline) ?StepForwardResult {
-        self.lighton_graph_declines[@intFromEnum(reason)] += 1;
+        self.lighton_graph_declines[@backingInt(reason)] += 1;
         observation.cudaDecoderDeclined(reason);
         return null;
     }
@@ -776,15 +776,16 @@ pub const Executor = struct {
         input_ids: []const i64,
         first_context: *gpt_arch.DecodeContext,
     ) !?StepForwardResult {
+        const graph = @import("../ops/cuda/bounded_decode_graph.zig");
         const C = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
-        if (!C.lightOnDecodeGraphEnabled(self.context.cb) or claimed.len < 2 or claimed.len > (if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128")) @as(usize, 128) else 64) or first_context.mrope_positions == null)
+        if (!C.lightOnDecodeGraphEnabled(self.context.cb) or !C.supportsBoundedDecodeGraphRows(claimed.len) or first_context.mrope_positions == null)
             return self.tryOrderedLightOnCudaDecodeGraph(claimed, items, input_ids, first_context);
         std.debug.assert(items.len == claimed.len and input_ids.len == claimed.len);
-        var sequences: [128]u64 = undefined;
-        var order: [128]usize = undefined;
+        var sequences: [graph.max_rows]u64 = undefined;
+        var order: [graph.max_rows]usize = undefined;
         for (items, 0..) |item, i| sequences[i] = item.state.sequence_id orelse
             return self.tryOrderedLightOnCudaDecodeGraph(claimed, items, input_ids, first_context);
-        try @import("../ops/cuda/bounded_decode_graph.zig").canonicalOrder(sequences[0..claimed.len], order[0..claimed.len]);
+        try graph.canonicalOrder(sequences[0..claimed.len], order[0..claimed.len]);
         var identity = true;
         for (order[0..claimed.len], 0..) |original, row| identity = identity and original == row;
         if (identity) return self.tryOrderedLightOnCudaDecodeGraph(claimed, items, input_ids, first_context);
@@ -954,8 +955,7 @@ pub const Executor = struct {
         self.lighton_graph_attempts += 1;
         if (self.lighton_cuda_execution_id == 0 or self.access.mutex == null) return self.declineLightOnGraph(.unsupported_lane_state);
         if (!C.lightOnDecodeGraphEnabled(self.context.cb) or
-            claimed.len < 2 or claimed.len > (if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128")) @as(usize, 128) else 64) or self.context.gpt_config.suppressTokenIds().len != 0) return self.declineLightOnGraph(.unsupported_geometry);
-        if (claimed.len > 64 and claimed.len % 64 == 1) return self.declineLightOnGraph(.unsupported_geometry);
+            !C.supportsBoundedDecodeGraphRows(claimed.len) or self.context.gpt_config.suppressTokenIds().len != 0) return self.declineLightOnGraph(.unsupported_geometry);
         // The graph requires the same concrete packet route as its numerical
         // attention calls. Generic shapes must decline before weight lookup,
         // KV reservations, admission, graph creation or warm execution.

@@ -29,7 +29,27 @@ const quota_mod = @import("cache_quota.zig");
 const funding_mod = @import("prepared_cache.zig");
 const retirement = @import("../../execution/resource_retirement.zig");
 const Cleanup = @import("../../execution/cleanup_context.zig").Context;
-pub const max_rows = 128;
+pub const max_rows = 2 * paged_attention.max_packet_rows;
+
+/// Each captured attention packet requires at least two rows. A cohort
+/// ending in a singleton packet uses the ordinary decoder schedule.
+pub fn supportsRows(rows: usize, wide: bool) bool {
+    const packet_rows = paged_attention.max_packet_rows;
+    const limit: usize = if (wide) max_rows else packet_rows;
+    return rows >= 2 and rows <= limit and (rows <= packet_rows or rows % packet_rows != 1);
+}
+
+test "bounded CUDA decoder row eligibility follows attention packet boundaries" {
+    const packet_rows = paged_attention.max_packet_rows;
+    try std.testing.expect(!supportsRows(1, true));
+    try std.testing.expect(supportsRows(2, false));
+    try std.testing.expect(supportsRows(packet_rows, false));
+    try std.testing.expect(!supportsRows(packet_rows + 2, false));
+    try std.testing.expect(!supportsRows(packet_rows + 1, true));
+    try std.testing.expect(supportsRows(packet_rows + 2, true));
+    try std.testing.expect(supportsRows(max_rows, true));
+    try std.testing.expect(!supportsRows(max_rows + 1, true));
+}
 
 /// Exact independently retained buffers for a captured two-column sequence.
 /// Pure geometry is available to cold admission before any SDK teardown or

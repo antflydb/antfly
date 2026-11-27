@@ -4088,15 +4088,19 @@ pub const CudaCompute = struct {
         return !try self.ctx.streamCaptureActive();
     }
 
+    pub fn supportsBoundedDecodeGraphRows(rows: usize) bool {
+        return @import("bounded_decode_graph.zig").supportsRows(rows, platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128"));
+    }
+
     pub fn inspectCapturedGraphPhase(cb: *const ops.ComputeBackend, phase: *@import("bounded_decode_graph.zig").GraphPhase, current: CacheCleanup) !GraphPhaseDecision {
         if (!acceptsPhysicalImplementation(cb.vtable)) return error.UnsupportedReaderEpochBackend;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         const descriptor = phase.descriptor;
         if (phase.cold != null or phase.bound) return error.InvalidPreparedCacheState;
         if (current.outside_execution or current.boundary == null or try current.boundary.?.isSealed()) return error.MissingCurrentCleanupEpoch;
-        if (!lightOnDecodeGraphEnabled(cb) or descriptor.rows > (if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128")) @as(usize, 128) else 64) or
+        if (!lightOnDecodeGraphEnabled(cb) or !supportsBoundedDecodeGraphRows(descriptor.rows) or
             descriptor.future_tokens == 0 or descriptor.future_tokens > @import("paged_attention_bf16.zig").max_native_context_tokens or
-            (descriptor.hidden != 1024 and descriptor.hidden != 2560) or (descriptor.rows > 64 and (descriptor.rows % 64 == 1 or !self.lighton_ragged_recurrent_enabled))) return .unsupported;
+            (descriptor.hidden != 1024 and descriptor.hidden != 2560) or (descriptor.rows > @import("gated_delta.zig").max_packet_rows and !self.lighton_ragged_recurrent_enabled)) return .unsupported;
         if (self.execution_scope != null) return .unsupported;
         const owner = &self.bounded_decode_graph;
         if (!owner.mutex.tryLock()) return error.ReaderEpochBackendBusy;
@@ -4157,10 +4161,9 @@ pub const CudaCompute = struct {
         const hidden = expected.hidden;
         const vocab = expected.vocab;
         const future_tokens = expected.future_tokens;
-        if (!lightOnDecodeGraphEnabled(cb) or epoch == 0 or rows < 2 or rows > (if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128")) @as(usize, 128) else 64) or vocab == 0 or future_tokens == 0 or future_tokens > @import("paged_attention_bf16.zig").max_native_context_tokens or positions.len != rows * 3 or (hidden != 1024 and hidden != 2560)) return null;
-        if (rows > 64 and rows % 64 == 1) return null;
+        if (!lightOnDecodeGraphEnabled(cb) or epoch == 0 or !supportsBoundedDecodeGraphRows(rows) or vocab == 0 or future_tokens == 0 or future_tokens > @import("paged_attention_bf16.zig").max_native_context_tokens or positions.len != rows * 3 or (hidden != 1024 and hidden != 2560)) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
-        if (rows > 64 and !self.lighton_ragged_recurrent_enabled) return null;
+        if (rows > @import("gated_delta.zig").max_packet_rows and !self.lighton_ragged_recurrent_enabled) return null;
         if (self.execution_scope != null or try self.ctx.streamCaptureActive()) return null;
         const descriptor = graph_phase.descriptor;
         if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or !std.meta.eql(descriptor.attention_geometry, expected.attention_geometry) or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions)) return error.PreparedCachePlanChanged;
