@@ -2301,3 +2301,12 @@ binary, so this pair verifies each storage route and does not
 isolate the impact of removing the host view allocations. The
 receipts are `81dc942657692251dc137447d5bf1c6151a422ce974b6e8d1174816b184415a7`
 and `e00230dabf8ce8f2fab7ea26460d02b3461579b7fd61267a8da429ea9fc5d57e`.
+
+A same-settings ABBA run compared `e535ad9229` with `af26d3f4b6`
+using the arena in every arm. The first retained-view arm exhausted
+GPU-domain scratch during page admission and did not finish. The
+second retained-view arm matched all 256 pages at 7.2330 pages/s,
+with three wide replays at up to 97 rows. Both borrowed-view arms
+matched all 256 pages at 7.2765 and 7.2790 pages/s. The first had no
+replay and the second reached 97 rows once. The incomplete control
+and differing replay counts leave the throughput effect unresolved.
