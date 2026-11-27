@@ -689,4 +689,50 @@ test "retained CUDA execution accepts an independent typed recipe without model 
     try std.testing.expectEqual(P.Arena.GraphAction.replay, arena.graphAction(false));
     arena.replay_samples = 2;
     try std.testing.expectEqual(P.Arena.GraphAction.eager, arena.graphAction(true));
+
+    const FailedLaunch = struct {
+        var waited: bool = false;
+        var destroyed: bool = false;
+
+        fn current(_: driver.CUcontext) callconv(.c) driver.CUresult {
+            return driver.CUDA_SUCCESS;
+        }
+
+        fn launch(_: driver.CUgraphExec, _: driver.CUstream) callconv(.c) driver.CUresult {
+            return 1;
+        }
+
+        fn wait(_: driver.CUstream) callconv(.c) driver.CUresult {
+            waited = true;
+            return driver.CUDA_SUCCESS;
+        }
+
+        fn destroy(_: driver.CUgraphExec) callconv(.c) driver.CUresult {
+            std.debug.assert(waited);
+            destroyed = true;
+            return driver.CUDA_SUCCESS;
+        }
+
+        fn describe(_: driver.CUresult, name: *?[*:0]const u8) callconv(.c) driver.CUresult {
+            name.* = "injected retained graph launch failure";
+            return driver.CUDA_SUCCESS;
+        }
+    };
+    var launch_context: Context = .{ .driver = undefined, .device = 0, .ctx = @ptrFromInt(1), .stream = null, .info = .{} };
+    launch_context.driver.fns.cuCtxSetCurrent = FailedLaunch.current;
+    launch_context.driver.fns.cuGraphLaunch = FailedLaunch.launch;
+    launch_context.driver.fns.cuStreamSynchronize = FailedLaunch.wait;
+    launch_context.driver.fns.cuGraphExecDestroy = FailedLaunch.destroy;
+    launch_context.driver.fns.cuGetErrorName = FailedLaunch.describe;
+    launch_context.driver.fns.cuGetErrorString = FailedLaunch.describe;
+    const backing: Buffer = .{ .ptr = 0x1000, .len = 64 };
+    var failed_arena: P.Arena = .{ .kind = .audio, .batch = 1, .sequence = 1, .graph = &graph_marker };
+    failed_arena.buffers[0] = backing;
+    FailedLaunch.waited = false;
+    FailedLaunch.destroyed = false;
+    @import("../../test_error_logs.zig").expectErrorLogs(1);
+    try std.testing.expectError(error.CudaDriverError, failed_arena.launch(&launch_context));
+    try std.testing.expect(FailedLaunch.destroyed and failed_arena.graph == null);
+    try std.testing.expectEqualDeep(backing, failed_arena.buffers[0]);
+    try std.testing.expectEqual(P.Arena.GraphAction.eager, failed_arena.graphAction(true));
 }
