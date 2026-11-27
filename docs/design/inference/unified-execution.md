@@ -2171,3 +2171,13 @@ arm did not log a storage denial, so it does not demonstrate
 contraction under pressure. The paired receipts are
 `d6499b99a4687a1dcade013e47e8f639f1df2b9ed10c7a5d61264199addc4c82`
 and `9f1b5d07ee8a38b918b46c2d97e64667e04ac416b7cc14b6336ee7d5bfb6fd8c`.
+
+The same Metal server used for the tuning-boundary comparison also
+passed the short Inkling 2 Mini ordered-image streaming smoke test
+using the default checkpoint. The provider selected Metal
+automatically. The two 50-token requests returned the expected
+`red` and `blue` in order, each with stop, final usage and
+`[DONE]`. Cold and warm wall times were 41.28 and 1.016 seconds.
+This is a correctness smoke test with one request per order.
+The JSONL receipt is
+`b1021d98df97b87d1c624ec85a33aafca6b19a8b7384cfe554897ba8231cce0c`.
