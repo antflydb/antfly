@@ -686,13 +686,18 @@ def run(args, model, label, mode, concurrency, output):
                 prior_snapshots = re.findall(snapshot_pattern, pieces[0])
                 previous_snapshots = int(prior_snapshots[-1]) if prior_snapshots else 0
                 for sample, section in zip(result["policy_rounds"], sections):
-                    replay_rows = [
-                        int(v)
-                        for v in re.findall(
-                            r"LIGHTONOCR3 cuda_model_graph_first_replay_rows=(\d+)",
-                            section,
-                        )
-                    ]
+                    replays = re.findall(
+                        r"LIGHTONOCR3 cuda_model_graph_first_replay_rows=(\d+)"
+                        r"(?: capture=\d+ head_packet_rows=(\d+) head_bank_bytes=(\d+))?",
+                        section,
+                    )
+                    replay_rows = [int(rows) for rows, _, _ in replays]
+                    if banks := [
+                        dict(rows=int(rows), packet_rows=int(packet), bank_bytes=int(bank))
+                        for rows, packet, bank in replays
+                        if packet
+                    ]:
+                        sample["model_graph_replay_head_banks"] = banks
                     sample["model_graph_replay_cohort_rows"] = sorted(set(replay_rows))
                     sample["model_graph_first_replay_events"] = len(replay_rows)
                     sample["model_graph_max_replay_rows"] = max(replay_rows, default=0)

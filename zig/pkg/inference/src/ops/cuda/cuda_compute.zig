@@ -3827,8 +3827,12 @@ pub const CudaCompute = struct {
                 owner.replays += 1;
                 owner.wide_replays += @intFromBool(owner.rows > 64);
                 owner.max_replay_rows = @max(owner.max_replay_rows, owner.rows);
-                if (owner.progress == 2 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
-                    std.debug.print("LIGHTONOCR3 cuda_model_graph_first_replay_rows={d} capture={d}\n", .{ owner.rows, owner.captures });
+                if (owner.progress == 2 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
+                    const packet_rows = if (owner.head.len == 0) owner.rows else owner.head.len / (owner.vocab * @sizeOf(f32));
+                    std.debug.print("LIGHTONOCR3 cuda_model_graph_first_replay_rows={d} capture={d} head_packet_rows={d} head_bank_bytes={d}\n", .{
+                        owner.rows, owner.captures, packet_rows, owner.head.len,
+                    });
+                }
                 return;
             }
             const phase = owner.phase;
