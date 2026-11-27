@@ -2792,3 +2792,11 @@ CUDA text's ABBA p95 difference was smaller than the spread between
 the two baseline-only p95 controls. Default CUDA grouped audio's
 candidate-only p50 range was 48.28–48.49 ms versus 50.10–50.44 ms in
 the baseline controls.
+
+With the CUDA audio graph option enabled on both builds, the same 40-request
+paired comparison also matched exactly. Baseline p50/p95 were 50.44/51.17 ms
+and candidate p50/p95 were 49.06/49.43 ms. Candidate-only p50 controls were
+48.59–48.95 ms. The HTTP run confirms behavior with the option enabled.
+Actual capture and replay counts come from the separate released-checkpoint
+fixture. The default-mode and graph-enabled runs were separate comparisons,
+so their latency difference does not isolate graph replay overhead.
