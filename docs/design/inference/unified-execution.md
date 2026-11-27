@@ -2390,3 +2390,12 @@ selected token 1 and recorded 12 bytes of host access for one F32 row
 of a two-row tensor. The normal reader entrypoint also matched the
 host reference. The log hash is
 `e825cef836db554e08dbdcd2b83c3a3d4895d0aba84d7ea5487ce2dca4cce4bf`.
+
+At `4da5997db2`, Spark GB10 passed all 35 selected CUDA checks.
+The same binary passed the released LightOnOCR HTTP check with
+recurrent fusion disabled. Both runs replayed two rows and returned a
+44-byte pinned receipt. The fused run bound no recurrent scratch, and
+the unfused run bound 65,536 bytes within the same 297,216-byte bank
+used by attention. The standard and unfused log hashes are
+`1ec1af4fe0d5fcdee84debf1f02e9b0c10be685a4fbf7f64f35e3ef70a944caa`
+and `29e3adaf879a69739870abca1f03ce6882699d38aae2886d4d4eae6a394c12ce`.
