@@ -2086,3 +2086,13 @@ observed response, including all four Gemma 4 modalities and DECIDE.
 This was a capacity and repeatability control with one warmup and one
 measured request per arm. Its receipt is
 `4e1770f3a6a5e41102e35a0685936fd4ca447bf0dbc713bfef1cd8ce8b1cb14d`.
+
+A same-binary Metal audio control disabled the optional prepared audio
+plan in the B arms. All outputs matched across A/A, A/B and B/B, with
+48 measured samples per side per phase. Enabled versus disabled A/B
+p50 was 35.96 versus 35.87 ms and p95 was 40.55 versus 36.45 ms.
+Enabled A/A p95 was 40.58/40.48 ms; disabled B/B p95 was
+36.50/38.20 ms. This isolates the tail difference to the optional
+plan path on this binary. It leaves the cause within the plan path
+and its storage lifetime unqualified. The receipt is
+`64b4ee11047e3bb0293d2bf5e1e8a80abe080c0e408d1c3bf8047b9caeb66fe8`.
