@@ -20,6 +20,7 @@ import unittest
 from benchmark_concurrency import (
     apply_token_burst_overrides,
     graph_funding_denials,
+    graph_retirements,
     recurrent_placement_observation,
 )
 
@@ -42,6 +43,19 @@ class GraphFundingTests(unittest.TestCase):
                   policy_scratch_limit=900)],
         )
         self.assertEqual(graph_funding_denials(text.splitlines()[0]), [])
+
+
+class GraphRetirementTests(unittest.TestCase):
+    def test_records_progress_and_ignores_reset_messages(self):
+        text = (
+            "LIGHTONOCR3 cuda_model_graph_reset phase=disabled rows=64\n"
+            "LIGHTONOCR3 cuda_model_graph_retired reason=mixed_prefill "
+            "phase=replay epoch=3 rows=64 progress=12\n"
+        )
+        self.assertEqual(
+            graph_retirements(text),
+            [dict(reason="mixed_prefill", phase="replay", epoch=3, rows=64, progress=12)],
+        )
 
 
 class RecurrentPlacementTests(unittest.TestCase):

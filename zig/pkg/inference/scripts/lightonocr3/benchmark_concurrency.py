@@ -57,6 +57,17 @@ def graph_funding_denials(text):
     ]
 
 
+def graph_retirements(text):
+    return [
+        dict(reason=reason, phase=phase, epoch=int(epoch), rows=int(rows), progress=int(progress))
+        for reason, phase, epoch, rows, progress in re.findall(
+            r"LIGHTONOCR3 cuda_model_graph_retired reason=(\w+) phase=(\w+) "
+            r"epoch=(\d+) rows=(\d+) progress=(\d+)",
+            text,
+        )
+    ]
+
+
 def prefill_stream_observation(text):
     values = re.findall(
         r"LIGHTONOCR3 prefill_stream_layers=(\d+) prefill_stream_splits=(\d+)", text
@@ -689,19 +700,25 @@ def run(args, model, label, mode, concurrency, output):
                 for sample, section in zip(result["policy_rounds"], sections):
                     replays = re.findall(
                         r"LIGHTONOCR3 cuda_model_graph_first_replay_rows=(\d+)"
-                        r"(?: capture=\d+ head_packet_rows=(\d+) head_bank_bytes=(\d+))?",
+                        r"(?: capture=\d+ head_packet_rows=(\d+) head_bank_bytes=(\d+)"
+                        r"(?: fused_head_scratch_bytes=(\d+))?)?",
                         section,
                     )
-                    replay_rows = [int(rows) for rows, _, _ in replays]
+                    replay_rows = [int(rows) for rows, _, _, _ in replays]
                     if banks := [
-                        dict(rows=int(rows), packet_rows=int(packet), bank_bytes=int(bank))
-                        for rows, packet, bank in replays
+                        dict(
+                            rows=int(rows), packet_rows=int(packet), bank_bytes=int(bank),
+                            fused_head_scratch_bytes=int(fused) if fused else None,
+                        )
+                        for rows, packet, bank, fused in replays
                         if packet
                     ]:
                         sample["model_graph_replay_head_banks"] = banks
                     sample["model_graph_replay_cohort_rows"] = sorted(set(replay_rows))
                     sample["model_graph_first_replay_events"] = len(replay_rows)
                     sample["model_graph_max_replay_rows"] = max(replay_rows, default=0)
+                    if retirements := graph_retirements(section):
+                        sample["model_graph_retirements"] = retirements
                     if denials := graph_funding_denials(section):
                         sample["model_graph_funding_denials"] = denials
                     if args.require_lighton_model_graph and not replay_rows:
