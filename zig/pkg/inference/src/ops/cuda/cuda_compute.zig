@@ -21083,7 +21083,10 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     const output = storage.output orelse return null;
     // The same complete event ABI drives preflight and actual arena lookup.
     const cache_request = CudaCompute.audioArenaRequest(executable);
-    const arena = (try self.embedding_gemma2_execution.bindArenaRequest(&self.ctx, cache_request.arena)) orelse return null;
+    const arena = (try self.embedding_gemma2_execution.bindArenaRequest(&self.ctx, cache_request.arena)) orelse {
+        observation.cudaAudioResult(.arena_unavailable);
+        return null;
+    };
     arena.pollTiming(&self.ctx);
     // The sealed allocation plan above is the audio route's capture proof.
     const existing_output: ?*CudaTensor = if (arena.retained_output) |retained| @ptrCast(@alignCast(retained.owner)) else null;
@@ -21101,10 +21104,20 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         // A held publication forces eager execution into independent storage.
         const retained_input = held and tensorFromCt(ct) == existing_output.?;
         if (source.ptr == 0 or CudaCompute.stageBufferOverlap(source, arena.buffers[0]) or
-            (!retained_input and CudaCompute.stageBufferOverlap(source, arena.buffers[1]))) return null;
+            (!retained_input and CudaCompute.stageBufferOverlap(source, arena.buffers[1])))
+        {
+            observation.cudaAudioResult(.input_alias_declined);
+            return null;
+        }
     }
     var execution_scope = if (replay) null else try plan_mod.Scope.bind(plan, storage, arena.buffers[0].ptr, arena.buffers[0].len);
-    if (capture) try SourceLinearTemporary.validateArenaCapture(self, &execution_scope.?);
+    if (capture) SourceLinearTemporary.validateArenaCapture(self, &execution_scope.?) catch |err| switch (err) {
+        error.CudaGraphCaptureUnsafeTempAlloc => {
+            observation.cudaAudioResult(.capture_storage_declined);
+            return null;
+        },
+        else => return err,
+    };
     // Eager execution can bind the final write even when the learned
     // allocation has padding. The shape and element count stay logical.
     const published_directly = !replay and !capture;
@@ -21155,6 +21168,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         }
         if (capture) self.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED) catch {
             arena.disabled = true;
+            observation.cudaAudioResult(.capture_begin_declined);
             return null;
         };
         const h2d_before = self.stats.h2d_bytes;
@@ -21169,6 +21183,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
             entry.disabled = err != error.Cancelled and err != error.Timeout;
             if (err == error.Cancelled or err == error.Timeout) return err;
             if (!capture) return err;
+            observation.cudaAudioResult(.capture_callback_declined);
             return null;
         };
         self.execution_scope = null;
@@ -21183,6 +21198,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
             entry.disabled = true;
             // The ordinary callback may already have submitted numerical work.
             if (!capture) return error.AudioPlanChanged;
+            observation.cudaAudioResult(.capture_layout_declined);
             return null;
         }
         if (capture) {
@@ -21190,6 +21206,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
                 // Recording matched the admitted plan. Only the SDK graph
                 // failed, so later requests can still use assigned execution.
                 arena.captureFailed(err);
+                observation.cudaAudioResult(.capture_instantiation_declined);
                 return null;
             };
         }

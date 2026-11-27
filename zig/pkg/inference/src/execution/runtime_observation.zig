@@ -427,13 +427,20 @@ noinline fn cudaKernelEnabled(context: usize, function: usize, stream: usize, co
     }
 }
 
-/// Published CUDA audio results by physical route on the submitting thread.
+/// CUDA audio route outcomes on the submitting thread.
 pub const CudaAudio = struct {
     warmed: u64 = 0,
     learned: u64 = 0,
     learning_output_mismatch: u64 = 0,
     learning_host_transfer: u64 = 0,
     learning_unsealed: u64 = 0,
+    arena_unavailable: u64 = 0,
+    input_alias_declined: u64 = 0,
+    capture_storage_declined: u64 = 0,
+    capture_begin_declined: u64 = 0,
+    capture_callback_declined: u64 = 0,
+    capture_layout_declined: u64 = 0,
+    capture_instantiation_declined: u64 = 0,
     eager_assigned: u64 = 0,
     eager_copied: u64 = 0,
     recorded_and_launched: u64 = 0,
@@ -1310,7 +1317,8 @@ test "CUDA audio result observations preserve nested route counts and disabled s
         defer inner.deinit();
         cudaAudioResult(.replayed);
         cudaAudioResult(.eager_assigned);
-        try testing.expectEqualDeep(CudaAudio{ .replayed = 1, .eager_assigned = 1 }, inner.snapshot().cuda_audio.?);
+        cudaAudioResult(.capture_storage_declined);
+        try testing.expectEqualDeep(CudaAudio{ .replayed = 1, .eager_assigned = 1, .capture_storage_declined = 1 }, inner.snapshot().cuda_audio.?);
     }
-    try testing.expectEqualDeep(CudaAudio{ .warmed = 1, .learning_host_transfer = 1, .recorded_and_launched = 1, .replayed = 1, .eager_assigned = 1 }, outer.snapshot().cuda_audio.?);
+    try testing.expectEqualDeep(CudaAudio{ .warmed = 1, .learning_host_transfer = 1, .recorded_and_launched = 1, .replayed = 1, .eager_assigned = 1, .capture_storage_declined = 1 }, outer.snapshot().cuda_audio.?);
 }
