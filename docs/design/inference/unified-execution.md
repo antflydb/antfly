@@ -1448,6 +1448,12 @@ recurrent storage, graph reuse under adaptive head admission, rejection
 of scratch overlapping token metadata or using misaligned backing, and
 workspace receipts after publication.
 
+At `4fbacd1102`, all 23 scoped Spark CUDA checks passed without
+skips. The 128-page recurrent fixture matched the two independent
+64-page packets for both supported head geometries, including mixed
+prefill and decode. This establishes correctness for scratch reuse
+across the ordered packets. Serving latency was not measured.
+
 At `ee3629cec0`, five scoped Metal audio tests passed without skips.
 The replay fixture rejected missing and excess input bindings before
 dispatch. The same run covered fresh inputs, held results, and
