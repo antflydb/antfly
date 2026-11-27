@@ -725,6 +725,11 @@ def run(args, model, label, mode, concurrency, output):
                         sample["model_graph_retirements"] = retirements
                     if denials := graph_funding_denials(section):
                         sample["model_graph_funding_denials"] = denials
+                    if (
+                        args.require_model_graph_replay_rows is not None
+                        and args.require_model_graph_replay_rows not in replay_rows
+                    ):
+                        result["status"] = "missing_required_model_graph_replay_rows"
                     if args.require_lighton_model_graph and not replay_rows:
                         result["status"] = "missing_timed_model_graph_replay"
                     if (
@@ -2104,6 +2109,10 @@ def main():
     parser.add_argument("--require-lighton-bf16-prefill-ffn", action="store_true")
     parser.add_argument("--require-lighton-bf16-recurrent-prefill", action="store_true")
     parser.add_argument("--require-lighton-model-graph", action="store_true")
+    parser.add_argument(
+        "--require-model-graph-replay-rows", type=int, choices=range(2, 129),
+        metavar="ROWS", help="Require a timed graph replay at this exact cohort width",
+    )
     parser.add_argument("--require-wide-packed-prefill", action="store_true")
     parser.add_argument("--require-lighton-norm-weight-cache", action="store_true")
     parser.add_argument("--require-florence-bart-ffn", action="store_true")
@@ -2434,6 +2443,11 @@ def main():
         parser.error(f"prefill batch limit must be 1..{prefill_limit}")
     if args.require_compact_kv and not args.compact_kv:
         parser.error("--require-compact-kv requires --compact-kv")
+    if args.require_model_graph_replay_rows is not None:
+        if not args.policy_rounds or "batch" not in args.modes:
+            parser.error("--require-model-graph-replay-rows requires timed batch --policy-rounds")
+        if args.require_model_graph_replay_rows > args.batch_rows:
+            parser.error("--require-model-graph-replay-rows must fit --batch-rows")
     if args.require_physical128 and not args.policy_rounds:
         parser.error("--require-physical128 requires timed --policy-rounds")
     if args.require_physical128 and not args.physical128:
