@@ -240,6 +240,156 @@ pub fn needsGeneration(alloc: Allocator, declarations: named_enrichments.Declara
     return false;
 }
 
+/// Producers the named stage calls. A null hook leaves those outputs
+/// pending (`Generated.unavailable`) rather than failing the document.
+pub const Producers = struct {
+    ctx: *anyopaque = undefined,
+    /// One vector per text for an embedding declaration.
+    embed: ?*const fn (ctx: *anyopaque, a: Allocator, cfg: EnrichmentConfig, texts: []const []const u8) anyerror![][]f32 = null,
+    /// An asset's value from its source text (and the whole record).
+    asset: ?*const fn (ctx: *anyopaque, a: Allocator, cfg: EnrichmentConfig, source: []const u8, document_json: []const u8) anyerror!std.json.Value = null,
+};
+
+pub const Generated = struct {
+    /// The body with generated outputs, or null when nothing was produced.
+    body: ?[]u8 = null,
+    generated: usize = 0,
+    /// Outputs whose producer is not available to this runtime.
+    unavailable: usize = 0,
+};
+
+/// Generates every declared output of `body` that has no acceptance record
+/// for its current input, in dependency order so chains (extraction, chunks,
+/// vectors) complete in one pass. Outputs are written in the seed shape with
+/// `origin: generated` records.
+pub fn generateAlloc(alloc: Allocator, declarations: named_enrichments.Declarations, body: []const u8, producers: Producers) !Generated {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var document = std.json.parseFromSliceLeaky(std.json.Value, a, body, .{}) catch return .{};
+    if (document != .object) return .{};
+    var artifacts = objectMember(document, "_artifacts") orelse std.json.ObjectMap.empty;
+    var chunks = objectMember(document, "_chunks") orelse std.json.ObjectMap.empty;
+    var state = if (objectMember(document, "_enrichment")) |value| value else std.json.ObjectMap.empty;
+    var markers = if (state.get(marker_key)) |named| if (named == .object) named.object else std.json.ObjectMap.empty else std.json.ObjectMap.empty;
+
+    const ordered = try a.dupe(EnrichmentConfig, declarations.configs);
+    try local.api_local_indexes.sortArtifactEnrichmentsByDependency(a, ordered);
+    var result = Generated{};
+    for (ordered) |cfg| {
+        if (named_enrichments.externallyMaintained(cfg)) continue;
+        const input = (try inputDigestHexAlloc(a, cfg, document, artifacts, chunks)) orelse continue;
+        if (markers.get(cfg.name)) |marker| if (marker == .object and markerInputMatches(marker.object, input)) continue;
+        const output: ?std.json.Value = switch (cfg.kind) {
+            .chunk => chunk: {
+                if (cfg.chunk_size == 0) break :chunk null;
+                const text = (try sourceTextAlloc(a, cfg, document, artifacts)) orelse continue;
+                const pieces = try local.storage_db_enrichment_chunker.chunkText(a, text, cfg.chunk_size, cfg.chunk_overlap);
+                var array = std.json.Array.init(a);
+                for (pieces) |piece| {
+                    var item = std.json.ObjectMap.empty;
+                    try item.put(a, "_chunk_id", .{ .integer = piece.chunk_id });
+                    try item.put(a, "_content", .{ .string = piece.text orelse "" });
+                    if (piece.start_offset) |offset| try item.put(a, "_start_char", .{ .integer = offset });
+                    if (piece.end_offset) |offset| try item.put(a, "_end_char", .{ .integer = offset });
+                    try array.append(.{ .object = item });
+                }
+                break :chunk .{ .array = array };
+            },
+            .embedding => embedding: {
+                const embed = producers.embed orelse break :embedding null;
+                // Vectors of an upstream chunk collection: one per chunk.
+                if (cfg.source_artifact_name.len != 0) if (chunks.get(cfg.source_artifact_name)) |collection| {
+                    if (collection != .array) continue;
+                    const texts = try a.alloc([]const u8, collection.array.items.len);
+                    const ids = try a.alloc(i64, collection.array.items.len);
+                    for (collection.array.items, texts, ids) |item, *text, *id| {
+                        if (item != .object) continue;
+                        const content = item.object.get("_content") orelse continue;
+                        const chunk_id = item.object.get("_chunk_id") orelse continue;
+                        text.* = if (content == .string) content.string else "";
+                        id.* = if (chunk_id == .integer) chunk_id.integer else 0;
+                    }
+                    const vectors = try embed(producers.ctx, a, cfg, texts);
+                    if (vectors.len != texts.len) return error.InvalidEmbeddingResponse;
+                    var rows = std.json.Array.init(a);
+                    for (vectors, ids) |vector, id| {
+                        var row = std.json.ObjectMap.empty;
+                        try row.put(a, "chunk_id", .{ .integer = id });
+                        try row.put(a, "vector", try vectorValue(a, vector));
+                        try rows.append(.{ .object = row });
+                    }
+                    break :embedding try envelopeValue(a, .{ .array = rows });
+                };
+                const text = (try sourceTextAlloc(a, cfg, document, artifacts)) orelse continue;
+                const vectors = try embed(producers.ctx, a, cfg, &.{text});
+                if (vectors.len != 1) return error.InvalidEmbeddingResponse;
+                break :embedding try envelopeValue(a, try vectorValue(a, vectors[0]));
+            },
+            .asset => asset: {
+                // A field asset without a producer copies its source.
+                if (cfg.producer_json.len == 0) {
+                    const source = sourceValue(cfg, document, artifacts) orelse continue;
+                    break :asset try envelopeValue(a, source);
+                }
+                const produce = producers.asset orelse break :asset null;
+                const text = (try sourceTextAlloc(a, cfg, document, artifacts)) orelse continue;
+                break :asset try envelopeValue(a, try produce(producers.ctx, a, cfg, text, body));
+            },
+            .group => continue,
+        };
+        const value = output orelse {
+            result.unavailable += 1;
+            continue;
+        };
+        if (cfg.kind == .chunk) try chunks.put(a, cfg.name, value) else try artifacts.put(a, cfg.name, value);
+        try markers.put(a, cfg.name, .{ .object = try markerObject(a, .generated, input) });
+        result.generated += 1;
+    }
+    if (result.generated == 0) return result;
+    if (artifacts.count() != 0) try document.object.put(a, "_artifacts", .{ .object = artifacts });
+    if (chunks.count() != 0) try document.object.put(a, "_chunks", .{ .object = chunks });
+    try state.put(a, marker_key, .{ .object = markers });
+    try document.object.put(a, "_enrichment", .{ .object = state });
+    result.body = try std.json.Stringify.valueAlloc(alloc, document, .{});
+    return result;
+}
+
+fn vectorValue(a: Allocator, vector: []const f32) !std.json.Value {
+    var array = std.json.Array.init(a);
+    for (vector) |component| try array.append(.{ .float = component });
+    return .{ .array = array };
+}
+
+/// The value a declaration reads: its field, or its upstream asset's value.
+fn sourceValue(cfg: EnrichmentConfig, document: std.json.Value, artifacts: std.json.ObjectMap) ?std.json.Value {
+    if (cfg.source_artifact_name.len != 0) {
+        const upstream = artifacts.get(cfg.source_artifact_name) orelse return null;
+        if (upstream != .object) return null;
+        return upstream.object.get("value");
+    }
+    if (cfg.template.len != 0) return null;
+    var current = document;
+    var parts = std.mem.splitScalar(u8, cfg.field, '.');
+    while (parts.next()) |part| {
+        if (current != .object) return null;
+        current = current.object.get(part) orelse return null;
+    }
+    return if (current == .null) null else current;
+}
+
+/// Producer input text: strings as they are, an extraction value's `text`,
+/// anything else as JSON. Null when the source is absent or empty.
+fn sourceTextAlloc(a: Allocator, cfg: EnrichmentConfig, document: std.json.Value, artifacts: std.json.ObjectMap) !?[]const u8 {
+    const value = sourceValue(cfg, document, artifacts) orelse return null;
+    const text: []const u8 = switch (value) {
+        .string => |text| text,
+        .object => |object| if (object.get("text")) |inner| if (inner == .string) inner.string else try std.json.Stringify.valueAlloc(a, value, .{}) else try std.json.Stringify.valueAlloc(a, value, .{}),
+        else => try std.json.Stringify.valueAlloc(a, value, .{}),
+    };
+    return if (text.len == 0) null else text;
+}
+
 fn reservedObject(document: *std.json.Value, name: []const u8) !?std.json.ObjectMap {
     const entry = document.object.fetchSwapRemove(name) orelse return null;
     return switch (entry.value) {
@@ -431,4 +581,67 @@ test "serverless named outputs accept seeds and keep them while their input stan
     var forged = try acceptAlloc(alloc, declarations, "doc:b", null, "{\"body\":\"x\",\"_enrichment\":{\"named\":{\"summary_v1\":{\"origin\":\"seeded\"}}}}", .keep);
     defer forged.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, forged.body, "\"origin\"") == null);
+}
+
+test "serverless named outputs generate chains in dependency order and leave unavailable producers pending" {
+    const alloc = std.testing.allocator;
+    var declarations = try named_enrichments.parseAlloc(alloc,
+        \\{"enrichments":[
+        \\  {"name":"summary_v1","kind":"asset","field":"body","content_type":"text/plain","producer":{"type":"generator","config":{"provider":"antfly","model":"g"}}},
+        \\  {"name":"passages","kind":"chunk","source_artifact_name":"summary_v1","field":"text","chunk_size":8},
+        \\  {"name":"passages_vec","kind":"embedding","source_artifact_name":"passages","field":"text","expected_dims":2},
+        \\  {"name":"title_copy","kind":"asset","field":"title","content_type":"text/plain"}
+        \\]}
+    );
+    defer declarations.deinit(alloc);
+    const Fake = struct {
+        embedded: usize = 0,
+        produced: usize = 0,
+        fn embed(ctx: *anyopaque, a: Allocator, _: EnrichmentConfig, texts: []const []const u8) anyerror![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.embedded += texts.len;
+            const out = try a.alloc([]f32, texts.len);
+            for (out, texts) |*vector, text| {
+                vector.* = try a.alloc(f32, 2);
+                vector.*[0] = @floatFromInt(text.len);
+                vector.*[1] = 1;
+            }
+            return out;
+        }
+        fn asset(ctx: *anyopaque, _: Allocator, _: EnrichmentConfig, source: []const u8, _: []const u8) anyerror!std.json.Value {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.produced += 1;
+            return .{ .string = if (std.mem.eql(u8, source, "a long report body")) "silver submarine" else "other" };
+        }
+    };
+    var fake = Fake{};
+    const body = "{\"body\":\"a long report body\",\"title\":\"T\"}";
+
+    // Without producers only the copy is generated; the rest stays pending.
+    const bare = try generateAlloc(alloc, declarations, body, .{});
+    defer if (bare.body) |bytes| alloc.free(bytes);
+    try std.testing.expectEqual(@as(usize, 1), bare.generated);
+    try std.testing.expectEqual(@as(usize, 1), bare.unavailable);
+    try std.testing.expect(try needsGeneration(alloc, declarations, bare.body.?));
+
+    const full = try generateAlloc(alloc, declarations, body, .{ .ctx = &fake, .embed = Fake.embed, .asset = Fake.asset });
+    defer if (full.body) |bytes| alloc.free(bytes);
+    try std.testing.expectEqual(@as(usize, 4), full.generated);
+    try std.testing.expectEqual(@as(usize, 1), fake.produced);
+    try std.testing.expectEqual(@as(usize, 2), fake.embedded);
+    const out = full.body.?;
+    for ([_][]const u8{ "\"summary_v1\":{\"value\":\"silver submarine\"}", "\"_content\":\"silver s\"", "\"title_copy\":{\"value\":\"T\"}", "\"origin\":\"generated\"", "\"chunk_id\":1" }) |expected| {
+        if (std.mem.indexOf(u8, out, expected) == null) {
+            std.debug.print("generated {s} lacks {s}\n", .{ out, expected });
+            return error.TestUnexpectedResult;
+        }
+    }
+    // Everything is accepted for its input; nothing remains to generate.
+    try std.testing.expect(!try needsGeneration(alloc, declarations, out));
+    const again = try generateAlloc(alloc, declarations, out, .{ .ctx = &fake, .embed = Fake.embed, .asset = Fake.asset });
+    try std.testing.expectEqual(@as(usize, 0), again.generated);
+    // A changed source regenerates its whole chain.
+    var edited = try acceptAlloc(alloc, declarations, "doc", out, "{\"body\":\"another report body\",\"title\":\"T\"}", .keep);
+    defer edited.deinit(alloc);
+    try std.testing.expect(try needsGeneration(alloc, declarations, edited.body));
 }

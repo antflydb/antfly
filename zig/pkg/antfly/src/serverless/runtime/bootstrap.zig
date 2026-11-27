@@ -36,6 +36,7 @@ const enrichment_mod = @import("../enrichment/mod.zig");
 const search_sources = @import("../search_sources.zig");
 const runtime_manager = @import("manager.zig");
 const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
+const asset_producer_runtime = @import("antfly_local_sources").asset_producer_runtime;
 const aws = @import("antfly_credentials").aws;
 const foreign_mod = @import("../../foreign/mod.zig");
 const scraping = @import("antfly_scraping");
@@ -440,6 +441,9 @@ pub const OwnedStack = struct {
     embedding_cache: query_embedding_cache.QueryEmbeddingCache,
     embedding_cache_budget: cache_budget.CacheBudget,
     managed_query_embedder: ?managed_embedder.ManagedEmbedder = null,
+    /// Asset producers (generator, extractor, document_extraction, ...) for
+    /// named enrichments; borrows the embedding provider runtime.
+    asset_runtime: ?*asset_producer_runtime.Runtime = null,
     dense_query_index_name: ?[]u8 = null,
     sparse_query_index_name: []u8 = undefined,
     owned_foreign_registry: ?*foreign_mod.Registry = null,
@@ -629,6 +633,13 @@ pub const OwnedStack = struct {
         self.status = try runtimeStatusAlloc(alloc, cfg);
         var status_owned = true;
         errdefer if (status_owned) self.status.deinit(alloc);
+        self.asset_runtime = try asset_producer_runtime.Runtime.createOwned(alloc, io, .{
+            .provider_runtime = &self.embedding_provider_runtime,
+            .inference_api_url = cfg.inference_api_url,
+            .inference_api_key = cfg.inference_api_key,
+            .secret_store = cfg.secret_store,
+        });
+        errdefer self.destroyAssetRuntime();
         self.runtime = runtime_manager.ManagedRuntime.initWithIo(alloc, io, .{
             .tick_interval_ms = cfg.tick_interval_ms,
             .sql_execution_gc = cfg.sql_execution_gc,
@@ -643,6 +654,7 @@ pub const OwnedStack = struct {
                 .secret_store = cfg.secret_store,
                 .remote_content = cfg.remote_content,
             },
+            .asset_producer = self.asset_runtime.?.producer(),
         }, &self.catalog, build_mod.Pruner.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal));
         var runtime_owned = true;
         errdefer if (runtime_owned) self.runtime.deinit();
@@ -780,10 +792,18 @@ pub const OwnedStack = struct {
         return query_mod.live_session.Session.open(alloc, &self.query, &self.wal, namespace, configured);
     }
 
+    fn destroyAssetRuntime(self: *OwnedStack) void {
+        const runtime = self.asset_runtime orelse return;
+        runtime.deinit();
+        self.alloc.destroy(runtime);
+        self.asset_runtime = null;
+    }
+
     pub fn deinit(self: *OwnedStack) void {
         self.resident_points.deinit(self.alloc);
         self.read_states.deinit();
         self.runtime.deinit();
+        self.destroyAssetRuntime();
         if (self.wal_collector) |collector| self.alloc.destroy(collector);
         if (self.managed_query_embedder) |*query_embedder| query_embedder.deinit();
         self.embedding_cache.deinit(&self.embedding_cache_budget);

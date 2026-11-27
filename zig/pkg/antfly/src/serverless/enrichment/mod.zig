@@ -17,6 +17,7 @@ pub const pipeline = @import("pipeline.zig");
 pub const worker = @import("worker.zig");
 pub const operation_id = @import("operation_id.zig");
 pub const named_outputs = @import("named_outputs.zig");
+pub const named_producers = @import("named_producers.zig");
 
 pub const BuiltinPipeline = pipeline.BuiltinPipeline;
 pub const StageSpec = pipeline.StageSpec;
@@ -32,6 +33,7 @@ test "serverless enrichment module compiles" {
     _ = pipeline;
     _ = worker;
     _ = named_outputs;
+    _ = named_producers;
     _ = BuiltinPipeline;
     _ = StageSpec;
     _ = builtinPipelineForPolicy;

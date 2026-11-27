@@ -942,6 +942,7 @@ fn stageLeaf(stage: catalog_types.EnrichmentStage) []const u8 {
         .chunk_preview => "CHUNK_PREVIEW",
         .chunk_embeddings => "CHUNK_EMBEDDINGS",
         .rerank_terms => "RERANK_TERMS",
+        .named => "NAMED",
     };
 }
 

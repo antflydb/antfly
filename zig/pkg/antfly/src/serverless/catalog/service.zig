@@ -763,6 +763,7 @@ pub const CatalogService = struct {
             .rerank_terms => {
                 out.rerank_terms = plan.derived_output_actions.rerank_terms == .recompute;
             },
+            .named => {},
         }
         return out;
     }
@@ -2429,6 +2430,8 @@ const EnrichmentCompletion = struct {
     chunk_embeddings_pending_documents: u64 = 0,
     rerank_terms_complete: bool = true,
     rerank_terms_pending_documents: u64 = 0,
+    named_complete: bool = true,
+    named_pending_documents: u64 = 0,
 };
 
 fn chooseActiveEnrichmentStage(
@@ -2438,6 +2441,8 @@ fn chooseActiveEnrichmentStage(
     for (pipeline.slice()) |spec| {
         if (!isStageComplete(completion, spec.stage)) return spec.stage;
     }
+    // Named enrichments are declared per table, not by namespace policy.
+    if (!completion.named_complete) return .named;
     return null;
 }
 
@@ -2458,6 +2463,7 @@ fn pendingDocumentsForStage(completion: EnrichmentCompletion, active_stage: ?cat
         .chunk_preview => completion.chunk_preview_pending_documents,
         .chunk_embeddings => completion.chunk_embeddings_pending_documents,
         .rerank_terms => completion.rerank_terms_pending_documents,
+        .named => completion.named_pending_documents,
     };
 }
 
@@ -2467,6 +2473,7 @@ fn isStageComplete(completion: EnrichmentCompletion, stage: catalog_types.Enrich
         .chunk_preview => completion.chunk_preview_complete,
         .chunk_embeddings => completion.chunk_embeddings_complete,
         .rerank_terms => completion.rerank_terms_complete,
+        .named => completion.named_complete,
     };
 }
 
@@ -2538,14 +2545,19 @@ fn enrichmentCompletionFromFactsAlloc(
     policy: catalog_types.NamespacePolicy,
     indexes_json: []const u8,
 ) !EnrichmentCompletion {
-    if (!policy.enrichment_enabled and !policy.chunk_preview_enabled and
-        !policy.chunk_embeddings_enabled and !policy.rerank_terms_enabled) return .{};
-    var pending: [4]u64 = root.counts[3..7].*;
+    const builtin_enabled = policy.enrichment_enabled or policy.chunk_preview_enabled or
+        policy.chunk_embeddings_enabled or policy.rerank_terms_enabled;
+    // Tables without named enrichments carry no named facts; skip the parse.
+    const named_declared = std.mem.indexOf(u8, indexes_json, "\"enrichments\"") != null;
+    if (!builtin_enabled and !named_declared) return .{};
+    var pending: [4]u64 = if (builtin_enabled) root.counts[3..7].* else @splat(0);
+    var named_pending: u64 = if (root.named_format) root.named_pending_count else 0;
     if (try document_facts_builder.needsRebuild(alloc, root, policy, indexes_json)) {
         // Only a real change to facts semantics needs bodies. Stream that
         // exceptional read with bounded memory and the same admission budget
         // as publication, rather than rebuilding a second document array.
         pending = @splat(0);
+        named_pending = 0;
         var context = try document_facts_builder.Context.init(alloc, policy, indexes_json);
         defer context.deinit();
         var cursor = try graph_page_tree.Cursor.init(alloc, pages.store(), root.page, "", null);
@@ -2562,9 +2574,12 @@ fn enrichmentCompletionFromFactsAlloc(
                 .last_lsn = fact.last_lsn,
                 .last_timestamp_ns = fact.last_timestamp_ns,
             });
-            for (&pending, 0..) |*value, bit| {
-                if (flags.pending & (@as(u4, 1) << @intCast(bit)) != 0) value.* += 1;
+            if (builtin_enabled) {
+                for (&pending, 0..) |*value, bit| {
+                    if (flags.pending & (@as(u4, 1) << @intCast(bit)) != 0) value.* += 1;
+                }
             }
+            if (flags.named_pending) named_pending += 1;
             count += 1;
         }
         if (count != root.document_count) return error.InvalidDocumentFactsRoot;
@@ -2578,7 +2593,50 @@ fn enrichmentCompletionFromFactsAlloc(
         .chunk_embeddings_pending_documents = pending[2],
         .rerank_terms_complete = pending[3] == 0,
         .rerank_terms_pending_documents = pending[3],
+        .named_complete = named_pending == 0,
+        .named_pending_documents = named_pending,
     };
+}
+
+test "serverless catalog schedules named enrichments from facts after builtin stages" {
+    const alloc = std.testing.allocator;
+    const pipeline = enrichment_pipeline.builtinPipelineForPolicy(.{ .enrichment_enabled = true });
+    try std.testing.expectEqual(catalog_types.EnrichmentStage.lexical_sparse, chooseActiveEnrichmentStage(pipeline, .{ .lexical_sparse_complete = false, .named_complete = false }).?);
+    try std.testing.expectEqual(catalog_types.EnrichmentStage.named, chooseActiveEnrichmentStage(pipeline, .{ .named_complete = false }).?);
+    try std.testing.expect(chooseActiveEnrichmentStage(pipeline, .{}) == null);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/named-completion", .{tmp.sub_path});
+    defer alloc.free(path);
+    var fs = try artifacts_mod.FsStore.init(alloc, path);
+    var artifacts = fs.artifactStore();
+    defer artifacts.deinit();
+    var reads: u64 = 1024 * 1024;
+    var writes: u64 = 1024 * 1024;
+    var pages = graph_page_store.PageStore{
+        .domain = graph_page_store.PageStore.namespaceDomain("docs"),
+        .attempt = @splat(1),
+        .artifacts = &artifacts,
+        .remaining_read_bytes = &reads,
+        .remaining_write_bytes = &writes,
+    };
+    const indexes = "{\"enrichments\":[{\"name\":\"title_copy\",\"kind\":\"asset\",\"field\":\"title\",\"content_type\":\"text/plain\"}]}";
+    const docs = [_]query_mod.QueryMaterializedDocument{
+        .{ .doc_id = @constCast("a"), .body = @constCast("{\"title\":\"alpha\"}"), .last_lsn = 1, .last_timestamp_ns = 1 },
+        .{ .doc_id = @constCast("b"), .body = @constCast("{\"other\":1}"), .last_lsn = 2, .last_timestamp_ns = 2 },
+    };
+    const published = try document_facts_builder.publishAlloc(alloc, &pages, null, &docs, null, .{}, indexes, 2);
+    defer alloc.free(published.artifact_id);
+    defer alloc.free(published.checksum);
+    const root = try document_facts.loadRoot(alloc, &pages, published);
+    try std.testing.expect(root.named_format);
+    const completion = try enrichmentCompletionFromFactsAlloc(alloc, &pages, root, .{}, indexes);
+    // Only the document with an input is pending; no builtin stage is enabled.
+    try std.testing.expect(!completion.named_complete);
+    try std.testing.expectEqual(@as(u64, 1), completion.named_pending_documents);
+    try std.testing.expect(completion.lexical_sparse_complete);
+    try std.testing.expectEqual(catalog_types.EnrichmentStage.named, chooseActiveEnrichmentStage(enrichment_pipeline.builtinPipelineForPolicy(.{}), completion).?);
 }
 
 test "serverless catalog facts completion uses exact counters and authoritative policy refresh" {

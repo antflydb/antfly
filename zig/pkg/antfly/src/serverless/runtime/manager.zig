@@ -37,6 +37,9 @@ pub const RuntimeConfig = struct {
     prune_enabled: bool = true,
     enrichment_enabled: bool = true,
     embedder_options: managed_embedder.InitOptions = .{},
+    /// Host asset producer (generator, extractor, document_extraction, ...)
+    /// for named enrichments. Borrowed; null leaves those outputs pending.
+    asset_producer: ?enrichment_mod.named_producers.asset_producer.Producer = null,
 };
 
 pub const RuntimeRunStats = struct {
@@ -604,7 +607,16 @@ pub const ManagedRuntime = struct {
             if (!try @import("../build/document_facts_builder.zig").hasModelSources(self.alloc, table.indexes_json)) return true;
             break :audit catalog_mod.EnrichmentStage.chunk_embeddings;
         };
-        const stage_spec = enrichment_mod.builtinPipelineForPolicy(effective_policy).stageSpec(stage) orelse return false;
+        // Named enrichments are declared by the table, outside the policy pipeline.
+        const stage_spec = if (stage == .named) enrichment_mod.StageSpec{
+            .stage = .named,
+            .pipeline_version = enrichment_mod.worker.named_enrichment_version,
+            .model_preference = .prefer_model,
+            .publish_min_pending_records = 0,
+        } else enrichment_mod.builtinPipelineForPolicy(effective_policy).stageSpec(stage) orelse return false;
+        var named_state: ?enrichment_mod.named_producers.NamedProducers = null;
+        defer if (named_state) |*value| value.deinit();
+        defer enricher.named_producers = .{};
 
         var held_lease: ?build_mod.work_lease.HeldLease = null;
         if (self.work_lease_provider) |provider| {
@@ -670,6 +682,12 @@ pub const ManagedRuntime = struct {
                     }
                 },
                 .chunk_preview, .rerank_terms => {},
+                .named => {
+                    var declarations = catalog_mod.named_enrichments.parseAlloc(self.alloc, table.indexes_json) catch return true;
+                    defer declarations.deinit(self.alloc);
+                    named_state = try enrichment_mod.named_producers.NamedProducers.init(self.alloc, table.indexes_json, declarations, self.cfg.embedder_options, self.cfg.asset_producer);
+                    enricher.named_producers = named_state.?.producers();
+                },
             }
         } else {
             // Namespace-only records predate the table catalog. Preserve their

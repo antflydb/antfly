@@ -40,6 +40,8 @@ const operation_identity = @import("operation_id.zig");
 const media_checkpoint = @import("media_checkpoint.zig");
 const media_audit = @import("media_audit.zig");
 const build_limits = @import("../build/lake_build_limits.zig");
+const named_outputs = @import("named_outputs.zig");
+const named_enrichments = @import("../catalog/named_enrichments.zig");
 
 pub const EnrichmentRunStats = struct {
     enriched_namespaces: usize = 0,
@@ -56,6 +58,7 @@ pub const lexical_sparse_enrichment_version: u32 = 1;
 pub const chunk_preview_enrichment_version: u32 = 1;
 pub const chunk_embeddings_enrichment_version: u32 = 1;
 pub const rerank_terms_enrichment_version: u32 = 1;
+pub const named_enrichment_version: u32 = 1;
 
 pub const SparseEnricherConfig = struct {
     batch_size: usize = 32,
@@ -115,6 +118,7 @@ const DerivedBodyResult = struct {
 };
 
 const EnrichmentError = error{
+    NamedEnrichmentProducerFailed,
     MissingSparseEmbeddingName,
     MissingChunkEmbeddingName,
     RequiredSparseModelUnavailable,
@@ -221,6 +225,10 @@ pub const SparseEnricher = struct {
     execution_context: ?@import("antfly_inference_execution_context").RequestContext = null,
     prepared_dense_generation: ?embedder_mod.DenseEmbedder.TextGeneration = null,
     prepared_sparse_revision: ?[32]u8 = null,
+    /// Producers of the named stage; the host's runtime sets them per table.
+    named_producers: named_outputs.Producers = .{},
+    /// The pinned manifest's declarations while the named stage runs.
+    named_declarations: ?*const named_enrichments.Declarations = null,
 
     pub fn init(
         alloc: Allocator,
@@ -606,8 +614,18 @@ pub const SparseEnricher = struct {
         const facts = try document_facts.loadRoot(self.alloc, &pages, manifest.artifacts[facts_index]);
         if (facts.wal_end_lsn != manifest.wal_end_lsn or facts.document_count != manifest.stats.document_count) return error.DocumentFactsSourceChanged;
         if (try @import("../build/document_facts_builder.zig").needsRebuild(self.alloc, facts, manifest.stats.policy, manifest.stats.indexes_json)) return error.EnrichmentPolicyChanged;
-        const stage_index: usize = @backingInt(cfg.stage) - 1;
-        const pending_count = facts.counts[3 + stage_index];
+        const named_stage = cfg.stage == .named;
+        var declarations: named_enrichments.Declarations = .{};
+        defer declarations.deinit(self.alloc);
+        if (named_stage) {
+            // Declarations come from the pinned manifest, never a newer catalog.
+            declarations = named_enrichments.parseAlloc(self.alloc, manifest.stats.indexes_json) catch return error.EnrichmentPolicyChanged;
+            if (!facts.named_format) return error.EnrichmentPolicyChanged;
+        }
+        self.named_declarations = &declarations;
+        defer self.named_declarations = null;
+        const stage_index: usize = if (named_stage) 0 else @backingInt(cfg.stage) - 1;
+        const pending_count = if (named_stage) facts.named_pending_count else facts.counts[3 + stage_index];
         const media_scan = cfg.stage == .chunk_embeddings and self.model_chunker != null;
         const scan_count = if (media_scan) facts.document_count else pending_count;
         var scan_fingerprint = facts.policy_fingerprint;
@@ -621,19 +639,21 @@ pub const SparseEnricher = struct {
             scan_fingerprint = hash.finalResult();
         }
 
-        const pending_page = facts.pending_pages[stage_index];
+        const pending_page = if (named_stage) facts.named_pending_page else facts.pending_pages[stage_index];
         const policy = manifest.stats.policy;
         const enabled = switch (cfg.stage) {
             .lexical_sparse => policy.enrichment_enabled,
             .chunk_preview => policy.chunk_preview_enabled,
             .chunk_embeddings => policy.chunk_embeddings_enabled,
             .rerank_terms => policy.rerank_terms_enabled,
+            .named => declarations.configs.len != 0,
         };
         const policy_version = switch (cfg.stage) {
             .lexical_sparse => policy.enrichment_pipeline_version,
             .chunk_preview => policy.chunk_preview_pipeline_version,
             .chunk_embeddings => policy.chunk_embeddings_pipeline_version,
             .rerank_terms => policy.rerank_terms_pipeline_version,
+            .named => named_enrichment_version,
         };
         if (!enabled or policy_version != cfg.pipeline_version) return error.EnrichmentPolicyChanged;
         if (pending_count != if (pending_page) |page| page.records else @as(u64, 0)) return error.InvalidDocumentFactsRoot;
@@ -672,12 +692,12 @@ pub const SparseEnricher = struct {
             if (cycle_upper == null) {
                 // Capture one finite cycle under the pinned source. Rank seek
                 // is O(tree height), not a scan of the pending population.
-                var tail = if (media_scan) try document_facts.mediaCursor(self.alloc, pages.store(), facts, "", scan_count - 1) else try document_facts.pendingCursorAtRank(self.alloc, pages.store(), facts, stage_index, pending_count - 1);
+                var tail = if (media_scan) try document_facts.mediaCursor(self.alloc, pages.store(), facts, "", scan_count - 1) else if (named_stage) try document_facts.namedPendingCursorAtRank(self.alloc, pages.store(), facts, pending_count - 1) else try document_facts.pendingCursorAtRank(self.alloc, pages.store(), facts, stage_index, pending_count - 1);
                 defer tail.deinit();
                 const last = (try tail.next()) orelse return error.InvalidDocumentFactsRoot;
                 cycle_upper = try self.alloc.dupe(u8, last.order_key);
             }
-            var cursor = if (media_scan) try document_facts.mediaCursor(self.alloc, pages.store(), facts, after orelse "", null) else try document_facts.pendingCursor(self.alloc, pages.store(), facts, stage_index, after orelse "");
+            var cursor = if (media_scan) try document_facts.mediaCursor(self.alloc, pages.store(), facts, after orelse "", null) else if (named_stage) try document_facts.namedPendingCursor(self.alloc, pages.store(), facts, after orelse "") else try document_facts.pendingCursor(self.alloc, pages.store(), facts, stage_index, after orelse "");
             defer cursor.deinit();
             var scanned: usize = 0;
             scan: while (scanned < cfg.scan_batch_size) {
@@ -917,6 +937,18 @@ fn buildDerivedBodyAlloc(
     pipeline_version: u32,
     model_preference: catalog_mod.EnrichmentModelPreference,
 ) !DerivedBodyResult {
+    if (stage == .named) {
+        // Outputs whose acceptance record matches their input (seeded or
+        // generated) are kept; the rest are generated in dependency order.
+        const declarations = self.named_declarations orelse return error.EnrichmentPolicyChanged;
+        // A producer failure skips this document (it stays pending and is
+        // revisited next cycle); control errors and memory pressure do not.
+        const generated = named_outputs.generateAlloc(self.alloc, declarations.*, body, self.named_producers) catch |err| {
+            if (isExecutionControlError(err) or err == error.OutOfMemory) return err;
+            return EnrichmentError.NamedEnrichmentProducerFailed;
+        };
+        return .{ .body = generated.body, .used_model = generated.generated != 0 };
+    }
     var normalized: ?[]u8 = null;
     defer if (normalized) |bytes| self.alloc.free(bytes);
     if (self.prepared_catalog) |expected| if (std.mem.indexOf(u8, body, "commit_catalog") != null) {
@@ -939,6 +971,7 @@ fn buildDerivedBodyAlloc(
         .chunk_preview => DerivedBodyResult{ .body = try buildDerivedChunkPreviewBodyAlloc(self.alloc, input, pipeline_version) },
         .chunk_embeddings => try buildDerivedChunkEmbeddingsBodyAlloc(self, input, pipeline_version, model_preference),
         .rerank_terms => DerivedBodyResult{ .body = try buildDerivedRerankTermsBodyAlloc(self.alloc, input, pipeline_version) },
+        .named => unreachable,
     };
     if (result.body) |produced| {
         defer self.alloc.free(produced);
@@ -998,6 +1031,7 @@ fn directStageOutput(stage: catalog_mod.EnrichmentStage) []const u8 {
         .chunk_preview => "chunk_preview",
         .chunk_embeddings => "chunk_embeddings",
         .rerank_terms => "rerank_terms",
+        .named => "named",
     };
 }
 
@@ -1022,6 +1056,7 @@ fn mergeDirectStageAlloc(a: Allocator, original: []const u8, produced: []const u
             .chunk_preview => "chunk_preview",
             .chunk_embeddings => "chunk_embeddings",
             .rerank_terms => "rerank_terms",
+            .named => "named",
         };
         var it = next.object.iterator();
         while (it.next()) |entry| if (std.mem.startsWith(u8, entry.key_ptr.*, prefix)) {
@@ -1044,6 +1079,7 @@ fn preserveOtherEnrichmentOutputsAlloc(a: Allocator, original: []const u8, produ
         .chunk_preview => "chunk_preview",
         .chunk_embeddings => "chunk_embeddings",
         .rerank_terms => "rerank_terms",
+        .named => "named",
     };
     for ([_][]const u8{ "embedding", "sparse_embedding", "graph_edges", "chunk_preview", "chunk_embeddings", "rerank_terms", "media_outputs", "transcript", "transcript_spans" }) |name| {
         const media_owned = stage == .chunk_embeddings and (std.mem.eql(u8, name, "chunk_preview") or std.mem.eql(u8, name, "media_outputs") or std.mem.eql(u8, name, "transcript") or std.mem.eql(u8, name, "transcript_spans"));
@@ -1059,6 +1095,7 @@ fn preserveOtherEnrichmentOutputsAlloc(a: Allocator, original: []const u8, produ
         .chunk_preview => "chunk_preview",
         .chunk_embeddings => "chunk_embeddings",
         .rerank_terms => "rerank_terms",
+        .named => "named",
     };
     var it = old_state.object.iterator();
     while (it.next()) |entry| {
@@ -2109,7 +2146,8 @@ fn isRecoverableEnrichmentError(err: anyerror) bool {
         err == EnrichmentError.RequiredSparseModelUnavailable or
         err == EnrichmentError.RequiredChunkEmbeddingModelUnavailable or
         err == EnrichmentError.SparseEmbeddingModelFailed or
-        err == EnrichmentError.ChunkEmbeddingModelFailed;
+        err == EnrichmentError.ChunkEmbeddingModelFailed or
+        err == EnrichmentError.NamedEnrichmentProducerFailed;
 }
 
 const FailingDenseEmbedder = struct {
@@ -3622,6 +3660,91 @@ test "serverless sparse enricher advances progress in batches" {
     });
     try std.testing.expectEqual(@as(usize, 0), second.enriched_documents);
     try std.testing.expectEqual(@as(usize, 1), second.idle_namespaces);
+}
+
+test "serverless enricher generates named enrichments and clears their pending facts" {
+    const alloc = std.testing.allocator;
+    var artifact_root_buf: [256]u8 = undefined;
+    var manifest_root_buf: [256]u8 = undefined;
+    var wal_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "artifacts-named");
+    const manifest_root = tmpPath(&manifest_root_buf, "manifests-named");
+    const wal_root = tmpPath(&wal_root_buf, "wal-named");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(manifest_root);
+    defer cleanupTmp(wal_root);
+    var fs_artifacts = try artifacts_mod.FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+    var fs_manifests = try manifest_mod.FsStore.init(alloc, std.mem.span(manifest_root));
+    var manifest_store = fs_manifests.manifestStore();
+    defer manifest_store.deinit();
+    var fs_progress = try catalog_mod.FsProgressStore.init(alloc, std.mem.span(manifest_root));
+    var progress_store = fs_progress.progressStore();
+    defer progress_store.deinit();
+    var fs_wal = try wal_mod.FsStore.init(alloc, std.mem.span(wal_root));
+    var wal_store = fs_wal.walStore();
+    defer wal_store.deinit();
+    var builder = @import("../build/builder.zig").Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+    var api = @import("../api/service.zig").Service.init(alloc, &wal_store, &builder);
+
+    const indexes =
+        \\{"enrichments":[
+        \\  {"name":"passages","kind":"chunk","field":"text","chunk_size":16},
+        \\  {"name":"title_copy","kind":"asset","field":"title","content_type":"text/plain"},
+        \\  {"name":"summary","kind":"asset","field":"text","content_type":"text/plain","producer":{"type":"generator","config":{"provider":"antfly","model":"g"}}},
+        \\  {"name":"notes","kind":"asset","content_type":"text/plain"}
+        \\]}
+    ;
+    const plan: @import("../build/publication_plan.zig").TablePublicationPlan = .{
+        .targets = .{ .published_search_sources = @import("../search_sources.zig").defaultPublishedSearchSources() },
+        .table_definition = .{ .indexes_json = @constCast(indexes) },
+    };
+    const batch = [_]api_types.DocumentMutation{
+        .{ .kind = .upsert, .doc_id = "doc-a", .body = "{\"title\":\"Alpha\",\"text\":\"alpha bravo charlie delta echo foxtrot\"}" },
+    };
+    var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 100, .mutations = &batch });
+    defer ingest.deinit(alloc);
+    var build = try builder.publishNamespaceWithMetricAndPlan("docs", .cosine, plan);
+    defer build.deinit(alloc);
+
+    const Generator = struct {
+        calls: usize = 0,
+        fn asset(ctx: *anyopaque, _: Allocator, _: named_enrichments.EnrichmentConfig, _: []const u8, _: []const u8) anyerror!std.json.Value {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            return .{ .string = "a generated summary" };
+        }
+    };
+    var generator = Generator{};
+    var enricher = SparseEnricher.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+    defer enricher.deinit();
+    enricher.named_producers = .{ .ctx = &generator, .asset = Generator.asset };
+    const stats = try enricher.runNamespaceWithConfig("docs", .{ .batch_size = 4, .pipeline_version = named_enrichment_version, .stage = .named });
+    try std.testing.expectEqual(@as(usize, 1), stats.enriched_documents);
+    try std.testing.expectEqual(@as(usize, 1), generator.calls);
+
+    const tail = try wal_store.readFromAlloc("docs", 2);
+    defer wal_mod.freeRecords(alloc, tail);
+    try std.testing.expectEqual(@as(usize, 1), tail.len);
+    var mutation = try api_codec.decodeMutationAlloc(alloc, tail[0].payload);
+    defer mutation.deinit(alloc);
+    const enriched = (try document_facts.parseEnrichedBody(mutation.body.?)).body;
+    for ([_][]const u8{ "\"summary\":{\"value\":\"a generated summary\"}", "\"title_copy\":{\"value\":\"Alpha\"}", "\"passages\":[{\"_chunk_id\":0", "\"origin\":\"generated\"" }) |expected| {
+        if (std.mem.indexOf(u8, enriched, expected) == null) {
+            std.debug.print("named body {s} lacks {s}\n", .{ enriched, expected });
+            return error.TestUnexpectedResult;
+        }
+    }
+    // The externally maintained asset is never generated.
+    try std.testing.expect(std.mem.indexOf(u8, enriched, "\"notes\"") == null);
+
+    // Publishing the outputs clears the document's named pending fact.
+    var republished = try builder.publishNamespaceWithMetricAndPlan("docs", .cosine, plan);
+    defer republished.deinit(alloc);
+    const again = try enricher.runNamespaceWithConfig("docs", .{ .batch_size = 4, .pipeline_version = named_enrichment_version, .stage = .named });
+    try std.testing.expectEqual(@as(usize, 0), again.enriched_documents);
+    try std.testing.expectEqual(@as(usize, 1), generator.calls);
 }
 
 fn publishEnrichmentFixture(builder: *@import("../build/builder.zig").Builder) !@import("../build/builder.zig").BuildResult {

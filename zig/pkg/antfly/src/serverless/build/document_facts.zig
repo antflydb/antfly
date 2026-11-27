@@ -544,6 +544,20 @@ pub fn namedPendingCursor(alloc: Allocator, store: tree.Store, root: Root, lower
     };
 }
 
+/// The named-pending entry at `rank`: bounds a finite worker cycle.
+pub fn namedPendingCursorAtRank(alloc: Allocator, store: tree.Store, root: Root, rank: u64) !PendingCursor {
+    if (!root.named_format) return error.InvalidEnrichmentStage;
+    if (!std.mem.eql(u8, &root.domain, &store.domain)) return error.GraphPageDomainMismatch;
+    if ((if (root.named_pending_page) |ref| ref.records else @as(u64, 0)) != root.named_pending_count) return error.InvalidDocumentFactsRoot;
+    return .{
+        .cursor = try tree.Cursor.initAtRank(alloc, store, root.named_pending_page, rank),
+        .stage_bit = 0,
+        .named = true,
+        .wal_end_lsn = root.wal_end_lsn,
+        .root = root,
+    };
+}
+
 pub fn pendingCursorAtRank(alloc: Allocator, store: tree.Store, root: Root, stage_index: usize, rank: u64) !PendingCursor {
     if (stage_index >= 4) return error.InvalidEnrichmentStage;
     if (!std.mem.eql(u8, &root.domain, &store.domain)) return error.GraphPageDomainMismatch;

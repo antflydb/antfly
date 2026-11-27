@@ -31,6 +31,9 @@ pub const EnrichmentStage = enum(u8) {
     chunk_preview = 2,
     chunk_embeddings = 3,
     rerank_terms = 4,
+    /// The table's named enrichments (#1791): declared outputs whose input
+    /// has no acceptance record. Scheduled after the built-in stages.
+    named = 5,
 };
 
 pub const EnrichmentStageSource = enum(u8) {

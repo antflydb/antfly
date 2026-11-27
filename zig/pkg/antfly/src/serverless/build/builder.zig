@@ -2368,6 +2368,7 @@ pub const PendingEnrichmentPrediction = struct {
                 .chunk_preview => self.chunk_preview_pending_documents,
                 .chunk_embeddings => self.chunk_embeddings_pending_documents,
                 .rerank_terms => self.rerank_terms_pending_documents,
+                .named => 0,
             };
             if (pending > 0) return spec.stage;
         }
@@ -2381,6 +2382,7 @@ pub const PendingEnrichmentPrediction = struct {
             .chunk_preview => self.chunk_preview_pending_documents,
             .chunk_embeddings => self.chunk_embeddings_pending_documents,
             .rerank_terms => self.rerank_terms_pending_documents,
+            .named => 0,
         };
     }
 };
