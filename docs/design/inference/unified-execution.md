@@ -2034,3 +2034,23 @@ between video and the later Gemma requests, so this order control
 does not establish persistent Gemma weight-cache reuse. The control
 receipt SHA-256 is
 `70e569973895877fbd754684cb213afde969f25f9011c688bbb22c6fa2ddf929`.
+
+The compiled Metal trace subsequently identified the capacity denial
+at acquisition of the per-layer embedding weight for all three
+failing modalities. The request reached neither table lookup nor
+projection. This identifies the operation returning the error;
+it does not measure the charge or establish that it is redundant.
+
+Spark GB10 CUDA qualification on `97ddc913be` passed all 29 focused
+tests, including a short final projection packet writing into its
+assigned span. In the same-binary LightOnOCR-3-4B comparison, both
+arms completed 256 pages with exact reference parity. Full-width
+and packet arms measured 7.4628 and 7.4588 pages/s respectively;
+both replayed at most 60 rows. At 98 rows, the packet path reduced
+the requested backend storage from 103,630,848 to 38,074,368 bytes,
+but the same 24 GiB scratch domain still denied the reservation.
+Park also declined independently. The packet arm failed the required
+wide-replay gate and remains opt-in. Full-width and packet receipt
+SHA-256 hashes are
+`21b38922dda57caf49cb5876049a1e06c51fb76e5e0155c3be9cc00614d18f09`
+and `8c3ae649f0b1f97017c87b7552384fe975214a35e885269b72d5d3e9c75b159b`.
