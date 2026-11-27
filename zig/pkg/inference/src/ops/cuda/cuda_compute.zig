@@ -16297,20 +16297,21 @@ fn glideGatedFfnNoBias(self: *CudaCompute, request: *const ops.GatedFfnNoBiasReq
     if (configured_tile == 0 or configured_tile > 4096) return error.InvalidShape;
     const tile = @min(rows, configured_tile);
     const layout = try CudaCompute.DenseFfnProgram.Layout.init(tile, hidden, intermediate, 0);
-    var scratch = try allocDeviceBuffer(self, layout.scratch_bytes);
-    defer releaseDeviceBuffer(self, &scratch);
-    const staged = try scratch.borrowRange(0, tile * hidden * @sizeOf(f16));
-    const activated = try scratch.borrowRange(0, tile * intermediate * @sizeOf(f16));
-    const gate_values = try scratch.borrowRange(layout.gate_offset, tile * intermediate * @sizeOf(f32));
-    const up_values = try scratch.borrowRange(layout.up_offset, gate_values.len);
-    const output = (try allocUninitF32ShapeOp(self, &.{ @intCast(rows), @intCast(hidden) })).?;
-    errdefer freeTensor(self, output);
+    const capture = if (self.execution_scope != null) try SourceLinearTemporary.preflightCapture(self) else false;
+    var output = try OwnedF32Output.alloc2(self, rows, hidden, input_count);
+    defer output.deinit();
+    var temporary = try SourceLinearTemporary.acquireCachedOrDeclared(self, layout.scratch_bytes, capture);
+    defer temporary.deinit(self);
+    const staged = try temporary.bank.borrowRange(0, tile * hidden * @sizeOf(f16));
+    const activated = try temporary.bank.borrowRange(0, tile * intermediate * @sizeOf(f16));
+    const gate_values = try temporary.bank.borrowRange(layout.gate_offset, tile * intermediate * @sizeOf(f32));
+    const up_values = try temporary.bank.borrowRange(layout.up_offset, gate_values.len);
     const workspace = cublasLtWorkspace(self);
     var first: usize = 0;
     while (first < rows) : (first += tile) {
         const count = @min(tile, rows - first);
         const source = debertaWorkspaceRegion(input.buffer, first * hidden * 4, count * hidden * 4);
-        const target = debertaWorkspaceRegion(tensorFromCt(output).buffer, first * hidden * 4, count * hidden * 4);
+        const target = debertaWorkspaceRegion(output.buffer, first * hidden * 4, count * hidden * 4);
         try self.kernels.launchF32ToF16(&self.ctx, staged, source, count * hidden);
         try self.cublaslt.?.matmulF16WeightF32Out(&self.ctx, gate_values, staged, gate.buffer, workspace, count, hidden, intermediate);
         try self.cublaslt.?.matmulF16WeightF32Out(&self.ctx, up_values, staged, up.buffer, workspace, count, hidden, intermediate);
@@ -16320,7 +16321,7 @@ fn glideGatedFfnNoBias(self: *CudaCompute, request: *const ops.GatedFfnNoBiasReq
         self.stats.f16_cublaslt_linear_calls += 3;
         self.stats.launch_elementwise += 1;
     }
-    return output;
+    return output.intoTensor();
 }
 
 fn lightOnGatedFfnNoBias(ctx: *anyopaque, request: *const ops.GatedFfnNoBiasRequest) anyerror!?CT {
@@ -22469,6 +22470,12 @@ const SourceLinearTemporary = struct {
         return acquireEager(self, bytes, steady_bytes);
     }
 
+    fn acquireCachedOrDeclared(self: *CudaCompute, bytes: usize, capture: bool) !@This() {
+        if (self.execution_scope == null and !self.source_linear_scratch.active and !capture)
+            return .{ .bank = try allocDeviceBuffer(self, bytes), .kind = .cached };
+        return acquireDeclared(self, bytes, bytes, capture);
+    }
+
     fn acquireEager(self: *CudaCompute, bytes: usize, steady_bytes: usize) !@This() {
         if (self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return error.CudaGraphCaptureUnsafeTempAlloc;
         if (self.source_linear_scratch.active) {
@@ -22648,10 +22655,7 @@ fn SourceF32Operands(comptime count: usize) type {
             if (self.bytes == 0) return;
             // Outside a planned or retained audio scope, keep the ordinary
             // temporary cache hot while using the same operand offsets.
-            self.temporary = if (compute.execution_scope == null and !compute.source_linear_scratch.active and !self.capture)
-                .{ .bank = try allocDeviceBuffer(compute, self.bytes), .kind = .cached }
-            else
-                try SourceLinearTemporary.acquireDeclared(compute, self.bytes, self.bytes, self.capture);
+            self.temporary = try SourceLinearTemporary.acquireCachedOrDeclared(compute, self.bytes, self.capture);
             for (self.tensors, self.spans, &self.buffers) |tensor_opt, span, *buffer| {
                 if (span.bytes == 0) continue;
                 const tensor = tensor_opt.?;
@@ -63720,6 +63724,7 @@ test "GLiDE CUDA tiled FFN matches separate operations across tile tails" {
                 errdefer cb.free(result);
                 try std.testing.expect(plan.finish(tensorFromCt(result).buffer.ptr));
                 try std.testing.expectEqual(@as(usize, 2), plan.count);
+                try std.testing.expectEqual(@as(usize, 1), plan.declared_operation_scratch_intervals);
                 break :observed result;
             };
             defer cb.free(actual);
