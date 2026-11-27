@@ -1314,6 +1314,19 @@ fused arm medians ranged from 14.17 to 14.79 ms. Metal therefore uses
 the production collection window by default and treats an explicit
 zero window as a direct-execution control.
 
+On Spark GB10 at `961bcaa6c3`, all 39 focused CUDA checks passed,
+including released DECIDE HTTP classification. The earlier 6 GiB fixture
+cap rejected construction because the 5,944,010,285-byte peak request
+and 591,595,830 bytes of existing reservations shared the cap. The
+passing fixture uses runtime host and unified limits.
+
+The same revision passed four released T5-small ABBA runs with a 200 µs
+collection window. All measured pairs coalesced on the fused arms and
+matched direct greedy tokens. Direct arm medians ranged from 9.88 to
+12.04 ms. Fused arm medians ranged from 9.85 to 14.72 ms, with the
+largest costs concentrated in the early fused arm. The comparison does
+not establish a consistent CUDA throughput improvement.
+
 ### Issue closure audit
 
 This audit reconciles the original `2f2438e67f` implementation review
