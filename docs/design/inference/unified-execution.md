@@ -1476,6 +1476,11 @@ At `194e567a75`, six scoped Metal tests passed without skips. They
 covered checked attention geometry, rejection of live output aliases,
 reuse of retired handles, and the existing audio replay paths.
 
+At `ce443928a5`, all seven selected local tests passed without skips
+with direct Metal access. The run covered prepared audio replay with
+fresh inputs, selector eviction, held results and admission recovery,
+plus pending cuDNN receipt aggregation and both CUDA workspace reports.
+
 This audit reconciles the original `2f2438e67f` implementation review
 against merged main `4951ca13f9` with later evidence. Each serving
 measurement identifies the revision that ran.
