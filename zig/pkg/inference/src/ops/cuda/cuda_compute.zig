@@ -62284,6 +62284,12 @@ test "public source audio linear recreates input bank through actual learning ca
         try std.testing.expect(compute.source_linear_scratch.active);
         if (iteration >= 2) {
             const workspace = workspace_observation.cuda_audio_workspace orelse return error.TestUnexpectedResult;
+            const expected_workspace_route: observation.CudaAudioWorkspace.Route = switch (iteration) {
+                2 => .recorded_and_launched,
+                3, 6 => .replayed,
+                else => .eager_assigned,
+            };
+            try std.testing.expectEqual(expected_workspace_route, workspace.route);
             try std.testing.expectEqual(.observed, workspace.plan_origin);
             try std.testing.expect(workspace.planned_events > 0);
             try std.testing.expect(workspace.planned_arena_bytes <= workspace.bound_arena_bytes);
