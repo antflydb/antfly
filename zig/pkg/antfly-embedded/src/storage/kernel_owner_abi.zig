@@ -79,7 +79,7 @@ pub const merged_main_owner_abi_version: u32 = 123;
 // Version 133 adds an optional lifetime receipt for artifact dispatch.
 // Version 134 carries accepted Raft positions in artifact dispatch receipts.
 // Version 135 certifies superseded suffixes using the applied Raft term.
-pub const abi_version: u32 = 137;
+pub const abi_version: u32 = 138;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

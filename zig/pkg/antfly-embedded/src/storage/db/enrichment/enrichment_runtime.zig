@@ -33138,6 +33138,7 @@ const PublicationFlights = struct {
     mutex: Io.Mutex = .init,
     items: std.ArrayList(Flight) = .empty,
     cleanup: ?background_runtime_mod.MaintenanceScheduler.Handle = null,
+    cleanup_retry_ns: u64 = 0,
 
     fn deinit(self: *PublicationFlights, a: Allocator) void {
         if (self.cleanup) |*task| task.join();
@@ -33252,10 +33253,34 @@ const PublicationFlights = struct {
         };
     }
 
+    fn wakeCleanup(self: *PublicationFlights, runtime: *EnrichmentRuntime) void {
+        if (self.cleanup) |task| {
+            task.wake();
+            return;
+        }
+        const backend = runtime.backend_runtime orelse return;
+        const now = platform_time.monotonicNs();
+        if (now < self.cleanup_retry_ns) return;
+        self.cleanup = registerCleanup(backend, runtime) catch |err| {
+            // Reduced inline backends can run publication with no scheduler.
+            // Normal receipt reconciliation still releases their reservations.
+            self.cleanup_retry_ns = switch (err) {
+                error.InvalidMaintenanceCapacity, error.MissingBackendRuntimeIo, error.BackendRuntimeShuttingDown => std.math.maxInt(u64),
+                else => now +| std.time.ns_per_s,
+            };
+            return;
+        };
+    }
+
+    fn registerCleanup(backend: *background_runtime_mod.BackendRuntime, runtime: *EnrichmentRuntime) !background_runtime_mod.MaintenanceScheduler.Handle {
+        return (try backend.maintenanceScheduler()).registerClass(.maintenance, runtime, cleanupStep);
+    }
+
     fn retainProgressKey(self: *PublicationFlights, runtime: *EnrichmentRuntime, bytes: []const u8, encoding_budget: ?*resource_manager_mod.BudgetedAllocator) !*RetainedKey {
         for (self.items.items) |flight| if (flight.retained_key) |key| {
             if (std.mem.eql(u8, key.bytes, bytes)) {
                 key.refs += 1;
+                if (key.reservation != null) self.wakeCleanup(runtime);
                 return key;
             }
         };
@@ -33278,12 +33303,7 @@ const PublicationFlights = struct {
         errdefer a.destroy(key);
         const stored = try a.dupe(u8, bytes);
         errdefer a.free(stored);
-        if (reservation != null) if (runtime.backend_runtime) |backend| {
-            if (self.cleanup) |task|
-                task.wake()
-            else
-                self.cleanup = try (try backend.maintenanceScheduler()).registerClass(.maintenance, runtime, cleanupStep);
-        };
+        if (reservation != null) self.wakeCleanup(runtime);
         key.* = .{ .bytes = stored, .reservation = reservation };
         return key;
     }
@@ -52662,9 +52682,17 @@ test "model aware media ordered generation publishes beyond 4095 chunks and resu
             runtime.config.resource_manager = original_manager;
         }
         const backend = runtime.backend_runtime;
-        runtime.backend_runtime = null;
+        var reduced = try background_runtime_mod.BackendRuntime.init(a, .{
+            .backend = .manual,
+            .borrowed_io = .{ .general = std.testing.io },
+            .lane_limits = .{ .durable_background = 2 },
+        });
+        defer reduced.deinit();
+        runtime.backend_runtime = &reduced;
         defer runtime.backend_runtime = backend;
+        try std.testing.expectError(error.InvalidMaintenanceCapacity, reduced.maintenanceScheduler());
         try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedChunkGeneration(runtime, request, &token, scope, desired, true));
+        try std.testing.expect(runtime.publication_flights.cleanup == null);
         var shared_key: ?*PublicationFlights.RetainedKey = null;
         var page_witnesses: usize = 0;
         for (runtime.publication_flights.items.items) |flight| {
@@ -52696,6 +52724,7 @@ test "model aware media ordered generation publishes beyond 4095 chunks and resu
         try std.testing.expectEqual(calls_before, harness.calls);
         try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(slice).used_bytes);
         runtime.backend_runtime = backend;
+        runtime.publication_flights.cleanup_retry_ns = 0;
         {
             const io = concurrencyIo(runtime);
             runtime.publication_flights.mutex.lockUncancelable(io);
