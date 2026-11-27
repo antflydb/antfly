@@ -63164,15 +63164,23 @@ test "CUDA cold audio declaration dispatches before any learning invocation" {
     const projection = try SourceLinearGeometry.resolve(2, null, 2, 2);
     const publication_bytes = try checkedMul(projection.output_count, @sizeOf(f32));
     const layout = try sourceLinearLayout(compute.ctx.info.compute_major, projection.rows, 2, 2, true, false);
-    const entry = try compute.audio_plans.getWithCleanup(bindings.key, .{});
-    const owner = try plan_mod.Owner.create(std.heap.c_allocator);
-    entry.owner = owner;
-    var declaration = try owner.beginDeclaration(bindings);
-    const projected_slot = try declaration.events.allocate(publication_bytes);
-    try declaration.events.scratchInterval(layout.bytes);
-    const output_slot = try declaration.events.allocate(publication_bytes);
-    try declaration.events.release(projected_slot);
-    try declaration.finish(output_slot);
+    const entry = published: {
+        const owner = try plan_mod.Owner.create(std.heap.c_allocator);
+        errdefer owner.destroyUnusedOutsideExecution();
+        var declaration = try owner.beginDeclaration(bindings);
+        const projected_slot = try declaration.events.allocate(publication_bytes);
+        try declaration.events.scratchInterval(layout.bytes);
+        const output_slot = try declaration.events.allocate(publication_bytes);
+        try declaration.events.release(projected_slot);
+        try declaration.finish(output_slot);
+        try std.testing.expectError(error.InvalidExecutionPlan, compute.audio_plans.publishDeclared(try compute.audioCacheBase(cold_key + 1, &geometry, null), owner, .{}));
+        break :published try compute.audio_plans.publishDeclared(bindings, owner, .{});
+    };
+    const executable = compute.audioPlanFor(bindings).?.executableFor(bindings).?;
+    try std.testing.expect(executable.storage.external_output);
+    const admission = try compute.cacheRequestState(CudaCompute.audioArenaRequest(executable));
+    try std.testing.expect(admission.miss);
+    try std.testing.expectEqual(executable.storage.bytes + executable.storage.output.?.bytes, admission.amounts.backend_scratch_bytes);
 
     const executes_before = compute.audio_arena_executes;
     const first = (try cb.audioExecution(cold_key, &inputs, @constCast(&cb), Run.call)) orelse return error.TestUnexpectedResult;
@@ -63181,7 +63189,7 @@ test "CUDA cold audio declaration dispatches before any learning invocation" {
     defer std.testing.allocator.free(values);
     try std.testing.expectEqualSlices(f32, &.{ 0.5, 0, 0, 0.5 }, values);
     try std.testing.expect(!entry.warmed);
-    try std.testing.expect(owner.plan.origin == .declared);
+    try std.testing.expect(entry.owner.?.plan.origin == .declared);
     try std.testing.expectEqual(executes_before + 1, compute.audio_arena_executes);
 }
 

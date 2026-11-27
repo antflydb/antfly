@@ -221,6 +221,18 @@ pub const Cache = struct {
         if (entry.key != key or entry.stamp == 0) return error.AudioPlanChanged;
         return entry;
     }
+
+    /// Transfer a sealed, shape-declared plan only after validating its
+    /// identity and obtaining the slot. On failure the caller keeps ownership.
+    pub fn publishDeclared(self: *Cache, bindings: Bindings, owner: *Owner, current: Cleanup) !*Entry {
+        if (owner.retiring or owner.plan.origin != .declared or owner.executableFor(bindings) == null)
+            return error.InvalidExecutionPlan;
+        try owner.validateCleanup(current);
+        const entry = try self.getWithCleanup(bindings.key, current);
+        if (entry.disabled or entry.owner != null) return error.AudioPlanChanged;
+        entry.owner = owner;
+        return entry;
+    }
     pub fn validateCleanup(self: *const Cache, current: Cleanup) !void {
         for (self.entries) |entry| if (entry.owner) |owner| try owner.validateCleanup(current);
     }
