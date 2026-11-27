@@ -22607,17 +22607,31 @@ fn sourceLinearLayout(compute_major: i32, rows: kernel_geometry.SourceGemmRows, 
     return SourceLinearLayout.resolveSourceRows(rows, width, columns, pack_weight, pack_bias, try source_linear_arithmetic.workspaceBytes(compute_major));
 }
 
+const SourceLinearGeometry = struct {
+    rows: kernel_geometry.SourceGemmRows,
+    input_count: usize,
+    weight_count: usize,
+    output_count: usize,
+
+    fn resolve(rows: usize, source_rows: ?usize, width: usize, columns: usize) !SourceLinearGeometry {
+        const resolved = try kernel_geometry.SourceGemmRows.resolve(rows, source_rows);
+        if (width == 0 or columns == 0) return error.InvalidShape;
+        const input_count = try checkedMul(resolved.physical, width);
+        const weight_count = try checkedMul(columns, width);
+        const output_count = try checkedMul(resolved.physical, columns);
+        // The packer's linear index and vendor dimensions must both fit.
+        if (@max(input_count, @max(weight_count, output_count)) > std.math.maxInt(u32) or
+            @max(resolved.physical, @max(width, columns)) > std.math.maxInt(c_int)) return error.InvalidShape;
+        return .{ .rows = resolved, .input_count = input_count, .weight_count = weight_count, .output_count = output_count };
+    }
+};
+
 fn sourceLinear(self: *CudaCompute, request: @FieldType(ops.Bf16SourceOperation, "linear")) !CT {
-    const rows = try @import("../kernel_geometry.zig").SourceGemmRows.resolve(request.rows, request.source_rows);
-    if (request.width == 0 or request.columns == 0) return error.InvalidShape;
-    const input_count = try checkedMul(rows.physical, request.width);
-    const weight_count = try checkedMul(request.columns, request.width);
-    const output_count = try checkedMul(rows.physical, request.columns);
-    // The packer's linear index and the vendor dimensions must both fit.
-    if (@max(input_count, @max(weight_count, output_count)) > std.math.maxInt(u32) or
-        @max(rows.physical, @max(request.width, request.columns)) > std.math.maxInt(c_int)) return error.InvalidShape;
-    const input = try sourceScalarTensor(request.input, input_count);
-    const weight = try sourceScalarTensor(request.weight, weight_count);
+    const geometry = try SourceLinearGeometry.resolve(request.rows, request.source_rows, request.width, request.columns);
+    const rows = geometry.rows;
+    const output_count = geometry.output_count;
+    const input = try sourceScalarTensor(request.input, geometry.input_count);
+    const weight = try sourceScalarTensor(request.weight, geometry.weight_count);
     const bias = if (request.bias) |value| try sourceScalarTensor(value, request.columns) else null;
     const destination = if (request.output) |target| try sourceScalarTensor(target, output_count) else null;
     if (destination) |target| {
@@ -63137,7 +63151,9 @@ test "CUDA cold audio declaration dispatches before any learning invocation" {
     const Run = struct {
         fn call(raw: *anyopaque, inputs: []const CT) !CT {
             const backend: *const ops.ComputeBackend = @ptrCast(@alignCast(raw));
-            return (try backend.tryBf16SourceOperation(&.{ .linear = .{ .input = inputs[0], .weight = inputs[1], .rows = 2, .width = 2, .columns = 2 } })) orelse error.SourceArithmeticUnavailable;
+            const projected = (try backend.tryBf16SourceOperation(&.{ .linear = .{ .input = inputs[0], .weight = inputs[1], .rows = 2, .width = 2, .columns = 2 } })) orelse return error.SourceArithmeticUnavailable;
+            defer backend.free(projected);
+            return (try backend.tryBf16SourceOperation(&.{ .clamp = .{ .input = projected, .max = 0.5 } })) orelse error.SourceArithmeticUnavailable;
         }
     };
     const plan_mod = @import("audio_execution_plan.zig");
@@ -63145,13 +63161,17 @@ test "CUDA cold audio declaration dispatches before any learning invocation" {
     const inputs = [_]CT{ identity, identity };
     const geometry: [2]CudaCompute.AudioCacheInput = @splat(.{ .shape = &.{ 2, 2 }, .elements = 4 });
     const bindings = try compute.audioCacheBase(cold_key, &geometry, null);
-    const layout = try sourceLinearLayout(compute.ctx.info.compute_major, try kernel_geometry.SourceGemmRows.resolve(2, null), 2, 2, true, false);
+    const projection = try SourceLinearGeometry.resolve(2, null, 2, 2);
+    const publication_bytes = try checkedMul(projection.output_count, @sizeOf(f32));
+    const layout = try sourceLinearLayout(compute.ctx.info.compute_major, projection.rows, 2, 2, true, false);
     const entry = try compute.audio_plans.getWithCleanup(bindings.key, .{});
     const owner = try plan_mod.Owner.create(std.heap.c_allocator);
     entry.owner = owner;
     var declaration = try owner.beginDeclaration(bindings);
-    const output_slot = try declaration.events.allocate(bindings.output_bytes);
+    const projected_slot = try declaration.events.allocate(publication_bytes);
     try declaration.events.scratchInterval(layout.bytes);
+    const output_slot = try declaration.events.allocate(publication_bytes);
+    try declaration.events.release(projected_slot);
     try declaration.finish(output_slot);
 
     const executes_before = compute.audio_arena_executes;
@@ -63159,7 +63179,7 @@ test "CUDA cold audio declaration dispatches before any learning invocation" {
     defer cb.free(first);
     const values = try cb.toFloat32(first, std.testing.allocator);
     defer std.testing.allocator.free(values);
-    try std.testing.expectEqualSlices(f32, &identity_values, values);
+    try std.testing.expectEqualSlices(f32, &.{ 0.5, 0, 0, 0.5 }, values);
     try std.testing.expect(!entry.warmed);
     try std.testing.expect(owner.plan.origin == .declared);
     try std.testing.expectEqual(executes_before + 1, compute.audio_arena_executes);
