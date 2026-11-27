@@ -21644,13 +21644,17 @@ fn sourceLocalRelativeAttention(self: *CudaCompute, q: CT, k: CT, v: CT, rel: CT
     errdefer if (queued) synchronizeAndDrainDeferredDeviceFrees(self) catch {};
     queued = true; // A failed submission may already have consumed addresses.
     try module.launchLocalRelativeSourcePack(&self.ctx, plan, query, packed_query, key, value, tensorFromCt(q).buffer, tensorFromCt(k).buffer, tensorFromCt(v).buffer, tensorFromCt(scales).buffer, params.query_scale, params.k_scale);
-    try blas.stridedBatchedF32WithWorkspace(self.ctx.stream, @ptrFromInt(scores.ptr), @ptrFromInt(key.ptr), @ptrFromInt(packed_query.ptr), plan.contentLayout(), @ptrFromInt(workspace.ptr), workspace.len);
-    module.noteCublasF32Matmul();
-    try blas.stridedBatchedF32WithWorkspace(self.ctx.stream, @ptrFromInt(relative_scores.ptr), @ptrFromInt(tensorFromCt(rel).buffer.ptr), @ptrFromInt(query.ptr), plan.relativeLayout(), @ptrFromInt(workspace.ptr), workspace.len);
-    module.noteCublasF32Matmul();
-    try module.launchLocalRelativeSourceSoftmax(&self.ctx, plan, scores, relative_scores, tensorFromCt(valid).buffer, params.logit_cap, params.invalid_value, params.exclude_farthest_key);
-    try blas.stridedBatchedF32WithWorkspace(self.ctx.stream, @ptrFromInt(result.ptr), @ptrFromInt(value.ptr), @ptrFromInt(scores.ptr), plan.contextLayout(), @ptrFromInt(workspace.ptr), workspace.len);
-    module.noteCublasF32Matmul();
+    {
+        var workspace_scope = try blas.beginF32Workspace(self.ctx.stream, @ptrFromInt(workspace.ptr), workspace.len);
+        defer workspace_scope.deinit();
+        try workspace_scope.stridedBatched(@ptrFromInt(scores.ptr), @ptrFromInt(key.ptr), @ptrFromInt(packed_query.ptr), plan.contentLayout());
+        module.noteCublasF32Matmul();
+        try workspace_scope.stridedBatched(@ptrFromInt(relative_scores.ptr), @ptrFromInt(tensorFromCt(rel).buffer.ptr), @ptrFromInt(query.ptr), plan.relativeLayout());
+        module.noteCublasF32Matmul();
+        try module.launchLocalRelativeSourceSoftmax(&self.ctx, plan, scores, relative_scores, tensorFromCt(valid).buffer, params.logit_cap, params.invalid_value, params.exclude_farthest_key);
+        try workspace_scope.stridedBatched(@ptrFromInt(result.ptr), @ptrFromInt(value.ptr), @ptrFromInt(scores.ptr), plan.contextLayout());
+        module.noteCublasF32Matmul();
+    }
     try module.launchLocalRelativeSourcePublish(&self.ctx, plan, output.buffer, result);
     return output.intoTensor();
 }
@@ -62570,6 +62574,55 @@ test "source vision cold geometry preserves legacy phase without actual Lt progr
     try std.testing.expect((try CudaCompute.sourceVisionGeometryForTarget(wrong_target)) == null);
     const invalid = ops.ComputeBackend{ .ptr = @ptrFromInt(16), .vtable = &copied };
     try std.testing.expectError(error.UnsupportedSourceArithmeticReceiver, invalid.sourceVisionGeometry());
+}
+
+test "CUDA source local relative attention shares workspace across three physical GEMMs" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.testing.init(a);
+    defer compute.deinit();
+    compute.bf16_blas = try @import("libraries.zig").Cublas.initWithLibrary(compute.ctx.stream, null);
+    const cb = compute.computeBackend();
+    const hidden = 32;
+    const chunk = 12;
+    const context_left = 13;
+    const scale = try cb.fromFloat32Shape(&@as([hidden]f32, @splat(1)), &.{hidden});
+    defer cb.free(scale);
+    const relative = try cb.fromFloat32Shape(&@as([context_left * hidden]f32, @splat(0)), &.{ context_left, hidden });
+    defer cb.free(relative);
+    for ([_]usize{ 7, 19 }) |rows| {
+        const zeros: [19 * hidden]f32 = @splat(0);
+        const values: [19 * hidden]f32 = @splat(3);
+        const mask: [19]f32 = @splat(1);
+        const shape = [_]i64{ @intCast(rows), hidden };
+        const query = try cb.fromFloat32Shape(zeros[0 .. rows * hidden], &shape);
+        defer cb.free(query);
+        const value = try cb.fromFloat32Shape(values[0 .. rows * hidden], &shape);
+        defer cb.free(value);
+        const valid = try cb.fromFloat32Shape(mask[0..rows], &.{@intCast(rows)});
+        defer cb.free(valid);
+        const params: ops.Gemma4AudioLocalAttentionParams = .{
+            .rows = rows,
+            .hidden = hidden,
+            .heads = 1,
+            .head_dim = hidden,
+            .chunk = chunk,
+            .context_left = context_left,
+            .context = chunk + context_left - 1,
+            .k_scale = 1,
+            .logit_cap = 50,
+            .invalid_value = -1e9,
+            .arithmetic = .independent_f32,
+            .publication = .bf16_values_f32,
+        };
+        const before = compute.bf16_blas.?.calls;
+        const result = (try cb.gemma4AudioLocalAttention(query, query, value, relative, scale, valid, params)) orelse return error.TestUnexpectedResult;
+        defer cb.free(result);
+        try std.testing.expectEqual(before + 3, compute.bf16_blas.?.calls);
+        const output = try cb.toFloat32(result, a);
+        defer a.free(output);
+        try std.testing.expectEqualSlices(f32, values[0 .. rows * hidden], output);
+    }
 }
 
 test "source local relative attention validates geometry and library before opaque CUDA ownership" {

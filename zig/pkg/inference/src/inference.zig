@@ -68,6 +68,7 @@ test "dense projection cache metadata declarations compile" {
 }
 
 test {
+    _ = @import("ops/cuda/libraries.zig");
     _ = @import("ops/cuda/local_relative_source.zig");
     _ = @import("ops/cuda/retained_execution_cache.zig");
     _ = @import("backends/embedding_gemma2_cuda.zig");
