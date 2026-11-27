@@ -3978,8 +3978,9 @@ pub const CudaCompute = struct {
                     .attention_scratch_bytes = if (layout.attention_workspace) |span| span.bytes else 0,
                     .recurrent_scratch_bytes = owner.bound_recurrent_scratch_bytes,
                     .head_bytes = layout.head_bytes,
+                    .shared_head_scratch_bytes = if (layout.shared_head_workspace) |span| span.bytes else 0,
                     .head_packet_rows = layout.headPacketRows(owner.rows, owner.vocab),
-                    .head_in_stream_arena = layout.head_bytes == 0 and layout.fused_head_workspace == null and arena != null,
+                    .head_in_stream_arena = layout.head_bytes == 0 and layout.shared_head_workspace == null and layout.fused_head_workspace == null and arena != null,
                     .fused_head_scratch_bytes = if (layout.fused_head_workspace) |span| span.bytes else 0,
                     .readback_bytes = source.len,
                     .readback_backing = readback_backing,
@@ -46989,7 +46990,9 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
     var layout = try @import("bounded_decode_graph.zig").StorageLayout.init(3, 2, 2, 1);
     // A compact physical fixture uses the same declared-head contract.
     layout.head_bytes = backing.len;
-    var metadata = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, layout.metadata_bytes);
+    const head_offset = layout.metadata_bytes;
+    const packet_bytes = 4 * @sizeOf(f32);
+    var metadata = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, head_offset + packet_bytes);
     defer metadata.free(&compute.ctx);
     owner.storage_layout = layout;
     owner.metadata = metadata;
@@ -47059,7 +47062,6 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
     try std.testing.expectEqualSlices(f32, &.{ 2, 3, 5, 7, 2, 3 }, packet_actual);
 
     owner.storage_layout.?.head_bytes = 0;
-    owner.storage_layout.?.arena_head_rows = 2;
     claim.head_destination = try owner.bindExecutionStorage();
     const workspace = @import("../../execution/stream_workspace.zig");
     const plan = try a.create(workspace.Plan);
@@ -47078,6 +47080,25 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
     const shared_actual = try cb.toFloat32(shared_embeddings, a);
     defer a.free(shared_actual);
     try std.testing.expectEqualSlices(f32, packet_actual, shared_actual);
+
+    owner.storage_layout.?.metadata_bytes = metadata.len;
+    owner.storage_layout.?.shared_head_workspace = .{ .offset = head_offset, .bytes = packet_bytes };
+    claim.head_destination = try owner.bindExecutionStorage();
+    try std.testing.expectEqual(metadata.ptr + head_offset, claim.head_destination.?.ptr);
+    plan.* = .{};
+    try plan.declare(&.{}, null);
+    var assigned = try workspace.Scope.bind(plan, try plan.layout(0), 0, 0);
+    {
+        compute.execution_scope = &assigned;
+        defer compute.execution_scope = null;
+        try claim.projectGreedyHead(&cb, &burst, packet_input, weight, 1);
+    }
+    try std.testing.expect(assigned.complete());
+    const assigned_embeddings = try burst.embedding(1);
+    defer cb.free(assigned_embeddings);
+    const assigned_actual = try cb.toFloat32(assigned_embeddings, a);
+    defer a.free(assigned_actual);
+    try std.testing.expectEqualSlices(f32, packet_actual, assigned_actual);
 }
 
 test "LightOnOCR3 CUDA bounded GEMM refresh drains at an exclusive boundary and refuses capture" {

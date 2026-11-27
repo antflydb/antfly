@@ -1009,7 +1009,7 @@ pub const Executor = struct {
             C.boundedFusedHeadAvailable(self.context.cb, head, claimed.len, self.context.gpt_config.hidden_size, self.context.gpt_config.vocab_size))
             .fused_top1
         else if (platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_SHARE_HEAD_ARENA"))
-            .{ .arena_packets = 16 }
+            .{ .shared_layer_packets = 16 }
         else if (platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_HEAD_PACKETS"))
             .{ .adaptive_bank = 32 }
         else

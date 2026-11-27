@@ -48788,7 +48788,9 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
             try std.testing.expectEqual(report.rows, report.head_packet_rows);
             try std.testing.expectEqual(@as(usize, 0), report.head_bytes);
             const fused_head = platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_FUSED_HEAD");
-            try std.testing.expectEqual(!fused_head, report.head_in_stream_arena);
+            const shared_head = !fused_head and platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_SHARE_HEAD_ARENA");
+            try std.testing.expectEqual(!fused_head and !shared_head, report.head_in_stream_arena);
+            try std.testing.expectEqual(shared_head, report.shared_head_scratch_bytes != 0);
             try std.testing.expectEqual(fused_head, report.fused_head_scratch_bytes != 0);
             // At two rows the position plane starts on the first 16-byte boundary.
             try std.testing.expectEqual(@as(usize, 44), report.readback_bytes);
@@ -48796,7 +48798,7 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
             try std.testing.expect(report.planned_events != 0 and report.metadata_bytes != 0 and report.attention_scratch_bytes != 0);
             if (platform.env.getenvBool("ANTFLY_TEST_LIGHTONOCR3_CUDA_UNFUSED_RECURRENT"))
                 try std.testing.expect(report.recurrent_scratch_bytes != 0);
-            const shared_bytes = @max(report.attention_scratch_bytes, report.recurrent_scratch_bytes, report.fused_head_scratch_bytes);
+            const shared_bytes = @max(report.attention_scratch_bytes, report.recurrent_scratch_bytes, report.fused_head_scratch_bytes, report.shared_head_scratch_bytes);
             try std.testing.expectEqual(shared_bytes, report.shared_layer_workspace_bytes);
             std.debug.print("LIGHTONOCR3 observed_cuda_workspace rows={d} readback_bytes={d} backing={s} route={s} attention_scratch_bytes={d} recurrent_scratch_bytes={d} shared_layer_workspace_bytes={d}\n", .{ report.rows, report.readback_bytes, @tagName(report.readback_backing), @tagName(report.route), report.attention_scratch_bytes, report.recurrent_scratch_bytes, report.shared_layer_workspace_bytes });
         }

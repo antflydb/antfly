@@ -505,6 +505,7 @@ pub const CudaDecoderWorkspace = struct {
     head_bytes: usize,
     head_packet_rows: usize,
     head_in_stream_arena: bool,
+    shared_head_scratch_bytes: usize = 0,
     fused_head_scratch_bytes: usize = 0,
     readback_bytes: usize,
     readback_backing: ReadbackBacking,

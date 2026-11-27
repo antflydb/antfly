@@ -66,10 +66,10 @@ pub const StorageLayout = struct {
     metadata_bytes: usize,
     host_bytes: usize,
     head_bytes: usize,
-    arena_head_rows: usize = 0,
+    shared_head_workspace: ?Span = null,
 
     pub fn headPacketRows(self: StorageLayout, rows: usize, vocab: usize) usize {
-        if (self.arena_head_rows != 0) return self.arena_head_rows;
+        if (self.shared_head_workspace) |span| return span.bytes / @sizeOf(f32) / vocab;
         if (self.head_bytes != 0) return self.head_bytes / @sizeOf(f32) / vocab;
         return rows;
     }
@@ -230,7 +230,7 @@ pub const Descriptor = struct {
     pub const HeadStorage = union(enum) {
         full_bank,
         adaptive_bank: usize,
-        arena_packets: usize,
+        shared_layer_packets: usize,
         fused_top1,
     };
 
@@ -238,11 +238,13 @@ pub const Descriptor = struct {
         if (self.epoch == 0 or self.rows > max_rows or self.positions.len != self.rows * 3) return error.InvalidShape;
         const packet_rows = switch (self.head_storage) {
             .full_bank, .fused_top1 => self.rows,
-            .adaptive_bank, .arena_packets => |rows| rows,
+            .adaptive_bank, .shared_layer_packets => |rows| rows,
         };
         var storage = try StorageLayout.initWithHeadLimit(self.rows, self.hidden, self.vocab, self.key.len, packet_rows);
-        if (self.head_storage == .arena_packets and storage.head_bytes != 0) {
-            storage.arena_head_rows = @min(self.rows, packet_rows);
+        if (self.head_storage == .shared_layer_packets) {
+            const elements = try std.math.mul(usize, @min(self.rows, packet_rows), self.vocab);
+            const bytes = try std.math.mul(usize, elements, @sizeOf(f32));
+            storage.shared_head_workspace = try storage.declareLayerWorkspace(bytes);
             storage.head_bytes = 0;
         }
         if (self.head_storage == .fused_top1) {
@@ -678,6 +680,7 @@ pub const Module = struct {
             .{ plan_mod.alignment, @alignOf(f32), plan_mod.alignment },
             1,
         );
+        if (layout.shared_head_workspace) |span| return try self.bindLayerWorkspace(layout, span, span.bytes);
         if (layout.head_bytes == 0) return null;
         var destination = self.head;
         destination.len = layout.head_bytes;
@@ -857,13 +860,24 @@ test "captured graph head packets fund the exact smaller bank and invalidate a f
     try std.testing.expect(!phase.matchesOwner(&owner));
 
     var shared = packet;
-    shared.head_storage = .{ .arena_packets = 32 };
+    shared.head_storage = .{ .shared_layer_packets = 32 };
     try phase.initInto(shared);
-    try std.testing.expectEqual(@as(usize, 32), phase.storage_layout.arena_head_rows);
+    try std.testing.expectEqual(@as(usize, 32 * 248320 * 4), phase.storage_layout.shared_head_workspace.?.bytes);
     try std.testing.expectEqual(@as(usize, 32), phase.storage_layout.headPacketRows(shared.rows, shared.vocab));
     try std.testing.expectEqual(@as(usize, 0), phase.storage_layout.head_bytes);
     const shared_request = shared.storageRequestFor(phase.storage_layout);
-    try std.testing.expectEqual(layout.metadata_bytes, (try shared_request.captured_storage.amounts()).backend_scratch_bytes);
+    try std.testing.expectEqual(layout.metadata_bytes + 32 * 248320 * 4, (try shared_request.captured_storage.amounts()).backend_scratch_bytes);
+    const shared_layout = phase.storage_layout;
+    const head_span = shared_layout.shared_head_workspace.?;
+    const shared_owner: Module = .{ .storage_layout = shared_layout, .metadata = .{ .ptr = 0x10000, .len = shared_layout.metadata_bytes } };
+    const bound_head = (try shared_owner.bindExecutionStorage()).?;
+    try std.testing.expectEqual(shared_owner.metadata.ptr + head_span.offset, bound_head.ptr);
+    try std.testing.expectEqual(head_span.bytes, bound_head.len);
+    shared.rows = 2;
+    shared.positions = positions[0..6];
+    const narrow = try shared.layout();
+    try std.testing.expectEqual(@as(usize, 2 * 248320 * 4), narrow.shared_head_workspace.?.bytes);
+    try std.testing.expectEqual(@as(usize, 2), narrow.headPacketRows(2, shared.vocab));
     try std.testing.expect(!phase.matchesOwner(&owner));
 
     packet.vocab = 400_000;
