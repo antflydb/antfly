@@ -1851,6 +1851,14 @@ Speculative render preparers snapshot their owner's cancellation/deadline and
 lifecycle token before dispatch. Renewing an operation timeout for scratch retry
 must never renew the request deadline or read a sibling's mutable active guard.
 
+PDF failure manifests distinguish `PdfPreparationTimeout` (`pdf_preparation`),
+`PdfInspectionTimeout` (`pdf_inspection`), and `PdfRenderTimeout`
+(`pdf_page_render`). Inspection has one budget across its pages and excludes
+time in downstream page callbacks, including OCR. Inspection timeout messages
+report the page, configured inspection budget, and wall time. The originating
+request's deadline and cancellation still apply. Older failure records can use
+`PdfRenderTimeout` for any of these PDF stages.
+
 Local inference transport now distinguishes a request rejected before dispatch
 (`QueueFull`) from response-capacity/transport failure after possible execution.
 Only the former enters the scheduler's bounded drain-and-retry path. RPC request

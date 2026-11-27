@@ -66,7 +66,10 @@ pub const Document = struct {
         if (parsed.scheme.len == 0 or std.ascii.eqlIgnoreCase(parsed.scheme, "data") or parsed.user != null or parsed.password != null) return error.InvalidSourceUri;
         const revision = try string(value, "revision");
         if (revision.len == 0 or revision.len > 4096) return error.InvalidDocumentRevision;
-        const indexed_at = integer(field(value, "indexed_at")) orelse return error.InvalidIndexedTimestamp;
+        const indexed_at = if (field(value, "indexed_at")) |timestamp|
+            integer(timestamp) orelse return error.InvalidIndexedTimestamp
+        else
+            null;
         const permissions = field(value, "permissions") orelse return error.MissingDocumentPermissions;
         if (permissions != .object or field(permissions, "public") == null or field(permissions, "public").? != .bool) return error.InvalidDocumentPermissions;
         const readers = field(permissions, "readers") orelse return error.InvalidDocumentPermissions;

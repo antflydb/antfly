@@ -22,8 +22,7 @@
         "item_id",
         "uri",
         "path",
-        "revision",
-        "indexed_at"
+        "revision"
       ],
       "properties": {
         "id": {

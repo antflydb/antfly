@@ -53588,7 +53588,7 @@ fn renderDocumentPdfPagePngAlloc(
         );
         return rendered.png;
     }
-    var render_deadline = document_extraction_mod.PdfRenderDeadline.init(render_timeout_ms);
+    var render_deadline = document_extraction_mod.PdfOperationDeadline.init(render_timeout_ms);
     var session = try document_extraction_mod.PdfRenderSession.initWithDecodeLimitsAndCancellation(
         alloc,
         pdf_bytes,
@@ -53600,7 +53600,7 @@ fn renderDocumentPdfPagePngAlloc(
     );
     defer session.deinit();
     // Parsing and rasterization have independent wall-clock budgets.
-    render_deadline = document_extraction_mod.PdfRenderDeadline.init(render_timeout_ms);
+    render_deadline = document_extraction_mod.PdfOperationDeadline.init(render_timeout_ms);
     session.setCancellationProbe(render_deadline.probe());
     const rendered = try session.renderPagePngAdaptiveAlloc(alloc, page_number, dpi, max_pixels, max_dimension);
     return rendered.png;

@@ -6655,7 +6655,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // failures. Use the mutation allocator for the small manifest
                 // after the extraction allocator has exhausted its budget.
                 const exact_error_name = if (err != raw_err) @errorName(err) else boundaryFailureErrorName(&extraction_failure, err);
-                const decode_failure = document_extraction_mod.failureStageFromErrorName(exact_error_name, "").len != 0;
+                const decode_failure = document_extraction_mod.deterministicPdfFailureStage(exact_error_name, "").len != 0;
                 if (err == error.OutOfMemory or err == error.ResourceTemporarilyUnavailable or err == error.Canceled or err == error.Cancelled or err == error.DeadlineExceeded or err == error.Timeout or (!decode_failure and enrichment_runtime_mod.isRetryableEnrichmentError(err))) return err;
                 try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, exact_error_name, "document extraction failed", document_extraction_mod.failureStageFromErrorName(exact_error_name, "document_extraction"), request.execution_json, artifact_writes);
                 return;

@@ -501,6 +501,13 @@ pub fn failureStage(err: anyerror, fallback: []const u8) []const u8 {
 /// control flow while their bounded exact name remains available for durable
 /// diagnostics.
 pub fn failureStageFromErrorName(error_name: []const u8, fallback: []const u8) []const u8 {
+    if (std.mem.eql(u8, error_name, "PdfInspectionTimeout")) return "pdf_inspection";
+    if (std.mem.eql(u8, error_name, "PdfPreparationTimeout")) return "pdf_preparation";
+    if (std.mem.eql(u8, error_name, "PdfRenderTimeout")) return "pdf_page_render";
+    return deterministicPdfFailureStage(error_name, fallback);
+}
+
+pub fn deterministicPdfFailureStage(error_name: []const u8, fallback: []const u8) []const u8 {
     const stream_decode_errors = [_][]const u8{
         "InvalidFlateStream",          "MalformedLzw",         "MalformedPredictorData",
         "MalformedRunLength",          "MalformedAscii85",     "MalformedAsciiHex",
@@ -658,8 +665,10 @@ pub const PdfDecodeLimits = pdf.reader.DecodeLimits;
 /// A stack-owned monotonic deadline suitable for synchronous native PDF
 /// parsing and rendering. The owner must keep this value alive for as long as
 /// a reader holds the returned probe.
-pub const PdfRenderDeadline = struct {
+pub const PdfOperationDeadline = struct {
     deadline_ns: u64,
+    timeout_error: anyerror = error.PdfRenderTimeout,
+    inspection_page: ?usize = null,
     owner: PdfCancellationProbe = .{},
 
     pub fn init(timeout_ms: u64) @This() {
@@ -674,9 +683,36 @@ pub const PdfRenderDeadline = struct {
     }
 
     pub fn classifyError(self: *const @This(), err: anyerror) anyerror {
-        if ((err == error.Canceled or err == error.Cancelled) and platform_time.monotonicNs() >= self.deadline_ns)
-            return error.PdfRenderTimeout;
-        return err;
+        if (err != error.Canceled and err != error.Cancelled) return err;
+        const owner_outcome = self.owner.classifyError(err);
+        if (owner_outcome != err) return owner_outcome;
+        // A cancellation that outlived its operation must keep the owner's
+        // identity even when both clocks are now expired.
+        self.owner.check() catch return err;
+        return if (platform_time.monotonicNs() >= self.deadline_ns) self.timeout_error else err;
+    }
+
+    fn checkOwner(self: *const @This()) !void {
+        self.owner.check() catch |err| return self.owner.classifyError(err);
+    }
+
+    fn beginDownstream(self: *const @This()) !u64 {
+        try self.checkOwner();
+        const now = platform_time.monotonicNs();
+        if (now >= self.deadline_ns) return self.timeout_error;
+        return now;
+    }
+
+    fn endDownstream(self: *@This(), started_ns: u64) !void {
+        self.excludeDownstreamTime(started_ns, platform_time.monotonicNs());
+        try self.checkOwner();
+    }
+
+    fn excludeDownstreamTime(self: *@This(), started_ns: u64, finished_ns: u64) void {
+        // Keep the total inspection budget across pages. Only time spent
+        // outside the reader (e.g. in OCR) is excluded from that budget.
+        if (started_ns < self.deadline_ns)
+            self.deadline_ns +|= finished_ns -| started_ns;
     }
 
     fn cancellationError(raw: ?*const anyopaque, err: anyerror) anyerror {
@@ -688,6 +724,16 @@ pub const PdfRenderDeadline = struct {
         return .{ .context = self, .is_cancelled_fn = isCancelled, .cancellation_error_fn = cancellationError };
     }
 };
+
+test "PDF inspection budget excludes downstream time without replenishing work" {
+    var budget: PdfOperationDeadline = .{ .deadline_ns = 110, .timeout_error = error.PdfInspectionTimeout };
+    budget.excludeDownstreamTime(104, 204);
+    try std.testing.expectEqual(@as(u64, 210), budget.deadline_ns);
+    budget.excludeDownstreamTime(208, 308);
+    try std.testing.expectEqual(@as(u64, 310), budget.deadline_ns);
+    budget.excludeDownstreamTime(311, 411);
+    try std.testing.expectEqual(@as(u64, 310), budget.deadline_ns);
+}
 
 pub fn recordPdfRenderQualityWarningAlloc(alloc: Allocator, unit: *Unit, rendered: anytype) !void {
     if (rendered.quality == .native) return;
@@ -724,14 +770,19 @@ pub const PdfRenderSession = struct {
         return .{ .parsed = try pdf.reader.Reader.initWithDecodeLimitsAndCancellation(alloc, pdf_bytes, decode_limits, cancellation) };
     }
 
-    /// Build a task-local render session over a prepared document's immutable
-    /// xref, trailer, and page index. The prepared source must outlive this
-    /// session; mutable decode caches and diagnostics remain independently
-    /// owned by `alloc`. The caller must finish `prepareForBatchRendering`
-    /// before publishing the source to other task executors.
-    pub fn initFromPrepared(alloc: Allocator, source: *PdfRenderSession, cancellation: PdfCancellationProbe) !PdfRenderSession {
+    /// Fork a session that the owner may still use for serial rendering.
+    /// Refresh its template before taking the snapshot for this reader.
+    fn initFromPrepared(alloc: Allocator, source: *PdfRenderSession, cancellation: PdfCancellationProbe) !PdfRenderSession {
         try source.ensureRenderForkTemplate(cancellation);
-        return .{ .parsed = try source.render_fork_template.?.instantiate(alloc, cancellation) };
+        return initFromFrozen(alloc, source, cancellation);
+    }
+
+    /// Fork a published source without refreshing its shared metadata. The
+    /// owner must prepare the template before publication and keep the source
+    /// alive and immutable until all readers release their borrows.
+    pub fn initFromFrozen(alloc: Allocator, source: *const PdfRenderSession, cancellation: PdfCancellationProbe) !PdfRenderSession {
+        const template = if (source.render_fork_template) |*value| value else return error.PdfSourceNotPrepared;
+        return .{ .parsed = try template.instantiate(alloc, cancellation) };
     }
 
     pub fn deinit(self: *PdfRenderSession) void {
@@ -3477,13 +3528,13 @@ pub const PdfPageTextCache = struct {
     store_fn: *const fn (*anyopaque, usize, PdfPageText) anyerror!void,
 };
 
-pub fn extractPreparedPdfStreamingWithTextCache(alloc: Allocator, session: *PdfRenderSession, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, sink: UnitSink, cache: ?PdfPageTextCache) !void {
-    const cancellation = session.parsed.cancellationProbe();
+pub fn extractPreparedPdfStreamingWithTextCache(alloc: Allocator, session: *PdfRenderSession, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, sink: UnitSink, cache: ?PdfPageTextCache, inspection_budget: ?*PdfOperationDeadline) !void {
+    const cancellation = if (inspection_budget) |budget| budget.probe() else session.parsed.cancellationProbe();
     var text_session = PdfRenderSession.initFromPrepared(alloc, session, cancellation) catch |err|
         return cancellation.classifyError(err);
     defer text_session.deinit();
     text_session.parsed.setTextExtractionPolicy(native_text.policy);
-    return extractParsedPdfStreamingWithTextCache(alloc, &text_session.parsed, content_type, native_text, ocr_mode, sink, cache);
+    return extractParsedPdfStreamingWithTextCache(alloc, &text_session.parsed, content_type, native_text, ocr_mode, sink, cache, inspection_budget);
 }
 
 fn inspectPdfPageText(alloc: Allocator, parsed: *pdf.reader.Reader, page_num: usize, policy: NativeTextPolicy, cache: ?PdfPageTextCache) !PdfPageText {
@@ -3522,16 +3573,22 @@ fn inspectPdfPageText(alloc: Allocator, parsed: *pdf.reader.Reader, page_num: us
 }
 
 fn extractParsedPdfStreaming(alloc: Allocator, parsed: *pdf.reader.Reader, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, sink: UnitSink) !void {
-    return extractParsedPdfStreamingWithTextCache(alloc, parsed, content_type, native_text, ocr_mode, sink, null);
+    return extractParsedPdfStreamingWithTextCache(alloc, parsed, content_type, native_text, ocr_mode, sink, null, null);
 }
 
-fn extractParsedPdfStreamingWithTextCache(alloc: Allocator, parsed: *pdf.reader.Reader, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, sink: UnitSink, cache: ?PdfPageTextCache) !void {
+fn extractParsedPdfStreamingWithTextCache(alloc: Allocator, parsed: *pdf.reader.Reader, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, sink: UnitSink, cache: ?PdfPageTextCache, inspection_budget: ?*PdfOperationDeadline) !void {
     const page_count = parsed.pageCount() catch |err| return parsed.cancellationProbe().classifyError(err);
+    const begin_started_ns = if (inspection_budget) |budget| try budget.beginDownstream() else 0;
     try sink.on_begin(sink.ptr, .{ .content_type = content_type, .route_type = "pdf" });
+    if (inspection_budget) |budget| try budget.endDownstream(begin_started_ns);
 
     var page_num: usize = 1;
     var cursor: usize = 0;
     while (page_num <= page_count) : (page_num += 1) {
+        if (inspection_budget) |budget| {
+            budget.inspection_page = page_num;
+            budget.probe().check() catch |err| return budget.classifyError(err);
+        }
         const force_ocr = ocr_mode == .always;
         // Keep embedded text even in forced mode so OCR is not a blind
         // replacement for usable born-digital content.
@@ -3600,12 +3657,20 @@ fn extractParsedPdfStreamingWithTextCache(alloc: Allocator, parsed: *pdf.reader.
         text_blocks = &.{};
         extraction_warning = null;
         errdefer unit.deinit(alloc);
+        const unit_started_ns = if (inspection_budget) |budget| try budget.beginDownstream() else 0;
         try sink.on_unit(sink.ptr, &unit);
+        if (inspection_budget) |budget| try budget.endDownstream(unit_started_ns);
         unit.deinit(alloc);
         cursor += page_text_len;
     }
 
+    if (inspection_budget) |budget| {
+        // The final callback can flush an OCR batch. The operation's reader
+        // budget stops here, but request cancellation remains in force.
+        _ = try budget.beginDownstream();
+    }
     try sink.on_end(sink.ptr);
+    if (inspection_budget) |budget| try budget.checkOwner();
 }
 
 fn extractPdfTextRegionsFromRunsAlloc(

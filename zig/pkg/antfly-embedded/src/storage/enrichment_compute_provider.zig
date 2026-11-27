@@ -222,7 +222,7 @@ pub fn extractStream(
 /// retain an adapter table or deadline living in the open/render call's frame.
 const PdfSessionState = struct {
     allocator: abi.Allocator,
-    deadline: extraction.PdfRenderDeadline,
+    deadline: extraction.PdfOperationDeadline,
     pdf: extraction.PdfRenderSession,
     cancellation: abi.PdfCancellation,
     deadline_enabled: bool,
