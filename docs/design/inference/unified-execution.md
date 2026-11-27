@@ -2425,3 +2425,13 @@ gather fixture also passed using the shared CUDA batch-copy submission.
 Its single synthetic 48-row timing was 1.92 ms serial and 0.97 ms
 fused. Controlled serving comparisons are still required. The log hash
 is `372d4c9b65963e47f58e9a587255cae2990fd169ac2cf4c424587c78c8d7d12d`.
+
+A same-binary Metal ABBA test on top of `7fac50bbb4` compared a
+shared-input vision gate/up projection pair with the existing scalar
+clamp path. The official E2B projector declared matching input bounds
+for gate and up in all 16 layers. With eight measured samples per arm,
+mean arm-median latency was 643.89 versus 643.86 ms for image and
+600.77 versus 600.91 ms for silent video. All measured responses matched
+across arms. The toggle did not yield a measurable serving improvement,
+so the experimental source was removed. The receipt hash is
+`d5f38ffee83de0327e1fb51684e3001629da39d85e6ae2d32126d18f5a0bb2a0`.
