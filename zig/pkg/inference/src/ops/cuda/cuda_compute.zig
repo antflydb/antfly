@@ -3740,7 +3740,6 @@ pub const CudaCompute = struct {
     }
     pub const BoundedDecodeClaim = struct {
         compute: *CudaCompute,
-        future_tokens: usize,
         head_destination: ?buffer_mod.DeviceBuffer,
         capture_scope: ?@import("../../execution/stream_workspace.zig").Scope = null,
         launch_route: ?@import("../../execution/runtime_observation.zig").CudaDecoderWorkspace.Route = null,
@@ -4285,7 +4284,6 @@ pub const CudaCompute = struct {
         claimed = true;
         return .{
             .compute = self,
-            .future_tokens = future_tokens,
             .head_destination = head_destination,
             .capture_scope = capture_scope,
         };
@@ -46815,7 +46813,7 @@ test "CUDA bounded decoder drains a failed receipt transfer before returning" {
     owner.metadata = .{ .ptr = 0x1000, .len = layout.metadata_bytes };
     owner.progress = 2;
     owner.next_positions[0 .. rows * 3].* = @splat(7);
-    var claim = CudaCompute.BoundedDecodeClaim{ .compute = &compute, .future_tokens = 16, .head_destination = null };
+    var claim = CudaCompute.BoundedDecodeClaim{ .compute = &compute, .head_destination = null };
     var burst: CudaCompute.LightOnTokenBurst = undefined;
     burst.drained = false;
     var first: [rows]u32 = @splat(11);
@@ -46888,7 +46886,7 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
     const head_destination = try owner.bindExecutionStorage();
     try std.testing.expect(owner.mutex.tryLock());
     owner.active = true;
-    var claim = CudaCompute.BoundedDecodeClaim{ .compute = &compute, .future_tokens = 0, .head_destination = head_destination };
+    var claim = CudaCompute.BoundedDecodeClaim{ .compute = &compute, .head_destination = head_destination };
     defer claim.deinit();
     const copied_before = compute.stats.d2d_bytes;
     const launched_before = compute.stats.launch_embedding;
