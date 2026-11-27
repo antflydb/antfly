@@ -1306,10 +1306,13 @@ requests across all four arms with advancing cache positions 5–20.
 | Fused, positions 13–20 | 8 | 55.74 | 63.33 |
 | Serial, positions 13–20 | 8 | 22.15 | 23.57 |
 
-The released run used a 20 ms collection window, versus the 200 µs production
-broker control. It verifies advancing shapes and correctness. Qualification
-at the production window still needs to account for whether both requests
-actually coalesced at each position.
+That released run used a 20 ms collection window. Four repeats at the
+200 µs production window on `961bcaa6c3` verified physical coalescing
+and exact greedy-token parity for every measured pair. Across the four
+repeats, the direct arm medians ranged from 17.43 to 18.90 ms and the
+fused arm medians ranged from 14.17 to 14.79 ms. Metal therefore uses
+the production collection window by default and treats an explicit
+zero window as a direct-execution control.
 
 ### Issue closure audit
 

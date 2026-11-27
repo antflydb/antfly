@@ -465,12 +465,12 @@ fn runMode(comptime placement: OutputPlacement, broker: *micro.Broker, allocator
         if (!try borrowed.yieldExecution() and borrowed.lease != null) return error.MissingRunRequest;
     };
     const ticket = Ticket{ .session = session, .permit = permit, .gate = gate, .inputs = inputs, .control = control, .rows = if (inputs.len != 0 and inputs[0].shape.len != 0 and inputs[0].shape[0] > 0) @intCast(inputs[0].shape[0]) else 1, .stage = stage };
-    // CPU packing has no device-transfer savings. On Metal, batching helps
-    // repeated shapes but loses on released T5 with advancing cache lengths.
-    // Keep both providers on direct resident execution unless collection is
-    // explicitly enabled.
-    const serial_stage = stage != null and (wait_us orelse 0) == 0 and
-        (session.backend() == .native or session.backend() == .metal);
+    // CPU packing has no device-transfer savings. An explicit zero
+    // collection window also bypasses the broker for cached Metal stages.
+    const serial_stage = stage != null and if (session.backend() == .native)
+        (wait_us orelse 0) == 0
+    else
+        session.backend() == .metal and wait_us == 0;
     if (serial_stage or !(if (stage) |mixed| eligibleStage(session, inputs, mixed) else eligible(session, inputs)))
         return directMode(placement, allocator, ticket);
     const alloc = std.heap.smp_allocator;
@@ -869,10 +869,12 @@ fn gatherStageInputs(first: *const Ticket, items: []const micro.ExecuteItem, ten
         };
         if (!gathered_columns) for (values, 0..) |destination, column| if (destination == .resident) {
             const width = try denseBytes(destination.resident.shape[1..], 1);
-            if (kernels.gatherDeviceRows) |gather| {
+            if (backend.kind() == .metal) {
+                const gather = kernels.gatherDeviceColumns orelse return error.ResidentGatherUnavailable;
                 var sources: [8]ops.CT = undefined;
-                for (items, sources[0..items.len]) |item, *source| source.* = item.payloadAs(Ticket).stage.?[column].resident.value;
-                try gather(backend.ptr, destination.resident.value, sources[0..items.len]);
+                const inputs = sources[0..items.len];
+                for (items, inputs) |item, *source| source.* = item.payloadAs(Ticket).stage.?[column].resident.value;
+                if (!try gather(backend.ptr, &.{.{ .output = destination.resident.value, .sources = inputs }})) return error.ResidentGatherUnavailable;
             } else {
                 const target = if (backend.kind() == .native)
                     (kernels.pooledOutputStorage.?(backend.ptr, destination.resident.value) orelse return error.ResidentGatherUnavailable).tensor
@@ -2471,7 +2473,7 @@ test "tensor microbatch released T5-small fuses suffixes after encoder retiremen
     const Runtime = @import("../execution/seq2seq_runtime.zig");
     const control: Control = .{ .native_call_policy = .in_process };
     const DispatchContext = struct { broker: *micro.Broker, gate: std.atomic.Mutex = .unlocked, wait_us: ?u64 = 20_000 };
-    var dispatch_context: DispatchContext = .{ .broker = &broker };
+    var dispatch_context: DispatchContext = .{ .broker = &broker, .wait_us = if (kind == .metal) null else 20_000 };
     const Peer = struct {
         state: Runtime.State,
         token: i64,
@@ -2565,9 +2567,9 @@ test "tensor microbatch released T5-small fuses suffixes after encoder retiremen
     try std.testing.expectEqual(@as(u64, peers.len), report.native_items);
 
     if (!platform.env.getenvBool("ANTFLY_ONNX_T5_BENCH_ABBA") and (kind == .native or kind == .metal)) {
-        // Exercise the production unset policy through the same dispatcher.
-        // Advancing the detached state must skip the broker entirely.
-        dispatch_context.wait_us = null;
+        // Advancing the detached state through the serial control must
+        // skip the broker entirely.
+        dispatch_context.wait_us = if (kind == .metal) 0 else null;
         for (&peers) |*peer| {
             const row = try Peer.step(&peer.state, 5, peer.token, &dispatch_context);
             defer shared_allocator.free(row);

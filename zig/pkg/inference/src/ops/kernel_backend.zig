@@ -149,8 +149,6 @@ pub const VTable = struct {
     /// Pack unrelated columns in one submission. False declines before
     /// submission. Callers keep every referenced tensor through completion.
     gatherDeviceColumns: ?*const fn (ctx: *anyopaque, columns: []const DeviceRowColumn) anyerror!bool = null,
-    /// Pack whole dense device tensors into an already admitted destination.
-    gatherDeviceRows: ?*const fn (ctx: *anyopaque, output: CT, sources: []const CT) anyerror!void = null,
     /// Borrow the exact physical bank kept alive by retainImmutableTensor.
     /// A live view prevents the frame from reusing this bank.
     pooledOutputStorage: ?*const fn (ctx: *anyopaque, tensor: CT) ?*const physical_storage.Lease = null,
