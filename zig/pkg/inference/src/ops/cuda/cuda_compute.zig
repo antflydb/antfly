@@ -22246,8 +22246,7 @@ const SourceLinearTemporary = struct {
     }
     fn span(self: *const @This(), region: buffer_mod.ByteSpan) buffer_mod.DeviceBuffer {
         if (region.bytes == 0) return .{};
-        std.debug.assert(region.offset <= self.bank.len and region.bytes <= self.bank.len - region.offset);
-        return .{ .ptr = self.bank.ptr + region.offset, .len = region.bytes, .borrowed = true };
+        return self.bank.borrowRange(region.offset, region.bytes) catch unreachable;
     }
     fn deinit(value: *@This(), self: *CudaCompute) void {
         switch (value.kind) {
@@ -26908,7 +26907,7 @@ const ProjectionArgmaxScratch = struct {
                 self.noteDeviceBytes(layout.bytes);
             }
             if (owner.len == layout.bytes and owner.ptr != 0) {
-                var scratch = bind(owner.*, layout);
+                var scratch = try bind(owner.*, layout);
                 scratch.bank = .{}; // The request retires this address after its graph execs.
                 return scratch;
             }
@@ -26925,24 +26924,19 @@ const ProjectionArgmaxScratch = struct {
         }
         var bank = try allocDeviceBuffer(self, layout.bytes);
         errdefer releaseDeviceBuffer(self, &bank);
-        const scratch = bind(bank, layout);
+        const scratch = try bind(bank, layout);
         if (suppressed.len != 0) try copyFromHostTracked(self, scratch.suppression, std.mem.sliceAsBytes(suppressed));
         return scratch;
     }
 
-    fn bind(bank: buffer_mod.DeviceBuffer, layout: Layout) ProjectionArgmaxScratch {
+    fn bind(bank: buffer_mod.DeviceBuffer, layout: Layout) !ProjectionArgmaxScratch {
         return .{
             .bank = bank,
-            .partial_values = span(bank, layout.packed_bytes, layout.partial_bytes),
-            .partial_indices = span(bank, layout.indices_offset, layout.partial_bytes),
-            .quantized_input = span(bank, 0, layout.packed_bytes),
-            .suppression = span(bank, layout.suppression_offset, layout.suppression_bytes),
+            .partial_values = try bank.borrowRange(layout.packed_bytes, layout.partial_bytes),
+            .partial_indices = try bank.borrowRange(layout.indices_offset, layout.partial_bytes),
+            .quantized_input = if (layout.packed_bytes != 0) try bank.borrowRange(0, layout.packed_bytes) else .{},
+            .suppression = if (layout.suppression_bytes != 0) try bank.borrowRange(layout.suppression_offset, layout.suppression_bytes) else .{},
         };
-    }
-
-    fn span(bank: buffer_mod.DeviceBuffer, offset: usize, bytes: usize) buffer_mod.DeviceBuffer {
-        if (bytes == 0) return .{};
-        return .{ .ptr = bank.ptr + offset, .len = bytes, .borrowed = true };
     }
 
     fn deinit(scratch: *ProjectionArgmaxScratch, self: *CudaCompute) void {
