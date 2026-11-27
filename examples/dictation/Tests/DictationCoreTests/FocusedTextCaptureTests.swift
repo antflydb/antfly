@@ -47,3 +47,25 @@ struct FocusedTextCaptureTests {
     #expect(try lookup.resolve(1).get() != lookup.resolve(4).get())
   }
 }
+
+extension FocusedTextCaptureTests {
+  @Test func delayedCaptureCannotRetargetAnotherFieldInTheSameWindow() {
+    let lookup = resolver(editable: [1, 2])
+    if case .failure(.focusChanged) = lookup.resolve(original: 1, current: 2) {
+    } else {
+      Issue.record("Delayed capture chose a different editor")
+    }
+    let warming = resolver(editable: [2])
+    if case .success = warming.resolve(original: 1, current: 2) {
+      Issue.record("Unresolved original focus was replaced by a new editor")
+    }
+  }
+  @Test func anchoredCaptureAllowsOnlyDescendantsOfTheOriginalEditor() throws {
+    let lookup = resolver(editable: [3, 5], links: [1: 3, 2: 3, 4: 5])
+    #expect(try lookup.resolve(original: 1, current: 2).get() == 3)
+    if case .failure(.focusChanged) = lookup.resolve(original: 1, current: 4) {
+    } else {
+      Issue.record("Another editor was accepted during capture")
+    }
+  }
+}

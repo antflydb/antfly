@@ -763,9 +763,11 @@ and older known canonical Whisper identifiers retain compatibility.
 ### History storage and browser editors
 
 Enabling and saving history retention automatically checks/creates the selected
-Antfly table, including before the first dictation. Uploads also prepare their
-original destination and repair a subsequently removed table once. Setup is
-shared between uploads; authentication and service failures preserve local
+Antfly table, including before the first dictation. Uploads write directly to
+their original destination, so an existing table needs only write permission.
+A missing-table response triggers shared preparation and one upload retry.
+Canceling setup removes that caller; when its last caller leaves, the underlying
+request is canceled too. Authentication and service failures preserve local
 history and pending uploads rather than being treated as a missing table.
 Disabling retention never creates storage or enables new uploads. External
 servers must grant the configured credential permission to create a missing table.
@@ -775,9 +777,11 @@ not whether the entry was saved. Local retention and server-sync status are show
 separately. Dictation still works while optional server history is unavailable.
 
 For Chrome and other rich web editors, click inside the message body before using
-the global shortcut. Field capture requests the application’s accessibility tree
-and briefly retries while it becomes available. It follows only the focused
-element’s advertised editor chain, never searches a page for an arbitrary field.
+the global shortcut. Foreground activation warms the application’s accessibility
+tree with bounded background requests. Field capture snapshots the original focused element at shortcut time. Background retries
+resolve only that element’s advertised editor chain; they cannot choose a newly
+focused field. A slow or unavailable initial snapshot fails safely to copy.
+Capture never searches a page for an arbitrary field.
 Secure/disabled fields, changed focus, and unresponsive accessibility providers
 keep the result available to copy; automatic Enter still requires confirmed paste.
 A test inside Antfly Dictation does not capture an external editor.

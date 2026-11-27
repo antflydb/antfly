@@ -55,6 +55,7 @@ import Security
 
 @MainActor final class Hotkey: ShortcutManaging {
   private let resources = HotkeyResources()
+  private let accessibilityWarmup = BrowserAccessibilityWarmup()
   var changed: ((Bool) -> Void)?
   var interrupted: (() -> Void)?
   private var suspended = false
@@ -85,6 +86,7 @@ import Security
       }, events.count, &events, Unmanaged.passUnretained(self).toOpaque(), &resources.handler)
   }
   func unregister() {
+    accessibilityWarmup.stop()
     binding = nil
     bindingVersion = UUID()
     pressed = false
@@ -147,6 +149,7 @@ import Security
     }
     bindingVersion = version
     binding = shortcut
+    accessibilityWarmup.start()
     pressed = false
   }
 }
@@ -370,6 +373,7 @@ final class CaptureConverter: @unchecked Sendable {
   let bundleID: String
   let element: AXUIElement?
   private var pendingCapture: Task<CapturedTextElement, Never>?
+  private var captureFailure: TextCaptureFailure?
   init(pid: pid_t, bundleID: String, element: AXUIElement?) {
     self.pid = pid
     self.bundleID = bundleID
@@ -381,8 +385,12 @@ final class CaptureConverter: @unchecked Sendable {
     else { return nil }
     let pid = app.processIdentifier
     var target = InsertionTarget(pid: pid, bundleID: app.bundleIdentifier ?? "", element: nil)
-    target.pendingCapture = Task.detached(priority: .userInitiated) {
-      await captureTextElement(pid: pid)
+    if let anchor = snapshotTextFocus(pid: pid) {
+      target.pendingCapture = Task.detached(priority: .userInitiated) {
+        await captureTextElement(pid: pid, anchor: anchor)
+      }
+    } else {
+      target.captureFailure = AXIsProcessTrusted() ? .unsupported : .permission
     }
     return target
   }
@@ -403,7 +411,7 @@ final class CaptureConverter: @unchecked Sendable {
     try validate()
     try validateFrontmost()
     guard let element = captured?.element ?? element else {
-      throw captured?.failure ?? TextCaptureFailure.unsupported
+      throw captured?.failure ?? captureFailure ?? TextCaptureFailure.unsupported
     }
     let probe = InsertionAccessibility(pid: pid, element: element)
     var context: InsertionAccessibility.Context?

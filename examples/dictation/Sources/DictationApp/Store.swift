@@ -1846,6 +1846,10 @@ struct PreparedModelSetup: Sendable {
         try await historyStorage.prepare(
           HistoryDestination(server: snapshot.effectiveServer, table: snapshot.table),
           client: client)
+      } catch let failure as ServerFailure where failure.status == 403 {
+        // Write-only credentials can upload to existing tables. The outbox
+        // reports a permission failure only if a real write needs provisioning.
+        return
       } catch {
         guard !Task.isCancelled, historyEpoch == epoch, config.retainHistory else { return }
         historySyncStatus =

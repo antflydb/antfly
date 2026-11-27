@@ -954,6 +954,7 @@ extension ClientTests {
     let entry = HistoryEntry(
       preset: "Test", model: "test", application: "", raw: "test", text: "test", status: "ready")
     let connection = try client()
+    try await storage.prepare(destination, client: connection)
     try await storage.upload(entry, destination: destination, client: connection)
     try await storage.upload(entry, destination: destination, client: connection)
     #expect(
@@ -1016,7 +1017,134 @@ extension ClientTests {
       Issue.record("Persistent upload failure must remain pending")
     } catch let error as ServerFailure { #expect(error.status == 404) }
     #expect(trace.requests.filter { $0.hasSuffix("/batch") }.count == 2)
-    #expect(trace.requests.filter { $0 == "GET /db/v1/tables/dictation" }.count == 3)
+    #expect(trace.requests.filter { $0 == "GET /db/v1/tables/dictation" }.count == 2)
     #expect(!trace.requests.contains("POST /db/v1/tables/dictation"))
+  }
+}
+
+extension ClientTests {
+  @Test func existingHistoryTableNeedsOnlyWritePermission() async throws {
+    let trace = HistoryRequestTrace()
+    FixtureProtocol.reply = { request in
+      _ = trace.record(request)
+      if request.httpMethod == "GET" { return (403, "application/json", "{}") }
+      return (200, "application/json", "{}")
+    }
+    let destination = HistoryDestination(server: "https://antfly.example", table: "dictation")
+    let entry = HistoryEntry(
+      preset: "Test", model: "test", application: "", raw: "test", text: "test", status: "ready")
+    try await HistoryStorage().upload(entry, destination: destination, client: client())
+    #expect(trace.requests == ["POST /db/v1/tables/dictation/batch"])
+  }
+}
+
+private final class HistoryPreparationGate: @unchecked Sendable {
+  let started = AssetRequestSignal()
+  let stopped = AssetRequestSignal()
+  let trace = HistoryRequestTrace()
+  private let lock = NSLock()
+  private var held: PendingHistoryProtocol?
+  func start(_ request: PendingHistoryProtocol) {
+    _ = trace.record(request.request)
+    if request.request.httpMethod == "GET" {
+      lock.withLock { held = request }
+      Task { await started.send() }
+    } else {
+      request.respond(status: 201)
+    }
+  }
+  func stop() {
+    lock.withLock { held = nil }
+    Task { await stopped.send() }
+  }
+  func release() {
+    let request = lock.withLock {
+      let value = held
+      held = nil
+      return value
+    }
+    request?.respond(status: 404)
+  }
+}
+private final class PendingHistoryProtocol: URLProtocol, @unchecked Sendable {
+  nonisolated(unsafe) static var current = HistoryPreparationGate()
+  private let gate = PendingHistoryProtocol.current
+  override class func canInit(with request: URLRequest) -> Bool { true }
+  override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+  override func startLoading() { gate.start(self) }
+  override func stopLoading() { gate.stop() }
+  func respond(status: Int) {
+    let response = HTTPURLResponse(
+      url: request.url!, statusCode: status,
+      httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
+    client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+    client?.urlProtocol(self, didLoad: Data("{}".utf8))
+    client?.urlProtocolDidFinishLoading(self)
+  }
+}
+extension ClientTests {
+  private func pendingHistoryClient(_ gate: HistoryPreparationGate) throws -> AntflyClient {
+    PendingHistoryProtocol.current = gate
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [PendingHistoryProtocol.self]
+    return try AntflyClient(
+      server: "https://antfly.example", session: URLSession(configuration: configuration))
+  }
+
+  @Test(.timeLimit(.minutes(1))) func lastPreparationWaiterCancelsUnderlyingRequest() async throws {
+    let gate = HistoryPreparationGate()
+    let connection = try pendingHistoryClient(gate)
+    let storage = HistoryStorage()
+    let destination = HistoryDestination(server: "https://antfly.example", table: "old")
+    let pending = Task { try await storage.prepare(destination, client: connection) }
+    await gate.started.wait()
+    pending.cancel()
+    await #expect(throws: CancellationError.self) { try await pending.value }
+    await gate.stopped.wait()
+    #expect(await storage.pendingWaiterCount(for: destination) == 0)
+    #expect(gate.trace.requests == ["GET /db/v1/tables/old"])
+  }
+
+  @Test(.timeLimit(.minutes(1))) func cancelingOneWaiterPreservesSharedPreparation() async throws {
+    let gate = HistoryPreparationGate()
+    let connection = try pendingHistoryClient(gate)
+    let storage = HistoryStorage()
+    let destination = HistoryDestination(server: "https://antfly.example", table: "dictation")
+    let first = Task { try await storage.prepare(destination, client: connection) }
+    await gate.started.wait()
+    let second = Task { try await storage.prepare(destination, client: connection) }
+    let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+    while await storage.pendingWaiterCount(for: destination) < 2, ContinuousClock.now < deadline {
+      await Task.yield()
+    }
+    #expect(await storage.pendingWaiterCount(for: destination) == 2)
+    first.cancel()
+    await #expect(throws: CancellationError.self) { try await first.value }
+    #expect(await storage.pendingWaiterCount(for: destination) == 1)
+    gate.release()
+    try await second.value
+    #expect(gate.trace.requests == ["GET /db/v1/tables/dictation", "POST /db/v1/tables/dictation"])
+  }
+
+  @Test(.timeLimit(.minutes(1))) func cancelAllPreparationsResumesWaitersAndAllowsRetry()
+    async throws
+  {
+    let gate = HistoryPreparationGate()
+    let connection = try pendingHistoryClient(gate)
+    let storage = HistoryStorage()
+    let destination = HistoryDestination(server: "https://antfly.example", table: "dictation")
+    let first = Task { try await storage.prepare(destination, client: connection) }
+    await gate.started.wait()
+    await storage.cancelPreparations()
+    await #expect(throws: CancellationError.self) { try await first.value }
+    await gate.stopped.wait()
+    let replacementGate = HistoryPreparationGate()
+    let replacementClient = try pendingHistoryClient(replacementGate)
+    let replacement = Task { try await storage.prepare(destination, client: replacementClient) }
+    await replacementGate.started.wait()
+    replacementGate.release()
+    try await replacement.value
+    #expect(gate.trace.requests == ["GET /db/v1/tables/dictation"])
+    #expect(replacementGate.trace.requests.count == 2)
   }
 }

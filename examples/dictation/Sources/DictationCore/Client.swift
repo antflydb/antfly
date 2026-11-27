@@ -472,6 +472,7 @@ public actor AntflyClient {
     }
   }
   public func setup(table: String) async throws {
+    try Task.checkCancellation()
     // Never turn auth, connectivity, or schema failures into create requests.
     do {
       _ = try await json("db/v1/tables/\(table)", method: "GET")
@@ -479,6 +480,7 @@ public actor AntflyClient {
     } catch let failure as ServerFailure where failure.status == 404 {
       // A genuinely missing table is provisioned below.
     }
+    try Task.checkCancellation()
     do {
       _ = try await json(
         "db/v1/tables/\(table)", method: "POST",
