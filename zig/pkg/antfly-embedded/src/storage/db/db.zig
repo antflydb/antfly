@@ -109371,6 +109371,132 @@ test "db artifact seed field mappings can leave missing outputs pending" {
     try std.testing.expectEqual(@as(usize, 0), fake.generator_calls);
 }
 
+test "db artifact partial extraction seeds record their pages and defer extraction" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var fake = TestAssetProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a", .asset_producer = fake.producer() } });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "extracted", .kind = .asset, .field = "url", .content_type = "application/json", .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}" });
+    const partial_key = try @import("artifact_seed_chunks.zig").partialExtractionKeyAlloc(alloc, "doc:a", "extracted");
+    defer alloc.free(partial_key);
+
+    // Page 2 of a document is seeded; the producer extracts the rest on
+    // replay (PDF extraction itself is not compiled into unit tests).
+    const partial =
+        \\{"url":"gs://bucket/report.pdf","_artifacts":{"extracted":{"value":{"partial":true,"units":[{"text":"Seeded second page.","page_number":2,"page_label":"ii"}]}}}}
+    ;
+    const report = (try db.batchReportingSeeds(alloc, .{ .writes = &.{.{ .key = "doc:a", .value = partial }}, .sync_level = .write })).?;
+    defer alloc.free(report);
+    try std.testing.expect(std.mem.indexOf(u8, report, "\"name\":\"extracted\",\"outcome\":\"accepted\"") != null);
+    {
+        const record = (try db.core.getStoreValue(alloc, partial_key)).?;
+        defer alloc.free(record);
+        const seed = @import("artifact_seed_chunks.zig").partialExtractionSeed(record, "gs://bucket/report.pdf", "{}").?;
+        try std.testing.expect(std.mem.indexOf(u8, seed, "Seeded second page.") != null);
+        try std.testing.expect(@import("artifact_seed_chunks.zig").partialExtractionSeed(record, "gs://bucket/other.pdf", "{}") == null);
+    }
+    // Nothing was extracted in the write.
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    // Leader preparation carries the record to replicas.
+    {
+        const req: types.BatchRequest = .{ .writes = &.{.{ .key = "doc:d", .value = "{\"url\":\"gs://bucket/d.pdf\",\"_artifacts\":{\"extracted\":{\"value\":{\"partial\":true,\"units\":[{\"text\":\"d1\",\"page_number\":1}]}}}}" }}, .sync_level = .write };
+        const packet = try db.prepareSeedEnrichments(alloc, req);
+        defer alloc.free(packet);
+        var prepared = req;
+        prepared.prepared_enrichments_json = packet;
+        try db.batch(prepared);
+        const d_key = try @import("artifact_seed_chunks.zig").partialExtractionKeyAlloc(alloc, "doc:d", "extracted");
+        defer alloc.free(d_key);
+        const record = (try db.core.getStoreValue(alloc, d_key)).?;
+        alloc.free(record);
+    }
+
+    // Unit chunks of pages not yet extracted cannot bind in that write.
+    try db.addEnrichment(.{ .name = "passages", .kind = .chunk, .field = "text", .source_artifact_name = "extracted", .chunk_size = 64 });
+    if (db.batch(.{ .writes = &.{.{ .key = "doc:b", .value =
+        \\{"url":"gs://bucket/b.pdf","_artifacts":{"extracted":{"value":{"partial":true,"units":[{"text":"p1","page_number":1}]}}},
+        \\ "_chunks":{"passages":[{"_chunk_id":0,"_content":"p1","_start_char":0,"_end_char":2,"_parent_unit_id":"page:000001"}]}}
+    }}, .sync_level = .write })) |_| return error.TestUnexpectedResult else |err| try std.testing.expect(err == error.ArtifactSeedNotAccepted);
+
+    // A complete seed replaces the partial one.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value =
+        \\{"url":"gs://bucket/report.pdf","_artifacts":{"extracted":{"value":{"units":[{"text":"Whole page one.","page_number":1},{"text":"Whole page two.","page_number":2}]}}}}
+    }}, .sync_level = .write });
+    try std.testing.expect((try db.core.getStoreValue(alloc, partial_key)) == null);
+
+    // Partial seeds name pages, each at most once.
+    for ([_][]const u8{
+        "{\"url\":\"x\",\"_artifacts\":{\"extracted\":{\"value\":{\"partial\":true,\"units\":[{\"text\":\"no page\"}]}}}}",
+        "{\"url\":\"x\",\"_artifacts\":{\"extracted\":{\"value\":{\"partial\":true,\"units\":[{\"text\":\"a\",\"page_number\":1},{\"text\":\"b\",\"page_number\":1}]}}}}",
+        "{\"url\":\"x\",\"_artifacts\":{\"extracted\":{\"value\":{\"partial\":\"yes\",\"units\":[{\"text\":\"a\",\"page_number\":1}]}}}}",
+    }) |bad| {
+        if (db.batch(.{ .writes = &.{.{ .key = "doc:c", .value = bad }}, .sync_level = .write })) |_| return error.TestUnexpectedResult else |_| {}
+    }
+}
+
+test "db artifact partial extraction pages replace the producer's own pages as units stream" {
+    const alloc = std.testing.allocator;
+    const extraction = @import("enrichment/document_extraction.zig");
+    const Collect = struct {
+        texts: std.ArrayListUnmanaged([]u8) = .empty,
+        offsets: std.ArrayListUnmanaged([2]u32) = .empty,
+        methods: std.ArrayListUnmanaged([]u8) = .empty,
+        fn begin(_: *anyopaque, _: extraction.StreamInfo) anyerror!void {}
+        fn unit(ptr: *anyopaque, value: *extraction.Unit) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.texts.append(std.testing.allocator, try std.testing.allocator.dupe(u8, value.text));
+            try self.methods.append(std.testing.allocator, try std.testing.allocator.dupe(u8, value.method));
+            try self.offsets.append(std.testing.allocator, .{ value.char_start.?, value.char_end.? });
+            if (value.extraction_status != null) return error.TestUnexpectedResult;
+            value.deinit(std.testing.allocator);
+        }
+        fn end(_: *anyopaque) anyerror!void {}
+    };
+    var collected = Collect{};
+    defer {
+        for (collected.texts.items, collected.methods.items) |text, method| {
+            alloc.free(text);
+            alloc.free(method);
+        }
+        collected.texts.deinit(alloc);
+        collected.methods.deinit(alloc);
+        collected.offsets.deinit(alloc);
+    }
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"partial":true,"units":[{"text":"Seeded two.","page_number":2}]}
+    , .{});
+    defer parsed.deinit();
+    const seeds_mod = @import("artifact_seeds.zig");
+    const pages = try seeds_mod.decodeExtractionUnitsAlloc(alloc, parsed.value);
+    defer seeds_mod.freeExtractionUnits(alloc, pages);
+    var overlay = @import("enrichment/seeded_extraction_units.zig").SeededPagesSink{ .alloc = alloc, .pages = pages, .inner = .{ .ptr = &collected, .on_begin = Collect.begin, .on_unit = Collect.unit, .on_end = Collect.end } };
+    const sink = overlay.sink();
+    try sink.on_begin(sink.ptr, .{ .content_type = "application/pdf", .route_type = "pdf" });
+    for ([_][]const u8{ "native one", "", "native three" }, 1..) |text, page| {
+        // Page 2 is a scanned page awaiting OCR natively.
+        var unit = extraction.Unit{
+            .unit_id = try std.fmt.allocPrint(alloc, "page:{d:0>6}", .{page}),
+            .unit_type = try alloc.dupe(u8, "page"),
+            .text = try alloc.dupe(u8, text),
+            .method = try alloc.dupe(u8, if (page == 2) "pdf_ocr_pending" else "pdf_text"),
+            .extraction_status = if (page == 2) try alloc.dupe(u8, "pending_ocr") else null,
+            .page_number = @intCast(page),
+        };
+        try sink.on_unit(sink.ptr, &unit);
+    }
+    try sink.on_end(sink.ptr);
+    try std.testing.expectEqual(@as(usize, 1), overlay.replaced);
+    try std.testing.expectEqualStrings("Seeded two.", collected.texts.items[1]);
+    try std.testing.expectEqualStrings("seeded", collected.methods.items[1]);
+    // Offsets run over the combined text.
+    try std.testing.expectEqual([2]u32{ 10, 21 }, collected.offsets.items[1]);
+    try std.testing.expectEqual([2]u32{ 21, 33 }, collected.offsets.items[2]);
+}
+
 test "db artifact seeds accept extracted text for document extraction without fetching or OCR" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");

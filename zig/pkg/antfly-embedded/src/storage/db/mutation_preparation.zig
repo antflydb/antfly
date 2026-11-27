@@ -1196,6 +1196,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     try metadata.put(a, try seed_records.keyAlloc(a, producer.doc_key, name), {});
                     try metadata.put(a, try seed_records.unitKeyAlloc(a, producer.doc_key, name), {});
                     try metadata.put(a, try seed_records.extractionKeyAlloc(a, producer.doc_key, name), {});
+                    try metadata.put(a, try seed_records.partialExtractionKeyAlloc(a, producer.doc_key, name), {});
                     try metadata.put(a, try seed_records.assetKeyAlloc(a, producer.doc_key, name), {});
                 }
                 if (producer.kind != .asset) continue;
@@ -1719,7 +1720,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                     for (unit_vector_results.keys()) |name| alloc.free(name);
                                     unit_vector_results.deinit(alloc);
                                 }
+                                var extraction_deferred = false;
                                 const extraction_seed: ?S.ExtractionSeed = if (seed) |entry| .{
+                                    .partial = artifact_seeds.extractionSeedPartial(entry.artifact.value),
+                                    .deferred = &extraction_deferred,
                                     .text = extraction_identity orelse try artifact_seeds.assetText(entry.artifact.value),
                                     .units = extraction_units,
                                     .chunk_seeds = if (row_seeds) |*seeds| seeds else null,
@@ -1754,6 +1758,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                 };
                                 if (extraction_seed != null) try appendSeedOutcome(alloc, &seed_outcomes, request, extraction_result);
                                 for (unit_vector_results.keys(), unit_vector_results.values()) |name, result| try appendSeedOutcomeNamed(alloc, &seed_outcomes, request.doc_key, name, result);
+                                // A partial extraction seed is extracted on replay.
+                                if (extraction_deferred) try appendGeneratedEnrichmentRef(alloc, &planned, request);
                             }
                         },
                         .chunk_text => {
@@ -2638,6 +2644,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const state_key = try S.assetStateKeyAlloc(alloc, request.doc_key, requestArtifactName(request));
                     errdefer alloc.free(state_key);
                     try artifact_delete_keys.append(alloc, state_key);
+                    // A dropped extraction also drops its seeded pages.
+                    const partial_key = try @import("artifact_seed_chunks.zig").partialExtractionKeyAlloc(alloc, request.doc_key, requestArtifactName(request));
+                    errdefer alloc.free(partial_key);
+                    try artifact_delete_keys.append(alloc, partial_key);
                 },
                 .dense_embedding => {
                     // Chunk-derived vectors regenerate in preparation instead.

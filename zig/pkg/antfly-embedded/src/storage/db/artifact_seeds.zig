@@ -1271,8 +1271,17 @@ fn validUnitType(text: []const u8) bool {
     return true;
 }
 
+/// A partial extraction seed (`{"units": [...], "partial": true}`) carries
+/// some pages; the producer extracts the rest.
+pub fn extractionSeedPartial(value: std.json.Value) bool {
+    if (value != .object) return false;
+    const flag = value.object.get("partial") orelse return false;
+    return flag == .bool and flag.bool;
+}
+
 /// Units of a document extraction seed. `{"text": ...}` (or a string) is the
 /// plain-text form and returns no units; `{"units": [...]}` is the rich form.
+/// A partial seed's units must all be pages, each page at most once.
 /// Strings borrow from `value`.
 pub fn decodeExtractionUnitsAlloc(alloc: Allocator, value: std.json.Value) ![]ExtractionUnit {
     if (value == .string) return &.{};
@@ -1281,7 +1290,9 @@ pub fn decodeExtractionUnitsAlloc(alloc: Allocator, value: std.json.Value) ![]Ex
         _ = try assetText(value);
         return &.{};
     }
-    if (value.object.count() != 1) return error.InvalidArtifactSeed;
+    const partial = extractionSeedPartial(value);
+    if (value.object.count() != @as(usize, if (value.object.get("partial") != null) 2 else 1)) return error.InvalidArtifactSeed;
+    if (value.object.get("partial")) |flag| if (flag != .bool) return error.InvalidArtifactSeed;
     const units_value = value.object.get("units") orelse return error.InvalidArtifactSeed;
     if (units_value != .array or units_value.array.items.len == 0 or units_value.array.items.len > max_extraction_units) return error.InvalidArtifactSeed;
     const out = try alloc.alloc(ExtractionUnit, units_value.array.items.len);
@@ -1388,6 +1399,14 @@ pub fn decodeExtractionUnitsAlloc(alloc: Allocator, value: std.json.Value) ![]Ex
         parsed.unit_type = unit_type orelse if (parsed.page_number != null) "page" else if (parsed.spans.len > 0) "transcript" else "document";
         unit.* = parsed;
         initialized += 1;
+    }
+    if (partial) {
+        // Pages stand in for the producer's own pages by number.
+        for (out, 0..) |unit, i| {
+            const page = unit.page_number orelse return error.InvalidArtifactSeed;
+            if (page == 0 or !std.mem.eql(u8, unit.unit_type, "page")) return error.InvalidArtifactSeed;
+            for (out[0..i]) |other| if (other.page_number.? == page) return error.InvalidArtifactSeed;
+        }
     }
     return out;
 }

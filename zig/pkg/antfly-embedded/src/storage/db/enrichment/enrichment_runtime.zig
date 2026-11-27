@@ -20378,6 +20378,22 @@ fn processDocumentExtractionAsset(
         }
     }
 
+    // Seeded pages of a partial extraction seed (#1791) stand in for the
+    // producer's own pages of this same source and configuration.
+    const partial_records = @import("../artifact_seed_chunks.zig");
+    const partial_key = try partial_records.partialExtractionKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
+    defer runtime.alloc.free(partial_key);
+    const partial_record = try storeGetOptionalAllocWithRetry(runtime, partial_key);
+    defer if (partial_record) |bytes| runtime.alloc.free(bytes);
+    var partial_parsed: ?std.json.Parsed(std.json.Value) = null;
+    defer if (partial_parsed) |*parsed| parsed.deinit();
+    var partial_pages: []@import("../artifact_seeds.zig").ExtractionUnit = &.{};
+    defer @import("../artifact_seeds.zig").freeExtractionUnits(runtime.alloc, partial_pages);
+    if (partial_records.partialExtractionSeed(partial_record, source_url, config_json)) |seed_json| {
+        partial_parsed = try std.json.parseFromSlice(std.json.Value, runtime.alloc, seed_json, .{ .parse_numbers = false });
+        partial_pages = try @import("../artifact_seeds.zig").decodeExtractionUnitsAlloc(runtime.alloc, partial_parsed.?.value);
+    }
+
     // Past this point the declared digest (if any) did not already prove
     // this extraction unnecessary: the source is about to be fetched for
     // real. Logged (not just counted) so a real run can confirm a provider
@@ -20682,7 +20698,9 @@ fn processDocumentExtractionAsset(
         .prepared_pdf_session = if (prepared_pdf_session) |*session| session else null,
     };
     defer collect_ctx.deinit();
-    var prepared_marking = document_extraction_mod.UnconfiguredGeneratedTextSink{ .alloc = document_extraction_alloc, .config = &extraction_config, .inner = collect_ctx.sink() };
+    var seeded_pages = @import("seeded_extraction_units.zig").SeededPagesSink{ .alloc = document_extraction_alloc, .pages = partial_pages, .inner = collect_ctx.sink() };
+    const unit_sink = if (partial_pages.len != 0) seeded_pages.sink() else collect_ctx.sink();
+    var prepared_marking = document_extraction_mod.UnconfiguredGeneratedTextSink{ .alloc = document_extraction_alloc, .config = &extraction_config, .inner = unit_sink };
     const extraction_result = if (prepared_pdf_session) |*session|
         document_extraction_mod.extractPreparedPdfStreamingWithTextCache(
             document_extraction_alloc,
@@ -20694,7 +20712,7 @@ fn processDocumentExtractionAsset(
             if (page_text_spool) |*spool| spool.cache() else null,
         )
     else
-        document_extraction_mod.extractDownloadedStreaming(document_extraction_alloc, downloaded.*, source_url, extraction_config, collect_ctx.sink());
+        document_extraction_mod.extractDownloadedStreaming(document_extraction_alloc, downloaded.*, source_url, extraction_config, unit_sink);
     // Publish the final short neutral-text segment before a later consumer
     // traverses this source. Errors abandon buffered rows via deinit instead.
     if (extraction_result) |_| {

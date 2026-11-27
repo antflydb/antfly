@@ -8578,6 +8578,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             source: ?artifact_seeds.Source = null,
             policy: artifact_seeds.ConflictPolicy = .keep,
             result: *artifact_seeds.Result,
+            /// Partial form: the seeded pages are recorded and the producer
+            /// extracts the document on replay, using them in place of its
+            /// own (`deferred` is set so the caller plans that replay).
+            partial: bool = false,
+            deferred: ?*bool = null,
         };
 
         /// Seeded vectors of one embedding over an extraction's unit chunks.
@@ -8724,43 +8729,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             for (units, out, 0..) |seed, *unit, index| {
                 const unit_id = try std.fmt.allocPrint(alloc, "{s}:{d:0>6}", .{ seed.unit_type, index + 1 });
-                errdefer alloc.free(unit_id);
-                const unit_type = try alloc.dupe(u8, seed.unit_type);
-                errdefer alloc.free(unit_type);
-                const text = try alloc.dupe(u8, seed.text);
-                errdefer alloc.free(text);
-                const method = try alloc.dupe(u8, "seeded");
-                errdefer alloc.free(method);
-                const page_label: ?[]u8 = if (seed.page_label) |label| try alloc.dupe(u8, label) else null;
-                errdefer if (page_label) |label| alloc.free(label);
-                const regions = try alloc.alloc(document_extraction_mod.TextRegion, seed.text_regions.len);
-                errdefer alloc.free(regions);
-                for (seed.text_regions, regions) |box, *slot| slot.* = .{ .span = box.span, .bbox = box.bbox, .font_size = box.font_size, .bold = box.bold, .italic = box.italic };
-                const blocks = try alloc.alloc(document_extraction_mod.TextBlock, seed.text_blocks.len);
-                errdefer alloc.free(blocks);
-                for (seed.text_blocks, blocks, 0..) |box, *slot, order| slot.* = .{ .span = box.span, .bbox = box.bbox, .reading_order = @intCast(order), .font_size = box.font_size, .bold = box.bold, .italic = box.italic };
-                const spans = try alloc.alloc(document_extraction_mod.TranscriptSpan, seed.spans.len);
-                for (seed.spans, spans) |span, *slot| slot.* = .{
-                    .char_start = span.char_start,
-                    .char_end = span.char_end,
-                    .start_ms = span.start_ms,
-                    .end_ms = span.end_ms,
-                    .speaker_index = span.speaker,
-                };
-                unit.* = .{
-                    .unit_id = unit_id,
-                    .unit_type = unit_type,
-                    .text = text,
-                    .method = method,
-                    .page_number = seed.page_number,
-                    .page_label = page_label,
-                    .page_bbox = seed.page_bbox,
-                    .page_rotation = seed.page_rotation,
-                    .transcript_used = spans.len > 0,
-                    .transcript_spans = spans,
-                    .text_regions = regions,
-                    .text_blocks = blocks,
-                };
+                defer alloc.free(unit_id);
+                unit.* = try @import("enrichment/seeded_extraction_units.zig").unitAlloc(alloc, seed, unit_id);
                 initialized += 1;
             }
             const content_type = try alloc.dupe(u8, "text/plain");
@@ -8924,6 +8894,34 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         seed.result.* = .{ .outcome = .replaced, .existing_origin = .generated };
                     };
                 }
+            }
+
+            if (extraction_seed) |seed| {
+                const partial_key = try artifact_seed_chunks.partialExtractionKeyAlloc(alloc, request.doc_key, artifact_name);
+                var partial_key_owned = true;
+                defer if (partial_key_owned) alloc.free(partial_key);
+                if (seed.partial) {
+                    // Chunks and vectors of pages the producer has not yet
+                    // extracted cannot bind in this write.
+                    if (has_unit_chunk_seeds) return error.ArtifactSeedNotAccepted;
+                    const record = try artifact_seed_chunks.encodePartialExtractionAlloc(alloc, source_url, config_json, seed.text);
+                    defer alloc.free(record);
+                    try appendPreparedArtifactCopy(alloc, artifact_writes, partial_key, record);
+                    // The full-seed binding and the producer state no longer
+                    // describe the output: the producer runs on replay.
+                    const binding_key = try artifact_seed_chunks.extractionKeyAlloc(alloc, request.doc_key, artifact_name);
+                    errdefer alloc.free(binding_key);
+                    try artifact_delete_keys.append(alloc, binding_key);
+                    const partial_state_key = try alloc.dupe(u8, state_key);
+                    errdefer alloc.free(partial_state_key);
+                    try artifact_delete_keys.append(alloc, partial_state_key);
+                    seed.result.* = .{ .outcome = .accepted };
+                    if (seed.deferred) |flag| flag.* = true;
+                    return;
+                }
+                // A complete seed replaces any partial one.
+                try artifact_delete_keys.append(alloc, partial_key);
+                partial_key_owned = false;
             }
 
             const extraction_resource_manager = if (S.ownerField(db, "enrichment_runtime").*) |runtime|

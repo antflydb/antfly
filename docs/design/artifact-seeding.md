@@ -358,6 +358,24 @@ ordinary manifest, unit and child materialization with no fetch, decode, OCR
 or transcription; the canonical seed value is the input identity, so a
 resumed import is `unchanged`.
 
+A partial seed, `{ "units": [...], "partial": true }`, carries some pages of
+the document: every unit is a page with its `page_number`, each page once.
+The write records them with the source URL and extraction configuration they
+were accepted for (`artifact_seed_chunks.partialExtractionKeyAlloc`), drops
+the full-seed binding and the producer state, reports `accepted` and plans
+the extraction for replay; it extracts nothing itself, which also keeps leader
+preparation inference-free. The producer then fetches and extracts the
+document and, as units stream out of the extractor, replaces each seeded page
+with the seeded unit under the producer's own unit id (`page:<number>`),
+rebasing character offsets over the combined text
+(`enrichment/seeded_extraction_units.zig` `SeededPagesSink`). Seeded pages
+carry no pending OCR or transcription status, so completion skips them: only
+the other pages are OCRed. The record stands until a complete seed or `null`
+replaces it, so later regenerations keep the seeded pages. Unit-scoped chunk
+and vector seeds cannot bind in a partial write (`ArtifactSeedNotAccepted`):
+the units they name do not exist yet. Pages the source does not have are
+ignored.
+
 Chunks of an extraction's chunk consumers are unit-scoped: each names its
 unit (`_parent_unit_id`) and may carry its speaker (`_speaker`). They are
 accepted by the extraction seeded in the same write, must name one of its
@@ -572,9 +590,10 @@ subsystem features of their own:
   enrichment-level sync levels, and for seeds that come only from field
   mappings (the leader would need the table's mapping catalog before
   proposing). A cross-shard 2PC seed transform test.
-- Generating only the missing pages of a partial extraction seed: the
-  document extraction pipeline processes whole documents and has no page
-  selection to merge with seeded units.
+- Partial extraction seeds: an end-to-end test with a real PDF (PDF reading
+  is compiled out of the DB unit tests; the overlay and the write path are
+  tested separately), and the OCR prefetch path, which still renders seeded
+  pages before the overlay discards them.
 - Vector seeds for seeded chunk collections above 4,095 chunks; unit-scoped
   (extraction) chunk inventories above that bound. Origin counts on the
   distributed server's HTTP status (embedded and Lite have them).

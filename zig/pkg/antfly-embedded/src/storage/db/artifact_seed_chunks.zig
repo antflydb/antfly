@@ -113,6 +113,38 @@ pub fn chunksForInputAlloc(comptime chunker: type, alloc: Allocator, record: ?[]
     return try chunksFromFieldsAlloc(chunker, alloc, fields);
 }
 
+const partial_magic = "antfly-partial-extraction-v1\x00";
+const partial_record_name_prefix = "\x00partial-extraction\x00";
+
+/// Seeded pages of a partial document extraction, bound to the source URL and
+/// extraction configuration they were accepted for. The extraction producer
+/// extracts the document and uses these pages in place of its own.
+pub fn partialExtractionKeyAlloc(alloc: Allocator, doc_key: []const u8, extraction_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try internal_keys.appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, internal_keys.asset_state_kind);
+    const name = try std.mem.concat(alloc, u8, &.{ partial_record_name_prefix, extraction_name });
+    defer alloc.free(name);
+    try internal_keys.appendEncodedComponent(&list, alloc, name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn encodePartialExtractionAlloc(alloc: Allocator, source_url: []const u8, config_json: []const u8, seed_json: []const u8) ![]u8 {
+    const digest = extractionSourceDigest(source_url, config_json);
+    return try std.mem.concat(alloc, u8, &.{ partial_magic, &digest, seed_json });
+}
+
+/// The canonical seed value when the record names exactly this source;
+/// borrows from `record`.
+pub fn partialExtractionSeed(record: ?[]const u8, source_url: []const u8, config_json: []const u8) ?[]const u8 {
+    const bytes = record orelse return null;
+    if (bytes.len <= partial_magic.len + 32 or !std.mem.eql(u8, bytes[0..partial_magic.len], partial_magic)) return null;
+    const expected = extractionSourceDigest(source_url, config_json);
+    if (!std.mem.eql(u8, bytes[partial_magic.len..][0..32], &expected)) return null;
+    return bytes[partial_magic.len + 32 ..];
+}
+
 const extraction_magic = "antfly-seeded-extraction-v1\x00";
 const extraction_record_name_prefix = "\x00seeded-extraction\x00";
 
