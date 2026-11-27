@@ -46633,7 +46633,20 @@ test "LightOnOCR3 CUDA fused FFN activation input preserves F32 outputs for inde
                 const input = try cb.fromFloat32Shape(values, &.{ @intCast(rows), @intCast(hidden) });
                 defer cb.free(input);
                 const request = ops.GatedFfnNoBiasRequest{ .input = input, .gate_weight = weights[0], .up_weight = weights[1], .down_weight = weights[2], .rows = rows, .hidden_size = hidden, .intermediate_size = intermediate, .activation = .silu };
-                const fused = (try cb.gatedFfnNoBias(&request)) orelse return error.UnsupportedOperation;
+                const fused = if (rows != 7)
+                    (try cb.gatedFfnNoBias(&request)) orelse return error.UnsupportedOperation
+                else observed: {
+                    const Workspace = @import("../../execution/stream_workspace.zig");
+                    var plan: Workspace.Plan = .{};
+                    var scope = Workspace.Scope.observe(&plan);
+                    compute.execution_scope = &scope;
+                    defer compute.execution_scope = null;
+                    const output = (try cb.gatedFfnNoBias(&request)) orelse return error.UnsupportedOperation;
+                    errdefer cb.free(output);
+                    try std.testing.expect(plan.finish(tensorFromCt(output).buffer.ptr));
+                    try std.testing.expectEqual(@as(usize, 1), plan.declared_operation_scratch_intervals);
+                    break :observed output;
+                };
                 defer cb.free(fused);
                 const gate = try cb.linearNoBias(input, weights[0], rows, hidden, intermediate);
                 defer cb.free(gate);
