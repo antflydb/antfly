@@ -154,9 +154,17 @@ pub const StorageLayout = struct {
 
     fn declareLayerWorkspace(self: *StorageLayout, bytes: usize) !Span {
         if (bytes == 0 or bytes > plan_mod.limit) return error.InvalidShape;
-        const offset = try aligned(self.counter.offset + self.counter.bytes);
+        const offset = try self.layerWorkspaceOffset();
         self.metadata_bytes = @max(self.metadata_bytes, try std.math.add(usize, offset, bytes));
         return .{ .offset = offset, .bytes = bytes };
+    }
+
+    pub fn layerWorkspaceBytes(self: StorageLayout) usize {
+        return self.metadata_bytes - (self.layerWorkspaceOffset() catch unreachable);
+    }
+
+    fn layerWorkspaceOffset(self: StorageLayout) !usize {
+        return aligned(try std.math.add(usize, self.counter.offset, self.counter.bytes));
     }
 
     fn aligned(bytes: usize) !usize {
@@ -776,6 +784,8 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
     try std.testing.expectEqual(base.metadata_bytes, attention.offset);
     try std.testing.expectEqual(attention.offset, recurrent.offset);
     try std.testing.expectEqual(base.metadata_bytes + @max(attention.bytes, recurrent.bytes), layout.metadata_bytes);
+    try std.testing.expectEqual(@max(attention.bytes, recurrent.bytes), layout.layerWorkspaceBytes());
+    try std.testing.expectEqual(@as(usize, 0), base.layerWorkspaceBytes());
     var owner: Module = .{ .storage_layout = layout, .metadata = .{ .ptr = 0x10000, .len = layout.metadata_bytes } };
     const scratch = layout.recurrent_scratch.?;
     const recurrent_module = @import("gated_delta.zig");

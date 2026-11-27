@@ -495,6 +495,9 @@ pub const CudaDecoderWorkspace = struct {
     planned_scratch_bytes: usize,
     bound_scratch_bytes: usize,
     metadata_bytes: usize,
+    /// Physical bank shared by the serial attention, recurrent and fused
+    /// head stages. Their individual byte counts may overlap this bank.
+    shared_layer_workspace_bytes: usize = 0,
     attention_scratch_bytes: usize,
     recurrent_scratch_bytes: usize = 0,
     /// Bytes in the independently admitted bank. Arena-backed packets are
