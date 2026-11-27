@@ -33091,19 +33091,11 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
         if (existing.compressed_format != cuda_kv_format_f16 or existing.value_format != cuda_kv_value_format_f16 or
             existing.key_row_bytes != kv_width * 2 or existing.value_row_bytes != kv_width * 2 or
             existing.page_size_tokens != params.page_size or existing.capacity_tokens > std.math.maxInt(u32) / kv_width) break :direct false;
-        for (views, params.pages[0..views.len], 0..) |view, page, i| {
+        for (views, params.pages[0..views.len]) |view, page| {
             const table = storage.blockTable(view.kv_cache.sequence_id) orelse return error.InvalidPagedKvState;
             if ((page.tokens - 1) / params.page_size < table.shared_prefix_blocks) break :direct false;
-            for (params.blockIds(page)) |block_id| {
-                if ((@as(usize, block_id) + 1) * params.page_size > existing.capacity_tokens) break :direct false;
-            }
-            const tail_block = params.blockIds(page)[(page.tokens - 1) / params.page_size];
-            // Do not overwrite any block another live page may still read.
-            for (params.pages[0..views.len], 0..) |other, j| {
-                if (i == j) continue;
-                for (params.blockIds(other)) |block_id| if (block_id == tail_block) break :direct false;
-            }
         }
+        if (!params.suffixWritesDisjoint(existing.capacity_tokens)) break :direct false;
         const regions = [5]buffer_mod.DeviceBuffer{ qt.buffer, kt.buffer, vt.buffer, existing.k, existing.v };
         const lengths = [5]usize{ qt.buffer.len, kt.buffer.len, vt.buffer.len, existing.k.len, existing.v.len };
         buffer_mod.validateRegions(regions.len, regions, lengths, .{ @alignOf(f32), @alignOf(f32), @alignOf(f32), @alignOf(u16), @alignOf(u16) }, 3) catch return error.InvalidPagedKvBatch;
