@@ -16,7 +16,7 @@
 const std = @import("std");
 const platform = @import("antfly_platform");
 const runtime = @import("../runtime/root.zig");
-const generation = @import("../pipelines/generation.zig");
+const decoder_routes = @import("../execution/decoder_routes.zig");
 const gpt_model_mod = @import("../models/gpt.zig");
 const qwen3vl_projector = @import("../architectures/qwen3vl_projector.zig");
 
@@ -43,9 +43,9 @@ pub fn CohortMemory(comptime Hooks: type) type {
         pub fn add(self: *@This(), cfg: gpt_model_mod.Config, prompt_tokens: usize, output_tokens: usize, decoder: runtime.tier.memory.AdmissionAmounts, vision: runtime.tier.memory.AdmissionAmounts) !void {
             const prefill_capacity = if (self.backend == .cuda and Hooks.cudaLightOnBatchProfileEnabled() and
                 platform.env.getenvBool("ANTFLY_LIGHTONOCR3_CUDA_WIDE_MICROBATCHES"))
-                generation.NativeGenerationPipeline.max_prepared_qwen_prefill_items
+                decoder_routes.max_positioned_prefill_items
             else
-                generation.NativeGenerationPipeline.default_prepared_qwen_prefill_items;
+                decoder_routes.default_positioned_prefill_items;
             if (self.share_decoder_scratch and (self.decoder_rows == 0 or self.decoder_rows > 128 or
                 self.max_prefill_batch_items == 0 or self.max_prefill_batch_items > prefill_capacity)) return error.ResourceLimitExceeded;
             if (self.prefill_query_chunk_rows != 0 and

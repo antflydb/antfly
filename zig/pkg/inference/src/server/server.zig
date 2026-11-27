@@ -10029,7 +10029,7 @@ pub const Node = struct {
         };
         const queued_phase = request.ctx.beginQueuedPhase(false);
         defer if (queued_phase) request.ctx.finishPhaseWait();
-        const batch_items = try generation.NativeGenerationPipeline.preparedQwenPrefillBatchLimitForBackend(positioned.item.backend.kind(), request.ctx.features.prefill_batch_items, seq);
+        const batch_items = try @import("../execution/decoder_routes.zig").positionedPrefillBatchLimitForBackend(positioned.item.backend.kind(), request.ctx.features.prefill_batch_items, seq);
         const result = try request.ctx.prefill_broker.submitControlled(LightOnPrefillPayload, []f32, request.io, positioned.item.allocator, .{ .model = request.ctx.model.model_dir, .generation = request.ctx.execution_id, .task = .read, .transform = "lighton-prefill", .resource_class = .gpu }, .{ .mode = .native, .preferred_items = batch_items, .max_items = batch_items, .max_tokens = std.math.mul(usize, batch_items, seq) catch return error.ResourceLimitExceeded, .max_wait_us = @min(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_PREFILL_WAIT_US") orelse 5000, 1000000) }, .{ .geometry_key = @intCast(seq), .tokens = seq }, .{}, try directExecutorDeadline(request.io, request.control.deadline_ns), .{ .ptr = &request.control, .is_cancelled_fn = Cancel.check }, &payload, request.ctx, executeLightOnPrefillBatch);
         const logits = switch (result.result) {
             .value => |value| value,
@@ -10062,7 +10062,7 @@ pub const Node = struct {
         }
         var group = executor_microbatch.ExecutionControl{ .items = items };
         const control = lightOnMicrobatchExecutionControl(&group);
-        var batch: [generation.NativeGenerationPipeline.max_prepared_qwen_prefill_items]@import("../execution/decoder_prefill.zig").PositionedEmbeddingBatchItem = undefined;
+        var batch: [@import("../execution/decoder_routes.zig").max_positioned_prefill_items]@import("../execution/decoder_prefill.zig").PositionedEmbeddingBatchItem = undefined;
         for (items, 0..) |item, index| batch[index] = item.payloadAs(LightOnPrefillPayload).item;
         control.check() catch |err| {
             for (items) |item| item.slot.fail(err);

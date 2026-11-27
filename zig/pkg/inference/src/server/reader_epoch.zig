@@ -312,7 +312,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             ctx.coordinator.setPolicy(factory.node.lightOnOcrPolicy(factory.physical_rows_limit));
             if (factory.features.packed_mixed) {
                 ctx.coordinator.policy.max_step_prefill_items = factory.features.packed_prefill_items;
-                ctx.coordinator.policy.max_step_query_tokens = generation.NativeGenerationPipeline.max_prepared_qwen_prefill_rows;
+                ctx.coordinator.policy.max_step_query_tokens = @import("../execution/decoder_routes.zig").max_positioned_prefill_rows;
             }
             ctx.execution_gate_wait_ns = if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_DISABLE_GATE_PARK")) 0 else @as(u64, @min(ctx.coordinator.policy.contention_wait_us, 1000)) * std.time.ns_per_us;
             ctx.phase_wait_ns = if ((factory.cuda_batch_enabled and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHASE_PARK")) or metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_PHASE_PARK")) ctx.execution_gate_wait_ns else 0;
