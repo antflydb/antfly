@@ -458,9 +458,12 @@ pub const CudaAudio = struct {
     }
 };
 
-/// Latest submitted learned audio workspace in the observing interval.
+/// Latest submitted audio workspace in the observing interval.
 /// Spans may alias one another and describe neither peak usage nor completion.
 pub const CudaAudioWorkspace = struct {
+    pub const Route = enum { eager_assigned, recorded_and_launched, replayed };
+
+    route: Route,
     plan_origin: @import("stream_workspace.zig").Origin,
     planned_events: usize,
     planned_arena_bytes: usize,

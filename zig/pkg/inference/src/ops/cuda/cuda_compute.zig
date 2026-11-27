@@ -21389,14 +21389,12 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     // Include the publication copy in replay samples. The direct ordinary
     // route already publishes its result as part of the measured work.
     if (timing) |pair| try arena.endTiming(&self.ctx, pair, replay);
-    if (capture) {
-        observation.cudaAudioResult(.recorded_and_launched);
-    } else if (replay) {
-        observation.cudaAudioResult(.replayed);
-    } else {
-        observation.cudaAudioResult(.eager_assigned);
+    const route: observation.CudaAudioWorkspace.Route = if (capture) .recorded_and_launched else if (replay) .replayed else .eager_assigned;
+    switch (route) {
+        inline else => |tag| observation.cudaAudioResult(@field(std.meta.FieldEnum(observation.CudaAudio), @tagName(tag))),
     }
     observation.cudaAudioWorkspace(.{
+        .route = route,
         .plan_origin = plan.origin,
         .planned_events = storage.events,
         .planned_arena_bytes = storage.bytes,

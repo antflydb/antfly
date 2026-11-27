@@ -389,6 +389,7 @@ test "uniform report retains the observed CUDA audio workspace across publicatio
     try std.testing.expect(source.snapshot().?.report.?.cuda_audio_workspace == null);
 
     const workspace: observation.CudaAudioWorkspace = .{
+        .route = .replayed,
         .plan_origin = .observed,
         .planned_events = 12,
         .planned_arena_bytes = 4096,
