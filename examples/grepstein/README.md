@@ -407,15 +407,31 @@ artifact lifecycle as the explorer and semantic/graph indexes. Native index
 readiness is checked separately from source publication, including failed OCR.
 
 The binding maps the corpus's existing fields to source identity and permissions.
-New prepared rows include `indexed_at` and private `user:self` reader metadata;
-regenerate and publish older prepared rows before using the new binding. Preparation
-saves one `indexed_at` timestamp in `sources.json`, so resumed rows retain the
-same manifest bytes. Older preparation states without that timestamp require a
-new `--state`; do not edit sealed manifests to fabricate it. Local
-principal filtering narrows results; exposed APIs still require their own current
-caller authorization/RLS. The ordinary Antfly API and binding format are the
-same in Cloud and self-hosted deployments. Never distribute a write/admin key
-with the binding.
+New prepared rows include `indexed_at` and private `user:self` reader metadata.
+Preparation saves one timestamp in `sources.json` so resumed rows retain the
+same manifest bytes. Use a new preparation state for an older unpublished
+manifest without a timestamp. For an existing table, backfill the live primary
+records in place:
+
+```sh
+./grepstein repair-grep-metadata --url "$ANTFLY_URL" --table "$PDF_TABLE" --limit 1
+./grepstein repair-grep-metadata --url "$ANTFLY_URL" --table "$PDF_TABLE" --limit 1 \
+  --apply --indexed-at "$KNOWN_INGESTION_UNIX_SECONDS" --reader 'user:self'
+```
+
+The first invocation only inventories missing fields. Use `--after` with the
+preceding page's `next_after` to select a canary that needs a patch. Supply the
+verified ingestion time and intended private reader for that batch. The command
+fills absent fields using primary document-version predicates and retains any
+existing ACL and timestamp. On conflict or an uncertain response, inspect that
+page again before advancing. Confirm the canary returns a real grep match with
+its original extraction generation and no OCR calls, then continue in bounded
+batches. The command leaves sealed manifests alone.
+
+Local principal filtering narrows results. Exposed APIs still enforce current
+caller authorization and row policy. The ordinary Antfly API and binding format
+are the same in Cloud and self-hosted deployments. Keep write/admin credentials
+out of the binding.
 
 The former `--grep-table`, `--gcs-projection-bucket` and page source-job workflow
 are retired. Existing projection tables/buckets are not automatically deleted.
@@ -518,7 +534,20 @@ or an instance-scoped key. Reprocessing an artifact preserves the source documen
 there is no need to delete its table or index. Keep native repair/reprocess job
 IDs and advance their bounded passes until complete; job creation alone is not
 proof that a repair finished. If an API response is uncertain, inspect the job or
-artifact generation before submitting the mutation again.
+artifact generation before submitting the mutation again. For Grepstein PDF
+extraction, advance a durable job with the existing table API:
+
+1. Inspect the table's `/repair/issues` and the affected documents' raw
+   `document_units_v1` manifests. Correct the fetch, renderer, or inference
+   policy that caused the failure. A historical issue may outlive the manifest
+   it describes. Use the current manifest to verify whether work is incomplete.
+2. POST `{"selection":"incomplete","limit":25,"advance":false}` to
+   `/tables/$PDF_TABLE/artifacts/document_units_v1/reprocess-jobs`. Save the
+   returned `job_id`. Use `from_key` and `to_key` for a reviewed canary range.
+3. POST to the job's `/advance` endpoint until the recorded phase is terminal.
+   Read the job and artifact manifests to verify the expected generations and
+   coverage. Run ordinary grep during recovery and strict grep when coverage
+   is expected to be complete.
 
 Cloud global discovery and named-table requests must resolve the same live user
 permissions. A `401` on global discovery with working named-table requests is a

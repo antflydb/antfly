@@ -22,7 +22,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: grepstein stage-originals|fetch|fetch-archive|prepare-small|prepare|publish|load|enrich|wait|qualify|graph|grep|cloud-jobs|stats|explore|datasets")
+		fmt.Fprintln(os.Stderr, "usage: grepstein stage-originals|fetch|fetch-archive|prepare-small|prepare|publish|load|enrich|wait|qualify|graph|grep|repair-grep-metadata|cloud-jobs|stats|explore|datasets")
 		os.Exit(2)
 	}
 	var err error
@@ -41,6 +41,8 @@ func main() {
 		err = prepareSmallCmd(os.Args[2:])
 	case "grep":
 		err = grepCmd(os.Args[2:])
+	case "repair-grep-metadata":
+		err = repairGrepMetadataCmd(os.Args[2:])
 	case "fetch":
 		err = fetchCmd(os.Args[2:])
 	case "publish":

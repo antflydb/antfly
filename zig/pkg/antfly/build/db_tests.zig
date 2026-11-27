@@ -395,6 +395,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "pending document-unit dense embedding collection releases every failed allocation",
         "pending document-unit sparse embedding collection releases every failed allocation",
         "pending document-unit chunk sources append atomically under allocation failure",
+        "db graph fact orphan stages recover after reopen with no replay debt",
         "db document extraction completes audio transcription with transcriber producer",
         "db document extraction transcript segments time chunk artifacts",
         "db document extraction keeps diarized speakers through reopen",
