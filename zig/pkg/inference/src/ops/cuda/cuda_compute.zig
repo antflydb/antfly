@@ -62694,9 +62694,7 @@ test "source linear bank metadata reuses only its audio owner or exact captured 
     // The real graph-plan allocator owns one complete bank interval; source
     // slices never become independent free events or claimed output slots.
     var plan: @import("../../execution/stream_workspace.zig").Plan = .{};
-    plan.allocate(layout.bytes, 0x1000);
-    plan.release(0x1000);
-    try std.testing.expect(plan.finishNoOutput());
+    try plan.declareScratch(layout.bytes);
     var scope = @import("../../execution/stream_workspace.zig").Scope{ .recipe = .{ .bound = &plan }, .base = 0x10000000 };
     compute.source_linear_scratch = .{};
     compute.execution_scope = &scope;
@@ -62716,9 +62714,7 @@ test "source linear arena precondition refuses retained ordinary storage before 
     try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 16), compute.source_linear_scratch.buffer.ptr);
     try std.testing.expect(compute.source_linear_scratch.active and !compute.source_linear_scratch.in_use);
     var plan: plan_mod.Plan = .{};
-    plan.allocate(256, 0x1000);
-    plan.release(0x1000);
-    try std.testing.expect(plan.finishNoOutput());
+    try plan.declareScratch(256);
     scope = try plan_mod.Scope.bind(&plan, try plan.layout(256), 0x8000, 512);
     compute.source_linear_scratch.buffer.ptr = 0x8000;
     try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, SourceLinearTemporary.acquireDeclared(&compute, 256, 256, true));
@@ -63265,9 +63261,7 @@ test "source local relative temporary follows the actual learned and captured ba
     }
     try std.testing.expect(!compute.source_linear_scratch.in_use);
     var plan: @import("../../execution/stream_workspace.zig").Plan = .{};
-    plan.allocate(layout.bytes, 0x1000);
-    plan.release(0x1000);
-    try std.testing.expect(plan.finishNoOutput());
+    try plan.declareScratch(layout.bytes);
     var scope = @import("../../execution/stream_workspace.zig").Scope{ .recipe = .{ .bound = &plan }, .base = 0x10000000 };
     compute.source_linear_scratch = .{};
     compute.execution_scope = &scope;
@@ -63331,9 +63325,7 @@ test "source local relative actual external capture rejects before module or out
     // Actual capture with a funded arena keeps the exact bank lease and does
     // not consume the independently assigned output or allocate another bank.
     var plan: @import("../../execution/stream_workspace.zig").Plan = .{};
-    plan.allocate(256, 0x1000);
-    plan.release(0x1000);
-    try std.testing.expect(plan.finishNoOutput());
+    try plan.declareScratch(256);
     var scope = @import("../../execution/stream_workspace.zig").Scope{ .recipe = .{ .bound = &plan }, .base = 0x10000000 };
     compute.execution_scope = &scope;
     compute.source_linear_scratch = .{};
