@@ -58152,6 +58152,12 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
                     var peer_page = actual.bindPageLease(raw);
                     actual.unregister(peer_index);
                     peer_registered = false;
+                    {
+                        try actual.lockPageSetup(factory.control);
+                        defer actual.unlockStep();
+                        try std.testing.expectEqual(graph, compute.bounded_decode_graph.graph);
+                        try std.testing.expectEqual(plan, compute.bounded_decode_graph.plan);
+                    }
                     peer_page.release(&peer_pool);
                     peer_owned = false;
                     try std.testing.expect(graph != null and arena != 0 and metadata != 0 and plan != null);
