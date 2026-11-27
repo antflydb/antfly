@@ -773,17 +773,31 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
         defer selected_decoder.deinit();
         const policy: @import("encoder_decoder_runtime.zig").FinalTokenPolicy = .{ .context = &selected_decoder, .accepts = Selection.accepts };
         const transfer_audit = @import("transfer_audit.zig");
-        var transfers: transfer_audit.Audit = .{};
+        const Probe = struct {
+            audit: transfer_audit.Audit = .{},
+            started: bool = false,
+
+            fn stage(raw: *anyopaque, _: tensor_dispatch.Task, allocator: std.mem.Allocator, target: backends.Session, bindings: []const sessions.StageInput, active: ?Control) !sessions.ResidentOutputs {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                var outputs = (try target.runStageInputsBeforeExecution(bindings, allocator, active)) orelse return error.MissingResidentResult;
+                errdefer outputs.deinit();
+                try transfer_audit.begin(&self.audit);
+                self.started = true;
+                return outputs;
+            }
+
+            fn host(_: *anyopaque, _: tensor_dispatch.Task, _: std.mem.Allocator, _: backends.Session, _: ?*sessions.RunPermit, _: ?*std.atomic.Mutex, _: []const backends.Tensor, _: ?Control) ![]backends.Tensor {
+                return error.UnexpectedHostDecoder;
+            }
+        };
+        var probe: Probe = .{};
+        const dispatch: tensor_dispatch.Dispatch = .{ .ptr = &probe, .task = .generate, .run_stage_fn = Probe.stage, .run_fn = Probe.host };
         var selected = measured: {
-            try transfer_audit.begin(&transfers);
-            defer transfer_audit.end();
-            break :measured try selected_decoder.stepSelecting(&.{2}, 0, null, null, policy);
+            defer if (probe.started) transfer_audit.end();
+            break :measured try selected_decoder.stepSelecting(&.{2}, 0, null, dispatch, policy);
         };
         defer selected.deinit();
-        // The audit covers decoder control transfers as well as selection.
-        // A full vocabulary row alone would already use four float words.
-        try std.testing.expect(transfers.download_bytes >= @sizeOf(u32));
-        try std.testing.expect(transfers.download_bytes < 4 * @sizeOf(f32));
+        try std.testing.expectEqual(@as(u64, @sizeOf(u32)), probe.audit.download_bytes);
         try std.testing.expectEqual(@as(?u32, 3), selected.token);
         try std.testing.expectEqual(@as(usize, 0), selected.logits.len);
         {
