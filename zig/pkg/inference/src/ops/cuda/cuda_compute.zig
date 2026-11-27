@@ -63243,8 +63243,9 @@ test "CUDA source convolution binds declared BF16 packs and preserves border val
     var scope: @import("../../execution/runtime_observation.zig").KernelScope = undefined;
     scope.begin();
     defer _ = scope.finish();
+    const Workspace = @import("../../execution/stream_workspace.zig");
     for ([_]?CT{ null, bias }) |bias_value| {
-        const out = try sourceConvolutionF32(&compute, .{
+        const request: @FieldType(ops.Bf16SourceOperation, "conv3x3_stride2") = .{
             .input = input,
             .reduction = .vendor_f32,
             .weight = weights,
@@ -63254,16 +63255,44 @@ test "CUDA source convolution binds declared BF16 packs and preserves border val
             .outputs = 1,
             .height = 4,
             .width = 4,
-        });
+        };
+        var plan: Workspace.Plan = .{};
+        var observing = Workspace.Scope.observe(&plan);
+        const out = observed: {
+            compute.execution_scope = &observing;
+            defer compute.execution_scope = null;
+            break :observed try sourceConvolutionF32(&compute, request);
+        };
         defer cb.free(out);
+        try std.testing.expect(plan.finish(tensorFromCt(out).buffer.ptr));
+        try std.testing.expectEqual(@as(usize, 2), plan.count);
+        try std.testing.expectEqual(@as(usize, 3), plan.event_count);
         const actual = try cb.toFloat32(out, a);
         defer a.free(actual);
         const expected: []const f32 = if (bias_value == null) &.{ 4, 6, 6, 9 } else &.{ 4.5, 6.5, 6.5, 9.5 };
         try std.testing.expectEqualSlices(f32, expected, actual);
+
+        const layout = try plan.layout(0);
+        var backing = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, layout.bytes);
+        defer backing.free(&compute.ctx);
+        var bound = try Workspace.Scope.bind(&plan, layout, backing.ptr, backing.len);
+        const allocated = compute.stats.device_alloc_calls;
+        const assigned = submitted: {
+            compute.execution_scope = &bound;
+            defer compute.execution_scope = null;
+            break :submitted try sourceConvolutionF32(&compute, request);
+        };
+        defer cb.free(assigned);
+        try std.testing.expect(bound.complete());
+        try std.testing.expectEqual(allocated, compute.stats.device_alloc_calls);
+        try std.testing.expectEqual(backing.ptr + layout.output.?.offset, tensorFromCt(assigned).buffer.ptr);
+        const bound_values = try cb.toFloat32(assigned, a);
+        defer a.free(bound_values);
+        try std.testing.expectEqualSlices(f32, expected, bound_values);
     }
     const receipt = scope.cuda_vendor_convolution orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(u64, 2), receipt.forward_calls);
-    try std.testing.expectEqual(@as(u64, 1), receipt.bias_calls);
+    try std.testing.expectEqual(@as(u64, 4), receipt.forward_calls);
+    try std.testing.expectEqual(@as(u64, 2), receipt.bias_calls);
     try std.testing.expect(receipt.max_source_bank_bytes > receipt.max_explicit_workspace_bytes);
 }
 
