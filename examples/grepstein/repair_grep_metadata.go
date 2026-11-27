@@ -166,7 +166,7 @@ func repairGrepMetadataPage(client *http.Client, endpoint, table string, opts gr
 			return result, err
 		}
 		if receipt.Status != "committed" && receipt.Status != "committed_visibility_pending" {
-			return result, fmt.Errorf("metadata transaction status %q; recheck this page before continuing", receipt.Status)
+			return result, fmt.Errorf("recheck the metadata page after transaction status %q before continuing", receipt.Status)
 		}
 		result.Patched = len(transforms)
 	}
