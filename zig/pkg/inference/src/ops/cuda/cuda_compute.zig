@@ -4898,22 +4898,9 @@ pub const CudaCompute = struct {
             try runDenseFfnDown(self, .{ .separate = .{ .gate = gate, .up = up } }, weights[2], rows, hidden, intermediate, input, activated, output, try program.workspace());
             return try program.publish(slot);
         };
-        try self.lighton_activation.init(&self.ctx);
-        if (self.bounded_decode_graph.active) {
-            const layout = try DenseFfnProgram.Layout.init(rows, hidden, intermediate, 0);
-            if (try self.bounded_decode_graph.bindFfnScratch(layout)) |scratch| {
-                return runCapturedDenseFfn(self, request, input, norm, weights, layout, scratch);
-            }
-        }
-        var normalized = try allocDeviceBuffer(self, try checkedMul(try checkedMul(rows, hidden), 2));
-        defer releaseDeviceBuffer(self, &normalized);
-        var gate = try allocDeviceBuffer(self, try checkedMul(try checkedMul(rows, intermediate), 4));
-        defer releaseDeviceBuffer(self, &gate);
-        var up = try allocDeviceBuffer(self, try checkedMul(try checkedMul(rows, intermediate), 4));
-        defer releaseDeviceBuffer(self, &up);
-        errdefer self.ctx.synchronize() catch {};
-        try runDenseFfnGateUp(self, request, input, norm, weights, normalized, gate, up, null);
-        return try lightOnFfnBf16Down(self, .{ .separate = .{ .gate = gate, .up = up } }, weights[2], rows, hidden, intermediate, input);
+        const layout = try DenseFfnProgram.Layout.init(rows, hidden, intermediate, 0);
+        const assigned = if (self.bounded_decode_graph.active) try self.bounded_decode_graph.bindFfnScratch(layout) else null;
+        return try runDenseFfnWithScratch(self, request, input, norm, weights, layout, assigned);
     }
 
     /// Interpolate the resident learned-position table directly into patch
@@ -16113,17 +16100,18 @@ const LightOnActivationSources = union(enum) {
 /// input. The temporary F32 activation and its later conversion disappear.
 /// Compact intermediates for the separately opted-in BF16 projection policy.
 /// The original F32 FFN and its numerical oracle remain independent.
-fn runCapturedDenseFfn(self: *CudaCompute, request: CudaCompute.DenseSiluFfnBlockRequest, input: *const CudaTensor, norm: *const CudaTensor, weights: [3]*const CudaTensor, layout: CudaCompute.DenseFfnProgram.Layout, scratch: buffer_mod.DeviceBuffer) !CT {
+fn runDenseFfnWithScratch(self: *CudaCompute, request: CudaCompute.DenseSiluFfnBlockRequest, input: *const CudaTensor, norm: *const CudaTensor, weights: [3]*const CudaTensor, layout: CudaCompute.DenseFfnProgram.Layout, assigned: ?buffer_mod.DeviceBuffer) !CT {
     const narrow_count = try checkedMul(layout.rows, layout.hidden);
     const wide_count = try checkedMul(layout.rows, layout.intermediate);
-    for ([_]*const CudaTensor{ input, norm, weights[0], weights[1], weights[2] }) |source| {
-        if (kernel_geometry.byteRangesOverlap(scratch.ptr, scratch.len, source.buffer.ptr, source.buffer.len)) return error.InvalidAssignedAlias;
-    }
+    try self.lighton_activation.init(&self.ctx);
+    var scratch = assigned orelse try allocDeviceBuffer(self, layout.scratch_bytes);
+    defer if (assigned == null) releaseDeviceBuffer(self, &scratch);
+    if (assigned != null) try validateFfnScratch(scratch, input, norm, weights);
     const normalized = try scratch.borrowRange(0, narrow_count * @sizeOf(u16));
     const activated = try scratch.borrowRange(0, wide_count * @sizeOf(u16));
     const gate = try scratch.borrowRange(layout.gate_offset, wide_count * @sizeOf(f32));
     const up = try scratch.borrowRange(layout.up_offset, wide_count * @sizeOf(f32));
-    const output = try capturedFfnOutput(self, request, input, norm, weights, layout);
+    const output = try denseFfnOutput(self, input, norm, weights, layout, assigned != null);
     errdefer freeTensor(self, output);
     errdefer self.ctx.synchronize() catch {};
     try runDenseFfnGateUp(self, request, input, norm, weights, normalized, gate, up, null);
@@ -16131,11 +16119,19 @@ fn runCapturedDenseFfn(self: *CudaCompute, request: CudaCompute.DenseSiluFfnBloc
     return output;
 }
 
-fn capturedFfnOutput(self: *CudaCompute, request: CudaCompute.DenseSiluFfnBlockRequest, input: *const CudaTensor, norm: *const CudaTensor, weights: [3]*const CudaTensor, layout: CudaCompute.DenseFfnProgram.Layout) !CT {
+fn validateFfnScratch(scratch: buffer_mod.DeviceBuffer, input: *const CudaTensor, norm: *const CudaTensor, weights: [3]*const CudaTensor) !void {
+    for ([_]*const CudaTensor{ input, norm, weights[0], weights[1], weights[2] }) |source| {
+        if (kernel_geometry.byteRangesOverlap(scratch.ptr, scratch.len, source.buffer.ptr, source.buffer.len)) return error.InvalidAssignedAlias;
+    }
+}
+
+fn denseFfnOutput(self: *CudaCompute, input: *const CudaTensor, norm: *const CudaTensor, weights: [3]*const CudaTensor, layout: CudaCompute.DenseFfnProgram.Layout, assigned: bool) !CT {
+    if (!assigned)
+        return (try allocUninitF32ShapeOp(self, &.{ @intCast(layout.rows), @intCast(layout.hidden) })).?;
     const sources = [_]buffer_mod.DeviceBuffer{ input.buffer, norm.buffer, weights[0].buffer, weights[1].buffer, weights[2].buffer };
     const output = try self.bounded_decode_graph.bindFfnOutput(layout, &sources);
     const bytes = try checkedMul(try checkedMul(layout.rows, layout.hidden), @sizeOf(f32));
-    return try self.graphLayerOutputTensor(try output.borrowRange(0, bytes), request.rows, request.hidden);
+    return try self.graphLayerOutputTensor(try output.borrowRange(0, bytes), layout.rows, layout.hidden);
 }
 
 fn lightOnCompactBf16FfnBlock(self: *CudaCompute, request: CudaCompute.DenseSiluFfnBlockRequest, input: *const CudaTensor, norm: *const CudaTensor, weights: [3]*const CudaTensor) !CT {
@@ -16149,11 +16145,7 @@ fn lightOnCompactBf16FfnBlock(self: *CudaCompute, request: CudaCompute.DenseSilu
     const assigned = if (self.bounded_decode_graph.active) try self.bounded_decode_graph.bindFfnScratch(layout) else null;
     var scratch = assigned orelse try allocDeviceBuffer(self, layout.scratch_bytes);
     defer if (assigned == null) releaseDeviceBuffer(self, &scratch);
-    if (assigned != null) {
-        for ([_]*const CudaTensor{ input, norm, weights[0], weights[1], weights[2] }) |source| {
-            if (kernel_geometry.byteRangesOverlap(scratch.ptr, scratch.len, source.buffer.ptr, source.buffer.len)) return error.InvalidAssignedAlias;
-        }
-    }
+    if (assigned != null) try validateFfnScratch(scratch, input, norm, weights);
     // The initial BF16 normalization dies after both projections. Gate and
     // up die after SiLU, so the down projection can write over the gate.
     const normalized = try scratch.borrowRange(0, narrow_count * @sizeOf(u16));
@@ -16161,10 +16153,7 @@ fn lightOnCompactBf16FfnBlock(self: *CudaCompute, request: CudaCompute.DenseSilu
     const gate = try scratch.borrowRange(layout.gate_offset, wide_count * @sizeOf(u16));
     const up = try scratch.borrowRange(layout.up_offset, wide_count * @sizeOf(u16));
     const projected = try scratch.borrowRange(layout.gate_offset, narrow_count * @sizeOf(u16));
-    const output = if (assigned != null)
-        try capturedFfnOutput(self, request, input, norm, weights, layout)
-    else
-        (try allocUninitF32ShapeOp(self, &.{ @intCast(rows), @intCast(hidden) })).?;
+    const output = try denseFfnOutput(self, input, norm, weights, layout, assigned != null);
     errdefer freeTensor(self, output);
     errdefer self.ctx.synchronize() catch {};
     try self.lighton_activation.runRms(&self.ctx, .{ normalized.ptr, input.buffer.ptr, norm.buffer.ptr }, @intCast(rows), @intCast(hidden), request.eps, if (std.math.approxEqAbs(f32, request.weight_offset, 0, 1e-6)) 0 else request.weight_offset);

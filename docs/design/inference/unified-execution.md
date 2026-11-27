@@ -2671,3 +2671,19 @@ and zero device-to-device copy bytes. The released grouped checkpoint
 still matched repeated vectors exactly and replayed twice with
 38,017,792 planned and captured arena bytes. The test log hash is
 `a079da40a732781946571f5ce5979d3d17c8b8bd6ada5284597e43c116f94616`.
+
+On Spark GB10 at `386a7ba09e`, 37 CUDA checks passed without skips.
+The grouped local-relative attention fixture verified exact independent
+clip outputs and one workspace allocation interval. Released grouped
+audio still recorded two replays and 38,017,792 planned and captured
+arena bytes. The log hash is
+`e6c5014329628389a1178a560f0466dafc03682df7c19428e0b69006851f6c12`.
+
+The same-binary LightOnOCR 2×32-page ABBA comparison matched the
+serial output in all four arms. Rates were 8.5401, 7.0469, 13.3180
+and 9.3791 pages/s. Maximum replay widths were 19, 3, 8 and 0.
+The last arm retired a 64-row graph while it was still learning.
+All four arms failed the exact 64-row replay gate. A separate process
+held a GPU context when inspected after the run. These receipts
+establish output parity for this comparison, with throughput and
+consistent 64-row replay still unqualified.
