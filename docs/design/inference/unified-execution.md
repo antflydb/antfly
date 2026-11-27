@@ -2317,3 +2317,11 @@ Both runs used the shared ONNX artifact with SHA-256
 `f6d2874dafd291458e59f3762915e7111cc66caaffedbffb78d2d5fa42f6cdce`.
 The same focused cohort also passed the Native Node handoff fixture
 that retains encoder output through Node and session close.
+
+The diagnostic baseline at `25f946f673` passed 30 focused CUDA tests.
+Its full-window LightOnOCR run matched all 256 pages at 7.2885
+pages/s, with one two-row replay. One page admission requested
+93,676,716 bytes in the GPU scratch domain. The post-denial sample
+observed 25,768,492,592 admitted bytes against the 25,769,803,776-byte
+cap. This is a domain-local snapshot and does not attribute the
+admitted bytes to individual owners.
