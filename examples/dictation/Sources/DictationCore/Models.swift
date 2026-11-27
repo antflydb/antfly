@@ -272,6 +272,16 @@ public struct HistoryEntry: Codable, Identifiable, Equatable, Sendable {
   public var raw: String
   public var text: String
   public var status: String
+  public var deliveryLabel: String {
+    switch status {
+    case "paste_sent": return "Paste sent"
+    case "enter_sent": return "Enter sent"
+    case "insertion_failed": return "Not pasted"
+    case "original_selected": return "Original text selected"
+    case "ready": return "Ready to copy"
+    default: return status
+    }
+  }
   /// Absent only for archives written before destinations were retained.
   public var destination: HistoryDestination?
   public init(

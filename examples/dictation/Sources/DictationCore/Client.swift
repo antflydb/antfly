@@ -472,19 +472,25 @@ public actor AntflyClient {
     }
   }
   public func setup(table: String) async throws {
-    // GET distinguishes an existing table from a genuine create failure.
+    // Never turn auth, connectivity, or schema failures into create requests.
     do {
       _ = try await json("db/v1/tables/\(table)", method: "GET")
       return
-    } catch {
-      // Creation below surfaces auth, connection, and schema errors.
+    } catch let failure as ServerFailure where failure.status == 404 {
+      // A genuinely missing table is provisioned below.
     }
-    _ = try await json(
-      "db/v1/tables/\(table)", method: "POST",
-      body: encode([
-        "num_shards": 1, "indexes": ["search": ["type": "full_text", "field": "text"]],
-      ]))
+    do {
+      _ = try await json(
+        "db/v1/tables/\(table)", method: "POST",
+        body: encode([
+          "num_shards": 1, "indexes": ["search": ["type": "full_text", "field": "text"]],
+        ]))
+    } catch let failure as ServerFailure where failure.status == 409 {
+      // Another app/request may have created it since our existence check.
+      _ = try await json("db/v1/tables/\(table)", method: "GET")
+    }
   }
+
   public func saveSettings(_ config: Configuration) async throws {
     let data = try JSONEncoder().encode(config.validated())
     let document: [String: Any] = [

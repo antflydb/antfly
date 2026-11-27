@@ -769,7 +769,7 @@ struct SettingsView: View {
             HStack {
               Text(entry.created, style: .date)
               Text(entry.preset)
-              Text(entry.status).foregroundStyle(.secondary)
+              Text("Saved locally · " + entry.deliveryLabel).foregroundStyle(.secondary)
               Spacer()
               Button("Copy") { store.copy(entry.text) }
             }

@@ -369,31 +369,22 @@ final class CaptureConverter: @unchecked Sendable {
   let pid: pid_t
   let bundleID: String
   let element: AXUIElement?
+  private var pendingCapture: Task<CapturedTextElement, Never>?
+  init(pid: pid_t, bundleID: String, element: AXUIElement?) {
+    self.pid = pid
+    self.bundleID = bundleID
+    self.element = element
+  }
   static func capture() -> InsertionTarget? {
     guard let app = NSWorkspace.shared.frontmostApplication,
       app.processIdentifier != ProcessInfo.processInfo.processIdentifier
     else { return nil }
-    var focused: CFTypeRef?
-    AXUIElementCopyAttributeValue(
-      AXUIElementCreateApplication(app.processIdentifier), kAXFocusedUIElementAttribute as CFString,
-      &focused)
-    var element = focused.flatMap {
-      CFGetTypeID($0) == AXUIElementGetTypeID() ? unsafeDowncast($0, to: AXUIElement.self) : nil
+    let pid = app.processIdentifier
+    var target = InsertionTarget(pid: pid, bundleID: app.bundleIdentifier ?? "", element: nil)
+    target.pendingCapture = Task.detached(priority: .userInitiated) {
+      await captureTextElement(pid: pid)
     }
-    if let candidate = element {
-      var role: CFTypeRef?
-      var subrole: CFTypeRef?
-      AXUIElementCopyAttributeValue(candidate, kAXRoleAttribute as CFString, &role)
-      AXUIElementCopyAttributeValue(candidate, kAXSubroleAttribute as CFString, &subrole)
-      let textRoles = [kAXTextFieldRole, kAXTextAreaRole, kAXComboBoxRole]
-      if !textRoles.contains(role as? String ?? "")
-        || subrole as? String == kAXSecureTextFieldSubrole
-      {
-        element = nil
-      }
-    }
-    return InsertionTarget(
-      pid: app.processIdentifier, bundleID: app.bundleIdentifier ?? "", element: element)
+    return target
   }
   private func validateFrontmost() throws {
     guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else {
@@ -408,9 +399,11 @@ final class CaptureConverter: @unchecked Sendable {
   ) async throws {
     try validate()
     try validateFrontmost()
-    guard let element else {
-      throw DictationError.invalid(
-        "No supported text field was captured. Copy the transcript to insert it manually.")
+    let captured = await pendingCapture?.value
+    try validate()
+    try validateFrontmost()
+    guard let element = captured?.element ?? element else {
+      throw captured?.failure ?? TextCaptureFailure.unsupported
     }
     let probe = InsertionAccessibility(pid: pid, element: element)
     var context: InsertionAccessibility.Context?
@@ -506,11 +499,8 @@ private final class InsertionAccessibility: @unchecked Sendable {
     guard AXIsProcessTrusted() else {
       throw DictationError.invalid("Enable Accessibility for Antfly Dictation to paste.")
     }
-    var current: CFTypeRef?
-    guard
-      AXUIElementCopyAttributeValue(application, kAXFocusedUIElementAttribute as CFString, &current)
-        == .success,
-      let current, CFEqual(element, current)
+    let reader = NativeFocusReader(application: application, budget: .milliseconds(400))
+    guard case .success(let current) = reader.focusedText(), CFEqual(element, current)
     else {
       throw DictationError.invalid(
         "Focused text field changed or is not responding. Copy the transcript to insert it manually."

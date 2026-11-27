@@ -209,6 +209,9 @@ struct PreparedModelSetup: Sendable {
   private(set) var historyDeletionTask: Task<Void, Never>?
   private var historyRevision: UInt64 = 0
   private var historyEpoch = UUID()
+  private let preparesHistoryStorage: Bool
+  private let historyStorage = HistoryStorage()
+  private(set) var historyStorageTask: Task<Void, Never>?
   private var appliedHistoryRetention = false
   private var terminating = false
   private(set) var historyPersistenceTask: Task<Void, Never>?
@@ -318,6 +321,7 @@ struct PreparedModelSetup: Sendable {
     self.keyboardAccessRequest = keyboardAccessRequest
     self.settingsOpener = settingsOpener
     self.clientFactory = clientFactory
+    self.preparesHistoryStorage = historyUpload == nil
     self.credentialReader = credentialReader
     self.credentialWriter = credentialWriter
     let directory =
@@ -389,6 +393,7 @@ struct PreparedModelSetup: Sendable {
           try FileManager.default.removeItem(at: queue)
         }
       }
+      let historyStorage = self.historyStorage
       outbox = try HistoryOutbox(
         directory: self.directory.appendingPathComponent("outbox"), paused: true, archive: archive,
         upload: historyUpload ?? { entry, destination in
@@ -397,11 +402,10 @@ struct PreparedModelSetup: Sendable {
             destination.server == ManagedRuntime.origin
             ? await MainActor.run { Credentials.read(server: ManagedRuntime.credentialAccount) }
             : ""
-          try await AntflyClient(
+          let client = try AntflyClient(
             server: destination.server, token: token,
-            basicPassword: password.isEmpty ? nil : password
-          ).saveHistory(
-            entry, table: destination.table)
+            basicPassword: password.isEmpty ? nil : password)
+          try await historyStorage.upload(entry, destination: destination, client: client)
         }, changed: { [weak self] status in await self?.updateHistoryStatus(status) })
     } catch { historySyncStatus = "History sync unavailable: " + error.localizedDescription }
     do {
@@ -448,6 +452,7 @@ struct PreparedModelSetup: Sendable {
       }
       if config.usesManagedRuntime { runtime.start() }
       refreshModels()
+      prepareHistoryStorage()
     }
     settingsCleanupTask = Task { [weak self, writer = self.settingsWriter] in
       do { try await writer.recoverAbandonedWrites() } catch {
@@ -701,8 +706,10 @@ struct PreparedModelSetup: Sendable {
     settingsLoadError = nil
     if !config.retainHistory || !appliedHistoryRetention { historyEpoch = UUID() }
     appliedHistoryRetention = config.retainHistory
+    prepareHistoryStorage()
     let epoch = historyEpoch
     if !config.retainHistory {
+      await historyStorage.cancelPreparations()
       history = []
       historyRevision += 1
       let revision = historyRevision
@@ -1380,6 +1387,7 @@ struct PreparedModelSetup: Sendable {
         // A fresh inventory supersedes verification against the previous engine snapshot.
         verifiedSpeech = nil
         models = catalog.data
+        prepareHistoryStorage()
         if report { discovery = data }
         discoveryState = .current
         if state == .idle, !settingsLocked, modelSetup == .idle {
@@ -1729,6 +1737,9 @@ struct PreparedModelSetup: Sendable {
     automaticSaveTask?.cancel()
     automaticSaveTask = nil
     terminating = true
+    historyStorageTask?.cancel()
+    await historyStorage.cancelPreparations()
+    await historyStorageTask?.value
     cleanupWarmupTask?.cancel()
     await cleanupWarmupTask?.value
     working = true
@@ -1820,6 +1831,28 @@ struct PreparedModelSetup: Sendable {
     }
   }
   func discover() { checkEngine() }
+  private func prepareHistoryStorage() {
+    historyStorageTask?.cancel()
+    guard preparesHistoryStorage, savedConfiguration.retainHistory,
+      config.retainHistory, settingsLoadError == nil, !terminating,
+      !config.usesManagedRuntime || runtime.ready || clientFactory != nil
+    else { return }
+    let snapshot = savedConfiguration
+    let epoch = historyEpoch
+    historyStorageTask = Task { [weak self] in
+      guard let self else { return }
+      do {
+        let client = try self.client(snapshot)
+        try await historyStorage.prepare(
+          HistoryDestination(server: snapshot.effectiveServer, table: snapshot.table),
+          client: client)
+      } catch {
+        guard !Task.isCancelled, historyEpoch == epoch, config.retainHistory else { return }
+        historySyncStatus =
+          "History is saved locally; server storage setup failed: " + error.localizedDescription
+      }
+    }
+  }
   func setup() {
     run {
       try await self.client().setup(table: self.config.table)

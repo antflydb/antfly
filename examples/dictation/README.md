@@ -759,3 +759,31 @@ detection is respected, and English-only Whisper backends do not infer detection
 Unknown advertised formats retain the full identifier instead of guessing. These
 fields are optional: existing released catalogs already supply backend identity,
 and older known canonical Whisper identifiers retain compatibility.
+
+### History storage and browser editors
+
+Enabling and saving history retention automatically checks/creates the selected
+Antfly table, including before the first dictation. Uploads also prepare their
+original destination and repair a subsequently removed table once. Setup is
+shared between uploads; authentication and service failures preserve local
+history and pending uploads rather than being treated as a missing table.
+Disabling retention never creates storage or enables new uploads. External
+servers must grant the configured credential permission to create a missing table.
+
+A history entry’s **Not pasted** label describes delivery into the destination app,
+not whether the entry was saved. Local retention and server-sync status are shown
+separately. Dictation still works while optional server history is unavailable.
+
+For Chrome and other rich web editors, click inside the message body before using
+the global shortcut. Field capture requests the application’s accessibility tree
+and briefly retries while it becomes available. It follows only the focused
+element’s advertised editor chain, never searches a page for an arbitrary field.
+Secure/disabled fields, changed focus, and unresponsive accessibility providers
+keep the result available to copy; automatic Enter still requires confirmed paste.
+A test inside Antfly Dictation does not capture an external editor.
+
+Native browser qualification: open a local page containing an autofocus input,
+textarea, and `contenteditable` message body in a fresh Chrome window/profile.
+Verify capture before a screen reader has activated browser accessibility, then
+verify switching fields/windows, secure fields, and toggling Accessibility access.
+Use synthetic text; Gmail compose should also be rechecked on an affected Mac.

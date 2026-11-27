@@ -875,3 +875,148 @@ extension ClientTests {
     #expect(result.timing?.firstEvent != nil && result.timing?.firstDraft != nil)
   }
 }
+
+private final class HistoryRequestTrace: @unchecked Sendable {
+  private let lock = NSLock()
+  private var calls: [String] = []
+  func record(_ request: URLRequest) -> Int {
+    let key = (request.httpMethod ?? "GET") + " " + request.url!.path
+    return lock.withLock {
+      calls.append(key)
+      return calls.filter { $0 == key }.count
+    }
+  }
+  var requests: [String] { lock.withLock { calls } }
+}
+
+extension ClientTests {
+  @Test(arguments: [401, 403, 429, 503])
+  func tablePreparationDoesNotCreateOnAuthOrServiceFailures(status: Int) async throws {
+    let trace = HistoryRequestTrace()
+    FixtureProtocol.reply = { request in
+      _ = trace.record(request)
+      return (status, "application/json", "{\"error\":\"unavailable\"}")
+    }
+    do {
+      try await client().setup(table: "dictation")
+      Issue.record("Expected preparation failure")
+    } catch let failure as ServerFailure { #expect(failure.status == status) }
+    #expect(trace.requests == ["GET /db/v1/tables/dictation"])
+  }
+
+  @Test func missingHistoryTableIsCreatedAndPreparationIsShared() async throws {
+    let trace = HistoryRequestTrace()
+    FixtureProtocol.reply = { request in
+      _ = trace.record(request)
+      if request.httpMethod == "GET" { return (404, "application/json", "{}") }
+      #expect(request.httpMethod == "POST")
+      return (201, "application/json", "{}")
+    }
+    let storage = HistoryStorage()
+    let destination = HistoryDestination(server: "https://antfly.example", table: "dictation")
+    let connection = try client()
+    try await withThrowingTaskGroup(of: Void.self) { group in
+      for _ in 0..<10 {
+        group.addTask { try await storage.prepare(destination, client: connection) }
+      }
+      try await group.waitForAll()
+    }
+    #expect(trace.requests == ["GET /db/v1/tables/dictation", "POST /db/v1/tables/dictation"])
+  }
+
+  @Test func concurrentTableCreatorIsConfirmedBeforeUse() async throws {
+    let trace = HistoryRequestTrace()
+    FixtureProtocol.reply = { request in
+      let count = trace.record(request)
+      if request.httpMethod == "GET" { return (count == 1 ? 404 : 200, "application/json", "{}") }
+      return (409, "application/json", "{}")
+    }
+    try await client().setup(table: "dictation")
+    #expect(
+      trace.requests == [
+        "GET /db/v1/tables/dictation", "POST /db/v1/tables/dictation",
+        "GET /db/v1/tables/dictation",
+      ])
+  }
+
+  @Test func historyUploadRecreatesRemovedTableAndRetriesOnlyOnce() async throws {
+    let trace = HistoryRequestTrace()
+    FixtureProtocol.reply = { request in
+      let count = trace.record(request)
+      if request.httpMethod == "GET" { return (count == 1 ? 200 : 404, "application/json", "{}") }
+      if request.url!.path.hasSuffix("/batch") {
+        return (count == 1 ? 404 : 200, "application/json", "{}")
+      }
+      return (201, "application/json", "{}")
+    }
+    let storage = HistoryStorage()
+    let destination = HistoryDestination(server: "https://antfly.example", table: "dictation")
+    let entry = HistoryEntry(
+      preset: "Test", model: "test", application: "", raw: "test", text: "test", status: "ready")
+    let connection = try client()
+    try await storage.upload(entry, destination: destination, client: connection)
+    try await storage.upload(entry, destination: destination, client: connection)
+    #expect(
+      trace.requests == [
+        "GET /db/v1/tables/dictation", "POST /db/v1/tables/dictation/batch",
+        "GET /db/v1/tables/dictation", "POST /db/v1/tables/dictation",
+        "POST /db/v1/tables/dictation/batch", "POST /db/v1/tables/dictation/batch",
+      ])
+  }
+
+  @Test @MainActor func enablingHistoryPreparesStorageWithoutWaitingForADictation() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let trace = HistoryRequestTrace()
+    FixtureProtocol.reply = { request in
+      _ = trace.record(request)
+      return (request.httpMethod == "GET" ? 404 : 201, "application/json", "{}")
+    }
+    let connection = try client()
+    let store = Store(
+      directory: root, registerHotkey: false, clientFactory: { _ in connection },
+      credentialReader: { _ in "" }, credentialWriter: { _, _ in })
+    store.config.connectionMode = .external
+    store.config.server = "https://antfly.example"
+    store.config.retainHistory = true
+    store.save()
+    await store.settingsTask?.value
+    await store.historyStorageTask?.value
+    #expect(store.history.isEmpty)
+    #expect(trace.requests == ["GET /db/v1/tables/dictation", "POST /db/v1/tables/dictation"])
+    store.config.retainHistory = false
+    store.save()
+    await store.settingsTask?.value
+    #expect(trace.requests.count == 2)
+    await store.prepareToQuit()
+  }
+}
+
+extension ClientTests {
+  @Test func failedHistoryPreparationCanRetryAndPersistentUpload404IsBounded() async throws {
+    let trace = HistoryRequestTrace()
+    FixtureProtocol.reply = { request in
+      let count = trace.record(request)
+      if request.httpMethod == "GET" {
+        return (count == 1 ? 503 : 200, "application/json", "{}")
+      }
+      return (404, "application/json", "{}")
+    }
+    let storage = HistoryStorage()
+    let destination = HistoryDestination(server: "https://antfly.example", table: "dictation")
+    let connection = try client()
+    do {
+      try await storage.prepare(destination, client: connection)
+      Issue.record("Expected temporary storage failure")
+    } catch let error as ServerFailure { #expect(error.status == 503) }
+    let entry = HistoryEntry(
+      preset: "Test", model: "test", application: "", raw: "test", text: "test", status: "ready")
+    do {
+      try await storage.upload(entry, destination: destination, client: connection)
+      Issue.record("Persistent upload failure must remain pending")
+    } catch let error as ServerFailure { #expect(error.status == 404) }
+    #expect(trace.requests.filter { $0.hasSuffix("/batch") }.count == 2)
+    #expect(trace.requests.filter { $0 == "GET /db/v1/tables/dictation" }.count == 3)
+    #expect(!trace.requests.contains("POST /db/v1/tables/dictation"))
+  }
+}
