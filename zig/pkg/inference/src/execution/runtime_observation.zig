@@ -487,6 +487,7 @@ pub const CudaDecoderWorkspace = struct {
     planned_scratch_bytes: usize,
     bound_scratch_bytes: usize,
     metadata_bytes: usize,
+    attention_scratch_bytes: usize,
     head_bytes: usize,
     readback_bytes: usize,
     readback_backing: ReadbackBacking,
