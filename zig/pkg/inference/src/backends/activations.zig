@@ -608,12 +608,16 @@ fn vectorMax(data: []const f32) f32 {
 /// Select from caller-owned logits with explicit suppression. Preserve argmax's
 /// tie/NaN/empty conventions and its existing scan; no second vocabulary bank.
 pub fn argmaxSuppressedInPlace(data: []f32, suppressed: []const i32) usize {
+    applySuppressTokenMask(data, suppressed);
+    return argmax(data);
+}
+
+pub fn applySuppressTokenMask(data: []f32, suppressed: []const i32) void {
     for (suppressed) |token| {
         if (token < 0) continue;
         const index: usize = @intCast(token);
         if (index < data.len) data[index] = -std.math.inf(f32);
     }
-    return argmax(data);
 }
 
 /// Return the index of the largest value.

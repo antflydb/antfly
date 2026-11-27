@@ -7870,14 +7870,7 @@ pub const NativeGenerationPipeline = struct {
         };
     }
 
-    fn applySuppressTokenMask(logits: []f32, token_ids: []const i32) void {
-        for (token_ids) |token_id| {
-            if (token_id < 0) continue;
-            const idx: usize = @intCast(token_id);
-            if (idx >= logits.len) continue;
-            logits[idx] = -std.math.inf(f32);
-        }
-    }
+    const applySuppressTokenMask = activations.applySuppressTokenMask;
 
     fn isSuppressedToken(token_id: u32, token_ids: []const i32) bool {
         return decoder_forward.isSuppressedToken(token_id, token_ids);

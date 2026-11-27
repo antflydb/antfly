@@ -818,7 +818,9 @@ pub const Runtime = struct {
         const processed = request.processed_rows;
         const output_intent = request.output_intent;
         const capture_last_hidden = request.capture_hidden;
-        const allow_shared_kv_prefill = request.shared_kv_pruning;
+        const model = self.forward.context.gpt_config;
+        const metal_e2b = self.forward.context.cb.kind() == .metal and model.isGemma4E2bDenseLayout();
+        const allow_shared_kv_prefill = request.shared_kv_pruning and (!metal_e2b or prefilled_tokens == 0);
         const use_metal_target_last_logits = request.metal_target_last_logits;
         const prefer_cuda_direct_last_logits = request.cuda_direct_last_logits;
         const can_use_typed_prefill_outputs = request.typed_outputs;
@@ -841,7 +843,11 @@ pub const Runtime = struct {
         const shared_prefill = if (allow_shared_kv_prefill and
             !(self.forward.context.cb.kind() == .metal and request.prepared_metal_whole_prompt and output_intent != .kv_only) and
             (output_intent == .kv_only or output_intent == .last_logits or output_intent == .greedy_token))
-            try gpt_arch.trySharedKvPrefill(self.forward.context.cb, allocator, self.forward.context.gpt_config.*, chunk, total_chunk_end, &decode_context, output_intent)
+            gpt_arch.trySharedKvPrefill(self.forward.context.cb, allocator, model.*, chunk, total_chunk_end, &decode_context, output_intent) catch |err| {
+                if (metal_e2b and try retryAfterMemoryBudgetExceeded(&decode_runtime, chunk.len, request.attempted_chunk_size, &resized_chunk_size, request.allow_resize, err))
+                    return .{ .retry_chunk_size = resized_chunk_size };
+                return err;
+            }
         else
             null;
         const metal_prepared: ?Output = if (shared_prefill == null and request.prepared_metal_whole_prompt)
@@ -1049,14 +1055,8 @@ pub const Runtime = struct {
             .kv_only => .{},
             .last_logits => .{ .last_logits = try output.takeHostLogitsWithCleanup(allocator, cleanup) },
             .greedy_token => blk: {
-                const suppressions = self.forward.context.gpt_config.suppressTokenIds();
-                const token = if (suppressions.len == 0 or (if (output.prepared_tail) |tail| tail.greedy_token_id != null else false))
-                    try output.greedyTokenWithCleanup(allocator, self.forward.context.gpt_config.vocab_size, cleanup)
-                else masked: {
-                    const logits = try output.takeHostLogitsWithCleanup(allocator, cleanup);
-                    defer allocator.free(logits);
-                    break :masked @as(i64, @intCast(@import("../backends/activations.zig").argmaxSuppressedInPlace(logits, suppressions)));
-                };
+                const config = self.forward.context.gpt_config;
+                const token = try output.greedyTokenSuppressWithCleanup(allocator, config.vocab_size, config.suppressTokenIds(), cleanup);
                 if (token < 0) return error.InvalidModelOutput;
                 break :blk .{ .greedy_token = @intCast(token) };
             },
@@ -1855,7 +1855,7 @@ fn checkMetalCompiledChunk(cb: ComputeBackend, native_reference: ComputeBackend)
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     const a = std.testing.allocator;
     const backend_session = @import("../backends/session.zig");
-    const model = CompiledPrefillFixture.config();
+    var model = CompiledPrefillFixture.config();
     const ids = [_]i64{ 0, 1 };
     const expected = try CompiledPrefillFixture.eager(native_reference, model, &ids);
     defer a.free(expected);
@@ -1912,6 +1912,37 @@ fn checkMetalCompiledChunk(cb: ComputeBackend, native_reference: ComputeBackend)
         if (scenario == 1) for (expected, result.last_logits.?) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.001);
         if (scenario == 2) try std.testing.expectEqual(@as(usize, if (expected[1] > expected[0]) 1 else 0), result.greedy_token.?);
         try std.testing.expectEqual(@as(usize, 2), state.total_tokens);
+    }
+
+    const unmasked = try CompiledPrefillFixture.eager(native_reference, model, &.{ 0, 1, 1 });
+    defer a.free(unmasked);
+    const suppressed: i32 = if (unmasked[1] > unmasked[0]) 1 else 0;
+    model.suppress_token_ids_len = 1;
+    model.suppress_token_ids[0] = suppressed;
+    var executor = try graph_mod.metal_executor.createModelExecutor(a, session, model, .f16, null);
+    defer executor.deinit();
+    var model_instance = try executor.createRuntime(a);
+    defer model_instance.deinit();
+    for (ids, 0..) |id, index| {
+        var result = try model_instance.prefill(a, .{
+            .input_ids = &.{id},
+            .seq_len = index + 1,
+            .query_seq_len = 1,
+            .attention_mode = .paged_prefill,
+            .kv_only = true,
+        });
+        defer result.deinit(a);
+        try std.testing.expect(result.device_logits != null);
+    }
+    var history = [_]i64{ 0, 1, 1, 0 };
+    for (2..4) |position| {
+        const result = try model_instance.decodeSample(a, .{
+            .decode = .{ .token_id = history[position], .position = position, .attention_mode = .paged_decode },
+            .sampling = .{ .temperature = 1, .top_k = 1 },
+            .token_history = history[0 .. position + 1],
+        });
+        try std.testing.expectEqual(@as(i64, 1 - suppressed), result.token_id);
+        if (position + 1 < history.len) history[position + 1] = result.token_id;
     }
 }
 

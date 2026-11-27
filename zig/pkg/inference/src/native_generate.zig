@@ -6439,6 +6439,14 @@ fn liveWholeModelExecutorRequested(
     );
 }
 
+fn liveWholeModelFirstGreedyToken(
+    output: *graph_mod.model_runtime.ModelOutput,
+    allocator: std.mem.Allocator,
+    config: *const gpt_mod.Config,
+) !i32 {
+    return @intCast(try output.greedyTokenSuppress(allocator, config.vocab_size, config.suppressTokenIds()));
+}
+
 fn liveWholeModelShouldStopOnEos(gpt_config: gpt_mod.Config, ignore_eos: bool, token_id: i32) bool {
     return !ignore_eos and token_id >= 0 and gpt_config.isEosToken(@intCast(token_id));
 }
@@ -6484,6 +6492,7 @@ fn runLiveWholeModelExecutorReuseProbe(
     while (processed < prompt_ids.len) {
         const chunk_end = @min(prompt_ids.len, processed + @max(prefill_chunk_size, 1));
         if (output_accum) |*owned| owned.deinit(allocator);
+        output_accum = null;
         output_accum = try runtime_model.prefill(allocator, .{
             .input_ids = prompt_ids[processed..chunk_end],
             .seq_len = chunk_end,
@@ -6491,6 +6500,7 @@ fn runLiveWholeModelExecutorReuseProbe(
             .attention_mode = .paged_prefill,
             .max_inflight_tokens = if (allow_swa_ring) @max(prefill_chunk_size, 1) else 0,
             .allow_swa_ring = allow_swa_ring,
+            .kv_only = chunk_end < prompt_ids.len,
             .force_host_logits = forcePrefillHostLogits(),
             .prefer_greedy_token = prefillGreedyTokenEnabled() and chunk_end == prompt_ids.len,
         });
@@ -6499,7 +6509,7 @@ fn runLiveWholeModelExecutorReuseProbe(
     const finished_prefill_at = std.Io.Timestamp.now(io, .awake);
     var first_token_at = finished_prefill_at;
     if (runtime_model.capabilities().supports_greedy_decode) {
-        _ = try output_accum.?.greedyToken(allocator, gpt_config.vocab_size);
+        _ = try liveWholeModelFirstGreedyToken(&output_accum.?, allocator, &gpt_config);
         first_token_at = std.Io.Timestamp.now(io, .awake);
     }
     if (output_accum) |*owned| owned.deinit(allocator);
@@ -6655,6 +6665,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
         while (processed < prompt_ids.len) {
             const chunk_end = @min(prompt_ids.len, processed + prefill_chunk_size);
             if (output_accum) |*owned| owned.deinit(allocator);
+            output_accum = null;
             output_accum = runtime_model.prefill(allocator, .{
                 .input_ids = prompt_ids[processed..chunk_end],
                 .seq_len = chunk_end,
@@ -6680,27 +6691,15 @@ fn tryRunLiveWholeModelExecutorGenerate(
     var generated: usize = 0;
     var first_token_at: ?std.Io.Timestamp = null;
     while (generated < max_tokens) {
-        const sampled_token_i32: i32 = if (generated == 0) blk: {
-            if (use_greedy_decode) {
-                break :blk @intCast(try output.greedyToken(allocator, gpt_config.vocab_size));
-            }
-            const output_logits = try output.hostLogits(allocator);
-            traceGenerateTopLogits("prefill", generated, output_logits);
-            try dumpGenerateLogits(allocator, io, dump_generate_logits_path, "prefill", generated, output_logits);
-            break :blk @intCast(generation.sampleTokenFromLogits(
-                allocator,
-                output_logits,
-                config,
-                all_token_ids.items,
-            ));
-        } else if (use_greedy_decode) blk: {
+        const sampled_token_i32: i32 = if (use_greedy_decode) blk: {
+            if (generated == 0) break :blk try liveWholeModelFirstGreedyToken(&output, allocator, &gpt_config);
             const greedy = try runtime_model.decodeGreedy(allocator, .{
                 .token_id = all_token_ids.items[all_token_ids.items.len - 1],
                 .position = all_token_ids.items.len - 1,
                 .attention_mode = .paged_decode,
             });
             break :blk @intCast(greedy.token_id);
-        } else if (use_sample_decode) blk: {
+        } else if (generated != 0 and use_sample_decode) blk: {
             const sampled = try runtime_model.decodeSample(allocator, .{
                 .decode = .{
                     .token_id = all_token_ids.items[all_token_ids.items.len - 1],
@@ -6712,14 +6711,17 @@ fn tryRunLiveWholeModelExecutorGenerate(
             });
             break :blk @intCast(sampled.token_id);
         } else blk: {
-            const output_logits = try output.hostLogits(allocator);
-            traceGenerateTopLogits("decode", generated, output_logits);
-            try dumpGenerateLogits(allocator, io, dump_generate_logits_path, "decode", generated, output_logits);
-            break :blk @intCast(generation.sampleTokenFromLogits(
+            const output_logits = try output.takeHostLogits(allocator);
+            defer allocator.free(output_logits);
+            const stage = if (generated == 0) "prefill" else "decode";
+            traceGenerateTopLogits(stage, generated, output_logits);
+            try dumpGenerateLogits(allocator, io, dump_generate_logits_path, stage, generated, output_logits);
+            break :blk @intCast(try graph_mod.model_runtime.sampleTokenFromLogitsSuppressInPlace(
                 allocator,
                 output_logits,
-                config,
+                sampling_config,
                 all_token_ids.items,
+                gpt_config.suppressTokenIds(),
             ));
         };
         const next_token_i32 = if (teacher_force_token_ids) |ids| ids[generated] else sampled_token_i32;
@@ -9450,6 +9452,16 @@ test "live whole-model prewarm stays within admitted prefill geometry" {
         runtime.tier.memory.generation_default_prefill_chunk_tokens,
         liveWholeModelPrefillChunkSize(.{}, 65_536),
     );
+}
+
+test "live whole-model first greedy token honors configured suppression" {
+    const allocator = std.testing.allocator;
+    var config = gpt_mod.Config{ .vocab_size = 3, .suppress_token_ids_len = 1 };
+    config.suppress_token_ids[0] = 1;
+    var output = graph_mod.model_runtime.ModelOutput{ .logits = try allocator.dupe(f32, &.{ 0, 9, 8 }) };
+    defer output.deinit(allocator);
+    try std.testing.expectEqual(@as(i32, 2), try liveWholeModelFirstGreedyToken(&output, allocator, &config));
+    try std.testing.expectEqualSlices(f32, &.{ 0, 9, 8 }, try output.hostLogits(allocator));
 }
 
 test "live whole-model generation excludes all EOS tokens unless ignored" {
