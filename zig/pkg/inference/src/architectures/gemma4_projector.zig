@@ -2267,9 +2267,8 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
     } else countTrue(subsampled.valid_mask);
     if (valid_count == 0) return error.EmptyEmbeddingInput;
 
-    var layer_inputs = try AudioLayerInputs.initCached(cb, allocator, store, cfg, subsampled.valid_mask);
+    var layer_inputs = try AudioLayerInputs.initCached(cb, allocator, store, cfg, subsampled.valid_mask, subsampled.segments);
     defer layer_inputs.deinit(cb);
-    try layer_inputs.setSegments(cb, subsampled.segments);
 
     const grouped_frames = cohort and cb.kind() == .metal and store.huggingface and cfg.exclude_farthest_key and
         !cb.decoderRuntimeHasActiveFrame() and !cb.decoderRuntimeHasSubmittedFrame() and !profile_enabled and std.meta.eql(audioHostOps(), AudioHostOps{}) and platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") == null and
@@ -4590,14 +4589,14 @@ const AudioLayerInputs = struct {
     scales: []CT,
 
     fn init(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: AudioConfig, valid_mask: []const bool, per_dim_scales: []const []const f32) !AudioLayerInputs {
-        return initInternal(cb, allocator, null, cfg, valid_mask, per_dim_scales);
+        return initInternal(cb, allocator, null, cfg, valid_mask, &.{}, per_dim_scales);
     }
 
-    fn initCached(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, valid_mask: []const bool) !AudioLayerInputs {
-        return initInternal(cb, allocator, store, cfg, valid_mask, &.{});
+    fn initCached(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, valid_mask: []const bool, segments: []const usize) !AudioLayerInputs {
+        return initInternal(cb, allocator, store, cfg, valid_mask, segments, &.{});
     }
 
-    fn initInternal(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: ?*ProjectorWeights, declared_cfg: AudioConfig, valid_mask: []const bool, per_dim_scales: []const []const f32) !AudioLayerInputs {
+    fn initInternal(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: ?*ProjectorWeights, declared_cfg: AudioConfig, valid_mask: []const bool, segments: []const usize, per_dim_scales: []const []const f32) !AudioLayerInputs {
         const cfg = try audioConfigForBackend(cb, declared_cfg);
         if (store == null and per_dim_scales.len != cfg.block_count) return error.InvalidTensorShape;
         const cached = if (store) |weights| weights.gguf == null else false;
@@ -4606,12 +4605,12 @@ const AudioLayerInputs = struct {
         const rel_in = if (cached) (try cb.modelConstant(rel_key, null)) orelse try prepareAudioRelative(cb, allocator, cfg, rel_key) else try prepareAudioRelative(cb, allocator, cfg, null);
         errdefer cb.free(rel_in);
 
-        const valid = try allocator.alloc(f32, valid_mask.len);
-        defer allocator.free(valid);
-        for (valid_mask, 0..) |flag, i| valid[i] = if (flag) 1.0 else 0.0;
-        const valid_shape = [_]i32{@intCast(valid_mask.len)};
-        const valid_ct = try deviceResidentFromFloat32(cb, valid, &valid_shape);
-        errdefer cb.free(valid_ct);
+        const mask = try bindMasks(cb, allocator, valid_mask, segments);
+        errdefer {
+            cb.free(mask.valid);
+            if (mask.starts) |tensor| cb.free(tensor);
+            if (mask.tags) |tensor| cb.free(tensor);
+        }
 
         const ones_key = try audioCacheConfig(cfg).towerKey(&key_buf, .ones, 0);
         const ones = if (cached) (try cb.modelConstant(ones_key, null)) orelse try prepareAudioOnes(cb, allocator, cfg, ones_key) else try prepareAudioOnes(cb, allocator, cfg, null);
@@ -4682,45 +4681,53 @@ const AudioLayerInputs = struct {
         return .{
             .allocator = allocator,
             .valid_mask = valid_mask,
+            .segments = segments,
             .rel_in = rel_in,
-            .valid_ct = valid_ct,
+            .valid_ct = mask.valid,
+            .segment_starts = mask.starts,
+            .segment_valid = mask.tags,
             .ones = ones,
             .scales_host = scales_host_slice,
             .scales = scales_slice,
         };
     }
 
-    fn setSegments(self: *AudioLayerInputs, cb: *const ComputeBackend, segments: []const usize) !void {
-        self.segments = segments;
-        if (segments.len == 0 or (cb.kind() != .metal and cb.kind() != .cuda)) return;
-        if (self.valid_mask.len > 16777216) return error.InvalidTensorShape;
-        const rows = self.valid_mask.len;
-        const planes = try self.allocator.alloc(f32, rows * 2);
-        defer self.allocator.free(planes);
-        const starts = planes[0..rows];
-        const tags = planes[rows..];
+    const MaskBindings = struct { valid: CT, starts: ?CT = null, tags: ?CT = null };
+
+    fn bindMasks(cb: *const ComputeBackend, allocator: std.mem.Allocator, valid_mask: []const bool, segments: []const usize) !MaskBindings {
+        const grouped = segments.len != 0 and (cb.kind() == .metal or cb.kind() == .cuda);
+        const rows = valid_mask.len;
+        if (grouped and rows > 16777216) return error.InvalidTensorShape;
+        const planes = try allocator.alloc(f32, if (grouped) rows * 3 else rows);
+        defer allocator.free(planes);
+        const valid = planes[0..rows];
+        for (valid, valid_mask) |*value, flag| value.* = if (flag) 1 else 0;
+        if (!grouped) return .{ .valid = try deviceResidentFromFloat32(cb, valid, &.{@intCast(rows)}) };
+        const starts = planes[rows .. 2 * rows];
+        const tags = planes[2 * rows ..];
         var offset: usize = 0;
         for (segments) |span| {
-            if (span == 0 or span > starts.len - offset) return error.InvalidTensorShape;
+            if (span == 0 or span > rows - offset) return error.InvalidTensorShape;
             for (offset..offset + span) |row| {
                 starts[row] = @floatFromInt(offset);
-                tags[row] = @as(f32, @floatFromInt(offset + 1)) * @as(f32, if (self.valid_mask[row]) 1 else -1);
+                tags[row] = @as(f32, @floatFromInt(offset + 1)) * (2 * valid[row] - 1);
             }
             offset += span;
         }
-        if (offset != starts.len) return error.InvalidTensorShape;
-        // Both planes have the same invocation lifetime. The slices
-        // retain the uploaded bank and keep the vector ABI of each op.
+        if (offset != rows) return error.InvalidTensorShape;
+        // These planes have one invocation lifetime and retain the same
+        // upload, while individual kernels keep their original vector ABI.
         const bank = try deviceResidentFromFloat32(cb, planes, &.{ @intCast(planes.len), 1 });
         defer cb.free(bank);
-        const starts_ct = try self.segmentVector(cb, bank, 0, rows);
+        const valid_ct = try segmentVector(cb, allocator, bank, 0, rows);
+        errdefer cb.free(valid_ct);
+        const starts_ct = try segmentVector(cb, allocator, bank, rows, rows);
         errdefer cb.free(starts_ct);
-        self.segment_valid = try self.segmentVector(cb, bank, rows, rows);
-        self.segment_starts = starts_ct;
+        return .{ .valid = valid_ct, .starts = starts_ct, .tags = try segmentVector(cb, allocator, bank, 2 * rows, rows) };
     }
 
-    fn segmentVector(self: *const AudioLayerInputs, cb: *const ComputeBackend, bank: CT, offset: usize, rows: usize) !CT {
-        const view = try cb.sliceRows2D(self.allocator, bank, offset, rows, 1);
+    fn segmentVector(cb: *const ComputeBackend, allocator: std.mem.Allocator, bank: CT, offset: usize, rows: usize) !CT {
+        const view = try cb.sliceRows2D(allocator, bank, offset, rows, 1);
         defer cb.free(view);
         return cb.primReshape(view, &.{@intCast(rows)});
     }
@@ -10029,10 +10036,10 @@ fn checkAudioScaleCache(cb: ComputeBackend, _: ComputeBackend) !void {
     defer weights.deinit();
     const cfg = embeddingGemma2AudioConfig();
     const valid: [17]bool = @splat(true);
-    var first = try AudioLayerInputs.initCached(&cb, a, &weights, cfg, &valid);
+    var first = try AudioLayerInputs.initCached(&cb, a, &weights, cfg, &valid, &.{});
     defer first.deinit(&cb);
     const before = cb.trainingRuntimeStats().d2h_bytes;
-    var second = try AudioLayerInputs.initCached(&cb, a, &weights, cfg, &valid);
+    var second = try AudioLayerInputs.initCached(&cb, a, &weights, cfg, &valid, &.{});
     defer second.deinit(&cb);
     try std.testing.expectEqual(before, cb.trainingRuntimeStats().d2h_bytes);
     try std.testing.expectEqual(@as(u64, 12), compute.embedding_gemma2_audio_constant_hits);
@@ -10237,24 +10244,26 @@ fn checkSubsampleBatchGeometry(cb: ComputeBackend, _: ComputeBackend, base_frame
     }
     try before.expectUnchanged(cb);
     {
-        var metadata_config = cfg;
-        metadata_config.block_count = 0;
-        var inputs = try AudioLayerInputs.init(&cb, a, metadata_config, batch.valid_mask, &.{});
-        defer inputs.deinit(&cb);
         const transfers = @import("../execution/transfer_audit.zig");
         var audit: transfers.Audit = .{ .forbid_device_host_access = true };
-        {
+        const inputs = bound: {
             try transfers.begin(&audit);
             defer transfers.end();
-            try inputs.setSegments(&cb, batch.segments);
-        }
+            break :bound try AudioLayerInputs.bindMasks(&cb, a, batch.valid_mask, batch.segments);
+        };
+        defer cb.free(inputs.valid);
+        defer cb.free(inputs.starts.?);
+        defer cb.free(inputs.tags.?);
         if (cb.kind() == .cuda) {
             try std.testing.expectEqual(@as(u64, 1), audit.upload_calls);
-            try std.testing.expectEqual(@as(u64, batch.seq_len * 2 * @sizeOf(f32)), audit.upload_bytes);
+            try std.testing.expectEqual(@as(u64, batch.seq_len * 3 * @sizeOf(f32)), audit.upload_bytes);
         }
-        const starts = try cb.toFloat32(inputs.segment_starts.?, a);
+        const validity = try cb.toFloat32(inputs.valid, a);
+        defer a.free(validity);
+        for (batch.valid_mask, validity) |flag, value| try std.testing.expectEqual(@as(f32, if (flag) 1 else 0), value);
+        const starts = try cb.toFloat32(inputs.starts.?, a);
         defer a.free(starts);
-        const tags = try cb.toFloat32(inputs.segment_valid.?, a);
+        const tags = try cb.toFloat32(inputs.tags.?, a);
         defer a.free(tags);
         try std.testing.expectEqual(batch.seq_len, starts.len);
         try std.testing.expectEqual(batch.seq_len, tags.len);
