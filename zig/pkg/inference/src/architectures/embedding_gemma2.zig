@@ -894,10 +894,7 @@ fn packedPerLayerInputs(cb: *const ComputeBackend, cfg: Config, embeddings: CT, 
     defer cb.free(normalized);
     const result = (try cb.reshape2d(normalized, rows, width)) orelse return error.EmbeddingGemma2OperationUnavailable;
     errdefer cb.free(result);
-    if (frame.owns) {
-        try frame.finish();
-        try cb.releaseFrameActivationViews();
-    }
+    try frame.finishWithActivationViews();
     return result;
 }
 

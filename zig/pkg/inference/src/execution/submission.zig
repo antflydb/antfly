@@ -91,6 +91,22 @@ pub const Scope = struct {
         try self.finishUsing(self.backend.vtable.regions.commands.submitAndWaitFrame.?);
     }
 
+    /// Complete an owned frame and retire only its transient activation views.
+    pub fn finishWithActivationViews(self: *Scope) !void {
+        if (!self.owns) return;
+        try self.finish();
+        try self.backend.releaseFrameActivationViews();
+    }
+
+    /// Preserve successor views while waiting for and retiring its predecessor.
+    pub fn submitWithActivationViews(self: *Scope, pending: *Pending) !void {
+        if (!self.owns or pending.backend != self.backend) return error.InvalidFrameSubmissionOwner;
+        if (self.submit_attempted) return error.FrameSubmissionAlreadyAttempted;
+        try self.backend.detachFrameActivationViews();
+        try pending.wait();
+        try self.submitInto(pending);
+    }
+
     pub fn submitInto(self: *Scope, pending: *Pending) !void {
         if (!self.owns or pending.active or pending.backend != self.backend) return error.InvalidFrameSubmissionOwner;
         const commands = self.backend.vtable.regions.commands;
@@ -141,6 +157,18 @@ test "submission scopes preserve foreign batches unwind encoding and never repla
         starts: usize = 0,
         commits: usize = 0,
         cancels: usize = 0,
+        released_views: usize = 0,
+        detached_views: usize = 0,
+        fn releaseViews(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(!self.active and !self.submitted);
+            self.released_views += 1;
+        }
+        fn detachViews(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.active and self.submitted);
+            self.detached_views += 1;
+        }
         fn begin(ptr: *anyopaque) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.decline) return false;
@@ -181,10 +209,10 @@ test "submission scopes preserve foreign batches unwind encoding and never repla
     };
     var probe = Probe{};
     var table: ops.ComputeBackend.VTable = undefined;
-    table.regions = .{ .commands = .{ .beginFrame = Probe.begin, .hasActiveFrame = Probe.activeFrame, .submitAndWaitFrame = Probe.submit, .submitFrame = Probe.submitAsync, .waitSubmittedFrame = Probe.wait, .hasSubmittedFrame = Probe.submittedFrame, .cancelFrame = Probe.cancel } };
+    table.regions = .{ .commands = .{ .beginFrame = Probe.begin, .hasActiveFrame = Probe.activeFrame, .submitAndWaitFrame = Probe.submit, .submitFrame = Probe.submitAsync, .waitSubmittedFrame = Probe.wait, .hasSubmittedFrame = Probe.submittedFrame, .cancelFrame = Probe.cancel, .releaseActivationViews = Probe.releaseViews, .detachActivationViews = Probe.detachViews } };
     const backend = ops.ComputeBackend{ .ptr = &probe, .vtable = &table };
     var completed = try Scope.begin(&backend);
-    try completed.finish();
+    try completed.finishWithActivationViews();
     completed.deinit();
     try std.testing.expectEqual(@as(usize, 1), probe.commits);
     try std.testing.expectEqual(@as(usize, 0), probe.cancels);
@@ -198,7 +226,8 @@ test "submission scopes preserve foreign batches unwind encoding and never repla
     probe.active = true;
     var foreign = try Scope.beginIfNeeded(&backend, false);
     try std.testing.expect(foreign.foreign);
-    try foreign.finish();
+    try foreign.finishWithActivationViews();
+    try std.testing.expectEqual(@as(usize, 1), probe.released_views);
     foreign.deinit();
     try std.testing.expect(probe.active);
     try std.testing.expectEqual(@as(usize, 2), probe.starts);
@@ -233,10 +262,10 @@ test "submission scopes preserve foreign batches unwind encoding and never repla
     var pipelined = try Scope.beginPipelined(&backend);
     defer pipelined.deinit();
     try std.testing.expect(pipelined.owns and probe.submitted);
-    try Probe.wait(&probe);
-    var pending: Pending = .{ .backend = &backend };
+    var pending: Pending = .{ .backend = &backend, .active = true };
     probe.fail_after_queue = true;
-    try std.testing.expectError(error.SubmissionFailed, pipelined.submitInto(&pending));
+    try std.testing.expectError(error.SubmissionFailed, pipelined.submitWithActivationViews(&pending));
+    try std.testing.expectEqual(@as(usize, 1), probe.detached_views);
     try std.testing.expect(!pipelined.owns and !probe.active and pending.active and probe.submitted);
     try pending.wait();
     try std.testing.expect(!pending.active and !probe.submitted);

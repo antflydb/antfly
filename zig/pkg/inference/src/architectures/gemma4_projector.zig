@@ -1346,10 +1346,7 @@ pub fn encodeVideoBatchInput(cb: *const ComputeBackend, allocator: std.mem.Alloc
         defer cb.free(projected);
         const positioned = if (try sourceVisionSequence(cb, cfg, singleGeometry(g))) |_| try addPositionEmbeddingsBatchTensor(cb, allocator, &store, cfg, projected, singleGeometry(g), frames) else try addPositionEmbeddingsDevice(cb, allocator, projected, positions, cfg.vision_hidden, g);
         errdefer cb.free(positioned);
-        if (input_frame.owns) {
-            try input_frame.finish();
-            try cb.releaseFrameActivationViews();
-        }
+        try input_frame.finishWithActivationViews();
         break :input_phase positioned;
     };
     const result = try encodePositionedBatchResidentInto(cb, allocator, &store, cfg, positioned, singleGeometry(g), frames, output);
@@ -2333,12 +2330,9 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
         layer = end;
         if (cohort and frame.owns and (layer % frame_plan.layers == 0 or layer == cfg.block_count)) {
             if (pipelined) {
-                try cb.detachFrameActivationViews();
-                try pending.wait();
-                try frame.submitInto(&pending);
+                try frame.submitWithActivationViews(&pending);
             } else {
-                try frame.finish();
-                try cb.releaseFrameActivationViews();
+                try frame.finishWithActivationViews();
             }
         }
         store.releaseCompletedNativeLayer();
@@ -3415,10 +3409,7 @@ fn audioSubsampleCohort(cb: *const ComputeBackend, a: std.mem.Allocator, store: 
             for (0..span) |t| valid[offsets[index] + t] = features[index].mask[t * 4];
             if (!try cb.copyRows2D(a, hidden, offsets[index], batch_hidden, slot * audio_schedule.subsampledRows(padded_frames), span, cfg.audio_hidden)) return error.UnsupportedResidentGemma4Audio;
         }
-        if (frame.owns) {
-            try frame.finish();
-            try cb.releaseFrameActivationViews();
-        }
+        try frame.finishWithActivationViews();
     }
     return .{ .hidden = hidden, .valid_mask = valid, .seq_len = rows, .segments = segments };
 }
@@ -4318,9 +4309,7 @@ fn encodePositionedBatchResidentInto(cb: *const ComputeBackend, allocator: std.m
             hidden = next;
             if (frame.owns and ((layer + 1) % group == 0 or layer + 1 == cfg.block_count)) {
                 if (pipeline and layer + 1 < cfg.block_count) {
-                    try cb.detachFrameActivationViews();
-                    try pending.wait();
-                    try frame.submitInto(&pending);
+                    try frame.submitWithActivationViews(&pending);
                 } else {
                     try pending.wait();
                     try frame.finish();
@@ -4355,10 +4344,7 @@ fn encodePositionedBatchResidentInto(cb: *const ComputeBackend, allocator: std.m
     const projection_w = try projectorLinearWeightCt(cb, allocator, store, "mm.input_projection.weight", cfg.vision_hidden, cfg.text_hidden);
     const projected = try projectSpatialTensor(cb, allocator, normed_pooled, projection_w, output, batch * geometry.tokenCount(), cfg.vision_hidden, cfg.text_hidden, source_bf16);
     errdefer if (output == null) cb.free(projected);
-    if (projector_frame.owns) {
-        try projector_frame.finish();
-        try cb.releaseFrameActivationViews();
-    }
+    try projector_frame.finishWithActivationViews();
     if (store.gguf == null) try embeddingGemma2StageTensor(cb, allocator, "image_projected", projected);
 
     return .{
@@ -6614,10 +6600,7 @@ fn addPositionEmbeddingsDevice(cb: *const ComputeBackend, allocator: std.mem.All
     defer cb.free(offsets);
     const result = try cb.add(patches, offsets);
     errdefer cb.free(result);
-    if (frame.owns) {
-        try frame.finish();
-        try cb.releaseFrameActivationViews();
-    }
+    try frame.finishWithActivationViews();
     return result;
 }
 
