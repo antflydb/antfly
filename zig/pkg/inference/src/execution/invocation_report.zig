@@ -390,6 +390,7 @@ test "uniform report retains the observed CUDA audio workspace across publicatio
         .plan_origin = .observed,
         .planned_events = 12,
         .planned_arena_bytes = 4096,
+        .repacked_scratch_savings_bytes = 256,
         .bound_arena_bytes = 4096,
         .bound_input_bytes = 512,
         .planned_terminal_bytes = 256,

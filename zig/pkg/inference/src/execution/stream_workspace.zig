@@ -71,6 +71,7 @@ pub const Plan = struct {
     event_count: usize = 0,
     peak: usize = 0,
     scratch_peak: usize = 0,
+    external_scratch_savings_bytes: usize = 0,
     output: ?usize = null,
     recipe: u64 = 0,
     sealed: bool = false,
@@ -273,6 +274,7 @@ pub const Plan = struct {
         for (self.allocations[output + 1 .. self.count], scratch.allocations[output..scratch.count]) |*allocation, packed_slot|
             allocation.lifetime.external_offset = packed_slot.offset();
         self.scratch_peak = scratch.peak;
+        self.external_scratch_savings_bytes = inline_peak - scratch.peak;
     }
 
     pub fn layout(self: *const Plan, prefix_bytes: usize) !Layout {
@@ -705,6 +707,7 @@ test "external workspace packs scratch across a live inline publication" {
     const external = try plan.layoutWithExternalOutput(0);
     try std.testing.expectEqual(@as(usize, 2816), inline_layout.bytes);
     try std.testing.expectEqual(@as(usize, 512), external.bytes);
+    try std.testing.expectEqual(@as(usize, 2304), plan.external_scratch_savings_bytes);
     var scope = try Scope.bind(&plan, external, 0x1000, external.bytes);
     try scope.bindPublishedOutput(0x2000, 2048);
     try std.testing.expectEqual(@as(u64, 0x1000), try scope.allocate(256));
@@ -730,6 +733,7 @@ test "external workspace retains inline offsets when repacking increases peak" {
     }, 1);
     const layout = try plan.layoutWithExternalOutput(0);
     try std.testing.expectEqual(9 * alignment, layout.bytes);
+    try std.testing.expectEqual(@as(usize, 0), plan.external_scratch_savings_bytes);
     var scope = try Scope.bind(&plan, layout, 0x1000, layout.bytes);
     try scope.bindPublishedOutput(0x2000, alignment);
     const first = try scope.allocate(5 * alignment);

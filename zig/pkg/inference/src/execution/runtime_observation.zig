@@ -451,6 +451,9 @@ pub const CudaAudioWorkspace = struct {
     plan_origin: @import("stream_workspace.zig").Origin,
     planned_events: usize,
     planned_arena_bytes: usize,
+    /// Arena capacity saved by repacking the same scratch lifetimes with
+    /// external publication. This excludes the separate output bank.
+    repacked_scratch_savings_bytes: usize,
     bound_arena_bytes: usize,
     bound_input_bytes: usize,
     planned_terminal_bytes: usize,

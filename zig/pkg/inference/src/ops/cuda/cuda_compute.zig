@@ -21210,6 +21210,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         .plan_origin = plan.origin,
         .planned_events = storage.events,
         .planned_arena_bytes = storage.bytes,
+        .repacked_scratch_savings_bytes = if (storage.external_output) plan.external_scratch_savings_bytes else 0,
         .bound_arena_bytes = arena.buffers[0].len,
         .bound_input_bytes = input_bank.len,
         .planned_terminal_bytes = output.bytes,
