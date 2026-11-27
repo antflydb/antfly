@@ -1732,7 +1732,6 @@ pub fn handleTableBatch(
         switch (err) {
             error.ValueTooLong => return .{ .status = 413, .body = try alloc.dupe(u8, "value too large") },
             error.InvalidBatchRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid batch request") },
-            error.ArtifactSeedSourceBindingRequired => return .{ .status = 400, .body = try alloc.dupe(u8, "source_binding_required: a transform that only writes artifact seeds requires expected_version") },
             else => return err,
         }
     };
