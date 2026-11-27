@@ -390,6 +390,9 @@ pub const Options = struct {
 pub const Backend = struct {
     serialized_write_mutex: std.atomic.Mutex = .unlocked,
     allocator: Allocator,
+    /// Advances each time the mirror's state is replaced, under `mutex`:
+    /// work prepared against one state can tell whether it is still current.
+    state_epoch: std.atomic.Value(u64) = .init(0),
     sink: Sink,
     scope: []const u8,
     open_options: backend_types.OpenOptions,
@@ -546,9 +549,49 @@ pub const Backend = struct {
         lockBackend(self);
         const old = self.state;
         self.state = rc;
+        _ = self.state_epoch.fetchAdd(1, .acq_rel);
         releaseState(self.allocator, old);
         self.mutex.unlock();
         self.mirror_invalid.store(false, .release);
+    }
+
+    /// A private, read-only backend over the same sink and scope, loaded
+    /// from the file's tip now. Reads of it never touch this mirror.
+    pub fn openTipView(self: *Backend, allocator: Allocator) !*Backend {
+        const view = try allocator.create(Backend);
+        errdefer allocator.destroy(view);
+        view.* = try Backend.init(allocator, .{ .sink = self.sink, .scope = self.scope, .backend = .{ .read_only = true } });
+        return view;
+    }
+
+    pub fn closeTipView(allocator: Allocator, view: *Backend) void {
+        view.close();
+        allocator.destroy(view);
+    }
+
+    /// Replaces this mirror's state with `view`'s, if the mirror is still
+    /// at `expected_epoch`: nothing was published into it since the view
+    /// was taken.
+    pub fn adoptTipView(self: *Backend, view: *Backend, expected_epoch: u64) bool {
+        lockBackend(view);
+        const next = view.state;
+        retainState(next);
+        view.mutex.unlock();
+        lockBackend(self);
+        if (self.state_epoch.load(.acquire) != expected_epoch) {
+            self.mutex.unlock();
+            lockBackend(view);
+            releaseState(view.allocator, next);
+            view.mutex.unlock();
+            return false;
+        }
+        const old = self.state;
+        self.state = next;
+        _ = self.state_epoch.fetchAdd(1, .acq_rel);
+        releaseState(self.allocator, old);
+        self.mutex.unlock();
+        self.mirror_invalid.store(false, .release);
+        return true;
     }
 
     pub fn close(self: *Backend) void {
@@ -764,7 +807,7 @@ pub const Backend = struct {
         pub fn publishDurable(self: *@This()) void {
             // A bound batch stages no resolver, so it publishes no stamps,
             // and publishing without stamps allocates nothing.
-            std.debug.assert(self.inner.staged_stamps.items.len == 0);
+            std.debug.assert(self.inner.staged_stamps.count() == 0);
             self.inner.publishMirror() catch unreachable;
         }
 
@@ -1075,6 +1118,7 @@ pub const Backend = struct {
             lockBackend(self.backend);
             const old = self.backend.state;
             self.backend.state = replacement;
+            _ = self.backend.state_epoch.fetchAdd(1, .acq_rel);
             self.replacement = old;
             self.backend.mutex.unlock();
         }
@@ -1140,7 +1184,8 @@ pub const Backend = struct {
         // Stamps of the decisions this transaction's tree applies, keyed in
         // `pending_arena`. They reach the backend only with the tree, in
         // `publishMirror`: a tree that is never published leaves none.
-        staged_stamps: std.ArrayListUnmanaged(StagedStamp) = .empty,
+        // Keyed by namespace and key, with the newest stamp staged for it.
+        staged_stamps: std.StringHashMapUnmanaged(u64) = .empty,
 
         fn open(backend: *Backend, read_only: bool) !NamespaceTxn {
             if (backend.mirror_invalid.load(.acquire)) return error.IndexMirrorInvalid;
@@ -1323,7 +1368,11 @@ pub const Backend = struct {
         /// decisions it applies, or neither.
         fn publishMirror(self: *NamespaceTxn) !void {
             const rc = self.rc.?;
-            var owned = try self.backend.ownStamps(self.staged_stamps.items);
+            const staged = try self.pending_arena.allocator().alloc(StagedStamp, self.staged_stamps.count());
+            var entries = self.staged_stamps.iterator();
+            var i: usize = 0;
+            while (entries.next()) |entry| : (i += 1) staged[i] = .{ .key = entry.key_ptr.*, .stamp = entry.value_ptr.* };
+            var owned = try self.backend.ownStamps(staged);
             defer owned.deinit(self.allocator);
             lockBackend(self.backend);
             self.backend.insertStampsLocked(&owned) catch |err| {
@@ -1332,6 +1381,7 @@ pub const Backend = struct {
             };
             const old = self.backend.state;
             self.backend.state = rc;
+            _ = self.backend.state_epoch.fetchAdd(1, .acq_rel);
             releaseState(self.allocator, old);
             self.backend.mutex.unlock();
             self.rc = null;
@@ -1366,8 +1416,11 @@ pub const Backend = struct {
                     if (epochTracked(m.namespace)) {
                         const key = try epochKeyAlloc(arena, m.namespace, m.key);
                         // A newer decision earlier in this commit set the key.
-                        if (self.stagedStampNewer(key, resolver.stamp)) continue;
-                        if (record) try self.staged_stamps.append(arena, .{ .key = key, .stamp = resolver.stamp });
+                        if ((self.staged_stamps.get(key) orelse 0) > resolver.stamp) continue;
+                        if (record) {
+                            const entry = try self.staged_stamps.getOrPut(arena, key);
+                            entry.value_ptr.* = if (entry.found_existing) @max(entry.value_ptr.*, resolver.stamp) else resolver.stamp;
+                        }
                     }
                 }
                 if (self.read_since_write) try self.borrowed_trees.ensureUnusedCapacity(self.allocator, 1);
@@ -1377,13 +1430,6 @@ pub const Backend = struct {
                 else
                     try self.rc.?.state.tree.put(self.allocator, namespace.name, m.key, m.value));
             }
-        }
-
-        fn stagedStampNewer(self: *const NamespaceTxn, key: []const u8, stamp: u64) bool {
-            for (self.staged_stamps.items) |staged| {
-                if (staged.stamp > stamp and std.mem.eql(u8, staged.key, key)) return true;
-            }
-            return false;
         }
 
         /// For a sink that does not resolve: runs each resolver against the
@@ -1807,6 +1853,35 @@ test "native catalog backend publishes decision stamps only with the mirror that
         break;
     }
     try std.testing.expect(fail_index > 0);
+}
+
+// One resolver deciding many keys stages each key's stamp once, in a map
+// keyed by namespace and key, rather than scanning what it staged so far.
+test "native catalog backend stages one stamp per key for a resolver with many outputs" {
+    const a = std.testing.allocator;
+    const key_count = 4096;
+    const Decide = struct {
+        fn resolve(_: *anyopaque, _: TipReader, resolver: *Resolver) anyerror!void {
+            var buf: [32]u8 = undefined;
+            for (0..key_count) |i| try resolver.put("doc_map", try std.fmt.bufPrint(&buf, "doc:{d}", .{i}), "v");
+        }
+    };
+    var sink_impl = ResolvingTestSink{ .inner = .{ .allocator = a } };
+    defer sink_impl.inner.deinit();
+    var backend = try Backend.init(a, .{ .sink = sink_impl.sink(), .scope = "idx1" });
+    defer backend.close();
+    backend.beginPendingDecision();
+    defer backend.finishPendingDecision();
+    var context: u8 = 0;
+    var resolver = Resolver.init(a, &context, Decide.resolve);
+    defer resolver.deinit();
+    resolver.stamp_backend = &backend;
+    var txn = try backend.beginWrite();
+    errdefer txn.abort();
+    try txn.stageResolver(&resolver);
+    try txn.commit();
+    try std.testing.expectEqual(@as(u32, key_count), backend.applied_stamps.count());
+    try std.testing.expectEqual(@as(?u64, resolver.stamp), backend.applied_stamps.get("doc_map\x00doc:4095"));
 }
 
 test "native catalog backend supports prefix cursors over a namespace" {

@@ -6369,7 +6369,13 @@ pub const Store = struct {
 
     pub fn endForegroundRequest(self: *Store) void {
         const now = std.Io.Clock.awake.now(self.file.runtime()).nanoseconds;
-        self.foreground_last_end_ns.store(@intCast(@max(0, now)), .release);
+        self.endForegroundRequestAt(@intCast(@max(0, now)));
+    }
+
+    /// Completions can publish out of clock order: keep the latest, and
+    /// publish it before the count can reach zero.
+    fn endForegroundRequestAt(self: *Store, end_ns: u64) void {
+        _ = self.foreground_last_end_ns.fetchMax(end_ns, .acq_rel);
         _ = self.foreground_requests.fetchSub(1, .acq_rel);
     }
 
@@ -12904,6 +12910,24 @@ test "lite ride-along ticket resolves within the idle window even if the idle-fl
     const value = try reopened.file.getDocumentAlloc(alloc, "no-flush-task");
     defer if (value) |bytes| alloc.free(bytes);
     try std.testing.expectEqualStrings("rode along anyway", value orelse return error.TestExpectedEqual);
+}
+
+test "lite foreground completions keep the latest end when they publish out of order" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "foreground-completions.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{});
+    defer store.close();
+    store.beginForegroundRequest();
+    store.beginForegroundRequest();
+    // The later completion publishes first; the earlier one, delayed after
+    // sampling its clock, must not move the end back.
+    store.endForegroundRequestAt(200);
+    store.endForegroundRequestAt(100);
+    try std.testing.expectEqual(@as(u32, 0), store.foreground_requests.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 200), store.foreground_last_end_ns.load(.acquire));
 }
 
 test "lite maintenance ride-along waits for the leader that owns the drain" {

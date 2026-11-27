@@ -8864,7 +8864,73 @@ test "capi native idle redo fold waits for a foreground write in flight" {
     try std.testing.expect(store.last_redo_fold_ns != folded_before);
 }
 
+// A synchronous drain is not done while an index still owes a refresh from
+// the tip: it retries outside the apply lock within its budget, reports the
+// budget running out, and returns once the refresh lands.
+test "capi native text merge drain waits for a required tip refresh" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("drain-tip-refresh");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true, .busy_timeout_ms = 10_000 }, true);
+    const id = try api.publishHandle(wrapper);
+    defer api.antfly_db_close(id);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(
+        "{\"name\":\"drained_text\",\"kind\":\"full_text\",\"config_json\":\"{}\"}",
+    )));
+    {
+        var out: h.capi.Buffer = .{};
+        defer api.antfly_buffer_free_zero(&out);
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(id, .fromSlice(
+            "{\"inserts\":{\"doc\":{\"text\":\"quokka\"}},\"sync_level\":\"full_index\"}",
+        ), &out));
+    }
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(id));
+
+    const connection = wrapper.lite_connection.?;
+    const root = try connection.owner.writer_lane.checkout(connection, .mutation);
+    defer _ = root.lane_pins.fetchSub(1, .release);
+    defer connection.owner.writer_lane.checkin(connection, root.owned_lite_backend.?.native_docstore.?);
+    const db = root.database();
+    // Only this drain refreshes the index here.
+    const paused = if (db.text_merge_runtime) |runtime| runtime.pause() else false;
+    defer if (paused) db.text_merge_runtime.?.resumeAfterPause() catch {};
+    const entry = db.core.index_manager.textIndexEntry("drained_text") orelse return error.IndexNotFound;
+    // A merge was refused at the tip while an inline write is in flight,
+    // which keeps the refresh from running.
+    _ = entry.persistent.inline_in_flight.fetchAdd(1, .acq_rel);
+    var in_flight = true;
+    defer if (in_flight) {
+        _ = entry.persistent.inline_in_flight.fetchSub(1, .acq_rel);
+    };
+    entry.requestTipRefresh();
+
+    const clock = db.backend_runtime.monotonicClock();
+    const short: @import("../storage/db/derived/derived_executor.zig").VisibilityWait = .{ .deadline_ns = clock.nowRealtimeNs() + 50 * std.time.ns_per_ms, .clock = clock };
+    try std.testing.expectError(error.EnrichmentWaitTimeout, db.drainScheduledTextMergesWithin(short));
+    try std.testing.expect(entry.tipRefreshRequired());
+
+    _ = entry.persistent.inline_in_flight.fetchSub(1, .acq_rel);
+    in_flight = false;
+    entry.merge_retry_after_ns.store(0, .release);
+    // A spent budget starts no pass, even with the refresh now able to run.
+    const spent: @import("../storage/db/derived/derived_executor.zig").VisibilityWait = .{ .deadline_ns = clock.nowRealtimeNs(), .clock = clock };
+    try std.testing.expectError(error.EnrichmentWaitTimeout, db.drainScheduledTextMergesWithin(spent));
+    try std.testing.expect(entry.tipRefreshRequired());
+    const long: @import("../storage/db/derived/derived_executor.zig").VisibilityWait = .{ .deadline_ns = clock.nowRealtimeNs() + 10 * std.time.ns_per_s, .clock = clock };
+    try db.drainScheduledTextMergesWithin(long);
+    try std.testing.expect(!entry.tipRefreshRequired());
+}
+
 test "capi native full-text index dropped and never recreated leaves no records in the database file" {
+    try testDropFullTextIndex();
+}
+
+fn testDropFullTextIndex() !void {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     const a = std.testing.allocator;
     const io = h.handleLockIo();
@@ -8907,6 +8973,141 @@ test "capi native full-text index dropped and never recreated leaves no records 
     try std.testing.expect(deleted);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(id));
     try std.testing.expectEqual(@as(usize, 0), try Records.count(connection));
+    // The cleanup finished: the name is free again.
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(
+        "{\"name\":\"dropped_text\",\"kind\":\"full_text\",\"config_json\":\"{}\"}",
+    )));
+}
+
+// A rebuilt index serves a generation at its own path, named by the root
+// pointer in the canonical directory. A drop interrupted after its records
+// went and before its directories still has that pointer and its cleanup
+// tombstone; the retry, here after a reopen, finds both generations' scopes
+// empty and frees the name.
+test "capi native full-text index drop interrupted after its records finishes on retry" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    const index_manager = @import("../storage/db/catalog/index_manager.zig");
+    const IndexManager = index_manager.IndexManager;
+    var tmp = try api.TestDirectory.init("drop-full-text-interrupted");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    const index_json = "{\"name\":\"dropped_text\",\"kind\":\"full_text\",\"config_json\":\"{}\"}";
+    const canonical_scope = "__antfly_lite/indexes/dropped_text/index";
+
+    const Records = struct {
+        fn count(connection: *Connection, scope: []const u8) !usize {
+            const root = try connection.owner.writer_lane.checkout(connection, .mutation);
+            defer _ = root.lane_pins.fetchSub(1, .release);
+            defer connection.owner.writer_lane.checkin(connection, root.owned_lite_backend.?.native_docstore.?);
+            const sink = root.owned_lite_backend.?.native_catalog_sink.?.sink();
+            const records = try sink.loadKeysAlloc.?(sink.ptr, std.testing.allocator, scope);
+            defer @import("../storage/native_catalog_backend.zig").Backend.freeEntries(std.testing.allocator, records);
+            return records.len;
+        }
+    };
+
+    const cleanupPending = struct {
+        fn pending(connection: *Connection) !bool {
+            const root = try connection.owner.writer_lane.checkout(connection, .mutation);
+            defer _ = root.lane_pins.fetchSub(1, .release);
+            defer connection.owner.writer_lane.checkin(connection, root.owned_lite_backend.?.native_docstore.?);
+            const prefix = try @import("../storage/internal_keys.zig").indexArtifactCleanupIndexPrefixAlloc(std.testing.allocator, "dropped_text");
+            defer std.testing.allocator.free(prefix);
+            const rows = try root.database().core.store.scanPrefixPage(std.testing.allocator, prefix, null, 1);
+            defer @import("../storage/docstore.zig").DocStore.freeResults(std.testing.allocator, rows);
+            return rows.len != 0;
+        }
+    }.pending;
+
+    var active_scope: []u8 = &.{};
+    defer a.free(active_scope);
+    defer IndexManager.test_interrupt_retired_storage_finalization.store(false, .release);
+    {
+        const wrapper = try open(path, .{ .profile = .native, .no_sync = true, .busy_timeout_ms = 10_000 }, true);
+        const id = try api.publishHandle(wrapper);
+        defer api.antfly_db_close(id);
+        const connection = wrapper.lite_connection.?;
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(index_json)));
+        {
+            var out: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free_zero(&out);
+            try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(id, .fromSlice(
+                "{\"inserts\":{\"doc\":{\"text\":\"quokka\"}},\"sync_level\":\"full_index\"}",
+            ), &out));
+        }
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(id));
+
+        // Rebuild into a generation the root pointer selects.
+        {
+            const root = try connection.owner.writer_lane.checkout(connection, .mutation);
+            defer _ = root.lane_pins.fetchSub(1, .release);
+            defer connection.owner.writer_lane.checkin(connection, root.owned_lite_backend.?.native_docstore.?);
+            const db = root.database();
+            const cfg = db.core.index_manager.get("dropped_text") orelse return error.IndexNotFound;
+            try db.core.saveProjectionCheckpoint("dropped_text", .{
+                .applied_sequence = 0,
+                .status = .repair_required,
+                .config_hash = h.db_mod.types.indexConfigHash(cfg.*),
+            });
+            var repair = try db.repairArtifactIssuesWithRequest(a, .{ .target = .index, .artifact_kind = .full_text, .index_name = "dropped_text", .limit = 1 });
+            defer repair.deinit(a);
+            try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
+            const active = try db.core.index_manager.activeIndexPath("dropped_text");
+            defer db.core.index_manager.alloc.free(active);
+            try std.testing.expect(!std.mem.eql(u8, active, "__antfly_lite/indexes/dropped_text"));
+            active_scope = try std.fmt.allocPrint(a, "{s}/index", .{active});
+        }
+        try std.testing.expect(try Records.count(connection, active_scope) != 0);
+
+        // The drop starts its cleanup job at once: arm the interruption first,
+        // and keep it armed until the state there has been checked.
+        const interrupts_before = IndexManager.test_retired_storage_finalization_interrupts.load(.acquire);
+        IndexManager.test_interrupt_retired_storage_finalization.store(true, .release);
+        var deleted = false;
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_delete_index(id, .fromSlice("dropped_text"), &deleted));
+        try std.testing.expect(deleted);
+        _ = api.antfly_db_run_until_idle(id);
+        const deadline = std.Io.Clock.awake.now(io).nanoseconds + 10 * std.time.ns_per_s;
+        while (IndexManager.test_retired_storage_finalization_interrupts.load(.acquire) == interrupts_before) {
+            if (std.Io.Clock.awake.now(io).nanoseconds > deadline) return error.TestFinalizationNeverReached;
+            try std.Io.sleep(io, .fromMilliseconds(5), .awake);
+        }
+
+        // Stopped there, the records are gone, and the pointer still names
+        // the rebuilt generation.
+        try std.testing.expectEqual(@as(usize, 0), try Records.count(connection, active_scope));
+        try std.testing.expectEqual(@as(usize, 0), try Records.count(connection, canonical_scope));
+        {
+            const root = try connection.owner.writer_lane.checkout(connection, .mutation);
+            defer _ = root.lane_pins.fetchSub(1, .release);
+            defer connection.owner.writer_lane.checkin(connection, root.owned_lite_backend.?.native_docstore.?);
+            const manager = root.database().core.index_manager;
+            const still_active = try manager.activeIndexPath("dropped_text");
+            defer manager.alloc.free(still_active);
+            try std.testing.expectEqualStrings(active_scope[0 .. active_scope.len - "/index".len], still_active);
+        }
+        // Its cleanup tombstone is still there for the next attempt.
+        try std.testing.expect(try cleanupPending(connection));
+    }
+    // The handle closed armed, so its runtime could not finish the cleanup:
+    // recovery is the reopened runtime's.
+    IndexManager.test_interrupt_retired_storage_finalization.store(false, .release);
+
+    // The next attempt, after a reopen, finishes the cleanup.
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true, .busy_timeout_ms = 10_000 }, false);
+    const id = try api.publishHandle(wrapper);
+    defer api.antfly_db_close(id);
+    const interrupts_at_close = IndexManager.test_retired_storage_finalization_interrupts.load(.acquire);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(id));
+    try std.testing.expectEqual(interrupts_at_close, IndexManager.test_retired_storage_finalization_interrupts.load(.acquire));
+    try std.testing.expect(!try cleanupPending(wrapper.lite_connection.?));
+    try std.testing.expectEqual(@as(usize, 0), try Records.count(wrapper.lite_connection.?, active_scope));
+    try std.testing.expectEqual(@as(usize, 0), try Records.count(wrapper.lite_connection.?, canonical_scope));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(index_json)));
 }
 
 test "capi native full-text index recreated under its old name starts empty and indexes new writes" {

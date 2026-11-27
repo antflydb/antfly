@@ -623,6 +623,8 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi native text queries",
         "capi native replacement wait",
         "capi native full-text index dropped",
+        "capi native text merge drain waits",
+        "capi native full-text index drop interrupted",
         "capi native full-text index recreated",
         "capi graph replacement retains indexed serving edges",
         "capi native resolver maintenance retries",

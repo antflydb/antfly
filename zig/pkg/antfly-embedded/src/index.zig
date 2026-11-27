@@ -621,10 +621,14 @@ fn publishReplacementMissingLiveCounts(
     doc_count: u32,
     deleted: ?*const roaring.RoaringBitmap,
     publish_increases: bool,
+    /// Counts computed for `deleted` ahead of time, by coverage position;
+    /// null where a coverage was not initialized then.
+    precomputed: []const ?u32,
 ) void {
-    for (shared.typed_doc_values_coverage) |*coverage| {
+    for (shared.typed_doc_values_coverage, 0..) |*coverage, i| {
         if (!coverage.initialized.load(.acquire) or coverage.physical_status != .sparse_live_doc_values) continue;
-        const replacement = missingLiveCount(coverage, doc_count, deleted);
+        const known: ?u32 = if (i < precomputed.len) precomputed[i] else null;
+        const replacement = known orelse missingLiveCount(coverage, doc_count, deleted);
         const current = coverage.missing_live_count.load(.acquire);
         if ((publish_increases and replacement > current) or (!publish_increases and replacement <= current)) {
             coverage.missing_live_count.store(replacement, .release);
@@ -944,7 +948,41 @@ pub const ReplacementSegmentData = struct {
     /// the replacement data. The caller retains ownership; IndexWriter clones
     /// the bitmap into the replacement SegmentShared cell.
     deleted: ?*const roaring.RoaringBitmap = null,
+    /// Like `deleted`, but moved into the cell instead of cloned (allocated
+    /// with the writer allocator). Publication clears it; an unpublished
+    /// replacement still owns it.
+    deleted_owned: ?roaring.RoaringBitmap = null,
 };
+
+/// Deletions to install on a segment a publication keeps, prepared outside
+/// the writer lock (`prepareRetainedDeletion`): the bitmap, and each sparse
+/// typed-field coverage's missing live count under it.
+pub const RetainedDeletion = struct {
+    id: u64,
+    /// The segment's position in the snapshot `installRetainedDeletions`
+    /// installs into; checked, and searched for only when it moved.
+    position: usize,
+    bitmap: ?roaring.RoaringBitmap,
+    missing_live: []?u32 = &.{},
+
+    pub fn deinit(self: *RetainedDeletion, alloc: Allocator) void {
+        if (self.bitmap) |*bitmap| bitmap.deinit();
+        alloc.free(self.missing_live);
+        self.* = undefined;
+    }
+};
+
+pub fn prepareRetainedDeletion(alloc: Allocator, segment: *const SegmentEntry, position: usize, bitmap: roaring.RoaringBitmap) !RetainedDeletion {
+    const coverages = segment.shared.typed_doc_values_coverage;
+    const missing_live = try alloc.alloc(?u32, coverages.len);
+    for (coverages, missing_live) |*coverage, *slot| {
+        slot.* = if (coverage.initialized.load(.acquire) and coverage.physical_status == .sparse_live_doc_values)
+            missingLiveCount(coverage, segment.reader.doc_count, &bitmap)
+        else
+            null;
+    }
+    return .{ .id = segment.id, .position = position, .bitmap = bitmap, .missing_live = missing_live };
+}
 
 pub const RetiredSegmentCleanup = struct {
     ptr: *anyopaque,
@@ -4930,13 +4968,22 @@ pub const IndexWriter = struct {
         errdefer for (new_segments[keep_count .. keep_count + cells_created]) |*seg| {
             SegmentEntry.destroyShared(self.alloc, seg.shared);
         };
-        for (replacements, 0..) |replacement, i| {
+        for (replacements, 0..) |*replacement, i| {
             const shared = try SegmentEntry.createShared(self.alloc, replacement.data, &replacement_readers[i]);
             var shared_initialized = false;
             errdefer if (!shared_initialized) {
                 SegmentEntry.destroyShared(self.alloc, shared);
             };
-            if (replacement.deleted) |deleted| {
+            if (replacement.deleted_owned) |owned| {
+                if (owned.isEmpty()) {
+                    var empty = owned;
+                    empty.deinit();
+                } else {
+                    shared.deleted = owned;
+                    shared.deleted_count.store(@intCast(owned.cardinality()), .release);
+                }
+                replacement.deleted_owned = null;
+            } else if (replacement.deleted) |deleted| {
                 if (!deleted.isEmpty()) {
                     shared.deleted = try deleted.clone(self.alloc);
                     shared.deleted_count.store(@intCast(deleted.cardinality()), .release);
@@ -5027,41 +5074,68 @@ pub const IndexWriter = struct {
         var owned_bitmap = bitmap;
         const snap = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
         for (snap.segments) |*seg| {
-            if (seg.id == seg_id) {
-                const replacement_deleted: u32 = @intCast(owned_bitmap.cardinality());
-                const current_deleted = seg.shared.deleted_count.load(.acquire);
-                // Restoring a document that lacks a value must make coverage
-                // non-queryable before its tombstone disappears. Additional
-                // deletions become queryable only after their tombstones are
-                // visible to executors.
-                publishReplacementMissingLiveCounts(seg.shared, seg.reader.doc_count, &owned_bitmap, true);
-                // When documents are restored, publish the larger count first;
-                // readers may over-fetch while the bitmap is replaced but can
-                // never under-fetch newly visible documents. For additional
-                // deletions, publish the tombstone first and lower the count
-                // afterward.
-                if (replacement_deleted < current_deleted) {
-                    seg.shared.deleted_count.store(replacement_deleted, .release);
-                }
-                {
-                    seg.shared.lockDeletionExclusive();
-                    defer seg.shared.unlockDeletionExclusive();
-                    if (seg.shared.deleted) |*d| {
-                        var old_del = d.*;
-                        old_del.deinit();
-                    }
-                    seg.shared.deleted = owned_bitmap;
-                }
-                if (replacement_deleted >= current_deleted) {
-                    seg.shared.deleted_count.store(replacement_deleted, .release);
-                }
-                publishReplacementMissingLiveCounts(seg.shared, seg.reader.doc_count, &seg.shared.deleted.?, false);
-                return;
-            }
+            if (seg.id == seg_id) return replaceDeletionLocked(seg, owned_bitmap, &.{});
         }
         // Ownership is transferred to this API even when recovery references
         // a segment that is no longer active.
         owned_bitmap.deinit();
+    }
+
+    /// Installs prepared deletions on the segments a publication kept, in
+    /// one pass under the writer lock: each found at its prepared position.
+    /// Takes every bitmap; a segment no longer active drops its own.
+    pub fn installRetainedDeletions(self: *IndexWriter, items: []RetainedDeletion) void {
+        self.lockMutex();
+        defer self.mu.unlock();
+        const snap = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
+        for (items) |*item| {
+            const bitmap = item.bitmap orelse continue;
+            item.bitmap = null;
+            const seg: ?*SegmentEntry = if (item.position < snap.segments.len and snap.segments[item.position].id == item.id)
+                &snap.segments[item.position]
+            else for (snap.segments) |*candidate| {
+                if (candidate.id == item.id) break candidate;
+            } else null;
+            if (seg) |found| {
+                replaceDeletionLocked(found, bitmap, item.missing_live);
+            } else {
+                var dropped = bitmap;
+                dropped.deinit();
+            }
+        }
+    }
+
+    /// Under the writer lock. Takes `bitmap`.
+    fn replaceDeletionLocked(seg: *SegmentEntry, bitmap: roaring.RoaringBitmap, missing_live: []const ?u32) void {
+        var owned_bitmap = bitmap;
+        const replacement_deleted: u32 = @intCast(owned_bitmap.cardinality());
+        const current_deleted = seg.shared.deleted_count.load(.acquire);
+        // Restoring a document that lacks a value must make coverage
+        // non-queryable before its tombstone disappears. Additional
+        // deletions become queryable only after their tombstones are
+        // visible to executors.
+        publishReplacementMissingLiveCounts(seg.shared, seg.reader.doc_count, &owned_bitmap, true, missing_live);
+        // When documents are restored, publish the larger count first;
+        // readers may over-fetch while the bitmap is replaced but can
+        // never under-fetch newly visible documents. For additional
+        // deletions, publish the tombstone first and lower the count
+        // afterward.
+        if (replacement_deleted < current_deleted) {
+            seg.shared.deleted_count.store(replacement_deleted, .release);
+        }
+        {
+            seg.shared.lockDeletionExclusive();
+            defer seg.shared.unlockDeletionExclusive();
+            if (seg.shared.deleted) |*d| {
+                var old_del = d.*;
+                old_del.deinit();
+            }
+            seg.shared.deleted = owned_bitmap;
+        }
+        if (replacement_deleted >= current_deleted) {
+            seg.shared.deleted_count.store(replacement_deleted, .release);
+        }
+        publishReplacementMissingLiveCounts(seg.shared, seg.reader.doc_count, &seg.shared.deleted.?, false, missing_live);
     }
 
     /// Delete a document by its external ID.
@@ -5329,6 +5403,42 @@ test "typed doc values coverage is lazy and retains compact sparse membership" {
     try std.testing.expectEqual(@as(u32, 62), cached.missing_live_count.load(.acquire));
     try std.testing.expect(try writer.deleteById("doc:0"));
     try std.testing.expectEqual(@as(u32, 62), cached.missing_live_count.load(.acquire));
+}
+
+// A refresh prepares the deletions of the segments it keeps, with their
+// coverage counts, outside the writer lock, and installs them in one pass:
+// each found at its prepared position, or searched for when it moved.
+test "retained deletions install prepared coverage counts in one pass" {
+    const alloc = std.testing.allocator;
+    const segment_bytes = try buildSparseTypedDocValuesTestSegment(alloc, 64);
+    defer alloc.free(segment_bytes);
+    var writer = try IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegmentWithIdData(1, SegmentData.fromOwnedHeap(try alloc.dupe(u8, segment_bytes)));
+    try writer.addSegmentWithIdData(2, SegmentData.fromOwnedHeap(try alloc.dupe(u8, segment_bytes)));
+
+    const snap = writer.snapshot();
+    for (snap.segments) |*segment| _ = (try segment.typedDocValuesCoverage("rank")).?;
+    var first_deleted = roaring.RoaringBitmap.init(alloc);
+    try first_deleted.add(1);
+    try first_deleted.add(2);
+    var second_deleted = roaring.RoaringBitmap.init(alloc);
+    try second_deleted.add(0);
+    var items = [_]RetainedDeletion{
+        try prepareRetainedDeletion(alloc, &snap.segments[0], 0, first_deleted),
+        // A stale position: the install finds the segment by id.
+        try prepareRetainedDeletion(alloc, &snap.segments[1], 7, second_deleted),
+    };
+    defer for (&items) |*item| item.deinit(alloc);
+    try std.testing.expectEqual(@as(?u32, 61), items[0].missing_live[0]);
+    try std.testing.expectEqual(@as(?u32, 63), items[1].missing_live[0]);
+
+    writer.installRetainedDeletions(&items);
+    const after = writer.snapshot();
+    try std.testing.expectEqual(@as(u32, 2), after.segments[0].shared.deleted_count.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 61), after.segments[0].shared.typed_doc_values_coverage[0].missing_live_count.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), after.segments[1].shared.deleted_count.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 63), after.segments[1].shared.typed_doc_values_coverage[0].missing_live_count.load(.acquire));
 }
 
 test "typed doc values coverage admission honors cancellation deadline and contention" {
