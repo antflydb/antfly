@@ -429,6 +429,11 @@ noinline fn cudaKernelEnabled(context: usize, function: usize, stream: usize, co
 
 /// Published CUDA audio results by physical route on the submitting thread.
 pub const CudaAudio = struct {
+    warmed: u64 = 0,
+    learned: u64 = 0,
+    learning_output_mismatch: u64 = 0,
+    learning_host_transfer: u64 = 0,
+    learning_unsealed: u64 = 0,
     eager_assigned: u64 = 0,
     eager_copied: u64 = 0,
     recorded_and_launched: u64 = 0,
@@ -1296,6 +1301,9 @@ test "CUDA audio result observations preserve nested route counts and disabled s
     var outer = Scope.init();
     defer outer.deinit();
     try testing.expect(outer.snapshot().cuda_audio == null);
+    cudaAudioResult(.warmed);
+    cudaAudioResult(.learning_host_transfer);
+
     cudaAudioResult(.recorded_and_launched);
     {
         var inner = Scope.init();
@@ -1304,5 +1312,5 @@ test "CUDA audio result observations preserve nested route counts and disabled s
         cudaAudioResult(.eager_assigned);
         try testing.expectEqualDeep(CudaAudio{ .replayed = 1, .eager_assigned = 1 }, inner.snapshot().cuda_audio.?);
     }
-    try testing.expectEqualDeep(CudaAudio{ .recorded_and_launched = 1, .replayed = 1, .eager_assigned = 1 }, outer.snapshot().cuda_audio.?);
+    try testing.expectEqualDeep(CudaAudio{ .warmed = 1, .learning_host_transfer = 1, .recorded_and_launched = 1, .replayed = 1, .eager_assigned = 1 }, outer.snapshot().cuda_audio.?);
 }

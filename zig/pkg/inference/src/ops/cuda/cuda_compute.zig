@@ -20976,6 +20976,7 @@ fn retireUnusableAudioPlan(entry: *@import("audio_execution_plan.zig").Entry, cu
 /// One actual warm invocation initializes caches; the next learns lifetimes.
 /// Capture uses only bounded arena addresses and validates every allocation/free.
 fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: CacheCleanup, _: bool) anyerror!?CT {
+    const observation = @import("../../execution/runtime_observation.zig");
     const plan_mod = @import("audio_execution_plan.zig");
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (self.capability_profile != .embedding_gemma2 or !self.embedding_gemma2_policy.audio_graph or self.audio_execution_active or self.execution_scope != null or inputs.len == 0 or inputs.len > 20 or try self.ctx.streamCaptureActive()) return null;
@@ -21038,6 +21039,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
             const out = try run(context, canonical[0..canonical_count]);
             if (std.mem.indexOfScalar(CT, canonical[0..canonical_count], out) != null) return error.AudioPlanChanged;
             entry.warmed = true;
+            observation.cudaAudioResult(.warmed);
             return out;
         }
         const owner = if (learning) |*token|
@@ -21061,9 +21063,17 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
             return error.AudioPlanChanged;
         }
         const result = tensorFromCt(out);
-        if (!audioOutputMatches(first_input, result, output_bytes) or
-            self.stats.h2d_bytes != h2d_before or self.stats.d2h_bytes != d2h_before or
-            !owner.seal(result.buffer.ptr, base_key, input_bytes, output_bytes)) retireUnusableAudioPlan(entry, plan_cleanup, false);
+        if (!audioOutputMatches(first_input, result, output_bytes)) {
+            observation.cudaAudioResult(.learning_output_mismatch);
+        } else if (self.stats.h2d_bytes != h2d_before or self.stats.d2h_bytes != d2h_before) {
+            observation.cudaAudioResult(.learning_host_transfer);
+        } else if (!owner.seal(result.buffer.ptr, base_key, input_bytes, output_bytes)) {
+            observation.cudaAudioResult(.learning_unsealed);
+        } else {
+            observation.cudaAudioResult(.learned);
+            return out;
+        }
+        retireUnusableAudioPlan(entry, plan_cleanup, false);
         return out;
     }
     const owner = entry.owner.?;
@@ -21198,7 +21208,6 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     // Include the publication copy in replay samples. The direct ordinary
     // route already publishes its result as part of the measured work.
     if (timing) |pair| try arena.endTiming(&self.ctx, pair, replay);
-    const observation = @import("../../execution/runtime_observation.zig");
     if (capture) {
         observation.cudaAudioResult(.recorded_and_launched);
     } else if (replay) {
@@ -61864,6 +61873,9 @@ test "public source audio linear recreates input bank through actual learning ca
         }
         const before_calls = run.calls;
         var transfers = transfer_audit.Audit{};
+        const observation = @import("../../execution/runtime_observation.zig");
+        var route_observation = observation.Scope.init();
+        defer route_observation.deinit();
         var workspace_observation: @import("../../execution/runtime_observation.zig").KernelScope = .{};
         const output = observed: {
             workspace_observation.begin();
@@ -61875,6 +61887,14 @@ test "public source audio linear recreates input bank through actual learning ca
         const retain_output = iteration == 3 or iteration == 4;
         defer if (!retain_output) cb.free(output);
         if (retain_output) held[iteration - 3] = output;
+        const expected_route: observation.CudaAudio = switch (iteration) {
+            0 => .{ .warmed = 1 },
+            1 => .{ .learned = 1 },
+            2 => .{ .recorded_and_launched = 1 },
+            3, 6 => .{ .replayed = 1 },
+            else => .{ .eager_assigned = 1 },
+        };
+        try std.testing.expectEqualDeep(expected_route, route_observation.snapshot().cuda_audio orelse return error.TestUnexpectedResult);
         try std.testing.expect(compute.source_linear_scratch.active);
         if (iteration >= 2) {
             const workspace = workspace_observation.cuda_audio_workspace orelse return error.TestUnexpectedResult;

@@ -398,13 +398,19 @@ test "uniform report retains the observed CUDA audio workspace across publicatio
         .terminal_outside_arena = true,
     };
     var scope: observation.KernelScope = undefined;
+    var submission = observation.Scope.init();
+    defer submission.deinit();
+    observation.cudaAudioResult(.learning_host_transfer);
     scope.begin();
     observation.cudaAudioWorkspace(workspace);
     _ = scope.finish();
     var sample: runtime.Snapshot = .{};
     sample.recordKernelInterval(&scope);
-    source.publish(.{ .runtime = sample.since(.{}) });
+    var interval = sample.since(.{});
+    interval.submission = submission.snapshot();
+    source.publish(.{ .runtime = interval });
     try std.testing.expectEqual(workspace, source.snapshot().?.report.?.cuda_audio_workspace.?);
+    try std.testing.expectEqualDeep(observation.CudaAudio{ .learning_host_transfer = 1 }, source.snapshot().?.report.?.cuda_audio.?);
 }
 
 test "uniform report retains bounded CUDA decoder workspace after completed publication" {
