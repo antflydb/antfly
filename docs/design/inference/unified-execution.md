@@ -2054,3 +2054,13 @@ wide-replay gate and remains opt-in. Full-width and packet receipt
 SHA-256 hashes are
 `21b38922dda57caf49cb5876049a1e06c51fb76e5e0155c3be9cc00614d18f09`
 and `8c3ae649f0b1f97017c87b7552384fe975214a35e885269b72d5d3e9c75b159b`.
+
+The three-pair Metal audio selector rejected replay after exactly
+three completed pairs for each of the three sampled geometries.
+The subsequent steady-state log shows eager execution while keeping
+its prepared arena. All isolated A/A, A/B and B/B responses matched,
+but the A/B p50/p95 changed from 35.36/36.23 to 35.98/40.57 ms.
+B/B p95s were 40.56 and 40.16 ms. The tail regression persists after
+the shorter replay trial. The isolated and instrumented receipts are
+`e9a92dcbc09d4e57462e6cc0aa6be465e0593861ad841adb703915906de09c7e`
+and `d8832063947beef6731cd738b1892bb68b9c6f4e6f7259f29b71f65370ec3935`.
