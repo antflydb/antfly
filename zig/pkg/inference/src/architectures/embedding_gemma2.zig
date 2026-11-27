@@ -865,7 +865,7 @@ fn encoderLayer(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Co
                 std.debug.print("embeddinggemma2_layer_gpu: layer={d} global={} nanos={d}\n", .{ layer, cfg.headDim(layer) == 512, @import("../backends/metal_runtime.zig").lastFrameGpuNanos(compute.provider_impl.raw_decode_runtime) });
             }
         }
-        try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+        try cb.releaseFrameActivationViews();
     }
     try cb.checkExecutionControl();
     return result;
@@ -896,7 +896,7 @@ fn packedPerLayerInputs(cb: *const ComputeBackend, cfg: Config, embeddings: CT, 
     errdefer cb.free(result);
     if (frame.owns) {
         try frame.finish();
-        try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+        try cb.releaseFrameActivationViews();
     }
     return result;
 }
@@ -1313,7 +1313,7 @@ fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator
     // the admitted 128 KiB/row layer envelope without draining the successor.
     const pipeline = cb.kind() == .metal and rows > metalFrameRows() and
         !@import("antfly_platform").env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_ENCODER") and
-        cb.decoderRuntimeSetWhisperPipelinedFrames(true);
+        cb.decoderRuntimeSetPipelinedFrames(true);
     var pending_batch: LayerFrameBatch = .{};
     var pending_ple: ?CT = null;
     defer {
@@ -1321,10 +1321,10 @@ fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator
         pending.wait() catch {
             if (pending.active) @import("antfly_platform").inference_process_supervisor.restartWorker();
         };
-        if (pipeline) _ = cb.decoderRuntimeSetWhisperPipelinedFrames(false);
+        if (pipeline) _ = cb.decoderRuntimeSetPipelinedFrames(false);
         if (pending_ple) |tensor| cb.free(tensor);
         pending_batch.deinit(cb);
-        @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb) catch {};
+        cb.releaseFrameActivationViews() catch {};
     }
     if (cb.kind() == .metal and cfg.num_hidden_layers <= frame_batch.slices.len) {
         frame = if (pipeline) try submission.Scope.beginPipelined(cb) else try submission.Scope.begin(cb);
@@ -1377,7 +1377,7 @@ fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator
             if (pipeline) {
                 // Detach before waiting: the successor owns its encoded views
                 // even while the predecessor's wrappers are being retired.
-                try @import("../ops/metal_compute.zig").MetalCompute.detachEmbeddingGemma2ActivationViews(cb);
+                try cb.detachFrameActivationViews();
                 if (pending.active) {
                     try pending.wait();
                     if (pending_ple) |tensor| cb.free(tensor);
@@ -1398,7 +1398,7 @@ fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator
                     if (packed_ple) |tensor| cb.free(tensor);
                     packed_ple = null;
                 }
-                try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+                try cb.releaseFrameActivationViews();
                 frame_batch.deinit(cb);
                 frame_batch.count = 0;
             }
@@ -1423,7 +1423,7 @@ fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator
         pending_batch.count = 0;
     }
     try frame.finish();
-    try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+    try cb.releaseFrameActivationViews();
     try cb.checkExecutionControl();
     return result;
 }

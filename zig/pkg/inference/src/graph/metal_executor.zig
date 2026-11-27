@@ -3577,8 +3577,8 @@ test "actual Metal greedy arm rejects an already submitted frame without disturb
             const Metal = @import("../ops/metal_compute.zig").MetalCompute;
             const compute: *Metal = @ptrCast(@alignCast(cb.ptr));
             const raw = compute.provider_impl.raw_decode_runtime orelse return error.ExpectedActualMetalProvider;
-            try std.testing.expect(cb.decoderRuntimeSetWhisperPipelinedFrames(true));
-            defer _ = cb.decoderRuntimeSetWhisperPipelinedFrames(false);
+            try std.testing.expect(cb.decoderRuntimeSetPipelinedFrames(true));
+            defer _ = cb.decoderRuntimeSetPipelinedFrames(false);
             try metal_runtime.beginFrame(raw);
             errdefer if (metal_runtime.hasActiveFrame(raw)) metal_runtime.cancelFrame(raw) catch {};
             try metal_runtime.submitFrame(raw);

@@ -1814,10 +1814,10 @@ fn pipelineTrace(comptime fmt: []const u8, args: anytype) void {
 /// cannot pipeline; the cache must own preallocated slabs so no step
 /// reallocates while another is in flight.
 pub fn setPipelinedDecode(cb: *const ComputeBackend, cache: *const DecodeCache, enabled: bool) bool {
-    if (!enabled) return cb.decoderRuntimeSetWhisperPipelinedFrames(false);
+    if (!enabled) return cb.decoderRuntimeSetPipelinedFrames(false);
     if (cb.kind() != .metal or !whisperMetalFramesEnabled() or !whisperPipelinedDecodeEnabled()) return false;
     if (!cache.preallocated() or whisperMetalProfileEnabled()) return false;
-    return cb.decoderRuntimeSetWhisperPipelinedFrames(true);
+    return cb.decoderRuntimeSetPipelinedFrames(true);
 }
 
 /// Decode `tokens` at positions `[cache.positions, cache.positions + len)`.

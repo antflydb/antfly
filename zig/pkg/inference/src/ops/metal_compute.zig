@@ -5359,9 +5359,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     /// Retire activation views after the owned frame completes. Prepared model
     /// weights and multiplication plans remain available to later requests.
-    pub fn releaseEmbeddingGemma2ActivationViews(cb: *const ops.ComputeBackend) !void {
-        if (cb.kind() != .metal) return;
-        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+    fn releaseFrameActivationViewsOp(ctx: *anyopaque) anyerror!void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         // Persistent projections own only admitted weights and multiplication
         // plans. MPS matrix views must not retain request activation buffers.
         if (metal_runtime.termite_metal_decode_runtime_release_linear_views(
@@ -5371,9 +5370,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     /// Make encoded activation views completion-owned before rotating frames.
-    pub fn detachEmbeddingGemma2ActivationViews(cb: *const ops.ComputeBackend) !void {
-        if (cb.kind() != .metal) return;
-        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+    fn detachFrameActivationViewsOp(ctx: *anyopaque) anyerror!void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (metal_runtime.termite_metal_decode_runtime_detach_linear_views(
             self.provider_impl.raw_decode_runtime,
             metal_runtime.decoder_runtime_linear_slot_capacity,
@@ -25142,7 +25140,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return try self.ctFromOwnedMetalTensor(tensor);
     }
 
-    fn decoderRuntimeSetWhisperPipelinedFramesOp(ctx: *anyopaque, enabled: bool) bool {
+    fn decoderRuntimeSetPipelinedFramesOp(ctx: *anyopaque, enabled: bool) bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         return metal_runtime.setWhisperPipelinedFrames(self.provider_impl, enabled);
     }
@@ -43097,7 +43095,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.regions.token_selection.readLogitsStats = whisperLogitsStatsReadOp;
         vt.regions.token_selection.writeGrammar = whisperGrammarWriteOp;
         vt.embeddingLookupDeviceToken = embeddingLookupDeviceTokenOp;
-        vt.regions.commands.setPipelinedFrames = decoderRuntimeSetWhisperPipelinedFramesOp;
+        vt.regions.commands.setPipelinedFrames = decoderRuntimeSetPipelinedFramesOp;
+        vt.regions.commands.detachActivationViews = detachFrameActivationViewsOp;
+        vt.regions.commands.releaseActivationViews = releaseFrameActivationViewsOp;
         vt.regions.commands.submitFrame = decoderRuntimeSubmitFrameOp;
         vt.regions.commands.waitSubmittedFrame = decoderRuntimeWaitSubmittedFrameOp;
         vt.linear = linearOp;
@@ -43341,9 +43341,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return null;
     }
     pub fn releaseDynamicSlotsForTensor(_: *const ops.ComputeBackend, _: CT) void {}
-
-    pub fn releaseEmbeddingGemma2ActivationViews(_: *const ops.ComputeBackend) !void {}
-    pub fn detachEmbeddingGemma2ActivationViews(_: *const ops.ComputeBackend) !void {}
 
     pub fn takeQuantizedStorage(
         _: *const ops.ComputeBackend,
@@ -50977,28 +50974,28 @@ fn exerciseEmbeddingGemma2ProjectionCache(name: []const u8, denied_name: []const
         defer cb.free(output);
         const view_bytes = metal_runtime_mod.termite_metal_decode_runtime_linear_view_bytes(runtime, metal_runtime_mod.decoder_runtime_linear_slot_capacity);
         try std.testing.expect(view_bytes > 0);
-        try std.testing.expectError(error.MetalLinearViewReleaseFailed, MetalCompute.releaseEmbeddingGemma2ActivationViews(&cb));
+        try std.testing.expectError(error.MetalLinearViewReleaseFailed, cb.releaseFrameActivationViews());
         try std.testing.expectEqual(view_bytes, metal_runtime_mod.termite_metal_decode_runtime_linear_view_bytes(runtime, metal_runtime_mod.decoder_runtime_linear_slot_capacity));
         if (iteration == 0) {
-            try MetalCompute.detachEmbeddingGemma2ActivationViews(&cb);
+            try cb.detachFrameActivationViews();
             try std.testing.expectEqual(@as(u64, 0), metal_runtime_mod.termite_metal_decode_runtime_linear_view_bytes(runtime, metal_runtime_mod.decoder_runtime_linear_slot_capacity));
             try cb.decoderRuntimeCancelFrame();
         } else {
-            try std.testing.expect(cb.decoderRuntimeSetWhisperPipelinedFrames(true));
-            defer _ = cb.decoderRuntimeSetWhisperPipelinedFrames(false);
-            try MetalCompute.detachEmbeddingGemma2ActivationViews(&cb);
+            try std.testing.expect(cb.decoderRuntimeSetPipelinedFrames(true));
+            defer _ = cb.decoderRuntimeSetPipelinedFrames(false);
+            try cb.detachFrameActivationViews();
             try cb.decoderRuntimeSubmitFrame();
             // The successor owns different matrix views of the same slot.
             // Retiring its predecessor must leave the successor executable.
             try std.testing.expect(try cb.decoderRuntimeBeginFrame());
             const successor = (try cb.decoderRuntimeApplyLinear(&.{ .slot = slot, .input = output, .in_dim = dim, .out_dim = dim })) orelse return error.ExpectedMetalLinear;
             defer cb.free(successor);
-            try MetalCompute.detachEmbeddingGemma2ActivationViews(&cb);
+            try cb.detachFrameActivationViews();
             try std.testing.expectEqual(@as(u64, 0), metal_runtime_mod.termite_metal_decode_runtime_linear_view_bytes(runtime, metal_runtime_mod.decoder_runtime_linear_slot_capacity));
             try cb.decoderRuntimeWaitSubmittedFrame();
             try std.testing.expect(cb.decoderRuntimeHasActiveFrame());
             try cb.decoderRuntimeSubmitAndWaitFrame();
-            try MetalCompute.releaseEmbeddingGemma2ActivationViews(&cb);
+            try cb.releaseFrameActivationViews();
             const first_expected = try legacyGlinerMpsLinearOracle(a, input_values[0 .. rows * dim], &weights, &nonglobal_bias_values, false);
             defer a.free(first_expected);
             const next_expected = try legacyGlinerMpsLinearOracle(a, first_expected, &weights, &nonglobal_bias_values, false);

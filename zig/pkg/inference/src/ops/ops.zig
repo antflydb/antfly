@@ -2494,6 +2494,8 @@ pub const ComputeBackend = struct {
     /// decoders. Model-specific preparation/checkpoints remain in their region.
     pub const CommandSubmissionRegion = struct {
         setPipelinedFrames: ?*const fn (ctx: *anyopaque, enabled: bool) bool = null,
+        detachActivationViews: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+        releaseActivationViews: ?*const fn (ctx: *anyopaque) anyerror!void = null,
         submitFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
         waitSubmittedFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
         beginFrame: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
@@ -5129,9 +5131,19 @@ pub const ComputeBackend = struct {
     /// Allow `decoderRuntimeBeginFrame` while a submitted frame is still
     /// running, so the caller can keep one frame in flight behind the one
     /// it encodes. Returns false when the backend cannot pipeline.
-    pub fn decoderRuntimeSetWhisperPipelinedFrames(self: *const ComputeBackend, enabled: bool) bool {
+    pub fn decoderRuntimeSetPipelinedFrames(self: *const ComputeBackend, enabled: bool) bool {
         if (self.vtable.regions.commands.setPipelinedFrames) |f| return f(self.ptr, enabled);
         return false;
+    }
+
+    /// Transfer activation views to the encoded frame before asynchronous submission.
+    pub fn detachFrameActivationViews(self: *const ComputeBackend) !void {
+        if (self.vtable.regions.commands.detachActivationViews) |op| try op(self.ptr);
+    }
+
+    /// Retire transient views after synchronous frame completion.
+    pub fn releaseFrameActivationViews(self: *const ComputeBackend) !void {
+        if (self.vtable.regions.commands.releaseActivationViews) |op| try op(self.ptr);
     }
 
     /// Submit the active frame without waiting; pair with

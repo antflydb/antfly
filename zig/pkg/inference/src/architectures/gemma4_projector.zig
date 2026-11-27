@@ -1348,7 +1348,7 @@ pub fn encodeVideoBatchInput(cb: *const ComputeBackend, allocator: std.mem.Alloc
         errdefer cb.free(positioned);
         if (input_frame.owns) {
             try input_frame.finish();
-            try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+            try cb.releaseFrameActivationViews();
         }
         break :input_phase positioned;
     };
@@ -2303,7 +2303,7 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
             if (restart_frame and !frame.owns) frame = try Submission.begin(cb);
         };
     }
-    const pipelined = grouped_frames and frame_plan.in_flight == 2 and cb.decoderRuntimeSetWhisperPipelinedFrames(true);
+    const pipelined = grouped_frames and frame_plan.in_flight == 2 and cb.decoderRuntimeSetPipelinedFrames(true);
     var pending: PendingSubmission = .{ .backend = cb };
     var frame_snapshot: ?CT = null;
     errdefer if (frame_snapshot) |snapshot| cb.free(snapshot);
@@ -2313,7 +2313,7 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
         pending.wait() catch {
             if (pending.active) platform.inference_process_supervisor.restartWorker();
         };
-        if (pipelined) _ = cb.decoderRuntimeSetWhisperPipelinedFrames(false);
+        if (pipelined) _ = cb.decoderRuntimeSetPipelinedFrames(false);
     }
 
     const planned = if (cb.kind() == .metal and cohort) null else try tryAudioExecutionRange(cb, allocator, store, cfg, hidden, &layer_inputs, 0, cfg.block_count, defer_audio_arena);
@@ -2333,12 +2333,12 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
         layer = end;
         if (cohort and frame.owns and (layer % frame_plan.layers == 0 or layer == cfg.block_count)) {
             if (pipelined) {
-                try @import("../ops/metal_compute.zig").MetalCompute.detachEmbeddingGemma2ActivationViews(cb);
+                try cb.detachFrameActivationViews();
                 try pending.wait();
                 try frame.submitInto(&pending);
             } else {
                 try frame.finish();
-                try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+                try cb.releaseFrameActivationViews();
             }
         }
         store.releaseCompletedNativeLayer();
@@ -2400,12 +2400,12 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
         }
     }
     if (pending.active) {
-        if (frame.owns) try @import("../ops/metal_compute.zig").MetalCompute.detachEmbeddingGemma2ActivationViews(cb);
+        if (frame.owns) try cb.detachFrameActivationViews();
         try pending.wait();
     }
     if (frame.owns) {
         try frame.finish();
-        if (cohort and cb.kind() == .metal) try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+        if (cohort and cb.kind() == .metal) try cb.releaseFrameActivationViews();
     }
 
     if (@import("builtin").is_test) try embeddingGemma2StageTensor(cb, allocator, "audio_projected", projected);
@@ -3417,7 +3417,7 @@ fn audioSubsampleCohort(cb: *const ComputeBackend, a: std.mem.Allocator, store: 
         }
         if (frame.owns) {
             try frame.finish();
-            try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+            try cb.releaseFrameActivationViews();
         }
     }
     return .{ .hidden = hidden, .valid_mask = valid, .seq_len = rows, .segments = segments };
@@ -4286,7 +4286,7 @@ fn encodePositionedBatchResidentInto(cb: *const ComputeBackend, allocator: std.m
     // Larger images that admit only one layer keep the synchronous route.
     const pipeline = can_group and admitted_layers >= 2 and store.gguf == null and
         !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_VISION") and
-        cb.decoderRuntimeSetWhisperPipelinedFrames(true);
+        cb.decoderRuntimeSetPipelinedFrames(true);
     const group = if (pipeline) @max(@as(usize, 1), admitted_layers / 2) else if (can_group) policy.layerCapacity(@intCast(geometry.width), @intCast(geometry.height), batch, admitted_layers) else 1;
     const started = platform.time.monotonicNs();
     var frame: Submission = .{ .backend = cb };
@@ -4297,8 +4297,8 @@ fn encodePositionedBatchResidentInto(cb: *const ComputeBackend, allocator: std.m
             if (pending.active) platform.inference_process_supervisor.restartWorker();
         };
         if (pipeline) {
-            _ = cb.decoderRuntimeSetWhisperPipelinedFrames(false);
-            @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb) catch {};
+            _ = cb.decoderRuntimeSetPipelinedFrames(false);
+            cb.releaseFrameActivationViews() catch {};
         }
     }
     const resident_tower = if (store.huggingface and cb.kind() == .cuda)
@@ -4318,13 +4318,13 @@ fn encodePositionedBatchResidentInto(cb: *const ComputeBackend, allocator: std.m
             hidden = next;
             if (frame.owns and ((layer + 1) % group == 0 or layer + 1 == cfg.block_count)) {
                 if (pipeline and layer + 1 < cfg.block_count) {
-                    try @import("../ops/metal_compute.zig").MetalCompute.detachEmbeddingGemma2ActivationViews(cb);
+                    try cb.detachFrameActivationViews();
                     try pending.wait();
                     try frame.submitInto(&pending);
                 } else {
                     try pending.wait();
                     try frame.finish();
-                    if (store.gguf == null) try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+                    if (store.gguf == null) try cb.releaseFrameActivationViews();
                 }
             }
             store.releaseCompletedNativeLayer();
@@ -4357,7 +4357,7 @@ fn encodePositionedBatchResidentInto(cb: *const ComputeBackend, allocator: std.m
     errdefer if (output == null) cb.free(projected);
     if (projector_frame.owns) {
         try projector_frame.finish();
-        try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+        try cb.releaseFrameActivationViews();
     }
     if (store.gguf == null) try embeddingGemma2StageTensor(cb, allocator, "image_projected", projected);
 
@@ -6616,7 +6616,7 @@ fn addPositionEmbeddingsDevice(cb: *const ComputeBackend, allocator: std.mem.All
     errdefer cb.free(result);
     if (frame.owns) {
         try frame.finish();
-        try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+        try cb.releaseFrameActivationViews();
     }
     return result;
 }
@@ -6875,7 +6875,7 @@ fn encoderBlockBatch(
         // HF model-owned slots retain immutable weights, not each completed
         // layer's activations. Retire MPS views at the same boundary as the
         // backbone; otherwise every vision layer pins its large MLP buffers.
-        if (store.gguf == null) try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+        if (store.gguf == null) try cb.releaseFrameActivationViews();
     }
     cb.free(res1);
     return res2;
@@ -9403,7 +9403,7 @@ fn checkVisionViewLifetime(cb: ComputeBackend, reference: ComputeBackend) !void 
     try std.testing.expect(cb.decoderRuntimeHasActiveFrame());
     try std.testing.expect(runtime.termite_metal_decode_runtime_linear_view_bytes(raw, runtime.decoder_runtime_linear_slot_capacity) > 0);
     try cb.decoderRuntimeSubmitAndWaitFrame();
-    try metal.MetalCompute.releaseEmbeddingGemma2ActivationViews(&cb);
+    try cb.releaseFrameActivationViews();
     const external_reference = try encoderBlockBatch(&reference, a, &reference_weights, cfg, expected, geometry, 0, 1);
     defer reference.free(external_reference);
     const got = try cb.toFloat32(external, a);
@@ -9664,14 +9664,14 @@ fn checkAudioCohort(cb: ComputeBackend, reference: ComputeBackend) !void {
     defer a.free(retried);
     for (actual, retried) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-6);
     if (cb.kind() == .metal) {
-        try std.testing.expect(cb.decoderRuntimeSetWhisperPipelinedFrames(true));
-        defer _ = cb.decoderRuntimeSetWhisperPipelinedFrames(false);
+        try std.testing.expect(cb.decoderRuntimeSetPipelinedFrames(true));
+        defer _ = cb.decoderRuntimeSetPipelinedFrames(false);
         var external_pending = false;
         defer if (external_pending) cb.decoderRuntimeWaitSubmittedFrame() catch {};
         try std.testing.expect(try cb.decoderRuntimeBeginFrame());
         const precursor = (try cb.multiplyScalar(combined.embeddings, 1)).?;
         defer cb.free(precursor);
-        try @import("../ops/metal_compute.zig").MetalCompute.detachEmbeddingGemma2ActivationViews(&cb);
+        try cb.detachFrameActivationViews();
         try cb.decoderRuntimeSubmitFrame();
         external_pending = true;
         var external_active = try cb.decoderRuntimeBeginFrame();
@@ -9681,12 +9681,12 @@ fn checkAudioCohort(cb: ComputeBackend, reference: ComputeBackend) !void {
         defer cb.free(external.embeddings);
         try std.testing.expect(cb.decoderRuntimeHasActiveFrame());
         try std.testing.expect(cb.decoderRuntimeHasSubmittedFrame());
-        try @import("../ops/metal_compute.zig").MetalCompute.detachEmbeddingGemma2ActivationViews(&cb);
+        try cb.detachFrameActivationViews();
         try cb.decoderRuntimeWaitSubmittedFrame();
         external_pending = false;
         try cb.decoderRuntimeSubmitAndWaitFrame();
         external_active = false;
-        try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(&cb);
+        try cb.releaseFrameActivationViews();
         const external_values = try cb.toFloat32(external.embeddings, a);
         defer a.free(external_values);
         for (actual, external_values) |x, y| try std.testing.expectApproxEqAbs(x, y, 3e-4);
@@ -10764,7 +10764,7 @@ fn checkAdmittedAudioPeak(cb: ComputeBackend, _: ComputeBackend) !void {
     var warm = try audioSubsample(&cb, a, &store, cfg, ptrs[0]);
     cb.free(warm.hidden);
     warm.deinit(a);
-    try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(&cb);
+    try cb.releaseFrameActivationViews();
     const runtime = @import("../backends/metal_runtime.zig");
     const before = runtime.currentAllocatedSize(compute.provider_impl.raw_decode_runtime);
     var active = try cb.decoderRuntimeBeginFrame();
