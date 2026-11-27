@@ -1077,29 +1077,25 @@ pub const ReadingPipeline = struct {
         var decoder_run_total_ns: u64 = 0;
         var decoder_steps: usize = 0;
         var finished_count: usize = 0;
-        const decoder = FlorenceDecoder.FullPrefix{
+        var decoder = FlorenceDecoder.FullPrefix{
             .context = .{ .allocator = allocator, .backend = cb, .model = &florence_cfg, .control = self.execution_control },
             .encoder_hidden = encoder_hidden,
             .encoder_mask = encoder_attention_mask,
             .batch = batch,
             .encoder_length = enc_seq_len,
         };
+        defer decoder.deinit();
         while (dec_len < max_len and finished_count < batch) {
             if (self.execution_control) |control| try control.update(.executing, dec_len, max_len);
             {
-                const decoder_input_ids = try compactDecoderInputIds(allocator, dec_ids, batch, max_len, dec_len);
-                defer allocator.free(decoder_input_ids);
-
                 const decoder_run_start = nowNs();
-                const logits = try decoder.stepHost(decoder_input_ids, dec_len);
+                const step = try decoder.stepHostStrided(dec_ids, max_len, dec_len);
                 const decoder_run_ns = nowNs() - decoder_run_start;
                 decoder_run_total_ns += decoder_run_ns;
                 decoder_steps += 1;
                 logReadProfileStep("batch_decoder_run", decoder_steps, dec_len, decoder_run_ns);
-                defer allocator.free(logits);
+                defer allocator.free(step.logits);
 
-                const logits_row_stride = std.math.mul(usize, dec_len, florence_cfg.vocab_size) catch return error.InvalidInputShape;
-                const logits_tail_offset = std.math.mul(usize, dec_len - 1, florence_cfg.vocab_size) catch return error.InvalidInputShape;
                 finished_count += try applyFlorenceBatchGreedyStep(
                     dec_ids,
                     batch,
@@ -1107,9 +1103,9 @@ pub const ReadingPipeline = struct {
                     dec_len,
                     finished,
                     lengths,
-                    logits,
-                    logits_row_stride,
-                    logits_tail_offset,
+                    step.logits,
+                    step.row_stride,
+                    step.tail_offset,
                     florence_cfg.vocab_size,
                     self.config.eos_token_id,
                     self.config.pad_token_id,
@@ -1742,24 +1738,6 @@ pub const ReadingPipeline = struct {
 
 fn florenceIncrementalFallbackAdmitted(backend: backends.BackendType, incremental_admission: bool, err: anyerror) bool {
     return !incremental_admission and shouldFallbackFlorenceIncremental(backend, err);
-}
-
-fn compactDecoderInputIds(
-    allocator: std.mem.Allocator,
-    dec_ids: []const i64,
-    batch: usize,
-    max_len: usize,
-    dec_len: usize,
-) ![]i64 {
-    const total = std.math.mul(usize, batch, dec_len) catch return error.InvalidInputShape;
-    const out = try allocator.alloc(i64, total);
-    errdefer allocator.free(out);
-    for (0..batch) |b| {
-        const dst = std.math.mul(usize, b, dec_len) catch return error.InvalidInputShape;
-        const src = std.math.mul(usize, b, max_len) catch return error.InvalidInputShape;
-        @memcpy(out[dst..][0..dec_len], dec_ids[src..][0..dec_len]);
-    }
-    return out;
 }
 
 /// Effective native reader microbatch ceiling for this process. Capability

@@ -149,6 +149,40 @@ pub fn CachedDecoder(comptime Architecture: type) type {
             batch: usize,
             encoder_length: usize,
 
+            prefix_storage: []i64 = &.{},
+
+            pub fn deinit(self: *@This()) void {
+                self.context.allocator.free(self.prefix_storage);
+                self.prefix_storage = &.{};
+            }
+
+            pub const HostStep = struct {
+                logits: []f32,
+                row_stride: usize,
+                tail_offset: usize,
+            };
+
+            /// Read each batch row's valid prefix from a fixed-width history.
+            /// Reuse the invocation's packed input storage across decoder steps.
+            pub fn stepHostStrided(self: *@This(), history: []const i64, stride: usize, rows: usize) !HostStep {
+                const count = std.math.mul(usize, self.batch, stride) catch return error.InvalidInputShape;
+                if (self.batch == 0 or rows == 0 or rows > stride or count != history.len) return error.InvalidInputShape;
+                if (self.context.control) |control| try control.check();
+                const vocab = self.context.model.vocab_size;
+                const row_stride = std.math.mul(usize, rows, vocab) catch return error.InvalidInputShape;
+                const tail_offset = row_stride - vocab;
+                const needed = self.batch * rows;
+                if (self.prefix_storage.len < needed) {
+                    const grown = self.prefix_storage.len +| self.prefix_storage.len / 2;
+                    const capacity = @min(count, @max(needed, grown));
+                    self.prefix_storage = try self.context.allocator.realloc(self.prefix_storage, capacity);
+                }
+                const packed_ids = self.prefix_storage[0..needed];
+                for (0..self.batch) |batch|
+                    @memcpy(packed_ids[batch * rows ..][0..rows], history[batch * stride ..][0..rows]);
+                return .{ .logits = try self.stepHost(packed_ids, rows), .row_stride = row_stride, .tail_offset = tail_offset };
+            }
+
             pub const Output = struct {
                 allocator: std.mem.Allocator,
                 backend: *const ComputeBackend,
