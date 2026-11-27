@@ -18,6 +18,37 @@
 const std = @import("std");
 const Layout = @import("libraries.zig").F32StridedBatchedLayout;
 const Span = @import("buffer.zig").ByteSpan;
+
+/// Each clip consumes its operands before the next clip reuses the bank.
+/// The vendor span begins after every clip's private operand spans.
+pub fn planGroup(plans: []Plan, clips: []const usize, rows: usize, heads: usize, dim: usize, chunk: usize, context: usize, relative: usize) !struct { bytes: usize, vendor: Span } {
+    if (clips.len == 0 or clips.len != plans.len) return error.InvalidTensorShape;
+    var remaining = rows;
+    var largest: usize = 0;
+    for (plans, clips, 0..) |*plan, clip_rows, index| {
+        if (clip_rows == 0 or clip_rows > remaining) return error.InvalidTensorShape;
+        remaining -= clip_rows;
+        plan.* = try Plan.resolve(clip_rows, heads, dim, chunk, context, relative);
+        if (plan.bytes > plans[largest].bytes) largest = index;
+    }
+    if (remaining != 0) return error.InvalidTensorShape;
+    return .{ .bytes = plans[largest].bytes, .vendor = plans[largest].workspace };
+}
+
+test "grouped local relative source shares storage for unequal and partial clips" {
+    var plans: [3]Plan = undefined;
+    const workspace = try planGroup(&plans, &.{ 3, 25, 13 }, 41, 2, 64, 12, 24, 13);
+    try std.testing.expectEqual(workspace.bytes, plans[1].bytes);
+    try std.testing.expectEqual(workspace.vendor, plans[1].workspace);
+    for (plans) |plan| {
+        try std.testing.expect(plan.workspace.offset <= workspace.vendor.offset);
+        try std.testing.expectEqual(plan.workspace.bytes, workspace.vendor.bytes);
+    }
+    try std.testing.expectError(error.InvalidTensorShape, planGroup(&plans, &.{ 3, 25, 13 }, 40, 2, 64, 12, 24, 13));
+    try std.testing.expectError(error.InvalidTensorShape, planGroup(&plans, &.{ 3, 25, 13 }, 42, 2, 64, 12, 24, 13));
+    try std.testing.expectError(error.InvalidTensorShape, planGroup(&plans, &.{ 3, 0, 13 }, 16, 2, 64, 12, 24, 13));
+}
+
 pub const Plan = struct {
     rows: usize,
     heads: usize,

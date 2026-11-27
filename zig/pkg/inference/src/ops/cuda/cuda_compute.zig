@@ -21850,21 +21850,10 @@ fn sourceLocalRelativeAttention(self: *CudaCompute, q: CT, k: CT, v: CT, rel: CT
     const Source = @import("local_relative_source.zig");
     const single = [_]usize{params.rows};
     const segments = if (destination) |assigned| if (assigned.segments.len != 0) assigned.segments else &single else &single;
-    var plans: [@import("../../execution/audio_schedule.zig").GroupedRows.max_clips]Source.Plan = undefined;
-    if (segments.len > plans.len) return error.InvalidTensorShape;
-    var remaining = params.rows;
-    var scratch_bytes: usize = 0;
-    var vendor_span: buffer_mod.ByteSpan = undefined;
-    for (segments, plans[0..segments.len]) |rows, *plan| {
-        if (rows == 0 or rows > remaining) return error.InvalidTensorShape;
-        remaining -= rows;
-        plan.* = try Source.Plan.resolve(rows, params.heads, params.head_dim, params.chunk, params.context, params.context_left);
-        if (plan.bytes > scratch_bytes) {
-            scratch_bytes = plan.bytes;
-            vendor_span = plan.workspace;
-        }
-    }
-    if (remaining != 0) return error.InvalidTensorShape;
+    var group_plans: [@import("../../execution/audio_schedule.zig").GroupedRows.max_clips]Source.Plan = undefined;
+    if (segments.len > group_plans.len) return error.InvalidTensorShape;
+    const plans = group_plans[0..segments.len];
+    const grouped = try Source.planGroup(plans, segments, params.rows, params.heads, params.head_dim, params.chunk, params.context, params.context_left);
     const blas = if (self.bf16_blas) |*value| value else return error.CudaLibrariesUnavailable;
     try blas.requireF32Workspace();
     inline for (.{ q, k, v }) |tensor| {
@@ -21892,17 +21881,17 @@ fn sourceLocalRelativeAttention(self: *CudaCompute, q: CT, k: CT, v: CT, rel: CT
     try layout.validate(q_buffer, k_buffer, v_buffer, relative, scale, mask, output);
     const module = try self.encoderMultimodalModule();
     // Each clip's last consumer is submitted before the next clip reuses the bank.
-    var temporary = try SourceLinearTemporary.acquireDeclared(self, scratch_bytes, scratch_bytes, capture);
+    var temporary = try SourceLinearTemporary.acquireDeclared(self, grouped.bytes, grouped.bytes, capture);
     defer temporary.deinit(self);
     // The vendor workspace is the last span of the largest plan, so it
     // follows every clip's operands. Keep the handle bound across the group.
-    const vendor = temporary.span(vendor_span);
+    const vendor = temporary.span(grouped.vendor);
     try self.ctx.makeCurrent();
     var workspace = try blas.beginF32Workspace(self.ctx.stream, @ptrFromInt(vendor.ptr), vendor.len);
     defer workspace.deinit();
     const row_bytes = layout.span_bytes[6] / params.rows;
     var offset: usize = 0;
-    for (plans[0..segments.len]) |plan| {
+    for (plans) |plan| {
         if (control) |value| try value.check();
         const bytes = row_bytes * plan.rows;
         const first = offset * row_bytes;
