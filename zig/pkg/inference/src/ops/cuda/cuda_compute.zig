@@ -15493,6 +15493,45 @@ fn copyFromDeviceTracked(self: *CudaCompute, device: buffer_mod.DeviceBuffer, sr
     self.stats.d2d_bytes += len;
 }
 
+fn projectionActivationScratch(self: *CudaCompute, input: buffer_mod.DeviceBuffer, bytes: usize, ordinary: *scratch_mod.DeviceScratch) !buffer_mod.DeviceBuffer {
+    if (!self.bounded_decode_graph.active) return ordinary.acquire(&self.ctx, bytes);
+    // The producer and GEMM consume this interval on the same stream. The
+    // next projection may borrow it for either 16-bit input representation.
+    const assigned = (try self.bounded_decode_graph.bindProjectionStaging(bytes)) orelse return error.InvalidExecutionPlan;
+    if (kernel_geometry.byteRangesOverlap(assigned.ptr, assigned.len, input.ptr, input.len)) return error.InvalidAssignedAlias;
+    return assigned;
+}
+
+test "bounded CUDA projection staging refuses missing or aliased backing before device allocation" {
+    const Graph = @import("bounded_decode_graph.zig");
+    var compute = metadataOnlyTestCompute();
+    compute.bounded_decode_graph = .{ .active = true, .rows = 2, .hidden = 1024 };
+    var phase: Graph.GraphPhase = undefined;
+    try phase.initInto(.{
+        .epoch = 1,
+        .key = &.{1},
+        .positions = &.{ 0, 0, 0, 0, 0, 0 },
+        .rows = 2,
+        .hidden = 1024,
+        .vocab = 256,
+        .future_tokens = 16,
+        .attention_layers = 0,
+        .recurrent_layers = 0,
+    });
+    compute.bounded_decode_graph.storage_layout = phase.storage_layout;
+    const input: buffer_mod.DeviceBuffer = .{ .ptr = 0x10000, .len = 8192 };
+    try std.testing.expectError(error.InvalidExecutionPlan, projectionActivationScratch(&compute, input, 4096, &compute.bf16_activation_scratch));
+    try phase.declareProjectionStaging();
+    compute.bounded_decode_graph.storage_layout = phase.storage_layout;
+    compute.bounded_decode_graph.metadata = .{ .ptr = 0x20000, .len = phase.storage_layout.metadata_bytes };
+    const bf16_stage = try projectionActivationScratch(&compute, input, 4096, &compute.bf16_activation_scratch);
+    const f16_stage = try projectionActivationScratch(&compute, input, 4096, &compute.f16_activation_scratch);
+    try std.testing.expectEqual(bf16_stage.ptr, f16_stage.ptr);
+    try std.testing.expectError(error.InvalidAssignedAlias, projectionActivationScratch(&compute, bf16_stage, 4096, &compute.f16_activation_scratch));
+    try std.testing.expectEqual(@as(u64, 0), compute.bf16_activation_scratch.buffer.ptr);
+    try std.testing.expectEqual(@as(u64, 0), compute.f16_activation_scratch.buffer.ptr);
+}
+
 const Bf16Activation = struct { buffer: buffer_mod.DeviceBuffer, cast: bool, count: usize, tail: buffer_mod.DeviceBuffer = .{} };
 fn acquireBf16ActivationForCublasLt(self: *CudaCompute, input: *const CudaTensor, rows: usize, in_dim: usize, physical_rows: usize) !?Bf16Activation {
     if (!cudaCublasLtEnabled() or self.ctx.info.compute_major < 8 or self.cublaslt == null or input.dtype != .f32) return null;
@@ -15502,13 +15541,7 @@ fn acquireBf16ActivationForCublasLt(self: *CudaCompute, input: *const CudaTensor
     const bytes = try checkedMul(try checkedMul(physical_rows, in_dim), 2);
     if (physical_rows == rows and input.bf16_mirror.ptr != 0 and input.bf16_mirror.len >= bytes)
         return .{ .buffer = .{ .ptr = input.bf16_mirror.ptr, .len = bytes }, .cast = false, .count = count };
-    const assigned = if (self.bounded_decode_graph.active)
-        try self.bounded_decode_graph.bindProjectionStaging(bytes)
-    else
-        null;
-    const scratch = assigned orelse try self.bf16_activation_scratch.acquire(&self.ctx, bytes);
-    if (assigned != null and kernel_geometry.byteRangesOverlap(scratch.ptr, scratch.len, input.buffer.ptr, input.buffer.len))
-        return error.InvalidAssignedAlias;
+    const scratch = try projectionActivationScratch(self, input.buffer, bytes, &self.bf16_activation_scratch);
     return .{ .buffer = scratch, .cast = true, .count = count, .tail = .{ .ptr = scratch.ptr + count * 2, .len = bytes - count * 2 } };
 }
 fn convertBf16ActivationForCublasLt(self: *CudaCompute, input: *const CudaTensor, activation: Bf16Activation, rows: usize) !void {
@@ -15533,7 +15566,7 @@ fn acquireF16ActivationForCublasLt(self: *CudaCompute, input: *const CudaTensor,
     if (!canUseF16TensorCoreWeights(self) or input.dtype != .f32) return null;
     const count = try checkedMul(rows, in_dim);
     if (input.elem_count != count) return null;
-    return try self.f16_activation_scratch.acquire(&self.ctx, try checkedMul(count, @sizeOf(u16)));
+    return try projectionActivationScratch(self, input.buffer, try checkedMul(count, @sizeOf(u16)), &self.f16_activation_scratch);
 }
 
 fn convertF16ActivationForCublasLt(self: *CudaCompute, input: *const CudaTensor, scratch: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize) !void {
