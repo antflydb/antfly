@@ -22562,7 +22562,7 @@ fn sourceConvolutionF32(self: *CudaCompute, value: @FieldType(ops.Bf16SourceOper
         module.retireOldestAfterCompletion();
     }
     const plan = (try module.planForCapture(key, capture)) orelse return error.SourceArithmeticUnavailable;
-    const scratch = try Conv.SourceWorkspace.forKey(key, plan.workspace_bytes);
+    const scratch = plan.source_workspace orelse return error.SourceArithmeticUnavailable;
     const input_count = scratch.input.bytes / @sizeOf(u16);
     const weight_count = scratch.weight.bytes / @sizeOf(u16);
     const count = scratch.output.bytes / @sizeOf(u16);

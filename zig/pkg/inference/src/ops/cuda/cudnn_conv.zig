@@ -243,6 +243,11 @@ pub const Plan = struct {
     workspace_bytes: usize = 0,
     stamp: u64 = 0,
     graph: GraphPlan = .{},
+    source_workspace: ?SourceWorkspace = null,
+
+    fn resolveSourceWorkspace(p: *Plan) !void {
+        if (p.key.storage == .bf16) p.source_workspace = try SourceWorkspace.forKey(p.key, p.workspace_bytes);
+    }
 
     fn deinit(p: *Plan, f: *const Table, api: ?*const backend.Api) void {
         if (api) |owned| p.graph.deinit(owned);
@@ -449,6 +454,7 @@ pub const Module = struct {
                 try check(m.f.cudnnSetTensor4dDescriptor(p.y, 0, 9, @intCast(key.batch), @intCast(key.outputs), @intCast(key.outHeight()), @intCast(key.outWidth())));
                 try check(m.f.cudnnSetTensor4dDescriptor(p.bias, 0, 9, 1, @intCast(key.outputs), 1, 1));
             }
+            try p.resolveSourceWorkspace();
             m.plans[m.count] = p;
             m.count += 1;
             return &m.plans[m.count - 1];
@@ -483,6 +489,7 @@ pub const Module = struct {
             p.deinit(&m.f, null);
             return null;
         }
+        try p.resolveSourceWorkspace();
         m.plans[m.count] = p;
         m.count += 1;
         return &m.plans[m.count - 1];
@@ -907,4 +914,7 @@ test "source convolution separates pack storage and SDK workspace at CUDA alignm
     const key: Key = .{ .storage = .bf16, .batch = 1, .inputs = 1, .outputs = 2, .height = 3, .width = 3, .kernel = 3, .stride = 2, .padding = 1 };
     const source = try SourceWorkspace.forKey(key, 513);
     try std.testing.expectEqualDeep(try SourceWorkspace.resolve(18, 36, 16, 4, 513), source);
+    var plan: Plan = .{ .key = key, .workspace_bytes = 513 };
+    try plan.resolveSourceWorkspace();
+    try std.testing.expectEqualDeep(source, plan.source_workspace.?);
 }
