@@ -41,6 +41,8 @@ pub const Route = union(enum) {
     ingest_batch: NamespaceRoute,
     ingest_table_batch: TableRoute,
     table_batch: TableRoute,
+    /// POST /tables/{table}/enrichments/counts: named enrichment counts.
+    table_enrichment_counts: TableRoute,
     build_namespace: NamespaceRoute,
     build_status: NamespaceRoute,
     policy: NamespaceRoute,
@@ -136,6 +138,7 @@ pub fn admissionClass(route: Route) AdmissionClass {
         .table_query_request,
         .table_query_published,
         .table_query_latest,
+        .table_enrichment_counts,
         .query_search,
         .table_query_search,
         .table_query_graph_neighbors,
@@ -401,6 +404,11 @@ fn matchTableRoute(method: HttpMethod, segments: *std.mem.SplitIterator(u8, .sca
         if (method != .post or segments.next() != null) return null;
         return .{ .table_batch = .{ .table_name = table_name } };
     }
+    if (std.mem.eql(u8, suffix, "enrichments")) {
+        const action = segments.next() orelse return null;
+        if (!std.mem.eql(u8, action, "counts") or method != .post or segments.next() != null) return null;
+        return .{ .table_enrichment_counts = .{ .table_name = table_name } };
+    }
     if (!std.mem.eql(u8, suffix, "query")) return null;
 
     const query_suffix = segments.next() orelse {
@@ -557,6 +565,9 @@ test "http routes match the table public endpoints" {
 
     const batch = match(.post, "/tables/docs/batch").?;
     try std.testing.expectEqualStrings("docs", batch.table_batch.table_name);
+    const counts = match(.post, "/tables/docs/enrichments/counts").?;
+    try std.testing.expectEqualStrings("docs", counts.table_enrichment_counts.table_name);
+    try std.testing.expect(match(.get, "/tables/docs/enrichments/counts") == null);
 
     try std.testing.expect(match(.post, "/tables/docs/build") == null);
     try std.testing.expect(match(.get, "/tables/docs/build-status") == null);

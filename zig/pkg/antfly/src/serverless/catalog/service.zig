@@ -916,6 +916,11 @@ pub const CatalogService = struct {
         return try self.buildNamespaceWithCancellation(namespace, cancellation);
     }
 
+    /// See `namedEnrichmentCountsJsonImpl`.
+    pub fn namedEnrichmentCountsJsonAlloc(self: *CatalogService, alloc: Allocator, namespace: []const u8, indexes_json: []const u8, from_key: []const u8, limit: usize) ![]u8 {
+        return namedEnrichmentCountsJsonImpl(self, alloc, namespace, indexes_json, from_key, limit);
+    }
+
     pub fn tableBuildStatus(self: *CatalogService, table_name: []const u8) !catalog_types.BuildStatus {
         const namespace = try self.resolveTableNamespaceAlloc(table_name);
         defer self.alloc.free(namespace);
@@ -2528,6 +2533,100 @@ fn enrichmentCompletionAlloc(
     const result = try enrichmentCompletionFromFactsAlloc(self.alloc, &pages, root, policy, indexes_json);
     try token.check();
     return result;
+}
+
+/// Named enrichment counts for migration and readiness (#1791): one page
+/// of the published HEAD's documents in key order from `from_key`, with
+/// per-declaration origin and pending counts, plus the table-wide count of
+/// documents awaiting generation. Unpublished WAL writes are not included.
+fn namedEnrichmentCountsJsonImpl(self: *CatalogService, alloc: Allocator, namespace: []const u8, indexes_json: []const u8, from_key: []const u8, limit: usize) ![]u8 {
+    const named_outputs = @import("../enrichment/named_outputs.zig");
+    var declarations = try @import("named_enrichments.zig").parseAlloc(alloc, indexes_json);
+    defer declarations.deinit(alloc);
+    const tallies = try alloc.alloc(named_outputs.Tally, declarations.configs.len);
+    defer alloc.free(tallies);
+    @memset(tallies, .{});
+    var next: ?[]u8 = null;
+    defer if (next) |key| alloc.free(key);
+    var documents: u64 = 0;
+    var pending_documents: u64 = 0;
+    const head_version = self.progress.getHead(namespace) catch |err| switch (err) {
+        error.FileNotFound => 0,
+        else => return err,
+    };
+    if (head_version != 0) scan: {
+        const pin = try self.facts_read_leases.acquire(self.progress, namespace, head_version);
+        const ReadCheck = struct {
+            pin: read_lease.Lease,
+            fn check(ptr: *const anyopaque) !void {
+                try @as(*const @This(), @ptrCast(@alignCast(ptr))).pin.check();
+            }
+            fn cancelled(ptr: *const anyopaque) bool {
+                check(ptr) catch return true;
+                return false;
+            }
+        };
+        const check = ReadCheck{ .pin = pin };
+        const token = CancellationToken{ .ptr = &check, .check_fn = ReadCheck.check, .is_cancelled_fn = ReadCheck.cancelled };
+        var manifest = try self.manifests.getAlloc(namespace, head_version);
+        defer manifest.deinit(self.alloc);
+        if (isExternalManifest(manifest)) break :scan;
+        const idx = findArtifactIndex(manifest, .document_facts) orelse return error.DocumentFactsNotFound;
+        var reads: u64 = (builder_mod.GraphBuildLimits{}).max_input_bytes;
+        var writes: u64 = 0;
+        var pages = graph_page_store.PageStore{
+            .domain = graph_page_store.PageStore.namespaceDomain(namespace),
+            .artifacts = self.artifacts,
+            .remaining_read_bytes = &reads,
+            .remaining_write_bytes = &writes,
+            .cancellation = token,
+        };
+        const root = try document_facts.loadRoot(alloc, &pages, manifest.artifacts[idx]);
+        pending_documents = if (root.named_format) root.named_pending_count else 0;
+        var cursor = try graph_page_tree.Cursor.init(alloc, pages.store(), root.page, from_key, null);
+        defer cursor.deinit();
+        const page_limit = @max(limit, 1);
+        while (try cursor.next()) |record| {
+            try token.check();
+            if (documents == page_limit) {
+                next = try alloc.dupe(u8, record.key);
+                break;
+            }
+            const body = try document_facts.readRecordBodyAlloc(alloc, &pages, record);
+            defer alloc.free(body);
+            try named_outputs.tally(alloc, declarations, body, tallies);
+            documents += 1;
+        }
+    }
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    var json: std.json.Stringify = .{ .writer = &out.writer };
+    try json.beginObject();
+    try json.objectField("head_version");
+    try json.write(head_version);
+    try json.objectField("documents");
+    try json.write(documents);
+    try json.objectField("next");
+    try json.write(next);
+    try json.objectField("pending_documents");
+    try json.write(pending_documents);
+    try json.objectField("enrichments");
+    try json.beginArray();
+    for (declarations.configs, tallies) |cfg, count| {
+        try json.beginObject();
+        try json.objectField("name");
+        try json.write(cfg.name);
+        try json.objectField("kind");
+        try json.write(@tagName(cfg.kind));
+        inline for (.{ "seeded", "generated", "external", "pending" }) |field| {
+            try json.objectField(field);
+            try json.write(@field(count, field));
+        }
+        try json.endObject();
+    }
+    try json.endArray();
+    try json.endObject();
+    return out.toOwnedSlice();
 }
 
 fn isExternalManifest(manifest: manifest_mod.Manifest) bool {

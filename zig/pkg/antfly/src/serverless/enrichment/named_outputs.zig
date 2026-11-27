@@ -240,6 +240,49 @@ pub fn needsGeneration(alloc: Allocator, declarations: named_enrichments.Declara
     return false;
 }
 
+/// Per-declaration output counts of a table (migration and readiness).
+pub const Tally = struct {
+    seeded: u64 = 0,
+    generated: u64 = 0,
+    external: u64 = 0,
+    /// Declared with a computable input but not yet accepted for it: awaiting
+    /// generation, or a seed held `pending` by its mapping.
+    pending: u64 = 0,
+};
+
+/// Adds one document's outputs to `tallies` (parallel to the declarations).
+pub fn tally(alloc: Allocator, declarations: named_enrichments.Declarations, body: []const u8, tallies: []Tally) !void {
+    std.debug.assert(tallies.len == declarations.configs.len);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const document = std.json.parseFromSliceLeaky(std.json.Value, a, body, .{}) catch return;
+    if (document != .object) return;
+    const artifacts = objectMember(document, "_artifacts") orelse std.json.ObjectMap.empty;
+    const chunks = objectMember(document, "_chunks") orelse std.json.ObjectMap.empty;
+    const markers = if (objectMember(document, "_enrichment")) |state| if (state.get(marker_key)) |named| if (named == .object) named.object else null else null else null;
+    for (declarations.configs, tallies) |cfg, *count| {
+        const marker = if (markers) |map| if (map.get(cfg.name)) |found| if (found == .object) found.object else null else null else null;
+        const external_asset = named_enrichments.externallyMaintained(cfg);
+        const input = if (external_asset) null else try inputDigestHexAlloc(a, cfg, document, artifacts, chunks);
+        if (marker) |record| {
+            const held = if (record.get("pending")) |flag| flag == .bool and flag.bool else false;
+            if (held or (!external_asset and !markerInputMatches(record, input))) {
+                count.pending += 1;
+                continue;
+            }
+            const origin = record.get("origin") orelse continue;
+            if (origin != .string) continue;
+            if (std.mem.eql(u8, origin.string, "seeded")) count.seeded += 1 else if (std.mem.eql(u8, origin.string, "generated")) count.generated += 1 else if (std.mem.eql(u8, origin.string, "external")) count.external += 1;
+            continue;
+        }
+        const present = if (cfg.kind == .chunk) chunks.contains(cfg.name) else artifacts.contains(cfg.name);
+        if (external_asset) {
+            if (present) count.external += 1;
+        } else if (input != null) count.pending += 1;
+    }
+}
+
 /// Producers the named stage calls. A null hook leaves those outputs
 /// pending (`Generated.unavailable`) rather than failing the document.
 pub const Producers = struct {
@@ -636,6 +679,15 @@ test "serverless named outputs generate chains in dependency order and leave una
             return error.TestUnexpectedResult;
         }
     }
+    var bare_counts: [4]Tally = @splat(.{});
+    try tally(alloc, declarations, bare.body.?, &bare_counts);
+    for (declarations.configs, bare_counts) |cfg, count| {
+        if (std.mem.eql(u8, cfg.name, "summary_v1")) try std.testing.expectEqual(Tally{ .pending = 1 }, count);
+        if (std.mem.eql(u8, cfg.name, "title_copy")) try std.testing.expectEqual(Tally{ .generated = 1 }, count);
+    }
+    var full_counts: [4]Tally = @splat(.{});
+    try tally(alloc, declarations, out, &full_counts);
+    for (full_counts) |count| try std.testing.expectEqual(Tally{ .generated = 1 }, count);
     // Everything is accepted for its input; nothing remains to generate.
     try std.testing.expect(!try needsGeneration(alloc, declarations, out));
     const again = try generateAlloc(alloc, declarations, out, .{ .ctx = &fake, .embed = Fake.embed, .asset = Fake.asset });

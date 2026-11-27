@@ -364,6 +364,7 @@ pub const HttpHandler = struct {
             .ingest_batch => |value| try self.handleIngestBatch(value.namespace, req.body),
             .ingest_table_batch => |value| try self.handleIngestTableBatch(value.table_name, req.body),
             .table_batch => |value| try self.handleTableBatch(value.table_name, req.body, request_context),
+            .table_enrichment_counts => |value| try self.handleTableEnrichmentCounts(value.table_name, req.body),
             .build_namespace => |value| try self.handleBuildNamespace(value.namespace),
             .internal_table_build => |value| try self.handleBuildTable(value.table_name),
             .build_status => |value| try self.handleBuildStatus(value.namespace),
@@ -1272,6 +1273,23 @@ pub const HttpHandler = struct {
         };
         defer status.deinit(self.alloc);
         return try jsonResponse(self.alloc, 200, status);
+    }
+
+    /// Named enrichment counts of the published HEAD, one page of documents
+    /// at a time: `{"from": key, "limit": n}` (both optional).
+    fn handleTableEnrichmentCounts(self: *HttpHandler, table_name: []const u8, body: []const u8) !HttpResponse {
+        const Request = struct { from: []const u8 = "", limit: usize = 1000 };
+        var parsed = std.json.parseFromSlice(Request, self.alloc, if (std.mem.trim(u8, body, " \t\r\n").len == 0) "{}" else body, .{}) catch return try textResponse(self.alloc, 400, "invalid counts request");
+        defer parsed.deinit();
+        if (parsed.value.limit == 0 or parsed.value.limit > 100_000) return try textResponse(self.alloc, 400, "limit must be between 1 and 100000");
+        var table = (try self.catalog.getTableAlloc(self.alloc, table_name)) orelse return try textResponse(self.alloc, 404, "not found");
+        defer table.deinit(self.alloc);
+        const json = self.catalog.namedEnrichmentCountsJsonAlloc(self.alloc, table.namespace, table.indexes_json, parsed.value.from, parsed.value.limit) catch |err| {
+            std.log.warn("table enrichment counts failed table={s} err={s}", .{ table_name, @errorName(err) });
+            return try textResponse(self.alloc, 500, "counts failed");
+        };
+        defer self.alloc.free(json);
+        return try jsonSliceResponse(self.alloc, 200, json);
     }
 
     fn handleTableBuildStatus(self: *HttpHandler, table_name: []const u8) !HttpResponse {
@@ -14160,6 +14178,26 @@ test "http handler accepts named enrichment seeds on serverless table batches" {
             return error.TestUnexpectedResult;
         }
     }
+
+    // Counts read the published HEAD: nothing before publication.
+    var unpublished = try handler.handle(.{ .method = .post, .path = "/tables/docs/enrichments/counts" });
+    defer unpublished.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), unpublished.status);
+    try std.testing.expect(std.mem.indexOf(u8, unpublished.body, "\"head_version\":0,\"documents\":0") != null);
+    var build = try catalog.buildTable("docs");
+    defer build.deinit(alloc);
+    var counts = try handler.handle(.{ .method = .post, .path = "/tables/docs/enrichments/counts", .body = "{\"limit\":10}" });
+    defer counts.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), counts.status);
+    for ([_][]const u8{ "\"documents\":1,\"next\":null,\"pending_documents\":0", "{\"name\":\"passages\",\"kind\":\"chunk\",\"seeded\":1,\"generated\":0,\"external\":0,\"pending\":0}" }) |expected| {
+        if (std.mem.indexOf(u8, counts.body, expected) == null) {
+            std.debug.print("counts {s} lack {s}\n", .{ counts.body, expected });
+            return error.TestUnexpectedResult;
+        }
+    }
+    var invalid = try handler.handle(.{ .method = .post, .path = "/tables/docs/enrichments/counts", .body = "{\"limit\":0}" });
+    defer invalid.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), invalid.status);
 }
 
 test "http handler honors public serverless sync levels on table batch writes" {
