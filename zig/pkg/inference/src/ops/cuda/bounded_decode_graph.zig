@@ -22,7 +22,9 @@ const driver = @import("driver.zig");
 const buffer = @import("buffer.zig");
 const memory = @import("../../runtime/tier/memory.zig");
 const plan_mod = @import("../../execution/stream_workspace.zig");
-const DecodeScratch = @import("paged_attention_bf16.zig").DecodeScratch;
+const paged_attention = @import("paged_attention_bf16.zig");
+const DecodeScratch = paged_attention.DecodeScratch;
+const recurrent_packet_rows = @import("gated_delta.zig").max_packet_rows;
 const quota_mod = @import("cache_quota.zig");
 const funding_mod = @import("prepared_cache.zig");
 const retirement = @import("../../execution/resource_retirement.zig");
@@ -178,10 +180,11 @@ pub const Descriptor = struct {
 
     pub fn dispatchCounts(self: Descriptor) !DispatchCounts {
         if (self.rows < 2 or self.rows > max_rows) return error.InvalidShape;
-        const tiles = (self.rows + 63) / 64;
+        const attention_packets = (self.rows - 1) / paged_attention.max_packet_rows + 1;
+        const recurrent_packets = (self.rows - 1) / recurrent_packet_rows + 1;
         return .{
-            .attention = try std.math.mul(usize, self.attention_layers, 2 * tiles),
-            .ragged_recurrent = if (self.rows > 64) try std.math.mul(usize, self.recurrent_layers, 2 * tiles) else 0,
+            .attention = try std.math.mul(usize, self.attention_layers, 2 * attention_packets),
+            .ragged_recurrent = if (recurrent_packets > 1) try std.math.mul(usize, self.recurrent_layers, 2 * recurrent_packets) else 0,
         };
     }
 

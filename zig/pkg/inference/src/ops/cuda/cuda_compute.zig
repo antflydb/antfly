@@ -5386,7 +5386,7 @@ pub const CudaCompute = struct {
         var first: usize = 0;
         var row_offset: usize = 0;
         while (first < states.len) {
-            const end: usize = @min(first + 64, states.len);
+            const end: usize = @min(first + @import("gated_delta.zig").max_packet_rows, states.len);
             var group_rows: usize = 0;
             for (lengths[first..end]) |length| group_rows += length;
             var params = @import("gated_delta.zig").RaggedParams{ .base = .{

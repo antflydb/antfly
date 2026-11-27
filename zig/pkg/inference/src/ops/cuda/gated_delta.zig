@@ -148,11 +148,13 @@ comptime {
         @compileError("LightOn prefix batch ABI changed");
 }
 
+pub const max_packet_rows = @typeInfo(@FieldType(BatchParams, "pages")).array.len;
+
 pub const RaggedParams = extern struct {
     base: BatchParams,
-    offsets: [64]u32 = @splat(0),
-    lengths: [64]u32 = @splat(0),
-    initialized: [64]u32 = @splat(0),
+    offsets: [max_packet_rows]u32 = @splat(0),
+    lengths: [max_packet_rows]u32 = @splat(0),
+    initialized: [max_packet_rows]u32 = @splat(0),
 };
 comptime {
     if (@sizeOf(RaggedParams) != 2408 or @offsetOf(RaggedParams, "offsets") != 1640 or
