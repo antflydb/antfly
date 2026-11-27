@@ -1040,8 +1040,9 @@ pub const Executor = struct {
         // Funding tokens are consumed or published. Close metadata while
         // holding the claim, before later readback can rotate the boundary.
         try funding_phase.close(.{ .boundary = self.context.cleanupEpoch() });
+        var state_may_have_advanced = false;
         errdefer {
-            for (items) |item| if (item.state.qwen35_linear_cache) |cache| for (cache.layers) |*layer| {
+            if (state_may_have_advanced) for (items) |item| if (item.state.qwen35_linear_cache) |cache| for (cache.layers) |*layer| {
                 layer.cuda_device.failed = true;
             };
             graph.compute.bounded_decode_graph.disabled_epoch = graph.compute.bounded_decode_graph.epoch_id;
@@ -1060,7 +1061,9 @@ pub const Executor = struct {
             max_tokens: usize = 0,
             burst: *C.LightOnTokenBurst,
             head: ops.CT,
+            state_may_have_advanced: *bool,
             fn advanceCpu(render: *@This()) !void {
+                render.state_may_have_advanced.* = true;
                 for (render.items) |*item| {
                     try item.state.appendGeneratedTokenWithKvLockHeldWithCleanup(.{ .boundary = render.pipeline.context.cleanupEpoch(), .operation = render.pipeline.context.cb.operationToken() });
                     item.total_sequence_len += 1;
@@ -1087,6 +1090,7 @@ pub const Executor = struct {
                     context.context.prepared_lighton_decode = true;
                     claim.beginStep(step);
                     const input = if (step == 0) try claim.input() else try claim.embedNext(render.burst, 0);
+                    render.state_may_have_advanced.* = true;
                     const hidden = try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(pipeline.context.cb, pipeline.context.allocator, pipeline.context.gpt_config.*, input, .{}, if (render.items.len > 64) 1 else render.items.len, if (render.items.len > 64) render.items.len else 1, &context.context, null);
                     defer pipeline.context.cb.free(hidden.hidden);
                     try claim.projectGreedyHead(pipeline.context.cb, render.burst, hidden.hidden, render.head, step);
@@ -1094,9 +1098,15 @@ pub const Executor = struct {
                 }
             }
         };
-        var render = Render{ .pipeline = self, .items = items, .burst = &burst, .head = head };
-        if (graph.compute.bounded_decode_graph.phase == .replay) try render.advanceCpu();
+        var render = Render{
+            .pipeline = self,
+            .items = items,
+            .burst = &burst,
+            .head = head,
+            .state_may_have_advanced = &state_may_have_advanced,
+        };
         try self.context.cb.checkExecutionControl();
+        if (graph.compute.bounded_decode_graph.phase == .replay) try render.advanceCpu();
         try graph.run(&render, Render.run);
         graph.noteKvTokens(storage, render.max_tokens);
         try graph.read(&burst, first, second);
