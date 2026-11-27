@@ -1237,27 +1237,43 @@ pub const Runtime = struct {
             @import("invocation_observation.zig").recordContextAcquisitionFailure(&self.forward.context, .prefill, error.MissingCompiledModelRuntime);
             return error.MissingCompiledModelRuntime;
         };
-        var execution_scope = try self.acquireForObservation();
+        var execution_scope = self.acquireForObservation() catch |err| {
+            traceCompiledPrefillFailure("execution_scope", request, err);
+            return err;
+        };
         defer if (execution_scope) |*scope| scope.deinit();
         const phase_timer = @import("antfly_readers").pipeline_metrics.start(.prefill);
         defer phase_timer.finish();
         return @import("invocation_observation.zig").callContextOperation(&self.forward.context, .prefill, @This().runCompiledChunkWithOwnedLane, .{ self, request, cache, forward_fn });
     }
 
+    fn traceCompiledPrefillFailure(stage: []const u8, request: CompiledChunk, err: anyerror) void {
+        if (!platform.env.getenvBool("TERMITE_GEN_STAGE_DEBUG")) return;
+        std.debug.print("gen_debug: compiled prefill failed stage={s} rows={d} total={d} prepared={} error={s}\n", .{
+            stage, request.token_ids.len, request.total_sequence_length, request.prepared_rows != null, @errorName(err),
+        });
+    }
+
     fn runCompiledChunkWithOwnedLane(self: *Runtime, request: CompiledChunk, cache: *graph_mod.cache.GraphCache, comptime forward_fn: anytype) !Output {
         const allocator = self.forward.context.allocator;
         var logical = BorrowedDecodeStateRuntime.init(self.state);
-        const context = try logical.preparePrefillWithCleanup(request.total_sequence_length, request.token_ids.len, .{ .boundary = self.forward.context.cleanupEpoch(), .operation = self.forward.context.cb.operationToken() });
+        const context = logical.preparePrefillWithCleanup(request.total_sequence_length, request.token_ids.len, .{ .boundary = self.forward.context.cleanupEpoch(), .operation = self.forward.context.cb.operationToken() }) catch |err| {
+            traceCompiledPrefillFailure("kv_prepare", request, err);
+            return err;
+        };
         const cleanup_operation = self.forward.context.cb.operationToken();
         const supplied_cleanup = self.forward.context.cleanupEpoch();
         var inherited = if (supplied_cleanup == null and cleanup_operation != null) try cleanup_operation.?.retainCleanupEpoch() else null;
         defer if (inherited) |*epoch| epoch.release();
         const cleanup = @import("cleanup_context.zig").Context{ .boundary = supplied_cleanup orelse if (inherited) |*epoch| epoch else null, .operation = cleanup_operation };
-        var output = (try forward_fn(&self.forward.context, cache, request.token_ids, 1, request.total_sequence_length, &context, .{ .prepared_rows = request.prepared_rows, .output_intent = switch (request.output) {
+        var output = (forward_fn(&self.forward.context, cache, request.token_ids, 1, request.total_sequence_length, &context, .{ .prepared_rows = request.prepared_rows, .output_intent = switch (request.output) {
             .kv_only => .kv_only,
             .last_logits => .last_logits,
             .greedy_token => .greedy_token,
-        } })) orelse return error.MissingCompiledModelRuntime;
+        } }) catch |err| {
+            traceCompiledPrefillFailure("model_forward", request, err);
+            return err;
+        }) orelse return error.MissingCompiledModelRuntime;
         defer output.deinitWithCleanup(allocator, cleanup);
         return switch (request.output) {
             .kv_only => .{},

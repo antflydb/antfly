@@ -1297,6 +1297,10 @@ fn encodePleVectors(
     const num_layers: usize = gpt_config.num_hidden_layers;
     const ple_total_dim = ple_dim * num_layers;
 
+    var stage: []const u8 = "embedding_weight";
+    errdefer if (prefillTraceRequested()) {
+        std.debug.print("prefill-trace: per-layer input failed stage={s} rows={d}\n", .{ stage, total });
+    };
     var started_at = monotonicNowNs();
     const token_w = gpt_arch.getModelEmbeddingWeight(cb, gpt_config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
         error.MissingWeight => try gpt_arch.getModelEmbeddingWeight(cb, gpt_config, "model.embed_tokens_per_layer.weight"),
@@ -1307,6 +1311,7 @@ fn encodePleVectors(
     defer cb.free(token_w);
 
     started_at = monotonicNowNs();
+    stage = "embedding_lookup";
     const token_embd_raw = switch (tokens) {
         .host => |ids| try cb.embeddingLookup(token_w, ids, total, ple_total_dim),
         .device => |tensor| (try cb.embeddingLookupTensor(token_w, tensor, total, ple_total_dim)) orelse return null,
@@ -1316,6 +1321,7 @@ fn encodePleVectors(
     defer cb.free(token_embd_raw);
 
     started_at = monotonicNowNs();
+    stage = "model_projection";
     const projection_epsilon = try gpt_arch.gemmaPleProjectionEpsilon(cb, hidden, total, gpt_config);
     const model_proj_raw = (try cb.decoderRuntimeApplyLinear(&.{
         .slot = pleModelProjSlot(configured_layer_count),
@@ -1328,6 +1334,7 @@ fn encodePleVectors(
     defer cb.free(model_proj_raw);
 
     started_at = monotonicNowNs();
+    stage = "projection_normalization";
     const reshaped = (try cb.reshape2d(model_proj_raw, total * num_layers, ple_dim)) orelse return null;
     defer cb.free(reshaped);
 
@@ -1345,6 +1352,7 @@ fn encodePleVectors(
     defer cb.free(normed_proj);
 
     started_at = monotonicNowNs();
+    stage = "combine";
     const embed_scale_val = @sqrt(@as(f32, @floatFromInt(ple_dim)));
     const combine_scale_val: f32 = 1.0 / @sqrt(2.0);
     if (try cb.decoderRuntimeApplyScaledAddScale(&.{
