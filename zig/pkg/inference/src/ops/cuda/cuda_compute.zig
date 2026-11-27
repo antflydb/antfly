@@ -32735,7 +32735,19 @@ fn gqaAttentionMatch(self: *CudaCompute, owner: *CudaKvDeviceStorage, binding: *
 // The dedicated OCR profile has a bounded, one-token F16 paged decode ABI.
 // Snapshot every page table in the launch packet so peers never observe the
 // mutable per-sequence upload table used by the singleton fallback.
-fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention: ops.AttentionContext, views: []const ops.KvBatchView, heads: usize, kv_heads: usize, dim: usize) !?CT {
+const PackedAttentionDestination = struct { parent: CT, row_offset: usize };
+
+/// Capture's packed attention writes each packet directly to the caller's
+/// joined output, keeping the same packet and per-page K/V contract.
+pub fn tryCapturedPackedAttentionInto(cb: *const ops.ComputeBackend, q: CT, k: CT, v: CT, attention: ops.AttentionContext, heads: usize, kv_heads: usize, dim: usize, parent: CT, row_offset: usize) !bool {
+    if (!acceptsPhysicalImplementation(cb.vtable) or attention.forward_kv_reuse != null) return false;
+    const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    if (!self.bounded_decode_graph.active) return false;
+    const views = attention.kv_batch orelse return false;
+    return (try tryLightOnBatchedAttention(self, q, k, v, attention, views, heads, kv_heads, dim, .{ .parent = parent, .row_offset = row_offset })) != null;
+}
+
+fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention: ops.AttentionContext, views: []const ops.KvBatchView, heads: usize, kv_heads: usize, dim: usize, assigned: ?PackedAttentionDestination) !?CT {
     const module = @import("paged_attention_bf16.zig");
     if (!self.lighton_attention_enabled or self.capability_profile != .lightonocr3 or
         !module.packetSupported(self.ctx.info.compute_major, self.ctx.info.driver_version) or
@@ -32790,10 +32802,22 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
     // Allocate and qualify the module before the first KV mutation. Physical
     // buffers use the existing budgeted temporary pool and retire on this stream.
     try self.lighton_attention.init(&self.ctx);
-    const shape = try allocShape2(self.allocator, views.len, width);
-    errdefer self.allocator.free(shape);
-    var output = try allocDeviceBuffer(self, scratch_layout.output_elements * @sizeOf(f32));
-    errdefer releaseDeviceBuffer(self, &output);
+    const output_bytes = scratch_layout.output_elements * @sizeOf(f32);
+    const shape = if (assigned == null) try allocShape2(self.allocator, views.len, width) else null;
+    errdefer if (shape) |owned| self.allocator.free(owned);
+    var output = if (assigned) |target| bound: {
+        const parent = tensorFromCt(target.parent);
+        try ensureF32(parent);
+        const offset = try checkedMul(target.row_offset, width * @sizeOf(f32));
+        if (offset > parent.buffer.len or output_bytes > parent.buffer.len - offset) return error.InvalidAssignedOutputAuthority;
+        const destination: buffer_mod.DeviceBuffer = .{ .ptr = try std.math.add(u64, parent.buffer.ptr, offset), .len = output_bytes, .borrowed = true };
+        _ = try buffer_mod.validateRegion(destination, output_bytes, @alignOf(f32));
+        for ([_]buffer_mod.DeviceBuffer{ qt.buffer, kt.buffer, vt.buffer }) |source| {
+            if (kernel_geometry.byteRangesOverlap(destination.ptr, output_bytes, source.ptr, source.len)) return error.InvalidAssignedAlias;
+        }
+        break :bound destination;
+    } else try allocDeviceBuffer(self, output_bytes);
+    errdefer if (assigned == null) releaseDeviceBuffer(self, &output);
     var scratch = if (captured)
         try self.bounded_decode_graph.bindAttentionWorkspace(scratch_layout.bytes)
     else
@@ -32803,6 +32827,14 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
     params.partials = scratch.ptr;
     params.statistics = scratch.ptr + scratch_layout.statistics_offset;
     const shared_key = try device_storage.layerKey(views[0].kv_cache.sequence_id, attention.layer_index);
+    if (assigned != null) {
+        if (kernel_geometry.byteRangesOverlap(output.ptr, output.len, scratch.ptr, scratch.len)) return error.InvalidAssignedAlias;
+        if (device_storage.layers.getPtr(shared_key)) |layer| {
+            for ([_]buffer_mod.DeviceBuffer{ layer.k, layer.v }) |source| {
+                if (kernel_geometry.byteRangesOverlap(output.ptr, output.len, source.ptr, source.len)) return error.InvalidAssignedAlias;
+            }
+        }
+    }
     // An existing physical allocation covers most decode steps. Retain the
     // general storage path for growth, first writes, or shared-prefix tails.
     const direct_suffix = direct: {
@@ -32871,7 +32903,8 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
     self.stats.device_kv_batch_steps += 1;
     self.stats.device_kv_batch_items += views.len;
     self.stats.device_kv_successes += 1;
-    return createTensor(self, output, shape, scratch_layout.output_elements);
+    if (assigned) |target| return target.parent;
+    return createTensor(self, output, shape.?, scratch_layout.output_elements);
 }
 
 /// Ordinary F32 singleton into a batch parent's exact output subspan. The
@@ -33022,7 +33055,7 @@ fn gqaPagedAttentionBatchWithDeviceKv(
         }
     }
 
-    if (try tryLightOnBatchedAttention(self, q_ct, k_ct, v_ct, attention, kv_batch, num_heads, num_kv_heads, head_dim)) |result| return result;
+    if (try tryLightOnBatchedAttention(self, q_ct, k_ct, v_ct, attention, kv_batch, num_heads, num_kv_heads, head_dim, null)) |result| return result;
 
     const output_count = try checkedMul(q_rows, h_q);
     const output_shape = try dupeShape(self.allocator, q_tensor.shape);
@@ -43136,6 +43169,21 @@ test "LightOnOCR3 CUDA batched attention preserves page bindings and validates b
         const got = try cb.toFloat32(actual, a);
         defer a.free(got);
         for (gold, got) |x, y| try std.testing.expectApproxEqAbs(x, y, 2e-5);
+        const initial = try a.alloc(f32, 4 * width);
+        defer a.free(initial);
+        @memset(initial, -19);
+        const parent = try cb.fromFloat32Shape(initial, &.{ 4, @intCast(width) });
+        defer cb.free(parent);
+        const assigned: PackedAttentionDestination = .{ .parent = parent, .row_offset = 1 };
+        try std.testing.expectEqual(parent, (try tryLightOnBatchedAttention(&compute, qt, kt, vt, attention, &views, heads, kv_heads, 256, assigned)).?);
+        const joined = try cb.toFloat32(parent, a);
+        defer a.free(joined);
+        try std.testing.expectEqualSlices(f32, got, joined[width .. 3 * width]);
+        try std.testing.expectEqualSlices(f32, initial[0..width], joined[0..width]);
+        try std.testing.expectEqualSlices(f32, initial[3 * width ..], joined[3 * width ..]);
+        const writes_before_reject = compute.stats.device_kv_writes;
+        try std.testing.expectError(error.InvalidAssignedAlias, tryLightOnBatchedAttention(&compute, qt, kt, vt, attention, &views, heads, kv_heads, 256, .{ .parent = qt, .row_offset = 0 }));
+        try std.testing.expectEqual(writes_before_reject, compute.stats.device_kv_writes);
         const writes = compute.stats.device_kv_writes;
         var invalid = views;
         invalid[1] = invalid[0];
@@ -43145,7 +43193,7 @@ test "LightOnOCR3 CUDA batched attention preserves page bindings and validates b
         invalid = views;
         invalid[1].per_item_kv_len = 1025;
         invalid[1].per_item_total_len = 1025;
-        try std.testing.expect((try tryLightOnBatchedAttention(&compute, qt, kt, vt, attention, &invalid, heads, kv_heads, 256)) == null);
+        try std.testing.expect((try tryLightOnBatchedAttention(&compute, qt, kt, vt, attention, &invalid, heads, kv_heads, 256, null)) == null);
         try std.testing.expectEqual(writes, compute.stats.device_kv_writes);
     }
 }

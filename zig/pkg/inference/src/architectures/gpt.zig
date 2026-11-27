@@ -10531,9 +10531,13 @@ fn runPackedQwenAttention(
             item.kv_sequence_len = view.per_item_kv_len.?;
             item.kv_position_offset = view.per_item_kv_position_offset.?;
         }
-        const output = try runPreparedAttentionWithSinkMetadata(cb, q, k, v, item, sink, count, num_heads, num_kv_heads, head_dim);
-        defer cb.free(output);
-        if (!try cb.copyRows2D(a, result, offset, output, 0, rows, width)) return error.UnsupportedTensorType;
+        const assigned = cb.kind() == .cuda and count > 1 and !sink.hasMetadata() and
+            try @import("../ops/cuda/cuda_compute.zig").tryCapturedPackedAttentionInto(cb, q, k, v, item, num_heads, num_kv_heads, head_dim, result, offset);
+        if (!assigned) {
+            const output = try runPreparedAttentionWithSinkMetadata(cb, q, k, v, item, sink, count, num_heads, num_kv_heads, head_dim);
+            defer cb.free(output);
+            if (!try cb.copyRows2D(a, result, offset, output, 0, rows, width)) return error.UnsupportedTensorType;
+        }
         if (count > 1) if (context) |dc| {
             if (dc.packed_attention_groups) |counter| counter.* += 1;
             if (dc.packed_attention_rows) |counter| counter.* += count;
