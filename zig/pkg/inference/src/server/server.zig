@@ -47780,7 +47780,11 @@ test "Decide extraction v2 serves classifications through HTTP handler" {
     defer node.deinit();
     try node.attachIo(std.testing.io);
     const backend_name = platform.env.getenv("ANTFLY_GLINER_DECIDE_BACKEND") orelse "native";
-    const backend: backends_mod.BackendType = if (std.mem.eql(u8, backend_name, "cuda")) .cuda else if (std.mem.eql(u8, backend_name, "native")) .native else return error.InvalidDecisionTestBackend;
+    const backend = std.meta.stringToEnum(backends_mod.BackendType, backend_name) orelse return error.InvalidDecisionTestBackend;
+    switch (backend) {
+        .native, .metal, .cuda => {},
+        else => return error.InvalidDecisionTestBackend,
+    }
     node.session_manager.required_backend = backend;
     node.model_manager.session_manager.required_backend = backend;
     const body = try std.fmt.allocPrint(
