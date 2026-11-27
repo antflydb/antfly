@@ -298,7 +298,7 @@ pub const TextPipeline = struct {
 
     fn selectsInPrefill(config: generation.GenerationConfig) bool {
         return chat.usesUnpenalizedGreedy(config) and
-            @import("antfly_platform").env.getenvBoolDefault("ANTFLY_METAL_PREFILL_GREEDY_SELECTION", false);
+            @import("antfly_platform").env.getenvBoolDefault("ANTFLY_METAL_PREFILL_GREEDY_SELECTION", config.max_tokens == 1);
     }
 
     fn prefillTokenCount(self: *const TextPipeline, config: generation.GenerationConfig) usize {
