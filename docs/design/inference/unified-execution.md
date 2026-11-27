@@ -1454,6 +1454,12 @@ skips. The 128-page recurrent fixture matched the two independent
 prefill and decode. This establishes correctness for scratch reuse
 across the ordered packets. Serving latency was not measured.
 
+At `15b2758bf1`, all 24 scoped Spark CUDA checks passed without skips,
+including the physical scalar and batched projection argmax case.
+The released two-row LightOnOCR HTTP graph replay reported a
+297,216-byte shared layer workspace and a 44-byte admitted pinned
+readback. The reported workspace equals the largest stage bound.
+
 At `ee3629cec0`, five scoped Metal audio tests passed without skips.
 The replay fixture rejected missing and excess input bindings before
 dispatch. The same run covered fresh inputs, held results, and
