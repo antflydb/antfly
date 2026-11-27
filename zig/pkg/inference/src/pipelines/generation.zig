@@ -2362,7 +2362,6 @@ const retryDirectPrefillAfterMemoryBudgetExceeded = decoder_prefill.retryAfterMe
 const MixedBatchDecodeItem = decode_batch.Item;
 const buildOwnedMixedBatchDecodeContextWithMrope = decode_batch.buildWithPositions;
 const buildOwnedMixedBatchDecodeContextLayout = decode_batch.buildLayout;
-const buildOwnedLightOnGraphDecodeContext = decode_batch.buildPackedDecode;
 
 const Qwen3VlParityImageJson = struct {
     source_width: usize,
@@ -14285,19 +14284,16 @@ test "LightOnOCR3 CUDA wide graph contexts own explicit unequal page positions t
     }
     try std.testing.expectError(error.InvalidPackedQueryShape, buildOwnedMixedBatchDecodeContextLayout(a, &items, null, &lengths));
     for ([_]usize{ 66, 128 }) |rows| {
-        const bytes = 128 * (@sizeOf(gpt_arch.DecodeContext.KvBatchView) + @sizeOf(?*gpt_arch.Qwen35LinearCache) + 3 * @sizeOf(u32)) + 128;
-        var metadata: [bytes]u8 align(@alignOf(gpt_arch.DecodeContext.KvBatchView)) = undefined;
-        var fba = std.heap.FixedBufferAllocator.init(&metadata);
-        var owned = try buildOwnedLightOnGraphDecodeContext(fba.allocator(), items[0..rows], lengths[0..rows]);
-        defer owned.deinit();
-        try std.testing.expectEqual(rows, owned.context.query_sequence_len);
-        try std.testing.expectEqual(rows, owned.context.kv_batch.?.len);
-        try std.testing.expectEqualSlices(usize, lengths[0..rows], owned.context.packed_query_lengths.?);
+        var workspace: decode_batch.PackedDecodeWorkspace = .{};
+        const context = try workspace.build(items[0..rows]);
+        try std.testing.expectEqual(rows, context.query_sequence_len);
+        try std.testing.expectEqual(rows, context.kv_batch.?.len);
+        try std.testing.expectEqualSlices(usize, lengths[0..rows], context.packed_query_lengths.?);
         for (0..3) |axis| for (0..rows) |i| {
-            try std.testing.expectEqual(@as(u32, @intCast(4 + i % 3 - 1 + 100 + i)), owned.context.mrope_positions.?[axis * rows + i]);
+            try std.testing.expectEqual(@as(u32, @intCast(4 + i % 3 - 1 + 100 + i)), context.mrope_positions.?[axis * rows + i]);
         };
         @memset(&states[0].qwen3vl_decode_positions, 99999);
-        try std.testing.expectEqual(@as(u32, 103), owned.context.mrope_positions.?[0]);
+        try std.testing.expectEqual(@as(u32, 103), context.mrope_positions.?[0]);
     }
 }
 

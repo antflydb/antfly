@@ -37,7 +37,6 @@ const BorrowedDecodeStateRuntime = state_runtime.BorrowedDecodeStateRuntime;
 const decode_batch = @import("decode_batch.zig");
 const MixedBatchDecodeItem = decode_batch.Item;
 const buildOwnedMixedBatchDecodeContextLayout = decode_batch.buildLayout;
-const buildOwnedLightOnGraphDecodeContext = decode_batch.buildPackedDecode;
 pub const packed_head_rows = @import("../graph/packed_head_rows.zig");
 const max_gpu_token_burst_width = 8;
 pub const Result = Executor.StepForwardResult;
@@ -652,22 +651,18 @@ pub const Executor = struct {
                 item.kv_sequence_len = context.kv_sequence_len;
                 item.kv_position_offset = context.kv_position_offset;
             }
-            const metadata_bytes = 128 * (@sizeOf(gpt_arch.DecodeContext.KvBatchView) + @sizeOf(?*gpt_arch.Qwen35LinearCache) + 3 * @sizeOf(u32)) + 128;
-            var metadata: [metadata_bytes]u8 align(@alignOf(gpt_arch.DecodeContext.KvBatchView)) = undefined;
-            var fba = std.heap.FixedBufferAllocator.init(&metadata);
-            const lengths: [128]usize = @splat(1);
-            var context = try buildOwnedLightOnGraphDecodeContext(fba.allocator(), items, lengths[0..items.len]);
-            try self.context.bindDecoderCleanup(&context.context);
-            defer context.deinit();
-            context.context.prepared_lighton_decode = true;
+            var metadata: decode_batch.PackedDecodeWorkspace = .{};
+            var context = try metadata.build(items);
+            try self.context.bindDecoderCleanup(&context);
+            context.prepared_lighton_decode = true;
             if (wide) {
-                context.context.packed_recurrent_groups = &recurrent_groups;
-                context.context.packed_recurrent_rows = &recurrent_rows;
-                context.context.packed_attention_groups = &attention_groups;
-                context.context.packed_attention_rows = &attention_rows;
+                context.packed_recurrent_groups = &recurrent_groups;
+                context.packed_recurrent_rows = &recurrent_rows;
+                context.packed_attention_groups = &attention_groups;
+                context.packed_attention_rows = &attention_rows;
             }
             const embedded = try burst.embedding(step - 1);
-            const hidden = try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(self.context.cb, self.context.allocator, self.context.gpt_config.*, embedded, .{}, if (wide) 1 else claimed.len, if (wide) claimed.len else 1, &context.context, null);
+            const hidden = try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(self.context.cb, self.context.allocator, self.context.gpt_config.*, embedded, .{}, if (wide) 1 else claimed.len, if (wide) claimed.len else 1, &context, null);
             defer self.context.cb.free(hidden.hidden);
             try burst.projectArgmax(hidden.hidden, head, step);
         }
@@ -797,15 +792,11 @@ pub const Executor = struct {
             ordered_items[row] = items[original];
             ordered_ids[row] = input_ids[original];
         }
-        const metadata_bytes = 128 * (@sizeOf(gpt_arch.DecodeContext.KvBatchView) + @sizeOf(?*gpt_arch.Qwen35LinearCache) + 3 * @sizeOf(u32)) + 128;
-        var metadata: [metadata_bytes]u8 align(@alignOf(gpt_arch.DecodeContext.KvBatchView)) = undefined;
-        var fba = std.heap.FixedBufferAllocator.init(&metadata);
-        const lengths: [128]usize = @splat(1);
-        var context = try buildOwnedLightOnGraphDecodeContext(fba.allocator(), ordered_items[0..claimed.len], lengths[0..claimed.len]);
-        try self.context.bindDecoderCleanup(&context.context);
-        defer context.deinit();
-        context.context.prepared_lighton_decode = true;
-        const result = (try self.tryOrderedLightOnCudaDecodeGraph(ordered_claims[0..claimed.len], ordered_items[0..claimed.len], ordered_ids[0..claimed.len], &context.context)) orelse return null;
+        var metadata: decode_batch.PackedDecodeWorkspace = .{};
+        var context = try metadata.build(ordered_items[0..claimed.len]);
+        try self.context.bindDecoderCleanup(&context);
+        context.prepared_lighton_decode = true;
+        const result = (try self.tryOrderedLightOnCudaDecodeGraph(ordered_claims[0..claimed.len], ordered_items[0..claimed.len], ordered_ids[0..claimed.len], &context)) orelse return null;
         const first = result.greedy_tokens.?;
         const second = result.second_greedy_tokens.?;
         std.debug.assert(first.len == claimed.len and second.len == claimed.len);
@@ -1089,18 +1080,14 @@ pub const Executor = struct {
                 for (0..2) |step| {
                     try pipeline.context.cb.checkExecutionControl();
                     if (step == 1) try render.advanceCpu();
-                    const metadata_bytes = 128 * (@sizeOf(gpt_arch.DecodeContext.KvBatchView) + @sizeOf(?*gpt_arch.Qwen35LinearCache) + 3 * @sizeOf(u32)) + 128;
-                    var metadata: [metadata_bytes]u8 align(@alignOf(gpt_arch.DecodeContext.KvBatchView)) = undefined;
-                    var fba = std.heap.FixedBufferAllocator.init(&metadata);
-                    const lengths: [128]usize = @splat(1);
-                    var context = try buildOwnedLightOnGraphDecodeContext(fba.allocator(), render.items, lengths[0..render.items.len]);
-                    try pipeline.context.bindDecoderCleanup(&context.context);
-                    defer context.deinit();
-                    context.context.prepared_lighton_decode = true;
+                    var metadata: decode_batch.PackedDecodeWorkspace = .{};
+                    var context = try metadata.build(render.items);
+                    try pipeline.context.bindDecoderCleanup(&context);
+                    context.prepared_lighton_decode = true;
                     claim.beginStep(step);
                     const input = if (step == 0) try claim.input() else try claim.embedNext(render.burst, 0);
                     render.state_may_have_advanced.* = true;
-                    const hidden = try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(pipeline.context.cb, pipeline.context.allocator, pipeline.context.gpt_config.*, input, .{}, if (render.items.len > 64) 1 else render.items.len, if (render.items.len > 64) render.items.len else 1, &context.context, null);
+                    const hidden = try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(pipeline.context.cb, pipeline.context.allocator, pipeline.context.gpt_config.*, input, .{}, if (render.items.len > 64) 1 else render.items.len, if (render.items.len > 64) render.items.len else 1, &context, null);
                     defer pipeline.context.cb.free(hidden.hidden);
                     try claim.projectGreedyHead(pipeline.context.cb, render.burst, hidden.hidden, render.head, step);
                     try claim.advance();
@@ -1201,19 +1188,16 @@ pub const Executor = struct {
                     const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
                     ids[i] = work.token_id;
                 }
-                const metadata_bytes = 128 * (@sizeOf(gpt_arch.DecodeContext.KvBatchView) + @sizeOf(?*gpt_arch.Qwen35LinearCache) + 3 * @sizeOf(u32)) + 128;
-                var metadata: [metadata_bytes]u8 align(@alignOf(gpt_arch.DecodeContext.KvBatchView)) = undefined;
-                var fba = std.heap.FixedBufferAllocator.init(&metadata);
-                var context = try buildOwnedLightOnGraphDecodeContext(fba.allocator(), mixed[0..claimed.len], lengths[0..claimed.len]);
-                try self.context.bindDecoderCleanup(&context.context);
-                defer context.deinit();
-                context.context.prepared_lighton_decode = true;
-                if (try self.tryLightOnCudaDecodeGraph(claimed, mixed[0..claimed.len], ids[0..claimed.len], &context.context)) |result| return result;
+                var metadata: decode_batch.PackedDecodeWorkspace = .{};
+                var context = try metadata.build(mixed[0..claimed.len]);
+                try self.context.bindDecoderCleanup(&context);
+                context.prepared_lighton_decode = true;
+                if (try self.tryLightOnCudaDecodeGraph(claimed, mixed[0..claimed.len], ids[0..claimed.len], &context)) |result| return result;
                 try @import("../ops/cuda/cuda_compute.zig").CudaCompute.invalidateLightOnDecodeGraphWithCleanup(self.context.cb, .{ .boundary = self.context.cleanupEpoch(), .operation = self.context.cb.operationToken() }, .eager_decode);
                 // Eager decode introduces shapes absent from a mixed prefix
                 // frame; reserve bounded plan slots before enqueueing them.
                 try @import("../ops/cuda/cuda_compute.zig").CudaCompute.prepareLightOnMatmulFrame(self.context.cb);
-                if (try self.tryLightOnCudaTokenBurst(claimed, mixed[0..claimed.len], ids[0..claimed.len], &context.context)) |result| return result;
+                if (try self.tryLightOnCudaTokenBurst(claimed, mixed[0..claimed.len], ids[0..claimed.len], &context)) |result| return result;
             }
         }
         // The combined CPU logits and independent result copies coexist during

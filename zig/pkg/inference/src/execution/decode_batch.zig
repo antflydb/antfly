@@ -22,16 +22,18 @@ const NativeDecodeState = state_runtime.NativeDecodeState;
 const BorrowedDecodeStateRuntime = state_runtime.BorrowedDecodeStateRuntime;
 
 pub const OwnedContext = struct {
-    allocator: std.mem.Allocator,
+    allocator: ?std.mem.Allocator,
     kv_batch: ?[]gpt_arch.DecodeContext.KvBatchView = null,
     mrope_positions: ?[]u32 = null,
     qwen35_linear_batch: ?[]?*gpt_arch.Qwen35LinearCache = null,
     context: gpt_arch.DecodeContext,
 
     pub fn deinit(self: *OwnedContext) void {
-        if (self.kv_batch) |batch| self.allocator.free(batch);
-        if (self.mrope_positions) |positions| self.allocator.free(positions);
-        if (self.qwen35_linear_batch) |caches| self.allocator.free(caches);
+        if (self.allocator) |allocator| {
+            if (self.kv_batch) |batch| allocator.free(batch);
+            if (self.mrope_positions) |positions| allocator.free(positions);
+            if (self.qwen35_linear_batch) |caches| allocator.free(caches);
+        }
         self.kv_batch = null;
         self.mrope_positions = null;
         self.qwen35_linear_batch = null;
@@ -63,21 +65,23 @@ pub fn buildLayout(allocator: std.mem.Allocator, items: []const Item, positions:
     return assemble(true, allocator, items, 0, 0, positions, packed_lengths);
 }
 
-/// Wide decode cohorts retain explicit axis-major position metadata. Lengths
-/// are borrowed until the owned context retires; positions are copied here.
-pub fn buildPackedDecode(allocator: std.mem.Allocator, items: []const Item, lengths: []const usize) !OwnedContext {
-    if (items.len > gpt_arch.max_packed_qwen_items or lengths.len != items.len) return error.InvalidPackedQueryShape;
-    for (items, lengths) |item, len| if (len != 1 or item.query_sequence_len != 1) return error.InvalidPackedQueryShape;
-    if (items.len <= 64) return buildMixed(allocator, items);
-    var positions: [3 * gpt_arch.max_packed_qwen_items]u32 = undefined;
-    for (items, 0..) |item, row| {
-        var decode = BorrowedDecodeStateRuntime.init(item.state);
-        const context = decode.makeDecodeContext(item.total_sequence_len, 1);
-        const axes = context.mrope_positions orelse return error.Qwen3VlMropePositionsRequired;
-        for (0..3) |axis| positions[axis * items.len + row] = axes[axis];
+/// Caller-owned physical metadata for a synchronous decode burst. The
+/// returned context borrows these arrays until submission returns.
+pub const PackedDecodeWorkspace = struct {
+    const capacity = gpt_arch.max_packed_qwen_items;
+    const unit_lengths: [capacity]usize = @splat(1);
+
+    batch: [capacity]gpt_arch.DecodeContext.KvBatchView = undefined,
+    caches: [capacity]?*gpt_arch.Qwen35LinearCache = undefined,
+    positions: [3 * capacity]u32 = undefined,
+
+    pub fn build(self: *PackedDecodeWorkspace, items: []const Item) !gpt_arch.DecodeContext {
+        if (items.len > capacity) return error.InvalidPackedQueryShape;
+        for (items) |item| if (item.query_sequence_len != 1) return error.InvalidPackedQueryShape;
+        const lengths = if (items.len > 64) unit_lengths[0..items.len] else null;
+        return (try assemble(true, self, items, 0, 0, null, lengths)).context;
     }
-    return buildLayout(allocator, items, positions[0 .. 3 * items.len], lengths);
-}
+};
 
 fn Source(comptime mixed: bool) type {
     return if (mixed) []const Item else []const *NativeDecodeState;
@@ -92,12 +96,17 @@ fn contextAt(comptime mixed: bool, source: Source(mixed), index: usize, seq_len:
     return if (mixed) cursor.makeDecodeContext(source[index].total_sequence_len, source[index].query_sequence_len) else cursor.makeDecodeContext(seq_len, query_seq_len);
 }
 
-fn assemble(comptime mixed: bool, allocator: std.mem.Allocator, source: Source(mixed), seq_len: usize, query_seq_len: usize, full_positions: ?[]const u32, packed_lengths: ?[]const usize) !OwnedContext {
+fn assemble(comptime mixed: bool, storage: anytype, source: Source(mixed), seq_len: usize, query_seq_len: usize, full_positions: ?[]const u32, packed_lengths: ?[]const usize) !OwnedContext {
+    const uses_workspace = @TypeOf(storage) == *PackedDecodeWorkspace;
+    const workspace: ?*PackedDecodeWorkspace = if (uses_workspace) storage else null;
+    const allocator: ?std.mem.Allocator = if (uses_workspace) null else storage;
     if (source.len == 0) return error.EmptyBatch;
     if (packed_lengths) |lengths| {
-        if (lengths.len != source.len or full_positions == null) return error.InvalidPackedQueryShape;
-        _ = try gpt_arch.packedQueryRowCount(lengths);
-        if (mixed) for (source, lengths) |item, len| if (item.query_sequence_len != len) return error.InvalidPackedQueryShape;
+        if (!uses_workspace) {
+            if (lengths.len != source.len or full_positions == null) return error.InvalidPackedQueryShape;
+            _ = try gpt_arch.packedQueryRowCount(lengths);
+            if (mixed) for (source, lengths) |item, len| if (item.query_sequence_len != len) return error.InvalidPackedQueryShape;
+        }
     }
     // Reject malformed packed geometry before borrowing any sequence state.
     const first = if (mixed) undefined else contextAt(false, source, 0, seq_len, query_seq_len);
@@ -130,15 +139,16 @@ fn assemble(comptime mixed: bool, allocator: std.mem.Allocator, source: Source(m
         has_caches = has_caches or item.state.qwen35_linear_cache != null;
         has_positions = has_positions or item.state.qwen3vl_mrope_position_delta != null;
     };
-    const physical_rows = if (packed_lengths) |lengths| try gpt_arch.packedQueryRowCount(lengths) else try std.math.mul(usize, source.len, max_query);
+    const physical_rows = if (uses_workspace) source.len else if (packed_lengths) |lengths| try gpt_arch.packedQueryRowCount(lengths) else try std.math.mul(usize, source.len, max_query);
     if (mixed and full_positions == null and has_positions and max_query != 1) return error.Qwen3VlMixedBatchMropeUnsupported;
     if (full_positions) |positions| if (positions.len != try std.math.mul(usize, physical_rows, 3)) return error.InvalidQwen3VlMropeShape;
-    const caches: ?[]?*gpt_arch.Qwen35LinearCache = if (has_caches) try allocator.alloc(?*gpt_arch.Qwen35LinearCache, source.len) else null;
-    errdefer if (caches) |owned| allocator.free(owned);
-    const batch = try allocator.alloc(gpt_arch.DecodeContext.KvBatchView, source.len);
-    errdefer allocator.free(batch);
-    const positions: ?[]u32 = if (full_positions) |values| try allocator.dupe(u32, values) else if (has_positions) try allocator.alloc(u32, try std.math.mul(usize, source.len, 3)) else null;
-    errdefer if (positions) |owned| allocator.free(owned);
+    const needs_positions = full_positions != null or has_positions or (uses_workspace and packed_lengths != null);
+    const caches: ?[]?*gpt_arch.Qwen35LinearCache = if (!has_caches) null else if (workspace) |value| value.caches[0..source.len] else try allocator.?.alloc(?*gpt_arch.Qwen35LinearCache, source.len);
+    errdefer if (allocator) |owner| if (caches) |owned| owner.free(owned);
+    const batch = if (workspace) |value| value.batch[0..source.len] else try allocator.?.alloc(gpt_arch.DecodeContext.KvBatchView, source.len);
+    errdefer if (allocator) |owner| owner.free(batch);
+    const positions: ?[]u32 = if (!needs_positions) null else if (workspace) |value| value.positions[0 .. 3 * source.len] else if (full_positions) |values| try allocator.?.dupe(u32, values) else try allocator.?.alloc(u32, try std.math.mul(usize, source.len, 3));
+    errdefer if (allocator) |owner| if (positions) |owned| owner.free(owned);
     for (source, 0..) |_, index| {
         const context = contextAt(mixed, source, index, seq_len, query_seq_len);
         if (!context.usesPagedKv()) return error.MixedBatchDecodeModes;
