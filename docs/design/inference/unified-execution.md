@@ -1480,6 +1480,12 @@ the 64-row gate. In the second shared arm, page-state cleanup retired
 the 64-row graph before capture finished, after two tokens of progress.
 Throughput parity for the shared bank remains unqualified.
 
+At `2c6206072a`, the scoped page retirement changes passed the host
+dispatch geometry, recurrent cleanup and checked KV release tests.
+The physical graph park/restore fixture compiled and skipped locally.
+Its Spark run checks unrelated retirement, replay and affected-sequence
+retirement before the unchanged timed cohort is retried.
+
 At `ee3629cec0`, five scoped Metal audio tests passed without skips.
 The replay fixture rejected missing and excess input bindings before
 dispatch. The same run covered fresh inputs, held results, and
