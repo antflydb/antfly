@@ -2075,3 +2075,14 @@ both tiers. A larger cap let the serving workload admit more rows and
 did not establish wide replay. The full-width and packet receipts are
 `09c3bfec79832465d4baedc49c1adbfdc0245db5ec42c224342cd6fcb333b852`
 and `46975f03aacb65d34bb9c7561007bd9fb0456858d31cffa2ddbe4955164c083d`.
+
+Moving acquisition of the existing lazy per-layer embedding weight
+before decoder execution recovered mixed-model Metal HTTP at the
+unchanged memory limits. A retryable denial can now reclaim an idle
+peer before prefill advances any state. The request keeps a pin on
+the acquired weight through execution. In four same-binary arms at
+the original workload order, all 11 workloads matched their first
+observed response, including all four Gemma 4 modalities and DECIDE.
+This was a capacity and repeatability control with one warmup and one
+measured request per arm. Its receipt is
+`4e1770f3a6a5e41102e35a0685936fd4ca447bf0dbc713bfef1cd8ce8b1cb14d`.

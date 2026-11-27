@@ -7536,6 +7536,36 @@ pub fn configureReservedGenerationWorkspace(
     session.generation_workspace = &self.generation_workspace.?;
 }
 
+pub const GenerationEmbeddingPin = struct {
+    store: *gpu_hosted_store_mod.WeightStore,
+    entry: *gpu_hosted_store_mod.LazyWeightEntry,
+
+    pub fn release(self: GenerationEmbeddingPin) void {
+        self.store.prefetch.lock();
+        defer self.store.prefetch.unlock();
+        self.entry.pin_count -= 1;
+    }
+};
+
+/// Bring the existing lazy cache backing into residency before decoder
+/// state can advance. The caller retains the loaded model through release.
+pub fn pinGenerationEmbeddingOutsideExecution(session: Session, config: gpt_mod.Config) !?GenerationEmbeddingPin {
+    if (comptime !build_options.enable_metal) return null;
+    if (session.vtable != &arch_vtable or session.backend() != .metal or !config.hasPle() or config.weight_prefix.len != 0) return null;
+    const owner: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    const store = gpuBackendData(owner);
+    store.prefetch.lock();
+    defer store.prefetch.unlock();
+    const entry = store.lazy_weights.getPtr("model.per_layer_input.per_layer_token_embd.weight") orelse
+        store.lazy_weights.getPtr("per_layer_input.per_layer_token_embd.weight") orelse
+        store.lazy_weights.getPtr("model.embed_tokens_per_layer.weight") orelse
+        store.lazy_weights.getPtr("embed_tokens_per_layer.weight") orelse return null;
+    try gpu_hosted_store_mod.ensureHostLazyWeightLoadedSimple(store, entry);
+    gpu_hosted_store_mod.touchLazyWeight(store, entry);
+    entry.pin_count += 1;
+    return .{ .store = store, .entry = entry };
+}
+
 /// Bind a session's lazy residency cache to the serving owner's hard limits
 /// before the session is published. Cache defaults are derived from host/node
 /// capacity during construction and can be much larger than a container or an

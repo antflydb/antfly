@@ -18778,6 +18778,18 @@ pub const Node = struct {
         ) catch |err| return inferenceFailureResponse(ctx, err);
         defer admission_lease.release();
 
+        const embedding_pin = blk: {
+            if (backend_kind != .metal or !gpt_config.hasPle()) break :blk null;
+            while (true) {
+                try execution_control.check();
+                break :blk @import("../execution/architecture_session.zig").pinGenerationEmbeddingOutsideExecution(model.session, gpt_config) catch |err| {
+                    if (err == error.ResourceTemporarilyUnavailable and model.session.reclaimIdleForRunOutsideExecution()) continue;
+                    return inferenceFailureResponse(ctx, err);
+                };
+            }
+        };
+        defer if (embedding_pin) |pin| pin.release();
+
         // Exact Native host histories are an additive part of this SAME
         // primary. Prepare process-reclaiming state before either Model lane;
         // defers run after all state children and the real Model unlock, but

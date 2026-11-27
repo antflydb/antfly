@@ -13441,6 +13441,13 @@ pub fn getModelEmbeddingWeight(cb: *const ComputeBackend, config: Config, name: 
     return getModelEmbeddingWeightUnprefixed(cb, name);
 }
 
+pub fn getPerLayerEmbeddingWeight(cb: *const ComputeBackend, config: Config) !CT {
+    return getModelEmbeddingWeight(cb, config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
+        error.MissingWeight => getModelEmbeddingWeight(cb, config, "model.embed_tokens_per_layer.weight"),
+        else => err,
+    };
+}
+
 fn getModelEmbeddingWeightUnprefixed(cb: *const ComputeBackend, name: []const u8) !CT {
     return cb.getEmbeddingWeight(name) catch |err| switch (err) {
         error.MissingWeight, error.WeightNotFound => if (modelPrefixStrippedName(name)) |stripped| cb.getEmbeddingWeight(stripped) else err,
@@ -13749,10 +13756,7 @@ pub fn computePleVectors(
 
     // Token-identity path: look up concatenated per-layer token embeddings,
     // then scale by sqrt(ple_dim) (Gemma4TextScaledWordEmbedding).
-    const token_w = getModelEmbeddingWeight(cb, config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
-        error.MissingWeight => try getModelEmbeddingWeight(cb, config, "model.embed_tokens_per_layer.weight"),
-        else => return err,
-    };
+    const token_w = try getPerLayerEmbeddingWeight(cb, config);
     defer cb.free(token_w);
     const token_embd_raw = try cb.embeddingLookup(token_w, input_ids, total, ple_total_dim);
     defer cb.free(token_embd_raw);
@@ -13773,10 +13777,7 @@ pub fn computePleVectorsFromTokenTensor(
     const num_layers: usize = config.num_hidden_layers;
     const ple_total_dim: usize = ple_dim * num_layers;
 
-    const token_w = getModelEmbeddingWeight(cb, config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
-        error.MissingWeight => try getModelEmbeddingWeight(cb, config, "model.embed_tokens_per_layer.weight"),
-        else => return err,
-    };
+    const token_w = try getPerLayerEmbeddingWeight(cb, config);
     defer cb.free(token_w);
 
     if (try computePleVectorsFromTokenEmbeddingTensorPath(cb, allocator, config, token_w, input_token, hidden, total, ple_dim, num_layers, ple_total_dim)) |fused| {

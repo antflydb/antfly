@@ -1302,10 +1302,7 @@ fn encodePleVectors(
         std.debug.print("prefill-trace: per-layer input failed stage={s} rows={d}\n", .{ stage, total });
     };
     var started_at = monotonicNowNs();
-    const token_w = gpt_arch.getModelEmbeddingWeight(cb, gpt_config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
-        error.MissingWeight => try gpt_arch.getModelEmbeddingWeight(cb, gpt_config, "model.embed_tokens_per_layer.weight"),
-        else => return err,
-    };
+    const token_w = try gpt_arch.getPerLayerEmbeddingWeight(cb, gpt_config);
     var finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.prefill_ple_lookup_nanos += finished_at - started_at;
     defer cb.free(token_w);
@@ -1670,10 +1667,7 @@ fn tryBackendOwnedTokenResultPhaseHidden(
     const token_embedding_weight = try gpt_arch.getEmbeddingWeight(cb, gpt_config);
     defer cb.free(token_embedding_weight);
     const ple_token_embedding_weight: ?ops.CT = if (gpt_config.hasPle())
-        gpt_arch.getModelEmbeddingWeight(cb, gpt_config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
-            error.MissingWeight => try gpt_arch.getModelEmbeddingWeight(cb, gpt_config, "model.embed_tokens_per_layer.weight"),
-            else => return err,
-        }
+        try gpt_arch.getPerLayerEmbeddingWeight(cb, gpt_config)
     else
         null;
     defer if (ple_token_embedding_weight) |weight| cb.free(weight);
@@ -1769,10 +1763,7 @@ pub fn forwardGreedyTokensBatch(
     }
     const embedding = try gpt_arch.getEmbeddingWeight(cb, cfg);
     defer cb.free(embedding);
-    const ple_embedding = gpt_arch.getModelEmbeddingWeight(cb, cfg, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
-        error.MissingWeight => try gpt_arch.getModelEmbeddingWeight(cb, cfg, "model.embed_tokens_per_layer.weight"),
-        else => return err,
-    };
+    const ple_embedding = try gpt_arch.getPerLayerEmbeddingWeight(cb, cfg);
     defer cb.free(ple_embedding);
     const request = contracts.DecoderRuntimeDecodeRequest{
         .contract = .gemma4_gated_ple_shared_kv,
@@ -2205,10 +2196,7 @@ pub fn prewarmPleTokenEmbedding(
     if (gpt_config.family != .gemma or !gpt_config.hasPle()) return false;
     if (gpt_config.ple_hidden_size == 0 or gpt_config.num_hidden_layers == 0) return false;
     const ple_total_dim = try std.math.mul(usize, gpt_config.ple_hidden_size, gpt_config.num_hidden_layers);
-    const token_w = gpt_arch.getModelEmbeddingWeight(cb, gpt_config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
-        error.MissingWeight => try gpt_arch.getModelEmbeddingWeight(cb, gpt_config, "model.embed_tokens_per_layer.weight"),
-        else => return err,
-    };
+    const token_w = try gpt_arch.getPerLayerEmbeddingWeight(cb, gpt_config);
     defer cb.free(token_w);
     const ids = [_]i64{0};
     const embedding = try cb.embeddingLookup(token_w, ids[0..], ids.len, ple_total_dim);
