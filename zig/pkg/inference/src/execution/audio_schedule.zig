@@ -166,7 +166,9 @@ pub const AudioRecipe = struct {
     }
     pub const Constant = enum { relative, ones, query_scale, relative_key, depthwise };
     pub fn towerKey(self: AudioRecipe, buffer: []u8, kind: AudioRecipe.Constant, layer: usize) ![]const u8 {
-        if (self.source_bf16) {
+        // Depthwise filters are the same transposed F32 constants in both
+        // arithmetic modes. Their admission key must match the weight loader.
+        if (self.source_bf16 and kind != .depthwise) {
             var historical = self;
             historical.source_bf16 = false;
             var scratch: [192]u8 = undefined;

@@ -11806,6 +11806,12 @@ test "source audio immutable frequency schedule retains authenticated F32 constr
     var b: [256]u8 = undefined;
     try std.testing.expect(!std.mem.eql(u8, try source.towerKey(&a, .relative, 0), try original.towerKey(&b, .relative, 0)));
     try std.testing.expect(!std.mem.eql(u8, try source.towerKey(&a, .query_scale, 0), try original.towerKey(&b, .query_scale, 0)));
+    var weight_name: [128]u8 = undefined;
+    const name = try AudioCacheRecipe.depthwiseWeightName(&weight_name, 0);
+    try std.testing.expectEqualStrings(
+        try AudioCacheRecipe.depthwiseKey(&a, name, source.conv_kernel, source.hidden),
+        try source.towerKey(&b, .depthwise, 0),
+    );
 }
 
 test "source eager publication consumes only its owned input on success decline and error" {
