@@ -1321,14 +1321,22 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                 var parked = ctx.parkWithOwnedStep(control) catch |err| {
                     // Another owner reserved the outside window but has not
                     // taken our step. Decline BEFORE transfer, never wait here.
-                    if (err == error.ResourceTemporarilyUnavailable) return false;
+                    if (err == error.ResourceTemporarilyUnavailable) {
+                        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+                            std.debug.print("LIGHTONOCR3 cuda_model_graph_precommit_decline rows={d} stage=park error={s}\n", .{ descriptor.rows, @errorName(err) });
+                        return false;
+                    }
                     return err;
                 };
                 phase.prepareOutside(model) catch |err| {
                     phase.destroyOutside(); // inert failed phase, outside all gates
                     parked.restoreKeepingStep() catch platform.inference_process_supervisor.restartWorker();
                     switch (err) {
-                        error.OutOfMemory, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => return false,
+                        error.OutOfMemory, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => {
+                            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+                                std.debug.print("LIGHTONOCR3 cuda_model_graph_precommit_decline rows={d} stage={s} error={s}\n", .{ descriptor.rows, @tagName(phase.mode), @errorName(err) });
+                            return false;
+                        },
                         else => return err,
                     }
                 };
