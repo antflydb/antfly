@@ -2240,3 +2240,14 @@ this workload. The rates do not establish a throughput win or justify
 changing the default across supported signatures. The reverse receipts
 are `5b8c2570ce03df9e56c453193c1c4338b224c4d4b4e9e1beb890dc468dd1cfdc`
 and `3bba08b192be4f5d33502f4b5b1fb2c62dd3f96910c0a94c2079228fe91fc93f`.
+
+On Spark at `32d9d1b082`, the released LightOnOCR 0.8B two-page HTTP
+test verified exact output parity and reported completed CUDA replay.
+The invocation report attributed two logits rows to the stream arena,
+zero bytes to a separate logits bank, 297,216 bytes to declared
+attention scratch, and 44 bytes to the admitted pinned readback.
+The focused cohort passed 28 of 29 selected tests. The remaining
+EmbeddingGemma 2 test failed during fixture loading because the
+launcher lacked the image and audio links. The next run reuses those
+fixtures from the successful earlier cohort. The receipt is
+`abb67ac065507756723c05d2b474d2b6f73dd6ed9f6cc87e4148ce0f3a60b018`.
