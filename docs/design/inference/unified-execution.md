@@ -2119,3 +2119,12 @@ storage. The original 128-page window remains unqualified. The
 full-width and packet receipts are
 `f9070a2c64bb72c158cb5009d757860571ffdd9b674b1c50e68177ca89969554`
 and `ce8de02f16825b182086fd0832722f300eef97002bb5f54c7a54f5e29f592ff4`.
+
+Reusing pending quota for replacement audio buffers preserved exact
+outputs but left the isolated A/B p95 at 40.25 ms against 36.64 ms on
+the frozen baseline. Caching retained buffer sizes and filtering before
+fence polling also preserved exact outputs; A/B p95 was 40.19 versus
+36.32 ms. Neither candidate resolved the regression. The two comparison
+receipts are
+`cf6ba6c36cf25688a69887e2a25a0866242f1ad7118bbb07b6745482557e0c64`
+and `b8d45d3d564e0fad167087efb88b9bcab144c49b42feb0e6665e1d84382403a8`.
