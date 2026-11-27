@@ -55,6 +55,7 @@ pub fn parseIndexSpecsAlloc(alloc: Allocator, indexes_json: []const u8) ![]Index
     }
     var it = parsed.value.object.iterator();
     while (it.next()) |entry| {
+        if (@import("../catalog/named_enrichments.zig").isReservedEntry(entry.key_ptr.*)) continue;
         const value = entry.value_ptr.*;
         if (value != .object) return error.InvalidIndexConfig;
         const type_value = value.object.get("type") orelse continue;

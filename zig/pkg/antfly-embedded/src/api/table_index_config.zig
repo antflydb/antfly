@@ -161,6 +161,8 @@ pub fn validateGraphIndexesJson(alloc: std.mem.Allocator, indexes_json: []const 
 
     var it = indexes.iterator();
     while (it.next()) |entry| {
+        // Enrichment/resolver arrays and control state are not indexes.
+        if (@import("index_metadata.zig").isReservedEntry(entry.key_ptr.*)) continue;
         if (entry.value_ptr.* != .object) return error.InvalidCreateTableRequest;
         if (try parseIndexKind(entry.value_ptr.*) != .graph) continue;
         const config_json = try extractIndexConfigJson(alloc, entry.key_ptr.*, entry.value_ptr.*);

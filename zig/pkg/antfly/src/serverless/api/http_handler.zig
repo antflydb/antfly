@@ -813,6 +813,8 @@ pub const HttpHandler = struct {
             error.GraphMetricConfigurationLimitExceeded => return try textResponse(self.alloc, 400, "graph metric configuration exceeds serverless limits (maximum 16 graph metric indexes, 16 metrics per graph, 64 metrics total, 64 edge types per filter, 256-byte index names, and 128-byte metric names)"),
             error.UnsupportedServerlessArtifactIndexSources => return try unsupportedArtifactIndexSourcesResponse(self.alloc),
             error.UnsupportedCreateTableRequest, error.InvalidTableIndexMetadata => return try textResponse(self.alloc, 400, "unsupported table index configuration"),
+            error.InvalidServerlessEnrichment => return try textResponse(self.alloc, 400, "invalid enrichment declaration: \"enrichments\" must hold valid enrichment configs"),
+            error.UnsupportedServerlessEnrichment => return try textResponse(self.alloc, 400, "unsupported enrichment in serverless: grouped sources, prior context, graph neighbor context and cross-document context sources are not available"),
             else => return err,
         };
         const created = try self.catalog.ensureTableWithDefinition(
@@ -1024,6 +1026,8 @@ pub const HttpHandler = struct {
             error.UnsupportedServerlessArtifactIndexSources => return try unsupportedArtifactIndexSourcesResponse(self.alloc),
             error.UnsupportedCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported index configuration"),
             error.InvalidTableIndexMetadata => return try textResponse(self.alloc, 400, "invalid index configuration"),
+            error.InvalidServerlessEnrichment => return try textResponse(self.alloc, 400, "invalid enrichment declaration: \"enrichments\" must hold valid enrichment configs"),
+            error.UnsupportedServerlessEnrichment => return try textResponse(self.alloc, 400, "unsupported enrichment in serverless: grouped sources, prior context, graph neighbor context and cross-document context sources are not available"),
             else => return err,
         };
 
@@ -6581,7 +6585,7 @@ pub const HttpHandler = struct {
         const response_body = indexes_api.encodeCreatedIndexConfig(alloc, index_name, normalized_index_json) catch return error.InternalFailure;
         errdefer alloc.free(response_body);
         validateServerlessIndexCatalog(alloc, next_indexes_json) catch |err| switch (err) {
-            error.UnsupportedCreateTableRequest, error.UnsupportedGraphMetricRefreshMode, error.InvalidTableIndexMetadata => return error.InvalidIndexRequest,
+            error.UnsupportedCreateTableRequest, error.UnsupportedGraphMetricRefreshMode, error.InvalidTableIndexMetadata, error.InvalidServerlessEnrichment, error.UnsupportedServerlessEnrichment => return error.InvalidIndexRequest,
             error.GraphMetricConfigurationLimitExceeded => return error.GraphMetricConfigurationLimitExceeded,
             error.UnsupportedServerlessArtifactIndexSources => return error.UnsupportedArtifactIndexSources,
             else => return error.InternalFailure,
@@ -9458,6 +9462,8 @@ fn encodeServerlessIndexListWithGraphMetricsAlloc(
     var first = true;
     var it = parsed.value.map.iterator();
     while (it.next()) |entry| {
+        // Named enrichments are listed by their own route, not as indexes.
+        if (catalog_mod.named_enrichments.isReservedEntry(entry.key_ptr.*)) continue;
         if (!first) try out.append(alloc, ',');
         first = false;
         try appendServerlessIndexEntry(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, status, graph_metric_statuses);
@@ -9949,9 +9955,19 @@ fn validateServerlessIndexCatalog(alloc: Allocator, indexes_json: []const u8) !v
     var parsed = try std.json.parseFromSlice(JsonValueMap, alloc, indexes_json, .{});
     defer parsed.deinit();
 
+    // Named enrichments (#1791) are validated as a whole.
+    {
+        var declarations = catalog_mod.named_enrichments.parseAlloc(alloc, indexes_json) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            error.UnsupportedServerlessEnrichment => return err,
+            else => return error.InvalidServerlessEnrichment,
+        };
+        declarations.deinit(alloc);
+    }
     var graph_count: usize = 0;
     var it = parsed.value.map.iterator();
     while (it.next()) |entry| {
+        if (catalog_mod.named_enrichments.isReservedEntry(entry.key_ptr.*)) continue;
         if (entry.value_ptr.* != .object) return error.InvalidTableIndexMetadata;
         const kind = if (entry.value_ptr.object.get("type")) |value|
             switch (value) {
@@ -12834,6 +12850,20 @@ test "serverless create index normalization resolves and persists one probed emb
             \\{"type":"embeddings","field":"body","embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
         , options));
     }
+}
+
+test "serverless index catalog validation admits named enrichment declarations" {
+    const alloc = std.testing.allocator;
+    try validateServerlessIndexCatalog(alloc,
+        \\{"body":{"type":"full_text"},"enrichments":[{"name":"notes","kind":"asset","content_type":"text/plain"},{"name":"summary_v1","kind":"asset","field":"body","producer":{"type":"generator","config":{"provider":"antfly","model":"g"}}}]}
+    );
+    try std.testing.expectError(error.InvalidServerlessEnrichment, validateServerlessIndexCatalog(alloc,
+        \\{"enrichments":[{"name":"","kind":"asset"}]}
+    ));
+    try std.testing.expectError(error.UnsupportedServerlessEnrichment, validateServerlessIndexCatalog(alloc,
+        \\{"enrichments":[{"name":"x","kind":"asset","field":"body","neighbor_context":{"graph_index":"g"},"producer":{"type":"generator","config":{"provider":"antfly","model":"g"}}}]}
+    ));
+    try @import("../catalog/storage_capabilities.zig").requireDefinition(alloc, "", "{}", "{\"enrichments\":[{\"name\":\"notes\",\"kind\":\"asset\"}]}");
 }
 
 test "serverless index catalog validation rejects malformed configs" {

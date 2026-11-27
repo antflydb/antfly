@@ -22,6 +22,7 @@ pub const progress_store = @import("progress_store.zig");
 pub const fs_progress_store = @import("fs_progress_store.zig");
 pub const remote_progress_store = @import("remote_progress_store.zig");
 pub const service = @import("service.zig");
+pub const named_enrichments = @import("named_enrichments.zig");
 
 pub const NamespaceRecord = types.NamespaceRecord;
 pub const TableNamespaceRecord = types.TableNamespaceRecord;

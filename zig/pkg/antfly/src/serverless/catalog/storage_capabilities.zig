@@ -57,7 +57,8 @@ pub fn requireDefinition(alloc: std.mem.Allocator, schema: []const u8, read_sche
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidTableIndexMetadata;
-    for (parsed.value.object.values()) |index| {
+    for (parsed.value.object.keys(), parsed.value.object.values()) |name, index| {
+        if (@import("named_enrichments.zig").isReservedEntry(name)) continue;
         if (index != .object) return error.InvalidTableIndexMetadata;
         if (index.object.get("type")) |kind| {
             if (kind != .string) return error.InvalidTableIndexMetadata;
