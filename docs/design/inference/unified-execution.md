@@ -1328,6 +1328,15 @@ Final closure requires the remaining tier-one coverage, including DECIDE
 on the remaining supported targets, Inkling 2 Mini, and the E2B comparative
 deficits above, as well as normal PR review and CI. L4 and A100 remain user-deferred.
 
+The original FP32 DECIDE Native HTTP comparison on Spark ARM CPU used
+`9e4af7f847` and `5be5fbf2a3` with 32 samples per side in each phase.
+All responses matched exactly at batches 1, 8 and 32. Batches 8 and 32
+passed the latency gates. Median/p95 changed from 2676.57/2844.89 to
+2672.74/2793.00 ms and from 10780.63/11300.32 to 10776.62/11076.40 ms.
+Batch 1 remains unqualified for latency because candidate-only median
+controls differed by 13.13%. Its measured A/B median was 339.54 to
+320.10 ms.
+
 Subsequent scoped qualification covers these production paths:
 
 | Revision | Backend and workload | Result | Remaining evidence |
