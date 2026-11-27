@@ -760,6 +760,16 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             ctx.budget.host_scratch_bytes -= reserved.host_scratch_bytes;
             ctx.budget.backend_scratch_bytes -= reserved.backend_scratch_bytes;
         }
+        pub fn finishVisionPublication(ctx: *LightOnStreamContext, publication: *@import("../execution/architecture_session.zig").PreparedComputeAdmission.SupplementalStorage) void {
+            ctx.pageAccess(.{}, true).acquireForCleanup();
+            defer ctx.unlockStep();
+            // The independently admitted image bank belongs to the
+            // prefill input. Decode captures bind token and state buffers.
+            publication.finish(.{
+                .boundary = ctx.cleanup_owner.epoch(),
+                .operation = if (ctx.cb) |*backend| backend.operationToken() else null,
+            });
+        }
         pub fn unlockStep(ctx: *LightOnStreamContext) void {
             ctx.step_mutex.unlock();
             if (ctx.gate_events) (execution_control_mod.ExecutionLane.Lease{ .lane = &ctx.step_gate }).release();

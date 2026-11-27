@@ -10459,9 +10459,7 @@ pub const Node = struct {
         defer if (owned_io) |*value| value.deinit();
         const page_io = self.inferenceIo(a, control.io, &owned_io);
         defer if (comptime build_options.enable_cuda) if (vision_publication) |*publication| {
-            ctx.lockStepForCleanup();
-            defer ctx.unlockStep();
-            publication.finish(.{ .boundary = ctx.cleanup_owner.epoch(), .operation = if (ctx.cb) |*backend_cb| backend_cb.operationToken() else null });
+            ctx.finishVisionPublication(publication);
         };
         var vision_request = LightOnVisionRequest{ .ctx = ctx, .io = page_io, .control = control, .publication = if (comptime build_options.enable_cuda) if (vision_publication) |*publication| publication else null else null };
         var pipeline = generation.NativeGenerationPipeline{
