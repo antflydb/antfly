@@ -2376,3 +2376,10 @@ The single skipped test passed on the same binary with the merged
 decoder from the shared model directory. The two log hashes are
 `fddd106a76d18bd4260797c29fa5f3199875dac2d322da52e0dd43384a8ba8ad`
 and `84f6f35907e6ca826ce5dc74297f2371fc4e38293e2227951dc18ff8779c5677`.
+
+At `d5df0de679` on Spark GB10, 34 CUDA checks passed with zero skips.
+The report fixture retained the eager-burst count through publication
+while preserving the latest capture or replay receipt. The LightOnOCR
+HTTP fixture still reported replay, a 44-byte pinned receipt, and
+297,216 bytes of declared attention scratch. The log hash is
+`671077be8048373c648d1906f565bf4c99ef60f6139c6e57ee93a149868917d1`.
