@@ -11952,6 +11952,17 @@ const CudaKvDeviceStorage = struct {
     fn releaseSequence(ctx: *anyopaque, sequence_id: kv_storage_runtime.SequenceId) void {
         const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
         if (self.compute.lighton_decode_graph_enabled) self.compute.bounded_decode_graph.invalidate(&self.compute.ctx);
+        self.releaseSequenceStorage(sequence_id);
+    }
+
+    fn releaseSequenceWithCleanup(ctx: *anyopaque, sequence_id: kv_storage_runtime.SequenceId, current: CacheCleanup) !void {
+        const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
+        const backend = self.compute.computeBackend();
+        try invalidateCapturedGraphForMutation(self.compute, &backend, current);
+        self.releaseSequenceStorage(sequence_id);
+    }
+
+    fn releaseSequenceStorage(self: *CudaKvDeviceStorage, sequence_id: kv_storage_runtime.SequenceId) void {
         if (self.match_binding) |binding| if (binding.sequence == sequence_id) {
             binding.deinit();
             self.allocator.destroy(binding);
@@ -12355,6 +12366,7 @@ const CudaKvDeviceStorage = struct {
         .pagedLayerKvDevice = pagedLayerKvDevice,
         .truncateSequence = truncateSequence,
         .releaseSequence = releaseSequence,
+        .releaseSequenceWithCleanup = releaseSequenceWithCleanup,
         .deinit = hookDeinit,
     };
 
