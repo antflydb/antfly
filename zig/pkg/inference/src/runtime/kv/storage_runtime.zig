@@ -2214,6 +2214,12 @@ test "checked sequence release preserves pages until the device owner accepts cl
     try std.testing.expectEqual(@as(?usize, null), storage.tokenCount(sequence));
     try std.testing.expectEqual(@as(usize, 2), probe.checked_calls);
     try std.testing.expectEqual(@as(usize, 0), probe.legacy_calls);
+    const recycled = try storage.attachSequence(storage.poolId());
+    try std.testing.expectEqual(sequence, recycled);
+    try std.testing.expectEqual(@as(?usize, 0), storage.tokenCount(recycled));
+    try storage.releaseSequenceWithCleanup(recycled, current);
+    try std.testing.expectEqual(@as(usize, 3), probe.checked_calls);
+    try std.testing.expectEqual(@as(usize, 0), probe.legacy_calls);
 }
 
 test "unpublished storage attachment abort skips hooks and full prefill publishes only after page commit" {
