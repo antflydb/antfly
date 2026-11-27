@@ -447,6 +447,9 @@ pub fn residentVocabularyResult(allocator: std.mem.Allocator, decoder: backends.
     if (token_policy) |policy| {
         const backend = outputs.backend;
         if (knows_dtype and (backend.kind() == .cuda or backend.kind() == .metal)) {
+            // The token reduction performs a synchronous scalar download.
+            // Admit that transfer before either provider encodes the kernel.
+            try @import("transfer_audit.zig").checkDeviceHostAccess();
             const candidate = candidate: {
                 var guard = if (control) |active| try active.enterUninterruptible(decoder.interruption()) else null;
                 defer if (guard) |*scope| scope.deinit();

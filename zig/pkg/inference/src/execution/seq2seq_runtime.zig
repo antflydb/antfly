@@ -782,6 +782,14 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
         try std.testing.expectEqual(@as(u64, @sizeOf(u32)), transfers.download_bytes);
         try std.testing.expectEqual(@as(?u32, 3), selected.token);
         try std.testing.expectEqual(@as(usize, 0), selected.logits.len);
+        {
+            var strict: transfer_audit.Audit = .{ .forbid_device_host_access = true };
+            try transfer_audit.begin(&strict);
+            defer transfer_audit.end();
+            try std.testing.expectError(error.DeviceReadbackForbidden, selected_decoder.stepSelecting(&.{ 2, 5 }, 1, null, null, policy));
+            try std.testing.expectEqual(@as(u64, 0), strict.download_bytes);
+            try std.testing.expectEqual(@as(usize, 1), selected_decoder.incremental.?.position);
+        }
         var selected_next = try selected_decoder.stepSuffix(.{ .position = 1, .tokens = &.{5} }, null, null);
         defer selected_next.deinit();
         try std.testing.expectEqualSlices(f32, next.logits, selected_next.logits);
