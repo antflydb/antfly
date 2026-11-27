@@ -109,6 +109,7 @@ pub const AudioRecipe = struct {
     residual_bits: u32,
     chunk: usize,
     context_left: usize,
+    context_right: usize = 0,
     logit_cap_bits: u32,
     invalid_logits_bits: u32,
     exclude_farthest: bool,
@@ -147,6 +148,10 @@ pub const AudioRecipe = struct {
         hash.update(std.mem.sliceAsBytes(segments));
         std.hash.autoHash(&hash, .{ start, end });
         std.hash.autoHash(&hash, .{ self.hidden, self.intermediate, self.heads, self.conv_kernel, self.norm_eps_bits, self.residual_bits, self.chunk, self.context_left, self.logit_cap_bits, self.invalid_logits_bits, self.exclude_farthest });
+        if (self.context_right != 0) {
+            hash.update("audio-right-context");
+            std.hash.autoHash(&hash, self.context_right);
+        }
         if (self.source_bf16) {
             hash.update("bf16-source-audio-v1");
             std.hash.autoHash(&hash, self.gradient_clipping_bits);

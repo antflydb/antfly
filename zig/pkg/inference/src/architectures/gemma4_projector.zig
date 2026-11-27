@@ -1411,6 +1411,7 @@ fn audioCacheConfig(cfg: AudioConfig) AudioCacheRecipe {
         .residual_bits = @bitCast(cfg.residual_weight),
         .chunk = cfg.attention_chunk_size,
         .context_left = cfg.attention_context_left,
+        .context_right = cfg.attention_context_right,
         .logit_cap_bits = @bitCast(cfg.attention_logit_cap),
         .invalid_logits_bits = @bitCast(cfg.attention_invalid_logits_value),
         .exclude_farthest = cfg.exclude_farthest_key,
@@ -1441,6 +1442,9 @@ test "audio cache recipe shares exact execution key and original HF packed names
     const end: usize = 12;
     try std.testing.expectEqual(Legacy.key(cfg, &segments, start, end), recipe.key(&segments, start, end));
     try std.testing.expect(recipe.key(&segments, 0, 12) != recipe.key(&segments, 0, 6));
+    var right_context = cfg;
+    right_context.attention_context_right = 1;
+    try std.testing.expect(recipe.key(&segments, start, end) != audioCacheConfig(right_context).key(&segments, start, end));
     // Cold workspace admission describes exactly the tensor geometry of the
     // segmented producer, including odd frame counts and rank-one masks.
     var batch = recipe;
