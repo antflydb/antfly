@@ -208,16 +208,24 @@ pub const Descriptor = struct {
     hidden: usize,
     vocab: usize,
     future_tokens: usize,
-    head_row_limit: ?usize = null,
-    head_in_arena: bool = false,
+    head_storage: HeadStorage = .full_bank,
     attention_geometry: ?DecodeScratch.Geometry = null,
     attention_layers: usize,
     recurrent_layers: usize,
+    pub const HeadStorage = union(enum) {
+        full_bank,
+        adaptive_bank: usize,
+        arena_packets: usize,
+    };
+
     pub fn layout(self: Descriptor) !StorageLayout {
         if (self.epoch == 0 or self.rows > max_rows or self.positions.len != self.rows * 3) return error.InvalidShape;
-        var storage = try StorageLayout.initWithHeadLimit(self.rows, self.hidden, self.vocab, self.key.len, self.head_row_limit orelse self.rows);
-        if (self.head_in_arena and storage.head_bytes != 0) {
-            const packet_rows = self.head_row_limit orelse return error.InvalidShape;
+        const packet_rows = switch (self.head_storage) {
+            .full_bank => self.rows,
+            .adaptive_bank, .arena_packets => |rows| rows,
+        };
+        var storage = try StorageLayout.initWithHeadLimit(self.rows, self.hidden, self.vocab, self.key.len, packet_rows);
+        if (self.head_storage == .arena_packets and storage.head_bytes != 0) {
             storage.arena_head_rows = @min(self.rows, packet_rows);
             storage.head_bytes = 0;
         }
@@ -307,7 +315,7 @@ pub const GraphPhase = struct {
     pub fn matchesOwner(self: *const GraphPhase, owner: *const Module) bool {
         const storage = owner.storage_layout orelse return false;
         const compatible_head = storage.head_bytes == self.storage_layout.head_bytes or
-            (self.descriptor.head_row_limit != null and storage.head_bytes > 0 and storage.head_bytes < self.storage_layout.head_bytes);
+            (self.descriptor.head_storage == .adaptive_bank and storage.head_bytes > 0 and storage.head_bytes < self.storage_layout.head_bytes);
         return owner.matches(self.descriptor) and compatible_head and
             storage.arena_head_rows == self.storage_layout.arena_head_rows and
             std.meta.eql(owner.attention_scratch, self.attention_scratch);
@@ -317,7 +325,7 @@ pub const GraphPhase = struct {
     /// retain their exact declared addresses and the prepared graph records
     /// the bank it actually owns. Bound the number of extra GEMM launches.
     pub fn reduceHeadPacketAfterDenial(self: *GraphPhase) bool {
-        if (self.mode != .storage or self.cold != null or self.bound or self.descriptor.head_row_limit == null) return false;
+        if (self.mode != .storage or self.cold != null or self.bound or self.descriptor.head_storage != .adaptive_bank) return false;
         const pressure = self.admission_pressure orelse return false;
         switch (pressure) {
             .domain_scratch, .shared_scratch => {},
@@ -699,7 +707,7 @@ test "captured graph head packets fund the exact smaller bank and invalidate a f
     try std.testing.expect(phase.matchesOwner(&owner));
 
     var packet = descriptor;
-    packet.head_row_limit = 32;
+    packet.head_storage = .{ .adaptive_bank = 32 };
     try phase.initInto(packet);
     const layout = phase.storage_layout;
     const request = packet.storageRequestFor(layout);
@@ -728,7 +736,7 @@ test "captured graph head packets fund the exact smaller bank and invalidate a f
     try std.testing.expect(!phase.matchesOwner(&owner));
 
     var shared = packet;
-    shared.head_in_arena = true;
+    shared.head_storage = .{ .arena_packets = 32 };
     try phase.initInto(shared);
     try std.testing.expectEqual(@as(usize, 32), phase.storage_layout.arena_head_rows);
     try std.testing.expectEqual(@as(usize, 32), phase.storage_layout.headPacketRows(shared.rows, shared.vocab));
@@ -739,7 +747,7 @@ test "captured graph head packets fund the exact smaller bank and invalidate a f
 
     packet.vocab = 400_000;
     try std.testing.expectEqual(@as(usize, 32 * 400_000 * 4), (try packet.layout()).head_bytes);
-    packet.head_row_limit = null;
+    packet.head_storage = .full_bank;
     try std.testing.expectError(error.InvalidShape, packet.layout());
 }
 

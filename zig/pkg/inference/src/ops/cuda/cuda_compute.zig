@@ -3763,13 +3763,8 @@ pub const CudaCompute = struct {
             const owner = &self.compute.bounded_decode_graph;
             if (burst_value.rows != owner.rows or burst_value.vocab != owner.vocab or step >= burst_value.steps) return error.InvalidShape;
             try ensureCount(tensorFromCt(input_ct), try checkedMul(owner.rows, owner.hidden));
-            const planned_packet = if (owner.storage_layout) |layout| layout.arena_head_rows else 0;
-            const head_rows = if (self.head_destination) |bank|
-                bank.len / try checkedMul(owner.vocab, @sizeOf(f32))
-            else if (planned_packet != 0)
-                planned_packet
-            else
-                owner.rows;
+            const layout = owner.storage_layout orelse return error.InvalidExecutionPlan;
+            const head_rows = layout.headPacketRows(owner.rows, owner.vocab);
             if (head_rows == 0) return error.InvalidExecutionPlan;
             if (head_rows >= owner.rows) {
                 const logits = try self.projectHead(cb, input_ct, weight);
@@ -4227,7 +4222,7 @@ pub const CudaCompute = struct {
         if (rows > @import("gated_delta.zig").max_packet_rows and !self.lighton_ragged_recurrent_enabled) return null;
         if (self.execution_scope != null or try self.ctx.streamCaptureActive()) return null;
         const descriptor = graph_phase.descriptor;
-        if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or !std.meta.eql(descriptor.attention_geometry, expected.attention_geometry) or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or descriptor.head_in_arena != expected.head_in_arena or descriptor.head_row_limit != expected.head_row_limit or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions)) return error.PreparedCachePlanChanged;
+        if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or !std.meta.eql(descriptor.attention_geometry, expected.attention_geometry) or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or !std.meta.eql(descriptor.head_storage, expected.head_storage) or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions)) return error.PreparedCachePlanChanged;
         const owner = &self.bounded_decode_graph;
         while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
         var claimed = false;
@@ -46917,7 +46912,8 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
 
     // Two rows fit in the assigned bank. All three decisions must occupy
     // different positions in the second token step after bank reuse.
-    claim.head_destination.?.len = 4 * @sizeOf(f32);
+    owner.storage_layout.?.head_bytes = 4 * @sizeOf(f32);
+    claim.head_destination = try owner.bindExecutionStorage();
     const packet_input = try cb.fromFloat32Shape(&.{ 3, 2, 5, 7, 13, 11 }, &.{ 3, 2 });
     defer cb.free(packet_input);
     try claim.projectGreedyHead(&cb, &burst, packet_input, weight, 1);
@@ -46927,8 +46923,9 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
     defer a.free(packet_actual);
     try std.testing.expectEqualSlices(f32, &.{ 2, 3, 5, 7, 2, 3 }, packet_actual);
 
-    claim.head_destination = null;
+    owner.storage_layout.?.head_bytes = 0;
     owner.storage_layout.?.arena_head_rows = 2;
+    claim.head_destination = try owner.bindExecutionStorage();
     const workspace = @import("../../execution/stream_workspace.zig");
     const plan = try a.create(workspace.Plan);
     defer a.destroy(plan);

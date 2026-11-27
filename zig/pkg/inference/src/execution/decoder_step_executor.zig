@@ -1001,8 +1001,13 @@ pub const Executor = struct {
         var position_snapshot: [384]u32 = undefined;
         @memcpy(position_snapshot[0..positions.len], positions);
         const graph_owner = @import("../ops/cuda/bounded_decode_graph.zig");
-        const shared_head = platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_SHARE_HEAD_ARENA");
-        const descriptor = graph_owner.Descriptor{ .epoch = self.lighton_cuda_execution_id, .key = key.words[0..key.len], .positions = position_snapshot[0..positions.len], .rows = claimed.len, .hidden = self.context.gpt_config.hidden_size, .vocab = self.context.gpt_config.vocab_size, .future_tokens = max_future, .head_row_limit = if (shared_head) 16 else if (platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_HEAD_PACKETS")) 32 else null, .head_in_arena = shared_head, .attention_geometry = .{ .heads = self.context.gpt_config.num_attention_heads, .kv_heads = self.context.gpt_config.effectiveKVHeads(), .dim = self.context.gpt_config.headDim() }, .attention_layers = attention_count, .recurrent_layers = self.context.gpt_config.num_hidden_layers - attention_count };
+        const head_storage: graph_owner.Descriptor.HeadStorage = if (platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_SHARE_HEAD_ARENA"))
+            .{ .arena_packets = 16 }
+        else if (platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_HEAD_PACKETS"))
+            .{ .adaptive_bank = 32 }
+        else
+            .full_bank;
+        const descriptor = graph_owner.Descriptor{ .epoch = self.lighton_cuda_execution_id, .key = key.words[0..key.len], .positions = position_snapshot[0..positions.len], .rows = claimed.len, .hidden = self.context.gpt_config.hidden_size, .vocab = self.context.gpt_config.vocab_size, .future_tokens = max_future, .head_storage = head_storage, .attention_geometry = .{ .heads = self.context.gpt_config.num_attention_heads, .kv_heads = self.context.gpt_config.effectiveKVHeads(), .dim = self.context.gpt_config.headDim() }, .attention_layers = attention_count, .recurrent_layers = self.context.gpt_config.num_hidden_layers - attention_count };
         var funding_phase: graph_owner.GraphPhase = undefined;
         try funding_phase.initInto(descriptor);
         defer funding_phase.close(.{ .boundary = self.context.cleanupEpoch() }) catch platform.inference_process_supervisor.restartWorker();
