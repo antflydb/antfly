@@ -4694,22 +4694,13 @@ const AudioLayerInputs = struct {
             offset += span;
         }
         if (offset != starts.len) return error.InvalidTensorShape;
-        if (cb.kind() == .cuda) {
-            // Both planes have the same invocation lifetime. The slices
-            // retain the uploaded bank and keep the vector ABI of each op.
-            const bank = try deviceResidentFromFloat32(cb, planes, &.{ @intCast(planes.len), 1 });
-            defer cb.free(bank);
-            const starts_ct = try self.segmentVector(cb, bank, 0, rows);
-            errdefer cb.free(starts_ct);
-            self.segment_valid = try self.segmentVector(cb, bank, rows, rows);
-            self.segment_starts = starts_ct;
-            return;
-        }
-        const shape = [_]i32{@intCast(starts.len)};
-        const starts_ct = try deviceResidentFromFloat32(cb, starts, &shape);
+        // Both planes have the same invocation lifetime. The slices
+        // retain the uploaded bank and keep the vector ABI of each op.
+        const bank = try deviceResidentFromFloat32(cb, planes, &.{ @intCast(planes.len), 1 });
+        defer cb.free(bank);
+        const starts_ct = try self.segmentVector(cb, bank, 0, rows);
         errdefer cb.free(starts_ct);
-        const tags_ct = try deviceResidentFromFloat32(cb, tags, &shape);
-        self.segment_valid = tags_ct;
+        self.segment_valid = try self.segmentVector(cb, bank, rows, rows);
         self.segment_starts = starts_ct;
     }
 
@@ -10169,7 +10160,7 @@ fn checkSubsampleBatchGeometry(cb: ComputeBackend, _: ComputeBackend, base_frame
         batch.deinit(a);
     }
     try before.expectUnchanged(cb);
-    if (cb.kind() == .cuda) {
+    {
         var metadata_config = cfg;
         metadata_config.block_count = 0;
         var inputs = try AudioLayerInputs.init(&cb, a, metadata_config, batch.valid_mask, &.{});
@@ -10181,8 +10172,10 @@ fn checkSubsampleBatchGeometry(cb: ComputeBackend, _: ComputeBackend, base_frame
             defer transfers.end();
             try inputs.setSegments(&cb, batch.segments);
         }
-        try std.testing.expectEqual(@as(u64, 1), audit.upload_calls);
-        try std.testing.expectEqual(@as(u64, batch.seq_len * 2 * @sizeOf(f32)), audit.upload_bytes);
+        if (cb.kind() == .cuda) {
+            try std.testing.expectEqual(@as(u64, 1), audit.upload_calls);
+            try std.testing.expectEqual(@as(u64, batch.seq_len * 2 * @sizeOf(f32)), audit.upload_bytes);
+        }
         const starts = try cb.toFloat32(inputs.segment_starts.?, a);
         defer a.free(starts);
         const tags = try cb.toFloat32(inputs.segment_valid.?, a);
