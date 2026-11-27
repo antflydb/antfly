@@ -5886,23 +5886,13 @@ fn depthwiseConvWeightCt(
             }
             var weight = try self.store.tensorF32(self.name);
             defer weight.deinit();
-            const elements = try AudioCacheRecipe.validateDepthwiseSource(weight.shape, self.kernel_size, self.hidden, self.store.gguf == null);
-            if (weight.data.len != elements) return error.InvalidTensorShape;
-            const d0: usize = @intCast(weight.shape[0]);
-            const d1: usize = @intCast(weight.shape[1]);
+            const geometry = try AudioCacheRecipe.depthwiseSource(weight.shape, self.kernel_size, self.hidden, self.store.gguf == null);
+            if (weight.data.len != geometry.elements) return error.InvalidTensorShape;
             const shape = [_]i32{ @intCast(self.kernel_size), @intCast(self.hidden) };
-            if (self.store.gguf == null and weight.shape.len == 3 and d0 == self.hidden and d1 == 1 and weight.shape[2] == self.kernel_size) {
-                const transposed = try transposeMatrix(self.allocator, weight.data, self.hidden, self.kernel_size);
-                defer self.allocator.free(transposed);
-                return self.finish(transposed, &shape, key, cache);
-            }
-            if (d0 == self.kernel_size and d1 == self.hidden) return self.finish(weight.data, &shape, key, cache);
-            if (d0 == self.hidden and d1 == self.kernel_size) {
-                const transposed = try transposeMatrix(self.allocator, weight.data, self.hidden, self.kernel_size);
-                defer self.allocator.free(transposed);
-                return self.finish(transposed, &shape, key, cache);
-            }
-            return error.InvalidTensorShape;
+            if (geometry.layout == .kernel_first) return self.finish(weight.data, &shape, key, cache);
+            const transposed = try transposeMatrix(self.allocator, weight.data, self.hidden, self.kernel_size);
+            defer self.allocator.free(transposed);
+            return self.finish(transposed, &shape, key, cache);
         }
     };
     return store.cached(name, Load{ .cb = cb, .allocator = allocator, .store = store, .name = name, .kernel_size = kernel_size, .hidden = hidden });

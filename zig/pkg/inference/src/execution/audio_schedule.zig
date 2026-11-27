@@ -147,9 +147,14 @@ pub const AudioRecipe = struct {
     pub fn depthwiseKey(buffer: []u8, name: []const u8, kernel: usize, hidden: usize) ![]const u8 {
         return std.fmt.bufPrint(buffer, "audio_tower.prepared.depthwise.v1.{s}.{d}.{d}", .{ name, kernel, hidden });
     }
+    pub const DepthwiseSource = struct {
+        elements: usize,
+        layout: enum { kernel_first, hidden_first },
+    };
+
     /// Actual accepted source layouts, shared before cold quota and before
     /// the original CPU transpose/upload. No numerical work or allocation.
-    pub fn validateDepthwiseSource(shape: []const i64, kernel: usize, hidden: usize, allow_hidden_3d: bool) !usize {
+    pub fn depthwiseSource(shape: []const i64, kernel: usize, hidden: usize, allow_hidden_3d: bool) !DepthwiseSource {
         if (shape.len < 2 or kernel == 0 or hidden == 0) return error.InvalidTensorShape;
         const elements = try std.math.mul(usize, kernel, hidden);
         var count: usize = 1;
@@ -160,8 +165,9 @@ pub const AudioRecipe = struct {
         if (count != elements) return error.InvalidTensorShape;
         const k = std.math.cast(i64, kernel) orelse return error.InvalidTensorShape;
         const h = std.math.cast(i64, hidden) orelse return error.InvalidTensorShape;
-        if (allow_hidden_3d and shape.len == 3 and shape[0] == h and shape[1] == 1 and shape[2] == k) return elements;
-        if ((shape[0] == k and shape[1] == h) or (shape[0] == h and shape[1] == k)) return elements;
+        if (allow_hidden_3d and shape.len == 3 and shape[0] == h and shape[1] == 1 and shape[2] == k) return .{ .elements = elements, .layout = .hidden_first };
+        if (shape[0] == k and shape[1] == h) return .{ .elements = elements, .layout = .kernel_first };
+        if (shape[0] == h and shape[1] == k) return .{ .elements = elements, .layout = .hidden_first };
         return error.InvalidTensorShape;
     }
     pub const Constant = enum { relative, ones, query_scale, relative_key, depthwise };

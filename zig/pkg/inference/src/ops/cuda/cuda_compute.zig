@@ -7738,7 +7738,8 @@ pub const CudaCompute = struct {
         const name = try @import("../../architectures/gemma4_hf_weights.zig").resolve(&name_buffer, logical);
         const source = self.resident_weights.getPtr(name) orelse return null;
         if ((source.dtype != .f32 and source.dtype != .bf16 and source.dtype != .f16) or source.quant_type != null or source.tc_quant != null or source.buffer.ptr == 0) return null;
-        const elements = CacheFunding.AudioRecipe.validateDepthwiseSource(source.shape, recipe.conv_kernel, recipe.hidden, true) catch return null;
+        const geometry = CacheFunding.AudioRecipe.depthwiseSource(source.shape, recipe.conv_kernel, recipe.hidden, true) catch return null;
+        const elements = geometry.elements;
         if (source.elem_count != elements or source.buffer.len < try source.dtype.byteCount(elements)) return null;
         var key: [256]u8 = undefined;
         return try CacheFunding.Request.constantSpan(try recipe.towerKey(&key, .depthwise, layer), try checkedMul(elements, @sizeOf(f32)));

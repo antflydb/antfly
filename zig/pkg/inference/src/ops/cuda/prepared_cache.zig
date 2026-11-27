@@ -1763,15 +1763,15 @@ test "copied arena chronology preserves repeated uses and refuses ambiguous indi
 }
 
 test "audio depthwise shared source layout accepts original transpose cases and refuses malformed byte geometry" {
-    try std.testing.expectEqual(@as(usize, 5120), try AudioRecipe.validateDepthwiseSource(&.{ 1024, 1, 5 }, 5, 1024, true));
-    try std.testing.expectEqual(@as(usize, 5120), try AudioRecipe.validateDepthwiseSource(&.{ 5, 1024 }, 5, 1024, true));
-    try std.testing.expectEqual(@as(usize, 5120), try AudioRecipe.validateDepthwiseSource(&.{ 1024, 5 }, 5, 1024, true));
-    try std.testing.expectEqual(@as(usize, 5120), try AudioRecipe.validateDepthwiseSource(&.{ 5, 1024, 1 }, 5, 1024, true));
-    try std.testing.expectError(error.InvalidTensorShape, AudioRecipe.validateDepthwiseSource(&.{ 1024, 1, 5 }, 5, 1024, false));
-    try std.testing.expectError(error.InvalidTensorShape, AudioRecipe.validateDepthwiseSource(&.{ 1024, 1, 6 }, 5, 1024, true));
-    try std.testing.expectError(error.InvalidTensorShape, AudioRecipe.validateDepthwiseSource(&.{ -1, 1024 }, 5, 1024, true));
-    try std.testing.expectError(error.InvalidTensorShape, AudioRecipe.validateDepthwiseSource(&.{ 5, 1024, 2 }, 5, 1024, true));
-    try std.testing.expectError(error.InvalidTensorShape, AudioRecipe.validateDepthwiseSource(&.{5120}, 5, 1024, true));
+    try std.testing.expectEqualDeep(AudioRecipe.DepthwiseSource{ .elements = 5120, .layout = .hidden_first }, (try AudioRecipe.depthwiseSource(&.{ 1024, 1, 5 }, 5, 1024, true)));
+    try std.testing.expectEqualDeep(AudioRecipe.DepthwiseSource{ .elements = 5120, .layout = .kernel_first }, (try AudioRecipe.depthwiseSource(&.{ 5, 1024 }, 5, 1024, true)));
+    try std.testing.expectEqualDeep(AudioRecipe.DepthwiseSource{ .elements = 5120, .layout = .hidden_first }, (try AudioRecipe.depthwiseSource(&.{ 1024, 5 }, 5, 1024, true)));
+    try std.testing.expectEqualDeep(AudioRecipe.DepthwiseSource{ .elements = 5120, .layout = .kernel_first }, (try AudioRecipe.depthwiseSource(&.{ 5, 1024, 1 }, 5, 1024, true)));
+    try std.testing.expectError(error.InvalidTensorShape, AudioRecipe.depthwiseSource(&.{ 1024, 1, 5 }, 5, 1024, false));
+    try std.testing.expectError(error.InvalidTensorShape, AudioRecipe.depthwiseSource(&.{ 1024, 1, 6 }, 5, 1024, true));
+    try std.testing.expectError(error.InvalidTensorShape, AudioRecipe.depthwiseSource(&.{ -1, 1024 }, 5, 1024, true));
+    try std.testing.expectError(error.InvalidTensorShape, AudioRecipe.depthwiseSource(&.{ 5, 1024, 2 }, 5, 1024, true));
+    try std.testing.expectError(error.InvalidTensorShape, AudioRecipe.depthwiseSource(&.{5120}, 5, 1024, true));
     var key: [256]u8 = undefined;
     try std.testing.expectError(error.InvalidPreparedAudioRecipe, AudioRecipe.depthwiseWeightName(&key, 12));
 }
