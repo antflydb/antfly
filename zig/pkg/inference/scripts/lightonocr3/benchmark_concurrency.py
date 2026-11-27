@@ -38,6 +38,25 @@ RESULT = re.compile(
 )
 
 
+GRAPH_FUNDING_DENIAL = re.compile(
+    r"LIGHTONOCR3 cuda_model_graph_funding rows=(?P<rows>\d+) "
+    r"stage=(?P<stage>storage|arena) error=(?P<error>\w+) "
+    r"requested_host_scratch=(?P<requested_host_scratch>\d+) "
+    r"requested_backend_scratch=(?P<requested_backend_scratch>\d+) "
+    r"occupied_host_scratch=(?P<occupied_host_scratch>\d+) "
+    r"occupied_backend_scratch=(?P<occupied_backend_scratch>\d+) "
+    r"policy_scratch_limit=(?P<policy_scratch_limit>\d+)"
+)
+
+
+def graph_funding_denials(text):
+    return [
+        {key: value if key in ("stage", "error") else int(value)
+         for key, value in match.groupdict().items()}
+        for match in GRAPH_FUNDING_DENIAL.finditer(text)
+    ]
+
+
 def prefill_stream_observation(text):
     values = re.findall(
         r"LIGHTONOCR3 prefill_stream_layers=(\d+) prefill_stream_splits=(\d+)", text
@@ -676,6 +695,8 @@ def run(args, model, label, mode, concurrency, output):
                     sample["model_graph_replay_cohort_rows"] = sorted(set(replay_rows))
                     sample["model_graph_first_replay_events"] = len(replay_rows)
                     sample["model_graph_max_replay_rows"] = max(replay_rows, default=0)
+                    if denials := graph_funding_denials(section):
+                        sample["model_graph_funding_denials"] = denials
                     if args.require_lighton_model_graph and not replay_rows:
                         result["status"] = "missing_timed_model_graph_replay"
                     if (

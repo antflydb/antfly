@@ -19,8 +19,29 @@ import unittest
 
 from benchmark_concurrency import (
     apply_token_burst_overrides,
+    graph_funding_denials,
     recurrent_placement_observation,
 )
+
+
+class GraphFundingTests(unittest.TestCase):
+    def test_records_funding_bytes_without_inventing_a_park_denial(self):
+        text = (
+            "LIGHTONOCR3 cuda_model_graph_precommit_decline rows=98 stage=park "
+            "error=ResourceTemporarilyUnavailable\n"
+            "LIGHTONOCR3 cuda_model_graph_funding rows=97 stage=storage "
+            "error=ResourceTemporarilyUnavailable requested_host_scratch=100 "
+            "requested_backend_scratch=200 occupied_host_scratch=300 "
+            "occupied_backend_scratch=400 policy_scratch_limit=900\n"
+        )
+        self.assertEqual(
+            graph_funding_denials(text),
+            [dict(rows=97, stage="storage", error="ResourceTemporarilyUnavailable",
+                  requested_host_scratch=100, requested_backend_scratch=200,
+                  occupied_host_scratch=300, occupied_backend_scratch=400,
+                  policy_scratch_limit=900)],
+        )
+        self.assertEqual(graph_funding_denials(text.splitlines()[0]), [])
 
 
 class RecurrentPlacementTests(unittest.TestCase):
