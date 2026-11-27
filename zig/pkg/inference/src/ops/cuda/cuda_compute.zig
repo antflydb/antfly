@@ -37823,7 +37823,6 @@ const vtable: ops.ComputeBackend.VTable = .{
     .backendKind = &backendKind,
     .modelConstant = &modelConstantOp,
     .audioFrontend = &audioFrontendOp,
-    .audioExecution = &audioExecutionOp,
     .audioLogMelEnabled = &audioLogMelEnabledOp,
     .audioLogMel = &audioLogMelOp,
     .audioBatchLayoutsEnabled = &audioBatchLayoutsEnabledOp,
@@ -37842,7 +37841,6 @@ const vtable: ops.ComputeBackend.VTable = .{
     .convertDType = &convertDTypeOp,
     .roundBf16F32 = &roundBf16F32Op,
     .sourceScalarStorage = &sourceScalarStorageOp,
-    .audioStorage = &sourceAudioStorageOp,
     .bf16SourceOperation = &bf16SourceOperationOp,
     .provisionKvDeviceWriteHook = &provisionKvDeviceWriteHook,
     .getWeight = &getWeight,
@@ -37884,6 +37882,10 @@ const vtable: ops.ComputeBackend.VTable = .{
             .sourceEncoderTower = &runEmbeddingGemma2SourceVisionTowerOp,
             .imagePatchesInto = &preprocessEmbeddingGemma2ImagePatchesIntoOp,
             .imagePatches = &preprocessEmbeddingGemma2ImagePatchesOp,
+        },
+        .audio_execution = .{
+            .execute = &audioExecutionOp,
+            .storage = &sourceAudioStorageOp,
         },
         .audio_attention = .{
             .localRelative = &gemma4AudioLocalAttentionOp,

@@ -2494,6 +2494,7 @@ pub const ComputeBackend = struct {
         vision: VisionRegion = .{},
         token_selection: TokenSelectionRegion = .{},
         audio_attention: AudioAttentionRegion = .{},
+        audio_execution: AudioExecutionRegion = .{},
         sequence_projection: SequenceProjectionRegion = .{},
         relative_encoder: RelativeEncoderRegion = .{},
         decoder: DecoderRegion = .{},
@@ -2788,6 +2789,15 @@ pub const ComputeBackend = struct {
         packedLocalRelative: ?*const fn (ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) anyerror!?CT = null,
     };
 
+    /// Admission, cancellation and publication for composite audio execution.
+    pub const AudioExecutionRegion = struct {
+        setControl: ?*const fn (ctx: *anyopaque, control: ?InferenceExecutionControl) ?InferenceExecutionControl = null,
+        storage: ?*const fn (ctx: *anyopaque, begin: bool) anyerror!bool = null,
+        /// run submits work synchronously. Input handles are borrowed for the
+        /// callback and its returned output must own an independent handle.
+        execute: ?*const fn (ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: @import("../execution/cleanup_context.zig").Context, defer_arena: bool) anyerror!?CT = null,
+    };
+
     pub const TokenSelectionRegion = struct {
         encodeLogitsStats: ?*const fn (ctx: *anyopaque, logits: CT, params: *const WhisperLogitsParams, suppress_ids: []const i32) anyerror!bool = null,
         readLogitsStats: ?*const fn (ctx: *anyopaque, slot: usize, out: *WhisperLogitsStatsRaw) bool = null,
@@ -3068,12 +3078,7 @@ pub const ComputeBackend = struct {
         audioNodeInto: ?*const fn (ctx: *anyopaque, node: *const anyopaque, values: []const ?CT, output: CT) anyerror!bool = null,
         audioPreparedLinear: ?*const fn (ctx: *anyopaque, request: *const AudioPreparedLinearRequest) anyerror!?CT = null,
         audioArenaView: ?*const fn (ctx: *anyopaque, arena: CT, offset: usize, bytes: usize, shape: [2]i32) anyerror!CT = null,
-        audioSetControl: ?*const fn (ctx: *anyopaque, control: ?InferenceExecutionControl) ?InferenceExecutionControl = null,
-        audioStorage: ?*const fn (ctx: *anyopaque, begin: bool) anyerror!bool = null,
         audioPad: ?*const fn (ctx: *anyopaque, input: CT, p: AudioPadParams) anyerror!?CT = null,
-        /// run submits work synchronously. Input handles are borrowed for the
-        /// callback and its returned output must own an independent handle.
-        audioExecution: ?*const fn (ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: @import("../execution/cleanup_context.zig").Context, defer_arena: bool) anyerror!?CT = null,
         audioLogMelEnabled: ?*const fn (ctx: *anyopaque) bool = null,
         audioLogMel: ?*const fn (ctx: *anyopaque, pcm: CT, plan: CT, mask: CT, frames: usize, hop: usize, floor: f32) anyerror!?CT = null,
         audioBatchLayoutsEnabled: ?*const fn (ctx: *anyopaque) bool = null,
@@ -5830,8 +5835,8 @@ pub const ComputeBackend = struct {
     pub fn clippedLinear(self: *const ComputeBackend, input: CT, weight: CT, p: ClippedLinearParams) !?CT {
         try p.validate();
         const op = self.vtable.clippedLinear orelse return null;
-        const previous = if (self.vtable.audioSetControl) |set| set(self.ptr, self.execution_control) else null;
-        defer if (self.vtable.audioSetControl) |set| {
+        const previous = if (self.vtable.regions.audio_execution.setControl) |set| set(self.ptr, self.execution_control) else null;
+        defer if (self.vtable.regions.audio_execution.setControl) |set| {
             _ = set(self.ptr, previous);
         };
         try self.checkExecutionControl();
@@ -5841,7 +5846,7 @@ pub const ComputeBackend = struct {
         return result;
     }
     pub fn audioStorage(self: *const ComputeBackend, begin: bool) !bool {
-        const op = self.vtable.audioStorage orelse return false;
+        const op = self.vtable.regions.audio_execution.storage orelse return false;
         if (self.vtable.operation_services) |services| {
             if (!services.accepts(self.vtable)) return error.UnsupportedAudioStorageReceiver;
         }
@@ -5864,8 +5869,8 @@ pub const ComputeBackend = struct {
     pub fn embeddingFFN(self: *const ComputeBackend, layer: usize, input: CT, rows: usize, hidden: usize, intermediate: usize, streamed: bool) !?CT {
         const run = (if (streamed) self.vtable.embeddingStreamedFFN else self.vtable.embeddingGatedFFN) orelse return null;
         try self.checkExecutionControl();
-        const previous = if (self.vtable.audioSetControl) |set| set(self.ptr, self.execution_control) else null;
-        defer if (self.vtable.audioSetControl) |set| {
+        const previous = if (self.vtable.regions.audio_execution.setControl) |set| set(self.ptr, self.execution_control) else null;
+        defer if (self.vtable.regions.audio_execution.setControl) |set| {
             _ = set(self.ptr, previous);
         };
         const output = try run(self.ptr, layer, input, rows, hidden, intermediate);
@@ -5876,14 +5881,18 @@ pub const ComputeBackend = struct {
         return output;
     }
 
+    pub fn supportsAudioExecution(self: *const ComputeBackend) bool {
+        return self.vtable.regions.audio_execution.execute != null;
+    }
+
     pub fn audioExecution(self: *const ComputeBackend, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT) !?CT {
         return self.audioExecutionWithArenaFunding(key, inputs, context, run, false);
     }
 
     pub fn audioExecutionWithArenaFunding(self: *const ComputeBackend, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, defer_arena: bool) !?CT {
-        const op = self.vtable.audioExecution orelse return null;
-        const previous = if (self.vtable.audioSetControl) |set| set(self.ptr, self.execution_control) else null;
-        defer if (self.vtable.audioSetControl) |set| {
+        const op = self.vtable.regions.audio_execution.execute orelse return null;
+        const previous = if (self.vtable.regions.audio_execution.setControl) |set| set(self.ptr, self.execution_control) else null;
+        defer if (self.vtable.regions.audio_execution.setControl) |set| {
             _ = set(self.ptr, previous);
         };
         try self.checkExecutionControl();
@@ -6087,8 +6096,8 @@ pub const ComputeBackend = struct {
     pub fn runEmbeddingVisionFFN(self: *const ComputeBackend, input: CT, layer: usize) !?CT {
         const run = self.vtable.embeddingVisionFFN orelse return null;
         try self.checkExecutionControl();
-        const previous = if (self.vtable.audioSetControl) |set| set(self.ptr, self.execution_control) else null;
-        defer if (self.vtable.audioSetControl) |set| {
+        const previous = if (self.vtable.regions.audio_execution.setControl) |set| set(self.ptr, self.execution_control) else null;
+        defer if (self.vtable.regions.audio_execution.setControl) |set| {
             _ = set(self.ptr, previous);
         };
         const output = try run(self.ptr, input, layer);
@@ -7836,7 +7845,7 @@ test "embeddinggemma2 streamed FFN restores controls and releases post-cancel ou
         var fixture = Fixture{ .probe = &probe, .cancel_during = case == 2, .active = old };
         var table: ComputeBackend.VTable = undefined;
         table.embeddingStreamedFFN = Fixture.run;
-        table.audioSetControl = Fixture.set;
+        table.regions.audio_execution.setControl = Fixture.set;
         table.freeTensor = Fixture.free;
         const cb = ComputeBackend{ .ptr = &fixture, .vtable = &table, .execution_control = .{ .ptr = &probe, .check_fn = Probe.check } };
         if (case == 0) {
@@ -7972,7 +7981,7 @@ test "audio execution forwards caller cleanup authority" {
         }
     };
     var table = @import("native_compute.zig").vtable_impl;
-    table.audioExecution = Fixture.execute;
+    table.regions.audio_execution.execute = Fixture.execute;
     var observed: Cleanup = .{};
     var cb = ComputeBackend{ .ptr = &observed, .vtable = &table };
     const epoch: Epoch = undefined;
@@ -8325,7 +8334,7 @@ test "source scalar publication refuses copied canonical table before opaque cal
     table.roundBf16F32 = Fixture.round;
     table.bf16SourceOperation = Fixture.source;
     table.sourceScalarStorage = Fixture.storage;
-    table.audioStorage = Fixture.audio;
+    table.regions.audio_execution.storage = Fixture.audio;
     const cb = ComputeBackend{ .ptr = @ptrFromInt(16), .vtable = &table };
     const tensor: CT = @ptrFromInt(16);
     try std.testing.expectEqual(@as(?CT, null), try cb.tryRoundBf16F32(tensor));
@@ -8362,7 +8371,7 @@ test "audio storage scope surfaces provider retirement and reopen declines" {
     var fixture = Fixture{};
     var table = @import("native_compute.zig").vtable_impl;
     table.operation_services = null;
-    table.audioStorage = Fixture.audio;
+    table.regions.audio_execution.storage = Fixture.audio;
     const cb = ComputeBackend{ .ptr = &fixture, .vtable = &table };
     var scope = try AudioStorageScope.begin(&cb);
     defer scope.close();
