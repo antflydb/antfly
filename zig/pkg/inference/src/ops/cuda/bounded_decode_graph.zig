@@ -63,6 +63,7 @@ pub const StorageLayout = struct {
     metadata_bytes: usize,
     host_bytes: usize,
     head_bytes: usize,
+    arena_head_rows: usize = 0,
 
     const Span = struct {
         offset: usize,
@@ -202,12 +203,19 @@ pub const Descriptor = struct {
     vocab: usize,
     future_tokens: usize,
     head_row_limit: ?usize = null,
+    head_in_arena: bool = false,
     attention_geometry: ?DecodeScratch.Geometry = null,
     attention_layers: usize,
     recurrent_layers: usize,
     pub fn layout(self: Descriptor) !StorageLayout {
         if (self.epoch == 0 or self.rows > max_rows or self.positions.len != self.rows * 3) return error.InvalidShape;
-        return StorageLayout.initWithHeadLimit(self.rows, self.hidden, self.vocab, self.key.len, self.head_row_limit orelse self.rows);
+        var storage = try StorageLayout.initWithHeadLimit(self.rows, self.hidden, self.vocab, self.key.len, self.head_row_limit orelse self.rows);
+        if (self.head_in_arena and storage.head_bytes != 0) {
+            const packet_rows = self.head_row_limit orelse return error.InvalidShape;
+            storage.arena_head_rows = @min(self.rows, packet_rows);
+            storage.head_bytes = 0;
+        }
+        return storage;
     }
     pub const DispatchCounts = struct { attention: usize, ragged_recurrent: usize };
 
@@ -294,7 +302,9 @@ pub const GraphPhase = struct {
         const storage = owner.storage_layout orelse return false;
         const compatible_head = storage.head_bytes == self.storage_layout.head_bytes or
             (self.descriptor.head_row_limit != null and storage.head_bytes > 0 and storage.head_bytes < self.storage_layout.head_bytes);
-        return owner.matches(self.descriptor) and compatible_head and std.meta.eql(owner.attention_scratch, self.attention_scratch);
+        return owner.matches(self.descriptor) and compatible_head and
+            storage.arena_head_rows == self.storage_layout.arena_head_rows and
+            std.meta.eql(owner.attention_scratch, self.attention_scratch);
     }
 
     /// Only the optional packet bank changes. Input, token and attention spans
@@ -707,6 +717,15 @@ test "captured graph head packets fund the exact smaller bank and invalidate a f
     try phase.initInto(packet);
     try std.testing.expect(phase.matchesOwner(&owner));
     try phase.initInto(descriptor);
+    try std.testing.expect(!phase.matchesOwner(&owner));
+
+    var shared = packet;
+    shared.head_in_arena = true;
+    try phase.initInto(shared);
+    try std.testing.expectEqual(@as(usize, 32), phase.storage_layout.arena_head_rows);
+    try std.testing.expectEqual(@as(usize, 0), phase.storage_layout.head_bytes);
+    const shared_request = shared.storageRequestFor(phase.storage_layout);
+    try std.testing.expectEqual(layout.metadata_bytes, (try shared_request.captured_storage.amounts()).backend_scratch_bytes);
     try std.testing.expect(!phase.matchesOwner(&owner));
 
     packet.vocab = 400_000;

@@ -3763,7 +3763,13 @@ pub const CudaCompute = struct {
             const owner = &self.compute.bounded_decode_graph;
             if (burst_value.rows != owner.rows or burst_value.vocab != owner.vocab or step >= burst_value.steps) return error.InvalidShape;
             try ensureCount(tensorFromCt(input_ct), try checkedMul(owner.rows, owner.hidden));
-            const head_rows = if (self.head_destination) |bank| bank.len / try checkedMul(owner.vocab, @sizeOf(f32)) else owner.rows;
+            const planned_packet = if (owner.storage_layout) |layout| layout.arena_head_rows else 0;
+            const head_rows = if (self.head_destination) |bank|
+                bank.len / try checkedMul(owner.vocab, @sizeOf(f32))
+            else if (planned_packet != 0)
+                planned_packet
+            else
+                owner.rows;
             if (head_rows == 0) return error.InvalidExecutionPlan;
             if (head_rows >= owner.rows) {
                 const logits = try self.projectHead(cb, input_ct, weight);
@@ -3775,9 +3781,13 @@ pub const CudaCompute = struct {
                 const rows = @min(head_rows, owner.rows - first);
                 const packet_input = try sliceRows2DOp(self.compute, input_ct, first, rows, owner.hidden);
                 defer cb.free(packet_input);
-                var destination = self.head_destination.?;
-                destination.len = try checkedMul(try checkedMul(rows, owner.vocab), @sizeOf(f32));
-                const logits = try cb.observeBackendEntry(.linear_no_bias, &linearNoBiasWithDestination, .{ self.compute, packet_input, weight, rows, owner.hidden, owner.vocab, false, @as(?buffer_mod.DeviceBuffer, destination) });
+                // With no separate bank the existing stream scope records
+                // this projection's exact lifetime and binds it on capture.
+                const destination: ?buffer_mod.DeviceBuffer = if (self.head_destination) |bank| .{
+                    .ptr = bank.ptr,
+                    .len = try checkedMul(try checkedMul(rows, owner.vocab), @sizeOf(f32)),
+                } else null;
+                const logits = try cb.observeBackendEntry(.linear_no_bias, &linearNoBiasWithDestination, .{ self.compute, packet_input, weight, rows, owner.hidden, owner.vocab, false, destination });
                 defer cb.free(logits);
                 try burst_value.argmaxRange(logits, step, first, rows);
                 first += rows;
@@ -3828,7 +3838,13 @@ pub const CudaCompute = struct {
                 owner.wide_replays += @intFromBool(owner.rows > 64);
                 owner.max_replay_rows = @max(owner.max_replay_rows, owner.rows);
                 if (owner.progress == 2 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
-                    const packet_rows = if (owner.head.len == 0) owner.rows else owner.head.len / (owner.vocab * @sizeOf(f32));
+                    const arena_head_rows = owner.storage_layout.?.arena_head_rows;
+                    const packet_rows = if (owner.head.len != 0)
+                        owner.head.len / (owner.vocab * @sizeOf(f32))
+                    else if (arena_head_rows != 0)
+                        arena_head_rows
+                    else
+                        owner.rows;
                     std.debug.print("LIGHTONOCR3 cuda_model_graph_first_replay_rows={d} capture={d} head_packet_rows={d} head_bank_bytes={d}\n", .{
                         owner.rows, owner.captures, packet_rows, owner.head.len,
                     });
@@ -4215,7 +4231,7 @@ pub const CudaCompute = struct {
         if (rows > @import("gated_delta.zig").max_packet_rows and !self.lighton_ragged_recurrent_enabled) return null;
         if (self.execution_scope != null or try self.ctx.streamCaptureActive()) return null;
         const descriptor = graph_phase.descriptor;
-        if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or !std.meta.eql(descriptor.attention_geometry, expected.attention_geometry) or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions)) return error.PreparedCachePlanChanged;
+        if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or !std.meta.eql(descriptor.attention_geometry, expected.attention_geometry) or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or descriptor.head_in_arena != expected.head_in_arena or descriptor.head_row_limit != expected.head_row_limit or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions)) return error.PreparedCachePlanChanged;
         const owner = &self.bounded_decode_graph;
         while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
         var claimed = false;
@@ -46914,6 +46930,26 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
     const packet_actual = try cb.toFloat32(packet_embeddings, a);
     defer a.free(packet_actual);
     try std.testing.expectEqualSlices(f32, &.{ 2, 3, 5, 7, 2, 3 }, packet_actual);
+
+    claim.head_destination = null;
+    owner.storage_layout.?.arena_head_rows = 2;
+    const workspace = @import("../../execution/stream_workspace.zig");
+    const plan = try a.create(workspace.Plan);
+    defer a.destroy(plan);
+    plan.* = .{};
+    {
+        var scope = workspace.Scope.observe(plan);
+        compute.execution_scope = &scope;
+        defer compute.execution_scope = null;
+        try claim.projectGreedyHead(&cb, &burst, packet_input, weight, 1);
+    }
+    try std.testing.expect(plan.finishNoOutput());
+    try std.testing.expect((try plan.layout(0)).bytes > 0);
+    const shared_embeddings = try burst.embedding(1);
+    defer cb.free(shared_embeddings);
+    const shared_actual = try cb.toFloat32(shared_embeddings, a);
+    defer a.free(shared_actual);
+    try std.testing.expectEqualSlices(f32, packet_actual, shared_actual);
 }
 
 test "LightOnOCR3 CUDA bounded GEMM refresh drains at an exclusive boundary and refuses capture" {
