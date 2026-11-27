@@ -3732,7 +3732,7 @@ pub const CudaCompute = struct {
         }
         return eligible;
     }
-    pub fn lightOnGraphKvWords(cb: *const ops.ComputeBackend, storage: *kv_storage_runtime.KvStorageRuntime, sequence: kv_storage_runtime.SequenceId, future_tokens: usize, layer_indices: []const usize, words: []u64) !usize {
+    pub fn lightOnGraphKvWords(cb: *const ops.ComputeBackend, storage: *kv_storage_runtime.KvStorageRuntime, sequence: kv_storage_runtime.SequenceId, future_tokens: usize, physical_tokens: usize, layer_indices: []const usize, words: []u64) !?usize {
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         const hook = storage.device_write_hook orelse return error.InvalidPagedKvState;
         if (hook.vtable != &CudaKvDeviceStorage.hook_vtable or storage.storage.config.dtype != .f16)
@@ -3748,6 +3748,9 @@ pub const CudaCompute = struct {
             const layer = device.layers.getPtr(key) orelse return error.InvalidPagedKvState;
             if (layer.compressed_format != cuda_kv_format_f16 or layer.value_format != cuda_kv_value_format_f16 or layer.k.ptr == 0 or layer.v.ptr == 0)
                 return error.InvalidPagedKvState;
+            // Let the ordinary suffix path grow sparse page backing before
+            // freezing the K/V addresses into a captured graph.
+            if (layer.capacity_tokens < physical_tokens) return null;
             words[count..][0..3].* = .{ layer.k.ptr, layer.v.ptr, layer.capacity_tokens };
             count += 3;
         }

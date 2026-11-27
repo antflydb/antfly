@@ -953,11 +953,8 @@ pub const Executor = struct {
                 for (spans) |span| for (span) |block| try key.add(block);
             }
             var kv_words: [193]u64 = undefined;
-            const kv_count = try C.lightOnGraphKvWords(self.context.cb, storage, items[0].state.sequence_id.?, max_future, attention_layers[0..attention_count], &kv_words);
-            // Logical length is insufficient when the global page pool
-            // assigns a high physical block to a short sequence. Let the
-            // ordinary suffix path grow that backing before learning a graph.
-            for (0..attention_count) |index| if (kv_words[1 + index * 3 + 2] < physical_tokens) return decline(decline_code, .context_or_page_capacity);
+            const kv_count = (try C.lightOnGraphKvWords(self.context.cb, storage, items[0].state.sequence_id.?, max_future, physical_tokens, attention_layers[0..attention_count], &kv_words)) orelse
+                return decline(decline_code, .context_or_page_capacity);
             for (kv_words[0..kv_count]) |word| try key.add(word);
             return .{ .max_future = max_future, .attention_count = attention_count };
         }
