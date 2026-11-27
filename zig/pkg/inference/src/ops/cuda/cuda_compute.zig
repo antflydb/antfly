@@ -43198,6 +43198,89 @@ test "LightOnOCR3 CUDA batched attention preserves page bindings and validates b
     }
 }
 
+test "LightOnOCR3 CUDA batched attention preserves page bindings across captured full and tail packets" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = CudaCompute.init(a) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer compute.deinit();
+    const module = @import("paged_attention_bf16.zig");
+    if (!module.packetSupported(compute.ctx.info.compute_major, compute.ctx.info.driver_version)) return error.SkipZigTest;
+    const full = module.max_packet_rows;
+    const rows = full + 3;
+    const width = 8 * 256;
+    const kv_width = 2 * 256;
+    const scratch = try module.DecodeScratch.init(rows, 1, .{ .heads = 8, .kv_heads = 2, .dim = 256 }, false);
+    var workspace = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, scratch.full.bytes);
+    defer workspace.free(&compute.ctx);
+    const cb = compute.computeBackend();
+    const input = try a.alloc(f32, rows * width);
+    defer a.free(input);
+    @memset(input, 0);
+    const q = try cb.fromFloat32Shape(input, &.{ rows, width });
+    defer cb.free(q);
+    const k = try cb.fromFloat32Shape(input[0 .. rows * kv_width], &.{ rows, kv_width });
+    defer cb.free(k);
+    for (0..rows) |row| @memset(input[row * kv_width ..][0..kv_width], @floatFromInt(row + 1));
+    const v = try cb.fromFloat32Shape(input[0 .. rows * kv_width], &.{ rows, kv_width });
+    defer cb.free(v);
+    @memset(input, -19);
+    const output = try cb.fromFloat32Shape(input, &.{ rows, width });
+    defer cb.free(output);
+    var key_cache = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, rows * kv_width * @sizeOf(u16));
+    defer key_cache.free(&compute.ctx);
+    var value_cache = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, rows * kv_width * @sizeOf(u16));
+    defer value_cache.free(&compute.ctx);
+    try compute.lighton_attention.init(&compute.ctx);
+    try compute.ctx.synchronize();
+
+    var recorded = blk: {
+        try graph_mod.beginCapture(&compute.ctx);
+        errdefer if (compute.ctx.debug_graph_capture_active) graph_mod.discardRecording(&compute.ctx);
+        for ([_]usize{ 0, full }) |first| {
+            const count = @min(full, rows - first);
+            const layout = try scratch.forPacket(count, 1, scratch.geometry);
+            const kv_offset = first * kv_width * @sizeOf(f32);
+            const output_offset = first * width * @sizeOf(f32);
+            var params: module.Params = .{
+                .q = tensorFromCt(q).buffer.ptr + output_offset,
+                .k = key_cache.ptr,
+                .v = value_cache.ptr,
+                .new_k = tensorFromCt(k).buffer.ptr + kv_offset,
+                .new_v = tensorFromCt(v).buffer.ptr + kv_offset,
+                .out = tensorFromCt(output).buffer.ptr + output_offset,
+                .partials = workspace.ptr,
+                .statistics = workspace.ptr + layout.statistics_offset,
+                .items = @intCast(count),
+                .heads = 8,
+                .kv_heads = 2,
+                .chunks = layout.chunks,
+                .page_size = 1,
+                .row_values = kv_width,
+                .capacity = rows,
+            };
+            for (0..count) |row| try std.testing.expect(params.appendPage(row, 1, 0, &.{@intCast(first + row)}));
+            try compute.lighton_attention.writeSuffix(&compute.ctx, &params);
+            try compute.lighton_attention.run(&compute.ctx, &params, layout.chunk128);
+        }
+        break :blk try graph_mod.endCapture(&compute.ctx);
+    };
+    defer recorded.deinit(&compute.ctx);
+    for (0..2) |replay| {
+        for (0..rows) |row| @memset(input[row * kv_width ..][0..kv_width], @floatFromInt(row + 1 + replay));
+        try copyFromHostTracked(&compute, tensorFromCt(v).buffer, std.mem.sliceAsBytes(input[0 .. rows * kv_width]));
+        try recorded.launch(&compute.ctx);
+        const got = try cb.toFloat32(output, a);
+        defer a.free(got);
+        for (0..rows) |row| {
+            const expected: f32 = @floatFromInt(row + 1 + replay);
+            for (got[row * width ..][0..width]) |value| try std.testing.expectEqual(expected, value);
+        }
+    }
+}
+
 test "LightOnOCR3 CUDA recurrent batch matches independent pages and fails before state mutation" {
     try checkCudaRecurrentBatch(false);
 }
