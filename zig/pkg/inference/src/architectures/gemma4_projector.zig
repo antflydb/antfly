@@ -1450,6 +1450,9 @@ test "audio cache recipe shares exact execution key and original HF packed names
     const rows = try batch.rowsAndSegments(&measured);
     try std.testing.expectEqualSlices(usize, &segments, &measured);
     try std.testing.expectEqual(@as(usize, 33), rows);
+    const grouping = try audio_schedule.GroupedRows.resolve(batch.frames[0..batch.count]);
+    try std.testing.expectEqual(rows, grouping.total);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 11, 28 }, grouping.offsets[0..batch.count]);
     const Inputs = audio_schedule.ExecutionInputs;
     var shapes: [Inputs.count][2]i64 = undefined;
     const metadata = try Inputs.describe(&shapes, rows, batch.hidden, batch.context_left, batch.heads);
@@ -3339,16 +3342,15 @@ fn audioSubsampleWorkspacePerClip(cfg: AudioConfig, frames: usize, direct: bool,
 // time padding or cross-clip normalization. Output stays in caller order.
 fn audioSubsampleCohort(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, features: []const *AudioFeatures) !SubsampledAudio {
     if (features.len == 1) return audioSubsample(cb, a, store, cfg, features[0]);
-    if (features.len == 0 or features.len > 4) return error.InvalidInputShape;
-    const segments = try a.alloc(usize, features.len);
+    const Grouping = audio_schedule.GroupedRows;
+    if (features.len == 0 or features.len > Grouping.capacity) return error.InvalidInputShape;
+    var frames: [Grouping.capacity]usize = undefined;
+    for (features, frames[0..features.len]) |feature, *count| count.* = feature.frames;
+    const grouping = try Grouping.resolve(frames[0..features.len]);
+    const segments = try a.dupe(usize, grouping.spans[0..features.len]);
     errdefer a.free(segments);
-    var offsets: [4]usize = undefined;
-    var rows: usize = 0;
-    for (features, segments, offsets[0..features.len]) |f, *span, *off| {
-        off.* = rows;
-        span.* = audio_schedule.subsampledRows(f.frames);
-        rows = try std.math.add(usize, rows, span.*);
-    }
+    const offsets = grouping.offsets;
+    const rows = grouping.total;
     const valid = try a.alloc(bool, rows);
     errdefer a.free(valid);
     const hidden = (try cb.allocUninitF32Shape(&.{ @intCast(rows), @intCast(cfg.audio_hidden) })) orelse return error.UnsupportedResidentGemma4Audio;

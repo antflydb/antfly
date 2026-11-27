@@ -26,6 +26,26 @@ pub fn subsampledRows(frames: usize) usize {
 }
 
 /// Ordered inputs shared by audio projection and workspace admission.
+/// Exact compacted row boundaries shared by admission and the projector.
+pub const GroupedRows = struct {
+    pub const capacity = 4;
+
+    spans: [capacity]usize = @splat(0),
+    offsets: [capacity]usize = @splat(0),
+    total: usize = 0,
+
+    pub fn resolve(frames: []const usize) !GroupedRows {
+        if (frames.len > capacity) return error.InvalidPreparedAudioRecipe;
+        var result: GroupedRows = .{};
+        for (frames, result.spans[0..frames.len], result.offsets[0..frames.len]) |count, *span, *offset| {
+            offset.* = result.total;
+            span.* = subsampledRows(count);
+            result.total = try std.math.add(usize, result.total, span.*);
+        }
+        return result;
+    }
+};
+
 pub const ExecutionInputs = struct {
     pub const hidden = 0;
     pub const relative = 1;
@@ -76,7 +96,7 @@ pub const ExecutionInputs = struct {
 pub const AudioRecipe = struct {
     source_bf16: bool = false,
     gradient_clipping_bits: u32 = 0,
-    frames: [4]usize = @splat(0),
+    frames: [GroupedRows.capacity]usize = @splat(0),
     count: u3,
     hidden: usize,
     output_hidden: usize,
@@ -116,13 +136,9 @@ pub const AudioRecipe = struct {
     pub fn rowsAndSegments(self: AudioRecipe, segments: ?[]usize) !usize {
         if (self.count > self.frames.len) return error.InvalidPreparedAudioRecipe;
         if (segments) |output| if (output.len != self.count) return error.InvalidPreparedAudioRecipe;
-        var total: usize = 0;
-        for (self.frames[0..self.count], 0..) |frames, i| {
-            const span = subsampledRows(frames);
-            if (segments) |output| output[i] = span;
-            total = try std.math.add(usize, total, span);
-        }
-        return total;
+        const grouping = try GroupedRows.resolve(self.frames[0..self.count]);
+        if (segments) |output| @memcpy(output, grouping.spans[0..self.count]);
+        return grouping.total;
     }
     /// Identical to the actual execution key; singleton subsampling has no
     /// segments and therefore does not enter the CUDA learned execution route.
