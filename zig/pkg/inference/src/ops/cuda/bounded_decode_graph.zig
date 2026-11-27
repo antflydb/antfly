@@ -477,6 +477,7 @@ pub const Module = struct {
     recurrent_layers: usize = 0,
     expected_attention_calls: usize = 0,
     expected_ragged_packets: usize = 0,
+    bound_recurrent_scratch_bytes: usize = 0,
     storage_layout: ?StorageLayout = null,
     base_positions: [3 * max_rows]u32 = @splat(0),
     next_positions: [3 * max_rows]u32 = @splat(0),
@@ -530,6 +531,7 @@ pub const Module = struct {
         self.captured_roots_identity = 0;
         self.storage_layout = null;
         self.attention_scratch = null;
+        self.bound_recurrent_scratch_bytes = 0;
         self.rows = 0;
         self.hidden = 0;
         self.vocab = 0;
@@ -674,11 +676,13 @@ pub const Module = struct {
         return self.bindLayerWorkspace(layout, span, bytes);
     }
 
-    pub fn bindRecurrentWorkspace(self: *const Module, scratch: @import("gated_delta.zig").PacketScratch) !buffer.DeviceBuffer {
+    pub fn bindRecurrentWorkspace(self: *Module, scratch: @import("gated_delta.zig").PacketScratch) !buffer.DeviceBuffer {
         const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
         const span = layout.recurrent_workspace orelse return error.InvalidExecutionPlan;
         if (!std.meta.eql(layout.recurrent_scratch orelse return error.InvalidExecutionPlan, scratch)) return error.InvalidExecutionPlan;
-        return self.bindLayerWorkspace(layout, span, scratch.bytes);
+        const bound = try self.bindLayerWorkspace(layout, span, scratch.bytes);
+        self.bound_recurrent_scratch_bytes = bound.len;
+        return bound;
     }
 
     fn bindLayerWorkspace(self: *const Module, layout: StorageLayout, span: StorageLayout.Span, bytes: usize) !buffer.DeviceBuffer {
@@ -748,9 +752,10 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
     try std.testing.expectEqual(base.metadata_bytes, attention.offset);
     try std.testing.expectEqual(attention.offset, recurrent.offset);
     try std.testing.expectEqual(base.metadata_bytes + @max(attention.bytes, recurrent.bytes), layout.metadata_bytes);
-    const owner: Module = .{ .storage_layout = layout, .metadata = .{ .ptr = 0x10000, .len = layout.metadata_bytes } };
+    var owner: Module = .{ .storage_layout = layout, .metadata = .{ .ptr = 0x10000, .len = layout.metadata_bytes } };
     const scratch = layout.recurrent_scratch.?;
     try std.testing.expectEqual((try owner.bindAttentionWorkspace(attention.bytes)).ptr, (try owner.bindRecurrentWorkspace(scratch)).ptr);
+    try std.testing.expectEqual(scratch.bytes, owner.bound_recurrent_scratch_bytes);
     var changed = scratch;
     changed.core_offset -= @sizeOf(f32);
     try std.testing.expectError(error.InvalidExecutionPlan, owner.bindRecurrentWorkspace(changed));

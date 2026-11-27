@@ -3882,6 +3882,7 @@ pub const CudaCompute = struct {
             const attention_calls = compute.lighton_attention.calls;
             const ragged_calls = compute.lighton_recurrent.ragged_batch_calls;
             if (scope) |*active_scope| compute.execution_scope = active_scope;
+            owner.bound_recurrent_scratch_bytes = 0;
             owner.active = true;
             callback(context, self) catch |failure| {
                 std.log.warn("LightOn decoder graph forward failed: phase={s} error={s}", .{ @tagName(phase), @errorName(failure) });
@@ -3952,7 +3953,7 @@ pub const CudaCompute = struct {
                     .bound_scratch_bytes = if (arena != null) owner.arena.len else 0,
                     .metadata_bytes = if (layout.attention_workspace orelse layout.recurrent_workspace) |span| span.offset else layout.metadata_bytes,
                     .attention_scratch_bytes = if (layout.attention_workspace) |span| span.bytes else 0,
-                    .recurrent_scratch_bytes = if (layout.recurrent_workspace) |span| span.bytes else 0,
+                    .recurrent_scratch_bytes = owner.bound_recurrent_scratch_bytes,
                     .head_bytes = layout.head_bytes,
                     .head_packet_rows = layout.headPacketRows(owner.rows, owner.vocab),
                     .head_in_stream_arena = layout.head_bytes == 0 and arena != null,
