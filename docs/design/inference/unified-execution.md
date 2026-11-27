@@ -1422,8 +1422,11 @@ At `4e39bbadfa`, all 12 scoped Spark CUDA tests passed without skips.
 Released EmbeddingGemma 2 grouped audio repeated its vectors exactly
 and replayed twice. Both planned and captured arena sizes were
 38,017,792 bytes. The invocation-report test verified that the
-workspace receipt preserves the submission route. The production
-layout still comes from an observed allocation schedule.
+workspace receipt preserves the submission route. At `fcdf226536`,
+all 14 selected CUDA tests passed, including the audio key regression
+and physical route receipts across capture, replay and held outputs.
+The released model reproduced the same arena size and replay count.
+The production layout still comes from an observed allocation schedule.
 
 This audit reconciles the original `2f2438e67f` implementation review
 against merged main `4951ca13f9` with later evidence. Each serving
