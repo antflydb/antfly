@@ -658,6 +658,37 @@ pub const ModelOutput = struct {
         return @intCast(best_idx);
     }
 
+    pub fn greedyTokenSuppress(self: *ModelOutput, allocator: std.mem.Allocator, vocab_size: usize, suppressed: []const i32) !i64 {
+        return self.greedyTokenSuppressWithCleanup(allocator, vocab_size, suppressed, .{ .outside_execution = true });
+    }
+
+    pub fn greedyTokenSuppressWithCleanup(self: *ModelOutput, allocator: std.mem.Allocator, vocab_size: usize, suppressed: []const i32, cleanup_context: CleanupContext) !i64 {
+        if (suppressed.len == 0) return self.greedyTokenWithCleanup(allocator, vocab_size, cleanup_context);
+        if (vocab_size == 0) return error.InvalidModelOutput;
+        // The capped f32 values can tie even when the raw logits differ.
+        if (self.prepared_tail) |tail| {
+            if (tail.greedy_token_id) |id| {
+                if (tail.final_logit_softcap <= 0 and id >= 0 and id < vocab_size and !tokenIsSuppressed(id, suppressed)) return id;
+            }
+        }
+        if (self.final_logit_softcap <= 0) if (self.device_logits) |logits| {
+            const backend = self.device_logits_backend orelse return error.InvalidModelOutput;
+            if (try backend.argmaxLastRowSuppressTensor(logits, 1, vocab_size, suppressed)) |token| {
+                var cleanup = if (self.owner) |owner| owner.beginCleanup() else CloseScope{};
+                defer cleanup.deinit();
+                defer backend.freeWithCleanup(token, cleanup_context);
+                const data = try backend.toFloat32(token, allocator);
+                defer allocator.free(data);
+                if (data.len != 1 or !std.math.isFinite(data[0]) or data[0] < 0 or data[0] >= @as(f32, @floatFromInt(vocab_size))) return error.InvalidModelOutput;
+                const id: i64 = @intFromFloat(data[0]);
+                if (!tokenIsSuppressed(id, suppressed)) return id;
+            }
+        };
+        const logits = try self.hostLogitsWithCleanup(allocator, cleanup_context);
+        if (logits.len < vocab_size) return error.InvalidModelOutput;
+        return @intCast(try argmaxUnsuppressed(logits[0..vocab_size], suppressed));
+    }
+
     pub fn deinit(self: *ModelOutput, allocator: std.mem.Allocator) void {
         self.deinitWithCleanup(allocator, .{ .outside_execution = true });
     }
@@ -677,6 +708,20 @@ pub const ModelOutput = struct {
         self.* = undefined;
     }
 };
+
+fn argmaxUnsuppressed(logits: []const f32, suppressed: []const i32) !usize {
+    var best: ?usize = null;
+    for (logits, 0..) |value, index| {
+        if (best) |current| if (!(value > logits[current])) continue;
+        if (!tokenIsSuppressed(@intCast(index), suppressed)) best = index;
+    }
+    return best orelse error.InvalidModelOutput;
+}
+
+fn tokenIsSuppressed(token: i64, suppressed: []const i32) bool {
+    const id = std.math.cast(i32, token) orelse return false;
+    return std.mem.indexOfScalar(i32, suppressed, id) != null;
+}
 
 fn applyFinalLogitSoftcapInPlace(logits: []f32, softcap: f32) void {
     if (softcap <= 0.0) return;
@@ -850,6 +895,70 @@ pub fn sampleTokenFromLogits(
     defer penalty_state.deinit(allocator);
     penalty_state.seedFromHistory(allocator, token_history) catch {};
     return sample(@constCast(logits), config, &penalty_state, allocator);
+}
+
+pub fn sampleTokenFromLogitsSuppressInPlace(
+    allocator: std.mem.Allocator,
+    logits: []f32,
+    config: SamplingConfig,
+    token_history: []const i64,
+    suppressed: []const i32,
+) !usize {
+    if (logits.len == 0) return error.InvalidModelOutput;
+    activations.applySuppressTokenMask(logits, suppressed);
+    const token = sampleTokenFromLogits(allocator, logits, config, token_history);
+    // The sampler's fallback index can have zero probability.
+    if (tokenIsSuppressed(@intCast(token), suppressed)) return argmaxUnsuppressed(logits, suppressed);
+    return token;
+}
+
+test "suppressed Metal-style greedy output honors f32 softcap ties" {
+    const a = std.testing.allocator;
+    const native = @import("../ops/native_compute.zig");
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer weights.resident_weights.deinit(a);
+    defer weights.lazy_weights.deinit(a);
+    var compute = native.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const Probe = struct {
+        fn rawArgmax(ctx: *anyopaque, _: ops.CT, _: usize, _: usize, _: []const i32) !?ops.CT {
+            const owner: *native.NativeCompute = @ptrCast(@alignCast(ctx));
+            return try owner.computeBackend().fromFloat32Shape(&.{1}, &.{1});
+        }
+        fn preparedLogits(ctx: *anyopaque, _: *const ops.DecoderRuntimeApplyRmsNormLinearRequest) !?ops.CT {
+            const owner: *native.NativeCompute = @ptrCast(@alignCast(ctx));
+            return try owner.computeBackend().fromFloat32Shape(&.{ 100, 101, 102 }, &.{ 1, 3 });
+        }
+    };
+    var backend = compute.computeBackend();
+    var vtable = backend.vtable.*;
+    vtable.argmaxLastRowSuppressTensor = Probe.rawArgmax;
+    vtable.regions.decoder.applyRmsNormLinear = Probe.preparedLogits;
+    backend.vtable = &vtable;
+    for ([_]f32{ 0, 1 }) |cap| {
+        var output = ModelOutput{
+            .device_logits = try backend.fromFloat32Shape(&.{ 100, 101, 102 }, &.{ 1, 3 }),
+            .device_logits_backend = backend,
+            .final_logit_softcap = cap,
+        };
+        defer output.deinit(a);
+        try std.testing.expectEqual(@as(i64, if (cap == 0) 1 else 0), try output.greedyTokenSuppress(a, 3, &.{2}));
+
+        var prepared = ModelOutput{ .prepared_tail = .{
+            .final_hidden = try backend.fromFloat32Shape(&.{1}, &.{ 1, 1 }),
+            .backend = backend,
+            .norm = .rms,
+            .norm_slot = 0,
+            .lm_head_slot = 0,
+            .hidden_size = 1,
+            .vocab_size = 3,
+            .eps = 1e-5,
+            .final_logit_softcap = cap,
+            .greedy_token_id = 1,
+        } };
+        defer prepared.deinit(a);
+        try std.testing.expectEqual(@as(i64, if (cap == 0) 1 else 0), try prepared.greedyTokenSuppress(a, 3, &.{2}));
+    }
 }
 
 fn sample(logits: []const f32, config: SamplingConfig, penalty_state: *const SamplingPenaltyState, allocator: std.mem.Allocator) usize {
