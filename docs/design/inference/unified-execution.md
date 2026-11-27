@@ -2277,3 +2277,9 @@ Native serving comparison used the runtime's automatic host budget.
 The Metal and restricted Native test log hashes are respectively
 `2700b8422b66c14cbf0d416d6d3cd2da6a46a590b12004b0e44d87a40c471c95`
 and `05ca4aa530c437663ddd83d0a04acbb3d40564986e92aa00d57ac839a690b77d`.
+
+The released DECIDE-1B checkpoint passed the required-Native HTTP
+fixture with automatic host budgeting. The expected labels were
+returned and all request admission units were released. This check
+uses the same host budget policy as the earlier timing comparison.
+The log hash is `8261b1bf7b8525a785fbcf07316d1e1d01cccd1371b112604cf242f91ada2490`.

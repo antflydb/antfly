@@ -47764,6 +47764,12 @@ test "Decide extraction v2 serves classifications through HTTP handler" {
     const model_path = platform.env.getenv("ANTFLY_GLINER_DECIDE_MODEL") orelse return error.SkipZigTest;
     const model_name = std.fs.path.basename(model_path);
     const models_dir = std.fs.path.dirname(model_path) orelse return error.InvalidDecisionTestModelPath;
+    const backend_name = platform.env.getenv("ANTFLY_GLINER_DECIDE_BACKEND") orelse "native";
+    const backend = std.meta.stringToEnum(backends_mod.BackendType, backend_name) orelse return error.InvalidDecisionTestBackend;
+    switch (backend) {
+        .native, .metal, .cuda => {},
+        else => return error.InvalidDecisionTestBackend,
+    }
     const a = std.testing.allocator;
     var node = try Node.init(a, .{
         .models_dir = models_dir,
@@ -47771,20 +47777,16 @@ test "Decide extraction v2 serves classifications through HTTP handler" {
         .max_concurrent_requests = 1,
         .process_termination_available = true,
         .generation_budget_overrides = .{
-            .host_limit_bytes = 6 * 1024 * 1024 * 1024,
+            // Native construction keeps the source weights and serving state
+            // under the host budget. Use the runtime's host limit for this fixture.
+            .host_limit_bytes = if (backend == .native) 0 else 6 * 1024 * 1024 * 1024,
             .backend_limit_bytes = 12 * 1024 * 1024 * 1024,
-            .combined_limit_bytes = 18 * 1024 * 1024 * 1024,
+            .combined_limit_bytes = if (backend == .native) 0 else 18 * 1024 * 1024 * 1024,
             .scratch_limit_bytes = 8 * 1024 * 1024 * 1024,
         },
     });
     defer node.deinit();
     try node.attachIo(std.testing.io);
-    const backend_name = platform.env.getenv("ANTFLY_GLINER_DECIDE_BACKEND") orelse "native";
-    const backend = std.meta.stringToEnum(backends_mod.BackendType, backend_name) orelse return error.InvalidDecisionTestBackend;
-    switch (backend) {
-        .native, .metal, .cuda => {},
-        else => return error.InvalidDecisionTestBackend,
-    }
     node.session_manager.required_backend = backend;
     node.model_manager.session_manager.required_backend = backend;
     const body = try std.fmt.allocPrint(
