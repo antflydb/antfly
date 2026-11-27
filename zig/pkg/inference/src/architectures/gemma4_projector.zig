@@ -1455,6 +1455,16 @@ test "audio cache recipe shares exact execution key and original HF packed names
     var batch = recipe;
     batch.frames = .{ 41, 68, 19, 0 };
     batch.count = 3;
+    try batch.validate();
+    var invalid = batch;
+    invalid.chunk = 0;
+    try std.testing.expectError(error.InvalidPreparedAudioRecipe, invalid.validate());
+    invalid = batch;
+    invalid.conv_kernel = 0;
+    try std.testing.expectError(error.InvalidPreparedAudioRecipe, invalid.validate());
+    invalid = batch;
+    invalid.context_right = std.math.maxInt(usize);
+    try std.testing.expectError(error.InvalidPreparedAudioRecipe, invalid.validate());
     var measured: [3]usize = undefined;
     const rows = try batch.rowsAndSegments(&measured);
     try std.testing.expectEqualSlices(usize, &segments, &measured);

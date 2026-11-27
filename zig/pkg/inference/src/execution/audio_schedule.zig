@@ -129,10 +129,13 @@ pub const AudioRecipe = struct {
     pub fn validate(self: AudioRecipe) !void {
         if (self.count == 0 or self.count > GroupedRows.max_clips or self.hidden == 0 or self.heads == 0 or self.hidden % self.heads != 0 or
             self.output_hidden == 0 or self.intermediate == 0 or self.blocks != 12 or self.mel_bins != 128 or
-            self.context_left == 0 or self.packed_layers >> 12 != 0) return error.InvalidPreparedAudioRecipe;
+            self.chunk == 0 or self.context_left == 0 or self.conv_kernel == 0 or self.packed_layers >> 12 != 0)
+            return error.InvalidPreparedAudioRecipe;
+        const left_and_chunk = std.math.add(usize, self.chunk - 1, self.context_left) catch return error.InvalidPreparedAudioRecipe;
+        const context = std.math.add(usize, left_and_chunk, self.context_right) catch return error.InvalidPreparedAudioRecipe;
         for (self.frames[0..self.count]) |frames| if (frames == 0) return error.InvalidPreparedAudioRecipe;
         for (self.frames[self.count..]) |frames| if (frames != 0) return error.InvalidPreparedAudioRecipe;
-        for ([_]usize{ self.hidden, self.output_hidden, self.context_left, try self.rows() }) |extent|
+        for ([_]usize{ self.hidden, self.output_hidden, self.intermediate, self.conv_kernel, context, try self.rows() }) |extent|
             if (std.math.cast(i64, extent) == null) return error.InvalidPreparedAudioRecipe;
     }
     pub fn rows(self: AudioRecipe) !usize {
