@@ -108764,6 +108764,31 @@ test "db artifact seeds bind through transforms and reject unusable seeds" {
     try std.testing.expectEqual(@as(usize, 1), counting.calls);
 }
 
+test "db artifact seeds ride a direct enrichment packet" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var counting = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a", .dense_embedder = counting.interface() } });
+    defer db.close();
+    try addSeededDenseTestIndex(&db);
+    // One seeded and one generated document in a direct write.
+    const req: types.BatchRequest = .{ .writes = &.{
+        .{ .key = "doc:a", .value = "{\"body\":\"same source\",\"_artifacts\":{\"body_dense_v1\":{\"value\":[1,2,3]}}}" },
+        .{ .key = "doc:b", .value = "{\"body\":\"generated source\"}" },
+    }, .sync_level = .write, .commit_requires = .direct_enrichments };
+    const packet = try db.prepareDirectEnrichments(alloc, req);
+    defer alloc.free(packet);
+    try std.testing.expectEqual(@as(usize, 1), counting.calls);
+    var prepared = req;
+    prepared.prepared_enrichments_json = packet;
+    try db.batch(prepared);
+    try expectSeededDenseVector(alloc, &db, "doc:a", "same source", &.{ 1, 2, 3 });
+    try std.testing.expectEqual(@as(usize, 1), counting.calls);
+}
+
 fn documentVersionForTest(alloc: Allocator, db: *DB, key: []const u8) !u64 {
     var result = (try db.lookup(alloc, key, .{ .include_primary_digest = true })).?;
     defer result.deinit(alloc);

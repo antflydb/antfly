@@ -389,10 +389,13 @@ state it was prepared against; a concurrent change fails the entry with
 The packet requires Raft batch protocol 76. It is an optional upgrade: the
 leader prepares only once every applying peer can decode protocol 76, and
 drops the packet if the proposal is encoded at an older version, in which case
-replicas accept the seeds at apply as before. Transactions (including
-multi-shard 2PC batches), `direct_enrichments` writes, enrichment-level sync
+replicas accept the seeds at apply as before. `direct_enrichments` writes are
+leader-prepared already: their packet carries the seeded output beside the
+generated one, and a seeded output is never embedded (window prewarming skips
+it). Transactions (including multi-shard 2PC batches), enrichment-level sync
 levels and seeds supplied only through field mappings keep apply-time
-acceptance.
+acceptance; mapped text and JSON assets depend on no replica-local state, while
+mapped vectors bind the replica's embedder identity.
 
 ### Late inference results
 
@@ -425,18 +428,27 @@ These fail with `ArtifactSeedNotAccepted` rather than regenerating:
 
 ## Remaining work
 
+These need work this repository cannot verify on a 16.8 GB machine (the data
+runtime, storage kernel and server API test builds declare 19-21 GB), or are
+subsystem features of their own:
+
 - Per-item outcomes in server batch responses. The proposing leader holds
   them in its seed preparation packet, but the table write source returns no
-  value to the HTTP handler, and forwarded writes would need the internal
-  forwarding response to carry them. Until then, plan with `validate_only`.
-- Leader seed preparation for transactions and multi-shard 2PC batches, and
-  for seeds that come only from enrichment field mappings.
-- Readiness counters for `pending` outputs (they are reported per write and
-  never generated, but not counted separately), and downstream consumers of
+  value to the HTTP handler (the data runtime and the HTTP handler reach the
+  API through different module roots, so thread state cannot carry them), and
+  forwarded writes would need the internal forwarding response to carry them.
+  Until then, plan with `validate_only`.
+- Leader seed preparation for transactions and multi-shard 2PC batches, for
+  enrichment-level sync levels, and for seeds that come only from field
+  mappings (the leader would need the table's mapping catalog before
+  proposing). A cross-shard 2PC seed transform test.
+- Generating only the missing pages of a partial extraction seed: the
+  document extraction pipeline processes whole documents and has no page
+  selection to merge with seeded units.
+- Chunk inventories beyond the 4,095-chunk atomic-mutation ceiling through
+  staged publication (`docs/design/media-pass.md`), and migration progress
+  counters (imported, generated, rejected, pending) beside per-write outcomes.
+- Readiness counters for `pending` outputs, and downstream consumers of
   externally maintained assets.
-- Migration progress reporting, generation of only the missing pages of a
-  rich extraction seed, and a streaming import path for chunk inventories
-  beyond the 4,095-chunk atomic-mutation ceiling (staged publication,
-  `docs/design/media-pass.md`).
 - The serverless coordinator rejects seed paths until serverless publication
   accepts seeds; its fixed pipelines have no named enrichments to seed.

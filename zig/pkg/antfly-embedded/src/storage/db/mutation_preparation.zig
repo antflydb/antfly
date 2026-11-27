@@ -2030,6 +2030,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 for (plan.rows[row_index].requests) |request| {
                     if (request.kind != .dense_embedding or request.input_kind != .document) continue;
                     if (!try shouldPrecomputeGeneratedRequest(self, precompute_mode, request)) continue;
+                    // A seeded output is never embedded (#1791).
+                    if (try requestSeededInRow(memo.alloc, &extracted[row_index], request)) continue;
                     if (request.source_template.len > 0 and embedder.supportsParts()) continue;
                     const cleaned = (if (request.source_template.len > 0) try extracted[row_index].logicalJson() else try extracted[row_index].logicalJsonForField(request.source_field)) orelse continue;
                     const source_text = if (request.source_template.len > 0)
@@ -2173,6 +2175,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 for (plan.rows[row_index].requests) |request| {
                     if (request.kind != .sparse_embedding or request.input_kind != .document) continue;
                     if (!try shouldPrecomputeGeneratedRequest(self, precompute_mode, request)) continue;
+                    // A seeded output is never embedded (#1791).
+                    if (try requestSeededInRow(memo.alloc, &extracted[row_index], request)) continue;
                     const cleaned = (if (request.source_template.len > 0) try extracted[row_index].logicalJson() else try extracted[row_index].logicalJsonForField(request.source_field)) orelse continue;
                     const source_text = if (request.source_template.len > 0)
                         renderSourceTemplateText(memo.alloc, self, request.source_template, cleaned) catch |err| switch (err) {
@@ -2424,6 +2428,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         fn appendSeedOutcome(alloc: Allocator, outcomes: *std.ArrayListUnmanaged(artifact_seeds.OutcomeEntry), request: enrichment_types.GeneratedEnrichmentRequest, result: artifact_seeds.Result) !void {
             const name = if (request.kind == .asset or request.kind == .chunk_text) requestArtifactName(request) else requestEmbeddingName(request);
             try appendSeedOutcomeNamed(alloc, outcomes, request.doc_key, name, result);
+        }
+
+        /// Whether `request`'s output is seeded in this row: explicitly, or by
+        /// a field mapping whose field the record carries.
+        fn requestSeededInRow(alloc: Allocator, extracted: anytype, request: enrichment_types.GeneratedEnrichmentRequest) !bool {
+            if (extracted.artifact_seeds_json) |json| {
+                var seeds = try artifact_seeds.Seeds.parse(alloc, json);
+                defer seeds.deinit();
+                if (seeds.artifact(requestEmbeddingName(request)) != null) return true;
+            }
+            if (request.seed_mapping_json.len == 0) return false;
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const json = (try extracted.logicalJson()) orelse return false;
+            const document = std.json.parseFromSliceLeaky(std.json.Value, a, json, .{ .parse_numbers = false }) catch return false;
+            const mapping = try artifact_seeds.parseMapping(a, request.seed_mapping_json);
+            return (try artifact_seeds.mappedEntry(mapping, document, false)) != null;
         }
 
         fn externalAsset(db: anytype, name: []const u8) ?*const @import("catalog/enrichment_catalog.zig").EnrichmentConfig {
