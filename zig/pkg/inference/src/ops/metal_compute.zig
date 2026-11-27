@@ -24093,17 +24093,34 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.encodeAudioLinear(ctx, x, request, .prefer_fused);
     }
 
+    const AudioClampBinding = struct {
+        input: MetalTensor,
+        output: MetalTensor,
+        rows: usize,
+        width: usize,
+        bytes: usize,
+        output_bytes: usize,
+
+        fn view(self: *const AudioClampBinding, ct: CT) ?MetalTensor {
+            const target = denseDeviceF32(ct) orelse return null;
+            if (target.isReadOnlyPhysical() or !deviceTensorMatchesLinearRows(&target, self.rows, self.width) or
+                target.deviceByteLen() < self.bytes or target.device.?.ref.runtime != self.output.device.?.ref.runtime or
+                (target.deviceHandle() == self.input.deviceHandle() and kernel_geometry.byteRangesOverlap(target.deviceByteOffset(), self.bytes, self.input.deviceByteOffset(), self.input.deviceByteLen())) or
+                (target.deviceHandle() == self.output.deviceHandle() and kernel_geometry.byteRangesOverlap(target.deviceByteOffset(), self.bytes, self.output.deviceByteOffset(), self.output_bytes))) return null;
+            return target;
+        }
+    };
+
     // The plan retains the scratch throughout ordinary frame encoding.
     // Ordered encoders track the reuse dependency on the same Metal buffer.
-    fn audioEagerClampWorkspace(self: *const MetalCompute, rows: usize, width: usize) ?CT {
+    fn audioEagerClampWorkspace(self: *const MetalCompute, binding: *const AudioClampBinding) ?CT {
         const plan = self.audio_eager_plan orelse return null;
         const runtime = self.provider_impl.raw_decode_runtime;
         if (metal_runtime.hasSubmittedFrame(runtime)) return null;
         for (plan.workspaces) |entry| {
             const ct = entry orelse continue;
-            const view = denseDeviceF32(ct) orelse continue;
-            if (deviceTensorMatchesLinearRows(&view, rows, width) and
-                metal_runtime.antfly_metal_can_reuse_ordered_scratch(runtime, view.deviceHandle()) != 0) return ct;
+            const view = binding.view(ct) orelse continue;
+            if (metal_runtime.antfly_metal_can_reuse_ordered_scratch(runtime, view.deviceHandle()) != 0) return ct;
         }
         return null;
     }
@@ -24162,10 +24179,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             defer if (owned_scratch) |*tensor| self.retireTemporaryWorkspaceValue(tensor);
             // Outside a caller-owned frame, submit the dependent clamp and
             // projection kernels together instead of waiting after each one.
-            const input_workspace = request.input_workspace orelse if (clip != null and clip.?.flags & 3 != 0)
-                self.audioEagerClampWorkspace(rows, in_dim)
-            else
-                null;
             var owns_frame = false;
             errdefer if (owns_frame) metal_runtime.cancelFrame(runtime) catch {};
             if (clip) |p| {
@@ -24177,12 +24190,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             var operand = x;
             if (clip) |p| if (p.flags & 3 != 0) {
                 const bytes = try std.math.mul(usize, input_elements, @sizeOf(f32));
+                const binding: AudioClampBinding = .{
+                    .input = x,
+                    .output = mt,
+                    .rows = rows,
+                    .width = in_dim,
+                    .bytes = bytes,
+                    .output_bytes = output_bytes,
+                };
+                const input_workspace = request.input_workspace orelse self.audioEagerClampWorkspace(&binding);
                 const target = if (input_workspace) |scratch| blk: {
-                    const target = denseDeviceF32(scratch) orelse return error.InvalidPreparedProjectionWorkspace;
-                    if (target.isReadOnlyPhysical() or !deviceTensorMatchesLinearRows(&target, rows, in_dim) or target.deviceByteLen() < bytes or
-                        target.device.?.ref.runtime != @as(*anyopaque, @ptrCast(runtime)) or
-                        (target.deviceHandle() == x.deviceHandle() and kernel_geometry.byteRangesOverlap(target.deviceByteOffset(), bytes, x.deviceByteOffset(), x.deviceByteLen())) or
-                        (target.deviceHandle() == mt.deviceHandle() and kernel_geometry.byteRangesOverlap(target.deviceByteOffset(), bytes, mt.deviceByteOffset(), output_bytes))) return error.InvalidPreparedProjectionWorkspace;
+                    const target = binding.view(scratch) orelse return error.InvalidPreparedProjectionWorkspace;
                     toBuf(scratch).metal_tensor.?.invalidateHostMirror();
                     break :blk target;
                 } else blk: {
@@ -63561,7 +63579,7 @@ test "Metal prepared audio projection consumes disjoint clamp workspace after fu
     const repeat_values = try cb.toFloat32(repeat, a);
     defer a.free(repeat_values);
     try std.testing.expectEqualSlices(f32, expected, repeat_values);
-    var workspaces = [_]?CT{workspace};
+    var workspaces = [_]?CT{ input, destination, workspace };
     var plan: audio_tape.Plan = .{ .workspaces = &workspaces, .input_workspace_bytes = bytes };
     compute.audio_eager_plan = &plan;
     defer compute.audio_eager_plan = null;
@@ -63571,6 +63589,7 @@ test "Metal prepared audio projection consumes disjoint clamp workspace after fu
     const synced_values = try cb.toFloat32(synced, a);
     defer a.free(synced_values);
     try std.testing.expectEqualSlices(f32, expected, synced_values);
+    plan.workspaces = workspaces[2..];
     {
         try metal_runtime_mod.beginFrame(runtime);
         errdefer metal_runtime_mod.cancelFrame(runtime) catch {};
@@ -63583,7 +63602,15 @@ test "Metal prepared audio projection consumes disjoint clamp workspace after fu
         defer cb.free(second);
         try std.testing.expectEqual(before_frames, metal_runtime_mod.frameCommandBufferCount(runtime));
         try metal_runtime_mod.submitFrame(runtime);
-        try std.testing.expect(compute.audioEagerClampWorkspace(rows, width) == null);
+        const binding: MetalCompute.AudioClampBinding = .{
+            .input = source,
+            .output = MetalCompute.denseDeviceF32(destination).?,
+            .rows = rows,
+            .width = width,
+            .bytes = bytes,
+            .output_bytes = bytes,
+        };
+        try std.testing.expect(compute.audioEagerClampWorkspace(&binding) == null);
         try metal_runtime_mod.waitFrame(runtime);
         const first_values = try cb.toFloat32(first, a);
         defer a.free(first_values);
