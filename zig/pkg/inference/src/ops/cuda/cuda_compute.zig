@@ -7922,7 +7922,7 @@ pub const CudaCompute = struct {
         const entry = self.audioPlanFor(base) orelse return;
         if (entry.owner == null or !entry.owner.?.managed)
             try builder.add(.{ .audio_learning = .{ .key = base.key } });
-        if (entry.executableFor(base.input_bytes, base.output_bytes)) |executable|
+        if (entry.executableFor(base)) |executable|
             try builder.add(audioArenaRequest(executable));
     }
 
@@ -7962,32 +7962,18 @@ pub const CudaCompute = struct {
         const native = expected.embedding_gemma2_policy.native_vision and cuda_artifact.hasBf16WmmaCodeFor(expected.ctx.info.compute_major, expected.ctx.info.compute_minor);
         return try expected.visionSourceArenaRequest(batch, grid_x, grid_y, source_sequence, source_sequence != null or fused != null or native);
     }
-    pub const AudioCacheInput = @import("../../execution/audio_schedule.zig").ExecutionInputs.Metadata;
-    const AudioCacheBase = struct { key: u64, input_bytes: usize, output_bytes: usize };
-    const AudioInputSpan = buffer_mod.ByteSpan;
+    const AudioPlan = @import("audio_execution_plan.zig");
+    const AudioCacheInput = AudioPlan.Input;
+    const AudioCacheBase = AudioPlan.Bindings;
+    const AudioInputSpan = AudioPlan.InputSpan;
     fn audioCacheBase(self: *const CudaCompute, key: u64, inputs: []const AudioCacheInput, spans: ?[]AudioInputSpan) !AudioCacheBase {
-        if (spans) |output| if (output.len != inputs.len) return error.InvalidShape;
         var hash = std.hash.Wyhash.init(key);
         const bits = self.embedding_gemma2_policy.arithmeticBits();
         hash.update(std.mem.asBytes(&bits));
         hash.update(std.mem.asBytes(&self.embedding_gemma2_execution.weight_generation));
         hash.update(std.mem.asBytes(&self.cublaslt_workspace_scratch.buffer.ptr));
         hash.update(std.mem.asBytes(&self.embedding_gemma2_constant_generation));
-        hash.update(std.mem.asBytes(&inputs.len));
-        var input_bytes: usize = 0;
-        var output_bytes: usize = 0;
-        for (inputs, 0..) |input, index| {
-            hash.update(std.mem.asBytes(&input.shape.len));
-            hash.update(std.mem.sliceAsBytes(input.shape));
-            const bytes = try input.f32Bytes();
-            if (index == 0) output_bytes = bytes;
-            hash.update(std.mem.asBytes(&bytes));
-            if (spans) |output| output[index] = .{ .offset = input_bytes, .bytes = bytes };
-            const alignment = @import("../../execution/stream_workspace.zig").alignment;
-            const aligned = std.mem.alignBackward(usize, try checkedAdd(bytes, alignment - 1), alignment);
-            input_bytes = try checkedAdd(input_bytes, aligned);
-        }
-        return .{ .key = hash.final(), .input_bytes = input_bytes, .output_bytes = output_bytes };
+        return AudioCacheBase.resolve(&hash, inputs, spans);
     }
     fn audioArenaRequest(executable: @import("audio_execution_plan.zig").Owner.Executable) CacheFunding.Request {
         const storage = executable.storage;
@@ -7995,7 +7981,7 @@ pub const CudaCompute = struct {
     }
     /// Metadata-only inspection does not create an entry or change eviction order.
     fn audioPlanFor(self: *const CudaCompute, base: AudioCacheBase) ?*const @import("audio_execution_plan.zig").Entry {
-        if (base.input_bytes > @import("audio_execution_plan.zig").limit) return null;
+        if (!base.fitsArena()) return null;
         return self.audio_plans.warmedFor(base.key);
     }
 
@@ -21163,8 +21149,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     }
     const first_input = tensorFromCt(inputs[0]);
     const output_bytes = cache_base.output_bytes;
-    const input_bytes = cache_base.input_bytes;
-    if (input_bytes > plan_mod.limit) return null;
+    if (!cache_base.fitsArena()) return null;
     const base_key = cache_base.key;
     // Use the receiving invocation's cleanup when available. An installed
     // prepared funding scope supplies its own live epoch for legacy callers.
@@ -21233,7 +21218,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
             observation.cudaAudioResult(.learning_output_mismatch);
         } else if (self.stats.h2d_bytes != h2d_before or self.stats.d2h_bytes != d2h_before) {
             observation.cudaAudioResult(.learning_host_transfer);
-        } else if (!owner.seal(result.buffer.ptr, base_key, input_bytes, output_bytes)) {
+        } else if (!owner.seal(result.buffer.ptr, cache_base)) {
             observation.cudaAudioResult(.learning_unsealed);
         } else {
             observation.cudaAudioResult(.learned);
@@ -21244,7 +21229,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     }
     const owner = entry.owner.?;
     const plan = &owner.plan;
-    const executable = entry.executableFor(input_bytes, output_bytes) orelse return null;
+    const executable = entry.executableFor(cache_base) orelse return null;
     const storage = executable.storage;
     const output = storage.output orelse return null;
     // The same complete event ABI drives preflight and actual arena lookup.
@@ -62375,7 +62360,7 @@ test "public source audio linear recreates input bank through actual learning ca
     const metadata: CudaCompute.AudioCacheInput = .{ .shape = &.{ 2, 2 }, .elements = 4 };
     const base = try compute.audioCacheBase(key, &.{ metadata, metadata }, null);
     const entry = compute.audioPlanFor(base) orelse return error.TestUnexpectedResult;
-    const request = CudaCompute.audioArenaRequest(entry.executableFor(base.input_bytes, base.output_bytes) orelse return error.TestUnexpectedResult);
+    const request = CudaCompute.audioArenaRequest(entry.executableFor(base) orelse return error.TestUnexpectedResult);
     const output_bytes = request.arena.sizes[1];
     try std.testing.expect(output_bytes != 0);
     const funding = try @import("prepared_cache.zig").Funding.createWithAllocator(std.testing.allocator, .{ .requests = &.{request} });
@@ -62855,20 +62840,25 @@ test "source bias workspace policy isolates audio warm and arena plan identities
     const Owner = @import("audio_execution_plan.zig").Owner;
     var learned: Owner = .{ .allocator = std.testing.allocator };
     learned.plan.allocate(1024, 0x1000);
-    try std.testing.expect(learned.seal(0x1000, original.key, original.input_bytes, original.output_bytes));
+    try std.testing.expect(learned.seal(0x1000, original));
     var updated: Owner = .{ .allocator = std.testing.allocator };
     updated.plan.allocate(1024, 0x2000);
-    try std.testing.expect(updated.seal(0x2000, candidate.key, candidate.input_bytes, candidate.output_bytes));
-    try std.testing.expect(updated.executableFor(candidate.input_bytes + @import("../../execution/stream_workspace.zig").alignment, candidate.output_bytes) == null);
-    try std.testing.expect(updated.executableFor(candidate.input_bytes, candidate.output_bytes + 4) == null);
-    try std.testing.expectEqual(@as(usize, 12), updated.executableFor(candidate.input_bytes, candidate.output_bytes).?.output_bytes);
+    try std.testing.expect(updated.seal(0x2000, candidate));
+    try std.testing.expect(updated.executableFor(original) == null);
+    var changed = candidate;
+    changed.input_bytes += @import("../../execution/stream_workspace.zig").alignment;
+    try std.testing.expect(updated.executableFor(changed) == null);
+    changed = candidate;
+    changed.output_bytes += 4;
+    try std.testing.expect(updated.executableFor(changed) == null);
+    try std.testing.expectEqual(@as(usize, 12), updated.executableFor(candidate).?.bindings.output_bytes);
     const old_arena = CudaCompute.audioArenaRequest(learned.executable.?);
     const new_arena = CudaCompute.audioArenaRequest(updated.executable.?);
     try std.testing.expect(old_arena.arena.grid_x != new_arena.arena.grid_x);
     try std.testing.expectEqual(candidate.input_bytes, new_arena.arena.sizes[0]);
     try std.testing.expectEqual(@as(usize, 1024), new_arena.arena.sizes[1]);
     compute.audio_plans.entries[0] = .{ .key = candidate.key, .stamp = 1, .warmed = true, .owner = &updated };
-    try std.testing.expectEqualDeep(new_arena, CudaCompute.audioArenaRequest(compute.audioPlanFor(candidate).?.executableFor(candidate.input_bytes, candidate.output_bytes).?));
+    try std.testing.expectEqualDeep(new_arena, CudaCompute.audioArenaRequest(compute.audioPlanFor(candidate).?.executableFor(candidate).?));
 }
 
 test "GLiDE CUDA weight upload consumes keys on early allocation failure" {
