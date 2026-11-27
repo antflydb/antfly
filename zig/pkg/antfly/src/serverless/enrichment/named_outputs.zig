@@ -214,6 +214,32 @@ pub fn acceptAlloc(
     };
 }
 
+/// Whether `body` has a declared output the worker must still generate: no
+/// acceptance record for its current input (and none waiting on a seed),
+/// with its source present. Externally maintained assets never generate.
+pub fn needsGeneration(alloc: Allocator, declarations: named_enrichments.Declarations, body: []const u8) !bool {
+    if (declarations.configs.len == 0) return false;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const document = std.json.parseFromSliceLeaky(std.json.Value, a, body, .{}) catch return false;
+    if (document != .object) return false;
+    const artifacts = objectMember(document, "_artifacts") orelse std.json.ObjectMap.empty;
+    const chunks = objectMember(document, "_chunks") orelse std.json.ObjectMap.empty;
+    const markers = if (objectMember(document, "_enrichment")) |state| if (state.get(marker_key)) |named| if (named == .object) named.object else null else null else null;
+    for (declarations.configs) |cfg| {
+        if (named_enrichments.externallyMaintained(cfg)) continue;
+        // Upstream outputs are produced first; their consumers follow.
+        const input = (try inputDigestHexAlloc(a, cfg, document, artifacts, chunks)) orelse continue;
+        const marker = if (markers) |map| if (map.get(cfg.name)) |found| if (found == .object) found.object else null else null else null;
+        if (marker) |record| {
+            if (markerInputMatches(record, input)) continue;
+        }
+        return true;
+    }
+    return false;
+}
+
 fn reservedObject(document: *std.json.Value, name: []const u8) !?std.json.ObjectMap {
     const entry = document.object.fetchSwapRemove(name) orelse return null;
     return switch (entry.value) {

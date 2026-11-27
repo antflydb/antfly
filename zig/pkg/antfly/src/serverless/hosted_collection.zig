@@ -198,7 +198,7 @@ pub const Context = struct {
                 const root = try facts.loadRoot(a, &pages, .{ .kind = .document_facts, .artifact_id = artifact.artifact_id, .checksum = artifact.checksum, .byte_len = artifact.byte_len, .metadata_version = artifact.metadata_version });
                 if (!std.mem.eql(u8, &root.domain, &pages.domain)) return error.GraphPageDomainMismatch;
                 key = try self.artifactKey(a, artifact.artifact_id);
-                for ([_]?tree.Ref{root.page} ++ root.pending_pages ++ [_]?tree.Ref{root.audit_page}) |ref| if (ref) |page| try children.append(a, .{ .kind = .facts_page, .page = page });
+                for ([_]?tree.Ref{root.page} ++ root.pending_pages ++ [_]?tree.Ref{ root.audit_page, root.named_pending_page }) |ref| if (ref) |page| try children.append(a, .{ .kind = .facts_page, .page = page });
             },
             .projection_root => {
                 const artifact = task.artifact orelse return error.InvalidCollectionTask;

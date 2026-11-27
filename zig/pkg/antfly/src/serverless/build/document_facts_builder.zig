@@ -16,6 +16,8 @@
 //! Exact per-document accounting shared by publication and scheduling. No
 //! namespace-wide scan is needed when the policy fingerprint remains stable.
 const std = @import("std");
+const named_enrichments = @import("../catalog/named_enrichments.zig");
+const named_outputs = @import("../enrichment/named_outputs.zig");
 const Allocator = std.mem.Allocator;
 const facts = @import("document_facts.zig");
 const builder = @import("builder.zig");
@@ -160,7 +162,7 @@ pub fn needsRebuild(alloc: Allocator, root: facts.Root, policy: catalog.Namespac
     return !std.mem.eql(u8, &root.policy_fingerprint, &try fingerprint(alloc, policy, indexes_json));
 }
 
-pub const Flags = struct { present: u3, pending: u4, body_has_dependencies: bool = false };
+pub const Flags = struct { present: u3, pending: u4, body_has_dependencies: bool = false, named_pending: bool = false };
 pub fn outputsFromCountsAlloc(alloc: Allocator, counts: [7]u64, requested: builder.DerivedOutputDetectionSelection) !sources.MaterializedDerivedOutputs {
     var outputs = std.ArrayListUnmanaged(sources.DerivedOutputDescriptor).empty;
     errdefer {
@@ -191,14 +193,23 @@ pub const Context = struct {
     chunked_sources: []full_text_indexes.ChunkedFullTextSource,
     media_fields: [][]const u8,
     prepared_catalog: [32]u8,
+    /// Named enrichments (#1791); admission validated them, so a table whose
+    /// stored declarations no longer parse simply schedules none.
+    named: named_enrichments.Declarations = .{},
 
     pub fn init(alloc: Allocator, policy: catalog.NamespacePolicy, indexes_json: []const u8) !Context {
         const fields = try mediaFields(alloc, indexes_json);
         errdefer freeMediaFields(alloc, fields);
         const digest = try fingerprint(alloc, policy, indexes_json);
-        return .{ .alloc = alloc, .policy = policy, .prepared_catalog = digest, .media_fields = fields, .chunked_sources = try full_text_indexes.listChunkedFullTextSourcesAlloc(alloc, indexes_json) };
+        var named = named_enrichments.parseAlloc(alloc, indexes_json) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => named_enrichments.Declarations{},
+        };
+        errdefer named.deinit(alloc);
+        return .{ .alloc = alloc, .policy = policy, .prepared_catalog = digest, .media_fields = fields, .named = named, .chunked_sources = try full_text_indexes.listChunkedFullTextSourcesAlloc(alloc, indexes_json) };
     }
     pub fn deinit(self: *Context) void {
+        self.named.deinit(self.alloc);
         freeMediaFields(self.alloc, self.media_fields);
         full_text_indexes.freeChunkedFullTextSources(self.alloc, self.chunked_sources);
         self.* = undefined;
@@ -223,6 +234,7 @@ pub const Context = struct {
         } else false;
         const has_chunk_source = projection.chunk_embeddings_pending or projection.chunk_embeddings_terminal or projection.model_media_source_present or (if (projection.chunk_preview) |chunks| chunks.len > 0 else has_text);
         return .{
+            .named_pending = try named_outputs.needsGeneration(self.alloc, self.named, doc.body),
             .body_has_dependencies = projection.has_media_checkpoint,
             .present = @as(u3, @intFromBool(has_chunk_preview)) |
                 (@as(u3, @intFromBool(projection.chunk_embeddings != null)) << 1) |
@@ -301,6 +313,8 @@ pub fn publishAlloc(
     var source = if (rebuild) facts.Root{ .domain = pages.domain, .policy_fingerprint = policy_hash } else previous.?;
     source.packed_records = source.packed_records or (pages.artifacts.point_read_blocks and pages.artifacts.canonical_point_bodies);
     source.inline_leaf_format = source.inline_leaf_format or (source.packed_records and pages.artifacts.inline_fact_leaves);
+    // Tables with named enrichments index their pending outputs (#1791).
+    if (rebuild) source.named_format = context.named.configs.len != 0;
     var cache = tree.Cache{ .alloc = alloc, .underlying = pages.store() };
     defer cache.deinit();
     var pending = PendingBodies{ .alloc = alloc, .pages = pages };
@@ -360,7 +374,7 @@ fn makeFact(alloc: Allocator, pages: *page_store.PageStore, store: tree.Store, p
     const audit_json = if (doc.stored_body == null and !flags.body_has_dependencies) try @import("../enrichment/media_audit.zig").buildAlloc(alloc, doc.body) else null;
     defer if (audit_json) |json| alloc.free(json);
     const audit = if (audit_json) |json| try facts.putBody(alloc, pages, json) else null;
-    return .{ .canonical_body = canonical, .inline_payload = if (canonical or (pages.artifacts.inline_point_bodies and eligible and (if (body.pack) |pack| pack.leaf_records == 0 else true))) physical else null, .body = body, .media_audit = audit, .source_input_bytes = doc.source_input_bytes, .body_has_dependencies = doc.stored_body != null or flags.body_has_dependencies, .last_lsn = doc.last_lsn, .last_timestamp_ns = doc.last_timestamp_ns, .present = flags.present, .pending = flags.pending };
+    return .{ .canonical_body = canonical, .inline_payload = if (canonical or (pages.artifacts.inline_point_bodies and eligible and (if (body.pack) |pack| pack.leaf_records == 0 else true))) physical else null, .body = body, .media_audit = audit, .source_input_bytes = doc.source_input_bytes, .body_has_dependencies = doc.stored_body != null or flags.body_has_dependencies, .last_lsn = doc.last_lsn, .last_timestamp_ns = doc.last_timestamp_ns, .present = flags.present, .pending = flags.pending, .named_pending = flags.named_pending };
 }
 
 fn findDocument(docs: []const materializer.Document, id: []const u8) ?materializer.Document {

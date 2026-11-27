@@ -82,6 +82,10 @@ pub const Fact = struct {
     present: u3 = 0,
     /// lexical_sparse, chunk_preview, chunk_embeddings, rerank_terms.
     pending: u4 = 0,
+    /// Named enrichment outputs (#1791) still need generating. Stored as
+    /// bit 4 of the pending byte; only roots with the named extension index
+    /// it (`Root.named_format`).
+    named_pending: bool = false,
 
     pub const encoded_bytes = 144;
     pub fn encode(self: Fact) [encoded_bytes]u8 {
@@ -94,7 +98,7 @@ pub const Fact = struct {
         std.mem.writeInt(u64, bytes[56..64], self.last_lsn, .little);
         std.mem.writeInt(u64, bytes[64..72], self.last_timestamp_ns, .little);
         bytes[72] = self.present;
-        bytes[73] = self.pending;
+        bytes[73] = @as(u8, self.pending) | (@as(u8, @intFromBool(self.named_pending)) << 4);
         bytes[74] = @intFromBool(self.body_has_dependencies);
         if (self.media_audit) |audit| {
             bytes[75] = 1;
@@ -199,7 +203,7 @@ pub const Fact = struct {
     fn decodeBase(bytes: []const u8, leaf: bool) !Fact {
         const legacy_pack = bytes.len == 120;
         if (bytes.len != 80 and bytes.len != 120 and bytes.len != 136 and bytes.len != 144 and bytes.len != 184) return error.InvalidDocumentFact;
-        if (bytes[72] > 7 or bytes[73] > 15) return error.InvalidDocumentFact;
+        if (bytes[72] > 7 or bytes[73] > 31) return error.InvalidDocumentFact;
         const has_pack = legacy_pack or bytes.len == 184;
         if (legacy_pack) {
             if (bytes[74] != 1 or !std.mem.allEqual(u8, bytes[75..80], 0)) return error.InvalidDocumentFact;
@@ -222,7 +226,8 @@ pub const Fact = struct {
             .last_lsn = std.mem.readInt(u64, bytes[56..64], .little),
             .last_timestamp_ns = std.mem.readInt(u64, bytes[64..72], .little),
             .present = @intCast(bytes[72]),
-            .pending = @intCast(bytes[73]),
+            .pending = @intCast(bytes[73] & 15),
+            .named_pending = bytes[73] & 16 != 0,
         };
     }
     fn bits(self: Fact) u7 {
@@ -293,15 +298,26 @@ pub const Root = struct {
     document_count: u64 = 0,
     /// Presence counters followed by pending counters, in Fact bit order.
     counts: [7]u64 = @splat(0),
+    /// Named enrichment extension (#1791): documents whose named outputs
+    /// still need generating, ordered like the stage pending pages. Encoded
+    /// as `named_extension_bytes` after the base header, so roots of tables
+    /// without named enrichments keep their exact bytes.
+    named_format: bool = false,
+    named_pending_page: ?tree.Ref = null,
+    named_pending_count: u64 = 0,
+
+    pub const named_extension_bytes = 120;
 
     pub const encoded_bytes = 576;
     pub const packed_header_bytes = 832;
-    pub const max_encoded_bytes = packed_header_bytes + 4096;
+    pub const max_encoded_bytes = packed_header_bytes + named_extension_bytes + 4096;
     pub const metadata_version = 12;
     pub const packed_metadata_version = 13;
     pub const inline_leaf_metadata_version = 14;
     pub fn eql(a: Root, b: Root) bool {
         if (!std.mem.eql(u8, &a.encode(), &b.encode())) return false;
+        if (a.named_format != b.named_format or !std.mem.eql(u8, &a.encodeNamedExtension(), &b.encodeNamedExtension())) return false;
+        if (!std.meta.eql(a.named_pending_page, b.named_pending_page)) return false;
         const left = [_]?tree.Ref{a.page} ++ a.pending_pages ++ [_]?tree.Ref{a.audit_page};
         const right = [_]?tree.Ref{b.page} ++ b.pending_pages ++ [_]?tree.Ref{b.audit_page};
         for (left, right) |l, r| if (!std.meta.eql(l, r)) return false;
@@ -327,6 +343,56 @@ pub const Root = struct {
         };
         return out;
     }
+    pub fn encodeNamedExtension(self: Root) [named_extension_bytes]u8 {
+        var out: [named_extension_bytes]u8 = @splat(0);
+        if (!self.named_format) return out;
+        std.mem.writeInt(u64, out[8..16], self.named_pending_count, .little);
+        if (self.named_pending_page) |page| {
+            out[0] = 1;
+            @memcpy(out[16..48], &page.digest);
+            @memcpy(out[48..64], &page.attempt);
+            std.mem.writeInt(u32, out[64..68], page.bytes, .little);
+            out[68] = page.height;
+            std.mem.writeInt(u64, out[72..80], page.records, .little);
+            if (page.pack) |location| {
+                @memcpy(out[80..112], &location.digest);
+                std.mem.writeInt(u32, out[112..116], location.bytes, .little);
+                std.mem.writeInt(u32, out[116..120], location.offset, .little);
+            }
+        }
+        return out;
+    }
+
+    fn decodeNamedExtension(root: *Root, bytes: []const u8) !void {
+        if (bytes.len != named_extension_bytes or bytes[0] > 1 or !std.mem.allEqual(u8, bytes[1..8], 0)) return error.InvalidDocumentFactsRoot;
+        root.named_format = true;
+        root.named_pending_count = std.mem.readInt(u64, bytes[8..16], .little);
+        if (root.named_pending_count > root.document_count) return error.InvalidDocumentFactsRoot;
+        if (bytes[0] == 0) {
+            if (root.named_pending_count != 0 or !std.mem.allEqual(u8, bytes[16..], 0)) return error.InvalidDocumentFactsRoot;
+            return;
+        }
+        if (!std.mem.allEqual(u8, bytes[69..72], 0)) return error.InvalidDocumentFactsRoot;
+        var page: tree.Ref = .{
+            .digest = bytes[16..48].*,
+            .attempt = bytes[48..64].*,
+            .bytes = std.mem.readInt(u32, bytes[64..68], .little),
+            .height = bytes[68],
+            .records = std.mem.readInt(u64, bytes[72..80], .little),
+        };
+        if (!std.mem.allEqual(u8, bytes[80..120], 0)) page.pack = .{ .digest = bytes[80..112].*, .bytes = std.mem.readInt(u32, bytes[112..116], .little), .offset = std.mem.readInt(u32, bytes[116..120], .little) };
+        try page.validate();
+        if (page.records != root.named_pending_count) return error.InvalidDocumentFactsRoot;
+        root.named_pending_page = page;
+    }
+
+    /// Base header, named extension (when present), then directory.
+    pub fn headerBytes(self: Root) usize {
+        const base: usize = if (self.packed_records) packed_header_bytes else encoded_bytes;
+        const extension: usize = if (self.named_format) named_extension_bytes else 0;
+        return base + extension;
+    }
+
     pub fn encodePackedHeader(self: Root) [packed_header_bytes]u8 {
         var out: [packed_header_bytes]u8 = @splat(0);
         @memcpy(out[0..encoded_bytes], &self.encode());
@@ -347,7 +413,10 @@ pub const Root = struct {
         const legacy = bytes.len == 512 and (std.mem.eql(u8, bytes[0..8], "AFDFACT3") or std.mem.eql(u8, bytes[0..8], "AFDFACT4"));
         if (!legacy and (bytes.len < header_size or bytes.len > max_encoded_bytes or (!std.mem.eql(u8, bytes[0..8], "AFDFACT4") and !std.mem.eql(u8, bytes[0..8], "AFDFACT5") and !std.mem.eql(u8, bytes[0..8], "AFDFACT6") and !std.mem.eql(u8, bytes[0..8], "AFDFACT7") and !std.mem.eql(u8, bytes[0..8], "AFDFACT8") and !std.mem.eql(u8, bytes[0..8], "AFDFACT9") and !std.mem.eql(u8, bytes[0..8], "AFDFACTA") and !std.mem.eql(u8, bytes[0..8], "AFDFACTB") and !std.mem.eql(u8, bytes[0..8], "AFDFACTC") and !std.mem.eql(u8, bytes[0..8], "AFDFACTD") and !leaf_format))) return error.InvalidDocumentFactsRoot;
         const directory_len: usize = if (packed_format) std.mem.readInt(u32, bytes[816..820], .little) else 0;
-        if (!legacy and (directory_len > 4096 or bytes.len != header_size + directory_len)) return error.InvalidDocumentFactsRoot;
+        // A named extension follows the base header (unambiguous: unpacked
+        // headers have exact sizes and packed ones record their directory).
+        const named = !legacy and bytes.len == header_size + named_extension_bytes + directory_len;
+        if (!legacy and (directory_len > 4096 or (bytes.len != header_size + directory_len and !named))) return error.InvalidDocumentFactsRoot;
         if (bytes[8] > (if (legacy) @as(u8, 31) else 63) or !std.mem.allEqual(u8, bytes[9..16], 0) or
             !std.mem.allEqual(u8, bytes[if (legacy) @as(usize, 472) else @as(usize, 536)..if (legacy) @as(usize, 512) else encoded_bytes], 0)) return error.InvalidDocumentFactsRoot;
         if (packed_format and !std.mem.allEqual(u8, bytes[820..packed_header_bytes], 0)) return error.InvalidDocumentFactsRoot;
@@ -388,11 +457,13 @@ pub const Root = struct {
             if (page.records != count) return error.InvalidDocumentFactsRoot;
             if (i == 0) root.page = page else if (i == 5) root.audit_page = page else root.pending_pages[i - 1] = page;
         }
+        if (named) try root.decodeNamedExtension(bytes[header_size..][0..named_extension_bytes]);
+        const directory_start = header_size + (if (named) named_extension_bytes else @as(usize, 0));
         if (directory_len != 0) {
             const page = root.page orelse return error.InvalidDocumentFactsRoot;
             if ((!leaf_format and page.height == 0) or page.bytes != directory_len) return error.InvalidDocumentFactsRoot;
             var digest: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(bytes[header_size..], &digest, .{});
+            std.crypto.hash.sha2.Sha256.hash(bytes[directory_start..], &digest, .{});
             if (!std.mem.eql(u8, &digest, &page.digest)) return error.ArtifactIntegrityMismatch;
             root.directory_len = @intCast(directory_len);
         }
@@ -416,6 +487,8 @@ pub fn lookup(alloc: Allocator, store: tree.Store, root: Root, id: []const u8) !
 pub const PendingCursor = struct {
     cursor: tree.Cursor,
     stage_bit: u4,
+    /// Walks the named-enrichment pending index instead of a stage's.
+    named: bool = false,
     wal_end_lsn: u64,
     root: Root,
     scratch: ?[]u8 = null,
@@ -431,7 +504,7 @@ pub const PendingCursor = struct {
         self.scratch = null;
         const record = (try self.cursor.next()) orelse return null;
         const fact = try Fact.decode(record.value);
-        if ((self.stage_bit != 0 and fact.pending & self.stage_bit == 0) or fact.last_lsn > self.wal_end_lsn or
+        if ((self.stage_bit != 0 and fact.pending & self.stage_bit == 0) or (self.named and !fact.named_pending) or fact.last_lsn > self.wal_end_lsn or
             record.key.len <= 8 or record.key.len > max_pending_key_bytes or
             std.mem.readInt(u64, record.key[0..8], .big) != fact.last_lsn) return error.InvalidDocumentFact;
         if (fact.canonical_body) {
@@ -451,6 +524,21 @@ pub fn pendingCursor(alloc: Allocator, store: tree.Store, root: Root, stage_inde
     return .{
         .cursor = try tree.Cursor.init(alloc, store, page, lower, null),
         .stage_bit = @as(u4, 1) << @intCast(stage_index),
+        .wal_end_lsn = root.wal_end_lsn,
+        .root = root,
+    };
+}
+
+/// Documents whose named enrichment outputs still need generating, in
+/// (WAL LSN, document ID) order from `lower`.
+pub fn namedPendingCursor(alloc: Allocator, store: tree.Store, root: Root, lower: []const u8) !PendingCursor {
+    if (!root.named_format) return error.InvalidEnrichmentStage;
+    if (!std.mem.eql(u8, &root.domain, &store.domain)) return error.GraphPageDomainMismatch;
+    if ((if (root.named_pending_page) |ref| ref.records else @as(u64, 0)) != root.named_pending_count) return error.InvalidDocumentFactsRoot;
+    return .{
+        .cursor = try tree.Cursor.init(alloc, store, root.named_pending_page, lower, null),
+        .stage_bit = 0,
+        .named = true,
         .wal_end_lsn = root.wal_end_lsn,
         .root = root,
     };
@@ -486,12 +574,16 @@ pub const Plan = struct {
     changes: []tree.Mutation,
     /// Own ordering keys; values borrow the corresponding primary changes.
     pending_changes: [5][]tree.Mutation,
+    /// Named-enrichment pending index changes (`Root.named_pending_page`).
+    named_changes: []tree.Mutation = &.{},
 
     pub fn deinit(self: *Plan) void {
         for (self.pending_changes) |changes| {
             for (changes) |change| self.alloc.free(change.key);
             self.alloc.free(changes);
         }
+        for (self.named_changes) |change| self.alloc.free(change.key);
+        if (self.named_changes.len != 0) self.alloc.free(self.named_changes);
         for (self.changes) |change| {
             self.alloc.free(change.key);
             if (change.value) |value| self.alloc.free(value);
@@ -525,12 +617,15 @@ pub const Plan = struct {
             if (std.meta.eql(current.audit_page, current.pending_pages[i]) and sameChanges(self.pending_changes[4], self.pending_changes[i])) break i;
         } else null;
         next.audit_page = if (shared_audit) |i| next.pending_pages[i] else try applyIndex(self.alloc, batched, current.audit_page, self.pending_changes[4]);
+        if (next.named_format) next.named_pending_page = try applyIndex(self.alloc, batched, current.named_pending_page, self.named_changes);
         if (next.packed_records) _ = try Root.decode(&next.encodePackedHeader()) else _ = try Root.decode(&next.encode());
-        var roots = [_]?tree.Ref{next.page} ++ next.pending_pages ++ [_]?tree.Ref{next.audit_page};
+        if ((if (next.named_pending_page) |ref| ref.records else @as(u64, 0)) != next.named_pending_count) return error.InvalidDocumentFactsRoot;
+        var roots = [_]?tree.Ref{next.page} ++ next.pending_pages ++ [_]?tree.Ref{ next.audit_page, next.named_pending_page };
         try writes.finish(&roots);
         next.page = roots[0];
         @memcpy(&next.pending_pages, roots[1..5]);
         next.audit_page = roots[5];
+        next.named_pending_page = roots[6];
         return next;
     }
 };
@@ -586,6 +681,11 @@ pub fn planAlloc(alloc: Allocator, store: tree.Store, source: Root, replacements
         for (items.items) |change| alloc.free(change.key);
         items.deinit(alloc);
     };
+    var named = std.ArrayListUnmanaged(tree.Mutation).empty;
+    defer {
+        for (named.items) |change| alloc.free(change.key);
+        named.deinit(alloc);
+    }
     next.wal_end_lsn = next_wal_lsn;
     var seen = std.StringHashMapUnmanaged(void).empty;
     defer seen.deinit(alloc);
@@ -602,6 +702,10 @@ pub fn planAlloc(alloc: Allocator, store: tree.Store, source: Root, replacements
                 if (count.* == 0) return error.InvalidDocumentFactsRoot;
                 count.* -= 1;
             };
+            if (fact.named_pending) {
+                if (next.named_pending_count == 0) return error.InvalidDocumentFactsRoot;
+                next.named_pending_count -= 1;
+            }
         }
         if (replacement.value) |fact| {
             next.inline_records = next.inline_records or fact.inline_payload != null;
@@ -611,6 +715,11 @@ pub fn planAlloc(alloc: Allocator, store: tree.Store, source: Root, replacements
             for (&next.counts, 0..) |*count, i| if (fact.bits() & (@as(u7, 1) << @intCast(i)) != 0) {
                 count.* += 1;
             };
+            if (fact.named_pending) {
+                // Only a root with the named extension indexes it.
+                if (!next.named_format) return error.InvalidDocumentFact;
+                next.named_pending_count += 1;
+            }
         }
         const value = value: {
             const key = try alloc.dupe(u8, replacement.id);
@@ -634,6 +743,14 @@ pub fn planAlloc(alloc: Allocator, store: tree.Store, source: Root, replacements
             if (is_pending)
                 try appendPendingChange(alloc, items, replacement.value.?.last_lsn, replacement.id, if (value) |bytes| indexValue(bytes) else null);
         }
+        {
+            const was_pending = if (prior) |fact| fact.named_pending else false;
+            const is_pending = if (replacement.value) |fact| fact.named_pending else false;
+            if (was_pending and (!is_pending or prior.?.last_lsn != replacement.value.?.last_lsn))
+                try appendPendingChange(alloc, &named, prior.?.last_lsn, replacement.id, null);
+            if (is_pending)
+                try appendPendingChange(alloc, &named, replacement.value.?.last_lsn, replacement.id, if (value) |bytes| indexValue(bytes) else null);
+        }
     }
     std.mem.sort(tree.Mutation, changes.items, {}, struct {
         fn less(_: void, a: tree.Mutation, b: tree.Mutation) bool {
@@ -645,13 +762,23 @@ pub fn planAlloc(alloc: Allocator, store: tree.Store, source: Root, replacements
             return std.mem.order(u8, a.key, b.key) == .lt;
         }
     }.less);
+    std.mem.sort(tree.Mutation, named.items, {}, struct {
+        fn less(_: void, a: tree.Mutation, b: tree.Mutation) bool {
+            return std.mem.order(u8, a.key, b.key) == .lt;
+        }
+    }.less);
     var pending_changes: [5][]tree.Mutation = @splat(&.{});
     errdefer for (pending_changes) |items| {
         for (items) |change| alloc.free(change.key);
         alloc.free(items);
     };
     for (&pending_changes, &pending) |*owned, *items| owned.* = try items.toOwnedSlice(alloc);
-    return .{ .alloc = alloc, .source = source, .next = next, .changes = try changes.toOwnedSlice(alloc), .pending_changes = pending_changes };
+    const named_changes = try named.toOwnedSlice(alloc);
+    errdefer {
+        for (named_changes) |change| alloc.free(change.key);
+        alloc.free(named_changes);
+    }
+    return .{ .alloc = alloc, .source = source, .next = next, .changes = try changes.toOwnedSlice(alloc), .pending_changes = pending_changes, .named_changes = named_changes };
 }
 
 fn appendPendingChange(alloc: Allocator, changes: *std.ArrayListUnmanaged(tree.Mutation), lsn: u64, id: []const u8, value: ?[]const u8) !void {
@@ -980,7 +1107,8 @@ pub fn readStoredBodyAlloc(alloc: Allocator, pages: *page_store.PageStore, ref: 
 /// Validate immutable identity and format without fetching the root body.
 /// An overlay-only lookup may skip base I/O, never its declared source checks.
 pub fn validateRootSource(source: refs.ArtifactRef) !artifacts.UploadScope {
-    if (source.kind != .document_facts or !(((source.metadata_version == Root.packed_metadata_version or source.metadata_version == Root.inline_leaf_metadata_version) and source.byte_len >= Root.packed_header_bytes and source.byte_len <= Root.max_encoded_bytes) or ((source.metadata_version == 3 or source.metadata_version == 4) and source.byte_len == 512) or ((source.metadata_version == 4 or source.metadata_version == 5 or source.metadata_version == 6 or source.metadata_version == 7 or source.metadata_version == 8 or source.metadata_version == 9 or (source.metadata_version == 10 or source.metadata_version == 11 or source.metadata_version == Root.metadata_version)) and source.byte_len == Root.encoded_bytes)))
+    if (source.kind != .document_facts or !(((source.metadata_version == Root.packed_metadata_version or source.metadata_version == Root.inline_leaf_metadata_version) and source.byte_len >= Root.packed_header_bytes and source.byte_len <= Root.max_encoded_bytes) or ((source.metadata_version == 3 or source.metadata_version == 4) and source.byte_len == 512) or ((source.metadata_version == 4 or source.metadata_version == 5 or source.metadata_version == 6 or source.metadata_version == 7 or source.metadata_version == 8 or source.metadata_version == 9 or (source.metadata_version == 10 or source.metadata_version == 11 or source.metadata_version == Root.metadata_version)) and source.byte_len == Root.encoded_bytes) or
+        ((source.metadata_version == 10 or source.metadata_version == 11 or source.metadata_version == Root.metadata_version) and source.byte_len == Root.encoded_bytes + Root.named_extension_bytes)))
         return error.InvalidDocumentFactsRoot;
     try artifacts.validateSha256ArtifactIdentity(source.artifact_id, source.checksum);
     return (try artifacts.uploadScopeFromArtifactId(source.artifact_id)) orelse return error.InvalidDocumentFactsRoot;
@@ -1021,7 +1149,7 @@ pub fn loadRoot(alloc: Allocator, pages: *page_store.PageStore, source: refs.Art
         pages.inline_page = null;
         if (root.directory_len != 0) {
             const owner = cache.allocator orelse alloc;
-            const directory = try owner.dupe(u8, bytes[Root.packed_header_bytes..]);
+            const directory = try owner.dupe(u8, bytes[root.headerBytes()..]);
             cache.directory = .{ .allocator = owner, .bytes = directory };
             pages.inline_page = .{ .ref = root.page.?, .bytes = directory };
         }
@@ -1039,10 +1167,12 @@ pub fn publishRoot(alloc: Allocator, pages: *page_store.PageStore, root: Root) !
         directory = try tree.readPage(alloc, pages.store(), ref);
         published.directory_len = @intCast(directory.?.bytes.len);
     };
-    const header_size: usize = if (published.packed_records) Root.packed_header_bytes else Root.encoded_bytes;
+    const base_size: usize = if (published.packed_records) Root.packed_header_bytes else Root.encoded_bytes;
+    const header_size = published.headerBytes();
     const bytes = try alloc.alloc(u8, header_size + published.directory_len);
     defer alloc.free(bytes);
-    if (published.packed_records) @memcpy(bytes[0..header_size], &published.encodePackedHeader()) else @memcpy(bytes[0..header_size], &published.encode());
+    if (published.packed_records) @memcpy(bytes[0..base_size], &published.encodePackedHeader()) else @memcpy(bytes[0..base_size], &published.encode());
+    if (published.named_format) @memcpy(bytes[base_size..header_size], &published.encodeNamedExtension());
     if (directory) |page| @memcpy(bytes[header_size..], page.bytes);
     _ = try Root.decode(bytes);
     const body = try putEncoded(pages, bytes);
@@ -1057,7 +1187,7 @@ pub fn retainRoot(alloc: Allocator, pages: *page_store.PageStore, source: refs.A
     const root = try loadRoot(alloc, pages, source);
     var visitor = Reachability{ .alloc = alloc, .pages = pages, .retained = retained };
     if (root.page) |page| try tree.walkPostOrder(alloc, pages.store(), page, &visitor, false);
-    for (root.pending_pages ++ [_]?tree.Ref{root.audit_page}) |maybe_page| if (maybe_page) |page| try tree.walkPostOrder(alloc, pages.store(), page, &visitor, false);
+    for (root.pending_pages ++ [_]?tree.Ref{ root.audit_page, root.named_pending_page }) |maybe_page| if (maybe_page) |page| try tree.walkPostOrder(alloc, pages.store(), page, &visitor, false);
     try visitor.mark(source.artifact_id);
 }
 
@@ -1069,7 +1199,7 @@ pub fn reclaimRoot(alloc: Allocator, pages: *page_store.PageStore, source: refs.
     };
     var visitor = Reachability{ .alloc = alloc, .pages = pages, .retained = @constCast(retained), .reclaim = true };
     if (root.page) |page| try tree.walkPostOrder(alloc, pages.store(), page, &visitor, true);
-    for (root.pending_pages ++ [_]?tree.Ref{root.audit_page}) |maybe_page| if (maybe_page) |page| try tree.walkPostOrder(alloc, pages.store(), page, &visitor, true);
+    for (root.pending_pages ++ [_]?tree.Ref{ root.audit_page, root.named_pending_page }) |maybe_page| if (maybe_page) |page| try tree.walkPostOrder(alloc, pages.store(), page, &visitor, true);
     try visitor.mark(source.artifact_id);
     return visitor.deleted;
 }
@@ -1136,6 +1266,42 @@ const Reachability = struct {
         try self.mark(&try page_store.PageStore.identity(self.pages.domain, ref));
     }
 };
+
+test "serverless document facts index named enrichment pending documents in an extension" {
+    const a = std.testing.allocator;
+    var memory = tree.testing.MemoryStore{ .alloc = a };
+    defer memory.deinit();
+    const store = memory.store();
+    var empty = Root{ .domain = store.domain, .policy_fingerprint = @splat(1) };
+    const plain = Fact{ .body = .{ .digest = @splat(3), .attempt = @splat(1), .bytes = 12 }, .last_lsn = 1, .last_timestamp_ns = 10 };
+    var named = plain;
+    named.named_pending = true;
+    // Without the extension, no named-pending fact can be indexed.
+    try std.testing.expectError(error.InvalidDocumentFact, planAlloc(a, store, empty, &.{.{ .id = "a", .value = named }}, 1));
+    empty.named_format = true;
+    var first = try planAlloc(a, store, empty, &.{ .{ .id = "a", .value = named }, .{ .id = "b", .value = plain } }, 1);
+    defer first.deinit();
+    const root = try first.publish(store, empty);
+    try std.testing.expectEqual(@as(u64, 1), root.named_pending_count);
+    try std.testing.expectEqual([7]u64{ 0, 0, 0, 0, 0, 0, 0 }, root.counts);
+    // Base header plus extension round trips; base bytes are unchanged.
+    var bytes: [Root.encoded_bytes + Root.named_extension_bytes]u8 = undefined;
+    @memcpy(bytes[0..Root.encoded_bytes], &root.encode());
+    @memcpy(bytes[Root.encoded_bytes..], &root.encodeNamedExtension());
+    const decoded = try Root.decode(&bytes);
+    try std.testing.expect(root.eql(decoded));
+    try std.testing.expect(!(try Root.decode(&root.encode())).named_format);
+    var cursor = try namedPendingCursor(a, store, root, "");
+    defer cursor.deinit();
+    try std.testing.expectEqualStrings("a", (try cursor.next()).?.key);
+    try std.testing.expect((try cursor.next()) == null);
+    // Generating the outputs clears the document from the index.
+    var second = try planAlloc(a, store, root, &.{.{ .id = "a", .value = plain }}, 2);
+    defer second.deinit();
+    const next = try second.publish(store, root);
+    try std.testing.expectEqual(@as(u64, 0), next.named_pending_count);
+    try std.testing.expectEqual(@as(?tree.Ref, null), next.named_pending_page);
+}
 
 test "serverless document facts update only touched paths and maintain exact source-fenced counters" {
     const a = std.testing.allocator;
