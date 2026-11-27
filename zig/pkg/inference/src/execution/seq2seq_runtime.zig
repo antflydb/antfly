@@ -252,6 +252,7 @@ pub const State = struct {
 
     pub fn stepResidentSelecting(self: *State, suffix: Suffix, control: ?Control, dispatch: ?tensor_dispatch.Dispatch, policy: ?stages.FinalTokenPolicy) !stages.VocabularyResult {
         const end = try suffix.endAt(self.position);
+        try stages.preflightVocabularyReadback(self.session);
         const fresh = self.position == 0;
         if (self.resident_slots == null) {
             const slots = try self.allocator.alloc(?ResidentSlot, try std.math.mul(usize, 2, self.roles.len));

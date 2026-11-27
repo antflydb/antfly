@@ -406,8 +406,18 @@ pub fn finalVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Sessio
     return (try finalVocabularyResult(allocator, decoder, inputs, query_rows, vocab, control, dispatch, null)).row;
 }
 
+/// A GPU vocabulary result always crosses the host boundary as a token or
+/// row. Reject forbidden transfers before launching the decoder stage.
+pub fn preflightVocabularyReadback(decoder: backends.Session) !void {
+    switch (decoder.backend()) {
+        .cuda, .metal => try @import("transfer_audit.zig").checkDeviceHostAccess(),
+        else => {},
+    }
+}
+
 pub fn finalVocabularyResult(allocator: std.mem.Allocator, decoder: backends.Session, inputs: []const session_mod.StageInput, query_rows: usize, vocab: usize, control: ?Control, dispatch: ?@import("tensor_dispatch.zig").Dispatch, token_policy: ?FinalTokenPolicy) !VocabularyResult {
     if (query_rows == 0 or vocab == 0) return error.InvalidInputShape;
+    try preflightVocabularyReadback(decoder);
     var outputs = try @import("tensor_dispatch.zig").runStage(allocator, decoder, inputs, control, dispatch);
     defer outputs.deinit();
     if (outputs.outputs.len != 1) return error.InvalidDecoderOutput;
