@@ -1368,6 +1368,7 @@ Subsequent scoped qualification covers these production paths:
 | `6b41849019` | Spark GB10 CUDA HTTP vs issue baseline `9e4af7f847` | AA/AB/BB recorded 16 warm samples per side per supported workload. All ten shared workloads matched exactly. GLiNER p50 improved 13.34 → 10.88 ms and LightOnOCR 333.27 → 320.37 ms. Whisper, Qwen3 and all four E4B modalities stayed within 1.3% at p50. CUDA DECIDE passed on the candidate, while the baseline returned unsupported. EG2 text p50 rose 8.49 → 8.99 ms in the mixed matrix. The isolated 40-sample repeat matched outputs and measured p50 8.59 → 8.54 ms and p95 9.75 → 9.35 ms, with p50 control spreads of 1.7% and 4.1%. | Shared-GPU results against the issue baseline. Latest merged-main, external-engine comparisons and wide graph replay remain open. |
 | `7c7c2e1a84` | Spark GB10 CUDA, full and tail packet fixture and 4B serving | All 28 focused checks passed with zero skips. The checked-in fixture captured a 64-row packet plus a three-row tail using shared attention scratch, then matched changed inputs on both replays. Released 4B served all 256 invoice pages with exact serial parity, reached 98-row pure decode, and recorded five graph replays at a maximum of 61 rows. | The wide serving gate failed. The reset trace showed no retained graph at 98-row claims. Graph lifetime attribution and comparative performance remain open. |
 | `86024134de` | M4 Max Metal, released LightOnOCR 0.8B HTTP | All seven focused checks passed with zero skips. The warm singleton and the two-page HTTP batch returned identical text. The batch executed 21 batched decode steps. | Comparative performance and physical CUDA validation of the new KV preflight check. |
+| `b2317f8e23` | Spark GB10 CUDA, repeated released LightOnOCR 4B wide serving run | All 28 focused checks passed. All 256 pages matched the serial reference at 7.43 pages/s. The 97-row graph requested 102,755,512 bytes of scratch with 25,718,976,604 bytes already reserved against a 25,769,803,776-byte GPU domain limit. | The largest replay was 61 rows. A shared or smaller physical workspace is required to qualify replay above 64 rows under this limit. |
 | `8efe2c1cb3` | Spark GB10 CUDA, released LightOnOCR 4B with four concurrent 64-page requests | All 28 focused checks passed with zero skips. The serving run completed 256 pages with exact serial parity at 7.47 pages/s. The epoch reserved 2,815,361,024 bytes of shared decoder scratch. Graph storage for 97–98 rows hit the GPU domain scratch limit after optional cache reclamation. | Five replays completed at a maximum of 61 rows. Physical serving replay above 64 rows and comparative throughput remain open. |
 | `defbd61b8f` | Spark GB10 CUDA, page-capacity bounds and assigned attention output | All 27 focused checks passed with zero skips. The 1,025-token batch matched independent paged attention and verified direct destination parity and alias rejection before KV writes. The released 0.8B HTTP fixture replayed two rows with a 44-byte pinned receipt. Direct driver validation of the checked-in PTX captured 64 rows and a three-row tail with reused scratch, then matched all outputs on two replays with changed inputs. | The direct driver result covers the CUDA packets. Actual serving replay above 64 rows, comparative performance and the complete composite declaration remain open. |
 | `21c14d7bf4` | Spark GB10 CUDA, stable paged-attention backing and released LightOnOCR 0.8B | All 26 focused checks passed with zero skips. The HTTP fixture replayed two rows with 297,216 bytes of admitted attention scratch and a 44-byte pinned receipt. A separate prefill-first run admitted a 128-page window across two requests, completed all 128 pages with exact serial parity, and replayed at most three rows. | The wide replay gate failed. Physical replay above 64 rows, comparative performance and the complete composite declaration remain open. |
@@ -1947,6 +1948,32 @@ snapshots. The receipt SHA-256 is
 | Gemma 4 E4B video | 254.08 / 255.16 | 252.89 / 254.48 |
 
 Text embedding p50 rose 4.62% in A/B. The magnitude of the A/A and B/B
-p50 differences was 0.49% and 1.38%, respectively. Isolated attribution
-against the same two binaries is pending. This receipt covers the
-specified revisions and does not qualify the later PR head.
+p50 differences was 0.49% and 1.38%, respectively. An isolated repeat
+with the same binaries matched exactly at 40 warm samples per side per
+phase. A/B p50/p95 moved from 8.75/9.41 to 8.45/9.46 ms. With stage
+timing enabled in a separate matched run, the encoder through final host
+vector measured 5.874/5.901 ms (main/candidate p50) and pipeline p50 was
+6.589/6.640 ms. The mixed-workload p50 slowdown did not reproduce in
+isolation. These receipts qualify only the specified revisions.
+
+Local CPU and isolated Metal HTTP comparisons used issue baseline
+`9e4af7f847` and candidate `1e3d12f1f7`. The CPU comparison matched 10
+workloads in all sampled arms. The grouped-audio workload failed exact
+comparison between repeats of the frozen baseline. Candidate witnesses
+agreed across inspected processes and differed from the baseline reference
+by at most 1.79e-7 per coordinate. The isolated pinned-DFT and candidate
+FFT controls distinguish baseline drift from cross-route differences.
+CPU receipt SHA-256 is
+`c1e5372762655973cdbfb6d3da119856295038219474792e82c96b1bb31cc840`.
+
+The isolated E4B Metal comparison matched all four modality outputs
+with no failures. The mixed-model Metal capacity failure remains a
+separate gate. The isolated Metal receipt SHA-256 is
+`3380cf834c05b327b0002cfb16be68c6b4c4a6ea47a628d04c98b3936407222d`.
+
+| E4B workload | CPU baseline → candidate p50 (ms) | Metal baseline → candidate p50 (ms) |
+| --- | ---: | ---: |
+| Text | 7,955.46 → 3,058.61 | 448.94 → 452.40 |
+| Image | 5,515.11 → 3,661.21 | 1,093.06 → 740.56 |
+| Audio | 1,274.82 → 959.71 | 290.87 → 288.99 |
+| Video | 5,163.63 → 3,026.77 | 1,042.13 → 706.56 |

@@ -2799,16 +2799,13 @@ pub fn prepareEmbeddingGemma2AudioForBackendBounded(a: std.mem.Allocator, bytes:
     const cfg = embeddingGemma2AudioConfig();
     return prepareAudioCpuBounded(a, bytes, options, cfg.mel_bins, cfg.reject_audio_truncation, true, cfg.max_audio_samples, max_decode_working_bytes, true);
 }
-pub fn prepareEmbeddingGemma2AudioWithPacking(allocator: std.mem.Allocator, bytes: []const u8, options: audio.DecodeOptions, pack_device: bool) !PreparedAudio {
-    return prepareEmbeddingGemma2AudioWithPackingBounded(allocator, bytes, options, pack_device, audio.default_decode_working_bytes);
+pub fn prepareEmbeddingGemma2AudioWithPacking(allocator: std.mem.Allocator, bytes: []const u8, options: audio.DecodeOptions, prewarm_device_recipe: bool) !PreparedAudio {
+    return prepareEmbeddingGemma2AudioWithPackingBounded(allocator, bytes, options, prewarm_device_recipe, audio.default_decode_working_bytes);
 }
-pub fn prepareEmbeddingGemma2AudioWithPackingBounded(allocator: std.mem.Allocator, bytes: []const u8, options: audio.DecodeOptions, pack_device: bool, max_decode_working_bytes: usize) !PreparedAudio {
-    return prepareAudioCpuBounded(allocator, bytes, options, 128, true, pack_device, 480_000, max_decode_working_bytes, false);
+pub fn prepareEmbeddingGemma2AudioWithPackingBounded(allocator: std.mem.Allocator, bytes: []const u8, options: audio.DecodeOptions, prewarm_device_recipe: bool, max_decode_working_bytes: usize) !PreparedAudio {
+    return prepareAudioCpuBounded(allocator, bytes, options, 128, true, prewarm_device_recipe, 480_000, max_decode_working_bytes, false);
 }
-fn prepareAudioCpu(allocator: std.mem.Allocator, audio_bytes: []const u8, decode_options: audio.DecodeOptions, mel_bins: usize, strict: bool, pack_gpu: bool) !PreparedAudio {
-    return prepareAudioCpuBounded(allocator, audio_bytes, decode_options, mel_bins, strict, pack_gpu, 480_000, audio.default_decode_working_bytes, false);
-}
-fn prepareAudioCpuBounded(allocator: std.mem.Allocator, audio_bytes: []const u8, decode_options: audio.DecodeOptions, mel_bins: usize, strict: bool, pack_gpu: bool, max_samples: usize, max_decode_working_bytes: usize, reference_resample: bool) !PreparedAudio {
+fn prepareAudioCpuBounded(allocator: std.mem.Allocator, audio_bytes: []const u8, decode_options: audio.DecodeOptions, mel_bins: usize, strict: bool, prewarm_device_recipe: bool, max_samples: usize, max_decode_working_bytes: usize, reference_resample: bool) !PreparedAudio {
     var decoded = audio.decodeBounded(allocator, audio_bytes, decode_options, max_decode_working_bytes) catch |err| switch (err) {
         error.OutOfMemory, error.AudioTooLarge => return err,
         else => return if (reference_resample) error.InvalidAudioInput else err,
@@ -2821,7 +2818,7 @@ fn prepareAudioCpuBounded(allocator: std.mem.Allocator, audio_bytes: []const u8,
         if (info.total_samples != 0 and info.total_samples != decoded.samples.len) return error.InvalidAudioInput;
     }
     if (strict) for (decoded.samples) |sample| if (!std.math.isFinite(sample)) return error.InvalidAudioSamples;
-    return prepareAudioPcmBounded(allocator, .{ .samples = decoded.samples, .sample_rate = decoded.sample_rate }, mel_bins, strict, pack_gpu, max_samples, reference_resample);
+    return prepareAudioPcmBounded(allocator, .{ .samples = decoded.samples, .sample_rate = decoded.sample_rate }, mel_bins, strict, prewarm_device_recipe, max_samples, reference_resample);
 }
 
 /// Matches resampling and the every-fourth-row feature mask without allocating
@@ -2838,15 +2835,15 @@ pub fn embeddingGemma2PcmSequenceLength(samples: usize, sample_rate: u32) !usize
 pub fn prepareEmbeddingGemma2AudioPcm(allocator: std.mem.Allocator, pcm: audio.PcmAudio) !PreparedAudio {
     return prepareEmbeddingGemma2AudioPcmWithPacking(allocator, pcm, true);
 }
-pub fn prepareEmbeddingGemma2AudioPcmWithPacking(allocator: std.mem.Allocator, pcm: audio.PcmAudio, pack_device: bool) !PreparedAudio {
+pub fn prepareEmbeddingGemma2AudioPcmWithPacking(allocator: std.mem.Allocator, pcm: audio.PcmAudio, prewarm_device_recipe: bool) !PreparedAudio {
     if (pcm.sample_rate == 0 or pcm.sample_rate > 192000 or pcm.samples.len == 0) return error.UnsupportedAudioFormat;
     for (pcm.samples) |sample| if (!std.math.isFinite(sample)) return error.UnsupportedAudioFormat;
-    return prepareAudioPcm(allocator, pcm, 128, true, pack_device);
+    return prepareAudioPcm(allocator, pcm, 128, true, prewarm_device_recipe);
 }
-fn prepareAudioPcm(allocator: std.mem.Allocator, pcm: audio.PcmAudio, mel_bins: usize, strict: bool, pack_gpu: bool) !PreparedAudio {
-    return prepareAudioPcmBounded(allocator, pcm, mel_bins, strict, pack_gpu, 480_000, false);
+fn prepareAudioPcm(allocator: std.mem.Allocator, pcm: audio.PcmAudio, mel_bins: usize, strict: bool, prewarm_device_recipe: bool) !PreparedAudio {
+    return prepareAudioPcmBounded(allocator, pcm, mel_bins, strict, prewarm_device_recipe, 480_000, false);
 }
-fn prepareAudioPcmBounded(allocator: std.mem.Allocator, pcm: audio.PcmAudio, mel_bins: usize, strict: bool, pack_gpu: bool, max_samples: usize, reference_resample: bool) !PreparedAudio {
+fn prepareAudioPcmBounded(allocator: std.mem.Allocator, pcm: audio.PcmAudio, mel_bins: usize, strict: bool, prewarm_device_recipe: bool, max_samples: usize, reference_resample: bool) !PreparedAudio {
     const target_rate: u32 = 16_000;
     const frame_length: usize = 320;
     const hop_length: usize = 160;
@@ -2882,7 +2879,9 @@ fn prepareAudioPcmBounded(allocator: std.mem.Allocator, pcm: audio.PcmAudio, mel
     @memset(samples, 0.0);
     @memcpy(samples[pad_left..][0..real_samples], resampled[0..real_samples]);
 
-    const recipe = audio_frontend_recipe.get(mel_bins, pack_gpu);
+    // The device fallback borrows a process-wide basis, so warming it here
+    // does not add buffers to the prepared clip.
+    const recipe = audio_frontend_recipe.get(mel_bins, prewarm_device_recipe);
     const filters = if (recipe) |plan| plan.filters else try gemma4MelFilterbank(allocator, mel_bins, fft_length, target_rate);
     errdefer if (recipe == null) allocator.free(filters);
     const window: []const f32 = if (recipe) |plan| plan.window else create: {
