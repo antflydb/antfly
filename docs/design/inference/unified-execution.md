@@ -1924,3 +1924,29 @@ E2B returned the same code at 16,384 and 131,060 prompt tokens. The
 near-limit request took 33.87 s versus 568.55 s with the original MMA
 route on the same shared Spark. E4B returned the same answer in 55.48 s
 at 131,060 prompt tokens. Both models retained the overflow rejection.
+
+The shared-GPU Spark GB10 HTTP comparison against merged main
+`4951ca13f9` used candidate `6b41849019` and completed 16 samples per
+side per A/A, A/B and B/B phase for each of 11 workloads. Outputs matched
+throughout. A separate 184 MiB CUDA context was present at both endpoint
+snapshots. The receipt SHA-256 is
+`84ffc004fb80ff2f3ba8a8f2f376a5c05e677b9cdc6ccafdb165a00837467a89`.
+
+| Workload | Main p50 / p95 (ms) | Candidate p50 / p95 (ms) |
+| --- | ---: | ---: |
+| Whisper | 383.37 / 384.57 | 383.21 / 386.51 |
+| EmbeddingGemma 2 text | 8.37 / 8.87 | 8.75 / 9.32 |
+| EmbeddingGemma 2 grouped audio | 48.92 / 50.89 | 47.81 / 48.58 |
+| LightOnOCR | 318.85 / 320.80 | 320.44 / 324.68 |
+| GLiNER2.5 | 12.73 / 13.54 | 10.50 / 11.30 |
+| DECIDE | 39.59 / 40.92 | 40.04 / 41.17 |
+| Qwen3 | 86.63 / 88.71 | 86.36 / 86.71 |
+| Gemma 4 E4B text | 221.38 / 223.10 | 220.85 / 222.60 |
+| Gemma 4 E4B image | 278.52 / 281.65 | 278.44 / 281.05 |
+| Gemma 4 E4B audio | 215.79 / 218.76 | 213.64 / 217.05 |
+| Gemma 4 E4B video | 254.08 / 255.16 | 252.89 / 254.48 |
+
+Text embedding p50 rose 4.62% in A/B. The magnitude of the A/A and B/B
+p50 differences was 0.49% and 1.38%, respectively. Isolated attribution
+against the same two binaries is pending. This receipt covers the
+specified revisions and does not qualify the later PR head.
