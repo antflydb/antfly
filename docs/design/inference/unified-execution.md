@@ -2383,3 +2383,10 @@ while preserving the latest capture or replay receipt. The LightOnOCR
 HTTP fixture still reported replay, a 44-byte pinned receipt, and
 297,216 bytes of declared attention scratch. The log hash is
 `671077be8048373c648d1906f565bf4c99ef60f6139c6e57ee93a149868917d1`.
+
+On local Metal, the focused cohort through `da2ac4959c` passed all
+three checks. With device selection unavailable, the physical fallback
+selected token 1 and recorded 12 bytes of host access for one F32 row
+of a two-row tensor. The normal reader entrypoint also matched the
+host reference. The log hash is
+`e825cef836db554e08dbdcd2b83c3a3d4895d0aba84d7ea5487ce2dca4cce4bf`.
