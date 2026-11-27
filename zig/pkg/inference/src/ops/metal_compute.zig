@@ -4765,18 +4765,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return previous;
     }
 
-    pub fn requireEmbeddingVisionPlan(cb: *const ops.ComputeBackend, require: bool) bool {
-        if (cb.kind() != .metal) return false;
-        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+    fn requireVisionWorkspaceOp(ctx: *anyopaque, require: bool) bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const old = self.require_prepared_vision;
         self.require_prepared_vision = require;
         return old;
-    }
-    pub fn prepareEmbeddingVisionPlan(cb: *const ops.ComputeBackend, spec: ops.EmbeddingVisionSpec) !bool {
-        if (cb.kind() != .metal) return false;
-        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
-        try embeddingVisionWorkspaceOp(self, spec);
-        return self.embedding_vision_workspace != null;
     }
 
     /// Shared provider ownership amortizes shader setup and exact torchvision
@@ -22606,16 +22599,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         std.heap.c_allocator.destroy(old);
     }
-    fn embeddingVisionWorkspaceOp(ctx: *anyopaque, requested: ?ops.EmbeddingVisionSpec) anyerror!void {
+    fn setVisionWorkspaceOp(ctx: *anyopaque, requested: ?ops.VisionWorkspaceSpec) anyerror!bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         self.embedding_vision_workspace = null;
-        const spec = requested orelse return;
-        if (!self.require_f32_linears or self.shared_provider_lease_io == null or disableRuntimeElementwise() or audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_WORKSPACE") or audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_FOLLOWUP")) return;
-        if (spec.rows == 0 or spec.rows > 8192 or spec.hidden != 768 or spec.intermediate != 3072) return;
-        if (self.decoderWorkspaceBusy()) return;
+        const spec = requested orelse return false;
+        if (!self.require_f32_linears or self.shared_provider_lease_io == null or disableRuntimeElementwise() or audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_WORKSPACE") or audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_FOLLOWUP")) return false;
+        if (spec.rows == 0 or spec.rows > 8192 or spec.hidden != 768 or spec.intermediate != 3072) return false;
+        if (self.decoderWorkspaceBusy()) return false;
         const p = self.provider_impl;
-        const cache = if (self.data.tier_cache) |*v| v else return;
-        if (p.embeddinggemma2_cache_admission) |bound| if (bound != cache) return;
+        const cache = if (self.data.tier_cache) |*v| v else return false;
+        if (p.embeddinggemma2_cache_admission) |bound| if (bound != cache) return false;
         p.embedding_vision_clock += 1;
         const clock = p.embedding_vision_clock;
         var victim: usize = 0;
@@ -22632,9 +22625,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             try bindVisionWorkspace(workspace, spec);
             workspace.stamp = clock;
             self.embedding_vision_workspace = workspace;
-            return;
+            return true;
         }
-        if (clock < p.embedding_vision_retry) return;
+        if (clock < p.embedding_vision_retry) return false;
         const fresh = self.prepareVisionWorkspace(spec, clock) catch |first| retry: {
             if (p.embedding_vision_workspaces[victim]) |old| {
                 self.dropVisionWorkspace(old);
@@ -22642,14 +22635,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 break :retry self.prepareVisionWorkspace(spec, clock) catch |err| {
                     p.embedding_vision_retry = clock + 8;
                     switch (err) {
-                        error.OutOfMemory, error.MemoryBudgetExceeded, error.ResourceTemporarilyUnavailable, error.MetalBufferAllocFailed, error.AudioScheduleAdmission => return,
+                        error.OutOfMemory, error.MemoryBudgetExceeded, error.ResourceTemporarilyUnavailable, error.MetalBufferAllocFailed, error.AudioScheduleAdmission => return false,
                         else => return err,
                     }
                 };
             }
             p.embedding_vision_retry = clock + 8;
             switch (first) {
-                error.OutOfMemory, error.MemoryBudgetExceeded, error.ResourceTemporarilyUnavailable, error.MetalBufferAllocFailed, error.AudioScheduleAdmission => return,
+                error.OutOfMemory, error.MemoryBudgetExceeded, error.ResourceTemporarilyUnavailable, error.MetalBufferAllocFailed, error.AudioScheduleAdmission => return false,
                 else => return first,
             }
         };
@@ -22657,10 +22650,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         p.embeddinggemma2_cache_admission = cache;
         p.embedding_vision_workspaces[victim] = fresh;
         self.embedding_vision_workspace = fresh;
+        return true;
     }
     /// Repack only at a completed phase boundary. Physical storage and its
     /// admission stay fixed; unused activation rows become wider FFN scratch.
-    fn bindVisionWorkspace(workspace: *@import("metal_embedding_bindings.zig").VisionWorkspace, spec: ops.EmbeddingVisionSpec) !void {
+    fn bindVisionWorkspace(workspace: *@import("metal_embedding_bindings.zig").VisionWorkspace, spec: ops.VisionWorkspaceSpec) !void {
         if (std.meta.eql(workspace.spec, spec)) return;
         std.debug.assert(spec.rows <= workspace.capacity_rows);
         const layout = try @import("embedding_vision_plan.zig").layoutWithin(spec.rows, spec.hidden, spec.intermediate, workspace.arena_bytes);
@@ -22688,7 +22682,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         workspace.tile = layout.tile;
         workspace.tile_capacity = layout.tile;
     }
-    fn prepareVisionWorkspace(self: *MetalCompute, spec: ops.EmbeddingVisionSpec, clock: u64) !*@import("metal_embedding_bindings.zig").VisionWorkspace {
+    fn prepareVisionWorkspace(self: *MetalCompute, spec: ops.VisionWorkspaceSpec, clock: u64) !*@import("metal_embedding_bindings.zig").VisionWorkspace {
         const Workspace = @import("metal_embedding_bindings.zig").VisionWorkspace;
         const plan = @import("embedding_vision_plan.zig");
         var tile = plan.tileCapacity(spec.rows, spec.hidden, spec.intermediate) catch return error.AudioScheduleAdmission;
@@ -42950,6 +42944,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.maskedMeanRows = maskedMeanRowsOp;
         vt.maskedMeanNormalizedRows = maskedMeanNormalizedRowsOp;
         vt.regions.vision.unmaskedTensorCore = scaledDotProductAttentionQwen3VlVisionOp;
+        vt.regions.vision.setWorkspace = setVisionWorkspaceOp;
+        vt.regions.vision.requireWorkspace = requireVisionWorkspaceOp;
         vt.regions.vision.unmaskedF32 = scaledDotProductAttentionUnmaskedF32Op;
         vt.regions.vision.unmaskedRetrieval = scaledDotProductAttentionEmbeddingGemma2VisionOp;
         vt.scaledDotProductAttentionFull = scaledDotProductAttentionFullOp;
@@ -43038,7 +43034,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.audioPreparedLinear = audioPreparedLinearOp;
         vt.audioNodeInto = audioNodeIntoOp;
         vt.embeddingRotaryPrepare = embeddingRotaryPrepareOp;
-        vt.embeddingVisionWorkspace = embeddingVisionWorkspaceOp;
         vt.embeddingVisionNorm = embeddingVisionNormOp;
         vt.embeddingVisionQKV = embeddingVisionQKVOp;
         vt.embeddingVisionFFN = embeddingVisionFFNOp;
@@ -43297,13 +43292,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     pub fn requireQwenVisionResident(_: *const ops.ComputeBackend, _: bool) bool {
-        return false;
-    }
-
-    pub fn requireEmbeddingVisionPlan(_: *const ops.ComputeBackend, _: bool) bool {
-        return false;
-    }
-    pub fn prepareEmbeddingVisionPlan(_: *const ops.ComputeBackend, _: ops.EmbeddingVisionSpec) !bool {
         return false;
     }
 
@@ -54988,13 +54976,13 @@ test "embeddinggemma2 Metal vision workspace survives wrappers bounds retention 
         compute.require_f32_linears = true;
         const cb = compute.computeBackend();
         if (request == 0) {
-            try cb.vtable.embeddingVisionWorkspace.?(cb.ptr, .{ .rows = 2, .hidden = 768, .intermediate = 3072 });
+            try std.testing.expect(!try cb.setVisionWorkspace(.{ .rows = 2, .hidden = 768, .intermediate = 3072 }));
             try std.testing.expect(compute.embedding_vision_workspace == null);
             try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.host_bytes);
             store.tier_cache.?.budget.backend_limit_bytes = 64 * 1024 * 1024;
             compute.provider_impl.embedding_vision_clock = compute.provider_impl.embedding_vision_retry;
         }
-        try cb.vtable.embeddingVisionWorkspace.?(cb.ptr, .{ .rows = 2, .hidden = 768, .intermediate = 3072 });
+        try std.testing.expect(try cb.setVisionWorkspace(.{ .rows = 2, .hidden = 768, .intermediate = 3072 }));
         const workspace = compute.embedding_vision_workspace.?;
         try std.testing.expect(workspace.owner.backend_bytes <= 256 * 1024 * 1024);
         for (workspace.views) |view| {
@@ -55017,15 +55005,15 @@ test "embeddinggemma2 Metal vision workspace survives wrappers bounds retention 
         for (expected, actual) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-6);
         var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
         compute.allocator = failing.allocator();
-        cb.vtable.embeddingVisionWorkspace.?(cb.ptr, .{ .rows = 2, .hidden = 768, .intermediate = 3072 }) catch |err| {
+        _ = cb.setVisionWorkspace(.{ .rows = 2, .hidden = 768, .intermediate = 3072 }) catch |err| {
             compute.allocator = a;
             return err;
         };
         compute.allocator = a;
         try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
-        try cb.vtable.embeddingVisionWorkspace.?(cb.ptr, null);
+        _ = try cb.setVisionWorkspace(null);
         if (request == 1) {
-            for ([_]usize{ 3, 4, 513 }) |rows| try cb.vtable.embeddingVisionWorkspace.?(cb.ptr, .{ .rows = rows, .hidden = 768, .intermediate = 3072 });
+            for ([_]usize{ 3, 4, 513 }) |rows| _ = try cb.setVisionWorkspace(.{ .rows = rows, .hidden = 768, .intermediate = 3072 });
             var retained: usize = 0;
             for (compute.provider_impl.embedding_vision_workspaces) |entry| if (entry != null) {
                 retained += 1;
@@ -55042,7 +55030,7 @@ test "embeddinggemma2 Metal vision workspace survives wrappers bounds retention 
             for ([_]usize{ 300, 7, 513, 12, 2, 400, 3 }) |rows| {
                 var no_allocations = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
                 compute.allocator = no_allocations.allocator();
-                cb.vtable.embeddingVisionWorkspace.?(cb.ptr, .{ .rows = rows, .hidden = 768, .intermediate = 3072 }) catch |err| {
+                _ = cb.setVisionWorkspace(.{ .rows = rows, .hidden = 768, .intermediate = 3072 }) catch |err| {
                     compute.allocator = a;
                     return err;
                 };
@@ -55056,7 +55044,7 @@ test "embeddinggemma2 Metal vision workspace survives wrappers bounds retention 
                 try std.testing.expectEqual(rows * 768, MetalCompute.denseDeviceF32(bound.views[0].?).?.elemCount());
                 try std.testing.expectEqual(@import("embedding_vision_plan.zig").tileRows(rows, bound.tile_capacity) * 6144, MetalCompute.denseDeviceF32(bound.views[8].?).?.elemCount());
             }
-            try cb.vtable.embeddingVisionWorkspace.?(cb.ptr, null);
+            _ = try cb.setVisionWorkspace(null);
         }
     }
     const p = store.shared_metal_native_provider.?;
@@ -55069,14 +55057,14 @@ test "embeddinggemma2 Metal vision workspace survives wrappers bounds retention 
         defer compute.deinit();
         compute.require_f32_linears = true;
         const cb = compute.computeBackend();
-        try cb.vtable.embeddingVisionWorkspace.?(cb.ptr, .{ .rows = 1025, .hidden = 768, .intermediate = 3072 });
+        _ = try cb.setVisionWorkspace(.{ .rows = 1025, .hidden = 768, .intermediate = 3072 });
         const workspace = compute.embedding_vision_workspace.?;
         try std.testing.expectEqual(@as(usize, 512), workspace.tile_capacity);
         try std.testing.expectEqual(@as(usize, 1025), workspace.capacity_rows);
         try std.testing.expect(workspace.owner.backend_bytes <= 64 * 1024 * 1024);
-        try cb.vtable.embeddingVisionWorkspace.?(cb.ptr, .{ .rows = 700, .hidden = 768, .intermediate = 3072 });
+        _ = try cb.setVisionWorkspace(.{ .rows = 700, .hidden = 768, .intermediate = 3072 });
         try std.testing.expectEqual(@as(usize, 512), workspace.tile);
-        try cb.vtable.embeddingVisionWorkspace.?(cb.ptr, null);
+        _ = try cb.setVisionWorkspace(null);
     }
     try std.testing.expect(try p.reclaimEmbeddingGemma2Weights(.vision) > 0);
     store.tier_cache.?.budget.backend_limit_bytes = 512 * 1024 * 1024;
@@ -55107,7 +55095,7 @@ test "embeddinggemma2 Metal vision workspace survives wrappers bounds retention 
         {
             const plan = @import("embedding_vision_plan.zig");
             const rows = 7128;
-            try cb.vtable.embeddingVisionWorkspace.?(cb.ptr, .{ .rows = rows, .hidden = h, .intermediate = intermediate });
+            _ = try cb.setVisionWorkspace(.{ .rows = rows, .hidden = h, .intermediate = intermediate });
             const workspace = compute.embedding_vision_workspace.?;
             workspace.slots[0][1] = 0;
             workspace.slots[0][2] = 1;
@@ -55123,11 +55111,11 @@ test "embeddinggemma2 Metal vision workspace survives wrappers bounds retention 
             defer cb.free(input);
             // Busy frames must never repack descriptors visible to an encoder.
             try std.testing.expect(try cb.decoderRuntimeBeginFrame());
-            try cb.vtable.embeddingVisionWorkspace.?(cb.ptr, .{ .rows = 4752, .hidden = h, .intermediate = intermediate });
+            try std.testing.expect(!try cb.setVisionWorkspace(.{ .rows = 4752, .hidden = h, .intermediate = intermediate }));
             try std.testing.expect(compute.embedding_vision_workspace == null);
             try std.testing.expectEqual(@as(usize, rows), workspace.spec.rows);
             try cb.decoderRuntimeSubmitFrame();
-            try cb.vtable.embeddingVisionWorkspace.?(cb.ptr, .{ .rows = 4752, .hidden = h, .intermediate = intermediate });
+            try std.testing.expect(!try cb.setVisionWorkspace(.{ .rows = 4752, .hidden = h, .intermediate = intermediate }));
             try std.testing.expect(compute.embedding_vision_workspace == null);
             try std.testing.expectEqual(@as(usize, rows), workspace.spec.rows);
             try cb.decoderRuntimeWaitSubmittedFrame();
@@ -55136,7 +55124,7 @@ test "embeddinggemma2 Metal vision workspace survives wrappers bounds retention 
             for ([_]usize{ 7128, 4752, 7128, 1188, 4752, 7128 }) |active_rows| {
                 var no_allocations = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
                 compute.allocator = no_allocations.allocator();
-                cb.vtable.embeddingVisionWorkspace.?(cb.ptr, .{ .rows = active_rows, .hidden = h, .intermediate = intermediate }) catch |err| {
+                _ = cb.setVisionWorkspace(.{ .rows = active_rows, .hidden = h, .intermediate = intermediate }) catch |err| {
                     compute.allocator = a;
                     return err;
                 };
@@ -55166,12 +55154,12 @@ test "embeddinggemma2 Metal vision workspace survives wrappers bounds retention 
                     for (want[0..actual.len], actual) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-5);
                 } else reference = try a.dupe(f32, actual);
             }
-            try cb.vtable.embeddingVisionWorkspace.?(cb.ptr, null);
+            _ = try cb.setVisionWorkspace(null);
         }
         const benchmark = getenvBool("ANTFLY_EMBEDDINGGEMMA2_BENCH_VISION_TILES");
         for ([_]usize{ 513, 2049, 4752 }) |rows| {
             if (!benchmark and rows != 513) continue;
-            try cb.vtable.embeddingVisionWorkspace.?(cb.ptr, .{ .rows = rows, .hidden = h, .intermediate = intermediate });
+            _ = try cb.setVisionWorkspace(.{ .rows = rows, .hidden = h, .intermediate = intermediate });
             const workspace = compute.embedding_vision_workspace.?;
             workspace.slots[0][1] = 0;
             workspace.slots[0][2] = 1;
@@ -55210,7 +55198,7 @@ test "embeddinggemma2 Metal vision workspace survives wrappers bounds retention 
                 std.debug.print("embeddinggemma2 vision_ffn_tiles rows={d} capacity={d} tile512_completed_ns={d} tile1024_completed_ns={d} tile2048_completed_ns={d} tile512_gpu_ns={d} tile1024_gpu_ns={d} tile2048_gpu_ns={d} parity=true\n", .{ rows, workspace.tile_capacity, timings[0][3], timings[1][3], timings[2][3], gpu_timings[0][3], gpu_timings[1][3], gpu_timings[2][3] });
             }
             workspace.tile = @import("embedding_vision_plan.zig").tileRows(rows, workspace.tile_capacity);
-            try cb.vtable.embeddingVisionWorkspace.?(cb.ptr, null);
+            _ = try cb.setVisionWorkspace(null);
         }
     }
     try std.testing.expect(try p.reclaimEmbeddingGemma2Weights(.vision) > 0);

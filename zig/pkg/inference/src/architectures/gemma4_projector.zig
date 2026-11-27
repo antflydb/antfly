@@ -1314,7 +1314,7 @@ pub fn encodeVideoBatchInput(cb: *const ComputeBackend, allocator: std.mem.Alloc
     const g = Geometry{ .batches = frames, .width = width, .height = height, .grid_x = width / 16, .grid_y = height / 16, .pooled_x = width / 48, .pooled_y = height / 48 };
     if (g.tokenCount() / frames > 140) return error.InvalidTensorShape;
     if (required) {
-        if (!try @import("../ops/metal_compute.zig").MetalCompute.prepareEmbeddingVisionPlan(cb, .{ .rows = frames * g.grid_x * g.grid_y, .hidden = cfg.vision_hidden, .intermediate = cfg.intermediate_size })) return error.PreparedVisionUnavailable;
+        if (!try cb.setVisionWorkspace(.{ .rows = frames * g.grid_x * g.grid_y, .hidden = cfg.vision_hidden, .intermediate = cfg.intermediate_size })) return error.PreparedVisionUnavailable;
     }
     var store = ProjectorWeights.initHuggingFace(cb, allocator);
     defer store.deinit();
@@ -4106,7 +4106,7 @@ fn encodePreparedImageBatchResident(cb: *const ComputeBackend, allocator: std.me
     const batch = prepared.len;
     const geometry = prepared[0].geometry;
     if (cfg.require_prepared_vision) {
-        const ready = try @import("../ops/metal_compute.zig").MetalCompute.prepareEmbeddingVisionPlan(cb, .{ .rows = batch * geometry.grid_x * geometry.grid_y, .hidden = cfg.vision_hidden, .intermediate = cfg.intermediate_size });
+        const ready = try cb.setVisionWorkspace(.{ .rows = batch * geometry.grid_x * geometry.grid_y, .hidden = cfg.vision_hidden, .intermediate = cfg.intermediate_size });
         if (!ready) return error.PreparedVisionUnavailable;
     }
     var deferred = false;
@@ -4252,14 +4252,12 @@ fn encodePositionedBatchResidentInto(cb: *const ComputeBackend, allocator: std.m
     };
     defer cache_scope.close();
     if (cfg.embedding_gemma2_f32_attention) if (cb.vtable.embeddingRotaryPrepare) |prepare| try prepare(cb.ptr, .{ .vision = true, .dim = @intCast(cfg.vision_hidden / cfg.head_count), .x = @intCast(geometry.grid_x), .y = @intCast(geometry.grid_y), .theta = cfg.rope_theta });
-    const previous = @import("../ops/metal_compute.zig").MetalCompute.requireEmbeddingVisionPlan(cb, cfg.require_prepared_vision);
-    defer _ = @import("../ops/metal_compute.zig").MetalCompute.requireEmbeddingVisionPlan(cb, previous);
+    const previous = cb.requireVisionWorkspace(cfg.require_prepared_vision);
+    defer _ = cb.requireVisionWorkspace(previous);
 
-    if (visionFollowup(cb, store, cfg)) if (cb.vtable.embeddingVisionWorkspace) |prepare|
-        try prepare(cb.ptr, .{ .rows = batch * geometry.grid_x * geometry.grid_y, .hidden = cfg.vision_hidden, .intermediate = cfg.intermediate_size });
-    defer if (cb.vtable.embeddingVisionWorkspace) |prepare| {
-        prepare(cb.ptr, null) catch {};
-    };
+    if (visionFollowup(cb, store, cfg))
+        _ = try cb.setVisionWorkspace(.{ .rows = batch * geometry.grid_x * geometry.grid_y, .hidden = cfg.vision_hidden, .intermediate = cfg.intermediate_size });
+    defer _ = cb.setVisionWorkspace(null) catch false;
 
     // Group only our own frames. External frame owners keep their lifetime
     // boundary; stage diagnostics keep their synchronized per-layer behavior.

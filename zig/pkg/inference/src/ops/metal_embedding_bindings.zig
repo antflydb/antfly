@@ -150,7 +150,7 @@ pub const VisionCoefficients = struct {
 
 pub const VisionWorkspace = struct {
     owner: Storage = .{ .host_bytes = @sizeOf(VisionWorkspace) },
-    spec: ops.EmbeddingVisionSpec,
+    spec: ops.VisionWorkspaceSpec,
     capacity_rows: usize,
     arena_bytes: usize,
     /// Maximum tile for the currently packed layout, not the initial geometry.

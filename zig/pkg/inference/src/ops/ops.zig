@@ -1043,7 +1043,7 @@ pub const EmbeddingRotarySpec = struct {
         return try std.math.mul(usize, try std.math.add(usize, self.x, self.y), self.dim / (if (self.vision) @as(u32, 4) else 2) * 2);
     }
 };
-pub const EmbeddingVisionSpec = struct { rows: usize, hidden: usize, intermediate: usize };
+pub const VisionWorkspaceSpec = struct { rows: usize, hidden: usize, intermediate: usize };
 pub const LocalRelativeAttentionArithmetic = @import("kernel_geometry.zig").LocalRelativeAttentionArithmetic;
 pub const Gemma4AudioLocalAttentionParams = struct {
     arithmetic: LocalRelativeAttentionArithmetic = .combined_f32,
@@ -2354,6 +2354,17 @@ pub const ComputeBackend = struct {
         return op(self.ptr, tensor, axis, exclusive, reverse);
     }
 
+    /// Bind an admitted vision workspace for this invocation, or clear its binding.
+    pub fn setVisionWorkspace(self: *const ComputeBackend, spec: ?VisionWorkspaceSpec) !bool {
+        const set = self.vtable.regions.vision.setWorkspace orelse return false;
+        return set(self.ptr, spec);
+    }
+
+    pub fn requireVisionWorkspace(self: *const ComputeBackend, required: bool) bool {
+        const set = self.vtable.regions.vision.requireWorkspace orelse return false;
+        return set(self.ptr, required);
+    }
+
     /// Publish an eager BF16 storage boundary while retaining an F32 physical
     /// representation for a following source operation. The input is borrowed;
     /// a selected backend returns a new owning tensor and never mutates it.
@@ -2784,6 +2795,8 @@ pub const ComputeBackend = struct {
     };
 
     pub const VisionRegion = struct {
+        setWorkspace: ?*const fn (ctx: *anyopaque, spec: ?VisionWorkspaceSpec) anyerror!bool = null,
+        requireWorkspace: ?*const fn (ctx: *anyopaque, required: bool) bool = null,
         /// Optional model-scoped vision-attention routes. They have the same unmasked,
         /// unbiased semantics as scaledDotProductAttention with an empty mask,
         /// but lets a backend select a model-scoped kernel without changing
@@ -3037,7 +3050,6 @@ pub const ComputeBackend = struct {
         rmsNormClamped: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, params: NormClampParams) anyerror!?CT = null,
         clippedLinear: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, params: ClippedLinearParams) anyerror!?CT = null,
         embeddingRotaryPrepare: ?*const fn (ctx: *anyopaque, spec: EmbeddingRotarySpec) anyerror!void = null,
-        embeddingVisionWorkspace: ?*const fn (ctx: *anyopaque, spec: ?EmbeddingVisionSpec) anyerror!void = null,
         embeddingVisionNorm: ?*const fn (ctx: *anyopaque, input: CT, residual: ?CT, eps: f32, slot: usize) anyerror!?CT = null,
         embeddingVisionQKV: ?*const fn (ctx: *anyopaque, input: CT, layer: usize, params: VisionNormRopeParams) anyerror!?SplitLastDim3Result = null,
         embeddingVisionFFN: ?*const fn (ctx: *anyopaque, input: CT, layer: usize) anyerror!?CT = null,
