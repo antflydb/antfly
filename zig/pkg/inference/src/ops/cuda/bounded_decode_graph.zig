@@ -375,10 +375,14 @@ pub const GraphPhase = struct {
         self.storage_layout.recurrent_output = try self.storage_layout.declareLayerRegion(try StorageLayout.aligned(scratch_bytes), bytes);
     }
 
-    pub fn declareFfnScratch(self: *GraphPhase) !void {
+    pub fn declareFfnScratch(self: *GraphPhase, compact: bool) !void {
         const descriptor = self.descriptor;
         if (descriptor.ffn_intermediate == 0) return;
-        const layout = try @import("dense_ffn_workspace.zig").Layout.init(descriptor.rows, descriptor.hidden, descriptor.ffn_intermediate, 0);
+        const Ffn = @import("dense_ffn_workspace.zig").Layout;
+        const layout = if (compact)
+            try Ffn.initCompact(descriptor.rows, descriptor.hidden, descriptor.ffn_intermediate)
+        else
+            try Ffn.init(descriptor.rows, descriptor.hidden, descriptor.ffn_intermediate, 0);
         self.storage_layout.ffn_workspace = try self.storage_layout.declareLayerWorkspace(layout.scratch_bytes);
     }
 
@@ -904,7 +908,7 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
     try std.testing.expectEqual(@as(usize, rows * 8 * 256 * @sizeOf(f32)), attention_output.len);
     try std.testing.expect(attention_output.ptr >= output_owner.metadata.ptr + attention.offset + attention.bytes);
 
-    try phase.declareFfnScratch();
+    try phase.declareFfnScratch(false);
     output_owner.hidden = descriptor.hidden;
     output_owner.storage_layout = phase.storage_layout;
     output_owner.metadata.len = phase.storage_layout.metadata_bytes;

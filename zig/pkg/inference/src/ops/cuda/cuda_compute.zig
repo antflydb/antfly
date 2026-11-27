@@ -4239,8 +4239,8 @@ pub const CudaCompute = struct {
         phase.declareRecurrentOutput() catch |err| switch (err) {
             error.InvalidShape, error.Overflow => return .unsupported,
         };
-        if (lightOnFfnBlockEnabled(cb) and lightOnDevice(self).portableKernels() and !self.lighton_bf16_projection_outputs and !self.lighton_bf16_decode_outputs)
-            phase.declareFfnScratch() catch |err| switch (err) {
+        if (lightOnFfnBlockEnabled(cb) and lightOnDevice(self).portableKernels() and !self.lighton_bf16_decode_outputs)
+            phase.declareFfnScratch(self.lighton_bf16_projection_outputs) catch |err| switch (err) {
                 error.InvalidShape, error.Overflow => return .unsupported,
             };
         const owner = &self.bounded_decode_graph;
@@ -16136,16 +16136,22 @@ fn lightOnCompactBf16FfnBlock(self: *CudaCompute, request: CudaCompute.DenseSilu
     const narrow_count = try checkedMul(rows, hidden);
     const wide_count = try checkedMul(rows, intermediate);
     try self.lighton_activation.init(&self.ctx);
-    var normalized = try allocDeviceBuffer(self, try checkedMul(narrow_count, 2));
-    defer releaseDeviceBuffer(self, &normalized);
-    var gate = try allocDeviceBuffer(self, try checkedMul(wide_count, 2));
-    defer releaseDeviceBuffer(self, &gate);
-    var up = try allocDeviceBuffer(self, try checkedMul(wide_count, 2));
-    defer releaseDeviceBuffer(self, &up);
-    var activated = try allocDeviceBuffer(self, try checkedMul(wide_count, 2));
-    defer releaseDeviceBuffer(self, &activated);
-    var projected = try allocDeviceBuffer(self, try checkedMul(narrow_count, 2));
-    defer releaseDeviceBuffer(self, &projected);
+    const layout = try CudaCompute.DenseFfnProgram.Layout.initCompact(rows, hidden, intermediate);
+    const assigned = if (self.bounded_decode_graph.active) try self.bounded_decode_graph.bindFfnScratch(layout) else null;
+    var scratch = assigned orelse try allocDeviceBuffer(self, layout.scratch_bytes);
+    defer if (assigned == null) releaseDeviceBuffer(self, &scratch);
+    if (assigned != null) {
+        for ([_]*const CudaTensor{ input, norm, weights[0], weights[1], weights[2] }) |source| {
+            if (kernel_geometry.byteRangesOverlap(scratch.ptr, scratch.len, source.buffer.ptr, source.buffer.len)) return error.InvalidAssignedAlias;
+        }
+    }
+    // The initial BF16 normalization dies after both projections. Gate and
+    // up die after SiLU, so the down projection can write over the gate.
+    const normalized = try scratch.borrowRange(0, narrow_count * @sizeOf(u16));
+    const activated = try scratch.borrowRange(0, wide_count * @sizeOf(u16));
+    const gate = try scratch.borrowRange(layout.gate_offset, wide_count * @sizeOf(u16));
+    const up = try scratch.borrowRange(layout.up_offset, wide_count * @sizeOf(u16));
+    const projected = try scratch.borrowRange(layout.gate_offset, narrow_count * @sizeOf(u16));
     var output = try allocDeviceBuffer(self, try checkedMul(narrow_count, 4));
     errdefer releaseDeviceBuffer(self, &output);
     const shape = try allocShape2(self.allocator, rows, hidden);

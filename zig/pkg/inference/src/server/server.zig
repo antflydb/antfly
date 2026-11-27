@@ -48809,7 +48809,11 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
             if (report.declared_ffn_scratch_bytes != 0) {
                 var intermediate: usize = 0;
                 for (0..geometry.num_hidden_layers) |layer| intermediate = @max(intermediate, geometry.intermediateSize(layer));
-                const ffn = try @import("../ops/cuda/dense_ffn_workspace.zig").Layout.init(report.rows, geometry.hidden_size, intermediate, 0);
+                const Ffn = @import("../ops/cuda/dense_ffn_workspace.zig").Layout;
+                const ffn = if (platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_BF16_PROJECTION_OUTPUTS"))
+                    try Ffn.initCompact(report.rows, geometry.hidden_size, intermediate)
+                else
+                    try Ffn.init(report.rows, geometry.hidden_size, intermediate, 0);
                 try std.testing.expectEqual(ffn.scratch_bytes, report.declared_ffn_scratch_bytes);
             }
             const shared_bytes = @max(attention_bytes, recurrent_bytes, report.declared_ffn_scratch_bytes, report.fused_head_scratch_bytes, report.shared_head_scratch_bytes);
