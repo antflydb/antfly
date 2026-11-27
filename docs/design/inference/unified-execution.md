@@ -2181,3 +2181,14 @@ automatically. The two 50-token requests returned the expected
 This is a correctness smoke test with one request per order.
 The JSONL receipt is
 `b1021d98df97b87d1c624ec85a33aafca6b19a8b7384cfe554897ba8231cce0c`.
+
+The Metal tuning candidate also passed the short and 6.4K Inkling
+HTTP correctness cases using the shared checkpoint. The 6,396-token
+text and 6,403-token image prompts both returned `271`, taking
+80.03 and 80.18 seconds respectively. A separate INT4 image stream
+sent five idle comments before first content at 80.24 seconds, then
+returned the expected answer, final usage and `[DONE]`. The
+unsupported INT8 streaming request returned HTTP 400 before opening
+a stream. These are single-request correctness witnesses. The
+current-head long-prompt speed gap remains open. The JSONL receipt is
+`3f5a0d3a8c077a49b495e9063c8d6d2e234449d31d2fd82c7dcf004a86d2867c`.
