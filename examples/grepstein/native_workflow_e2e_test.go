@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -41,7 +42,7 @@ func mustNativeProfile(t *testing.T, name string) corpusProfile {
 }
 
 // The provider fixture truncates requests below 8K. Exercise the public policy
-// update and incomplete-only range routes without fabricating stored manifests.
+// update and the durable incomplete-only repair job without fabricating stored manifests.
 func testNativeExecutionPolicyRetry(t *testing.T, ctx context.Context, client *http.Client, tableURL string, source map[string]any, calls *atomic.Int64) {
 	t.Helper()
 	type manifest struct {
@@ -116,15 +117,30 @@ func testNativeExecutionPolicyRetry(t *testing.T, ctx context.Context, client *h
 	partial := wait(true)
 	testNativePartialCoverageGrep(t, ctx, client, tableURL)
 	update(8192)
-	raw, err := corpusRequestWithContext(ctx, client, "POST", tableURL+"/artifacts/"+corpusUnits+"/reprocess", map[string]any{"selection": "incomplete", "limit": 10})
-	if err != nil {
-		t.Fatal("incomplete reprocess", err)
+	jobURL := tableURL + "/artifacts/" + corpusUnits + "/reprocess-jobs"
+	raw, err := corpusRequestWithContext(ctx, client, "POST", jobURL, map[string]any{"selection": "incomplete", "limit": 1, "advance": false})
+	type repairJob struct {
+		ID                                    uint64 `json:"job_id"`
+		Phase, Selection                      string
+		Scanned, Reprocessed, Skipped, Failed int
 	}
-	var submitted struct{ Scanned, Reprocessed, Skipped, Failed int }
-	if err := json.Unmarshal(raw, &submitted); err != nil || submitted.Scanned != 3 || submitted.Reprocessed != 1 || submitted.Skipped != 2 || submitted.Failed != 0 {
-		t.Fatalf("unexpected incomplete selection: %s (%v)", raw, err)
+	var job repairJob
+	if err != nil || json.Unmarshal(raw, &job) != nil || job.ID == 0 || job.Phase != "queued" || job.Selection != "incomplete" {
+		t.Fatalf("create incomplete job: %s (%v)", raw, err)
 	}
-	t.Logf("incomplete submission: %s", raw)
+	for range 8 {
+		raw, err = corpusRequestWithContext(ctx, client, "POST", jobURL+"/"+strconv.FormatUint(job.ID, 10)+"/advance", nil)
+		if err != nil || json.Unmarshal(raw, &job) != nil {
+			t.Fatalf("advance incomplete job: %s (%v)", raw, err)
+		}
+		if job.Phase == "succeeded" || job.Phase == "failed" || job.Phase == "cancelled" {
+			break
+		}
+	}
+	if job.Phase != "succeeded" || job.Scanned != 3 || job.Reprocessed != 1 || job.Skipped != 2 || job.Failed != 0 {
+		t.Fatalf("unexpected incomplete selection: %s", raw)
+	}
+	t.Logf("incomplete job: %s", raw)
 	complete := wait(false)
 	if complete.Generation <= partial.Generation {
 		t.Fatal("retry did not advance generation")

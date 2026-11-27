@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -258,7 +259,13 @@ func testLocalNativeGCSExtraction(t *testing.T, options nativeCorpusSmokeOptions
 	}
 	tableURL := endpoint + "/tables/gcs_e2e"
 	source := "gs://e2e-originals/" + key + "?generation=123"
-	document := map[string]any{"url": source, "original_url": source, "filename": "evidence" + extension, "mime_type": mime, "version": digest + ":123", "indexed_at": time.Now().Unix(), "permissions": map[string]any{"public": false, "readers": []string{"user:self"}}, "metadata": map[string]any{"page_start": 1, "page_end": 1, "source_locator": map[string]any{"modified": json.Number("1794400000000000001")}}}
+	indexedAt := time.Now().Unix()
+	document := map[string]any{"url": source, "original_url": source, "filename": "evidence" + extension, "mime_type": mime, "version": digest + ":123", "indexed_at": indexedAt, "permissions": map[string]any{"public": false, "readers": []string{"user:self"}}, "metadata": map[string]any{"page_start": 1, "page_end": 1, "source_locator": map[string]any{"modified": json.Number("1794400000000000001")}}}
+	legacyPDF := ocr && !options.PolicyRetry
+	if legacyPDF {
+		delete(document, "indexed_at")
+		delete(document, "permissions")
+	}
 	record := corpusRecord{ID: "evidence", Document: document}
 	manifest, _ := json.Marshal(record)
 	manifest = append(manifest, '\n')
@@ -274,7 +281,7 @@ func testLocalNativeGCSExtraction(t *testing.T, options nativeCorpusSmokeOptions
 	if err := atomicCorpusJSON(filepath.Join(root, "prepare.json"), corpusProgress{Complete: true, Records: 1}); err != nil {
 		t.Fatal(err)
 	}
-	if err := atomicCorpusJSON(filepath.Join(root, "sources.json"), corpusConfig{Profile: profile, IndexedAt: document["indexed_at"].(int64), PagesPerRecord: 25}); err != nil {
+	if err := atomicCorpusJSON(filepath.Join(root, "sources.json"), corpusConfig{Profile: profile, IndexedAt: indexedAt, PagesPerRecord: 25}); err != nil {
 		t.Fatal(err)
 	}
 	loadArgs := []string{"--state", root, "--url", endpoint, "--table", "gcs_e2e", "--source-connection", "gcs-e2e", "--reader-config", readerConfig, "--transcriber-config", transcriberConfig, "--inference-secret", inferenceSecret, "--inference-url", inferenceURL}
@@ -319,7 +326,7 @@ func testLocalNativeGCSExtraction(t *testing.T, options nativeCorpusSmokeOptions
 		newDocument[k] = v
 	}
 	newDocument["url"], newDocument["original_url"], newDocument["version"], newDocument["filename"] = newSource, newSource, newDigest+":123", "appendix"+extension
-	writeAppendState(t, appendState, []corpusRecord{record, {ID: "appendix", Document: newDocument}}, corpusConfig{Profile: profile, IndexedAt: document["indexed_at"].(int64), PagesPerRecord: 25})
+	writeAppendState(t, appendState, []corpusRecord{record, {ID: "appendix", Document: newDocument}}, corpusConfig{Profile: profile, IndexedAt: indexedAt, PagesPerRecord: 25})
 	appendArgs := []string{"--state", appendState, "--url", endpoint, "--table", "gcs_e2e", "--source-connection", "gcs-e2e", "--reader-config", readerConfig, "--transcriber-config", transcriberConfig, "--inference-secret", inferenceSecret, "--inference-url", inferenceURL, "--append-only", "--accepted-state", root}
 	if err := corpusLoadCmd(append(append([]string{}, appendArgs...), "--plan-only")); err != nil {
 		t.Fatal("append preflight", err)
@@ -365,6 +372,35 @@ func testLocalNativeGCSExtraction(t *testing.T, options nativeCorpusSmokeOptions
 		t.Fatalf("append fetched more than the new PDF: %d -> %d", readsBefore, reads.Load())
 	}
 	t.Log("append preserved sample extraction generation and OCR call count; only new PDF fetched")
+	if legacyPDF {
+		calls, fetches := ocrCalls.Load(), reads.Load()
+		// "appendix" sorts before "evidence"; canary exactly the next row.
+		plan, err := repairGrepMetadataPage(client, endpoint, "gcs_e2e", grepMetadataOptions{After: "appendix", Limit: 1})
+		if err != nil || plan.NextAfter != "evidence" || plan.MissingIndexedAt != 1 || plan.MissingPermissions != 1 || plan.Patched != 0 {
+			t.Fatalf("legacy metadata plan: %+v %v", plan, err)
+		}
+		opts := grepMetadataOptions{After: "appendix", Limit: 1, IndexedAt: indexedAt, Reader: "user:self", Apply: true}
+		result, err := repairGrepMetadataPage(client, endpoint, "gcs_e2e", opts)
+		if err != nil || result.Patched != 1 {
+			t.Fatalf("legacy metadata repair: %+v %v", result, err)
+		}
+		result, err = repairGrepMetadataPage(client, endpoint, "gcs_e2e", opts)
+		if err != nil || result.Patched != 0 || result.MissingPermissions != 0 || result.MissingIndexedAt != 0 {
+			t.Fatalf("legacy metadata repair repeated a write: %+v %v", result, err)
+		}
+		// Repair the second published row before the unfiltered CLI smoke.
+		opts.After = ""
+		result, err = repairGrepMetadataPage(client, endpoint, "gcs_e2e", opts)
+		if err != nil || result.Patched != 1 {
+			t.Fatalf("repair legacy appendix: %+v %v", result, err)
+		}
+		raw, err := corpusRequest(client, "GET", tableURL+"/documents/evidence/artifacts/"+corpusUnits+"?detail=raw", nil)
+		var settled struct{ Generation uint64 }
+		if err != nil || json.Unmarshal(raw, &settled) != nil || settled.Generation != before.Generation || ocrCalls.Load() != calls || reads.Load() != fetches {
+			t.Fatalf("grep metadata repair changed accepted extraction: %v, generation %d -> %d, OCR %d -> %d, fetches %d -> %d",
+				err, before.Generation, settled.Generation, calls, ocrCalls.Load(), fetches, reads.Load())
+		}
+	}
 	if options.PolicyRetry {
 		// Verify partial-corpus grep before recovering only incomplete work.
 		testNativeExecutionPolicyRetry(t, ctx, client, tableURL, document, &ocrCalls)
@@ -422,6 +458,21 @@ func testLocalNativeGCSExtraction(t *testing.T, options nativeCorpusSmokeOptions
 					if !bytes.Contains(output, []byte(filename)) {
 						t.Fatalf("native grep %s lost %s across one-record pages: %s", stream, filename, output)
 					}
+				}
+			}
+			if legacyPDF {
+				config["principals"] = []string{"user:other"}
+				deniedPath := filepath.Join(root, "grep-denied.json")
+				if err := atomicCorpusJSON(deniedPath, config); err != nil {
+					t.Fatal(err)
+				}
+				cmd := exec.CommandContext(ctx, grepBinary, "--table-config", deniedPath, "--json", "Native GCS extraction")
+				cmd.Dir = root
+				cmd.Env = append(os.Environ(), "XDG_CACHE_HOME="+filepath.Join(root, "grep-cache"))
+				output, err := cmd.CombinedOutput()
+				var exit *exec.ExitError
+				if !errors.As(err, &exit) || exit.ExitCode() != 1 || bytes.Contains(output, []byte(`"type":"match"`)) {
+					t.Fatalf("legacy metadata repair did not enforce its private reader: %v\n%s", err, output)
 				}
 			}
 			if reads.Load() != before {
