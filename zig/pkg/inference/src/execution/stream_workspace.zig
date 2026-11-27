@@ -190,6 +190,16 @@ pub const Plan = struct {
         self.event(slot, false);
     }
 
+    fn appendOperationScratch(self: *Plan, bytes: usize) bool {
+        const slot = self.count;
+        self.allocateLive(bytes, null);
+        if (self.count == slot) return false;
+        self.releaseSlot(@intCast(slot));
+        if (!self.valid) return false;
+        self.declared_operation_scratch_intervals += 1;
+        return true;
+    }
+
     /// Allocations receive slots in declaration order. A release names the
     /// slot of an earlier allocation. Only the published slot may escape.
     pub const Declaration = union(enum) { allocate: usize, release: u15 };
@@ -213,6 +223,12 @@ pub const Plan = struct {
                 return error.InvalidExecutionPlan;
             self.plan.releaseSlot(@intCast(slot));
             if (!self.plan.valid) return error.InvalidExecutionPlan;
+        }
+
+        /// An operation submits all of its scratch users before the next
+        /// declared event. Its private offsets are relative to this interval.
+        pub fn scratchInterval(self: Builder, bytes: usize) !void {
+            if (self.plan.origin != .declared or !self.plan.appendOperationScratch(bytes)) return error.InvalidExecutionPlan;
         }
 
         pub fn finish(self: Builder, published_slot: ?u15) !void {
@@ -244,7 +260,10 @@ pub const Plan = struct {
 
     /// Both ordinary execution and recording consume the same interval.
     pub fn declareScratch(self: *Plan, bytes: usize) !void {
-        return self.declare(&.{ .{ .allocate = bytes }, .{ .release = 0 } }, null);
+        const builder = try self.declarationBuilder();
+        errdefer self.* = .{};
+        try builder.scratchInterval(bytes);
+        try builder.finish(null);
     }
 
     pub fn finishNoOutput(self: *Plan) bool {
@@ -390,12 +409,7 @@ pub const Scope = struct {
             if (!plan.sealed) plan.valid = false;
             return;
         }
-        const slot = plan.count;
-        plan.allocateLive(bytes, null);
-        if (plan.count != slot) {
-            plan.releaseSlot(@intCast(slot));
-            if (plan.valid) plan.declared_operation_scratch_intervals += 1;
-        }
+        _ = plan.appendOperationScratch(bytes);
     }
 
     /// Bind the funded byte range before recording or submitting any kernels.
@@ -615,6 +629,17 @@ test "an operation can declare scratch inside an observed workspace" {
     try std.testing.expect(plan.finish(0x1000));
     try std.testing.expectEqual(Origin.observed, plan.origin);
     try std.testing.expectEqual(@as(usize, 1), plan.declared_operation_scratch_intervals);
+
+    var declared: Plan = .{};
+    const builder = try declared.declarationBuilder();
+    const declared_input = try builder.allocate(64);
+    try builder.scratchInterval(512);
+    try builder.release(declared_input);
+    const publication = try builder.allocate(128);
+    try builder.finish(publication);
+    try std.testing.expectEqual(Origin.declared, declared.origin);
+    try std.testing.expectEqual(plan.declared_operation_scratch_intervals, declared.declared_operation_scratch_intervals);
+    try std.testing.expectEqual(try plan.layout(0), try declared.layout(0));
 
     const layout = try plan.layout(0);
     var bound = try Scope.bind(&plan, layout, 0x2000, layout.bytes);

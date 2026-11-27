@@ -264,19 +264,20 @@ test "CUDA declared audio workspace matches the observed capture layout" {
     {
         var builder = try declared.beginDeclaration(bindings);
         errdefer builder.abort();
-        const scratch = try builder.events.allocate(256);
-        try builder.events.release(scratch);
+        try builder.events.scratchInterval(256);
         const result = try builder.events.allocate(output_bytes);
         try builder.finish(result);
     }
     try std.testing.expectEqual(arena.Origin.declared, declared.plan.origin);
 
     var observed: Owner = .{ .allocator = std.testing.allocator };
-    observed.plan.allocate(256, 0x1000);
-    observed.plan.release(0x1000);
+    var scope = arena.Scope.observe(&observed.plan);
+    scope.recordScratchInterval(256);
     observed.plan.allocate(output_bytes, 0x2000);
     try std.testing.expect(observed.seal(0x2000, bindings));
     try std.testing.expectEqualDeep(observed.executable.?, declared.executable.?);
+    try std.testing.expectEqual(@as(usize, 1), declared.plan.declared_operation_scratch_intervals);
+    try std.testing.expectEqual(declared.plan.declared_operation_scratch_intervals, observed.plan.declared_operation_scratch_intervals);
 }
 
 test "embeddinggemma2 CUDA audio lifetime plan reuses dead regions and rejects allocation drift" {
