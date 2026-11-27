@@ -118,7 +118,7 @@ test "CUDA Inkling 2 loads and executes same-expert groups with identical BF16 o
         var layer = try moe.Layer.load(&ctx, &source, &staging, number);
         defer layer.deinit(&ctx);
         try forward.prepareResident(&ctx, config, &layer);
-        for ([_]u32{ 8, 16, 32, 64, 128, 256, 512, 1024, 2048 }) |rows| {
+        for ([_]u32{ 1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048 }) |rows| {
             const bytes = rows * row_bytes;
             var host = try buffer.HostBuffer.alloc(&ctx, bytes * 2);
             defer host.free(&ctx);
@@ -135,10 +135,10 @@ test "CUDA Inkling 2 loads and executes same-expert groups with identical BF16 o
                 if (precision == .block_scaled and rows != 64 and rows != 512 and rows != 2048) continue;
                 const scratch: moe.Scratch = .{ .activation_precision = precision, .logits = logits, .blas = blas_space, .routed = routed };
                 for ([_]bool{ false, true }) |repeat_tokens| {
-                    // Repeated rows force an expert to use multiple groups,
-                    // including a partially filled group alongside the unique rows.
+                    // Repeated rows exercise partial groups. The one-row case
+                    // compares the fused epilogue with two different embeddings.
                     for (0..rows) |row| {
-                        const token = if (repeat_tokens and row < rows - 5) 42 else 100 + row * 29;
+                        const token = if (repeat_tokens and row < @max(1, rows -| 5)) 42 else 100 + row * 29;
                         @memcpy(host.bytes()[row * row_bytes ..][0..row_bytes], embed[token * row_bytes ..][0..row_bytes]);
                     }
                     try input.copyFromHost(&ctx, host.constBytes()[0..bytes]);

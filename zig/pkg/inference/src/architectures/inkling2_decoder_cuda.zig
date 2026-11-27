@@ -349,12 +349,15 @@ pub const Request = struct {
         const text = model.text;
         if (max_tokens == 0 or max_tokens > text.model_max_length or chunk_rows == 0 or
             chunk_rows > @min(max_prefill_chunk_rows, max_tokens)) return error.InvalidInkling2Context;
+        const device = model.ctx.info;
+        const short_replay = max_tokens >= 5 and max_tokens <= text.sliding_window_size;
+        const long_replay = device.compute_minor == 1 and max_tokens > relative.shared_decode_replay_min_position and
+            text.sliding_window_size == relative.shared_decode_window and text.num_attention_heads == 3 * text.num_key_value_heads;
         self.* = .{
             .model = model,
             .max_tokens = max_tokens,
             .append_capacity = chunk_rows,
-            .replay_enabled = model.ctx.info.compute_major == 12 and model.ctx.info.compute_minor <= 1 and
-                max_tokens >= 5 and max_tokens <= text.sliding_window_size,
+            .replay_enabled = device.compute_major == 12 and device.compute_minor <= 1 and (short_replay or long_replay),
         };
         const ctx = model.ctx;
         const controller_rows: usize = @max(chunk_rows, if (supportsGroupedControllers(ctx)) @as(u32, 3) else 1);
@@ -977,9 +980,12 @@ pub const Request = struct {
         return cuda_graph.endCapture(ctx);
     }
 
-    fn replayVisits(self: *Request) !bool {
+    fn replayVisits(self: *Request, output: Output) !bool {
         // Batched prefill may reach decoding before the row-one BLAS plans exist.
         if (!self.replay_enabled or !self.single_row_prepared or self.workspace.rows != 1 or self.position() < 3) return false;
+        if (self.max_tokens > self.model.text.sliding_window_size and
+            (self.position() < relative.shared_decode_replay_min_position or output != .greedy or
+                !self.use_dense or self.use_native_prefill or self.draft != null)) return false;
         const ctx = self.model.ctx;
         const owner = &self.replay_graphs[self.history_side];
         if (owner.exec == null) {
@@ -1049,7 +1055,7 @@ pub const Request = struct {
         try self.kv.prepareAppend(rows);
         errdefer self.abortAppend();
         try self.stageInput(input);
-        const depth = if (try self.replayVisits()) block_slots - 1 else try self.runVisits(.{});
+        const depth = if (try self.replayVisits(output)) block_slots - 1 else try self.runVisits(.{});
         try self.finishAppend(input, rows, output, depth);
         if (rows == 1) self.single_row_prepared = true;
     }

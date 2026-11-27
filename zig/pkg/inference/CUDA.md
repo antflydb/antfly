@@ -1080,6 +1080,46 @@ released its request reservations.
 The paged attention, hybrid KV, and decoder suites passed all 10 CUDA
 tests, including rollover and eager decode through position 8,194.
 
+### Long-context replay and single-token expert fusion
+
+GB10 greedy decode can replay the 48 model visits once the position
+reaches 8,192. At this length the global split count is fixed. Replay
+derives the global split width, the sliding page origin, and query
+normalization from the absolute device position. It uses the published
+page tables and keeps separate graphs for the two convolution-history
+buffers. The staged KV append still commits after the stream fence.
+
+In a before-and-after CLI test with the same binary, graph replay raised
+10,604-token decode from 33.68 to 36.77 tok/s and 32,866-token decode from
+30.07 to 32.58 tok/s. Each replay run used 127 graph submissions and
+matched all 128 greedy token IDs. At 32K, GPU event timing put 13.0 ms
+per token around the attention kernels and 10.0 ms in routed experts.
+
+The BF16-input NVFP4 and MXFP8 single-token gate/up kernels apply weighted
+SwiGLU after the same BF16 rounding of the two projection results. This
+removes the intermediate gate/up write and the activation launch. In the
+operator sweep, NVFP4 gate/up plus activation fell from 57.2 to 54.0 µs,
+and MXFP8 fell from 194.4 to 191.1 µs. Both matched bit for bit, including
+the missing-route case. With resident checkpoint weights, the full FFNs
+took 174 µs for NVFP4 and 312 µs for MXFP8, down from 176 and 314 µs on
+the distinct embedding. The down-projection and route-reduction fusion
+matched bit for bit and had mixed performance across the two formats.
+
+Matched warm HTTP runs on Spark used the 3 GiB Antfly KV limit, prefix
+reuse off, and 128 greedy output tokens. Each median covers three runs.
+The vLLM worker used `0.34.1rc1.dev159+ged686ccec`.
+
+| Prompt tokens | Earlier Antfly | Replay and fusion | vLLM |
+| ---: | ---: | ---: | ---: |
+| 10,604 | 33.51 tok/s | 36.83 tok/s | 34.37 tok/s |
+| 32,866 | 29.92 tok/s | 32.55 tok/s | 31.16 tok/s |
+
+All 14 native CUDA tests passed. They covered 48 eager-matched graph
+replays across page rollover and device-position normalization. All 42
+saved full-vocabulary logit vectors matched the previous worker bit for bit.
+The overlapping 32K and short streams matched their isolated responses,
+processed 246 tokens in shared decode batches, and drained reservations.
+
 `/ai/v1/chat/completions` and `/ai/v1/generate` accept
 `chat_template_kwargs.enable_thinking` and `reasoning_effort`. Set
 `reasoning_effort` to `none`, `minimal`, `low`, `medium`, `high`, `xhigh`,

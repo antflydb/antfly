@@ -320,7 +320,7 @@ pub const Forward = struct {
             .clip = op[4],
             .eps = text.rms_norm_eps,
         };
-        try self.normalization.runPair(ctx, query_norm[0], query_norm[1]);
+        try self.normalization.runPair(ctx, query_norm[0], query_norm[1], r.replay_position);
         for ([_]struct { Temp, Temp, Weight, Weight, DeviceBuffer, DeviceBuffer, DeviceBuffer, f32 }{
             .{ .k, .k_norm, .k_taps, .k_dynamic, r.input.k, r.old_history.key, r.next_history.key, text.qk_l2_clip_threshold },
             .{ .v, .v_norm, .v_taps, .v_dynamic, r.input.v, r.old_history.value, r.next_history.value, 0 },
@@ -350,7 +350,8 @@ pub const Forward = struct {
         const decode_append = rows == 1 and position >= text.sliding_window_size and
             ctx.info.compute_major == 12 and ctx.info.compute_minor == 1;
         const binding = if (replay) |binding| blk: {
-            try self.attention.appendReplay(ctx, binding, r.replay_position, r.page_ids_device, staged, text.num_key_value_heads);
+            const window = if (layer.local) text.sliding_window_size else 0;
+            try self.attention.appendReplay(ctx, binding, r.replay_position, r.page_ids_device, staged, text.num_key_value_heads, window);
             break :blk binding;
         } else if (decode_append or (rows >= 16 and ctx.info.compute_major >= 8)) blk: {
             break :blk try r.cache_owner.queueWriteWithPages(r.visit, staged, r.page_ids_device, &self.attention);

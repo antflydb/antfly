@@ -338,7 +338,7 @@ fn verifyLongContext(allocator: std.mem.Allocator, model: *decoder.Decoder) !voi
     var request: decoder.Request = undefined;
     try request.init(allocator, model, limit);
     defer request.deinit() catch @panic("unable to drain long Inkling request");
-    try std.testing.expect(!request.replay_enabled);
+    const graphs_before = model.ctx.stats.graph_submissions;
     request.use_dense = true;
     const start = platform.time.monotonicNs();
     for (0..limit) |i| {
@@ -357,9 +357,45 @@ fn verifyLongContext(allocator: std.mem.Allocator, model: *decoder.Decoder) !voi
     }
     try std.testing.expectError(error.KvCapacityTooSmall, request.step(head_tokens[0]));
     try std.testing.expectEqual(@as(usize, limit), request.position());
+    try std.testing.expectEqual(graphs_before, model.ctx.stats.graph_submissions);
     std.debug.print("Inkling long context completed {d} tokens in {d:.3}s\n", .{
         limit, @as(f64, @floatFromInt(platform.time.monotonicNs() - start)) / 1e9,
     });
+}
+
+fn verifyLongGreedyReplay(allocator: std.mem.Allocator, model: *decoder.Decoder) !void {
+    const ctx = model.ctx;
+    if (ctx.info.compute_major != 12 or ctx.info.compute_minor != 1) return;
+    const min_position = @import("ops/cuda/paged_relative_attention.zig").shared_decode_replay_min_position;
+    const prefix = min_position - 1;
+    const limit = min_position + 48;
+    const chunk_rows = decoder.preferredPrefillRows(limit, true);
+    const tokens = try allocator.alloc(u32, prefix);
+    defer allocator.free(tokens);
+    for (tokens, 0..) |*token, i| token.* = head_tokens[i % head_tokens.len];
+    var eager: decoder.Request = undefined;
+    try eager.initWithPrefill(allocator, model, limit, chunk_rows);
+    defer eager.deinit() catch @panic("unable to drain eager Inkling request");
+    eager.replay_enabled = false;
+    var replay: decoder.Request = undefined;
+    try replay.initWithPrefill(allocator, model, limit, chunk_rows);
+    defer replay.deinit() catch @panic("unable to drain replayed Inkling request");
+    for ([_]*decoder.Request{ &eager, &replay }) |request| {
+        request.use_dense = true;
+        request.use_native_prefill = true;
+        try request.appendTokens(tokens);
+        request.use_native_prefill = false;
+    }
+    const before = ctx.stats.graph_submissions;
+    var token = head_tokens[0];
+    for (prefix..limit) |position| {
+        const expected = try eager.stepGreedy(token);
+        try std.testing.expectEqual(expected, try replay.stepGreedy(token));
+        try std.testing.expectEqual(position + 1, replay.position());
+        token = expected;
+    }
+    try std.testing.expectEqual(@as(usize, limit - min_position), ctx.stats.graph_submissions - before);
+    std.debug.print("Inkling long greedy CUDA Graph matched eager across {d} replays and KV rollover\n", .{ctx.stats.graph_submissions - before});
 }
 
 fn verifyOutputHead(allocator: std.mem.Allocator, model: *decoder.Decoder) !void {
@@ -662,5 +698,8 @@ test "CUDA Inkling 2 runs the fixed loop with all released text weights" {
             try verifyDSparkTransactions(allocator, &model, dir, config, model.text.log_scaling_n_floor + 1);
         }
     }
-    if (long_qualification) try verifyLongContext(allocator, &model);
+    if (long_qualification) {
+        try verifyLongContext(allocator, &model);
+        try verifyLongGreedyReplay(allocator, &model);
+    }
 }

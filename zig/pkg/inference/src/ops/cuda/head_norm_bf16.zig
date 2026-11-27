@@ -89,15 +89,16 @@ pub const Module = struct {
     }
 
     /// Group independent head dimensions and scales on the same position schedule.
-    pub fn runPair(self: *Module, ctx: *Context, a: Request, b: Request) !void {
+    pub fn runPair(self: *Module, ctx: *Context, a: Request, b: Request, position_device: DeviceBuffer) !void {
         if (a.rows != b.rows or a.heads != b.heads or a.position != b.position or a.log_floor != b.log_floor or
             a.log_alpha != b.log_alpha or a.eps != b.eps)
             return error.InvalidShape;
         const fa = try footprint(a);
         const fb = try footprint(b);
-        try buffer.validateRegions(6, .{ a.input, a.gamma, b.input, b.gamma, a.output, b.output }, .{
-            fa.bytes, fa.gamma, fb.bytes, fb.gamma, fa.bytes, fb.bytes,
-        }, @splat(2), 4);
+        const position_bytes: usize = if (position_device.ptr == 0) 0 else @sizeOf(u32);
+        try buffer.validateRegions(7, .{ a.input, a.gamma, b.input, b.gamma, position_device, a.output, b.output }, .{
+            fa.bytes, fa.gamma, fb.bytes, fb.gamma, position_bytes, fa.bytes, fb.bytes,
+        }, .{ 2, 2, 2, 2, 4, 2, 2 }, 5);
         if (ctx.info.compute_major < 8) return error.UnsupportedCudaDevice;
         try self.program.init(ctx);
         var pair: Pair = .{ .planes = .{
@@ -110,6 +111,12 @@ pub const Module = struct {
         var eps = a.eps;
         var alpha = a.log_alpha;
         var args = [_]?*anyopaque{ &pair, &heads, &position, &log_floor, &eps, &alpha };
-        try self.program.launch(ctx, .pair, fa.items, 2, 32, &args);
+        if (position_bytes == 0) {
+            try self.program.launch(ctx, .pair, fa.items, 2, 32, &args);
+        } else {
+            var address = position_device.ptr;
+            args[2] = &address;
+            try self.program.launch(ctx, .pair_at_position, fa.items, 2, 32, &args);
+        }
     }
 };

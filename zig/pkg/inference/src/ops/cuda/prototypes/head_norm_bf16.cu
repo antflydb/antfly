@@ -85,3 +85,12 @@ extern "C" __global__ void antfly_head_scaled_norm_pair_bf16(
     normalize_heads(plane.output, plane.input, plane.gamma, heads, plane.dim, position, log_floor,
                     plane.clip, eps, log_alpha);
 }
+
+extern "C" __global__ void antfly_head_scaled_norm_pair_at_position_bf16(
+    const __grid_constant__ NormPair pair, uint32_t heads, const uint32_t* position,
+    uint32_t log_floor, float eps, float log_alpha
+) {
+    const NormPlane& plane = pair.planes[blockIdx.y];
+    normalize_heads(plane.output, plane.input, plane.gamma, heads, plane.dim, *position, log_floor,
+                    plane.clip, eps, log_alpha);
+}

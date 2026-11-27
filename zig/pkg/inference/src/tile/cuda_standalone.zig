@@ -170,6 +170,7 @@ pub const causal_depthwise4_bf16 = nativeProfile("causal_depthwise4_bf16", "caus
 pub const head_norm_bf16_entries = .{
     .run = "antfly_head_scaled_norm_bf16",
     .pair = "antfly_head_scaled_norm_pair_bf16",
+    .pair_at_position = "antfly_head_scaled_norm_pair_at_position_bf16",
 };
 pub const head_norm_bf16 = nativeProfile("head_norm_bf16", "head_norm_bf16.ptx", "head_norm_bf16.cu", 80, head_norm_bf16_entries, &.{ "--fmad=false", "-std=c++17" });
 pub const residual_block_mix_entries = .{
@@ -206,6 +207,8 @@ pub const routed_block_scaled_matvec_entries = .{
     .pack = "antfly_pack_m16n8_routed_weights_sm120",
     .nvfp4_bf16 = "antfly_routed_e2m1_e4m3_bf16_input_m16n8k16_sm120",
     .mxfp8_bf16 = "antfly_routed_e4m3_e8m0_bf16_input_m16n8k16_sm120",
+    .nvfp4_bf16_swiglu = "antfly_routed_e2m1_e4m3_bf16_input_swiglu_m16n8k16_sm120",
+    .mxfp8_bf16_swiglu = "antfly_routed_e4m3_e8m0_bf16_input_swiglu_m16n8k16_sm120",
     .group_rows = "antfly_group_routed_rows8",
     .group_rows_512 = "antfly_group_routed_rows8_512",
     .group_rows32_4096 = "antfly_group_routed_rows32_4096",

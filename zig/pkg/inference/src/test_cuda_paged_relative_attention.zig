@@ -149,12 +149,24 @@ test "CUDA four-tap convolution and grouped BF16 normalization match separate la
     try norm.run(&ctx, relative);
     query.output = output[2];
     relative.output = output[3];
-    try norm.runPair(&ctx, query, relative);
+    try norm.runPair(&ctx, query, relative, .{});
     const stride = io_bytes + relative_bytes;
     for (0..2) |side| {
         try output[2 * side].copyToHost(&ctx, readback.bytes()[side * stride ..][0..io_bytes]);
         try output[2 * side + 1].copyToHost(&ctx, readback.bytes()[side * stride + io_bytes ..][0..relative_bytes]);
     }
+    try ctx.synchronize();
+    try std.testing.expectEqualSlices(u8, readback.constBytes()[0..stride], readback.constBytes()[stride .. 2 * stride]);
+
+    var position: [4]u8 = undefined;
+    std.mem.writeInt(u32, &position, query.position, .little);
+    var device_position = try upload(&ctx, &position);
+    defer device_position.free(&ctx);
+    query.position = 0;
+    relative.position = 0;
+    try norm.runPair(&ctx, query, relative, device_position);
+    try output[2].copyToHost(&ctx, readback.bytes()[stride..][0..io_bytes]);
+    try output[3].copyToHost(&ctx, readback.bytes()[stride + io_bytes ..][0..relative_bytes]);
     try ctx.synchronize();
     try std.testing.expectEqualSlices(u8, readback.constBytes()[0..stride], readback.constBytes()[stride .. 2 * stride]);
 }

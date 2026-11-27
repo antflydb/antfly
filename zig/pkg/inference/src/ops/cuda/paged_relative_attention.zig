@@ -30,7 +30,8 @@ const head_dim = 128;
 const partial_width = head_dim + 2;
 const keys_per_split = 128;
 const shared_decode_min_position = 4096;
-const shared_decode_window = 1024;
+pub const shared_decode_window = 1024;
+pub const shared_decode_replay_min_position = 64 * keys_per_split;
 const shared_query_rows = 4;
 const shared_query_min_position = 8192;
 const page_rows_min_queries = 16;
@@ -143,9 +144,10 @@ pub const Module = struct {
         self.relative_shared_memory = false;
     }
 
-    pub fn appendReplay(self: *Module, ctx: *Context, binding: cache.StagedView, positions: DeviceBuffer, ids: DeviceBuffer, source: cache.Planes, kv_heads: u32) !void {
+    pub fn appendReplay(self: *Module, ctx: *Context, binding: cache.StagedView, positions: DeviceBuffer, ids: DeviceBuffer, source: cache.Planes, kv_heads: u32, window: u32) !void {
         const bytes = @as(usize, kv_heads) * head_dim * 2;
-        if (binding.visible_start != 0 or binding.first_page != 0 or bytes == 0 or binding.page_tokens == 0) return error.InvalidAttentionGeometry;
+        if (bytes == 0 or binding.page_tokens == 0 or binding.page_count == 0 or
+            (window == 0 and binding.first_page != 0)) return error.InvalidAttentionGeometry;
         const plane_bytes = try std.math.mul(usize, bytes, binding.physical_pages * binding.page_tokens);
         try buffer.validateRegions(6, .{ source.key, source.value, ids, positions, binding.planes.key, binding.planes.value }, .{
             bytes, bytes, binding.page_count * 4, 4, plane_bytes, plane_bytes,
@@ -155,7 +157,9 @@ pub const Module = struct {
         var tokens: u32 = binding.page_tokens;
         var pairs: u32 = @intCast(bytes / 4);
         var pages: u32 = @intCast(binding.physical_pages);
-        var args = [_]?*anyopaque{ &pointers[0], &pointers[1], &pointers[2], &pointers[3], &pointers[4], &pointers[5], &tokens, &pairs, &pages };
+        var page_count: u32 = @intCast(binding.page_count);
+        var window_tokens = window;
+        var args = [_]?*anyopaque{ &pointers[0], &pointers[1], &pointers[2], &pointers[3], &pointers[4], &pointers[5], &tokens, &pairs, &pages, &page_count, &window_tokens };
         try self.program.launch(ctx, .append, (pairs - 1) / 128 + 1, 1, 128, &args);
     }
 
@@ -220,7 +224,7 @@ pub const Module = struct {
         const relative_query_bytes = if (fuse_relative) @as(usize, g.rows_by_heads) * relative_width * 2 else 0;
         const relative_basis_bytes = if (fuse_relative) @as(usize, q.relative_extent) * relative_width * 2 else 0;
         const replay_bytes: usize = if (r.replay_position.ptr == 0) 0 else 4;
-        if (replay_bytes != 0 and (q.rows != 1 or r.kv.first_page != 0 or r.kv.visible_start != 0)) return error.InvalidAttentionGeometry;
+        if (replay_bytes != 0 and q.rows != 1) return error.InvalidAttentionGeometry;
         try buffer.validateRegions(12, .{
             r.query,           r.kv.planes.key,   r.kv.planes.value, r.relative, projection.query, projection.basis, r.sinks, r.gate,
             r.device_page_ids, r.replay_position, r.scratch,         r.output,
@@ -259,8 +263,10 @@ pub const Module = struct {
         const tuned = !self.use_serial_chunks and ctx.info.compute_major == 12 and ctx.info.compute_minor <= 1;
         const parallel = tuned and q.rows == 1 and g.key_tile <= keys_per_split;
         const eager_sm121 = tuned and ctx.info.compute_minor == 1 and replay_bytes == 0;
-        const shared_decode = eager_sm121 and q.rows == 1 and q.start >= shared_decode_min_position and
+        const shared_decode = tuned and ctx.info.compute_minor == 1 and q.rows == 1 and
+            q.start >= (if (replay_bytes == 0) @as(u32, shared_decode_min_position) else shared_decode_replay_min_position) and
             page_tokens == 16 and q.q_heads / q.kv_heads == 3 and (q.window == 0 or q.window == shared_decode_window);
+        if (replay_bytes != 0 and !shared_decode and r.kv.visible_start != 0) return error.InvalidAttentionGeometry;
         const page_rows = eager_sm121 and self.use_page_rows and page_tokens == 16 and q.rows >= page_rows_min_queries and q.start >= page_rows_min_position and
             q.rows % shared_query_rows == 0;
         const share_rows = eager_sm121 and q.window == 0 and q.start >= shared_query_min_position and q.rows % shared_query_rows == 0;

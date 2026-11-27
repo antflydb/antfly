@@ -101,6 +101,12 @@ pub const Bf16Request = struct {
     expert_count: u32,
 };
 
+const WeightedSwiGlu = struct {
+    route_weights: DeviceBuffer,
+    gate_cap: f32,
+    up_cap: f32,
+};
+
 pub const FfnRequest = struct {
     use_pipelined_projection: bool = false,
     format: Format,
@@ -379,10 +385,10 @@ pub const Module = struct {
     /// Multiply BF16 activations by weights expanded from packed checkpoint
     /// fragments to BF16 at the Tensor Core input, with F32 accumulation.
     pub fn runBf16(self: *Module, ctx: *Context, r: Bf16Request) !void {
-        try self.projectBf16(ctx, r, .{});
+        try self.projectBf16(ctx, r, .{}, null);
     }
 
-    fn projectBf16(self: *Module, ctx: *Context, r: Bf16Request, grouped: GroupedRoutes) !void {
+    fn projectBf16(self: *Module, ctx: *Context, r: Bf16Request, grouped: GroupedRoutes, swiglu: ?WeightedSwiGlu) !void {
         const fp4 = r.format == .nvfp4;
         const tile_width: u32 = if (fp4) 64 else 32;
         const scale_group: u32 = if (fp4) 16 else 32;
@@ -395,16 +401,18 @@ pub const Module = struct {
         const weight_rows = try std.math.mul(usize, r.expert_count, r.out_dim);
         const input_elements = try std.math.mul(usize, r.input_rows, r.in_dim);
         const output_elements = try std.math.mul(usize, rows, r.out_dim);
-        const lengths = [7]usize{
+        const route_weights = if (swiglu) |activation| activation.route_weights else DeviceBuffer{};
+        const lengths = [8]usize{
             try std.math.mul(usize, input_elements, 2),
             try std.math.mul(usize, weight_rows, if (fp4) r.in_dim / 2 else r.in_dim),
             try std.math.mul(usize, weight_rows, r.in_dim / scale_group),
             @as(usize, rows) * 4,
             if (fp4) try std.math.mul(usize, r.expert_count, 4) else 0,
             if (fp4) 4 else 0,
-            try std.math.mul(usize, output_elements, 2),
+            if (swiglu != null) @as(usize, rows) * @sizeOf(f32) else 0,
+            try std.math.mul(usize, output_elements, if (swiglu == null) @sizeOf(u16) else 1),
         };
-        try buffer.validateRegions(7, .{ r.input, r.weights.values, r.weights.scales, r.expert_ids, r.weights.amax, r.weights.denominator, r.output }, lengths, .{ 4, 16, 1, 4, 4, 4, 2 }, 6);
+        try buffer.validateRegions(8, .{ r.input, r.weights.values, r.weights.scales, r.expert_ids, r.weights.amax, r.weights.denominator, route_weights, r.output }, lengths, .{ 4, 16, 1, 4, 4, 4, 4, 2 }, 7);
         if (fp4 and r.weights.scales.ptr % 4 != 0) return error.InvalidShape;
         try self.matvec.init(ctx);
         const share_weights = grouped.table.ptr != 0;
@@ -416,7 +424,14 @@ pub const Module = struct {
         var repeat = r.repeat;
         var count = grouped.count.ptr;
         var args = [_]?*anyopaque{ &ptrs[0], &ptrs[1], &ptrs[2], &ptrs[3], &ptrs[4], &ptrs[5], &ptrs[6], &k, &n, &experts, &repeat, &count };
-        if (share_weights) {
+        if (swiglu) |activation| {
+            if (share_weights or r.input_rows != 1) return error.InvalidShape;
+            var weights = route_weights.ptr;
+            var gate_cap = activation.gate_cap;
+            var up_cap = activation.up_cap;
+            var fused_args = args[0..11].* ++ [_]?*anyopaque{ &weights, &gate_cap, &up_cap };
+            try self.matvec.launch(ctx, if (fp4) .nvfp4_bf16_swiglu else .mxfp8_bf16_swiglu, r.out_dim / 16, rows, threads, &fused_args);
+        } else if (share_weights) {
             const entry: Matvec.Entry = switch (grouped.width) {
                 routes_per_group => if (fp4) .nvfp4_bf16_grouped else .mxfp8_bf16_grouped,
                 routes_per_wide_group => if (fp4) .nvfp4_bf16_routes32 else .mxfp8_bf16_routes32,
@@ -460,7 +475,7 @@ pub const Module = struct {
         return groups;
     }
 
-    fn projectFfn(self: *Module, ctx: *Context, precision: ActivationPrecision, projection: Request, input: QuantizeRequest, weights: PackedWeights, grouped: GroupedRoutes) !void {
+    fn projectFfn(self: *Module, ctx: *Context, precision: ActivationPrecision, projection: Request, input: QuantizeRequest, weights: PackedWeights, grouped: GroupedRoutes, swiglu: ?WeightedSwiGlu) !void {
         if (precision == .bf16) {
             try self.projectBf16(ctx, .{
                 .format = projection.format,
@@ -473,7 +488,7 @@ pub const Module = struct {
                 .in_dim = projection.in_dim,
                 .out_dim = projection.out_dim,
                 .expert_count = projection.expert_count,
-            }, grouped);
+            }, grouped, swiglu);
         } else {
             try self.quantize(ctx, input);
             try self.projectBlockScaled(ctx, projection, grouped);
@@ -522,6 +537,11 @@ pub const Module = struct {
         const route_threads: u32 = if (r.experts == 128 and ctx.info.compute_major == 12 and ctx.info.compute_minor <= 1) 32 else 256;
         try self.program.launch(ctx, .route, r.rows, 1, route_threads, &args);
         const grouped = try self.groupRoutes(ctx, r, layout, ids);
+        const swiglu: ?WeightedSwiGlu = if (!self.use_single_route and r.activation_precision == .bf16 and
+            r.rows == 1 and sm120(ctx) and ctx.info.compute_minor == 1)
+            .{ .route_weights = route_weights, .gate_cap = r.gate_cap, .up_cap = r.up_cap }
+        else
+            null;
 
         var quantize_request: QuantizeRequest = .{
             .format = r.format,
@@ -547,13 +567,13 @@ pub const Module = struct {
             .weight_block_scale = r.gate_up.scales,
             .expert_ids = ids,
             .row_outer_scale = outer_scale,
-            .output = gate_up,
+            .output = if (swiglu != null) activated else gate_up,
             .rows = layout.routed_rows,
             .in_dim = r.hidden,
             .out_dim = r.intermediate * 2,
             .expert_count = r.experts,
         };
-        try self.projectFfn(ctx, r.activation_precision, projection, quantize_request, r.gate_up, grouped);
+        try self.projectFfn(ctx, r.activation_precision, projection, quantize_request, r.gate_up, grouped, swiglu);
         var activation_ptrs = [3]u64{ activated.ptr, gate_up.ptr, route_weights.ptr };
         var intermediate = r.intermediate;
         var routed_rows = layout.routed_rows;
@@ -566,7 +586,7 @@ pub const Module = struct {
             var ptrs = [_]u64{ encoded.ptr, block_scale.ptr, outer_scale.ptr, gate_up.ptr, route_weights.ptr, ids.ptr, r.down.amax.ptr, r.down.denominator.ptr };
             var fused_args = [_]?*anyopaque{ &ptrs[0], &ptrs[1], &ptrs[2], &ptrs[3], &ptrs[4], &ptrs[5], &ptrs[6], &ptrs[7], &experts, &gate_cap, &up_cap };
             try self.matvec.launch(ctx, if (fp4) .activate_nvfp4_1152 else .activate_mxfp8_1152, layout.routed_rows, 1, if (fp4) 256 else threads, &fused_args);
-        } else {
+        } else if (swiglu == null) {
             var activation_args = [_]?*anyopaque{ &activation_ptrs[0], &activation_ptrs[1], &activation_ptrs[2], &intermediate, &routed_rows, &gate_cap, &up_cap };
             try self.program.launch(ctx, .activate, (r.intermediate - 1) / threads + 1, layout.routed_rows, threads, &activation_args);
         }
@@ -583,7 +603,7 @@ pub const Module = struct {
         projection.output = down;
         projection.in_dim = r.intermediate;
         projection.out_dim = r.hidden;
-        if (fuse) try self.projectBlockScaled(ctx, projection, grouped) else try self.projectFfn(ctx, r.activation_precision, projection, quantize_request, r.down, grouped);
+        if (fuse) try self.projectBlockScaled(ctx, projection, grouped) else try self.projectFfn(ctx, r.activation_precision, projection, quantize_request, r.down, grouped, null);
         var output = r.output.ptr;
         var routed_output = down.ptr;
         var hidden = r.hidden;

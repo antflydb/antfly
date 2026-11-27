@@ -239,16 +239,18 @@ __device__ void bf16_mma(float (&sum)[4], uint32_t a0, uint32_t a1, uint32_t a2,
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-template<bool FP4, unsigned Routes = 0>
+template<bool FP4, unsigned Routes = 0, bool SwiGlu = false>
 __device__ void project_bf16(
     __nv_bfloat16* output, const uint32_t* act,
     const uint4* weights, const uint8_t* weight_scales, const uint32_t* ids,
     const float* weight_amax, const float* denominator,
     uint32_t k, uint32_t n, uint32_t expert_count, uint32_t repeat,
     const ExpertRouteGroup<Routes == 0 ? routes_per_group : Routes>* groups = nullptr,
-    const uint32_t* group_count = nullptr
+    const uint32_t* group_count = nullptr,
+    const float* route_weights = nullptr, float gate_cap = 0, float up_cap = 0
 ) {
     constexpr bool grouped = Routes != 0;
+    static_assert(!SwiGlu || !grouped, "fused activation requires one route per block");
     constexpr unsigned route_matrices = grouped ? Routes / routes_per_group : 1;
     constexpr unsigned step = FP4 ? 64 : 32;
     constexpr unsigned scale_bytes = FP4 ? 4 : 1;
@@ -273,6 +275,12 @@ __device__ void project_bf16(
                 const unsigned dest = groups[work].rows[index / output_tile];
                 if (dest != UINT32_MAX)
                     output[(size_t)dest * n + column + index % output_tile] = __float2bfloat16_rn(0);
+            }
+        } else if constexpr (SwiGlu) {
+            if (tid < output_tile / 2) {
+                const auto zero = __float2bfloat16_rn(0);
+                output[((size_t)work * n + column) / 2 + tid] =
+                    antfly_routed_swiglu::weighted(zero, zero, route_weights[work], gate_cap, up_cap);
             }
         } else if (tid < output_tile) output[(size_t)work * n + column + tid] = __float2bfloat16_rn(0);
         return;
@@ -323,10 +331,10 @@ __device__ void project_bf16(
             }
             const unsigned pair_shift = FP4 ? quad_lane * 8 : (quad_lane % 2) * 16;
             const unsigned b = t * (step / 2) + part * 8 + quad_lane;
-            const uint32_t w_lo0 = dequantized_bf16_pair<FP4, grouped>(lo0, pair_shift, s0, outer);
-            const uint32_t w_lo1 = dequantized_bf16_pair<FP4, grouped>(lo1, pair_shift, s1, outer);
-            const uint32_t w_hi0 = dequantized_bf16_pair<FP4, grouped>(hi0, pair_shift, s0, outer);
-            const uint32_t w_hi1 = dequantized_bf16_pair<FP4, grouped>(hi1, pair_shift, s1, outer);
+            const uint32_t w_lo0 = dequantized_bf16_pair<FP4, grouped || SwiGlu>(lo0, pair_shift, s0, outer);
+            const uint32_t w_lo1 = dequantized_bf16_pair<FP4, grouped || SwiGlu>(lo1, pair_shift, s1, outer);
+            const uint32_t w_hi0 = dequantized_bf16_pair<FP4, grouped || SwiGlu>(hi0, pair_shift, s0, outer);
+            const uint32_t w_hi1 = dequantized_bf16_pair<FP4, grouped || SwiGlu>(hi1, pair_shift, s1, outer);
             #pragma unroll
             for (unsigned i = 0; i < route_matrices; ++i) {
                 bf16_mma(sum[i], w_lo0, w_lo1, w_hi0, w_hi1, a[i][b], a[i][b + 4]);
@@ -364,7 +372,19 @@ __device__ void project_bf16(
             partial[warp][quad + 8] = sum[0][2];
         }
         __syncthreads();
-        if (tid < output_tile) {
+        if constexpr (SwiGlu) {
+            if (tid < output_tile / 2) {
+                // Round both projected values exactly where the separate
+                // projection writes them before applying weighted SwiGLU.
+                const unsigned gate = 2 * tid;
+                const unsigned up = gate + 1;
+                const float gate_value = (partial[0][gate] + partial[1][gate]) + (partial[2][gate] + partial[3][gate]);
+                const float up_value = (partial[0][up] + partial[1][up]) + (partial[2][up] + partial[3][up]);
+                output[((size_t)work * n + column) / 2 + tid] =
+                    antfly_routed_swiglu::weighted(__float2bfloat16_rn(gate_value), __float2bfloat16_rn(up_value),
+                                                  route_weights[work], gate_cap, up_cap);
+            }
+        } else if (tid < output_tile) {
             const float value = (partial[0][tid] + partial[1][tid]) + (partial[2][tid] + partial[3][tid]);
             output[(size_t)work * n + column + tid] = __float2bfloat16_rn(value);
         }
@@ -581,6 +601,24 @@ extern "C" __global__ void antfly_routed_e4m3_e8m0_bf16_input_m16n8k16_sm120(
     const float* amax, const float* denominator, uint32_t k, uint32_t n, uint32_t experts, uint32_t repeat
 ) {
     project_bf16<false>(out, a, w, ws, ids, amax, denominator, k, n, experts, repeat);
+}
+
+extern "C" __global__ void antfly_routed_e2m1_e4m3_bf16_input_swiglu_m16n8k16_sm120(
+    __nv_bfloat16* out, const uint32_t* a, const uint4* w, const uint8_t* ws, const uint32_t* ids,
+    const float* amax, const float* denominator, uint32_t k, uint32_t n, uint32_t experts, uint32_t repeat,
+    const float* route_weights, float gate_cap, float up_cap
+) {
+    project_bf16<true, 0, true>(out, a, w, ws, ids, amax, denominator, k, n, experts, repeat,
+                               nullptr, nullptr, route_weights, gate_cap, up_cap);
+}
+
+extern "C" __global__ void antfly_routed_e4m3_e8m0_bf16_input_swiglu_m16n8k16_sm120(
+    __nv_bfloat16* out, const uint32_t* a, const uint4* w, const uint8_t* ws, const uint32_t* ids,
+    const float* amax, const float* denominator, uint32_t k, uint32_t n, uint32_t experts, uint32_t repeat,
+    const float* route_weights, float gate_cap, float up_cap
+) {
+    project_bf16<false, 0, true>(out, a, w, ws, ids, amax, denominator, k, n, experts, repeat,
+                               nullptr, nullptr, route_weights, gate_cap, up_cap);
 }
 
 template<unsigned RouteLimit, typename Index = unsigned, unsigned Routes = routes_per_group, unsigned Warps = 8>

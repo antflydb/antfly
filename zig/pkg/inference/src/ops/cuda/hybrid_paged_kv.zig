@@ -302,23 +302,25 @@ pub const Cache = struct {
         };
     }
 
-    /// A stable binding for GPU replay while the configured context fits
-    /// inside the sliding window. Replay consumes the live page IDs and token
-    /// position supplied for each append rather than the maximum visible end.
+    /// Bounds for capture. The replay kernels derive the live range and
+    /// rolling page origin from the device position supplied for each append.
     pub fn replayBinding(self: *Cache, visit: Visit) !StagedView {
         const layout = self.sequence.layout;
         const pending = self.pending orelse return error.KvAppendMissing;
-        if (layout.max_tokens > layout.window_tokens or pending.append.next_tokens != self.committedTokens() + 1)
+        if (pending.append.next_tokens != self.committedTokens() + 1)
             return error.InvalidKvShape;
         const selected = self.bank(visit.group);
         if (visit.slot >= selected.written.len) return error.InvalidKvRange;
+        const last = layout.max_tokens - 1;
+        const start = if (visit.group == .sliding) last -| layout.window_tokens else 0;
+        const first_page = start / layout.page_tokens;
         return .{
             .planes = selected.planes(visit.slot),
-            .first_page = 0,
-            .page_count = (layout.max_tokens - 1) / layout.page_tokens + 1,
+            .first_page = first_page,
+            .page_count = last / layout.page_tokens + 1 - first_page,
             .physical_pages = try layout.pageCapacity(visit.group),
             .page_tokens = layout.page_tokens,
-            .visible_start = 0,
+            .visible_start = start,
             .visible_end = layout.max_tokens,
         };
     }

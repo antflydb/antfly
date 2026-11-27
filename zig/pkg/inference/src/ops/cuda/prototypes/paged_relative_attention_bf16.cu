@@ -61,8 +61,8 @@ __device__ Chunk chunk_range(const PagedRelativeAttentionParams& p, unsigned spl
     const unsigned position = (p.replay_position ? *p.replay_position : p.query_start) + row;
     const unsigned prefix = position + 1;
     const unsigned local_first = p.window != 0 && prefix > p.window ? prefix - p.window : 0u;
-    const unsigned first = max(p.visible_start, local_first);
-    const unsigned splits = p.replay_position ? (prefix - first - 1) / 128 + 1 : p.splits;
+    const unsigned first = p.replay_position ? local_first : max(p.visible_start, local_first);
+    const unsigned splits = p.replay_position ? min(p.splits, (prefix - first - 1) / 128 + 1) : p.splits;
     const unsigned tile = p.replay_position ? (prefix - first - 1) / splits + 1 : p.key_tile;
     const unsigned begin = split < splits ? first + split * tile : prefix;
     return {position, begin, min(prefix, begin + tile)};
@@ -324,10 +324,14 @@ __device__ void copy_cache_vector(__nv_bfloat16* dst, const __nv_bfloat16* src, 
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(offset), "l"(src), "r"(size) : "memory");
 }
 
-__device__ uint32_t cache_page16(const PagedRelativeAttentionParams& p, unsigned position) {
-    const unsigned logical = position / 16 - p.first_page;
+__device__ uint32_t cache_page16(const PagedRelativeAttentionParams& p, unsigned position, unsigned first_page) {
+    const unsigned logical = position / 16 - first_page;
     const uint32_t page = logical < p.page_count ? p.page_ids[logical] : UINT32_MAX;
     return page < p.physical_pages ? page : UINT32_MAX;
+}
+
+__device__ uint32_t cache_page16(const PagedRelativeAttentionParams& p, unsigned position) {
+    return cache_page16(p, position, p.first_page);
 }
 
 using RelativeTile = __nv_bfloat16[mma_keys][head_dim];
@@ -731,6 +735,8 @@ __device__ __forceinline__ void page16_shared_decode(const PagedRelativeAttentio
     const unsigned kv_head = HeadsFirst ? blockIdx.x : blockIdx.y;
     const unsigned first_head = kv_head * heads;
     const Chunk chunk = chunk_range(p, split, 0);
+    const unsigned first_page = p.replay_position && p.window != 0 ?
+        (chunk.position - min(chunk.position, p.window)) / 16 : p.first_page;
     __shared__ float scores[heads][tile_keys];
     __shared__ __nv_bfloat16 values[tile_keys][head_dim];
     __shared__ bool valid[tile_keys];
@@ -747,7 +753,7 @@ __device__ __forceinline__ void page16_shared_decode(const PagedRelativeAttentio
         const unsigned count = min(tile_keys, chunk.end - begin);
         for (unsigned i = warp; i < count; i += warps) {
             const unsigned key_pos = begin + i;
-            const uint32_t page = cache_page16(p, key_pos);
+            const uint32_t page = cache_page16(p, key_pos, first_page);
             const bool present = page != UINT32_MAX;
             if (lane == 0) valid[i] = present;
             if (!present) continue;
@@ -858,12 +864,15 @@ extern "C" __global__ void antfly_paged_relative_gqa_d128_bf16_reduce_sink_gate(
 extern "C" __global__ void antfly_paged_kv_append_bf16(
     uint32_t* key, uint32_t* value, const uint32_t* src_key, const uint32_t* src_value,
     const uint32_t* ids, const uint32_t* position, unsigned page_tokens,
-    unsigned pairs, unsigned physical_pages
+    unsigned pairs, unsigned physical_pages, unsigned page_count, unsigned window
 ) {
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= pairs) return;
     const unsigned slot = *position;
-    const unsigned page = ids[slot / page_tokens];
+    const unsigned origin = window == 0 ? 0 : (slot - min(slot, window)) / page_tokens;
+    const unsigned logical = slot / page_tokens - origin;
+    if (logical >= page_count) return;
+    const unsigned page = ids[logical];
     if (page >= physical_pages) return;
     const size_t dest = ((size_t)page * page_tokens + slot % page_tokens) * pairs + i;
     key[dest] = src_key[i];

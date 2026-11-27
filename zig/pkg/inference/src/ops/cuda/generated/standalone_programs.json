@@ -439,7 +439,8 @@
     "producer": "head_norm_bf16.cu",
     "exports": [
       "antfly_head_scaled_norm_bf16",
-      "antfly_head_scaled_norm_pair_bf16"
+      "antfly_head_scaled_norm_pair_bf16",
+      "antfly_head_scaled_norm_pair_at_position_bf16"
     ],
     "nvcc_flags": [
       "--fmad=false",
@@ -521,6 +522,8 @@
       "antfly_pack_m16n8_routed_weights_sm120",
       "antfly_routed_e2m1_e4m3_bf16_input_m16n8k16_sm120",
       "antfly_routed_e4m3_e8m0_bf16_input_m16n8k16_sm120",
+      "antfly_routed_e2m1_e4m3_bf16_input_swiglu_m16n8k16_sm120",
+      "antfly_routed_e4m3_e8m0_bf16_input_swiglu_m16n8k16_sm120",
       "antfly_group_routed_rows8",
       "antfly_group_routed_rows8_512",
       "antfly_group_routed_rows32_4096",
