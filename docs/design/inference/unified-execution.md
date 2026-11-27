@@ -1366,6 +1366,13 @@ Baseline/candidate p50 was 1370.54/1370.02 ms and p95 was
 by at most 0.11% at p50 or p95. The run shared Spark with a separate
 184 MiB CUDA context.
 
+The same Spark revisions also passed the exact-output EmbeddingGemma 2
+HTTP comparison with 16 measured requests per side in AA, ABBA and BB.
+Text p50/p95 changed from 7.91/8.24 to 7.98/8.58 ms. Two distinct
+equal-length audio clips in one request changed from 49.90/50.45 to
+48.56/49.51 ms. All arms confirmed CUDA selection. The experimental
+CUDA audio graph flag was enabled for both binaries.
+
 At `34296ffb5a`, five Native CPU fixtures passed for resident handoff and
 task output custody. The incremental decoder matched host-reference logits
 after the encoder and destination session handles closed, and allocation
