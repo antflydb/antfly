@@ -41561,8 +41561,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 // The logits may still be pending in our active frame while
                 // argmaxLogitsDevice runs on its own command buffer — drain
                 // the frame first.
-                if (metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime)) {
-                    if (metal_runtime.termite_metal_decode_runtime_flush_active_frame(self.provider_impl.raw_decode_runtime) != 0) {
+                const runtime = self.provider_impl.raw_decode_runtime;
+                if (metal_runtime.activeFrameHasWork(runtime) or metal_runtime.hasSubmittedFrame(runtime)) {
+                    if (metal_runtime.termite_metal_decode_runtime_flush_active_frame(runtime) != 0) {
                         return error.MetalFrameSyncFailed;
                     }
                 }
@@ -41570,6 +41571,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     @import("../execution/transfer_audit.zig").download(@sizeOf(u32));
                     return @intCast(token_id);
                 }
+                const row = try last_row.toHostSlice();
+                if (row.len != dim) return error.InvalidTensorShape;
+                return argmaxHostRow(row);
             }
         }
         const data = if (buf.metal_tensor) |*metal_tensor|
@@ -41577,7 +41581,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         else
             buf.data;
         if (data.len != elements) return error.InvalidTensorShape;
-        const last_row = data[elements - dim ..];
+        return argmaxHostRow(data[elements - dim ..]);
+    }
+
+    fn argmaxHostRow(last_row: []const f32) u32 {
         var best_idx: u32 = 0;
         var best_val = last_row[0];
         for (last_row[1..], 1..) |value, idx| {
