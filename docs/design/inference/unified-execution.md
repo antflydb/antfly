@@ -1418,6 +1418,13 @@ pages/s. Fused arms measured 20.55 and 20.03 pages/s and bound
 was about 2.4% lower, so the result supports leaving fusion opt-in.
 The single 64-page-request cohort remains a separate serving case.
 
+At `4e39bbadfa`, all 12 scoped Spark CUDA tests passed without skips.
+Released EmbeddingGemma 2 grouped audio repeated its vectors exactly
+and replayed twice. Both planned and captured arena sizes were
+38,017,792 bytes. The invocation-report test verified that the
+workspace receipt preserves the submission route. The production
+layout still comes from an observed allocation schedule.
+
 This audit reconciles the original `2f2438e67f` implementation review
 against merged main `4951ca13f9` with later evidence. Each serving
 measurement identifies the revision that ran.
