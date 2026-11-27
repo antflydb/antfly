@@ -692,6 +692,22 @@ pub const PdfOperationDeadline = struct {
         return if (platform_time.monotonicNs() >= self.deadline_ns) self.timeout_error else err;
     }
 
+    fn checkOwner(self: *const @This()) !void {
+        self.owner.check() catch |err| return self.owner.classifyError(err);
+    }
+
+    fn beginDownstream(self: *const @This()) !u64 {
+        try self.checkOwner();
+        const now = platform_time.monotonicNs();
+        if (now >= self.deadline_ns) return self.timeout_error;
+        return now;
+    }
+
+    fn endDownstream(self: *@This(), started_ns: u64) !void {
+        self.excludeDownstreamTime(started_ns, platform_time.monotonicNs());
+        try self.checkOwner();
+    }
+
     fn excludeDownstreamTime(self: *@This(), started_ns: u64, finished_ns: u64) void {
         // Keep the total inspection budget across pages. Only time spent
         // outside the reader (e.g. in OCR) is excluded from that budget.
@@ -754,14 +770,19 @@ pub const PdfRenderSession = struct {
         return .{ .parsed = try pdf.reader.Reader.initWithDecodeLimitsAndCancellation(alloc, pdf_bytes, decode_limits, cancellation) };
     }
 
-    /// Build a task-local render session over a prepared document's immutable
-    /// xref, trailer, and page index. The prepared source must outlive this
-    /// session; mutable decode caches and diagnostics remain independently
-    /// owned by `alloc`. The caller must finish `prepareForBatchRendering`
-    /// before publishing the source to other task executors.
-    pub fn initFromPrepared(alloc: Allocator, source: *PdfRenderSession, cancellation: PdfCancellationProbe) !PdfRenderSession {
+    /// Fork a session that the owner may still use for serial rendering.
+    /// Refresh its template before taking the snapshot for this reader.
+    fn initFromPrepared(alloc: Allocator, source: *PdfRenderSession, cancellation: PdfCancellationProbe) !PdfRenderSession {
         try source.ensureRenderForkTemplate(cancellation);
-        return .{ .parsed = try source.render_fork_template.?.instantiate(alloc, cancellation) };
+        return initFromFrozen(alloc, source, cancellation);
+    }
+
+    /// Fork a published source without refreshing its shared metadata. The
+    /// owner must prepare the template before publication and keep the source
+    /// alive and immutable until all readers release their borrows.
+    pub fn initFromFrozen(alloc: Allocator, source: *const PdfRenderSession, cancellation: PdfCancellationProbe) !PdfRenderSession {
+        const template = if (source.render_fork_template) |*value| value else return error.PdfSourceNotPrepared;
+        return .{ .parsed = try template.instantiate(alloc, cancellation) };
     }
 
     pub fn deinit(self: *PdfRenderSession) void {
@@ -3557,12 +3578,17 @@ fn extractParsedPdfStreaming(alloc: Allocator, parsed: *pdf.reader.Reader, conte
 
 fn extractParsedPdfStreamingWithTextCache(alloc: Allocator, parsed: *pdf.reader.Reader, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, sink: UnitSink, cache: ?PdfPageTextCache, inspection_budget: ?*PdfOperationDeadline) !void {
     const page_count = parsed.pageCount() catch |err| return parsed.cancellationProbe().classifyError(err);
+    const begin_started_ns = if (inspection_budget) |budget| try budget.beginDownstream() else 0;
     try sink.on_begin(sink.ptr, .{ .content_type = content_type, .route_type = "pdf" });
+    if (inspection_budget) |budget| try budget.endDownstream(begin_started_ns);
 
     var page_num: usize = 1;
     var cursor: usize = 0;
     while (page_num <= page_count) : (page_num += 1) {
-        if (inspection_budget) |budget| budget.inspection_page = page_num;
+        if (inspection_budget) |budget| {
+            budget.inspection_page = page_num;
+            budget.probe().check() catch |err| return budget.classifyError(err);
+        }
         const force_ocr = ocr_mode == .always;
         // Keep embedded text even in forced mode so OCR is not a blind
         // replacement for usable born-digital content.
@@ -3631,19 +3657,20 @@ fn extractParsedPdfStreamingWithTextCache(alloc: Allocator, parsed: *pdf.reader.
         text_blocks = &.{};
         extraction_warning = null;
         errdefer unit.deinit(alloc);
-        if (inspection_budget) |budget| {
-            budget.probe().check() catch |err| return budget.classifyError(err);
-            const started_ns = platform_time.monotonicNs();
-            try sink.on_unit(sink.ptr, &unit);
-            budget.excludeDownstreamTime(started_ns, platform_time.monotonicNs());
-        } else {
-            try sink.on_unit(sink.ptr, &unit);
-        }
+        const unit_started_ns = if (inspection_budget) |budget| try budget.beginDownstream() else 0;
+        try sink.on_unit(sink.ptr, &unit);
+        if (inspection_budget) |budget| try budget.endDownstream(unit_started_ns);
         unit.deinit(alloc);
         cursor += page_text_len;
     }
 
+    if (inspection_budget) |budget| {
+        // The final callback can flush an OCR batch. The operation's reader
+        // budget stops here, but request cancellation remains in force.
+        _ = try budget.beginDownstream();
+    }
     try sink.on_end(sink.ptr);
+    if (inspection_budget) |budget| try budget.checkOwner();
 }
 
 fn extractPdfTextRegionsFromRunsAlloc(

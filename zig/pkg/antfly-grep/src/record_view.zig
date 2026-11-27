@@ -95,11 +95,12 @@ pub fn view(a: A, source: std.json.Value, fields: Fields, content: []const u8) !
     var out: std.json.ObjectMap = .empty;
     try out.put(a, "version", .{ .integer = 1 });
     try out.put(a, "content", .{ .string = content });
-    inline for (.{ "uri", "path", "revision", "indexed_at", "permissions", "metadata" }) |name| {
-        const path = @field(fields, name);
-        const value = document.at(source, path) orelse if (comptime std.mem.eql(u8, name, "metadata")) std.json.Value{ .object = .empty } else return error.MissingSourceField;
+    inline for (.{ "uri", "path", "revision", "permissions" }) |name| {
+        const value = document.at(source, @field(fields, name)) orelse return error.MissingSourceField;
         try out.put(a, name, value);
     }
+    if (document.at(source, fields.indexed_at)) |indexed_at| try out.put(a, "indexed_at", indexed_at);
+    try out.put(a, "metadata", document.at(source, fields.metadata) orelse .{ .object = .empty });
     return .{ .object = out };
 }
 
