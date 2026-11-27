@@ -652,7 +652,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
         /// it under the same lane as its producer, before the page/epoch dies.
         pub fn retireProjected(ctx: *LightOnStreamContext, projected: *qwen3vl_projector.ProjectedImages) void {
             if (projected.device_embeddings != null) {
-                ctx.lockStepForCleanup();
+                ctx.lockStepForCleanup(.projected_image_cleanup);
                 defer ctx.unlockStep();
                 projected.deinitWithCleanup(.{ .boundary = ctx.cleanup_owner.epoch(), .operation = if (ctx.cb) |*backend| backend.operationToken() else null });
             } else projected.deinit();
@@ -746,9 +746,9 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                 @import("../ops/cuda/cuda_compute.zig").CudaCompute.invalidateLightOnDecodeGraphWithCleanup(cb, .{ .boundary = ctx.cleanup_owner.epoch(), .operation = cb.operationToken() }, reason) catch platform.inference_process_supervisor.restartWorker();
             };
         }
-        pub fn lockStepForCleanup(ctx: *LightOnStreamContext) void {
+        pub fn lockStepForCleanup(ctx: *LightOnStreamContext, reason: @import("../ops/cuda/cuda_compute.zig").CudaCompute.GraphRetirement) void {
             ctx.pageAccess(.{}, true).acquireForCleanup();
-            ctx.invalidateCudaDecodeGraph(.foreground_cleanup);
+            ctx.invalidateCudaDecodeGraph(reason);
         }
         pub fn releasePageBudget(ctx: *LightOnStreamContext, reserved: runtime.tier.memory.AdmissionAmounts) void {
             ctx.pageAccess(.{}, true).acquireForCleanup();
