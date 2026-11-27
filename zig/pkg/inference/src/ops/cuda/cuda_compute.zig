@@ -22562,19 +22562,13 @@ fn sourceConvolutionF32(self: *CudaCompute, value: @FieldType(ops.Bf16SourceOper
         module.retireOldestAfterCompletion();
     }
     const plan = (try module.planForCapture(key, capture)) orelse return error.SourceArithmeticUnavailable;
-    const input_count = try checkedMul(try checkedMul(key.batch, key.inputs), try checkedMul(key.height, key.width));
-    const weight_count = try checkedMul(try checkedMul(key.outputs, key.inputs), 9);
-    const count = try checkedMul(try checkedMul(key.batch, key.outputs), try checkedMul(key.outHeight(), key.outWidth()));
+    const scratch = try Conv.SourceWorkspace.forKey(key, plan.workspace_bytes);
+    const input_count = scratch.input.bytes / @sizeOf(u16);
+    const weight_count = scratch.weight.bytes / @sizeOf(u16);
+    const count = scratch.output.bytes / @sizeOf(u16);
     const input = try sourceScalarTensor(value.input, input_count);
     const weight = try sourceScalarTensor(value.weight, weight_count);
     const bias = if (value.bias) |tensor| try sourceScalarTensor(tensor, key.outputs) else null;
-    const scratch = try Conv.SourceWorkspace.resolve(
-        try checkedMul(input_count, 2),
-        try checkedMul(weight_count, 2),
-        try checkedMul(count, 2),
-        if (bias != null) try checkedMul(key.outputs, 2) else 0,
-        plan.workspace_bytes,
-    );
     if (scratch.bytes > cudaTempArenaAdmissionBudgetBytes(self)) return error.MemoryBudgetExceeded;
     var temporary = try SourceLinearTemporary.acquireKnownCapture(self, scratch.bytes, scratch.bytes, capture);
     defer temporary.deinit(self);

@@ -267,6 +267,16 @@ pub const SourceWorkspace = struct {
     vendor: Span,
     bytes: usize,
 
+    pub fn forKey(key: Key, vendor_bytes: usize) !SourceWorkspace {
+        if (key.storage != .bf16 or !key.eligible()) return error.UnsupportedSourceArithmeticGeometry;
+        const mul = std.math.mul;
+        const scalar = @sizeOf(u16);
+        const input = try mul(usize, try mul(usize, key.batch, key.inputs), try mul(usize, key.height, key.width));
+        const weights = try mul(usize, try mul(usize, key.outputs, key.inputs), key.kernel * key.kernel);
+        const output = try mul(usize, try mul(usize, key.batch, key.outputs), try mul(usize, key.outHeight(), key.outWidth()));
+        return resolve(try mul(usize, input, scalar), try mul(usize, weights, scalar), try mul(usize, output, scalar), if (key.bias == .add) key.outputs * scalar else 0, vendor_bytes);
+    }
+
     pub fn resolve(input: usize, weight: usize, output: usize, bias: usize, vendor: usize) !SourceWorkspace {
         var cursor: usize = 0;
         return .{
@@ -894,4 +904,7 @@ test "source convolution separates pack storage and SDK workspace at CUDA alignm
     try std.testing.expectEqual(@as(usize, 768), layout.vendor.offset);
     try std.testing.expectEqual(@as(usize, 1536), layout.bytes);
     try std.testing.expectError(error.Overflow, SourceWorkspace.resolve(std.math.maxInt(usize), 1, 1, 0, 0));
+    const key: Key = .{ .storage = .bf16, .batch = 1, .inputs = 1, .outputs = 2, .height = 3, .width = 3, .kernel = 3, .stride = 2, .padding = 1 };
+    const source = try SourceWorkspace.forKey(key, 513);
+    try std.testing.expectEqualDeep(try SourceWorkspace.resolve(18, 36, 16, 4, 513), source);
 }
