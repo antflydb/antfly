@@ -53,13 +53,14 @@ Seeds travel in the document, under reserved fields keyed by enrichment name:
 | Document extraction asset | `{ "text": ... }`: already extracted plain text, or `{ "units": [...] }`: the extracted units with pages, layout and transcript phrases (see Rich document extraction). No fetch, OCR or transcription runs. |
 | Document embedding | Array of finite numbers; length must match the enrichment's dimensions. |
 | Chunk-derived embedding | `[{ chunk_id, window_index?, vector }]`. |
-| Sparse embedding | `{ "indices": [...], "values": [...] }` with strictly ascending indices, or a token-weight map. |
+| Sparse embedding | `{ "indices": [...], "values": [...] }` with unique indices, or a token-weight map. |
+| Chunk-derived sparse embedding | `[{ chunk_id, parent_unit_id?, indices, values }]`, one per chunk (never windowed). |
 | Chunk collection | `_chunks.<name>`: `[{ _chunk_id (or _id), _content, _start_char?, _end_char?, _start_time_ms?, _end_time_ms?, _parent_unit_id?, _speaker? }]`. Unit-scoped fields only for chunks of a document extraction's units. |
 
 `"<name>": null` drops accepted output so the producer regenerates it
-(chunk-derived vectors are embedded again in the same write; with no embedder
-configured the write fails rather than keep the seeded vectors); omitting a
-name is a no-op. A name may be seeded through only one reserved
+(chunk-derived vectors, dense or sparse, including those of extraction unit
+chunks, are embedded again in the same write; with no embedder configured the
+write fails rather than keep the seeded vectors); omitting a name is a no-op. A name may be seeded through only one reserved
 field: an asset or embedding under `_chunks` (or a chunk collection under
 `_artifacts`) is a kind mismatch.
 
@@ -312,9 +313,9 @@ and transcript phrases) whenever the extraction has pages, typed or several
 units, and unit-scoped chunks with their unit and speaker.
 
 Vectors of those unit chunks are seeded under the embedding's name with each
-entry naming its unit:
-`[{ parent_unit_id, chunk_id, vector }]` (no `window_index`: unit chunks are
-embedded whole). The extraction producer writes a seeded vector in place of
+entry naming its unit: dense `[{ parent_unit_id, chunk_id, vector }]` (no
+`window_index`: unit chunks are embedded whole) and sparse
+`[{ parent_unit_id, chunk_id, indices, values }]`. The extraction producer writes a seeded vector in place of
 queueing that chunk for its provider batch, with exactly the identity it
 would record (the chunk text's hash at the provider generation) and the
 `seeded` flag; unseeded chunks are embedded as usual. Each vector must name a
@@ -322,19 +323,25 @@ text chunk of an extracted unit (`InvalidArtifactSeed`), the extraction must
 be seeded in the same write, and an embedder must be configured so the
 identity can name its provider generation (`ArtifactSeedNotAccepted`
 otherwise). Replays reuse the vectors through the ordinary hash checks; a
-changed chunk text is embedded again. Outcomes are reported per embedding
-name, and the seed view exports the vectors with their unit.
+changed chunk text is embedded again. `null` re-materializes the units and
+embeds their chunks again in that write (`deleted`). Outcomes are reported per
+embedding name, and the seed view exports the vectors with their unit.
+
+Chunk-derived sparse vectors of plain chunk collections bind the same way as
+dense ones: each seed names a chunk of this revision (inline chunks, or chunk
+rows prepared in the write) and is stored with the identity the sparse
+producer records for that chunk text at its revision; unseeded chunks are
+embedded.
 
 ## Not yet accepted
 
 These fail with `ArtifactSeedNotAccepted` rather than regenerating:
 
-- `null` for vectors of extraction unit chunks (they regenerate with their
-  units), and sparse vectors of unit chunks.
 - Producers whose input is outside the write: neighbor or context sources,
   committed graph adjacency, grouped sources, prior context, privacy-managed
-  artifacts, PDF page-image embeddings, chunk-derived sparse vectors, chunks
-  of transcription (`media_output`) assets.
+  artifacts, PDF page-image embeddings, chunks of transcription
+  (`media_output`) assets.
+- Windowed (media-window) sparse chunk vectors, which have no seed shape.
 - `copy` assets (free to regenerate).
 
 ## Remaining work

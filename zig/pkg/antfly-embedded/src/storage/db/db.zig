@@ -109131,7 +109131,8 @@ test "db artifact seeds accept vectors of extraction unit chunks without embeddi
     defer cleanupTempDir(path);
     var fake = TestAssetProducer{};
     var embedder = CountingDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a", .asset_producer = fake.producer(), .dense_embedder = embedder.interface() } });
+    var sparse = CountingSparseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a", .asset_producer = fake.producer(), .dense_embedder = embedder.interface(), .sparse_embedder = sparse.interface() } });
     defer db.close();
     try db.addEnrichment(.{
         .name = "extracted",
@@ -109143,16 +109144,20 @@ test "db artifact seeds accept vectors of extraction unit chunks without embeddi
     try db.addEnrichment(.{ .name = "passages", .kind = .chunk, .source_artifact_name = "extracted", .field = "text", .chunk_size = 64, .chunk_overlap = 0 });
     try db.addEnrichment(.{ .name = "passages_dense", .kind = .embedding, .field = "text", .source_artifact_name = "passages", .expected_dims = 3 });
     try db.addIndex(.{ .name = "passages_vectors", .kind = .dense_vector, .config_json = "{\"field\":\"dense\",\"dims\":3,\"embedding_name\":\"passages_dense\"}" });
+    try db.addEnrichment(.{ .name = "passages_sparse", .kind = .embedding, .field = "text", .source_artifact_name = "passages" });
+    try db.addIndex(.{ .name = "passages_terms", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse\",\"embedding_name\":\"passages_sparse\"}" });
 
     const units =
         \\"units":[{"text":"Quarterly revenue grew.","page_number":1},{"text":"Margins improved.","page_number":2}]
     ;
     const seeded = "{\"url\":\"https://example.invalid/report.pdf\",\"_artifacts\":{\"extracted\":{\"value\":{" ++ units ++ "}}," ++
-        "\"passages_dense\":{\"value\":[{\"parent_unit_id\":\"page:000001\",\"chunk_id\":0,\"vector\":[1,0,0]},{\"parent_unit_id\":\"page:000002\",\"chunk_id\":0,\"vector\":[0,1,0]}]}}}";
+        "\"passages_dense\":{\"value\":[{\"parent_unit_id\":\"page:000001\",\"chunk_id\":0,\"vector\":[1,0,0]},{\"parent_unit_id\":\"page:000002\",\"chunk_id\":0,\"vector\":[0,1,0]}]}," ++
+        "\"passages_sparse\":{\"value\":[{\"parent_unit_id\":\"page:000001\",\"chunk_id\":0,\"indices\":[1,2],\"values\":[0.5,0.5]},{\"parent_unit_id\":\"page:000002\",\"chunk_id\":0,\"indices\":[3],\"values\":[1]}]}}}";
     try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = seeded }}, .sync_level = .write });
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
     try std.testing.expectEqual(@as(usize, 0), embedder.calls);
+    try std.testing.expectEqual(@as(usize, 0), sparse.calls);
     try std.testing.expectEqual(@as(u64, 2), db.core.index_manager.denseIndex("passages_vectors").?.index.metadata.active_count);
 
     // The seed view exports them with their unit.
@@ -109165,10 +109170,15 @@ test "db artifact seeds accept vectors of extraction unit chunks without embeddi
         try std.testing.expectEqual(@as(usize, 2), vectors.len);
         try std.testing.expectEqualStrings("page:000001", vectors[0].object.get("parent_unit_id").?.string);
         try std.testing.expect(vectors[0].object.get("window_index") == null);
+        const terms = parsed.value.object.get("_artifacts").?.object.get("passages_sparse").?.object.get("value").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), terms.len);
+        try std.testing.expectEqualStrings("page:000002", terms[1].object.get("parent_unit_id").?.string);
+        try std.testing.expectEqual(@as(i64, 3), terms[1].object.get("indices").?.array.items[0].integer);
     }
 
     // Resuming the same import is unchanged and embeds nothing.
     try expectSeedPlanOutcome(alloc, &db, "{\"inserts\":{\"doc:a\":" ++ seeded ++ "}}", "\"name\":\"passages_dense\",\"outcome\":\"unchanged\"");
+    try expectSeedPlanOutcome(alloc, &db, "{\"inserts\":{\"doc:a\":" ++ seeded ++ "}}", "\"name\":\"passages_sparse\",\"outcome\":\"unchanged\"");
     try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = seeded }}, .sync_level = .write });
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(usize, 0), embedder.calls);
@@ -109179,7 +109189,22 @@ test "db artifact seeds accept vectors of extraction unit chunks without embeddi
     try db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = partial }}, .sync_level = .write });
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(usize, 1), embedder.calls);
+    try std.testing.expectEqual(@as(usize, 2), sparse.calls);
     try std.testing.expectEqual(@as(u64, 4), db.core.index_manager.denseIndex("passages_vectors").?.index.metadata.active_count);
+
+    // `null` drops the accepted vectors: the embedder produces them again,
+    // in this same write, with the units it materializes.
+    const regenerated = "{\"url\":\"https://example.invalid/report.pdf\",\"_artifacts\":{\"extracted\":{\"value\":{" ++ units ++ "}},\"passages_dense\":null}}";
+    try expectSeedPlanOutcome(alloc, &db, "{\"inserts\":{\"doc:a\":" ++ regenerated ++ "}}", "\"name\":\"passages_dense\",\"outcome\":\"deleted\"");
+    const before_regeneration = embedder.calls;
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = regenerated }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(before_regeneration + 2, embedder.calls);
+    {
+        var view = (try db.lookup(alloc, "doc:a", .{ .fields = &.{"_artifacts"}, .include_all_fields = false, .artifact_view = .seed })).?;
+        defer view.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, view.json, "[1,0,0]") == null);
+    }
 
     // A vector must name a chunk of an extracted unit, and needs the
     // extraction seed in the same write.
@@ -109193,6 +109218,55 @@ test "db artifact seeds accept vectors of extraction unit chunks without embeddi
         return error.TestUnexpectedResult
     else |err|
         try std.testing.expect(err == error.ArtifactSeedNotAccepted);
+}
+
+test "db artifact seeds accept chunk-derived sparse vectors per chunk" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var sparse = CountingSparseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a", .sparse_embedder = sparse.interface() } });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "sv_chunks",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse_embedding\",\"generator\":{\"kind\":\"sparse_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_sparse_v1\"}}",
+    });
+    const chunks =
+        \\"_chunks":{"body_chunks_v1":[{"_chunk_id":0,"_content":"abcdefghij","_start_char":0,"_end_char":10},{"_chunk_id":1,"_content":"klmno","_start_char":10,"_end_char":15}]}
+    ;
+    const seeded = "{\"body\":\"abcdefghijklmno\"," ++ chunks ++ ",\"_artifacts\":{\"chunk_sparse_v1\":{\"value\":[{\"chunk_id\":0,\"indices\":[1,7],\"values\":[0.5,0.25]},{\"chunk_id\":1,\"indices\":[9],\"values\":[1]}]}}}";
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = seeded }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 0), sparse.calls);
+    {
+        var view = (try db.lookup(alloc, "doc:a", .{ .fields = &.{"_artifacts"}, .include_all_fields = false, .artifact_view = .seed })).?;
+        defer view.deinit(alloc);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, view.json, .{});
+        defer parsed.deinit();
+        const vectors = parsed.value.object.get("_artifacts").?.object.get("chunk_sparse_v1").?.object.get("value").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), vectors.len);
+        try std.testing.expectEqual(@as(i64, 9), vectors[1].object.get("indices").?.array.items[0].integer);
+    }
+    try expectSeedPlanOutcome(alloc, &db, "{\"inserts\":{\"doc:a\":" ++ seeded ++ "}}", "\"name\":\"chunk_sparse_v1\",\"outcome\":\"unchanged\"");
+
+    // Partial seeding embeds the rest; a seed must name a chunk.
+    const partial = "{\"body\":\"abcdefghijklmno\"," ++ chunks ++ ",\"_artifacts\":{\"chunk_sparse_v1\":{\"value\":[{\"chunk_id\":0,\"indices\":[1],\"values\":[1]}]}}}";
+    try db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = partial }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 1), sparse.calls);
+    const orphan = "{\"body\":\"abcdefghijklmno\"," ++ chunks ++ ",\"_artifacts\":{\"chunk_sparse_v1\":{\"value\":[{\"chunk_id\":5,\"indices\":[1],\"values\":[1]}]}}}";
+    if (db.batch(.{ .writes = &.{.{ .key = "doc:c", .value = orphan }}, .sync_level = .write })) |_|
+        return error.TestUnexpectedResult
+    else |err|
+        try std.testing.expect(err == error.InvalidArtifactSeed);
+
+    // `null` embeds the chunks again in the same write.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"," ++ chunks ++ ",\"_artifacts\":{\"chunk_sparse_v1\":null}}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 3), sparse.calls);
 }
 
 fn addSeedRoundTripTestIndexes(db: *DB) !void {

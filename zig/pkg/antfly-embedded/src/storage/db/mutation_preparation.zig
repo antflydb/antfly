@@ -95,6 +95,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const installSeededChunks = S.installSeededChunks;
         const installGeneratedChunks = S.installGeneratedChunks;
         const computeSeededSparseRequestDerived = S.computeSeededSparseRequestDerived;
+        const computeSeededSparseChunkRequestDerived = S.computeSeededSparseChunkRequestDerived;
         const computeSparseRequestDerived = S.computeSparseRequestDerived;
         const containsName = S.containsName;
         const deinitOwnedGraphEdgeDelete = S.deinitOwnedGraphEdgeDelete;
@@ -1495,7 +1496,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (seed == null) unseeded_index += 1;
                     if (seed) |entry| {
                         try requireSeedableRequest(request);
-                        if (request.kind == .dense_embedding and request.upstream_artifact_name.len != 0 and try upstreamIsDocumentExtraction(alloc, self, request.upstream_artifact_name)) {
+                        if ((request.kind == .dense_embedding or request.kind == .sparse_embedding) and request.upstream_artifact_name.len != 0 and try upstreamIsDocumentExtraction(alloc, self, request.upstream_artifact_name)) {
                             // Vectors of extraction unit chunks are accepted
                             // by the extraction seeded in this write; only
                             // an explicit seed reaches it.
@@ -1504,7 +1505,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             try appendGeneratedEnrichmentRef(alloc, &planned, request);
                             continue;
                         }
-                        if (entry == .delete and ((request.kind == .dense_embedding and request.input_kind != .document) or request.kind == .chunk_text)) {
+                        if (entry == .delete and (((request.kind == .dense_embedding or request.kind == .sparse_embedding) and request.input_kind != .document) or request.kind == .chunk_text)) {
                             // Chunk-derived vectors live beneath each chunk
                             // and keep their index entries, and a chunk
                             // collection was chunked again above: both are
@@ -1714,8 +1715,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             try indexPendingArtifactWrites(alloc, &pending_writes, artifact_writes.items, &indexed_write_count);
                             const before = sparse_embeddings.items.len;
                             const reuse_unchanged = !containsName(force_generated_artifact_names, requestArtifactName(request)) and !containsName(force_generated_artifact_names, requestEmbeddingName(request));
-                            if (seed) |entry| {
-                                try appendSeedOutcome(alloc, &seed_outcomes, request, try computeSeededSparseRequestDerived(alloc, self, cleaned, request, entry.artifact.value, &artifact_writes, &sparse_embeddings, preparation_memo, row_policy, entry.artifact.source));
+                            if (seed != null and seed.? == .delete) {
+                                // A dropped chunk-derived output is embedded
+                                // again now; with no embedder the write fails
+                                // visibly rather than keep the seeded vectors.
+                                computeSparseRequestDerived(alloc, self, cleaned, request, &artifact_writes, &pending_deletes.keys, &sparse_embeddings, &chunk_cache, preparation_memo, &pending_writes, false) catch |err| switch (err) {
+                                    error.MissingSparseEmbedder => return error.ArtifactSeedNotAccepted,
+                                    else => return err,
+                                };
+                            } else if (seed) |entry| {
+                                const result = if (request.input_kind == .document)
+                                    try computeSeededSparseRequestDerived(alloc, self, cleaned, request, entry.artifact.value, &artifact_writes, &sparse_embeddings, preparation_memo, row_policy, entry.artifact.source)
+                                else
+                                    try computeSeededSparseChunkRequestDerived(alloc, self, cleaned, request, entry.artifact.value, &artifact_writes, &sparse_embeddings, &chunk_cache, preparation_memo, row_policy, entry.artifact.source);
+                                try appendSeedOutcome(alloc, &seed_outcomes, request, result);
                             } else computeSparseRequestDerived(alloc, self, cleaned, request, &artifact_writes, &pending_deletes.keys, &sparse_embeddings, &chunk_cache, preparation_memo, &pending_writes, reuse_unchanged) catch |err| switch (err) {
                                 error.MissingSparseEmbedder => {
                                     if (precompute_mode == .direct) return error.CommitRequirementUnavailable;
@@ -2364,9 +2377,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (request.requires_committed_graph or request.neighbor_context_json.len != 0 or request.context_sources_json.len != 0) return error.ArtifactSeedNotAccepted;
             if (request.group_source_json.len != 0) return error.ArtifactSeedNotAccepted;
             // Chunks and chunk-derived vectors of an upstream asset bind to the
-            // upstream output prepared in the same write; sparse vectors of
-            // chunks bind per chunk and are not seedable.
-            if (request.kind == .sparse_embedding and request.upstream_artifact_name.len != 0) return error.ArtifactSeedNotAccepted;
+            // upstream output prepared in the same write.
             if (request.embedding_input == .pdf_page_images) return error.ArtifactSeedNotAccepted;
         }
 

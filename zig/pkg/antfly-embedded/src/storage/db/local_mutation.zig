@@ -482,6 +482,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const installGeneratedChunks = materialization.installGeneratedChunks;
         pub const ExtractionSeed = materialization.ExtractionSeed;
         pub const computeSeededSparseRequestDerived = materialization.computeSeededSparseRequestDerived;
+        pub const computeSeededSparseChunkRequestDerived = materialization.computeSeededSparseChunkRequestDerived;
         pub const computeDocumentExtractionAssetRequestDerived = materialization.computeDocumentExtractionAssetRequestDerived;
         pub const computeSparseMaterializedChunkRequest = materialization.computeSparseMaterializedChunkRequest;
         pub const computeSparseRequestDerived = materialization.computeSparseRequestDerived;

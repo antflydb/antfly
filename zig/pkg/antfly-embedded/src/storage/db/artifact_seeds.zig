@@ -816,6 +816,100 @@ test "artifact seed unit chunk vectors name their unit and never window" {
     try std.testing.expectError(error.ArtifactSeedNotAccepted, decodeUnitChunkVectorsAlloc(alloc, windowed.value, 2));
 }
 
+/// One seeded sparse vector of a chunk: of a plain chunk collection, or of
+/// a document extraction's unit chunk (`parent_unit_id`). Sparse chunk
+/// vectors are never windowed.
+pub const SparseChunkVector = struct {
+    parent_unit_id: ?[]const u8 = null,
+    chunk_id: u32,
+    sparse: SparseVector,
+};
+
+pub fn freeSparseChunkVectors(alloc: Allocator, vectors: []SparseChunkVector) void {
+    for (vectors) |entry| entry.sparse.deinit(alloc);
+    if (vectors.len > 0) alloc.free(vectors);
+}
+
+pub const ChunkScope = enum { plain, unit };
+
+/// `[{chunk_id, parent_unit_id?, indices, values}]`, each chunk at most once.
+/// `parent_unit_id` is required for unit chunks and refused otherwise.
+/// Unit ids borrow from `value`.
+pub fn decodeSparseChunkVectorsAlloc(alloc: Allocator, value: std.json.Value, scope: ChunkScope) ![]SparseChunkVector {
+    if (value != .array or value.array.items.len == 0 or value.array.items.len > max_seed_chunks * 64) return error.InvalidArtifactSeed;
+    var out = std.ArrayListUnmanaged(SparseChunkVector).empty;
+    errdefer {
+        for (out.items) |entry| entry.sparse.deinit(alloc);
+        out.deinit(alloc);
+    }
+    for (value.array.items) |item| {
+        if (item != .object) return error.InvalidArtifactSeed;
+        var unit_id: ?[]const u8 = null;
+        var chunk_id: ?u32 = null;
+        var weights = std.json.ObjectMap.empty;
+        defer weights.deinit(alloc);
+        var it = item.object.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const field = entry.value_ptr.*;
+            if (std.mem.eql(u8, key, "chunk_id")) {
+                chunk_id = try jsonU32(field);
+            } else if (std.mem.eql(u8, key, "parent_unit_id")) {
+                if (scope == .plain) return error.ArtifactSeedNotAccepted;
+                if (field != .string or field.string.len == 0 or field.string.len > max_name_bytes) return error.InvalidArtifactSeed;
+                unit_id = field.string;
+            } else if (std.mem.eql(u8, key, "indices") or std.mem.eql(u8, key, "values")) {
+                try weights.put(alloc, key, field);
+            } else if (std.mem.eql(u8, key, "window_index")) {
+                return error.ArtifactSeedNotAccepted;
+            } else return error.InvalidArtifactSeed;
+        }
+        if (scope == .unit and unit_id == null) return error.InvalidArtifactSeed;
+        const sparse = try decodeSparseVectorAlloc(alloc, .{ .object = weights });
+        errdefer sparse.deinit(alloc);
+        try out.append(alloc, .{ .parent_unit_id = unit_id, .chunk_id = chunk_id orelse return error.InvalidArtifactSeed, .sparse = sparse });
+    }
+    for (out.items, 0..) |entry, i| {
+        for (out.items[i + 1 ..]) |other| {
+            if (entry.chunk_id != other.chunk_id) continue;
+            if (entry.parent_unit_id == null or std.mem.eql(u8, entry.parent_unit_id.?, other.parent_unit_id.?)) return error.InvalidArtifactSeed;
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+test "artifact seed sparse chunk vectors bind per chunk and unit" {
+    const alloc = std.testing.allocator;
+    var plain = try parseForTest(alloc,
+        \\[{"chunk_id":0,"indices":[1,4],"values":[0.5,0.25]},{"chunk_id":1,"indices":[2],"values":[1]}]
+    );
+    defer plain.deinit();
+    const vectors = try decodeSparseChunkVectorsAlloc(alloc, plain.value, .plain);
+    defer freeSparseChunkVectors(alloc, vectors);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 4 }, vectors[0].sparse.indices);
+    try std.testing.expectError(error.InvalidArtifactSeed, decodeSparseChunkVectorsAlloc(alloc, plain.value, .unit));
+
+    var unit = try parseForTest(alloc,
+        \\[{"parent_unit_id":"page:000001","chunk_id":0,"indices":[3],"values":[1]},{"parent_unit_id":"page:000002","chunk_id":0,"indices":[3],"values":[2]}]
+    );
+    defer unit.deinit();
+    const unit_vectors = try decodeSparseChunkVectorsAlloc(alloc, unit.value, .unit);
+    defer freeSparseChunkVectors(alloc, unit_vectors);
+    try std.testing.expectEqualStrings("page:000002", unit_vectors[1].parent_unit_id.?);
+    try std.testing.expectError(error.ArtifactSeedNotAccepted, decodeSparseChunkVectorsAlloc(alloc, unit.value, .plain));
+
+    for ([_][]const u8{
+        "[{\"chunk_id\":0,\"indices\":[1],\"values\":[1]},{\"chunk_id\":0,\"indices\":[2],\"values\":[1]}]",
+        "[{\"chunk_id\":0,\"indices\":[1,1],\"values\":[1,1]}]",
+        "[{\"indices\":[1],\"values\":[1]}]",
+        "[{\"chunk_id\":0,\"vector\":[1]}]",
+    }) |bad| {
+        var doc = try parseForTest(alloc, bad);
+        defer doc.deinit();
+        try std.testing.expectError(error.InvalidArtifactSeed, decodeSparseChunkVectorsAlloc(alloc, doc.value, .plain));
+    }
+}
+
 pub fn freeChunkVectors(alloc: Allocator, vectors: []ChunkVector) void {
     for (vectors) |entry| alloc.free(entry.vector);
     alloc.free(vectors);

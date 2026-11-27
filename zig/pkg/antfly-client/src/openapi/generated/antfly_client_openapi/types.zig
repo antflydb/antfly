@@ -2827,7 +2827,7 @@ pub const ArtifactRepairReason = enum {
     }
 };
 
-/// An already computed result for a named enrichment, written as `_artifacts.<name>` in a document or transform. The enrichment defines the output contract (content type, dimensions, vector space); the seed does not repeat it. `"<name>": null` drops the accepted output so its producer regenerates it; omitting a name leaves it unchanged. `value` by enrichment kind: - Text asset: a string (`""` is a valid, complete empty result), or `{ "text": "..." }`. - JSON asset: any JSON value. - Document extraction asset: `{ "text": "..." }`, the already extracted plain text, or `{ "units": [ExtractionUnitSeed] }`, the extracted units themselves with their pages, layout and transcript phrases. No fetch, OCR or transcription runs; `source` identifies the remote object it was extracted from. - Document embedding: an array of finite numbers. - Chunk-derived embedding: an array of `ChunkVectorSeed`. - Sparse embedding: `{ "indices": [...], "values": [...] }` with strictly ascending indices. Descriptive read fields (`artifact_id`, `artifact_ref`, `kind`, `status`, `dims`, `items`, `content_type`) and internal routing fields are rejected.
+/// An already computed result for a named enrichment, written as `_artifacts.<name>` in a document or transform. The enrichment defines the output contract (content type, dimensions, vector space); the seed does not repeat it. `"<name>": null` drops the accepted output so its producer regenerates it; omitting a name leaves it unchanged. `value` by enrichment kind: - Text asset: a string (`""` is a valid, complete empty result), or `{ "text": "..." }`. - JSON asset: any JSON value. - Document extraction asset: `{ "text": "..." }`, the already extracted plain text, or `{ "units": [ExtractionUnitSeed] }`, the extracted units themselves with their pages, layout and transcript phrases. No fetch, OCR or transcription runs; `source` identifies the remote object it was extracted from. - Document embedding: an array of finite numbers. - Chunk-derived embedding: an array of `ChunkVectorSeed`. - Sparse embedding: `{ "indices": [...], "values": [...] }` with unique indices. - Chunk-derived sparse embedding: an array of `SparseChunkVectorSeed`. For chunk-derived vectors (dense or sparse, including those of a document extraction's unit chunks), `null` embeds the chunks again in the same write; an embedder must be configured. Descriptive read fields (`artifact_id`, `artifact_ref`, `kind`, `status`, `dims`, `items`, `content_type`) and internal routing fields are rejected.
 pub const ArtifactSeed = struct {
     /// The seeded result; its shape follows the enrichment kind.
     value: std.json.Value,
@@ -60867,6 +60867,45 @@ pub const SortProfile = struct {
 pub const SourceContentPart = struct {
     type: []const u8,
     source: std.json.Value,
+};
+
+/// One seeded sparse vector of a chunk. Sparse chunk vectors are never windowed. Vectors of a document extraction's unit chunks name their unit with `parent_unit_id` (every entry) and are accepted with the extraction seed in the same write; plain chunk vectors must not name one. Every entry must name a chunk of this revision; chunks without a seeded vector are embedded as usual.
+pub const SparseChunkVectorSeed = struct {
+    chunk_id: i64,
+    parent_unit_id: ?[]const u8 = null,
+    indices: []const i64,
+    values: []const f64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "chunk_id", "chunk_id", false },
+        .{ "parent_unit_id", "parent_unit_id", true },
+        .{ "indices", "indices", false },
+        .{ "values", "values", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("chunk_id");
+        try jw.write(self.chunk_id);
+        if (self.parent_unit_id) |value| {
+            try jw.objectField("parent_unit_id");
+            try jw.write(value);
+        }
+        try jw.objectField("indices");
+        try jw.write(self.indices);
+        try jw.objectField("values");
+        try jw.write(self.values);
+        try jw.endObject();
+    }
 };
 
 pub const SqlSettingDatabaseDefault = struct {

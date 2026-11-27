@@ -1878,10 +1878,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             if (try acceptSeededUnitChunkVector(alloc, db, runtime, doc_key, unit.unit_id, chunk_key, @intCast(chunk.chunk_id), chunk_text, pending, vector_seeds, vector_policy, vector_results, artifact_writes, dense_embeddings)) continue;
                             if (dense_embedder) |embedder| try appendChunkToPendingDenseChunkEmbedding(alloc, runtime.?, embedder, doc_key, chunk_key, chunk_text, pending, artifact_writes, dense_embeddings);
                         }
-                        if (sparse_embedder) |embedder| {
-                            for (sparse_pending.items) |*pending| {
-                                try appendChunkToPendingSparseChunkEmbedding(alloc, runtime.?, embedder, chunk_key, chunk_text, pending, artifact_writes, sparse_embeddings);
-                            }
+                        for (sparse_pending.items) |*pending| {
+                            if (try acceptSeededUnitChunkSparse(alloc, db, runtime, doc_key, unit.unit_id, chunk_key, @intCast(chunk.chunk_id), chunk_text, pending, vector_seeds, vector_policy, vector_results, artifact_writes, sparse_embeddings)) continue;
+                            if (sparse_embedder) |embedder| try appendChunkToPendingSparseChunkEmbedding(alloc, runtime.?, embedder, chunk_key, chunk_text, pending, artifact_writes, sparse_embeddings);
                         }
                     }
 
@@ -8065,8 +8064,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             policy: artifact_seeds.ConflictPolicy,
             binding: ?artifact_seeds.Source,
         ) !artifact_seeds.Result {
-            // Chunk-derived sparse vectors bind per chunk; not seedable yet.
-            if (requestUsesChunkSource(request)) return error.ArtifactSeedNotAccepted;
+            // Chunk-derived sparse vectors bind per chunk.
+            if (requestUsesChunkSource(request)) return error.InvalidArgument;
             const runtime = S.ownerField(db, "enrichment_runtime").* orelse return error.ArtifactSeedNotAccepted;
             var sparse_embedder = (runtime.config.sparse_embedder orelse return error.ArtifactSeedNotAccepted).withRequestContext(requestContext(artifact_writes));
             const embedding_name = requestEmbeddingName(request);
@@ -8092,22 +8091,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const existing_key = try embeddingArtifactKeyForBaseAlloc(alloc, request.doc_key, embedding_name);
             defer alloc.free(existing_key);
-            const existing: ?artifact_seeds.Result = existing: {
-                const raw = (try S.ownerField(db, "core").*.getStoreValue(alloc, existing_key)) orelse break :existing null;
-                defer alloc.free(raw);
-                const header = enrichment_artifact_codec.decodeHeader(raw) catch break :existing null;
-                if (header.kind != .sparse_embedding) break :existing null;
-                const origin: artifact_seeds.Origin = if (header.flags.authored) .external else .generated;
-                if (!header.flags.authored and (!header.flags.has_source_hash or header.source_hash != source_hash)) break :existing null;
-                const stored = enrichment_artifact_codec.decodeSparseEmbeddingAlloc(alloc, raw) catch break :existing .{ .outcome = .conflict, .existing_origin = origin };
-                defer alloc.free(stored.indices);
-                defer alloc.free(stored.values);
-                break :existing .{
-                    .outcome = if (std.mem.eql(u32, stored.indices, sparse.indices) and std.mem.eql(f32, stored.values, sparse.values)) .unchanged else .conflict,
-                    .existing_origin = origin,
-                };
-            };
-            const decision = seedDecision(existing, policy);
+            const decision = seedDecision(try seededSparseExisting(alloc, db, existing_key, source_hash, sparse), policy);
             if (decision.outcome == .unchanged or decision.outcome == .conflict) {
                 try appendDerivedSparseEmbeddingForConsumers(alloc, sparse_embeddings, request.doc_key, existing_key, &.{}, &.{}, consumer_indexes);
                 return decision;
@@ -8125,6 +8109,169 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .chunk_id = std.mem.readInt(u32, parent[parent.len - 4 ..][0..4], .big),
                 .window = internal_keys.mediaWindowIndex(key) orelse 0,
             };
+        }
+
+        /// The chunk inputs a seeded chunk vector binds to: inline chunks of
+        /// this document revision, or materialized chunk rows prepared in
+        /// this batch (seeded or generated). Stored rows of an earlier
+        /// revision cannot establish that binding.
+        fn collectSeedChunkSources(
+            alloc: Allocator,
+            db: anytype,
+            doc_value: []const u8,
+            request: enrichment_types.GeneratedEnrichmentRequest,
+            artifact_writes: anytype,
+            cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
+            sources: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
+        ) !void {
+            switch (request.input_kind) {
+                .inline_chunks => {
+                    var created: usize = 0;
+                    const inline_sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, cache, &created);
+                    defer alloc.free(inline_sources);
+                    sources.appendSlice(alloc, inline_sources) catch |err| {
+                        for (inline_sources) |source| {
+                            alloc.free(source.key);
+                            alloc.free(source.text);
+                        }
+                        return err;
+                    };
+                },
+                .materialized_chunks => {
+                    const artifact_name = requestArtifactName(request);
+                    const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "chunk", artifact_name);
+                    defer alloc.free(prefix);
+                    var seen = std.StringHashMapUnmanaged(void).empty;
+                    defer seen.deinit(alloc);
+                    var bytes: usize = 0;
+                    var i = artifact_writes.items.len;
+                    while (i > 0) {
+                        i -= 1;
+                        const write = artifact_writes.items[i];
+                        if (!std.mem.startsWith(u8, write.key, prefix) or !internal_keys.matchesChunkArtifactName(write.key, artifact_name)) continue;
+                        if (seededChunkIdentity(write.key) == null) continue;
+                        const entry = try seen.getOrPut(alloc, write.key);
+                        if (entry.found_existing) continue;
+                        _ = try appendMaterializedChunkSourceToBatch(alloc, sources, &bytes, write.key, write.value, request.source_field);
+                    }
+                },
+                .document => unreachable,
+            }
+        }
+
+        /// Output already accepted for this sparse input, compared with the seed.
+        fn seededSparseExisting(alloc: Allocator, db: anytype, artifact_key: []const u8, source_hash: u64, sparse: artifact_seeds.SparseVector) !?artifact_seeds.Result {
+            const raw = (try S.ownerField(db, "core").*.getStoreValue(alloc, artifact_key)) orelse return null;
+            defer alloc.free(raw);
+            const header = enrichment_artifact_codec.decodeHeader(raw) catch return null;
+            if (header.kind != .sparse_embedding) return null;
+            const origin: artifact_seeds.Origin = if (header.flags.authored) .external else if (header.flags.seeded) .seeded else .generated;
+            if (!header.flags.authored and (!header.flags.has_source_hash or header.source_hash != source_hash)) return null;
+            const stored = enrichment_artifact_codec.decodeSparseEmbeddingAlloc(alloc, raw) catch return .{ .outcome = .conflict, .existing_origin = origin };
+            defer alloc.free(stored.indices);
+            defer alloc.free(stored.values);
+            return .{
+                .outcome = if (std.mem.eql(u32, stored.indices, sparse.indices) and std.mem.eql(f32, stored.values, sparse.values)) .unchanged else .conflict,
+                .existing_origin = origin,
+            };
+        }
+
+        /// Writes one seeded sparse chunk vector bound to `source_hash`, or
+        /// attaches consumers to accepted output for the same input.
+        fn applySeededSparseChunkVector(
+            alloc: Allocator,
+            db: anytype,
+            chunk_key: []const u8,
+            embedding_name: []const u8,
+            source_hash: u64,
+            sparse: artifact_seeds.SparseVector,
+            policy: artifact_seeds.ConflictPolicy,
+            consumer_indexes: []const []const u8,
+            artifact_writes: anytype,
+            sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
+        ) !artifact_seeds.Result {
+            const existing_key = try embeddingArtifactKeyForBaseAlloc(alloc, chunk_key, embedding_name);
+            defer alloc.free(existing_key);
+            const decision = seedDecision(try seededSparseExisting(alloc, db, existing_key, source_hash, sparse), policy);
+            if (decision.outcome == .unchanged or decision.outcome == .conflict) {
+                try appendDerivedSparseEmbeddingForConsumers(alloc, sparse_embeddings, chunk_key, existing_key, &.{}, &.{}, consumer_indexes);
+                return decision;
+            }
+            const artifact_key = try appendSparseEmbeddingArtifactWrite(alloc, artifact_writes, chunk_key, embedding_name, .{ .seeded = source_hash }, sparse.indices, sparse.values);
+            defer alloc.free(artifact_key);
+            try appendDerivedSparseEmbeddingForConsumers(alloc, sparse_embeddings, chunk_key, artifact_key, sparse.indices, sparse.values, consumer_indexes);
+            return decision;
+        }
+
+        /// Seeded chunk-derived sparse vectors, one per chunk. Chunks without
+        /// a seeded vector are embedded as usual.
+        pub fn computeSeededSparseChunkRequestDerived(
+            alloc: Allocator,
+            db: anytype,
+            doc_value: []const u8,
+            request: enrichment_types.GeneratedEnrichmentRequest,
+            seed_value: std.json.Value,
+            artifact_writes: anytype,
+            sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
+            cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
+            memo: ?*GeneratedEmbeddingMemo,
+            policy: artifact_seeds.ConflictPolicy,
+            binding: ?artifact_seeds.Source,
+        ) !artifact_seeds.Result {
+            if (!requestUsesChunkSource(request)) return error.InvalidArgument;
+            try artifact_seeds.rejectSourceHash(binding);
+            const runtime = S.ownerField(db, "enrichment_runtime").* orelse return error.ArtifactSeedNotAccepted;
+            var sparse_embedder = (runtime.config.sparse_embedder orelse return error.ArtifactSeedNotAccepted).withRequestContext(requestContext(artifact_writes));
+            const embedding_name = requestEmbeddingName(request);
+            const generation = if (memo) |cache_memo| try cache_memo.sparseGeneration(sparse_embedder, embedding_name) else try sparse_embedder.captureGeneration(alloc, embedding_name);
+            sparse_embedder = sparse_embedder.withGeneration(generation);
+            const revision = if (memo) |cache_memo| try cache_memo.sparseRevision(sparse_embedder, embedding_name) else try sparse_embedder.captureRevision(alloc, embedding_name);
+            const consumer_indexes: []const []const u8 = request.consumer_indexes;
+            if (consumer_indexes.len == 0) return error.ArtifactSeedNotAccepted;
+            const seeds = try artifact_seeds.decodeSparseChunkVectorsAlloc(alloc, seed_value, .plain);
+            defer artifact_seeds.freeSparseChunkVectors(alloc, seeds);
+
+            var sources = std.ArrayListUnmanaged(ChunkEmbeddingSource).empty;
+            defer {
+                for (sources.items) |source| {
+                    alloc.free(source.key);
+                    alloc.free(source.text);
+                }
+                sources.deinit(alloc);
+            }
+            try collectSeedChunkSources(alloc, db, doc_value, request, artifact_writes, cache, &sources);
+
+            var result: ?artifact_seeds.Result = null;
+            const used = try alloc.alloc(bool, seeds.len);
+            defer alloc.free(used);
+            @memset(used, false);
+            var chunk_texts = std.ArrayListUnmanaged([]const u8).empty;
+            defer chunk_texts.deinit(alloc);
+            var source_indexes = std.ArrayListUnmanaged(usize).empty;
+            defer source_indexes.deinit(alloc);
+            for (sources.items, 0..) |source, source_index| {
+                const identity = seededChunkIdentity(source.key) orelse return error.InvalidArtifactSeed;
+                const seed_index = for (seeds, 0..) |seed, index| {
+                    if (seed.chunk_id == identity.chunk_id) break index;
+                } else null;
+                if (seed_index == null or identity.window != 0) {
+                    // A windowed chunk has no sparse seed shape; it, and any
+                    // unseeded chunk, is embedded.
+                    if (seed_index != null) return error.ArtifactSeedNotAccepted;
+                    try chunk_texts.append(alloc, source.text);
+                    try source_indexes.append(alloc, source_index);
+                    continue;
+                }
+                used[seed_index.?] = true;
+                const source_hash = enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, source.text, revision);
+                const decision = try applySeededSparseChunkVector(alloc, db, source.key, embedding_name, source_hash, seeds[seed_index.?].sparse, policy, consumer_indexes, artifact_writes, sparse_embeddings);
+                result = if (result) |prior| prior.merge(decision) else decision;
+            }
+            // Every seed names a chunk of this revision.
+            for (used) |was_used| if (!was_used) return error.InvalidArtifactSeed;
+            try flushGeneratedSparseChunkBatch(alloc, runtime, sparse_embedder, embedding_name, request.producer_json, request.reprocess_generation, revision, artifact_writes, sparse_embeddings, sources.items, &source_indexes, &chunk_texts, consumer_indexes);
+            try sparse_embedder.requireRevision(alloc, embedding_name, revision);
+            return result orelse .{ .outcome = .accepted };
         }
 
         /// Seeded chunk-derived vectors. Chunks without a seeded vector are
@@ -8165,39 +8312,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 sources.deinit(alloc);
             }
-            switch (request.input_kind) {
-                .inline_chunks => {
-                    var created: usize = 0;
-                    const inline_sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, cache, &created);
-                    defer alloc.free(inline_sources);
-                    sources.appendSlice(alloc, inline_sources) catch |err| {
-                        for (inline_sources) |source| {
-                            alloc.free(source.key);
-                            alloc.free(source.text);
-                        }
-                        return err;
-                    };
-                },
-                .materialized_chunks => {
-                    const artifact_name = requestArtifactName(request);
-                    const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "chunk", artifact_name);
-                    defer alloc.free(prefix);
-                    var seen = std.StringHashMapUnmanaged(void).empty;
-                    defer seen.deinit(alloc);
-                    var bytes: usize = 0;
-                    var i = artifact_writes.items.len;
-                    while (i > 0) {
-                        i -= 1;
-                        const write = artifact_writes.items[i];
-                        if (!std.mem.startsWith(u8, write.key, prefix) or !internal_keys.matchesChunkArtifactName(write.key, artifact_name)) continue;
-                        if (seededChunkIdentity(write.key) == null) continue;
-                        const entry = try seen.getOrPut(alloc, write.key);
-                        if (entry.found_existing) continue;
-                        _ = try appendMaterializedChunkSourceToBatch(alloc, &sources, &bytes, write.key, write.value, request.source_field);
-                    }
-                },
-                .document => unreachable,
-            }
+            try collectSeedChunkSources(alloc, db, doc_value, request, artifact_writes, cache, &sources);
 
             var result: ?artifact_seeds.Result = null;
             const used = try alloc.alloc(bool, seeds.len);
@@ -8452,8 +8567,81 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         /// Seeded vectors of one embedding over an extraction's unit chunks.
         pub const UnitVectorSeed = struct {
             name: []const u8,
-            vectors: []artifact_seeds.UnitChunkVector,
+            vectors: []artifact_seeds.UnitChunkVector = &.{},
+            sparse_vectors: []artifact_seeds.SparseChunkVector = &.{},
+            /// `null`: the embedder produces these vectors again in this write.
+            regenerate: bool = false,
+
+            fn deinit(self: UnitVectorSeed, alloc: Allocator) void {
+                artifact_seeds.freeUnitChunkVectors(alloc, self.vectors);
+                artifact_seeds.freeSparseChunkVectors(alloc, self.sparse_vectors);
+            }
         };
+
+        /// Every seeded vector names a text chunk of an extracted unit.
+        fn requireUnitChunkVectorsBound(alloc: Allocator, entry: DocumentExtractionChunkView, units: []const document_extraction_mod.Unit, vectors: anytype) !void {
+            var bound: usize = 0;
+            for (units) |unit| {
+                var named = false;
+                for (vectors) |vector| {
+                    if (std.mem.eql(u8, vector.parent_unit_id.?, unit.unit_id)) named = true;
+                }
+                if (!named) continue;
+                const chunks = try documentUnitChunksAlloc(alloc, entry, unit);
+                defer chunker_mod.freeChunks(alloc, chunks);
+                for (vectors) |vector| {
+                    if (!std.mem.eql(u8, vector.parent_unit_id.?, unit.unit_id)) continue;
+                    for (chunks) |chunk| {
+                        if (chunk.chunk_id == vector.chunk_id and chunk.isText()) break;
+                    } else return error.InvalidArtifactSeed;
+                    bound += 1;
+                }
+            }
+            if (bound != vectors.len) return error.InvalidArtifactSeed;
+        }
+
+        fn recordUnitVectorResult(alloc: Allocator, results: ?*std.StringArrayHashMapUnmanaged(artifact_seeds.Result), name: []const u8, decision: artifact_seeds.Result) !void {
+            const map = results orelse return;
+            if (map.getPtr(name)) |existing| {
+                existing.* = existing.merge(decision);
+                return;
+            }
+            const owned = try alloc.dupe(u8, name);
+            errdefer alloc.free(owned);
+            try map.put(alloc, owned, decision);
+        }
+
+        /// The sparse counterpart of `acceptSeededUnitChunkVector`.
+        fn acceptSeededUnitChunkSparse(
+            alloc: Allocator,
+            db: anytype,
+            runtime: ?*enrichment_runtime_mod.EnrichmentRuntime,
+            doc_key: []const u8,
+            unit_id: []const u8,
+            chunk_key: []const u8,
+            chunk_id: u32,
+            chunk_text: []const u8,
+            pending: *PendingDocumentUnitSparseChunkEmbedding,
+            vector_seeds: []const UnitVectorSeed,
+            policy: artifact_seeds.ConflictPolicy,
+            vector_results: ?*std.StringArrayHashMapUnmanaged(artifact_seeds.Result),
+            artifact_writes: anytype,
+            sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
+        ) !bool {
+            const sparse = found: for (vector_seeds) |seed_set| {
+                if (!std.mem.eql(u8, seed_set.name, pending.embedding_name)) continue;
+                for (seed_set.sparse_vectors) |entry| {
+                    if (entry.chunk_id == chunk_id and std.mem.eql(u8, entry.parent_unit_id.?, unit_id)) break :found entry.sparse;
+                }
+            } else return false;
+            const rt = runtime orelse return error.ArtifactSeedNotAccepted;
+            const revision = pending.revision orelse return error.ArtifactSeedNotAccepted;
+            if (pending.reprocess_generation == null) pending.reprocess_generation = try enrichment_runtime_mod.embeddingReprocessGeneration(rt, doc_key, pending.embedding_name);
+            const source_hash = enrichment_runtime_mod.hashEmbeddingSourceAtRevision(chunk_text, pending.producer_json, pending.reprocess_generation.?, revision);
+            const decision = try applySeededSparseChunkVector(alloc, db, chunk_key, pending.embedding_name, source_hash, sparse, policy, pending.consumer_indexes, artifact_writes, sparse_embeddings);
+            try recordUnitVectorResult(alloc, vector_results, pending.embedding_name, decision);
+            return true;
+        }
 
         /// Writes the seeded vector of one unit chunk in place of embedding
         /// it, with exactly the input identity the producer would record for
@@ -8498,15 +8686,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const existing_key = try embeddingArtifactKeyForBaseAlloc(alloc, chunk_key, pending.embedding_name);
             defer alloc.free(existing_key);
             const decision = seedDecision(try seededDenseExisting(alloc, db, existing_key, source_hash, vector), policy);
-            if (vector_results) |results| {
-                if (results.getPtr(pending.embedding_name)) |existing| {
-                    existing.* = existing.merge(decision);
-                } else {
-                    const owned = try alloc.dupe(u8, pending.embedding_name);
-                    errdefer alloc.free(owned);
-                    try results.put(alloc, owned, decision);
-                }
-            }
+            try recordUnitVectorResult(alloc, vector_results, pending.embedding_name, decision);
             if (decision.outcome == .unchanged or decision.outcome == .conflict) {
                 try appendDerivedDenseEmbeddingForConsumers(alloc, dense_embeddings, chunk_key, doc_key, existing_key, &.{}, pending.consumer_indexes);
                 return true;
@@ -8998,46 +9178,58 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
             var unit_vector_seeds = std.ArrayListUnmanaged(UnitVectorSeed).empty;
             defer {
-                for (unit_vector_seeds.items) |seed_set| artifact_seeds.freeUnitChunkVectors(alloc, seed_set.vectors);
+                for (unit_vector_seeds.items) |seed_set| seed_set.deinit(alloc);
                 unit_vector_seeds.deinit(alloc);
             }
             if (extraction_seed) |seed| if (seed.chunk_seeds) |seeds| for (seeded_chunk_views) |entry| {
-                // Sparse vectors of unit chunks have no seed shape.
-                for (entry.sparse_embeddings) |embedding| {
-                    if (seeds.artifact(embedding.name) != null) return error.ArtifactSeedNotAccepted;
-                }
+                const extraction_runtime = S.ownerField(db, "enrichment_runtime").*;
                 for (entry.dense_embeddings) |embedding| {
                     const vector_entry = seeds.artifact(embedding.name) orelse continue;
-                    const envelope = switch (vector_entry) {
-                        .artifact => |value| value,
-                        // Regeneration of unit-chunk vectors follows the units.
-                        .delete, .chunks => return error.ArtifactSeedNotAccepted,
-                    };
-                    try artifact_seeds.rejectSourceHash(envelope.source);
-                    const vectors = try artifact_seeds.decodeUnitChunkVectorsAlloc(alloc, envelope.value, embedding.expected_dims);
-                    var vectors_owned = true;
-                    defer if (vectors_owned) artifact_seeds.freeUnitChunkVectors(alloc, vectors);
-                    // Every vector names a text chunk of an extracted unit.
-                    var bound: usize = 0;
-                    for (extraction.units) |unit| {
-                        var named = false;
-                        for (vectors) |vector| {
-                            if (std.mem.eql(u8, vector.parent_unit_id, unit.unit_id)) named = true;
-                        }
-                        if (!named) continue;
-                        const chunks = try documentUnitChunksAlloc(alloc, entry, unit);
-                        defer chunker_mod.freeChunks(alloc, chunks);
-                        for (vectors) |vector| {
-                            if (!std.mem.eql(u8, vector.parent_unit_id, unit.unit_id)) continue;
-                            for (chunks) |chunk| {
-                                if (chunk.chunk_id == vector.chunk_id and chunk.isText()) break;
-                            } else return error.InvalidArtifactSeed;
-                            bound += 1;
-                        }
+                    switch (vector_entry) {
+                        // `null`: the embedder produces them again here, with
+                        // the units this write materializes.
+                        .delete => {
+                            const runtime = extraction_runtime orelse return error.ArtifactSeedNotAccepted;
+                            if (runtime.config.dense_embedder == null) return error.ArtifactSeedNotAccepted;
+                            try unit_vector_seeds.append(alloc, .{ .name = embedding.name, .regenerate = true });
+                            try recordUnitVectorResult(alloc, seed.unit_vector_results, embedding.name, .{ .outcome = .deleted });
+                        },
+                        .chunks => return error.UnknownArtifactSeed,
+                        .artifact => |envelope| {
+                            try artifact_seeds.rejectSourceHash(envelope.source);
+                            const vectors = try artifact_seeds.decodeUnitChunkVectorsAlloc(alloc, envelope.value, embedding.expected_dims);
+                            var vectors_owned = true;
+                            defer if (vectors_owned) artifact_seeds.freeUnitChunkVectors(alloc, vectors);
+                            const Named = struct { parent_unit_id: ?[]const u8, chunk_id: u32 };
+                            const named = try alloc.alloc(Named, vectors.len);
+                            defer alloc.free(named);
+                            for (vectors, named) |vector, *slot| slot.* = .{ .parent_unit_id = vector.parent_unit_id, .chunk_id = vector.chunk_id };
+                            try requireUnitChunkVectorsBound(alloc, entry, extraction.units, named);
+                            try unit_vector_seeds.append(alloc, .{ .name = embedding.name, .vectors = vectors });
+                            vectors_owned = false;
+                        },
                     }
-                    if (bound != vectors.len) return error.InvalidArtifactSeed;
-                    try unit_vector_seeds.append(alloc, .{ .name = embedding.name, .vectors = vectors });
-                    vectors_owned = false;
+                }
+                for (entry.sparse_embeddings) |embedding| {
+                    const vector_entry = seeds.artifact(embedding.name) orelse continue;
+                    switch (vector_entry) {
+                        .delete => {
+                            const runtime = extraction_runtime orelse return error.ArtifactSeedNotAccepted;
+                            if (runtime.config.sparse_embedder == null) return error.ArtifactSeedNotAccepted;
+                            try unit_vector_seeds.append(alloc, .{ .name = embedding.name, .regenerate = true });
+                            try recordUnitVectorResult(alloc, seed.unit_vector_results, embedding.name, .{ .outcome = .deleted });
+                        },
+                        .chunks => return error.UnknownArtifactSeed,
+                        .artifact => |envelope| {
+                            try artifact_seeds.rejectSourceHash(envelope.source);
+                            const vectors = try artifact_seeds.decodeSparseChunkVectorsAlloc(alloc, envelope.value, .unit);
+                            var vectors_owned = true;
+                            defer if (vectors_owned) artifact_seeds.freeSparseChunkVectors(alloc, vectors);
+                            try requireUnitChunkVectorsBound(alloc, entry, extraction.units, vectors);
+                            try unit_vector_seeds.append(alloc, .{ .name = embedding.name, .sparse_vectors = vectors });
+                            vectors_owned = false;
+                        },
+                    }
                 }
             };
 

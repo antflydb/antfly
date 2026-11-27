@@ -102,7 +102,16 @@ fn envelope(a: Allocator, value: std.json.Value) !std.json.Value {
     return .{ .object = object };
 }
 
-const ChunkVector = struct { chunk_id: u32, window: u32, windowed: bool, vector: []f32, unit_id: ?[]const u8 = null };
+const ChunkVector = struct {
+    chunk_id: u32,
+    window: u32,
+    windowed: bool,
+    vector: []f32,
+    unit_id: ?[]const u8 = null,
+    /// Sparse chunk vectors (never windowed).
+    indices: ?[]u32 = null,
+    values: []f32 = &.{},
+};
 
 fn sameChunk(x: ChunkVector, y: ChunkVector) bool {
     if (x.chunk_id != y.chunk_id) return false;
@@ -283,7 +292,17 @@ pub fn loadTxn(alloc: Allocator, doc_key: []const u8, txn: *docstore_mod.DocStor
             const window_index = source.window_index orelse ref.window_index;
             const payload = try txn.get(entry.key);
             const header = codec.decodeHeaderPrefix(payload) catch continue;
-            if (header.flags.authored or header.kind != .dense_embedding) continue;
+            if (header.flags.authored) continue;
+            if (header.kind == .sparse_embedding) {
+                // Sparse chunk vectors are never windowed.
+                if (window_index != null) continue;
+                const sparse = codec.decodeSparseEmbeddingAlloc(a, payload) catch continue;
+                const list = try vectors.getOrPut(a, try a.dupe(u8, ref.name));
+                if (!list.found_existing) list.value_ptr.* = .empty;
+                try list.value_ptr.append(a, .{ .chunk_id = chunk_id, .window = 0, .windowed = false, .vector = &.{}, .unit_id = unit_id, .indices = sparse.indices, .values = sparse.values });
+                continue;
+            }
+            if (header.kind != .dense_embedding) continue;
             const vector = codec.decodeDenseEmbeddingAlloc(a, payload) catch continue;
             const list = try vectors.getOrPut(a, try a.dupe(u8, ref.name));
             if (!list.found_existing) list.value_ptr.* = .empty;
@@ -312,6 +331,14 @@ pub fn loadTxn(alloc: Allocator, doc_key: []const u8, txn: *docstore_mod.DocStor
                 var object = std.json.ObjectMap.empty;
                 if (item.unit_id) |id| try object.put(a, "parent_unit_id", .{ .string = id });
                 try object.put(a, "chunk_id", .{ .integer = item.chunk_id });
+                if (item.indices) |indices| {
+                    var array_indices = try std.json.Array.initCapacity(a, indices.len);
+                    for (indices) |index| array_indices.appendAssumeCapacity(.{ .integer = index });
+                    try object.put(a, "indices", .{ .array = array_indices });
+                    try object.put(a, "values", try floatArray(a, item.values));
+                    try array.append(.{ .object = object });
+                    continue;
+                }
                 if (several or item.window != 0) try object.put(a, "window_index", .{ .integer = item.window });
                 try object.put(a, "vector", try floatArray(a, item.vector));
                 try array.append(.{ .object = object });

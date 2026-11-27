@@ -2583,6 +2583,7 @@ from .source_content_part_source import SourceContentPartSource
 from .source_content_part_source_type import SourceContentPartSourceType
 from .source_content_part_source_version_kind import SourceContentPartSourceVersionKind
 from .source_content_part_type import SourceContentPartType
+from .sparse_chunk_vector_seed import SparseChunkVectorSeed
 from .sql_array_column_schema import SQLArrayColumnSchema
 from .sql_array_column_schema_type import SQLArrayColumnSchemaType
 from .sql_array_dimension import SQLArrayDimension
@@ -5212,6 +5213,7 @@ __all__ = (
     "SourceContentPartSourceType",
     "SourceContentPartSourceVersionKind",
     "SourceContentPartType",
+    "SparseChunkVectorSeed",
     "SQLArrayColumnSchema",
     "SQLArrayColumnSchemaType",
     "SQLArrayDimension",

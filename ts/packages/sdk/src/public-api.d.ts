@@ -11760,7 +11760,12 @@ export interface components {
          *     - Document embedding: an array of finite numbers.
          *     - Chunk-derived embedding: an array of `ChunkVectorSeed`.
          *     - Sparse embedding: `{ "indices": [...], "values": [...] }` with
-         *       strictly ascending indices.
+         *       unique indices.
+         *     - Chunk-derived sparse embedding: an array of `SparseChunkVectorSeed`.
+         *
+         *     For chunk-derived vectors (dense or sparse, including those of a
+         *     document extraction's unit chunks), `null` embeds the chunks again in
+         *     the same write; an embedder must be configured.
          *
          *     Descriptive read fields (`artifact_id`, `artifact_ref`, `kind`,
          *     `status`, `dims`, `items`, `content_type`) and internal routing
@@ -11812,6 +11817,21 @@ export interface components {
             /** Format: int64 */
             window_index?: number;
             vector: number[];
+        };
+        /**
+         * @description One seeded sparse vector of a chunk. Sparse chunk vectors are never
+         *     windowed. Vectors of a document extraction's unit chunks name their
+         *     unit with `parent_unit_id` (every entry) and are accepted with the
+         *     extraction seed in the same write; plain chunk vectors must not name
+         *     one. Every entry must name a chunk of this revision; chunks without a
+         *     seeded vector are embedded as usual.
+         */
+        SparseChunkVectorSeed: {
+            /** Format: int64 */
+            chunk_id: number;
+            parent_unit_id?: string;
+            indices: number[];
+            values: number[];
         };
         /**
          * @description One chunk of a seeded chunk collection (`_chunks.<name>`), the plain

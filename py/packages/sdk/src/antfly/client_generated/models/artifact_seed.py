@@ -36,7 +36,12 @@ class ArtifactSeed:
     - Document embedding: an array of finite numbers.
     - Chunk-derived embedding: an array of `ChunkVectorSeed`.
     - Sparse embedding: `{ "indices": [...], "values": [...] }` with
-      strictly ascending indices.
+      unique indices.
+    - Chunk-derived sparse embedding: an array of `SparseChunkVectorSeed`.
+
+    For chunk-derived vectors (dense or sparse, including those of a
+    document extraction's unit chunks), `null` embeds the chunks again in
+    the same write; an embedder must be configured.
 
     Descriptive read fields (`artifact_id`, `artifact_ref`, `kind`,
     `status`, `dims`, `items`, `content_type`) and internal routing
