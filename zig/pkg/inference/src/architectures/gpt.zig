@@ -3848,7 +3848,7 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
     if (!is_freestanding and prefillTraceEnabled() and decode_context != null and decode_context.?.attention_mode == .paged_prefill) {
         debugPrint("prefill-trace: gpt final norm start\n", .{});
     }
-    const final_hidden = if (final_norm) try applyFinalNorm(cb, allocator, config, hidden) else hidden;
+    const final_hidden = if (final_norm) try applyFinalNormInternal(cb, allocator, config, hidden, null, trace_sink == null and decode_context != null and decode_context.?.prepared_lighton_decode) else hidden;
     if (reserved_hidden) |*carrier| {
         carrier.deinit(cb, false);
         reserved_hidden = null;
@@ -12633,6 +12633,17 @@ pub fn applyFinalNormWithCleanup(
     hidden: CT,
     cleanup: ?*const @import("../execution/cleanup_context.zig").Context,
 ) !CT {
+    return applyFinalNormInternal(cb, allocator, config, hidden, cleanup, false);
+}
+
+fn applyFinalNormInternal(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden: CT,
+    cleanup: ?*const @import("../execution/cleanup_context.zig").Context,
+    reuse_graph_input: bool,
+) !CT {
     const dim = config.hidden_size;
     switch (config.family) {
         .deepseek_v4 => {
@@ -12650,6 +12661,11 @@ pub fn applyFinalNormWithCleanup(
             defer freeTensorWithCleanup(cb, base_w, cleanup);
             const w = try maybeAdjustNormWeight(cb, allocator, config, base_w, dim);
             defer if (w != base_w) freeTensorWithCleanup(cb, w, cleanup);
+            if (comptime build_options.enable_cuda) {
+                if (reuse_graph_input and cb.kind() == .cuda) {
+                    if (try @import("../ops/cuda/cuda_compute.zig").tryCapturedFinalNorm(cb, hidden, w, dim, config.norm_eps)) |assigned| return assigned;
+                }
+            }
             const result = try cb.rmsNorm(hidden, w, dim, config.norm_eps);
             return result;
         },

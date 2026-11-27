@@ -29349,6 +29349,27 @@ fn addLayerNorm(ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, 
 }
 
 fn rmsNorm(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerror!CT {
+    return rmsNormWithDestination(ctx, input, weight, dim, eps, null);
+}
+
+/// The graph's original input has been consumed when the decoder reaches its
+/// final norm. Reuse that same slab until the head has consumed the result.
+pub fn tryCapturedFinalNorm(cb: *const ops.ComputeBackend, input: CT, weight: CT, dim: usize, eps: f32) !?CT {
+    if (!acceptsPhysicalImplementation(cb.vtable)) return null;
+    const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    const owner = &self.bounded_decode_graph;
+    if (!owner.active or self.capability_profile != .lightonocr3 or dim != owner.hidden) return null;
+    const source = tensorFromCt(input);
+    const gamma = tensorFromCt(weight);
+    const bytes = try checkedMul(source.elem_count, @sizeOf(f32));
+    const destination = owner.input();
+    if (destination.len != bytes or kernel_geometry.byteRangesOverlap(destination.ptr, bytes, source.buffer.ptr, source.buffer.len) or
+        kernel_geometry.byteRangesOverlap(destination.ptr, bytes, gamma.buffer.ptr, gamma.buffer.len)) return null;
+    _ = try buffer_mod.validateRegion(destination, bytes, @alignOf(f32));
+    return try rmsNormWithDestination(cb.ptr, input, weight, dim, eps, destination);
+}
+
+fn rmsNormWithDestination(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32, destination: ?buffer_mod.DeviceBuffer) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input_tensor = tensorFromCt(input);
     const weight_tensor = tensorFromCt(weight);
@@ -29365,11 +29386,14 @@ fn rmsNorm(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerro
 
     const shape = try dupeShape(self.allocator, input_tensor.shape);
     errdefer self.allocator.free(shape);
-    var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
-    errdefer device.free(&self.ctx);
+    var device = destination orelse try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
+    errdefer if (destination == null) releaseDeviceBuffer(self, &device);
     var norm_profile_scope = beginPrefillProfile(self, .norm, geometry.rows);
     defer if (norm_profile_scope) |*scope| scope.end();
-    if (try tryRmsQ8Mirror(self, .norm, device, shape, input_tensor, weight_tensor, null, null, dim, eps)) |result| return result;
+    if (try tryRmsQ8Mirror(self, .norm, device, shape, input_tensor, weight_tensor, null, null, dim, eps)) |result| {
+        tensorFromCt(result).owns_buffer = destination == null;
+        return result;
+    }
     if (geometry.rows > 1 and cudaRmsNormBf16MirrorEnabled() and cudaCublasLtEnabled() and self.ctx.info.compute_major >= 8 and self.cublaslt != null) {
         var bf16_mirror = allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(u16)) catch buffer_mod.DeviceBuffer{};
         if (bf16_mirror.ptr != 0) {
@@ -29388,14 +29412,18 @@ fn rmsNorm(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerro
                 self.stats.launch_norm_rms += 1;
                 self.stats.rms_norm_bf16_mirror_hits += 1;
                 errdefer bf16_mirror.free(&self.ctx);
-                return createTensorWithDTypeAndBf16Mirror(self, device, bf16_mirror, shape, input_tensor.elem_count, .f32);
+                const result = try createTensorWithDTypeAndBf16Mirror(self, device, bf16_mirror, shape, input_tensor.elem_count, .f32);
+                tensorFromCt(result).owns_buffer = destination == null;
+                return result;
             }
         }
     }
     try self.kernels.launchRmsNormF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, geometry.rows, geometry.width, eps);
     self.stats.launch_norm += 1;
     self.stats.launch_norm_rms += 1;
-    return createTensor(self, device, shape, input_tensor.elem_count);
+    const result = try createTensor(self, device, shape, input_tensor.elem_count);
+    tensorFromCt(result).owns_buffer = destination == null;
+    return result;
 }
 
 fn rmsNormAddMultiplyScalarTensor(ctx: *anyopaque, input: CT, weight: CT, residual: CT, scalar: CT, dim: usize, eps: f32) anyerror!?CT {
@@ -47190,6 +47218,26 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
     const next_gathered = try cb.toFloat32(next, a);
     defer a.free(next_gathered);
     try std.testing.expectEqualSlices(f32, &.{ 5, 7, 5, 7, 5, 7 }, next_gathered);
+
+    {
+        const original_profile = compute.capability_profile;
+        defer compute.capability_profile = original_profile;
+        compute.capability_profile = .lightonocr3;
+        const gamma = try cb.fromFloat32Shape(&.{ 1, 2 }, &.{2});
+        defer cb.free(gamma);
+        const ordinary_norm = try cb.rmsNorm(input, gamma, 2, 1e-6);
+        defer cb.free(ordinary_norm);
+        const assigned_norm = (try tryCapturedFinalNorm(&cb, input, gamma, 2, 1e-6)) orelse return error.TestUnexpectedResult;
+        defer cb.free(assigned_norm);
+        try std.testing.expectEqual(owner.input().ptr, tensorFromCt(assigned_norm).buffer.ptr);
+        try std.testing.expect(!tensorFromCt(assigned_norm).owns_buffer);
+        try std.testing.expect((try tryCapturedFinalNorm(&cb, assigned_norm, gamma, 2, 1e-6)) == null);
+        const ordinary_values = try cb.toFloat32(ordinary_norm, a);
+        defer a.free(ordinary_values);
+        const assigned_values = try cb.toFloat32(assigned_norm, a);
+        defer a.free(assigned_values);
+        try std.testing.expectEqualSlices(f32, ordinary_values, assigned_values);
+    }
 
     var observation = @import("../../execution/runtime_observation.zig").Scope.init();
     defer observation.deinit();
