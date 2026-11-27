@@ -1521,6 +1521,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const row_outcomes_start = seed_outcomes.items.len;
                 defer markSeedOutcomesVia(seed_outcomes.items[row_outcomes_start..], generated, request_seed_mapped);
                 var seeded_row = row_seeds != null;
+                // Seeded collections above the synchronous bound publish on
+                // replay: their chunk requests and chunk consumers defer.
+                var staged_chunk_names = std.ArrayListUnmanaged([]const u8).empty;
+                defer staged_chunk_names.deinit(alloc);
                 for (generated, request_seeds, request_seed_mapped, request_pending) |request, *slot, *mapped, *pending| {
                     slot.* = if (row_seeds) |*seeds| try requestSeed(seeds, request) else null;
                     if (slot.* == null and request.seed_mapping_json.len != 0) {
@@ -1553,7 +1557,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     } else null else null;
                     const entry = explicit_chunks orelse chunkSeedFor(generated, request_seeds, requestArtifactName(request)) orelse continue;
                     try requireSeedableRequest(request);
-                    try installSeededChunks(alloc, self, source, request, entry, &chunk_cache, &artifact_writes);
+                    if (try installSeededChunks(alloc, self, source, request, entry, &chunk_cache, &artifact_writes) == .staged)
+                        try staged_chunk_names.append(alloc, requestArtifactName(request));
                 };
                 var inline_embedding_cleanup = InlineChunkEmbeddingCleanup{};
                 defer inline_embedding_cleanup.deinit(alloc);
@@ -1604,6 +1609,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         }
                     }
                     const seed = request_seeds[request_index];
+                    if (stagedChunkConsumer(request, staged_chunk_names.items)) {
+                        // Vectors of these chunks would bind to rows this
+                        // write does not prepare.
+                        if (seed != null and request.kind != .chunk_text) return error.ArtifactSeedNotAccepted;
+                        if (request.kind == .chunk_text) try appendSeedOutcome(alloc, &seed_outcomes, request, .{ .outcome = .accepted });
+                        try appendGeneratedEnrichmentRef(alloc, &planned, request);
+                        continue;
+                    }
                     // Waiting for its seed: nothing runs or is scheduled.
                     if (request_pending[request_index]) {
                         try appendSeedOutcome(alloc, &seed_outcomes, request, .{ .outcome = .pending });
@@ -1764,7 +1777,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                 };
                                 const document = try upstreamChunkDocumentAlloc(alloc, self, request, &artifact_writes);
                                 errdefer alloc.free(document);
-                                try installSeededChunks(alloc, self, document, request, items, &chunk_cache, &artifact_writes);
+                                if (try installSeededChunks(alloc, self, document, request, items, &chunk_cache, &artifact_writes) == .staged) {
+                                    alloc.free(document);
+                                    try staged_chunk_names.append(alloc, requestArtifactName(request));
+                                    try appendSeedOutcome(alloc, &seed_outcomes, request, .{ .outcome = .accepted });
+                                    try appendGeneratedEnrichmentRef(alloc, &planned, request);
+                                    continue;
+                                }
                                 break :upstream document;
                             } else null;
                             defer if (upstream_document) |document| alloc.free(document);
@@ -2636,6 +2655,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     try artifact_delete_keys.append(alloc, key);
                 },
             }
+        }
+
+        fn stagedChunkConsumer(request: enrichment_types.GeneratedEnrichmentRequest, staged: []const []const u8) bool {
+            if (staged.len == 0) return false;
+            const consumes = request.kind == .chunk_text or ((request.kind == .dense_embedding or request.kind == .sparse_embedding) and request.input_kind != .document);
+            if (!consumes) return false;
+            for (staged) |name| {
+                if (std.mem.eql(u8, name, request.artifact_name) or std.mem.eql(u8, name, requestArtifactName(request))) return true;
+            }
+            return false;
         }
 
         pub fn shouldPrecomputeGeneratedRequest(

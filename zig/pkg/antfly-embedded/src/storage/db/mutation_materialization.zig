@@ -8398,7 +8398,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             items: []const std.json.Value,
             cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
             artifact_writes: anytype,
-        ) !void {
+        ) !SeededChunkInstall {
             if (!requestHasChunking(request)) return error.ArtifactSeedNotAccepted;
             const source_text = if (request.source_template.len > 0)
                 renderSourceTemplateText(alloc, db, request.source_template, doc_value) catch |err| switch (err) {
@@ -8425,6 +8425,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 defer alloc.free(record);
                 try appendPreparedArtifactCopy(alloc, artifact_writes, record_key, record);
             }
+            // Too large for this write's atomic mutation: the producer reads
+            // the accepted record on replay and publishes it in stages.
+            if (artifact_seeds.stagedChunkCollection(chunks.len)) {
+                chunker_mod.freeChunks(alloc, chunks);
+                return .staged;
+            }
             const cache_key = try makeChunkCacheKey(alloc, request);
             errdefer alloc.free(cache_key);
             for (cache.items) |*entry| {
@@ -8432,10 +8438,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 alloc.free(cache_key);
                 chunker_mod.freeChunks(alloc, entry.chunks);
                 entry.chunks = chunks;
-                return;
+                return .installed;
             }
             try cache.append(alloc, .{ .key = cache_key, .chunks = chunks });
+            return .installed;
         }
+
+        pub const SeededChunkInstall = enum { installed, staged };
 
         /// Seeded generic asset. Its state row binds the seed to the same
         /// producer input fingerprint the producer would record.

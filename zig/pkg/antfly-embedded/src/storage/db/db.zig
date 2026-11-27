@@ -109453,6 +109453,62 @@ fn expectSeedViewChunksForTest(alloc: Allocator, db: *DB, doc_key: []const u8, n
     for (expected, contents) |want, got| try std.testing.expectEqualStrings(want, got);
 }
 
+test "db artifact seeded chunk collections above the atomic write bound publish on replay" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var embedder = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a", .dense_embedder = embedder.interface() } });
+    defer db.close();
+    try addSeedRoundTripTestIndexes(&db);
+
+    // One seeded chunk per character, more than one write can publish.
+    const count = @import("artifact_seeds.zig").max_seed_chunks + 905;
+    var body = std.ArrayListUnmanaged(u8).empty;
+    defer body.deinit(alloc);
+    for (0..count) |i| try body.append(alloc, "abcdefghijklmnopqrstuvwxyz"[i % 26]);
+    var json = std.ArrayListUnmanaged(u8).empty;
+    defer json.deinit(alloc);
+    try json.print(alloc, "{{\"title\":\"big\",\"body\":\"{s}\",\"_chunks\":{{\"body_chunks_v1\":[", .{body.items});
+    for (0..count) |i| {
+        if (i != 0) try json.append(alloc, ',');
+        try json.print(alloc, "{{\"_chunk_id\":{d},\"_content\":\"{c}\",\"_start_char\":{d},\"_end_char\":{d}}}", .{ i, body.items[i], i, i + 1 });
+    }
+    try json.appendSlice(alloc, "]}}");
+
+    const report = (try db.batchReportingSeeds(alloc, .{ .writes = &.{.{ .key = "doc:a", .value = json.items }}, .sync_level = .write })).?;
+    defer alloc.free(report);
+    try std.testing.expect(std.mem.indexOf(u8, report, "\"name\":\"body_chunks_v1\",\"outcome\":\"accepted\"") != null);
+    try db.runUntilIdle();
+    {
+        const contents = try seedViewChunkContentsForTest(alloc, &db, "doc:a", "body_chunks_v1");
+        defer {
+            for (contents) |content| alloc.free(content);
+            alloc.free(contents);
+        }
+        try std.testing.expectEqual(count, contents.len);
+        try std.testing.expectEqualStrings("a", contents[0]);
+        try std.testing.expectEqualStrings(body.items[count - 1 ..], contents[count - 1]);
+    }
+    try std.testing.expectEqual(@as(u64, count), db.core.index_manager.denseIndex("dv_chunks").?.index.metadata.active_count);
+
+    // An unrelated edit keeps the accepted set.
+    const edited = try std.fmt.allocPrint(alloc, "{{\"title\":\"edited\",\"body\":\"{s}\"}}", .{body.items});
+    defer alloc.free(edited);
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = edited }}, .sync_level = .write });
+    try db.runUntilIdle();
+    {
+        const contents = try seedViewChunkContentsForTest(alloc, &db, "doc:a", "body_chunks_v1");
+        defer {
+            for (contents) |content| alloc.free(content);
+            alloc.free(contents);
+        }
+        try std.testing.expectEqual(count, contents.len);
+    }
+}
+
 test "db artifact seeded chunk collections survive unrelated edits and replays of the same input" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");

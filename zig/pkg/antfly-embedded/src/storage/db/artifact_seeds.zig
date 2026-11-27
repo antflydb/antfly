@@ -111,9 +111,19 @@ pub const OutcomeEntry = struct {
 
 pub const Via = enum { explicit, mapping };
 
-/// Upper bound on one seeded chunk collection inside a single atomic write.
-/// Larger inventories belong to staged publication (`docs/design/media-pass.md`).
+/// Upper bound on one seeded chunk collection published inside the seeding
+/// write itself (one atomic mutation, with its manifest).
 pub const max_seed_chunks: usize = 4095;
+/// Upper bound on one seeded chunk collection. Above `max_seed_chunks` the
+/// write records the accepted set and the chunk producer publishes it on
+/// replay, through staged publication where the ordered authority applies
+/// (`docs/design/media-pass.md`).
+pub const max_staged_seed_chunks: usize = 65536;
+
+/// Whether a seeded collection of `count` chunks publishes on replay.
+pub fn stagedChunkCollection(count: usize) bool {
+    return count > max_seed_chunks;
+}
 /// Upper bound on seeded artifact names per document and kind.
 pub const max_seed_names: usize = 64;
 pub const max_name_bytes: usize = 256;
@@ -309,7 +319,7 @@ pub fn validateChunkCollection(value: std.json.Value) !void {
         .array => {},
         else => return error.InvalidArtifactSeed,
     }
-    if (value.array.items.len > max_seed_chunks) return error.InvalidArtifactSeed;
+    if (value.array.items.len > max_staged_seed_chunks) return error.InvalidArtifactSeed;
     var previous: ?ChunkFields = null;
     var scoped: ?bool = null;
     for (value.array.items) |item| {

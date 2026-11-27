@@ -308,6 +308,16 @@ the seeded set is the output, so unrelated edits and replays keep it. A
 changed input or chunker configuration falls back to the chunker. `null`
 chunks the input again in that same write and deletes the record.
 
+One write publishes at most 4,095 seeded chunks per collection (one atomic
+mutation with its manifest). Larger collections, up to 65,536 chunks, are
+accepted into the record only: the write reports them `accepted`, defers the
+collection's chunk request and its chunk consumers to replay, and the worker
+publishes the recorded set from the record, through staged chunk generations
+where the ordered authority applies (`docs/design/media-pass.md`). Vector
+seeds for the chunks of such a collection are refused
+(`ArtifactSeedNotAccepted`): they would bind to rows the write does not
+prepare; the chunks are embedded on replay instead.
+
 ### Rich document extraction
 
 Besides `{ "text": ... }`, a document extraction seed may carry the
@@ -565,8 +575,8 @@ subsystem features of their own:
 - Generating only the missing pages of a partial extraction seed: the
   document extraction pipeline processes whole documents and has no page
   selection to merge with seeded units.
-- Chunk inventories beyond the 4,095-chunk atomic-mutation ceiling through
-  staged publication (`docs/design/media-pass.md`); origin counts on the
+- Vector seeds for seeded chunk collections above 4,095 chunks; unit-scoped
+  (extraction) chunk inventories above that bound. Origin counts on the
   distributed server's HTTP status (embedded and Lite have them).
 - Asset producers consuming externally maintained assets (they need an
   upstream producer receipt); an ordered-authority test of chunk consumers.
