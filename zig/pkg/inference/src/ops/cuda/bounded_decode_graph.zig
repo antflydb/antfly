@@ -66,6 +66,7 @@ pub const StorageLayout = struct {
     recurrent_output: ?Span = null,
     ffn_workspace: ?Span = null,
     ffn_outputs: ?Span = null,
+    projection_staging: ?Span = null,
     fused_head_workspace: ?Span = null,
     recurrent_scratch: ?@import("gated_delta.zig").PacketScratch = null,
     metadata_bytes: usize,
@@ -389,6 +390,18 @@ pub const GraphPhase = struct {
         // Place both alternating publication slots after all serial scratch.
         const scratch_end = try StorageLayout.aligned(self.storage_layout.layerWorkspaceBytes());
         self.storage_layout.ffn_outputs = try self.storage_layout.declareLayerRegion(scratch_end, try std.math.mul(usize, layout.output_bytes, 2));
+    }
+
+    pub fn declareProjectionStaging(self: *GraphPhase) !void {
+        const descriptor = self.descriptor;
+        var width = @max(descriptor.hidden, descriptor.ffn_intermediate);
+        if (descriptor.attention_geometry) |geometry|
+            width = @max(width, try std.math.mul(usize, geometry.heads, geometry.dim));
+        if (descriptor.recurrent_heads) |heads|
+            width = @max(width, try std.math.mul(usize, heads.value, recurrent_value_dim));
+        const bytes = try std.math.mul(usize, descriptor.rows * @sizeOf(u16), width);
+        const occupied = try StorageLayout.aligned(self.storage_layout.layerWorkspaceBytes());
+        self.storage_layout.projection_staging = try self.storage_layout.declareLayerRegion(occupied, bytes);
     }
 
     pub fn matchesOwner(self: *const GraphPhase, owner: *const Module) bool {
@@ -809,6 +822,12 @@ pub const Module = struct {
         return slot;
     }
 
+    pub fn bindProjectionStaging(self: *const Module, bytes: usize) !?buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const span = layout.projection_staging orelse return null;
+        return try self.bindLayerWorkspace(layout, span, bytes);
+    }
+
     pub fn bindFusedHeadWorkspace(self: *const Module) !buffer.DeviceBuffer {
         const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
         const span = layout.fused_head_workspace orelse return error.InvalidExecutionPlan;
@@ -944,6 +963,14 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
     try std.testing.expect(first_output.ptr >= output_owner.metadata.ptr + attention.offset + attention.bytes);
     try std.testing.expectError(error.InvalidExecutionPlan, output_owner.bindFfnOutput(ffn, &.{first_output}));
     try std.testing.expectEqual(first_output.ptr, (try output_owner.bindFfnOutput(ffn, &.{second_output})).ptr);
+
+    try phase.declareProjectionStaging();
+    output_owner.storage_layout = phase.storage_layout;
+    output_owner.metadata.len = phase.storage_layout.metadata_bytes;
+    const staging_bytes = rows * descriptor.ffn_intermediate * @sizeOf(u16);
+    const staging = (try output_owner.bindProjectionStaging(staging_bytes)).?;
+    try std.testing.expect(staging.ptr >= second_output.ptr + second_output.len);
+    try std.testing.expectError(error.InvalidExecutionPlan, output_owner.bindProjectionStaging(staging_bytes + 1));
 
     var fused = descriptor;
     fused.hidden = 1024;

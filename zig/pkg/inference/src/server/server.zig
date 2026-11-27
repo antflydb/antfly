@@ -48818,7 +48818,8 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
                 try std.testing.expectEqual(2 * ffn.output_bytes, report.declared_ffn_output_bank_bytes);
             }
             const serial_bytes = @max(attention_bytes, recurrent_bytes, report.declared_ffn_scratch_bytes, report.fused_head_scratch_bytes, report.shared_head_scratch_bytes);
-            const shared_bytes = if (report.declared_ffn_output_bank_bytes != 0) std.mem.alignForward(usize, serial_bytes, alignment) + report.declared_ffn_output_bank_bytes else serial_bytes;
+            const layer_and_outputs_bytes = if (report.declared_ffn_output_bank_bytes != 0) std.mem.alignForward(usize, serial_bytes, alignment) + report.declared_ffn_output_bank_bytes else serial_bytes;
+            const shared_bytes = if (report.declared_projection_staging_bytes != 0) std.mem.alignForward(usize, layer_and_outputs_bytes, alignment) + report.declared_projection_staging_bytes else layer_and_outputs_bytes;
             try std.testing.expectEqual(shared_bytes, report.shared_layer_workspace_bytes);
             std.debug.print("LIGHTONOCR3 observed_cuda_workspace rows={d} readback_bytes={d} backing={s} route={s} attention_scratch_bytes={d} recurrent_scratch_bytes={d} shared_layer_workspace_bytes={d} attention_output_bytes={d} recurrent_output_bytes={d}\n", .{ report.rows, report.readback_bytes, @tagName(report.readback_backing), @tagName(report.route), report.attention_scratch_bytes, report.recurrent_scratch_bytes, report.shared_layer_workspace_bytes, report.declared_attention_output_bytes, report.declared_recurrent_output_bytes });
         }

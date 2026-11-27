@@ -3996,6 +3996,7 @@ pub const CudaCompute = struct {
                     .declared_recurrent_output_bytes = if (layout.recurrent_output) |span| span.bytes else 0,
                     .declared_ffn_scratch_bytes = if (layout.ffn_workspace) |span| span.bytes else 0,
                     .declared_ffn_output_bank_bytes = if (layout.ffn_outputs) |span| span.bytes else 0,
+                    .declared_projection_staging_bytes = if (layout.projection_staging) |span| span.bytes else 0,
                     .head_bytes = layout.head_bytes,
                     .shared_head_scratch_bytes = if (layout.shared_head_workspace) |span| span.bytes else 0,
                     .head_packet_rows = layout.headPacketRows(owner.rows, owner.vocab),
@@ -4243,6 +4244,10 @@ pub const CudaCompute = struct {
         };
         if (lightOnFfnBlockEnabled(cb) and lightOnDevice(self).portableKernels() and !self.lighton_bf16_decode_outputs)
             phase.declareFfnScratch(self.lighton_bf16_projection_outputs) catch |err| switch (err) {
+                error.InvalidShape, error.Overflow => return .unsupported,
+            };
+        if (cudaCublasLtEnabled() and self.cublaslt != null and self.ctx.info.compute_major >= 8)
+            phase.declareProjectionStaging() catch |err| switch (err) {
                 error.InvalidShape, error.Overflow => return .unsupported,
             };
         const owner = &self.bounded_decode_graph;
@@ -15497,7 +15502,13 @@ fn acquireBf16ActivationForCublasLt(self: *CudaCompute, input: *const CudaTensor
     const bytes = try checkedMul(try checkedMul(physical_rows, in_dim), 2);
     if (physical_rows == rows and input.bf16_mirror.ptr != 0 and input.bf16_mirror.len >= bytes)
         return .{ .buffer = .{ .ptr = input.bf16_mirror.ptr, .len = bytes }, .cast = false, .count = count };
-    const scratch = try self.bf16_activation_scratch.acquire(&self.ctx, bytes);
+    const assigned = if (self.bounded_decode_graph.active)
+        try self.bounded_decode_graph.bindProjectionStaging(bytes)
+    else
+        null;
+    const scratch = assigned orelse try self.bf16_activation_scratch.acquire(&self.ctx, bytes);
+    if (assigned != null and kernel_geometry.byteRangesOverlap(scratch.ptr, scratch.len, input.buffer.ptr, input.buffer.len))
+        return error.InvalidAssignedAlias;
     return .{ .buffer = scratch, .cast = true, .count = count, .tail = .{ .ptr = scratch.ptr + count * 2, .len = bytes - count * 2 } };
 }
 fn convertBf16ActivationForCublasLt(self: *CudaCompute, input: *const CudaTensor, activation: Bf16Activation, rows: usize) !void {
@@ -16487,7 +16498,7 @@ fn tryCublasLtBf16InputGradient(
 
 fn lightOnGemmPhysicalRows(self: *const CudaCompute, rows: usize) usize {
     if (!self.lighton_gemm_bucket_rows or self.capability_profile != .lightonocr3 or
-        rows < 2 or rows > 64 or
+        rows < 2 or rows > 64 or self.bounded_decode_graph.active or
         self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return rows;
     var bucket: usize = 2;
     while (bucket < rows) bucket *= 2;
@@ -44270,6 +44281,9 @@ test "LightOnOCR3 CUDA bucketed GEMM preserves logical rows and reuses bounded p
     compute.debug_cuda_graph_capture_active = true;
     try std.testing.expectEqual(@as(usize, 17), lightOnGemmPhysicalRows(&compute, 17));
     compute.debug_cuda_graph_capture_active = false;
+    compute.bounded_decode_graph.active = true;
+    try std.testing.expectEqual(@as(usize, 17), lightOnGemmPhysicalRows(&compute, 17));
+    compute.bounded_decode_graph.active = false;
     compute.capability_profile = .embedding_gemma2;
     try std.testing.expectEqual(@as(usize, 17), lightOnGemmPhysicalRows(&compute, 17));
 }
