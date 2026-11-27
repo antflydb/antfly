@@ -10169,6 +10169,37 @@ fn checkSubsampleBatchGeometry(cb: ComputeBackend, _: ComputeBackend, base_frame
         batch.deinit(a);
     }
     try before.expectUnchanged(cb);
+    if (cb.kind() == .cuda) {
+        var metadata_config = cfg;
+        metadata_config.block_count = 0;
+        var inputs = try AudioLayerInputs.init(&cb, a, metadata_config, batch.valid_mask, &.{});
+        defer inputs.deinit(&cb);
+        const transfers = @import("../execution/transfer_audit.zig");
+        var audit: transfers.Audit = .{ .forbid_device_host_access = true };
+        {
+            try transfers.begin(&audit);
+            defer transfers.end();
+            try inputs.setSegments(&cb, batch.segments);
+        }
+        try std.testing.expectEqual(@as(u64, 1), audit.upload_calls);
+        try std.testing.expectEqual(@as(u64, batch.seq_len * 2 * @sizeOf(f32)), audit.upload_bytes);
+        const starts = try cb.toFloat32(inputs.segment_starts.?, a);
+        defer a.free(starts);
+        const tags = try cb.toFloat32(inputs.segment_valid.?, a);
+        defer a.free(tags);
+        try std.testing.expectEqual(batch.seq_len, starts.len);
+        try std.testing.expectEqual(batch.seq_len, tags.len);
+        var first: usize = 0;
+        for (batch.segments) |span| {
+            const base: f32 = @floatFromInt(first);
+            for (first..first + span) |row| {
+                try std.testing.expectEqual(base, starts[row]);
+                try std.testing.expectEqual((base + 1) * @as(f32, if (batch.valid_mask[row]) 1 else -1), tags[row]);
+            }
+            first += span;
+        }
+    }
+
     const actual = try cb.toFloat32(batch.hidden, a);
     defer a.free(actual);
     var offset: usize = 0;
