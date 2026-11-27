@@ -1334,7 +1334,10 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                     switch (err) {
                         error.OutOfMemory, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => {
                             if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
-                                std.debug.print("LIGHTONOCR3 cuda_model_graph_precommit_decline rows={d} stage={s} error={s}\n", .{ descriptor.rows, @tagName(phase.mode), @errorName(err) });
+                                std.debug.print("LIGHTONOCR3 cuda_model_graph_precommit_decline rows={d} stage={s} error={s} pressure={s}\n", .{
+                                    descriptor.rows,                                                         @tagName(phase.mode), @errorName(err),
+                                    if (phase.admission_pressure) |pressure| @tagName(pressure) else "none",
+                                });
                             return false;
                         },
                         else => return err,

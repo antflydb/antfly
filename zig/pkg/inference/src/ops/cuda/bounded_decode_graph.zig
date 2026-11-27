@@ -268,6 +268,7 @@ pub const GraphPhase = struct {
     mode: enum { none, storage, arena } = .none,
     expected_compute: usize = 0,
     old: Snapshot = undefined,
+    admission_pressure: ?memory.AdmissionPressure = null,
     admission: ?@import("video_cache_budget.zig").Admission = null,
     cold: ?*ColdPhase = null,
     bound: bool = false,
@@ -325,7 +326,11 @@ pub const GraphPhase = struct {
         var pin: ?@import("../../runtime/tier/admission_domain.zig").Pin = null;
         if (self.admission) |policy| pin = model.retainAdmissionDomain(policy.controller) orelse return error.MissingCacheRetirementDomain;
         defer if (pin) |value| value.release();
-        try funding.fundOutsideExecution(if (pin) |*value| value else null);
+        self.admission_pressure = null;
+        funding.fundOutsideExecution(if (pin) |*value| value else null) catch |err| {
+            self.admission_pressure = funding.admission_pressure;
+            return err;
+        };
         if (self.mode == .storage) {
             cold.key = try allocator.dupe(u64, self.descriptor.key);
             cold.plan = try allocator.create(plan_mod.Plan);

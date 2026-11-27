@@ -295,6 +295,7 @@ pub const Funding = struct {
     decoder_sequence: ?@import("video_cache_budget.zig").Sequence = null,
     deny_constants: bool = false,
     compute_identity: usize = 0,
+    admission_pressure: ?memory.AdmissionPressure = null,
     admission: ?policy = null,
     domain_pin: ?domain.Pin = null,
     boundary: ?*const sink.Epoch = null, // ONLY during actual Stage-owned gate
@@ -375,6 +376,7 @@ pub const Funding = struct {
     // always uses its certified process allocator, never the task arena.
     fn fundWithMetadataAllocator(self: *Funding, pin: ?*const domain.Pin, shell_allocator: ?std.mem.Allocator) !void {
         if (self.state != .snapped) return error.InvalidPreparedCacheState;
+        self.admission_pressure = null;
         const actual = self.admission orelse {
             if (self.hasRawUpgrades()) return error.MissingCacheRetirementDomain;
             for (self.entries) |*entry| if (entry.miss) {
@@ -403,7 +405,7 @@ pub const Funding = struct {
         }
         // Existing owners carry their SAME charged lease. Zero fresh demand
         // prepares only pure retirement metadata, never a zero-byte supplier.
-        var source: ?memory.AdmissionLease = if (std.meta.eql(total, memory.AdmissionAmounts{})) null else try actual.controller.tryAcquire(.gpu, actual.limits, total, actual.check_live_memory);
+        var source: ?memory.AdmissionLease = if (std.meta.eql(total, memory.AdmissionAmounts{})) null else try actual.controller.tryAcquireWithPressure(.gpu, actual.limits, total, actual.check_live_memory, &self.admission_pressure);
         defer if (source) |*lease| lease.release();
         // Every error leaves complete ownership in this cold object; its
         // outside destructor returns all children, with no SDK state published.
@@ -1451,6 +1453,14 @@ test "CUDA audio learned metadata one below host class refuses before payload ba
     try std.testing.expectError(error.ResourceLimitExceeded, funding.fundOutsideExecution(&pin));
     try std.testing.expect(funding.entries[0].audio_learning == null and funding.entries[0].lease == null);
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, actual.controller.snapshot());
+    // An occupied domain is retryable and preserves the rejecting limit.
+    var peer = try actual.controller.tryAcquire(.gpu, .{}, .{ .host_scratch_bytes = 1 }, false);
+    defer peer.release();
+    funding.admission.?.limits.host_limit_bytes = bytes;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, funding.fundOutsideExecution(&pin));
+    try std.testing.expectEqualDeep(@as(?memory.AdmissionPressure, .{ .domain_host = .gpu }), funding.admission_pressure);
+    try std.testing.expect(funding.entries[0].audio_learning == null and funding.entries[0].lease == null);
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .host_scratch_bytes = 1 }, actual.controller.snapshot());
 }
 
 test "CUDA audio learned metadata publication and LRU death retain exact old Domain quota until actual current B seals" {
