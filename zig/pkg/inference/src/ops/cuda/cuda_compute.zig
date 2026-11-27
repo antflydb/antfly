@@ -16228,18 +16228,13 @@ fn lightOnCompactBf16FfnBlock(self: *CudaCompute, request: CudaCompute.DenseSilu
     return output;
 }
 
-fn lightOnFfnBf16Down(self: *CudaCompute, sources: LightOnActivationSources, down: *const CudaTensor, rows: usize, hidden: usize, intermediate: usize, residual: ?*const CudaTensor) !CT {
-    const count = try checkedMul(rows, intermediate);
+fn lightOnFfnBf16Down(self: *CudaCompute, sources: LightOnActivationSources, down: *const CudaTensor, rows: usize, hidden: usize, intermediate: usize, activated: buffer_mod.DeviceBuffer) !CT {
     try self.lighton_activation.init(&self.ctx);
-    var activated = try allocDeviceBuffer(self, try checkedMul(count, 2));
-    defer releaseDeviceBuffer(self, &activated);
-    const shape = try allocShape2(self.allocator, rows, hidden);
-    errdefer self.allocator.free(shape);
-    var output = try allocDeviceBuffer(self, try checkedMul(try checkedMul(rows, hidden), 4));
-    errdefer releaseDeviceBuffer(self, &output);
+    var output = try OwnedF32Output.alloc2(self, rows, hidden, try checkedMul(rows, hidden));
+    defer output.deinit();
     errdefer self.ctx.synchronize() catch {};
-    try runDenseFfnDown(self, sources, down, rows, hidden, intermediate, residual, activated, output, null);
-    return createTensor(self, output, shape, rows * hidden);
+    try runDenseFfnDown(self, sources, down, rows, hidden, intermediate, null, activated, output.buffer, null);
+    return output.intoTensor();
 }
 
 // Both storage policies use the same original RMS/GEMM/activation sequence.
@@ -16301,14 +16296,13 @@ fn glideGatedFfnNoBias(self: *CudaCompute, request: *const ops.GatedFfnNoBiasReq
     const configured_tile = platform.env.getenvUsize("ANTFLY_GLIDE_CUDA_FFN_TILE_ROWS") orelse 4096;
     if (configured_tile == 0 or configured_tile > 4096) return error.InvalidShape;
     const tile = @min(rows, configured_tile);
-    var staged = try allocDeviceBuffer(self, tile * hidden * 2);
-    defer releaseDeviceBuffer(self, &staged);
-    var gate_values = try allocDeviceBuffer(self, tile * intermediate * 4);
-    defer releaseDeviceBuffer(self, &gate_values);
-    var up_values = try allocDeviceBuffer(self, tile * intermediate * 4);
-    defer releaseDeviceBuffer(self, &up_values);
-    var activated = try allocDeviceBuffer(self, tile * intermediate * 2);
-    defer releaseDeviceBuffer(self, &activated);
+    const layout = try CudaCompute.DenseFfnProgram.Layout.init(tile, hidden, intermediate, 0);
+    var scratch = try allocDeviceBuffer(self, layout.scratch_bytes);
+    defer releaseDeviceBuffer(self, &scratch);
+    const staged = try scratch.borrowRange(0, tile * hidden * @sizeOf(f16));
+    const activated = try scratch.borrowRange(0, tile * intermediate * @sizeOf(f16));
+    const gate_values = try scratch.borrowRange(layout.gate_offset, tile * intermediate * @sizeOf(f32));
+    const up_values = try scratch.borrowRange(layout.up_offset, gate_values.len);
     const output = (try allocUninitF32ShapeOp(self, &.{ @intCast(rows), @intCast(hidden) })).?;
     errdefer freeTensor(self, output);
     const workspace = cublasLtWorkspace(self);
@@ -16363,16 +16357,18 @@ fn lightOnGatedFfnNoBias(ctx: *anyopaque, request: *const ops.GatedFfnNoBiasRequ
         // gate/up weight copy. Both GEMMs consume the same staged input.
         const staged = (try stageBf16ActivationForCublasLt(self, input, rows, hidden)) orelse return null;
         const bytes = try checkedMul(try checkedMul(rows, intermediate), 4);
-        var gate_values = try allocDeviceBuffer(self, bytes);
-        defer releaseDeviceBuffer(self, &gate_values);
-        var up_values = try allocDeviceBuffer(self, bytes);
-        defer releaseDeviceBuffer(self, &up_values);
+        const layout = try CudaCompute.DenseFfnProgram.Layout.init(rows, hidden, intermediate, 0);
+        var scratch = try allocDeviceBuffer(self, layout.scratch_bytes);
+        defer releaseDeviceBuffer(self, &scratch);
+        const gate_values = try scratch.borrowRange(layout.gate_offset, bytes);
+        const up_values = try scratch.borrowRange(layout.up_offset, bytes);
+        const activated = try scratch.borrowRange(0, bytes / 2);
         errdefer self.ctx.synchronize() catch {};
         const workspace = cublasLtWorkspace(self);
         if (!try runCublasLtBf16Matmul(self, gate_values, staged, gate.buffer, workspace, rows, hidden, intermediate) or
             !try runCublasLtBf16Matmul(self, up_values, staged, up.buffer, workspace, rows, hidden, intermediate)) return error.CublasLtError;
         self.stats.bf16_cublaslt_linear_calls += 2;
-        const output = try lightOnFfnBf16Down(self, .{ .separate = .{ .gate = gate_values, .up = up_values } }, down, rows, hidden, intermediate, null);
+        const output = try lightOnFfnBf16Down(self, .{ .separate = .{ .gate = gate_values, .up = up_values } }, down, rows, hidden, intermediate, activated);
         self.lighton_fused_ffn_calls += 1;
         return output;
     }
@@ -16400,17 +16396,26 @@ fn lightOnGatedFfnNoBias(ctx: *anyopaque, request: *const ops.GatedFfnNoBiasRequ
     const pair = pair_owner.buffer;
     const staged = (try stageBf16ActivationForCublasLt(self, input, rows, hidden)) orelse return null;
     const two_intermediate = try checkedMul(intermediate, 2);
-    var projected = try allocDeviceBuffer(self, try checkedMul(try checkedMul(rows, two_intermediate), 4));
-    defer releaseDeviceBuffer(self, &projected);
+    const projected_bytes = try checkedMul(try checkedMul(rows, two_intermediate), @sizeOf(f32));
+    var scratch_bytes = projected_bytes;
+    const activation_bytes = projected_bytes / @as(usize, if (self.lighton_ffn_bf16_inputs) 4 else 2);
+    const activation_span = try buffer_mod.ByteSpan.append(&scratch_bytes, activation_bytes, buffer_mod.DeviceBuffer.allocation_alignment);
+    var scratch = try allocDeviceBuffer(self, scratch_bytes);
+    defer releaseDeviceBuffer(self, &scratch);
+    const projected = try scratch.borrowRange(0, projected_bytes);
     if (!try runCublasLtBf16Matmul(self, projected, staged, pair, cublasLtWorkspace(self), rows, hidden, two_intermediate)) return null;
     self.stats.bf16_cublaslt_linear_calls += 1;
+    const activation = try scratch.borrowRange(activation_span.offset, activation_span.bytes);
     if (self.lighton_ffn_bf16_inputs) {
-        const output = try lightOnFfnBf16Down(self, .{ .joined = projected }, down, rows, hidden, intermediate, null);
+        const output = try lightOnFfnBf16Down(self, .{ .joined = projected }, down, rows, hidden, intermediate, activation);
         self.lighton_fused_ffn_calls += 1;
         return output;
     }
     const cb = self.computeBackend();
-    const activated = (try cb.allocUninitF32Shape(&.{ @intCast(rows), @intCast(intermediate) })).?;
+    const activation_shape = try allocShape2(self.allocator, rows, intermediate);
+    var activation_view = try OwnedF32Output.fromOwnedShapeDestination(self, activation_shape, rows * intermediate, activation_bytes, activation);
+    defer activation_view.deinit();
+    const activated = activation_view.intoTensor();
     defer cb.free(activated);
     try self.kernels.launchActivationMultiplyFusedGateUpF32(&self.ctx, tensorFromCt(activated).buffer, projected, rows, intermediate, @backingInt(request.activation));
     self.stats.launch_elementwise += 1;
@@ -63705,7 +63710,18 @@ test "GLiDE CUDA tiled FFN matches separate operations across tile tails" {
             const expected = try cb.linearNoBias(activated, weights[2], rows, intermediate, hidden);
             defer cb.free(expected);
             const request = ops.GatedFfnNoBiasRequest{ .input = input, .gate_weight = weights[0], .up_weight = weights[1], .down_weight = weights[2], .rows = rows, .hidden_size = hidden, .intermediate_size = intermediate, .activation = .silu };
-            const actual = (try cb.gatedFfnNoBias(&request)).?;
+            const actual = if (rows != 1) (try cb.gatedFfnNoBias(&request)).? else observed: {
+                const Workspace = @import("../../execution/stream_workspace.zig");
+                var plan: Workspace.Plan = .{};
+                var scope = Workspace.Scope.observe(&plan);
+                compute.execution_scope = &scope;
+                defer compute.execution_scope = null;
+                const result = (try cb.gatedFfnNoBias(&request)).?;
+                errdefer cb.free(result);
+                try std.testing.expect(plan.finish(tensorFromCt(result).buffer.ptr));
+                try std.testing.expectEqual(@as(usize, 2), plan.count);
+                break :observed result;
+            };
             defer cb.free(actual);
             const want = try cb.toFloat32(expected, a);
             defer a.free(want);
