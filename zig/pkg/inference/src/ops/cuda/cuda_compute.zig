@@ -46696,6 +46696,7 @@ fn checkDenseSiluFfnBlockPolicy(bf16_projections: bool, prefill_only: bool) !voi
                 const want = try cb.toFloat32(original, a);
                 defer a.free(want);
                 for (want, got) |x, y| try std.testing.expectApproxEqAbs(x, y, 2e-4);
+                if (!prefill_only and rows == 7) try checkAssignedDenseFfnCapture(&compute, &cb, request, bf16_projections, got);
                 const unchanged = try cb.toFloat32(input, a);
                 defer a.free(unchanged);
                 try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(values), std.mem.sliceAsBytes(unchanged));
@@ -46708,7 +46709,7 @@ fn checkDenseSiluFfnBlockPolicy(bf16_projections: bool, prefill_only: bool) !voi
                 compute.debug_cuda_graph_capture_active = false;
                 try std.testing.expectEqual(launches, compute.ctx.stats.kernel_launches);
             }
-            const block_calls = cases.len + @as(usize, if (prefill_only) 6 else 0);
+            const block_calls = cases.len + @as(usize, if (prefill_only) 6 else 2);
             try std.testing.expectEqual(block_calls, compute.lighton_activation.calls);
             try std.testing.expectEqual(block_calls, compute.lighton_activation.separate_calls);
             try std.testing.expectEqual(block_calls, compute.lighton_activation.norm_calls);
@@ -46720,6 +46721,75 @@ fn checkDenseSiluFfnBlockPolicy(bf16_projections: bool, prefill_only: bool) !voi
             try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(norm_values), std.mem.sliceAsBytes(norm_unchanged));
         }
     }
+}
+
+fn checkAssignedDenseFfnCapture(compute: *CudaCompute, cb: *const ops.ComputeBackend, request: CudaCompute.DenseSiluFfnBlockRequest, compact: bool, expected: []const f32) !void {
+    const a = std.testing.allocator;
+    const Graph = @import("bounded_decode_graph.zig");
+    const Workspace = @import("../../execution/stream_workspace.zig");
+    const positions: [7 * 3]u32 = @splat(0);
+    var phase: Graph.GraphPhase = undefined;
+    try phase.initInto(.{
+        .epoch = 1,
+        .key = &.{1},
+        .positions = &positions,
+        .rows = request.rows,
+        .hidden = request.hidden,
+        .vocab = 1,
+        .future_tokens = 2,
+        .attention_layers = 0,
+        .recurrent_layers = 0,
+        .ffn_intermediate = request.intermediate,
+    });
+    try phase.declareFfnScratch(compact);
+    var backing = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, phase.storage_layout.metadata_bytes);
+    defer backing.free(&compute.ctx);
+    const owner = &compute.bounded_decode_graph;
+    owner.vendor_workspace = cublasLtWorkspace(compute);
+    owner.metadata = backing;
+    owner.storage_layout = phase.storage_layout;
+    owner.epoch_id = 1;
+    owner.rows = request.rows;
+    owner.hidden = request.hidden;
+    owner.active = true;
+    defer {
+        owner.active = false;
+        owner.metadata = .{};
+        owner.vendor_workspace = .{};
+        owner.storage_layout = null;
+        owner.epoch_id = 0;
+        owner.rows = 0;
+        owner.hidden = 0;
+    }
+    const warm_address = address: {
+        const warm = (try CudaCompute.denseSiluFfnBlock(cb, request)) orelse return error.TestUnexpectedResult;
+        defer cb.free(warm);
+        try compute.ctx.synchronize();
+        break :address tensorFromCt(warm).buffer.ptr;
+    };
+    owner.next_ffn_output = 0;
+
+    var plan: Workspace.Plan = .{};
+    try plan.declare(&.{}, null);
+    var scope = try Workspace.Scope.bind(&plan, try plan.layout(0), 0, 0);
+    compute.execution_scope = &scope;
+    defer compute.execution_scope = null;
+    try compute.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED);
+    var recording = true;
+    errdefer if (recording) graph_mod.discardRecording(&compute.ctx);
+    const output = (try CudaCompute.denseSiluFfnBlock(cb, request)) orelse return error.TestUnexpectedResult;
+    defer cb.free(output);
+    try std.testing.expect(scope.complete());
+    try std.testing.expectEqual(warm_address, tensorFromCt(output).buffer.ptr);
+    var graph = try graph_mod.endRecording(&compute.ctx);
+    recording = false;
+    defer compute.ctx.destroyGraphChecked(&graph) catch unreachable;
+    var executable = try compute.ctx.instantiateGraph(graph);
+    defer compute.ctx.destroyGraphExecChecked(&executable) catch unreachable;
+    try compute.ctx.launchGraph(executable);
+    const actual = try cb.toFloat32(output, a);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(f32, expected, actual);
 }
 
 test "LightOnOCR3 CUDA token burst keeps dependent IDs on device and preserves suppressed ties embeddings and ownership" {
