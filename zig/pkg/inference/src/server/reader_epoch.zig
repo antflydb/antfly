@@ -748,6 +748,16 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             ctx.pageAccess(.{}, true).acquireForCleanup();
             ctx.invalidateCudaDecodeGraph(.foreground_cleanup);
         }
+        pub fn releasePageBudget(ctx: *LightOnStreamContext, reserved: runtime.tier.memory.AdmissionAmounts) void {
+            ctx.pageAccess(.{}, true).acquireForCleanup();
+            defer ctx.unlockStep();
+            // Only the reader's budget counters change here. The state
+            // and its device allocations retire under their own cleanup.
+            ctx.budget.host_kv_bytes -= reserved.host_kv_bytes;
+            ctx.budget.backend_kv_bytes -= reserved.backend_kv_bytes;
+            ctx.budget.host_scratch_bytes -= reserved.host_scratch_bytes;
+            ctx.budget.backend_scratch_bytes -= reserved.backend_scratch_bytes;
+        }
         pub fn unlockStep(ctx: *LightOnStreamContext) void {
             ctx.step_mutex.unlock();
             if (ctx.gate_events) (execution_control_mod.ExecutionLane.Lease{ .lane = &ctx.step_gate }).release();

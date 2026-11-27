@@ -10403,14 +10403,7 @@ pub const Node = struct {
             .host_scratch_bytes = ctx.budget.host_scratch_bytes - before.host_scratch_bytes,
             .backend_scratch_bytes = ctx.budget.backend_scratch_bytes - before.backend_scratch_bytes,
         };
-        defer {
-            ctx.lockStepForCleanup();
-            ctx.budget.host_kv_bytes -= reserved.host_kv_bytes;
-            ctx.budget.backend_kv_bytes -= reserved.backend_kv_bytes;
-            ctx.budget.host_scratch_bytes -= reserved.host_scratch_bytes;
-            ctx.budget.backend_scratch_bytes -= reserved.backend_scratch_bytes;
-            ctx.unlockStep();
-        }
+        defer ctx.releasePageBudget(reserved);
         if (chunk != estimate.token_count) {
             ctx.unlockStep();
             return error.MemoryBudgetExceeded;
