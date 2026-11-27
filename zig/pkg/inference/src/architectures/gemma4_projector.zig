@@ -5330,7 +5330,8 @@ fn audioKeyScale() f32 {
 fn audioLocalAttention(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: AudioConfig, q: CT, k: CT, v: CT, rel: CT, layer: usize, inputs: *const AudioLayerInputs) !CT {
     if (inputs.segments.len == 0) return audioLocalAttentionSingle(cb, allocator, cfg, q, k, v, rel, layer, inputs);
     if (layer >= inputs.scales.len) return error.InvalidTensorShape;
-    if (inputs.segment_valid) |validity| if (cfg.attention_context_right == 0 and !audioHostOps().attention) {
+    const device_attention = cfg.attention_context_right == 0 and !audioHostOps().attention;
+    if (inputs.segment_valid) |validity| if (device_attention) {
         var params = try audioLocalAttentionParams(cfg, inputs.valid_mask.len);
         params.segmented = true;
         if (try cb.gemma4AudioLocalAttention(q, k, v, rel, inputs.scales[layer], validity, params)) |result| return result;
@@ -5343,7 +5344,7 @@ fn audioLocalAttention(cb: *const ComputeBackend, allocator: std.mem.Allocator, 
     if (remaining != 0) return error.InvalidInputShape;
     const output = (try cb.allocUninitF32Shape(&.{ @intCast(inputs.valid_mask.len), @intCast(cfg.audio_hidden) })) orelse return error.UnsupportedResidentGemma4Audio;
     errdefer cb.free(output);
-    if (cfg.source_scalar_storage == .bf16 and cfg.attention_context_right == 0 and !audioHostOps().attention) {
+    if (cfg.source_scalar_storage == .bf16 and device_attention) {
         try cb.checkExecutionControl();
         const params = try audioLocalAttentionParams(cfg, inputs.valid_mask.len);
         if (try cb.localRelativeAttentionInto(q, k, v, rel, inputs.scales[layer], inputs.valid_ct, params, .{
@@ -5364,6 +5365,16 @@ fn audioLocalAttention(cb: *const ComputeBackend, allocator: std.mem.Allocator, 
         // Views reuse the one admitted mask upload across all tower layers.
         const valid_ct = try cb.sliceRows2D(allocator, inputs.valid_ct, offset, span, 1);
         defer cb.free(valid_ct);
+        if (device_attention and cb.vtable.regions.audio_attention.localRelativeInto != null) {
+            const params = try audioLocalAttentionParams(cfg, span);
+            if (try cb.localRelativeAttentionInto(qs, ks, vs, rel, inputs.scales[layer], valid_ct, params, .{
+                .tensor = output,
+                .first_row = offset,
+            })) {
+                offset += span;
+                continue;
+            }
+        }
         var clip = inputs.*;
         clip.valid_mask = inputs.valid_mask[offset..][0..span];
         clip.valid_ct = valid_ct;
@@ -9773,6 +9784,44 @@ fn checkAudioSegmentKernels(cb: ComputeBackend, _: ComputeBackend) !void {
         try before.expectUnchanged(cb);
         const actual = try cb.toFloat32(result, a);
         defer a.free(actual);
+        if (cb.kind() == .cuda) {
+            var valid_values: [rows]f32 = undefined;
+            for (&valid_values, mask) |*entry, present| entry.* = if (present) 1 else 0;
+            const plain_mask = try cb.fromFloat32Shape(&valid_values, &.{rows});
+            defer cb.free(plain_mask);
+            var scale_handles = [_]CT{scale};
+            const inputs: AudioLayerInputs = .{
+                .allocator = a,
+                .valid_mask = &mask,
+                .segments = &spans,
+                .rel_in = relative,
+                .valid_ct = plain_mask,
+                .ones = scale,
+                .scales_host = &.{},
+                .scales = &scale_handles,
+            };
+            const cfg: AudioConfig = .{
+                .text_hidden = hidden,
+                .audio_hidden = hidden,
+                .output_hidden = hidden,
+                .intermediate_size = hidden,
+                .block_count = 1,
+                .head_count = 2,
+                .mel_bins = 128,
+                .layer_norm_eps = 1e-5,
+                .attention_chunk_size = 12,
+                .attention_context_left = 13,
+                .attention_invalid_logits_value = invalid,
+                .exclude_farthest_key = true,
+            };
+            const transfers = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
+            const assigned = try audioLocalAttention(&cb, a, cfg, source, source, source, relative, 0, &inputs);
+            defer cb.free(assigned);
+            try transfers.expectUnchanged(cb);
+            const assigned_values = try cb.toFloat32(assigned, a);
+            defer a.free(assigned_values);
+            for (actual, assigned_values) |expected, value| try std.testing.expectApproxEqAbs(expected, value, 2e-5);
+        }
         offset = 0;
         for (spans) |span| {
             params.rows = span;
