@@ -29,6 +29,46 @@ pub fn CachedDecoder(comptime Architecture: type) type {
     return struct {
         const Self = @This();
         pub const Mode = enum { scalar, batched };
+        pub const LogitStorage = enum { full_prefix, incremental };
+
+        /// Cached batched decoding materializes [active_rows, vocab] logits for one
+        /// step. KV capacity and encoder geometry still cover the complete invocation.
+        /// Callers selecting this envelope must unwind before full-prefix fallback.
+        pub fn planRun(
+            cfg: Architecture.Config,
+            batch: usize,
+            pixel_count: usize,
+            prompt_length: usize,
+            max_length: usize,
+            storage: LogitStorage,
+        ) !@import("../backends/session.zig").RunRequest {
+            const Checked = struct {
+                fn add(a: usize, b: usize) !usize {
+                    return std.math.add(usize, a, b) catch error.ResourceLimitExceeded;
+                }
+                fn mul(a: usize, b: usize) !usize {
+                    return std.math.mul(usize, a, b) catch error.ResourceLimitExceeded;
+                }
+            };
+            if (batch == 0) return error.InvalidInputShape;
+            const encoder_length = Architecture.encoderSequenceLength(cfg, prompt_length) catch |err| switch (err) {
+                error.Overflow => return error.ResourceLimitExceeded,
+                else => return err,
+            };
+            const decoder_length = @max(max_length, 1);
+            const encoder_bytes = try Checked.mul(try Checked.mul(batch, encoder_length), try Checked.mul(cfg.d_model, @sizeOf(f32)));
+            const logits_bytes = try Checked.mul(try Checked.mul(batch, if (storage == .incremental) @as(usize, 1) else decoder_length), try Checked.mul(cfg.vocab_size, @sizeOf(f32)));
+            const kv_bytes = Architecture.decoderKvBytes(cfg, batch, encoder_length, decoder_length) catch return error.ResourceLimitExceeded;
+            const prompt_bytes = try Checked.mul(prompt_length, try Checked.add(try Checked.mul(batch, @sizeOf(i64)), @sizeOf(i32)));
+            return .{
+                .batch = batch,
+                .sequence = @max(encoder_length, decoder_length),
+                .input_bytes = try Checked.add(try Checked.mul(pixel_count, @sizeOf(f32)), prompt_bytes),
+                .output_bytes = try Checked.add(try Checked.add(encoder_bytes, logits_bytes), kv_bytes),
+                .output_kv_bytes = kv_bytes,
+            };
+        }
+
         pub const Context = struct {
             allocator: std.mem.Allocator,
             backend: *const ComputeBackend,
