@@ -2168,6 +2168,54 @@ test "prepared generated storage append authorizes front retirement before publi
     try std.testing.expectEqualSlices(block.KvBlockId, before, (try storage.sequenceMut(sequence)).block_table.blocks.items);
 }
 
+test "checked sequence release preserves pages until the device owner accepts cleanup" {
+    const Probe = struct {
+        reject: bool = true,
+        checked_calls: usize = 0,
+        legacy_calls: usize = 0,
+
+        fn write(_: *anyopaque, _: KvSuffixWrite, _: DeviceKvRef, _: DeviceKvRef) !void {
+            return error.UnexpectedWrite;
+        }
+        fn prepare(_: *anyopaque, _: *const anyopaque, _: Cleanup) !void {
+            return error.UnexpectedLegacyPreparation;
+        }
+        fn checked(raw: *anyopaque, sequence: SequenceId, current: Cleanup) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(sequence != 0);
+            try std.testing.expect(current.outside_execution);
+            self.checked_calls += 1;
+            if (self.reject) return error.ReleaseDeclined;
+        }
+        fn release(raw: *anyopaque, _: SequenceId) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.legacy_calls += 1;
+        }
+        fn close(_: *anyopaque, _: std.mem.Allocator) void {}
+        const table: DeviceWriteHook.VTable = .{
+            .prepareMutationWithCleanup = prepare,
+            .writeLayerKvSuffix = write,
+            .releaseSequence = release,
+            .releaseSequenceWithCleanup = checked,
+            .deinit = close,
+        };
+    };
+    var probe: Probe = .{};
+    var storage = try KvStorageRuntime.init(std.testing.allocator, .{ .backend = .native, .dtype = .f32, .page_size_tokens = 4, .num_kv_heads = 1, .head_dim = 1 });
+    defer storage.deinit();
+    const sequence = try storage.attachSequence(storage.poolId());
+    try storage.appendTokens(sequence, 3);
+    storage.setDeviceWriteHook(.{ .ctx = &probe, .vtable = &Probe.table });
+    const current: Cleanup = .{ .outside_execution = true };
+    try std.testing.expectError(error.ReleaseDeclined, storage.releaseSequenceWithCleanup(sequence, current));
+    try std.testing.expectEqual(@as(?usize, 3), storage.tokenCount(sequence));
+    probe.reject = false;
+    try storage.releaseSequenceWithCleanup(sequence, current);
+    try std.testing.expectEqual(@as(?usize, null), storage.tokenCount(sequence));
+    try std.testing.expectEqual(@as(usize, 2), probe.checked_calls);
+    try std.testing.expectEqual(@as(usize, 0), probe.legacy_calls);
+}
+
 test "unpublished storage attachment abort skips hooks and full prefill publishes only after page commit" {
     const Fixture = struct {
         releases: usize = 0,
