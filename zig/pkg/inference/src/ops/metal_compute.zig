@@ -54378,10 +54378,12 @@ test "embeddinggemma2 Metal audio replay survives fused selector eviction after 
     const plan = try a.create(audio_tape.Plan);
     defer a.destroy(plan);
     var nodes: [2]audio_tape.Node = undefined;
-    plan.* = .{ .nodes = &nodes, .count = 2, .output = 3 };
+    plan.* = .{ .nodes = &nodes, .count = 2, .input_count = 2, .output = 3 };
     plan.nodes[0] = .{ .output = 2, .inputs = .{ 0, 0, 0, 0, 0, 0, 0, 0 }, .input_count = 1, .args = .{ .silu = .{ .input = 0 } } };
     plan.nodes[1] = .{ .output = 3, .inputs = .{ 2, 1, 0, 0, 0, 0, 0, 0 }, .input_count = 2, .args = .{ .clippedLinear = .{ .input = 2, .weight = 1, .p = .{ .rows = 1, .in_dim = 2, .out_dim = 2, .flags = 2 | 8 | 16, .input_min = 0, .input_max = 1, .output_min = 0, .output_max = 0.8 } } } };
     plan.last_use[2] = 1;
+    try std.testing.expectError(error.AudioScheduleInvalid, plan.replay(&cb, &.{x}, .{}));
+    try std.testing.expectError(error.AudioScheduleInvalid, plan.replay(&cb, &.{ x, w, w }, .{}));
     for (0..2) |_| {
         try std.testing.expect(try cb.decoderRuntimeBeginFrame());
         defer cb.decoderRuntimeCancelFrame() catch {};
@@ -54572,7 +54574,7 @@ test "embeddinggemma2 Metal audio prepared slots reuse arenas without mutating r
     const plan = try a.create(audio_tape.Plan);
     defer a.destroy(plan);
     var nodes: [2]audio_tape.Node = undefined;
-    plan.* = .{ .nodes = &nodes, .count = 2, .output = 2 };
+    plan.* = .{ .nodes = &nodes, .count = 2, .input_count = 1, .output = 2 };
     plan.nodes[0] = .{ .prepared_slot = 0, .output = 1, .inputs = .{ 0, 0, 0, 0, 0, 0, 0, 0 }, .input_count = 1, .args = .{ .clippedLinear = .{ .input = 0, .weight = 0, .p = .{ .rows = 3, .in_dim = width, .out_dim = width, .flags = 16, .input_min = 0, .input_max = 0, .output_min = 0, .output_max = 0 } } } };
     plan.nodes[1] = .{ .prepared_slot = 0, .output = 2, .inputs = .{ 1, 0, 0, 0, 0, 0, 0, 0 }, .input_count = 1, .args = .{ .linearNoBias = .{ .input = 1, .weight = 0, .rows = 3, .in_dim = width, .out_dim = width } } };
     plan.last_use[1] = 1;
@@ -54646,7 +54648,7 @@ test "embeddinggemma2 Metal compact audio plans recover admission and reuse inte
     const plan = try a.create(audio_tape.Plan);
     defer a.destroy(plan);
     var nodes: [2]audio_tape.Node = undefined;
-    plan.* = .{ .nodes = &nodes, .count = 2, .output = 2 };
+    plan.* = .{ .nodes = &nodes, .count = 2, .input_count = 1, .output = 2 };
     nodes[0] = .{ .output = 1, .output_rows = 1, .output_dim = 2, .inputs = .{ 0, 0, 0, 0, 0, 0, 0, 0 }, .input_count = 1, .args = .{ .silu = .{ .input = 0 } } };
     nodes[1] = .{ .output = 2, .output_rows = 1, .output_dim = 2, .inputs = .{ 1, 1, 0, 0, 0, 0, 0, 0 }, .input_count = 2, .args = .{ .add = .{ .a = 1, .b = 1 } } };
     plan.last_use[1] = 1;
@@ -63639,7 +63641,7 @@ test "Metal audio optional clamp scratch preserves a fitting output bank and fun
     var nodes: [2]audio_tape.Node = undefined;
     nodes[0] = .{ .output = 1, .prepared_slot = 0, .args = .{ .clippedLinear = .{ .input = 0, .weight = 0, .p = .{ .rows = 3, .in_dim = width, .out_dim = output_width, .flags = 3, .input_min = -1, .input_max = 1, .output_min = 0, .output_max = 0 } } } };
     nodes[1] = .{ .output = 2, .output_rows = 3, .output_dim = output_width, .args = .{ .silu = .{ .input = 1 } } };
-    plan.* = .{ .nodes = &nodes, .count = 2, .output = 2 };
+    plan.* = .{ .nodes = &nodes, .count = 2, .input_count = 1, .output = 2 };
     plan.last_use[1] = 1;
     const cache = &store.tier_cache.?;
     try cache.reserve(.host, @sizeOf(audio_tape.Plan));
