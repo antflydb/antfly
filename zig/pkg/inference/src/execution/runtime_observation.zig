@@ -374,6 +374,7 @@ pub const KernelScope = struct {
     metal_serial_workspace: ?SerialWorkspaceObservation = null,
     cuda_audio_workspace: ?CudaAudioWorkspace = null,
     cuda_decoder_workspace: ?CudaDecoderWorkspace = null,
+    cuda_decoder_declines: ?CudaDecoderDeclines = null,
     attached: bool = false,
     /// Must be called only after the owner reaches final address-stable storage.
     pub fn begin(self: *KernelScope) void {
@@ -498,6 +499,34 @@ pub const CudaDecoderWorkspace = struct {
 pub inline fn cudaDecoderWorkspace(workspace: CudaDecoderWorkspace) void {
     var active = active_kernels;
     while (active) |scope| : (active = scope.previous) scope.cuda_decoder_workspace = workspace;
+}
+
+/// Declines before a bounded decoder graph takes ownership of execution.
+pub const CudaDecoderDeclines = struct {
+    unsupported_geometry: u64 = 0,
+    missing_kv_binding: u64 = 0,
+    unsupported_lane_state: u64 = 0,
+    context_or_page_capacity: u64 = 0,
+    unstable_weight_or_workspace: u64 = 0,
+    incompatible_layer_state: u64 = 0,
+    unstable_recurrent_state: u64 = 0,
+    admission_or_revalidation: u64 = 0,
+
+    pub const Reason = @import("std").meta.FieldEnum(CudaDecoderDeclines);
+};
+
+pub inline fn cudaDecoderDeclined(reason: CudaDecoderDeclines.Reason) void {
+    if (active_kernels != null) cudaDecoderDeclinedEnabled(reason);
+}
+
+noinline fn cudaDecoderDeclinedEnabled(reason: CudaDecoderDeclines.Reason) void {
+    var active = active_kernels;
+    while (active) |scope| : (active = scope.previous) {
+        if (scope.cuda_decoder_declines == null) scope.cuda_decoder_declines = .{};
+        switch (reason) {
+            inline else => |tag| @field(scope.cuda_decoder_declines.?, @tagName(tag)) +|= 1,
+        }
+    }
 }
 
 threadlocal var cuda_audio: CudaAudio = .{};

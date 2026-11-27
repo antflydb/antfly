@@ -249,6 +249,7 @@ pub const Snapshot = struct {
     metal_serial_workspace: ?@import("runtime_observation.zig").SerialWorkspaceObservation = null,
     cuda_audio_workspace: ?@import("runtime_observation.zig").CudaAudioWorkspace = null,
     cuda_decoder_workspace: ?@import("runtime_observation.zig").CudaDecoderWorkspace = null,
+    cuda_decoder_declines: ?@import("runtime_observation.zig").CudaDecoderDeclines = null,
     memory: Memory = .{},
     /// Invocation interval on its submitting thread, including CPU fallbacks.
     submission: ?@import("runtime_observation.zig").Counters = null,
@@ -270,6 +271,7 @@ pub const Snapshot = struct {
         self.metal_serial_workspace = scope.metal_serial_workspace;
         self.cuda_audio_workspace = scope.cuda_audio_workspace;
         self.cuda_decoder_workspace = scope.cuda_decoder_workspace;
+        self.cuda_decoder_declines = scope.cuda_decoder_declines;
     }
 
     pub fn since(self: Snapshot, before: Snapshot) Snapshot {
@@ -296,6 +298,7 @@ pub const Snapshot = struct {
             .metal_serial_workspace = self.metal_serial_workspace,
             .cuda_audio_workspace = self.cuda_audio_workspace,
             .cuda_decoder_workspace = self.cuda_decoder_workspace,
+            .cuda_decoder_declines = self.cuda_decoder_declines,
             .cuda = if (self.cuda) |after| if (before.cuda) |start| after.since(start) else after else null,
             .native_allocations = if (self.native_allocations) |after| if (before.native_allocations) |start| after.since(start) else after else null,
             .process = if (self.process) |after| if (before.process) |start| after.since(start) else after else null,

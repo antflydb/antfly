@@ -27,6 +27,8 @@ const ComputeBackend = ops.ComputeBackend;
 const decoder_gated_runtime = @import("../backends/decoder_gated_runtime.zig");
 const execution = @import("../graph/execution.zig");
 const work_mod = @import("decoder_work.zig");
+const observation = @import("runtime_observation.zig");
+const CudaGraphDecline = observation.CudaDecoderDeclines.Reason;
 const PendingDecodeBatchWork = work_mod.Decode;
 const PendingPrefillBatchWork = work_mod.Prefill;
 const state_runtime = @import("decode_state_runtime.zig");
@@ -761,8 +763,9 @@ pub const Executor = struct {
 
     /// Execute only inside the reader epoch's model lane. The two-step graph
     /// returns through the existing bounded-burst publication contract.
-    fn declineLightOnGraph(self: *Executor, reason: u3) ?StepForwardResult {
-        self.lighton_graph_declines[reason] += 1;
+    fn declineLightOnGraph(self: *Executor, reason: CudaGraphDecline) ?StepForwardResult {
+        self.lighton_graph_declines[@intFromEnum(reason)] += 1;
+        observation.cudaDecoderDeclined(reason);
         return null;
     }
 
@@ -831,11 +834,11 @@ pub const Executor = struct {
             }
         };
         const Info = struct { max_future: usize, attention_count: usize };
-        fn decline(code: *u3, value: u3) ?Info {
+        fn decline(code: *CudaGraphDecline, value: CudaGraphDecline) ?Info {
             code.* = value;
             return null;
         }
-        fn build(self: *Executor, key: *Key, claimed: []const runtime.scheduler.native_generate.StepItem, items: []MixedBatchDecodeItem, manager: *@import("../runtime/kv/manager.zig").KvManager, storage: *@import("../runtime/kv/storage_runtime.zig").KvStorageRuntime, embedding_out: *?ops.CT, head_out: *?ops.CT, comptime reserve: bool, decline_code: *u3) !?Info {
+        fn build(self: *Executor, key: *Key, claimed: []const runtime.scheduler.native_generate.StepItem, items: []MixedBatchDecodeItem, manager: *@import("../runtime/kv/manager.zig").KvManager, storage: *@import("../runtime/kv/storage_runtime.zig").KvStorageRuntime, embedding_out: *?ops.CT, head_out: *?ops.CT, comptime reserve: bool, decline_code: *CudaGraphDecline) !?Info {
             const C = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
             var future: [128]usize = undefined;
             var max_future: usize = 0;
@@ -846,12 +849,12 @@ pub const Executor = struct {
                     mixed.state.kv_manager != manager or mixed.state.kv_storage != storage or mixed.state.sequence_id == null or
                     mixed.state.force_full_recompute or mixed.state.kv_compacted or mixed.state.allow_swa_ring or
                     mixed.kv_position_offset != 0 or mixed.kv_sequence_len != mixed.total_sequence_len or
-                    mixed.state.qwen35_linear_cache == null) return decline(decline_code, 2);
+                    mixed.state.qwen35_linear_cache == null) return decline(decline_code, .unsupported_lane_state);
                 const remaining = work.remaining_tokens;
                 future[i] = try std.math.add(usize, item.total_sequence_len, remaining);
-                if (future[i] > @import("../ops/cuda/paged_attention_bf16.zig").max_native_context_tokens) return decline(decline_code, 3);
+                if (future[i] > @import("../ops/cuda/paged_attention_bf16.zig").max_native_context_tokens) return decline(decline_code, .context_or_page_capacity);
                 if (storage.storage.config.sliding_window_size) |window|
-                    if (future[i] > window) return decline(decline_code, 3);
+                    if (future[i] > window) return decline(decline_code, .context_or_page_capacity);
                 max_future = @max(max_future, future[i]);
             }
             if (reserve) {
@@ -860,39 +863,39 @@ pub const Executor = struct {
             }
             const embedding = embedding_out.* orelse return error.InvalidState;
             const head = head_out.* orelse return error.InvalidState;
-            const embedding_pointer = C.lightOnGraphWeightPointer(self.context.cb, embedding) orelse return decline(decline_code, 4);
-            const head_pointer = C.lightOnGraphWeightPointer(self.context.cb, head) orelse return decline(decline_code, 4);
+            const embedding_pointer = C.lightOnGraphWeightPointer(self.context.cb, embedding) orelse return decline(decline_code, .unstable_weight_or_workspace);
+            const head_pointer = C.lightOnGraphWeightPointer(self.context.cb, head) orelse return decline(decline_code, .unstable_weight_or_workspace);
             try key.add(self.lighton_cuda_execution_id);
             try key.add(claimed.len);
             try key.add(self.context.gpt_config.hidden_size);
             try key.add(self.context.gpt_config.vocab_size);
             try key.add(embedding_pointer);
             try key.add(head_pointer);
-            try key.add(if (reserve) C.lightOnGraphWorkspacePointer(self.context.cb) else C.peekLightOnGraphWorkspacePointer(self.context.cb) orelse return decline(decline_code, 4));
+            try key.add(if (reserve) C.lightOnGraphWorkspacePointer(self.context.cb) else C.peekLightOnGraphWorkspacePointer(self.context.cb) orelse return decline(decline_code, .unstable_weight_or_workspace));
             var attention_layers: [128]usize = undefined;
             var attention_count: usize = 0;
             const first_cache = &items[0].state.qwen35_linear_cache.?;
             for (first_cache.layers, 0..) |*layer, layer_index| {
                 if (!self.context.gpt_config.layerUsesQwen35LinearAttention(layer_index)) {
-                    if (attention_count == attention_layers.len) return decline(decline_code, 5);
+                    if (attention_count == attention_layers.len) return decline(decline_code, .incompatible_layer_state);
                     // Native attention addresses the compact full-attention KV
                     // layers; recurrent decoder layers have no KV storage slot.
-                    attention_layers[attention_count] = self.context.gpt_config.compactQwen35KvStorageLayerIndex(layer_index) orelse return decline(decline_code, 5);
+                    attention_layers[attention_count] = self.context.gpt_config.compactQwen35KvStorageLayerIndex(layer_index) orelse return decline(decline_code, .incompatible_layer_state);
                     attention_count += 1;
                     continue;
                 }
                 for (items, 0..) |item, row| {
                     const cache = &item.state.qwen35_linear_cache.?;
-                    if (cache.layers.len != first_cache.layers.len) return decline(decline_code, 5);
+                    if (cache.layers.len != first_cache.layers.len) return decline(decline_code, .incompatible_layer_state);
                     const state = &cache.layers[layer_index].cuda_device;
-                    if (!C.lightOnGraphStateOwned(self.context.cb, state)) return decline(decline_code, 5);
+                    if (!C.lightOnGraphStateOwned(self.context.cb, state)) return decline(decline_code, .incompatible_layer_state);
                     if (row % 64 == 0) for (state.weights) |weight| try key.add(weight.ptr);
                     // BF16 convolution filters are widened into independently
                     // owned page copies. The batch kernel already uses the first
                     // page's copy for all peers; prove the immutable source IDs,
                     // while the key above retains the actual captured pointers.
                     for (state.weight_sources, layer.cuda_device.weight_sources) |source, expected|
-                        if (source == 0 or source != expected) return decline(decline_code, 6);
+                        if (source == 0 or source != expected) return decline(decline_code, .unstable_recurrent_state);
                     try key.add(state.recurrent.ptr);
                     try key.add(state.history[0].ptr);
                     try key.add(state.history[1].ptr);
@@ -907,21 +910,21 @@ pub const Executor = struct {
                 if (i % 64 == 0) packet_blocks = 0;
                 const state = item.state;
                 const sequence = state.sequence_id.?;
-                const table = storage.blockTable(sequence) orelse return decline(decline_code, 1);
-                if (table.shared_prefix_blocks != 0) return decline(decline_code, 3);
+                const table = storage.blockTable(sequence) orelse return decline(decline_code, .missing_kv_binding);
+                if (table.shared_prefix_blocks != 0) return decline(decline_code, .context_or_page_capacity);
                 if (reserve) {
                     try manager.reserveTokenCapacity(sequence, future[i]);
                     try storage.reserveDeviceTokenCapacity(sequence, future[i], future[i]);
-                } else if (try manager.reservedTokenCapacity(sequence) < future[i]) return decline(decline_code, 3);
-                const manager_table = manager.blockTable(sequence) orelse return decline(decline_code, 1);
-                if (manager_table.shared_prefix_blocks != 0) return decline(decline_code, 3);
+                } else if (try manager.reservedTokenCapacity(sequence) < future[i]) return decline(decline_code, .context_or_page_capacity);
+                const manager_table = manager.blockTable(sequence) orelse return decline(decline_code, .missing_kv_binding);
+                if (manager_table.shared_prefix_blocks != 0) return decline(decline_code, .context_or_page_capacity);
                 const blocks: []const u32 = if (reserve) try storage.logicalBlocksWithReservations(sequence) else &.{};
                 const owned_sequence: ?*@import("../runtime/kv/storage_runtime.zig").SequenceState = if (!reserve) try storage.sequenceMut(sequence) else null;
                 const block_count = if (owned_sequence) |value| try std.math.add(usize, value.block_table.blocks.items.len, value.reserved_tail_blocks.items.len) else blocks.len;
-                if (storage.storage.config.page_size_tokens == 0 or try std.math.mul(usize, block_count, storage.storage.config.page_size_tokens) < future[i]) return decline(decline_code, 3);
+                if (storage.storage.config.page_size_tokens == 0 or try std.math.mul(usize, block_count, storage.storage.config.page_size_tokens) < future[i]) return decline(decline_code, .context_or_page_capacity);
                 const packet_limit = @import("../ops/cuda/paged_attention_bf16.zig").max_blocks;
-                if (block_count == 0 or block_count > packet_limit - packet_blocks) return decline(decline_code, 3);
-                if (key.len > key.words.len - 3 or block_count > key.words.len - key.len - 3) return decline(decline_code, 3);
+                if (block_count == 0 or block_count > packet_limit - packet_blocks) return decline(decline_code, .context_or_page_capacity);
+                if (key.len > key.words.len - 3 or block_count > key.words.len - key.len - 3) return decline(decline_code, .context_or_page_capacity);
                 packet_blocks += block_count;
                 try key.add(sequence);
                 try key.add(future[i]);
@@ -933,7 +936,7 @@ pub const Executor = struct {
             }
             var kv_words: [193]u64 = undefined;
             const kv_count = try C.lightOnGraphKvWords(self.context.cb, storage, items[0].state.sequence_id.?, max_future, attention_layers[0..attention_count], &kv_words);
-            for (0..attention_count) |index| if (kv_words[1 + index * 3 + 2] < max_future) return decline(decline_code, 3);
+            for (0..attention_count) |index| if (kv_words[1 + index * 3 + 2] < max_future) return decline(decline_code, .context_or_page_capacity);
             for (kv_words[0..kv_count]) |word| try key.add(word);
             return .{ .max_future = max_future, .attention_count = attention_count };
         }
@@ -949,25 +952,25 @@ pub const Executor = struct {
         const C = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
         self.lighton_graph_attempts += 1;
         if (self.lighton_cuda_execution_id == 0 or self.access.mutex == null or !C.lightOnDecodeGraphEnabled(self.context.cb) or
-            claimed.len < 2 or claimed.len > (if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128")) @as(usize, 128) else 64) or self.context.gpt_config.suppressTokenIds().len != 0) return self.declineLightOnGraph(0);
-        if (claimed.len > 64 and claimed.len % 64 == 1) return self.declineLightOnGraph(0);
+            claimed.len < 2 or claimed.len > (if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128")) @as(usize, 128) else 64) or self.context.gpt_config.suppressTokenIds().len != 0) return self.declineLightOnGraph(.unsupported_geometry);
+        if (claimed.len > 64 and claimed.len % 64 == 1) return self.declineLightOnGraph(.unsupported_geometry);
         // The graph requires the same concrete packet route as its numerical
         // attention calls. Generic shapes must decline before weight lookup,
         // KV reservations, admission, graph creation or warm execution.
-        if (!@import("../ops/cuda/paged_attention_bf16.zig").geometrySupported(self.context.gpt_config.num_attention_heads, self.context.gpt_config.effectiveKVHeads(), self.context.gpt_config.headDim())) return self.declineLightOnGraph(0);
+        if (!@import("../ops/cuda/paged_attention_bf16.zig").geometrySupported(self.context.gpt_config.num_attention_heads, self.context.gpt_config.effectiveKVHeads(), self.context.gpt_config.headDim())) return self.declineLightOnGraph(.unsupported_geometry);
         for (0..self.context.gpt_config.num_hidden_layers) |layer| {
             if (self.context.gpt_config.layerUsesQwen35LinearAttention(layer) and
-                !@import("../ops/cuda/gated_delta.zig").packetGeometrySupported(self.context.gpt_config.qwen35_linear_num_key_heads, self.context.gpt_config.qwen35_linear_num_value_heads, self.context.gpt_config.qwen35_linear_key_head_dim, self.context.gpt_config.qwen35_linear_value_head_dim, self.context.gpt_config.qwen35_linear_conv_kernel_dim)) return self.declineLightOnGraph(0);
+                !@import("../ops/cuda/gated_delta.zig").packetGeometrySupported(self.context.gpt_config.qwen35_linear_num_key_heads, self.context.gpt_config.qwen35_linear_num_value_heads, self.context.gpt_config.qwen35_linear_key_head_dim, self.context.gpt_config.qwen35_linear_value_head_dim, self.context.gpt_config.qwen35_linear_conv_kernel_dim)) return self.declineLightOnGraph(.unsupported_geometry);
         }
         try self.context.cb.checkExecutionControl();
         var key_words: [24576]u64 = undefined;
         var key = CapturedGraphRecipe.Key{ .words = &key_words };
-        const storage = items[0].state.kv_storage orelse return self.declineLightOnGraph(1);
-        const manager = items[0].state.kv_manager orelse return self.declineLightOnGraph(1);
-        const positions = first_context.mrope_positions orelse return self.declineLightOnGraph(1);
-        if (positions.len != claimed.len * 3) return self.declineLightOnGraph(1);
-        const kv_lock = items[0].state.kv_lock orelse return self.declineLightOnGraph(1);
-        for (items) |item| if (item.state.kv_lock != kv_lock) return self.declineLightOnGraph(1);
+        const storage = items[0].state.kv_storage orelse return self.declineLightOnGraph(.missing_kv_binding);
+        const manager = items[0].state.kv_manager orelse return self.declineLightOnGraph(.missing_kv_binding);
+        const positions = first_context.mrope_positions orelse return self.declineLightOnGraph(.missing_kv_binding);
+        if (positions.len != claimed.len * 3) return self.declineLightOnGraph(.missing_kv_binding);
+        const kv_lock = items[0].state.kv_lock orelse return self.declineLightOnGraph(.missing_kv_binding);
+        for (items) |item| if (item.state.kv_lock != kv_lock) return self.declineLightOnGraph(.missing_kv_binding);
         platform.sync.lockYielding(kv_lock);
         var kv_held = true;
         defer if (kv_held) kv_lock.unlock();
@@ -975,7 +978,7 @@ pub const Executor = struct {
         defer if (embedding_out) |value| self.context.cb.free(value);
         var head_out: ?ops.CT = null;
         defer if (head_out) |value| self.context.cb.free(value);
-        var decline_code: u3 = 7;
+        var decline_code: CudaGraphDecline = .admission_or_revalidation;
         const recipe = (try CapturedGraphRecipe.build(self, &key, claimed, items, manager, storage, &embedding_out, &head_out, true, &decline_code)) orelse return self.declineLightOnGraph(decline_code);
         const embedding = embedding_out.?;
         const head = head_out.?;
@@ -988,7 +991,7 @@ pub const Executor = struct {
         var funding_phase: graph_owner.GraphPhase = undefined;
         try funding_phase.initInto(descriptor);
         defer funding_phase.close(.{ .boundary = self.context.cleanupEpoch() }) catch platform.inference_process_supervisor.restartWorker();
-        const preparation = self.context.graph_preparation orelse return self.declineLightOnGraph(7);
+        const preparation = self.context.graph_preparation orelse return self.declineLightOnGraph(.admission_or_revalidation);
         const KvOutside = struct {
             mutex: @TypeOf(kv_lock),
             held: *bool,
@@ -1000,17 +1003,17 @@ pub const Executor = struct {
             }
         };
         var outside = KvOutside{ .mutex = kv_lock, .held = &kv_held };
-        if (!try preparation.prepare_fn(preparation.ptr, self.context.cb, descriptor, &funding_phase, .{ .ptr = &outside, .release_fn = KvOutside.release }, self.context.execution_control orelse .{})) return self.declineLightOnGraph(7);
+        if (!try preparation.prepare_fn(preparation.ptr, self.context.cb, descriptor, &funding_phase, .{ .ptr = &outside, .release_fn = KvOutside.release }, self.context.execution_control orelse .{})) return self.declineLightOnGraph(.admission_or_revalidation);
         if (!kv_held) {
             platform.sync.lockYielding(kv_lock);
             kv_held = true;
             var verified_key = CapturedGraphRecipe.Key{ .words = key.words, .verification_len = key.len };
-            const verified = (try CapturedGraphRecipe.build(self, &verified_key, claimed, items, manager, storage, &embedding_out, &head_out, false, &decline_code)) orelse return self.declineLightOnGraph(7);
-            const current_positions = first_context.mrope_positions orelse return self.declineLightOnGraph(7);
-            if (verified.max_future != max_future or verified.attention_count != attention_count or (!verified_key.same or verified_key.len != key.len) or !std.mem.eql(u32, position_snapshot[0..positions.len], current_positions)) return self.declineLightOnGraph(7);
+            const verified = (try CapturedGraphRecipe.build(self, &verified_key, claimed, items, manager, storage, &embedding_out, &head_out, false, &decline_code)) orelse return self.declineLightOnGraph(.admission_or_revalidation);
+            const current_positions = first_context.mrope_positions orelse return self.declineLightOnGraph(.admission_or_revalidation);
+            if (verified.max_future != max_future or verified.attention_count != attention_count or (!verified_key.same or verified_key.len != key.len) or !std.mem.eql(u32, position_snapshot[0..positions.len], current_positions)) return self.declineLightOnGraph(.admission_or_revalidation);
         }
         // The callback may have parked/restored; read the actual owner NOW.
-        const prepared = (try C.beginBoundedDecodeGraph(self.context.cb, .{ .boundary = self.context.cleanupEpoch(), .operation = self.context.cb.operationToken() }, &funding_phase, descriptor)) orelse return self.declineLightOnGraph(7);
+        const prepared = (try C.beginBoundedDecodeGraph(self.context.cb, .{ .boundary = self.context.cleanupEpoch(), .operation = self.context.cb.operationToken() }, &funding_phase, descriptor)) orelse return self.declineLightOnGraph(.admission_or_revalidation);
         var graph = prepared;
         defer graph.deinit();
         // Funding tokens are consumed or published. Close metadata while

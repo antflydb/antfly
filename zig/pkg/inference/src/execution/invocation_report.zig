@@ -117,6 +117,7 @@ pub const Report = struct {
     metal_serial_workspace: ?@import("runtime_observation.zig").SerialWorkspaceObservation = null,
     cuda_audio_workspace: ?@import("runtime_observation.zig").CudaAudioWorkspace = null,
     cuda_decoder_workspace: ?@import("runtime_observation.zig").CudaDecoderWorkspace = null,
+    cuda_decoder_declines: ?@import("runtime_observation.zig").CudaDecoderDeclines = null,
     /// Available from the corresponding successfully published physical Frame.
     assigned_regions: ?@import("stats.zig").AssignedRegions = null,
     owned_program_fallbacks: ?ProgramFallbacks = null,
@@ -153,6 +154,7 @@ pub const Report = struct {
         report.metal_serial_workspace = value.runtime.metal_serial_workspace;
         report.cuda_audio_workspace = value.runtime.cuda_audio_workspace;
         report.cuda_decoder_workspace = value.runtime.cuda_decoder_workspace;
+        report.cuda_decoder_declines = value.runtime.cuda_decoder_declines;
         if (value.pending_interval != null) report.synchronous_interval = .pending_phase_only;
         if (value.error_name) |failure| report.failure = @import("runtime_observation.zig").FailureText.init(failure.view());
         if (value.program_error) |failure| {
@@ -420,6 +422,7 @@ test "uniform report retains bounded CUDA decoder workspace after completed publ
     source.configure(true);
     source.publish(.{});
     try std.testing.expect(source.snapshot().?.report.?.cuda_decoder_workspace == null);
+    try std.testing.expect(source.snapshot().?.report.?.cuda_decoder_declines == null);
     const workspace: observation.CudaDecoderWorkspace = .{
         .route = .replayed,
         .plan_origin = .observed,
@@ -434,12 +437,21 @@ test "uniform report retains bounded CUDA decoder workspace after completed publ
     };
     var scope: observation.KernelScope = undefined;
     scope.begin();
+    observation.cudaDecoderDeclined(.missing_kv_binding);
+    {
+        var nested: observation.KernelScope = undefined;
+        nested.begin();
+        observation.cudaDecoderDeclined(.admission_or_revalidation);
+        _ = nested.finish();
+        try std.testing.expectEqualDeep(observation.CudaDecoderDeclines{ .admission_or_revalidation = 1 }, nested.cuda_decoder_declines.?);
+    }
     observation.cudaDecoderWorkspace(workspace);
     _ = scope.finish();
     var sample: runtime.Snapshot = .{};
     sample.recordKernelInterval(&scope);
     source.publish(.{ .runtime = sample.since(.{}) });
     try std.testing.expectEqual(workspace, source.snapshot().?.report.?.cuda_decoder_workspace.?);
+    try std.testing.expectEqualDeep(observation.CudaDecoderDeclines{ .missing_kv_binding = 1, .admission_or_revalidation = 1 }, source.snapshot().?.report.?.cuda_decoder_declines.?);
 }
 
 test "uniform report separates planned literal publication from opaque Metal output copies" {
