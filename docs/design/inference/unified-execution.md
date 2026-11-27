@@ -1294,6 +1294,22 @@ All 64 measured Antfly responses matched the explicitly tuned run's content
 and finish reasons. Both engines passed all four fixture fact checks with
 48 tokens. The Spark tests passed 94 cases with one Metal-only skip.
 
+With the packed Metal gather at `d2e27a2f11`, both focused tests passed.
+The synthetic 48-row gather control took 33.33 ms serial and 19.51 ms
+fused. The released T5-small decoder matched greedy tokens for both
+requests across all four arms with advancing cache positions 5–20.
+
+| Metal T5 suffix arm | Pairs | p50 (ms) | Max (ms) |
+| --- | ---: | ---: | ---: |
+| Serial, positions 5–12 | 8 | 18.03 | 23.27 |
+| Fused, positions 5–12 | 8 | 46.81 | 54.93 |
+| Fused, positions 13–20 | 8 | 55.74 | 63.33 |
+| Serial, positions 13–20 | 8 | 22.15 | 23.57 |
+
+The released result covers advancing shapes and contrasts with the
+earlier repeated-shape control. Metal uses the direct resident route by
+default while a positive explicit broker collection window enables fusion.
+
 ### Issue closure audit
 
 This audit reconciles the original `2f2438e67f` implementation review

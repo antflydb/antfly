@@ -465,10 +465,13 @@ fn runMode(comptime placement: OutputPlacement, broker: *micro.Broker, allocator
         if (!try borrowed.yieldExecution() and borrowed.lease != null) return error.MissingRunRequest;
     };
     const ticket = Ticket{ .session = session, .permit = permit, .gate = gate, .inputs = inputs, .control = control, .rows = if (inputs.len != 0 and inputs[0].shape.len != 0 and inputs[0].shape[0] > 0) @intCast(inputs[0].shape[0]) else 1, .stage = stage };
-    // CPU packing has no device-transfer savings. Use the serial resident
-    // path by default until fused CPU decoding is qualified on real models.
-    const serial_cpu_stage = stage != null and session.backend() == .native and (wait_us orelse 0) == 0;
-    if (serial_cpu_stage or !(if (stage) |mixed| eligibleStage(session, inputs, mixed) else eligible(session, inputs)))
+    // CPU packing has no device-transfer savings. On Metal, batching helps
+    // repeated shapes but loses on released T5 with advancing cache lengths.
+    // Keep both providers on direct resident execution unless collection is
+    // explicitly enabled.
+    const serial_stage = stage != null and (wait_us orelse 0) == 0 and
+        (session.backend() == .native or session.backend() == .metal);
+    if (serial_stage or !(if (stage) |mixed| eligibleStage(session, inputs, mixed) else eligible(session, inputs)))
         return directMode(placement, allocator, ticket);
     const alloc = std.heap.smp_allocator;
     var signature = std.Io.Writer.Allocating.init(allocator);
