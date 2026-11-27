@@ -5437,7 +5437,7 @@ pub const CudaCompute = struct {
         }
         const scratch_layout = try @import("gated_delta.zig").PacketScratch.init(states.len, channels, width);
         const planned = self.bounded_decode_graph.active;
-        var scratch = if (planned) try self.bounded_decode_graph.bindRecurrentWorkspace(scratch_layout) else try allocDeviceBuffer(self, scratch_layout.bytes);
+        var scratch = if (planned) try self.bounded_decode_graph.bindRecurrentWorkspace(scratch_layout) else try allocOperationScratch(self, scratch_layout.bytes);
         defer if (!planned) releaseDeviceBuffer(self, &scratch);
         params.conv = scratch.ptr;
         params.core = scratch.ptr + scratch_layout.core_offset;
@@ -5560,7 +5560,7 @@ pub const CudaCompute = struct {
         for (states) |state| try self.prepareLightOnRecurrentState(state, weights, weight_counts, kh, vh, pre_admitted);
         const output = try recurrentLayerOutput(self, rows, width, inputs);
         errdefer cb.free(output);
-        var scratch = assigned orelse if (scratch_layout) |layout| try allocDeviceBuffer(self, layout.bytes) else buffer_mod.DeviceBuffer{};
+        var scratch = assigned orelse if (scratch_layout) |layout| try allocOperationScratch(self, layout.bytes) else buffer_mod.DeviceBuffer{};
         defer if (!planned) releaseDeviceBuffer(self, &scratch);
         var packets: [2]@import("gated_delta.zig").RaggedParams = undefined;
         var packet_rows: [2]u32 = @splat(0);
@@ -5702,7 +5702,7 @@ pub const CudaCompute = struct {
         const output = (try allocUninitF32ShapeOp(self, &.{ @intCast(rows), @intCast(width) })).?;
         errdefer cb.free(output);
         const scratch_layout = try @import("gated_delta.zig").PacketScratch.init(rows, channels, width);
-        var scratch = try allocDeviceBuffer(self, scratch_layout.bytes);
+        var scratch = try allocOperationScratch(self, scratch_layout.bytes);
         defer releaseDeviceBuffer(self, &scratch);
         var params = @import("gated_delta.zig").PrefixBatchParams{
             .base = .{
@@ -18190,6 +18190,12 @@ fn allocDeviceBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
 
 const ScopedBufferRole = enum { tensor, operation_scratch };
 
+fn allocOperationScratch(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
+    if (len == 0) return .{};
+    if (self.execution_scope) |scope| return allocScopedDeviceBuffer(self, scope, len, .operation_scratch);
+    return allocDeviceBufferOrdinary(self, len);
+}
+
 fn allocScopedDeviceBuffer(self: *CudaCompute, scope: *@import("../../execution/stream_workspace.zig").Scope, len: usize, comptime role: ScopedBufferRole) !buffer_mod.DeviceBuffer {
     if (scope.isBound()) return .{
         .ptr = switch (role) {
@@ -27245,10 +27251,7 @@ const ProjectionArgmaxScratch = struct {
         if (suppressed.len != 0) {
             if (self.execution_scope) |scope| if (scope.isBound()) return error.CudaGraphCaptureUnsafeHostCopy;
         }
-        var bank = if (self.execution_scope) |scope|
-            try allocScopedDeviceBuffer(self, scope, layout.bytes, .operation_scratch)
-        else
-            try allocDeviceBuffer(self, layout.bytes);
+        var bank = try allocOperationScratch(self, layout.bytes);
         errdefer releaseDeviceBuffer(self, &bank);
         const scratch = try bind(bank, layout);
         if (suppressed.len != 0) try copyFromHostTracked(self, scratch.suppression, std.mem.sliceAsBytes(suppressed));
