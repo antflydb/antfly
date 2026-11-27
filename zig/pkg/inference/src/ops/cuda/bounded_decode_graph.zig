@@ -337,15 +337,15 @@ pub const GraphPhase = struct {
     }
 
     pub fn matchesOwner(self: *const GraphPhase, owner: *const Module) bool {
-        const storage = owner.storage_layout orelse return false;
-        const compatible_head = storage.head_bytes == self.storage_layout.head_bytes or
-            (self.descriptor.head_storage == .adaptive_bank and storage.head_bytes > 0 and storage.head_bytes < self.storage_layout.head_bytes);
-        return owner.matches(self.descriptor) and compatible_head and
-            storage.arena_head_rows == self.storage_layout.arena_head_rows and
-            std.meta.eql(storage.fused_head_workspace, self.storage_layout.fused_head_workspace) and
-            std.meta.eql(storage.recurrent_workspace, self.storage_layout.recurrent_workspace) and
-            std.meta.eql(storage.recurrent_scratch, self.storage_layout.recurrent_scratch) and
-            std.meta.eql(owner.attention_scratch, self.attention_scratch);
+        if (!owner.matches(self.descriptor)) return false;
+        var storage = owner.storage_layout orelse return false;
+        const expected = self.storage_layout;
+        if (self.descriptor.head_storage == .adaptive_bank and storage.head_bytes < expected.head_bytes) {
+            const row_bytes = self.descriptor.vocab * @sizeOf(f32);
+            if (storage.head_bytes < 8 * row_bytes or storage.head_bytes % row_bytes != 0) return false;
+            storage.head_bytes = expected.head_bytes;
+        }
+        return std.meta.eql(storage, expected) and std.meta.eql(owner.attention_scratch, self.attention_scratch);
     }
 
     /// Only the optional packet bank changes. Input, token and attention spans
@@ -1334,7 +1334,12 @@ test "bounded decoder graph reuse requires the prepared dispatch geometry" {
     try phase.declareAttentionScratch(false);
     try std.testing.expect(!phase.matchesOwner(&owner));
     owner.attention_scratch = phase.attention_scratch;
+    try std.testing.expect(!phase.matchesOwner(&owner));
+    owner.storage_layout = phase.storage_layout;
     try std.testing.expect(phase.matchesOwner(&owner));
+    owner.storage_layout.?.metadata_bytes -= 1;
+    try std.testing.expect(!phase.matchesOwner(&owner));
+    owner.storage_layout = phase.storage_layout;
     try phase.declareAttentionScratch(true);
     try std.testing.expect(!phase.matchesOwner(&owner));
     phase.descriptor.future_tokens += 2;
