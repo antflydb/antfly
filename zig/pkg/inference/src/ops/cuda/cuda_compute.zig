@@ -3476,6 +3476,7 @@ pub const CudaCompute = struct {
     pub fn boundedFusedHeadAvailable(cb: *const ops.ComputeBackend, head: CT, rows: usize, hidden: usize, vocab: usize) bool {
         if (!acceptsPhysicalImplementation(cb.vtable)) return false;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        if (self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return false;
         const weight = tensorFromCt(head);
         if (!self.fusedHeadAvailable(weight, rows, hidden, vocab)) return false;
         // Shape eligibility bounds both dimensions before multiplying.
@@ -3489,8 +3490,7 @@ pub const CudaCompute = struct {
         const fused = @import("projection_top1_bf16.zig");
         return !self.lighton_fused_head_disabled and fused.supported(self.ctx.info.compute_major, self.ctx.info.compute_minor, rows, hidden, vocab) and
             weight.dtype == .bf16 and weight.quant_type == null and !weight.strict_resident_training and
-            !self.resident_training_cache and self.lazy_host_store == null and
-            !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active;
+            !self.resident_training_cache and self.lazy_host_store == null;
     }
 
     /// Token IDs stay on the CUDA stream until the complete bounded burst
@@ -3525,7 +3525,9 @@ pub const CudaCompute = struct {
             const input = tensorFromCt(hidden);
             const weight = tensorFromCt(head);
             const fused = @import("projection_top1_bf16.zig");
-            if (self.fusedHeadAvailable(weight, burst.rows, burst.hidden, burst.vocab) and !input.strict_resident_training) {
+            if (!self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active and
+                self.fusedHeadAvailable(weight, burst.rows, burst.hidden, burst.vocab) and !input.strict_resident_training)
+            {
                 const layout = try fused.Scratch.forRows(burst.rows);
                 // Both planes stay live through the finish kernel. Use one
                 // admitted range and retain it through the whole burst.
