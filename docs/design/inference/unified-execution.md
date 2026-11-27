@@ -1429,6 +1429,11 @@ The released model reproduced the same arena size and replay count.
 At `20d6f40954`, after unifying the grouped clip limit and geometry
 check, all 14 tests again passed without skips. The released checkpoint
 still matched vectors exactly and replayed twice with the same arena.
+At `eeab638ade`, after sharing the checked attention extent with
+dispatch, all 16 Spark CUDA checks passed without skips. The released
+two-clip checkpoint reproduced exact vectors, two replays, and
+38,017,792 bytes of planned and captured arena capacity. The same
+run covered segmented kernel parity and fused LightOnOCR HTTP replay.
 The production layout still comes from an observed allocation schedule.
 
 At `ee3629cec0`, five scoped Metal audio tests passed without skips.
