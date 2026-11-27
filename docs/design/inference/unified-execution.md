@@ -1977,3 +1977,17 @@ separate gate. The isolated Metal receipt SHA-256 is
 | Image | 5,515.11 → 3,661.21 | 1,093.06 → 740.56 |
 | Audio | 1,274.82 → 959.71 | 290.87 → 288.99 |
 | Video | 5,163.63 → 3,026.77 | 1,042.13 → 706.56 |
+
+The local CPU audio controls completed with exact equality throughout.
+With both revisions pinned to DFT, the 16-sample-per-side A/B p50/p95
+moved from 225.34/227.82 ms to 226.35/229.47 ms, with no same-binary
+failures. The candidate-only default FFT also matched every response
+across both arms. The DFT and FFT receipt hashes are
+`ec2bfdf7ea8f04f00b5f394f622ef315b7e399438aadb3aeefb8935527000d20`
+and `60516667126f9bacb91b88eb4f1f187485a42d7b58b041dcfbb27cfef6374965`.
+
+The isolated two-clip Metal audio case also matched exactly. A/B
+p50/p95 moved from 37.67/42.89 ms to 40.66/43.49 ms. Same-binary median
+differences were below 1%; the p50 increase remains under investigation.
+The Metal audio receipt SHA-256 is
+`1835c78059945da6a58029628da300633053c41efd12ae095638adc988e7cda1`.
