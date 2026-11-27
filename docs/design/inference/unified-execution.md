@@ -1404,6 +1404,12 @@ retained in the qualification receipt.
 | 8 | 67.14/68.61 | 61.69/62.78 |
 | 32 | 259.78/262.53 | 240.71/242.81 |
 
+A separate local DECIDE-1B singleton case at `da4dea80de` passed
+exact outputs and all timing controls with 32 samples per side per
+phase. Native CPU p50/p95 was 123.38/127.72 ms on the baseline and
+123.97/127.19 ms on the candidate. Metal was 29.86/30.46 and
+29.95/30.35 ms, respectively. This used the cached DECIDE-1B checkpoint.
+
 On M4 Max at `da4dea80de`, all ten Metal HTTP workloads matched
 outputs and confirmed Metal selection against the frozen baseline.
 Eight workloads passed the timing gates. Gemma 4 E4B image p50 fell
