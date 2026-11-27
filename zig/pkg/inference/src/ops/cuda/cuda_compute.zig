@@ -4163,7 +4163,7 @@ pub const CudaCompute = struct {
         if (rows > 64 and !self.lighton_ragged_recurrent_enabled) return null;
         if (self.execution_scope != null or try self.ctx.streamCaptureActive()) return null;
         const descriptor = graph_phase.descriptor;
-        if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions)) return error.PreparedCachePlanChanged;
+        if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or !std.meta.eql(descriptor.attention_geometry, expected.attention_geometry) or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions)) return error.PreparedCachePlanChanged;
         const owner = &self.bounded_decode_graph;
         while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
         var claimed = false;
@@ -4199,6 +4199,11 @@ pub const CudaCompute = struct {
             };
         }
         const head_destination = try owner.bindExecutionStorage();
+        const paged_attention = @import("paged_attention_bf16.zig");
+        const attention_scratch = if (expected.attention_layers != 0) plan: {
+            const geometry = expected.attention_geometry orelse return error.InvalidExecutionPlan;
+            break :plan try paged_attention.DecodeScratch.init(rows, future_tokens, geometry, paged_attention.useChunk128(self.lighton_attention_chunk128, geometry.heads));
+        } else null;
         const capture_scope = if (owner.phase == .capture) try owner.bindArena() else null;
         if (self.captured_cache_roots) |roots| try roots.beginGeneration(self, current);
         try self.lighton_attention.init(&self.ctx);
@@ -4215,7 +4220,7 @@ pub const CudaCompute = struct {
         if (owner.phase == .warm) if (self.cublaslt) |*blas| {
             _ = try blas.reserveTensorCorePlanSlots(&self.ctx, 64);
         };
-        owner.future_tokens = future_tokens;
+        owner.attention_scratch = attention_scratch;
         claimed = true;
         return .{
             .compute = self,
@@ -32771,10 +32776,10 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
         if (!params.appendPage(i, tokens, total - 1, blocks[0..count])) return null;
         max_tokens = @max(max_tokens, tokens);
     }
-    const chunk128 = module.useChunk128(self.lighton_attention_chunk128, heads);
-    const planned_tokens = if (self.bounded_decode_graph.active) self.bounded_decode_graph.future_tokens else max_tokens;
-    if (planned_tokens < max_tokens) return error.InvalidExecutionPlan;
-    const scratch_layout = module.ScratchLayout.init(views.len, heads, kv_heads, dim, planned_tokens, chunk128) catch return null;
+    const scratch_layout = if (self.bounded_decode_graph.active) bound: {
+        const scratch = self.bounded_decode_graph.attention_scratch orelse return error.InvalidExecutionPlan;
+        break :bound try scratch.forPacket(views.len, max_tokens, .{ .heads = heads, .kv_heads = kv_heads, .dim = dim });
+    } else module.ScratchLayout.init(views.len, heads, kv_heads, dim, max_tokens, module.useChunk128(self.lighton_attention_chunk128, heads)) catch return null;
     params.chunks = scratch_layout.chunks;
     if (self.bounded_decode_graph.active) {
         params.graph_progress = self.bounded_decode_graph.counter().ptr;
@@ -32857,7 +32862,7 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
     params.k = layer.k.ptr;
     params.v = layer.v.ptr;
     params.capacity = @intCast(layer.capacity_tokens);
-    try self.lighton_attention.run(&self.ctx, &params, chunk128);
+    try self.lighton_attention.run(&self.ctx, &params, scratch_layout.chunk128);
     self.stats.device_kv_batch_steps += 1;
     self.stats.device_kv_batch_items += views.len;
     self.stats.device_kv_successes += 1;

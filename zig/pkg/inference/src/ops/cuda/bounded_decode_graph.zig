@@ -22,6 +22,7 @@ const driver = @import("driver.zig");
 const buffer = @import("buffer.zig");
 const memory = @import("../../runtime/tier/memory.zig");
 const plan_mod = @import("../../execution/stream_workspace.zig");
+const DecodeScratch = @import("paged_attention_bf16.zig").DecodeScratch;
 const quota_mod = @import("cache_quota.zig");
 const funding_mod = @import("prepared_cache.zig");
 const retirement = @import("../../execution/resource_retirement.zig");
@@ -165,6 +166,7 @@ pub const Descriptor = struct {
     hidden: usize,
     vocab: usize,
     future_tokens: usize,
+    attention_geometry: ?DecodeScratch.Geometry = null,
     attention_layers: usize,
     recurrent_layers: usize,
     pub fn layout(self: Descriptor) !StorageLayout {
@@ -342,7 +344,7 @@ pub const Module = struct {
     // Wide logits live outside the bounded temporary arena. Both dependent
     // steps reuse this independently admitted output after their argmax.
     head: buffer.DeviceBuffer = .{},
-    future_tokens: usize = 0,
+    attention_scratch: ?DecodeScratch = null,
     attention_layers: usize = 0,
     recurrent_layers: usize = 0,
     expected_attention_calls: usize = 0,
@@ -399,6 +401,7 @@ pub const Module = struct {
         try self.metadata_quota.releaseAfterSdkDeath(current);
         self.captured_roots_identity = 0;
         self.storage_layout = null;
+        self.attention_scratch = null;
         self.rows = 0;
         self.hidden = 0;
         self.vocab = 0;
