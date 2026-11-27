@@ -21288,6 +21288,19 @@ fn retireUnusableAudioPlan(entry: *@import("audio_execution_plan.zig").Entry, cu
     };
 }
 
+fn runAudioWithWorkspace(
+    self: *CudaCompute,
+    scope: *@import("../../execution/stream_workspace.zig").Scope,
+    context: *anyopaque,
+    inputs: []const CT,
+    run: *const fn (*anyopaque, []const CT) anyerror!CT,
+) !CT {
+    std.debug.assert(self.execution_scope == null);
+    self.execution_scope = scope;
+    defer self.execution_scope = null;
+    return run(context, inputs);
+}
+
 /// One actual warm invocation initializes caches; the next learns lifetimes.
 /// Capture uses only bounded arena addresses and validates every allocation/free.
 fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: CacheCleanup, _: bool) anyerror!?CT {
@@ -21364,13 +21377,10 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         var scope = plan_mod.Scope.observe(plan);
         const h2d_before = self.stats.h2d_bytes;
         const d2h_before = self.stats.d2h_bytes;
-        self.execution_scope = &scope;
-        const out = run(context, canonical[0..canonical_count]) catch |err| {
-            self.execution_scope = null;
+        const out = runAudioWithWorkspace(self, &scope, context, canonical[0..canonical_count], run) catch |err| {
             retireUnusableAudioPlan(entry, plan_cleanup, err == error.Cancelled or err == error.Timeout);
             return err;
         };
-        self.execution_scope = null;
         if (std.mem.indexOfScalar(CT, canonical[0..canonical_count], out) != null or std.mem.indexOfScalar(CT, inputs, out) != null) {
             retireUnusableAudioPlan(entry, plan_cleanup, false);
             return error.AudioPlanChanged;
@@ -21486,9 +21496,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         };
         const h2d_before = self.stats.h2d_bytes;
         const d2h_before = self.stats.d2h_bytes;
-        self.execution_scope = scope;
-        const result = run(context, stable[0..inputs.len]) catch |err| {
-            self.execution_scope = null;
+        const result = runAudioWithWorkspace(self, scope, context, stable[0..inputs.len], run) catch |err| {
             if (capture) {
                 graph_mod.discardRecording(&self.ctx);
             }
@@ -21499,7 +21507,6 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
             observation.cudaAudioResult(.capture_callback_declined);
             return null;
         };
-        self.execution_scope = null;
         // Callback inputs are borrowed stack views. Even a rejected result
         // must never reach freeTensor if it aliases one of these handles.
         const borrowed = std.mem.indexOfScalar(CT, stable[0..inputs.len], result) != null or
