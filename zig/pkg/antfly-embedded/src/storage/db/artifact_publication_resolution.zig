@@ -93,9 +93,11 @@ pub const EncodingAdmission = struct {
         primary_revision: ?publication.Position,
         upstream_revision: ?publication.Position,
     };
-    const refresh_interval_ns = 5 * std.time.ns_per_s;
+    const refresh_interval_ns: u64 = 5 * std.time.ns_per_s;
+    const hard_limit_refresh_ns: u64 = runtime.publication_limit_retry_ms * std.time.ns_per_ms;
     clock: Clock = Clock.real(),
     denied: ?struct { input: Input, bytes: usize, refresh_at_ns: u64 } = null,
+    hard_limit_blocked: bool = false,
 
     fn preflight(self: *EncodingAdmission, manager: *resources.ResourceManager, input: Input, minimum: usize) !void {
         // The estimate does not describe the complete causal read set. Let
@@ -109,21 +111,30 @@ pub const EncodingAdmission = struct {
         // This is a capacity check only. Candidate search and inference
         // admit their own working sets, so never overlap their memory with
         // the encoder reservation.
-        var credit = manager.reserveWithoutReclaim(.relational_preparation_working_set, required) catch |err|
-            return if (err == error.ResourceBudgetExceeded) error.ResourceTemporarilyUnavailable else err;
-        credit.release();
+        const slice: resources.Slice = .relational_preparation_working_set;
+        if (manager.availableAdmissionBytes(slice) >= required) return;
+        const denial = manager.classifyRequestDenial(slice, required);
+        if (denial == error.ResourceRequestTooLarge) {
+            self.hard_limit_blocked = true;
+            return denial;
+        }
+        _ = manager.reclaimForAllocation(slice, required);
+        if (manager.availableAdmissionBytes(slice) < required) return error.ResourceTemporarilyUnavailable;
     }
 
     fn encode(self: *EncodingAdmission, budget: *resources.BudgetedAllocator, input: Input, command: publication.Command) ![]u8 {
         const bytes = transport_codec.encodeAlloc(budget.allocator(), command) catch |err| {
             if (err == error.OutOfMemory) if (budget.allocationFailureThreadSafe()) |failure| if (failure.cause == .admission) {
                 const previous = if (self.denied) |old| if (std.meta.eql(old.input, input)) old.bytes else 0 else 0;
+                const demand = failure.requested_bytes +| @as(usize, @intCast(failure.live_bytes));
+                const denial = budget.reservation.manager.classifyRequestDenial(budget.reservation.slice, demand);
+                self.hard_limit_blocked = denial == error.ResourceRequestTooLarge;
                 self.denied = .{
                     .input = input,
-                    .bytes = @max(previous, failure.requested_bytes +| @as(usize, @intCast(failure.live_bytes))),
-                    .refresh_at_ns = self.clock.nowRealtimeNs() +| refresh_interval_ns,
+                    .bytes = @max(previous, demand),
+                    .refresh_at_ns = self.clock.nowRealtimeNs() +| if (self.hard_limit_blocked) hard_limit_refresh_ns else refresh_interval_ns,
                 };
-                return error.ResourceTemporarilyUnavailable;
+                return denial;
             };
             return err;
         };
@@ -148,6 +159,7 @@ pub fn process(
     candidate_source: ?runtime.CandidateSource,
     embedder: ?@import("enrichment/embedder.zig").DenseEmbedder,
 ) !bool {
+    encoding_admission.hard_limit_blocked = false;
     {
         var read = try store.beginReadTxnWithBlockCacheAdmission(.transient);
         defer read.abort();
@@ -252,7 +264,7 @@ pub fn process(
 
             const port = dispatcher orelse return error.ArtifactCatalogDrift;
             var budget = if (resource_manager) |owner|
-                resources.BudgetedAllocator.init(owner, .relational_preparation_working_set, alloc, 1)
+                resources.BudgetedAllocator.initReclaiming(owner, .relational_preparation_working_set, alloc, 1)
             else
                 null;
             defer if (budget) |*tracked| tracked.deinit();
@@ -619,6 +631,38 @@ test "ordered resolver preparation binds output to exact source and configured g
         var ann = try manager.reserveWithoutReclaim(.dense_search_working_set, encoder_demand + 1);
         ann.release();
         try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(slice).used_bytes);
+
+        var limited = resources.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = available } });
+        defer limited.deinit(alloc);
+        {
+            var budget = resources.BudgetedAllocator.initReclaiming(&limited, slice, alloc, 1);
+            defer budget.deinit();
+            try std.testing.expectError(error.ResourceRequestTooLarge, admission.encode(&budget, admission_input, large_command));
+            try std.testing.expect(admission.hard_limit_blocked);
+            admission.hard_limit_blocked = false;
+            try std.testing.expectError(error.ResourceRequestTooLarge, admission.preflight(&limited, admission_input, 1));
+            try std.testing.expect(admission.hard_limit_blocked);
+        }
+        clock.advanceNs(EncodingAdmission.hard_limit_refresh_ns - 1);
+        try std.testing.expectError(error.ResourceRequestTooLarge, admission.preflight(&limited, admission_input, 1));
+        clock.advanceNs(1);
+        const Cache = struct {
+            reservation: resources.Reservation,
+
+            fn reclaim(raw: *anyopaque, _: u64) u64 {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                const bytes = self.reservation.bytes;
+                self.reservation.release();
+                return bytes;
+            }
+        };
+        var cache: Cache = .{ .reservation = try limited.reserve(.hbc_node_metadata_cache, available) };
+        defer cache.reservation.release();
+        const reclaimer = try limited.registerReclaimer(.hbc_node_metadata_cache, &cache, Cache.reclaim);
+        defer limited.unregisterReclaimer(reclaimer);
+        const wire_size = try transport_codec.encodedLength(command);
+        try admission.preflight(&limited, admission_input, wire_size);
+        try std.testing.expectEqual(@as(u64, 0), limited.sliceStats(.hbc_node_metadata_cache).used_bytes);
     }
     var prepared = try prepareResolution(alloc, command, .{ .resolvers = encoded });
     defer prepared.deinit();

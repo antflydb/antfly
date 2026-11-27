@@ -2708,6 +2708,8 @@ pub fn initRuntimeStore(alloc: Allocator, store: anytype) !RuntimeStoreHandle {
     return .{ .store = try backend_erased.storeFrom(alloc, store), .owned = true };
 }
 
+pub const publication_limit_retry_ms = std.time.ms_per_min;
+
 /// Managed worker that catches the resolution stage up on changed extraction
 /// artifacts. Mirrors `EnrichmentRuntime`'s lifecycle: it wraps the shard store
 /// into the erased store and runs a background loop on the `backend_runtime` io
@@ -2747,6 +2749,7 @@ pub const ResolutionRuntime = struct {
     /// Catalog changes and cursor advancement share catch_up_mutex so an older
     /// window cannot clear a newer configuration's restart cursor.
     backfill_pending: std.atomic.Value(bool) = .init(false),
+    publication_limit_blocked: std.atomic.Value(bool) = .init(false),
     worker_started: std.atomic.Value(bool),
     worker_mutex: Io.Mutex = .init,
     worker_cond: Io.Condition = .init,
@@ -2817,6 +2820,7 @@ pub const ResolutionRuntime = struct {
     /// already wrote both cursors atomically; never reacquire catch_up_mutex or
     /// execute callbacks from the metadata refresh activity.
     pub fn notifyBackfill(self: *ResolutionRuntime) void {
+        self.notePublicationLimit(false);
         self.backfill_pending.store(true, .release);
         self.wakeWorker();
     }
@@ -2824,12 +2828,21 @@ pub const ResolutionRuntime = struct {
     pub fn stats(self: *ResolutionRuntime) types.ReplayStageStats {
         const target = self.target_sequence.load(.acquire);
         const applied = self.applied_sequence.load(.acquire);
+        const blocked = self.publication_limit_blocked.load(.acquire);
         return .{
             .enabled = target > 0 or applied < target or self.backfill_pending.load(.acquire),
             .target_sequence = target,
             .applied_sequence = applied,
             .catch_up_required = applied < target or self.backfill_pending.load(.acquire),
+            .blocked = blocked,
+            .blocked_reason = if (blocked) "resolver_publication_working_set_limit" else "",
         };
+    }
+
+    pub fn notePublicationLimit(self: *ResolutionRuntime, blocked: bool) void {
+        const previous = self.publication_limit_blocked.swap(blocked, .acq_rel);
+        if (blocked and !previous)
+            std.log.warn("resolution replay blocked by the publication working-set limit", .{});
     }
 
     /// Inject (or clear) the cross-shard candidate source after construction.
@@ -2958,6 +2971,7 @@ pub const ResolutionRuntime = struct {
         }
         const record = if (self.pending_replay_record) |*value| value else {
             if (self.replay_progress != null) return error.InvalidResolutionReplayCursor;
+            self.notePublicationLimit(false);
             // A scan that stopped at its entry cap examined only a prefix:
             // advance through what it verified holds no resolution work, not
             // to the target.
@@ -3048,6 +3062,7 @@ pub const ResolutionRuntime = struct {
                 self.alloc.free(resolvers);
             }
             if (resolvers.len == 0) {
+                self.notePublicationLimit(false);
                 // No resolver configured; advance so the hint does not
                 // rescan. Persist only once the durable watermark trails by
                 // a whole window: this would otherwise be a background
@@ -3081,6 +3096,7 @@ pub const ResolutionRuntime = struct {
                 self.ordered_writer,
             );
             if (max_seen <= applied) {
+                self.notePublicationLimit(false);
                 // No matching records in (applied, target]; advance to target.
                 try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, target);
                 self.persisted_applied = target;
@@ -3227,6 +3243,7 @@ pub const ResolutionRuntime = struct {
             // Accepted queue admission is not a completed publication. These
             // states keep the replay cursor pending and retry without turning
             // normal Raft/catalog convergence into a warning on every poll.
+            if (self.publication_limit_blocked.load(.acquire)) return publication_limit_retry_ms;
             switch (err) {
                 error.ResourceTemporarilyUnavailable => return 250,
                 error.ArtifactPublicationPending,

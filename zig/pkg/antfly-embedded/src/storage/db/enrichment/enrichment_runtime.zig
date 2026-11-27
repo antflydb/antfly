@@ -33144,8 +33144,8 @@ const PublicationFlights = struct {
     items: std.ArrayList(Flight) = .empty,
     cleanup_owner: ?CleanupOwner = null,
     cleanup_armed: bool = false,
-    cleanup_active: bool = false,
-    cleanup_retry_ns: u64 = 0,
+    cleanup_active: std.atomic.Value(bool) = .init(false),
+    cleanup_retry_ns: std.atomic.Value(u64) = .init(0),
 
     fn deinit(self: *PublicationFlights, a: Allocator) void {
         if (self.cleanup_owner) |owner| owner.backend.durable_jobs.closeOwner(owner.id);
@@ -33182,11 +33182,13 @@ const PublicationFlights = struct {
         const owner = self.cleanup_owner.?;
         const io = concurrencyIo(runtime);
         if (!self.mutex.tryLock()) return;
-        if (!self.cleanup_armed or self.cleanup_active or runtime.deadline_clock.nowRealtimeNs() < self.cleanup_retry_ns) {
+        if (!self.cleanup_armed or self.cleanup_active.load(.acquire) or
+            runtime.deadline_clock.nowRealtimeNs() < self.cleanup_retry_ns.load(.monotonic))
+        {
             self.mutex.unlock(io);
             return;
         }
-        self.cleanup_active = true;
+        self.cleanup_active.store(true, .monotonic);
         self.mutex.unlock(io);
         owner.backend.durable_jobs.submit(.{
             .owner_id = owner.id,
@@ -33195,10 +33197,8 @@ const PublicationFlights = struct {
             .run = cleanupJob,
             .deinit = finishCleanupJob,
         }) catch {
-            self.mutex.lockUncancelable(io);
-            defer self.mutex.unlock(io);
-            self.cleanup_active = false;
-            self.cleanup_retry_ns = runtime.deadline_clock.nowRealtimeNs() +| cleanup_retry_delay_ns;
+            self.deferCleanup(runtime);
+            self.cleanup_active.store(false, .release);
         };
     }
 
@@ -33209,24 +33209,24 @@ const PublicationFlights = struct {
         if (!self.mutex.tryLock()) return;
         defer self.mutex.unlock(io);
         const pending = self.reconcileLocked(runtime, .retained) catch {
-            self.cleanup_retry_ns = runtime.deadline_clock.nowRealtimeNs() +| cleanup_retry_delay_ns;
+            self.deferCleanup(runtime);
             return;
         };
         if (!pending) {
             const owner = self.cleanup_owner.?;
             self.cleanup_armed = false;
-            self.cleanup_retry_ns = 0;
+            self.cleanup_retry_ns.store(0, .monotonic);
             owner.backend.disarmOwnerMaintenanceProbe(owner.id);
         }
     }
 
+    fn deferCleanup(self: *PublicationFlights, runtime: *EnrichmentRuntime) void {
+        self.cleanup_retry_ns.store(runtime.deadline_clock.nowRealtimeNs() +| cleanup_retry_delay_ns, .monotonic);
+    }
+
     fn finishCleanupJob(ptr: *anyopaque) void {
         const runtime: *EnrichmentRuntime = @ptrCast(@alignCast(ptr));
-        const self = &runtime.publication_flights;
-        const io = concurrencyIo(runtime);
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        self.cleanup_active = false;
+        runtime.publication_flights.cleanup_active.store(false, .release);
     }
 
     const Selection = union(enum) {
@@ -52764,12 +52764,20 @@ test "model aware media ordered generation publishes beyond 4095 chunks and resu
         try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(slice).used_bytes);
         const TestLane = struct {
             original: background_runtime_mod.DurableJobLane,
+            runtime: *EnrichmentRuntime,
             submissions: usize = 0,
+            tracker_locked: bool = false,
 
             fn submit(ptr: *anyopaque, job: background_runtime_mod.Job) !void {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 self.submissions += 1;
-                if (self.submissions == 1) return error.ConcurrencyUnavailable;
+                if (self.submissions == 1) {
+                    // Simulate reconciliation taking the tracker lock after
+                    // the probe releases it and before submission fails.
+                    try std.testing.expect(self.runtime.publication_flights.mutex.tryLock());
+                    self.tracker_locked = true;
+                    return error.ConcurrencyUnavailable;
+                }
                 try self.original.submit(job);
             }
             fn drain(ptr: *anyopaque, owner: u64) void {
@@ -52786,7 +52794,7 @@ test "model aware media ordered generation publishes beyond 4095 chunks and resu
             }
         };
         {
-            var test_lane: TestLane = .{ .original = reduced.durable_jobs };
+            var test_lane: TestLane = .{ .original = reduced.durable_jobs, .runtime = runtime };
             reduced.durable_jobs = .{
                 .ptr = &test_lane,
                 .vtable = &.{ .submit = TestLane.submit, .drain_owner = TestLane.drain, .close_owner = TestLane.close, .poll = TestLane.poll, .executes_inline = true },
@@ -52804,7 +52812,10 @@ test "model aware media ordered generation publishes beyond 4095 chunks and resu
                 settled_append.completion.append.key = settled_append.retained_key.?.bytes;
                 runtime.publication_flights.items.appendAssumeCapacity(settled_append);
             }
-            try std.testing.expectEqual(@as(usize, 1), try reduced.durable_jobs.poll(1));
+            const first_poll = reduced.durable_jobs.poll(1);
+            if (test_lane.tracker_locked) runtime.publication_flights.mutex.unlock(concurrencyIo(runtime));
+            try std.testing.expectEqual(@as(usize, 1), try first_poll);
+            try std.testing.expect(test_lane.tracker_locked);
             try std.testing.expectEqual(charged_bytes, manager.sliceStats(slice).used_bytes);
             clock.advanceNs(PublicationFlights.cleanup_retry_delay_ns - 1);
             try std.testing.expectEqual(@as(usize, 1), try reduced.durable_jobs.poll(1));

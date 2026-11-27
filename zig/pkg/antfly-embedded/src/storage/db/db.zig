@@ -67661,6 +67661,7 @@ const NoopResolutionHandoffPublishHook = struct {
 
 fn processOrderedResolutions(ctx_ptr: *anyopaque, alloc: Allocator, resolvers: []const resolution_runtime_mod.ResolverConfig, store: resolver_lib.ArtifactStore, provider: ?resolver_lib.CandidateProvider, changed_keys: []const []const u8, candidate_source: ?resolution_runtime_mod.CandidateSource, embedder: ?embedder_mod.DenseEmbedder) !bool {
     const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
+    defer if (ctx.resolution_runtime) |runtime| runtime.notePublicationLimit(ctx.resolution_encoding_admission.hard_limit_blocked);
     return @import("artifact_publication_resolution.zig").process(alloc, ctx.store, ctx.artifact_publication_dispatcher, ctx.index_manager.resource_manager, &ctx.resolution_encoding_admission, resolvers, store, provider, changed_keys, candidate_source, embedder);
 }
 

@@ -6878,7 +6878,7 @@ pub const DataServer = struct {
         // dispatcher there fences local production behind an unavailable
         // replicated authority, even for an empty index.
         if (owner_source.online_source_authority == .raft)
-            _ = try owner_source.withArtifactPublications(.{ .ptr = self, .enqueue_fn = enqueueArtifactPublication, .enqueue_tracked_fn = enqueueTrackedArtifactPublication, .applied_fn = artifactPublicationApplied });
+            _ = owner_source.withArtifactPublications(.{ .ptr = self, .enqueue_fn = enqueueArtifactPublication, .enqueue_tracked_fn = enqueueTrackedArtifactPublication, .applied_fn = artifactPublicationApplied });
         owner_source.schema_snapshot_retention = .{ .ptr = self, .retain = retainSchemaSnapshot, .reopen = reopenSchemaSnapshot, .release = releaseSchemaSnapshot };
         _ = owner_source.withSecretStore(self.api_server_cfg.secret_store);
         if (comptime linked_storage) {
@@ -60971,7 +60971,8 @@ fn implementationTests() type {
                     server.read_source.read_safety_barrier,
                 );
                 defer owner_source.deinit();
-                try std.testing.expectError(error.CatalogRoutingUnavailable, owner_source.withArtifactPublications(dispatch_port));
+                _ = owner_source.withArtifactPublications(dispatch_port);
+                try std.testing.expect(owner_source.artifact_publications != null);
             }
             var receipt: artifact_publication_dispatch.Receipt = .{};
             defer receipt.release();
