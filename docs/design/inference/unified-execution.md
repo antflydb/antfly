@@ -1383,6 +1383,14 @@ rows and therefore failed its fixed 64-row gate before the fused arm.
 
 ### Issue closure audit
 
+On Spark GB10 at `68e086e4be`, all seven selected CUDA tests passed
+without skips. The released LightOnOCR-3-0.8B HTTP fixture recorded one
+capture and six two-row replays. The separate one-request, 64-page
+dense control interleaved prefill and decode and returned exact outputs
+at 18.80 pages/s. It attempted decoder graphs at widths up to 22 and
+recorded zero captures and replays. The 64-row gate stopped the comparison
+before the fused arms, leaving fused-head throughput unqualified.
+
 This audit reconciles the original `2f2438e67f` implementation review
 against merged main `4951ca13f9` with later evidence. Each serving
 measurement identifies the revision that ran.
