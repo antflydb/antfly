@@ -590,7 +590,7 @@ pub const ReadingPipeline = struct {
 
     fn florenceIncrementalRetryEligible(self: *ReadingPipeline, err: anyerror) bool {
         if (session_factory.getFlorenceConfig(self.vision_encoder) == null or nativeFlorenceReadBatchSize() <= 1) return false;
-        return florenceIncrementalAdmissionRetryEligible(self.vision_encoder.backend(), florenceKvCacheDisabled(), err);
+        return (FlorenceDecoder.AdmissionPolicy{ .cache_disabled = florenceKvCacheDisabled() }).canRetryIncrementally(self.vision_encoder.backend(), err);
     }
 
     fn readBatchNativeFlorenceChunked(self: *ReadingPipeline, image_datas: []const []const u8) ![]ReadResult {
@@ -700,29 +700,17 @@ pub const ReadingPipeline = struct {
 
         // Direct compute bypasses Session.run, so retain its admission permit
         // through both encoder/decoder execution and backend cleanup.
-        var incremental_admission = cudaFlorenceIncrementalAdmissionEligible(self.vision_encoder.backend(), florenceKvCacheDisabled());
-        run_permit = preparation.admitInputRun(self.vision_encoder.withAdmissionControl(self.execution_control), try FlorenceDecoder.planRun(
-            florence_cfg,
-            batch,
-            pixel_values.len,
-            prompt_i32.len,
-            self.config.max_length,
-            if (incremental_admission) .incremental else .full_prefix,
-        )) catch |err| permit: {
-            // The full-prefix envelope only funds a fallback the KV-cached
-            // decoder rarely needs. If it can never fit the run budget, admit
-            // the incremental envelope and give up that fallback for this run.
-            if (incremental_admission or !florenceIncrementalAdmissionRetryEligible(self.vision_encoder.backend(), florenceKvCacheDisabled(), err)) return err;
-            incremental_admission = true;
-            break :permit try preparation.admitInputRun(self.vision_encoder.withAdmissionControl(self.execution_control), try FlorenceDecoder.planRun(
-                florence_cfg,
-                batch,
-                pixel_values.len,
-                prompt_i32.len,
-                self.config.max_length,
-                .incremental,
-            ));
-        };
+        const admitted = try FlorenceDecoder.admitBatchedRun(&preparation, self.vision_encoder.withAdmissionControl(self.execution_control), florence_cfg, .{
+            .batch = batch,
+            .pixel_count = pixel_values.len,
+            .prompt_length = prompt_i32.len,
+            .max_length = self.config.max_length,
+        }, .{
+            .cache_disabled = florenceKvCacheDisabled(),
+            .prefer_cuda_incremental = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_INCREMENTAL_ADMISSION"),
+        });
+        run_permit = admitted.permit;
+        const incremental_admission = admitted.storage == .incremental;
         if (incremental_admission and platform.env.getenvBool("ANTFLY_FLORENCE2_TRACE_NO_REPEAT_ARGMAX"))
             std.debug.print("FLORENCE2 cuda_incremental_admission_items={d}\n", .{batch});
 
@@ -1752,18 +1740,6 @@ pub const ReadingPipeline = struct {
     }
 };
 
-fn cudaFlorenceIncrementalAdmissionEligible(backend: backends.BackendType, cache_disabled: bool) bool {
-    return backend == .cuda and !cache_disabled and
-        platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_INCREMENTAL_ADMISSION");
-}
-
-/// A full-prefix admission that can never fit may retry with the incremental
-/// envelope on backends whose default batched decoder uses a KV cache.
-fn florenceIncrementalAdmissionRetryEligible(backend: backends.BackendType, cache_disabled: bool, err: anyerror) bool {
-    return err == error.ResourceLimitExceeded and !cache_disabled and
-        (backend == .native or backend == .cuda or backend == .metal);
-}
-
 fn florenceIncrementalFallbackAdmitted(backend: backends.BackendType, incremental_admission: bool, err: anyerror) bool {
     return !incremental_admission and shouldFallbackFlorenceIncremental(backend, err);
 }
@@ -2044,10 +2020,10 @@ fn normalizeFlorencePrompt(prompt: []const u8) []const u8 {
 }
 
 test "Florence retries an unfittable full-prefix admission only with a KV-cached decoder" {
-    try std.testing.expect(florenceIncrementalAdmissionRetryEligible(.metal, false, error.ResourceLimitExceeded));
-    try std.testing.expect(florenceIncrementalAdmissionRetryEligible(.native, false, error.ResourceLimitExceeded));
-    try std.testing.expect(!florenceIncrementalAdmissionRetryEligible(.metal, true, error.ResourceLimitExceeded));
-    try std.testing.expect(!florenceIncrementalAdmissionRetryEligible(.metal, false, error.ResourceTemporarilyUnavailable));
+    try std.testing.expect((FlorenceDecoder.AdmissionPolicy{ .cache_disabled = false }).canRetryIncrementally(.metal, error.ResourceLimitExceeded));
+    try std.testing.expect((FlorenceDecoder.AdmissionPolicy{ .cache_disabled = false }).canRetryIncrementally(.native, error.ResourceLimitExceeded));
+    try std.testing.expect(!(FlorenceDecoder.AdmissionPolicy{ .cache_disabled = true }).canRetryIncrementally(.metal, error.ResourceLimitExceeded));
+    try std.testing.expect(!(FlorenceDecoder.AdmissionPolicy{ .cache_disabled = false }).canRetryIncrementally(.metal, error.ResourceTemporarilyUnavailable));
     // The incremental envelope admits one logits row per step, so it fits
     // where the full-prefix one cannot.
     const cfg = florence_arch.Config{
@@ -2062,6 +2038,34 @@ test "Florence retries an unfittable full-prefix admission only with a KV-cached
     const full = try FlorenceDecoder.planRun(cfg, 1, 384, 3, 1024, .full_prefix);
     const incremental = try FlorenceDecoder.planRun(cfg, 1, 384, 3, 1024, .incremental);
     try std.testing.expect(incremental.output_bytes.? < full.output_bytes.?);
+
+    const Probe = struct {
+        denial: anyerror,
+        submissions: [2]session_mod.RunRequest = undefined,
+        count: usize = 0,
+
+        pub fn admitInputRun(self: *@This(), session: backends.Session, request: session_mod.RunRequest) !session_mod.RunPermit {
+            self.submissions[self.count] = request;
+            self.count += 1;
+            if (self.count == 1) return self.denial;
+            return session.admit(request);
+        }
+    };
+    var fake = AdmissionDenyingFlorenceSession{};
+    const geometry: FlorenceDecoder.AdmissionGeometry = .{ .batch = 1, .pixel_count = 384, .prompt_length = 3, .max_length = 1024 };
+    var probe = Probe{ .denial = error.ResourceLimitExceeded };
+    const admitted = try FlorenceDecoder.admitBatchedRun(&probe, fake.session(), cfg, geometry, .{ .cache_disabled = false });
+    var permit = admitted.permit;
+    defer permit.deinit();
+    try std.testing.expectEqual(FlorenceDecoder.LogitStorage.incremental, admitted.storage);
+    try std.testing.expectEqual(@as(usize, 2), probe.count);
+    try std.testing.expectEqualDeep(full, probe.submissions[0]);
+    try std.testing.expectEqualDeep(incremental, probe.submissions[1]);
+    try std.testing.expect(!fake.run_called);
+
+    probe = .{ .denial = error.ResourceTemporarilyUnavailable };
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, FlorenceDecoder.admitBatchedRun(&probe, fake.session(), cfg, geometry, .{ .cache_disabled = false }));
+    try std.testing.expectEqual(@as(usize, 1), probe.count);
 }
 
 test "Florence defaults an empty read prompt to OCR" {
@@ -3140,9 +3144,9 @@ test "LightOnOCR3 CUDA Florence incremental admission preserves complete KV capa
     try std.testing.expectEqual(full.input_bytes, incremental.input_bytes);
     try std.testing.expectEqual(full.output_kv_bytes, incremental.output_kv_bytes);
     try std.testing.expectEqual(full.sequence, incremental.sequence);
-    try std.testing.expect(!cudaFlorenceIncrementalAdmissionEligible(.metal, false));
-    try std.testing.expect(!cudaFlorenceIncrementalAdmissionEligible(.native, false));
-    try std.testing.expect(!cudaFlorenceIncrementalAdmissionEligible(.cuda, true));
+    try std.testing.expect((FlorenceDecoder.AdmissionPolicy{ .cache_disabled = false, .prefer_cuda_incremental = true }).initialStorage(.metal) == .full_prefix);
+    try std.testing.expect((FlorenceDecoder.AdmissionPolicy{ .cache_disabled = false, .prefer_cuda_incremental = true }).initialStorage(.native) == .full_prefix);
+    try std.testing.expect((FlorenceDecoder.AdmissionPolicy{ .cache_disabled = true, .prefer_cuda_incremental = true }).initialStorage(.cuda) == .full_prefix);
     try std.testing.expect(!florenceIncrementalFallbackAdmitted(.cuda, true, error.UnsupportedOperation));
     try std.testing.expect(!florenceIncrementalFallbackAdmitted(.cuda, true, error.UnsupportedShape));
     try std.testing.expect(florenceIncrementalFallbackAdmitted(.cuda, false, error.UnsupportedOperation));

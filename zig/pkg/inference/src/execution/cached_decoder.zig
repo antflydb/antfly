@@ -69,6 +69,46 @@ pub fn CachedDecoder(comptime Architecture: type) type {
             };
         }
 
+        pub const AdmissionGeometry = struct {
+            batch: usize,
+            pixel_count: usize,
+            prompt_length: usize,
+            max_length: usize,
+        };
+
+        pub const AdmissionPolicy = struct {
+            cache_disabled: bool,
+            prefer_cuda_incremental: bool = false,
+
+            pub fn initialStorage(self: AdmissionPolicy, backend: @import("../backends/backends.zig").BackendType) LogitStorage {
+                return if (backend == .cuda and !self.cache_disabled and self.prefer_cuda_incremental) .incremental else .full_prefix;
+            }
+
+            pub fn canRetryIncrementally(self: AdmissionPolicy, backend: @import("../backends/backends.zig").BackendType, err: anyerror) bool {
+                return err == error.ResourceLimitExceeded and !self.cache_disabled and
+                    (backend == .native or backend == .cuda or backend == .metal);
+            }
+        };
+
+        pub const Admission = struct {
+            permit: @import("../backends/session.zig").RunPermit,
+            storage: LogitStorage,
+        };
+
+        /// Retry an unfittable full-prefix envelope before numerical execution.
+        /// The returned mode determines whether full-prefix fallback is funded.
+        pub fn admitBatchedRun(preparation: anytype, session: @import("../backends/session.zig").Session, cfg: Architecture.Config, geometry: AdmissionGeometry, policy: AdmissionPolicy) !Admission {
+            const backend = session.backend();
+            const initial = policy.initialStorage(backend);
+            const request = try planRun(cfg, geometry.batch, geometry.pixel_count, geometry.prompt_length, geometry.max_length, initial);
+            const permit = preparation.admitInputRun(session, request) catch |err| {
+                if (initial == .incremental or !policy.canRetryIncrementally(backend, err)) return err;
+                const retry = try planRun(cfg, geometry.batch, geometry.pixel_count, geometry.prompt_length, geometry.max_length, .incremental);
+                return .{ .permit = try preparation.admitInputRun(session, retry), .storage = .incremental };
+            };
+            return .{ .permit = permit, .storage = initial };
+        }
+
         pub const Context = struct {
             allocator: std.mem.Allocator,
             backend: *const ComputeBackend,
