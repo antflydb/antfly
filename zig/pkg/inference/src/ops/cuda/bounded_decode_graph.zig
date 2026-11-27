@@ -59,6 +59,7 @@ pub const StorageLayout = struct {
     tokens: Span,
     positions: Span,
     counter: Span,
+    attention_workspace: ?Span = null,
     metadata_bytes: usize,
     host_bytes: usize,
     head_bytes: usize,
@@ -132,6 +133,14 @@ pub const StorageLayout = struct {
             .head_bytes = head_bytes,
         };
     }
+    fn declareAttentionWorkspace(self: *StorageLayout, scratch: DecodeScratch) !void {
+        const bytes = @max(scratch.full.bytes, if (scratch.tail) |tail| tail.bytes else 0);
+        if (bytes > plan_mod.limit) return error.InvalidShape;
+        const offset = try aligned(self.counter.offset + self.counter.bytes);
+        self.metadata_bytes = try std.math.add(usize, offset, bytes);
+        self.attention_workspace = .{ .offset = offset, .bytes = bytes };
+    }
+
     fn aligned(bytes: usize) !usize {
         return (try std.math.add(usize, bytes, 255)) & ~@as(usize, 255);
     }
@@ -271,7 +280,9 @@ pub const GraphPhase = struct {
         const descriptor = self.descriptor;
         if (descriptor.attention_layers == 0) return;
         const geometry = descriptor.attention_geometry orelse return error.InvalidShape;
-        self.attention_scratch = try DecodeScratch.init(descriptor.rows, descriptor.future_tokens, geometry, paged_attention.useChunk128(chunk128_override, geometry.heads));
+        const scratch = try DecodeScratch.init(descriptor.rows, descriptor.future_tokens, geometry, paged_attention.useChunk128(chunk128_override, geometry.heads));
+        try self.storage_layout.declareAttentionWorkspace(scratch);
+        self.attention_scratch = scratch;
     }
 
     pub fn matchesOwner(self: *const GraphPhase, owner: *const Module) bool {
@@ -573,6 +584,16 @@ pub const Module = struct {
         return destination;
     }
 
+    /// Decode packets submit in order on one stream. The split and merge
+    /// finish consuming partials before the next packet can reuse this span.
+    pub fn bindAttentionWorkspace(self: *const Module, bytes: usize) !buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const span = layout.attention_workspace orelse return error.InvalidExecutionPlan;
+        if (bytes == 0 or bytes > span.bytes or self.metadata.len < layout.metadata_bytes)
+            return error.InvalidExecutionPlan;
+        return (StorageLayout.Span{ .offset = span.offset, .bytes = bytes }).bind(self.metadata);
+    }
+
     pub fn input(self: *const Module) buffer.DeviceBuffer {
         return self.storage_layout.?.input.bind(self.metadata);
     }
@@ -586,6 +607,26 @@ pub const Module = struct {
         return self.storage_layout.?.counter.bind(self.metadata);
     }
 };
+
+test "bounded CUDA decoder funds one stable attention workspace for both packets" {
+    const base = try StorageLayout.init(67, 1024, 151936, 1);
+    var layout = base;
+    const geometry: DecodeScratch.Geometry = .{ .heads = 8, .kv_heads = 2, .dim = 256 };
+    const scratch = try DecodeScratch.init(67, 321, geometry, false);
+    try layout.declareAttentionWorkspace(scratch);
+    const req: Descriptor = .{ .epoch = 1, .key = &.{1}, .positions = &.{}, .rows = 67, .hidden = 1024, .vocab = 151936, .future_tokens = 321, .attention_layers = 1, .recurrent_layers = 1 };
+    const amounts = try req.storageRequestFor(layout).captured_storage.amounts();
+    try std.testing.expectEqual(base.metadata_bytes + scratch.full.bytes + base.head_bytes, amounts.backend_scratch_bytes);
+    var owner: Module = .{ .storage_layout = layout, .metadata = .{ .ptr = 0x10000, .len = layout.metadata_bytes } };
+    const full = try owner.bindAttentionWorkspace(scratch.full.bytes);
+    const tail = try owner.bindAttentionWorkspace(scratch.tail.?.bytes);
+    try std.testing.expectEqual(owner.metadata.ptr + base.metadata_bytes, full.ptr);
+    try std.testing.expectEqual(full.ptr, tail.ptr);
+    try std.testing.expectEqual(base.readback(owner.metadata), layout.readback(owner.metadata));
+    try std.testing.expectError(error.InvalidExecutionPlan, owner.bindAttentionWorkspace(full.len + 1));
+    owner.metadata.len -= 1;
+    try std.testing.expectError(error.InvalidExecutionPlan, owner.bindAttentionWorkspace(tail.len));
+}
 
 test "captured sequence storage layout packs narrow and wide readbacks with aligned physical planes" {
     const cases = [_]struct { rows: usize, hidden: usize, vocab: usize, bank: usize, positions: usize, progress: usize, bytes: usize, head: usize }{

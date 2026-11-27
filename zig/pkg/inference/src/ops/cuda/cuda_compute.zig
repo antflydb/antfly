@@ -32776,12 +32776,13 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
         if (!params.appendPage(i, tokens, total - 1, blocks[0..count])) return null;
         max_tokens = @max(max_tokens, tokens);
     }
-    const scratch_layout = if (self.bounded_decode_graph.active) bound: {
+    const captured = self.bounded_decode_graph.active;
+    const scratch_layout = if (captured) bound: {
         const scratch = self.bounded_decode_graph.attention_scratch orelse return error.InvalidExecutionPlan;
         break :bound try scratch.forPacket(views.len, max_tokens, .{ .heads = heads, .kv_heads = kv_heads, .dim = dim });
     } else module.ScratchLayout.init(views.len, heads, kv_heads, dim, max_tokens, module.useChunk128(self.lighton_attention_chunk128, heads)) catch return null;
     params.chunks = scratch_layout.chunks;
-    if (self.bounded_decode_graph.active) {
+    if (captured) {
         params.graph_progress = self.bounded_decode_graph.counter().ptr;
         params.graph_step = self.bounded_decode_graph.capture_step;
     }
@@ -32792,8 +32793,11 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
     errdefer self.allocator.free(shape);
     var output = try allocDeviceBuffer(self, scratch_layout.output_elements * @sizeOf(f32));
     errdefer releaseDeviceBuffer(self, &output);
-    var scratch = try allocDeviceBuffer(self, scratch_layout.bytes);
-    defer releaseDeviceBuffer(self, &scratch);
+    var scratch = if (captured)
+        try self.bounded_decode_graph.bindAttentionWorkspace(scratch_layout.bytes)
+    else
+        try allocDeviceBuffer(self, scratch_layout.bytes);
+    defer if (!captured) releaseDeviceBuffer(self, &scratch);
     params.out = output.ptr;
     params.partials = scratch.ptr;
     params.statistics = scratch.ptr + scratch_layout.statistics_offset;
