@@ -21353,9 +21353,12 @@ fn gemma4AudioLocalAttentionOp(
     const scale_shape = [_]i64{@intCast(params.head_dim)};
     const scales = tensorFromCt(q_dim_scales);
     if (scales.elem_count != params.head_dim or !std.mem.eql(i64, scales.shape, &scale_shape)) return error.InvalidTensorShape;
-    const valid_shape = [_]i64{@intCast(params.rows)};
     const validity = tensorFromCt(valid);
-    if (validity.elem_count != params.rows or !std.mem.eql(i64, validity.shape, &valid_shape)) return error.InvalidTensorShape;
+    const row_dim: i64 = @intCast(params.rows);
+    // A segmented source passes a borrowed one-column view of the vector.
+    // Both representations have the same contiguous one-value-per-row ABI.
+    if (validity.elem_count != params.rows or (!std.mem.eql(i64, validity.shape, &.{row_dim}) and
+        !std.mem.eql(i64, validity.shape, &.{ row_dim, 1 }))) return error.InvalidTensorShape;
     if (params.arithmetic == .independent_f32 and params.publication == .bf16_values_f32) {
         // The existing architecture fallback has authoritative host clip spans
         // and submits each clip independently, without downloading validity.
@@ -21382,6 +21385,38 @@ fn gemma4AudioLocalAttentionOp(
     );
     queued = false;
     return out;
+}
+
+test "CUDA audio validity accepts only a vector or contiguous one-column view" {
+    var compute = metadataOnlyTestCompute();
+    compute.ctx.info.compute_major = 8;
+    const params: ops.Gemma4AudioLocalAttentionParams = .{
+        .rows = 17,
+        .hidden = 128,
+        .heads = 2,
+        .head_dim = 64,
+        .chunk = 12,
+        .context_left = 13,
+        .context = 24,
+        .k_scale = 1,
+        .logit_cap = 50,
+        .invalid_value = -1e9,
+        .segmented = true,
+        .arithmetic = .independent_f32,
+        .publication = .bf16_values_f32,
+    };
+    var source: CudaTensor = .{ .buffer = .{}, .shape = @constCast(&[_]i64{ 17, 128 }), .elem_count = 17 * 128, .dtype = .f32 };
+    var relative: CudaTensor = .{ .buffer = .{}, .shape = @constCast(&[_]i64{ 13, 128 }), .elem_count = 13 * 128, .dtype = .f32 };
+    var scale: CudaTensor = .{ .buffer = .{}, .shape = @constCast(&[_]i64{64}), .elem_count = 64, .dtype = .f32 };
+    var mask: CudaTensor = .{ .buffer = .{}, .shape = undefined, .elem_count = 17, .dtype = .f32 };
+    for ([_][]i64{ @constCast(&[_]i64{17}), @constCast(&[_]i64{ 17, 1 }) }) |shape| {
+        mask.shape = shape;
+        // This format has no combined segmented CUDA kernel. Reaching its
+        // ordinary decline proves shape validation accepted the mask.
+        try std.testing.expect(try gemma4AudioLocalAttentionOp(&compute, &source, &source, &source, &relative, &scale, &mask, params) == null);
+    }
+    mask.shape = @constCast(&[_]i64{ 1, 17 });
+    try std.testing.expectError(error.InvalidTensorShape, gemma4AudioLocalAttentionOp(&compute, &source, &source, &source, &relative, &scale, &mask, params));
 }
 
 fn sourceLocalRelativeAttention(self: *CudaCompute, q: CT, k: CT, v: CT, rel: CT, scales: CT, valid: CT, params: ops.Gemma4AudioLocalAttentionParams) !CT {
