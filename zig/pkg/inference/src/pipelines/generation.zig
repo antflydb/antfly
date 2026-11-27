@@ -213,6 +213,15 @@ fn qwenVisionLimits(allocator: std.mem.Allocator, model_dir: []const u8, config:
     return .{ .min_merged_tokens = min_tokens, .max_merged_tokens = max_tokens, .hard_max_merged_tokens = max_tokens };
 }
 
+fn promptLimitedQwenVisionLimits(allocator: std.mem.Allocator, model_dir: []const u8, config: gpt_mod.Config, expanded_limit: usize, image_count: usize) !qwen3vl_projector.Limits {
+    if (image_count == 0 or image_count > 8) return error.ImageLimitExceeded;
+    var limits = try qwenVisionLimits(allocator, model_dir, config);
+    const per_image_budget = expanded_limit / image_count;
+    if (per_image_budget < limits.min_merged_tokens) return error.InputTokenLimitExceeded;
+    limits.max_merged_tokens = @min(limits.max_merged_tokens, per_image_budget);
+    return limits;
+}
+
 /// Cold optional pinned-input planning only. Reuses the exact resident CUDA
 /// producer's resize geometry and prompt-limited vision policy. The caller may
 /// precommit-decline this optimization on metadata failure; the ordinary image
@@ -227,10 +236,7 @@ pub fn nativeCudaPinnedPatchUploadBytesAtMost(allocator: std.mem.Allocator, mode
     defer allocator.free(images);
     if (images.len == 0 or images.len > 8) return error.ImageLimitExceeded;
     const expanded_limit = try nativeGenerationPromptTokenLimit(config, null, requested_output_tokens, 0, 0);
-    var limits = try qwenVisionLimits(allocator, model_dir, config);
-    const per_image_budget = expanded_limit / images.len;
-    if (per_image_budget < limits.min_merged_tokens) return error.InputTokenLimitExceeded;
-    limits.max_merged_tokens = @min(limits.max_merged_tokens, per_image_budget);
+    const limits = try promptLimitedQwenVisionLimits(allocator, model_dir, config, expanded_limit, images.len);
     return qwen3vl_projector.planResidentCudaPatchUploadBytesAtMost(config, images, limits, maximum_upload_bytes);
 }
 
@@ -242,9 +248,7 @@ pub fn nativeCudaVisionPublicationBytes(allocator: std.mem.Allocator, model_dir:
     defer allocator.free(images);
     if (images.len != 1) return 0;
     const expanded_limit = try nativeGenerationPromptTokenLimit(config, null, requested_output_tokens, 0, 0);
-    var limits = try qwenVisionLimits(allocator, model_dir, config);
-    if (expanded_limit < limits.min_merged_tokens) return error.InputTokenLimitExceeded;
-    limits.max_merged_tokens = @min(limits.max_merged_tokens, expanded_limit);
+    const limits = try promptLimitedQwenVisionLimits(allocator, model_dir, config, expanded_limit, images.len);
     if (maximum_batch_items > 1) {
         const batch: ?qwen3vl_projector.ResidentBatchGeometry = qwen3vl_projector.residentBatchGeometry(.cuda, config, images[0], limits) catch |err| switch (err) {
             error.UnsupportedBatchedVision => null,
@@ -305,6 +309,7 @@ pub fn nativeGenerationMediaAdmissionWithInspection(
     inspection: ?*@import("embedding_gemma2_video.zig").InspectionScope,
 ) !NativeGenerationMediaAdmission {
     try control.check();
+    const video_bytes = try singleVideoInput(messages);
     if (config.family == .qwen3_vl or config.hasQwen35VisionArchitectureContract()) {
         const images = try collectImagesInPromptOrder(allocator, messages);
         defer allocator.free(images);
@@ -338,19 +343,46 @@ pub fn nativeGenerationMediaAdmissionWithInspection(
     };
     // CUDA decodes on the device. Portable decoding runs in host memory, and
     // CUDA's fallback to it admits that memory only when the fallback happens.
-    for (messages) |message| if (message.video_bytes) |bytes| {
+    if (video_bytes) |bytes| {
         // Malformed inputs retain the decoder's detailed diagnostic. The
         // scheduling estimate is permitted to be conservative in that case.
         admission.token_allowance +|= gemma4_video.promptAllowance(allocator, bytes, control, inspection) catch |err| switch (err) {
             error.OutOfMemory, error.VideoInputTooLarge, error.Cancelled, error.Canceled, error.Timeout, error.DeadlineExceeded => return err,
             else => gemma4_video.token_allowance,
         };
-        if (backend == .cuda) continue;
-        const reserved = try gemma4_video.reservationControlled(bytes, control);
-        admission.host_scratch_bytes = reserved.host_bytes;
-        admission.backend_scratch_bytes = reserved.surface_bytes;
-    };
+        if (backend != .cuda) {
+            const reserved = try gemma4_video.reservationControlled(bytes, control);
+            admission.host_scratch_bytes = reserved.host_bytes;
+            admission.backend_scratch_bytes = reserved.surface_bytes;
+        }
+    }
     return admission;
+}
+
+fn singleVideoInput(messages: []const Message) !?[]const u8 {
+    var video: ?[]const u8 = null;
+    for (messages) |message| if (message.video_bytes) |bytes| {
+        if (video != null) return error.VideoLimitExceeded;
+        video = bytes;
+    };
+    return video;
+}
+
+test "native generation rejects multiple videos before sizing scratch" {
+    const messages = [_]Message{
+        .{ .role = "user", .content = "first", .video_bytes = "invalid" },
+        .{ .role = "user", .content = "second", .video_bytes = "invalid" },
+    };
+    try std.testing.expectError(error.VideoLimitExceeded, nativeGenerationMediaAdmissionWithInspection(
+        std.testing.allocator,
+        "",
+        &messages,
+        .{ .family = .gemma },
+        .cuda,
+        null,
+        .{},
+        null,
+    ));
 }
 
 /// Media allowance that can safely constrain the text-only encode before
@@ -3055,11 +3087,7 @@ pub const NativeGenerationPipeline = struct {
         const formatted_prompt_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         if (self.failure_trace) |trace| trace.mark(.tokenize);
 
-        var video_bytes: ?[]const u8 = null;
-        for (messages) |message| if (message.video_bytes) |bytes| {
-            if (video_bytes != null) return error.VideoLimitExceeded;
-            video_bytes = bytes;
-        };
+        const video_bytes = try singleVideoInput(messages);
         if (video_bytes != null) {
             if (!self.cb.supportsCopyRows2D() or self.gpt_config.family != .gemma or !self.gpt_config.usesGemma4Channels() or self.gguf_projector_path == null) return error.UnsupportedVideoBackend;
             for (messages) |message| {
@@ -3377,11 +3405,7 @@ pub const NativeGenerationPipeline = struct {
                 const model_dir = self.model_dir orelse return error.MissingModelDirForMultimodal;
                 if (self.gpt_config.family == .qwen3_vl or self.gpt_config.hasQwen35VisionArchitectureContract()) {
                     if (!decode_state.isPaged() and !self.usesPjrtSession()) return error.InvalidModelForGeneration;
-                    if (images.len == 0 or images.len > 8) return error.ImageLimitExceeded;
-                    const per_image_budget = expanded_prompt_token_limit / images.len;
-                    var vision_limits = try qwenVisionLimits(allocator, model_dir, self.gpt_config);
-                    if (per_image_budget < vision_limits.min_merged_tokens) return error.InputTokenLimitExceeded;
-                    vision_limits.max_merged_tokens = @min(vision_limits.max_merged_tokens, per_image_budget);
+                    const vision_limits = try promptLimitedQwenVisionLimits(allocator, model_dir, self.gpt_config, expanded_prompt_token_limit, images.len);
                     // The shared vision owner collects compatible requests
                     // before taking the GPU lock. Prompt assembly stays under
                     // the ordinary lock after projected outputs return.
