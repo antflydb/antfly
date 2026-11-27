@@ -17,7 +17,7 @@
 //! publication boundaries are explicit; no checkpoint or model policy lives here.
 const std = @import("std");
 const Layout = @import("libraries.zig").F32StridedBatchedLayout;
-pub const Span = struct { offset: usize, bytes: usize };
+const Span = @import("buffer.zig").ByteSpan;
 pub const Plan = struct {
     rows: usize,
     heads: usize,

@@ -226,7 +226,7 @@ pub const Bf16GemmProgram = struct {
     input_layout: enum { row_major, column_major } = .row_major,
     addend: enum { zero, output } = .zero,
 
-    pub const Span = struct { offset: usize = 0, bytes: usize = 0 };
+    pub const Span = @import("buffer.zig").ByteSpan;
     pub const TemporaryLayout = struct {
         input: Span,
         weight: Span,

@@ -139,6 +139,9 @@ pub const MappedHostBuffer = struct {
     }
 };
 
+/// Byte range relative to a planned device allocation.
+pub const ByteSpan = struct { offset: usize = 0, bytes: usize = 0 };
+
 pub const DeviceBuffer = struct {
     pub const Purpose = @import("allocation_budget.zig").OwnedPurpose;
     /// CUDA cuMemAlloc base guarantee, also used by canonical cuBLASLt profiles.

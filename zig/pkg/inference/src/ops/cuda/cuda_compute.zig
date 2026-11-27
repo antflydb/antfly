@@ -21439,14 +21439,14 @@ fn sourceLocalRelativeAttention(self: *CudaCompute, q: CT, k: CT, v: CT, rel: CT
     // The same one-bank lifetime joins existing learned/captured audio plans.
     var temporary = try SourceLinearTemporary.acquireKnownCapture(self, plan.bytes, plan.bytes, capture);
     defer temporary.deinit(self);
-    const query = temporary.span(.{ .offset = plan.query.offset, .bytes = plan.query.bytes });
-    const packed_query = temporary.span(.{ .offset = plan.packed_query.offset, .bytes = plan.packed_query.bytes });
-    const key = temporary.span(.{ .offset = plan.key.offset, .bytes = plan.key.bytes });
-    const value = temporary.span(.{ .offset = plan.value.offset, .bytes = plan.value.bytes });
-    const scores = temporary.span(.{ .offset = plan.scores.offset, .bytes = plan.scores.bytes });
-    const relative_scores = temporary.span(.{ .offset = plan.relative_scores.offset, .bytes = plan.relative_scores.bytes });
-    const result = temporary.span(.{ .offset = plan.result.offset, .bytes = plan.result.bytes });
-    const workspace = temporary.span(.{ .offset = plan.workspace.offset, .bytes = plan.workspace.bytes });
+    const query = temporary.span(plan.query);
+    const packed_query = temporary.span(plan.packed_query);
+    const key = temporary.span(plan.key);
+    const value = temporary.span(plan.value);
+    const scores = temporary.span(plan.scores);
+    const relative_scores = temporary.span(plan.relative_scores);
+    const result = temporary.span(plan.result);
+    const workspace = temporary.span(plan.workspace);
     var queued = false;
     errdefer if (queued) synchronizeAndDrainDeferredDeviceFrees(self) catch {};
     queued = true; // A failed submission may already have consumed addresses.
@@ -22047,7 +22047,7 @@ const SourceLinearTemporary = struct {
         }
         return .{ .bank = try allocate(self, bytes), .kind = .owned };
     }
-    fn span(self: *const @This(), region: @import("libraries.zig").Bf16GemmProgram.Span) buffer_mod.DeviceBuffer {
+    fn span(self: *const @This(), region: buffer_mod.ByteSpan) buffer_mod.DeviceBuffer {
         if (region.bytes == 0) return .{};
         std.debug.assert(region.offset <= self.bank.len and region.bytes <= self.bank.len - region.offset);
         return .{ .ptr = self.bank.ptr + region.offset, .len = region.bytes, .borrowed = true };
