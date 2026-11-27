@@ -1324,9 +1324,9 @@ improved and the two-clip audio regression passed requalification after
 the completed-frame fix. Isolated Native text embedding and GLiNER2.5
 passed. Native two-clip audio still has a candidate-only exact repeat
 failure even though matching request ordinals passed across revisions.
-Final closure requires the remaining tier-one coverage, including DECIDE,
-Inkling 2 Mini, and the E2B comparative deficits above, as well as normal
-PR review and CI. L4 and A100 remain user-deferred.
+Final closure requires the remaining tier-one coverage, including DECIDE
+on the remaining supported targets, Inkling 2 Mini, and the E2B comparative
+deficits above, as well as normal PR review and CI. L4 and A100 remain user-deferred.
 
 Subsequent scoped qualification covers these production paths:
 
@@ -1390,6 +1390,19 @@ resident at the start and end.
 | Gemma 4 E4B image | 279.29/282.30 | 279.80/281.77 |
 | Gemma 4 E4B audio | 217.47/221.51 | 215.84/222.66 |
 | Gemma 4 E4B video | 253.30/256.94 | 252.78/255.20 |
+
+Original FP32 DECIDE on the same Spark revisions passed all timing controls
+with 32 measured requests per side per phase. Singleton payloads matched
+exactly. Eight- and 32-item payloads matched in every field other than
+classification scores, whose maximum absolute difference was 6.56e-7,
+within the existing FP32 fixture tolerance. The strict bitwise failure is
+retained in the qualification receipt.
+
+| DECIDE batch | Baseline p50/p95 (ms) | Candidate p50/p95 (ms) |
+| --- | ---: | ---: |
+| 1 | 23.25/24.17 | 22.27/23.09 |
+| 8 | 67.14/68.61 | 61.69/62.78 |
+| 32 | 259.78/262.53 | 240.71/242.81 |
 
 On M4 Max at `da4dea80de`, all ten Metal HTTP workloads matched
 outputs and confirmed Metal selection against the frozen baseline.
