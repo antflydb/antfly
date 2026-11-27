@@ -57,6 +57,56 @@ def test_extract_entities(api):
         assert "label" in ent
 
 
+def test_extract_entities_with_tokenless_controls(api):
+    clean = "Alice Smith works at Acme Corporation in Paris. "
+    insert_at = clean.index("Paris")
+    control = "\u009f "
+    with_infix = clean[:insert_at] + control + clean[insert_at:]
+    with_trailing = clean + "\u009f \x07 \x05 \x10"
+    options = {
+        "model": GLINER_MODEL,
+        "labels": [
+            "person",
+            "organization",
+            "location",
+            "date",
+            "event",
+            "project",
+            "product",
+            "topic",
+        ],
+        "threshold": 0.5,
+        "include_spans": True,
+    }
+
+    expected = _entities(api.extract_entities(text=[clean], **options))[0]
+    assert any(entity["text"] == "Alice Smith" for entity in expected)
+    assert any(entity["text"] == "Paris" for entity in expected)
+
+    # Send the trailing case alone so padding from another row cannot hide a
+    # disagreement between the span tensor and the backend's word count.
+    trailing = _entities(api.extract_entities(text=[with_trailing], **options))[0]
+    assert trailing == expected
+
+    infix = _entities(api.extract_entities(text=[with_infix], **options))[0]
+    offset = len(control.encode("utf-8"))
+    assert [
+        (
+            entity["label"],
+            entity["text"],
+            entity["start"] + (offset if entity["start"] >= insert_at else 0),
+            entity["end"] + (offset if entity["end"] > insert_at else 0),
+        )
+        for entity in expected
+    ] == [
+        (entity["label"], entity["text"], entity["start"], entity["end"])
+        for entity in infix
+    ]
+    original = with_infix.encode("utf-8")
+    for entity in infix:
+        assert original[entity["start"] : entity["end"]].decode() == entity["text"]
+
+
 def test_extract_entities_with_custom_labels(api):
     """Custom labels should restrict entity types."""
     resp = api.extract_entities(
