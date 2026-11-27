@@ -1373,6 +1373,21 @@ equal-length audio clips in one request changed from 49.90/50.45 to
 48.56/49.51 ms. All arms confirmed CUDA selection. The experimental
 CUDA audio graph flag was enabled for both binaries.
 
+Seven additional Spark HTTP cases passed exact output, backend selection
+and latency gates against the same frozen baseline, with 16 measured
+requests per side per phase. The separate 184 MiB context remained
+resident at the start and end.
+
+| Workload | Baseline p50/p95 (ms) | Candidate p50/p95 (ms) |
+| --- | ---: | ---: |
+| LightOnOCR | 326.07/328.31 | 322.63/325.79 |
+| GLiNER2.5 | 12.64/13.53 | 10.43/11.37 |
+| Qwen3 | 85.90/87.14 | 86.45/87.49 |
+| Gemma 4 E4B text | 222.17/224.15 | 222.82/225.88 |
+| Gemma 4 E4B image | 279.29/282.30 | 279.80/281.77 |
+| Gemma 4 E4B audio | 217.47/221.51 | 215.84/222.66 |
+| Gemma 4 E4B video | 253.30/256.94 | 252.78/255.20 |
+
 At `34296ffb5a`, five Native CPU fixtures passed for resident handoff and
 task output custody. The incremental decoder matched host-reference logits
 after the encoder and destination session handles closed, and allocation
