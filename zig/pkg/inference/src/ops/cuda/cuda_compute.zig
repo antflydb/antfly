@@ -21472,8 +21472,13 @@ fn gemma4AudioLocalAttentionOp(
         if (params.segmented) return null;
         return try sourceLocalRelativeAttention(self, q, k, v, rel, q_dim_scales, valid, layout, params);
     }
+    const input_buffers = [6]buffer_mod.DeviceBuffer{
+        tensorFromCt(q).buffer, tensorFromCt(k).buffer, tensorFromCt(v).buffer,
+        relative.buffer,        scales.buffer,          validity.buffer,
+    };
+    try layout.validateInputs(input_buffers);
     const shape = [_]i64{ @intCast(params.rows), @intCast(params.hidden) };
-    const out = try self.createEmbeddingGemma2Tensor(&shape, .f32);
+    const out = try self.createEmbeddingGemma2TensorWithBacking(&shape, layout.matrix_elements, .f32, layout.span_bytes[6]);
     errdefer freeTensor(self, out);
     var queued = false;
     errdefer if (queued) synchronizeAndDrainDeferredDeviceFrees(self) catch {};
@@ -21482,12 +21487,12 @@ fn gemma4AudioLocalAttentionOp(
     try module.launchAudioAttention(
         &self.ctx,
         tensorFromCt(out).buffer,
-        tensorFromCt(q).buffer,
-        tensorFromCt(k).buffer,
-        tensorFromCt(v).buffer,
-        tensorFromCt(rel).buffer,
-        tensorFromCt(q_dim_scales).buffer,
-        tensorFromCt(valid).buffer,
+        input_buffers[0],
+        input_buffers[1],
+        input_buffers[2],
+        input_buffers[3],
+        input_buffers[4],
+        input_buffers[5],
         layout,
         params,
     );
@@ -21525,6 +21530,14 @@ test "CUDA audio validity accepts only a vector or contiguous one-column view" {
     }
     mask.shape = @constCast(&[_]i64{ 1, 17 });
     try std.testing.expectError(error.InvalidTensorShape, gemma4AudioLocalAttentionOp(&compute, &source, &source, &source, &relative, &scale, &mask, params));
+    mask.shape = @constCast(&[_]i64{17});
+    var combined = params;
+    combined.arithmetic = .combined_f32;
+    combined.publication = .f32;
+    const allocations = compute.stats.device_alloc_calls;
+    // The poisoned metadata-only compute cannot allocate or load a module.
+    try std.testing.expectError(error.InvalidShape, gemma4AudioLocalAttentionOp(&compute, &source, &source, &source, &relative, &scale, &mask, combined));
+    try std.testing.expectEqual(allocations, compute.stats.device_alloc_calls);
 }
 
 fn sourceLocalRelativeAttention(self: *CudaCompute, q: CT, k: CT, v: CT, rel: CT, scales: CT, valid: CT, layout: embedding_gemma2_cuda.AudioAttentionLayout, params: ops.Gemma4AudioLocalAttentionParams) !CT {
@@ -21756,6 +21769,15 @@ fn debugCudaDeviceWarmup(ctx: *anyopaque, bytes: usize, iterations: usize) !bool
     return true;
 }
 
+/// Retire an unpublished temporary in the authority that issued its address.
+inline fn retireUnpublishedF32Buffer(compute: *CudaCompute, storage: *buffer_mod.DeviceBuffer) void {
+    if (compute.execution_scope != null) {
+        releaseDeviceBuffer(compute, storage);
+    } else {
+        storage.free(&compute.ctx);
+    }
+}
+
 /// Ordinary F32 result storage. Allocation and failed-launch cleanup keep the
 /// same cache, pinned-slot and audio-arena policies as the individual adapters.
 const OwnedF32Output = struct {
@@ -21764,6 +21786,7 @@ const OwnedF32Output = struct {
     buffer: buffer_mod.DeviceBuffer,
     count: usize,
     header: *CudaTensor,
+    owns_buffer: bool,
 
     inline fn alloc(compute: *CudaCompute, shape: []const i64, count: usize) !@This() {
         return fromOwnedShape(compute, try dupeShape(compute.allocator, shape), count);
@@ -21785,11 +21808,11 @@ const OwnedF32Output = struct {
             if (assigned.ptr == 0 or assigned.len != bytes) return error.InvalidExecutionPlan;
             break :blk .{ .ptr = assigned.ptr, .len = assigned.len, .borrowed = true };
         } else try allocDeviceBuffer(compute, bytes);
-        return .{ .compute = compute, .shape = shape, .buffer = buffer, .count = count, .header = header };
+        return .{ .compute = compute, .shape = shape, .buffer = buffer, .count = count, .header = header, .owns_buffer = destination == null };
     }
     inline fn deinit(output: *@This()) void {
         if (output.shape) |shape| {
-            output.buffer.free(&output.compute.ctx);
+            if (output.owns_buffer) retireUnpublishedF32Buffer(output.compute, &output.buffer);
             output.compute.allocator.free(shape);
             output.compute.allocator.destroy(output.header);
             output.shape = null;
@@ -21797,7 +21820,7 @@ const OwnedF32Output = struct {
     }
     /// Infallible publication of metadata allocated before device storage/math.
     inline fn intoTensor(output: *@This()) CT {
-        output.header.* = .{ .buffer = output.buffer, .dtype = .f32, .shape = output.shape.?, .elem_count = output.count };
+        output.header.* = .{ .buffer = output.buffer, .dtype = .f32, .shape = output.shape.?, .elem_count = output.count, .owns_buffer = output.owns_buffer };
         output.shape = null;
         return output.header;
     }
@@ -21823,7 +21846,7 @@ fn OwnedF32Outputs(comptime n: usize) type {
         }
 
         inline fn deinit(self: *@This()) void {
-            inline for (0..n) |reverse| self.buffers[n - 1 - reverse].free(&self.compute.ctx);
+            inline for (0..n) |reverse| retireUnpublishedF32Buffer(self.compute, &self.buffers[n - 1 - reverse]);
             inline for (0..n) |reverse| {
                 const i = n - 1 - reverse;
                 if (self.shapes[i]) |shape| self.compute.allocator.free(shape);
@@ -21835,7 +21858,7 @@ fn OwnedF32Outputs(comptime n: usize) type {
 
         /// Explicit fallback keeps its historical forward retirement order.
         inline fn discard(self: *@This()) void {
-            inline for (&self.buffers) |*buffer| buffer.free(&self.compute.ctx);
+            inline for (&self.buffers) |*buffer| retireUnpublishedF32Buffer(self.compute, buffer);
             inline for (&self.shapes) |*shape| {
                 if (shape.*) |value| self.compute.allocator.free(value);
                 shape.* = null;
@@ -24659,9 +24682,7 @@ fn embeddingLookupTensorScaledCommon(ctx: *anyopaque, weight: CT, ids: CT, total
         try self.kernels.launchEmbeddingLookupI32F32(&self.ctx, device, weight_tensor.buffer, ids_tensor.buffer, total, dim, scale);
     }
     self.stats.launch_embedding += 1;
-    const result = output.intoTensor();
-    if (destination != null) tensorFromCt(result).owns_buffer = false;
-    return result;
+    return output.intoTensor();
 }
 
 fn embeddingLookupTensor(ctx: *anyopaque, weight: CT, ids: CT, total: usize, dim: usize) anyerror!?CT {
@@ -26128,9 +26149,7 @@ fn linearNoBiasWithDestination(self: *CudaCompute, input: CT, weight: CT, rows: 
     errdefer if (strictSeq2seqMatmul(self) or isF16Weight(weight_tensor)) self.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
     const device = output.buffer;
     try linearNoBiasInto(self, device, input_tensor, weight_tensor, rows, in_dim, out_dim, primitive_training);
-    const result = output.intoTensor();
-    if (destination != null) tensorFromCt(result).owns_buffer = false;
-    return result;
+    return output.intoTensor();
 }
 
 /// One target schedule for allocating and physically planned projections.
@@ -43527,6 +43546,24 @@ test "CUDA projection argmax shares the temporary arena admission ceiling" {
     try compute.temp_pinned_slots.append(a, .{ .buffer = .{ .ptr = 0x2000, .len = 64, .allocation_bytes = 512 } });
     try std.testing.expect(projectionArgmaxReplayBudgetAvailable(&compute, capacity - 256 - 512));
     try std.testing.expect(!projectionArgmaxReplayBudgetAvailable(&compute, capacity - 256 - 512 + 1));
+}
+
+test "CUDA unpublished F32 outputs retire through their declared workspace" {
+    const workspace = @import("../../execution/stream_workspace.zig");
+    var plan: workspace.Plan = .{};
+    try plan.declareScratch(32);
+    const layout = try plan.layout(0);
+    var scope = try workspace.Scope.bind(&plan, layout, 0x10000, layout.bytes);
+    var compute = metadataOnlyTestCompute();
+    compute.execution_scope = &scope;
+
+    var owned = try OwnedF32Output.alloc2(&compute, 2, 4, 8);
+    defer owned.deinit();
+    var assigned = try OwnedF32Output.fromOwnedShapeDestination(&compute, try allocShape2(compute.allocator, 2, 4), 8, 32, owned.buffer);
+    assigned.deinit();
+    try std.testing.expectEqual(@as(usize, 1), scope.cursor);
+    owned.deinit();
+    try std.testing.expect(scope.complete());
 }
 
 test "CUDA projection argmax binds declared scratch without advancing rejected events" {

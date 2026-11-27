@@ -49,6 +49,10 @@ pub const AudioAttentionLayout = struct {
         return .{ .matrix_elements = matrix_elements, .relative_elements = relative_elements, .span_bytes = .{ matrix, matrix, matrix, relative, scale, mask, matrix } };
     }
 
+    pub fn validateInputs(self: AudioAttentionLayout, inputs: [6]Buffer) !void {
+        try @import("buffer.zig").validateRegions(6, inputs, self.span_bytes[0..6].*, @splat(@alignOf(f32)), 6);
+    }
+
     pub fn validate(self: AudioAttentionLayout, q: Buffer, k: Buffer, v: Buffer, rel: Buffer, scales: Buffer, valid: Buffer, out: Buffer) !void {
         try @import("buffer.zig").validateRegions(7, .{ q, k, v, rel, scales, valid, out }, self.span_bytes, @splat(@alignOf(f32)), 6);
     }
