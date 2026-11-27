@@ -681,7 +681,9 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                 if (comptime build_options.enable_cuda) {
                     const before = self.before orelse return;
                     self.before = null;
-                    ctx.lockStepForCleanup();
+                    // The snapshot drains profiling events while holding
+                    // the real step. It does not replace graph backing.
+                    ctx.pageAccess(.{}, true).acquireForCleanup();
                     defer ctx.unlockStep();
                     const after = page.cudaProfileSnapshot(ctx) catch |err| {
                         std.log.warn("cuda_read_profile: status=unavailable reason={s} request_outcome={s}", .{ @errorName(err), if (complete) "complete" else "partial" });
