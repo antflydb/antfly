@@ -2229,3 +2229,14 @@ This first pair establishes successful wide replay with shared backing.
 The order-reversed comparison is pending. The two receipts are
 `2396762cc6393a5db9357cc672d44ec99cc94371ca918cb48cc01d256f63318a`
 and `9472fbacb69c92dcdd5db7d60d3969bc373e3024ad04c120ea873459c9620de1`.
+
+The reverse-order run reused that binary and workload. The shared arena
+again matched all 256 outputs and passed the wide gate, reaching 97 rows
+with three wide replays at 7.3087 pages/s. The standalone arm also matched
+all outputs and measured 7.4274 pages/s, but replayed at most 61 rows and
+failed the wide gate. Neither arm reported admission denials in that run.
+The results establish reproducible wide replay with shared backing in
+this workload. The rates do not establish a throughput win or justify
+changing the default across supported signatures. The reverse receipts
+are `5b8c2570ce03df9e56c453193c1c4338b224c4d4b4e9e1beb890dc468dd1cfdc`
+and `3bba08b192be4f5d33502f4b5b1fb2c62dd3f96910c0a94c2079228fe91fc93f`.
