@@ -2265,24 +2265,26 @@ test "resident serving cohort releases actual provider before publishing receive
 
 test "tensor microbatch CPU gathers backend-owned ONNX decoder cache" {
     if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
-    try checkDecoderGather(.native);
+    try checkDecoderGather(.native, 1);
 }
 
 test "tensor microbatch Metal gathers ONNX decoder cache inputs on device" {
     if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
     if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
-    try checkDecoderGather(.metal);
+    try checkDecoderGather(.metal, 1);
+    try checkDecoderGather(.metal, 65);
 }
 
 test "tensor microbatch CUDA gathers ONNX decoder cache inputs on device" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
-    checkDecoderGather(.cuda) catch |err| switch (err) {
+    checkDecoderGather(.cuda, 1) catch |err| switch (err) {
         error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
         else => return err,
     };
+    try checkDecoderGather(.cuda, 65);
 }
 
-fn checkDecoderGather(kind: @import("../backends/backends.zig").BackendType) !void {
+fn checkDecoderGather(kind: @import("../backends/backends.zig").BackendType, comptime cache_columns: usize) !void {
     const a = std.testing.allocator;
     const ml = @import("ml");
     var graph = ml.graph.Graph.init(a);
@@ -2290,7 +2292,15 @@ fn checkDecoderGather(kind: @import("../backends/backends.zig").BackendType) !vo
     var builder = ml.graph.Builder.init(&graph);
     const ids = try builder.parameter("input_ids", ml.graph.Shape.init(.i64, &.{ -1, 1 }));
     const encoder = try builder.parameter("encoder_hidden_states", ml.graph.Shape.init(.f32, &.{ -1, 1, 4 }));
-    const past = try builder.parameter("past_key_values.0.decoder.key", ml.graph.Shape.init(.f32, &.{ -1, 1, -1, 4 }));
+    var cache_names: [cache_columns][48]u8 = undefined;
+    var names: [cache_columns][]const u8 = undefined;
+    const cache_shape = ml.graph.Shape.init(.f32, &.{ -1, 1, -1, 4 });
+    var past: ml.graph.NodeId = undefined;
+    for (&cache_names, &names, 0..) |*buffer, *name, index| {
+        name.* = try std.fmt.bufPrint(buffer, "past_key_values.{d}.decoder.key", .{index});
+        const input = try builder.parameter(name.*, cache_shape);
+        past = if (index == 0) input else try builder.add(past, input);
+    }
     const token = try builder.reshape(try builder.convertDtype(ids, .f32), ml.graph.Shape.init(.f32, &.{ -1, 1, 1 }));
     const logits = try builder.add(encoder, token);
     const next = try builder.reshape(logits, ml.graph.Shape.init(.f32, &.{ -1, 1, 1, 4 }));
@@ -2332,8 +2342,8 @@ fn checkDecoderGather(kind: @import("../backends/backends.zig").BackendType) !vo
     var sources: [count]ops.CT = undefined;
     var created: usize = 0;
     defer for (sources[0..created]) |value| backend.free(value);
-    var stage: [count][3]StageInput = undefined;
-    var views: [count][3]Tensor = undefined;
+    var stage: [count][2 + cache_columns]StageInput = undefined;
+    var views: [count][2 + cache_columns]Tensor = undefined;
     var tickets: [count]Ticket = undefined;
     for (0..count) |index| {
         @memset(&data, @floatFromInt(10 + index));
@@ -2350,15 +2360,19 @@ fn checkDecoderGather(kind: @import("../backends/backends.zig").BackendType) !vo
             .owns_data = false,
             .owns_shape = false,
         };
-        views[index] = .{ ids_tensor, host_encoder, input.borrowedView(input.name) };
-        views[index][2].data = &.{};
-        views[index][2].shape = &past_shape;
-        stage[index] = .{ .{ .host = ids_tensor }, .{ .host = host_encoder }, .{ .resident = .{
-            .value = sources[index],
-            .backend = backend,
-            .shape = &past_shape,
-            .estimated_bytes = @sizeOf(@TypeOf(data)),
-        } } };
+        views[index][0..2].* = .{ ids_tensor, host_encoder };
+        stage[index][0..2].* = .{ .{ .host = ids_tensor }, .{ .host = host_encoder } };
+        for (names, views[index][2..], stage[index][2..]) |name, *view, *value| {
+            view.* = input.borrowedView(name);
+            view.data = &.{};
+            view.shape = &past_shape;
+            value.* = .{ .resident = .{
+                .value = sources[index],
+                .backend = backend,
+                .shape = &past_shape,
+                .estimated_bytes = @sizeOf(@TypeOf(data)),
+            } };
+        }
         try std.testing.expect(eligibleStage(session, &views[index], &stage[index]));
         tickets[index] = .{ .session = session, .permit = null, .gate = gate, .inputs = &views[index], .control = control, .rows = 1, .stage = &stage[index] };
     }
@@ -2396,7 +2410,7 @@ fn checkDecoderGather(kind: @import("../backends/backends.zig").BackendType) !vo
                 try std.testing.expectEqual(@as(usize, 4), logits_value.len);
                 try std.testing.expectEqual(@as(usize, 257 * 4), cache_value.len);
                 for (logits_value, 0..) |value, j| try std.testing.expectEqual(@as(f32, @floatFromInt(2 + i + j)), value);
-                for (cache_value[0 .. 256 * 4]) |value| try std.testing.expectEqual(@as(f32, @floatFromInt(10 + i)), value);
+                for (cache_value[0 .. 256 * 4]) |value| try std.testing.expectEqual(@as(f32, @floatFromInt((10 + i) * cache_columns)), value);
                 try std.testing.expectEqualSlices(f32, logits_value, cache_value[256 * 4 ..]);
             }
         }
@@ -2432,7 +2446,7 @@ fn checkDecoderGather(kind: @import("../backends/backends.zig").BackendType) !vo
     try Bench.run(&tickets, true, true);
     var serial_ns: i96 = 0;
     var fused_ns: i96 = 0;
-    for (0..12) |iteration| {
+    for (0..if (cache_columns == 1) 12 else 0) |iteration| {
         for ([_]bool{ iteration % 2 == 0, iteration % 2 != 0 }) |fused| {
             const start = std.Io.Clock.Timestamp.now(std.testing.io, .awake);
             try Bench.run(&tickets, fused, false);
@@ -2440,7 +2454,7 @@ fn checkDecoderGather(kind: @import("../backends/backends.zig").BackendType) !vo
             if (fused) fused_ns += elapsed else serial_ns += elapsed;
         }
     }
-    std.debug.print("\n{s} decoder serving executor, 48 rows each: serial {d} ns, fused {d} ns\n", .{ @tagName(kind), serial_ns, fused_ns });
+    if (cache_columns == 1) std.debug.print("\n{s} decoder serving executor, 48 rows each: serial {d} ns, fused {d} ns\n", .{ @tagName(kind), serial_ns, fused_ns });
     for (&callers) |*caller| try group.concurrent(std.testing.io, Submit.call, .{caller});
     try group.await(std.testing.io);
     for (&callers, 0..) |*caller, index| {
@@ -2448,7 +2462,7 @@ fn checkDecoderGather(kind: @import("../backends/backends.zig").BackendType) !vo
         const output = caller.output orelse return error.MissingMergedDecoderResult;
         const cache = try output.backend.toFloat32(output.outputs[1], a);
         defer a.free(cache);
-        try std.testing.expectEqual(@as(f32, @floatFromInt(10 + index)), cache[0]);
+        try std.testing.expectEqual(@as(f32, @floatFromInt((10 + index) * cache_columns)), cache[0]);
     }
     const report = broker.snapshot(std.testing.io);
     try std.testing.expectEqual(@as(u64, count), report.native_items);
