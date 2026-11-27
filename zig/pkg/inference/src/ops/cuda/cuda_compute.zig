@@ -18182,19 +18182,20 @@ fn allocDeviceBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
     if (len == 0) return .{};
     if (self.execution_scope) |scope| {
         if (scope.isBound()) return .{ .ptr = try scope.allocate(len), .len = len, .borrowed = true };
-    }
-    var result = try allocDeviceBufferOrdinary(self, len);
-    if (self.execution_scope) |scope| {
+        // A composite recipe owns these lifetimes. Keep the ordinary device
+        // cache and mandatory admission, without feeding the legacy trace.
+        var result = try allocDeviceBufferOrdinaryWithPolicy(self, len, .scoped);
         result.len = len;
         scope.recordAllocation(len, result.ptr);
+        return result;
     }
-    return result;
+    return allocDeviceBufferOrdinary(self, len);
 }
 fn allocDeviceBufferOrdinary(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
     return allocDeviceBufferOrdinaryWithPolicy(self, len, .required);
 }
 
-const TempAllocPolicy = enum { required, optional };
+const TempAllocPolicy = enum { required, optional, scoped };
 
 fn allocDeviceBufferOrdinaryWithPolicy(self: *CudaCompute, len: usize, policy: TempAllocPolicy) !buffer_mod.DeviceBuffer {
     const lock_sample = self.temp_scan_profile.beginLock(0);
@@ -18204,7 +18205,7 @@ fn allocDeviceBufferOrdinaryWithPolicy(self: *CudaCompute, len: usize, policy: T
     if (lock_sample) |sample| self.temp_scan_profile.end(2, sample, 0);
     const seq = self.temp_trace_seq;
     const capture_requires_pinned = self.debug_cuda_graph_capture_active and cudaEffectiveTempSlotPeriod(self) != 0;
-    // Optional scratch must stay reclaimable and must not shift graph slot numbering.
+    // Optional and scoped scratch must not shift legacy graph slot numbering.
     if (policy == .required) {
         self.temp_trace_seq = seq + 1;
         if (self.temp_slot_config.autoplan_enabled) {
@@ -18269,7 +18270,7 @@ fn allocUnpinnedDeviceBufferUnlocked(self: *CudaCompute, len: usize, seq: usize,
     }
     self.stats.temp_buffer_misses += 1;
     const buffer = allocFreshTempBufferUnlocked(self, len, policy) catch |err| {
-        if (policy == .required and err == error.CudaMemoryLimitExceeded) return error.ResourceLimitExceeded;
+        if (policy != .optional and err == error.CudaMemoryLimitExceeded) return error.ResourceLimitExceeded;
         return err;
     };
     self.noteDeviceBytes(len);
@@ -65470,6 +65471,19 @@ test "Gemma4 CUDA projector optional scratch leaves graph slots available after 
     releaseDeviceBuffer(&compute, &scratch);
     try std.testing.expectEqual(seq, compute.temp_trace_seq);
     try std.testing.expectEqual(@as(usize, 0), compute.temp_pinned_slots.items.len);
+    {
+        const Workspace = @import("../../execution/stream_workspace.zig");
+        var plan: Workspace.Plan = .{};
+        var scope = Workspace.Scope.observe(&plan);
+        compute.execution_scope = &scope;
+        defer compute.execution_scope = null;
+        var scoped = try allocDeviceBuffer(&compute, 512);
+        releaseDeviceBuffer(&compute, &scoped);
+        try std.testing.expect(plan.finishNoOutput());
+        try std.testing.expectEqual(@as(usize, 1), plan.count);
+        try std.testing.expectEqual(seq, compute.temp_trace_seq);
+        try std.testing.expectEqual(@as(usize, 0), compute.temp_pinned_slots.items.len);
+    }
     const budget = &compute.ctx.device_allocations;
     const before = budget.snapshot();
     try budget.setLimit(before.live);
