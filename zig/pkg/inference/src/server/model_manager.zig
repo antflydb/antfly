@@ -3133,49 +3133,11 @@ pub const ModelManager = struct {
         // repeating stable-limit OS probes for every parser node; live physical
         // capacity is checked separately by metadata's batched reservations.
         if (check_live) self.tightenUnifiedDeviceAdmission();
-        var pressure: ?runtime.tier.memory.AdmissionPressure = null;
-        const requests = [_]runtime.tier.memory.AdmissionRequest{.{
+        return self.acquireResolvedRequestsWithEviction(&.{.{
             .backend_class = backend_class,
             .limits = limits,
             .amounts = amounts,
-        }};
-        return self.admissionController().tryAcquireWithPressure(
-            backend_class,
-            limits,
-            amounts,
-            check_live,
-            &pressure,
-        ) catch |first_err| switch (first_err) {
-            error.ResourceTemporarilyUnavailable => {
-                spinLock(&self.eviction_lock);
-                defer self.eviction_lock.unlock();
-                while (true) {
-                    if (self.admissionController().tryAcquireWithPressure(
-                        backend_class,
-                        limits,
-                        amounts,
-                        check_live,
-                        &pressure,
-                    )) |lease| return lease else |retry_err| switch (retry_err) {
-                        error.ResourceTemporarilyUnavailable => {},
-                        else => {
-                            self.logRunAdmissionDenied(retry_err, pressure, &requests);
-                            return retry_err;
-                        },
-                    }
-                    if (!self.reclaimOneForAdmission(
-                        pressure orelse return error.ResourceTemporarilyUnavailable,
-                    )) {
-                        self.logRunAdmissionDenied(error.ResourceTemporarilyUnavailable, pressure, &requests);
-                        return error.ResourceTemporarilyUnavailable;
-                    }
-                }
-            },
-            else => {
-                self.logRunAdmissionDenied(first_err, pressure, &requests);
-                return first_err;
-            },
-        };
+        }}, check_live);
     }
 
     fn acquireRequestsWithEviction(
@@ -3191,10 +3153,18 @@ pub const ModelManager = struct {
         @memcpy(requests, requested);
         for (requests) |*request| request.limits = self.physicalRunLimits(request.backend_class, request.limits);
         self.tightenUnifiedDeviceAdmission();
+        return self.acquireResolvedRequestsWithEviction(requests, true);
+    }
+
+    fn acquireResolvedRequestsWithEviction(
+        self: *ModelManager,
+        requests: []const runtime.tier.memory.AdmissionRequest,
+        check_live: bool,
+    ) !runtime.tier.memory.AdmissionLease {
         var pressure: ?runtime.tier.memory.AdmissionPressure = null;
         return self.admissionController().tryAcquireRequestsWithPressure(
             requests,
-            true,
+            check_live,
             &pressure,
         ) catch |first_err| switch (first_err) {
             error.ResourceTemporarilyUnavailable => {
@@ -3203,7 +3173,7 @@ pub const ModelManager = struct {
                 while (true) {
                     if (self.admissionController().tryAcquireRequestsWithPressure(
                         requests,
-                        true,
+                        check_live,
                         &pressure,
                     )) |lease|
                         return lease
@@ -3214,9 +3184,8 @@ pub const ModelManager = struct {
                             return retry_err;
                         },
                     }
-                    if (!self.reclaimOneForAdmission(
-                        pressure orelse return error.ResourceTemporarilyUnavailable,
-                    )) {
+                    const reclaimed = if (pressure) |reason| self.reclaimOneForAdmission(reason) else false;
+                    if (!reclaimed) {
                         self.logRunAdmissionDenied(error.ResourceTemporarilyUnavailable, pressure, requests);
                         return error.ResourceTemporarilyUnavailable;
                     }
