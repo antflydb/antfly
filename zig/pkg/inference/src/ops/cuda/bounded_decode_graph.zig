@@ -292,7 +292,27 @@ pub const GraphPhase = struct {
 
     pub fn matchesOwner(self: *const GraphPhase, owner: *const Module) bool {
         const storage = owner.storage_layout orelse return false;
-        return owner.matches(self.descriptor) and storage.head_bytes == self.storage_layout.head_bytes and std.meta.eql(owner.attention_scratch, self.attention_scratch);
+        const compatible_head = storage.head_bytes == self.storage_layout.head_bytes or
+            (self.descriptor.head_row_limit != null and storage.head_bytes > 0 and storage.head_bytes < self.storage_layout.head_bytes);
+        return owner.matches(self.descriptor) and compatible_head and std.meta.eql(owner.attention_scratch, self.attention_scratch);
+    }
+
+    /// Only the optional packet bank changes. Input, token and attention spans
+    /// retain their exact declared addresses and the prepared graph records
+    /// the bank it actually owns. Bound the number of extra GEMM launches.
+    pub fn reduceHeadPacketAfterDenial(self: *GraphPhase) bool {
+        if (self.mode != .storage or self.cold != null or self.bound or self.descriptor.head_row_limit == null) return false;
+        const pressure = self.admission_pressure orelse return false;
+        switch (pressure) {
+            .domain_scratch, .shared_scratch => {},
+            else => return false,
+        }
+        if (self.storage_layout.head_bytes == 0) return false;
+        const row_bytes = self.descriptor.vocab * @sizeOf(f32);
+        const packet_rows = self.storage_layout.head_bytes / row_bytes;
+        if (packet_rows <= 8) return false;
+        self.storage_layout.head_bytes = @max(8, packet_rows / 2) * row_bytes;
+        return true;
     }
 
     fn arenaRequest(self: *const GraphPhase, layout: plan_mod.Layout) funding_mod.Request {
@@ -672,6 +692,22 @@ test "captured graph head packets fund the exact smaller bank and invalidate a f
     try std.testing.expect(!phase.matchesOwner(&owner));
     owner.storage_layout = layout;
     try std.testing.expect(phase.matchesOwner(&owner));
+
+    phase.mode = .storage;
+    phase.admission_pressure = .live_host;
+    try std.testing.expect(!phase.reduceHeadPacketAfterDenial());
+    phase.admission_pressure = .domain_scratch;
+    for ([_]usize{ 16, 8 }) |packet_rows| {
+        try std.testing.expect(phase.reduceHeadPacketAfterDenial());
+        try std.testing.expectEqual(packet_rows * packet.vocab * 4, phase.storage_layout.head_bytes);
+        try std.testing.expectEqual(layout.metadata_bytes, phase.storage_layout.metadata_bytes);
+    }
+    try std.testing.expect(!phase.reduceHeadPacketAfterDenial());
+    owner.storage_layout = phase.storage_layout;
+    try phase.initInto(packet);
+    try std.testing.expect(phase.matchesOwner(&owner));
+    try phase.initInto(descriptor);
+    try std.testing.expect(!phase.matchesOwner(&owner));
 
     packet.vocab = 400_000;
     try std.testing.expectEqual(@as(usize, 32 * 400_000 * 4), (try packet.layout()).head_bytes);

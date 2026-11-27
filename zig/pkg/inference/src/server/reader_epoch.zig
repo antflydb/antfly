@@ -1328,7 +1328,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                     }
                     return err;
                 };
-                const funded: anyerror!void = phase.prepareOutside(model) catch |err| retry: {
+                var funded: anyerror!void = phase.prepareOutside(model) catch |err| retry: {
                     if (err != error.ResourceTemporarilyUnavailable) break :retry err;
                     phase.destroyOutside();
                     // Yield unused optional cache reservations to the already
@@ -1338,6 +1338,14 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                     control.check() catch |failure| break :retry failure;
                     break :retry phase.prepareOutside(model);
                 };
+                while (true) {
+                    funded catch |err| {
+                        if (err != error.ResourceTemporarilyUnavailable or !phase.reduceHeadPacketAfterDenial()) break;
+                        funded = if (control.check()) |_| phase.prepareOutside(model) else |failure| failure;
+                        continue;
+                    };
+                    break;
+                }
                 funded catch |err| {
                     phase.destroyOutside(); // inert failed phase, outside all gates
                     parked.restoreKeepingStep() catch platform.inference_process_supervisor.restartWorker();
