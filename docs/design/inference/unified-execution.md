@@ -1397,6 +1397,13 @@ audio p50 rose from 37.40 to 40.73 ms with valid same-binary controls.
 EmbeddingGemma 2 text had unstable timing controls. Both embedding
 cases require isolated repeats.
 
+The 48-sample-per-side Metal audio repeat retained exact outputs and
+confirmed the regression. Baseline p50/p95 was 35.40/36.14 ms and
+candidate p50/p95 was 40.66/41.19 ms. Baseline-only and candidate-only
+p50 drift stayed below 0.3%. The isolated Native CPU text embedding and
+GLiNER2.5 repeats both passed exact output and timing gates with the
+same sample count.
+
 At `34296ffb5a`, five Native CPU fixtures passed for resident handoff and
 task output custody. The incremental decoder matched host-reference logits
 after the encoder and destination session handles closed, and allocation
