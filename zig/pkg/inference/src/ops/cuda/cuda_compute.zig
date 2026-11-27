@@ -3861,9 +3861,11 @@ pub const CudaCompute = struct {
                 owner.wide_replays += @intFromBool(owner.rows > 64);
                 owner.max_replay_rows = @max(owner.max_replay_rows, owner.rows);
                 if (owner.progress == 2 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
-                    const packet_rows = owner.storage_layout.?.headPacketRows(owner.rows, owner.vocab);
-                    std.debug.print("LIGHTONOCR3 cuda_model_graph_first_replay_rows={d} capture={d} head_packet_rows={d} head_bank_bytes={d}\n", .{
-                        owner.rows, owner.captures, packet_rows, owner.head.len,
+                    const layout = owner.storage_layout.?;
+                    const packet_rows = layout.headPacketRows(owner.rows, owner.vocab);
+                    const fused_scratch = if (layout.fused_head_workspace) |span| span.bytes else 0;
+                    std.debug.print("LIGHTONOCR3 cuda_model_graph_first_replay_rows={d} capture={d} head_packet_rows={d} head_bank_bytes={d} fused_head_scratch_bytes={d}\n", .{
+                        owner.rows, owner.captures, packet_rows, owner.head.len, fused_scratch,
                     });
                 }
                 return;
