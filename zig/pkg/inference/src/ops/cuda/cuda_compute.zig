@@ -21521,14 +21521,14 @@ fn gemma4AudioLocalAttentionOp(
     valid: CT,
     params: ops.Gemma4AudioLocalAttentionParams,
 ) anyerror!?CT {
-    return localRelativeAttention(ctx, q, k, v, rel, q_dim_scales, valid, params, null);
+    return localRelativeAttention(ctx, q, k, v, rel, q_dim_scales, valid, params, null, null);
 }
 
-fn localRelativeAttentionIntoOp(ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, scales: CT, valid: CT, params: ops.Gemma4AudioLocalAttentionParams, destination: ops.ComputeBackend.LocalRelativeDestination) !bool {
-    return (try localRelativeAttention(ctx, q, k, v, rel, scales, valid, params, destination)) != null;
+fn localRelativeAttentionIntoOp(ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, scales: CT, valid: CT, params: ops.Gemma4AudioLocalAttentionParams, destination: ops.ComputeBackend.LocalRelativeDestination, control: ?InferenceExecutionControl) !bool {
+    return (try localRelativeAttention(ctx, q, k, v, rel, scales, valid, params, destination, control)) != null;
 }
 
-fn localRelativeAttention(ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: ops.Gemma4AudioLocalAttentionParams, destination: ?ops.ComputeBackend.LocalRelativeDestination) !?CT {
+fn localRelativeAttention(ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: ops.Gemma4AudioLocalAttentionParams, destination: ?ops.ComputeBackend.LocalRelativeDestination, control: ?InferenceExecutionControl) !?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (self.ctx.info.compute_major < 8) return null;
     if (params.arithmetic == .combined_f32 and params.publication != .f32) return null;
@@ -21557,7 +21557,7 @@ fn localRelativeAttention(ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_s
         // The existing architecture fallback has authoritative host clip spans
         // and submits each clip independently, without downloading validity.
         if (params.segmented) return null;
-        return try sourceLocalRelativeAttention(self, q, k, v, rel, q_dim_scales, valid, layout, params, destination);
+        return try sourceLocalRelativeAttention(self, q, k, v, rel, q_dim_scales, valid, layout, params, destination, control);
     }
     if (destination != null) return null;
     const input_buffers = [6]buffer_mod.DeviceBuffer{
@@ -21628,9 +21628,25 @@ test "CUDA audio validity accepts only a vector or contiguous one-column view" {
     try std.testing.expectEqual(allocations, compute.stats.device_alloc_calls);
 }
 
-fn sourceLocalRelativeAttention(self: *CudaCompute, q: CT, k: CT, v: CT, rel: CT, scales: CT, valid: CT, layout: embedding_gemma2_cuda.AudioAttentionLayout, params: ops.Gemma4AudioLocalAttentionParams, destination: ?ops.ComputeBackend.LocalRelativeDestination) !CT {
+fn sourceLocalRelativeAttention(self: *CudaCompute, q: CT, k: CT, v: CT, rel: CT, scales: CT, valid: CT, layout: embedding_gemma2_cuda.AudioAttentionLayout, params: ops.Gemma4AudioLocalAttentionParams, destination: ?ops.ComputeBackend.LocalRelativeDestination, control: ?InferenceExecutionControl) !CT {
     const Source = @import("local_relative_source.zig");
-    const plan = try Source.Plan.resolve(params.rows, params.heads, params.head_dim, params.chunk, params.context, params.context_left);
+    const single = [_]usize{params.rows};
+    const segments = if (destination) |assigned| if (assigned.segments.len != 0) assigned.segments else &single else &single;
+    var plans: [@import("../../execution/audio_schedule.zig").GroupedRows.max_clips]Source.Plan = undefined;
+    if (segments.len > plans.len) return error.InvalidTensorShape;
+    var remaining = params.rows;
+    var scratch_bytes: usize = 0;
+    var vendor_span: buffer_mod.ByteSpan = undefined;
+    for (segments, plans[0..segments.len]) |rows, *plan| {
+        if (rows == 0 or rows > remaining) return error.InvalidTensorShape;
+        remaining -= rows;
+        plan.* = try Source.Plan.resolve(rows, params.heads, params.head_dim, params.chunk, params.context, params.context_left);
+        if (plan.bytes > scratch_bytes) {
+            scratch_bytes = plan.bytes;
+            vendor_span = plan.workspace;
+        }
+    }
+    if (remaining != 0) return error.InvalidTensorShape;
     const blas = if (self.bf16_blas) |*value| value else return error.CudaLibrariesUnavailable;
     try blas.requireF32Workspace();
     inline for (.{ q, k, v }) |tensor| {
@@ -21657,11 +21673,51 @@ fn sourceLocalRelativeAttention(self: *CudaCompute, q: CT, k: CT, v: CT, rel: CT
         owned = try OwnedF32Output.alloc2(self, params.rows, params.hidden, layout.matrix_elements);
         break :block owned.?.buffer;
     };
-    try layout.validate(tensorFromCt(q).buffer, tensorFromCt(k).buffer, tensorFromCt(v).buffer, tensorFromCt(rel).buffer, tensorFromCt(scales).buffer, tensorFromCt(valid).buffer, output);
+    const q_buffer = tensorFromCt(q).buffer;
+    const k_buffer = tensorFromCt(k).buffer;
+    const v_buffer = tensorFromCt(v).buffer;
+    const relative = tensorFromCt(rel).buffer;
+    const scale = tensorFromCt(scales).buffer;
+    const mask = tensorFromCt(valid).buffer;
+    try layout.validate(q_buffer, k_buffer, v_buffer, relative, scale, mask, output);
     const module = try self.encoderMultimodalModule();
-    // The same one-bank lifetime joins existing learned/captured audio plans.
-    var temporary = try SourceLinearTemporary.acquireKnownCapture(self, plan.bytes, plan.bytes, capture);
+    // Each clip's last consumer is submitted before the next clip reuses the bank.
+    var temporary = try SourceLinearTemporary.acquireKnownCapture(self, scratch_bytes, scratch_bytes, capture);
     defer temporary.deinit(self);
+    // The vendor workspace is the last span of the largest plan, so it
+    // follows every clip's operands. Keep the handle bound across the group.
+    const vendor = temporary.span(vendor_span);
+    try self.ctx.makeCurrent();
+    var workspace = try blas.beginF32Workspace(self.ctx.stream, @ptrFromInt(vendor.ptr), vendor.len);
+    defer workspace.deinit();
+    const row_bytes = layout.span_bytes[6] / params.rows;
+    var offset: usize = 0;
+    for (plans[0..segments.len]) |plan| {
+        if (control) |value| try value.check();
+        const bytes = row_bytes * plan.rows;
+        const first = offset * row_bytes;
+        try dispatchLocalRelativeSource(self, module, &workspace, &temporary, plan, params, try q_buffer.borrowRange(first, bytes), try k_buffer.borrowRange(first, bytes), try v_buffer.borrowRange(first, bytes), relative, scale, try mask.borrowRange(offset * @sizeOf(f32), plan.rows * @sizeOf(f32)), try output.borrowRange(first, bytes));
+        offset += plan.rows;
+    }
+    if (owned) |*value_output| return value_output.intoTensor();
+    return destination.?.tensor;
+}
+
+fn dispatchLocalRelativeSource(
+    self: *CudaCompute,
+    module: *embedding_gemma2_cuda.Module,
+    workspace: *const @import("libraries.zig").Cublas.F32Workspace,
+    temporary: *const SourceLinearTemporary,
+    plan: @import("local_relative_source.zig").Plan,
+    params: ops.Gemma4AudioLocalAttentionParams,
+    q: buffer_mod.DeviceBuffer,
+    k: buffer_mod.DeviceBuffer,
+    v: buffer_mod.DeviceBuffer,
+    relative: buffer_mod.DeviceBuffer,
+    scales: buffer_mod.DeviceBuffer,
+    valid: buffer_mod.DeviceBuffer,
+    output: buffer_mod.DeviceBuffer,
+) !void {
     const query = temporary.span(plan.query);
     const packed_query = temporary.span(plan.packed_query);
     const key = temporary.span(plan.key);
@@ -21669,25 +21725,18 @@ fn sourceLocalRelativeAttention(self: *CudaCompute, q: CT, k: CT, v: CT, rel: CT
     const scores = temporary.span(plan.scores);
     const relative_scores = temporary.span(plan.relative_scores);
     const result = temporary.span(plan.result);
-    const workspace = temporary.span(plan.workspace);
     var queued = false;
     errdefer if (queued) synchronizeAndDrainDeferredDeviceFrees(self) catch {};
     queued = true; // A failed submission may already have consumed addresses.
-    try module.launchLocalRelativeSourcePack(&self.ctx, plan, query, packed_query, key, value, tensorFromCt(q).buffer, tensorFromCt(k).buffer, tensorFromCt(v).buffer, tensorFromCt(scales).buffer, params.query_scale, params.k_scale);
-    {
-        var workspace_scope = try blas.beginF32Workspace(self.ctx.stream, @ptrFromInt(workspace.ptr), workspace.len);
-        defer workspace_scope.deinit();
-        try workspace_scope.stridedBatched(@ptrFromInt(scores.ptr), @ptrFromInt(key.ptr), @ptrFromInt(packed_query.ptr), plan.contentLayout());
-        module.noteCublasF32Matmul();
-        try workspace_scope.stridedBatched(@ptrFromInt(relative_scores.ptr), @ptrFromInt(tensorFromCt(rel).buffer.ptr), @ptrFromInt(query.ptr), plan.relativeLayout());
-        module.noteCublasF32Matmul();
-        try module.launchLocalRelativeSourceSoftmax(&self.ctx, plan, scores, relative_scores, tensorFromCt(valid).buffer, params.logit_cap, params.invalid_value, params.exclude_farthest_key);
-        try workspace_scope.stridedBatched(@ptrFromInt(result.ptr), @ptrFromInt(value.ptr), @ptrFromInt(scores.ptr), plan.contextLayout());
-        module.noteCublasF32Matmul();
-    }
+    try module.launchLocalRelativeSourcePack(&self.ctx, plan, query, packed_query, key, value, q, k, v, scales, params.query_scale, params.k_scale);
+    try workspace.stridedBatched(@ptrFromInt(scores.ptr), @ptrFromInt(key.ptr), @ptrFromInt(packed_query.ptr), plan.contentLayout());
+    module.noteCublasF32Matmul();
+    try workspace.stridedBatched(@ptrFromInt(relative_scores.ptr), @ptrFromInt(relative.ptr), @ptrFromInt(query.ptr), plan.relativeLayout());
+    module.noteCublasF32Matmul();
+    try module.launchLocalRelativeSourceSoftmax(&self.ctx, plan, scores, relative_scores, valid, params.logit_cap, params.invalid_value, params.exclude_farthest_key);
+    try workspace.stridedBatched(@ptrFromInt(result.ptr), @ptrFromInt(value.ptr), @ptrFromInt(scores.ptr), plan.contextLayout());
+    module.noteCublasF32Matmul();
     try module.launchLocalRelativeSourcePublish(&self.ctx, plan, output, result);
-    if (owned) |*value_output| return value_output.intoTensor();
-    return destination.?.tensor;
 }
 
 fn gemma4AudioClampScalarOp(ctx: *anyopaque, input: CT, min_value: ?f32, max_value: ?f32) anyerror!?CT {
@@ -62677,6 +62726,32 @@ test "CUDA source local relative attention shares workspace across three physica
         try std.testing.expectEqualSlices(f32, sentinel[0..hidden], assigned[0..hidden]);
         try std.testing.expectEqualSlices(f32, output, assigned[hidden .. (rows + 1) * hidden]);
         try std.testing.expectEqualSlices(f32, sentinel[0..hidden], assigned[(rows + 1) * hidden ..]);
+
+        if (rows == 19) {
+            var grouped_values = values;
+            @memset(grouped_values[7 * hidden ..], -5);
+            const grouped_value = try cb.fromFloat32Shape(&grouped_values, &shape);
+            defer cb.free(grouped_value);
+            const Workspace = @import("../../execution/stream_workspace.zig");
+            var plan: Workspace.Plan = .{};
+            var scope = Workspace.Scope.observe(&plan);
+            {
+                compute.execution_scope = &scope;
+                defer compute.execution_scope = null;
+                try std.testing.expect(try cb.localRelativeAttentionInto(query, query, grouped_value, relative, scale, valid, params, .{
+                    .tensor = target,
+                    .first_row = 1,
+                    .segments = &.{ 7, 12 },
+                }));
+            }
+            try std.testing.expect(plan.finishNoOutput());
+            try std.testing.expectEqual(@as(usize, 1), plan.count);
+            try std.testing.expectEqual(copies, compute.stats.d2d_bytes);
+            try std.testing.expectEqual(before + 12, compute.bf16_blas.?.calls);
+            const grouped = try cb.toFloat32(target, a);
+            defer a.free(grouped);
+            try std.testing.expectEqualSlices(f32, &grouped_values, grouped[hidden .. (rows + 1) * hidden]);
+        }
     }
 }
 
@@ -62685,7 +62760,7 @@ test "source local relative attention validates geometry and library before opaq
     var params = ops.Gemma4AudioLocalAttentionParams{ .arithmetic = .independent_f32, .publication = .bf16_values_f32, .rows = 0, .hidden = 6, .heads = 2, .head_dim = 3, .chunk = 4, .context_left = 3, .context = 6, .k_scale = 1, .logit_cap = 50, .invalid_value = -1e9 };
     try std.testing.expectError(error.InvalidTensorShape, embedding_gemma2_cuda.AudioAttentionLayout.init(params));
     params.rows = 3;
-    try std.testing.expectError(error.CudaLibrariesUnavailable, sourceLocalRelativeAttention(&compute, undefined, undefined, undefined, undefined, undefined, undefined, try embedding_gemma2_cuda.AudioAttentionLayout.init(params), params, null));
+    try std.testing.expectError(error.CudaLibrariesUnavailable, sourceLocalRelativeAttention(&compute, undefined, undefined, undefined, undefined, undefined, undefined, try embedding_gemma2_cuda.AudioAttentionLayout.init(params), params, null, null));
 }
 
 test "source local relative temporary follows the actual learned and captured bank lifetime" {
@@ -62756,7 +62831,7 @@ test "source local relative actual external capture rejects before module or out
     const params = ops.Gemma4AudioLocalAttentionParams{ .arithmetic = .independent_f32, .publication = .bf16_values_f32, .rows = 3, .hidden = 6, .heads = 2, .head_dim = 3, .chunk = 4, .context_left = 3, .context = 6, .k_scale = 1, .logit_cap = 50, .invalid_value = -1e9 };
     // Allocator, module cache and kernels stay poisoned. Reaching any of them
     // before rejecting externally active capture is a test failure.
-    try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, sourceLocalRelativeAttention(&compute, &tensor, &tensor, &tensor, &tensor, &scalar, &scalar, try embedding_gemma2_cuda.AudioAttentionLayout.init(params), params, null));
+    try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, sourceLocalRelativeAttention(&compute, &tensor, &tensor, &tensor, &tensor, &scalar, &scalar, try embedding_gemma2_cuda.AudioAttentionLayout.init(params), params, null, null));
     try std.testing.expectEqual(@as(usize, 1), Fake.queries);
     try std.testing.expectEqual(@as(u64, 0), compute.stats.device_alloc_calls);
     // The shared preflight must use the same real driver query.
@@ -62779,7 +62854,7 @@ test "source local relative actual external capture rejects before module or out
     compute.execution_scope = &scope;
     compute.source_linear_scratch = .{};
     compute.embedding_gemma2 = null;
-    try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, sourceLocalRelativeAttention(&compute, &tensor, &tensor, &tensor, &tensor, &scalar, &scalar, try embedding_gemma2_cuda.AudioAttentionLayout.init(params), params, null));
+    try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, sourceLocalRelativeAttention(&compute, &tensor, &tensor, &tensor, &tensor, &scalar, &scalar, try embedding_gemma2_cuda.AudioAttentionLayout.init(params), params, null, null));
     try std.testing.expectEqual(@as(usize, 5), Fake.queries);
     const capture = try SourceLinearTemporary.preflightCapture(&compute);
     try std.testing.expect(capture);
