@@ -4199,11 +4199,10 @@ pub const CudaCompute = struct {
             };
         }
         const head_destination = try owner.bindExecutionStorage();
-        const paged_attention = @import("paged_attention_bf16.zig");
-        const attention_scratch = if (expected.attention_layers != 0) plan: {
-            const geometry = expected.attention_geometry orelse return error.InvalidExecutionPlan;
-            break :plan try paged_attention.DecodeScratch.init(rows, future_tokens, geometry, paged_attention.useChunk128(self.lighton_attention_chunk128, geometry.heads));
-        } else null;
+        if (expected.attention_geometry) |geometry| {
+            const chunk128 = @import("paged_attention_bf16.zig").useChunk128(self.lighton_attention_chunk128, geometry.heads);
+            try owner.prepareAttentionScratch(expected, chunk128);
+        } else if (expected.attention_layers != 0) return error.InvalidExecutionPlan;
         const capture_scope = if (owner.phase == .capture) try owner.bindArena() else null;
         if (self.captured_cache_roots) |roots| try roots.beginGeneration(self, current);
         try self.lighton_attention.init(&self.ctx);
@@ -4220,7 +4219,6 @@ pub const CudaCompute = struct {
         if (owner.phase == .warm) if (self.cublaslt) |*blas| {
             _ = try blas.reserveTensorCorePlanSlots(&self.ctx, 64);
         };
-        owner.attention_scratch = attention_scratch;
         claimed = true;
         return .{
             .compute = self,

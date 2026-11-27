@@ -522,6 +522,17 @@ pub const Module = struct {
         return plan_mod.Scope.bind(plan, layout, self.arena.ptr, self.arena.len);
     }
 
+    pub fn prepareAttentionScratch(self: *Module, descriptor: Descriptor, chunk128: bool) !void {
+        if (descriptor.attention_layers == 0) return;
+        const geometry = descriptor.attention_geometry orelse return error.InvalidExecutionPlan;
+        if (self.attention_scratch) |*scratch| {
+            if (scratch.tokens != descriptor.future_tokens or scratch.full_rows + scratch.tail_rows != descriptor.rows or
+                !std.meta.eql(scratch.geometry, geometry) or scratch.full.chunk128 != chunk128) return error.PreparedCachePlanChanged;
+            return;
+        }
+        self.attention_scratch = try DecodeScratch.init(descriptor.rows, descriptor.future_tokens, geometry, chunk128);
+    }
+
     pub fn bindExecutionStorage(self: *const Module) !?buffer.DeviceBuffer {
         const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
         try buffer.validateRegions(
@@ -1021,6 +1032,13 @@ test "bounded decoder graph reuse requires the prepared dispatch geometry" {
     var changed = descriptor;
     changed.future_tokens += 2;
     try std.testing.expect(owner.matches(changed));
+    var scratch_descriptor = descriptor;
+    scratch_descriptor.attention_geometry = .{ .heads = 8, .kv_heads = 2, .dim = 256 };
+    try owner.prepareAttentionScratch(scratch_descriptor, false);
+    try owner.prepareAttentionScratch(scratch_descriptor, false);
+    try std.testing.expectError(error.PreparedCachePlanChanged, owner.prepareAttentionScratch(scratch_descriptor, true));
+    scratch_descriptor.future_tokens += 2;
+    try std.testing.expectError(error.PreparedCachePlanChanged, owner.prepareAttentionScratch(scratch_descriptor, false));
     changed.attention_layers += 1;
     try std.testing.expect(!owner.matches(changed));
     changed = descriptor;
