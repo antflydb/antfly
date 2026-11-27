@@ -203,6 +203,10 @@ pub const Decoder = struct {
     /// Dispatch stays a synchronous borrowed capability; no task pointer or
     /// tokenizer is retained. Rows preserve provider ownership without copies.
     pub fn stepSuffix(self: *Decoder, suffix: @import("decoder_position.zig").Suffix, stats_request: ?Native.StatsRequest, dispatch: anytype) !Row {
+        return self.stepSuffixSelecting(suffix, stats_request, dispatch, null);
+    }
+
+    fn stepSuffixSelecting(self: *Decoder, suffix: @import("decoder_position.zig").Suffix, stats_request: ?Native.StatsRequest, dispatch: anytype, token_policy: ?stages.FinalTokenPolicy) !Row {
         var row = Row{ .allocator = self.allocator, .vocab_size = self.vocab_size };
         errdefer row.deinit();
         if (self.native) |*decoder| {
@@ -233,8 +237,13 @@ pub const Decoder = struct {
             const adapters = @import("tensor_dispatch.zig");
             const stage = adapters.stageDispatcher(dispatch);
             if (adapters.hasDispatcher(dispatch) and stage == null) return error.DecoderDispatchChanged;
-            row.owned_logits = try state.stepResidentDispatched(suffix, self.control, stage);
-            row.logits = row.owned_logits.?;
+            switch (try state.stepResidentSelecting(suffix, self.control, stage, token_policy)) {
+                .row => |logits| {
+                    row.owned_logits = logits;
+                    row.logits = logits;
+                },
+                .token => |token| row.token = token,
+            }
             return row;
         }
         return error.InvalidDecoderPosition;
@@ -244,9 +253,13 @@ pub const Decoder = struct {
     /// still need the whole slice, while incremental routes consume only
     /// the explicitly positioned suffix.
     pub fn step(self: *Decoder, prefix: []const i64, position: usize, stats_request: ?Native.StatsRequest, dispatch: anytype) !Row {
+        return self.stepSelecting(prefix, position, stats_request, dispatch, null);
+    }
+
+    pub fn stepSelecting(self: *Decoder, prefix: []const i64, position: usize, stats_request: ?Native.StatsRequest, dispatch: anytype, token_policy: ?stages.FinalTokenPolicy) !Row {
         if (position >= prefix.len) return error.InvalidDecoderPosition;
-        if (self.full_prefix == null) return self.stepSuffix(.{ .position = position, .tokens = prefix[position..] }, stats_request, dispatch);
-        return self.stepFullPrefix(prefix, dispatch);
+        if (self.full_prefix == null) return self.stepSuffixSelecting(.{ .position = position, .tokens = prefix[position..] }, stats_request, dispatch, token_policy);
+        return self.stepFullPrefixSelecting(prefix, dispatch, token_policy);
     }
 
     pub fn stepFullPrefix(self: *Decoder, prefix: []const i64, dispatch: anytype) !Row {

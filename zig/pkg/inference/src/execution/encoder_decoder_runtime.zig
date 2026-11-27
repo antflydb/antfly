@@ -420,7 +420,7 @@ pub fn residentVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Ses
     return (try residentVocabularyResult(allocator, decoder, outputs, logits_index, query_rows, vocab, control, published, null)).row;
 }
 
-fn residentVocabularyResult(allocator: std.mem.Allocator, decoder: backends.Session, outputs: *const session_mod.ResidentOutputs, logits_index: usize, query_rows: usize, vocab: usize, control: ?Control, published: bool, token_policy: ?FinalTokenPolicy) !VocabularyResult {
+pub fn residentVocabularyResult(allocator: std.mem.Allocator, decoder: backends.Session, outputs: *const session_mod.ResidentOutputs, logits_index: usize, query_rows: usize, vocab: usize, control: ?Control, published: bool, token_policy: ?FinalTokenPolicy) !VocabularyResult {
     if (query_rows == 0 or vocab == 0 or logits_index >= outputs.outputs.len) return error.InvalidDecoderOutput;
     const expected = [_]i64{
         1,
