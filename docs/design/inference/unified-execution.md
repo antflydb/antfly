@@ -2365,3 +2365,14 @@ zero skips. The normal reader entrypoint matched the host reference and
 recorded a four-byte token download. These fixtures establish correctness
 and transfer behavior. Reader latency and throughput require timed serving
 comparisons.
+
+At `5bba7cd4c4` on Spark GB10, 33 of 34 CUDA checks passed on the
+first run. The packeted head rejected a full-width write into a
+smaller admitted bank before processing the correctly sized packets.
+The released LightOnOCR HTTP test replayed two rows with a 44-byte
+pinned receipt and 297,216 bytes of declared attention scratch. The
+first run skipped T5-small because its fixture variable was unset.
+The single skipped test passed on the same binary with the merged
+decoder from the shared model directory. The two log hashes are
+`fddd106a76d18bd4260797c29fa5f3199875dac2d322da52e0dd43384a8ba8ad`
+and `84f6f35907e6ca826ce5dc74297f2371fc4e38293e2227951dc18ff8779c5677`.
