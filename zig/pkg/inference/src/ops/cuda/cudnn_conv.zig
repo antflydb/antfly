@@ -256,6 +256,30 @@ pub const Plan = struct {
 };
 
 pub const Buffer = struct { ptr: usize = 0, bytes: usize = 0 };
+/// Explicit input, weight, output and bias packs surrounding the SDK workspace.
+pub const SourceWorkspace = struct {
+    const Span = @import("buffer.zig").ByteSpan;
+    const alignment = @import("buffer.zig").DeviceBuffer.allocation_alignment;
+    input: Span,
+    weight: Span,
+    output: Span,
+    bias: Span,
+    vendor: Span,
+    bytes: usize,
+
+    pub fn resolve(input: usize, weight: usize, output: usize, bias: usize, vendor: usize) !SourceWorkspace {
+        var cursor: usize = 0;
+        return .{
+            .input = try Span.append(&cursor, input, alignment),
+            .weight = try Span.append(&cursor, weight, alignment),
+            .output = try Span.append(&cursor, output, alignment),
+            .bias = try Span.append(&cursor, bias, alignment),
+            .vendor = try Span.append(&cursor, vendor, alignment),
+            .bytes = try Span.alignedEnd(cursor, alignment),
+        };
+    }
+};
+
 pub const Bindings = struct {
     input: Buffer,
     weight: Buffer,
@@ -859,4 +883,15 @@ test "CUDA backend convolution BF16 NCHW primitive preserves center filters tail
     try std.testing.expectEqual(@as(usize, 1), module.graph_calls);
     try std.testing.expectEqual(@as(usize, 1), module.bf16_calls);
     try std.testing.expectEqual(@as(usize, 1), module.bias_calls);
+}
+
+test "source convolution separates pack storage and SDK workspace at CUDA alignment" {
+    const layout = try SourceWorkspace.resolve(18, 36, 24, 0, 513);
+    try std.testing.expectEqual(@as(usize, 0), layout.input.offset);
+    try std.testing.expectEqual(@as(usize, 256), layout.weight.offset);
+    try std.testing.expectEqual(@as(usize, 512), layout.output.offset);
+    try std.testing.expectEqual(@as(usize, 0), layout.bias.bytes);
+    try std.testing.expectEqual(@as(usize, 768), layout.vendor.offset);
+    try std.testing.expectEqual(@as(usize, 1536), layout.bytes);
+    try std.testing.expectError(error.Overflow, SourceWorkspace.resolve(std.math.maxInt(usize), 1, 1, 0, 0));
 }

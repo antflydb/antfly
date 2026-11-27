@@ -140,7 +140,21 @@ pub const MappedHostBuffer = struct {
 };
 
 /// Byte range relative to a planned device allocation.
-pub const ByteSpan = struct { offset: usize = 0, bytes: usize = 0 };
+pub const ByteSpan = struct {
+    offset: usize = 0,
+    bytes: usize = 0,
+
+    pub fn append(cursor: *usize, bytes: usize, comptime alignment: usize) !ByteSpan {
+        const offset = try alignedEnd(cursor.*, alignment);
+        cursor.* = try std.math.add(usize, offset, bytes);
+        return .{ .offset = offset, .bytes = bytes };
+    }
+
+    pub fn alignedEnd(bytes: usize, comptime alignment: usize) !usize {
+        const padded = try std.math.add(usize, bytes, alignment - 1);
+        return std.mem.alignBackward(usize, padded, alignment);
+    }
+};
 
 pub const DeviceBuffer = struct {
     pub const Purpose = @import("allocation_budget.zig").OwnedPurpose;

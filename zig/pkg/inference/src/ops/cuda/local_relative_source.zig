@@ -41,10 +41,7 @@ pub const Plan = struct {
         return std.math.mul(usize, a, b);
     }
     fn append(cursor: *usize, elements: usize) !Span {
-        const start = std.mem.alignBackward(usize, try std.math.add(usize, cursor.*, 255), 256);
-        const bytes = try mul(elements, 4);
-        cursor.* = try std.math.add(usize, start, bytes);
-        return .{ .offset = start, .bytes = bytes };
+        return Span.append(cursor, try mul(elements, 4), 256);
     }
     pub fn resolve(rows: usize, heads: usize, dim: usize, chunk: usize, context: usize, relative: usize) !Plan {
         if (rows == 0 or heads == 0 or dim == 0 or chunk == 0 or relative < 2 or context > 24 or

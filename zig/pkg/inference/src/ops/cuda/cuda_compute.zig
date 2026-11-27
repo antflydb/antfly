@@ -15518,14 +15518,12 @@ const DebertaMaterializedWorkspaceLayout = struct {
 };
 
 fn alignDebertaWorkspaceOffset(value: usize) !usize {
-    const padded = try checkedAdd(value, deberta_materialized_workspace_alignment - 1);
-    return padded & ~(deberta_materialized_workspace_alignment - 1);
+    return buffer_mod.ByteSpan.alignedEnd(value, deberta_materialized_workspace_alignment) catch error.InvalidShape;
 }
 
 fn appendDebertaWorkspaceRegion(cursor: *usize, bytes: usize) !usize {
-    const offset = try alignDebertaWorkspaceOffset(cursor.*);
-    cursor.* = try checkedAdd(offset, bytes);
-    return offset;
+    const span = buffer_mod.ByteSpan.append(cursor, bytes, deberta_materialized_workspace_alignment) catch return error.InvalidShape;
+    return span.offset;
 }
 
 fn debertaMaterializedWorkspaceLayout(
@@ -22570,25 +22568,21 @@ fn sourceConvolutionF32(self: *CudaCompute, value: @FieldType(ops.Bf16SourceOper
     const input = try sourceScalarTensor(value.input, input_count);
     const weight = try sourceScalarTensor(value.weight, weight_count);
     const bias = if (value.bias) |tensor| try sourceScalarTensor(tensor, key.outputs) else null;
-    var bytes: usize = 0;
-    const x_bytes = try checkedMul(input_count, 2);
-    const w_bytes = try checkedMul(weight_count, 2);
-    const y_bytes = try checkedMul(count, 2);
-    const b_bytes = if (bias != null) try checkedMul(key.outputs, 2) else 0;
-    const x_offset = try appendDebertaWorkspaceRegion(&bytes, x_bytes);
-    const w_offset = try appendDebertaWorkspaceRegion(&bytes, w_bytes);
-    const y_offset = try appendDebertaWorkspaceRegion(&bytes, y_bytes);
-    const b_offset = try appendDebertaWorkspaceRegion(&bytes, b_bytes);
-    const workspace_offset = try appendDebertaWorkspaceRegion(&bytes, plan.workspace_bytes);
-    bytes = try alignDebertaWorkspaceOffset(bytes);
-    if (bytes > cudaTempArenaAdmissionBudgetBytes(self)) return error.MemoryBudgetExceeded;
-    var temporary = try SourceLinearTemporary.acquireKnownCapture(self, bytes, bytes, capture);
+    const scratch = try Conv.SourceWorkspace.resolve(
+        try checkedMul(input_count, 2),
+        try checkedMul(weight_count, 2),
+        try checkedMul(count, 2),
+        if (bias != null) try checkedMul(key.outputs, 2) else 0,
+        plan.workspace_bytes,
+    );
+    if (scratch.bytes > cudaTempArenaAdmissionBudgetBytes(self)) return error.MemoryBudgetExceeded;
+    var temporary = try SourceLinearTemporary.acquireKnownCapture(self, scratch.bytes, scratch.bytes, capture);
     defer temporary.deinit(self);
-    const x = debertaWorkspaceRegion(temporary.bank, x_offset, x_bytes);
-    const w = debertaWorkspaceRegion(temporary.bank, w_offset, w_bytes);
-    const y = debertaWorkspaceRegion(temporary.bank, y_offset, y_bytes);
-    const b = debertaWorkspaceRegion(temporary.bank, b_offset, b_bytes);
-    const workspace = debertaWorkspaceRegion(temporary.bank, workspace_offset, plan.workspace_bytes);
+    const x = temporary.span(scratch.input);
+    const w = temporary.span(scratch.weight);
+    const y = temporary.span(scratch.output);
+    const b = temporary.span(scratch.bias);
+    const workspace = temporary.span(scratch.vendor);
     const bindings = Conv.Bindings{ .input = .{ .ptr = x.ptr, .bytes = x.len }, .weight = .{ .ptr = w.ptr, .bytes = w.len }, .bias = .{ .ptr = b.ptr, .bytes = b.len }, .output = .{ .ptr = y.ptr, .bytes = y.len }, .workspace = .{ .ptr = workspace.ptr, .bytes = workspace.len } };
     if (!capture and module.needsBindingRetirement(plan, bindings)) {
         try self.ctx.synchronize();
