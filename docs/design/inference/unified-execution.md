@@ -1353,6 +1353,14 @@ control. All intended pairs coalesced and greedy tokens matched.
 Serial arm medians were 6.70 and 6.58 ms. Fused medians were 9.22
 and 9.35 ms. CPU retains direct resident execution by default.
 
+On Spark GB10 at `eabbcb1bb5`, all 43 focused CUDA checks passed
+with the opt-in fused decoder head. Released LightOnOCR-3-0.8B
+replayed a two-row HTTP decode using 15,520 bytes of shared top-1
+scratch, zero standalone logits-bank bytes, and an unchanged 44-byte
+pinned receipt. The earlier capture failure at `a1b392f5bf` was
+caused by applying ordinary capture exclusion to the prebound launch.
+The comparative throughput run is separate from this correctness result.
+
 ### Issue closure audit
 
 This audit reconciles the original `2f2438e67f` implementation review
