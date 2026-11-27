@@ -4718,6 +4718,17 @@ const AudioLayerInputs = struct {
         }
         // These planes have one invocation lifetime and retain the same
         // upload, while individual kernels keep their original vector ABI.
+        if (cb.kind() == .cuda) {
+            const shape = [_]i64{@intCast(planes.len)};
+            const bank = try deviceResidentFromFloat32(cb, planes, &.{@intCast(planes.len)});
+            defer cb.free(bank);
+            const valid_ct = try cb.primSlice(bank, &.{0}, &.{@intCast(rows)}, &.{1}, &shape);
+            errdefer cb.free(valid_ct);
+            const starts_ct = try cb.primSlice(bank, &.{@intCast(rows)}, &.{@intCast(2 * rows)}, &.{1}, &shape);
+            errdefer cb.free(starts_ct);
+            const tags_ct = try cb.primSlice(bank, &.{@intCast(2 * rows)}, &shape, &.{1}, &shape);
+            return .{ .valid = valid_ct, .starts = starts_ct, .tags = tags_ct };
+        }
         const bank = try deviceResidentFromFloat32(cb, planes, &.{ @intCast(planes.len), 1 });
         defer cb.free(bank);
         const valid_ct = try segmentVector(cb, allocator, bank, 0, rows);
