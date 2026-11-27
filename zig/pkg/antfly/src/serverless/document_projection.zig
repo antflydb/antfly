@@ -237,33 +237,48 @@ pub fn parseAllocWithSourceFields(alloc: Allocator, body: []const u8, source_fie
 }
 
 fn cloneNamedEmbeddingsAlloc(alloc: Allocator, obj: std.json.ObjectMap) !?[]NamedEmbedding {
-    const named = obj.get("_embeddings") orelse return null;
-    if (named != .object) return null;
-
-    var count: usize = 0;
-    var iter = named.object.iterator();
-    while (iter.next()) |entry| {
-        if (entry.value_ptr.* == .array) count += 1;
-    }
-    if (count == 0) return null;
-
-    const out = try alloc.alloc(NamedEmbedding, count);
-    errdefer alloc.free(out);
-    var initialized: usize = 0;
+    var out = std.ArrayListUnmanaged(NamedEmbedding).empty;
     errdefer {
-        for (out[0..initialized]) |*embedding| embedding.deinit(alloc);
+        for (out.items) |*embedding| embedding.deinit(alloc);
+        out.deinit(alloc);
     }
+    if (obj.get("_embeddings")) |named| if (named == .object) {
+        var iter = named.object.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.* != .array) continue;
+            try appendNamedEmbedding(alloc, &out, entry.key_ptr.*, entry.value_ptr.array.items);
+        }
+    };
+    // Named enrichment outputs (#1791): a document vector of
+    // `_artifacts.<name>` (`{"value": [numbers]}`) is consumed by an index
+    // naming it as its `embedding_name`, like `_embeddings.<name>`.
+    if (obj.get("_artifacts")) |named| if (named == .object) {
+        var iter = named.object.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.* != .object) continue;
+            const value = entry.value_ptr.object.get("value") orelse continue;
+            if (value != .array or value.array.items.len == 0) continue;
+            switch (value.array.items[0]) {
+                .integer, .float, .number_string => {},
+                else => continue,
+            }
+            try appendNamedEmbedding(alloc, &out, entry.key_ptr.*, value.array.items);
+        }
+    };
+    if (out.items.len == 0) {
+        out.deinit(alloc);
+        return null;
+    }
+    return try out.toOwnedSlice(alloc);
+}
 
-    iter = named.object.iterator();
-    while (iter.next()) |entry| {
-        if (entry.value_ptr.* != .array) continue;
-        out[initialized] = .{
-            .name = try alloc.dupe(u8, entry.key_ptr.*),
-            .embedding = try cloneEmbeddingAlloc(alloc, entry.value_ptr.array.items),
-        };
-        initialized += 1;
-    }
-    return out;
+fn appendNamedEmbedding(alloc: Allocator, out: *std.ArrayListUnmanaged(NamedEmbedding), name: []const u8, items: []const std.json.Value) !void {
+    for (out.items) |known| if (std.mem.eql(u8, known.name, name)) return;
+    const owned_name = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned_name);
+    const embedding = try cloneEmbeddingAlloc(alloc, items);
+    errdefer alloc.free(embedding);
+    try out.append(alloc, .{ .name = owned_name, .embedding = embedding });
 }
 
 fn cloneNamedSparseEmbeddingsAlloc(alloc: Allocator, obj: std.json.ObjectMap) !?[]NamedSparseEmbedding {
@@ -615,4 +630,13 @@ test "document projection extracts rerank terms enrichment version" {
     var projection = try parseAlloc(alloc, "{\"text\":\"alpha\",\"_enrichment\":{\"rerank_terms\":true,\"rerank_terms_version\":4}}");
     defer projection.deinit(alloc);
     try std.testing.expectEqual(@as(?u32, 4), projection.rerank_terms_version);
+}
+
+test "serverless projection reads named enrichment document vectors" {
+    const alloc = std.testing.allocator;
+    var projection = try parseAlloc(alloc, "{\"body\":\"x\",\"_artifacts\":{\"body_vec\":{\"value\":[1,0,0.5]},\"notes\":{\"value\":\"n\"}},\"_embeddings\":{\"idx\":[0,1,0]}}");
+    defer projection.deinit(alloc);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0.5 }, projection.findNamedEmbedding("body_vec").?);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 1, 0 }, projection.findNamedEmbedding("idx").?);
+    try std.testing.expect(projection.findNamedEmbedding("notes") == null);
 }

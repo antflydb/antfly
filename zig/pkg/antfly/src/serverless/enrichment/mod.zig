@@ -16,6 +16,7 @@
 pub const pipeline = @import("pipeline.zig");
 pub const worker = @import("worker.zig");
 pub const operation_id = @import("operation_id.zig");
+pub const named_outputs = @import("named_outputs.zig");
 
 pub const BuiltinPipeline = pipeline.BuiltinPipeline;
 pub const StageSpec = pipeline.StageSpec;
@@ -30,6 +31,7 @@ pub const rerank_terms_enrichment_version = worker.rerank_terms_enrichment_versi
 test "serverless enrichment module compiles" {
     _ = pipeline;
     _ = worker;
+    _ = named_outputs;
     _ = BuiltinPipeline;
     _ = StageSpec;
     _ = builtinPipelineForPolicy;

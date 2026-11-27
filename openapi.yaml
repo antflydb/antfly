@@ -33538,6 +33538,16 @@ components:
           description: Number of documents successfully transformed
         failure:
           $ref: '#/components/schemas/BatchCommittedFailure'
+        seeds:
+          type: array
+          description: >
+            Per-item outcomes of the artifact seeds the batch carried, when any
+
+            did. Serverless tables and embedded databases report them; a
+
+            distributed table does not yet (plan with `validate_only`).
+          items:
+            $ref: '#/components/schemas/SeedOutcome'
     BatchCommittedFailure:
       type: object
       description: >

@@ -33,6 +33,14 @@ pub fn isReservedEntry(name: []const u8) bool {
     return local.api_index_metadata.isReservedEntry(name);
 }
 
+/// An asset with no producer and no input is maintained outside Antfly:
+/// only seeds write it (the public-config form of
+/// `enrichment_catalog.externallyMaintained`).
+pub fn externallyMaintained(cfg: EnrichmentConfig) bool {
+    return cfg.kind == .asset and cfg.producer_json.len == 0 and cfg.field.len == 0 and cfg.template.len == 0 and
+        cfg.source_artifact_name.len == 0 and cfg.prior_context == null and cfg.neighbor_context == null and cfg.context_sources_json.len == 0;
+}
+
 pub const Declarations = struct {
     configs: []EnrichmentConfig = &.{},
 

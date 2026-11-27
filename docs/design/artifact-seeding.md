@@ -413,6 +413,38 @@ levels and seeds supplied only through field mappings keep apply-time
 acceptance; mapped text and JSON assets depend on no replica-local state, while
 mapped vectors bind the replica's embedder identity.
 
+### Serverless named enrichments
+
+A serverless table declares named enrichments exactly like a distributed
+table: the reserved top-level `enrichments` array of its `indexes`
+(`indexes_json`), holding public enrichment configs. The array travels with
+the table definition through the catalog, the WAL catalog updates and the
+manifest without any persisted format change; index-walking code and index
+listings skip reserved entries. Declarations are validated with the embedded
+validator; producers that need grouped sources, prior or graph-neighbor
+context or cross-document context are refused.
+
+Serverless keeps every derived output in the document body, so named outputs
+live there in exactly the seed write shape: `_artifacts.<name>`
+(`{"value": ...}`) and `_chunks.<name>`. Each output's acceptance record is
+`_enrichment.named.<name>` (`origin` and a hex `input` digest of the
+declaration and its source value: field, template record or upstream output;
+`{"pending": true}` while a mapping waits). On every write the table batch
+(`api/http_handler.zig` `acceptNamedOutputs`, `enrichment/named_outputs.zig`):
+
+- accepts explicit seeds (a value that differs from the stored output) and
+  field-mapping seeds, under `seed_conflict` like embedded writes;
+- carries each stored output forward while its input digest still matches, so
+  unrelated edits keep seeded and generated outputs, and drops it otherwise;
+- keeps externally maintained assets unconditionally;
+- rejects undeclared names, and on a table without declarations any
+  `_artifacts`/`_chunks` member, instead of storing them as JSON.
+
+Seed transforms (`$set`/`$unset` on `_artifacts.<name>`/`_chunks.<name>`) are
+accepted. The batch response carries the per-item `seeds` outcomes. An
+embeddings index consumes a named embedding's document vectors when its
+`embedding_name` is its own name and a declared embedding enrichment.
+
 ### Late inference results
 
 Generated output that was planned before a seed was accepted or replaced must
@@ -465,5 +497,7 @@ subsystem features of their own:
   staged publication (`docs/design/media-pass.md`); origin counts on the
   distributed server's HTTP status (embedded and Lite have them).
 - Downstream consumers of externally maintained assets.
-- The serverless coordinator rejects seed paths until serverless publication
-  accepts seeds; its fixed pipelines have no named enrichments to seed.
+- Serverless generation of missing named outputs (the named-enrichment worker
+  stage), sparse named vectors and chunk-level named vectors in serverless
+  indexes, and `expected_version` on serverless seed-only transforms (they bind
+  to the body read at request time).

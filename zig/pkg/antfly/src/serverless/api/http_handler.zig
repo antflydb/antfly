@@ -72,6 +72,20 @@ const artifacts_mod = @import("../artifacts/mod.zig");
 const build_mod = @import("../build/mod.zig");
 const catalog_types = @import("../catalog/types.zig");
 const catalog_mod = @import("../catalog/mod.zig");
+const named_outputs = @import("../enrichment/named_outputs.zig");
+const local_artifact_seeds = @import("antfly_local_sources").storage_db_artifact_seeds;
+
+/// The current table batch's seed outcome sink (`handleTableBatch`).
+threadlocal var named_seed_outcomes: ?*std.ArrayListUnmanaged(local_artifact_seeds.OutcomeEntry) = null;
+
+/// Whether a body carries top-level seed members.
+fn bodyHasSeedFields(alloc: Allocator, body: []const u8) !bool {
+    if (std.mem.indexOf(u8, body, "\"_artifacts\"") == null and std.mem.indexOf(u8, body, "\"_chunks\"") == null) return false;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    return parsed.value.object.contains("_artifacts") or parsed.value.object.contains("_chunks");
+}
 const manifest_mod = @import("../manifest/mod.zig");
 const query_mod = @import("../query/mod.zig");
 const query_materializer = @import("../query/materializer.zig");
@@ -1133,6 +1147,19 @@ pub const HttpHandler = struct {
     fn handleTableBatch(self: *HttpHandler, table_name: []const u8, body: []const u8, request: api_operation.RequestContext) !HttpResponse {
         var api = self.tableApi(request.cancellation);
         api.request = request;
+        // Per-item outcomes of the named outputs this batch seeded (#1791),
+        // recorded by `acceptNamedOutputs` on this thread.
+        var outcomes = std.ArrayListUnmanaged(local_artifact_seeds.OutcomeEntry).empty;
+        defer {
+            for (outcomes.items) |entry| {
+                self.alloc.free(entry.key);
+                self.alloc.free(entry.name);
+            }
+            outcomes.deinit(self.alloc);
+        }
+        const previous_sink = named_seed_outcomes;
+        named_seed_outcomes = &outcomes;
+        defer named_seed_outcomes = previous_sink;
         var resp = try public_table_http.handleTableBatch(self.alloc, table_name, body, api);
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
@@ -1140,7 +1167,12 @@ pub const HttpHandler = struct {
                 var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                 defer arena_impl.deinit();
                 const parsed = try parseJsonResponseBody(metadata_openapi.BatchResponse, arena_impl.allocator(), resp.body);
-                break :blk try jsonResponse(self.alloc, resp.status, parsed);
+                if (outcomes.items.len == 0) break :blk try jsonResponse(self.alloc, resp.status, parsed);
+                const base = try std.json.Stringify.valueAlloc(arena_impl.allocator(), parsed, .{ .emit_null_optional_fields = false });
+                const seeds = try std.json.Stringify.valueAlloc(arena_impl.allocator(), outcomes.items, .{ .emit_null_optional_fields = false });
+                if (base.len == 0 or base[base.len - 1] != '}') break :blk try jsonResponse(self.alloc, resp.status, parsed);
+                const joined = try std.mem.concat(arena_impl.allocator(), u8, &.{ base[0 .. base.len - 1], if (base.len > 2) "," else "", "\"seeds\":", seeds, "}" });
+                break :blk try jsonSliceResponse(self.alloc, resp.status, joined);
             },
             else => if (resp.json)
                 try jsonSliceResponse(self.alloc, resp.status, resp.body)
@@ -5936,6 +5968,54 @@ pub const HttpHandler = struct {
         return output;
     }
 
+    /// Binds each upsert's named outputs (#1791): accepts its seeds, carries
+    /// outputs whose input is unchanged from the stored body, and records
+    /// the per-item outcomes for the batch response. A table without named
+    /// enrichments rejects seed fields instead of storing them as JSON.
+    fn acceptNamedOutputs(self: *HttpHandler, table_name: []const u8, namespace: []const u8, mutations: []api_types.DocumentMutation, cancellation: CancellationToken) !void {
+        var table = (try self.catalog.getTableAlloc(self.alloc, table_name)) orelse return error.NamespaceNotFound;
+        defer table.deinit(self.alloc);
+        var declarations = try catalog_mod.named_enrichments.parseAlloc(self.alloc, table.indexes_json);
+        defer declarations.deinit(self.alloc);
+        if (declarations.configs.len == 0) {
+            for (mutations) |mutation| if (mutation.body) |body| if (try bodyHasSeedFields(self.alloc, body)) return error.UnknownArtifactSeed;
+            return;
+        }
+        var live: ?*query_mod.LiveSession = null;
+        defer if (live) |session| session.deinit();
+        if (self.live_read_options) |options| {
+            var configured = options;
+            configured.cancellation = cancellation;
+            configured.io = self.io;
+            live = query_mod.LiveSession.open(self.alloc, self.query, self.api.wal, namespace, configured) catch |err| switch (err) {
+                error.HostedDocumentFactsRequired => null,
+                else => return err,
+            };
+        }
+        const latest_docs = if (live == null)
+            try self.allocLatestDocumentsAlloc(namespace)
+        else
+            try self.alloc.alloc(query_materializer.Document, 0);
+        defer query_materializer.freeDocuments(self.alloc, latest_docs);
+        for (mutations) |*mutation| {
+            try cancellation.check();
+            const body = mutation.body orelse continue;
+            if (mutation.kind != .upsert) continue;
+            const fetched = if (live) |session| try session.lookupAlloc(mutation.doc_id) else null;
+            defer if (fetched) |bytes| self.alloc.free(bytes);
+            const prior = if (live != null) fetched else findMaterializedDocumentBody(latest_docs, mutation.doc_id);
+            var accepted = try named_outputs.acceptAlloc(self.alloc, declarations, mutation.doc_id, prior, body, .keep);
+            errdefer accepted.deinit(self.alloc);
+            if (named_seed_outcomes) |sink| {
+                try sink.appendSlice(self.alloc, accepted.outcomes);
+                if (accepted.outcomes.len != 0) self.alloc.free(accepted.outcomes);
+            } else named_outputs.freeOutcomes(self.alloc, accepted.outcomes);
+            accepted.outcomes = &.{};
+            self.alloc.free(body);
+            mutation.body = accepted.body;
+        }
+    }
+
     fn resolveTableBatchMutationsAlloc(self: *HttpHandler, namespace: []const u8, req: db_types.BatchRequest, cancellation: CancellationToken) ![]api_types.DocumentMutation {
         try cancellation.check();
         var live: ?*query_mod.LiveSession = null;
@@ -5979,11 +6059,10 @@ pub const HttpHandler = struct {
             defer if (fetched) |body| self.alloc.free(body);
             const existing_body = if (live != null) fetched else findMaterializedDocumentBody(latest_docs, transform.key);
             // Reserved fields classify exactly as in the storage coalescer.
-            // Serverless publication has no artifact-seed acceptance yet, so
-            // seed paths fail visibly instead of landing as document JSON.
+            // Seed paths fold into the body as `_artifacts`/`_chunks`, then
+            // named-output acceptance binds or rejects them (#1791).
             var reserved_paths = false;
-            for (transform.operations) |operation| if (try db_transform.reservedProjectionOperation(operation)) |reserved| {
-                if (reserved.path.field != .embeddings) return error.ArtifactSeedNotAccepted;
+            for (transform.operations) |operation| if (try db_transform.reservedProjectionOperation(operation)) |_| {
                 reserved_paths = true;
             };
             const resolved = (if (reserved_paths)
@@ -6125,6 +6204,16 @@ pub const HttpHandler = struct {
             },
         };
         defer freeDocumentMutations(self.alloc, mutations);
+        self.acceptNamedOutputs(table_name, namespace, mutations, request.cancellation) catch |err| switch (err) {
+            error.InvalidArtifactSeed, error.UnknownArtifactSeed, error.ArtifactSeedMissing, error.ArtifactSeedNotAccepted, error.InvalidDocumentBody => return error.InvalidBatchRequest,
+            error.Canceled => return error.Canceled,
+            error.DeadlineExceeded => return error.DeadlineExceeded,
+            error.WalReadBudgetExceeded, error.WalVisibilityUnavailable, error.WalSnapshotExpired => return error.Backpressured,
+            else => {
+                std.log.err("serverless named output acceptance failed table={s} namespace={s} err={}", .{ table_name, namespace, err });
+                return error.InternalFailure;
+            },
+        };
 
         request.ensureActive() catch |err| return if (err == error.DeadlineExceeded) error.DeadlineExceeded else if (err == error.Canceled) error.Canceled else error.InternalFailure;
         const timestamp = currentTimeNs();
@@ -9956,14 +10045,12 @@ fn validateServerlessIndexCatalog(alloc: Allocator, indexes_json: []const u8) !v
     defer parsed.deinit();
 
     // Named enrichments (#1791) are validated as a whole.
-    {
-        var declarations = catalog_mod.named_enrichments.parseAlloc(alloc, indexes_json) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            error.UnsupportedServerlessEnrichment => return err,
-            else => return error.InvalidServerlessEnrichment,
-        };
-        declarations.deinit(alloc);
-    }
+    var declarations = catalog_mod.named_enrichments.parseAlloc(alloc, indexes_json) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.UnsupportedServerlessEnrichment => return err,
+        else => return error.InvalidServerlessEnrichment,
+    };
+    defer declarations.deinit(alloc);
     var graph_count: usize = 0;
     var it = parsed.value.map.iterator();
     while (it.next()) |entry| {
@@ -9977,7 +10064,7 @@ fn validateServerlessIndexCatalog(alloc: Allocator, indexes_json: []const u8) !v
         else
             "full_text";
 
-        if (try serverlessIndexUsesArtifactSources(kind, entry.value_ptr.*)) {
+        if (try serverlessIndexUsesArtifactSources(kind, entry.value_ptr.*) and !consumesNamedEmbedding(declarations, kind, entry.key_ptr.*, entry.value_ptr.*)) {
             return error.UnsupportedServerlessArtifactIndexSources;
         }
 
@@ -10006,6 +10093,18 @@ fn validateServerlessIndexCatalog(alloc: Allocator, indexes_json: []const u8) !v
     if (graph_count > 1) {
         return error.UnsupportedCreateTableRequest;
     }
+}
+
+/// An embeddings index consumes a named embedding enrichment's document
+/// vectors (`_artifacts.<name>`) when its `embedding_name` is its own name
+/// and a declared embedding enrichment (#1791).
+fn consumesNamedEmbedding(declarations: catalog_mod.named_enrichments.Declarations, kind: []const u8, index_name: []const u8, config: std.json.Value) bool {
+    if (!std.mem.eql(u8, kind, "embeddings") or config != .object) return false;
+    if (config.object.get("sources") != null or config.object.get("source_artifact_name") != null) return false;
+    const name = config.object.get("embedding_name") orelse return false;
+    if (name != .string or !std.mem.eql(u8, name.string, index_name)) return false;
+    const declared = declarations.find(name.string) orelse return false;
+    return declared.kind == .embedding;
 }
 
 fn serverlessIndexUsesArtifactSources(kind: []const u8, config: std.json.Value) !bool {
@@ -12864,6 +12963,13 @@ test "serverless index catalog validation admits named enrichment declarations" 
         \\{"enrichments":[{"name":"x","kind":"asset","field":"body","neighbor_context":{"graph_index":"g"},"producer":{"type":"generator","config":{"provider":"antfly","model":"g"}}}]}
     ));
     try @import("../catalog/storage_capabilities.zig").requireDefinition(alloc, "", "{}", "{\"enrichments\":[{\"name\":\"notes\",\"kind\":\"asset\"}]}");
+    // An embeddings index consumes a declared embedding of its own name.
+    try validateServerlessIndexCatalog(alloc,
+        \\{"body_vec":{"type":"embeddings","dimension":3,"embedding_name":"body_vec"},"enrichments":[{"name":"body_vec","kind":"embedding","field":"body","expected_dims":3}]}
+    );
+    try std.testing.expectError(error.UnsupportedServerlessArtifactIndexSources, validateServerlessIndexCatalog(alloc,
+        \\{"other":{"type":"embeddings","dimension":3,"embedding_name":"body_vec"},"enrichments":[{"name":"body_vec","kind":"embedding","field":"body","expected_dims":3}]}
+    ));
 }
 
 test "serverless index catalog validation rejects malformed configs" {
@@ -13967,6 +14073,93 @@ test "http handler resolves table routes through persisted serving namespace map
     try std.testing.expectEqualStrings("docs", parsed_query_published.value.table_name);
     try std.testing.expectEqual(@as(usize, 1), parsed_query_published.value.documents.len);
     try std.testing.expectEqualStrings("doc-a", parsed_query_published.value.documents[0].doc_id);
+}
+
+test "http handler accepts named enrichment seeds on serverless table batches" {
+    const alloc = std.testing.allocator;
+    var artifact_root_buf: [256]u8 = undefined;
+    var manifest_root_buf: [256]u8 = undefined;
+    var wal_root_buf: [256]u8 = undefined;
+    var catalog_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "artifacts-named-seeds");
+    const manifest_root = tmpPath(&manifest_root_buf, "manifests-named-seeds");
+    const wal_root = tmpPath(&wal_root_buf, "wal-named-seeds");
+    const catalog_root = tmpPath(&catalog_root_buf, "catalog-named-seeds");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(manifest_root);
+    defer cleanupTmp(wal_root);
+    defer cleanupTmp(catalog_root);
+    var fs_artifacts = try @import("../artifacts/mod.zig").FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+    var fs_manifests = try manifest_mod.FsStore.init(alloc, std.mem.span(manifest_root));
+    var manifest_store = fs_manifests.manifestStore();
+    defer manifest_store.deinit();
+    var fs_progress = try @import("../catalog/fs_progress_store.zig").FsProgressStore.init(alloc, std.mem.span(manifest_root));
+    var progress_store = fs_progress.progressStore();
+    defer progress_store.deinit();
+    var fs_wal = try @import("../wal/mod.zig").FsStore.init(alloc, std.mem.span(wal_root));
+    var wal_store = fs_wal.walStore();
+    defer wal_store.deinit();
+    var fs_catalog = try @import("../catalog/fs_store.zig").FsStore.init(alloc, std.mem.span(catalog_root));
+    var catalog_store = fs_catalog.catalogStore();
+    defer catalog_store.deinit();
+    var builder = build_mod.Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+    var api = api_service.Service.init(alloc, &wal_store, &builder);
+    var catalog = catalog_mod.CatalogService.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store, &builder, &catalog_store);
+    defer catalog.deinit();
+    var query = query_mod.QueryRuntime.init(alloc, &artifact_store, &manifest_store, &progress_store);
+    defer query.deinit();
+    var runtime_status = api_types.RuntimeStatusResult{ .role = .combined, .tick_interval_ms = 1, .validated = true, .targets = try alloc.alloc(api_types.RuntimeStorageTarget, 0) };
+    defer runtime_status.deinit(alloc);
+    var handler = HttpHandler.init(alloc, &api, &catalog, &manifest_store, &progress_store, &query, &runtime_status);
+
+    var plain = try handler.handle(.{ .method = .put, .path = "/tables/plain", .body = "{\"created_at_ns\":1}" });
+    defer plain.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), plain.status);
+    // Without declarations, seed members fail instead of landing as JSON.
+    var undeclared = try handler.handle(.{ .method = .post, .path = "/tables/plain/batch", .body = "{\"inserts\":{\"doc:a\":{\"body\":\"x\",\"_artifacts\":{\"notes\":{\"value\":\"n\"}}}}}" });
+    defer undeclared.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), undeclared.status);
+
+    var create = try handler.handle(.{ .method = .put, .path = "/tables/docs", .body =
+        \\{"created_at_ns":2,"indexes":{"enrichments":[{"name":"notes","kind":"asset","content_type":"text/plain"},{"name":"passages","kind":"chunk","field":"body","chunk_size":64}]}}
+    });
+    defer create.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), create.status);
+    var seeded = try handler.handle(.{ .method = .post, .path = "/tables/docs/batch", .body =
+        \\{"inserts":{"doc:a":{"body":"alpha beta","_artifacts":{"notes":{"value":"n"}},"_chunks":{"passages":[{"_chunk_id":0,"_content":"alpha beta"}]}}}}
+    });
+    defer seeded.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), seeded.status);
+    try std.testing.expect(std.mem.indexOf(u8, seeded.body, "\"seeds\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seeded.body, "\"name\":\"passages\",\"outcome\":\"accepted\"") != null);
+
+    // An unrelated edit keeps both outputs; a seed transform replaces the
+    // external note without expected_version.
+    var edited = try handler.handle(.{ .method = .post, .path = "/tables/docs/batch", .body =
+        \\{"inserts":{"doc:a":{"body":"alpha beta","title":"t"}},"transforms":[]}
+    });
+    defer edited.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), edited.status);
+    var transformed = try handler.handle(.{ .method = .post, .path = "/tables/docs/batch", .body =
+        \\{"transforms":[{"key":"doc:a","operations":[{"op":"$set","path":"_artifacts.notes","value":{"value":"edited"}}]}]}
+    });
+    defer transformed.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), transformed.status);
+    try std.testing.expect(std.mem.indexOf(u8, transformed.body, "\"name\":\"notes\",\"outcome\":\"replaced\"") != null);
+
+    const namespace = try catalog.resolveTableNamespaceAlloc("docs");
+    defer alloc.free(namespace);
+    const latest = try handler.allocLatestDocumentsAlloc(namespace);
+    defer query_materializer.freeDocuments(alloc, latest);
+    const stored = findMaterializedDocumentBody(latest, "doc:a").?;
+    for ([_][]const u8{ "alpha beta", "\"title\":\"t\"", "edited", "\"_chunk_id\":0", "\"origin\":\"seeded\"" }) |expected| {
+        if (std.mem.indexOf(u8, stored, expected) == null) {
+            std.debug.print("stored {s} lacks {s}\n", .{ stored, expected });
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 test "http handler honors public serverless sync levels on table batch writes" {

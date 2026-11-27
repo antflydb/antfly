@@ -12324,6 +12324,12 @@ export interface components {
             /** @description Number of documents successfully transformed */
             transformed?: number;
             failure?: components["schemas"]["BatchCommittedFailure"];
+            /**
+             * @description Per-item outcomes of the artifact seeds the batch carried, when any
+             *     did. Serverless tables and embedded databases report them; a
+             *     distributed table does not yet (plan with `validate_only`).
+             */
+            seeds?: components["schemas"]["SeedOutcome"][];
         };
         /**
          * @description Additive details for a committed batch that needs operator action. The

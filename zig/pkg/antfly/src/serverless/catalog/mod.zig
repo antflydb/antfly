@@ -53,6 +53,7 @@ test "serverless catalog module compiles" {
     _ = fs_progress_store;
     _ = remote_progress_store;
     _ = service;
+    _ = named_enrichments;
     _ = NamespaceRecord;
     _ = TableNamespaceRecord;
     _ = DefaultQueryView;

@@ -273,6 +273,20 @@ pub fn normalizeTableDefinitionIndexesValueAlloc(alloc: std.mem.Allocator, value
 
     var it = object.iterator();
     while (it.next()) |entry| {
+        // Table-level enrichment declarations ride beside the indexes as the
+        // reserved `enrichments` array (validated by the table's runtime).
+        // Other reserved entries are private control state.
+        if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) {
+            if (entry.value_ptr.* != .array) return error.InvalidCreateTableRequest;
+            const canonical = try @import("antfly_local_sources").storage_db_document_content_hash.canonicalJsonValueAlloc(alloc, entry.value_ptr.*);
+            defer alloc.free(canonical);
+            if (!first) try out.append(alloc, ',');
+            first = false;
+            try appendJsonString(alloc, &out, entry.key_ptr.*);
+            try out.append(alloc, ':');
+            try out.appendSlice(alloc, canonical);
+            continue;
+        }
         if (entry.value_ptr.* != .object) return error.InvalidCreateTableRequest;
         const index_type = extractPublicIndexType(entry.value_ptr.object) orelse "full_text";
         const is_full_text = isPublicFullTextType(index_type);

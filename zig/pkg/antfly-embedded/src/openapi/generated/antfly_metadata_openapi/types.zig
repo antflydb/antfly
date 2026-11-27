@@ -1978,6 +1978,8 @@ pub const BatchResponse = struct {
     /// Number of documents successfully transformed
     transformed: ?i64 = null,
     failure: ?BatchCommittedFailure = null,
+    /// Per-item outcomes of the artifact seeds the batch carried, when any did. Serverless tables and embedded databases report them; a distributed table does not yet (plan with `validate_only`).
+    seeds: ?[]const SeedOutcome = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -1986,6 +1988,7 @@ pub const BatchResponse = struct {
         .{ "deleted", "deleted", true },
         .{ "transformed", "transformed", true },
         .{ "failure", "failure", true },
+        .{ "seeds", "seeds", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -2016,6 +2019,10 @@ pub const BatchResponse = struct {
         }
         if (self.failure) |value| {
             try jw.objectField("failure");
+            try jw.write(value);
+        }
+        if (self.seeds) |value| {
+            try jw.objectField("seeds");
             try jw.write(value);
         }
         try jw.endObject();
