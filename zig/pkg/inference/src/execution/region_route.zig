@@ -106,6 +106,8 @@ pub const Validate = struct {
     /// Present only after pre-admission stabilization. Cache availability may
     /// change while this invocation's exact pinned payload remains usable.
     payload_claim: ?*const PayloadClaim = null,
+    /// Actual receiving Frame operation. Cold planning never supplies this.
+    operation: ?@import("backend_operation.zig").Borrowed = null,
 };
 pub const Assigned = struct {
     tensor: ops.CT,
@@ -118,6 +120,9 @@ pub const Invocation = struct {
     workspace: ?ops.CT = null,
     host_workspace: []u8 = &.{},
     prepared_resources: ?*const AssignedResources = null,
+    /// Optional persistent destination for the K/V members of a row QKV.
+    /// Only an explicit provider callback can consume this capability.
+    qkv_cache_row: ?@import("../ops/kernel_backend.zig").QkvCacheRow = null,
 };
 
 pub const AssignedResources = struct {
@@ -137,11 +142,15 @@ pub const Owned = struct {
     /// substitute for this ownership boundary in a replacement proof.
     covered_nodes: []const NodeId,
     input_nodes: []const NodeId,
+    /// Graph constants encoded directly in the prepared kernel arguments.
+    literal_nodes: []const NodeId = &.{},
     entry_node: NodeId,
     requirements: Requirements,
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// Exact external operand consumed exclusively through pinned provider slots.
+        pinned_input: ?*const fn (*anyopaque, usize, kernel.Binding) bool = null,
         /// Metadata-only. Includes input layout/storage/version and all static
         /// backend profile facts that selected the original tuned schedule.
         matches: *const fn (*anyopaque, Validate) bool,
@@ -156,6 +165,7 @@ pub const Owned = struct {
         /// Runs the same tuned implementation selected by this owner. An error
         /// is committed/uncertain and always propagates; it never means decline.
         dispatch: *const fn (*anyopaque, Invocation) anyerror!Outcome,
+        dispatch_qkv_cache_row: ?*const fn (*anyopaque, Invocation) anyerror!Outcome = null,
         deinit: *const fn (*anyopaque) void,
     };
 
@@ -213,7 +223,11 @@ pub const Owned = struct {
         try self.validate(request.validation);
         try self.validateAssigned(request);
         if (request.prepared_resources) |resources| try resources.validate(resources.context, request);
-        const outcome = try self.vtable.dispatch(self.context, request);
+        const apply = if (request.qkv_cache_row != null)
+            self.vtable.dispatch_qkv_cache_row orelse return error.UnsupportedDenseSchedule
+        else
+            self.vtable.dispatch;
+        const outcome = try apply(self.context, request);
         if (outcome == .declined_before_submission and self.requirements.replacementEligible()) return error.PreparedRegionDeclined;
         return outcome;
     }
@@ -256,6 +270,7 @@ pub const Prepare = struct {
     last_use: []const u32,
     partition_index: u32,
     partition_nodes: []const NodeId,
+    deferral_analysis: ?*?@import("region_schedule.zig").DeferralAnalysis = null,
     /// Indexed by graph NodeId. Unknown/unbacked planned representations never
     /// establish a cached immutable source or cold-upload credit.
     node_facts: []const kernel.Binding,

@@ -17,13 +17,13 @@
 //! Opaque model/vendor envelopes and request IO retain independent protection.
 const std = @import("std");
 const physical = @import("physical_buffers.zig");
-const buffers = @import("../graph/buffer_plan.zig");
+const buffers = @import("buffer_plan.zig");
 const route = @import("kernel_route.zig");
 const ownership = @import("storage_ownership.zig");
 const ops = @import("../ops/ops.zig");
 const native = @import("../ops/native_compute.zig");
 const ml = @import("ml");
-pub const Reason = enum { no_selected_routes, execution_path, backend_region, transfer, input_representation, literal, alias, output_publication, operation, workspace };
+pub const Reason = enum { no_selected_routes, execution_path, backend_region, deferred_producer, transfer, input_representation, literal, alias, output_publication, operation, workspace, opaque_workspace };
 pub const Complete = struct { accounting_class: enum { host, device } = .host, epoch: u64, operations: usize = 0, aliases: usize = 0, literals: usize = 0 };
 pub const Coverage = union(enum) { compatibility: Reason, complete: Complete };
 
@@ -132,10 +132,11 @@ fn literalIndex(pool: *const physical.Pool, slot: buffers.LogicalSlot) ?usize {
     if (index == ml.graph.null_node or index >= store.literals.len or index >= selected.literal_enabled.len or !selected.literal_enabled[index]) return null;
     const item = store.literals[index];
     const bytes = logicalBytes(item.shape) orelse return null;
-    if (item.node != slot.node_id or !item.shape.eq(slot.desc.shape) or item.data.len != bytes / 4 or item.backend_index >= pool.backends.len or item.backend_index >= store.backends.len) return null;
+    if (item.node != slot.node_id or !item.shape.eq(slot.desc.shape) or item.data.len != bytes or item.backend_index >= pool.backends.len or item.backend_index >= store.backends.len) return null;
     const backend = pool.backends[item.backend_index];
     const owner = store.backends[item.backend_index];
     if (!canonical(backend) or owner.ptr != backend.ptr or owner.vtable != backend.vtable or !allocation(pool, item.allocation, bytes, .constant_binding)) return null;
+    if (pool.plan.allocations[item.allocation].alignment < item.shape.dtype.byteSize()) return null;
     return index;
 }
 fn publication(pool: *const physical.Pool, slot: buffers.LogicalSlot, index: usize) bool {
@@ -144,7 +145,7 @@ fn publication(pool: *const physical.Pool, slot: buffers.LogicalSlot, index: usi
     const copy = store.publications[slot.node_id] orelse return false;
     const item = store.literals[index];
     const bytes = logicalBytes(item.shape) orelse return false;
-    return copy.node == slot.node_id and copy.literal == index and copy.shape.eq(slot.desc.shape) and copy.allocation != item.allocation and allocation(pool, copy.allocation, bytes, .tensor) and !pool.plan.allocations[copy.allocation].reusable;
+    return copy.node == slot.node_id and copy.literal == index and copy.shape.eq(slot.desc.shape) and copy.allocation != item.allocation and allocation(pool, copy.allocation, bytes, .tensor) and !pool.plan.allocations[copy.allocation].reusable and pool.plan.allocations[copy.allocation].alignment >= item.shape.dtype.byteSize();
 }
 fn resources(pool: *const physical.Pool, kernel: physical.KernelPlan, owned: route.Owned) bool {
     const needed = owned.requirements;
@@ -165,7 +166,7 @@ fn resources(pool: *const physical.Pool, kernel: physical.KernelPlan, owned: rou
     return count == needed.auxiliaries.count;
 }
 
-fn nativeInputPlan(pool: *const physical.Pool, plan: anytype, target: ops.ComputeBackend) bool {
+pub fn nativeInputPlan(pool: *const physical.Pool, plan: anytype, target: ops.ComputeBackend) bool {
     const selected = if (pool.selection) |*value| value else return false;
     if (plan.backend_index >= pool.backends.len or plan.epoch != selected.epoch or plan.requirements.host_bytes != 0 or plan.requirements.host_backing_bytes != 0) return false;
     const backend = pool.backends[plan.backend_index];
@@ -182,94 +183,140 @@ fn nativeInputPlan(pool: *const physical.Pool, plan: anytype, target: ops.Comput
     return current.eql(plan.requirements) and backend.vtable.kernels.?.createHostInput != null;
 }
 
+pub fn kernelOutputMatches(kernel: physical.KernelPlan, owned: route.Owned, backend: ops.ComputeBackend, slot: buffers.LogicalSlot, bytes: usize) bool {
+    return owned.implementation.context == backend.ptr and owned.implementation.table == @as(*const anyopaque, @ptrCast(backend.vtable)) and
+        kernel.output_allocation == slot.allocation and kernel.descriptor.output_shape.eq(slot.desc.shape) and owned.requirements.primary_bytes >= bytes;
+}
+
+pub fn kernelInputsMatch(graph: *const ml.graph.Graph, reachable: []const bool, node: ml.graph.NodeId, kernel: physical.KernelPlan) bool {
+    const expected_inputs = graph.node(node).getInputs();
+    if (kernel.descriptor.input_count != expected_inputs.len or expected_inputs.len > kernel.inputs.len) return false;
+    for (kernel.inputs[0..expected_inputs.len], expected_inputs, 0..) |actual, expected, index| {
+        if (actual != expected or expected >= reachable.len or !reachable[expected] or !kernel.descriptor.input_shapes[index].eq(graph.node(expected).output_shape)) return false;
+    }
+    return true;
+}
+
+/// Every requested output must survive the selected schedule. Region
+/// intermediates have logical graph slots but only declared publications
+/// escape the region's storage.
+pub fn outputsArePublished(pool: *const physical.Pool, graph: *const ml.graph.Graph, reachable: []const bool) bool {
+    for (graph.outputs.items) |id| {
+        if (id >= reachable.len or !reachable[id]) return false;
+        if (pool.regionForNode(id)) |region| {
+            for (region.outputs) |output| {
+                if (output.slot.node == id) break;
+            } else return false;
+        }
+        const slot = pool.plan.slotForNode(id) orelse return false;
+        if (!slot.roles.graph_output) return false;
+    }
+    return graph.outputs.items.len != 0;
+}
+
 pub fn assess(pool: *const physical.Pool) Coverage {
     const selected = if (pool.selection) |*value| value else return .{ .compatibility = .no_selected_routes };
     const target_backend = pool.coverage_backend orelse return .{ .compatibility = .execution_path };
-    if (@import("cuda_owned_coverage.zig").services(target_backend) != null) return @import("cuda_owned_coverage.zig").assess(pool, target_backend, null);
+    if (@import("device_owned_coverage.zig").cudaServices(target_backend) != null) return @import("device_owned_coverage.zig").assess(pool, target_backend, null);
     if (!canonical(target_backend)) return .{ .compatibility = .execution_path };
     const graph = pool.coverage_graph orelse return .{ .compatibility = .execution_path };
     const reachable = pool.coverage_reachable orelse return .{ .compatibility = .execution_path };
     if (!pool.native_frame_dispatch or reachable.len != graph.nodeCount() or pool.plan.node_slots.len != graph.nodeCount() or graph.outputs.items.len == 0) return .{ .compatibility = .execution_path };
     if (pool.plan.transfers.len != 0) return .{ .compatibility = .transfer };
-    for (pool.host_input_plans) |plan| if (!nativeInputPlan(pool, plan, target_backend)) return .{ .compatibility = .input_representation };
-    var borrowed = false;
-    for (pool.host_input_plans) |input| borrowed = borrowed or input.borrowed;
-    if (borrowed) {
-        if (pool.regions.len != 0) return .{ .compatibility = .backend_region };
-        for (pool.host_input_plans) |input| if (!input.borrowed) return .{ .compatibility = .input_representation };
-    }
     var result = Complete{ .epoch = selected.epoch };
+    if (assessNativeNodes(pool, graph, reachable, target_backend, .whole, &result)) |reason| return .{ .compatibility = reason };
+    if (!outputsArePublished(pool, graph, reachable)) return .{ .compatibility = .output_publication };
+    return .{ .complete = result };
+}
+
+pub const NodeScope = enum { whole, provider };
+
+/// Prove Native input representations, literals, aliases and assigned nodes.
+/// Schedule ownership and final output publication are checked by the caller.
+pub fn assessNativeNodes(pool: *const physical.Pool, graph: *const ml.graph.Graph, reachable: []const bool, target_backend: ops.ComputeBackend, scope: NodeScope, result: *Complete) ?Reason {
+    const selected = if (pool.selection) |*value| value else return .no_selected_routes;
+    var borrowed = false;
+    var uploaded = false;
+    for (pool.host_input_plans) |plan| {
+        const slot = pool.plan.slotForNode(plan.node) orelse return .input_representation;
+        if (scope == .provider and slot.backend != .native) continue;
+        if (!nativeInputPlan(pool, plan, target_backend)) return .input_representation;
+        borrowed = borrowed or plan.borrowed;
+        uploaded = uploaded or !plan.borrowed;
+    }
+    if (borrowed and scope == .provider) return .input_representation;
+    if (borrowed and pool.regions.len != 0) return .backend_region;
+    if (borrowed and uploaded) return .input_representation;
     for (reachable, 0..) |executed, id| {
         if (!executed) continue;
-        const slot = (pool.plan.slotForNode(@intCast(id)) orelse return .{ .compatibility = .operation }).*;
-        if (slot.node_id != id or slot.id >= pool.plan.slots.len or slot.id != pool.plan.node_slots[id] or slot.backend != .native) return .{ .compatibility = .backend_region };
-        const bytes = logicalBytes(slot.desc.shape) orelse return .{ .compatibility = .input_representation };
+        const slot = (pool.plan.slotForNode(@intCast(id)) orelse return .operation).*;
+        if (slot.node_id != id or slot.id >= pool.plan.slots.len or slot.id != pool.plan.node_slots[id]) return .backend_region;
+        if (slot.backend != .native) {
+            if (scope == .whole) return .backend_region;
+            continue;
+        }
+        const bytes = logicalBytes(slot.desc.shape) orelse return .input_representation;
         const node = graph.node(@intCast(id));
-        if (!slot.desc.shape.eq(node.output_shape)) return .{ .compatibility = .operation };
+        if (!slot.desc.shape.eq(node.output_shape)) return .operation;
         switch (slot.kind) {
+            .region_internal => return .operation,
             .runtime_input => {
-                if (node.op != .parameter) return .{ .compatibility = .input_representation };
-                if (slot.roles.graph_output) return .{ .compatibility = .output_publication };
+                if (node.op != .parameter) return .input_representation;
+                if (slot.roles.graph_output) return .output_publication;
                 var binding: route.Binding = .unknown;
                 if (selected.inputs.find(@intCast(id))) |known| binding = known else if (pool.immutable_bindings) |immutable| if (immutable.find(@intCast(id))) |known| {
                     binding = known;
                 };
-                if (!inputKnown(pool, @intCast(id), binding, slot.desc.shape, target_backend)) return .{ .compatibility = .input_representation };
+                if (!inputKnown(pool, @intCast(id), binding, slot.desc.shape, target_backend)) return .input_representation;
             },
             .constant => {
-                if (node.op != .constant or literalIndex(pool, slot) == null) return .{ .compatibility = .literal };
-                if (slot.roles.graph_output and !publication(pool, slot, literalIndex(pool, slot).?)) return .{ .compatibility = .output_publication };
+                if (node.op != .constant or literalIndex(pool, slot) == null) return .literal;
+                if (slot.roles.graph_output and !publication(pool, slot, literalIndex(pool, slot).?)) return .output_publication;
                 result.literals += 1;
             },
             .view => {
-                if (borrowed) return .{ .compatibility = .alias };
-                if (node.num_inputs != 1 or id >= selected.plane_counts.len or selected.plane_counts[id] != 1) return .{ .compatibility = .alias };
+                if (borrowed) return .alias;
+                if (node.num_inputs != 1 or id >= selected.plane_counts.len or selected.plane_counts[id] != 1) return .alias;
                 var exact_alias = false;
                 for (pool.metadata_aliases, 0..) |alias, alias_index| if (alias.node == id and alias.source == node.inputs[0] and selected.alias_enabled[alias_index]) {
                     exact_alias = true;
                     break;
                 };
-                if (!exact_alias) return .{ .compatibility = .alias };
-                const source = slot.source_slot orelse return .{ .compatibility = .alias };
-                if (source >= pool.plan.slots.len or pool.plan.slots[source].node_id != node.inputs[0]) return .{ .compatibility = .alias };
+                if (!exact_alias) return .alias;
+                const source = slot.source_slot orelse return .alias;
+                if (source >= pool.plan.slots.len or pool.plan.slots[source].node_id != node.inputs[0]) return .alias;
                 const plane = selected.planes[id][0];
-                const readable = @import("metadata_alias.zig").readableBytes(slot.desc.shape, plane.descriptor.strides) orelse return .{ .compatibility = .alias };
-                if (plane.role != .primary or plane.descriptor.current_backend != .native or plane.descriptor.storage != .metadata_view or plane.descriptor.quant_format != null or plane.descriptor.attention_storage != null or plane.descriptor.attention_kv_format != null or !plane.descriptor.shape.eq(slot.desc.shape) or plane.descriptor.view_source != node.inputs[0] or plane.logical_bytes != bytes or plane.readable_bytes != readable) return .{ .compatibility = .alias };
+                const readable = @import("metadata_alias.zig").readableBytes(slot.desc.shape, plane.descriptor.strides) orelse return .alias;
+                if (plane.role != .primary or plane.descriptor.current_backend != .native or plane.descriptor.storage != .metadata_view or plane.descriptor.quant_format != null or plane.descriptor.attention_storage != null or plane.descriptor.attention_kv_format != null or !plane.descriptor.shape.eq(slot.desc.shape) or plane.descriptor.view_source != node.inputs[0] or plane.logical_bytes != bytes or plane.readable_bytes != readable) return .alias;
                 if (slot.roles.graph_output) {
                     var root = slot;
                     var depth: usize = 0;
                     while (root.kind == .view) : (depth += 1) {
-                        const parent = root.source_slot orelse return .{ .compatibility = .alias };
-                        if (parent >= pool.plan.slots.len or depth >= pool.plan.slots.len) return .{ .compatibility = .alias };
+                        const parent = root.source_slot orelse return .alias;
+                        if (parent >= pool.plan.slots.len or depth >= pool.plan.slots.len) return .alias;
                         root = pool.plan.slots[parent];
                     }
-                    if (root.kind == .runtime_input) return .{ .compatibility = .output_publication };
-                    if (root.kind == .constant and !publication(pool, slot, literalIndex(pool, root) orelse return .{ .compatibility = .literal })) return .{ .compatibility = .output_publication };
+                    if (root.kind == .runtime_input) return .output_publication;
+                    if (root.kind == .constant and !publication(pool, slot, literalIndex(pool, root) orelse return .literal)) return .output_publication;
                 }
                 result.aliases += 1;
             },
             .allocation => {
-                if (id >= selected.routes.len or id >= pool.kernels.len) return .{ .compatibility = .operation };
-                const owned = selected.routes[id] orelse return .{ .compatibility = .operation };
-                const kernel = pool.kernels[id] orelse return .{ .compatibility = .operation };
-                if (borrowed and owned.validation_scope != .prepared_program) return .{ .compatibility = .operation };
-                if (kernel.backend_index >= pool.backends.len) return .{ .compatibility = .backend_region };
+                if (id >= selected.routes.len or id >= pool.kernels.len) return .operation;
+                const owned = selected.routes[id] orelse return .operation;
+                const kernel = pool.kernels[id] orelse return .operation;
+                if (borrowed and owned.validation_scope != .prepared_program) return .operation;
+                if (kernel.backend_index >= pool.backends.len) return .backend_region;
                 const backend = pool.backends[kernel.backend_index];
-                if (!canonical(backend) or owned.implementation.context != backend.ptr or owned.implementation.table != @as(*const anyopaque, @ptrCast(backend.vtable)) or kernel.output_allocation != slot.allocation or !kernel.descriptor.output_shape.eq(slot.desc.shape) or owned.requirements.primary_bytes < bytes or kernel.descriptor.input_count != node.num_inputs) return .{ .compatibility = .operation };
-                for (kernel.inputs[0..kernel.descriptor.input_count], node.getInputs(), 0..) |actual, expected, index| {
-                    if (actual != expected or expected >= reachable.len or !reachable[expected] or !kernel.descriptor.input_shapes[index].eq(graph.node(expected).output_shape)) return .{ .compatibility = .operation };
-                }
-                if (!resources(pool, kernel, owned)) return .{ .compatibility = .workspace };
+                if (backend.ptr != target_backend.ptr or backend.vtable != target_backend.vtable or
+                    !kernelOutputMatches(kernel, owned, backend, slot, bytes) or
+                    !kernelInputsMatch(graph, reachable, @intCast(id), kernel)) return .operation;
+                if (!resources(pool, kernel, owned)) return .workspace;
                 result.operations += 1;
             },
         }
     }
-    for (graph.outputs.items) |id| {
-        if (id >= reachable.len or !reachable[id]) return .{ .compatibility = .output_publication };
-        const slot = pool.plan.slotForNode(id) orelse return .{ .compatibility = .output_publication };
-        if (!slot.roles.graph_output) return .{ .compatibility = .output_publication };
-    }
-    return .{ .complete = result };
+    return null;
 }
 
 test "Native owned coverage actual packed primary requires exact format storage shape and compressed row bytes" {

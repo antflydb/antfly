@@ -29,6 +29,9 @@ pub const Diagnostic = struct {
     requested_scratch_bytes: u64 = 0,
     admitted_host_bytes: u64 = 0,
     admitted_backend_bytes: u64 = 0,
+    /// Observed after denial. Other requests can change residency before sampling.
+    scratch_domain: ?ScratchDomain = null,
+
     host_limit_bytes: u64 = 0,
     backend_limit_bytes: u64 = 0,
     combined_limit_bytes: u64 = 0,
@@ -38,6 +41,13 @@ pub const Diagnostic = struct {
     available_memory_sampled_ns: u64 = 0,
     shared_host_limit_bytes: u64 = 0,
     shared_unified_limit_bytes: u64 = 0,
+
+    pub const ScratchDomain = struct {
+        backend: @import("../runtime/tier/memory.zig").BackendClass,
+        requested_bytes: u64 = 0,
+        admitted_bytes: u64,
+        limit_bytes: u64 = 0,
+    };
 };
 
 pub const Recorder = struct {

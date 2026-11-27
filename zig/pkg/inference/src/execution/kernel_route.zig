@@ -93,6 +93,8 @@ pub const Requirements = struct {
     /// A backend-owned static physical precision/layout/schedule profile.
     profile: u32,
     workspace: descriptor.WorkspaceRequirement = .{},
+    /// Provider scratch exists outside the supplied workspace planes.
+    opaque_workspace: bool = false,
     host_alignment: u32 = 1,
     /// Cold algorithm probes run before capture with owned assigned slots.
     /// Reuse normal scratch only when the lifetimes are provably disjoint;
@@ -170,6 +172,8 @@ pub const Owned = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// Exact immutable operand consumed through an already pinned provider slot.
+        pinned_input: ?*const fn (*anyopaque, usize, Binding) bool = null,
         host_input_constraint: ?*const fn (*anyopaque, usize) ?@import("host_ingress.zig").IndexBounds = null,
         /// Metadata only; run before admission when credit is requested, and
         /// again before any frame allocation/submission at dispatch. A mismatch

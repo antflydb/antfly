@@ -22,6 +22,7 @@ pub const tier = @import("tier/root.zig");
 
 test {
     _ = distributed;
+    _ = @import("embedding_scheduler.zig");
     _ = kv;
     _ = moe;
     _ = scheduler;

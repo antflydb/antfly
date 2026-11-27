@@ -185,11 +185,21 @@ fn encoderForwardOutput(
     defer allocator.free(pos_ids);
     const total = pos_ids.len;
 
-    var frame_active = try beginWhisperMetalFrame(cb, .prefill);
-    errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
-    const scope_active = frame_active and (cb.decoderRuntimeBeginPlannedComputeScope() catch false);
+    var frame = try beginWhisperMetalFrame(cb, .prefill, false);
+    errdefer frame.deinit();
+    const MetalCompute = @import("../ops/metal_compute.zig").MetalCompute;
+    const linear_scope = if (comptime @import("build_options").enable_metal)
+        if (frame.owns and qualifiedMetalSmall(config))
+            MetalCompute.beginDenseLinearScope(cb, platform.env.getenvBoolDefault("TERMITE_WHISPER_METAL_LOSSLESS_F16_LINEAR", true))
+        else
+            null
+    else {};
+    defer if (comptime @import("build_options").enable_metal) {
+        if (linear_scope) |scope| scope.deinit();
+    };
+    const scope_active = frame.owns and (cb.decoderRuntimeBeginPlannedComputeScope() catch false);
     defer if (scope_active) cb.decoderRuntimeEndPlannedComputeScope();
-    var profile = EncoderProfile{ .enabled = frame_active and whisperMetalProfileEnabled(), .frame_active = &frame_active };
+    var profile = EncoderProfile{ .enabled = frame.owns and whisperMetalProfileEnabled(), .frame_active = &frame.owns };
     profile.start();
     defer profile.finish();
 
@@ -321,10 +331,7 @@ fn encoderForwardOutput(
     defer if (comptime !resident) cb.free(normed);
     errdefer if (comptime resident) cb.free(normed);
     profile.mark(cb, "final_norm");
-    if (frame_active) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        frame_active = false;
-    }
+    try frame.finish();
     if (comptime resident) return normed;
     const result = try cb.toFloat32(normed, allocator);
     profile.mark(cb, "readback");
@@ -667,6 +674,17 @@ fn whisperMetalFramesEnabled() bool {
     return !platform.env.getenvBool("TERMITE_WHISPER_METAL_DISABLE_FRAMES");
 }
 
+fn qualifiedMetalSmall(config: Config) bool {
+    return config.d_model == 768 and config.encoder_layers == 12 and
+        config.decoder_layers == 12 and config.decoder_attention_heads == 12 and config.num_mel_bins == 80;
+}
+
+pub fn metalPackedPrefillEnabled(config: Config) bool {
+    return whisperMetalFramesEnabled() and
+        !platform.env.getenvBool("TERMITE_METAL_DISABLE_DENSE_QKV_PACKED") and
+        platform.env.getenvBoolDefault("TERMITE_METAL_WHISPER_PREPARE_PACKED_QKV", qualifiedMetalSmall(config));
+}
+
 fn whisperMetalProfileEnabled() bool {
     return platform.env.getenvBool("TERMITE_WHISPER_METAL_PROFILE");
 }
@@ -729,17 +747,14 @@ const StepProfile = struct {
     }
 };
 
-/// Open one backend-owned command submission for a decoder step. Every
-/// device op issued until `decoderRuntimeSubmitAndWaitFrame` joins it, so a
-/// token costs one dispatch and one wait instead of one per op. Returns
-/// false on backends without frames; callers then run eagerly.
-fn beginWhisperMetalFrame(cb: *const ComputeBackend, regime: ops.DecoderRuntimeFrameRegime) !bool {
-    if (cb.kind() != .metal or !whisperMetalFramesEnabled() or cb.decoderRuntimeHasActiveFrame()) return false;
-    const active = try cb.decoderRuntimeBeginFrame();
-    if (!active) return false;
-    errdefer cb.decoderRuntimeCancelFrame() catch {};
-    try cb.decoderRuntimeSetActiveFrameRegime(regime);
-    return true;
+const Submission = @import("../execution/submission.zig").Scope;
+
+fn beginWhisperMetalFrame(cb: *const ComputeBackend, regime: ops.DecoderRuntimeFrameRegime, pipelined: bool) !Submission {
+    if (cb.kind() != .metal or !whisperMetalFramesEnabled()) return .{ .backend = cb };
+    var frame = if (pipelined) try Submission.beginPipelined(cb) else try Submission.begin(cb);
+    errdefer frame.deinit();
+    if (frame.owns) try cb.decoderRuntimeSetActiveFrameRegime(regime);
+    return frame;
 }
 
 /// Replace `tensor` with a device-resident copy when the backend can make
@@ -821,15 +836,14 @@ const WeightFetcher = struct {
     cold: ?NativeColdWeights = null,
 
     fn prepareCold(self: *WeightFetcher, name: []const u8) !void {
-        if (comptime !@import("build_options").enable_native) return;
         const source = self.cold orelse return;
-        if (self.cb.kind() == .cuda) {
-            // CUDA's original acquired cache handle pins stable headers and
-            // payload before Frame construction. Named current-source proof
-            // follows acquisition; never reinterpret a GPU owner as Native.
+        if (self.cb.kind() != .native) {
+            // The provider owns cold residency and proves the source after
+            // lookup. Native typed preparation requires Native ownership.
             if (!dense_backend.available(self.cb)) return error.UnsupportedDenseSchedule;
             return;
         }
+        if (comptime !@import("build_options").enable_native) return error.UnsupportedDenseSchedule;
         const Native = @import("../ops/native_compute.zig").NativeCompute;
         if (source.domain) |pin| {
             if (try Native.prepareTypedWeightOutsideExecution(self.cb, source.expected_data, name, pin)) return;
@@ -842,29 +856,32 @@ const WeightFetcher = struct {
         if (query.shape) |shape| if (shape.dtype != .f32 or query.quantized != null) return error.UnsupportedDenseSchedule;
     }
 
-    fn fetch(self: *WeightFetcher, name: []const u8) !CT {
-        try self.prepareCold(name);
-        const tensor = if (self.cold != null and self.cb.kind() == .cuda) try self.cb.acquireWeight(name) else try self.cb.getWeight(name);
+    fn lookup(self: *WeightFetcher, name: []const u8) !CT {
+        if (self.cold != null) return dense_backend.lookupWeight(self.cb, name);
+        return self.cb.getWeight(name);
+    }
+
+    fn record(self: *WeightFetcher, name: []const u8, tensor: CT) !CT {
         errdefer self.cb.free(tensor);
         if (self.cold) |source| {
-            if (self.cb.kind() == .cuda) _ = try dense_backend.heldWeight(self.cb, source.expected_data, tensor, name);
+            if (self.cb.kind() != .native) _ = try dense_backend.heldWeight(self.cb, source.expected_data, tensor, name);
         }
         try self.handles.append(self.allocator, tensor);
         return tensor;
     }
 
+    fn fetch(self: *WeightFetcher, name: []const u8) !CT {
+        try self.prepareCold(name);
+        return self.record(name, try self.lookup(name));
+    }
+
     fn fetchOptional(self: *WeightFetcher, name: []const u8) !?CT {
         try self.prepareCold(name);
-        const tensor = (if (self.cold != null and self.cb.kind() == .cuda) self.cb.acquireWeight(name) else self.cb.getWeight(name)) catch |err| switch (err) {
+        const tensor = self.lookup(name) catch |err| switch (err) {
             error.MissingWeight, error.WeightNotFound => return null,
             else => return err,
         };
-        errdefer self.cb.free(tensor);
-        if (self.cold) |source| {
-            if (self.cb.kind() == .cuda) _ = try dense_backend.heldWeight(self.cb, source.expected_data, tensor, name);
-        }
-        try self.handles.append(self.allocator, tensor);
-        return tensor;
+        return try self.record(name, tensor);
     }
 
     fn linear(self: *WeightFetcher, layer: usize, proj: []const u8, buf: *[256]u8) !Linear {
@@ -903,7 +920,7 @@ const WeightFetcher = struct {
 /// attention kernel reads a zero-copy view of the live prefix. Elsewhere the
 /// cache grows by concatenation.
 /// Canonical allocation geometry shared by cache construction and admission.
-/// KV values are F32 on every current backend; opaque source preparation keeps
+/// Prepared destinations and self-cache slabs use F32. Opaque preparation keeps
 /// the existing model/static workspace floor until its selected-route bound is
 /// available. No private cache is mislabeled as a published output tensor.
 pub const CacheGeometry = struct {
@@ -911,31 +928,40 @@ pub const CacheGeometry = struct {
     width: usize,
     encoder_rows: usize,
     capacity: usize,
-    encoder_mask_elements: usize,
-    self_mask_elements: usize,
     cross_tensor_bytes: usize,
     self_tensor_bytes: usize,
     known_metadata_bytes: usize,
 
     pub fn init(config: Config, encoder_rows: usize) !CacheGeometry {
         const mul = cacheMul;
-        const add = cacheAdd;
         const width: usize = config.d_model;
         const capacity = @max(@as(usize, 1), config.max_target_positions);
         if (encoder_rows == 0 or width == 0) return error.InvalidInputShape;
         const cross_bytes = try mul(usize, try mul(usize, encoder_rows, width), @sizeOf(f32));
         const self_bytes = try mul(usize, try mul(usize, capacity, width), @sizeOf(f32));
-        const masks = try mul(usize, try add(usize, encoder_rows, capacity), @sizeOf(i64));
         const vectors = try mul(usize, config.decoder_layers, @sizeOf(DecodeCache.LayerCache) + @sizeOf(LayerWeights));
-        return .{ .layers = config.decoder_layers, .width = width, .encoder_rows = encoder_rows, .capacity = capacity, .encoder_mask_elements = encoder_rows, .self_mask_elements = capacity, .cross_tensor_bytes = cross_bytes, .self_tensor_bytes = self_bytes, .known_metadata_bytes = try add(usize, masks, vectors) };
+        return .{ .layers = config.decoder_layers, .width = width, .encoder_rows = encoder_rows, .capacity = capacity, .cross_tensor_bytes = cross_bytes, .self_tensor_bytes = self_bytes, .known_metadata_bytes = vectors };
     }
 
     pub fn cacheAmounts(self: CacheGeometry, cb: *const ComputeBackend) !@import("../runtime/tier/memory.zig").AdmissionAmounts {
+        return self.cacheAmountsForCrossBytes(cb, self.cross_tensor_bytes);
+    }
+
+    pub fn eagerCacheAmounts(self: CacheGeometry, cb: *const ComputeBackend) !@import("../runtime/tier/memory.zig").AdmissionAmounts {
+        const width = if (cb.vtable.regions.sequence_projection.reducedCrossKvElementBytes) |query|
+            query(cb.ptr) orelse @sizeOf(f32)
+        else
+            @sizeOf(f32);
+        if (width != @sizeOf(f32) and width != @sizeOf(f16)) return error.InvalidPhysicalStorageReservation;
+        return self.cacheAmountsForCrossBytes(cb, try cacheMul(usize, self.cross_tensor_bytes / @sizeOf(f32), width));
+    }
+
+    fn cacheAmountsForCrossBytes(self: CacheGeometry, cb: *const ComputeBackend, cross_bytes: usize) !@import("../runtime/tier/memory.zig").AdmissionAmounts {
         if (self.layers == 0) return .{ .host_scratch_bytes = self.known_metadata_bytes };
         const functions = cb.vtable.kernels;
-        const cross = if (functions) |table| if (table.physical_storage_policy) |_| try ops.physical_storage.reservationBytes(cb.*, .{ .byte_size = self.cross_tensor_bytes }) else self.cross_tensor_bytes else self.cross_tensor_bytes;
+        const cross = if (functions) |table| if (table.physical_storage_policy) |_| try ops.physical_storage.reservationBytes(cb.*, .{ .byte_size = cross_bytes }) else cross_bytes else cross_bytes;
         const slab = if (functions) |table| if (table.physical_storage_policy) |_| try ops.physical_storage.reservationBytes(cb.*, .{ .byte_size = self.self_tensor_bytes }) else self.self_tensor_bytes else self.self_tensor_bytes;
-        if (cross < self.cross_tensor_bytes or slab < self.self_tensor_bytes) return error.InvalidPhysicalStorageReservation;
+        if (cross < cross_bytes or slab < self.self_tensor_bytes) return error.InvalidPhysicalStorageReservation;
         const bytes = try cacheMul(usize, try cacheMul(usize, self.layers, 2), try cacheAdd(usize, cross, slab));
         var result = @import("../runtime/tier/memory.zig").AdmissionAmounts{ .host_scratch_bytes = self.known_metadata_bytes };
         switch (cb.kind()) {
@@ -946,7 +972,7 @@ pub const CacheGeometry = struct {
         return result;
     }
 
-    pub fn workspaceBytes(self: CacheGeometry, config: Config) !usize {
+    pub fn workspaceBytes(self: CacheGeometry, config: Config, initial_rows: usize) !usize {
         const mul = cacheMul;
         const add = cacheAdd;
         const keys = @max(self.encoder_rows, self.capacity);
@@ -955,7 +981,15 @@ pub const CacheGeometry = struct {
         const context = try mul(usize, try mul(usize, keys, self.width), 6);
         const constructor = try mul(usize, try mul(usize, self.encoder_rows, self.width), 6);
         const head = try add(usize, self.width, config.vocab_size);
-        return mul(usize, @max(constructor, @max(head, @max(attention, @max(activations, context)))), @sizeOf(f32));
+        const decode_peak = @max(constructor, head, attention, activations, context);
+        if (initial_rows <= 1) return mul(usize, decode_peak, @sizeOf(f32));
+
+        // Initial self-attention has no preceding keys. Cross-attention
+        // sees the encoder rows. The logits head consumes only the last row.
+        const prefill_keys = @max(initial_rows, self.encoder_rows);
+        const prefill_attention = try mul(usize, try mul(usize, try mul(usize, initial_rows, prefill_keys), config.decoder_attention_heads), 3);
+        const prefill_activations = try mul(usize, initial_rows, activations);
+        return mul(usize, @max(decode_peak, prefill_attention, prefill_activations), @sizeOf(f32));
     }
 };
 
@@ -977,7 +1011,51 @@ pub const PreparedDecoderWeights = struct {
     // Captured by the original lookup, never inferred from a later witness.
     lm_head_source: enum { projection, tied_embedding } = .projection,
 
-    pub const Cross = struct { k: Linear, v: Linear };
+    pub const Cross = struct {
+        k: Linear,
+        v: Linear,
+
+        fn projectInto(self: Cross, cb: *const ComputeBackend, source_data: *const anyopaque, encoder: CT, destinations: [2]CT, rows: usize, width: usize, mode: dense_backend.ProjectionMode) !bool {
+            const schedule_mod = @import("../execution/dense_decoder_schedule.zig");
+            const projections = [2]Linear{ self.k, self.v };
+            var descriptors: [2]ops.kernel_descriptor.Descriptor = undefined;
+            for (projections, destinations, &descriptors) |projection, target, *descriptor| {
+                descriptor.* = try schedule_mod.projectionDescriptor(cb, source_data, encoder, projection.w, projection.b, target, rows, width, width);
+            }
+            for (projections, destinations, &descriptors) |projection, target, *descriptor| {
+                const inputs = [3]CT{ encoder, projection.w, projection.b orelse projection.w };
+                if (!try dense_backend.projectionInto(cb, descriptor, inputs[0..descriptor.input_count], target, mode)) return false;
+            }
+            return true;
+        }
+    };
+
+    fn ensureQkvSlots(cb: *const ComputeBackend, projections: [3]Linear, width: usize, model_slot: ops.DecoderRuntimeEnsureLinearSlotRequest.ModelSlot) !?[3]usize {
+        var slots: [3]usize = undefined;
+        for (projections, 0..) |projection, index| {
+            const slot = (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = projection.w, .bias = projection.b, .in_dim = width, .out_dim = width, .model_slot = model_slot })) orelse return null;
+            if (std.mem.indexOfScalar(usize, slots[0..index], slot) != null) return null;
+            slots[index] = slot;
+        }
+        return slots;
+    }
+
+    pub fn prepareModelQkvSlots(cb: *const ComputeBackend, allocator: std.mem.Allocator, width: usize, groups: [][3]usize) !usize {
+        var fetcher = WeightFetcher{ .cb = cb, .allocator = allocator };
+        defer fetcher.release(cb);
+        var name: [256]u8 = undefined;
+        var count: usize = 0;
+        for (0..groups.len) |layer| {
+            const projections = [3]Linear{
+                try fetcher.linear(layer, "self_attn.q_proj", &name),
+                try fetcher.linear(layer, "self_attn.k_proj", &name),
+                try fetcher.linear(layer, "self_attn.v_proj", &name),
+            };
+            groups[count] = (try ensureQkvSlots(cb, projections, width, .publish)) orelse break;
+            count += 1;
+        }
+        return count;
+    }
 
     pub fn init(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config, resolve_cross: bool) !PreparedDecoderWeights {
         return initWithSource(cb, allocator, config, resolve_cross, null);
@@ -1008,12 +1086,9 @@ pub const PreparedDecoderWeights = struct {
         // Fused Q/K/V projection: one dispatch per layer instead of three.
         // Slots live in the backend runtime; a backend without them (or one
         // that ran out of slots) leaves the separate projections in place.
+        const model_slot: ops.DecoderRuntimeEnsureLinearSlotRequest.ModelSlot = if (cb.kind() == .metal and metalPackedPrefillEnabled(config)) .reuse else .request;
         for (layer_weights) |*lw| {
-            const q_slot = (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = lw.q.w, .bias = lw.q.b, .in_dim = d_model, .out_dim = d_model })) orelse break;
-            const k_slot = (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = lw.k.w, .bias = lw.k.b, .in_dim = d_model, .out_dim = d_model })) orelse break;
-            const v_slot = (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = lw.v.w, .bias = lw.v.b, .in_dim = d_model, .out_dim = d_model })) orelse break;
-            if (q_slot == k_slot or q_slot == v_slot or k_slot == v_slot) break;
-            lw.qkv_slots = .{ q_slot, k_slot, v_slot };
+            lw.qkv_slots = (try ensureQkvSlots(cb, .{ lw.q, lw.k, lw.v }, d_model, model_slot)) orelse break;
         }
         const embed = try fetcher.fetch("model.decoder.embed_tokens.weight");
         var lm_head_source: @FieldType(PreparedDecoderWeights, "lm_head_source") = .projection;
@@ -1046,6 +1121,35 @@ pub const PreparedDecoderWeights = struct {
         fetcher.cold = null;
         return .{ .allocator = allocator, .backend = cb.withoutSynchronousBorrows(), .weights = weights, .fetcher = fetcher, .cross = cross, .lm_head_source = lm_head_source };
     }
+    pub fn prepareMetalSchedulePayload(self: *const PreparedDecoderWeights, cb: *const ComputeBackend, model: *const anyopaque, config: Config) !bool {
+        const cross = self.cross orelse return false;
+        const w = self.weights;
+        const width = config.d_model;
+        if (!try dense_backend.prepareEmbeddingF32(cb, model, w.embed) or
+            !try dense_backend.prepareEmbeddingF32(cb, model, w.positions)) return false;
+        for (w.layers, cross) |layer, projections| {
+            if (layer.qkv_slots == null) return false;
+            for ([_]Norm{ layer.self_ln, layer.cross_ln, layer.ffn_ln }) |norm| {
+                if (!try prepareScheduleNorm(cb, norm, width)) return false;
+            }
+            for ([_]Linear{ layer.o, layer.cross_q, layer.cross_o, projections.k, projections.v }) |linear| {
+                if (!try prepareScheduleLinear(cb, linear, width, width)) return false;
+            }
+            if (!try prepareScheduleLinear(cb, layer.fc1, width, config.decoder_ffn_dim) or
+                !try prepareScheduleLinear(cb, layer.fc2, config.decoder_ffn_dim, width)) return false;
+        }
+        return try prepareScheduleNorm(cb, w.final_ln, width) and
+            try prepareScheduleLinear(cb, .{ .w = w.lm_head, .b = null }, width, config.vocab_size);
+    }
+
+    fn prepareScheduleNorm(cb: *const ComputeBackend, norm: Norm, width: usize) !bool {
+        return (try cb.decoderRuntimeEnsureLayerNormSlot(&.{ .weight = norm.w, .bias = norm.b, .hidden_size = width })) != null;
+    }
+
+    fn prepareScheduleLinear(cb: *const ComputeBackend, linear: Linear, in_dim: usize, out_dim: usize) !bool {
+        return (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = linear.w, .bias = linear.b, .in_dim = in_dim, .out_dim = out_dim })) != null;
+    }
+
     pub fn deinit(self: *PreparedDecoderWeights) void {
         self.fetcher.release(&self.backend);
         self.allocator.free(self.weights.layers);
@@ -1073,8 +1177,6 @@ pub const PreparedSingleToken = struct {
     position_rows: usize,
     adopted: bool = false,
     cache_layers: []DecodeCache.LayerCache,
-    encoder_mask: []i64,
-    self_mask: []i64,
 
     const schedule_mod = @import("../execution/dense_decoder_schedule.zig");
     const NodeId = @import("ml").graph.NodeId;
@@ -1126,7 +1228,7 @@ pub const PreparedSingleToken = struct {
             return count;
         }
         pub fn header(self: @This()) schedule_mod.ProgramSpec {
-            return .{ .family = .whisper, .phase = if (self.initial) .initial else .decode, .geometry = .{ .layers = self.config.decoder_layers, .width = self.config.d_model, .heads = self.config.decoder_attention_heads, .ffn_dim = self.config.decoder_ffn_dim, .vocab_size = self.config.vocab_size, .encoder_rows = self.rows, .capacity = @max(@as(usize, 1), self.config.max_target_positions), .query_rows = self.query_rows }, .semantics = .{ .epsilon = 1e-5, .activation = .gelu, .norm_order = .pre, .position_offset = 0, .global_final_norm = true }, .parameters = &.{} };
+            return .{ .family = .whisper, .phase = if (self.initial) .initial else .decode, .geometry = .{ .layers = self.config.decoder_layers, .width = self.config.d_model, .heads = self.config.decoder_attention_heads, .ffn_dim = self.config.decoder_ffn_dim, .vocab_size = self.config.vocab_size, .encoder_rows = self.rows, .capacity = @max(@as(usize, 1), self.config.max_target_positions), .query_rows = self.query_rows }, .semantics = .{ .epsilon = 1e-5, .activation = .gelu, .norm_order = .pre, .position_offset = 0, .global_final_norm = true, .all_keys_visible = true }, .parameters = &.{} };
         }
         pub fn len(self: @This()) usize {
             return self.parameter_count;
@@ -1279,15 +1381,21 @@ pub const PreparedSingleToken = struct {
             return result;
         }
     };
+    pub fn supportsInitialRows(config: Config, query_rows: usize) bool {
+        return query_rows != 0 and query_rows <= config.max_target_positions and query_rows <= 2048;
+    }
+
     pub fn specSource(cb: *const ComputeBackend, data: *const anyopaque, config: Config, rows: usize, weights: *const PreparedDecoderWeights, query_rows: usize, initial: bool) !?SpecSource {
         if (!dense_backend.available(cb) or weights.cross == null or weights.weights.layers.len != config.decoder_layers or weights.cross.?.len != config.decoder_layers) return null;
-        for (weights.weights.layers) |w| if (w.qkv_slots != null) return null;
+        if (cb.kind() != .metal) for (weights.weights.layers) |w| if (w.qkv_slots != null) return null;
         const embed = try dense_backend.heldWeight(cb, data, weights.weights.embed, "model.decoder.embed_tokens.weight");
         const position = try dense_backend.heldWeight(cb, data, weights.weights.positions, "model.decoder.embed_positions.weight");
         if (embed.descriptor.shape.rank() != 2 or position.descriptor.shape.rank() != 2 or embed.descriptor.shape.dims[1] != config.d_model or position.descriptor.shape.dims[1] != config.d_model or embed.descriptor.shape.dims[0] <= 0 or position.descriptor.shape.dims[0] <= 0) return null;
         const geometry = try CacheGeometry.init(config, rows);
         if (config.decoder_attention_heads == 0 or config.d_model % config.decoder_attention_heads != 0 or rows > std.math.maxInt(i32) or geometry.capacity > std.math.maxInt(i32) or config.d_model > std.math.maxInt(i32) or config.decoder_ffn_dim > std.math.maxInt(i32) or config.vocab_size > std.math.maxInt(i32)) return null;
-        if (query_rows == 0 or (!initial and query_rows != 1) or (initial and (query_rows > config.max_target_positions or query_rows > 2048))) return error.UnsupportedDenseSchedule;
+        if (initial) {
+            if (!supportsInitialRows(config, query_rows) or query_rows > @as(u64, @intCast(position.descriptor.shape.dims[0]))) return null;
+        } else if (query_rows != 1) return error.UnsupportedDenseSchedule;
         var count: usize = 7;
         for (weights.weights.layers) |layer| count = try std.math.add(usize, count, SpecSource.layerCount(layer, initial));
         return .{ .cb = cb, .data = data, .config = config, .rows = rows, .weights = weights, .query_rows = query_rows, .initial = initial, .parameter_count = count };
@@ -1295,7 +1403,7 @@ pub const PreparedSingleToken = struct {
 
     pub fn init(cb: *const ComputeBackend, source_data: *const anyopaque, a: std.mem.Allocator, config: Config, encoder: CT, rows: usize, weights: *const PreparedDecoderWeights, preparation: ?*schedule_mod.Preparation, spec: *const schedule_mod.ProgramSpec, storage: ?*schedule_mod.ProgramSpecStorage) !?PreparedSingleToken {
         if (!dense_backend.available(cb) or weights.cross == null or weights.weights.layers.len != config.decoder_layers or weights.cross.?.len != config.decoder_layers) return null;
-        for (weights.weights.layers) |w| if (w.qkv_slots != null) return null;
+        if (cb.kind() != .metal) for (weights.weights.layers) |w| if (w.qkv_slots != null) return null;
         const embed_shape = (try dense_backend.heldWeight(cb, source_data, weights.weights.embed, "model.decoder.embed_tokens.weight")).descriptor.shape;
         const position_shape = (try dense_backend.heldWeight(cb, source_data, weights.weights.positions, "model.decoder.embed_positions.weight")).descriptor.shape;
         if (embed_shape.rank() != 2 or position_shape.rank() != 2 or embed_shape.dims[1] != config.d_model or position_shape.dims[1] != config.d_model) return null;
@@ -1326,21 +1434,15 @@ pub const PreparedSingleToken = struct {
             slab.* = .{ .k = k, .v = v, .cross_k = cross_k, .cross_v = cross_v };
             built += 1;
         }
-        const authored = try authorPhase(cb, source_data, a, config, encoder, rows, weights, slabs, preparation, spec, storage);
+        try validateCrossDestinations(cb, source_data, config, encoder, rows, weights, slabs);
+        const authored = try authorPhase(cb, source_data, a, config, rows, weights, slabs, preparation, spec, storage);
         errdefer authored.schedule.deinit(.{ .outside_execution = true });
         const cache_layers = try a.alloc(DecodeCache.LayerCache, config.decoder_layers);
         errdefer a.free(cache_layers);
-        const encoder_mask = try a.alloc(i64, geometry.encoder_mask_elements);
-        errdefer a.free(encoder_mask);
-        @memset(encoder_mask, 1);
-        const self_mask = try a.alloc(i64, geometry.self_mask_elements);
-        errdefer a.free(self_mask);
-        @memset(self_mask, 1);
-        return .{ .allocator = a, .backend = cb.withoutSynchronousBorrows(), .schedule = authored.schedule, .source_data = source_data, .self_slabs = slabs, .token_node = authored.token_node, .position_node = authored.position_node, .cache_layers = cache_layers, .encoder_mask = encoder_mask, .self_mask = self_mask, .token_rows = @intCast(embed_shape.dims[0]), .position_rows = @intCast(position_shape.dims[0]) };
+        return .{ .allocator = a, .backend = cb.withoutSynchronousBorrows(), .schedule = authored.schedule, .source_data = source_data, .self_slabs = slabs, .token_node = authored.token_node, .position_node = authored.position_node, .cache_layers = cache_layers, .token_rows = @intCast(embed_shape.dims[0]), .position_rows = @intCast(position_shape.dims[0]) };
     }
-    fn authorPhase(cb: *const ComputeBackend, source_data: *const anyopaque, a: std.mem.Allocator, config: Config, encoder: CT, rows: usize, weights: *const PreparedDecoderWeights, slabs: []const Slab, preparation: ?*schedule_mod.Preparation, spec: *const schedule_mod.ProgramSpec, storage: ?*schedule_mod.ProgramSpecStorage) !Authored {
+    fn authorPhase(cb: *const ComputeBackend, source_data: *const anyopaque, a: std.mem.Allocator, config: Config, rows: usize, weights: *const PreparedDecoderWeights, slabs: []const Slab, preparation: ?*schedule_mod.Preparation, spec: *const schedule_mod.ProgramSpec, storage: ?*schedule_mod.ProgramSpecStorage) !Authored {
         const source = (try specSource(cb, source_data, config, rows, weights, spec.geometry.query_rows, spec.phase == .initial)) orelse return error.UnsupportedDenseSchedule;
-        try validateCrossDestinations(cb, source_data, config, encoder, rows, weights, slabs);
         const bound = try source.bind(a, spec, slabs);
         defer a.free(bound);
         if (preparation) |prepared| if (prepared.cached) |definition| {
@@ -1360,9 +1462,8 @@ pub const PreparedSingleToken = struct {
                 _ = try dense_backend.heldWeight(cb, source_data, pair.w, try std.fmt.bufPrint(&buffer, "model.decoder.layers.{d}.encoder_attn.{s}.weight", .{ layer, projection }));
                 if (pair.b) |bias| _ = try dense_backend.heldWeight(cb, source_data, bias, try std.fmt.bufPrint(&buffer, "model.decoder.layers.{d}.encoder_attn.{s}.bias", .{ layer, projection }));
             }
-            const k_desc = try schedule_mod.projectionDescriptor(cb, source_data, encoder, cross.k.w, cross.k.b, slab.cross_k, rows, config.d_model, config.d_model);
-            const v_desc = try schedule_mod.projectionDescriptor(cb, source_data, encoder, cross.v.w, cross.v.b, slab.cross_v, rows, config.d_model, config.d_model);
-            if (!try dense_backend.projectionInto(cb, &k_desc, if (cross.k.b) |bias| &.{ encoder, cross.k.w, bias } else &.{ encoder, cross.k.w }, slab.cross_k, .query) or !try dense_backend.projectionInto(cb, &v_desc, if (cross.v.b) |bias| &.{ encoder, cross.v.w, bias } else &.{ encoder, cross.v.w }, slab.cross_v, .query)) return error.UnsupportedDenseSchedule;
+            if (!try cross.projectInto(cb, source_data, encoder, .{ slab.cross_k, slab.cross_v }, rows, config.d_model, .query))
+                return error.UnsupportedDenseSchedule;
         }
     }
     fn authorPure(cb: *const ComputeBackend, a: std.mem.Allocator, preparation: ?*schedule_mod.Preparation, spec: *const schedule_mod.ProgramSpec, storage: ?*schedule_mod.ProgramSpecStorage, bound: []const schedule_mod.BoundParameter) !Authored {
@@ -1372,8 +1473,8 @@ pub const PreparedSingleToken = struct {
         const nodes = try schedule_mod.authorSemanticGraph(&b);
         return .{ .schedule = try schedule_mod.Schedule.create(&b), .token_node = nodes.token_node, .position_node = nodes.position_node };
     }
-    pub fn initInitial(self: *PreparedSingleToken, config: Config, encoder: CT, rows: usize, weights: *const PreparedDecoderWeights, preparation: ?*schedule_mod.Preparation, query_rows: usize, spec: *const schedule_mod.ProgramSpec, storage: ?*schedule_mod.ProgramSpecStorage) !void {
-        if (self.initial != null or query_rows == 0 or query_rows > config.max_target_positions or query_rows > 2048) return error.UnsupportedDenseSchedule;
+    pub fn initInitial(self: *PreparedSingleToken, config: Config, rows: usize, weights: *const PreparedDecoderWeights, preparation: ?*schedule_mod.Preparation, query_rows: usize, spec: *const schedule_mod.ProgramSpec, storage: ?*schedule_mod.ProgramSpecStorage) !void {
+        if (self.initial != null or !supportsInitialRows(config, query_rows) or query_rows > self.position_rows) return error.UnsupportedDenseSchedule;
         if (spec.phase != .initial or spec.geometry.query_rows != query_rows) return error.DenseDefinitionChanged;
         const tokens = try self.allocator.alloc(i64, query_rows);
         errdefer self.allocator.free(tokens);
@@ -1381,7 +1482,7 @@ pub const PreparedSingleToken = struct {
         errdefer self.allocator.free(positions);
         @memset(tokens, 0);
         for (positions, 0..) |*position, i| position.* = @intCast(i);
-        const phase = try authorPhase(&self.backend, self.source_data, self.allocator, config, encoder, rows, weights, self.self_slabs, preparation, spec, storage);
+        const phase = try authorPhase(&self.backend, self.source_data, self.allocator, config, rows, weights, self.self_slabs, preparation, spec, storage);
         self.initial = .{ .schedule = phase.schedule, .token_node = phase.token_node, .position_node = phase.position_node, .tokens = tokens, .positions = positions };
     }
     fn bindInitial(self: *PreparedSingleToken, capability: ?@import("../execution/storage_admission.zig").Capability, current: @import("../execution/cleanup_context.zig").Context, enter: bool) !void {
@@ -1453,8 +1554,6 @@ pub const PreparedSingleToken = struct {
                 self.backend.free(slab.cross_v);
             }
             self.allocator.free(self.cache_layers);
-            self.allocator.free(self.encoder_mask);
-            self.allocator.free(self.self_mask);
         }
         self.allocator.free(self.self_slabs);
         self.* = undefined;
@@ -1469,9 +1568,7 @@ pub const DecodeCache = struct {
     /// Tokens already folded into the self-attention cache.
     positions: usize = 0,
     enc_seq: usize,
-    encoder_mask: []i64,
     /// All-ones mask covering `max_target_positions` cached keys.
-    self_mask: []i64,
     /// Rows per preallocated self-cache slab; 0 when the cache grows by
     /// concatenation instead.
     capacity: usize = 0,
@@ -1500,6 +1597,7 @@ pub const DecodeCache = struct {
     /// Consumption is explicit: on error the caller still owns all cold weights.
     /// Numerical encoder projections remain at the original execution boundary.
     pub fn initPrepared(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config, encoder_hidden: CT, enc_seq: usize, prepared: *PreparedDecoderWeights, program_owner: ?*?PreparedSingleToken) !DecodeCache {
+        try cb.checkExecutionControl();
         if (cb.ptr != prepared.backend.ptr or cb.vtable != prepared.backend.vtable or prepared.weights.layers.len != config.decoder_layers) return error.PreparedDecoderWeightOwnerChanged;
         const native = if (program_owner) |owner| if (owner.*) |*program| program else null else null;
         if (native) |program| if (program.schedule.frame == null or program.schedule.frame.?.scope_backends != 1) return error.DenseScheduleNotEntered;
@@ -1527,9 +1625,15 @@ pub const DecodeCache = struct {
         if (native) |program| try PreparedSingleToken.validateCrossDestinations(cb, program.source_data, config, encoder_hidden, enc_seq, prepared, program.self_slabs);
         // The cross projections are one batched pass over the encoder
         // output; on Metal they share a single submission.
-        var frame_active = try beginWhisperMetalFrame(cb, .prefill);
-        errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
+        var frame = try beginWhisperMetalFrame(cb, .prefill, false);
+        errdefer frame.deinit();
+        // Assigned projections share the active encoder when their Metal
+        // schedule supports it. Vendor GEMM can close it before encoding on
+        // the same command buffer, and the caller still owns the terminal wait.
+        const scope_active = native != null and frame.owns and (cb.decoderRuntimeBeginPlannedComputeScope() catch false);
+        defer if (scope_active) cb.decoderRuntimeEndPlannedComputeScope();
         for (0..config.decoder_layers) |layer| {
+            try cb.checkExecutionControl();
             prepared.fetcher.cb = cb;
             var buf: [256]u8 = undefined;
             const cross = if (prepared.cross) |values| values[layer] else PreparedDecoderWeights.Cross{
@@ -1546,11 +1650,8 @@ pub const DecodeCache = struct {
             var v_cross: CT = undefined;
             if (native) |program| {
                 const slab = program.self_slabs[layer];
-                const schedule_mod = @import("../execution/dense_decoder_schedule.zig");
-                const k_descriptor = try schedule_mod.projectionDescriptor(cb, program.source_data, encoder_hidden, k, k_b, slab.cross_k, enc_seq, d_model, d_model);
-                const v_descriptor = try schedule_mod.projectionDescriptor(cb, program.source_data, encoder_hidden, v, v_b, slab.cross_v, enc_seq, d_model, d_model);
-                if (!try dense_backend.projectionInto(cb, &k_descriptor, if (k_b) |bias| &.{ encoder_hidden, k, bias } else &.{ encoder_hidden, k }, slab.cross_k, .apply)) return error.PreparedDenseProjectionChanged;
-                if (!try dense_backend.projectionInto(cb, &v_descriptor, if (v_b) |bias| &.{ encoder_hidden, v, bias } else &.{ encoder_hidden, v }, slab.cross_v, .apply)) return error.PreparedDenseProjectionChanged;
+                if (!try cross.projectInto(cb, program.source_data, encoder_hidden, .{ slab.cross_k, slab.cross_v }, enc_seq, d_model, .apply))
+                    return error.PreparedDenseProjectionChanged;
                 k_cross = slab.cross_k;
                 v_cross = slab.cross_v;
             } else {
@@ -1573,10 +1674,8 @@ pub const DecodeCache = struct {
             layers[layer] = .{ .k_cross = k_cross, .v_cross = v_cross };
             built += 1;
         }
-        if (frame_active) {
-            try cb.decoderRuntimeSubmitAndWaitFrame();
-            frame_active = false;
-        }
+        try cb.checkExecutionControl();
+        try frame.finish();
 
         // Preallocated self-cache slabs, when the backend supports them.
         var capacity: usize = 0;
@@ -1591,6 +1690,7 @@ pub const DecodeCache = struct {
             const shape = [_]i32{ @intCast(slab_rows), @intCast(d_model) };
             var all_allocated = true;
             for (layers) |*layer| {
+                try cb.checkExecutionControl();
                 const k_slab = (try cb.allocUninitF32Shape(&shape)) orelse {
                     all_allocated = false;
                     break;
@@ -1614,11 +1714,7 @@ pub const DecodeCache = struct {
             }
         }
 
-        const encoder_mask = if (native) |program| program.encoder_mask else try allocator.alloc(i64, geometry.encoder_mask_elements);
-        errdefer if (native == null) allocator.free(encoder_mask);
-        @memset(encoder_mask, 1);
-        const self_mask = if (native) |program| program.self_mask else try allocator.alloc(i64, geometry.self_mask_elements);
-        @memset(self_mask, 1);
+        try cb.checkExecutionControl();
         var fetcher = prepared.fetcher;
         prepared.fetcher.handles = .empty;
         prepared.weights.layers = &.{};
@@ -1636,8 +1732,6 @@ pub const DecodeCache = struct {
             .weights = weights,
             .fetcher = fetcher,
             .enc_seq = enc_seq,
-            .encoder_mask = encoder_mask,
-            .self_mask = self_mask,
             .capacity = capacity,
             .native_program = program_value,
         };
@@ -1658,8 +1752,6 @@ pub const DecodeCache = struct {
         self.allocator.free(self.layers);
         self.allocator.free(self.weights.layers);
         self.fetcher.release(cb);
-        self.allocator.free(self.encoder_mask);
-        self.allocator.free(self.self_mask);
         self.* = undefined;
     }
 
@@ -1679,8 +1771,8 @@ pub const StepOutput = union(enum) {
     /// the device from the logits row, so only sixteen floats come back.
     stats: StatsRequest,
     /// Like `stats`, but the step is only encoded: the frame stays open
-    /// for `decoderStepSubmit`, the device chooses the token itself, and
-    /// `decoderStepAwait` collects the statistics.
+    /// for caller submission, the device chooses the token itself, and
+    /// the caller collects the statistics.
     pipelined: PipelinedRequest,
 };
 
@@ -1701,7 +1793,7 @@ pub const StepResult = union(enum) {
     logits: []f32,
     none,
     stats: ops.WhisperLogitsStatsRaw,
-    /// The step is encoded in the open frame, waiting for `decoderStepSubmit`.
+    /// The step is encoded in the open frame, waiting for caller submission.
     encoded,
 };
 
@@ -1722,31 +1814,10 @@ fn pipelineTrace(comptime fmt: []const u8, args: anytype) void {
 /// cannot pipeline; the cache must own preallocated slabs so no step
 /// reallocates while another is in flight.
 pub fn setPipelinedDecode(cb: *const ComputeBackend, cache: *const DecodeCache, enabled: bool) bool {
-    if (!enabled) return cb.decoderRuntimeSetWhisperPipelinedFrames(false);
+    if (!enabled) return cb.decoderRuntimeSetPipelinedFrames(false);
     if (cb.kind() != .metal or !whisperMetalFramesEnabled() or !whisperPipelinedDecodeEnabled()) return false;
     if (!cache.preallocated() or whisperMetalProfileEnabled()) return false;
-    return cb.decoderRuntimeSetWhisperPipelinedFrames(true);
-}
-
-/// Submit the frame a `.pipelined` step left open. The backend keeps one
-/// submitted frame, so the previous step must have been awaited.
-pub fn decoderStepSubmit(cb: *const ComputeBackend) !void {
-    try cb.decoderRuntimeSubmitFrame();
-}
-
-/// Drop an encoded step that will never be submitted (the step before it
-/// ended the text).
-pub fn decoderStepDiscard(cb: *const ComputeBackend) void {
-    if (cb.decoderRuntimeHasActiveFrame()) cb.decoderRuntimeCancelFrame() catch {};
-}
-
-/// Wait for the step submitted by `decoderStepSubmit` and read the
-/// statistics it left in `slot`. Null when nothing could be read.
-pub fn decoderStepAwait(cb: *const ComputeBackend, slot: usize) !?ops.WhisperLogitsStatsRaw {
-    try cb.decoderRuntimeWaitSubmittedFrame();
-    var stats: ops.WhisperLogitsStatsRaw = undefined;
-    if (!cb.whisperLogitsStatsRead(slot, &stats)) return null;
-    return stats;
+    return cb.decoderRuntimeSetPipelinedFrames(true);
 }
 
 /// Decode `tokens` at positions `[cache.positions, cache.positions + len)`.
@@ -1763,6 +1834,8 @@ pub fn decoderStepCached(
     output: StepOutput,
 ) !StepResult {
     if (tokens.len == 0) return error.InvalidInputShape;
+    const end = @import("../execution/decoder_position.zig").appendEnd(cache.positions, tokens.len) catch return error.SequenceTooLong;
+    if (end > config.max_target_positions) return error.SequenceTooLong;
     if (cache.positions == 0) return decodeBlockCached(cb, allocator, config, tokens, cache, output);
     var index: usize = 0;
     while (index + 1 < tokens.len) : (index += 1) {
@@ -1841,7 +1914,7 @@ fn stepAdd(cb: *const ComputeBackend, profile: ?*StepProfile, a: CT, b: CT) !CT 
 }
 fn stepEmbedding(cb: *const ComputeBackend, profile: *StepProfile, weight: CT, ids: []const i64, rows: usize, width: usize) !CT {
     if (profile.assigned) |schedule| {
-        const node = schedule.graph.node(schedule.steps[schedule.cursor]);
+        const node = try schedule.nextNode();
         if (rows != ids.len or node.op != .gather or node.output_shape.dims[0] != rows) return error.DenseScheduleOrderChanged;
         return schedule.execute(&.{ weight, schedule.values[node.inputs[1]] orelse return error.MissingValue }, null);
     }
@@ -1857,17 +1930,17 @@ fn validatePrefixRows(cb: *const ComputeBackend, actual: CT, whole: CT, bytes: u
     if (observed.backing == null or !std.meta.eql(observed.backing, full.backing) or observed.byte_offset != full.byte_offset or observed.readable_bytes < bytes) return error.PreparedDensePrefixBindingChanged;
 }
 
-fn stepPrefix(cb: *const ComputeBackend, profile: *StepProfile, q: CT, k: CT, v: CT, mask: []const i64, live: usize, heads: usize, dim: usize) !CT {
+fn stepPrefix(cb: *const ComputeBackend, profile: *StepProfile, q: CT, k: CT, v: CT, live: usize, heads: usize, dim: usize) !CT {
     if (profile.assigned) |schedule| {
-        if (schedule.descriptors[schedule.steps[schedule.cursor]].?.operation == .dense_attention_rows) return stepCrossRows(cb, profile, q, k, v, mask, 1, live, heads, dim);
-        const node = schedule.graph.node(schedule.steps[schedule.cursor]);
+        if ((try schedule.nextDescriptor()).operation == .dense_attention_rows) return stepCrossRows(cb, profile, q, k, v, 1, live, heads, dim);
+        const node = try schedule.nextNode();
         const whole_k = schedule.values[node.inputs[1]] orelse return error.MissingValue;
         const whole_v = schedule.values[node.inputs[2]] orelse return error.MissingValue;
         for ([_]CT{ k, v }, [_]CT{ whole_k, whole_v }) |actual, whole| try validatePrefixRows(cb, actual, whole, live * heads * dim * 4);
-        const attention = ops.AttentionContext{ .total_sequence_len = live, .query_sequence_len = 1, .kv_sequence_len = live, .dense_attention_prefix = .{ .live_key_rows = live, .mask = mask } };
+        const attention = ops.AttentionContext{ .total_sequence_len = live, .query_sequence_len = 1, .kv_sequence_len = live, .dense_attention_prefix = .{ .live_key_rows = live } };
         return schedule.execute(&.{ q, whole_k, whole_v }, &attention);
     }
-    return cb.crossAttention(q, k, v, mask, 1, 1, live, heads, dim);
+    return cb.crossAttention(q, k, v, null, 1, 1, live, heads, dim);
 }
 
 fn stepCausal(cb: *const ComputeBackend, profile: *StepProfile, q: CT, k: CT, v: CT, rows: usize, heads: usize, dim: usize) !CT {
@@ -1877,18 +1950,25 @@ fn stepCausal(cb: *const ComputeBackend, profile: *StepProfile, q: CT, k: CT, v:
     }
     return cb.causalSelfAttention(q, k, v, null, 1, rows, heads, dim);
 }
-fn stepCrossRows(cb: *const ComputeBackend, profile: *StepProfile, q: CT, k: CT, v: CT, mask: []const i64, rows: usize, keys: usize, heads: usize, dim: usize) !CT {
+fn stepCrossRows(cb: *const ComputeBackend, profile: *StepProfile, q: CT, k: CT, v: CT, rows: usize, keys: usize, heads: usize, dim: usize) !CT {
     if (profile.assigned) |schedule| {
-        const attention = ops.AttentionContext{ .total_sequence_len = keys, .query_sequence_len = rows, .kv_sequence_len = keys, .dense_attention_rows = .{ .mask = mask } };
+        const attention = ops.AttentionContext{ .total_sequence_len = keys, .query_sequence_len = rows, .kv_sequence_len = keys, .dense_attention_rows = .{} };
         return schedule.execute(&.{ q, k, v }, &attention);
     }
-    return cb.crossAttention(q, k, v, mask, 1, rows, keys, heads, dim);
+    return cb.crossAttention(q, k, v, null, 1, rows, keys, heads, dim);
 }
 
 fn addNorm(cb: *const ComputeBackend, a: CT, b: CT, norm: Norm, dim: usize, profile: ?*StepProfile) !AddNormPair {
-    if (try cb.addLayerNormSum(a, b, norm.w, norm.b, dim, 1e-5)) |fused| {
-        if (profile) |prof| prof.fused_add_norm += 1;
-        return .{ .sum = fused.sum, .normed = fused.normed };
+    if (stepSchedule(profile)) |schedule| {
+        if (try schedule.executeAddNorm(a, b, norm.w, norm.b, dim, 1e-5)) |fused| {
+            profile.?.fused_add_norm += 1;
+            return .{ .sum = fused[0], .normed = fused[1] };
+        }
+    } else {
+        if (try cb.addLayerNormSum(a, b, norm.w, norm.b, dim, 1e-5)) |fused| {
+            if (profile) |prof| prof.fused_add_norm += 1;
+            return .{ .sum = fused.sum, .normed = fused.normed };
+        }
     }
     const sum = try stepAdd(cb, profile, a, b);
     errdefer stepRelease(cb, profile, sum);
@@ -1907,27 +1987,27 @@ fn decodeBlockCached(
     const d_model = config.d_model;
     const n = tokens.len;
     const start = cache.positions;
-    if (start + n > config.max_target_positions) return error.SequenceTooLong;
     std.debug.assert(start == 0 or n == 1);
+    var pos_ids_buf: [2048]i64 = undefined;
+    if (n > pos_ids_buf.len) return error.SequenceTooLong;
     const weights = &cache.weights;
 
     // One submission for the whole step. Registered before any tensor so a
     // failure cancels the frame after the intermediates are released.
-    var frame_active = try beginWhisperMetalFrame(cb, if (start == 0) .prefill else .decode);
-    errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
-    // A pipelined step must run inside a frame: the caller submits it later
-    // instead of waiting for it here.
+    // A pipelined step returns the active frame to the caller for submission.
     const pipelined = output == .pipelined;
-    if (pipelined and (!frame_active or n != 1)) {
-        pipelineTrace("step declined: frame_active={} tokens={d}", .{ frame_active, n });
+    var frame = try beginWhisperMetalFrame(cb, if (start == 0) .prefill else .decode, pipelined);
+    errdefer frame.deinit();
+    if (pipelined and (!frame.owns or n != 1)) {
+        pipelineTrace("step declined: frame_active={} tokens={d}", .{ frame.owns, n });
         return error.UnsupportedOperation;
     }
     // One compute encoder for the whole step: every runtime op joins it, so
     // the GPU sees a single command sequence rather than an encoder per op.
     // Submitting the frame closes it; the end call only releases the scope.
-    const scope_active = frame_active and (cb.decoderRuntimeBeginPlannedComputeScope() catch false);
+    const scope_active = frame.owns and (cb.decoderRuntimeBeginPlannedComputeScope() catch false);
     defer if (scope_active) cb.decoderRuntimeEndPlannedComputeScope();
-    var profile = StepProfile{ .enabled = frame_active and !pipelined and whisperMetalProfileEnabled(), .frame_active = &frame_active };
+    var profile = StepProfile{ .enabled = frame.owns and !pipelined and whisperMetalProfileEnabled(), .frame_active = &frame.owns };
     if (n == 1 and start > 0 and !pipelined) if (cache.native_program) |*program| {
         try program.beginStep(tokens[0], start);
         profile.assigned = program.schedule;
@@ -1949,8 +2029,6 @@ fn decodeBlockCached(
     var embedded_live = true;
     defer if (embedded_live) stepRelease(cb, &profile, embedded);
 
-    var pos_ids_buf: [2048]i64 = undefined;
-    if (n > pos_ids_buf.len) return error.SequenceTooLong;
     const pos_ids = pos_ids_buf[0..n];
     for (0..n) |i| pos_ids[i] = @intCast(start + i);
     const pos_emb = try stepEmbedding(cb, &profile, weights.positions, pos_ids, n, d_model);
@@ -1967,10 +2045,7 @@ fn decodeBlockCached(
 
     if (output == .none) {
         // Cache-only token: the residual stream is not needed past here.
-        if (frame_active) {
-            try cb.decoderRuntimeSubmitAndWaitFrame();
-            frame_active = false;
-        }
+        try frame.finish();
         cache.positions += n;
         return .none;
     }
@@ -2001,17 +2076,13 @@ fn decodeBlockCached(
         }
         // The frame stays open; the caller submits it once the previous
         // step has been awaited (the backend keeps one frame in flight).
-        frame_active = false;
-        cache.positions += n;
+        frame.owns = false;
         return .encoded;
     }
     if (output == .stats) {
         const request = output.stats;
         if (try cb.whisperLogitsStatsEncode(logits, &request.params, request.suppress)) {
-            if (frame_active) {
-                try cb.decoderRuntimeSubmitAndWaitFrame();
-                frame_active = false;
-            }
+            try frame.finish();
             var stats: ops.WhisperLogitsStatsRaw = undefined;
             if (cb.whisperLogitsStatsRead(request.params.stats_slot, &stats)) {
                 profile.device_choice = true;
@@ -2022,10 +2093,7 @@ fn decodeBlockCached(
             }
         }
     }
-    if (frame_active) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        frame_active = false;
-    }
+    try frame.finish();
     const result = try cb.toFloat32(logits, allocator);
     profile.mark(cb, .readback);
     profile.report(start, n);
@@ -2076,9 +2144,25 @@ const Projections = struct {
     q: CT,
     k: CT,
     v: CT,
+    wrote_cache_banks: bool = false,
 };
 
-fn projectQkv(cb: *const ComputeBackend, w: *const LayerWeights, normed: CT, rows: usize, d_model: usize, profile: *StepProfile) !Projections {
+fn projectQkv(cb: *const ComputeBackend, w: *const LayerWeights, normed: CT, rows: usize, d_model: usize, profile: *StepProfile, cache_row: ?@import("../ops/kernel_backend.zig").QkvCacheRow) !Projections {
+    if (profile.assigned) |schedule| {
+        const q = [3]CT{ normed, w.q.w, w.q.b orelse w.q.w };
+        const k = [3]CT{ normed, w.k.w, w.k.b orelse w.k.w };
+        const v = [3]CT{ normed, w.v.w, w.v.b orelse w.v.w };
+        const operands = [3][]const CT{ q[0..if (w.q.b == null) 2 else 3], k[0..if (w.k.b == null) 2 else 3], v[0..if (w.v.b == null) 2 else 3] };
+        if (cache_row) |cache| {
+            if (try schedule.executeQkvCacheRow(operands, cache)) |query| {
+                profile.fused_qkv += 1;
+                profile.in_place_kv += 1;
+                return .{ .q = query, .k = cache.keys, .v = cache.values, .wrote_cache_banks = true };
+            }
+        }
+        const projected = try schedule.executeQkv(operands);
+        return .{ .q = projected.first, .k = projected.second, .v = projected.third };
+    }
     if (w.qkv_slots) |slots| {
         if (try cb.decoderRuntimeApplyLinearQkv(&.{
             .q_slot = slots[0],
@@ -2134,42 +2218,58 @@ fn decoderBlockCached(
     // no blit splits the command sequence.
     var proj: Projections = undefined;
     var in_place = false;
-    if (cache.preallocated() and w.qkv_slots != null and start + dec_seq <= cache.capacity) {
+    const cache_row: ?@import("../ops/kernel_backend.zig").QkvCacheRow = if (cache.preallocated() and start != 0 and dec_seq == 1 and total <= cache.capacity)
+        .{ .keys = layer_cache.k_self.?, .values = layer_cache.v_self.?, .position = start, .capacity = cache.capacity }
+    else
+        null;
+    if (profile.assigned == null and cache.preallocated() and w.qkv_slots != null and total <= cache.capacity) {
         const slots = w.qkv_slots.?;
-        const k_dst = try cb.sliceRows2D(allocator, layer_cache.k_self.?, start, dec_seq, d_model);
-        var dst_live = true;
-        errdefer if (dst_live) stepRelease(cb, profile, k_dst);
-        const v_dst = try cb.sliceRows2D(allocator, layer_cache.v_self.?, start, dec_seq, d_model);
-        errdefer if (dst_live) stepRelease(cb, profile, v_dst);
-        var q_in_place: ?CT = null;
-        if (dec_seq == 1) {
-            q_in_place = try cb.decoderRuntimeApplyLinearQkvInto(&.{
-                .q_slot = slots[0],
-                .k_slot = slots[1],
-                .v_slot = slots[2],
-                .input = normed,
-                .in_dim = d_model,
-                .q_out_dim = d_model,
-                .kv_out_dim = d_model,
-            }, k_dst, v_dst);
-        } else {
-            const k_ok = try cb.decoderRuntimeApplyLinearInto(&.{ .slot = slots[1], .input = normed, .in_dim = d_model, .out_dim = d_model }, k_dst);
-            const v_ok = k_ok and try cb.decoderRuntimeApplyLinearInto(&.{ .slot = slots[2], .input = normed, .in_dim = d_model, .out_dim = d_model }, v_dst);
-            if (v_ok) q_in_place = try stepLinear(cb, profile, w.q, normed, dec_seq, d_model, d_model);
+        const request = ops.DecoderRuntimeApplyLinearQkvRequest{
+            .q_slot = slots[0],
+            .k_slot = slots[1],
+            .v_slot = slots[2],
+            .input = normed,
+            .in_dim = d_model,
+            .q_out_dim = d_model,
+            .kv_out_dim = d_model,
+        };
+        if (cache_row) |row| {
+            if (try dense_backend.projectionQkvCacheRow(cb, &request, row, null)) |q| {
+                proj = .{ .q = q, .k = row.keys, .v = row.values, .wrote_cache_banks = true };
+                in_place = true;
+                profile.fused_qkv += 1;
+                profile.in_place_kv += 1;
+            }
         }
-        if (q_in_place) |q| {
-            proj = .{ .q = q, .k = k_dst, .v = v_dst };
-            in_place = true;
-            profile.fused_qkv += 1;
-            profile.in_place_kv += 1;
-        } else {
-            stepRelease(cb, profile, k_dst);
-            stepRelease(cb, profile, v_dst);
+        if (!in_place) {
+            const k_dst = try cb.sliceRows2D(allocator, layer_cache.k_self.?, start, dec_seq, d_model);
+            var dst_live = true;
+            errdefer if (dst_live) stepRelease(cb, profile, k_dst);
+            const v_dst = try cb.sliceRows2D(allocator, layer_cache.v_self.?, start, dec_seq, d_model);
+            errdefer if (dst_live) stepRelease(cb, profile, v_dst);
+            var q_in_place: ?CT = null;
+            if (dec_seq == 1) {
+                q_in_place = try cb.decoderRuntimeApplyLinearQkvInto(&request, k_dst, v_dst);
+            } else if (try cb.decoderRuntimeApplyLinearKvInto(&request, k_dst, v_dst)) {
+                q_in_place = try stepLinear(cb, profile, w.q, normed, dec_seq, d_model, d_model);
+            }
+            if (q_in_place) |q| {
+                proj = .{ .q = q, .k = k_dst, .v = v_dst };
+                in_place = true;
+                profile.fused_qkv += 1;
+                profile.in_place_kv += 1;
+            } else {
+                stepRelease(cb, profile, k_dst);
+                stepRelease(cb, profile, v_dst);
+            }
+            dst_live = false;
         }
-        dst_live = false;
     }
-    if (!in_place) proj = try projectQkv(cb, w, normed, dec_seq, d_model, profile);
-    var kv_consumed = false;
+    if (!in_place) {
+        proj = try projectQkv(cb, w, normed, dec_seq, d_model, profile, cache_row);
+        in_place = proj.wrote_cache_banks;
+    }
+    var kv_consumed = proj.wrote_cache_banks;
     defer {
         stepRelease(cb, profile, proj.q);
         if (!kv_consumed) {
@@ -2180,33 +2280,41 @@ fn decoderBlockCached(
     profile.mark(cb, .qkv);
 
     var self_attn: CT = undefined;
-    if (start == 0 and !cache.preallocated()) {
-        // First block without slabs: the projections become the cache.
+    if (start == 0) {
+        if (cache.preallocated()) {
+            if (!in_place) {
+                // Prefill attends over the projected rows directly. Copy
+                // into the slabs for the next step without making views.
+                _ = try appendSelfCache(cb, allocator, cache, &layer_cache.k_self, proj.k, start, dec_seq, d_model, true);
+                _ = try appendSelfCache(cb, allocator, cache, &layer_cache.v_self, proj.v, start, dec_seq, d_model, true);
+            }
+            profile.mark(cb, .kv_append);
+        }
         self_attn = try stepCausal(cb, profile, proj.q, proj.k, proj.v, dec_seq, num_heads, head_dim);
-        layer_cache.k_self = proj.k;
-        layer_cache.v_self = proj.v;
-        kv_consumed = true;
+        if (!cache.preallocated()) {
+            layer_cache.k_self = proj.k;
+            layer_cache.v_self = proj.v;
+            kv_consumed = true;
+        }
     } else {
-        // Slabs take a copy of the fresh rows unless they were projected in
-        // place; concatenation copies too. In every case the projections
-        // are released with this block.
-        const k_rows = if (in_place)
+        // Continuation reads the entire committed prefix and its new row.
+        const k_rows = if (proj.wrote_cache_banks and profile.assigned != null)
+            CachedRows{ .tensor = proj.k, .owned_view = false }
+        else if (in_place)
             CachedRows{ .tensor = try cb.sliceRows2D(allocator, layer_cache.k_self.?, 0, total, d_model), .owned_view = true }
         else
             try appendSelfCache(cb, allocator, cache, &layer_cache.k_self, proj.k, start, dec_seq, d_model, profile.assigned != null);
         defer if (k_rows.owned_view) stepRelease(cb, profile, k_rows.tensor);
-        const v_rows = if (in_place)
+        const v_rows = if (proj.wrote_cache_banks and profile.assigned != null)
+            CachedRows{ .tensor = proj.v, .owned_view = false }
+        else if (in_place)
             CachedRows{ .tensor = try cb.sliceRows2D(allocator, layer_cache.v_self.?, 0, total, d_model), .owned_view = true }
         else
             try appendSelfCache(cb, allocator, cache, &layer_cache.v_self, proj.v, start, dec_seq, d_model, profile.assigned != null);
         defer if (v_rows.owned_view) stepRelease(cb, profile, v_rows.tensor);
         profile.mark(cb, .kv_append);
-        if (start == 0) {
-            self_attn = try stepCausal(cb, profile, proj.q, proj.k, proj.v, dec_seq, num_heads, head_dim);
-        } else {
-            // One new query over every cached key: causal by construction.
-            self_attn = if (dec_seq == 1) try stepPrefix(cb, profile, proj.q, k_rows.tensor, v_rows.tensor, cache.self_mask[0..total], total, num_heads, head_dim) else try cb.crossAttention(proj.q, k_rows.tensor, v_rows.tensor, cache.self_mask[0..total], 1, dec_seq, total, num_heads, head_dim);
-        }
+        std.debug.assert(dec_seq == 1);
+        self_attn = try stepPrefix(cb, profile, proj.q, k_rows.tensor, v_rows.tensor, total, num_heads, head_dim);
     }
     defer stepRelease(cb, profile, self_attn);
     profile.mark(cb, .self_attn);
@@ -2223,7 +2331,7 @@ fn decoderBlockCached(
     const Q_cross = try stepLinear(cb, profile, w.cross_q, after_self.normed, dec_seq, d_model, d_model);
     defer stepRelease(cb, profile, Q_cross);
     profile.mark(cb, .cross_norm_q);
-    const cross_attn = if (dec_seq == 1) try stepPrefix(cb, profile, Q_cross, layer_cache.k_cross, layer_cache.v_cross, cache.encoder_mask, cache.enc_seq, num_heads, head_dim) else try stepCrossRows(cb, profile, Q_cross, layer_cache.k_cross, layer_cache.v_cross, cache.encoder_mask, dec_seq, cache.enc_seq, num_heads, head_dim);
+    const cross_attn = if (dec_seq == 1) try stepPrefix(cb, profile, Q_cross, layer_cache.k_cross, layer_cache.v_cross, cache.enc_seq, num_heads, head_dim) else try stepCrossRows(cb, profile, Q_cross, layer_cache.k_cross, layer_cache.v_cross, dec_seq, cache.enc_seq, num_heads, head_dim);
     defer stepRelease(cb, profile, cross_attn);
     profile.mark(cb, .cross_attn);
     const cross_proj = try stepLinear(cb, profile, w.cross_o, cross_attn, dec_seq, d_model, d_model);
@@ -2298,6 +2406,14 @@ fn checkIncrementalResidentEncoder(cb: ComputeBackend, reference: ComputeBackend
     for (expected_first, actual_first) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.0001);
     for (expected_second, actual_second) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.0001);
     try std.testing.expectEqual(@as(usize, 3), cache.positions);
+    try std.testing.expectError(error.SequenceTooLong, decoderStepCachedLogits(&cb, a, config, &.{ 0, 1, 2, 0, 1, 2 }, &cache));
+    try std.testing.expectEqual(@as(usize, 3), cache.positions);
+    const actual_retry = try decoderStepCachedLogits(&cb, a, config, &.{ 0, 1 }, &cache);
+    defer a.free(actual_retry);
+    const expected_retry = try decoderStepCachedLogits(&reference, a, config, &.{ 0, 1 }, &expected_cache);
+    defer a.free(expected_retry);
+    for (expected_retry, actual_retry) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.0001);
+    try std.testing.expectEqual(@as(usize, 5), cache.positions);
     const geometry = try CacheGeometry.init(config, 2);
     const amounts = try geometry.cacheAmounts(&cb);
     const logical = 2 * config.decoder_layers * (geometry.cross_tensor_bytes + geometry.self_tensor_bytes);
@@ -2327,9 +2443,14 @@ test "incremental resident encoder and real Metal KV steps match Native referenc
 test "incremental canonical cache geometry bounds full encoder constructor and rejects overflow" {
     const config: Config = .{ .d_model = 64, .decoder_layers = 2, .decoder_attention_heads = 2, .decoder_ffn_dim = 128, .max_target_positions = 8, .vocab_size = 4 };
     const geometry = try CacheGeometry.init(config, 1024);
-    try std.testing.expect(try geometry.workspaceBytes(config) >= 6 * 1024 * 64 * @sizeOf(f32));
-    try std.testing.expectEqual(@as(usize, 1024), geometry.encoder_mask_elements);
-    try std.testing.expectEqual(@as(usize, 8), geometry.self_mask_elements);
+    const decode_workspace = try geometry.workspaceBytes(config, 1);
+    try std.testing.expect(decode_workspace >= 6 * 1024 * 64 * @sizeOf(f32));
+    try std.testing.expectEqual(decode_workspace, try geometry.workspaceBytes(config, 0));
+    var prefill_config = config;
+    prefill_config.max_target_positions = 256;
+    const prefill_geometry = try CacheGeometry.init(prefill_config, 32);
+    try std.testing.expect(try prefill_geometry.workspaceBytes(prefill_config, 256) >= 256 * 256 * 2 * 3 * @sizeOf(f32));
+    try std.testing.expectError(error.ResourceLimitExceeded, geometry.workspaceBytes(config, std.math.maxInt(usize)));
     try std.testing.expectError(error.ResourceLimitExceeded, CacheGeometry.init(config, std.math.maxInt(usize)));
     try std.testing.expectError(error.InvalidInputShape, CacheGeometry.init(config, 0));
 }

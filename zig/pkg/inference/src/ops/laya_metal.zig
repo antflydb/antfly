@@ -395,7 +395,7 @@ const Execution = struct {
         defer view.deinit();
         var output = try self.allocate(rows * l.output * 4, &.{ @intCast(rows), @intCast(l.output) });
         errdefer output.deinit();
-        if (!try runtime.tryApplyDenseRuntimeLinearInto(self.owner.provider, l.slot, view, rows, l.input, l.output, output)) {
+        if (!try runtime.decoderRuntimeApplyLinearDeviceInto(self.owner.provider, l.slot, view, rows, l.input, l.output, output)) {
             std.log.err("Laya resident projection failed: {s} rows={d} input={d} output={d}", .{ name, rows, l.input, l.output });
             return error.LayaResidentLinearDispatchFailed;
         }

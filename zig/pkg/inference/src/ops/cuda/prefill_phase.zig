@@ -72,10 +72,8 @@ const Cold = struct {
     allocator: std.mem.Allocator,
     node: retirement.Node = undefined,
     funding: ?*funding_mod.Funding = null,
-    upgrades: [2]?quota_mod.RawUpgrade = @splat(null),
     fn destroyOutside(self: *Cold) void {
         if (self.funding) |value| value.finishOutsideExecution();
-        for (&self.upgrades) |*value| if (value.*) |*upgrade| upgrade.deinitOutsideExecution();
         self.allocator.destroy(self);
     }
     fn retire(raw: *anyopaque) callconv(.c) void {
@@ -88,7 +86,7 @@ pub const Phase = struct {
     expected_compute: usize = 0,
     old: Snapshot = undefined,
     admission: ?@import("video_cache_budget.zig").Admission = null,
-    mode: enum { none, query, upgrade, fund } = .none,
+    mode: enum { none, query, fund } = .none,
     queried: bool = false,
     recurrent_bytes: usize = 0,
     packet_bytes: [2]usize = @splat(0),
@@ -123,37 +121,21 @@ pub const Phase = struct {
         const cold = try a.create(Cold);
         cold.* = .{ .allocator = a };
         errdefer cold.destroyOutside();
-        if (self.mode == .upgrade) {
-            const values = [_]quota_mod.Quota{ self.old.recurrent_quota, self.old.attention_quota };
-            for (values, 0..) |quota, index| if (quota == .raw) {
-                const controller = quota.raw.controller orelse return error.MissingCacheRetirementDomain;
-                const pin = model.retainAdmissionDomain(controller) orelse return error.MissingCacheRetirementDomain;
-                defer pin.release();
-                cold.upgrades[index] = try quota_mod.RawUpgrade.prepare(quota.raw, &pin);
-            };
-        } else {
-            if (self.mode != .fund or self.request_count == 0) return error.InvalidPreparedCacheState;
-            const funding = try funding_mod.Funding.createWithAllocator(a, .{ .requests = self.requests[0..self.request_count] });
-            cold.funding = funding;
-            for (funding.entries, 0..) |entry, index| try funding.noteMiss(index, entry.request.external_prefill.amounts(), 0);
-            funding.admission = self.admission;
-            funding.compute_identity = self.expected_compute;
-            funding.state = .snapped;
-            var pin: ?@import("../../runtime/tier/admission_domain.zig").Pin = null;
-            if (self.admission) |policy| pin = model.retainAdmissionDomain(policy.controller) orelse return error.MissingCacheRetirementDomain;
-            defer if (pin) |value| value.release();
-            try funding.fundOutsideExecution(if (pin) |*value| value else null);
-        }
+        if (self.mode != .fund or self.request_count == 0) return error.InvalidPreparedCacheState;
+        const funding = try funding_mod.Funding.createWithAllocator(a, .{ .requests = self.requests[0..self.request_count] });
+        cold.funding = funding;
+        for (funding.entries, 0..) |entry, index| try funding.noteMiss(index, entry.request.external_prefill.amounts(), 0);
+        funding.admission = self.admission;
+        funding.compute_identity = self.expected_compute;
+        funding.state = .snapped;
+        var pin: ?@import("../../runtime/tier/admission_domain.zig").Pin = null;
+        if (self.admission) |policy| pin = model.retainAdmissionDomain(policy.controller) orelse return error.MissingCacheRetirementDomain;
+        defer if (pin) |value| value.release();
+        try funding.fundOutsideExecution(if (pin) |*value| value else null);
         self.cold = cold;
     }
     pub fn preparedFunding(self: *Phase) !*funding_mod.Funding {
         return (self.cold orelse return error.InvalidPreparedCacheState).funding orelse return error.InvalidPreparedCacheState;
-    }
-    pub fn installUpgrades(self: *Phase, recurrent: *quota_mod.Quota, attention: ?*quota_mod.Quota) !void {
-        if (self.mode != .upgrade) return error.InvalidPreparedCacheState;
-        const cold = self.cold orelse return error.InvalidPreparedCacheState;
-        if (cold.upgrades[0]) |*value| _ = try value.install(recurrent);
-        if (cold.upgrades[1]) |*value| _ = try value.install(attention orelse return error.PreparedCachePlanChanged);
     }
     pub fn bindFunding(self: *Phase, current: Cleanup) !void {
         const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;

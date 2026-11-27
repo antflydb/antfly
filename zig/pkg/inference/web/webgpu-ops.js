@@ -1793,11 +1793,11 @@ export class WebGPUOps {
     const qBuf = this.buffers.get(qId);
     const kBuf = this.buffers.get(kId);
     const vBuf = this.buffers.get(vId);
-    const maskBuf = this.buffers.get(maskId);
+    const maskBuf = (maskId === 0 ? qBuf : this.buffers.get(maskId));
     const outBuf = this.buffers.get(outId);
     if (!qBuf || !kBuf || !vBuf || !maskBuf || !outBuf) return;
 
-    // Params: dec_seq, enc_seq, num_heads, head_dim, scale, _pad (24 bytes)
+    // Params: dec_seq, enc_seq, num_heads, head_dim, scale, has_mask (24 bytes)
     const scale = 1.0 / Math.sqrt(headDim);
     const paramsAB = new ArrayBuffer(24);
     const paramsU32 = new Uint32Array(paramsAB);
@@ -1807,7 +1807,7 @@ export class WebGPUOps {
     paramsU32[2] = numHeads;
     paramsU32[3] = headDim;
     paramsF32[4] = scale;
-    paramsU32[5] = 0; // padding
+    paramsU32[5] = maskId !== 0 ? 1 : 0;
 
     const paramsBuffer = this.device.createBuffer({
       size: 24,

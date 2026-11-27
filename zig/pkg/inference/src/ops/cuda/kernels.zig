@@ -1485,6 +1485,7 @@ const GqaFlashPrefillRequest = struct {
     kv_position_offset: usize,
     sliding_window: usize,
     total_sequence_len: usize,
+    wide_single_kv: bool = false,
 };
 
 fn gqaFlashPrefillTargetSupported(major: i32, minor: i32, kv_heads: usize) bool {
@@ -1494,7 +1495,9 @@ fn gqaFlashPrefillTargetSupported(major: i32, minor: i32, kv_heads: usize) bool 
 }
 
 fn gqaFlashPrefillEligibility(request: GqaFlashPrefillRequest) GqaFlashPrefillEligibility {
-    if (!gqaFlashPrefillTargetSupported(request.compute_major, request.compute_minor, request.base.num_kv_heads)) {
+    const wide_single_kv = request.wide_single_kv and request.base.num_kv_heads == 1;
+    if (wide_single_kv and (request.compute_major != 12 or request.compute_minor != 1)) return .compute_capability_ineligible;
+    if (!wide_single_kv and !gqaFlashPrefillTargetSupported(request.compute_major, request.compute_minor, request.base.num_kv_heads)) {
         return .compute_capability_ineligible;
     }
     const kv_heads: usize = if (request.base.num_kv_heads == 2) 2 else 1;
@@ -1511,7 +1514,7 @@ fn gqaFlashPrefillEligibility(request: GqaFlashPrefillRequest) GqaFlashPrefillEl
     if (request.base.page_size_tokens != cuda_kernel_renderer.generated_flash_prefill_page_size_tokens) {
         return .page_size_ineligible;
     }
-    const policy: cuda_kernel_renderer.FlashPrefillQueryLengthPolicy = if (kv_heads == 2)
+    const policy: cuda_kernel_renderer.FlashPrefillQueryLengthPolicy = if (kv_heads == 2 or wide_single_kv)
         .paged_f16_q2_to_8192_128k_v2
     else
         .gemma4_q512_or_q3_v1;
@@ -2413,6 +2416,7 @@ pub const KernelModule = struct {
     add_scalar_f32: driver_mod.CUfunction = null,
     binary_scalar_f32: driver_mod.CUfunction = null,
     add_mul_scalar_f32: driver_mod.CUfunction = null,
+    add_mul_scalar_separate_f32: driver_mod.CUfunction = null,
     add_weighted_scalars_f32: driver_mod.CUfunction = null,
     linear_f32: driver_mod.CUfunction = null,
     linear_f32_tiled: driver_mod.CUfunction = null,
@@ -2630,6 +2634,7 @@ pub const KernelModule = struct {
     /// Admitted by a model adapter; all physical/storage/target checks remain
     /// in the shared Flash selector, including explicit rollback profiles.
     grouped_f16_flash_prefill: bool = false,
+    long_single_kv_flash_prefill: bool = false,
     // Resolved once at module load: the score-prework decision runs per layer
     // per decoded token and getenv is a linear scan of environ.
     gqa_score_prework_mode: GeneratedGqaScorePreworkMode = .automatic,
@@ -2646,8 +2651,9 @@ pub const KernelModule = struct {
     gqa_prefill_mma_m32_smem_opted_in: bool = false,
     gqa_prefill_flash_e4b_smem_functions: [2]driver_mod.CUfunction = .{ null, null },
     gqa_attention_decode_f16_warp_stage1_f32: driver_mod.CUfunction = null,
-    e4b_f16_warp_split_enabled: bool = false,
-    e4b_f16_warp_split_used: bool = false,
+    f16_gqa_warp_split_enabled: bool = false,
+    f16_mqa_warp_split_enabled: bool = false,
+    f16_warp_split_used: bool = false,
     gqa_attention_decode_turboquant_split_stage1_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_turboquant_split_stage2_f32: driver_mod.CUfunction = null,
@@ -2656,6 +2662,12 @@ pub const KernelModule = struct {
     deberta_attention_f32: driver_mod.CUfunction = null,
     deberta_attention_fused_f32: driver_mod.CUfunction = null,
     deberta_attention_stream_f32: driver_mod.CUfunction = null,
+    gliner25_attention_softmax_f32: driver_mod.CUfunction = null,
+    gliner25_attention_pointer_views_f32: driver_mod.CUfunction = null,
+    gliner25_attention_stage_bf16: driver_mod.CUfunction = null,
+    gliner25_attention_softmax_bf16: driver_mod.CUfunction = null,
+    gliner25_ffn_bias_gelu_bf16: driver_mod.CUfunction = null,
+    gliner25_attention_pointer_views_bf16: driver_mod.CUfunction = null,
     deberta_attention_stream_f16: driver_mod.CUfunction = null,
     /// Generated tensor-core DeBERTa prefill schedule. It consumes graph
     /// layout F32 directly and owns a 16-query x 32-key tile per CTA.
@@ -2669,6 +2681,9 @@ pub const KernelModule = struct {
     deberta_attention_backward_scores_f32: driver_mod.CUfunction = null,
     deberta_attention_backward_f32: driver_mod.CUfunction = null,
     gliner25_boundary_f32: driver_mod.CUfunction = null,
+    gliner25_boundary_banded_f32: driver_mod.CUfunction = null,
+    gliner25_boundary_parallel_f32: driver_mod.CUfunction = null,
+    gliner25_norm_bf16_mirror: driver_mod.CUfunction = null,
     training_validate_f32: driver_mod.CUfunction = null,
     training_validate_finish: driver_mod.CUfunction = null,
     gliner25_layer_norm_f32: driver_mod.CUfunction = null,
@@ -2936,6 +2951,15 @@ pub const KernelModule = struct {
         if (std.mem.eql(u8, field, "linear_q4_k_generated_bias_gelu")) return null;
         if (std.mem.eql(u8, field, "gqa_attention_prefill_flash_sm89_e4b_hd256_f32")) return cuda_kernel_renderer.generated_flash_prefill_e4b_hd256_kernel_id;
         if (std.mem.eql(u8, field, "gqa_attention_prefill_flash_sm89_e4b_hd512_f32")) return cuda_kernel_renderer.generated_flash_prefill_e4b_hd512_kernel_id;
+        if (std.mem.eql(u8, field, "gliner25_attention_softmax_f32")) return "termite_gliner25_attention_softmax_f32_v2";
+        if (std.mem.eql(u8, field, "gliner25_attention_pointer_views_f32")) return "termite_gliner25_attention_pointer_views_f32_v1";
+        if (std.mem.eql(u8, field, "gliner25_attention_stage_bf16")) return "termite_gliner25_attention_stage_bf16_v1";
+        if (std.mem.eql(u8, field, "gliner25_attention_softmax_bf16")) return "termite_gliner25_attention_softmax_bf16_v2";
+        if (std.mem.eql(u8, field, "gliner25_ffn_bias_gelu_bf16")) return "termite_gliner25_ffn_bias_gelu_bf16_v1";
+        if (std.mem.eql(u8, field, "gliner25_attention_pointer_views_bf16")) return "termite_gliner25_attention_pointer_views_bf16_v2";
+        if (std.mem.eql(u8, field, "gliner25_boundary_banded_f32")) return "termite_gliner25_boundary_banded_f32_v1";
+        if (std.mem.eql(u8, field, "gliner25_boundary_parallel_f32")) return "termite_gliner25_boundary_parallel_f32_v1";
+        if (std.mem.eql(u8, field, "gliner25_norm_bf16_mirror")) return "termite_gliner25_norm_bf16_mirror_v1";
         return "termite_" ++ field;
     }
 
@@ -3873,7 +3897,7 @@ pub const KernelModule = struct {
         loaded.gqa_score_prework_mode = gqa_score_prework_mode;
         loaded.gqa_score_prework_consumer_mode = gqa_score_prework_consumer_mode;
         loaded.gliner25_attention = gliner25_attention;
-        loaded.e4b_f16_warp_split_enabled = ctx.info.compute_major == 8 and ctx.info.compute_minor == 9 and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT", false);
+        loaded.f16_gqa_warp_split_enabled = ctx.info.compute_major == 8 and ctx.info.compute_minor == 9 and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT", false);
         return loaded;
     }
 
@@ -3969,8 +3993,9 @@ pub const KernelModule = struct {
             self.gqa_prefill_mma_smem_opted_in = false;
             self.gqa_prefill_mma_m32_smem_opted_in = false;
             self.gqa_prefill_flash_e4b_smem_functions = .{ null, null };
-            self.e4b_f16_warp_split_enabled = false;
-            self.e4b_f16_warp_split_used = false;
+            self.f16_gqa_warp_split_enabled = false;
+            self.f16_mqa_warp_split_enabled = false;
+            self.f16_warp_split_used = false;
             self.gliner25_attention = @splat(null);
         }
         self.clearBundledFunctions();
@@ -4199,12 +4224,42 @@ pub const KernelModule = struct {
     }
 
     /// Descriptors and byte extents are checked by the shared boundary planner.
-    pub fn launchGliner25Boundary(self: *const KernelModule, ctx: *context_mod.CudaContext, inputs: [10]buffer_mod.DeviceBuffer, output: buffer_mod.DeviceBuffer, descriptor: @import("../gliner_boundary_device_ops.zig").Params, work: usize, inference_only: bool, mixed_attention: bool) !void {
+    pub fn launchGliner25NormBf16Mirror(self: *const KernelModule, ctx: *context_mod.CudaContext, output: buffer_mod.DeviceBuffer, mirror: buffer_mod.DeviceBuffer, inputs: [4]buffer_mod.DeviceBuffer, rows: usize, width: usize, eps: f32, flavor: u32) !void {
+        const function = self.gliner25_norm_bf16_mirror orelse return error.CudaKernelUnavailable;
+        const count = try checkedTensorElements(rows, width);
+        if (count == 0 or flavor > 3 or !std.math.isFinite(eps) or eps <= 0) return error.InvalidCudaState;
+        try checkBytes(output, count);
+        if (mirror.ptr == 0 or mirror.len < try checkedTensorElements(count, 2)) return error.InvalidCudaState;
+        try checkBytes(inputs[0], count);
+        if (flavor == 1 or flavor == 2) try checkBytes(inputs[1], count);
+        try checkBytes(inputs[2], width);
+        try checkBytes(inputs[3], width);
+        var pointers = [_]driver_mod.CUdeviceptr{ output.ptr, mirror.ptr, inputs[0].ptr, inputs[1].ptr, inputs[2].ptr, inputs[3].ptr };
+        var n = try toU32(rows);
+        var dim = try toU32(width);
+        var epsilon = eps;
+        var mode = flavor;
+        var params: [10]?*anyopaque = undefined;
+        for (&pointers, 0..) |*pointer, i| params[i] = @ptrCast(pointer);
+        params[6] = @ptrCast(&n);
+        params[7] = @ptrCast(&dim);
+        params[8] = @ptrCast(&epsilon);
+        params[9] = @ptrCast(&mode);
+        try launchBlocks(function, ctx, if (flavor < 2) (rows + 7) / 8 else rows, 256, &params);
+    }
+
+    pub fn launchGliner25Boundary(self: *const KernelModule, ctx: *context_mod.CudaContext, inputs: [10]buffer_mod.DeviceBuffer, output: buffer_mod.DeviceBuffer, descriptor: @import("../gliner_boundary_device_ops.zig").Params, work: usize, inference_only: bool, mixed_attention: bool, experimental_bf16: bool) !bool {
+        const banded = experimental_bf16 and inference_only and ctx.info.compute_major == 8 and ctx.info.compute_minor == 9 and descriptor.kind == 6 and descriptor.dims[0] <= 8 and descriptor.dims[1] <= 512 and descriptor.dims[2] <= 16 and descriptor.dims[3] <= 32 and descriptor.dims[4] <= 128 and self.gliner25_boundary_banded_f32 != null;
+        const parallel = experimental_bf16 and inference_only and ctx.info.compute_major == 8 and ctx.info.compute_minor == 9 and
+            descriptor.dims[0] > 0 and descriptor.dims[0] <= 8 and descriptor.dims[1] >= 256 and descriptor.dims[1] <= 512 and
+            descriptor.dims[2] > 0 and descriptor.dims[2] <= 128 and
+            ((descriptor.kind == 8 and descriptor.dims[3] > 0 and descriptor.dims[3] <= 128) or descriptor.kind == 9 or descriptor.kind == 10) and
+            self.gliner25_boundary_parallel_f32 != null;
         const tiled_attention = inference_only and descriptor.kind == 30 and self.gliner_boundary_attention_f32 != null;
         const tensor_attention = tiled_attention and mixed_attention and descriptor.dims[3] == 64;
         const compact = tensor_attention and descriptor.dims[1] >= 2048 and self.gliner_boundary_attention_tc_f16_compact != null;
         const wide = compact or tensor_attention and descriptor.dims[1] >= 512 and self.gliner_boundary_attention_tc_f16_m64 != null;
-        const function = (if (compact) self.gliner_boundary_attention_tc_f16_compact else if (wide) self.gliner_boundary_attention_tc_f16_m64 else if (tensor_attention) self.gliner_boundary_attention_tc_f16 else if (tiled_attention) self.gliner_boundary_attention_f32 else self.gliner25_boundary_f32) orelse return error.CudaKernelUnavailable;
+        const function = (if (banded) self.gliner25_boundary_banded_f32 else if (parallel) self.gliner25_boundary_parallel_f32 else if (compact) self.gliner_boundary_attention_tc_f16_compact else if (wide) self.gliner_boundary_attention_tc_f16_m64 else if (tensor_attention) self.gliner_boundary_attention_tc_f16 else if (tiled_attention) self.gliner_boundary_attention_f32 else self.gliner25_boundary_f32) orelse return error.CudaKernelUnavailable;
         var pointers: [11]driver_mod.CUdeviceptr = undefined;
         for (inputs, 0..) |input, i| pointers[i] = input.ptr;
         pointers[10] = output.ptr;
@@ -4214,7 +4269,17 @@ pub const KernelModule = struct {
         for (&pointers, 0..) |*pointer, i| params[i] = @ptrCast(pointer);
         params[11] = @ptrCast(&desc);
         params[12] = @ptrCast(&count);
-        if (tiled_attention) {
+        if (banded) {
+            try ctx.makeCurrent();
+            const blocks = try checkedTensorElements(try checkedTensorElements(descriptor.dims[0], descriptor.dims[1]), descriptor.dims[2]);
+            try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(function, try toU32(blocks), 1, 1, 256, 1, 1, 0, ctx.stream, &params, null));
+            ctx.noteKernelLaunch();
+        } else if (parallel) {
+            const blocks = if (descriptor.kind == 8) (work + 7) / 8 else try checkedTensorElements(descriptor.dims[0], descriptor.dims[2]);
+            try ctx.makeCurrent();
+            try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(function, try toU32(blocks), 1, 1, if (descriptor.kind == 8) 256 else 512, 1, 1, 0, ctx.stream, &params, null));
+            ctx.noteKernelLaunch();
+        } else if (tiled_attention) {
             // Wider direct relative tiles retain the short path's workspace contract.
             const query_tile: usize = if (wide) 64 else 16;
             try ctx.makeCurrent();
@@ -4225,6 +4290,7 @@ pub const KernelModule = struct {
             try ctx.launchKernel(function, try toU32(blocks), 1, 1, if (tensor_attention) 256 else 128, 1, 1, 0, ctx.stream, &params, null);
             ctx.noteKernelLaunch();
         } else try launch1d(function, ctx, work, &params);
+        return banded or parallel;
     }
 
     /// Backend-neutral primitives required by the compiled autodiff executor,
@@ -5227,6 +5293,7 @@ pub const KernelModule = struct {
         b: buffer_mod.DeviceBuffer,
         scalar: buffer_mod.DeviceBuffer,
         count: usize,
+        separate_rounding: bool,
     ) driver_mod.Error!void {
         try checkBytes(dst, count);
         try checkBytes(a, count);
@@ -5234,13 +5301,19 @@ pub const KernelModule = struct {
         try checkBytes(scalar, 1);
         if (count == 0) return;
 
+        const function = if (separate_rounding) self.add_mul_scalar_separate_f32 else self.add_mul_scalar_f32;
+        if (separate_rounding and function == null) {
+            try self.launchBinaryScalarF32(ctx, dst, a, scalar, count, .multiply, false);
+            try self.launchElementwiseF32(ctx, dst, dst, b, count, .add);
+            return;
+        }
         var dst_ptr = dst.ptr;
         var a_ptr = a.ptr;
         var b_ptr = b.ptr;
         var scalar_ptr = scalar.ptr;
         var count_u32 = try toU32(count);
         var params = launch_abi.addresses(.{ &dst_ptr, &a_ptr, &b_ptr, &scalar_ptr, &count_u32 });
-        try launch1d(self.add_mul_scalar_f32, ctx, count, &params);
+        try launch1d(function, ctx, count, &params);
     }
 
     pub fn launchAddWeightedScalarsF32(
@@ -9796,8 +9869,13 @@ pub const KernelModule = struct {
         );
         const f16_prefill_request = r.eligibility(GqaF16PrefillRequest);
         const f16_prefill_eligibility = gqaF16PrefillEligibility(f16_prefill_request);
+        const wide_single_kv = self.long_single_kv_flash_prefill and self.gqa_prefill_profile == .mma and
+            r.num_kv_heads == 1 and r.kv_seq_len > 8192;
+        const wide_flash = r.num_kv_heads == 2 or wide_single_kv;
+        const flash_prefill_profile: GqaPrefillProfile = if (wide_single_kv) .automatic else self.gqa_prefill_profile;
         const flash_prefill_request = GqaFlashPrefillRequest{
             .base = f16_prefill_request,
+            .wide_single_kv = wide_single_kv,
             .compute_major = ctx.info.compute_major,
             .compute_minor = ctx.info.compute_minor,
             .query_position_offset = r.query_position_offset,
@@ -9811,12 +9889,12 @@ pub const KernelModule = struct {
             self.gqa_prefill_profile != .tiled_f16_exact))
             return error.CudaKernelUnavailable;
         const flash_prefill_function = switch (r.head_dim) {
-            256 => if (r.num_kv_heads == 2) self.gqa_attention_prefill_flash_sm89_e4b_hd256_f32 else self.gqa_attention_prefill_flash_sm89_hd256_f32,
-            512 => if (r.num_kv_heads == 2) self.gqa_attention_prefill_flash_sm89_e4b_hd512_f32 else self.gqa_attention_prefill_flash_sm89_hd512_f32,
+            256 => if (wide_flash) self.gqa_attention_prefill_flash_sm89_e4b_hd256_f32 else self.gqa_attention_prefill_flash_sm89_hd256_f32,
+            512 => if (wide_flash) self.gqa_attention_prefill_flash_sm89_e4b_hd512_f32 else self.gqa_attention_prefill_flash_sm89_hd512_f32,
             else => null,
         };
         const flash_prefill_launch = selectGqaFlashPrefillLaunch(
-            self.gqa_prefill_profile,
+            flash_prefill_profile,
             flash_prefill_eligibility,
             flash_prefill_function != null and (r.num_kv_heads != 2 or self.gqa_prefill_profile != .automatic or self.grouped_f16_flash_prefill),
         );
@@ -9831,7 +9909,7 @@ pub const KernelModule = struct {
         // falls through silently and keeps the historical unset (`off`)
         // launch topology; only the explicit `flash-f16-sm89` profile tags
         // fallback launch kinds for telemetry.
-        if (self.gqa_prefill_profile.selectsFlashF16Sm89() and r.q_seq_len > 1) {
+        if (flash_prefill_profile.selectsFlashF16Sm89() and r.q_seq_len > 1) {
             if (flash_prefill_launch == .prefill_flash_f16_sm89) {
                 function = flash_prefill_function.?;
                 launch_kind = .prefill_flash_f16_sm89;
@@ -9847,7 +9925,7 @@ pub const KernelModule = struct {
             function = (if (r.head_dim == 256) self.gqa_repeat_hd256 else self.gqa_repeat_hd512) orelse
                 return error.CudaKernelUnavailable;
             launch_kind = .prefill_tiled_f16_exact;
-        } else if (self.gqa_prefill_profile != .off and prefill_storage_eligible and prefill_shape_eligible) {
+        } else if (launch_kind != .prefill_flash_f16_sm89 and self.gqa_prefill_profile != .off and prefill_storage_eligible and prefill_shape_eligible) {
             switch (self.gqa_prefill_profile) {
                 .off => unreachable,
                 .fast, .required_fast => {
@@ -10049,8 +10127,8 @@ pub const KernelModule = struct {
             grid_y = try toU32((r.q_seq_len + 15) / 16);
         } else if (launch_kind == .prefill_flash_f16_sm89) {
             const plan = cuda_kernel_renderer.flashPrefillPlanFor(switch (r.head_dim) {
-                256 => if (r.num_kv_heads == 2) .gqa_prefill_flash_sm89_e4b_hd256_swa512_f32 else .gqa_prefill_flash_sm89_hd256_swa512_f32,
-                512 => if (r.num_kv_heads == 2) .gqa_prefill_flash_sm89_e4b_hd512_global_f32 else .gqa_prefill_flash_sm89_hd512_global_f32,
+                256 => if (wide_flash) .gqa_prefill_flash_sm89_e4b_hd256_swa512_f32 else .gqa_prefill_flash_sm89_hd256_swa512_f32,
+                512 => if (wide_flash) .gqa_prefill_flash_sm89_e4b_hd512_global_f32 else .gqa_prefill_flash_sm89_hd512_global_f32,
                 else => unreachable,
             });
             block = @intCast(plan.launch.threads_per_block);
@@ -10422,10 +10500,15 @@ pub const KernelModule = struct {
         };
     }
 
-    pub fn e4bF16WarpSplitSelected(self: *const KernelModule, num_heads: usize, num_kv_heads: usize, head_dim: usize, format: u32, value_format: u32) bool {
-        return self.e4b_f16_warp_split_enabled and self.gqa_attention_decode_f16_warp_stage1_f32 != null and
+    pub fn f16WarpSplitSelected(self: *const KernelModule, num_heads: usize, num_kv_heads: usize, head_dim: usize, format: u32, value_format: u32) bool {
+        const enabled = switch (num_kv_heads) {
+            1 => self.f16_mqa_warp_split_enabled,
+            2 => self.f16_gqa_warp_split_enabled,
+            else => false,
+        };
+        return enabled and self.gqa_attention_decode_f16_warp_stage1_f32 != null and
             self.gqa_attention_decode_turboquant_split_stage2_f32 != null and
-            num_heads == 8 and num_kv_heads == 2 and (head_dim == 256 or head_dim == 512) and
+            num_heads == 8 and (head_dim == 256 or head_dim == 512) and
             format == 2 and value_format == 2;
     }
 
@@ -10458,7 +10541,7 @@ pub const KernelModule = struct {
         chunk_size: usize,
         chunk_count: usize,
     ) driver_mod.Error!bool {
-        const warp_f16 = self.e4bF16WarpSplitSelected(num_heads, num_kv_heads, head_dim, format, value_format);
+        const warp_f16 = self.f16WarpSplitSelected(num_heads, num_kv_heads, head_dim, format, value_format);
         const stage1 = if (warp_f16)
             self.gqa_attention_decode_f16_warp_stage1_f32.?
         else if (format == 0 and value_format == 1 and block_count == 0)
@@ -10506,9 +10589,9 @@ pub const KernelModule = struct {
         };
         var stage1_params = launch_abi.fieldsFor("TQ_SPLIT_STAGE1", &stage1_arguments);
         try launch2d(stage1, ctx, num_heads, chunk_count, if (warp_f16 or head_dim <= 256) 256 else 512, &stage1_params);
-        if (warp_f16 and !self.e4b_f16_warp_split_used) {
-            self.e4b_f16_warp_split_used = true;
-            std.log.info("cuda_e4b_f16_warp_split: status=active kernel=termite_gqa_attention_decode_f16_warp_stage1_f32", .{});
+        if (warp_f16 and !self.f16_warp_split_used) {
+            self.f16_warp_split_used = true;
+            std.log.info("cuda_f16_warp_split: status=active query_heads={d} kv_heads={d} head_dim={d}", .{ num_heads, num_kv_heads, head_dim });
         }
 
         var dst_ptr = dst.ptr;
@@ -11377,6 +11460,115 @@ pub const KernelModule = struct {
         const blocks = try checkedTensorElements(try checkedTensorElements(batch, num_heads), seq_len);
         try launchBlocks(function, ctx, blocks, 256, &params);
         return true;
+    }
+
+    pub fn launchGliner25AttentionStageBf16(self: *KernelModule, ctx: *context_mod.CudaContext, outputs: [5]buffer_mod.DeviceBuffer, inputs: [5]buffer_mod.DeviceBuffer, tokens: usize, positions: usize) !void {
+        const function = self.gliner25_attention_stage_bf16 orelse return error.CudaKernelUnavailable;
+        if (tokens == 0 or tokens > 8 * 512 * 16 * 64 or positions == 0 or positions > 1023 * 16 * 64) return error.InvalidCudaState;
+        for (outputs, inputs, 0..) |output, input, i| {
+            const n = if (i < 3) tokens else positions;
+            try checkRawBytes(output, n * 2);
+            try checkBytes(input, n);
+        }
+        var pointers: [10]driver_mod.CUdeviceptr = undefined;
+        for (outputs, inputs, 0..) |output, input, i| {
+            pointers[i] = output.ptr;
+            pointers[i + 5] = input.ptr;
+        }
+        var dimensions = [_]u32{ try toU32(tokens), try toU32(positions) };
+        var params: [12]?*anyopaque = undefined;
+        for (&pointers, 0..) |*pointer, i| params[i] = @ptrCast(pointer);
+        for (&dimensions, 0..) |*dimension, i| params[i + 10] = @ptrCast(dimension);
+        try launch1d(function, ctx, 3 * tokens + 2 * positions, &params);
+    }
+
+    pub fn launchGliner25AttentionPointerViewsBf16(self: *KernelModule, ctx: *context_mod.CudaContext, arrays: buffer_mod.DeviceBuffer, inputs: [5]buffer_mod.DeviceBuffer, output: buffer_mod.DeviceBuffer, cc: buffer_mod.DeviceBuffer, cp: buffer_mod.DeviceBuffer, pc: buffer_mod.DeviceBuffer, probabilities: buffer_mod.DeviceBuffer, sequence: usize, heads: usize, relative: usize, relative_pitch: usize, first: usize, count: usize) !void {
+        const function = self.gliner25_attention_pointer_views_bf16 orelse return error.CudaKernelUnavailable;
+        if (sequence == 0 or sequence > 512 or heads == 0 or heads > 16 or relative == 0 or relative > 1023 or count == 0 or count > 128 or first >= 8 * heads or first + count > 8 * heads) return error.InvalidCudaState;
+        if (relative_pitch < relative or relative_pitch > 1024 or relative_pitch % 8 != 0) return error.InvalidCudaState;
+        const documents = (first + count + heads - 1) / heads;
+        for (inputs[0..3]) |input| try checkRawBytes(input, documents * sequence * heads * 64 * 2);
+        for (inputs[3..5]) |input| try checkRawBytes(input, relative * heads * 64 * 2);
+        try checkBytes(output, documents * sequence * heads * 64);
+        try checkRawBytes(cc, count * sequence * sequence * 2);
+        try checkRawBytes(cp, count * sequence * relative_pitch * 2);
+        try checkRawBytes(pc, count * sequence * relative_pitch * 2);
+        try checkRawBytes(probabilities, count * sequence * sequence * 2);
+        try checkRawBytes(arrays, 10 * count * 8);
+        var pointers = [_]driver_mod.CUdeviceptr{ arrays.ptr, inputs[0].ptr, inputs[1].ptr, inputs[2].ptr, inputs[3].ptr, inputs[4].ptr, output.ptr, cc.ptr, cp.ptr, pc.ptr, probabilities.ptr };
+        var dimensions = [_]u32{ try toU32(sequence), try toU32(heads), try toU32(relative_pitch), try toU32(first), try toU32(count) };
+        var params: [16]?*anyopaque = undefined;
+        for (&pointers, 0..) |*pointer, i| params[i] = @ptrCast(pointer);
+        for (&dimensions, 0..) |*dimension, i| params[i + 11] = @ptrCast(dimension);
+        try launch1d(function, ctx, count, &params);
+    }
+
+    pub fn launchGliner25AttentionSoftmaxBf16(self: *KernelModule, ctx: *context_mod.CudaContext, probabilities: buffer_mod.DeviceBuffer, scores: buffer_mod.DeviceBuffer, c2p: buffer_mod.DeviceBuffer, p2c: buffer_mod.DeviceBuffer, mask: buffer_mod.DeviceBuffer, buckets: buffer_mod.DeviceBuffer, sequence: usize, relative: usize, relative_pitch: usize, heads: usize, first: usize, boundary: bool, model_heads: usize) !void {
+        const function = self.gliner25_attention_softmax_bf16 orelse return error.CudaKernelUnavailable;
+        if (sequence == 0 or sequence > 512 or relative == 0 or relative > 1023 or relative_pitch < relative or relative_pitch > 1024 or relative_pitch % 8 != 0 or heads == 0 or heads > 128 or model_heads == 0 or model_heads > 16 or first >= 8 * model_heads or first + heads > 8 * model_heads) return error.InvalidCudaState;
+        try checkRawBytes(probabilities, heads * sequence * sequence * 2);
+        try checkRawBytes(scores, heads * sequence * sequence * 2);
+        try checkRawBytes(c2p, heads * sequence * relative_pitch * 2);
+        try checkRawBytes(p2c, heads * sequence * relative_pitch * 2);
+        try checkRawBytes(mask, ((first + heads + model_heads - 1) / model_heads) * sequence * @as(usize, if (boundary) 4 else 8));
+        if (boundary or buckets.ptr != 0) try checkRawBytes(buckets, (2 * sequence - 1) * 4);
+        var pointers = [_]driver_mod.CUdeviceptr{ probabilities.ptr, scores.ptr, c2p.ptr, p2c.ptr, mask.ptr, buckets.ptr };
+        var dimensions = [_]u32{ try toU32(sequence), try toU32(relative), try toU32(heads), try toU32(first), @intFromBool(boundary), try toU32(model_heads), try toU32(relative_pitch) };
+        var params: [13]?*anyopaque = undefined;
+        for (&pointers, 0..) |*pointer, i| params[i] = @ptrCast(pointer);
+        for (&dimensions, 0..) |*dimension, i| params[i + 6] = @ptrCast(dimension);
+        try launchBlocks(function, ctx, (heads * sequence + 7) / 8, 256, &params);
+    }
+
+    pub fn launchGliner25FfnGeluBiasBf16(self: *KernelModule, ctx: *context_mod.CudaContext, output: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, bias: buffer_mod.DeviceBuffer, rows: usize, width: usize, exact: bool) !void {
+        const function = self.gliner25_ffn_bias_gelu_bf16 orelse return error.CudaKernelUnavailable;
+        if (rows == 0 or rows > 4096 or width == 0 or width > 4096) return error.InvalidCudaState;
+        const count = rows * width;
+        try checkRawBytes(output, count * 2);
+        try checkRawBytes(input, count * 2);
+        try checkBytes(bias, width);
+        var pointers = [_]driver_mod.CUdeviceptr{ output.ptr, input.ptr, bias.ptr };
+        var dimensions = [_]u32{ try toU32(count), try toU32(width), @intFromBool(exact) };
+        var params: [6]?*anyopaque = undefined;
+        for (&pointers, 0..) |*pointer, i| params[i] = @ptrCast(pointer);
+        for (&dimensions, 0..) |*dimension, i| params[i + 3] = @ptrCast(dimension);
+        try launch1d(function, ctx, count, &params);
+    }
+
+    pub fn launchGliner25AttentionPointerViewsF32(self: *KernelModule, ctx: *context_mod.CudaContext, arrays: buffer_mod.DeviceBuffer, inputs: [5]buffer_mod.DeviceBuffer, output: buffer_mod.DeviceBuffer, cc: buffer_mod.DeviceBuffer, cp: buffer_mod.DeviceBuffer, pc: buffer_mod.DeviceBuffer, sequence: usize, heads: usize, relative: usize, first: usize, count: usize) !void {
+        const function = self.gliner25_attention_pointer_views_f32 orelse return error.CudaKernelUnavailable;
+        if (sequence == 0 or sequence > 512 or heads == 0 or heads > 16 or relative == 0 or relative > 1023 or count == 0 or count > 128 or first >= 8 * heads or first + count > 8 * heads) return error.InvalidCudaState;
+        const documents = (first + count + heads - 1) / heads;
+        for (inputs[0..3]) |input| try checkBytes(input, documents * sequence * heads * 64);
+        for (inputs[3..5]) |input| try checkBytes(input, relative * heads * 64);
+        try checkBytes(output, documents * sequence * heads * 64);
+        try checkBytes(cc, count * sequence * sequence);
+        try checkBytes(cp, count * sequence * relative);
+        try checkBytes(pc, count * sequence * relative);
+        try checkRawBytes(arrays, 9 * count * 8);
+        var pointers = [_]driver_mod.CUdeviceptr{ arrays.ptr, inputs[0].ptr, inputs[1].ptr, inputs[2].ptr, inputs[3].ptr, inputs[4].ptr, output.ptr, cc.ptr, cp.ptr, pc.ptr };
+        var dimensions = [_]u32{ try toU32(sequence), try toU32(heads), try toU32(relative), try toU32(first), try toU32(count) };
+        var params: [15]?*anyopaque = undefined;
+        for (&pointers, 0..) |*pointer, i| params[i] = @ptrCast(pointer);
+        for (&dimensions, 0..) |*dimension, i| params[i + 10] = @ptrCast(dimension);
+        try launch1d(function, ctx, count, &params);
+    }
+
+    pub fn launchGliner25AttentionSoftmaxF32(self: *KernelModule, ctx: *context_mod.CudaContext, scores: buffer_mod.DeviceBuffer, c2p: buffer_mod.DeviceBuffer, p2c: buffer_mod.DeviceBuffer, mask: buffer_mod.DeviceBuffer, buckets: buffer_mod.DeviceBuffer, sequence: usize, relative: usize, heads: usize, first_head: usize, boundary: bool, model_heads: usize) !void {
+        const function = self.gliner25_attention_softmax_f32 orelse return error.CudaKernelUnavailable;
+        if (sequence == 0 or sequence > 512 or relative == 0 or relative > 1023 or heads == 0 or heads > 128 or model_heads == 0 or model_heads > 16 or first_head >= 8 * model_heads or first_head + heads > 8 * model_heads) return error.InvalidCudaState;
+        try checkBytes(scores, heads * sequence * sequence);
+        try checkBytes(c2p, heads * sequence * relative);
+        try checkBytes(p2c, heads * sequence * relative);
+        const documents = (first_head + heads + model_heads - 1) / model_heads;
+        try checkRawBytes(mask, documents * sequence * @as(usize, if (boundary) 4 else 8));
+        if (boundary or buckets.ptr != 0) try checkRawBytes(buckets, (2 * sequence - 1) * 4);
+        var pointers = [_]driver_mod.CUdeviceptr{ scores.ptr, c2p.ptr, p2c.ptr, mask.ptr, buckets.ptr };
+        var dimensions = [_]u32{ try toU32(sequence), try toU32(relative), try toU32(heads), try toU32(first_head), @intFromBool(boundary), try toU32(model_heads) };
+        var params: [11]?*anyopaque = undefined;
+        for (&pointers, 0..) |*pointer, i| params[i] = @ptrCast(pointer);
+        for (&dimensions, 0..) |*dimension, i| params[i + 5] = @ptrCast(dimension);
+        try launchBlocks(function, ctx, heads * sequence, 256, &params);
     }
 
     /// Eight FP32 query warps per block, with no additional scratch allocation.
@@ -14846,7 +15038,7 @@ fn generatedQ6KQ8_1ArgmaxStage1Threads(in_dim: usize) usize {
     };
 }
 
-fn generatedQ4_0Q8_1ArgmaxLaunchBounds(rows: usize, in_dim: usize, out_dim: usize) driver_mod.Error!GeneratedQ4_0Q8_1ArgmaxLaunchBounds {
+pub fn generatedQ4_0Q8_1ArgmaxLaunchBounds(rows: usize, in_dim: usize, out_dim: usize) driver_mod.Error!GeneratedQ4_0Q8_1ArgmaxLaunchBounds {
     if (!linearQ4_0Q8_1ArgmaxE2BShapeEligible(rows, in_dim, out_dim)) return error.InvalidCudaState;
     const row_blocks = in_dim / q8_1_values_per_block;
     const col_tiles = (out_dim + generated_q4_0_q8_1_argmax_tile8_cols - 1) / generated_q4_0_q8_1_argmax_tile8_cols;
@@ -18483,7 +18675,7 @@ fn smokeAddMulScalarF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaCont
     try a.copyFromHost(ctx, std.mem.sliceAsBytes(&a_data));
     try b.copyFromHost(ctx, std.mem.sliceAsBytes(&b_data));
     try scale.copyFromHost(ctx, std.mem.sliceAsBytes(&scale_data));
-    try module.launchAddMulScalarF32(ctx, output, a, b, scale, a_data.len);
+    try module.launchAddMulScalarF32(ctx, output, a, b, scale, a_data.len, false);
     try ctx.synchronize();
 
     const out = try allocator.alloc(f32, a_data.len);
@@ -23098,6 +23290,17 @@ test "E4B Flash selector checks two-head strides and long-context bounds" {
     request.compute_minor = 1;
     request.query_position_offset += 1;
     try std.testing.expect(gqaFlashPrefillEligibility(request) == .query_length_policy_ineligible);
+    request.query_position_offset -= 1;
+    request.base.num_kv_heads = 1;
+    request.base.key_row_bytes = 1024;
+    request.base.base_key_row_bytes = 1024;
+    request.base.value_row_bytes = 1024;
+    try std.testing.expect(gqaFlashPrefillEligibility(request) == .compute_capability_ineligible);
+    request.wide_single_kv = true;
+    try std.testing.expect(gqaFlashPrefillEligibility(request) == .eligible);
+    request.compute_major = 8;
+    request.compute_minor = 9;
+    try std.testing.expect(gqaFlashPrefillEligibility(request) == .compute_capability_ineligible);
 }
 
 test "E4B Flash prefill target gate keeps GB10 qualification narrow" {
@@ -23110,25 +23313,30 @@ test "E4B Flash prefill target gate keeps GB10 qualification narrow" {
     try std.testing.expect(!gqaFlashPrefillTargetSupported(9, 0, 2));
 }
 
-test "E4B Flash warp decode selection preserves compressed and E2B routes" {
+test "F16 warp split decode admits only independently enabled head groups" {
     var module: KernelModule = undefined;
-    module.e4b_f16_warp_split_enabled = true;
+    module.f16_gqa_warp_split_enabled = true;
+    module.f16_mqa_warp_split_enabled = false;
     module.gqa_attention_decode_f16_warp_stage1_f32 = @ptrFromInt(1);
     module.gqa_attention_decode_turboquant_split_stage2_f32 = @ptrFromInt(1);
-    try std.testing.expect(module.e4bF16WarpSplitSelected(8, 2, 256, 2, 2));
-    try std.testing.expect(module.e4bF16WarpSplitSelected(8, 2, 512, 2, 2));
-    try std.testing.expect(!module.e4bF16WarpSplitSelected(8, 1, 256, 2, 2));
-    try std.testing.expect(!module.e4bF16WarpSplitSelected(8, 2, 128, 2, 2));
-    try std.testing.expect(!module.e4bF16WarpSplitSelected(8, 2, 256, 0, 1));
-    try std.testing.expect(!module.e4bF16WarpSplitSelected(8, 2, 256, 2, 1));
-    module.e4b_f16_warp_split_enabled = false;
-    try std.testing.expect(!module.e4bF16WarpSplitSelected(8, 2, 256, 2, 2));
-    module.e4b_f16_warp_split_enabled = true;
+    try std.testing.expect(module.f16WarpSplitSelected(8, 2, 256, 2, 2));
+    try std.testing.expect(module.f16WarpSplitSelected(8, 2, 512, 2, 2));
+    try std.testing.expect(!module.f16WarpSplitSelected(8, 1, 256, 2, 2));
+    module.f16_mqa_warp_split_enabled = true;
+    try std.testing.expect(module.f16WarpSplitSelected(8, 1, 256, 2, 2));
+    try std.testing.expect(module.f16WarpSplitSelected(8, 1, 512, 2, 2));
+    try std.testing.expect(!module.f16WarpSplitSelected(8, 4, 256, 2, 2));
+    try std.testing.expect(!module.f16WarpSplitSelected(8, 2, 128, 2, 2));
+    try std.testing.expect(!module.f16WarpSplitSelected(8, 2, 256, 0, 1));
+    try std.testing.expect(!module.f16WarpSplitSelected(8, 2, 256, 2, 1));
+    module.f16_gqa_warp_split_enabled = false;
+    try std.testing.expect(!module.f16WarpSplitSelected(8, 2, 256, 2, 2));
+    module.f16_gqa_warp_split_enabled = true;
     module.gqa_attention_decode_turboquant_split_stage2_f32 = null;
-    try std.testing.expect(!module.e4bF16WarpSplitSelected(8, 2, 256, 2, 2));
+    try std.testing.expect(!module.f16WarpSplitSelected(8, 2, 256, 2, 2));
     module.gqa_attention_decode_turboquant_split_stage2_f32 = @ptrFromInt(1);
     module.gqa_attention_decode_f16_warp_stage1_f32 = null;
-    try std.testing.expect(!module.e4bF16WarpSplitSelected(8, 2, 256, 2, 2));
+    try std.testing.expect(!module.f16WarpSplitSelected(8, 2, 256, 2, 2));
 }
 
 test "CUDA GQA request preserves dense scalar and physical paged preflight contracts" {

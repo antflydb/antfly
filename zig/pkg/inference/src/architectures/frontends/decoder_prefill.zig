@@ -203,7 +203,7 @@ test "functional prefix exports KV and preserves ordinary decoder hidden values"
     // hidden value rather than requesting another prefix execution.
     const raw_last = try cb.sliceRows2D(a, raw_outputs[0].value, 1, 1, config.hidden_size);
     defer cb.free(raw_last);
-    const token = (try @import("../../backends/decoder_tail_runtime.zig").forwardGreedyTokenTensorFromFinalHidden(&cb, a, config, raw_last, .rms, 999)) orelse return error.UnexpectedTailDecline;
+    const token = try @import("../../backends/decoder_tail_runtime.zig").forwardGreedyTokenTensorFromFinalHidden(&cb, a, config, raw_last, .rms, 999);
     defer if (token.token_tensor) |value| cb.free(value);
     const lm_head = try cb.getWeight("lm_head.weight");
     defer cb.free(lm_head);
@@ -211,6 +211,12 @@ test "functional prefix exports KV and preserves ordinary decoder hidden values"
     defer cb.free(all_logits);
     const full = try cb.toFloat32(all_logits, a);
     defer a.free(full);
+    const tail_logits = try @import("../../backends/decoder_tail_runtime.zig").completePreparedLogits(&cb, a, config, raw_last, .rms, 999, 999);
+    defer cb.free(tail_logits);
+    const tail_values = try cb.toFloat32(tail_logits, a);
+    defer a.free(tail_values);
+    try std.testing.expectEqual(@as(usize, config.vocab_size), tail_values.len);
+    for (full[config.vocab_size..], tail_values) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.00001);
     var best: usize = 0;
     for (full[config.vocab_size..], 0..) |value, index| if (value > full[config.vocab_size + best]) {
         best = index;
@@ -224,7 +230,7 @@ test "functional prefix exports KV and preserves ordinary decoder hidden values"
         if (index == best) continue;
         if (alternate == null or value > full[config.vocab_size + alternate.?]) alternate = index;
     }
-    const suppressed = (try @import("../../backends/decoder_tail_runtime.zig").forwardGreedyTokenTensorFromFinalHidden(&cb, a, suppressed_config, raw_last, .rms, 999)) orelse return error.UnexpectedTailDecline;
+    const suppressed = try @import("../../backends/decoder_tail_runtime.zig").forwardGreedyTokenTensorFromFinalHidden(&cb, a, suppressed_config, raw_last, .rms, 999);
     defer if (suppressed.token_tensor) |value| cb.free(value);
     try std.testing.expectEqual(alternate.?, suppressed.token_id);
     const normalized = try gpt.greedyLastTokenTensorFromFinalHiddenRetain(&cb, a, suppressed_config, .{ .hidden = outputs[0].value, .total_rows = 2 });

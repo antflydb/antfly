@@ -15,6 +15,10 @@
 
 const std = @import("std");
 
+/// Row capacity of the CUDA paged decoder packet ABI. Task partitioning,
+/// packet scratch and descriptor arrays must agree on this limit.
+pub const cuda_paged_decode_packet_rows = 64;
+
 /// Physical dense-attention storage shared by CPU, Metal and CUDA adapters.
 /// The values preserve the native Metal ABI. Unrecognized shapes remain an
 /// explicit compatibility decision of the caller, rather than a model hint.

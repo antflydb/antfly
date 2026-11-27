@@ -44,7 +44,7 @@ pub const phases = .{
     }).native(),
     .causal_attention_scores =
     \\        uint key_pos = p.kv_position_offset + ki;
-    ++ "        bool allowed = " ++ @import("antfly_tile").native_attention.CausalWindow.native("query_pos", "key_pos", "p.sliding_window") ++ ";\n",
+    ++ "        bool allowed = " ++ @import("antfly_tile").native_attention.CausalWindow.native("query_pos", "key_pos", "p.sliding_window") ++ ";\n" ++ "        if (p.reserved0 != 0u) allowed = mask[b * p.kv_len + ki] != 0u;\n",
     .segment_tensor_geometry =
     \\    const uint D = p.head_dim, hidden = p.num_heads * D, h = tg.y;
     \\    const uint QB = (p.seq_len + BQ - 1u) / BQ;

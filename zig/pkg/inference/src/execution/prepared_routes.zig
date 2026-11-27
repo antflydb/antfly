@@ -42,6 +42,9 @@ pub const InputSource = union(enum) {
         entries: []const IndexedInputBinding,
         planes: []const @import("storage_ownership.zig").Plane,
         implementation: route.Implementation,
+        /// Some immutable provider slots require the actual retained tensor,
+        /// even when their logical and storage planes have been attested.
+        tensors_by_node: ?[]const ?ops.CT = null,
     },
     pub fn len(self: InputSource) usize {
         return switch (self) {
@@ -58,6 +61,11 @@ pub const InputSource = union(enum) {
                 break :source .{ .node_id = input.node_id, .value = switch (input.source) {
                     .resident => |resident| fact: {
                         if (resident.plane >= items.planes.len) return error.InvalidKernelInputBinding;
+                        if (items.tensors_by_node) |values| {
+                            if (input.node_id >= values.len) return error.InvalidKernelInputBinding;
+                            const value = values[input.node_id] orelse return error.InvalidKernelInputBinding;
+                            break :fact .{ .tensor = .{ .implementation = items.implementation, .value = value } };
+                        }
                         break :fact .{ .resident = .{ .logical = resident.logical, .planes = items.planes[resident.plane..][0..1], .implementation = items.implementation } };
                     },
                     .host => |host| .{ .imported_host = host },
@@ -229,7 +237,9 @@ pub const PreparedRoutes = struct {
     /// An exact physical variant may only reuse their original bound handles;
     /// overriding model/literal nodes requires a fresh semantic preparation.
     pub fn validateRuntimeInputs(self: *const PreparedRoutes, inputs: []const @import("../graph/interpreter.zig").RuntimeInput, default_backend: *const ops.ComputeBackend) !void {
-        const verify_projection_input = self.pool.metal_projection_region_candidate and self.pool.completeOwnedPayload() != null;
+        const complete = self.pool.completeOwnedPayload() != null;
+        const owned_metal = complete and self.pool.metal_frame_dispatch;
+        const verify_projection_input = owned_metal and self.pool.metal_projection_region_candidate;
         for (inputs) |input| {
             const slot = self.pool.plan.slotForNode(input.node_id) orelse return error.InvalidRuntimeInputNode;
             // Weight initializers can also be parameter-shaped graph nodes.
@@ -239,9 +249,13 @@ pub const PreparedRoutes = struct {
                 if (input.value != original.value or backend.ptr != original.implementation.context or @as(*const anyopaque, backend.vtable) != original.implementation.table) return error.PreparedImmutableBindingChanged;
             } else {
                 if (self.immutable.find(input.node_id) != null or (!slot.roles.runtime_input and slot.kind != .runtime_input)) return error.PreparedImmutableBindingChanged;
-                if (verify_projection_input) {
-                    const selected = self.pool.selection.?.inputs.find(input.node_id) orelse return error.PreparedRegionBindingChanged;
-                    if (selected != .resident or !try matchesResidentPlane(input.source_backend orelse default_backend, input.value, selected.resident)) return error.PreparedRegionBindingChanged;
+                if (complete) {
+                    const selected = self.pool.selection.?.inputs.find(input.node_id);
+                    if (selected) |fact| {
+                        if (fact == .resident) {
+                            if (!try matchesResidentPlane(input.source_backend orelse default_backend, input.value, fact.resident)) return error.PreparedRegionBindingChanged;
+                        } else if (verify_projection_input) return error.PreparedRegionBindingChanged;
+                    } else if (owned_metal) return error.PreparedRegionBindingChanged;
                 }
             }
         }
@@ -630,6 +644,15 @@ fn indexedInputSourceCase(a: std.mem.Allocator) !void {
         .{ .node_id = 1, .source = .{ .host = host } },
     };
     const source = InputSource{ .indexed = .{ .entries = &indexed, .planes = &planes, .implementation = implementation } };
+    var values = [_]?ops.CT{value};
+    var concrete = source;
+    concrete.indexed.tensors_by_node = &values;
+    const original = (try concrete.at(0)).value.tensor;
+    try std.testing.expectEqual(value, original.value);
+    try std.testing.expectEqualDeep(implementation, original.implementation);
+    try std.testing.expectEqualDeep(host, (try concrete.at(1)).value.imported_host);
+    values[0] = null;
+    try std.testing.expectError(error.InvalidKernelInputBinding, concrete.at(0));
     const direct = try ImmutableBindings.createSource(a, source);
     defer direct.release();
     const ordinary = try ImmutableBindings.create(a, &.{ try source.at(0), try source.at(1) });

@@ -26,6 +26,8 @@ const StageInput = session_mod.StageInput;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const micro = @import("executor_microbatch.zig");
 
+const onnx_cache = @import("../execution/onnx_kv_cache.zig");
+
 pub const Dispatch = @import("../execution/tensor_dispatch.zig").Dispatch;
 
 /// Invocation-local metadata. Physical outputs/provider/model/quota are shared
@@ -40,8 +42,7 @@ const ResidentBatch = struct {
 
     fn omittedCrossCache(session: session_mod.Session, name: []const u8, shape: []const i64, total: usize) bool {
         if (session.cached_decoder_geometry == null or shape.len != 4) return false;
-        const suffix = @import("../graph/onnx_kv_cache.zig").presentOutputSuffix(name) orelse return false;
-        if (std.mem.indexOf(u8, suffix, ".encoder.") == null) return false;
+        if (onnx_cache.presentOutputRole(name) != .cross_attention) return false;
         if (shape[0] != 0 and shape[0] != total) return false;
         var empty = false;
         for (shape) |dim| {
@@ -397,7 +398,7 @@ fn eligibleStage(session: session_mod.Session, views: []const Tensor, inputs: []
         (backend.kind() == .cuda and kernels.createPhysicalCompletion == null)) return false;
     const first = views[0].shape;
     if (first.len == 0 or first[0] < 1) return false;
-    for (inputs, views, session.inputInfo()) |value, view, declared| {
+    for (inputs, views, session.inputInfo(), 0..) |value, view, declared, index| {
         if (view.shape.len > 8 or view.shape.len != declared.shape.len) return false;
         if (session.isBroadcastInput(view.name)) {
             if (value != .host or !validTensor(view) or view.data.len == 0 or view.data.len > 8 or !std.mem.eql(i64, view.shape, declared.shape)) return false;
@@ -406,7 +407,7 @@ fn eligibleStage(session: session_mod.Session, views: []const Tensor, inputs: []
         if (view.shape.len == 0 or view.shape[0] != first[0] or declared.shape[0] > 0) return false;
         for (view.shape[1..], declared.shape[1..]) |actual, expected| if (actual < 0 or (expected > 0 and expected != actual)) return false;
         switch (value) {
-            .host => if (!validTensor(view)) return false,
+            .host => if (!validTensor(view) and !@import("../backends/imported_onnx_session.zig").cachedEncoderStageInputIsShapeOnly(session, inputs, index)) return false,
             .resident => |resident| if (declared.dtype != .f32 or resident.estimated_bytes != (denseBytes(view.shape, @sizeOf(f32)) catch return false) or !denseDeviceInput(backend, resident.value, view.shape)) return false,
         }
     }
@@ -464,10 +465,13 @@ fn runMode(comptime placement: OutputPlacement, broker: *micro.Broker, allocator
         if (!try borrowed.yieldExecution() and borrowed.lease != null) return error.MissingRunRequest;
     };
     const ticket = Ticket{ .session = session, .permit = permit, .gate = gate, .inputs = inputs, .control = control, .rows = if (inputs.len != 0 and inputs[0].shape.len != 0 and inputs[0].shape[0] > 0) @intCast(inputs[0].shape[0]) else 1, .stage = stage };
-    // CPU packing has no device-transfer savings. Use the serial resident
-    // path by default until fused CPU decoding is qualified on real models.
-    const serial_cpu_stage = stage != null and session.backend() == .native and (wait_us orelse 0) == 0;
-    if (serial_cpu_stage or !(if (stage) |mixed| eligibleStage(session, inputs, mixed) else eligible(session, inputs)))
+    // CPU packing has no device-transfer savings. An explicit zero
+    // collection window also bypasses the broker for cached Metal stages.
+    const serial_stage = stage != null and if (session.backend() == .native)
+        (wait_us orelse 0) == 0
+    else
+        session.backend() == .metal and wait_us == 0;
+    if (serial_stage or !(if (stage) |mixed| eligibleStage(session, inputs, mixed) else eligible(session, inputs)))
         return directMode(placement, allocator, ticket);
     const alloc = std.heap.smp_allocator;
     var signature = std.Io.Writer.Allocating.init(allocator);
@@ -475,7 +479,8 @@ fn runMode(comptime placement: OutputPlacement, broker: *micro.Broker, allocator
     try signature.writer.print("{s};{s};", .{ @tagName(placement), if (stage != null) "stage" else "tensor" });
     try signature.writer.print("{d}:{d};", .{ @intFromPtr(session.vtable), @intFromPtr(gate) });
     try std.json.Stringify.value(session.output_geometry, .{}, &signature.writer);
-    try std.json.Stringify.value(session.cached_decoder_geometry, .{}, &signature.writer);
+    const vocabulary = if (session.cached_decoder_geometry) |geometry| @as(?usize, geometry.vocab_size) else null;
+    try std.json.Stringify.value(vocabulary, .{}, &signature.writer);
     try std.json.Stringify.value(session.broadcast_inputs, .{}, &signature.writer);
     try std.json.Stringify.value(if (control) |active| active.native_call_policy else @import("../execution_control.zig").NativeCallPolicy.require_supervision, .{}, &signature.writer);
     // A fused native call must stay inside the same supervising boundary.
@@ -501,7 +506,7 @@ fn runMode(comptime placement: OutputPlacement, broker: *micro.Broker, allocator
         const device_bytes = if (stage) |mixed| if (mixed[column] == .resident) mixed[column].resident.estimated_bytes else 0 else 0;
         bytes = try std.math.add(usize, bytes, try std.math.add(usize, tensor.data.len, device_bytes));
         const broadcast = session.isBroadcastInput(tensor.name);
-        try std.json.Stringify.value(.{ .name = tensor.name, .dtype = tensor.dtype, .shape = if (broadcast) tensor.shape else tensor.shape[1..], .value = if (broadcast) tensor.data else &.{}, .device = if (stage) |mixed| mixed[column] == .resident else false }, .{}, &signature.writer);
+        try std.json.Stringify.value(.{ .name = tensor.name, .dtype = tensor.dtype, .shape = if (broadcast) tensor.shape else tensor.shape[1..], .value = if (broadcast) tensor.data else &.{}, .device = if (stage) |mixed| mixed[column] == .resident else false, .empty = tensor.data.len == 0 }, .{}, &signature.writer);
     }
     const policy: session_mod.ForwardBatchPolicy = if (stage != null) .{} else session.forwardBatchPolicy(inputs);
     const max_items = @min(@as(usize, 8), policy.max_items);
@@ -622,7 +627,7 @@ fn directMode(comptime placement: OutputPlacement, allocator: std.mem.Allocator,
         var outputs = (if (ticket.stage) |mixed|
             try execution.runStageInputsWithControl(mixed, allocator, ticket.control)
         else
-            try execution.runResidentWithControl(ticket.inputs, allocator, ticket.control)) orelse return error.UnexpectedResidentStageDecline;
+            try execution.runResidentForPublication(ticket.inputs, allocator, ticket.control)) orelse return error.UnexpectedResidentStageDecline;
         errdefer outputs.deinitWithBoundary(cleanup_owner.epoch());
         _ = try cleanup_owner.retainThroughBackend(outputs.backend);
         if (owned_execution != null and outputs.resource_lease == null) {
@@ -705,8 +710,21 @@ const GatheredInputs = struct {
     initialized: usize = 0,
     allocator: std.mem.Allocator,
     has_device_storage: bool = false,
+    completion: ?@import("../ops/physical_storage.zig").Completion = null,
+    transfers: ?@import("../execution/transfer_audit.zig").Measurements = null,
+
+    fn awaitCopies(self: *GatheredInputs) !void {
+        const completion = self.completion orelse return;
+        // A failed query falls through to the checked drain path.
+        if (!(completion.isReady() catch false)) try completion.wait();
+        self.completion = null;
+        completion.deinit();
+    }
 
     fn deinit(self: *GatheredInputs, epoch: ?*const @import("../execution/retirement_sink.zig").Epoch) void {
+        // A declined or cancelled forward must drain the copies before any
+        // source request or destination can be retired or subdivided.
+        self.awaitCopies() catch platform.inference_process_supervisor.restartWorker();
         for (self.values[0..self.initialized]) |input| if (input == .resident) self.backend.freeWithBoundary(input.resident.value, epoch);
         self.allocator.free(self.values);
     }
@@ -720,13 +738,24 @@ fn gatherStageInputs(first: *const Ticket, items: []const micro.ExecuteItem, ten
     const prepared_storage = @import("../execution/prepared_storage_admission.zig");
     var requirements: std.ArrayList(prepared_storage.Requirement) = .empty;
     defer requirements.deinit(allocator);
+    const shared_bank = backend.kind() == .metal;
+    const alignment = if (shared_bank) try storage.minimumAlignment(backend.*) else 1;
+    var bank_bytes: usize = 0;
     var bytes: usize = 0;
     for (first.stage.?, tensors) |source, tensor| if (source == .resident) {
         const size = try denseBytes(tensor.shape, @sizeOf(f32));
+        if (shared_bank) {
+            bank_bytes = try std.math.add(usize, try alignedGatherOffset(bank_bytes, alignment), size);
+            continue;
+        }
         const bound = try storage.reservationBytes(backend.*, .{ .byte_size = size, .admitted = true });
         bytes = try std.math.add(usize, bytes, bound);
         try requirements.append(allocator, .{ .backend = backend.kind(), .class = .activation, .bytes = bound });
     };
+    if (bank_bytes != 0) {
+        bytes = try storage.reservationBytes(backend.*, .{ .byte_size = bank_bytes, .admitted = true });
+        try requirements.append(allocator, .{ .backend = .metal, .class = .activation, .bytes = bytes });
+    }
     const storage_admission = @import("../execution/storage_admission.zig");
     const Reserve = struct {
         lease: *@import("../runtime/tier/memory.zig").AdmissionLease,
@@ -782,15 +811,23 @@ fn gatherStageInputs(first: *const Ticket, items: []const micro.ExecuteItem, ten
     defer scope.deinitChecked() catch fatal();
     if (backend.kind() == .metal and (backend.decoderRuntimeHasActiveFrame() or backend.decoderRuntimeHasSubmittedFrame())) return error.ResidentGatherUnavailable;
 
+    const bank = if (shared_bank)
+        (try storage.Lease.createAdmitted(allocator, backend.*, bank_bytes, null, .activation, capability)) orelse return error.ResidentGatherUnavailable
+    else
+        null;
+    defer if (bank) |lease| lease.releaseWithBoundary(epoch);
+    var bank_offset: usize = 0;
     for (first.stage.?, tensors, values) |source, tensor, *value| {
         value.* = if (source == .resident) blk: {
             const size = try denseBytes(tensor.shape, @sizeOf(f32));
-            const lease = (try storage.Lease.createAdmitted(allocator, backend.*, size, null, .activation, capability)) orelse return error.ResidentGatherUnavailable;
-            defer lease.releaseWithBoundary(epoch);
+            const lease = bank orelse (try storage.Lease.createAdmitted(allocator, backend.*, size, null, .activation, capability)) orelse return error.ResidentGatherUnavailable;
+            defer if (bank == null) lease.releaseWithBoundary(epoch);
+            const offset = if (bank != null) try alignedGatherOffset(bank_offset, alignment) else 0;
+            bank_offset = try std.math.add(usize, offset, size);
             if (lease.backing_byte_size == null) return error.ResidentGatherUnavailable;
             var dims: [8]i32 = undefined;
             for (tensor.shape, dims[0..tensor.shape.len]) |dim, *dest| dest.* = std.math.cast(i32, dim) orelse return error.ResidentGatherUnavailable;
-            const ct = (try kernels.physicalTensorView.?(backend.ptr, .{ .storage = lease, .shape = dims[0..tensor.shape.len] })) orelse return error.ResidentGatherUnavailable;
+            const ct = (try kernels.physicalTensorView.?(backend.ptr, .{ .storage = lease, .shape = dims[0..tensor.shape.len], .byte_offset = offset })) orelse return error.ResidentGatherUnavailable;
             break :blk .{ .resident = .{ .value = ct, .backend = backend, .shape = tensor.shape, .estimated_bytes = size } };
         } else .{ .host = tensor };
         result.initialized += 1;
@@ -799,12 +836,14 @@ fn gatherStageInputs(first: *const Ticket, items: []const micro.ExecuteItem, ten
     // One completion covers every packed cache column. No source or
     // destination may retire until all queued copies have completed.
     const event = if (kernels.createPhysicalCompletion) |create| try create(backend.ptr) else null;
-    defer if (event) |completion| completion.deinit();
+    var event_transferred = false;
+    defer if (!event_transferred) if (event) |completion| {
+        // This covers a failure after a driver call but before publication.
+        completion.record() catch fatal();
+        completion.wait() catch fatal();
+        completion.deinit();
+    };
     {
-        defer if (event) |completion| {
-            completion.record() catch fatal();
-            completion.wait() catch fatal();
-        };
         const metal_frame = backend.kind() == .metal and try backend.decoderRuntimeBeginFrame();
         var recording = metal_frame;
         defer if (recording and backend.decoderRuntimeHasActiveFrame()) backend.decoderRuntimeCancelFrame() catch fatal();
@@ -812,13 +851,32 @@ fn gatherStageInputs(first: *const Ticket, items: []const micro.ExecuteItem, ten
         var audit: transfers.Audit = .{ .forbid_device_host_access = true };
         try transfers.begin(&audit);
         defer transfers.end();
-        for (values, 0..) |destination, column| if (destination == .resident) {
-            const width = try denseBytes(destination.resident.shape[1..], 1);
-            if (kernels.gatherDeviceRows) |gather| {
-                var sources: [8]ops.CT = undefined;
-                for (items, sources[0..items.len]) |item, *source| source.* = item.payloadAs(Ticket).stage.?[column].resident.value;
-                try gather(backend.ptr, destination.resident.value, sources[0..items.len]);
-            } else {
+        const Column = @import("../ops/kernel_backend.zig").VTable.DeviceRowColumn;
+        var columns: [64]Column = undefined;
+        var sources: [64][8]ops.CT = undefined;
+        // Bound a packet to the CUDA driver request limit even for a full cohort.
+        const packet_capacity = @min(columns.len, 256 / items.len);
+        var next_column: usize = 0;
+        while (next_column < values.len) {
+            const start_column = next_column;
+            var count: usize = 0;
+            while (next_column < values.len and count < packet_capacity) {
+                const index = next_column;
+                next_column += 1;
+                const destination = values[index];
+                if (destination != .resident) continue;
+                const inputs = sources[count][0..items.len];
+                for (items, inputs) |item, *source| source.* = item.payloadAs(Ticket).stage.?[index].resident.value;
+                columns[count] = .{ .output = destination.resident.value, .sources = inputs };
+                count += 1;
+            }
+            if (count == 0) continue;
+            if (kernels.gatherDeviceColumns) |gather| {
+                if (try gather(backend.ptr, columns[0..count])) continue;
+            }
+            for (values[start_column..next_column], start_column..) |destination, index| {
+                if (destination != .resident) continue;
+                const width = try denseBytes(destination.resident.shape[1..], 1);
                 const target = if (backend.kind() == .native)
                     (kernels.pooledOutputStorage.?(backend.ptr, destination.resident.value) orelse return error.ResidentGatherUnavailable).tensor
                 else
@@ -826,20 +884,32 @@ fn gatherStageInputs(first: *const Ticket, items: []const micro.ExecuteItem, ten
                 var start: usize = 0;
                 for (items) |item| {
                     const ticket = item.payloadAs(Ticket);
-                    const source = ticket.stage.?[column].resident;
+                    const source = ticket.stage.?[index].resident;
                     if (!try backend.vtable.copyRows2D.?(backend.ptr, target, start, source.value, 0, ticket.rows, width)) return error.ResidentGatherUnavailable;
                     start += ticket.rows;
                 }
             }
-        };
+        }
+        if (first.session.invocation_diagnostics) |binding| {
+            if (binding.diagnostics.isEnabled()) result.transfers = audit.measurements();
+        }
         if (metal_frame) {
             try backend.decoderRuntimeSubmitFrame();
             recording = false;
             try backend.decoderRuntimeWaitSubmittedFrame();
         }
     }
+    if (event) |completion| {
+        try completion.record();
+        result.completion = completion;
+        event_transferred = true;
+    }
     try scope.finish();
     return result;
+}
+
+fn alignedGatherOffset(offset: usize, alignment: usize) !usize {
+    return std.mem.alignBackward(usize, try std.math.add(usize, offset, alignment - 1), alignment);
 }
 
 fn denseBytes(shape: []const i64, element_bytes: usize) !usize {
@@ -1023,16 +1093,30 @@ fn executeGroupMode(comptime placement: OutputPlacement, items: []const micro.Ex
     if (comptime placement == .host)
         cleanup_owner = try @import("../execution/cleanup_owner.zig").Owner.beginAdmitted(first.session);
     if (cleanup_owner.epoch()) |epoch| try permit.bindPhysicalCleanupEpoch(epoch);
+    const stream_ordered = @import("../backends/imported_onnx_session.zig").acceptsStreamOrderedStageInputs(first.session);
+    if (!stream_ordered) if (gathered) |*owned| try owned.awaitCopies();
+    var ingress: @import("../execution/runtime_telemetry.zig").BatchIngress = undefined;
+    if (gathered) |owned| if (owned.transfers) |measurements| {
+        if (permit.session.invocation_diagnostics) |*binding| {
+            ingress = .{ .transfers = measurements, .stream_ordered = stream_ordered and owned.completion != null };
+            binding.batch_ingress = &ingress;
+        }
+    };
     // The lexical cleanup owner binds prepared resources before this gate
     // and seals only after its eventual numerical unlock.
     try first.session.acquireSelectedCohort(control, &cohort_waiter);
     var locked = true;
     defer if (locked) first.session.releaseSelectedCohortGate(&cohort_waiter);
     if (comptime placement == .resident) {
+        if (stream_ordered) if (gathered) |owned| if (owned.completion) |completion| {
+            // Keep the fence and source tickets until publication or error
+            // cleanup. The provider orders its reads without a host wait.
+            try completion.beforeReuse();
+        };
         var outputs = (if (gathered) |owned|
             try permit.runStageInputsWithControl(owned.values, alloc, control)
         else
-            try permit.runResidentWithControl(batch_inputs, alloc, control)) orelse return error.UnexpectedResidentStageDecline;
+            try permit.runResidentForPublication(batch_inputs, alloc, control)) orelse return error.UnexpectedResidentStageDecline;
         defer outputs.deinitWithBoundary(cleanup_owner.epoch());
         if (gathered) |owned| outputs.physical_backing_requires_epoch = owned.has_device_storage;
         _ = try cleanup_owner.retainThroughBackend(outputs.backend);
@@ -1104,7 +1188,7 @@ fn executeGroupMode(comptime placement: OutputPlacement, items: []const micro.Ex
     if (outputs.len == 0 or outputs.len != first.session.outputInfo().len) return error.InvalidFusedOutputShape;
     for (outputs, first.session.outputInfo()) |tensor, info| {
         const empty_cross_cache = first.session.cached_decoder_geometry != null and
-            std.mem.startsWith(u8, tensor.name, "present.") and std.mem.indexOf(u8, tensor.name, ".encoder.") != null and
+            onnx_cache.presentOutputRole(tensor.name) == .cross_attention and
             tensor.data.len == 0 and tensor.shape.len == 4 and tensor.shape[0] == 0;
         if (!validTensor(tensor) or tensor.dtype != info.dtype or tensor.shape.len == 0 or (tensor.shape[0] != rows and !empty_cross_cache)) return error.InvalidFusedOutputShape;
         // Native multi-entry sessions qualify concrete stages independently
@@ -2181,24 +2265,26 @@ test "resident serving cohort releases actual provider before publishing receive
 
 test "tensor microbatch CPU gathers backend-owned ONNX decoder cache" {
     if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
-    try checkDecoderGather(.native);
+    try checkDecoderGather(.native, 1);
 }
 
 test "tensor microbatch Metal gathers ONNX decoder cache inputs on device" {
     if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
     if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
-    try checkDecoderGather(.metal);
+    try checkDecoderGather(.metal, 1);
+    try checkDecoderGather(.metal, 65);
 }
 
 test "tensor microbatch CUDA gathers ONNX decoder cache inputs on device" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
-    checkDecoderGather(.cuda) catch |err| switch (err) {
+    checkDecoderGather(.cuda, 1) catch |err| switch (err) {
         error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
         else => return err,
     };
+    try checkDecoderGather(.cuda, 65);
 }
 
-fn checkDecoderGather(kind: @import("../backends/backends.zig").BackendType) !void {
+fn checkDecoderGather(kind: @import("../backends/backends.zig").BackendType, comptime cache_columns: usize) !void {
     const a = std.testing.allocator;
     const ml = @import("ml");
     var graph = ml.graph.Graph.init(a);
@@ -2206,7 +2292,15 @@ fn checkDecoderGather(kind: @import("../backends/backends.zig").BackendType) !vo
     var builder = ml.graph.Builder.init(&graph);
     const ids = try builder.parameter("input_ids", ml.graph.Shape.init(.i64, &.{ -1, 1 }));
     const encoder = try builder.parameter("encoder_hidden_states", ml.graph.Shape.init(.f32, &.{ -1, 1, 4 }));
-    const past = try builder.parameter("past_key_values.0.decoder.key", ml.graph.Shape.init(.f32, &.{ -1, 1, -1, 4 }));
+    var cache_names: [cache_columns][48]u8 = undefined;
+    var names: [cache_columns][]const u8 = undefined;
+    const cache_shape = ml.graph.Shape.init(.f32, &.{ -1, 1, -1, 4 });
+    var past: ml.graph.NodeId = undefined;
+    for (&cache_names, &names, 0..) |*buffer, *name, index| {
+        name.* = try std.fmt.bufPrint(buffer, "past_key_values.{d}.decoder.key", .{index});
+        const input = try builder.parameter(name.*, cache_shape);
+        past = if (index == 0) input else try builder.add(past, input);
+    }
     const token = try builder.reshape(try builder.convertDtype(ids, .f32), ml.graph.Shape.init(.f32, &.{ -1, 1, 1 }));
     const logits = try builder.add(encoder, token);
     const next = try builder.reshape(logits, ml.graph.Shape.init(.f32, &.{ -1, 1, 1, 4 }));
@@ -2248,8 +2342,8 @@ fn checkDecoderGather(kind: @import("../backends/backends.zig").BackendType) !vo
     var sources: [count]ops.CT = undefined;
     var created: usize = 0;
     defer for (sources[0..created]) |value| backend.free(value);
-    var stage: [count][3]StageInput = undefined;
-    var views: [count][3]Tensor = undefined;
+    var stage: [count][2 + cache_columns]StageInput = undefined;
+    var views: [count][2 + cache_columns]Tensor = undefined;
     var tickets: [count]Ticket = undefined;
     for (0..count) |index| {
         @memset(&data, @floatFromInt(10 + index));
@@ -2266,15 +2360,19 @@ fn checkDecoderGather(kind: @import("../backends/backends.zig").BackendType) !vo
             .owns_data = false,
             .owns_shape = false,
         };
-        views[index] = .{ ids_tensor, host_encoder, input.borrowedView(input.name) };
-        views[index][2].data = &.{};
-        views[index][2].shape = &past_shape;
-        stage[index] = .{ .{ .host = ids_tensor }, .{ .host = host_encoder }, .{ .resident = .{
-            .value = sources[index],
-            .backend = backend,
-            .shape = &past_shape,
-            .estimated_bytes = @sizeOf(@TypeOf(data)),
-        } } };
+        views[index][0..2].* = .{ ids_tensor, host_encoder };
+        stage[index][0..2].* = .{ .{ .host = ids_tensor }, .{ .host = host_encoder } };
+        for (names, views[index][2..], stage[index][2..]) |name, *view, *value| {
+            view.* = input.borrowedView(name);
+            view.data = &.{};
+            view.shape = &past_shape;
+            value.* = .{ .resident = .{
+                .value = sources[index],
+                .backend = backend,
+                .shape = &past_shape,
+                .estimated_bytes = @sizeOf(@TypeOf(data)),
+            } };
+        }
         try std.testing.expect(eligibleStage(session, &views[index], &stage[index]));
         tickets[index] = .{ .session = session, .permit = null, .gate = gate, .inputs = &views[index], .control = control, .rows = 1, .stage = &stage[index] };
     }
@@ -2312,7 +2410,7 @@ fn checkDecoderGather(kind: @import("../backends/backends.zig").BackendType) !vo
                 try std.testing.expectEqual(@as(usize, 4), logits_value.len);
                 try std.testing.expectEqual(@as(usize, 257 * 4), cache_value.len);
                 for (logits_value, 0..) |value, j| try std.testing.expectEqual(@as(f32, @floatFromInt(2 + i + j)), value);
-                for (cache_value[0 .. 256 * 4]) |value| try std.testing.expectEqual(@as(f32, @floatFromInt(10 + i)), value);
+                for (cache_value[0 .. 256 * 4]) |value| try std.testing.expectEqual(@as(f32, @floatFromInt((10 + i) * cache_columns)), value);
                 try std.testing.expectEqualSlices(f32, logits_value, cache_value[256 * 4 ..]);
             }
         }
@@ -2348,7 +2446,7 @@ fn checkDecoderGather(kind: @import("../backends/backends.zig").BackendType) !vo
     try Bench.run(&tickets, true, true);
     var serial_ns: i96 = 0;
     var fused_ns: i96 = 0;
-    for (0..12) |iteration| {
+    for (0..if (cache_columns == 1) 12 else 0) |iteration| {
         for ([_]bool{ iteration % 2 == 0, iteration % 2 != 0 }) |fused| {
             const start = std.Io.Clock.Timestamp.now(std.testing.io, .awake);
             try Bench.run(&tickets, fused, false);
@@ -2356,7 +2454,7 @@ fn checkDecoderGather(kind: @import("../backends/backends.zig").BackendType) !vo
             if (fused) fused_ns += elapsed else serial_ns += elapsed;
         }
     }
-    std.debug.print("\n{s} decoder serving executor, 48 rows each: serial {d} ns, fused {d} ns\n", .{ @tagName(kind), serial_ns, fused_ns });
+    if (cache_columns == 1) std.debug.print("\n{s} decoder serving executor, 48 rows each: serial {d} ns, fused {d} ns\n", .{ @tagName(kind), serial_ns, fused_ns });
     for (&callers) |*caller| try group.concurrent(std.testing.io, Submit.call, .{caller});
     try group.await(std.testing.io);
     for (&callers, 0..) |*caller, index| {
@@ -2364,9 +2462,217 @@ fn checkDecoderGather(kind: @import("../backends/backends.zig").BackendType) !vo
         const output = caller.output orelse return error.MissingMergedDecoderResult;
         const cache = try output.backend.toFloat32(output.outputs[1], a);
         defer a.free(cache);
-        try std.testing.expectEqual(@as(f32, @floatFromInt(10 + index)), cache[0]);
+        try std.testing.expectEqual(@as(f32, @floatFromInt((10 + index) * cache_columns)), cache[0]);
     }
     const report = broker.snapshot(std.testing.io);
     try std.testing.expectEqual(@as(u64, count), report.native_items);
     try std.testing.expectEqual(@as(u64, 1), report.native_batches);
+}
+
+test "tensor microbatch released T5-small fuses suffixes after encoder retirement" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const path = platform.env.getenv("ANTFLY_ONNX_T5_MERGED_DECODER") orelse return error.SkipZigTest;
+    const name = platform.env.getenv("ANTFLY_ONNX_T5_BACKEND") orelse "native";
+    const kind = std.meta.stringToEnum(@import("../backends/backends.zig").BackendType, name) orelse return error.InvalidBackend;
+    const a = std.testing.allocator;
+    const shared_allocator = std.heap.smp_allocator;
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    var session = try @import("../backends/imported_onnx_session.zig").createSession(a, path, kind);
+    defer session.close();
+    try session.model_lifetime.?.prepareFinalResources();
+    session.model_lifetime.?.admission_domain = domain.pin();
+    session.run_admission = .{ .controller = &domain.controller, .backend_class = if (kind == .native) .cpu else .gpu, .limits = .{}, .static_workspace_bytes = 1, .check_live_memory = false };
+    var broker = micro.Broker.init(a);
+    defer broker.deinit();
+    const Runtime = @import("../execution/seq2seq_runtime.zig");
+    const control: Control = .{ .native_call_policy = .in_process };
+    const DispatchContext = struct { broker: *micro.Broker, gate: std.atomic.Mutex = .unlocked, wait_us: ?u64 = 20_000 };
+    var dispatch_context: DispatchContext = .{ .broker = &broker, .wait_us = if (kind == .metal) null else 20_000 };
+    const Peer = struct {
+        state: Runtime.State,
+        token: i64,
+        position: usize = 4,
+        dispatch: *DispatchContext,
+        row: ?[]f32 = null,
+        failure: ?anyerror = null,
+
+        fn stage(raw: *anyopaque, task: micro.Task, allocator: std.mem.Allocator, target: session_mod.Session, inputs: []const StageInput, active: ?Control) !session_mod.ResidentOutputs {
+            const dispatch: *DispatchContext = @ptrCast(@alignCast(raw));
+            return runStage(dispatch.broker, allocator, std.testing.io, task, target, target.execution_gate orelse &dispatch.gate, inputs, active, null, dispatch.wait_us) catch |err| {
+                std.debug.print("T5 stage dispatch failed: {s}\n", .{@errorName(err)});
+                return err;
+            };
+        }
+
+        fn host(_: *anyopaque, _: micro.Task, _: std.mem.Allocator, _: session_mod.Session, _: ?*session_mod.RunPermit, _: ?*std.atomic.Mutex, _: []const Tensor, _: ?Control) ![]Tensor {
+            return error.UnexpectedHostDispatch;
+        }
+
+        fn step(state: *Runtime.State, position: usize, token: i64, dispatch: *DispatchContext) ![]f32 {
+            return state.stepResidentDispatched(.{ .position = position, .tokens = &.{token} }, control, .{
+                .ptr = dispatch,
+                .task = .rewrite,
+                .run_fn = host,
+                .run_stage_fn = stage,
+                .accepts_shape_only_stage_inputs = true,
+            });
+        }
+
+        fn run(peer: *@This()) void {
+            peer.row = step(&peer.state, peer.position, peer.token, peer.dispatch) catch |err| {
+                peer.failure = err;
+                return;
+            };
+        }
+    };
+    var peers: [2]Peer = undefined;
+    var references: [2][]f32 = undefined;
+    var ready: usize = 0;
+    defer for (peers[0..ready], references[0..ready]) |*peer, reference| {
+        if (peer.row) |row| shared_allocator.free(row);
+        a.free(reference);
+        peer.state.deinit();
+    };
+    for (&peers, &references, 0..) |*peer, *reference, index| {
+        const initial = [_]i64{ 0, 1, 2, @as(i64, @intCast(3 + index)) };
+        const token: i64 = @intCast(8 + index);
+        var hidden = try Tensor.initFloat32(a, "encoder_hidden_states", &.{ 1, 4, 512 }, &(@as([2048]f32, @splat(0.01))));
+        defer hidden.deinit();
+        const mask: []const i64 = &.{ 1, 1, 1, 1 };
+        reference.* = blk: {
+            var serial = (try Runtime.State.init(a, session, .{ .host = hidden }, mask, 32128)) orelse return error.UnqualifiedMergedDecoder;
+            defer serial.deinit();
+            break :blk try serial.stepResident(.{ .position = 0, .tokens = &(initial ++ [1]i64{token}) }, control);
+        };
+        errdefer a.free(reference.*);
+
+        var state = (try Runtime.State.init(shared_allocator, session, .{ .host = hidden }, mask, 32128)) orelse return error.UnqualifiedMergedDecoder;
+        errdefer state.deinit();
+        const row = try state.stepResident(.{ .position = 0, .tokens = &initial }, control);
+        shared_allocator.free(row);
+        try std.testing.expect(state.detachEncoderPayload());
+        peer.* = .{ .state = state, .token = token, .dispatch = &dispatch_context };
+        ready += 1;
+    }
+    try std.testing.expect(session.configureExecutionDiagnostics(true));
+    var group = std.Io.Group.init;
+    defer group.cancel(std.testing.io);
+    for (&peers) |*peer| try group.concurrent(std.testing.io, Peer.run, .{peer});
+    try group.await(std.testing.io);
+    for (&peers, references) |*peer, reference| {
+        if (peer.failure) |err| {
+            std.debug.print("T5 broker suffix failure: {s}\n", .{@errorName(err)});
+            return err;
+        }
+        const row = peer.row orelse return error.MissingMergedDecoderResult;
+        try std.testing.expectEqual(reference.len, row.len);
+        for (reference, row) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
+    }
+    const observation = session.executionDiagnostics() orelse return error.MissingBatchObservation;
+    const ingress = observation.runtime.batch_ingress orelse return error.MissingBatchObservation;
+    try std.testing.expectEqual(kind == .cuda, ingress.stream_ordered);
+    try std.testing.expectEqual(@as(u64, 0), ingress.transfers.download_calls);
+    if (kind == .cuda) {
+        try std.testing.expect((ingress.transfers.device_copy_calls orelse 0) > 0);
+        try std.testing.expectEqual(@as(?u64, 2 * 24 * 4 * 512 * @sizeOf(f32)), ingress.transfers.device_copy_bytes);
+    }
+    const report = broker.snapshot(std.testing.io);
+    try std.testing.expectEqual(@as(u64, 1), report.native_batches);
+    try std.testing.expectEqual(@as(u64, peers.len), report.native_items);
+
+    if (!platform.env.getenvBool("ANTFLY_ONNX_T5_BENCH_ABBA") and (kind == .native or kind == .metal)) {
+        // Advancing the detached state through the serial control must
+        // skip the broker entirely.
+        dispatch_context.wait_us = if (kind == .metal) 0 else null;
+        for (&peers) |*peer| {
+            const row = try Peer.step(&peer.state, 5, peer.token, &dispatch_context);
+            defer shared_allocator.free(row);
+            try std.testing.expectEqual(@as(usize, 32128), row.len);
+        }
+        try std.testing.expectEqualDeep(report, broker.snapshot(std.testing.io));
+    }
+
+    if (platform.env.getenvBool("ANTFLY_ONNX_T5_BENCH_ABBA")) {
+        _ = session.configureExecutionDiagnostics(false);
+        var serial_states: [peers.len]Runtime.State = undefined;
+        var serial_ready: usize = 0;
+        defer for (serial_states[0..serial_ready]) |*state| state.deinit();
+        for (&serial_states, 0..) |*slot, index| {
+            var hidden = try Tensor.initFloat32(a, "encoder_hidden_states", &.{ 1, 4, 512 }, &(@as([2048]f32, @splat(0.01))));
+            defer hidden.deinit();
+            slot.* = (try Runtime.State.init(a, session, .{ .host = hidden }, &.{ 1, 1, 1, 1 }, 32128)) orelse return error.UnqualifiedMergedDecoder;
+            serial_ready += 1;
+            const initial = [_]i64{ 0, 1, 2, @intCast(3 + index), @intCast(8 + index) };
+            const row = try slot.stepResident(.{ .position = 0, .tokens = &initial }, control);
+            a.free(row);
+            try std.testing.expect(slot.detachEncoderPayload());
+        }
+        for (&peers) |*peer| {
+            shared_allocator.free(peer.row.?);
+            peer.row = null;
+        }
+        const direct_serial = platform.env.getenvBool("ANTFLY_ONNX_T5_BENCH_DIRECT_SERIAL");
+        const samples_per_arm = 8;
+        const benchmark_wait_us = platform.env.getenvUsize("ANTFLY_ONNX_T5_BENCH_WAIT_US") orelse collectionWaitUs(null, 0);
+        var positions = [2]usize{ 5, 5 };
+        var serial_ids: [2 * samples_per_arm][peers.len]usize = undefined;
+        for ([_]bool{ false, true, true, false }, 0..) |fused, arm| {
+            const route: usize = @intFromBool(fused);
+            dispatch_context.wait_us = if (fused) benchmark_wait_us else 0;
+            for (0..samples_per_arm) |sample| {
+                const position = positions[route];
+                const tokens = [2]i64{ @intCast(position + 10), @intCast(position + 20) };
+                var selected: [peers.len]usize = undefined;
+                var serial_rows: [peers.len]?[]f32 = @splat(null);
+                defer for (serial_rows) |row| if (row) |values| a.free(values);
+                const before = broker.snapshot(std.testing.io);
+                const start = platform.time.monotonicNs();
+                if (fused) {
+                    var batch_group = std.Io.Group.init;
+                    defer batch_group.cancel(std.testing.io);
+                    for (&peers, tokens) |*peer, token| {
+                        peer.position = position;
+                        peer.token = token;
+                        try batch_group.concurrent(std.testing.io, Peer.run, .{peer});
+                    }
+                    try batch_group.await(std.testing.io);
+                } else {
+                    for (&serial_states, tokens, &serial_rows) |*state, token, *row| {
+                        row.* = if (direct_serial)
+                            try state.stepResident(.{ .position = position, .tokens = &.{token} }, control)
+                        else
+                            try Peer.step(state, position, token, &dispatch_context);
+                    }
+                }
+                const elapsed = platform.time.monotonicNs() - start;
+                const after = broker.snapshot(std.testing.io);
+                if (fused) {
+                    try std.testing.expectEqual(before.native_batches + 1, after.native_batches);
+                    try std.testing.expectEqual(before.native_items + peers.len, after.native_items);
+                }
+                for (&peers, serial_rows, &selected) |*peer, serial_row, *id| {
+                    if (peer.failure) |err| return err;
+                    const row = (if (fused) peer.row else serial_row) orelse return error.MissingMergedDecoderResult;
+                    id.* = std.mem.indexOfMax(f32, row);
+                    if (fused) {
+                        shared_allocator.free(row);
+                        peer.row = null;
+                    }
+                }
+                const index = position - 5;
+                if (arm == 0) {
+                    serial_ids[index] = selected;
+                } else if (arm == 3) {
+                    try std.testing.expectEqualDeep(serial_ids[index], selected);
+                } else if (index < samples_per_arm) {
+                    try std.testing.expectEqualDeep(serial_ids[index], selected);
+                } else {
+                    serial_ids[index] = selected;
+                }
+                positions[route] += 1;
+                std.debug.print("T5 release suffix arm={d} fused={} sample={d} position={d} ns={d}\n", .{ arm, fused, sample, position, elapsed });
+            }
+        }
+    }
 }

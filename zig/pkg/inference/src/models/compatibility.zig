@@ -188,6 +188,14 @@ fn assessWithRuntimeFacts(
         );
     }
 
+    if (man.isInkling2()) {
+        const enabled = @import("build_options");
+        if ((!enabled.enable_cuda and !enabled.enable_metal) or man.model_type != .generator or
+            man.nativeWeightArtifactKind() != .sharded_safetensors)
+            return makeIncompatible(architecture, .unsupported_backend, "Inkling 2 requires Metal or CUDA and the sharded NVFP4 generation checkpoint");
+        return makeCompatible(architecture, "Inkling 2 Mini text and image generation");
+    }
+
     if (man.isQwen3VlBundle()) {
         // The CUDA generation route uses the official integrated BF16
         // safetensors bundle instead of the split GGUF decoder/projector

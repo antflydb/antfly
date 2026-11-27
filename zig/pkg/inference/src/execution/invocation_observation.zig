@@ -37,8 +37,11 @@ pub const Binding = struct {
     pending_interval: ?*const diagnostics_mod.PendingInterval = null,
     pending_counters: ?*diagnostics_mod.PendingInterval.ObservedPhases = null,
     capture_programs: bool = false,
+    batch_ingress: ?*const @import("runtime_telemetry.zig").BatchIngress = null,
     native_definition_templates: ?diagnostics_mod.NativeDefinitionTemplates = null,
     native_program_construction: ?diagnostics_mod.NativeProgramConstruction = null,
+    planned_prefill: ?diagnostics_mod.PrefillGeometry = null,
+    prefill_progress: ?*const diagnostics_mod.PrefillProgress = null,
     model_allocator: ?std.mem.Allocator = null,
     stable_backend: ?ops.ComputeBackend = null,
     /// Shared providers require their own short metadata exclusion. Raw/private
@@ -140,6 +143,48 @@ pub fn recordContextAcquisitionFailure(context: anytype, operation: diagnostics_
     recordFailureWithoutBackendSample(context.diagnosticsBinding(), operation, failure);
 }
 
+test "planned prefill geometry is exported separately from observed GPU work" {
+    const Work = struct {
+        fn run() !void {}
+        fn partial(progress: *diagnostics_mod.PrefillProgress) !void {
+            progress.commitThrough(256);
+            progress.commitThrough(512);
+            progress.commitThrough(512);
+            return error.Cancelled;
+        }
+    };
+    var owner = diagnostics_mod.Diagnostics{};
+    owner.configure(true);
+    var binding = Binding{ .diagnostics = &owner };
+    binding.planned_prefill = .{
+        .max_append_rows = 256,
+        .attention_workspace_rows = 32,
+        .cache_capacity_tokens = 1_048_576,
+        .workspace = .{ .planned_bytes = 32768, .bound_bytes = 32768 },
+    };
+    try callOperation(binding, .prefill, Work.run, .{});
+    const report = owner.snapshot().?.report.?;
+    try std.testing.expectEqualStrings("prefill", report.operation);
+    try std.testing.expectEqual(binding.planned_prefill, report.planned_prefill);
+    try std.testing.expectEqual(@as(?u64, if (build_options.enable_metal) 0 else null), report.metal_encoded_dispatches);
+    var progress: diagnostics_mod.PrefillProgress = .{};
+    binding.prefill_progress = &progress;
+    try std.testing.expectError(error.Cancelled, callOperation(binding, .prefill, Work.partial, .{&progress}));
+    const partial = owner.snapshot().?.report.?;
+    try std.testing.expectEqualStrings("failed", partial.outcome);
+    try std.testing.expectEqual(diagnostics_mod.PrefillProgress{
+        .committed_input_tokens = 512,
+        .committed_chunks = 2,
+    }, partial.prefill_progress.?);
+
+    binding.planned_prefill = null;
+    binding.prefill_progress = null;
+    try callOperation(binding, .decode_step, Work.run, .{});
+    const decode = owner.snapshot().?.report.?;
+    try std.testing.expect(decode.planned_prefill == null);
+    try std.testing.expect(decode.prefill_progress == null);
+}
+
 test "classified physical retries and declines preserve results and replace success only while enabled" {
     const Probe = struct {
         const Outcome = enum { complete, retry, declined };
@@ -217,7 +262,7 @@ noinline fn observedInputs(comptime stages: bool, binding: Binding, inputs: anyt
     for (inputs) |input| {
         if (comptime stages) {
             if (input == .resident) input.resident.backend.registerTensorOwnershipObservation(input.resident.value);
-        } else input.backend.registerTensorOwnershipObservation(input.value);
+        } else if (input.binding == .provider_tensor) input.backend.registerTensorOwnershipObservation(input.value);
     }
     const result = @call(.auto, callback, args) catch |err| {
         scope.error_name = @errorName(err);
@@ -279,20 +324,13 @@ const Invocation = struct {
         };
         snapshot.execution_scope = if (snapshot.execution != null) .last_published_program else .unavailable;
         snapshot.runtime.transfers = self.transfers.measurements();
-        snapshot.runtime.resolved_project_metal_dispatches = if (comptime build_options.enable_metal) self.kernels.metal else null;
-        snapshot.runtime.terminal_native_bodies = self.kernels.native_bodies;
-        snapshot.runtime.selected_native_dispatches = self.kernels.native_dispatches;
-        snapshot.runtime.joined_native_workers = self.kernels.native_workers;
-        snapshot.runtime.native_quant_worker_callbacks = self.kernels.quant_worker_callbacks;
-        snapshot.runtime.native_attention_programs = self.kernels.attention_programs;
-        snapshot.runtime.native_activation_programs = self.kernels.activation_programs;
-        snapshot.runtime.authored_native_programs = self.kernels.native_programs;
-        snapshot.runtime.authored_native_program_bank = self.kernels.native_program_bank;
-        snapshot.runtime.metal_serial_workspace = self.kernels.metal_serial_workspace;
+        snapshot.runtime.batch_ingress = if (self.binding.batch_ingress) |ingress| ingress.* else null;
+        snapshot.runtime.recordKernelInterval(&self.kernels);
         if (self.binding.native_definition_templates) |value| snapshot.native_definition_templates = value;
         if (self.binding.native_program_construction) |value| snapshot.native_program_construction = value;
-        snapshot.runtime.owned_native_fallbacks = self.kernels.native_fallbacks;
-        snapshot.runtime.resolved_project_cuda_launches = self.kernels.finish();
+        if (self.binding.planned_prefill) |value| snapshot.planned_prefill = value;
+        if (self.binding.prefill_progress) |value| snapshot.prefill_progress = value.*;
+        _ = self.kernels.finish();
         snapshot.runtime.submission = self.scope.snapshot();
         snapshot.runtime.allocation_owners = self.owners.finish();
         snapshot.runtime.device_owners = self.device_owners.end();
@@ -457,7 +495,7 @@ test "resident owner observations preserve the disabled raw path and unwind sour
             return 7;
         }
     };
-    const Input = struct { backend: *const ops.ComputeBackend, value: ops.CT };
+    const Input = @import("../backends/session.zig").ResidentInput;
     var probe = Probe{};
     var table = @import("../ops/native_compute.zig").vtable_impl;
     const kernels = ops.KernelBackend{ .implementation_table = &table, .registerTensorOwnershipObservation = &Probe.register };
@@ -470,12 +508,16 @@ test "resident owner observations preserve the disabled raw path and unwind sour
     try std.testing.expectEqual(@as(usize, 7), try callResident(binding, &unread, Probe.dispatch, .{&probe}));
     try std.testing.expectEqual(@as(usize, 0), probe.registrations);
     try std.testing.expect(diagnostics.snapshot() == null);
-    const input = [_]Input{.{ .backend = &backend, .value = &probe }};
+    const input = [_]Input{
+        .{ .backend = &backend, .value = &probe },
+        .{ .backend = &backend, .value = &probe, .binding = .omitted },
+    };
     diagnostics.configure(true);
     probe.expected_enabled = true;
     try std.testing.expectEqual(@as(usize, 7), try callResident(binding, &input, Probe.dispatch, .{&probe}));
     var measured = diagnostics.snapshot().?;
     try std.testing.expectEqual(@as(usize, 1), measured.runtime.device_owners.?.owners);
+    try std.testing.expectEqual(@as(usize, 1), probe.registrations);
     try std.testing.expectEqual(@as(usize, 32), measured.runtime.device_owners.?.reports[0].physical_live_bytes);
     try std.testing.expectEqual(@as(usize, 1), probe.references);
     probe.fail = true;

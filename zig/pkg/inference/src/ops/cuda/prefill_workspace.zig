@@ -21,7 +21,7 @@ const Cleanup = @import("../../execution/cleanup_context.zig").Context;
 pub const Request = struct {
     // Existing recurrent quota custody has no allocation/geometry demand.
     // Its zero-byte role can only prepare a SAME-lease retirement shell.
-    kind: enum { recurrent, attention, recurrent_existing },
+    kind: enum { recurrent, attention },
     library_identity: usize,
     geometry_hash: u64,
     device_bytes: usize,

@@ -41,7 +41,11 @@ pub const Result = struct {
 pub fn shape(group: grouped.Group) !?micro.Shape {
     if (group.title != null or group.content.len != 1) return null;
     const part = group.content[0];
-    if (part == .audio) return .{ .bytes = part.audio.bytes.len, .tokens = 1024 };
+    if (part == .audio) {
+        const clip = part.audio;
+        const sequence = projector.embeddingGemma2EncodedAudioSequenceBoundWithOptions(clip.bytes, clip.decode_options) catch 1024;
+        return .{ .bytes = clip.bytes.len, .tokens = @min(sequence, 1024) };
+    }
     if (part != .image and part != .raster) return null;
     return try imageShape(part, try group.imageInfo(0));
 }
@@ -173,6 +177,7 @@ pub fn submit(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, m
         } else raster_mode = raw;
         const part = group.content[0];
         largest_input = @max(largest_input, shapes[index].bytes);
+        if (audio_mode) largest_sequence = @max(largest_sequence, shapes[index].tokens);
         if (dimensions) |info| {
             if (grouped.boundedVision(session.backend())) {
                 const geometry = try projector.embeddingGemma2ImageGeometry(info.width, info.height);
@@ -187,7 +192,7 @@ pub fn submit(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, m
     // Plan against immutable policy limits without reserving GPU scratch.
     // A tighter policy decreases occupancy; an ineligible singleton retains
     // the original executor instead of making a previously valid call fail.
-    capacity = if (general) capacity else if (audio_mode) try fittingAudioCapacity(session, capacity, largest_input) else try fittingCapacity(session, capacity, largest_input, largest_scratch, largest_patches, largest_sequence, largest_decoded);
+    capacity = if (general) capacity else if (audio_mode) try fittingAudioCapacity(session, capacity, largest_input, largest_sequence) else try fittingCapacity(session, capacity, largest_input, largest_scratch, largest_patches, largest_sequence, largest_decoded);
     if (capacity == 0) return null;
     const Probe = struct {
         fn canceled(ptr: *const anyopaque) bool {
@@ -234,11 +239,15 @@ fn fittingCapacity(session: Session, ceiling: usize, largest_input: usize, large
     return capacity;
 }
 
-fn fittingAudioCapacity(session: Session, ceiling: usize, largest_input: usize) !usize {
+fn fittingAudioCapacity(session: Session, ceiling: usize, largest_input: usize, sequence: usize) !usize {
     var capacity = ceiling;
     while (capacity != 0) : (capacity -= 1) {
         const bytes = std.math.mul(usize, largest_input, capacity) catch return 0;
-        if (try session.fitsRun(grouped.audioRunRequest(session.backend(), bytes, 0, capacity))) break;
+        const request = if (grouped.boundedVision(session.backend()))
+            try grouped.preparedAudioRunRequest(session.backend(), bytes, 0, capacity, sequence)
+        else
+            grouped.audioRunRequest(session.backend(), bytes, 0, capacity);
+        if (try session.fitsRun(request)) break;
     }
     return capacity;
 }
@@ -416,6 +425,11 @@ test "embeddinggemma2 image broker shares bounded plan without source staging in
     try std.testing.expectEqual(@as(usize, 4), try fittingCapacity(session, 4, 1024, scratch, 0, 0, 0));
     session.run_admission.?.limits.scratch_limit_bytes = 256 * 1024 * 1024;
     try std.testing.expectEqual(@as(usize, 0), try fittingCapacity(session, 4, 1024, scratch, 0, 0, 0));
+
+    // Probing the short audio shape must use the same request as execution.
+    session.run_admission.?.limits.scratch_limit_bytes = 925 * 1024 * 1024;
+    try std.testing.expectEqual(@as(usize, 4), try fittingAudioCapacity(session, 4, 1024, 7));
+    try std.testing.expectEqual(@as(usize, 0), try fittingAudioCapacity(session, 4, 1024, 1024));
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().scratchTotalBytes());
 }
 
@@ -423,6 +437,12 @@ test "gemma4 audio broker bounds unknown lengths and rejects mixed modalities" {
     const value = (try shape(.{ .content = &.{.{ .audio = .{ .bytes = "encoded" } }} })).?;
     try std.testing.expectEqual(@as(usize, 1024), value.tokens);
     try std.testing.expectEqual(@as(usize, 7), value.bytes);
+    const samples: [1600]f32 = @splat(0);
+    const wav = try @import("audio.zig").wav.encodeInterleaved(std.testing.allocator, &samples, 1, .{ .audio_format = 1, .sample_rate = 16000, .bits_per_sample = 16 });
+    defer std.testing.allocator.free(wav);
+    const known = (try shape(.{ .content = &.{.{ .audio = .{ .bytes = wav } }} })).?;
+    try std.testing.expectEqual(@as(usize, 7), known.tokens);
+    try std.testing.expectEqual(wav.len, known.bytes);
     try std.testing.expect(try shape(.{ .content = &.{ .{ .text = "query" }, .{ .audio = .{ .bytes = "encoded" } } } }) == null);
 }
 

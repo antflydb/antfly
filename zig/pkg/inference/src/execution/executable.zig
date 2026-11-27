@@ -19,7 +19,7 @@ const std = @import("std");
 const ops = @import("../ops/ops.zig");
 const interpreter = @import("../graph/interpreter.zig");
 const ModelProgram = @import("program.zig").ModelProgram;
-pub const runtime_module = if (@import("build_options").enable_wasm) @import("wasm_runtime.zig") else @import("../graph/runtime.zig");
+pub const runtime_module = if (@import("build_options").enable_wasm) @import("wasm_runtime.zig") else @import("graph_runtime.zig");
 
 /// Borrows immutable program and backend. Both must outlive this executable,
 /// while the backend context must outlive resident results. Result storage and
@@ -545,7 +545,7 @@ test "prepared physical workspace is declared once reused and owned by its frame
     const pool = executable.runtime.physical_pool.?;
     const scratch_id = pool.workspace_allocations[0];
     const allocation = executable.runtime.buffer_plan.?.allocations[scratch_id];
-    try std.testing.expectEqual(@import("../graph/buffer_plan.zig").AllocationKind.workspace, allocation.kind);
+    try std.testing.expectEqual(@import("buffer_plan.zig").AllocationKind.workspace, allocation.kind);
     try std.testing.expectEqual(@as(u64, 32), allocation.byte_size);
     try std.testing.expectEqual(@as(u32, 8), allocation.alignment);
     try std.testing.expect(allocation.first_use == 0 and allocation.last_use >= program.graph.nodeCount());
@@ -673,13 +673,19 @@ test "prepared physical transfer protocol binds download and upload storage with
         const actual = try result.backendFor(&executable.runtime, 0).toFloat32(result.outputs[0], a);
         defer a.free(actual);
         try std.testing.expectEqualSlices(f32, &.{ 2, 0, 0, 4 }, actual);
+        var diagnostics = @import("diagnostics.zig").Diagnostics{};
+        diagnostics.configure(true);
+        diagnostics.publish(.{ .execution = result.stats });
+        const transfers = diagnostics.snapshot().?.report.?.assigned_frame_copies.?;
+        try std.testing.expectEqual(result.stats.physical_transfer_dispatches, transfers.partition_transfers);
+        try std.testing.expectEqual(result.stats.physical_transfer_bytes, transfers.partition_transfer_bytes);
         try std.testing.expectEqual(@as(u64, 2), result.stats.physical_transfer_dispatches);
         try std.testing.expectEqual(@as(u64, 40), result.stats.physical_transfer_bytes);
         if (iteration != 0) try std.testing.expectEqual(@as(u64, 0), result.stats.physical_storage_allocations);
     }
 }
 
-test "prepared Metal fanout placement preserves outputs and removes two boundary transfers" {
+test "prepared Metal fanout placement preserves outputs and removes an activation transfer" {
     if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
     if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
     const ml = @import("ml");
@@ -691,12 +697,14 @@ test "prepared Metal fanout placement preserves outputs and removes two boundary
     defer graph.deinit();
     var b = ml.graph.Builder.init(&graph);
     const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ 2, 3 }));
-    const indices = try b.parameter("indices", ml.graph.Shape.init(.i32, &.{2}));
+    const indices = try b.parameter("indices", ml.graph.Shape.init(.i32, &.{ 2, 2 }));
     const first = try b.gather(x, indices, ml.graph.Shape.init(.f32, &.{ 2, 2 }));
     graph.nodeMut(first).op.gather.axis = 1;
+    graph.nodeMut(first).op.gather.elements = true;
     const activation = try b.relu(first);
     const host = try b.gather(activation, indices, ml.graph.Shape.init(.f32, &.{ 2, 2 }));
     graph.nodeMut(host).op.gather.axis = 1;
+    graph.nodeMut(host).op.gather.elements = true;
     const resident = try b.softmax(activation);
     try graph.markOutput(host);
     try graph.markOutput(resident);
@@ -704,7 +712,7 @@ test "prepared Metal fanout placement preserves outputs and removes two boundary
     defer program.deinit();
     const input = try cb.fromFloat32Shape(&.{ -1, 2, -3, 4, -5, 6 }, &.{ 2, 3 });
     defer cb.free(input);
-    const index_values = (try cb.fromInt32Shape(&.{ 1, 0 }, &.{2})).?;
+    const index_values = (try cb.fromInt32Shape(&.{ 1, 0, 1, 0 }, &.{ 2, 2 })).?;
     defer cb.free(index_values);
     const bindings = [_]interpreter.RuntimeInput{ .{ .node_id = program.id_map[x], .value = input }, .{ .node_id = program.id_map[indices], .value = index_values } };
     for ([_]bool{ false, true }) |refine| {
@@ -712,17 +720,26 @@ test "prepared Metal fanout placement preserves outputs and removes two boundary
         defer executable.deinit();
         const placement = &executable.runtime.plan.?.base;
         const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+        const device_plan = &executable.runtime.plan.?;
+        const mesh = &executable.runtime.mesh.?;
+        try std.testing.expect(attestOwnedDeviceSchedule(pool, device_plan, mesh, &cb, executable.analysis.reachable));
+        // The node order remains unchanged when runtime loses a handoff.
+        // It must no longer share the physical pool's schedule proof.
+        for (device_plan.base.partitions) |*part| {
+            if (part.external_inputs.len == 0) continue;
+            const original = part.external_inputs;
+            defer part.external_inputs = original;
+            part.external_inputs = original[0 .. original.len - 1];
+            try std.testing.expect(!attestOwnedDeviceSchedule(pool, device_plan, mesh, &cb, executable.analysis.reachable));
+            break;
+        } else return error.MissingPartitionTransfer;
         // This caller uses the ordinary assigned physical plan, not a retained
         // input-qualified PreparedRoutes variant. Inspect its actual KernelPlans
         // and the numerical dispatch counters; the root owns no route selection.
         try std.testing.expect(pool.selection == null);
         for ([_]@TypeOf(first){ first, host }) |original| {
             const node = program.id_map[original];
-            const kernel = pool.kernels[node] orelse return error.MissingPreparedGather;
-            try std.testing.expect(kernel.descriptor.operation == .gather);
-            try std.testing.expectEqual(@as(u8, 1), kernel.descriptor.operation.gather.axis);
-            try std.testing.expectEqual(.i32, kernel.descriptor.input_shapes[1].dtype);
-            try std.testing.expectEqual(ops.BackendKind.native, pool.backends[kernel.backend_index].kind());
+            try std.testing.expectEqual(ops.BackendKind.native, placement.partitions[placement.node_assignment[node]].backend);
         }
         const activation_kernel = pool.kernels[program.id_map[activation]] orelse return error.MissingPreparedActivation;
         try std.testing.expect(activation_kernel.descriptor.operation == .unary);
@@ -735,7 +752,7 @@ test "prepared Metal fanout placement preserves outputs and removes two boundary
         for (pool.kernels) |kernel| if (kernel != null) {
             prepared_dispatches += 1;
         };
-        try std.testing.expectEqual(@as(u64, 4), prepared_dispatches);
+        try std.testing.expectEqual(@as(u64, 2), prepared_dispatches);
         try std.testing.expectEqual(if (refine) ops.BackendKind.native else .metal, placement.partitions[placement.node_assignment[program.id_map[activation]]].backend);
         try std.testing.expectError(error.DeviceReadbackForbidden, executable.run(a, .{ .runtime_inputs = &bindings, .output_placement = .producer, .activation_readbacks = .forbidden }));
         for (0..3) |iteration| {
@@ -752,10 +769,10 @@ test "prepared Metal fanout placement preserves outputs and removes two boundary
             const probabilities = try device_backend.toFloat32(result.outputs[1], a);
             defer a.free(probabilities);
             for (probabilities, [_]f32{ 0.8807971, 0.11920292, 0.01798621, 0.98201376 }) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-6);
-            try std.testing.expectEqual(@as(u64, if (refine) 3 else 5), result.stats.cross_device_transfers);
+            try std.testing.expectEqual(@as(u64, if (refine) 3 else 4), result.stats.cross_device_transfers);
             try std.testing.expectEqual(prepared_dispatches, result.stats.assigned_kernel_dispatches);
-            try std.testing.expectEqual(@as(u64, if (refine) 24 else 40), result.stats.physical_transfer_bytes);
-            try std.testing.expectEqual(@as(u64, if (refine) 32 else 48), result.stats.actual_download_bytes);
+            try std.testing.expectEqual(@as(u64, if (refine) 40 else 56), result.stats.physical_transfer_bytes);
+            try std.testing.expectEqual(@as(u64, if (refine) 40 else 56), result.stats.actual_download_bytes);
             if (iteration != 0) try std.testing.expectEqual(@as(u64, 0), result.stats.physical_storage_allocations);
         }
     }
@@ -809,7 +826,7 @@ test "prepared auxiliary planes reuse primary lifetimes and survive frame retire
     var executable_live = true;
     defer if (executable_live) executable.deinit();
     const pool = executable.runtime.physical_pool.?;
-    var plane_id: @import("../graph/buffer_plan.zig").AllocationId = undefined;
+    var plane_id: @import("buffer_plan.zig").AllocationId = undefined;
     for (pool.kernels) |maybe_kernel| if (maybe_kernel) |kernel| {
         const auxiliary = kernel.auxiliaries[0].?;
         plane_id = auxiliary.allocation;
@@ -1070,6 +1087,7 @@ test "prepared physical CUDA replay owns address banks and preserves held output
         try std.testing.expectEqual(@as(u64, 0), result.stats.device_host_accesses);
         if (iteration == 1 or iteration == 4) try std.testing.expectEqual(@as(u64, 1), result.stats.physical_graph_captures);
         if (iteration == 2 or iteration == 5) {
+            try std.testing.expect(result.stats.physical_replay_blocker == null);
             try std.testing.expectEqual(@as(u64, 1), result.stats.physical_graph_replays);
             try std.testing.expectEqual(@as(u64, 0), result.stats.physical_storage_allocations);
             try std.testing.expectEqual(@as(u64, 2), result.stats.physical_input_copies);
@@ -2714,12 +2732,6 @@ test "prepared CUDA host ingress keeps one upload through graph capture and repl
     const ingress = [_]@import("host_ingress.zig").Input{.{ .node_id = x, .value = &input }};
     // Cold immutable initialization is measured separately from mutable ingress.
     // This optimized graph legitimately retains one shared scalar ReLU literal.
-    for (program.graph.nodes.items, 0..) |node, id| {
-        const live = routes.pool.coverage_reachable.?[id];
-        const replay_index = routes.pool.replay_input_indices[id];
-        const literal = if (replay_index != @import("ml").graph.null_node) routes.pool.replay_inputs[replay_index].constant != null else false;
-        std.debug.print("CUDA_REPLAY_IR id={d} op={s} inputs={any} vjp={d} reachable={} route={} literal={}\n", .{ id, @tagName(node.op), node.getInputs(), node.vjp_alternate, live, routes.pool.preparedKernelRoute(@intCast(id)) != null, literal });
-    }
     {
         const d2d = context.cuda.stats.d2d_bytes;
         var audit = @import("transfer_audit.zig").Audit{ .forbid_device_host_access = true };
@@ -2813,15 +2825,85 @@ test "direct executable diagnostics replace success with actual failed invocatio
     try std.testing.expect(!@import("runtime_observation.zig").kernelEnabled());
 }
 
+/// Verify the executable uses the same ordered placement as the physical
+/// plan. Exact provider identity and the device-zero default are shared by
+/// each provider proof. Backend-specific executor evidence is checked next.
+fn attestOwnedDeviceSchedule(
+    pool: *const @import("physical_buffers.zig").Pool,
+    plan: *const @import("../graph/multi_executor.zig").DevicePartitionPlan,
+    mesh: *const @import("../graph/device_mesh.zig").DeviceMesh,
+    default: *const ops.ComputeBackend,
+    reachable: []const bool,
+) bool {
+    const count = reachable.len;
+    if (pool.plan.node_positions.len != count or plan.base.node_assignment.len != count or
+        plan.device_assignment.len != plan.base.partitions.len) return false;
+    var default_count: usize = 0;
+    for (mesh.devices, 0..) |device, index| {
+        for (mesh.devices[0..index]) |previous| if (previous.id == device.id) return false;
+        if (device.backend.ptr == default.ptr and device.backend.vtable == default.vtable) {
+            if (device.id != 0 or device.kind != default.kind()) return false;
+            default_count += 1;
+        }
+    }
+    if (default_count != 1) return false;
+
+    var ordinal: usize = 0;
+    var transfer_ordinal: usize = 0;
+    for (plan.base.partitions, plan.device_assignment, 0..) |part, device_id, partition_index| {
+        var active = false;
+        for (part.node_ids) |id| {
+            if (id >= count or plan.base.node_assignment[id] != partition_index or pool.plan.node_positions[id] != ordinal) return false;
+            ordinal += 1;
+            active = active or reachable[id];
+        }
+        for (part.external_inputs) |input| {
+            if (input.node_id >= count or input.source_partition >= partition_index or
+                plan.base.node_assignment[input.node_id] != input.source_partition or
+                transfer_ordinal >= pool.plan.transfers.len) return false;
+            const edge = pool.plan.transfers[transfer_ordinal];
+            if (edge.source_node != input.node_id or edge.source_partition != input.source_partition or
+                edge.target_partition != partition_index or edge.target_backend != part.backend or
+                edge.source_backend != plan.base.partitions[input.source_partition].backend) return false;
+            if (edge.source_backend == edge.target_backend and plan.device_assignment[input.source_partition] != device_id) return false;
+            transfer_ordinal += 1;
+        }
+        if (!active) continue;
+        const device = mesh.device(device_id) orelse return false;
+        if (device.kind != part.backend) return false;
+        for (pool.backends) |backend| {
+            if (backend.ptr == device.backend.ptr and backend.vtable == device.backend.vtable) break;
+        } else return false;
+    }
+    return ordinal == count and transfer_ordinal == pool.plan.transfers.len;
+}
+
+fn attestNativePartition(executable: *const Executable, graph: *const @import("ml").graph.Graph, executor: *const @import("../graph/partition.zig").PartitionExecutor, backend: *const ops.ComputeBackend) bool {
+    if (backend.vtable != &@import("../ops/native_compute.zig").vtable_impl) return false;
+    const pool = executable.runtime.physical_pool orelse return false;
+    for (pool.backends) |known| {
+        if (known.ptr == backend.ptr and known.vtable == backend.vtable) break;
+    } else return false;
+    for (executable.runtime.native_partition_executors.items) |owner| {
+        if (executor.ptr == @as(*anyopaque, @ptrCast(owner)) and executor.vtable == owner.pe.vtable and
+            owner.graph == graph and owner.backend.ptr == backend.ptr and owner.backend.vtable == backend.vtable) return true;
+    }
+    return false;
+}
+
 fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").graph.Graph, analysis: interpreter.CachedAnalysis) !void {
     if (comptime @import("build_options").enable_wasm) return;
     const pool = executable.runtime.physical_pool orelse return;
     pool.coverage_graph = graph;
     pool.coverage_reachable = analysis.reachable;
     pool.native_frame_dispatch = false;
+    pool.mixed_frame_dispatch = false;
     pool.cuda_frame_dispatch = false;
     pool.metal_frame_dispatch = false;
     pool.metal_projection_region_candidate = false;
+    pool.allocator.free(pool.metal_required_deferrals);
+    pool.metal_required_deferrals = &.{};
+    pool.cold_coverage_decline = null;
     pool.coverage_backend = .{ .ptr = executable.runtime.default_backend.ptr, .vtable = executable.runtime.default_backend.vtable };
     if (comptime @import("build_options").enable_metal) {
         if (executable.runtime.default_backend.kind() == .metal and @import("device_owned_coverage.zig").services(executable.runtime.default_backend.*) != null) {
@@ -2829,21 +2911,10 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
             const mesh = executable.runtime.mesh orelse return;
             const entry = executable.runtime.runtime_cache_entry orelse return;
             const compiled = entry.compiled_partitions orelse return;
-            if (plan.device_assignment.len != plan.base.partitions.len or plan.base.node_assignment.len != graph.nodeCount() or analysis.reachable.len != graph.nodeCount() or pool.plan.transfers.len != 0) return;
-            var targets: usize = 0;
-            for (mesh.devices, 0..) |device, index| {
-                for (mesh.devices[0..index]) |previous| if (previous.id == device.id) return;
-                if (device.backend.ptr == executable.runtime.default_backend.ptr and device.backend.vtable == executable.runtime.default_backend.vtable) {
-                    if (device.id != 0 or device.kind != .metal) return;
-                    targets += 1;
-                }
-            }
-            if (targets != 1) return;
+            if (!attestOwnedDeviceSchedule(pool, &plan, &mesh, executable.runtime.default_backend, analysis.reachable)) return;
             const Executor = @import("../graph/metal_partition_executor.zig").MetalPartitionExecutor;
-            const projection_head = if (ops.kernel_descriptor.projectionHead(graph)) |head|
-                head.linears[0].operation.linear.rows > 1 or head.form == .independent
-            else
-                false;
+            const projection_head = ops.kernel_descriptor.metalRowProjectionHead(graph) or
+                if (ops.kernel_descriptor.metalProjectionHead(graph)) |head| head.linears[0].operation.linear.rows > 1 else false;
             const operation = @import("backend_operation.zig");
             var metadata: operation.Scope = .{};
             defer metadata.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
@@ -2858,7 +2929,10 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
                 };
                 if (metadata.token() == null) return;
             }
+            var required_deferrals = std.array_list.Managed(@import("region_schedule.zig").DeferredProducer).init(pool.allocator);
+            defer required_deferrals.deinit();
             var active_partitions: usize = 0;
+            var native_partitions: usize = 0;
             for (plan.base.partitions, 0..) |part, index| {
                 var active = false;
                 var active_compute = false;
@@ -2870,6 +2944,13 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
                     active_compute = active_compute or graph.node(id).op != .parameter;
                 }
                 if (!active) continue;
+                if (part.backend == .native) {
+                    if (projection_head or pool.plan.transfers.len == 0 or pool.backends.len != 2) return;
+                    const device = mesh.device(plan.device_assignment[index]) orelse return;
+                    if (!attestNativePartition(executable, graph, part.executor orelse return, device.backend)) return;
+                    native_partitions += 1;
+                    continue;
+                }
                 if (part.backend != .metal or plan.device_assignment[index] != 0) return;
                 if (projection_head and !active_compute) continue;
                 active_partitions += 1;
@@ -2881,44 +2962,27 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
                 if (!owned) return;
                 if (projection_head) {
                     if (active_partitions != 1 or !Executor.ownsPartition(actual, graph, executable.runtime.default_backend)) return;
-                } else if (!try Executor.attestOwnedFrameDispatch(actual, graph, executable.runtime.default_backend, part.node_ids, analysis.reachable, analysis.last_use)) return;
+                } else if (try Executor.ownedFrameDispatchDecline(actual, graph, executable.runtime.default_backend, part.node_ids, analysis.reachable, analysis.last_use, &required_deferrals)) |reason| {
+                    pool.cold_coverage_decline = reason;
+                    return;
+                }
             }
-            for (analysis.reachable, 0..) |active, id| {
-                if (!active) continue;
-                const assigned = plan.base.node_assignment[id];
-                if (assigned >= plan.base.partitions.len) return;
-                var count: usize = 0;
-                for (plan.base.partitions[assigned].node_ids) |node| if (node == id) {
-                    count += 1;
-                };
-                if (count != 1) return;
-            }
+            if (active_partitions == 0 or (pool.plan.transfers.len != 0 and native_partitions == 0)) return;
+            pool.mixed_frame_dispatch = native_partitions != 0;
             pool.metal_projection_region_candidate = projection_head and active_partitions == 1;
+            pool.metal_required_deferrals = try required_deferrals.toOwnedSlice();
             pool.metal_frame_dispatch = !projection_head;
             return;
         }
     }
     // CUDA's ordinary per-node branch calls interpreter.executeNode and its
     // Frame first. No compiled executor/fusion may bypass the selected route.
-    if (@import("cuda_owned_coverage.zig").services(executable.runtime.default_backend.*) != null) {
+    if (@import("device_owned_coverage.zig").cudaServices(executable.runtime.default_backend.*) != null) {
         const plan = executable.runtime.plan orelse return;
         const mesh = executable.runtime.mesh orelse return;
-        if (plan.device_assignment.len != plan.base.partitions.len or plan.base.node_assignment.len != graph.nodeCount() or analysis.reachable.len != graph.nodeCount()) return;
-        // The runtime always catalogs an independently owned Native fallback
-        // when available. Its mere presence does not execute or transfer data.
-        // However runtimeInputDevice(null source_backend) resolves to literal
-        // DeviceId0, and explicit inputs resolve through the first exact owner
-        // match. Require one unambiguous target at0 and EVERY active part at0.
-        // Unused catalog entries keep their existing fallback behavior.
-        var target_entries: usize = 0;
-        for (mesh.devices, 0..) |entry, entry_index| {
-            for (mesh.devices[0..entry_index]) |previous| if (previous.id == entry.id) return;
-            if (entry.backend.ptr == executable.runtime.default_backend.ptr and entry.backend.vtable == executable.runtime.default_backend.vtable) {
-                if (entry.id != 0 or entry.kind != .cuda) return;
-                target_entries += 1;
-            }
-        }
-        if (target_entries != 1) return;
+        if (!attestOwnedDeviceSchedule(pool, &plan, &mesh, executable.runtime.default_backend, analysis.reachable)) return;
+        var native_partitions: usize = 0;
+        var cuda_partitions: usize = 0;
         for (plan.base.partitions, 0..) |part, index| {
             var active = false;
             for (part.node_ids) |id| {
@@ -2928,27 +2992,28 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
                 active = true;
             }
             if (!active) continue;
+            if (part.backend == .native) {
+                if (pool.plan.transfers.len == 0 or pool.backends.len != 2) return;
+                const device = mesh.device(plan.device_assignment[index]) orelse return;
+                if (!attestNativePartition(executable, graph, part.executor orelse return, device.backend)) return;
+                native_partitions += 1;
+                continue;
+            }
             if (part.backend != .cuda or part.executor != null or plan.device_assignment[index] != 0) return;
+            cuda_partitions += 1;
             const device = mesh.device(plan.device_assignment[index]) orelse return;
             if (device.kind != .cuda or device.backend.ptr != executable.runtime.default_backend.ptr or device.backend.vtable != executable.runtime.default_backend.vtable) return;
         }
-        for (analysis.reachable, 0..) |active, id| {
-            if (!active) continue;
-            const assigned = plan.base.node_assignment[id];
-            if (assigned >= plan.base.partitions.len) return;
-            var count: usize = 0;
-            for (plan.base.partitions[assigned].node_ids) |node| if (node == id) {
-                count += 1;
-            };
-            if (count != 1) return;
-        }
+        if (cuda_partitions == 0) return;
+        pool.mixed_frame_dispatch = native_partitions != 0;
         pool.cuda_frame_dispatch = true;
         return;
     }
     if (executable.runtime.default_backend.vtable != &@import("../ops/native_compute.zig").vtable_impl) return;
     const plan = executable.runtime.plan orelse return;
     if (analysis.reachable.len != graph.nodeCount()) return;
-    for (plan.base.partitions) |part| {
+    const mesh = executable.runtime.mesh orelse return;
+    for (plan.base.partitions, plan.device_assignment) |part, device_id| {
         var executed = false;
         for (part.node_ids) |id| {
             if (id >= analysis.reachable.len) return;
@@ -2957,15 +3022,8 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
         if (!executed) continue;
         if (part.backend != .native) return;
         const actual = part.executor orelse return;
-        var found = false;
-        for (executable.runtime.native_partition_executors.items) |owner| {
-            if (actual.ptr == @as(*anyopaque, @ptrCast(owner)) and actual.vtable == owner.pe.vtable and owner.graph == graph and owner.backend.ptr == executable.runtime.default_backend.ptr and owner.backend.vtable == &@import("../ops/native_compute.zig").vtable_impl) {
-                for (pool.backends) |backend| if (backend.ptr == owner.backend.ptr and backend.vtable == owner.backend.vtable) {
-                    found = true;
-                };
-            }
-        }
-        if (!found) return;
+        const device = mesh.device(device_id) orelse return;
+        if (device.backend.ptr != executable.runtime.default_backend.ptr or !attestNativePartition(executable, graph, actual, device.backend)) return;
     }
     pool.native_frame_dispatch = true;
 }
@@ -3025,6 +3083,32 @@ test "owned payload coverage follows exact Native routes publication aliases and
     const unknown = (try pool.prepareRoutes(&.{.{ .node_id = x, .value = .unknown }})) orelse return error.MissingPreparedKernelRoute;
     defer unknown.release();
     try std.testing.expect(unknown.pool.completeOwnedPayload() == null);
+    const ownership = @import("storage_ownership.zig");
+    const PlaneProbe = struct {
+        plane: ?ownership.Plane = null,
+        fn visit(raw: *anyopaque, report: ownership.Report) !void {
+            const probe: *@This() = @ptrCast(@alignCast(raw));
+            if (report == .plane and report.plane.role == .primary) probe.plane = report.plane;
+        }
+    };
+    const resident = try cb.fromFloat32Shape(&.{ 5, 6, 7, 8 }, &.{4});
+    defer cb.free(resident);
+    var probe = PlaneProbe{};
+    const query = cb.vtable.kernels.?.storageOwnership.?;
+    try std.testing.expectEqual(.complete, try query(cb.ptr, resident, .{ .context = &probe, .visit = PlaneProbe.visit }));
+    const planes = [_]ownership.Plane{probe.plane orelse return error.MissingResidentInputPlane};
+    const resident_routes = (try pool.prepareRoutes(&.{.{ .node_id = x, .value = .{ .resident = .{
+        .logical = program.graph.node(x).output_shape,
+        .planes = &planes,
+        .implementation = .{ .context = cb.ptr, .table = cb.vtable },
+    } } }})) orelse return error.MissingPreparedKernelRoute;
+    defer resident_routes.release();
+    try std.testing.expect(resident_routes.pool.completeOwnedPayload() != null);
+    try resident_routes.validateRuntimeInputs(&.{.{ .node_id = x, .value = resident }}, &cb);
+    const replacement = try cb.fromFloat32Shape(&.{ 5, 6, 7, 8 }, &.{4});
+    defer cb.free(replacement);
+    try std.testing.expectError(error.PreparedRegionBindingChanged, resident_routes.validateRuntimeInputs(&.{.{ .node_id = x, .value = replacement }}, &cb));
+
     const Policy = struct {
         fn deny(_: *anyopaque, _: ops.CT) !ops.CT {
             return error.CustomNumericsMustNotBeBypassed;
@@ -3159,6 +3243,531 @@ test "Native planned concat slice gather execute only declared banks across warm
     const values = try cb.toFloat32(retry.outputs[0], a);
     defer a.free(values);
     try std.testing.expectEqualSlices(f32, &.{ 5, 6, 4, 2, 3, 1 }, values);
+}
+
+test "Metal immutable literal plans and publishes exact typed graph outputs" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    const data = [_]i64{ 9_007_199_254_740_993, -9_007_199_254_740_993 };
+    const bytes = std.mem.asBytes(&data);
+    const query = cb.vtable.kernels.?.physicalLiteralInitializer.?;
+    const initializer = (try query(cb.ptr, .i64, bytes.len)) orelse return error.SkipZigTest;
+    for ([_]bool{ false, true }) |invalid| {
+        var graph = ml.graph.Graph.init(a);
+        defer graph.deinit();
+        var b = ml.graph.Builder.init(&graph);
+        const literal = try b.tensorConstBytes(bytes, ml.graph.Shape.init(.i64, &.{2}));
+        try graph.markOutput(literal);
+        const table = try b.parameter("table", ml.graph.Shape.init(.f32, &.{ 2, 3 }));
+        const index_values = [_]i64{ -1, if (invalid) data[0] else 0 };
+        const indices = try b.tensorConstBytes(std.mem.asBytes(&index_values), ml.graph.Shape.init(.i64, &.{2}));
+        const gathered = try b.gather(table, indices, ml.graph.Shape.init(.f32, &.{ 2, 3 }));
+        try graph.markOutput(gathered);
+        var program = try ModelProgram.init(a, &graph, &.{.{ .name = "table", .node_id = table, .kind = .input }});
+        defer program.deinit();
+        var executable = try prepare(a, &program, &cb, .partitioned);
+        defer executable.deinit();
+        const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+        const store = pool.literal_store orelse return error.MissingLiteralStore;
+        const node = program.id_map[literal];
+        const index = store.node_indices[node];
+        try std.testing.expect(index != ml.graph.null_node);
+        try std.testing.expectEqual(try @import("../ops/physical_storage.zig").reservationBytes(cb, initializer.staging), store.literals[index].staging_bound);
+        const publication = store.publications[node] orelse return error.MissingLiteralPublication;
+        try std.testing.expectEqual(@as(u32, @alignOf(i64)), pool.plan.allocations[store.literals[index].allocation].alignment);
+        try std.testing.expectEqual(@as(u32, @alignOf(i64)), pool.plan.allocations[publication.allocation].alignment);
+        const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 2, 3 }));
+        defer cb.free(input);
+        const ownership = @import("storage_ownership.zig");
+        const PlaneProbe = struct {
+            primary: ?ownership.Plane = null,
+            fn visit(raw: *anyopaque, report: ownership.Report) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (report == .plane and report.plane.role == .primary) self.primary = report.plane;
+            }
+        };
+        var probe = PlaneProbe{};
+        try std.testing.expectEqual(.complete, try cb.vtable.kernels.?.storageOwnership.?(cb.ptr, input, .{ .context = &probe, .visit = PlaneProbe.visit }));
+        const table_id = program.id_map[table];
+        const routes = (try pool.prepareRoutes(&.{.{
+            .node_id = table_id,
+            .value = .{ .resident = .{
+                .logical = program.graph.node(table_id).output_shape,
+                .planes = &.{probe.primary orelse return error.MissingResidentInputPlane},
+                .implementation = .{ .context = cb.ptr, .table = cb.vtable },
+            } },
+        }})) orelse return error.MissingPreparedLiteralRoute;
+        defer routes.release();
+        try std.testing.expect(routes.pool.completeOwnedPayload() != null);
+        var inputs = [_]interpreter.RuntimeInput{.{ .node_id = table, .value = input, .source_backend = &cb }};
+        const options = interpreter.ExecuteOptions{
+            .prepared_routes = routes,
+            .runtime_inputs = try program.remapInputs(&inputs),
+            .output_placement = .producer,
+            .collect_partition_stats = true,
+            .activation_readbacks = .forbidden,
+        };
+        if (invalid) {
+            try std.testing.expectError(error.IndexOutOfBounds, executable.run(a, options));
+            continue;
+        }
+        var result = try executable.run(a, options);
+        defer result.deinit(&executable.runtime);
+        const output = (try cb.exportTensorData(result.outputs[0], a)) orelse return error.MissingTypedLiteralExport;
+        defer a.free(output.payload.bytes);
+        try std.testing.expectEqual(.i64, output.dtype);
+        try std.testing.expectEqualSlices(u8, bytes, output.payload.bytes);
+        const owner = store.owners[index].lease orelse return error.MissingPhysicalLiteral;
+        const functions = cb.vtable.kernels.?;
+        const retagged = (try functions.physicalTensorView.?(cb.ptr, .{ .storage = owner, .shape = &.{4} })).?;
+        defer cb.free(retagged);
+        try std.testing.expectError(error.ReadOnlyPhysicalStorage, functions.writePhysicalFloat32.?(cb.ptr, retagged, &.{ 0, 0, 0, 0 }));
+        try std.testing.expectEqual(@as(u64, 1), result.stats.assigned_kernel_dispatches);
+        try std.testing.expectEqual(@as(u64, 0), result.stats.index_metadata_host_access_bytes);
+        const selected = try cb.toFloat32(result.outputs[1], a);
+        defer a.free(selected);
+        try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6, 1, 2, 3 }, selected);
+    }
+}
+
+test "Metal planned integer concat and slice preserve exact assigned output bytes" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    inline for (.{ ml.graph.DType.i32, ml.graph.DType.i64 }) |dtype| {
+        const Int = if (dtype == .i64) i64 else i32;
+        const large: Int = if (dtype == .i64) 9_007_199_254_740_993 else 16_777_217;
+        var graph = ml.graph.Graph.init(a);
+        defer graph.deinit();
+        var b = ml.graph.Builder.init(&graph);
+        const x = try b.parameter("x", ml.graph.Shape.init(dtype, &.{ 2, 2 }));
+        const joined = try b.concat(x, x, 1);
+        const sliced = try b.sliceLastDim(joined, 1, 3);
+        try graph.markOutput(sliced);
+        var program = try ModelProgram.init(a, &graph, &.{.{ .name = "x", .node_id = x, .kind = .input }});
+        defer program.deinit();
+        var executable = try prepare(a, &program, &cb, .partitioned);
+        defer executable.deinit();
+        const node = program.id_map[x];
+        const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+        const routes = (try pool.prepareRoutes(&.{.{ .node_id = node, .value = .{ .imported_host = .{ .logical = program.graph.node(node).output_shape, .target = .metal, .owned_ingress = true } } }})) orelse return error.MissingPreparedKernelRoute;
+        defer routes.release();
+        try std.testing.expect(routes.pool.preparedKernelRoute(program.id_map[joined]) != null);
+        try std.testing.expect(routes.pool.preparedKernelRoute(program.id_map[sliced]) != null);
+        try std.testing.expect(routes.pool.completeOwnedPayload() != null);
+        var values = [_]Int{ large, -large, large + 2, -(large + 2) };
+        const input = @import("../backends/tensor.zig").Tensor{
+            .data = std.mem.asBytes(&values),
+            .dtype = if (dtype == .i64) .i64 else .i32,
+            .shape = &.{ 2, 2 },
+            .name = "x",
+            .allocator = a,
+            .owns_data = false,
+            .owns_shape = false,
+        };
+        var result = try executable.run(a, .{
+            .host_inputs = &.{.{ .node_id = node, .value = &input }},
+            .prepared_routes = routes,
+            .output_placement = .producer,
+            .collect_partition_stats = true,
+            .activation_readbacks = .forbidden,
+        });
+        defer result.deinit(&executable.runtime);
+        const output = (try cb.exportTensorData(result.outputs[0], a)) orelse return error.MissingIntegerOutput;
+        defer a.free(output.payload.bytes);
+        try std.testing.expectEqual(input.dtype, output.dtype);
+        try std.testing.expectEqualSlices(u8, std.mem.asBytes(&[_]Int{ -large, large, -(large + 2), large + 2 }), output.payload.bytes);
+        try std.testing.expectEqual(@as(u64, 2), result.stats.assigned_kernel_dispatches);
+    }
+}
+
+test "planned scalar residual fuses into one assigned output on Native, Metal and CUDA" {
+    const options = @import("build_options");
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const Tensor = @import("../backends/tensor.zig").Tensor;
+    const Route = @import("kernel_route.zig");
+
+    const BackendType = @import("../backends/backends.zig").BackendType;
+    inline for (.{ BackendType.native, BackendType.metal, BackendType.cuda }) |kind| {
+        if (comptime switch (kind) {
+            .native => options.enable_native,
+            .metal => options.enable_metal,
+            .cuda => options.enable_cuda,
+            else => unreachable,
+        }) run: {
+            const Context = @import("../backends/compute_context.zig").SharedBackendContext;
+            if (kind == .metal and !@import("../backends/metal_runtime.zig").metalDeviceAvailable()) break :run;
+            const context = Context.init(a, kind, std.testing.io) catch |err| switch (@as(anyerror, err)) {
+                error.CudaUnavailable, error.NoCudaDevices => break :run,
+                else => return err,
+            };
+            defer context.release();
+            const cb = context.computeBackend();
+            if (kind == .metal and !@import("../backends/metal_runtime.zig").antfly_metal_host_input_shared_supported(context.ctx.metal_hosted.compute.provider_impl.raw_decode_runtime)) break :run;
+
+            var graph = ml.graph.Graph.init(a);
+            defer graph.deinit();
+            var builder = ml.graph.Builder.init(&graph);
+            const width = 8193;
+            const dims = [_]i64{ 1, width };
+            const shape = ml.graph.Shape.init(.f32, &dims);
+            const x = try builder.parameter("x", shape);
+            const y = try builder.parameter("y", shape);
+            const scale_value: f32 = 1.0 - 0x1p-23;
+            const scale = try builder.scalarConst(.f32, scale_value);
+            try graph.markOutput(try builder.add(try builder.mul(x, scale), y));
+            var program = try ModelProgram.init(a, &graph, &.{ .{ .name = "x", .node_id = x, .kind = .input }, .{ .name = "y", .node_id = y, .kind = .input } });
+            defer program.deinit();
+            const output = program.graph.outputs.items[0];
+            try std.testing.expect(program.graph.node(output).op == .fused_add_mul_scalar);
+            try std.testing.expect(program.graph.node(output).op.fused_add_mul_scalar.scale_before_add);
+            try std.testing.expect(program.graph.node(output).op.fused_add_mul_scalar.separate_rounding);
+
+            var executable = try prepare(a, &program, &cb, .partitioned);
+            defer executable.deinit();
+            const x_id = program.id_map[x];
+            const y_id = program.id_map[y];
+            const host: Route.Binding = .{ .imported_host = .{ .target = cb.kind(), .logical = shape, .owned_ingress = true } };
+            const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+            const routes = (try pool.prepareRoutes(&.{ .{ .node_id = x_id, .value = host }, .{ .node_id = y_id, .value = host } })) orelse return error.MissingPreparedKernelRoute;
+            defer routes.release();
+            if (routes.pool.preparedKernelRoute(output) == null or routes.pool.completeOwnedPayload() == null) {
+                const slot = routes.pool.plan.slotForNode(output).?;
+                std.debug.print("scalar residual requested={s} producer={s} assigned={} coverage={any} cuda_frame={} mixed={}\n", .{ @tagName(kind), @tagName(slot.backend), routes.pool.preparedKernelRoute(output) != null, routes.pool.payload_coverage, pool.cuda_frame_dispatch, pool.mixed_frame_dispatch });
+                if (executable.runtime.plan) |plan| for (plan.base.partitions, plan.device_assignment) |part, device| {
+                    std.debug.print("scalar residual partition={s} device={d} nodes={any} compiled={}\n", .{ @tagName(part.backend), device, part.node_ids, part.executor != null });
+                };
+                return error.MissingScalarResidualOwnership;
+            }
+
+            var x_values: [width]f32 = undefined;
+            var y_values: [width]f32 = undefined;
+            for (&x_values, &y_values, 0..) |*lhs, *rhs, i| {
+                lhs.* = @floatFromInt(i % 31);
+                rhs.* = @floatFromInt(i % 3);
+            }
+            x_values[0] = 1.0 + 0x1p-23;
+            y_values[0] = -1;
+            var left = try Tensor.initFloat32(a, "x", &dims, &x_values);
+            defer left.deinit();
+            var right = try Tensor.initFloat32(a, "y", &dims, &y_values);
+            defer right.deinit();
+            var launches: @import("runtime_observation.zig").KernelScope = .{};
+            if (kind == .cuda) launches.begin();
+            defer if (launches.attached) {
+                _ = launches.finish();
+            };
+            var result = try executable.run(a, .{ .host_inputs = &.{ .{ .node_id = x_id, .value = &left }, .{ .node_id = y_id, .value = &right } }, .prepared_routes = routes, .output_placement = .producer, .collect_partition_stats = true, .activation_readbacks = .forbidden });
+            defer result.deinit(&executable.runtime);
+            if (kind == .cuda) try std.testing.expectEqual(@as(u64, 1), launches.finish().total_calls);
+            if (result.stats.assigned_kernel_dispatches != 1) {
+                std.debug.print("scalar residual backend={s} dispatches={d} replay={s}\n", .{ @tagName(kind), result.stats.assigned_kernel_dispatches, @tagName(result.stats.physical_replay) });
+                return error.InvalidScalarResidualDispatchCount;
+            }
+            const values = try cb.toFloat32(result.outputs[0], a);
+            defer a.free(values);
+            try std.testing.expectEqual(@as(usize, width), values.len);
+            try std.testing.expectEqual(@as(f32, 0), values[0]);
+            for (values, left.asFloat32(), right.asFloat32()) |actual, lhs, rhs| {
+                const product: f32 = lhs * scale_value;
+                try std.testing.expectEqual(product + rhs, actual);
+            }
+        }
+    }
+}
+
+test "planned Metal elementwise product-add publishes into the assigned region output" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    const metal = @import("../backends/metal_runtime.zig");
+    if (!metal.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const Tensor = @import("../backends/tensor.zig").Tensor;
+    const Context = @import("../backends/compute_context.zig").SharedBackendContext;
+    const context = try Context.init(a, .metal, std.testing.io);
+    defer context.release();
+    const cb = context.computeBackend();
+    if (!metal.antfly_metal_host_input_shared_supported(context.ctx.metal_hosted.compute.provider_impl.raw_decode_runtime)) return error.SkipZigTest;
+    const width = 8193;
+    const dims = [_]i64{ 1, width };
+    const shape = ml.graph.Shape.init(.f32, &dims);
+    const names = [_][]const u8{ "a", "b", "c", "d" };
+    for ([_]enum { product_first, product_second, dual_product, scale_first, scale_second, dual_scaled, scale_published }{ .product_first, .product_second, .dual_product, .scale_first, .scale_second, .dual_scaled, .scale_published }) |order| {
+        const pair = order == .dual_product;
+        const dual_scaled = order == .dual_scaled;
+        const publish_literal = order == .scale_published;
+        const scaled = order == .scale_first or order == .scale_second or dual_scaled or publish_literal;
+        var graph = ml.graph.Graph.init(a);
+        defer graph.deinit();
+        var builder = ml.graph.Builder.init(&graph);
+        const count: usize = if (pair) 4 else if (scaled) 2 else 3;
+        var nodes: [4]ml.graph.NodeId = undefined;
+        var bindings: [4]@import("program.zig").Binding = undefined;
+        for (names[0..count], nodes[0..count], bindings[0..count]) |name, *node, *binding| {
+            node.* = try builder.parameter(name, shape);
+            binding.* = .{ .name = name, .node_id = node.*, .kind = .input };
+        }
+        const scale = if (scaled) try builder.scalarConst(.f32, if (dual_scaled) 0x1.fffffcp-1 else 0.5) else nodes[1];
+        const left = try builder.mul(nodes[0], scale);
+        const right = if (pair) try builder.mul(nodes[2], nodes[3]) else if (dual_scaled) try builder.mul(nodes[1], try builder.scalarConst(.f32, 2)) else nodes[count - 1];
+        const output_node = if (order == .product_second or order == .scale_second) try builder.add(right, left) else try builder.add(left, right);
+        try graph.markOutput(output_node);
+        if (publish_literal) try graph.markOutput(scale);
+        // The default graph pipeline folds scalar products into an existing
+        // native descriptor. Exercise the provider-owned primitive schedule.
+        const pipeline = if (scaled) ml.graph.passes.pipeline.Pipeline.provider_fusion else ml.graph.passes.pipeline.Pipeline.default;
+        var program = try ModelProgram.initWithPipeline(a, &graph, bindings[0..count], pipeline);
+        defer program.deinit();
+        var executable = try prepare(a, &program, &cb, .partitioned);
+        defer executable.deinit();
+        const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+        var facts: [4]@import("kernel_route.zig").InputBinding = undefined;
+        var values: [4]Tensor = undefined;
+        var inputs: [4]@import("host_ingress.zig").Input = undefined;
+        var initialized: usize = 0;
+        defer for (values[0..initialized]) |*value| value.deinit();
+        var row: [width]f32 = undefined;
+        for (names[0..count], nodes[0..count], facts[0..count], values[0..count], inputs[0..count], 0..) |name, node, *fact, *value, *input, index| {
+            const id = program.id_map[node];
+            fact.* = .{ .node_id = id, .value = .{ .imported_host = .{ .target = .metal, .logical = shape, .owned_ingress = true } } };
+            @memset(&row, @floatFromInt(index + 1));
+            // The first product rounds to 1 before adding -1. Contracting
+            // the multiply into the add would preserve the small residual.
+            if (dual_scaled) row[0] = if (index == 0) 0x1.000002p0 else -0.5;
+            value.* = try Tensor.initFloat32(a, name, &dims, &row);
+            initialized += 1;
+            input.* = .{ .node_id = id, .value = value };
+        }
+        const routes = (try pool.prepareRoutes(facts[0..count])) orelse return error.MissingPreparedKernelRoute;
+        defer routes.release();
+        if (routes.pool.completeOwnedPayload() == null) {
+            std.debug.print("Metal product-add coverage {any}, required products {any}, regions {d}\n", .{ routes.pool.payload_coverage, pool.metal_required_deferrals, routes.pool.regions.len });
+            return error.MissingProductAddCoverage;
+        }
+        try std.testing.expectEqual(@as(usize, 1), routes.pool.regions.len);
+        const expected_literals: usize = if (dual_scaled) 2 else if (scaled and !publish_literal) 1 else 0;
+        try std.testing.expectEqual(expected_literals, routes.pool.baked_region_literals.count());
+        for (routes.pool.regions[0].owner.literal_nodes) |literal| {
+            const store = routes.pool.literal_store orelse return error.MissingPhysicalPool;
+            const index = store.node_indices[literal];
+            try std.testing.expectEqual(publish_literal, routes.pool.literalEnabled(index));
+            try std.testing.expectEqual(publish_literal, routes.pool.plan.allocationById(store.literals[index].allocation) != null);
+        }
+        const products = [_]ml.graph.NodeId{ left, right };
+        for (products[0..if (pair or dual_scaled) @as(usize, 2) else 1]) |product| {
+            const id = program.id_map[product];
+            const slot = routes.pool.plan.slotForNode(id) orelse return error.MissingPhysicalPool;
+            try std.testing.expectEqual(.region_internal, slot.kind);
+            try std.testing.expect(routes.pool.plan.allocationForSlot(slot.id) == null);
+        }
+        try routes.pool.plan.validate(executable.graph, &executable.runtime.plan.?.base);
+        const compatibility = (try pool.prepareRoutesWithPolicy(facts[0..count], .compatibility_regions)) orelse return error.MissingCompatibilityRoutes;
+        defer compatibility.release();
+        try std.testing.expect(compatibility.pool.completeOwnedPayload() == null);
+        try std.testing.expectEqual(@as(usize, 0), compatibility.pool.regions.len);
+        var claims = switch (try routes.claimRegions(a, null, facts[0..count])) {
+            .ready => |owned| owned,
+            .no_regions, .reprepare => return error.MissingPreparedRegionClaims,
+        };
+        defer claims.releaseUnsubmitted();
+        var result = try executable.run(a, .{ .host_inputs = inputs[0..count], .prepared_routes = routes, .region_claims = &claims, .output_placement = .producer, .collect_partition_stats = true, .activation_readbacks = .forbidden });
+        defer result.deinit(&executable.runtime);
+        if (publish_literal) {
+            const published = try cb.toFloat32(result.outputs[1], a);
+            defer a.free(published);
+            try std.testing.expectEqualSlices(f32, &.{0.5}, published);
+        }
+        try std.testing.expect(!result.stats.metal_region_policy_observed);
+        try std.testing.expectEqual(@as(u64, 0), result.stats.graph_plan_slots_reserved);
+        const dispatch = result.stats.assigned_regions orelse return error.MissingRegionDispatch;
+        try std.testing.expectEqual(@as(u64, 1), dispatch.accepted_callbacks);
+        try std.testing.expectEqual(@as(u64, if (pair or dual_scaled) 3 else 2), dispatch.covered_callback_nodes);
+        @memset(&row, 5);
+        var replacement = try Tensor.initFloat32(a, names[count - 1], &dims, &row);
+        defer replacement.deinit();
+        inputs[count - 1].value = &replacement;
+        var next_claims = switch (try routes.claimRegions(a, null, facts[0..count])) {
+            .ready => |owned| owned,
+            .no_regions, .reprepare => return error.MissingPreparedRegionClaims,
+        };
+        defer next_claims.releaseUnsubmitted();
+        var next = try executable.run(a, .{ .host_inputs = inputs[0..count], .prepared_routes = routes, .region_claims = &next_claims, .output_placement = .producer, .collect_partition_stats = true, .activation_readbacks = .forbidden });
+        defer next.deinit(&executable.runtime);
+        const next_values = try cb.toFloat32(next.outputs[0], a);
+        defer a.free(next_values);
+        for (next_values) |element| try std.testing.expectEqual(@as(f32, if (pair) 17 else if (dual_scaled) 11 else if (scaled) 5.5 else 7), element);
+        const output = try cb.toFloat32(result.outputs[0], a);
+        defer a.free(output);
+        try std.testing.expectEqual(@as(usize, width), output.len);
+        for (output, 0..) |element, index| try std.testing.expectEqual(@as(f32, if (pair) 14 else if (dual_scaled) if (index == 0) 0 else 5 else if (scaled) 2.5 else 5), element);
+
+        const compute = context.ctx.metal_hosted.compute;
+        const before_ordinary = compute.timing_stats.decoder_runtime_apply_add_calls;
+        if (dual_scaled) inputs[count - 1].value = &values[count - 1];
+        var ordinary = try executable.run(a, .{ .host_inputs = inputs[0..count], .prepared_routes = compatibility, .output_placement = .producer, .activation_readbacks = .forbidden });
+        defer ordinary.deinit(&executable.runtime);
+        const ordinary_values = try cb.toFloat32(ordinary.outputs[0], a);
+        defer a.free(ordinary_values);
+        try std.testing.expectEqualSlices(f32, if (dual_scaled) output else next_values, ordinary_values);
+        if (dual_scaled) try std.testing.expectEqual(before_ordinary + 1, compute.timing_stats.decoder_runtime_apply_add_calls);
+    }
+}
+
+test "planned Metal gather-add-bias publishes directly into its assigned output" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    const metal = @import("../backends/metal_runtime.zig");
+    if (!metal.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const Tensor = @import("../backends/tensor.zig").Tensor;
+    const context = try @import("../backends/compute_context.zig").SharedBackendContext.init(a, .metal, std.testing.io);
+    defer context.release();
+    const cb = context.computeBackend();
+    if (!metal.antfly_metal_host_input_shared_supported(context.ctx.metal_hosted.compute.provider_impl.raw_decode_runtime)) return error.SkipZigTest;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const shapes = [_]ml.graph.Shape{
+        ml.graph.Shape.init(.f32, &.{ 3, 5 }),
+        ml.graph.Shape.init(.f32, &.{5}),
+        ml.graph.Shape.init(.f32, &.{4}),
+    };
+    const names = [_][]const u8{ "matrix", "bias", "indices" };
+    var bindings: [3]@import("program.zig").Binding = undefined;
+    for (names, shapes, &bindings) |name, shape, *binding| {
+        binding.* = .{ .name = name, .node_id = try builder.parameter(name, shape), .kind = .input };
+    }
+    const biased = try graph.addNode(.{
+        .op = .add,
+        .output_shape = shapes[0],
+        .inputs = .{ bindings[0].node_id, bindings[1].node_id, ml.graph.null_node, ml.graph.null_node },
+        .num_inputs = 2,
+    });
+    try graph.markOutput(try builder.gather(biased, bindings[2].node_id, ml.graph.Shape.init(.f32, &.{ 4, 5 })));
+    var program = try ModelProgram.initWithPipeline(a, &graph, &bindings, .cleanup);
+    defer program.deinit();
+    var executable = try prepare(a, &program, &cb, .partitioned);
+    defer executable.deinit();
+    const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    const data = [_][]const f32{ &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 }, &.{ 10, 20, 30, 40, 50 }, &.{ 1, -1, 3, -4 } };
+    var facts: [3]@import("kernel_route.zig").InputBinding = undefined;
+    var values: [3]Tensor = undefined;
+    var inputs: [3]@import("host_ingress.zig").Input = undefined;
+    var initialized: usize = 0;
+    defer for (values[0..initialized]) |*value| value.deinit();
+    for (bindings, shapes, data, &facts, &values, &inputs) |binding, shape, elements, *fact, *value, *input| {
+        const id = program.id_map[binding.node_id];
+        fact.* = .{ .node_id = id, .value = .{ .imported_host = .{ .target = .metal, .logical = shape, .owned_ingress = true } } };
+        value.* = try Tensor.initFloat32(a, binding.name, shape.dims[0..shape.rank()], elements);
+        initialized += 1;
+        input.* = .{ .node_id = id, .value = value };
+    }
+    const routes = (try pool.prepareRoutes(&facts)) orelse return error.MissingPreparedKernelRoute;
+    defer routes.release();
+    if (routes.pool.completeOwnedPayload() == null) {
+        std.debug.print("Metal gather-add-bias coverage {any}, cold decline {any}, required producers {any}, regions {d}\n", .{
+            routes.pool.payload_coverage, pool.cold_coverage_decline, pool.metal_required_deferrals, routes.pool.regions.len,
+        });
+        return error.MissingGatherAddBiasCoverage;
+    }
+    const slot = routes.pool.plan.slotForNode(program.id_map[biased]) orelse return error.MissingPhysicalPool;
+    try std.testing.expectEqual(.region_internal, slot.kind);
+    if (routes.pool.plan.allocationForSlot(slot.id) != null) return error.GatherProducerAllocated;
+    var claims = switch (try routes.claimRegions(a, null, &facts)) {
+        .ready => |owned| owned,
+        .no_regions, .reprepare => return error.MissingPreparedRegionClaims,
+    };
+    defer claims.releaseUnsubmitted();
+    var result = try executable.run(a, .{ .host_inputs = &inputs, .prepared_routes = routes, .region_claims = &claims, .output_placement = .producer, .collect_partition_stats = true, .activation_readbacks = .forbidden });
+    defer result.deinit(&executable.runtime);
+    const dispatch = result.stats.assigned_regions orelse return error.MissingRegionDispatch;
+    try std.testing.expectEqual(@as(u64, 1), dispatch.accepted_callbacks);
+    try std.testing.expectEqual(@as(u64, 2), dispatch.covered_callback_nodes);
+    if (result.stats.metal_region_policy_observed) return error.LegacyGatherPolicyObserved;
+    const output = try cb.toFloat32(result.outputs[0], a);
+    defer a.free(output);
+    try std.testing.expectEqualSlices(f32, &.{ 15, 26, 37, 48, 59, 20, 31, 42, 53, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, output);
+}
+
+test "Native planned integer concat slice and gather use assigned buffers and preserve full width" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const DType = ml.graph.DType;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    inline for (.{ DType.i32, DType.i64 }) |dtype| {
+        const Int = if (dtype == .i64) i64 else i32;
+        const large: Int = if (dtype == .i64) 9_007_199_254_740_993 else 16_777_217;
+        var graph = ml.graph.Graph.init(a);
+        defer graph.deinit();
+        var b = ml.graph.Builder.init(&graph);
+        const x = try b.parameter("x", ml.graph.Shape.init(dtype, &.{ 2, 2 }));
+        const joined = try b.concat(x, x, 1);
+        const sliced = try b.sliceLastDim(joined, 1, 3);
+        const Index = if (dtype == .i64) i32 else i64;
+        const index_values = [_]Index{ -1, 0 };
+        const indices = try b.tensorConstBytes(std.mem.asBytes(&index_values), ml.graph.Shape.init(if (Index == i64) .i64 else .i32, &.{2}));
+        const literal_values = [_]Int{ large, -large };
+        const literal_node = try b.tensorConstBytes(std.mem.asBytes(&literal_values), ml.graph.Shape.init(dtype, &.{2}));
+        const gathered = try b.gather(sliced, indices, ml.graph.Shape.init(dtype, &.{ 2, 2 }));
+        const reshaped = try b.reshape(gathered, ml.graph.Shape.init(dtype, &.{4}));
+        try graph.markOutput(reshaped);
+        try graph.markOutput(literal_node);
+        var program = try ModelProgram.init(a, &graph, &.{.{ .name = "x", .node_id = x, .kind = .input }});
+        defer program.deinit();
+        var executable = try prepare(a, &program, &cb, .partitioned);
+        defer executable.deinit();
+        const node = program.id_map[x];
+        const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+        const routes = (try pool.prepareRoutes(&.{.{ .node_id = node, .value = .{ .imported_host = .{ .logical = program.graph.node(node).output_shape, .target = .native, .owned_ingress = true } } }})) orelse return error.MissingPreparedKernelRoute;
+        defer routes.release();
+        if (routes.pool.preparedKernelRoute(program.id_map[joined]) == null) return error.MissingIntegerConcatRoute;
+        if (routes.pool.preparedKernelRoute(program.id_map[sliced]) == null) return error.MissingIntegerSliceRoute;
+        if (routes.pool.preparedKernelRoute(program.id_map[gathered]) == null) return error.MissingIntegerGatherRoute;
+        if (routes.pool.selection.?.enabledAliasIndex(program.id_map[reshaped]) == null) return error.MissingIntegerReshapeAlias;
+        if (routes.pool.completeOwnedPayload() == null) {
+            std.debug.print("Integer layout payload proof: {any}\n", .{routes.pool.payload_coverage});
+            return error.MissingIntegerPayloadProof;
+        }
+        var values: [4]Int = .{ large, -large, large + 2, -(large + 2) };
+        const Tensor = @import("../backends/tensor.zig").Tensor;
+        const input = Tensor{ .data = std.mem.asBytes(&values), .dtype = if (dtype == .i64) .i64 else .i32, .shape = &.{ 2, 2 }, .name = "x", .allocator = a, .owns_data = false, .owns_shape = false };
+        var result = try executable.run(a, .{ .host_inputs = &.{.{ .node_id = node, .value = &input }}, .prepared_routes = routes, .collect_partition_stats = true });
+        defer result.deinit(&executable.runtime);
+        const output = (try cb.exportTensorData(result.outputs[0], a)) orelse return error.MissingIntegerOutput;
+        defer a.free(output.payload.bytes);
+        try std.testing.expectEqual(input.dtype, output.dtype);
+        try std.testing.expectEqualSlices(u8, std.mem.asBytes(&[_]Int{ -(large + 2), large + 2, -large, large }), output.payload.bytes);
+        const literal = (try cb.exportTensorData(result.outputs[1], a)) orelse return error.MissingIntegerLiteral;
+        defer a.free(literal.payload.bytes);
+        try std.testing.expectEqual(input.dtype, literal.dtype);
+        try std.testing.expectEqualSlices(u8, std.mem.asBytes(&literal_values), literal.payload.bytes);
+        try std.testing.expectEqual(@as(u64, 3), result.stats.assigned_kernel_dispatches);
+
+        // A subsequent frame may not reuse the allocation underneath the
+        // published reshape while its exact integer view remains live.
+        values = .{ -large, large, -(large + 2), large + 2 };
+        var next = try executable.run(a, .{ .host_inputs = &.{.{ .node_id = node, .value = &input }}, .prepared_routes = routes });
+        defer next.deinit(&executable.runtime);
+        const current = (try cb.exportTensorData(next.outputs[0], a)) orelse return error.MissingIntegerOutput;
+        defer a.free(current.payload.bytes);
+        try std.testing.expectEqualSlices(u8, std.mem.asBytes(&[_]Int{ large + 2, -(large + 2), large, -large }), current.payload.bytes);
+        const held = (try cb.exportTensorData(result.outputs[0], a)) orelse return error.MissingIntegerOutput;
+        defer a.free(held.payload.bytes);
+        try std.testing.expectEqualSlices(u8, output.payload.bytes, held.payload.bytes);
+    }
 }
 
 test "Native declared typed ingress executes exact gather and retains held outputs across index failure" {
@@ -3381,7 +3990,7 @@ fn exerciseReachableNativeProjection(a: std.mem.Allocator) !void {
     try std.testing.expect(routes.pool.plan.slotForNode(dead_kernel) == null);
     try std.testing.expect(routes.pool.plan.slotForNode(dead_literal) == null);
     try std.testing.expect(routes.pool.preparedKernelRoute(dead_kernel) == null);
-    try std.testing.expectEqual(@import("../graph/buffer_plan.zig").invalid_allocation, routes.pool.outputSlot(dead_kernel, 65536).allocation);
+    try std.testing.expectEqual(@import("buffer_plan.zig").invalid_allocation, routes.pool.outputSlot(dead_kernel, 65536).allocation);
     try std.testing.expect(root.plan.slotForNode(dead_kernel) != null);
     try std.testing.expectEqual(@as(u64, 65536), root.plan.allocations[original_bank].byte_size);
     try std.testing.expectEqual(@as(u64, 16), routes.pool.plan.allocations[original_bank].byte_size);
@@ -3394,7 +4003,7 @@ fn exerciseReachableNativeProjection(a: std.mem.Allocator) !void {
     // writable allocation merely because that bank is live for another node.
     routes.pool.plan.slots[dead_kernel].allocation = original_bank;
     const malformed = routes.pool.plan.validate(&graph, &executable.runtime.plan.?.base);
-    routes.pool.plan.slots[dead_kernel].allocation = @import("../graph/buffer_plan.zig").invalid_allocation;
+    routes.pool.plan.slots[dead_kernel].allocation = @import("buffer_plan.zig").invalid_allocation;
     try std.testing.expectError(error.InvalidBufferPlan, malformed);
     const bad_reachable = try a.dupe(bool, analysis.reachable);
     defer a.free(bad_reachable);
@@ -3910,6 +4519,129 @@ test "CUDA owned dispatch permits unused Native catalog and declines active fall
     try std.testing.expect(!state_executable.runtime.physical_pool.?.cuda_frame_dispatch);
 }
 
+test "prepared Metal F32 MPS projection uses the assigned graph output" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    const metal = @import("../backends/metal_runtime.zig");
+    if (!metal.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const Env = struct {
+        extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+        extern "c" fn unsetenv([*:0]const u8) c_int;
+    };
+    const enable_mps = "TERMITE_METAL_ENABLE_DENSE_MPS_LINEAR";
+    const previous = if (std.c.getenv(enable_mps)) |value| try a.dupeSentinel(u8, std.mem.span(value), 0) else null;
+    defer if (previous) |value| {
+        _ = Env.setenv(enable_mps, value.ptr, 1);
+        a.free(value);
+    } else {
+        _ = Env.unsetenv(enable_mps);
+    };
+    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(enable_mps, "1", 1));
+
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    const runtime = context.metal_hosted.compute.provider_impl.raw_decode_runtime;
+    const rows = 128;
+    const width = 64;
+    var data: [rows * width]f32 = undefined;
+    for (&data, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 23)) * 0.125;
+    var weights: [width * width]f32 = @splat(0);
+    for (0..width) |i| weights[i * width + i] = 1;
+    const bias: [width]f32 = @splat(0.25);
+    const x = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&data, &.{ rows, width }));
+    defer cb.free(x);
+    const w = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&weights, &.{ width, width }));
+    defer cb.free(w);
+    const b = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&bias, &.{width}));
+    defer cb.free(b);
+    const warm = try cb.linear(x, w, b, rows, width, width);
+    cb.free(warm);
+
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const xn = try builder.parameter("x", ml.graph.Shape.init(.f32, &.{ rows, width }));
+    const wn = try builder.parameter("weight", ml.graph.Shape.init(.f32, &.{ width, width }));
+    const bn = try builder.parameter("bias", ml.graph.Shape.init(.f32, &.{width}));
+    try graph.markOutput(try builder.linear(xn, wn, bn, rows, width, width));
+    var program = try ModelProgram.init(a, &graph, &.{
+        .{ .name = "x", .node_id = xn, .kind = .input },
+        .{ .name = "weight", .node_id = wn, .kind = .weight },
+        .{ .name = "bias", .node_id = bn, .kind = .weight },
+    });
+    defer program.deinit();
+    const route = @import("kernel_route.zig");
+    const implementation: route.Implementation = .{ .context = cb.ptr, .table = cb.vtable };
+    const weight_inputs = [_]interpreter.RuntimeInput{
+        .{ .node_id = program.id_map[wn], .value = w, .source_backend = &cb },
+        .{ .node_id = program.id_map[bn], .value = b, .source_backend = &cb },
+    };
+    const immutable = [_]route.InputBinding{
+        .{ .node_id = program.id_map[wn], .value = .{ .tensor = .{ .value = w, .implementation = implementation } } },
+        .{ .node_id = program.id_map[bn], .value = .{ .tensor = .{ .value = b, .implementation = implementation } } },
+    };
+    var executable = try prepareWithOptions(a, &program, &cb, .partitioned, .{ .input_bindings = &weight_inputs, .immutable_input_bindings = &immutable, .physical_replay = false });
+    defer executable.deinit();
+    executable.configureExecutionDiagnostics(true);
+    const x_node = program.id_map[xn];
+    const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    const routes = (try pool.prepareRoutes(&.{.{ .node_id = x_node, .value = .{ .imported_host = .{
+        .target = .metal,
+        .logical = program.graph.node(x_node).output_shape,
+        .owned_ingress = true,
+    } } }})) orelse return error.MissingPreparedRoutes;
+    defer routes.release();
+    const Tensor = @import("../backends/tensor.zig").Tensor;
+    var host_input = try Tensor.initFloat32(a, "x", &.{ rows, width }, &data);
+    defer host_input.deinit();
+    const before = metal.runtimeMemorySnapshot(runtime);
+    var result = try executable.run(a, .{
+        .runtime_inputs = &weight_inputs,
+        .host_inputs = &.{.{ .node_id = x_node, .value = &host_input }},
+        .prepared_routes = routes,
+        .output_placement = .producer,
+        .collect_partition_stats = true,
+        .activation_readbacks = .forbidden,
+    });
+    defer result.deinit(&executable.runtime);
+    try std.testing.expectEqual(@as(u64, 1), result.stats.assigned_kernel_dispatches);
+    const coverage = result.stats.prepared_payload_coverage orelse return error.MissingPreparedCoverage;
+    try std.testing.expectEqual(@import("owned_coverage.zig").Reason.opaque_workspace, coverage.compatibility);
+    const report = executable.diagnostics.snapshot().?.report.?;
+    try std.testing.expectEqualDeep(coverage, report.payload_admission_coverage.?.value);
+    try std.testing.expectEqual(before.mps_dense_linear_active_frame_calls + 1, metal.runtimeMemorySnapshot(runtime).mps_dense_linear_active_frame_calls);
+    try std.testing.expectEqual(@as(u64, 0), result.stats.device_host_accesses);
+    // Hold the first assigned result across another submission. The vendor
+    // frame may retire its matrix wrappers, but it must not recycle a live
+    // result's backing into the second invocation.
+    var next_data: [rows * width]f32 = undefined;
+    for (data, &next_data) |value, *next| next.* = -value;
+    var next_input = try Tensor.initFloat32(a, "x", &.{ rows, width }, &next_data);
+    defer next_input.deinit();
+    var next = try executable.run(a, .{
+        .runtime_inputs = &weight_inputs,
+        .host_inputs = &.{.{ .node_id = x_node, .value = &next_input }},
+        .prepared_routes = routes,
+        .output_placement = .producer,
+        .collect_partition_stats = true,
+        .activation_readbacks = .forbidden,
+    });
+    defer next.deinit(&executable.runtime);
+    try std.testing.expectEqual(@as(u64, 1), next.stats.assigned_kernel_dispatches);
+    try std.testing.expectEqual(@as(u64, 0), next.stats.device_host_accesses);
+    try std.testing.expectEqual(before.mps_dense_linear_active_frame_calls + 2, metal.runtimeMemorySnapshot(runtime).mps_dense_linear_active_frame_calls);
+    const next_output = try cb.toFloat32(next.outputs[0], a);
+    defer a.free(next_output);
+    try std.testing.expectEqual(next_data.len, next_output.len);
+    for (next_data, next_output) |expected, actual| try std.testing.expectEqual(expected + 0.25, actual);
+    const output = try cb.toFloat32(result.outputs[0], a);
+    defer a.free(output);
+    try std.testing.expectEqual(data.len, output.len);
+    for (data, output) |expected, actual| try std.testing.expectEqual(expected + 0.25, actual);
+}
+
 test "Metal Frame coverage refuses input rooted aliases and keeps tuned linear executor ownership" {
     if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
     if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
@@ -3943,8 +4675,10 @@ test "Metal Frame coverage refuses input rooted aliases and keeps tuned linear e
     var projection = ml.graph.Builder.init(&projection_graph);
     const px = try projection.parameter("x", ml.graph.Shape.init(.f32, &.{ 128, 64 }));
     const pw = try projection.parameter("w", ml.graph.Shape.init(.f32, &.{ 64, 64 }));
+    const pw2 = try projection.parameter("w2", ml.graph.Shape.init(.f32, &.{ 64, 64 }));
     try projection_graph.markOutput(try projection.linearNoBias(px, pw, 128, 64, 64));
-    var projection_program = try ModelProgram.init(a, &projection_graph, &.{ .{ .name = "x", .node_id = px, .kind = .input }, .{ .name = "w", .node_id = pw, .kind = .input } });
+    try projection_graph.markOutput(try projection.linearNoBias(px, pw2, 128, 64, 64));
+    var projection_program = try ModelProgram.init(a, &projection_graph, &.{ .{ .name = "x", .node_id = px, .kind = .input }, .{ .name = "w", .node_id = pw, .kind = .input }, .{ .name = "w2", .node_id = pw2, .kind = .input } });
     defer projection_program.deinit();
     var tuned = try prepare(a, &projection_program, &cb, .partitioned);
     defer tuned.deinit();
@@ -3987,4 +4721,113 @@ test "Metal Frame cold metadata publication unwinds every allocation failure wit
     const before = @import("../backends/metal_tensor.zig").memoryStatsSnapshot();
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Case.run, .{ &graph, analysis, &backend });
     try std.testing.expectEqual(before.device_owned_buffers_created, @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created);
+}
+
+test "planned Metal shared transpose publishes two assigned dot outputs" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    const metal = @import("../backends/metal_runtime.zig");
+    if (!metal.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const Tensor = @import("../backends/tensor.zig").Tensor;
+    const Context = @import("../backends/compute_context.zig").SharedBackendContext;
+    const context = try Context.init(a, .metal, std.testing.io);
+    defer context.release();
+    const cb = context.computeBackend();
+    if (!metal.antfly_metal_host_input_shared_supported(context.ctx.metal_hosted.compute.provider_impl.raw_decode_runtime)) return error.SkipZigTest;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const names = [_][]const u8{ "first", "second", "shared" };
+    const dims = [_][2]i64{ .{ 4, 7 }, .{ 5, 7 }, .{ 13, 7 } };
+    var nodes: [3]ml.graph.NodeId = undefined;
+    var bindings: [3]@import("program.zig").Binding = undefined;
+    for (names, &dims, &nodes, &bindings) |name, *shape, *node, *binding| {
+        node.* = try builder.parameter(name, ml.graph.Shape.init(.f32, shape));
+        binding.* = .{ .name = name, .node_id = node.*, .kind = .input };
+    }
+    const transpose = try builder.transpose(nodes[2], &.{ 1, 0 });
+    const first = try builder.matmul(nodes[0], transpose);
+    const second = try builder.matmul(nodes[1], transpose);
+    try graph.markOutput(first);
+    try graph.markOutput(second);
+    var program = try ModelProgram.initWithPipeline(a, &graph, &bindings, .cleanup);
+    defer program.deinit();
+    var executable = try prepare(a, &program, &cb, .partitioned);
+    defer executable.deinit();
+    const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    var facts: [3]@import("kernel_route.zig").InputBinding = undefined;
+    var values: [3]Tensor = undefined;
+    var inputs: [3]@import("host_ingress.zig").Input = undefined;
+    var initialized: usize = 0;
+    defer for (values[0..initialized]) |*value| value.deinit();
+    var rows: [3][91]f32 = undefined;
+    for (nodes, names, &dims, &facts, &values, &inputs, &rows, 0..) |node, name, *shape, *fact, *value, *input, *data, index| {
+        const id = program.id_map[node];
+        fact.* = .{ .node_id = id, .value = .{ .imported_host = .{ .target = .metal, .logical = ml.graph.Shape.init(.f32, shape), .owned_ingress = true } } };
+        const len: usize = @intCast(shape[0] * shape[1]);
+        for (data[0..len], 0..) |*element, i| element.* = @floatFromInt((i + index * 3) % 11);
+        value.* = try Tensor.initFloat32(a, name, shape, data[0..len]);
+        initialized += 1;
+        input.* = .{ .node_id = id, .value = value };
+    }
+    const routes = (try pool.prepareRoutes(&facts)) orelse return error.MissingPreparedKernelRoute;
+    defer routes.release();
+    if (routes.pool.completeOwnedPayload() == null) {
+        std.debug.print("Metal transpose coverage {any}, cold decline {any}, required deferrals {any}, regions {d}\n", .{ routes.pool.payload_coverage, pool.cold_coverage_decline, pool.metal_required_deferrals, routes.pool.regions.len });
+        return error.MissingTransposeCoverage;
+    }
+    try std.testing.expectEqual(@as(usize, 1), routes.pool.regions.len);
+    const slot = routes.pool.plan.slotForNode(program.id_map[transpose]) orelse return error.InvalidBufferPlan;
+    try std.testing.expectEqual(.region_internal, slot.kind);
+    try std.testing.expect(routes.pool.plan.allocationForSlot(slot.id) == null);
+    try routes.pool.plan.validate(executable.graph, &executable.runtime.plan.?.base);
+    var claims = switch (try routes.claimRegions(a, null, &facts)) {
+        .ready => |owned| owned,
+        .no_regions, .reprepare => return error.MissingPreparedRegionClaims,
+    };
+    defer claims.releaseUnsubmitted();
+    var assigned = executable.run(a, .{ .host_inputs = &inputs, .prepared_routes = routes, .region_claims = &claims, .output_placement = .producer, .collect_partition_stats = true, .activation_readbacks = .forbidden }) catch |err| {
+        std.debug.print("Metal assigned transpose dispatch failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer assigned.deinit(&executable.runtime);
+    try std.testing.expect(!assigned.stats.metal_region_policy_observed);
+    try std.testing.expectEqual(@as(u64, 0), assigned.stats.graph_plan_slots_reserved);
+    const dispatch = assigned.stats.assigned_regions orelse return error.MissingRegionDispatch;
+    try std.testing.expectEqual(@as(u64, 1), dispatch.accepted_callbacks);
+    try std.testing.expectEqual(@as(u64, 3), dispatch.covered_callback_nodes);
+
+    const compatibility = (try pool.prepareRoutesWithPolicy(&facts, .compatibility_regions)) orelse return error.MissingCompatibilityRoutes;
+    defer compatibility.release();
+    // Compare against the legacy route even when it materializes a view.
+    var ordinary = try executable.run(a, .{ .host_inputs = &inputs, .prepared_routes = compatibility, .output_placement = .producer });
+    defer ordinary.deinit(&executable.runtime);
+    for (assigned.outputs, ordinary.outputs, 0..) |selected, original, index| {
+        const result = try cb.toFloat32(selected, a);
+        defer a.free(result);
+        const reference = try cb.toFloat32(original, a);
+        defer a.free(reference);
+        try std.testing.expectEqualSlices(f32, reference, result);
+        for (result, 0..) |element, j| {
+            var expected: f32 = 0;
+            for (0..7) |k| expected += rows[index][(j / 13) * 7 + k] * rows[2][(j % 13) * 7 + k];
+            try std.testing.expectEqual(expected, element);
+        }
+    }
+    try graph.markOutput(transpose);
+    var published_program = try ModelProgram.initWithPipeline(a, &graph, &bindings, .cleanup);
+    defer published_program.deinit();
+    var published = try prepare(a, &published_program, &cb, .partitioned);
+    defer published.deinit();
+    const published_pool = published.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    const published_slot = published_pool.plan.slotForNode(published_program.id_map[transpose]) orelse return error.InvalidBufferPlan;
+    try std.testing.expect(published_slot.roles.graph_output);
+    try std.testing.expect(published_slot.kind != .region_internal);
+    if (published_slot.kind == .view) {
+        try std.testing.expect(published_slot.source_slot != null);
+    } else {
+        try std.testing.expect(published_pool.plan.allocationForSlot(published_slot.id) != null);
+    }
+    try std.testing.expectEqual(@as(?@import("owned_coverage.zig").Reason, .deferred_producer), published_pool.cold_coverage_decline);
 }

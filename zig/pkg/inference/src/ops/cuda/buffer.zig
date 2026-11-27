@@ -139,11 +139,23 @@ pub const MappedHostBuffer = struct {
     }
 };
 
+/// Byte range relative to a planned device allocation.
+pub const ByteSpan = struct { offset: usize = 0, bytes: usize = 0 };
+
 pub const DeviceBuffer = struct {
     pub const Purpose = @import("allocation_budget.zig").OwnedPurpose;
     /// CUDA cuMemAlloc base guarantee, also used by canonical cuBLASLt profiles.
     /// Borrowed private KV slots preserve this base selection contract.
     pub const allocation_alignment: usize = 256;
+
+    /// A byte view borrows storage without inheriting allocation custody.
+    pub fn borrowRange(self: DeviceBuffer, offset: usize, bytes: usize) !DeviceBuffer {
+        if (offset > self.len or bytes > self.len - offset) return error.InvalidShape;
+        if (bytes != 0 and self.ptr == 0) return error.InvalidShape;
+        const view: DeviceBuffer = .{ .ptr = try std.math.add(u64, self.ptr, offset), .len = bytes, .borrowed = true };
+        _ = try validateRegion(view, bytes, 1);
+        return view;
+    }
     ptr: driver_mod.CUdeviceptr = 0,
     len: usize = 0,
     /// Original allocation size, independent of a logical view's length.
@@ -289,6 +301,18 @@ pub const DeviceBuffer = struct {
         if (len > self.len or len > src.len) return error.InvalidCudaState;
         if (len == 0) return;
         try ctx.makeCurrent();
+        try self.submitDeviceCopy(ctx, src, len);
+    }
+
+    /// For a series of copies on the same thread after makeCurrent. The
+    /// caller keeps the context current for the full submission sequence.
+    pub fn copyFromCurrentDevice(self: DeviceBuffer, ctx: *context_mod.CudaContext, src: DeviceBuffer, len: usize) driver_mod.Error!void {
+        if (len > self.len or len > src.len) return error.InvalidCudaState;
+        if (len == 0) return;
+        try self.submitDeviceCopy(ctx, src, len);
+    }
+
+    fn submitDeviceCopy(self: DeviceBuffer, ctx: *context_mod.CudaContext, src: DeviceBuffer, len: usize) driver_mod.Error!void {
         const result = ctx.driver.fns.cuMemcpyDtoDAsync(self.ptr, src.ptr, len, ctx.stream);
         if (result != driver_mod.CUDA_SUCCESS) {
             std.log.err("CUDA cuMemcpyDtoDAsync failed: bytes={d} error={s} ({s})", .{ len, ctx.driver.errorName(result), ctx.driver.errorString(result) });
@@ -298,6 +322,12 @@ pub const DeviceBuffer = struct {
     }
 };
 
+/// Return the exclusive device address of the used range.
+pub inline fn validateRegion(region: DeviceBuffer, length: usize, comptime alignment: u64) !u64 {
+    if (length != 0 and (region.ptr == 0 or alignment == 0 or region.ptr % alignment != 0 or region.len < length)) return error.InvalidShape;
+    return std.math.add(u64, region.ptr, length);
+}
+
 /// Validate byte regions before driver access. Read-only regions may alias;
 /// every nonempty output must be disjoint from inputs and earlier outputs.
 /// Alignment is static ABI metadata; lengths describe actual used bytes.
@@ -305,8 +335,7 @@ pub inline fn validateRegions(comptime count: usize, regions: [count]DeviceBuffe
     comptime std.debug.assert(first_write <= count);
     var ends: [count]u64 = undefined;
     inline for (regions, lengths, alignment, 0..) |region, length, align_bytes, i| {
-        if (length != 0 and (region.ptr == 0 or align_bytes == 0 or region.ptr % align_bytes != 0 or region.len < length)) return error.InvalidShape;
-        ends[i] = try std.math.add(u64, region.ptr, length);
+        ends[i] = try validateRegion(region, length, align_bytes);
     }
     inline for (first_write..count) |written| {
         if (lengths[written] != 0) {
@@ -318,6 +347,11 @@ pub inline fn validateRegions(comptime count: usize, regions: [count]DeviceBuffe
 }
 
 test "CUDA region admission permits readonly aliases and rejects output overlap overflow and truncation" {
+    const owner: DeviceBuffer = .{ .ptr = 4096, .len = 64, .allocation_bytes = 128 };
+    try std.testing.expectEqualDeep(DeviceBuffer{ .ptr = 4128, .len = 32, .borrowed = true }, try owner.borrowRange(32, 32));
+    try std.testing.expectError(error.InvalidShape, owner.borrowRange(32, 33));
+    try std.testing.expectError(error.Overflow, (DeviceBuffer{ .ptr = std.math.maxInt(u64) - 3, .len = 64 }).borrowRange(1, 3));
+    try std.testing.expectError(error.InvalidShape, (DeviceBuffer{ .len = 64 }).borrowRange(1, 3));
     var regions = [_]DeviceBuffer{ .{ .ptr = 4096, .len = 64 }, .{ .ptr = 4096, .len = 64 }, .{}, .{ .ptr = 8192, .len = 64 } };
     const lengths = [4]usize{ 64, 64, 0, 64 };
     try validateRegions(4, regions, lengths, @splat(4), 3);

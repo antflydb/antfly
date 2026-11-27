@@ -67,6 +67,14 @@ test "dense projection cache metadata declarations compile" {
     _ = @import("backends/dense_projection_pack.zig");
 }
 
+test {
+    _ = @import("ops/cuda/libraries.zig");
+    _ = @import("ops/cuda/local_relative_source.zig");
+    _ = @import("ops/cuda/retained_execution_cache.zig");
+    _ = @import("backends/embedding_gemma2_cuda.zig");
+    _ = @import("server/reader_epoch.zig");
+}
+
 test "Gemma4 CUDA host PLE declarations compile" {
     _ = @import("backends/admitted_allocator.zig");
     _ = @import("ops/cuda/host_retirement.zig");
@@ -174,7 +182,11 @@ test {
     _ = @import("execution/testing/model_formats.zig");
     _ = @import("tile/q4_q8_schedule.zig");
     // Keep host-only ownership/descriptor tests reachable under narrow filters.
-    if (!build_options.enable_wasm) _ = @import("ops/cuda/embedded_module.zig");
+    if (!build_options.enable_wasm) {
+        _ = @import("ops/cuda/embedded_module.zig");
+        _ = @import("ops/cuda/audio_execution_plan.zig");
+        _ = @import("ops/cuda/bounded_decode_graph.zig");
+    }
     _ = @import("ops/kernel_geometry.zig");
     _ = @import("backends/onnx_projection_pack.zig");
     _ = @import("ops/gpu_hosted_store.zig");
@@ -502,4 +514,17 @@ pub fn printMetalInfo() void {
     if (comptime build_options.enable_metal) {
         std.debug.print("metal device_available={}\n", .{metal_runtime.metalDeviceAvailable()});
     }
+}
+
+test {
+    _ = @import("architectures/inkling2_chat.zig");
+    _ = @import("architectures/inkling2_moe_metal.zig");
+    _ = @import("architectures/inkling2_attention_weights.zig");
+    _ = @import("architectures/inkling2_attention_metal.zig");
+    _ = @import("architectures/inkling2_controller_metal.zig");
+    _ = @import("architectures/inkling2_endpoints_metal.zig");
+    _ = @import("architectures/inkling2_residual_metal.zig");
+    _ = @import("architectures/inkling2_decoder_metal.zig");
+    _ = @import("architectures/inkling2_session_metal.zig");
+    _ = @import("architectures/inkling2_vision_metal.zig");
 }

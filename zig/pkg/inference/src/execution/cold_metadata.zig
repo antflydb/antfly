@@ -40,6 +40,7 @@ pub const Owner = struct {
     shared_contributions: u8 = 0,
     shared_identities: [2]usize = @splat(0),
     pending_additional: ?memory.AdmissionAmounts = null,
+    borrowed_host_floor: memory.AdmissionAmounts = .{},
     phase: Phase = .preparing,
 
     /// The supplied permits stay at their final addresses and retain their
@@ -47,7 +48,13 @@ pub const Owner = struct {
     /// Backing frees must reclaim storage without quota/provider callbacks;
     /// the preparing runtime proves that allocator contract before opting in.
     pub fn create(backing: std.mem.Allocator, session: sessions.Session, permits: []const *const sessions.RunPermit) !*Owner {
-        const floor = try sumPermits(session, permits);
+        return createWithBorrowedHostFloor(backing, session, permits, 0);
+    }
+
+    /// Include independently retained host storage in feasibility only.
+    pub fn createWithBorrowedHostFloor(backing: std.mem.Allocator, session: sessions.Session, permits: []const *const sessions.RunPermit, host_bytes: usize) !*Owner {
+        const borrowed: memory.AdmissionAmounts = .{ .host_scratch_bytes = host_bytes };
+        const floor = try (try sumPermits(session, permits)).merge(borrowed);
         const model = if (session.model_lifetime) |value| value.retain() else null;
         errdefer if (model) |value| value.release();
         const wrapper = memory.AdmissionAmounts{ .host_scratch_bytes = @sizeOf(Owner) };
@@ -64,6 +71,7 @@ pub const Owner = struct {
             .session = session,
             .model = model,
             .wrapper_lease = lease,
+            .borrowed_host_floor = borrowed,
         };
         for (permits, 0..) |permit, index| self.held[index] = permit;
         self.held_count = permits.len;
@@ -99,7 +107,7 @@ pub const Owner = struct {
         if (self.pending_additional != null) return error.MetadataPendingAdmissionMustBeReplaced;
         if (self.phase != .preparing) return error.MetadataPreparationSealed;
         if (self.held_floor != null) return error.MetadataAdmissionOwnersFrozen;
-        const floor = try sumPermits(self.session, permits);
+        const floor = try (try sumPermits(self.session, permits)).merge(self.borrowed_host_floor);
         if (self.session.run_admission) |policy| try policy.validateOwnedRunAmounts(try (try floor.merge(self.admittedAmounts())).merge(try self.sharedMetadataAmounts()));
         @memset(&self.held, null);
         for (permits, 0..) |permit, index| self.held[index] = permit;
@@ -122,7 +130,7 @@ pub const Owner = struct {
         if (self.phase != .preparing) return error.MetadataPreparationSealed;
         if (self.held_floor != null) return error.MetadataAdmissionOwnersFrozen;
         const pending = self.pending_additional orelse return error.MetadataPendingAdmissionMissing;
-        const floor = try sumPermits(self.session, permits);
+        const floor = try (try sumPermits(self.session, permits)).merge(self.borrowed_host_floor);
         const required = try (try self.heldAmounts()).merge(pending);
         inline for (@typeInfo(memory.AdmissionAmounts).@"struct".field_names) |field| {
             if (@field(floor, field) < @field(required, field)) return error.MetadataPendingAdmissionIncomplete;
@@ -205,7 +213,7 @@ pub const Owner = struct {
         if (self.held_floor) |floor| return floor;
         var permits: [max_held]*const sessions.RunPermit = undefined;
         for (self.held[0..self.held_count], 0..) |permit, index| permits[index] = permit orelse return error.MissingMetadataAdmissionOwner;
-        return sumPermits(self.session, permits[0..self.held_count]);
+        return (try sumPermits(self.session, permits[0..self.held_count])).merge(self.borrowed_host_floor);
     }
 
     /// Keep the actual complete request as a conservative denial floor while

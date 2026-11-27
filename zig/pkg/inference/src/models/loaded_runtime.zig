@@ -524,10 +524,10 @@ pub const Runtime = struct {
 
         // Embedding checkpoints can ship their decoder backbone's chat
         // template, but embedding execution never uses it. Qwen rerankers use
-        // their explicit scoring templates instead of this general chat path.
+        // their explicit scoring templates. Inkling renders its own CUDA prompt.
         var chat_template_failed = false;
         const needs_chat_template = man.model_type != .embedder and
-            !man.isQwen3TextReranker() and !man.isQwen3VlReranker();
+            !man.isQwen3TextReranker() and !man.isQwen3VlReranker() and !man.isInkling2();
         const chat_template_source: ?[]const u8 = if (man.isLightOnOcr3())
             @import("../readers/lightonocr3.zig").chat_template
         else
@@ -1718,7 +1718,14 @@ pub const Runtime = struct {
         const physical = try proof.artifacts().constructionPath(path);
         defer self.allocator.free(physical);
         try proof.artifacts().verifyPath(physical);
-        const store = try gemma4_projector.ProjectorStore.open(self.allocator, physical);
+        const source = if (self.session.backend() == .metal and @import("../execution/gemma4_native_plan.zig").metalResidentProjectorEnabled(session_factory.getGptConfig(self.session)))
+            session_factory.getAuxiliaryProjectorStore(self.session)
+        else
+            null;
+        const store = if (source != null and std.mem.eql(u8, source.?.path orelse "", physical))
+            try gemma4_projector.ProjectorStore.borrow(self.allocator, physical, source.?)
+        else
+            try gemma4_projector.ProjectorStore.open(self.allocator, physical);
         errdefer store.close();
         try proof.finish();
         self.projector_store = store;

@@ -36,6 +36,7 @@ pub const Task = enum {
 pub const Dispatch = struct {
     ptr: *anyopaque,
     task: Task,
+    accepts_shape_only_stage_inputs: bool = false,
     run_stage_fn: ?*const fn (*anyopaque, Task, std.mem.Allocator, session_mod.Session, []const session_mod.StageInput, ?Control) anyerror!session_mod.ResidentOutputs = null,
     run_resident_fn: ?*const fn (*anyopaque, Task, std.mem.Allocator, session_mod.Session, ?*session_mod.RunPermit, ?*std.atomic.Mutex, []const Tensor, ?Control) anyerror!?session_mod.ResidentOutputs = null,
     run_fn: *const fn (*anyopaque, Task, std.mem.Allocator, session_mod.Session, ?*session_mod.RunPermit, ?*std.atomic.Mutex, []const Tensor, ?Control) anyerror![]Tensor,
@@ -121,6 +122,14 @@ pub fn stageDispatcher(dispatch: anytype) ?Dispatch {
     const selected = if (comptime @typeInfo(@TypeOf(dispatch)) == .optional) dispatch orelse return null else dispatch;
     if (comptime @TypeOf(selected) != Dispatch) return null;
     return if (selected.run_stage_fn != null) selected else null;
+}
+
+pub fn runStage(allocator: std.mem.Allocator, session: session_mod.Session, inputs: []const session_mod.StageInput, control: ?Control, dispatch: ?Dispatch) !session_mod.ResidentOutputs {
+    if (dispatch) |selected| {
+        const execute = selected.run_stage_fn orelse return error.DecoderDispatchChanged;
+        return execute(selected.ptr, selected.task, allocator, session, inputs, control);
+    }
+    return (try session.runStageInputsWithControl(inputs, allocator, control)) orelse return error.UnexpectedResidentStageDecline;
 }
 
 pub fn run(allocator: std.mem.Allocator, session: session_mod.Session, permit: ?*session_mod.RunPermit, gate: ?*std.atomic.Mutex, inputs: []const Tensor, control: ?Control, dispatch: anytype) ![]Tensor {

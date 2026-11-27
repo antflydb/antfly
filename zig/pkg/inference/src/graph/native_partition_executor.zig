@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const tensor_transfer = @import("../execution/tensor_transfer.zig");
 const std = @import("std");
 const ml = @import("ml");
 const platform = @import("antfly_platform");
@@ -144,12 +145,14 @@ pub const NativePartitionExecutor = struct {
             if (rt_map.get(node_id)) |rt_val| {
                 const current_dev = value_device[i];
                 if (current_dev != device_id) {
+                    if (options.require_assigned_kernels) return error.UnsupportedCompiledGraphRuntime;
                     const mesh = exec_ctx.mesh orelse return error.DeviceNotFound;
                     const src_entry = mesh.device(current_dev) orelse return error.DeviceNotFound;
-                    const transferred = try transferTensor(allocator, rt_val, src_entry.backend, cb);
+                    if (exec_ctx.owned_runtime_transfers) |owned| try owned.ensureUnusedCapacity(allocator, 1);
+                    const transferred = try tensor_transfer.copyRuntimeInput(allocator, rt_val, src_entry.backend, cb);
                     values[i] = transferred;
                     if (exec_ctx.owned_runtime_transfers) |owned| {
-                        try owned.put(allocator, node_id, {});
+                        owned.putAssumeCapacity(node_id, {});
                     }
                     if (exec_ctx.stats) |stats| stats.runtime_input_transfers += 1;
                 } else {
@@ -203,7 +206,7 @@ pub const NativePartitionExecutor = struct {
                 if (last_use[input_index] != i) continue;
                 if (rt_map.contains(input_id) and
                     !donated.contains(input_id) and
-                    !ownedRuntimeTransferContains(exec_ctx, input_id)) continue;
+                    !exec_ctx.ownsRuntimeTransfer(input_id)) continue;
                 if (values[input_index]) |ct| {
                     if (values[i]) |out_ct| {
                         if (ct == out_ct and interpreter.canKeepAliasedOutput(n.op)) {
@@ -245,6 +248,7 @@ fn executeNativePlannedNode(
         if (try frame.execute(cb, values, node_id, if (graph.node(node_id).op == .fused_rope) (try interpreter.ropePositionOverride(exec_state.options.attention)) else null)) |output| return output;
     }
     const n = graph.node(node_id);
+    if (exec_state.options.require_assigned_kernels) return error.UnsupportedCompiledGraphRuntime;
     const inputs = n.getInputs();
     // Planned native kernels currently derive several operand layouts from
     // graph declarations. When any participating shape is symbolic, route the
@@ -862,38 +866,6 @@ fn nativeGraphNodeRequiresPlannedExecution(graph: *const Graph, values: []?CT, n
                 native_compute.nativeTensorHasQuantizedStorage(valueAt(values, inputs[2]))),
         else => false,
     };
-}
-
-fn ownedRuntimeTransferContains(
-    exec_ctx: PartitionExecutor.ExecutionContext,
-    node_id: NodeId,
-) bool {
-    const owned = exec_ctx.owned_runtime_transfers orelse return false;
-    return owned.contains(node_id);
-}
-
-fn transferTensor(
-    allocator: std.mem.Allocator,
-    value: CT,
-    from: *const ComputeBackend,
-    to: *const ComputeBackend,
-) !CT {
-    const shape_i64 = try from.tensorShape(value, allocator);
-    defer allocator.free(shape_i64);
-    const shape_i32 = try tensorShapeI32(allocator, shape_i64);
-    defer allocator.free(shape_i32);
-    const f32_data = try from.toFloat32(value, allocator);
-    defer allocator.free(f32_data);
-    return to.fromFloat32Shape(f32_data, shape_i32);
-}
-
-fn tensorShapeI32(allocator: std.mem.Allocator, shape: []const i64) ![]i32 {
-    const out = try allocator.alloc(i32, shape.len);
-    errdefer allocator.free(out);
-    for (shape, 0..) |dim, i| {
-        out[i] = std.math.cast(i32, dim) orelse return error.UnsupportedShape;
-    }
-    return out;
 }
 
 test "native partition executor evaluates a partition through backend ops" {

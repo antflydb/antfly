@@ -35,12 +35,36 @@ pub const PhysicalReplayDecision = enum {
     busy_frame,
 };
 
+/// First concrete node rejected by capture admission. A missing record means
+/// that no node-specific rejection was observed for this invocation.
+pub const PhysicalReplayBlocker = struct {
+    node: u32,
+    operation: ?@import("std").meta.Tag(@import("ml").graph.OpCode) = null,
+    dtype: ?@import("ml").graph.DType = null,
+    reason: Reason,
+
+    pub const Reason = enum { literal_storage, typed_input, region, view, missing_kernel, foreign_partition, kernel_route, output };
+};
+
 /// Assigned region callbacks observed in one successfully published Frame.
 /// A callback may encode a CUDA recording. Graph launches count separately.
 pub const AssignedRegions = struct {
     selected: usize,
     accepted_callbacks: u64,
     covered_callback_nodes: u64,
+};
+
+pub const AssignedTransferDeclines = struct {
+    not_assigned: u64 = 0,
+    provider_mismatch: u64 = 0,
+    representation: u64 = 0,
+    destination_unavailable: u64 = 0,
+    destination_held: u64 = 0,
+
+    pub fn merge(self: *@This(), other: @This()) void {
+        inline for (comptime @import("std").meta.fieldNames(@This())) |name|
+            @field(self.*, name) +|= @field(other, name);
+    }
 };
 
 pub const ExecutionStats = struct {
@@ -52,14 +76,18 @@ pub const ExecutionStats = struct {
     /// Lifetime peaks are not per-request peaks or total model/device residency.
     planned_storage: ?@import("storage_accounting.zig").Snapshot = null,
     physical_replay: PhysicalReplayDecision = .not_requested,
+    physical_replay_blocker: ?PhysicalReplayBlocker = null,
     physical_graph_captures: u64 = 0,
     physical_capture_failures: u64 = 0,
     physical_replay_error: ?[]const u8 = null,
     physical_graph_replays: u64 = 0,
+    /// True only after the runtime receives a completed Frame receipt.
+    physical_frame_observed: bool = false,
     physical_input_copies: u64 = 0,
     physical_input_copy_bytes: u64 = 0,
     physical_transfer_dispatches: u64 = 0,
     physical_transfer_bytes: u64 = 0,
+    physical_transfer_declines: AssignedTransferDeclines = .{},
     assigned_kernel_dispatches: u64 = 0,
     physical_storage_allocations: u64 = 0,
     physical_storage_bytes: u64 = 0,
@@ -69,6 +97,8 @@ pub const ExecutionStats = struct {
     actual_upload_bytes: u64 = 0,
     actual_download_calls: u64 = 0,
     actual_download_bytes: u64 = 0,
+    actual_device_copy_calls: ?u64 = null,
+    actual_device_copy_bytes: ?u64 = null,
     device_host_accesses: u64 = 0,
     device_host_access_bytes: u64 = 0,
     index_metadata_host_accesses: u64 = 0,

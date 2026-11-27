@@ -877,12 +877,9 @@ pub fn forwardHiddenTensorWithCudaReplay(
     return hidden_result.hidden;
 }
 
-/// Last-row logits through the decoder-runtime forward (CUDA graph replay
-/// capable). Same result shape as the interpreter's last-row logits, but the
-/// layer stack runs through the fused decoder-runtime path — this is what
-/// lets sampled (non-greedy) decoding reuse the fast machinery the greedy
-/// loop gets from forwardGreedyLastToken.
-pub fn forwardLastLogitsWithCudaReplay(
+/// Project only the final hidden row. The hidden producer can replay its
+/// decoder runtime on CUDA or run the ordinary forward on other providers.
+pub fn forwardLastLogitsFromTokens(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     config: Config,
@@ -1114,18 +1111,32 @@ pub fn forwardGreedyLastTokenTensorOnlyFromTokenTensor(
     batch: usize,
     seq_len: usize,
     decode_context: ?*const DecodeContext,
+    resolved_input_owner: ?*?CT,
 ) !?CT {
     const hidden_size = config.hidden_size;
     const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
     const total = batch * query_seq_len;
     if (batch != 1 or query_seq_len != 1 or total != 1) return null;
 
+    if (resolved_input_owner) |owner| {
+        if (owner.* != input_token) return error.InvalidTensorShape;
+    }
     const embed_w = try getEmbeddingWeight(cb, config);
     defer cb.free(embed_w);
     const hidden = (try lookupScaledTokenEmbeddingsTensor(cb, allocator, config, embed_w, input_token, total, hidden_size)) orelse return null;
 
-    const ple_vectors = try computePleVectorsFromTokenTensor(cb, allocator, config, input_token, hidden, total);
+    const ple_vectors = computePleVectorsFromTokenTensor(cb, allocator, config, input_token, hidden, total) catch |err| {
+        cb.free(hidden);
+        return err;
+    };
     defer if (ple_vectors) |pv| cb.free(pv);
+
+    // The CUDA caller has resolved the scalar. Both gathers that read its
+    // device copy have been queued on the same stream as the following graph.
+    if (resolved_input_owner) |owner| {
+        owner.* = null;
+        cb.free(input_token);
+    }
 
     return try forwardGreedyLastTokenTensorOnlyFromEmbeddings(cb, allocator, config, hidden, batch, seq_len, decode_context, ple_vectors);
 }
@@ -1414,15 +1425,19 @@ pub fn forwardPrefillHiddenFromEmbeddingsWithLayer0Overrides(
     decode_context: ?*const DecodeContext,
     ple_vectors: ?CT,
 ) !HiddenTensorResult {
-    const output: SharedKvPrefillOutput = if (batch == 1 and cb.kind() == .cuda and
-        (getenvBool("ANTFLY_INFERENCE_CUDA_MULTIMODAL_SHARED_KV_PREFILL") or
+    const can_prune = switch (cb.kind()) {
+        .native => nativeSharedKvPrefillEnabled(config) and layer0DecoderOverridesEmpty(overrides),
+        .cuda => getenvBool("ANTFLY_INFERENCE_CUDA_MULTIMODAL_SHARED_KV_PREFILL") or
             @import("../ops/cuda/cuda_compute.zig").CudaCompute.nativePrefillPolicySelected(cb) or
             (@import("../ops/cuda/cuda_compute.zig").CudaCompute.gemma4SharedKvPrefillEnabled(cb) and
                 platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_E4B_PREPARED_SHARED_KV_PREFILL", true) and
-                preparedSharedKvPrefillEligible(config, overrides, batch, seq_len, decode_context))) and !disableSharedKvDebug() and
+                preparedSharedKvPrefillEligible(config, overrides, batch, seq_len, decode_context)),
+        else => false,
+    };
+    const output: SharedKvPrefillOutput = if (batch == 1 and can_prune and !disableSharedKvDebug() and
         decode_context != null and
         decode_context.?.query_sequence_len > 1 and decode_context.?.query_sequence_len <= seq_len and decode_context.?.total_sequence_len == seq_len and
-        sharedKvPrefillBoundary(config, decode_context.?.*) != null)
+        sharedKvPrefillBoundaryForBackend(cb, config, decode_context.?.*) != null)
         .last
     else
         .all;
@@ -1908,22 +1923,15 @@ fn cudaDecodeGraphReplayMode() CudaDecodeGraphReplayMode {
     return cudaDecodeGraphReplayModeFromValue(platform.env.getenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY"));
 }
 
-fn cudaDecodeGraphReplayRequested() bool {
-    return cudaDecodeGraphReplayMode() != .off;
-}
-
 pub fn cudaDecodeGraphReplayRequired() bool {
     return cudaDecodeGraphReplayMode() == .required;
 }
 
 /// Automatic request replay must reach the graph-aware forward before an
-/// eager fused shortcut. Its failure policy remains automatic, not required.
+/// eager fused shortcut. A process preference alone cannot supply bounded KV
+/// or exclusive storage for an automatic capture.
 pub fn cudaDecodeGraphReplayPrefersGraph(cb: *const ComputeBackend) bool {
     return cudaDecodeGraphReplayRequired() or cb.debugCudaGraphReplayRequested();
-}
-
-fn cudaDecodeGraphReplayRequestedForBackend(cb: *const ComputeBackend) bool {
-    return cudaDecodeGraphReplayRequested() or cb.debugCudaGraphReplayRequested();
 }
 
 test "Gemma4 CUDA request replay reaches architecture capture without global flags" {
@@ -1955,7 +1963,7 @@ test "Gemma4 CUDA request replay reaches architecture capture without global fla
     try std.testing.expect(!cudaCaptureFinalHiddenProbeEnabled(&cb, 1, 32, &prefill));
     cb.execution_owner = 7;
     try std.testing.expect(!cb.debugCudaGraphReplayRequested());
-    try std.testing.expectEqual(cudaDecodeGraphReplayRequested(), cudaDecodeGraphReplayRequestedForBackend(&cb));
+    try std.testing.expectEqual(cudaDecodeGraphReplayRequired(), cudaDecodeGraphReplayPrefersGraph(&cb));
     cb.execution_owner = 0;
     active = false;
     try std.testing.expectEqual(cudaDecodeGraphReplayRequired(), cudaDecodeGraphReplayPrefersGraph(&cb));
@@ -1989,7 +1997,7 @@ fn cudaCaptureFinalHiddenProbeEnabled(
     decode_context: ?*const DecodeContext,
 ) bool {
     if (!platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_FINAL_HIDDEN", false) and
-        !cudaDecodeGraphReplayRequestedForBackend(cb)) return false;
+        !cudaDecodeGraphReplayPrefersGraph(cb)) return false;
     if (cb.kind() != .cuda) return false;
     if (batch != 1) return false;
     return actualQuerySeqLen(seq_len, decode_context) == 1;
@@ -2003,7 +2011,7 @@ fn cudaCaptureGreedyTokenProbeEnabled(
 ) bool {
     if (!cudaCaptureFinalHiddenProbeEnabled(cb, batch, seq_len, decode_context)) return false;
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_GREEDY_TOKEN", false) or
-        cudaDecodeGraphReplayRequestedForBackend(cb);
+        cudaDecodeGraphReplayPrefersGraph(cb);
 }
 
 fn forwardGreedyLastTokenTensorFromEmbeddingsWithLayer0Overrides(
@@ -2986,8 +2994,30 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithLayer0OverridesAndTrace(
 pub const SharedKvPrefillOutput = enum { all, last, kv_only };
 
 fn sharedKvPrefillBoundary(config: Config, dc: DecodeContext) ?usize {
+    return sharedKvBoundary(config.sharedKvPrefillDonorLayers(), dc);
+}
+
+pub fn nativeSharedKvPrefillEnabled(config: Config) bool {
+    if (config.sharedKvFunctionalDonorLayers() == null) return false;
+    if (platform.env.getenv("ANTFLY_INFERENCE_NATIVE_SHARED_KV_PREFILL")) |value| return platform.env.truthy(value);
+    return @import("../execution/gemma4_native_plan.zig").cpuSharedKvPrefillDefault(config);
+}
+
+fn sharedKvPrefillBoundaryForBackend(cb: *const ComputeBackend, config: Config, dc: DecodeContext) ?usize {
+    // Functional prefill owns its donor values and has no paged backend state.
+    // Its traced and ordinary calls must select the same structural boundary.
+    const supports_functional = hasFunctionalPrefillKv(dc) or cb.kind() == .native or (build_options.enable_cuda and cb.kind() == .cuda and
+        @import("../ops/cuda/cuda_compute.zig").CudaCompute.nativePrefillPolicySelected(cb));
+    return sharedKvBoundary(if (supports_functional) config.sharedKvFunctionalDonorLayers() else config.sharedKvPrefillDonorLayers(), dc);
+}
+
+fn hasFunctionalPrefillKv(dc: DecodeContext) bool {
+    return dc.attention_mode == .full_recompute and dc.forward_kv_reuse != null and dc.kv_cache == null;
+}
+
+fn sharedKvBoundary(donors: ?usize, dc: DecodeContext) ?usize {
     if (!sharedKvPrefillContextEligible(dc)) return null;
-    return config.sharedKvPrefillDonorLayers();
+    return donors;
 }
 
 pub fn metalE2bSharedKvPrefillBoundary(config: Config, dc: DecodeContext) ?usize {
@@ -2998,8 +3028,7 @@ pub fn metalE2bSharedKvPrefillBoundary(config: Config, dc: DecodeContext) ?usize
 }
 
 fn sharedKvPrefillContextEligible(dc: DecodeContext) bool {
-    const functional = dc.attention_mode == .full_recompute and dc.forward_kv_reuse != null and dc.kv_cache == null;
-    if ((!functional and (dc.attention_mode != .paged_prefill or dc.kv_cache == null)) or dc.query_sequence_len <= 1 or
+    if ((!hasFunctionalPrefillKv(dc) and (dc.attention_mode != .paged_prefill or dc.kv_cache == null)) or dc.query_sequence_len <= 1 or
         dc.query_sequence_len > dc.total_sequence_len or
         dc.kv_batch != null or dc.selection_query_capture != null or
         dc.mrope_positions != null or dc.qwen3vl_visual_mask != null or
@@ -3010,6 +3039,34 @@ fn sharedKvPrefillContextEligible(dc: DecodeContext) bool {
     }
     if (dc.input_ids) |ids| if (ids.len == 0) return false;
     return true;
+}
+
+test "functional shared KV prefill admits traced one-head donor geometry" {
+    const allocator = std.testing.allocator;
+    var trace = @import("../graph/tracing_compute.zig").TracingCompute.init(allocator);
+    defer trace.deinit();
+    const cb = trace.backend();
+    const config: Config = .{
+        .family = .gemma,
+        .hidden_size = 1536,
+        .num_hidden_layers = 35,
+        .num_kv_shared_layers = 20,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .position_encoding = .rope,
+        .sliding_window = 512,
+        .sliding_window_pattern = 5,
+    };
+    var donors = try @import("../execution/forward_kv_reuse.zig").Scope.init(allocator, &cb, config.num_hidden_layers, null);
+    defer donors.deinit();
+    var context: DecodeContext = .{ .total_sequence_len = 79, .query_sequence_len = 79, .kv_sequence_len = 79 };
+    try std.testing.expectEqual(@as(?usize, null), sharedKvPrefillBoundaryForBackend(&cb, config, context));
+    context.forward_kv_reuse = donors.context();
+    try std.testing.expectEqual(@as(?usize, 15), sharedKvPrefillBoundaryForBackend(&cb, config, context));
+    context.mrope_positions = &.{};
+    try std.testing.expectEqual(@as(?usize, null), sharedKvPrefillBoundaryForBackend(&cb, config, context));
 }
 
 fn preparedSharedKvPrefillEligible(config: Config, overrides: Layer0DecoderOverrides, batch: usize, seq_len: usize, context: ?*const DecodeContext) bool {
@@ -3272,7 +3329,7 @@ pub fn projectPrefillHead(cb: *const ComputeBackend, allocator: std.mem.Allocato
     };
 }
 
-/// E4B's shared suffix produces no KV. KV-only chunks can omit it, and a
+/// A shared suffix produces no KV. KV-only chunks can omit it, and a
 /// final-logit chunk only needs its last row. Null always precedes KV writes;
 /// errors after execution begins must be handled by the caller's rollback.
 pub fn trySharedKvPrefill(
@@ -3287,6 +3344,7 @@ pub fn trySharedKvPrefill(
     if (disableSharedKvDebug() or intent.capturesHidden()) return null;
     const want_last_row = intent != .kv_only;
     const enabled = switch (cb.kind()) {
+        .native => nativeSharedKvPrefillEnabled(config),
         .metal => platform.env.getenvBoolDefault("ANTFLY_INFERENCE_METAL_SHARED_KV_PREFILL", true),
         .cuda => if (comptime build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig").CudaCompute.gemma4SharedKvPrefillEnabled(cb) else false,
         else => false,
@@ -3321,7 +3379,7 @@ pub fn trySharedKvPrefill(
         try cb.decoderRuntimeResetState();
         return result;
     }
-    _ = sharedKvPrefillBoundary(config, dc.*) orelse return null;
+    _ = sharedKvPrefillBoundaryForBackend(cb, config, dc.*) orelse return null;
     if (cb.kind() == .metal) {
         if (want_last_row) return null;
         const prepared = cb.decoderRuntimePrepareOrReuseFamily(allocator, config, seq_len, config.num_hidden_layers) catch return null;
@@ -3449,7 +3507,7 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
     }
     const shared_boundary: ?usize = if (output == .all) null else blk: {
         if (batch != 1 or pre_norm_out != null or trace_sink != null) return error.UnsupportedShape;
-        break :blk sharedKvPrefillBoundary(config, (decode_context orelse return error.UnsupportedShape).*) orelse return error.UnsupportedShape;
+        break :blk sharedKvPrefillBoundaryForBackend(cb, config, (decode_context orelse return error.UnsupportedShape).*) orelse return error.UnsupportedShape;
     };
     var shared_context: DecodeContext = undefined;
     var layer_context = decode_context;
@@ -3509,31 +3567,33 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
     errdefer if (layer0_k_pending) |override| cb.free(override);
     errdefer if (layer0_v_pending) |override| cb.free(override);
 
-    // Own one frame across the full A4B stack. Once every expert arena layer is
-    // warm, checkpoint/replay removes the router completion point: the first
-    // pass maps routes on-device and records only per-layer miss counts. The
-    // terminal frame wait decides whether the token is accepted or replayed
-    // once through synchronized bounded repair.
-    var owns_a4b_forward_frame = false;
-    if (cb.kind() == .metal and
-        isDecodeStep(decode_context) and
+    // A long-lived Metal frame may recycle a released buffer immediately for
+    // a later encoded layer even though an earlier command still reads it.
+    // Keep prior hidden tensors owned until frame completion; this retains the
+    // no-blit cross-layer path without allowing same-frame storage reuse.
+    var deferred_a4b_hidden_frees = std.ArrayListUnmanaged(CT).empty;
+    defer {
+        for (deferred_a4b_hidden_frees.items) |tensor| cb.free(tensor);
+        deferred_a4b_hidden_frees.deinit(allocator);
+    }
+    var a4b_replay_checkpoint: ?CT = null;
+    defer if (a4b_replay_checkpoint) |checkpoint| cb.free(checkpoint);
+
+    // A4B keeps one frame across the stack so routing misses can be
+    // resolved from a checkpoint after the terminal wait.
+    const Submission = @import("../execution/submission.zig").Scope;
+    const frame_needed = cb.kind() == .metal and isDecodeStep(decode_context) and
         gemma4_runtime.isQualifiedA4bArchitecture(config) and
         !getenvBool("TERMITE_METAL_DISABLE_A4B_LAYER_FRAME") and
-        !getenvBool("TERMITE_METAL_DISABLE_A4B_FORWARD_FRAME") and
-        !cb.decoderRuntimeHasActiveFrame())
-    {
-        owns_a4b_forward_frame = try cb.decoderRuntimeBeginFrame();
-        if (owns_a4b_forward_frame) {
-            try cb.decoderRuntimeSetActiveFrameRegime(.decode);
-        }
-    }
-    defer if (owns_a4b_forward_frame) cb.decoderRuntimeCancelFrame() catch {};
+        !getenvBool("TERMITE_METAL_DISABLE_A4B_FORWARD_FRAME");
+    var a4b_frame: Submission = if (frame_needed) try Submission.begin(cb) else .{ .backend = cb };
+    defer a4b_frame.deinit();
+    if (a4b_frame.owns) try cb.decoderRuntimeSetActiveFrameRegime(.decode);
 
     // Keep a frame active across eager Qwen3-VL decode layers. This coalesces
     // adjacent work around required runtime drains while preserving mRoPE,
     // barriers, and the alternating hidden-state carrier. Disabling the decode
     // gate restores per-layer boundaries; prepared prefill remains an opt-in.
-    var owns_qwen3vl_forward_frame = false;
     const qwen3vl_forward_context = decode_context;
     const qwen3vl_eager_decode_frame = isDecodeStep(decode_context) and
         qwen3VlMetalDecodeFrameEnabled() and
@@ -3548,21 +3608,15 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
     const qwen35_forward_frame = config.hasQwen35VisionArchitectureContract() and
         qwen3vl_forward_context != null and
         !getenvBool("TERMITE_METAL_DISABLE_QWEN35_FORWARD_FRAME");
-    if (cb.kind() == .metal and
-        trace_sink == null and
-        ((config.family == .qwen3_vl and (qwen3vl_eager_decode_frame or qwen3vl_prepared_prefill_frame)) or qwen35_forward_frame) and
-        !cb.decoderRuntimeHasActiveFrame())
-    {
-        owns_qwen3vl_forward_frame = try cb.decoderRuntimeBeginFrame();
-        if (owns_qwen3vl_forward_frame) {
-            try cb.decoderRuntimeSetActiveFrameRegime(if (isDecodeStep(decode_context)) .decode else .prefill);
-        }
-    }
-    defer if (owns_qwen3vl_forward_frame) cb.decoderRuntimeCancelFrame() catch {};
+    const qwen_frame_needed = cb.kind() == .metal and trace_sink == null and
+        ((config.family == .qwen3_vl and (qwen3vl_eager_decode_frame or qwen3vl_prepared_prefill_frame)) or qwen35_forward_frame);
+    var qwen_frame: Submission = if (qwen_frame_needed) try Submission.begin(cb) else .{ .backend = cb };
+    defer qwen_frame.deinit();
+    if (qwen_frame.owns) try cb.decoderRuntimeSetActiveFrameRegime(if (isDecodeStep(decode_context)) .decode else .prefill);
 
     const prefill_stream_layers: usize = if (comptime build_options.enable_metal) blk: {
         const layers = metal_compute_mod.MetalCompute.lightOnPrefillStreamLayers(cb);
-        break :blk if (lightOnPrefillSplitEligible(config, batch, query_seq_len, decode_context != null and decode_context.?.attention_mode == .paged_prefill, owns_qwen3vl_forward_frame, layers) and trace_sink == null and
+        break :blk if (lightOnPrefillSplitEligible(config, batch, query_seq_len, decode_context != null and decode_context.?.attention_mode == .paged_prefill, qwen_frame.owns, layers) and trace_sink == null and
             !prefillTraceEnabled() and !forceLayerCloneDebug() and !debugLastRowEnabled() and
             !debugTensorStatsEnabled()) layers else 0;
     } else 0;
@@ -3570,7 +3624,7 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
         const layers = metal_compute_mod.MetalCompute.lightOnStreamFirstLayers(cb);
         // Only the explicit native greedy-stream owner may lend its frame.
         // Ordinary borrowed frames retain the existing no-submit contract.
-        const can_stream_frame = owns_qwen3vl_forward_frame or
+        const can_stream_frame = qwen_frame.owns or
             (metal_compute_mod.MetalCompute.lightOnGpuGreedyStreamEnabled(cb) and
                 cb.decoderRuntimeHasActiveFrame() and !metal_compute_mod.MetalCompute.lightOnHasSubmittedFrame(cb));
         break :blk if (lightOnForwardSplitEligible(config, batch, isDecodeStep(decode_context), can_stream_frame, layers) and
@@ -3580,18 +3634,15 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
     if (comptime build_options.enable_metal) metal_compute_mod.MetalCompute.setLightOnExpectedStreamFrames(cb, @intCast(lightOnStreamFrameCount(config.num_hidden_layers, stream_first_layers, stream_chunks)));
     // At most one submitted prefix and one active suffix exist. Drain the
     // submitted prefix on every exit before releasing any borrowed context.
-    defer if (stream_first_layers != 0) cb.decoderRuntimeWaitSubmittedFrame() catch {};
-
-    // A long-lived Metal frame may recycle a released buffer immediately for
-    // a later encoded layer even though an earlier command still reads it.
-    // Keep prior hidden tensors owned until frame completion; this retains the
-    // no-blit cross-layer path without allowing same-frame storage reuse.
-    var deferred_a4b_hidden_frees = std.ArrayListUnmanaged(CT).empty;
+    var qwen_pending: @import("../execution/submission.zig").Pending = .{ .backend = cb };
+    const borrowed_stream = stream_first_layers != 0 and !qwen_frame.owns;
     defer {
-        for (deferred_a4b_hidden_frees.items) |tensor| cb.free(tensor);
-        deferred_a4b_hidden_frees.deinit(allocator);
+        qwen_pending.wait() catch {
+            if (qwen_pending.active) platform.inference_process_supervisor.restartWorker();
+        };
     }
-    if (owns_a4b_forward_frame) {
+
+    if (a4b_frame.owns) {
         try deferred_a4b_hidden_frees.ensureTotalCapacity(
             allocator,
             config.num_hidden_layers * 2 + 2,
@@ -3599,9 +3650,7 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
     }
 
     var a4b_moe_checkpoint_started = false;
-    var a4b_replay_checkpoint: ?CT = null;
-    defer if (a4b_replay_checkpoint) |checkpoint| cb.free(checkpoint);
-    if (owns_a4b_forward_frame and pre_norm_out == null and trace_sink == null and
+    if (a4b_frame.owns and pre_norm_out == null and trace_sink == null and
         layer0DecoderOverridesEmpty(effective_overrides))
     {
         const top_k: usize = @intCast(config.num_experts_per_tok);
@@ -3621,7 +3670,7 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
     // buffers. Those copies are useful for per-layer frames, but inside this
     // cross-layer frame they add one blit and a long dependency chain per
     // layer. Let the naturally device-resident result flow directly instead.
-    var reserved_hidden: ?ReservedHiddenCarrier = if (owns_a4b_forward_frame)
+    var reserved_hidden: ?ReservedHiddenCarrier = if (a4b_frame.owns)
         null
     else
         try ReservedHiddenCarrier.init(cb, hidden, total, hidden_size);
@@ -3705,7 +3754,7 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
             owns_hidden = false;
         } else {
             if (new_hidden != hidden) {
-                if (owns_a4b_forward_frame)
+                if (a4b_frame.owns)
                     deferred_a4b_hidden_frees.appendAssumeCapacity(hidden)
                 else
                     cb.free(hidden);
@@ -3717,7 +3766,7 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
         if (cb.kind() == .metal and forceLayerCloneDebug()) {
             const cloned_hidden = try cloneTensorMaterialized(cb, allocator, hidden);
             if (owns_hidden) {
-                if (owns_a4b_forward_frame)
+                if (a4b_frame.owns)
                     deferred_a4b_hidden_frees.appendAssumeCapacity(hidden)
                 else
                     cb.free(hidden);
@@ -3729,10 +3778,15 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
             try cb.checkExecutionControl();
             // Finish the prior submitted group before promoting this active
             // group. Only the existing two storage banks can be in flight.
-            try cb.decoderRuntimeWaitSubmittedFrame();
-            try cb.decoderRuntimeSubmitFrame();
-            errdefer cb.decoderRuntimeWaitSubmittedFrame() catch {};
-            if (!try cb.decoderRuntimeBeginFrame()) return error.StreamedForwardFrameUnavailable;
+            try qwen_pending.wait();
+            if (borrowed_stream) {
+                try qwen_pending.submitBorrowed();
+                if (!try cb.decoderRuntimeBeginFrame()) return error.StreamedForwardFrameUnavailable;
+            } else {
+                try qwen_frame.submitInto(&qwen_pending);
+                qwen_frame = try Submission.beginPipelined(cb);
+                if (!qwen_frame.owns) return error.StreamedForwardFrameUnavailable;
+            }
             // Preserve the prefill BF16 input policy across every new group.
             try cb.decoderRuntimeSetActiveFrameRegime(if (prefill_stream_layers != 0) .prefill else .decode);
             if (comptime build_options.enable_metal) {
@@ -3800,16 +3854,15 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
         reserved_hidden = null;
         owns_hidden = true;
     } else if (final_hidden != hidden) {
-        if (owns_a4b_forward_frame)
+        if (a4b_frame.owns)
             deferred_a4b_hidden_frees.appendAssumeCapacity(hidden)
         else
             cb.free(hidden);
     }
     hidden = final_hidden;
-    if (owns_qwen3vl_forward_frame) {
-        if (stream_first_layers != 0) try cb.decoderRuntimeWaitSubmittedFrame();
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        owns_qwen3vl_forward_frame = false;
+    if (qwen_frame.owns) {
+        try qwen_pending.wait();
+        try qwen_frame.finish();
         if (comptime build_options.enable_metal) {
             if (lightOnPrefillSplitEligible(config, batch, query_seq_len, decode_context != null and decode_context.?.attention_mode == .paged_prefill, true, 1))
                 metal_compute_mod.MetalCompute.noteLightOnPrefillComplete(cb);
@@ -3825,9 +3878,8 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
     }
     try cb.debugCudaTraceTensor("gpt.final_hidden", hidden);
     try maybeCaptureActivationTrace(trace_sink, cb, allocator, "final_norm", null, hidden, hidden_size);
-    if (owns_a4b_forward_frame) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        owns_a4b_forward_frame = false;
+    if (a4b_frame.owns) {
+        try a4b_frame.finish();
         for (deferred_a4b_hidden_frees.items) |tensor| cb.free(tensor);
         deferred_a4b_hidden_frees.clearRetainingCapacity();
         const replay_required = if (a4b_moe_checkpoint_started)
@@ -3993,7 +4045,7 @@ test "LightOnOCR3 rolling chunks omit empty final frames and preserve prefix mod
 fn decoderOverridesWithCleanup(overrides: Layer0DecoderOverrides, decode: ?*const DecodeContext) Layer0DecoderOverrides {
     if (overrides.cleanup != null) return overrides;
     const context = decode orelse return overrides;
-    if (context.cleanup.boundary == null and context.cleanup.operation == null and !context.cleanup.outside_execution and context.cleanup.synchronous_outside_raw == null) return overrides;
+    if (context.cleanup.boundary == null and context.cleanup.operation == null and !context.cleanup.outside_execution) return overrides;
     var current = overrides;
     current.cleanup = &context.cleanup;
     return current;
@@ -4005,7 +4057,7 @@ inline fn validateForwardCleanup(cb: *const ComputeBackend, cleanup: ?*const @im
 
 inline fn validateDecoderForwardCleanup(cb: *const ComputeBackend, cleanup: ?*const @import("../execution/cleanup_context.zig").Context, decode: ?*const DecodeContext) !void {
     if (cleanup) |current| {
-        if (current.outside_execution or current.synchronous_outside_raw != null or current.boundary == null) return error.MissingCurrentCleanupEpoch;
+        if (current.outside_execution or current.boundary == null) return error.MissingCurrentCleanupEpoch;
         if (comptime build_options.enable_cuda) if (decode) |context| if (context.dense_ffn_program) |program| if (cb.kind() == .cuda) {
             // A private Model/cohort receiver has no Engine token. Its actual
             // program independently validates the receiving Session and held
@@ -4145,10 +4197,10 @@ pub fn tryDenseQwen3Prefill(
     defer if (scores) |value| freeTensorWithCleanup(cb, value, options.cleanup);
     var normalized: ?CT = null;
     defer if (normalized) |value| freeTensorWithCleanup(cb, value, options.cleanup);
-    var active = try cb.decoderRuntimeBeginFrame();
-    if (!active) return null;
+    var frame = try @import("../execution/submission.zig").Scope.begin(cb);
+    if (!frame.owns) return null;
     // Runs before any tensor defer, including when execution returned false.
-    defer if (active) cb.decoderRuntimeCancelFrame() catch {};
+    defer frame.deinit();
     if (options.profile) try cb.decoderRuntimeSetActiveFrameRegime(.prefill);
     if (!try cb.decoderRuntimeExecuteGraphCommandPlanFrame(&.{
         .cleanup = options.cleanup,
@@ -4192,8 +4244,7 @@ pub fn tryDenseQwen3Prefill(
         }
     }
     try cb.checkExecutionControl();
-    try cb.decoderRuntimeSubmitAndWaitFrame();
-    active = false;
+    try frame.finish();
     try cb.checkExecutionControl();
     if (scores) |value| {
         scores = null;
@@ -4342,8 +4393,7 @@ pub fn qwen3RerankerLogits(
         defer {
             // The synchronous helper submits or cancels before returning.
             // Retire its temporary head slot before the buffer can be reused.
-            metal_compute_mod.MetalCompute.releaseDynamicSlotsForTensor(cb, difference_weight);
-            cb.free(difference_weight);
+            cb.freeProjectionInput(difference_weight, .transient);
         }
         if (try tryDenseQwen3Prefill(cb, allocator, config, input_ids, attention_mask, batch, seq_len, .{
             .output_rows = active_rows,
@@ -4562,8 +4612,7 @@ fn qwen3RerankerLogitsFromHiddenRows(
 
     const difference_weight = try qwen3RerankerDifferenceWeight(cb, allocator, config);
     defer {
-        metal_compute_mod.MetalCompute.releaseDynamicSlotsForTensor(cb, difference_weight);
-        cb.free(difference_weight);
+        cb.freeProjectionInput(difference_weight, .transient);
     }
 
     const logits = try cb.linearNoBias(
@@ -6617,71 +6666,28 @@ fn decoderBlock(
     // boundaries: host readbacks flush and reopen the active frame. This
     // replaces the per-op synchronous command buffers used by the generic
     // path without changing routing or residency.
-    var owns_a4b_layer_frame = false;
-    if (cb.kind() == .metal and
-        isDecodeStep(decode_context) and
-        gemma4_runtime.isQualifiedA4bArchitecture(config) and
-        !getenvBool("TERMITE_METAL_DISABLE_A4B_LAYER_FRAME") and
-        !cb.decoderRuntimeHasActiveFrame())
-    {
-        owns_a4b_layer_frame = try cb.decoderRuntimeBeginFrame();
-        if (owns_a4b_layer_frame) {
-            try cb.decoderRuntimeSetActiveFrameRegime(.decode);
+    const layer_regime: ?ops.DecoderRuntimeFrameRegime = regime: {
+        if (cb.kind() != .metal) break :regime null;
+        const decode = isDecodeStep(decode_context);
+        if (decode and gemma4_runtime.isQualifiedA4bArchitecture(config) and
+            !getenvBool("TERMITE_METAL_DISABLE_A4B_LAYER_FRAME")) break :regime .decode;
+        if (config.family == .qwen3_vl) {
+            if (decode and qwen3VlMetalDecodeFrameEnabled()) break :regime .decode;
+            if (qwen3VlMetalPrefillFastPathEnabled() and
+                decoderOverrideLayerSlot(raw_overrides.attn_q_slots, layer) != null and
+                decoderOverrideLayerSlot(raw_overrides.mlp_down_slots, layer) != null and
+                decode_context != null and decode_context.?.attention_mode == .paged_prefill and
+                decode_context.?.query_sequence_len > 1) break :regime .prefill;
         }
-    }
-    defer if (owns_a4b_layer_frame) cb.decoderRuntimeCancelFrame() catch {};
-
-    // Decode with the established eager Qwen3-VL math but submit the layer as
-    // one bounded Metal frame. This avoids the mRoPE correctness hazard of a
-    // whole-token prepared decoder while removing its per-op submit/wait
-    // bubbles. An explicit disable gate remains available for rollout safety.
-    var owns_qwen3vl_decode_frame = false;
-    if (cb.kind() == .metal and
-        config.family == .qwen3_vl and
-        isDecodeStep(decode_context) and
-        qwen3VlMetalDecodeFrameEnabled() and
-        !cb.decoderRuntimeHasActiveFrame())
-    {
-        owns_qwen3vl_decode_frame = try cb.decoderRuntimeBeginFrame();
-        if (owns_qwen3vl_decode_frame) try cb.decoderRuntimeSetActiveFrameRegime(.decode);
-    }
-    defer if (owns_qwen3vl_decode_frame) cb.decoderRuntimeCancelFrame() catch {};
-
-    // The qualified Qwen3-VL prefill lane uses one command buffer per decoder
-    // layer. This preserves bounded lifetimes while coalescing the 20+ device
-    // dispatches in attention and FFN; the paired slot/frame gate prevents the
-    // independently unqualified slots-only execution from becoming reachable.
-    var owns_qwen3vl_prefill_frame = false;
-    const qwen3vl_prepared_layer = decoderOverrideLayerSlot(raw_overrides.attn_q_slots, layer) != null and
-        decoderOverrideLayerSlot(raw_overrides.mlp_down_slots, layer) != null;
-    if (cb.kind() == .metal and
-        config.family == .qwen3_vl and
-        qwen3VlMetalPrefillFastPathEnabled() and
-        qwen3vl_prepared_layer and
-        decode_context != null and
-        decode_context.?.attention_mode == .paged_prefill and
-        decode_context.?.query_sequence_len > 1 and
-        !cb.decoderRuntimeHasActiveFrame())
-    {
-        owns_qwen3vl_prefill_frame = try cb.decoderRuntimeBeginFrame();
-        if (owns_qwen3vl_prefill_frame) try cb.decoderRuntimeSetActiveFrameRegime(.prefill);
-    }
-    defer if (owns_qwen3vl_prefill_frame) cb.decoderRuntimeCancelFrame() catch {};
-
-    // Independent Gemma4 KV rows use the eager batched math, rather than the
-    // singleton prepared decoder. Bound temporary lifetimes to one layer while
-    // coalescing its GPU dispatches; singleton direct decoding is unaffected.
-    var owns_gemma4_batch_frame = false;
-    if (cb.kind() == .metal and config.family == .gemma and config.hasPle() and
-        config.usesGemma4Channels() and isDecodeStep(decode_context) and
-        batch <= 4 and decode_context != null and decode_context.?.kv_batch != null and
-        !getenvBool("ANTFLY_GEMMA4_METAL_OCR_DISABLE_LAYER_FRAMES") and
-        !cb.decoderRuntimeHasActiveFrame())
-    {
-        owns_gemma4_batch_frame = try cb.decoderRuntimeBeginFrame();
-        if (owns_gemma4_batch_frame) try cb.decoderRuntimeSetActiveFrameRegime(.decode);
-    }
-    defer if (owns_gemma4_batch_frame) cb.decoderRuntimeCancelFrame() catch {};
+        if (decode and config.family == .gemma and config.hasPle() and config.usesGemma4Channels() and
+            batch <= 4 and decode_context != null and decode_context.?.kv_batch != null and
+            !getenvBool("ANTFLY_GEMMA4_METAL_OCR_DISABLE_LAYER_FRAMES")) break :regime .decode;
+        break :regime null;
+    };
+    const Submission = @import("../execution/submission.zig").Scope;
+    var frame: Submission = if (layer_regime != null) try Submission.begin(cb) else .{ .backend = cb };
+    defer frame.deinit();
+    if (frame.owns) try cb.decoderRuntimeSetActiveFrameRegime(layer_regime.?);
 
     const owns_ocr_prefill_scope = if (config.hasQwen35VisionArchitectureContract() and
         decode_context != null and decode_context.?.attention_mode == .paged_prefill and
@@ -6711,22 +6717,8 @@ fn decoderBlock(
         layer0_v_override,
         trace_sink,
     );
-    if (owns_a4b_layer_frame) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        owns_a4b_layer_frame = false;
-    }
-    if (owns_qwen3vl_decode_frame) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        owns_qwen3vl_decode_frame = false;
-    }
-    if (owns_qwen3vl_prefill_frame) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        owns_qwen3vl_prefill_frame = false;
-    }
-    if (owns_gemma4_batch_frame) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        owns_gemma4_batch_frame = false;
-    }
+    errdefer cb.free(result);
+    try frame.finish();
     return result;
 }
 
@@ -7251,7 +7243,7 @@ fn decoderBlockImpl(
             defer freeTensorWithCleanup(cb, reshaped, raw_overrides.cleanup);
             if (try cb.rmsNormBare(reshaped, v_dim, config.norm_eps)) |normed_flat| {
                 defer freeTensorWithCleanup(cb, normed_flat, raw_overrides.cleanup);
-                const result = try reshape2dOwnedWithCleanup(cb, allocator, normed_flat, total, kv_dim, raw_overrides.cleanup);
+                const result = try reshape2dOwnedWithCleanup(cb, allocator, normed_flat, total, kv_dim, decode_context, raw_overrides.cleanup);
                 if (!v_omitted) freeTensorWithCleanup(cb, V, raw_overrides.cleanup); // V = K when omitted, don't double-free
                 break :blk result;
             }
@@ -7269,7 +7261,7 @@ fn decoderBlockImpl(
             defer freeTensorWithCleanup(cb, reshaped, raw_overrides.cleanup);
             const normed_flat = try cb.rmsNorm(reshaped, ones_ct, v_dim, config.norm_eps);
             defer freeTensorWithCleanup(cb, normed_flat, raw_overrides.cleanup);
-            const result = try reshape2dOwnedWithCleanup(cb, allocator, normed_flat, total, kv_dim, raw_overrides.cleanup);
+            const result = try reshape2dOwnedWithCleanup(cb, allocator, normed_flat, total, kv_dim, decode_context, raw_overrides.cleanup);
             if (!v_omitted) freeTensorWithCleanup(cb, V, raw_overrides.cleanup); // V = K when omitted, don't double-free
             break :blk result;
         }
@@ -7314,7 +7306,7 @@ fn decoderBlockImpl(
         Q
     else if (fused_q_rope) |roped_q|
         roped_q
-    else if (try maybeApplyQKHeadNormWithCleanup(cb, allocator, config, Q, total, num_heads * head_dim, layer, "q", head_dim, &name_buf, raw_overrides.cleanup)) |normed_q|
+    else if (try maybeApplyQKHeadNormWithCleanup(cb, allocator, config, Q, total, num_heads * head_dim, layer, "q", head_dim, &name_buf, decode_context, raw_overrides.cleanup)) |normed_q|
         normed_q
     else
         Q;
@@ -7326,7 +7318,7 @@ fn decoderBlockImpl(
     else if (fused_k_rope) |roped_k|
         roped_k
     else if (!shares_kv)
-        if (try maybeApplyQKHeadNormWithCleanup(cb, allocator, config, K, total, num_kv_heads * head_dim, layer, "k", head_dim, &name_buf, raw_overrides.cleanup)) |normed_k|
+        if (try maybeApplyQKHeadNormWithCleanup(cb, allocator, config, K, total, num_kv_heads * head_dim, layer, "k", head_dim, &name_buf, decode_context, raw_overrides.cleanup)) |normed_k|
             normed_k
         else
             K
@@ -8132,10 +8124,10 @@ pub fn maybeApplyQKHeadNorm(
     head_dim: u32,
     buf: *[256]u8,
 ) !?CT {
-    return maybeApplyQKHeadNormWithCleanup(cb, allocator, config, tensor, total_rows, total_dim, layer, proj, head_dim, buf, null);
+    return maybeApplyQKHeadNormWithCleanup(cb, allocator, config, tensor, total_rows, total_dim, layer, proj, head_dim, buf, null, null);
 }
 
-pub fn maybeApplyQKHeadNormWithCleanup(
+fn maybeApplyQKHeadNormWithCleanup(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     config: Config,
@@ -8146,6 +8138,7 @@ pub fn maybeApplyQKHeadNormWithCleanup(
     proj: []const u8,
     head_dim: u32,
     buf: *[256]u8,
+    decode_context: ?*const DecodeContext,
     cleanup: ?*const @import("../execution/cleanup_context.zig").Context,
 ) !?CT {
     switch (config.family) {
@@ -8168,7 +8161,7 @@ pub fn maybeApplyQKHeadNormWithCleanup(
         defer freeTensorWithCleanup(cb, reshaped, cleanup);
         const normed_flat = try cb.rmsNorm(reshaped, adjusted_weight, head_dim, config.norm_eps);
         defer freeTensorWithCleanup(cb, normed_flat, cleanup);
-        return try reshape2dOwnedWithCleanup(cb, allocator, normed_flat, total_rows, total_dim, cleanup);
+        return try reshape2dOwnedWithCleanup(cb, allocator, normed_flat, total_rows, total_dim, decode_context, cleanup);
     }
 
     // CPU fallback (native — rmsNorm handles chunked dim natively).
@@ -8948,18 +8941,19 @@ fn maybeDebugTensorLastRowDiff(
 }
 
 pub fn reshape2dOwned(cb: *const ComputeBackend, allocator: std.mem.Allocator, tensor: CT, rows: usize, cols: usize) !CT {
-    return reshape2dOwnedWithCleanup(cb, allocator, tensor, rows, cols, null);
+    return reshape2dOwnedWithCleanup(cb, allocator, tensor, rows, cols, null, null);
 }
 
-pub fn reshape2dOwnedWithCleanup(
+fn reshape2dOwnedWithCleanup(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     tensor: CT,
     rows: usize,
     cols: usize,
+    decode_context: ?*const DecodeContext,
     cleanup: ?*const @import("../execution/cleanup_context.zig").Context,
 ) !CT {
-    try validateForwardCleanup(cb, cleanup);
+    try validateDecoderForwardCleanup(cb, cleanup, decode_context);
     const shape = [_]i32{ @intCast(rows), @intCast(cols) };
     if (try cb.cloneTensorShape(tensor, &shape)) |cloned| return cloned;
 
@@ -10299,7 +10293,7 @@ pub fn applyAttentionWithCleanup(
     decode_context: ?*const DecodeContext,
     cleanup: ?*const @import("../execution/cleanup_context.zig").Context,
 ) !CT {
-    try validateForwardCleanup(cb, cleanup);
+    try validateDecoderForwardCleanup(cb, cleanup, decode_context);
     return applyAttentionWithSinkWithCleanup(cb, config, Q, K, V, null, batch, seq_len, num_heads, num_kv_heads, head_dim, layer, kv_layer_index, skip_kv_write, decode_context, cleanup);
 }
 
@@ -10494,12 +10488,13 @@ fn runPackedQwenAttention(
     errdefer cb.free(result);
     var offset: usize = 0;
     var index: usize = 0;
+    const max_cuda_packet_rows = @import("../ops/kernel_geometry.zig").cuda_paged_decode_packet_rows;
     while (index < lengths.len) {
         const view = views[index];
         const len = lengths[index];
         var count: usize = 1;
         if (len == 1 and view.per_item_mode == .paged_decode) {
-            while ((cb.kind() != .cuda or count < 64) and index + count < lengths.len and lengths[index + count] == 1 and views[index + count].per_item_mode == .paged_decode) : (count += 1) {}
+            while ((cb.kind() != .cuda or count < max_cuda_packet_rows) and index + count < lengths.len and lengths[index + count] == 1 and views[index + count].per_item_mode == .paged_decode) : (count += 1) {}
         }
         const rows = if (count > 1) count else len;
         const q = try cb.sliceRows2D(a, Q, offset, rows, width);
@@ -10536,9 +10531,13 @@ fn runPackedQwenAttention(
             item.kv_sequence_len = view.per_item_kv_len.?;
             item.kv_position_offset = view.per_item_kv_position_offset.?;
         }
-        const output = try runPreparedAttentionWithSinkMetadata(cb, q, k, v, item, sink, count, num_heads, num_kv_heads, head_dim);
-        defer cb.free(output);
-        if (!try cb.copyRows2D(a, result, offset, output, 0, rows, width)) return error.UnsupportedTensorType;
+        const assigned = cb.kind() == .cuda and count > 1 and !sink.hasMetadata() and
+            try @import("../ops/cuda/cuda_compute.zig").tryCapturedPackedAttentionInto(cb, q, k, v, item, num_heads, num_kv_heads, head_dim, result, offset);
+        if (!assigned) {
+            const output = try runPreparedAttentionWithSinkMetadata(cb, q, k, v, item, sink, count, num_heads, num_kv_heads, head_dim);
+            defer cb.free(output);
+            if (!try cb.copyRows2D(a, result, offset, output, 0, rows, width)) return error.UnsupportedTensorType;
+        }
         if (count > 1) if (context) |dc| {
             if (dc.packed_attention_groups) |counter| counter.* += 1;
             if (dc.packed_attention_rows) |counter| counter.* += count;
@@ -12382,17 +12381,11 @@ fn runGroupedExpertBatchTensor(
     // the pair projection, activation/multiply, down projection, and scatter
     // in one command buffer instead of paying a synchronous submission for
     // every operation. Other MoE layouts retain their existing scheduling.
-    var a4b_frame_active = false;
-    if (cb.kind() == .metal and
-        gemma4_runtime.supportsRuntimeConfig(config) and
-        !cb.decoderRuntimeHasActiveFrame())
-    {
-        a4b_frame_active = try cb.decoderRuntimeBeginFrame();
-        if (a4b_frame_active) {
-            try cb.decoderRuntimeSetActiveFrameRegime(if (total_rows > 1) .prefill else .decode);
-        }
-    }
-    defer if (a4b_frame_active) cb.decoderRuntimeCancelFrame() catch {};
+    const Submission = @import("../execution/submission.zig").Scope;
+    const frame_needed = cb.kind() == .metal and gemma4_runtime.supportsRuntimeConfig(config);
+    var frame: Submission = if (frame_needed) try Submission.begin(cb) else .{ .backend = cb };
+    defer frame.deinit();
+    if (frame.owns) try cb.decoderRuntimeSetActiveFrameRegime(if (total_rows > 1) .prefill else .decode);
 
     const batch_size = grouped.rows.len;
     const input_upload_started_at = monotonicNowNs();
@@ -12516,10 +12509,8 @@ fn runGroupedExpertBatchTensor(
 
     const scattered_ct = (try cb.moeScatterAdd(output_ct, grouped.rows, grouped.route_weights, expert_out_ct, batch_size, hidden_size)) orelse return null;
     debug_timing_stats.moe_grouped_scatter_nanos += @intCast(monotonicNowNs() - scatter_started_at);
-    if (a4b_frame_active) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        a4b_frame_active = false;
-    }
+    errdefer cb.free(scattered_ct);
+    try frame.finish();
     if (enableMoeSyncProfileDebug()) {
         const sync_started_at = monotonicNowNs();
         try cb.evalTensor(scattered_ct);
@@ -13450,6 +13441,13 @@ pub fn getModelEmbeddingWeight(cb: *const ComputeBackend, config: Config, name: 
     return getModelEmbeddingWeightUnprefixed(cb, name);
 }
 
+pub fn getPerLayerEmbeddingWeight(cb: *const ComputeBackend, config: Config) !CT {
+    return getModelEmbeddingWeight(cb, config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
+        error.MissingWeight => getModelEmbeddingWeight(cb, config, "model.embed_tokens_per_layer.weight"),
+        else => err,
+    };
+}
+
 fn getModelEmbeddingWeightUnprefixed(cb: *const ComputeBackend, name: []const u8) !CT {
     return cb.getEmbeddingWeight(name) catch |err| switch (err) {
         error.MissingWeight, error.WeightNotFound => if (modelPrefixStrippedName(name)) |stripped| cb.getEmbeddingWeight(stripped) else err,
@@ -13758,10 +13756,7 @@ pub fn computePleVectors(
 
     // Token-identity path: look up concatenated per-layer token embeddings,
     // then scale by sqrt(ple_dim) (Gemma4TextScaledWordEmbedding).
-    const token_w = getModelEmbeddingWeight(cb, config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
-        error.MissingWeight => try getModelEmbeddingWeight(cb, config, "model.embed_tokens_per_layer.weight"),
-        else => return err,
-    };
+    const token_w = try getPerLayerEmbeddingWeight(cb, config);
     defer cb.free(token_w);
     const token_embd_raw = try cb.embeddingLookup(token_w, input_ids, total, ple_total_dim);
     defer cb.free(token_embd_raw);
@@ -13782,10 +13777,7 @@ pub fn computePleVectorsFromTokenTensor(
     const num_layers: usize = config.num_hidden_layers;
     const ple_total_dim: usize = ple_dim * num_layers;
 
-    const token_w = getModelEmbeddingWeight(cb, config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
-        error.MissingWeight => try getModelEmbeddingWeight(cb, config, "model.embed_tokens_per_layer.weight"),
-        else => return err,
-    };
+    const token_w = try getPerLayerEmbeddingWeight(cb, config);
     defer cb.free(token_w);
 
     if (try computePleVectorsFromTokenEmbeddingTensorPath(cb, allocator, config, token_w, input_token, hidden, total, ple_dim, num_layers, ple_total_dim)) |fused| {
@@ -15672,6 +15664,8 @@ test "Qwen explicit cleanup refuses absent authority before backend or model acc
     // A decode context without a private program uses the same explicit
     // operation requirement, without consulting the poisoned callback table.
     const no_program = DecodeContext{ .total_sequence_len = 1, .query_sequence_len = 1, .kv_sequence_len = 0 };
+    try std.testing.expectError(error.BackendCleanupAuthorityRequired, applyAttentionWithCleanup(&backend, undefined, undefined, undefined, undefined, 0, 0, 0, 0, 0, 0, 0, false, &no_program, &boundary_without_operation));
+    try std.testing.expectError(error.BackendCleanupAuthorityRequired, reshape2dOwnedWithCleanup(&backend, std.testing.allocator, undefined, 0, 0, &no_program, &boundary_without_operation));
     try std.testing.expectError(error.BackendCleanupAuthorityRequired, validateDecoderForwardCleanup(&backend, &boundary_without_operation, &no_program));
     // The ordinary caller without an explicit cleanup stays a no-op here.
     try validateDecoderForwardCleanup(&backend, null, &no_program);

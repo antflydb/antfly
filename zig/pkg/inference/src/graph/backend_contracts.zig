@@ -754,9 +754,13 @@ pub const DecoderRuntimePrepareLinearRequest = struct {
 };
 
 pub const DecoderRuntimeEnsureLinearSlotRequest = struct {
+    pub const ModelSlot = enum { request, reuse, publish };
+
     /// Explicit invocation scope. Zero never authorizes reuse of an unknown
     /// source across independent calls. No ambient/TLS preparation state.
     preparation_scope: u64 = 0,
+    /// Only cold model preparation can publish an immutable F32 slot.
+    model_slot: ModelSlot = .request,
     weight: CT,
     bias: ?CT,
     in_dim: usize,
@@ -930,6 +934,9 @@ pub const DecoderRuntimeApplyScaledAddScaleRequest = struct {
     dim: usize,
     lhs_scale: f32,
     output_scale: f32,
+    /// When present, round both scaled operands before addition. Requires a
+    /// unit output scale. Providers without this route decline before work.
+    rhs_scale: ?f32 = null,
 };
 
 pub const DecoderRuntimeApplyMultiplyAddRequest = struct {
@@ -997,7 +1004,7 @@ pub const AttentionSinkMetadata = struct {
 /// program. The supplying cache and Frame retain the actual K/V capacity CTs.
 pub const DenseAttentionPrefixBinding = struct {
     live_key_rows: usize,
-    mask: []const i64,
+    mask: ?[]const i64 = null,
 };
 
 pub const DenseAttentionRowsBinding = struct { mask: ?[]const i64 = null };

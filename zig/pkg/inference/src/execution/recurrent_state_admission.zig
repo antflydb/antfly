@@ -225,7 +225,7 @@ pub const NativeHostState = struct {
     const Session = @import("../backends/session.zig").Session;
     const Config = @import("../models/gpt.zig").Config;
     const Geometry = @import("../models/qwen35_state_layout.zig").Layout;
-    const State = @import("../graph/decode_state_runtime.zig").NativeDecodeState;
+    const State = @import("decode_state_runtime.zig").NativeDecodeState;
     const Owner = @import("cleanup_owner.zig").Owner;
     const Control = @import("../execution_control.zig").InferenceExecutionControl;
     const Alignment = std.mem.Alignment.of(Gpt.Qwen35LinearLayerState);
@@ -387,7 +387,7 @@ test "Native recurrent cold backing keeps exact child pointers across reset and 
     defer if (live) owner.destroyAfterUnlock() catch unreachable;
     var other = try @import("cleanup_owner.zig").Owner.beginOutsideCleanup();
     defer other.finishAfterUnlock();
-    var state = @import("../graph/decode_state_runtime.zig").NativeDecodeState.initContiguous(a);
+    var state = @import("decode_state_runtime.zig").NativeDecodeState.initContiguous(a);
     var state_live = true;
     defer if (state_live) state.deinitWithCleanup(.{ .boundary = owner.cleanupOwner().epoch() }) catch unreachable;
     try std.testing.expectError(error.ForeignRecurrentStateCleanup, owner.adopt(&state, native_host_test_config, .{ .boundary = other.epoch() }));
@@ -474,12 +474,10 @@ test "Native recurrent header-only cache owns exact cold storage and current B t
     try std.testing.expectEqual(@as(usize, 0), try NativeHostState.requiredBytes(cfg));
 }
 
-test "Native numerical recurrent owner never grants outside raw cleanup authority" {
+test "Native numerical recurrent owner never grants outside cleanup authority" {
     const owner = try NativeHostState.prepareWithAllocator(std.testing.allocator, native_host_test_config);
     defer owner.destroyAfterUnlock() catch unreachable;
-    var pending: @import("resource_retirement.zig").SynchronousOutsideRawLeases = .{};
-    try std.testing.expectError(error.MissingOutsideCleanupOwner, owner.cleanupOwner().synchronousOutsideContext(&pending));
-    try std.testing.expect(pending.boundary_context == null);
+    try std.testing.expectError(error.MissingOutsideCleanupOwner, owner.cleanupOwner().outsideCleanupEpoch());
     try std.testing.expect(!try owner.cleanupOwner().epoch().?.isSealed());
 }
 
@@ -535,7 +533,7 @@ test "independent Native recurrent workers publish copied baselines only from th
             const context = @import("../graph/execution.zig").Context{ .allocator = std.testing.allocator, .cb = &cb, .gpt_config = &self.config, .cleanup_owner = self.host.cleanupOwner(), .diagnostics_binding = .{ .diagnostics = &self.diagnostics } };
             const decode = Gpt.DecodeContext{ .total_sequence_len = 4, .query_sequence_len = 4, .kv_sequence_len = 4, .qwen35_linear_cache = &self.state.qwen35_linear_cache.? };
             var fallbacks: u64 = 0;
-            self.result = try @import("../graph/decoder_step_executor.zig").forwardAll(&context, null, &.{ 1, 2, 3, 4 }, 1, 4, &decode, &fallbacks);
+            self.result = try @import("decoder_step_executor.zig").forwardAll(&context, null, &.{ 1, 2, 3, 4 }, 1, 4, &decode, &fallbacks);
         }
     };
     var workers: [2]Worker = undefined;

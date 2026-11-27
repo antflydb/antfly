@@ -1303,7 +1303,7 @@ pub const ReadingPipeline = struct {
             var source = session_mod.PreparedSource{};
             defer source.deinit();
             const rows = try florence_arch.encoderSequenceLength(florence_cfg, prompt_i64.len);
-            if (try @import("../execution/architecture_session.zig").prepareColdNativeFlorence(self.vision_encoder, allocator, self.execution_control, florence_cfg, rows, self.config.max_length, &run_permit.?)) |cold| {
+            if (try @import("../execution/architecture_session.zig").prepareColdNativeFlorenceWithHostFloor(self.vision_encoder, allocator, self.execution_control, florence_cfg, rows, self.config.max_length, &run_permit.?, try preparation.ownedHostBytesFor(self.vision_encoder))) |cold| {
                 // Frame/provider work retires under actual B; Model/lane then
                 // leave before AA/cache callbacks, and B drains only afterbody.
                 defer {
@@ -1316,7 +1316,7 @@ pub const ReadingPipeline = struct {
                 const initial_token = self.config.decoder_start_token_id;
                 const first_supported = initial_token >= 0 and @as(u64, @intCast(initial_token)) < token_rows;
                 const forced_supported = if (self.config.forced_bos_token_id) |token| self.config.max_length <= 1 or (token >= 0 and @as(u64, @intCast(token)) < token_rows) else true;
-                if (first_supported and forced_supported and try source.initOwningSynchronousTaskPermitBeforeExecutionInto(&run_permit.?, allocator, self.execution_control)) {
+                if (first_supported and forced_supported and try source.initOwningSynchronousTaskPermitWithHostStorage(&run_permit.?, &preparation.owner, allocator, self.execution_control)) {
                     try cold.finishConstructionBeforeExecution(&source);
                     try source.bindExecutionLaneBeforeExecution(self.native_execution_lane, false);
                     try source.enter();
@@ -1677,13 +1677,28 @@ pub const ReadingPipeline = struct {
 
         var numerical = try decoder_stage.Decoder.initWithOptions(allocator, self.decoder, encoder_outputs, enc_seq_len, encoder_attention_mask, stage_runtime.outputVocabulary(self.decoder) orelse 0, self.execution_control, .{ .allow_native = false, .allow_merged = false, .output_rows = .full_prefix });
         defer numerical.deinit();
+        const GreedyPolicy = struct {
+            prefix: []const i64,
+            no_repeat: usize,
+
+            fn accepts(raw: *const anyopaque, token: u32) bool {
+                const self_policy: *const @This() = @ptrCast(@alignCast(raw));
+                return !wouldRepeatNgram(self_policy.prefix, @intCast(token), self_policy.no_repeat);
+            }
+        };
         const decode_loop_start = nowNs();
         var decoder_run_total_ns: u64 = 0;
         var decoder_steps: usize = 0;
         while (dec_len < max_len) {
             const decoder_run_start = nowNs();
             if (self.execution_control) |control| try control.update(.executing, @intCast(dec_len), @intCast(max_len));
-            var row = try numerical.stepFullPrefix(dec_ids[0..dec_len], null);
+            const prefix = dec_ids[0..dec_len];
+            const policy = GreedyPolicy{ .prefix = prefix, .no_repeat = self.config.no_repeat_ngram_size };
+            const needs_debug_logits = decoder_steps < 4 and florenceDebugStats();
+            var row = try numerical.stepFullPrefixSelecting(prefix, null, if (needs_debug_logits) null else .{
+                .context = &policy,
+                .accepts = GreedyPolicy.accepts,
+            });
             defer row.deinit();
             const decoder_run_ns = nowNs() - decoder_run_start;
             decoder_run_total_ns += decoder_run_ns;
@@ -1693,7 +1708,7 @@ pub const ReadingPipeline = struct {
             if (decoder_steps <= 4) logTopLogits("logits(session)", decoder_steps, last_logits);
 
             // Greedy: argmax
-            const best_id = selectGreedyToken(last_logits, dec_ids[0..dec_len], self.config.no_repeat_ngram_size);
+            const best_id: usize = row.token orelse selectGreedyToken(last_logits, prefix, self.config.no_repeat_ngram_size);
 
             // Check for EOS
             if (@as(i32, @intCast(best_id)) == self.config.eos_token_id) break;
@@ -2537,8 +2552,8 @@ test "Florence checked no-repeat argmax keeps logits on Metal and preserves fall
                         const zero_device = (try cb.ensureDeviceResident(zero_host)) orelse return error.DeviceLogitsUnavailable;
                         defer cb.free(zero_device);
                         var owns_frame = try beginFlorenceStepFrame(&cb, frame_mode);
-                        defer if (owns_frame) cb.decoderRuntimeCancelFrame() catch {};
-                        try std.testing.expectEqual(frame_mode, owns_frame);
+                        defer if (owns_frame) |*frame| frame.deinit();
+                        try std.testing.expectEqual(frame_mode, owns_frame != null);
                         const produced = if (frame_mode) blk: {
                             const intermediate = try cb.add(device, zero_device);
                             defer cb.free(intermediate);
@@ -2549,7 +2564,7 @@ test "Florence checked no-repeat argmax keeps logits on Metal and preserves fall
                         var frame_steps: usize = 0;
                         var frame_fallbacks: usize = 0;
                         const selected = (try florenceStepArgmaxRows(&cb, produced, 2, vocab, allocator, &owns_frame, &frame_steps, &frame_fallbacks)) orelse return error.DeviceArgmaxUnavailable;
-                        try std.testing.expect(!owns_frame and !cb.decoderRuntimeHasActiveFrame());
+                        try std.testing.expect(owns_frame == null and !cb.decoderRuntimeHasActiveFrame());
                         try std.testing.expectEqual(@as(usize, @intFromBool(frame_mode)), frame_steps);
                         try std.testing.expectEqual(@as(usize, 0), frame_fallbacks);
                         defer allocator.free(selected);
@@ -2608,7 +2623,7 @@ test "Florence step frame drains unsupported consumers and cancels failed token 
             var fallback_cb = cb;
             fallback_cb.vtable = &fallback_table;
             var owns = try beginFlorenceStepFrame(&fallback_cb, true);
-            defer if (owns) cb.decoderRuntimeCancelFrame() catch {};
+            defer if (owns) |*frame| frame.deinit();
             const produced = try cb.add(device, device);
             defer cb.free(produced);
             var steps: usize = 0;
@@ -2616,16 +2631,16 @@ test "Florence step frame drains unsupported consumers and cancels failed token 
             const selected = (try florenceStepArgmaxRows(&fallback_cb, produced, 2, 4, allocator, &owns, &steps, &fallbacks)).?;
             defer allocator.free(selected);
             try std.testing.expectEqualSlices(u32, &.{ 1, 0 }, selected);
-            try std.testing.expect(!owns and !cb.decoderRuntimeHasActiveFrame());
+            try std.testing.expect(owns == null and !cb.decoderRuntimeHasActiveFrame());
             try std.testing.expectEqual(@as(usize, 0), steps);
             try std.testing.expectEqual(@as(usize, 1), fallbacks);
             {
                 var failed_frame = try beginFlorenceStepFrame(&cb, true);
-                defer if (failed_frame) cb.decoderRuntimeCancelFrame() catch {};
+                defer if (failed_frame) |*frame| frame.deinit();
                 const pending = try cb.add(device, device);
                 defer cb.free(pending);
                 try std.testing.expectError(error.OutOfMemory, florenceStepArgmaxRows(&cb, pending, 2, 4, std.testing.failing_allocator, &failed_frame, &steps, &fallbacks));
-                try std.testing.expect(failed_frame and cb.decoderRuntimeHasActiveFrame());
+                try std.testing.expect(failed_frame != null and cb.decoderRuntimeHasActiveFrame());
             }
             try std.testing.expect(!cb.decoderRuntimeHasActiveFrame());
             var lost_context = LostResult{ .base = cb };
@@ -2635,11 +2650,11 @@ test "Florence step frame drains unsupported consumers and cancels failed token 
             lost_table.regions.decoder.beginPlannedComputeScope = LostResult.scope;
             const lost_cb = ComputeBackend{ .ptr = &lost_context, .vtable = &lost_table };
             var lost_frame = try beginFlorenceStepFrame(&cb, true);
-            defer if (lost_frame) cb.decoderRuntimeCancelFrame() catch {};
+            defer if (lost_frame) |*frame| frame.deinit();
             const lost_logits = try cb.add(device, device);
             defer cb.free(lost_logits);
             try std.testing.expectError(error.FlorenceArgmaxFrameFailed, florenceStepArgmaxRows(&lost_cb, lost_logits, 2, 4, allocator, &lost_frame, &steps, &fallbacks));
-            try std.testing.expect(!lost_frame and !cb.decoderRuntimeHasActiveFrame());
+            try std.testing.expect(lost_frame == null and !cb.decoderRuntimeHasActiveFrame());
         }
     };
     const fixture = @import("../ops/media_residency_test.zig");
@@ -3242,8 +3257,10 @@ test "reading default imported stages keep encoder resident and preserve host re
         defer shared_decoder.close();
         const reference_decoder = try imported.createSessionWithOptions(a, decoder_path, kind, .{ .graph_runtime_strategy = .compiled_preferred });
         defer reference_decoder.close();
-        try std.testing.expect(stage_runtime.supportsResidentPair(encoder, shared_decoder, true));
-        try std.testing.expect(!stage_runtime.supportsResidentPair(encoder, reference_decoder, true));
+        try std.testing.expectEqual(.resident_pair, stage_runtime.residentPairPlacement(encoder, shared_decoder, true));
+        const independent = stage_runtime.residentPairPlacement(encoder, reference_decoder, true);
+        const expected_independent: @TypeOf(independent) = if (kind == .native) .resident_pair else .foreign_context;
+        try std.testing.expectEqual(expected_independent, independent);
         const config = ReadConfig{ .image_size = 1, .image_mean = .{ 0, 0, 0 }, .image_std = .{ 1, 1, 1 }, .max_length = 2, .decoder_start_token_id = 0, .eos_token_id = 1 };
         var candidate = ReadingPipeline.init(a, encoder, shared_decoder, tokenizer, config, null);
         var reference = ReadingPipeline.init(a, encoder, reference_decoder, tokenizer, config, null);
@@ -3259,7 +3276,20 @@ test "reading default imported stages keep encoder resident and preserve host re
         const expected = blk: {
             try audit_mod.begin(&reference_audit);
             defer audit_mod.end();
-            break :blk try reference.readDecoded(.{ .data = &pixels, .width = 1, .height = 1, .channels = 4 });
+            // Request host encoder output explicitly while preserving the
+            // original session's provider and retirement identity.
+            var preparation = reference.preparationScope();
+            defer preparation.deinit();
+            const work = try preparation.allocator();
+            const normalized_pixels = try work.dupe(f32, &.{ 1, 0, 0 });
+            defer work.free(normalized_pixels);
+            var tensor = try preparation.tensor(f32, "pixel_values", &.{ 1, 3, 1, 1 }, normalized_pixels);
+            defer tensor.deinit();
+            var encoder_outputs: stage_runtime.EncoderOutputs = .{
+                .host = try preparation.run(encoder, &.{tensor}, a, null),
+            };
+            defer encoder_outputs.deinit(a);
+            break :blk try reference.decodeFromEncoderOutputs(&encoder_outputs, null, &preparation);
         };
         var owned_expected = expected;
         defer owned_expected.deinit();
@@ -3268,7 +3298,7 @@ test "reading default imported stages keep encoder resident and preserve host re
         try std.testing.expectEqual(expected.completion_tokens, actual.completion_tokens);
         try std.testing.expectEqualStrings("", actual.text);
         if (kind != .native) {
-            try std.testing.expectEqual(@as(u64, 3 * @sizeOf(f32)), candidate_audit.download_bytes);
+            try std.testing.expectEqual(@as(u64, @sizeOf(u32)), candidate_audit.download_bytes);
             try std.testing.expect(reference_audit.download_bytes > candidate_audit.download_bytes);
         }
         const Cancel = struct {
@@ -3322,13 +3352,6 @@ fn nativeFlorencePublicScheduleCase(a: std.mem.Allocator, cold_only: bool, tight
     ;
     const hf = try tokenizer_mod.hf.HfTokenizer.loadFromBytes(std.testing.allocator, tokenizer_data);
     defer hf.deinitSelf();
-    if (tight) {
-        const prompt = try buildFlorencePromptIds(std.testing.allocator, hf.tokenizer(), Fixture.config, "one");
-        defer std.testing.allocator.free(prompt);
-        const request = try nativeFlorenceRunRequest(Fixture.config, 1, 12, prompt.len, 4);
-        const plan = try session.run_admission.?.planRequest(request, session.outputInfo());
-        session.run_admission.?.limits.host_limit_bytes = plan.required.hostTotalBytes();
-    }
     const cfg = ReadConfig{ .image_size = 2, .image_mean = .{ 0, 0, 0 }, .image_std = .{ 1, 1, 1 }, .prompt = "one", .max_length = 4, .decoder_start_token_id = 0, .eos_token_id = 7, .no_repeat_ngram_size = 2 };
     var lane = @import("../execution_control.zig").ExecutionLane{};
     var candidate = ReadingPipeline.init(a, session, session, hf.tokenizer(), cfg, null);
@@ -3341,6 +3364,26 @@ fn nativeFlorencePublicScheduleCase(a: std.mem.Allocator, cold_only: bool, tight
     var expected = try reference.readDecoded(img);
     defer expected.deinit();
     try std.testing.expect(lastReadTelemetry().native_decoder_program == null);
+    if (tight) {
+        // Measure the actual base floor, including the live allocation headers
+        // produced by the public preparation path.
+        const prompt = try buildFlorencePromptIds(a, hf.tokenizer(), Fixture.config, "one");
+        defer a.free(prompt);
+        var request = try nativeFlorenceRunRequest(Fixture.config, 1, 12, prompt.len, cfg.max_length);
+        request.pre_admitted_host_bytes = request.input_bytes;
+        const base = try session.run_admission.?.estimateRequest(request, session.outputInfo());
+        candidate.vision_encoder.run_admission.?.limits.host_limit_bytes = base.hostTotalBytes();
+        var failure = admission_memory.AdmissionFailure{};
+        candidate.execution_control.?.admission_failure = &failure;
+        try std.testing.expectError(error.ResourceLimitExceeded, candidate.readDecoded(img));
+        candidate.execution_control.?.admission_failure = null;
+        const floor = failure.snapshot() orelse return error.MissingFlorenceAdmissionFloor;
+        try std.testing.expectEqual(.host, floor.limit);
+        try std.testing.expectEqual(base.hostTotalBytes(), floor.limit_bytes);
+        try std.testing.expect(floor.requested_bytes > base.hostTotalBytes() + request.input_bytes);
+        candidate.vision_encoder.run_admission.?.limits.host_limit_bytes = floor.requested_bytes;
+        candidate.decoder.run_admission.?.limits.host_limit_bytes = floor.requested_bytes;
+    }
     if (cold_only) {
         const CancelAtModel = struct {
             gate: *std.atomic.Mutex,

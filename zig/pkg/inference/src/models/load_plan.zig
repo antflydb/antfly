@@ -661,12 +661,11 @@ pub fn withNativeAuxiliaryAdmission(man: manifest_mod.ModelManifest, backend: ba
 
 pub fn withNativeAuxiliaryAdmissionForPolicy(man: manifest_mod.ModelManifest, backend: backends.BackendType, base: ModelLoadAdmissionPlan, host_ple: bool) !ModelLoadAdmissionPlan {
     var result = base;
-    // Automatic donor mirrors apply only to the parsed qualified geometry.
-    // Do not inflate every CUDA model's load estimate on the same device.
+    // Admit mirrors from the parsed donor inventory. Automatic mirrors can
+    // fall back under pressure. A requested BF16 plan must fund its storage.
     const native_plan = @import("../execution/gemma4_native_plan.zig");
-    if (backend == .cuda and man.gguf_path != null and
-        native_plan.explicitSelection() == null and native_plan.selected() == .bf16_donors)
-    {
+    if (backend == .cuda and man.gguf_path != null and native_plan.selected() == .bf16_donors) {
+        const explicit = native_plan.explicitSelection() == .bf16_donors;
         const root = man.source_root orelse return error.UnsupportedModelLoadPlan;
         const store = try @import("tensor_store.zig").openFromManifest(man.allocator, man);
         defer {
@@ -674,10 +673,13 @@ pub fn withNativeAuxiliaryAdmissionForPolicy(man: manifest_mod.ModelManifest, ba
             store.deinit();
         }
         const arch = try @import("../architectures/model_definition.zig").detectArchitectureWithGgufFile(man.allocator, root, man, store.ggufFile());
-        if (arch == .gpt and native_plan.automaticArtifact(arch.gpt, store.ggufFile())) {
-            const mirrors = try native_plan.Geometry.resolve(arch.gpt).?.mirroredBf16Bytes(store.ggufFile().?);
-            result.optional_cuda_peak_weight_bytes = mirrors;
-            result.optional_cuda_resident_weight_bytes = mirrors;
+        if (arch == .gpt and (explicit or native_plan.automaticArtifact(arch.gpt, store.ggufFile()))) admitted: {
+            const selected = native_plan.Geometry.resolve(arch.gpt) orelse break :admitted;
+            const mirrors = try selected.mirroredBf16Bytes(store.ggufFile() orelse break :admitted);
+            if (!explicit) {
+                result.optional_cuda_peak_weight_bytes = mirrors;
+                result.optional_cuda_resident_weight_bytes = mirrors;
+            }
             result.peak.backend_weight_bytes = try std.math.add(usize, result.peak.backend_weight_bytes, mirrors);
             result.resident.backend_weight_bytes = try std.math.add(usize, result.resident.backend_weight_bytes, mirrors);
         }
@@ -789,6 +791,14 @@ pub fn estimateBaseModelLoadAdmission(
     laya_packed: bool,
 ) !ModelLoadAdmissionPlan {
     const weights = try estimateModelArtifactBytes(man);
+    if (man.isInkling2()) {
+        if (backend_runtime.backend == .metal)
+            return nativeModelLoadAdmission(weights, .metal, .{});
+        if (backend_runtime.backend != .cuda) return error.UnsupportedBackend;
+        var total = weights;
+        if (man.inkling2_draft_path) |path| try addArtifactBytes(&total, man.allocator, path);
+        return nativeModelLoadAdmission(total, .cuda, .{});
+    }
     if (!manifestHasNativeAssets(man)) return onnxModelLoadAdmission(weights, backend_runtime);
     if (backend_runtime.backend == .pjrt) return pjrtArtifactLoadAdmission(man, backend_runtime.pjrt_memory_policy);
     if (backend_runtime.backend == .metal) {

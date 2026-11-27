@@ -21,12 +21,13 @@ const platform = @import("antfly_platform");
 const ops = @import("../ops/ops.zig");
 const ComputeBackend = ops.ComputeBackend;
 const gpt_arch = @import("../architectures/gpt.zig");
+const decoder_step_executor = @import("decoder_step_executor.zig");
 const graph_mod = @import("../graph/root.zig");
 const metal_runtime = @import("../backends/metal_runtime.zig");
 const decoder_gated_runtime = @import("../backends/decoder_gated_runtime.zig");
 const BorrowedDecodeStateRuntime = graph_mod.decode_state_runtime.BorrowedDecodeStateRuntime;
-const NativeDecodeState = @import("../graph/decode_state_runtime.zig").NativeDecodeState;
-const runWithDecoderRuntimeResetBoundary = graph_mod.decoder_step_executor.runWithDecoderRuntimeResetBoundary;
+const NativeDecodeState = @import("decode_state_runtime.zig").NativeDecodeState;
+const runWithDecoderRuntimeResetBoundary = decoder_step_executor.runWithDecoderRuntimeResetBoundary;
 
 pub const ForwardAllWithHiddenHost = struct {
     allocator: std.mem.Allocator,
@@ -43,12 +44,25 @@ pub const ForwardAllWithHiddenHost = struct {
     }
 };
 
+/// Borrowed result rows. The forward result keeps both tensors alive
+/// until the caller publishes its independent host or backend value.
+pub const DeviceHiddenRows = struct {
+    backend: *const ComputeBackend,
+    hidden: ops.CT,
+    pre_norm_hidden: ?ops.CT,
+    rows: usize,
+};
+
 pub const ForwardAllWithHiddenDevice = struct {
     cb: *const ComputeBackend,
     logits: ops.CT,
     hidden: ops.CT,
     pre_norm_hidden: ops.CT,
     rows: usize,
+
+    pub fn hiddenRows(self: *const ForwardAllWithHiddenDevice) DeviceHiddenRows {
+        return .{ .backend = self.cb, .hidden = self.hidden, .pre_norm_hidden = self.pre_norm_hidden, .rows = self.rows };
+    }
 
     pub fn deinit(self: *ForwardAllWithHiddenDevice) void {
         self.cb.free(self.logits);
@@ -66,6 +80,10 @@ pub const ForwardHiddenDevice = struct {
     greedy_token_id: ?u32 = null,
     prepared_tail_choices: ?[]u32 = null,
     choices_allocator: ?std.mem.Allocator = null,
+
+    pub fn hiddenRows(self: *const ForwardHiddenDevice) DeviceHiddenRows {
+        return .{ .backend = self.cb, .hidden = self.hidden, .pre_norm_hidden = self.pre_norm_hidden, .rows = self.rows };
+    }
 
     pub fn deinit(self: *ForwardHiddenDevice) void {
         self.cb.free(self.hidden);
@@ -170,6 +188,15 @@ pub fn metalDirectTailDefault() bool {
 }
 pub fn metalDirectTailEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_METAL_DIRECT_GREEDY", metalDirectTailDefault());
+}
+
+/// The pipelined Metal ABI requires a paged Gemma decoder with PLE
+/// and both direct-greedy and driver-frame routes enabled.
+pub fn metalPipelinedGreedyAvailable(backend: *const ComputeBackend, model: *const gpt_arch.Config, state: *NativeDecodeState) bool {
+    if (backend.kind() != .metal) return false;
+    var decode = BorrowedDecodeStateRuntime.init(state);
+    return decode.kvView() != null and model.family == .gemma and model.hasPle() and
+        metalDirectTailEnabled() and metal_runtime.pipelinedDecodeFrameEnabled();
 }
 
 /// Task semantics that affect physical device-token placement. The runtime
@@ -325,7 +352,7 @@ pub const Runtime = struct {
     /// this selector neither wraps a second invocation nor publishes a token.
     pub fn pendingCandidate(self: *Runtime, state: *NativeDecodeState, request: PendingCandidateRequest, events: *PendingCandidateEvents) !PendingCandidate {
         if (!request.pure_greedy or request.grammar_active) return .declined;
-        if (try self.pendingTensorCandidate(state, request, events)) |tensor| return .{ .tensor = tensor };
+        if (try self.pendingTensorCandidate(state, request, null, events)) |tensor| return .{ .tensor = tensor };
         events.attempts += 1;
         events.scalar_route = self.deviceRoute(state, .{ .mode = .scalar, .generated_tokens = request.generated_tokens, .pure_greedy = request.pure_greedy, .grammar_active = request.grammar_active });
         if (events.scalar_route.? != .eligible) return .declined;
@@ -345,11 +372,11 @@ pub const Runtime = struct {
     /// physical forward after the pending position has been reserved. The
     /// regular pending selector shares this first attempt before its scalar
     /// fallback; actual route and partial callback events remain caller-owned.
-    pub fn pendingTensorCandidate(self: *Runtime, state: *NativeDecodeState, request: PendingCandidateRequest, events: *PendingCandidateEvents) !?ops.CT {
+    pub fn pendingTensorCandidate(self: *Runtime, state: *NativeDecodeState, request: PendingCandidateRequest, resolved_input_owner: ?*?ops.CT, events: *PendingCandidateEvents) !?ops.CT {
         events.attempts += 1;
         events.tensor_route = self.deviceRoute(state, .{ .mode = .tensor, .generated_tokens = request.generated_tokens, .pure_greedy = request.pure_greedy, .grammar_active = request.grammar_active });
         if (events.tensor_route.? != .eligible) return null;
-        return self.forwardDeviceTokenTensor(state, request.sequence_length, request.input_token_tensor, request.prefetch_drain_budget, &events.handoff);
+        return self.forwardDeviceTokenTensor(state, request.sequence_length, request.input_token_tensor, request.prefetch_drain_budget, resolved_input_owner, &events.handoff);
     }
 
     pub fn forwardDeviceStep(self: *Runtime, state: *NativeDecodeState, request: DeviceStepRequest, events: *DeviceStepEvents) !DeviceStepResult {
@@ -404,11 +431,11 @@ pub const Runtime = struct {
         return .{ .token = .{ .token = try gpt_arch.forwardGreedyLastToken(cb, allocator, model, ids, 1, request.sequence_length, &decode) } };
     }
 
-    pub fn forwardDeviceTokenTensor(self: *Runtime, state: *NativeDecodeState, sequence_length: usize, input: ops.CT, drain_budget: usize, events: *DeviceStepEvents) !?ops.CT {
-        return @import("invocation_observation.zig").callContextOperation(&self.context, .decode_step, @This().forwardDeviceTokenTensorUnobserved, .{ self, state, sequence_length, input, drain_budget, events });
+    pub fn forwardDeviceTokenTensor(self: *Runtime, state: *NativeDecodeState, sequence_length: usize, input: ops.CT, drain_budget: usize, resolved_input_owner: ?*?ops.CT, events: *DeviceStepEvents) !?ops.CT {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .decode_step, @This().forwardDeviceTokenTensorUnobserved, .{ self, state, sequence_length, input, drain_budget, resolved_input_owner, events });
     }
 
-    fn forwardDeviceTokenTensorUnobserved(self: *Runtime, state: *NativeDecodeState, sequence_length: usize, input: ops.CT, drain_budget: usize, events: *DeviceStepEvents) !?ops.CT {
+    fn forwardDeviceTokenTensorUnobserved(self: *Runtime, state: *NativeDecodeState, sequence_length: usize, input: ops.CT, drain_budget: usize, resolved_input_owner: ?*?ops.CT, events: *DeviceStepEvents) !?ops.CT {
         const cb = self.context.cb;
         const model = self.context.gpt_config.*;
         cb.drainPrefetchBudget(drain_budget);
@@ -416,13 +443,14 @@ pub const Runtime = struct {
         var decode = physical.makeDecodeContext(sequence_length, 1);
         try self.context.bindDecoderCleanup(&decode);
         events.handoff_attempts += 1;
-        if (gatedTokenTensorEnabled() and !gpt_arch.cudaDecodeGraphReplayPrefersGraph(self.context.cb)) {
+        const prefer_graph = gpt_arch.cudaDecodeGraphReplayPrefersGraph(cb);
+        if (gatedTokenTensorEnabled() and !prefer_graph) {
             if (try decoder_gated_runtime.forwardGreedyTokenTensorOnlyFromTokenTensor(cb, self.context.allocator, model, model.num_hidden_layers, 0, input, sequence_length, &decode)) |token| {
                 events.handoff_hits += 1;
                 return token;
             }
         }
-        if (try gpt_arch.forwardGreedyLastTokenTensorOnlyFromTokenTensor(cb, self.context.allocator, model, input, 1, sequence_length, &decode)) |token| {
+        if (try gpt_arch.forwardGreedyLastTokenTensorOnlyFromTokenTensor(cb, self.context.allocator, model, input, 1, sequence_length, &decode, if (prefer_graph) resolved_input_owner else null)) |token| {
             events.handoff_hits += 1;
             return token;
         }
@@ -799,7 +827,7 @@ pub const Runtime = struct {
         )) |active_result| {
             var result = active_result;
             defer result.deinit();
-            const activation = try self.dupeTargetHiddenRowFromHiddenDevice(&result, 0, hidden_source);
+            const activation = try self.dupeTargetHiddenRowFromDevice(result.hiddenRows(), 0, hidden_source);
             errdefer self.context.allocator.free(activation);
             return .{
                 .activation = activation,
@@ -825,7 +853,7 @@ pub const Runtime = struct {
                     hidden_source,
                 );
             defer result.deinit();
-            const activation = try self.dupeTargetHiddenRowFromHiddenDevice(&result, 0, hidden_source);
+            const activation = try self.dupeTargetHiddenRowFromDevice(result.hiddenRows(), 0, hidden_source);
             errdefer self.context.allocator.free(activation);
             return .{
                 .activation = activation,
@@ -839,7 +867,7 @@ pub const Runtime = struct {
             &decode_context,
         );
         defer result.deinit();
-        const activation = try self.dupeTargetHiddenRowFromDevice(&result, 0, hidden_source);
+        const activation = try self.dupeTargetHiddenRowFromDevice(result.hiddenRows(), 0, hidden_source);
         errdefer self.context.allocator.free(activation);
         return .{
             .activation = activation,
@@ -880,7 +908,7 @@ pub const Runtime = struct {
         )) |active_result| {
             var result = active_result;
             defer result.deinit();
-            const activation = try self.copyTargetHiddenRowFromHiddenToBackend(&result, 0, hidden_source, dst_cb);
+            const activation = try self.copyTargetHiddenRowToBackend(result.hiddenRows(), 0, hidden_source, dst_cb);
             errdefer if (activation) |tensor| dst_cb.free(tensor);
             return .{
                 .activation = activation,
@@ -906,7 +934,7 @@ pub const Runtime = struct {
                     hidden_source,
                 );
             defer result.deinit();
-            const activation = try self.copyTargetHiddenRowFromHiddenToBackend(&result, 0, hidden_source, dst_cb);
+            const activation = try self.copyTargetHiddenRowToBackend(result.hiddenRows(), 0, hidden_source, dst_cb);
             errdefer if (activation) |tensor| dst_cb.free(tensor);
             return .{
                 .activation = activation,
@@ -920,7 +948,7 @@ pub const Runtime = struct {
             &decode_context,
         );
         defer result.deinit();
-        const activation = try self.copyTargetHiddenRowToBackend(&result, 0, hidden_source, dst_cb);
+        const activation = try self.copyTargetHiddenRowToBackend(result.hiddenRows(), 0, hidden_source, dst_cb);
         errdefer if (activation) |tensor| dst_cb.free(tensor);
         return .{
             .activation = activation,
@@ -930,7 +958,7 @@ pub const Runtime = struct {
 
     fn forwardAllLogits(self: *Runtime, input_ids: []const i64, batch: usize, seq_len: usize, decode_context: *const gpt_arch.DecodeContext) ![]f32 {
         var fallback_count: u64 = 0;
-        return graph_mod.decoder_step_executor.forwardAll(&self.context, self.graph_cache, input_ids, batch, seq_len, decode_context, self.replay_fallbacks orelse &fallback_count);
+        return decoder_step_executor.forwardAll(&self.context, self.graph_cache, input_ids, batch, seq_len, decode_context, self.replay_fallbacks orelse &fallback_count);
     }
 
     /// Reserve the real predictor verify suffix before deriving its query.
@@ -1098,7 +1126,7 @@ pub const Runtime = struct {
         // per-op host overhead. Escape hatch:
         // ANTFLY_INFERENCE_CUDA_REPLAY_LAST_LOGITS=0.
         if (self.context.cb.kind() == .cuda and cudaReplayLastLogitsEnabled()) {
-            if (gpt_arch.forwardLastLogitsWithCudaReplay(
+            if (gpt_arch.forwardLastLogitsFromTokens(
                 self.context.cb,
                 self.context.allocator,
                 self.context.gpt_config.*,
@@ -1116,6 +1144,19 @@ pub const Runtime = struct {
                     .{@errorName(err)},
                 );
             }
+        }
+
+        if (self.context.cb.kind() == .native and batch == 1 and query_seq_len > 1) {
+            return gpt_arch.forwardLastLogitsFromTokens(
+                self.context.cb,
+                self.context.allocator,
+                self.context.gpt_config.*,
+                input_ids,
+                batch,
+                seq_len,
+                decode_context,
+                "gpt.standard_last_logits",
+            );
         }
 
         const logits = try gpt_arch.forward(self.context.cb, self.context.allocator, self.context.gpt_config.*, input_ids, batch, seq_len, decode_context);
@@ -1791,9 +1832,19 @@ pub const Runtime = struct {
         return try self.context.allocator.dupe(f32, hidden[row * hidden_size ..][0..hidden_size]);
     }
 
+    fn targetHiddenRow(self: *Runtime, result: DeviceHiddenRows, row: usize, source: HiddenSource) !ops.CT {
+        if (result.backend.ptr != self.context.cb.ptr or result.backend.vtable != self.context.cb.vtable) return error.ForeignPreparedRows;
+        if (row >= result.rows) return error.InvalidTensorShape;
+        const hidden = switch (source) {
+            .final => result.hidden,
+            .pre_norm => result.pre_norm_hidden orelse return error.MissingMaterializedHiddenState,
+        };
+        return self.context.cb.sliceRows2D(self.context.allocator, hidden, row, 1, self.context.gpt_config.hidden_size);
+    }
+
     pub fn dupeTargetHiddenRowFromDevice(
         self: *Runtime,
-        result: *const ForwardAllWithHiddenDevice,
+        result: DeviceHiddenRows,
         row: usize,
         source: HiddenSource,
     ) ![]f32 {
@@ -1802,56 +1853,21 @@ pub const Runtime = struct {
 
     fn dupeTargetHiddenRowFromDeviceUnobserved(
         self: *Runtime,
-        result: *const ForwardAllWithHiddenDevice,
+        result: DeviceHiddenRows,
         row: usize,
         source: HiddenSource,
     ) ![]f32 {
-        const hidden_size: usize = @intCast(self.context.gpt_config.*.hidden_size);
-        if (row >= result.rows) return error.InvalidTensorShape;
-        const hidden = switch (source) {
-            .final => result.hidden,
-            .pre_norm => result.pre_norm_hidden,
-        };
-        const row_ct = try self.context.cb.sliceRows2D(self.context.allocator, hidden, row, 1, hidden_size);
+        const row_ct = try self.targetHiddenRow(result, row, source);
         defer self.context.cb.free(row_ct);
         const row_host = try self.context.cb.toFloat32(row_ct, self.context.allocator);
         errdefer self.context.allocator.free(row_host);
-        if (row_host.len != hidden_size) return error.InvalidTensorShape;
-        return row_host;
-    }
-
-    pub fn dupeTargetHiddenRowFromHiddenDevice(
-        self: *Runtime,
-        result: *const ForwardHiddenDevice,
-        row: usize,
-        source: HiddenSource,
-    ) ![]f32 {
-        return @import("invocation_observation.zig").callContextOperation(&self.context, .forward, @This().dupeTargetHiddenRowFromHiddenDeviceUnobserved, .{ self, result, row, source });
-    }
-
-    fn dupeTargetHiddenRowFromHiddenDeviceUnobserved(
-        self: *Runtime,
-        result: *const ForwardHiddenDevice,
-        row: usize,
-        source: HiddenSource,
-    ) ![]f32 {
-        const hidden_size: usize = @intCast(self.context.gpt_config.*.hidden_size);
-        if (row >= result.rows) return error.InvalidTensorShape;
-        const hidden = switch (source) {
-            .final => result.hidden,
-            .pre_norm => result.pre_norm_hidden orelse return error.MissingMaterializedHiddenState,
-        };
-        const row_ct = try self.context.cb.sliceRows2D(self.context.allocator, hidden, row, 1, hidden_size);
-        defer self.context.cb.free(row_ct);
-        const row_host = try self.context.cb.toFloat32(row_ct, self.context.allocator);
-        errdefer self.context.allocator.free(row_host);
-        if (row_host.len != hidden_size) return error.InvalidTensorShape;
+        if (row_host.len != self.context.gpt_config.hidden_size) return error.InvalidTensorShape;
         return row_host;
     }
 
     pub fn copyTargetHiddenRowToBackend(
         self: *Runtime,
-        result: *const ForwardAllWithHiddenDevice,
+        result: DeviceHiddenRows,
         row: usize,
         source: HiddenSource,
         dst_cb: *const ComputeBackend,
@@ -1861,48 +1877,14 @@ pub const Runtime = struct {
 
     fn copyTargetHiddenRowToBackendUnobserved(
         self: *Runtime,
-        result: *const ForwardAllWithHiddenDevice,
+        result: DeviceHiddenRows,
         row: usize,
         source: HiddenSource,
         dst_cb: *const ComputeBackend,
     ) !?ops.CT {
-        const hidden_size: usize = @intCast(self.context.gpt_config.*.hidden_size);
-        if (row >= result.rows) return error.InvalidTensorShape;
-        const hidden = switch (source) {
-            .final => result.hidden,
-            .pre_norm => result.pre_norm_hidden,
-        };
-        const row_ct = try self.context.cb.sliceRows2D(self.context.allocator, hidden, row, 1, hidden_size);
+        const row_ct = try self.targetHiddenRow(result, row, source);
         defer self.context.cb.free(row_ct);
-        return try dst_cb.copyTensorFromBackend(self.context.cb, row_ct);
-    }
-
-    pub fn copyTargetHiddenRowFromHiddenToBackend(
-        self: *Runtime,
-        result: *const ForwardHiddenDevice,
-        row: usize,
-        source: HiddenSource,
-        dst_cb: *const ComputeBackend,
-    ) !?ops.CT {
-        return @import("invocation_observation.zig").callContextOperation(&self.context, .forward, @This().copyTargetHiddenRowFromHiddenToBackendUnobserved, .{ self, result, row, source, dst_cb });
-    }
-
-    fn copyTargetHiddenRowFromHiddenToBackendUnobserved(
-        self: *Runtime,
-        result: *const ForwardHiddenDevice,
-        row: usize,
-        source: HiddenSource,
-        dst_cb: *const ComputeBackend,
-    ) !?ops.CT {
-        const hidden_size: usize = @intCast(self.context.gpt_config.*.hidden_size);
-        if (row >= result.rows) return error.InvalidTensorShape;
-        const hidden = switch (source) {
-            .final => result.hidden,
-            .pre_norm => result.pre_norm_hidden orelse return error.MissingMaterializedHiddenState,
-        };
-        const row_ct = try self.context.cb.sliceRows2D(self.context.allocator, hidden, row, 1, hidden_size);
-        defer self.context.cb.free(row_ct);
-        return try dst_cb.copyTensorFromBackend(self.context.cb, row_ct);
+        return dst_cb.copyTensorFromBackend(self.context.cb, row_ct);
     }
 
     pub fn graphForward(
@@ -2412,6 +2394,16 @@ fn checkPhysicalLogitRowSelection(backend_value: ops.ComputeBackend, _: ops.Comp
     defer backend.free(logits);
     var numerical = Runtime{ .context = .{ .allocator = a, .cb = backend, .gpt_config = &config } };
     const rows = ForwardAllWithHiddenDevice{ .cb = backend, .logits = logits, .hidden = logits, .pre_norm_hidden = logits, .rows = 3 };
+    const pre_norm = try numerical.dupeTargetHiddenRowFromDevice(rows.hiddenRows(), 1, .pre_norm);
+    defer a.free(pre_norm);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 5, 4, 0 }, pre_norm);
+    const hidden_only = ForwardHiddenDevice{ .cb = backend, .hidden = logits, .pre_norm_hidden = null, .rows = 3 };
+    try std.testing.expectError(error.MissingMaterializedHiddenState, numerical.dupeTargetHiddenRowFromDevice(hidden_only.hiddenRows(), 1, .pre_norm));
+    var foreign_backend = backend_value;
+    foreign_backend.ptr = @ptrFromInt(8);
+    var foreign_rows = hidden_only.hiddenRows();
+    foreign_rows.backend = &foreign_backend;
+    try std.testing.expectError(error.ForeignPreparedRows, numerical.dupeTargetHiddenRowFromDevice(foreign_rows, 1, .final));
     const choices = (try numerical.greedyLogitRows(logits, 1, 2)) orelse return error.MissingLogitChoices;
     defer a.free(choices);
     try std.testing.expectEqualSlices(u32, &.{ 1, 3 }, choices);
@@ -2559,7 +2551,7 @@ fn checkActualPendingCandidate(cb_value: ComputeBackend, _: ComputeBackend) !voi
     var events = PendingCandidateEvents{};
     const request = PendingCandidateRequest{ .token_ids = &.{ 0, 1 }, .sequence_length = 2, .generated_tokens = 1, .input_token_tensor = input, .pure_greedy = true, .grammar_active = false };
     var tensor_events = PendingCandidateEvents{};
-    try std.testing.expect(try numerical.pendingTensorCandidate(&state, request, &tensor_events) == null);
+    try std.testing.expect(try numerical.pendingTensorCandidate(&state, request, null, &tensor_events) == null);
     try std.testing.expectEqual(@as(usize, 1), tensor_events.attempts);
     try std.testing.expectEqual(DeviceRoute.backend_not_device, tensor_events.tensor_route.?);
     try std.testing.expect(tensor_events.scalar_route == null);
@@ -2699,12 +2691,12 @@ fn checkActualCudaPendingCandidates(cb_value: ComputeBackend, _: ComputeBackend)
     var original_tensor_events = PendingCandidateEvents{ .attempts = 1 };
     original_tensor_events.tensor_route = numerical.deviceRoute(&state, .{ .mode = .tensor, .generated_tokens = 1, .pure_greedy = true, .grammar_active = false });
     const original_tensor = if (original_tensor_events.tensor_route.? == .eligible)
-        try numerical.forwardDeviceTokenTensor(&state, 2, input, request.prefetch_drain_budget, &original_tensor_events.handoff)
+        try numerical.forwardDeviceTokenTensor(&state, 2, input, request.prefetch_drain_budget, null, &original_tensor_events.handoff)
     else
         null;
     defer if (original_tensor) |tensor| cb.free(tensor);
     var lookahead_events = PendingCandidateEvents{};
-    const lookahead = try numerical.pendingTensorCandidate(&state, request, &lookahead_events);
+    const lookahead = try numerical.pendingTensorCandidate(&state, request, null, &lookahead_events);
     defer if (lookahead) |tensor| cb.free(tensor);
     try std.testing.expectEqualDeep(original_tensor_events, lookahead_events);
     try std.testing.expectEqual(@as(usize, 1), lookahead_events.attempts);
@@ -2722,7 +2714,7 @@ fn checkActualCudaPendingCandidates(cb_value: ComputeBackend, _: ComputeBackend)
     original_events.tensor_route = numerical.deviceRoute(&state, .{ .mode = .tensor, .generated_tokens = 1, .pure_greedy = true, .grammar_active = false });
     var original: PendingCandidate = .declined;
     if (original_events.tensor_route.? == .eligible) {
-        if (try numerical.forwardDeviceTokenTensor(&state, 2, input, request.prefetch_drain_budget, &original_events.handoff)) |tensor| original = .{ .tensor = tensor };
+        if (try numerical.forwardDeviceTokenTensor(&state, 2, input, request.prefetch_drain_budget, null, &original_events.handoff)) |tensor| original = .{ .tensor = tensor };
     }
     if (original == .declined) {
         original_events.attempts += 1;

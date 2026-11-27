@@ -84,15 +84,24 @@ pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile 
     // Other host/target, backend and optimization profiles keep their claims.
     // HTTP-only ReleaseSmall with Metal measured a 4.46 GiB build-tree
     // peak on an M4, under a 10 GiB watchdog with no additional swap.
-    // Other optimization modes retain the broader Metal allowance.
-    const http_default_memory_gib: usize = if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal)
+    // Native unstripped ReleaseFast with Metal peaked at 22.16 GB on
+    // arm64 macOS during LightOnOCR qualification. Reserve 26 GiB with
+    // 25 percent headroom. Other Metal profiles retain their claims.
+    const native_metal_http_unstripped = ctx.b.graph.host.result.os.tag == .macos and
+        ctx.b.graph.host.result.cpu.arch == .aarch64 and ctx.target.result.os.tag == .macos and
+        ctx.target.result.cpu.arch == .aarch64 and ctx.backend.enable_metal and ctx.optimize == .fast and !ctx.strip;
+    const http_default_memory_gib: usize = if (native_metal_http_unstripped)
+        26
+    else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal)
         (if (ctx.optimize == .small) 10 else 14)
     else if (ctx.hasAccelerator()) 8 else 6;
-    // Zig 0.17 CUDA measured 12.08 GB stripped on GB10/aarch64 and
-    // 12.69 GB unstripped on x86_64/L4. Reserve 14 GiB for these profiles.
-    const linux_cuda_http_release = ctx.target.result.os.tag == .linux and
-        (ctx.target.result.cpu.arch == .x86_64 or (ctx.target.result.cpu.arch == .aarch64 and ctx.strip)) and
-        ctx.backend.enable_cuda and ctx.optimize == .fast;
+    // GB10/aarch64 ReleaseFast with stripping peaked at 15.05 GB in
+    // the current CUDA reader build. Keep the measured x86_64/L4 claim.
+    const aarch64_cuda_http_stripped = ctx.target.result.os.tag == .linux and
+        ctx.target.result.cpu.arch == .aarch64 and ctx.backend.enable_cuda and
+        ctx.optimize == .fast and ctx.strip;
+    const x86_cuda_http_release = ctx.target.result.os.tag == .linux and
+        ctx.target.result.cpu.arch == .x86_64 and ctx.backend.enable_cuda and ctx.optimize == .fast;
     // Native F32 HTTP-only ReleaseFast/strip on GB10/aarch64 measured a
     // 10.84 GB compiler peak. ReleaseSmall/strip also measured 9.55 GB
     // on ARM64 Linux; its old 6 GiB claim rejected successful compilation.
@@ -101,7 +110,11 @@ pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile 
     const aarch64_cpu_http_release = ctx.target.result.os.tag == .linux and
         ctx.target.result.cpu.arch == .aarch64 and !ctx.hasAccelerator() and
         (ctx.optimize == .fast or ctx.optimize == .small) and ctx.strip;
-    const http_compile_memory_mb: usize = if (native_cpu_http_release) 3840 else if (linux_cuda_http_release) 14 * 1024 else if (aarch64_cpu_http_release) 13 * 1024 else http_default_memory_gib * 1024;
+    // GB10/aarch64 CUDA ReleaseFast without stripping measured 26.84 GB.
+    const aarch64_cuda_http_unstripped = ctx.target.result.os.tag == .linux and
+        ctx.target.result.cpu.arch == .aarch64 and ctx.backend.enable_cuda and
+        ctx.optimize == .fast and !ctx.strip;
+    const http_compile_memory_mb: usize = if (native_cpu_http_release) 3840 else if (aarch64_cuda_http_unstripped) 32 * 1024 else if (aarch64_cuda_http_stripped) 15 * 1024 else if (x86_cuda_http_release) 14 * 1024 else if (aarch64_cpu_http_release) 13 * 1024 else http_default_memory_gib * 1024;
     const http_server = b.addExecutable(.{
         .name = "antfly-inference-http-server",
         .max_rss = http_compile_memory_mb * 1024 * 1024,
@@ -121,6 +134,20 @@ pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile 
     const install_http_server = b.addInstallArtifact(http_server, .{});
     const http_server_step = ctx.step("http-server", "Build the constrained production HTTP-only server");
     http_server_step.dependOn(&install_http_server.step);
+
+    if (ctx.backend.enable_cuda) {
+        const inkling_root = b.createModule(.{
+            .root_source_file = ctx.path("src/inkling2_generate.zig"),
+            .target = ctx.target,
+            .optimize = ctx.optimize,
+            .link_libc = ctx.backend.link_libc,
+        });
+        var imports = ctx.graph.inference_mod.import_table.iterator();
+        while (imports.next()) |entry| inkling_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+        const inkling = b.addExecutable(.{ .name = "antfly-inference-inkling2-cuda", .root_module = inkling_root });
+        const install_inkling = b.addInstallArtifact(inkling, .{});
+        ctx.step("inkling2-cuda", "Build the native CUDA Inkling 2 generator").dependOn(&install_inkling.step);
+    }
 
     return exe;
 }

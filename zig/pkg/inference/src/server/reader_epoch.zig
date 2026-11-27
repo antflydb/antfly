@@ -24,6 +24,7 @@ const reader_execution_pool = @import("reader_execution_pool.zig");
 const execution_control_mod = @import("../execution_control.zig");
 const executor_microbatch = @import("executor_microbatch.zig");
 const generation = @import("../pipelines/generation.zig");
+const decoder_storage = @import("../execution/decoder_storage.zig");
 const session_factory = @import("../architectures/session_factory.zig");
 const metal_runtime = @import("../backends/metal_runtime.zig");
 const qwen3vl_projector = @import("../architectures/qwen3vl_projector.zig");
@@ -208,7 +209,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                 const policy = session.run_admission orelse return;
                 const model = session.model_lifetime orelse return;
                 if (self.control.native_call_policy == .require_supervision and model.close_protection == null) return;
-                const config = generation.requestKvManagerPoolConfig(generation.kvPoolConfig(if (session.backend() == .cuda) .cuda else .metal, dtype, self.cfg, Hooks.generationKvSlidingTrimForced()));
+                const config = decoder_storage.requestMetadataPool(decoder_storage.poolPlan(if (session.backend() == .cuda) .cuda else .metal, dtype, &self.cfg, .{ .force_sliding_trim = decoder_storage.slidingTrimForced() }));
                 // Cyclic/selected stores require separate proven owners. This
                 // path describes only full-history ordinary request storage.
                 if (config.sliding_window_size != null) return;
@@ -311,7 +312,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             ctx.coordinator.setPolicy(factory.node.lightOnOcrPolicy(factory.physical_rows_limit));
             if (factory.features.packed_mixed) {
                 ctx.coordinator.policy.max_step_prefill_items = factory.features.packed_prefill_items;
-                ctx.coordinator.policy.max_step_query_tokens = generation.NativeGenerationPipeline.max_prepared_qwen_prefill_rows;
+                ctx.coordinator.policy.max_step_query_tokens = @import("../execution/decoder_routes.zig").max_positioned_prefill_rows;
             }
             ctx.execution_gate_wait_ns = if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_DISABLE_GATE_PARK")) 0 else @as(u64, @min(ctx.coordinator.policy.contention_wait_us, 1000)) * std.time.ns_per_us;
             ctx.phase_wait_ns = if ((factory.cuda_batch_enabled and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHASE_PARK")) or metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_PHASE_PARK")) ctx.execution_gate_wait_ns else 0;
@@ -320,10 +321,6 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             // Keep the latency-oriented default; bulk-throughput profiles can
             // prioritize runnable prefills to fill the physical decode batch.
             ctx.coordinator.max_decode_streak_before_prefill = factory.features.prefill_decode_streak;
-            if (comptime build_options.enable_cuda) if (factory.model.session.backend() == .cuda) {
-                ctx.captured_root_slots = try a.alloc(@import("../ops/cuda/cuda_compute.zig").CudaCompute.CapturedCacheRoots.Slot, try std.math.add(usize, 2, try std.math.mul(usize, factory.cfg.num_hidden_layers, 4)));
-                @memset(ctx.captured_root_slots, .{});
-            };
             if (comptime build_options.enable_metal) if (factory.model.session.backend() == .metal) {
                 ctx.metal_park = try @import("../ops/metal_compute.zig").MetalCompute.ReaderEpochPark.prepare();
                 // Exact authored metadata declaration (two C arrays + process
@@ -371,8 +368,11 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                 if (comptime build_options.enable_cuda) if (cleanup.epoch() != null) {
                     norms = try factory.prepareNorm();
                     if (norms) |value| {
-                        ctx.captured_roots = try @import("../ops/cuda/cuda_compute.zig").CudaCompute.CapturedCacheRoots.init(ctx.captured_root_slots, value.normRequests());
-                        try ctx.prepareLegacyQuotasOutside(value);
+                        const Roots = @import("../ops/cuda/cuda_compute.zig").CudaCompute.CapturedCacheRoots;
+                        const requests = value.normRequests();
+                        if (ctx.captured_root_slots.len != requests.len)
+                            ctx.captured_root_slots = try a.realloc(ctx.captured_root_slots, requests.len);
+                        ctx.captured_roots = try Roots.init(ctx.captured_root_slots, requests);
                     }
                 };
                 lane = try factory.model.native_reader_execution_lane.acquire(factory.control);
@@ -381,7 +381,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                 model_owned = true;
                 try ctx.enterSessionCohort(factory.control);
                 if (comptime build_options.enable_cuda) if (norms) |value| {
-                    ctx.validateNormsAndLegacyQuotas(value) catch |err| {
+                    value.validateForCohort(ctx.model.session, &ctx.cohort_waiter) catch |err| {
                         if (err != error.PreparedCachePlanChanged) return err;
                         // No ctx/consumer/bank adoption or numerical SDK work
                         // exists yet. Retry only after BOTH real lanes leave.
@@ -390,10 +390,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                         model_owned = false;
                         lane.release();
                         lane_owned = false;
-                        if (comptime build_options.enable_cuda) if (ctx.captured_roots) |*roots| {
-                            roots.finishLegacyPreparationOutside();
-                            ctx.captured_roots = null;
-                        };
+                        ctx.captured_roots = null;
                         value.finishAfterUnlock(cleanup.epoch());
                         norms = null;
                         continue;
@@ -416,7 +413,6 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
         }
         fn destroyUnpublished(ctx: *LightOnStreamContext) void {
             if (comptime build_options.enable_cuda) {
-                if (ctx.captured_roots) |*roots| roots.finishLegacyPreparationOutside();
                 ctx.allocator.free(ctx.captured_root_slots);
             }
             if (comptime build_options.enable_metal) if (ctx.metal_park) |*park| park.deinit();
@@ -564,7 +560,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             // not ctx's now-empty getter. Destroy captured addresses BEFORE KV
             // teardown invokes strict raw recycle callbacks.
             if (comptime build_options.enable_cuda) if (ctx.cb) |*cb| if (cb.kind() == .cuda) {
-                @import("../ops/cuda/cuda_compute.zig").CudaCompute.invalidateLightOnDecodeGraphWithCleanup(cb, .{ .boundary = cleanup_epoch, .operation = cb.operationToken() }) catch platform.inference_process_supervisor.restartWorker();
+                @import("../ops/cuda/cuda_compute.zig").CudaCompute.invalidateLightOnDecodeGraphWithCleanup(cb, .{ .boundary = cleanup_epoch, .operation = cb.operationToken() }, .reader_epoch) catch platform.inference_process_supervisor.restartWorker();
             };
             if (ctx.cb != null) ctx.storage.deinitWithBoundary(cleanup_epoch);
             ctx.manager.deinit();
@@ -627,7 +623,6 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             if (comptime build_options.enable_cuda) {
                 // Roots died under current B above. Only inert unused cold
                 // metadata remains; release it after every actual gate left.
-                for (ctx.captured_root_slots) |*slot| if (slot.upgrade) |*upgrade| upgrade.deinitOutsideExecution();
                 ctx.allocator.free(ctx.captured_root_slots);
             }
             ctx.allocator.destroy(ctx);
@@ -657,7 +652,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
         /// it under the same lane as its producer, before the page/epoch dies.
         pub fn retireProjected(ctx: *LightOnStreamContext, projected: *qwen3vl_projector.ProjectedImages) void {
             if (projected.device_embeddings != null) {
-                ctx.lockStepForCleanup();
+                ctx.lockStepForCleanup(.projected_image_cleanup);
                 defer ctx.unlockStep();
                 projected.deinitWithCleanup(.{ .boundary = ctx.cleanup_owner.epoch(), .operation = if (ctx.cb) |*backend| backend.operationToken() else null });
             } else projected.deinit();
@@ -686,7 +681,9 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                 if (comptime build_options.enable_cuda) {
                     const before = self.before orelse return;
                     self.before = null;
-                    ctx.lockStepForCleanup();
+                    // The snapshot drains profiling events while holding
+                    // the real step. It does not replace graph backing.
+                    ctx.pageAccess(.{}, true).acquireForCleanup();
                     defer ctx.unlockStep();
                     const after = page.cudaProfileSnapshot(ctx) catch |err| {
                         std.log.warn("cuda_read_profile: status=unavailable reason={s} request_outcome={s}", .{ @errorName(err), if (complete) "complete" else "partial" });
@@ -728,7 +725,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
 
         pub fn lockStep(ctx: *LightOnStreamContext, control: InferenceExecutionControl) !void {
             try ctx.pageAccess(control, true).acquire();
-            ctx.invalidateCudaDecodeGraph();
+            ctx.invalidateCudaDecodeGraph(.foreground_step);
         }
         // Private park/restore owner only: it already owns the pause reservation.
         // This method neither invalidates the graph nor waits on its OWN pause.
@@ -742,16 +739,36 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             access.pause = null;
             access.acquireForCleanup();
         }
-        fn invalidateCudaDecodeGraph(ctx: *LightOnStreamContext) void {
+        fn invalidateCudaDecodeGraph(ctx: *LightOnStreamContext, reason: @import("../ops/cuda/cuda_compute.zig").CudaCompute.GraphRetirement) void {
             // Vision and other foreground phases may resize shared CUDA
             // scratch. Retire captured addresses before that phase executes.
             if (comptime build_options.enable_cuda) if (ctx.cb) |*cb| if (cb.kind() == .cuda) {
-                @import("../ops/cuda/cuda_compute.zig").CudaCompute.invalidateLightOnDecodeGraphWithCleanup(cb, .{ .boundary = ctx.cleanup_owner.epoch(), .operation = cb.operationToken() }) catch platform.inference_process_supervisor.restartWorker();
+                @import("../ops/cuda/cuda_compute.zig").CudaCompute.invalidateLightOnDecodeGraphWithCleanup(cb, .{ .boundary = ctx.cleanup_owner.epoch(), .operation = cb.operationToken() }, reason) catch platform.inference_process_supervisor.restartWorker();
             };
         }
-        pub fn lockStepForCleanup(ctx: *LightOnStreamContext) void {
+        pub fn lockStepForCleanup(ctx: *LightOnStreamContext, reason: @import("../ops/cuda/cuda_compute.zig").CudaCompute.GraphRetirement) void {
             ctx.pageAccess(.{}, true).acquireForCleanup();
-            ctx.invalidateCudaDecodeGraph();
+            ctx.invalidateCudaDecodeGraph(reason);
+        }
+        pub fn releasePageBudget(ctx: *LightOnStreamContext, reserved: runtime.tier.memory.AdmissionAmounts) void {
+            ctx.pageAccess(.{}, true).acquireForCleanup();
+            defer ctx.unlockStep();
+            // Only the reader's budget counters change here. The state
+            // and its device allocations retire under their own cleanup.
+            ctx.budget.host_kv_bytes -= reserved.host_kv_bytes;
+            ctx.budget.backend_kv_bytes -= reserved.backend_kv_bytes;
+            ctx.budget.host_scratch_bytes -= reserved.host_scratch_bytes;
+            ctx.budget.backend_scratch_bytes -= reserved.backend_scratch_bytes;
+        }
+        pub fn finishVisionPublication(ctx: *LightOnStreamContext, publication: *@import("../execution/architecture_session.zig").PreparedComputeAdmission.SupplementalStorage) void {
+            ctx.pageAccess(.{}, true).acquireForCleanup();
+            defer ctx.unlockStep();
+            // The independently admitted image bank belongs to the
+            // prefill input. Decode captures bind token and state buffers.
+            publication.finish(.{
+                .boundary = ctx.cleanup_owner.epoch(),
+                .operation = if (ctx.cb) |*backend| backend.operationToken() else null,
+            });
         }
         pub fn unlockStep(ctx: *LightOnStreamContext) void {
             ctx.step_mutex.unlock();
@@ -795,7 +812,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                         if (ctx.cb) |*cb| try self.cuda.prepareRestore(cb, norms.expectedCudaCompute());
                         const Resume = struct {
                             fn run(owner: *LightOnStreamContext, preparation: *NormPreparation) !void {
-                                try owner.validateNormsAndLegacyQuotas(preparation);
+                                try preparation.validateForCohort(owner.model.session, &owner.cohort_waiter);
                                 try preparation.resumeRequestForCohort(owner.model.session, &owner.cohort_waiter, if (owner.cb) |*cb| cb else null, owner.cleanup_owner.epoch() orelse return error.MissingCurrentCleanupEpoch);
                             }
                         };
@@ -829,18 +846,6 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             }
         };
 
-        fn prepareLegacyQuotasOutside(ctx: *LightOnStreamContext, norms: *NormPreparation) !void {
-            if (comptime build_options.enable_cuda) if (ctx.captured_roots) |*roots| {
-                const model = ctx.model.session.model_lifetime orelse return error.MissingCacheRetirementModel;
-                try roots.prepareLegacyQuotasOutside(norms.expectedCudaCompute(), model);
-            };
-        }
-        fn validateNormsAndLegacyQuotas(ctx: *LightOnStreamContext, norms: *NormPreparation) !void {
-            if (comptime build_options.enable_cuda) {
-                try norms.validateForCohort(ctx.model.session, &ctx.cohort_waiter);
-                if (ctx.captured_roots) |*roots| try roots.commitLegacyQuotas(norms.expectedCudaCompute());
-            }
-        }
         fn refreshNormFundingOutside(ctx: *LightOnStreamContext, control: InferenceExecutionControl) !void {
             if (comptime build_options.enable_cuda) if (ctx.norm_preparation) |norms| {
                 norms.finishFundingOutsideExecution();
@@ -851,7 +856,6 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                     error.OutOfMemory, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => try norms.recoverOptionalFundingOutsideExecution(),
                     else => return err,
                 };
-                try ctx.prepareLegacyQuotasOutside(norms);
             };
         }
 
@@ -886,6 +890,9 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                 .cuda => if (comptime build_options.enable_cuda) {
                     const norms = ctx.norm_preparation orelse return error.UnsupportedReaderEpochBackend;
                     const roots = if (ctx.captured_roots) |*value| value else return error.UnsupportedReaderEpochBackend;
+                    // Decline before unbinding or synchronizing another
+                    // step's pending readback. The errdefers release our turn.
+                    try @TypeOf(parked.cuda).checkPendingReadback(norms.expectedCudaCompute());
                     norms.unbind(cb);
                     parked.cuda.park(cb, norms.expectedCudaCompute(), roots) catch |err| {
                         // Failure has not moved backend custody. Prove the
@@ -919,12 +926,6 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             // normal cache preparation instead of preserving a disabled policy.
             if (comptime build_options.enable_cuda) if (ctx.norm_preparation) |norms| if (norms.optionalRecoveryActive()) {
                 ctx.refreshNormFundingOutside(control) catch |err| {
-                    parked.restore() catch platform.inference_process_supervisor.restartWorker();
-                    return err;
-                };
-            };
-            if (comptime build_options.enable_cuda) if (ctx.norm_preparation) |norms| {
-                ctx.prepareLegacyQuotasOutside(norms) catch |err| {
                     parked.restore() catch platform.inference_process_supervisor.restartWorker();
                     return err;
                 };
@@ -1125,7 +1126,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             return factory.node.model_manager.acquireGenerationResources(&.{.{ .session = factory.model.session, .resources = .{ .backend_class = .gpu, .limits = factory.limits, .amounts = amounts } }}) catch |err| {
                 if (unpublished or (err != error.ResourceLimitExceeded and err != error.ResourceTemporarilyUnavailable)) return err;
                 if (comptime build_options.enable_cuda) if (ctx.norm_preparation) |norms| {
-                    if (try norms.releaseUnusedFundingForPageOutside()) {
+                    if (try norms.releaseUnusedOptionalFundingOutside()) {
                         // SAME PAGE amounts, exactly one retry, no math replay.
                         return factory.node.model_manager.acquireGenerationResources(&.{.{ .session = factory.model.session, .resources = .{ .backend_class = .gpu, .limits = factory.limits, .amounts = amounts } }});
                     }
@@ -1143,13 +1144,13 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             const needs_peak = if (peak) |bytes| ctx.phase_wait_ns == 0 or bytes > ctx.published_vision_peak.load(.acquire) else false;
             const needs_host_peak = host_peak > 0 and (ctx.phase_wait_ns == 0 or host_peak > ctx.published_vision_host_peak.load(.acquire));
             const needs_decoder_peak = factory.decoder_workspace != null or (factory.decoder_peak != 0 and (ctx.phase_wait_ns == 0 or factory.decoder_peak > ctx.published_decoder_peak.load(.acquire)));
-            if (needs_auxiliary or needs_peak or needs_host_peak or needs_decoder_peak or factory.dynamic_vision_batch_items != 0) {
+            const lease = if (needs_auxiliary or needs_peak or needs_host_peak or needs_decoder_peak or factory.dynamic_vision_batch_items != 0) admitted: {
                 const vision_mark = if (peak != null) ctx.vision_peak.mark() else null;
                 const host_mark = if (host_peak != 0) ctx.vision_host_peak.mark() else null;
                 const decoder_mark = if (factory.decoder_peak != 0 or factory.decoder_workspace != null) ctx.decoder_peak.mark() else null;
-                const old_workspace = if (factory.decoder_workspace != null) ctx.decoder_workspace else null;
-                const old_vision = if (factory.dynamic_vision_batch_items != 0) ctx.vision_per_item_peak else 0;
-                const old_host = if (factory.dynamic_vision_batch_items != 0) ctx.vision_host_per_item_peak else 0;
+                const old_workspace = ctx.decoder_workspace;
+                const old_vision = ctx.vision_per_item_peak;
+                const old_host = ctx.vision_host_per_item_peak;
                 var committed = false;
                 defer if (!committed) {
                     // No GPU consumer can use these increments before this
@@ -1213,12 +1214,12 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                     try ctx.vision_host_peak.grow(bytes, factory, acquireVisionHostPeak);
                     if (ctx.phase_wait_ns != 0) ctx.published_vision_host_peak.store(ctx.vision_host_peak.bytes, .release);
                 }
-                const lease = try ctx.acquirePageOutside(factory, amounts, unpublished);
-                if (index) |slot| ctx.noteAdmitted(slot, peak, host_peak, factory.decoder_workspace);
+                const page_lease = try ctx.acquirePageOutside(factory, amounts, unpublished);
                 committed = true;
-                return lease;
-            }
-            return ctx.acquirePageOutside(factory, amounts, unpublished);
+                break :admitted page_lease;
+            } else try ctx.acquirePageOutside(factory, amounts, unpublished);
+            if (index) |slot| ctx.noteAdmitted(slot, peak, host_peak, factory.decoder_workspace);
+            return lease;
         }
 
         fn noteAdmitted(ctx: *LightOnStreamContext, slot: usize, peak: ?usize, host_peak: usize, workspace: ?@import("reader_workspace.zig").Decoder) void {
@@ -1342,32 +1343,56 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                 var parked = ctx.parkWithOwnedStep(control) catch |err| {
                     // Another owner reserved the outside window but has not
                     // taken our step. Decline BEFORE transfer, never wait here.
-                    if (err == error.ResourceTemporarilyUnavailable) return false;
+                    if (err == error.ResourceTemporarilyUnavailable) {
+                        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+                            std.debug.print("LIGHTONOCR3 cuda_model_graph_precommit_decline rows={d} stage=park error={s}\n", .{ descriptor.rows, @errorName(err) });
+                        return false;
+                    }
                     return err;
                 };
-                phase.prepareOutside(model) catch |err| {
+                var funded: anyerror!void = phase.prepareOutside(model) catch |err| retry: {
+                    if (err != error.ResourceTemporarilyUnavailable) break :retry err;
+                    phase.destroyOutside();
+                    // Yield unused optional cache reservations to the already
+                    // admitted step. Retry once outside the reader lanes.
+                    const released = preparation.releaseUnusedOptionalFundingOutside() catch |failure| break :retry failure;
+                    if (!released) break :retry err;
+                    control.check() catch |failure| break :retry failure;
+                    break :retry phase.prepareOutside(model);
+                };
+                while (true) {
+                    funded catch |err| {
+                        if (err != error.ResourceTemporarilyUnavailable or !phase.reduceHeadPacketAfterDenial()) break;
+                        funded = if (control.check()) |_| phase.prepareOutside(model) else |failure| failure;
+                        continue;
+                    };
+                    break;
+                }
+                funded catch |err| {
                     phase.destroyOutside(); // inert failed phase, outside all gates
                     parked.restoreKeepingStep() catch platform.inference_process_supervisor.restartWorker();
                     switch (err) {
-                        error.OutOfMemory, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => return false,
+                        error.OutOfMemory, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => {
+                            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+                                std.debug.print("LIGHTONOCR3 cuda_model_graph_precommit_decline rows={d} stage={s} error={s} pressure={s}\n", .{
+                                    descriptor.rows,                                                         @tagName(phase.mode), @errorName(err),
+                                    if (phase.admission_pressure) |pressure| @tagName(pressure) else "none",
+                                });
+                            return false;
+                        },
                         else => return err,
                     }
                 };
                 parked.restoreKeepingStep() catch platform.inference_process_supervisor.restartWorker();
                 // NEVER use the pre-pause current variable for bind/retirement.
                 const now = @import("../execution/cleanup_context.zig").Context{ .boundary = ctx.cleanup_owner.epoch(), .operation = cb.operationToken() };
-                const bound = Cuda.bindCapturedGraphPhase(cb, phase, now) catch |err| {
+                Cuda.bindCapturedGraphPhase(cb, phase, now) catch |err| {
                     try phase.close(now); // process-owned node, not this stack
                     if (err != error.PreparedCachePlanChanged) return err;
                     try phase.initInto(descriptor);
                     continue;
                 };
-                if (bound) return true;
-                // Legacy raw metadata upgrade consumed no graph math. Retire
-                // its inert process phase under NOW B, then inspect again;
-                // the next park seals B before any new graph funding supplier.
-                try phase.close(now);
-                try phase.initInto(descriptor);
+                return true;
             }
             return error.PreparedCachePlanChanged;
         }
@@ -1437,7 +1462,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
         /// Mandatory packed CPU arrays precede ALL packet KV mutation/math,
         /// regardless of whether an optional external DSO exists or declines.
         /// This is the SAME actual owned-step outside window as graph/DSO
-        /// preparation. Busy/cancel/admission errors restore and propagate.
+        /// preparation. Window contention is retryable before dispatch.
         fn preparePackedHost(raw: *anyopaque, cb: *const ops.ComputeBackend, bytes: usize, control: InferenceExecutionControl) !@import("../execution/packed_host_loan.zig").Loan {
             if (comptime !build_options.enable_cuda) return error.UnsupportedReaderEpochBackend;
             const ctx: *LightOnStreamContext = @ptrCast(@alignCast(raw));
@@ -1447,7 +1472,10 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             try preparation.validateForCohort(ctx.model.session, &ctx.cohort_waiter);
             if (@as(*anyopaque, @ptrCast(preparation.expectedCudaCompute())) != cb.ptr) return error.ForeignReaderEpochBackend;
             const identity = @import("../execution/kernel_route.zig").Implementation{ .context = cb.ptr, .table = cb.vtable };
-            var parked = try ctx.parkWithOwnedStep(control);
+            var parked = ctx.parkWithOwnedStep(control) catch |err| switch (err) {
+                error.ResourceTemporarilyUnavailable => return error.ReaderAdmissionWindowBusy,
+                else => return err,
+            };
             var loan = @import("../execution/packed_host_loan.zig").Loan.prepareOutsideExecution(ctx.model.session, identity, bytes) catch |err| {
                 parked.restoreKeepingStep() catch platform.inference_process_supervisor.restartWorker();
                 return err;
@@ -1467,8 +1495,9 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
         /// runtime harness. This metadata assignment grants no execution or
         /// outside authority: caller must still use the real step/cohort and
         /// satisfy the callback's exact backend/Model proof before SDK work.
-        pub fn configureGraphAdmission(ctx: *LightOnStreamContext, executor: *@import("../graph/decoder_step_executor.zig").Executor) void {
+        pub fn configureGraphAdmission(ctx: *LightOnStreamContext, executor: *@import("../execution/decoder_step_executor.zig").Executor) void {
             executor.context.cleanup_owner = &ctx.cleanup_owner;
+            executor.batch_diagnostics = ctx.model.session.invocation_diagnostics;
             executor.context.before_owned_forward = if (comptime build_options.enable_cuda) .{ .ptr = ctx, .prepare_fn = preparePackedHost } else null;
             executor.context.graph_preparation = if (comptime build_options.enable_cuda) .{ .ptr = ctx, .prepare_fn = prepareCapturedGraph } else null;
             executor.context.external_prefill_preparation = if (comptime build_options.enable_cuda) .{ .ptr = ctx, .prepare_fn = prepareExternalPrefill } else null;
@@ -1478,7 +1507,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             const io = ctx.worker_io.?.io();
             // Physical execution borrows the epoch's backend/state. Task
             // publication is a separate adapter and retains no request pipeline.
-            var executor = @import("../graph/decoder_step_executor.zig").Executor{
+            var executor = @import("../execution/decoder_step_executor.zig").Executor{
                 .context = .{
                     .allocator = ctx.allocator,
                     .cb = &ctx.cb.?,
@@ -1566,7 +1595,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             }
             // The device hook owns CUDA KV bytes. Both epoch pools retain
             // logical pages without allocating a second pair of host mirrors.
-            const config = generation.requestKvManagerPoolConfig(generation.kvPoolConfig(if (ctx.model.session.backend() == .cuda) .cuda else .metal, kv_dtype, ctx.cfg, Hooks.generationKvSlidingTrimForced()));
+            const config = decoder_storage.requestMetadataPool(decoder_storage.poolPlan(if (ctx.model.session.backend() == .cuda) .cuda else .metal, kv_dtype, &ctx.cfg, .{ .force_sliding_trim = decoder_storage.slidingTrimForced() }));
             ctx.pool = try ctx.manager.addPool(config);
             ctx.storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(ctx.allocator, config);
             errdefer ctx.storage.deinitWithBoundary(ctx.cleanup_owner.epoch());
@@ -1638,8 +1667,9 @@ fn coldCreatorPageCase(a: std.mem.Allocator, cancel_after_reserve: bool, transie
         const table = @import("../backends/session.zig").Session.VTable{ .backend = backend, .run = run, .inputInfo = info, .outputInfo = info, .close = close };
     };
     var marker: u8 = 0;
+    var diagnostics: @import("../execution/diagnostics.zig").Diagnostics = .{};
     var model: model_manager_mod.LoadedModel = undefined;
-    model.session = .{ .ptr = &marker, .vtable = &ColdSession.table };
+    model.session = .{ .ptr = &marker, .vtable = &ColdSession.table, .invocation_diagnostics = .{ .diagnostics = &diagnostics } };
     model.native_generate_lock = .unlocked;
     model.native_reader_execution_lane = .{};
     model.native_reader_stream = .{};
@@ -1714,9 +1744,10 @@ fn coldCreatorPageCase(a: std.mem.Allocator, cancel_after_reserve: bool, transie
         // its one worker/harness configuration seam. With no actual backend
         // yet, the prefill callback must refuse before touching phase/Model
         // metadata, reserving anything, or changing the active epoch.
-        var configured: @import("../graph/decoder_step_executor.zig").Executor = undefined;
+        var configured: @import("../execution/decoder_step_executor.zig").Executor = undefined;
         ctx.configureGraphAdmission(&configured);
         try std.testing.expect(configured.context.cleanup_owner == &ctx.cleanup_owner);
+        try std.testing.expect(configured.batch_diagnostics.?.diagnostics == &diagnostics);
         if (comptime build_options.enable_cuda) {
             const graph_hook = configured.context.graph_preparation orelse return error.MissingReaderGraphPreparation;
             const prefill_hook = configured.context.external_prefill_preparation orelse return error.MissingReaderPrefillPreparation;

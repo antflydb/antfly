@@ -30,6 +30,8 @@ pub const Owner = struct {
     pub const MetadataIndexScope = struct {
         token: ?operation.Borrowed = null,
         previous: ?*MetadataIndexScope = null,
+        parent: ?operation.Borrowed = null,
+        program: ?*const @import("ml").graph.Graph = null,
     };
 
     // Null for the unchanged embedded Native/CUDA owner. Metal's independently

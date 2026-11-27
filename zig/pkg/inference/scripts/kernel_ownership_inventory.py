@@ -119,12 +119,9 @@ def verify_shared_dependencies(root):
                 if source == bindings:
                     contracts.add(package / "ops/ops.zig")
                 if source in retained:
-                    contracts.update(
-                        {
-                            package / "backends/session.zig",
-                            package / "test_error_logs.zig",
-                        }
-                    )
+                    contracts.add(package / "backends/session.zig")
+                if source == cache or source in retained:
+                    contracts.add(package / "test_error_logs.zig")
                 if target not in contracts and not any(
                     target.is_relative_to(directory) for directory in allowed
                 ):

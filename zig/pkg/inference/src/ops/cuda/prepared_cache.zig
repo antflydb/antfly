@@ -39,116 +39,7 @@ pub const Name = struct {
     }
 };
 pub const Resize = struct { width: u32, height: u32, target_width: u32, target_height: u32, resident: bool };
-/// Copied operation geometry only. The actual Stage certifies the model and
-/// rebuilds mutable backend policy/learned-layout requests after every yield.
-pub const AudioRecipe = struct {
-    source_bf16: bool = false,
-    gradient_clipping_bits: u32 = 0,
-    frames: [4]usize = @splat(0),
-    count: u3,
-    hidden: usize,
-    output_hidden: usize,
-    intermediate: usize,
-    blocks: usize,
-    heads: usize,
-    mel_bins: usize,
-    conv_kernel: usize,
-    norm_eps_bits: u32,
-    residual_bits: u32,
-    chunk: usize,
-    context_left: usize,
-    logit_cap_bits: u32,
-    invalid_logits_bits: u32,
-    exclude_farthest: bool,
-    frontend_device: bool,
-    force_dft: bool,
-    force_unfused: bool,
-    host_ops_empty: bool,
-    graph_allowed: bool,
-    packed_layers: u16,
-    depthwise_cached: bool = false,
-
-    pub fn validate(self: AudioRecipe) !void {
-        if (self.count == 0 or self.count > 4 or self.hidden == 0 or self.heads == 0 or self.hidden % self.heads != 0 or
-            self.output_hidden == 0 or self.intermediate == 0 or self.blocks != 12 or self.mel_bins != 128 or
-            self.context_left == 0 or self.packed_layers >> 12 != 0) return error.InvalidPreparedAudioRecipe;
-        for (self.frames[0..self.count]) |frames| if (frames == 0) return error.InvalidPreparedAudioRecipe;
-        for (self.frames[self.count..]) |frames| if (frames != 0) return error.InvalidPreparedAudioRecipe;
-        for ([_]usize{ self.hidden, self.output_hidden, self.context_left, try self.rows() }) |extent|
-            if (std.math.cast(i64, extent) == null) return error.InvalidPreparedAudioRecipe;
-    }
-    pub fn rows(self: AudioRecipe) !usize {
-        if (self.count > self.frames.len) return error.InvalidPreparedAudioRecipe;
-        var total: usize = 0;
-        for (self.frames[0..self.count]) |frames| total = try std.math.add(usize, total, (try std.math.add(usize, frames, 3)) / 4);
-        return total;
-    }
-    /// Identical to the actual execution key; singleton subsampling has no
-    /// segments and therefore does not enter the CUDA learned execution route.
-    pub fn key(self: AudioRecipe, segments: []const usize, start: usize, end: usize) u64 {
-        var hash = std.hash.Wyhash.init(0x616e74666c796175);
-        hash.update(std.mem.sliceAsBytes(segments));
-        std.hash.autoHash(&hash, .{ start, end });
-        std.hash.autoHash(&hash, .{ self.hidden, self.intermediate, self.heads, self.conv_kernel, self.norm_eps_bits, self.residual_bits, self.chunk, self.context_left, self.logit_cap_bits, self.invalid_logits_bits, self.exclude_farthest });
-        if (self.source_bf16) {
-            hash.update("bf16-source-audio-v1");
-            std.hash.autoHash(&hash, self.gradient_clipping_bits);
-        }
-        return hash.final();
-    }
-    pub fn frontendKey(buffer: []u8, kind: []const u8, fft: usize, frame: usize, mel: usize) ![]const u8 {
-        return std.fmt.bufPrint(buffer, "audio_tower.prepared.frontend.f32.v1.{s}.{d}.{d}.{d}", .{ kind, fft, frame, mel });
-    }
-    pub fn depthwiseWeightName(buffer: []u8, layer: usize) ![]const u8 {
-        if (layer >= 12) return error.InvalidPreparedAudioRecipe;
-        return std.fmt.bufPrint(buffer, "a.blk.{d}.conv_dw.weight", .{layer});
-    }
-    pub fn depthwiseKey(buffer: []u8, name: []const u8, kernel: usize, hidden: usize) ![]const u8 {
-        return std.fmt.bufPrint(buffer, "audio_tower.prepared.depthwise.v1.{s}.{d}.{d}", .{ name, kernel, hidden });
-    }
-    /// Actual accepted source layouts, shared before cold quota and before
-    /// the original CPU transpose/upload. No numerical work or allocation.
-    pub fn validateDepthwiseSource(shape: []const i64, kernel: usize, hidden: usize, allow_hidden_3d: bool) !usize {
-        if (shape.len < 2 or kernel == 0 or hidden == 0) return error.InvalidTensorShape;
-        const elements = try std.math.mul(usize, kernel, hidden);
-        var count: usize = 1;
-        for (shape) |extent| {
-            if (extent <= 0) return error.InvalidTensorShape;
-            count = try std.math.mul(usize, count, std.math.cast(usize, extent) orelse return error.InvalidTensorShape);
-        }
-        if (count != elements) return error.InvalidTensorShape;
-        const k = std.math.cast(i64, kernel) orelse return error.InvalidTensorShape;
-        const h = std.math.cast(i64, hidden) orelse return error.InvalidTensorShape;
-        if (allow_hidden_3d and shape.len == 3 and shape[0] == h and shape[1] == 1 and shape[2] == k) return elements;
-        if ((shape[0] == k and shape[1] == h) or (shape[0] == h and shape[1] == k)) return elements;
-        return error.InvalidTensorShape;
-    }
-    pub const Constant = enum { relative, ones, query_scale, relative_key, depthwise };
-    pub fn towerKey(self: AudioRecipe, buffer: []u8, kind: Constant, layer: usize) ![]const u8 {
-        if (self.source_bf16) {
-            var historical = self;
-            historical.source_bf16 = false;
-            var scratch: [192]u8 = undefined;
-            const historical_key = try historical.towerKey(&scratch, kind, layer);
-            return std.fmt.bufPrint(buffer, "{s}.bf16-source-v1", .{historical_key});
-        }
-        return switch (kind) {
-            .relative => std.fmt.bufPrint(buffer, "audio_tower.prepared.relative.v1.{d}.{d}", .{ self.context_left, self.hidden }),
-            .ones => std.fmt.bufPrint(buffer, "audio_tower.prepared.ones.v1.{d}", .{self.output_hidden}),
-            .query_scale => std.fmt.bufPrint(buffer, "audio_tower.prepared.query_scale.v1.{d}.{d}", .{ layer, self.hidden / self.heads }),
-            .relative_key => std.fmt.bufPrint(buffer, "audio_tower.prepared.relative_key.v1.{d}.{d}.{d}", .{ layer, self.context_left, self.hidden }),
-            .depthwise => blk: {
-                var name: [128]u8 = undefined;
-                break :blk depthwiseKey(buffer, try depthwiseWeightName(&name, layer), self.conv_kernel, self.hidden);
-            },
-        };
-    }
-    pub fn qkvWeightName(buffer: []u8, layer: usize, component: usize) ![]const u8 {
-        const names = [_][]const u8{ "q_proj", "k_proj", "v_proj" };
-        if (layer >= 12 or component >= names.len) return error.InvalidPreparedAudioRecipe;
-        return std.fmt.bufPrint(buffer, "audio_tower.layers.{d}.self_attn.{s}.linear.weight", .{ layer, names[component] });
-    }
-};
+pub const AudioRecipe = @import("../../execution/audio_schedule.zig").AudioRecipe;
 pub const Arena = struct {
     kind: enum { encoder, vision, audio },
     batch: usize,
@@ -222,6 +113,7 @@ pub const CapturedArena = struct {
     key_hash: u64,
     bytes: usize,
     events: usize,
+    recipe: u64,
     pub fn amounts(self: CapturedArena) memory.AdmissionAmounts {
         return .{ .backend_scratch_bytes = self.bytes };
     }
@@ -403,6 +295,7 @@ pub const Funding = struct {
     decoder_sequence: ?@import("video_cache_budget.zig").Sequence = null,
     deny_constants: bool = false,
     compute_identity: usize = 0,
+    admission_pressure: ?memory.AdmissionPressure = null,
     admission: ?policy = null,
     domain_pin: ?domain.Pin = null,
     boundary: ?*const sink.Epoch = null, // ONLY during actual Stage-owned gate
@@ -420,13 +313,14 @@ pub const Funding = struct {
         temporary_host_bytes: usize = 0,
         optional_declined: bool = false,
         audio_learning: ?*@import("audio_execution_plan.zig").Owner = null,
-        retired_audio_plan: ?*@import("audio_execution_plan.zig").Plan = null,
         upgrade_raw: bool = false,
         // Value-only identity, not a second lease owner. Filled under actual
         // cache exclusion; no cache/SDK/Model pointer crosses the cold window.
         raw_snapshot: ?memory.AdmissionLease = null,
         upgrade: retirement.PreparedCharge = .{ .owner = null },
         lease: ?memory.AdmissionLease = null,
+        audio_output_lease: ?memory.AdmissionLease = null,
+        audio_output_charge: retirement.PreparedCharge = .{ .owner = null },
         temporary: ?memory.AdmissionLease = null,
         failure: retirement.PreparedCharge = .{ .owner = null },
         state: enum { unavailable, ready, taken, published, failed } = .unavailable,
@@ -482,6 +376,7 @@ pub const Funding = struct {
     // always uses its certified process allocator, never the task arena.
     fn fundWithMetadataAllocator(self: *Funding, pin: ?*const domain.Pin, shell_allocator: ?std.mem.Allocator) !void {
         if (self.state != .snapped) return error.InvalidPreparedCacheState;
+        self.admission_pressure = null;
         const actual = self.admission orelse {
             if (self.hasRawUpgrades()) return error.MissingCacheRetirementDomain;
             for (self.entries) |*entry| if (entry.miss) {
@@ -510,14 +405,25 @@ pub const Funding = struct {
         }
         // Existing owners carry their SAME charged lease. Zero fresh demand
         // prepares only pure retirement metadata, never a zero-byte supplier.
-        var source: ?memory.AdmissionLease = if (std.meta.eql(total, memory.AdmissionAmounts{})) null else try actual.controller.tryAcquire(.gpu, actual.limits, total, actual.check_live_memory);
+        var source: ?memory.AdmissionLease = if (std.meta.eql(total, memory.AdmissionAmounts{})) null else try actual.controller.tryAcquireWithPressure(.gpu, actual.limits, total, actual.check_live_memory, &self.admission_pressure);
         defer if (source) |*lease| lease.release();
         // Every error leaves complete ownership in this cold object; its
         // outside destructor returns all children, with no SDK state published.
         errdefer self.releaseFundedOutside();
         for (self.entries) |*entry| if (entry.miss) {
             entry.failure = try retirement.PreparedCharge.prepare(0);
-            var prepared = try source.?.preparePartition(self.allocator, entry.amounts);
+            var scratch_amounts = entry.amounts;
+            if (entry.request == .arena and entry.request.arena.kind == .audio) {
+                const bytes = entry.request.arena.sizes[1];
+                if (bytes != 0) {
+                    if (bytes >= scratch_amounts.backend_scratch_bytes) return error.InvalidPreparedCacheAmount;
+                    scratch_amounts.backend_scratch_bytes -= bytes;
+                    entry.audio_output_charge = try retirement.PreparedCharge.prepare(0);
+                    var publication = try source.?.preparePartition(self.allocator, .{ .backend_scratch_bytes = bytes });
+                    entry.audio_output_lease = publication.commit();
+                }
+            }
+            var prepared = try source.?.preparePartition(self.allocator, scratch_amounts);
             entry.lease = prepared.commit();
             if (entry.temporary_host_bytes != 0) {
                 var scratch = try source.?.preparePartition(self.allocator, .{ .host_scratch_bytes = entry.temporary_host_bytes });
@@ -580,7 +486,7 @@ pub const Funding = struct {
     fn prepareAudioLearningOutsideExecution(self: *Funding) !void {
         for (self.entries) |*entry| if (entry.request == .audio_learning and entry.miss and entry.state == .ready) {
             if (entry.audio_learning != null) return error.InvalidPreparedCacheState;
-            entry.audio_learning = try @import("audio_execution_plan.zig").Owner.createOutsideExecution(self.allocator);
+            entry.audio_learning = try @import("audio_execution_plan.zig").Owner.create(self.allocator);
         };
     }
     /// A decoder is mandatory. If the combined optional reservation declines,
@@ -630,7 +536,7 @@ pub const Funding = struct {
                 if (entry.miss and !std.meta.eql(entry.amounts, value.amounts())) return error.InvalidPreparedCacheAmount;
             },
             .external_prefill => |value| {
-                if (value.kind == .recurrent or value.kind == .recurrent_existing and (entry.miss or value.device_bytes != 0 or value.host_bytes != 0 or value.geometry_hash != 0) or entry.miss and !std.meta.eql(entry.amounts, value.amounts())) return error.InvalidPreparedCacheAmount;
+                if (value.kind != .attention or entry.miss and !std.meta.eql(entry.amounts, value.amounts())) return error.InvalidPreparedCacheAmount;
             },
             else => return error.UnsupportedPreparedCacheWorkload,
         };
@@ -660,10 +566,6 @@ pub const Funding = struct {
             var prepared = try source.*.?.preparePartition(self.allocator, entry.amounts);
             entry.lease = prepared.commit();
             entry.state = .ready;
-        };
-        for (self.entries) |*entry| if (entry.upgrade_raw) {
-            if (entry.request != .auxiliary and entry.request != .derived_weight and entry.request != .external_prefill) return error.InvalidPreparedCacheState;
-            entry.upgrade = try retirement.PreparedCharge.prepare(0);
         };
         // Preserve already accepted retention and norm banks. Each optional
         // workspace has its own original reservation and can decline alone.
@@ -728,11 +630,11 @@ pub const Funding = struct {
             const unused_learning = entry.audio_learning;
             entry.audio_learning = null;
             if (unused_learning) |owner| owner.destroyUnusedOutsideExecution();
-            const retired_plan = entry.retired_audio_plan;
-            entry.retired_audio_plan = null;
-            if (retired_plan) |plan| std.heap.c_allocator.destroy(plan);
             if (entry.lease) |*lease| lease.release();
             entry.lease = null;
+            if (entry.audio_output_lease) |*lease| lease.release();
+            entry.audio_output_lease = null;
+            entry.audio_output_charge.destroyUnused();
             if (entry.temporary) |*lease| lease.release();
             entry.temporary = null;
             entry.failure.destroyUnused();
@@ -758,6 +660,27 @@ pub const Funding = struct {
 /// A cached payload receives only its exact independently owned lease. A cold
 /// failure moves it into the preallocated pure Charge AFTER checked SDK death.
 pub const Lease = struct {
+    pub fn validatePinnedHost(self: *const Lease, kind: Auxiliary.Kind, bytes: usize, current: @import("../../execution/cleanup_context.zig").Context) !void {
+        const owner = self.owner orelse return error.UnpreparedCacheAdmission;
+        const entry = self.entry orelse return error.InvalidPreparedCacheState;
+        const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;
+        if (current.outside_execution or owner.state != .bound or entry.state != .taken) return error.InvalidPreparedCacheState;
+        const expected_epoch = owner.boundary orelse return error.InvalidPreparedCacheState;
+        if (try epoch.isSealed() or try expected_epoch.isSealed()) return error.RetirementEpochSealed;
+        const actual = try epoch.boundary();
+        const expected = try expected_epoch.boundary();
+        if (actual.context != expected.context or actual.nonce != expected.nonce) return error.ForeignPreparedCacheBoundary;
+        var found = false;
+        for (owner.entries) |*candidate| if (candidate == entry) {
+            found = true;
+            break;
+        };
+        if (!found or entry.request != .auxiliary or entry.request.auxiliary.kind != kind or entry.request.auxiliary.device_bytes != 0 or entry.request.auxiliary.host_bytes != bytes) return error.PreparedCacheAmountChanged;
+        const value = self.value orelse return error.MissingCacheRetirementLease;
+        const pin = owner.domain_pin orelse return error.MissingCacheRetirementDomain;
+        if (value.controller != pin.controller() or !std.meta.eql(value.amounts, memory.AdmissionAmounts{ .host_scratch_bytes = bytes })) return error.ForeignAdmissionDomain;
+    }
+
     value: ?memory.AdmissionLease = null,
     owner: ?*Funding = null,
     entry: ?*Funding.Entry = null,
@@ -767,15 +690,23 @@ pub const Lease = struct {
     /// The large exact Plan backing was allocated only after cold funding.
     /// Cache publication retains no Funding/entry/model/creation-B pointer.
     pub fn publishAudioLearning(self: *Lease) !*@import("audio_execution_plan.zig").Owner {
+        const entry = self.entry orelse return error.InvalidPreparedCacheState;
+        const owner = entry.audio_learning orelse return error.MissingPreparedAudioPlan;
+        try self.fundAudioLearning(owner);
+        entry.audio_learning = null;
+        return owner;
+    }
+
+    /// Adopt the existing plan in place. Its address remains stable and its
+    /// funding shell retires independently of the cache backing.
+    pub fn fundAudioLearning(self: *Lease, owner: *@import("audio_execution_plan.zig").Owner) !void {
         const funding = self.owner orelse return error.UnpreparedCacheAdmission;
         const entry = self.entry orelse return error.InvalidPreparedCacheState;
-        if (funding.state != .bound or entry.state != .taken or entry.request != .audio_learning) return error.InvalidPreparedCacheState;
+        if (funding.state != .bound or entry.state != .taken or entry.request != .audio_learning or owner.managed or owner.retiring or owner.quota != .none) return error.InvalidPreparedCacheState;
         const current = funding.boundary orelse return error.MissingCurrentCleanupEpoch;
         if (try current.isSealed()) return error.RetirementEpochSealed;
-        const owner = entry.audio_learning orelse return error.MissingPreparedAudioPlan;
-        entry.audio_learning = null;
         owner.quota = self.publishQuota();
-        return owner;
+        owner.managed = true;
     }
 
     /// Successful caches retain the SAME cold shell for their future actual
@@ -794,6 +725,17 @@ pub const Lease = struct {
         self.owner = null;
         self.entry = null;
         return quota;
+    }
+    pub fn publishArenaQuotas(self: *Lease) [2]CacheQuota {
+        var output: CacheQuota = .none;
+        if (self.entry) |entry| {
+            std.debug.assert(entry.request == .arena);
+            if (entry.audio_output_lease != null) {
+                var pin: ?domain.Pin = self.owner.?.domain_pin.?.retain();
+                output = CacheQuota.arm(&entry.audio_output_charge, &entry.audio_output_lease, &pin) catch platform.inference_process_supervisor.restartWorker();
+            }
+        }
+        return .{ self.publishQuota(), output };
     }
     pub fn publish(self: *Lease) ?memory.AdmissionLease {
         const value = self.value;
@@ -839,6 +781,11 @@ pub const Lease = struct {
                 const charge = entry.failure.arm(&self.value, &optional_pin) catch platform.inference_process_supervisor.restartWorker();
                 charge.holdUntilBoundary(boundary) catch platform.inference_process_supervisor.restartWorker();
                 charge.release();
+            }
+            if (entry.audio_output_lease != null) {
+                var pin: ?domain.Pin = owner.domain_pin.?.retain();
+                var output = CacheQuota.arm(&entry.audio_output_charge, &entry.audio_output_lease, &pin) catch platform.inference_process_supervisor.restartWorker();
+                output.releaseAfterSdkDeath(.{ .boundary = epoch }) catch platform.inference_process_supervisor.restartWorker();
             }
             entry.state = .failed;
         } else if (self.value) |*lease| lease.release();
@@ -1031,6 +978,51 @@ pub fn acquireRaw(ctx: anytype, amounts: memory.AdmissionAmounts) !Lease {
     std.debug.assert(ctx.prepared_cache_funding == null);
     const admission = ctx.video_cache_budget.admission orelse return .{};
     return .{ .value = try admission.controller.tryAcquire(.gpu, admission.limits, amounts, admission.check_live_memory) };
+}
+
+test "CUDA prepared audio arena retains its exact output charge after scratch retirement" {
+    const actual = try domain.Domain.create();
+    defer actual.release();
+    const pin = actual.pin();
+    defer pin.release();
+    const request: Request = .{ .arena = .{
+        .kind = .audio,
+        .batch = 1,
+        .sequence = 1,
+        .sizes = .{ 256, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    } };
+    const funding = try Funding.createWithAllocator(std.testing.allocator, .{ .requests = &.{request} });
+    defer {
+        if (funding.state == .bound) funding.unbind();
+        funding.finishOutsideExecution();
+    }
+    funding.admission = .{ .controller = &actual.controller, .limits = .{}, .check_live_memory = false };
+    const amounts = memory.AdmissionAmounts{ .backend_scratch_bytes = 320 };
+    try funding.noteMiss(0, amounts, 0);
+    funding.state = .snapped;
+    try funding.fundOutsideExecution(&pin);
+    var reference = try sink.Ref.create();
+    defer reference.release();
+    var guard = try reference.enter();
+    var guard_open = true;
+    defer if (guard_open) guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    try funding.bind(&epoch);
+    var token = try funding.take(request, amounts);
+    var quotas = token.publishArenaQuotas();
+    defer for (&quotas) |*quota| quota.releaseOutsideExecution();
+    try std.testing.expectEqual(@as(usize, 256), quotas[0].peek().?.amounts.backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 64), quotas[1].peek().?.amounts.backend_scratch_bytes);
+    try quotas[0].releaseAfterSdkDeath(.{ .boundary = &epoch });
+    try std.testing.expectEqual(@as(usize, 320), actual.controller.snapshot().backend_scratch_bytes);
+    funding.unbind();
+    guard.finish();
+    guard_open = false;
+    _ = retirement.poll();
+    try std.testing.expectEqual(@as(usize, 64), actual.controller.snapshot().backend_scratch_bytes);
+    quotas[1].releaseOutsideExecution();
+    try std.testing.expectEqual(@as(usize, 0), actual.controller.snapshot().backend_scratch_bytes);
 }
 
 test "CUDA prepared cache builder copies exact keys coalesces repeated requests and refuses conflicting spans" {
@@ -1427,29 +1419,6 @@ test "CUDA derived weight cold reservation unwinds all metadata OOM and exact or
     try platform.allocator.checkAllAllocationFailures(std.testing.allocator, derivedWeightFundingOomCase, .{});
 }
 
-test "external recurrent existing-only custody prepares a shell without new backing admission" {
-    const owner = try domain.Domain.create();
-    defer owner.release();
-    var original = try owner.controller.tryAcquire(.gpu, .{ .backend_limit_bytes = 64 }, .{ .backend_scratch_bytes = 64 }, false);
-    defer original.release();
-    const requests = [_]Request{
-        .{ .external_prefill = .{ .kind = .recurrent_existing, .library_identity = 1, .geometry_hash = 0, .device_bytes = 0 } },
-        .{ .ocr_retention = .{ .cache_bytes = 0, .deferred_bytes = 0, .pressure_step = @bitSizeOf(usize) } },
-    };
-    const funding = try Funding.create(.{ .requests = &requests });
-    defer funding.finishOutsideExecution();
-    funding.entries[0].upgrade_raw = true;
-    funding.admission = .{ .controller = &owner.controller, .limits = .{ .backend_limit_bytes = 64 }, .check_live_memory = false };
-    funding.state = .snapped;
-    const before = owner.controller.snapshot();
-    const pin = owner.pin();
-    defer pin.release();
-    try funding.fundLightOnOutsideExecution(&pin);
-    try std.testing.expect(funding.entries[0].upgrade.owner != null);
-    try std.testing.expect(funding.entries[0].lease == null and !funding.entries[0].miss);
-    try std.testing.expectEqualDeep(before, owner.controller.snapshot());
-}
-
 fn audioLearningFundingOomCase(a: std.mem.Allocator) !void {
     const actual = try domain.Domain.create();
     defer actual.release();
@@ -1484,9 +1453,22 @@ test "CUDA audio learned metadata one below host class refuses before payload ba
     try std.testing.expectError(error.ResourceLimitExceeded, funding.fundOutsideExecution(&pin));
     try std.testing.expect(funding.entries[0].audio_learning == null and funding.entries[0].lease == null);
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, actual.controller.snapshot());
+    // An occupied domain is retryable and preserves the rejecting limit.
+    var peer = try actual.controller.tryAcquire(.gpu, .{}, .{ .host_scratch_bytes = 1 }, false);
+    defer peer.release();
+    funding.admission.?.limits.host_limit_bytes = bytes;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, funding.fundOutsideExecution(&pin));
+    try std.testing.expectEqualDeep(@as(?memory.AdmissionPressure, .{ .domain_host = .gpu }), funding.admission_pressure);
+    try std.testing.expect(funding.entries[0].audio_learning == null and funding.entries[0].lease == null);
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .host_scratch_bytes = 1 }, actual.controller.snapshot());
 }
 
 test "CUDA audio learned metadata publication and LRU death retain exact old Domain quota until actual current B seals" {
+    try qualifyAudioMetadataRetirement(false);
+    try qualifyAudioMetadataRetirement(true);
+}
+
+fn qualifyAudioMetadataRetirement(comptime adopt_warm_plan: bool) !void {
     var gate: std.atomic.Mutex = .unlocked;
     const Probe = struct {
         gate: *std.atomic.Mutex,
@@ -1545,20 +1527,28 @@ test "CUDA audio learned metadata publication and LRU death retain exact old Dom
     defer epoch.release();
     try funding.?.bind(&publication_epoch);
     var token = try funding.?.take(.{ .audio_learning = .{ .key = 93 } }, .{ .host_scratch_bytes = bytes });
-    const owner = try token.publishAudioLearning();
+    const owner = if (adopt_warm_plan) warm: {
+        const raw = try plan_mod.Owner.create(std.testing.allocator);
+        errdefer raw.destroyUnusedOutsideExecution();
+        raw.plan.allocate(256, 0x1000);
+        try std.testing.expect(raw.plan.finish(0x1000));
+        try token.fundAudioLearning(raw);
+        break :warm raw;
+    } else try token.publishAudioLearning();
     var cache: plan_mod.Cache = .{};
     defer cache.clearWithCleanup(.{ .outside_execution = true }) catch unreachable;
-    cache.entries[0] = .{ .key = 93, .stamp = 1, .warmed = true, .plan = &owner.plan, .owner = owner };
+    cache.entries[0] = .{ .key = 93, .stamp = 1, .warmed = true, .owner = owner };
     cache.clock = 1;
     funding.?.unbind();
     funding.?.finishOutsideExecution();
     funding = null; // no phase/task pointer survives in the cache owner
     publication_guard.finish();
     try std.testing.expectError(error.RetirementEpochSealed, cache.clearWithCleanup(.{ .boundary = &publication_epoch }));
-    try std.testing.expect(cache.entries[0].owner == owner and cache.entries[0].plan == &owner.plan);
-    try std.testing.expectError(error.MissingCurrentCleanupEpoch, cache.clearLegacy());
-    const original = cache.entries[0].plan;
-    for (0..3) |_| try std.testing.expect((try cache.getWithCleanup(93, .{ .boundary = &epoch })).plan == original);
+    try std.testing.expect(cache.entries[0].owner == owner and owner.managed);
+    if (adopt_warm_plan) try std.testing.expectEqual(@as(usize, 256), (try owner.plan.layout(0)).bytes);
+    try std.testing.expectError(error.CacheRetirementCleanupAuthorityRequired, cache.clearWithCleanup(.{}));
+    const original = cache.entries[0].owner;
+    for (0..3) |_| try std.testing.expect((try cache.getWithCleanup(93, .{ .boundary = &epoch })).owner == original);
     try std.testing.expect(gate.tryLock());
     var gate_held = true;
     defer if (gate_held) gate.unlock();
@@ -1783,15 +1773,15 @@ test "copied arena chronology preserves repeated uses and refuses ambiguous indi
 }
 
 test "audio depthwise shared source layout accepts original transpose cases and refuses malformed byte geometry" {
-    try std.testing.expectEqual(@as(usize, 5120), try AudioRecipe.validateDepthwiseSource(&.{ 1024, 1, 5 }, 5, 1024, true));
-    try std.testing.expectEqual(@as(usize, 5120), try AudioRecipe.validateDepthwiseSource(&.{ 5, 1024 }, 5, 1024, true));
-    try std.testing.expectEqual(@as(usize, 5120), try AudioRecipe.validateDepthwiseSource(&.{ 1024, 5 }, 5, 1024, true));
-    try std.testing.expectEqual(@as(usize, 5120), try AudioRecipe.validateDepthwiseSource(&.{ 5, 1024, 1 }, 5, 1024, true));
-    try std.testing.expectError(error.InvalidTensorShape, AudioRecipe.validateDepthwiseSource(&.{ 1024, 1, 5 }, 5, 1024, false));
-    try std.testing.expectError(error.InvalidTensorShape, AudioRecipe.validateDepthwiseSource(&.{ 1024, 1, 6 }, 5, 1024, true));
-    try std.testing.expectError(error.InvalidTensorShape, AudioRecipe.validateDepthwiseSource(&.{ -1, 1024 }, 5, 1024, true));
-    try std.testing.expectError(error.InvalidTensorShape, AudioRecipe.validateDepthwiseSource(&.{ 5, 1024, 2 }, 5, 1024, true));
-    try std.testing.expectError(error.InvalidTensorShape, AudioRecipe.validateDepthwiseSource(&.{5120}, 5, 1024, true));
+    try std.testing.expectEqualDeep(AudioRecipe.DepthwiseSource{ .elements = 5120, .layout = .hidden_first }, (try AudioRecipe.depthwiseSource(&.{ 1024, 1, 5 }, 5, 1024, true)));
+    try std.testing.expectEqualDeep(AudioRecipe.DepthwiseSource{ .elements = 5120, .layout = .kernel_first }, (try AudioRecipe.depthwiseSource(&.{ 5, 1024 }, 5, 1024, true)));
+    try std.testing.expectEqualDeep(AudioRecipe.DepthwiseSource{ .elements = 5120, .layout = .hidden_first }, (try AudioRecipe.depthwiseSource(&.{ 1024, 5 }, 5, 1024, true)));
+    try std.testing.expectEqualDeep(AudioRecipe.DepthwiseSource{ .elements = 5120, .layout = .kernel_first }, (try AudioRecipe.depthwiseSource(&.{ 5, 1024, 1 }, 5, 1024, true)));
+    try std.testing.expectError(error.InvalidTensorShape, AudioRecipe.depthwiseSource(&.{ 1024, 1, 5 }, 5, 1024, false));
+    try std.testing.expectError(error.InvalidTensorShape, AudioRecipe.depthwiseSource(&.{ 1024, 1, 6 }, 5, 1024, true));
+    try std.testing.expectError(error.InvalidTensorShape, AudioRecipe.depthwiseSource(&.{ -1, 1024 }, 5, 1024, true));
+    try std.testing.expectError(error.InvalidTensorShape, AudioRecipe.depthwiseSource(&.{ 5, 1024, 2 }, 5, 1024, true));
+    try std.testing.expectError(error.InvalidTensorShape, AudioRecipe.depthwiseSource(&.{5120}, 5, 1024, true));
     var key: [256]u8 = undefined;
     try std.testing.expectError(error.InvalidPreparedAudioRecipe, AudioRecipe.depthwiseWeightName(&key, 12));
 }

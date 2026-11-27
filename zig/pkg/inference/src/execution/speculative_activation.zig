@@ -21,9 +21,44 @@ const ComputeBackend = ops.ComputeBackend;
 const gpt_mod = @import("../models/gpt.zig");
 const gpt_arch = @import("../architectures/gpt.zig");
 const decoder_forward = @import("decoder_forward.zig");
-const state_mod = @import("../graph/decode_state_runtime.zig");
+const state_mod = @import("decode_state_runtime.zig");
 const NativeDecodeState = state_mod.NativeDecodeState;
 const BorrowedDecodeStateRuntime = state_mod.BorrowedDecodeStateRuntime;
+
+/// Physical options for one verification round. Draft acceptance, grammar,
+/// and sampling remain with the caller.
+pub const RoundPolicy = struct {
+    dedicated_verify: bool,
+    verify_device_result: bool,
+    defer_materialize: bool,
+    reuse_deferred_target_activation: bool,
+
+    pub fn configured() RoundPolicy {
+        const env = @import("antfly_platform").env;
+        return .{
+            .dedicated_verify = env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_DEDICATED_RUNTIME", true),
+            .verify_device_result = env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_VERIFY_DEVICE_RESULT", false),
+            .defer_materialize = env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE", false),
+            .reuse_deferred_target_activation = env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE_TARGET_ACTIVATION", false),
+        };
+    }
+};
+
+pub fn residentDraftSupported(kind: ops.BackendKind) bool {
+    return kind == .cuda or kind == .metal;
+}
+
+fn deferredTargetActivationRow(cached_first: bool, logit_base_row: usize, accepted: usize) ?usize {
+    if (cached_first) return if (accepted >= 2) accepted - 2 else null;
+    return if (accepted != 0) logit_base_row + accepted - 1 else null;
+}
+
+test "Gemma4 MTP deferred target activation maps cached verify rows" {
+    try std.testing.expectEqual(@as(?usize, null), deferredTargetActivationRow(true, 0, 1));
+    try std.testing.expectEqual(@as(?usize, 0), deferredTargetActivationRow(true, 0, 2));
+    try std.testing.expectEqual(@as(?usize, 2), deferredTargetActivationRow(true, 0, 4));
+    try std.testing.expectEqual(@as(?usize, 3), deferredTargetActivationRow(false, 1, 3));
+}
 
 pub const State = struct {
     /// One physical drafting round. Retained deferred slots and logits own
@@ -134,17 +169,22 @@ pub const State = struct {
             }
         }
 
-        pub fn captureHidden(self: *@This(), value: *const decoder_forward.ForwardHiddenDevice, row: usize, source: decoder_forward.HiddenSource, resident: bool, sync: bool) !void {
-            if (resident) {
-                self.next_device = (try self.target.copyTargetHiddenRowFromHiddenToBackend(value, row, source, self.draft.context.cb)) orelse return error.UnsupportedBackend;
-                if (sync) self.draft.context.cb.evalTensor(self.next_device.?) catch {};
-            } else {
-                var target = self.target;
-                target.context.allocator = self.owner.allocator;
-                self.next_host = try target.dupeTargetHiddenRowFromHiddenDevice(value, row, source);
-            }
+        pub const DeferredTarget = struct {
+            cached_first: bool,
+            logit_base_row: usize,
+            accepted: usize,
+            source: decoder_forward.HiddenSource,
+            resident: bool,
+            sync: bool,
+        };
+
+        pub fn captureDeferredTarget(self: *@This(), value: decoder_forward.DeviceHiddenRows, request: DeferredTarget) !void {
+            const row = deferredTargetActivationRow(request.cached_first, request.logit_base_row, request.accepted) orelse return error.InvalidTensorShape;
+            if (row >= value.rows) return error.InvalidTensorShape;
+            try self.captureDevice(value, row, request.source, request.resident, request.sync);
         }
-        pub fn captureAllDevice(self: *@This(), value: *const decoder_forward.ForwardAllWithHiddenDevice, row: usize, source: decoder_forward.HiddenSource, resident: bool, sync: bool) !void {
+
+        pub fn captureDevice(self: *@This(), value: decoder_forward.DeviceHiddenRows, row: usize, source: decoder_forward.HiddenSource, resident: bool, sync: bool) !void {
             if (resident) {
                 self.next_device = (try self.target.copyTargetHiddenRowToBackend(value, row, source, self.draft.context.cb)) orelse return error.UnsupportedBackend;
                 if (sync) self.draft.context.cb.evalTensor(self.next_device.?) catch {};
@@ -329,7 +369,7 @@ pub const State = struct {
 
         const row = seq_len - 1;
         if (use_resident_draft) {
-            if (try target.copyTargetHiddenRowFromHiddenToBackend(&target_hidden, row, hidden_source, draft_cb)) |activation| {
+            if (try target.copyTargetHiddenRowToBackend(target_hidden.hiddenRows(), row, hidden_source, draft_cb)) |activation| {
                 self.replaceDevice(activation);
                 return;
             }
@@ -357,7 +397,7 @@ pub const State = struct {
         };
         const row = rows - 1;
         if (use_resident_draft) {
-            if (try target.copyTargetHiddenRowFromHiddenToBackend(&target_hidden, row, hidden_source, draft_cb)) |activation| {
+            if (try target.copyTargetHiddenRowToBackend(target_hidden.hiddenRows(), row, hidden_source, draft_cb)) |activation| {
                 self.replaceDevice(activation);
                 return true;
             }
@@ -371,7 +411,7 @@ pub const State = struct {
         // Host activations belong to this owner, even when its allocator is
         // different from the source runtime's temporary allocation domain.
         target.context.allocator = self.allocator;
-        return target.dupeTargetHiddenRowFromHiddenDevice(hidden, row, source);
+        return target.dupeTargetHiddenRowFromDevice(hidden.hiddenRows(), row, source);
     }
 
     pub const CacheEvent = struct {
@@ -381,7 +421,12 @@ pub const State = struct {
 
     /// The returned tensor is borrowed from this owner. Cache storage uses the
     /// draft backend; source model scaling and layout remain canonical.
-    pub fn cachedTargetEmbedding(self: *State, target_runtime: decoder_forward.Runtime, draft_model: *const gpt_mod.Config, token_id: i64, limit: usize) !?ops.CT {
+    pub fn cachedTargetEmbedding(self: *State, target_runtime: decoder_forward.Runtime, draft_model: *const gpt_mod.Config, token_id: i64) !?ops.CT {
+        const limit = @import("antfly_platform").env.getenvUsize("ANTFLY_GEMMA4_MTP_DRAFT_EMBED_CACHE") orelse 256;
+        return self.cachedTargetEmbeddingWithLimit(target_runtime, draft_model, token_id, limit);
+    }
+
+    fn cachedTargetEmbeddingWithLimit(self: *State, target_runtime: decoder_forward.Runtime, draft_model: *const gpt_mod.Config, token_id: i64, limit: usize) !?ops.CT {
         self.cache_event = .{};
         if (limit == 0) {
             self.cache_event.status = .disabled;
@@ -461,13 +506,27 @@ fn checkActualActivationOwner(draft_value: ComputeBackend, reference_value: Comp
     try std.testing.expect(!try state.replaceFromPrefillHidden(target, hidden, 2, .pre_norm, false, draft));
     try std.testing.expectEqualSlices(f32, &.{ -2, 4, 6, 8 }, state.host.?);
 
-    try std.testing.expect((try state.cachedTargetEmbedding(target, &draft_config, 1, 0)) == null);
+    {
+        var round = state.beginRound(target, target, true);
+        defer round.deinit();
+        const input = decoder_forward.DeviceHiddenRows{ .backend = target_cb, .hidden = hidden, .pre_norm_hidden = null, .rows = 2 };
+        var request = State.Round.DeferredTarget{ .cached_first = true, .logit_base_row = 0, .accepted = 1, .source = .final, .resident = false, .sync = false };
+        try std.testing.expectError(error.InvalidTensorShape, round.captureDeferredTarget(input, request));
+        request.accepted = 4;
+        try std.testing.expectError(error.InvalidTensorShape, round.captureDeferredTarget(input, request));
+        try std.testing.expect(round.next_host == null and round.next_device == null);
+        request.accepted = 3;
+        try round.captureDeferredTarget(input, request);
+        try std.testing.expectEqualSlices(f32, &.{ -2, 4, 6, 8 }, round.next_host.?);
+    }
+
+    try std.testing.expect((try state.cachedTargetEmbeddingWithLimit(target, &draft_config, 1, 0)) == null);
     try std.testing.expectEqual(.disabled, state.cache_event.status);
-    const copied = try state.cachedTargetEmbedding(target, &draft_config, 1, 2);
+    const copied = try state.cachedTargetEmbeddingWithLimit(target, &draft_config, 1, 2);
     if (draft.kind() == .metal) try std.testing.expect(copied != null);
     if (copied) |tensor| {
         try std.testing.expectEqual(.inserted, state.cache_event.status);
-        const hit = try state.cachedTargetEmbedding(target, &draft_config, 1, 2);
+        const hit = try state.cachedTargetEmbeddingWithLimit(target, &draft_config, 1, 2);
         try std.testing.expectEqual(.hit, state.cache_event.status);
         try std.testing.expectEqual(tensor, hit.?);
         const source_weight = try gpt_arch.getEmbeddingWeight(reference_cb, config);

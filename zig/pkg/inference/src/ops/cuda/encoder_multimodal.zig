@@ -27,6 +27,58 @@ pub const PixelScaleStorage = @import("../kernel_geometry.zig").PixelScaleStorag
 
 pub const PatchFormat = enum(u32) { pixel_rgb_centered, channel_planar_centered, channel_planar_unit };
 
+pub const AudioAttentionLayout = struct {
+    matrix_elements: usize,
+    relative_elements: usize,
+    span_bytes: [7]usize,
+
+    pub fn init(p: @import("../ops.zig").Gemma4AudioLocalAttentionParams) !AudioAttentionLayout {
+        if (p.rows == 0 or p.rows > std.math.maxInt(i32) or p.hidden == 0 or p.hidden > std.math.maxInt(u32) or
+            p.heads == 0 or p.heads > 65535 or p.head_dim == 0 or p.head_dim > std.math.maxInt(u32) or
+            p.chunk == 0 or p.chunk > std.math.maxInt(i32) or p.context_left < 2 or p.context_left > p.context or p.context > 24 or
+            !std.math.isFinite(p.query_scale) or !std.math.isFinite(p.k_scale) or !std.math.isFinite(p.logit_cap) or
+            p.logit_cap <= 0 or !std.math.isFinite(p.invalid_value)) return error.InvalidTensorShape;
+        const hidden = std.math.mul(usize, p.heads, p.head_dim) catch return error.InvalidTensorShape;
+        if (hidden != p.hidden) return error.InvalidTensorShape;
+        const matrix_elements = std.math.mul(usize, p.rows, hidden) catch return error.InvalidTensorShape;
+        const relative_elements = std.math.mul(usize, p.context_left, hidden) catch return error.InvalidTensorShape;
+        const matrix = std.math.mul(usize, matrix_elements, @sizeOf(f32)) catch return error.InvalidTensorShape;
+        const relative = std.math.mul(usize, relative_elements, @sizeOf(f32)) catch return error.InvalidTensorShape;
+        const scale = std.math.mul(usize, p.head_dim, @sizeOf(f32)) catch return error.InvalidTensorShape;
+        const mask = std.math.mul(usize, p.rows, @sizeOf(f32)) catch return error.InvalidTensorShape;
+        return .{ .matrix_elements = matrix_elements, .relative_elements = relative_elements, .span_bytes = .{ matrix, matrix, matrix, relative, scale, mask, matrix } };
+    }
+
+    pub fn validateInputs(self: AudioAttentionLayout, inputs: [6]Buffer) !void {
+        try @import("buffer.zig").validateRegions(6, inputs, self.span_bytes[0..6].*, @splat(@alignOf(f32)), 6);
+    }
+
+    pub fn validate(self: AudioAttentionLayout, q: Buffer, k: Buffer, v: Buffer, rel: Buffer, scales: Buffer, valid: Buffer, out: Buffer) !void {
+        try @import("buffer.zig").validateRegions(7, .{ q, k, v, rel, scales, valid, out }, self.span_bytes, @splat(@alignOf(f32)), 6);
+    }
+};
+
+test "CUDA audio attention declaration rejects truncated and aliased output spans" {
+    const layout = try AudioAttentionLayout.init(.{
+        .rows = 2,
+        .hidden = 4,
+        .heads = 1,
+        .head_dim = 4,
+        .chunk = 2,
+        .context = 2,
+        .context_left = 2,
+        .k_scale = 1,
+        .logit_cap = 50,
+        .invalid_value = -1e9,
+    });
+    const input: Buffer = .{ .ptr = 0x1000, .len = 32 };
+    const mask: Buffer = .{ .ptr = 0x2000, .len = 8 };
+    const out: Buffer = .{ .ptr = 0x3000, .len = 32 };
+    try layout.validate(input, input, input, input, input, mask, out);
+    try std.testing.expectError(error.InvalidShape, layout.validate(input, input, input, input, input, mask, input));
+    try std.testing.expectError(error.InvalidShape, layout.validate(input, input, input, input, input, .{ .ptr = mask.ptr, .len = 4 }, out));
+}
+
 pub const Attention = struct {
     batch: u32,
     seq: u32,
@@ -492,27 +544,8 @@ pub const Module = struct {
         try self.launch1d(ctx, self.pillow_vertical_patches, &args, @intCast(count));
     }
 
-    pub fn launchAudioAttention(self: *Module, ctx: *Context, out: Buffer, q: Buffer, k: Buffer, v: Buffer, rel: Buffer, scales: Buffer, valid: Buffer, p: @import("../ops.zig").Gemma4AudioLocalAttentionParams) !void {
-        if (p.rows == 0 or p.rows > std.math.maxInt(i32) or p.hidden == 0 or p.heads == 0 or p.heads > 65535 or p.head_dim == 0 or
-            p.chunk == 0 or p.chunk > std.math.maxInt(i32) or p.context == 0 or p.context_left < 2 or p.context_left > p.context or p.context > 24 or
-            !std.math.isFinite(p.query_scale) or !std.math.isFinite(p.k_scale) or !std.math.isFinite(p.logit_cap) or p.logit_cap <= 0 or !std.math.isFinite(p.invalid_value))
-            return error.InvalidEmbeddingGemma2Shape;
-        if (p.arithmetic == .combined_f32 and p.publication != .f32) return error.InvalidEmbeddingGemma2Shape;
-        const derived_hidden = std.math.mul(usize, p.heads, p.head_dim) catch return error.InvalidEmbeddingGemma2Shape;
-        if (derived_hidden != p.hidden) return error.InvalidEmbeddingGemma2Shape;
-        const count = try std.math.mul(usize, p.rows, p.hidden);
-        const matrix_bytes = try std.math.mul(usize, count, @sizeOf(f32));
-        const relative_count = try std.math.mul(usize, p.context_left, p.hidden);
-        const relative_bytes = try std.math.mul(usize, relative_count, @sizeOf(f32));
-        const scale_bytes = try std.math.mul(usize, p.head_dim, @sizeOf(f32));
-        const valid_bytes = try std.math.mul(usize, p.rows, @sizeOf(f32));
-        try require(out, matrix_bytes);
-        try require(q, matrix_bytes);
-        try require(k, matrix_bytes);
-        try require(v, matrix_bytes);
-        try require(rel, relative_bytes);
-        try require(scales, scale_bytes);
-        try require(valid, valid_bytes);
+    pub fn launchAudioAttention(self: *Module, ctx: *Context, out: Buffer, q: Buffer, k: Buffer, v: Buffer, rel: Buffer, scales: Buffer, valid: Buffer, layout: AudioAttentionLayout, p: @import("../ops.zig").Gemma4AudioLocalAttentionParams) !void {
+        try layout.validate(q, k, v, rel, scales, valid, out);
         var op = out.ptr;
         var qp = q.ptr;
         var kp = k.ptr;
@@ -520,7 +553,6 @@ pub const Module = struct {
         var rp = rel.ptr;
         var sp = scales.ptr;
         var mp = valid.ptr;
-        if (p.rows > std.math.maxInt(u32) or p.hidden > std.math.maxInt(u32) or p.head_dim > std.math.maxInt(u32) or p.chunk > std.math.maxInt(u32)) return error.InvalidEmbeddingGemma2Shape;
         var rows: u32 = @intCast(p.rows);
         var hidden: u32 = @intCast(p.hidden);
         var heads: u32 = @intCast(p.heads);

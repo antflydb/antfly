@@ -57,6 +57,7 @@ const CapabilityReason = partition.CapabilityReason;
 /// failing inside a Metal partition.
 pub fn supportsMetalEagerGraph(op: OpCode) bool {
     return switch (op) {
+        .fused_cross_attention => |attrs| attrs.all_keys_visible and attrs.batch == 1,
         .parameter,
         .constant,
         .neg,
@@ -350,6 +351,7 @@ fn metalEagerGraphNodeHasSupportedResidentShape(query: CapabilityQuery) bool {
         .argmax => metalArgmaxHasResidentShape(query),
         .fused_sdpa => metalSdpaHasResidentShape(query),
         .fused_gqa_causal_attention => metalGqaCausalAttentionHasResidentShape(query),
+        .fused_cross_attention => @import("../ops/kernel_descriptor.zig").lower(query.graph, query.node_id) != null,
         .fused_softmax, .fused_log_softmax => metalSoftmaxHasResidentShape(query),
         .convert_dtype => metalConvertDTypeHasResidentShape(query),
         else => true,
@@ -548,14 +550,17 @@ fn metalGatherHasResidentShape(query: CapabilityQuery) bool {
         .gather => |attrs| attrs,
         else => return false,
     };
-    if (attrs.elements or attrs.nd) return false;
-    if (attrs.axis != 0) return false;
+    if (attrs.elements or attrs.nd or attrs.batch_dims != 0) return false;
     const input_shape = nodeInputShape(query, 0) orelse return false;
     const indices_shape = nodeInputShape(query, 1) orelse return false;
     if (input_shape.dtype != .f32) return false;
-    if (input_shape.rank() != 2) return false;
-    if (indices_shape.rank() + 1 > ml.graph.shape.max_rank) return false;
-    return shapeHasConcreteElements(input_shape) and shapeHasConcreteElements(indices_shape);
+    if (!shapeHasConcreteElements(input_shape) or !shapeHasConcreteElements(indices_shape)) return false;
+    return switch (indices_shape.dtype) {
+        .f32 => attrs.axis == 0 and input_shape.rank() == 2 and indices_shape.rank() + 1 <= ml.graph.shape.max_rank,
+        .i32, .i64 => attrs.axis < input_shape.rank() and
+            @as(usize, input_shape.rank()) - 1 + indices_shape.rank() <= ml.graph.shape.max_rank,
+        else => false,
+    };
 }
 
 fn metalReduceHasResidentShape(query: CapabilityQuery) bool {
@@ -763,6 +768,10 @@ fn metalGqaCausalAttentionHasResidentShape(query: CapabilityQuery) bool {
         .fused_gqa_causal_attention => |attrs| attrs,
         else => return false,
     };
+    if (attrs.functional_kv) {
+        const descriptor = @import("../ops/kernel_descriptor.zig").lower(query.graph, query.node_id) orelse return false;
+        if (descriptor.operation.dense_attention_rows.isGroupedCausalSuffix()) return true;
+    }
     if (attrs.batch == 0 or attrs.seq_len == 0 or attrs.num_heads == 0 or attrs.head_dim == 0) return false;
     const kv_heads = if (attrs.num_kv_heads != 0) attrs.num_kv_heads else attrs.num_heads;
     const kv_len = if (attrs.kv_seq_len != 0) attrs.kv_seq_len else attrs.seq_len;
@@ -1513,16 +1522,19 @@ test "metal eager graph capability decisions are attrs and shape aware" {
     nd_query.op.gather.nd = true;
     try std.testing.expect(!decideMetalEagerGraph(nd_query).can_execute);
 
-    const invalid_gather_query = CapabilityQuery{
+    const axis1_gather_query = CapabilityQuery{
         .graph = &gather_graph,
         .node_id = gather_axis1,
         .op = gather_graph.node(gather_axis1).op,
         .tensor_descs = gather_seeds,
     };
+    try std.testing.expect(decideMetalEagerGraph(axis1_gather_query).can_execute);
+    try std.testing.expect(!metalEagerGraphNodeIsHostAssisted(axis1_gather_query));
+    var invalid_gather_query = axis1_gather_query;
+    invalid_gather_query.op.gather.axis = 2;
     const invalid_gather_decision = decideMetalEagerGraph(invalid_gather_query);
     try std.testing.expect(!invalid_gather_decision.can_execute);
     try std.testing.expectEqual(CapabilityReason.unsupported_op, invalid_gather_decision.reason);
-    try std.testing.expect(!metalEagerGraphNodeIsHostAssisted(invalid_gather_query));
 
     var argmax_graph = Graph.init(allocator);
     defer argmax_graph.deinit();
@@ -2258,7 +2270,7 @@ test "gemma4 graph planner keeps real qkv projection layout on metal" {
     });
     defer plan.deinit();
 
-    const reachable = try allocReachableFromOutputs(allocator, &g);
+    const reachable = try ml.graph.passes.dce.computeReachable(allocator, &g);
     defer allocator.free(reachable);
 
     try expectReachableNamedWeightLinearConsumersOnMetal(&g, &plan, reachable, "model.layers.0.self_attn.q_proj.weight", .mul_mv_ext);
@@ -2529,26 +2541,6 @@ fn expectNodePlannedOnMetal(
         });
     }
     try std.testing.expectEqual(contracts.BackendKind.metal, backend);
-}
-
-fn allocReachableFromOutputs(allocator: std.mem.Allocator, graph: *const Graph) ![]bool {
-    const reachable = try allocator.alloc(bool, graph.nodeCount());
-    @memset(reachable, false);
-    for (graph.outputs.items) |output| {
-        markReachable(graph, reachable, output);
-    }
-    return reachable;
-}
-
-fn markReachable(graph: *const Graph, reachable: []bool, node_id: NodeId) void {
-    if (node_id == null_node) return;
-    const idx: usize = @intCast(node_id);
-    if (idx >= reachable.len or reachable[idx]) return;
-    reachable[idx] = true;
-    const node = graph.node(node_id);
-    for (node.getInputs()) |input_id| {
-        markReachable(graph, reachable, input_id);
-    }
 }
 
 fn expectSeededQ8LinearRoutesToMetal(rows: usize, expected_operator: operator_plan.Operator) !void {

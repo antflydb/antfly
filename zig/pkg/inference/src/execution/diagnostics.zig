@@ -92,11 +92,13 @@ pub const PendingInterval = struct {
         /// Sum of callback host wall time, excluding inter-phase waits.
         callback_wall_ns: ?u64 = null,
         native_assigned_dispatches: u64 = 0,
+        backend_callback_returns: observation.EntryReturns = .{},
         metal_encoded_dispatches: ?u64 = null,
         metal_vendor_encodes: ?u64 = null,
         metal_command_submissions: ?u64 = null,
         metal_command_waits: ?u64 = null,
         cuda_accepted_launch_calls: ?u64 = null,
+        cuda_host_waits: ?observation.CudaHostWaits = null,
 
         pub fn join(self: *ObservedPhases, transfers: @import("transfer_audit.zig").Measurements, submission: observation.Counters, cuda_launch_calls: ?u64, wall_ns: ?u64) void {
             self.uploads +|= transfers.upload_calls;
@@ -111,11 +113,16 @@ pub const PendingInterval = struct {
             self.index_metadata_host_access_bytes +|= transfers.index_metadata_host_access_bytes;
             self.callback_wall_ns = sum(self.count, self.callback_wall_ns, wall_ns);
             self.native_assigned_dispatches +|= submission.native_assigned_dispatches;
+            self.backend_callback_returns.accumulate(submission.backend_entries.totals);
             self.metal_encoded_dispatches = sum(self.count, self.metal_encoded_dispatches, submission.metal_encoded_dispatches);
             self.metal_vendor_encodes = sum(self.count, self.metal_vendor_encodes, submission.metal_vendor_encodes);
             self.metal_command_submissions = sum(self.count, self.metal_command_submissions, submission.metal_command_submissions);
             self.metal_command_waits = sum(self.count, self.metal_command_waits, submission.metal_command_waits);
             self.cuda_accepted_launch_calls = sum(self.count, self.cuda_accepted_launch_calls, cuda_launch_calls);
+            self.cuda_host_waits = if (self.count == 0) submission.cuda_host_waits else if (self.cuda_host_waits) |prior|
+                if (submission.cuda_host_waits) |delta| prior.add(delta) else null
+            else
+                null;
             self.count +|= 1;
         }
 
@@ -136,6 +143,9 @@ pub const PendingInterval = struct {
     counters_scope: enum { synchronous_phase_only } = .synchronous_phase_only,
     whole_interval_counters: enum { unavailable } = .unavailable,
     callback_wall_ns: ?u64 = null,
+    /// Host elapsed time from the start of this pending observation through this phase.
+    /// Includes inter-phase time and makes no claim about device execution.
+    elapsed_host_wall_ns: ?u64 = null,
     observed_phases: ?ObservedPhases = null,
 };
 pub const PublicationScope = enum { program_execution, session_numerical_dispatch, shared_batch_numerical_dispatch, session_preparation };
@@ -155,6 +165,8 @@ pub const NativeProgramConstruction = struct {
     producer: enum { decoder_runtime, whisper_single_token_schedule, whisper_dense_decoder_schedule } = .decoder_runtime,
     outcome: enum { not_attempted, declined, prepared, failed },
     error_name: ?Text = null,
+    /// Cold result for an explicitly requested causal prefill phase.
+    initial_outcome: ?enum { prepared, unsupported, admission_pressure } = null,
     initial_query_rows: ?usize = null,
     /// Independently sampled initial-phase cache; not an atomic two-cache view.
     initial_definition_templates: ?NativeDefinitionTemplates = null,
@@ -178,6 +190,7 @@ pub const StagePlacement = struct {
     pub const Reason = enum {
         resident_pair,
         resident_incremental,
+        resident_merged_decoder,
         dispatcher_host_only,
         no_source_context,
         foreign_context,
@@ -198,7 +211,7 @@ pub const DecoderRoute = struct {
     backend: @import("../backends/backends.zig").BackendType,
     encoder_storage: enum { host, resident },
     /// A provider-owned state may itself use host storage. This field names
-    /// the owner and makes the merged decoder's host-tensor ABI explicit.
+    /// the owner independently of encoder placement.
     cache_custody: enum { unavailable, none, merged_resident, native_runtime, compiled_runtime },
     native_allowed: bool,
     merged_allowed: bool,
@@ -207,7 +220,34 @@ pub const DecoderRoute = struct {
     requested_rows: enum { final_available, full_prefix },
 };
 
+/// Selected geometry for the prefill request. Physical submissions and
+/// counters still describe the work actually observed in the interval.
+pub const PrefillGeometry = struct {
+    max_append_rows: u32,
+    attention_workspace_rows: u32,
+    cache_capacity_tokens: u32,
+    /// Dedicated prefill scratch payload. The decode arena, cache, and
+    /// opaque provider allocations are outside this measure.
+    workspace: ?struct { planned_bytes: usize, bound_bytes: usize } = null,
+};
+
+/// State published by a managed prefill callback, including work retired
+/// before a later chunk fails. Counts exclude the subsequent decode phase.
+pub const PrefillProgress = struct {
+    committed_input_tokens: u32 = 0,
+    committed_chunks: u32 = 0,
+    selected_first_token: bool = false,
+
+    pub fn commitThrough(self: *PrefillProgress, tokens: u32) void {
+        if (tokens <= self.committed_input_tokens) return;
+        self.committed_input_tokens = tokens;
+        self.committed_chunks += 1;
+    }
+};
+
 pub const Snapshot = struct {
+    planned_prefill: ?PrefillGeometry = null,
+    prefill_progress: ?PrefillProgress = null,
     decoder_route: ?DecoderRoute = null,
     stage_placement: ?StagePlacement = null,
     native_program_construction: ?NativeProgramConstruction = null,
@@ -251,6 +291,8 @@ pub const Capture = struct {
     diagnostics: *const Diagnostics,
     previous: ?*Capture = null,
     latest: ?Snapshot = null,
+    stage_placement: ?StagePlacement = null,
+    decoder_route: ?DecoderRoute = null,
     include_programs: bool = false,
     last_program_owner: ?usize = null,
     pub fn begin(self: *Capture, diagnostics: *const Diagnostics) void {
@@ -284,11 +326,21 @@ pub const Capture = struct {
         std.debug.assert(active_capture == self);
         active_capture = self.previous;
         if (self.include_programs) program_observation_depth -= 1;
-        return self.latest;
+        if (self.stage_placement == null and self.decoder_route == null) return self.latest;
+        var snapshot = self.latest orelse return null;
+        snapshot.stage_placement = self.stage_placement;
+        snapshot.decoder_route = self.decoder_route;
+        return snapshot.owned();
     }
     fn published(diagnostics: *const Diagnostics, value: Snapshot) void {
         var current = active_capture;
         while (current) |capture| : (current = capture.previous) if (capture.diagnostics == diagnostics or capture.last_program_owner == @intFromPtr(diagnostics)) {
+            if (value.stage_placement) |placement| capture.stage_placement = placement;
+            if (value.decoder_route) |route| capture.decoder_route = route;
+            // Cold routing can follow encoder execution in the same request.
+            // Keep the numerical snapshot and merge the decisions at finish.
+            const route_only = value.scope == .session_preparation and (value.stage_placement != null or value.decoder_route != null);
+            if (route_only and capture.latest != null and capture.latest.?.scope != .session_preparation) continue;
             capture.latest = value;
         };
     }
@@ -310,19 +362,7 @@ fn observedRuntime(after: ops.RuntimeTelemetry, before: ?Start) ops.RuntimeTelem
         runtime.submission = start.scope.snapshot();
         if (start.device_owners) |owners| runtime.device_owners = owners.snapshot();
         if (start.device_roots) |roots| runtime.device_allocator_roots = roots.snapshot();
-        if (start.kernels) |kernels| {
-            runtime.resolved_project_cuda_launches = kernels.values;
-            runtime.resolved_project_metal_dispatches = if (comptime @import("build_options").enable_metal) kernels.metal else null;
-            runtime.terminal_native_bodies = kernels.native_bodies;
-            runtime.selected_native_dispatches = kernels.native_dispatches;
-            runtime.joined_native_workers = kernels.native_workers;
-            runtime.native_quant_worker_callbacks = kernels.quant_worker_callbacks;
-            runtime.native_attention_programs = kernels.attention_programs;
-            runtime.native_activation_programs = kernels.activation_programs;
-            runtime.authored_native_programs = kernels.native_programs;
-            runtime.authored_native_program_bank = kernels.native_program_bank;
-            runtime.owned_native_fallbacks = kernels.native_fallbacks;
-        }
+        if (start.kernels) |kernels| runtime.recordKernelInterval(kernels);
         if (start.metal_buffers) |buffers| runtime.metal_buffer_interval = buffers.snapshot(@import("build_options").enable_metal);
         if (start.video_resources) |resources| if (resources.snapshot(@import("build_options").enable_metal)) |value| {
             runtime.video_owned_resources = @import("runtime_telemetry.zig").VideoOwnedResources.from(value);
@@ -547,4 +587,35 @@ test "program callback capture preserves comptime arguments error unwinding and 
     root_owner.configure(false);
     try std.testing.expectEqual(@as(u8, 9), try root_owner.callProgram(&child, .{ .fixed = .{} }, Probe.run, .{ &child, &counters, false }));
     try std.testing.expect(root_owner.snapshot() == null and child.snapshot() == null);
+}
+
+test "invocation capture preserves route metadata alongside later program counters" {
+    var owner = Diagnostics{};
+    var program = Diagnostics{};
+    var unrelated = Diagnostics{};
+    var capture: Capture = undefined;
+    capture.beginPrograms(&owner, true);
+    owner.publish(.{ .scope = .session_preparation, .stage_placement = .{ .source_backend = .native, .destination_backend = .native, .reason = .resident_pair } });
+    unrelated.publish(.{ .stage_placement = .{ .source_backend = .native, .destination_backend = .cuda, .reason = .foreign_context } });
+    program.publishProgram(.{ .execution = .{ .assigned_kernel_dispatches = 3 } });
+    owner.publish(.{ .scope = .session_preparation, .decoder_route = .{
+        .selected = .full_prefix,
+        .backend = .native,
+        .encoder_storage = .resident,
+        .cache_custody = .none,
+        .native_allowed = false,
+        .merged_allowed = false,
+        .compiled_cache_requested = null,
+        .expected_initial_query_rows = null,
+        .requested_rows = .final_available,
+    } });
+    const captured = capture.finish().?;
+    try std.testing.expectEqual(StagePlacement.Reason.resident_pair, captured.report.?.stage_placement.?.reason);
+    try std.testing.expectEqual(DecoderRoute.Selection.full_prefix, captured.report.?.decoder_route.?.selected);
+    try std.testing.expectEqual(@as(u64, 3), captured.execution.?.assigned_kernel_dispatches);
+
+    capture.beginPrograms(&owner, true);
+    program.publishProgram(.{ .execution = .{ .assigned_kernel_dispatches = 1 } });
+    const next = capture.finish().?;
+    try std.testing.expect(next.report.?.stage_placement == null and next.report.?.decoder_route == null);
 }

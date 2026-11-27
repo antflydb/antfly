@@ -127,8 +127,12 @@ pub const TempArenaPlanner = struct {
 
     candidate_lengths: std.ArrayListUnmanaged(usize) = .empty,
     current_lengths: std.ArrayListUnmanaged(usize) = .empty,
+    // Matching eager and replayed events advance this cursor. Only a
+    // divergence needs mutable event storage.
+    matched_prefix: usize = 0,
     observing: bool = false,
     active: bool = false,
+    installation_pending: bool = false,
     ready_for_capture: bool = false,
     matching_iterations: u8 = 0,
     allocation_seq_base: usize = 0,
@@ -140,6 +144,7 @@ pub const TempArenaPlanner = struct {
     peak_planned_physical_high_water_bytes: usize = 0,
     admission_budget_bytes: usize = 0,
     admission_denials: usize = 0,
+    capture_binding_denials: usize = 0,
     disabled: bool = false,
     pinned_validation_failed: bool = false,
     replay_validation_failed: bool = false,
@@ -158,7 +163,7 @@ pub const TempArenaPlanner = struct {
     }
 
     pub fn period(self: *const TempArenaPlanner) usize {
-        return if (self.active) self.candidate_lengths.items.len else 0;
+        return if (self.active and !self.disabled and !self.installation_pending) self.candidate_lengths.items.len else 0;
     }
 
     /// Account and admit the learned physical layout before any pinned slot is
@@ -178,6 +183,7 @@ pub const TempArenaPlanner = struct {
             self.admission_denials += 1;
             self.disabled = true;
             self.active = false;
+            self.installation_pending = false;
             self.ready_for_capture = false;
         }
         return admission;
@@ -190,13 +196,31 @@ pub const TempArenaPlanner = struct {
         max_slots: usize,
     ) !void {
         if (self.disabled or !self.observing) return;
-        if (byte_len == 0 or self.current_lengths.items.len >= max_slots) {
-            self.disabled = true;
-            self.active = false;
-            self.ready_for_capture = false;
+        if (self.installation_pending) self.markPinnedValidationFailure();
+        const candidate = self.candidate_lengths.items;
+        if (byte_len == 0 or self.matched_prefix + self.current_lengths.items.len >= max_slots) {
+            self.disableObservation();
             return;
         }
-        try self.current_lengths.append(allocator, byte_len);
+        if (self.current_lengths.items.len == 0 and self.matched_prefix < candidate.len and
+            candidate[self.matched_prefix] == byte_len)
+        {
+            self.matched_prefix += 1;
+            return;
+        }
+        self.current_lengths.ensureUnusedCapacity(allocator, self.matched_prefix + 1) catch |err| {
+            self.disableObservation();
+            return err;
+        };
+        self.current_lengths.appendSliceAssumeCapacity(candidate[0..self.matched_prefix]);
+        self.matched_prefix = 0;
+        self.current_lengths.appendAssumeCapacity(byte_len);
+    }
+
+    fn disableObservation(self: *TempArenaPlanner) void {
+        // Keep the active flag until the boundary can retire graph addresses.
+        self.disabled = true;
+        self.ready_for_capture = false;
     }
 
     pub fn markPinnedValidationFailure(self: *TempArenaPlanner) void {
@@ -218,7 +242,7 @@ pub const TempArenaPlanner = struct {
         allocation_seq: usize,
         allocation_count: usize,
     ) bool {
-        if (!self.active or !self.ready_for_capture or self.pinned_validation_failed or
+        if (!self.active or self.installation_pending or !self.ready_for_capture or self.pinned_validation_failed or
             self.replay_validation_failed)
         {
             return false;
@@ -226,18 +250,12 @@ pub const TempArenaPlanner = struct {
         const candidate = self.candidate_lengths.items;
         if (candidate.len == 0 or allocation_seq < self.allocation_seq_base) return false;
         const phase = (allocation_seq - self.allocation_seq_base) % candidate.len;
-        if (phase != self.current_lengths.items.len) return false;
-        if (allocation_count > candidate.len - phase) return false;
-        if (self.current_lengths.capacity < phase + allocation_count) return false;
-        return std.mem.eql(usize, candidate[0..phase], self.current_lengths.items);
+        return self.current_lengths.items.len == 0 and phase == self.matched_prefix and
+            allocation_count <= candidate.len - phase;
     }
 
-    /// CUDA graph replay skips the captured host allocation calls. Rebuild
-    /// that exact interval from the learned ABI so the next decode boundary
-    /// validates the complete iteration, including any uncaptured prefix or
-    /// tail. Merely marking the interval as replayed is unsafe: a missing or
-    /// extra tail allocation can phase-shift cyclic pinned slots, and repeated
-    /// byte lengths can otherwise hide the drift.
+    /// Replay extends an exact prefix without copying the candidate.
+    /// The iteration boundary still checks that every event was observed.
     pub fn markGraphReplay(
         self: *TempArenaPlanner,
         allocation_seq: usize,
@@ -247,26 +265,25 @@ pub const TempArenaPlanner = struct {
             if (self.active) self.replay_validation_failed = true;
             return false;
         }
-        const phase = self.current_lengths.items.len;
-        const end = phase + allocation_count;
-        for (self.candidate_lengths.items[phase..end]) |byte_len| {
-            self.current_lengths.appendAssumeCapacity(byte_len);
-        }
+        self.matched_prefix += allocation_count;
         return true;
     }
 
     /// Mark the beginning of the next decode iteration. The lengths collected
     /// since the preceding boundary describe the just-finished iteration.
-    pub fn beginDecodeIteration(
-        self: *TempArenaPlanner,
-        allocator: std.mem.Allocator,
-        allocation_seq: usize,
-    ) !BoundaryResult {
-        if (self.disabled) return .unchanged;
+    pub fn beginDecodeIteration(self: *TempArenaPlanner, allocation_seq: usize) BoundaryResult {
+        if (self.installation_pending) return .unchanged;
+        if (self.disabled) {
+            if (!self.active) return .unchanged;
+            self.active = false;
+            self.invalidations += 1;
+            self.clearTrace();
+            return .invalidated;
+        }
         self.capture_warmup_boundaries +|= 1;
         if (!self.observing) {
             self.observing = true;
-            self.current_lengths.clearRetainingCapacity();
+            self.clearTrace();
             return .observing;
         }
 
@@ -282,39 +299,35 @@ pub const TempArenaPlanner = struct {
             self.pinned_validation_failed = false;
             self.invalidations += 1;
             self.matching_iterations = if (self.candidate_lengths.items.len == 0) 0 else 1;
-            self.current_lengths.clearRetainingCapacity();
+            self.clearTrace();
             return .invalidated;
         }
 
-        const matches = std.mem.eql(
-            usize,
-            self.candidate_lengths.items,
-            self.current_lengths.items,
-        );
-        if (self.active and (!matches or self.pinned_validation_failed)) {
+        const matches = self.current_lengths.items.len == 0 and self.matched_prefix == self.candidate_lengths.items.len;
+        if (self.active and !matches) {
+            self.replaceCandidate();
             self.active = false;
             self.ready_for_capture = false;
             self.replay_validation_failed = false;
             self.pinned_validation_failed = false;
             self.invalidations += 1;
-            try self.replaceCandidate(allocator);
             self.matching_iterations = if (self.candidate_lengths.items.len == 0) 0 else 1;
-            self.current_lengths.clearRetainingCapacity();
+            self.clearTrace();
             return .invalidated;
         }
 
         if (self.candidate_lengths.items.len == 0) {
-            try self.replaceCandidate(allocator);
+            self.replaceCandidate();
             self.matching_iterations = if (self.candidate_lengths.items.len == 0) 0 else 1;
         } else if (matches) {
             if (self.matching_iterations < std.math.maxInt(u8)) self.matching_iterations += 1;
         } else {
             self.invalidations += 1;
-            try self.replaceCandidate(allocator);
+            self.replaceCandidate();
             self.matching_iterations = if (self.candidate_lengths.items.len == 0) 0 else 1;
         }
 
-        self.current_lengths.clearRetainingCapacity();
+        self.clearTrace();
         if (self.active) {
             // The first complete iteration using pinned slots matched the
             // learned ABI. Capture may begin at the next boundary, and any
@@ -325,6 +338,7 @@ pub const TempArenaPlanner = struct {
         }
         if (self.matching_iterations >= required_matching_iterations and self.candidate_lengths.items.len != 0) {
             self.active = true;
+            self.installation_pending = true;
             self.ready_for_capture = false;
             self.allocation_seq_base = allocation_seq;
             self.activations += 1;
@@ -336,9 +350,10 @@ pub const TempArenaPlanner = struct {
     /// Preserve the last validated shape as a seed across request boundaries,
     /// but require the new request to prove it once before pinning addresses.
     pub fn resetForRequest(self: *TempArenaPlanner) void {
-        self.current_lengths.clearRetainingCapacity();
+        self.clearTrace();
         self.observing = false;
         self.active = false;
+        self.installation_pending = false;
         self.ready_for_capture = false;
         self.replay_validation_failed = false;
         self.pinned_validation_failed = false;
@@ -347,9 +362,36 @@ pub const TempArenaPlanner = struct {
         self.matching_iterations = if (self.candidate_lengths.items.len == 0) 0 else 1;
     }
 
-    fn replaceCandidate(self: *TempArenaPlanner, allocator: std.mem.Allocator) !void {
-        self.candidate_lengths.clearRetainingCapacity();
-        try self.candidate_lengths.appendSlice(allocator, self.current_lengths.items);
+    /// A proposed layout never authorizes pinned addressing when installing
+    /// its slot metadata failed. Keep the lengths only as an eager seed.
+    pub fn publishInstallation(self: *TempArenaPlanner) void {
+        std.debug.assert(self.active and self.installation_pending and !self.disabled and !self.pinned_validation_failed);
+        self.installation_pending = false;
+    }
+
+    pub fn abandonInstallation(self: *TempArenaPlanner) void {
+        self.active = false;
+        self.installation_pending = false;
+        self.ready_for_capture = false;
+        self.pinned_validation_failed = false;
+        self.allocation_seq_base = 0;
+        self.matching_iterations = 1;
+        self.invalidations += 1;
+    }
+
+    fn clearTrace(self: *TempArenaPlanner) void {
+        self.matched_prefix = 0;
+        self.current_lengths.clearRetainingCapacity();
+    }
+
+    fn replaceCandidate(self: *TempArenaPlanner) void {
+        if (self.current_lengths.items.len == 0) {
+            // A shortened trace already has its bytes in the candidate.
+            self.candidate_lengths.items.len = self.matched_prefix;
+        } else {
+            std.mem.swap(std.ArrayListUnmanaged(usize), &self.candidate_lengths, &self.current_lengths);
+        }
+        self.clearTrace();
     }
 };
 
@@ -387,15 +429,17 @@ test "CUDA temp arena planner requires repeatability and a pinned validation ite
     var planner: TempArenaPlanner = .{};
     defer planner.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(TempArenaPlanner.BoundaryResult.observing, try planner.beginDecodeIteration(std.testing.allocator, 100));
+    try std.testing.expectEqual(TempArenaPlanner.BoundaryResult.observing, planner.beginDecodeIteration(100));
     try planner.noteAllocation(std.testing.allocator, 64, 16);
     try planner.noteAllocation(std.testing.allocator, 128, 16);
-    try std.testing.expectEqual(TempArenaPlanner.BoundaryResult.observing, try planner.beginDecodeIteration(std.testing.allocator, 102));
+    try std.testing.expectEqual(TempArenaPlanner.BoundaryResult.observing, planner.beginDecodeIteration(102));
     try std.testing.expect(!planner.active);
 
     try planner.noteAllocation(std.testing.allocator, 64, 16);
     try planner.noteAllocation(std.testing.allocator, 128, 16);
-    try std.testing.expectEqual(TempArenaPlanner.BoundaryResult.activated, try planner.beginDecodeIteration(std.testing.allocator, 104));
+    try std.testing.expectEqual(TempArenaPlanner.BoundaryResult.activated, planner.beginDecodeIteration(104));
+    try std.testing.expectEqual(@as(usize, 0), planner.period());
+    planner.publishInstallation();
     try std.testing.expect(planner.active);
     try std.testing.expect(!planner.ready_for_capture);
     try std.testing.expectEqual(@as(usize, 2), planner.period());
@@ -403,33 +447,54 @@ test "CUDA temp arena planner requires repeatability and a pinned validation ite
 
     try planner.noteAllocation(std.testing.allocator, 64, 16);
     try planner.noteAllocation(std.testing.allocator, 128, 16);
-    try std.testing.expectEqual(TempArenaPlanner.BoundaryResult.unchanged, try planner.beginDecodeIteration(std.testing.allocator, 106));
+    try std.testing.expectEqual(TempArenaPlanner.BoundaryResult.unchanged, planner.beginDecodeIteration(106));
     try std.testing.expect(planner.ready_for_capture);
 
     // Replayed graphs do not execute host allocation calls.
     try std.testing.expect(planner.markGraphReplay(106, 2));
-    try std.testing.expectEqual(TempArenaPlanner.BoundaryResult.unchanged, try planner.beginDecodeIteration(std.testing.allocator, 108));
+    try std.testing.expectEqual(TempArenaPlanner.BoundaryResult.unchanged, planner.beginDecodeIteration(108));
     try std.testing.expect(planner.ready_for_capture);
+}
+
+test "CUDA temp arena proposal exposes no pinned slots and detects an intervening allocation" {
+    const allocator = std.testing.allocator;
+    var planner: TempArenaPlanner = .{};
+    defer planner.deinit(allocator);
+    try std.testing.expectEqual(.observing, planner.beginDecodeIteration(0));
+    try planner.noteAllocation(allocator, 64, 16);
+    try std.testing.expectEqual(.observing, planner.beginDecodeIteration(1));
+    try planner.noteAllocation(allocator, 64, 16);
+    try std.testing.expectEqual(.activated, planner.beginDecodeIteration(2));
+    try std.testing.expectEqual(@as(usize, 0), planner.period());
+    try planner.noteAllocation(allocator, 64, 16);
+    try std.testing.expect(planner.pinned_validation_failed);
+    try std.testing.expect(!planner.canGraphReplay(2, 1));
+    planner.abandonInstallation();
+    try std.testing.expectEqual(@as(usize, 0), planner.period());
+    try std.testing.expectEqual(.activated, planner.beginDecodeIteration(3));
+    planner.publishInstallation();
+    try std.testing.expectEqual(@as(usize, 1), planner.period());
+    try std.testing.expect(!planner.canGraphReplay(3, 1));
 }
 
 test "CUDA temp arena planner invalidates on shape drift and relearns" {
     var planner: TempArenaPlanner = .{};
     defer planner.deinit(std.testing.allocator);
 
-    _ = try planner.beginDecodeIteration(std.testing.allocator, 0);
+    _ = planner.beginDecodeIteration(0);
     inline for (0..2) |_| {
         try planner.noteAllocation(std.testing.allocator, 64, 8);
         try planner.noteAllocation(std.testing.allocator, 128, 8);
-        _ = try planner.beginDecodeIteration(std.testing.allocator, 2);
+        if (planner.beginDecodeIteration(2) == .activated) planner.publishInstallation();
     }
     try planner.noteAllocation(std.testing.allocator, 64, 8);
     try planner.noteAllocation(std.testing.allocator, 128, 8);
-    _ = try planner.beginDecodeIteration(std.testing.allocator, 4);
+    _ = planner.beginDecodeIteration(4);
     try std.testing.expect(planner.ready_for_capture);
 
     try planner.noteAllocation(std.testing.allocator, 64, 8);
     try planner.noteAllocation(std.testing.allocator, 256, 8);
-    try std.testing.expectEqual(TempArenaPlanner.BoundaryResult.invalidated, try planner.beginDecodeIteration(std.testing.allocator, 6));
+    try std.testing.expectEqual(TempArenaPlanner.BoundaryResult.invalidated, planner.beginDecodeIteration(6));
     try std.testing.expect(!planner.active);
     try std.testing.expect(!planner.ready_for_capture);
     try std.testing.expectEqualSlices(usize, &.{ 64, 256 }, planner.candidate_lengths.items);
@@ -448,10 +513,12 @@ test "CUDA temp arena planner keeps a validated request seed but requires reprov
     try std.testing.expect(!planner.active);
     try std.testing.expect(!planner.ready_for_capture);
     try std.testing.expectEqual(@as(u8, 1), planner.matching_iterations);
-    _ = try planner.beginDecodeIteration(std.testing.allocator, 200);
+    _ = planner.beginDecodeIteration(200);
     try planner.noteAllocation(std.testing.allocator, 32, 8);
     try planner.noteAllocation(std.testing.allocator, 96, 8);
-    try std.testing.expectEqual(TempArenaPlanner.BoundaryResult.activated, try planner.beginDecodeIteration(std.testing.allocator, 202));
+    try std.testing.expectEqual(TempArenaPlanner.BoundaryResult.activated, planner.beginDecodeIteration(202));
+    try std.testing.expectEqual(@as(usize, 0), planner.period());
+    planner.publishInstallation();
 }
 
 test "CUDA temp arena planner rejects a repeated shape when a pinned slot misses" {
@@ -468,7 +535,7 @@ test "CUDA temp arena planner rejects a repeated shape when a pinned slot misses
     try planner.noteAllocation(std.testing.allocator, 128, 8);
     try std.testing.expectEqual(
         TempArenaPlanner.BoundaryResult.invalidated,
-        try planner.beginDecodeIteration(std.testing.allocator, 2),
+        planner.beginDecodeIteration(2),
     );
     try std.testing.expect(!planner.active);
     try std.testing.expect(!planner.ready_for_capture);
@@ -490,11 +557,34 @@ test "CUDA temp arena planner accepts a marked graph replay with uncaptured tail
     try planner.noteAllocation(std.testing.allocator, 256, 8);
     try std.testing.expectEqual(
         TempArenaPlanner.BoundaryResult.unchanged,
-        try planner.beginDecodeIteration(std.testing.allocator, 3),
+        planner.beginDecodeIteration(3),
     );
     try std.testing.expect(planner.active);
     try std.testing.expect(planner.ready_for_capture);
     try std.testing.expectEqual(@as(usize, 0), planner.current_lengths.items.len);
+}
+
+test "CUDA temp arena planner avoids rebuilding the trace for a whole iteration replay" {
+    const allocator = std.testing.allocator;
+    var planner: TempArenaPlanner = .{
+        .observing = true,
+        .active = true,
+        .ready_for_capture = true,
+        .allocation_seq_base = 100,
+    };
+    defer planner.deinit(allocator);
+    try planner.candidate_lengths.appendSlice(allocator, &.{ 64, 128 });
+    try planner.current_lengths.ensureTotalCapacity(allocator, 3);
+
+    try std.testing.expect(planner.markGraphReplay(100, 2));
+    try std.testing.expectEqual(@as(usize, 0), planner.current_lengths.items.len);
+    try std.testing.expect(!planner.canGraphReplay(102, 2));
+    try std.testing.expectEqual(.unchanged, planner.beginDecodeIteration(102));
+
+    try std.testing.expect(planner.markGraphReplay(102, 2));
+    try planner.noteAllocation(allocator, 256, 8);
+    try std.testing.expectEqual(.invalidated, planner.beginDecodeIteration(105));
+    try std.testing.expectEqualSlices(usize, &.{ 64, 128, 256 }, planner.candidate_lengths.items);
 }
 
 test "CUDA temp arena planner invalidates a replay interval after pinned drift" {
@@ -512,7 +602,7 @@ test "CUDA temp arena planner invalidates a replay interval after pinned drift" 
     try planner.noteAllocation(std.testing.allocator, 256, 8);
     try std.testing.expectEqual(
         TempArenaPlanner.BoundaryResult.invalidated,
-        try planner.beginDecodeIteration(std.testing.allocator, 2),
+        planner.beginDecodeIteration(2),
     );
     try std.testing.expect(!planner.active);
     try std.testing.expect(!planner.ready_for_capture);
@@ -534,7 +624,7 @@ test "CUDA temp arena planner rejects a replay count that crosses the iteration 
     try std.testing.expect(!planner.markGraphReplay(101, 3));
     try std.testing.expectEqual(
         TempArenaPlanner.BoundaryResult.invalidated,
-        try planner.beginDecodeIteration(std.testing.allocator, 104),
+        planner.beginDecodeIteration(104),
     );
     try std.testing.expect(!planner.active);
 }
@@ -553,7 +643,7 @@ test "CUDA temp arena planner reconstructs replay and detects a missing tail" {
     try std.testing.expect(planner.markGraphReplay(100, 2));
     try std.testing.expectEqual(
         TempArenaPlanner.BoundaryResult.invalidated,
-        try planner.beginDecodeIteration(std.testing.allocator, 102),
+        planner.beginDecodeIteration(102),
     );
     try std.testing.expect(!planner.active);
 }
@@ -604,7 +694,7 @@ test "CUDA temp arena planner admission denial disables unsafe relearning" {
     try std.testing.expect(planner.disabled);
     try std.testing.expectEqual(
         TempArenaPlanner.BoundaryResult.unchanged,
-        try planner.beginDecodeIteration(std.testing.allocator, 0),
+        planner.beginDecodeIteration(0),
     );
 }
 
@@ -640,7 +730,7 @@ test "CUDA temp arena planner exhausts the capture warmup budget on an unstable 
     var byte_len: usize = 64;
     for (0..TempArenaPlanner.max_capture_warmup_boundaries) |_| {
         try std.testing.expect(!planner.captureWarmupExhausted());
-        _ = try planner.beginDecodeIteration(std.testing.allocator, seq);
+        _ = planner.beginDecodeIteration(seq);
         try planner.noteAllocation(std.testing.allocator, byte_len, 16);
         byte_len += 64;
         seq += 1;
@@ -662,14 +752,34 @@ test "CUDA temp arena planner keeps capture reachable within the warmup budget" 
     // The clean flow (two matching observations, activation, one pinned
     // validation iteration) stabilizes in four boundaries: far inside the
     // budget, and readiness returns the budget to a fresh warmup episode.
-    _ = try planner.beginDecodeIteration(std.testing.allocator, 0);
+    _ = planner.beginDecodeIteration(0);
     inline for (0..3) |iteration| {
         try planner.noteAllocation(std.testing.allocator, 64, 16);
         try planner.noteAllocation(std.testing.allocator, 128, 16);
-        _ = try planner.beginDecodeIteration(std.testing.allocator, (iteration + 1) * 2);
+        if (planner.beginDecodeIteration((iteration + 1) * 2) == .activated) planner.publishInstallation();
         try std.testing.expect(!planner.captureWarmupExhausted());
     }
     try std.testing.expect(planner.ready_for_capture);
     try std.testing.expectEqual(@as(usize, 0), planner.capture_warmup_boundaries);
     try std.testing.expect(!planner.captureWarmupExhausted());
+}
+
+test "CUDA temp arena retires active bindings when observation exceeds its limit" {
+    const allocator = std.testing.allocator;
+    var planner: TempArenaPlanner = .{};
+    defer planner.deinit(allocator);
+
+    _ = planner.beginDecodeIteration(0);
+    for (1..4) |sequence| {
+        try planner.noteAllocation(allocator, 64, 1);
+        if (planner.beginDecodeIteration(sequence) == .activated) planner.publishInstallation();
+    }
+    try std.testing.expect(planner.ready_for_capture);
+
+    try planner.noteAllocation(allocator, 64, 1);
+    try planner.noteAllocation(allocator, 64, 1);
+    try std.testing.expectEqual(@as(usize, 0), planner.period());
+    try std.testing.expect(!planner.canGraphReplay(3, 1));
+    try std.testing.expectEqual(.invalidated, planner.beginDecodeIteration(5));
+    try std.testing.expectEqual(.unchanged, planner.beginDecodeIteration(5));
 }

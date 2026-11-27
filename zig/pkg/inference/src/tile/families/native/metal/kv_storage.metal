@@ -34,9 +34,9 @@ kernel void termite_paged_f32_v_seed(device const float *src_v [[buffer(0)]], de
 }
 // native-program:entry termite_encode_int8_per_head
 // native-program:indent 11
-kernel void termite_encode_int8_per_head(device const float *in [[buffer(0)]], device uchar *out [[buffer(1)]], constant termite_metal_encode_key_params &p [[buffer(2)]], uint2 gid [[thread_position_in_grid]], uint2 tid [[thread_position_in_threadgroup]], uint2 tg_size [[threads_per_threadgroup]]) {
+kernel void termite_encode_int8_per_head(device const float *in [[buffer(0)]], device uchar *out [[buffer(1)]], constant termite_metal_encode_key_params &p [[buffer(2)]], constant uint *block_table [[buffer(3)]], constant uint2 &mapping [[buffer(4)]], uint2 gid [[thread_position_in_grid]], uint2 tid [[thread_position_in_threadgroup]], uint2 tg_size [[threads_per_threadgroup]]) {
     uint head_dim = p.head_dim; uint num_kv_heads = p.num_kv_heads; uint total_heads = p.rows * num_kv_heads; if (gid.y >= total_heads) return;
-    uint row = gid.y / num_kv_heads; uint head = gid.y - row * num_kv_heads; uint d = gid.x; uint row_values = num_kv_heads * head_dim; uint in_base = row * row_values + head * head_dim; uint out_base = row * p.key_row_bytes + head * (head_dim + 4u);
+    uint row = gid.y / num_kv_heads; uint head = gid.y - row * num_kv_heads; uint d = gid.x; uint row_values = num_kv_heads * head_dim; ulong in_base = ulong(row) * row_values + head * head_dim; uint logical = mapping.x + row; uint physical = mapping.y == 0u ? row : block_table[logical / mapping.y] + logical % mapping.y; ulong out_base = ulong(physical) * p.key_row_bytes + head * (head_dim + 4u);
     float val = (d < head_dim) ? in[in_base + d] : 0.0f; float abs_val = (d < head_dim) ? fabs(val) : 0.0f;
     threadgroup float tg_max[256];
 {{head_maximum}}

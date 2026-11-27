@@ -39,10 +39,32 @@ pub fn supported(major: i32, minor: i32, rows: usize, hidden: usize, vocab: usiz
     return major == 12 and minor == 1 and rows >= 1 and rows <= 128 and hidden == 1024 and vocab == 248320;
 }
 
+pub const Scratch = struct {
+    plane_bytes: usize,
+    indices_offset: usize,
+    bytes: usize,
+
+    pub fn forRows(rows: usize) !Scratch {
+        if (rows == 0 or rows > 128) return error.InvalidShape;
+        const plane_bytes = rows * tiles * @sizeOf(u32);
+        const indices_offset = std.mem.alignForward(usize, plane_bytes, 16);
+        return .{ .plane_bytes = plane_bytes, .indices_offset = indices_offset, .bytes = indices_offset + plane_bytes };
+    }
+
+    pub fn bind(self: Scratch, bank: buffer.DeviceBuffer) !struct { partial: buffer.DeviceBuffer, indices: buffer.DeviceBuffer } {
+        _ = try buffer.validateRegion(bank, self.bytes, 16);
+        return .{
+            .partial = .{ .ptr = bank.ptr, .len = self.plane_bytes },
+            .indices = .{ .ptr = bank.ptr + self.indices_offset, .len = self.plane_bytes },
+        };
+    }
+};
+
 pub fn validate(r: Request) !void {
     if (!supported(12, 1, r.rows, 1024, 248320) or r.suppress_count > std.math.maxInt(i32)) return error.InvalidShape;
+    const scratch = try Scratch.forRows(r.rows);
     const regions = [_]buffer.DeviceBuffer{ r.input, r.weight, r.suppress, r.partial, r.indices, r.output };
-    const lengths = [_]usize{ r.rows * 1024 * 4, 248320 * 1024 * 2, try std.math.mul(usize, r.suppress_count, 4), r.rows * tiles * 4, r.rows * tiles * 4, r.rows * 4 };
+    const lengths = [_]usize{ r.rows * 1024 * 4, 248320 * 1024 * 2, try std.math.mul(usize, r.suppress_count, 4), scratch.plane_bytes, scratch.plane_bytes, r.rows * 4 };
     const alignment = [_]u64{ 4, 16, 4, 16, 16, 4 };
     try buffer.validateRegions(6, regions, lengths, alignment, 3);
 }
@@ -93,6 +115,12 @@ pub const Module = struct {
 test "CUDA BF16 projection top1 bounds alignment and scratch ownership" {
     const valid = Request{ .input = .{ .ptr = 0x100004, .len = 7 * 1024 * 4 }, .weight = .{ .ptr = 0x10000000, .len = 248320 * 1024 * 2 }, .partial = .{ .ptr = 0x40000000, .len = 7 * tiles * 4 }, .indices = .{ .ptr = 0x50000000, .len = 7 * tiles * 4 }, .suppress = .{}, .output = .{ .ptr = 0x60000004, .len = 7 * 4 }, .rows = 7, .suppress_count = 0 };
     try validate(valid);
+    const scratch = try Scratch.forRows(valid.rows);
+    const bound = try scratch.bind(.{ .ptr = valid.partial.ptr, .len = scratch.bytes });
+    try std.testing.expectEqual(valid.partial.len, bound.partial.len);
+    try std.testing.expectEqual(valid.indices.len, bound.indices.len);
+    try std.testing.expect(bound.indices.ptr >= bound.partial.ptr + bound.partial.len);
+    try std.testing.expectError(error.InvalidShape, scratch.bind(.{ .ptr = valid.partial.ptr, .len = scratch.bytes - 1 }));
     inline for (.{ "input", "weight", "partial", "indices", "output" }) |field| {
         var bad = valid;
         @field(bad, field).len -= 1;

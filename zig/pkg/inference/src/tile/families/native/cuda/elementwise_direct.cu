@@ -429,3 +429,14 @@ extern "C" __global__ void termite_deberta_scores_softmax_f32(
     const float inv_sum = reductions[0] > 0.0f ? 1.0f / reductions[0] : 0.0f;
     for (unsigned int ki = tid; ki < seq_len; ki += kThreads) content_scores[score_base + ki] *= inv_sum;
 }
+// native-program:entry termite_add_mul_scalar_separate_f32
+extern "C" __global__ void termite_add_mul_scalar_separate_f32(
+    float* dst,
+    const float* a,
+    const float* b,
+    const float* scalar,
+    unsigned int n
+) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __fadd_rn(__fmul_rn(a[i], scalar[0]), b[i]);
+}

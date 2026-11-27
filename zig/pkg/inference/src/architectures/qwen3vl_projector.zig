@@ -46,26 +46,32 @@ const VisionFrameGroup = struct {
     cb: *const ComputeBackend,
     blocks: usize,
     streamed: bool = false,
-    owns_frame: bool = false,
+    frame: submission.Scope,
+    completion: submission.Pending,
     held: [4]?CT = @splat(null),
     count: usize = 0,
     pending: [4]?CT = @splat(null),
     pending_count: usize = 0,
-    submitted: bool = false,
     submits: usize = 0,
     waits: usize = 0,
     overlaps: usize = 0,
 
+    const submission = @import("../execution/submission.zig");
+
+    fn init(cb: *const ComputeBackend, blocks: usize, streamed: bool) VisionFrameGroup {
+        return .{ .cb = cb, .blocks = blocks, .streamed = streamed, .frame = .{ .backend = cb }, .completion = .{ .backend = cb } };
+    }
+
     fn begin(self: *@This(), enabled: bool) !void {
-        if (self.owns_frame) return;
-        if (self.streamed and !self.submitted and self.cb.decoderRuntimeHasSubmittedFrame()) return error.PreparedVisionUnavailable;
-        if (!enabled or self.cb.decoderRuntimeHasActiveFrame()) {
-            if (self.streamed) return error.PreparedVisionUnavailable;
-            return;
-        }
-        self.owns_frame = try self.cb.decoderRuntimeBeginFrame();
-        if (self.streamed and !self.owns_frame) return error.PreparedVisionUnavailable;
-        if (self.owns_frame and self.submitted) self.overlaps += 1;
+        if (self.frame.owns) return;
+        if (self.streamed and !self.completion.active and self.cb.decoderRuntimeHasSubmittedFrame())
+            return error.PreparedVisionUnavailable;
+        self.frame = if (enabled and self.streamed)
+            try submission.Scope.beginPipelined(self.cb)
+        else
+            try submission.Scope.beginIfNeeded(self.cb, enabled);
+        if (self.streamed and !self.frame.owns) return error.PreparedVisionUnavailable;
+        if (self.frame.owns and self.completion.active) self.overlaps += 1;
     }
 
     fn release(self: *@This()) void {
@@ -79,15 +85,14 @@ const VisionFrameGroup = struct {
     }
 
     fn wait(self: *@This()) !void {
-        if (!self.submitted) return;
-        try self.cb.decoderRuntimeWaitSubmittedFrame();
-        self.submitted = false;
+        if (!self.completion.active) return;
+        try self.completion.wait();
         self.waits += 1;
         self.releasePending();
     }
 
     fn finishBlock(self: *@This(), previous: CT, last: bool) !void {
-        if (!self.owns_frame) {
+        if (!self.frame.owns) {
             self.cb.free(previous);
             return;
         }
@@ -98,17 +103,14 @@ const VisionFrameGroup = struct {
                 // The active group's commands are encoded while its producer
                 // executes. Drain that producer before rotating either bank.
                 try self.wait();
-                try self.cb.decoderRuntimeSubmitFrame();
-                self.owns_frame = false;
-                self.submitted = true;
+                try self.frame.submitInto(&self.completion);
                 @memcpy(self.pending[0..self.count], self.held[0..self.count]);
                 self.pending_count = self.count;
                 self.count = 0;
                 self.submits += 1;
                 if (last) try self.wait();
             } else {
-                try self.cb.decoderRuntimeSubmitAndWaitFrame();
-                self.owns_frame = false;
+                try self.frame.finish();
                 self.submits += 1;
                 self.release();
             }
@@ -116,12 +118,12 @@ const VisionFrameGroup = struct {
     }
 
     fn deinit(self: *@This()) void {
-        if (self.owns_frame) self.cb.decoderRuntimeCancelFrame() catch {};
-        self.owns_frame = false;
+        self.frame.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
         // The active group's input can be an output of the submitted group.
         // Neither set may retire before that producer completes, even on error.
-        if (self.submitted) self.cb.decoderRuntimeWaitSubmittedFrame() catch {};
-        self.submitted = false;
+        self.completion.wait() catch {
+            if (self.completion.active) platform.inference_process_supervisor.restartWorker();
+        };
         self.releasePending();
         self.release();
     }
@@ -544,10 +546,7 @@ const WeightCache = struct {
     pub fn deinit(self: *WeightCache) void {
         var value_it = self.tensors.valueIterator();
         while (value_it.next()) |tensor| {
-            if (self.cb.kind() == .metal) {
-                metal_compute_mod.MetalCompute.releaseProjectorSlotsForTensor(self.cb, tensor.*);
-            }
-            self.cb.free(tensor.*);
+            self.cb.freeProjectionInput(tensor.*, .provider_backing);
         }
         var key_it = self.tensors.keyIterator();
         while (key_it.next()) |key| self.allocator.free(key.*);
@@ -1088,7 +1087,7 @@ fn encodePreparedProjectedImagesResidentBatchedPolicy(
         @memcpy(positions[axis * rows + index * per_image ..][0..per_image], positions_one[axis * per_image ..][0..per_image]);
     };
     const stream_frames = limits.metal_frame_pipeline and cfg.is_qwen35 and cfg.require_metal_resident_vision and cfg.deepstack_len == 0 and !qwen3VlProfileEnabled() and platform.env.getenv("ANTFLY_QWEN3VL_QUALIFICATION_TRACE_LAYER") == null;
-    var frame_group = VisionFrameGroup{ .cb = cb, .blocks = limits.metal_frame_blocks, .streamed = stream_frames };
+    var frame_group = VisionFrameGroup.init(cb, limits.metal_frame_blocks, stream_frames);
     defer frame_group.deinit();
     for (0..cfg.block_count) |layer| {
         try cb.checkExecutionControl();
@@ -1900,7 +1899,7 @@ fn encodePreparedSingleImage(
     var blocks_ns: u64 = 0;
     var deepstack_ns: u64 = 0;
     const stream_frames = !collect_preprocess_evidence and limits.metal_frame_pipeline and cfg.is_qwen35 and cfg.require_metal_resident_vision and cfg.deepstack_len == 0 and !qwen3VlProfileEnabled() and platform.env.getenv("ANTFLY_QWEN3VL_QUALIFICATION_TRACE_LAYER") == null;
-    var frame_group = VisionFrameGroup{ .cb = cb, .blocks = limits.metal_frame_blocks, .streamed = stream_frames };
+    var frame_group = VisionFrameGroup.init(cb, limits.metal_frame_blocks, stream_frames);
     defer frame_group.deinit();
     for (0..cfg.block_count) |layer| {
         // GGUF-backed projector weights bypass ComputeBackend.getWeight, so
@@ -3443,6 +3442,7 @@ test "Qwen3-VL vision pipeline drains both tensor banks on completion cancellati
             f.active = false;
             f.submitted_mask = f.active_mask;
             f.active_mask = 0;
+            if (f.mode == 6 and f.submit_calls == 2) return error.InjectedSubmitFailure;
         }
         fn wait(raw: *anyopaque) !void {
             const f = get(raw);
@@ -3474,7 +3474,7 @@ test "Qwen3-VL vision pipeline drains both tensor banks on completion cancellati
             f.freed_mask |= bit;
         }
     };
-    for (0..6) |mode| {
+    for (0..7) |mode| {
         var fake = Fake{ .mode = mode };
         var table = native_compute.vtable_impl;
         table.freeTensor = Fake.free;
@@ -3486,7 +3486,7 @@ test "Qwen3-VL vision pipeline drains both tensor banks on completion cancellati
         table.regions.commands.submitAndWaitFrame = Fake.submitWait;
         table.regions.commands.cancelFrame = Fake.cancel;
         const cb = ComputeBackend{ .ptr = &fake, .vtable = &table };
-        var group = VisionFrameGroup{ .cb = &cb, .blocks = 2, .streamed = mode != 5 };
+        var group = VisionFrameGroup.init(&cb, 2, mode != 5);
         var encoded: usize = 0;
         var failure: ?anyerror = null;
         for (0..6) |index| {
@@ -3523,7 +3523,7 @@ test "Qwen3-VL vision pipeline drains both tensor banks on completion cancellati
                 try std.testing.expectEqual(@as(usize, 2), group.overlaps);
             },
             1 => try std.testing.expect(failure == null),
-            2 => try std.testing.expectEqual(error.InjectedSubmitFailure, failure.?),
+            2, 6 => try std.testing.expectEqual(error.InjectedSubmitFailure, failure.?),
             3 => try std.testing.expectEqual(error.InjectedWaitFailure, failure.?),
             4 => try std.testing.expectEqual(error.PreparedVisionUnavailable, failure.?),
             5 => {

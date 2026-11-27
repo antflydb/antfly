@@ -70,7 +70,19 @@ pub fn create(ctx: Context) Suite {
         .enable_metal = ctx.backend.enable_metal,
     });
     const existing_test_compile_max_rss: usize = if (b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == .aarch64 and ctx.target.result.os.tag == .linux and ctx.target.result.cpu.arch == .aarch64 and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt) @as(usize, if (ctx.optimize == .safe) 24 else 16) * 1024 * 1024 * 1024 else if (native_cpu_macos) @as(usize, if (ctx.optimize == .debug) 12_672 else 12_032) * 1024 * 1024 else @as(usize, if (cuda_arm_linux) 28 else if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 20 else 9) * 1024 * 1024 * 1024;
-    const default_test_compile_memory_mb: usize = if (measured_cuda_pjrt_arm_linux) |profile| profile.testMiB(selected_test_filters.len, ctx.runtime_test_filter) orelse (existing_test_compile_max_rss / (1024 * 1024)) else existing_test_compile_max_rss / (1024 * 1024);
+    // Native Apple Silicon Metal ReleaseFast with runtime filtering compiles
+    // the full suite. Its unstripped compiler peaked at 30,041,653,248 bytes.
+    const measured_metal_runtime_filter = ctx.runtime_test_filter and !ctx.strip and ctx.optimize == .fast and
+        b.graph.host.result.os.tag == .macos and b.graph.host.result.cpu.arch == .aarch64 and
+        ctx.target.result.os.tag == .macos and ctx.target.result.cpu.arch == .aarch64 and
+        ctx.backend.enable_metal and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt;
+    const existing_test_compile_memory_mb = existing_test_compile_max_rss / (1024 * 1024);
+    const default_test_compile_memory_mb: usize = if (measured_metal_runtime_filter)
+        32 * 1024
+    else if (measured_cuda_pjrt_arm_linux) |profile|
+        profile.testMiB(selected_test_filters.len, ctx.runtime_test_filter) orelse existing_test_compile_memory_mb
+    else
+        existing_test_compile_memory_mb;
     const test_compile_memory_mb = b.option(usize, "inference-test-compile-memory-mb", "Declared inference test compiler memory bound in MiB") orelse default_test_compile_memory_mb;
     if (test_compile_memory_mb == 0) @panic("inference test compiler memory bound must be positive");
     const tests = b.addTest(.{
@@ -156,6 +168,25 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("antfly_runtime_abi", ctx.graph.runtime_abi_mod);
     tests.root_module.addImport("antfly_reader_config", ctx.graph.reader_config_mod);
     tests.root_module.addImport("inference_internal", tests.root_module);
+    if (ctx.backend.enable_cuda) {
+        const fast_root = b.createModule(.{ .root_source_file = ctx.path("src/test_gliner25_fast_f32.zig"), .target = ctx.target, .optimize = ctx.optimize });
+        var fast_imports = tests.root_module.import_table.iterator();
+        while (fast_imports.next()) |entry| fast_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+        fast_root.link_libc = true;
+        const fast_tests = b.addTest(.{ .root_module = fast_root, .filters = &.{"GLiNER fast FP32"} });
+        const fast_run = ctx.addRunArtifact(fast_tests);
+        fast_run.setEnvironmentVariable("TERMITE_REQUIRE_CUDA_TESTS", "1");
+        ctx.step("test-gliner25-fast-f32", "Require CUDA and validate accurate Tensor Core projections").dependOn(&fast_run.step);
+        const attention_root = b.createModule(.{ .root_source_file = ctx.path("src/test_gliner25_fp32_attention.zig"), .target = ctx.target, .optimize = ctx.optimize });
+        var imports = tests.root_module.import_table.iterator();
+        while (imports.next()) |entry| attention_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+        attention_root.link_libc = true;
+        const attention_tests = b.addTest(.{ .root_module = attention_root, .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple }, .filters = &.{ "GLiNER FP32 attention", "GLiNER fast FP32", "GLiNER BF16 attention", "GLiNER BF16 projections", "GLiNER BF16 relative cache", "GLiNER BF16 bias", "GLiNER BF16 norm", "GLiNER CUDA long document", "gliner boundary shared pool stable ties", "GLiNER experimental banded", "GLiNER experimental parallel", "GLiNER shared pool", "GLiNER BF16 FFN", "GLiNER BF16 encoder upload", "GLiNER BF16 optional", "CUDA vendor cache descriptor destruction", "CUDA vendor captured GEMM", "BF16 deferred", "DeBERTa native bucketed relative", "GPU boundary request groups distinct ragged inputs within physical limits", "gliner boundary optimized required outputs preserve only requested record work", "embeddinggemma2 CUDA tuned BF16 GEMM caches and replays fresh inputs", "LightOnOCR3 CUDA bounded GEMM" } });
+        ctx.step("gliner25-fp32-attention-test-build", "Build focused GLiNER CUDA tests for a serialized GPU run").dependOn(&b.addInstallArtifact(attention_tests, .{}).step);
+        const attention_run = ctx.addRunArtifact(attention_tests);
+        attention_run.setEnvironmentVariable("TERMITE_REQUIRE_CUDA_TESTS", "1");
+        ctx.step("test-gliner25-fp32-attention", "Require CUDA and validate bounded FP32 attention against CPU").dependOn(&attention_run.step);
+    }
     if (ctx.graph.inference_client_mod) |mod| {
         tests.root_module.addImport("inference_client", mod);
     }
@@ -368,25 +399,132 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     const run_lifecycle_tests = ctx.addRunArtifact(lifecycle_tests);
     test_step.dependOn(&run_lifecycle_tests.step);
     ctx.step("test-cuda-allocation-lifecycle", "Verify failed-free quarantine across primary-context lifetimes without a GPU").dependOn(&run_lifecycle_tests.step);
+    const hybrid_kv_root = b.createModule(.{ .root_source_file = ctx.path("src/test_cuda_hybrid_kv.zig"), .target = ctx.target, .optimize = ctx.optimize });
+    var hybrid_kv_imports = suite.tests.root_module.import_table.iterator();
+    while (hybrid_kv_imports.next()) |entry| hybrid_kv_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    hybrid_kv_root.link_libc = true;
+    const hybrid_kv_host_tests = b.addTest(.{
+        .root_module = hybrid_kv_root,
+        .filters = &.{ "test_0", "runtime.kv.hybrid_paged.test.hybrid paged KV", "runtime.kv.storage_runtime.test.checked sequence release", "runtime.kv.writable_blocks.test.prepared KV" },
+    });
+    ctx.step("test-hybrid-kv", "Verify bounded hybrid page tables and prepared KV transactions").dependOn(&ctx.addRunArtifact(hybrid_kv_host_tests).step);
+    const inkling2_root = b.createModule(.{ .root_source_file = ctx.path("src/test_inkling2_checkpoint.zig"), .target = ctx.target, .optimize = ctx.optimize });
+    inkling2_root.addImport("antfly_platform", ctx.graph.platform_mod);
+    inkling2_root.addImport("antfly_tile", ctx.graph.tile_mod);
+    inkling2_root.link_libc = true;
+    const inkling2_tests = b.addTest(.{ .root_module = inkling2_root, .filters = &.{"Inkling 2 Mini validates"} });
+    const run_inkling2 = ctx.addRunArtifact(inkling2_tests);
+    run_inkling2.has_side_effects = true;
+    ctx.step("test-inkling2-checkpoint", "Validate the Inkling 2 Mini decoder geometry against the released header").dependOn(&run_inkling2.step);
+    if (ctx.backend.enable_cuda) {
+        const inkling_attention_root = b.createModule(.{ .root_source_file = ctx.path("src/test_cuda_inkling2_attention.zig"), .target = ctx.target, .optimize = ctx.optimize });
+        var inkling_attention_imports = suite.tests.root_module.import_table.iterator();
+        while (inkling_attention_imports.next()) |entry| inkling_attention_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+        inkling_attention_root.link_libc = true;
+        const inkling_attention_test = b.addTest(.{
+            .root_module = inkling_attention_root,
+            .filters = &.{"CUDA Inkling 2 runs resident"},
+            .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple },
+        });
+        const run_inkling_attention = ctx.addRunArtifact(inkling_attention_test);
+        run_inkling_attention.has_side_effects = true;
+        ctx.step("test-cuda-inkling2-attention", "Run Inkling local and global checkpoint attention with staged CUDA KV").dependOn(&run_inkling_attention.step);
+        const inkling_decoder_root = b.createModule(.{ .root_source_file = ctx.path("src/test_cuda_inkling2_decoder.zig"), .target = ctx.target, .optimize = ctx.optimize });
+        var inkling_decoder_imports = suite.tests.root_module.import_table.iterator();
+        while (inkling_decoder_imports.next()) |entry| inkling_decoder_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+        inkling_decoder_root.link_libc = true;
+        const inkling_decoder_test = b.addTest(.{
+            .root_module = inkling_decoder_root,
+            .filters = &.{ "CUDA Inkling 2 runs the fixed loop", "CUDA BF16 patch norm reads" },
+            .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple },
+        });
+        const run_inkling_decoder = ctx.addRunArtifact(inkling_decoder_test);
+        run_inkling_decoder.has_side_effects = true;
+        ctx.step("test-cuda-inkling2-decoder", "Run Inkling 2 text and vision with the released CUDA weights").dependOn(&run_inkling_decoder.step);
+        const paged_relative_root = b.createModule(.{ .root_source_file = ctx.path("src/test_cuda_paged_relative_attention.zig"), .target = ctx.target, .optimize = ctx.optimize });
+        var paged_relative_imports = suite.tests.root_module.import_table.iterator();
+        while (paged_relative_imports.next()) |entry| paged_relative_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+        paged_relative_root.link_libc = true;
+        const paged_relative_test = b.addTest(.{
+            .root_module = paged_relative_root,
+            .filters = &.{ "CUDA paged relative attention", "CUDA four-tap convolution" },
+            .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple },
+        });
+        const run_paged_relative = ctx.addRunArtifact(paged_relative_test);
+        run_paged_relative.has_side_effects = true;
+        ctx.step("test-cuda-paged-relative-attention", "Verify BF16 paged relative GQA and its staged short convolution").dependOn(&run_paged_relative.step);
+        const inkling_moe_root = b.createModule(.{ .root_source_file = ctx.path("src/test_cuda_inkling2_moe.zig"), .target = ctx.target, .optimize = ctx.optimize });
+        var inkling_moe_imports = suite.tests.root_module.import_table.iterator();
+        while (inkling_moe_imports.next()) |entry| inkling_moe_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+        inkling_moe_root.link_libc = true;
+        const inkling_moe_test = b.addTest(.{
+            .root_module = inkling_moe_root,
+            .filters = &.{"CUDA Inkling 2 loads and executes"},
+            .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple },
+        });
+        const run_inkling_moe = ctx.addRunArtifact(inkling_moe_test);
+        run_inkling_moe.has_side_effects = true;
+        ctx.step("test-cuda-inkling2-moe", "Load and execute both Inkling 2 expert formats from the full checkpoint").dependOn(&run_inkling_moe.step);
+        const routed_projection_root = b.createModule(.{ .root_source_file = ctx.path("src/test_cuda_routed_projection.zig"), .target = ctx.target, .optimize = ctx.optimize });
+        var projection_imports = suite.tests.root_module.import_table.iterator();
+        while (projection_imports.next()) |entry| routed_projection_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+        routed_projection_root.link_libc = true;
+        const routed_projection_test = b.addTest(.{
+            .root_module = routed_projection_root,
+            .filters = &.{"CUDA routed block scaled projection"},
+            .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple },
+        });
+        const run_routed_projection = ctx.addRunArtifact(routed_projection_test);
+        run_routed_projection.has_side_effects = true;
+        ctx.step("test-cuda-routed-projection", "Verify CUDA expert projection against released packed checkpoint rows").dependOn(&run_routed_projection.step);
+        const hybrid_kv_cuda_tests = b.addTest(.{
+            .root_module = hybrid_kv_root,
+            .filters = &.{"CUDA hybrid paged KV"},
+            .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple },
+        });
+        const run_hybrid_kv_cuda = ctx.addRunArtifact(hybrid_kv_cuda_tests);
+        run_hybrid_kv_cuda.has_side_effects = true;
+        ctx.step("test-cuda-hybrid-kv", "Require CUDA and verify BF16 hybrid KV payloads at 32K").dependOn(&run_hybrid_kv_cuda.step);
+    }
     const microbatch_root = b.createModule(.{ .root_source_file = ctx.path("src/test_executor_microbatch.zig"), .target = ctx.target, .optimize = ctx.optimize });
     var microbatch_imports = suite.tests.root_module.import_table.iterator();
     while (microbatch_imports.next()) |entry| microbatch_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
     microbatch_root.link_libc = true;
-    // Native ARM macOS ReleaseSafe peaks: CPU 5,713,297,408 bytes and
-    // Metal 7,442,055,168 bytes. Reserve 10% headroom rounded to 128 MiB.
-    // Other hosts, backend combinations and optimization modes retain 4 GiB.
+    // Native ARM macOS peaks: ReleaseSafe CPU 5,713,297,408 bytes and Metal
+    // 7,442,055,168 bytes, ReleaseFast CPU 5,376,081,920 bytes and Metal
+    // 6,102,368,256 bytes.
+    // Native ARM Linux ReleaseFast CUDA peaked at 10,340,761,600 bytes.
+    // Reserve 10% headroom rounded to 128 MiB for measured configurations.
     const measured_microbatch_macos = b.graph.host.result.os.tag == .macos and b.graph.host.result.cpu.arch == .aarch64 and
         ctx.target.result.os.tag == .macos and ctx.target.result.cpu.arch == .aarch64 and
-        ctx.backend.enable_native and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt and ctx.optimize == .safe;
-    const microbatch_tests = b.addTest(.{ .max_rss = if (measured_microbatch_macos) @as(usize, if (ctx.backend.enable_metal) 7808 else 6016) * 1024 * 1024 else 4 * 1024 * 1024 * 1024, .root_module = microbatch_root, .filters = &(executor_microbatch_filters ++ [_][]const u8{"test_0"}) });
+        ctx.backend.enable_native and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt;
+    const measured_microbatch_spark = b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == .aarch64 and
+        ctx.target.result.os.tag == .linux and ctx.target.result.cpu.arch == .aarch64 and
+        ctx.backend.enable_cuda and !ctx.backend.enable_metal and !ctx.backend.enable_pjrt and ctx.optimize == .fast;
+    const microbatch_compile_mib: usize = if (measured_microbatch_macos and ctx.optimize == .safe)
+        if (ctx.backend.enable_metal) 7808 else 6016
+    else if (measured_microbatch_macos and ctx.optimize == .fast)
+        if (ctx.backend.enable_metal) 6528 else 5760
+    else if (measured_microbatch_spark)
+        10_880
+    else
+        4096;
+    const microbatch_tests = b.addTest(.{ .max_rss = microbatch_compile_mib * 1024 * 1024, .root_module = microbatch_root, .filters = &(executor_microbatch_filters ++ [_][]const u8{"test_0"}) });
     const run_microbatch_tests = ctx.addRunArtifact(microbatch_tests);
     // This cohort includes actual provider/device discovery and retirement.
     // A cached skip must not stand in for the current execution environment.
     run_microbatch_tests.has_side_effects = true;
     test_step.dependOn(&run_microbatch_tests.step);
     ctx.step("test-executor-microbatch", "Verify executor batching, GLiNER adapters, row ownership, capacity and cancellation").dependOn(&run_microbatch_tests.step);
+    if (ctx.backend.enable_metal) {
+        const routed_metal = b.addTest(.{ .root_module = suite.tests.root_module, .filters = &.{ "Metal routed block-scaled projection", "Inkling chat frontend", "Inkling directory metadata", "Metal paged relative attention", "Metal causal depthwise stencil", "Metal dense BF16 projection", "Inkling Metal checkpoint adapter", "Inkling attention weights", "Inkling Metal attention weights", "Metal BF16 residual mixing", "Metal gated residual", "Inkling Metal controller checkpoint", "Metal BF16 residual sum", "Metal full-width BF16 RMS", "Inkling Metal decoder endpoints", "Inkling Metal residual stack", "Inkling Metal resident decoder" } });
+        const run_routed_metal = ctx.addRunArtifact(routed_metal);
+        run_routed_metal.has_side_effects = true;
+        ctx.step("test-metal-routed-projection", "Verify packed routed projections in a physical Metal frame").dependOn(&run_routed_metal.step);
+    }
     const inference_unit = ctx.step("test-inference-unit", "Run inference unit tests with optional filters, without independent library suites");
     inference_unit.dependOn(&run_tests.step);
+    ctx.step("test-inference-focused", "Run the inference test executable with -Dtest-filter, without standalone executor suites").dependOn(&run_tests.step);
     inference_unit.dependOn(&run_microbatch_tests.step);
     inference_unit.dependOn(&run_lifecycle_tests.step);
     inference_unit.dependOn(&run_batch_tests.step);
@@ -475,7 +613,7 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
         .name = "gliner25-decide-cuda-serving-tests",
         .max_rss = 11 * 1024 * 1024 * 1024,
         .root_module = suite.tests.root_module,
-        .filters = &.{ "Decide CUDA serving required artifact", "Decide CUDA execution batches", "model listing reports an unreadable model", "executor contract failures preserve", "gliner span configuration diagnostics", "span GLiNER native config", "always-download files pull the GLiNER2.5 boundary encoder", "GLiNER production CUDA distinct input batches Decide", "qualified FP32 attention policy", "Decide Q8 CUDA qualification binds", "Decide CUDA legacy geometry", "Decide Q8 projection mirrors", "Decide Q8 mirror admission", "GLiNER Decide CUDA Q8 half staging", "GLiNER Decide CUDA Q8 execution mirror" },
+        .filters = &.{ "Decide CUDA serving required artifact", "Decide CUDA execution batches", "model listing reports an unreadable model", "executor contract failures preserve", "gliner span configuration diagnostics", "span GLiNER native config", "always-download files pull the GLiNER2.5 boundary encoder", "GLiNER production CUDA distinct input batches Decide", "GLiNER2.5-Decide CUDA classification oracle parity", "qualified FP32 attention policy", "Decide Q8 CUDA qualification binds", "Decide CUDA legacy geometry", "Decide Q8 projection mirrors", "Decide Q8 mirror admission", "GLiNER Decide CUDA Q8 half staging", "GLiNER Decide CUDA Q8 execution mirror" },
         .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple },
     });
     ctx.step("gliner25-decide-cuda-serving-test-build", "Build focused original Decide CUDA batch and cancellation tests").dependOn(&b.addInstallArtifact(decide_serving_tests, .{}).step);

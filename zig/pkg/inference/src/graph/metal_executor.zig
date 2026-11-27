@@ -26,16 +26,16 @@ const metal_runtime = @import("../backends/metal_runtime.zig");
 const cache_mod = @import("cache.zig");
 const session_factory = @import("../architectures/session_factory.zig");
 const gemma4_runtime = @import("../architectures/gemma4_runtime.zig");
-const decode_state = @import("decode_state_runtime.zig");
+const decode_state = @import("../execution/decode_state_runtime.zig");
 const debug_timing = @import("../debug_timing.zig");
 const gpt_arch = @import("../architectures/gpt.zig");
 const gpt_mod = @import("../models/gpt.zig");
 const ops = @import("../ops/ops.zig");
 const runtime = @import("../runtime/root.zig");
 const contracts = @import("backend_contracts.zig");
-const model_runtime = @import("model_runtime.zig");
+const model_runtime = @import("../execution/model_runtime.zig");
 const decoder_storage = @import("../execution/decoder_storage.zig");
-const session_decoder = @import("session_decoder.zig");
+const session_decoder = @import("../execution/session_decoder.zig");
 const quant_matmul = @import("quant_matmul.zig");
 
 const c_std = std.c;
@@ -1965,7 +1965,7 @@ const RuntimeContext = struct {
                     &arm_context,
                 );
             }
-            const armed = metal_runtime.forwardGreedyTokenPipelinedArmFamily(
+            const armed = try metal_runtime.forwardGreedyTokenPipelinedArmFamily(
                 &self.cb,
                 allocator,
                 self.definition.configuration.value,
@@ -1973,7 +1973,7 @@ const RuntimeContext = struct {
                 request.token_id,
                 arm_seq_len,
                 &arm_context,
-            ) catch false;
+            );
             if (!armed) {
                 return try metal_runtime.forwardGreedyTokenFamily(
                     &self.cb,
@@ -2015,24 +2015,21 @@ const RuntimeContext = struct {
             next_step.seq_len,
             &next_step.decode_context,
         )) |token| {
+            self.pipelined_decode_armed = false;
+            self.pipelined_decode_mode = null;
+            self.pipelined_sampling = null;
+            errdefer decoder_gated_runtime.pipelinedCancelPending(&self.cb);
             if (token < 0) return error.InvalidModelOutput;
             if (try cancelStoppedPipelineToken(&self.cb, token, self.definition.configuration.value.vocab_size, request.continuation)) {
-                self.pipelined_decode_armed = false;
-                self.pipelined_decode_mode = null;
-                self.pipelined_sampling = null;
                 // Same metadata-only speculative append as the existing
                 // cancel path; B never executes or claims written KV rows.
                 self.pipelined_kv_advanced_for = request.position + 1;
-            } else if (metal_runtime.decoderRuntimePipelinedSubmitPending(&self.cb)) {
+            } else if ((try decoder_gated_runtime.decoderRuntimePipelinedControl(&self.cb, .submit_pending)) != null) {
                 self.pipelined_decode_armed = true;
                 self.pipelined_decode_mode = .greedy;
-                self.pipelined_sampling = null;
                 self.pipelined_next_position = request.position + 1;
             } else {
-                metal_runtime.decoderRuntimePipelinedCancelPending(&self.cb);
-                self.pipelined_decode_armed = false;
-                self.pipelined_decode_mode = null;
-                self.pipelined_sampling = null;
+                decoder_gated_runtime.pipelinedCancelPending(&self.cb);
                 self.pipelined_kv_advanced_for = request.position + 1;
             }
             self.noteDecoderRuntimeStateFromCurrentView();
@@ -2124,10 +2121,13 @@ const RuntimeContext = struct {
             request.sampling,
             request.token_history,
         )) orelse return error.ResidentSamplingFrameFailed;
-        if (try cancelStoppedPipelineToken(&self.cb, token, self.definition.configuration.value.vocab_size, request.decode.continuation)) {
-            self.pipelined_decode_armed = false;
-            self.pipelined_decode_mode = null;
-            self.pipelined_sampling = null;
+        self.pipelined_decode_armed = false;
+        self.pipelined_decode_mode = null;
+        self.pipelined_sampling = null;
+        if (cancelStoppedPipelineToken(&self.cb, token, self.definition.configuration.value.vocab_size, request.decode.continuation) catch |err| {
+            decoder_gated_runtime.pipelinedCancelPending(&self.cb);
+            return err;
+        }) {
             self.pipelined_kv_advanced_for = request.decode.position + 1;
             self.noteDecoderRuntimeStateFromCurrentView();
             return token;
@@ -3089,10 +3089,6 @@ test "metal executor only enables split KV policy for mixed local and global Gem
     try std.testing.expect(!config.supportsSplitSwaGlobalKvRing());
 }
 
-test "metal executor pipelined decode frames delegate to the shared policy" {
-    try std.testing.expect(metal_runtime.pipelinedDecodeFrameEnabledForFlags(false, false, true));
-}
-
 test "metal executor keeps speculative decode frames opt in" {
     try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(false, false, false, true, true));
     try std.testing.expect(pipelinedDecodeFrameEnabledForFlags(true, false, false, false, false));
@@ -3476,12 +3472,21 @@ test "cached Metal pipelined runtime settles each real request before Engine epo
         defer cleanup.finishAfterUnlock();
         var backend = try session_factory.getComputeBackend(session, a);
         const current: @import("../execution/cleanup_context.zig").Context = .{ .boundary = cleanup.epoch(), .operation = backend.operationToken() };
-        defer backend.deinitWithCleanup(current);
+        defer {
+            const closer = backend.retainCleanupFinish();
+            backend.deinitWithCleanup(current);
+            if (closer) |pin| pin.releaseLocalWithBoundary(current.boundary) catch platform.inference_process_supervisor.restartWorker();
+        }
         try std.testing.expect(try cleanup.bindBackend(&backend));
-        _ = try cleanup.retainThroughBackend(&backend);
+        try std.testing.expect(try cleanup.retainThroughBackend(&backend));
         // On every later assertion/allocation failure, pending numerical work
         // still retires through this same current owner before Engine cleanup.
-        defer instance.finishRequestWithCleanup(current) catch platform.inference_process_supervisor.restartWorker();
+        defer instance.finishRequestWithCleanup(current) catch |err| {
+            std.debug.print("Metal fixture cleanup failed in mode {d}: {s}\n", .{ mode, @errorName(err) });
+            platform.inference_process_supervisor.restartWorker();
+        };
+        errdefer std.debug.print("Metal fixture mode {d} failed before cleanup\n", .{mode});
+
         try instance.resetWithCleanup(current);
         try std.testing.expect(physical.pipelined_kv_advanced_for == null);
         _ = try instance.prepare(a, .{ .kv_tokens_hint = 16, .cleanup_epoch = current.boundary, .backend_operation = current.operation });
@@ -3563,4 +3568,30 @@ test "terminal pipeline cancels only an actual accepted stop before submit" {
     try std.testing.expectEqual(@as(usize, 0), probe.submits);
     try std.testing.expectError(error.InvalidModelOutput, cancelStoppedPipelineToken(&cb, 9, 8, policy));
     try std.testing.expectEqual(@as(usize, 4), probe.cancels);
+}
+
+test "actual Metal greedy arm rejects an already submitted frame without disturbing it" {
+    const Fixture = struct {
+        fn populate(_: *@import("../ops/native_compute.zig").WeightStore) !void {}
+        fn check(cb: ops.ComputeBackend, _: ops.ComputeBackend) !void {
+            const Metal = @import("../ops/metal_compute.zig").MetalCompute;
+            const compute: *Metal = @ptrCast(@alignCast(cb.ptr));
+            const raw = compute.provider_impl.raw_decode_runtime orelse return error.ExpectedActualMetalProvider;
+            try std.testing.expect(cb.decoderRuntimeSetPipelinedFrames(true));
+            defer _ = cb.decoderRuntimeSetPipelinedFrames(false);
+            try metal_runtime.beginFrame(raw);
+            errdefer if (metal_runtime.hasActiveFrame(raw)) metal_runtime.cancelFrame(raw) catch {};
+            try metal_runtime.submitFrame(raw);
+            defer metal_runtime.waitFrame(raw) catch unreachable;
+            try std.testing.expectError(error.FrameAlreadyActive, decoder_gated_runtime.decoderRuntimePipelinedControl(&cb, .submit_only));
+            try std.testing.expect(metal_runtime.hasSubmittedFrame(raw));
+            try std.testing.expect(!metal_runtime.hasActiveFrame(raw));
+            try metal_runtime.beginFrame(raw);
+            defer if (metal_runtime.hasActiveFrame(raw)) metal_runtime.cancelFrame(raw) catch unreachable;
+            try std.testing.expectError(error.FrameAlreadyActive, decoder_gated_runtime.decoderRuntimePipelinedControl(&cb, .submit_pending));
+            try std.testing.expect(metal_runtime.hasSubmittedFrame(raw));
+            try std.testing.expect(metal_runtime.hasActiveFrame(raw));
+        }
+    };
+    try @import("../ops/media_residency_test.zig").onMetal(Fixture.populate, Fixture.check);
 }

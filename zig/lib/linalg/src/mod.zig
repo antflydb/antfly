@@ -553,6 +553,7 @@ pub const ropeCore = attention.ropeCore;
 pub const ropeCoreWithPositions = attention.ropeCoreWithPositions;
 pub const flashCausalAttentionHost = attention.flashCausalAttentionHost;
 pub const flashCausalAttentionHostInto = attention.flashCausalAttentionHostInto;
+pub const flashCausalAttentionHostIntoWithGemm = attention.flashCausalAttentionHostIntoWithGemm;
 pub const FlashCausalWorkspace = attention.FlashCausalWorkspace;
 pub const FlashCausalAttentionWorkspace = attention.FlashCausalAttentionWorkspace;
 pub const flashCausalAttentionHostWithWorkspace = attention.flashCausalAttentionHostWithWorkspace;

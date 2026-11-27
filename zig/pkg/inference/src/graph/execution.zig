@@ -25,7 +25,7 @@ const cache_mod = @import("cache.zig");
 const compiled_backend = @import("compiled_backend.zig");
 const compiled_registry = @import("compiled_registry.zig");
 const interpreter = @import("interpreter.zig");
-const model_runtime = @import("model_runtime.zig");
+const model_runtime = @import("../execution/model_runtime.zig");
 const partition_mod = @import("partition.zig");
 const device_mesh = @import("device_mesh.zig");
 const multi_executor = @import("multi_executor.zig");
@@ -128,8 +128,8 @@ pub const Context = struct {
     /// DecodeContext is an owned stack value; no cache or persistent state is
     /// consulted or changed. Reject stale/foreign borrowed authority before math.
     pub fn bindDecoderCleanup(self: *const Context, decode: *gpt_arch.DecodeContext) !void {
-        if (decode.dense_ffn_program == null and decode.cleanup.boundary == null and decode.cleanup.operation == null and !decode.cleanup.outside_execution and decode.cleanup.synchronous_outside_raw == null) return;
-        if (decode.cleanup.outside_execution or decode.cleanup.synchronous_outside_raw != null) return error.MissingCurrentCleanupEpoch;
+        if (decode.dense_ffn_program == null and decode.cleanup.boundary == null and decode.cleanup.operation == null and !decode.cleanup.outside_execution) return;
+        if (decode.cleanup.outside_execution) return error.MissingCurrentCleanupEpoch;
         const boundary = self.cleanupEpoch();
         if (decode.dense_ffn_program != null and boundary == null) return error.MissingCurrentCleanupEpoch;
         if (decode.cleanup.boundary) |supplied| {
@@ -1296,10 +1296,6 @@ test "decoder cleanup borrows current call only and rejects foreign retired outs
     owner.cb = &inaccessible_backend;
     call = original;
     call.cleanup.outside_execution = true;
-    try std.testing.expectError(error.MissingCurrentCleanupEpoch, owner.bindDecoderCleanup(&call));
-    var raw_outside: @import("../execution/resource_retirement.zig").SynchronousOutsideRawLeases = undefined;
-    call = original;
-    call.cleanup.synchronous_outside_raw = &raw_outside;
     try std.testing.expectError(error.MissingCurrentCleanupEpoch, owner.bindDecoderCleanup(&call));
     owner.cleanup_epoch = null;
     call = original;

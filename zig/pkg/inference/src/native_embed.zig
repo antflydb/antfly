@@ -23,7 +23,7 @@ const metal_runtime = if (build_options.enable_metal) @import("backends/metal_ru
     }
 };
 const c_file = @import("util/c_file.zig");
-const graph_runtime = @import("graph/runtime.zig");
+const graph_runtime = @import("execution/graph_runtime.zig");
 const graph_executor_stats = @import("graph/executor_stats.zig");
 const model_manager_mod = @import("server/model_manager.zig");
 const native_backend_guard = @import("native_backend_guard.zig");

@@ -267,6 +267,10 @@ pub const WeightStore = struct {
         if (supports_native_metal_provider) null else {},
     shared_metal_native_provider_lock: if (supports_native_metal_provider) std.Io.Mutex else void =
         if (supports_native_metal_provider) .init else {},
+    /// Creators belonging to the exact shared Metal provider. Request
+    /// contexts can retire independently of these admitted immutable roots.
+    metal_projection_packs: if (supports_native_metal_provider) @import("../backends/dense_projection_pack.zig").Cache else void =
+        if (supports_native_metal_provider) .{} else {},
     /// Immutable physical FP32 weights/relative constants. Request ComputeBackend
     /// wrappers borrow this owner; it is destroyed before the shared provider.
     boundary_resident: ?*@import("gliner_boundary_resident.zig").Owner = null,

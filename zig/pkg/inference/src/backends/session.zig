@@ -18,6 +18,7 @@ const ops = @import("../ops/ops.zig");
 const Tensor = @import("tensor.zig").Tensor;
 const TensorInfo = @import("tensor.zig").TensorInfo;
 const BackendType = @import("backends.zig").BackendType;
+const onnx_cache = @import("../execution/onnx_kv_cache.zig");
 const memory = @import("../runtime/tier/memory.zig");
 const invocation = @import("../execution/prepared_invocation.zig");
 const storage_admission = @import("../execution/storage_admission.zig");
@@ -35,9 +36,23 @@ fn unsupportedControlledRun(
 
 pub const ResidentInput = struct {
     value: ops.CT,
+    /// Ordinary inputs hold a provider tensor. Only selected prepared stages
+    /// construct the other bindings, whose value must never be dereferenced.
+    binding: union(enum) {
+        provider_tensor,
+        omitted,
+        planned_host: *const Tensor,
+    } = .provider_tensor,
     backend: *const ops.ComputeBackend,
     estimated_bytes: usize = 0,
     shape: []const i64 = &.{},
+
+    /// Native CPU tensors share a host representation across providers.
+    /// Device tensors require the exact provider context and table.
+    pub fn backendCompatible(source: *const ops.ComputeBackend, target: *const ops.ComputeBackend) bool {
+        return (source.ptr == target.ptr and source.vtable == target.vtable) or
+            (source.kind() == .native and target.kind() == .native);
+    }
 };
 
 /// Borrowed stage inputs ordered by the destination session signature.
@@ -427,8 +442,14 @@ pub const RunAdmission = struct {
         record: *const fn (*anyopaque, anyerror, ?memory.AdmissionPressure, memory.AdmissionRequest) void,
     };
 
+    pub const IdleReclaimer = struct {
+        context: *anyopaque,
+        reclaim: *const fn (*anyopaque, BackendType) bool,
+    };
+
     controller: *memory.AdmissionController,
     denial_observer: ?DenialObserver = null,
+    idle_reclaimer: ?IdleReclaimer = null,
     failure: ?*memory.AdmissionFailure = null,
     backend_class: memory.BackendClass,
     limits: memory.Limits,
@@ -918,7 +939,11 @@ pub const ShapeInputs = union(enum) {
         return switch (self) {
             .tensors, .host_shapes => .host_dense,
             .shapes => .unknown,
-            .resident_inputs => |v| .{ .resident = v.values[i] },
+            .resident_inputs => |v| switch (v.values[i].binding) {
+                .provider_tensor => .{ .resident = v.values[i] },
+                .planned_host => .host_dense,
+                .omitted => .unknown,
+            },
             .stage_inputs => |v| switch (v.values[i]) {
                 .host => .host_dense,
                 .resident => |value| .{ .resident = value },
@@ -958,6 +983,25 @@ pub const SequenceOutputGeometry = struct {
 /// self-attention time grows, while cross-attention time is encoder-context time.
 pub const CachedDecoderGeometry = struct {
     vocab_size: usize,
+    /// Indices in the cold qualified input signature. A caller may still
+    /// supply the same bindings in a different order.
+    past_input_indices: []const usize = &.{},
+
+    fn findPastInput(inputs: ShapeInputs, suffix: []const u8, preferred: ?usize) ?TensorInfo {
+        if (preferred) |index| {
+            if (index < inputs.len()) {
+                const input = inputs.get(index);
+                if (onnx_cache.pastInputSuffix(input.name)) |actual| {
+                    if (std.mem.eql(u8, actual, suffix)) return input;
+                }
+            }
+        }
+        for (0..inputs.len()) |index| {
+            const input = inputs.get(index);
+            if (std.mem.eql(u8, onnx_cache.pastInputSuffix(input.name) orelse continue, suffix)) return input;
+        }
+        return null;
+    }
 
     fn resolve(self: @This(), inputs: ShapeInputs, outputs: []const TensorInfo, batch: usize) !RunGeometry {
         const ids = inputs.named("input_ids") orelse return error.MissingInputs;
@@ -968,25 +1012,30 @@ pub const CachedDecoderGeometry = struct {
         var bytes: usize = 0;
         var cache_bytes: usize = 0;
         var sequence = @max(tokens, context);
-        for (outputs) |output| {
+        var self_cache: ?struct { previous: usize, end: usize } = null;
+        for (outputs, 0..) |output, index| {
             if (std.mem.eql(u8, output.name, "logits")) {
                 bytes = try addBytes(bytes, try mulBytes(try mulBytes(try mulBytes(batch, tokens), self.vocab_size), output.dtype.byteSize()));
             } else {
-                const prefix = "present.";
-                if (!std.mem.startsWith(u8, output.name, prefix) or output.shape.len != 4) return error.UnresolvedOutputGeometry;
-                const suffix = output.name[prefix.len..];
-                var past: ?TensorInfo = null;
-                for (0..inputs.len()) |i| {
-                    const input = inputs.get(i);
-                    if (std.mem.startsWith(u8, input.name, "past_key_values.") and std.mem.eql(u8, input.name["past_key_values.".len..], suffix)) {
-                        past = input;
-                        break;
-                    }
-                }
-                const cached = past orelse return error.MissingInputs;
+                const suffix = onnx_cache.presentOutputSuffix(output.name) orelse return error.UnresolvedOutputGeometry;
+                const role = onnx_cache.cacheRole(suffix) orelse return error.UnresolvedOutputGeometry;
+                if (output.shape.len != 4) return error.UnresolvedOutputGeometry;
+                const preferred = if (index < self.past_input_indices.len) self.past_input_indices[index] else null;
+                const cached = findPastInput(inputs, suffix, preferred) orelse return error.MissingInputs;
                 if (cached.shape.len != 4 or cached.shape[1] <= 0 or cached.shape[2] < 0 or cached.shape[3] <= 0) return error.InvalidInputShape;
-                const cross = std.mem.indexOf(u8, suffix, ".encoder.") != null;
-                const time = if (cross) context else try addBytes(@intCast(cached.shape[2]), tokens);
+                const past_length: usize = @intCast(cached.shape[2]);
+                const time = if (role == .cross_attention) cross: {
+                    if (past_length != 0 and past_length != context) return error.InvalidDecoderPosition;
+                    break :cross context;
+                } else self: {
+                    if (self_cache) |span| {
+                        if (past_length != span.previous) return error.InvalidDecoderPosition;
+                        break :self span.end;
+                    }
+                    const end = try @import("../execution/decoder_position.zig").appendEnd(past_length, tokens);
+                    self_cache = .{ .previous = past_length, .end = end };
+                    break :self end;
+                };
                 sequence = @max(sequence, time);
                 const elements = try mulBytes(try mulBytes(try mulBytes(batch, @intCast(cached.shape[1])), time), @intCast(cached.shape[3]));
                 const size = try mulBytes(elements, output.dtype.byteSize());
@@ -998,6 +1047,44 @@ pub const CachedDecoderGeometry = struct {
         return .{ .sequence = sequence, .output_bytes = bytes, .output_kv_bytes = cache_bytes };
     }
 };
+
+test "ONNX cache geometry prebinds exact names across reordered inputs and outputs" {
+    const ids: TensorInfo = .{ .name = "input_ids", .dtype = .i64, .shape = &.{ 2, 2 } };
+    const encoder: TensorInfo = .{ .name = "encoder_hidden_states", .dtype = .f32, .shape = &.{ 2, 4, 8 } };
+    const self_cache: TensorInfo = .{ .name = "past_key_values.0.decoder.key", .dtype = .f32, .shape = &.{ 2, 2, 5, 3 } };
+    const cross_cache: TensorInfo = .{ .name = "past_key_values.0.encoder.key", .dtype = .f32, .shape = &.{ 2, 1, 0, 2 } };
+    const logits: TensorInfo = .{ .name = "logits", .dtype = .f32, .shape = &.{ -1, -1, 11 } };
+    const self_output: TensorInfo = .{ .name = "present.0.decoder.key", .dtype = .f32, .shape = &.{ -1, 2, -1, 3 } };
+    const cross_output: TensorInfo = .{ .name = "present.0.encoder.key", .dtype = .f32, .shape = &.{ -1, 1, -1, 2 } };
+    const geometry: CachedDecoderGeometry = .{ .vocab_size = 11, .past_input_indices = &.{ std.math.maxInt(usize), 2, 3 } };
+    const expected: RunGeometry = .{ .sequence = 7, .output_bytes = 664, .output_kv_bytes = 464 };
+    try std.testing.expectEqual(expected, try geometry.resolve(.{ .shapes = &.{ ids, encoder, self_cache, cross_cache } }, &.{ logits, self_output, cross_output }, 2));
+    try std.testing.expectEqual(expected, try geometry.resolve(.{ .shapes = &.{ cross_cache, encoder, ids, self_cache } }, &.{ self_output, logits, cross_output }, 2));
+    try std.testing.expectError(error.MissingInputs, geometry.resolve(.{ .shapes = &.{ ids, encoder, cross_cache } }, &.{ logits, self_output, cross_output }, 2));
+    var malformed_past = self_cache;
+    malformed_past.name = "past_key_values.0.extra.encoder.key";
+    var malformed_present = self_output;
+    malformed_present.name = "present.0.extra.encoder.key";
+    try std.testing.expectError(error.UnresolvedOutputGeometry, geometry.resolve(.{ .shapes = &.{ ids, encoder, malformed_past } }, &.{ logits, malformed_present }, 2));
+}
+
+test "ONNX cache geometry rejects inconsistent decoder positions before admission" {
+    const inputs: []const TensorInfo = &.{
+        .{ .name = "input_ids", .dtype = .i64, .shape = &.{ 1, 2 } },
+        .{ .name = "encoder_hidden_states", .dtype = .f32, .shape = &.{ 1, 4, 8 } },
+        .{ .name = "past_key_values.0.decoder.key", .dtype = .f32, .shape = &.{ 1, 2, 5, 3 } },
+        .{ .name = "past_key_values.0.decoder.value", .dtype = .f32, .shape = &.{ 1, 2, 4, 3 } },
+        .{ .name = "past_key_values.0.encoder.key", .dtype = .f32, .shape = &.{ 1, 2, 3, 3 } },
+    };
+    const outputs: []const TensorInfo = &.{
+        .{ .name = "present.0.decoder.key", .dtype = .f32, .shape = &.{ -1, 2, -1, 3 } },
+        .{ .name = "present.0.decoder.value", .dtype = .f32, .shape = &.{ -1, 2, -1, 3 } },
+        .{ .name = "present.0.encoder.key", .dtype = .f32, .shape = &.{ -1, 2, -1, 3 } },
+    };
+    const geometry: CachedDecoderGeometry = .{ .vocab_size = 11 };
+    try std.testing.expectError(error.InvalidDecoderPosition, geometry.resolve(.{ .shapes = inputs }, outputs[0..2], 1));
+    try std.testing.expectError(error.InvalidDecoderPosition, geometry.resolve(.{ .shapes = inputs }, outputs[2..], 1));
+}
 
 test "imported sequence geometry resolves transformed audio axes without native hooks" {
     const Probe = struct {
@@ -1112,14 +1199,16 @@ const OutputAdmission = struct {
     }
 };
 
+fn addRetainedOutput(amounts: *memory.AdmissionAmounts, output: Tensor, is_cache: bool) !void {
+    const bytes = try addBytes(output.data.len, try mulBytes(output.shape.len, @sizeOf(i64)));
+    const category = if (is_cache) &amounts.host_kv_bytes else &amounts.host_scratch_bytes;
+    category.* = try addBytes(category.*, bytes);
+}
+
 pub fn retainedOutputAmounts(outputs: []const Tensor, cache_qualified: bool) !memory.AdmissionAmounts {
     var amounts = memory.AdmissionAmounts{};
-    for (outputs) |output| {
-        const bytes = try addBytes(output.data.len, try mulBytes(output.shape.len, @sizeOf(i64)));
-        if (cache_qualified and std.mem.startsWith(u8, output.name, "present.")) {
-            amounts.host_kv_bytes = try addBytes(amounts.host_kv_bytes, bytes);
-        } else amounts.host_scratch_bytes = try addBytes(amounts.host_scratch_bytes, bytes);
-    }
+    for (outputs) |output|
+        try addRetainedOutput(&amounts, output, cache_qualified and onnx_cache.presentOutputRole(output.name) != null);
     return amounts;
 }
 
@@ -1133,11 +1222,6 @@ pub const OutputCredits = struct {
     covered: bool,
     const Entry = struct { group: usize = 0, remaining: usize = 0, amounts: memory.AdmissionAmounts = .{} };
 
-    fn cacheGroup(name: []const u8) ?bool {
-        if (!std.mem.startsWith(u8, name, "present.")) return null;
-        return std.mem.indexOf(u8, name, ".encoder.") != null;
-    }
-
     pub fn init(allocator: std.mem.Allocator, outputs: []const Tensor, cache_qualified: bool, covered: bool) !OutputCredits {
         const entries = try allocator.alloc(Entry, outputs.len);
         errdefer allocator.free(entries);
@@ -1146,17 +1230,16 @@ pub const OutputCredits = struct {
         var cache_groups: [2]?usize = .{ null, null };
         for (outputs, 0..) |output, index| {
             var group = index;
-            if (cacheGroup(output.name)) |kind| {
-                const slot = &cache_groups[@intFromBool(kind)];
+            const role = onnx_cache.presentOutputRole(output.name);
+            if (role) |kind| {
+                const slot = &cache_groups[@backingInt(kind)];
                 group = slot.* orelse index;
                 slot.* = group;
             }
             entries[index].group = group;
             if (group == index) groups += 1;
             entries[group].remaining += 1;
-            const amounts = try retainedOutputAmounts(&.{output}, cache_qualified);
-            entries[group].amounts.host_scratch_bytes = try addBytes(entries[group].amounts.host_scratch_bytes, amounts.host_scratch_bytes);
-            entries[group].amounts.host_kv_bytes = try addBytes(entries[group].amounts.host_kv_bytes, amounts.host_kv_bytes);
+            try addRetainedOutput(&entries[group].amounts, output, cache_qualified and role != null);
         }
         return .{ .entries = entries, .remaining_groups = groups, .covered = covered };
     }
@@ -1709,9 +1792,14 @@ pub const ModelContract = struct {
 /// Host-only eager owner. Only its complete static table may certify and run
 /// the actual original implementation; copied/forwarded unknown tables decline.
 pub const EagerHostRunServices = struct {
+    pub const ResidentPublication = *const fn (*anyopaque, []const Tensor, std.mem.Allocator, ?InferenceExecutionControl, *const @import("../execution/retirement_sink.zig").Epoch) anyerror!?ResidentOutputs;
+
     /// Synchronous resident producer only; the receiving implementation clears
     /// every borrowed header field before its backend/output owner escapes.
     run_resident: ?*const fn (*anyopaque, []const Tensor, std.mem.Allocator, *const @import("../execution/invocation_context.zig").Context) anyerror!?ResidentOutputs = null,
+    /// Dispatch in a caller-owned publication epoch. The caller attaches the
+    /// provider finish guard before publication.
+    select_resident_publication: ?*const fn (*anyopaque) ?ResidentPublication = null,
     accepts: *const fn (*const Session.VTable) bool,
     recurrent_layout: *const fn (*anyopaque) anyerror!?@import("../execution/recurrent_state_admission.zig").Layout,
     run: *const fn (*anyopaque, []const Tensor, std.mem.Allocator, ?InferenceExecutionControl, *const @import("../execution/invocation_context.zig").Context, ?*@import("../execution/existing_workspace_receipt.zig").Owner) anyerror![]Tensor,
@@ -2807,6 +2895,13 @@ pub const Session = struct {
         return self.retainPermit(.{ .session = self, .lease = try admission.acquireAmountsWithPressure(extra, pressure) });
     }
 
+    /// Call after a retryable admission denial, before taking execution locks.
+    pub fn reclaimIdleForRunOutsideExecution(self: Session) bool {
+        const admission = self.run_admission orelse return false;
+        const reclaimer = admission.idle_reclaimer orelse return false;
+        return reclaimer.reclaim(reclaimer.context, self.backend());
+    }
+
     /// Preserve the exact denial constraint for bounded batch planning. A
     /// failed reservation publishes no lease; a fit probe is never a permit.
     pub fn admitWithPressure(self: Session, request: RunRequest, pressure: *?memory.AdmissionPressure) !RunPermit {
@@ -3116,9 +3211,41 @@ pub const Session = struct {
     /// Request-retained decoder banks use the KV quota independently of
     /// transient operator workspace. CPU provider state is physical host KV.
     pub fn admitRetainedState(self: Session, host_metadata_bytes: usize, state_bytes: usize) !RunPermit {
+        return self.admitRetainedStateWithWorkspace(host_metadata_bytes, state_bytes, 0);
+    }
+
+    fn retainedStateAmounts(backend_class: memory.BackendClass, host_scratch_bytes: usize, state_bytes: usize, workspace_bytes: usize) !memory.AdmissionAmounts {
+        return switch (backend_class) {
+            .gpu => .{
+                .host_scratch_bytes = host_scratch_bytes,
+                .backend_kv_bytes = state_bytes,
+                .backend_scratch_bytes = workspace_bytes,
+            },
+            .cpu => .{
+                .host_scratch_bytes = try addBytes(host_scratch_bytes, workspace_bytes),
+                .host_kv_bytes = state_bytes,
+            },
+        };
+    }
+
+    /// Check a candidate against intrinsic limits, including model residency.
+    /// The selected candidate still needs a permit against live capacity.
+    pub fn fitsRetainedStateWithWorkspace(self: Session, host_scratch_bytes: usize, state_bytes: usize, workspace_bytes: usize) !bool {
+        const admission = self.run_admission orelse return true;
+        const amounts = try retainedStateAmounts(admission.backend_class, host_scratch_bytes, state_bytes, workspace_bytes);
+        admission.controller.validateRequests(&.{.{
+            .backend_class = admission.backend_class,
+            .limits = admission.limits,
+            .amounts = amounts,
+            .required_residency = admission.requiredResidency(),
+        }}) catch return false;
+        return true;
+    }
+
+    /// Acquire request state and its concurrent workspace in one admission.
+    pub fn admitRetainedStateWithWorkspace(self: Session, host_scratch_bytes: usize, state_bytes: usize, workspace_bytes: usize) !RunPermit {
         const admission = self.run_admission orelse return self.retainPermit(.{ .session = self, .lease = null });
-        var amounts = memory.AdmissionAmounts{ .host_scratch_bytes = host_metadata_bytes };
-        if (admission.backend_class == .gpu) amounts.backend_kv_bytes = state_bytes else amounts.host_kv_bytes = state_bytes;
+        const amounts = try retainedStateAmounts(admission.backend_class, host_scratch_bytes, state_bytes, workspace_bytes);
         return self.retainPermit(.{ .session = self, .lease = try admission.acquireAmounts(amounts) });
     }
 
@@ -3164,11 +3291,7 @@ pub const Session = struct {
         const stage_backend = shared.stableBackend();
         for (inputs, self.inputInfo()) |input, info| switch (input) {
             .host => |host| if (!std.mem.eql(u8, host.name, info.name) or host.dtype != info.dtype) return false,
-            .resident => |value| {
-                if (value.backend.ptr == stage_backend.ptr and value.backend.vtable == stage_backend.vtable) continue;
-                if (value.backend.kind() == .native and stage_backend.kind() == .native) continue;
-                return false;
-            },
+            .resident => |value| if (value.binding != .provider_tensor or !ResidentInput.backendCompatible(value.backend, stage_backend)) return false,
         };
         return true;
     }
@@ -3176,6 +3299,16 @@ pub const Session = struct {
     /// A mixed stage has one admission boundary. Resident activations stay with
     /// their producer; only host controls are imported into the selected context.
     pub fn runStageInputsWithControl(self: Session, inputs: []const StageInput, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !?ResidentOutputs {
+        return self.runStageInputsAdmitted(inputs, allocator, control, false);
+    }
+
+    /// Direct callers holding no numerical or provider gate can retire an
+    /// evicted specialization before acquiring the next stage's admission.
+    pub fn runStageInputsBeforeExecution(self: Session, inputs: []const StageInput, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !?ResidentOutputs {
+        return self.runStageInputsAdmitted(inputs, allocator, control, true);
+    }
+
+    fn runStageInputsAdmitted(self: Session, inputs: []const StageInput, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, comptime before_execution: bool) !?ResidentOutputs {
         if (!self.supportsStageInputs(inputs)) return null;
         if (control != null and self.vtable.runResidentInputsWithControl == null) return null;
         if (control) |active| try active.check();
@@ -3196,7 +3329,12 @@ pub const Session = struct {
             };
         }
         const batch = if (info.len > 0) positiveDimension(info[0].shape, 0) else 1;
-        var permit = try self.admitShapeRequest(.{ .stage_inputs = .{ .info = info, .values = inputs } }, try self.planShapes(info, batch), allocator, control);
+        const shapes: ShapeInputs = .{ .stage_inputs = .{ .info = info, .values = inputs } };
+        const request = try self.planShapes(info, batch);
+        var permit = if (before_execution)
+            try self.admitShapeRequestBeforeExecution(shapes, request, allocator, control)
+        else
+            try self.admitShapeRequest(shapes, request, allocator, control);
         defer permit.deinit();
         try permit.prepareResidentOutputRetirement();
         var outputs = (try @import("../execution/invocation_observation.zig").callStage(self.invocation_diagnostics, inputs, RunPermit.runStageInputsWithinBoundary, .{ &permit, inputs, allocator, control })) orelse return null;
@@ -3896,6 +4034,12 @@ pub const PreparedSource = struct {
     /// The receiving task must attest its cold owner against the returned
     /// dispatch permit's exact session, not merely a shared controller/Domain.
     pub fn initOwningSynchronousTaskPermitBeforeExecutionInto(self: *PreparedSource, original: *RunPermit, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !bool {
+        return self.initOwningSynchronousTaskPermitWithHostStorage(original, null, allocator, control);
+    }
+
+    /// Borrow a live preprocessing owner for this synchronous handoff. The
+    /// caller keeps its payload and leases alive until Source has drained.
+    pub fn initOwningSynchronousTaskPermitWithHostStorage(self: *PreparedSource, original: *RunPermit, host_storage: ?*const @import("admitted_allocator.zig").AdmittedAllocator, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !bool {
         if (self.phase != .empty) return error.SourceInvocationAlreadyInitialized;
         const source = original.session;
         const model = @import("../execution/architecture_session.zig").nativeSynchronousTaskPermitModel(source) orelse return false;
@@ -3908,11 +4052,20 @@ pub const PreparedSource = struct {
             !std.meta.eql(original.physical_credit, memory.AdmissionAmounts{})) return false;
         const held = original.lease orelse return false;
         const request = original.request orelse return false;
-        if (request.workspace_planned or request.retained_backend_workspace_bytes != 0 or request.pre_admitted_host_bytes != 0) return false;
+        if (request.workspace_planned or request.retained_backend_workspace_bytes != 0) return false;
         const policy = source.run_admission.?; // exact Model/Domain proof above
         if (held.controller != policy.controller or held.retain_backend_class != policy.backend_class) return error.ForeignAdmissionDomain;
+        const borrowed_pin = if (request.pre_admitted_host_bytes != 0) pin: {
+            const storage = host_storage orelse return false;
+            const owner = storage.session orelse return false;
+            if (owner.ptr != source.ptr or owner.vtable != source.vtable or owner.model_lifetime != source.model_lifetime or
+                (owner.run_admission orelse return false).controller != policy.controller or
+                request.pre_admitted_host_bytes > storage.live_bytes or
+                request.pre_admitted_host_bytes > try storage.ownedHostBytesFor(policy.controller)) return false;
+            break :pin storage.resource_pin;
+        } else null;
         if (source.resourcePin()) |expected| {
-            const actual = original.resource_pin orelse return false;
+            const actual = original.resource_pin orelse borrowed_pin orelse return false;
             if (actual.ptr != expected.ptr or actual.retain_fn != expected.retain_fn or actual.release_fn != expected.release_fn or
                 actual.release_with_boundary_fn != expected.release_with_boundary_fn or actual.payload_charge_fn != expected.payload_charge_fn) return false;
         } else if (original.resource_pin != null) return false;
@@ -5687,6 +5840,28 @@ pub const RunPermit = struct {
         allocator: std.mem.Allocator,
         control: ?InferenceExecutionControl,
     ) !?ResidentOutputs {
+        return self.runResidentWithControlImpl(inputs, allocator, control, false);
+    }
+
+    /// The resident publisher already owns and binds the exact cleanup epoch
+    /// and will retain it through the provider before the result escapes.
+    pub fn runResidentForPublication(
+        self: *RunPermit,
+        inputs: []const Tensor,
+        allocator: std.mem.Allocator,
+        control: ?InferenceExecutionControl,
+    ) !?ResidentOutputs {
+        if (self.dispatch_cleanup_epoch == null or self.execution_yielded) return error.MissingCurrentCleanupEpoch;
+        return self.runResidentWithControlImpl(inputs, allocator, control, true);
+    }
+
+    fn runResidentWithControlImpl(
+        self: *RunPermit,
+        inputs: []const Tensor,
+        allocator: std.mem.Allocator,
+        control: ?InferenceExecutionControl,
+        publication: bool,
+    ) anyerror!?ResidentOutputs {
         try self.validateResidentDispatch();
         try self.session.validateEagerHostServices();
         try self.resolveGeometry(inputs);
@@ -5705,6 +5880,23 @@ pub const RunPermit = struct {
             return outputs;
         }
         if (try self.executePreparedResident(.{ .host = inputs }, allocator, control)) |outputs| return outputs;
+        if (publication) if (self.session.vtable.eager_host_services) |services| {
+            if (!services.accepts(self.session.vtable)) return error.UnsupportedRecurrentStateTarget;
+            const run_for_publication = if (services.select_resident_publication) |select| select(self.session.ptr) else null;
+            if (run_for_publication) |run_selected| {
+                const epoch = &self.dispatch_cleanup_epoch.?;
+                if (control) |active| try active.check();
+                var hard_cancellation = if (control) |active| try active.enterUninterruptible(self.session.interruption()) else null;
+                defer if (hard_cancellation) |*guard| guard.deinit();
+                if (try @import("../execution/invocation_observation.zig").call(self.session.invocation_diagnostics, run_selected, .{ self.session.ptr, inputs, allocator, control, epoch })) |published| {
+                    var outputs = published;
+                    self.pinResident(&outputs);
+                    errdefer self.discardFailedResident(&outputs);
+                    if (control) |active| try active.check();
+                    return outputs;
+                }
+            }
+        };
         const active = control orelse return self.runResident(inputs, allocator);
         try active.check();
         var hard_cancellation = try active.enterUninterruptible(self.session.interruption());
@@ -5768,11 +5960,29 @@ pub const RunPermit = struct {
         defer if (allocate) allocator.free(resident);
         var initialized: usize = 0;
         defer for (inputs[0..initialized], resident[0..initialized]) |input, value| {
-            if (input == .host) backend.free(value.value);
+            if (input == .host and value.binding == .provider_tensor) backend.free(value.value);
         };
-        for (inputs, resident) |input, *value| {
+        var needs_prepared_dispatch = false;
+        for (inputs, resident, 0..) |*input, *value, index| {
             if (control) |active| try active.check();
-            value.* = switch (input) {
+            if (input.* == .host) if (self.prepared) |*selected| {
+                const binding = selected.hostStageBinding(index);
+                switch (binding) {
+                    .import => {},
+                    .omitted, .planned_host => {
+                        value.* = .{
+                            .value = backend.ptr,
+                            .binding = if (binding == .omitted) .omitted else .{ .planned_host = &input.host },
+                            .backend = backend,
+                            .shape = input.host.shape,
+                        };
+                        needs_prepared_dispatch = true;
+                        initialized += 1;
+                        continue;
+                    },
+                }
+            };
+            value.* = switch (input.*) {
                 .host => |host| .{
                     .value = try shared.importReadOnlyHostTensor(allocator, &host),
                     .backend = backend,
@@ -5784,6 +5994,7 @@ pub const RunPermit = struct {
             initialized += 1;
         }
         if (try self.executePreparedResident(.{ .resident = resident }, allocator, control)) |outputs| return outputs;
+        if (needs_prepared_dispatch) return error.UnpreparedStagePayload;
         var outputs = (if (control) |active|
             try @import("../execution/invocation_observation.zig").callResident(self.session.invocation_diagnostics, resident, self.session.vtable.runResidentInputsWithControl.?, .{ self.session.ptr, resident, allocator, active })
         else
@@ -5975,7 +6186,7 @@ fn residentShapeInfo(session: Session, inputs: []const ResidentInput, allocator:
     for (inputs, session.inputInfo(), info) |input, declared, *actual| actual.* = .{
         .name = declared.name,
         .dtype = declared.dtype,
-        .shape = if (input.shape.len != 0) input.shape else try input.backend.tensorShape(input.value, allocator),
+        .shape = if (input.binding != .provider_tensor or input.shape.len != 0) input.shape else try input.backend.tensorShape(input.value, allocator),
     };
     return info;
 }
@@ -6179,6 +6390,33 @@ test "controlled blocked backend expires and admission unwinds" {
     try std.testing.expectError(error.Timeout, permit.runWithControl(&.{}, std.testing.allocator, control));
     permit.deinit();
     try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+test "retained decoder state and workspace admit and retire together" {
+    var controller = memory.AdmissionController{};
+    var session = Session{ .ptr = &controller, .vtable = undefined, .run_admission = .{
+        .controller = &controller,
+        .backend_class = .gpu,
+        .limits = .{ .combined_limit_bytes = 63 },
+        .static_workspace_bytes = 0,
+        .check_live_memory = false,
+    } };
+    if (session.admitRetainedStateWithWorkspace(16, 32, 16)) |unexpected| {
+        var permit = unexpected;
+        permit.deinit();
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
+
+    session.run_admission.?.limits.combined_limit_bytes = 64;
+    var permit = try session.admitRetainedStateWithWorkspace(16, 32, 16);
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{
+        .host_scratch_bytes = 16,
+        .backend_kv_bytes = 32,
+        .backend_scratch_bytes = 16,
+    }, controller.snapshot());
+    permit.deinit();
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
 }
 
 test "run admission credits retained Qwen workspace once and keeps hard limits" {
@@ -6540,6 +6778,19 @@ test "session output admission coalesces cache column callbacks" {
     permit.deinit();
     try std.testing.expectEqual(@as(usize, 1), probe.releases);
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
+
+    var malformed = outputs[0];
+    malformed.name = "present.0.decoder.encoder.key";
+    var compact = outputs[0];
+    compact.name = "present.0.key";
+    const mixed = [_]Tensor{ outputs[0], malformed, outputs[64], compact };
+    const total = try retainedOutputAmounts(&mixed, true);
+    try std.testing.expectEqual(@as(usize, 36), total.host_kv_bytes);
+    try std.testing.expectEqual(@as(usize, 12), total.host_scratch_bytes);
+    var separate = try OutputCredits.init(std.testing.allocator, &mixed, true, true);
+    defer separate.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 3), separate.remaining_groups);
+    try std.testing.expectEqual(@as(usize, 12), separate.retire(1).?.host_scratch_bytes);
 }
 
 test "session output admission releases obsolete outputs independently" {

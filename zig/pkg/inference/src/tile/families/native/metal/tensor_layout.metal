@@ -96,7 +96,7 @@ kernel void termite_gather_axis0_add_bias_f32_2d(device const float *input [[buf
 }
 // native-program:entry termite_concat_lastdim_f32_2d
 // native-program:indent 11
-kernel void termite_concat_lastdim_f32_2d(device const float *a [[buffer(0)]], device const float *b [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_concat_lastdim_f32_2d_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+kernel void termite_concat_lastdim_f32_2d(device const uint *a [[buffer(0)]], device const uint *b [[buffer(1)]], device uint *output [[buffer(2)]], constant termite_metal_concat_lastdim_f32_2d_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
     uint out_dim = p.dim_a + p.dim_b;
 {{concat_rows}}}
 // native-program:entry termite_argmax_axis_f32

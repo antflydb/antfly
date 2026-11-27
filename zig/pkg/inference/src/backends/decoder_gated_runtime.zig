@@ -19,7 +19,7 @@ const platform = @import("antfly_platform");
 const gemma4_runtime = @import("../architectures/gemma4_runtime.zig");
 const gpt_arch = @import("../architectures/gpt.zig");
 const contracts = @import("../graph/backend_contracts.zig");
-const model_runtime = @import("../graph/model_runtime.zig");
+const model_runtime = @import("../execution/model_runtime.zig");
 const gpt_mod = @import("../models/gpt.zig");
 const decoder_rms_runtime = @import("decoder_rms_runtime.zig");
 const decoder_tail_runtime = @import("decoder_tail_runtime.zig");
@@ -1262,40 +1262,63 @@ fn applyPleDirect(
     })) orelse cb.add(hidden, normed);
 }
 
+const PleTokenSource = union(enum) { host: []const i64, device: ops.CT };
+
 fn computePleVectorsDirect(
     cb: *const ops.ComputeBackend,
     gpt_config: gpt_mod.Config,
     configured_layer_count: usize,
-    input_ids: []const i64,
+    tokens: PleTokenSource,
     hidden: ops.CT,
     total: usize,
 ) !?ops.CT {
     if (gpt_config.family != .gemma or !gpt_config.hasPle()) return null;
     if (total == 0) return null;
 
+    const planned_scope = try metal_compute_mod.MetalCompute.beginPlannedGraphScope(cb, .ple);
+    var finished = false;
+    defer if (!finished) metal_compute_mod.MetalCompute.abortPlannedGraphScope(cb, planned_scope);
+    const output = (try encodePleVectors(cb, gpt_config, configured_layer_count, tokens, hidden, total)) orelse return null;
+    errdefer cb.free(output);
+    finished = true;
+    try metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope);
+    return output;
+}
+
+fn encodePleVectors(
+    cb: *const ops.ComputeBackend,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    tokens: PleTokenSource,
+    hidden: ops.CT,
+    total: usize,
+) !?ops.CT {
     const ple_dim: usize = gpt_config.ple_hidden_size;
     const num_layers: usize = gpt_config.num_hidden_layers;
     const ple_total_dim = ple_dim * num_layers;
 
-    const planned_scope = try metal_compute_mod.MetalCompute.beginPlannedGraphScope(cb, .ple);
-    defer metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope) catch {};
-
-    var started_at = monotonicNowNs();
-    const token_w = gpt_arch.getModelEmbeddingWeight(cb, gpt_config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
-        error.MissingWeight => try gpt_arch.getModelEmbeddingWeight(cb, gpt_config, "model.embed_tokens_per_layer.weight"),
-        else => return err,
+    var stage: []const u8 = "embedding_weight";
+    errdefer if (prefillTraceRequested()) {
+        std.debug.print("prefill-trace: per-layer input failed stage={s} rows={d}\n", .{ stage, total });
     };
+    var started_at = monotonicNowNs();
+    const token_w = try gpt_arch.getPerLayerEmbeddingWeight(cb, gpt_config);
     var finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.prefill_ple_lookup_nanos += finished_at - started_at;
     defer cb.free(token_w);
 
     started_at = monotonicNowNs();
-    const token_embd_raw = try cb.embeddingLookup(token_w, input_ids, total, ple_total_dim);
+    stage = "embedding_lookup";
+    const token_embd_raw = switch (tokens) {
+        .host => |ids| try cb.embeddingLookup(token_w, ids, total, ple_total_dim),
+        .device => |tensor| (try cb.embeddingLookupTensor(token_w, tensor, total, ple_total_dim)) orelse return null,
+    };
     finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.prefill_ple_embedding_nanos += finished_at - started_at;
     defer cb.free(token_embd_raw);
 
     started_at = monotonicNowNs();
+    stage = "model_projection";
     const projection_epsilon = try gpt_arch.gemmaPleProjectionEpsilon(cb, hidden, total, gpt_config);
     const model_proj_raw = (try cb.decoderRuntimeApplyLinear(&.{
         .slot = pleModelProjSlot(configured_layer_count),
@@ -1308,6 +1331,7 @@ fn computePleVectorsDirect(
     defer cb.free(model_proj_raw);
 
     started_at = monotonicNowNs();
+    stage = "projection_normalization";
     const reshaped = (try cb.reshape2d(model_proj_raw, total * num_layers, ple_dim)) orelse return null;
     defer cb.free(reshaped);
 
@@ -1325,6 +1349,7 @@ fn computePleVectorsDirect(
     defer cb.free(normed_proj);
 
     started_at = monotonicNowNs();
+    stage = "combine";
     const embed_scale_val = @sqrt(@as(f32, @floatFromInt(ple_dim)));
     const combine_scale_val: f32 = 1.0 / @sqrt(2.0);
     if (try cb.decoderRuntimeApplyScaledAddScale(&.{
@@ -1338,6 +1363,8 @@ fn computePleVectorsDirect(
         if (finished_at > started_at) timing_stats.prefill_ple_combine_nanos += finished_at - started_at;
         return combined_scaled;
     }
+
+    if (tokens == .device) return null;
 
     const scale_shape = [_]i32{1};
     const embed_scale_ct = try cb.fromFloat32Shape(&[_]f32{embed_scale_val}, &scale_shape);
@@ -1356,86 +1383,6 @@ fn computePleVectorsDirect(
     finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.prefill_ple_combine_nanos += finished_at - started_at;
     return combined_scaled;
-}
-
-fn computePleVectorsDirectFromTokenTensor(
-    cb: *const ops.ComputeBackend,
-    gpt_config: gpt_mod.Config,
-    configured_layer_count: usize,
-    input_token: ops.CT,
-    hidden: ops.CT,
-    total: usize,
-) !?ops.CT {
-    if (gpt_config.family != .gemma or !gpt_config.hasPle()) return null;
-    if (total == 0) return null;
-
-    const ple_dim: usize = gpt_config.ple_hidden_size;
-    const num_layers: usize = gpt_config.num_hidden_layers;
-    const ple_total_dim = ple_dim * num_layers;
-
-    const planned_scope = try metal_compute_mod.MetalCompute.beginPlannedGraphScope(cb, .ple);
-    defer metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope) catch {};
-
-    var started_at = monotonicNowNs();
-    const token_w = gpt_arch.getModelEmbeddingWeight(cb, gpt_config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
-        error.MissingWeight => try gpt_arch.getModelEmbeddingWeight(cb, gpt_config, "model.embed_tokens_per_layer.weight"),
-        else => return err,
-    };
-    var finished_at = monotonicNowNs();
-    if (finished_at > started_at) timing_stats.prefill_ple_lookup_nanos += finished_at - started_at;
-    defer cb.free(token_w);
-
-    started_at = monotonicNowNs();
-    const token_embd_raw = (try cb.embeddingLookupTensor(token_w, input_token, total, ple_total_dim)) orelse return null;
-    finished_at = monotonicNowNs();
-    if (finished_at > started_at) timing_stats.prefill_ple_embedding_nanos += finished_at - started_at;
-    defer cb.free(token_embd_raw);
-
-    started_at = monotonicNowNs();
-    const projection_epsilon = try gpt_arch.gemmaPleProjectionEpsilon(cb, hidden, total, gpt_config);
-    const model_proj_raw = (try cb.decoderRuntimeApplyLinear(&.{
-        .slot = pleModelProjSlot(configured_layer_count),
-        .input = hidden,
-        .in_dim = gpt_config.hidden_size,
-        .out_dim = ple_total_dim,
-    })) orelse return null;
-    finished_at = monotonicNowNs();
-    if (finished_at > started_at) timing_stats.prefill_ple_model_proj_nanos += finished_at - started_at;
-    defer cb.free(model_proj_raw);
-
-    started_at = monotonicNowNs();
-    const reshaped = (try cb.reshape2d(model_proj_raw, total * num_layers, ple_dim)) orelse return null;
-    defer cb.free(reshaped);
-
-    const normed_flat = (try cb.decoderRuntimeApplyRmsNorm(&.{
-        .slot = pleProjNormSlot(configured_layer_count),
-        .input = reshaped,
-        .hidden_size = ple_dim,
-        .eps = projection_epsilon,
-    })) orelse return null;
-    defer cb.free(normed_flat);
-
-    const normed_proj = (try cb.reshape2d(normed_flat, total, ple_total_dim)) orelse return null;
-    finished_at = monotonicNowNs();
-    if (finished_at > started_at) timing_stats.prefill_ple_norm_nanos += finished_at - started_at;
-    defer cb.free(normed_proj);
-
-    started_at = monotonicNowNs();
-    const embed_scale_val = @sqrt(@as(f32, @floatFromInt(ple_dim)));
-    const combine_scale_val: f32 = 1.0 / @sqrt(2.0);
-    if (try cb.decoderRuntimeApplyScaledAddScale(&.{
-        .lhs = token_embd_raw,
-        .rhs = normed_proj,
-        .dim = total * ple_total_dim,
-        .lhs_scale = embed_scale_val,
-        .output_scale = combine_scale_val,
-    })) |combined_scaled| {
-        finished_at = monotonicNowNs();
-        if (finished_at > started_at) timing_stats.prefill_ple_combine_nanos += finished_at - started_at;
-        return combined_scaled;
-    }
-
-    return null;
 }
 
 pub fn preparedLayers(configured_layers: usize) usize {
@@ -1720,10 +1667,7 @@ fn tryBackendOwnedTokenResultPhaseHidden(
     const token_embedding_weight = try gpt_arch.getEmbeddingWeight(cb, gpt_config);
     defer cb.free(token_embedding_weight);
     const ple_token_embedding_weight: ?ops.CT = if (gpt_config.hasPle())
-        gpt_arch.getModelEmbeddingWeight(cb, gpt_config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
-            error.MissingWeight => try gpt_arch.getModelEmbeddingWeight(cb, gpt_config, "model.embed_tokens_per_layer.weight"),
-            else => return err,
-        }
+        try gpt_arch.getPerLayerEmbeddingWeight(cb, gpt_config)
     else
         null;
     defer if (ple_token_embedding_weight) |weight| cb.free(weight);
@@ -1819,10 +1763,7 @@ pub fn forwardGreedyTokensBatch(
     }
     const embedding = try gpt_arch.getEmbeddingWeight(cb, cfg);
     defer cb.free(embedding);
-    const ple_embedding = gpt_arch.getModelEmbeddingWeight(cb, cfg, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
-        error.MissingWeight => try gpt_arch.getModelEmbeddingWeight(cb, cfg, "model.embed_tokens_per_layer.weight"),
-        else => return err,
-    };
+    const ple_embedding = try gpt_arch.getPerLayerEmbeddingWeight(cb, cfg);
     defer cb.free(ple_embedding);
     const request = contracts.DecoderRuntimeDecodeRequest{
         .contract = .gemma4_gated_ple_shared_kv,
@@ -2255,15 +2196,18 @@ pub fn prewarmPleTokenEmbedding(
     if (gpt_config.family != .gemma or !gpt_config.hasPle()) return false;
     if (gpt_config.ple_hidden_size == 0 or gpt_config.num_hidden_layers == 0) return false;
     const ple_total_dim = try std.math.mul(usize, gpt_config.ple_hidden_size, gpt_config.num_hidden_layers);
-    const token_w = gpt_arch.getModelEmbeddingWeight(cb, gpt_config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
-        error.MissingWeight => try gpt_arch.getModelEmbeddingWeight(cb, gpt_config, "model.embed_tokens_per_layer.weight"),
-        else => return err,
-    };
+    const token_w = try gpt_arch.getPerLayerEmbeddingWeight(cb, gpt_config);
     defer cb.free(token_w);
     const ids = [_]i64{0};
     const embedding = try cb.embeddingLookup(token_w, ids[0..], ids.len, ple_total_dim);
     defer cb.free(embedding);
     return true;
+}
+
+fn completeDecoderRuntimeFrame(cb: *const ops.ComputeBackend, active: *bool) !void {
+    if (!active.*) return;
+    try cb.decoderRuntimeSubmitAndWaitFrame();
+    active.* = false;
 }
 
 fn finishDecoderRuntimeFrame(cb: *const ops.ComputeBackend, active: *bool) void {
@@ -2462,6 +2406,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
             .layers = planned_frame_layers,
             .include_tail = row_output == .all,
             .output_hidden = &frame_hidden,
+            .execution_control = cb.execution_control,
         })) {
             const frame_execute_finished_at = monotonicNowNs();
             if (frame_execute_finished_at > frame_execute_started_at) {
@@ -5987,7 +5932,7 @@ pub fn forwardGreedyToken(
         cb,
         gpt_config,
         configured_layer_count,
-        &ple_input_ids,
+        .{ .host = &ple_input_ids },
         hidden,
         1,
     )) |direct_ple|
@@ -6276,10 +6221,6 @@ pub fn pipelinedAwaitToken(cb: *const ops.ComputeBackend) !?i64 {
     return decoderRuntimePipelinedControl(cb, .await_only);
 }
 
-pub fn pipelinedSubmitPending(cb: *const ops.ComputeBackend) bool {
-    return ((decoderRuntimePipelinedControl(cb, .submit_pending) catch null) != null);
-}
-
 pub fn pipelinedCancelPending(cb: *const ops.ComputeBackend) void {
     _ = decoderRuntimePipelinedControl(cb, .cancel_pending) catch {};
 }
@@ -6356,11 +6297,11 @@ pub fn forwardGreedyTokenFromTokenTensor(
     if (finished_at > started_at) timing_stats.greedy_embed_nanos += finished_at - started_at;
 
     started_at = monotonicNowNs();
-    const ple_vectors = if (try computePleVectorsDirectFromTokenTensor(
+    const ple_vectors = if (try computePleVectorsDirect(
         cb,
         gpt_config,
         configured_layer_count,
-        token_tensor,
+        .{ .device = token_tensor },
         hidden,
         1,
     )) |direct_ple|
@@ -6436,14 +6377,14 @@ pub fn forwardGreedyTokenFromTokenTensor(
     }
 
     started_at = monotonicNowNs();
-    const result = (try decoder_tail_runtime.forwardGreedyTokenTensorFromFinalHidden(
+    const result = try decoder_tail_runtime.forwardGreedyTokenTensorFromFinalHidden(
         cb,
         allocator,
         gpt_config,
         final_hidden,
         .rms,
         finalNormSlot(configured_layer_count),
-    )) orelse return null;
+    );
     finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.greedy_tail_nanos += finished_at - started_at;
     if (compare_fallback_hidden) |fallback_hidden| {
@@ -6486,11 +6427,11 @@ pub fn forwardGreedyTokenTensorOnlyFromTokenTensor(
     if (finished_at > started_at) timing_stats.greedy_embed_nanos += finished_at - started_at;
 
     started_at = monotonicNowNs();
-    const ple_vectors = if (try computePleVectorsDirectFromTokenTensor(
+    const ple_vectors = if (try computePleVectorsDirect(
         cb,
         gpt_config,
         configured_layer_count,
-        token_tensor,
+        .{ .device = token_tensor },
         hidden,
         1,
     )) |direct_ple|
@@ -6660,7 +6601,7 @@ fn forwardPrefillPreparedTail(
         cb,
         gpt_config,
         configured_layer_count,
-        input_ids,
+        .{ .host = input_ids },
         hidden,
         input_ids.len,
     );
@@ -6720,7 +6661,7 @@ fn forwardPrefillPreparedTail(
     else
         false;
     if (decoder_frame_active) ple_frame_active = false;
-    defer finishDecoderRuntimeFrame(cb, &decoder_frame_active);
+    errdefer cancelDecoderRuntimeFrame(cb, &decoder_frame_active);
     var final_hidden, var total_rows = if (direct_hidden_result) |direct_hidden|
         .{ direct_hidden.hidden, direct_hidden.total_rows }
     else blk: {
@@ -6810,7 +6751,7 @@ fn forwardPrefillPreparedTail(
     }
     if (syncGatedFamilyFinalHiddenRequested()) {
         const sync_started_at = monotonicNowNs();
-        finishDecoderRuntimeFrame(cb, &decoder_frame_active);
+        try completeDecoderRuntimeFrame(cb, &decoder_frame_active);
         const synced_hidden = try cb.toFloat32(final_hidden, allocator);
         allocator.free(synced_hidden);
         const sync_finished_at = monotonicNowNs();
@@ -6826,7 +6767,7 @@ fn forwardPrefillPreparedTail(
     cb.free(final_hidden);
     owns_final_hidden = false;
     const frame_finish_started_at = monotonicNowNs();
-    finishDecoderRuntimeFrame(cb, &decoder_frame_active);
+    try completeDecoderRuntimeFrame(cb, &decoder_frame_active);
     const frame_finish_finished_at = monotonicNowNs();
     if (frame_finish_finished_at > frame_finish_started_at) {
         timing_stats.prefill_frame_finish_nanos += frame_finish_finished_at - frame_finish_started_at;
@@ -6963,13 +6904,15 @@ fn forwardFinalHiddenRowsFromHidden(
     phase: BlockTimingPhase,
     row_output: PrefillRowsOutput,
 ) !?FinalHiddenRows {
+    var owns_input = owns_hidden;
+    defer if (owns_input) cb.free(hidden);
     var started_at = monotonicNowNs();
     var finished_at = started_at;
     const direct_ple_vectors = try computePleVectorsDirect(
         cb,
         gpt_config,
         configured_layer_count,
-        ple_ids,
+        .{ .host = ple_ids },
         hidden,
         ple_ids.len,
     );
@@ -7001,16 +6944,13 @@ fn forwardFinalHiddenRowsFromHidden(
         ple_vectors,
         row_output,
     );
-    if (direct_hidden_result == null) {
-        if (owns_hidden) cb.free(hidden);
-        return null;
-    }
-    const hidden_result = direct_hidden_result.?;
+    const hidden_result = direct_hidden_result orelse return null;
     // The direct paths copy the input rows into their own hidden buffers, so
     // an owned input is done once they return.
-    if (owns_hidden and hidden_result.hidden != hidden) cb.free(hidden);
+    if (owns_input and hidden_result.hidden != hidden) cb.free(hidden);
+    owns_input = false;
     var decoder_frame_active = hidden_result.decoder_frame_active;
-    defer finishDecoderRuntimeFrame(cb, &decoder_frame_active);
+    errdefer cancelDecoderRuntimeFrame(cb, &decoder_frame_active);
     finished_at = monotonicNowNs();
     if (finished_at > started_at) {
         if (phase == .greedy) {
@@ -7019,26 +6959,17 @@ fn forwardFinalHiddenRowsFromHidden(
             timing_stats.prefill_block_nanos += finished_at - started_at;
         }
     }
-    if (row_output == .kv_only and decoder_frame_active) {
-        // KV publication is the only output of this stage. A failed GPU
-        // completion must propagate before a later chunk can consume it.
-        cb.decoderRuntimeSubmitAndWaitFrame() catch |err| {
-            cancelDecoderRuntimeFrame(cb, &decoder_frame_active);
-            cb.free(hidden_result.hidden);
-            return err;
-        };
-        decoder_frame_active = false;
-    }
-    const final_hidden = if (row_output == .kv_only) hidden_result.hidden else (try cb.decoderRuntimeApplyRmsNorm(&.{
-        .slot = finalNormSlot(configured_layer_count),
-        .input = hidden_result.hidden,
-        .hidden_size = gpt_config.hidden_size,
-        .eps = gpt_config.norm_eps,
-    })) orelse {
-        cb.free(hidden_result.hidden);
-        return null;
+    const final_hidden = if (row_output == .kv_only) hidden_result.hidden else norm: {
+        errdefer cb.free(hidden_result.hidden);
+        const normalized = (try cb.decoderRuntimeApplyRmsNorm(&.{
+            .slot = finalNormSlot(configured_layer_count),
+            .input = hidden_result.hidden,
+            .hidden_size = gpt_config.hidden_size,
+            .eps = gpt_config.norm_eps,
+        })) orelse try gpt_arch.applyFinalNorm(cb, allocator, gpt_config, hidden_result.hidden);
+        if (normalized != hidden_result.hidden) cb.free(hidden_result.hidden);
+        break :norm normalized;
     };
-    if (final_hidden != hidden_result.hidden) cb.free(hidden_result.hidden);
     errdefer cb.free(final_hidden);
     var prepared_tail_choices: ?[]u32 = null;
     errdefer if (prepared_tail_choices) |choices| allocator.free(choices);
@@ -7059,6 +6990,7 @@ fn forwardFinalHiddenRowsFromHidden(
             if (!cb.decoderRuntimeHasActiveFrame()) decoder_frame_active = false;
         }
     }
+    try completeDecoderRuntimeFrame(cb, &decoder_frame_active);
     return .{
         .final_hidden = final_hidden,
         .rows = hidden_result.total_rows,
@@ -7228,24 +7160,15 @@ pub fn forwardPrefillLastLogits(
     defer cb.free(tail.final_hidden);
 
     const started_at = monotonicNowNs();
-    const logits = if (try decoder_tail_runtime.forwardPreparedLogitsTensorFromFinalHidden(
+    const logits = try decoder_tail_runtime.completePreparedLogits(
         cb,
+        allocator,
         gpt_config,
         tail.final_hidden,
         .rms,
         tail.final_norm_slot,
         tail.final_lm_head_slot,
-    )) |prepared_logits|
-        prepared_logits
-    else blk: {
-        break :blk (try decoder_tail_runtime.forwardLogitsTensorFromFinalHidden(
-            cb,
-            gpt_config,
-            tail.final_hidden,
-            .rms,
-            tail.final_norm_slot,
-        )) orelse return null;
-    };
+    );
     timing_stats.prefill_tail_logits_ops += 1;
     defer cb.free(logits);
     const result = try cb.toFloat32(logits, allocator);
@@ -7393,22 +7316,14 @@ pub fn forwardLastLogitsTensor(
         allocator.free(synced_hidden);
     }
 
-    if (try decoder_tail_runtime.forwardPreparedLogitsTensorFromFinalHidden(
+    return try decoder_tail_runtime.completePreparedLogits(
         cb,
+        allocator,
         gpt_config,
         final_hidden,
         .rms,
         finalNormSlot(configured_layer_count),
         finalLmHeadSlot(configured_layer_count),
-    )) |logits| {
-        return logits;
-    }
-    return decoder_tail_runtime.forwardLogitsTensorFromFinalHidden(
-        cb,
-        gpt_config,
-        final_hidden,
-        .rms,
-        finalNormSlot(configured_layer_count),
     );
 }
 
@@ -7612,6 +7527,41 @@ test "Gemma4 MTP input frame excludes full prompts and unsupported models" {
     other.num_local_experts = 8;
     other.num_experts_per_tok = 2;
     try std.testing.expect(!supportsMtpVerifyInputFrame(other, 3, 1024));
+}
+
+test "gated decoder frame completion propagates a failed submission once" {
+    const Probe = struct {
+        attempts: usize = 0,
+        cancellations: usize = 0,
+
+        fn submit(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.attempts += 1;
+            if (self.attempts == 1) return error.DeviceLost;
+        }
+        fn cancel(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.cancellations += 1;
+        }
+    };
+    var table = @import("../ops/native_compute.zig").vtable_impl;
+    table.regions.commands.submitAndWaitFrame = Probe.submit;
+    table.regions.commands.cancelFrame = Probe.cancel;
+    var probe: Probe = .{};
+    const cb: ops.ComputeBackend = .{ .ptr = &probe, .vtable = &table };
+    var owned = true;
+    try std.testing.expectError(error.DeviceLost, completeDecoderRuntimeFrame(&cb, &owned));
+    try std.testing.expect(owned);
+    try std.testing.expectEqual(@as(usize, 1), probe.attempts);
+    cancelDecoderRuntimeFrame(&cb, &owned);
+    try std.testing.expect(!owned);
+    try std.testing.expectEqual(@as(usize, 1), probe.cancellations);
+
+    owned = true;
+    try completeDecoderRuntimeFrame(&cb, &owned);
+    try std.testing.expect(!owned);
+    try completeDecoderRuntimeFrame(&cb, &owned);
+    try std.testing.expectEqual(@as(usize, 2), probe.attempts);
 }
 
 test "Gemma4 MTP input frame transfers and cancels only owned frames" {

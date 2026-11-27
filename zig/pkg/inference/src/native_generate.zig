@@ -26,7 +26,9 @@ const ops = @import("ops/ops.zig");
 const gpt_arch = @import("architectures/gpt.zig");
 const gemma4_runtime = @import("architectures/gemma4_runtime.zig");
 const session_factory = @import("architectures/session_factory.zig");
+const decoder_prefill = @import("execution/decoder_prefill.zig");
 const generation = @import("pipelines/generation.zig");
+const decoder_storage = @import("execution/decoder_storage.zig");
 const graph_mod = @import("graph/root.zig");
 const kernel_jit = graph_mod.kernel_jit;
 const quant_matmul = @import("graph/quant_matmul.zig");
@@ -619,7 +621,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .pjrt => return error.UnexpectedPjrtBackend,
         .wasm => return error.UnexpectedWasmBackend,
     };
-    const idle_prefill_ceiling = generation.nativeGenerationPrefillChunkCeiling(
+    const idle_prefill_ceiling = decoder_prefill.idleChunkCeiling(
         backend_kind,
         gpt_config,
         (runtime.scheduler.native_generate.Policy{}).max_idle_prefill_chunk_size,
@@ -914,7 +916,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         null;
     defer if (draft_cb) |*backend| backend.deinit();
 
-    var kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, kvSlidingTrimForced());
+    var kv_pool_config = decoder_storage.poolPlan(backend_kind, kv_dtype, &gpt_config, .{ .force_sliding_trim = decoder_storage.slidingTrimForced() });
     if (explicit_partition_backend == .pjrt or (explicit_partition_backend == .metal and compiled_attachment_target == .whole_model)) kv_pool_config.store_cpu_bytes = false;
     const pool_id = try kv_manager.addPool(kv_pool_config);
     var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, kv_pool_config);
@@ -952,7 +954,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     if (draft_model != null) {
         if (draft_gpt_config) |draft_cfg| {
             draft_kv_manager = runtime.kv.manager.KvManager.init(allocator);
-            const draft_pool_config = generation.kvPoolConfig(draft_backend_kind.?, draft_kv_dtype.?, draft_cfg, kvSlidingTrimForced());
+            const draft_pool_config = decoder_storage.poolPlan(draft_backend_kind.?, draft_kv_dtype.?, &draft_cfg, .{ .force_sliding_trim = decoder_storage.slidingTrimForced() });
             const draft_pool_id = try draft_kv_manager.?.addPool(draft_pool_config);
             draft_decode_state = generation.NativeDecodeState.initPaged(allocator, &draft_kv_manager.?, draft_pool_id, null);
         }
@@ -2548,6 +2550,7 @@ fn runRawDecodeBench(
                     1,
                     seq_len,
                     &decode_context,
+                    null,
                 )) orelse return error.RawDecodeGreedyTokenTensorUnavailable;
                 continue;
             }
@@ -2615,6 +2618,7 @@ fn runRawDecodeBench(
                     1,
                     seq_len,
                     &decode_context,
+                    null,
                 )) orelse return error.RawDecodeGreedyTokenTensorUnavailable;
                 continue;
             }
@@ -6325,10 +6329,6 @@ fn traceGenerateTopLogits(label: []const u8, step: usize, logits: []const f32) v
     std.debug.print("\n", .{});
 }
 
-fn kvSlidingTrimForced() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_KV_SLIDING_TRIM", false);
-}
-
 fn generationKvBackendKind(backend: backends.BackendType) ?runtime.kv.pool.BackendKind {
     return switch (backend) {
         .native => .native,
@@ -8828,7 +8828,7 @@ test "draft KV backend follows the loaded draft session" {
         .sliding_window = 1024,
         .sliding_window_pattern = 6,
     };
-    const draft_pool = generation.kvPoolConfig(.native, .f16, mixed_draft, false);
+    const draft_pool = decoder_storage.poolPlan(.native, .f16, &mixed_draft, .{});
     try std.testing.expectEqual(runtime.kv.pool.BackendKind.native, draft_pool.backend);
     try std.testing.expectEqual(@as(?u32, null), draft_pool.sliding_window_size);
 }

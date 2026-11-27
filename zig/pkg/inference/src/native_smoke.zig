@@ -21,6 +21,7 @@ const session_factory = @import("architectures/session_factory.zig");
 const manifest_mod = @import("models/manifest.zig");
 const tensor_store_mod = @import("models/tensor_store.zig");
 const gpt_mod = @import("models/gpt.zig");
+const decoder_prefill = @import("execution/decoder_prefill.zig");
 const generation = @import("pipelines/generation.zig");
 const model_manager_mod = @import("server/model_manager.zig");
 const runtime = @import("runtime/root.zig");
@@ -160,7 +161,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .pjrt => return error.UnexpectedPjrtBackend,
         .wasm => return error.UnexpectedWasmBackend,
     };
-    const idle_prefill_ceiling = generation.nativeGenerationPrefillChunkCeiling(
+    const idle_prefill_ceiling = decoder_prefill.idleChunkCeiling(
         backend_kind,
         gpt_config,
         (runtime.scheduler.native_generate.Policy{}).max_idle_prefill_chunk_size,

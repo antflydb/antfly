@@ -13,6 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const Submission = @import("../execution/submission.zig").Scope;
+const PendingSubmission = @import("../execution/submission.zig").Pending;
 const std = @import("std");
 const audio = @import("../pipelines/audio.zig");
 const inference_audio = @import("inference_audio");
@@ -26,7 +28,6 @@ const hf_weights = @import("gemma4_hf_weights.zig");
 const embedding_gemma2_resample = @import("embedding_gemma2_resample.zig");
 const logmel_plan = @import("audio_logmel_plan.zig");
 const fft512 = @import("audio_fft512.zig");
-const spectrum_policy = @import("audio_spectrum_policy.zig");
 const gemma4_mel_sparse = @import("gemma4_mel_sparse.zig");
 const tensor_store_mod = @import("../models/tensor_store.zig");
 const weight_source_mod = @import("../models/weight_source.zig");
@@ -85,7 +86,7 @@ pub const ResidentProjectedImages = struct {
     output_ownership: OutputOwnership = .unknown,
 
     pub fn promptRows(self: *const ResidentProjectedImages) prompt_rows.ProjectedInputRows {
-        return .{ .rows_per_item = self.tokens_per_image, .width = self.hidden_size, .source = .{ .resident = self.embeddings } };
+        return .{ .rows_per_item = self.tokens_per_image, .width = self.hidden_size, .source = .{ .resident = .{ .backend = self.backend, .rows = self.embeddings } } };
     }
 
     pub fn deinit(self: *ResidentProjectedImages) void {
@@ -153,7 +154,15 @@ pub const ProjectedAudio = struct {
     embeddings: []f32,
     tokens_per_audio: []usize,
     hidden_size: usize,
-    resident: ?struct { backend: *const ComputeBackend, rows: CT } = null,
+    resident: ?prompt_rows.ProjectedInputRows.Resident = null,
+
+    pub fn promptRows(self: *const ProjectedAudio) prompt_rows.ProjectedInputRows {
+        return .{
+            .rows_per_item = self.tokens_per_audio,
+            .width = self.hidden_size,
+            .source = if (self.resident) |value| .{ .resident = value } else .{ .host = self.embeddings },
+        };
+    }
 
     pub fn deinit(self: *ProjectedAudio) void {
         if (self.resident) |resident| resident.backend.free(resident.rows);
@@ -217,10 +226,6 @@ const AudioConfig = struct {
 
     fn headDim(self: AudioConfig) usize {
         return self.audio_hidden / self.head_count;
-    }
-
-    fn attentionContextSize(self: AudioConfig) usize {
-        return self.attention_chunk_size + self.attention_context_left - 1 + self.attention_context_right;
     }
 };
 
@@ -514,18 +519,24 @@ pub fn encodeProjectedVideoWithSession(
 /// model-sized pixels. `project` runs afterward under the caller's execution lock.
 pub const PortableVideoFrames = struct {
     allocator: std.mem.Allocator,
-    weights: ProjectorWeights,
+    weights: ?ProjectorWeights = null,
     cfg: Config,
     resample: image.Resample,
     prepared: []?PreparedImage,
     resize: antfly_image.processing.PillowResizeCache = .{},
 
     pub fn init(cb: *const ComputeBackend, allocator: std.mem.Allocator, projector: *ProjectorStore, frames: usize) !PortableVideoFrames {
-        var cfg = try parseConfig(&projector.gguf.parsed);
+        var result = try initMetadata(cb, allocator, &projector.gguf.parsed, frames);
+        result.weights = ProjectorWeights.init(cb, allocator, projector.gguf, projector);
+        return result;
+    }
+
+    pub fn initMetadata(cb: *const ComputeBackend, allocator: std.mem.Allocator, metadata: *const gguf_format.File, frames: usize) !PortableVideoFrames {
+        var cfg = try parseConfig(metadata);
         cfg.max_image_tokens = video_tokens_per_frame;
         const prepared = try allocator.alloc(?PreparedImage, frames);
         @memset(prepared, null);
-        return .{ .allocator = allocator, .weights = ProjectorWeights.init(cb, allocator, projector.gguf, projector), .cfg = cfg, .resample = videoResample(cb, cfg), .prepared = prepared };
+        return .{ .allocator = allocator, .cfg = cfg, .resample = videoResample(cb, cfg), .prepared = prepared };
     }
     /// Retained CHW frames plus the largest projection batch and patch staging.
     /// The token bound covers variable presentation geometry within a clip.
@@ -539,7 +550,7 @@ pub const PortableVideoFrames = struct {
         self.resize.deinit();
         for (self.prepared) |item| if (item) |value| value.deinit();
         self.allocator.free(self.prepared);
-        self.weights.deinit();
+        if (self.weights) |*weights| weights.deinit();
     }
     /// Model geometry follows the presentation size, so one resample corrects
     /// non-square pixels without an intermediate stretched raster.
@@ -554,7 +565,8 @@ pub const PortableVideoFrames = struct {
     pub fn project(self: *PortableVideoFrames, timestamps_us: []i64, decoder_source_bytes: u64) !ProjectedVideo {
         self.resize.deinit();
         const a = self.allocator;
-        const cb = self.weights.cb;
+        const weights = if (self.weights) |*value| value else return error.MissingProjector;
+        const cb = weights.cb;
         if (timestamps_us.len != self.prepared.len) return error.InvalidVideoFrame;
         var frames: std.ArrayList(PreparedImage) = .empty;
         defer frames.deinit(a);
@@ -567,7 +579,7 @@ pub const PortableVideoFrames = struct {
         if (kept == 0) return error.EmptyVideo;
         const timestamps = try a.dupe(i64, timestamps_us[0..kept]);
         errdefer a.free(timestamps);
-        const images = try projectPreparedSequence(cb, a, &self.weights, self.cfg, frames.items, .{});
+        const images = try projectPreparedSequence(cb, a, weights, self.cfg, frames.items, .{});
         return .{ .images = images, .timestamps_us = timestamps, .stats = .{ .decoder_source_bytes = decoder_source_bytes, .selected_frames = kept } };
     }
 };
@@ -789,17 +801,16 @@ pub const ProjectorStore = struct {
     allocator: std.mem.Allocator,
     path: []u8,
     gguf: *tensor_store_mod.GgufStore,
+    owns_gguf: bool = true,
     /// Scalar clamp bounds per linear prefix, resolved on first use.
     clamp_specs: std.StringHashMapUnmanaged(ClampSpec) = .empty,
     clamp_mutex: std.atomic.Mutex = .unlocked,
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !*ProjectorStore {
-        const self = try allocator.create(ProjectorStore);
-        errdefer allocator.destroy(self);
-        const owned_path = try allocator.dupe(u8, path);
-        errdefer allocator.free(owned_path);
         const gguf = try tensor_store_mod.GgufStore.initAbsolute(allocator, path);
-        self.* = .{ .allocator = allocator, .path = owned_path, .gguf = gguf, .cache_identity = next_projector_cache_identity.fetchAdd(1, .monotonic) };
+        errdefer gguf.tensorStore().deinit();
+        const self = try borrow(allocator, path, gguf);
+        self.owns_gguf = true;
         return self;
     }
 
@@ -808,9 +819,18 @@ pub const ProjectorStore = struct {
         var it = self.clamp_specs.keyIterator();
         while (it.next()) |key| allocator.free(key.*);
         self.clamp_specs.deinit(allocator);
-        self.gguf.tensorStore().deinit();
+        if (self.owns_gguf) self.gguf.tensorStore().deinit();
         allocator.free(self.path);
         allocator.destroy(self);
+    }
+
+    /// The containing session retains this verified source until after close.
+    pub fn borrow(allocator: std.mem.Allocator, path: []const u8, source: *tensor_store_mod.GgufStore) !*ProjectorStore {
+        const self = try allocator.create(ProjectorStore);
+        errdefer allocator.destroy(self);
+        const owned_path = try allocator.dupe(u8, path);
+        self.* = .{ .allocator = allocator, .path = owned_path, .gguf = source, .owns_gguf = false, .cache_identity = next_projector_cache_identity.fetchAdd(1, .monotonic) };
+        return self;
     }
 
     /// Cached scalar clamp bounds for `prefix`; null when the bounds are not
@@ -853,6 +873,15 @@ const ProjectorWeights = struct {
     }
 
     fn residentWeight(self: *const ProjectorWeights, name: []const u8) !CT {
+        const model_owned = if (self.owner) |owner| !owner.owns_gguf else false;
+        if (@import("build_options").enable_metal and self.cb.kind() == .metal and
+            (model_owned or platform.env.getenvBool("ANTFLY_INFERENCE_METAL_RESIDENT_PROJECTOR")))
+        {
+            if (self.gguf) |projector_source| {
+                const metal = @import("../ops/metal_compute.zig").MetalCompute;
+                return (try metal.borrowProjectorWeight(self.cb, projector_source, name)) orelse error.MissingWeight;
+            }
+        }
         var buffer: [256]u8 = undefined;
         return self.cb.getWeight(if (self.huggingface and self.cb.kind() == .cuda) try hf_weights.resolve(&buffer, name) else name);
     }
@@ -882,6 +911,12 @@ const ProjectorWeights = struct {
 
     fn weightCt(self: *ProjectorWeights, tensor_name: []const u8) !CT {
         if (self.require_resident_weights) return self.cb.getWeight(tensor_name);
+        if (self.owner) |owner| {
+            if (@import("build_options").enable_metal and self.cb.kind() == .metal and !owner.owns_gguf) {
+                const metal = @import("../ops/metal_compute.zig").MetalCompute;
+                if (try metal.borrowProjectorWeight(self.cb, owner.gguf, tensor_name)) |weight| return weight;
+            }
+        }
         if (try self.cudaCachedWeight(tensor_name, null)) |weight| return weight;
         if (self.gguf) |gguf| {
             var buffer: [256]u8 = undefined;
@@ -995,13 +1030,9 @@ const ProjectorWeights = struct {
     }
 
     pub fn deinit(self: *ProjectorWeights) void {
-        const metal_compute_mod = @import("../ops/metal_compute.zig");
         var it = self.entries.iterator();
         while (it.next()) |entry| {
-            if (self.cb.kind() == .metal) {
-                metal_compute_mod.MetalCompute.releaseDynamicSlotsForTensor(self.cb, entry.value_ptr.*);
-            }
-            self.cb.free(entry.value_ptr.*);
+            self.cb.freeProjectionInput(entry.value_ptr.*, .transient);
             self.allocator.free(entry.key_ptr.*);
         }
         self.entries.deinit(self.allocator);
@@ -1278,7 +1309,7 @@ pub fn encodeVideoBatchInput(cb: *const ComputeBackend, allocator: std.mem.Alloc
     const g = Geometry{ .batches = frames, .width = width, .height = height, .grid_x = width / 16, .grid_y = height / 16, .pooled_x = width / 48, .pooled_y = height / 48 };
     if (g.tokenCount() / frames > 140) return error.InvalidTensorShape;
     if (required) {
-        if (!try @import("../ops/metal_compute.zig").MetalCompute.prepareEmbeddingVisionPlan(cb, .{ .rows = frames * g.grid_x * g.grid_y, .hidden = cfg.vision_hidden, .intermediate = cfg.intermediate_size })) return error.PreparedVisionUnavailable;
+        if (!try cb.setVisionWorkspace(.{ .rows = frames * g.grid_x * g.grid_y, .hidden = cfg.vision_hidden, .intermediate = cfg.intermediate_size })) return error.PreparedVisionUnavailable;
     }
     var store = ProjectorWeights.initHuggingFace(cb, allocator);
     defer store.deinit();
@@ -1295,8 +1326,8 @@ pub fn encodeVideoBatchInput(cb: *const ComputeBackend, allocator: std.mem.Alloc
             if (shape.len != 3 or shape[0] != 2 or shape[1] <= 0 or shape[2] != 768) return error.InvalidPositionEmbeddingShape;
             try @import("../ops/metal_compute.zig").MetalCompute.prepareVideoInput(cb, weight, positions, @intCast(shape[1]));
         }
-        var input_frame = if (cb.kind() == .metal) try beginVisionBoundary(cb, &store, cfg) else false;
-        defer if (input_frame) cb.decoderRuntimeCancelFrame() catch {};
+        var input_frame = try beginVisionBoundary(cb, &store, cfg);
+        defer input_frame.deinit();
         const input = switch (source) {
             .tensor => |ct| ct,
             .gather => |sources| try @import("../ops/metal_compute.zig").MetalCompute.gatherVideoInputs(cb, sources, g.grid_x * g.grid_y, 768),
@@ -1306,11 +1337,7 @@ pub fn encodeVideoBatchInput(cb: *const ComputeBackend, allocator: std.mem.Alloc
         defer cb.free(projected);
         const positioned = if (try sourceVisionSequence(cb, cfg, singleGeometry(g))) |_| try addPositionEmbeddingsBatchTensor(cb, allocator, &store, cfg, projected, singleGeometry(g), frames) else try addPositionEmbeddingsDevice(cb, allocator, projected, positions, cfg.vision_hidden, g);
         errdefer cb.free(positioned);
-        if (input_frame) {
-            try cb.decoderRuntimeSubmitAndWaitFrame();
-            input_frame = false;
-            try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
-        }
+        try input_frame.finishWithActivationViews();
         break :input_phase positioned;
     };
     const result = try encodePositionedBatchResidentInto(cb, allocator, &store, cfg, positioned, singleGeometry(g), frames, output);
@@ -1362,7 +1389,8 @@ fn embeddingGemma2ImageConfig() Config {
     };
 }
 
-const AudioCacheRecipe = @import("../ops/cuda/prepared_cache.zig").AudioRecipe;
+const audio_schedule = @import("../execution/audio_schedule.zig");
+const AudioCacheRecipe = audio_schedule.AudioRecipe;
 fn audioCacheConfig(cfg: AudioConfig) AudioCacheRecipe {
     return .{
         .count = 0,
@@ -1379,6 +1407,7 @@ fn audioCacheConfig(cfg: AudioConfig) AudioCacheRecipe {
         .residual_bits = @bitCast(cfg.residual_weight),
         .chunk = cfg.attention_chunk_size,
         .context_left = cfg.attention_context_left,
+        .context_right = cfg.attention_context_right,
         .logit_cap_bits = @bitCast(cfg.attention_logit_cap),
         .invalid_logits_bits = @bitCast(cfg.attention_invalid_logits_value),
         .exclude_farthest = cfg.exclude_farthest_key,
@@ -1409,6 +1438,49 @@ test "audio cache recipe shares exact execution key and original HF packed names
     const end: usize = 12;
     try std.testing.expectEqual(Legacy.key(cfg, &segments, start, end), recipe.key(&segments, start, end));
     try std.testing.expect(recipe.key(&segments, 0, 12) != recipe.key(&segments, 0, 6));
+    var right_context = cfg;
+    right_context.attention_context_right = 1;
+    try std.testing.expect(recipe.key(&segments, start, end) != audioCacheConfig(right_context).key(&segments, start, end));
+    try std.testing.expect(audio_schedule.supportsCudaGroupedGraph(2, cfg.attention_context_right));
+    try std.testing.expect(audio_schedule.supportsCudaGroupedGraph(4, cfg.attention_context_right));
+    try std.testing.expect(!audio_schedule.supportsCudaGroupedGraph(1, cfg.attention_context_right));
+    try std.testing.expect(!audio_schedule.supportsCudaGroupedGraph(5, cfg.attention_context_right));
+    try std.testing.expect(!audio_schedule.supportsCudaGroupedGraph(2, right_context.attention_context_right));
+    // Cold workspace admission describes exactly the tensor geometry of the
+    // segmented producer, including odd frame counts and rank-one masks.
+    var batch = recipe;
+    batch.frames = .{ 41, 68, 19, 0 };
+    batch.count = 3;
+    try batch.validate();
+    var invalid = batch;
+    invalid.chunk = 0;
+    try std.testing.expectError(error.InvalidPreparedAudioRecipe, invalid.validate());
+    invalid = batch;
+    invalid.conv_kernel = 0;
+    try std.testing.expectError(error.InvalidPreparedAudioRecipe, invalid.validate());
+    invalid = batch;
+    invalid.context_right = std.math.maxInt(usize);
+    try std.testing.expectError(error.InvalidPreparedAudioRecipe, invalid.validate());
+    var measured: [3]usize = undefined;
+    const rows = try batch.rowsAndSegments(&measured);
+    try std.testing.expectEqualSlices(usize, &segments, &measured);
+    try std.testing.expectEqual(@as(usize, 33), rows);
+    const grouping = try audio_schedule.GroupedRows.resolve(batch.frames[0..batch.count]);
+    try std.testing.expectEqual(rows, grouping.total);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 11, 28 }, grouping.offsets[0..batch.count]);
+    const Inputs = audio_schedule.ExecutionInputs;
+    var shapes: [Inputs.count][2]i64 = undefined;
+    const metadata = try Inputs.describe(&shapes, rows, batch.hidden, batch.context_left, batch.heads);
+    try std.testing.expectEqualSlices(i64, &.{ 33, @intCast(batch.hidden) }, metadata[Inputs.hidden].shape);
+    try std.testing.expectEqualSlices(i64, &.{ @intCast(batch.context_left), @intCast(batch.hidden) }, metadata[Inputs.relative].shape);
+    for (metadata[Inputs.valid..Inputs.scales]) |mask| {
+        try std.testing.expectEqualSlices(i64, &.{33}, mask.shape);
+        try std.testing.expectEqual(rows, mask.elements);
+    }
+    for (metadata[Inputs.scales..]) |scale| {
+        try std.testing.expectEqualSlices(i64, &.{@intCast(batch.hidden / batch.heads)}, scale.shape);
+        try std.testing.expectEqual(batch.hidden / batch.heads, scale.elements);
+    }
     for (0..12) |layer| for ([_][]const u8{ "q", "k", "v" }, 0..) |component, index| {
         var original: [128]u8 = undefined;
         const logical = try std.fmt.bufPrint(&original, "a.blk.{d}.attn_{s}.weight", .{ layer, component });
@@ -1426,7 +1498,7 @@ pub fn embeddingGemma2AudioCacheRecipe(cb: *const ComputeBackend, prepared: []co
     return audioCacheRecipe(cb, embeddingGemma2AudioConfig(), prepared);
 }
 fn audioCacheRecipe(cb: *const ComputeBackend, cfg: AudioConfig, prepared: []const *const PreparedAudio) !AudioCacheRecipe {
-    if (cb.kind() != .cuda or prepared.len == 0 or prepared.len > 4) return error.UnsupportedPreparedAudioCache;
+    if (cb.kind() != .cuda or prepared.len == 0 or prepared.len > audio_schedule.GroupedRows.max_clips) return error.UnsupportedPreparedAudioCache;
     var recipe = audioCacheConfig(try audioConfigForBackend(cb, cfg));
     recipe.count = @intCast(prepared.len);
     for (prepared, 0..) |audio_input, index| {
@@ -1619,6 +1691,7 @@ fn audioSourceLinear(
         .rows = rows,
         .width = width,
         .columns = columns,
+        .reuse_projection = .{ .width = cfg.audio_hidden, .columns = cfg.intermediate_size },
         .reference_input_layout = layout,
     } })) orelse return error.SourceArithmeticUnavailable;
     var output = projected;
@@ -1652,65 +1725,49 @@ fn embeddingGemma2AudioConfig() AudioConfig {
         .layer_norm_eps = 1e-6,
     };
 }
-pub fn encodeEmbeddingGemma2Audio(cb: *const ComputeBackend, allocator: std.mem.Allocator, bytes: []const u8) !EncodedAudio {
-    return encodeEmbeddingGemma2AudioBounded(cb, allocator, bytes, .{}, 64 * 1024 * 1024);
-}
 pub fn encodeEmbeddingGemma2AudioBounded(cb: *const ComputeBackend, allocator: std.mem.Allocator, bytes: []const u8, decode_options: audio.DecodeOptions, max_decode_working_bytes: usize) !EncodedAudio {
-    var weights = ProjectorWeights.initHuggingFace(cb, allocator);
-    defer weights.deinit();
-    var cfg = embeddingGemma2AudioConfig();
-    cfg.audio_decode_options = decode_options;
-    cfg.max_audio_decode_working_bytes = max_decode_working_bytes;
-    return encodeSingleAudio(cb, allocator, &weights, cfg, bytes);
-}
-
-/// Native PCM goes directly to preparation; no intermediate WAV allocation.
-pub fn encodeEmbeddingGemma2Pcm(cb: *const ComputeBackend, a: std.mem.Allocator, pcm: audio.PcmAudio) !EncodedAudio {
-    var prepared = try prepareAudioPcm(a, pcm, 128, true, !audioHostOps().features and supportsGemma4LogMel(cb));
-    defer prepared.deinit();
-    const result = try encodePreparedEmbeddingGemma2AudioResident(cb, a, &prepared);
+    const result = try encodeEmbeddingGemma2AudioResidentBounded(cb, allocator, bytes, decode_options, max_decode_working_bytes);
     defer cb.free(result.embeddings);
-    return .{ .embeddings = try cb.toFloat32(result.embeddings, a), .tokens = result.tokens };
+    return .{ .embeddings = try cb.toFloat32(result.embeddings, allocator), .tokens = result.tokens };
 }
 
 pub const ResidentEncodedAudio = struct { embeddings: CT, tokens: usize };
 pub fn encodePreparedEmbeddingGemma2AudioBatchResident(cb: *const ComputeBackend, a: std.mem.Allocator, prepared: []const *const PreparedAudio) !ResidentProjectedImages {
-    if (prepared.len == 0 or prepared.len > 4) return error.InvalidInputShape;
+    if (prepared.len == 0 or prepared.len > audio_schedule.GroupedRows.max_clips) return error.InvalidInputShape;
     var cache_scope = try beginAudioCache(cb, embeddingGemma2AudioConfig(), prepared);
     defer cache_scope.close();
-    const storage = try cb.audioStorage(true);
-    defer if (storage) {
-        _ = cb.audioStorage(false) catch false;
-    };
-    var weights = ProjectorWeights.initHuggingFace(cb, a);
-    defer weights.deinit();
-    var features: [4]AudioFeatures = undefined;
-    var pointers: [4]*AudioFeatures = undefined;
-    var count: usize = 0;
-    defer for (features[0..count]) |*feature| feature.deinit();
-    count = try audioFeatureCohort(cb, a, prepared, &features);
-    for (pointers[0..count], 0..) |*pointer, i| pointer.* = &features[i];
+    var storage = try ops.AudioStorageScope.begin(cb);
+    errdefer storage.close();
     const lengths = try a.alloc(usize, prepared.len);
     errdefer a.free(lengths);
-    // The outer storage lease also covers feature preparation; the cohort borrows it.
-    const result = try encodeAudioFeatureCohortResidentWithinStorage(cb, a, &weights, try audioConfigForBackend(cb, embeddingGemma2AudioConfig()), pointers[0..count], lengths);
+    var count: usize = 0;
+    const result = encode: {
+        var weights = ProjectorWeights.initHuggingFace(cb, a);
+        defer weights.deinit();
+        var features: [audio_schedule.GroupedRows.max_clips]AudioFeatures = undefined;
+        var pointers: [audio_schedule.GroupedRows.max_clips]*AudioFeatures = undefined;
+        defer for (features[0..count]) |*feature| feature.deinit();
+        count = try audioFeatureCohort(cb, a, prepared, &features);
+        for (pointers[0..count], 0..) |*pointer, i| pointer.* = &features[i];
+        // The outer storage lease also covers feature preparation; the cohort borrows it.
+        break :encode try encodeAudioFeatureCohortResidentWithinStorage(cb, a, &weights, try audioConfigForBackend(cb, embeddingGemma2AudioConfig()), pointers[0..count], lengths, &storage);
+    };
+    errdefer cb.free(result.embeddings);
+    try storage.finish();
     return .{ .allocator = a, .backend = cb, .embeddings = result.embeddings, .tokens_per_image = lengths, .hidden_size = 512, .batches_executed = 1, .max_batch_executed = count };
 }
 
-fn audioFeatureCohort(cb: *const ComputeBackend, a: std.mem.Allocator, prepared: []const *const PreparedAudio, features: *[4]AudioFeatures) !usize {
-    if (prepared.len == 0 or prepared.len > 4) return error.InvalidInputShape;
-    var frame = cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame() and try cb.decoderRuntimeBeginFrame();
-    defer if (frame) cb.decoderRuntimeCancelFrame() catch {};
+fn audioFeatureCohort(cb: *const ComputeBackend, a: std.mem.Allocator, prepared: []const *const PreparedAudio, features: *[audio_schedule.GroupedRows.max_clips]AudioFeatures) !usize {
+    if (prepared.len == 0 or prepared.len > audio_schedule.GroupedRows.max_clips) return error.InvalidInputShape;
+    var frame = try @import("../execution/submission.zig").Scope.beginIfNeeded(cb, cb.kind() == .metal);
+    defer frame.deinit();
     var count: usize = 0;
     errdefer for (features[0..count]) |*feature| feature.deinit();
     for (prepared) |item| {
         features[count] = try audioFeaturesFromPrepared(cb, a, @constCast(item));
         count += 1;
     }
-    if (frame) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        frame = false;
-    }
+    try frame.finish();
     return count;
 }
 
@@ -1953,12 +2010,15 @@ pub fn encodeProjectedAudioInputs(cb: *const ComputeBackend, allocator: std.mem.
     return encodeProjectedAudioInputsWithWeights(cb, allocator, &weights, inputs);
 }
 
-/// Prompt projection can keep output rows on the same CUDA stream as the decoder.
+/// Prompt projection can hand rows directly to the decoder's device backend.
 pub fn encodeProjectedAudioForPrompt(cb: *const ComputeBackend, allocator: std.mem.Allocator, projector: *ProjectorStore, inputs: []const AudioInput) !ProjectedAudio {
-    if (cb.kind() != .cuda or !cudaNativePlanSelected(cb))
-        return encodeProjectedAudioInputs(cb, allocator, projector, inputs);
+    const resident_handoff = switch (cb.kind()) {
+        .cuda => cudaNativePlanSelected(cb),
+        .metal => cb.supportsCopyRows2D() and cb.vtable.allocUninitF32Shape != null,
+        else => false,
+    };
+    if (!resident_handoff) return encodeProjectedAudioInputs(cb, allocator, projector, inputs);
     const cfg = try parseAudioConfig(&projector.gguf.parsed);
-    if (cfg.direct_unified) return encodeProjectedAudioInputs(cb, allocator, projector, inputs);
     if (inputs.len == 0) return error.EmptyEmbeddingInput;
     var weights = ProjectorWeights.init(cb, allocator, projector.gguf, projector);
     defer weights.deinit();
@@ -1969,16 +2029,23 @@ pub fn encodeProjectedAudioForPrompt(cb: *const ComputeBackend, allocator: std.m
     var initialized: usize = 0;
     defer for (clips[0..initialized]) |clip| cb.free(clip.embeddings);
     var total: usize = 0;
-    for (inputs, clips, counts) |input, *clip, *count| {
-        clip.* = switch (input) {
+    for (inputs, counts) |input, *count| {
+        const projected: ?ResidentEncodedAudio = if (cfg.direct_unified)
+            try encodeUnifiedDirectAudioResident(cb, allocator, &weights, cfg, input)
+        else switch (input) {
             .encoded => |bytes| try encodeSingleAudioResident(cb, allocator, &weights, cfg, bytes),
             .pcm => |pcm| try encodeSingleAudioPcmResident(cb, allocator, &weights, cfg, pcm),
         };
-        initialized += 1;
-        count.* = clip.tokens;
-        total = try std.math.add(usize, total, clip.tokens);
+        count.* = 0;
+        if (projected) |clip| {
+            clips[initialized] = clip;
+            initialized += 1;
+            count.* = clip.tokens;
+            total = try std.math.add(usize, total, clip.tokens);
+        }
     }
-    const rows = if (clips.len == 1) single: {
+    if (total == 0) return .{ .allocator = allocator, .embeddings = &.{}, .tokens_per_audio = counts, .hidden_size = cfg.text_hidden };
+    const rows = if (initialized == 1) single: {
         initialized = 0;
         break :single clips[0].embeddings;
     } else merged: {
@@ -1989,7 +2056,7 @@ pub fn encodeProjectedAudioForPrompt(cb: *const ComputeBackend, allocator: std.m
         const output = (try cb.allocUninitF32Shape(&shape)) orelse return error.UnsupportedResidentGemma4Audio;
         errdefer cb.free(output);
         var offset: usize = 0;
-        for (clips) |clip| {
+        for (clips[0..initialized]) |clip| {
             if (!try cb.copyRows2D(allocator, output, offset, clip.embeddings, 0, clip.tokens, cfg.text_hidden))
                 return error.UnsupportedResidentGemma4Audio;
             offset += clip.tokens;
@@ -2086,19 +2153,14 @@ fn embeddingGemma2StageTensor(cb: *const ComputeBackend, a: std.mem.Allocator, n
 }
 
 fn encodeSingleAudio(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, audio_bytes: []const u8) !EncodedAudio {
-    if (cfg.direct_unified) return encodeUnifiedDirectAudio(cb, allocator, store, cfg, audio_bytes);
+    if (cfg.direct_unified) return encodeUnifiedDirectAudio(cb, allocator, store, cfg, .{ .encoded = audio_bytes });
     const result = try encodeSingleAudioResident(cb, allocator, store, cfg, audio_bytes);
     defer cb.free(result.embeddings);
     return .{ .embeddings = try cb.toFloat32(result.embeddings, allocator), .tokens = result.tokens };
 }
 
 fn encodeSingleAudioPcm(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, pcm: audio.PcmAudio) !EncodedAudio {
-    if (cfg.direct_unified) {
-        for (pcm.samples) |sample| if (!std.math.isFinite(sample)) return error.InvalidAudioSamples;
-        const frames = try prepareGemma4RawAudioFramesPcm(allocator, pcm, cfg.raw_samples_per_token, cfg.max_direct_audio_tokens);
-        defer allocator.free(frames);
-        return encodeUnifiedDirectAudioFrames(cb, allocator, store, cfg, frames);
-    }
+    if (cfg.direct_unified) return encodeUnifiedDirectAudio(cb, allocator, store, cfg, .{ .pcm = pcm });
     const result = try encodeSingleAudioPcmResident(cb, allocator, store, cfg, pcm);
     defer cb.free(result.embeddings);
     return .{ .embeddings = try cb.toFloat32(result.embeddings, allocator), .tokens = result.tokens };
@@ -2141,44 +2203,33 @@ fn encodeAudioFeaturesResident(cb: *const ComputeBackend, allocator: std.mem.All
     return encodeAudioFeatureCohortResident(cb, allocator, store, cfg, &.{features}, null);
 }
 
-/// Rowwise conformer projections/FFNs run once over all clips. Only temporal
-/// attention and convolution split at clip boundaries; padding cannot leak.
-const AudioFramePlan = struct { layers: usize = 1, in_flight: usize = 1 };
-fn audioFramePlan(rows: usize, hidden: usize, intermediate: usize) AudioFramePlan {
-    if (rows == 0 or hidden == 0 or intermediate == 0) return .{};
-    const floats = std.math.add(usize, std.math.mul(usize, hidden, 12) catch return .{}, std.math.mul(usize, intermediate, 4) catch return .{}) catch return .{};
-    const bytes = std.math.mul(usize, std.math.mul(usize, rows, floats) catch return .{}, 4) catch return .{};
-    // At most one submitted group and one encoding group. Views and activation
-    // buffers for both fit inside the existing 768-MiB audio reservation.
-    const group = @min(@as(usize, 4), (384 * 1024 * 1024) / (std.math.mul(usize, bytes, 2) catch return .{}));
-    return if (group == 0) .{} else .{ .layers = group, .in_flight = 2 };
-}
-
 fn encodeAudioFeatureCohortResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, declared_cfg: AudioConfig, features_list: []const *AudioFeatures, lengths: ?[]usize) !ResidentEncodedAudio {
     const cfg = try audioConfigForBackend(cb, declared_cfg);
     if (features_list.len == 0 or features_list.len > 4 or (lengths != null and lengths.?.len != features_list.len)) return error.InvalidInputShape;
-    const storage = try cb.audioStorage(true);
-    defer if (storage) {
-        _ = cb.audioStorage(false) catch false;
-    };
-    return encodeAudioFeatureCohortResidentWithinStorage(cb, allocator, store, cfg, features_list, lengths);
+    var storage = try ops.AudioStorageScope.begin(cb);
+    errdefer storage.close();
+    const resident = try encodeAudioFeatureCohortResidentWithinStorage(cb, allocator, store, cfg, features_list, lengths, &storage);
+    errdefer cb.free(resident.embeddings);
+    try storage.finish();
+    return resident;
 }
 
 // Only the owning wrapper above and the prepared-batch lexical storage owner
 // call this helper. It borrows their bank and never begins or retires storage.
-fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, features_list: []const *AudioFeatures, lengths: ?[]usize) !ResidentEncodedAudio {
+fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, features_list: []const *AudioFeatures, lengths: ?[]usize, storage: *ops.AudioStorageScope) !ResidentEncodedAudio {
     if (features_list.len == 0 or features_list.len > 4 or (lengths != null and lengths.?.len != features_list.len)) return error.InvalidInputShape;
     const features = features_list[0];
     const cohort = features_list.len > 1;
 
     var profile = AudioProfile{ .cb = cb };
     const profile_enabled = gemma4AudioMetalProfileEnabled();
+    const previous_profile = active_audio_profile;
     if (profile_enabled) {
         profile.start();
         active_audio_profile = &profile;
     }
     defer if (profile_enabled) {
-        active_audio_profile = null;
+        active_audio_profile = previous_profile;
     };
 
     if (@import("builtin").is_test) {
@@ -2191,11 +2242,8 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
     // runtime submits once instead of committing and waiting after every
     // op. The frame is owned only here; a caller that already composes one
     // keeps it.
-    var frame_active = false;
-    if (!cohort and cb.kind() == .metal and gemma4AudioEncoderFrameEnabled() and !cb.decoderRuntimeHasActiveFrame()) {
-        frame_active = try cb.decoderRuntimeBeginFrame();
-    }
-    errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
+    var frame = try Submission.beginIfNeeded(cb, !cohort and cb.kind() == .metal and gemma4AudioEncoderFrameEnabled());
+    errdefer frame.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
 
     var subsampled = try audioSubsampleCohort(cb, allocator, store, cfg, features_list);
     defer subsampled.deinit(allocator);
@@ -2205,6 +2253,20 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
     if (@import("builtin").is_test) try embeddingGemma2StageTensor(cb, allocator, "audio_subsample", subsampled.hidden);
     audioProfileMark(.subsample);
 
+    const valid_count = if (lengths) |counts| block: {
+        var offset: usize = 0;
+        var total: usize = 0;
+        const segments = if (subsampled.segments.len == 0) &[_]usize{subsampled.seq_len} else subsampled.segments;
+        for (counts, segments) |*count, span| {
+            count.* = countTrue(subsampled.valid_mask[offset..][0..span]);
+            if (count.* == 0) return error.EmptyEmbeddingInput;
+            total += count.*;
+            offset += span;
+        }
+        break :block total;
+    } else countTrue(subsampled.valid_mask);
+    if (valid_count == 0) return error.EmptyEmbeddingInput;
+
     var layer_inputs = try AudioLayerInputs.initCached(cb, allocator, store, cfg, subsampled.valid_mask);
     defer layer_inputs.deinit(cb);
     try layer_inputs.setSegments(cb, subsampled.segments);
@@ -2212,20 +2274,59 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
     const grouped_frames = cohort and cb.kind() == .metal and store.huggingface and cfg.exclude_farthest_key and
         !cb.decoderRuntimeHasActiveFrame() and !cb.decoderRuntimeHasSubmittedFrame() and !profile_enabled and std.meta.eql(audioHostOps(), AudioHostOps{}) and platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") == null and
         !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_AUDIO");
-    const frame_plan = if (grouped_frames) audioFramePlan(subsampled.seq_len, cfg.audio_hidden, cfg.intermediate_size) else AudioFramePlan{};
-    const pipelined = grouped_frames and frame_plan.in_flight == 2 and cb.decoderRuntimeSetWhisperPipelinedFrames(true);
-    var pending_frame = false;
-    // Drain before layer inputs, hidden outputs, and cached weights leave scope.
+    const frame_plan = if (grouped_frames) audio_schedule.audioFramePlan(subsampled.seq_len, cfg.audio_hidden, cfg.intermediate_size) else audio_schedule.AudioFramePlan{};
+    const cohort_layer_span = if (grouped_frames) frame_plan.layers else 1;
+    var defer_audio_arena = false;
+    const schedule_span = if (cohort) cohort_layer_span else @max(cfg.block_count, 1);
+    const schedule_count = if (cohort) @divCeil(cfg.block_count, schedule_span) else @as(usize, @intFromBool(cfg.block_count != 0));
+    const fits_retained_schedules = schedule_count <= audio_schedule.retained_plan_capacity;
+    if (cb.kind() == .metal and fits_retained_schedules and audioExecutionEligible(cb, store, cfg, &layer_inputs)) {
+        if (cb.embedding_stage) |stage| if (stage.audio_scratch_fn) |prepare| {
+            const Boundary = struct {
+                store: *ProjectorWeights,
+                frame: *Submission,
+
+                fn quiesce(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try self.frame.finish();
+                    // The completed subsampler's weight handles belong to the
+                    // current compute owner. Only independent tensors cross.
+                    self.store.deinit();
+                }
+            };
+            var boundary = Boundary{ .store = store, .frame = &frame };
+            const restart_frame = frame.owns;
+            var keys: [audio_schedule.retained_plan_capacity]u64 = undefined;
+            const recipe = audioCacheConfig(cfg);
+            for (keys[0..schedule_count], 0..) |*key, index| {
+                const start = index * schedule_span;
+                const end = start + @min(cfg.block_count - start, schedule_span);
+                key.* = recipe.key(layer_inputs.segments, start, end);
+            }
+            const values = audioExecutionInputs(hidden, &layer_inputs);
+            defer_audio_arena = try prepare(stage.ptr, cb, keys[0..schedule_count], &values, .{
+                .storage = storage,
+                .owns_active_frame = frame.owns,
+                .context = &boundary,
+                .quiesce = Boundary.quiesce,
+            });
+            if (restart_frame and !frame.owns) frame = try Submission.begin(cb);
+        };
+    }
+    const pipelined = grouped_frames and frame_plan.in_flight == 2 and cb.decoderRuntimeSetPipelinedFrames(true);
+    var pending: PendingSubmission = .{ .backend = cb };
+    var frame_snapshot: ?CT = null;
+    errdefer if (frame_snapshot) |snapshot| cb.free(snapshot);
+    // Drain before publishing or releasing a snapshot, layer inputs, or cached weights.
     defer {
-        if (frame_active) {
-            cb.decoderRuntimeCancelFrame() catch {};
-            frame_active = false;
-        }
-        if (pending_frame) cb.decoderRuntimeWaitSubmittedFrame() catch {};
-        if (pipelined) _ = cb.decoderRuntimeSetWhisperPipelinedFrames(false);
+        frame.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
+        pending.wait() catch {
+            if (pending.active) platform.inference_process_supervisor.restartWorker();
+        };
+        if (pipelined) _ = cb.decoderRuntimeSetPipelinedFrames(false);
     }
 
-    const planned = if (cb.kind() == .metal and cohort) null else try tryAudioExecution(cb, allocator, store, cfg, hidden, &layer_inputs);
+    const planned = if (cb.kind() == .metal and cohort) null else try tryAudioExecutionRange(cb, allocator, store, cfg, hidden, &layer_inputs, 0, cfg.block_count, defer_audio_arena);
     if (planned) |next| {
         cb.free(hidden);
         hidden = next;
@@ -2233,27 +2334,18 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
     var layer: usize = 0;
     if (planned == null) while (layer < cfg.block_count) {
         try cb.checkExecutionControl();
-        if (cohort and cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame()) frame_active = try cb.decoderRuntimeBeginFrame();
-        const end = if (cohort and cb.kind() == .metal and !profile_enabled and platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") == null) @min(cfg.block_count, layer + frame_plan.layers) else layer + 1;
-        const grouped = if (cohort and cb.kind() == .metal) try tryAudioExecutionRange(cb, allocator, store, cfg, hidden, &layer_inputs, layer, end) else null;
+        const end = @min(cfg.block_count, layer + cohort_layer_span);
+        if (cohort and cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame()) frame = if (pipelined) try Submission.beginPipelined(cb) else try Submission.begin(cb);
+        const grouped = if (cohort and cb.kind() == .metal and fits_retained_schedules) try tryAudioExecutionRange(cb, allocator, store, cfg, hidden, &layer_inputs, layer, end, defer_audio_arena) else null;
         const next = grouped orelse try runAudioLayers(cb, allocator, store, cfg, hidden, &layer_inputs, layer, end);
         cb.free(hidden);
         hidden = next;
         layer = end;
-        if (cohort and frame_active and (layer % frame_plan.layers == 0 or layer == cfg.block_count)) {
+        if (cohort and frame.owns and (layer % frame_plan.layers == 0 or layer == cfg.block_count)) {
             if (pipelined) {
-                try @import("../ops/metal_compute.zig").MetalCompute.detachEmbeddingGemma2ActivationViews(cb);
-                if (pending_frame) {
-                    try cb.decoderRuntimeWaitSubmittedFrame();
-                    pending_frame = false;
-                }
-                try cb.decoderRuntimeSubmitFrame();
-                frame_active = false;
-                pending_frame = true;
+                try frame.submitWithActivationViews(&pending);
             } else {
-                try cb.decoderRuntimeSubmitAndWaitFrame();
-                frame_active = false;
-                try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+                try frame.finishWithActivationViews();
             }
         }
         store.releaseCompletedNativeLayer();
@@ -2263,7 +2355,7 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
         }
     };
 
-    if (cohort and cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame()) frame_active = try cb.decoderRuntimeBeginFrame();
+    if (cohort and cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame()) frame = if (pipelined) try Submission.beginPipelined(cb) else try Submission.begin(cb);
     const output = try audioSourceLinear(cb, allocator, store, cfg, hidden, "a.pre_encode.out", subsampled.seq_len, cfg.audio_hidden, cfg.output_hidden, .row_major, false, true);
     cb.free(hidden);
     hidden_live = false;
@@ -2285,89 +2377,94 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
         try cb.linearNoBias(normed, projection_w, subsampled.seq_len, cfg.output_hidden, cfg.text_hidden);
     defer cb.free(projected);
     audioProfileMark(.tail);
-    if (pending_frame) {
-        if (frame_active) try @import("../ops/metal_compute.zig").MetalCompute.detachEmbeddingGemma2ActivationViews(cb);
-        try cb.decoderRuntimeWaitSubmittedFrame();
-        pending_frame = false;
+    // A contiguous copy owns its destination independently of the frame.
+    // Encode it before submitting the last Metal frame to share its fence.
+    const contiguous_first = if (valid_count != 0 and (cb.kind() == .metal or cb.kind() == .cuda) and
+        cb.supportsCopyRows2D() and try cb.tensorDType(projected) == .f32)
+        contiguousValidAudioRows(subsampled.valid_mask, valid_count)
+    else
+        null;
+    // Stage only the index map for a ragged mask. The projected rows stay
+    // resident and the owned result crosses the frame boundary.
+    const valid_rows = if (contiguous_first == null and valid_count != 0) try allocator.alloc(u32, valid_count) else null;
+    defer if (valid_rows) |rows| allocator.free(rows);
+    if (valid_rows) |rows| {
+        var dst: usize = 0;
+        for (subsampled.valid_mask, 0..) |valid, row| {
+            if (valid) {
+                rows[dst] = @intCast(row);
+                dst += 1;
+            }
+        }
     }
-    if (frame_active) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        frame_active = false;
-        if (cohort and cb.kind() == .metal) try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+    if (frame.owns and cb.kind() == .metal) {
+        if (contiguous_first) |first| {
+            frame_snapshot = try cb.snapshotRows2D(allocator, projected, first, valid_count, cfg.text_hidden);
+        } else if (valid_rows) |rows| {
+            if (cb.vtable.takeRows != null and try cb.tensorDType(projected) == .f32) {
+                frame_snapshot = try cb.takeRows(projected, rows, rows.len, cfg.text_hidden);
+            }
+        }
+    }
+    if (pending.active) {
+        if (frame.owns) try cb.detachFrameActivationViews();
+        try pending.wait();
+    }
+    if (frame.owns) {
+        try frame.finish();
+        if (cohort and cb.kind() == .metal) try cb.releaseFrameActivationViews();
     }
 
     if (@import("builtin").is_test) try embeddingGemma2StageTensor(cb, allocator, "audio_projected", projected);
-    const valid_count = countTrue(subsampled.valid_mask);
-    const valid_rows = try allocator.alloc(u32, valid_count);
-    defer allocator.free(valid_rows);
-    var dst: usize = 0;
-    for (subsampled.valid_mask, 0..) |valid, row| {
-        if (valid) {
-            valid_rows[dst] = @intCast(row);
-            dst += 1;
-        }
-    }
-    if (lengths) |counts| {
-        var offset: usize = 0;
-        for (counts, if (subsampled.segments.len == 0) &[_]usize{subsampled.seq_len} else subsampled.segments) |*count, span| {
-            count.* = countTrue(subsampled.valid_mask[offset..][0..span]);
-            if (count.* == 0) return error.EmptyEmbeddingInput;
-            offset += span;
-        }
-    }
-    if (valid_count == 0) return error.EmptyEmbeddingInput;
-    if (cb.vtable.takeRows != null) {
-        const compact = try cb.takeRows(projected, valid_rows, valid_count, cfg.text_hidden) orelse return error.UnsupportedResidentGemma4Audio;
-        errdefer cb.free(compact);
+    const resident: ?CT = frame_snapshot orelse if (contiguous_first) |first|
+        try cb.snapshotRows2D(allocator, projected, first, valid_count, cfg.text_hidden)
+    else if (cb.vtable.takeRows != null)
+        (try cb.takeRows(projected, valid_rows.?, valid_count, cfg.text_hidden)) orelse return error.UnsupportedResidentGemma4Audio
+    else
+        null;
+    if (resident) |output_rows| {
         audioProfileMark(.readback);
         if (profile_enabled) profile.finish(subsampled.seq_len);
-        return .{ .embeddings = compact, .tokens = valid_count };
+        return .{ .embeddings = output_rows, .tokens = valid_count };
     }
     const values = try cb.toFloat32(projected, allocator);
     defer allocator.free(values);
     const packed_values = try allocator.alloc(f32, valid_count * cfg.text_hidden);
     defer allocator.free(packed_values);
-    for (valid_rows, 0..) |row, index| @memcpy(packed_values[index * cfg.text_hidden ..][0..cfg.text_hidden], values[row * cfg.text_hidden ..][0..cfg.text_hidden]);
+    for (valid_rows.?, 0..) |row, index| @memcpy(packed_values[index * cfg.text_hidden ..][0..cfg.text_hidden], values[row * cfg.text_hidden ..][0..cfg.text_hidden]);
     return .{ .embeddings = try deviceResidentFromFloat32(cb, packed_values, &.{ @intCast(valid_count), @intCast(cfg.text_hidden) }), .tokens = valid_count };
 }
 
-fn encodeUnifiedDirectAudio(
-    cb: *const ComputeBackend,
-    allocator: std.mem.Allocator,
-    store: *ProjectorWeights,
-    cfg: AudioConfig,
-    audio_bytes: []const u8,
-) !EncodedAudio {
-    const frames = try prepareGemma4RawAudioFrames(allocator, audio_bytes, cfg.raw_samples_per_token, cfg.max_direct_audio_tokens);
-    defer allocator.free(frames);
-    return encodeUnifiedDirectAudioFrames(cb, allocator, store, cfg, frames);
+fn encodeUnifiedDirectAudio(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, input: AudioInput) !EncodedAudio {
+    const result = (try encodeUnifiedDirectAudioResident(cb, a, store, cfg, input)) orelse
+        return .{ .embeddings = try a.alloc(f32, 0), .tokens = 0 };
+    defer cb.free(result.embeddings);
+    return .{ .embeddings = try cb.toFloat32(result.embeddings, a), .tokens = result.tokens };
 }
 
-fn encodeUnifiedDirectAudioFrames(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, frames: []const f32) !EncodedAudio {
-    const token_count = frames.len / cfg.raw_samples_per_token;
-    if (token_count == 0) {
-        return .{
-            .embeddings = try allocator.alloc(f32, 0),
-            .tokens = 0,
-        };
-    }
-    const frame_shape = [_]i32{ @intCast(token_count), @intCast(cfg.raw_samples_per_token) };
-    const frame_ct = try deviceResidentFromFloat32(cb, frames, &frame_shape);
-    defer cb.free(frame_ct);
-
-    // Direct unified audio projects RMS-normalized raw waveform chunks, matching
-    // llama.cpp's Gemma4UnifiedMultimodalEmbedder graph.
-    const normed = try rmsNormNoScaleCt(cb, allocator, frame_ct, token_count, cfg.raw_samples_per_token, cfg.layer_norm_eps);
-    defer cb.free(normed);
-    const projection_w = try store.linearCt("mm.a.input_projection.weight", cfg.raw_samples_per_token, cfg.text_hidden);
-    defer cb.free(projection_w);
-    const projected = try cb.linearNoBias(normed, projection_w, token_count, cfg.raw_samples_per_token, cfg.text_hidden);
-    defer cb.free(projected);
-
-    return .{
-        .embeddings = try cb.toFloat32(projected, allocator),
-        .tokens = token_count,
+fn encodeUnifiedDirectAudioResident(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, input: AudioInput) !?ResidentEncodedAudio {
+    const frames = switch (input) {
+        .encoded => |bytes| try prepareGemma4RawAudioFrames(a, bytes, cfg.raw_samples_per_token, cfg.max_direct_audio_tokens),
+        .pcm => |pcm| pcm_frames: {
+            for (pcm.samples) |sample| if (!std.math.isFinite(sample)) return error.InvalidAudioSamples;
+            break :pcm_frames try prepareGemma4RawAudioFramesPcm(a, pcm, cfg.raw_samples_per_token, cfg.max_direct_audio_tokens);
+        },
     };
+    defer a.free(frames);
+    const count = frames.len / cfg.raw_samples_per_token;
+    if (count == 0) return null;
+    const matrix = try deviceResidentFromFloat32(cb, frames, &.{ @intCast(count), @intCast(cfg.raw_samples_per_token) });
+    defer cb.free(matrix);
+    return try projectUnifiedAudioMatrix(cb, a, store, cfg, matrix, count);
+}
+
+fn projectUnifiedAudioMatrix(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, matrix: CT, frames: usize) !ResidentEncodedAudio {
+    const width = cfg.raw_samples_per_token;
+    const normalized = try rmsNormNoScaleCt(cb, a, matrix, frames, width, cfg.layer_norm_eps);
+    defer cb.free(normalized);
+    const weight = try store.linearCt("mm.a.input_projection.weight", width, cfg.text_hidden);
+    defer cb.free(weight);
+    return .{ .embeddings = try cb.linearNoBias(normalized, weight, frames, width, cfg.text_hidden), .tokens = frames };
 }
 
 fn prepareGemma4RawAudioFrames(
@@ -2387,19 +2484,18 @@ fn prepareGemma4RawAudioFramesPcm(allocator: std.mem.Allocator, decoded: audio.P
     const max_samples = std.math.mul(usize, samples_per_token, max_tokens) catch return error.InvalidTensorShape;
     const source_limit = try sourceSampleLimitForResample(max_samples, decoded.sample_rate, target_rate);
     if (decoded.samples.len > source_limit) return error.AudioInputTooLong;
-    const resampled = try audio.copyOrResample(allocator, decoded.samples, decoded.sample_rate, target_rate);
-    defer allocator.free(resampled);
-
-    if (resampled.len > max_samples) return error.AudioInputTooLong;
-    const real_samples = resampled.len;
-    const frames = if (real_samples == 0)
-        0
+    const resampled: ?[]f32 = if (decoded.sample_rate != target_rate)
+        try audio.copyOrResample(allocator, decoded.samples, decoded.sample_rate, target_rate)
     else
-        (real_samples + samples_per_token - 1) / samples_per_token;
+        null;
+    defer if (resampled) |owned| allocator.free(owned);
+    const samples: []const f32 = if (resampled) |owned| owned else decoded.samples;
+    if (samples.len > max_samples) return error.AudioInputTooLong;
+    const frames = std.math.divCeil(usize, samples.len, samples_per_token) catch return error.InvalidTensorShape;
     const out_len = std.math.mul(usize, frames, samples_per_token) catch return error.InvalidTensorShape;
     const out = try allocator.alloc(f32, out_len);
-    @memset(out, 0.0);
-    if (real_samples > 0) @memcpy(out[0..real_samples], resampled[0..real_samples]);
+    @memcpy(out[0..samples.len], samples);
+    @memset(out[samples.len..], 0.0);
     return out;
 }
 
@@ -2409,6 +2505,52 @@ fn sourceSampleLimitForResample(target_samples: usize, source_rate: u32, target_
         return error.AudioInputTooLong;
     const source_samples = numerator / @as(u128, target_rate);
     return std.math.cast(usize, source_samples) orelse error.AudioInputTooLong;
+}
+
+const UnifiedWaveformTest = struct {
+    const helpers = @import("../ops/media_residency_test.zig");
+
+    fn weights(store: *@import("../ops/native_compute.zig").WeightStore) !void {
+        try helpers.putWeight(store, "mm.a.input_projection.weight", &.{ 64, 640 }, null);
+    }
+
+    fn check(backend: ComputeBackend, reference: ComputeBackend) !void {
+        const a = std.testing.allocator;
+        var cfg = embeddingGemma2AudioConfig();
+        cfg.direct_unified = true;
+        cfg.raw_samples_per_token = 640;
+        cfg.text_hidden = 64;
+        var source: ProjectorWeights = .{ .cb = &backend, .allocator = a, .gguf = null, .owner = null, .require_resident_weights = true };
+        defer source.deinit();
+        var host: ProjectorWeights = .{ .cb = &reference, .allocator = a, .gguf = null, .owner = null, .require_resident_weights = true };
+        defer host.deinit();
+        const empty: AudioInput = .{ .pcm = .{ .samples = &.{}, .sample_rate = 16000 } };
+        try std.testing.expect(try encodeUnifiedDirectAudioResident(&backend, a, &source, cfg, empty) == null);
+        const samples: [641]f32 = @splat(0.25);
+        const input: AudioInput = .{ .pcm = .{ .samples = &samples, .sample_rate = 16000 } };
+        const before = helpers.Transfers.snapshot(backend);
+        const actual = (try encodeUnifiedDirectAudioResident(&backend, a, &source, cfg, input)) orelse return error.MissingResidentAudioProjection;
+        defer backend.free(actual.embeddings);
+        try before.expectUnchanged(backend);
+        if (backend.kind() == .metal)
+            try std.testing.expect(@import("../ops/metal_compute.zig").MetalCompute.debugHasDeviceTensor(&backend, actual.embeddings));
+        const expected = try encodeUnifiedDirectAudio(&reference, a, &host, cfg, input);
+        defer a.free(expected.embeddings);
+        try std.testing.expectEqual(@as(usize, 2), actual.tokens);
+        try std.testing.expectEqual(expected.tokens, actual.tokens);
+        const values = try backend.toFloat32(actual.embeddings, a);
+        defer a.free(values);
+        try std.testing.expectEqual(expected.embeddings.len, values.len);
+        for (expected.embeddings, values) |want, have| try std.testing.expectApproxEqAbs(want, have, 1e-4);
+    }
+};
+
+test "Metal unified waveform projection shares host math and preserves empty clips" {
+    try @import("../ops/media_residency_test.zig").onMetal(UnifiedWaveformTest.weights, UnifiedWaveformTest.check);
+}
+
+test "CUDA unified waveform projection shares host math and preserves empty clips" {
+    try @import("../ops/media_residency_test.zig").onCuda(UnifiedWaveformTest.weights, UnifiedWaveformTest.check);
 }
 
 test "gemma4 direct audio frames preserve raw waveform samples" {
@@ -2431,6 +2573,16 @@ test "gemma4 direct audio frames preserve raw waveform samples" {
     try std.testing.expectEqual(@as(f32, 0.0), frames[5]);
     try std.testing.expectEqual(@as(f32, 0.0), frames[6]);
     try std.testing.expectEqual(@as(f32, 0.0), frames[7]);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
+    const frame_allocator = failing.allocator();
+    const from_pcm = try prepareGemma4RawAudioFramesPcm(frame_allocator, .{
+        .samples = &samples,
+        .sample_rate = 16_000,
+    }, 4, 4);
+    defer frame_allocator.free(from_pcm);
+    try std.testing.expectEqualSlices(f32, &samples, from_pcm[0..samples.len]);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0 }, from_pcm[samples.len..]);
 }
 
 test "gemma4 audio source window is bounded before resampling" {
@@ -2564,21 +2716,18 @@ pub const PreparedAudio = struct {
     mask: []bool,
     frames: usize,
     mel_bins: usize,
-    packed_frames: []f32 = &.{},
-    basis: []const f32 = &.{},
     owns_frontend: bool = true,
     pub fn deinit(self: *PreparedAudio) void {
         self.allocator.free(self.samples);
         if (self.owns_frontend) {
             self.allocator.free(self.window);
             self.allocator.free(self.filters);
-            self.allocator.free(self.basis);
         }
         self.allocator.free(self.mask);
-        self.allocator.free(self.packed_frames);
     }
     pub fn retainedBytes(self: PreparedAudio) usize {
-        return (self.samples.len + self.window.len + self.filters.len + self.packed_frames.len + self.basis.len) * 4 + self.mask.len;
+        const owned_frontend = if (self.owns_frontend) self.window.len + self.filters.len else 0;
+        return (self.samples.len + owned_frontend) * @sizeOf(f32) + self.mask.len;
     }
     pub fn tokenCount(self: PreparedAudio) usize {
         var count: usize = 0;
@@ -2668,16 +2817,13 @@ pub fn prepareEmbeddingGemma2AudioForBackendBounded(a: std.mem.Allocator, bytes:
     const cfg = embeddingGemma2AudioConfig();
     return prepareAudioCpuBounded(a, bytes, options, cfg.mel_bins, cfg.reject_audio_truncation, true, cfg.max_audio_samples, max_decode_working_bytes, true);
 }
-pub fn prepareEmbeddingGemma2AudioWithPacking(allocator: std.mem.Allocator, bytes: []const u8, options: audio.DecodeOptions, pack_device: bool) !PreparedAudio {
-    return prepareEmbeddingGemma2AudioWithPackingBounded(allocator, bytes, options, pack_device, audio.default_decode_working_bytes);
+pub fn prepareEmbeddingGemma2AudioWithPacking(allocator: std.mem.Allocator, bytes: []const u8, options: audio.DecodeOptions, prewarm_device_recipe: bool) !PreparedAudio {
+    return prepareEmbeddingGemma2AudioWithPackingBounded(allocator, bytes, options, prewarm_device_recipe, audio.default_decode_working_bytes);
 }
-pub fn prepareEmbeddingGemma2AudioWithPackingBounded(allocator: std.mem.Allocator, bytes: []const u8, options: audio.DecodeOptions, pack_device: bool, max_decode_working_bytes: usize) !PreparedAudio {
-    return prepareAudioCpuBounded(allocator, bytes, options, 128, true, pack_device, 480_000, max_decode_working_bytes, false);
+pub fn prepareEmbeddingGemma2AudioWithPackingBounded(allocator: std.mem.Allocator, bytes: []const u8, options: audio.DecodeOptions, prewarm_device_recipe: bool, max_decode_working_bytes: usize) !PreparedAudio {
+    return prepareAudioCpuBounded(allocator, bytes, options, 128, true, prewarm_device_recipe, 480_000, max_decode_working_bytes, false);
 }
-fn prepareAudioCpu(allocator: std.mem.Allocator, audio_bytes: []const u8, decode_options: audio.DecodeOptions, mel_bins: usize, strict: bool, pack_gpu: bool) !PreparedAudio {
-    return prepareAudioCpuBounded(allocator, audio_bytes, decode_options, mel_bins, strict, pack_gpu, 480_000, audio.default_decode_working_bytes, false);
-}
-fn prepareAudioCpuBounded(allocator: std.mem.Allocator, audio_bytes: []const u8, decode_options: audio.DecodeOptions, mel_bins: usize, strict: bool, pack_gpu: bool, max_samples: usize, max_decode_working_bytes: usize, reference_resample: bool) !PreparedAudio {
+fn prepareAudioCpuBounded(allocator: std.mem.Allocator, audio_bytes: []const u8, decode_options: audio.DecodeOptions, mel_bins: usize, strict: bool, prewarm_device_recipe: bool, max_samples: usize, max_decode_working_bytes: usize, reference_resample: bool) !PreparedAudio {
     var decoded = audio.decodeBounded(allocator, audio_bytes, decode_options, max_decode_working_bytes) catch |err| switch (err) {
         error.OutOfMemory, error.AudioTooLarge => return err,
         else => return if (reference_resample) error.InvalidAudioInput else err,
@@ -2690,7 +2836,7 @@ fn prepareAudioCpuBounded(allocator: std.mem.Allocator, audio_bytes: []const u8,
         if (info.total_samples != 0 and info.total_samples != decoded.samples.len) return error.InvalidAudioInput;
     }
     if (strict) for (decoded.samples) |sample| if (!std.math.isFinite(sample)) return error.InvalidAudioSamples;
-    return prepareAudioPcmBounded(allocator, .{ .samples = decoded.samples, .sample_rate = decoded.sample_rate }, mel_bins, strict, pack_gpu, max_samples, reference_resample);
+    return prepareAudioPcmBounded(allocator, .{ .samples = decoded.samples, .sample_rate = decoded.sample_rate }, mel_bins, strict, prewarm_device_recipe, max_samples, reference_resample);
 }
 
 /// Matches resampling and the every-fourth-row feature mask without allocating
@@ -2707,15 +2853,15 @@ pub fn embeddingGemma2PcmSequenceLength(samples: usize, sample_rate: u32) !usize
 pub fn prepareEmbeddingGemma2AudioPcm(allocator: std.mem.Allocator, pcm: audio.PcmAudio) !PreparedAudio {
     return prepareEmbeddingGemma2AudioPcmWithPacking(allocator, pcm, true);
 }
-pub fn prepareEmbeddingGemma2AudioPcmWithPacking(allocator: std.mem.Allocator, pcm: audio.PcmAudio, pack_device: bool) !PreparedAudio {
+pub fn prepareEmbeddingGemma2AudioPcmWithPacking(allocator: std.mem.Allocator, pcm: audio.PcmAudio, prewarm_device_recipe: bool) !PreparedAudio {
     if (pcm.sample_rate == 0 or pcm.sample_rate > 192000 or pcm.samples.len == 0) return error.UnsupportedAudioFormat;
     for (pcm.samples) |sample| if (!std.math.isFinite(sample)) return error.UnsupportedAudioFormat;
-    return prepareAudioPcm(allocator, pcm, 128, true, pack_device);
+    return prepareAudioPcm(allocator, pcm, 128, true, prewarm_device_recipe);
 }
-fn prepareAudioPcm(allocator: std.mem.Allocator, pcm: audio.PcmAudio, mel_bins: usize, strict: bool, pack_gpu: bool) !PreparedAudio {
-    return prepareAudioPcmBounded(allocator, pcm, mel_bins, strict, pack_gpu, 480_000, false);
+fn prepareAudioPcm(allocator: std.mem.Allocator, pcm: audio.PcmAudio, mel_bins: usize, strict: bool, prewarm_device_recipe: bool) !PreparedAudio {
+    return prepareAudioPcmBounded(allocator, pcm, mel_bins, strict, prewarm_device_recipe, 480_000, false);
 }
-fn prepareAudioPcmBounded(allocator: std.mem.Allocator, pcm: audio.PcmAudio, mel_bins: usize, strict: bool, pack_gpu: bool, max_samples: usize, reference_resample: bool) !PreparedAudio {
+fn prepareAudioPcmBounded(allocator: std.mem.Allocator, pcm: audio.PcmAudio, mel_bins: usize, strict: bool, prewarm_device_recipe: bool, max_samples: usize, reference_resample: bool) !PreparedAudio {
     const target_rate: u32 = 16_000;
     const frame_length: usize = 320;
     const hop_length: usize = 160;
@@ -2751,7 +2897,9 @@ fn prepareAudioPcmBounded(allocator: std.mem.Allocator, pcm: audio.PcmAudio, mel
     @memset(samples, 0.0);
     @memcpy(samples[pad_left..][0..real_samples], resampled[0..real_samples]);
 
-    const recipe = audio_frontend_recipe.get(mel_bins, pack_gpu);
+    // The device fallback borrows a process-wide basis, so warming it here
+    // does not add buffers to the prepared clip.
+    const recipe = audio_frontend_recipe.get(mel_bins, prewarm_device_recipe);
     const filters = if (recipe) |plan| plan.filters else try gemma4MelFilterbank(allocator, mel_bins, fft_length, target_rate);
     errdefer if (recipe == null) allocator.free(filters);
     const window: []const f32 = if (recipe) |plan| plan.window else create: {
@@ -2764,20 +2912,12 @@ fn prepareAudioPcmBounded(allocator: std.mem.Allocator, pcm: audio.PcmAudio, mel
         const frame_end = frame * hop_length + frame_size_for_unfold - 1;
         mask[frame] = frame_end >= pad_left and frame_end < pad_left + real_samples;
     }
-    var prepared = PreparedAudio{ .allocator = allocator, .samples = samples, .window = window, .filters = filters, .mask = mask, .frames = frames, .mel_bins = mel_bins, .owns_frontend = recipe == null, .basis = if (recipe) |plan| plan.basis else &.{} };
+    const prepared = PreparedAudio{ .allocator = allocator, .samples = samples, .window = window, .filters = filters, .mask = mask, .frames = frames, .mel_bins = mel_bins, .owns_frontend = recipe == null };
     // The two stride-two subsampling layers retain every fourth mask row.
     // Padded frames alone do not guarantee any usable projected audio tokens.
     // Reject these clips before GPU execution so preparation can attribute the
     // error to one item rather than aborting its entire encoder cohort.
     if (prepared.tokenCount() == 0) return error.EmptyEmbeddingInput;
-    if (pack_gpu and frames > 0) {
-        const bins = fft_length / 2 + 1;
-        if (recipe == null) {
-            const basis = try allocator.alloc(f32, 2 * bins * frame_length);
-            fillAudioDftBasis(basis, frame_length, fft_length);
-            prepared.basis = basis;
-        }
-    }
     return prepared;
 }
 fn prepareGemma4AudioFeatures(cb: *const ComputeBackend, allocator: std.mem.Allocator, bytes: []const u8, cfg: AudioConfig) !AudioFeatures {
@@ -2802,7 +2942,7 @@ pub fn namedAudioLayout(file: *const gguf_format.File, frames: usize, width: usi
     const expected = if (cfg.direct_unified) cfg.raw_samples_per_token else cfg.mel_bins;
     const maximum = if (cfg.direct_unified) cfg.max_direct_audio_tokens else cfg.max_audio_samples / 160 + 4;
     if (frames == 0 or frames > maximum or width != expected) return error.InvalidInputShape;
-    return .{ .width = expected, .hidden = cfg.text_hidden, .max_tokens = if (cfg.direct_unified) frames else (frames + 3) / 4, .raw = cfg.direct_unified };
+    return .{ .width = expected, .hidden = cfg.text_hidden, .max_tokens = if (cfg.direct_unified) frames else audio_schedule.subsampledRows(frames), .raw = cfg.direct_unified };
 }
 
 /// Host-only waveform decoding and the checkpoint's existing feature policy.
@@ -2838,11 +2978,7 @@ pub fn encodeNamedAudioTensorResident(cb: *const ComputeBackend, a: std.mem.Allo
         for (mask) |valid| if (!valid) return error.InvalidAttentionMask;
         const matrix = try cb.primReshape(input, &.{ @intCast(frames), @intCast(width) });
         defer cb.free(matrix);
-        const normalized = try rmsNormNoScaleCt(cb, a, matrix, frames, width, cfg.layer_norm_eps);
-        defer cb.free(normalized);
-        const weight = try weights.linearCt("mm.a.input_projection.weight", width, cfg.text_hidden);
-        defer cb.free(weight);
-        return .{ .embeddings = try cb.linearNoBias(normalized, weight, frames, width, cfg.text_hidden), .tokens = frames };
+        return projectUnifiedAudioMatrix(cb, a, &weights, cfg, matrix, frames);
     }
     var features = AudioFeatures{ .allocator = a, .data = &.{}, .resident = input, .backend = cb, .mask = @constCast(mask), .frames = frames, .mel_bins = width };
     return encodeAudioFeaturesResident(cb, a, &weights, cfg, &features);
@@ -2864,14 +3000,11 @@ fn audioFeaturesFromPrepared(cb: *const ComputeBackend, allocator: std.mem.Alloc
     errdefer allocator.free(out);
     const mask = try allocator.dupe(bool, prepared.mask);
     errdefer allocator.free(mask);
-    var owned_frame = cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame() and try cb.decoderRuntimeBeginFrame();
-    defer if (owned_frame) cb.decoderRuntimeCancelFrame() catch {};
+    var frame = try @import("../execution/submission.zig").Scope.beginIfNeeded(cb, cb.kind() == .metal);
+    defer frame.deinit();
     const tensor = try gemma4LogMelTensor(cb, allocator, prepared.samples, prepared.frames, 160, 320, 512, prepared.window, prepared.filters, prepared.mel_bins, 1e-3, mask);
     errdefer cb.free(tensor);
-    if (owned_frame) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        owned_frame = false;
-    }
+    try frame.finish();
     return .{ .allocator = allocator, .data = out, .resident = tensor, .backend = cb, .mask = mask, .frames = prepared.frames, .mel_bins = prepared.mel_bins };
 }
 
@@ -3031,11 +3164,9 @@ fn gemma4LogMelFrames(
     use_blas: bool,
 ) !void {
     if (use_blas and audio.blas_available and frames > 0 and frames <= std.math.maxInt(c_int) and frame_length == 320 and fft_length == 512 and mel_bins == 128 and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_AUDIO_DFT")) {
-        const ticket = spectrum_policy.cpu.choose(frames);
-        const started = platform.time.monotonicNs();
-        if (ticket.fft) try gemma4LogMelFramesFft(allocator, samples, frames, hop_length, frame_length, fft_length, window, filters, mel_bins, mel_floor, mask, out) else try gemma4LogMelFramesReference(allocator, samples, frames, hop_length, frame_length, fft_length, window, filters, mel_bins, mel_floor, mask, out, true);
-        spectrum_policy.cpu.completed(ticket, platform.time.monotonicNs() - started);
-        return;
+        // Fix the arithmetic route for this geometry. A timing-based switch
+        // changes rounded log-mel values for otherwise identical requests.
+        return gemma4LogMelFramesFft(allocator, samples, frames, hop_length, window, filters, mel_bins, mel_floor, mask, out);
     }
     return gemma4LogMelFramesReference(allocator, samples, frames, hop_length, frame_length, fft_length, window, filters, mel_bins, mel_floor, mask, out, use_blas);
 }
@@ -3044,8 +3175,6 @@ fn gemma4LogMelFramesFft(
     samples: []const f32,
     frames: usize,
     hop_length: usize,
-    frame_length: usize,
-    fft_length: usize,
     window: []const f32,
     filters: []const f32,
     mel_bins: usize,
@@ -3053,16 +3182,18 @@ fn gemma4LogMelFramesFft(
     mask: []const bool,
     out: []f32,
 ) !void {
-    _ = frame_length;
-    _ = fft_length;
+    if (filters.len != try std.math.mul(usize, 257, mel_bins) or
+        out.len != try std.math.mul(usize, frames, mel_bins) or mask.len != frames) return error.InvalidTensorShape;
     const mag = try allocator.alloc(f32, try std.math.mul(usize, frames, 257));
     defer allocator.free(mag);
     try fft512.magnitudes(samples, frames, hop_length, window, audio_frontend_recipe.fft(), mag);
-    const mel = try allocator.alloc(f32, try std.math.mul(usize, frames, mel_bins));
-    defer allocator.free(mel);
-    if (filters.len != 257 * mel_bins or out.len != frames * mel_bins or mask.len != frames) return error.InvalidTensorShape;
-    audio.blas.cblas_sgemm(audio.blas.row_major, audio.blas.no_trans, audio.blas.trans, @intCast(frames), @intCast(mel_bins), 257, 1, mag.ptr, 257, filters.ptr, 257, 0, mel.ptr, @intCast(mel_bins));
-    for (mel, out, 0..) |x, *y, i| y.* = if (mask[i / mel_bins]) @log(x + mel_floor) else 0;
+    audio.blas.cblas_sgemm(audio.blas.row_major, audio.blas.no_trans, audio.blas.trans, @intCast(frames), @intCast(mel_bins), 257, 1, mag.ptr, 257, filters.ptr, 257, 0, out.ptr, @intCast(mel_bins));
+    for (mask, 0..) |valid, frame| {
+        const row = out[frame * mel_bins ..][0..mel_bins];
+        if (valid) {
+            for (row) |*value| value.* = @log(value.* + mel_floor);
+        } else @memset(row, 0);
+    }
 }
 
 fn gemma4LogMelFramesReference(
@@ -3184,7 +3315,7 @@ test "gemma4 blas log-mel matches the fft log-mel" {
     const via_fft = try allocator.alloc(f32, frames * mel_bins);
     defer allocator.free(via_fft);
     try gemma4LogMelFrames(allocator, samples, frames, hop_length, frame_length, fft_length, window, filters, mel_bins, 1e-3, mask, via_blas, true);
-    try gemma4LogMelFrames(allocator, samples, frames, hop_length, frame_length, fft_length, window, filters, mel_bins, 1e-3, mask, via_fft, false);
+    try gemma4LogMelFramesReference(allocator, samples, frames, hop_length, frame_length, fft_length, window, filters, mel_bins, 1e-3, mask, via_fft, false);
     for (via_blas, via_fft, 0..) |a, b, i| {
         if (i / mel_bins == 3) {
             try std.testing.expectEqual(@as(f32, 0.0), a);
@@ -3201,47 +3332,50 @@ fn subsampleBatchCapacity(cfg: AudioConfig, frames: usize, maximum: usize) usize
     return subsampleBatchCapacityFor(cfg, frames, maximum, false, false);
 }
 fn subsampleBatchCapacityFor(cfg: AudioConfig, frames: usize, maximum: usize, direct: bool, masked: bool) usize {
+    const bytes = audioSubsampleWorkspacePerClip(cfg, frames, direct, masked) catch return 1;
+    if (bytes == 0) return 1;
+    return @max(1, @min(maximum, (128 * 1024 * 1024) / bytes));
+}
+
+fn audioSubsampleWorkspacePerClip(cfg: AudioConfig, frames: usize, direct: bool, masked: bool) !usize {
     const Mul = std.math.mul;
     const Add = std.math.add;
     const h0 = frames / 2 + frames % 2;
     const h1 = h0 / 2 + h0 % 2;
     const w0 = cfg.mel_bins / 2 + cfg.mel_bins % 2;
     const w1 = w0 / 2 + w0 % 2;
-    const input = Mul(usize, frames, cfg.mel_bins) catch return 1;
-    const conv0 = Mul(usize, Mul(usize, h0, w0) catch return 1, cfg.conv_channels0) catch return 1;
-    const conv1 = Mul(usize, Mul(usize, h1, w1) catch return 1, cfg.conv_channels1) catch return 1;
-    const output = Mul(usize, h1, cfg.audio_hidden) catch return 1;
+    const input = try Mul(usize, frames, cfg.mel_bins);
+    const conv0 = try Mul(usize, try Mul(usize, h0, w0), cfg.conv_channels0);
+    const conv1 = try Mul(usize, try Mul(usize, h1, w1), cfg.conv_channels1);
+    const output = try Mul(usize, h1, cfg.audio_hidden);
     var floats: usize = 0;
-    for ([_]usize{ input, conv0, conv1, output }, (if (direct) [_]usize{ 3, if (masked) 3 else 2, 3, 3 } else [_]usize{ 3, 4, 5, 3 })) |n, copies| floats = Add(usize, floats, Mul(usize, n, copies) catch return 1) catch return 1;
-    const bytes = Mul(usize, floats, 4) catch return 1;
-    if (bytes == 0) return 1;
-    return @max(1, @min(maximum, (128 * 1024 * 1024) / bytes));
+    for ([_]usize{ input, conv0, conv1, output }, (if (direct) [_]usize{ 3, if (masked) 3 else 2, 3, 3 } else [_]usize{ 3, 4, 5, 3 })) |n, copies| floats = try Add(usize, floats, try Mul(usize, n, copies));
+    return Mul(usize, floats, @sizeOf(f32));
 }
 
 // Equal-length clips share convolutions and projection, with no artificial
 // time padding or cross-clip normalization. Output stays in caller order.
 fn audioSubsampleCohort(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, features: []const *AudioFeatures) !SubsampledAudio {
     if (features.len == 1) return audioSubsample(cb, a, store, cfg, features[0]);
-    if (features.len == 0 or features.len > 4) return error.InvalidInputShape;
-    const segments = try a.alloc(usize, features.len);
+    const Grouping = audio_schedule.GroupedRows;
+    if (features.len == 0 or features.len > Grouping.max_clips) return error.InvalidInputShape;
+    var frames: [Grouping.max_clips]usize = undefined;
+    for (features, frames[0..features.len]) |feature, *count| count.* = feature.frames;
+    const grouping = try Grouping.resolve(frames[0..features.len]);
+    const segments = try a.dupe(usize, grouping.spans[0..features.len]);
     errdefer a.free(segments);
-    var offsets: [4]usize = undefined;
-    var rows: usize = 0;
-    for (features, segments, offsets[0..features.len]) |f, *span, *off| {
-        off.* = rows;
-        span.* = (f.frames + 3) / 4;
-        rows = try std.math.add(usize, rows, span.*);
-    }
+    const offsets = grouping.offsets;
+    const rows = grouping.total;
     const valid = try a.alloc(bool, rows);
     errdefer a.free(valid);
     const hidden = (try cb.allocUninitF32Shape(&.{ @intCast(rows), @intCast(cfg.audio_hidden) })) orelse return error.UnsupportedResidentGemma4Audio;
     errdefer cb.free(hidden);
-    var done: [4]bool = @splat(false);
+    var done: [Grouping.max_clips]bool = @splat(false);
     const can_batch = (cb.kind() == .cuda or cb.kind() == .metal) and cb.vtable.channelLayerNormRelu != null and std.meta.eql(audioHostOps(), AudioHostOps{});
     for (features, 0..) |feature, first| {
         if (done[first]) continue;
-        var indices: [4]usize = undefined;
-        var cohort: [4]*AudioFeatures = undefined;
+        var indices: [Grouping.max_clips]usize = undefined;
+        var cohort: [audio_schedule.GroupedRows.max_clips]*AudioFeatures = undefined;
         var count: usize = 0;
         var padded_frames = feature.frames;
         var min_frames = feature.frames;
@@ -3260,8 +3394,8 @@ fn audioSubsampleCohort(cb: *const ComputeBackend, a: std.mem.Allocator, store: 
             count += 1;
             done[i] = true;
         }
-        var frame = cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame() and try cb.decoderRuntimeBeginFrame();
-        defer if (frame) cb.decoderRuntimeCancelFrame() catch {};
+        var frame = try @import("../execution/submission.zig").Scope.beginIfNeeded(cb, cb.kind() == .metal);
+        defer frame.deinit();
         var singleton: ?SubsampledAudio = null;
         defer if (singleton) |*clip| {
             cb.free(clip.hidden);
@@ -3275,13 +3409,9 @@ fn audioSubsampleCohort(cb: *const ComputeBackend, a: std.mem.Allocator, store: 
         for (indices[0..count], 0..) |index, slot| {
             const span = segments[index];
             for (0..span) |t| valid[offsets[index] + t] = features[index].mask[t * 4];
-            if (!try cb.copyRows2D(a, hidden, offsets[index], batch_hidden, slot * ((padded_frames + 3) / 4), span, cfg.audio_hidden)) return error.UnsupportedResidentGemma4Audio;
+            if (!try cb.copyRows2D(a, hidden, offsets[index], batch_hidden, slot * audio_schedule.subsampledRows(padded_frames), span, cfg.audio_hidden)) return error.UnsupportedResidentGemma4Audio;
         }
-        if (frame) {
-            try cb.decoderRuntimeSubmitAndWaitFrame();
-            frame = false;
-            try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
-        }
+        try frame.finishWithActivationViews();
     }
     return .{ .hidden = hidden, .valid_mask = valid, .seq_len = rows, .segments = segments };
 }
@@ -3982,7 +4112,7 @@ fn encodePreparedImageBatchResident(cb: *const ComputeBackend, allocator: std.me
     const batch = prepared.len;
     const geometry = prepared[0].geometry;
     if (cfg.require_prepared_vision) {
-        const ready = try @import("../ops/metal_compute.zig").MetalCompute.prepareEmbeddingVisionPlan(cb, .{ .rows = batch * geometry.grid_x * geometry.grid_y, .hidden = cfg.vision_hidden, .intermediate = cfg.intermediate_size });
+        const ready = try cb.setVisionWorkspace(.{ .rows = batch * geometry.grid_x * geometry.grid_y, .hidden = cfg.vision_hidden, .intermediate = cfg.intermediate_size });
         if (!ready) return error.PreparedVisionUnavailable;
     }
     var deferred = false;
@@ -4128,14 +4258,12 @@ fn encodePositionedBatchResidentInto(cb: *const ComputeBackend, allocator: std.m
     };
     defer cache_scope.close();
     if (cfg.embedding_gemma2_f32_attention) if (cb.vtable.embeddingRotaryPrepare) |prepare| try prepare(cb.ptr, .{ .vision = true, .dim = @intCast(cfg.vision_hidden / cfg.head_count), .x = @intCast(geometry.grid_x), .y = @intCast(geometry.grid_y), .theta = cfg.rope_theta });
-    const previous = @import("../ops/metal_compute.zig").MetalCompute.requireEmbeddingVisionPlan(cb, cfg.require_prepared_vision);
-    defer _ = @import("../ops/metal_compute.zig").MetalCompute.requireEmbeddingVisionPlan(cb, previous);
+    const previous = cb.requireVisionWorkspace(cfg.require_prepared_vision);
+    defer _ = cb.requireVisionWorkspace(previous);
 
-    if (visionFollowup(cb, store, cfg)) if (cb.vtable.embeddingVisionWorkspace) |prepare|
-        try prepare(cb.ptr, .{ .rows = batch * geometry.grid_x * geometry.grid_y, .hidden = cfg.vision_hidden, .intermediate = cfg.intermediate_size });
-    defer if (cb.vtable.embeddingVisionWorkspace) |prepare| {
-        prepare(cb.ptr, null) catch {};
-    };
+    if (visionFollowup(cb, store, cfg))
+        _ = try cb.setVisionWorkspace(.{ .rows = batch * geometry.grid_x * geometry.grid_y, .hidden = cfg.vision_hidden, .intermediate = cfg.intermediate_size });
+    defer _ = cb.setVisionWorkspace(null) catch false;
 
     // Group only our own frames. External frame owners keep their lifetime
     // boundary; stage diagnostics keep their synchronized per-layer behavior.
@@ -4149,17 +4277,19 @@ fn encodePositionedBatchResidentInto(cb: *const ComputeBackend, allocator: std.m
     // Larger images that admit only one layer keep the synchronous route.
     const pipeline = can_group and admitted_layers >= 2 and store.gguf == null and
         !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_VISION") and
-        cb.decoderRuntimeSetWhisperPipelinedFrames(true);
+        cb.decoderRuntimeSetPipelinedFrames(true);
     const group = if (pipeline) @max(@as(usize, 1), admitted_layers / 2) else if (can_group) policy.layerCapacity(@intCast(geometry.width), @intCast(geometry.height), batch, admitted_layers) else 1;
     const started = platform.time.monotonicNs();
-    var frame = false;
-    var pending = false;
+    var frame: Submission = .{ .backend = cb };
+    var pending: PendingSubmission = .{ .backend = cb };
     defer {
-        if (frame) cb.decoderRuntimeCancelFrame() catch {};
-        if (pending) cb.decoderRuntimeWaitSubmittedFrame() catch {};
+        frame.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
+        pending.wait() catch {
+            if (pending.active) platform.inference_process_supervisor.restartWorker();
+        };
         if (pipeline) {
-            _ = cb.decoderRuntimeSetWhisperPipelinedFrames(false);
-            @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb) catch {};
+            _ = cb.decoderRuntimeSetPipelinedFrames(false);
+            cb.releaseFrameActivationViews() catch {};
         }
     }
     const resident_tower = if (store.huggingface and cb.kind() == .cuda)
@@ -4173,28 +4303,17 @@ fn encodePositionedBatchResidentInto(cb: *const ComputeBackend, allocator: std.m
         if (source_sequence != null) return error.SourceStorageUnavailable;
         for (0..cfg.block_count) |layer| {
             try cb.checkExecutionControl();
-            if (can_group and !frame) frame = try cb.decoderRuntimeBeginFrame();
+            if (can_group and !frame.owns) frame = if (pipeline) try Submission.beginPipelined(cb) else try Submission.begin(cb);
             const next = try encoderBlockBatch(cb, allocator, store, cfg, hidden, geometry, layer, batch);
             cb.free(hidden);
             hidden = next;
-            if (frame and ((layer + 1) % group == 0 or layer + 1 == cfg.block_count)) {
+            if (frame.owns and ((layer + 1) % group == 0 or layer + 1 == cfg.block_count)) {
                 if (pipeline and layer + 1 < cfg.block_count) {
-                    try @import("../ops/metal_compute.zig").MetalCompute.detachEmbeddingGemma2ActivationViews(cb);
-                    if (pending) {
-                        try cb.decoderRuntimeWaitSubmittedFrame();
-                        pending = false;
-                    }
-                    try cb.decoderRuntimeSubmitFrame();
-                    frame = false;
-                    pending = true;
+                    try frame.submitWithActivationViews(&pending);
                 } else {
-                    if (pending) {
-                        try cb.decoderRuntimeWaitSubmittedFrame();
-                        pending = false;
-                    }
-                    try cb.decoderRuntimeSubmitAndWaitFrame();
-                    frame = false;
-                    if (store.gguf == null) try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+                    try pending.wait();
+                    try frame.finish();
+                    if (store.gguf == null) try cb.releaseFrameActivationViews();
                 }
             }
             store.releaseCompletedNativeLayer();
@@ -4206,7 +4325,7 @@ fn encodePositionedBatchResidentInto(cb: *const ComputeBackend, allocator: std.m
     }
     if (can_group and !pipeline) policy.layerCompleted(@intCast(geometry.width), @intCast(geometry.height), batch, group, cfg.block_count, platform.time.monotonicNs() - started);
     var projector_frame = try beginVisionBoundary(cb, store, cfg);
-    defer if (projector_frame) cb.decoderRuntimeCancelFrame() catch {};
+    defer projector_frame.deinit();
     // Preserve the source GEMM's physical reduction extent until pooling.
     const source_bf16 = sourcePixelStorage(cb.kind(), cfg) == .bf16 and sourceSpatialPoolSelected(cb.kind(), cfg, try cb.sourceScalarStorage(.linear));
     if (@import("build_options").enable_cuda and !source_bf16) if (source_sequence) |physical| {
@@ -4225,11 +4344,7 @@ fn encodePositionedBatchResidentInto(cb: *const ComputeBackend, allocator: std.m
     const projection_w = try projectorLinearWeightCt(cb, allocator, store, "mm.input_projection.weight", cfg.vision_hidden, cfg.text_hidden);
     const projected = try projectSpatialTensor(cb, allocator, normed_pooled, projection_w, output, batch * geometry.tokenCount(), cfg.vision_hidden, cfg.text_hidden, source_bf16);
     errdefer if (output == null) cb.free(projected);
-    if (projector_frame) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        projector_frame = false;
-        try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
-    }
+    try projector_frame.finishWithActivationViews();
     if (store.gguf == null) try embeddingGemma2StageTensor(cb, allocator, "image_projected", projected);
 
     return .{
@@ -4579,10 +4694,11 @@ const AudioLayerInputs = struct {
         self.segments = segments;
         if (segments.len == 0 or (cb.kind() != .metal and cb.kind() != .cuda)) return;
         if (self.valid_mask.len > 16777216) return error.InvalidTensorShape;
-        const starts = try self.allocator.alloc(f32, self.valid_mask.len);
-        defer self.allocator.free(starts);
-        const tags = try self.allocator.alloc(f32, starts.len);
-        defer self.allocator.free(tags);
+        const rows = self.valid_mask.len;
+        const planes = try self.allocator.alloc(f32, rows * 2);
+        defer self.allocator.free(planes);
+        const starts = planes[0..rows];
+        const tags = planes[rows..];
         var offset: usize = 0;
         for (segments) |span| {
             if (span == 0 or span > starts.len - offset) return error.InvalidTensorShape;
@@ -4593,12 +4709,20 @@ const AudioLayerInputs = struct {
             offset += span;
         }
         if (offset != starts.len) return error.InvalidTensorShape;
-        const shape = [_]i32{@intCast(starts.len)};
-        const starts_ct = try deviceResidentFromFloat32(cb, starts, &shape);
+        // Both planes have the same invocation lifetime. The slices
+        // retain the uploaded bank and keep the vector ABI of each op.
+        const bank = try deviceResidentFromFloat32(cb, planes, &.{ @intCast(planes.len), 1 });
+        defer cb.free(bank);
+        const starts_ct = try self.segmentVector(cb, bank, 0, rows);
         errdefer cb.free(starts_ct);
-        const tags_ct = try deviceResidentFromFloat32(cb, tags, &shape);
-        self.segment_valid = tags_ct;
+        self.segment_valid = try self.segmentVector(cb, bank, rows, rows);
         self.segment_starts = starts_ct;
+    }
+
+    fn segmentVector(self: *const AudioLayerInputs, cb: *const ComputeBackend, bank: CT, offset: usize, rows: usize) !CT {
+        const view = try cb.sliceRows2D(self.allocator, bank, offset, rows, 1);
+        defer cb.free(view);
+        return cb.primReshape(view, &.{@intCast(rows)});
     }
 
     pub fn deinit(self: *AudioLayerInputs, cb: *const ComputeBackend) void {
@@ -4760,7 +4884,7 @@ const AudioProfile = struct {
     }
 };
 
-var active_audio_profile: ?*AudioProfile = null;
+threadlocal var active_audio_profile: ?*AudioProfile = null;
 
 fn audioProfileMark(bucket: AudioProfile.Bucket) void {
     if (active_audio_profile) |profile| profile.mark(bucket);
@@ -4788,11 +4912,8 @@ fn runAudioLayers(cb: *const ComputeBackend, a: std.mem.Allocator, store: *Proje
     }
     return state;
 }
-fn tryAudioExecution(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, hidden: CT, inputs: *AudioLayerInputs) !?CT {
-    return tryAudioExecutionRange(cb, a, store, cfg, hidden, inputs, 0, 12);
-}
-fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, hidden: CT, inputs: *AudioLayerInputs, start: usize, end: usize) !?CT {
-    if ((cb.kind() != .cuda and cb.kind() != .metal) or cb.vtable.audioExecution == null or !store.huggingface or !std.meta.eql(audioHostOps(), AudioHostOps{}) or cfg.block_count != 12 or inputs.scales.len != 12 or (cb.kind() == .cuda and (inputs.segment_starts == null or inputs.segment_valid == null)) or platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") != null) return null;
+fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, hidden: CT, inputs: *AudioLayerInputs, start: usize, end: usize, defer_arena: bool) !?CT {
+    if (!audioExecutionEligible(cb, store, cfg, inputs)) return null;
     const Run = struct {
         cb: *const ComputeBackend,
         a: std.mem.Allocator,
@@ -4804,25 +4925,41 @@ fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store
         fn call(raw: *anyopaque, values: []const CT) !CT {
             const self: *@This() = @ptrCast(@alignCast(raw));
             var layer_inputs = self.inputs.*;
-            layer_inputs.rel_in = values[1];
-            layer_inputs.valid_ct = values[2];
-            layer_inputs.segment_starts = if (self.inputs.segment_starts != null) values[3] else null;
-            layer_inputs.segment_valid = if (self.inputs.segment_valid != null) values[4] else null;
-            var scales: [12]CT = undefined;
-            @memcpy(&scales, values[5..17]);
+            layer_inputs.rel_in = values[audio_schedule.ExecutionInputs.relative];
+            layer_inputs.valid_ct = values[audio_schedule.ExecutionInputs.valid];
+            layer_inputs.segment_starts = if (self.inputs.segment_starts != null) values[audio_schedule.ExecutionInputs.segment_start] else null;
+            layer_inputs.segment_valid = if (self.inputs.segment_valid != null) values[audio_schedule.ExecutionInputs.segment_valid] else null;
+            var scales: [audio_schedule.ExecutionInputs.scale_count]CT = undefined;
+            @memcpy(&scales, values[audio_schedule.ExecutionInputs.scales..]);
             layer_inputs.scales = &scales;
-            return runAudioLayers(self.cb, self.a, self.store, self.cfg, values[0], &layer_inputs, self.start, self.end);
+            return runAudioLayers(self.cb, self.a, self.store, self.cfg, values[audio_schedule.ExecutionInputs.hidden], &layer_inputs, self.start, self.end);
         }
     };
     var run = Run{ .cb = cb, .a = a, .store = store, .cfg = cfg, .inputs = inputs, .start = start, .end = end };
-    var values: [17]CT = undefined;
-    values[0] = hidden;
-    values[1] = inputs.rel_in;
-    values[2] = inputs.valid_ct;
-    values[3] = inputs.segment_starts orelse inputs.valid_ct;
-    values[4] = inputs.segment_valid orelse inputs.valid_ct;
-    @memcpy(values[5..17], inputs.scales);
-    return cb.audioExecution(audioCacheConfig(cfg).key(inputs.segments, start, end), &values, &run, Run.call);
+    const values = audioExecutionInputs(hidden, inputs);
+    return cb.audioExecutionWithArenaFunding(audioCacheConfig(cfg).key(inputs.segments, start, end), &values, &run, Run.call, defer_arena);
+}
+
+fn audioExecutionEligible(cb: *const ComputeBackend, store: *const ProjectorWeights, cfg: AudioConfig, inputs: *const AudioLayerInputs) bool {
+    switch (cb.kind()) {
+        .cuda => if (!audio_schedule.supportsCudaGroupedGraph(inputs.segments.len, cfg.attention_context_right) or
+            inputs.segment_starts == null or inputs.segment_valid == null) return false,
+        .metal => {},
+        else => return false,
+    }
+    return cb.supportsAudioExecution() and store.huggingface and std.meta.eql(audioHostOps(), AudioHostOps{}) and
+        cfg.block_count == 12 and inputs.scales.len == 12 and platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") == null;
+}
+
+fn audioExecutionInputs(hidden: CT, inputs: *const AudioLayerInputs) [audio_schedule.ExecutionInputs.count]CT {
+    var values: [audio_schedule.ExecutionInputs.count]CT = undefined;
+    values[audio_schedule.ExecutionInputs.hidden] = hidden;
+    values[audio_schedule.ExecutionInputs.relative] = inputs.rel_in;
+    values[audio_schedule.ExecutionInputs.valid] = inputs.valid_ct;
+    values[audio_schedule.ExecutionInputs.segment_start] = inputs.segment_starts orelse inputs.valid_ct;
+    values[audio_schedule.ExecutionInputs.segment_valid] = inputs.segment_valid orelse inputs.valid_ct;
+    @memcpy(values[audio_schedule.ExecutionInputs.scales..], inputs.scales);
+    return values;
 }
 fn audioLayer(
     cb: *const ComputeBackend,
@@ -4834,39 +4971,50 @@ fn audioLayer(
     layer: usize,
 ) !CT {
     const rows = inputs.valid_mask.len;
-    const ff1 = try audioFeedForward(cb, allocator, store, cfg, input, rows, layer, false);
-    defer cb.free(ff1);
-    if (@import("builtin").is_test and layer == 0) try embeddingGemma2StageTensor(cb, allocator, "audio_0_feed_forward1", ff1);
-    audioProfileMark(.ffn);
-
     var buf: [128]u8 = undefined;
-    const attn_pre = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.attn_pre_norm.weight", .{layer}), cfg.audio_hidden);
-    const ff1_bounded = try audioSourceGradientBounded(cb, cfg, ff1);
-    defer if (ff1_bounded != ff1) cb.free(ff1_bounded);
-    const normed = try audioSourceRms(cb, cfg, ff1_bounded, attn_pre, rows, cfg.audio_hidden, .contiguous, rows);
-    defer cb.free(normed);
-    audioProfileMark(.norms);
-    const attn = try audioSelfAttention(cb, allocator, store, cfg, normed, inputs, layer);
-    defer cb.free(attn);
-    if (@import("builtin").is_test and layer == 0) try embeddingGemma2StageTensor(cb, allocator, "audio_0_self_attn", attn);
-    audioProfileMark(.attn_out);
-    const attn_post = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.attn_post_norm.weight", .{layer}), cfg.audio_hidden);
-    const fused_residual = if (cfg.source_scalar_storage == .full_f32 and store.gguf == null) try cb.rmsNormResidual(attn, attn_post, ff1, cfg.audio_hidden, cfg.layer_norm_eps, 1, 1) else null;
-    const res_attn = fused_residual orelse blk: {
-        const bounded = try audioSourceGradientBounded(cb, cfg, attn);
-        defer if (bounded != attn) cb.free(bounded);
-        const attn_normed = try audioSourceRms(cb, cfg, bounded, attn_post, rows, cfg.audio_hidden, .contiguous, rows);
-        defer cb.free(attn_normed);
-        break :blk try audioSourceRoundOwned(cb, cfg, try cb.add(ff1, attn_normed));
-    };
-    defer cb.free(res_attn);
-    audioProfileMark(.norms);
+    const ff2 = feed_forward: {
+        const lconv = convolution: {
+            const res_attn = attention: {
+                const ff1 = try audioFeedForward(cb, allocator, store, cfg, input, rows, layer, false);
+                defer cb.free(ff1);
+                if (@import("builtin").is_test and layer == 0) try embeddingGemma2StageTensor(cb, allocator, "audio_0_feed_forward1", ff1);
+                audioProfileMark(.ffn);
 
-    const lconv = try audioLightConv(cb, allocator, store, cfg, res_attn, rows, layer, inputs.segments, inputs.segment_starts);
-    defer cb.free(lconv);
-    if (@import("builtin").is_test and layer == 0) try embeddingGemma2StageTensor(cb, allocator, "audio_0_lconv1d", lconv);
-    audioProfileMark(.lconv);
-    const ff2 = try audioFeedForward(cb, allocator, store, cfg, lconv, rows, layer, true);
+                const attn = self_attention: {
+                    const attn_pre = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.attn_pre_norm.weight", .{layer}), cfg.audio_hidden);
+                    const normed = normalization: {
+                        const bounded = try audioSourceGradientBounded(cb, cfg, ff1);
+                        defer if (bounded != ff1) cb.free(bounded);
+                        break :normalization try audioSourceRms(cb, cfg, bounded, attn_pre, rows, cfg.audio_hidden, .contiguous, rows);
+                    };
+                    defer cb.free(normed);
+                    audioProfileMark(.norms);
+                    break :self_attention try audioSelfAttention(cb, allocator, store, cfg, normed, inputs, layer);
+                };
+                defer cb.free(attn);
+                if (@import("builtin").is_test and layer == 0) try embeddingGemma2StageTensor(cb, allocator, "audio_0_self_attn", attn);
+                audioProfileMark(.attn_out);
+                const attn_post = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.attn_post_norm.weight", .{layer}), cfg.audio_hidden);
+                if (cfg.source_scalar_storage == .full_f32 and store.gguf == null) {
+                    if (try cb.rmsNormResidual(attn, attn_post, ff1, cfg.audio_hidden, cfg.layer_norm_eps, 1, 1)) |fused| break :attention fused;
+                }
+                const attn_normed = normalization: {
+                    const bounded = try audioSourceGradientBounded(cb, cfg, attn);
+                    defer if (bounded != attn) cb.free(bounded);
+                    break :normalization try audioSourceRms(cb, cfg, bounded, attn_post, rows, cfg.audio_hidden, .contiguous, rows);
+                };
+                defer cb.free(attn_normed);
+                break :attention try audioSourceRoundOwned(cb, cfg, try cb.add(ff1, attn_normed));
+            };
+            defer cb.free(res_attn);
+            audioProfileMark(.norms);
+            break :convolution try audioLightConv(cb, allocator, store, cfg, res_attn, rows, layer, inputs.segments, inputs.segment_starts);
+        };
+        defer cb.free(lconv);
+        if (@import("builtin").is_test and layer == 0) try embeddingGemma2StageTensor(cb, allocator, "audio_0_lconv1d", lconv);
+        audioProfileMark(.lconv);
+        break :feed_forward try audioFeedForward(cb, allocator, store, cfg, lconv, rows, layer, true);
+    };
     defer cb.free(ff2);
     if (@import("builtin").is_test and layer == 0) try embeddingGemma2StageTensor(cb, allocator, "audio_0_feed_forward2", ff2);
     audioProfileMark(.ffn);
@@ -4892,29 +5040,35 @@ fn audioFeedForward(
     const suffix = if (second) "_1" else "";
     const norm_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.ffn_norm{s}.weight", .{ layer, suffix }), cfg.audio_hidden);
     const up_name = try fmt(&buf, "a.blk.{d}.ffn_up{s}", .{ layer, suffix });
-    const input_bounded = try audioSourceGradientBounded(cb, cfg, input);
-    defer if (input_bounded != input) cb.free(input_bounded);
-    const preparation: AudioFfnPreparation = if (cfg.source_scalar_storage == .bf16)
-        .{ .normed = try audioSourceRms(cb, cfg, input_bounded, norm_w, rows, cfg.audio_hidden, .contiguous, rows) }
-    else
-        try audioFfnPreparation(cb, allocator, store, input, norm_w, up_name, rows, cfg.audio_hidden, cfg.layer_norm_eps);
-    const normed = preparation.normed;
-    defer cb.free(normed);
-    const activated = if (cfg.source_scalar_storage == .bf16)
-        try audioSourceLinear(cb, allocator, store, cfg, normed, up_name, rows, cfg.audio_hidden, cfg.intermediate_size, .row_major, true, false)
-    else if (preparation.spec) |spec| fused: {
-        const name = try std.fmt.allocPrint(allocator, "{s}.weight", .{up_name});
-        defer allocator.free(name);
-        break :fused try linearNoBiasScalarClipped(cb, allocator, store, normed, name, spec, rows, cfg.audio_hidden, cfg.intermediate_size, true);
-    } else if (store.gguf == null)
-        try linearNoBiasMaybeClippedInternal(cb, allocator, store, normed, up_name, rows, cfg.audio_hidden, cfg.intermediate_size, true)
-    else blk: {
-        const up = try audioSourceLinear(cb, allocator, store, cfg, normed, up_name, rows, cfg.audio_hidden, cfg.intermediate_size, .row_major, false, false);
-        defer cb.free(up);
-        break :blk try cb.silu(up);
+    const down = project: {
+        const activated = activate: {
+            const preparation: AudioFfnPreparation = normalize: {
+                const input_bounded = try audioSourceGradientBounded(cb, cfg, input);
+                defer if (input_bounded != input) cb.free(input_bounded);
+                break :normalize if (cfg.source_scalar_storage == .bf16)
+                    .{ .normed = try audioSourceRms(cb, cfg, input_bounded, norm_w, rows, cfg.audio_hidden, .contiguous, rows) }
+                else
+                    try audioFfnPreparation(cb, allocator, store, input, norm_w, up_name, rows, cfg.audio_hidden, cfg.layer_norm_eps);
+            };
+            const normed = preparation.normed;
+            defer cb.free(normed);
+            break :activate if (cfg.source_scalar_storage == .bf16)
+                try audioSourceLinear(cb, allocator, store, cfg, normed, up_name, rows, cfg.audio_hidden, cfg.intermediate_size, .row_major, true, false)
+            else if (preparation.spec) |spec| fused: {
+                const name = try std.fmt.allocPrint(allocator, "{s}.weight", .{up_name});
+                defer allocator.free(name);
+                break :fused try linearNoBiasScalarClipped(cb, allocator, store, normed, name, spec, rows, cfg.audio_hidden, cfg.intermediate_size, true);
+            } else if (store.gguf == null)
+                try linearNoBiasMaybeClippedInternal(cb, allocator, store, normed, up_name, rows, cfg.audio_hidden, cfg.intermediate_size, true)
+            else blk: {
+                const up = try audioSourceLinear(cb, allocator, store, cfg, normed, up_name, rows, cfg.audio_hidden, cfg.intermediate_size, .row_major, false, false);
+                defer cb.free(up);
+                break :blk try cb.silu(up);
+            };
+        };
+        defer cb.free(activated);
+        break :project try audioSourceLinear(cb, allocator, store, cfg, activated, try fmt(&buf, "a.blk.{d}.ffn_down{s}", .{ layer, suffix }), rows, cfg.intermediate_size, cfg.audio_hidden, .row_major, false, false);
     };
-    defer cb.free(activated);
-    const down = try audioSourceLinear(cb, allocator, store, cfg, activated, try fmt(&buf, "a.blk.{d}.ffn_down{s}", .{ layer, suffix }), rows, cfg.intermediate_size, cfg.audio_hidden, .row_major, false, false);
     defer cb.free(down);
     const post_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.ffn_post_norm{s}.weight", .{ layer, suffix }), cfg.audio_hidden);
     if (cfg.source_scalar_storage == .full_f32 and store.gguf == null and !audioHostOps().scale) if (try cb.rmsNormResidual(down, post_w, input, cfg.audio_hidden, cfg.layer_norm_eps, cfg.residual_weight, 1)) |fused| return fused;
@@ -4986,19 +5140,27 @@ fn audioLightConv(
     // GGUF's inherited tensor mapping swaps the two convolution norm names.
     // Keep HF's logical names intact for the EmbeddingGemma 2 path.
     const norm_names = audioConvNormNames(store.gguf != null);
-    const pre_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.{s}.weight", .{ layer, norm_names.pre }), cfg.audio_hidden);
-    const normed = try audioSourceRms(cb, cfg, input, pre_w, rows, cfg.audio_hidden, .contiguous, rows);
-    defer cb.free(normed);
-    const pw1 = try audioSourceLinear(cb, allocator, store, cfg, normed, try fmt(&buf, "a.blk.{d}.conv_pw1", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden * 2, .row_major, false, false);
-    defer cb.free(pw1);
-    const glu = try audioSourceRoundOwned(cb, cfg, try applyGlu(cb, allocator, pw1, rows, cfg.audio_hidden));
-    defer cb.free(glu);
-    const conv = try audioSourceRoundOwned(cb, cfg, try depthwiseCausalConvSegments(cb, allocator, store, glu, rows, cfg.audio_hidden, cfg.conv_kernel_size, segments, segment_starts, try fmt(&buf, "a.blk.{d}.conv_dw.weight", .{layer})));
-    defer cb.free(conv);
-    const conv_norm_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.{s}.weight", .{ layer, norm_names.post }), cfg.audio_hidden);
-    const conv_bounded = try audioSourceGradientBounded(cb, cfg, conv);
-    defer if (conv_bounded != conv) cb.free(conv_bounded);
-    const conv_normed = try audioSourceChannelRms(cb, allocator, cfg, conv_bounded, conv_norm_w, rows, cfg.audio_hidden, segments);
+    const conv_normed = normalize: {
+        const conv = depthwise: {
+            const glu = gate: {
+                const pw1 = project: {
+                    const pre_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.{s}.weight", .{ layer, norm_names.pre }), cfg.audio_hidden);
+                    const normed = try audioSourceRms(cb, cfg, input, pre_w, rows, cfg.audio_hidden, .contiguous, rows);
+                    defer cb.free(normed);
+                    break :project try audioSourceLinear(cb, allocator, store, cfg, normed, try fmt(&buf, "a.blk.{d}.conv_pw1", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden * 2, .row_major, false, false);
+                };
+                defer cb.free(pw1);
+                break :gate try audioSourceRoundOwned(cb, cfg, try applyGlu(cb, allocator, pw1, rows, cfg.audio_hidden));
+            };
+            defer cb.free(glu);
+            break :depthwise try audioSourceRoundOwned(cb, cfg, try depthwiseCausalConvSegments(cb, allocator, store, glu, rows, cfg.audio_hidden, cfg.conv_kernel_size, segments, segment_starts, try fmt(&buf, "a.blk.{d}.conv_dw.weight", .{layer})));
+        };
+        defer cb.free(conv);
+        const conv_norm_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.{s}.weight", .{ layer, norm_names.post }), cfg.audio_hidden);
+        const conv_bounded = try audioSourceGradientBounded(cb, cfg, conv);
+        defer if (conv_bounded != conv) cb.free(conv_bounded);
+        break :normalize try audioSourceChannelRms(cb, allocator, cfg, conv_bounded, conv_norm_w, rows, cfg.audio_hidden, segments);
+    };
     defer cb.free(conv_normed);
     const activated = try audioSourceRoundOwned(cb, cfg, try cb.silu(conv_normed));
     defer cb.free(activated);
@@ -5091,7 +5253,7 @@ fn audioSelfAttention(
         .interleaved => |interleaved| blk: {
             defer cb.free(interleaved.tensor);
             if (cfg.attention_context_right == 0 and (inputs.segments.len == 0 or inputs.segment_valid != null)) {
-                var params = audioLocalAttentionParams(cfg, rows);
+                var params = try audioLocalAttentionParams(cfg, rows);
                 params.segmented = inputs.segments.len != 0;
                 params.packed_qkv = true;
                 for (interleaved.specs, 0..) |spec, i| {
@@ -5114,21 +5276,23 @@ fn audioSelfAttention(
             break :blk try splitAudioQkv(cb, allocator, interleaved.tensor, rows, cfg.audio_hidden, interleaved.specs);
         },
     } else null;
-    var remaining_k = if (packed_rows) |value| @as(?CT, value.second) else null;
-    defer if (remaining_k) |tensor| cb.free(tensor);
-    var remaining_v = if (packed_rows) |value| @as(?CT, value.third) else null;
-    defer if (remaining_v) |tensor| cb.free(tensor);
-    const q = if (packed_rows) |value| value.first else try audioSourceLinear(cb, allocator, store, cfg, input, try fmt(&buf, "a.blk.{d}.attn_q", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden, .row_major, false, false);
-    defer cb.free(q);
-    const k = remaining_k orelse try audioSourceLinear(cb, allocator, store, cfg, input, try fmt(&buf, "a.blk.{d}.attn_k", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden, .row_major, false, false);
-    remaining_k = null;
-    defer cb.free(k);
-    const v = remaining_v orelse try audioSourceLinear(cb, allocator, store, cfg, input, try fmt(&buf, "a.blk.{d}.attn_v", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden, .row_major, false, false);
-    remaining_v = null;
-    defer cb.free(v);
-    audioProfileMark(.attn_proj);
+    const out_ct = attend: {
+        var remaining_k = if (packed_rows) |value| @as(?CT, value.second) else null;
+        defer if (remaining_k) |tensor| cb.free(tensor);
+        var remaining_v = if (packed_rows) |value| @as(?CT, value.third) else null;
+        defer if (remaining_v) |tensor| cb.free(tensor);
+        const q = if (packed_rows) |value| value.first else try audioSourceLinear(cb, allocator, store, cfg, input, try fmt(&buf, "a.blk.{d}.attn_q", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden, .row_major, false, false);
+        defer cb.free(q);
+        const k = remaining_k orelse try audioSourceLinear(cb, allocator, store, cfg, input, try fmt(&buf, "a.blk.{d}.attn_k", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden, .row_major, false, false);
+        remaining_k = null;
+        defer cb.free(k);
+        const v = remaining_v orelse try audioSourceLinear(cb, allocator, store, cfg, input, try fmt(&buf, "a.blk.{d}.attn_v", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden, .row_major, false, false);
+        remaining_v = null;
+        defer cb.free(v);
+        audioProfileMark(.attn_proj);
 
-    const out_ct = try audioLocalAttention(cb, allocator, cfg, q, k, v, rel, layer, inputs);
+        break :attend try audioLocalAttention(cb, allocator, cfg, q, k, v, rel, layer, inputs);
+    };
     defer cb.free(out_ct);
     audioProfileMark(.attn_kernel);
     return audioSourceLinear(cb, allocator, store, cfg, out_ct, try fmt(&buf, "a.blk.{d}.attn_out", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden, .row_major, false, false);
@@ -5166,7 +5330,7 @@ fn audioKeyScale() f32 {
 fn audioLocalAttention(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: AudioConfig, q: CT, k: CT, v: CT, rel: CT, layer: usize, inputs: *const AudioLayerInputs) !CT {
     if (inputs.segments.len == 0) return audioLocalAttentionSingle(cb, allocator, cfg, q, k, v, rel, layer, inputs);
     if (inputs.segment_valid) |validity| if (cfg.attention_context_right == 0 and !audioHostOps().attention) {
-        var params = audioLocalAttentionParams(cfg, inputs.valid_mask.len);
+        var params = try audioLocalAttentionParams(cfg, inputs.valid_mask.len);
         params.segmented = true;
         if (try cb.gemma4AudioLocalAttention(q, k, v, rel, inputs.scales[layer], validity, params)) |result| return result;
     };
@@ -5211,7 +5375,7 @@ fn audioLocalAttentionSingle(
     const rows = inputs.valid_mask.len;
     if (layer >= inputs.scales.len) return error.InvalidTensorShape;
     if (cfg.attention_context_right == 0 and !audioHostOps().attention) {
-        if (try cb.gemma4AudioLocalAttention(q, k, v, rel, inputs.scales[layer], inputs.valid_ct, audioLocalAttentionParams(cfg, rows))) |out| return out;
+        if (try cb.gemma4AudioLocalAttention(q, k, v, rel, inputs.scales[layer], inputs.valid_ct, try audioLocalAttentionParams(cfg, rows))) |out| return out;
     }
 
     if (cfg.source_scalar_storage == .bf16) return error.SourceArithmeticUnavailable;
@@ -5229,7 +5393,7 @@ fn audioLocalAttentionSingle(
     // host/reference fallback materializes them, alongside its Q/K/V reads.
     const downloaded_scale = if (inputs.scales_host[layer].len == 0) try cb.toFloat32(inputs.scales[layer], allocator) else null;
     defer if (downloaded_scale) |values| allocator.free(values);
-    const out = try audioLocalAttentionReference(allocator, audioLocalAttentionParams(cfg, rows), q_data, k_data, v_data, rel_data, downloaded_scale orelse inputs.scales_host[layer], inputs.valid_mask);
+    const out = try audioLocalAttentionReference(allocator, try audioLocalAttentionParams(cfg, rows), q_data, k_data, v_data, rel_data, downloaded_scale orelse inputs.scales_host[layer], inputs.valid_mask);
     defer allocator.free(out);
     const out_shape = [_]i32{ @intCast(rows), @intCast(cfg.audio_hidden) };
     return cb.fromFloat32Shape(out, &out_shape);
@@ -5549,6 +5713,19 @@ fn audioLinearWithBias(
     return cb.fromFloat32Shape(data, &shape);
 }
 
+fn contiguousValidAudioRows(mask: []const bool, count: usize) ?usize {
+    const first = std.mem.findScalar(bool, mask, true) orelse return null;
+    if (count > mask.len - first) return null;
+    return if (std.mem.findScalar(bool, mask[first..][0..count], false) == null) first else null;
+}
+
+test "gemma4 audio publication bypasses gather only for contiguous valid rows" {
+    try std.testing.expectEqual(@as(?usize, 0), contiguousValidAudioRows(&.{ true, true }, 2));
+    try std.testing.expectEqual(@as(?usize, 1), contiguousValidAudioRows(&.{ false, true, true, false }, 2));
+    try std.testing.expectEqual(@as(?usize, null), contiguousValidAudioRows(&.{ true, false, true }, 2));
+    try std.testing.expectEqual(@as(?usize, null), contiguousValidAudioRows(&.{ false, false }, 0));
+}
+
 fn countTrue(mask: []const bool) usize {
     var count: usize = 0;
     for (mask) |valid| {
@@ -5683,9 +5860,35 @@ fn depthwiseConvWeightCt(
             const key = try AudioCacheRecipe.depthwiseKey(&key_buf, self.name, self.kernel_size, self.hidden);
             const cache = self.store.huggingface and !audioHostOps().resident and (self.cb.kind() == .metal or self.cb.kind() == .cuda);
             if (cache) if (try self.cb.modelConstant(key, null)) |hit| return hit;
-            // CUDA resident checkpoint weights can be BF16, but transpose and
-            // the prepared-constant cache require F32. Use tensorF32 below to
-            // materialize and transpose these small constants once.
+            if (cache and self.cb.kind() == .cuda) {
+                if (self.store.residentWeight(self.name)) |resident| {
+                    defer self.cb.free(resident);
+                    const hidden_dim: i64 = @intCast(self.hidden);
+                    const kernel: i64 = @intCast(self.kernel_size);
+                    const kernel_first = (try self.cb.tensorShapeMatches(resident, &.{ kernel, hidden_dim })) orelse false;
+                    const hidden_first = ((try self.cb.tensorShapeMatches(resident, &.{ hidden_dim, kernel })) orelse false) or
+                        ((try self.cb.tensorShapeMatches(resident, &.{ hidden_dim, 1, kernel })) orelse false);
+                    if (kernel_first or hidden_first) {
+                        const values = switch (try self.cb.tensorDType(resident)) {
+                            .f32 => resident,
+                            .bf16 => try self.cb.tryConvertDType(resident, .f32),
+                            else => null,
+                        };
+                        if (values) |f32_values| {
+                            if (kernel_first) {
+                                const source = if (f32_values == resident)
+                                    try self.cb.primReshape(resident, &.{ kernel, hidden_dim })
+                                else
+                                    f32_values;
+                                return publishAudioConstant(self.cb, key, source, true);
+                            }
+                            defer if (f32_values != resident) self.cb.free(f32_values);
+                            const transposed = try self.cb.primTranspose(f32_values, &.{ 1, 0 }, &.{ hidden_dim, kernel });
+                            return publishAudioConstant(self.cb, key, transposed, true);
+                        }
+                    }
+                } else |err| if (err != error.MissingWeight) return err;
+            }
             if (!audioHostOps().resident and self.cb.kind() != .cuda) {
                 if (self.store.residentWeight(self.name)) |resident| {
                     const expected = [_]i64{ @intCast(self.kernel_size), @intCast(self.hidden) };
@@ -5703,29 +5906,19 @@ fn depthwiseConvWeightCt(
             }
             var weight = try self.store.tensorF32(self.name);
             defer weight.deinit();
-            const elements = try AudioCacheRecipe.validateDepthwiseSource(weight.shape, self.kernel_size, self.hidden, self.store.gguf == null);
-            if (weight.data.len != elements) return error.InvalidTensorShape;
-            const d0: usize = @intCast(weight.shape[0]);
-            const d1: usize = @intCast(weight.shape[1]);
+            const geometry = try AudioCacheRecipe.depthwiseSource(weight.shape, self.kernel_size, self.hidden, self.store.gguf == null);
+            if (weight.data.len != geometry.elements) return error.InvalidTensorShape;
             const shape = [_]i32{ @intCast(self.kernel_size), @intCast(self.hidden) };
-            if (self.store.gguf == null and weight.shape.len == 3 and d0 == self.hidden and d1 == 1 and weight.shape[2] == self.kernel_size) {
-                const transposed = try transposeMatrix(self.allocator, weight.data, self.hidden, self.kernel_size);
-                defer self.allocator.free(transposed);
-                return self.finish(transposed, &shape, key, cache);
-            }
-            if (d0 == self.kernel_size and d1 == self.hidden) return self.finish(weight.data, &shape, key, cache);
-            if (d0 == self.hidden and d1 == self.kernel_size) {
-                const transposed = try transposeMatrix(self.allocator, weight.data, self.hidden, self.kernel_size);
-                defer self.allocator.free(transposed);
-                return self.finish(transposed, &shape, key, cache);
-            }
-            return error.InvalidTensorShape;
+            if (geometry.layout == .kernel_first) return self.finish(weight.data, &shape, key, cache);
+            const transposed = try transposeMatrix(self.allocator, weight.data, self.hidden, self.kernel_size);
+            defer self.allocator.free(transposed);
+            return self.finish(transposed, &shape, key, cache);
         }
     };
     return store.cached(name, Load{ .cb = cb, .allocator = allocator, .store = store, .name = name, .kernel_size = kernel_size, .hidden = hidden });
 }
 
-fn audioLocalAttentionParams(cfg: AudioConfig, rows: usize) ops.Gemma4AudioLocalAttentionParams {
+fn audioLocalAttentionParams(cfg: AudioConfig, rows: usize) !ops.Gemma4AudioLocalAttentionParams {
     return .{
         .rows = rows,
         .hidden = cfg.audio_hidden,
@@ -5736,7 +5929,7 @@ fn audioLocalAttentionParams(cfg: AudioConfig, rows: usize) ops.Gemma4AudioLocal
         .query_scale = if (cfg.source_scalar_storage == .bf16) audioSourceQueryScale(cfg.headDim()) else 1,
         .chunk = cfg.attention_chunk_size,
         .context_left = cfg.attention_context_left,
-        .context = cfg.attentionContextSize(),
+        .context = try audio_schedule.attentionContextRows(cfg.attention_chunk_size, cfg.attention_context_left, cfg.attention_context_right),
         .k_scale = if (cfg.source_scalar_storage == .bf16) audioSourceKeyScale() else audioKeyScale(),
         .logit_cap = cfg.attention_logit_cap,
         .invalid_value = cfg.attention_invalid_logits_value,
@@ -6358,9 +6551,9 @@ test "embeddinggemma2 resident position rows preserve asymmetric x y order" {
 
 /// HF positions are axis-first. Gather only the x/y rows needed by this
 /// frame and add their sum on device, preserving the host addition order.
-fn beginVisionBoundary(cb: *const ComputeBackend, store: *const ProjectorWeights, cfg: Config) !bool {
-    if (!visionFollowup(cb, store, cfg) or platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_BOUNDARY_FRAMES") or cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame()) return false;
-    return cb.decoderRuntimeBeginFrame();
+fn beginVisionBoundary(cb: *const ComputeBackend, store: *const ProjectorWeights, cfg: Config) !Submission {
+    return Submission.beginIfNeeded(cb, cb.kind() == .metal and visionFollowup(cb, store, cfg) and
+        !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_BOUNDARY_FRAMES"));
 }
 
 fn addPositionEmbeddingsDevice(cb: *const ComputeBackend, allocator: std.mem.Allocator, patches: CT, positions: CT, hidden: usize, geometry: Geometry) !CT {
@@ -6401,8 +6594,10 @@ fn addPositionEmbeddingsDevice(cb: *const ComputeBackend, allocator: std.mem.All
         x[i] = @intCast(i % geometry.grid_x);
         y[i] = std.math.cast(i64, per_axis + (i / geometry.grid_x) % geometry.grid_y) orelse return error.InvalidPositionEmbeddingShape;
     }
-    var frame = if (cb.kind() == .metal and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_FOLLOWUP") and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_BOUNDARY_FRAMES") and !cb.decoderRuntimeHasActiveFrame() and !cb.decoderRuntimeHasSubmittedFrame()) try cb.decoderRuntimeBeginFrame() else false;
-    defer if (frame) cb.decoderRuntimeCancelFrame() catch {};
+    var frame = try Submission.beginIfNeeded(cb, cb.kind() == .metal and
+        !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_FOLLOWUP") and
+        !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_BOUNDARY_FRAMES"));
+    defer frame.deinit();
     const xp = try cb.embeddingLookup(positions, x, rows, hidden);
     defer cb.free(xp);
     const yp = try cb.embeddingLookup(positions, y, rows, hidden);
@@ -6411,11 +6606,7 @@ fn addPositionEmbeddingsDevice(cb: *const ComputeBackend, allocator: std.mem.All
     defer cb.free(offsets);
     const result = try cb.add(patches, offsets);
     errdefer cb.free(result);
-    if (frame) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        frame = false;
-        try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
-    }
+    try frame.finishWithActivationViews();
     return result;
 }
 
@@ -6644,9 +6835,9 @@ fn encoderBlockBatch(
     // One owned command frame per vision layer amortizes dispatch/wait costs.
     // Existing active-frame owners retain their boundary. Runtime frame leases
     // keep freed producer buffers alive until completion or cancellation.
-    var frame = false;
-    if (cb.kind() == .metal and !platform.env.getenvBool("TERMITE_METAL_DISABLE_GEMMA4_VISION_FRAMES") and !cb.decoderRuntimeHasActiveFrame()) frame = try cb.decoderRuntimeBeginFrame();
-    defer if (frame) cb.decoderRuntimeCancelFrame() catch {};
+    var frame = try Submission.beginIfNeeded(cb, cb.kind() == .metal and
+        !platform.env.getenvBool("TERMITE_METAL_DISABLE_GEMMA4_VISION_FRAMES"));
+    defer frame.deinit();
     var profile = VisionProfile.init(cb, layer);
 
     const normed1 = try visionNorm(cb, cfg, store, input, null, layer * 4);
@@ -6668,13 +6859,12 @@ fn encoderBlockBatch(
     const res2 = try visionNorm(cb, cfg, store, ffn, res1, layer * 4 + 3);
     errdefer cb.free(res2);
     try profile.phase(cb, "ffn_post_norm_residual");
-    if (frame) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        frame = false;
+    if (frame.owns) {
+        try frame.finish();
         // HF model-owned slots retain immutable weights, not each completed
         // layer's activations. Retire MPS views at the same boundary as the
         // backbone; otherwise every vision layer pins its large MLP buffers.
-        if (store.gguf == null) try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+        if (store.gguf == null) try cb.releaseFrameActivationViews();
     }
     cb.free(res1);
     return res2;
@@ -7904,9 +8094,68 @@ test "gemma4 real mmproj audio device ops match the host encoder" {
             max_ref = @max(max_ref, @abs(a));
         }
         std.debug.print("gemma4 audio device-vs-host host_ops='{s}' max_abs_diff={d:.6} max_abs_ref={d:.4}\n", .{ spec, max_diff, max_ref });
-        if (spec.len == 0) worst = max_diff;
+        if (spec.len == 0) {
+            worst = max_diff;
+            const inputs = [_]AudioInput{ .{ .encoded = audio_bytes }, .{ .encoded = audio_bytes } };
+            for (1..inputs.len + 1) |clip_count| {
+                var prompt = try encodeProjectedAudioForPrompt(&cb, allocator, projector, inputs[0..clip_count]);
+                defer prompt.deinit();
+                const resident = prompt.resident orelse return error.MissingResidentAudioProjection;
+                try std.testing.expect(!cb.decoderRuntimeHasActiveFrame());
+                try std.testing.expect(!cb.decoderRuntimeHasSubmittedFrame());
+                try std.testing.expect(metal_compute_mod.MetalCompute.debugHasDeviceTensor(&cb, resident.rows));
+                try std.testing.expectEqual(@as(usize, 0), prompt.embeddings.len);
+                try std.testing.expectEqual(clip_count, prompt.tokens_per_audio.len);
+                try std.testing.expectEqual(projected.hidden_size, prompt.hidden_size);
+                const values = try cb.toFloat32(resident.rows, allocator);
+                defer allocator.free(values);
+                try std.testing.expectEqual(projected.embeddings.len * clip_count, values.len);
+                for (prompt.tokens_per_audio, 0..) |tokens, clip| {
+                    try std.testing.expectEqual(projected.tokens_per_audio[0], tokens);
+                    try std.testing.expectEqualSlices(f32, projected.embeddings, values[clip * projected.embeddings.len ..][0..projected.embeddings.len]);
+                }
+            }
+        }
     }
     try std.testing.expect(worst < 5e-2);
+
+    const cfg = try parseAudioConfig(&projector.gguf.parsed);
+    const frames = 33;
+    const mel = try allocator.alloc(f32, frames * cfg.mel_bins);
+    defer allocator.free(mel);
+    for (mel, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index % 31)) * 0.01;
+    var mask: [frames]bool = @splat(true);
+    @memset(mask[12..20], false);
+    var features = AudioFeatures{ .allocator = allocator, .data = mel, .mask = &mask, .frames = frames, .mel_bins = cfg.mel_bins };
+    var weights = ProjectorWeights.init(&cb, allocator, projector.gguf, projector);
+    defer weights.deinit();
+    const standalone = block: {
+        const disabled = try AudioTestEnv.set("TERMITE_GEMMA4_AUDIO_DISABLE_ENCODER_FRAME", "1");
+        defer disabled.deinit();
+        break :block try encodeAudioFeaturesResident(&cb, allocator, &weights, cfg, &features);
+    };
+    defer cb.free(standalone.embeddings);
+    const enabled = try AudioTestEnv.set("TERMITE_GEMMA4_AUDIO_DISABLE_ENCODER_FRAME", "0");
+    defer enabled.deinit();
+    const submits_before = cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits;
+    const framed = try encodeAudioFeaturesResident(&cb, allocator, &weights, cfg, &features);
+    defer cb.free(framed.embeddings);
+    try std.testing.expect(cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits > submits_before);
+    try std.testing.expectEqual(@as(usize, 7), framed.tokens);
+    try std.testing.expectEqual(standalone.tokens, framed.tokens);
+    try std.testing.expect(!cb.decoderRuntimeHasActiveFrame());
+    try std.testing.expect(!cb.decoderRuntimeHasSubmittedFrame());
+    const expected_rows = try cb.toFloat32(standalone.embeddings, allocator);
+    defer allocator.free(expected_rows);
+    const actual_rows = try cb.toFloat32(framed.embeddings, allocator);
+    defer allocator.free(actual_rows);
+    try std.testing.expectEqual(expected_rows.len, actual_rows.len);
+    for (expected_rows, actual_rows) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
+
+    @memset(mask[0..], false);
+    try std.testing.expectError(error.EmptyEmbeddingInput, encodeAudioFeaturesResident(&cb, allocator, &weights, cfg, &features));
+    try std.testing.expect(!cb.decoderRuntimeHasActiveFrame());
+    try std.testing.expect(!cb.decoderRuntimeHasSubmittedFrame());
 }
 
 test "model-owned projector store serves requests with their own allocators" {
@@ -8532,8 +8781,7 @@ test "gemma4 prepared audio preserves encoded PCM geometry and drains allocation
             try std.testing.expectEqual(encoded.tokenCount(), pcm.tokenCount());
             try std.testing.expect(encoded.tokenCount() > 0);
             try std.testing.expectEqualSlices(bool, encoded.mask, pcm.mask);
-            try std.testing.expectEqualSlices(f32, encoded.packed_frames, pcm.packed_frames);
-            try std.testing.expectEqualSlices(f32, encoded.basis, pcm.basis);
+            try std.testing.expectEqualSlices(f32, encoded.samples, pcm.samples);
             try std.testing.expectError(error.UnsupportedAudioFormat, prepareEmbeddingGemma2AudioPcm(a, .{ .samples = &samples, .sample_rate = 0 }));
         }
     };
@@ -8715,7 +8963,9 @@ test "gemma4 video portable generation projects large edited AV1 and AVC transpo
     try std.testing.expectError(error.ResourceLimitExceeded, video_input.selectedPresentationUs(a, bytes, .{}, .{ .timestamps = .{} }, null));
     const reference = try video_input.selectedPresentationUs(a, bytes, .{}, .reference, null);
     defer a.free(reference);
-    try std.testing.expectEqualSlices(i64, &.{ 250000, 1250000 }, reference);
+    // The edit begins at 375 ms, inside the 250 ms picture. Reference
+    // sampling selects that picture and the 1250 ms picture in source time.
+    try std.testing.expectEqualSlices(i64, &.{ 0, 875000 }, reference);
     var projected = try @import("../pipelines/gemma4_video.zig").encode(&cb, .{}, a, projector, bytes);
     defer projected.deinit();
     try std.testing.expectEqualSlices(i64, &.{ 0, 1125000 }, projected.timestamps_us);
@@ -9141,7 +9391,7 @@ fn checkVisionViewLifetime(cb: ComputeBackend, reference: ComputeBackend) !void 
     try std.testing.expect(cb.decoderRuntimeHasActiveFrame());
     try std.testing.expect(runtime.termite_metal_decode_runtime_linear_view_bytes(raw, runtime.decoder_runtime_linear_slot_capacity) > 0);
     try cb.decoderRuntimeSubmitAndWaitFrame();
-    try metal.MetalCompute.releaseEmbeddingGemma2ActivationViews(&cb);
+    try cb.releaseFrameActivationViews();
     const external_reference = try encoderBlockBatch(&reference, a, &reference_weights, cfg, expected, geometry, 0, 1);
     defer reference.free(external_reference);
     const got = try cb.toFloat32(external, a);
@@ -9402,14 +9652,14 @@ fn checkAudioCohort(cb: ComputeBackend, reference: ComputeBackend) !void {
     defer a.free(retried);
     for (actual, retried) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-6);
     if (cb.kind() == .metal) {
-        try std.testing.expect(cb.decoderRuntimeSetWhisperPipelinedFrames(true));
-        defer _ = cb.decoderRuntimeSetWhisperPipelinedFrames(false);
+        try std.testing.expect(cb.decoderRuntimeSetPipelinedFrames(true));
+        defer _ = cb.decoderRuntimeSetPipelinedFrames(false);
         var external_pending = false;
         defer if (external_pending) cb.decoderRuntimeWaitSubmittedFrame() catch {};
         try std.testing.expect(try cb.decoderRuntimeBeginFrame());
         const precursor = (try cb.multiplyScalar(combined.embeddings, 1)).?;
         defer cb.free(precursor);
-        try @import("../ops/metal_compute.zig").MetalCompute.detachEmbeddingGemma2ActivationViews(&cb);
+        try cb.detachFrameActivationViews();
         try cb.decoderRuntimeSubmitFrame();
         external_pending = true;
         var external_active = try cb.decoderRuntimeBeginFrame();
@@ -9419,12 +9669,12 @@ fn checkAudioCohort(cb: ComputeBackend, reference: ComputeBackend) !void {
         defer cb.free(external.embeddings);
         try std.testing.expect(cb.decoderRuntimeHasActiveFrame());
         try std.testing.expect(cb.decoderRuntimeHasSubmittedFrame());
-        try @import("../ops/metal_compute.zig").MetalCompute.detachEmbeddingGemma2ActivationViews(&cb);
+        try cb.detachFrameActivationViews();
         try cb.decoderRuntimeWaitSubmittedFrame();
         external_pending = false;
         try cb.decoderRuntimeSubmitAndWaitFrame();
         external_active = false;
-        try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(&cb);
+        try cb.releaseFrameActivationViews();
         const external_values = try cb.toFloat32(external.embeddings, a);
         defer a.free(external_values);
         for (actual, external_values) |x, y| try std.testing.expectApproxEqAbs(x, y, 3e-4);
@@ -9458,15 +9708,6 @@ test "embeddinggemma2 CUDA audio preparation accepts model-valid clips beyond th
     @memset(bytes[24..28], 0);
     try std.testing.expectError(error.UnsupportedAudioFormat, embeddingGemma2EncodedAudioSequenceBound(bytes));
     @memcpy(bytes[24..28], &rate);
-}
-
-test "embeddinggemma2 Metal audio frame groups bound two live groups and avoid overflow" {
-    try std.testing.expectEqual(AudioFramePlan{ .layers = 4, .in_flight = 2 }, audioFramePlan(64, 1024, 4096));
-    for ([_]usize{ 64, 256, 512, 1024, 2048, 8192 }) |rows| {
-        const plan = audioFramePlan(rows, 1024, 4096);
-        if (plan.in_flight == 2) try std.testing.expect(rows * (1024 * 12 + 4096 * 4) * 4 * plan.layers * 2 <= 384 * 1024 * 1024);
-    }
-    try std.testing.expectEqual(AudioFramePlan{}, audioFramePlan(std.math.maxInt(usize), 1024, 4096));
 }
 
 test "embeddinggemma2 audio QKV packing uses an overflow-safe activation budget" {
@@ -9648,13 +9889,15 @@ test "embeddinggemma2 audio frontend recipe builds once under concurrent prepara
     var second = try prepareEmbeddingGemma2AudioPcm(a, .{ .samples = &samples, .sample_rate = 16000 });
     defer second.deinit();
     try std.testing.expect(!first.owns_frontend and !second.owns_frontend);
-    try std.testing.expect(first.window.ptr == second.window.ptr and first.filters.ptr == second.filters.ptr and first.basis.ptr == second.basis.ptr);
+    try std.testing.expect(first.window.ptr == second.window.ptr and first.filters.ptr == second.filters.ptr);
     first.deinit();
     try std.testing.expectEqualSlices(f32, reference_filters, second.filters);
-    const reference_basis = try a.alloc(f32, second.basis.len);
+    try std.testing.expectEqual(second.samples.len * @sizeOf(f32) + second.mask.len, second.retainedBytes());
+    const basis = recipe.get(128, true).?.basis;
+    const reference_basis = try a.alloc(f32, basis.len);
     defer a.free(reference_basis);
     fillAudioDftBasis(reference_basis, 320, 512);
-    try std.testing.expectEqualSlices(f32, reference_basis, second.basis);
+    try std.testing.expectEqualSlices(f32, reference_basis, basis);
 }
 
 fn populateBf16DepthwiseWeight(store: *@import("../ops/native_compute.zig").WeightStore) !void {
@@ -9917,8 +10160,8 @@ fn checkSubsampleBatchGeometry(cb: ComputeBackend, _: ComputeBackend, base_frame
     const cfg = AudioConfig{ .text_hidden = 8, .audio_hidden = 16, .output_hidden = 24, .intermediate_size = 32, .block_count = 8, .head_count = 2, .mel_bins = 8, .conv_channels0 = 4, .conv_channels1 = 2, .layer_norm_eps = 1e-6 };
     var data: [4][15 * 8]f32 = undefined;
     var masks: [4][15]bool = @splat(@splat(true));
-    var features: [4]AudioFeatures = undefined;
-    var pointers: [4]*AudioFeatures = undefined;
+    var features: [audio_schedule.GroupedRows.max_clips]AudioFeatures = undefined;
+    var pointers: [audio_schedule.GroupedRows.max_clips]*AudioFeatures = undefined;
     for (&data, &features, &pointers, 0..) |*values, *f, *ptr, i| {
         for (values, 0..) |*x, j| x.* = @sin(@as(f32, @floatFromInt(j + i * 17)) * 0.13);
         masks[i][0] = false;
@@ -9939,6 +10182,39 @@ fn checkSubsampleBatchGeometry(cb: ComputeBackend, _: ComputeBackend, base_frame
         batch.deinit(a);
     }
     try before.expectUnchanged(cb);
+    {
+        var metadata_config = cfg;
+        metadata_config.block_count = 0;
+        var inputs = try AudioLayerInputs.init(&cb, a, metadata_config, batch.valid_mask, &.{});
+        defer inputs.deinit(&cb);
+        const transfers = @import("../execution/transfer_audit.zig");
+        var audit: transfers.Audit = .{ .forbid_device_host_access = true };
+        {
+            try transfers.begin(&audit);
+            defer transfers.end();
+            try inputs.setSegments(&cb, batch.segments);
+        }
+        if (cb.kind() == .cuda) {
+            try std.testing.expectEqual(@as(u64, 1), audit.upload_calls);
+            try std.testing.expectEqual(@as(u64, batch.seq_len * 2 * @sizeOf(f32)), audit.upload_bytes);
+        }
+        const starts = try cb.toFloat32(inputs.segment_starts.?, a);
+        defer a.free(starts);
+        const tags = try cb.toFloat32(inputs.segment_valid.?, a);
+        defer a.free(tags);
+        try std.testing.expectEqual(batch.seq_len, starts.len);
+        try std.testing.expectEqual(batch.seq_len, tags.len);
+        var first: usize = 0;
+        for (batch.segments) |span| {
+            const base: f32 = @floatFromInt(first);
+            for (first..first + span) |row| {
+                try std.testing.expectEqual(base, starts[row]);
+                try std.testing.expectEqual((base + 1) * @as(f32, if (batch.valid_mask[row]) 1 else -1), tags[row]);
+            }
+            first += span;
+        }
+    }
+
     const actual = try cb.toFloat32(batch.hidden, a);
     defer a.free(actual);
     var offset: usize = 0;
@@ -10149,7 +10425,7 @@ fn measureSpectrum(cb: ComputeBackend, _: ComputeBackend) !void {
             var elapsed: u64 = 0;
             for (0..8) |iteration| {
                 const started = platform.time.monotonicNs();
-                if (route == 0) try gemma4LogMelFramesReference(a, samples, frames, 160, 320, 512, &window, filters, 128, 1e-3, mask, host, true) else try gemma4LogMelFramesFft(a, samples, frames, 160, 320, 512, &window, filters, 128, 1e-3, mask, host);
+                if (route == 0) try gemma4LogMelFramesReference(a, samples, frames, 160, 320, 512, &window, filters, 128, 1e-3, mask, host, true) else try gemma4LogMelFramesFft(a, samples, frames, 160, &window, filters, 128, 1e-3, mask, host);
                 if (iteration >= 3) elapsed += platform.time.monotonicNs() - started;
             }
             std.debug.print("spectrum_cpu frames={} fft={} completed_ns={}\n", .{ frames, route == 1, elapsed / 5 });
@@ -10511,7 +10787,7 @@ fn checkAdmittedAudioPeak(cb: ComputeBackend, _: ComputeBackend) !void {
     var warm = try audioSubsample(&cb, a, &store, cfg, ptrs[0]);
     cb.free(warm.hidden);
     warm.deinit(a);
-    try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(&cb);
+    try cb.releaseFrameActivationViews();
     const runtime = @import("../backends/metal_runtime.zig");
     const before = runtime.currentAllocatedSize(compute.provider_impl.raw_decode_runtime);
     var active = try cb.decoderRuntimeBeginFrame();
@@ -10525,7 +10801,9 @@ fn checkAdmittedAudioPeak(cb: ComputeBackend, _: ComputeBackend) !void {
     // encoding footprint includes all buffers whose lifetimes admission counts.
     const retained = runtime.currentAllocatedSize(compute.provider_impl.raw_decode_runtime) -| before;
     std.debug.print("audio_batch_peak frames={} batch={} incremental_device_bytes={} ceiling={}\n", .{ frames, batch, retained, 128 * 1024 * 1024 });
-    try std.testing.expect(retained <= 128 * 1024 * 1024);
+    const planned = try std.math.mul(usize, batch, try audioSubsampleWorkspacePerClip(cfg, frames, true, false));
+    try std.testing.expect(planned <= 128 * 1024 * 1024);
+    try std.testing.expect(retained <= planned);
     try cb.decoderRuntimeSubmitAndWaitFrame();
     active = false;
     try std.testing.expectEqual(@as(usize, 3), out.segments.len);
@@ -10667,7 +10945,7 @@ fn checkAudioFrontendCohort(cb: ComputeBackend, _: ComputeBackend) !void {
     for (&samples, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.13) * 0.4;
     var prepared = try prepareAudioPcm(a, .{ .samples = &samples, .sample_rate = 16000 }, 128, true, true);
     defer prepared.deinit();
-    var features: [4]AudioFeatures = undefined;
+    var features: [audio_schedule.GroupedRows.max_clips]AudioFeatures = undefined;
     const before = cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits;
     const count = try audioFeatureCohort(&cb, a, &.{ &prepared, &prepared, &prepared }, &features);
     defer for (features[0..count]) |*f| f.deinit();
@@ -10681,7 +10959,7 @@ fn checkAudioFrontendCohort(cb: ComputeBackend, _: ComputeBackend) !void {
     }
     try std.testing.expect(try cb.decoderRuntimeBeginFrame());
     defer cb.decoderRuntimeCancelFrame() catch {};
-    var external: [4]AudioFeatures = undefined;
+    var external: [audio_schedule.GroupedRows.max_clips]AudioFeatures = undefined;
     const n = try audioFeatureCohort(&cb, a, &.{ &prepared, &prepared }, &external);
     defer for (external[0..n]) |*f| f.deinit();
     try std.testing.expect(cb.decoderRuntimeHasActiveFrame());
@@ -11196,7 +11474,8 @@ fn checkPromptImageInputOwnership(a: std.mem.Allocator) !void {
             try std.testing.expect(rows.source == .resident);
             // The host-phase cleanup does not shorten resident payload life.
             input.releaseHost();
-            const values = try cb.toFloat32((try input.rows()).?.source.resident, a);
+            const payload = (try input.rows()).?.source.resident;
+            const values = try payload.backend.toFloat32(payload.rows, a);
             defer a.free(values);
             try std.testing.expectEqualSlices(f32, &expected, values);
         } else {
@@ -11578,6 +11857,12 @@ test "source audio immutable frequency schedule retains authenticated F32 constr
     var b: [256]u8 = undefined;
     try std.testing.expect(!std.mem.eql(u8, try source.towerKey(&a, .relative, 0), try original.towerKey(&b, .relative, 0)));
     try std.testing.expect(!std.mem.eql(u8, try source.towerKey(&a, .query_scale, 0), try original.towerKey(&b, .query_scale, 0)));
+    var weight_name: [128]u8 = undefined;
+    const name = try AudioCacheRecipe.depthwiseWeightName(&weight_name, 0);
+    try std.testing.expectEqualStrings(
+        try AudioCacheRecipe.depthwiseKey(&a, name, source.conv_kernel, source.hidden),
+        try source.towerKey(&b, .depthwise, 0),
+    );
 }
 
 test "source eager publication consumes only its owned input on success decline and error" {

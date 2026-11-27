@@ -710,6 +710,19 @@ fn applyVjp(
             try accumulate(b, adjoints, ins[1], try reduceToBroadcast(b, g, grad_b, ins[1], strict));
         },
 
+        .fused_add_mul_scalar => |attrs| {
+            // Optimizer-owned residuals carry no decomposed VJP alternate.
+            if (ins.len != 3) return error.InvalidGradientGraph;
+            const scaled_adj = try b.mul(adj, ins[2]);
+            try accumulate(b, adjoints, ins[0], try reduceToBroadcast(b, g, scaled_adj, ins[0], strict));
+            try accumulate(b, adjoints, ins[1], try reduceToBroadcast(b, g, if (attrs.scale_before_add) adj else scaled_adj, ins[1], strict));
+            if (depends_on_wrt[ins[2]]) {
+                const scalar_input = if (attrs.scale_before_add) ins[0] else try b.add(ins[0], ins[1]);
+                const scalar_grad = try b.mul(adj, scalar_input);
+                try accumulate(b, adjoints, ins[2], try reduceToBroadcast(b, g, scalar_grad, ins[2], strict));
+            }
+        },
+
         .sub => {
             // d/d(a)(a - b) = 1, d/d(b)(a - b) = -1
             try accumulate(b, adjoints, ins[0], try reduceToBroadcast(b, g, adj, ins[0], strict));
@@ -1810,6 +1823,41 @@ test "gradient of mul" {
     // dL/dx should involve w, dL/dw should involve x
     try std.testing.expect(result.param_grads[0] != null_node);
     try std.testing.expect(result.param_grads[1] != null_node);
+}
+
+test "gradient of optimized scalar residual preserves both operation orders" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |scale_before_add| {
+        var graph = Graph.init(a);
+        defer graph.deinit();
+        var builder = Builder.init(&graph);
+        const shape = Shape.init(.f32, &.{ 2, 3 });
+        const lhs = try builder.parameter("lhs", shape);
+        const rhs = try builder.parameter("rhs", shape);
+        const scalar = try builder.parameter("scalar", Shape.scalar(.f32));
+        const residual = try graph.addNode(.{
+            .op = .{ .fused_add_mul_scalar = .{ .scale_before_add = scale_before_add, .separate_rounding = scale_before_add } },
+            .output_shape = shape,
+            .inputs = .{ lhs, rhs, scalar, null_node },
+            .num_inputs = 3,
+        });
+        const loss = try builder.reduceSum(residual, &.{ 0, 1 });
+        try graph.markOutput(loss);
+
+        var result = try gradient(a, &graph, loss, &.{ lhs, rhs, scalar });
+        defer result.deinit();
+        const left = result.graph.node(result.param_grads[0]);
+        try std.testing.expect(left.op == .mul);
+        try std.testing.expectEqual(result.id_map[scalar], left.inputs[1]);
+        if (scale_before_add) {
+            try std.testing.expect(result.graph.node(result.param_grads[1]).op == .broadcast_in_dim);
+        } else {
+            try std.testing.expectEqual(result.param_grads[0], result.param_grads[1]);
+        }
+        const scale = result.graph.node(result.param_grads[2]);
+        try std.testing.expect(scale.op == .reduce_sum);
+        try std.testing.expectEqual(@as(?i64, 1), scale.output_shape.numElements());
+    }
 }
 
 test "gradient of fused gelu emits fused backward op" {

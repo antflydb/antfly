@@ -288,6 +288,25 @@ pub fn enterInto(backend: *const @import("../ops/ops.zig").ComputeBackend, progr
     try output.owned.?.begin(request);
 }
 
+/// Wait for a sibling consumer to release the provider before reading a
+/// published result. Callers must hold no model or provider gate.
+pub fn enterPublishedInto(backend: *const @import("../ops/ops.zig").ComputeBackend, control: ?@import("../execution_control.zig").InferenceExecutionControl, output: *Scope) !void {
+    const platform = @import("antfly_platform");
+    while (true) {
+        if (control) |active| try active.check();
+        const token = backend.operationToken();
+        enterInto(backend, null, token, .legacy_unknown_frame, output) catch |err| switch (err) {
+            error.QueueFull => {
+                if (token != null) return err;
+                platform.time.sleepNs(100 * std.time.ns_per_us);
+                continue;
+            },
+            else => return err,
+        };
+        return;
+    }
+}
+
 const std = @import("std");
 
 /// Whole-model/executor numerical callbacks share the same provider protocol

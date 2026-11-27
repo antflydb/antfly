@@ -15,12 +15,12 @@
 
 const std = @import("std");
 const ops = @import("ops.zig");
-const tape = @import("../execution/audio_schedule.zig");
+const Storage = @import("../execution/prepared_tensor_storage.zig").Storage;
 
 /// One immutable coefficient buffer plus indexed model slot identities. No
 /// request allocator, activation, lazy pin, or hash-map entry pointer survives.
 pub const State = struct {
-    owner: tape.Plan = .{ .host_bytes = @sizeOf(State), .metadata_bytes = @sizeOf(State) },
+    owner: Storage = .{ .host_bytes = @sizeOf(State) },
     weights: [170]?ops.CT = @splat(null),
     scalars: [24]f32 = @splat(1),
     slots: [24][11]?usize = @splat(@splat(null)),
@@ -57,13 +57,13 @@ pub const State = struct {
             std.heap.c_allocator.destroy(geometry);
         };
         if (self.owner.drop_ct) |drop| for (self.weights) |ct| if (ct) |value| drop(value);
-        self.owner.dropPrepared();
+        self.owner.deinit();
     }
 };
 
 /// Full rectangular masks only. Padding and holes retain the dynamic path.
 pub const Geometry = struct {
-    owner: tape.Plan = .{ .host_bytes = @sizeOf(Geometry), .metadata_bytes = @sizeOf(Geometry) },
+    owner: Storage = .{ .host_bytes = @sizeOf(Geometry) },
     batch: usize,
     seq: usize,
     window: u32,
@@ -85,7 +85,7 @@ pub const Geometry = struct {
 /// scratch norm, attention residual, FFN residual and alternating hidden rows
 /// each have separate ranges. No projection input aliases its output.
 pub const Workspace = struct {
-    owner: tape.Plan = .{ .host_bytes = @sizeOf(Workspace), .metadata_bytes = @sizeOf(Workspace) },
+    owner: Storage = .{ .host_bytes = @sizeOf(Workspace) },
     spec: ops.EmbeddingWorkspaceSpec,
     projection_rows: usize,
     stamp: u64,
@@ -125,7 +125,7 @@ pub const Template = struct {
 /// Exact masks and positions are immutable while an encoder borrows this entry.
 /// One host allocation and one device allocation own the cached layout.
 pub const CompactGeometry = struct {
-    owner: tape.Plan = .{ .host_bytes = @sizeOf(CompactGeometry), .metadata_bytes = @sizeOf(CompactGeometry) },
+    owner: Storage = .{ .host_bytes = @sizeOf(CompactGeometry) },
     batch: usize,
     sequence: usize,
     window: u32,
@@ -144,13 +144,13 @@ pub const CompactGeometry = struct {
 /// no host upload writes these ranges while either frame is live.
 /// Immutable coefficients are shared by every admitted arena capacity.
 pub const VisionCoefficients = struct {
-    owner: tape.Plan = .{ .host_bytes = @sizeOf(VisionCoefficients), .metadata_bytes = @sizeOf(VisionCoefficients) },
+    owner: Storage = .{ .host_bytes = @sizeOf(VisionCoefficients) },
     views: [96]?ops.CT = @splat(null),
 };
 
 pub const VisionWorkspace = struct {
-    owner: tape.Plan = .{ .host_bytes = @sizeOf(VisionWorkspace), .metadata_bytes = @sizeOf(VisionWorkspace) },
-    spec: ops.EmbeddingVisionSpec,
+    owner: Storage = .{ .host_bytes = @sizeOf(VisionWorkspace) },
+    spec: ops.VisionWorkspaceSpec,
     capacity_rows: usize,
     arena_bytes: usize,
     /// Maximum tile for the currently packed layout, not the initial geometry.
@@ -164,7 +164,7 @@ pub const VisionWorkspace = struct {
 /// Immutable precise-Metal sin/cos table. Cache creation completes on an owned
 /// command before publication, so cancellation cannot publish uninitialized data.
 pub const Rotary = struct {
-    owner: tape.Plan = .{ .host_bytes = @sizeOf(Rotary), .metadata_bytes = @sizeOf(Rotary) },
+    owner: Storage = .{ .host_bytes = @sizeOf(Rotary) },
     spec: ops.EmbeddingRotarySpec,
     stamp: u64,
     views: [1]?ops.CT = @splat(null),

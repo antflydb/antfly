@@ -18,7 +18,7 @@
 const ops = @import("../ops/ops.zig");
 const region = @import("region_route.zig");
 const kernel = @import("kernel_route.zig");
-const buffers = @import("../graph/buffer_plan.zig");
+const buffers = @import("buffer_plan.zig");
 
 pub const max_outputs = 8;
 pub const max_inputs = 32;
@@ -61,8 +61,11 @@ pub const Bound = struct {
         return self.outputs[index].tensor;
     }
     pub fn deinit(self: *Bound) void {
-        for (self.outputs[0..self.output_count], self.owned[0..self.output_count]) |output, owned| if (owned) self.backend.free(output.tensor);
-        if (self.workspace) |workspace| self.backend.free(workspace);
+        self.deinitWithCleanup(.{});
+    }
+    pub fn deinitWithCleanup(self: *Bound, cleanup: @import("cleanup_context.zig").Context) void {
+        for (self.outputs[0..self.output_count], self.owned[0..self.output_count]) |output, owned| if (owned) self.backend.freeWithCleanup(output.tensor, cleanup);
+        if (self.workspace) |workspace| self.backend.freeWithCleanup(workspace, cleanup);
         self.* = undefined;
     }
 };

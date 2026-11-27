@@ -27,13 +27,14 @@ pub const Layout = struct {
     strides: Strides,
     readable_bytes: usize,
 };
-pub const Request = struct { input: Layout, output: Layout };
+pub const Request = struct { input: Layout, output: Layout, byte_offset: usize = 0 };
 pub const Plan = struct {
     node: ml.graph.NodeId,
     source: ml.graph.NodeId,
     input: Shape,
     output: Shape,
-    kind: enum { reshape, full_slice, transpose, broadcast },
+    kind: enum { reshape, full_slice, contiguous_slice, transpose, broadcast },
+    byte_offset: usize = 0,
     axes: [8]u8 = @splat(0),
 
     pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId, backend: contracts.BackendKind) ?Plan {
@@ -41,17 +42,26 @@ pub const Plan = struct {
         if (node.num_inputs != 1 or node.inputs[0] >= graph.nodeCount()) return null;
         const input = graph.node(node.inputs[0]).output_shape;
         const output = node.output_shape;
-        if (input.dtype != .f32 or output.dtype != .f32 or logicalBytes(input) == null or logicalBytes(output) == null) return null;
+        if (input.dtype != output.dtype or logicalBytes(input) == null or logicalBytes(output) == null) return null;
+        if (input.dtype != .f32 and (backend != .native or node.op != .reshape)) return null;
         var result = Plan{ .node = id, .source = node.inputs[0], .input = input, .output = output, .kind = .reshape };
         switch (node.op) {
             .reshape => |attrs| {
                 if (attrs.runtime_shape or !attrs.new_shape.eq(output) or input.numElements() != output.numElements()) return null;
             },
             .slice => |attrs| {
-                if ((backend != .native and backend != .metal) or attrs.runtime_starts or attrs.runtime_limits or attrs.num_axes != input.rank() or !input.eq(output)) return null;
-                const slice = @import("../ops/slice_plan.zig").Plan.init(input.dims[0..input.rank()], attrs.starts[0..attrs.num_axes], attrs.limits[0..attrs.num_axes], attrs.strides[0..attrs.num_axes], input.dims[0..input.rank()]) catch return null;
-                if (slice.base != 0 or slice.count != slice.input_count or !slice.contiguous()) return null;
-                result.kind = .full_slice;
+                if ((backend != .native and backend != .metal and backend != .cuda) or attrs.runtime_starts or attrs.runtime_limits or attrs.num_axes != input.rank() or output.rank() != input.rank()) return null;
+                const dims = output.dims[0..output.rank()];
+                const slice = @import("../ops/slice_plan.zig").Plan.init(input.dims[0..input.rank()], attrs.starts[0..attrs.num_axes], attrs.limits[0..attrs.num_axes], attrs.strides[0..attrs.num_axes], dims) catch return null;
+                if (!slice.contiguous() or !std.mem.eql(i64, slice.shape[0..slice.rank], dims)) return null;
+                if (slice.base == 0 and input.eq(output)) {
+                    if (backend == .cuda) return null;
+                    result.kind = .full_slice;
+                } else if (backend == .metal or backend == .cuda) {
+                    result.kind = .contiguous_slice;
+                    const base = std.math.cast(usize, slice.base) orelse return null;
+                    result.byte_offset = std.math.mul(usize, base, @sizeOf(f32)) catch return null;
+                } else return null;
             },
             .transpose => |attrs| {
                 if (backend != .native or attrs.num_axes != input.rank() or input.rank() != output.rank()) return null;
@@ -88,9 +98,13 @@ pub const Plan = struct {
         const desc = source.descriptor;
         if (source.role != .primary or !desc.shape.eq(self.input) or desc.quant_format != null or desc.attention_storage != null or desc.attention_kv_format != null) return null;
         switch (desc.current_backend orelse return null) {
-            .native => if (desc.storage != .host_f32 and desc.storage != .metadata_view) return null,
-            .cuda => if (desc.storage != .cuda_buffer or self.kind != .reshape) return null,
-            .metal => if (desc.storage != .metal_buffer or (self.kind != .reshape and self.kind != .full_slice)) return null,
+            .native => if (self.input.dtype == .f32) {
+                if (desc.storage != .host_f32 and desc.storage != .metadata_view) return null;
+            } else {
+                if (self.kind != .reshape or self.input.dtype != self.output.dtype or (desc.storage != .host_dense and desc.storage != .metadata_view)) return null;
+            },
+            .cuda => if (desc.storage != .cuda_buffer or (self.kind != .reshape and self.kind != .contiguous_slice)) return null,
+            .metal => if (desc.storage != .metal_buffer or (self.kind != .reshape and self.kind != .full_slice and self.kind != .contiguous_slice)) return null,
             else => return null,
         }
         const input_bytes = logicalBytes(self.input) orelse return null;
@@ -99,7 +113,7 @@ pub const Plan = struct {
         if (source.readable_bytes < read) return null;
         var strides = Strides{ .rank = self.output.rank() };
         switch (self.kind) {
-            .reshape => {
+            .reshape, .contiguous_slice => {
                 if (!dense(self.input, desc.strides)) return null;
                 strides = Strides.dense(self.output);
             },
@@ -115,8 +129,9 @@ pub const Plan = struct {
         // lets existing Into readers consume actual dense aliases directly.
         if (dense(self.output, strides)) strides = Strides.dense(self.output);
         const output_read = readableBytes(self.output, strides) orelse return null;
-        if (output_read > read) return null;
+        if (self.byte_offset > read or output_read > read - self.byte_offset) return null;
         var result = source;
+        result.byte_offset = std.math.add(usize, source.byte_offset, self.byte_offset) catch return null;
         result.descriptor.shape = self.output;
         result.descriptor.strides = strides;
         if (desc.current_backend == .native) result.descriptor.storage = .metadata_view;
@@ -130,10 +145,10 @@ pub const Plan = struct {
 };
 
 pub fn logicalBytes(shape: Shape) ?usize {
-    if (shape.dtype != .f32 or shape.rank() > 8) return null;
+    if ((shape.dtype != .f32 and shape.dtype != .i32 and shape.dtype != .i64) or shape.rank() > 8) return null;
     const count = shape.numElements() orelse return null;
     if (count <= 0) return null;
-    return std.math.mul(usize, @intCast(count), @sizeOf(f32)) catch null;
+    return std.math.mul(usize, @intCast(count), shape.dtype.byteSize()) catch null;
 }
 pub fn readableBytes(shape: Shape, strides: Strides) ?usize {
     if (logicalBytes(shape) == null or strides.rank != shape.rank()) return null;
@@ -143,7 +158,7 @@ pub fn readableBytes(shape: Shape, strides: Strides) ?usize {
         const extent = std.math.mul(usize, @intCast(dimension - 1), @intCast(stride)) catch return null;
         last = std.math.add(usize, last, extent) catch return null;
     }
-    return std.math.mul(usize, std.math.add(usize, last, 1) catch return null, @sizeOf(f32)) catch null;
+    return std.math.mul(usize, std.math.add(usize, last, 1) catch return null, shape.dtype.byteSize()) catch null;
 }
 pub fn dense(shape: Shape, strides: Strides) bool {
     if (logicalBytes(shape) == null or strides.rank != shape.rank()) return false;
@@ -154,7 +169,7 @@ pub fn dense(shape: Shape, strides: Strides) bool {
     return true;
 }
 pub fn request(input: ownership.Plane, output: ownership.Plane) Request {
-    return .{ .input = .{ .shape = input.descriptor.shape, .strides = input.descriptor.strides, .readable_bytes = readableBytes(input.descriptor.shape, input.descriptor.strides) orelse 0 }, .output = .{ .shape = output.descriptor.shape, .strides = output.descriptor.strides, .readable_bytes = output.readable_bytes } };
+    return .{ .byte_offset = std.math.sub(usize, output.byte_offset, input.byte_offset) catch std.math.maxInt(usize), .input = .{ .shape = input.descriptor.shape, .strides = input.descriptor.strides, .readable_bytes = readableBytes(input.descriptor.shape, input.descriptor.strides) orelse 0 }, .output = .{ .shape = output.descriptor.shape, .strides = output.descriptor.strides, .readable_bytes = output.readable_bytes } };
 }
 
 test "affine facts separate logical bytes from initialized broadcast footprint" {
@@ -211,11 +226,26 @@ test "affine lowering declines inconsistent static target attributes" {
 /// never becomes initialized data or a writable alias capability.
 pub fn fullSpanRequest(value: *const Request, actual_shape: []const i64, available_bytes: usize) bool {
     const bytes = logicalBytes(value.input.shape) orelse return false;
-    return value.input.shape.rank() == actual_shape.len and std.mem.eql(i64, value.input.shape.dims[0..value.input.shape.rank()], actual_shape) and logicalBytes(value.output.shape) == bytes and value.input.readable_bytes == bytes and value.output.readable_bytes == bytes and bytes <= available_bytes and dense(value.input.shape, value.input.strides) and dense(value.output.shape, value.output.strides);
+    if (value.input.shape.dtype != value.output.shape.dtype) return false;
+    return value.byte_offset == 0 and value.input.shape.rank() == actual_shape.len and std.mem.eql(i64, value.input.shape.dims[0..value.input.shape.rank()], actual_shape) and logicalBytes(value.output.shape) == bytes and value.input.readable_bytes == bytes and value.output.readable_bytes == bytes and bytes <= available_bytes and dense(value.input.shape, value.input.strides) and dense(value.output.shape, value.output.strides);
 }
+/// Validate a dense view against the size of its immediate source, never
+/// against the larger physical bank or the allocation's padded capacity.
+pub fn contiguousRange(value: *const Request, actual_shape: []const i64, available_bytes: usize) ?usize {
+    const input_bytes = logicalBytes(value.input.shape) orelse return null;
+    const output_bytes = logicalBytes(value.output.shape) orelse return null;
+    if (!std.mem.eql(i64, actual_shape, value.input.shape.dims[0..value.input.shape.rank()]) or
+        !dense(value.input.shape, value.input.strides) or !dense(value.output.shape, value.output.strides) or
+        value.input.readable_bytes != input_bytes or value.output.readable_bytes != output_bytes or
+        value.input.shape.dtype != value.output.shape.dtype or input_bytes != available_bytes or
+        value.byte_offset % value.input.shape.dtype.byteSize() != 0 or
+        value.byte_offset > input_bytes or output_bytes > input_bytes - value.byte_offset) return null;
+    return output_bytes;
+}
+
 /// Follow the existing planner's alias/root lifetime, never inventing a new
 /// root or recoloring a live source. External inputs/constants remain opaque.
-pub fn fullSpanRoot(plan: *const @import("../graph/buffer_plan.zig").BufferPlan, node: ml.graph.NodeId, backend: contracts.BackendKind) ?@import("../graph/buffer_plan.zig").LogicalSlot {
+pub fn fullSpanRoot(plan: *const @import("buffer_plan.zig").BufferPlan, node: ml.graph.NodeId, backend: contracts.BackendKind) ?@import("buffer_plan.zig").LogicalSlot {
     var current = (plan.slotForNode(node) orelse return null).*;
     var depth: usize = 0;
     while (current.kind == .view) : (depth += 1) {
@@ -243,6 +273,10 @@ test "GPU full span alias metadata preserves source offsets and rejects padded o
         try std.testing.expect(fullSpanRequest(&exact, &.{ 2, 3 }, 512));
         exact.output.readable_bytes = 28;
         try std.testing.expect(!fullSpanRequest(&exact, &.{ 2, 3 }, 512));
+        exact = request(source, alias);
+        exact.output.shape = Shape.init(.i32, &.{6});
+        try std.testing.expect(!fullSpanRequest(&exact, &.{ 2, 3 }, 24));
+        try std.testing.expect(contiguousRange(&exact, &.{ 2, 3 }, 24) == null);
         exact = request(source, alias);
         exact.output.strides = Strides.init(&.{2});
         try std.testing.expect(!fullSpanRequest(&exact, &.{ 2, 3 }, 512));

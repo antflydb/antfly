@@ -338,6 +338,83 @@ test "transcription CLI explicitly selects CUDA without CPU fallback" {
     try std.testing.expectEqualSlices(backends.BackendType, &.{.cuda}, manager.preferred_backends);
 }
 
+test "Whisper Small Metal checkpoint runs assigned packed prefill" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const model_dir = std.c.getenv("ANTFLY_WHISPER_METAL_MODEL_DIR") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var sessions = backends.SessionManager.initWithIo(a, std.testing.io);
+    sessions.native_call_policy = .in_process;
+    sessions.process_termination_available = false;
+    configureBackendPreference(&sessions, .metal);
+    var manager = model_manager_mod.ModelManager.init(a, sessions);
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    const model = try manager.loadFromDir(std.mem.span(model_dir));
+    try std.testing.expectEqual(backends.BackendType.metal, model.session.backend());
+    const cfg = session_factory.getWhisperConfig(model.session) orelse return error.InvalidModelForTranscription;
+    const hidden = try a.alloc(f32, 8 * cfg.d_model);
+    defer a.free(hidden);
+    for (hidden, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index % 17)) / 64;
+    const Adapter = @import("execution/architecture_session.zig").IncrementalDecoderAdapter;
+    const control = @import("execution_control.zig").InferenceExecutionControl{ .io = std.testing.io, .native_call_policy = .in_process };
+    const tokens = [_]i64{ cfg.decoder_start_token_id, 50259, 50359, 50363 };
+    {
+        const frames = 16;
+        const mel = try a.alloc(f32, cfg.num_mel_bins * frames);
+        defer a.free(mel);
+        @memset(mel, 0);
+        var features = try backends.Tensor.initFloat32(a, "input_features", &.{ 1, @intCast(cfg.num_mel_bins), frames }, mel);
+        defer features.deinit();
+        var outputs = (try model.session.runResident(&.{features}, a)) orelse return error.MissingWhisperEncoderOutput;
+        defer outputs.deinit();
+        const receiver = Adapter.qualify(model.session, model.session) orelse return error.MissingWhisperReceiver;
+        const shape = try outputs.backend.tensorShape(outputs.outputs[0], a);
+        defer a.free(shape);
+        try std.testing.expectEqual(@as(usize, 3), shape.len);
+        var request = std.heap.ArenaAllocator.init(a);
+        defer request.deinit();
+        const task_allocator = request.allocator();
+        var decoder = try Adapter.fromResidentPrepared(model.session, task_allocator, control, .{
+            .receiver = receiver,
+            .value = outputs.outputs[0],
+            .backend = outputs.backend,
+            .shape = .{ shape[0], shape[1], shape[2] },
+            .resources = try outputs.retainResources(a),
+        }, .{ .expected_initial_query_rows = tokens.len });
+        defer decoder.deinit();
+        const program = decoder.cache.native_program orelse return error.MissingPreparedWhisperSchedule;
+        const initial = program.initial orelse return error.MissingPreparedWhisperInitialSchedule;
+        try std.testing.expectEqual(cfg.decoder_layers, initial.schedule.selected.pool.regions.len);
+        for (initial.schedule.selected.pool.regions) |region| try std.testing.expect(region.owner.requirements.dispatch_workspace.byte_size != 0);
+        const logits = try decoder.step(&tokens);
+        defer task_allocator.free(logits);
+        try std.testing.expectEqual(cfg.vocab_size, logits.len);
+        try std.testing.expectEqual(initial.schedule.steps.len, initial.schedule.cursor);
+    }
+    const expected = blk: {
+        var ordinary = (try Adapter.fromHostPrepared(model.session, a, control, hidden, 8, .{})) orelse return error.MissingWhisperDecoder;
+        defer ordinary.deinit();
+        break :blk try ordinary.step(&tokens);
+    };
+    defer a.free(expected);
+    for (0..3) |_| {
+        var decoder = (try Adapter.fromHostPrepared(model.session, a, control, hidden, 8, .{ .expected_initial_query_rows = tokens.len })) orelse return error.MissingWhisperDecoder;
+        defer decoder.deinit();
+        const program = decoder.cache.native_program orelse return error.MissingPreparedWhisperSchedule;
+        const initial = program.initial orelse return error.MissingPreparedWhisperInitialSchedule;
+        var packed_regions: usize = 0;
+        for (initial.schedule.selected.pool.regions) |region| {
+            if (region.owner.requirements.dispatch_workspace.byte_size != 0) packed_regions += 1;
+        }
+        try std.testing.expectEqual(cfg.decoder_layers, packed_regions);
+        const actual = try decoder.step(&tokens);
+        defer a.free(actual);
+        try std.testing.expectEqual(expected.len, actual.len);
+        for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.01);
+        try std.testing.expectEqual(initial.schedule.steps.len, initial.schedule.cursor);
+    }
+}
+
 test "Whisper CUDA checkpoint transcribes English with reusable model state" {
     if (comptime !build_options.enable_cuda) return error.SkipZigTest;
     const model_dir = std.c.getenv("ANTFLY_WHISPER_CUDA_MODEL_DIR") orelse return error.SkipZigTest;
@@ -352,6 +429,32 @@ test "Whisper CUDA checkpoint transcribes English with reusable model state" {
     const model = try manager.loadFromDir(std.mem.span(model_dir));
     try std.testing.expectEqual(backends.BackendType.cuda, model.session.backend());
     const cfg = session_factory.getWhisperConfig(model.session).?;
+    {
+        const whisper = @import("architectures/whisper.zig");
+        const hidden = try a.alloc(f32, 2 * cfg.d_model);
+        defer a.free(hidden);
+        @memset(hidden, 0);
+        var decoder = (try session_factory.whisperNativeDecoder(model.session, a, .{ .io = std.testing.io, .native_call_policy = .in_process }, hidden, 2)) orelse return error.TestUnexpectedResult;
+        defer decoder.deinit();
+        var backend = decoder.cb.backend;
+        var prepared = try whisper.PreparedDecoderWeights.init(&backend, a, cfg, true);
+        defer prepared.deinit();
+        const CancelBetweenLayers = struct {
+            fn check(raw: ?*anyopaque) !void {
+                const count: *usize = @ptrCast(@alignCast(raw.?));
+                count.* += 1;
+                if (count.* == 3) return error.Cancelled;
+            }
+        };
+        var count: usize = 0;
+        backend.execution_control = .{ .ptr = &count, .check_fn = CancelBetweenLayers.check, .native_call_policy = .in_process };
+        try std.testing.expectError(error.Cancelled, whisper.DecodeCache.initPrepared(&backend, a, cfg, decoder.encoder_hidden, 2, &prepared, null));
+        try std.testing.expectEqual(cfg.decoder_layers, prepared.weights.layers.len);
+        backend.execution_control = null;
+        var retry = try whisper.DecodeCache.initPrepared(&backend, a, cfg, decoder.encoder_hidden, 2, &prepared, null);
+        defer retry.deinit(&backend);
+        try std.testing.expectEqual(cfg.decoder_layers, retry.layers.len);
+    }
     const prompt = &model.whisper_prompt_cache.?;
     var scratch: [3]whisper_prompt.ForcedDecoderId = undefined;
     const forced = try prompt.resolve(&scratch, "en");

@@ -603,11 +603,9 @@ pub fn forwardCtProfiled(
     if (cb.kind() == .metal and config.metal_require_f32_weight_mirrors and !resident_slots)
         return error.RequiredDebertaF32MirrorsUnavailable;
 
-    var encoder_frame_active = false;
-    if (cb.kind() == .metal and metalEncoderFrameEnabled() and !cb.decoderRuntimeHasActiveFrame()) {
-        encoder_frame_active = try cb.decoderRuntimeBeginFrame();
-    }
-    errdefer if (encoder_frame_active) cb.decoderRuntimeCancelFrame() catch {};
+    const Submission = @import("../execution/submission.zig").Scope;
+    var frame = try Submission.beginIfNeeded(cb, cb.kind() == .metal and metalEncoderFrameEnabled());
+    errdefer frame.deinit();
 
     var timer = profileStart(profile);
     var hidden = try embeddings(cb, allocator, config, input_ids, attention_mask, total, H);
@@ -629,21 +627,17 @@ pub fn forwardCtProfiled(
         hidden = new_hidden;
         if (profile) |p| p.layer_total_ns += profileElapsed(timer);
         pending_work += layer_work;
-        if (cb.execution_control != null and encoder_frame_active and
+        if (cb.execution_control != null and frame.owns and
             pending_work >= cancellation_frame_work and layer + 1 < config.num_hidden_layers)
         {
             pending_work = 0;
-            try cb.decoderRuntimeSubmitAndWaitFrame();
-            encoder_frame_active = false;
+            try frame.finish();
             try cb.checkExecutionControl();
-            encoder_frame_active = try cb.decoderRuntimeBeginFrame();
+            frame = try Submission.begin(cb);
         }
     }
     // No post-encoder LayerNorm in DeBERTa-v3 (encoder.LayerNorm is norm_rel_ebd).
-    if (encoder_frame_active) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        encoder_frame_active = false;
-    }
+    try frame.finish();
     try cb.checkExecutionControl();
     return hidden;
 }
@@ -829,7 +823,8 @@ fn buildRelativePositionEmbInfo(
     seq_len: usize,
 ) !RelativePositionEmb {
     const num_rel = 2 * seq_len - 1;
-    const compact_relative = (cb.kind() == .metal and uniqueRelativePositionProjectionEnabled()) or
+    const compact_relative = cb.compactDebertaRelativeProjectionEnabled(seq_len) or
+        (cb.kind() == .metal and uniqueRelativePositionProjectionEnabled()) or
         (cb.kind() == .native and num_rel > config.max_position_embeddings);
     return buildRelativePositionEmbInfoWithLayout(cb, allocator, config, seq_len, compact_relative);
 }
@@ -840,6 +835,26 @@ fn buildRelativePositionEmbInfoWithLayout(
     config: Config,
     seq_len: usize,
     compact_relative: bool,
+) !RelativePositionEmb {
+    // Explicit BF16 CUDA sessions use tensor-core GEMMs. Pad only the compact
+    // table's unreferenced tail; bucket IDs still address exactly the same rows.
+    const alignment: usize = blk: {
+        if (cb.kind() != .cuda) break :blk 1;
+        const query = try cb.getWeight("encoder.layer.0.attention.self.query_proj.weight");
+        defer cb.free(query);
+        break :blk if ((try cb.tensorDType(query)) == .bf16) 8 else 1;
+    };
+
+    return buildRelativePositionEmbInfoAligned(cb, allocator, config, seq_len, compact_relative, alignment);
+}
+
+fn buildRelativePositionEmbInfoAligned(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    seq_len: usize,
+    compact_relative: bool,
+    alignment: usize,
 ) !RelativePositionEmb {
     const H = config.hidden_size;
     const num_buckets = config.position_buckets;
@@ -880,7 +895,7 @@ fn buildRelativePositionEmbInfoWithLayout(
 
     const full_to_unique = try allocator.alloc(i64, num_rel);
     errdefer allocator.free(full_to_unique);
-    const unique_bucket_ids = try allocator.alloc(i64, num_rel);
+    const unique_bucket_ids = try allocator.alloc(i64, std.mem.alignForward(usize, num_rel, alignment));
     defer allocator.free(unique_bucket_ids);
     const bucket_to_unique = try allocator.alloc(i64, max_pos);
     defer allocator.free(bucket_to_unique);
@@ -899,7 +914,7 @@ fn buildRelativePositionEmbInfoWithLayout(
         full_to_unique[i] = bucket_to_unique[bucket];
     }
 
-    if (unique_count == num_rel) {
+    if (unique_count == num_rel and alignment == 1) {
         const gathered = try normalizedRelativeEmbeddingLookup(cb, allocator, rel_weight, ln_w, ln_b, bucket_ids, H, config.layer_norm_eps);
         // Keep the error cleanup's ownership until the last fallible operation.
         allocator.free(full_to_unique);
@@ -911,10 +926,12 @@ fn buildRelativePositionEmbInfoWithLayout(
         };
     }
 
+    const padded_count = std.mem.alignForward(usize, unique_count, alignment);
+    @memset(unique_bucket_ids[unique_count..padded_count], unique_bucket_ids[0]);
     return .{
-        .embeddings = try normalizedRelativeEmbeddingLookup(cb, allocator, rel_weight, ln_w, ln_b, unique_bucket_ids[0..unique_count], H, config.layer_norm_eps),
+        .embeddings = try normalizedRelativeEmbeddingLookup(cb, allocator, rel_weight, ln_w, ln_b, unique_bucket_ids[0..padded_count], H, config.layer_norm_eps),
         .full_to_unique = full_to_unique,
-        .unique_count = unique_count,
+        .unique_count = padded_count,
         .full_count = num_rel,
     };
 }
@@ -1046,6 +1063,8 @@ fn encoderLayer(
         const V = try linearReplicatedToMaybeSharded(cb, hidden, v_w, v_b, total, H, H);
         break :blk ops.LinearTripleResult{ .first = Q, .second = K, .third = V };
     } else blk: {
+        if (try cb.debertaBf16Projections(&.{ .input = hidden, .weights = .{ q_w, k_w, v_w }, .biases = .{ q_b, k_b, v_b }, .count = 3, .rows = total, .hidden = H, .batch = batch, .sequence = seq_len })) |projected|
+            break :blk ops.LinearTripleResult{ .first = projected[0].?, .second = projected[1].?, .third = projected[2].? };
         if (slot_ops) {
             if (try cb.decoderRuntimeApplyLinearQkv(&.{
                 .q_slot = debertaLinearSlot(layer, .q),
@@ -1085,6 +1104,8 @@ fn encoderLayer(
         const K_r = try linearReplicatedToMaybeSharded(cb, rel_emb.embeddings, k_w, k_b, rel_emb.unique_count, H, H);
         break :blk ops.LinearPairResult{ .first = Q_r, .second = K_r };
     } else blk: {
+        if (try cb.debertaBf16Projections(&.{ .input = rel_emb.embeddings, .relative_policy = .{ .layout = .unique_padded_v1, .normalization_eps = eps, .position_buckets = config.position_buckets, .max_position = config.max_position_embeddings }, .weights = .{ q_w, k_w, q_w }, .biases = .{ q_b, k_b, q_b }, .count = 2, .rows = rel_emb.unique_count, .hidden = H, .batch = batch, .sequence = seq_len })) |projected|
+            break :blk ops.LinearPairResult{ .first = projected[0].?, .second = projected[1].? };
         if (slot_ops) {
             // share_att_key: the relative projections reuse the content q/k
             // slots, so the prepared mirrors serve both GEMMs.
@@ -1106,19 +1127,34 @@ fn encoderLayer(
     var relative_live = true;
     defer if (relative_live) cb.free(Q_r);
     defer if (relative_live) cb.free(K_r);
+    var compact_attention: ?CT = null;
     if (rel_emb.full_to_unique) |ids| {
-        const Q_expanded = try cb.embeddingLookup(Q_r, ids, num_rel, H);
-        errdefer cb.free(Q_expanded);
-        const K_expanded = try cb.embeddingLookup(K_r, ids, num_rel, H);
-        cb.free(Q_r);
-        cb.free(K_r);
-        Q_r = Q_expanded;
-        K_r = K_expanded;
+        const projection_ns = profileElapsed(timer);
+        const attention_started = profileStart(profile);
+        compact_attention = try cb.disentangledRelativeAttentionCompact(Q, K, V, Q_r, K_r, ids, attention_mask, batch, seq_len, local_num_heads, head_dim);
+        if (compact_attention != null) {
+            if (profile) |p| {
+                p.relative_qk_ns += projection_ns;
+                p.attention_ns += profileElapsed(attention_started);
+            }
+            // The optional callback executes attention before the legacy
+            // expansion point; keep that work out of relative-projection time.
+            timer = 0;
+        }
+        if (compact_attention == null) {
+            const Q_expanded = try cb.embeddingLookup(Q_r, ids, num_rel, H);
+            errdefer cb.free(Q_expanded);
+            const K_expanded = try cb.embeddingLookup(K_r, ids, num_rel, H);
+            cb.free(Q_r);
+            cb.free(K_r);
+            Q_r = Q_expanded;
+            K_r = K_expanded;
+        }
     }
     if (profile) |p| p.relative_qk_ns += profileElapsed(timer);
 
     timer = profileStart(profile);
-    const attn_out = try cb.disentangledRelativeAttention(Q, K, V, Q_r, K_r, attention_mask, batch, seq_len, local_num_heads, head_dim);
+    const attn_out = compact_attention orelse try cb.disentangledRelativeAttention(Q, K, V, Q_r, K_r, attention_mask, batch, seq_len, local_num_heads, head_dim);
     var attention_live = true;
     defer if (attention_live) cb.free(attn_out);
     // Native execution is synchronous. Its projection buffers are dead here;
@@ -1454,6 +1490,23 @@ test "DeBERTa native bucketed relative projections preserve values and clean up 
         const short = try buildRelativePositionEmbInfo(&cb, a, config, 7);
         defer cb.free(short.embeddings);
         try std.testing.expect(short.full_to_unique == null);
+        // Exercise the BF16 table geometry on CPU independently of CUDA.
+        // Its padded duplicate row must never change gathered projections.
+        const padded = try buildRelativePositionEmbInfoAligned(&cb, a, config, 7, true, 8);
+        defer cb.free(padded.embeddings);
+        defer a.free(padded.full_to_unique.?);
+        try std.testing.expectEqual(@as(usize, 16), padded.unique_count);
+        const padded_projected = try cb.linear(padded.embeddings, weight, bias, padded.unique_count, 4, 4);
+        defer cb.free(padded_projected);
+        const padded_expanded = try cb.embeddingLookup(padded_projected, padded.full_to_unique.?, padded.full_count, 4);
+        defer cb.free(padded_expanded);
+        const short_projected = try cb.linear(short.embeddings, weight, bias, short.unique_count, 4, 4);
+        defer cb.free(short_projected);
+        const short_values = try cb.toFloat32(short_projected, a);
+        defer a.free(short_values);
+        const padded_values = try cb.toFloat32(padded_expanded, a);
+        defer a.free(padded_values);
+        for (short_values, padded_values) |left, right| try std.testing.expectApproxEqAbs(left, right, 1e-5);
     }
     const Check = struct {
         fn run(allocator: std.mem.Allocator, weights: *native.WeightStore, cfg: Config) !void {

@@ -17,6 +17,7 @@
 //! compiled graph an error, rather than reporting native fallback as PJRT.
 const std = @import("std");
 const inference = @import("inference_internal");
+const decoder_storage = inference.execution.decoder_storage;
 const factory = inference.architectures.session_factory;
 const generation = inference.pipelines.generation;
 
@@ -46,9 +47,9 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
             else => return error.GenerationBackendSelectionMismatch,
         };
         const dtype = factory.recommendedKvDTypeForSession(model.session, kind);
-        var pool_config = generation.kvPoolConfig(kind, dtype, config, false);
+        var pool_config = decoder_storage.poolPlan(kind, dtype, &config, .{});
         if (resident_metal) pool_config.store_cpu_bytes = false;
-        const pool_id = try kv.addPool(generation.requestKvManagerPoolConfig(pool_config));
+        const pool_id = try kv.addPool(decoder_storage.requestMetadataPool(pool_config));
         storage = try inference.runtime.kv.storage_runtime.KvStorageRuntime.init(a, pool_config);
         try cb.provisionKvDeviceWriteHook(&storage.?);
         request_pool = pool_id;
@@ -113,6 +114,7 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
     var counts: [2]usize = @splat(0);
     var cold: [2]u64 = @splat(0);
     const requests = try std.math.mul(usize, try std.math.add(usize, options.warmup, options.iterations), if (comparison) @as(usize, 2) else 1);
+    const cuda_profile = model.session.backend() == .cuda and factory.cudaOpProfileLoggingEnabled();
     const cuda_before = factory.getCudaRuntimeStats(model.session);
     var cuda_before_measured: @TypeOf(cuda_before) = null;
     // Cooperative stepping keeps two warmed providers resident while a
@@ -150,6 +152,9 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
             break :request try pipeline.generate(&messages, .{ .max_tokens = @intCast(options.generate_tokens), .temperature = 0, .enable_thinking = false, .prefill_chunk_size = options.generate_prefill_chunk_rows });
         };
         const elapsed = inference.platform.time.awakeNs(init.io) - start;
+        // Retire the opt-in operation events outside request timing, so the
+        // warmup snapshot excludes warmup events and each request frees slots.
+        if (cuda_profile) factory.drainCudaProfile(model.session);
         if (comparison) {
             const observed = Execution{ .cached = pipeline.pjrt_decoder_cache_used, .resident_prefill_steps = pipeline.resident_prefill_steps, .resident_prefill_head_skips = pipeline.resident_prefill_head_skips };
             if (mode == 1 and !observed.cached) {

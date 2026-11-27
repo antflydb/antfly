@@ -105,13 +105,19 @@ def main():
             source = cuda / "prototypes" / producer
             if source.suffix == ".cu":
                 spec = profiles[0]
+                flags = spec["nvcc_flags"]
+                arch_flags = (
+                    []
+                    if any(flag.startswith("-arch=") for flag in flags)
+                    else ["-arch=compute_" + str(spec["target"])]
+                )
                 subprocess.run(
                     [
                         args.nvcc,
                         "--ptx",
-                        "-arch=compute_" + str(spec["target"]),
+                        *arch_flags,
                         "-O3",
-                        *spec["nvcc_flags"],
+                        *flags,
                         str(source),
                         "-o",
                         str(output / spec["file"]),

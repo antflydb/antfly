@@ -31,12 +31,14 @@ const Direct = struct {
     support: Support,
     immutable_resources: bool,
     runtime_inputs: bool = false,
+    host_gather: bool,
     workspace: ops.kernel_descriptor.WorkspaceRequirement,
     auxiliaries: ops.kernel_descriptor.AuxiliaryRequirements,
 
     fn matches(raw: *anyopaque, request: route.Validate) bool {
         const self: *Direct = @ptrCast(@alignCast(raw));
         if (!self.support(self.backend.ptr, &self.descriptor) or request.output.epoch != self.slot.epoch or request.output.node != self.slot.node or request.output.allocation != self.slot.allocation or !shapeEqual(request.output.logical, self.descriptor.output_shape) or request.inputs.len != self.descriptor.input_count) return false;
+        if (self.host_gather and !hostGatherIndex(self.backend, request.inputs[1])) return false;
         for (request.inputs, 0..) |input, index| if (!(self.runtime_inputs and input == .unknown) and !bindingDense(self.backend, input, self.descriptor.input_shapes[index])) return false;
         // Canonical prepareImmutable callers attest descriptor-only resource
         // recipes. Keep support policy, current slots and every input checked
@@ -57,7 +59,12 @@ const Direct = struct {
         const self: *Direct = @ptrCast(@alignCast(raw));
         self.allocator.destroy(self);
     }
+    fn gatherConstraint(raw: *anyopaque, input: usize) ?@import("host_ingress.zig").IndexBounds {
+        const self: *const Direct = @ptrCast(@alignCast(raw));
+        return if (input == 1) .{ .extent = self.descriptor.operation.gather.geometry.extent } else null;
+    }
     const vtable = route.Owned.VTable{ .matches = matches, .validate = validate, .deinit = deinit };
+    const gather_vtable = route.Owned.VTable{ .matches = matches, .validate = validate, .deinit = deinit, .host_input_constraint = gatherConstraint };
 };
 fn shapeEqual(a: ml.graph.Shape, b: ml.graph.Shape) bool {
     return a.dtype == b.dtype and a.rank() == b.rank() and std.mem.eql(i64, a.dims[0..a.rank()], b.dims[0..b.rank()]);
@@ -98,7 +105,7 @@ fn planesDense(backend: ops.ComputeBackend, logical: ml.graph.Shape, planes: []c
 pub fn bindingDense(backend: ops.ComputeBackend, binding: route.Binding, expected: ml.graph.Shape) bool {
     return switch (binding) {
         .imported_host => |host| host.target == backend.kind() and shapeEqual(host.logical, expected),
-        .imported_device => |device| backend.kind() == .cuda and device.implementation.context == backend.ptr and device.implementation.table == @as(*const anyopaque, @ptrCast(backend.vtable)) and (expected.dtype == .f32 or expected.dtype == .i32 or expected.dtype == .i64) and shapeEqual(device.logical, expected),
+        .imported_device => |device| (backend.kind() == .cuda or (backend.kind() == .metal)) and device.implementation.context == backend.ptr and device.implementation.table == @as(*const anyopaque, @ptrCast(backend.vtable)) and (expected.dtype == .f32 or expected.dtype == .i32 or expected.dtype == .i64) and shapeEqual(device.logical, expected),
         .planned => |planned| planesDense(backend, planned.logical, planned.planes, expected),
         .resident => |resident| resident.implementation.context == backend.ptr and resident.implementation.table == @as(*const anyopaque, @ptrCast(backend.vtable)) and planesDense(backend, resident.logical, resident.planes, expected),
         .tensor => |known| actualDense(backend, known, expected),
@@ -131,14 +138,14 @@ fn actualDense(backend: ops.ComputeBackend, known: anytype, expected: ml.graph.S
 }
 
 pub fn prepare(backend: ops.ComputeBackend, request: route.Prepare, support: Support) !?route.Owned {
-    return prepareImpl(backend, request, support, false, false);
+    return prepareImpl(backend, request, support, false, false, false);
 }
 
 /// Only canonical backends with descriptor-only resource callbacks call this.
 /// Current support policy and model Tensor operands still require validation.
 /// Runtime input equivalence remains mandatory for either validation scope.
 pub fn prepareImmutable(backend: ops.ComputeBackend, request: route.Prepare, support: Support) !?route.Owned {
-    return prepareImpl(backend, request, support, true, false);
+    return prepareImpl(backend, request, support, true, false, false);
 }
 
 /// An explicit target family may guarantee an assigned dense output while
@@ -146,10 +153,21 @@ pub fn prepareImmutable(backend: ops.ComputeBackend, request: route.Prepare, sup
 /// representation or admission proof and always retains invocation validation.
 /// The target must reject malformed current CTs before submitting any work.
 pub fn prepareWithRuntimeInputs(backend: ops.ComputeBackend, request: route.Prepare, support: Support) !?route.Owned {
-    return prepareImpl(backend, request, support, false, true);
+    return prepareImpl(backend, request, support, false, true, false);
 }
 
-fn prepareImpl(backend: ops.ComputeBackend, request: route.Prepare, support: Support, immutable_program: bool, runtime_inputs: bool) !?route.Owned {
+fn hostGatherIndex(backend: ops.ComputeBackend, binding: route.Binding) bool {
+    if (binding == .imported_device) return backend.kind() == .metal and bindingDense(backend, binding, binding.imported_device.logical);
+
+    return binding == .imported_host and binding.imported_host.target == backend.kind() and binding.imported_host.owned_ingress;
+}
+
+pub fn prepareHostGather(backend: ops.ComputeBackend, request: route.Prepare, support: Support) !?route.Owned {
+    if (request.descriptor.operation != .gather or request.inputs.len != 2 or !hostGatherIndex(backend, request.inputs[1])) return null;
+    return prepareImpl(backend, request, support, false, false, true);
+}
+
+fn prepareImpl(backend: ops.ComputeBackend, request: route.Prepare, support: Support, immutable_program: bool, runtime_inputs: bool, host_gather: bool) !?route.Owned {
     if (request.descriptor.elements() == 0) return null;
     const implementation = request.implementation orelse return null;
     if (implementation.context != backend.ptr or implementation.table != @as(*const anyopaque, @ptrCast(backend.vtable))) return null;
@@ -166,12 +184,12 @@ fn prepareImpl(backend: ops.ComputeBackend, request: route.Prepare, support: Sup
         if (index >= request.inputs_witnessed.len or !request.inputs_witnessed[index] or input == .tensor) stable = false;
     }
     const owner = try request.allocator.create(Direct);
-    owner.* = .{ .allocator = request.allocator, .backend = backend.withoutSynchronousBorrows(), .descriptor = request.descriptor.*, .slot = request.output, .support = support, .immutable_resources = immutable_program, .runtime_inputs = runtime_inputs, .workspace = workspace, .auxiliaries = auxiliaries };
-    return .{ .validation_scope = if (stable) .prepared_program else .invocation, .context = owner, .implementation = .{ .context = backend.ptr, .table = backend.vtable }, .key = @intCast(request.output.node), .requirements = .{ .primary_alignment = request.descriptor.alignment, .primary_bytes = primary_bytes, .profile = @intCast(@backingInt(std.meta.activeTag(request.descriptor.operation))), .workspace = workspace, .auxiliaries = auxiliaries, .capture = if (functions.physicalReplayKernelSupported) |query| (if (query(backend.ptr, request.descriptor)) .supported else .unsupported) else .unsupported }, .vtable = &Direct.vtable };
+    owner.* = .{ .allocator = request.allocator, .backend = backend.withoutSynchronousBorrows(), .descriptor = request.descriptor.*, .slot = request.output, .support = support, .immutable_resources = immutable_program, .runtime_inputs = runtime_inputs, .host_gather = host_gather, .workspace = workspace, .auxiliaries = auxiliaries };
+    return .{ .validation_scope = if (stable) .prepared_program else .invocation, .context = owner, .implementation = .{ .context = backend.ptr, .table = backend.vtable }, .key = @intCast(request.output.node), .requirements = .{ .primary_alignment = request.descriptor.alignment, .primary_bytes = primary_bytes, .profile = @intCast(@backingInt(std.meta.activeTag(request.descriptor.operation))), .workspace = workspace, .auxiliaries = auxiliaries, .capture = if (functions.physicalReplayKernelSupported) |query| (if (query(backend.ptr, request.descriptor)) .supported else .unsupported) else .unsupported }, .vtable = if (host_gather) &Direct.gather_vtable else &Direct.vtable };
 }
 
 pub fn isDirect(selected: *const route.Owned) bool {
-    return selected.vtable == &Direct.vtable;
+    return selected.vtable == &Direct.vtable or selected.vtable == &Direct.gather_vtable;
 }
 
 test "direct program validation stays dynamic by default and for model tensor operands" {

@@ -21,7 +21,8 @@ Usage:
 
 The generated two-level table stores four 2-bit classes per byte and
 deduplicates identical 256-codepoint pages. Unicode 16 occupies about 16 KiB
-of data instead of a 272 KiB flat table.
+of data instead of a 272 KiB flat table. Sparse overrides distinguish
+upper/lowercase letters and marks for cased ByteLevel expressions.
 """
 
 from __future__ import annotations
@@ -49,10 +50,12 @@ WHITESPACE = 2
 OTHER = 3
 
 
-def parse_unicode_data(path: pathlib.Path) -> bytearray:
+def parse_unicode_data(path: pathlib.Path) -> tuple[bytearray, bytearray]:
     classes = bytearray([OTHER]) * CODEPOINT_COUNT
+    cased = bytearray(CODEPOINT_COUNT)
     range_start: int | None = None
     range_class = OTHER
+    range_case = 0
 
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         fields = raw_line.split(";")
@@ -67,22 +70,34 @@ def parse_unicode_data(path: pathlib.Path) -> bytearray:
             else OTHER
         )
 
+        letter_case = (
+            1 if category == "Ll" else
+            2 if category in ("Lu", "Lt") else
+            3 if category.startswith("M") else
+            0
+        )
+
         if name.endswith(", First>"):
             range_start = codepoint
             range_class = char_class
+            range_case = letter_case
         elif name.endswith(", Last>"):
             if range_start is None:
                 raise ValueError(f"range end without start at U+{codepoint:04X}")
             classes[range_start : codepoint + 1] = bytes([range_class]) * (
                 codepoint + 1 - range_start
             )
+            cased[range_start : codepoint + 1] = bytes([range_case]) * (
+                codepoint + 1 - range_start
+            )
             range_start = None
         else:
             classes[codepoint] = char_class
+            cased[codepoint] = letter_case
 
     if range_start is not None:
         raise ValueError("unterminated UnicodeData range")
-    return classes
+    return classes, cased
 
 
 def apply_whitespace(classes: bytearray, path: pathlib.Path) -> None:
@@ -132,7 +147,24 @@ def format_values(values: list[int] | bytes, width: int, indent: str = "    ") -
     return "\n".join(rows)
 
 
-def render(version: str, indices: list[int], pages: list[bytes]) -> str:
+def cased_ranges(cased: bytearray) -> list[int]:
+    # 21 bits for the first codepoint, 9 for a run of up to 512 and 2 for kind.
+    result = []
+    first = 0
+    while first < len(cased):
+        category = cased[first]
+        if category == 0:
+            first += 1
+            continue
+        end = first + 1
+        while end < min(len(cased), first + 512) and cased[end] == category:
+            end += 1
+        result.append(first << 11 | (end - first - 1) << 2 | category)
+        first = end
+    return result
+
+
+def render(version: str, indices: list[int], pages: list[bytes], cased: list[int]) -> str:
     rendered_pages = []
     for page in pages:
         rendered_pages.append(
@@ -161,7 +193,32 @@ const pages = [{len(pages)}][{PACKED_PAGE_BYTES}]u8{{
 pub inline fn classify(codepoint: u21) Class {{
     const page = pages[page_index[codepoint >> 8]];
     const class_byte = page[(codepoint & 0xff) >> 2];
-    return @enumFromInt((class_byte >> @intCast((codepoint & 3) * 2)) & 3);
+    return @fromBackingInt(@as(u2, @truncate(class_byte >> @intCast((codepoint & 3) * 2))));
+}}
+
+pub const CaseOverride = enum(u2) {{ none, lower, upper, mark }};
+
+const cased_ranges = [{len(cased)}]u32{{
+{format_values(cased, 8)}
+}};
+
+pub fn caseOverride(codepoint: u21) CaseOverride {{
+    var low: usize = 0;
+    var high: usize = cased_ranges.len;
+    while (low < high) {{
+        const middle = low + (high - low) / 2;
+        const entry = cased_ranges[middle];
+        const first = entry >> 11;
+        const last = first + ((entry >> 2) & 511);
+        if (codepoint < first) {{
+            high = middle;
+        }} else if (codepoint > last) {{
+            low = middle + 1;
+        }} else {{
+            return @enumFromInt(entry & 3);
+        }}
+    }}
+    return .none;
 }}
 """
 
@@ -170,11 +227,11 @@ def main() -> None:
     if len(sys.argv) != 5:
         raise SystemExit(__doc__)
     version, unicode_data_path, prop_list_path, output_path = sys.argv[1:]
-    classes = parse_unicode_data(pathlib.Path(unicode_data_path))
+    classes, cased = parse_unicode_data(pathlib.Path(unicode_data_path))
     apply_whitespace(classes, pathlib.Path(prop_list_path))
     indices, pages = packed_pages(classes)
     pathlib.Path(output_path).write_text(
-        unicode_source_header(__file__) + render(version, indices, pages),
+        unicode_source_header(__file__) + render(version, indices, pages, cased_ranges(cased)),
         encoding="utf-8",
     )
     print(f"generated {len(indices)} page indices and {len(pages)} unique pages")

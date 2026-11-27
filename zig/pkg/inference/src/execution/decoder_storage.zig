@@ -123,6 +123,13 @@ pub fn ringRequestEligible(request: Request, sampled_qualified: bool) bool {
         !request.prompt_cache and !request.compaction and !request.speculation and !request.draft;
 }
 
+/// The opt-in sampled or grammar ring is a direct eager route. A scheduler
+/// or a compiled executor can still require contiguous full-history storage.
+pub fn validateSampledRingExecution(request: Request, sampled_qualified: bool, requires_contiguous: bool) !void {
+    if (sampled_qualified and requires_contiguous and (!request.pure_greedy or request.grammar))
+        return error.UnsupportedKvCachePolicy;
+}
+
 pub fn splitRingRequestEligible(config: Config, request: Request, sampled_qualified: bool) bool {
     if (comptime !@import("build_options").enable_metal) return false;
     const sampled_or_grammar = !request.pure_greedy or request.grammar;
@@ -245,7 +252,7 @@ test "decoder KV capacity geometry preserves sparse architectural layers and com
     for (dense.items(), 0..) |layer, index| try std.testing.expectEqual(index, layer.index);
 }
 
-const DecodeState = @import("../graph/decode_state_runtime.zig").NativeDecodeState;
+const DecodeState = @import("decode_state_runtime.zig").NativeDecodeState;
 const PrefixCache = @import("../runtime/kv/prompt_cache.zig").PromptPrefixCache;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 
@@ -342,6 +349,13 @@ pub fn validateSelectedTokenBudget(selected: bool, max_tokens: usize, protected:
         return error.ProtectedRowsExceedTarget;
 }
 
+/// Cooperative metadata scopes require a shared prefix cache and a provider
+/// that can drain its current batch without replacing the execution owner.
+pub fn kvMetadataPhase(backend: *const ComputeBackend, has_prefix_cache: bool) @import("../ops/execution_scope.zig").Phase {
+    return if (has_prefix_cache and backend.execution_batch_drain != null and
+        @import("antfly_platform").env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_KV_METADATA_SCOPE", true)) .metadata else .step;
+}
+
 /// Borrowed request lifetime, not a new execution engine. The loaded runtime
 /// owns state and model configuration; no allocation occurs on the ordinary path.
 pub const SelectedRequest = struct {
@@ -351,7 +365,7 @@ pub const SelectedRequest = struct {
     gpu_oracle: bool = false,
 
     pub const CommitContext = struct {
-        allow_metadata_scope: bool = false,
+        has_prefix_cache: bool = false,
         execution: @import("../execution_control.zig").ExecutionAccess = .{},
         cleanup_owner: ?*const @import("cleanup_owner.zig").Owner = null,
         backend: *const ComputeBackend,
@@ -373,7 +387,7 @@ pub const SelectedRequest = struct {
     /// extends logical KV. One execution scope excludes both physical changes;
     /// each canonical state helper takes its own KV lock inside that scope.
     /// The request borrows no epoch or provider across operations.
-    pub fn commitGeneratedToken(self: *const SelectedRequest, cursor: *@import("../graph/decode_state_runtime.zig").BorrowedDecodeStateRuntime, context: CommitContext) !usize {
+    pub fn commitGeneratedToken(self: *const SelectedRequest, cursor: *@import("decode_state_runtime.zig").BorrowedDecodeStateRuntime, context: CommitContext) !usize {
         return self.commitGeneratedTokenUsing(cursor, context);
     }
 
@@ -386,9 +400,7 @@ pub const SelectedRequest = struct {
         // the model's execution exclusion, even without shared KV metadata.
         if (!self.enabled and state.kv_lock == null) access.mutex = null;
         if (access.mutex != null and access.mutex == state.kv_lock) return error.InvalidDecodeStorageRequest;
-        const metadata_only = context.allow_metadata_scope and !self.enabled and
-            context.backend.execution_batch_drain != null;
-        var scope = try access.acquireScopeForPhase(if (metadata_only) .metadata else .step);
+        var scope = try access.acquireScopeForPhase(kvMetadataPhase(context.backend, context.has_prefix_cache and !self.enabled));
         defer if (scope) |*held| held.deinit();
         if (access.control) |control| try control.check();
         // A parked caller can rotate B while acquireScope waits. Read only the
@@ -684,7 +696,7 @@ test "decoder storage ordinary disabled policies perform no allocator requests" 
     defer cache.deinit();
     const model = PrefixFixture.model;
     var selected = try SelectedRequest.begin(false, &backend, false, &state, &model, null, 0, false, &.{});
-    var cursor = @import("../graph/decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&state);
+    var cursor = @import("decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&state);
     try std.testing.expectEqual(@as(usize, 1), try selected.commitGeneratedToken(&cursor, .{ .backend = &backend }));
     selected.deinit();
     var request = PrefixFixture.request;
@@ -716,7 +728,7 @@ test "decoder storage token commit rejects foreign and closed requests before ex
     };
     var counter = Counter{};
     const commit = SelectedRequest.CommitContext{ .backend = &backend, .execution = .{ .control = .{ .ptr = &counter, .check_fn = Counter.check } } };
-    var cursor = @import("../graph/decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&foreign);
+    var cursor = @import("decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&foreign);
     try std.testing.expectError(error.InvalidDecodeStorageRequest, request.commitGeneratedToken(&cursor, commit));
     var mutex = std.atomic.Mutex.unlocked;
     state.kv_lock = &mutex;
@@ -762,7 +774,7 @@ test "decoder storage failed selected maintenance never appends and releases exe
     };
     var observe = Observe{ .mutex = &mutex };
     const commit = SelectedRequest.CommitContext{ .backend = &backend, .execution = .{ .mutex = &mutex, .control = .{ .ptr = &observe, .check_fn = Observe.check } } };
-    var cursor = @import("../graph/decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&state);
+    var cursor = @import("decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&state);
     try std.testing.expectError(error.DeviceWriteUnsupported, request.commitGeneratedToken(&cursor, commit));
     try std.testing.expect(observe.checks != 0);
     try std.testing.expectEqual(@as(usize, 0), state.total_tokens);
@@ -856,7 +868,7 @@ const NativePrefixFixture = struct {
         defer state.deinit();
         var binding = NativePrefixBinding.init(&backend, cache, &state, &metadata).?;
         defer binding.deinit();
-        var cursor = @import("../graph/decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&state);
+        var cursor = @import("decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&state);
         try cursor.notePrefill(4);
         // Actual Native attention writes this manager, not the local mirror.
         try cache.manager.writeFullLayerKv(state.sequence_id.?, 0, 4, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &.{ 11, 12, 13, 14, 15, 16, 17, 18 });
@@ -893,7 +905,7 @@ test "decoder Native prefix binding reuses server ensurePool payload after sourc
     try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, values.k);
     try std.testing.expectEqualSlices(f32, &.{ 11, 12, 13, 14 }, values.v);
     // Continue through the same runtime with no duplicate local KV store.
-    var cursor = @import("../graph/decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&state);
+    var cursor = @import("decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&state);
     try cursor.appendPrefillChunk(2);
     try cache.manager.writeLayerKvSuffix(state.sequence_id.?, 0, 4, 2, &.{ 9, 10, 11, 12 }, &.{ 19, 20, 21, 22 });
     try std.testing.expectEqual(@as(usize, 0), metadata.storage.liveBlocks());

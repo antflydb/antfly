@@ -53,7 +53,7 @@ const contracts = @import("backend_contracts.zig");
 const interpreter = @import("interpreter.zig");
 const quant_matmul = @import("quant_matmul.zig");
 const operator_plan = @import("operator_plan.zig");
-const buffer_plan_mod = @import("buffer_plan.zig");
+const buffer_plan_mod = @import("../execution/buffer_plan.zig");
 const transpose_utils = @import("transpose_utils.zig");
 const runtime_root = @import("../runtime/root.zig");
 const kv_pool = @import("../runtime/kv/pool.zig");
@@ -130,6 +130,11 @@ pub const PartitionExecutor = struct {
         pub fn runtimeInputIndex(self: @This(), allocator: std.mem.Allocator, options: interpreter.ExecuteOptions) !RuntimeInputIndex {
             if (self.runtime_input_index) |index| return index.borrow();
             return RuntimeInputIndex.init(allocator, options);
+        }
+
+        pub fn ownsRuntimeTransfer(self: @This(), node: NodeId) bool {
+            const transfers = self.owned_runtime_transfers orelse return false;
+            return transfers.contains(node);
         }
 
         /// Every partition backend shares this checkpoint contract. Compiled

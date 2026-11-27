@@ -122,6 +122,10 @@ check_source_policy() {
 
 check_source_policy
 if [ "$source_policy_only" = "true" ]; then
+  python3 "$script_dir/regen-gliner25-fast-f32.py" --check-source-policy
+  python3 "$script_dir/regen-gliner25-bf16.py" --check-source-policy
+fi
+if [ "$source_policy_only" = "true" ]; then
   printf 'CUDA artifact source policy passes: %s (%s compiler-managed dev-only runtime-wired candidates included)\n' \
     "$src" "$CUDA_RUNTIME_WIRED_DEV_CANDIDATE_COUNT"
   exit 0
@@ -306,6 +310,15 @@ required_symbols=(
   termite_gliner_encoder_attention_tc_f16
   termite_gliner_encoder_attention_tc_f16_m64
   termite_gliner_boundary_attention_f32
+  termite_gliner25_attention_softmax_f32_v2
+  termite_gliner25_attention_pointer_views_f32_v1
+  termite_gliner25_attention_stage_bf16_v1
+  termite_gliner25_attention_pointer_views_bf16_v2
+  termite_gliner25_attention_softmax_bf16_v2
+  termite_gliner25_ffn_bias_gelu_bf16_v1
+  termite_gliner25_boundary_parallel_f32_v1
+  termite_gliner25_boundary_banded_f32_v1
+  termite_gliner25_norm_bf16_mirror_v1
   termite_gliner_boundary_attention_tc_f16
   termite_gliner_boundary_attention_tc_f16_m64
   termite_gliner_boundary_attention_tc_f16_compact
@@ -698,6 +711,8 @@ build_sm89() {
       exit 1
     fi
   fi
+  NVCC="$(command -v "$nvcc")" python3 "$script_dir/regen-gliner25-fast-f32.py" "--$mode"
+  NVCC="$(command -v "$nvcc")" python3 "$script_dir/regen-gliner25-bf16.py" "--$mode"
   write_or_check "$tmp_sm89" "$sm89_dst" "sm89"
 }
 

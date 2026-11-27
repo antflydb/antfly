@@ -20,14 +20,15 @@ const inference = @import("inference_internal");
 const memory = inference.runtime.tier.memory;
 const Control = inference.execution_control.InferenceExecutionControl;
 
-fn transient(amounts: memory.AdmissionAmounts) memory.AdmissionAmounts {
+fn transient(amounts: memory.AdmissionAmounts, definition_bytes: usize) !memory.AdmissionAmounts {
     var result = amounts;
     result.host_weight_bytes = 0;
     result.backend_weight_bytes = 0;
+    result.host_scratch_bytes = try std.math.sub(usize, result.host_scratch_bytes, definition_bytes);
     return result;
 }
-fn waitRetired(controller: *memory.AdmissionController, initial: memory.AdmissionAmounts, control: Control) !void {
-    while (!std.meta.eql(transient(controller.snapshot()), transient(initial))) {
+fn waitRetired(controller: *memory.AdmissionController, initial: memory.AdmissionAmounts, retained_definition_bytes: usize, control: Control) !void {
+    while (!std.meta.eql(try transient(controller.snapshot(), retained_definition_bytes), initial)) {
         try control.check();
         inference.platform.time.sleepNs(100 * std.time.ns_per_us);
     }
@@ -185,14 +186,15 @@ pub fn run(init: std.process.Init, model: anytype, allocator: std.mem.Allocator,
         const lifecycle_start = inference.platform.time.monotonicNs();
         const timeout_seconds: u64 = if (iteration == 0) options.transcribe_cold_timeout_seconds else 120;
         const control = Control{ .io = init.io, .deadline_ns = inference.platform.time.monotonicNs() + timeout_seconds * std.time.ns_per_s, .hard_cancellation = watchdog.boundary(), .native_call_policy = .require_supervision, .cancellation_grace_ns = std.time.ns_per_s };
-        const initial = domain.controller().snapshot();
+        const initial_definition_bytes = try inference.execution.architecture_session.whisperRetainedDefinitionHostBytes(session);
+        const initial = try transient(domain.controller().snapshot(), initial_definition_bytes);
         var arena = std.heap.ArenaAllocator.init(allocator);
         var arena_open = true;
         defer if (arena_open) arena.deinit();
         const a = arena.allocator();
         const audio_bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, options.transcribe_audio, a, .limited(32 * 1024 * 1024));
         var forced_scratch: [3]@typeInfo(@TypeOf(prompt.automatic_ids)).pointer.child = undefined;
-        const forced_ids = try prompt.resolveWithTimestamps(&forced_scratch, null, options.transcribe_timestamps);
+        const forced_ids = try prompt.resolveWithTimestamps(&forced_scratch, options.transcribe_language, options.transcribe_timestamps);
         var pipeline = inference.pipelines.transcription.TranscriptionPipeline.init(a, session, session, model.getTokenizer(), .{
             .pjrt_decoder_cache = options.pjrt.decoder_cache,
             .max_length = config.max_target_positions,
@@ -202,6 +204,7 @@ pub fn run(init: std.process.Init, model: anytype, allocator: std.mem.Allocator,
             .eos_token_id = config.eos_token_id,
             .n_mels = config.num_mel_bins,
             .forced_decoder_ids = forced_ids,
+            .language = options.transcribe_language,
             .language_tokens = prompt.language_tokens,
             .decode = prompt.decode,
             .no_timestamps_id = prompt.no_timestamps_id,
@@ -226,7 +229,14 @@ pub fn run(init: std.process.Init, model: anytype, allocator: std.mem.Allocator,
         try control.check();
         const audio_samples = decoded.samples.len;
         const sample_rate = decoded.sample_rate;
-        var result = try pipeline.transcribePcm(decoded.samples, decoded.sample_rate);
+        const conditioning = if (options.transcribe_prompt) |text| block: {
+            if (prompt.decode.start_of_prev_id == null) return error.TranscriptionPromptNotSupported;
+            break :block try pipeline.encodePromptText(a, text);
+        } else &.{};
+        const prefix_capacity = @min(inference.pipelines.transcription.maxPromptPrefixTokens(config.max_target_positions), config.max_target_positions -| 2);
+        const conditioning_tokens = @min(conditioning.len, prefix_capacity);
+        if (options.transcribe_prompt != null and conditioning_tokens == 0) return error.EmptyTranscriptionPrompt;
+        var result = try pipeline.transcribePcmConditioned(decoded.samples, decoded.sample_rate, conditioning);
         var result_open = true;
         defer if (result_open) result.deinit();
         const returned = inference.platform.time.monotonicNs();
@@ -245,7 +255,8 @@ pub fn run(init: std.process.Init, model: anytype, allocator: std.mem.Allocator,
         pipeline_open = false;
         arena.deinit();
         arena_open = false;
-        try waitRetired(domain.controller(), initial, control);
+        const retained_definition_bytes = try inference.execution.architecture_session.whisperRetainedDefinitionHostBytes(session);
+        try waitRetired(domain.controller(), initial, retained_definition_bytes, control);
         const retired = inference.platform.time.monotonicNs();
         const record = try std.json.Stringify.valueAlloc(allocator, .{
             .schema_version = 1,
@@ -271,7 +282,9 @@ pub fn run(init: std.process.Init, model: anytype, allocator: std.mem.Allocator,
             .max_length = config.max_target_positions,
             .max_output_tokens = max_output_tokens,
             .configured_eos_token_id = config.eos_token_id,
-            .automatic_language = true,
+            .automatic_language = options.transcribe_language == null,
+            .requested_language = options.transcribe_language,
+            .conditioning_tokens = conditioning_tokens,
             .configured_warmup_iterations = options.warmup,
             .configured_measured_iterations = options.iterations,
             .persistent_model_load_in_lifecycle = false,
@@ -300,6 +313,11 @@ pub fn run(init: std.process.Init, model: anytype, allocator: std.mem.Allocator,
             .encoded_file_read_in_lifecycle = true,
             .retained_report_publication_outlives_task = true,
             .diagnostic_observation = options.diagnostics,
+            .retained_definition_host_scratch_bytes = retained_definition_bytes,
+            .native_program_construction = if (options.diagnostics)
+                if (session.executionDiagnostics()) |observed| observed.native_program_construction else null
+            else
+                null,
             .language = publication.language,
             .text = publication.text,
             .selected_text_tokens = publication.tokens,

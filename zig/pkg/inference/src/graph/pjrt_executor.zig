@@ -43,7 +43,7 @@ const Partition = partition_mod.Partition;
 const DeviceId = @import("device_mesh.zig").DeviceId;
 
 const compiler = @import("pjrt_compiler.zig");
-const model_runtime = @import("model_runtime.zig");
+const model_runtime = @import("../execution/model_runtime.zig");
 
 fn pjrtExecDebugEnabled() bool {
     return std.c.getenv("TERMITE_PJRT_EXEC_DEBUG") != null;
@@ -89,6 +89,22 @@ fn downloadTypedOutput(buffer: *const pjrt_lib.pjrt.Buffer, backend: *const Comp
 }
 
 // ── PjrtExecutor ───────────────────────────────────────────────────
+
+pub const ResidentOperand = struct { node: ml.graph.NodeId, value: CT };
+
+const InputValues = union(enum) {
+    graph: []const ?CT,
+    resident: []const ResidentOperand,
+
+    fn get(self: InputValues, target: ml.graph.NodeId) ?CT {
+        return switch (self) {
+            .graph => |values| values[target],
+            .resident => |values| for (values) |operand| {
+                if (operand.node == target) break operand.value;
+            } else null,
+        };
+    }
+};
 
 pub const PjrtExecutor = struct {
     allocator: Allocator,
@@ -147,14 +163,14 @@ pub const PjrtExecutor = struct {
         retained_cache: ?*const PjrtRetainedBufferCache,
         semantic_input_bindings: []const PjrtSemanticInputBinding,
     ) ![]pjrt_lib.pjrt.Buffer {
-        return self.executeToBuffersWithAllocators(values, exec_ctx, allocator, allocator, retained_cache, semantic_input_bindings, null);
+        return self.executeToBuffersWithAllocators(.{ .graph = values }, exec_ctx, allocator, allocator, retained_cache, semantic_input_bindings, null);
     }
 
     /// Borrow request-owned inputs without donating them. Publication belongs
     /// to the request transaction after synchronization and logits readback.
-    pub fn executeWithResidentState(self: *PjrtExecutor, values: []?CT, backend: *const ComputeBackend, state: []const pjrt_lib.pjrt.Buffer, allocator: Allocator) ![]pjrt_lib.pjrt.Buffer {
+    pub fn executeWithResidentState(self: *PjrtExecutor, values: []const ResidentOperand, backend: *const ComputeBackend, state: []const pjrt_lib.pjrt.Buffer, allocator: Allocator) ![]pjrt_lib.pjrt.Buffer {
         if (self.resident_output_start == null) return error.NotResidentDecoder;
-        return self.executeToBuffersWithAllocators(values, .{ .backend = backend }, allocator, allocator, null, &.{}, state);
+        return self.executeToBuffersWithAllocators(.{ .resident = values }, .{ .backend = backend }, allocator, allocator, null, &.{}, state);
     }
 
     fn uploadTensor(self: *PjrtExecutor, backend: *const ComputeBackend, value: CT, index: usize, allocator: Allocator) !pjrt_lib.pjrt.Buffer {
@@ -172,19 +188,21 @@ pub const PjrtExecutor = struct {
             // before returning, so neither F32 upload nor narrowing needs an
             // additional full-size F32 staging allocation. Device tensors and
             // strided/quantized views retain the backend materialization path.
-            var owned: ?[]f32 = null;
-            defer if (owned) |data| allocator.free(data);
-            const data = (try backend.hostFloat32Read(value)) orelse materialize: {
-                owned = try backend.toFloat32(value, allocator);
-                break :materialize owned.?;
-            };
+            const host = try Float32Upload.init(backend, value, allocator);
+            defer host.deinit(allocator);
+            const data = host.values;
             const shape = try resolveUploadShapeFromTensor(allocator, backend, value, self.input_shapes_[index], data.len);
-            defer allocator.free(shape);
-            if (dtype == .f32) return self.client.bufferFromHostFloat32(data, shape);
+            defer shape.deinit(allocator);
+            if (dtype == .f32) return self.client.bufferFromHostFloat32(data, shape.dims());
             const narrow = try allocator.alloc(u16, data.len);
             defer allocator.free(narrow);
             for (data, narrow) |element, *bits| bits.* = if (dtype == .bf16) @truncate(@as(u32, @bitCast(@import("antfly_tile").fexpr.roundBf16Value(element))) >> 16) else @bitCast(@as(f16, @floatCast(element)));
-            return self.client.bufferFromHostBytes(std.mem.sliceAsBytes(narrow), bufferType(dtype), shape);
+            return self.client.bufferFromHostBytes(std.mem.sliceAsBytes(narrow), bufferType(dtype), shape.dims());
+        }
+        if (comptime @import("build_options").enable_native) {
+            if (try @import("../ops/native_compute.zig").NativeCompute.borrowTypedHostBytes(backend, value, expected)) |bytes| {
+                return self.uploadTypedBytes(index, dtype, bytes, allocator);
+            }
         }
         const exported = (try backend.exportTensorData(value, allocator)) orelse return error.UnsupportedPjrtInputType;
         const bytes = switch (exported.payload) {
@@ -196,11 +214,16 @@ pub const PjrtExecutor = struct {
             },
         };
         defer allocator.free(bytes);
-        if (exported.dtype != expected or bytes.len % dtype.byteSize() != 0) return error.UnsupportedPjrtInputType;
+        if (exported.dtype != expected) return error.UnsupportedPjrtInputType;
+        return self.uploadTypedBytes(index, dtype, bytes, allocator);
+    }
+
+    fn uploadTypedBytes(self: *PjrtExecutor, index: usize, dtype: ml.graph.DType, bytes: []const u8, allocator: Allocator) !pjrt_lib.pjrt.Buffer {
+        if (bytes.len % dtype.byteSize() != 0) return error.UnsupportedPjrtInputType;
         const shape = try resolveUploadShapeFromElementCount(allocator, self.input_shapes_[index], bytes.len / dtype.byteSize());
-        defer allocator.free(shape);
+        defer shape.deinit(allocator);
         const kind = bufferType(dtype);
-        return self.client.bufferFromHostBytes(bytes, kind, shape);
+        return self.client.bufferFromHostBytes(bytes, kind, shape.dims());
     }
 
     /// Immutable model operands are transferred once, outside invocation frames.
@@ -246,7 +269,7 @@ pub const PjrtExecutor = struct {
 
     fn executeToBuffersWithAllocators(
         self: *PjrtExecutor,
-        values: []?CT,
+        values: InputValues,
         exec_ctx: PartitionExecutor.ExecutionContext,
         allocator: Allocator,
         transfer_allocator: Allocator,
@@ -330,11 +353,11 @@ pub const PjrtExecutor = struct {
                             owned_input_bufs[i] = false;
                             break :blk buffer;
                         };
-                        const value = values[nid] orelse return error.MissingValue;
+                        const value = values.get(nid) orelse return error.MissingValue;
                         break :blk try self.uploadTensor(exec_ctx.backend orelse self.host_backend, value, i, staging_allocator);
                     },
                     .semantic_past_graph_node => |nid| blk: {
-                        const ct = values[@intCast(nid)] orelse {
+                        const ct = values.get(nid) orelse {
                             if (debug) {
                                 std.log.warn(
                                     "PJRT execute input[{d}/{d}] missing semantic graph node value node={d}",
@@ -343,8 +366,9 @@ pub const PjrtExecutor = struct {
                             }
                             return error.MissingValue;
                         };
-                        const f32_data = try (exec_ctx.backend orelse self.host_backend).toFloat32(ct, staging_allocator);
-                        defer staging_allocator.free(f32_data);
+                        const host = try Float32Upload.init(exec_ctx.backend orelse self.host_backend, ct, staging_allocator);
+                        defer host.deinit(staging_allocator);
+                        const f32_data = host.values;
                         const upload_shape = resolveUploadShapeFromTensor(
                             allocator,
                             exec_ctx.backend orelse self.host_backend,
@@ -360,12 +384,12 @@ pub const PjrtExecutor = struct {
                             }
                             return err;
                         };
-                        defer allocator.free(upload_shape);
-                        break :blk self.client.bufferFromHostFloat32(f32_data, upload_shape) catch |err| {
+                        defer upload_shape.deinit(allocator);
+                        break :blk self.client.bufferFromHostFloat32(f32_data, upload_shape.dims()) catch |err| {
                             if (debug) {
                                 std.log.warn(
                                     "PJRT execute input[{d}/{d}] upload semantic graph_node={d} failed shape={any} elems={d} err={s}",
-                                    .{ i + 1, num_inputs, nid, upload_shape, f32_data.len, @errorName(err) },
+                                    .{ i + 1, num_inputs, nid, upload_shape.dims(), f32_data.len, @errorName(err) },
                                 );
                             }
                             return err;
@@ -390,27 +414,18 @@ pub const PjrtExecutor = struct {
                             }
                             return err;
                         };
-                        defer allocator.free(upload_shape);
-                        if (ids.len != numElements(upload_shape)) {
-                            if (debug) {
-                                std.log.warn(
-                                    "PJRT execute input[{d}/{d}] embedding ids shape mismatch elems={d} shape={any}",
-                                    .{ i + 1, num_inputs, ids.len, upload_shape },
-                                );
-                            }
-                            return error.UnsupportedShape;
-                        }
+                        defer upload_shape.deinit(allocator);
                         if (debug and shouldLogPjrtInput(i, num_inputs)) {
                             std.log.info(
                                 "PJRT execute input[{d}/{d}] upload embedding_ids elems={d} shape={any}",
-                                .{ i + 1, num_inputs, ids.len, upload_shape },
+                                .{ i + 1, num_inputs, ids.len, upload_shape.dims() },
                             );
                         }
-                        break :blk self.client.bufferFromHostInt64(ids, upload_shape) catch |err| {
+                        break :blk self.client.bufferFromHostInt64(ids, upload_shape.dims()) catch |err| {
                             if (debug) {
                                 std.log.warn(
                                     "PJRT execute input[{d}/{d}] upload embedding_ids failed shape={any} elems={d} err={s}",
-                                    .{ i + 1, num_inputs, upload_shape, ids.len, @errorName(err) },
+                                    .{ i + 1, num_inputs, upload_shape.dims(), ids.len, @errorName(err) },
                                 );
                             }
                             return err;
@@ -513,6 +528,9 @@ pub fn createExecutorWithOptions(
     options: compiler.CompileOptions,
     shared_parameters: ?*@import("pjrt_parameters.zig").Store,
 ) !*PjrtExecutor {
+    const debug = pjrtExecDebugEnabled();
+    const clock = @import("antfly_platform").time;
+    const lower_started = if (debug) clock.monotonicNs() else 0;
     // 1. Compile partition to HLO bytes
     var compile_options = options;
     if (compile_options.mutable_parameters != null) compile_options.parameter_inputs = true;
@@ -539,6 +557,9 @@ pub fn createExecutorWithOptions(
     var result = try compiler.compilePartitionWithOptions(allocator, graph, part, cb, compile_options);
     defer result.deinit();
 
+    const compile_started = if (debug) clock.monotonicNs() else 0;
+    if (debug) std.log.info("PJRT partition lowered host_wall_ns={d} hlo_bytes={d} nodes={d}", .{ compile_started - lower_started, result.hlo_bytes.len, part.node_ids.len });
+
     // 2. Compile HLO via PJRT
     // Precision fixes publication boundaries and accumulation types. Let the
     // provider choose its tuned GEMM/fusion schedule outside the qualified
@@ -549,6 +570,7 @@ pub fn createExecutorWithOptions(
         try client.compileWithEntryLayoutsAndOptions(result.hlo_bytes, result.output_node_ids.len, client.device, layouts, program_options, allocator)
     else
         try client.compileForDevice(result.hlo_bytes, result.output_node_ids.len, client.device);
+    if (debug) std.log.info("PJRT partition compiler returned host_wall_ns={d}", .{clock.monotonicNs() - compile_started});
     var executable_owned = true;
     errdefer if (executable_owned) executable.deinit();
 
@@ -571,7 +593,11 @@ pub fn createExecutorWithOptions(
     executor.resident_prefill_only = options.resident_initial or options.resident_visibility != null;
     executor.resident_initial = options.resident_initial;
     errdefer executor.partitionExecutor().deinitExecutor();
-    if (options.mutable_parameters) |flags| try executor.retainParameters(graph, cb, flags, shared_parameters);
+    if (options.mutable_parameters) |flags| {
+        const bind_started = if (debug) clock.monotonicNs() else 0;
+        try executor.retainParameters(graph, cb, flags, shared_parameters);
+        if (debug) std.log.info("PJRT partition parameter binding completed host_wall_ns={d}", .{clock.monotonicNs() - bind_started});
+    }
     return executor;
 }
 
@@ -1368,7 +1394,7 @@ const PjrtModelRuntime = struct {
         @memset(retained, false);
         const exec_ctx: PartitionExecutor.ExecutionContext = .{ .embedding_ids = input_ids };
         var outputs = try phase.executor.executeToBuffersWithAllocators(
-            values,
+            .{ .graph = values },
             exec_ctx,
             bookkeeping,
             allocator,
@@ -1964,42 +1990,77 @@ fn numElements(shape: []const i64) usize {
     return n;
 }
 
+const Float32Upload = struct {
+    values: []const f32,
+    owned: ?[]f32 = null,
+
+    fn init(backend: *const ComputeBackend, value: CT, allocator: Allocator) !Float32Upload {
+        if (try backend.hostFloat32Read(value)) |borrowed| return .{ .values = borrowed };
+        const owned = try backend.toFloat32(value, allocator);
+        return .{ .values = owned, .owned = owned };
+    }
+
+    fn deinit(self: Float32Upload, allocator: Allocator) void {
+        if (self.owned) |values| allocator.free(values);
+    }
+};
+
+const UploadShape = union(enum) {
+    borrowed: []const i64,
+    owned: []i64,
+
+    fn dims(self: UploadShape) []const i64 {
+        return switch (self) {
+            .borrowed => |shape| shape,
+            .owned => |shape| shape,
+        };
+    }
+
+    fn deinit(self: UploadShape, allocator: Allocator) void {
+        if (self == .owned) allocator.free(self.owned);
+    }
+};
+
 fn resolveUploadShapeFromTensor(
     allocator: Allocator,
     backend: *const ComputeBackend,
     tensor: CT,
     expected_shape: []const i64,
     element_count: usize,
-) ![]i64 {
+) !UploadShape {
+    if (!shapeHasDynamicDim(expected_shape)) {
+        try validateConcreteElementCount(expected_shape, element_count);
+        return .{ .borrowed = expected_shape };
+    }
     const out = try allocator.dupe(i64, expected_shape);
     errdefer allocator.free(out);
 
-    if (shapeHasDynamicDim(out)) {
-        const actual_shape = try backend.tensorShape(tensor, allocator);
-        defer allocator.free(actual_shape);
-        if (actual_shape.len != out.len) return error.UnsupportedShape;
-        for (out, actual_shape) |*dim, actual_dim| {
-            if (dim.* < 0) dim.* = actual_dim;
-        }
+    const actual_shape = try backend.tensorShape(tensor, allocator);
+    defer allocator.free(actual_shape);
+    if (actual_shape.len != out.len) return error.UnsupportedShape;
+    for (out, actual_shape) |*dim, actual_dim| {
+        if (dim.* < 0) dim.* = actual_dim;
     }
-    if (shapeHasDynamicDim(out)) {
-        const inferred = try resolveUploadShapeFromElementCount(allocator, out, element_count);
-        allocator.free(out);
-        return inferred;
-    }
-
-    try validateConcreteElementCount(out, element_count);
-    return out;
+    try inferUploadShape(out, element_count);
+    return .{ .owned = out };
 }
 
 fn resolveUploadShapeFromElementCount(
     allocator: Allocator,
     expected_shape: []const i64,
     element_count: usize,
-) ![]i64 {
+) !UploadShape {
+    if (!shapeHasDynamicDim(expected_shape)) {
+        try validateConcreteElementCount(expected_shape, element_count);
+        return .{ .borrowed = expected_shape };
+    }
     const out = try allocator.dupe(i64, expected_shape);
     errdefer allocator.free(out);
+    try inferUploadShape(out, element_count);
+    return .{ .owned = out };
+}
 
+fn inferUploadShape(out: []i64, element_count: usize) !void {
     var known_product: usize = 1;
     var dynamic_index: ?usize = null;
     for (out, 0..) |dim, idx| {
@@ -2009,15 +2070,12 @@ fn resolveUploadShapeFromElementCount(
             continue;
         }
         if (dim == 0) return error.UnsupportedShape;
-        known_product *= @intCast(dim);
+        known_product = std.math.mul(usize, known_product, std.math.cast(usize, dim) orelse return error.UnsupportedShape) catch return error.UnsupportedShape;
     }
     if (dynamic_index) |idx| {
-        if (known_product == 0 or element_count % known_product != 0) return error.UnsupportedShape;
-        out[idx] = @intCast(element_count / known_product);
-    }
-
-    try validateConcreteElementCount(out, element_count);
-    return out;
+        if (element_count == 0 or element_count % known_product != 0) return error.UnsupportedShape;
+        out[idx] = std.math.cast(i64, element_count / known_product) orelse return error.UnsupportedShape;
+    } else if (known_product != element_count) return error.UnsupportedShape;
 }
 
 fn shapeHasDynamicDim(shape: []const i64) bool {
@@ -2028,10 +2086,12 @@ fn shapeHasDynamicDim(shape: []const i64) bool {
 }
 
 fn validateConcreteElementCount(shape: []const i64, element_count: usize) !void {
+    var product: usize = 1;
     for (shape) |dim| {
         if (dim <= 0) return error.UnsupportedShape;
+        product = std.math.mul(usize, product, std.math.cast(usize, dim) orelse return error.UnsupportedShape) catch return error.UnsupportedShape;
     }
-    if (numElements(shape) != element_count) return error.UnsupportedShape;
+    if (product != element_count) return error.UnsupportedShape;
 }
 
 fn sliceLastLogits(
@@ -2364,13 +2424,13 @@ test "PJRT host uploads borrow contiguous F32 and materialize unsupported views"
     executor.client = &client;
     executor.input_shapes_ = &shapes;
     executor.input_dtypes = &dtypes;
-    // Enough for the narrow payload and shape, never a second F32 payload.
-    // Failure here detects accidental reintroduction of full-size staging.
-    var scratch: [input.len * 2 + 64]u8 = undefined;
+    // F32 uploads need no staging, and half uploads need only the narrow payload.
+    var scratch: [input.len * @sizeOf(u16)]u8 align(@alignOf(u16)) = undefined;
     for ([_]ml.graph.DType{ .f32, .bf16, .f16 }) |dtype| {
         var fixed = std.heap.FixedBufferAllocator.init(&scratch);
         dtypes[0] = dtype;
-        var buffer = try executor.uploadTensor(&cb, tensor, 0, fixed.allocator());
+        const staging = if (dtype == .f32) std.testing.failing_allocator else fixed.allocator();
+        var buffer = try executor.uploadTensor(&cb, tensor, 0, staging);
         defer buffer.deinit();
         if (dtype == .f32) {
             const actual = try buffer.toFloat32WithShape(a, &shape);
@@ -2401,10 +2461,17 @@ test "PJRT host uploads borrow contiguous F32 and materialize unsupported views"
 
 test "PJRT upload shape resolver fills one dynamic dimension from element count" {
     const shape = try resolveUploadShapeFromElementCount(std.testing.allocator, &.{ -1, 1536 }, 3072);
-    defer std.testing.allocator.free(shape);
+    defer shape.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(i64, 2), shape[0]);
-    try std.testing.expectEqual(@as(i64, 1536), shape[1]);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 1536 }, shape.dims());
+}
+
+test "PJRT upload shape resolver borrows static metadata without allocations" {
+    const expected = [_]i64{ 2, 1536 };
+    const shape = try resolveUploadShapeFromElementCount(std.testing.failing_allocator, &expected, 3072);
+    defer shape.deinit(std.testing.failing_allocator);
+    try std.testing.expectEqual(expected[0..].ptr, shape.dims().ptr);
+    try std.testing.expectError(error.UnsupportedShape, resolveUploadShapeFromElementCount(std.testing.failing_allocator, &expected, 1536));
 }
 
 test "PJRT upload shape resolver rejects ambiguous dynamic dimensions" {

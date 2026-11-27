@@ -100,6 +100,7 @@ pub const Selection = struct {
     alias_index: ?AliasIndex = null,
     invocation_nodes: []NodeId = &.{},
     planes_witnessed: []bool = &.{},
+    transfer_planes: []?ownership.Plane = &.{},
     literal_claim_selection: ?*physical.SharedLiteralStore.LiteralSelection = null,
 
     pub fn create(pool: *physical.Pool, runtime: []const route.InputBinding) !Selection {
@@ -132,13 +133,6 @@ pub const Selection = struct {
         @memset(counts, 0);
         const enabled = try allocator.alloc(bool, if (pool.literal_store) |store| store.literals.len else 0);
         errdefer allocator.free(enabled);
-        @memset(enabled, true);
-        if (pool.plan.execution_reachable) |reachable| {
-            if (reachable.len != pool.plan.node_slots.len) return error.InvalidReachabilityTable;
-            if (pool.literal_store) |store| for (store.literals, enabled) |literal, *active| {
-                active.* = reachable[literal.node];
-            };
-        }
         const aliases = try allocator.alloc(bool, pool.metadata_aliases.len);
         errdefer allocator.free(aliases);
         @memset(aliases, true);
@@ -148,7 +142,12 @@ pub const Selection = struct {
         const alias_index = try AliasIndex.init(allocator, selected.len, pool.metadata_aliases, pool.coverage_graph);
         errdefer alias_index.deinit();
         const epoch = try nextEpoch();
-        var self = Selection{ .allocator = allocator, .epoch = epoch, .inputs = inputs, .routes = selected, .planes = planes, .plane_counts = counts, .literal_enabled = enabled, .alias_enabled = aliases, .alias_index = alias_index, .planes_witnessed = witnessed };
+        const transfer_planes = try allocator.alloc(?ownership.Plane, pool.transfers.len);
+        errdefer allocator.free(transfer_planes);
+        for (pool.transfers, transfer_planes) |maybe, *plane| {
+            plane.* = if (maybe) |transfer| try densePlane(transfer.shape, pool.backends[transfer.backend_index], .primary, epoch) else null;
+        }
+        var self = Selection{ .allocator = allocator, .epoch = epoch, .inputs = inputs, .routes = selected, .planes = planes, .plane_counts = counts, .literal_enabled = enabled, .alias_enabled = aliases, .alias_index = alias_index, .planes_witnessed = witnessed, .transfer_planes = transfer_planes };
         errdefer self.clearRoutes();
         errdefer allocator.free(self.invocation_nodes);
         try self.refreshWithAuthority(pool, authority);
@@ -182,6 +181,22 @@ pub const Selection = struct {
         self.clearRoutes();
         if (self.literal_claim_selection) |claim| claim.release();
         self.literal_claim_selection = null;
+        // Installing regions can qualify consumers that had no ordinary route
+        // during the preceding selection. Recompute the literal fixed point.
+        @memset(self.literal_enabled, true);
+        if (pool.plan.execution_reachable) |reachable| {
+            if (reachable.len != pool.plan.node_slots.len) return error.InvalidReachabilityTable;
+            if (pool.literal_store) |store| for (store.literals, self.literal_enabled) |literal, *active| {
+                active.* = reachable[literal.node];
+            };
+        }
+        if (pool.literal_store) |store| {
+            var baked = pool.baked_region_literals.keyIterator();
+            while (baked.next()) |node| {
+                const index = store.node_indices[node.*];
+                if (index != ml.graph.null_node) self.literal_enabled[index] = false;
+            }
+        }
         const stable = try self.allocator.alloc(bool, if (self.alias_index) |index| index.by_node.len else 0);
         defer self.allocator.free(stable);
         while (true) {
@@ -193,7 +208,8 @@ pub const Selection = struct {
                     if (consumer < self.routes.len) {
                         if (self.routes[consumer] != null) continue;
                         if (pool.regionForNode(consumer)) |installed| {
-                            if (std.mem.indexOfScalar(NodeId, installed.owner.input_nodes, literal.node) != null) continue;
+                            if (std.mem.indexOfScalar(NodeId, installed.owner.input_nodes, literal.node) != null or
+                                std.mem.indexOfScalar(NodeId, installed.owner.literal_nodes, literal.node) != null) continue;
                         }
                     }
                     self.literal_enabled[index] = false;
@@ -262,6 +278,7 @@ pub const Selection = struct {
         if (self.alias_index) |index| index.deinit();
         self.allocator.free(self.invocation_nodes);
         self.allocator.free(self.planes_witnessed);
+        self.allocator.free(self.transfer_planes);
         self.* = undefined;
     }
 
@@ -299,6 +316,23 @@ pub const Selection = struct {
             .witnessed = node < self.planes_witnessed.len and self.planes_witnessed[node],
         };
         return .{ .value = .unknown, .witnessed = false };
+    }
+
+    /// A consumer sees the destination representation of an assigned copy.
+    /// The producer fact remains available to other partitions. Until the
+    /// whole program has admission evidence, validate the dispatch at runtime.
+    fn kernelInput(self: *const Selection, pool: *const physical.Pool, consumer: NodeId, source: NodeId, retained: RetainedInput) RetainedInput {
+        if (self.transfer_planes.len == 0) return retained;
+        const slot = pool.plan.slotForNode(consumer) orelse return retained;
+        const index = pool.plan.transfer_index.get(@import("buffer_plan.zig").transferKey(source, slot.partition_index)) orelse return retained;
+        if (index >= pool.plan.transfers.len) return .{ .value = .unknown, .witnessed = false };
+        const edge = pool.plan.transfers[index];
+        // Placement between partitions on the same provider preserves
+        // the producer's backing and its selected representation.
+        if (edge.source_backend == edge.target_backend and pool.hasUniqueProvider(edge.source_backend)) return retained;
+        if (index >= self.transfer_planes.len or self.transfer_planes[index] == null) return .{ .value = .unknown, .witnessed = false };
+        const plane: *const [1]ownership.Plane = @ptrCast(&self.transfer_planes[index].?);
+        return .{ .value = .{ .planned = .{ .logical = plane[0].descriptor.shape, .planes = plane } }, .witnessed = false };
     }
 
     fn readOnlyHostInputs(pool: *const physical.Pool, current: NodeId) [3]bool {
@@ -367,8 +401,8 @@ pub const Selection = struct {
         const order = try self.allocator.alloc(NodeId, pool.kernels.len);
         defer self.allocator.free(order);
         for (order, 0..) |*node, index| node.* = @intCast(index);
-        std.mem.sort(NodeId, order, @as(*const @import("../graph/buffer_plan.zig").BufferPlan, &pool.plan), struct {
-            fn less(plan: *const @import("../graph/buffer_plan.zig").BufferPlan, a: NodeId, b: NodeId) bool {
+        std.mem.sort(NodeId, order, @as(*const @import("buffer_plan.zig").BufferPlan, &pool.plan), struct {
+            fn less(plan: *const @import("buffer_plan.zig").BufferPlan, a: NodeId, b: NodeId) bool {
                 return plan.positionForNode(a) < plan.positionForNode(b);
             }
         }.less);
@@ -395,7 +429,7 @@ pub const Selection = struct {
             var integer_literals: [3]bool = @splat(false);
             var output_witnessed = true;
             for (kernel.inputs[0..kernel.descriptor.input_count], 0..) |input, index| {
-                const retained = self.retainedInput(pool, input);
+                const retained = self.kernelInput(pool, node, input, self.retainedInput(pool, input));
                 incoming[index] = retained.value;
                 witnesses[index] = retained.witnessed;
                 if (retained.witnessed) if (pool.literal_store) |store| {
@@ -445,6 +479,14 @@ pub const Selection = struct {
             const source = self.retainedInput(pool, alias.source);
             const incoming = source.value;
             const root = @import("metadata_alias.zig").fullSpanRoot(&pool.plan, alias.source, slot.backend);
+            if (alias.input.dtype != .f32 and (incoming != .planned or root == null or (root.?.kind != .allocation and root.?.kind != .constant))) {
+                self.alias_enabled[alias_index] = false;
+                break :alias_candidate;
+            }
+            if (alias.kind == .contiguous_slice and (root == null or root.?.kind != .allocation)) {
+                self.alias_enabled[alias_index] = false;
+                break :alias_candidate;
+            }
             const device_input = if (slot.backend == .cuda and root != null and root.?.kind == .runtime_input)
                 self.inputs.find(root.?.node_id)
             else
@@ -524,7 +566,7 @@ pub const Selection = struct {
                 break :imported try densePlane(host.logical, backend, .primary, self.epoch);
             } else if (binding_value == .imported_device) imported: {
                 const device = binding_value.imported_device;
-                if (backend.kind() != .cuda or device.implementation.context != backend.ptr or device.implementation.table != @as(*const anyopaque, @ptrCast(backend.vtable)) or !device.logical.eq(source_slot.desc.shape) or device.logical.dtype != .f32) break :imported null;
+                if (device.logical.dtype != .f32 or !@import("assigned_kernel_route.zig").bindingDense(backend, binding_value, source_slot.desc.shape)) break :imported null;
                 break :imported try densePlane(device.logical, backend, .primary, self.epoch);
             } else try @import("dense_alias.zig").primary(binding_value, backend, source_slot.desc.shape);
             const primary = candidate orelse continue;
@@ -571,7 +613,7 @@ pub const Selection = struct {
             const owned = self.routes[node].?;
             const kernel = pool.kernels[node].?;
             var incoming: [3]route.Binding = undefined;
-            for (kernel.inputs[0..kernel.descriptor.input_count], 0..) |input, index| incoming[index] = self.binding(pool, input, runtime);
+            for (kernel.inputs[0..kernel.descriptor.input_count], 0..) |input, index| incoming[index] = self.kernelInput(pool, node, input, .{ .value = self.binding(pool, input, runtime), .witnessed = false }).value;
             if (!owned.vtable.matches(owned.context, .{ .inputs = incoming[0..kernel.descriptor.input_count], .output = self.output(pool, node, owned.requirements.primary_bytes) })) return false;
         }
         return true;
@@ -588,11 +630,75 @@ pub const Selection = struct {
             const owned = self.routes[node].?;
             const kernel = pool.kernels[node].?;
             var incoming: [3]route.Binding = undefined;
-            for (kernel.inputs[0..kernel.descriptor.input_count], 0..) |input, index| incoming[index] = if (runtime) |public| self.binding(pool, input, public) else self.retainedInput(pool, input).value;
+            for (kernel.inputs[0..kernel.descriptor.input_count], 0..) |input, index| {
+                const retained: RetainedInput = if (runtime) |public| .{ .value = self.binding(pool, input, public), .witnessed = false } else self.retainedInput(pool, input);
+                incoming[index] = self.kernelInput(pool, node, input, retained).value;
+            }
             try owned.validate(.{ .inputs = incoming[0..kernel.descriptor.input_count], .output = self.output(pool, node, owned.requirements.primary_bytes) });
         }
     }
 };
+
+test "prepared transfer facts expose only the consuming Metal partition representation" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Context = @import("../backends/compute_context.zig").BackendContext;
+    var host_context = try Context.init(a, .native, std.testing.io);
+    defer host_context.deinit(a);
+    var device_context = try Context.init(a, .metal, std.testing.io);
+    defer device_context.deinit(a);
+    const host = host_context.computeBackend();
+    const metal = device_context.computeBackend();
+
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const shape = ml.graph.Shape.init(.f32, &.{4});
+    const x = try builder.parameter("host", shape);
+    const first = try builder.neg(x);
+    const consumer = try builder.absOp(first);
+    try graph.markOutput(consumer);
+    const partition = @import("../graph/partition.zig");
+    var parts = [_]partition.Partition{
+        .{ .backend = .native, .node_ids = &.{ x, first }, .external_inputs = &.{} },
+        .{ .backend = .metal, .node_ids = &.{consumer}, .external_inputs = &.{.{ .node_id = first, .source_partition = 0 }} },
+    };
+    const placement: partition.PartitionPlan = .{
+        .allocator = a,
+        .partitions = &parts,
+        .node_assignment = &.{ 0, 0, 1 },
+        .node_operator_plans = &.{ null, null, null },
+        .owns_executors = false,
+    };
+    var plan = try @import("buffer_plan.zig").build(a, &graph, &placement, .{});
+    defer plan.deinit();
+    const pool = (try physical.Pool.create(a, &graph, &plan, &.{ &host, &metal }, placement.node_operator_plans)) orelse return error.MissingPhysicalPool;
+    defer pool.deinit();
+    var selection = try Selection.create(pool, &.{});
+    defer selection.deinit();
+
+    const original = [1]ownership.Plane{try Selection.densePlane(shape, host, .primary, selection.epoch)};
+    const source: Selection.RetainedInput = .{ .value = .{ .planned = .{ .logical = shape, .planes = &original } }, .witnessed = true };
+    const selected_route = selection.routes[consumer] orelse return error.MissingPreparedKernelRoute;
+    try std.testing.expectEqual(.invocation, selected_route.validation_scope);
+    try std.testing.expect(selection.matches(pool, &.{}));
+    const projected = selection.kernelInput(pool, consumer, first, source);
+    try std.testing.expect(!projected.witnessed);
+    try std.testing.expectEqual(.metal, projected.value.planned.planes[0].descriptor.current_backend);
+    try std.testing.expectEqual(.metal_buffer, projected.value.planned.planes[0].descriptor.storage);
+    const local = selection.kernelInput(pool, first, x, source);
+    try std.testing.expect(local.witnessed);
+    try std.testing.expectEqual(.native, local.value.planned.planes[0].descriptor.current_backend);
+    // Compatibility copies cannot use the producer's representation as a
+    // destination guarantee when the physical transfer is unavailable.
+    try std.testing.expectEqual(@as(usize, 1), selection.transfer_planes.len);
+    selection.transfer_planes[0] = null;
+    const unplanned = selection.kernelInput(pool, consumer, first, source);
+    try std.testing.expect(!unplanned.witnessed);
+    try std.testing.expect(unplanned.value == .unknown);
+    try std.testing.expect(!selection.matches(pool, &.{}));
+}
 
 test "invocation validation worklist excludes immutable programs and refresh is failure atomic" {
     const Case = struct {
@@ -823,7 +929,7 @@ fn currentConsumerReadOnlyCase(a: std.mem.Allocator) !void {
     const second = try builder.gather(table, indices, output_shape);
     try graph.markOutput(first);
     try graph.markOutput(second);
-    var layout = try @import("../graph/runtime.zig").PhysicalLayout.create(a, &graph, &.{&native}, .{}, false);
+    var layout = try @import("graph_runtime.zig").PhysicalLayout.create(a, &graph, &.{&native}, .{}, false);
     defer layout.deinit();
     const reachable = try a.alloc(bool, graph.nodeCount());
     defer a.free(reachable);

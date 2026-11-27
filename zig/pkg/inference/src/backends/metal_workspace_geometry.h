@@ -132,19 +132,17 @@ typedef struct antfly_metal_prefill_scratch_sizes {
     size_t slots[ANTFLY_PREFILL_SCRATCH_COUNT];
     size_t bytes[ANTFLY_PREFILL_SCRATCH_COUNT];
 } antfly_metal_prefill_scratch_sizes;
-static inline int antfly_workspace_geometry_prefill_scratch(
-    size_t rows, size_t heads, size_t kv_heads, size_t head_dim,
+static inline int antfly_workspace_geometry_prefill_scratch_widths(
+    size_t rows, size_t q_width, size_t kv_width,
     size_t hidden, size_t intermediate, size_t tail_vocab,
     antfly_metal_prefill_scratch_sizes *out
 ) {
     if (!out) return -1;
-    if (!rows || !heads || !kv_heads || !head_dim) return -2;
+    if (!rows || !q_width || !kv_width) return -2;
     size_t q, kv, h, ffn, tail;
-    if (!antfly_workspace_geometry_mul(rows, heads, &q) ||
-        !antfly_workspace_geometry_mul(q, head_dim, &q) ||
+    if (!antfly_workspace_geometry_mul(rows, q_width, &q) ||
         !antfly_workspace_geometry_mul(q, sizeof(float), &q) ||
-        !antfly_workspace_geometry_mul(rows, kv_heads, &kv) ||
-        !antfly_workspace_geometry_mul(kv, head_dim, &kv) ||
+        !antfly_workspace_geometry_mul(rows, kv_width, &kv) ||
         !antfly_workspace_geometry_mul(kv, sizeof(float), &kv) ||
         !antfly_workspace_geometry_mul(rows, hidden, &h) ||
         !antfly_workspace_geometry_mul(h, sizeof(float), &h) ||
@@ -169,6 +167,19 @@ static inline int antfly_workspace_geometry_prefill_scratch(
     };
     *out = value;
     return 0;
+}
+
+static inline int antfly_workspace_geometry_prefill_scratch(
+    size_t rows, size_t heads, size_t kv_heads, size_t head_dim,
+    size_t hidden, size_t intermediate, size_t tail_vocab,
+    antfly_metal_prefill_scratch_sizes *out
+) {
+    if (!out) return -1;
+    if (!rows || !heads || !kv_heads || !head_dim) return -2;
+    size_t q_width, kv_width;
+    if (!antfly_workspace_geometry_mul(heads, head_dim, &q_width) ||
+        !antfly_workspace_geometry_mul(kv_heads, head_dim, &kv_width)) return -3;
+    return antfly_workspace_geometry_prefill_scratch_widths(rows, q_width, kv_width, hidden, intermediate, tail_vocab, out);
 }
 
 // Standalone staging reuses offset zero and never advances a frame cursor.

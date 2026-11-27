@@ -2069,10 +2069,19 @@ fn projectCohortParts(a: std.mem.Allocator, session: Session, cb: *const Compute
         }
         if (wave.count != 0) {
             if (cb.embedding_stage) |stage| try stage.acquire();
-            var request = base.request.?;
-            const scratch = if (image) (try preparedVisionScratch(session, wave.images[0..wave.count], 2 * 1024 * 1024 * 1024, control)) else audioRunRequest(session.backend(), 0, 0, wave.count).workspace_bytes;
-            request.workspace_bytes = @max(request.workspace_bytes, scratch + groups.len * 8192 * 512 * 4);
-            var supplement = if (!image and session.run_admission != null) try scheduler.lane.admitPhaseScoped(try session.run_admission.?.estimateRequest(request, session.outputInfo()), scheduler.lane.credit()) else scheduler.lane.emptyPhase();
+            const scratch = if (image) try preparedVisionScratch(session, wave.images[0..wave.count], 2 * 1024 * 1024 * 1024, control) else audioRunRequest(session.backend(), 0, 0, wave.count).workspace_bytes;
+            var supplement = phase: {
+                const admission = session.run_admission orelse break :phase scheduler.lane.emptyPhase();
+                if (image) break :phase scheduler.lane.emptyPhase();
+                var request = base.request.?;
+                // The tower overlaps the projected rows in the inspected cohort.
+                const retained_bytes = if (boundedGroupPlanning(session.backend(), options))
+                    scheduler.retained
+                else
+                    try std.math.mul(usize, groups.len, 8192 * 512 * @sizeOf(f32));
+                request.workspace_bytes = @max(request.workspace_bytes, try std.math.add(usize, scratch, retained_bytes));
+                break :phase try scheduler.lane.admitPhaseScoped(try admission.estimateRequest(request, session.outputInfo()), scheduler.lane.credit());
+            };
             defer supplement.deinit();
             var audio: [4]*const projector.PreparedAudio = undefined;
             if (!image) {
@@ -3120,6 +3129,10 @@ pub fn audioRunRequest(backend: @import("../backends/backends.zig").BackendType,
     return .{ .batch = batch, .sequence = 1024, .input_bytes = input_bytes, .pre_admitted_host_bytes = retained_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = if (backend == .metal) 768 * 1024 * 1024 else 512 * 1024 * 1024, .output_bytes = batch * 768 * 4 };
 }
 
+pub fn preparedAudioRunRequest(backend: @import("../backends/backends.zig").BackendType, input_bytes: usize, retained_bytes: usize, batch: usize, sequence: usize) !@import("../backends/session.zig").RunRequest {
+    return preparedRunRequest(backend, input_bytes, retained_bytes, batch, sequence, audioRunRequest(backend, 0, 0, batch).workspace_bytes);
+}
+
 /// Audio-only clips: conformer context stays independent per clip; length-
 /// qualified cohorts share the downstream embedding encoder and final pooling.
 pub fn embedAudios(out: std.mem.Allocator, session: Session, tokenizer: Tokenizer, clips: []const @import("audio_preparation.zig").Clip, options: Options, lock: ?*std.atomic.Mutex, supplied: ?Control, errors: ?[]?anyerror) !AudioBatchResult {
@@ -3190,7 +3203,7 @@ pub fn embedAudios(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
         if (options.timings) |t| t.max_prepared_audio = @max(t.max_prepared_audio, slot.clips.len + if (options.prepare_ahead) next_count else 0);
         if (slot.retained > 0) {
             var execution_waiter = Scheduler.Waiter{};
-            const staged = audioUsesStagedExecution(session.backend());
+            const staged = audioUsesStagedExecution(session, lock);
             if (!staged) try enterModel(session, lock, control, &execution_waiter);
             defer if (!staged) leaveModel(lock, &execution_waiter);
             try consumePreparedAudios(out, slot, tokenizer, cfg, options, vectors[offset..][0..slot.consumed], token_counts[offset..][0..slot.consumed], &observation, if (next_count > 0 and options.prepare_ahead) &slots[next] else null, lock);
@@ -3214,10 +3227,12 @@ pub fn embedAudios(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     return .{ .vectors = vectors, .input_tokens = token_counts, .execution = observation.execution(observation.native_items + observation.serial_items) };
 }
 
-// Native media getters need the same actual Model/B cache loan as CUDA;
-// ordinary Metal keeps its original provider and numerical lane.
-fn audioUsesStagedExecution(backend: @import("../backends/backends.zig").BackendType) bool {
-    return backend == .native or backend == .cuda;
+fn audioUsesStagedExecution(session: Session, lock: ?*std.atomic.Mutex) bool {
+    return switch (session.backend()) {
+        .native, .cuda => true,
+        .metal => lock != null and session.model_lifetime != null and session.run_admission != null,
+        else => false,
+    };
 }
 
 fn consumePreparedAudios(out: std.mem.Allocator, slot: *@import("audio_preparation.zig").Wave, tokenizer: Tokenizer, cfg: encoder.Config, options: Options, vectors: [][]f32, token_counts: []usize, observation: *BatchExecution.Observation, future: ?*@import("audio_preparation.zig").Wave, lock: ?*std.atomic.Mutex) !void {
@@ -3229,23 +3244,35 @@ fn consumePreparedAudios(out: std.mem.Allocator, slot: *@import("audio_preparati
     const a = slot.allocator();
     var sequence: usize = 1;
     for (slot.gemma[0..slot.retained]) |*prepared| sequence = @max(sequence, prepared.tokenCount() + 4);
-    const request = try preparedRunRequest(slot.session.backend(), slot.input_bytes, slot.retained_bytes, slot.retained, sequence, if (slot.session.backend() == .metal) 768 * 1024 * 1024 else 512 * 1024 * 1024);
+    const request = try preparedAudioRunRequest(slot.session.backend(), slot.input_bytes, slot.retained_bytes, slot.retained, sequence);
     if (slot.bounded.live > request.host_preprocess_bytes) return error.MemoryBudgetExceeded;
     slot.bounded.limit = request.host_preprocess_bytes;
     var permit = admitWithVisionCacheReclaim(slot.session, request, slot.control) catch |err| blk: {
-        const next = future orelse return err;
         if (!@import("audio_preparation.zig").pressure(err)) return err;
-        next.deinit();
-        next.failure = err;
+        var denied = err;
+        if (future) |next| {
+            next.deinit();
+            next.failure = err;
+            if (admitWithVisionCacheReclaim(slot.session, request, slot.control)) |permit|
+                break :blk permit
+            else |failure|
+                denied = failure;
+        }
+        // Staged Metal takes its model and provider locks after admission. An
+        // idle peer can release residency before any clips start projection.
+        if (denied != error.ResourceTemporarilyUnavailable or slot.session.backend() != .metal or !audioUsesStagedExecution(slot.session, lock)) return denied;
+        try slot.control.check();
+        if (!slot.session.reclaimIdleForRunOutsideExecution()) return denied;
         break :blk try admitWithVisionCacheReclaim(slot.session, request, slot.control);
     };
     defer permit.deinit();
     const staged_cuda = slot.session.backend() == .cuda;
-    const staged = audioUsesStagedExecution(slot.session.backend());
+    const staged = audioUsesStagedExecution(slot.session, lock);
+    const idle_backend = if (slot.session.backend() == .metal) request.workspace_bytes else 0;
     var execution_waiter = Scheduler.Waiter{};
     var stage_counters = StageLane.Counters{};
     defer collectStageCounters(options.timings, stage_counters);
-    var lane = StageLane{ .execution_lane = options.execution_lane, .execution_lane_interactive = options.execution_lane_interactive, .session = slot.session, .gate = lock, .waiter = &execution_waiter, .cb = undefined, .control = slot.control, .permit = &permit, .idle_backend = 0, .scheduling_enabled = false, .active = false, .timings = if (options.timings != null) &stage_counters else null };
+    var lane = StageLane{ .execution_lane = options.execution_lane, .execution_lane_interactive = options.execution_lane_interactive, .session = slot.session, .gate = lock, .waiter = &execution_waiter, .cb = undefined, .control = slot.control, .permit = &permit, .idle_backend = idle_backend, .scheduling_enabled = false, .prepare_metal_audio_scratch = true, .active = false, .timings = if (options.timings != null) &stage_counters else null };
     defer lane.deinit();
     var unstaged: ?compute_provider.ManagedComputeBackend = null;
     defer if (unstaged) |*managed| managed.deinit();
@@ -6517,6 +6544,8 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
     const model_path = platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_MODEL") orelse return error.SkipZigTest;
     const oracle = platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_MEDIA_ORACLE") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
+    var stage: []const u8 = "load fixtures";
+    errdefer std.debug.print("embeddinggemma2 CUDA grouped Stage failed during {s}\n", .{stage});
     const memory = @import("../runtime/tier/memory.zig");
     const file = @import("../util/c_file.zig");
     const image_path = try std.fs.path.join(a, &.{ std.fs.path.dirname(oracle).?, "image.png" });
@@ -6601,9 +6630,11 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
     const options: Options = .{};
     // FIRST numerical inference uses the real ordered group and the SAME
     // instruction, projected buffers, token order and resident Stage body.
+    stage = "publish mixed text, image and audio";
     var owned = try embedOwned(session, hf.tokenizer(), group, options, session.execution_gate, control, .{ .outside_execution = true });
     defer owned.vectors.deinitOutsideExecution();
     try std.testing.expectEqual(@as(usize, 1), owned.vectors.len());
+    stage = "evaluate mixed reference";
     const raw = try embed(a, session, hf.tokenizer(), group, options, session.execution_gate, control);
     defer a.free(raw.vector);
     try std.testing.expectEqual(raw.input_tokens, owned.input_tokens);
@@ -6619,6 +6650,9 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
         graphs: usize = 0,
         executions: u64 = 0,
         replays: u64 = 0,
+        max_planned_arena_bytes: usize = 0,
+        max_captured_arena_bytes: usize = 0,
+        max_repacked_scratch_savings_bytes: usize = 0,
         fn read(actual: Session, supplied: Control) !@This() {
             // Metadata only, under the SAME actual model cohort. Attest the
             // canonical full published CUDA table before inspecting its ctx;
@@ -6633,17 +6667,24 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
             try cuda.CudaCompute.checkRequestCacheRetirement(&cb);
             const compute: *const cuda.CudaCompute = @ptrCast(@alignCast(cb.ptr));
             var result = @This(){ .executions = compute.audio_arena_executes, .replays = compute.audio_graph_replays };
-            for (compute.audio_plans.entries) |entry| if (entry.owner != null and entry.plan != null and !entry.disabled) {
+            for (compute.audio_plans.entries) |entry| if (entry.owner != null and entry.owner.?.managed and !entry.disabled) {
                 result.owners += 1;
+                if (entry.owner.?.executable) |executable| {
+                    result.max_planned_arena_bytes = @max(result.max_planned_arena_bytes, executable.storage.bytes);
+                    if (executable.storage.external_output)
+                        result.max_repacked_scratch_savings_bytes = @max(result.max_repacked_scratch_savings_bytes, entry.owner.?.plan.external_scratch_savings_bytes);
+                }
             };
             for (compute.embedding_gemma2_execution.arenas) |arena| if (arena.kind == .audio and arena.graph != null) {
                 result.graphs += 1;
+                result.max_captured_arena_bytes = @max(result.max_captured_arena_bytes, arena.buffers[0].len);
             };
             return result;
         }
     };
     const audio_optin = platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_AUDIO_GRAPH");
     const audio_before = try AudioWitness.read(session, control);
+    stage = "prepare first audio cohort";
     const first_audio = try embedAudios(a, session, hf.tokenizer(), &clips, options, session.execution_gate, control, null);
     defer {
         for (first_audio.vectors) |vector| a.free(vector);
@@ -6651,6 +6692,7 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
         a.free(first_audio.input_tokens);
     }
     try std.testing.expectEqual(@as(usize, 2), first_audio.vectors.len);
+    stage = "replay repeated audio cohorts";
     for (0..if (audio_optin) @as(usize, 6) else @as(usize, 2)) |_| {
         const repeated_audio = try embedAudios(a, session, hf.tokenizer(), &clips, options, session.execution_gate, control, null);
         defer {
@@ -6667,13 +6709,24 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
     }
     const audio_after = try AudioWitness.read(session, control);
     if (audio_optin) {
+        stage = "verify captured audio ownership and replay";
+        std.debug.print("embeddinggemma2 CUDA grouped audio before={any} after={any}\n", .{ audio_before, audio_after });
         try std.testing.expect(audio_after.owners > audio_before.owners);
         try std.testing.expect(audio_after.graphs > audio_before.graphs);
         try std.testing.expect(audio_after.executions >= audio_before.executions + 2);
         try std.testing.expect(audio_after.replays > audio_before.replays);
+        try std.testing.expect(audio_after.max_captured_arena_bytes > 0);
+        try std.testing.expect(audio_after.max_planned_arena_bytes > 0);
+        std.debug.print("embeddinggemma2 CUDA grouped audio max_planned_arena_bytes={d} max_captured_arena_bytes={d} max_repacked_scratch_savings_bytes={d} replays={d}\n", .{
+            audio_after.max_planned_arena_bytes,
+            audio_after.max_captured_arena_bytes,
+            audio_after.max_repacked_scratch_savings_bytes,
+            audio_after.replays - audio_before.replays,
+        });
     }
     // Existing six-second closed.mp4 naturally selects six unique frames:
     // image_batch uses one full4 +one final2 flush, without changing cadence.
+    stage = "prepare video and qualify replay";
     const video_group: Group = .{ .content = &.{.{ .video = @embedFile("../testdata/video/closed.mp4") }} };
     const video_inspection = try @import("../ops/cuda/video.zig").inspectEmbedding(a, @embedFile("../testdata/video/closed.mp4"), .{});
     const video_geometry = @import("../architectures/gemma4_projector.zig").embeddingGemma2VideoGeometry(video_inspection.width, video_inspection.height);

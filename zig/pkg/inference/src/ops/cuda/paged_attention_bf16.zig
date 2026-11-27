@@ -17,6 +17,7 @@ const std = @import("std");
 const context = @import("context.zig");
 const driver = @import("driver.zig");
 
+pub const max_packet_rows = @import("../kernel_geometry.zig").cuda_paged_decode_packet_rows;
 pub const max_blocks = 4096;
 // Native decoder KV pages contain 16 tokens. The packet bounds aggregate
 // table ownership; individual request/context ceilings remain independent.
@@ -36,6 +37,83 @@ pub fn geometrySupported(heads: usize, kv_heads: usize, head_dim: usize) bool {
 
 pub fn useChunk128(requested: ?bool, heads: usize) bool {
     return requested orelse (heads == 16);
+}
+
+/// The partial values and their softmax statistics have the same lifetime.
+pub const ScratchLayout = struct {
+    chunk128: bool,
+    chunks: u32,
+    output_elements: usize,
+    statistics_offset: usize,
+    bytes: usize,
+
+    pub fn init(rows: usize, heads: usize, kv_heads: usize, dim: usize, tokens: usize, chunk128: bool) !ScratchLayout {
+        if (rows < 2 or rows > max_packet_rows or !geometrySupported(heads, kv_heads, dim) or tokens == 0 or tokens > std.math.maxInt(u32))
+            return error.InvalidShape;
+        const chunk_size: usize = if (chunk128) 128 else 32;
+        const chunks = (tokens - 1) / chunk_size + 1;
+        // The split kernel maps packet rows and context chunks to grid.y.
+        if (chunks > 65535 / rows) return error.InvalidShape;
+        const partial_rows = try std.math.mul(usize, rows * heads, chunks);
+        const bytes = try std.math.mul(usize, partial_rows, (dim + 2) * @sizeOf(f32));
+        return .{
+            .chunk128 = chunk128,
+            .chunks = @intCast(chunks),
+            .output_elements = rows * heads * dim,
+            .statistics_offset = partial_rows * dim * @sizeOf(f32),
+            .bytes = bytes,
+        };
+    }
+};
+
+/// Resolve packet scratch for the entire two-step graph before staging any
+/// inputs. The scheduler splits wide cohorts into 64-row packets and a tail.
+pub const DecodeScratch = struct {
+    pub const Geometry = struct { heads: usize, kv_heads: usize, dim: usize };
+
+    geometry: Geometry,
+    tokens: usize,
+    full_rows: usize,
+    full: ScratchLayout,
+    tail_rows: usize,
+    tail: ?ScratchLayout,
+
+    pub fn init(rows: usize, tokens: usize, geometry: Geometry, chunk128: bool) !DecodeScratch {
+        if (rows > 2 * max_packet_rows) return error.InvalidShape;
+        const full_rows = @min(rows, max_packet_rows);
+        const tail_rows = rows - full_rows;
+        return .{
+            .geometry = geometry,
+            .tokens = tokens,
+            .full_rows = full_rows,
+            .full = try ScratchLayout.init(full_rows, geometry.heads, geometry.kv_heads, geometry.dim, tokens, chunk128),
+            .tail_rows = tail_rows,
+            .tail = if (tail_rows == 0) null else try ScratchLayout.init(tail_rows, geometry.heads, geometry.kv_heads, geometry.dim, tokens, chunk128),
+        };
+    }
+
+    pub fn forPacket(self: DecodeScratch, rows: usize, tokens: usize, geometry: Geometry) !ScratchLayout {
+        if (tokens > self.tokens or !std.meta.eql(geometry, self.geometry)) return error.InvalidExecutionPlan;
+        if (rows == self.full_rows) return self.full;
+        if (rows == self.tail_rows) return self.tail orelse error.InvalidExecutionPlan;
+        return error.InvalidExecutionPlan;
+    }
+};
+
+test "bounded CUDA decoder attention admits contexts above 1024 within its launch geometry" {
+    try std.testing.expectEqual(@as(u32, 33), (try ScratchLayout.init(2, 8, 2, 256, 1025, false)).chunks);
+    try std.testing.expectError(error.InvalidShape, ScratchLayout.init(64, 8, 2, 256, 32768, false));
+    try std.testing.expectEqual(@as(u32, 256), (try ScratchLayout.init(64, 8, 2, 256, 32768, true)).chunks);
+}
+
+test "bounded CUDA decoder declares the full and tail paged attention scratch" {
+    const geometry: DecodeScratch.Geometry = .{ .heads = 8, .kv_heads = 2, .dim = 256 };
+    const plan = try DecodeScratch.init(67, 321, geometry, false);
+    try std.testing.expectEqualDeep(try ScratchLayout.init(64, 8, 2, 256, 321, false), try plan.forPacket(64, 319, geometry));
+    try std.testing.expectEqualDeep(try ScratchLayout.init(3, 8, 2, 256, 321, false), try plan.forPacket(3, 320, geometry));
+    try std.testing.expectError(error.InvalidExecutionPlan, plan.forPacket(3, 322, geometry));
+    try std.testing.expectError(error.InvalidExecutionPlan, plan.forPacket(2, 319, geometry));
+    try std.testing.expectError(error.InvalidShape, DecodeScratch.init(65, 321, geometry, false));
 }
 
 test "LightOnOCR3 batched attention policy checks artifact support and preserves chunk override" {
@@ -71,7 +149,7 @@ pub const Params = extern struct {
     page_size: u32 = 0,
     row_values: u32 = 0,
     capacity: u32 = 0,
-    pages: [64]Page = @splat(.{}),
+    pages: [max_packet_rows]Page = @splat(.{}),
     blocks: [max_blocks]u32 = @splat(0),
     graph_progress: driver.CUdeviceptr = 0,
     graph_step: u32 = 0,

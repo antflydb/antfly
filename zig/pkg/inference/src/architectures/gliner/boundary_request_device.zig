@@ -43,6 +43,7 @@ pub const Limits = struct {
 };
 
 pub const Options = struct {
+    backend: ops.BackendKind = .metal,
     /// Planning-only declaration, before row error storage is installed.
     /// Execution also derives this requirement from pipeline.independent_rows.
     independent_requests: bool = false,
@@ -95,7 +96,7 @@ fn add(a: usize, b: usize) !usize {
 }
 
 fn encoderOptions(options: Options) engine.Options {
-    return .{ .precision = options.precision, .execution_policy = options.execution_policy, .admission = options.limits.encoder, .max_device_bytes = options.limits.max_encoder_device_bytes, .max_result_download_bytes = options.limits.scorer.max_result_download_bytes, .control = options.pipeline.control };
+    return .{ .backend = options.backend, .precision = options.precision, .execution_policy = options.execution_policy, .admission = options.limits.encoder, .max_device_bytes = options.limits.max_encoder_device_bytes, .max_result_download_bytes = options.limits.scorer.max_result_download_bytes, .control = options.pipeline.control };
 }
 
 pub fn requiredHeadOutputs(schemas: []const *const schema.CompiledSchema) head.RequiredHeadOutputs {
@@ -222,14 +223,16 @@ pub fn runWindowsWithOutputAllocator(cb: *const ops.ComputeBackend, allocator: s
     return execute(true, cb, allocator, output_allocator, config, prepared, schemas, options);
 }
 
-fn execute(comptime windows: bool, cb: *const ops.ComputeBackend, allocator: std.mem.Allocator, output_allocator: std.mem.Allocator, config: *const model.Config, prepared: *const processor.PreparedBatch, schemas: []const *const schema.CompiledSchema, options: Options) !(if (windows) WindowResult else Result) {
+fn execute(comptime windows: bool, cb: *const ops.ComputeBackend, allocator: std.mem.Allocator, output_allocator: std.mem.Allocator, config: *const model.Config, prepared: *const processor.PreparedBatch, schemas: []const *const schema.CompiledSchema, requested_options: Options) !(if (windows) WindowResult else Result) {
+    var options = requested_options;
+    options.backend = cb.kind();
     try checkBackend(cb);
     const admitted = try plan(config, prepared, schemas, options);
     var encoded = try engine.encodeDevice(cb, allocator, config, prepared, encoderOptions(options));
     defer encoded.deinit();
     var headed: ?head.Result = if (admitted.head != null) blk: {
         var input = try encoded.asHeadInput(options.pipeline.control);
-        if (options.execution_policy == .optimized_v2) input.required_outputs = requiredHeadOutputs(schemas);
+        if (options.execution_policy == .optimized_v2 or cb.kind() == .cuda) input.required_outputs = requiredHeadOutputs(schemas);
         break :blk try head.forwardDevice(cb, allocator, config, input, options.limits.head);
     } else null;
     defer if (headed) |*value| value.deinit();

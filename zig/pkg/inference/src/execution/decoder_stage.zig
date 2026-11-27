@@ -29,6 +29,7 @@ pub const Row = struct {
     logits: []const f32 = &.{},
     vocab_size: usize = 0,
     stats: ?ops.WhisperLogitsStatsRaw = null,
+    token: ?u32 = null,
     owned_logits: ?[]f32 = null,
     host_outputs: []backends.Tensor = &.{},
     host_logits: ?backends.Tensor = null,
@@ -57,12 +58,8 @@ pub const RetainedEncoderSource = Native.Source;
 /// The caller owns the mutable encoder holder during promotion. The source
 /// owns its shape snapshot and an independent complete storage/provider pin.
 pub fn retainIncrementalSource(allocator: std.mem.Allocator, encoded: *stages.EncoderOutputs, decoder: backends.Session) !?RetainedEncoderSource {
-    const resident = switch (encoded.*) {
-        .host => return null,
-        .resident => |*value| value,
-    };
-    const receiver = resident.incremental_receiver orelse return null;
-    if (receiver.destination_ptr != decoder.ptr or receiver.destination_vtable != decoder.vtable or resident.values.outputs.len != 1) return error.InvalidIncrementalReceiver;
+    const receiver = (try encoded.incrementalReceiverFor(decoder)) orelse return null;
+    const resident = &encoded.resident;
     const pin = try resident.values.retainResources(allocator);
     return .{ .receiver = receiver, .value = resident.values.outputs[0], .backend = resident.values.backend, .shape = resident.shape, .resources = pin };
 }
@@ -129,7 +126,10 @@ pub const Decoder = struct {
         errdefer if (native) |*value| value.deinit();
         var compiled = if (native == null and options.allow_native and host != null) try @import("resident_decoder.zig").Decoder.initEncoderDecoder(allocator, session, encoder_length, options.compiled_cache, control) else null;
         errdefer if (compiled) |*value| value.deinit();
-        const incremental = if (options.allow_merged and native == null and compiled == null and host != null) try merged.State.init(allocator, session, host.?, encoder_mask, vocab_size) else null;
+        const incremental = if (options.allow_merged and native == null and compiled == null)
+            try merged.State.init(allocator, session, try stages.decoderHiddenInput(encoder, encoder_mask.len), encoder_mask, vocab_size)
+        else
+            null;
         const full_prefix = if (native == null and compiled == null and incremental == null)
             try stages.DecoderInputPlan.init(allocator, try session.inputInfoForStage(.decoder))
         else
@@ -184,6 +184,14 @@ pub const Decoder = struct {
         });
     }
 
+    pub fn retireEncoderAfterPrefill(self: *Decoder, encoder: *stages.EncoderOutputs) void {
+        if (self.encoder != encoder) return;
+        const state = if (self.incremental) |*value| value else return;
+        if (!state.detachEncoderPayload()) return;
+        encoder.deinit(self.allocator);
+        encoder.* = .{ .host = &.{} };
+    }
+
     pub fn deinit(self: *Decoder) void {
         if (self.native) |*value| value.deinit();
         if (self.compiled) |*value| value.deinit();
@@ -217,8 +225,8 @@ pub const Decoder = struct {
         }
         if (self.compiled) |*decoder| {
             const outputs = self.encoder.host;
-            row.owned_logits = try decoder.encoderDecoderSuffix(suffix, outputs[0], self.encoder_mask, self.allocator, self.control);
-            row.logits = row.owned_logits.?;
+            row.host_logits = try decoder.encoderDecoderSuffix(suffix, outputs[0], self.encoder_mask, self.allocator, self.control);
+            row.logits = row.host_logits.?.asFloat32();
             return row;
         }
         if (self.incremental) |*state| {
@@ -242,6 +250,10 @@ pub const Decoder = struct {
     }
 
     pub fn stepFullPrefix(self: *Decoder, prefix: []const i64, dispatch: anytype) !Row {
+        return self.stepFullPrefixSelecting(prefix, dispatch, null);
+    }
+
+    pub fn stepFullPrefixSelecting(self: *Decoder, prefix: []const i64, dispatch: anytype, token_policy: ?stages.FinalTokenPolicy) !Row {
         var row = Row{ .allocator = self.allocator, .vocab_size = self.vocab_size };
         errdefer row.deinit();
         var inputs: stages.DecoderInputs = undefined;
@@ -250,8 +262,16 @@ pub const Decoder = struct {
         try plan.bind(&inputs, prefix, self.encoder_mask, hidden);
         switch (hidden) {
             .resident => {
-                row.owned_logits = try stages.finalVocabularyRow(self.allocator, self.session, inputs.stageInputs(), prefix.len, self.vocab_size, self.control);
-                row.logits = row.owned_logits.?;
+                const adapters = @import("tensor_dispatch.zig");
+                const stage = adapters.stageDispatcher(dispatch);
+                if (adapters.hasDispatcher(dispatch) and stage == null) return error.DecoderDispatchChanged;
+                switch (try stages.finalVocabularyResult(self.allocator, self.session, inputs.stageInputs(), prefix.len, self.vocab_size, self.control, stage, token_policy)) {
+                    .row => |logits| {
+                        row.owned_logits = logits;
+                        row.logits = logits;
+                    },
+                    .token => |token| row.token = token,
+                }
             },
             .host => {
                 const host_inputs = try inputs.hostInputs();

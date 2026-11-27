@@ -17,7 +17,8 @@
 //! Reuses the graph KV owner, never a process-global prompt/context cache.
 const std = @import("std");
 const backends = @import("../backends/backends.zig");
-const kv = @import("../graph/onnx_kv_cache.zig");
+const kv = @import("onnx_kv_cache.zig");
+const ops = @import("../ops/ops.zig");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 
 const sessions = @import("../backends/session.zig");
@@ -54,15 +55,15 @@ pub fn qualifiedSignature(inputs: []const backends.TensorInfo, outputs: []const 
             if (info.dtype != .bool_ or info.shape.len > 1 or (info.shape.len == 1 and info.shape[0] != 1)) return false;
             branch = true;
         } else if (kv.pastInputSuffix(info.name)) |suffix| {
-            if (!validCacheSuffix(suffix) or info.dtype != .f32 or info.shape.len != 4 or info.shape[0] == 0 or info.shape[0] > 1 or info.shape[1] <= 0 or info.shape[2] >= 0 or info.shape[3] <= 0) return false;
+            const role = kv.cacheRole(suffix) orelse return false;
+            if (info.dtype != .f32 or info.shape.len != 4 or info.shape[0] == 0 or info.shape[0] > 1 or info.shape[1] <= 0 or info.shape[2] >= 0 or info.shape[3] <= 0) return false;
             const present = for (outputs) |output| {
                 if (kv.presentNameMatchesPastInput(info.name, output.name)) break output;
             } else return false;
             if (present.shape.len != 4 or
                 (present.shape[1] >= 0 and present.shape[1] != info.shape[1]) or
                 (present.shape[3] >= 0 and present.shape[3] != info.shape[3])) return false;
-            const cross = std.mem.indexOf(u8, suffix, ".encoder.") != null;
-            if (!cross and present.shape[2] >= 0) return false;
+            if (role == .self_attention and present.shape[2] >= 0) return false;
             past_count += 1;
         } else return false;
     }
@@ -75,26 +76,19 @@ pub fn qualifiedSignature(inputs: []const backends.TensorInfo, outputs: []const 
                 info.shape[1] >= 0 or (info.shape[2] >= 0 and info.shape[2] != vocab)) return false;
             logits = true;
         } else if (kv.presentOutputSuffix(info.name)) |suffix| {
-            if (!validCacheSuffix(suffix) or info.dtype != .f32 or info.shape.len != 4 or info.shape[0] == 0 or info.shape[0] > 1) return false;
+            if (kv.cacheRole(suffix) == null or info.dtype != .f32 or info.shape.len != 4 or info.shape[0] == 0 or info.shape[0] > 1) return false;
             present_count += 1;
         } else return false;
     }
     return ids and encoder and branch and logits and past_count > 0 and past_count == present_count;
 }
 
-fn validCacheSuffix(suffix: []const u8) bool {
-    const dot = std.mem.indexOfScalar(u8, suffix, '.') orelse return false;
-    _ = std.fmt.parseInt(usize, suffix[0..dot], 10) catch return false;
-    for ([_][]const u8{ ".decoder.key", ".decoder.value", ".encoder.key", ".encoder.value" }) |ending|
-        if (std.mem.eql(u8, suffix[dot..], ending)) return true;
-    return false;
-}
-
 fn cacheBound(session: backends.Session, batch: usize, tokens: usize, context: usize) !usize {
     var total: usize = 0;
     for (session.inputInfo()) |info| {
         const suffix = kv.pastInputSuffix(info.name) orelse continue;
-        const time = if (std.mem.indexOf(u8, suffix, ".encoder.") != null) context else tokens;
+        const role = kv.cacheRole(suffix) orelse return error.UnresolvedOutputGeometry;
+        const time = if (role == .cross_attention) context else tokens;
         const rows = try std.math.mul(usize, batch, time);
         const features = try std.math.mul(usize, @intCast(info.shape[1]), @intCast(info.shape[3]));
         const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, features), info.dtype.byteSize());
@@ -142,27 +136,48 @@ pub const State = struct {
     roles: []InputRole,
     resident_slots: ?[]?ResidentSlot = null,
     stage_inputs: []sessions.StageInput = &.{},
+    cache_copy_reservations: std.ArrayList(CacheCopyReservation) = .empty,
     logits_index: usize,
     /// Encoder buffers and mask are pinned by the enclosing generation request.
-    encoder: backends.Tensor,
+    encoder: sessions.StageInput,
+    retired_encoder_shape: ?[3]i64 = null,
     mask: []const i64,
     position: usize = 0,
     vocab_size: usize,
 
-    pub fn init(allocator: std.mem.Allocator, session: backends.Session, encoder: backends.Tensor, mask: []const i64, vocab_size: usize) !?State {
+    pub fn init(allocator: std.mem.Allocator, session: backends.Session, encoder: sessions.StageInput, mask: []const i64, vocab_size: usize) !?State {
         if (!qualified(session, vocab_size)) return null;
         const input_info = session.inputInfo();
         const output_info = session.outputInfo();
+        if (encoder == .resident) {
+            const value = encoder.resident;
+            const target = session.shared_compute_context.?.stableBackend();
+            if (!sessions.ResidentInput.backendCompatible(value.backend, target) or value.shape.len != 3 or value.shape[0] != 1 or
+                value.shape[1] <= 0 or value.shape[2] <= 0 or std.math.cast(usize, value.shape[1]) != mask.len)
+                return error.InvalidInputShape;
+            for (input_info) |info| {
+                if (!std.mem.eql(u8, info.name, "encoder_hidden_states")) continue;
+                for (value.shape, info.shape) |actual, declared| if (declared > 0 and actual != declared) return error.InvalidInputShape;
+                break;
+            }
+        }
         const roles = try allocator.alloc(InputRole, input_info.len);
         errdefer allocator.free(roles);
-        for (input_info, roles) |info, *role| {
+        const past_indices = try allocator.alloc(usize, output_info.len);
+        errdefer allocator.free(past_indices);
+        @memset(past_indices, std.math.maxInt(usize));
+        for (input_info, roles, 0..) |info, *role, input_index| {
             role.* = if (kv.pastInputSuffix(info.name)) |suffix| cache: {
+                const cache_role = kv.cacheRole(suffix) orelse unreachable;
                 for (output_info, 0..) |output, index| {
-                    if (kv.presentNameMatchesPastInput(info.name, output.name)) break :cache .{ .past = .{
-                        .output_index = index,
-                        .empty_shape = .{ 1, info.shape[1], 0, info.shape[3] },
-                        .cross = std.mem.indexOf(u8, suffix, ".encoder.") != null,
-                    } };
+                    if (kv.presentNameMatchesPastInput(info.name, output.name)) {
+                        past_indices[index] = input_index;
+                        break :cache .{ .past = .{
+                            .output_index = index,
+                            .empty_shape = .{ 1, info.shape[1], 0, info.shape[3] },
+                            .cross = cache_role == .cross_attention,
+                        } };
+                    }
                 }
                 unreachable; // The immutable qualified signature has an exact match.
             } else if (std.mem.eql(u8, info.name, "input_ids")) .tokens else if (std.mem.eql(u8, info.name, "encoder_hidden_states")) .encoder else if (std.mem.eql(u8, info.name, "encoder_attention_mask")) .mask else .cache_branch;
@@ -173,30 +188,54 @@ pub const State = struct {
             break;
         };
         var planned = session;
-        planned.cached_decoder_geometry = .{ .vocab_size = vocab_size };
+        planned.cached_decoder_geometry = .{ .vocab_size = vocab_size, .past_input_indices = past_indices };
         planned.broadcast_inputs = &.{"use_cache_branch"};
         return .{
             .allocator = allocator,
             .session = planned,
             .roles = roles,
             .logits_index = logits_index,
-            .encoder = encoder.borrowedView("encoder_hidden_states"),
+            .encoder = switch (encoder) {
+                .host => |value| .{ .host = value.borrowedView("encoder_hidden_states") },
+                .resident => encoder,
+            },
             .mask = mask,
             .vocab_size = vocab_size,
         };
     }
 
     pub fn deinit(self: *State) void {
+        self.cache_copy_reservations.deinit(self.allocator);
         if (self.resident_slots) |slots| {
             for (slots) |slot| if (slot) |owned| owned.pin.release();
             self.allocator.free(slots);
             self.allocator.free(self.stage_inputs);
         }
+        self.allocator.free(self.session.cached_decoder_geometry.?.past_input_indices);
         self.allocator.free(self.roles);
     }
 
     fn borrow(self: *const State, info: backends.TensorInfo, shape: []const i64, data: []const u8) backends.Tensor {
         return .{ .data = @constCast(data), .shape = shape, .dtype = info.dtype, .name = info.name, .allocator = self.allocator, .owns_data = false, .owns_shape = false };
+    }
+
+    /// Return permission to retire the caller's original output after prefill.
+    /// No retained cache may still depend on the producer or its frame banks.
+    pub fn detachEncoderPayload(self: *State) bool {
+        if (self.position == 0 or self.retired_encoder_shape != null or
+            !@import("../backends/imported_onnx_session.zig").cachedEncoderShapeOnly(self.session)) return false;
+        const slots = self.resident_slots orelse return false;
+        for (self.roles, slots[0..self.roles.len]) |role, slot| {
+            if (role == .past and (slot == null or !slot.?.independent)) return false;
+        }
+        const shape = switch (self.encoder) {
+            .host => |host| host.shape,
+            .resident => |resident| resident.shape,
+        };
+        if (shape.len != 3) return false;
+        self.retired_encoder_shape = shape[0..3].*;
+        self.encoder = .{ .host = .{ .name = "encoder_hidden_states", .dtype = .f32, .shape = &.{}, .data = &.{}, .allocator = self.allocator, .owns_data = false, .owns_shape = false } };
+        return true;
     }
 
     /// Each cache binding retains its producer independently. Omitted cross
@@ -224,7 +263,10 @@ pub const State = struct {
         for (self.session.inputInfo(), self.roles, slots, self.stage_inputs) |info, *role, *slot, *binding| {
             binding.* = switch (role.*) {
                 .tokens => .{ .host = self.borrow(info, &token_shape, std.mem.sliceAsBytes(suffix.tokens)) },
-                .encoder => .{ .host = self.encoder },
+                .encoder => if (self.retired_encoder_shape) |*shape|
+                    .{ .host = self.borrow(info, shape, &.{}) }
+                else
+                    self.encoder,
                 .mask => .{ .host = self.borrow(info, &mask_shape, std.mem.sliceAsBytes(self.mask)) },
                 .cache_branch => .{ .host = self.borrow(info, info.shape, &branch) },
                 .past => |*past| if (slot.*) |*owned| resident: {
@@ -234,73 +276,51 @@ pub const State = struct {
                 } else .{ .host = self.borrow(info, &past.empty_shape, &.{}) },
             };
         }
-        var outputs = if (dispatch) |selected|
-            try selected.run_stage_fn.?(selected.ptr, selected.task, self.allocator, self.session, self.stage_inputs, control)
+        var outputs = if (dispatch != null)
+            try tensor_dispatch.runStage(self.allocator, self.session, self.stage_inputs, control, dispatch)
         else
-            (try self.session.runStageInputsWithControl(self.stage_inputs, self.allocator, control)) orelse return error.UnexpectedResidentStageDecline;
+            (try self.session.runStageInputsBeforeExecution(self.stage_inputs, self.allocator, control)) orelse return error.UnexpectedResidentStageDecline;
         defer outputs.deinit();
         if (outputs.outputs.len != self.session.outputInfo().len) return error.InvalidDecoderOutput;
         defer @memset(updated, null);
         errdefer for (updated) |slot| if (slot) |owned| owned.pin.release();
-        for (self.roles, updated) |role, *slot| switch (role) {
+        const row = try @import("encoder_decoder_runtime.zig").residentVocabularyRow(self.allocator, self.session, &outputs, self.logits_index, suffix.tokens.len, self.vocab_size, control, dispatch != null);
+        errdefer self.allocator.free(row);
+        for (self.roles, slots, updated) |role, old, *slot| switch (role) {
             .past => |past| {
                 const value = outputs.outputs[past.output_index];
-                if (try outputs.backend.tensorDType(value) != .f32) return error.InvalidDecoderOutput;
-                const shape = try outputs.backend.tensorShape(value, self.allocator);
-                defer self.allocator.free(shape);
-                if (shape.len != 4) return error.InvalidDecoderOutput;
-                const elements = try cacheElements(shape);
-                if (!fresh and past.cross and elements == 0) continue;
-                const want = [_]i64{ 1, past.empty_shape[1], @intCast(if (past.cross) self.mask.len else end), past.empty_shape[3] };
-                if (!std.mem.eql(i64, shape, &want)) return error.InvalidDecoderOutput;
-                const bytes = try std.math.mul(usize, elements, @sizeOf(f32));
-                slot.* = .{
-                    .pin = try outputs.retainResources(self.allocator),
-                    .input = .{ .value = value, .backend = outputs.backend, .estimated_bytes = bytes },
-                    .shape = want,
+                const length = std.math.cast(i64, if (past.cross) self.mask.len else end) orelse return error.InvalidDecoderOutput;
+                const shape = [_]i64{ 1, past.empty_shape[1], length, past.empty_shape[3] };
+                const bytes = (try residentCacheBytes(outputs.backend, value, &shape, if (!fresh and past.cross) &past.empty_shape else null)) orelse {
+                    if (old == null) return error.InvalidDecoderOutput;
+                    continue;
                 };
-            },
-            else => {},
-        };
-        const row = try @import("encoder_decoder_runtime.zig").residentVocabularyRow(self.allocator, self.session, &outputs, self.logits_index, suffix.tokens.len, self.vocab_size, control);
-        errdefer self.allocator.free(row);
-        for (self.roles, updated) |role, *slot| switch (role) {
-            .past => |past| if (!past.cross) {
-                const provisional = slot.* orelse return error.InvalidDecoderOutput;
+                const input: sessions.ResidentInput = .{ .value = value, .backend = outputs.backend, .estimated_bytes = bytes };
                 var aliases: usize = 0;
-                for (outputs.outputs) |value| {
-                    if (value == provisional.input.value) aliases += 1;
+                for (outputs.outputs) |other| {
+                    if (other == value) aliases += 1;
                 }
-                if (aliases != 1) continue;
-                const adopted = self.adoptSelfCache(provisional) catch |err| switch (err) {
-                    error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => null,
-                    else => return err,
-                };
+                const adopted = if (aliases == 1)
+                    self.adoptCache(input, shape, if (past.cross) .isolated_or_standalone else .pooled_or_standalone) catch |err| switch (err) {
+                        error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => null,
+                        else => return err,
+                    }
+                else
+                    null;
                 if (adopted) |independent| {
-                    // The new lease owns this backing. Keep the output vector
-                    // in signature order but remove this CT from the original
-                    // invocation's retirement inventory. Its destruction
-                    // already deduplicates repeated handles.
+                    // The independent lease owns this backing. Remove the CT
+                    // from invocation retirement without reordering its ABI.
                     outputs.outputs[past.output_index] = outputs.outputs[self.logits_index];
-                    outputs.backend.free(provisional.input.value);
-                    provisional.pin.release();
+                    outputs.backend.free(value);
                     slot.* = independent;
+                } else {
+                    slot.* = .{ .pin = try outputs.retainResources(self.allocator), .input = input, .shape = shape };
                 }
             },
             else => {},
         };
         // The logits readback has finished the invocation's numerical use.
-        // An omitted cross column can now be copied outside that frame.
-        if (!fresh) for (self.roles, slots, updated) |role, old, *slot| switch (role) {
-            .past => |past| if (past.cross and slot.* == null) {
-                const previous = old orelse return error.InvalidDecoderOutput;
-                if (!previous.independent) slot.* = self.copyCrossCache(previous, control) catch |err| switch (err) {
-                    error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.QueueFull, error.InvalidPhysicalTransferSize => null,
-                    else => return err,
-                };
-            },
-            else => {},
-        };
+        try self.migrateDependentCaches(slots, updated, control);
         if (control) |active| try active.check();
         for (slots, updated) |*old, new| if (new) |value| {
             if (old.*) |previous| previous.pin.release();
@@ -310,18 +330,29 @@ pub const State = struct {
         return row;
     }
 
-    fn adoptSelfCache(self: *State, source: ResidentSlot) !?ResidentSlot {
+    const CacheAdoption = enum { standalone, isolated_or_standalone, pooled_or_standalone };
+
+    fn adoptCache(self: *State, input: sessions.ResidentInput, shape: [4]i64, policy: CacheAdoption) !?ResidentSlot {
         const shared = self.session.shared_compute_context orelse return null;
         const backend = shared.stableBackend();
-        if (self.session.model_lifetime == null or source.input.backend.ptr != backend.ptr or source.input.backend.vtable != backend.vtable) return null;
+        if (self.session.model_lifetime == null or input.backend.ptr != backend.ptr or input.backend.vtable != backend.vtable) return null;
         const kernels = backend.vtable.kernels orelse return null;
         if (!kernels.accepts(backend.vtable)) return null;
         const retain = kernels.retainImmutableTensor orelse return null;
-        const pooled = if (kernels.pooledOutputStorage) |storage| storage(backend.ptr, source.input.value) else null;
+        // Cross-cache bindings can outlive every suffix. Retain pool backing
+        // only when the cache spans the entire logical allocation.
+        const candidate = if (policy != .standalone)
+            if (kernels.pooledOutputStorage) |storage| storage(backend.ptr, input.value) else null
+        else
+            null;
+        const pooled = if (candidate) |lease| blk: {
+            if (policy == .isolated_or_standalone and lease.byte_size != input.estimated_bytes) break :blk null;
+            break :blk lease;
+        } else null;
         var admission = if (pooled) |lease| blk: {
             if (lease.backend.ptr != backend.ptr or lease.backend.vtable != backend.vtable or
                 lease.usage != .ordinary or lease.accounting_class != .activation or lease.isReadOnly() or
-                lease.byte_size < source.input.estimated_bytes) return null;
+                lease.byte_size < input.estimated_bytes) return null;
             const backing_bytes = lease.backing_byte_size orelse lease.byte_size;
             if (lease.admission) |charged| {
                 const expected = self.session.run_admission orelse return null;
@@ -335,8 +366,8 @@ pub const State = struct {
             break :blk try self.session.admitRetainedState(0, backing_bytes);
         } else blk: {
             const measure = kernels.standaloneOutputBytes orelse return null;
-            const bytes = measure(backend.ptr, source.input.value) orelse return null;
-            if (bytes < source.input.estimated_bytes) return null;
+            const bytes = measure(backend.ptr, input.value) orelse return null;
+            if (bytes < input.estimated_bytes) return null;
             break :blk try self.session.admitRetainedState(0, bytes);
         };
         defer if (admission) |*reservation| reservation.deinit();
@@ -344,7 +375,7 @@ pub const State = struct {
         var populated = false;
         var owned: sessions.ResidentOutputs = .{ .outputs = handles, .backend = backend, .allocator = self.allocator };
         defer if (populated) owned.deinit() else self.allocator.free(handles);
-        handles[0] = (try retain(backend.ptr, source.input.value)) orelse return null;
+        handles[0] = (try retain(backend.ptr, input.value)) orelse return null;
         populated = true;
         self.session.pinResident(&owned);
         owned.physical_backing_requires_epoch = if (pooled) |lease| lease.retirement_owner != null else false;
@@ -354,86 +385,246 @@ pub const State = struct {
             owned.resource_lease = reservation.lease;
             reservation.lease = null;
         }
-        var result = source;
-        result.pin = try owned.retainResources(self.allocator);
-        result.input.value = handles[0];
-        result.input.backend = backend;
-        result.independent = true;
-        return result;
-    }
-
-    /// Move a cross cache off its original invocation once omission shows
-    /// that it could keep that invocation alive for the rest of the request.
-    fn copyCrossCache(self: *State, previous: ResidentSlot, control: ?Control) !?ResidentSlot {
-        const storage = @import("../ops/physical_storage.zig");
-        const operation = @import("backend_operation.zig");
-        const shared = self.session.shared_compute_context orelse return null;
-        const backend = shared.stableBackend();
-        if (self.session.model_lifetime == null or previous.input.backend.ptr != backend.ptr or previous.input.backend.vtable != backend.vtable) return null;
-        const kernels = backend.vtable.kernels orelse return null;
-        if (!kernels.accepts(backend.vtable) or kernels.physical_storage_policy == null) return null;
-        const view = kernels.physicalTensorView orelse return null;
-        const copy = kernels.copyPhysicalInput orelse return null;
-        if (backend.kind() != .native and backend.kind() != .metal and kernels.createPhysicalCompletion == null) return null;
-        if (control) |active| try active.check();
-        const bytes = previous.input.estimated_bytes;
-        var dimensions: [4]i32 = undefined;
-        for (&dimensions, previous.shape) |*dim, axis| dim.* = std.math.cast(i32, axis) orelse return null;
-        const bound = try storage.reservationBytes(backend.*, .{ .byte_size = bytes });
-        var admission = try self.session.admitRetainedState(0, bound);
-        defer admission.deinit();
-        var protection = if (control) |active| try active.enterUninterruptible(self.session.interruption()) else null;
-        defer if (protection) |*guard| guard.deinit();
-
-        const handles = try self.allocator.alloc(@import("../ops/ops.zig").CT, 1);
-        var populated = false;
-        var copied: sessions.ResidentOutputs = .{ .outputs = handles, .backend = backend, .allocator = self.allocator };
-        defer if (populated) copied.deinit() else self.allocator.free(handles);
-        {
-            var scope = try operation.enter(backend.*, null, backend.operationToken(), .legacy_unknown_frame);
-            defer scope.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
-            // A standalone Metal blit completes synchronously. An open
-            // frame would require that frame's submission and retirement.
-            if (backend.kind() == .metal and (backend.decoderRuntimeHasActiveFrame() or backend.decoderRuntimeHasSubmittedFrame())) return null;
-            const completion = if (kernels.createPhysicalCompletion) |create| try create(backend.ptr) else null;
-            defer if (completion) |event| event.deinit();
-            const allocation = (try storage.Lease.create(self.allocator, backend.*, bytes)) orelse return null;
-            defer allocation.release();
-            if ((allocation.backing_byte_size orelse return null) > bound) return error.PhysicalStorageExceededReservation;
-            handles[0] = (try view(backend.ptr, .{ .storage = allocation, .shape = &dimensions })) orelse return null;
-            populated = true;
-            self.session.pinResident(&copied);
-            copied.resource_lease = admission.lease;
-            admission.lease = null;
-            // A callback error can occur after an asynchronous submission.
-            // Complete the copy before releasing either source or destination.
-            {
-                defer if (completion) |event| {
-                    event.record() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
-                    event.wait() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
-                };
-                try copy(backend.ptr, handles[0], previous.input.value);
-            }
-            try scope.finish();
-        }
-        if (control) |active| try active.check();
+        var retained = input;
+        retained.value = handles[0];
+        retained.backend = backend;
         return .{
-            .pin = try copied.retainResources(self.allocator),
-            .input = .{ .value = handles[0], .backend = backend, .estimated_bytes = bytes },
-            .shape = previous.shape,
+            .pin = try owned.retainResources(self.allocator),
+            .input = retained,
+            .shape = shape,
             .independent = true,
         };
+    }
+
+    /// Prepare each independently admitted target before submitting the
+    /// copies. One stream completion protects all sources and destinations.
+    const CacheCopyReservation = struct {
+        index: usize,
+        source: ResidentSlot,
+        bound: usize,
+        dimensions: [4]i32,
+        permit: sessions.RunPermit,
+        target: union(enum) { empty, unpromoted: sessions.ResidentOutputs, ready: ResidentSlot } = .empty,
+        rejected: bool = false,
+    };
+
+    fn migrateDependentCaches(self: *State, previous: []const ?ResidentSlot, updated: []?ResidentSlot, control: ?Control) !void {
+        const shared = self.session.shared_compute_context orelse return;
+        const backend = shared.stableBackend();
+        if (self.session.model_lifetime == null) return;
+        const kernels = backend.vtable.kernels orelse return;
+        if (!kernels.accepts(backend.vtable) or kernels.physical_storage_policy == null) return;
+        const copy = kernels.copyPhysicalInput orelse return;
+        if (kernels.physicalTensorView == null) return;
+        if (backend.kind() != .native and backend.kind() != .metal and kernels.createPhysicalCompletion == null) return;
+
+        const reservations = &self.cache_copy_reservations;
+        std.debug.assert(reservations.items.len == 0);
+        defer {
+            for (reservations.items) |*item| {
+                switch (item.target) {
+                    .empty => {},
+                    .unpromoted => |*output| output.deinit(),
+                    .ready => |target| target.pin.release(),
+                }
+                item.permit.deinit();
+            }
+            reservations.clearRetainingCapacity();
+        }
+        for (self.roles, previous, updated, 0..) |role, old, slot, index| switch (role) {
+            .past => |past| {
+                // A suffix can publish a transient view just like prefill.
+                // An omitted cross output can also retry after admission pressure.
+                const source = slot orelse (if (past.cross) old else null) orelse continue;
+                if (source.independent or source.input.backend.ptr != backend.ptr or source.input.backend.vtable != backend.vtable) continue;
+                if (control) |active| try active.check();
+                const item = self.reserveCacheCopy(backend, source, index) catch |err| switch (err) {
+                    error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.QueueFull, error.InvalidPhysicalTransferSize => null,
+                    else => return err,
+                };
+                if (item) |reservation| {
+                    var owned = reservation;
+                    errdefer owned.permit.deinit();
+                    try reservations.append(self.allocator, owned);
+                }
+            },
+            else => {},
+        };
+        if (reservations.items.len == 0) return;
+        if (control) |active| try active.check();
+        var protection = if (control) |active| try active.enterUninterruptible(self.session.interruption()) else null;
+        defer if (protection) |*guard| guard.deinit();
+        const operation = @import("backend_operation.zig");
+        var scope = operation.enter(backend.*, null, backend.operationToken(), .legacy_unknown_frame) catch |err| switch (err) {
+            error.QueueFull => return, // Already published cache views remain valid.
+            else => return err,
+        };
+        defer scope.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        const submission = @import("submission.zig");
+        const metal_frame = backend.kind() == .metal;
+        if (metal_frame and (try submission.Scope.beginIfNeeded(backend, false)).foreign) return scope.finish();
+
+        var staged = false;
+        for (reservations.items) |*item| {
+            const output = self.prepareCacheCopy(backend, kernels, item) catch |err| switch (err) {
+                // This optional copy has submitted no commands. Keep the
+                // published cache under its existing residency charge.
+                error.ResourceLimitExceeded,
+                error.ResourceTemporarilyUnavailable,
+                error.QueueFull,
+                error.InvalidPhysicalTransferSize,
+                error.CudaMemoryLimitExceeded,
+                error.MetalBufferAllocFailed,
+                => null,
+                else => return err,
+            };
+            if (output) |owner| {
+                item.target = .{ .unpromoted = owner };
+                const pending = &item.target.unpromoted;
+                const target: ResidentSlot = .{
+                    .pin = try pending.retainResources(self.allocator),
+                    .input = .{ .value = pending.outputs[0], .backend = backend, .estimated_bytes = item.source.input.estimated_bytes },
+                    .shape = item.source.shape,
+                    .independent = true,
+                };
+                pending.deinit();
+                item.target = .{ .ready = target };
+                staged = true;
+            }
+        }
+        if (!staged) return scope.finish();
+        // Keep the Metal copies in one frame and publish only after retirement.
+        var frame = if (metal_frame) try submission.Scope.begin(backend) else null;
+        defer if (frame) |*owned| owned.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        if (frame) |owned| if (!owned.owns) return scope.finish();
+        const completion = if (kernels.createPhysicalCompletion) |create| try create(backend.ptr) else null;
+        defer if (completion) |event| event.deinit();
+        {
+            // An error can follow command submission. Keep every staged
+            // target and its previous source alive until the stream drains.
+            defer if (completion) |event| {
+                event.record() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+                event.wait() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+            };
+            for (reservations.items) |*item| {
+                if (item.target != .ready) continue;
+                const target = item.target.ready;
+                copy(backend.ptr, target.input.value, item.source.input.value) catch |err| switch (err) {
+                    error.InvalidPhysicalTransferSize, error.InvalidShape => item.rejected = true,
+                    else => return err,
+                };
+            }
+        }
+        if (frame) |*owned| try owned.finish();
+        try scope.finish();
+        // Publish only completed copies. All ownership is already staged;
+        // rejection and cancellation leave the prior slots authoritative.
+        if (control) |active| try active.check();
+        for (reservations.items) |*item| {
+            if (item.rejected) continue;
+            if (item.target == .ready) {
+                if (updated[item.index]) |prior| prior.pin.release();
+                updated[item.index] = item.target.ready;
+                item.target = .empty;
+            }
+        }
+    }
+
+    fn reserveCacheCopy(self: *State, backend: *const ops.ComputeBackend, previous: ResidentSlot, index: usize) !?CacheCopyReservation {
+        const storage = @import("../ops/physical_storage.zig");
+        var dimensions: [4]i32 = undefined;
+        for (&dimensions, previous.shape) |*dim, axis| dim.* = std.math.cast(i32, axis) orelse return null;
+        const bound = try storage.reservationBytes(backend.*, .{ .byte_size = previous.input.estimated_bytes });
+        return .{ .index = index, .source = previous, .bound = bound, .dimensions = dimensions, .permit = try self.session.admitRetainedState(0, bound) };
+    }
+
+    /// All bank creation and copies share the caller's provider operation.
+    /// Each target takes only the admission permit for its own bank.
+    fn prepareCacheCopy(self: *State, backend: *const ops.ComputeBackend, kernels: *const @import("../ops/kernel_backend.zig").VTable, reservation: *CacheCopyReservation) !?sessions.ResidentOutputs {
+        const storage = @import("../ops/physical_storage.zig");
+        const allocation = (try storage.Lease.create(self.allocator, backend.*, reservation.source.input.estimated_bytes)) orelse return null;
+        defer allocation.release();
+        if ((allocation.backing_byte_size orelse return null) > reservation.bound) return error.PhysicalStorageExceededReservation;
+        const handles = try self.allocator.alloc(ops.CT, 1);
+        var populated = false;
+        defer if (!populated) self.allocator.free(handles);
+        handles[0] = (try kernels.physicalTensorView.?(backend.ptr, .{ .storage = allocation, .shape = &reservation.dimensions })) orelse return null;
+        populated = true;
+        var output: sessions.ResidentOutputs = .{ .outputs = handles, .backend = backend, .allocator = self.allocator };
+        self.session.pinResident(&output);
+        output.resource_lease = reservation.permit.lease;
+        reservation.permit.lease = null;
+        return output;
+    }
+
+    /// The output contract already supplies the full shape. Ordinary
+    /// Native, Metal and CUDA tensors can attest it without a shape copy.
+    fn residentCacheBytes(backend: *const ops.ComputeBackend, value: ops.CT, expected: *const [4]i64, omitted: ?*const [4]i64) !?usize {
+        if (try backend.tensorDType(value) != .f32) return error.InvalidDecoderOutput;
+        if (try backend.tensorShapeMatches(value, expected)) |matches| {
+            if (matches) {
+                const elements = try cacheElements(expected);
+                if (omitted != null and elements == 0) return null;
+                return try std.math.mul(usize, elements, @sizeOf(f32));
+            }
+            const sentinel = omitted orelse return error.InvalidDecoderOutput;
+            if ((try backend.tensorShapeMatches(value, sentinel)) == true) return null;
+        }
+
+        // Compatibility providers and noncanonical empty cross outputs retain
+        // the prior rank, extent and emptiness checks.
+        const shape = (try backend.tensorShapeFixed(4, value)) orelse return error.InvalidDecoderOutput;
+        const elements = try cacheElements(&shape);
+        if (omitted != null and elements == 0) return null;
+        if (!std.mem.eql(i64, &shape, expected)) return error.InvalidDecoderOutput;
+        return try std.math.mul(usize, elements, @sizeOf(f32));
     }
 
     fn cacheElements(shape: []const i64) !usize {
         var count: usize = 1;
         for (shape) |dim| {
-            if (dim < 0) return error.InvalidDecoderOutput;
-            count = try std.math.mul(usize, count, @intCast(dim));
+            const extent = std.math.cast(usize, dim) orelse return error.InvalidDecoderOutput;
+            count = try std.math.mul(usize, count, extent);
         }
         return count;
     }
 };
+
+test "resident seq2seq cache validates exact and omitted cross shapes without allocation" {
+    const Probe = struct {
+        shape: [4]i64,
+
+        fn dtype(_: *anyopaque, _: ops.CT) !backends.DType {
+            return .f32;
+        }
+        fn matches(raw: *anyopaque, _: ops.CT, expected: []const i64) !?bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return std.mem.eql(i64, &self.shape, expected);
+        }
+        fn copyShape(raw: *anyopaque, _: ops.CT, allocator: std.mem.Allocator) ![]i64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return allocator.dupe(i64, &self.shape);
+        }
+    };
+    var table = @import("../ops/native_compute.zig").vtable_impl;
+    table.tensorDType = Probe.dtype;
+    table.tensorShapeMatches = Probe.matches;
+    table.tensorShape = Probe.copyShape;
+    var probe: Probe = .{ .shape = .{ 1, 2, 3, 4 } };
+    const backend: ops.ComputeBackend = .{ .ptr = &probe, .vtable = &table };
+    const value: ops.CT = @ptrFromInt(8);
+    const expected = [4]i64{ 1, 2, 3, 4 };
+    const omitted = [4]i64{ 1, 2, 0, 4 };
+    try std.testing.expectEqual(@as(?usize, 96), try State.residentCacheBytes(&backend, value, &expected, null));
+    probe.shape = omitted;
+    try std.testing.expectError(error.InvalidDecoderOutput, State.residentCacheBytes(&backend, value, &expected, null));
+    try std.testing.expectEqual(@as(?usize, null), try State.residentCacheBytes(&backend, value, &expected, &omitted));
+    probe.shape = .{ 1, 0, 3, 4 };
+    try std.testing.expectEqual(@as(?usize, null), try State.residentCacheBytes(&backend, value, &expected, &omitted));
+    table.tensorShapeMatches = null;
+    probe.shape = expected;
+    try std.testing.expectEqual(@as(?usize, 96), try State.residentCacheBytes(&backend, value, &expected, null));
+}
 
 const fixture_inputs = [_]backends.TensorInfo{
     .{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, -1 } },
@@ -564,6 +755,91 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
     try std.testing.expectEqualSlices(f32, &.{ 7, 8, 9, 10 }, next.logits);
     const state = if (decoder.incremental) |*value| value else return error.InvalidMergedDecoderFixture;
     const expected_cache: []const f32 = &.{ 3, 4, 5, 6, 7, 8, 9, 10 };
+    if (!require_independent) {
+        // Use separate Native contexts, and the shared context required for
+        // device input, through the same imported producer and consumer.
+        var producer = ml.graph.Graph.init(a);
+        defer producer.deinit();
+        var encoder_builder = ml.graph.Builder.init(&producer);
+        const features = try encoder_builder.parameter("features", ml.graph.Shape.init(.f32, &.{ 1, 1, 4 }));
+        try producer.markOutput(try encoder_builder.absOp(features));
+        const encoder_model = try @import("onnx_graph").exportGraph(a, &producer, .{});
+        defer a.free(encoder_model);
+        try directory.dir.writeFile(std.testing.io, .{ .sub_path = "encoder.onnx", .data = encoder_model });
+        const encoder_path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", directory.sub_path[0..], "encoder.onnx" });
+        defer a.free(encoder_path);
+        var encoder_session = try @import("../backends/imported_onnx_session.zig").createSessionWithOptions(a, encoder_path, backend, .{
+            .shared_backend_ctx = if (backend == .native) null else session.shared_compute_context,
+        });
+        defer encoder_session.close();
+        if (backend == .native) try std.testing.expect(encoder_session.shared_compute_context != session.shared_compute_context);
+        const stages = @import("encoder_decoder_runtime.zig");
+        const control: Control = .{ .native_call_policy = .in_process };
+        const feature_input = hidden.borrowedView("features");
+        // Exercise dynamic output metadata with the actual imported provider
+        // and a separately known vocabulary from the task configuration.
+        const logits_info = session.outputInfo()[0];
+        try std.testing.expectEqualStrings("logits", logits_info.name);
+        const vocab_axis = &@constCast(logits_info.shape)[2];
+        const saved_vocab = vocab_axis.*;
+        defer vocab_axis.* = saved_vocab;
+        if (backend == .native) vocab_axis.* = -1;
+        const Broker = struct {
+            encode_calls: usize = 0,
+            decode_calls: usize = 0,
+
+            fn encode(raw: *anyopaque, _: tensor_dispatch.Task, allocator: std.mem.Allocator, target: backends.Session, supplied: ?*sessions.RunPermit, _: ?*std.atomic.Mutex, inputs: []const backends.Tensor, active: ?Control) !?sessions.ResidentOutputs {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.encode_calls += 1;
+                if (supplied != null) return error.UnexpectedStagePermit;
+                var permit = try target.admitInputs(inputs, allocator, active);
+                defer permit.deinit();
+                try permit.prepareResidentOutputRetirement();
+                var output = (try permit.runResidentWithControl(inputs, allocator, active)) orelse return null;
+                if (output.resource_lease == null) {
+                    output.resource_lease = permit.lease;
+                    permit.lease = null;
+                }
+                return output;
+            }
+
+            fn decode(raw: *anyopaque, _: tensor_dispatch.Task, allocator: std.mem.Allocator, target: backends.Session, bindings: []const sessions.StageInput, active: ?Control) !sessions.ResidentOutputs {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.decode_calls += 1;
+                return (try target.runStageInputsWithControl(bindings, allocator, active)) orelse error.UnexpectedResidentStageDecline;
+            }
+
+            fn host(_: *anyopaque, _: tensor_dispatch.Task, _: std.mem.Allocator, _: backends.Session, _: ?*sessions.RunPermit, _: ?*std.atomic.Mutex, _: []const backends.Tensor, _: ?Control) ![]backends.Tensor {
+                return error.UnexpectedHostDecoder;
+            }
+        };
+        var broker = Broker{};
+        const dispatch: tensor_dispatch.Dispatch = .{ .ptr = &broker, .task = .generate, .run_resident_fn = Broker.encode, .run_stage_fn = Broker.decode, .run_fn = Broker.host };
+        var encoded_resident = resident: {
+            var audit = @import("transfer_audit.zig").Audit{ .forbid_activation_readbacks = true };
+            try @import("transfer_audit.zig").begin(&audit);
+            defer @import("transfer_audit.zig").end();
+            break :resident try stages.encodeWithIntent(a, encoder_session, session, &.{feature_input}, dispatch, control, null, .{
+                .incremental_with_vocabulary = .{ .vocabulary = 4, .allow_native = false },
+            });
+        };
+        defer encoded_resident.deinit(a);
+        try std.testing.expect(encoded_resident == .resident);
+        var resident_decoder = try @import("decoder_stage.zig").Decoder.init(a, session, &encoded_resident, 1, &.{1}, 4, control);
+        defer resident_decoder.deinit();
+        const resident_route = diagnostics.snapshot().?.report.?.decoder_route.?;
+        try std.testing.expectEqual(.merged_incremental, resident_route.selected);
+        try std.testing.expectEqual(.resident, resident_route.encoder_storage);
+        try std.testing.expect(resident_decoder.incremental.?.encoder == .resident);
+        var resident_first = try resident_decoder.stepSuffix(.{ .position = 0, .tokens = &.{2} }, null, dispatch);
+        defer resident_first.deinit();
+        try std.testing.expectEqualSlices(f32, first.logits, resident_first.logits);
+        var resident_next = try resident_decoder.stepSuffix(.{ .position = 1, .tokens = &.{5} }, null, dispatch);
+        defer resident_next.deinit();
+        try std.testing.expectEqualSlices(f32, next.logits, resident_next.logits);
+        try std.testing.expectEqual(@as(usize, 1), broker.encode_calls);
+        try std.testing.expectEqual(@as(usize, 2), broker.decode_calls);
+    }
     if (backend == .native) {
         const slots = state.resident_slots orelse return error.MissingResidentResult;
         const cpu_cache = for (slots[0..state.roles.len]) |slot| {
@@ -615,7 +891,7 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
                 standalone_input.input.value = original;
                 standalone_input.input.backend = shared.stableBackend();
                 const before_adopt = controller.snapshot();
-                const adopted = (try state.adoptSelfCache(standalone_input)) orelse return error.MissingIndependentSelfCache;
+                const adopted = (try state.adoptCache(standalone_input.input, standalone_input.shape, .standalone)) orelse return error.MissingIndependentSelfCache;
                 defer adopted.pin.release();
                 try std.testing.expect(adopted.independent);
                 try std.testing.expect(controller.snapshot().backend_kv_bytes >= before_adopt.backend_kv_bytes + owned.input.estimated_bytes);
@@ -626,14 +902,96 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
                 try std.testing.expectEqualSlices(f32, expected_cache, adopted_cache);
                 try checkPooledSelfAdoption(state, owned, &controller, expected_cache);
                 const bound = try @import("../ops/physical_storage.zig").reservationBytes(owned.input.backend.*, .{ .byte_size = owned.input.estimated_bytes });
-                var below = state.*;
-                below.session.run_admission.?.limits.kv_limit_bytes = bound - 1;
+                var copy_state = state.*;
+                copy_state.cache_copy_reservations = .empty;
+                defer copy_state.cache_copy_reservations.deinit(a);
+                var cross_roles: [2]InputRole = @splat(.{ .past = .{ .output_index = 0, .empty_shape = undefined, .cross = true } });
+                copy_state.roles = &cross_roles;
+                const original_limits = copy_state.session.run_admission.?.limits;
+                copy_state.session.run_admission.?.limits.kv_limit_bytes = bound - 1;
+                var source = owned;
+                source.independent = false;
+                const previous: [2]?ResidentSlot = @splat(source);
+                var targets: [2]?ResidentSlot = @splat(null);
+                defer for (targets) |target| if (target) |value| value.pin.release();
                 const before_denial = controller.snapshot();
                 const copy_control: Control = .{ .native_call_policy = .in_process };
-                try std.testing.expectError(error.ResourceLimitExceeded, below.copyCrossCache(owned, copy_control));
+                try copy_state.migrateDependentCaches(&previous, &targets, copy_control);
+                try std.testing.expect(targets[0] == null and targets[1] == null);
                 try std.testing.expectEqualDeep(before_denial, controller.snapshot());
-                const detached = (try state.copyCrossCache(owned, copy_control)) orelse return error.MissingIndependentResidentCache;
-                defer detached.pin.release();
+                copy_state.session.run_admission.?.limits = original_limits;
+                const before_waits: ?u64 = if (comptime @import("build_options").enable_cuda) blk: {
+                    if (backend != .cuda) break :blk null;
+                    const cuda = shared.ctx.cuda;
+                    cuda.ctx.enableRuntimeObservation();
+                    break :blk cuda.ctx.runtimeObservation().?.counters.?.host_event_synchronizations;
+                } else null;
+                {
+                    var observation = @import("runtime_observation.zig").Scope.init();
+                    defer observation.deinit();
+                    try copy_state.migrateDependentCaches(&previous, &targets, copy_control);
+                    if (backend == .metal) {
+                        const counters = observation.snapshot();
+                        try std.testing.expectEqual(@as(?u64, 1), counters.metal_command_submissions);
+                        try std.testing.expectEqual(@as(?u64, 1), counters.metal_command_waits);
+                    }
+                }
+                if (comptime @import("build_options").enable_cuda) {
+                    if (before_waits) |count| try std.testing.expectEqual(count + 1, shared.ctx.cuda.ctx.runtimeObservation().?.counters.?.host_event_synchronizations);
+                }
+                // A dependent self cache published after prefill must get
+                // the same independent copy as the initial cache.
+                cross_roles[0].past.cross = false;
+                var suffix_targets: [2]?ResidentSlot = .{ source, null };
+                suffix_targets[0].?.pin = source.pin.retain() orelse return error.MissingIndependentResidentCache;
+                defer for (suffix_targets) |target| if (target) |value| value.pin.release();
+                try copy_state.migrateDependentCaches(&previous, &suffix_targets, copy_control);
+                try std.testing.expect(suffix_targets[0].?.independent);
+                cross_roles[0].past.cross = true;
+
+                const detached = targets[0] orelse return error.MissingIndependentResidentCache;
+                const other = targets[1] orelse return error.MissingIndependentResidentCache;
+                try std.testing.expect(other.independent and other.input.value != detached.input.value);
+
+                // A stale tensor extent in one column must leave its source
+                // authoritative without discarding a completed sibling.
+                const malformed = try source.input.backend.fromFloat32Shape(&.{99}, &.{1});
+                defer source.input.backend.free(malformed);
+                var mixed = previous;
+                mixed[1].?.input.value = malformed;
+                var partial_targets: [2]?ResidentSlot = @splat(null);
+                defer for (partial_targets) |target| if (target) |value| value.pin.release();
+                try copy_state.migrateDependentCaches(&mixed, &partial_targets, copy_control);
+                try std.testing.expect(partial_targets[0] != null and partial_targets[1] == null);
+                const partial_cache = try partial_targets[0].?.input.backend.toFloat32(partial_targets[0].?.input.value, a);
+                defer a.free(partial_cache);
+                try std.testing.expectEqualSlices(f32, expected_cache, partial_cache);
+
+                const CancelBeforePublication = struct {
+                    checks: usize = 0,
+                    fn check(raw: ?*anyopaque) !void {
+                        const probe: *@This() = @ptrCast(@alignCast(raw.?));
+                        probe.checks += 1;
+                        // Two reservation checks and one check before entering
+                        // the provider. The fourth follows copy completion.
+                        if (probe.checks == 4) return error.Cancelled;
+                    }
+                };
+                var cancellation = CancelBeforePublication{};
+                var cancelled_targets: [2]?ResidentSlot = @splat(null);
+                defer for (cancelled_targets) |target| if (target) |value| value.pin.release();
+                const before_cancel = controller.snapshot();
+                try std.testing.expectError(error.Cancelled, copy_state.migrateDependentCaches(&previous, &cancelled_targets, .{
+                    .ptr = &cancellation,
+                    .check_fn = CancelBeforePublication.check,
+                    .native_call_policy = .in_process,
+                }));
+                try std.testing.expect(cancelled_targets[0] == null and cancelled_targets[1] == null);
+                try std.testing.expectEqualDeep(before_cancel, controller.snapshot());
+
+                const other_cache = try other.input.backend.toFloat32(other.input.value, a);
+                defer a.free(other_cache);
+                try std.testing.expectEqualSlices(f32, expected_cache, other_cache);
                 try std.testing.expect(detached.independent);
                 try std.testing.expect(controller.snapshot().backend_kv_bytes >= owned.input.estimated_bytes);
                 slot.* = null;
@@ -670,7 +1028,7 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
     }
     var prefill = (try state.session.runStageInputsWithControl(&bindings, a, test_control)) orelse return error.MissingResidentResult;
     defer prefill.deinit();
-    const prefill_logits = try stages.residentVocabularyRow(a, state.session, &prefill, state.logits_index, 1, 4, test_control);
+    const prefill_logits = try stages.residentVocabularyRow(a, state.session, &prefill, state.logits_index, 1, 4, test_control, false);
     defer a.free(prefill_logits);
     try std.testing.expectEqualSlices(f32, first.logits, prefill_logits);
     for (state.session.inputInfo(), state.roles, &bindings) |info, role, *binding| switch (role) {
@@ -681,7 +1039,7 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
     };
     var decoded = (try state.session.runStageInputsWithControl(&bindings, a, test_control)) orelse return error.MissingResidentResult;
     defer decoded.deinit();
-    const decode_logits = try stages.residentVocabularyRow(a, state.session, &decoded, state.logits_index, 1, 4, test_control);
+    const decode_logits = try stages.residentVocabularyRow(a, state.session, &decoded, state.logits_index, 1, 4, test_control, false);
     defer a.free(decode_logits);
     try std.testing.expectEqualSlices(f32, next.logits, decode_logits);
     const final_cache = try decoded.backend.toFloat32(decoded.outputs[1], a);
@@ -728,7 +1086,9 @@ fn checkPooledSelfAdoption(state: *State, previous: ResidentSlot, controller: *@
         const charged = controller.snapshot();
         var source = previous;
         source.input.value = value;
-        const result = (try state.adoptSelfCache(source)) orelse return error.MissingIndependentPooledCache;
+        try std.testing.expect((try state.adoptCache(source.input, source.shape, .standalone)) == null);
+        try std.testing.expectEqualDeep(charged, controller.snapshot());
+        const result = (try state.adoptCache(source.input, source.shape, .isolated_or_standalone)) orelse return error.MissingIndependentPooledCache;
         errdefer result.pin.release();
         try std.testing.expect(result.independent);
         try std.testing.expectEqualDeep(charged, controller.snapshot());

@@ -33,7 +33,7 @@ pub const Request = struct {
 /// returns. Ordinary published copies retain their read-only checks.
 pub const LiteralInitializer = struct {
     staging: Request,
-    initialize: *const fn (*anyopaque, *Lease, *Lease, []const f32) anyerror!void,
+    initialize: *const fn (*anyopaque, *Lease, *Lease, []const u8) anyerror!void,
 };
 /// One canonical allocation policy. KernelBackend.accepts must be checked
 /// before invoking any callback, including metadata-only reservation queries.
@@ -77,6 +77,12 @@ pub const Lease = struct {
     references: std.atomic.Value(usize) = .init(1),
     slot_authority: ?@import("../execution/slot_authority.zig").Slot = null,
     host_index_certificate: ?IndexCertificate = null,
+    /// Bounds and encoding from the bytes used to initialize an immutable literal.
+    literal_index_proof: ?LiteralIndexProof = null,
+    pub const LiteralIndexProof = struct {
+        dtype: @import("ml").graph.DType,
+        bounds: @import("index_metadata.zig").Bounds,
+    };
     /// A by-value certificate owns no resource and borrows no Frame/Upload.
     /// Its token belongs to this retained Lease's immutable slot authority.
     const IndexCertificate = struct {
@@ -333,6 +339,7 @@ pub const CapturedLeases = struct {
 pub const View = struct {
     storage: *Lease,
     shape: []const i32,
+    byte_offset: usize = 0,
     dtype: ops.GraphDType = .f32,
     /// Clone only logical/view metadata over new owned backing. Used by
     /// planned independent publication; never aliases the source's data.
@@ -397,6 +404,7 @@ pub const Completion = struct {
         record: *const fn (*anyopaque) anyerror!void,
         before_reuse: *const fn (*anyopaque) anyerror!void,
         wait: ?*const fn (*anyopaque) anyerror!void = null,
+        is_ready: ?*const fn (*anyopaque) anyerror!bool = null,
         deinit: *const fn (*anyopaque) void,
     };
     pub fn record(self: Completion) !void {
@@ -404,6 +412,10 @@ pub const Completion = struct {
     }
     pub fn beforeReuse(self: Completion) !void {
         return self.vtable.before_reuse(self.ptr);
+    }
+    pub fn isReady(self: Completion) !bool {
+        const check = self.vtable.is_ready orelse return false;
+        return check(self.ptr);
     }
     pub fn wait(self: Completion) !void {
         if (self.vtable.wait) |synchronize| try synchronize(self.ptr);

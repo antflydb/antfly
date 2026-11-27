@@ -30,91 +30,6 @@ pub const Node = extern struct {
     context: *anyopaque,
     release_fn: *const fn (*anyopaque) callconv(.c) void,
 };
-/// Synchronous compatibility custody for EXACTLY the three raw graph quotas
-/// (metadata, learned arena, head). Owner.beginOutsideCleanup registers this
-/// final-address node before taking any locks. The owner MUST seal before the
-/// outside function returns; this is not a persistent queue, Domain substitute,
-/// or permission to transfer an arbitrary raw lease under an admitted B.
-pub const SynchronousOutsideRawLeases = struct {
-    pub const capacity = 3;
-    node: Node = undefined,
-    boundary_context: ?*anyopaque = null,
-    nonce: u64 = 0,
-    graph_identity: usize = 0,
-    sources: [capacity]?*memory.AdmissionLease = @splat(null),
-    expected: [capacity]?memory.AdmissionLease = @splat(null), // nonowning facts
-    pending: [capacity]?memory.AdmissionLease = @splat(null), // moved ownership
-    graph_bound: bool = false,
-    finished: bool = false,
-
-    /// Only the actual local outside Owner may initialize this capability.
-    /// No source endpoint is retained beyond that same synchronous function.
-    pub fn begin(self: *@This(), owner: *const @import("cleanup_owner.zig").Owner) !void {
-        const epoch = try owner.outsideCleanupEpoch();
-        if (self.boundary_context != null or self.finished) return error.SynchronousOutsideRetirementAlreadyBound;
-        if (try epoch.isSealed()) return error.RetirementEpochSealed;
-        const boundary = try epoch.boundary();
-        self.boundary_context = boundary.context;
-        self.nonce = boundary.nonce;
-        self.node = .{ .context = self, .release_fn = finish };
-        errdefer {
-            self.boundary_context = null;
-            self.nonce = 0;
-        }
-        try boundary.register(boundary.context, boundary.nonce, &self.node);
-    }
-    fn validateEpoch(self: *const @This(), epoch: *const @import("retirement_sink.zig").Epoch) !void {
-        if (self.boundary_context == null or self.finished or try epoch.isSealed()) return error.InvalidSynchronousOutsideRetirement;
-        const boundary = try epoch.boundary();
-        if (boundary.context != self.boundary_context or boundary.nonce != self.nonce) return error.ForeignSynchronousOutsideRetirement;
-    }
-    /// Called by the concrete graph owner under its exclusion BEFORE any SDK
-    /// death. Fixed size comes from its three actual quota fields, not requests.
-    pub fn bindGraph(self: *@This(), identity: usize, slots: [capacity]?*memory.AdmissionLease, epoch: *const @import("retirement_sink.zig").Epoch) !void {
-        try self.validateEpoch(epoch);
-        if (identity == 0) return error.InvalidSynchronousOutsideRetirement;
-        for (slots, 0..) |slot, index| if (slot) |value| {
-            if (value.controller == null) return error.InvalidSynchronousOutsideLease;
-            for (slots[0..index]) |previous| if (previous == value) return error.DuplicateSynchronousOutsideLease;
-        };
-        if (self.graph_bound) {
-            if (self.graph_identity != identity) return error.ForeignSynchronousOutsideGraph;
-            for (slots, self.sources, self.expected, self.pending) |actual, original, expected, pending| {
-                if (actual) |value| {
-                    if (original != value or expected == null or pending != null or !std.meta.eql(value.*, expected.?)) return error.SynchronousOutsideLeaseChanged;
-                } else if (original != null and pending == null) return error.SynchronousOutsideLeaseChanged;
-            }
-            return;
-        }
-        self.sources = slots;
-        for (slots, 0..) |slot, index| self.expected[index] = if (slot) |value| value.* else null;
-        self.graph_identity = identity;
-        self.graph_bound = true;
-    }
-    pub fn validateValue(self: *const @This(), lease: memory.AdmissionLease, epoch: *const @import("retirement_sink.zig").Epoch) !void {
-        try self.validateEpoch(epoch);
-        if (!self.graph_bound) return error.UnboundSynchronousOutsideGraph;
-        for (self.expected, self.pending) |expected, pending| if (expected != null and pending == null and std.meta.eql(expected.?, lease)) return;
-        return error.ForeignSynchronousOutsideLease;
-    }
-    /// Moves one actual prevalidated source only AFTER checked SDK death.
-    pub fn take(self: *@This(), source: *memory.AdmissionLease, epoch: *const @import("retirement_sink.zig").Epoch) !void {
-        try self.validateValue(source.*, epoch);
-        for (self.sources, 0..) |expected_source, index| if (expected_source == source) {
-            if (self.pending[index] != null) return error.SynchronousOutsideLeaseAlreadyMoved;
-            self.pending[index] = source.*;
-            return;
-        };
-        return error.ForeignSynchronousOutsideLease;
-    }
-    fn finish(raw: *anyopaque) callconv(.c) void {
-        const self: *@This() = @ptrCast(@alignCast(raw));
-        var pending = self.pending;
-        self.* = .{ .finished = true }; // consume every endpoint before callbacks
-        for (&pending) |*slot| if (slot.*) |*lease| lease.release();
-    }
-};
-
 pub const Payload = extern struct {
     context: *anyopaque,
     retain_fn: *const fn (*anyopaque) callconv(.c) void,
@@ -389,20 +304,6 @@ pub const PreparedCharge = struct {
         self.owner = null;
         return owner;
     }
-    /// One actual cache component already owns its exact quota in the existing
-    /// tier ledger. Move that retained component; never reserve it a second time.
-    pub fn armCacheBacking(self: *PreparedCharge, backing: *?@import("../runtime/tier/cache.zig").PhysicalBacking) !*Charge {
-        const owner = self.owner orelse return error.PreparedChargeAlreadyArmed;
-        const retained = backing.* orelse return error.MissingResourceRetirementLease;
-        const pin = try retained.retainAdmissionDomain();
-        std.debug.assert(owner.quota == .unarmed);
-        owner.quota = .{ .cache_component = .{ retained, null } };
-        owner.domain = pin;
-        backing.* = null;
-        self.owner = null;
-        return owner;
-    }
-
     /// Host project metadata and backend SDK payload were funded atomically
     /// in the SAME real cache transaction. Keep both exact components until
     /// actual SDK death and final current-B retirement, without new quota.
@@ -416,7 +317,7 @@ pub const PreparedCharge = struct {
         defer other.release();
         if (pin.owner != other.owner) return error.ForeignAdmissionDomain;
         std.debug.assert(owner.quota == .unarmed);
-        owner.quota = .{ .cache_component = .{ retained[0], retained[1] } };
+        owner.quota = .{ .cache_component = retained };
         owner.domain = pin;
         backings.* = null;
         self.owner = null;
@@ -452,7 +353,7 @@ pub const Charge = struct {
         unarmed,
         run: memory.AdmissionLease,
         storage: @import("storage_admission.zig").Reservation,
-        cache_component: [2]?@import("../runtime/tier/cache.zig").PhysicalBacking,
+        cache_component: [2]@import("../runtime/tier/cache.zig").PhysicalBacking,
     },
     domain: ?admission.Pin,
     // Production records/groups always use independent process allocator. The private override
@@ -526,15 +427,28 @@ pub const Charge = struct {
             .unarmed => null,
             .run => |lease| lease.controller,
             .storage => |reservation| reservation.identity.controller,
-            .cache_component => |backings| backings[0].?.controller(),
+            .cache_component => |backings| backings[0].controller(),
         };
     }
     /// Validate both packed roots BEFORE the caller drops either SDK retain.
     /// This capability is no numerical permission and stores no creation B.
+    /// The cache charge owns this physical backing independently of its
+    /// logical slot. Read only while the caller still owns a charge reference.
+    pub fn cacheBackendBytes(self: *const Charge) usize {
+        var bytes: usize = 0;
+        switch (self.quota) {
+            .cache_component => |parts| for (parts) |backing| {
+                if (backing.tier == .backend) bytes +|= backing.bytes;
+            },
+            else => {},
+        }
+        return bytes;
+    }
+
     pub fn validateCacheCleanup(self: *const Charge, current: @import("cleanup_context.zig").Context) !void {
         switch (self.quota) {
             .cache_component => |backings| for (backings) |backing| {
-                if (backing) |value| try value.validateCleanup(current);
+                try backing.validateCleanup(current);
             },
             else => return error.NotCacheComponentCharge,
         }
@@ -560,6 +474,26 @@ pub const Charge = struct {
             charge.release();
         }
     };
+    /// Transfer the creator reference to cache settlement after its owner
+    /// and views have been destroyed. No allocation or supplier runs here.
+    pub fn deferCacheCreatorDrop(self: *Charge) !void {
+        const backing = switch (self.quota) {
+            .cache_component => |parts| parts[0],
+            else => return error.NotCacheComponentCharge,
+        };
+        const holder = self.prepared_boundary orelse return error.PreparedBoundaryAlreadyUsed;
+        holder.* = .{
+            .node = .{ .context = holder, .release_fn = DeferredRoot.release },
+            .charge = self,
+            .allocator = self.metadata,
+        };
+        self.prepared_boundary = null;
+        backing.deferCreatorDrop(&holder.node) catch |err| {
+            self.prepared_boundary = holder;
+            return err;
+        };
+    }
+
     /// Register before any SDK allocation/submission or physical retirement.
     /// The caller's existing root remains held on every registration error.
     /// This extra root prevents quota callbacks under the numerical gate even
@@ -722,7 +656,7 @@ pub const Charge = struct {
         }
         allocator.destroy(self);
         if (cache_backings) |backings| for (backings) |backing| {
-            if (backing) |value| value.releaseAfterMetadataDeathOutsideExecution();
+            backing.releaseAfterMetadataDeathOutsideExecution();
         };
         if (domain) |value| value.release();
     }
@@ -1746,34 +1680,4 @@ test "accepted prepared retirement rejects legacy shell before backend callback"
     prepared.?.end();
     try std.testing.expectEqual(@as(usize, 1), probe.prepared_calls);
     try std.testing.expectEqual(@as(usize, 1), probe.legacy_calls);
-}
-
-test "synchronous outside raw graph slots reject foreign epoch duplicate provenance and copied lease before transfer" {
-    const Outside = @import("cleanup_owner.zig").Owner;
-    var missing = Outside{};
-    var missing_pending = SynchronousOutsideRawLeases{};
-    try std.testing.expectError(error.MissingOutsideCleanupOwner, missing.synchronousOutsideContext(&missing_pending));
-    var controller = memory.AdmissionController{};
-    var source: ?memory.AdmissionLease = try controller.tryAcquire(.gpu, .{}, .{ .backend_scratch_bytes = 64 }, false);
-    defer if (source) |*lease| lease.release();
-    var pending = SynchronousOutsideRawLeases{};
-    var owner = try Outside.beginOutsideCleanup();
-    defer owner.finishAfterUnlock();
-    const current = try owner.synchronousOutsideContext(&pending);
-    try std.testing.expectError(error.DuplicateSynchronousOutsideLease, pending.bindGraph(1, .{ &source.?, &source.?, null }, current.boundary.?));
-    try std.testing.expect(!pending.graph_bound);
-    try pending.bindGraph(1, .{ &source.?, null, null }, current.boundary.?);
-    var foreign = try Outside.beginOutsideCleanup();
-    defer foreign.finishAfterUnlock();
-    try std.testing.expectError(error.ForeignSynchronousOutsideRetirement, pending.validateValue(source.?, foreign.epoch().?));
-    try std.testing.expectError(error.ForeignSynchronousOutsideGraph, pending.bindGraph(2, .{ &source.?, null, null }, current.boundary.?));
-    var copied = source.?; // facts only, no independent ownership
-    try std.testing.expectError(error.ForeignSynchronousOutsideLease, pending.take(&copied, current.boundary.?));
-    try std.testing.expectEqual(@as(usize, 64), controller.snapshot().backend_scratch_bytes);
-    try pending.take(&source.?, current.boundary.?);
-    source = null; // exact source owner consumed after successful move
-    try std.testing.expectEqual(@as(usize, 64), controller.snapshot().backend_scratch_bytes);
-    owner.finishAfterUnlock();
-    try std.testing.expect(pending.finished);
-    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
 }

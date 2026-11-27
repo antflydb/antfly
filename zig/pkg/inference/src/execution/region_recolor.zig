@@ -18,7 +18,7 @@
 //! All mutation is committed only after successful metadata preparation.
 const std = @import("std");
 const ml = @import("ml");
-const buffers = @import("../graph/buffer_plan.zig");
+const buffers = @import("buffer_plan.zig");
 const none = std.math.maxInt(u32);
 
 fn active(plan: *const buffers.BufferPlan, slot: buffers.LogicalSlot, index: usize) !bool {
@@ -54,7 +54,7 @@ pub fn applyWithLastUse(plan: *buffers.BufferPlan, first_use: []const u32, last_
         const first = first_use[slot.node_id];
         const last = if (last_use[slot.node_id] == none) slot.last_use else @max(slot.last_use, last_use[slot.node_id]);
         if (first != none and first > last) return error.InvalidRegionOrder;
-        changed = changed or last != slot.last_use;
+        changed = changed or slot.kind == .region_internal or last != slot.last_use;
         changed = changed or (first != none and first < slot.first_use);
     }
     if (!changed) return;
@@ -208,7 +208,7 @@ const Fixture = struct {
         defer schedule.deinit();
         var plan = try buffers.build(a, &graph, &schedule, .{});
         defer plan.deinit();
-        const fixed = try plan.addConstantBinding(.native, 16);
+        const fixed = try plan.addConstantBinding(.native, 16, @alignOf(f32));
         const fixed_before = plan.allocations[fixed];
         const overrides = try a.alloc(u32, graph.nodeCount());
         defer a.free(overrides);
@@ -251,7 +251,7 @@ const BoundFixture = struct {
         var plan = try buffers.build(a, &graph, &schedule, .{});
         defer plan.deinit();
         const input_bank = try plan.addInputBinding(.native, 16);
-        const constant_bank = try plan.addConstantBinding(.native, 16);
+        const constant_bank = try plan.addConstantBinding(.native, 16, @alignOf(f32));
         // These model the actual physical binding refinement: logical input
         // and constant slots now name fixed admitted banks, preserving roles.
         for ([_]ml.graph.NodeId{ input, literal }, [_]buffers.AllocationId{ input_bank, constant_bank }) |node, bank| {

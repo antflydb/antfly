@@ -21,6 +21,7 @@ const ops = @import("../ops/ops.zig");
 const session_mod = @import("../backends/session.zig");
 const diagnostics = @import("diagnostics.zig");
 const invocation = @import("invocation_observation.zig");
+const clock = @import("antfly_platform").time;
 var next_identity: std.atomic.Value(u64) = .init(1);
 
 pub const Source = struct {
@@ -39,6 +40,7 @@ pub const Source = struct {
 pub const Span = struct {
     source: ?Source = null,
     identity: u64 = 0,
+    started_ns: u64 = 0,
     sequence: u64 = 0,
     first_failure: ?diagnostics.Text = null,
     counters: diagnostics.PendingInterval.ObservedPhases = .{},
@@ -46,7 +48,7 @@ pub const Span = struct {
         const selected = source orelse return .{};
         if (!selected.publisher.isEnabled()) return .{};
         _ = selected.model.retain();
-        return .{ .source = selected, .identity = next_identity.fetchAdd(1, .monotonic) };
+        return .{ .source = selected, .identity = next_identity.fetchAdd(1, .monotonic), .started_ns = clock.monotonicNs() };
     }
     pub fn deinit(self: *Span) void {
         const source = self.source orelse return;
@@ -68,15 +70,15 @@ pub const Span = struct {
         self.sequence +|= 1;
         var interval = diagnostics.PendingInterval{ .identity = self.identity, .request_id = source.request_id, .sequence = self.sequence, .phase = phase, .prior_failure = self.first_failure };
         const binding = invocation.Binding{ .diagnostics = source.publisher, .operation = operation, .capture_programs = true, .model_allocator = source.model_allocator, .stable_backend = backend.*, .context_runtime_scope = .borrowed_execution_backend_context, .pending_interval = &interval, .pending_counters = &self.counters };
-        return invocation.callClassified(binding, classify, phaseCall, .{ &interval, &self.first_failure, completion, callback, args });
+        return invocation.callClassified(binding, classify, phaseCall, .{ &interval, &self.first_failure, self.started_ns, completion, callback, args });
     }
 };
-fn phaseCall(interval: *diagnostics.PendingInterval, first_failure: *?diagnostics.Text, completion: diagnostics.PendingInterval.Completion, comptime callback: anytype, args: anytype) @TypeOf(@call(.auto, callback, args)) {
-    const clock = @import("antfly_platform").time;
+fn phaseCall(interval: *diagnostics.PendingInterval, first_failure: *?diagnostics.Text, interval_start_ns: u64, completion: diagnostics.PendingInterval.Completion, comptime callback: anytype, args: anytype) @TypeOf(@call(.auto, callback, args)) {
     const started = clock.monotonicNs();
     defer {
         const ended = clock.monotonicNs();
         if (started != 0 and ended >= started) interval.callback_wall_ns = ended - started;
+        if (interval_start_ns != 0 and ended >= interval_start_ns) interval.elapsed_host_wall_ns = ended - interval_start_ns;
     }
     const result = @call(.auto, callback, args) catch |err| {
         // The invocation report records this phase's error independently.
@@ -116,9 +118,12 @@ test "pending retirement preserves the initiating error when cleanup fails" {
     };
     var first_failure: ?diagnostics.Text = null;
     var interval = diagnostics.PendingInterval{ .identity = 1, .sequence = 1, .phase = .acquire };
-    try std.testing.expectError(error.SubmissionFailure, phaseCall(&interval, &first_failure, .unavailable, Call.fail, .{error.SubmissionFailure}));
+    const acquired = clock.monotonicNs();
+    try std.testing.expectError(error.SubmissionFailure, phaseCall(&interval, &first_failure, acquired, .unavailable, Call.fail, .{error.SubmissionFailure}));
+    const submit_elapsed = interval.elapsed_host_wall_ns.?;
     interval.sequence += 1;
-    try std.testing.expectError(error.CleanupFailure, phaseCall(&interval, &first_failure, .unavailable, Call.fail, .{error.CleanupFailure}));
+    try std.testing.expectError(error.CleanupFailure, phaseCall(&interval, &first_failure, acquired, .unavailable, Call.fail, .{error.CleanupFailure}));
     try std.testing.expectEqualStrings("SubmissionFailure", interval.prior_failure.?.view());
-    try std.testing.expect(interval.callback_wall_ns != null);
+    try std.testing.expect(interval.elapsed_host_wall_ns.? >= submit_elapsed);
+    try std.testing.expect(interval.elapsed_host_wall_ns.? >= interval.callback_wall_ns.?);
 }

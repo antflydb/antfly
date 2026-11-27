@@ -141,6 +141,12 @@ pub const CudaCounters = struct {
     declared_graph_kernel_nodes_submitted: u64 = 0,
     declared_graph_nodes_submitted: u64 = 0,
     opaque_graph_submissions: u64 = 0,
+    /// A legacy decode replay declined before submission because its output bank was still held.
+    decode_replay_output_bank_denials: u64 = 0,
+    /// Pre-submission declines that preserve a warm exec until scratch is released.
+    decode_replay_scratch_borrow_denials: u64 = 0,
+    /// Pre-submission declines that retire an exec with obsolete scratch bindings.
+    decode_replay_stale_workspace_denials: u64 = 0,
     /// Explicit project-owned successful host wait APIs. These are not CPU
     /// blocking durations or implicit vendor/free synchronizations.
     host_stream_synchronizations: u64 = 0,
@@ -189,8 +195,12 @@ pub const DeviceMemory = struct {
 
 pub const PeriodicWorkspace = struct {
     scope: enum { cuda_context_pinned_allocations } = .cuda_context_pinned_allocations,
-    state: enum { fixed, idle, observing, validating, capture_ready, disabled },
+    state: enum { fixed, idle, observing, installing, validating, capture_ready, disabled },
+    /// Published ordinals and their exact bound backing. Other live buffers
+    /// can be retained for reuse while the current request has no active plan.
     slots: usize,
+    bound_slots: usize,
+    bound_backing_bytes: usize,
     live_backing_bytes: usize,
     planned_bytes: ?usize = null,
     admission_limit_bytes: ?usize = null,
@@ -200,6 +210,14 @@ pub const PeriodicWorkspace = struct {
     activations: usize,
     invalidations: usize,
     admission_denials: usize,
+    /// Recording declined because learned slots lacked exact owned backing.
+    capture_binding_denials: usize,
+};
+
+pub const BatchIngress = struct {
+    transfers: @import("transfer_audit.zig").Measurements,
+    // This is an ordering decision. It does not describe later retirement.
+    stream_ordered: bool,
 };
 
 pub const Snapshot = struct {
@@ -219,6 +237,8 @@ pub const Snapshot = struct {
     video_owned_resources: ?VideoOwnedResources = null,
     resolved_project_cuda_launches: ?@import("runtime_observation.zig").Kernels = null,
     transfers: ?@import("transfer_audit.zig").Measurements = null,
+    /// Copies for this physical cohort before the observed model forward.
+    batch_ingress: ?BatchIngress = null,
     counters: Counters = .{},
     native_allocations: ?NativeAllocations = null,
     /// Immutable deduplicated owner intervals for observed numerical dispatch.
@@ -227,11 +247,33 @@ pub const Snapshot = struct {
     cuda: ?Cuda = null,
     cuda_periodic_workspace: ?PeriodicWorkspace = null,
     metal_serial_workspace: ?@import("runtime_observation.zig").SerialWorkspaceObservation = null,
+    cuda_audio_workspace: ?@import("runtime_observation.zig").CudaAudioWorkspace = null,
+    cuda_decoder_workspace: ?@import("runtime_observation.zig").CudaDecoderWorkspace = null,
+    cuda_decoder_declines: ?@import("runtime_observation.zig").CudaDecoderDeclines = null,
     memory: Memory = .{},
     /// Invocation interval on its submitting thread, including CPU fallbacks.
     submission: ?@import("runtime_observation.zig").Counters = null,
     /// Process-wide interval/gauges, never per-request ownership or residency.
     process: ?Process = null,
+
+    pub fn recordKernelInterval(self: *Snapshot, scope: *const @import("runtime_observation.zig").KernelScope) void {
+        self.resolved_project_cuda_launches = scope.values;
+        self.resolved_project_metal_dispatches = if (comptime @import("build_options").enable_metal) scope.metal else null;
+        self.terminal_native_bodies = scope.native_bodies;
+        self.selected_native_dispatches = scope.native_dispatches;
+        self.joined_native_workers = scope.native_workers;
+        self.native_quant_worker_callbacks = scope.quant_worker_callbacks;
+        self.native_attention_programs = scope.attention_programs;
+        self.native_activation_programs = scope.activation_programs;
+        self.authored_native_programs = scope.native_programs;
+        self.authored_native_program_bank = scope.native_program_bank;
+        self.owned_native_fallbacks = scope.native_fallbacks;
+        self.metal_serial_workspace = scope.metal_serial_workspace;
+        self.cuda_audio_workspace = scope.cuda_audio_workspace;
+        self.cuda_decoder_workspace = scope.cuda_decoder_workspace;
+        self.cuda_decoder_declines = scope.cuda_decoder_declines;
+    }
+
     pub fn since(self: Snapshot, before: Snapshot) Snapshot {
         return .{
             .device_memory = self.device_memory,
@@ -254,6 +296,9 @@ pub const Snapshot = struct {
             .memory = self.memory,
             .cuda_periodic_workspace = self.cuda_periodic_workspace,
             .metal_serial_workspace = self.metal_serial_workspace,
+            .cuda_audio_workspace = self.cuda_audio_workspace,
+            .cuda_decoder_workspace = self.cuda_decoder_workspace,
+            .cuda_decoder_declines = self.cuda_decoder_declines,
             .cuda = if (self.cuda) |after| if (before.cuda) |start| after.since(start) else after else null,
             .native_allocations = if (self.native_allocations) |after| if (before.native_allocations) |start| after.since(start) else after else null,
             .process = if (self.process) |after| if (before.process) |start| after.since(start) else after else null,

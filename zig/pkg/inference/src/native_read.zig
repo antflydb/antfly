@@ -781,14 +781,23 @@ test "benchmark telemetry equality detects drift" {
 }
 
 test "Florence CUDA pinned OCR reads invoice fixture" {
-    if (!build_options.enable_cuda) return error.SkipZigTest;
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    try checkFlorencePinnedOcr(.cuda);
+}
+
+test "Florence Metal pinned OCR reads invoice fixture" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    try checkFlorencePinnedOcr(.metal);
+}
+
+fn checkFlorencePinnedOcr(backend: backends.BackendType) !void {
     const directory = platform.env.getenv("ANTFLY_FLORENCE2_MODEL_DIR") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
     const image_data = try c_file.readFile(a, "../../lib/readers/src/testdata/apple-ocr.png");
     defer a.free(image_data);
     var sessions = backends.SessionManager.initWithIo(a, std.testing.io);
-    sessions.preferred_backends = &.{.cuda};
-    sessions.required_backend = .cuda;
+    sessions.preferred_backends = &.{backend};
+    sessions.required_backend = backend;
     sessions.process_termination_available = true;
     var manager = model_manager_mod.ModelManager.init(a, sessions);
     defer manager.deinit();
@@ -803,17 +812,15 @@ test "Florence CUDA pinned OCR reads invoice fixture" {
     defer reader.deinit();
     var fence = (try readers_mod.LoadedReader.acquireExecutionFence(directory, &manager, control)) orelse return error.MissingFlorenceExecutionFence;
     defer fence.deinit();
-    try std.testing.expectEqual(backends.BackendType.cuda, fence.backend());
+    try std.testing.expectEqual(backend, fence.backend());
     var result = try reader.read(image_data, .{ .prompt = "<OCR>", .max_tokens = 128, .execution_control = control });
     defer result.deinit();
     const lower = try std.ascii.allocLowerString(a, result.text);
     defer a.free(lower);
-    errdefer std.debug.print("Florence CUDA invoice output: {s}\n", .{result.text});
+    errdefer std.debug.print("Florence {s} invoice output: {s}\n", .{ @tagName(backend), result.text });
     for ([_][]const u8{ "invoice", "12345", "42.00" }) |text|
         try std.testing.expect(std.mem.indexOf(u8, lower, text) != null);
-    // This is CUDA implementation parity, not a claim of exact transcription.
-    // The model can misspell the uncommon brand in this fixture; preserve the
-    // complete CPU output as the reference rather than accepting a CUDA drift.
+    // Match the complete CPU output, including the model's spelling of the brand.
     var cpu_sessions = backends.SessionManager.initWithIo(a, std.testing.io);
     cpu_sessions.preferred_backends = &.{.native};
     cpu_sessions.required_backend = .native;
@@ -824,6 +831,16 @@ test "Florence CUDA pinned OCR reads invoice fixture" {
     var cpu_result = try cpu_reader.read(image_data, .{ .prompt = "<OCR>", .max_tokens = 128, .execution_control = control });
     defer cpu_result.deinit();
     try std.testing.expectEqualStrings(cpu_result.text, result.text);
+    if (backend == .metal) {
+        const batch = try reader.readBatchReported(&.{ image_data, image_data }, .{ .prompt = "<OCR>", .max_tokens = 128, .execution_control = control });
+        defer {
+            for (batch.results) |*item| item.deinit();
+            a.free(batch.results);
+        }
+        try std.testing.expectEqual(.native, batch.mode);
+        try std.testing.expectEqual(@as(usize, 2), batch.results.len);
+        for (batch.results) |item| try std.testing.expectEqualStrings(cpu_result.text, item.text);
+    }
 }
 
 test "standalone reader derives MIME from encoded bytes rather than filename" {

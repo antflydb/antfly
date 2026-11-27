@@ -22,7 +22,7 @@ const cache_mod = @import("cache.zig");
 const compiled_backend = @import("compiled_backend.zig");
 const partition_mod = @import("partition.zig");
 const multi_executor_mod = @import("multi_executor.zig");
-const model_runtime = @import("model_runtime.zig");
+const model_runtime = @import("../execution/model_runtime.zig");
 const pjrt_artifact_executor_mod = if (build_options.enable_pjrt) @import("pjrt_artifact_executor.zig") else struct {};
 const pjrt_executor_mod = if (build_options.enable_pjrt) @import("pjrt_executor.zig") else struct {};
 

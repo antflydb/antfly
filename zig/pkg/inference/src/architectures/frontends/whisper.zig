@@ -257,7 +257,7 @@ test "model program Whisper resident self and immutable cross KV match full pref
             const values = try ordinary.toFloat32(expected[0].value, a);
             defer a.free(values);
             try std.testing.expectEqual(length, state.position);
-            try std.testing.expectEqual(@as(usize, cfg.decoder_layers * 4), state.buffers.len);
+            try std.testing.expectEqual(@as(usize, cfg.decoder_layers * 4), state.banks().len);
             for (values[values.len - cfg.vocab_size ..], actual[0].asFloat32()) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-5);
         }
     }
@@ -296,7 +296,7 @@ test "model program Whisper resident self and immutable cross KV match full pref
     defer a.free(initial);
     defer for (initial) |*value| value.deinit();
     var handles: [fixture.config.decoder_layers * 4]usize = undefined;
-    for (state.buffers, &handles) |buffer, *handle| handle.* = @intFromPtr(buffer.handle);
+    for (state.banks(), &handles) |buffer, *handle| handle.* = @intFromPtr(buffer.handle);
     var next_ids = try Tensor.initInt64(a, "input_ids", &.{ 1, 1 }, &.{3});
     defer next_ids.deinit();
     var next_pos = try Tensor.initInt64(a, "position_ids", next_ids.shape, &.{1});
@@ -304,6 +304,6 @@ test "model program Whisper resident self and immutable cross KV match full pref
     forward.resident_initial = false;
     try std.testing.expectError(error.InvalidResidentDecoderOutput, failed_cache.runResident(a, failed_provider, forward, &.{ .{ .tensor = next_ids }, .{ .tensor = hidden }, .{ .tensor = mask }, .{ .tensor = next_pos } }, &state, a, null));
     try std.testing.expectEqual(@as(usize, 1), state.position);
-    try std.testing.expectEqual(handles.len, state.buffers.len);
-    for (state.buffers, handles) |buffer, handle| try std.testing.expectEqual(handle, @intFromPtr(buffer.handle));
+    try std.testing.expectEqual(handles.len, state.banks().len);
+    for (state.banks(), handles) |buffer, handle| try std.testing.expectEqual(handle, @intFromPtr(buffer.handle));
 }

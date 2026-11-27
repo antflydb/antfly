@@ -39,7 +39,7 @@ const interpreter = @import("interpreter.zig");
 const RuntimeInput = interpreter.RuntimeInput;
 const CachedAnalysis = interpreter.CachedAnalysis;
 const PartitionExecutor = @import("partition.zig").PartitionExecutor;
-const model_runtime = @import("model_runtime.zig");
+const model_runtime = @import("../execution/model_runtime.zig");
 
 /// Attention mode mirroring DecodeContext.AttentionMode. Duplicated here
 /// so the cache module doesn't depend on the full runtime import chain.

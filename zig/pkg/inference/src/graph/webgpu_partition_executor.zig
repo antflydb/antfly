@@ -25,7 +25,7 @@ const ml = @import("ml");
 const contracts = @import("backend_contracts.zig");
 const ops_mod = @import("../ops/ops.zig");
 const partition_mod = @import("partition.zig");
-const buffer_plan_mod = @import("buffer_plan.zig");
+const buffer_plan_mod = @import("../execution/buffer_plan.zig");
 const device_mesh_mod = @import("device_mesh.zig");
 const native_partition_executor = @import("native_partition_executor.zig");
 const interpreter = @import("interpreter.zig");
@@ -439,7 +439,7 @@ fn executeCommandNode(
             const rhs = valueFor(values, inputs[1]) orelse return error.MissingValue;
             const scalar = valueFor(values, inputs[2]) orelse return error.MissingValue;
             if (attrs.scale_before_add) {
-                if (try cb.addMultiplyScalarTensor(lhs, rhs, scalar)) |fused| break :blk fused;
+                if (!attrs.separate_rounding) if (try cb.addMultiplyScalarTensor(lhs, rhs, scalar)) |fused| break :blk fused;
                 const scaled = try cb.multiply(lhs, scalar);
                 defer cb.free(scaled);
                 break :blk try cb.add(scaled, rhs);

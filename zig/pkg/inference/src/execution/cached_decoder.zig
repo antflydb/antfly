@@ -21,6 +21,7 @@ const platform = @import("antfly_platform");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const CT = ops.CT;
 const ComputeBackend = ops.ComputeBackend;
+const Submission = @import("submission.zig").Scope;
 
 /// Compile-time architecture binding preserves its tuned scalar/batched
 /// implementations without a backend wrapper or dispatch allocation.
@@ -124,7 +125,7 @@ pub fn CachedDecoder(comptime Architecture: type) type {
         mode: Mode,
         cache: Architecture.DecoderIncrementalCache,
         hidden: ?CT = null,
-        owns_frame: bool = false,
+        frame: ?Submission = null,
         frame_start: u64 = 0,
         frame_stats: FrameStats = .{},
         compaction_supported: bool = true,
@@ -140,7 +141,7 @@ pub fn CachedDecoder(comptime Architecture: type) type {
 
         pub fn deinit(self: *Self) void {
             // Driver cancellation precedes storage retirement on every exit.
-            if (self.owns_frame) self.context.backend.decoderRuntimeCancelFrame() catch {};
+            if (self.frame) |*frame| frame.deinit();
             if (self.hidden) |hidden| self.context.backend.free(hidden);
             self.cache.deinit(self.context.backend, self.context.allocator);
             self.* = undefined;
@@ -158,11 +159,11 @@ pub fn CachedDecoder(comptime Architecture: type) type {
         /// retire before the next step; decoder cache commit remains canonical.
         pub fn step(self: *Self, token_ids: []const i64, single_frame: bool) !void {
             if (self.context.control) |control| try control.check();
-            if (self.owns_frame) return error.DecoderStepFrameStillOwned;
+            if (self.frame != null) return error.DecoderStepFrameStillOwned;
             if (self.hidden) |old| self.context.backend.free(old);
             self.hidden = null;
-            self.owns_frame = try beginStepFrame(self.context.backend, single_frame);
-            if (self.owns_frame)
+            self.frame = try beginStepFrame(self.context.backend, single_frame);
+            if (self.frame != null)
                 self.frame_start = self.context.backend.debugTimingSnapshot().provider.decoder_runtime_frame_submits;
             self.hidden = switch (self.mode) {
                 .scalar => blk: {
@@ -201,7 +202,7 @@ pub fn CachedDecoder(comptime Architecture: type) type {
 
         pub fn argmaxRows(self: *Self, logits: CT) !?[]u32 {
             const prior_steps = self.frame_stats.consumed_steps;
-            const tokens = try stepArgmaxRows(self.context.backend, logits, self.cache.batch, self.context.model.vocab_size, self.context.allocator, &self.owns_frame, &self.frame_stats.consumed_steps, &self.frame_stats.api_fallbacks);
+            const tokens = try stepArgmaxRows(self.context.backend, logits, self.cache.batch, self.context.model.vocab_size, self.context.allocator, &self.frame, &self.frame_stats.consumed_steps, &self.frame_stats.api_fallbacks);
             if (self.frame_stats.consumed_steps > prior_steps and
                 self.context.backend.debugTimingSnapshot().provider.decoder_runtime_frame_submits -| self.frame_start != 1)
                 self.frame_stats.topology_mismatches += 1;
@@ -371,36 +372,38 @@ fn selectLogitsHead(cb: *const ComputeBackend, allocator: std.mem.Allocator, log
     return unsupported;
 }
 
-pub fn beginStepFrame(cb: *const ComputeBackend, enabled: bool) !bool {
-    if (!enabled or cb.kind() != .metal or cb.decoderRuntimeHasActiveFrame()) return false;
-    if (!try cb.decoderRuntimeBeginFrame()) return false;
-    errdefer cb.decoderRuntimeCancelFrame() catch {};
+/// Open the shared single-step Metal decoder scope for an owning caller.
+pub fn beginStepFrame(cb: *const ComputeBackend, enabled: bool) !?Submission {
+    if (!enabled or cb.kind() != .metal) return null;
+    var frame = try Submission.begin(cb);
+    if (!frame.owns) return null;
+    errdefer frame.deinit();
     try cb.decoderRuntimeSetActiveFrameRegime(.decode);
     if (!try cb.decoderRuntimeBeginPlannedComputeScope()) {
-        try cb.decoderRuntimeCancelFrame();
-        return false;
+        try frame.deinitChecked();
+        return null;
     }
-    return true;
+    return frame;
 }
 
-pub fn stepArgmaxRows(cb: *const ComputeBackend, logits: CT, rows: usize, vocab: usize, allocator: std.mem.Allocator, owns_frame: *bool, steps: *usize, fallbacks: *usize) !?[]u32 {
-    if (owns_frame.*) {
+pub fn stepArgmaxRows(cb: *const ComputeBackend, logits: CT, rows: usize, vocab: usize, allocator: std.mem.Allocator, frame: *?Submission, steps: *usize, fallbacks: *usize) !?[]u32 {
+    if (frame.*) |*owned| {
         _ = try cb.decoderRuntimeBeginPlannedComputeScope();
         if (try cb.decoderRuntimeArgmaxRowsSuppress(logits, 0, rows, vocab, &.{}, allocator)) |selected| {
             if (cb.decoderRuntimeHasActiveFrame()) {
                 allocator.free(selected);
                 return error.FlorenceArgmaxFrameNotConsumed;
             }
-            owns_frame.* = false;
+            frame.* = null;
             steps.* += 1;
             return selected;
         }
         if (!cb.decoderRuntimeHasActiveFrame()) {
-            owns_frame.* = false;
+            frame.* = null;
             return error.FlorenceArgmaxFrameFailed;
         }
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        owns_frame.* = false;
+        try owned.finish();
+        frame.* = null;
         fallbacks.* += 1;
     }
     return cb.argmaxRows(logits, 0, rows, vocab, allocator);

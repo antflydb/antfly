@@ -52,7 +52,7 @@ pub const ProgramSpec = struct {
     family: enum { whisper, florence },
     phase: enum { decode, initial },
     geometry: struct { layers: usize, width: usize, heads: usize, ffn_dim: usize, vocab_size: usize, encoder_rows: usize, capacity: usize, query_rows: usize },
-    semantics: struct { epsilon: f32 = 1e-5, activation: enum { gelu, gelu_exact }, norm_order: enum { pre, post }, position_offset: usize, global_final_norm: bool },
+    semantics: struct { epsilon: f32 = 1e-5, activation: enum { gelu, gelu_exact }, norm_order: enum { pre, post }, position_offset: usize, global_final_norm: bool, all_keys_visible: bool = false },
     parameters: []const ParameterSpec,
 
     fn validate(self: *const ProgramSpec) !void {
@@ -83,7 +83,7 @@ const SliceSpecSource = struct {
 };
 fn hashSpecHeader(hash: *std.crypto.hash.sha2.Sha256, spec: *const ProgramSpec, count: usize) void {
     hash.update("dense.semantic.binding.recipe.v1");
-    const header = [_]u64{ @backingInt(spec.family), @backingInt(spec.phase), spec.geometry.layers, spec.geometry.width, spec.geometry.heads, spec.geometry.ffn_dim, spec.geometry.vocab_size, spec.geometry.encoder_rows, spec.geometry.capacity, spec.geometry.query_rows, @as(u32, @bitCast(spec.semantics.epsilon)), @backingInt(spec.semantics.activation), @backingInt(spec.semantics.norm_order), spec.semantics.position_offset, @intFromBool(spec.semantics.global_final_norm), count };
+    const header = [_]u64{ @backingInt(spec.family), @backingInt(spec.phase), spec.geometry.layers, spec.geometry.width, spec.geometry.heads, spec.geometry.ffn_dim, spec.geometry.vocab_size, spec.geometry.encoder_rows, spec.geometry.capacity, spec.geometry.query_rows, @as(u32, @bitCast(spec.semantics.epsilon)), @backingInt(spec.semantics.activation), @backingInt(spec.semantics.norm_order), spec.semantics.position_offset, @intFromBool(spec.semantics.global_final_norm), @intFromBool(spec.semantics.all_keys_visible), count };
     hash.update(std.mem.sliceAsBytes(&header));
 }
 fn hashParameter(hash: *std.crypto.hash.sha2.Sha256, parameter: ParameterSpec) void {
@@ -257,7 +257,7 @@ pub const Definition = struct {
     descriptors: []?ops.kernel_descriptor.Descriptor,
     steps: []Node,
     analysis: @import("../graph/interpreter.zig").CachedAnalysis,
-    physical_layout: @import("../graph/runtime.zig").FrozenPhysicalLayout,
+    physical_layout: @import("graph_runtime.zig").FrozenPhysicalLayout,
     program_spec: ?OwnedSpec = null,
     parameter_recipe: []ParameterRecipe = &.{},
     runtime_recipe: []PendingBinding = &.{},
@@ -355,9 +355,9 @@ pub const Definition = struct {
         errdefer a.free(steps);
         var analysis = try @import("../graph/interpreter.zig").CachedAnalysis.compute(a, &graph);
         errdefer analysis.deinit(a);
-        var layout = try @import("../graph/runtime.zig").PhysicalLayout.create(a, &graph, &.{&builder.backend}, .{}, true);
+        var layout = try @import("graph_runtime.zig").PhysicalLayout.create(a, &graph, &.{&builder.backend}, .{}, true);
         errdefer layout.deinit();
-        var frozen = try @import("../graph/runtime.zig").FrozenPhysicalLayout.initConsuming(&graph, &layout, &.{&builder.backend});
+        var frozen = try @import("graph_runtime.zig").FrozenPhysicalLayout.initConsuming(&graph, &layout, &.{&builder.backend});
         errdefer frozen.deinit();
         self.* = .{ .allocator = a, .key = key, .shared = if (builder.preparation) |preparation| preparation.shared else null, .graph = frozen.graph().*, .descriptors = descriptors, .steps = steps, .analysis = analysis, .physical_layout = frozen, .plane_count = builder.planes.items.len, .program_spec = owned_spec, .parameter_recipe = recipe, .runtime_recipe = runtime_recipe, .immutable_recipe = immutable_recipe };
         // No fallible work follows transfer of the finalizer. Publication is
@@ -587,12 +587,15 @@ pub const Builder = struct {
         return self.operation(op, inputs[0..if (b != null) @as(usize, 3) else 2], .{ .operation = .{ .linear = geometry }, .output_shape = Shape.init(.f32, &.{ @intCast(rows), @intCast(out) }), .input_shapes = .{ self.logicalShape(x), self.logicalShape(w), if (b) |id| self.logicalShape(id) else undefined }, .input_count = if (b != null) 3 else 2 });
     }
     pub fn prefix(self: *Builder, q: Node, k: Node, v: Node, heads: usize, dim: usize, capacity: usize) !Node {
-        const geometry = ops.kernel_descriptor.DenseAttentionPrefix{ .num_heads = std.math.cast(u32, heads) orelse return error.DimensionOverflow, .head_dim = std.math.cast(u32, dim) orelse return error.DimensionOverflow, .max_key_rows = std.math.cast(u32, capacity) orelse return error.DimensionOverflow };
-        return self.operation(.{ .fused_cross_attention = .{ .batch = 1, .dec_seq = 1, .enc_seq = geometry.max_key_rows, .num_heads = geometry.num_heads, .head_dim = geometry.head_dim } }, &.{ q, k, v }, .{ .operation = .{ .dense_attention_prefix = geometry }, .input_count = 3, .output_shape = self.logicalShape(q), .input_shapes = .{ self.logicalShape(q), self.logicalShape(k), self.logicalShape(v) } });
+        const geometry = ops.kernel_descriptor.DenseAttentionPrefix{ .num_heads = std.math.cast(u32, heads) orelse return error.DimensionOverflow, .head_dim = std.math.cast(u32, dim) orelse return error.DimensionOverflow, .max_key_rows = std.math.cast(u32, capacity) orelse return error.DimensionOverflow, .all_keys_visible = if (self.program_spec) |spec| spec.semantics.all_keys_visible else false };
+        return self.operation(.{ .fused_cross_attention = .{ .batch = 1, .dec_seq = 1, .enc_seq = geometry.max_key_rows, .num_heads = geometry.num_heads, .head_dim = geometry.head_dim, .all_keys_visible = geometry.all_keys_visible } }, &.{ q, k, v }, .{ .operation = .{ .dense_attention_prefix = geometry }, .input_count = 3, .output_shape = self.logicalShape(q), .input_shapes = .{ self.logicalShape(q), self.logicalShape(k), self.logicalShape(v) } });
     }
     pub fn attentionRows(self: *Builder, kind: ops.kernel_descriptor.DenseAttentionRows.Kind, q: Node, k: Node, v: Node, heads: usize, dim: usize, query_rows: usize, key_rows: usize) !Node {
-        const geometry = ops.kernel_descriptor.DenseAttentionRows{ .kind = kind, .num_heads = std.math.cast(u32, heads) orelse return error.DimensionOverflow, .head_dim = std.math.cast(u32, dim) orelse return error.DimensionOverflow, .query_rows = std.math.cast(u32, query_rows) orelse return error.DimensionOverflow, .key_rows = std.math.cast(u32, key_rows) orelse return error.DimensionOverflow };
-        const op: ml.graph.OpCode = .{ .fused_cross_attention = .{ .batch = 1, .dec_seq = geometry.query_rows, .enc_seq = geometry.key_rows, .num_heads = geometry.num_heads, .head_dim = geometry.head_dim } };
+        const geometry = ops.kernel_descriptor.DenseAttentionRows{ .kind = kind, .num_heads = std.math.cast(u32, heads) orelse return error.DimensionOverflow, .head_dim = std.math.cast(u32, dim) orelse return error.DimensionOverflow, .query_rows = std.math.cast(u32, query_rows) orelse return error.DimensionOverflow, .key_rows = std.math.cast(u32, key_rows) orelse return error.DimensionOverflow, .all_keys_visible = if (self.program_spec) |spec| kind == .cross and spec.semantics.all_keys_visible else false };
+        const op: ml.graph.OpCode = switch (kind) {
+            .cross => .{ .fused_cross_attention = .{ .batch = 1, .dec_seq = geometry.query_rows, .enc_seq = geometry.key_rows, .num_heads = geometry.num_heads, .head_dim = geometry.head_dim, .all_keys_visible = geometry.all_keys_visible } },
+            .causal => .{ .fused_gqa_causal_attention = .{ .batch = 1, .seq_len = geometry.query_rows, .kv_seq_len = geometry.key_rows, .num_heads = geometry.num_heads, .num_kv_heads = geometry.num_heads, .head_dim = geometry.head_dim, .functional_kv = true, .sliding_window = 0 } },
+        };
         return self.operation(op, &.{ q, k, v }, .{ .operation = .{ .dense_attention_rows = geometry }, .input_count = 3, .output_shape = self.logicalShape(q), .input_shapes = .{ self.logicalShape(q), self.logicalShape(k), self.logicalShape(v) } });
     }
     pub fn lastRow(self: *Builder, input: Node, rows: usize, width: usize) !Node {
@@ -768,7 +771,7 @@ pub const Schedule = struct {
         errdefer a.free(values);
         const implementation = route.Implementation{ .context = builder.backend.ptr, .table = builder.backend.vtable };
         const bindings = input_facts.InputSource{ .indexed = .{ .entries = builder.bindings.items, .planes = builder.planes.items, .implementation = implementation } };
-        const immutable = input_facts.InputSource{ .indexed = .{ .entries = builder.immutable_resident.items, .planes = builder.planes.items, .implementation = implementation } };
+        const immutable = input_facts.InputSource{ .indexed = .{ .entries = builder.immutable_resident.items, .planes = builder.planes.items, .implementation = implementation, .tensors_by_node = if (builder.backend.kind() == .metal) values else null } };
         return createPrepared(a, builder.backend, definition, values, immutable, bindings);
     }
     /// Values and planes belong to this request. Only the frozen pure recipe
@@ -790,7 +793,7 @@ pub const Schedule = struct {
             if (entry.plane) |index| planes[index] = try currentPlane(cb, parameter, current);
         }
         const implementation = route.Implementation{ .context = cb.ptr, .table = cb.vtable };
-        const immutable = input_facts.InputSource{ .indexed = .{ .entries = definition.immutable_recipe, .planes = planes, .implementation = implementation } };
+        const immutable = input_facts.InputSource{ .indexed = .{ .entries = definition.immutable_recipe, .planes = planes, .implementation = implementation, .tensors_by_node = if (cb.kind() == .metal) values else null } };
         const runtime = input_facts.InputSource{ .indexed = .{ .entries = definition.runtime_recipe, .planes = planes, .implementation = implementation } };
         return createPrepared(a, cb.*, definition, values, immutable, runtime);
     }
@@ -809,7 +812,7 @@ pub const Schedule = struct {
         self.values = values;
         var private_pool: ?*physical.Pool = (definition.physical_layout.createPool(a, &.{&self.backend}, self.descriptors) catch |err| switch (err) {
             error.PhysicalOutputLayoutChanged => fallback: {
-                var fresh = try @import("../graph/runtime.zig").PhysicalLayout.create(a, &self.graph, &.{&self.backend}, .{}, false);
+                var fresh = try @import("graph_runtime.zig").PhysicalLayout.create(a, &self.graph, &.{&self.backend}, .{}, false);
                 defer fresh.deinit();
                 break :fallback try fresh.createPool(a, &self.graph, &.{&self.backend}, self.descriptors);
             },
@@ -821,9 +824,26 @@ pub const Schedule = struct {
         private_pool.?.coverage_backend = self.backend;
         private_pool.?.native_frame_dispatch = self.backend.kind() == .native;
         private_pool.?.cuda_frame_dispatch = self.backend.kind() == .cuda;
+        private_pool.?.metal_frame_dispatch = self.backend.kind() == .metal;
         self.selected = (try physical.Pool.preparePrivateDecoderSourcesConsuming(&private_pool, immutable, bindings)) orelse return error.UnsupportedDenseSchedule;
         errdefer self.selected.release();
-        if (self.selected.pool.payload_coverage != .complete or self.selected.pool.regions.len != 0) return error.UnsupportedDenseSchedule;
+        if (self.selected.pool.payload_coverage != .complete) return error.UnsupportedDenseSchedule;
+        // The model advances a complete QKV as one step. Every installed
+        // region must match the exact contiguous authored step interval.
+        var step: usize = 0;
+        while (step < self.steps.len) {
+            const installed = self.selected.pool.regionForNode(self.steps[step]) orelse {
+                step += 1;
+                continue;
+            };
+            // Direct cache-row writes are optional. Initial prefill uses the
+            // assigned QKV outputs, and decode can consume those same outputs
+            // when the region cannot write directly into the cache.
+            if (self.steps.len - step < 3 or installed.owner.entry_node != self.steps[step])
+                return error.UnsupportedDenseSchedule;
+            validateQkvRegion(installed, self.steps[step..][0..3]) catch return error.UnsupportedDenseSchedule;
+            step += 3;
+        }
         // A ready authored plan owns its complete cold resource recipe before
         // admission, metadata sealing, or the first numerical Model scope.
         _ = try self.selected.storageRequirement();
@@ -838,16 +858,25 @@ pub const Schedule = struct {
     }
     pub fn enter(self: *Schedule, capability: ?@import("storage_admission.zig").Capability, current: Cleanup, host_inputs: []const @import("host_ingress.zig").Input) !void {
         if (self.frame != null) return error.DenseScheduleAlreadyEntered;
-        const frame = (try self.selected.pool.acquirePrepared(capability, null)) orelse return error.PreparedStorageUnavailable;
+        const operation = @import("backend_operation.zig");
+        var scope: operation.Scope = .{};
+        defer scope.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        var cleanup = current;
+        if (self.selected.pool.requiresManagedExecution()) {
+            try operation.enterInto(&self.backend, &self.graph, current.operation orelse self.backend.operationToken(), .managed, &scope);
+            cleanup.operation = scope.token() orelse return error.UnsupportedDenseSchedule;
+        }
+        const frame = (try self.selected.pool.acquirePrivateDecoderFrame(capability, cleanup.operation)) orelse return error.PreparedStorageUnavailable;
         self.frame = frame;
         errdefer {
-            _ = frame.finishWithCleanup(current) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+            _ = frame.finishWithCleanup(cleanup) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
             self.frame = null;
         }
-        try frame.beginWithCleanup(current);
+        try frame.beginWithCleanup(cleanup);
         try frame.beginProgramPreparation();
-        try self.bindHostInputs(host_inputs);
-        try frame.prepareProgramViews(&self.backend, &self.graph, self.values, current);
+        const bound = try frame.bindHostInputsWithOperation(host_inputs, null, if (cleanup.operation) |*token| token else null);
+        for (bound) |input| self.values[input.node_id] = input.value;
+        try frame.prepareProgramViews(&self.backend, &self.graph, self.values, cleanup);
         try self.borrowed.ensureTotalCapacity(self.allocator, self.graph.nodeCount());
         for (frame.native_program_views) |maybe| if (maybe) |value| self.borrowed.putAssumeCapacity(value, {});
         try frame.sealProgramStorage();
@@ -856,21 +885,24 @@ pub const Schedule = struct {
     pub fn beginExecution(self: *Schedule, current: Cleanup) !void {
         const frame = self.frame orelse return error.DenseScheduleNotEntered;
         if (frame.scope_backends != 0 or self.numerical_epoch != null) return error.DenseScheduleAlreadyEntered;
-        if (current.operation != null or current.synchronous_outside_raw != null) return error.UnsupportedDenseScheduleCleanup;
+        if (current.operation != null) return error.UnsupportedDenseScheduleCleanup;
         const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;
+        const operation = if (self.selected.pool.requiresManagedExecution()) operation: {
+            const token = self.backend.operationToken() orelse return error.UnsupportedDenseSchedule;
+            try token.validate(.{ .implementation = .{ .context = self.backend.ptr, .table = self.backend.vtable }, .program = &self.graph, .mode = .managed });
+            var owner_epoch = (try token.retainCleanupEpoch()) orelse return error.MissingCurrentCleanupEpoch;
+            defer owner_epoch.release();
+            if (owner_epoch.record != epoch.record or owner_epoch.nonce != epoch.nonce) return error.BackendOperationCleanupChanged;
+            break :operation token;
+        } else null;
         var held = try epoch.retain();
         errdefer held.release();
         if (try held.isSealed()) return error.RetirementEpochSealed;
         self.numerical_epoch = held;
-        frame.beginWithCleanup(.{ .boundary = &self.numerical_epoch.? }) catch |err| {
+        frame.beginWithCleanup(.{ .boundary = &self.numerical_epoch.?, .operation = operation }) catch |err| {
             self.numerical_epoch = null;
             return err;
         };
-    }
-    pub fn bindHostInputs(self: *Schedule, inputs: []const @import("host_ingress.zig").Input) !void {
-        const frame = self.frame orelse return error.DenseScheduleNotEntered;
-        const bound = try frame.bindHostInputs(inputs);
-        for (bound) |input| self.values[input.node_id] = input.value;
     }
     pub fn beforeHostInputReuse(self: *Schedule) !void {
         const frame = self.frame orelse return error.DenseScheduleNotEntered;
@@ -882,11 +914,109 @@ pub const Schedule = struct {
     pub fn releaseTemporary(self: *const Schedule, cb: *const ops.ComputeBackend, value: CT) void {
         if (!self.borrowed.contains(value)) cb.free(value);
     }
-    pub fn execute(self: *Schedule, inputs: []const CT, attention: ?*const ops.AttentionContext) !CT {
+    fn nextNodeId(self: *const Schedule) !Node {
         if (self.cursor >= self.steps.len) return error.DenseScheduleOrderChanged;
-        const id = self.steps[self.cursor];
-        const node = self.graph.node(id);
+        return self.steps[self.cursor];
+    }
+    pub fn nextNode(self: *const Schedule) !*const ml.graph.Node {
+        return self.graph.node(try self.nextNodeId());
+    }
+    pub fn nextDescriptor(self: *const Schedule) !*const ops.kernel_descriptor.Descriptor {
+        return if (self.descriptors[try self.nextNodeId()]) |*descriptor| descriptor else error.DenseScheduleOrderChanged;
+    }
+    pub fn execute(self: *Schedule, inputs: []const CT, attention: ?*const ops.AttentionContext) !CT {
+        const node = self.graph.node(try self.nextNodeId());
         if (inputs.len != node.num_inputs) return error.DenseScheduleOrderChanged;
+        return self.executeStep(node, inputs, attention);
+    }
+    pub fn executeAddNorm(self: *Schedule, a: CT, b: CT, weight: CT, bias: CT, dim: usize, eps: f32) !?[2]CT {
+        if (self.backend.kind() != .metal) return null;
+        if (self.cursor >= self.steps.len or self.steps.len - self.cursor < 2) return error.DenseScheduleOrderChanged;
+        const add, const norm = self.steps[self.cursor..][0..2].*;
+        const add_op = (self.descriptors[add] orelse return error.DenseScheduleOrderChanged).operation;
+        const norm_op = (self.descriptors[norm] orelse return error.DenseScheduleOrderChanged).operation;
+        const node = self.graph.node(norm);
+        if (add_op != .binary or add_op.binary != .add or norm_op != .norm or norm_op.norm.kind != .layer or
+            norm_op.norm.dim != dim or norm_op.norm.eps != eps or node.num_inputs != 3 or node.inputs[0] != add)
+            return error.DenseScheduleOrderChanged;
+        if (self.values[node.inputs[1]] != weight or self.values[node.inputs[2]] != bias)
+            return error.PreparedKernelBindingChanged;
+        const frame = self.frame orelse return error.DenseScheduleNotEntered;
+        self.values[add] = frame.preparedOutputView(add) orelse return error.UnpreparedNativeProgramViews;
+        const outputs = try frame.executePreparedAddNorm(&self.backend, self.values, add, norm, .{ a, b });
+        self.cursor += 2;
+        if (self.cursor == self.steps.len) try frame.recordProgramCompletion();
+        return outputs;
+    }
+
+    /// Consume a semantic projection group with one cursor contract. Validate
+    /// all member operands before submitting the first numerical operation.
+    fn validateQkv(self: *const Schedule, inputs: [3][]const CT) ![]const ml.graph.NodeId {
+        if (self.cursor > self.steps.len or self.steps.len - self.cursor < inputs.len) return error.DenseScheduleOrderChanged;
+        const members = self.steps[self.cursor..][0..inputs.len];
+        const activation = self.graph.node(members[0]).inputs[0];
+        for (members, inputs) |id, operands| {
+            const descriptor = self.descriptors[id] orelse return error.DenseScheduleOrderChanged;
+            const node = self.graph.node(id);
+            if (descriptor.operation != .linear or operands.len < 2 or operands.len != descriptor.input_count or
+                node.num_inputs != operands.len or node.inputs[0] != activation or operands[0] != inputs[0][0])
+                return error.DenseScheduleOrderChanged;
+            for (node.getInputs()[1..], operands[1..]) |source, value| {
+                if (self.graph.node(source).op != .parameter or self.values[source] != value) return error.PreparedKernelBindingChanged;
+            }
+        }
+        return members;
+    }
+
+    fn validateQkvRegion(installed: *const @import("region_binding.zig").Installed, members: []const ml.graph.NodeId) !void {
+        if (!std.mem.eql(ml.graph.NodeId, installed.owner.covered_nodes, members) or installed.outputs.len != members.len)
+            return error.DenseScheduleOrderChanged;
+        for (installed.outputs, members) |output, member| if (output.slot.node != member) return error.DenseScheduleOrderChanged;
+    }
+
+    /// The receiving prefix must refer to the same admitted cache banks.
+    pub fn executeQkvCacheRow(self: *Schedule, inputs: [3][]const CT, cache: @import("../ops/kernel_backend.zig").QkvCacheRow) !?CT {
+        if (self.backend.kind() != .metal) return null;
+        const members = try self.validateQkv(inputs);
+        const installed = self.selected.pool.regionAtEntry(members[0]) orelse return null;
+        if (installed.owner.vtable.dispatch_qkv_cache_row == null) return null;
+        try validateQkvRegion(installed, members);
+        const next = self.cursor + members.len;
+        if (next >= self.steps.len) return error.DenseScheduleOrderChanged;
+        const next_id = self.steps[next];
+        const descriptor = self.descriptors[next_id] orelse return error.DenseScheduleOrderChanged;
+        if (descriptor.operation != .dense_attention_prefix) return null;
+        const receiving = self.graph.node(next_id);
+        if (receiving.inputs[0] != members[0] or self.values[receiving.inputs[1]] != cache.keys or self.values[receiving.inputs[2]] != cache.values or
+            descriptor.operation.dense_attention_prefix.max_key_rows != cache.capacity or cache.position >= cache.capacity)
+            return error.PreparedDensePrefixBindingChanged;
+        const frame = self.frame orelse return error.DenseScheduleNotEntered;
+        self.values[self.graph.node(members[0]).inputs[0]] = inputs[0][0];
+        const query = try frame.executeProgramQkvCacheRow(installed, self.values, cache);
+        self.cursor = next;
+        return query;
+    }
+
+    pub fn executeQkv(self: *Schedule, inputs: [3][]const CT) !ops.LinearTripleResult {
+        const members = try self.validateQkv(inputs);
+        const activation = self.graph.node(members[0]).inputs[0];
+        if (self.selected.pool.regionAtEntry(members[0])) |installed| {
+            const frame = self.frame orelse return error.DenseScheduleNotEntered;
+            try validateQkvRegion(installed, members);
+            self.values[activation] = inputs[0][0];
+            const outputs = try frame.executeProgramRegion(installed, self.values);
+            self.cursor += members.len;
+            if (self.cursor == self.steps.len) try frame.recordProgramCompletion();
+            return .{ .first = outputs[0].tensor, .second = outputs[1].tensor, .third = outputs[2].tensor };
+        }
+        return .{
+            .first = try self.executeStep(self.graph.node(members[0]), inputs[0], null),
+            .second = try self.executeStep(self.graph.node(members[1]), inputs[1], null),
+            .third = try self.executeStep(self.graph.node(members[2]), inputs[2], null),
+        };
+    }
+    fn executeStep(self: *Schedule, node: *const ml.graph.Node, inputs: []const CT, attention: ?*const ops.AttentionContext) !CT {
+        const id = self.steps[self.cursor];
         for (node.getInputs(), inputs) |source, value| self.values[source] = value;
         const frame = self.frame orelse return error.DenseScheduleNotEntered;
         const result = try frame.executePreparedProgram(&self.backend, self.values, id, null, attention orelse &.{ .total_sequence_len = 0, .query_sequence_len = 0, .kv_sequence_len = 0 });
@@ -1302,7 +1432,11 @@ fn packedSpecNameCase(a: std.mem.Allocator) !void {
     try std.testing.expectEqual(@intFromPtr(owned_names.names.ptr) + 5, @intFromPtr(owned_names.value.parameters[1].source_name.ptr));
     var expected = header;
     expected.parameters = &parameters;
-    try std.testing.expectEqual(try specKey(&expected), try specKey(&owned_names.value));
+    const original_key = try specKey(&expected);
+    try std.testing.expectEqual(original_key, try specKey(&owned_names.value));
+    expected.semantics.all_keys_visible = true;
+    const all_valid_key = try specKey(&expected);
+    try std.testing.expect(!std.mem.eql(u8, &original_key, &all_valid_key));
     query_name[0] = 'X';
     try std.testing.expectEqualStrings("query", owned_names.value.parameters[0].source_name);
     query_name[0] = 'q';

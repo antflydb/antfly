@@ -19,8 +19,60 @@ import unittest
 
 from benchmark_concurrency import (
     apply_token_burst_overrides,
+    graph_first_replays,
+    graph_funding_denials,
+    graph_retirements,
     recurrent_placement_observation,
 )
+
+
+class GraphFundingTests(unittest.TestCase):
+    def test_records_funding_bytes_without_inventing_a_park_denial(self):
+        text = (
+            "LIGHTONOCR3 cuda_model_graph_precommit_decline rows=98 stage=park "
+            "error=ResourceTemporarilyUnavailable\n"
+            "LIGHTONOCR3 cuda_model_graph_funding rows=97 stage=storage "
+            "error=ResourceTemporarilyUnavailable requested_host_scratch=100 "
+            "requested_backend_scratch=200 occupied_host_scratch=300 "
+            "occupied_backend_scratch=400 policy_scratch_limit=900\n"
+        )
+        self.assertEqual(
+            graph_funding_denials(text),
+            [dict(rows=97, stage="storage", error="ResourceTemporarilyUnavailable",
+                  requested_host_scratch=100, requested_backend_scratch=200,
+                  occupied_host_scratch=300, occupied_backend_scratch=400,
+                  policy_scratch_limit=900)],
+        )
+        self.assertEqual(graph_funding_denials(text.splitlines()[0]), [])
+
+
+class GraphReplayTests(unittest.TestCase):
+    def test_distinguishes_dense_fused_and_uninstrumented_scratch(self):
+        prefix = "LIGHTONOCR3 cuda_model_graph_first_replay_rows="
+        text = "\n".join((
+            prefix + "2",
+            prefix + "8 capture=1 head_packet_rows=8 head_bank_bytes=128",
+            prefix + "64 capture=1 head_packet_rows=64 head_bank_bytes=0 fused_head_scratch_bytes=0",
+            prefix + "64 capture=1 head_packet_rows=64 head_bank_bytes=0 fused_head_scratch_bytes=496640",
+        ))
+        rows, banks = graph_first_replays(text)
+        self.assertEqual(rows, [2, 8, 64, 64])
+        self.assertNotIn("fused_head_scratch_bytes", banks[0])
+        self.assertEqual(banks[1]["fused_head_scratch_bytes"], 0)
+        self.assertEqual(banks[2]["fused_head_scratch_bytes"], 496640)
+
+
+class GraphRetirementTests(unittest.TestCase):
+    def test_records_progress_and_ignores_reset_messages(self):
+        text = (
+            "LIGHTONOCR3 cuda_model_graph_reset phase=disabled rows=64\n"
+            "LIGHTONOCR3 cuda_model_graph_retired reason=mixed_prefill "
+            "phase=replay epoch=3 rows=64 progress=12\n"
+        )
+        self.assertEqual(
+            graph_retirements(text),
+            [dict(reason="mixed_prefill", phase="replay", epoch=3, rows=64, progress=12)],
+        )
 
 
 class RecurrentPlacementTests(unittest.TestCase):

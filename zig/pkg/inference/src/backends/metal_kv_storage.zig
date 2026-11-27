@@ -682,16 +682,22 @@ pub const MetalKvStorage = struct {
                     }
                 }
             }
+            // A long cyclic write can cover the same address more than once.
+            // Publish only the final turn of the ring so each GPU lane owns a distinct row.
+            const suffix_count = if (ring_page_count > 0) @min(write.suffix_token_count, required_tokens) else write.suffix_token_count;
+            const skipped_bytes = (write.suffix_token_count - suffix_count) * v_row_stride * @sizeOf(f32);
+            const key_offset = std.math.add(usize, k.byte_offset, skipped_bytes) catch break :paged -9999;
+            const value_offset = std.math.add(usize, v.byte_offset, skipped_bytes) catch break :paged -9999;
             break :paged metal_runtime.termite_metal_decode_runtime_update_attention_paged_from_f32_key_device_slot(
                 self.runtime,
                 slot,
                 @backingInt(self.format),
                 k.handle,
-                k.byte_offset,
+                key_offset,
                 v.handle,
-                v.byte_offset,
+                value_offset,
                 write.total_token_count,
-                write.suffix_token_count,
+                suffix_count,
                 num_kv_heads,
                 head_dim,
                 key_row_bytes,
@@ -963,51 +969,19 @@ pub const MetalKvStorage = struct {
         if (prepared != 0) return error.DeviceKvCapacityPreparationFailed;
         defer metal_runtime.antfly_metal_kv_growth_discard(stage);
 
-        const Attachment = struct {
-            runtime: *metal_runtime.RawMetalDecodeRuntime,
-            buffer: *anyopaque,
-            fn beginScope(raw: *anyopaque, _: []const @import("../ops/ops.zig").CT) !retirement.Scope.Begun {
-                const value: *@This() = @ptrCast(@alignCast(raw));
-                var origin: u64 = 0;
-                const pending = metal_runtime.antfly_metal_output_retirement_begin(value.runtime, &origin, retirement.Queue.createIdentity);
-                if (pending < 0) return error.InvalidResourceRetirement;
-                metal_runtime.antfly_metal_output_retirement_end(value.runtime);
-                // These freshly allocated buffers have not been encoded yet.
-                // Unrelated frame/reuse-pool batches do not own this claim.
-                return .{ .origin = .{ .identity = origin }, .pending_batches = 0 };
-            }
-            fn end(_: *anyopaque) void {}
-            fn attach(raw: *anyopaque, _: []const @import("../ops/ops.zig").CT, nodes: []retirement.Node, payload: retirement.Payload) !void {
-                const value: *@This() = @ptrCast(@alignCast(raw));
-                if (nodes.len != 0) return error.InvalidResourceRetirement;
-                const buffers = [_]*anyopaque{value.buffer};
-                const witnesses = metal_runtime.antfly_metal_prepare_retirement_witnesses(&buffers, buffers.len, payload) orelse return error.OutOfMemory;
-                defer metal_runtime.antfly_metal_discard_retirement_witnesses(witnesses);
-                if (metal_runtime.antfly_metal_buffer_retirement_attach(witnesses) != 0) return error.InvalidResourceRetirement;
-            }
-            fn attachPrepared(raw: *anyopaque, _: []const @import("../ops/ops.zig").CT, nodes: []retirement.Node, payload: retirement.Payload, metadata: *retirement.BackendPreparation) !void {
-                const value: *@This() = @ptrCast(@alignCast(raw));
-                if (nodes.len != 0) return error.InvalidResourceRetirement;
-                const buffers = [_]*anyopaque{value.buffer};
-                const witnesses = try metadata.armMetal(null, &buffers, payload);
-                defer metal_runtime.antfly_metal_discard_retirement_witnesses(witnesses);
-                if (metal_runtime.antfly_metal_buffer_retirement_attach(witnesses) != 0) return error.InvalidResourceRetirement;
-            }
-            const table = retirement.Scope.VTable{ .begin = beginScope, .attach = attach, .attach_prepared = attachPrepared, .end = end, .notify = metal_runtime.antfly_metal_request_retirement_poll };
-        };
         for (plan.layers[0..plan.count], 0..) |layer, index| {
             const planned_planes = [_]storage_runtime.device_capacity.Plane{ layer.keys, layer.values };
             for (planned_planes, 0..) |plane, which| if (plane.new_length != 0) {
                 const buffer = metal_runtime.antfly_metal_kv_growth_buffer(stage.?, index, which) orelse return error.InvalidResourceRetirement;
                 const owner = claim.ownerAt(index, which);
                 owner.measure(cleanup, metal_runtime.termite_metal_buffer_allocated_size(buffer));
-                var attachment = Attachment{ .runtime = self.runtime, .buffer = buffer };
-                const begun = try Attachment.beginScope(&attachment, &.{});
-                var scope = retirement.Scope{ .context = &attachment, .origin = begun.origin, .pending_batches = begun.pending_batches, .outputs = &.{}, .active = true, .vtable = &Attachment.table };
-                defer scope.end();
-                if (begun.pending_batches != 0) return error.SharedKvCopyDuringFrame;
-                try owner.charge.attach(&scope);
-                scope.end();
+                var origin: u64 = 0;
+                const pending = metal_runtime.antfly_metal_output_retirement_begin(self.runtime, &origin, retirement.Queue.createIdentity);
+                if (pending < 0) return error.InvalidResourceRetirement;
+                metal_runtime.antfly_metal_output_retirement_end(self.runtime);
+                // The new buffers have never been encoded. Unrelated frames
+                // and the reuse pool do not own any part of their charge.
+                try metal_runtime.attachStandaloneRetirement(owner.charge, &.{buffer}, .{ .identity = origin }, true, metal_runtime.antfly_metal_request_retirement_poll);
             };
         }
         const copied = metal_runtime.antfly_metal_kv_growth_copy_checked(stage);
@@ -1560,37 +1534,6 @@ pub const MetalKvStorage = struct {
                 return self.reservation.?.partition(allocator, bytes);
             }
         };
-        const Attachment = struct {
-            buffer: *anyopaque,
-            origin: retirement.Queue,
-            fn begin(raw: *anyopaque, _: []const @import("../ops/ops.zig").CT) !retirement.Scope.Begun {
-                const self: *@This() = @ptrCast(@alignCast(raw));
-                return .{ .origin = self.origin, .pending_batches = 0 };
-            }
-            fn attach(raw: *anyopaque, _: []const @import("../ops/ops.zig").CT, nodes: []retirement.Node, payload: retirement.Payload) !void {
-                const self: *@This() = @ptrCast(@alignCast(raw));
-                if (nodes.len != 0) return error.InvalidResourceRetirement;
-                const handles = [_]*anyopaque{self.buffer};
-                const prepared = metal_runtime.antfly_metal_prepare_retirement_witnesses(&handles, 1, payload) orelse return error.OutOfMemory;
-                defer metal_runtime.antfly_metal_discard_retirement_witnesses(prepared);
-                if (metal_runtime.antfly_metal_buffer_retirement_attach(prepared) != 0) return error.InvalidResourceRetirement;
-            }
-            fn attachPrepared(raw: *anyopaque, _: []const @import("../ops/ops.zig").CT, nodes: []retirement.Node, payload: retirement.Payload, metadata: *retirement.BackendPreparation) !void {
-                const self: *@This() = @ptrCast(@alignCast(raw));
-                if (nodes.len != 0) return error.InvalidResourceRetirement;
-                const handles = [_]*anyopaque{self.buffer};
-                const witnesses = try metadata.armMetal(null, &handles, payload);
-                defer metal_runtime.antfly_metal_discard_retirement_witnesses(witnesses);
-                if (metal_runtime.antfly_metal_buffer_retirement_attach(witnesses) != 0) return error.InvalidResourceRetirement;
-            }
-            fn end(_: *anyopaque) void {}
-            const table = retirement.Scope.VTable{ .begin = begin, .attach = attach, .attach_prepared = attachPrepared, .end = end, .notify = metal_runtime.antfly_metal_request_retirement_poll };
-            fn bind(self: *@This(), owner: *capacity.BackingOwner) !void {
-                var scope = retirement.Scope{ .context = self, .origin = self.origin, .pending_batches = 0, .outputs = &.{}, .active = true, .vtable = &table };
-                defer scope.end();
-                try owner.charge.attach(&scope);
-            }
-        };
 
         /// Pure pre-join description: no SDK handles, allocation or lane access.
         pub fn describeCoverage(target: cold.Target, dtype: pool_mod.KvDType, window: capacity.Window, mode: banks.Mode, geometry: []const capacity.LayerGeometry) !?banks.Descriptor {
@@ -1742,14 +1685,12 @@ pub const MetalKvStorage = struct {
             const origin = retirement.Queue.init();
             // Roots in claim/retiring remain live until after this Gate unwinds.
             if (retiring) |r| for (r.owners, old_handles[0..old_count]) |*owner, buffer| {
-                var attachment = Attachment{ .buffer = buffer, .origin = origin };
-                try attachment.bind(owner);
+                try metal_runtime.attachStandaloneRetirement(owner.charge, &.{buffer}, origin, true, metal_runtime.antfly_metal_request_retirement_poll);
             };
             for (slots[0..self.count], 0..) |slot, index| {
                 const buffers = [2]*anyopaque{ slot.keys, slot.values };
                 for (buffers, 0..) |buffer, which| {
-                    var attachment = Attachment{ .buffer = buffer, .origin = origin };
-                    try attachment.bind(claim.ownerAt(index, which));
+                    try metal_runtime.attachStandaloneRetirement(claim.ownerAt(index, which).charge, &.{buffer}, origin, true, metal_runtime.antfly_metal_request_retirement_poll);
                 }
             }
             if (metal_runtime.antfly_metal_initialize_leased_kv_slots(runtime, &slots, self.count) != 0) return error.DeviceKvCapacityPreparationFailed;
@@ -1987,22 +1928,46 @@ test "selected Metal GPU scorer matches decoded-key oracle before and after repa
         const binding = try owned.acquireBinding(.{ .sequence_id = 91, .layer_index = 0 }, 0, false, true);
         try std.testing.expect(binding.slot >= metal_runtime.paged_kv_slot_base);
         const layout = owned.rowLayout(kv_heads, head_dim);
-        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_update_attention_span_from_f32_key_device_slot(
-            metal,
-            binding.slot,
-            @backingInt(owned.format),
-            k_handle,
-            0,
-            v_handle,
-            0,
-            rows,
-            kv_heads,
-            head_dim,
-            layout.key_row_bytes,
-            layout.base_key_row_bytes,
-            layout.v_row_stride,
-            0,
-        ));
+        const reserved: ?MetalKvStorage.SlotInfo = if (dtype == .f16) blk: {
+            try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_reserve_attention_span_slot_buffers(
+                metal,
+                binding.slot,
+                @backingInt(owned.format),
+                rows,
+                layout.key_row_bytes,
+                layout.v_row_stride,
+            ));
+            break :blk try owned.slotInfo(binding.slot);
+        } else null;
+        // Exercise F16 seeding and suffix append with nonzero source and slot offsets.
+        const updates: []const usize = if (dtype == .f16) &.{ 2, rows } else &.{rows};
+        var prior_rows: usize = 0;
+        for (updates) |covered_rows| {
+            const suffix_offset = prior_rows * width * @sizeOf(f32);
+            try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_update_attention_span_from_f32_key_device_slot(
+                metal,
+                binding.slot,
+                @backingInt(owned.format),
+                k_handle,
+                suffix_offset,
+                v_handle,
+                suffix_offset,
+                covered_rows,
+                kv_heads,
+                head_dim,
+                layout.key_row_bytes,
+                layout.base_key_row_bytes,
+                layout.v_row_stride,
+                0,
+            ));
+            prior_rows = covered_rows;
+        }
+        if (reserved) |before| {
+            const after = try owned.slotInfo(binding.slot);
+            try std.testing.expectEqual(rows * width * @sizeOf(f16), after.v_capacity);
+            try std.testing.expectEqual(before.v_handle, after.v_handle);
+            try std.testing.expectEqual(before.encoded_key_handle, after.encoded_key_handle);
+        }
         binding.written_tokens = rows;
         // This fixture writes the native slot directly, bypassing the storage
         // writer that normally publishes contiguous physical-row metadata.
@@ -2021,6 +1986,12 @@ test "selected Metal GPU scorer matches decoded-key oracle before and after repa
             .num_kv_heads = kv_heads,
             .head_dim = head_dim,
         }, &decoded_keys, &decoded_values);
+        if (dtype == .f16) {
+            for (keys, values, decoded_keys, decoded_values) |key, value, decoded_key, decoded_value| {
+                try std.testing.expectEqual(@as(f32, @as(f16, @floatCast(key))), decoded_key);
+                try std.testing.expectEqual(@as(f32, @as(f16, @floatCast(value))), decoded_value);
+            }
+        }
         var gpu_scores: [rows]f32 = undefined;
         const score_memory_0 = @import("metal_telemetry.zig").memorySnapshot(true);
         var score_interval_0: @import("metal_telemetry.zig").BufferInterval = .{};
@@ -2239,6 +2210,127 @@ test "Metal KV sequence release removes more bindings than one slot batch" {
     storage.releaseSequenceSlots(target_sequence);
     try std.testing.expectEqual(@as(usize, 1), storage.slot_map.count());
     try std.testing.expect(storage.slot_map.contains(.{ .sequence_id = 8, .layer_index = 0 }));
+}
+
+test "Metal compressed cyclic append writes only the newest physical rows" {
+    if (!build_options.enable_metal or builtin.os.tag != .macos or !metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    if (!MetalKvStorage.splitSwaKvRingEnabled()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const metal = metal_runtime.termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_decode_runtime_destroy(metal);
+    if (metal_runtime.termite_metal_decode_runtime_ready(metal) == 0) return error.SkipZigTest;
+
+    const width = 64;
+    const tokens = 7;
+    const ring_tokens = 4;
+    var runtime = try storage_runtime.KvStorageRuntime.init(allocator, .{
+        .backend = .metal,
+        .dtype = .int8,
+        .page_size_tokens = 2,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = width,
+        .store_cpu_bytes = false,
+    });
+    defer runtime.deinit();
+    const owner = try MetalKvStorage.create(allocator, metal, .int8, 1, width, 2);
+    runtime.setDeviceWriteHook(owner.deviceWriteHook());
+    const sequence = try runtime.attachSequence(runtime.poolId());
+    try runtime.appendTokens(sequence, tokens);
+
+    var rows: [tokens][width]f32 = undefined;
+    for (&rows, 1..) |*row, index| @memset(row, @floatFromInt(index));
+    const input = metal_runtime.termite_metal_buffer_alloc(metal, @sizeOf(@TypeOf(rows)), 0) orelse return error.MetalBufferAllocFailed;
+    defer metal_runtime.termite_metal_buffer_release(input);
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(metal, input, 0, &rows, @sizeOf(@TypeOf(rows))));
+    const ref = storage_runtime.DeviceKvRef{ .handle = input, .byte_offset = 0, .byte_len = @sizeOf(@TypeOf(rows)) };
+    {
+        const observation = @import("../execution/runtime_observation.zig");
+        var observed_calls = observation.Scope.init();
+        defer observed_calls.deinit();
+        var dispatch = observation.KernelScope{};
+        dispatch.begin();
+        defer _ = dispatch.finish();
+        try runtime.writeLayerKvSuffixDevice(.{
+            .sequence_id = sequence,
+            .layer_index = 0,
+            .total_token_count = tokens,
+            .suffix_token_count = tokens,
+            .position_offset = 0,
+            .num_kv_heads = 1,
+            .head_dim = width,
+            .sliding_window = 2,
+            .max_inflight_tokens = 1,
+            .allow_swa_ring = true,
+        }, ref, ref);
+        try std.testing.expectEqual(@as(u64, 2), dispatch.metal.total_messages);
+        try std.testing.expectEqual(@as(u64, 0), dispatch.metal.unknown_pipeline_messages);
+        try std.testing.expectEqual(@as(u8, 2), dispatch.metal.count);
+        try std.testing.expectEqual([3]u64{ width, ring_tokens, 1 }, dispatch.metal.records[0].grid);
+        try std.testing.expectEqual([3]u64{ width * ring_tokens, 1, 1 }, dispatch.metal.records[1].grid);
+    }
+
+    const binding = owner.slot_map.get(.{ .sequence_id = sequence, .layer_index = 0 }).?;
+    try std.testing.expectEqual(@as(usize, 2), binding.ring_page_count);
+    const info = try owner.slotInfo(binding.slot);
+    // Reject an out-of-range source before the next page could grow either backing.
+    const pages = [_]u32{ 0, 2, 4, 6 };
+    const invalid = metal_runtime.termite_metal_decode_runtime_update_attention_paged_from_f32_key_device_slot(
+        metal,
+        binding.slot,
+        @backingInt(owner.format),
+        input,
+        @sizeOf(@TypeOf(rows)),
+        input,
+        0,
+        tokens + 1,
+        1,
+        1,
+        width,
+        info.key_row_bytes,
+        info.key_row_bytes,
+        width,
+        0,
+        &pages,
+        pages.len,
+        2,
+    );
+    try std.testing.expect(invalid != 0);
+    const unchanged = try owner.slotInfo(binding.slot);
+    try std.testing.expectEqual(info.encoded_key_handle, unchanged.encoded_key_handle);
+    try std.testing.expectEqual(info.v_handle, unchanged.v_handle);
+    try std.testing.expectEqual(info.encoded_key_capacity, unchanged.encoded_key_capacity);
+    try std.testing.expectEqual(info.v_capacity, unchanged.v_capacity);
+
+    {
+        var growth = @import("../execution/runtime_observation.zig").Scope.init();
+        defer growth.deinit();
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_reserve_attention_span_slot_buffers(
+            metal,
+            binding.slot,
+            @backingInt(owner.format),
+            2 * ring_tokens,
+            info.key_row_bytes,
+            width,
+        ));
+        const counters = growth.snapshot();
+        try std.testing.expectEqual(@as(u64, 1), counters.metal_command_submissions);
+        try std.testing.expectEqual(@as(u64, 1), counters.metal_command_waits);
+    }
+    const grown = try owner.slotInfo(binding.slot);
+    try std.testing.expect(info.encoded_key_handle != grown.encoded_key_handle);
+    try std.testing.expect(info.v_handle != grown.v_handle);
+
+    var physical_values: [ring_tokens][width]f32 = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_download(metal, grown.v_handle, 0, &physical_values, @sizeOf(@TypeOf(physical_values))));
+    var physical_keys: [ring_tokens][width + @sizeOf(f32)]u8 = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_download(metal, grown.encoded_key_handle, 0, &physical_keys, @sizeOf(@TypeOf(physical_keys))));
+    for (physical_values, physical_keys, [_]f32{ 5, 6, 7, 4 }) |values, keys, expected| {
+        for (values) |value| try std.testing.expectEqual(expected, value);
+        const scale: f32 = @bitCast(std.mem.readInt(u32, keys[0..4], .little));
+        try std.testing.expectApproxEqAbs(expected / 127, scale, 0.000001);
+        for (keys[4..]) |key| try std.testing.expectEqual(@as(u8, 127), key);
+    }
 }
 
 test "Metal paged KV hooks sharing a runtime lease disjoint slots" {

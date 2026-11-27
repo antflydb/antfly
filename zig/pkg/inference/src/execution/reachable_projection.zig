@@ -16,7 +16,7 @@
 //! Cold storage projection for a private prepared variant. The executable's
 //! cached reachability is the only authority; root compatibility plans persist.
 const std = @import("std");
-const buffers = @import("../graph/buffer_plan.zig");
+const buffers = @import("buffer_plan.zig");
 
 pub fn deactivate(pool: anytype) !void {
     const graph = pool.coverage_graph orelse return;
@@ -48,6 +48,39 @@ fn mark(required: []usize, id: buffers.AllocationId, bytes: usize) !void {
 fn original(pool: anytype, required: []usize, id: buffers.AllocationId) !void {
     if (id >= pool.plan.allocations.len) return error.InvalidPhysicalProjectionResource;
     try mark(required, id, @intCast(pool.plan.allocations[id].byte_size));
+}
+
+pub fn retireRegionInternals(pool: anytype, owners: []const *const @import("region_route.zig").Owned) !void {
+    if (pool.plan.execution_reachable == null or owners.len == 0) return;
+    var retained = try std.DynamicBitSetUnmanaged.initEmpty(pool.allocator, pool.plan.slots.len);
+    defer retained.deinit(pool.allocator);
+    // Preserve storage for metadata views whose plan still names their source.
+    for (pool.plan.slots) |slot| {
+        if (pool.plan.slotForNode(slot.node_id) == null) continue;
+        if (slot.source_slot) |source| {
+            if (source >= retained.capacity()) return error.InvalidBufferPlan;
+            retained.set(source);
+        }
+    }
+    for (owners) |owner| {
+        if (!owner.requirements.replacementEligible()) continue;
+        for (owner.requirements.outputs) |output| {
+            const slot = pool.plan.slotForNode(output.node) orelse return error.InvalidBufferPlan;
+            retained.set(slot.id);
+        }
+        for (owner.covered_nodes) |node| {
+            const slot = pool.plan.slotForNode(node) orelse return error.InvalidBufferPlan;
+            if (retained.isSet(slot.id) or (slot.kind != .allocation and slot.kind != .view) or slot.roles.graph_output or
+                slot.roles.partition_output or slot.roles.transfer_source or slot.roles.transfer_target) continue;
+            const internal = &pool.plan.slots[slot.id];
+            internal.kind = .region_internal;
+            internal.allocation = buffers.invalid_allocation;
+            internal.source_slot = null;
+            internal.reusable = false;
+            internal.roles.view = false;
+            pool.kernels[node] = null;
+        }
+    }
 }
 
 pub fn refine(pool: anytype) !void {

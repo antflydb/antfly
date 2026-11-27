@@ -20,6 +20,66 @@ const Tensor = @import("../backends/tensor.zig").Tensor;
 const Session = @import("../backends/session.zig").Session;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 
+const ExecutionAccess = @import("../execution_control.zig").ExecutionAccess;
+const ops = @import("../ops/ops.zig");
+
+const resident_decoder = @import("resident_decoder.zig");
+
+/// Admit cached or ordinary compiled prefill against the physical query
+/// bound of the selected route, including any media padding.
+pub fn prepareDecoder(
+    allocator: std.mem.Allocator,
+    session: Session,
+    requested_cache: ?bool,
+    prefix: ?*const Prefix,
+    prompt_rows: usize,
+    max_tokens: usize,
+    max_positions: usize,
+    query_rows: usize,
+    control: ?Control,
+) !?resident_decoder.Decoder {
+    const capacity = @min(try std.math.add(usize, prompt_rows, max_tokens), max_positions);
+    const cache_candidate = try resident_decoder.select(session, requested_cache);
+    const whole_prefill = if (cache_candidate) whole: {
+        break :whole if (prefix) |media| try media.cachedAdmission(prompt_rows, max_positions) else null;
+    } else null;
+    const decoder = try resident_decoder.Decoder.initForRequest(allocator, session, requested_cache, .{
+        .limit = capacity,
+        .prompt_rows = prompt_rows,
+        .max_tokens = max_tokens,
+        .query_rows = query_rows,
+        .whole_prefill = whole_prefill,
+    }, control);
+    if (decoder == null and query_rows != 0) {
+        if (prefix) |media| {
+            if (try media.ordinaryRows(prompt_rows, session) > query_rows) return error.UnsupportedCompiledMediaPrefillChunking;
+        }
+    }
+    return decoder;
+}
+
+/// Execute one compiled generation step from the request's selected state.
+pub fn runStep(session: Session, decoder: ?*resident_decoder.Decoder, prefix: ?*const Prefix, phase: enum { prefill, decode }, history: []const i64, a: std.mem.Allocator, control: ?Control) ![]f32 {
+    if (decoder) |state| {
+        if (phase == .prefill) if (prefix) |media| return media.runCached(state, history, a, control);
+        return state.text(history, a, control);
+    }
+    if (prefix) |media| return media.run(session, history, a, control);
+    return runText(session, history, a, control);
+}
+
+/// Reuse the loaded session program for whole-prefix text decoding.
+pub fn runText(session: Session, history: []const i64, a: std.mem.Allocator, control: ?Control) ![]f32 {
+    if (history.len == 0) return error.InvalidPreparedPrompt;
+    const rows = std.math.cast(i64, history.len) orelse return error.InvalidInputShape;
+    const shape = [2]i64{ 1, rows };
+    const row = [1]i64{rows - 1};
+    return publishLogits(a, try session.runWithControl(&.{
+        Tensor.borrowInt64(a, "input_ids", &shape, history),
+        Tensor.borrowInt64(a, "logits_row", &.{1}, &row),
+    }, a, control));
+}
+
 pub const Prefix = struct {
     embeddings: Tensor,
     /// Zero preserves exact-shape execution; opt-in buckets bound padding.
@@ -29,6 +89,72 @@ pub const Prefix = struct {
     axis_positions: ?[]u32 = null,
     position_delta: i64 = 0,
     visibility: ?[]u8 = null,
+
+    /// Session tensor ABI boundary for compiled generation. The request owns
+    /// the materialized prefix and pays for it until the last consumer retires.
+    pub const Prepared = struct {
+        source: *?ops.CT,
+        rows: usize,
+        width: usize,
+        bucket_rows: usize,
+        ple: ?[]const i64 = null,
+        positions: ?[]const u32 = null,
+        position_delta: i64 = 0,
+        visibility: ?[]const u8 = null,
+
+        fn retainedBytes(self: Prepared) !usize {
+            const mul = std.math.mul;
+            const add = std.math.add;
+            if (self.rows == 0 or self.width == 0 or self.bucket_rows > 256) return error.InvalidPreparedPrompt;
+            var bytes = try mul(usize, try mul(usize, self.rows, self.width), @sizeOf(f32));
+            if (self.ple) |ids| {
+                if (ids.len != self.rows) return error.InvalidPreparedPrompt;
+                bytes = try add(usize, bytes, try mul(usize, ids.len, @sizeOf(i64)));
+            }
+            if (self.positions) |ids| {
+                if (ids.len != try mul(usize, self.rows, 3)) return error.InvalidPreparedPrompt;
+                bytes = try add(usize, bytes, try mul(usize, ids.len, @sizeOf(u32)));
+            }
+            if (self.visibility) |mask| {
+                if (mask.len != try mul(usize, self.rows, self.rows)) return error.InvalidPreparedPrompt;
+                bytes = try add(usize, bytes, mask.len);
+            }
+            return try add(usize, bytes, 3 * @sizeOf(i64));
+        }
+
+        pub fn materialize(self: Prepared, a: std.mem.Allocator, session: Session, backend: *const ops.ComputeBackend, control: ?Control, access: ExecutionAccess) !Prefix {
+            const source = self.source.* orelse return error.InvalidPreparedPrompt;
+            const bytes = try self.retainedBytes();
+            const rows = std.math.cast(i64, self.rows) orelse return error.InvalidPreparedPrompt;
+            const width = std.math.cast(i64, self.width) orelse return error.InvalidPreparedPrompt;
+            var retained = try session.withAdmissionControl(control).admitRetainedMedia(bytes, 0);
+            errdefer retained.deinit();
+            const ple = if (self.ple) |ids| try a.dupe(i64, ids) else null;
+            errdefer if (ple) |ids| a.free(ids);
+            const positions = if (self.positions) |ids| try a.dupe(u32, ids) else null;
+            errdefer if (positions) |ids| a.free(ids);
+            const visibility = if (self.visibility) |mask| try a.dupe(u8, mask) else null;
+            errdefer if (visibility) |mask| a.free(mask);
+
+            var scope = try access.acquireScope();
+            defer if (scope) |*held| held.deinit();
+            const values = try backend.toFloat32(source, a);
+            errdefer a.free(values);
+            if (values.len != self.rows * self.width) return error.InvalidPreparedPrompt;
+            const embeddings = try Tensor.initFloat32Owned(a, "input_embeddings", &.{ 1, rows, width }, values);
+            backend.free(source);
+            self.source.* = null;
+            return .{
+                .embeddings = embeddings,
+                .bucket_rows = self.bucket_rows,
+                .retained = retained,
+                .ple_ids = ple,
+                .axis_positions = positions,
+                .position_delta = self.position_delta,
+                .visibility = visibility,
+            };
+        }
+    };
 
     pub fn deinit(self: *Prefix, a: std.mem.Allocator) void {
         self.embeddings.deinit();
@@ -70,13 +196,10 @@ pub const Prefix = struct {
         if (self.axis_positions) |positions| if (positions.len != try mul(usize, prefix_rows, 3)) return error.InvalidPreparedPrompt;
         if (self.visibility) |mask| if (mask.len != try mul(usize, prefix_rows, prefix_rows)) return error.InvalidPreparedPrompt;
         const pad_embeddings = cached and prefix_rows == prompt_rows and rows != prefix_rows;
-        var elements = try mul(usize, rows, 2 + @as(usize, if (self.ple_ids != null) 1 else 0));
-        if (self.axis_positions != null) elements = try add(usize, elements, try mul(usize, rows, 6));
-        var staging = try mul(usize, elements, @sizeOf(i64));
+        var staging: usize = if (rows != prompt_rows) try mul(usize, rows, @sizeOf(i64)) else 0;
         var input = try add(usize, try mul(usize, rows, @sizeOf(i64)), try mul(usize, try mul(usize, if (pad_embeddings) rows else prefix_rows, width), @sizeOf(f32)));
         var metadata: usize = 6 * @sizeOf(Tensor) + 2 * @sizeOf(i64);
         if (cached or self.bucket_rows != 0) {
-            staging = try add(usize, staging, @sizeOf(i64));
             input = try add(usize, input, @sizeOf(i64));
             metadata = try add(usize, metadata, @sizeOf(i64));
         }
@@ -85,11 +208,15 @@ pub const Prefix = struct {
             metadata = try add(usize, metadata, 3 * @sizeOf(i64));
         }
         if (self.ple_ids != null) {
-            input = try add(usize, input, try mul(usize, rows, @sizeOf(i64)));
+            const ids = try mul(usize, rows, @sizeOf(i64));
+            if (rows != prefix_rows) staging = try add(usize, staging, ids);
+            input = try add(usize, input, ids);
             metadata = try add(usize, metadata, 2 * @sizeOf(i64));
         }
         if (self.axis_positions != null) {
-            input = try add(usize, input, try mul(usize, rows, 3 * @sizeOf(i64)));
+            const positions = try mul(usize, rows, 3 * @sizeOf(i64));
+            staging = try add(usize, staging, positions);
+            input = try add(usize, input, positions);
             metadata = try add(usize, metadata, 2 * @sizeOf(i64));
         }
         if (self.visibility != null) {
@@ -101,14 +228,14 @@ pub const Prefix = struct {
         return .{ .prefix_rows = prefix_rows, .pad_embeddings = pad_embeddings, .staging_bytes = try add(usize, staging, metadata), .input_bytes = input };
     }
 
-    pub fn cachedAdmission(self: *const Prefix, prompt_rows: usize, maximum: usize) !@import("resident_decoder.zig").Decoder.WholePrefill {
+    fn cachedAdmission(self: *const Prefix, prompt_rows: usize, maximum: usize) !@import("resident_decoder.zig").Decoder.WholePrefill {
         const rows = try @import("resident_decoder.zig").prefillRowsFor(prompt_rows, maximum);
         const planned = try self.layout(prompt_rows, rows, true);
         return .{ .rows = rows, .input_bytes = planned.input_bytes, .host_staging_bytes = planned.staging_bytes };
     }
 
     /// The admission check and execution use the same physical query shape.
-    pub fn ordinaryRows(self: *const Prefix, prompt_rows: usize, session: Session) !usize {
+    fn ordinaryRows(self: *const Prefix, prompt_rows: usize, session: Session) !usize {
         if (self.bucket_rows > 256 or prompt_rows == 0) return error.InvalidInputShape;
         if (self.bucket_rows == 0) return prompt_rows;
         const cfg = @import("../architectures/session_factory.zig").getGptConfig(session) orelse return error.InvalidPreparedPrompt;
@@ -139,8 +266,12 @@ pub const Prefix = struct {
         var packet: [6]Tensor = undefined;
         var inputs = std.ArrayList(Tensor).initBuffer(&packet);
         defer for (inputs.items) |*input| input.deinit();
-        inputs.appendAssumeCapacity(try Tensor.initInt64(a, "input_ids", &.{ 1, @intCast(rows) }, padded_ids));
-        if (self.bucket_rows != 0 or decoder != null) inputs.appendAssumeCapacity(try Tensor.initInt64(a, "logits_row", &.{1}, &.{@intCast(history.len - 1)}));
+        const ids_shape = [2]i64{ 1, @intCast(rows) };
+        const logits_row = [1]i64{@intCast(history.len - 1)};
+        const positions_shape = [2]i64{ 3, @intCast(rows) };
+        inputs.appendAssumeCapacity(Tensor.borrowInt64(a, "input_ids", &ids_shape, padded_ids));
+        if (self.bucket_rows != 0 or decoder != null)
+            inputs.appendAssumeCapacity(Tensor.borrowInt64(a, "logits_row", &.{1}, &logits_row));
         if (pad_embeddings) {
             const width: usize = @intCast(self.embeddings.shape[2]);
             const values = try a.alloc(f32, try std.math.mul(usize, rows, width));
@@ -152,21 +283,25 @@ pub const Prefix = struct {
             };
             inputs.appendAssumeCapacity(imported);
         } else inputs.appendAssumeCapacity(self.embeddings.borrowedView("input_embeddings"));
+        const staged_ple = if (self.ple_ids != null and rows != prefix_rows) try a.alloc(i64, rows) else null;
+        defer if (staged_ple) |values| a.free(values);
         if (self.ple_ids) |prefix| {
-            if (prefix.len != prefix_rows) return error.InvalidPreparedPrompt;
-            const ids = try Tensor.initInt64(a, "ple_input_ids", &.{ 1, @intCast(rows) }, padded_ids);
-            @memcpy(std.mem.bytesAsSlice(i64, @as([]align(@alignOf(i64)) u8, @alignCast(ids.data)))[0..prefix_rows], prefix);
-            inputs.appendAssumeCapacity(ids);
+            if (staged_ple) |values| {
+                @memcpy(values[0..prefix_rows], prefix);
+                @memcpy(values[prefix_rows..], padded_ids[prefix_rows..]);
+            }
+            inputs.appendAssumeCapacity(Tensor.borrowInt64(a, "ple_input_ids", &ids_shape, staged_ple orelse prefix));
         }
+        const positions = if (self.axis_positions != null) try a.alloc(i64, rows * 3) else null;
+        defer if (positions) |values| a.free(values);
         if (self.axis_positions) |prefix| {
             if (prefix.len != prefix_rows * 3) return error.InvalidPreparedPrompt;
-            const positions = try a.alloc(i64, rows * 3);
-            defer a.free(positions);
+            const values = positions.?;
             for (0..3) |axis| {
-                for (0..prefix_rows) |row| positions[axis * rows + row] = prefix[axis * prefix_rows + row];
-                for (prefix_rows..rows) |row| positions[axis * rows + row] = std.math.add(i64, @intCast(row), self.position_delta) catch return error.InvalidInputShape;
+                for (0..prefix_rows) |row| values[axis * rows + row] = prefix[axis * prefix_rows + row];
+                for (prefix_rows..rows) |row| values[axis * rows + row] = std.math.add(i64, @intCast(row), self.position_delta) catch return error.InvalidInputShape;
             }
-            inputs.appendAssumeCapacity(try Tensor.initInt64(a, "position_ids", &.{ 3, @intCast(rows) }, positions));
+            inputs.appendAssumeCapacity(Tensor.borrowInt64(a, "position_ids", &positions_shape, values));
         }
         if (self.visibility) |prefix| {
             if (prefix.len != prefix_rows * prefix_rows) return error.InvalidPreparedPrompt;
@@ -181,12 +316,16 @@ pub const Prefix = struct {
             inputs.appendAssumeCapacity(mask);
         }
         const outputs = if (decoder) |cached| try cached.run(inputs.items, a, control) else try session.runWithControl(inputs.items, a, control);
-        defer a.free(outputs);
-        defer for (outputs) |*output| output.deinit();
-        if (outputs.len != 1 or !std.mem.eql(u8, outputs[0].name, "logits") or outputs[0].dtype != .f32) return error.InvalidModelProgramOutput;
-        return a.dupe(f32, outputs[0].asFloat32());
+        return publishLogits(a, outputs);
     }
 };
+
+fn publishLogits(a: std.mem.Allocator, outputs: []Tensor) ![]f32 {
+    defer a.free(outputs);
+    defer for (outputs) |*output| output.deinit();
+    if (outputs.len != 1 or !std.mem.eql(u8, outputs[0].name, "logits") or outputs[0].dtype != .f32) return error.InvalidModelProgramOutput;
+    return outputs[0].takeOrCopyFloat32(a);
+}
 
 test "media prefix cached admission includes padded embeddings positions PLE visibility and metadata" {
     const a = std.testing.allocator;
@@ -202,11 +341,84 @@ test "media prefix cached admission includes padded embeddings positions PLE vis
     // IDs 32 + row 8 + padded embeddings 32 + PLE 32 + axes 96 + mask 16.
     try std.testing.expectEqual(@as(usize, 216), cached.input_bytes);
     try std.testing.expectEqual(layout.staging_bytes, cached.host_staging_bytes);
-    try std.testing.expect(cached.host_staging_bytes >= 9 * 4 * @sizeOf(i64) + 32 + 16 + 8 + 6 * @sizeOf(Tensor));
+    try std.testing.expectEqual(6 * @sizeOf(Tensor) + 12 * @sizeOf(i64) + 5 * 4 * @sizeOf(i64) + 32 + 16, cached.host_staging_bytes);
     const ordinary = try prefix.layout(3, 3, false);
     try std.testing.expect(!ordinary.pad_embeddings);
     try std.testing.expect(cached.host_staging_bytes > ordinary.staging_bytes);
     var invalid = prefix;
     invalid.ple_ids = ids[0..2];
     try std.testing.expectError(error.InvalidPreparedPrompt, invalid.cachedAdmission(3, 1024));
+}
+
+test "media prefix admission enforces the padded ordinary query bound" {
+    const allocator = std.testing.allocator;
+    const config: @import("../models/gpt.zig").Config = .{ .max_position_embeddings = 32 };
+    // With caching disabled the planner reads only the model contract.
+    const session = Session{ .ptr = undefined, .vtable = undefined, .model_contract = .{ .decoder_config = &config } };
+    const prefix = Prefix{ .embeddings = undefined, .bucket_rows = 4 };
+    try std.testing.expectError(error.UnsupportedCompiledMediaPrefillChunking, prepareDecoder(allocator, session, false, &prefix, 3, 1, 32, 3, null));
+    try std.testing.expect((try prepareDecoder(allocator, session, false, &prefix, 3, 1, 32, 4, null)) == null);
+}
+
+test "prepared media prefix materializes an owned typed packet from the Native backend" {
+    const native = @import("../ops/native_compute.zig");
+    const a = std.testing.allocator;
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer weights.deinitOwned();
+    var compute = native.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var source: ?ops.CT = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 });
+    defer if (source) |tensor| cb.free(tensor);
+    const session = Session{ .ptr = undefined, .vtable = undefined };
+    const input = Prefix.Prepared{ .source = &source, .rows = 2, .width = 2, .bucket_rows = 4, .ple = &.{ 7, 9 }, .positions = &.{ 0, 1, 0, 1, 0, 1 }, .visibility = &.{ 0, 1, 1, 0 }, .position_delta = -1 };
+    var invalid = input;
+    invalid.visibility = &.{1};
+    try std.testing.expectError(error.InvalidPreparedPrompt, invalid.materialize(a, session, &cb, null, .{}));
+    invalid = input;
+    invalid.width = 3;
+    try std.testing.expectError(error.InvalidPreparedPrompt, invalid.materialize(a, session, &cb, null, .{}));
+    try std.testing.expect(source != null);
+    var prefix = try input.materialize(a, session, &cb, null, .{});
+    defer prefix.deinit(a);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 2 }, prefix.embeddings.shape);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, prefix.embeddings.asFloat32());
+    try std.testing.expectEqualSlices(i64, input.ple.?, prefix.ple_ids.?);
+    try std.testing.expectEqualSlices(u32, input.positions.?, prefix.axis_positions.?);
+    try std.testing.expectEqualSlices(u8, input.visibility.?, prefix.visibility.?);
+    try std.testing.expectEqual(@as(i64, -1), prefix.position_delta);
+    try std.testing.expect(source == null);
+}
+
+test "whole-prefix text borrows history and publishes only the final logits row" {
+    const Probe = struct {
+        history: []const i64,
+        fn backend(_: *anyopaque) @import("../backends/backends.zig").BackendType {
+            return .pjrt;
+        }
+        fn info(_: *anyopaque) []const @import("../backends/tensor.zig").TensorInfo {
+            return &.{};
+        }
+        fn close(_: *anyopaque) void {}
+        fn run(raw: *anyopaque, inputs: []const Tensor, a: std.mem.Allocator) anyerror![]Tensor {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 2), inputs.len);
+            try std.testing.expectEqualStrings("input_ids", inputs[0].name);
+            try std.testing.expectEqualStrings("logits_row", inputs[1].name);
+            try std.testing.expectEqual(self.history.ptr, inputs[0].asInt64().ptr);
+            try std.testing.expectEqualSlices(i64, &.{ 1, 3 }, inputs[0].shape);
+            try std.testing.expectEqualSlices(i64, &.{2}, inputs[1].asInt64());
+            const outputs = try a.alloc(Tensor, 1);
+            errdefer a.free(outputs);
+            outputs[0] = try Tensor.initFloat32(a, "logits", &.{ 1, 2 }, &.{ 3, 7 });
+            return outputs;
+        }
+        const table = Session.VTable{ .run = run, .backend = backend, .inputInfo = info, .outputInfo = info, .close = close };
+    };
+    const a = std.testing.allocator;
+    var probe = Probe{ .history = &.{ 4, 7, 9 } };
+    const session = Session{ .ptr = &probe, .vtable = &Probe.table };
+    const logits = try runText(session, probe.history, a, null);
+    defer a.free(logits);
+    try std.testing.expectEqualSlices(f32, &.{ 3, 7 }, logits);
 }

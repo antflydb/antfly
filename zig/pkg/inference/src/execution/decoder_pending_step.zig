@@ -17,7 +17,7 @@
 //! sampling, token publication, EOS, grammar, streaming and scheduler progress.
 const std = @import("std");
 const ops = @import("../ops/ops.zig");
-const state_mod = @import("../graph/decode_state_runtime.zig");
+const state_mod = @import("decode_state_runtime.zig");
 const gated = @import("../backends/decoder_gated_runtime.zig");
 const model_mod = @import("../models/gpt.zig");
 const control_mod = @import("../execution_control.zig");
@@ -154,13 +154,14 @@ pub const Readback = struct {
             var runtime = self.context.runtime();
             runtime.truncateGeneratedTokens(1) catch {};
         }
-        if (self.pending) |pending| self.observation.call(self.context.backend, .cancel, .unavailable, cancelReadback, .{ self.context.backend, pending }) catch {};
+        if (self.pending) |pending| {
+            const backend = self.context.backend;
+            // A failed fence leaves the provider's pinned scalar slot
+            // in use. Releasing the request cannot make it reusable.
+            self.observation.call(backend, .drain, .driver_await_returned, ops.ComputeBackend.drainI32ScalarDownload, .{ backend, pending }) catch
+                @import("antfly_platform").inference_process_supervisor.restartWorker();
+        }
         self.pending = null;
-    }
-    fn cancelReadback(backend: *const ops.ComputeBackend, pending: ops.PendingI32ScalarDownload) !void {
-        // This legacy callback has no failure/completion result. Record only
-        // return from a cancellation request, never successful GPU drain.
-        backend.cancelI32ScalarDownload(pending);
     }
 };
 
@@ -279,7 +280,7 @@ test "pending readback failed atomic reservation preserves paired KV owners and 
     const a = std.testing.allocator;
     const Probe = struct {
         cancelled: usize = 0,
-        fn cancel(raw: *anyopaque, _: ops.PendingI32ScalarDownload) void {
+        fn cancel(raw: *anyopaque, _: ops.PendingI32ScalarDownload) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.cancelled += 1;
         }
@@ -307,7 +308,7 @@ test "pending readback failed atomic reservation preserves paired KV owners and 
             defer a.free(ids);
             var probe = Probe{};
             var table = @import("../ops/native_compute.zig").vtable_impl;
-            table.cancelI32ScalarDownload = Probe.cancel;
+            table.drainI32ScalarDownload = Probe.cancel;
             const backend = ops.ComputeBackend{ .ptr = &probe, .vtable = &table };
             const model = model_mod.Config{};
             const context = Context{ .allocator = a, .backend = &backend, .model = &model, .state = &state };
@@ -365,7 +366,7 @@ test "pending readback owns download lookahead and real KV reservation across ac
             if (self.fail_finish) return error.InjectedReadbackFailure;
             return 7;
         }
-        fn cancel(raw: *anyopaque, pending: ops.PendingI32ScalarDownload) void {
+        fn cancel(raw: *anyopaque, pending: ops.PendingI32ScalarDownload) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             std.debug.assert(pending.handle == 11 and self.state.total_tokens == 4);
             self.note(.cancel);
@@ -389,7 +390,7 @@ test "pending readback owns download lookahead and real KV reservation across ac
         var table = @import("../ops/native_compute.zig").vtable_impl;
         table.beginI32ScalarDownload = Probe.begin;
         table.finishI32ScalarDownload = Probe.finish;
-        table.cancelI32ScalarDownload = Probe.cancel;
+        table.drainI32ScalarDownload = Probe.cancel;
         table.evalTensor = Probe.evaluate;
         table.freeTensor = Probe.free;
         const backend = ops.ComputeBackend{ .ptr = &probe, .vtable = &table };
@@ -580,6 +581,7 @@ pub fn PipelinedStage(comptime Decoder: type) type {
 const PendingObservationFixture = struct {
     const diagnostics_mod = @import("diagnostics.zig");
     const observation_mod = @import("pending_observation.zig");
+    const runtime = @import("runtime_observation.zig");
     const ModelLifetime = @import("../backends/session.zig").Session.ModelLifetime;
     var destroyed: bool = false;
     fn destroy(_: *anyopaque) void {
@@ -595,6 +597,7 @@ const PendingObservationFixture = struct {
             if (@import("allocation_registry.zig").enabled() != self.observed) return error.PendingDisabledPathChanged;
             self.calls += 1;
             @import("transfer_audit.zig").upload(8);
+            runtime.backendEntry(ops.BackendKind.native, .linear, 1, .selected, null);
             return .{ .handle = 42 };
         }
         fn finish(raw: *anyopaque, handle: ops.PendingI32ScalarDownload) !i32 {
@@ -602,14 +605,19 @@ const PendingObservationFixture = struct {
             if (handle.handle != 42 or destroyed) return error.PendingOwnerRetiredBeforeAwait;
             if (@import("allocation_registry.zig").enabled() != self.observed) return error.PendingDisabledPathChanged;
             self.calls += 1;
-            if (self.fail) return error.PendingAwaitFailure;
+            if (self.fail) {
+                runtime.backendEntry(ops.BackendKind.native, .linear, 1, .failed, "PendingAwaitFailure");
+                return error.PendingAwaitFailure;
+            }
+            runtime.backendEntry(ops.BackendKind.native, .linear, 1, .selected, null);
             @import("transfer_audit.zig").download(4);
             return 7;
         }
-        fn cancel(raw: *anyopaque, handle: ops.PendingI32ScalarDownload) void {
+        fn cancel(raw: *anyopaque, handle: ops.PendingI32ScalarDownload) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             std.debug.assert(handle.handle == 42 and !destroyed);
             self.cancelled += 1;
+            runtime.backendEntry(ops.BackendKind.native, .add, 2, .declined, null);
         }
     };
 };
@@ -629,10 +637,17 @@ test "pending readback observations retain publication only and separate submiss
         var table = @import("../ops/native_compute.zig").vtable_impl;
         table.beginI32ScalarDownload = F.Probe.begin;
         table.finishI32ScalarDownload = F.Probe.finish;
-        table.cancelI32ScalarDownload = F.Probe.cancel;
+        table.drainI32ScalarDownload = F.Probe.cancel;
         table.registerRuntimeObservation = null;
         table.debugTimingSnapshot = null;
         const backend = ops.ComputeBackend{ .ptr = &probe, .vtable = &table };
+        if (mode == 0) {
+            var incomplete = table;
+            incomplete.drainI32ScalarDownload = null;
+            const unsupported = ops.ComputeBackend{ .ptr = &probe, .vtable = &incomplete };
+            try std.testing.expect((try unsupported.beginI32ScalarDownload(@ptrFromInt(8))) == null);
+            try std.testing.expectEqual(@as(usize, 0), probe.calls);
+        }
         const config = model_mod.Config{};
         var state = state_mod.NativeDecodeState.initContiguous(std.testing.allocator);
         defer state.deinit();
@@ -668,7 +683,9 @@ test "pending readback observations retain publication only and separate submiss
                 try std.testing.expect(ready.pending_interval.?.whole_interval_counters == .unavailable);
                 const joined = ready.pending_interval.?.observed_phases.?;
                 try std.testing.expectEqual(@as(u64, 2), joined.count);
+                try std.testing.expectEqual(@as(u64, 2), joined.backend_callback_returns.native.successful);
                 try std.testing.expect(joined.callback_wall_ns.? >= ready.pending_interval.?.callback_wall_ns.?);
+                try std.testing.expect(ready.pending_interval.?.elapsed_host_wall_ns.? >= joined.callback_wall_ns.?);
                 try std.testing.expectEqual(@as(u64, 1), joined.uploads);
                 try std.testing.expectEqual(@as(u64, 8), joined.upload_bytes);
                 try std.testing.expectEqual(@as(u64, 1), joined.downloads);
@@ -692,8 +709,12 @@ test "pending readback observations retain publication only and separate submiss
             if (mode == 1) try std.testing.expectEqualStrings("PendingAwaitFailure", retained_report.pending_interval.?.prior_failure.?.view());
             if (mode == 1) try std.testing.expectEqualStrings("PendingAwaitFailure", latest.pending_interval.?.prior_failure.?.view());
             if (mode == 1 or mode == 2) {
-                try std.testing.expect(latest.pending_interval.?.phase == .cancel);
-                try std.testing.expect(latest.pending_interval.?.completion == .unavailable);
+                try std.testing.expect(latest.pending_interval.?.phase == .drain);
+                try std.testing.expect(latest.pending_interval.?.completion == .driver_await_returned);
+                const callbacks = latest.pending_interval.?.observed_phases.?.backend_callback_returns.native;
+                try std.testing.expectEqual(@as(u64, 1), callbacks.successful);
+                try std.testing.expectEqual(@as(u64, 1), callbacks.declined);
+                try std.testing.expectEqual(@as(u64, if (mode == 1) 1 else 0), callbacks.failed);
             }
         } else {
             try std.testing.expect(!F.destroyed);
@@ -721,15 +742,26 @@ fn checkCudaPendingObservation(actual: ops.ComputeBackend, _: ops.ComputeBackend
     defer pending.deinit();
     const submitted = diagnostics.snapshot().?;
     try std.testing.expect(submitted.pending_interval.?.completion == .unavailable);
+    try std.testing.expectEqual(@as(u64, 0), submitted.runtime.submission.?.cuda_host_waits.?.event);
     try std.testing.expectEqual(@as(usize, 7), try pending.resolve());
     const ready = diagnostics.snapshot().?;
     try std.testing.expect(ready.outcome == .success and ready.pending_interval.?.completion == .readback_returned);
     try std.testing.expectEqual(submitted.pending_interval.?.identity, ready.pending_interval.?.identity);
+    try std.testing.expect(ready.pending_interval.?.elapsed_host_wall_ns.? >= submitted.pending_interval.?.elapsed_host_wall_ns.?);
+    const waits = ready.pending_interval.?.observed_phases.?.cuda_host_waits.?;
+    try std.testing.expectEqual(@as(u64, 1), waits.event);
+    try std.testing.expectEqual(@as(u64, 0), waits.failed);
+    try std.testing.expectEqual(@as(u64, 1), ready.report.?.cuda_host_waits.?.event);
     pending.deinit();
     var cancelled = (try Readback.begin(context, tensor)) orelse return error.MissingCudaScalarReadback;
+    const cancel_submission = diagnostics.snapshot().?.pending_interval.?;
+
     cancelled.deinit();
-    const cancel = diagnostics.snapshot().?;
-    try std.testing.expect(cancel.pending_interval.?.phase == .cancel and cancel.pending_interval.?.completion == .unavailable);
+    const drained = diagnostics.snapshot().?.pending_interval.?;
+    try std.testing.expect(drained.phase == .drain and drained.completion == .driver_await_returned);
+    try std.testing.expectEqual(cancel_submission.identity, drained.identity);
+    try std.testing.expectEqual(@as(u64, 1), drained.observed_phases.?.cuda_host_waits.?.event);
+    try std.testing.expectEqual(@as(u64, 0), drained.observed_phases.?.cuda_host_waits.?.failed);
 }
 
 test "actual CUDA pending scalar observation labels submission readback and cancellation without interval kernel totals" {

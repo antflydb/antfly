@@ -206,14 +206,14 @@ pub fn reservationControlled(bytes: []const u8, control: Control) !Reservation {
     return .{ .host_bytes = apple_hevc_host_bytes };
 }
 
-pub fn encode(cb: *const ComputeBackend, admission: Admission, a: std.mem.Allocator, projector: *projector_mod.ProjectorStore, bytes: []const u8) !projector_mod.ProjectedVideo {
+pub fn encode(cb: *const ComputeBackend, admission: Admission, a: std.mem.Allocator, projector: ?*projector_mod.ProjectorStore, bytes: []const u8) !projector_mod.ProjectedVideo {
     if (bytes.len > video.packet_sampling.reference_max_input_bytes) return error.VideoInputTooLarge;
     if (cb.kind() == .cuda) {
         // NVDEC takes a narrower set of clips than the catalog advertises, and
         // some rejections only surface mid-bitstream. Portable decoding decides
         // what's really invalid; either route projects on the device.
         if (!std.mem.startsWith(u8, bytes, "\x1a\x45\xdf\xa3") and !media.transport_stream.isTransportStream(bytes)) {
-            if (projector_mod.encodeProjectedVideoWithSession(cb, a, projector, bytes, admission.explicit_scratch_limit == 0, admission.session)) |projected| {
+            if (projector_mod.encodeProjectedVideoWithSession(cb, a, projector orelse return error.MissingProjector, bytes, admission.explicit_scratch_limit == 0, admission.session)) |projected| {
                 return projected;
             } else |err| {
                 // Decoder envelope rejections can retry under portable admission.
@@ -369,7 +369,7 @@ const Observer = struct {
     }
 };
 
-fn encodePortable(cb: *const ComputeBackend, a: std.mem.Allocator, projector: *projector_mod.ProjectorStore, bytes: []const u8, admission: Admission, permit: *Permit) !projector_mod.ProjectedVideo {
+fn encodePortable(cb: *const ComputeBackend, a: std.mem.Allocator, projector: ?*projector_mod.ProjectorStore, bytes: []const u8, admission: Admission, permit: *Permit) !projector_mod.ProjectedVideo {
     // Indexing and decoding run under the model execution lock, so they must honor
     // the request's cancellation and deadline between selected frames too.
     const control = cb.execution_control orelse Control{};
@@ -390,7 +390,14 @@ fn encodePortable(cb: *const ComputeBackend, a: std.mem.Allocator, projector: *p
         if (required > video.apple_hevc.max_surface_bytes) return error.SharedAdmissionExceeded;
         try permit.ensureSurfaces(admission, std.math.cast(usize, required) orelse return error.SharedAdmissionExceeded);
     }
-    var frames = try projector_mod.PortableVideoFrames.init(cb, a, projector, timestamps.len);
+    const compiled_session: ?Session = if (admission.session) |session|
+        (if (session.backend() == .pjrt) session else null)
+    else
+        null;
+    var frames = if (compiled_session) |session|
+        try projector_mod.PortableVideoFrames.initMetadata(cb, a, @import("../architectures/session_factory.zig").getAuxiliaryProjectorMetadata(session) orelse return error.MissingProjector, timestamps.len)
+    else
+        try projector_mod.PortableVideoFrames.init(cb, a, projector orelse return error.MissingProjector, timestamps.len);
     defer frames.deinit();
     const extra = (try frames.pixelWorkingBytes()) -| prepaid_model_pixels;
     try permit.ensureCapacity(admission, .host, try std.math.add(usize, permit.reservation.host_bytes, extra));
@@ -401,7 +408,7 @@ fn encodePortable(cb: *const ComputeBackend, a: std.mem.Allocator, projector: *p
         .pool = &pool,
         .inspection_scope = scope,
     }) catch |err| return inputError(err);
-    if (admission.session) |session| if (session.backend() == .pjrt) return @import("../execution/media_projection.zig").companionVideoFrames(session, cb, a, frames.prepared, timestamps, replay_bytes, control);
+    if (compiled_session) |session| return @import("../execution/media_projection.zig").companionVideoFrames(session, cb, a, frames.prepared, timestamps, replay_bytes, control);
     return frames.project(timestamps, replay_bytes);
 }
 

@@ -30,11 +30,18 @@ const DType = @import("../backends/tensor.zig").DType;
 
 pub const max_header_size = 100 * 1024 * 1024; // 100MB sanity limit
 
+pub const Encoding = enum { dense, e4m3fn };
+
+pub const HeaderOptions = struct {
+    allow_e4m3fn: bool = false,
+};
+
 pub const TensorMeta = struct {
     dtype: DType,
     shape: []const i64,
     data_start: u64,
     data_end: u64,
+    encoding: Encoding = .dense,
 };
 
 pub const Header = struct {
@@ -71,6 +78,11 @@ pub const Header = struct {
 /// Parse a SafeTensors file header from raw bytes.
 /// Returns the header and the byte offset where tensor data begins.
 pub fn parseHeader(allocator: std.mem.Allocator, file_bytes: []const u8) !struct { header: Header, data_offset: u64 } {
+    const parsed = try parseHeaderWithOptions(allocator, file_bytes, .{});
+    return .{ .header = parsed.header, .data_offset = parsed.data_offset };
+}
+
+pub fn parseHeaderWithOptions(allocator: std.mem.Allocator, file_bytes: []const u8, options: HeaderOptions) !struct { header: Header, data_offset: u64 } {
     if (file_bytes.len < 8) return error.FileTooSmall;
 
     const header_size = std.mem.readInt(u64, file_bytes[0..8], .little);
@@ -130,7 +142,9 @@ pub fn parseHeader(allocator: std.mem.Allocator, file_bytes: []const u8) !struct
 
         if (val != .object) continue;
 
-        const dtype = parseDType(jsonString(val.object.get("dtype"))) orelse return error.UnsupportedDType;
+        const dtype_name = jsonString(val.object.get("dtype")) orelse return error.UnsupportedDType;
+        const e4m3fn = options.allow_e4m3fn and std.mem.eql(u8, dtype_name, "F8_E4M3");
+        const dtype = if (e4m3fn) .u8 else parseDType(dtype_name) orelse return error.UnsupportedDType;
         const shape = try parseShape(allocator, val.object.get("shape") orelse return error.MissingShape);
         errdefer allocator.free(shape);
         const offsets = val.object.get("data_offsets") orelse return error.MissingOffsets;
@@ -145,6 +159,7 @@ pub fn parseHeader(allocator: std.mem.Allocator, file_bytes: []const u8) !struct
             .shape = shape,
             .data_start = data_start,
             .data_end = data_end,
+            .encoding = if (e4m3fn) .e4m3fn else .dense,
         });
     }
 
@@ -284,6 +299,7 @@ pub const MMapReader = struct {
 
     pub fn readTensor(self: *const MMapReader, name: []const u8) !Tensor {
         const meta = self.header.tensors.get(name) orelse return error.TensorNotFound;
+        if (meta.encoding != .dense) return error.UnsupportedDType;
         const raw = try self.validatedTensorBytes(meta);
 
         if ((self.mmap_region != null or self.borrow_tensor_data) and @intFromPtr(raw.ptr) % meta.dtype.byteSize() == 0) {
@@ -316,6 +332,12 @@ pub const MMapReader = struct {
         };
     }
 
+    /// The encoding is carried in the header and interpreted by the caller's
+    /// packed-weight adapter. Bytes borrow the reader's source lifetime.
+    pub fn rawTensorBytes(self: *const MMapReader, name: []const u8) ![]const u8 {
+        return self.validatedTensorBytes(self.header.tensors.get(name) orelse return error.TensorNotFound);
+    }
+
     /// Open a SafeTensors file by absolute path using mmap.
     pub fn openFileAbsolute(allocator: std.mem.Allocator, path: []const u8) !MMapReader {
         return openFileAbsoluteLimited(allocator, path, std.math.maxInt(usize), max_header_size);
@@ -324,12 +346,16 @@ pub const MMapReader = struct {
     /// The supplied allocator owns parsed metadata until deinit. Callers can
     /// impose an independent heap budget without copying the mapped payload.
     pub fn openFileAbsoluteLimited(allocator: std.mem.Allocator, path: []const u8, max_file_bytes: usize, max_header_bytes: usize) !MMapReader {
+        return openFileAbsoluteWithOptions(allocator, path, max_file_bytes, max_header_bytes, .{});
+    }
+
+    pub fn openFileAbsoluteWithOptions(allocator: std.mem.Allocator, path: []const u8, max_file_bytes: usize, max_header_bytes: usize, options: HeaderOptions) !MMapReader {
         var mmap_region = try c_file.MmapRegion.initLimited(allocator, path, max_file_bytes);
         errdefer mmap_region.deinit();
 
         if (mmap_region.data.len < 8) return error.FileTooSmall;
         if (std.mem.readInt(u64, mmap_region.data[0..8], .little) > max_header_bytes) return error.HeaderTooLarge;
-        const result = try parseHeader(allocator, mmap_region.data);
+        const result = try parseHeaderWithOptions(allocator, mmap_region.data, options);
         // Header parse done — switch to random-access advice for inference.
         mmap_region.adviseRandom();
         return .{
@@ -458,13 +484,6 @@ fn validateReaderWithControl(allocator: std.mem.Allocator, reader: *const MMapRe
     if (covered_end != data_bytes) return error.InvalidTensorLayout;
 }
 
-fn validateFileWithControl(allocator: std.mem.Allocator, path: []const u8, control: ExecutionControl) !void {
-    try control.check();
-    var reader = try MMapReader.openFileAbsolute(allocator, path);
-    defer reader.deinit();
-    return validateReaderWithControl(allocator, &reader, control);
-}
-
 fn validateShardPath(path: []const u8) !void {
     if (path.len == 0 or std.fs.path.isAbsolute(path)) return error.InvalidShardPath;
     if (std.mem.indexOfScalar(u8, path, 0) != null or
@@ -562,8 +581,16 @@ pub fn validateArtifactSet(
 }
 
 pub fn validateArtifactSetWithControl(allocator: std.mem.Allocator, single_path: ?[]const u8, index_path: ?[]const u8, control: ExecutionControl) !void {
+    return validateArtifactSetWithOptions(allocator, single_path, index_path, control, .{});
+}
+
+pub fn validateArtifactSetWithOptions(allocator: std.mem.Allocator, single_path: ?[]const u8, index_path: ?[]const u8, control: ExecutionControl, options: HeaderOptions) !void {
     try control.check();
-    if (single_path) |path| return validateFileWithControl(allocator, path, control);
+    if (single_path) |path| {
+        var reader = try MMapReader.openFileAbsoluteWithOptions(allocator, path, std.math.maxInt(usize), max_header_size, options);
+        defer reader.deinit();
+        return validateReaderWithControl(allocator, &reader, control);
+    }
     const path = index_path orelse return error.NoSafetensorsArtifact;
     const index_bytes = try c_file.readFileWithControl(allocator, control.io orelse std.Options.debug_io, path, control);
     defer allocator.free(index_bytes);
@@ -607,7 +634,7 @@ pub fn validateArtifactSetWithControl(allocator: std.mem.Allocator, single_path:
     var plan_it = plans.valueIterator();
     while (plan_it.next()) |plan| {
         try control.check();
-        var reader = try MMapReader.openFileAbsolute(allocator, plan.path);
+        var reader = try MMapReader.openFileAbsoluteWithOptions(allocator, plan.path, std.math.maxInt(usize), max_header_size, options);
         defer reader.deinit();
         try validateReaderWithControl(allocator, &reader, control);
         for (plan.tensor_names.items) |tensor_name| {

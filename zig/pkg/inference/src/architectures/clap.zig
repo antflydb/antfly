@@ -19,7 +19,7 @@ const ComputeBackend = ops.ComputeBackend;
 const CT = ops.CT;
 const clap_mod = @import("../models/clap.zig");
 const bert_mod = @import("../models/bert.zig");
-const graph_runtime = @import("../graph/runtime.zig");
+const graph_runtime = @import("../execution/graph_runtime.zig");
 const clap_graph = @import("clap_graph.zig");
 
 pub fn textEncoderForward(

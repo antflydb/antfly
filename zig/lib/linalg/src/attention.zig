@@ -449,6 +449,33 @@ pub fn flashCausalAttentionHostInto(
     output: []f32,
     workspace: []align(64) f32,
 ) !void {
+    const Sequential = struct {
+        pub const sgemmTransBSync = gemm.sgemmTransBSequential;
+        pub const sgemmSync = gemm.sgemmSequential;
+    };
+    return flashCausalAttentionHostIntoWithGemm(Sequential, Q, K, V, bias, attn_or_mask, sliding_window, batch, q_seq_len, kv_seq_len, query_position_offset, kv_position_offset, num_heads, num_kv_heads, head_dim, output, workspace);
+}
+
+/// Share packed tiles and online softmax with a host GEMM provider.
+pub fn flashCausalAttentionHostIntoWithGemm(
+    comptime Gemm: type,
+    Q: []const f32,
+    K: []const f32,
+    V: []const f32,
+    bias: ?[]const f32,
+    attn_or_mask: ?[]const u8,
+    sliding_window: usize,
+    batch: usize,
+    q_seq_len: usize,
+    kv_seq_len: usize,
+    query_position_offset: usize,
+    kv_position_offset: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    output: []f32,
+    workspace: []align(64) f32,
+) !void {
     const shape = try hostAttentionShape(Q.len, K.len, V.len, batch, q_seq_len, kv_seq_len, query_position_offset, kv_position_offset, num_heads, num_kv_heads, head_dim);
     const H_q = shape.h_q;
     const H_kv = shape.h_kv;
@@ -508,9 +535,16 @@ pub fn flashCausalAttentionHostInto(
                 // to `output` at the end.
                 @memset(out_pack[0 .. cur_bq * head_dim], 0.0);
 
+                const first_query = query_position_offset + q_start;
+                const last_query = query_position_offset + q_end - 1;
                 var kv_start: usize = 0;
                 while (kv_start < kv_seq_len) {
-                    const kv_end = @min(kv_start + BLOCK_KV, kv_seq_len);
+                    if (attn_or_mask == null and kv_position_offset + kv_start > last_query) break;
+                    const kv_end = kv_start + @min(BLOCK_KV, kv_seq_len - kv_start);
+                    if (!allowsPastAttention(sliding_window, first_query, kv_position_offset + kv_end - 1)) {
+                        kv_start = kv_end;
+                        continue;
+                    }
                     const cur_bkv = kv_end - kv_start;
 
                     // Pack K and V for this K-block (one head's slab) into
@@ -527,7 +561,7 @@ pub fn flashCausalAttentionHostInto(
                     // QK^T as a single register-tiled GEMM with prescaled Q
                     // (alpha=scale folds the per-cell `* scale` into the
                     // matmul, dropping cur_bq*cur_bkv scalar muls).
-                    gemm.sgemmTransBSequential(cur_bq, cur_bkv, head_dim, scale, q_pack[0 .. cur_bq * head_dim], k_pack[0 .. cur_bkv * head_dim], 0.0, score_tile[0 .. cur_bq * cur_bkv]);
+                    Gemm.sgemmTransBSync(cur_bq, cur_bkv, head_dim, scale, q_pack[0 .. cur_bq * head_dim], k_pack[0 .. cur_bkv * head_dim], 0.0, score_tile[0 .. cur_bq * cur_bkv]);
 
                     if (bias) |bias_data| {
                         for (0..cur_bq) |qi_local| {
@@ -566,7 +600,7 @@ pub fn flashCausalAttentionHostInto(
                     }
 
                     // Batched V projection: out_pack[bq, hd] += score_tile[bq, bkv] @ V_pack[bkv, hd].
-                    gemm.sgemmSequential(cur_bq, head_dim, cur_bkv, 1.0, score_tile[0 .. cur_bq * cur_bkv], v_pack[0 .. cur_bkv * head_dim], 1.0, out_pack[0 .. cur_bq * head_dim]);
+                    Gemm.sgemmSync(cur_bq, head_dim, cur_bkv, 1.0, score_tile[0 .. cur_bq * cur_bkv], v_pack[0 .. cur_bkv * head_dim], 1.0, out_pack[0 .. cur_bq * head_dim]);
 
                     kv_start = kv_end;
                 }
@@ -1723,13 +1757,16 @@ pub fn crossAttentionHost(
     Q: []const f32,
     K: []const f32,
     V: []const f32,
-    enc_mask: []const i64,
+    enc_mask: ?[]const i64,
     batch: usize,
     dec_seq: usize,
     enc_seq: usize,
     num_heads: usize,
     head_dim: usize,
 ) ![]f32 {
+    if (enc_mask) |mask| {
+        if (mask.len < try std.math.mul(usize, batch, enc_seq)) return error.InvalidAttentionShape;
+    }
     const H = std.math.mul(usize, num_heads, head_dim) catch return error.InvalidAttentionShape;
     const output = try allocator.alloc(f32, std.math.mul(usize, batch * dec_seq, H) catch return error.InvalidAttentionShape);
     errdefer allocator.free(output);
@@ -1745,7 +1782,7 @@ pub fn crossAttentionHostInto(
     Q: []const f32,
     K: []const f32,
     V: []const f32,
-    enc_mask: []const i64,
+    enc_mask: ?[]const i64,
     batch: usize,
     dec_seq: usize,
     enc_seq: usize,
@@ -1759,13 +1796,14 @@ pub fn crossAttentionHostInto(
     @memset(output, 0.0);
 
     for (0..batch) |b| {
+        const key_mask = if (enc_mask) |mask| mask[b * enc_seq ..][0..enc_seq] else null;
         for (0..num_heads) |h| {
             for (0..dec_seq) |qi| {
                 const q_ptr = Q[(b * dec_seq + qi) * H + h * head_dim ..].ptr;
                 const row = scores[qi * enc_seq ..][0..enc_seq];
                 for (0..enc_seq) |ki| {
                     const k_ptr = K[(b * enc_seq + ki) * H + h * head_dim ..].ptr;
-                    row[ki] = if (enc_mask[b * enc_seq + ki] == 0)
+                    row[ki] = if (key_mask != null and key_mask.?[ki] == 0)
                         -std.math.inf(f32)
                     else
                         primitives.dotPtrs(q_ptr, k_ptr, head_dim) * scale;
@@ -4332,6 +4370,22 @@ fn declaredCausalIntoCase(a: std.mem.Allocator) !void {
             }
             for (0..2) |d| try std.testing.expectApproxEqAbs(@as(f32, @floatCast(sums[d] / denominator)), result[row * width + head * 2 + d], 0.00001);
         };
+        if (rows > BLOCK_KV) {
+            const mask = try a.alloc(u8, rows * rows);
+            defer a.free(mask);
+            @memset(mask, 0);
+            mask[rows - 1] = 1;
+            const offset = rows - 1;
+            const shifted = q[offset * width ..];
+            const want = try originalFlashCausalForDeclaredTest(a, shifted, k, v, null, mask, 1, 1, 1, rows, offset, 0, 2, 2, 2);
+            defer a.free(want);
+            try flashCausalAttentionHostInto(shifted, k, v, null, mask, 1, 1, 1, rows, offset, 0, 2, 2, 2, result[0..shifted.len], scratch);
+            try std.testing.expectEqualSlices(f32, want, result[0..shifted.len]);
+            const future = try originalFlashCausalForDeclaredTest(a, q, k, v, null, mask, 0, 1, rows, rows, 0, 0, 2, 2, 2);
+            defer a.free(future);
+            try flashCausalAttentionHostInto(q, k, v, null, mask, 0, 1, rows, rows, 0, 0, 2, 2, 2, result, scratch);
+            try std.testing.expectEqualSlices(f32, future, result);
+        }
         @memset(result, 77);
         try std.testing.expectError(error.InvalidAttentionShape, flashCausalAttentionHostInto(q, k, v, null, null, 0, 1, rows, rows, 0, 0, 2, 2, 2, result, scratch[0 .. scratch.len - 1]));
         for (result) |value| try std.testing.expectEqual(@as(f32, 77), value);

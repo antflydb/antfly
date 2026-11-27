@@ -33,14 +33,29 @@ const null_node = node_mod.null_node;
 /// Mark nodes reachable from outputs by walking backward through inputs.
 /// Does NOT follow vjp_alternate links — those are for autograd only.
 pub fn computeReachable(allocator: std.mem.Allocator, graph: *const Graph) ![]bool {
-    const count = graph.nodeCount();
-    const reachable = try allocator.alloc(bool, count);
+    return computeReachableFromNodes(allocator, graph, graph.outputs.items);
+}
+
+pub fn computeReachableFromNodes(allocator: std.mem.Allocator, graph: *const Graph, roots: []const NodeId) ![]bool {
+    const reachable = try allocator.alloc(bool, graph.nodeCount());
     @memset(reachable, false);
 
-    for (graph.outputs.items) |out_id| {
-        markReachable(graph, reachable, out_id);
+    for (roots) |root| {
+        if (root < reachable.len) reachable[root] = true;
     }
-
+    var id = graph.nodeCount();
+    while (id > 0) {
+        id -= 1;
+        if (!reachable[id]) continue;
+        for (graph.node(id).getInputs()) |input| {
+            if (input < id) {
+                reachable[input] = true;
+            } else if (input < reachable.len) {
+                // Some rewrites inspect a graph before restoring topological order.
+                markReachable(graph, reachable, input);
+            }
+        }
+    }
     return reachable;
 }
 
@@ -161,6 +176,10 @@ test "DCE removes vjp_alternate subgraph" {
     const result = try b.linear(x, w, bias, 2, 4, 3);
     try g.markOutput(result);
 
+    const targeted = try computeReachableFromNodes(allocator, &g, &.{w});
+    defer allocator.free(targeted);
+    for (targeted, 0..) |reachable, id| try std.testing.expectEqual(id == w, reachable);
+
     const total_before = g.nodeCount();
     try std.testing.expect(total_before > 4); // has decomposed nodes
 
@@ -171,6 +190,27 @@ test "DCE removes vjp_alternate subgraph" {
     try std.testing.expectEqual(@as(u32, 4), dce.graph.nodeCount());
     try std.testing.expectEqual(@as(usize, 1), dce.graph.outputs.items.len);
     try std.testing.expectEqual(@as(usize, 3), dce.graph.parameters.items.len);
+}
+
+test "reachability follows a forward input during graph rewriting" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const shape = Shape.init(.f32, &.{4});
+    const unused = try b.parameter("unused", shape);
+    const root = try b.neg(unused);
+    const input = try b.parameter("input", shape);
+    const later = try b.neg(input);
+    g.nodeMut(root).inputs[0] = later;
+
+    const reachable = try computeReachableFromNodes(allocator, &g, &.{root});
+    defer allocator.free(reachable);
+    try std.testing.expect(!reachable[unused]);
+    try std.testing.expect(reachable[root]);
+    try std.testing.expect(reachable[input]);
+    try std.testing.expect(reachable[later]);
 }
 
 test "DCE preserves chained fused ops" {

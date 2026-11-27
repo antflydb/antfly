@@ -111,11 +111,20 @@ pub const PreparedInvocation = struct {
     backend_cookie: usize = 0,
     validate_stage_controls: ?*const fn (*PreparedInvocation, []const @import("../backends/session.zig").StageInput) anyerror!void = null,
     stage_controls_validated: bool = false,
+    host_stage_binding: ?*const fn (*const PreparedInvocation, usize) HostStageBinding = null,
     dispatch: *const fn (*PreparedInvocation, Inputs, Placement, std.mem.Allocator, ?Control, ?storage.Capability) anyerror!Result,
     reclaim_idle: ?*const fn (*PreparedInvocation, ?Control) anyerror!bool = null,
     reclaim_idle_with_cleanup: ?*const fn (*PreparedInvocation, ?Control, @import("cleanup_context.zig").Context) anyerror!bool = null,
     executed: bool = false,
     closed: bool = false,
+
+    pub const HostStageBinding = enum { import, omitted, planned_host };
+
+    pub fn hostStageBinding(self: *const PreparedInvocation, index: usize) HostStageBinding {
+        if (self.executed) return .import;
+        const select = self.host_stage_binding orelse return .import;
+        return select(self, index);
+    }
 
     pub fn hasCompleteOwnedPayload(self: *const PreparedInvocation) bool {
         const declared = self.requirement.owned_payload orelse return false;

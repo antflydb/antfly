@@ -436,6 +436,7 @@ pub const DeviceWriteHook = struct {
         /// cache entries, etc.). Called from `releaseSequence` before the
         /// sequence state is cleared. Null = no-op.
         releaseSequence: ?*const fn (ctx: *anyopaque, sequence_id: SequenceId) void = null,
+        releaseSequenceWithCleanup: ?*const fn (ctx: *anyopaque, sequence_id: SequenceId, current: Cleanup) anyerror!void = null,
         /// True only when the backend can consume donor-scoped selected KV
         /// with an explicit absolute position per retained row. A backend must
         /// leave this false until storage, attention kernels, and transactional
@@ -565,7 +566,7 @@ pub const KvStorageRuntime = struct {
     pub fn deinitWithBoundary(self: *KvStorageRuntime, cleanup: ?*const @import("../../execution/retirement_sink.zig").Epoch) void {
         if (cleanup != null) if (self.device_write_hook) |hook| hook.prepareMutationWithCleanup(.{ .boundary = cleanup }) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         for (self.sequences.items, 0..) |_, idx| {
-            self.releaseSequenceByIndex(idx) catch {};
+            self.releaseSequenceByIndex(idx, null) catch {};
         }
         for (self.sequences.items) |*seq_state| seq_state.deinit(self.allocator);
         self.sequences.deinit(self.allocator);
@@ -850,14 +851,17 @@ pub const KvStorageRuntime = struct {
     }
 
     pub fn releaseSequenceWithCleanup(self: *KvStorageRuntime, sequence_id: SequenceId, current: Cleanup) !void {
-        if (self.device_write_hook) |hook| try hook.prepareMutationWithCleanup(current);
-        try self.releaseSequence(sequence_id);
+        try self.releaseSequenceUsing(sequence_id, current);
     }
 
     pub fn releaseSequence(self: *KvStorageRuntime, sequence_id: SequenceId) !void {
+        try self.releaseSequenceUsing(sequence_id, null);
+    }
+
+    fn releaseSequenceUsing(self: *KvStorageRuntime, sequence_id: SequenceId, current: ?Cleanup) !void {
         const idx = sequenceIndex(sequence_id) orelse return error.InvalidSequenceId;
         if (idx >= self.sequences.items.len) return error.InvalidSequenceId;
-        try self.releaseSequenceByIndex(idx);
+        try self.releaseSequenceByIndex(idx, current);
     }
 
     pub fn tokenCount(self: *const KvStorageRuntime, sequence_id: SequenceId) ?usize {
@@ -1298,11 +1302,20 @@ pub const KvStorageRuntime = struct {
         return self.trimSequenceToWindow(sequence_id, keep_tokens);
     }
 
-    fn releaseSequenceByIndex(self: *KvStorageRuntime, idx: usize) !void {
+    fn releaseSequenceByIndex(self: *KvStorageRuntime, idx: usize, current: ?Cleanup) !void {
         if (idx >= self.sequences.items.len) return;
         const seq_state = &self.sequences.items[idx];
         if (!seq_state.active) return;
-        if (self.device_write_hook) |hook| hook.releaseSequence(seq_state.id);
+        if (self.device_write_hook) |hook| release: {
+            if (current) |cleanup| {
+                if (hook.vtable.releaseSequenceWithCleanup) |checked| {
+                    try checked(hook.ctx, seq_state.id, cleanup);
+                    break :release;
+                }
+                try hook.prepareMutationWithCleanup(cleanup);
+            }
+            hook.releaseSequence(seq_state.id);
+        }
         for (seq_state.block_table.blocks.items) |block_id| {
             _ = try self.storage.releaseRef(self.allocator, block_id);
         }
@@ -2153,6 +2166,60 @@ test "prepared generated storage append authorizes front retirement before publi
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     try std.testing.expectEqual(@as(usize, 7), storage.tokenCount(sequence).?);
     try std.testing.expectEqualSlices(block.KvBlockId, before, (try storage.sequenceMut(sequence)).block_table.blocks.items);
+}
+
+test "checked sequence release preserves pages until the device owner accepts cleanup" {
+    const Probe = struct {
+        reject: bool = true,
+        checked_calls: usize = 0,
+        legacy_calls: usize = 0,
+
+        fn write(_: *anyopaque, _: KvSuffixWrite, _: DeviceKvRef, _: DeviceKvRef) !void {
+            return error.UnexpectedWrite;
+        }
+        fn prepare(_: *anyopaque, _: *const anyopaque, _: Cleanup) !void {
+            return error.UnexpectedLegacyPreparation;
+        }
+        fn checked(raw: *anyopaque, sequence: SequenceId, current: Cleanup) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(sequence != 0);
+            try std.testing.expect(current.outside_execution);
+            self.checked_calls += 1;
+            if (self.reject) return error.ReleaseDeclined;
+        }
+        fn release(raw: *anyopaque, _: SequenceId) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.legacy_calls += 1;
+        }
+        fn close(_: *anyopaque, _: std.mem.Allocator) void {}
+        const table: DeviceWriteHook.VTable = .{
+            .prepareMutationWithCleanup = prepare,
+            .writeLayerKvSuffix = write,
+            .releaseSequence = release,
+            .releaseSequenceWithCleanup = checked,
+            .deinit = close,
+        };
+    };
+    var probe: Probe = .{};
+    var storage = try KvStorageRuntime.init(std.testing.allocator, .{ .backend = .native, .dtype = .f32, .page_size_tokens = 4, .num_kv_heads = 1, .head_dim = 1 });
+    defer storage.deinit();
+    const sequence = try storage.attachSequence(storage.poolId());
+    try storage.appendTokens(sequence, 3);
+    storage.setDeviceWriteHook(.{ .ctx = &probe, .vtable = &Probe.table });
+    const current: Cleanup = .{ .outside_execution = true };
+    try std.testing.expectError(error.ReleaseDeclined, storage.releaseSequenceWithCleanup(sequence, current));
+    try std.testing.expectEqual(@as(?usize, 3), storage.tokenCount(sequence));
+    probe.reject = false;
+    try storage.releaseSequenceWithCleanup(sequence, current);
+    try std.testing.expectEqual(@as(?usize, null), storage.tokenCount(sequence));
+    try std.testing.expectEqual(@as(usize, 2), probe.checked_calls);
+    try std.testing.expectEqual(@as(usize, 0), probe.legacy_calls);
+    const recycled = try storage.attachSequence(storage.poolId());
+    try std.testing.expectEqual(sequence, recycled);
+    try std.testing.expectEqual(@as(?usize, 0), storage.tokenCount(recycled));
+    try storage.releaseSequenceWithCleanup(recycled, current);
+    try std.testing.expectEqual(@as(usize, 3), probe.checked_calls);
+    try std.testing.expectEqual(@as(usize, 0), probe.legacy_calls);
 }
 
 test "unpublished storage attachment abort skips hooks and full prefill publishes only after page commit" {

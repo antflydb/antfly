@@ -525,13 +525,12 @@ fn forwardImpl(
     // them (and their dependent elementwise ops) in one command buffer so MPS
     // does not submit and wait after every projection.  The frame is owned
     // only here; callers that already compose a frame retain control.
-    var encoder_frame_active = false;
-    // Interleaved packed RoPE and trunk capture read back to the host, so
-    // those forwards run unframed.
-    if ((packed_row == null or !config.rope_interleaved) and capture == null and cb.kind() == .metal and metalEncoderFrameEnabled() and !cb.decoderRuntimeHasActiveFrame()) {
-        encoder_frame_active = try cb.decoderRuntimeBeginFrame();
-    }
-    errdefer if (encoder_frame_active) cb.decoderRuntimeCancelFrame() catch {};
+    // Interleaved packed RoPE and trunk capture read back to the host.
+    const Submission = @import("../execution/submission.zig").Scope;
+    const frame_needed = (packed_row == null or !config.rope_interleaved) and capture == null and
+        cb.kind() == .metal and metalEncoderFrameEnabled();
+    var frame: Submission = if (frame_needed) try Submission.begin(cb) else .{ .backend = cb };
+    errdefer frame.deinit();
 
     // 1. Token embeddings + embedding LayerNorm.
     //    ModernBERT has no absolute position embeddings; RoPE is applied in each
@@ -600,24 +599,22 @@ fn forwardImpl(
             );
         cb.free(hidden);
         hidden = new_hidden;
-        if (trace.per_layer and encoder_frame_active) {
+        if (trace.per_layer and frame.owns) {
             // Diagnostic-only attribution fence. This deliberately changes the
             // production two-layer command-buffer cadence and is unsuitable for
             // end-to-end latency claims.
-            try cb.decoderRuntimeSubmitAndWaitFrame();
-            encoder_frame_active = false;
+            try frame.finish();
             trace.emitLayer(cb, layer_idx, layer_started_ns, layer_started);
             try cb.checkExecutionControl();
             if (layer_idx + 1 < config.num_hidden_layers)
-                encoder_frame_active = try cb.decoderRuntimeBeginFrame();
-        } else if (cb.execution_control != null and encoder_frame_active and
+                frame = try Submission.begin(cb);
+        } else if (cb.execution_control != null and frame.owns and
             (layer_idx + 1) % 2 == 0 and layer_idx + 1 < config.num_hidden_layers and
             batch * seq_len >= config.glide.single_frame_below_tokens)
         {
-            try cb.decoderRuntimeSubmitAndWaitFrame();
-            encoder_frame_active = false;
+            try frame.finish();
             try cb.checkExecutionControl();
-            encoder_frame_active = try cb.decoderRuntimeBeginFrame();
+            frame = try Submission.begin(cb);
         }
     }
 
@@ -641,10 +638,7 @@ fn forwardImpl(
         cb.free(hidden);
         hidden = padded;
     };
-    if (encoder_frame_active) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        encoder_frame_active = false;
-    }
+    try frame.finish();
     try cb.checkExecutionControl();
     trace.emitAggregate(cb, if (row_segments) |rows| rows.tokens else batch * seq_len, @intCast(config.num_hidden_layers));
     if (readout != null and readout_rows == null) {

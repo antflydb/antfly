@@ -78,7 +78,7 @@ const graph_input_binder = @import("graph_input_binder.zig");
 const graph_weight_bridge = @import("graph_weight_bridge.zig");
 const ops = @import("../ops/ops.zig");
 const interpreter = @import("../graph/interpreter.zig");
-const graph_runtime = @import("../graph/runtime.zig");
+const graph_runtime = @import("../execution/graph_runtime.zig");
 const graph_training = @import("../graph/training.zig");
 
 const Builder = ml.graph.Builder;

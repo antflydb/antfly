@@ -15,8 +15,11 @@
 
 // native-program:entry termite_encode_f16_convert
 // native-program:indent 11
-kernel void termite_encode_f16_convert(device const float *in [[buffer(0)]], device half *out [[buffer(1)]], constant termite_metal_encode_key_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
-    uint total = p.rows * p.num_kv_heads * p.head_dim; if (gid >= total) return; out[gid] = half(in[gid]);
+kernel void termite_encode_f16_convert(device const float *key [[buffer(0)]], device half *key_out [[buffer(1)]], device const float *value [[buffer(2)]], device half *value_out [[buffer(3)]], constant termite_metal_encode_key_params &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
+    const uint total = p.rows * p.num_kv_heads * p.head_dim;
+    if (gid >= total) return;
+    key_out[gid] = half(key[gid]);
+    value_out[gid] = half(value[gid]);
 }
 // native-program:entry termite_conv1d_f32
 // native-program:indent 11

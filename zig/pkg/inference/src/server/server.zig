@@ -72,7 +72,10 @@ const decide_mod = @import("antfly_decisions").legacy;
 const BoundedRequestAllocator = @import("../runtime/bounded_allocator.zig").BoundedAllocator;
 const image_pipeline = @import("../pipelines/image.zig");
 const sparse_embedding_mod = @import("../pipelines/sparse_embedding.zig");
+const decoder_prefill = @import("../execution/decoder_prefill.zig");
 const generation = @import("../pipelines/generation.zig");
+const decoder_checkpoint = @import("../execution/decoder_checkpoint.zig");
+const decoder_storage = @import("../execution/decoder_storage.zig");
 const context_management = @import("context_management.zig");
 const native_kv_wire = @import("native_kv_wire.zig");
 const multimodal_reranker = @import("../pipelines/multimodal_reranker.zig");
@@ -567,6 +570,12 @@ fn generationStreamShouldContinue(
     return true;
 }
 
+fn writeGenerationKeepaliveIfIdle(writer: anytype, last_write_ns: *u128, now_ns: u128) !void {
+    if (now_ns -| last_write_ns.* < 15 * std.time.ns_per_s) return;
+    try writer.write(": keep-alive\n\n");
+    last_write_ns.* = now_ns;
+}
+
 fn generationStreamWriteIsPeerDisconnect(err: anyerror) bool {
     return switch (err) {
         error.Canceled,
@@ -688,6 +697,32 @@ test "generation stream continuation observes writes and peer cancellation" {
     cancellation.store(true, .release);
     try std.testing.expect(!generationStreamShouldContinue(false, &cancellation));
     try std.testing.expect(!generationStreamShouldContinue(true, null));
+}
+
+test "generation SSE keepalive is emitted only after an idle interval" {
+    const Writer = struct {
+        events: usize = 0,
+        closed: bool = false,
+
+        fn write(self: *@This(), bytes: []const u8) !void {
+            if (self.closed) return error.StreamClosed;
+            try std.testing.expectEqualStrings(": keep-alive\n\n", bytes);
+            self.events += 1;
+        }
+    };
+    const second = std.time.ns_per_s;
+    var writer: Writer = .{};
+    var last: u128 = second;
+    try writeGenerationKeepaliveIfIdle(&writer, &last, 15 * second);
+    try std.testing.expectEqual(@as(usize, 0), writer.events);
+    try writeGenerationKeepaliveIfIdle(&writer, &last, 16 * second);
+    try std.testing.expectEqual(@as(usize, 1), writer.events);
+    try std.testing.expectEqual(@as(u128, 16 * second), last);
+    try writeGenerationKeepaliveIfIdle(&writer, &last, 17 * second);
+    try std.testing.expectEqual(@as(usize, 1), writer.events);
+    writer.closed = true;
+    try std.testing.expectError(error.StreamClosed, writeGenerationKeepaliveIfIdle(&writer, &last, 31 * second));
+    try std.testing.expectEqual(@as(u128, 16 * second), last);
 }
 
 test "generation stream write classification separates peer disconnects from server faults" {
@@ -979,10 +1014,6 @@ test "radix prompt cache is opt in and excludes CUDA device storage" {
     try std.testing.expect(promptCacheBackendEligible(.radix, .native));
     try std.testing.expect(!promptCacheBackendEligible(.radix, .cuda));
     try std.testing.expect(promptCacheBackendEligible(.block_hash, .cuda));
-}
-
-fn generationKvSlidingTrimForced() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_KV_SLIDING_TRIM", false);
 }
 
 fn validateCacheCompactionRatio(ratio: ?f32) !void {
@@ -2518,6 +2549,21 @@ fn logEmbedTiming(phase: []const u8, count: usize, start_ns: u128) void {
 
 fn serverGenerateTimingEnabled() bool {
     return platform.env.getenvBool("TERMITE_SERVER_GENERATE_TIMING");
+}
+
+fn logWhisperTiming(comptime task: []const u8, model: []const u8, transcript: *const long_transcription.Result) void {
+    if (!serverGenerateTimingEnabled()) return;
+    const timing = transcript.timing;
+    std.log.info(task ++ " timing model={s} audio_ms={d} mel_ms={d} encoder_ms={d} prefill_ms={d} decode_ms={d} decode_steps={d} kv_cached={}", .{
+        model,
+        transcript.duration_ms,
+        timing.mel_ns / std.time.ns_per_ms,
+        timing.encoder_ns / std.time.ns_per_ms,
+        timing.prefill_ns / std.time.ns_per_ms,
+        timing.decode_ns / std.time.ns_per_ms,
+        timing.decode_steps,
+        timing.kv_cached,
+    });
 }
 
 fn elapsedMs(from_ns: u128, to_ns: u128) u64 {
@@ -5051,7 +5097,7 @@ pub const Node = struct {
     }
 
     fn tensorBatchDispatch(self: *Node, task: executor_microbatch.Task) @import("tensor_microbatch.zig").Dispatch {
-        return .{ .ptr = self, .task = task, .run_fn = runTensorBatch, .run_resident_fn = runResidentTensorBatch, .run_stage_fn = runStageTensorBatch };
+        return .{ .ptr = self, .task = task, .run_fn = runTensorBatch, .run_resident_fn = runResidentTensorBatch, .run_stage_fn = runStageTensorBatch, .accepts_shape_only_stage_inputs = true };
     }
 
     fn runStageTensorBatch(raw: *anyopaque, task: executor_microbatch.Task, allocator: std.mem.Allocator, session: backends_mod.Session, inputs: []const @import("../backends/session.zig").StageInput, supplied: ?InferenceExecutionControl) anyerror!@import("../backends/session.zig").ResidentOutputs {
@@ -6446,6 +6492,82 @@ pub const Node = struct {
         continue_fn: ?*const fn (*anyopaque) bool = null,
     };
 
+    const InklingCuda = @import("../architectures/inkling2_session.zig");
+    const InklingMetal = @import("../architectures/inkling2_session_metal.zig");
+
+    const InklingEagerRuntime = union(enum) {
+        cuda: *InklingCuda.Runtime,
+        metal: *InklingMetal.Runtime,
+
+        fn fromSession(session: backends_mod.Session) ?InklingEagerRuntime {
+            if (comptime build_options.enable_metal) {
+                if (InklingMetal.Runtime.fromSession(session)) |resident| return .{ .metal = resident };
+            }
+            if (comptime build_options.enable_cuda) {
+                if (InklingCuda.Runtime.fromSession(session)) |resident| return .{ .cuda = resident };
+            }
+            return null;
+        }
+
+        fn maxActiveRequests(self: InklingEagerRuntime) usize {
+            return switch (self) {
+                .cuda => InklingCuda.max_active_requests,
+                .metal => InklingMetal.max_active_requests,
+            };
+        }
+
+        fn init(self: InklingEagerRuntime, allocator: std.mem.Allocator, model: *model_manager_mod.LoadedModel, control: InferenceExecutionControl, input: []const generation.Message, config: generation.GenerationConfig, limit: ?usize) !InklingEagerPipeline {
+            return switch (self) {
+                .cuda => |resident| if (comptime build_options.enable_cuda)
+                    .{ .cuda = try InklingCuda.Pipeline.init(allocator, resident, model.session, model.getTokenizer(), control, input, config, limit) }
+                else
+                    unreachable,
+                .metal => |resident| if (comptime build_options.enable_metal)
+                    .{ .metal = .{
+                        .resident = resident,
+                        .session = model.session,
+                        .text = try InklingMetal.TextPipeline.init(allocator, model.getTokenizer(), control, input, config, limit, resident.model.text.model_max_length, .{}),
+                    } }
+                else
+                    unreachable,
+            };
+        }
+    };
+
+    const InklingEagerPipeline = union(enum) {
+        cuda: InklingCuda.Pipeline,
+        metal: InklingMetal.ServingPipeline,
+
+        fn deinit(self: *InklingEagerPipeline) void {
+            switch (self.*) {
+                .cuda => |*pipeline| if (comptime build_options.enable_cuda) pipeline.deinit() else unreachable,
+                .metal => |*pipeline| if (comptime build_options.enable_metal) pipeline.deinit() else unreachable,
+            }
+        }
+
+        fn generate(self: *InklingEagerPipeline, input: []const generation.Message, config: generation.GenerationConfig, stream: ?DirectGenerateStream) !generation.GenerationResult {
+            return switch (self.*) {
+                .cuda => |*pipeline| if (comptime build_options.enable_cuda)
+                    generateWith(pipeline, input, config, stream)
+                else
+                    unreachable,
+                .metal => |*pipeline| if (comptime build_options.enable_metal)
+                    generateWith(pipeline, input, config, stream)
+                else
+                    unreachable,
+            };
+        }
+
+        fn generateWith(pipeline: anytype, input: []const generation.Message, config: generation.GenerationConfig, stream: ?DirectGenerateStream) !generation.GenerationResult {
+            if (stream) |sink| {
+                pipeline.continue_ctx = sink.ctx;
+                pipeline.continue_fn = sink.continue_fn;
+                return pipeline.generateStreaming(input, config, sink.ctx, sink.on_token);
+            }
+            return pipeline.generate(input, config);
+        }
+    };
+
     const DirectGenerateTiming = struct {
         resolve_ms: u64 = 0,
         load_ms: u64 = 0,
@@ -6726,6 +6848,35 @@ pub const Node = struct {
         if (timing != null) {
             std.log.info("direct generator loaded model={s} backend={s}", .{ model_name, @tagName(model.session.backend()) });
         }
+        if (InklingEagerRuntime.fromSession(model.session)) |resident| {
+            if (a4b_request != null or prompt_cache_key != null or preflight.audio_transcription)
+                return error.UnsupportedInkling2Request;
+            const slot = try model.generation_admission.acquire(execution_control, false, runtime.scheduler.generation_admission.Limits.forRequests(self.config.max_concurrent_requests, resident.maxActiveRequests()));
+            defer slot.release();
+            const config: generation.GenerationConfig = .{ .max_tokens = max_tokens };
+            var pipeline = try resident.init(allocator, model, execution_control, messages, config, executor_contract.batch.max_input_tokens_per_item);
+            defer pipeline.deinit();
+            const setup_at_ns = embedTimingNowNs();
+            var result = try pipeline.generate(messages, config, stream);
+            defer result.deinit();
+            const generated_at_ns = embedTimingNowNs();
+            if (timing) |report| report.* = .{
+                .resolve_ms = elapsedMs(started_at_ns, resolved_at_ns),
+                .load_ms = elapsedMs(resolved_at_ns, loaded_at_ns),
+                .setup_ms = elapsedMs(loaded_at_ns, setup_at_ns),
+                .generate_ms = elapsedMs(setup_at_ns, generated_at_ns),
+                .total_ms = elapsedMs(started_at_ns, generated_at_ns),
+            };
+            const text = try caller_allocator.dupe(u8, result.text);
+            if (pin_after_success) model_handle.pin();
+            return .{
+                .text = text,
+                .prompt_tokens = result.prompt_tokens,
+                .completion_tokens = result.tokens_used,
+                .truncated = std.mem.eql(u8, result.finish_reason, "length"),
+                .naturally_completed = std.mem.eql(u8, result.finish_reason, "stop"),
+            };
+        }
         const gpt_config = session_factory.getGptConfig(model.session) orelse return error.UnsupportedGeneratorProvider;
         // Preserve model resolution, capability checks, admission and cancellation
         // for silence, but do not ask a generative model to invent a transcript.
@@ -6850,7 +7001,7 @@ pub const Node = struct {
         };
         const direct_prefill_ceiling = @min(
             prompt_tokens,
-            generation.nativeGenerationPrefillChunkCeiling(
+            decoder_prefill.idleChunkCeiling(
                 backend_kind,
                 gpt_config,
                 self.config.generation_batching.schedulerPolicy().max_idle_prefill_chunk_size,
@@ -6921,7 +7072,7 @@ pub const Node = struct {
         var prepared_ocr: ?*PreparedOcrRequest = null;
         if (comptime build_options.enable_cuda) if (admission_lease.resources) |*primary| {
             const publication_bytes = if (model.session.backend() == .cuda) generation.nativeCudaVisionPublicationBytes(allocator, model_path, gpt_config, messages, @intCast(@max(max_tokens, 1)), 1) catch 0 else 0;
-            vision_publication = try generation.prepareNativeVisionPublication(model.session, primary, publication_bytes, 1, budget_limits, execution_control);
+            vision_publication = try VisionPublication.prepareVisionPublication(model.session, primary, publication_bytes, 1, budget_limits, execution_control);
             const upload_bytes = if (backend_kind == .cuda)
                 generation.nativeCudaPinnedPatchUploadBytesAtMost(allocator, model_path, gpt_config, messages, @intCast(@max(max_tokens, 1)), PreparedOcrRequest.pinned_input_upload_capacity) catch 0
             else
@@ -6959,7 +7110,7 @@ pub const Node = struct {
             } else cb.deinit();
         }
 
-        const kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced());
+        const kv_pool_config = decoder_storage.poolPlan(backend_kind, kv_dtype, &gpt_config, .{ .force_sliding_trim = decoder_storage.slidingTrimForced() });
         // Prefix cache activation mirrors the HTTP generate route: the cache's
         // own KV manager and (on GPU backends) its device storage replace the
         // request-local pool so cached blocks are addressable by the decode.
@@ -7000,12 +7151,12 @@ pub const Node = struct {
                 pool_id = model.prompt_prefix_cache.pool_id.?;
                 prompt_cache = &model.prompt_prefix_cache;
             } else {
-                pool_id = try kv_manager.addPool(generation.requestKvManagerPoolConfig(kv_pool_config));
+                pool_id = try kv_manager.addPool(decoder_storage.requestMetadataPool(kv_pool_config));
                 generation_config.prompt_cache_enabled = false;
                 self.model_manager.cancelPromptCacheActivation(model, prompt_cache_config);
             }
         } else {
-            pool_id = try kv_manager.addPool(generation.requestKvManagerPoolConfig(kv_pool_config));
+            pool_id = try kv_manager.addPool(decoder_storage.requestMetadataPool(kv_pool_config));
         }
         var kv_storage: ?runtime.kv.storage_runtime.KvStorageRuntime = if (active_kv_storage == null)
             try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, kv_pool_config)
@@ -8526,7 +8677,7 @@ pub const Node = struct {
         var longest: usize = 0;
         for (items) |item| longest = @max(longest, item.payloadAs(DecideClassifyTicket).sample.input_ids.len);
         const variant = try gliner_decide_qualification.require(try session_factory.getGlinerDecisionIdentity(first.model.session));
-        const workspace_bytes: usize = if (variant == .decide_deberta or variant == .decide_deberta_q8) gliner_specialty.cuda_matmul_workspace_bytes else 0;
+        const workspace_bytes: usize = if (variant == .decide_deberta and (session_factory.glinerCudaBf16Enabled(first.model.session) orelse true)) @import("../models/gliner25_bf16_policy.zig").workspace_bytes else if (variant == .decide_deberta or variant == .decide_deberta_q8) gliner_specialty.cuda_matmul_workspace_bytes else 0;
         var budget = gliner_microbatch.classificationBudget(first.limits, first.config, longest, items.len, workspace_bytes) catch |err| {
             if (err == error.MemoryBudgetExceeded) return error.ClassificationMicrobatchCapacity;
             return err;
@@ -9503,7 +9654,6 @@ pub const Node = struct {
     const ReaderEpochHooks = struct {
         pub const effectiveLightOnReadRows = readerPhysicalRows;
         pub const cudaLightOnBatchProfileEnabled = readerCudaBatchEnabled;
-        pub const generationKvSlidingTrimForced = readerSlidingTrimForced;
     };
     const LightOnStreamContext = @import("reader_epoch.zig").Epoch(Node, ReaderEpochHooks);
 
@@ -9540,13 +9690,13 @@ pub const Node = struct {
                 var tight = limits;
                 tight.backend_limit_bytes = primary.amounts.backendTotalBytes();
                 try std.testing.expect(tight.backend_limit_bytes != 0);
-                var denied = try generation.prepareNativeVisionPublication(model.session, primary, publication_bytes, 2, tight, control);
+                var denied = try VisionPublication.prepareVisionPublication(model.session, primary, publication_bytes, 2, tight, control);
                 defer if (denied) |*unexpected| unexpected.deinit();
                 try std.testing.expect(denied == null);
                 try std.testing.expect(std.meta.eql(original_primary, primary.*));
                 try std.testing.expectEqualDeep(before_optional, controller.snapshot());
             }
-            vision_publication = try generation.prepareNativeVisionPublication(model.session, primary, publication_bytes, 2, limits, control);
+            vision_publication = try VisionPublication.prepareVisionPublication(model.session, primary, publication_bytes, 2, limits, control);
             if (model.session.backend() == .cuda and vision_publication == null) return error.MissingQualifiedPublicationFunding;
             const upload_bytes = if (model.session.backend() == .cuda) try qwen3vl_projector.planResidentCudaPatchUploadBytesAtMost(cfg, &.{fixture}, .{}, PreparedOcrRequest.pinned_input_upload_capacity) else 0;
             prepared_ocr = try PreparedOcrRequest.acquireAfterAdmissionWithUploadBytes(model.session, primary, upload_bytes, model.nativeGenerationMutex(), &model.native_reader_execution_lane, control);
@@ -9879,7 +10029,7 @@ pub const Node = struct {
         };
         const queued_phase = request.ctx.beginQueuedPhase(false);
         defer if (queued_phase) request.ctx.finishPhaseWait();
-        const batch_items = try generation.NativeGenerationPipeline.preparedQwenPrefillBatchLimitForBackend(positioned.item.backend.kind(), request.ctx.features.prefill_batch_items, seq);
+        const batch_items = try @import("../execution/decoder_routes.zig").positionedPrefillBatchLimitForBackend(positioned.item.backend.kind(), request.ctx.features.prefill_batch_items, seq);
         const result = try request.ctx.prefill_broker.submitControlled(LightOnPrefillPayload, []f32, request.io, positioned.item.allocator, .{ .model = request.ctx.model.model_dir, .generation = request.ctx.execution_id, .task = .read, .transform = "lighton-prefill", .resource_class = .gpu }, .{ .mode = .native, .preferred_items = batch_items, .max_items = batch_items, .max_tokens = std.math.mul(usize, batch_items, seq) catch return error.ResourceLimitExceeded, .max_wait_us = @min(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_PREFILL_WAIT_US") orelse 5000, 1000000) }, .{ .geometry_key = @intCast(seq), .tokens = seq }, .{}, try directExecutorDeadline(request.io, request.control.deadline_ns), .{ .ptr = &request.control, .is_cancelled_fn = Cancel.check }, &payload, request.ctx, executeLightOnPrefillBatch);
         const logits = switch (result.result) {
             .value => |value| value,
@@ -9912,7 +10062,7 @@ pub const Node = struct {
         }
         var group = executor_microbatch.ExecutionControl{ .items = items };
         const control = lightOnMicrobatchExecutionControl(&group);
-        var batch: [generation.NativeGenerationPipeline.max_prepared_qwen_prefill_items]@import("../execution/decoder_prefill.zig").PositionedEmbeddingBatchItem = undefined;
+        var batch: [@import("../execution/decoder_routes.zig").max_positioned_prefill_items]@import("../execution/decoder_prefill.zig").PositionedEmbeddingBatchItem = undefined;
         for (items, 0..) |item, index| batch[index] = item.payloadAs(LightOnPrefillPayload).item;
         control.check() catch |err| {
             for (items) |item| item.slot.fail(err);
@@ -10074,9 +10224,9 @@ pub const Node = struct {
         const backend: runtime.kv.pool.BackendKind = if (model.session.backend() == .cuda) .cuda else .metal;
         cfg.qwen35_device_only_state = cfg.hasQwen35VisionArchitectureContract() and
             ((backend == .cuda and cfg.qwen35_device_only_state) or
-                (metal_runtime.appleSimdgroupDeviceDefault() and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_DEVICE_RECURRENT_STATE")));
+                (metal_runtime.appleSimdgroupDeviceDefault() and metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_DEVICE_RECURRENT_STATE")));
         cfg.qwen35_metal_resident_vision = metal_runtime.appleSimdgroupDeviceDefault() and cfg.hasQwen35VisionArchitectureContract() and
-            qwen3vl_projector.supportsResidentVisionBudget(cfg) and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_RESIDENT_VISION_BUDGET");
+            qwen3vl_projector.supportsResidentVisionBudget(cfg) and metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_RESIDENT_VISION_BUDGET");
         const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend);
         const messages = [_]generation.Message{.{ .role = "user", .content = prompt, .image_bytes = &.{image}, .content_parts = &.{ .{ .image = 0 }, .{ .text = prompt } } }};
         const estimate = try self.countAdmittedPromptTokens(model_path, model, cfg, &messages, max_tokens, control);
@@ -10180,6 +10330,9 @@ pub const Node = struct {
                         denial.admitted_backend_bytes, denial.host_limit_bytes,        denial.backend_limit_bytes,
                         denial.combined_limit_bytes,   limits.scratch_limit_bytes,
                     });
+                    if (denial.scratch_domain) |domain| std.debug.print("LIGHTONOCR3 scratch_domain={s} requested_bytes={d} sampled_admitted_bytes={d} limit_bytes={d}\n", .{
+                        @tagName(domain.backend), domain.requested_bytes, domain.admitted_bytes, domain.limit_bytes,
+                    });
                     logged_wait = true;
                 }
                 platform.time.sleepNs(admission_wait.nextRetryDelayNs());
@@ -10225,7 +10378,7 @@ pub const Node = struct {
             if (publication_bytes != 0) {
                 const Prepare = struct {
                     fn run(bytes: usize, selected: @import("../backends/session.zig").Session, primary: *runtime.tier.memory.AdmissionLease, active: InferenceExecutionControl) !?VisionPublication {
-                        return generation.prepareNativeVisionPublication(selected, primary, bytes, 1, selected.run_admission.?.limits, active);
+                        return VisionPublication.prepareVisionPublication(selected, primary, bytes, 1, selected.run_admission.?.limits, active);
                     }
                 };
                 vision_publication = admission.withSupplementalOutside(limits, control, publication_bytes, Prepare.run) catch |err| switch (err) {
@@ -10250,14 +10403,7 @@ pub const Node = struct {
             .host_scratch_bytes = ctx.budget.host_scratch_bytes - before.host_scratch_bytes,
             .backend_scratch_bytes = ctx.budget.backend_scratch_bytes - before.backend_scratch_bytes,
         };
-        defer {
-            ctx.lockStepForCleanup();
-            ctx.budget.host_kv_bytes -= reserved.host_kv_bytes;
-            ctx.budget.backend_kv_bytes -= reserved.backend_kv_bytes;
-            ctx.budget.host_scratch_bytes -= reserved.host_scratch_bytes;
-            ctx.budget.backend_scratch_bytes -= reserved.backend_scratch_bytes;
-            ctx.unlockStep();
-        }
+        defer ctx.releasePageBudget(reserved);
         if (chunk != estimate.token_count) {
             ctx.unlockStep();
             return error.MemoryBudgetExceeded;
@@ -10291,7 +10437,7 @@ pub const Node = struct {
         state.kv_storage = &ctx.storage;
         state.kv_lock = &ctx.kv_mutex;
         defer {
-            ctx.lockStepForCleanup();
+            ctx.lockStepForCleanup(.page_state_cleanup);
             if (state.qwen35_linear_cache) |cache| {
                 ctx.recurrent_cache_pages += 1;
                 for (cache.layers) |layer| ctx.host_recurrent_bytes_total +|= (layer.conv.len + layer.recurrent.len) * @sizeOf(f32);
@@ -10313,9 +10459,7 @@ pub const Node = struct {
         defer if (owned_io) |*value| value.deinit();
         const page_io = self.inferenceIo(a, control.io, &owned_io);
         defer if (comptime build_options.enable_cuda) if (vision_publication) |*publication| {
-            ctx.lockStepForCleanup();
-            defer ctx.unlockStep();
-            publication.finish(.{ .boundary = ctx.cleanup_owner.epoch(), .operation = if (ctx.cb) |*backend_cb| backend_cb.operationToken() else null });
+            ctx.finishVisionPublication(publication);
         };
         var vision_request = LightOnVisionRequest{ .ctx = ctx, .io = page_io, .control = control, .publication = if (comptime build_options.enable_cuda) if (vision_publication) |*publication| publication else null else null };
         var pipeline = generation.NativeGenerationPipeline{
@@ -10681,7 +10825,7 @@ pub const Node = struct {
         }
         var manager = runtime.kv.manager.KvManager.init(allocator);
         defer manager.deinit();
-        const pool_config = generation.kvPoolConfig(backend, kv_dtype, cfg, generationKvSlidingTrimForced());
+        const pool_config = decoder_storage.poolPlan(backend, kv_dtype, &cfg, .{ .force_sliding_trim = decoder_storage.slidingTrimForced() });
         const pool = try manager.addPool(pool_config);
         var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, pool_config);
         defer {
@@ -13799,7 +13943,7 @@ pub const Node = struct {
                 try std.math.add(
                     usize,
                     try std.math.mul(usize, try span_v2_executor.deviceScratchUpperBound(config, longest), span_v2_executor.classificationBatchItems(request, &request_plan, options)),
-                    if (backend == .cuda and (qualified_variant == .decide_deberta or qualified_variant == .decide_deberta_q8)) gliner_specialty.cuda_matmul_workspace_bytes else 0,
+                    if (backend == .cuda and qualified_variant == .decide_deberta and (session_factory.glinerCudaBf16Enabled(loaded.session) orelse true)) @import("../models/gliner25_bf16_policy.zig").workspace_bytes else if (backend == .cuda and (qualified_variant == .decide_deberta or qualified_variant == .decide_deberta_q8)) gliner_specialty.cuda_matmul_workspace_bytes else 0,
                 );
             const device_limits = try runtime.tier.memory.withAutomaticScratchFloor(
                 self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(if (gpu) .gpu else .cpu)),
@@ -16966,7 +17110,7 @@ pub const Node = struct {
     const NativeCheckpointTransfer = struct {
         metadata: []const u8,
         lease: ?*NativeCheckpointLease = null,
-        prepare: ?*generation.NativeCheckpointPrepare = null,
+        prepare: ?*decoder_checkpoint.PrepareRequest = null,
         resume_request: ?*generation.NativeCheckpointResume = null,
         reader: ?*httpx.Context.RequestBodyReader = null,
         checkpoint_bytes: usize = 0,
@@ -17005,7 +17149,7 @@ pub const Node = struct {
         if (metadata.len > 2 * 1024 * 1024) return nativeCheckpointErrorResponse(ctx, error.NativeKvFrameLimit);
         const encoding = runtime.kv.attention_match_checkpoint.Encoding.parse(ctx.header("X-Antfly-KV-Encoding") orelse "f16") catch |err|
             return nativeCheckpointErrorResponse(ctx, err);
-        var prepare: generation.NativeCheckpointPrepare = .{ .encoding = encoding };
+        var prepare: decoder_checkpoint.PrepareRequest = .{ .encoding = encoding };
         defer prepare.deinit();
         var transfer: NativeCheckpointTransfer = .{ .metadata = metadata, .lease = &lease, .prepare = &prepare };
         return self.completeNativeOrOrdinaryGeneration(ctx, &transfer);
@@ -17041,7 +17185,7 @@ pub const Node = struct {
         return self.completeNativeOrOrdinaryGeneration(ctx, &transfer);
     }
 
-    fn nativeCheckpointResponse(ctx: *httpx.Context, request: *generation.NativeCheckpointPrepare, model: []const u8, execution: InferenceExecutionControl, completion: *?DeferredGenerationCompletion) !httpx.Response {
+    fn nativeCheckpointResponse(ctx: *httpx.Context, request: *decoder_checkpoint.PrepareRequest, model: []const u8, execution: InferenceExecutionControl, completion: *?DeferredGenerationCompletion) !httpx.Response {
         const result = if (request.result) |*result| result else return error.InvalidNativeCheckpointResult;
         const export_started_ns = embedTimingNowNs();
         const checkpoint = runtime.kv.attention_match_checkpoint;
@@ -17154,14 +17298,14 @@ pub const Node = struct {
         else
             (try ctx.body()) orelse
                 return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
-        // Single JSON parse per request: only bodies that can carry
-        // chat_template_kwargs (substring pre-gate, false positives harmless)
-        // are parsed as an untyped Value, which then doubles as the kwargs
-        // validator input and the typed-parse source. Malformed bodies fall
-        // back to the raw typed parse so their errors stay identical.
+        // Reuse the untyped value for template options and the typed request.
+        // Escaped keys also need the untyped parse before validation.
         var parsed_body_value: ?std.json.Parsed(std.json.Value) = null;
         defer if (parsed_body_value) |*owned| owned.deinit();
-        if (std.mem.indexOf(u8, request_json, "chat_template_kwargs") != null) {
+        if (std.mem.indexOf(u8, request_json, "chat_template_kwargs") != null or
+            std.mem.indexOf(u8, request_json, "reasoning_effort") != null or
+            std.mem.indexOfScalar(u8, request_json, '\\') != null)
+        {
             parsed_body_value = @import("antfly-json").parseValueLossless(ctx.allocator, request_json) catch null;
         }
         if (parsed_body_value) |owned| {
@@ -17172,11 +17316,11 @@ pub const Node = struct {
                 });
             }
         }
-        var parsed = if (parsed_body_value) |owned|
-            try std.json.parseFromValue(api.GenerateRequest, ctx.allocator, owned.value, .{ .ignore_unknown_fields = true })
+        var parsed = (if (parsed_body_value) |owned|
+            std.json.parseFromValue(api.GenerateRequest, ctx.allocator, owned.value, .{ .ignore_unknown_fields = true })
         else
-            parseGenerateBody(api.GenerateRequest, ctx.allocator, request_json) catch
-                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid generation request" });
+            parseGenerateBody(api.GenerateRequest, ctx.allocator, request_json)) catch
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid generation request" });
         defer parsed.deinit();
         const body = parsed.value;
         if (native_transfer) |transfer| {
@@ -17264,17 +17408,21 @@ pub const Node = struct {
         defer ctx.allocator.free(model_path);
         const manifest_started: ?i96 = if (admission_started != null) std.Io.Clock.awake.now(ctx.io).nanoseconds else null;
         // Reuse immutable warm metadata without parsing GGUF tokenizer arrays
-        // per request. Explicit eager CUDA lookup uses execution's backend and
-        // load-policy keys; cold and compiled requests retain artifact preflight.
-        const cached_manifest = if (body.backend == null)
-            self.model_manager.copyCachedGenerationManifestWithControl(ctx.allocator, model_path, self.bindModelSelection(model_path_selection, execution_control)) catch |err|
-                return modelLoadFailureResponse(ctx, err)
-        else if (body.backend == .cuda and body.mode == null and body.compiled_target == null)
-            self.model_manager.copyCachedGenerationManifestForBackendWithControl(ctx.allocator, model_path, .cuda, self.bindModelSelection(model_path_selection, execution_control)) catch |err|
-                return modelLoadFailureResponse(ctx, err)
-        else
-            null;
-        var admission_manifest = cached_manifest orelse self.loadBoundManifest(ctx.allocator, model_path, false, self.bindModelSelection(model_path_selection, execution_control)) catch |err|
+        // per request. Explicit placement uses execution's provider policy.
+        // Cold and explicitly compiled requests retain artifact preflight.
+        const manifest_control = self.bindModelSelection(model_path_selection, execution_control);
+        const cached_manifest = (if (body.backend) |backend| blk: {
+            if (body.mode != null or body.compiled_target != null) break :blk null;
+            const placement: backends_mod.BackendType = switch (backend) {
+                .native => .native,
+                .metal => .metal,
+                .cuda => .cuda,
+                else => break :blk null,
+            };
+            break :blk self.model_manager.copyCachedGenerationManifestForBackendWithControl(ctx.allocator, model_path, placement, manifest_control);
+        } else self.model_manager.copyCachedGenerationManifestWithControl(ctx.allocator, model_path, manifest_control)) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        var admission_manifest = cached_manifest orelse self.loadBoundManifest(ctx.allocator, model_path, false, manifest_control) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer admission_manifest.deinit();
         if (manifest_started) |started| {
@@ -17403,21 +17551,25 @@ pub const Node = struct {
 
         var tool_parser: ?tool_parser_mod.Parser = null;
         defer if (tool_parser) |*parser| parser.deinit();
+        var inkling_tools: std.ArrayList(tool_parser_mod.ToolDefinition) = .empty;
+        defer inkling_tools.deinit(ctx.allocator);
 
         if (body.tools) |tools| {
             if (tools.len > 0 and tool_parser_mod.toolCallsEnabled(parsed_tool_choice)) {
-                tool_parser = tool_parser_mod.loadParser(ctx.allocator, model_path) catch |err| switch (err) {
-                    error.UnknownToolCallFormat => return ctx.status(400).json(.{
-                        .@"error" = "INVALID_MODEL",
-                        .message = "model has an unsupported tool_call_format",
-                    }),
-                    else => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) }),
-                };
-                if (tool_parser == null) {
-                    return ctx.status(400).json(.{
-                        .@"error" = "INVALID_MODEL",
-                        .message = "model does not support tool calling",
-                    });
+                if (!admission_manifest.isInkling2()) {
+                    tool_parser = tool_parser_mod.loadParser(ctx.allocator, model_path) catch |err| switch (err) {
+                        error.UnknownToolCallFormat => return ctx.status(400).json(.{
+                            .@"error" = "INVALID_MODEL",
+                            .message = "model has an unsupported tool_call_format",
+                        }),
+                        else => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) }),
+                    };
+                    if (tool_parser == null) {
+                        return ctx.status(400).json(.{
+                            .@"error" = "INVALID_MODEL",
+                            .message = "model does not support tool calling",
+                        });
+                    }
                 }
 
                 var selected_tools = std.ArrayListUnmanaged(tool_parser_mod.ToolDefinition).empty;
@@ -17452,19 +17604,24 @@ pub const Node = struct {
                     });
                 }
 
-                const tools_prompt = try tool_parser.?.formatToolsPrompt(ctx.allocator, selected_tools.items);
-                defer ctx.allocator.free(tools_prompt);
+                if (admission_manifest.isInkling2()) {
+                    inkling_tools = selected_tools;
+                    selected_tools = .empty;
+                } else {
+                    const tools_prompt = try tool_parser.?.formatToolsPrompt(ctx.allocator, selected_tools.items);
+                    defer ctx.allocator.free(tools_prompt);
 
-                const prompt = if (forced_function) |forced|
-                    try std.fmt.allocPrint(ctx.allocator, "{s}\nYou MUST call the {s} function. Do not respond with text, only call the function.\n", .{
-                        tools_prompt,
-                        forced,
-                    })
-                else
-                    try ctx.allocator.dupe(u8, tools_prompt);
-                defer ctx.allocator.free(prompt);
+                    const prompt = if (forced_function) |forced|
+                        try std.fmt.allocPrint(ctx.allocator, "{s}\nYou MUST call the {s} function. Do not respond with text, only call the function.\n", .{
+                            tools_prompt,
+                            forced,
+                        })
+                    else
+                        try ctx.allocator.dupe(u8, tools_prompt);
+                    defer ctx.allocator.free(prompt);
 
-                try prependSystemPrompt(ctx.allocator, &messages, prompt);
+                    try prependSystemPrompt(ctx.allocator, &messages, prompt);
+                }
             }
         }
         if (executor_contract.batch.max_text_bytes_per_item) |limit| {
@@ -17485,9 +17642,11 @@ pub const Node = struct {
                 .message = "draft_model must not be empty",
             });
         }
+        const builtin_draft = admission_manifest.isInkling2() and requested_draft_model_name == null and
+            (body.speculation_policy != null or body.speculative_k != null);
         var speculation = parseGenerateSpeculationOptions(
-            requested_draft_model_name != null,
-            body.speculative_k,
+            requested_draft_model_name != null or builtin_draft,
+            if (builtin_draft) body.speculative_k orelse 7 else body.speculative_k,
             body.speculation_policy,
             body.speculation_calibration,
         ) catch |err| {
@@ -17507,7 +17666,7 @@ pub const Node = struct {
         var auto_draft_extra_units: usize = 0;
         if (native_transfer == null and requested_draft_model_name == null and
             speculation.policy == .auto and
-            gemma4MtpAutoDraftDiscoveryEnabled())
+            !admission_manifest.isInkling2() and gemma4MtpAutoDraftDiscoveryEnabled())
         {
             if (gemma4MtpAssistantSiblingPath(ctx.allocator, ctx.io, model_path)) |sibling| {
                 if (validateDiscoveredDraftDir(ctx.allocator, sibling)) {
@@ -17580,7 +17739,7 @@ pub const Node = struct {
                 .message = "cache_compaction_ratio is not supported by resident server generation",
             });
         }
-        if (requested_draft_model_name != null) self.metrics.incSpeculationRequested();
+        if (requested_draft_model_name != null or builtin_draft) self.metrics.incSpeculationRequested();
 
         const want_stream = body.stream orelse false;
         const include_stream_usage = want_stream and (if (body.stream_options) |options|
@@ -17612,7 +17771,7 @@ pub const Node = struct {
             .frequency_penalty = sampling.frequency_penalty,
             .presence_penalty = sampling.presence_penalty,
             .speculative_k = speculation.k,
-            .speculation_requested = generationSpeculationRequested(effective_draft_model_name, auto_draft_sibling),
+            .speculation_requested = builtin_draft or generationSpeculationRequested(effective_draft_model_name, auto_draft_sibling),
             .speculation_policy = speculation.policy,
             .speculation_calibration = speculation.calibration,
             .prefill_chunk_size = 0,
@@ -17788,6 +17947,68 @@ pub const Node = struct {
             .has_audio = owned_messages.decoded_audio.len > 0,
             .has_video = owned_messages.decoded_video.len > 0,
         }) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
+
+        if (comptime build_options.enable_metal) {
+            const inkling = @import("../architectures/inkling2_session_metal.zig");
+            if (inkling.Runtime.fromSession(model.session)) |resident| {
+                if (body.context_management != null or native_transfer != null or requested_draft_model_name != null or
+                    body.speculation_calibration != null or tool_parser != null or wants_logprobs or
+                    backend_selection.graph_mode_requested or backend_selection.compiled_partition_backend != null)
+                    return generationErrorResponse(ctx, error.UnsupportedInkling2Request);
+                const raw_effort = if (parsed_body_value) |owned| if (owned.value == .object) owned.value.object.get("reasoning_effort") else null else null;
+                const ChatOptions = @import("../architectures/inkling2_chat.zig").ChatOptions;
+                const effort = if (raw_effort) |value| ChatOptions.parseEffort(value) catch |err|
+                    return generationErrorResponse(ctx, err) else null;
+                var pipeline: inkling.ServingPipeline = .{
+                    .resident = resident,
+                    .session = model.session,
+                    .text = inkling.TextPipeline.init(ctx.allocator, model.getTokenizer(), execution_control, messages.items, config, executor_contract.batch.max_input_tokens_per_item, resident.model.text.model_max_length, .{
+                        .effort = effort,
+                        .tools = inkling_tools.items,
+                        .choice = parsed_tool_choice,
+                    }) catch |err| return generationErrorResponse(ctx, err),
+                };
+                defer pipeline.deinit();
+                const slot = model.generation_admission.acquire(execution_control, false, runtime.scheduler.generation_admission.Limits.forRequests(self.config.max_concurrent_requests, inkling.max_active_requests)) catch |err| {
+                    if (err == error.GenerationQueueFull) return modelResourceBusyResponse(ctx);
+                    return inferenceFailureResponse(ctx, err);
+                };
+                defer slot.release();
+                if (want_stream) return self.streamGenerate(ctx, body.model, &pipeline, null, messages.items, config, null, include_stream_usage, null, completion);
+                var result = pipeline.generate(messages.items, config) catch |err| return generationErrorResponse(ctx, err);
+                defer result.deinit();
+                return self.finishGenerate(ctx, body, result, config, null, null, null);
+            }
+        }
+
+        if (comptime build_options.enable_cuda) {
+            const inkling = @import("../architectures/inkling2_session.zig");
+            if (inkling.Runtime.fromSession(model.session)) |resident| {
+                if (body.context_management != null or native_transfer != null or requested_draft_model_name != null or
+                    body.speculation_calibration != null or tool_parser != null or wants_logprobs or
+                    backend_selection.graph_mode_requested or backend_selection.compiled_partition_backend != null)
+                    return generationErrorResponse(ctx, error.UnsupportedInkling2Request);
+                const raw_effort = if (parsed_body_value) |owned| if (owned.value == .object) owned.value.object.get("reasoning_effort") else null else null;
+                const effort = if (raw_effort) |value| inkling.ChatOptions.parseEffort(value) catch |err|
+                    return generationErrorResponse(ctx, err) else null;
+                var pipeline = inkling.Pipeline.initChat(ctx.allocator, resident, model.session, model.getTokenizer(), execution_control, messages.items, config, executor_contract.batch.max_input_tokens_per_item, .{
+                    .effort = effort,
+                    .tools = inkling_tools.items,
+                    .choice = parsed_tool_choice,
+                }) catch |err|
+                    return generationErrorResponse(ctx, err);
+                defer pipeline.deinit();
+                const slot = model.generation_admission.acquire(execution_control, pipeline.speculate, runtime.scheduler.generation_admission.Limits.forRequests(self.config.max_concurrent_requests, inkling.max_active_requests)) catch |err| {
+                    if (err == error.GenerationQueueFull) return modelResourceBusyResponse(ctx);
+                    return inferenceFailureResponse(ctx, err);
+                };
+                defer slot.release();
+                if (want_stream) return self.streamGenerate(ctx, body.model, &pipeline, null, messages.items, config, null, include_stream_usage, null, completion);
+                var result = pipeline.generate(messages.items, config) catch |err| return generationErrorResponse(ctx, err);
+                defer result.deinit();
+                return self.finishGenerate(ctx, body, result, config, null, null, null);
+            }
+        }
 
         const gpt_config = session_factory.getGptConfig(model.session) orelse {
             // The session is not a decoder at all, which in practice means the
@@ -17988,7 +18209,7 @@ pub const Node = struct {
                 });
             }
         }
-        const idle_prefill_ceiling = generation.nativeGenerationPrefillChunkCeiling(
+        const idle_prefill_ceiling = decoder_prefill.idleChunkCeiling(
             backend_kind,
             gpt_config,
             self.config.generation_batching.schedulerPolicy().max_idle_prefill_chunk_size,
@@ -18008,7 +18229,7 @@ pub const Node = struct {
         // Queued callers own neither scheduler work nor device KV/scratch.
         // Exclusive requests fence the shared backend's cache/graph lifetime.
         const queued_cached_tokens = if (config.prompt_cache_enabled and prompt_estimate != null and config.prompt_cache_key != null and !generateMessagesHaveMedia(effective_messages) and prompt_tokens <= prompt_estimate.?.encoded.ids.len)
-            model.prompt_prefix_cache.peekLongestPrefixForPool(config.prompt_cache_key.?, prompt_estimate.?.encoded.ids[0..prompt_tokens], prompt_tokens -| 16, generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced()))
+            model.prompt_prefix_cache.peekLongestPrefixForPool(config.prompt_cache_key.?, prompt_estimate.?.encoded.ids[0..prompt_tokens], prompt_tokens -| 16, decoder_storage.poolPlan(backend_kind, kv_dtype, &gpt_config, .{ .force_sliding_trim = decoder_storage.slidingTrimForced() }))
         else
             0;
         const generation_slot = model.generation_admission.acquireWithWork(
@@ -18273,7 +18494,7 @@ pub const Node = struct {
         var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
         const native_host_reservation: usize = if (native_transfer) |transfer|
             if (transfer.prepare) |request| blk: {
-                const plan = generation.NativeCheckpointPrepare.hostPlan(gpt_config, prompt_tokens, request.encoding) catch |err| return nativeCheckpointErrorResponse(ctx, err);
+                const plan = decoder_checkpoint.PrepareRequest.hostPlan(gpt_config, prompt_tokens, request.encoding) catch |err| return nativeCheckpointErrorResponse(ctx, err);
                 request.planned_fit_host_bytes = plan.fit_bytes;
                 request.planned_fit_workers = plan.workers;
                 std.log.info("native_checkpoint_host_plan source_tokens={d} source_bytes={d} head_workspace_bytes={d} fit_bytes={d} reservation_bytes={d} workers={d}", .{ prompt_tokens, plan.source_bytes, plan.head_workspace_bytes, plan.fit_bytes, plan.reservation_bytes, plan.workers });
@@ -18551,6 +18772,18 @@ pub const Node = struct {
         ) catch |err| return inferenceFailureResponse(ctx, err);
         defer admission_lease.release();
 
+        const embedding_pin = blk: {
+            if (backend_kind != .metal or !gpt_config.hasPle()) break :blk null;
+            while (true) {
+                try execution_control.check();
+                break :blk @import("../execution/architecture_session.zig").pinGenerationEmbeddingOutsideExecution(model.session, gpt_config) catch |err| {
+                    if (err == error.ResourceTemporarilyUnavailable and model.session.reclaimIdleForRunOutsideExecution()) continue;
+                    return inferenceFailureResponse(ctx, err);
+                };
+            }
+        };
+        defer if (embedding_pin) |pin| pin.release();
+
         // Exact Native host histories are an additive part of this SAME
         // primary. Prepare process-reclaiming state before either Model lane;
         // defers run after all state children and the real Model unlock, but
@@ -18598,7 +18831,7 @@ pub const Node = struct {
         var prepared_generation: ?*PreparedGeneration = null;
         if (comptime build_options.enable_cuda) if (admission_lease.resources) |*primary| {
             const publication_bytes = if (backend_kind == .cuda and !cooperative_cuda and draft_model_for_generation == null) generation.nativeCudaVisionPublicationBytes(ctx.allocator, model_path, gpt_config, effective_messages, @intCast(@max(config.max_tokens, 1)), 1) catch 0 else 0;
-            vision_publication = generation.prepareNativeVisionPublication(model.session, primary, publication_bytes, 1, budget_limits, execution_control) catch |err| return inferenceFailureResponse(ctx, err);
+            vision_publication = VisionPublication.prepareVisionPublication(model.session, primary, publication_bytes, 1, budget_limits, execution_control) catch |err| return inferenceFailureResponse(ctx, err);
             const upload_bytes = if (backend_kind == .cuda)
                 generation.nativeCudaPinnedPatchUploadBytesAtMost(ctx.allocator, model_path, gpt_config, effective_messages, @intCast(@max(config.max_tokens, 1)), PreparedGeneration.pinned_input_upload_capacity) catch 0
             else
@@ -18693,9 +18926,9 @@ pub const Node = struct {
         // and scheduler-batched ordinary generation keep their existing control.
         if (native_transfer != null) cb.execution_control = execution_control;
         var pool_config = if (native_transfer != null)
-            generation.attentionMatchCheckpointPoolConfig(kv_dtype, gpt_config)
+            decoder_storage.checkpointPool(kv_dtype, gpt_config)
         else
-            generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced());
+            decoder_storage.poolPlan(backend_kind, kv_dtype, &gpt_config, .{ .force_sliding_trim = decoder_storage.slidingTrimForced() });
 
         // The compiled runtime owns numerical KV. Outer request storage only
         // coordinates logical positions and must not allocate a second mirror.
@@ -18748,14 +18981,14 @@ pub const Node = struct {
                 pool_id = model.prompt_prefix_cache.pool_id.?;
                 prompt_cache = &model.prompt_prefix_cache;
             } else {
-                pool_id = kv_manager.addPool(generation.requestKvManagerPoolConfig(pool_config)) catch |err|
+                pool_id = kv_manager.addPool(decoder_storage.requestMetadataPool(pool_config)) catch |err|
                     return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
                 config.prompt_cache_enabled = false;
                 self.model_manager.cancelPromptCacheActivation(model, prompt_cache_config);
             }
         } else {
             config.prompt_cache_enabled = false;
-            pool_id = kv_manager.addPool(generation.requestKvManagerPoolConfig(pool_config)) catch |err|
+            pool_id = kv_manager.addPool(decoder_storage.requestMetadataPool(pool_config)) catch |err|
                 return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         }
 
@@ -18828,11 +19061,11 @@ pub const Node = struct {
         if (draft_cb != null) {
             if (draft_gpt_config) |draft_cfg| {
                 draft_kv_manager = runtime.kv.manager.KvManager.init(ctx.allocator);
-                const draft_pool_config = generation.kvPoolConfig(
+                const draft_pool_config = decoder_storage.poolPlan(
                     draft_backend_kind.?,
                     draft_kv_dtype.?,
-                    draft_cfg,
-                    generationKvSlidingTrimForced(),
+                    &draft_cfg,
+                    .{ .force_sliding_trim = decoder_storage.slidingTrimForced() },
                 );
                 const draft_pool_id = draft_kv_manager.?.addPool(draft_pool_config) catch |err|
                     return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
@@ -18989,6 +19222,11 @@ pub const Node = struct {
             );
         }
 
+        var cuda_profile = if (!isolated_generation and (owns_generation_lock or prepared_generation != null))
+            session_factory.GenerationCudaProfile.begin(model.session, &pipeline.cb)
+        else
+            null;
+        defer if (cuda_profile) |profile| profile.finish(model.session, false);
         const server_a4b_telemetry_before = serverA4bTelemetrySnapshot(&pipeline.cb);
         var telemetry_pending = true;
         defer if (telemetry_pending) logServerA4bTelemetry(&pipeline.cb, server_a4b_telemetry_before, body.model);
@@ -18999,6 +19237,10 @@ pub const Node = struct {
             return generationErrorResponse(ctx, err);
         };
         defer result.deinit();
+        if (cuda_profile) |profile| {
+            profile.finish(model.session, true);
+            cuda_profile = null;
+        }
         if (result.text.len > 0) model.generation_admission.noteFirstContent(generation_request_started_ns);
         if (native_transfer) |transfer| if (transfer.prepare) |prepare| {
             // The result owns only host arrays. Retire request GPU storage and
@@ -19064,7 +19306,7 @@ pub const Node = struct {
         var response_text = result.text;
         var tool_response_text: ?[]u8 = null;
         defer if (tool_response_text) |text| ctx.allocator.free(text);
-        const parsed_tool_calls = if (tool_parser) |parser| blk: {
+        const parsed_tool_calls: ?[]const tool_parser_mod.ToolCall = if (tool_parser) |parser| blk: {
             parser.reset();
             _ = parser.feed(result.text) catch |err|
                 return generationErrorResponse(ctx, err);
@@ -19074,7 +19316,7 @@ pub const Node = struct {
             if (response_text.len == 0) response_text = result.text;
             const calls = parser.toolCalls();
             break :blk if (calls.len > 0) calls else null;
-        } else null;
+        } else result.native_tool_calls;
 
         if (parsed_tool_calls == null and tool_parser != null and response_text.len == 0) {
             response_text = "No tool call was emitted.";
@@ -19094,9 +19336,9 @@ pub const Node = struct {
         return self.buildGenerateResponse(
             ctx,
             body.model,
-            response_text,
+            if (tool_parser != null and parsed_tool_calls != null) "" else response_text,
             result.reasoning_text,
-            if (parsed_tool_calls != null) "tool_calls" else result.finish_reason,
+            if (tool_parser != null and parsed_tool_calls != null) "tool_calls" else result.finish_reason,
             result.prompt_tokens,
             result.tokens_used,
             result.cached_prompt_tokens,
@@ -20572,6 +20814,45 @@ pub const Node = struct {
                     prompt_estimates[idx] = null;
                 };
 
+                if (InklingEagerRuntime.fromSession(model.session)) |resident| {
+                    for (group_indices.items) |idx| {
+                        pending[idx] = false;
+                        const item = body.requests[idx].body;
+                        const input = owned_messages[idx].messages;
+                        var grammar: ?[]u8 = null;
+                        defer if (grammar) |value| ctx.allocator.free(value);
+                        const cfg = generateConfigFromBody(ctx.allocator, item, &grammar) catch |err| {
+                            results[idx].@"error" = batchGenerationError(err);
+                            continue;
+                        };
+                        const slot = model.generation_admission.acquire(execution_control, false, runtime.scheduler.generation_admission.Limits.forRequests(self.config.max_concurrent_requests, resident.maxActiveRequests())) catch |err| {
+                            results[idx].@"error" = batchGenerationError(err);
+                            continue;
+                        };
+                        defer slot.release();
+                        var pipeline = resident.init(ctx.allocator, model, execution_control, input, cfg, executor_contract.batch.max_input_tokens_per_item) catch |err| {
+                            results[idx].@"error" = batchGenerationError(err);
+                            continue;
+                        };
+                        defer pipeline.deinit();
+                        execution_attempted[idx] = true;
+                        var result = pipeline.generate(input, cfg, null) catch |err| {
+                            results[idx].@"error" = batchGenerationError(err);
+                            continue;
+                        };
+                        defer result.deinit();
+                        results[idx].response = try buildGenerateResponseValue(
+                            response_alloc,
+                            item.model,
+                            result.text,
+                            result.reasoning_text,
+                            result.finish_reason,
+                            result.prompt_tokens,
+                            result.tokens_used,
+                        );
+                    }
+                    continue;
+                }
                 const gpt_config = session_factory.getGptConfig(model.session) orelse {
                     for (group_indices.items) |idx| {
                         results[idx].@"error" = .{ .code = "INVALID_MODEL", .message = "model does not support native generation", .retryable = false };
@@ -20628,7 +20909,7 @@ pub const Node = struct {
                     continue;
                 };
                 defer batch_generation_slot.release();
-                const idle_prefill_ceiling = generation.nativeGenerationPrefillChunkCeiling(
+                const idle_prefill_ceiling = decoder_prefill.idleChunkCeiling(
                     backend_kind,
                     gpt_config,
                     self.config.generation_batching.schedulerPolicy().max_idle_prefill_chunk_size,
@@ -21035,8 +21316,8 @@ pub const Node = struct {
 
                 var kv_manager = runtime.kv.manager.KvManager.init(ctx.allocator);
                 defer kv_manager.deinit();
-                const kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced());
-                const pool_id = kv_manager.addPool(generation.requestKvManagerPoolConfig(kv_pool_config)) catch |err| {
+                const kv_pool_config = decoder_storage.poolPlan(backend_kind, kv_dtype, &gpt_config, .{ .force_sliding_trim = decoder_storage.slidingTrimForced() });
+                const pool_id = kv_manager.addPool(decoder_storage.requestMetadataPool(kv_pool_config)) catch |err| {
                     for (group_indices.items) |idx| {
                         if (!pending[idx]) continue;
                         results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err), .retryable = true };
@@ -21662,7 +21943,7 @@ pub const Node = struct {
                         .function = .{ .name = call.function.name, .arguments = call.function.arguments },
                     };
                 }
-                message.content = .null_value;
+                if (response_text.len == 0) message.content = .null_value;
                 message.tool_calls = api_calls;
             }
         }
@@ -21810,6 +22091,9 @@ pub const Node = struct {
         defer ctx.allocator.free(stream_id);
         const stream_created = completionCreatedTimestamp();
 
+        const Pipeline = @TypeOf(pipeline.*);
+        const can_write_keepalive = @hasDecl(Pipeline, "serial_stream_checkpoints") and Pipeline.serial_stream_checkpoints;
+
         // Context for the token callback — carries the writer and model name for building SSE events
         const StreamCtx = struct {
             writer: *httpx.Context.StreamWriter,
@@ -21825,6 +22109,7 @@ pub const Node = struct {
             first_content_recorded: bool = false,
             write_error: ?anyerror = null,
             parser_failed: bool = false,
+            last_write_ns: u128 = 0,
 
             fn noteContent(stream: *@This()) void {
                 if (stream.first_content_recorded) return;
@@ -21832,11 +22117,33 @@ pub const Node = struct {
                 stream.first_content_recorded = true;
             }
 
+            fn noteWrite(stream: *@This()) void {
+                if (comptime can_write_keepalive) stream.last_write_ns = embedTimingNowNs();
+            }
+
             fn shouldContinue(raw_ctx: *anyopaque) bool {
                 const stream: *@This() = @ptrCast(@alignCast(raw_ctx));
-                return stream.write_error == null and
-                    !stream.parser_failed and
-                    !stream.request_context.isCancellationRequested();
+                if (stream.write_error != null or stream.parser_failed or stream.request_context.isCancellationRequested())
+                    return false;
+                // Only a serial pipeline may write from its continuation callback.
+                // SSE comments keep the connection active without publishing a token.
+                if (comptime can_write_keepalive) {
+                    writeGenerationKeepaliveIfIdle(stream.writer, &stream.last_write_ns, embedTimingNowNs()) catch |err| {
+                        stream.write_error = err;
+                        return false;
+                    };
+                }
+                return true;
+            }
+
+            fn onReasoning(raw_ctx: *anyopaque, token_text: []const u8) bool {
+                const stream: *@This() = @ptrCast(@alignCast(raw_ctx));
+                emitReasoningDelta(stream.writer, stream.payload, stream.stream_id, stream.stream_created, stream.model_name, token_text) catch |err| {
+                    stream.write_error = err;
+                    return false;
+                };
+                stream.noteWrite();
+                return true;
             }
 
             fn onToken(raw_ctx: *anyopaque, token_text: []const u8) bool {
@@ -21856,6 +22163,7 @@ pub const Node = struct {
                             stream.write_error = err;
                             return false;
                         };
+                        stream.noteWrite();
                         stream.noteContent();
                     }
                     if (!parser.streamsIncrementalToolDeltas() and update.new_calls.len > 0) {
@@ -21864,6 +22172,7 @@ pub const Node = struct {
                                 stream.write_error = err;
                                 return false;
                             };
+                            stream.noteWrite();
                         }
                     }
                     if (update.active_tool_delta) |delta| {
@@ -21871,6 +22180,7 @@ pub const Node = struct {
                             stream.write_error = err;
                             return false;
                         };
+                        stream.noteWrite();
                     }
                     return true;
                 }
@@ -21879,6 +22189,7 @@ pub const Node = struct {
                     stream.write_error = err;
                     return false;
                 };
+                stream.noteWrite();
                 if (token_text.len > 0) stream.noteContent();
                 return true;
             }
@@ -21906,6 +22217,12 @@ pub const Node = struct {
             pipeline.continue_fn = StreamCtx.shouldContinue;
         }
 
+        const streams_reasoning = comptime @hasField(@TypeOf(pipeline.*), "reasoning_callback");
+        if (streams_reasoning) {
+            pipeline.reasoning_ctx = @ptrCast(&stream_ctx);
+            pipeline.reasoning_callback = StreamCtx.onReasoning;
+        }
+
         if (context_diagnostics) |diagnostics| {
             writeGenerateChunkEvent(&writer, &chunk_payload, .{
                 .id = stream_id,
@@ -21926,6 +22243,7 @@ pub const Node = struct {
             writer.close() catch {};
             return ctx.response.build();
         };
+        stream_ctx.noteWrite();
 
         // Snapshot CUDA op-profile counters before generation so the emitted
         // line below reflects this request alone. Mirrors the direct-generator
@@ -22024,7 +22342,7 @@ pub const Node = struct {
             if (result.text.len > 0) stream_ctx.noteContent();
         } else {
             if (result.reasoning_text) |reasoning| {
-                if (reasoning.len > 0) emitReasoningDelta(
+                if (reasoning.len > 0 and !streams_reasoning) emitReasoningDelta(
                     &writer,
                     &chunk_payload,
                     stream_id,
@@ -22044,6 +22362,15 @@ pub const Node = struct {
                     return ctx.response.build();
                 };
             } else {
+                if (result.native_tool_calls) |calls| {
+                    for (calls, 0..) |call, index| {
+                        emitToolCallDelta(&writer, &chunk_payload, stream_id, stream_created, model_name, index, call) catch |err| {
+                            writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
+                            writer.close() catch {};
+                            return ctx.response.build();
+                        };
+                    }
+                }
                 emitFinishDelta(&writer, &chunk_payload, stream_id, stream_created, model_name, result.finish_reason, speculative) catch |err| {
                     writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
                     writer.close() catch {};
@@ -23839,6 +24166,7 @@ pub const Node = struct {
             try validateInferenceExecutorInvocation(contract, .{ .item_count = 1, .media_parts_per_item = 1, .has_audio = true, .encoded_media_bytes = bytes.len });
             var result = try self.recognizePcmFromPath(a, model_path, .{ .url = "", .language = options.language, .timestamps = options.timestamps, .diarization = options.diarization }, .{ .samples = decoded.samples, .sample_rate = decoded.sample_rate }, control, audio_admission.max_decode_working_bytes, null, .{ .split_estimated_words = false });
             defer result.deinit();
+            logWhisperTiming("read", model_path, &result);
             metadata.language = options.language orelse result.language;
             metadata.language_source = if (options.language != null) .forced else if (result.language != null) .detected else .unknown;
             var unresolved_speaker = false;
@@ -25328,19 +25656,7 @@ pub const Node = struct {
         };
         defer transcript.deinit();
         transcript.requireComplete() catch |err| return documentFailureResponse(ctx, err);
-        if (serverGenerateTimingEnabled()) {
-            const t = transcript.timing;
-            std.log.info("dictate timing model={s} audio_ms={d} mel_ms={d} encoder_ms={d} prefill_ms={d} decode_ms={d} decode_steps={d} kv_cached={}", .{
-                model_name,
-                transcript.duration_ms,
-                t.mel_ns / std.time.ns_per_ms,
-                t.encoder_ns / std.time.ns_per_ms,
-                t.prefill_ns / std.time.ns_per_ms,
-                t.decode_ns / std.time.ns_per_ms,
-                t.decode_steps,
-                t.kv_cached,
-            });
-        }
+        logWhisperTiming("dictate", model_name, &transcript);
 
         const dictation_id = try allocDictationId(ctx.allocator);
         defer ctx.allocator.free(dictation_id);
@@ -28094,7 +28410,7 @@ pub const Node = struct {
         try control.check();
         const dtype = if (body.cache_dtype) |name| runtime.kv.pool.parseKvDType(name) orelse return ctx.status(422).json(.{ .@"error" = "PLACEMENT_UNAVAILABLE" }) else session_factory.recommendedKvDTypeForSession(model.session, .cuda);
         const cached = if (self.config.prompt_cache.enabled and (body.prompt_cache orelse true) and body.prompt_cache_key != null and body.prompt_cache_key.?.len > 0)
-            model.prompt_prefix_cache.peekLongestPrefixForPool(body.prompt_cache_key.?, estimate.?.encoded.ids[0..tokens], tokens -| 16, generation.kvPoolConfig(.cuda, dtype, cfg, generationKvSlidingTrimForced()))
+            model.prompt_prefix_cache.peekLongestPrefixForPool(body.prompt_cache_key.?, estimate.?.encoded.ids[0..tokens], tokens -| 16, decoder_storage.poolPlan(.cuda, dtype, &cfg, .{ .force_sliding_trim = decoder_storage.slidingTrimForced() }))
         else
             0;
         const admission = model.generation_admission.snapshot();
@@ -28682,7 +28998,7 @@ pub const Node = struct {
 
                 const capabilities = listing.manifest.capabilities;
                 const gliner_model_type = listing.manifest.gliner_model_type;
-                const inputs = listing.manifest.inputs;
+                const inputs = model_caps.modelInputs(&listing.manifest);
                 const has_visual = listing.manifest.visual_model_path != null or listing.manifest.visual_projection_path != null;
                 const has_audio = listing.manifest.audio_model_path != null or listing.manifest.audio_projection_path != null;
                 if (!manifestMatchesModelListingTask(task, listing.kind, &listing.manifest)) continue;
@@ -28784,7 +29100,7 @@ pub const Node = struct {
                     model_task,
                     model.manifest.gliner_model_type,
                     model.manifest.capabilities,
-                    model.manifest.inputs,
+                    model_caps.modelInputs(&model.manifest),
                     manifestSupportsZeroShotClassification(&model.manifest),
                     model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
                     model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
@@ -29256,6 +29572,19 @@ pub const Node = struct {
         try appendPromMetric(&writer.writer, "antfly_inference_generation_started_total", "counter", "Generation execution slots acquired", generation_stats.started);
         try appendPromMetric(&writer.writer, "antfly_inference_generation_queue_rejected_total", "counter", "Requests rejected by the bounded generation queue", generation_stats.rejected);
         try appendPromMetric(&writer.writer, "antfly_inference_generation_queue_cancelled_total", "counter", "Cancelled or expired generation waiters removed from the queue", generation_stats.cancelled);
+        if (comptime build_options.enable_cuda) {
+            const inkling = @import("../architectures/inkling2_session.zig");
+            var paired_steps: u64 = 0;
+            var batched_tokens: u64 = 0;
+            for (loaded_snapshot.handles) |handle| {
+                if (inkling.Runtime.fromSession(handle.get().session)) |model| {
+                    paired_steps +|= model.pairedDecodeSteps();
+                    batched_tokens +|= model.batchedDecodeTokens();
+                }
+            }
+            try appendPromMetric(&writer.writer, "antfly_inference_inkling_paired_decode_steps_total", "counter", "Inkling CUDA decode steps that share a routed feed-forward batch across two sequences", paired_steps);
+            try appendPromMetric(&writer.writer, "antfly_inference_inkling_batched_decode_tokens_total", "counter", "Inkling CUDA tokens decoded in a shared routed feed-forward batch", batched_tokens);
+        }
         try generation_stats.queue_wait.render(&writer.writer, "antfly_inference_generation_queue_wait_seconds", "Time waiting for a generation slot before device-memory admission");
         try generation_stats.first_content.render(&writer.writer, "antfly_inference_generation_first_content_seconds", "Server-observed first public content availability including queue and prefill; excludes network transit");
         try generation_stats.prefill.render(&writer.writer, "antfly_inference_generation_prefill_seconds", "Pipeline prefill elapsed time including cooperative scheduling waits");
@@ -30283,16 +30612,21 @@ test "gliner boundary microbatch capacity rejoins the caller with its original b
         \\{"schema_version":2,"model":"m","schema":{"entities":["person"]},"inputs":[{"content":"Ada"}]}
     , .{});
     defer request.deinit();
-    // Request an output reservation larger than the host budget, including
-    // its owner overhead. A smaller scratch limit can refuse the second heap
-    // first. Neither case reaches a model or turns a serial request into 507.
-    for ([_]usize{ 0, 256 * 1024 * 1024 }) |scratch_limit| {
+    // Exercise broker-heap refusal, output scratch pressure, and a
+    // response reservation whose owner takes it over the host budget.
+    const working_bytes = 16 * 1024;
+    const host_limit = 4 * working_bytes;
+    const cases = [_]struct { scratch: usize, response: usize }{
+        .{ .scratch = working_bytes, .response = 1 },
+        .{ .scratch = 2 * working_bytes, .response = 1 },
+        .{ .scratch = 8 * working_bytes, .response = host_limit },
+    };
+    for (cases) |case| {
         var node = try Node.init(a, .{
-            .generation_budget_overrides = .{ .scratch_limit_bytes = scratch_limit },
+            .generation_budget_overrides = .{ .scratch_limit_bytes = case.scratch, .host_limit_bytes = host_limit },
         });
         defer node.deinit();
         const limits = node.config.generation_budget_overrides.apply(node.defaultGenerationLimits(.cpu));
-        const working_bytes = @min(512 * 1024 * 1024, @min(limits.host_limit_bytes, limits.scratch_limit_bytes));
         var caller = try node.model_manager.acquireRunResourceAmounts(.cpu, limits, .{ .host_scratch_bytes = working_bytes });
         defer caller.release();
         const before = node.model_manager.currentAdmissionAmounts();
@@ -30300,7 +30634,7 @@ test "gliner boundary microbatch capacity rejoins the caller with its original b
         const ticket = Node.BoundaryRequestTicket{
             .model = undefined,
             .request = &request,
-            .options = .{ .max_response_bytes = limits.host_limit_bytes },
+            .options = .{ .max_response_bytes = case.response },
             .working_bytes = working_bytes,
         };
         var output: Node.BoundaryReply = undefined;
@@ -32644,6 +32978,7 @@ pub const ResolvedExecutorBatchImplementation = struct {
 /// loops cannot accidentally advertise native batching.
 pub const ResolvedExecutorKind = enum {
     native_generation,
+    inkling2_generation,
     compatibility,
     /// Ordered groups are executed serially, with one vector per group.
     grouped_dense_embedding,
@@ -32736,6 +33071,8 @@ pub fn resolvedExecutorKind(
     resolved_task: []const u8,
     manifest: *const manifest_mod.ModelManifest,
 ) ResolvedExecutorKind {
+    if (std.mem.eql(u8, resolved_task, "generate") and manifest.isInkling2())
+        return .inkling2_generation;
     if (std.mem.eql(u8, resolved_task, "generate") and
         (manifest.usesGgufWeights() or manifest.isQwen3VlGenerationSafetensorsBundle()) and
         !std.mem.eql(u8, manifest.config_model_arch, "moondream1")) return .native_generation;
@@ -32825,7 +33162,10 @@ pub fn resolvedExecutorBatchImplementation(
         .preferred_items = preferred_items,
         .max_items = max_items,
         .per_item_failures = std.mem.eql(u8, resolved_task, "generate") or executor_kind == .grouped_dense_embedding,
-        .max_media_parts_per_item = if (executor_kind == .grouped_dense_embedding) 64 else null,
+        .max_media_parts_per_item = switch (executor_kind) {
+            .grouped_dense_embedding => 64,
+            else => null,
+        },
     };
 }
 
@@ -33159,7 +33499,7 @@ fn resolvedInferenceExecutorContract(
             manifest_video,
         );
     }
-    const max_images = if (modalities.image) executorMaxImages(resolved_task) else 0;
+    const max_images: usize = if (modalities.image) executorMaxImages(resolved_task) else 0;
     var implementation = resolvedExecutorBatchImplementation(resolved_task, executor_kind);
     const cuda_decide_batch = build_options.enable_cuda and node.session_manager.required_backend == .cuda;
     const metal_decide_batch = build_options.enable_metal and node.session_manager.required_backend == .metal;
@@ -34655,7 +34995,7 @@ test "native checkpoint terminal callbacks observe retired owners and can acquir
         gate: *std.atomic.Value(bool),
         controller: *runtime.tier.memory.AdmissionController,
         old_lease: *Node.NativeCheckpointLease,
-        prepare: *generation.NativeCheckpointPrepare,
+        prepare: *decoder_checkpoint.PrepareRequest,
         resume_request: *generation.NativeCheckpointResume,
         next: ?Node.NativeCheckpointLease = null,
         writes: usize = 0,
@@ -34694,7 +35034,7 @@ test "native checkpoint terminal callbacks observe retired owners and can acquir
         var gate: std.atomic.Value(bool) = .init(false);
         var lease = Node.NativeCheckpointLease.acquire(&gate) orelse return error.TestUnexpectedResult;
         defer lease.release();
-        var prepare: generation.NativeCheckpointPrepare = .{};
+        var prepare: decoder_checkpoint.PrepareRequest = .{};
         defer prepare.deinit();
         var resumed: generation.NativeCheckpointResume = .{};
         defer resumed.deinit();
@@ -35023,19 +35363,19 @@ test "generate draft resources follow the draft backend" {
 }
 
 test "generate draft KV pool uses safe model geometry" {
-    const mha = generation.kvPoolConfig(.native, .f16, .{
+    const mha = decoder_storage.poolPlan(.native, .f16, &.{
         .hidden_size = 1024,
         .num_hidden_layers = 2,
         .num_attention_heads = 8,
         .num_key_value_heads = 0,
         .position_encoding = .rope,
         .max_position_embeddings = 4096,
-    }, false);
+    }, .{});
     try std.testing.expectEqual(@as(u32, 8), mha.num_kv_heads);
     try std.testing.expectEqual(@as(u32, 128), mha.head_dim);
     try std.testing.expectEqual(@as(?u32, 4096), mha.sliding_window_size);
 
-    const gemma4 = generation.kvPoolConfig(.metal, .bf16, .{
+    const gemma4 = decoder_storage.poolPlan(.metal, .bf16, &.{
         .family = .gemma,
         .hidden_size = 512,
         .num_hidden_layers = 2,
@@ -35046,7 +35386,7 @@ test "generate draft KV pool uses safe model geometry" {
         .global_head_dim = 512,
         .position_encoding = .rope,
         .sliding_window = 1024,
-    }, false);
+    }, .{});
     try std.testing.expectEqual(@as(u32, 8), gemma4.num_kv_heads);
     try std.testing.expectEqual(@as(u32, 512), gemma4.head_dim);
     try std.testing.expectEqual(@as(?u32, 1024), gemma4.sliding_window_size);
@@ -35063,11 +35403,11 @@ test "generate draft KV pool uses safe model geometry" {
     };
     try std.testing.expectEqual(
         @as(?u32, null),
-        generation.kvPoolConfig(.metal, .bf16, mixed_gemma4_config, false).sliding_window_size,
+        decoder_storage.poolPlan(.metal, .bf16, &mixed_gemma4_config, .{}).sliding_window_size,
     );
     try std.testing.expectEqual(
         @as(?u32, 1024),
-        generation.kvPoolConfig(.metal, .bf16, mixed_gemma4_config, true).sliding_window_size,
+        decoder_storage.poolPlan(.metal, .bf16, &mixed_gemma4_config, .{ .force_sliding_trim = true }).sliding_window_size,
     );
 }
 
@@ -36627,6 +36967,26 @@ test "accepted multimodal routes reject tiny high-pixel batches before model loa
         node.embedDenseJsonInputDirect(allocator, "owner/embed", parsed_input.value),
     );
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+}
+
+test "Inkling generation admits ordered images under shared generation limits" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{});
+    defer node.deinit();
+    var inputs = [_][]const u8{ "text", "image" };
+    const manifest: manifest_mod.ModelManifest = .{
+        .allocator = a,
+        .config_model_arch = @import("../architectures/inkling2_checkpoint.zig").architecture,
+        .inputs = &inputs,
+    };
+    const contract = try resolvedGenerateExecutorContract(&node, &manifest);
+    try std.testing.expectEqual(max_generate_media_parts_per_item, contract.batch.max_media_parts_per_item);
+    try std.testing.expectEqual(requestMediaMaxDecodedPixels(&node, executorMaxImages("generate")), contract.batch.max_decoded_pixels.?);
+    try validateGenerateExecutorInvocation(contract, .{ .has_image = true, .media_parts_per_item = 2 });
+    try std.testing.expectError(error.InferenceMediaPartLimitExceeded, validateGenerateExecutorInvocation(contract, .{
+        .has_image = true,
+        .media_parts_per_item = max_generate_media_parts_per_item + 1,
+    }));
 }
 
 test "generate HTTP enforces resolved manifest media limits before model loading" {
@@ -45967,6 +46327,13 @@ fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
         .retryable = true,
     };
     return switch (err) {
+        error.InvalidInkling2Effort => .{ .status = 400, .code = "INVALID_REQUEST", .message = "reasoning_effort must be a supported effort name or a number between 0 and 0.99", .retryable = false },
+        error.InvalidInkling2ToolHistory => .{ .status = 400, .code = "INVALID_REQUEST", .message = "invalid Inkling 2 tool definition or tool message history", .retryable = false },
+        error.InvalidInkling2ToolOutput => .{ .status = 422, .code = "INVALID_TOOL_OUTPUT", .message = "Inkling 2 did not emit a complete call to a declared tool", .retryable = false },
+        error.UnsupportedInkling2Request => .{ .status = 400, .code = "UNSUPPORTED_FEATURE", .message = "Inkling 2 does not support the requested generation option", .retryable = false },
+        error.UnsupportedInkling2Speculation => .{ .status = 400, .code = "UNSUPPORTED_FEATURE", .message = "Inkling 2 speculation requires mtp.safetensors, greedy decoding and speculative_k between 1 and 7", .retryable = false },
+        error.InvalidInkling2Context, error.InferenceInputTokensExceeded => .{ .status = 400, .code = "INPUT_TOKENS_EXCEEDED", .message = "the generation request exceeds the input or model context limit", .retryable = false },
+        error.InvalidInkling2Image => .{ .status = 400, .code = "INVALID_MEDIA_LAYOUT", .message = "Inkling 2 accepts valid user and tool images up to 4096 pixels per side", .retryable = false },
         error.UnsupportedVideoBackend => .{ .status = 400, .code = "UNSUPPORTED_VIDEO_BACKEND", .message = "video input requires a Gemma 4 generator with its projector", .retryable = false },
         error.UnsupportedMixedVideoInput => .{ .status = 400, .code = "INVALID_MEDIA_LAYOUT", .message = "a request with video cannot also contain image or audio parts", .retryable = false },
         error.VideoLimitExceeded => .{ .status = 400, .code = "INVALID_MEDIA_LAYOUT", .message = "generation request may contain one video", .retryable = false },
@@ -47391,6 +47758,12 @@ test "Decide extraction v2 serves classifications through HTTP handler" {
     const model_path = platform.env.getenv("ANTFLY_GLINER_DECIDE_MODEL") orelse return error.SkipZigTest;
     const model_name = std.fs.path.basename(model_path);
     const models_dir = std.fs.path.dirname(model_path) orelse return error.InvalidDecisionTestModelPath;
+    const backend_name = platform.env.getenv("ANTFLY_GLINER_DECIDE_BACKEND") orelse "native";
+    const backend = std.meta.stringToEnum(backends_mod.BackendType, backend_name) orelse return error.InvalidDecisionTestBackend;
+    switch (backend) {
+        .native, .metal, .cuda => {},
+        else => return error.InvalidDecisionTestBackend,
+    }
     const a = std.testing.allocator;
     var node = try Node.init(a, .{
         .models_dir = models_dir,
@@ -47398,16 +47771,14 @@ test "Decide extraction v2 serves classifications through HTTP handler" {
         .max_concurrent_requests = 1,
         .process_termination_available = true,
         .generation_budget_overrides = .{
-            .host_limit_bytes = 6 * 1024 * 1024 * 1024,
+            // Use the runtime's host and unified limits for this serving fixture.
+            // Construction and the already-admitted loader state share that budget.
             .backend_limit_bytes = 12 * 1024 * 1024 * 1024,
-            .combined_limit_bytes = 18 * 1024 * 1024 * 1024,
             .scratch_limit_bytes = 8 * 1024 * 1024 * 1024,
         },
     });
     defer node.deinit();
     try node.attachIo(std.testing.io);
-    const backend_name = platform.env.getenv("ANTFLY_GLINER_DECIDE_BACKEND") orelse "native";
-    const backend: backends_mod.BackendType = if (std.mem.eql(u8, backend_name, "cuda")) .cuda else if (std.mem.eql(u8, backend_name, "native")) .native else return error.InvalidDecisionTestBackend;
     node.session_manager.required_backend = backend;
     node.model_manager.session_manager.required_backend = backend;
     const body = try std.fmt.allocPrint(
@@ -47423,7 +47794,11 @@ test "Decide extraction v2 serves classifications through HTTP handler" {
     defer ctx.deinit();
     var response = try node.extractJSON(&ctx);
     defer response.deinit();
-    errdefer std.debug.print("Decide HTTP response: status={d} body={s}\n", .{ response.status.code, response.body orelse "<absent>" });
+    errdefer {
+        std.debug.print("Decide HTTP response: status={d} body={s}\n", .{ response.status.code, response.body orelse "<absent>" });
+        const admission = node.model_manager.memoryAdmissionDiagnostic();
+        std.debug.print("Decide admission: {any}\n", .{admission});
+    }
     try std.testing.expectEqual(@as(u16, 200), response.status.code);
     var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body orelse return error.MissingResponseBody, .{});
     defer parsed.deinit();
@@ -48340,6 +48715,38 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
         const previous_models_root = node.config.models_dir;
         node.config.models_dir = std.fs.path.dirname(model_dir) orelse ".";
         defer node.config.models_dir = previous_models_root;
+        const WorkspaceEvidence = struct {
+            owner: u64 = 0,
+            completed: ?@import("../execution/runtime_observation.zig").CudaDecoderWorkspace = null,
+            fn collect(self: *@This(), record: @import("../execution/diagnostic_export.zig").Record) void {
+                if (record.owner != self.owner) return;
+                const report = record.snapshot.report orelse return;
+                if (report.cuda_decoder_workspace) |workspace| switch (workspace.route) {
+                    .recorded_and_launched, .replayed => self.completed = workspace,
+                    .warmed, .learned, .learning_declined => {},
+                };
+            }
+        };
+        const verify_workspace = platform.env.getenvBool("ANTFLY_TEST_LIGHTONOCR3_CUDA_WORKSPACE_REPORT");
+        const diagnostics_export = @import("../execution/diagnostic_export.zig");
+        var workspace_evidence: WorkspaceEvidence = .{};
+        var observed_model = if (verify_workspace)
+            node.model_manager.acquireLoadedModel(model_dir) orelse return error.ModelNotFound
+        else
+            null;
+        defer if (observed_model) |*model| model.release();
+        if (observed_model) |*model| {
+            const session = model.get().session;
+            try std.testing.expect(session.backend() == .cuda);
+            try std.testing.expect(session.configureExecutionDiagnostics(true));
+            const binding = session.invocation_diagnostics orelse return error.TestUnexpectedResult;
+            binding.diagnostics.configureExport();
+            workspace_evidence.owner = binding.diagnostics.export_owner;
+        }
+        defer if (observed_model) |*model| {
+            _ = model.get().session.configureExecutionDiagnostics(false);
+            diagnostics_export.drain(WorkspaceEvidence.collect, &workspace_evidence);
+        };
         const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(fixture.len));
         defer allocator.free(encoded);
         _ = std.base64.standard.Encoder.encode(encoded, fixture);
@@ -48362,9 +48769,38 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
         const objects = decoded.value.object.get("data").?.array.items;
         try std.testing.expectEqual(@as(usize, 2), objects.len);
         for (objects) |object| try std.testing.expectEqualStrings(result.items[0].text, object.object.get("text").?.string);
-        if (platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_BATCH", true) and effectiveLightOnReadRows() > 1 and effectiveLightOnReadWindow() > 1) {
-            const execution = decoded.value.object.get("execution").?.object;
+        const routed_backend = backend: {
+            var loaded = node.model_manager.acquireLoadedModel(model_dir) orelse return error.ModelNotFound;
+            defer loaded.release();
+            break :backend loaded.get().session.backend();
+        };
+        const execution = decoded.value.object.get("execution").?.object;
+        if (routed_backend == .native) {
+            try std.testing.expectEqual(@as(i64, 0), execution.get("native_items").?.integer);
+            try std.testing.expectEqual(@as(i64, 2), execution.get("serial_items").?.integer);
+        } else if (platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_BATCH", true) and effectiveLightOnReadRows() > 1 and effectiveLightOnReadWindow() > 1) {
             try std.testing.expectEqual(@as(i64, 2), execution.get("native_items").?.integer);
+        }
+        if (verify_workspace) {
+            diagnostics_export.drain(WorkspaceEvidence.collect, &workspace_evidence);
+            const report = workspace_evidence.completed orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(usize, 2), report.rows);
+            try std.testing.expectEqual(report.rows, report.head_packet_rows);
+            try std.testing.expectEqual(@as(usize, 0), report.head_bytes);
+            const fused_head = platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_FUSED_HEAD");
+            const shared_head = !fused_head and platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_SHARE_HEAD_ARENA");
+            try std.testing.expectEqual(!fused_head and !shared_head, report.head_in_stream_arena);
+            try std.testing.expectEqual(shared_head, report.shared_head_scratch_bytes != 0);
+            try std.testing.expectEqual(fused_head, report.fused_head_scratch_bytes != 0);
+            // At two rows the position plane starts on the first 16-byte boundary.
+            try std.testing.expectEqual(@as(usize, 44), report.readback_bytes);
+            try std.testing.expectEqual(report.planned_scratch_bytes, report.bound_scratch_bytes);
+            try std.testing.expect(report.planned_events != 0 and report.metadata_bytes != 0 and report.attention_scratch_bytes != 0);
+            if (platform.env.getenvBool("ANTFLY_TEST_LIGHTONOCR3_CUDA_UNFUSED_RECURRENT"))
+                try std.testing.expect(report.recurrent_scratch_bytes != 0);
+            const shared_bytes = @max(report.attention_scratch_bytes, report.recurrent_scratch_bytes, report.fused_head_scratch_bytes, report.shared_head_scratch_bytes);
+            try std.testing.expectEqual(shared_bytes, report.shared_layer_workspace_bytes);
+            std.debug.print("LIGHTONOCR3 observed_cuda_workspace rows={d} readback_bytes={d} backing={s} route={s} attention_scratch_bytes={d} recurrent_scratch_bytes={d} shared_layer_workspace_bytes={d}\n", .{ report.rows, report.readback_bytes, @tagName(report.readback_backing), @tagName(report.route), report.attention_scratch_bytes, report.recurrent_scratch_bytes, report.shared_layer_workspace_bytes });
         }
         std.debug.print("LIGHTONOCR3 http_batch_pages=2 parity=true\n", .{});
     }
@@ -51573,7 +52009,6 @@ test "LightOnOCR3 CUDA sixteen prefix admission keeps all per page state and res
 
 const readerPhysicalRows = effectiveLightOnReadRows;
 const readerCudaBatchEnabled = cudaLightOnBatchProfileEnabled;
-const readerSlidingTrimForced = generationKvSlidingTrimForced;
 
 test "context checkpoint HTTP errors distinguish stale revisions from corrupt payloads" {
     const allocator = std.testing.allocator;
@@ -55791,9 +56226,11 @@ test "dynamic CUDA admission counts admitted pages and rolls back failed batch g
     defer first.release();
     try std.testing.expectEqual(@as(usize, 10 * mib), ctx.decoder_peak.bytes);
     try std.testing.expectEqual(@as(usize, 4 * mib), ctx.vision_peak.bytes);
+    const prior_workspace = ctx.decoder_workspace;
     try std.testing.expectError(error.ResourceTemporarilyUnavailable, ctx.admitRegisteredPage(&factory, pending_index, 4 * mib, 0, page));
     try std.testing.expectEqual(@as(usize, 10 * mib), ctx.decoder_peak.bytes);
     try std.testing.expectEqual(@as(usize, 4 * mib), ctx.vision_peak.bytes);
+    try std.testing.expectEqualDeep(prior_workspace, ctx.decoder_workspace);
     try std.testing.expectEqual(@as(usize, 1), ctx.admitted_pages);
     first.release();
     ctx.unregister(first_index);
@@ -55801,6 +56238,16 @@ test "dynamic CUDA admission counts admitted pages and rolls back failed batch g
     defer next.release();
     ctx.unregister(pending_index);
     try std.testing.expectEqual(@as(usize, 0), ctx.admitted_pages);
+
+    next.release();
+    factory.decoder_workspace = null;
+    factory.dynamic_vision_batch_items = 0;
+    const reused_index = ctx.register(.{});
+    defer ctx.unregister(reused_index);
+    var reused = try ctx.admitRegisteredPage(&factory, reused_index, null, 0, page);
+    defer reused.release();
+    try std.testing.expectEqual(@as(usize, 1), ctx.admitted_pages);
+    try std.testing.expect(ctx.admitted_controls[reused_index]);
 }
 
 test "installed Node typed resident dispatch preserves encoder ownership past Node and session close" {
@@ -56411,7 +56858,13 @@ test "LightOn reader actual public CUDA loader prepares immutable norm caches be
     domain.controller.configureSharedLimits(.{});
     try std.testing.expect(session.model_lifetime.?.admission_domain == null);
     session.model_lifetime.?.admission_domain = domain.pin();
-    const limits = runtime.tier.memory.Limits{ .host_limit_bytes = 256 * 1024 * 1024, .backend_limit_bytes = 1024 * 1024 * 1024, .scratch_limit_bytes = 1024 * 1024 * 1024 };
+    // Preserve the backend retention-pressure check while independently
+    // allowing the prepared host arena alongside optional vendor scratch.
+    const limits = runtime.tier.memory.Limits{
+        .host_limit_bytes = 256 * 1024 * 1024,
+        .backend_limit_bytes = 1024 * 1024 * 1024,
+        .scratch_limit_bytes = (256 + 1024) * 1024 * 1024,
+    };
     session.run_admission = .{ .controller = &domain.controller, .backend_class = .gpu, .limits = limits, .static_workspace_bytes = 0, .check_live_memory = false };
     var model: model_manager_mod.LoadedModel = undefined;
     try session.installOwnedExecutionGate(a);
@@ -56445,7 +56898,6 @@ test "LightOn reader actual public CUDA loader prepares immutable norm caches be
             defer request.closeBackend(&backend);
             if (!self.legacy_peer_proved and request.preparation.norm_count > 1) {
                 const compute = request.preparation.expectedCudaCompute();
-                try std.testing.expect(compute.managed_norm_publication);
                 const source = try @import("../architectures/gpt.zig").getModelWeight(&backend, self.config, "model.layers.0.post_attention_layernorm.weight");
                 defer backend.free(source);
                 const roots_before = compute.embedding_gemma2_constant_count.load(.acquire);
@@ -56654,6 +57106,7 @@ test "LightOn reader actual public CUDA loader prepares immutable norm caches be
         var peer_registered = true;
         defer if (peer_registered) ctx.unregister(peer_index);
         const before_warm = domain.controller.snapshot();
+        const before_pages = ctx.admitted_pages;
         const before_reentries = probe.numerical_reentries;
         const raw_page = try ctx.admitRegisteredPage(&factory, peer_index, null, 0, .{ .backend_scratch_bytes = 64, .host_scratch_bytes = 16 });
         var owned_page = ctx.bindPageLease(raw_page);
@@ -56665,6 +57118,8 @@ test "LightOn reader actual public CUDA loader prepares immutable norm caches be
             owned_page.release(&peer_pool);
             peer_pool_live = false;
         };
+        try std.testing.expectEqual(before_pages + 1, ctx.admitted_pages);
+        try std.testing.expect(ctx.admitted_controls[peer_index]);
         try std.testing.expect(probe.numerical_reentries > before_reentries);
         try std.testing.expect(probe.failure == null);
         // Retire an actual per-page state under NOW's step/cohort and B;
@@ -56682,6 +57137,7 @@ test "LightOn reader actual public CUDA loader prepares immutable norm caches be
         ctx.unlockStep();
         ctx.unregister(peer_index);
         peer_registered = false;
+        try std.testing.expectEqual(before_pages, ctx.admitted_pages);
         const before_refund_reentries = probe.numerical_reentries;
         owned_page.release(&peer_pool);
         peer_pool_live = false;
@@ -57189,8 +57645,8 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
     const Harness = struct {
         const Context = Node.LightOnStreamContext;
         const C = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
-        const Executor = @import("../graph/decoder_step_executor.zig").Executor;
-        const Work = @import("../graph/decoder_work.zig");
+        const Executor = @import("../execution/decoder_step_executor.zig").Executor;
+        const Work = @import("../execution/decoder_work.zig");
         const Item = runtime.scheduler.native_generate.StepItem;
         const PoolLease = @import("../execution/reader_pool.zig").Pool.Lease;
         const original_tokens_per_page = 13; // Keep the maintained control unchanged.
@@ -57444,7 +57900,7 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
                 probe.ctx = null;
                 if (ctx) |actual| {
                     if (state_count != 0) {
-                        actual.lockStepForCleanup();
+                        actual.lockStepForCleanup(.page_state_cleanup);
                         for (0..state_count) |row| if (state_live[row]) {
                             state[row].deinitWithCleanup(.{ .boundary = actual.cleanup_owner.epoch(), .operation = if (actual.cb) |*cb| cb.operationToken() else null }) catch platform.inference_process_supervisor.restartWorker();
                             state_live[row] = false;
@@ -57551,7 +58007,7 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
                 }
                 var embeddings: ?ops.CT = null;
                 defer if (embeddings) |value| {
-                    actual.lockStepForCleanup();
+                    actual.lockStepForCleanup(.projected_image_cleanup);
                     cb.freeWithCleanup(value, .{ .boundary = actual.cleanup_owner.epoch(), .operation = cb.operationToken() });
                     actual.unlockStep();
                 };
@@ -57569,7 +58025,7 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
                 {
                     var prefix = Work.Prefill{ .allocator = allocator, .decode_state = &state[1], .token_ids = &.{}, .seq_len = prefix_tokens, .query_seq_len = prefix_tokens, .wants_last_logits = true, .wants_greedy = true, .prepared_prefix = .{ .token_count = prefix_tokens, .positions = text_plan.?.mrope_positions, .embeddings = embeddings, .intermediate_layer_count = 0 } };
                     state[0].appendGeneratedTokenWithCleanup(.{ .boundary = actual.cleanup_owner.epoch(), .operation = cb.operationToken() }) catch |err| return failure(err, graph_enabled, "mixed_text_advance");
-                    var borrowed = @import("../graph/decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&state[0]);
+                    var borrowed = @import("../execution/decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&state[0]);
                     const context = borrowed.makeDecodeContext(state[0].total_tokens, 1);
                     var decode = Work.Decode{ .allocator = allocator, .decode_state = &state[0], .token_id = result.tokens[0][0], .seq_len = state[0].total_tokens, .wants_greedy = true, .remaining_tokens = tokens_per_page - 1, .continuation_context = &result };
                     const items = [_]Item{
@@ -57594,7 +58050,7 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
                     // legitimately bursts up to remaining_tokens. Both pages then rejoin
                     // the separate two-page17-choice decode/replay schedule.
                     state[1].appendGeneratedTokenWithCleanup(.{ .boundary = actual.cleanup_owner.epoch(), .operation = cb.operationToken() }) catch |err| return failure(err, graph_enabled, "text_peer_advance");
-                    var borrowed = @import("../graph/decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&state[1]);
+                    var borrowed = @import("../execution/decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&state[1]);
                     const context = borrowed.makeDecodeContext(state[1].total_tokens, 1);
                     var work = Work.Decode{ .allocator = allocator, .decode_state = &state[1], .token_id = result.tokens[1][0], .seq_len = state[1].total_tokens, .wants_greedy = true, .remaining_tokens = 1, .continuation_context = &result };
                     const items = [_]Item{.{ .work_ptr = &work, .phase = .decode, .query_sequence_len = 1, .total_sequence_len = state[1].total_tokens, .kv_sequence_len = context.kv_sequence_len, .kv_position_offset = context.kv_position_offset }};
@@ -57635,7 +58091,7 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
                     probe.phase = .advance;
                     probe.row = row;
                     state[row].appendGeneratedTokenWithCleanup(.{ .boundary = actual.cleanup_owner.epoch(), .operation = cb.operationToken() }) catch |err| return failure(err, graph_enabled, "advance");
-                    var borrowed = @import("../graph/decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&state[row]);
+                    var borrowed = @import("../execution/decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&state[row]);
                     const context = borrowed.makeDecodeContext(state[row].total_tokens, 1);
                     work[row] = .{ .allocator = allocator, .decode_state = &state[row], .token_id = result.tokens[row][count - 1], .seq_len = state[row].total_tokens, .wants_greedy = true, .remaining_tokens = tokens_per_page - count, .continuation_context = &result };
                     items[row] = .{ .work_ptr = &work[row], .phase = .decode, .query_sequence_len = 1, .total_sequence_len = state[row].total_tokens, .kv_sequence_len = context.kv_sequence_len, .kv_position_offset = context.kv_position_offset };
@@ -57715,7 +58171,7 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
             for (0..state_count) |row| try std.testing.expectEqual(@as(usize, prefix_tokens + tokens_per_page - 1), state[row].total_tokens);
             probe.phase = .cleanup;
             probe.row = null;
-            actual.lockStepForCleanup();
+            actual.lockStepForCleanup(.page_state_cleanup);
             for (0..state_count) |row| {
                 state[row].deinitWithCleanup(.{ .boundary = actual.cleanup_owner.epoch(), .operation = cb.operationToken() }) catch platform.inference_process_supervisor.restartWorker();
                 state_live[row] = false;
@@ -58109,8 +58565,8 @@ test "CUDA actual standalone generation original admission and optional attentio
             const before_calls = if (compute.lighton_recurrent.bf16_prefill) |*library| (if (library.attention) |*attention| attention.calls else return error.ActualOptionalAttentionLibraryMissing) else return error.ActualOptionalPrefillLibraryMissing;
             var manager = runtime.kv.manager.KvManager.init(allocator);
             defer manager.deinit();
-            const pool_config = generation.kvPoolConfig(.cuda, dtype, cfg, false);
-            const pool = try manager.addPool(generation.requestKvManagerPoolConfig(pool_config));
+            const pool_config = decoder_storage.poolPlan(.cuda, dtype, &cfg, .{});
+            const pool = try manager.addPool(decoder_storage.requestMetadataPool(pool_config));
             var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, pool_config);
             defer storage.deinitWithBoundary(current.boundary);
             try cb.provisionKvDeviceWriteHook(&storage);

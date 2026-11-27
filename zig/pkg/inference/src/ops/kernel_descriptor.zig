@@ -28,6 +28,119 @@ pub const NativeMatrixScratchGeometry = struct {
 
 pub const Unary = enum { negate, sqrt, rsqrt, exp, log, sin, cos, tanh, erf, abs, gelu, gelu_exact, relu, silu };
 pub const Binary = enum { add, subtract, multiply, divide };
+pub const ScalarProduct = struct {
+    source_id: ml.graph.NodeId,
+    scalar_id: ml.graph.NodeId,
+    scale: f32,
+
+    pub fn match(graph: *const ml.graph.Graph, id: ml.graph.NodeId, shape: ml.graph.Shape) ?ScalarProduct {
+        if (id >= graph.nodeCount()) return null;
+        const node = graph.node(id);
+        if ((node.op != .mul and node.op != .fused_elem_multiply) or node.num_inputs < 2 or !node.output_shape.eq(shape)) return null;
+        for (node.inputs[0..2], 0..) |scalar, index| {
+            const scale = scalarConstantF32(graph, scalar) orelse continue;
+            return .{ .source_id = node.inputs[1 - index], .scalar_id = scalar, .scale = scale };
+        }
+        return null;
+    }
+};
+
+pub const F32ScaledAdd = struct {
+    product: ml.graph.NodeId,
+    source: ml.graph.NodeId,
+    addend: ml.graph.NodeId,
+    scalar: ml.graph.NodeId,
+    scale: f32,
+    rhs_product: ?ScalarProduct = null,
+
+    pub fn match(graph: *const ml.graph.Graph, inputs: []const ml.graph.NodeId, shape: ml.graph.Shape, deferred: [2]bool) ?F32ScaledAdd {
+        if (inputs.len != 2 or shape.dtype != .f32) return null;
+        if (deferred[0] and deferred[1]) {
+            const lhs = ScalarProduct.match(graph, inputs[0], shape) orelse return null;
+            const rhs = ScalarProduct.match(graph, inputs[1], shape) orelse return null;
+            if (lhs.source_id >= graph.nodeCount() or rhs.source_id >= graph.nodeCount()) return null;
+            if (!graph.node(lhs.source_id).output_shape.eq(shape) or !graph.node(rhs.source_id).output_shape.eq(shape)) return null;
+            return .{ .product = inputs[0], .source = lhs.source_id, .addend = rhs.source_id, .scalar = lhs.scalar_id, .scale = lhs.scale, .rhs_product = rhs };
+        }
+        for (inputs, 0..) |id, index| {
+            if (!deferred[index] or deferred[1 - index]) continue;
+            const mul = ScalarProduct.match(graph, id, shape) orelse continue;
+            const addend = inputs[1 - index];
+            if (addend >= graph.nodeCount() or !graph.node(addend).output_shape.eq(shape)) continue;
+            if (mul.source_id < graph.nodeCount() and graph.node(mul.source_id).output_shape.eq(shape)) {
+                return .{ .product = id, .source = mul.source_id, .addend = addend, .scalar = mul.scalar_id, .scale = mul.scale };
+            }
+        }
+        return null;
+    }
+};
+
+pub const F32Product = struct { node: ml.graph.NodeId, lhs_id: ml.graph.NodeId, rhs_id: ml.graph.NodeId };
+
+pub const F32ProductAdd = union(enum) {
+    single: struct { product: F32Product, addend: ml.graph.NodeId },
+    pair: [2]F32Product,
+
+    /// The caller supplies which products it has proved safe to elide. The
+    /// original add order determines the order of the two-product kernel.
+    pub fn match(graph: *const ml.graph.Graph, inputs: []const ml.graph.NodeId, shape: ml.graph.Shape, deferred: [2]bool) ?F32ProductAdd {
+        if (inputs.len != 2) return null;
+        const left = if (deferred[0]) sameShapeF32Product(graph, inputs[0], shape) else null;
+        const right = if (deferred[1]) sameShapeF32Product(graph, inputs[1], shape) else null;
+        if (left) |product| {
+            if (right) |other| return .{ .pair = .{ product, other } };
+            return .{ .single = .{ .product = product, .addend = inputs[1] } };
+        }
+        if (right) |product| return .{ .single = .{ .product = product, .addend = inputs[0] } };
+        return null;
+    }
+};
+
+/// Dense product geometry for the elementwise multiply-add schedules. Scalar
+/// constants and nested products are handled by their separate schedules.
+pub fn sameShapeF32Product(graph: *const ml.graph.Graph, node_id: ml.graph.NodeId, output_shape: ml.graph.Shape) ?F32Product {
+    if (node_id == ml.graph.null_node or node_id >= graph.nodeCount()) return null;
+    const node = graph.node(node_id);
+    switch (node.op) {
+        .mul, .fused_elem_multiply => {},
+        else => return null,
+    }
+    if (!ml.graph.Shape.eq(node.output_shape, output_shape)) return null;
+    if (node.output_shape.dtype != .f32 or node.num_inputs < 2) return null;
+    const lhs_id = node.inputs[0];
+    const rhs_id = node.inputs[1];
+    if (lhs_id == ml.graph.null_node or rhs_id == ml.graph.null_node or lhs_id >= graph.nodeCount() or rhs_id >= graph.nodeCount()) return null;
+    if (scalarConstantF32(graph, lhs_id) != null or scalarConstantF32(graph, rhs_id) != null) return null;
+    if (!ml.graph.Shape.eq(graph.node(lhs_id).output_shape, output_shape)) return null;
+    if (!ml.graph.Shape.eq(graph.node(rhs_id).output_shape, output_shape)) return null;
+    if (isSameShapeElementwiseMul(graph, lhs_id, output_shape)) return null;
+    if (isSameShapeElementwiseMul(graph, rhs_id, output_shape)) return null;
+    return .{ .node = node_id, .lhs_id = lhs_id, .rhs_id = rhs_id };
+}
+
+fn isSameShapeElementwiseMul(graph: *const ml.graph.Graph, node_id: ml.graph.NodeId, output_shape: ml.graph.Shape) bool {
+    if (node_id == ml.graph.null_node or node_id >= graph.nodeCount()) return false;
+    const node = graph.node(node_id);
+    switch (node.op) {
+        .mul, .fused_elem_multiply => {},
+        else => return false,
+    }
+    return ml.graph.Shape.eq(node.output_shape, output_shape);
+}
+
+pub fn scalarConstantF32(graph: *const ml.graph.Graph, node_id: ml.graph.NodeId) ?f32 {
+    if (node_id == ml.graph.null_node or node_id >= graph.nodeCount()) return null;
+    const node = graph.node(node_id);
+    const attrs = switch (node.op) {
+        .constant => |constant_attrs| constant_attrs,
+        else => return null,
+    };
+    if (node.output_shape.dtype != .f32 or node.output_shape.rank() != 0 or attrs.data_len != 1) return null;
+    const values = graph.constantDataAs(f32, attrs.data_offset, attrs.data_len);
+    if (values.len != 1) return null;
+    return values[0];
+}
+
 pub const Linear = struct {
     rows: u32,
     in_dim: u32,
@@ -161,6 +274,61 @@ pub const Gather = struct {
         return std.mem.eql(i64, expected[0..rank], output_dims);
     }
 };
+/// Rank-two input plus a column bias, independent of add operand order.
+pub const MatrixColumnBias = struct {
+    matrix: ml.graph.NodeId,
+    bias: ml.graph.NodeId,
+    matrix_shape: ml.graph.Shape,
+
+    pub fn match(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?MatrixColumnBias {
+        if (id >= graph.nodeCount()) return null;
+        const node = graph.node(id);
+        if (node.op != .add or node.num_inputs != 2) return null;
+        const lhs = node.inputs[0];
+        const rhs = node.inputs[1];
+        if (lhs >= graph.nodeCount() or rhs >= graph.nodeCount()) return null;
+        const lhs_shape = graph.node(lhs).output_shape;
+        const rhs_shape = graph.node(rhs).output_shape;
+        if (lhs_shape.rank() == 2 and rhs_shape.rank() == 1 and lhs_shape.dims[1] == rhs_shape.dims[0])
+            return .{ .matrix = lhs, .bias = rhs, .matrix_shape = lhs_shape };
+        if (rhs_shape.rank() == 2 and lhs_shape.rank() == 1 and rhs_shape.dims[1] == lhs_shape.dims[0])
+            return .{ .matrix = rhs, .bias = lhs, .matrix_shape = rhs_shape };
+        return null;
+    }
+};
+
+/// The generated F32 kernel adds the bias only for valid gathered rows.
+pub const GatherAddBias = struct {
+    producer: ml.graph.NodeId,
+    inputs: [3]ml.graph.NodeId,
+    rows: usize,
+    cols: usize,
+    index_count: usize,
+    output_shape: ml.graph.Shape,
+
+    pub fn match(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?GatherAddBias {
+        if (id >= graph.nodeCount()) return null;
+        const node = graph.node(id);
+        if (node.op != .gather or node.num_inputs != 2 or node.op.gather.axis != 0) return null;
+        const descriptor = lower(graph, id) orelse return null;
+        const biased = MatrixColumnBias.match(graph, node.inputs[0]) orelse return null;
+        const shape = biased.matrix_shape;
+        if (shape.dtype != .f32 or graph.node(biased.bias).output_shape.dtype != .f32 or
+            !descriptor.input_shapes[0].eq(shape) or descriptor.input_shapes[1].dtype != .f32 or
+            descriptor.output_shape.dtype != .f32 or shape.dims[0] <= 0 or shape.dims[0] > std.math.maxInt(i32) or shape.dims[1] <= 0 or
+            (shape.numElements() orelse return null) > std.math.maxInt(u32)) return null;
+        const count = std.math.cast(u32, descriptor.input_shapes[1].numElements() orelse return null) orelse return null;
+        if (count == 0) return null;
+        return .{
+            .producer = node.inputs[0],
+            .inputs = .{ biased.matrix, biased.bias, node.inputs[1] },
+            .rows = @intCast(shape.dims[0]),
+            .cols = @intCast(shape.dims[1]),
+            .index_count = count,
+            .output_shape = descriptor.output_shape,
+        };
+    }
+};
 /// Cold, value-only geometry authored only by the complete Native decoder.
 /// Generic lower() deliberately never constructs this operation: ordinary
 /// causal attention must preserve its original target route.
@@ -187,6 +355,8 @@ pub const DenseAttentionPrefix = struct {
     num_heads: u32,
     head_dim: u32,
     max_key_rows: u32,
+    /// The runtime binds the live extent but cannot supply a key mask.
+    all_keys_visible: bool = false,
 
     pub fn valid(self: @This(), descriptor: *const Descriptor) bool {
         if (self.num_heads == 0 or self.head_dim == 0 or self.max_key_rows == 0 or descriptor.input_count != 3) return false;
@@ -211,10 +381,16 @@ pub const DenseAttentionRows = struct {
     key_rows: u32,
     num_heads: u32,
     head_dim: u32,
+    all_keys_visible: bool = false,
     /// Zero retains the authored equal-head contract. Explicit KV heads name
     /// a functional grouped-query program with an exact static key extent.
     num_kv_heads: u32 = 0,
     sliding_window: u32 = 0,
+
+    pub fn isGroupedCausalSuffix(self: @This()) bool {
+        return self.kind == .causal and self.num_kv_heads != 0 and self.query_rows < self.key_rows;
+    }
+
     pub fn valid(self: @This(), descriptor: *const Descriptor) bool {
         if (self.query_rows == 0 or self.key_rows == 0 or self.num_heads == 0 or self.head_dim == 0 or descriptor.input_count != 3) return false;
         if (self.num_kv_heads == 0) {
@@ -232,7 +408,7 @@ pub const DenseAttentionRows = struct {
     }
 };
 
-pub const Operation = union(enum) { transpose: Layout, broadcast: Layout, unary: Unary, binary: Binary, add_mul_scalar: struct { scale_before_add: bool = false }, linear: Linear, norm: Norm, softmax: Softmax, rope: Rope, reduction: Reduction, dot: Dot, concat: kernel_geometry.ConcatAxis, slice: Slice, gather: Gather, paged_attention: PagedAttention, dense_attention_prefix: DenseAttentionPrefix, dense_attention_rows: DenseAttentionRows };
+pub const Operation = union(enum) { transpose: Layout, broadcast: Layout, unary: Unary, binary: Binary, add_mul_scalar: ml.graph.node.ScalarResidualAttrs, linear: Linear, norm: Norm, softmax: Softmax, rope: Rope, reduction: Reduction, dot: Dot, concat: kernel_geometry.ConcatAxis, slice: Slice, gather: Gather, paged_attention: PagedAttention, dense_attention_prefix: DenseAttentionPrefix, dense_attention_rows: DenseAttentionRows };
 
 pub const HeadMajorAttention = struct {
     query_rows: u32,
@@ -357,6 +533,7 @@ pub const ProjectionHead = struct {
     count: u8,
     input: ml.graph.NodeId,
     weights: [3]ml.graph.NodeId = @splat(ml.graph.null_node),
+    biases: [3]ml.graph.NodeId = @splat(ml.graph.null_node),
     outputs: [3]ml.graph.NodeId = @splat(ml.graph.null_node),
     covered: [6]ml.graph.NodeId = @splat(ml.graph.null_node),
     covered_count: u8 = 0,
@@ -568,16 +745,30 @@ pub fn headNormRope(graph: *const ml.graph.Graph, output: ml.graph.NodeId) ?Head
 /// widths; every source retains its own projection/rounding contract. Callers
 /// prove partition membership and availability, rather than guessing adjacency.
 pub fn independentProjections(graph: *const ml.graph.Graph, outputs: []const ml.graph.NodeId) ?ProjectionHead {
+    return independentProjectionHead(graph, outputs, false);
+}
+
+/// Metal's prepared row kernels bind each optional bias as part of the
+/// immutable slot recipe. Callers that only bind weights opt out.
+pub fn independentProjectionHead(graph: *const ml.graph.Graph, outputs: []const ml.graph.NodeId, allow_bias: bool) ?ProjectionHead {
     if (outputs.len < 2 or outputs.len > 3) return null;
     var head = ProjectionHead{ .form = .independent, .count = @intCast(outputs.len), .input = ml.graph.null_node, .entry = outputs[0] };
     for (outputs, 0..) |output, index| {
         if (output >= graph.nodeCount()) return null;
         const node = graph.node(output);
         const descriptor = lower(graph, output) orelse return null;
-        if (descriptor.operation != .linear or descriptor.operation.linear.bias or node.getInputs().len != 2) return null;
+        if (descriptor.operation != .linear or node.getInputs().len != descriptor.input_count) return null;
+        if (descriptor.operation.linear.bias) {
+            if (!allow_bias or node.getInputs().len != 3) return null;
+            const bias = graph.node(node.inputs[2]);
+            if (bias.op != .parameter or bias.output_shape.dtype != .f32 or bias.output_shape.rank() != 1 or
+                bias.output_shape.dim(0) != descriptor.operation.linear.out_dim) return null;
+            head.biases[index] = node.inputs[2];
+        } else if (node.getInputs().len != 2) return null;
         if (index == 0) head.input = node.inputs[0] else if (node.inputs[0] != head.input) return null;
         const dims = descriptor.operation.linear;
         if (!head.source(graph, index, node.inputs[1], output, dims.rows, dims.in_dim, dims.out_dim, true) or !head.append(output)) return null;
+        head.linears[index] = descriptor;
         if (descriptor.output_shape.dtype != .f32 or descriptor.input_shapes[0].dtype != .f32 or descriptor.input_shapes[1].dtype != .f32) return null;
         if (index != 0 and (dims.rows != head.linears[0].operation.linear.rows or dims.in_dim != head.linears[0].operation.linear.in_dim)) return null;
         for (head.weights[0..index]) |prior| if (prior == head.weights[index]) return null;
@@ -586,9 +777,29 @@ pub fn independentProjections(graph: *const ml.graph.Graph, outputs: []const ml.
     return head;
 }
 
+/// A complete one-row head eligible for the pair or QKV region. Slot
+/// readiness and precise input bindings are checked by the region owner.
+pub fn metalRowProjectionHead(graph: *const ml.graph.Graph) bool {
+    const head = independentProjectionHead(graph, graph.outputs.items, true) orelse return false;
+    if (graph.node(head.input).op != .parameter or head.linears[0].operation.linear.rows != 1) return false;
+    const ops = head.linears;
+    return if (head.count == 2)
+        ops[0].operation.linear.out_dim == ops[1].operation.linear.out_dim
+    else
+        ops[1].operation.linear.out_dim == ops[2].operation.linear.out_dim;
+}
+
 /// Complete parameter-fed projection head only. Mixed graphs keep their
 /// original executor and schedule; no reachability/placement is guessed here.
 pub fn projectionHead(graph: *const ml.graph.Graph) ?ProjectionHead {
+    return projectionHeadWithBias(graph, false);
+}
+
+pub fn metalProjectionHead(graph: *const ml.graph.Graph) ?ProjectionHead {
+    return projectionHeadWithBias(graph, true);
+}
+
+fn projectionHeadWithBias(graph: *const ml.graph.Graph, allow_bias: bool) ?ProjectionHead {
     const outputs = graph.outputs.items;
     if (outputs.len != 2 and outputs.len != 3) return null;
     var result: ?ProjectionHead = null;
@@ -602,7 +813,7 @@ pub fn projectionHead(graph: *const ml.graph.Graph) ?ProjectionHead {
             result = head;
         }
     }
-    if (result == null) result = independentProjections(graph, outputs) orelse return null;
+    if (result == null) result = independentProjectionHead(graph, outputs, allow_bias) orelse return null;
     const head = result.?;
     if (graph.node(head.input).op != .parameter) return null;
     for (head.linears[0..head.count], 0..) |linear, index| {
@@ -631,6 +842,40 @@ pub const Descriptor = struct {
         return @intCast(self.output_shape.numElements().?);
     }
 };
+
+/// Canonical dense matrix product with a logical right-hand transpose.
+/// Keep the original weight as a region input and contract its last axis.
+pub const TransposedRightDot = struct {
+    transpose: ml.graph.NodeId,
+    inputs: [2]ml.graph.NodeId,
+    descriptor: Descriptor,
+
+    pub fn match(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?TransposedRightDot {
+        if (id >= graph.nodeCount()) return null;
+        const node = graph.node(id);
+        if (node.op != .dot_general or node.num_inputs != 2) return null;
+        const attrs = node.op.dot_general;
+        if (attrs.num_batch != 0 or attrs.num_contracting != 1 or attrs.lhs_contracting[0] != 1 or attrs.rhs_contracting[0] != 0) return null;
+        const transpose_id = node.inputs[1];
+        if (transpose_id >= graph.nodeCount() or node.inputs[0] >= graph.nodeCount()) return null;
+        const transpose = graph.node(transpose_id);
+        if (transpose.op != .transpose or transpose.num_inputs != 1 or transpose.inputs[0] >= graph.nodeCount()) return null;
+        const lhs = graph.node(node.inputs[0]).output_shape;
+        const source = graph.node(transpose.inputs[0]).output_shape;
+        if (lhs.dtype != .f32 or source.dtype != .f32 or lhs.rank() != 2 or source.rank() != 2) return null;
+        if (transpose.op.transpose.num_axes != 0 and transpose.op.transpose.num_axes != 2) return null;
+        var permutation: [ml.graph.shape.max_rank]u8 = undefined;
+        const perm = @import("../graph/transpose_utils.zig").effectivePerm(transpose.op.transpose, 2, &permutation);
+        if (!std.mem.eql(u8, perm, &.{ 1, 0 })) return null;
+        const transposed = transpose.output_shape;
+        if (transposed.dtype != .f32 or transposed.rank() != 2 or
+            transposed.dim(0) != source.dim(1) or transposed.dim(1) != source.dim(0)) return null;
+        var descriptor = lower(graph, id) orelse return null;
+        descriptor.operation.dot.rhs_contract_last = true;
+        descriptor.input_shapes[1] = source;
+        return .{ .transpose = transpose_id, .inputs = .{ node.inputs[0], transpose.inputs[0] }, .descriptor = descriptor };
+    }
+};
 /// Per-invocation scratch. Targets expose their own layout inside this region;
 /// its physical owner and reuse lifetime belong to the executable plan.
 pub const WorkspaceRequirement = struct {
@@ -654,7 +899,13 @@ pub const AuxiliaryRequirements = struct {
     }
 };
 pub const AuxiliaryBinding = struct { role: AuxiliaryRole, tensor: CT };
+pub const ResidualAdd = struct {
+    inputs: [2]CT,
+    authority: @import("../execution/kernel_route.zig").AssignedOutput,
+};
+
 pub const Invocation = struct {
+    residual_add: ?*const ResidualAdd = null,
     /// Actual synchronous DecodeContext, never saved by a descriptor/route.
     attention: ?*const @import("../graph/backend_contracts.zig").AttentionContext = null,
     input_generation: u64 = 0,
@@ -706,8 +957,9 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
     const node = graph.node(id);
     const shape = node.output_shape;
     const count = shape.numElements() orelse return null;
-    const typed_slice = node.op == .slice and (shape.dtype == .i32 or shape.dtype == .i64);
-    if ((shape.dtype != .f32 and !typed_slice) or count <= 0 or count > std.math.maxInt(i32)) return null;
+    const integer_layout = (shape.dtype == .i32 or shape.dtype == .i64) and
+        (node.op == .slice or node.op == .concat_prim or node.op == .fused_concat or node.op == .gather);
+    if ((shape.dtype != .f32 and !integer_layout) or count <= 0 or count > std.math.maxInt(i32)) return null;
     const operation: Operation = switch (node.op) {
         .transpose, .broadcast_in_dim => blk: {
             if (node.num_inputs != 1 or node.inputs[0] == ml.graph.null_node or node.inputs[0] >= graph.nodeCount()) return null;
@@ -760,6 +1012,7 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
             if (node.num_inputs != 2 or attrs.nd or attrs.elements or attrs.batch_dims != 0) return null;
             const input = inputShape(graph, id, 0) orelse return null;
             const indices = inputShape(graph, id, 1) orelse return null;
+            if (integer_layout and (input.dtype != shape.dtype or (indices.dtype != .i32 and indices.dtype != .i64))) return null;
             const geometry = kernel_geometry.GatherAxis.init(std.math.maxInt(u32), input.dims[0..input.rank()], attrs.axis) catch return null;
             const index_count = indices.numElements() orelse return null;
             const gather: Gather = .{ .axis = attrs.axis, .geometry = geometry };
@@ -771,7 +1024,7 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
         .sub => .{ .binary = .subtract },
         .mul, .fused_elem_multiply => .{ .binary = .multiply },
         .div => .{ .binary = .divide },
-        .fused_add_mul_scalar => |attrs| .{ .add_mul_scalar = .{ .scale_before_add = attrs.scale_before_add } },
+        .fused_add_mul_scalar => |attrs| .{ .add_mul_scalar = attrs },
         .fused_linear, .fused_linear_no_bias => |attrs| blk: {
             if (attrs.rows == 0 or attrs.in_dim == 0 or attrs.out_dim == 0 or (node.op == .fused_linear and attrs.num_projections != 0) or shape.rank() != 2 or shape.dim(0) != attrs.rows or shape.dim(1) != attrs.out_dim) return null;
             kernel_geometry.validateProjectionGroups(&attrs.projection_out_dims, attrs.num_projections, attrs.out_dim) catch return null;
@@ -799,6 +1052,17 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
                 .reduce_max => .max,
                 else => .mean,
             }, .geometry = geometry } };
+        },
+        .fused_cross_attention => |attrs| blk: {
+            if (!attrs.all_keys_visible or attrs.batch != 1 or node.num_inputs != 3) return null;
+            break :blk .{ .dense_attention_rows = .{
+                .kind = .cross,
+                .query_rows = attrs.dec_seq,
+                .key_rows = attrs.enc_seq,
+                .num_heads = attrs.num_heads,
+                .head_dim = attrs.head_dim,
+                .all_keys_visible = true,
+            } };
         },
         .fused_gqa_causal_attention => |attrs| blk: {
             if (!attrs.functional_kv or attrs.batch != 1 or node.num_inputs != 3) return null;
@@ -833,8 +1097,8 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
             (input_shape.dtype == .f16 or input_shape.dtype == .bf16);
         const integer_indices = index == 1 and operation == .gather and
             (input_shape.dtype == .i32 or input_shape.dtype == .i64);
-        const typed_slice_input = typed_slice and index == 0 and input_shape.dtype == shape.dtype;
-        if ((input_shape.dtype != .f32 and !reduced_weight and !integer_indices and !typed_slice_input) or input_count <= 0 or input_count > std.math.maxInt(i32)) return null;
+        const integer_layout_input = integer_layout and input_shape.dtype == shape.dtype;
+        if ((input_shape.dtype != .f32 and !reduced_weight and !integer_indices and !integer_layout_input) or input_count <= 0 or input_count > std.math.maxInt(i32)) return null;
         if ((operation == .unary or operation == .binary or operation == .softmax or operation == .rope) and input_count != 1 and !std.mem.eql(i64, input_shape.dims[0..input_shape.rank()], shape.dims[0..shape.rank()])) return null;
         if ((operation == .unary or operation == .softmax or operation == .rope) and input_count != count) return null;
         result.input_shapes[index] = input_shape;
@@ -1229,4 +1493,47 @@ test "head-major attention preserves independent query rows and broadcast bias" 
     try std.testing.expect(!transposed_program.key_contract_last);
     try std.testing.expectEqual(transposed, transposed_program.inputs[1]);
     try std.testing.expectEqual(program.key_rows, transposed_program.key_rows);
+}
+
+test "Metal row projection head preserves optional bias operands" {
+    const a = std.testing.allocator;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ 1, 32 }));
+    const bias = try b.parameter("bias", ml.graph.Shape.init(.f32, &.{64}));
+    const w0 = try b.parameter("w0", ml.graph.Shape.init(.f32, &.{ 64, 32 }));
+    const w1 = try b.parameter("w1", ml.graph.Shape.init(.f32, &.{ 64, 32 }));
+    const first = try b.linear(x, w0, bias, 1, 32, 64);
+    const second = try b.linearNoBias(x, w1, 1, 32, 64);
+    try graph.markOutput(first);
+    try graph.markOutput(second);
+    try std.testing.expect(metalRowProjectionHead(&graph));
+    try std.testing.expect(projectionHead(&graph) == null);
+    const head = independentProjectionHead(&graph, graph.outputs.items, true) orelse return error.MissingIndependentProjection;
+    try std.testing.expect(head.linears[0].operation.linear.bias);
+    try std.testing.expectEqualSlices(ml.graph.NodeId, &.{ bias, ml.graph.null_node }, metalProjectionHead(&graph).?.biases[0..2]);
+    try std.testing.expect(!head.linears[1].operation.linear.bias);
+    graph.nodeMut(bias).output_shape.dtype = .bf16;
+    try std.testing.expect(!metalRowProjectionHead(&graph));
+}
+
+test "dense right transpose contracts the original weight axis and retains output geometry" {
+    var graph = ml.graph.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const lhs = try builder.parameter("activation", ml.graph.Shape.init(.f32, &.{ 4, 7 }));
+    const weights = try builder.parameter("weight", ml.graph.Shape.init(.f32, &.{ 9, 7 }));
+    const transpose = try builder.transpose(weights, &.{ 1, 0 });
+    const dot = try builder.matmul(lhs, transpose);
+    const selected = TransposedRightDot.match(&graph, dot) orelse return error.MissingDotDescriptor;
+    try std.testing.expectEqual(transpose, selected.transpose);
+    try std.testing.expectEqualSlices(ml.graph.NodeId, &.{ lhs, weights }, &selected.inputs);
+    const geometry = selected.descriptor.operation.dot;
+    try std.testing.expect(geometry.rhs_contract_last);
+    try std.testing.expectEqual(@as(usize, 4), geometry.m);
+    try std.testing.expectEqual(@as(usize, 9), geometry.n);
+    try std.testing.expectEqual(@as(usize, 7), geometry.k);
+    const direct = try builder.parameter("direct", ml.graph.Shape.init(.f32, &.{ 7, 9 }));
+    try std.testing.expect(TransposedRightDot.match(&graph, try builder.matmul(lhs, direct)) == null);
 }

@@ -80,6 +80,29 @@ pub const CUgraphExecUpdateFn = *const fn (
     resultInfo: *CUgraphExecUpdateResultInfo,
 ) callconv(.c) CUresult;
 
+const MemcpyLocation = extern struct {
+    kind: c_int = 0,
+    id: c_int = 0,
+};
+
+pub const MemcpyAttributes = extern struct {
+    source_access_order: c_int = 1, // CU_MEMCPY_SRC_ACCESS_ORDER_STREAM
+    source_location: MemcpyLocation = .{},
+    destination_location: MemcpyLocation = .{},
+    flags: c_uint = 0,
+};
+
+pub const MemcpyBatchAsync = *const fn (
+    destinations: [*]CUdeviceptr,
+    sources: [*]CUdeviceptr,
+    sizes: [*]usize,
+    count: usize,
+    attributes: [*]MemcpyAttributes,
+    attribute_indices: [*]usize,
+    num_attributes: usize,
+    stream: CUstream,
+) callconv(.c) CUresult;
+
 pub const CUDA_GRAPH_INSTANTIATE_PARAMS = extern struct {
     flags: c_ulonglong = 0,
     hUploadStream: CUstream = null,
@@ -145,6 +168,8 @@ pub const CudaDriver = struct {
         cuMemcpyHtoDAsync: *const fn (dstDevice: CUdeviceptr, srcHost: ?*const anyopaque, ByteCount: usize, hStream: CUstream) callconv(.c) CUresult,
         cuMemcpyDtoHAsync: *const fn (dstHost: ?*anyopaque, srcDevice: CUdeviceptr, ByteCount: usize, hStream: CUstream) callconv(.c) CUresult,
         cuMemcpyDtoDAsync: *const fn (dstDevice: CUdeviceptr, srcDevice: CUdeviceptr, ByteCount: usize, hStream: CUstream) callconv(.c) CUresult,
+        // Only v2 has this argument list. Earlier drivers keep the ordinary copy path.
+        cuMemcpyBatchAsync: ?MemcpyBatchAsync = null,
         cuModuleLoadDataEx: *const fn (module: *CUmodule, image: ?*const anyopaque, numOptions: c_uint, options: ?[*]CUjit_option, optionValues: ?[*]?*anyopaque) callconv(.c) CUresult,
         cuModuleUnload: *const fn (hmod: CUmodule) callconv(.c) CUresult,
         cuModuleGetFunction: *const fn (hfunc: *CUfunction, hmod: CUmodule, name: [*:0]const u8) callconv(.c) CUresult,
@@ -220,6 +245,7 @@ pub const CudaDriver = struct {
                 .cuMemcpyHtoDAsync = lookup(&lib, @TypeOf(@as(Table, undefined).cuMemcpyHtoDAsync), "cuMemcpyHtoDAsync_v2") catch return error.CudaSymbolMissing,
                 .cuMemcpyDtoHAsync = lookup(&lib, @TypeOf(@as(Table, undefined).cuMemcpyDtoHAsync), "cuMemcpyDtoHAsync_v2") catch return error.CudaSymbolMissing,
                 .cuMemcpyDtoDAsync = lookup(&lib, @TypeOf(@as(Table, undefined).cuMemcpyDtoDAsync), "cuMemcpyDtoDAsync_v2") catch return error.CudaSymbolMissing,
+                .cuMemcpyBatchAsync = lookupOptional(&lib, MemcpyBatchAsync, "cuMemcpyBatchAsync_v2"),
                 .cuModuleLoadDataEx = lookup(&lib, @TypeOf(@as(Table, undefined).cuModuleLoadDataEx), "cuModuleLoadDataEx") catch return error.CudaSymbolMissing,
                 .cuModuleUnload = lookup(&lib, @TypeOf(@as(Table, undefined).cuModuleUnload), "cuModuleUnload") catch return error.CudaSymbolMissing,
                 .cuModuleGetFunction = lookup(&lib, @TypeOf(@as(Table, undefined).cuModuleGetFunction), "cuModuleGetFunction") catch return error.CudaSymbolMissing,

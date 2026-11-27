@@ -33,7 +33,7 @@ const ml = @import("ml");
 const ops_mod = @import("../ops/ops.zig");
 const contracts = @import("backend_contracts.zig");
 const transpose_utils = @import("transpose_utils.zig");
-const buffer_plan_mod = @import("buffer_plan.zig");
+const buffer_plan_mod = @import("../execution/buffer_plan.zig");
 const runtime_slice = @import("runtime_slice.zig");
 const runtime_shape_values = @import("runtime_shape_values.zig");
 
@@ -185,6 +185,9 @@ pub const ExecuteOptions = struct {
     /// forbid every host access. Final output materialization is outside this
     /// submission scope.
     activation_readbacks: enum { allowed, forbidden } = .allowed,
+    /// Decline before numerical dispatch if the physical replay plan or its
+    /// bindings are unavailable. An admitted plan may execute its warmup.
+    require_physical_replay_admission: bool = false,
     /// Request lifetime checked before graph setup and at every reachable node.
     /// A backend operation that is already executing still owns its buffers and
     /// must return before cleanup, but graph-scale work can no longer ignore a
@@ -552,53 +555,8 @@ fn currentResidentBytes() usize {
     return platform.time.residentBytes();
 }
 
-/// Compute which nodes are reachable from graph outputs (walking
-/// backward through inputs). Unreachable nodes (e.g. decomposed
-/// primitive subgraphs stored in vjp_alternate) are skipped during
-/// execution.
-pub fn computeReachable(allocator: std.mem.Allocator, graph: *const Graph) ![]bool {
-    const count = graph.nodeCount();
-    const reachable = try allocator.alloc(bool, count);
-    @memset(reachable, false);
-
-    // Seed with output nodes
-    for (graph.outputs.items) |out_id| {
-        markReachable(graph, reachable, out_id);
-    }
-
-    return reachable;
-}
-
-/// Compute which nodes are reachable from an explicit target set. This is used
-/// by debug/artifact capture paths that should not execute the full model tail.
-pub fn computeReachableFromNodes(
-    allocator: std.mem.Allocator,
-    graph: *const Graph,
-    target_node_ids: []const NodeId,
-) ![]bool {
-    const count = graph.nodeCount();
-    const reachable = try allocator.alloc(bool, count);
-    @memset(reachable, false);
-
-    for (target_node_ids) |node_id| {
-        markReachable(graph, reachable, node_id);
-    }
-
-    return reachable;
-}
-
-fn markReachable(graph: *const Graph, reachable: []bool, id: NodeId) void {
-    if (id == null_node or id >= reachable.len) return;
-    if (reachable[id]) return; // already visited
-
-    reachable[id] = true;
-
-    const n = graph.node(id);
-    for (n.getInputs()) |input_id| {
-        markReachable(graph, reachable, input_id);
-    }
-    // Note: we do NOT follow vjp_alternate — those are for autograd only.
-}
+pub const computeReachable = ml.graph.passes.dce.computeReachable;
+pub const computeReachableFromNodes = ml.graph.passes.dce.computeReachableFromNodes;
 
 /// Compute the last node index that uses each node as an input.
 /// Used for liveness-based tensor freeing.
@@ -2861,7 +2819,7 @@ pub fn executeNode(
 
         .fused_add_mul_scalar => |attrs| {
             if (attrs.scale_before_add) {
-                if (try cb.addMultiplyScalarTensor(V.get(ins[0]), V.get(ins[1]), V.get(ins[2]))) |fused| return fused;
+                if (!attrs.separate_rounding) if (try cb.addMultiplyScalarTensor(V.get(ins[0]), V.get(ins[1]), V.get(ins[2]))) |fused| return fused;
                 const scaled = try cb.multiply(V.get(ins[0]), V.get(ins[2]));
                 defer cb.free(scaled);
                 return cb.add(scaled, V.get(ins[1]));
@@ -2966,8 +2924,7 @@ pub fn executeNode(
         },
 
         .fused_cross_attention => |attrs| {
-            const mask = state.options.cross_attention_mask orelse
-                return error.MissingRuntimeInput;
+            const mask: ?[]const i64 = if (attrs.all_keys_visible) null else state.options.cross_attention_mask orelse return error.MissingRuntimeInput;
             return cb.crossAttention(
                 V.get(ins[0]),
                 V.get(ins[1]),
@@ -5261,7 +5218,7 @@ const TestCompute = struct {
     fn stubSdpa(_: *anyopaque, _: CT, _: CT, _: CT, _: []const i64, _: ?CT, _: usize, _: usize, _: usize, _: usize) anyerror!CT {
         return error.UnsupportedPrimitiveOp;
     }
-    fn stubCrossAttn(_: *anyopaque, _: CT, _: CT, _: CT, _: []const i64, _: usize, _: usize, _: usize, _: usize, _: usize) anyerror!CT {
+    fn stubCrossAttn(_: *anyopaque, _: CT, _: CT, _: CT, _: ?[]const i64, _: usize, _: usize, _: usize, _: usize, _: usize) anyerror!CT {
         return error.UnsupportedPrimitiveOp;
     }
     fn stubRelPosBias(_: *anyopaque, _: CT, _: usize, _: usize, _: usize, _: usize, _: usize, _: bool) anyerror!CT {

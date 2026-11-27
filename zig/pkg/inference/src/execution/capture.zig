@@ -135,7 +135,7 @@ pub const Forward = struct {
     fingerprint: u64,
     /// Authored native schedules retain their original projection calls and
     /// packed weight operands; only unreachable nodes are removed.
-    optimization: enum { general, authored_schedule } = .general,
+    optimization: enum { general, authored_schedule, provider_fusion } = .general,
     /// Assigned CUDA inputs trade a device copy for stable reusable banks.
     /// Callers opt in only after qualifying their workload's replay benefit.
     device_inputs: enum { direct, assigned } = .direct,
@@ -239,7 +239,11 @@ pub fn trace(allocator: std.mem.Allocator, forward: Forward, inputs: []const Inp
         };
         if (!external) try bindings.append(allocator, .{ .name = graph.parameterName(graph.node(node)), .node_id = node, .kind = .weight });
     }
-    return program.ModelProgram.initWithPipeline(allocator, graph, bindings.items, if (forward.optimization == .authored_schedule) ml.graph.passes.pipeline.Pipeline.cleanup else ml.graph.passes.pipeline.Pipeline.default);
+    return program.ModelProgram.initWithPipeline(allocator, graph, bindings.items, switch (forward.optimization) {
+        .general => ml.graph.passes.pipeline.Pipeline.default,
+        .authored_schedule => ml.graph.passes.pipeline.Pipeline.cleanup,
+        .provider_fusion => ml.graph.passes.pipeline.Pipeline.provider_fusion,
+    });
 }
 
 const TestForward = struct {

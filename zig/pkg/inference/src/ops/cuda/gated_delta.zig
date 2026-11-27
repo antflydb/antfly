@@ -148,11 +148,13 @@ comptime {
         @compileError("LightOn prefix batch ABI changed");
 }
 
+pub const max_packet_rows = @typeInfo(@FieldType(BatchParams, "pages")).array.len;
+
 pub const RaggedParams = extern struct {
     base: BatchParams,
-    offsets: [64]u32 = @splat(0),
-    lengths: [64]u32 = @splat(0),
-    initialized: [64]u32 = @splat(0),
+    offsets: [max_packet_rows]u32 = @splat(0),
+    lengths: [max_packet_rows]u32 = @splat(0),
+    initialized: [max_packet_rows]u32 = @splat(0),
 };
 comptime {
     if (@sizeOf(RaggedParams) != 2408 or @offsetOf(RaggedParams, "offsets") != 1640 or
@@ -171,6 +173,24 @@ const Program = @import("embedded_module.zig").EmbeddedModule(struct {
 pub fn packetGeometrySupported(key_heads: usize, value_heads: usize, dim: usize, value_dim: usize, conv_kernel: usize) bool {
     return dim == 128 and value_dim == 128 and conv_kernel == 4 and key_heads == 16 and (value_heads == 16 or value_heads == 32);
 }
+
+/// The convolution and recurrent intermediates are private to the packet
+/// and retire together after submission.
+pub const PacketScratch = struct {
+    core_offset: usize,
+    bytes: usize,
+
+    pub fn forHeads(rows: usize, key_heads: usize, value_heads: usize) !PacketScratch {
+        if (!packetGeometrySupported(key_heads, value_heads, 128, 128, 4)) return error.InvalidShape;
+        return init(rows, (2 * key_heads + value_heads) * 128, value_heads * 128);
+    }
+
+    pub fn init(rows: usize, channels: usize, width: usize) !PacketScratch {
+        const core_offset = try std.math.mul(usize, try std.math.mul(usize, rows, channels), @sizeOf(f32));
+        const core_bytes = try std.math.mul(usize, try std.math.mul(usize, rows, width), @sizeOf(f32));
+        return .{ .core_offset = core_offset, .bytes = try std.math.add(usize, core_offset, core_bytes) };
+    }
+};
 
 pub const Module = struct {
     program: Program = .{},

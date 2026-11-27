@@ -25,6 +25,29 @@ const prepared = @import("prepared_cache.zig");
 const CacheQuota = @import("cache_quota.zig").Quota;
 const Cleanup = @import("../../execution/cleanup_context.zig").Context;
 
+/// A graph-owned reference to independently retained output storage. The
+/// backing descriptor in the arena is borrowed and remains address-stable.
+pub const RetainedOutput = struct {
+    owner: *anyopaque,
+    quota: *CacheQuota,
+    retirement_slot: *?*@import("cache_retirement.zig").PreparedQuotas.Slot,
+    release: *const fn (*anyopaque, Cleanup) void,
+
+    fn validateCleanup(self: RetainedOutput, current: Cleanup) !void {
+        if (self.retirement_slot.*) |slot| {
+            try slot.validateCleanup(current);
+        } else {
+            try self.quota.validateCleanup(current);
+        }
+    }
+
+    fn park(self: RetainedOutput, quotas: *@import("cache_retirement.zig").PreparedQuotas) void {
+        std.debug.assert(self.retirement_slot.* == null);
+        if (self.quota.peek()) |lease|
+            self.retirement_slot.* = quotas.reserve(lease) catch unreachable;
+    }
+};
+
 pub fn Program(comptime Recipe: type) type {
     return struct {
         pub const packed_limit = Recipe.packed_limit;
@@ -73,6 +96,8 @@ pub fn Program(comptime Recipe: type) type {
             weight_generation: usize = 0,
             buffers: [11]Buffer = @splat(.{}),
             quota: CacheQuota = .none,
+            output_quota: CacheQuota = .none,
+            retained_output: ?RetainedOutput = null,
             graph: driver.CUgraphExec = null,
             warm: bool = false,
             disabled: bool = false,
@@ -157,8 +182,11 @@ pub fn Program(comptime Recipe: type) type {
                 for (self.buffers, sizes) |buffer, size| if (buffer.len != size) return false;
                 return true;
             }
+            pub fn outputLease(self: *const Arena) ?memory.AdmissionLease {
+                return if (self.retained_output) |output| output.quota.peek() else self.output_quota.peek();
+            }
             pub fn hasBacking(self: *const Arena) bool {
-                return self.bytes() != 0 or self.logical_upload != null or self.graph != null or self.completion != null or self.timing != null or self.quota.hasLease();
+                return self.bytes() != 0 or self.logical_upload != null or self.graph != null or self.completion != null or self.timing != null or self.quota.hasLease() or self.output_quota.hasLease() or self.retained_output != null;
             }
             pub fn attentionWorkspacesMatch(self: *const Arena, attention: usize, global_attention: usize, global_generation: u64, blas: usize) bool {
                 return self.attention_workspace == attention and self.global_attention_workspace == global_attention and self.global_attention_generation == global_generation and self.blas_workspace == blas;
@@ -190,9 +218,9 @@ pub fn Program(comptime Recipe: type) type {
                 return total;
             }
             pub const GraphAction = enum { eager, capture, replay };
-            pub fn graphAction(self: *const Arena) GraphAction {
+            pub fn graphAction(self: *const Arena, capture_ready: bool) GraphAction {
                 if (self.graph != null) return if (self.preferReplay()) .replay else .eager;
-                return if (self.warm and !self.disabled) .capture else .eager;
+                return if (capture_ready and !self.disabled) .capture else .eager;
             }
             pub fn preferReplay(self: *const Arena) bool {
                 if (self.replay_samples < 2) return true;
@@ -210,7 +238,34 @@ pub fn Program(comptime Recipe: type) type {
                 samples.* +|= 1;
                 self.timed_uses +%= 1;
             }
+            /// Collect only completed device samples without waiting on the stream.
+            pub fn pollTiming(self: *Arena, ctx: *Context) void {
+                const replay = self.timing_replay orelse return;
+                const pair = self.timing orelse return;
+                var ms: f32 = 0;
+                const status = ctx.driver.fns.cuEventElapsedTime(&ms, pair.start, pair.end);
+                if (status != driver.CUDA_ERROR_NOT_READY) self.timing_replay = null;
+                const ns = @as(f64, ms) * std.time.ns_per_ms;
+                if (status == driver.CUDA_SUCCESS and ns > 0 and ns < @as(f64, @floatFromInt(std.math.maxInt(u64)))) {
+                    self.recordCompleted(replay, @intFromFloat(ns));
+                }
+            }
+
+            pub fn beginTiming(self: *Arena, ctx: *Context) !?@import("context.zig").ProfileEventPair {
+                if (self.graph == null or self.timing_replay != null) return null;
+                if (self.timing == null) self.timing = ctx.createProfileEventPair() catch return null;
+                const pair = self.timing.?;
+                try ctx.recordProfileStart(pair);
+                return pair;
+            }
+
+            pub fn endTiming(self: *Arena, ctx: *Context, pair: @import("context.zig").ProfileEventPair, replay: bool) !void {
+                try ctx.recordProfileEnd(pair);
+                self.timing_replay = replay;
+            }
+
             pub fn resetTiming(self: *Arena) void {
+                self.timing_replay = null;
                 self.eager_samples = 0;
                 self.replay_samples = 0;
                 self.eager_ns = 0;
@@ -225,6 +280,8 @@ pub fn Program(comptime Recipe: type) type {
             }
             fn deinit(self: *Arena, ctx: *Context) void {
                 self.quota.validateLegacyRaw() catch @import("antfly_platform").inference_process_supervisor.restartWorker(); // BEFORE graph/event/buffer SDK destruction
+                std.debug.assert(self.retained_output == null); // only prepared output can be retained
+                self.output_quota.validateLegacyRaw() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
                 if (self.timing) |*pair| {
                     ctx.destroyEventChecked(&pair.start) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
                     ctx.destroyEventChecked(&pair.end) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
@@ -235,6 +292,7 @@ pub fn Program(comptime Recipe: type) type {
                 for (&self.buffers) |*buffer| _ = buffer.freeChecked(ctx) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
                 if (self.logical_upload) |upload| std.heap.smp_allocator.destroy(upload);
                 self.quota.releaseLegacyRawAfterSdkDeath() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+                self.output_quota.releaseLegacyRawAfterSdkDeath() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
                 self.* = .{};
             }
         };
@@ -308,7 +366,7 @@ pub fn Program(comptime Recipe: type) type {
             }
         };
         fn selectArenaLayout(self: anytype, request: prepared.Arena) !?Cache.ArenaSelection {
-            if (!Recipe.acceptsArena(request.kind, request.batch, request.sequence)) return null;
+            if (!Recipe.acceptsArena(request.kind, request.batch, request.sequence) or !try Recipe.validateArena(request)) return null;
             for (self.arenas, 0..) |entry, index| if (@backingInt(entry.kind) == @backingInt(request.kind) and entry.grid_x == request.grid_x and entry.grid_y == request.grid_y and entry.sequence == request.sequence and entry.batch == request.batch and entry.mask_kind == request.mask_kind) {
                 if (!entry.sizesMatch(request.sizes)) return error.InvalidCudaState;
                 return .{ .index = index, .hit = true, .victims = 0, .bytes = entry.bytes() };
@@ -358,18 +416,27 @@ pub fn Program(comptime Recipe: type) type {
             pub fn retirementLeaseCount(self: *const Cache, controller: *?*memory.AdmissionController) !usize {
                 const quotas = @import("cache_retirement.zig");
                 var count: usize = 0;
-                for (self.arenas) |arena_value| count += try quotas.scanLease(arena_value.quota.peek(), controller);
+                for (self.arenas) |arena_value| {
+                    count += try quotas.scanLease(arena_value.quota.peek(), controller);
+                    count += try quotas.scanLease(arena_value.outputLease(), controller);
+                }
                 var iterator = self.weights.iterator();
                 while (iterator.next()) |entry| count += try quotas.scanLease(entry.value_ptr.quota.peek(), controller);
                 return count;
             }
             pub fn parkRetirementLeases(self: *Cache, quotas: *@import("cache_retirement.zig").PreparedQuotas) void {
-                for (&self.arenas) |*entry| entry.quota.park(quotas);
+                for (&self.arenas) |*entry| {
+                    entry.quota.park(quotas);
+                    if (entry.retained_output) |output| output.park(quotas) else entry.output_quota.park(quotas);
+                }
                 var iterator = self.weights.iterator();
                 while (iterator.next()) |entry| entry.value_ptr.quota.park(quotas);
             }
             pub fn validateCleanup(self: *const Cache, current: Cleanup) !void {
-                for (self.arenas) |entry| try entry.quota.validateCleanup(current);
+                for (self.arenas) |entry| {
+                    try entry.quota.validateCleanup(current);
+                    if (entry.retained_output) |output| try output.validateCleanup(current) else try entry.output_quota.validateCleanup(current);
+                }
                 var iterator = self.weights.iterator();
                 while (iterator.next()) |entry| try entry.value_ptr.quota.validateCleanup(current);
             }
@@ -403,6 +470,8 @@ pub fn Program(comptime Recipe: type) type {
                         entry.logical_upload = null;
                     }
                     try entry.quota.releaseAfterSdkDeath(current);
+                    if (entry.retained_output) |output| output.release(output.owner, current);
+                    try entry.output_quota.releaseAfterSdkDeath(current);
                     entry.* = .{};
                 }
                 var iterator = self.weights.iterator();
@@ -425,6 +494,8 @@ pub fn Program(comptime Recipe: type) type {
                 for (&self.arenas) |*entry| {
                     if (entry.logical_upload) |upload| std.heap.smp_allocator.destroy(upload);
                     entry.quota.releaseOutsideExecution();
+                    if (entry.retained_output) |output| output.release(output.owner, .{ .outside_execution = true });
+                    entry.output_quota.releaseOutsideExecution();
                 }
                 var iterator = self.weights.iterator();
                 while (iterator.next()) |entry| {
@@ -480,32 +551,13 @@ pub fn Program(comptime Recipe: type) type {
                 return buffer;
             }
 
-            pub fn arena(self: *Cache, ctx: *Context, batch: usize, sequence: usize, mask_kind: u8, sizes: [11]usize) !?*Arena {
-                return self.arenaFor(ctx, .encoder, batch, sequence, mask_kind, 0, 0, sizes);
-            }
-
-            pub fn visionArena(self: *Cache, ctx: *Context, batch: usize, grid_x: usize, grid_y: usize, sizes: [11]usize) !?*Arena {
-                if (grid_x == 0 or grid_y == 0) return null;
-                const sequence = try std.math.mul(usize, grid_x, grid_y);
-                return self.arenaFor(ctx, .vision, batch, sequence, 0, grid_x, grid_y, sizes);
-            }
-
-            pub fn sourceVisionArena(self: *Cache, ctx: *Context, batch: usize, sequence: usize, grid_x: usize, grid_y: usize, sizes: [11]usize) !?*Arena {
-                const logical = try std.math.mul(usize, grid_x, grid_y);
-                _ = try @import("../kernel_geometry.zig").SourceGemmRows.resolve(logical, sequence);
-                return self.arenaFor(ctx, .vision, batch, sequence, 1, grid_x, grid_y, sizes);
-            }
-
-            pub fn audioArena(self: *Cache, ctx: *Context, key: u64, bytes: usize) !?*Arena {
-                return self.arenaFor(ctx, .audio, 1, 1, 0, @intCast(key), 0, .{ bytes, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
-            }
             pub const ArenaSelection = struct { index: usize, hit: bool, victims: u8, bytes: usize };
             pub fn selectArena(self: *const Cache, request: prepared.Arena) !?ArenaSelection {
                 return selectArenaLayout(self, request);
             }
-            fn arenaFor(self: *Cache, ctx: *Context, kind: @FieldType(Arena, "kind"), batch: usize, sequence: usize, mask_kind: u8, grid_x: usize, grid_y: usize, sizes: [11]usize) !?*Arena {
-                const request: prepared.Arena = .{ .kind = @fromBackingInt(@intCast(@backingInt(kind))), .batch = batch, .sequence = sequence, .mask_kind = mask_kind, .grid_x = grid_x, .grid_y = grid_y, .sizes = sizes };
-                if (!Recipe.acceptsArena(kind, batch, sequence)) return null;
+            pub fn bindArenaRequest(self: *Cache, ctx: *Context, request: prepared.Arena) !?*Arena {
+                const kind: @FieldType(Arena, "kind") = @fromBackingInt(@intCast(@backingInt(request.kind)));
+                if (!Recipe.acceptsArena(kind, request.batch, request.sequence)) return null;
                 const preview = self.selectArena(request) catch |err| {
                     self.clock +|= 1;
                     return err;
@@ -513,7 +565,7 @@ pub fn Program(comptime Recipe: type) type {
                 self.clock +|= 1;
                 const selected = preview orelse return null;
                 if (!selected.hit and ctx.prepared_cache_funding == null) {
-                    for (self.arenas, 0..) |value, index| if (selected.victims & (@as(u8, 1) << @intCast(index)) != 0 and value.quota == .prepared) return null;
+                    for (self.arenas, 0..) |value, index| if (selected.victims & (@as(u8, 1) << @intCast(index)) != 0 and (value.quota == .prepared or value.output_quota == .prepared or value.retained_output != null)) return null;
                 }
                 if (!selected.hit and selected.victims != 0 and ctx.prepared_cache_funding != null) return null;
                 const entry = &self.arenas[selected.index];
@@ -528,13 +580,13 @@ pub fn Program(comptime Recipe: type) type {
                 };
                 var lease = prepared.acquire(ctx, .{ .arena = request }, .{ .backend_scratch_bytes = selected.bytes, .host_scratch_bytes = logicalUploadHostBytes(request.kind) }) catch return null;
                 errdefer lease.releaseAfterSdkDeath();
-                var candidate = Arena{ .kind = kind, .grid_x = grid_x, .grid_y = grid_y, .sequence = sequence, .batch = batch, .mask_kind = mask_kind };
+                var candidate = Arena{ .kind = kind, .grid_x = request.grid_x, .grid_y = request.grid_y, .sequence = request.sequence, .batch = request.batch, .mask_kind = request.mask_kind };
                 errdefer for (&candidate.buffers) |*buffer| {
                     if (lease.funded()) {
                         _ = buffer.freeChecked(ctx) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
                     } else buffer.free(ctx);
                 };
-                for (&candidate.buffers, sizes) |*buffer, size| {
+                for (&candidate.buffers, request.sizes) |*buffer, size| {
                     buffer.* = Buffer.allocWithPurpose(ctx, size, .model_cache) catch {
                         for (&candidate.buffers) |*allocated| {
                             if (lease.funded()) {
@@ -559,7 +611,9 @@ pub fn Program(comptime Recipe: type) type {
                 }
                 candidate.last_used = self.clock;
                 candidate.uses = 1;
-                candidate.quota = lease.publishQuota();
+                const quotas = lease.publishArenaQuotas();
+                candidate.quota = quotas[0];
+                candidate.output_quota = quotas[1];
                 entry.* = candidate;
                 self.next_arena += 1;
                 return entry;
@@ -587,17 +641,27 @@ test "retained CUDA execution accepts an independent typed recipe without model 
         pub fn compatible(_: Geometry, _: anytype, _: anytype, a: Capture, b: Capture, _: i32) !bool {
             return std.meta.eql(a, b);
         }
+        pub fn validateArena(_: prepared.Arena) !bool {
+            return true;
+        }
         pub fn extraEntryBytes(_: prepared.Arena) !usize {
             return 0;
         }
     };
     const P = Program(Other);
-    const cache: P.Cache = .{};
+    var cache: P.Cache = .{};
     var request = prepared.Arena{ .kind = .encoder, .batch = 1, .sequence = 8, .sizes = @splat(0) };
     request.sizes[0] = 64;
     try std.testing.expectEqual(@as(usize, 64), (try cache.selectArena(request)).?.bytes);
     request.sizes[0] = 65;
     try std.testing.expect((try cache.selectArena(request)) == null);
+    var binding_context: Context = undefined;
+    request.sizes[0] = 64;
+    cache.arenas[0] = .{ .kind = .encoder, .batch = 1, .sequence = 8 };
+    cache.arenas[0].buffers[0] = .{ .ptr = 0x1000, .len = 64 };
+    try std.testing.expectEqual(&cache.arenas[0], (try cache.bindArenaRequest(&binding_context, request)).?);
+    request.sizes[0] = 63;
+    try std.testing.expectError(error.InvalidCudaState, cache.bindArenaRequest(&binding_context, request));
     var upload: P.LogicalUpload = .{};
     var arena = P.Arena{ .batch = 1, .sequence = 8, .logical_upload = &upload, .warm = true };
     var context: Context = undefined;
@@ -605,6 +669,70 @@ test "retained CUDA execution accepts an independent typed recipe without model 
     arena.noteAttentionSource(.{ .sequence = 4, .all_valid = true }, .{ .generation = 1 });
     try arena.prepareAttentionSource(&context, .{ .sequence = 5, .all_valid = true }, .{ .generation = 1 });
     try std.testing.expect(arena.warm);
+    arena.timing_replay = true;
     try arena.prepareAttentionSource(&context, .{ .sequence = 5, .all_valid = true }, .{ .generation = 2 });
     try std.testing.expect(!arena.warm and arena.attention_source == null);
+    try std.testing.expect(arena.timing_replay == null);
+
+    try std.testing.expectEqual(P.Arena.GraphAction.eager, arena.graphAction(false));
+    try std.testing.expectEqual(P.Arena.GraphAction.capture, arena.graphAction(true));
+    arena.captureFailed(error.CudaDriverError);
+    try std.testing.expectEqual(P.Arena.GraphAction.eager, arena.graphAction(true));
+    arena.disabled = false;
+    arena.captureFailed(error.Cancelled);
+    try std.testing.expectEqual(P.Arena.GraphAction.capture, arena.graphAction(true));
+    arena.disabled = true;
+    try std.testing.expectEqual(P.Arena.GraphAction.eager, arena.graphAction(true));
+    arena.disabled = false;
+    var graph_marker: u8 = 0;
+    arena.graph = &graph_marker;
+    try std.testing.expectEqual(P.Arena.GraphAction.replay, arena.graphAction(false));
+    arena.replay_samples = 2;
+    try std.testing.expectEqual(P.Arena.GraphAction.eager, arena.graphAction(true));
+
+    const FailedLaunch = struct {
+        var waited: bool = false;
+        var destroyed: bool = false;
+
+        fn current(_: driver.CUcontext) callconv(.c) driver.CUresult {
+            return driver.CUDA_SUCCESS;
+        }
+
+        fn launch(_: driver.CUgraphExec, _: driver.CUstream) callconv(.c) driver.CUresult {
+            return 1;
+        }
+
+        fn wait(_: driver.CUstream) callconv(.c) driver.CUresult {
+            waited = true;
+            return driver.CUDA_SUCCESS;
+        }
+
+        fn destroy(_: driver.CUgraphExec) callconv(.c) driver.CUresult {
+            std.debug.assert(waited);
+            destroyed = true;
+            return driver.CUDA_SUCCESS;
+        }
+
+        fn describe(_: driver.CUresult, name: *?[*:0]const u8) callconv(.c) driver.CUresult {
+            name.* = "injected retained graph launch failure";
+            return driver.CUDA_SUCCESS;
+        }
+    };
+    var launch_context: Context = .{ .driver = undefined, .device = 0, .ctx = @ptrFromInt(1), .stream = null, .info = .{} };
+    launch_context.driver.fns.cuCtxSetCurrent = FailedLaunch.current;
+    launch_context.driver.fns.cuGraphLaunch = FailedLaunch.launch;
+    launch_context.driver.fns.cuStreamSynchronize = FailedLaunch.wait;
+    launch_context.driver.fns.cuGraphExecDestroy = FailedLaunch.destroy;
+    launch_context.driver.fns.cuGetErrorName = FailedLaunch.describe;
+    launch_context.driver.fns.cuGetErrorString = FailedLaunch.describe;
+    const backing: Buffer = .{ .ptr = 0x1000, .len = 64 };
+    var failed_arena: P.Arena = .{ .kind = .audio, .batch = 1, .sequence = 1, .graph = &graph_marker };
+    failed_arena.buffers[0] = backing;
+    FailedLaunch.waited = false;
+    FailedLaunch.destroyed = false;
+    @import("../../test_error_logs.zig").expectErrorLogs(1);
+    try std.testing.expectError(error.CudaDriverError, failed_arena.launch(&launch_context));
+    try std.testing.expect(FailedLaunch.destroyed and failed_arena.graph == null);
+    try std.testing.expectEqualDeep(backing, failed_arena.buffers[0]);
+    try std.testing.expectEqual(P.Arena.GraphAction.eager, failed_arena.graphAction(true));
 }

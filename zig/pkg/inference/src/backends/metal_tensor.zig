@@ -36,6 +36,30 @@ pub const StorageMode = enum(c_int) {
     private = 1,
 };
 
+/// A detached allocator capability. It pins the SDK device independently
+/// from the provider runtime and can be used during outside admission.
+pub const StandaloneDevice = struct {
+    handle: *anyopaque,
+
+    pub fn retain(runtime: *anyopaque) ?StandaloneDevice {
+        if (comptime !@import("build_options").enable_metal) return null;
+        return .{ .handle = antfly_metal_standalone_device_retain(runtime) orelse return null };
+    }
+
+    pub fn release(self: StandaloneDevice) void {
+        antfly_metal_standalone_device_release(self.handle);
+    }
+
+    pub fn allocationBytes(self: StandaloneDevice, bytes: usize, mode: StorageMode) ?usize {
+        const bound = antfly_metal_standalone_allocation_bytes_mode(self.handle, bytes, @backingInt(mode));
+        return if (bound < bytes or bound == 0) null else bound;
+    }
+
+    pub fn allocate(self: StandaloneDevice, bytes: usize, mode: StorageMode) ?*anyopaque {
+        return antfly_metal_standalone_buffer_alloc_mode(self.handle, bytes, @backingInt(mode));
+    }
+};
+
 pub const DType = enum(u8) {
     f32 = 0,
     i32 = 1,
@@ -71,6 +95,7 @@ const DeviceBufferRef = struct {
     /// An owned retain of external/runtime storage is not an allocation lease.
     /// Its final release must never make that storage available to the pool.
     recycle_on_drop: bool = true,
+    initialization_pending: bool = false,
     // Only exported legacy allocations with a successfully installed charge
     // witness bypass pooling. Ordinary kernel intermediate reuse is unchanged.
     retirement_witnessed: std.atomic.Value(bool) = .init(false),
@@ -528,6 +553,10 @@ fn registerWorkspaceReference(handle: *anyopaque, owns_handle: bool) bool {
 }
 extern fn termite_metal_decode_runtime_release_buffer(runtime: *anyopaque, handle: *anyopaque) void;
 extern fn antfly_metal_decode_runtime_release_charged_buffer(runtime: *anyopaque, handle: *anyopaque) void;
+extern fn antfly_metal_standalone_device_retain(runtime: *anyopaque) ?*anyopaque;
+extern fn antfly_metal_standalone_device_release(device: *anyopaque) void;
+extern fn antfly_metal_standalone_allocation_bytes_mode(device: *anyopaque, bytes: usize, storage_mode: c_int) usize;
+extern fn antfly_metal_standalone_buffer_alloc_mode(device: *anyopaque, bytes: usize, storage_mode: c_int) ?*anyopaque;
 extern fn termite_metal_buffer_contents(handle: *anyopaque) ?*anyopaque;
 extern fn termite_metal_buffer_download(
     runtime: *anyopaque,
@@ -538,7 +567,9 @@ extern fn termite_metal_buffer_download(
 ) c_int;
 fn downloadBuffer(runtime: *anyopaque, handle: *anyopaque, offset: usize, output: *anyopaque, bytes: usize) !void {
     try transfer_audit.checkDeviceHostAccess();
-    if (termite_metal_buffer_download(runtime, handle, offset, output, bytes) != 0) return error.MetalBufferDownloadFailed;
+    const status = termite_metal_buffer_download(runtime, handle, offset, output, bytes);
+    if (status == -8) return error.MetalFrameSyncFailed;
+    if (status != 0) return error.MetalBufferDownloadFailed;
     transfer_audit.download(bytes);
 }
 extern fn termite_metal_decode_runtime_flush_active_frame(runtime: *anyopaque) c_int;
@@ -714,17 +745,23 @@ pub const MetalTensor = struct {
     /// A view pins the plan's backing lease, and every retained metadata view
     /// shares that pin. The original backing reference remains independent.
     /// Allocate the ownership record before taking the pin so OOM is atomic.
-    pub fn deviceLeasedView(allocator: std.mem.Allocator, source: *const MetalTensor, lease: *@import("../ops/physical_storage.zig").Lease, dims: []const i32) !MetalTensor {
+    pub fn deviceLeasedView(allocator: std.mem.Allocator, source: *const MetalTensor, lease: *@import("../ops/physical_storage.zig").Lease, dims: []const i32, dtype: DType) !MetalTensor {
+        return deviceLeasedViewAt(allocator, source, lease, 0, dims, dtype);
+    }
+
+    pub fn deviceLeasedViewAt(allocator: std.mem.Allocator, source: *const MetalTensor, lease: *@import("../ops/physical_storage.zig").Lease, offset: usize, dims: []const i32, dtype: DType) !MetalTensor {
         const device = source.device orelse return error.UnsupportedTensorType;
         const handle = source.deviceHandle() orelse return error.ReleasedDeviceBuffer;
-        if (source.dtype != .f32 or dims.len > max_dims) return error.UnsupportedTensorType;
+        const start = try std.math.add(usize, device.byte_offset, offset);
+        if (dims.len > max_dims or start % dtype.byteSize() != 0) return error.UnsupportedTensorType;
         var elements: usize = 1;
         for (dims) |extent| {
             if (extent < 0) return error.InvalidTensorShape;
             elements = try std.math.mul(usize, elements, @intCast(extent));
         }
-        const bytes = try std.math.mul(usize, elements, @sizeOf(f32));
-        if (bytes > device.byte_len) return error.InvalidTensorShape;
+        const bytes = try std.math.mul(usize, elements, dtype.byteSize());
+        if (offset > device.byte_len or bytes > device.byte_len - offset or
+            offset > lease.byte_size or bytes > lease.byte_size - offset) return error.InvalidTensorShape;
         const ref = try allocator.create(DeviceBufferRef);
         ref.* = .{
             .handle = handle,
@@ -740,7 +777,7 @@ pub const MetalTensor = struct {
         };
         lease.retain();
         memoryAdd(.device_borrowed_tensors_created, 1);
-        return deviceView(ref, device.byte_offset, bytes, dims, .f32);
+        return deviceView(ref, start, bytes, dims, dtype);
     }
 
     /// True only for storage whose execution-plan lease pins every view and
@@ -904,6 +941,49 @@ pub const MetalTensor = struct {
         return deviceAllocateChecked(allocator, runtime, byte_len, mode, dims, true, .f32);
     }
 
+    /// A cold bank is still owned by the caller while its views are prepared.
+    /// Encoding, rather than allocation, retains it for the consuming frame.
+    pub fn deviceAllocateUnpublishedBank(allocator: std.mem.Allocator, runtime: *anyopaque, device: StandaloneDevice, byte_len: usize, mode: StorageMode, dims: []const i32) !MetalTensor {
+        if (comptime !@import("build_options").enable_metal) return error.MetalUnavailable;
+        if (dims.len > max_dims or byte_len == 0) return error.InvalidTensorShape;
+        var elements: usize = 1;
+        for (dims) |axis| {
+            if (axis <= 0) return error.InvalidTensorShape;
+            elements = try std.math.mul(usize, elements, @intCast(axis));
+        }
+        if (try std.math.mul(usize, elements, @sizeOf(f32)) != byte_len) return error.InvalidTensorShape;
+        // The provider supplies its device, but its active frame, pools and
+        // workspace budget have no custody of this separately admitted bank.
+        const ref = try allocator.create(DeviceBufferRef);
+        errdefer allocator.destroy(ref);
+        const handle = device.allocate(byte_len, mode) orelse return error.MetalBufferAllocFailed;
+        ref.* = .{
+            .handle = handle,
+            .runtime = runtime,
+            .byte_len = byte_len,
+            .ref_count = .init(1),
+            .released = false,
+            .release_on_drop = true,
+            .recycle_on_drop = false,
+            .initialization_pending = mode == .shared,
+            .allocator = allocator,
+        };
+        noteDeviceOwnedCreate(handle, byte_len, dims);
+        return deviceView(ref, 0, byte_len, dims, .f32);
+    }
+
+    /// The unique, unsubmitted Shared root may be initialized directly.
+    /// Complete the write before retaining a view or encoding any consumer.
+    pub fn beginUnpublishedF32Initialization(self: *MetalTensor) ![]f32 {
+        const dev = self.device orelse return error.InvalidPhysicalAllocation;
+        if (self.dtype != .f32 or dev.byte_offset != 0 or dev.byte_len != dev.ref.byte_len or
+            !dev.ref.initialization_pending or dev.ref.released or dev.ref.ref_count.load(.acquire) != 1) return error.InvalidPhysicalAllocation;
+        const raw = termite_metal_buffer_contents(dev.ref.handle) orelse return error.InvalidPhysicalAllocation;
+        dev.ref.initialization_pending = false;
+        const base: [*]f32 = @ptrCast(@alignCast(raw));
+        return base[0 .. dev.byte_len / @sizeOf(f32)];
+    }
+
     /// Allocate physical storage without converting or narrowing the dtype.
     pub fn deviceAllocateTyped(allocator: std.mem.Allocator, runtime: *anyopaque, dtype: DType, mode: StorageMode, dims: []const i32) !MetalTensor {
         var count: usize = 1;
@@ -924,7 +1004,7 @@ pub const MetalTensor = struct {
         dims: []const i32,
         admitted: bool,
     ) !MetalTensor {
-        return deviceAllocateCheckedImpl(allocator, runtime, byte_len, mode, dims, true, .f32, admitted);
+        return deviceAllocateCheckedImpl(allocator, runtime, byte_len, mode, dims, true, .f32, admitted, true);
     }
 
     fn deviceAllocateChecked(
@@ -936,7 +1016,7 @@ pub const MetalTensor = struct {
         fresh: bool,
         dtype: DType,
     ) !MetalTensor {
-        return deviceAllocateCheckedImpl(allocator, runtime, byte_len, mode, dims, fresh, dtype, false);
+        return deviceAllocateCheckedImpl(allocator, runtime, byte_len, mode, dims, fresh, dtype, false, true);
     }
 
     fn deviceAllocateCheckedImpl(
@@ -948,6 +1028,7 @@ pub const MetalTensor = struct {
         fresh: bool,
         dtype: DType,
         admitted: bool,
+        retain_in_active_frame: bool,
     ) !MetalTensor {
         if (dims.len > max_dims) return error.InvalidTensorShape;
         var elements: usize = 1;
@@ -976,6 +1057,7 @@ pub const MetalTensor = struct {
             .ref_count = .init(1),
             .released = false,
             .release_on_drop = true,
+            .recycle_on_drop = retain_in_active_frame,
             .retirement_witnessed = .init(admitted),
             .workspace_reference = registerWorkspaceReference(handle, true),
             .allocator = allocator,
@@ -983,7 +1065,7 @@ pub const MetalTensor = struct {
         var result = deviceView(ref, 0, byte_len, dims, dtype);
         noteDeviceOwnedCreate(handle, byte_len, dims);
         errdefer result.deinit();
-        try result.retainForActiveFrame();
+        if (retain_in_active_frame) try result.retainForActiveFrame();
         return result;
     }
 
@@ -1076,6 +1158,23 @@ pub const MetalTensor = struct {
         const count = byte_len / @sizeOf(f32);
         if (start + count > self.len) return error.InvalidTensorShape;
         return ownedCloneFrom(self.data[start .. start + count], dims);
+    }
+
+    /// Retain a typed, bounded region of a device arena. The byte view
+    /// stays pinned to the original backing even when the arena handle retires.
+    pub fn retainedTypedView(self: *const MetalTensor, offset: usize, dims: []const i32, dtype: DType) !MetalTensor {
+        const device = self.device orelse return error.UnsupportedTensorType;
+        if (dims.len > max_dims) return error.InvalidTensorShape;
+        var elements: usize = 1;
+        for (dims) |extent| {
+            if (extent < 0) return error.InvalidTensorShape;
+            elements = try std.math.mul(usize, elements, @intCast(extent));
+        }
+        const bytes = try std.math.mul(usize, elements, dtype.byteSize());
+        if (offset > device.byte_len or bytes > device.byte_len - offset) return error.InvalidTensorShape;
+        const start = try std.math.add(usize, device.byte_offset, offset);
+        if (start % dtype.byteSize() != 0) return error.InvalidTensorShape;
+        return deviceView(try retainDeviceBuffer(device.ref), start, bytes, dims, dtype);
     }
 
     pub fn retainedStorageView(
@@ -1405,10 +1504,16 @@ pub const MetalTensor = struct {
     /// passing through an f32 host mirror or mutating resident storage.
     pub fn downloadBytesInto(self: *const MetalTensor, output: []u8) !void {
         const dev = self.device orelse return error.UnsupportedTensorType;
-        if (dev.ref.released or dev.ref.ref_count.load(.acquire) == 0) return error.ReleasedDeviceBuffer;
         if (output.len != dev.byte_len) return error.InvalidTensorShape;
-        if (termite_metal_decode_runtime_flush_active_frame(dev.ref.runtime) != 0) return error.MetalFrameSyncFailed;
-        try downloadBuffer(dev.ref.runtime, dev.ref.handle, dev.byte_offset, @ptrCast(output.ptr), dev.byte_len);
+        return self.downloadByteRangeInto(0, output);
+    }
+
+    pub fn downloadByteRangeInto(self: *const MetalTensor, offset: usize, output: []u8) !void {
+        const dev = self.device orelse return error.UnsupportedTensorType;
+        if (dev.ref.released or dev.ref.ref_count.load(.acquire) == 0) return error.ReleasedDeviceBuffer;
+        if (offset > dev.byte_len or output.len > dev.byte_len - offset) return error.InvalidTensorShape;
+        if (output.len == 0) return;
+        try downloadBuffer(dev.ref.runtime, dev.ref.handle, dev.byte_offset + offset, @ptrCast(output.ptr), output.len);
     }
 
     pub fn uploadBytes(self: *MetalTensor, input: []const u8) !void {

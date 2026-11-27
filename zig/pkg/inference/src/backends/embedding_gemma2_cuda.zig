@@ -63,6 +63,19 @@ const Recipe = struct {
     pub fn acceptsArena(kind: anytype, batch: usize, sequence: usize) bool {
         return batch != 0 and batch <= (if (kind == .encoder) @as(usize, 4) else 8) and sequence != 0 and sequence <= model.official_max_input_tokens and batch <= @This().graph_rows_limit / sequence;
     }
+    pub fn validateArena(request: prepared.Arena) !bool {
+        if (request.kind != .vision) return true;
+        const logical = try std.math.mul(usize, request.grid_x, request.grid_y);
+        return switch (request.mask_kind) {
+            0 => logical != 0 and request.sequence == logical,
+            1 => source: {
+                _ = @import("../ops/kernel_geometry.zig").SourceGemmRows.resolve(logical, request.sequence) catch
+                    return error.InvalidEmbeddingGemma2VisionShape;
+                break :source true;
+            },
+            else => false,
+        };
+    }
     pub fn encoderGeometry(kind: anytype, batch: usize, sequence: usize) !Geometry {
         if (kind != .encoder or !acceptsArena(kind, batch, sequence)) return invalid_geometry;
         return .{ .batch = std.math.cast(u32, batch) orelse return invalid_geometry, .sequence = std.math.cast(u32, sequence) orelse return invalid_geometry };
@@ -189,13 +202,13 @@ test "embeddinggemma2 execution cache retains shared admission and releases grap
     ctx.driver.fns.cuGraphExecDestroy = Mock.graph;
     var cache = Cache{};
     defer cache.clear(std.testing.allocator, &ctx) catch unreachable;
-    try std.testing.expect((try cache.arena(&ctx, 4, 1025, 0, @splat(16))) == null);
-    const first = (try cache.arena(&ctx, 1, 64, 1, @splat(16))).?;
-    try std.testing.expect(first == (try cache.arena(&ctx, 1, 64, 1, @splat(16))).?);
-    try std.testing.expectError(error.InvalidCudaState, cache.arena(&ctx, 1, 64, 1, @splat(32)));
+    try std.testing.expect((try cache.bindArenaRequest(&ctx, .{ .kind = .encoder, .batch = 4, .sequence = 1025, .mask_kind = 0, .sizes = @splat(16) })) == null);
+    const first = (try cache.bindArenaRequest(&ctx, .{ .kind = .encoder, .batch = 1, .sequence = 64, .mask_kind = 1, .sizes = @splat(16) })).?;
+    try std.testing.expect(first == (try cache.bindArenaRequest(&ctx, .{ .kind = .encoder, .batch = 1, .sequence = 64, .mask_kind = 1, .sizes = @splat(16) })).?);
+    try std.testing.expectError(error.InvalidCudaState, cache.bindArenaRequest(&ctx, .{ .kind = .encoder, .batch = 1, .sequence = 64, .mask_kind = 1, .sizes = @splat(32) }));
     const pointer = first.buffers[0].ptr;
     first.graph = @ptrFromInt(3);
-    const cohort = (try cache.arena(&ctx, 1, 64, 2, @splat(16))).?;
+    const cohort = (try cache.bindArenaRequest(&ctx, .{ .kind = .encoder, .batch = 1, .sequence = 64, .mask_kind = 2, .sizes = @splat(16) })).?;
     try std.testing.expect(first != cohort);
     try std.testing.expectEqual(pointer, first.buffers[0].ptr);
     _ = (try cache.allocatePacked(std.testing.allocator, &ctx, "qkv", 512)).?;
@@ -216,7 +229,7 @@ test "embeddinggemma2 execution cache retains shared admission and releases grap
     const before_denial = controller.snapshot();
     const allocations_before_denial = ctx.device_allocations.snapshot();
     ctx.video_cache_budget.admission.?.limits.host_limit_bytes = @sizeOf(LogicalUpload) - 1;
-    try std.testing.expect((try cache.arena(&ctx, 1, 64, 1, @splat(16))) == null);
+    try std.testing.expect((try cache.bindArenaRequest(&ctx, .{ .kind = .encoder, .batch = 1, .sequence = 64, .mask_kind = 1, .sizes = @splat(16) })) == null);
     try std.testing.expectEqualDeep(before_denial, controller.snapshot());
     try std.testing.expectEqualDeep(allocations_before_denial, ctx.device_allocations.snapshot());
     ctx.video_cache_budget.admission.?.limits.host_limit_bytes = 0;
@@ -224,19 +237,19 @@ test "embeddinggemma2 execution cache retains shared admission and releases grap
     _ = (try other.allocatePacked(std.testing.allocator, &ctx, "gate", 256)).?;
     try other.discardPacked(std.testing.allocator, &ctx, "gate");
     try std.testing.expectEqual(@as(usize, 0), ctx.device_allocations.snapshot().live);
-    const large = (try cache.arena(&ctx, 4, 1024, 1, @splat(16))).?;
-    try std.testing.expect(large == (try cache.arena(&ctx, 4, 1024, 1, @splat(16))).?);
-    const smaller_batch = (try cache.arena(&ctx, 2, 1024, 1, @splat(16))).?;
+    const large = (try cache.bindArenaRequest(&ctx, .{ .kind = .encoder, .batch = 4, .sequence = 1024, .mask_kind = 1, .sizes = @splat(16) })).?;
+    try std.testing.expect(large == (try cache.bindArenaRequest(&ctx, .{ .kind = .encoder, .batch = 4, .sequence = 1024, .mask_kind = 1, .sizes = @splat(16) })).?);
+    const smaller_batch = (try cache.bindArenaRequest(&ctx, .{ .kind = .encoder, .batch = 2, .sequence = 1024, .mask_kind = 1, .sizes = @splat(16) })).?;
     try std.testing.expect(large != smaller_batch);
-    const vision = (try cache.visionArena(&ctx, 2, 32, 32, @splat(16))).?;
+    const vision = (try cache.bindArenaRequest(&ctx, .{ .kind = .vision, .batch = 2, .sequence = 32 * 32, .grid_x = 32, .grid_y = 32, .sizes = @splat(16) })).?;
     try std.testing.expect(vision != smaller_batch);
     vision.geometry_ready = true;
-    try std.testing.expect(vision == (try cache.visionArena(&ctx, 2, 32, 32, @splat(16))).?);
+    try std.testing.expect(vision == (try cache.bindArenaRequest(&ctx, .{ .kind = .vision, .batch = 2, .sequence = 32 * 32, .grid_x = 32, .grid_y = 32, .sizes = @splat(16) })).?);
     try std.testing.expect(vision.geometry_ready);
-    const rotated = (try cache.visionArena(&ctx, 2, 64, 16, @splat(16))).?;
+    const rotated = (try cache.bindArenaRequest(&ctx, .{ .kind = .vision, .batch = 2, .sequence = 64 * 16, .grid_x = 64, .grid_y = 16, .sizes = @splat(16) })).?;
     try std.testing.expect(vision != rotated and !rotated.geometry_ready);
     try std.testing.expectEqual(@as(usize, 704), controller.snapshot().backend_scratch_bytes);
-    try std.testing.expect((try cache.visionArena(&ctx, 8, 32, 32, @splat(16))) == null);
+    try std.testing.expect((try cache.bindArenaRequest(&ctx, .{ .kind = .vision, .batch = 8, .sequence = 32 * 32, .grid_x = 32, .grid_y = 32, .sizes = @splat(16) })) == null);
 }
 
 test "embeddinggemma2 graph cancellation keeps capture retryable" {
@@ -344,17 +357,17 @@ test "embeddinggemma2 graph retention keeps mixed stages and fences only replace
     sizes[0] = 16;
     var first: usize = 0;
     for (1..9) |seq| {
-        const slot = (try cache.arena(&ctx, 1, seq, 0, sizes)).?;
+        const slot = (try cache.bindArenaRequest(&ctx, .{ .kind = .encoder, .batch = 1, .sequence = seq, .mask_kind = 0, .sizes = sizes })).?;
         if (seq == 1) first = slot.buffers[0].ptr;
         slot.noteUse(&ctx);
     }
     try std.testing.expectEqual(@as(usize, 0), Mock.barriers);
     try std.testing.expectEqual(@as(usize, 0), Mock.waits);
-    try std.testing.expectEqual(first, (try cache.arena(&ctx, 1, 1, 0, sizes)).?.buffers[0].ptr);
-    _ = try cache.visionArena(&ctx, 1, 3, 3, sizes);
+    try std.testing.expectEqual(first, (try cache.bindArenaRequest(&ctx, .{ .kind = .encoder, .batch = 1, .sequence = 1, .mask_kind = 0, .sizes = sizes })).?.buffers[0].ptr);
+    _ = try cache.bindArenaRequest(&ctx, .{ .kind = .vision, .batch = 1, .sequence = 3 * 3, .grid_x = 3, .grid_y = 3, .sizes = sizes });
     try std.testing.expectEqual(@as(usize, 1), Mock.waits);
     try std.testing.expectEqual(@as(usize, 0), Mock.barriers);
-    try std.testing.expectEqual(first, (try cache.arena(&ctx, 1, 1, 0, sizes)).?.buffers[0].ptr);
+    try std.testing.expectEqual(first, (try cache.bindArenaRequest(&ctx, .{ .kind = .encoder, .batch = 1, .sequence = 1, .mask_kind = 0, .sizes = sizes })).?.buffers[0].ptr);
 }
 
 test "arena cold chronology uses same selector for full and partial batches without mutating original cache" {
@@ -484,10 +497,10 @@ test "CUDA retained cache purposes reach uniform report across checked free fail
     try std.testing.expectEqual(@as(u64, 0), failed.frees);
     try std.testing.expectEqual(packed_buffer.ptr, cache.findPacked("telemetry.packed").?.ptr);
     Mock.fail_free = false;
-    const arena = (try cache.arena(&ctx, 1, 16, 0, @splat(16))).?;
+    const arena = (try cache.bindArenaRequest(&ctx, .{ .kind = .encoder, .batch = 1, .sequence = 16, .mask_kind = 0, .sizes = @splat(16) })).?;
     for (arena.buffers) |buffer| try std.testing.expectEqual(Purpose.model_cache, buffer.allocation_purpose);
     const allocations = ctx.device_allocations.snapshot().allocations;
-    try std.testing.expect(arena == (try cache.arena(&ctx, 1, 16, 0, @splat(16))).?);
+    try std.testing.expect(arena == (try cache.bindArenaRequest(&ctx, .{ .kind = .encoder, .batch = 1, .sequence = 16, .mask_kind = 0, .sizes = @splat(16) })).?);
     try std.testing.expectEqual(allocations, ctx.device_allocations.snapshot().allocations);
     var unknown = try Buffer.alloc(&ctx, 32);
     defer _ = unknown.freeChecked(&ctx) catch unreachable;
@@ -568,7 +581,7 @@ test "CUDA encoder graph refresh preserves physical banks across logical source 
     sizes[3] = q_elements * 2;
     sizes[4] = try encoderMaskBytes(192);
     sizes[5] = scratch_bytes;
-    const entry = (try cache.arena(&ctx, 1, 192, 1, sizes)) orelse return error.TestUnexpectedResult;
+    const entry = (try cache.bindArenaRequest(&ctx, .{ .kind = .encoder, .batch = 1, .sequence = 192, .mask_kind = 1, .sizes = sizes })) orelse return error.TestUnexpectedResult;
     const a = std.testing.allocator;
     const zeros = try a.alloc(u16, q_elements);
     defer a.free(zeros);
@@ -609,7 +622,7 @@ test "CUDA encoder graph refresh preserves physical banks across logical source 
             const source: AttentionSource = .{ .sequence = program.source_sequence, .all_valid = true };
             try prepareAttentionSource(arena, context, source, config, .{}, .{});
             try arena.uploadLogical(context, program.logical_metadata, source);
-            const action = arena.graphAction();
+            const action = arena.graphAction(arena.warm);
             switch (action) {
                 .eager => {
                     try m.launchLocalFlashAttention(context, arena.buffers[3], arena.buffers[0], arena.buffers[1], arena.buffers[2], arena.buffers[4], program, arena.buffers[5]);
@@ -642,7 +655,7 @@ test "CUDA encoder graph refresh preserves physical banks across logical source 
     // Actual old captured scalar arguments remain177 despite the new mask.
     try ctx.launchGraph(entry.graph);
     try Fixture.check(&ctx, entry, output, 178, 0);
-    const same = (try cache.arena(&ctx, 1, 192, 1, sizes)) orelse return error.TestUnexpectedResult;
+    const same = (try cache.bindArenaRequest(&ctx, .{ .kind = .encoder, .batch = 1, .sequence = 192, .mask_kind = 1, .sizes = sizes })) orelse return error.TestUnexpectedResult;
     try std.testing.expect(same == entry);
     try std.testing.expect(!entry.attentionSourceMatches(.{ .sequence = 178, .all_valid = true }));
     try entry.invalidateGraph(&ctx); // SAME receiver used by production.
@@ -742,7 +755,7 @@ test "encoder retained logical metadata rejects topology changes without borrowi
     entry.eager_samples = 1;
     try prepareAttentionSource(&entry, &ctx, next, config, .{ .graph_replay = true }, .{});
     try std.testing.expect(entry.warm); // next logical request can capture
-    try std.testing.expectEqual(Arena.GraphAction.capture, entry.graphAction());
+    try std.testing.expectEqual(Arena.GraphAction.capture, entry.graphAction(entry.warm));
     try std.testing.expectEqual(@as(u8, 0), entry.eager_samples);
     try std.testing.expectEqual(@as(usize, 177), entry.attention_source.?.sequence); // not published before execution
     var changed = config;
@@ -854,6 +867,13 @@ test "source vision fixed attention plane extends only its entry and preserves t
     try std.testing.expect((try preview.select(malformed)) == null);
     malformed = request;
     malformed.grid_x = 0;
+    try std.testing.expectError(error.InvalidEmbeddingGemma2VisionShape, preview.select(malformed));
+    // Geometry is checked even when there is no fixed attention plane.
+    malformed.sizes[10] = 0;
+    try std.testing.expectError(error.InvalidEmbeddingGemma2VisionShape, preview.select(malformed));
+    malformed = request;
+    malformed.sizes = @splat(0);
+    malformed.sequence = 2339;
     try std.testing.expectError(error.InvalidEmbeddingGemma2VisionShape, preview.select(malformed));
     // One independently retained arena cannot provide free source-bank credit.
     preview.arenas[0] = .{ .sequence = 1, .batch = 1, .sizes = .{ 4 * arena_limit, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, .has_backing = true, .uses = 2, .last_used = 0 };

@@ -124,7 +124,6 @@ pub const Module = struct {
     plans: usize = 0,
 
     pub const StorageSnapshot = struct {
-        raw_quota: bool,
         has_lease: bool,
         controller: ?*memory.AdmissionController,
         ready: bool,
@@ -136,7 +135,6 @@ pub const Module = struct {
         while (!mutable.metadata_mutex.tryLock()) std.atomic.spinLoopHint();
         defer mutable.metadata_mutex.unlock();
         return .{
-            .raw_quota = self.quota == .raw,
             .has_lease = self.quota.hasLease(),
             .controller = if (self.quota.peek()) |lease| lease.controller else null,
             .ready = self.device.ptr != 0 and self.host.ptr != null,
@@ -162,32 +160,27 @@ pub const Module = struct {
         };
     }
 
-    pub fn reserve(self: *Module, ctx: *context.CudaContext) !void {
-        // External quota callbacks precede publication locking. Recheck after
-        // reservation; a reentrant cold observer must never see a partial owner.
-        while (!self.metadata_mutex.tryLock()) std.atomic.spinLoopHint();
-        const ready = self.device.ptr != 0;
-        const invalid = self.failed or self.closing;
-        const managed = self.managed or self.quota == .prepared;
-        self.metadata_mutex.unlock();
-        if (invalid) return error.LightOnAttentionExecutionFailed;
-        if (ready) return;
-        if (managed) return error.RecurrentPrefillColdPreparationRequired;
-        var lease: ?memory.AdmissionLease = null;
-        defer if (lease) |*value| value.release();
-        if (ctx.video_cache_budget.admission) |policy|
-            lease = try policy.controller.tryAcquire(.gpu, policy.limits, .{
+    pub fn reserveForExecution(self: *Module, ctx: *context.CudaContext) !void {
+        if (ctx.video_cache_budget.admission) |policy| {
+            if (self.failed or self.closing) return error.LightOnAttentionExecutionFailed;
+            if (self.quota != .prepared or self.device.ptr == 0 or self.host.ptr == null) return error.RecurrentPrefillColdPreparationRequired;
+            const owned = self.quota.peek() orelse return error.RecurrentPrefillColdPreparationRequired;
+            if (owned.controller != policy.controller or !std.meta.eql(owned.amounts, memory.AdmissionAmounts{
                 .backend_scratch_bytes = device_bytes,
                 .host_scratch_bytes = host_bytes + host_plan_bytes,
-            }, policy.check_live_memory);
+            })) return error.PreparedCacheAmountChanged;
+            return;
+        }
+        return self.reserveUnadmitted(ctx);
+    }
+
+    fn reserveUnadmitted(self: *Module, ctx: *context.CudaContext) !void {
         while (!self.metadata_mutex.tryLock()) std.atomic.spinLoopHint();
         var locked = true;
         defer if (locked) self.metadata_mutex.unlock();
         if (self.failed or self.closing) return error.LightOnAttentionExecutionFailed;
         if (self.device.ptr != 0) return;
         if (self.managed or self.quota.hasLease()) return error.RecurrentPrefillColdPreparationRequired;
-        self.quota = Quota.fromRawAdmission(lease);
-        lease = null;
         self.failed = true;
         self.revision +%= 1;
         self.allocateStorage(ctx) catch |err| {
@@ -623,7 +616,7 @@ test "optional recurrent prefill checked SDK free retains exact quota and closin
     consumer.finish();
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, domain.controller.snapshot());
     module.closing = true;
-    try std.testing.expectError(error.RecurrentPrefillClosing, module.reserve(&ctx, 64));
+    try std.testing.expectError(error.RecurrentPrefillClosing, module.reserveForExecution(&ctx, 64));
     try std.testing.expectEqual(@as(usize, 0), ctx.device_allocations.snapshot().live);
 }
 

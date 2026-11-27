@@ -3484,6 +3484,14 @@ fn decodeAppleWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: vi
     };
     return video.apple_webm.decodeTo(a, reader, indexed, selected, .{ .decode = .{ .require_hardware = false, .max_decode_packets = 8192 }, .pool = capture.pool, .device_surfaces = capture.metal != null, .replay_budget = budget }, .{ .context = capture, .accept = Capture.publishAppleWebm, .before_decode = releasePortableWebm, .submitted_packets = submitted });
 }
+fn appleWebmDecodeFailure(err: anyerror, may_retry: bool) anyerror {
+    return switch (err) {
+        error.AppleReplayPacketLimit => if (may_retry) error.UnsupportedVideoProfile else error.ResourceLimitExceeded,
+        error.AppleWindowAdmissionExceeded => if (may_retry) error.VideoDecoderUnavailable else error.SharedAdmissionExceeded,
+        else => err,
+    };
+}
+
 /// Reserve a complete cold portable retry before Apple may release its state.
 fn automaticAppleReplayBudget(reader: *const media.webm.Reader, indexed: video.webm_pictures.Index, selected: []const usize, total: video.webm_pictures.ReplayBudget, cursor: ?usize) !?video.webm_pictures.ReplayBudget {
     const control = reader.input.control;
@@ -3571,11 +3579,8 @@ fn decodeWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.w
         var submitted: usize = 0;
         const receipt: ?video.apple_webm.Receipt = decodeAppleWebm(a, reader, indexed, selected, capture, input, trial_budget, &submitted) catch |err| blk: {
             if (err == error.UnsupportedVideoProfile and capture.apple_published == 0) if (apple_owner) |owner| owner.apple_unsupported.store(true, .release);
-            const reason = switch (err) {
-                error.AppleReplayPacketLimit => if (capture.decoder.policy == .automatic and portable_retry) error.UnsupportedVideoProfile else error.ResourceLimitExceeded,
-                error.AppleWindowAdmissionExceeded => if (capture.decoder.policy == .automatic and portable_retry) error.VideoDecoderUnavailable else error.SharedAdmissionExceeded,
-                else => err,
-            };
+            const may_retry = capture.decoder.policy == .automatic and portable_retry;
+            const reason = appleWebmDecodeFailure(err, may_retry);
             if (!portable_retry) return reason;
             try appleUnavailable(capture, reason);
             // The worker owns this source view. Its counters include packet

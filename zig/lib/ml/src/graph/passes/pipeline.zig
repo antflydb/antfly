@@ -90,6 +90,9 @@ pub const Pipeline = struct {
     /// dead branches.
     pub const default: Pipeline = .{ .passes = &.{ .const_fold, .cse, .fuse, .dce, .cse } };
 
+    /// Keep portable primitives intact when a provider owns fusion.
+    pub const provider_fusion: Pipeline = .{ .passes = &.{ .const_fold, .cse, .dce } };
+
     /// Minimal cleanup: dead code elimination only.
     pub const cleanup: Pipeline = .{ .passes = &.{.dce} };
 
@@ -418,6 +421,12 @@ test "pipeline exposes attention after primitive softmax recognition" {
         }
     }
     try std.testing.expect(found_sdpa);
+
+    var portable = try Pipeline.provider_fusion.run(allocator, &g);
+    defer portable.deinit();
+    const portable_output = portable.graph.node(portable.id_map[output]);
+    try std.testing.expect(portable_output.op == .dot_general);
+    try std.testing.expectEqual(@as(u32, 0), portable.stats.num_fused);
 }
 
 test "optimization packs row-major literal projections before execution" {

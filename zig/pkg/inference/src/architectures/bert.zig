@@ -336,11 +336,9 @@ pub fn forwardCtWithControl(
     const resident_slots = try preplanMetalEncoder(cb, allocator, config);
     if (control) |active| try active.update(.executing, 0, @intCast(config.num_hidden_layers));
 
-    var encoder_frame_active = false;
-    if (resident_slots and !cb.decoderRuntimeHasActiveFrame()) {
-        encoder_frame_active = try cb.decoderRuntimeBeginFrame();
-    }
-    errdefer if (encoder_frame_active) cb.decoderRuntimeCancelFrame() catch {};
+    const Submission = @import("../execution/submission.zig").Scope;
+    var frame = try Submission.beginIfNeeded(cb, resident_slots);
+    errdefer frame.deinit();
 
     // 1. Embeddings: word + position + token_type + LayerNorm
     var hidden = try embeddings(
@@ -362,22 +360,18 @@ pub fn forwardCtWithControl(
         const new_hidden = try encoderLayer(cb, allocator, config, hidden, attention_mask, batch, seq_len, layer, resident_slots);
         cb.free(hidden);
         hidden = new_hidden;
-        const bounded_frame = control != null and encoder_frame_active and
+        const bounded_frame = control != null and frame.owns and
             ((layer + 1) % 2 == 0 or layer + 1 == config.num_hidden_layers);
         if (bounded_frame) {
-            try cb.decoderRuntimeSubmitAndWaitFrame();
-            encoder_frame_active = false;
+            try frame.finish();
             if (control) |active| try active.update(.executing, @intCast(layer + 1), @intCast(config.num_hidden_layers));
             if (layer + 1 < config.num_hidden_layers) {
-                encoder_frame_active = try cb.decoderRuntimeBeginFrame();
+                frame = try Submission.begin(cb);
             }
         }
     }
 
-    if (encoder_frame_active) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        encoder_frame_active = false;
-    }
+    try frame.finish();
     return hidden;
 }
 

@@ -84,6 +84,17 @@ pub const Request = struct {
     }
 };
 
+pub const Cache = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    entries: ?*Entry = null,
+
+    pub const Entry = struct {
+        request: Request,
+        owner: *Owner,
+        next: ?*Entry,
+    };
+};
+
 /// One independently charged immutable native packed entry. The actual C
 /// entry owns both SDK roots. The shared Charge's witnesses own the SAME cache
 /// token until BOTH SDK roots die, independently of provider/model lifetime.
@@ -150,27 +161,7 @@ pub const Owner = struct {
     /// Attachment failure may retain partial death witnesses conservatively.
     pub fn attachSDKRoots(charge: *retirement.Charge, roots: [2]*anyopaque) !void {
         if (roots[0] == roots[1]) return error.InvalidDenseProjectionPack;
-        const Attach = struct {
-            roots: [2]*anyopaque,
-            fn begin(_: *anyopaque, _: []const @import("../ops/ops.zig").CT) !retirement.Scope.Begun {
-                return error.UnpreparedPackedProjectionScope;
-            }
-            fn unsupported(_: *anyopaque, _: []const @import("../ops/ops.zig").CT, _: []retirement.Node, _: retirement.Payload) !void {
-                return error.UnpreparedPackedProjectionWitnesses;
-            }
-            fn attach(raw: *anyopaque, _: []const @import("../ops/ops.zig").CT, nodes: []retirement.Node, payload: retirement.Payload, prepared: *retirement.BackendPreparation) !void {
-                const self: *@This() = @ptrCast(@alignCast(raw));
-                if (nodes.len != 0) return error.InvalidDenseProjectionPack;
-                const witnesses = try prepared.armMetal(null, &self.roots, payload);
-                if (@import("metal_runtime.zig").antfly_metal_buffer_retirement_attach(witnesses) != 0) return error.PackedProjectionWitnessAttachmentFailed;
-            }
-            fn end(_: *anyopaque) void {}
-            const table = retirement.Scope.VTable{ .begin = begin, .attach = unsupported, .attach_prepared = attach, .end = end, .notify = retirement.pollRetirementChargesCPU };
-        };
-        var receiver = Attach{ .roots = roots };
-        var scope = retirement.Scope{ .context = &receiver, .origin = retirement.Queue.init(), .outputs = &.{}, .vtable = &Attach.table, .active = true };
-        defer scope.end();
-        try charge.attach(&scope);
+        try @import("metal_runtime.zig").attachStandaloneRetirement(charge, &roots, retirement.Queue.init(), false, retirement.pollRetirementChargesCPU);
     }
 
     /// Caller prepares this final metadata address BEFORE SDK work. A fully

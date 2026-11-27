@@ -32,6 +32,61 @@ const runtime = @import("../runtime/root.zig");
 const cuda_compute = if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig") else struct {};
 const BorrowedDecodeStateRuntime = graph_mod.decode_state_runtime.BorrowedDecodeStateRuntime;
 
+fn inflightRows(chunk_rows: usize, speculative_k: u32) usize {
+    const speculative_rows = @as(usize, @min(speculative_k, runtime.tier.memory.generation_max_speculative_k)) + 1;
+    return @max(chunk_rows, speculative_rows);
+}
+
+/// Bound idle prefill chunks only for geometries with qualified measurements.
+/// Keep the general scheduler ceiling intact for every other model and backend;
+/// explicit request limits and memory admission are applied separately.
+pub fn idleChunkCeiling(
+    backend: runtime.kv.pool.BackendKind,
+    config: gpt_arch.Config,
+    configured_ceiling: usize,
+) usize {
+    const ceiling = @max(configured_ceiling, 1);
+    if (backend == .cuda) {
+        if (@import("gemma4_native_plan.zig").Plan.resolve(config)) |plan|
+            return @min(ceiling, plan.geometry.prefillQueryLimit());
+    }
+    if (backend == .metal and
+        config.family == .gemma and
+        config.hasPle() and
+        config.num_attention_heads == 8 and
+        config.effectiveKVHeads() == 2 and
+        config.headDim() == 256 and
+        config.global_head_dim == 512 and
+        config.sliding_window == 512 and
+        !config.gemma4_mtp_assistant)
+    {
+        return @min(ceiling, 512);
+    }
+    // Gemma4 E2B CUDA evidence currently selects the fixed 512-row schedule.
+    // A forced 2051-row pass triggered a >2 GiB deferred-free drain, while
+    // balanced 411-row and 513-row candidates were both slower. Keep the
+    // fingerprint-specific winner until a new plan is promoted by paired E2E
+    // evidence.
+    if (backend == .cuda and
+        config.family == .gemma and
+        config.hidden_size == 1536 and
+        config.num_hidden_layers == 35 and
+        config.num_attention_heads == 8 and
+        config.effectiveKVHeads() == 1 and
+        config.headDim() == 256 and
+        config.global_head_dim == 512 and
+        config.intermediate_size == 6144 and
+        config.shared_layer_intermediate_size == 12288 and
+        config.num_kv_shared_layers == 20 and
+        config.sliding_window == 512 and
+        config.hasPle() and
+        !config.gemma4_mtp_assistant)
+    {
+        return @min(ceiling, 512);
+    }
+    return ceiling;
+}
+
 /// Resolve the native physical row bound for text and prepared embeddings.
 pub fn nativeChunkRows(cb: *const ComputeBackend, config: gpt_arch.Config, prompt_rows: usize, requested_rows: usize) ?usize {
     return switch (cb.kind()) {
@@ -168,8 +223,47 @@ pub const EmbeddingReplacement = struct {
 pub const ProjectedInputRows = struct {
     rows_per_item: []const usize,
     width: usize,
-    source: EmbeddingSource,
+    source: union(enum) {
+        host: []const f32,
+        resident: Resident,
+    },
+
+    pub const Resident = struct { backend: *const ComputeBackend, rows: ops.CT };
+
+    pub fn validateFor(self: ProjectedInputRows, backend: *const ComputeBackend, width: usize) !void {
+        if (self.width != width or width == 0) return error.InvalidTensorShape;
+        switch (self.source) {
+            .resident => |value| {
+                if (value.backend.ptr != backend.ptr or value.backend.vtable != backend.vtable)
+                    return error.InvalidPhysicalStorageBackend;
+            },
+            .host => |values| {
+                var rows: usize = 0;
+                for (self.rows_per_item) |count| rows = try std.math.add(usize, rows, count);
+                if (values.len != try std.math.mul(usize, rows, width)) return error.InvalidTensorShape;
+            },
+        }
+    }
 };
+
+test "projected media rows reject foreign custody and inconsistent host spans" {
+    const native = @import("../ops/native_compute.zig");
+    var producer: u8 = 0;
+    var consumer: u8 = 0;
+    const source: ComputeBackend = .{ .ptr = &producer, .vtable = &native.vtable_impl };
+    const target: ComputeBackend = .{ .ptr = &consumer, .vtable = &native.vtable_impl };
+    var projected: ProjectedInputRows = .{
+        .rows_per_item = &.{1},
+        .width = 2,
+        .source = .{ .resident = .{ .backend = &source, .rows = &producer } },
+    };
+    try projected.validateFor(&source, 2);
+    try std.testing.expectError(error.InvalidPhysicalStorageBackend, projected.validateFor(&target, 2));
+    projected.source = .{ .host = &.{1} };
+    try std.testing.expectError(error.InvalidTensorShape, projected.validateFor(&target, 2));
+    projected.source = .{ .host = &.{ 1, 2 } };
+    try projected.validateFor(&target, 2);
+}
 
 /// Borrow a contiguous host producer without allocating an image-span array.
 pub const EmbeddingReplacements = union(enum) {
@@ -223,24 +317,43 @@ pub const PromptEmbeddingRows = struct {
     pub fn init(backend: *const ComputeBackend, allocator: std.mem.Allocator, base: ops.CT, rows: usize, width: usize, scale: f32) !@This() {
         if (rows == 0 or width == 0 or std.math.cast(i32, rows) == null or std.math.cast(i32, width) == null) return error.InvalidEmbeddingAssembly;
         const elements = try std.math.mul(usize, rows, width);
-        // Known packed/opaque bases retain their original host route without
-        // first allocating an unsupported speculative prompt destination.
-        if (std.math.approxEqAbs(f32, scale, 1.0, 1e-6) and try EmbeddingRows.supportsSource(backend, base, rows, width)) {
-            if (try EmbeddingRows.init(backend, allocator, rows, width)) |initial| {
-                var assembly = initial;
-                errdefer assembly.deinit();
-                if (try assembly.acceptsSource(base, rows)) {
-                    try assembly.append(base, 0, rows);
-                    return .{ .backend = backend, .allocator = allocator, .rows = rows, .width = width, .storage = .{ .resident = assembly } };
+        const scaled = !std.math.approxEqAbs(f32, scale, 1.0, 1e-6);
+        // Packed/opaque inputs keep their host conversion. A resident F32
+        // multiply produces an independent destination for later row writes.
+        if (try EmbeddingRows.sourceNamespace(backend, base, rows, width)) |base_storage| {
+            if (!scaled) {
+                if (try EmbeddingRows.init(backend, allocator, rows, width)) |initial| {
+                    var assembly = initial;
+                    errdefer assembly.deinit();
+                    if (try assembly.acceptsSource(base, rows)) {
+                        try assembly.append(base, 0, rows);
+                        return .{ .backend = backend, .allocator = allocator, .rows = rows, .width = width, .storage = .{ .resident = assembly } };
+                    }
+                    assembly.deinit();
                 }
-                assembly.deinit();
+            } else if (base_storage.kind != .host and backend.supportsCopyRows2D()) {
+                if (try backend.multiplyScalar(base, scale)) |result| {
+                    errdefer backend.free(result);
+                    const result_storage = (try EmbeddingRows.sourceNamespace(backend, result, rows, width)) orelse return error.InvalidEmbeddingAssembly;
+                    if (result_storage.kind != base_storage.kind or result_storage.context != base_storage.context or
+                        result_storage.base == base_storage.base) return error.InvalidEmbeddingAssembly;
+                    return .{ .backend = backend, .allocator = allocator, .rows = rows, .width = width, .storage = .{ .resident = .{
+                        .backend = backend,
+                        .allocator = allocator,
+                        .tensor = result,
+                        .rows = rows,
+                        .width = width,
+                        .written = rows,
+                        .namespace = result_storage,
+                    } } };
+                }
             }
         }
         const values = try backend.toFloat32(base, allocator);
         errdefer allocator.free(values);
         if (values.len != elements) return error.InvalidEmbeddingAssembly;
         // Exactly the original host scaling order and approximate-one guard.
-        if (!std.math.approxEqAbs(f32, scale, 1.0, 1e-6)) for (values) |*value| {
+        if (scaled) for (values) |*value| {
             value.* *= scale;
         };
         return .{ .backend = backend, .allocator = allocator, .rows = rows, .width = width, .storage = .{ .host = values } };
@@ -448,11 +561,11 @@ pub const ChunkCursor = struct {
         default_chunk_rows: usize = 0,
         selected_kv: bool = false,
         checkpoint_resume: bool = false,
-        backend: ops.BackendKind,
+        backend: ops.BackendKind = .native,
         pure_greedy: bool,
         resident_greedy_allowed: bool,
-        first_token_enabled: bool,
-        coalesce_token_limit: usize,
+        first_token_enabled: bool = false,
+        coalesce_token_limit: usize = 0,
     };
     pub const PlanDecision = union(enum) {
         none,
@@ -460,6 +573,20 @@ pub const ChunkCursor = struct {
         bypassed_prompt_cache: Plan,
         bypassed_geometry: Plan,
     };
+
+    pub fn selectNative(
+        backend: *const ComputeBackend,
+        config: gpt_arch.Config,
+        request: Options,
+        selection: Selection,
+    ) !ChunkCursor {
+        var physical = selection;
+        physical.backend = backend.kind();
+        physical.default_chunk_rows = nativeChunkRows(backend, config, request.prompt_tokens, 0) orelse 0;
+        physical.first_token_enabled = firstTokenEnabled();
+        physical.coalesce_token_limit = firstTokenCoalesceLimit();
+        return select(request, physical);
+    }
 
     /// Resolve the physical plan once before any chunk/KV mutation. Scheduler
     /// and task configuration become primitive request facts at this boundary.
@@ -595,6 +722,14 @@ pub const PromptRequest = struct {
     speculative_k: u32,
     sampled_ring_qualified: bool,
 
+    pub fn compiledOutputIntent(self: PromptRequest, final: bool) Runtime.CompiledChunk.Intent {
+        if (!final) return .kv_only;
+        return if (self.allow_resident_greedy and self.route.storage.pure_greedy and !self.route.storage.grammar)
+            .greedy_token
+        else
+            .last_logits;
+    }
+
     pub fn compiled(self: PromptRequest) CompiledPromptRequest {
         return .{
             .storage = self.route.storage,
@@ -629,6 +764,47 @@ pub const PromptPlan = struct {
     compiled_whole_model: bool,
     pub fn greedy(self: PromptPlan) bool {
         return self.cuda_greedy or self.metal_greedy;
+    }
+
+    pub const Chunk = struct {
+        request: ChunkRequest,
+        scheduler_eligible: bool,
+        execution_mutex: ?*std.atomic.Mutex,
+    };
+
+    /// Bind the cursor's admitted attempt to the selected numerical route.
+    /// The caller still coordinates scheduler turns and publishes progress.
+    pub fn bindChunk(self: PromptPlan, prompt: PromptRequest, cursor: *const ChunkCursor, attempt: ChunkCursor.Attempt, tokens: []const i64, execution_mutex: ?*std.atomic.Mutex, gpu_oracle: bool, exact_repeat_calls: *usize) Chunk {
+        const final = attempt.total_end == prompt.prompt_tokens;
+        return .{
+            .scheduler_eligible = !self.exact_repeat_probe and !decoder_routes.prefillFinalChunkNeedsDirectExecution(attempt.total_end, prompt.prompt_tokens, attempt.output_intent, self.cuda_last_logits, self.metal_last_logits),
+            .execution_mutex = decoder_routes.directPrefillExecutionMutex(
+                self.exact_repeat_probe,
+                self.cuda_greedy or (final and self.cuda_last_logits),
+                self.metal_greedy,
+                execution_mutex,
+            ),
+            .request = .{
+                .token_ids = tokens[attempt.start..attempt.end],
+                .total_chunk_end = attempt.total_end,
+                .prompt_tokens = prompt.prompt_tokens,
+                .already_prefilled = prompt.prefilled_tokens,
+                .processed_rows = attempt.start,
+                .output_intent = attempt.output_intent,
+                .capture_hidden = prompt.capture_hidden,
+                .shared_kv_pruning = self.shared_kv,
+                .prepared_metal_whole_prompt = attempt.start == 0 and final and self.metal_greedy,
+                .metal_target_last_logits = self.metal_last_logits,
+                .cuda_direct_last_logits = self.cuda_last_logits,
+                .typed_outputs = self.typed_outputs,
+                .attempted_chunk_size = attempt.chunk.rows,
+                .allow_resize = cursor.options.admitted_plan == null,
+                .compact_selected = prompt.selected_kv,
+                .selection_gpu_oracle = gpu_oracle,
+                .exact_repeat_probe = self.exact_repeat_probe,
+                .exact_repeat_calls = exact_repeat_calls,
+            },
+        };
     }
 };
 
@@ -679,8 +855,20 @@ test "fixed prefill windows preserve logical prefix and produce the exact final 
 }
 
 pub const EmbeddingRoute = enum { prepared_last_row, ordinary_last_row };
+pub const EmbeddingPromptRequest = struct {
+    route: decoder_routes.Request,
+    query_tokens: usize,
+    configured_chunk_rows: usize,
+    scheduler_chunk_rows: usize,
+    speculative_k: u32,
+    sampled_ring_qualified: bool,
+    capture_hidden: bool,
+    has_draft: bool,
+    needs_host_logits: bool,
+};
 pub const EmbeddingPromptPlan = struct {
     chunk_rows: usize,
+    output_intent: decoder_routes.PrefillOutputIntent,
     /// Ordinary routes reserve the complete logical KV window after obtaining
     /// their scheduler turn. The compiled path has already bound its window.
     reserve_whole_prompt: bool,
@@ -739,19 +927,23 @@ pub const Runtime = struct {
             .metal_last_logits = decoder_routes.shouldUseMetalGemmaTargetLastLogits(backend, model, request.capture_hidden),
             .typed_outputs = typed,
             .shared_kv = typed and !request.checkpoint and !request.capture_hidden and
-                (request.route.exact_hybrid or (build_options.enable_cuda and backend == .cuda and cuda_compute.CudaCompute.gemma4SharedKvPrefillEnabled(context.cb))),
+                (request.route.exact_hybrid or (backend == .native and gpt_arch.nativeSharedKvPrefillEnabled(model.*)) or
+                    (build_options.enable_cuda and backend == .cuda and cuda_compute.CudaCompute.gemma4SharedKvPrefillEnabled(context.cb))),
             .cuda_last_logits = typed and backend == .cuda,
             .compiled_whole_model = !request.selected_kv and context.compiled_partition_backend != null and
                 context.compiled_attachment_target == .whole_model and self.forward.graph_cache != null,
         };
     }
 
-    /// Own the complete whole-model physical window before its first chunk.
-    /// Scheduler turn/progress publication remains in the caller.
-    pub fn prepareCompiledPrompt(self: *Runtime, request: CompiledPromptRequest) !CompiledPromptPlan {
-        if (request.prefilled_tokens != 0) return error.UnsupportedShape;
+    fn planCompiledPrompt(self: *const Runtime, request: CompiledPromptRequest) CompiledPromptPlan {
         const context = self.forward.context;
-        const route: decoder_storage.Route = if (context.compiled_partition_backend == .metal and context.cb.kind() == .metal and self.state.isPaged() and context.kv_dtype != null) .metal_whole_model else .standard;
+        const route = (decoder_storage.ActiveRoute{
+            .backend = context.cb.kind(),
+            .compiled_backend = context.compiled_partition_backend,
+            .whole_model = context.compiled_attachment_target == .whole_model,
+            .has_graph = self.forward.graph_cache != null,
+            .dtype = context.kv_dtype,
+        }).storageRoute(self.state);
         const policy = decoder_storage.routeCapacityPolicy(route, context.gpt_config.*, request.storage, context.kv_dtype orelse .f16, request.sampled_ring_qualified);
         const bounded = policy == .split_swa_ring;
         // Reuse the admitted native schedule default instead of substituting the
@@ -761,14 +953,28 @@ pub const Runtime = struct {
         else
             0;
         const rows = decoder_routes.wholeModelExecutionPrefillChunkSize(context.compiled_partition_backend, configured_rows, request.scheduler_chunk_rows, request.query_tokens, bounded);
-        const speculative = @min(@as(usize, @intCast(request.speculative_k)), @as(usize, runtime.tier.memory.generation_max_speculative_k)) + 1;
-        self.state.configureKvMaxInflightTokens(@max(rows, speculative), bounded);
         return .{ .chunk_rows = rows, .bounded_swa = bounded };
     }
 
+    /// Prepare the same executable shape the first numerical chunk can use.
+    pub fn compiledPreparationRows(self: *const Runtime, request: CompiledPromptRequest) usize {
+        const context = self.forward.context;
+        if (context.compiled_partition_backend == null or context.compiled_attachment_target != .whole_model or self.forward.graph_cache == null)
+            return request.query_tokens;
+        return self.planCompiledPrompt(request).chunk_rows;
+    }
+
+    /// Own the complete whole-model physical window before its first chunk.
+    /// Scheduler turn/progress publication remains in the caller.
+    pub fn prepareCompiledPrompt(self: *Runtime, request: CompiledPromptRequest) !CompiledPromptPlan {
+        if (request.prefilled_tokens != 0) return error.UnsupportedShape;
+        const plan = self.planCompiledPrompt(request);
+        self.state.configureKvMaxInflightTokens(inflightRows(plan.chunk_rows, request.speculative_k), plan.bounded_swa);
+        return plan;
+    }
+
     pub fn prepareChunkWindow(self: *Runtime, request: PromptRequest, chunk_rows: usize) void {
-        const speculative = @min(@as(usize, @intCast(request.speculative_k)), 16) + 1;
-        self.state.configureKvMaxInflightTokens(@max(chunk_rows, speculative), self.forward.context.cb.kind() == .metal and
+        self.state.configureKvMaxInflightTokens(inflightRows(chunk_rows, request.speculative_k), self.forward.context.cb.kind() == .metal and
             request.prefilled_tokens == 0 and decoder_storage.ringRequestEligible(request.route.storage, request.sampled_ring_qualified));
     }
 
@@ -1013,7 +1219,9 @@ pub const Runtime = struct {
         token_ids: []const i64,
         prepared_rows: ?@import("resident_rows.zig").Rows = null,
         total_sequence_length: usize,
-        output: enum { kv_only, last_logits, greedy_token },
+        output: Intent,
+
+        pub const Intent = enum { kv_only, last_logits, greedy_token };
     };
 
     /// The whole-model runtime owns physical KV/cache storage. This owner
@@ -1029,27 +1237,43 @@ pub const Runtime = struct {
             @import("invocation_observation.zig").recordContextAcquisitionFailure(&self.forward.context, .prefill, error.MissingCompiledModelRuntime);
             return error.MissingCompiledModelRuntime;
         };
-        var execution_scope = try self.acquireForObservation();
+        var execution_scope = self.acquireForObservation() catch |err| {
+            traceCompiledPrefillFailure("execution_scope", request, err);
+            return err;
+        };
         defer if (execution_scope) |*scope| scope.deinit();
         const phase_timer = @import("antfly_readers").pipeline_metrics.start(.prefill);
         defer phase_timer.finish();
         return @import("invocation_observation.zig").callContextOperation(&self.forward.context, .prefill, @This().runCompiledChunkWithOwnedLane, .{ self, request, cache, forward_fn });
     }
 
+    fn traceCompiledPrefillFailure(stage: []const u8, request: CompiledChunk, err: anyerror) void {
+        if (!platform.env.getenvBool("TERMITE_GEN_STAGE_DEBUG")) return;
+        std.debug.print("gen_debug: compiled prefill failed stage={s} rows={d} total={d} prepared={} error={s}\n", .{
+            stage, request.token_ids.len, request.total_sequence_length, request.prepared_rows != null, @errorName(err),
+        });
+    }
+
     fn runCompiledChunkWithOwnedLane(self: *Runtime, request: CompiledChunk, cache: *graph_mod.cache.GraphCache, comptime forward_fn: anytype) !Output {
         const allocator = self.forward.context.allocator;
         var logical = BorrowedDecodeStateRuntime.init(self.state);
-        const context = try logical.preparePrefillWithCleanup(request.total_sequence_length, request.token_ids.len, .{ .boundary = self.forward.context.cleanupEpoch(), .operation = self.forward.context.cb.operationToken() });
+        const context = logical.preparePrefillWithCleanup(request.total_sequence_length, request.token_ids.len, .{ .boundary = self.forward.context.cleanupEpoch(), .operation = self.forward.context.cb.operationToken() }) catch |err| {
+            traceCompiledPrefillFailure("kv_prepare", request, err);
+            return err;
+        };
         const cleanup_operation = self.forward.context.cb.operationToken();
         const supplied_cleanup = self.forward.context.cleanupEpoch();
         var inherited = if (supplied_cleanup == null and cleanup_operation != null) try cleanup_operation.?.retainCleanupEpoch() else null;
         defer if (inherited) |*epoch| epoch.release();
         const cleanup = @import("cleanup_context.zig").Context{ .boundary = supplied_cleanup orelse if (inherited) |*epoch| epoch else null, .operation = cleanup_operation };
-        var output = (try forward_fn(&self.forward.context, cache, request.token_ids, 1, request.total_sequence_length, &context, .{ .prepared_rows = request.prepared_rows, .output_intent = switch (request.output) {
+        var output = (forward_fn(&self.forward.context, cache, request.token_ids, 1, request.total_sequence_length, &context, .{ .prepared_rows = request.prepared_rows, .output_intent = switch (request.output) {
             .kv_only => .kv_only,
             .last_logits => .last_logits,
             .greedy_token => .greedy_token,
-        } })) orelse return error.MissingCompiledModelRuntime;
+        } }) catch |err| {
+            traceCompiledPrefillFailure("model_forward", request, err);
+            return err;
+        }) orelse return error.MissingCompiledModelRuntime;
         defer output.deinitWithCleanup(allocator, cleanup);
         return switch (request.output) {
             .kv_only => .{},
@@ -1107,14 +1331,49 @@ pub const Runtime = struct {
             self.forward.context.compiled_attachment_target == .whole_model and self.forward.graph_cache != null;
     }
 
-    pub fn planEmbeddingPrompt(self: *Runtime, request: CompiledPromptRequest, attention_mask: ?[]const u8, capture_hidden: bool) !EmbeddingPromptPlan {
+    pub fn positionedWantsGreedy(self: *const Runtime, request: decoder_routes.Request, allow: bool, needs_host_logits: bool) bool {
+        const context = self.forward.context;
+        return decoder_routes.shouldUsePreparedQwenPrefillGreedyToken(
+            context.cb.kind(),
+            context.gpt_config.*,
+            request,
+            allow,
+            needs_host_logits,
+            firstTokenEnabled() and greedyTokenEnabled(),
+        );
+    }
+
+    pub fn planEmbeddingPrompt(self: *Runtime, request: EmbeddingPromptRequest, attention_mask: ?[]const u8) !EmbeddingPromptPlan {
+        const context = self.forward.context;
+        const backend = context.cb.kind();
+        const greedy = !request.capture_hidden and !request.has_draft and decoder_routes.shouldUsePreparedPrefillGreedyToken(
+            backend,
+            context.gpt_config.*,
+            request.route,
+            true,
+            request.needs_host_logits,
+            backend != .cuda or (firstTokenEnabled() and greedyTokenEnabled()),
+        );
+        const output_intent = decoder_routes.prefillOutputIntent(true, greedy, request.capture_hidden);
         if (!self.usesCompiledEmbeddings(.prepared_last_row)) return .{
             .chunk_rows = request.configured_chunk_rows,
+            .output_intent = output_intent,
             .reserve_whole_prompt = true,
         };
-        if (attention_mask != null or capture_hidden) return error.UnsupportedPreparedRows;
-        const plan = try self.prepareCompiledPrompt(request);
-        return .{ .chunk_rows = @min(plan.chunk_rows, compiled_embedding_chunk_limit), .reserve_whole_prompt = false };
+        if (attention_mask != null or request.capture_hidden) return error.UnsupportedPreparedRows;
+        const plan = try self.prepareCompiledPrompt(.{
+            .storage = request.route.storage,
+            .query_tokens = request.query_tokens,
+            .configured_chunk_rows = request.configured_chunk_rows,
+            .scheduler_chunk_rows = request.scheduler_chunk_rows,
+            .speculative_k = request.speculative_k,
+            .sampled_ring_qualified = request.sampled_ring_qualified,
+        });
+        return .{
+            .chunk_rows = @min(plan.chunk_rows, compiled_embedding_chunk_limit),
+            .output_intent = output_intent,
+            .reserve_whole_prompt = false,
+        };
     }
 
     pub fn resetRecurrentPrompt(self: *Runtime) !void {
@@ -1135,9 +1394,7 @@ pub const Runtime = struct {
         owner: *?ops.CT,
         token_ids: []const i64,
         sequence_length: usize,
-        output_intent: PreparedEmbeddingOutput = .last_logits,
-        /// Nonzero rows are the caller's existing admitted scratch envelope.
-        chunk_rows: usize = 0,
+        plan: EmbeddingPromptPlan = .{ .chunk_rows = 0, .output_intent = .last_logits, .reserve_whole_prompt = true },
         ensure_device_resident: bool = true,
         route: EmbeddingRoute = .prepared_last_row,
         attention_mask: ?[]const u8 = null,
@@ -1147,9 +1404,11 @@ pub const Runtime = struct {
         deepstack_layer_count: usize = 0,
     };
 
-    /// The caller owns its admitted scheduler turn. Physical state was prepared
-    /// before acquiring the model lane, preserving prepared-prefix lock order.
+    /// The caller owns its admitted scheduler turn. Apply the planned KV
+    /// reservation before acquiring the model lane.
     pub fn runEmbeddingsOwned(self: *Runtime, request: EmbeddingRequest) !Output {
+        if (request.plan.reserve_whole_prompt) try self.prepareWholePrompt(request.sequence_length);
+        if (request.owner.* == null) return error.InvalidPreparedPrompt;
         var execution_scope = try self.acquireForObservation();
         defer if (execution_scope) |*scope| scope.deinit();
         const phase_timer = @import("antfly_readers").pipeline_metrics.start(.prefill);
@@ -1158,7 +1417,7 @@ pub const Runtime = struct {
     }
 
     fn runEmbeddingsOwnedUnobserved(self: *Runtime, request: EmbeddingRequest) !Output {
-        if (request.output_intent == .kv_only or (request.route == .ordinary_last_row and request.output_intent != .last_logits)) return error.InvalidPreparedPrompt;
+        if (request.plan.output_intent == .kv_only or (request.route == .ordinary_last_row and request.plan.output_intent != .last_logits)) return error.InvalidPreparedPrompt;
         const original = request.owner.* orelse return error.InvalidPreparedPrompt;
         request.owner.* = null;
         const cb = self.forward.context.cb;
@@ -1166,17 +1425,17 @@ pub const Runtime = struct {
         var owned = true;
         errdefer if (owned) cb.free(embeddings);
         if (self.usesCompiledEmbeddings(request.route)) {
-            if (request.output_intent.capturesHidden() or request.attention_mask != null or request.positions != null or request.visual_mask != null or request.deepstack_embeddings != null or request.token_ids.len != request.sequence_length) return error.UnsupportedPreparedRows;
-            const rows = if (request.chunk_rows == 0) compiled_embedding_chunk_limit else @min(compiled_embedding_chunk_limit, request.chunk_rows);
+            if (request.plan.output_intent.capturesHidden() or request.attention_mask != null or request.positions != null or request.visual_mask != null or request.deepstack_embeddings != null or request.token_ids.len != request.sequence_length) return error.UnsupportedPreparedRows;
+            const rows = if (request.plan.chunk_rows == 0) compiled_embedding_chunk_limit else @min(compiled_embedding_chunk_limit, request.plan.chunk_rows);
             owned = false;
             defer cb.free(embeddings);
             return self.runEmbeddingChunks(embeddings, request, rows);
         }
-        if (request.route == .prepared_last_row and !request.output_intent.capturesHidden() and request.attention_mask == null and
+        if (request.route == .prepared_last_row and !request.plan.output_intent.capturesHidden() and request.attention_mask == null and
             request.positions == null and request.visual_mask == null and request.deepstack_embeddings == null and
             self.state.isPaged())
         {
-            const rows = nativeChunkRows(cb, self.forward.context.gpt_config.*, request.sequence_length, request.chunk_rows);
+            const rows = nativeChunkRows(cb, self.forward.context.gpt_config.*, request.sequence_length, request.plan.chunk_rows);
             if (rows) |bounded_rows| if (request.sequence_length > bounded_rows) {
                 owned = false;
                 defer cb.free(embeddings);
@@ -1194,7 +1453,7 @@ pub const Runtime = struct {
         var numerical = Forward{ .forward = self.forward };
         owned = false;
         return switch (request.route) {
-            .prepared_last_row => try numerical.forwardPreparedEmbeddingsOutput(embeddings, request.token_ids, request.sequence_length, &decode, request.output_intent),
+            .prepared_last_row => try numerical.forwardPreparedEmbeddingsOutput(embeddings, request.token_ids, request.sequence_length, &decode, request.plan.output_intent),
             .ordinary_last_row => .{ .last_logits = try gpt_arch.forwardLastLogitsLastRowFromEmbeddingsWithLayer0Overrides(cb, self.forward.context.allocator, self.forward.context.gpt_config.*, embeddings, .{}, 1, request.sequence_length, &decode, null) },
         };
     }
@@ -1226,7 +1485,7 @@ pub const Runtime = struct {
                     .token_ids = ids,
                     .prepared_rows = .{ .source = cb, .tensor = part, .rows = count, .width = config.hidden_size },
                     .total_sequence_length = end,
-                    .output = if (!chunk.final) .kv_only else if (request.output_intent.isGreedy()) .greedy_token else .last_logits,
+                    .output = if (!chunk.final) .kv_only else if (request.plan.output_intent.isGreedy()) .greedy_token else .last_logits,
                 }, self.forward.graph_cache.?, graph_mod.execution.graphForwardCompiledModelOutputWithInputs);
                 if (chunk.final) return result;
                 continue;
@@ -1238,7 +1497,7 @@ pub const Runtime = struct {
             if (chunk.final) {
                 var numerical = Forward{ .forward = self.forward };
                 owns_part = false;
-                return numerical.forwardPreparedEmbeddingsOutput(part, ids, end, &decode, request.output_intent);
+                return numerical.forwardPreparedEmbeddingsOutput(part, ids, end, &decode, request.plan.output_intent);
             }
             if (cb.kind() == .metal and count > 1) {
                 var framed = Forward{ .forward = self.forward };
@@ -1267,6 +1526,70 @@ pub const PositionedEmbeddingBatchItem = struct {
     position_ids: []const u32,
     deepstack_layer_count: usize,
     sequence_length: usize,
+};
+
+/// Owns the queue borrow until publication or synchronous cancellation.
+pub const ScheduledStep = struct {
+    const scheduler_api = runtime.scheduler.native_generate;
+    const Executor = graph_mod.decoder_step_executor.Executor;
+
+    scheduler: *scheduler_api.NativeGenerateCoordinator,
+    lease: *scheduler_api.Lease,
+    io: std.Io,
+    execution_control: ?control.InferenceExecutionControl,
+    executor: *Executor,
+    publication: Executor.Publication,
+    exclusive: bool = false,
+
+    pub fn runTokens(self: ScheduledStep, allocator: std.mem.Allocator, state: *graph_mod.decode_state_runtime.NativeDecodeState, tokens: []const i64, end: usize, final: bool, shared_kv: bool) !?[]f32 {
+        const output = try self.run(.{
+            .allocator = allocator,
+            .decode_state = state,
+            .token_ids = tokens,
+            .seq_len = end,
+            .query_seq_len = tokens.len,
+            .wants_last_logits = final,
+            .allow_shared_kv_prefill = shared_kv,
+        });
+        return output.last_logits;
+    }
+
+    fn run(self: ScheduledStep, request: graph_mod.decoder_work.Prefill) !Output {
+        var pending = request;
+        const work = &pending;
+        errdefer if (work.logits) |logits| work.allocator.free(logits);
+        var decode_runtime = BorrowedDecodeStateRuntime.init(work.decode_state);
+        const context = decode_runtime.makeDecodeContext(work.seq_len, work.query_seq_len);
+        var options = graph_mod.decoder_work.pendingOptions(work.decode_state, work.query_seq_len);
+        options.exclusive_step = options.exclusive_step or self.exclusive;
+        try self.scheduler.enqueuePrefillWork(self.lease.*, work, work.seq_len, work.query_seq_len, context.kv_sequence_len, context.kv_position_offset, options);
+        defer if (!work.ready.load(.acquire)) self.scheduler.cancelPrefillWork(work);
+        var driver = Driver{ .step = self, .work = work };
+        try @import("../runtime/scheduler/step_wait.zig").run(work.allocator, self.scheduler, self.lease, work, .prefill, self.io, null, &driver);
+        if (work.failure) |err| return err;
+        return .{ .last_logits = work.logits, .greedy_token = if (work.greedy_token) |token| @as(usize, token) else null };
+    }
+
+    const Driver = struct {
+        step: ScheduledStep,
+        work: *graph_mod.decoder_work.Prefill,
+
+        pub fn checkControl(self: *@This()) !void {
+            if (self.step.execution_control) |active| try active.check();
+        }
+
+        pub fn isReady(self: *const @This()) bool {
+            return self.work.ready.load(.acquire);
+        }
+
+        pub fn stepBudget(self: *const @This()) scheduler_api.StepBudget {
+            return graph_mod.decoder_work.stepBudget(self.step.scheduler, self.work.decode_state);
+        }
+
+        pub fn execute(self: *@This(), scheduler: *scheduler_api.NativeGenerateCoordinator, _: *scheduler_api.Lease, claimed: []const scheduler_api.StepItem) void {
+            self.step.executor.execute(claimed, scheduler.usesStepEvents(), self.step.publication);
+        }
+    };
 };
 
 /// One borrowed positioned-prefix request. Queue work and its prefix remain
@@ -1302,50 +1625,40 @@ pub const PositionedRequest = struct {
             const query = @min(chunk_rows, seq - processed);
             const end = processed + query;
             const final = end == seq;
-            var decode_runtime = BorrowedDecodeStateRuntime.init(state);
-            // This context describes queued KV geometry only. The executor
-            // binds cleanup when it acquires the actual physical forward lane.
-            const context = decode_runtime.makeDecodeContext(end, query);
-            var work = graph_mod.decoder_work.Prefill{ .allocator = self.item.allocator, .decode_state = state, .token_ids = &.{}, .seq_len = end, .query_seq_len = query, .wants_last_logits = final, .wants_greedy = final and wants_greedy, .prepared_prefix = self.prefix };
-            defer if (work.logits) |logits| work.allocator.free(logits);
-            try scheduler.enqueuePrefillWork(lease.*, @ptrCast(&work), end, query, context.kv_sequence_len, context.kv_position_offset, graph_mod.decoder_work.pendingOptions(state, query));
-            defer if (!work.ready.load(.acquire)) scheduler.cancelPrefillWork(@ptrCast(&work));
-            var driver = Driver{ .request = self, .work = &work };
-            try @import("../runtime/scheduler/step_wait.zig").run(self.item.allocator, scheduler, lease, @ptrCast(&work), .prefill, io, null, &driver);
-            if (work.failure) |err| return err;
+            const output = try (ScheduledStep{
+                .scheduler = scheduler,
+                .lease = lease,
+                .io = io,
+                .execution_control = self.control,
+                .executor = &self.executor,
+                .publication = self.publication,
+            }).run(.{
+                .allocator = self.item.allocator,
+                .decode_state = state,
+                .token_ids = &.{},
+                .seq_len = end,
+                .query_seq_len = query,
+                .wants_last_logits = final,
+                .wants_greedy = final and wants_greedy,
+                .prepared_prefix = self.prefix,
+            });
+            var transfer_output = false;
+            defer if (!transfer_output) if (output.last_logits) |logits| self.item.allocator.free(logits);
             // The forward reserved exactly this prefix before mutating its KV
             // and recurrent histories. Never restart a partially consumed prefix.
             if (state.total_tokens != end) return error.InvalidBatchDecodeState;
             scheduler.notePrefillProgress(lease, end, seq);
             if (final) {
-                if (work.greedy_token) |token| {
-                    if (!wants_greedy or work.logits != null or token >= self.item.model.vocab_size) return error.InvalidBatchDecodeState;
-                    return .{ .greedy_token = token };
-                }
-                const logits = work.logits orelse return error.InvalidBatchDecodeState;
-                work.logits = null;
-                return .{ .last_logits = logits };
+                if (output.greedy_token) |token| {
+                    if (!wants_greedy or output.last_logits != null or token >= self.item.model.vocab_size) return error.InvalidBatchDecodeState;
+                } else if (output.last_logits == null) return error.InvalidBatchDecodeState;
+                transfer_output = true;
+                return output;
             }
             processed = end;
         }
         return error.InvalidPreparedPrompt;
     }
-    const Driver = struct {
-        request: *PositionedRequest,
-        work: *graph_mod.decoder_work.Prefill,
-        pub fn checkControl(self: *@This()) !void {
-            if (self.request.control) |active| try active.check();
-        }
-        pub fn isReady(self: *const @This()) bool {
-            return self.work.ready.load(.acquire);
-        }
-        pub fn stepBudget(self: *const @This()) runtime.scheduler.native_generate.StepBudget {
-            return graph_mod.decoder_work.stepBudget(self.request.scheduler, self.work.decode_state);
-        }
-        pub fn execute(self: *@This(), scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator, _: *runtime.scheduler.native_generate.Lease, claimed: []const runtime.scheduler.native_generate.StepItem) void {
-            self.request.executor.execute(claimed, scheduler.usesStepEvents(), self.request.publication);
-        }
-    };
 };
 
 pub fn forwardPositionedEmbeddingBatch(items: []const PositionedEmbeddingBatchItem) ![][]f32 {
@@ -1490,28 +1803,18 @@ pub const Forward = struct {
             decode_context,
             .{ .execution = .captured_native },
         )) orelse return null;
-        var owns_hidden = true;
-        errdefer if (owns_hidden) self.forward.context.cb.free(tail.final_hidden);
-
-        var greedy = (try decoder_tail_runtime.forwardGreedyTokenTensorFromFinalHidden(
+        defer self.forward.context.cb.free(tail.final_hidden);
+        const greedy = try decoder_tail_runtime.forwardGreedyTokenTensorFromFinalHidden(
             self.forward.context.cb,
             self.forward.context.allocator,
             self.forward.context.gpt_config.*,
             tail.final_hidden,
             .rms,
             tail.final_norm_slot,
-        )) orelse {
-            self.forward.context.cb.free(tail.final_hidden);
-            return null;
-        };
-        if (greedy.token_tensor) |token_tensor| {
-            self.forward.context.cb.free(token_tensor);
-            greedy.token_tensor = null;
-        }
+        );
+        if (greedy.token_tensor) |token_tensor| self.forward.context.cb.free(token_tensor);
 
         const last_hidden = try self.capturePreparedTailPostNormHiddenFromModel(capture_last_hidden, tail.final_hidden, tail.final_norm_slot);
-        self.forward.context.cb.free(tail.final_hidden);
-        owns_hidden = false;
         debugGenerationStage(
             "executePrefill prepared_tail_greedy token={d} capture_hidden={}",
             .{ greedy.token_id, capture_last_hidden },
@@ -1601,26 +1904,15 @@ pub const Forward = struct {
             };
         }
 
-        const logits = if (try decoder_tail_runtime.forwardPreparedLogitsTensorFromFinalHidden(
+        const logits = try decoder_tail_runtime.completePreparedLogits(
             self.forward.context.cb,
+            self.forward.context.allocator,
             self.forward.context.gpt_config.*,
             tail.final_hidden,
             .rms,
             tail.final_norm_slot,
             tail.final_lm_head_slot,
-        )) |prepared_logits|
-            prepared_logits
-        else
-            (try decoder_tail_runtime.forwardLogitsTensorFromFinalHidden(
-                self.forward.context.cb,
-                self.forward.context.gpt_config.*,
-                tail.final_hidden,
-                .rms,
-                tail.final_norm_slot,
-            )) orelse {
-                if (last_hidden) |hidden| self.forward.context.cb.free(hidden);
-                return null;
-            };
+        );
         defer self.forward.context.cb.free(logits);
         const last_logits = try self.forward.context.cb.toFloat32(logits, self.forward.context.allocator);
         gpt_arch.applyFinalLogitSoftcapInPlace(self.forward.context.gpt_config.*, last_logits);
@@ -1897,6 +2189,41 @@ fn checkMetalCompiledChunk(cb: ComputeBackend, native_reference: ComputeBackend)
         var state = graph_mod.decode_state_runtime.NativeDecodeState.initContiguous(a);
         defer state.deinit();
         var physical = Runtime{ .forward = .{ .context = .{ .allocator = a, .cb = &cb, .gpt_config = &model, .weight_semantics = .traced_decoder, .session = session, .compiled_partition_backend = .metal, .compiled_attachment_target = .whole_model, .kv_dtype = .f16, .execution_control = request_control }, .graph_cache = &cache }, .state = &state };
+        if (scenario == 0) {
+            var embedding = EmbeddingPromptRequest{
+                .route = .{ .storage = .{ .pure_greedy = true, .grammar = false, .prompt_cache = false, .compaction = false, .speculation = false, .draft = false }, .has_token_observer = false, .exact_hybrid = true },
+                .query_tokens = ids.len,
+                .configured_chunk_rows = 1,
+                .scheduler_chunk_rows = 0,
+                .speculative_k = 0,
+                .sampled_ring_qualified = false,
+                .capture_hidden = false,
+                .has_draft = false,
+                .needs_host_logits = false,
+            };
+            const compiled: CompiledPromptRequest = .{
+                .storage = embedding.route.storage,
+                .query_tokens = ids.len,
+                .configured_chunk_rows = 1,
+                .scheduler_chunk_rows = 0,
+                .speculative_k = 0,
+                .sampled_ring_qualified = false,
+            };
+            try std.testing.expectEqual(@as(usize, 1), physical.compiledPreparationRows(compiled));
+            try std.testing.expectEqual(physical.planCompiledPrompt(compiled).chunk_rows, physical.compiledPreparationRows(compiled));
+            try std.testing.expectEqual(@as(usize, 0), state.total_tokens);
+            const planned = try physical.planEmbeddingPrompt(embedding, null);
+            try std.testing.expectEqual(.greedy_token, planned.output_intent);
+            try std.testing.expectEqual(@as(usize, 1), planned.chunk_rows);
+            try std.testing.expect(!planned.reserve_whole_prompt);
+            embedding.needs_host_logits = true;
+            try std.testing.expectEqual(.last_logits, (try physical.planEmbeddingPrompt(embedding, null)).output_intent);
+            embedding.needs_host_logits = false;
+            embedding.has_draft = true;
+            try std.testing.expectEqual(.last_logits, (try physical.planEmbeddingPrompt(embedding, null)).output_intent);
+            embedding.capture_hidden = true;
+            try std.testing.expectError(error.UnsupportedPreparedRows, physical.planEmbeddingPrompt(embedding, null));
+        }
         const request = Runtime.CompiledChunk{ .token_ids = &ids, .total_sequence_length = ids.len, .output = if (scenario == 0) .kv_only else if (scenario == 2) .greedy_token else .last_logits };
         if (scenario == 3) {
             var fault = Fault{};
@@ -2058,6 +2385,13 @@ test "prefill cursor preserves scalar coalescing and rejects invalid retry witho
 }
 
 test "prefill selection reconciles actual admitted plans cache bypass and checkpoint geometry" {
+    var compiled = promptOwnerTestRequest(2);
+    compiled.allow_resident_greedy = true;
+    compiled.route.storage.pure_greedy = true;
+    try std.testing.expectEqual(.kv_only, compiled.compiledOutputIntent(false));
+    try std.testing.expectEqual(.greedy_token, compiled.compiledOutputIntent(true));
+    compiled.route.storage.grammar = true;
+    try std.testing.expectEqual(.last_logits, compiled.compiledOutputIntent(true));
     const Case = struct {
         fn run(a: std.mem.Allocator) !void {
             var plan = try runtime.scheduler.native_generate.PrefillChunkPlan.init(a, 19, 8, 4096, .shared, .fixed_ceiling);
@@ -2377,6 +2711,22 @@ fn checkPromptReplacementRows(backend_value: ComputeBackend, _: ComputeBackend) 
     const held = try cb.toFloat32(completed, a);
     defer a.free(held);
     try std.testing.expectEqualSlices(f32, actual, held);
+    if (backend_value.kind() != .native) {
+        const scaled_transfers = helper.Transfers.snapshot(backend_value);
+        var scaled_prompt = try PromptEmbeddingRows.init(cb, a, base, 6, 4, 1.25);
+        defer scaled_prompt.deinit();
+        try std.testing.expect(scaled_prompt.storage == .resident);
+        try scaled_prompt.replace(.{ .offset = 1, .rows = 2, .source = .{ .resident = image } });
+        const scaled_output = try scaled_prompt.finish();
+        defer cb.free(scaled_output);
+        try scaled_transfers.expectUnchanged(backend_value);
+        const scaled_values = try cb.toFloat32(scaled_output, a);
+        defer a.free(scaled_values);
+        var expected = base_values;
+        for (&expected) |*value| value.* *= 1.25;
+        @memcpy(expected[4..12], &[_]f32{ 41, 42, 43, 44, 51, 52, 53, 54 });
+        try std.testing.expectEqualSlices(f32, &expected, scaled_values);
+    }
     // Unit-scale host producers still need an explicit current-provider
     // upload before joining an already resident prompt. This exercises the
     // genuine host-chunks ABI shared by all three Gemma entrypoints.
@@ -2611,8 +2961,83 @@ fn checkBatchLastHeadRows(cb: ComputeBackend, _: ComputeBackend) !void {
     }
     try std.testing.expectError(error.InvalidShape, gpt_arch.forwardBatchLastLogits(&cb, a, cfg, &ids, &.{ 0, 3 }, 3, &decode));
     try std.testing.expectError(error.InvalidShape, gpt_arch.forwardBatchLastLogits(&cb, a, cfg, &ids, &.{ 4, 3 }, 3, &decode));
+
+    var ordinary = decoder_forward.Runtime{ .context = .{ .allocator = a, .cb = &cb, .gpt_config = &cfg } };
+    const selected = try ordinary.forwardLastLogits(ids[0..3], 1, 3, &decode);
+    defer a.free(selected);
+    try std.testing.expectEqual(@as(usize, cfg.vocab_size), selected.len);
+    for (all[2 * cfg.vocab_size ..][0..cfg.vocab_size], selected) |want, got|
+        try std.testing.expectApproxEqAbs(want, got, 0.00001);
 }
 
 test "prefill compact Native vocabulary rows match full head at unequal actual query ends" {
     try @import("../ops/media_residency_test.zig").onNative(CompiledPrefillFixture.populate, checkBatchLastHeadRows);
+}
+
+test "idle prefill ceiling applies only to qualified Gemma4 geometries" {
+    const gemma4_target = gpt_arch.Config{
+        .family = .gemma,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .sliding_window = 512,
+        .ple_hidden_size = 2560,
+    };
+    try std.testing.expectEqual(
+        @as(usize, 512),
+        idleChunkCeiling(.metal, gemma4_target, 2048),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 64),
+        idleChunkCeiling(.metal, gemma4_target, 64),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 2048),
+        idleChunkCeiling(.cuda, gemma4_target, 2048),
+    );
+    const gemma4_e2b_cuda = gpt_arch.Config{
+        .family = .gemma,
+        .hidden_size = 1536,
+        .num_hidden_layers = 35,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .intermediate_size = 6144,
+        .shared_layer_intermediate_size = 12288,
+        .num_kv_shared_layers = 20,
+        .sliding_window = 512,
+        .ple_hidden_size = 256,
+    };
+    try std.testing.expectEqual(
+        @as(usize, 512),
+        idleChunkCeiling(.cuda, gemma4_e2b_cuda, 2048),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 256),
+        idleChunkCeiling(.cuda, gemma4_e2b_cuda, 256),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 2048),
+        idleChunkCeiling(.metal, .{ .family = .gemma }, 2048),
+    );
+    inline for (.{
+        gpt_arch.Config{ .family = .gemma, .num_attention_heads = 7, .num_key_value_heads = 2, .attention_head_dim = 256, .global_head_dim = 512, .sliding_window = 512, .ple_hidden_size = 2560 },
+        gpt_arch.Config{ .family = .gemma, .num_attention_heads = 8, .num_key_value_heads = 1, .attention_head_dim = 256, .global_head_dim = 512, .sliding_window = 512, .ple_hidden_size = 2560 },
+        gpt_arch.Config{ .family = .gemma, .num_attention_heads = 8, .num_key_value_heads = 2, .attention_head_dim = 128, .global_head_dim = 512, .sliding_window = 512, .ple_hidden_size = 2560 },
+        gpt_arch.Config{ .family = .gemma, .num_attention_heads = 8, .num_key_value_heads = 2, .attention_head_dim = 256, .global_head_dim = 256, .sliding_window = 512, .ple_hidden_size = 2560 },
+        gpt_arch.Config{ .family = .gemma, .num_attention_heads = 8, .num_key_value_heads = 2, .attention_head_dim = 256, .global_head_dim = 512, .sliding_window = 1024, .ple_hidden_size = 2560 },
+    }) |other_geometry| {
+        try std.testing.expectEqual(
+            @as(usize, 2048),
+            idleChunkCeiling(.metal, other_geometry, 2048),
+        );
+    }
+    var assistant = gemma4_target;
+    assistant.gemma4_mtp_assistant = true;
+    try std.testing.expectEqual(
+        @as(usize, 2048),
+        idleChunkCeiling(.metal, assistant, 2048),
+    );
 }

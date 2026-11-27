@@ -23,6 +23,7 @@
 // Partitions execute sequentially in plan order. True pipeline overlap
 // (concurrent stages) is a future extension requiring std.Thread.
 
+const tensor_transfer = @import("../execution/tensor_transfer.zig");
 const std = @import("std");
 const ml = @import("ml");
 const build_options = @import("build_options");
@@ -49,7 +50,7 @@ const partition_mod = @import("partition.zig");
 const native_partition_executor = @import("native_partition_executor.zig");
 const metal_partition_executor = @import("metal_partition_executor.zig");
 const webgpu_partition_executor = @import("webgpu_partition_executor.zig");
-const buffer_plan_mod = @import("buffer_plan.zig");
+const buffer_plan_mod = @import("../execution/buffer_plan.zig");
 const executor_stats = @import("executor_stats.zig");
 const Partition = partition_mod.Partition;
 const PartitionPlan = partition_mod.PartitionPlan;
@@ -128,77 +129,7 @@ pub const MultiExecutionResult = struct {
     }
 };
 
-/// Transfer a tensor without changing dtype. Try direct device copy first;
-/// otherwise stage its exact bytes (f32 may use the numeric host path).
-pub fn transferTensor(
-    allocator: std.mem.Allocator,
-    value: CT,
-    from: *const ComputeBackend,
-    to: *const ComputeBackend,
-) !CT {
-    return transferTensorWithKnownShape(allocator, value, from, to, null);
-}
-
-fn transferTensorWithKnownShape(
-    allocator: std.mem.Allocator,
-    value: CT,
-    from: *const ComputeBackend,
-    to: *const ComputeBackend,
-    known_shape: ?[]const i64,
-) !CT {
-    const trace = traceTransfersEnabled();
-    if (trace) std.debug.print("graph_executor_transfer_stage: begin from={s} to={s}\n", .{ @tagName(from.kind()), @tagName(to.kind()) });
-    if (try to.copyTensorFromBackend(from, value)) |copied| return copied;
-    const runtime_shape_needed = if (known_shape) |shape| blk: {
-        for (shape) |dim| if (dim < 0) break :blk true;
-        break :blk false;
-    } else true;
-    const owned_shape_i64 = if (runtime_shape_needed) try from.tensorShape(value, allocator) else null;
-    defer if (owned_shape_i64) |shape| allocator.free(shape);
-    const shape_i64 = owned_shape_i64 orelse known_shape.?;
-    if (trace) std.debug.print("graph_executor_transfer_stage: shape_i64={any}\n", .{shape_i64});
-    const shape_i32 = try tensorShapeI32(allocator, shape_i64);
-    defer allocator.free(shape_i32);
-    if (trace) std.debug.print("graph_executor_transfer_stage: shape_i32={any}\n", .{shape_i32});
-    const dtype = try from.tensorDType(value);
-    switch (dtype) {
-        inline .i8, .i16, .i32, .i64, .u8, .bool_, .f16, .bf16, .f64 => |tag| {
-            const exported = (try from.exportTensorData(value, allocator)) orelse return error.UnsupportedTensorType;
-            const bytes = switch (exported.payload) {
-                .bytes => |bytes| bytes,
-                .quantized_f32 => |quant| {
-                    allocator.free(quant.raw_bytes);
-                    allocator.free(quant.shape);
-                    return error.UnsupportedTensorType;
-                },
-            };
-            defer allocator.free(bytes);
-            if (exported.dtype != dtype) return error.UnsupportedTensorType;
-            if (try to.fromConstantBytes(bytes, @field(ml.graph.DType, @tagName(tag)), shape_i64)) |exact| return exact;
-            if (dtype != .i32 or bytes.len % 4 != 0) return error.UnsupportedTensorType;
-            const integers = try allocator.alloc(i32, bytes.len / 4);
-            defer allocator.free(integers);
-            for (integers, 0..) |*integer, i| integer.* = std.mem.readInt(i32, bytes[i * 4 ..][0..4], .little);
-            return (try to.fromInt32Shape(integers, shape_i32)) orelse return error.UnsupportedTensorType;
-        },
-        else => {},
-    }
-    const f32_data = try from.toFloat32(value, allocator);
-    defer allocator.free(f32_data);
-    if (trace) std.debug.print("graph_executor_transfer_stage: f32_len={d}\n", .{f32_data.len});
-    const transferred = try to.fromFloat32Shape(f32_data, shape_i32);
-    errdefer to.free(transferred);
-    if (trace) std.debug.print("graph_executor_transfer_stage: from_float32_shape_done\n", .{});
-    if (to.kind() == .metal) {
-        if (try metal_partition_executor.makeMetalDeviceResident(to, transferred)) |device_transferred| {
-            to.free(transferred);
-            if (trace) std.debug.print("graph_executor_transfer_stage: made_metal_device_resident\n", .{});
-            return device_transferred;
-        }
-    }
-    if (trace) std.debug.print("graph_executor_transfer_stage: end host_resident\n", .{});
-    return transferred;
-}
+pub const transferTensor = tensor_transfer.copy;
 
 fn graphShapeDims(shape: ml.graph.Shape, buf: *[ml.graph.shape.max_rank]i64) ![]const i64 {
     const rank = shape.rank();
@@ -207,21 +138,8 @@ fn graphShapeDims(shape: ml.graph.Shape, buf: *[ml.graph.shape.max_rank]i64) ![]
     return buf[0..rank];
 }
 
-fn traceTransfersEnabled() bool {
-    return platform.env.getenvBoolDefault("TERMITE_GRAPH_EXECUTOR_TRACE_TRANSFERS", false);
-}
-
 fn traceOutputsEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_GRAPH_EXECUTOR_TRACE_OUTPUTS", false);
-}
-
-fn tensorShapeI32(allocator: std.mem.Allocator, shape: []const i64) ![]i32 {
-    const out = try allocator.alloc(i32, shape.len);
-    errdefer allocator.free(out);
-    for (shape, 0..) |dim, i| {
-        out[i] = std.math.cast(i32, dim) orelse return error.UnsupportedShape;
-    }
-    return out;
 }
 
 /// Partitions may schedule independent branches in a different order from
@@ -295,7 +213,7 @@ pub fn executeDeviceOutputs(
     if (auditing) try transfer_audit.begin(&audit);
     defer if (auditing) transfer_audit.end();
     const result = try executeMultiDeviceImpl(allocator, graph, plan, mesh, options, stats);
-    audit.recordStats(stats);
+    if (auditing) audit.recordStats(stats);
     return result;
 }
 
@@ -387,6 +305,15 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
     const exec_stats = stats;
     const trace_partitions = tracePartitionsEnabled();
 
+    const BorrowedPartitionInput = struct {
+        node: NodeId,
+        producer_value: CT,
+        producer_device: DeviceId,
+        producer_is_owned_transfer: bool,
+    };
+    var preserved_inputs: std.ArrayList(BorrowedPartitionInput) = .empty;
+    defer preserved_inputs.deinit(allocator);
+
     // Execute each partition in order.
     for (plan.base.partitions, 0..) |part, part_idx| {
         if (options.execution_control) |control| try control.check();
@@ -398,12 +325,29 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
             printPartitionTrace("begin", graph, part, part_idx, dev_id);
         }
 
+        defer {
+            for (preserved_inputs.items) |input| {
+                if (values[input.node]) |copy| {
+                    // A partition may give the alias an output slot. That slot
+                    // retains ownership after restoring the producer binding.
+                    for (part.node_ids) |local| {
+                        if (values[local] == copy) break;
+                    } else cb.free(copy);
+                }
+                values[input.node] = input.producer_value;
+                value_device[input.node] = input.producer_device;
+                if (!input.producer_is_owned_transfer) _ = owned_runtime_transfers.remove(input.node);
+            }
+            preserved_inputs.clearRetainingCapacity();
+        }
+
         // Transfer external inputs from source device to this device.
         for (part.external_inputs) |ext_in| {
             const nid: usize = @intCast(ext_in.node_id);
             const src_val = values[nid] orelse continue;
             const src_dev = value_device[nid];
             if (src_dev != dev_id) {
+                if (options.execution_control) |control| try control.check();
                 const src_entry = mesh.device(src_dev) orelse continue;
                 if (trace_partitions) {
                     std.debug.print(
@@ -420,13 +364,23 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
                         },
                     );
                 }
-                var static_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
-                const static_shape = try graphShapeDims(graph.node(ext_in.node_id).output_shape, &static_shape_buf);
+                const runtime_input = rt_map.contains(ext_in.node_id);
+                const final_user = last_use[nid];
+                const preserve_producer = final_user >= count or
+                    (plan.base.node_assignment[final_user] != part_idx and
+                        hasLaterConsumerOnAnotherDevice(plan, part_idx + 1, ext_in.node_id, dev_id));
+                if (preserve_producer) try preserved_inputs.ensureUnusedCapacity(allocator, 1);
+                if (runtime_input) try owned_runtime_transfers.ensureUnusedCapacity(allocator, 1);
                 const planned_transfer = if (options.physical_frame) |frame|
                     try frame.transfer(src_entry.backend, cb, src_val, ext_in.node_id, @intCast(part_idx))
                 else
                     null;
-                const transferred = planned_transfer orelse try transferTensorWithKnownShape(allocator, src_val, src_entry.backend, cb, static_shape);
+                const transferred = planned_transfer orelse fallback: {
+                    if (options.require_assigned_kernels) return error.UnsupportedCompiledGraphRuntime;
+                    var static_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
+                    const static_shape = try graphShapeDims(graph.node(ext_in.node_id).output_shape, &static_shape_buf);
+                    break :fallback try tensor_transfer.copyWithKnownShape(allocator, src_val, src_entry.backend, cb, static_shape);
+                };
                 if (collect_stats) exec_stats.cross_device_transfers += 1;
                 if (collect_stats and cb.kind() == .metal and metal_partition_executor.isMetalDeviceResident(cb, transferred)) {
                     exec_stats.device_resident_transfers += 1;
@@ -437,17 +391,19 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
                     ext_in.node_id,
                     src_val,
                 );
-                // Keep the old value alive (other partitions may need it).
-                // Store the transferred copy as an additional ref.
-                // We'll use the transferred value for this partition's nodes.
-                values[nid] = transferred;
-                value_device[nid] = dev_id;
-                if (!source_is_borrowed_runtime_input) {
+                if (preserve_producer) {
+                    preserved_inputs.appendAssumeCapacity(.{
+                        .node = ext_in.node_id,
+                        .producer_value = src_val,
+                        .producer_device = src_dev,
+                        .producer_is_owned_transfer = owned_runtime_transfers.contains(ext_in.node_id),
+                    });
+                } else if (!source_is_borrowed_runtime_input) {
                     src_entry.backend.free(src_val);
                 }
-                if (rt_map.contains(ext_in.node_id)) {
-                    try owned_runtime_transfers.put(allocator, ext_in.node_id, {});
-                }
+                values[nid] = transferred;
+                value_device[nid] = dev_id;
+                if (runtime_input) owned_runtime_transfers.putAssumeCapacity(ext_in.node_id, {});
             }
         }
 
@@ -508,10 +464,13 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
                 if (rt_map.get(node_id)) |rt_val| {
                     const current_dev = value_device[i];
                     if (current_dev != dev_id) {
+                        if (options.require_assigned_kernels) return error.UnsupportedCompiledGraphRuntime;
                         const src_entry = mesh.device(current_dev) orelse return error.DeviceNotFound;
+                        try owned_runtime_transfers.ensureUnusedCapacity(allocator, 1);
                         const transferred = try transferTensor(allocator, rt_val, src_entry.backend, cb);
                         values[i] = transferred;
-                        try owned_runtime_transfers.put(allocator, node_id, {});
+                        owned_runtime_transfers.putAssumeCapacity(node_id, {});
+                        if (collect_stats) exec_stats.runtime_input_transfers += 1;
                     } else {
                         values[i] = rt_val;
                     }
@@ -707,6 +666,18 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
         .output_devices = output_devices,
         .allocator = allocator,
     };
+}
+
+/// If the remaining consumers all use the current destination, that copy
+/// can become the last owner. Other devices still need the producer value.
+fn hasLaterConsumerOnAnotherDevice(plan: *const DevicePartitionPlan, start: usize, node: NodeId, destination: DeviceId) bool {
+    for (plan.base.partitions[start..], plan.device_assignment[start..]) |partition, device| {
+        if (device == destination) continue;
+        for (partition.external_inputs) |input| {
+            if (input.node_id == node) return true;
+        }
+    }
+    return false;
 }
 
 fn isBorrowedRuntimeInputValue(
@@ -950,7 +921,7 @@ test "graph backend partition executes through native partition executor path" {
     try std.testing.expectEqualSlices(f32, &.{ -1, 2, -3, 4 }, raw);
 }
 
-test "native partition executor transfers borrowed runtime input across devices" {
+test "native partition executor transfers borrowed runtime input across devices with partition transfer ownership" {
     const allocator = std.testing.allocator;
 
     var g = Graph.init(allocator);
@@ -1012,6 +983,17 @@ test "native partition executor transfers borrowed runtime input across devices"
     const original = try cb_a.toFloat32(input, allocator);
     defer allocator.free(original);
     try std.testing.expectEqualSlices(f32, &input_data, original);
+
+    const AllocationProbe = struct {
+        fn run(scratch: std.mem.Allocator, graph: *const Graph, placement: *const DevicePartitionPlan, devices: *const DeviceMesh, node: NodeId, borrowed: CT) !void {
+            var executed = try executeMultiDevice(scratch, graph, placement, devices, .{
+                .runtime_inputs = &.{.{ .node_id = node, .value = borrowed }},
+            });
+            defer executed.deinit(devices);
+            try std.testing.expectEqual(@as(DeviceId, 1), executed.output_devices[0]);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(allocator, AllocationProbe.run, .{ &g, &dpp, &mesh, x, input });
 
     // A resident input on a non-default device needs no upload to that same
     // device. Its owner is independent of the parameter's proposed placement.
@@ -1255,7 +1237,80 @@ test "multi-executor retains inputs when partitions reorder independent consumer
     try std.testing.expectEqualSlices(f32, &.{ 1, 4, 9, 16 }, square_values);
 }
 
-test "transferTensor preserves floating storage without numeric conversion" {
+test "multi-executor preserves a published producer across cross-device fan-out" {
+    const a = std.testing.allocator;
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const Context = @import("../backends/compute_context.zig").BackendContext;
+    var source_ctx = try Context.init(a, .native, std.testing.io);
+    defer source_ctx.deinit(a);
+    var target_ctx = try Context.init(a, .native, std.testing.io);
+    defer target_ctx.deinit(a);
+    const source = source_ctx.computeBackend();
+    const target = target_ctx.computeBackend();
+    var mesh = try DeviceMesh.init(a, &.{
+        .{ .id = 0, .backend = &source, .kind = .native },
+        .{ .id = 1, .backend = &target, .kind = .native },
+    });
+    defer mesh.deinit();
+
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var b = Builder.init(&graph);
+    const x = try b.tensorConst(&.{ 1, 2, 3, 4 }, Shape.init(.f32, &.{4}));
+    const negative = try b.neg(x);
+    const square = try b.mul(x, x);
+    for ([_]NodeId{ x, negative, square }) |output| try graph.markOutput(output);
+    const incoming: []const @import("partition.zig").ExternalInput = &.{.{ .node_id = x, .source_partition = 0 }};
+    var parts = [_]Partition{
+        .{ .backend = .native, .node_ids = &.{x}, .external_inputs = &.{} },
+        .{ .backend = .native, .node_ids = &.{negative}, .external_inputs = incoming },
+        .{ .backend = .native, .node_ids = &.{square}, .external_inputs = incoming },
+    };
+    const plan = DevicePartitionPlan{
+        .base = .{ .partitions = &parts, .node_assignment = &.{ 0, 1, 2 }, .node_operator_plans = &.{ null, null, null }, .allocator = a, .owns_executors = false },
+        .device_assignment = &.{ 0, 1, 0 },
+        .allocator = a,
+    };
+    // An existing runtime binding makes the producer available before
+    // dispatch. Strict execution must decline the undeclared copy itself.
+    const bound = try source.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{4});
+    defer source.free(bound);
+    var strict_stats: ExecutionStats = .{};
+    try std.testing.expectError(error.UnsupportedCompiledGraphRuntime, executeDeviceOutputs(a, &graph, &plan, &mesh, &.{
+        .runtime_inputs = &.{.{ .node_id = x, .value = bound }},
+        .require_assigned_kernels = true,
+        .collect_partition_stats = true,
+    }, &strict_stats));
+    try std.testing.expectEqual(@as(u64, 0), strict_stats.cross_device_transfers);
+
+    var result = try executeMultiDevice(a, &graph, &plan, &mesh, .{ .collect_partition_stats = true });
+    defer result.deinit(&mesh);
+    try std.testing.expectEqualSlices(DeviceId, &.{ 0, 1, 0 }, result.output_devices);
+    try std.testing.expectEqual(@as(u64, 1), result.stats.cross_device_transfers);
+    const expected = [_][4]f32{ .{ 1, 2, 3, 4 }, .{ -1, -2, -3, -4 }, .{ 1, 4, 9, 16 } };
+    for (result.outputs, result.output_devices, expected) |tensor, device, want| {
+        const values = try mesh.device(device).?.backend.toFloat32(tensor, a);
+        defer a.free(values);
+        try std.testing.expectEqualSlices(f32, &want, values);
+    }
+
+    // With no published source and both consumers on the destination, the
+    // first copy remains the live binding until the final use.
+    _ = graph.outputs.orderedRemove(0);
+    var same_destination = plan;
+    same_destination.device_assignment = &.{ 0, 1, 1 };
+    var reused = try executeMultiDevice(a, &graph, &same_destination, &mesh, .{ .collect_partition_stats = true });
+    defer reused.deinit(&mesh);
+    try std.testing.expectEqualSlices(DeviceId, &.{ 1, 1 }, reused.output_devices);
+    try std.testing.expectEqual(@as(u64, 1), reused.stats.cross_device_transfers);
+    for (reused.outputs, expected[1..]) |tensor, want| {
+        const values = try target.toFloat32(tensor, a);
+        defer a.free(values);
+        try std.testing.expectEqualSlices(f32, &want, values);
+    }
+}
+
+test "transferTensor preserves typed storage without numeric conversion" {
     const a = std.testing.allocator;
     var weights = native_compute.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&weights, a);
@@ -1293,8 +1348,13 @@ test "transferTensor preserves floating storage without numeric conversion" {
     };
     const doubles = [_]f64{ 1.0000000000000002, -1.23456789012345e100 };
     const halves = [_]u16{ 0x7e19, 0x8000 };
-    for ([_]DType{ .f16, .bf16, .f64 }) |dtype| {
-        var probe = Probe{ .dtype = dtype, .bytes = if (dtype == .f64) std.mem.sliceAsBytes(&doubles) else std.mem.sliceAsBytes(&halves) };
+    const indices = [_]i64{ 16777219, -9007199254740993 };
+    for ([_]DType{ .f16, .bf16, .f64, .i64 }) |dtype| {
+        var probe = Probe{ .dtype = dtype, .bytes = switch (dtype) {
+            .f64 => std.mem.sliceAsBytes(&doubles),
+            .i64 => std.mem.sliceAsBytes(&indices),
+            else => std.mem.sliceAsBytes(&halves),
+        } };
         var vtable = native.vtable.*;
         vtable.backendKind = Probe.kind;
         vtable.tensorDType = Probe.dtypeOf;

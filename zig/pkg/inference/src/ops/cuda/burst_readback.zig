@@ -68,24 +68,7 @@ pub const Slot = struct {
     /// A synchronous borrow of the exact cold token; no supplier on this path.
     pub fn prepareAdmitted(self: *Slot, ctx: *context.CudaContext, lease: *@import("prepared_cache.zig").Lease, current: Cleanup) !bool {
         if (self.host.ptr != null or self.event != null or self.quota.hasLease() or self.failed or self.busy) return error.InvalidCacheRetirementState;
-        const owner = lease.owner orelse return error.UnpreparedCacheAdmission;
-        const entry = lease.entry orelse return error.InvalidPreparedCacheState;
-        const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;
-        if (current.outside_execution or owner.state != .bound or entry.state != .taken) return error.InvalidPreparedCacheState;
-        const expected_epoch = owner.boundary orelse return error.InvalidPreparedCacheState;
-        if (try epoch.isSealed() or try expected_epoch.isSealed()) return error.RetirementEpochSealed;
-        const actual = try epoch.boundary();
-        const expected = try expected_epoch.boundary();
-        if (actual.context != expected.context or actual.nonce != expected.nonce) return error.ForeignPreparedCacheBoundary;
-        var found = false;
-        for (owner.entries) |*candidate| if (candidate == entry) {
-            found = true;
-            break;
-        };
-        if (!found or entry.request != .auxiliary or entry.request.auxiliary.kind != .burst_readback_host or entry.request.auxiliary.device_bytes != 0 or entry.request.auxiliary.host_bytes != capacity) return error.PreparedCacheAmountChanged;
-        const value = lease.value orelse return error.MissingCacheRetirementLease;
-        const pin = owner.domain_pin orelse return error.MissingCacheRetirementDomain;
-        if (value.controller != pin.controller() or !std.meta.eql(value.amounts, memory.AdmissionAmounts{ .host_scratch_bytes = capacity })) return error.ForeignAdmissionDomain;
+        try lease.validatePinnedHost(.burst_readback_host, capacity, current);
         self.host = buffer.HostBuffer.alloc(ctx, capacity) catch return false;
         self.quota = lease.publishQuota();
         self.event = ctx.createStreamEvent() catch {
@@ -94,35 +77,27 @@ pub const Slot = struct {
         };
         return true;
     }
-    pub fn beginPrepared(self: *Slot, ctx: *context.CudaContext, source: buffer.DeviceBuffer, bytes: usize) !?Pending {
-        if (self.host.ptr == null or self.event == null) return null;
-        return self.begin(ctx, source, bytes);
-    }
-
-    pub fn deinit(self: *Slot, ctx: *context.CudaContext) void {
-        self.clear(ctx) catch {
-            std.log.err("CUDA OCR burst readback could not retire its admitted host buffer", .{});
-        };
-    }
-
-    pub fn begin(self: *Slot, ctx: *context.CudaContext, source: buffer.DeviceBuffer, bytes: usize) !?Pending {
-        if (self.busy or self.failed or bytes == 0 or bytes > capacity or ctx.debug_graph_capture_active) return null;
+    pub fn beginUnadmitted(self: *Slot, ctx: *context.CudaContext, source: buffer.DeviceBuffer, bytes: usize) !?Pending {
+        if (ctx.video_cache_budget.admission != null or self.quota.hasLease()) return null;
+        if (!self.canBegin(ctx, bytes)) return null;
         if (source.ptr == 0 or source.len < bytes) return error.InvalidShape;
         if (self.host.ptr == null) {
-            var lease: ?memory.AdmissionLease = null;
-            if (ctx.video_cache_budget.admission) |policy|
-                lease = policy.controller.tryAcquire(.gpu, policy.limits, .{ .host_scratch_bytes = capacity }, policy.check_live_memory) catch return null;
-            const host = buffer.HostBuffer.alloc(ctx, capacity) catch {
-                if (lease) |*owned| owned.release();
-                return null;
-            };
-            self.host = host;
-            self.quota = Quota.fromRawAdmission(lease);
+            self.host = buffer.HostBuffer.alloc(ctx, capacity) catch return null;
             self.event = ctx.createStreamEvent() catch {
                 self.clear(ctx) catch {};
                 return null;
             };
         }
+        return self.beginPrepared(ctx, source, bytes);
+    }
+
+    fn canBegin(self: *const Slot, ctx: *const context.CudaContext, bytes: usize) bool {
+        return !self.busy and !self.failed and bytes != 0 and bytes <= capacity and !ctx.debug_graph_capture_active;
+    }
+
+    pub fn beginPrepared(self: *Slot, ctx: *context.CudaContext, source: buffer.DeviceBuffer, bytes: usize) !?Pending {
+        if (!self.canBegin(ctx, bytes) or self.host.ptr == null or self.event == null) return null;
+        if (source.ptr == 0 or source.len < bytes) return error.InvalidShape;
         // Set ownership before enqueueing. A copy or event-record failure
         // drains before storage can be reused, exactly as cancellation does.
         self.busy = true;
@@ -203,7 +178,7 @@ test "LightOnOCR3 CUDA burst readback failed physical free retains ownership and
     try std.testing.expectError(error.CudaDriverError, slot.clear(&ctx));
     try std.testing.expect(slot.failed and slot.host.ptr != null and slot.quota.hasLease());
     try std.testing.expectEqual(@as(usize, capacity), controller.snapshot().host_scratch_bytes);
-    try std.testing.expect((try slot.begin(&ctx, .{}, 4)) == null);
+    try std.testing.expect((try slot.beginPrepared(&ctx, .{}, 4)) == null);
     Fake.reject = false;
     try slot.clear(&ctx);
     try std.testing.expect(slot.host.ptr == null and !slot.quota.hasLease());

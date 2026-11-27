@@ -6021,15 +6021,22 @@ test "embeddinggemma2 CUDA flat audio and mixed batch dispatch fit production ad
     const hf = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_bytes);
     defer hf.deinitSelf();
     const memory = @import("../runtime/tier/memory.zig");
-    var controller = memory.AdmissionController{};
-    defer controller.deinit();
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    const controller = &domain.controller;
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
     var session = try session_factory.createCudaSession(a, model);
     defer session.close();
+    const lifetime = session.model_lifetime orelse return error.MissingModelLifetime;
+    lifetime.admission_domain = domain.pin();
+    session.execution_gate = &lifetime.execution_gate;
+    session.cohort_scheduler = &scheduler;
+    session_factory.attachIo(session, std.testing.io);
     const MiB = 1024 * 1024;
     const limits = memory.Limits{ .host_limit_bytes = 1536 * MiB, .backend_limit_bytes = 4608 * MiB, .combined_limit_bytes = 6144 * MiB, .scratch_limit_bytes = 768 * MiB };
     var weights = try controller.tryAcquire(.gpu, limits, .{ .backend_weight_bytes = 3195 * MiB }, false);
     defer weights.release();
-    session.run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = limits, .static_workspace_bytes = 512 * MiB, .model_profile = .{ .hidden_size = 512, .embedding_gemma2_cuda = true }, .check_live_memory = false };
+    session.run_admission = .{ .controller = controller, .backend_class = .gpu, .limits = limits, .static_workspace_bytes = 512 * MiB, .model_profile = .{ .hidden_size = 512, .embedding_gemma2_cuda = true }, .check_live_memory = false };
     var pipeline = EmbeddingPipeline.init(a, session, hf.tokenizer(), .{
         .resident_embedding_gemma2 = true,
         .max_length = 8192,

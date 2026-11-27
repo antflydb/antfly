@@ -62,7 +62,7 @@
     function expectClose(name, actual, expected, tol = tolerance) {
       const maxAbs = maxAbsDiff(actual, expected);
       log(`${name}: maxAbs=${maxAbs.toExponential(6)}`);
-      if (maxAbs > tol) {
+      if (!(maxAbs <= tol)) {
         throw new Error(`${name} exceeded tolerance ${tol}: actual=${JSON.stringify(actual)} expected=${JSON.stringify(expected)}`);
       }
     }
@@ -219,6 +219,32 @@
       imports.gpu_download(id, scratchPtr, len * Float32Array.BYTES_PER_ELEMENT);
       await gpu.flush();
       return readF32(scratchPtr, len);
+    }
+
+    async function runCrossAttention(gpu, imports) {
+      const q = await uploadF32(gpu, imports, [1]);
+      const k = await uploadF32(gpu, imports, [0, 1]);
+      const v = await uploadF32(gpu, imports, [2, 4]);
+      const out = gpu.createBuffer(Float32Array.BYTES_PER_ELEMENT);
+      const cases = [
+        ['no mask', null, (2 + 4 * Math.E) / (1 + Math.E)],
+        ['one visible key', [1, 0], 2],
+        ['no visible keys', [0, 0], 0],
+      ];
+      for (const [name, mask, expected] of cases) {
+        const maskId = mask ? await uploadBytes(gpu, imports, new Uint8Array(Uint32Array.from(mask).buffer)) : 0;
+        imports.gpu_cross_attention(q, k, v, maskId, out, 1, 1, 2, 1, 1);
+        expectClose(`cross attention ${name}`, await downloadF32(gpu, imports, out, 1), [expected]);
+        if (maskId) gpu.freeBuffer(maskId);
+      }
+      const batchedQ = await uploadF32(gpu, imports, [1, 1]);
+      const batchedK = await uploadF32(gpu, imports, [0, 1, 0, 1]);
+      const batchedV = await uploadF32(gpu, imports, [2, 4, 8, 16]);
+      const batchedMask = await uploadBytes(gpu, imports, new Uint8Array(Uint32Array.of(0, 1, 0, 0).buffer));
+      const batchedOut = gpu.createBuffer(2 * Float32Array.BYTES_PER_ELEMENT);
+      imports.gpu_cross_attention(batchedQ, batchedK, batchedV, batchedMask, batchedOut, 2, 1, 2, 1, 1);
+      expectClose('cross attention distinct batch masks', await downloadF32(gpu, imports, batchedOut, 2), [4, 0]);
+      for (const id of [q, k, v, out, batchedQ, batchedK, batchedV, batchedMask, batchedOut]) gpu.freeBuffer(id);
     }
 
     async function runBinary(gpu, imports, name, fnName, a, b, expected) {
@@ -404,6 +430,7 @@
         await runBinary(gpu, imports, 'div scalar', 'gpu_div', [4, 9, 16, 25], [2], [2, 4.5, 8, 12.5]);
         await runBinary(gpu, imports, 'less_than broadcast', 'gpu_less_than', [0, 3, 2, 8], [1, 2], [1, 0, 0, 0]);
         await runWhereSelect(gpu, imports);
+        await runCrossAttention(gpu, imports);
 
         const unaryInput = [-1.5, -0.25, 0.25, 2.0];
         await runUnary(gpu, imports, 'neg', 'gpu_neg', unaryInput, unaryInput.map((v) => -v));

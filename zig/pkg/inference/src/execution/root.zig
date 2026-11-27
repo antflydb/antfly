@@ -22,6 +22,8 @@ pub const model_frontend = @import("model_frontend.zig");
 pub const captured_forward = @import("captured_forward.zig");
 pub const prefill_frontend = @import("../architectures/frontends/decoder_prefill.zig");
 pub const Binding = @import("program.zig").Binding;
+pub const graph_runtime = @import("graph_runtime.zig");
+pub const buffer_plan = @import("buffer_plan.zig");
 pub const Executable = @import("executable.zig").Executable;
 pub const prepare = @import("executable.zig").prepare;
 pub const prepareWithOptions = @import("executable.zig").prepareWithOptions;
@@ -34,6 +36,13 @@ pub const model_candidate = @import("model_candidate.zig");
 pub const ModelCandidate = model_candidate.Candidate;
 pub const transfer_audit = @import("transfer_audit.zig");
 
+pub const model_runtime = @import("model_runtime.zig");
+pub const decode_state_runtime = @import("decode_state_runtime.zig");
+pub const session_decoder = @import("session_decoder.zig");
+pub const live_model_executor = @import("live_model_executor.zig");
+pub const decode_batch = @import("decode_batch.zig");
+pub const decoder_work = @import("decoder_work.zig");
+pub const decoder_step_executor = @import("decoder_step_executor.zig");
 pub const decoder_forward = @import("decoder_forward.zig");
 pub const native_decoder_program = @import("native_decoder_program.zig");
 pub const decoder_storage = @import("decoder_storage.zig");
@@ -173,5 +182,8 @@ test {
 test {
     _ = @import("gemma4_native_plan.zig");
     _ = @import("resident_decoder.zig");
+    _ = @import("media_prefix.zig");
+    _ = @import("physical_buffers.zig");
+    _ = @import("tensor_transfer.zig");
     _ = @import("decoder_checkpoint.zig");
 }

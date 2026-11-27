@@ -77,12 +77,8 @@ pub const Cleanup = union(enum) {
 /// same-model decode deliberately keeps its existing alias/borrowed-provider path.
 fn promoteForeignMetalSource(encoder: *stages.EncoderOutputs, destination: Session, cleanup: *Cleanup) !void {
     if (cleanup.* != .task) return;
-    const resident = switch (encoder.*) {
-        .host => return,
-        .resident => |*value| value,
-    };
-    const receiver = resident.incremental_receiver orelse return;
-    if (receiver.destination_ptr != destination.ptr or receiver.destination_vtable != destination.vtable) return error.InvalidIncrementalReceiver;
+    const receiver = (try encoder.incrementalReceiverFor(destination)) orelse return;
+    const resident = &encoder.resident;
     if (receiver.backend != .metal or receiver.same_model_owner) return;
     const values = &resident.values;
     if (values.resource_hold != null or values.backend.execution_control == null) return;

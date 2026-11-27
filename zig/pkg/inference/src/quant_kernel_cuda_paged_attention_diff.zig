@@ -1219,7 +1219,7 @@ fn runProductionOracleCase(
     if (warp_module) |module| {
         // Exercise the production dispatch and both split stages, including
         // fully masked chunks. Never accept its generic fallback as a warp test.
-        if (!module.e4bF16WarpSplitSelected(cfg.num_heads, cfg.num_kv_heads, dim, @backingInt(key_format), @backingInt(value_format)))
+        if (!module.f16WarpSplitSelected(cfg.num_heads, cfg.num_kv_heads, dim, @backingInt(key_format), @backingInt(value_format)))
             return error.CudaKernelUnavailable;
         const chunk_size: usize = if (dim == 256) 64 else 128;
         const split_capacity = if (cfg.sliding_window > 0) @min(physical_capacity, cfg.sliding_window) else physical_capacity;

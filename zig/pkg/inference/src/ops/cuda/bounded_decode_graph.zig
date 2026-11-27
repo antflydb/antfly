@@ -22,35 +22,150 @@ const driver = @import("driver.zig");
 const buffer = @import("buffer.zig");
 const memory = @import("../../runtime/tier/memory.zig");
 const plan_mod = @import("../../execution/stream_workspace.zig");
+const paged_attention = @import("paged_attention_bf16.zig");
+const DecodeScratch = paged_attention.DecodeScratch;
+const recurrent_packet_rows = @import("gated_delta.zig").max_packet_rows;
 const quota_mod = @import("cache_quota.zig");
 const funding_mod = @import("prepared_cache.zig");
 const retirement = @import("../../execution/resource_retirement.zig");
 const Cleanup = @import("../../execution/cleanup_context.zig").Context;
-pub const max_rows = 128;
+pub const max_rows = 2 * paged_attention.max_packet_rows;
+
+/// Each captured attention packet requires at least two rows. A cohort
+/// ending in a singleton packet uses the ordinary decoder schedule.
+pub fn supportsRows(rows: usize, wide: bool) bool {
+    const packet_rows = paged_attention.max_packet_rows;
+    const limit: usize = if (wide) max_rows else packet_rows;
+    return rows >= 2 and rows <= limit and (rows <= packet_rows or rows % packet_rows != 1);
+}
+
+test "bounded CUDA decoder row eligibility follows attention packet boundaries" {
+    const packet_rows = paged_attention.max_packet_rows;
+    try std.testing.expect(!supportsRows(1, true));
+    try std.testing.expect(supportsRows(2, false));
+    try std.testing.expect(supportsRows(packet_rows, false));
+    try std.testing.expect(!supportsRows(packet_rows + 2, false));
+    try std.testing.expect(!supportsRows(packet_rows + 1, true));
+    try std.testing.expect(supportsRows(packet_rows + 2, true));
+    try std.testing.expect(supportsRows(max_rows, true));
+    try std.testing.expect(!supportsRows(max_rows + 1, true));
+}
 
 /// Exact independently retained buffers for a captured two-column sequence.
 /// Pure geometry is available to cold admission before any SDK teardown or
 /// allocation. It contains no page/key/weight pointer and grants no byte credit.
 pub const StorageLayout = struct {
-    bank_offset: usize,
-    positions_offset: usize,
-    progress_offset: usize,
+    input: Span,
+    tokens: Span,
+    positions: Span,
+    counter: Span,
+    attention_workspace: ?Span = null,
+    recurrent_workspace: ?Span = null,
+    fused_head_workspace: ?Span = null,
+    recurrent_scratch: ?@import("gated_delta.zig").PacketScratch = null,
     metadata_bytes: usize,
     host_bytes: usize,
     head_bytes: usize,
+    shared_head_workspace: ?Span = null,
+
+    pub fn headPacketRows(self: StorageLayout, rows: usize, vocab: usize) usize {
+        if (self.shared_head_workspace) |span| return span.bytes / @sizeOf(f32) / vocab;
+        if (self.head_bytes != 0) return self.head_bytes / @sizeOf(f32) / vocab;
+        return rows;
+    }
+
+    const Span = struct {
+        offset: usize,
+        bytes: usize,
+
+        fn bind(self: Span, backing: buffer.DeviceBuffer) buffer.DeviceBuffer {
+            return backing.borrowRange(self.offset, self.bytes) catch unreachable;
+        }
+    };
+
+    pub const max_readback_words = blk: {
+        const maximum = init(max_rows, 1, 1, 1) catch unreachable;
+        break :blk maximum.readbackProgressIndex() + 1;
+    };
+
+    pub fn readback(self: StorageLayout, backing: buffer.DeviceBuffer) buffer.DeviceBuffer {
+        return (Span{ .offset = self.tokens.offset, .bytes = self.counter.offset + self.counter.bytes - self.tokens.offset }).bind(backing);
+    }
+
+    pub fn readbackPositionIndex(self: StorageLayout) usize {
+        return (self.positions.offset - self.tokens.offset) / @sizeOf(u32);
+    }
+
+    pub fn readbackProgressIndex(self: StorageLayout) usize {
+        return (self.counter.offset - self.tokens.offset) / @sizeOf(u32);
+    }
+
+    /// Check the device receipt before any tokens or position changes escape.
+    pub fn publishReadback(self: StorageLayout, host: []const u32, previous_positions: []u32, progress: *u32, first: []u32, second: []u32) !void {
+        const counter_word = self.readbackProgressIndex();
+        const position_word = self.readbackPositionIndex();
+        const rows = self.tokens.bytes / (2 * @sizeOf(u32));
+        if (host.len != counter_word + 1 or first.len != rows or second.len != rows or
+            previous_positions.len != self.positions.bytes / @sizeOf(u32))
+            return error.InvalidExecutionPlan;
+        if (host[counter_word] != try std.math.add(u32, progress.*, 2)) return error.InvalidExecutionPlan;
+        const positions = host[position_word..][0..previous_positions.len];
+        for (previous_positions, positions) |position, actual|
+            if (actual != try std.math.add(u32, position, 2)) return error.InvalidExecutionPlan;
+        @memcpy(first, host[0..rows]);
+        @memcpy(second, host[rows..][0..rows]);
+        @memcpy(previous_positions, positions);
+        progress.* = host[counter_word];
+    }
 
     pub fn init(rows: usize, hidden: usize, vocab: usize, key_words: usize) !StorageLayout {
-        if (rows < 2 or rows > max_rows or hidden == 0 or vocab == 0 or key_words == 0) return error.InvalidShape;
+        return initWithHeadLimit(rows, hidden, vocab, key_words, rows);
+    }
+
+    fn initWithHeadLimit(rows: usize, hidden: usize, vocab: usize, key_words: usize, max_head_rows: usize) !StorageLayout {
+        if (rows < 2 or rows > max_rows or hidden == 0 or vocab == 0 or key_words == 0 or max_head_rows == 0) return error.InvalidShape;
         const input_bytes = try std.math.mul(usize, try std.math.mul(usize, rows, hidden), @sizeOf(f32));
         const bank_offset = try aligned(input_bytes);
-        const positions_offset = try std.math.add(usize, bank_offset, try aligned(rows * 2 * @sizeOf(u32)));
-        const progress_offset = try aligned(try std.math.add(usize, positions_offset, rows * 3 * @sizeOf(u32)));
-        const metadata_bytes = try std.math.add(usize, progress_offset, 256);
+        const token_bytes = rows * 2 * @sizeOf(u32);
+        const position_bytes = rows * 3 * @sizeOf(u32);
+        // Keep the input and token bank at CUDA allocation alignment. The
+        // position plane only needs vector alignment and progress is scalar.
+        const positions_offset = try std.math.add(usize, bank_offset, std.mem.alignForward(usize, token_bytes, 16));
+        const progress_offset = try std.math.add(usize, positions_offset, position_bytes);
+        const metadata_bytes = try aligned(try std.math.add(usize, progress_offset, @sizeOf(u32)));
         const host_bytes = try std.math.add(usize, @sizeOf(plan_mod.Plan), try std.math.mul(usize, key_words, @sizeOf(u64)));
-        const head_bytes = if (rows > 64) try std.math.mul(usize, try std.math.mul(usize, rows, vocab), @sizeOf(f32)) else 0;
+        const head_bytes = if (rows > 64) try std.math.mul(usize, try std.math.mul(usize, @min(rows, max_head_rows), vocab), @sizeOf(f32)) else 0;
         if (head_bytes > plan_mod.limit) return error.InvalidShape;
-        return .{ .bank_offset = bank_offset, .positions_offset = positions_offset, .progress_offset = progress_offset, .metadata_bytes = metadata_bytes, .host_bytes = host_bytes, .head_bytes = head_bytes };
+        return .{
+            .input = .{ .offset = 0, .bytes = input_bytes },
+            .tokens = .{ .offset = bank_offset, .bytes = token_bytes },
+            .positions = .{ .offset = positions_offset, .bytes = position_bytes },
+            .counter = .{ .offset = progress_offset, .bytes = @sizeOf(u32) },
+            .metadata_bytes = metadata_bytes,
+            .host_bytes = host_bytes,
+            .head_bytes = head_bytes,
+        };
     }
+    fn declareAttentionWorkspace(self: *StorageLayout, scratch: DecodeScratch) !void {
+        const bytes = @max(scratch.full.bytes, if (scratch.tail) |tail| tail.bytes else 0);
+        self.attention_workspace = try self.declareLayerWorkspace(bytes);
+    }
+
+    fn declareLayerWorkspace(self: *StorageLayout, bytes: usize) !Span {
+        if (bytes == 0 or bytes > plan_mod.limit) return error.InvalidShape;
+        const offset = try self.layerWorkspaceOffset();
+        self.metadata_bytes = @max(self.metadata_bytes, try std.math.add(usize, offset, bytes));
+        return .{ .offset = offset, .bytes = bytes };
+    }
+
+    pub fn layerWorkspaceBytes(self: StorageLayout) usize {
+        return self.metadata_bytes - (self.layerWorkspaceOffset() catch unreachable);
+    }
+
+    fn layerWorkspaceOffset(self: StorageLayout) !usize {
+        return aligned(try std.math.add(usize, self.counter.offset, self.counter.bytes));
+    }
+
     fn aligned(bytes: usize) !usize {
         return (try std.math.add(usize, bytes, 255)) & ~@as(usize, 255);
     }
@@ -107,15 +222,51 @@ pub const Descriptor = struct {
     hidden: usize,
     vocab: usize,
     future_tokens: usize,
+    head_storage: HeadStorage = .full_bank,
+    attention_geometry: ?DecodeScratch.Geometry = null,
+    recurrent_heads: ?struct { key: usize, value: usize } = null,
     attention_layers: usize,
     recurrent_layers: usize,
+    pub const HeadStorage = union(enum) {
+        full_bank,
+        adaptive_bank: usize,
+        shared_layer_packets: usize,
+        fused_top1,
+    };
+
     pub fn layout(self: Descriptor) !StorageLayout {
-        const value = try StorageLayout.init(self.rows, self.hidden, self.vocab, self.key.len);
-        if (self.epoch == 0 or self.positions.len != self.rows * 3) return error.InvalidShape;
-        return value;
+        if (self.epoch == 0 or self.rows > max_rows or self.positions.len != self.rows * 3) return error.InvalidShape;
+        const packet_rows = switch (self.head_storage) {
+            .full_bank, .fused_top1 => self.rows,
+            .adaptive_bank, .shared_layer_packets => |rows| rows,
+        };
+        var storage = try StorageLayout.initWithHeadLimit(self.rows, self.hidden, self.vocab, self.key.len, packet_rows);
+        if (self.head_storage == .shared_layer_packets) {
+            const elements = try std.math.mul(usize, @min(self.rows, packet_rows), self.vocab);
+            const bytes = try std.math.mul(usize, elements, @sizeOf(f32));
+            storage.shared_head_workspace = try storage.declareLayerWorkspace(bytes);
+            storage.head_bytes = 0;
+        }
+        if (self.head_storage == .fused_top1) {
+            const scratch = try @import("projection_top1_bf16.zig").Scratch.forRows(self.rows);
+            storage.fused_head_workspace = try storage.declareLayerWorkspace(scratch.bytes);
+            storage.head_bytes = 0;
+        }
+        return storage;
     }
-    pub fn storageRequest(self: Descriptor) !funding_mod.Request {
-        const value = try self.layout();
+    pub const DispatchCounts = struct { attention: usize, ragged_recurrent: usize };
+
+    pub fn dispatchCounts(self: Descriptor) !DispatchCounts {
+        if (self.rows < 2 or self.rows > max_rows) return error.InvalidShape;
+        const attention_packets = (self.rows - 1) / paged_attention.max_packet_rows + 1;
+        const recurrent_packets = (self.rows - 1) / recurrent_packet_rows + 1;
+        return .{
+            .attention = try std.math.mul(usize, self.attention_layers, 2 * attention_packets),
+            .ragged_recurrent = if (recurrent_packets > 1) try std.math.mul(usize, self.recurrent_layers, 2 * recurrent_packets) else 0,
+        };
+    }
+
+    fn storageRequestFor(self: Descriptor, value: StorageLayout) funding_mod.Request {
         return .{ .captured_storage = .{ .epoch = self.epoch, .key_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(self.key)), .key_words = self.key.len, .rows = self.rows, .hidden = self.hidden, .vocab = self.vocab, .metadata_bytes = value.metadata_bytes, .host_bytes = value.host_bytes, .head_bytes = value.head_bytes } };
     }
 };
@@ -130,14 +281,11 @@ pub const Snapshot = struct {
     graph: usize,
     pending_graph: usize,
     plan: usize,
-    peak: usize,
-    events: usize,
+    storage_layout: ?StorageLayout,
+    admitted_arena_layout: ?plan_mod.Layout,
+    arena_layout: ?plan_mod.Layout,
     metadata_quota: quota_mod.Quota,
     arena_quota: quota_mod.Quota,
-    head_quota: quota_mod.Quota,
-    pub fn hasRaw(self: Snapshot) bool {
-        return self.metadata_quota == .raw or self.arena_quota == .raw or self.head_quota == .raw;
-    }
 };
 
 /// Pure heap metadata retired by the CURRENT caller's unsealed B. It never
@@ -150,10 +298,8 @@ const ColdPhase = struct {
     funding: ?*funding_mod.Funding = null,
     key: []u64 = &.{},
     plan: ?*plan_mod.Plan = null,
-    upgrades: [3]?quota_mod.RawUpgrade = @splat(null),
     fn destroyOutside(self: *ColdPhase) void {
         if (self.funding) |value| value.finishOutsideExecution();
-        for (&self.upgrades) |*slot| if (slot.*) |*upgrade| upgrade.deinitOutsideExecution();
         if (self.plan) |value| self.allocator.destroy(value);
         if (self.key.len != 0) self.allocator.free(self.key);
         self.allocator.destroy(self);
@@ -166,19 +312,79 @@ const ColdPhase = struct {
 
 pub const GraphPhase = struct {
     descriptor: Descriptor,
-    mode: enum { none, upgrade, storage, arena } = .none,
+    storage_layout: StorageLayout = undefined,
+    attention_scratch: ?DecodeScratch = null,
+    mode: enum { none, storage, arena } = .none,
     expected_compute: usize = 0,
     old: Snapshot = undefined,
+    admission_pressure: ?memory.AdmissionPressure = null,
     admission: ?@import("video_cache_budget.zig").Admission = null,
     cold: ?*ColdPhase = null,
     bound: bool = false,
     pub fn initInto(self: *GraphPhase, descriptor: Descriptor) !void {
-        _ = try descriptor.layout();
-        self.* = .{ .descriptor = descriptor };
+        const layout = try descriptor.layout();
+        _ = try descriptor.dispatchCounts();
+        self.* = .{ .descriptor = descriptor, .storage_layout = layout };
     }
-    pub fn needsOutside(self: *const GraphPhase) bool {
-        return self.mode != .none;
+    pub fn declareAttentionScratch(self: *GraphPhase, chunk128_override: ?bool) !void {
+        const descriptor = self.descriptor;
+        if (descriptor.attention_layers == 0) return;
+        const geometry = descriptor.attention_geometry orelse return error.InvalidShape;
+        const scratch = try DecodeScratch.init(descriptor.rows, descriptor.future_tokens, geometry, paged_attention.useChunk128(chunk128_override, geometry.heads));
+        try self.storage_layout.declareAttentionWorkspace(scratch);
+        self.attention_scratch = scratch;
     }
+
+    pub fn declareRecurrentScratch(self: *GraphPhase) !void {
+        const descriptor = self.descriptor;
+        if (descriptor.recurrent_layers == 0) return;
+        const heads = descriptor.recurrent_heads orelse return error.InvalidShape;
+        const recurrent = @import("gated_delta.zig");
+        const scratch = try recurrent.PacketScratch.forHeads(@min(descriptor.rows, recurrent_packet_rows), heads.key, heads.value);
+        self.storage_layout.recurrent_workspace = try self.storage_layout.declareLayerWorkspace(scratch.bytes);
+        self.storage_layout.recurrent_scratch = scratch;
+    }
+
+    pub fn matchesOwner(self: *const GraphPhase, owner: *const Module) bool {
+        if (!owner.matches(self.descriptor)) return false;
+        var storage = owner.storage_layout orelse return false;
+        const expected = self.storage_layout;
+        if (self.descriptor.head_storage == .adaptive_bank and storage.head_bytes < expected.head_bytes) {
+            const row_bytes = self.descriptor.vocab * @sizeOf(f32);
+            if (storage.head_bytes < 8 * row_bytes or storage.head_bytes % row_bytes != 0) return false;
+            storage.head_bytes = expected.head_bytes;
+        }
+        return std.meta.eql(storage, expected) and std.meta.eql(owner.attention_scratch, self.attention_scratch);
+    }
+
+    /// Only the optional packet bank changes. Input, token and attention spans
+    /// retain their exact declared addresses and the prepared graph records
+    /// the bank it actually owns. Bound the number of extra GEMM launches.
+    pub fn reduceHeadPacketAfterDenial(self: *GraphPhase) bool {
+        if (self.mode != .storage or self.cold != null or self.bound or self.descriptor.head_storage != .adaptive_bank) return false;
+        const pressure = self.admission_pressure orelse return false;
+        switch (pressure) {
+            .domain_scratch, .shared_scratch => {},
+            else => return false,
+        }
+        if (self.storage_layout.head_bytes == 0) return false;
+        const row_bytes = self.descriptor.vocab * @sizeOf(f32);
+        const packet_rows = self.storage_layout.head_bytes / row_bytes;
+        if (packet_rows <= 8) return false;
+        self.storage_layout.head_bytes = @max(8, packet_rows / 2) * row_bytes;
+        return true;
+    }
+
+    fn arenaRequest(self: *const GraphPhase, layout: plan_mod.Layout) funding_mod.Request {
+        return .{ .captured_arena = .{
+            .epoch = self.descriptor.epoch,
+            .key_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(self.descriptor.key)),
+            .bytes = layout.bytes,
+            .events = layout.events,
+            .recipe = layout.recipe,
+        } };
+    }
+
     /// Caller has dropped EVERY model/provider/reader lane but retains the
     /// exact model lifetime and SAME worker step. All callback-capable quota,
     /// Domain and process metadata ownership is created here.
@@ -187,47 +393,49 @@ pub const GraphPhase = struct {
     }
     fn prepareOutsideUsing(self: *GraphPhase, model: *const @import("../../backends/session.zig").Session.ModelLifetime, allocator: std.mem.Allocator) !void {
         if (self.cold != null or self.bound or self.mode == .none) return error.InvalidPreparedCacheState;
+        self.admission_pressure = null;
         const cold = try allocator.create(ColdPhase);
         cold.* = .{ .allocator = allocator };
         errdefer cold.destroyOutside();
-        if (self.mode == .upgrade) {
-            const previous = [_]quota_mod.Quota{ self.old.metadata_quota, self.old.arena_quota, self.old.head_quota };
-            for (previous, 0..) |quota, index| if (quota == .raw) {
-                const lease = quota.raw;
-                const controller = lease.controller orelse return error.MissingResourceRetirementLease;
-                const pin = model.retainAdmissionDomain(controller) orelse return error.MissingCacheRetirementDomain;
-                defer pin.release();
-                cold.upgrades[index] = try quota_mod.RawUpgrade.prepare(lease, &pin);
-            };
-        } else {
-            const request = if (self.mode == .storage) try self.descriptor.storageRequest() else funding_mod.Request{ .captured_arena = .{ .epoch = self.descriptor.epoch, .key_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(self.descriptor.key)), .bytes = self.old.peak, .events = self.old.events } };
-            const amounts = switch (request) {
-                .captured_storage => |value| try value.amounts(),
-                .captured_arena => |value| value.amounts(),
-                else => unreachable,
-            };
-            const funding = try funding_mod.Funding.createWithAllocator(allocator, .{ .requests = &.{request} });
-            cold.funding = funding;
-            try funding.noteMiss(0, amounts, 0);
-            funding.admission = self.admission;
-            funding.compute_identity = self.expected_compute;
-            funding.state = .snapped;
-            var pin: ?@import("../../runtime/tier/admission_domain.zig").Pin = null;
-            if (self.admission) |policy| pin = model.retainAdmissionDomain(policy.controller) orelse return error.MissingCacheRetirementDomain;
-            defer if (pin) |value| value.release();
-            try funding.fundOutsideExecution(if (pin) |*value| value else null);
-            if (self.mode == .storage) {
-                cold.key = try allocator.dupe(u64, self.descriptor.key);
-                cold.plan = try allocator.create(plan_mod.Plan);
-                cold.plan.?.* = .{};
+        const request = if (self.mode == .storage) self.descriptor.storageRequestFor(self.storage_layout) else self.arenaRequest(self.old.arena_layout orelse return error.InvalidPreparedCacheState);
+        const amounts = switch (request) {
+            .captured_storage => |value| try value.amounts(),
+            .captured_arena => |value| value.amounts(),
+            else => unreachable,
+        };
+        const funding = try funding_mod.Funding.createWithAllocator(allocator, .{ .requests = &.{request} });
+        cold.funding = funding;
+        try funding.noteMiss(0, amounts, 0);
+        funding.admission = self.admission;
+        funding.compute_identity = self.expected_compute;
+        funding.state = .snapped;
+        var pin: ?@import("../../runtime/tier/admission_domain.zig").Pin = null;
+        if (self.admission) |policy| pin = model.retainAdmissionDomain(policy.controller) orelse return error.MissingCacheRetirementDomain;
+        defer if (pin) |value| value.release();
+        funding.fundOutsideExecution(if (pin) |*value| value else null) catch |err| {
+            self.admission_pressure = funding.admission_pressure;
+            if (self.admission) |policy| {
+                if (funding.admission_pressure != null and @import("antfly_platform").env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
+                    const occupied = policy.controller.snapshotBackend(.gpu);
+                    std.debug.print("LIGHTONOCR3 cuda_model_graph_funding rows={d} stage={s} error={s} requested_host_scratch={d} requested_backend_scratch={d} occupied_host_scratch={d} occupied_backend_scratch={d} policy_scratch_limit={d}\n", .{
+                        self.descriptor.rows,        @tagName(self.mode),            @errorName(err),                   amounts.host_scratch_bytes, amounts.backend_scratch_bytes,
+                        occupied.host_scratch_bytes, occupied.backend_scratch_bytes, policy.limits.scratch_limit_bytes,
+                    });
+                }
             }
+            return err;
+        };
+        if (self.mode == .storage) {
+            cold.key = try allocator.dupe(u64, self.descriptor.key);
+            cold.plan = try allocator.create(plan_mod.Plan);
+            cold.plan.?.* = .{};
         }
         self.cold = cold;
     }
     /// Metadata-only. Concrete CUDA owner validates full table/context,
     /// geometry/key/policy/snapshot before exposing this funding to reset.
     pub fn bind(self: *GraphPhase, current: Cleanup) !void {
-        if (self.bound or self.mode == .upgrade) return error.InvalidPreparedCacheState;
+        if (self.bound or self.mode == .none) return error.InvalidPreparedCacheState;
         const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;
         if (current.outside_execution or try epoch.isSealed()) return error.InvalidPreparedCacheState;
         const cold = self.cold orelse return error.InvalidPreparedCacheState;
@@ -269,6 +477,7 @@ pub const Module = struct {
     phase: Phase = .warm,
     metadata: buffer.DeviceBuffer = .{},
     arena: buffer.DeviceBuffer = .{},
+    admitted_arena_layout: ?plan_mod.Layout = null,
     metadata_quota: quota_mod.Quota = .none,
     arena_quota: quota_mod.Quota = .none,
     graph: driver.CUgraphExec = null,
@@ -277,16 +486,17 @@ pub const Module = struct {
     rows: usize = 0,
     hidden: usize = 0,
     vocab: usize = 0,
-    // Wide logits live outside the bounded temporary arena. Both dependent
-    // steps reuse this independently admitted output after their argmax.
+    // Both graph steps reuse this independently admitted logits bank after
+    // argmax when the plan assigns a separate head buffer. Arena-backed
+    // packets instead allocate their logits through the stream workspace.
     head: buffer.DeviceBuffer = .{},
-    head_quota: quota_mod.Quota = .none,
-    future_tokens: usize = 0,
+    attention_scratch: ?DecodeScratch = null,
+    attention_layers: usize = 0,
+    recurrent_layers: usize = 0,
     expected_attention_calls: usize = 0,
     expected_ragged_packets: usize = 0,
-    bank_offset: usize = 0,
-    positions_offset: usize = 0,
-    progress_offset: usize = 0,
+    bound_recurrent_scratch_bytes: usize = 0,
+    storage_layout: ?StorageLayout = null,
     base_positions: [3 * max_rows]u32 = @splat(0),
     next_positions: [3 * max_rows]u32 = @splat(0),
     progress: u32 = 0,
@@ -307,25 +517,13 @@ pub const Module = struct {
     pub fn clear(self: *Module, ctx: *context.CudaContext) !void {
         try self.metadata_quota.validateLegacyRaw();
         try self.arena_quota.validateLegacyRaw();
-        try self.head_quota.validateLegacyRaw();
         return self.clearWithCleanup(ctx, .{ .outside_execution = true });
     }
     pub fn validateCleanup(self: *const Module, current: Cleanup) !void {
         try self.metadata_quota.validateCleanup(current);
         try self.arena_quota.validateCleanup(current);
-        try self.head_quota.validateCleanup(current);
     }
     pub fn clearWithCleanup(self: *Module, ctx: *context.CudaContext, current: Cleanup) !void {
-        if (current.synchronous_outside_raw) |pending| {
-            const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;
-            // Exact metadata/arena/head provenance and capacity are certified
-            // together before ANY checked SDK destruction can begin.
-            try pending.bindGraph(@intFromPtr(self), .{
-                if (self.metadata_quota == .raw) &self.metadata_quota.raw else null,
-                if (self.arena_quota == .raw) &self.arena_quota.raw else null,
-                if (self.head_quota == .raw) &self.head_quota.raw else null,
-            }, epoch);
-        }
         try self.validateCleanup(current);
         if (self.active) return error.CapturedGraphActive;
         const live = self.head.ptr != 0 or self.metadata.ptr != 0 or self.arena.ptr != 0 or self.graph != null or self.pending_graph != null;
@@ -340,15 +538,18 @@ pub const Module = struct {
         try ctx.destroyGraphChecked(&self.pending_graph);
         _ = try self.head.freeChecked(ctx);
         _ = try self.arena.freeChecked(ctx);
+        self.admitted_arena_layout = null;
         _ = try self.metadata.freeChecked(ctx);
         if (self.plan) |plan| self.host_allocator.destroy(plan);
         self.plan = null;
         if (self.key.len != 0) self.host_allocator.free(self.key);
         self.key = &.{};
-        try self.head_quota.releaseAfterSdkDeath(current);
         try self.arena_quota.releaseAfterSdkDeath(current);
         try self.metadata_quota.releaseAfterSdkDeath(current);
         self.captured_roots_identity = 0;
+        self.storage_layout = null;
+        self.attention_scratch = null;
+        self.bound_recurrent_scratch_bytes = 0;
         self.rows = 0;
         self.hidden = 0;
         self.vocab = 0;
@@ -356,46 +557,50 @@ pub const Module = struct {
         self.invalidations += 1;
     }
     pub fn snapshot(self: *const Module) Snapshot {
-        return .{ .invalidations = self.invalidations, .epoch = self.epoch_id, .phase = self.phase, .metadata = self.metadata.ptr, .arena = self.arena.ptr, .head = self.head.ptr, .graph = if (self.graph) |value| @intFromPtr(value) else 0, .pending_graph = if (self.pending_graph) |value| @intFromPtr(value) else 0, .plan = if (self.plan) |value| @intFromPtr(value) else 0, .peak = if (self.plan) |value| value.peak else 0, .events = if (self.plan) |value| value.event_count else 0, .metadata_quota = self.metadata_quota, .arena_quota = self.arena_quota, .head_quota = self.head_quota };
+        const missing_arena_layout = if (self.phase == .capture and self.admitted_arena_layout == null)
+            self.arenaLayout() catch null
+        else
+            null;
+        return .{
+            .invalidations = self.invalidations,
+            .epoch = self.epoch_id,
+            .phase = self.phase,
+            .metadata = self.metadata.ptr,
+            .arena = self.arena.ptr,
+            .head = self.head.ptr,
+            .graph = if (self.graph) |value| @intFromPtr(value) else 0,
+            .pending_graph = if (self.pending_graph) |value| @intFromPtr(value) else 0,
+            .plan = if (self.plan) |value| @intFromPtr(value) else 0,
+            .storage_layout = self.storage_layout,
+            .admitted_arena_layout = self.admitted_arena_layout,
+            .arena_layout = missing_arena_layout,
+            .metadata_quota = self.metadata_quota,
+            .arena_quota = self.arena_quota,
+        };
     }
     pub fn invalidate(self: *Module, ctx: *context.CudaContext) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
         self.clear(ctx) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
     }
-    pub fn matches(self: *const Module, key: []const u64, host_positions: []const u32) bool {
-        return self.key.len != 0 and std.mem.eql(u64, self.key, key) and
-            host_positions.len == 3 * self.rows and
-            std.mem.eql(u32, self.next_positions[0..host_positions.len], host_positions);
+    pub fn matches(self: *const Module, descriptor: Descriptor) bool {
+        return self.epoch_id == descriptor.epoch and self.rows == descriptor.rows and
+            self.hidden == descriptor.hidden and self.vocab == descriptor.vocab and
+            self.attention_layers == descriptor.attention_layers and self.recurrent_layers == descriptor.recurrent_layers and
+            self.key.len != 0 and std.mem.eql(u64, self.key, descriptor.key) and
+            descriptor.positions.len == 3 * self.rows and
+            std.mem.eql(u32, self.next_positions[0..descriptor.positions.len], descriptor.positions);
     }
-    /// Explicit legacy raw producer. Managed execution uses resetPrepared.
-    pub fn reset(self: *Module, ctx: *context.CudaContext, key: []const u64, host_positions: []const u32, rows: usize, hidden: usize, vocab: usize) !void {
-        const layout = try StorageLayout.init(rows, hidden, vocab, key.len);
-        if (host_positions.len != rows * 3) return error.InvalidShape;
-        try self.clear(ctx);
-        errdefer self.clear(ctx) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
-        if (ctx.video_cache_budget.admission) |policy|
-            self.metadata_quota = quota_mod.Quota.fromRawAdmission(try policy.controller.tryAcquire(.gpu, policy.limits, .{ .backend_scratch_bytes = layout.metadata_bytes, .host_scratch_bytes = layout.host_bytes }, policy.check_live_memory));
-        self.host_allocator = std.heap.c_allocator;
-        self.key = try std.heap.c_allocator.dupe(u64, key);
-        self.plan = try std.heap.c_allocator.create(plan_mod.Plan);
-        self.plan.?.* = .{};
-        self.metadata = try buffer.DeviceBuffer.alloc(ctx, layout.metadata_bytes);
-        if (layout.head_bytes != 0) {
-            if (ctx.video_cache_budget.admission) |policy|
-                self.head_quota = quota_mod.Quota.fromRawAdmission(try policy.controller.tryAcquire(.gpu, policy.limits, .{ .backend_scratch_bytes = layout.head_bytes }, policy.check_live_memory));
-            self.head = try buffer.DeviceBuffer.alloc(ctx, layout.head_bytes);
-        }
+    fn installStorageGeometry(self: *Module, layout: StorageLayout, rows: usize, hidden: usize, vocab: usize, positions_: []const u32) void {
         self.rows = rows;
         self.hidden = hidden;
         self.vocab = vocab;
-        self.bank_offset = layout.bank_offset;
-        self.positions_offset = layout.positions_offset;
-        self.progress_offset = layout.progress_offset;
-        @memcpy(self.base_positions[0..host_positions.len], host_positions);
-        @memcpy(self.next_positions[0..host_positions.len], host_positions);
+        self.storage_layout = layout;
+        @memcpy(self.base_positions[0..positions_.len], positions_);
+        @memcpy(self.next_positions[0..positions_.len], positions_);
         self.phase = .warm;
     }
+
     pub fn arenaLayout(self: *const Module) !plan_mod.Layout {
         const plan = self.plan orelse return error.InvalidState;
         const layout = try plan.layout(0);
@@ -403,25 +608,14 @@ pub const Module = struct {
         return layout;
     }
 
-    pub fn reserveArena(self: *Module, ctx: *context.CudaContext) !void {
-        if (self.arena.ptr != 0) return;
-        const layout = try self.arenaLayout();
-        var lease: ?memory.AdmissionLease = null;
-        if (ctx.video_cache_budget.admission) |policy|
-            lease = try policy.controller.tryAcquire(.gpu, policy.limits, .{
-                .backend_scratch_bytes = layout.bytes,
-            }, policy.check_live_memory);
-        errdefer if (lease) |*value| value.release();
-        self.arena = try buffer.DeviceBuffer.alloc(ctx, layout.bytes);
-        self.arena_quota = quota_mod.Quota.fromRawAdmission(lease);
-    }
     pub fn resetPrepared(self: *Module, ctx: *context.CudaContext, phase: *GraphPhase) !void {
         const descriptor = phase.descriptor;
-        const layout = try descriptor.layout();
+        const layout = phase.storage_layout;
+        const dispatch = try descriptor.dispatchCounts();
         if (!phase.bound or phase.mode != .storage or self.metadata.ptr != 0 or self.head.ptr != 0 or self.arena.ptr != 0 or self.graph != null or self.pending_graph != null or self.plan != null or self.key.len != 0) return error.InvalidPreparedCacheState;
         const cold = phase.cold orelse return error.InvalidPreparedCacheState;
         if (cold.plan == null or !std.mem.eql(u64, cold.key, descriptor.key)) return error.PreparedCachePlanChanged;
-        const request = try descriptor.storageRequest();
+        const request = descriptor.storageRequestFor(layout);
         var lease = try cold.funding.?.take(request, try request.captured_storage.amounts());
         errdefer lease.releaseAfterSdkDeath();
         var metadata = try buffer.DeviceBuffer.alloc(ctx, layout.metadata_bytes);
@@ -437,77 +631,327 @@ pub const Module = struct {
         cold.key = &.{};
         self.plan = cold.plan;
         cold.plan = null;
-        self.rows = descriptor.rows;
-        self.hidden = descriptor.hidden;
-        self.vocab = descriptor.vocab;
-        self.bank_offset = layout.bank_offset;
-        self.positions_offset = layout.positions_offset;
-        self.progress_offset = layout.progress_offset;
-        @memcpy(self.base_positions[0..descriptor.positions.len], descriptor.positions);
-        @memcpy(self.next_positions[0..descriptor.positions.len], descriptor.positions);
-        self.phase = .warm;
+        self.installStorageGeometry(layout, descriptor.rows, descriptor.hidden, descriptor.vocab, descriptor.positions);
+        self.epoch_id = descriptor.epoch;
+        self.attention_layers = descriptor.attention_layers;
+        self.recurrent_layers = descriptor.recurrent_layers;
+        self.attention_scratch = phase.attention_scratch;
+        self.expected_attention_calls = dispatch.attention;
+        self.expected_ragged_packets = dispatch.ragged_recurrent;
     }
     pub fn reserveArenaPrepared(self: *Module, ctx: *context.CudaContext, phase: *GraphPhase) !void {
-        if (self.arena.ptr != 0) return;
+        if (self.admitted_arena_layout != null) {
+            _ = try self.bindArena();
+            return;
+        }
         const layout = try self.arenaLayout();
-        if (!phase.bound or phase.mode != .arena or layout.bytes != phase.old.peak or layout.events != phase.old.events) return error.InvalidPreparedCacheState;
-        const request = funding_mod.Request{ .captured_arena = .{ .epoch = phase.descriptor.epoch, .key_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(phase.descriptor.key)), .bytes = layout.bytes, .events = layout.events } };
+        if (layout.bytes == 0) {
+            // The reader's ready decision stays under the same owner lanes
+            // and carries no outside funding to bind.
+            if (phase.bound or phase.mode != .none or phase.cold != null) return error.InvalidPreparedCacheState;
+            if (!std.meta.eql(self.snapshot(), phase.old)) return error.PreparedCachePlanChanged;
+            self.admitted_arena_layout = layout;
+            return;
+        }
+        if (!phase.bound or phase.mode != .arena) return error.InvalidPreparedCacheState;
+        const admitted = phase.old.arena_layout orelse return error.InvalidPreparedCacheState;
+        if (!std.meta.eql(layout, admitted)) return error.PreparedCachePlanChanged;
+        const request = phase.arenaRequest(admitted);
         var lease = try phase.cold.?.funding.?.take(request, request.captured_arena.amounts());
         errdefer lease.releaseAfterSdkDeath();
         const arena = try buffer.DeviceBuffer.alloc(ctx, layout.bytes);
         self.arena = arena;
+        self.admitted_arena_layout = layout;
         self.arena_quota = lease.publishQuota();
     }
 
+    pub fn bindArena(self: *const Module) !plan_mod.Scope {
+        const plan = self.plan orelse return error.InvalidExecutionPlan;
+        const layout = self.admitted_arena_layout orelse return error.InvalidExecutionPlan;
+        return plan_mod.Scope.bind(plan, layout, self.arena.ptr, self.arena.len);
+    }
+
+    pub fn bindExecutionStorage(self: *const Module) !?buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        try buffer.validateRegions(
+            3,
+            .{ self.metadata, self.head, self.arena },
+            .{ layout.metadata_bytes, layout.head_bytes, self.arena.len },
+            .{ plan_mod.alignment, @alignOf(f32), plan_mod.alignment },
+            1,
+        );
+        if (layout.shared_head_workspace) |span| return try self.bindLayerWorkspace(layout, span, span.bytes);
+        if (layout.head_bytes == 0) return null;
+        var destination = self.head;
+        destination.len = layout.head_bytes;
+        return destination;
+    }
+
+    /// Decode packets submit in order on one stream. The split and merge
+    /// finish consuming partials before the next packet can reuse this span.
+    pub fn bindAttentionWorkspace(self: *const Module, bytes: usize) !buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const span = layout.attention_workspace orelse return error.InvalidExecutionPlan;
+        return self.bindLayerWorkspace(layout, span, bytes);
+    }
+
+    pub fn bindRecurrentWorkspace(self: *Module, scratch: @import("gated_delta.zig").PacketScratch) !buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const span = layout.recurrent_workspace orelse return error.InvalidExecutionPlan;
+        if (!std.meta.eql(layout.recurrent_scratch orelse return error.InvalidExecutionPlan, scratch)) return error.InvalidExecutionPlan;
+        const bound = try self.bindLayerWorkspace(layout, span, scratch.bytes);
+        self.bound_recurrent_scratch_bytes = bound.len;
+        return bound;
+    }
+
+    pub fn bindFusedHeadWorkspace(self: *const Module) !buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const span = layout.fused_head_workspace orelse return error.InvalidExecutionPlan;
+        return self.bindLayerWorkspace(layout, span, span.bytes);
+    }
+
+    fn bindLayerWorkspace(self: *const Module, layout: StorageLayout, span: StorageLayout.Span, bytes: usize) !buffer.DeviceBuffer {
+        const prefix_end = layout.counter.offset + layout.counter.bytes;
+        if (bytes == 0 or bytes > span.bytes or span.offset < prefix_end or
+            span.offset % plan_mod.alignment != 0 or span.offset > layout.metadata_bytes or
+            span.bytes > layout.metadata_bytes - span.offset) return error.InvalidExecutionPlan;
+        _ = buffer.validateRegion(self.metadata, layout.metadata_bytes, plan_mod.alignment) catch return error.InvalidExecutionPlan;
+        return self.metadata.borrowRange(span.offset, bytes) catch return error.InvalidExecutionPlan;
+    }
+
     pub fn input(self: *const Module) buffer.DeviceBuffer {
-        return .{ .ptr = self.metadata.ptr, .len = self.rows * self.hidden * 4, .borrowed = true };
+        return self.storage_layout.?.input.bind(self.metadata);
     }
     pub fn bank(self: *const Module) buffer.DeviceBuffer {
-        return .{ .ptr = self.metadata.ptr + self.bank_offset, .len = self.rows * 2 * 4, .borrowed = true };
+        return self.storage_layout.?.tokens.bind(self.metadata);
     }
     pub fn positions(self: *const Module) buffer.DeviceBuffer {
-        return .{ .ptr = self.metadata.ptr + self.positions_offset, .len = self.rows * 3 * 4, .borrowed = true };
+        return self.storage_layout.?.positions.bind(self.metadata);
     }
     pub fn counter(self: *const Module) buffer.DeviceBuffer {
-        return .{ .ptr = self.metadata.ptr + self.progress_offset, .len = 4, .borrowed = true };
-    }
-    pub fn notePair(self: *Module) !void {
-        const next = try std.math.add(u32, self.progress, 2);
-        for (self.next_positions[0 .. self.rows * 3]) |*position|
-            position.* = try std.math.add(u32, position.*, 2);
-        self.progress = next;
+        return self.storage_layout.?.counter.bind(self.metadata);
     }
 };
 
-test "captured sequence storage layout preserves existing narrow wide and aligned physical planes" {
+test "bounded CUDA decoder funds one stable attention workspace for both packets" {
+    const base = try StorageLayout.init(67, 1024, 151936, 1);
+    var layout = base;
+    const geometry: DecodeScratch.Geometry = .{ .heads = 8, .kv_heads = 2, .dim = 256 };
+    const scratch = try DecodeScratch.init(67, 321, geometry, false);
+    try layout.declareAttentionWorkspace(scratch);
+    const req: Descriptor = .{ .epoch = 1, .key = &.{1}, .positions = &.{}, .rows = 67, .hidden = 1024, .vocab = 151936, .future_tokens = 321, .attention_layers = 1, .recurrent_layers = 1 };
+    const amounts = try req.storageRequestFor(layout).captured_storage.amounts();
+    try std.testing.expectEqual(base.metadata_bytes + scratch.full.bytes + base.head_bytes, amounts.backend_scratch_bytes);
+    var owner: Module = .{ .storage_layout = layout, .metadata = .{ .ptr = 0x10000, .len = layout.metadata_bytes } };
+    const full = try owner.bindAttentionWorkspace(scratch.full.bytes);
+    const tail = try owner.bindAttentionWorkspace(scratch.tail.?.bytes);
+    try std.testing.expectEqual(owner.metadata.ptr + base.metadata_bytes, full.ptr);
+    try std.testing.expectEqual(full.ptr, tail.ptr);
+    try std.testing.expectEqual(base.readback(owner.metadata), layout.readback(owner.metadata));
+    try std.testing.expectError(error.InvalidExecutionPlan, owner.bindAttentionWorkspace(full.len + 1));
+    owner.metadata.len -= 1;
+    try std.testing.expectError(error.InvalidExecutionPlan, owner.bindAttentionWorkspace(tail.len));
+    owner.metadata.len = layout.metadata_bytes;
+    owner.storage_layout.?.attention_workspace.?.offset = 0;
+    try std.testing.expectError(error.InvalidExecutionPlan, owner.bindAttentionWorkspace(tail.len));
+    owner.storage_layout = layout;
+    owner.metadata.ptr += 1;
+    try std.testing.expectError(error.InvalidExecutionPlan, owner.bindAttentionWorkspace(tail.len));
+}
+
+test "bounded CUDA decoder shares declared attention and recurrent workspace" {
+    const rows = 67;
+    const positions: [rows * 3]u32 = @splat(0);
+    const descriptor: Descriptor = .{
+        .epoch = 1,
+        .key = &.{1},
+        .positions = &positions,
+        .rows = rows,
+        .hidden = 2560,
+        .vocab = 248320,
+        .future_tokens = 321,
+        .attention_geometry = .{ .heads = 8, .kv_heads = 2, .dim = 256 },
+        .recurrent_heads = .{ .key = 16, .value = 32 },
+        .attention_layers = 1,
+        .recurrent_layers = 1,
+    };
+    const base = try descriptor.layout();
+    var phase: GraphPhase = undefined;
+    try phase.initInto(descriptor);
+    try phase.declareRecurrentScratch();
+    try phase.declareAttentionScratch(false);
+    const layout = phase.storage_layout;
+    const attention = layout.attention_workspace.?;
+    const recurrent = layout.recurrent_workspace.?;
+    try std.testing.expectEqual(base.metadata_bytes, attention.offset);
+    try std.testing.expectEqual(attention.offset, recurrent.offset);
+    try std.testing.expectEqual(base.metadata_bytes + @max(attention.bytes, recurrent.bytes), layout.metadata_bytes);
+    try std.testing.expectEqual(@max(attention.bytes, recurrent.bytes), layout.layerWorkspaceBytes());
+    try std.testing.expectEqual(@as(usize, 0), base.layerWorkspaceBytes());
+    var owner: Module = .{ .storage_layout = layout, .metadata = .{ .ptr = 0x10000, .len = layout.metadata_bytes } };
+    const scratch = layout.recurrent_scratch.?;
+    const recurrent_module = @import("gated_delta.zig");
+    try std.testing.expectEqualDeep(try recurrent_module.PacketScratch.forHeads(recurrent_module.max_packet_rows, 16, 32), scratch);
+    try std.testing.expect(scratch.bytes < (try recurrent_module.PacketScratch.forHeads(rows, 16, 32)).bytes);
+    try std.testing.expectEqual((try owner.bindAttentionWorkspace(attention.bytes)).ptr, (try owner.bindRecurrentWorkspace(scratch)).ptr);
+    try std.testing.expectEqual(scratch.bytes, owner.bound_recurrent_scratch_bytes);
+    var changed = scratch;
+    changed.core_offset -= @sizeOf(f32);
+    try std.testing.expectError(error.InvalidExecutionPlan, owner.bindRecurrentWorkspace(changed));
+
+    var fused = descriptor;
+    fused.hidden = 1024;
+    fused.head_storage = .fused_top1;
+    try phase.initInto(fused);
+    try phase.declareRecurrentScratch();
+    try phase.declareAttentionScratch(false);
+    const fused_layout = phase.storage_layout;
+    const head = fused_layout.fused_head_workspace.?;
+    try std.testing.expectEqual(@as(usize, 0), fused_layout.head_bytes);
+    try std.testing.expectEqual(fused_layout.attention_workspace.?.offset, head.offset);
+    try std.testing.expectEqual(fused_layout.recurrent_workspace.?.offset, head.offset);
+    try std.testing.expectEqual(head.offset + @max(head.bytes, attention.bytes, recurrent.bytes), fused_layout.metadata_bytes);
+    owner.storage_layout = fused_layout;
+    owner.metadata.len = fused_layout.metadata_bytes;
+    try std.testing.expectEqual(owner.metadata.ptr + head.offset, (try owner.bindFusedHeadWorkspace()).ptr);
+}
+
+test "captured graph head packets fund the exact smaller bank and invalidate a full-width binding" {
+    var key = [_]u64{1};
+    const positions: [97 * 3]u32 = @splat(0);
+    const descriptor = Descriptor{ .epoch = 1, .key = &key, .positions = &positions, .rows = 97, .hidden = 2560, .vocab = 248320, .future_tokens = 128, .attention_layers = 0, .recurrent_layers = 1 };
+    const full = try descriptor.layout();
+    var owner: Module = .{};
+    owner.installStorageGeometry(full, descriptor.rows, descriptor.hidden, descriptor.vocab, descriptor.positions);
+    owner.epoch_id = descriptor.epoch;
+    owner.key = &key;
+    owner.recurrent_layers = descriptor.recurrent_layers;
+    var phase: GraphPhase = undefined;
+    try phase.initInto(descriptor);
+    try std.testing.expect(phase.matchesOwner(&owner));
+
+    var packet = descriptor;
+    packet.head_storage = .{ .adaptive_bank = 32 };
+    try phase.initInto(packet);
+    const layout = phase.storage_layout;
+    const request = packet.storageRequestFor(layout);
+    try std.testing.expectEqual(@as(usize, 32 * 248320 * 4), layout.head_bytes);
+    try std.testing.expectEqual(full.metadata_bytes, layout.metadata_bytes);
+    try std.testing.expectEqual(layout.metadata_bytes + layout.head_bytes, (try request.captured_storage.amounts()).backend_scratch_bytes);
+    try std.testing.expect(!phase.matchesOwner(&owner));
+    owner.storage_layout = layout;
+    try std.testing.expect(phase.matchesOwner(&owner));
+
+    phase.mode = .storage;
+    phase.admission_pressure = .live_host;
+    try std.testing.expect(!phase.reduceHeadPacketAfterDenial());
+    phase.admission_pressure = .{ .domain_scratch = .gpu };
+    for ([_]usize{ 16, 8 }) |packet_rows| {
+        try std.testing.expect(phase.reduceHeadPacketAfterDenial());
+        try std.testing.expectEqual(packet_rows * packet.vocab * 4, phase.storage_layout.head_bytes);
+        try std.testing.expectEqual(packet_rows, phase.storage_layout.headPacketRows(packet.rows, packet.vocab));
+        try std.testing.expectEqual(layout.metadata_bytes, phase.storage_layout.metadata_bytes);
+    }
+    try std.testing.expect(!phase.reduceHeadPacketAfterDenial());
+    owner.storage_layout = phase.storage_layout;
+    try phase.initInto(packet);
+    try std.testing.expect(phase.matchesOwner(&owner));
+    try phase.initInto(descriptor);
+    try std.testing.expect(!phase.matchesOwner(&owner));
+
+    var shared = packet;
+    shared.head_storage = .{ .shared_layer_packets = 32 };
+    try phase.initInto(shared);
+    try std.testing.expectEqual(@as(usize, 32 * 248320 * 4), phase.storage_layout.shared_head_workspace.?.bytes);
+    try std.testing.expectEqual(@as(usize, 32), phase.storage_layout.headPacketRows(shared.rows, shared.vocab));
+    try std.testing.expectEqual(@as(usize, 0), phase.storage_layout.head_bytes);
+    const shared_request = shared.storageRequestFor(phase.storage_layout);
+    try std.testing.expectEqual(layout.metadata_bytes + 32 * 248320 * 4, (try shared_request.captured_storage.amounts()).backend_scratch_bytes);
+    const shared_layout = phase.storage_layout;
+    const head_span = shared_layout.shared_head_workspace.?;
+    const shared_owner: Module = .{ .storage_layout = shared_layout, .metadata = .{ .ptr = 0x10000, .len = shared_layout.metadata_bytes } };
+    const bound_head = (try shared_owner.bindExecutionStorage()).?;
+    try std.testing.expectEqual(shared_owner.metadata.ptr + head_span.offset, bound_head.ptr);
+    try std.testing.expectEqual(head_span.bytes, bound_head.len);
+    shared.rows = 2;
+    shared.positions = positions[0..6];
+    const narrow = try shared.layout();
+    try std.testing.expectEqual(@as(usize, 2 * 248320 * 4), narrow.shared_head_workspace.?.bytes);
+    try std.testing.expectEqual(@as(usize, 2), narrow.headPacketRows(2, shared.vocab));
+    try std.testing.expect(!phase.matchesOwner(&owner));
+
+    packet.vocab = 400_000;
+    try std.testing.expectEqual(@as(usize, 32 * 400_000 * 4), (try packet.layout()).head_bytes);
+    packet.head_storage = .full_bank;
+    try std.testing.expectError(error.InvalidShape, packet.layout());
+}
+
+test "captured sequence storage layout packs narrow and wide readbacks with aligned physical planes" {
     const cases = [_]struct { rows: usize, hidden: usize, vocab: usize, bank: usize, positions: usize, progress: usize, bytes: usize, head: usize }{
-        .{ .rows = 2, .hidden = 1024, .vocab = 8, .bank = 8192, .positions = 8448, .progress = 8704, .bytes = 8960, .head = 0 },
+        .{ .rows = 2, .hidden = 1024, .vocab = 8, .bank = 8192, .positions = 8208, .progress = 8232, .bytes = 8448, .head = 0 },
+        .{ .rows = 3, .hidden = 1024, .vocab = 8, .bank = 12288, .positions = 12320, .progress = 12356, .bytes = 12544, .head = 0 },
         .{ .rows = 64, .hidden = 1024, .vocab = 151936, .bank = 262144, .positions = 262656, .progress = 263424, .bytes = 263680, .head = 0 },
         .{ .rows = 128, .hidden = 2560, .vocab = 151936, .bank = 1310720, .positions = 1311744, .progress = 1313280, .bytes = 1313536, .head = 77791232 },
     };
     for (cases) |value| {
         const actual = try StorageLayout.init(value.rows, value.hidden, value.vocab, 24576);
-        try std.testing.expectEqual(value.bank, actual.bank_offset);
-        try std.testing.expectEqual(value.positions, actual.positions_offset);
-        try std.testing.expectEqual(value.progress, actual.progress_offset);
+        try std.testing.expectEqual(value.bank, actual.tokens.offset);
+        try std.testing.expectEqual(value.positions, actual.positions.offset);
+        try std.testing.expectEqual(value.progress, actual.counter.offset);
         try std.testing.expectEqual(value.bytes, actual.metadata_bytes);
         try std.testing.expectEqual(value.head, actual.head_bytes);
+        const backing: buffer.DeviceBuffer = .{ .ptr = 0x10000, .len = value.bytes };
+        var owner = Module{ .storage_layout = actual, .metadata = backing };
+        if (value.head == 0) {
+            try std.testing.expect((try owner.bindExecutionStorage()) == null);
+        } else {
+            try std.testing.expectError(error.InvalidShape, owner.bindExecutionStorage());
+            owner.head = .{ .ptr = backing.ptr, .len = value.head };
+            try std.testing.expectError(error.InvalidShape, owner.bindExecutionStorage());
+            owner.head = .{ .ptr = 0x10000000, .len = value.head + 256 };
+            try std.testing.expectEqual(value.head, (try owner.bindExecutionStorage()).?.len);
+            owner.arena = .{ .ptr = owner.head.ptr, .len = 256 };
+            try std.testing.expectError(error.InvalidShape, owner.bindExecutionStorage());
+            owner.arena.ptr = owner.head.ptr + value.head;
+            try std.testing.expectEqual(value.head, (try owner.bindExecutionStorage()).?.len);
+        }
+        try std.testing.expectEqual(@as(u64, 0x10000 + value.bank), actual.tokens.bind(backing).ptr);
+        try std.testing.expectEqual(value.rows * 2 * @sizeOf(u32), actual.tokens.bytes);
+        try std.testing.expectEqual(value.rows * 3 * @sizeOf(u32), actual.positions.bytes);
+        try std.testing.expectEqual(value.progress + @sizeOf(u32) - value.bank, actual.readback(backing).len);
+        try std.testing.expectEqual((value.positions - value.bank) / @sizeOf(u32), actual.readbackPositionIndex());
+        try std.testing.expectEqual((value.progress - value.bank) / @sizeOf(u32), actual.readbackProgressIndex());
+        try std.testing.expect(actual.readbackProgressIndex() < StorageLayout.max_readback_words);
+        if (value.rows == max_rows) try std.testing.expectEqual(StorageLayout.max_readback_words, actual.readbackProgressIndex() + 1);
         try std.testing.expectEqual(@sizeOf(plan_mod.Plan) + 196608, actual.host_bytes);
     }
-}
-
-test "captured sequence malformed replacement refuses before old graph or SDK mutation" {
-    // Negative-only sentinels prove no context access or destruction. There
-    // is no SDK/GPU endpoint and this does not qualify a numerical replay.
-    var ctx: context.CudaContext = undefined;
-    var owner = Module{ .phase = .replay, .graph = @ptrFromInt(1), .metadata = .{ .ptr = 256, .len = 256 } };
-    try std.testing.expectError(error.InvalidShape, owner.reset(&ctx, &.{1}, &.{}, 1, 1024, 8));
-    try std.testing.expectError(error.InvalidShape, owner.reset(&ctx, &.{1}, &.{}, 2, 1024, 8));
-    try std.testing.expectError(error.Overflow, owner.reset(&ctx, &.{1}, &.{}, 128, std.math.maxInt(usize), 8));
-    try std.testing.expectError(error.Overflow, owner.reset(&ctx, &.{1}, &.{}, 128, 1024, std.math.maxInt(usize)));
-    try std.testing.expectError(error.InvalidShape, owner.reset(&ctx, &.{1}, &.{}, 128, 1024, 262145));
-    try std.testing.expect(owner.phase == .replay and owner.graph == @as(driver.CUgraphExec, @ptrFromInt(1)));
-    try std.testing.expectEqual(@as(u64, 256), owner.metadata.ptr);
+    const paired = try StorageLayout.init(2, 1024, 8, 1);
+    var receipt: [StorageLayout.max_readback_words]u32 = @splat(0);
+    const words = receipt[0 .. paired.readbackProgressIndex() + 1];
+    words[0..4].* = .{ 11, 22, 33, 44 };
+    words[paired.readbackPositionIndex()..][0..6].* = .{ 3, 4, 5, 6, 7, 8 };
+    words[paired.readbackProgressIndex()] = 10;
+    var first: [2]u32 = @splat(0);
+    var second: [2]u32 = @splat(0);
+    var progress: u32 = 8;
+    var positions = [_]u32{ 1, 2, 3, 4, 5, 9 };
+    try std.testing.expectError(error.InvalidExecutionPlan, paired.publishReadback(words, &positions, &progress, &first, &second));
+    try std.testing.expectEqualSlices(u32, &.{ 0, 0 }, &first);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 0 }, &second);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5, 9 }, &positions);
+    try std.testing.expectEqual(@as(u32, 8), progress);
+    positions[5] = 6;
+    try paired.publishReadback(words, &positions, &progress, &first, &second);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 4, 5, 6, 7, 8 }, &positions);
+    try std.testing.expectEqual(@as(u32, 10), progress);
+    try std.testing.expectEqualSlices(u32, &.{ 11, 22 }, &first);
+    try std.testing.expectEqualSlices(u32, &.{ 33, 44 }, &second);
+    try std.testing.expectError(error.InvalidShape, StorageLayout.init(1, 1024, 8, 1));
+    try std.testing.expectError(error.Overflow, StorageLayout.init(128, std.math.maxInt(usize), 8, 1));
+    try std.testing.expectError(error.Overflow, StorageLayout.init(128, 1024, std.math.maxInt(usize), 1));
+    try std.testing.expectError(error.InvalidShape, StorageLayout.init(128, 1024, 262145, 1));
+    const malformed = Descriptor{ .epoch = 1, .key = &.{1}, .positions = &.{}, .rows = 2, .hidden = 1024, .vocab = 8, .future_tokens = 1, .attention_layers = 1, .recurrent_layers = 0 };
+    try std.testing.expectError(error.InvalidShape, malformed.layout());
 }
 
 const GraphTestDriver = struct {
@@ -609,7 +1053,10 @@ fn qualifyGraphPhaseOom(allocator: std.mem.Allocator) !void {
     phase.mode = .storage;
     phase.expected_compute = 1;
     phase.admission = .{ .controller = &domain.controller, .limits = .{}, .check_live_memory = false };
+    // An early allocation failure on retry must not inherit the prior denial.
+    phase.admission_pressure = .{ .domain_scratch = .gpu };
     phase.prepareOutsideUsing(&model, allocator) catch |err| {
+        try std.testing.expect(phase.admission_pressure == null);
         try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, domain.controller.snapshot());
         try std.testing.expect(phase.cold == null);
         return err;
@@ -640,7 +1087,7 @@ test "captured graph exact funding precedes host plan allocation and quota final
     const key = [_]u64{ 3, 5, 7 };
     const positions = [_]u32{ 1, 2, 3, 4, 5, 6 };
     const descriptor = Descriptor{ .epoch = 1, .key = &key, .positions = &positions, .rows = 2, .hidden = 1024, .vocab = 8, .future_tokens = 16, .attention_layers = 1, .recurrent_layers = 1 };
-    const request = try descriptor.storageRequest();
+    const request = descriptor.storageRequestFor(try descriptor.layout());
     const exact = try request.captured_storage.amounts();
     var phase: GraphPhase = undefined;
     try phase.initInto(descriptor);
@@ -775,7 +1222,7 @@ test "captured graph wide head and learned arena consume separate exact prefunde
     const positions: [384]u32 = @splat(1);
     const key = [_]u64{ 17, 23 };
     const descriptor = Descriptor{ .epoch = 42, .key = &key, .positions = &positions, .rows = 128, .hidden = 1024, .vocab = 8, .future_tokens = 16, .attention_layers = 1, .recurrent_layers = 1 };
-    const request = try descriptor.storageRequest();
+    const request = descriptor.storageRequestFor(try descriptor.layout());
     const exact = try request.captured_storage.amounts();
     var storage: GraphPhase = undefined;
     try storage.initInto(descriptor);
@@ -810,6 +1257,13 @@ test "captured graph wide head and learned arena consume separate exact prefunde
     arena.expected_compute = 1;
     arena.old = owner.snapshot();
     arena.admission = storage.admission;
+    const total = try exact.merge(.{ .backend_scratch_bytes = owner.plan.?.peak });
+    arena.admission.?.limits.backend_limit_bytes = total.backend_scratch_bytes - 1;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, arena.prepareOutside(&model));
+    try std.testing.expect(arena.cold == null and owner.arena.ptr == 0);
+    try std.testing.expectEqual(@as(usize, 2), GraphTestDriver.allocations);
+    try std.testing.expectEqualDeep(exact, domain.controller.snapshot());
+    arena.admission.?.limits.backend_limit_bytes = total.backend_scratch_bytes;
     try arena.prepareOutside(&model);
     defer arena.destroyOutside();
     var current = try sink.enter();
@@ -817,13 +1271,29 @@ test "captured graph wide head and learned arena consume separate exact prefunde
     var b = try current.retainEpoch();
     defer b.release();
     try arena.bind(.{ .boundary = &b });
+    const plan = owner.plan.?;
+    plan.* = .{};
+    try plan.declareScratch(1023);
+    const changed = try plan.layout(0);
+    try std.testing.expectEqual(arena.old.arena_layout.?.bytes, changed.bytes);
+    try std.testing.expectEqual(arena.old.arena_layout.?.events, changed.events);
+    try std.testing.expect(arena.old.arena_layout.?.recipe != changed.recipe);
+    try std.testing.expectError(error.PreparedCachePlanChanged, owner.reserveArenaPrepared(&ctx, &arena));
+    try std.testing.expectEqual(@as(usize, 2), GraphTestDriver.allocations);
+    plan.* = .{};
+    try plan.declareScratch(1024);
     try owner.reserveArenaPrepared(&ctx, &arena);
     const pointer = owner.arena.ptr;
     try owner.reserveArenaPrepared(&ctx, &arena); // warm path consumes no token twice
+    plan.* = .{};
+    try plan.declareScratch(1023);
+    try std.testing.expectError(error.InvalidExecutionPlan, owner.bindArena());
+    plan.* = .{};
+    try plan.declareScratch(1024);
+    _ = try owner.bindArena();
     try std.testing.expectEqual(pointer, owner.arena.ptr);
     try std.testing.expectEqual(@as(usize, 3), GraphTestDriver.allocations);
     try arena.close(.{ .boundary = &b });
-    const total = try exact.merge(.{ .backend_scratch_bytes = owner.plan.?.peak });
     try std.testing.expectEqualDeep(total, domain.controller.snapshot());
     try owner.clearWithCleanup(&ctx, .{ .boundary = &b });
     try std.testing.expectEqual(@as(usize, 3), GraphTestDriver.frees);
@@ -831,4 +1301,118 @@ test "captured graph wide head and learned arena consume separate exact prefunde
     current.finish();
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, domain.controller.snapshot());
     try std.testing.expect(ctx.prepared_cache_funding == null); // norm binding never overridden
+}
+
+test "CUDA bounded decoder binds zero scratch without reserving a device arena" {
+    var plan: plan_mod.Plan = .{};
+    try plan.declare(&.{}, null);
+    var owner: Module = .{ .plan = &plan, .phase = .capture };
+    var phase: GraphPhase = .{ .descriptor = undefined, .mode = .none, .old = owner.snapshot() };
+    var ctx = GraphTestDriver.contextValue();
+    owner.invalidations += 1;
+    try std.testing.expectError(error.PreparedCachePlanChanged, owner.reserveArenaPrepared(&ctx, &phase));
+    try std.testing.expect(owner.admitted_arena_layout == null);
+    phase.old = owner.snapshot();
+    try owner.reserveArenaPrepared(&ctx, &phase);
+    const admitted = owner.snapshot();
+    try std.testing.expectEqualDeep(phase.old.arena_layout, admitted.admitted_arena_layout);
+    try std.testing.expect(admitted.arena_layout == null);
+    try owner.reserveArenaPrepared(&ctx, &phase);
+    try std.testing.expectEqual(@as(usize, 0), owner.arena.len);
+    try std.testing.expect(owner.arena_quota == .none);
+    try std.testing.expect((try owner.bindArena()).complete());
+}
+
+test "CUDA bounded decoder validates dispatch geometry before preparing storage" {
+    const positions: [384]u32 = @splat(0);
+    var descriptor: Descriptor = .{ .epoch = 1, .key = &.{1}, .positions = positions[0 .. 64 * 3], .rows = 64, .hidden = 1024, .vocab = 8, .future_tokens = 16, .attention_layers = 3, .recurrent_layers = 5 };
+    try std.testing.expectEqual(Descriptor.DispatchCounts{ .attention = 6, .ragged_recurrent = 0 }, try descriptor.dispatchCounts());
+    descriptor.rows = 128;
+    descriptor.positions = &positions;
+    try std.testing.expectEqual(Descriptor.DispatchCounts{ .attention = 12, .ragged_recurrent = 20 }, try descriptor.dispatchCounts());
+    descriptor.recurrent_layers = std.math.maxInt(usize);
+    var phase: GraphPhase = undefined;
+    try std.testing.expectError(error.Overflow, phase.initInto(descriptor));
+}
+
+test "bounded decoder graph reuse requires the prepared dispatch geometry" {
+    var owner: Module = .{};
+    var key = [_]u64{9};
+    const positions: [6]u32 = @splat(7);
+    const descriptor: Descriptor = .{
+        .epoch = 1,
+        .key = &key,
+        .positions = &positions,
+        .rows = 2,
+        .hidden = 1024,
+        .vocab = 100,
+        .future_tokens = 9,
+        .attention_layers = 4,
+        .recurrent_layers = 3,
+    };
+    owner.installStorageGeometry(try descriptor.layout(), descriptor.rows, descriptor.hidden, descriptor.vocab, descriptor.positions);
+    owner.epoch_id = descriptor.epoch;
+    owner.key = &key;
+    owner.attention_layers = descriptor.attention_layers;
+    owner.recurrent_layers = descriptor.recurrent_layers;
+    try std.testing.expect(owner.matches(descriptor));
+    var changed = descriptor;
+    changed.future_tokens += 2;
+    try std.testing.expect(owner.matches(changed));
+    var phase: GraphPhase = undefined;
+    changed = descriptor;
+    changed.attention_geometry = .{ .heads = 8, .kv_heads = 2, .dim = 256 };
+    try phase.initInto(changed);
+    try phase.declareAttentionScratch(false);
+    try std.testing.expect(!phase.matchesOwner(&owner));
+    owner.attention_scratch = phase.attention_scratch;
+    try std.testing.expect(!phase.matchesOwner(&owner));
+    owner.storage_layout = phase.storage_layout;
+    try std.testing.expect(phase.matchesOwner(&owner));
+    owner.storage_layout.?.metadata_bytes -= 1;
+    try std.testing.expect(!phase.matchesOwner(&owner));
+    owner.storage_layout = phase.storage_layout;
+    try phase.declareAttentionScratch(true);
+    try std.testing.expect(!phase.matchesOwner(&owner));
+    phase.descriptor.future_tokens += 2;
+    try phase.declareAttentionScratch(false);
+    try std.testing.expect(!phase.matchesOwner(&owner));
+    phase.descriptor.attention_geometry = null;
+    try std.testing.expectError(error.InvalidShape, phase.declareAttentionScratch(false));
+    changed = descriptor;
+    changed.attention_layers += 1;
+    try std.testing.expect(!owner.matches(changed));
+    changed = descriptor;
+    changed.recurrent_layers += 1;
+    try std.testing.expect(!owner.matches(changed));
+    changed = descriptor;
+    changed.vocab += 1;
+    try std.testing.expect(!owner.matches(changed));
+}
+
+test "batched CUDA attention scratch packs exact chunk values and statistics" {
+    const ScratchLayout = @import("paged_attention_bf16.zig").ScratchLayout;
+    for ([_]bool{ false, true }, [_]usize{ 5, 2 }) |chunk128, chunks| {
+        const layout = try ScratchLayout.init(64, 8, 2, 256, 129, chunk128);
+        const partial_rows = 64 * 8 * chunks;
+        try std.testing.expectEqual(chunks, layout.chunks);
+        try std.testing.expectEqual(@as(usize, 64 * 8 * 256), layout.output_elements);
+        try std.testing.expectEqual(partial_rows * 256 * 4, layout.statistics_offset);
+        try std.testing.expectEqual(partial_rows * 258 * 4, layout.bytes);
+        try std.testing.expectEqual(@as(usize, 0), layout.statistics_offset % 256);
+    }
+    try std.testing.expectError(error.InvalidShape, ScratchLayout.init(2, 8, 2, 256, 0, false));
+}
+
+test "CUDA recurrent packet scratch packs aligned convolution and recurrent planes" {
+    const Scratch = @import("gated_delta.zig").PacketScratch;
+    for ([_]usize{ 16, 32 }) |value_heads| {
+        const channels = (2 * 16 + value_heads) * 128;
+        const width = value_heads * 128;
+        const layout = try Scratch.init(65, channels, width);
+        try std.testing.expectEqual(65 * channels * @sizeOf(f32), layout.core_offset);
+        try std.testing.expectEqual(65 * width * @sizeOf(f32), layout.bytes - layout.core_offset);
+        try std.testing.expectEqual(@as(usize, 0), layout.core_offset % 256);
+    }
+    try std.testing.expectError(error.Overflow, Scratch.init(std.math.maxInt(usize), 2, 1));
 }

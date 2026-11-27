@@ -16,7 +16,7 @@
 const std = @import("std");
 const backends = @import("backends/backends.zig");
 const classification_mod = @import("pipelines/classification.zig");
-const graph_runtime = @import("graph/runtime.zig");
+const graph_runtime = @import("execution/graph_runtime.zig");
 const model_manager_mod = @import("server/model_manager.zig");
 const native_backend_choice = @import("native_backend_choice.zig");
 

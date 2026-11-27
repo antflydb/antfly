@@ -17,7 +17,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const gpt_arch = @import("../architectures/gpt.zig");
 const decoder_rms_runtime = @import("decoder_rms_runtime.zig");
-const model_runtime = @import("../graph/model_runtime.zig");
+const model_runtime = @import("../execution/model_runtime.zig");
 const gpt_mod = @import("../models/gpt.zig");
 const decoder_tail_runtime = @import("decoder_tail_runtime.zig");
 const metal_compute = @import("../ops/metal_compute.zig");
@@ -155,11 +155,11 @@ fn forwardLogitsTensorFromNormalizedHidden(
     gpt_config: gpt_mod.Config,
     configured_layer_count: usize,
     final_hidden: ops.CT,
-) !?ops.CT {
+) !ops.CT {
     if (try forwardLogitsTensorFromNormalizedHiddenPrepared(cb, gpt_config, configured_layer_count, final_hidden)) |logits| {
         return logits;
     }
-    return try forwardLogitsTensorFromNormalizedHiddenFallback(cb, gpt_config, final_hidden);
+    return forwardLogitsTensorFromNormalizedHiddenFallback(cb, gpt_config, final_hidden);
 }
 
 fn forwardSampledFromNormalizedHidden(
@@ -171,7 +171,7 @@ fn forwardSampledFromNormalizedHidden(
     sampling: model_runtime.SamplingConfig,
     token_history: []const i64,
 ) !?i64 {
-    const logits = (try forwardLogitsTensorFromNormalizedHidden(cb, gpt_config, configured_layer_count, final_hidden)) orelse return null;
+    const logits = try forwardLogitsTensorFromNormalizedHidden(cb, gpt_config, configured_layer_count, final_hidden);
     defer cb.free(logits);
 
     if (gpt_config.final_logit_softcapping <= 0.0) {
@@ -549,8 +549,8 @@ pub fn forwardLastLogits(
         seq_len,
         decode_context,
     )) orelse return null;
+    defer cb.free(logits);
     const logits_host = try cb.toFloat32(logits, allocator);
-    cb.free(logits);
     gpt_arch.applyFinalLogitSoftcapInPlace(gpt_config, logits_host);
     return logits_host;
 }
@@ -589,12 +589,12 @@ pub fn forwardPrefillLastLogits(
         try cb.sliceRows2D(allocator, hidden_result.hidden, hidden_result.total_rows - 1, 1, gpt_config.hidden_size);
     defer if (last_hidden != hidden_result.hidden) cb.free(last_hidden);
 
-    const logits = (try forwardLogitsTensorFromNormalizedHidden(
+    const logits = try forwardLogitsTensorFromNormalizedHidden(
         cb,
         gpt_config,
         configured_layer_count,
         last_hidden,
-    )) orelse return null;
+    );
     defer cb.free(logits);
 
     const result = try cb.toFloat32(logits, allocator);
@@ -634,7 +634,7 @@ pub fn forwardLastLogitsTensor(
     );
     defer cb.free(final_hidden);
 
-    return forwardLogitsTensorFromNormalizedHidden(
+    return try forwardLogitsTensorFromNormalizedHidden(
         cb,
         gpt_config,
         configured_layer_count,

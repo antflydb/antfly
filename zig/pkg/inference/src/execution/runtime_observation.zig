@@ -21,7 +21,7 @@ const build_options = @import("build_options");
 
 /// Actual successful/declined/failed backend callback returns. These entry
 /// families do not claim vendor-internal kernel algorithms or completion.
-pub const Entry = enum { linear, linear_no_bias, layer_norm, gelu, add, encoder_attention, causal_attention, cross_attention, convolution_1d, convolution_2d, prepared_linear, prepared_linear_pair, prepared_qkv, prepared_linear_into, prepared_qkv_into };
+pub const Entry = enum { linear, linear_no_bias, layer_norm, gelu, add, encoder_attention, causal_attention, cross_attention, convolution_1d, convolution_2d, prepared_linear, prepared_linear_pair, prepared_qkv, prepared_linear_into, prepared_qkv_into, audio_execution };
 pub const EntryBackend = enum { native, metal, cuda };
 pub const EntryOutcome = enum { selected, declined, failed };
 pub const FailureText = struct {
@@ -53,11 +53,34 @@ pub const EntryReport = struct {
     implementation_changes: u64 = 0,
     last_failure: FailureText = .{},
 };
+pub const EntryReturns = struct {
+    native: Counts = .{},
+    metal: Counts = .{},
+    cuda: Counts = .{},
+
+    pub const Counts = struct {
+        successful: u64 = 0,
+        declined: u64 = 0,
+        failed: u64 = 0,
+    };
+
+    pub fn accumulate(self: *EntryReturns, current: EntryReturns) void {
+        inline for (@typeInfo(EntryBackend).@"enum".field_names) |backend| {
+            const total = &@field(self, backend);
+            const delta = @field(current, backend);
+            total.successful +|= delta.successful;
+            total.declined +|= delta.declined;
+            total.failed +|= delta.failed;
+        }
+    }
+};
+
 pub const Entries = struct {
     scope: enum { submitting_thread_instrumented_backend_entries } = .submitting_thread_instrumented_backend_entries,
     unit: enum { callback_returns_not_device_kernels } = .callback_returns_not_device_kernels,
     coverage: enum { instrumented_entries_only } = .instrumented_entries_only,
     vendor_internal_algorithms: enum { opaque_vendor } = .opaque_vendor,
+    totals: EntryReturns = .{},
     records: [8]EntryReport = @splat(.{}),
     count: u8 = 0,
     truncated: bool = false,
@@ -96,12 +119,21 @@ fn entriesSince(before: [entry_slots]EntryCounts) Entries {
         const declined = state.counters.declined -| start.declined;
         const failed = state.counters.failed -| start.failed;
         if (selected == 0 and declined == 0 and failed == 0) continue;
+        const backend: EntryBackend = @fromBackingInt(@intCast(index / entry_count));
+        const totals = switch (backend) {
+            .native => &result.totals.native,
+            .metal => &result.totals.metal,
+            .cuda => &result.totals.cuda,
+        };
+        totals.successful +|= selected;
+        totals.declined +|= declined;
+        totals.failed +|= failed;
         result.observed_families += 1;
         if (result.count == result.records.len) {
             result.truncated = true;
             continue;
         }
-        result.records[result.count] = .{ .backend = @fromBackingInt(@intCast(index / entry_count)), .family = @fromBackingInt(@intCast(index % entry_count)), .successful_returns = selected, .declined_returns = declined, .failed_returns = failed, .last_implementation_identity = state.implementation, .implementation_changes = state.counters.identity_changes -| start.identity_changes, .last_failure = if (failed != 0) state.failure else .{} };
+        result.records[result.count] = .{ .backend = backend, .family = @fromBackingInt(@intCast(index % entry_count)), .successful_returns = selected, .declined_returns = declined, .failed_returns = failed, .last_implementation_identity = state.implementation, .implementation_changes = state.counters.identity_changes -| start.identity_changes, .last_failure = if (failed != 0) state.failure else .{} };
         result.count += 1;
     }
     return result;
@@ -243,13 +275,40 @@ noinline fn nativeActivationBodyEnabled(activation: []const u8, vector_width: us
 const MetalDispatchSink = *const fn (usize, usize, u32, u64, u64, u64, u64, u64, u64, bool) callconv(.c) void;
 extern fn termite_metal_observation_exchange_dispatch_sink(sink: ?MetalDispatchSink) ?MetalDispatchSink;
 
-/// A ready serial schedule's actual execution selection on the submitting
-/// thread. The bank gauges describe the latest selected plan, not a request peak.
+/// Serial schedule decisions and successful callbacks on the submitting thread.
 pub const SerialWorkspaceObservation = struct {
-    scope: enum { metal_ready_serial_schedule_callbacks } = .metal_ready_serial_schedule_callbacks,
+    scope: enum { metal_serial_schedule_callbacks } = .metal_serial_schedule_callbacks,
+    /// Successful host callbacks. Device retirement is outside this observation.
     successful_replays: u64 = 0,
     successful_eager_calls: u64 = 0,
-    latest: Banks,
+    callbacks_with_pending_frame: u64 = 0,
+    /// Decision counts include declined routes whose caller owns the eager callback.
+    decisions: Decisions = .{},
+    /// Sum of logical scratch spans bound to clamp dispatches. These are
+    /// usage totals, not physical backing sizes or simultaneous peaks.
+    planned_clamp_bindings: u64 = 0,
+    planned_clamp_bytes: u64 = 0,
+    temporary_clamp_bindings: u64 = 0,
+    temporary_clamp_bytes: u64 = 0,
+    /// Gauges for the latest successful ready-plan callback.
+    latest: ?Banks = null,
+
+    pub const Decisions = struct {
+        selector_declined: u64 = 0,
+        waiting_for_reuse: u64 = 0,
+        cache_slot_busy: u64 = 0,
+        cache_owner_unavailable: u64 = 0,
+        metadata_allocation_declined: u64 = 0,
+        disabled_schedule: u64 = 0,
+        eager_reference: u64 = 0,
+        awaiting_preparation: u64 = 0,
+        learning_backoff: u64 = 0,
+        learning: u64 = 0,
+        arena_funding_pressure: u64 = 0,
+        arena_funding_stale: u64 = 0,
+        arena_publication_declined: u64 = 0,
+        arena_published: u64 = 0,
+    };
 
     pub const Banks = struct {
         planned_output_bytes: usize,
@@ -260,18 +319,41 @@ pub const SerialWorkspaceObservation = struct {
     };
 };
 
-pub inline fn metalSerialWorkspace(replayed: bool, banks: SerialWorkspaceObservation.Banks) void {
-    if (active_kernels == null) return;
-    metalSerialWorkspaceEnabled(replayed, banks);
+pub inline fn kernelObservationActive() bool {
+    return active_kernels != null;
 }
 
-noinline fn metalSerialWorkspaceEnabled(replayed: bool, banks: SerialWorkspaceObservation.Banks) void {
+pub noinline fn metalSerialScheduleDecision(comptime reason: @import("std").meta.FieldEnum(SerialWorkspaceObservation.Decisions)) void {
     var active = active_kernels;
     while (active) |scope| : (active = scope.previous) {
-        if (scope.metal_serial_workspace == null) scope.metal_serial_workspace = .{ .latest = banks };
+        if (scope.metal_serial_workspace == null) scope.metal_serial_workspace = .{};
+        @field(scope.metal_serial_workspace.?.decisions, @tagName(reason)) +|= 1;
+    }
+}
+
+pub noinline fn metalSerialWorkspace(replayed: bool, pending_frame: bool, banks: SerialWorkspaceObservation.Banks) void {
+    var active = active_kernels;
+    while (active) |scope| : (active = scope.previous) {
+        if (scope.metal_serial_workspace == null) scope.metal_serial_workspace = .{};
         const value = &scope.metal_serial_workspace.?;
         value.latest = banks;
         if (replayed) value.successful_replays +|= 1 else value.successful_eager_calls +|= 1;
+        if (pending_frame) value.callbacks_with_pending_frame +|= 1;
+    }
+}
+
+pub noinline fn metalAudioClampScratch(bytes: usize, planned: bool) void {
+    var active = active_kernels;
+    while (active) |scope| : (active = scope.previous) {
+        if (scope.metal_serial_workspace == null) scope.metal_serial_workspace = .{};
+        const value = &scope.metal_serial_workspace.?;
+        if (planned) {
+            value.planned_clamp_bindings +|= 1;
+            value.planned_clamp_bytes +|= bytes;
+        } else {
+            value.temporary_clamp_bindings +|= 1;
+            value.temporary_clamp_bytes +|= bytes;
+        }
     }
 }
 
@@ -290,6 +372,9 @@ pub const KernelScope = struct {
     native_programs: NativePrograms = .{},
     native_program_bank: ?NativeProgramBank = null,
     metal_serial_workspace: ?SerialWorkspaceObservation = null,
+    cuda_audio_workspace: ?CudaAudioWorkspace = null,
+    cuda_decoder_workspace: ?CudaDecoderWorkspace = null,
+    cuda_decoder_declines: ?CudaDecoderDeclines = null,
     attached: bool = false,
     /// Must be called only after the owner reaches final address-stable storage.
     pub fn begin(self: *KernelScope) void {
@@ -343,14 +428,182 @@ noinline fn cudaKernelEnabled(context: usize, function: usize, stream: usize, co
     }
 }
 
+/// CUDA audio route outcomes on the submitting thread.
+pub const CudaAudio = struct {
+    warmed: u64 = 0,
+    learned: u64 = 0,
+    learning_output_mismatch: u64 = 0,
+    learning_host_transfer: u64 = 0,
+    learning_unsealed: u64 = 0,
+    arena_unavailable: u64 = 0,
+    input_alias_declined: u64 = 0,
+    capture_storage_declined: u64 = 0,
+    capture_begin_declined: u64 = 0,
+    capture_callback_declined: u64 = 0,
+    capture_layout_declined: u64 = 0,
+    capture_instantiation_declined: u64 = 0,
+    eager_assigned: u64 = 0,
+    eager_copied: u64 = 0,
+    recorded_and_launched: u64 = 0,
+    replayed: u64 = 0,
+
+    fn since(self: CudaAudio, before: CudaAudio) ?CudaAudio {
+        var result: CudaAudio = .{};
+        var observed = false;
+        inline for (@typeInfo(CudaAudio).@"struct".field_names) |field| {
+            @field(result, field) = @field(self, field) -| @field(before, field);
+            observed = observed or @field(result, field) != 0;
+        }
+        return if (observed) result else null;
+    }
+};
+
+/// Latest submitted audio workspace in the observing interval.
+/// Spans may alias one another and describe neither peak usage nor completion.
+pub const CudaAudioWorkspace = struct {
+    pub const Route = enum { eager_assigned, recorded_and_launched, replayed };
+
+    route: Route,
+    plan_origin: @import("stream_workspace.zig").Origin,
+    planned_events: usize,
+    planned_arena_bytes: usize,
+    /// Arena capacity saved by repacking the same scratch lifetimes with
+    /// external publication. This excludes the separate output bank.
+    repacked_scratch_savings_bytes: usize,
+    bound_arena_bytes: usize,
+    bound_input_bytes: usize,
+    planned_terminal_bytes: usize,
+    bound_terminal_bytes: usize,
+    terminal_outside_arena: bool,
+};
+
+pub inline fn cudaAudioWorkspace(workspace: CudaAudioWorkspace) void {
+    var active = active_kernels;
+    while (active) |scope| : (active = scope.previous) scope.cuda_audio_workspace = workspace;
+}
+
+/// Latest bounded CUDA graph whose device readback and publication succeeded.
+/// Physical geometry for the last decoder burst that completed its receipt.
+/// Multiple bursts can share a diagnostic interval. Their workspace sizes
+/// describe stage backing and cannot be summed to obtain an invocation peak.
+pub const CudaDecoderWorkspace = struct {
+    completed_bursts: u64 = 1,
+    eager_bursts: u64 = 0,
+    route: Route,
+    plan_origin: ?@import("stream_workspace.zig").Origin,
+    planned_events: usize,
+    planned_scratch_bytes: usize,
+    bound_scratch_bytes: usize,
+    metadata_bytes: usize,
+    /// Physical bank shared by the serial attention, recurrent and fused
+    /// head stages. Their individual byte counts may overlap this bank.
+    shared_layer_workspace_bytes: usize = 0,
+    attention_scratch_bytes: usize,
+    recurrent_scratch_bytes: usize = 0,
+    /// Bytes in the independently admitted bank. Arena-backed packets are
+    /// already accounted for by bound_scratch_bytes.
+    head_bytes: usize,
+    head_packet_rows: usize,
+    head_in_stream_arena: bool,
+    shared_head_scratch_bytes: usize = 0,
+    fused_head_scratch_bytes: usize = 0,
+    readback_bytes: usize,
+    readback_backing: ReadbackBacking,
+    rows: usize,
+
+    pub const Route = enum { warmed, learned, learning_declined, recorded_and_launched, replayed };
+    pub const ReadbackBacking = enum { admitted_pinned, request_buffer, legacy_policy };
+};
+
+pub inline fn cudaDecoderWorkspace(workspace: CudaDecoderWorkspace) void {
+    var active = active_kernels;
+    while (active) |scope| : (active = scope.previous) {
+        const prior = scope.cuda_decoder_workspace;
+        scope.cuda_decoder_workspace = workspace;
+        scope.cuda_decoder_workspace.?.completed_bursts = (if (prior) |previous| previous.completed_bursts else 0) +| 1;
+        const eager: u64 = switch (workspace.route) {
+            .warmed, .learned, .learning_declined => 1,
+            .recorded_and_launched, .replayed => 0,
+        };
+        scope.cuda_decoder_workspace.?.eager_bursts = (if (prior) |previous| previous.eager_bursts else 0) +| eager;
+    }
+}
+
+/// Declines before a bounded decoder graph takes ownership of execution.
+pub const CudaDecoderDeclines = struct {
+    unsupported_geometry: u64 = 0,
+    missing_kv_binding: u64 = 0,
+    unsupported_lane_state: u64 = 0,
+    context_or_page_capacity: u64 = 0,
+    unbacked_kv_pages: u64 = 0,
+    unstable_weight_or_workspace: u64 = 0,
+    incompatible_layer_state: u64 = 0,
+    unstable_recurrent_state: u64 = 0,
+    admission_or_revalidation: u64 = 0,
+    workspace_admission: u64 = 0,
+
+    pub const Reason = @import("std").meta.FieldEnum(CudaDecoderDeclines);
+    pub const Counts = [@typeInfo(CudaDecoderDeclines).@"struct".field_names.len]u64;
+};
+
+pub inline fn cudaDecoderDeclined(reason: CudaDecoderDeclines.Reason) void {
+    if (active_kernels != null) cudaDecoderDeclinedEnabled(reason);
+}
+
+noinline fn cudaDecoderDeclinedEnabled(reason: CudaDecoderDeclines.Reason) void {
+    var active = active_kernels;
+    while (active) |scope| : (active = scope.previous) {
+        if (scope.cuda_decoder_declines == null) scope.cuda_decoder_declines = .{};
+        switch (reason) {
+            inline else => |tag| @field(scope.cuda_decoder_declines.?, @tagName(tag)) +|= 1,
+        }
+    }
+}
+
+threadlocal var cuda_audio: CudaAudio = .{};
+
+pub inline fn cudaAudioResult(comptime route: @import("std").meta.FieldEnum(CudaAudio)) void {
+    if (enabled()) @field(cuda_audio, @tagName(route)) +|= 1;
+}
+
 pub const Counters = struct {
     native_assigned_dispatches: u64 = 0,
     backend_entries: Entries = .{},
+    cuda_audio: ?CudaAudio = null,
+    cuda_host_waits: ?CudaHostWaits = null,
     metal_encoded_dispatches: ?u64 = null,
     metal_command_submissions: ?u64 = null,
     metal_command_waits: ?u64 = null,
     metal_vendor_encodes: ?u64 = null,
 };
+
+/// Instrumented host wait API returns on the submitting thread.
+pub const CudaHostWaits = struct {
+    stream: u64 = 0,
+    event: u64 = 0,
+    failed: u64 = 0,
+
+    pub fn add(self: CudaHostWaits, other: CudaHostWaits) CudaHostWaits {
+        return .{ .stream = self.stream +| other.stream, .event = self.event +| other.event, .failed = self.failed +| other.failed };
+    }
+
+    fn since(self: CudaHostWaits, before: CudaHostWaits) CudaHostWaits {
+        return .{ .stream = self.stream -| before.stream, .event = self.event -| before.event, .failed = self.failed -| before.failed };
+    }
+};
+
+threadlocal var cuda_host_waits: CudaHostWaits = .{};
+
+pub inline fn cudaHostWait(comptime event: bool, success: bool) void {
+    if (!enabled()) return;
+    if (!success) {
+        cuda_host_waits.failed +|= 1;
+    } else if (event) {
+        cuda_host_waits.event +|= 1;
+    } else {
+        cuda_host_waits.stream +|= 1;
+    }
+}
 
 threadlocal var native_depth: usize = 0;
 threadlocal var native_dispatches: u64 = 0;
@@ -373,6 +626,8 @@ fn metalCounters() [4]u64 {
 pub const Scope = struct {
     active: bool = false,
     native_start: u64 = 0,
+    cuda_audio_start: CudaAudio = .{},
+    cuda_host_wait_start: CudaHostWaits = .{},
     entry_start: [entry_slots]EntryCounts = @splat(.{}),
     metal_start: [4]u64 = @splat(0),
 
@@ -381,11 +636,12 @@ pub const Scope = struct {
     pub fn init() Scope {
         native_depth += 1;
         if (comptime build_options.enable_metal) termite_metal_observation_begin();
-        return .{ .active = true, .native_start = native_dispatches, .entry_start = entryStarts(), .metal_start = metalCounters() };
+        return .{ .active = true, .native_start = native_dispatches, .cuda_audio_start = cuda_audio, .cuda_host_wait_start = if (comptime build_options.enable_cuda) cuda_host_waits else .{}, .entry_start = entryStarts(), .metal_start = metalCounters() };
     }
 
     pub fn snapshot(self: Scope) Counters {
-        var result = Counters{ .native_assigned_dispatches = native_dispatches -| self.native_start, .backend_entries = entriesSince(self.entry_start) };
+        var result = Counters{ .native_assigned_dispatches = native_dispatches -| self.native_start, .backend_entries = entriesSince(self.entry_start), .cuda_audio = cuda_audio.since(self.cuda_audio_start) };
+        if (comptime build_options.enable_cuda) result.cuda_host_waits = cuda_host_waits.since(self.cuda_host_wait_start);
         if (comptime build_options.enable_metal) {
             const after = metalCounters();
             result.metal_encoded_dispatches = after[0] -| self.metal_start[0];
@@ -1104,4 +1360,25 @@ test "Native Call bank observations copy optional lifetime gauges through nested
     fresh.begin();
     defer _ = fresh.finish();
     try a.expect(fresh.native_program_bank == null);
+}
+
+test "CUDA audio result observations preserve nested route counts and disabled scopes" {
+    const testing = @import("std").testing;
+    cudaAudioResult(.eager_copied);
+    var outer = Scope.init();
+    defer outer.deinit();
+    try testing.expect(outer.snapshot().cuda_audio == null);
+    cudaAudioResult(.warmed);
+    cudaAudioResult(.learning_host_transfer);
+
+    cudaAudioResult(.recorded_and_launched);
+    {
+        var inner = Scope.init();
+        defer inner.deinit();
+        cudaAudioResult(.replayed);
+        cudaAudioResult(.eager_assigned);
+        cudaAudioResult(.capture_storage_declined);
+        try testing.expectEqualDeep(CudaAudio{ .replayed = 1, .eager_assigned = 1, .capture_storage_declined = 1 }, inner.snapshot().cuda_audio.?);
+    }
+    try testing.expectEqualDeep(CudaAudio{ .warmed = 1, .learning_host_transfer = 1, .recorded_and_launched = 1, .replayed = 1, .eager_assigned = 1, .capture_storage_declined = 1 }, outer.snapshot().cuda_audio.?);
 }

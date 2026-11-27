@@ -74,7 +74,7 @@ fn encoded(a: std.mem.Allocator, values: []const f32, precision: Precision) ![]u
         .q8_0 => codec.quantizeQ8_0FromF32(a, values),
         .q4_0 => codec.quantizeQ4_0FromF32(a, values),
         .q4_k => codec.quantizeQ4_KFromF32(a, values),
-        .f32 => error.InvalidInput,
+        .f32, .bf16 => error.InvalidInput,
     };
 }
 

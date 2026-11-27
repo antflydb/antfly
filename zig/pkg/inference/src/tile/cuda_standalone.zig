@@ -136,4 +136,97 @@ pub const encoder_decoder_f16 = nativeProfile("encoder_decoder_f16", "florence_f
 // Legacy exported names adapt the existing shared RowReduce source ABI.
 pub const row_selection_stats_f32_entries = .{ .partials = "antfly_tile_whisper_logits_partials", .combine = "antfly_tile_whisper_logits_partials_combine" };
 pub const row_selection_stats_f32 = nativeProfile("row_selection_stats_f32", "row_selection_stats_f32.ptx", "../generated/tile_whisper_logits.cu", 75, row_selection_stats_f32_entries, &.{ "--fmad=false", "-std=c++17" });
-pub const profiles = [_]Profile{ attention, encoder } ++ gelu ++ residual ++ top1 ++ [_]Profile{ activation_bf16, paged_attention_bf16, gated_delta, vision_projection_bf16, encoder_decoder_f16, row_selection_stats_f32 };
+pub const routed_block_scaled_projection_entries = .{
+    .nvfp4 = "antfly_routed_e2m1_e4m3_projection_bf16",
+    .mxfp8 = "antfly_routed_e4m3_e8m0_projection_bf16",
+    .quantize_nvfp4 = "antfly_quantize_bf16_rows_e2m1_e4m3",
+    .quantize_mxfp8 = "antfly_quantize_bf16_rows_e4m3_e8m0",
+    .route = "antfly_route_biased_sigmoid_topk_f32",
+    .activate = "antfly_weighted_softcapped_swiglu_interleaved_bf16",
+    .combine = "antfly_reduce_routed_rows_bf16",
+};
+pub const routed_block_scaled_projection = nativeProfile("routed_block_scaled_projection", "routed_block_scaled_projection.ptx", "routed_block_scaled_projection.cu", 80, routed_block_scaled_projection_entries, &.{ "--fmad=false", "-std=c++17" });
+pub const paged_relative_attention_entries = .{
+    .chunks = "antfly_paged_relative_gqa_d128_bf16_chunks",
+    .parallel_chunks = "antfly_paged_relative_gqa_d128_bf16_parallel_chunks",
+    .combine = "antfly_paged_relative_gqa_d128_bf16_reduce_sink_gate",
+    .append = "antfly_paged_kv_append_bf16",
+};
+pub const paged_relative_attention = nativeProfile("paged_relative_attention_bf16", "paged_relative_attention_bf16.ptx", "paged_relative_attention_bf16.cu", 80, paged_relative_attention_entries, &.{ "--fmad=false", "-std=c++17" });
+pub const causal_depthwise4_bf16_entries = .{
+    .run = "antfly_causal_depthwise4_bf16_staged_history",
+    .head_norm_d128 = "antfly_causal_depthwise4_head_norm_d128_bf16",
+};
+pub const causal_depthwise4_bf16 = nativeProfile("causal_depthwise4_bf16", "causal_depthwise4_bf16.ptx", "causal_depthwise4_bf16.cu", 80, causal_depthwise4_bf16_entries, &.{ "--fmad=false", "-std=c++17" });
+pub const head_norm_bf16_entries = .{
+    .run = "antfly_head_scaled_norm_bf16",
+    .pair = "antfly_head_scaled_norm_pair_bf16",
+};
+pub const head_norm_bf16 = nativeProfile("head_norm_bf16", "head_norm_bf16.ptx", "head_norm_bf16.cu", 80, head_norm_bf16_entries, &.{ "--fmad=false", "-std=c++17" });
+pub const residual_block_mix_entries = .{
+    .mix = "antfly_mix_normalized_residual_blocks_bf16_f32",
+    .mix_norm = "antfly_mix_residual_blocks_rms_bf16",
+    .mix_pair = "antfly_mix_two_blocks_normalize_pair_bf16",
+    .mix_three_pairs = "antfly_mix_two_blocks_normalize_three_pairs_bf16",
+    .blend = "antfly_controller_blend_rms_f32_bf16",
+    .blend_three = "antfly_controller_blend_three_rms_f32_bf16",
+    .norm = "antfly_rms_norm_to_bf16",
+    .sum = "antfly_residual_sum3_bf16",
+    .softcap = "antfly_softcap_logits_f32",
+};
+pub const residual_block_mix = nativeProfile("residual_block_mix_bf16", "residual_block_mix_bf16.ptx", "residual_block_mix_bf16.cu", 80, residual_block_mix_entries, &.{ "--fmad=false", "-std=c++17" });
+pub const patch_transformer_entries = .{
+    .patches = "antfly_rgb_patches20_bf16",
+    .positions = "antfly_patch_position_bf16",
+    .rotary = "antfly_apply_patch_rotary_bf16",
+    .attention = "antfly_bidirectional_attention_d64_bf16",
+    .residual = "antfly_layer_scale_residual_bf16",
+    .gelu = "antfly_exact_gelu_bf16",
+    .merge = "antfly_merge_2x2_patch_rows_bf16",
+    .norm = "antfly_patch_layer_norm_bf16",
+};
+pub const patch_transformer = nativeProfile("patch_transformer_bf16", "patch_transformer_bf16.ptx", "patch_transformer_bf16.cu", 80, patch_transformer_entries, &.{ "--fmad=false", "-std=c++17" });
+pub const routed_block_scaled_matvec_entries = .{
+    .nvfp4 = "antfly_routed_e2m1_e4m3_m16n8k64_bf16_sm120",
+    .mxfp8 = "antfly_routed_e4m3_e8m0_m16n8k32_bf16_sm120",
+    .quantize_nvfp4 = "antfly_quantize_bf16_rows_e2m1_e4m3_sm120",
+    .pack = "antfly_pack_m16n8_routed_weights_sm120",
+    .nvfp4_bf16 = "antfly_routed_e2m1_e4m3_bf16_input_m16n8k16_sm120",
+    .mxfp8_bf16 = "antfly_routed_e4m3_e8m0_bf16_input_m16n8k16_sm120",
+};
+pub const routed_block_scaled_matvec = nativeProfile("routed_block_scaled_matvec_sm120", "routed_block_scaled_matvec_sm120.ptx", "routed_block_scaled_matvec_sm120.cu", 120, routed_block_scaled_matvec_entries, &.{ "-arch=compute_120f", "--fmad=false", "-std=c++17" });
+pub const dense_bf16_matvec_entries = .{
+    .f32_2304 = "antfly_dense_bf16_matvec_f32_2304",
+    .f32_64 = "antfly_dense_bf16_matvec_f32_64",
+    .three_f32_64 = "antfly_dense_bf16_matvec_three_f32_64",
+    .bf16_2304 = "antfly_dense_bf16_matvec_bf16_2304",
+    .bf16_3072 = "antfly_dense_bf16_matvec_bf16_3072",
+    .count_spills = "antfly_count_bf16_exponent_spill_tiles",
+    .pack = "antfly_pack_bf16_exponent_tiles",
+    .packed_f32_2304 = "antfly_dense_packed_bf16_matvec_f32_2304",
+    .packed_bf16_2304 = "antfly_dense_interleaved_bf16_matvec_bf16_2304",
+    .packed_bf16_3072 = "antfly_dense_interleaved_bf16_matvec_bf16_3072",
+    .packed_batch_bf16_3072 = "antfly_dense_interleaved_bf16_matvec_batch_bf16_3072",
+    .segmented_bf16_2304 = "antfly_dense_interleaved_bf16_segmented_matvec_bf16_2304",
+    .pack_shortlist = "antfly_pack_q4_projection_bounds_2304",
+    .quantize_shortlist = "antfly_quantize_q8_projection_bounds_2304",
+    .shortlist_bounds = "antfly_q4_q8_projection_upper_bounds_2304",
+    .shortlist_seed = "antfly_bf16_projection_seed_score_2304",
+    .shortlist_refine = "antfly_bf16_projection_refine_candidates_2304",
+    .greedy_index = "antfly_projection_greedy_index",
+};
+pub const dense_bf16_matvec = nativeProfile("dense_bf16_matvec", "dense_bf16_matvec.ptx", "dense_bf16_matvec.cu", 80, dense_bf16_matvec_entries, &.{ "--fmad=false", "-std=c++17" });
+pub const block_decoder_bf16_entries = .{
+    .mix_rms = "antfly_weighted_four_rows_rms_bf16",
+    .add_rms = "antfly_residual_add_rms_bf16",
+    .rope = "antfly_head_rms_neox_rope_d128_bf16",
+    .swiglu = "antfly_swiglu_separate_bf16",
+    .attention = "antfly_bshd_block_gqa_d128_bf16",
+    .recurrent = "antfly_low_rank_recurrent_gate_bf16",
+    .argmax_tiles = "antfly_softcapped_sum_argmax_bf16_tiles",
+    .target_argmax_tiles = "antfly_softcapped_argmax_rows_f32_tiles",
+    .argmax_merge = "antfly_argmax_merge_tiles_f32",
+};
+pub const block_decoder_bf16 = nativeProfile("block_decoder_bf16", "block_decoder_bf16.ptx", "block_decoder_bf16.cu", 80, block_decoder_bf16_entries, &.{ "--fmad=false", "-std=c++17" });
+
+pub const profiles = [_]Profile{ attention, encoder } ++ gelu ++ residual ++ top1 ++ [_]Profile{ activation_bf16, paged_attention_bf16, gated_delta, vision_projection_bf16, encoder_decoder_f16, row_selection_stats_f32, routed_block_scaled_projection, paged_relative_attention, causal_depthwise4_bf16, head_norm_bf16, residual_block_mix, patch_transformer, routed_block_scaled_matvec, dense_bf16_matvec, block_decoder_bf16 };

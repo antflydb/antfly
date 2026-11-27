@@ -16,6 +16,7 @@
 //! Target-owned descriptor execution and storage hooks. A backend installs
 //! its own table as a unit; deriving other compute operations from a native
 //! table never inherits native tensor casts into a device implementation.
+const ops = @import("ops.zig");
 const CT = @import("../graph/backend_contracts.zig").CT;
 const kernel_descriptor = @import("kernel_descriptor.zig");
 const physical_storage = @import("physical_storage.zig");
@@ -33,10 +34,24 @@ pub const OwnedPayloadServices = struct {
 /// caller's already admitted ordinary cache destination; it creates no slot
 /// authority or physical-storage credit.
 pub const ProjectionMode = enum { query, apply };
+/// Receiver-owned, append-only cache banks. The decoder has already matched
+/// the position to its committed prefix and reserved both banks.
+pub const QkvCacheRow = struct {
+    keys: CT,
+    values: CT,
+    position: usize,
+    capacity: usize,
+};
 pub const DenseDecoderServices = struct {
     available: *const fn (*anyopaque) bool,
+    weight_access: enum { shared, acquired } = .shared,
     heldWeightF32: *const fn (*anyopaque, *const anyopaque, CT, ?[]const u8) anyerror!@import("../execution/storage_ownership.zig").Plane,
+    hasPackedQkv: ?*const fn (*anyopaque, [3]usize, usize) anyerror!bool = null,
+    prepareEmbeddingF32: ?*const fn (*anyopaque, *const anyopaque, CT) anyerror!bool = null,
     projectionInto: *const fn (*anyopaque, *const kernel_descriptor.Descriptor, []const CT, CT, ProjectionMode) anyerror!bool,
+    /// Optional query storage is borrowed, or null to allocate just the query.
+    /// K/V are written directly into the specified row of the cache banks.
+    projectionQkvCacheRow: ?*const fn (*anyopaque, *const ops.DecoderRuntimeApplyLinearQkvRequest, QkvCacheRow, ?CT) anyerror!?CT = null,
 };
 pub const VTable = struct {
     /// Canonical full compute-table identity. Copying ordinary math callbacks
@@ -92,7 +107,7 @@ pub const VTable = struct {
     createHostInput: ?*const fn (*anyopaque, @import("../execution/host_ingress.zig").Create) anyerror!?@import("../execution/host_ingress.zig").Upload = null,
     /// Exact optional host staging and synchronous initialization, before literal
     /// publication. Null retains the original compatibility workspace floor.
-    physicalLiteralInitializer: ?*const fn (*anyopaque, usize) anyerror!?physical_storage.LiteralInitializer = null,
+    physicalLiteralInitializer: ?*const fn (*anyopaque, @import("ml").graph.DType, usize) anyerror!?physical_storage.LiteralInitializer = null,
     validatePhysicalIndexInput: ?*const fn (ctx: *anyopaque, source: CT, extent: usize) anyerror!void = null,
     copyPhysicalIndexInput: ?*const fn (ctx: *anyopaque, destination: CT, source: CT) anyerror!void = null,
     copyPhysicalInput: ?*const fn (ctx: *anyopaque, destination: CT, source: CT) anyerror!void = null,
@@ -119,7 +134,9 @@ pub const VTable = struct {
     prepareKernelRoute: ?*const fn (*anyopaque, @import("../execution/kernel_route.zig").Prepare) anyerror!?@import("../execution/kernel_route.zig").Owned = null,
     runAssignedKernel: ?*const fn (ctx: *anyopaque, request: kernel_descriptor.Invocation) anyerror!bool = null,
     createPhysicalCompletion: ?*const fn (ctx: *anyopaque) anyerror!physical_storage.Completion = null,
-    readFloat32Into: ?*const fn (ctx: *anyopaque, tensor: CT, output: []f32) anyerror!bool = null,
+    /// Read a whole F32 tensor (null) or an element range into caller storage.
+    /// False leaves the slice untouched.
+    readFloat32Into: ?*const fn (ctx: *anyopaque, tensor: CT, offset: ?usize, output: []f32) anyerror!bool = null,
     /// Metadata-only gate for borrowing shared literals in this invocation.
     /// Metal declines foreign active frames whose quota lifetime is unowned.
     physicalLiteralBindingSupported: ?*const fn (ctx: *anyopaque) bool = null,
@@ -128,9 +145,16 @@ pub const VTable = struct {
     retainImmutableTensor: ?*const fn (ctx: *anyopaque, tensor: CT) anyerror!?CT = null,
     /// Whole provider-owned output that can outlive its publishing invocation.
     standaloneOutputBytes: ?*const fn (ctx: *anyopaque, tensor: CT) ?usize = null,
-    /// Pack whole dense device tensors into an already admitted destination.
-    gatherDeviceRows: ?*const fn (ctx: *anyopaque, output: CT, sources: []const CT) anyerror!void = null,
+
+    /// Pack unrelated columns in one submission. False declines before
+    /// submission. Callers keep every referenced tensor through completion.
+    gatherDeviceColumns: ?*const fn (ctx: *anyopaque, columns: []const DeviceRowColumn) anyerror!bool = null,
     /// Borrow the exact physical bank kept alive by retainImmutableTensor.
     /// A live view prevents the frame from reusing this bank.
     pooledOutputStorage: ?*const fn (ctx: *anyopaque, tensor: CT) ?*const physical_storage.Lease = null,
+
+    pub const DeviceRowColumn = struct {
+        output: CT,
+        sources: []const CT,
+    };
 };

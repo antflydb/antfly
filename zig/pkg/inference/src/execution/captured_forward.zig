@@ -128,6 +128,7 @@ const Entry = struct {
     }
     fn weightShape(context: ?*anyopaque, allocator: std.mem.Allocator, name: []const u8) anyerror!?@import("ml").graph.Shape {
         const backend: *const ops.ComputeBackend = @ptrCast(@alignCast(context.?));
+        if (comptime @import("build_options").enable_native) if (try @import("../ops/native_compute.zig").NativeCompute.capturePackedWeightShape(backend, name)) |shape| return shape;
         const weight = try backend.getWeight(name);
         defer backend.free(weight);
         const shape = try backend.tensorShape(weight, allocator);
@@ -332,7 +333,14 @@ pub const Cache = struct {
             allocator.destroy(parameters);
         };
     }
-    fn acquire(self: *Cache, allocator: std.mem.Allocator, provider: Provider, forward: capture.Forward, inputs: []const capture.Input, control: ?Control) !*Entry {
+    fn acquire(self: *Cache, allocator: std.mem.Allocator, provider: Provider, requested: capture.Forward, inputs: []const capture.Input, control: ?Control) !*Entry {
+        var forward = requested;
+        if (provider.compiled_context) |context| {
+            // Retain the portable graph for XLA to fuse. The default graph
+            // pass can introduce backend operations outside its lowering ABI.
+            if (context.requested_backend == .pjrt and forward.optimization == .general)
+                forward.optimization = .provider_fusion;
+        }
         // Precision belongs to the program specialization, not model/provider
         // identity: F32 task heads can follow a BF16 encoder on one client.
         if (provider.compiled_context) |context| if (context.requested_backend == .pjrt and context.pjrt_precision != forward.precision) return error.ModelProgramPrecisionMismatch;
@@ -412,10 +420,12 @@ pub const Cache = struct {
         defer entry.returnFrame(frame);
         frame.backend.execution_control = control;
         defer frame.backend.execution_control = null;
-        const values = try allocator.alloc(?ops.CT, entry.program.graph.nodeCount());
-        defer allocator.free(values);
-        @memset(values, null);
-        defer for (values) |value| if (value) |tensor| frame.backend.free(tensor);
+        const Operand = @import("../graph/pjrt_executor.zig").ResidentOperand;
+        var local: [8]Operand = undefined;
+        const values = if (inputs.len <= local.len) local[0..inputs.len] else try allocator.alloc(Operand, inputs.len);
+        defer if (inputs.len > local.len) allocator.free(values);
+        var value_count: usize = 0;
+        defer for (values[0..value_count]) |operand| frame.backend.free(operand.value);
         for (inputs) |input| {
             for (entry.program.bindings) |binding| {
                 if (binding.kind != .input or !std.mem.eql(u8, binding.name, input.tensor.name) or binding.node_id == @import("ml").graph.null_node) continue;
@@ -429,7 +439,12 @@ pub const Cache = struct {
                     }
                 } else false;
                 if (!required) continue;
-                values[binding.node_id] = try provider.import(provider.context, &frame.backend, &input.tensor, allocator);
+                values[value_count] = .{
+                    .node = binding.node_id,
+                    .value = try provider.import(provider.context, &frame.backend, &input.tensor, allocator),
+                };
+                value_count += 1;
+                break;
             }
         }
         var rows: usize = 0;
@@ -450,16 +465,22 @@ pub const Cache = struct {
         errdefer allocator.free(outputs);
         const shape = try allocator.dupe(i64, entry.resident.?.output_shapes[0]);
         errdefer allocator.free(shape);
-        const data = try state.run(entry.resident.?, &frame.backend, values, rows, valid_rows, allocator, control);
+        const data = try state.run(entry.resident.?, &frame.backend, values[0..value_count], rows, valid_rows, allocator, control);
         outputs[0] = .{ .data = std.mem.sliceAsBytes(data), .dtype = .f32, .shape = shape, .name = output_names[0], .allocator = allocator, .owns_data = true, .owns_shape = true, .data_alignment = .of(f32) };
         return outputs;
     }
 
+    pub const ReplayPolicy = enum { allow_eager, require_admission };
+
     pub fn runDevice(self: *Cache, model_allocator: std.mem.Allocator, provider: Provider, forward: capture.Forward, inputs: []const capture.Input, allocator: std.mem.Allocator, control: ?Control) !DeviceResult {
-        return self.runDeviceWithReadbacks(model_allocator, provider, forward, inputs, allocator, control, .forbidden);
+        return self.runDeviceWithReplayPolicy(model_allocator, provider, forward, inputs, allocator, control, .allow_eager);
     }
 
-    fn runDeviceWithReadbacks(self: *Cache, model_allocator: std.mem.Allocator, provider: Provider, forward: capture.Forward, inputs: []const capture.Input, allocator: std.mem.Allocator, control: ?Control, readbacks: @FieldType(interpreter.ExecuteOptions, "activation_readbacks")) !DeviceResult {
+    pub fn runDeviceWithReplayPolicy(self: *Cache, model_allocator: std.mem.Allocator, provider: Provider, forward: capture.Forward, inputs: []const capture.Input, allocator: std.mem.Allocator, control: ?Control, replay: ReplayPolicy) !DeviceResult {
+        return self.runDeviceWithReadbacks(model_allocator, provider, forward, inputs, allocator, control, .forbidden, replay);
+    }
+
+    fn runDeviceWithReadbacks(self: *Cache, model_allocator: std.mem.Allocator, provider: Provider, forward: capture.Forward, inputs: []const capture.Input, allocator: std.mem.Allocator, control: ?Control, readbacks: @FieldType(interpreter.ExecuteOptions, "activation_readbacks"), replay: ReplayPolicy) !DeviceResult {
         if (control) |active| try active.check();
         for (inputs) |input| {
             _ = try input.shape();
@@ -527,7 +548,7 @@ pub const Cache = struct {
             .reprepare => return error.PreparedRegionBindingChanged,
             .ready => |claims| region_claims = claims,
         };
-        var result = try frame_executable.run(allocator, .{ .runtime_inputs = runtime_inputs.items, .prepared_routes = routes, .region_claims = if (region_claims) |*claims| claims else null, .execution_control = control, .output_placement = .producer, .strict_integer_constants = true, .activation_readbacks = readbacks });
+        var result = try frame_executable.run(allocator, .{ .runtime_inputs = runtime_inputs.items, .prepared_routes = routes, .region_claims = if (region_claims) |*claims| claims else null, .execution_control = control, .output_placement = .producer, .strict_integer_constants = true, .activation_readbacks = readbacks, .require_physical_replay_admission = replay == .require_admission });
         errdefer result.deinit(&frame_executable.runtime);
         if (control) |active| try active.check();
         return .{ .entry = entry, .frame = frame, .result = result };
@@ -553,7 +574,7 @@ pub const Cache = struct {
     };
 
     pub fn run(self: *Cache, model_allocator: std.mem.Allocator, provider: Provider, forward: capture.Forward, inputs: []const capture.Input, allocator: std.mem.Allocator, control: ?Control) ![]Tensor {
-        var held = try self.runDeviceWithReadbacks(model_allocator, provider, forward, inputs, allocator, control, .allowed);
+        var held = try self.runDeviceWithReadbacks(model_allocator, provider, forward, inputs, allocator, control, .allowed, .allow_eager);
         defer held.deinit();
         const entry = held.entry;
         const frame_executable = &held.frame.executable.?;
@@ -660,7 +681,7 @@ const TestProvider = struct {
         var foreign = provider;
         foreign.context = @ptrFromInt(1);
         try std.testing.expectError(error.ForeignModelProgramProvider, cache.run(a, foreign, frontend, &declared, a, null));
-        if (@import("build_options").enable_pjrt and client != null) {
+        if (comptime @import("build_options").enable_pjrt) if (client != null) {
             var second_program = frontend;
             second_program.fingerprint = 1;
             const outputs = try cache.run(a, provider, second_program, &declared, a, null);
@@ -679,7 +700,7 @@ const TestProvider = struct {
             try std.testing.expectEqual(@as(u64, 3), cache.entries.stats.builds);
             try std.testing.expectEqual(@as(usize, 2), cache.parameters.?.uploads);
             try std.testing.expectError(error.ModelProgramPrecisionMismatch, cache.run(a, bf16_provider, frontend, &declared, a, null));
-        }
+        };
         const entry = cache.entries.entries.items[0];
         const first = try entry.acquireFrame();
         defer entry.returnFrame(first);
@@ -1151,6 +1172,7 @@ test "device program cache keeps current inputs and pins output frames across ev
         const value = try origin.fromFloat32Shape(&values, &.{ 2, 3 });
         defer origin.free(value);
         const inputs = [_]capture.Input{.{ .tensor = .{ .name = "input", .data = &.{}, .dtype = .f32, .shape = &shape, .allocator = a, .owns_data = false, .owns_shape = false }, .resident = .{ .backend = &origin, .value = value } }};
+        try std.testing.expectError(error.PhysicalReplayUnavailableBeforeSubmission, cache.runDeviceWithReplayPolicy(a, provider, forward, &inputs, a, null, .require_admission));
         var held = try cache.runDevice(a, provider, forward, &inputs, a, null);
         defer held.deinit();
         try std.testing.expectEqual(@as(usize, 1), cache.specializationCount());

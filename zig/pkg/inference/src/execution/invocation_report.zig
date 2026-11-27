@@ -22,6 +22,8 @@ pub const Report = struct {
     schema_version: u8 = 1,
     stage_placement: ?@import("diagnostics.zig").StagePlacement = null,
     decoder_route: ?@import("diagnostics.zig").DecoderRoute = null,
+    planned_prefill: ?@import("diagnostics.zig").PrefillGeometry = null,
+    prefill_progress: ?@import("diagnostics.zig").PrefillProgress = null,
     operation: []const u8,
     publication_scope: []const u8,
     synchronous_interval: enum { invocation_body, pending_phase_only } = .invocation_body,
@@ -40,6 +42,9 @@ pub const Report = struct {
     program_failure: ?@import("runtime_observation.zig").FailureText = null,
     transfers: ?@import("transfer_audit.zig").Measurements = null,
     transfers_scope: enum { unavailable, invocation_submitting_thread, last_program_only } = .unavailable,
+    /// Physical Frame route counters overlap submitting-thread I/O. The
+    /// two observations carry independent scopes and must not be summed.
+    assigned_frame_copies: ?AssignedFrameCopies = null,
     implementation_entries: ?@import("runtime_observation.zig").Entries = null,
     native_assigned_dispatches: ?u64 = null,
     metal_encoded_dispatches: ?u64 = null,
@@ -48,6 +53,10 @@ pub const Report = struct {
     metal_command_waits: ?u64 = null,
     /// Actual accepted driver API/topology units, not completed device kernels.
     cuda: ?runtime.Cuda = null,
+    cuda_audio: ?@import("runtime_observation.zig").CudaAudio = null,
+    /// CUDA wait API returns observed on this invocation's submitting thread.
+    /// The backend-context interval above is a separate, overlapping sample.
+    cuda_host_waits: ?@import("runtime_observation.zig").CudaHostWaits = null,
     cuda_periodic_workspace: ?runtime.PeriodicWorkspace = null,
     resolved_project_cuda_launches: ?@import("runtime_observation.zig").Kernels = null,
     resolved_project_metal_dispatches: ?@import("runtime_observation.zig").MetalDispatches = null,
@@ -106,6 +115,9 @@ pub const Report = struct {
     payload_admission_coverage: ?PayloadAdmissionCoverage = null,
     metal_region_policy: ?MetalRegionPolicy = null,
     metal_serial_workspace: ?@import("runtime_observation.zig").SerialWorkspaceObservation = null,
+    cuda_audio_workspace: ?@import("runtime_observation.zig").CudaAudioWorkspace = null,
+    cuda_decoder_workspace: ?@import("runtime_observation.zig").CudaDecoderWorkspace = null,
+    cuda_decoder_declines: ?@import("runtime_observation.zig").CudaDecoderDeclines = null,
     /// Available from the corresponding successfully published physical Frame.
     assigned_regions: ?@import("stats.zig").AssignedRegions = null,
     owned_program_fallbacks: ?ProgramFallbacks = null,
@@ -135,9 +147,14 @@ pub const Report = struct {
         report.pending_interval = value.pending_interval;
         report.stage_placement = value.stage_placement;
         report.decoder_route = value.decoder_route;
+        report.planned_prefill = value.planned_prefill;
+        report.prefill_progress = value.prefill_progress;
         report.device_memory = value.runtime.device_memory;
         report.cuda_periodic_workspace = value.runtime.cuda_periodic_workspace;
         report.metal_serial_workspace = value.runtime.metal_serial_workspace;
+        report.cuda_audio_workspace = value.runtime.cuda_audio_workspace;
+        report.cuda_decoder_workspace = value.runtime.cuda_decoder_workspace;
+        report.cuda_decoder_declines = value.runtime.cuda_decoder_declines;
         if (value.pending_interval != null) report.synchronous_interval = .pending_phase_only;
         if (value.error_name) |failure| report.failure = @import("runtime_observation.zig").FailureText.init(failure.view());
         if (value.program_error) |failure| {
@@ -151,6 +168,8 @@ pub const Report = struct {
         }
         if (value.runtime.submission) |submission| {
             report.implementation_entries = submission.backend_entries;
+            report.cuda_audio = submission.cuda_audio;
+            report.cuda_host_waits = submission.cuda_host_waits;
             report.native_assigned_dispatches = submission.native_assigned_dispatches;
             report.metal_encoded_dispatches = submission.metal_encoded_dispatches;
             report.metal_vendor_encodes = submission.metal_vendor_encodes;
@@ -172,6 +191,13 @@ pub const Report = struct {
         }
         if (value.runtime.device_owners) |owners| report.retained_device_owner_count = owners.owners;
         if (value.execution) |program| {
+            if (program.physical_frame_observed) report.assigned_frame_copies = .{
+                .partition_transfers = program.physical_transfer_dispatches,
+                .partition_transfer_bytes = program.physical_transfer_bytes,
+                .partition_transfer_declines = program.physical_transfer_declines,
+                .bound_input_copies = program.physical_input_copies,
+                .bound_input_copy_bytes = program.physical_input_copy_bytes,
+            };
             if (program.prepared_payload_coverage) |coverage| report.payload_admission_coverage = .{ .scope = .corresponding_program_last_finished_frame_prepared_metadata, .value = coverage };
             if (program.metal_region_policy_observed) report.metal_region_policy = MetalRegionPolicy.init(program);
             report.assigned_regions = program.assigned_regions;
@@ -190,8 +216,8 @@ pub const Report = struct {
                 report.program_workspace = owned.workspace;
                 report.program_host_workspace = owned.host_workspace;
             }
-            if (report.transfers == null) {
-                report.transfers = .{ .upload_calls = program.actual_upload_calls, .upload_bytes = program.actual_upload_bytes, .download_calls = program.actual_download_calls, .download_bytes = program.actual_download_bytes, .host_accesses = program.device_host_accesses, .host_access_bytes = program.device_host_access_bytes, .index_metadata_host_accesses = program.index_metadata_host_accesses, .index_metadata_host_access_bytes = program.index_metadata_host_access_bytes };
+            if (report.transfers == null and program.actual_device_copy_calls != null) {
+                report.transfers = .{ .upload_calls = program.actual_upload_calls, .upload_bytes = program.actual_upload_bytes, .download_calls = program.actual_download_calls, .download_bytes = program.actual_download_bytes, .device_copy_calls = program.actual_device_copy_calls, .device_copy_bytes = program.actual_device_copy_bytes, .host_accesses = program.device_host_accesses, .host_access_bytes = program.device_host_access_bytes, .index_metadata_host_accesses = program.index_metadata_host_accesses, .index_metadata_host_access_bytes = program.index_metadata_host_access_bytes };
                 report.transfers_scope = .last_program_only;
             }
         }
@@ -217,6 +243,15 @@ pub const Report = struct {
         }
         return report;
     }
+};
+
+pub const AssignedFrameCopies = struct {
+    scope: enum { corresponding_program_physical_frame_publication } = .corresponding_program_physical_frame_publication,
+    partition_transfers: u64,
+    partition_transfer_bytes: u64,
+    partition_transfer_declines: @import("stats.zig").AssignedTransferDeclines = .{},
+    bound_input_copies: u64,
+    bound_input_copy_bytes: u64,
 };
 
 /// Counts from the corresponding published program's two known output-copy
@@ -345,6 +380,104 @@ test "uniform video owned root values survive producer mutation without independ
     try std.testing.expect(retained.interval_peak_bytes[0] != retained.interval_peak_bytes[1] + retained.interval_peak_bytes[2]);
 }
 
+test "uniform report retains the observed CUDA audio workspace across publication" {
+    const std = @import("std");
+    const observation = @import("runtime_observation.zig");
+    var source = @import("diagnostics.zig").Diagnostics{};
+    source.configure(true);
+    source.publish(.{});
+    try std.testing.expect(source.snapshot().?.report.?.cuda_audio_workspace == null);
+
+    const workspace: observation.CudaAudioWorkspace = .{
+        .route = .replayed,
+        .plan_origin = .observed,
+        .planned_events = 12,
+        .planned_arena_bytes = 4096,
+        .repacked_scratch_savings_bytes = 256,
+        .bound_arena_bytes = 4096,
+        .bound_input_bytes = 512,
+        .planned_terminal_bytes = 256,
+        .bound_terminal_bytes = 256,
+        .terminal_outside_arena = true,
+    };
+    var scope: observation.KernelScope = undefined;
+    var submission = observation.Scope.init();
+    defer submission.deinit();
+    observation.cudaAudioResult(.learning_host_transfer);
+    scope.begin();
+    observation.cudaAudioWorkspace(workspace);
+    _ = scope.finish();
+    var sample: runtime.Snapshot = .{};
+    sample.recordKernelInterval(&scope);
+    var interval = sample.since(.{});
+    interval.submission = submission.snapshot();
+    source.publish(.{ .runtime = interval });
+    try std.testing.expectEqual(workspace, source.snapshot().?.report.?.cuda_audio_workspace.?);
+    try std.testing.expectEqualDeep(observation.CudaAudio{ .learning_host_transfer = 1 }, source.snapshot().?.report.?.cuda_audio.?);
+}
+
+test "uniform report retains bounded CUDA decoder workspace after completed publication" {
+    const std = @import("std");
+    const observation = @import("runtime_observation.zig");
+    var source = @import("diagnostics.zig").Diagnostics{};
+    source.configure(true);
+    source.publish(.{});
+    try std.testing.expect(source.snapshot().?.report.?.cuda_decoder_workspace == null);
+    try std.testing.expect(source.snapshot().?.report.?.cuda_decoder_declines == null);
+    const workspace: observation.CudaDecoderWorkspace = .{
+        .route = .replayed,
+        .plan_origin = .observed,
+        .planned_events = 12,
+        .planned_scratch_bytes = 4096,
+        .bound_scratch_bytes = 4096,
+        .metadata_bytes = 512,
+        .shared_layer_workspace_bytes = 2048,
+        .attention_scratch_bytes = 2048,
+        .head_bytes = 0,
+        .head_packet_rows = 2,
+        .head_in_stream_arena = true,
+        .readback_bytes = 44,
+        .readback_backing = .admitted_pinned,
+        .rows = 2,
+    };
+    var scope: observation.KernelScope = undefined;
+    scope.begin();
+    observation.cudaDecoderDeclined(.missing_kv_binding);
+    var warmed = workspace;
+    warmed.route = .warmed;
+    warmed.plan_origin = null;
+    warmed.planned_events = 0;
+    warmed.planned_scratch_bytes = 0;
+    warmed.bound_scratch_bytes = 0;
+    warmed.head_in_stream_arena = false;
+    observation.cudaDecoderWorkspace(warmed);
+    try std.testing.expectEqual(@as(u64, 1), scope.cuda_decoder_workspace.?.eager_bursts);
+    try std.testing.expect(scope.cuda_decoder_workspace.?.plan_origin == null);
+    var recorded = workspace;
+    recorded.route = .recorded_and_launched;
+    observation.cudaDecoderWorkspace(recorded);
+    {
+        var nested: observation.KernelScope = undefined;
+        nested.begin();
+        observation.cudaDecoderDeclined(.admission_or_revalidation);
+        observation.cudaDecoderDeclined(.unbacked_kv_pages);
+        observation.cudaDecoderDeclined(.workspace_admission);
+        observation.cudaDecoderWorkspace(workspace);
+        _ = nested.finish();
+        try std.testing.expectEqual(workspace, nested.cuda_decoder_workspace.?);
+        try std.testing.expectEqualDeep(observation.CudaDecoderDeclines{ .admission_or_revalidation = 1, .unbacked_kv_pages = 1, .workspace_admission = 1 }, nested.cuda_decoder_declines.?);
+    }
+    _ = scope.finish();
+    var sample: runtime.Snapshot = .{};
+    sample.recordKernelInterval(&scope);
+    source.publish(.{ .runtime = sample.since(.{}) });
+    var expected = workspace;
+    expected.completed_bursts = 3;
+    expected.eager_bursts = 1;
+    try std.testing.expectEqual(expected, source.snapshot().?.report.?.cuda_decoder_workspace.?);
+    try std.testing.expectEqualDeep(observation.CudaDecoderDeclines{ .missing_kv_binding = 1, .admission_or_revalidation = 1, .unbacked_kv_pages = 1, .workspace_admission = 1 }, source.snapshot().?.report.?.cuda_decoder_declines.?);
+}
+
 test "uniform report separates planned literal publication from opaque Metal output copies" {
     const std = @import("std");
     var source = @import("diagnostics.zig").Diagnostics{};
@@ -412,4 +545,44 @@ test "coverage publication preserves absence and corresponding program precedenc
     try std.testing.expectEqual(.latest_entered_native_call_prepared_metadata, native.payload_admission_coverage.?.scope);
     try std.testing.expectEqual(@as(u64, 19), native.payload_admission_coverage.?.value.complete.epoch);
     try std.testing.expectEqual(@import("owned_coverage.zig").Reason.alias, program.payload_admission_coverage.?.value.compatibility);
+}
+
+test "program transfers retain audited device copy counts and distinguish unavailable samples" {
+    const std = @import("std");
+    var diagnostics = @import("diagnostics.zig").Diagnostics{};
+    diagnostics.configure(true);
+    var program: @import("stats.zig").ExecutionStats = .{};
+    diagnostics.publish(.{ .execution = program });
+    try std.testing.expect(diagnostics.snapshot().?.report.?.transfers == null);
+    try std.testing.expect(diagnostics.snapshot().?.report.?.assigned_frame_copies == null);
+    program.physical_frame_observed = true;
+    diagnostics.publish(.{ .execution = program });
+    try std.testing.expectEqual(@as(u64, 0), diagnostics.snapshot().?.report.?.assigned_frame_copies.?.partition_transfers);
+    var audit = @import("transfer_audit.zig").Audit{};
+    audit.recordStats(&program);
+    diagnostics.publish(.{ .execution = program });
+    try std.testing.expectEqual(@as(?u64, 0), diagnostics.snapshot().?.report.?.transfers.?.device_copy_calls);
+    try @import("transfer_audit.zig").begin(&audit);
+    @import("transfer_audit.zig").deviceCopy(64);
+    @import("transfer_audit.zig").deviceCopy(16);
+    @import("transfer_audit.zig").end();
+    audit.recordStats(&program);
+    diagnostics.publish(.{ .execution = program });
+    const report = diagnostics.snapshot().?.report.?;
+    try std.testing.expectEqual(.last_program_only, report.transfers_scope);
+    try std.testing.expectEqual(@as(?u64, 2), report.transfers.?.device_copy_calls);
+    try std.testing.expectEqual(@as(?u64, 80), report.transfers.?.device_copy_bytes);
+
+    program.physical_transfer_dispatches = 2;
+    program.physical_transfer_bytes = 40;
+    program.physical_transfer_declines.destination_held = 1;
+    program.physical_input_copies = 1;
+    program.physical_input_copy_bytes = 16;
+    diagnostics.publish(.{ .execution = program });
+    const counts = diagnostics.snapshot().?.report.?.assigned_frame_copies.?;
+    try std.testing.expectEqual(@as(u64, 2), counts.partition_transfers);
+    try std.testing.expectEqual(@as(u64, 40), counts.partition_transfer_bytes);
+    try std.testing.expectEqual(@as(u64, 1), counts.partition_transfer_declines.destination_held);
+    try std.testing.expectEqual(@as(u64, 1), counts.bound_input_copies);
+    try std.testing.expectEqual(@as(u64, 16), counts.bound_input_copy_bytes);
 }

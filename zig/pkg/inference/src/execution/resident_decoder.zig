@@ -251,7 +251,7 @@ pub const Decoder = struct {
         return .{ .allocator = a, .source = source, .config = .{}, .encoder_decoder_config = cfg, .encoder_rows = encoder_rows, .capacity = cfg.max_target_positions, .limit = cfg.max_target_positions, .bank_bytes = bytes, .reservation = reservation, .control = control };
     }
 
-    pub fn encoderDecoderSuffix(self: *Decoder, suffix: @import("decoder_position.zig").Suffix, encoder: Tensor, mask: []const i64, a: std.mem.Allocator, control: ?Control) ![]f32 {
+    pub fn encoderDecoderSuffix(self: *Decoder, suffix: @import("decoder_position.zig").Suffix, encoder: Tensor, mask: []const i64, a: std.mem.Allocator, control: ?Control) !Tensor {
         if (self.failed) return error.DecoderRequestFailed;
         const cfg = self.encoder_decoder_config orelse return error.UnsupportedResidentDecode;
         const end = suffix.endAt(self.position) catch return error.InvalidResidentDecodePosition;
@@ -267,24 +267,25 @@ pub const Decoder = struct {
         // Language detection can expose several already-known forced tokens.
         // Submit the complete new suffix; never drop those intermediate rows.
         const ids = suffix.tokens;
-        var staging = try self.source.withAdmissionControl(control).admitRetainedMedia(try std.math.add(usize, try std.math.mul(usize, ids.len, 3 * @sizeOf(i64)), try std.math.add(usize, try std.math.mul(usize, mask.len, @sizeOf(i64)), 6 * @sizeOf(i64))), 0);
-        defer staging.deinit();
-        const positions = try a.alloc(i64, ids.len);
-        defer a.free(positions);
+        var local: [16]i64 = undefined;
+        var staging = try InputStaging.init(self.source, a, &local, ids.len, control);
+        defer staging.deinit(a);
+        const positions = staging.values;
         for (positions, 0..) |*position, index| position.* = @intCast(self.position + index);
-        var input = try Tensor.initInt64(a, "input_ids", &.{ 1, @intCast(ids.len) }, ids);
-        defer input.deinit();
-        var pos = try Tensor.initInt64(a, "position_ids", input.shape, positions);
-        defer pos.deinit();
-        var attention = try Tensor.initInt64(a, "encoder_attention_mask", &.{ 1, @intCast(mask.len) }, mask);
-        defer attention.deinit();
+        const suffix_shape = [_]i64{ 1, @intCast(ids.len) };
+        const mask_shape = [_]i64{ 1, @intCast(mask.len) };
+        const input = Tensor.borrowInt64(a, "input_ids", &suffix_shape, ids);
+        const pos = Tensor.borrowInt64(a, "position_ids", &suffix_shape, positions);
+        const attention = Tensor.borrowInt64(a, "encoder_attention_mask", &mask_shape, mask);
         const hidden = encoder.borrowedView("encoder_hidden_states");
         if (hidden.dtype != .f32 or hidden.shape.len != 3 or hidden.shape[0] != 1 or hidden.shape[1] != self.encoder_rows or hidden.shape[2] != cfg.d_model) return error.InvalidInputShape;
         const outputs = try self.run(&.{ input, pos, hidden, attention }, a, control);
         defer a.free(outputs);
-        defer for (outputs) |*output| output.deinit();
-        if (outputs.len != 1 or outputs[0].asFloat32().len != cfg.vocab_size) return error.InvalidResidentDecoderOutput;
-        return a.dupe(f32, outputs[0].asFloat32());
+        errdefer for (outputs) |*output| output.deinit();
+        const logits_bytes = try std.math.mul(usize, cfg.vocab_size, @sizeOf(f32));
+        if (outputs.len != 1 or outputs[0].dtype != .f32 or outputs[0].data.len != logits_bytes or
+            !outputs[0].isAlignedFor(f32)) return error.InvalidResidentDecoderOutput;
+        return outputs[0];
     }
 
     pub fn deinit(self: *Decoder) void {
@@ -332,8 +333,7 @@ pub const Decoder = struct {
         if (initial and chunk != 0) {
             var end = @min(chunk, history.len);
             while (end < history.len) {
-                const intermediate = try self.appendText(history[0..end], false, a, control);
-                a.free(intermediate);
+                _ = try self.appendText(history[0..end], false, a, control);
                 self.prefill_steps += 1;
                 self.prefill_head_skips += 1;
                 end += @min(chunk, history.len - end);
@@ -351,48 +351,66 @@ pub const Decoder = struct {
         defer self.prefill_only = false;
         const ids = history[self.position..];
         const rows = try boundedPrefillRows(ids.len, self.capacity - self.position, self.config.max_position_embeddings, causalQueryLimit(self.source));
-        // These copies precede per-step admission, so retain their real host
-        // charge until the complete synchronous invocation has finished.
-        var staging_bytes = try std.math.mul(usize, rows, 2 * @sizeOf(i64));
-        if (self.axis_positions and self.position != 0) staging_bytes = try std.math.add(usize, staging_bytes, try std.math.mul(usize, rows, 6 * @sizeOf(i64)));
-        if (self.position == 0 or ids.len > 1) staging_bytes = try std.math.add(usize, staging_bytes, @sizeOf(i64));
-        var staging = try self.source.withAdmissionControl(control).admitRetainedMedia(staging_bytes, 0);
-        defer staging.deinit();
-        const padded = if (rows != ids.len) try a.alloc(i64, rows) else null;
-        defer if (padded) |values| a.free(values);
+        const padded_count: usize = if (rows != ids.len) rows else 0;
+        const position_count = if (self.axis_positions and self.position != 0) try std.math.mul(usize, rows, 3) else 0;
+        // Only the two optional, invocation-owned arrays consume staging
+        // quota. Caller history and stack operands are borrowed synchronously.
+        const staging_elements = try std.math.add(usize, padded_count, position_count);
+        var local: [16]i64 = undefined;
+        var staging = try InputStaging.init(self.source, a, &local, staging_elements, control);
+        defer staging.deinit(a);
+        const padded = if (padded_count != 0) staging.values[0..padded_count] else null;
         if (padded) |values| {
             @memcpy(values[0..ids.len], ids);
             @memset(values[ids.len..], 0);
         }
-        var input = try Tensor.initInt64(a, "input_ids", &.{ 1, @intCast(rows) }, padded orelse ids);
-        defer input.deinit();
-        var logits_row: ?Tensor = if (self.position == 0 or ids.len > 1) try Tensor.initInt64(a, "logits_row", &.{1}, &.{@intCast(ids.len - 1)}) else null;
-        defer if (logits_row) |*tensor| tensor.deinit();
-        var positions: ?Tensor = null;
-        defer if (positions) |*tensor| tensor.deinit();
-        if (self.axis_positions and self.position != 0) {
-            const values = try a.alloc(i64, try std.math.mul(usize, rows, 3));
-            defer a.free(values);
+        const input_shape = [_]i64{ 1, @intCast(rows) };
+        const position_shape = [_]i64{ 3, @intCast(rows) };
+        const logits_row = [_]i64{@intCast(ids.len - 1)};
+        const positions = if (position_count != 0) staging.values[padded_count..] else null;
+        var declared: [3]Tensor = undefined;
+        declared[0] = Tensor.borrowInt64(a, "input_ids", &input_shape, padded orelse ids);
+        var count: usize = 1;
+        if (positions) |values| {
             for (0..3) |axis| for (0..rows) |row| {
                 values[axis * rows + row] = try std.math.add(i64, @intCast(self.position + row), self.position_delta);
             };
-            positions = try Tensor.initInt64(a, "position_ids", &.{ 3, @intCast(rows) }, values);
-        }
-        var declared: [3]Tensor = undefined;
-        declared[0] = input;
-        var count: usize = 1;
-        if (positions) |tensor| {
-            declared[count] = tensor;
+            declared[count] = Tensor.borrowInt64(a, "position_ids", &position_shape, values);
             count += 1;
         }
-        if (logits_row) |tensor| {
-            declared[count] = tensor;
+        if (self.position == 0 or ids.len > 1) {
+            declared[count] = Tensor.borrowInt64(a, "logits_row", &.{1}, &logits_row);
             count += 1;
         }
         const outputs = try self.run(declared[0..count], a, control);
         defer a.free(outputs);
         defer for (outputs) |*output| output.deinit();
-        return a.dupe(f32, outputs[0].asFloat32());
+        if (!publish_logits) return &.{};
+        if (outputs.len != 1 or outputs[0].dtype != .f32 or outputs[0].data.len % @sizeOf(f32) != 0 or
+            !outputs[0].isAlignedFor(f32)) return error.InvalidResidentDecoderOutput;
+        return outputs[0].takeOrCopyFloat32(a);
+    }
+};
+
+/// A synchronous decoder call may borrow small operands from its caller's
+/// stack. Larger suffixes use one admitted allocation for all operands.
+const InputStaging = struct {
+    values: []i64,
+    permit: ?@import("../backends/session.zig").RunPermit = null,
+
+    fn init(source: Session, allocator: std.mem.Allocator, local: []i64, count: usize, control: ?Control) !InputStaging {
+        if (count <= local.len) return .{ .values = local[0..count] };
+        const bytes = try std.math.mul(usize, count, @sizeOf(i64));
+        var permit = try source.withAdmissionControl(control).admitRetainedMedia(bytes, 0);
+        errdefer permit.deinit();
+        return .{ .values = try allocator.alloc(i64, count), .permit = permit };
+    }
+
+    fn deinit(self: *InputStaging, allocator: std.mem.Allocator) void {
+        if (self.permit) |*permit| {
+            allocator.free(self.values);
+            permit.deinit();
+        }
     }
 };
 
@@ -708,6 +726,9 @@ test "resident encoder decoder accepts forced prompt suffixes and rejects immuta
     const fixture = @import("testing/incremental_encoder_decoder.zig");
     const Probe = struct {
         calls: usize = 0,
+        last_logits: ?[*]const u8 = null,
+        history: []const i64,
+        mask: []const i64,
         fn backend(_: *anyopaque) @import("../backends/backends.zig").BackendType {
             return .pjrt;
         }
@@ -727,6 +748,8 @@ test "resident encoder decoder accepts forced prompt suffixes and rejects immuta
             const lengths = [_]usize{ 1, 2, 1 };
             try std.testing.expectEqual(starts[self.calls], state.position);
             try std.testing.expectEqual(lengths[self.calls], inputs[0].asInt64().len);
+            try std.testing.expectEqual(self.history[state.position..].ptr, inputs[0].asInt64().ptr);
+            try std.testing.expectEqual(self.mask.ptr, inputs[3].asInt64().ptr);
             for (inputs[0].asInt64(), inputs[1].asInt64(), 0..) |token, position, index| {
                 try std.testing.expectEqual(@as(i64, @intCast(state.position + index)), token);
                 try std.testing.expectEqual(token, position);
@@ -734,25 +757,28 @@ test "resident encoder decoder accepts forced prompt suffixes and rejects immuta
             const outputs = try a.alloc(Tensor, 1);
             errdefer a.free(outputs);
             outputs[0] = try Tensor.initFloat32(a, "logits", &.{ 1, fixture.config.vocab_size }, &(@as([fixture.config.vocab_size]f32, @splat(0))));
+            self.last_logits = outputs[0].data.ptr;
             state.position += lengths[self.calls];
             self.calls += 1;
             return outputs;
         }
     };
     const a = std.testing.allocator;
-    var probe = Probe{};
+    const history = [_]i64{ 0, 1, 2, 3, 4 };
+    const mask = [_]i64{ 1, 1 };
+    var probe = Probe{ .history = &history, .mask = &mask };
     const session = Session{ .ptr = &probe, .vtable = &.{ .run = Probe.run, .runWithControl = Probe.controlled, .backend = Probe.backend, .inputInfo = Probe.info, .outputInfo = Probe.info, .close = Probe.close, .runCachedDecoder = Probe.cached }, .model_contract = .{ .encoder_decoder_config = &fixture.config, .decoder_cache = .{ .automatic = true } } };
     var decoder = (try Decoder.initEncoderDecoder(a, session, 2, true, .{ .native_call_policy = .in_process })).?;
     defer decoder.deinit();
     var hidden = try Tensor.initFloat32(a, "encoder_hidden_states", &.{ 1, 2, 4 }, &.{ 0, 0, 0, 0, 0, 0, 0, 0 });
     defer hidden.deinit();
-    const history = [_]i64{ 0, 1, 2, 3, 4 };
     for ([_]usize{ 1, 3, 4 }) |length| {
-        const logits = try decoder.encoderDecoderSuffix(.{ .position = decoder.position, .tokens = history[decoder.position..length] }, hidden, &.{ 1, 1 }, a, null);
-        a.free(logits);
+        var logits = try decoder.encoderDecoderSuffix(.{ .position = decoder.position, .tokens = history[decoder.position..length] }, hidden, &mask, a, null);
+        defer logits.deinit();
+        try std.testing.expect(logits.data.ptr == probe.last_logits.?);
     }
     try std.testing.expectEqual(@as(usize, 3), probe.calls);
-    try std.testing.expectError(error.InvalidResidentDecodePosition, decoder.encoderDecoderSuffix(.{ .position = 0, .tokens = history[0..4] }, hidden, &.{ 1, 1 }, a, null));
+    try std.testing.expectError(error.InvalidResidentDecodePosition, decoder.encoderDecoderSuffix(.{ .position = 0, .tokens = history[0..4] }, hidden, &mask, a, null));
     try std.testing.expectError(error.ImmutableEncoderContractChanged, decoder.encoderDecoderSuffix(.{ .position = decoder.position, .tokens = history[decoder.position..] }, hidden, &.{ 1, 0 }, a, null));
     try std.testing.expectEqual(@as(usize, 3), probe.calls);
     try std.testing.expect(decoder.failed);
@@ -762,6 +788,7 @@ test "resident decoder submits bounded physical chunks and consumes every valid 
     if (comptime !enabled) return error.SkipZigTest;
     const Probe = struct {
         calls: usize = 0,
+        logits_pointer: ?[*]const f32 = null,
         fn backend(_: *anyopaque) @import("../backends/backends.zig").BackendType {
             return .pjrt;
         }
@@ -787,6 +814,7 @@ test "resident decoder submits bounded physical chunks and consumes every valid 
             const outputs = try a.alloc(Tensor, 1);
             errdefer a.free(outputs);
             outputs[0] = try Tensor.initFloat32(a, "logits", &.{1}, &.{0});
+            self.logits_pointer = outputs[0].asFloat32().ptr;
             return outputs;
         }
         const table = Session.VTable{ .run = run, .backend = backend, .inputInfo = info, .outputInfo = info, .close = close, .runCachedDecoder = cached };
@@ -802,11 +830,13 @@ test "resident decoder submits bounded physical chunks and consumes every valid 
     for (&ids, 0..) |*v, i| v.* = @intCast(i);
     const prefill = try decoder.text(ids[0..150], a, control);
     defer a.free(prefill);
+    try std.testing.expectEqual(probe.logits_pointer.?, prefill.ptr);
     try std.testing.expectEqual(@as(usize, 150), decoder.position);
     try std.testing.expectEqual(@as(usize, 3), decoder.prefill_steps);
     try std.testing.expectEqual(@as(usize, 2), decoder.prefill_head_skips);
     const decode = try decoder.text(&ids, a, control);
     defer a.free(decode);
+    try std.testing.expectEqual(probe.logits_pointer.?, decode.ptr);
     try std.testing.expectEqual(@as(usize, 151), decoder.position);
     try std.testing.expectEqual(@as(usize, 4), probe.calls);
 }

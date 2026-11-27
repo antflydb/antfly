@@ -888,7 +888,7 @@ Antfly inference:
 - `pkg/inference/src/backends/metal_runtime.zig`
 - `pkg/inference/src/backends/decoder_gated_runtime.zig`
 - `zig/pkg/inference/src/graph/metal_executor.zig`
-- `pkg/inference/src/graph/decode_state_runtime.zig`
+- `pkg/inference/src/execution/decode_state_runtime.zig`
 - `pkg/inference/src/gguf/tensor_types.zig`
 
 Local ggml reference:

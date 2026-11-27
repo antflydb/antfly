@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const tensor_transfer = @import("../execution/tensor_transfer.zig");
 const std = @import("std");
 const ml = @import("ml");
 const build_options = @import("build_options");
@@ -23,7 +24,7 @@ const ops_mod = @import("../ops/ops.zig");
 const interpreter = @import("interpreter.zig");
 const partition_mod = @import("partition.zig");
 const metal_capabilities = @import("metal_capabilities.zig");
-const buffer_plan_mod = @import("buffer_plan.zig");
+const buffer_plan_mod = @import("../execution/buffer_plan.zig");
 const operator_plan_mod = @import("operator_plan.zig");
 const quant_kernel_compiler = @import("quant_kernel_compiler.zig");
 const device_mesh_mod = @import("device_mesh.zig");
@@ -845,8 +846,10 @@ pub fn makeMetalDeviceResident(cb: *const ComputeBackend, tensor: CT) !?CT {
     return metal_compute_mod.MetalCompute.makeDeviceResident(cb, tensor);
 }
 
-fn promoteMetalOutputIfNeeded(cb: *const ComputeBackend, output: ?CT) !?CT {
+fn promoteMetalOutputIfNeeded(cb: *const ComputeBackend, output: ?CT, borrowed: ?CT) !?CT {
     const ct = output orelse return null;
+    if (ct == borrowed) return ct;
+    errdefer cb.free(ct);
     if (isMetalDeviceResident(cb, ct)) return ct;
     if (try makeMetalDeviceResident(cb, ct)) |device_ct| {
         if (device_ct != ct) cb.free(ct);
@@ -865,8 +868,9 @@ const TemporaryMetalResidentValue = struct {
 };
 
 fn temporaryMetalResidentValue(cb: *const ComputeBackend, tensor: CT) !TemporaryMetalResidentValue {
-    if (isMetalDeviceResident(cb, tensor)) return .{ .value = tensor };
-    if (try makeMetalDeviceResident(cb, tensor)) |device_ct| {
+    if (comptime !build_options.enable_metal) return .{ .value = tensor };
+    if (cb.kind() != .metal or metal_compute_mod.MetalCompute.debugHasDeviceTensor(cb, tensor)) return .{ .value = tensor };
+    if (try metal_compute_mod.MetalCompute.makeDeviceResident(cb, tensor)) |device_ct| {
         return .{ .value = device_ct, .owned = device_ct != tensor };
     }
     return .{ .value = tensor };
@@ -1596,54 +1600,121 @@ pub const MetalPartitionExecutor = struct {
     /// Cold canonical-executor proof. The caller owns the actual provider's
     /// metadata operation before touching the cached region plan. This reuses
     /// the plan and reachability authority already used by real execution.
-    pub fn attestOwnedFrameDispatch(actual: *const PartitionExecutor, graph: *const Graph, backend: *const ComputeBackend, nodes: []const NodeId, reachable: []const bool, last_use: []const u32) !bool {
-        if (!ownsPartition(actual, graph, backend) or reachable.len != graph.nodeCount() or last_use.len != graph.nodeCount()) return false;
+    pub fn ownedFrameDispatchDecline(actual: *const PartitionExecutor, graph: *const Graph, backend: *const ComputeBackend, nodes: []const NodeId, reachable: []const bool, last_use: []const u32, required_deferrals: ?*std.array_list.Managed(region_schedule.DeferredProducer)) !?@import("../execution/owned_coverage.zig").Reason {
+        if (!ownsPartition(actual, graph, backend) or reachable.len != graph.nodeCount() or last_use.len != graph.nodeCount()) return .execution_path;
         const self: *MetalPartitionExecutor = @ptrCast(@alignCast(actual.ptr));
+        var saw_dot = false;
+        var transposes: ?std.DynamicBitSetUnmanaged = null;
+        defer if (transposes) |*seen| seen.deinit(self.allocator);
         for (nodes) |id| {
-            if (id >= reachable.len) return false;
+            if (id >= reachable.len) return .execution_path;
             if (!reachable[id]) continue;
             const node = graph.node(id);
-            if (node.output_shape.dtype != .f32) return false;
-            if (node.op == .parameter) continue;
-            if (node.op == .constant) {
-                // The ORIGINAL executor materializes constants before beginFrame.
-                // Only the declared F32 Shared-stage/Private-bank constructor is
-                // eligible; no new kernel or legacy staging credit is implied.
-                const count = node.output_shape.numElements() orelse return false;
-                if (count <= 0 or count > std.math.maxInt(i32) or count != node.op.constant.data_len) return false;
-                const bytes = std.math.mul(usize, @intCast(count), @sizeOf(f32)) catch return false;
-                const functions = backend.vtable.kernels orelse return false;
-                if (!functions.accepts(backend.vtable)) return false;
-                const eligible = functions.physicalLiteralBindingSupported orelse return false;
-                if (!eligible(backend.ptr)) return false;
-                const query = functions.physicalLiteralInitializer orelse return false;
-                const initializer = (try query(backend.ptr, bytes)) orelse return false;
-                if (initializer.staging.byte_size != bytes or initializer.staging.usage != .host_input or initializer.staging.admitted) return false;
+            if (node.op == .parameter) {
+                if (!@import("../execution/host_ingress.zig").rawDType(node.output_shape.dtype)) return .input_representation;
                 continue;
             }
-            // The existing fused families all require a linear, dot or norm.
-            // Keep those families on their tuned owner path until its complete
-            // ingress/output/scratch contract is declared; never disable them.
+            if (node.op == .constant) {
+                // The executor materializes declared constants before beginFrame.
+                // Their typed Shared staging and Private storage are proved here.
+                const count = node.output_shape.numElements() orelse return .literal;
+                if (count <= 0 or count > std.math.maxInt(i32) or count != node.op.constant.data_len) return .literal;
+                const bytes = std.math.mul(usize, @intCast(count), node.output_shape.dtype.byteSize()) catch return .literal;
+                const functions = backend.vtable.kernels orelse return .literal;
+                if (!functions.accepts(backend.vtable)) return .literal;
+                const eligible = functions.physicalLiteralBindingSupported orelse return .literal;
+                if (!eligible(backend.ptr)) return .literal;
+                const query = functions.physicalLiteralInitializer orelse return .literal;
+                const initializer = (try query(backend.ptr, node.output_shape.dtype, bytes)) orelse return .literal;
+                if (initializer.staging.byte_size != bytes or initializer.staging.usage != .host_input or initializer.staging.admitted) return .literal;
+                continue;
+            }
+            // The region and elision checks below guard composite schedules
+            // that use a different owner than a standalone destination kernel.
             // Regular RoPE descriptors derive positions in the shared kernel;
             // the route separately verifies its exact specialized pipeline.
+            // Projection selection likewise pins the concrete slot and
+            // validates its schedule before assigning any destination.
             const descriptor = ops_mod.kernel_descriptor.lower(graph, id);
+            if (node.output_shape.dtype != .f32) {
+                const value = descriptor orelse return .operation;
+                if (!metal_compute_mod.supportsAssignedDescriptor(&value)) return .operation;
+            }
             if (descriptor) |value| switch (value.operation) {
-                .linear, .dot, .norm, .gather => return false,
+                .gather => {
+                    if (value.input_shapes[1].dtype == .f32) {
+                        // F32 indices retain the generated kernel's conversion
+                        // and invalid-row behavior under an exact region owner.
+                        const gather = ops_mod.kernel_descriptor.GatherAddBias.match(graph, id) orelse return .input_representation;
+                        const pending = required_deferrals orelse return .deferred_producer;
+                        try pending.append(.{ .producer = gather.producer, .consumer = id });
+                    }
+                    // Preserve the compatibility gather-after-column-bias
+                    // fusion. Other additions can publish assigned storage.
+                    if (value.input_shapes[1].dtype != .f32 and value.operation.gather.axis == 0 and
+                        ops_mod.kernel_descriptor.MatrixColumnBias.match(graph, node.inputs[0]) != null) return .backend_region;
+                },
+                .dot => {
+                    if (transposes) |seen| if (seen.isSet(node.inputs[1])) continue;
+                    // A terminal standalone dot cannot be subsumed by a
+                    // neighboring projection or grouped head schedule.
+                    if (saw_dot or std.mem.indexOfScalar(NodeId, graph.outputs.items, id) == null) return .backend_region;
+                    for (graph.nodes.items, reachable) |consumer, active| {
+                        if (active and std.mem.indexOfScalar(NodeId, consumer.getInputs(), id) != null) return .backend_region;
+                    }
+                    saw_dot = true;
+                },
                 else => {},
-            } else if (@import("../execution/metadata_alias.zig").Plan.lower(graph, id, .metal) == null) return false;
+            };
             // These exact heuristics run ahead of the physical branch. Even
             // a supported descriptor cannot claim a producer they defer.
-            if (shouldDeferScaleMulForAdd(graph, id, reachable, last_use, null) or shouldDeferElementwiseMulForAdd(graph, id, reachable, last_use, null) or shouldDeferTransposeForLinearDot(graph, id, reachable, last_use)) return false;
+            if (shouldDeferScaleMulForAdd(graph, id, reachable, last_use, null)) {
+                const pending = required_deferrals orelse return .deferred_producer;
+                try pending.append(.{ .producer = id, .consumer = last_use[id] });
+            }
+            if (shouldDeferTransposeForLinearDot(graph, id, reachable, last_use)) {
+                const pending = required_deferrals orelse return .deferred_producer;
+                if (std.mem.indexOfScalar(NodeId, graph.outputs.items, id) != null) return .deferred_producer;
+                for (graph.nodes.items, reachable, 0..) |consumer, active, consumer_id| {
+                    if (!active or std.mem.indexOfScalar(NodeId, consumer.getInputs(), id) == null) continue;
+                    const consumer_node: NodeId = @intCast(consumer_id);
+                    const matched = ops_mod.kernel_descriptor.TransposedRightDot.match(graph, consumer_node) orelse return .deferred_producer;
+                    if (matched.transpose != id) return .deferred_producer;
+                    try pending.append(.{ .producer = id, .consumer = consumer_node });
+                }
+                if (transposes == null) transposes = try std.DynamicBitSetUnmanaged.initEmpty(self.allocator, graph.nodeCount());
+                transposes.?.set(id);
+            }
+            if (shouldDeferElementwiseMulForAdd(graph, id, reachable, last_use, null)) {
+                const pending = required_deferrals orelse return .deferred_producer;
+                try pending.append(.{ .producer = id, .consumer = last_use[id] });
+            }
         }
         var transient: ?RuntimeRegionPlan = null;
         defer if (transient) |*plan| plan.deinit(self.allocator);
         const plan = try self.runtimeRegionPlan(self.allocator, graph, nodes, graph.nodeCount(), reachable, last_use, null, &transient);
-        if (!plan.matches(nodes, graph.nodeCount()) or plan.region_count != 0 or plan.covered_node_count != 0 or plan.elided_node_count != 0 or plan.pre_skipped_node_count != 0) return false;
+        if (!plan.matches(nodes, graph.nodeCount()) or plan.elided_node_count != 0 or plan.pre_skipped_node_count != 0) return .backend_region;
+        for (plan.regions_by_pos) |region| switch (region) {
+            .none => {},
+            .raw_linear_dot => |dot| {
+                // A planned transpose group must replace this exact edge.
+                const needed = transposes orelse return .backend_region;
+                if (!needed.isSet(dot.transpose_id)) return .backend_region;
+            },
+            else => return .backend_region,
+        };
         for (nodes, 0..) |id, position| {
             if (!reachable[id] or graph.node(id).op == .parameter or graph.node(id).op == .constant) continue;
-            if (plan.descriptorAt(position) == null and @import("../execution/metadata_alias.zig").Plan.lower(graph, id, .metal) == null) return false;
+            if (plan.descriptorAt(position) != null or @import("../execution/metadata_alias.zig").Plan.lower(graph, id, .metal) != null) continue;
+            // Neither the broadcast add nor the F32-index gather needs a
+            // standalone route when the prepared region proves the exact edge.
+            if (required_deferrals) |pending| {
+                for (pending.items) |edge| {
+                    if (edge.producer == id or edge.consumer == id) break;
+                } else return .operation;
+            } else return .operation;
         }
-        return true;
+        return null;
     }
 
     fn executeFn(
@@ -1854,8 +1925,9 @@ pub const MetalPartitionExecutor = struct {
         const planned_primitives = if (exec_ctx.options) |opts| opts.planned_device_execution else false;
         const owned_frame = if (options.physical_frame) |frame| frame.pool.completeOwnedPayload() != null and frame.pool.metal_frame_dispatch else false;
         if (owned_frame and !ownedFramePolicyAvailable()) return error.PreparedMetalFramePolicyChanged;
+        const compatibility_banks = !owned_frame and !synchronous_regions;
         const graph_plan_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
-        if (!owned_frame and !synchronous_regions and (reservePartitionGraphPlanForExecution(chunk_ops) or
+        if (compatibility_banks and (reservePartitionGraphPlanForExecution(chunk_ops) or
             (planned_primitives and !platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_PARTITION_GRAPH_PLAN", false))))
         {
             var metal_graph_plan = try buildMetalGraphPlan(allocator, buffer_plan, partition_view);
@@ -1876,15 +1948,15 @@ pub const MetalPartitionExecutor = struct {
 
         // Phase-0 slot-bound output pool (persistent executor only). Binds
         // node outputs to fixed device buffers reused across steps.
-        const slot_bound_outputs = !synchronous_regions and self.owned and cb.kind() == .metal and slotBoundOutputsEnabled();
+        const slot_bound_outputs = compatibility_banks and self.owned and cb.kind() == .metal and slotBoundOutputsEnabled();
         if (slot_bound_outputs) self.ensureOutputPool(cb, buffer_plan) catch {};
-        const eager_arena_outputs = !synchronous_regions and self.owned and cb.kind() == .metal and metalEagerArenaEnabled();
+        const eager_arena_outputs = compatibility_banks and self.owned and cb.kind() == .metal and metalEagerArenaEnabled();
         var eager_arena = MetalEagerArena{};
         defer eager_arena.deinit(allocator, cb);
         if (eager_arena_outputs) {
             eager_arena.init(allocator, buffer_plan.allocations.len) catch {};
         }
-        const chunk_local_outputs = !synchronous_regions and self.owned and cb.kind() == .metal and chunk_ops > 0 and metalChunkLocalOutputsEnabled();
+        const chunk_local_outputs = compatibility_banks and self.owned and cb.kind() == .metal and chunk_ops > 0 and metalChunkLocalOutputsEnabled();
         var chunk_local_pool = ChunkLocalOutputPool{};
         defer chunk_local_pool.deinit(allocator, cb);
         if (chunk_local_outputs) {
@@ -1892,7 +1964,7 @@ pub const MetalPartitionExecutor = struct {
         }
         var resident_input_cache = ResidentInputCache{};
         defer resident_input_cache.deinit(allocator, cb);
-        const resident_input_cache_enabled = !synchronous_regions and self.owned and cb.kind() == .metal and (gatherPromoteInputEnabled() or reducePromoteInputEnabled());
+        const resident_input_cache_enabled = compatibility_banks and self.owned and cb.kind() == .metal and (gatherPromoteInputEnabled() or reducePromoteInputEnabled());
         if (resident_input_cache_enabled) {
             try resident_input_cache.init(allocator, graph, node_ids);
         }
@@ -1953,6 +2025,8 @@ pub const MetalPartitionExecutor = struct {
         // numerical nodes. Validate the actual operation Claim and full cover
         // BEFORE changing the ordinary frame/fusion path or writing any output.
         if (synchronous_regions) {
+            if (options.physical_frame.?.metal_device_copy_pending) return error.PreparedMetalFrameDispatchChanged;
+
             try executeSynchronousPhysicalRegions(graph, cb, node_ids, reachable, values, value_device, device_id, options, exec_ctx.stats);
             return;
         }
@@ -1969,6 +2043,7 @@ pub const MetalPartitionExecutor = struct {
             reachable,
             device_id,
             options.physical_frame,
+            owned_frame,
         );
         if (collect_loop_profile) loop_profile.materialize_constants_ns += metalPartitionElapsedNs(constants_start_ns, metalPartitionNowNs());
         if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_constants_end partition={d}\n", .{partition_index});
@@ -1977,7 +2052,7 @@ pub const MetalPartitionExecutor = struct {
         var transient_runtime_region_plan: ?RuntimeRegionPlan = null;
         defer if (transient_runtime_region_plan) |*plan| plan.deinit(allocator);
         const runtime_region_plan_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
-        const runtime_region_plan = try self.runtimeRegionPlan(
+        const runtime_region_plan = if (owned_frame) RuntimeRegionPlan{} else try self.runtimeRegionPlan(
             allocator,
             graph,
             node_ids,
@@ -1989,9 +2064,9 @@ pub const MetalPartitionExecutor = struct {
         );
         if (collect_loop_profile) loop_profile.runtime_region_plan_ns += metalPartitionElapsedNs(runtime_region_plan_start_ns, metalPartitionNowNs());
         if (trace_progress) std.debug.print("metal_partition_progress: phase=runtime_region_plan_ready partition={d} regions={d}\n", .{ partition_index, runtime_region_plan.region_count });
-        if (traceRuntimeRegionsEnabled()) printRuntimeRegionPlanSummary(graph, runtime_region_plan, partition_index);
+        if (traceRuntimeRegionsEnabled() and !owned_frame) printRuntimeRegionPlanSummary(graph, runtime_region_plan, partition_index);
         if (metalPartitionOpRunsEnabled()) printMetalPartitionOpRuns(graph, node_ids, reachable, last_use, partition_index);
-        if (exec_ctx.stats) |stats| {
+        if (!owned_frame) if (exec_ctx.stats) |stats| {
             stats.runtime_region_plan_active_regions += runtime_region_plan.region_count;
             stats.runtime_region_plan_covered_nodes += runtime_region_plan.covered_node_count;
             stats.runtime_region_plan_elided_nodes += runtime_region_plan.elided_node_count;
@@ -2001,14 +2076,16 @@ pub const MetalPartitionExecutor = struct {
             if (frame_eligibility.eligible()) {
                 stats.runtime_frame_metadata_ready += 1;
             }
-        }
+        };
 
         if (trace_nodes) std.debug.print("graph_executor_node_trace: begin_frame_begin partition={d}\n", .{partition_index});
         if (trace_progress) std.debug.print("metal_partition_progress: phase=begin_frame_begin partition={d}\n", .{partition_index});
         const begin_frame_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
-        var frame_active = if (metalPartitionFrameDisabled() or (!planned_primitives and runtime_region_plan.region_count == 0)) false else try cb.decoderRuntimeBeginFrame();
+        var frame_active = if (metalPartitionFrameDisabled() or (!owned_frame and !planned_primitives and runtime_region_plan.region_count == 0)) false else try cb.decoderRuntimeBeginFrame();
         errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
         if (owned_frame and !frame_active) return error.PreparedMetalFrameDispatchChanged;
+        if (options.physical_frame) |frame| try frame.encodeMetalDeviceInputs(cb);
+
         if (collect_loop_profile) loop_profile.begin_frame_ns += metalPartitionElapsedNs(begin_frame_start_ns, metalPartitionNowNs());
         if (trace_progress) std.debug.print("metal_partition_progress: phase=begin_frame_end partition={d} active={}\n", .{ partition_index, frame_active });
         if (trace_nodes) std.debug.print("graph_executor_node_trace: begin_frame_end partition={d} active={}\n", .{ partition_index, frame_active });
@@ -2016,7 +2093,6 @@ pub const MetalPartitionExecutor = struct {
             try metal_compute_mod.MetalCompute.beginPlannedGraphScope(cb, .ffn)
         else
             metal_compute_mod.MetalCompute.PlannedGraphScope{};
-        errdefer metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope) catch {};
 
         // Coarse frame chunking: split the single frame every `chunk_ops`
         // executed nodes so dead/pooled device buffers release mid-step.
@@ -2102,25 +2178,27 @@ pub const MetalPartitionExecutor = struct {
             }
         }
 
-        try prepareRuntimeRegionPlan(
-            graph,
-            cb,
-            values,
-            value_device,
-            device_id,
-            runtime_region_plan,
-            preparation_scope,
-            exec_ctx.stats,
-        );
+        if (!owned_frame) {
+            try prepareRuntimeRegionPlan(
+                graph,
+                cb,
+                values,
+                value_device,
+                device_id,
+                runtime_region_plan,
+                preparation_scope,
+                exec_ctx.stats,
+            );
 
-        applyRuntimeRegionPreSkippedNodes(
-            graph,
-            runtime_region_plan,
-            skipped_nodes,
-            elision_protected_nodes,
-            rt_map,
-            exec_ctx.stats,
-        );
+            applyRuntimeRegionPreSkippedNodes(
+                graph,
+                runtime_region_plan,
+                skipped_nodes,
+                elision_protected_nodes,
+                rt_map,
+                exec_ctx.stats,
+            );
+        }
 
         // Precompute per-node consumer counts (capped at 2) once so the mul-for-add
         // deferral checks in the loop below are O(1) instead of an O(nodes) scan
@@ -2155,6 +2233,7 @@ pub const MetalPartitionExecutor = struct {
             if (collect_loop_profile) loop_profile.nodes += 1;
             const i: usize = @intCast(node_id);
             if (i >= reachable.len or !reachable[i]) continue;
+            if (owned_frame and graph.node(node_id).op == .constant and options.physical_frame.?.pool.baked_region_literals.contains(node_id)) continue;
             if (i < skipped_nodes.len and skipped_nodes[i]) {
                 traceMetalValueLifetime("top_skip_continue", node_id, node_id);
                 if (traceRuntimeRegionsEnabled()) {
@@ -2226,13 +2305,38 @@ pub const MetalPartitionExecutor = struct {
 
             if (graph.node(node_id).op == .fused_from_float32) continue;
 
+            if (owned_frame) {
+                const frame = options.physical_frame.?;
+                if (try @import("../execution/region_dispatch.zig").execute(frame, cb, node_id, values)) |installed| {
+                    if (installed.owner.entry_node == node_id) {
+                        for (installed.outputs) |output| value_device[output.slot.node] = device_id;
+                        if (options.execution_control) |control| try control.check();
+                        if (exec_ctx.stats) |stats| {
+                            stats.runtime_region_plan_dispatches += 1;
+                            stats.runtime_region_plan_active_regions += 1;
+                            stats.runtime_region_plan_covered_nodes += installed.owner.covered_nodes.len;
+                            stats.runtime_region_plan_elided_nodes += installed.owner.covered_nodes.len - 1;
+                        }
+                        for (installed.owner.input_nodes) |input| {
+                            if (last_use[input] != node_id) continue;
+                            if (rt_map.contains(input) and !donated.contains(input) and !effective_exec_ctx.ownsRuntimeTransfer(input)) continue;
+                            if (values[input]) |value| {
+                                cb.free(value);
+                                values[input] = null;
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+
             // Defer heuristics may not skip override-protected nodes (graph
             // outputs / scalar-tail producers): the loop never revisits a
             // node's position, so a protected node deferred here would rely
             // on a consumer fusing it — which writes the consumer's slot,
             // not this one.
             const node_elision_protected = i < elision_protected_nodes.len and elision_protected_nodes[i];
-            const defer_allowed = deferredProducerConsumerStaysInFrameChunk(
+            const defer_allowed = !owned_frame and deferredProducerConsumerStaysInFrameChunk(
                 node_ids,
                 node_pos,
                 node_id,
@@ -2295,10 +2399,12 @@ pub const MetalPartitionExecutor = struct {
             const op_plan = partition_plan.operatorPlanForNode(node_id);
             var execution_kind: ?MetalExecutionKind = null;
             if (trace_node_progress) std.debug.print("metal_partition_progress: phase=planned_region_begin partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
-            const runtime_region = runtime_region_plan.regionAt(node_pos, node_id, node_ids);
+            // Attestation excludes region schedules and deferred producers.
+            // Keep complete frames on assigned dispatch after admission.
+            const runtime_region: RuntimeRegion = if (owned_frame) .{ .none = {} } else runtime_region_plan.regionAt(node_pos, node_id, node_ids);
             const region_start_ns = if (collect_op_stats) metalPartitionNowNs() else 0;
             const planned_region_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
-            if (try tryExecutePlannedRuntimeRegion(
+            if (!owned_frame and try tryExecutePlannedRuntimeRegion(
                 runtime_region,
                 runtime_region_plan.preparedPtrAt(node_pos, node_id, node_ids),
                 runtime_region_plan.sourceStateAt(node_pos),
@@ -2334,7 +2440,7 @@ pub const MetalPartitionExecutor = struct {
                 if (trace_node_progress) std.debug.print("metal_partition_progress: phase=planned_region_miss partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
                 if (trace_node_progress) std.debug.print("metal_partition_progress: phase=fused_pattern_begin partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
                 const fused_pattern_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
-                if (try tryExecuteFusedMetalGraphPattern(
+                if (!owned_frame and try tryExecuteFusedMetalGraphPattern(
                     allocator,
                     graph,
                     cb,
@@ -2376,7 +2482,9 @@ pub const MetalPartitionExecutor = struct {
                         if (!frame_active) break :physical null;
                         if (metalPartitionRuntimeCommandsDisabled()) break :physical null;
                         const frame = options.physical_frame orelse break :physical null;
-                        if (runtime_region_plan.descriptorAt(node_pos) == null and !frame.hasPreparedMetadataAlias(node_id)) break :physical null;
+                        // Complete frames use the descriptor already bound to their
+                        // selected route. Compatibility still requires a legacy hint.
+                        if (!owned_frame and runtime_region_plan.descriptorAt(node_pos) == null and !frame.hasPreparedMetadataAlias(node_id)) break :physical null;
                         // Metal may intentionally leave a producer absent so
                         // the command path below can fold it into its consumer
                         // (broadcasts, scales and transposes, for example).
@@ -2655,7 +2763,7 @@ pub const MetalPartitionExecutor = struct {
                     donated,
                     effective_exec_ctx,
                 );
-                metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope) catch {};
+                try metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope);
                 planned_scope = metal_compute_mod.MetalCompute.PlannedGraphScope{};
                 try cb.decoderRuntimeSubmitAndWaitFrame();
                 frame_active = false;
@@ -2713,7 +2821,7 @@ pub const MetalPartitionExecutor = struct {
                         donated,
                         effective_exec_ctx,
                     );
-                    metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope) catch {};
+                    try metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope);
                     planned_scope = metal_compute_mod.MetalCompute.PlannedGraphScope{};
                     try cb.decoderRuntimeSubmitAndWaitFrame();
                     frame_active = false;
@@ -3939,7 +4047,7 @@ fn arenaAliasStillLive(
     }
     if (rt_map.contains(alias_node) and
         !donated.contains(alias_node) and
-        !ownedRuntimeTransferContains(exec_ctx, alias_node))
+        !exec_ctx.ownsRuntimeTransfer(alias_node))
     {
         return true;
     }
@@ -14290,15 +14398,7 @@ fn tryExecuteMetalCommand(
                 error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
                 else => return err,
             };
-            if (transposed) |ct| {
-                if (!preserve_host_view and !isMetalDeviceResident(cb, ct)) {
-                    if (try makeMetalDeviceResident(cb, ct)) |device_ct| {
-                        cb.free(ct);
-                        break :blk device_ct;
-                    }
-                }
-            }
-            break :blk transposed;
+            break :blk if (preserve_host_view) transposed else try promoteMetalOutputIfNeeded(cb, transposed, null);
         },
         .broadcast_in_dim => |attrs| try executeRuntimeBroadcast(cb, values, inputs, graph.node(inputs[0]).output_shape, attrs, output_hint),
         .neg, .sqrt, .rsqrt, .exp, .log, .sin, .cos, .tanh, .erf, .abs => try executeRuntimeUnary(cb, values, inputs, ops_mod.kernel_descriptor.unary(n.op).?, output_hint),
@@ -14318,7 +14418,7 @@ fn tryExecuteMetalCommand(
         .fused_tanh_act => try executeRuntimeFusedUnary(cb, values, inputs, .tanh_act),
         .fused_elem_add, .add => try executeRuntimeAdd(graph, cb, values, inputs, n.output_shape, output_hint),
         .fused_elem_multiply, .mul => try executeRuntimeBinary(graph, cb, values, node_id, inputs, n.output_shape, .multiply, output_hint),
-        .fused_add_mul_scalar => |attrs| try executeRuntimeAddMulScalar(cb, values, inputs, attrs.scale_before_add),
+        .fused_add_mul_scalar => |attrs| try executeRuntimeAddMulScalar(cb, values, inputs, attrs),
         .sub => try executeRuntimeBinary(graph, cb, values, node_id, inputs, n.output_shape, .subtract, output_hint),
         .div => try executeRuntimeBinary(graph, cb, values, node_id, inputs, n.output_shape, .divide, output_hint),
         .less_than => try executeRuntimeBinary(graph, cb, values, node_id, inputs, n.output_shape, .less_than, null),
@@ -14416,14 +14516,7 @@ fn executeRuntimeZeroTensor(
     rows: usize,
     out_dim: usize,
 ) !?CT {
-    const ct = (try cb.zeroTensor(rows, out_dim)) orelse return null;
-    errdefer cb.free(ct);
-    if (isMetalDeviceResident(cb, ct)) return ct;
-    if (try makeMetalDeviceResident(cb, ct)) |device_ct| {
-        if (device_ct != ct) cb.free(ct);
-        return device_ct;
-    }
-    return ct;
+    return promoteMetalOutputIfNeeded(cb, try cb.zeroTensor(rows, out_dim), null);
 }
 
 fn executeRuntimeConstant(
@@ -14433,16 +14526,9 @@ fn executeRuntimeConstant(
     attrs: anytype,
 ) !?CT {
     const ct = try interpreter.materializeConstant(graph, cb, output_shape, attrs, true);
-    errdefer cb.free(ct);
-
-    // Empty values are shape-only sentinels. No device buffer is needed.
+    // Empty values are shape-only sentinels.
     if (attrs.data_len == 0) return ct;
-    if (isMetalDeviceResident(cb, ct)) return ct;
-    if (try makeMetalDeviceResident(cb, ct)) |device_ct| {
-        if (device_ct != ct) cb.free(ct);
-        return device_ct;
-    }
-    return ct;
+    return promoteMetalOutputIfNeeded(cb, ct, null);
 }
 
 fn executeRuntimeGqaCausalAttention(
@@ -14459,7 +14545,21 @@ fn executeRuntimeGqaCausalAttention(
     const bias = valueFor(values, if (num_inputs > 3) inputs[3] else null_node);
     const kv_heads = if (attrs.num_kv_heads != 0) attrs.num_kv_heads else attrs.num_heads;
 
-    if (exec_state.options.attention) |base_attn| {
+    const key_rows = if (attrs.kv_seq_len == 0) attrs.seq_len else attrs.kv_seq_len;
+    const window = attrs.sliding_window orelse 0;
+    const attention = if (!attrs.functional_kv)
+        exec_state.options.attention
+    else if (key_rows != attrs.seq_len or window != 0)
+        @as(?ops_mod.AttentionContext, .{
+            .total_sequence_len = key_rows,
+            .query_sequence_len = attrs.seq_len,
+            .kv_sequence_len = key_rows,
+            .sliding_window = window,
+        })
+    else
+        null;
+
+    if (attention) |base_attn| {
         var attn = base_attn;
         attn.layer_index = if (attrs.layer_index == std.math.maxInt(u32))
             exec_state.attention_layer
@@ -14480,7 +14580,7 @@ fn executeRuntimeGqaCausalAttention(
             error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch, error.UnsupportedTensorType, error.InvalidAttentionShape => null,
             else => return err,
         };
-        if (out != null) exec_state.attention_layer += 1;
+        if (out != null and !attrs.functional_kv) exec_state.attention_layer += 1;
         return out;
     }
 
@@ -14671,14 +14771,7 @@ fn executeRuntimeScatterAdd(
     }
 
     const out_shape = [_]i32{ @intCast(out_rows), @intCast(dim) };
-    const host_result = try cb.fromFloat32Shape(output, &out_shape);
-    errdefer cb.free(host_result);
-    if (isMetalDeviceResident(cb, host_result)) return host_result;
-    if (try makeMetalDeviceResident(cb, host_result)) |device_result| {
-        if (device_result != host_result) cb.free(host_result);
-        return device_result;
-    }
-    return host_result;
+    return promoteMetalOutputIfNeeded(cb, try cb.fromFloat32Shape(output, &out_shape), null);
 }
 
 fn executeRuntimeConvertDType(
@@ -14858,25 +14951,13 @@ fn executeRuntimeBinary(
         if (traceRuntimeCommandFallbacksEnabled()) traceRuntimeBinaryFallback(graph, node_id, op, "broadcast_mismatch", lhs_operand, rhs_operand, output_shape);
         return null;
     }
-    var lhs = lhs_operand.value;
-    var rhs = rhs_operand.value;
-    var owned_lhs: ?CT = null;
-    defer if (owned_lhs) |ct| cb.free(ct);
-    var owned_rhs: ?CT = null;
-    defer if (owned_rhs) |ct| cb.free(ct);
+    const left = try temporaryMetalResidentValue(cb, lhs_operand.value);
+    defer left.deinit(cb);
+    const right = try temporaryMetalResidentValue(cb, rhs_operand.value);
+    defer right.deinit(cb);
+    const lhs = left.value;
+    const rhs = right.value;
     if (cb.kind() == .metal) {
-        if (!isMetalDeviceResident(cb, lhs)) {
-            if (try makeMetalDeviceResident(cb, lhs)) |device_lhs| {
-                if (device_lhs != lhs) owned_lhs = device_lhs;
-                lhs = device_lhs;
-            }
-        }
-        if (!isMetalDeviceResident(cb, rhs)) {
-            if (try makeMetalDeviceResident(cb, rhs)) |device_rhs| {
-                if (device_rhs != rhs) owned_rhs = device_rhs;
-                rhs = device_rhs;
-            }
-        }
         // Slot-bound output: write a*b directly into the pooled buffer.
         // force_barrier guards reused pooled buffers against non-declaring
         // consumer reads (conservative: barrier on every pooled write).
@@ -14909,13 +14990,13 @@ fn executeRuntimeAddMulScalar(
     cb: *const ComputeBackend,
     values: []?CT,
     inputs: []const NodeId,
-    scale_before_add: bool,
+    attrs: ml.graph.node.ScalarResidualAttrs,
 ) !?CT {
     const lhs = valueFor(values, inputs[0]) orelse return null;
     const rhs = valueFor(values, inputs[1]) orelse return null;
     const scalar = valueFor(values, inputs[2]) orelse return null;
-    if (scale_before_add) {
-        if (try cb.addMultiplyScalarTensor(lhs, rhs, scalar)) |fused| return fused;
+    if (attrs.scale_before_add) {
+        if (!attrs.separate_rounding) if (try cb.addMultiplyScalarTensor(lhs, rhs, scalar)) |fused| return fused;
         const scaled = try cb.multiply(lhs, scalar);
         defer cb.free(scaled);
         return cb.add(scaled, rhs);
@@ -15012,8 +15093,7 @@ fn executeRuntimeLinear(
         const rhs_shape = [_]i64{ @intCast(out_dim), @intCast(in_dim) };
         const output = try cb.primDotGeneral(input, weight, &lhs_shape, &rhs_shape, &.{1}, &.{1}, &.{}, &.{});
         if (!has_bias) {
-            errdefer cb.free(output);
-            return try promoteMetalOutputIfNeeded(cb, output);
+            return try promoteMetalOutputIfNeeded(cb, output, null);
         }
         defer cb.free(output);
         const bias = valueFor(values, inputs[2]) orelse return null;
@@ -15021,8 +15101,7 @@ fn executeRuntimeLinear(
         const expanded = try cb.primBroadcastInDim(bias, &shape, &.{1}, &.{@intCast(out_dim)});
         defer cb.free(expanded);
         const biased = try cb.add(output, expanded);
-        errdefer cb.free(biased);
-        return try promoteMetalOutputIfNeeded(cb, biased);
+        return try promoteMetalOutputIfNeeded(cb, biased, null);
     }
     try validatePlannedLinearOp(cb, weight, rows, in_dim, out_dim, op_plan);
     if (has_bias) {
@@ -15031,13 +15110,13 @@ fn executeRuntimeLinear(
             error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
             else => return err,
         };
-        return try promoteMetalOutputIfNeeded(cb, output);
+        return try promoteMetalOutputIfNeeded(cb, output, null);
     } else {
         const output = cb.linearNoBiasWithPlan(input, weight, rows, in_dim, out_dim, op_plan) catch |err| switch (err) {
             error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
             else => return err,
         };
-        return try promoteMetalOutputIfNeeded(cb, output);
+        return try promoteMetalOutputIfNeeded(cb, output, null);
     }
 }
 
@@ -15130,7 +15209,7 @@ fn executeRuntimeDotGeneral(
         error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
     };
-    return try promoteMetalOutputIfNeeded(cb, output);
+    return try promoteMetalOutputIfNeeded(cb, output, null);
 }
 
 fn executeRuntimeLinearDotFromDeferredTranspose(
@@ -15179,7 +15258,7 @@ fn executeRuntimeLinearDotFromDeferredTranspose(
             error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
             else => return err,
         };
-        return try promoteMetalOutputIfNeeded(cb, output);
+        return try promoteMetalOutputIfNeeded(cb, output, null);
     }
     // Unplanned dense weights: execute as `dot_general(input, weight)` with
     // the weight's second axis contracted (X @ Wᵀ) instead of routing through
@@ -15204,13 +15283,13 @@ fn executeRuntimeLinearDotFromDeferredTranspose(
             error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch, error.UnsupportedTensorType => null,
             else => return err,
         };
-        if (dot_output != null) return try promoteMetalOutputIfNeeded(cb, dot_output);
+        if (dot_output != null) return try promoteMetalOutputIfNeeded(cb, dot_output, null);
     }
     const output = cb.linearNoBiasWithPlan(input, weight, rows, in_dim, out_dim, op_plan) catch |err| switch (err) {
         error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
     };
-    return try promoteMetalOutputIfNeeded(cb, output);
+    return try promoteMetalOutputIfNeeded(cb, output, null);
 }
 
 /// Quantized weight descriptors must stay on the planned `linearNoBias`
@@ -15804,40 +15883,11 @@ fn executeRuntimeGather(
     }
 
     if (!promote_output and attrs.axis == 0) gather_add_bias: {
-        const input_node = graph.node(inputs[0]);
-        if (input_node.op != .add) break :gather_add_bias;
-        const add_inputs = input_node.getInputs();
-        if (add_inputs.len != 2) break :gather_add_bias;
-
-        const lhs = add_inputs[0];
-        const rhs = add_inputs[1];
-        if (lhs == null_node or rhs == null_node) break :gather_add_bias;
-
-        var lhs_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
-        var rhs_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
-        const lhs_shape = try fillShapeDims(graph.node(lhs).output_shape, &lhs_shape_buf);
-        const rhs_shape = try fillShapeDims(graph.node(rhs).output_shape, &rhs_shape_buf);
-
-        var matrix_id: NodeId = null_node;
-        var bias_id: NodeId = null_node;
+        const biased = ops_mod.kernel_descriptor.MatrixColumnBias.match(graph, inputs[0]) orelse break :gather_add_bias;
         var matrix_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
-        var matrix_shape: []const i64 = &.{};
-        if (lhs_shape.len == 2 and rhs_shape.len == 1 and lhs_shape[1] == rhs_shape[0]) {
-            matrix_id = lhs;
-            bias_id = rhs;
-            @memcpy(matrix_shape_buf[0..lhs_shape.len], lhs_shape);
-            matrix_shape = matrix_shape_buf[0..lhs_shape.len];
-        } else if (rhs_shape.len == 2 and lhs_shape.len == 1 and rhs_shape[1] == lhs_shape[0]) {
-            matrix_id = rhs;
-            bias_id = lhs;
-            @memcpy(matrix_shape_buf[0..rhs_shape.len], rhs_shape);
-            matrix_shape = matrix_shape_buf[0..rhs_shape.len];
-        } else {
-            break :gather_add_bias;
-        }
-
-        const matrix = valueFor(values, matrix_id) orelse break :gather_add_bias;
-        const bias = valueFor(values, bias_id) orelse break :gather_add_bias;
+        const matrix_shape = try fillShapeDims(biased.matrix_shape, &matrix_shape_buf);
+        const matrix = valueFor(values, biased.matrix) orelse break :gather_add_bias;
+        const bias = valueFor(values, biased.bias) orelse break :gather_add_bias;
         const fused = cb.primGatherAddBiasAxis0(matrix, bias, indices.value, matrix_shape) catch |err| switch (err) {
             error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedTensorType, error.UnsupportedShape, error.ShapeMismatch, error.InvalidTensorShape => null,
             else => return err,
@@ -15852,6 +15902,7 @@ fn executeRuntimeGather(
     if (promote_output) {
         if (gathered) |host_result| {
             if (!isMetalDeviceResident(cb, host_result)) {
+                errdefer cb.free(host_result);
                 const output_promotion_start_ns = metalPartitionNowNs();
                 if (try makeMetalDeviceResident(cb, host_result)) |device_result| {
                     if (stats) |s| {
@@ -15904,16 +15955,12 @@ fn executeRuntimeAdd(
     };
 }
 
-const DeferredScaleMul = struct {
-    source_id: NodeId,
-    scalar_id: NodeId,
-    scale: f32,
-};
+const DeferredScaleMul = ops_mod.kernel_descriptor.ScalarProduct;
+const deferredScaleMul = DeferredScaleMul.match;
 
-const DeferredElementwiseMul = struct {
-    lhs_id: NodeId,
-    rhs_id: NodeId,
-};
+const DeferredElementwiseMul = ops_mod.kernel_descriptor.F32Product;
+const deferredElementwiseMul = ops_mod.kernel_descriptor.sameShapeF32Product;
+const scalarConstantF32 = ops_mod.kernel_descriptor.scalarConstantF32;
 
 const RuntimeBinaryOperand = struct {
     value: CT,
@@ -15960,48 +16007,35 @@ fn executeRuntimeScaledAddFromDeferredMul(
     output_hint: ?CT,
 ) !?CT {
     if (inputs.len < 2) return null;
-    if (pendingDeferredScaleMul(graph, values, inputs[0], output_shape)) |lhs_scaled| {
-        if (pendingDeferredScaleMul(graph, values, inputs[1], output_shape)) |rhs_scaled| {
-            const lhs = (try executeDeferredScaleMulValue(cb, values, lhs_scaled)) orelse return null;
-            defer cb.free(lhs);
-            const rhs = (try executeDeferredScaleMulValue(cb, values, rhs_scaled)) orelse return null;
-            defer cb.free(rhs);
-            const output = cb.add(lhs, rhs) catch |err| switch (err) {
-                error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
-                else => return err,
-            };
-            return try promoteMetalOutputIfNeeded(cb, output);
-        }
+    const lhs_pending = pendingDeferredScaleMul(graph, values, inputs[0], output_shape);
+    const rhs_pending = pendingDeferredScaleMul(graph, values, inputs[1], output_shape);
+    const scaled = lhs_pending orelse rhs_pending orelse return null;
+    const second = if (lhs_pending != null) rhs_pending else null;
+    const scaled_input = valueFor(values, scaled.source_id) orelse return null;
+    const residual_id = if (second) |term| term.source_id else inputs[if (lhs_pending != null) 1 else 0];
+    const residual = valueFor(values, residual_id) orelse return null;
+    const output = try executeDecoderWithOutputHint(cb, ComputeBackend.decoderRuntimeApplyScaledAddScale, ops_mod.DecoderRuntimeApplyScaledAddScaleRequest{
+        .output = output_hint,
+        .lhs = scaled_input,
+        .rhs = residual,
+        .dim = dim,
+        .lhs_scale = scaled.scale,
+        .rhs_scale = if (second) |term| term.scale else null,
+        .output_scale = 1,
+    });
+    if (try promoteMetalOutputIfNeeded(cb, output, output_hint)) |result| return result;
+    if (second) |term| {
+        const lhs = (try executeDeferredScaleMulValue(cb, values, scaled)) orelse return null;
+        defer cb.free(lhs);
+        const rhs = (try executeDeferredScaleMulValue(cb, values, term)) orelse return null;
+        defer cb.free(rhs);
+        const fallback = cb.add(lhs, rhs) catch |err| switch (err) {
+            error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
+            else => return err,
+        };
+        return try promoteMetalOutputIfNeeded(cb, fallback, null);
     }
-    if (pendingDeferredScaleMul(graph, values, inputs[0], output_shape)) |scaled| {
-        const scaled_lhs = valueFor(values, scaled.source_id) orelse return null;
-        const residual = valueFor(values, inputs[1]) orelse return null;
-        const output = try executeDecoderWithOutputHint(cb, ComputeBackend.decoderRuntimeApplyScaledAddScale, ops_mod.DecoderRuntimeApplyScaledAddScaleRequest{
-            .output = output_hint,
-            .lhs = scaled_lhs,
-            .rhs = residual,
-            .dim = dim,
-            .lhs_scale = scaled.scale,
-            .output_scale = 1.0,
-        });
-        if (try promoteMetalOutputIfNeeded(cb, output)) |result| return result;
-        return try executeDeferredScaleAddFallback(cb, values, scaled, residual);
-    }
-    if (pendingDeferredScaleMul(graph, values, inputs[1], output_shape)) |scaled| {
-        const scaled_lhs = valueFor(values, scaled.source_id) orelse return null;
-        const residual = valueFor(values, inputs[0]) orelse return null;
-        const output = try executeDecoderWithOutputHint(cb, ComputeBackend.decoderRuntimeApplyScaledAddScale, ops_mod.DecoderRuntimeApplyScaledAddScaleRequest{
-            .output = output_hint,
-            .lhs = scaled_lhs,
-            .rhs = residual,
-            .dim = dim,
-            .lhs_scale = scaled.scale,
-            .output_scale = 1.0,
-        });
-        if (try promoteMetalOutputIfNeeded(cb, output)) |result| return result;
-        return try executeDeferredScaleAddFallback(cb, values, scaled, residual);
-    }
-    return null;
+    return try executeDeferredScaleAddFallback(cb, values, scaled, residual);
 }
 
 fn executeRuntimeMultiplyAddFromDeferredMul(
@@ -16013,19 +16047,15 @@ fn executeRuntimeMultiplyAddFromDeferredMul(
     dim: usize,
     output_hint: ?CT,
 ) !?CT {
-    if (inputs.len < 2) return null;
-    if (pendingDeferredElementwiseMul(graph, values, inputs[0], output_shape)) |mul| {
-        if (pendingDeferredElementwiseMul(graph, values, inputs[1], output_shape)) |rhs_mul| {
-            return try executeDeferredElementwiseMultiplyAdd2(cb, values, mul, rhs_mul, dim, output_hint);
-        }
-        const addend = valueFor(values, inputs[1]) orelse return null;
-        return try executeDeferredElementwiseMultiplyAdd(cb, values, mul, addend, dim, output_hint);
-    }
-    if (pendingDeferredElementwiseMul(graph, values, inputs[1], output_shape)) |mul| {
-        const addend = valueFor(values, inputs[0]) orelse return null;
-        return try executeDeferredElementwiseMultiplyAdd(cb, values, mul, addend, dim, output_hint);
-    }
-    return null;
+    if (inputs.len != 2) return null;
+    const recipe = ops_mod.kernel_descriptor.F32ProductAdd.match(graph, inputs, output_shape, .{
+        valueFor(values, inputs[0]) == null,
+        valueFor(values, inputs[1]) == null,
+    }) orelse return null;
+    return switch (recipe) {
+        .pair => |products| try executeDeferredElementwiseMultiplyAdd2(cb, values, products[0], products[1], dim, output_hint),
+        .single => |single| try executeDeferredElementwiseMultiplyAdd(cb, values, single.product, valueFor(values, single.addend) orelse return null, dim, output_hint),
+    };
 }
 
 fn executeDeferredElementwiseMultiplyAdd2(
@@ -16036,60 +16066,34 @@ fn executeDeferredElementwiseMultiplyAdd2(
     dim: usize,
     output_hint: ?CT,
 ) !?CT {
-    var lhs0 = valueFor(values, lhs_mul.lhs_id) orelse return null;
-    var rhs0 = valueFor(values, lhs_mul.rhs_id) orelse return null;
-    var lhs1 = valueFor(values, rhs_mul.lhs_id) orelse return null;
-    var rhs1 = valueFor(values, rhs_mul.rhs_id) orelse return null;
-    var owned_lhs0: ?CT = null;
-    defer if (owned_lhs0) |ct| cb.free(ct);
-    var owned_rhs0: ?CT = null;
-    defer if (owned_rhs0) |ct| cb.free(ct);
-    var owned_lhs1: ?CT = null;
-    defer if (owned_lhs1) |ct| cb.free(ct);
-    var owned_rhs1: ?CT = null;
-    defer if (owned_rhs1) |ct| cb.free(ct);
-    if (cb.kind() == .metal) {
-        if (!isMetalDeviceResident(cb, lhs0)) {
-            if (try makeMetalDeviceResident(cb, lhs0)) |device_lhs0| {
-                if (device_lhs0 != lhs0) owned_lhs0 = device_lhs0;
-                lhs0 = device_lhs0;
-            }
-        }
-        if (!isMetalDeviceResident(cb, rhs0)) {
-            if (try makeMetalDeviceResident(cb, rhs0)) |device_rhs0| {
-                if (device_rhs0 != rhs0) owned_rhs0 = device_rhs0;
-                rhs0 = device_rhs0;
-            }
-        }
-        if (!isMetalDeviceResident(cb, lhs1)) {
-            if (try makeMetalDeviceResident(cb, lhs1)) |device_lhs1| {
-                if (device_lhs1 != lhs1) owned_lhs1 = device_lhs1;
-                lhs1 = device_lhs1;
-            }
-        }
-        if (!isMetalDeviceResident(cb, rhs1)) {
-            if (try makeMetalDeviceResident(cb, rhs1)) |device_rhs1| {
-                if (device_rhs1 != rhs1) owned_rhs1 = device_rhs1;
-                rhs1 = device_rhs1;
-            }
-        }
-    }
+    const lhs0 = valueFor(values, lhs_mul.lhs_id) orelse return null;
+    const rhs0 = valueFor(values, lhs_mul.rhs_id) orelse return null;
+    const lhs1 = valueFor(values, rhs_mul.lhs_id) orelse return null;
+    const rhs1 = valueFor(values, rhs_mul.rhs_id) orelse return null;
+    const left0 = try temporaryMetalResidentValue(cb, lhs0);
+    defer left0.deinit(cb);
+    const right0 = try temporaryMetalResidentValue(cb, rhs0);
+    defer right0.deinit(cb);
+    const left1 = try temporaryMetalResidentValue(cb, lhs1);
+    defer left1.deinit(cb);
+    const right1 = try temporaryMetalResidentValue(cb, rhs1);
+    defer right1.deinit(cb);
     const output = try executeDecoderWithOutputHint(cb, ComputeBackend.decoderRuntimeApplyMultiplyAdd2, ops_mod.DecoderRuntimeApplyMultiplyAdd2Request{
         .output = output_hint,
-        .lhs0 = lhs0,
-        .rhs0 = rhs0,
-        .lhs1 = lhs1,
-        .rhs1 = rhs1,
+        .lhs0 = left0.value,
+        .rhs0 = right0.value,
+        .lhs1 = left1.value,
+        .rhs1 = right1.value,
         .dim = dim,
     });
-    if (try promoteMetalOutputIfNeeded(cb, output)) |result| return result;
+    if (try promoteMetalOutputIfNeeded(cb, output, output_hint)) |result| return result;
 
-    const lhs_product = cb.multiply(lhs0, rhs0) catch |err| switch (err) {
+    const lhs_product = cb.multiply(left0.value, right0.value) catch |err| switch (err) {
         error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return null,
         else => return err,
     };
     defer cb.free(lhs_product);
-    const rhs_product = cb.multiply(lhs1, rhs1) catch |err| switch (err) {
+    const rhs_product = cb.multiply(left1.value, right1.value) catch |err| switch (err) {
         error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return null,
         else => return err,
     };
@@ -16098,7 +16102,7 @@ fn executeDeferredElementwiseMultiplyAdd2(
         error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return null,
         else => return err,
     };
-    return try promoteMetalOutputIfNeeded(cb, fallback);
+    return try promoteMetalOutputIfNeeded(cb, fallback, null);
 }
 
 fn executeDeferredElementwiseMultiplyAdd(
@@ -16109,54 +16113,33 @@ fn executeDeferredElementwiseMultiplyAdd(
     dim: usize,
     output_hint: ?CT,
 ) !?CT {
-    var lhs = valueFor(values, mul.lhs_id) orelse return null;
-    var rhs = valueFor(values, mul.rhs_id) orelse return null;
-    var residual = addend;
-    var owned_lhs: ?CT = null;
-    defer if (owned_lhs) |ct| cb.free(ct);
-    var owned_rhs: ?CT = null;
-    defer if (owned_rhs) |ct| cb.free(ct);
-    var owned_residual: ?CT = null;
-    defer if (owned_residual) |ct| cb.free(ct);
-    if (cb.kind() == .metal) {
-        if (!isMetalDeviceResident(cb, lhs)) {
-            if (try makeMetalDeviceResident(cb, lhs)) |device_lhs| {
-                if (device_lhs != lhs) owned_lhs = device_lhs;
-                lhs = device_lhs;
-            }
-        }
-        if (!isMetalDeviceResident(cb, rhs)) {
-            if (try makeMetalDeviceResident(cb, rhs)) |device_rhs| {
-                if (device_rhs != rhs) owned_rhs = device_rhs;
-                rhs = device_rhs;
-            }
-        }
-        if (!isMetalDeviceResident(cb, residual)) {
-            if (try makeMetalDeviceResident(cb, residual)) |device_residual| {
-                if (device_residual != residual) owned_residual = device_residual;
-                residual = device_residual;
-            }
-        }
-    }
+    const lhs = valueFor(values, mul.lhs_id) orelse return null;
+    const rhs = valueFor(values, mul.rhs_id) orelse return null;
+    const left = try temporaryMetalResidentValue(cb, lhs);
+    defer left.deinit(cb);
+    const right = try temporaryMetalResidentValue(cb, rhs);
+    defer right.deinit(cb);
+    const residual = try temporaryMetalResidentValue(cb, addend);
+    defer residual.deinit(cb);
     const output = try executeDecoderWithOutputHint(cb, ComputeBackend.decoderRuntimeApplyMultiplyAdd, ops_mod.DecoderRuntimeApplyMultiplyAddRequest{
         .output = output_hint,
-        .lhs = lhs,
-        .rhs = rhs,
-        .addend = residual,
+        .lhs = left.value,
+        .rhs = right.value,
+        .addend = residual.value,
         .dim = dim,
     });
-    if (try promoteMetalOutputIfNeeded(cb, output)) |result| return result;
+    if (try promoteMetalOutputIfNeeded(cb, output, output_hint)) |result| return result;
 
-    const multiplied = cb.multiply(lhs, rhs) catch |err| switch (err) {
+    const multiplied = cb.multiply(left.value, right.value) catch |err| switch (err) {
         error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return null,
         else => return err,
     };
     defer cb.free(multiplied);
-    const fallback = cb.add(multiplied, residual) catch |err| switch (err) {
+    const fallback = cb.add(multiplied, residual.value) catch |err| switch (err) {
         error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return null,
         else => return err,
     };
-    return try promoteMetalOutputIfNeeded(cb, fallback);
+    return try promoteMetalOutputIfNeeded(cb, fallback, null);
 }
 
 fn executeDeferredScaleMulValue(
@@ -16164,27 +16147,13 @@ fn executeDeferredScaleMulValue(
     values: []?CT,
     scaled: DeferredScaleMul,
 ) !?CT {
-    var lhs = valueFor(values, scaled.source_id) orelse return null;
-    var scalar = valueFor(values, scaled.scalar_id) orelse return null;
-    var owned_lhs: ?CT = null;
-    defer if (owned_lhs) |ct| cb.free(ct);
-    var owned_scalar: ?CT = null;
-    defer if (owned_scalar) |ct| cb.free(ct);
-    if (cb.kind() == .metal) {
-        if (!isMetalDeviceResident(cb, lhs)) {
-            if (try makeMetalDeviceResident(cb, lhs)) |device_lhs| {
-                if (device_lhs != lhs) owned_lhs = device_lhs;
-                lhs = device_lhs;
-            }
-        }
-        if (!isMetalDeviceResident(cb, scalar)) {
-            if (try makeMetalDeviceResident(cb, scalar)) |device_scalar| {
-                if (device_scalar != scalar) owned_scalar = device_scalar;
-                scalar = device_scalar;
-            }
-        }
-    }
-    return cb.multiply(lhs, scalar) catch |err| switch (err) {
+    const lhs = valueFor(values, scaled.source_id) orelse return null;
+    const scalar = valueFor(values, scaled.scalar_id) orelse return null;
+    const left = try temporaryMetalResidentValue(cb, lhs);
+    defer left.deinit(cb);
+    const right = try temporaryMetalResidentValue(cb, scalar);
+    defer right.deinit(cb);
+    return cb.multiply(left.value, right.value) catch |err| switch (err) {
         error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
     };
@@ -16196,24 +16165,15 @@ fn executeDeferredScaleAddFallback(
     scaled: DeferredScaleMul,
     residual: CT,
 ) !?CT {
-    var rhs = residual;
-    var owned_rhs: ?CT = null;
-    defer if (owned_rhs) |ct| cb.free(ct);
-    if (cb.kind() == .metal) {
-        if (!isMetalDeviceResident(cb, rhs)) {
-            if (try makeMetalDeviceResident(cb, rhs)) |device_rhs| {
-                if (device_rhs != rhs) owned_rhs = device_rhs;
-                rhs = device_rhs;
-            }
-        }
-    }
+    const rhs = try temporaryMetalResidentValue(cb, residual);
+    defer rhs.deinit(cb);
     const multiplied_ct = (try executeDeferredScaleMulValue(cb, values, scaled)) orelse return null;
     defer cb.free(multiplied_ct);
-    const output = cb.add(multiplied_ct, rhs) catch |err| switch (err) {
+    const output = cb.add(multiplied_ct, rhs.value) catch |err| switch (err) {
         error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
     };
-    return try promoteMetalOutputIfNeeded(cb, output);
+    return try promoteMetalOutputIfNeeded(cb, output, null);
 }
 
 /// A mul input may only be consumed as a "deferred" (fused) producer when its
@@ -16230,59 +16190,6 @@ fn executeDeferredScaleAddFallback(
 fn pendingDeferredScaleMul(graph: *const Graph, values: []?CT, node_id: NodeId, output_shape: ml.graph.Shape) ?DeferredScaleMul {
     if (valueFor(values, node_id) != null) return null;
     return deferredScaleMul(graph, node_id, output_shape);
-}
-
-fn pendingDeferredElementwiseMul(graph: *const Graph, values: []?CT, node_id: NodeId, output_shape: ml.graph.Shape) ?DeferredElementwiseMul {
-    if (valueFor(values, node_id) != null) return null;
-    return deferredElementwiseMul(graph, node_id, output_shape);
-}
-
-fn deferredScaleMul(graph: *const Graph, node_id: NodeId, output_shape: ml.graph.Shape) ?DeferredScaleMul {
-    if (node_id == null_node or node_id >= graph.nodeCount()) return null;
-    const node = graph.node(node_id);
-    switch (node.op) {
-        .mul, .fused_elem_multiply => {},
-        else => return null,
-    }
-    if (!shapesEqual(node.output_shape, output_shape)) return null;
-    if (node.num_inputs < 2) return null;
-    if (scalarConstantF32(graph, node.inputs[0])) |scale| {
-        return .{ .source_id = node.inputs[1], .scalar_id = node.inputs[0], .scale = scale };
-    }
-    if (scalarConstantF32(graph, node.inputs[1])) |scale| {
-        return .{ .source_id = node.inputs[0], .scalar_id = node.inputs[1], .scale = scale };
-    }
-    return null;
-}
-
-fn deferredElementwiseMul(graph: *const Graph, node_id: NodeId, output_shape: ml.graph.Shape) ?DeferredElementwiseMul {
-    if (node_id == null_node or node_id >= graph.nodeCount()) return null;
-    const node = graph.node(node_id);
-    switch (node.op) {
-        .mul, .fused_elem_multiply => {},
-        else => return null,
-    }
-    if (!shapesEqual(node.output_shape, output_shape)) return null;
-    if (node.output_shape.dtype != .f32 or node.num_inputs < 2) return null;
-    if (deferredScaleMul(graph, node_id, output_shape) != null) return null;
-    const lhs_id = node.inputs[0];
-    const rhs_id = node.inputs[1];
-    if (lhs_id == null_node or rhs_id == null_node or lhs_id >= graph.nodeCount() or rhs_id >= graph.nodeCount()) return null;
-    if (!shapesEqual(graph.node(lhs_id).output_shape, output_shape)) return null;
-    if (!shapesEqual(graph.node(rhs_id).output_shape, output_shape)) return null;
-    if (isSameShapeElementwiseMul(graph, lhs_id, output_shape)) return null;
-    if (isSameShapeElementwiseMul(graph, rhs_id, output_shape)) return null;
-    return .{ .lhs_id = lhs_id, .rhs_id = rhs_id };
-}
-
-fn isSameShapeElementwiseMul(graph: *const Graph, node_id: NodeId, output_shape: ml.graph.Shape) bool {
-    if (node_id == null_node or node_id >= graph.nodeCount()) return false;
-    const node = graph.node(node_id);
-    switch (node.op) {
-        .mul, .fused_elem_multiply => {},
-        else => return false,
-    }
-    return shapesEqual(node.output_shape, output_shape);
 }
 
 fn binaryBroadcastResultMatches(
@@ -16319,147 +16226,19 @@ fn binaryBroadcastResultMatches(
     return true;
 }
 
-fn shouldDeferScaleMulForAdd(
-    graph: *const Graph,
-    node_id: NodeId,
-    reachable: []const bool,
-    last_use: []const u32,
-    use_counts: ?[]const u8,
-) bool {
-    const node_index: usize = @intCast(node_id);
-    if (node_index >= reachable.len or !reachable[node_index]) return false;
-    if (node_index >= last_use.len) return false;
-    const consumer_id: NodeId = @intCast(last_use[node_index]);
-    if (consumer_id == null_node or consumer_id >= graph.nodeCount()) return false;
-    const consumer_index: usize = @intCast(consumer_id);
-    if (consumer_index >= reachable.len or !reachable[consumer_index]) return false;
-    const consumer = graph.node(consumer_id);
-    switch (consumer.op) {
-        .add, .fused_elem_add => {},
-        else => return false,
-    }
-    if (consumer.num_inputs < 2 or (consumer.inputs[0] != node_id and consumer.inputs[1] != node_id)) return false;
-    if (!hasSingleReachableConsumer(graph, node_id, reachable, use_counts)) return false;
-    if (deferredScaleMul(graph, node_id, consumer.output_shape) == null) return false;
-    return deferredProducerInputsLiveUntilConsumer(graph, node_id, consumer_id, last_use);
+const region_schedule = @import("../execution/region_schedule.zig");
+const deferredProducerInputsLiveUntilConsumer = region_schedule.deferredProducerInputsLiveUntilConsumer;
+const reachableUseCount = region_schedule.reachableUseCount;
+const computeReachableUseCountsCapped = region_schedule.computeReachableUseCountsCapped;
+
+fn shouldDeferScaleMulForAdd(graph: *const Graph, node_id: NodeId, reachable: []const bool, last_use: []const u32, use_counts: ?[]const u8) bool {
+    const consumer = region_schedule.deferredAddConsumer(graph, node_id, reachable, last_use, use_counts) orelse return false;
+    return deferredScaleMul(graph, node_id, graph.node(consumer).output_shape) != null;
 }
 
-fn shouldDeferElementwiseMulForAdd(
-    graph: *const Graph,
-    node_id: NodeId,
-    reachable: []const bool,
-    last_use: []const u32,
-    use_counts: ?[]const u8,
-) bool {
-    const node_index: usize = @intCast(node_id);
-    if (node_index >= reachable.len or !reachable[node_index]) return false;
-    if (node_index >= last_use.len) return false;
-    const consumer_id: NodeId = @intCast(last_use[node_index]);
-    if (consumer_id == null_node or consumer_id >= graph.nodeCount()) return false;
-    const consumer_index: usize = @intCast(consumer_id);
-    if (consumer_index >= reachable.len or !reachable[consumer_index]) return false;
-    const consumer = graph.node(consumer_id);
-    switch (consumer.op) {
-        .add, .fused_elem_add => {},
-        else => return false,
-    }
-    if (consumer.num_inputs < 2 or (consumer.inputs[0] != node_id and consumer.inputs[1] != node_id)) return false;
-    if (!hasSingleReachableConsumer(graph, node_id, reachable, use_counts)) return false;
-    if (deferredElementwiseMul(graph, node_id, consumer.output_shape) == null) return false;
-    if (!deferredProducerInputsLiveUntilConsumer(graph, node_id, consumer_id, last_use)) return false;
-    return true;
-}
-
-fn deferredProducerInputsLiveUntilConsumer(
-    graph: *const Graph,
-    producer_id: NodeId,
-    consumer_id: NodeId,
-    last_use: []const u32,
-) bool {
-    if (producer_id == null_node or producer_id >= graph.nodeCount()) return false;
-    const producer_index: usize = @intCast(producer_id);
-    const consumer_index: usize = @intCast(consumer_id);
-    const producer = graph.node(producer_id);
-    for (producer.getInputs()) |input_id| {
-        if (input_id == null_node or input_id >= graph.nodeCount()) return false;
-        const input_index: usize = @intCast(input_id);
-        if (input_index >= last_use.len) return false;
-        // Pre-materialized constants (scalar/tensor consts, zero tensors) are
-        // re-materialized every execution and never recycled by buffer reuse, so
-        // their last-use position does not constrain deferral — a deferred mul can
-        // safely read them at the consumer even if a sibling consumed them earlier.
-        // Exempting them recovers fusion for the common `(x*s) + (y*s)` pattern
-        // where a shared scalar's last use is the sibling multiply.
-        if (isPreMaterializedConstantOp(graph.node(input_id).op)) continue;
-        const input_last_use = last_use[input_index];
-        if (input_last_use == std.math.maxInt(u32)) continue;
-        const input_last_use_index: usize = @intCast(input_last_use);
-        if (input_last_use_index == producer_index) continue;
-        if (input_last_use_index >= consumer_index) continue;
-        return false;
-    }
-    return true;
-}
-
-fn reachableUseCount(graph: *const Graph, node_id: NodeId, reachable: []const bool, stop_after: usize) usize {
-    var count: usize = 0;
-    var candidate: NodeId = 0;
-    while (candidate < graph.nodeCount()) : (candidate += 1) {
-        const candidate_index: usize = @intCast(candidate);
-        if (candidate_index >= reachable.len or !reachable[candidate_index]) continue;
-        const node = graph.node(candidate);
-        for (node.getInputs()) |input_id| {
-            if (input_id != node_id) continue;
-            count += 1;
-            if (count >= stop_after) return count;
-        }
-    }
-    return count;
-}
-
-/// Per-node count of reachable consumers, capped at 2 (callers only need to tell
-/// "exactly one consumer" from "more than one"). Built once in O(edges) so the
-/// per-node execution loop can answer the deferral use-count query in O(1)
-/// instead of an O(nodes) `reachableUseCount` scan per candidate — the fix for
-/// the O(nodes^2) term on the hot path. Caller owns the returned slice.
-fn computeReachableUseCountsCapped(allocator: std.mem.Allocator, graph: *const Graph, reachable: []const bool) ![]u8 {
-    const counts = try allocator.alloc(u8, graph.nodeCount());
-    @memset(counts, 0);
-    var candidate: NodeId = 0;
-    while (candidate < graph.nodeCount()) : (candidate += 1) {
-        const candidate_index: usize = @intCast(candidate);
-        if (candidate_index >= reachable.len or !reachable[candidate_index]) continue;
-        for (graph.node(candidate).getInputs()) |input_id| {
-            if (input_id == null_node or input_id >= graph.nodeCount()) continue;
-            const input_index: usize = @intCast(input_id);
-            if (counts[input_index] < 2) counts[input_index] += 1;
-        }
-    }
-    return counts;
-}
-
-/// True when `node_id` has exactly one reachable consumer. Uses the precomputed
-/// capped use-count array when supplied (O(1)); otherwise falls back to the
-/// O(nodes) scan (fine for the small graphs in unit tests).
-fn hasSingleReachableConsumer(graph: *const Graph, node_id: NodeId, reachable: []const bool, use_counts: ?[]const u8) bool {
-    if (use_counts) |counts| {
-        const idx: usize = @intCast(node_id);
-        if (idx < counts.len) return counts[idx] == 1;
-    }
-    return reachableUseCount(graph, node_id, reachable, 2) == 1;
-}
-
-fn scalarConstantF32(graph: *const Graph, node_id: NodeId) ?f32 {
-    if (node_id == null_node or node_id >= graph.nodeCount()) return null;
-    const node = graph.node(node_id);
-    const attrs = switch (node.op) {
-        .constant => |constant_attrs| constant_attrs,
-        else => return null,
-    };
-    if (node.output_shape.dtype != .f32 or node.output_shape.rank() != 0 or attrs.data_len != 1) return null;
-    const values = graph.constantDataAs(f32, attrs.data_offset, attrs.data_len);
-    if (values.len != 1) return null;
-    return values[0];
+fn shouldDeferElementwiseMulForAdd(graph: *const Graph, node_id: NodeId, reachable: []const bool, last_use: []const u32, use_counts: ?[]const u8) bool {
+    const consumer = region_schedule.deferredAddConsumer(graph, node_id, reachable, last_use, use_counts) orelse return false;
+    return deferredElementwiseMul(graph, node_id, graph.node(consumer).output_shape) != null;
 }
 
 fn shapesEqual(lhs: ml.graph.Shape, rhs: ml.graph.Shape) bool {
@@ -16615,6 +16394,7 @@ fn materializePartitionRuntimeInputs(
     const trace_nodes = traceMetalGraphNodesEnabled();
     for (node_ids) |node_id| {
         const rt_val = rt_map.get(node_id) orelse continue;
+        try exec_ctx.check();
         const i: usize = @intCast(node_id);
         const current_dev = value_device[i];
         if (trace_nodes) std.debug.print(
@@ -16622,30 +16402,24 @@ fn materializePartitionRuntimeInputs(
             .{ node_id, current_dev, device_id, isMetalDeviceResident(cb, rt_val) },
         );
         const stay_host_backed = runtimeInputShouldStayHostBackedForDynamicMetalSlot(graph, node_id);
-        if (current_dev != device_id and stay_host_backed) {
+        if (current_dev != device_id) {
             const mesh = exec_ctx.mesh orelse return error.DeviceNotFound;
             const src_entry = mesh.device(current_dev) orelse return error.DeviceNotFound;
             if (trace_nodes) std.debug.print(
-                "graph_executor_node_trace: materialize_runtime_input_transfer_host node={d} from_backend={s} to_backend={s}\n",
-                .{ node_id, @tagName(src_entry.backend.kind()), @tagName(cb.kind()) },
+                "graph_executor_node_trace: materialize_runtime_input_transfer node={d} from_backend={s} to_backend={s} host={}\n",
+                .{ node_id, @tagName(src_entry.backend.kind()), @tagName(cb.kind()), stay_host_backed },
             );
-            const transferred = try transferTensorHostBacked(allocator, rt_val, src_entry.backend, cb);
+            if (exec_ctx.owned_runtime_transfers) |owned| try owned.ensureUnusedCapacity(allocator, 1);
+            const transferred = if (stay_host_backed)
+                try tensor_transfer.copyHostFloat32(allocator, rt_val, src_entry.backend, cb)
+            else
+                try tensor_transfer.copyRuntimeInput(allocator, rt_val, src_entry.backend, cb);
             values[i] = transferred;
-            if (exec_ctx.owned_runtime_transfers) |owned| try owned.put(allocator, node_id, {});
-            if (exec_ctx.stats) |stats| stats.runtime_input_transfers += 1;
-        } else if (current_dev != device_id) {
-            const mesh = exec_ctx.mesh orelse return error.DeviceNotFound;
-            const src_entry = mesh.device(current_dev) orelse return error.DeviceNotFound;
-            if (trace_nodes) std.debug.print(
-                "graph_executor_node_trace: materialize_runtime_input_transfer node={d} from_backend={s} to_backend={s}\n",
-                .{ node_id, @tagName(src_entry.backend.kind()), @tagName(cb.kind()) },
-            );
-            const transferred = try transferTensor(allocator, rt_val, src_entry.backend, cb);
-            values[i] = transferred;
-            if (exec_ctx.owned_runtime_transfers) |owned| try owned.put(allocator, node_id, {});
+            value_device[i] = device_id;
+            if (exec_ctx.owned_runtime_transfers) |owned| owned.putAssumeCapacity(node_id, {});
             if (exec_ctx.stats) |stats| {
                 stats.runtime_input_transfers += 1;
-                if (isMetalDeviceResident(cb, transferred)) stats.device_resident_transfers += 1;
+                if (!stay_host_backed and isMetalDeviceResident(cb, transferred)) stats.device_resident_transfers += 1;
             }
         } else {
             values[i] = rt_val;
@@ -16654,6 +16428,7 @@ fn materializePartitionRuntimeInputs(
         if (!preserve_runtime_input_residency and values[i] != null) {
             const current = values[i].?;
             if (!stay_host_backed and !isMetalDeviceResident(cb, current)) {
+                if (exec_ctx.owned_runtime_transfers) |owned| try owned.ensureUnusedCapacity(allocator, 1);
                 if (trace_nodes) std.debug.print(
                     "graph_executor_node_trace: materialize_runtime_input_make_resident node={d}\n",
                     .{node_id},
@@ -16661,7 +16436,8 @@ fn materializePartitionRuntimeInputs(
                 if (try makeMetalDeviceResident(cb, current)) |device_value| {
                     if (device_value != current) {
                         values[i] = device_value;
-                        if (exec_ctx.owned_runtime_transfers) |owned| try owned.put(allocator, node_id, {});
+                        if (exec_ctx.owned_runtime_transfers) |owned| owned.putAssumeCapacity(node_id, {});
+                        if (current_dev != device_id) cb.free(current);
                     }
                     if (exec_ctx.stats) |stats| stats.device_resident_transfers += 1;
                 }
@@ -16842,12 +16618,14 @@ fn materializePartitionConstants(
     reachable: []const bool,
     device_id: DeviceId,
     physical_frame: ?*@import("../execution/physical_buffers.zig").Frame,
+    owned_frame: bool,
 ) !void {
     for (node_ids) |node_id| {
         const i: usize = @intCast(node_id);
         if (i >= reachable.len or !reachable[i]) continue;
         if (values[i] != null) continue;
         const node = graph.node(node_id);
+        if (owned_frame and node.op == .constant and physical_frame.?.pool.baked_region_literals.contains(node_id)) continue;
         const materialized = switch (node.op) {
             .constant => |attrs| if (physical_frame) |frame|
                 (try frame.materializeLiteral(cb, node_id)) orelse try executeRuntimeConstant(graph, cb, node.output_shape, attrs)
@@ -16894,7 +16672,7 @@ fn freeExpiredInputs(
         }
         if (rt_map.contains(input_id) and
             !donated.contains(input_id) and
-            !ownedRuntimeTransferContains(exec_ctx, input_id)) continue;
+            !exec_ctx.ownsRuntimeTransfer(input_id)) continue;
         const ct = values[input_index] orelse continue;
         const input_bytes = outputByteLen(graph.node(input_id).output_shape) orelse 0;
         if (values[node_index]) |out_ct| {
@@ -16964,7 +16742,7 @@ fn sweepExpiredValuesThroughNode(
         }
         if (rt_map.contains(node_id) and
             !donated.contains(node_id) and
-            !ownedRuntimeTransferContains(exec_ctx, node_id)) continue;
+            !exec_ctx.ownsRuntimeTransfer(node_id)) continue;
 
         var has_live_alias = false;
         for (values, 0..) |other_maybe, other_raw_id| {
@@ -16983,7 +16761,7 @@ fn sweepExpiredValuesThroughNode(
             }
             if (rt_map.contains(other_id) and
                 !donated.contains(other_id) and
-                !ownedRuntimeTransferContains(exec_ctx, other_id))
+                !exec_ctx.ownsRuntimeTransfer(other_id))
             {
                 has_live_alias = true;
                 break;
@@ -17036,7 +16814,7 @@ fn promoteLiveValuesAcrossFrameBoundary(
         if (!valueReferencedAfterBoundary(graph, node_ids, boundary_pos, node_id)) continue;
         if (rt_map.contains(node_id) and
             !donated.contains(node_id) and
-            !ownedRuntimeTransferContains(exec_ctx, node_id)) continue;
+            !exec_ctx.ownsRuntimeTransfer(node_id)) continue;
 
         const owned = (try metal_compute_mod.MetalCompute.cloneOutputTensorOwned(cb, ct)) orelse continue;
         errdefer cb.free(owned);
@@ -17256,59 +17034,6 @@ fn countPartitionBoundaryOutputs(view: buffer_plan_mod.PartitionBufferView) u64 
         if (slot_view.roles.output or slot_view.roles.graph_output) count += 1;
     }
     return count;
-}
-
-fn ownedRuntimeTransferContains(
-    exec_ctx: PartitionExecutor.ExecutionContext,
-    node_id: NodeId,
-) bool {
-    const owned = exec_ctx.owned_runtime_transfers orelse return false;
-    return owned.contains(node_id);
-}
-
-fn transferTensor(
-    allocator: std.mem.Allocator,
-    value: CT,
-    from: *const ComputeBackend,
-    to: *const ComputeBackend,
-) !CT {
-    const shape_i64 = try from.tensorShape(value, allocator);
-    defer allocator.free(shape_i64);
-    const shape_i32 = try tensorShapeI32(allocator, shape_i64);
-    defer allocator.free(shape_i32);
-    const f32_data = try from.toFloat32(value, allocator);
-    defer allocator.free(f32_data);
-    const transferred = try to.fromFloat32Shape(f32_data, shape_i32);
-    errdefer to.free(transferred);
-    if (try makeMetalDeviceResident(to, transferred)) |device_transferred| {
-        to.free(transferred);
-        return device_transferred;
-    }
-    return transferred;
-}
-
-fn transferTensorHostBacked(
-    allocator: std.mem.Allocator,
-    value: CT,
-    from: *const ComputeBackend,
-    to: *const ComputeBackend,
-) !CT {
-    const shape_i64 = try from.tensorShape(value, allocator);
-    defer allocator.free(shape_i64);
-    const shape_i32 = try tensorShapeI32(allocator, shape_i64);
-    defer allocator.free(shape_i32);
-    const f32_data = try from.toFloat32(value, allocator);
-    defer allocator.free(f32_data);
-    return to.fromFloat32Shape(f32_data, shape_i32);
-}
-
-fn tensorShapeI32(allocator: std.mem.Allocator, shape: []const i64) ![]i32 {
-    const out = try allocator.alloc(i32, shape.len);
-    errdefer allocator.free(out);
-    for (shape, 0..) |dim, i| {
-        out[i] = std.math.cast(i32, dim) orelse return error.UnsupportedShape;
-    }
-    return out;
 }
 
 const native_compute = @import("../ops/native_compute.zig");
@@ -18830,6 +18555,22 @@ test "metal partition executor defers same shape multiply for multiply-add" {
     try std.testing.expectEqual(@as(usize, 1), reachableUseCount(&g, multiplied, reachable, 2));
     try std.testing.expect(deferredElementwiseMul(&g, multiplied, g.node(out).output_shape) != null);
     try std.testing.expect(shouldDeferElementwiseMulForAdd(&g, multiplied, reachable, last_use, null));
+    if (ownedFramePolicyAvailable()) {
+        const Stub = struct {
+            fn kind(_: *anyopaque) ops_mod.BackendKind {
+                return .metal;
+            }
+        };
+        var table = native_compute.vtable_impl;
+        table.backendKind = Stub.kind;
+        var marker: u8 = 0;
+        const backend: ComputeBackend = .{ .ptr = &marker, .vtable = &table };
+        const executor = try MetalPartitionExecutor.create(allocator, &g, &backend);
+        const pe = executor.partitionExecutor();
+        defer pe.deinitExecutor();
+        const reason = try MetalPartitionExecutor.ownedFrameDispatchDecline(pe, &g, &backend, &.{ x, y, z, multiplied, out }, reachable, last_use, null);
+        try std.testing.expectEqual(@as(?@import("../execution/owned_coverage.zig").Reason, .deferred_producer), reason);
+    }
 }
 
 test "metal partition executor allows deferred multiply-add inside current frame chunk" {
@@ -19025,6 +18766,12 @@ test "metal partition executor defers both same shape multiply add inputs" {
     const out = try b.add(lhs, rhs);
     try g.markOutput(out);
 
+    const ProductAdd = ops_mod.kernel_descriptor.F32ProductAdd;
+    const both = ProductAdd.match(&g, g.node(out).getInputs(), shape, .{ true, true }).?;
+    try std.testing.expectEqualDeep(ProductAdd{ .pair = .{ .{ .node = lhs, .lhs_id = x, .rhs_id = y }, .{ .node = rhs, .lhs_id = z, .rhs_id = w } } }, both);
+    const right = ProductAdd.match(&g, g.node(out).getInputs(), shape, .{ false, true }).?;
+    try std.testing.expectEqualDeep(ProductAdd{ .single = .{ .product = .{ .node = rhs, .lhs_id = z, .rhs_id = w }, .addend = lhs } }, right);
+
     const reachable = try interpreter.computeReachable(allocator, &g);
     defer allocator.free(reachable);
     const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
@@ -19036,6 +18783,8 @@ test "metal partition executor defers both same shape multiply add inputs" {
     try std.testing.expect(deferredElementwiseMul(&g, rhs, g.node(out).output_shape) != null);
     try std.testing.expect(shouldDeferElementwiseMulForAdd(&g, lhs, reachable, last_use, null));
     try std.testing.expect(shouldDeferElementwiseMulForAdd(&g, rhs, reachable, last_use, null));
+    try g.markOutput(lhs);
+    try std.testing.expect(!shouldDeferElementwiseMulForAdd(&g, lhs, reachable, last_use, null));
 }
 
 test "metal partition executor only treats unmaterialized mul inputs as deferred" {
@@ -19088,7 +18837,7 @@ test "metal partition executor only treats unmaterialized mul inputs as deferred
     try std.testing.expect(pendingDeferredScaleMul(&g, values, materialized_mul, out_shape) == null);
     // ...while the skipped (null-valued) mul is still eligible for fusion.
     try std.testing.expect(pendingDeferredScaleMul(&g, values, deferred_mul, out_shape) != null);
-    try std.testing.expect(pendingDeferredElementwiseMul(&g, values, materialized_mul, out_shape) == null);
+    try std.testing.expect(ops_mod.kernel_descriptor.F32ProductAdd.match(&g, g.node(out).getInputs(), out_shape, .{ false, true }) == null);
 }
 
 test "metal partition executor does not defer nested same shape multiply add input" {
@@ -20444,6 +20193,25 @@ test "metal partition executor runtime add keeps resident input device backed" {
     const raw = try cb.toFloat32(out, allocator);
     defer allocator.free(raw);
     try std.testing.expectEqualSlices(f32, &.{ 11.0, 22.0, 33.0, 44.0 }, raw);
+
+    const product: DeferredElementwiseMul = .{ .node = null_node, .lhs_id = x, .rhs_id = y };
+    const fused = (try executeDeferredElementwiseMultiplyAdd2(&cb, values, product, product, dim, null)) orelse return error.UnsupportedPrimitiveOp;
+    defer cb.free(fused);
+    try std.testing.expect(isMetalDeviceResident(&cb, fused));
+    const products = try cb.toFloat32(fused, allocator);
+    defer allocator.free(products);
+    try std.testing.expectEqualSlices(f32, &.{ 20.0, 80.0, 180.0, 320.0 }, products);
+
+    const host_output = try cb.fromFloat32(&.{ 1.0, 2.0, 3.0, 4.0 });
+    var failure = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    metal_compute.allocator = failure.allocator();
+    defer metal_compute.allocator = allocator;
+    const promoted = promoteMetalOutputIfNeeded(&cb, host_output, null) catch |err| {
+        try std.testing.expect(err == error.OutOfMemory);
+        return;
+    };
+    if (promoted) |ct| cb.free(ct);
+    return error.MissingPromotionAllocationFailure;
 }
 
 test "metal partition executor runtime rms norm supports row-wise resident shapes" {
@@ -21875,6 +21643,20 @@ test "metal partition executor resident zero tensor materializes without fallbac
 }
 
 test "metal partition executor resident gqa attention uses command path" {
+    try qualifyResidentAttention(.gqa);
+}
+
+test "Metal partition executes functional GQA suffix into the planned output" {
+    try qualifyResidentAttention(.suffix);
+}
+
+test "Metal partition executes fixed all-valid cross attention into the planned output" {
+    try qualifyResidentAttention(.cross);
+}
+
+fn qualifyResidentAttention(comptime mode: enum { gqa, suffix, cross }) !void {
+    const suffix = mode == .suffix;
+    const cross = mode == .cross;
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
 
@@ -21884,20 +21666,32 @@ test "metal partition executor resident gqa attention uses command path" {
     var b = ml.graph.Builder.init(&g);
 
     const batch: usize = 1;
-    const seq_len: usize = 1;
-    const num_heads: usize = 1;
-    const head_dim: usize = 4;
+    const seq_len: usize = if (suffix) 2 else 1;
+    const key_rows: usize = if (suffix or cross) 4 else seq_len;
+    const num_heads: usize = if (suffix) 2 else 1;
+    const num_kv_heads: usize = 1;
+    const head_dim: usize = if (suffix) 2 else 4;
     const dim: usize = num_heads * head_dim;
+    const kv_dim: usize = num_kv_heads * head_dim;
     const q = try b.parameter("q", ml.graph.Shape.init(.f32, &.{ seq_len, dim }));
-    const k = try b.parameter("k", ml.graph.Shape.init(.f32, &.{ seq_len, dim }));
-    const v = try b.parameter("v", ml.graph.Shape.init(.f32, &.{ seq_len, dim }));
+    const k = try b.parameter("k", ml.graph.Shape.init(.f32, &.{ key_rows, kv_dim }));
+    const v = try b.parameter("v", ml.graph.Shape.init(.f32, &.{ key_rows, kv_dim }));
     const attn = try g.addNode(.{
-        .op = .{ .fused_gqa_causal_attention = .{
+        .op = if (cross) .{ .fused_cross_attention = .{
+            .batch = batch,
+            .dec_seq = seq_len,
+            .enc_seq = key_rows,
+            .num_heads = num_heads,
+            .head_dim = head_dim,
+            .all_keys_visible = true,
+        } } else .{ .fused_gqa_causal_attention = .{
             .batch = @intCast(batch),
             .seq_len = @intCast(seq_len),
-            .kv_seq_len = @intCast(seq_len),
+            .kv_seq_len = @intCast(key_rows),
+            .functional_kv = suffix,
+            .sliding_window = if (suffix) 2 else null,
             .num_heads = @intCast(num_heads),
-            .num_kv_heads = @intCast(num_heads),
+            .num_kv_heads = @intCast(num_kv_heads),
             .head_dim = @intCast(head_dim),
         } },
         .output_shape = ml.graph.Shape.init(.f32, &.{ seq_len, dim }),
@@ -21929,11 +21723,18 @@ test "metal partition executor resident gqa attention uses command path" {
     defer allocator.free(value_device);
     @memset(value_device, 0);
 
-    const q_ct = try cb.fromFloat32Shape(&.{ 1.0, 0.0, 0.0, 0.0 }, &.{ seq_len, dim });
+    const q_values: [seq_len * dim]f32 = @splat(0);
+    const k_values: [key_rows * kv_dim]f32 = @splat(0);
+    const q_ct = try cb.fromFloat32Shape(&q_values, &.{ seq_len, dim });
     defer cb.free(q_ct);
-    const k_ct = try cb.fromFloat32Shape(&.{ 1.0, 0.0, 0.0, 0.0 }, &.{ seq_len, dim });
+    const k_ct = try cb.fromFloat32Shape(&k_values, &.{ key_rows, kv_dim });
     defer cb.free(k_ct);
-    const v_ct = try cb.fromFloat32Shape(&.{ 5.0, 6.0, 7.0, 8.0 }, &.{ seq_len, dim });
+    const key_values: []const f32 = switch (mode) {
+        .gqa => &.{ 5, 6, 7, 8 },
+        .suffix => &.{ 1, 2, 3, 4, 5, 6, 7, 8 },
+        .cross => &.{ 1, 2, 3, 4, 2, 3, 4, 5, 3, 4, 5, 6, 4, 5, 6, 7 },
+    };
+    const v_ct = try cb.fromFloat32Shape(key_values, &.{ key_rows, kv_dim });
     defer cb.free(v_ct);
     const q_dev = (try makeMetalDeviceResident(&cb, q_ct)) orelse return error.SkipZigTest;
     defer cb.free(q_dev);
@@ -21944,6 +21745,24 @@ test "metal partition executor resident gqa attention uses command path" {
     values[@intCast(q)] = q_dev;
     values[@intCast(k)] = k_dev;
     values[@intCast(v)] = v_dev;
+
+    if (suffix) {
+        // An ordinary execution of the same functional node ignores the
+        // caller's unrelated stateful decoder geometry and layer cursor.
+        var state: interpreter.ExecState = .{
+            .attention_layer = 7,
+            .options = .{ .attention = .{ .total_sequence_len = 1, .query_sequence_len = 1, .kv_sequence_len = 1 } },
+        };
+        const node = g.node(attn);
+        const fallback = (try executeRuntimeGqaCausalAttention(&cb, values, node.getInputs(), node.op.fused_gqa_causal_attention, node.num_inputs, &state)) orelse return error.TestUnexpectedResult;
+        defer cb.free(fallback);
+        const result = try cb.toFloat32(fallback, allocator);
+        defer allocator.free(result);
+        for ([_]f32{ 4, 5, 4, 5, 6, 7, 6, 7 }, result) |expected, actual| {
+            try std.testing.expectApproxEqAbs(expected, actual, 1e-5);
+        }
+        try std.testing.expectEqual(@as(usize, 7), state.attention_layer);
+    }
 
     const reachable = try interpreter.computeReachable(allocator, &g);
     defer allocator.free(reachable);
@@ -21980,7 +21799,13 @@ test "metal partition executor resident gqa attention uses command path" {
 
     const raw = try cb.toFloat32(values[out_index].?, allocator);
     defer allocator.free(raw);
-    try std.testing.expectEqualSlices(f32, &.{ 5.0, 6.0, 7.0, 8.0 }, raw);
+    if (suffix or cross) try std.testing.expectEqual(@as(u64, 1), exec_stats.assigned_kernel_dispatches);
+    const expected: []const f32 = switch (mode) {
+        .gqa => &.{ 5, 6, 7, 8 },
+        .suffix => &.{ 4, 5, 4, 5, 6, 7, 6, 7 },
+        .cross => &.{ 2.5, 3.5, 4.5, 5.5 },
+    };
+    try std.testing.expectEqualSlices(f32, expected, raw);
 }
 
 fn putTestQuantizedWeight(
@@ -22776,7 +22601,7 @@ fn expectCachedPreparedParameters(comptime rebind_slot: bool) !void {
     defer compute.deinit();
     var backend = compute.computeBackend();
     if (!backend.decoderRuntimeReady()) return error.ExpectedMetalDecoderRuntime;
-    var runtime = try @import("runtime.zig").Runtime.initWithOptions(a, &graph, &backend, .partitioned, .{ .tensor_descs = seeds });
+    var runtime = try @import("../execution/graph_runtime.zig").Runtime.initWithOptions(a, &graph, &backend, .partitioned, .{ .tensor_descs = seeds });
     defer runtime.deinit();
     var input_data: [dim]f32 = @splat(0.125);
     var first_data: [dim * dim]f32 = @splat(0.125);

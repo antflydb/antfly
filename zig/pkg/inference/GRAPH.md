@@ -92,7 +92,7 @@ For decoder serving, the intended layering is:
 This keeps backend-specific optimizations below the runtime boundary without
 turning a backend helper into a second model executor.
 
-The generic runtime seam lives in `src/graph/runtime.zig`.
+The generic runtime seam lives in `src/execution/graph_runtime.zig`.
 `ImportedOnnxSession` is one caller of that runtime, not the owner of a separate
 ONNX-specific execution architecture.
 

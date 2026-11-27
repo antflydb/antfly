@@ -762,7 +762,7 @@ test "model program real companion video stage preserves frame projection and ti
     const session = try factory.createPjrtSessionWithOptions(a, model, try @import("testing/pjrt_qualification.zig").options(.f32, .generic));
     defer session.close();
     for (0..2) |_| {
-        var actual = try @import("../pipelines/gemma4_video.zig").encode(&cb, .{ .session = session }, a, oracle_store, clip);
+        var actual = try @import("../pipelines/gemma4_video.zig").encode(&cb, .{ .session = session }, a, null, clip);
         defer actual.deinit();
         try std.testing.expectEqualSlices(i64, expected.timestamps_us, actual.timestamps_us);
         try std.testing.expectEqualSlices(usize, expected.images.tokens_per_image, actual.images.tokens_per_image);
@@ -827,7 +827,12 @@ test "model program resident decoder matches full-prefix logits without per-toke
         for (values, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 19)) - 9)) / 100;
         var embedding = try Tensor.initFloat32(a, "input_embeddings", &.{ 1, 1, cfg.hidden_size }, values);
         defer embedding.deinit();
-        const prefix = @import("media_prefix.zig").Prefix{ .embeddings = embedding.borrowedView("input_embeddings") };
+        // Real Gemma 4 media rows carry independent per-layer token IDs.
+        var prefix_ple = [_]i64{0};
+        const prefix = @import("media_prefix.zig").Prefix{
+            .embeddings = embedding.borrowedView("input_embeddings"),
+            .ple_ids = if (cfg.hasPle()) &prefix_ple else null,
+        };
         const history = [_]i64{ 1, 2, 3, 4, 5 };
         for (0..2) |round| {
             var cached = try @import("resident_decoder.zig").Decoder.init(a, session, 8 + round, null);
@@ -837,7 +842,7 @@ test "model program resident decoder matches full-prefix logits without per-toke
                 const exact = try prefix.run(session, history[0..rows], a, .{ .native_call_policy = .in_process });
                 defer a.free(exact);
                 const before = factory.getPjrtSpecializationCount(session).?;
-                const incremental = if (rows == first_rows) try prefix.runCached(&cached, history[0..rows], a, .{ .native_call_policy = .in_process }) else try cached.text(history[0..rows], a, .{ .native_call_policy = .in_process });
+                const incremental = try @import("media_prefix.zig").runStep(session, &cached, &prefix, if (rows == first_rows) .prefill else .decode, history[0..rows], a, .{ .native_call_policy = .in_process });
                 defer a.free(incremental);
                 if (rows == 5 or round == 1) try std.testing.expectEqual(before, factory.getPjrtSpecializationCount(session).?);
                 try std.testing.expectEqual(exact.len, incremental.len);
@@ -886,7 +891,11 @@ test "model program resident decoder matches full-prefix logits without per-toke
                 for (full_values, 0..) |*value, i| value.* = values[i % values.len];
                 var full_embedding = try Tensor.initFloat32(a, "input_embeddings", &.{ 1, @intCast(rows), cfg.hidden_size }, full_values);
                 defer full_embedding.deinit();
-                const prepared = @import("media_prefix.zig").Prefix{ .embeddings = full_embedding.borrowedView("input_embeddings") };
+                var full_ple: [history.len]i64 = @splat(0);
+                const prepared = @import("media_prefix.zig").Prefix{
+                    .embeddings = full_embedding.borrowedView("input_embeddings"),
+                    .ple_ids = if (cfg.hasPle()) full_ple[0..rows] else null,
+                };
                 const expected = try prepared.run(session, history[0..rows], a, .{ .native_call_policy = .in_process });
                 defer a.free(expected);
                 var cached = try @import("resident_decoder.zig").Decoder.init(a, session, 8, null);
@@ -1154,11 +1163,11 @@ test "model program real Whisper resident full-window banks and first decode mat
         }
         const tokens = [_]i64{ cfg.decoder_start_token_id, cfg.bos_token_id, cfg.eos_token_id, cfg.decoder_start_token_id };
         for ([_]usize{ 3, 4 }) |length| {
-            const actual = try decoder.encoderDecoderSuffix(.{ .position = decoder.position, .tokens = tokens[decoder.position..length] }, hidden, mask, a, DecoderQualification.control);
-            defer a.free(actual);
+            var actual = try decoder.encoderDecoderSuffix(.{ .position = decoder.position, .tokens = tokens[decoder.position..length] }, hidden, mask, a, DecoderQualification.control);
+            defer actual.deinit();
             {
                 const state = decoder.resident.?;
-                for (state.buffers, 0..) |*buffer, index| {
+                for (state.banks(), 0..) |*buffer, index| {
                     const self_attention = index % 4 < 2;
                     const shape = [_]i64{ @intCast(if (self_attention) cfg.max_target_positions else rows), cfg.d_model };
                     const bank = try buffer.toFloat32WithShape(a, &shape);
@@ -1182,19 +1191,19 @@ test "model program real Whisper resident full-window banks and first decode mat
             if (length == 4) {
                 var fresh = (try DecoderQualification.Decoder.initEncoderDecoder(a, session, rows, true, DecoderQualification.control)).?;
                 defer fresh.deinit();
-                const fresh_logits = try fresh.encoderDecoderSuffix(.{ .position = 0, .tokens = tokens[0..length] }, hidden, mask, a, DecoderQualification.control);
-                defer a.free(fresh_logits);
+                var fresh_logits = try fresh.encoderDecoderSuffix(.{ .position = 0, .tokens = tokens[0..length] }, hidden, mask, a, DecoderQualification.control);
+                defer fresh_logits.deinit();
                 var native_backend = try factory.getComputeBackend(session, a);
                 defer native_backend.deinit();
                 const native_encoder = try native_backend.fromFloat32Shape(values, &.{ 1, @intCast(rows), @intCast(cfg.d_model) });
                 defer native_backend.free(native_encoder);
                 const native_logits = try @import("../architectures/whisper.zig").decoderForward(&native_backend, a, cfg.*, tokens[0..length], native_encoder, mask, 1, length, rows);
                 defer a.free(native_logits);
-                for (native_logits[native_logits.len - cfg.vocab_size ..], actual, fresh_logits) |reference, cached, initial| {
+                for (native_logits[native_logits.len - cfg.vocab_size ..], actual.asFloat32(), fresh_logits.asFloat32()) |reference, cached, initial| {
                     try std.testing.expectApproxEqAbs(reference, cached, 1e-4);
                     try std.testing.expectApproxEqAbs(reference, initial, 1e-4);
                 }
-                for (decoder.resident.?.buffers, fresh.resident.?.buffers, 0..) |*updated, *initial, index| {
+                for (decoder.resident.?.banks(), fresh.resident.?.banks(), 0..) |*updated, *initial, index| {
                     const self_attention = index % 4 < 2;
                     const shape = [_]i64{ @intCast(if (self_attention) cfg.max_target_positions else rows), cfg.d_model };
                     const left = try updated.toFloat32WithShape(a, &shape);
@@ -1216,7 +1225,7 @@ test "model program real Whisper resident full-window banks and first decode mat
             defer a.free(expected);
             defer for (expected) |*output| output.deinit();
             const logits = expected[0].asFloat32();
-            for (logits[logits.len - cfg.vocab_size ..], actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-4);
+            for (logits[logits.len - cfg.vocab_size ..], actual.asFloat32()) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-4);
         }
     }
 }
@@ -1262,7 +1271,7 @@ test "model program resident decoder qualifies complete logical context with bou
                 for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, @as(f32, 0.003));
                 try std.testing.expectEqual(std.mem.indexOfMax(f32, expected), std.mem.indexOfMax(f32, actual));
             } else reference[step] = try a.dupe(f32, actual);
-            std.debug.print("full context rows={d} query_bound={d} banks={d} bank_bytes={d}\n", .{ rows, chunk, decoder.resident.?.buffers.len, decoder.bank_bytes });
+            std.debug.print("full context rows={d} query_bound={d} banks={d} bank_bytes={d}\n", .{ rows, chunk, decoder.resident.?.banks().len, decoder.bank_bytes });
         }
         try std.testing.expectError(error.InvalidResidentDecodePosition, decoder.text(history, a, DecoderQualification.control));
         try std.testing.expectEqual(maximum, decoder.position);

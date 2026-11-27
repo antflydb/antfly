@@ -170,6 +170,9 @@ pub const Bf16SourceOperation = union(enum) {
         source_rows: ?usize = null,
         width: usize,
         columns: usize,
+        /// Largest packed projection geometry expected in a shared scratch
+        /// scope with the same row count. Individual workspace stays exact.
+        reuse_projection: ?struct { width: usize, columns: usize } = null,
         reference_input_layout: SourceMatrixLayout = .row_major,
     },
     rms_norm: struct {
@@ -211,6 +214,29 @@ pub const LinearNoBiasPairResult = struct {
     first: CT,
     second: CT,
 };
+
+/// Offline BF16 DeBERTa projection strip. The backend may emit BF16 only
+/// when its paired attention operator supports the complete request geometry.
+/// Identifies a canonical normalized relative table derived solely from the
+/// immutable checkpoint and this layout/configuration. Never use for text QKV.
+pub const DebertaBf16RelativePolicy = struct {
+    layout: enum { unique_padded_v1, boundary_padded_v1 },
+    normalization_eps: f32,
+    position_buckets: u32,
+    max_position: u32,
+};
+pub const DebertaBf16ProjectionsRequest = struct {
+    input: CT,
+    relative_policy: ?DebertaBf16RelativePolicy = null,
+    weights: [3]CT,
+    biases: [3]CT,
+    count: usize,
+    rows: usize,
+    hidden: usize,
+    batch: usize,
+    sequence: usize,
+};
+pub const DebertaBf16ProjectionsResult = [3]?CT;
 
 pub const LinearPairResult = struct {
     first: CT,
@@ -1017,7 +1043,7 @@ pub const EmbeddingRotarySpec = struct {
         return try std.math.mul(usize, try std.math.add(usize, self.x, self.y), self.dim / (if (self.vision) @as(u32, 4) else 2) * 2);
     }
 };
-pub const EmbeddingVisionSpec = struct { rows: usize, hidden: usize, intermediate: usize };
+pub const VisionWorkspaceSpec = struct { rows: usize, hidden: usize, intermediate: usize };
 pub const LocalRelativeAttentionArithmetic = @import("kernel_geometry.zig").LocalRelativeAttentionArithmetic;
 pub const Gemma4AudioLocalAttentionParams = struct {
     arithmetic: LocalRelativeAttentionArithmetic = .combined_f32,
@@ -1903,6 +1929,47 @@ pub const NativeWeightCacheControl = struct {
     ptr: *anyopaque,
     prepare: *const fn (*anyopaque, *const ComputeBackend, NativeWeightCachePreparation) anyerror!EmbeddingCacheScope,
 };
+/// Caller-owned work that must finish before the stage can lend its provider.
+pub const AudioStorageScope = struct {
+    backend: *const ComputeBackend,
+    active: bool,
+
+    pub fn begin(backend: *const ComputeBackend) !AudioStorageScope {
+        return .{ .backend = backend, .active = try backend.audioStorage(true) };
+    }
+
+    pub fn park(self: *AudioStorageScope) !bool {
+        if (!self.active) return false;
+        if (!try self.backend.audioStorage(false)) return error.AudioStorageScopeUnavailable;
+        self.active = false;
+        return true;
+    }
+
+    pub fn resumeAfterPark(self: *AudioStorageScope, parked: bool) !void {
+        if (!parked) return;
+        self.active = try self.backend.audioStorage(true);
+        if (!self.active) return error.AudioStorageScopeUnavailable;
+    }
+
+    pub fn finish(self: *AudioStorageScope) !void {
+        _ = try self.park();
+    }
+
+    pub fn close(self: *AudioStorageScope) void {
+        self.finish() catch |err| {
+            std.log.warn("audio storage scope cleanup failed: {s}", .{@errorName(err)});
+            return;
+        };
+    }
+};
+
+pub const AudioScratchBoundary = struct {
+    storage: *AudioStorageScope,
+    owns_active_frame: bool = false,
+    context: ?*anyopaque = null,
+    quiesce: ?*const fn (*anyopaque) anyerror!void = null,
+};
+
 pub const EmbeddingStageControl = struct {
     ptr: *anyopaque,
     pause_fn: *const fn (*anyopaque) anyerror!void,
@@ -1921,7 +1988,8 @@ pub const EmbeddingStageControl = struct {
     video_consumer_fn: ?*const fn (*anyopaque, *const ComputeBackend) anyerror!EmbeddingCacheScope = null,
     image_cache_fn: ?*const fn (*anyopaque, *const ComputeBackend, EmbeddingImageCacheRequest, []const *CT) anyerror!EmbeddingCacheScope = null,
     vision_cache_fn: ?*const fn (*anyopaque, *const ComputeBackend, EmbeddingVisionCacheRequest, []const *CT) anyerror!EmbeddingCacheScope = null,
-    audio_cache_fn: ?*const fn (*anyopaque, *const ComputeBackend, @import("cuda/prepared_cache.zig").AudioRecipe, []const *CT) anyerror!EmbeddingCacheScope = null,
+    audio_scratch_fn: ?*const fn (*anyopaque, *const ComputeBackend, []const u64, []const CT, AudioScratchBoundary) anyerror!bool = null,
+    audio_cache_fn: ?*const fn (*anyopaque, *const ComputeBackend, @import("../execution/audio_schedule.zig").AudioRecipe, []const *CT) anyerror!EmbeddingCacheScope = null,
     /// A fenced ready-work boundary may keep its provider when uncontended.
     yield_ready_fn: ?*const fn (*anyopaque) anyerror!void = null,
     /// Marks the actual synchronous cuvid consumer boundary. Only a scope
@@ -1947,7 +2015,7 @@ pub const EmbeddingStageControl = struct {
         const run = self.image_cache_fn orelse return .{};
         return run(self.ptr, cb, request, live_inputs);
     }
-    pub fn audioCache(self: *const @This(), cb: *const ComputeBackend, recipe: @import("cuda/prepared_cache.zig").AudioRecipe, live_inputs: []const *CT) !EmbeddingCacheScope {
+    pub fn audioCache(self: *const @This(), cb: *const ComputeBackend, recipe: @import("../execution/audio_schedule.zig").AudioRecipe, live_inputs: []const *CT) !EmbeddingCacheScope {
         const run = self.audio_cache_fn orelse return .{};
         return run(self.ptr, cb, recipe, live_inputs);
     }
@@ -2286,6 +2354,17 @@ pub const ComputeBackend = struct {
         return op(self.ptr, tensor, axis, exclusive, reverse);
     }
 
+    /// Bind an admitted vision workspace for this invocation, or clear its binding.
+    pub fn setVisionWorkspace(self: *const ComputeBackend, spec: ?VisionWorkspaceSpec) !bool {
+        const set = self.vtable.regions.vision.setWorkspace orelse return false;
+        return set(self.ptr, spec);
+    }
+
+    pub fn requireVisionWorkspace(self: *const ComputeBackend, required: bool) bool {
+        const set = self.vtable.regions.vision.requireWorkspace orelse return false;
+        return set(self.ptr, required);
+    }
+
     /// Publish an eager BF16 storage boundary while retaining an F32 physical
     /// representation for a following source operation. The input is borrowed;
     /// a selected backend returns a new owning tensor and never mutates it.
@@ -2415,6 +2494,7 @@ pub const ComputeBackend = struct {
         vision: VisionRegion = .{},
         token_selection: TokenSelectionRegion = .{},
         audio_attention: AudioAttentionRegion = .{},
+        audio_execution: AudioExecutionRegion = .{},
         sequence_projection: SequenceProjectionRegion = .{},
         relative_encoder: RelativeEncoderRegion = .{},
         decoder: DecoderRegion = .{},
@@ -2426,6 +2506,8 @@ pub const ComputeBackend = struct {
     /// decoders. Model-specific preparation/checkpoints remain in their region.
     pub const CommandSubmissionRegion = struct {
         setPipelinedFrames: ?*const fn (ctx: *anyopaque, enabled: bool) bool = null,
+        detachActivationViews: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+        releaseActivationViews: ?*const fn (ctx: *anyopaque) anyerror!void = null,
         submitFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
         waitSubmittedFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
         beginFrame: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
@@ -2587,7 +2669,7 @@ pub const ComputeBackend = struct {
         /// input and return all projected outputs.
         applyLinearQkv: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearQkvRequest) anyerror!?LinearNoBiasTripleResult = null,
         applyLinearQkvInto: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearQkvRequest, k_out: CT, v_out: CT) anyerror!?CT = null,
-        applyLinearInto: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearRequest, out: CT) anyerror!bool = null,
+        applyLinearKvInto: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearQkvRequest, key: CT, value: CT) anyerror!bool = null,
         beginPlannedComputeScope: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
         endPlannedComputeScope: ?*const fn (ctx: *anyopaque) void = null,
         /// Apply an activation inside the backend-owned decoder runtime.
@@ -2670,10 +2752,16 @@ pub const ComputeBackend = struct {
         layer: ?*const fn (ctx: *anyopaque, request: *const DebertaEncoderLayerRequest) anyerror!?CT = null,
     };
 
+    pub const ProjectionInputRetention = enum { transient, provider_backing };
+
     pub const SequenceProjectionRegion = struct {
+        retireInput: ?*const fn (ctx: *anyopaque, tensor: CT, retention: ProjectionInputRetention) void = null,
         /// Null hook retains legacy unfold policy. A present false decision
         /// declines before dense-slot preparation or any numerical submission.
         unfold1dReady: ?*const fn (ctx: *anyopaque, request: *const Conv1dUnfoldRequest) anyerror!bool = null,
+        /// Physical element width of the retained result of prepareCrossKv.
+        /// A null value preserves the projection output's F32 storage.
+        reducedCrossKvElementBytes: ?*const fn (ctx: *anyopaque) ?usize = null,
         /// Immutable backend-preferred cross-attention cache; null preserves input precision.
         prepareCrossKv: ?*const fn (ctx: *anyopaque, k: CT, v: CT) anyerror!?LinearNoBiasPairResult = null,
         /// GLiNER-specific word embedding aggregation:
@@ -2701,6 +2789,15 @@ pub const ComputeBackend = struct {
         packedLocalRelative: ?*const fn (ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) anyerror!?CT = null,
     };
 
+    /// Admission, cancellation and publication for composite audio execution.
+    pub const AudioExecutionRegion = struct {
+        setControl: ?*const fn (ctx: *anyopaque, control: ?InferenceExecutionControl) ?InferenceExecutionControl = null,
+        storage: ?*const fn (ctx: *anyopaque, begin: bool) anyerror!bool = null,
+        /// run submits work synchronously. Input handles are borrowed for the
+        /// callback and its returned output must own an independent handle.
+        execute: ?*const fn (ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: @import("../execution/cleanup_context.zig").Context, defer_arena: bool) anyerror!?CT = null,
+    };
+
     pub const TokenSelectionRegion = struct {
         encodeLogitsStats: ?*const fn (ctx: *anyopaque, logits: CT, params: *const WhisperLogitsParams, suppress_ids: []const i32) anyerror!bool = null,
         readLogitsStats: ?*const fn (ctx: *anyopaque, slot: usize, out: *WhisperLogitsStatsRaw) bool = null,
@@ -2708,6 +2805,8 @@ pub const ComputeBackend = struct {
     };
 
     pub const VisionRegion = struct {
+        setWorkspace: ?*const fn (ctx: *anyopaque, spec: ?VisionWorkspaceSpec) anyerror!bool = null,
+        requireWorkspace: ?*const fn (ctx: *anyopaque, required: bool) bool = null,
         /// Optional model-scoped vision-attention routes. They have the same unmasked,
         /// unbiased semantics as scaledDotProductAttention with an empty mask,
         /// but lets a backend select a model-scoped kernel without changing
@@ -2911,6 +3010,8 @@ pub const ComputeBackend = struct {
         /// DeBERTa FFN block: activation(X @ W1^T + b1) @ W2^T + b2,
         /// residual add, then LayerNorm. Backends may keep the entire strip
         /// resident; callers fall back to the generic ops sequence.
+        debertaBf16Projections: ?*const fn (ctx: *anyopaque, request: *const DebertaBf16ProjectionsRequest) anyerror!?DebertaBf16ProjectionsResult = null,
+
         denseFfnLayerNorm: ?*const fn (ctx: *anyopaque, request: *const DenseFfnLayerNormRequest) anyerror!?CT = null,
 
         /// Dense projection, residual add, then LayerNorm. Used by DeBERTa
@@ -2959,7 +3060,6 @@ pub const ComputeBackend = struct {
         rmsNormClamped: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, params: NormClampParams) anyerror!?CT = null,
         clippedLinear: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, params: ClippedLinearParams) anyerror!?CT = null,
         embeddingRotaryPrepare: ?*const fn (ctx: *anyopaque, spec: EmbeddingRotarySpec) anyerror!void = null,
-        embeddingVisionWorkspace: ?*const fn (ctx: *anyopaque, spec: ?EmbeddingVisionSpec) anyerror!void = null,
         embeddingVisionNorm: ?*const fn (ctx: *anyopaque, input: CT, residual: ?CT, eps: f32, slot: usize) anyerror!?CT = null,
         embeddingVisionQKV: ?*const fn (ctx: *anyopaque, input: CT, layer: usize, params: VisionNormRopeParams) anyerror!?SplitLastDim3Result = null,
         embeddingVisionFFN: ?*const fn (ctx: *anyopaque, input: CT, layer: usize) anyerror!?CT = null,
@@ -2977,11 +3077,8 @@ pub const ComputeBackend = struct {
         embeddingModelLinear: ?*const fn (ctx: *anyopaque, layer: usize, kind: EmbeddingModelProjection, input: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!?CT = null,
         audioNodeInto: ?*const fn (ctx: *anyopaque, node: *const anyopaque, values: []const ?CT, output: CT) anyerror!bool = null,
         audioPreparedLinear: ?*const fn (ctx: *anyopaque, request: *const AudioPreparedLinearRequest) anyerror!?CT = null,
-        audioArenaView: ?*const fn (ctx: *anyopaque, arena: CT, offset: usize, rows: usize, dim: usize) anyerror!CT = null,
-        audioSetControl: ?*const fn (ctx: *anyopaque, control: ?InferenceExecutionControl) ?InferenceExecutionControl = null,
-        audioStorage: ?*const fn (ctx: *anyopaque, begin: bool) anyerror!bool = null,
+        audioArenaView: ?*const fn (ctx: *anyopaque, arena: CT, offset: usize, bytes: usize, shape: [2]i32) anyerror!CT = null,
         audioPad: ?*const fn (ctx: *anyopaque, input: CT, p: AudioPadParams) anyerror!?CT = null,
-        audioExecution: ?*const fn (ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT) anyerror!?CT = null,
         audioLogMelEnabled: ?*const fn (ctx: *anyopaque) bool = null,
         audioLogMel: ?*const fn (ctx: *anyopaque, pcm: CT, plan: CT, mask: CT, frames: usize, hop: usize, floor: f32) anyerror!?CT = null,
         audioBatchLayoutsEnabled: ?*const fn (ctx: *anyopaque) bool = null,
@@ -3428,7 +3525,7 @@ pub const ComputeBackend = struct {
         /// Q: [batch*dec_seq, num_heads*head_dim], K/V: [batch*enc_seq, num_heads*head_dim].
         /// enc_mask: [batch, enc_seq] with 0=masked, 1=attend.
         /// Returns: [batch*dec_seq, num_heads*head_dim].
-        crossAttention: *const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, enc_mask: []const i64, batch: usize, dec_seq: usize, enc_seq: usize, num_heads: usize, head_dim: usize) anyerror!CT,
+        crossAttention: *const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, enc_mask: ?[]const i64, batch: usize, dec_seq: usize, enc_seq: usize, num_heads: usize, head_dim: usize) anyerror!CT,
 
         /// Compute T5-style relative position bias.
         /// weight: [num_heads, num_buckets] learned bias table.
@@ -3440,6 +3537,8 @@ pub const ComputeBackend = struct {
         /// Q_r/K_r are [2*seq_len-1, num_heads*head_dim].
         /// Returns [batch*seq_len, num_heads*head_dim].
         disentangledRelativeAttention: *const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, Q_r: CT, K_r: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT,
+        disentangledRelativeAttentionCompact: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, Q_r: CT, K_r: CT, relative_ids: []const i64, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!?CT = null,
+        compactDebertaRelativeProjectionEnabled: ?*const fn (ctx: *anyopaque, seq_len: usize) bool = null,
 
         /// Optional cooperative form. The control is borrowed synchronously;
         /// tiled native kernels check it between bounded GEMM calls. Backends
@@ -3633,11 +3732,11 @@ pub const ComputeBackend = struct {
         exportTensorData: ?*const fn (ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror!?ExportTensorData = null,
 
         /// Enqueue a backend-side i32 scalar download without blocking the
-        /// caller. The returned handle must be finished or canceled before the
+        /// caller. The returned handle must be finished or drained before the
         /// backend is destroyed. Backends return null when unsupported.
         beginI32ScalarDownload: ?*const fn (ctx: *anyopaque, tensor: CT) anyerror!?PendingI32ScalarDownload = null,
         finishI32ScalarDownload: ?*const fn (ctx: *anyopaque, pending: PendingI32ScalarDownload) anyerror!i32 = null,
-        cancelI32ScalarDownload: ?*const fn (ctx: *anyopaque, pending: PendingI32ScalarDownload) void = null,
+        drainI32ScalarDownload: ?*const fn (ctx: *anyopaque, pending: PendingI32ScalarDownload) anyerror!void = null,
 
         /// Clone a tensor into a new backend handle with the requested logical
         /// shape without requiring host materialization. Backends may alias
@@ -3956,6 +4055,12 @@ pub const ComputeBackend = struct {
         self.deinit();
     }
 
+    /// Retire identity-keyed projection bindings before releasing their input.
+    pub fn freeProjectionInput(self: *const ComputeBackend, tensor: CT, retention: ProjectionInputRetention) void {
+        if (self.vtable.regions.sequence_projection.retireInput) |retire| retire(self.ptr, tensor, retention);
+        self.free(tensor);
+    }
+
     pub fn free(self: *const ComputeBackend, tensor: CT) void {
         // This is the actual caller-owned receiving header, never provider or
         // Engine ancestry. Borrow its explicit synchronous cleanup only while
@@ -4146,7 +4251,7 @@ pub const ComputeBackend = struct {
         return null;
     }
 
-    inline fn observeBackendEntry(self: *const ComputeBackend, comptime family: @import("../execution/runtime_observation.zig").Entry, callback: anytype, args: anytype) @TypeOf(@call(.auto, callback, args)) {
+    pub inline fn observeBackendEntry(self: *const ComputeBackend, comptime family: @import("../execution/runtime_observation.zig").Entry, callback: anytype, args: anytype) @TypeOf(@call(.auto, callback, args)) {
         if (!@import("../execution/runtime_observation.zig").enabled()) return @call(.auto, callback, args);
         return self.observeBackendEntryEnabled(family, callback, args);
     }
@@ -5052,9 +5157,19 @@ pub const ComputeBackend = struct {
     /// Allow `decoderRuntimeBeginFrame` while a submitted frame is still
     /// running, so the caller can keep one frame in flight behind the one
     /// it encodes. Returns false when the backend cannot pipeline.
-    pub fn decoderRuntimeSetWhisperPipelinedFrames(self: *const ComputeBackend, enabled: bool) bool {
+    pub fn decoderRuntimeSetPipelinedFrames(self: *const ComputeBackend, enabled: bool) bool {
         if (self.vtable.regions.commands.setPipelinedFrames) |f| return f(self.ptr, enabled);
         return false;
+    }
+
+    /// Transfer activation views to the encoded frame before asynchronous submission.
+    pub fn detachFrameActivationViews(self: *const ComputeBackend) !void {
+        if (self.vtable.regions.commands.detachActivationViews) |op| try op(self.ptr);
+    }
+
+    /// Retire transient views after synchronous frame completion.
+    pub fn releaseFrameActivationViews(self: *const ComputeBackend) !void {
+        if (self.vtable.regions.commands.releaseActivationViews) |op| try op(self.ptr);
     }
 
     /// Submit the active frame without waiting; pair with
@@ -5161,6 +5276,11 @@ pub const ComputeBackend = struct {
     pub fn glinerGatherConcatRelu(self: *const ComputeBackend, request: *const GlinerGatherConcatReluRequest) !?CT {
         if (self.vtable.regions.sequence_projection.gatherConcatRelu) |f| return f(self.ptr, request);
         return null;
+    }
+
+    pub fn debertaBf16Projections(self: *const ComputeBackend, request: *const DebertaBf16ProjectionsRequest) !?DebertaBf16ProjectionsResult {
+        const op = self.vtable.debertaBf16Projections orelse return null;
+        return op(self.ptr, request);
     }
 
     pub fn denseFfnLayerNorm(self: *const ComputeBackend, request: *const DenseFfnLayerNormRequest) !?CT {
@@ -5426,7 +5546,8 @@ pub const ComputeBackend = struct {
         return self.observeBackendEntry(.causal_attention, self.vtable.causalSelfAttention, .{ self.ptr, Q, K, V, attn_bias, batch, seq_len, num_heads, head_dim });
     }
 
-    pub fn crossAttention(self: *const ComputeBackend, Q: CT, K: CT, V: CT, enc_mask: []const i64, batch: usize, dec_seq: usize, enc_seq: usize, num_heads: usize, head_dim: usize) !CT {
+    /// A null mask proves all keys visible. An explicit mask remains borrowed.
+    pub fn crossAttention(self: *const ComputeBackend, Q: CT, K: CT, V: CT, enc_mask: ?[]const i64, batch: usize, dec_seq: usize, enc_seq: usize, num_heads: usize, head_dim: usize) !CT {
         return self.observeBackendEntry(.cross_attention, self.vtable.crossAttention, .{ self.ptr, Q, K, V, enc_mask, batch, dec_seq, enc_seq, num_heads, head_dim });
     }
 
@@ -5457,6 +5578,20 @@ pub const ComputeBackend = struct {
     pub fn disentangledRelativeAttentionPacked(self: *const ComputeBackend, qkv: CT, qr_kr: CT, attn_bias: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !?CT {
         const op = self.vtable.disentangledRelativeAttentionPacked orelse return null;
         return try op(self.ptr, qkv, qr_kr, attn_bias, batch, seq_len, num_heads, head_dim);
+    }
+
+    pub fn compactDebertaRelativeProjectionEnabled(self: *const ComputeBackend, seq_len: usize) bool {
+        const op = self.vtable.compactDebertaRelativeProjectionEnabled orelse return false;
+        return op(self.ptr, seq_len);
+    }
+
+    pub fn disentangledRelativeAttentionCompact(self: *const ComputeBackend, Q: CT, K: CT, V: CT, Q_r: CT, K_r: CT, relative_ids: []const i64, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !?CT {
+        const op = self.vtable.disentangledRelativeAttentionCompact orelse return null;
+        try self.checkExecutionControl();
+        const output = try op(self.ptr, Q, K, V, Q_r, K_r, relative_ids, mask, batch, seq_len, num_heads, head_dim);
+        errdefer if (output) |value| self.free(value);
+        try self.checkExecutionControl();
+        return output;
     }
 
     pub fn debertaTrainingAttentionV1(self: *const ComputeBackend, qkv: CT, relative: CT, control_i32: CT, attrs: ml.graph.DebertaTrainingAttentionAttrs) !CT {
@@ -5700,8 +5835,8 @@ pub const ComputeBackend = struct {
     pub fn clippedLinear(self: *const ComputeBackend, input: CT, weight: CT, p: ClippedLinearParams) !?CT {
         try p.validate();
         const op = self.vtable.clippedLinear orelse return null;
-        const previous = if (self.vtable.audioSetControl) |set| set(self.ptr, self.execution_control) else null;
-        defer if (self.vtable.audioSetControl) |set| {
+        const previous = if (self.vtable.regions.audio_execution.setControl) |set| set(self.ptr, self.execution_control) else null;
+        defer if (self.vtable.regions.audio_execution.setControl) |set| {
             _ = set(self.ptr, previous);
         };
         try self.checkExecutionControl();
@@ -5711,7 +5846,7 @@ pub const ComputeBackend = struct {
         return result;
     }
     pub fn audioStorage(self: *const ComputeBackend, begin: bool) !bool {
-        const op = self.vtable.audioStorage orelse return false;
+        const op = self.vtable.regions.audio_execution.storage orelse return false;
         if (self.vtable.operation_services) |services| {
             if (!services.accepts(self.vtable)) return error.UnsupportedAudioStorageReceiver;
         }
@@ -5734,8 +5869,8 @@ pub const ComputeBackend = struct {
     pub fn embeddingFFN(self: *const ComputeBackend, layer: usize, input: CT, rows: usize, hidden: usize, intermediate: usize, streamed: bool) !?CT {
         const run = (if (streamed) self.vtable.embeddingStreamedFFN else self.vtable.embeddingGatedFFN) orelse return null;
         try self.checkExecutionControl();
-        const previous = if (self.vtable.audioSetControl) |set| set(self.ptr, self.execution_control) else null;
-        defer if (self.vtable.audioSetControl) |set| {
+        const previous = if (self.vtable.regions.audio_execution.setControl) |set| set(self.ptr, self.execution_control) else null;
+        defer if (self.vtable.regions.audio_execution.setControl) |set| {
             _ = set(self.ptr, previous);
         };
         const output = try run(self.ptr, layer, input, rows, hidden, intermediate);
@@ -5746,14 +5881,23 @@ pub const ComputeBackend = struct {
         return output;
     }
 
+    pub fn supportsAudioExecution(self: *const ComputeBackend) bool {
+        return self.vtable.regions.audio_execution.execute != null;
+    }
+
     pub fn audioExecution(self: *const ComputeBackend, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT) !?CT {
-        const op = self.vtable.audioExecution orelse return null;
-        const previous = if (self.vtable.audioSetControl) |set| set(self.ptr, self.execution_control) else null;
-        defer if (self.vtable.audioSetControl) |set| {
+        return self.audioExecutionWithArenaFunding(key, inputs, context, run, false);
+    }
+
+    pub fn audioExecutionWithArenaFunding(self: *const ComputeBackend, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, defer_arena: bool) !?CT {
+        const op = self.vtable.regions.audio_execution.execute orelse return null;
+        const previous = if (self.vtable.regions.audio_execution.setControl) |set| set(self.ptr, self.execution_control) else null;
+        defer if (self.vtable.regions.audio_execution.setControl) |set| {
             _ = set(self.ptr, previous);
         };
         try self.checkExecutionControl();
-        const result = try op(self.ptr, key, inputs, context, run);
+        const cleanup = if (self.call_context) |invocation| invocation.cleanup else @import("../execution/cleanup_context.zig").Context{};
+        const result = try self.observeBackendEntry(.audio_execution, op, .{ self.ptr, key, inputs, context, run, cleanup, defer_arena });
         errdefer if (result) |ct| self.free(ct);
         try self.checkExecutionControl();
         return result;
@@ -5952,8 +6096,8 @@ pub const ComputeBackend = struct {
     pub fn runEmbeddingVisionFFN(self: *const ComputeBackend, input: CT, layer: usize) !?CT {
         const run = self.vtable.embeddingVisionFFN orelse return null;
         try self.checkExecutionControl();
-        const previous = if (self.vtable.audioSetControl) |set| set(self.ptr, self.execution_control) else null;
-        defer if (self.vtable.audioSetControl) |set| {
+        const previous = if (self.vtable.regions.audio_execution.setControl) |set| set(self.ptr, self.execution_control) else null;
+        defer if (self.vtable.regions.audio_execution.setControl) |set| {
             _ = set(self.ptr, previous);
         };
         const output = try run(self.ptr, input, layer);
@@ -6139,6 +6283,7 @@ pub const ComputeBackend = struct {
     }
 
     pub fn beginI32ScalarDownload(self: *const ComputeBackend, tensor: CT) !?PendingI32ScalarDownload {
+        if (self.vtable.finishI32ScalarDownload == null or self.vtable.drainI32ScalarDownload == null) return null;
         if (self.vtable.beginI32ScalarDownload) |begin_i32_scalar_download| {
             return begin_i32_scalar_download(self.ptr, tensor);
         }
@@ -6152,17 +6297,24 @@ pub const ComputeBackend = struct {
         return error.UnsupportedBackendOp;
     }
 
-    pub fn cancelI32ScalarDownload(self: *const ComputeBackend, pending: PendingI32ScalarDownload) void {
-        if (self.vtable.cancelI32ScalarDownload) |cancel_i32_scalar_download| {
-            cancel_i32_scalar_download(self.ptr, pending);
-        }
+    pub fn drainI32ScalarDownload(self: *const ComputeBackend, pending: PendingI32ScalarDownload) !void {
+        const drain = self.vtable.drainI32ScalarDownload orelse return error.UnsupportedBackendOp;
+        try drain(self.ptr, pending);
     }
 
     pub fn readFloat32Into(self: *const ComputeBackend, tensor: CT, output: []f32) !bool {
+        return self.readFloat32SelectionInto(tensor, null, output);
+    }
+
+    pub fn readFloat32RangeInto(self: *const ComputeBackend, tensor: CT, offset: usize, output: []f32) !bool {
+        return self.readFloat32SelectionInto(tensor, offset, output);
+    }
+
+    fn readFloat32SelectionInto(self: *const ComputeBackend, tensor: CT, offset: ?usize, output: []f32) !bool {
         try self.checkExecutionControl();
         const functions = self.vtable.kernels orelse return false;
         const read = functions.readFloat32Into orelse return false;
-        return read(self.ptr, tensor, output);
+        return read(self.ptr, tensor, offset, output);
     }
 
     pub fn retainImmutableTensor(self: *const ComputeBackend, tensor: CT, allocator: std.mem.Allocator) !?CT {
@@ -6268,6 +6420,19 @@ pub const ComputeBackend = struct {
             return tensor_shape(self.ptr, tensor, allocator);
         }
         return error.UnsupportedShape;
+    }
+
+    /// Read fixed-rank metadata without a request allocator. A provider
+    /// returning another rank cannot publish into this handoff contract.
+    pub fn tensorShapeFixed(self: *const ComputeBackend, comptime rank: usize, tensor: CT) !?[rank]i64 {
+        var storage: [rank * @sizeOf(i64)]u8 align(@alignOf(i64)) = undefined;
+        var bounded = std.heap.FixedBufferAllocator.init(&storage);
+        const dimensions = self.tensorShape(tensor, bounded.allocator()) catch |err| switch (err) {
+            error.OutOfMemory => return null,
+            else => return err,
+        };
+        if (dimensions.len != rank) return null;
+        return dimensions[0..rank].*;
     }
 
     pub fn tensorShapeMatches(self: *const ComputeBackend, tensor: CT, shape: []const i64) !?bool {
@@ -6852,11 +7017,10 @@ pub const ComputeBackend = struct {
         return null;
     }
 
-    /// Dense linear written into `out`, a `rows x out_dim` device tensor
-    /// such as rows of a resident cache. False (nothing written) when the
-    /// backend cannot place the output.
-    pub fn decoderRuntimeApplyLinearInto(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLinearRequest, out: CT) !bool {
-        if (self.vtable.regions.decoder.applyLinearInto) |op| return self.observeBackendEntry(.prepared_linear_into, op, .{ self.ptr, request, out });
+    /// Project K and V into separate caller-owned cache views. False means
+    /// the pair declined before writing. After the first write, propagate errors.
+    pub fn decoderRuntimeApplyLinearKvInto(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLinearQkvRequest, key: CT, value: CT) !bool {
+        if (self.vtable.regions.decoder.applyLinearKvInto) |op| return self.observeBackendEntry(.prepared_linear_into, op, .{ self.ptr, request, key, value });
         return false;
     }
 
@@ -7681,7 +7845,7 @@ test "embeddinggemma2 streamed FFN restores controls and releases post-cancel ou
         var fixture = Fixture{ .probe = &probe, .cancel_during = case == 2, .active = old };
         var table: ComputeBackend.VTable = undefined;
         table.embeddingStreamedFFN = Fixture.run;
-        table.audioSetControl = Fixture.set;
+        table.regions.audio_execution.setControl = Fixture.set;
         table.freeTensor = Fixture.free;
         const cb = ComputeBackend{ .ptr = &fixture, .vtable = &table, .execution_control = .{ .ptr = &probe, .check_fn = Probe.check } };
         if (case == 0) {
@@ -7800,6 +7964,34 @@ test "decoder assigned output contracts decline legacy providers before submissi
     _ = try cb.decoderRuntimeApplyMultiplyAdd(&.{ .lhs = value, .rhs = value, .addend = value, .dim = 1 });
     _ = try cb.decoderRuntimeApplyMultiplyAdd2(&.{ .lhs0 = value, .rhs0 = value, .lhs1 = value, .rhs1 = value, .dim = 1 });
     try std.testing.expectEqual(@as(usize, 4), submissions);
+}
+
+test "audio execution forwards caller cleanup authority" {
+    const Cleanup = @import("../execution/cleanup_context.zig").Context;
+    const Invocation = @import("../execution/invocation_context.zig").Context;
+    const Epoch = @import("../execution/retirement_sink.zig").Epoch;
+    const Fixture = struct {
+        fn execute(raw: *anyopaque, _: u64, _: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: Cleanup, _: bool) anyerror!?CT {
+            const observed: *Cleanup = @ptrCast(@alignCast(raw));
+            observed.* = cleanup;
+            return try run(context, &.{});
+        }
+        fn body(_: *anyopaque, _: []const CT) anyerror!CT {
+            return @ptrFromInt(16);
+        }
+    };
+    var table = @import("native_compute.zig").vtable_impl;
+    table.regions.audio_execution.execute = Fixture.execute;
+    var observed: Cleanup = .{};
+    var cb = ComputeBackend{ .ptr = &observed, .vtable = &table };
+    const epoch: Epoch = undefined;
+    const invocation: Invocation = .{ .cleanup = .{ .boundary = &epoch } };
+    cb.call_context = &invocation;
+    try std.testing.expect((try cb.audioExecution(0, &.{}, &observed, Fixture.body)) != null);
+    try std.testing.expect(observed.boundary == &epoch);
+    cb.call_context = null;
+    try std.testing.expect((try cb.audioExecution(0, &.{}, &observed, Fixture.body)) != null);
+    try std.testing.expect(observed.boundary == null and !observed.outside_execution);
 }
 
 test "explicit invocation header free forwards caller cleanup and raw fallback never recurses" {
@@ -8142,7 +8334,7 @@ test "source scalar publication refuses copied canonical table before opaque cal
     table.roundBf16F32 = Fixture.round;
     table.bf16SourceOperation = Fixture.source;
     table.sourceScalarStorage = Fixture.storage;
-    table.audioStorage = Fixture.audio;
+    table.regions.audio_execution.storage = Fixture.audio;
     const cb = ComputeBackend{ .ptr = @ptrFromInt(16), .vtable = &table };
     const tensor: CT = @ptrFromInt(16);
     try std.testing.expectEqual(@as(?CT, null), try cb.tryRoundBf16F32(tensor));
@@ -8165,4 +8357,30 @@ test "source scalar publication refuses copied canonical table before opaque cal
     try std.testing.expectEqual(@as(?CT, null), try cb.tryBf16SourceOperation(&request));
     try std.testing.expect(try cb.audioStorage(true));
     try std.testing.expectEqual(@as(usize, 3), Fixture.calls);
+}
+
+test "audio storage scope surfaces provider retirement and reopen declines" {
+    const Fixture = struct {
+        allow_begin: bool = true,
+        allow_end: bool = false,
+        fn audio(raw: *anyopaque, begin: bool) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return if (begin) self.allow_begin else self.allow_end;
+        }
+    };
+    var fixture = Fixture{};
+    var table = @import("native_compute.zig").vtable_impl;
+    table.operation_services = null;
+    table.regions.audio_execution.storage = Fixture.audio;
+    const cb = ComputeBackend{ .ptr = &fixture, .vtable = &table };
+    var scope = try AudioStorageScope.begin(&cb);
+    defer scope.close();
+    try std.testing.expectError(error.AudioStorageScopeUnavailable, scope.finish());
+    try std.testing.expect(scope.active);
+    fixture.allow_end = true;
+    const parked = try scope.park();
+    try std.testing.expect(parked);
+    fixture.allow_begin = false;
+    try std.testing.expectError(error.AudioStorageScopeUnavailable, scope.resumeAfterPark(parked));
+    try std.testing.expect(!scope.active);
 }
