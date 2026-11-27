@@ -1296,35 +1296,37 @@ and finish reasons. Both engines passed all four fixture fact checks with
 
 ### Issue closure audit
 
-This audit uses `97ae654504` as the implementation head and `2fd277baea`
-as the merged-main ancestor. It covers the seven open #1166 entries and
-the implementation, deletion and qualification gates in #1771.
+This audit covers implementation head `dec232d868` and merged main
+`451f3add98`. The serving measurements below identify the revisions that
+actually ran. The seven remaining #1166 requirements map to the #1771
+implementation, deletion and qualification gates.
 
-| Requirement | State at the audited head | Evidence and remaining gate |
+| Requirement | State | Evidence and remaining gate |
 | --- | --- | --- |
-| Shared liveness and authoritative storage | Partial | Dependency analysis and admitted destination/workspace are shared. The physical Metal scopes and opaque vendor workspaces in the compatibility table still have separate allocation ownership. |
-| Stable addresses and CUDA capture | Partial | Prepared plans retain stable storage. Released T5-small has bounded replay at prefixes 1, 8, 32 and 64. Legacy decoder and audio signatures still need ordinary/capture recipe parity before deleting learned address policy. |
-| Runtime-owned state and physical policy | Partial | `decoder_storage.zig` owns Gemma4 replay capacity. `decoder_prefill.zig` selects chunk sizes, binds eager routes and owns scheduled work and cancellation. Task-bound state and publication decisions still need the remaining architecture-specific migration. |
-| Resident placement | Partial | Released fused T5-small frees both encoder activations before the cached step on Native, Metal and CUDA. Glowworm recorded 393,216 device-to-device gather bytes with zero gather downloads. Untested or opaque encoder/consumer pairs still need residency and output-custody qualification. |
-| Task orchestration | Partial | Generation supplies publication callbacks to shared scheduled steps and preserves independent outputs through the publication boundary. Compatibility routes still own numerical transitions for some model/provider pairs. |
-| Ownership and deletion | Partial | Ten detected source renames establish common execution ownership. The original `cuda_owned_coverage.zig` wrapper was removed and its provider check is shared by `device_owned_coverage.zig`. The remaining physical compatibility owners have deletion gates in the preceding table. |
-| Common telemetry | Partial | Invocation reports now record cache-gather copy counts, bytes and stream ordering alongside the separate model-forward observations. The gather receipt covers submission and ordering. Cross-provider lifetime and retirement observations still need coverage. |
+| Shared liveness and authoritative storage | Partial | Assigned execution and admitted storage share dependency analysis. Metal image and video bind workspaces through the vision region. CUDA grouped audio and the bounded decoder still learn their composite allocation schedules. The compatibility table identifies opaque vendor workspaces with separate accounting. |
+| Stable addresses and CUDA capture | Partial | Released T5-small replayed at prefixes 1, 8, 32 and 64. Released EmbeddingGemma 2 grouped audio captured and replayed using a 38,017,792-byte arena. The context-level projector guard declines unplanned cuBLASLt staging before allocation. Declared ordinary and capture workspace parity remains open for the learned composite routes. |
+| Runtime-owned state and physical policy | Partial | `decoder_storage.zig` owns Gemma 4 replay capacity and `decoder_prefill.zig` owns chunk selection, eager binding and scheduled cancellation. The shared frame owner now controls media view retirement. Residual task-bound state and cache policy need provider-specific verification and migration. |
+| Resident placement | Partial | The released fused T5-small step retired its encoder activations before decoding on CPU, Metal and CUDA. Spark recorded 393,216 device-to-device gather bytes and zero gather downloads. Imported ONNX handoff tests exercise exact output custody and host fallback on all three providers. Other eligible stateful and opaque producer/consumer pairs still need qualification. |
+| Task orchestration | Partial | Media tasks call shared frame and projection retirement owners. Scheduled generation routes publish independent outputs through runtime callbacks. Some hardware-specific paths still choose or own physical transitions in model and task code. |
+| Ownership and deletion | Partial | Nine execution source moves, removal of the 34-line legacy ONNX KV file and 24-line CUDA coverage wrapper, and removal of direct Metal frame-view, projection-slot and vision-workspace wrappers. The remaining compatibility owners retain the deletion gates in the preceding table. |
+| Common telemetry | Partial | Invocation reports distinguish gather transfers and ordering, CUDA audio learning and replay outcomes, and actual workspace bindings. The Metal audio selector uses completed GPU timing through existing frame retirement. Cross-provider lifetime attribution and coverage of opaque and pending routes remain open. |
 
-The diff from merged main contains 46 added paths, 225 modified paths, ten
-detected renames and one deleted path. The deleted path is the 24-line
-CUDA coverage wrapper, of which nine lines follow the license header.
-These counts describe the source tree diff. A rename can include edits,
-and generated copies and binary sizes are outside this deletion count.
+Relative to merged main, Git reports 106 added paths, 276 modified paths,
+ten rename matches and one deletion. The match from the old CUDA coverage
+wrapper to a new GLiNER test reflects shared boilerplate. The provider
+check moved into `device_owned_coverage.zig`. File counts include generated
+copies and artifacts. They do not measure authored deletions.
 
-The publication and optional-component suite at the audited head passed
-199 of 203 selected tests with four skips. The targeted prefill and
-T5-small evidence covers smaller physical and model-specific cohorts.
-Closure still requires a current-head tier-one regression and performance
-matrix against frozen merged main, including Whisper multi-window,
-Gemma4 text/image/audio/video and the E2B comparative deficits above,
-EmbeddingGemma2, LightOnOCR, GLiNER2.5/DECIDE, Inkling 2 Mini and the
-representative Qwen3 routes. Spark GB10, local Metal and CPU are the
-available physical targets. L4 and A100 remain the user-deferred targets.
+Current scoped serving evidence includes Spark Whisper multi-window,
+EmbeddingGemma 2 text and two-clip audio, LightOnOCR, GLiNER2.5, Qwen3,
+and all four official Gemma 4 E4B modalities. Local Metal image and video
+improved and the two-clip audio regression passed requalification after
+the completed-frame fix. Isolated Native text embedding and GLiNER2.5
+passed. Native two-clip audio still has a candidate-only exact repeat
+failure even though matching request ordinals passed across revisions.
+Final closure requires the remaining tier-one coverage, including DECIDE,
+Inkling 2 Mini, and the E2B comparative deficits above, as well as normal
+PR review and CI. L4 and A100 remain user-deferred.
 
 Subsequent scoped qualification covers these production paths:
 
