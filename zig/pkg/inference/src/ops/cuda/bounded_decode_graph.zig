@@ -340,6 +340,26 @@ pub const GraphPhase = struct {
         _ = try descriptor.dispatchCounts();
         self.* = .{ .descriptor = descriptor, .storage_layout = layout };
     }
+    pub const WorkspacePolicy = struct {
+        attention_chunk128: ?bool = null,
+        recurrent_scratch: bool,
+        compact_ffn: ?bool,
+        projection_staging: bool,
+    };
+
+    /// Resolve layer lifetimes in submission order from the descriptor. A
+    /// repeated inspection starts from the same prefix and head reservation.
+    pub fn prepareWorkspace(self: *GraphPhase, policy: WorkspacePolicy) !void {
+        self.storage_layout = try self.descriptor.layout();
+        self.attention_scratch = null;
+        try self.declareAttentionScratch(policy.attention_chunk128);
+        try self.declareAttentionOutput();
+        if (policy.recurrent_scratch) try self.declareRecurrentScratch();
+        try self.declareRecurrentOutput();
+        if (policy.compact_ffn) |compact| try self.declareFfnScratch(compact);
+        if (policy.projection_staging) try self.declareProjectionStaging();
+    }
+
     pub fn declareAttentionScratch(self: *GraphPhase, chunk128_override: ?bool) !void {
         const descriptor = self.descriptor;
         if (descriptor.attention_layers == 0) return;
@@ -975,6 +995,20 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
     const staging = (try output_owner.bindProjectionStaging(staging_bytes)).?;
     try std.testing.expect(staging.ptr >= second_output.ptr + second_output.len);
     try std.testing.expectError(error.InvalidExecutionPlan, output_owner.bindProjectionStaging(staging_bytes + 1));
+
+    const policy: GraphPhase.WorkspacePolicy = .{
+        .attention_chunk128 = false,
+        .recurrent_scratch = true,
+        .compact_ffn = false,
+        .projection_staging = true,
+    };
+    const composed = phase.storage_layout;
+    try phase.prepareWorkspace(policy);
+    try std.testing.expectEqualDeep(composed, phase.storage_layout);
+    try phase.prepareWorkspace(policy);
+    try std.testing.expectEqualDeep(composed, phase.storage_layout);
+    try phase.prepareWorkspace(.{ .recurrent_scratch = false, .compact_ffn = null, .projection_staging = false });
+    try std.testing.expect(phase.storage_layout.recurrent_workspace == null and phase.storage_layout.ffn_outputs == null and phase.storage_layout.projection_staging == null);
 
     var fused = descriptor;
     fused.hidden = 1024;

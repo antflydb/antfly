@@ -4234,27 +4234,14 @@ pub const CudaCompute = struct {
             descriptor.future_tokens == 0 or descriptor.future_tokens > @import("paged_attention_bf16.zig").max_native_context_tokens or
             (descriptor.hidden != 1024 and descriptor.hidden != 2560) or (descriptor.rows > @import("gated_delta.zig").max_packet_rows and !self.lighton_ragged_recurrent_enabled)) return .unsupported;
         if (self.execution_scope != null) return .unsupported;
-        phase.declareAttentionScratch(self.lighton_attention_chunk128) catch |err| switch (err) {
+        phase.prepareWorkspace(.{
+            .attention_chunk128 = self.lighton_attention_chunk128,
+            .recurrent_scratch = !self.lighton_fused_gdn_decode_enabled or self.ctx.info.compute_major < 8,
+            .compact_ffn = if (lightOnFfnBlockEnabled(cb) and lightOnDevice(self).portableKernels() and !self.lighton_bf16_decode_outputs) self.lighton_bf16_projection_outputs else null,
+            .projection_staging = cudaCublasLtEnabled() and self.cublaslt != null and self.ctx.info.compute_major >= 8,
+        }) catch |err| switch (err) {
             error.InvalidShape, error.Overflow => return .unsupported,
         };
-        phase.declareAttentionOutput() catch |err| switch (err) {
-            error.InvalidShape, error.Overflow => return .unsupported,
-        };
-        if (!self.lighton_fused_gdn_decode_enabled or self.ctx.info.compute_major < 8)
-            phase.declareRecurrentScratch() catch |err| switch (err) {
-                error.InvalidShape, error.Overflow => return .unsupported,
-            };
-        phase.declareRecurrentOutput() catch |err| switch (err) {
-            error.InvalidShape, error.Overflow => return .unsupported,
-        };
-        if (lightOnFfnBlockEnabled(cb) and lightOnDevice(self).portableKernels() and !self.lighton_bf16_decode_outputs)
-            phase.declareFfnScratch(self.lighton_bf16_projection_outputs) catch |err| switch (err) {
-                error.InvalidShape, error.Overflow => return .unsupported,
-            };
-        if (cudaCublasLtEnabled() and self.cublaslt != null and self.ctx.info.compute_major >= 8)
-            phase.declareProjectionStaging() catch |err| switch (err) {
-                error.InvalidShape, error.Overflow => return .unsupported,
-            };
         phase.vendor_workspace = self.currentGraphVendorWorkspace() orelse return .unsupported;
         const owner = &self.bounded_decode_graph;
         if (!owner.mutex.tryLock()) return error.ReaderEpochBackendBusy;
