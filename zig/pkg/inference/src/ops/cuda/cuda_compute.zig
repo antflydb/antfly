@@ -5491,20 +5491,22 @@ pub const CudaCompute = struct {
             for (state.history) |history| if ((history.ptr != 0 and history.len < channels * 16) or (state.initialized and history.ptr == 0)) return error.CudaRecurrentStateInvalid;
             if ((state.recurrent.ptr != 0 and state.recurrent.len < vh * 128 * 128 * 4) or (state.initialized and state.recurrent.ptr == 0)) return error.CudaRecurrentStateInvalid;
         }
-        try self.lighton_recurrent.init(&self.ctx);
-        const pre_admitted = if (@hasField(@TypeOf(request), "device_state_admitted")) request.device_state_admitted else false;
-        for (states) |state| try self.prepareLightOnRecurrentState(state, weights, weight_counts, kh, vh, pre_admitted);
-        const output = (try allocUninitF32ShapeOp(self, &.{ @intCast(rows), @intCast(width) })).?;
-        errdefer cb.free(output);
         const fused_decode = self.lighton_fused_gdn_decode_enabled and self.ctx.info.compute_major >= 8;
         const only_decode = fused_decode and rows == states.len;
         // Packets submit in stream order. Each packet consumes its own
         // intermediate results before the next can overwrite the bank.
         const scratch_layout = if (only_decode) null else try @import("gated_delta.zig").PacketScratch.init(largest_packet_rows, channels, width);
-        var scratch = if (scratch_layout) |layout|
-            if (planned) try self.bounded_decode_graph.bindRecurrentWorkspace(layout) else try allocDeviceBuffer(self, layout.bytes)
+        // Reject an invalid graph binding before creating or uploading state.
+        const assigned = if (planned and scratch_layout != null)
+            try self.bounded_decode_graph.bindRecurrentWorkspace(scratch_layout.?)
         else
-            buffer_mod.DeviceBuffer{};
+            null;
+        try self.lighton_recurrent.init(&self.ctx);
+        const pre_admitted = if (@hasField(@TypeOf(request), "device_state_admitted")) request.device_state_admitted else false;
+        for (states) |state| try self.prepareLightOnRecurrentState(state, weights, weight_counts, kh, vh, pre_admitted);
+        const output = (try allocUninitF32ShapeOp(self, &.{ @intCast(rows), @intCast(width) })).?;
+        errdefer cb.free(output);
+        var scratch = assigned orelse if (scratch_layout) |layout| try allocDeviceBuffer(self, layout.bytes) else buffer_mod.DeviceBuffer{};
         defer if (!planned) releaseDeviceBuffer(self, &scratch);
         var packets: [2]@import("gated_delta.zig").RaggedParams = undefined;
         var packet_rows: [2]u32 = @splat(0);
