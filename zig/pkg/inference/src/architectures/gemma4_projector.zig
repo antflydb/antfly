@@ -5138,19 +5138,27 @@ fn audioLightConv(
     // GGUF's inherited tensor mapping swaps the two convolution norm names.
     // Keep HF's logical names intact for the EmbeddingGemma 2 path.
     const norm_names = audioConvNormNames(store.gguf != null);
-    const pre_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.{s}.weight", .{ layer, norm_names.pre }), cfg.audio_hidden);
-    const normed = try audioSourceRms(cb, cfg, input, pre_w, rows, cfg.audio_hidden, .contiguous, rows);
-    defer cb.free(normed);
-    const pw1 = try audioSourceLinear(cb, allocator, store, cfg, normed, try fmt(&buf, "a.blk.{d}.conv_pw1", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden * 2, .row_major, false, false);
-    defer cb.free(pw1);
-    const glu = try audioSourceRoundOwned(cb, cfg, try applyGlu(cb, allocator, pw1, rows, cfg.audio_hidden));
-    defer cb.free(glu);
-    const conv = try audioSourceRoundOwned(cb, cfg, try depthwiseCausalConvSegments(cb, allocator, store, glu, rows, cfg.audio_hidden, cfg.conv_kernel_size, segments, segment_starts, try fmt(&buf, "a.blk.{d}.conv_dw.weight", .{layer})));
-    defer cb.free(conv);
-    const conv_norm_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.{s}.weight", .{ layer, norm_names.post }), cfg.audio_hidden);
-    const conv_bounded = try audioSourceGradientBounded(cb, cfg, conv);
-    defer if (conv_bounded != conv) cb.free(conv_bounded);
-    const conv_normed = try audioSourceChannelRms(cb, allocator, cfg, conv_bounded, conv_norm_w, rows, cfg.audio_hidden, segments);
+    const conv_normed = normalize: {
+        const conv = depthwise: {
+            const glu = gate: {
+                const pw1 = project: {
+                    const pre_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.{s}.weight", .{ layer, norm_names.pre }), cfg.audio_hidden);
+                    const normed = try audioSourceRms(cb, cfg, input, pre_w, rows, cfg.audio_hidden, .contiguous, rows);
+                    defer cb.free(normed);
+                    break :project try audioSourceLinear(cb, allocator, store, cfg, normed, try fmt(&buf, "a.blk.{d}.conv_pw1", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden * 2, .row_major, false, false);
+                };
+                defer cb.free(pw1);
+                break :gate try audioSourceRoundOwned(cb, cfg, try applyGlu(cb, allocator, pw1, rows, cfg.audio_hidden));
+            };
+            defer cb.free(glu);
+            break :depthwise try audioSourceRoundOwned(cb, cfg, try depthwiseCausalConvSegments(cb, allocator, store, glu, rows, cfg.audio_hidden, cfg.conv_kernel_size, segments, segment_starts, try fmt(&buf, "a.blk.{d}.conv_dw.weight", .{layer})));
+        };
+        defer cb.free(conv);
+        const conv_norm_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.{s}.weight", .{ layer, norm_names.post }), cfg.audio_hidden);
+        const conv_bounded = try audioSourceGradientBounded(cb, cfg, conv);
+        defer if (conv_bounded != conv) cb.free(conv_bounded);
+        break :normalize try audioSourceChannelRms(cb, allocator, cfg, conv_bounded, conv_norm_w, rows, cfg.audio_hidden, segments);
+    };
     defer cb.free(conv_normed);
     const activated = try audioSourceRoundOwned(cb, cfg, try cb.silu(conv_normed));
     defer cb.free(activated);
@@ -5266,21 +5274,23 @@ fn audioSelfAttention(
             break :blk try splitAudioQkv(cb, allocator, interleaved.tensor, rows, cfg.audio_hidden, interleaved.specs);
         },
     } else null;
-    var remaining_k = if (packed_rows) |value| @as(?CT, value.second) else null;
-    defer if (remaining_k) |tensor| cb.free(tensor);
-    var remaining_v = if (packed_rows) |value| @as(?CT, value.third) else null;
-    defer if (remaining_v) |tensor| cb.free(tensor);
-    const q = if (packed_rows) |value| value.first else try audioSourceLinear(cb, allocator, store, cfg, input, try fmt(&buf, "a.blk.{d}.attn_q", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden, .row_major, false, false);
-    defer cb.free(q);
-    const k = remaining_k orelse try audioSourceLinear(cb, allocator, store, cfg, input, try fmt(&buf, "a.blk.{d}.attn_k", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden, .row_major, false, false);
-    remaining_k = null;
-    defer cb.free(k);
-    const v = remaining_v orelse try audioSourceLinear(cb, allocator, store, cfg, input, try fmt(&buf, "a.blk.{d}.attn_v", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden, .row_major, false, false);
-    remaining_v = null;
-    defer cb.free(v);
-    audioProfileMark(.attn_proj);
+    const out_ct = attend: {
+        var remaining_k = if (packed_rows) |value| @as(?CT, value.second) else null;
+        defer if (remaining_k) |tensor| cb.free(tensor);
+        var remaining_v = if (packed_rows) |value| @as(?CT, value.third) else null;
+        defer if (remaining_v) |tensor| cb.free(tensor);
+        const q = if (packed_rows) |value| value.first else try audioSourceLinear(cb, allocator, store, cfg, input, try fmt(&buf, "a.blk.{d}.attn_q", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden, .row_major, false, false);
+        defer cb.free(q);
+        const k = remaining_k orelse try audioSourceLinear(cb, allocator, store, cfg, input, try fmt(&buf, "a.blk.{d}.attn_k", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden, .row_major, false, false);
+        remaining_k = null;
+        defer cb.free(k);
+        const v = remaining_v orelse try audioSourceLinear(cb, allocator, store, cfg, input, try fmt(&buf, "a.blk.{d}.attn_v", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden, .row_major, false, false);
+        remaining_v = null;
+        defer cb.free(v);
+        audioProfileMark(.attn_proj);
 
-    const out_ct = try audioLocalAttention(cb, allocator, cfg, q, k, v, rel, layer, inputs);
+        break :attend try audioLocalAttention(cb, allocator, cfg, q, k, v, rel, layer, inputs);
+    };
     defer cb.free(out_ct);
     audioProfileMark(.attn_kernel);
     return audioSourceLinear(cb, allocator, store, cfg, out_ct, try fmt(&buf, "a.blk.{d}.attn_out", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden, .row_major, false, false);
