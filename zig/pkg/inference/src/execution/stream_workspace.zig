@@ -95,31 +95,12 @@ pub const Plan = struct {
             return;
         }
         const extent = std.mem.alignForward(usize, bytes, alignment);
-        var offset: usize = 0;
-        var previous: Slot = no_slot;
-        var slot = self.first_live;
-        var insert_after: ?Slot = null;
-        while (slot != no_slot) {
-            const allocation = self.allocations[slot];
-            if (allocation.lifetime.live_id == live_id) {
-                self.valid = false;
-                return;
-            }
-            if (insert_after == null) {
-                if (offset + extent <= allocation.offset()) {
-                    insert_after = previous;
-                } else {
-                    offset = allocation.offset() + std.mem.alignForward(usize, allocation.bytes, alignment);
-                }
-            }
-            previous = slot;
-            slot = allocation.placement.next_live;
-        }
-        if (offset > limit - extent) {
+        const placement = self.findPlacement(false, extent, live_id) orelse {
             self.valid = false;
             return;
-        }
-        const predecessor = insert_after orelse previous;
+        };
+        const offset = placement.offset;
+        const predecessor = placement.predecessor;
         self.allocations[self.count] = .{
             .bytes = @intCast(bytes),
             .placement = .{ .offset_blocks = @intCast(offset / alignment), .next_live = self.nextLive(predecessor) },
@@ -130,6 +111,30 @@ pub const Plan = struct {
         self.count += 1;
         self.peak = @max(self.peak, offset + extent);
     }
+    fn findPlacement(self: *const Plan, comptime external: bool, extent: usize, live_id: u64) ?struct { offset: usize, predecessor: Slot } {
+        var offset: usize = 0;
+        var previous: Slot = no_slot;
+        var slot = self.first_live;
+        var insert_after: ?Slot = null;
+        while (slot != no_slot) {
+            const allocation = self.allocations[slot];
+            if (!external and allocation.lifetime.live_id == live_id) return null;
+            if (insert_after == null) {
+                const start = if (external) @as(usize, @intCast(allocation.lifetime.external_offset)) else allocation.offset();
+                if (offset + extent <= start) {
+                    insert_after = previous;
+                    if (external) break;
+                } else {
+                    offset = start + std.mem.alignForward(usize, allocation.bytes, alignment);
+                }
+            }
+            previous = slot;
+            slot = allocation.placement.next_live;
+        }
+        if (offset > limit - extent) return null;
+        return .{ .offset = offset, .predecessor = insert_after orelse previous };
+    }
+
     pub fn release(self: *Plan, pointer: DevicePointer) void {
         if (!self.valid or self.sealed or pointer == 0) return;
         var previous: Slot = no_slot;
@@ -153,6 +158,10 @@ pub const Plan = struct {
     }
 
     fn releaseSlot(self: *Plan, target: Slot) void {
+        self.unlinkLive(self.predecessorOf(target), target);
+    }
+
+    fn predecessorOf(self: *const Plan, target: Slot) Slot {
         var previous: Slot = no_slot;
         var slot = self.first_live;
         while (slot != target) {
@@ -160,7 +169,7 @@ pub const Plan = struct {
             previous = slot;
             slot = self.nextLive(slot);
         }
-        self.unlinkLive(previous, slot);
+        return previous;
     }
 
     fn unlinkLive(self: *Plan, predecessor: Slot, slot: Slot) void {
@@ -249,32 +258,45 @@ pub const Plan = struct {
     }
 
     fn packExternalScratch(self: *Plan, output: usize) void {
-        var inline_peak: usize = 0;
-        for (self.allocations[0..self.count], 0..) |*allocation, index| {
-            if (index == output) continue;
-            allocation.lifetime.external_offset = allocation.offset();
-            inline_peak = @max(inline_peak, allocation.offset() + std.mem.alignForward(usize, allocation.bytes, alignment));
-        }
+        const inline_peak = self.restoreExternalOffsets(output);
         self.scratch_peak = inline_peak;
         if (output + 1 == self.count) return;
 
-        // Replay only scratch intervals through the same first-fit planner.
-        // Keep the inline placement if the alternate packing costs more.
-        var scratch: Plan = .{};
+        // Replay sealed lifetimes with the existing live-list links. Keep
+        // the original offsets available when first-fit packing costs more.
+        self.first_live = no_slot;
+        var peak: usize = 0;
         for (self.events[0..self.event_count]) |entry| {
             if (entry.slot == output) continue;
-            const id = @as(u64, entry.slot) + 1;
+            const slot: Slot = @intCast(entry.slot);
             if (entry.allocate) {
-                scratch.allocateLive(self.allocations[entry.slot].bytes, id);
-                if (!scratch.valid or scratch.peak > inline_peak) return;
-            } else scratch.release(id);
+                const allocation = &self.allocations[slot];
+                const extent = std.mem.alignForward(usize, allocation.bytes, alignment);
+                const placement = self.findPlacement(true, extent, 0) orelse break;
+                const end = placement.offset + extent;
+                if (end > inline_peak) break;
+                allocation.lifetime.external_offset = placement.offset;
+                allocation.placement.next_live = self.nextLive(placement.predecessor);
+                self.setNextLive(placement.predecessor, slot);
+                peak = @max(peak, end);
+            } else self.setNextLive(self.predecessorOf(slot), self.nextLive(slot));
+        } else {
+            self.scratch_peak = peak;
+            self.external_scratch_savings_bytes = inline_peak - peak;
+            return;
         }
-        for (self.allocations[0..output], scratch.allocations[0..output]) |*allocation, packed_slot|
-            allocation.lifetime.external_offset = packed_slot.offset();
-        for (self.allocations[output + 1 .. self.count], scratch.allocations[output..scratch.count]) |*allocation, packed_slot|
-            allocation.lifetime.external_offset = packed_slot.offset();
-        self.scratch_peak = scratch.peak;
-        self.external_scratch_savings_bytes = inline_peak - scratch.peak;
+        _ = self.restoreExternalOffsets(output);
+    }
+
+    fn restoreExternalOffsets(self: *Plan, output: usize) usize {
+        var peak: usize = 0;
+        for (self.allocations[0..self.count], 0..) |*allocation, index| {
+            if (index == output) continue;
+            const offset = allocation.offset();
+            allocation.lifetime.external_offset = offset;
+            peak = @max(peak, offset + std.mem.alignForward(usize, allocation.bytes, alignment));
+        }
+        return peak;
     }
 
     pub fn layout(self: *const Plan, prefix_bytes: usize) !Layout {
