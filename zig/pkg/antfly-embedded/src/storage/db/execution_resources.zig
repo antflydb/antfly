@@ -1143,6 +1143,11 @@ pub const ReplacementShape = struct {
     /// A derived replay with no workers: the wait applies the materialized
     /// batch, which only the write's own runtime holds.
     materialized_apply: bool = false,
+    /// Replicated LEANN coverage. Its write positions are in-memory counters
+    /// that a reopened graph renumbers, and the write's own LEANN work is
+    /// numbered only during derived replay, so no position this write could
+    /// carry means the same thing on another runtime.
+    leann_coverage: bool = false,
 };
 
 pub fn replacementContinuationEligible(shape: ReplacementShape) bool {
