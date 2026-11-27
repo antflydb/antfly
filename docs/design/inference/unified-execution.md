@@ -2698,3 +2698,11 @@ FFN arithmetic against independent references. Released grouped audio
 matched exactly across repeats and recorded two replays with
 38,017,792 planned and captured arena bytes. The test log hash is
 `313a207f8120d6a30c4210c55ecd4d1b52bc74c5ed6ec31b9e52d9456dd58b66`.
+
+The following same-binary LightOnOCR default/shared/shared/default
+comparison at `211c80a1f9` again matched serial text in every arm. Rates
+were 19.8708, 19.5106, 18.6225 and 8.3353 pages/s. Maximum timed replay
+widths were 64, 3, 8 and 0 rows. Foreground steps retired learning
+graphs at widths 61 and 56, and retired a 63-row graph in the capture
+phase. Since only the first arm passed the exact 64-row gate, this
+comparison leaves throughput parity open.
