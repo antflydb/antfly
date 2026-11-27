@@ -2597,17 +2597,19 @@ test "tensor microbatch released T5-small fuses suffixes after encoder retiremen
         }
         const direct_serial = platform.env.getenvBool("ANTFLY_ONNX_T5_BENCH_DIRECT_SERIAL");
         const samples_per_arm = 8;
+        const benchmark_wait_us = platform.env.getenvUsize("ANTFLY_ONNX_T5_BENCH_WAIT_US") orelse collectionWaitUs(null, 0);
         var positions = [2]usize{ 5, 5 };
         var serial_ids: [2 * samples_per_arm][peers.len]usize = undefined;
         for ([_]bool{ false, true, true, false }, 0..) |fused, arm| {
             const route: usize = @intFromBool(fused);
-            dispatch_context.wait_us = if (fused) 20_000 else 0;
+            dispatch_context.wait_us = if (fused) benchmark_wait_us else 0;
             for (0..samples_per_arm) |sample| {
                 const position = positions[route];
                 const tokens = [2]i64{ @intCast(position + 10), @intCast(position + 20) };
                 var selected: [peers.len]usize = undefined;
                 var serial_rows: [peers.len]?[]f32 = @splat(null);
                 defer for (serial_rows) |row| if (row) |values| a.free(values);
+                const before = broker.snapshot(std.testing.io);
                 const start = platform.time.monotonicNs();
                 if (fused) {
                     var batch_group = std.Io.Group.init;
@@ -2627,6 +2629,11 @@ test "tensor microbatch released T5-small fuses suffixes after encoder retiremen
                     }
                 }
                 const elapsed = platform.time.monotonicNs() - start;
+                const after = broker.snapshot(std.testing.io);
+                if (fused) {
+                    try std.testing.expectEqual(before.native_batches + 1, after.native_batches);
+                    try std.testing.expectEqual(before.native_items + peers.len, after.native_items);
+                }
                 for (&peers, serial_rows, &selected) |*peer, serial_row, *id| {
                     if (peer.failure) |err| return err;
                     const row = (if (fused) peer.row else serial_row) orelse return error.MissingMergedDecoderResult;

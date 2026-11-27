@@ -47780,11 +47780,9 @@ test "Decide extraction v2 serves classifications through HTTP handler" {
         .max_concurrent_requests = 1,
         .process_termination_available = true,
         .generation_budget_overrides = .{
-            // Native construction keeps the source weights and serving state
-            // under the host budget. Use the runtime's host limit for this fixture.
-            .host_limit_bytes = if (backend == .native) 0 else 6 * 1024 * 1024 * 1024,
+            // Use the runtime's host and unified limits for this serving fixture.
+            // Construction and the already-admitted loader state share that budget.
             .backend_limit_bytes = 12 * 1024 * 1024 * 1024,
-            .combined_limit_bytes = if (backend == .native) 0 else 18 * 1024 * 1024 * 1024,
             .scratch_limit_bytes = 8 * 1024 * 1024 * 1024,
         },
     });

@@ -1306,9 +1306,10 @@ requests across all four arms with advancing cache positions 5–20.
 | Fused, positions 13–20 | 8 | 55.74 | 63.33 |
 | Serial, positions 13–20 | 8 | 22.15 | 23.57 |
 
-The released result covers advancing shapes and contrasts with the
-earlier repeated-shape control. Metal uses the direct resident route by
-default while a positive explicit broker collection window enables fusion.
+The released run used a 20 ms collection window, versus the 200 µs production
+broker control. It verifies advancing shapes and correctness. Qualification
+at the production window still needs to account for whether both requests
+actually coalesced at each position.
 
 ### Issue closure audit
 
