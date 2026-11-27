@@ -1991,3 +1991,15 @@ p50/p95 moved from 37.67/42.89 ms to 40.66/43.49 ms. Same-binary median
 differences were below 1%; the p50 increase remains under investigation.
 The Metal audio receipt SHA-256 is
 `1835c78059945da6a58029628da300633053c41efd12ae095638adc988e7cda1`.
+
+Mixed-model Metal HTTP at `f61c0c11f4` recovered two-clip
+EmbeddingGemma 2 audio after the unchanged unified-memory limit denied
+the first execution permit. Each of the six candidate processes logged
+the denial and reclaimed an idle Metal peer before retry. All grouped
+audio outputs matched across 16 warm samples per side per A/B and B/B
+phase. A/B p50/p95 moved from 37.87/43.81 to 40.96/63.24 ms. The
+candidate B/B p95s were 62.33 and 43.58 ms, so tail latency remains
+unqualified. Gemma 4 text, image, and audio each returned 503 in all
+eight arms. Video and the other workloads completed. The mixed receipt
+SHA-256 is
+`5f564a0ea554a5c3081f282ee5a2a2397dd75a3bacaa8dc2dcbe99fd9ae889d8`.
