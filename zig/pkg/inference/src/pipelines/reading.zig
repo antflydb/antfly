@@ -2537,8 +2537,8 @@ test "Florence checked no-repeat argmax keeps logits on Metal and preserves fall
                         const zero_device = (try cb.ensureDeviceResident(zero_host)) orelse return error.DeviceLogitsUnavailable;
                         defer cb.free(zero_device);
                         var owns_frame = try beginFlorenceStepFrame(&cb, frame_mode);
-                        defer if (owns_frame) cb.decoderRuntimeCancelFrame() catch {};
-                        try std.testing.expectEqual(frame_mode, owns_frame);
+                        defer if (owns_frame) |*frame| frame.deinit();
+                        try std.testing.expectEqual(frame_mode, owns_frame != null);
                         const produced = if (frame_mode) blk: {
                             const intermediate = try cb.add(device, zero_device);
                             defer cb.free(intermediate);
@@ -2549,7 +2549,7 @@ test "Florence checked no-repeat argmax keeps logits on Metal and preserves fall
                         var frame_steps: usize = 0;
                         var frame_fallbacks: usize = 0;
                         const selected = (try florenceStepArgmaxRows(&cb, produced, 2, vocab, allocator, &owns_frame, &frame_steps, &frame_fallbacks)) orelse return error.DeviceArgmaxUnavailable;
-                        try std.testing.expect(!owns_frame and !cb.decoderRuntimeHasActiveFrame());
+                        try std.testing.expect(owns_frame == null and !cb.decoderRuntimeHasActiveFrame());
                         try std.testing.expectEqual(@as(usize, @intFromBool(frame_mode)), frame_steps);
                         try std.testing.expectEqual(@as(usize, 0), frame_fallbacks);
                         defer allocator.free(selected);
@@ -2608,7 +2608,7 @@ test "Florence step frame drains unsupported consumers and cancels failed token 
             var fallback_cb = cb;
             fallback_cb.vtable = &fallback_table;
             var owns = try beginFlorenceStepFrame(&fallback_cb, true);
-            defer if (owns) cb.decoderRuntimeCancelFrame() catch {};
+            defer if (owns) |*frame| frame.deinit();
             const produced = try cb.add(device, device);
             defer cb.free(produced);
             var steps: usize = 0;
@@ -2616,16 +2616,16 @@ test "Florence step frame drains unsupported consumers and cancels failed token 
             const selected = (try florenceStepArgmaxRows(&fallback_cb, produced, 2, 4, allocator, &owns, &steps, &fallbacks)).?;
             defer allocator.free(selected);
             try std.testing.expectEqualSlices(u32, &.{ 1, 0 }, selected);
-            try std.testing.expect(!owns and !cb.decoderRuntimeHasActiveFrame());
+            try std.testing.expect(owns == null and !cb.decoderRuntimeHasActiveFrame());
             try std.testing.expectEqual(@as(usize, 0), steps);
             try std.testing.expectEqual(@as(usize, 1), fallbacks);
             {
                 var failed_frame = try beginFlorenceStepFrame(&cb, true);
-                defer if (failed_frame) cb.decoderRuntimeCancelFrame() catch {};
+                defer if (failed_frame) |*frame| frame.deinit();
                 const pending = try cb.add(device, device);
                 defer cb.free(pending);
                 try std.testing.expectError(error.OutOfMemory, florenceStepArgmaxRows(&cb, pending, 2, 4, std.testing.failing_allocator, &failed_frame, &steps, &fallbacks));
-                try std.testing.expect(failed_frame and cb.decoderRuntimeHasActiveFrame());
+                try std.testing.expect(failed_frame != null and cb.decoderRuntimeHasActiveFrame());
             }
             try std.testing.expect(!cb.decoderRuntimeHasActiveFrame());
             var lost_context = LostResult{ .base = cb };
@@ -2635,11 +2635,11 @@ test "Florence step frame drains unsupported consumers and cancels failed token 
             lost_table.regions.decoder.beginPlannedComputeScope = LostResult.scope;
             const lost_cb = ComputeBackend{ .ptr = &lost_context, .vtable = &lost_table };
             var lost_frame = try beginFlorenceStepFrame(&cb, true);
-            defer if (lost_frame) cb.decoderRuntimeCancelFrame() catch {};
+            defer if (lost_frame) |*frame| frame.deinit();
             const lost_logits = try cb.add(device, device);
             defer cb.free(lost_logits);
             try std.testing.expectError(error.FlorenceArgmaxFrameFailed, florenceStepArgmaxRows(&lost_cb, lost_logits, 2, 4, allocator, &lost_frame, &steps, &fallbacks));
-            try std.testing.expect(!lost_frame and !cb.decoderRuntimeHasActiveFrame());
+            try std.testing.expect(lost_frame == null and !cb.decoderRuntimeHasActiveFrame());
         }
     };
     const fixture = @import("../ops/media_residency_test.zig");

@@ -372,7 +372,8 @@ fn selectLogitsHead(cb: *const ComputeBackend, allocator: std.mem.Allocator, log
     return unsupported;
 }
 
-fn beginStepFrame(cb: *const ComputeBackend, enabled: bool) !?Submission {
+/// Open the shared single-step Metal decoder scope for an owning caller.
+pub fn beginStepFrame(cb: *const ComputeBackend, enabled: bool) !?Submission {
     if (!enabled or cb.kind() != .metal) return null;
     var frame = try Submission.begin(cb);
     if (!frame.owns) return null;
@@ -385,7 +386,7 @@ fn beginStepFrame(cb: *const ComputeBackend, enabled: bool) !?Submission {
     return frame;
 }
 
-fn stepArgmaxRows(cb: *const ComputeBackend, logits: CT, rows: usize, vocab: usize, allocator: std.mem.Allocator, frame: *?Submission, steps: *usize, fallbacks: *usize) !?[]u32 {
+pub fn stepArgmaxRows(cb: *const ComputeBackend, logits: CT, rows: usize, vocab: usize, allocator: std.mem.Allocator, frame: *?Submission, steps: *usize, fallbacks: *usize) !?[]u32 {
     if (frame.*) |*owned| {
         _ = try cb.decoderRuntimeBeginPlannedComputeScope();
         if (try cb.decoderRuntimeArgmaxRowsSuppress(logits, 0, rows, vocab, &.{}, allocator)) |selected| {
