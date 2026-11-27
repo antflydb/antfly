@@ -85,6 +85,10 @@ pub const Plan = struct {
         self.event_count += 1;
     }
     pub fn allocate(self: *Plan, bytes: usize, pointer: DevicePointer) void {
+        if (self.origin != .observed) {
+            if (!self.sealed) self.valid = false;
+            return;
+        }
         self.allocateLive(bytes, pointer);
     }
 
@@ -140,6 +144,10 @@ pub const Plan = struct {
 
     pub fn release(self: *Plan, pointer: DevicePointer) void {
         if (!self.valid or self.sealed or pointer == 0) return;
+        if (self.origin != .observed) {
+            self.valid = false;
+            return;
+        }
         var previous: Slot = no_slot;
         var slot = self.first_live;
         while (slot != no_slot) {
@@ -191,6 +199,7 @@ pub const Plan = struct {
         plan: *Plan,
 
         pub fn allocate(self: Builder, bytes: usize) !u15 {
+            if (self.plan.origin != .declared) return error.InvalidExecutionPlan;
             const slot = self.plan.count;
             self.plan.allocateLive(bytes, null);
             if (!self.plan.valid or self.plan.count == slot) return error.InvalidExecutionPlan;
@@ -198,25 +207,27 @@ pub const Plan = struct {
         }
 
         pub fn release(self: Builder, slot: u15) !void {
-            if (!self.plan.valid or self.plan.sealed or slot >= self.plan.count or self.plan.allocations[slot].lifetime.live_id == 0)
+            if (self.plan.origin != .declared or !self.plan.valid or self.plan.sealed or
+                slot >= self.plan.count or self.plan.allocations[slot].lifetime.live_id == 0)
                 return error.InvalidExecutionPlan;
             self.plan.releaseSlot(@intCast(slot));
             if (!self.plan.valid) return error.InvalidExecutionPlan;
         }
 
         pub fn finish(self: Builder, published_slot: ?u15) !void {
+            if (self.plan.origin != .declared) return error.InvalidExecutionPlan;
             const published: ?u64 = if (published_slot) |slot| p: {
                 if (slot >= self.plan.count or self.plan.allocations[slot].lifetime.live_id == 0) return error.InvalidExecutionPlan;
                 break :p self.plan.allocations[slot].lifetime.live_id;
             } else null;
             if (!self.plan.seal(published)) return error.InvalidExecutionPlan;
-            self.plan.origin = .declared;
         }
     };
 
     pub fn declarationBuilder(self: *Plan) !Builder {
-        if (!self.valid or self.sealed or self.event_count != 0 or self.count != 0)
+        if (!self.valid or self.sealed or self.origin != .observed or self.event_count != 0 or self.count != 0)
             return error.InvalidExecutionPlan;
+        self.origin = .declared;
         return .{ .plan = self };
     }
 
@@ -236,21 +247,22 @@ pub const Plan = struct {
     }
 
     pub fn finishNoOutput(self: *Plan) bool {
-        return self.seal(null);
+        return self.origin == .observed and self.seal(null);
     }
 
     pub fn finish(self: *Plan, pointer: DevicePointer) bool {
-        return self.seal(pointer);
+        return self.origin == .observed and self.seal(pointer);
     }
 
     fn seal(self: *Plan, expected: ?u64) bool {
         if (self.sealed) return false;
-        for (self.allocations[0..self.count], 0..) |*allocation, index| {
-            if (allocation.lifetime.live_id == 0) continue;
+        var slot = self.first_live;
+        while (slot != no_slot) : (slot = self.nextLive(slot)) {
+            const allocation = &self.allocations[slot];
             if (expected != allocation.lifetime.live_id or self.output != null) self.valid = false;
             // The published layout keeps slot geometry, never a learning-run address.
             allocation.lifetime.live_id = 0;
-            self.output = index;
+            self.output = slot;
         }
         self.valid = self.valid and (expected == null) == (self.output == null);
         if (self.valid) if (self.output) |output| self.packExternalScratch(output);
@@ -572,6 +584,22 @@ test "declared CUDA workspace reuses dead slots and redirects its sole published
     try builder.finish(publication);
     try std.testing.expectEqual(layout, try composed.layoutWithExternalOutput(alignment));
     try std.testing.expectEqual(plan.fingerprint(0), composed.fingerprint(0));
+}
+
+test "stream workspace keeps declared slots separate from observed addresses" {
+    var plan: Plan = .{};
+    const builder = try plan.declarationBuilder();
+    try std.testing.expectError(error.InvalidExecutionPlan, plan.declarationBuilder());
+    try std.testing.expect(!plan.finishNoOutput());
+    const slot = try builder.allocate(64);
+    plan.release(@as(u64, slot) + 1);
+    try std.testing.expectError(error.InvalidExecutionPlan, builder.finish(slot));
+
+    plan = .{};
+    try std.testing.expectError(error.InvalidExecutionPlan, builder.allocate(64));
+    const fresh = try plan.declarationBuilder();
+    plan.allocate(64, 0x1000);
+    try std.testing.expectError(error.InvalidExecutionPlan, fresh.finish(null));
 }
 
 test "CUDA arena preserves device addresses wider than a 32-bit host pointer" {
