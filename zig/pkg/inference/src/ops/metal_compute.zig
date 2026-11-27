@@ -2049,6 +2049,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     audio_execution_control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
     audio_capture: ?*audio_tape.Capture = null,
     audio_eager_plan: ?*const audio_tape.Plan = null,
+    audio_encoding_trial: ?AudioFrameTrial = null,
+    audio_submitted_trial: ?AudioFrameTrial = null,
     embedding_bindings_enabled: bool = false,
     embedding_workspace: ?*@import("metal_embedding_bindings.zig").Workspace = null,
     embedding_vision_workspace: ?*@import("metal_embedding_bindings.zig").VisionWorkspace = null,
@@ -24318,6 +24320,38 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return false;
     }
 
+    /// One plan may sample a frame that was empty when the plan began.
+    /// Keep only cache identity across submission so eviction cannot leave a
+    /// dangling plan pointer or train its replacement.
+    const AudioFrameTrial = struct { key: u64, stamp: u64, submits: u64, replay: bool };
+
+    fn submitTrackedAudioFrame(self: *MetalCompute, runtime: *metal_runtime.RawMetalDecodeRuntime) !void {
+        const trial = self.audio_encoding_trial;
+        self.audio_encoding_trial = null;
+        const valid = if (trial) |sample| metal_runtime.runtimeMemorySnapshot(runtime).frame_submit_count == sample.submits else false;
+        try metal_runtime.submitFrame(runtime);
+        self.audio_submitted_trial = if (valid) trial else null;
+    }
+
+    fn waitTrackedAudioFrame(self: *MetalCompute, runtime: *metal_runtime.RawMetalDecodeRuntime) !void {
+        const trial = self.audio_submitted_trial;
+        self.audio_submitted_trial = null;
+        try metal_runtime.waitFrame(runtime);
+        const sample = trial orelse return;
+        for (self.provider_impl.audio_schedules) |entry| {
+            const plan = entry orelse continue;
+            if (plan.key == sample.key and plan.stamp == sample.stamp) {
+                const gpu_ns = metal_runtime.lastFrameGpuNanos(runtime);
+                // Keep a measured loss out of the request tail while still
+                // rechecking long-lived frame recipes periodically.
+                plan.frame_selection.recordWithCooldown(sample.replay, gpu_ns, 255);
+                if (audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_AUDIO_STATS"))
+                    std.debug.print("metal_audio_schedule completed_frame replay={} gpu_ns={d} eager_samples={d} replay_samples={d}\n", .{ sample.replay, gpu_ns, plan.frame_selection.eager_count, plan.frame_selection.replay_count });
+                break;
+            }
+        }
+    }
+
     fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: @import("../execution/cleanup_context.zig").Context, defer_arena: bool) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const observation = @import("../execution/runtime_observation.zig");
@@ -24410,7 +24444,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (observation.kernelObservationActive()) observation.metalSerialScheduleDecision(.awaiting_preparation);
                 return try run(context, inputs);
             }
-            const replay = plan.selection.useReplay();
+            const runtime = p.raw_decode_runtime;
+            const inside_frame = metal_runtime.hasActiveFrame(runtime);
+            const exclusive_frame = inside_frame and !metal_runtime.activeFrameHasWork(runtime);
+            const replay = if (!inside_frame) plan.selection.useReplay() else if (exclusive_frame) plan.frame_selection.useReplay() else false;
+            const frame_trial: ?AudioFrameTrial = if (exclusive_frame and plan.frame_selection.sampling) .{
+                .key = plan.key,
+                .stamp = plan.stamp,
+                .submits = metal_runtime.runtimeMemorySnapshot(runtime).frame_submit_count,
+                .replay = replay,
+            } else null;
+            if (inside_frame) self.audio_encoding_trial = null;
             var out: CT = undefined;
             const stats = audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_AUDIO_STATS");
             const before_encoders = if (stats) metal_runtime.runtimeMemorySnapshot(p.raw_decode_runtime).compute_encoder_count else 0;
@@ -24430,7 +24474,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 out = try run(context, inputs);
             }
             const elapsed = @import("antfly_platform").time.monotonicNs() -| start;
-            plan.selection.record(replay, elapsed);
+            if (inside_frame) {
+                self.audio_encoding_trial = frame_trial;
+            } else if (!metal_runtime.hasSubmittedFrame(runtime) and !metal_runtime.hasActiveFrame(runtime)) {
+                plan.selection.record(replay, elapsed);
+            }
             if (replay) plan.replay_ns = elapsed else plan.eager_ns = elapsed;
             if (observation.kernelObservationActive()) observation.metalSerialWorkspace(replay, metal_runtime.hasActiveFrame(p.raw_decode_runtime) or metal_runtime.hasSubmittedFrame(p.raw_decode_runtime), .{
                 .planned_output_bytes = plan.arena_recipe.outputs_bytes,
@@ -25140,7 +25188,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             self.cancelDecoderRuntimeFrame(runtime, &active);
         }
         if (metal_runtime.hasSubmittedFrame(runtime)) return error.UnsupportedOperation;
-        try metal_runtime.submitFrame(runtime);
+        try self.submitTrackedAudioFrame(runtime);
         self.timing_stats.decoder_runtime_frame_submits += 1;
     }
 
@@ -25149,7 +25197,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const runtime = self.provider_impl.raw_decode_runtime orelse return;
         if (!metal_runtime.hasSubmittedFrame(runtime)) return;
         const started_at = monotonicNowNs();
-        try metal_runtime.waitFrame(runtime);
+        try self.waitTrackedAudioFrame(runtime);
         const finished_at = monotonicNowNs();
         if (finished_at > started_at) {
             self.timing_stats.decoder_runtime_frame_wait_nanos += @intCast(finished_at - started_at);
@@ -40075,9 +40123,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             try self.flushPendingPrefillKvDeviceSeeds();
             return;
         }
-        try metal_runtime.submitFrame(rt);
+        try self.submitTrackedAudioFrame(rt);
         const started_at = monotonicNowNs();
-        try metal_runtime.waitFrame(rt);
+        try self.waitTrackedAudioFrame(rt);
         const finished_at = monotonicNowNs();
         self.timing_stats.decoder_runtime_frame_submits += 1;
         if (finished_at > started_at) {
@@ -40107,6 +40155,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn cancelDecoderRuntimeFrame(self: *MetalCompute, runtime: ?*metal_runtime.RawMetalDecodeRuntime, active: *bool) void {
         if (!active.*) return;
+        self.audio_encoding_trial = null;
         const rt = runtime orelse {
             active.* = false;
             self.finishPendingDebertaRelativeProjections(false);
@@ -40124,6 +40173,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const runtime = self.provider_impl.raw_decode_runtime orelse return false;
         const owns_frame = try self.beginDecoderRuntimeFrame(runtime);
         if (!owns_frame) return false;
+        self.audio_encoding_trial = null;
         errdefer {
             var active = true;
             self.cancelDecoderRuntimeFrame(runtime, &active);

@@ -250,6 +250,7 @@ pub const Plan = struct {
     eager_ns: u64 = 0,
     replay_ns: u64 = 0,
     selection: Selection = .{},
+    frame_selection: Selection = .{},
     storage: @import("prepared_tensor_storage.zig").Storage = .{ .host_bytes = @sizeOf(Plan) },
     metadata_bytes: usize = @sizeOf(Plan),
     metadata_views: ?[]?CT = null,
@@ -953,6 +954,10 @@ pub const Selection = struct {
         return sorted[2];
     }
     pub fn record(self: *Selection, replayed: bool, ns: u64) void {
+        self.recordWithCooldown(replayed, ns, 8);
+    }
+
+    pub fn recordWithCooldown(self: *Selection, replayed: bool, ns: u64, cooldown: u8) void {
         if (ns == 0 or !self.sampling) return;
         if (replayed and self.replay_count < 5) {
             self.replay[self.replay_count] = ns;
@@ -964,10 +969,26 @@ pub const Selection = struct {
         }
         if (self.eager_count == 5 and self.replay_count == 5) {
             const baseline = median(self.eager);
-            if (median(self.replay) > baseline + baseline / 20) self.* = .{ .cooldown = 8 };
+            if (median(self.replay) > baseline + baseline / 20) self.* = .{ .cooldown = cooldown };
         }
     }
 };
+
+test "Metal completed audio frames keep a losing route out of the warm tail" {
+    var selection: Selection = .{};
+    for (0..5) |_| {
+        try std.testing.expect(!selection.useReplay());
+        selection.recordWithCooldown(false, 4_000_000, 255);
+        try std.testing.expect(selection.useReplay());
+        selection.recordWithCooldown(true, 6_000_000, 255);
+    }
+    for (0..255) |_| {
+        try std.testing.expect(!selection.useReplay());
+        try std.testing.expect(!selection.sampling);
+    }
+    try std.testing.expect(!selection.useReplay());
+    try std.testing.expect(selection.sampling);
+}
 
 test "embeddinggemma2 audio selection rejects isolated outliers and retries after cooldown" {
     var selection = Selection{};

@@ -1404,6 +1404,15 @@ p50 drift stayed below 0.3%. The isolated Native CPU text embedding and
 GLiNER2.5 repeats both passed exact output and timing gates with the
 same sample count.
 
+Metal audio route selection now samples completed GPU frames through
+the existing retirement wait and keeps a measured slower route out of
+the warm latency tail. A completed-frame trace measured roughly 4 ms
+for eager frames and 6 ms for replay on the two-clip fixture. Against
+the same frozen baseline, the fixed server passed with 48 measured
+requests per side per phase, exact outputs, and Metal selection in
+every arm. Baseline/candidate p50 was 35.30/35.52 ms and p95 was
+35.62/35.97 ms. Same-binary p50 and p95 differences stayed within 1%.
+
 At `34296ffb5a`, five Native CPU fixtures passed for resident handoff and
 task output custody. The incremental decoder matched host-reference logits
 after the encoder and destination session handles closed, and allocation
