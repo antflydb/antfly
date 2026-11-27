@@ -32814,11 +32814,9 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
                 for (params.blockIds(other)) |block_id| if (block_id == tail_block) break :direct false;
             }
         }
-        for ([_]*const CudaTensor{ qt, kt, vt }) |source| {
-            for ([_]buffer_mod.DeviceBuffer{ existing.k, existing.v }) |destination| {
-                if (source.buffer.ptr < destination.ptr + destination.len and destination.ptr < source.buffer.ptr + source.buffer.len) return error.InvalidPagedKvBatch;
-            }
-        }
+        const regions = [5]buffer_mod.DeviceBuffer{ qt.buffer, kt.buffer, vt.buffer, existing.k, existing.v };
+        const lengths = [5]usize{ qt.buffer.len, kt.buffer.len, vt.buffer.len, existing.k.len, existing.v.len };
+        buffer_mod.validateRegions(regions.len, regions, lengths, .{ @alignOf(f32), @alignOf(f32), @alignOf(f32), @alignOf(u16), @alignOf(u16) }, 3) catch return error.InvalidPagedKvBatch;
         params.k = existing.k.ptr;
         params.v = existing.v.ptr;
         params.new_k = kt.buffer.ptr;
