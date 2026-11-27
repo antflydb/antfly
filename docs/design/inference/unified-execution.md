@@ -1428,6 +1428,11 @@ and physical route receipts across capture, replay and held outputs.
 The released model reproduced the same arena size and replay count.
 The production layout still comes from an observed allocation schedule.
 
+At `ee3629cec0`, five scoped Metal audio tests passed without skips.
+The replay fixture rejected missing and excess input bindings before
+dispatch. The same run covered fresh inputs, held results, and
+recovery after admission pressure.
+
 This audit reconciles the original `2f2438e67f` implementation review
 against merged main `4951ca13f9` with later evidence. Each serving
 measurement identifies the revision that ran.
