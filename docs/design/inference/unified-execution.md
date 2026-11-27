@@ -2016,3 +2016,21 @@ separate from whole-request latency. The uninstrumented and instrumented
 receipt hashes are
 `b48f0385285a894d52382cc799396eb94d3c94d620a3101711c31134bd061c47`
 and `f765e4b0b89afebe5585810db61c9afc742bcba696365cb0c1f39ca2cdfe82ce`.
+
+The Metal mixed-model failure reproduced on the compiled E4B runtime
+with text, image and audio prefill chunks of 512, 286 and 79 rows.
+Execution scope and KV preparation succeeded. The provider entered
+the per-layer input scope and returned a capacity error before
+entering the decoder layer frame. The official E4B QAT checkpoint
+contains a 2,312,110,080-byte Q6_K per-layer embedding table.
+This is the source tensor size; the trace does not yet measure its
+incremental charge or identify the denied reservation.
+
+A candidate-only order control kept the same request bodies and
+memory limits and ran video first. All four Gemma 4 modalities
+completed with matching outputs in all four arms. DECIDE returned a
+capacity error in every arm. The log also records E4B eviction
+between video and the later Gemma requests, so this order control
+does not establish persistent Gemma weight-cache reuse. The control
+receipt SHA-256 is
+`70e569973895877fbd754684cb213afde969f25f9011c688bbb22c6fa2ddf929`.
