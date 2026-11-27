@@ -2784,8 +2784,11 @@ pub const ComputeBackend = struct {
         projectImageFeatures: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, rows: usize, vision_dim: usize, projection_dim: usize) anyerror!?CT = null,
     };
 
+    pub const LocalRelativeDestination = struct { tensor: CT, first_row: usize };
+
     pub const AudioAttentionRegion = struct {
         localRelative: ?*const fn (ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) anyerror!?CT = null,
+        localRelativeInto: ?*const fn (ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams, destination: LocalRelativeDestination) anyerror!bool = null,
         packedLocalRelative: ?*const fn (ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) anyerror!?CT = null,
     };
 
@@ -5963,6 +5966,11 @@ pub const ComputeBackend = struct {
     pub fn gemma4AudioLocalAttention(self: *const ComputeBackend, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) !?CT {
         const op = self.vtable.regions.audio_attention.localRelative orelse return null;
         return op(self.ptr, q, k, v, rel, q_dim_scales, valid, params);
+    }
+
+    pub fn localRelativeAttentionInto(self: *const ComputeBackend, q: CT, k: CT, v: CT, rel: CT, scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams, destination: LocalRelativeDestination) !bool {
+        const op = self.vtable.regions.audio_attention.localRelativeInto orelse return false;
+        return op(self.ptr, q, k, v, rel, scales, valid, params, destination);
     }
 
     pub fn addScalar(self: *const ComputeBackend, input: CT, value: f32) !?CT {

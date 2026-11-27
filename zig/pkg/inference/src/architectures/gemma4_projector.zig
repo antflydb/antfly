@@ -5329,11 +5329,19 @@ fn audioKeyScale() f32 {
 /// the host reference.
 fn audioLocalAttention(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: AudioConfig, q: CT, k: CT, v: CT, rel: CT, layer: usize, inputs: *const AudioLayerInputs) !CT {
     if (inputs.segments.len == 0) return audioLocalAttentionSingle(cb, allocator, cfg, q, k, v, rel, layer, inputs);
+    if (layer >= inputs.scales.len) return error.InvalidTensorShape;
     if (inputs.segment_valid) |validity| if (cfg.attention_context_right == 0 and !audioHostOps().attention) {
         var params = try audioLocalAttentionParams(cfg, inputs.valid_mask.len);
         params.segmented = true;
         if (try cb.gemma4AudioLocalAttention(q, k, v, rel, inputs.scales[layer], validity, params)) |result| return result;
     };
+    var remaining = inputs.valid_mask.len;
+    for (inputs.segments) |span| {
+        if (span == 0 or span > remaining) return error.InvalidInputShape;
+        remaining -= span;
+    }
+    if (remaining != 0) return error.InvalidInputShape;
+    const can_assign = cfg.source_scalar_storage == .bf16 and cfg.attention_context_right == 0 and !audioHostOps().attention;
     const output = (try cb.allocUninitF32Shape(&.{ @intCast(inputs.valid_mask.len), @intCast(cfg.audio_hidden) })) orelse return error.UnsupportedResidentGemma4Audio;
     errdefer cb.free(output);
     var offset: usize = 0;
@@ -5348,6 +5356,10 @@ fn audioLocalAttention(cb: *const ComputeBackend, allocator: std.mem.Allocator, 
         // Views reuse the one admitted mask upload across all tower layers.
         const valid_ct = try cb.sliceRows2D(allocator, inputs.valid_ct, offset, span, 1);
         defer cb.free(valid_ct);
+        if (can_assign and try cb.localRelativeAttentionInto(qs, ks, vs, rel, inputs.scales[layer], valid_ct, try audioLocalAttentionParams(cfg, span), .{ .tensor = output, .first_row = offset })) {
+            offset += span;
+            continue;
+        }
         var clip = inputs.*;
         clip.valid_mask = inputs.valid_mask[offset..][0..span];
         clip.valid_ct = valid_ct;
@@ -5357,7 +5369,6 @@ fn audioLocalAttention(cb: *const ComputeBackend, allocator: std.mem.Allocator, 
         if (!try cb.copyRows2D(allocator, output, offset, result, 0, span, cfg.audio_hidden)) return error.UnsupportedResidentGemma4Audio;
         offset += span;
     }
-    if (offset != inputs.valid_mask.len) return error.InvalidInputShape;
     return output;
 }
 
