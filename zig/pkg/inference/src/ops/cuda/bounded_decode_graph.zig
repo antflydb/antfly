@@ -329,6 +329,15 @@ pub const GraphPhase = struct {
         self.admission_pressure = null;
         funding.fundOutsideExecution(if (pin) |*value| value else null) catch |err| {
             self.admission_pressure = funding.admission_pressure;
+            if (self.admission) |policy| {
+                if (funding.admission_pressure != null and @import("antfly_platform").env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
+                    const occupied = policy.controller.snapshotBackend(.gpu);
+                    std.debug.print("LIGHTONOCR3 cuda_model_graph_funding rows={d} stage={s} error={s} requested_host_scratch={d} requested_backend_scratch={d} occupied_host_scratch={d} occupied_backend_scratch={d} policy_scratch_limit={d}\n", .{
+                        self.descriptor.rows,        @tagName(self.mode),            @errorName(err),                   amounts.host_scratch_bytes, amounts.backend_scratch_bytes,
+                        occupied.host_scratch_bytes, occupied.backend_scratch_bytes, policy.limits.scratch_limit_bytes,
+                    });
+                }
+            }
             return err;
         };
         if (self.mode == .storage) {

@@ -2069,10 +2069,19 @@ fn projectCohortParts(a: std.mem.Allocator, session: Session, cb: *const Compute
         }
         if (wave.count != 0) {
             if (cb.embedding_stage) |stage| try stage.acquire();
-            var request = base.request.?;
-            const scratch = if (image) (try preparedVisionScratch(session, wave.images[0..wave.count], 2 * 1024 * 1024 * 1024, control)) else audioRunRequest(session.backend(), 0, 0, wave.count).workspace_bytes;
-            request.workspace_bytes = @max(request.workspace_bytes, scratch + groups.len * 8192 * 512 * 4);
-            var supplement = if (!image and session.run_admission != null) try scheduler.lane.admitPhaseScoped(try session.run_admission.?.estimateRequest(request, session.outputInfo()), scheduler.lane.credit()) else scheduler.lane.emptyPhase();
+            const scratch = if (image) try preparedVisionScratch(session, wave.images[0..wave.count], 2 * 1024 * 1024 * 1024, control) else audioRunRequest(session.backend(), 0, 0, wave.count).workspace_bytes;
+            var supplement = phase: {
+                const admission = session.run_admission orelse break :phase scheduler.lane.emptyPhase();
+                if (image) break :phase scheduler.lane.emptyPhase();
+                var request = base.request.?;
+                // The tower overlaps the projected rows in the inspected cohort.
+                const retained_bytes = if (boundedGroupPlanning(session.backend(), options))
+                    scheduler.retained
+                else
+                    try std.math.mul(usize, groups.len, 8192 * 512 * @sizeOf(f32));
+                request.workspace_bytes = @max(request.workspace_bytes, try std.math.add(usize, scratch, retained_bytes));
+                break :phase try scheduler.lane.admitPhaseScoped(try admission.estimateRequest(request, session.outputInfo()), scheduler.lane.credit());
+            };
             defer supplement.deinit();
             var audio: [4]*const projector.PreparedAudio = undefined;
             if (!image) {
