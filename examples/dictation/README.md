@@ -26,7 +26,9 @@ available for reproducible installs.
 After downloading:
 
 1. Quit any development copy and unzip the download.
-2. Move **Antfly Dictation.app** into `/Applications` or `~/Applications`, then open it.
+2. Open **Antfly Dictation.app** and choose **Move to Applications**, or move it
+   into `/Applications` or `~/Applications` yourself. If you choose **Not Now**,
+   Settings → General → **Install in Applications…** remains available.
 3. Allow microphone access and enable the app in Accessibility for Fn/Globe and paste.
 4. Keep **On this Mac** selected. Automatic presets use ready Apple speech on
    macOS 26+, otherwise select **Download Whisper Tiny…**. No server address or
