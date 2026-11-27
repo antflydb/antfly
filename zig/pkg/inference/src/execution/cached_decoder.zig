@@ -712,6 +712,37 @@ fn checkActualFullPrefixDecoder(cb_value: ComputeBackend, reference_backend: Com
     cancelled.context.control = .{ .check_fn = Cancel.check };
     try std.testing.expectError(error.Cancelled, cancelled.stepResident(&.{ 1, 2 }, 2));
     try std.testing.expectError(error.Cancelled, cancelled.stepHost(&.{ 1, 2 }, 2));
+    try std.testing.expectError(error.Cancelled, cancelled.stepHostStrided(&.{ 1, 2, 0 }, 3, 2));
+    try std.testing.expectEqual(@as(usize, 0), cancelled.prefix_storage.len);
+
+    const batch_encoder = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &.{ 2, 1, 4 });
+    defer cb.free(batch_encoder);
+    var batch = TestDecoder.FullPrefix{
+        .context = owner.context,
+        .encoder_hidden = batch_encoder,
+        .encoder_mask = &.{ 1, 1 },
+        .batch = 2,
+        .encoder_length = 1,
+    };
+    defer batch.deinit();
+    const history = [_]i64{ 1, 2, 3, 0, 3, 1, 2, 0 };
+    try std.testing.expectError(error.InvalidInputShape, batch.stepHostStrided(history[0..7], 4, 2));
+    try std.testing.expectError(error.InvalidInputShape, batch.stepHostStrided(&history, 4, 5));
+    const prefixes = [_][]const i64{ &.{ 1, 3 }, &.{ 1, 2, 3, 1 }, &.{ 1, 2, 3, 3, 1, 2 } };
+    for (prefixes, 1..) |packed_ids, rows| {
+        const expected = try batch.stepHost(packed_ids, rows);
+        defer a.free(expected);
+        const step = try batch.stepHostStrided(&history, 4, rows);
+        defer a.free(step.logits);
+        try std.testing.expectEqualSlices(f32, expected, step.logits);
+        try std.testing.expectEqual(rows * config.vocab_size, step.row_stride);
+        try std.testing.expectEqual((rows - 1) * config.vocab_size, step.tail_offset);
+        const backing = batch.prefix_storage.ptr;
+        const repeated = try batch.stepHostStrided(&history, 4, rows);
+        defer a.free(repeated.logits);
+        try std.testing.expectEqual(backing, batch.prefix_storage.ptr);
+        try std.testing.expectEqualSlices(f32, expected, repeated.logits);
+    }
 }
 
 test "full prefix decoder actual Native preserves host resident heads held outputs and cancellation" {
