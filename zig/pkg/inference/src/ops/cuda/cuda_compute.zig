@@ -22685,35 +22685,46 @@ fn SourceF32Operands(comptime count: usize) type {
     return struct {
         const Self = @This();
         const Span = buffer_mod.ByteSpan;
+        const Layout = struct {
+            spans: [count]Span = @splat(.{}),
+            extra: Span = .{},
+            bytes: usize = 0,
+
+            fn resolve(conversion_elements: [count]?usize, extra_bytes: usize) !Layout {
+                var result: Layout = .{};
+                const alignment = buffer_mod.DeviceBuffer.allocation_alignment;
+                for (conversion_elements, &result.spans) |conversion, *span| {
+                    if (conversion) |elements| span.* = try Span.append(&result.bytes, try checkedMul(elements, @sizeOf(f32)), alignment);
+                }
+                if (extra_bytes != 0) result.extra = try Span.append(&result.bytes, extra_bytes, alignment);
+                return result;
+            }
+        };
         tensors: [count]?*CudaTensor,
-        spans: [count]Span = @splat(.{}),
+        layout: Layout,
         buffers: [count]buffer_mod.DeviceBuffer = @splat(.{}),
-        extra: Span = .{},
-        bytes: usize = 0,
         temporary: ?SourceLinearTemporary = null,
         capture: bool = false,
 
         fn plan(self: *CudaCompute, tensors: [count]?*CudaTensor, round: [count]bool, extra_bytes: usize) !Self {
-            var result: Self = .{ .tensors = tensors };
-            const alignment = buffer_mod.DeviceBuffer.allocation_alignment;
-            for (tensors, round, &result.spans, &result.buffers) |tensor_opt, rounds, *span, *buffer| {
+            var result: Self = .{ .tensors = tensors, .layout = undefined };
+            var conversion_elements: [count]?usize = @splat(null);
+            for (tensors, round, &conversion_elements, &result.buffers) |tensor_opt, rounds, *elements, *buffer| {
                 const tensor = tensor_opt orelse continue;
                 buffer.* = tensor.buffer;
-                if (rounds or tensor.dtype == .bf16) {
-                    span.* = try Span.append(&result.bytes, try checkedMul(tensor.elem_count, @sizeOf(f32)), alignment);
-                }
+                if (rounds or tensor.dtype == .bf16) elements.* = tensor.elem_count;
             }
-            if (extra_bytes != 0) result.extra = try Span.append(&result.bytes, extra_bytes, alignment);
-            if (result.bytes != 0) result.capture = try SourceLinearTemporary.preflightCapture(self);
+            result.layout = try Layout.resolve(conversion_elements, extra_bytes);
+            if (result.layout.bytes != 0) result.capture = try SourceLinearTemporary.preflightCapture(self);
             return result;
         }
 
         fn bind(self: *Self, compute: *CudaCompute) !void {
-            if (self.bytes == 0) return;
+            if (self.layout.bytes == 0) return;
             // Outside a planned or retained audio scope, keep the ordinary
             // temporary cache hot while using the same operand offsets.
-            self.temporary = try SourceLinearTemporary.acquireCachedOrDeclared(compute, self.bytes, self.capture);
-            for (self.tensors, self.spans, &self.buffers) |tensor_opt, span, *buffer| {
+            self.temporary = try SourceLinearTemporary.acquireCachedOrDeclared(compute, self.layout.bytes, self.capture);
+            for (self.tensors, self.layout.spans, &self.buffers) |tensor_opt, span, *buffer| {
                 if (span.bytes == 0) continue;
                 const tensor = tensor_opt.?;
                 buffer.* = self.temporary.?.span(span);
@@ -22807,7 +22818,7 @@ fn bf16SourceOperationOp(ctx: *anyopaque, request: *const ops.Bf16SourceOperatio
                 self.stats.source_rms_contiguous_calls += 1;
             } else {
                 const plan = channel_plan.?;
-                const partial = if (operands.temporary) |temporary| temporary.span(operands.extra) else buffer_mod.DeviceBuffer{};
+                const partial = if (operands.temporary) |temporary| temporary.span(operands.layout.extra) else buffer_mod.DeviceBuffer{};
                 try self.kernels.launchSourceChannelRms(&self.ctx, output.buffer, values, gamma, partial, plan, value.epsilon);
                 self.stats.source_rms_channel_calls += 1;
             }
