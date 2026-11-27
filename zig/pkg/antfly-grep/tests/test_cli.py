@@ -177,14 +177,21 @@ class DecisionHandler(BaseHTTPRequestHandler):
         pass
 
     def do_POST(self):
-        gate = getattr(self.server, "provider_lanes", None)
-        if gate is not None:
-            gate.acquire()
-        self.request_active = True
-        self.request_gate = gate
-        with self.server.lock:
-            self.server.active += 1
-            self.server.peak = max(self.server.peak, self.server.active)
+        # Ordered asset projection can overlap inference. A provider-only
+        # measurement excludes the independently admitted index requests.
+        provider_only = getattr(self.server, "measure_provider_work", False)
+        self.request_active = not (provider_only and "/tables/" in self.path)
+        self.request_gate = (
+            getattr(self.server, "provider_lanes", None)
+            if self.request_active
+            else None
+        )
+        if self.request_gate is not None:
+            self.request_gate.acquire()
+        if self.request_active:
+            with self.server.lock:
+                self.server.active += 1
+                self.server.peak = max(self.server.peak, self.server.active)
         try:
             if self.server.barrier and not self.path.startswith("/api/v1/tables/"):
                 try:
@@ -4340,6 +4347,7 @@ class CliTests(unittest.TestCase):
 
     def test_media_cross_parent_projection_coalescing_and_stable_delivery(self):
         config = self.visual_parents(count=20)
+        self.server.measure_provider_work = True
         args = [
             *self.decision_args(),
             "--media=images",
@@ -4370,6 +4378,7 @@ class CliTests(unittest.TestCase):
         )
         self.server.requests.clear()
         self.server.index_requests.clear()
+        self.server.peak = 0
         self.server.delay = 0.02
         try:
             streamed = self.raw_cli(*args, "--decision-transport=single", "--no-rank")
