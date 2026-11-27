@@ -2646,3 +2646,20 @@ mean arm-median latency was 643.89 versus 643.86 ms for image and
 across arms. The toggle did not yield a measurable serving improvement,
 so the experimental source was removed. The receipt hash is
 `d5f38ffee83de0327e1fb51684e3001629da39d85e6ae2d32126d18f5a0bb2a0`.
+
+On Spark GB10 at `2c6206072a`, 34 CUDA checks passed without skips.
+The parked decoder graph survived unrelated sequence and recurrent
+retirement, replayed with exact outputs, and retired when a captured
+binding was released. Released grouped audio matched its repeated
+vectors exactly using a 38,017,792-byte arena and two graph replays.
+The test log hash is
+`239004836385b43638fbca95668a45fbb6aadb6f44de877c01d89fc4fe926ef1`.
+
+All four arms of the same-binary default/shared/shared/default
+LightOnOCR 2×32-page comparison matched the serial outputs exactly.
+Throughputs were 19.9178, 20.1425, 19.6868 and 20.9036 pages/s. Maximum
+timed replay widths were 2, 0, 64 and 64 rows. A1 retired its 64-row
+capture after two tokens during page cleanup. B1 recorded no replay.
+Both final arms replayed at 64 rows and retired the captured binding
+after ten tokens. The measured throughputs do not establish a reliable
+default/shared difference because replay eligibility differed across arms.
