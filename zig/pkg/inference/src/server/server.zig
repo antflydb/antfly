@@ -56222,9 +56222,11 @@ test "dynamic CUDA admission counts admitted pages and rolls back failed batch g
     defer first.release();
     try std.testing.expectEqual(@as(usize, 10 * mib), ctx.decoder_peak.bytes);
     try std.testing.expectEqual(@as(usize, 4 * mib), ctx.vision_peak.bytes);
+    const prior_workspace = ctx.decoder_workspace;
     try std.testing.expectError(error.ResourceTemporarilyUnavailable, ctx.admitRegisteredPage(&factory, pending_index, 4 * mib, 0, page));
     try std.testing.expectEqual(@as(usize, 10 * mib), ctx.decoder_peak.bytes);
     try std.testing.expectEqual(@as(usize, 4 * mib), ctx.vision_peak.bytes);
+    try std.testing.expectEqualDeep(prior_workspace, ctx.decoder_workspace);
     try std.testing.expectEqual(@as(usize, 1), ctx.admitted_pages);
     first.release();
     ctx.unregister(first_index);
@@ -56232,6 +56234,16 @@ test "dynamic CUDA admission counts admitted pages and rolls back failed batch g
     defer next.release();
     ctx.unregister(pending_index);
     try std.testing.expectEqual(@as(usize, 0), ctx.admitted_pages);
+
+    next.release();
+    factory.decoder_workspace = null;
+    factory.dynamic_vision_batch_items = 0;
+    const reused_index = ctx.register(.{});
+    defer ctx.unregister(reused_index);
+    var reused = try ctx.admitRegisteredPage(&factory, reused_index, null, 0, page);
+    defer reused.release();
+    try std.testing.expectEqual(@as(usize, 1), ctx.admitted_pages);
+    try std.testing.expect(ctx.admitted_controls[reused_index]);
 }
 
 test "installed Node typed resident dispatch preserves encoder ownership past Node and session close" {
