@@ -3264,7 +3264,11 @@ pub const Search = struct {
         }
         var output: std.Io.Writer.Allocating = .init(a);
         try output.writer.print("{s}  relevance={d:.3}\n", .{ path, self.best_probability });
-        if (self.provenance.backend == .antfly) try output.writer.print("  source={s} revision={s} indexed_at={d} (indexed snapshot)\n", .{ self.provenance.uri.?, self.provenance.revision.?, self.provenance.indexed_at.? });
+        if (self.provenance.backend == .antfly) {
+            try output.writer.print("  source={s} revision={s}", .{ self.provenance.uri.?, self.provenance.revision.? });
+            if (self.provenance.indexed_at) |indexed_at| try output.writer.print(" indexed_at={d}", .{indexed_at});
+            try output.writer.writeAll(" (indexed snapshot)\n");
+        }
         for (view.regions[0..@min(view.regions.len, self.options.max_regions_per_file)]) |region| try output.writer.print("  {d}-{d}  {d:.3}  {s}\n", .{ region.start, region.end, region.p, region.label });
         if (view.regions.len > self.options.max_regions_per_file) try output.writer.print("  [omitted {d} qualifying regions; increase --max-regions]\n", .{view.regions.len - self.options.max_regions_per_file});
         if (view.regions.len == 0 and view.declarations.len > 0) {
