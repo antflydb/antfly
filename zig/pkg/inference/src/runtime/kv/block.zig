@@ -19,6 +19,32 @@ pub const KvPoolId = u32;
 pub const KvBlockId = u32;
 pub const invalid_block_id = std.math.maxInt(KvBlockId);
 
+/// The logical prefix can span the active block table and its reserved tail.
+pub inline fn physicalTokenCapacity(spans: []const []const KvBlockId, needed_blocks: usize, page_size: usize) !usize {
+    if (needed_blocks == 0) return 0;
+    if (page_size == 0) return error.InvalidBlockId;
+    var remaining = needed_blocks;
+    var largest: usize = 0;
+    for (spans) |span| {
+        const count = @min(span.len, remaining);
+        for (span[0..count]) |id| {
+            if (id == invalid_block_id) return error.InvalidBlockId;
+            largest = @max(largest, id);
+        }
+        remaining -= count;
+        if (remaining == 0)
+            return std.math.mul(usize, try std.math.add(usize, largest, 1), page_size);
+    }
+    return error.InvalidBlockId;
+}
+
+test "physical KV capacity takes a sparse prefix across retained and reserved pages" {
+    const spans = [_][]const KvBlockId{ &.{2}, &.{ 17, 4, 99 } };
+    try std.testing.expectEqual(@as(usize, 18 * 16), try physicalTokenCapacity(&spans, 3, 16));
+    try std.testing.expectEqual(@as(usize, 100 * 16), try physicalTokenCapacity(&spans, 4, 16));
+    try std.testing.expectError(error.InvalidBlockId, physicalTokenCapacity(&spans, 5, 16));
+}
+
 pub const KvResidency = enum {
     gpu,
     ram,

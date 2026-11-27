@@ -11584,13 +11584,10 @@ const CudaKvDeviceStorage = struct {
     }
 
     fn physicalCapacityTokens(logical_blocks: []const kv_block_mod.KvBlockId, needed_blocks: usize, page_size_tokens: u16) !usize {
-        if (needed_blocks == 0) return 0;
-        if (logical_blocks.len < needed_blocks or page_size_tokens == 0) return error.InvalidPagedKvState;
-        var max_block: usize = 0;
-        for (logical_blocks[0..needed_blocks]) |block_id| {
-            max_block = @max(max_block, @as(usize, block_id));
-        }
-        return checkedMul(try checkedAdd(max_block, 1), page_size_tokens);
+        return kv_block_mod.physicalTokenCapacity(&.{logical_blocks}, needed_blocks, page_size_tokens) catch |err| switch (err) {
+            error.InvalidBlockId => error.InvalidPagedKvState,
+            error.Overflow => error.Overflow,
+        };
     }
 
     fn plannedBlockTableUploadCount(

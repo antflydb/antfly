@@ -920,7 +920,7 @@ pub const Executor = struct {
             // pages share its capacity instead of each being capped at 64 blocks.
             const packet_rows = attention.max_packet_rows;
             var packet_blocks: usize = 0;
-            var max_physical_block: usize = 0;
+            var physical_tokens: usize = 0;
             for (items, 0..) |item, i| {
                 if (i % packet_rows == 0) packet_blocks = 0;
                 const state = item.state;
@@ -946,20 +946,17 @@ pub const Executor = struct {
                 try key.add(block_count);
                 const primary = if (owned_sequence) |value| value.block_table.blocks.items else blocks;
                 const tail = if (owned_sequence) |value| value.reserved_tail_blocks.items else &.{};
-                var required_blocks = try std.math.divCeil(usize, future[i], page_size);
-                for ([_][]const u32{ primary, tail }) |span| {
-                    const needed = @min(required_blocks, span.len);
-                    for (span[0..needed]) |block| max_physical_block = @max(max_physical_block, block);
-                    required_blocks -= needed;
-                    for (span) |block| try key.add(block);
-                }
+                const spans = [_][]const u32{ primary, tail };
+                const required_blocks = try std.math.divCeil(usize, future[i], page_size);
+                const capacity = try @import("../runtime/kv/block.zig").physicalTokenCapacity(&spans, required_blocks, page_size);
+                physical_tokens = @max(physical_tokens, capacity);
+                for (spans) |span| for (span) |block| try key.add(block);
             }
             var kv_words: [193]u64 = undefined;
             const kv_count = try C.lightOnGraphKvWords(self.context.cb, storage, items[0].state.sequence_id.?, max_future, attention_layers[0..attention_count], &kv_words);
             // Logical length is insufficient when the global page pool
             // assigns a high physical block to a short sequence. Let the
             // ordinary suffix path grow that backing before learning a graph.
-            const physical_tokens = try std.math.mul(usize, try std.math.add(usize, max_physical_block, 1), page_size);
             for (0..attention_count) |index| if (kv_words[1 + index * 3 + 2] < physical_tokens) return decline(decline_code, .context_or_page_capacity);
             for (kv_words[0..kv_count]) |word| try key.add(word);
             return .{ .max_future = max_future, .attention_count = attention_count };
