@@ -951,7 +951,8 @@ pub const Executor = struct {
     ) !?StepForwardResult {
         const C = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
         self.lighton_graph_attempts += 1;
-        if (self.lighton_cuda_execution_id == 0 or self.access.mutex == null or !C.lightOnDecodeGraphEnabled(self.context.cb) or
+        if (self.lighton_cuda_execution_id == 0 or self.access.mutex == null) return self.declineLightOnGraph(.unsupported_lane_state);
+        if (!C.lightOnDecodeGraphEnabled(self.context.cb) or
             claimed.len < 2 or claimed.len > (if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128")) @as(usize, 128) else 64) or self.context.gpt_config.suppressTokenIds().len != 0) return self.declineLightOnGraph(.unsupported_geometry);
         if (claimed.len > 64 and claimed.len % 64 == 1) return self.declineLightOnGraph(.unsupported_geometry);
         // The graph requires the same concrete packet route as its numerical
@@ -1961,6 +1962,18 @@ fn checkSharedNativeCohort(actual: ComputeBackend, reference: ComputeBackend) !v
 test "actual Native shared prefill cohort publishes exact model-owned participants before task publication" {
     const helper = @import("../ops/media_residency_test.zig");
     try helper.onNative(@import("testing/decoder.zig").populate, checkSharedNativeCohort);
+}
+
+test "bounded CUDA decoder reports missing lane ownership before backend access" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    var executor = Executor{ .context = undefined };
+    var scope: observation.KernelScope = undefined;
+    scope.begin();
+    defer _ = scope.finish();
+    var decode: gpt_arch.DecodeContext = undefined;
+    try std.testing.expect(try executor.tryOrderedLightOnCudaDecodeGraph(&.{}, &.{}, &.{}, &decode) == null);
+    try std.testing.expectEqual(@as(u64, 1), executor.lighton_graph_attempts);
+    try std.testing.expectEqualDeep(observation.CudaDecoderDeclines{ .unsupported_lane_state = 1 }, scope.cuda_decoder_declines.?);
 }
 
 test "captured graph recipe compares every rebuilt key word without a second key buffer" {
