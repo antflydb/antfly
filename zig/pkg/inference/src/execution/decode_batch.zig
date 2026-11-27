@@ -98,7 +98,6 @@ fn contextAt(comptime mixed: bool, source: Source(mixed), index: usize, seq_len:
 
 fn assemble(comptime mixed: bool, storage: anytype, source: Source(mixed), seq_len: usize, query_seq_len: usize, full_positions: ?[]const u32, packed_lengths: ?[]const usize) !OwnedContext {
     const uses_workspace = @TypeOf(storage) == *PackedDecodeWorkspace;
-    const workspace: ?*PackedDecodeWorkspace = if (uses_workspace) storage else null;
     const allocator: ?std.mem.Allocator = if (uses_workspace) null else storage;
     if (source.len == 0) return error.EmptyBatch;
     if (packed_lengths) |lengths| {
@@ -143,11 +142,11 @@ fn assemble(comptime mixed: bool, storage: anytype, source: Source(mixed), seq_l
     if (mixed and full_positions == null and has_positions and max_query != 1) return error.Qwen3VlMixedBatchMropeUnsupported;
     if (full_positions) |positions| if (positions.len != try std.math.mul(usize, physical_rows, 3)) return error.InvalidQwen3VlMropeShape;
     const needs_positions = full_positions != null or has_positions or (uses_workspace and packed_lengths != null);
-    const caches: ?[]?*gpt_arch.Qwen35LinearCache = if (!has_caches) null else if (workspace) |value| value.caches[0..source.len] else try allocator.?.alloc(?*gpt_arch.Qwen35LinearCache, source.len);
+    const caches: ?[]?*gpt_arch.Qwen35LinearCache = if (!has_caches) null else if (comptime uses_workspace) storage.caches[0..source.len] else try allocator.?.alloc(?*gpt_arch.Qwen35LinearCache, source.len);
     errdefer if (allocator) |owner| if (caches) |owned| owner.free(owned);
-    const batch = if (workspace) |value| value.batch[0..source.len] else try allocator.?.alloc(gpt_arch.DecodeContext.KvBatchView, source.len);
+    const batch = if (comptime uses_workspace) storage.batch[0..source.len] else try allocator.?.alloc(gpt_arch.DecodeContext.KvBatchView, source.len);
     errdefer if (allocator) |owner| owner.free(batch);
-    const positions: ?[]u32 = if (!needs_positions) null else if (workspace) |value| value.positions[0 .. 3 * source.len] else if (full_positions) |values| try allocator.?.dupe(u32, values) else try allocator.?.alloc(u32, try std.math.mul(usize, source.len, 3));
+    const positions: ?[]u32 = if (!needs_positions) null else if (comptime uses_workspace) storage.positions[0 .. 3 * source.len] else if (full_positions) |values| try allocator.?.dupe(u32, values) else try allocator.?.alloc(u32, try std.math.mul(usize, source.len, 3));
     errdefer if (allocator) |owner| if (positions) |owned| owner.free(owned);
     for (source, 0..) |_, index| {
         const context = contextAt(mixed, source, index, seq_len, query_seq_len);
