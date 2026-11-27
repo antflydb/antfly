@@ -2399,3 +2399,11 @@ the unfused run bound 65,536 bytes within the same 297,216-byte bank
 used by attention. The standard and unfused log hashes are
 `1ec1af4fe0d5fcdee84debf1f02e9b0c10be685a4fbf7f64f35e3ef70a944caa`
 and `29e3adaf879a69739870abca1f03ce6882699d38aae2886d4d4eae6a394c12ce`.
+
+At `7250827ac1`, Spark GB10 passed 36 CUDA checks with zero skips.
+The invalid audio input was rejected before CUDA allocation. The
+unpublished-output test verified that a borrowed destination did not
+advance the owning scope and that retiring the actual allocation
+completed the declared event sequence. The released LightOnOCR HTTP
+fixture still replayed with a 44-byte pinned receipt. The log hash is
+`a60570abdc1ddfa254285f5f92c5d67bd32983d9bfc5937b78d7ab3aaabc2971`.
