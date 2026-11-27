@@ -418,12 +418,12 @@ pub const Scope = struct {
             (self.requires_published_output and self.published_ptr == 0))
         {
             self.valid = false;
-            return error.AudioPlanChanged;
+            return error.InvalidExecutionPlan;
         }
         const e = self.recipe.bound.events[self.cursor];
         if (!e.allocate or self.recipe.bound.allocations[e.slot].bytes != bytes) {
             self.valid = false;
-            return error.AudioPlanChanged;
+            return error.InvalidExecutionPlan;
         }
         self.cursor += 1;
         if (self.published_ptr != 0 and self.recipe.bound.output == e.slot) return self.published_ptr;
@@ -466,7 +466,7 @@ test "stream workspace rejects live buffers and event drift" {
     var observing = Scope.observe(&open_plan);
     try std.testing.expect(!observing.owns(0x1000));
     try std.testing.expectError(error.InvalidExecutionPlan, observing.bindPublishedOutput(0x1000, alignment));
-    try std.testing.expectError(error.AudioPlanChanged, observing.allocate(256));
+    try std.testing.expectError(error.InvalidExecutionPlan, observing.allocate(256));
     try std.testing.expectEqual(@as(usize, 0), observing.cursor);
     var scope = Scope{ .recipe = .{ .bound = p }, .base = 10000 };
     try std.testing.expect(!scope.disjointBacking(0x1000, alignment));
@@ -478,11 +478,11 @@ test "stream workspace rejects live buffers and event drift" {
     scope.release(b);
     scope.release(c);
     try std.testing.expect(scope.complete());
-    try std.testing.expectError(error.AudioPlanChanged, scope.allocate(256));
+    try std.testing.expectError(error.InvalidExecutionPlan, scope.allocate(256));
     try std.testing.expect(!scope.complete());
     var changed = Scope{ .recipe = .{ .bound = p }, .base = 10000 };
     _ = try changed.allocate(256);
-    try std.testing.expectError(error.AudioPlanChanged, changed.allocate(256));
+    try std.testing.expectError(error.InvalidExecutionPlan, changed.allocate(256));
 }
 
 test "stream workspace rejects duplicate live addresses and accepts retired address reuse" {
@@ -646,7 +646,7 @@ test "stream workspace can exclude its terminal output from the scratch backing"
     try std.testing.expectEqual(2 * alignment, layout.bytes);
     try std.testing.expectEqual(@as(usize, 256), layout.output.?.bytes);
     var unbound = try Scope.bind(&plan, layout, 0x2000, layout.bytes);
-    try std.testing.expectError(error.AudioPlanChanged, unbound.allocate(256));
+    try std.testing.expectError(error.InvalidExecutionPlan, unbound.allocate(256));
     try std.testing.expectEqual(@as(usize, 0), unbound.cursor);
     var scope = try Scope.bind(&plan, layout, 0x2000, layout.bytes);
     try std.testing.expectError(error.InvalidExecutionPlan, scope.bindPublishedOutput(0x2100, 256));
@@ -681,7 +681,7 @@ test "stream workspace binds a declared zero-scratch recipe without a device add
     var scope = try Scope.bind(&plan, layout, 0, 0);
     try std.testing.expect(scope.complete());
     try std.testing.expect(!scope.owns(alignment));
-    try std.testing.expectError(error.AudioPlanChanged, scope.allocate(alignment));
+    try std.testing.expectError(error.InvalidExecutionPlan, scope.allocate(alignment));
     try std.testing.expect(!scope.complete());
 }
 

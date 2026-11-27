@@ -441,20 +441,26 @@ test "uniform report retains bounded CUDA decoder workspace after completed publ
     var scope: observation.KernelScope = undefined;
     scope.begin();
     observation.cudaDecoderDeclined(.missing_kv_binding);
+    var recorded = workspace;
+    recorded.route = .recorded_and_launched;
+    observation.cudaDecoderWorkspace(recorded);
     {
         var nested: observation.KernelScope = undefined;
         nested.begin();
         observation.cudaDecoderDeclined(.admission_or_revalidation);
         observation.cudaDecoderDeclined(.workspace_admission);
+        observation.cudaDecoderWorkspace(workspace);
         _ = nested.finish();
+        try std.testing.expectEqual(workspace, nested.cuda_decoder_workspace.?);
         try std.testing.expectEqualDeep(observation.CudaDecoderDeclines{ .admission_or_revalidation = 1, .workspace_admission = 1 }, nested.cuda_decoder_declines.?);
     }
-    observation.cudaDecoderWorkspace(workspace);
     _ = scope.finish();
     var sample: runtime.Snapshot = .{};
     sample.recordKernelInterval(&scope);
     source.publish(.{ .runtime = sample.since(.{}) });
-    try std.testing.expectEqual(workspace, source.snapshot().?.report.?.cuda_decoder_workspace.?);
+    var expected = workspace;
+    expected.completed_bursts = 2;
+    try std.testing.expectEqual(expected, source.snapshot().?.report.?.cuda_decoder_workspace.?);
     try std.testing.expectEqualDeep(observation.CudaDecoderDeclines{ .missing_kv_binding = 1, .admission_or_revalidation = 1, .workspace_admission = 1 }, source.snapshot().?.report.?.cuda_decoder_declines.?);
 }
 

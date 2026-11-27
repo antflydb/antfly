@@ -261,7 +261,7 @@ test "embeddinggemma2 CUDA audio lifetime plan reuses dead regions and rejects a
     s.release(10256);
     try std.testing.expect(s.valid and s.cursor == p.event_count);
     var wrong = Scope{ .recipe = .{ .bound = p }, .base = 10000 };
-    try std.testing.expectError(error.AudioPlanChanged, wrong.allocate(128));
+    try std.testing.expectError(error.InvalidExecutionPlan, wrong.allocate(128));
     p.* = .{};
     p.allocate(limit + 1, 1);
     try std.testing.expect(!p.valid);

@@ -480,7 +480,11 @@ pub inline fn cudaAudioWorkspace(workspace: CudaAudioWorkspace) void {
 }
 
 /// Latest bounded CUDA graph whose device readback and publication succeeded.
+/// Physical geometry for the last decoder burst that completed its receipt.
+/// Multiple bursts can share a diagnostic interval. Their workspace sizes
+/// describe stage backing and cannot be summed to obtain an invocation peak.
 pub const CudaDecoderWorkspace = struct {
+    completed_bursts: u64 = 1,
     route: Route,
     plan_origin: @import("stream_workspace.zig").Origin,
     planned_events: usize,
@@ -503,7 +507,11 @@ pub const CudaDecoderWorkspace = struct {
 
 pub inline fn cudaDecoderWorkspace(workspace: CudaDecoderWorkspace) void {
     var active = active_kernels;
-    while (active) |scope| : (active = scope.previous) scope.cuda_decoder_workspace = workspace;
+    while (active) |scope| : (active = scope.previous) {
+        const prior = if (scope.cuda_decoder_workspace) |previous| previous.completed_bursts else 0;
+        scope.cuda_decoder_workspace = workspace;
+        scope.cuda_decoder_workspace.?.completed_bursts = prior +| 1;
+    }
 }
 
 /// Declines before a bounded decoder graph takes ownership of execution.
