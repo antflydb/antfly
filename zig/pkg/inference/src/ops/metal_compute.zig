@@ -41544,11 +41544,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn argmaxLastRowOp(ctx: *anyopaque, tensor: CT, rows: usize, dim: usize) anyerror!?u32 {
         if (rows == 0 or dim == 0) return null;
+        const elements = try std.math.mul(usize, rows, dim);
+        if (dim > std.math.maxInt(u32)) return error.InvalidTensorShape;
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const buf = toBuf(tensor);
         if (buf.quantized_storage != null) return error.UnsupportedTensorType;
         if (buf.metal_tensor) |*metal_tensor| {
+            if (metal_tensor.dtype != .f32) return error.UnsupportedTensorType;
             if (metal_tensor.isDevice()) {
+                const byte_offset = try std.math.mul(usize, elements - dim, @sizeOf(f32));
+                const shape = [_]i32{ 1, std.math.cast(i32, dim) orelse return error.InvalidTensorShape };
+                // Imported logits can retain a leading batch axis even when
+                // rows is one. Bind the two-dimensional kernel view directly.
+                var last_row = try metal_tensor.retainedTypedView(byte_offset, &shape, .f32);
+                defer self.retireTemporaryWorkspaceValue(&last_row);
                 // The logits may still be pending in our active frame while
                 // argmaxLogitsDevice runs on its own command buffer — drain
                 // the frame first.
@@ -41557,13 +41566,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         return error.MetalFrameSyncFailed;
                     }
                 }
-                const byte_len = try std.math.mul(usize, dim, @sizeOf(f32));
-                const byte_offset = try std.math.mul(usize, rows - 1, byte_len);
-                const shape = [_]i32{ 1, std.math.cast(i32, dim) orelse return error.InvalidTensorShape };
-                // Imported logits can retain a leading batch axis even when
-                // rows is one. Bind the two-dimensional kernel view directly.
-                var last_row = try metal_tensor.retainedView(byte_offset, byte_len, &shape);
-                defer self.retireTemporaryWorkspaceValue(&last_row);
                 if (try metal_runtime.argmaxLogitsDevice(self.provider_impl, last_row, dim)) |token_id| {
                     @import("../execution/transfer_audit.zig").download(@sizeOf(u32));
                     return @intCast(token_id);
@@ -41574,8 +41576,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             try metal_tensor.toHostSlice()
         else
             buf.data;
-        if (data.len != rows * dim) return error.InvalidTensorShape;
-        const last_row = data[(rows - 1) * dim ..][0..dim];
+        if (data.len != elements) return error.InvalidTensorShape;
+        const last_row = data[elements - dim ..];
         var best_idx: u32 = 0;
         var best_val = last_row[0];
         for (last_row[1..], 1..) |value, idx| {

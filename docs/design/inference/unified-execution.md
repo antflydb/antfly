@@ -2352,3 +2352,16 @@ intervening allocations and exact branch outputs. The declared host
 workspace fixture rejected an inconsistent target before opaque decoder
 access. The log hash is
 `83d2519787a1c43f729a283f8e2f8c4a0f882907642f0eed3ee3ba78bdeb61a6`.
+
+On Spark GB10 at `a72bfddb4a`, all 34 selected CUDA checks passed with
+zero skips. The imported resident decoder fixture selected the expected
+token on device and checked that rejecting the candidate reads the same
+resident final row without redispatching the decoder. The released
+T5-small suffix test separately checked fused decoder state after encoder
+retirement. The CUDA log hash is
+`890f6da3bad5a3f177cac02ff0c5cf2ab3310dbf3622d876123fe19e2d80dc16`.
+On local Metal at `0649355f5d`, all three selected checks passed with
+zero skips. The normal reader entrypoint matched the host reference and
+recorded a four-byte token download. These fixtures establish correctness
+and transfer behavior. Reader latency and throughput require timed serving
+comparisons.
