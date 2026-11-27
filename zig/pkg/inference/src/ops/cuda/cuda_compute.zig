@@ -22424,7 +22424,7 @@ fn sourceAudioStorageOp(ctx: *anyopaque, begin: bool) anyerror!bool {
 /// its exact bank after the SDK consumes it and output widening completes.
 const SourceLinearTemporary = struct {
     bank: buffer_mod.DeviceBuffer,
-    kind: enum { owned, audio, learned, captured },
+    kind: enum { owned, audio, captured },
     fn allocate(self: *CudaCompute, bytes: usize) !buffer_mod.DeviceBuffer {
         const bank = try buffer_mod.DeviceBuffer.allocWithPurpose(&self.ctx, bytes, .command_workspace);
         self.stats.device_alloc_calls += 1;
@@ -22444,7 +22444,7 @@ const SourceLinearTemporary = struct {
             !scope.disjointBacking(source.ptr, source.len)))) return error.CudaGraphCaptureUnsafeTempAlloc;
     }
     /// Query once, before any output, module or temporary allocation. The
-    /// returned proof is reused by acquireKnownCapture in this synchronous call.
+    /// returned proof is reused by acquireDeclared in this synchronous call.
     fn preflightCapture(self: *CudaCompute) !bool {
         const capture = self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or try self.ctx.streamCaptureActive();
         try validateCaptureStorage(self, capture);
@@ -22452,29 +22452,17 @@ const SourceLinearTemporary = struct {
         return capture;
     }
     fn acquireDeclared(self: *CudaCompute, bytes: usize, steady_bytes: usize, capture: bool) !@This() {
-        if (self.execution_scope) |scope| if (!scope.isBound()) {
-            try validateCaptureStorage(self, capture);
-            // All commands for the operation run within this interval, with
-            // no allocation from the outer scope. Borrow eager backing when
-            // present and add the exact planned size to the composite layout.
-            const storage = try acquireEager(self, bytes, steady_bytes);
-            scope.recordScratchInterval(bytes);
-            return storage;
-        };
-        return acquireKnownCapture(self, bytes, steady_bytes, capture);
-    }
-    fn acquireKnownCapture(self: *CudaCompute, bytes: usize, steady_bytes: usize, actual_capture: bool) !@This() {
-        try validateCaptureStorage(self, actual_capture);
+        try validateCaptureStorage(self, capture);
         if (self.execution_scope) |scope| {
             if (self.source_linear_scratch.in_use) return error.SourceStorageInUse;
             if (scope.isBound()) {
                 return .{ .bank = .{ .ptr = try scope.allocate(bytes), .len = bytes, .borrowed = true }, .kind = .captured };
             }
-            if (self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return error.CudaGraphCaptureUnsafeTempAlloc;
-            retireSourceLinearScratch(self);
-            const bank = try allocate(self, bytes);
-            scope.recordAllocation(bytes, bank.ptr);
-            return .{ .bank = bank, .kind = .learned };
+            // The operation holds this exact interval without nested scratch
+            // allocations. Eager backing need not match the recorded address.
+            const storage = try acquireEager(self, bytes, steady_bytes);
+            scope.recordScratchInterval(bytes);
+            return storage;
         }
         return acquireEager(self, bytes, steady_bytes);
     }
@@ -22503,18 +22491,11 @@ const SourceLinearTemporary = struct {
     fn deinit(value: *@This(), self: *CudaCompute) void {
         switch (value.kind) {
             .audio => self.source_linear_scratch.in_use = false,
-            .learned, .captured => {
+            .captured => {
                 const scope = self.execution_scope orelse platform.inference_process_supervisor.restartWorker();
-                const bound = value.kind == .captured;
-                if (scope.isBound() != bound or (bound and !scope.owns(value.bank.ptr)))
-                    platform.inference_process_supervisor.restartWorker();
+                if (!scope.isBound() or !scope.owns(value.bank.ptr)) platform.inference_process_supervisor.restartWorker();
                 scope.release(value.bank.ptr);
-                if (bound) {
-                    value.bank = .{};
-                    return;
-                }
-                _ = value.bank.freeChecked(&self.ctx) catch platform.inference_process_supervisor.restartWorker();
-                self.stats.device_free_calls += 1;
+                value.bank = .{};
             },
             .owned => {
                 _ = value.bank.freeChecked(&self.ctx) catch platform.inference_process_supervisor.restartWorker();
@@ -22821,7 +22802,10 @@ fn sourceConvolutionF32(self: *CudaCompute, value: @FieldType(ops.Bf16SourceOper
     const weight = try sourceScalarTensor(value.weight, weight_count);
     const bias = if (value.bias) |tensor| try sourceScalarTensor(tensor, key.outputs) else null;
     if (scratch.bytes > cudaTempArenaAdmissionBudgetBytes(self)) return error.MemoryBudgetExceeded;
-    var temporary = try SourceLinearTemporary.acquireKnownCapture(self, scratch.bytes, scratch.bytes, capture);
+    const shape = [_]i64{ @intCast(key.batch), @intCast(key.outputs), @intCast(key.outHeight()), @intCast(key.outWidth()) };
+    var output = try OwnedF32Output.alloc(self, &shape, count);
+    defer output.deinit();
+    var temporary = try SourceLinearTemporary.acquireDeclared(self, scratch.bytes, scratch.bytes, capture);
     defer temporary.deinit(self);
     const x = temporary.span(scratch.input);
     const w = temporary.span(scratch.weight);
@@ -22836,9 +22820,6 @@ fn sourceConvolutionF32(self: *CudaCompute, value: @FieldType(ops.Bf16SourceOper
     // Variant-pack creation belongs to cold admission, before any cast or
     // output publication. Captured execution only reuses exact live bindings.
     try module.prepareBindings(plan, bindings, capture);
-    const shape = [_]i64{ @intCast(key.batch), @intCast(key.outputs), @intCast(key.outHeight()), @intCast(key.outWidth()) };
-    var output = try OwnedF32Output.alloc(self, &shape, count);
-    defer output.deinit();
     try module.bindStream(self.ctx.stream);
     var queued = false;
     errdefer if (queued) synchronizeAndDrainDeferredDeviceFrees(self) catch {};
@@ -31358,14 +31339,14 @@ fn sourceSpatialPool(self: *CudaCompute, input: *const CudaTensor, bias: buffer_
     const capture = try SourceLinearTemporary.preflightCapture(self);
     if (capture and self.embedding_gemma2 == null) return error.CudaGraphCaptureUnsafeTempAlloc;
     const module = try self.encoderMultimodalModule();
-    var temporary = try SourceLinearTemporary.acquireKnownCapture(self, plan.bytes, plan.bytes, capture);
+    var output = try OwnedF32Output.alloc2(self, params.rows(), params.dim, try checkedMul(params.rows(), params.dim));
+    defer output.deinit();
+    var temporary = try SourceLinearTemporary.acquireDeclared(self, plan.bytes, plan.bytes, capture);
     defer temporary.deinit(self);
     const weights = debertaWorkspaceRegion(temporary.bank, plan.weights.offset, plan.weights.bytes);
     const values = debertaWorkspaceRegion(temporary.bank, plan.input.offset, plan.input.bytes);
     const pooled = debertaWorkspaceRegion(temporary.bank, plan.result.offset, plan.result.bytes);
     const workspace = debertaWorkspaceRegion(temporary.bank, plan.workspace.offset, plan.workspace.bytes);
-    var output = try OwnedF32Output.alloc2(self, params.rows(), params.dim, try checkedMul(params.rows(), params.dim));
-    defer output.deinit();
     var queued = false;
     errdefer if (queued) synchronizeAndDrainDeferredDeviceFrees(self) catch {};
     queued = true;
@@ -62593,10 +62574,10 @@ test "source linear bank metadata reuses only its audio owner or exact captured 
     compute.ctx.debug_graph_capture_active = false;
     compute.source_linear_scratch = .{ .active = true, .buffer = .{ .ptr = 0x1000, .len = layout.bytes } };
     for (0..2) |_| {
-        var temporary = try SourceLinearTemporary.acquireKnownCapture(&compute, layout.bytes, layout.bytes, false);
+        var temporary = try SourceLinearTemporary.acquireDeclared(&compute, layout.bytes, layout.bytes, false);
         try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0x1000), temporary.bank.ptr);
         try std.testing.expect(temporary.bank.borrowed and compute.source_linear_scratch.in_use);
-        try std.testing.expectError(error.SourceStorageInUse, SourceLinearTemporary.acquireKnownCapture(&compute, layout.bytes, layout.bytes, false));
+        try std.testing.expectError(error.SourceStorageInUse, SourceLinearTemporary.acquireDeclared(&compute, layout.bytes, layout.bytes, false));
         const input = temporary.span(layout.input);
         const output = temporary.span(layout.output);
         const workspace = temporary.span(layout.workspace);
@@ -62616,7 +62597,7 @@ test "source linear bank metadata reuses only its audio owner or exact captured 
     var scope = @import("../../execution/stream_workspace.zig").Scope{ .recipe = .{ .bound = &plan }, .base = 0x10000000 };
     compute.source_linear_scratch = .{};
     compute.execution_scope = &scope;
-    var captured = try SourceLinearTemporary.acquireKnownCapture(&compute, layout.bytes, layout.bytes, false);
+    var captured = try SourceLinearTemporary.acquireDeclared(&compute, layout.bytes, layout.bytes, false);
     try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0x10000000), captured.bank.ptr);
     captured.deinit(&compute);
     try std.testing.expect(scope.valid and scope.cursor == plan.event_count);
@@ -62628,7 +62609,7 @@ test "source linear arena precondition refuses retained ordinary storage before 
     var compute = metadataOnlyTestCompute();
     compute.execution_scope = &scope;
     compute.source_linear_scratch = .{ .active = true, .buffer = .{ .ptr = 16, .len = 256 } };
-    try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, SourceLinearTemporary.acquireKnownCapture(&compute, 256, 256, true));
+    try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, SourceLinearTemporary.acquireDeclared(&compute, 256, 256, true));
     try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 16), compute.source_linear_scratch.buffer.ptr);
     try std.testing.expect(compute.source_linear_scratch.active and !compute.source_linear_scratch.in_use);
     var plan: plan_mod.Plan = .{};
@@ -62637,9 +62618,9 @@ test "source linear arena precondition refuses retained ordinary storage before 
     try std.testing.expect(plan.finishNoOutput());
     scope = try plan_mod.Scope.bind(&plan, try plan.layout(256), 0x8000, 512);
     compute.source_linear_scratch.buffer.ptr = 0x8000;
-    try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, SourceLinearTemporary.acquireKnownCapture(&compute, 256, 256, true));
+    try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, SourceLinearTemporary.acquireDeclared(&compute, 256, 256, true));
     compute.source_linear_scratch.buffer.ptr = 0x7000;
-    var captured = try SourceLinearTemporary.acquireKnownCapture(&compute, 256, 256, true);
+    var captured = try SourceLinearTemporary.acquireDeclared(&compute, 256, 256, true);
     try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0x8100), captured.bank.ptr);
     captured.deinit(&compute);
     try std.testing.expect(scope.complete());
@@ -62649,7 +62630,7 @@ test "source linear arena precondition refuses retained ordinary storage before 
     var learning: plan_mod.Plan = .{};
     scope = plan_mod.Scope.observe(&learning);
     compute.debug_cuda_graph_capture_active = true;
-    try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, SourceLinearTemporary.acquireKnownCapture(&compute, 256, 256, false));
+    try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, SourceLinearTemporary.acquireDeclared(&compute, 256, 256, false));
     try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 16), compute.source_linear_scratch.buffer.ptr);
 }
 
@@ -63143,10 +63124,10 @@ test "source local relative temporary follows the actual learned and captured ba
     compute.ctx.debug_graph_capture_active = false;
     compute.source_linear_scratch = .{ .active = true, .buffer = .{ .ptr = 0x1000, .len = layout.bytes } };
     {
-        var temporary = try SourceLinearTemporary.acquireKnownCapture(&compute, layout.bytes, layout.bytes, false);
+        var temporary = try SourceLinearTemporary.acquireDeclared(&compute, layout.bytes, layout.bytes, false);
         defer temporary.deinit(&compute);
         try std.testing.expect(compute.source_linear_scratch.in_use);
-        try std.testing.expectError(error.SourceStorageInUse, SourceLinearTemporary.acquireKnownCapture(&compute, layout.bytes, layout.bytes, false));
+        try std.testing.expectError(error.SourceStorageInUse, SourceLinearTemporary.acquireDeclared(&compute, layout.bytes, layout.bytes, false));
         const q = temporary.span(.{ .offset = layout.query.offset, .bytes = layout.query.bytes });
         const out = temporary.span(.{ .offset = layout.result.offset, .bytes = layout.result.bytes });
         const ws = temporary.span(.{ .offset = layout.workspace.offset, .bytes = layout.workspace.bytes });
@@ -63161,7 +63142,7 @@ test "source local relative temporary follows the actual learned and captured ba
     var scope = @import("../../execution/stream_workspace.zig").Scope{ .recipe = .{ .bound = &plan }, .base = 0x10000000 };
     compute.source_linear_scratch = .{};
     compute.execution_scope = &scope;
-    var temporary = try SourceLinearTemporary.acquireKnownCapture(&compute, layout.bytes, layout.bytes, false);
+    var temporary = try SourceLinearTemporary.acquireDeclared(&compute, layout.bytes, layout.bytes, false);
     temporary.deinit(&compute);
     try std.testing.expect(scope.valid and scope.cursor == plan.event_count);
 }
@@ -63170,7 +63151,7 @@ test "actual source capture without a planned arena rejects before allocation or
     var compute = metadataOnlyTestCompute();
     compute.ctx.debug_graph_capture_active = false;
     // Driver and allocator deliberately remain undefined: neither may be used.
-    try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, SourceLinearTemporary.acquireKnownCapture(&compute, 256, 256, true));
+    try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, SourceLinearTemporary.acquireDeclared(&compute, 256, 256, true));
     try std.testing.expectEqual(@as(u64, 0), compute.stats.device_alloc_calls);
 }
 
@@ -63232,7 +63213,7 @@ test "source local relative actual external capture rejects before module or out
     try std.testing.expectEqual(@as(usize, 5), Fake.queries);
     const capture = try SourceLinearTemporary.preflightCapture(&compute);
     try std.testing.expect(capture);
-    var temporary = try SourceLinearTemporary.acquireKnownCapture(&compute, 256, 256, capture);
+    var temporary = try SourceLinearTemporary.acquireDeclared(&compute, 256, 256, capture);
     try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0x10000000), temporary.bank.ptr);
     temporary.deinit(&compute);
     try std.testing.expect(scope.valid and scope.cursor == plan.event_count);
