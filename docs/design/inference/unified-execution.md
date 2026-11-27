@@ -2310,3 +2310,10 @@ with three wide replays at up to 97 rows. Both borrowed-view arms
 matched all 256 pages at 7.2765 and 7.2790 pages/s. The first had no
 replay and the second reached 97 rows once. The incomplete control
 and differing replay counts leave the throughput effect unresolved.
+
+At `cf1a159b0c`, the released T5-small merged decoder passed the
+suffix microbatch test after encoder retirement on Native and Metal.
+Both runs used the shared ONNX artifact with SHA-256
+`f6d2874dafd291458e59f3762915e7111cc66caaffedbffb78d2d5fa42f6cdce`.
+The same focused cohort also passed the Native Node handoff fixture
+that retains encoder output through Node and session close.
