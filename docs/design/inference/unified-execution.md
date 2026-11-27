@@ -2416,3 +2416,12 @@ cancellation, and the physical Metal final-row fallback. The four-test
 cohort and the separate Metal DECIDE run had zero skips. The log hashes
 are `74585bc7af2b4e285d343d27adc82ccf447220a953f0fd2fccf0e732afd6b84f`
 and `01f5dbce8f54d7d75e684a28218bd97bae85e5ba7faa9e7f0c6ba1ffefedddbc`.
+
+At `bd0e05a4e3`, Spark GB10 passed all 38 selected CUDA checks with
+zero skips. The captured audio fixture reshaped a held output into a
+retained device view, consumed it through eager execution, and wrote
+an independent result with zero device copies. The ONNX cache-input
+gather fixture also passed using the shared CUDA batch-copy submission.
+Its single synthetic 48-row timing was 1.92 ms serial and 0.97 ms
+fused. Controlled serving comparisons are still required. The log hash
+is `372d4c9b65963e47f58e9a587255cae2990fd169ac2cf4c424587c78c8d7d12d`.
