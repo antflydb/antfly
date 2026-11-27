@@ -62736,6 +62736,40 @@ test "source local relative actual external capture rejects before module or out
     try std.testing.expectEqual(@as(usize, 6), Fake.queries);
 }
 
+test "CUDA source convolution binds declared BF16 packs and preserves border values" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.testing.init(a);
+    defer compute.deinit();
+    compute.vendor_convolution = try @import("cudnn_conv.zig").Module.init(compute.ctx.stream);
+    compute.embedding_gemma2_policy.source_convolution = .legacy;
+    const cb = compute.computeBackend();
+    const input = try cb.fromFloat32Shape(&@as([16]f32, @splat(1)), &.{ 1, 1, 4, 4 });
+    defer cb.free(input);
+    const weights = try cb.fromFloat32Shape(&@as([9]f32, @splat(1)), &.{ 1, 1, 3, 3 });
+    defer cb.free(weights);
+    const bias = try cb.fromFloat32Shape(&.{0.5}, &.{1});
+    defer cb.free(bias);
+    for ([_]?CT{ null, bias }) |bias_value| {
+        const out = try sourceConvolutionF32(&compute, .{
+            .input = input,
+            .reduction = .vendor_f32,
+            .weight = weights,
+            .bias = bias_value,
+            .batch = 1,
+            .inputs = 1,
+            .outputs = 1,
+            .height = 4,
+            .width = 4,
+        });
+        defer cb.free(out);
+        const actual = try cb.toFloat32(out, a);
+        defer a.free(actual);
+        const expected: []const f32 = if (bias_value == null) &.{ 4, 6, 6, 9 } else &.{ 4.5, 6.5, 6.5, 9.5 };
+        try std.testing.expectEqualSlices(f32, expected, actual);
+    }
+}
+
 test "CUDA source audio cold metadata requires retained convolution without probing SDK" {
     var compute = metadataOnlyTestCompute();
     compute.bf16_blas = @as(@import("libraries.zig").Cublas, undefined);
