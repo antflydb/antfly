@@ -2107,3 +2107,14 @@ affects linear tuning, so this comparison is evidence about the
 scope as a whole. The linear-only and storage-scope receipts are
 `bba80c62489419b3dced779a19eadb94da222b48d9ef6e3af23ed98890d7a3ff`
 and `99a9b8d2c24b0d943308d3d3bd2e09bdea715bc87c2d57205f06319508050124`.
+
+A separate 88-page reader-window diagnostic kept the original
+24 GiB scratch cap and the 128-row physical limit. The packet arm
+captured once and replayed twice at 82 rows, matching all 256
+reference outputs. Full-width replay did not occur. Full-width and
+packet throughput was 7.5119 and 7.4513 pages/s, so this pair
+establishes wide execution and exact parity with room for graph
+storage. The original 128-page window remains unqualified. The
+full-width and packet receipts are
+`f9070a2c64bb72c158cb5009d757860571ffdd9b674b1c50e68177ca89969554`
+and `ce8de02f16825b182086fd0832722f300eef97002bb5f54c7a54f5e29f592ff4`.
