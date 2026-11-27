@@ -7832,7 +7832,7 @@ pub const CudaCompute = struct {
     }
     pub const AudioCacheInput = @import("../../execution/audio_schedule.zig").ExecutionInputs.Metadata;
     const AudioCacheBase = struct { key: u64, input_bytes: usize, output_bytes: usize };
-    const AudioInputSpan = struct { offset: usize, bytes: usize };
+    const AudioInputSpan = buffer_mod.ByteSpan;
     fn audioCacheBase(self: *const CudaCompute, key: u64, inputs: []const AudioCacheInput, spans: ?[]AudioInputSpan) !AudioCacheBase {
         if (spans) |output| if (output.len != inputs.len) return error.InvalidShape;
         var hash = std.hash.Wyhash.init(key);
@@ -20993,8 +20993,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     const spans = input_spans[0..inputs.len];
     const cache_base = try self.audioCacheBase(key, input_metadata[0..inputs.len], spans);
     for (inputs, spans) |ct, span| {
-        const storage = tensorFromCt(ct).buffer;
-        if (span.bytes > storage.len or (span.bytes != 0 and storage.ptr == 0)) return error.InvalidShape;
+        _ = try buffer_mod.validateRegion(tensorFromCt(ct).buffer, span.bytes, @alignOf(f32));
     }
     const first_input = tensorFromCt(inputs[0]);
     const output_bytes = cache_base.output_bytes;

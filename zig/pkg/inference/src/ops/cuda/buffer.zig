@@ -313,6 +313,12 @@ pub const DeviceBuffer = struct {
     }
 };
 
+/// Return the exclusive device address of the used range.
+pub inline fn validateRegion(region: DeviceBuffer, length: usize, comptime alignment: u64) !u64 {
+    if (length != 0 and (region.ptr == 0 or alignment == 0 or region.ptr % alignment != 0 or region.len < length)) return error.InvalidShape;
+    return std.math.add(u64, region.ptr, length);
+}
+
 /// Validate byte regions before driver access. Read-only regions may alias;
 /// every nonempty output must be disjoint from inputs and earlier outputs.
 /// Alignment is static ABI metadata; lengths describe actual used bytes.
@@ -320,8 +326,7 @@ pub inline fn validateRegions(comptime count: usize, regions: [count]DeviceBuffe
     comptime std.debug.assert(first_write <= count);
     var ends: [count]u64 = undefined;
     inline for (regions, lengths, alignment, 0..) |region, length, align_bytes, i| {
-        if (length != 0 and (region.ptr == 0 or align_bytes == 0 or region.ptr % align_bytes != 0 or region.len < length)) return error.InvalidShape;
-        ends[i] = try std.math.add(u64, region.ptr, length);
+        ends[i] = try validateRegion(region, length, align_bytes);
     }
     inline for (first_write..count) |written| {
         if (lengths[written] != 0) {
