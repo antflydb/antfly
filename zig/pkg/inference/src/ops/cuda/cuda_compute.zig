@@ -4115,6 +4115,18 @@ pub const CudaCompute = struct {
         phase.old = owner.snapshot();
         if (!phase.matchesOwner(owner)) {
             if (try self.ctx.streamCaptureActive()) return .unsupported;
+            if (owner.resets_logged < 12 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
+                var mismatch: usize = 0;
+                while (mismatch < @min(owner.key.len, descriptor.key.len) and owner.key[mismatch] == descriptor.key[mismatch]) : (mismatch += 1) {}
+                const positions_equal = descriptor.positions.len == owner.rows * 3 and
+                    std.mem.eql(u32, owner.next_positions[0 .. owner.rows * 3], descriptor.positions);
+                std.debug.print("LIGHTONOCR3 cuda_model_graph_reset phase={s} old_epoch={d} epoch={d} old_rows={d} rows={d} old_words={d} words={d} first_word={d} positions_equal={d} invalidations={d} progress={d}\n", .{
+                    @tagName(owner.phase), owner.epoch_id,     descriptor.epoch, owner.rows,                    descriptor.rows,
+                    owner.key.len,         descriptor.key.len, mismatch,         @intFromBool(positions_equal), owner.invalidations,
+                    owner.progress,
+                });
+                owner.resets_logged += 1;
+            }
             // Exact invalid graph dies under the ACTUAL B before outside
             // reservation, so its quota returns when this caller parks.
             try owner.clearWithCleanup(&self.ctx, current);
@@ -4177,15 +4189,6 @@ pub const CudaCompute = struct {
         defer if (!claimed) owner.mutex.unlock();
         if (owner.disabled_epoch == epoch) return null;
         if (!graph_phase.matchesOwner(owner)) {
-            if (owner.resets_logged < 12 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
-                var mismatch: usize = 0;
-                while (mismatch < @min(owner.key.len, key.len) and owner.key[mismatch] == key[mismatch]) : (mismatch += 1) {}
-                std.debug.print("LIGHTONOCR3 cuda_model_graph_reset phase={s} old_epoch={d} epoch={d} old_words={d} words={d} first_word={d} old_value={d} value={d} positions_equal={d} invalidations={d} progress={d}\n", .{
-                    @tagName(owner.phase),                                    owner.epoch_id,                               epoch,                                                                                                                    owner.key.len,       key.len,        mismatch,
-                    if (mismatch < owner.key.len) owner.key[mismatch] else 0, if (mismatch < key.len) key[mismatch] else 0, @intFromBool(positions.len == owner.rows * 3 and std.mem.eql(u32, owner.next_positions[0 .. owner.rows * 3], positions)), owner.invalidations, owner.progress,
-                });
-                owner.resets_logged += 1;
-            }
             owner.resetPrepared(&self.ctx, graph_phase) catch |err| switch (err) {
                 error.CudaMemoryLimitExceeded => {
                     owner.admission_denials += 1;
