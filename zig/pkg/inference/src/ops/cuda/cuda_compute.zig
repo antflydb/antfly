@@ -16160,15 +16160,17 @@ fn runDenseFfnWithScratch(self: *CudaCompute, request: CudaCompute.DenseSiluFfnB
     const narrow_count = try checkedMul(layout.rows, layout.hidden);
     const wide_count = try checkedMul(layout.rows, layout.intermediate);
     try self.lighton_activation.init(&self.ctx);
-    var scratch = assigned orelse try allocDeviceBuffer(self, layout.scratch_bytes);
-    defer if (assigned == null) releaseDeviceBuffer(self, &scratch);
+    const capture = if (assigned == null and self.execution_scope != null) try SourceLinearTemporary.preflightCapture(self) else false;
+    const output = try denseFfnOutput(self, input, norm, weights, layout, assigned != null);
+    errdefer freeTensor(self, output);
+    var temporary: ?SourceLinearTemporary = if (assigned == null) try SourceLinearTemporary.acquireCachedOrDeclared(self, layout.scratch_bytes, capture) else null;
+    defer if (temporary) |*storage| storage.deinit(self);
+    const scratch = assigned orelse temporary.?.bank;
     if (assigned != null) try validateFfnScratch(scratch, input, norm, weights);
     const normalized = try scratch.borrowRange(0, narrow_count * @sizeOf(u16));
     const activated = try scratch.borrowRange(0, wide_count * @sizeOf(u16));
     const gate = try scratch.borrowRange(layout.gate_offset, wide_count * @sizeOf(f32));
     const up = try scratch.borrowRange(layout.up_offset, wide_count * @sizeOf(f32));
-    const output = try denseFfnOutput(self, input, norm, weights, layout, assigned != null);
-    errdefer freeTensor(self, output);
     errdefer self.ctx.synchronize() catch {};
     try runDenseFfnGateUp(self, request, input, norm, weights, normalized, gate, up, null);
     try runDenseFfnDown(self, .{ .separate = .{ .gate = gate, .up = up } }, weights[2], layout.rows, layout.hidden, layout.intermediate, input, activated, tensorFromCt(output).buffer, null);
@@ -16199,8 +16201,12 @@ fn lightOnCompactBf16FfnBlock(self: *CudaCompute, request: CudaCompute.DenseSilu
     try self.lighton_activation.init(&self.ctx);
     const layout = try CudaCompute.DenseFfnProgram.Layout.initCompact(rows, hidden, intermediate);
     const assigned = if (self.bounded_decode_graph.active) try self.bounded_decode_graph.bindFfnScratch(layout) else null;
-    var scratch = assigned orelse try allocDeviceBuffer(self, layout.scratch_bytes);
-    defer if (assigned == null) releaseDeviceBuffer(self, &scratch);
+    const capture = if (assigned == null and self.execution_scope != null) try SourceLinearTemporary.preflightCapture(self) else false;
+    const output = try denseFfnOutput(self, input, norm, weights, layout, assigned != null);
+    errdefer freeTensor(self, output);
+    var temporary: ?SourceLinearTemporary = if (assigned == null) try SourceLinearTemporary.acquireCachedOrDeclared(self, layout.scratch_bytes, capture) else null;
+    defer if (temporary) |*storage| storage.deinit(self);
+    const scratch = assigned orelse temporary.?.bank;
     if (assigned != null) try validateFfnScratch(scratch, input, norm, weights);
     // The initial BF16 normalization dies after both projections. Gate and
     // up die after SiLU, so the down projection can write over the gate.
@@ -16209,8 +16215,6 @@ fn lightOnCompactBf16FfnBlock(self: *CudaCompute, request: CudaCompute.DenseSilu
     const gate = try scratch.borrowRange(layout.gate_offset, wide_count * @sizeOf(u16));
     const up = try scratch.borrowRange(layout.up_offset, wide_count * @sizeOf(u16));
     const projected = try scratch.borrowRange(layout.gate_offset, narrow_count * @sizeOf(u16));
-    const output = try denseFfnOutput(self, input, norm, weights, layout, assigned != null);
-    errdefer freeTensor(self, output);
     errdefer self.ctx.synchronize() catch {};
     try self.lighton_activation.runRms(&self.ctx, .{ normalized.ptr, input.buffer.ptr, norm.buffer.ptr }, @intCast(rows), @intCast(hidden), request.eps, if (std.math.approxEqAbs(f32, request.weight_offset, 0, 1e-6)) 0 else request.weight_offset);
     self.stats.launch_norm += 1;
@@ -46687,7 +46691,21 @@ fn checkDenseSiluFfnBlockPolicy(bf16_projections: bool, prefill_only: bool) !voi
                 const input = try cb.fromFloat32Shape(values, &.{ @intCast(rows), @intCast(hidden) });
                 defer cb.free(input);
                 const request = CudaCompute.DenseSiluFfnBlockRequest{ .input = input, .norm = norm, .weights = weights, .rows = rows, .hidden = hidden, .intermediate = intermediate, .eps = 1e-6, .weight_offset = offset };
-                const fused = (try CudaCompute.denseSiluFfnBlock(&cb, request)) orelse return error.UnsupportedOperation;
+                const fused = if (rows != 7)
+                    (try CudaCompute.denseSiluFfnBlock(&cb, request)) orelse return error.UnsupportedOperation
+                else observed: {
+                    const Workspace = @import("../../execution/stream_workspace.zig");
+                    var plan: Workspace.Plan = .{};
+                    var scope = Workspace.Scope.observe(&plan);
+                    compute.execution_scope = &scope;
+                    defer compute.execution_scope = null;
+                    const result = (try CudaCompute.denseSiluFfnBlock(&cb, request)) orelse return error.UnsupportedOperation;
+                    errdefer cb.free(result);
+                    try std.testing.expect(plan.finish(tensorFromCt(result).buffer.ptr));
+                    try std.testing.expectEqual(@as(usize, 2), plan.count);
+                    try std.testing.expectEqual(@as(usize, 1), plan.declared_operation_scratch_intervals);
+                    break :observed result;
+                };
                 defer cb.free(fused);
                 if (prefill_only and rows < 256) {
                     compute.lighton_bf16_prefill_ffn = false;
