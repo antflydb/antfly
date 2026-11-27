@@ -2003,3 +2003,16 @@ unqualified. Gemma 4 text, image, and audio each returned 503 in all
 eight arms. Video and the other workloads completed. The mixed receipt
 SHA-256 is
 `5f564a0ea554a5c3081f282ee5a2a2397dd75a3bacaa8dc2dcbe99fd9ae889d8`.
+
+An isolated two-clip Metal audio repeat at `f61c0c11f4` used 48 warm
+samples per side in each A/A, A/B and B/B phase. Every output matched.
+A/B p50/p95 moved from 35.33/36.73 to 35.94/40.95 ms. The A/A p95s were
+36.25 and 36.23 ms and the B/B p95s were 40.80 and 40.86 ms. The repeat
+narrows the outstanding latency regression to the isolated tail on this
+host. In a separate instrumented comparison, completed eager audio
+frames took about 4.1 ms and completed replay frames took about 6.0 ms
+in each candidate arm. These frame measurements are a diagnostic
+separate from whole-request latency. The uninstrumented and instrumented
+receipt hashes are
+`b48f0385285a894d52382cc799396eb94d3c94d620a3101711c31134bd061c47`
+and `f765e4b0b89afebe5585810db61c9afc742bcba696365cb0c1f39ca2cdfe82ce`.
