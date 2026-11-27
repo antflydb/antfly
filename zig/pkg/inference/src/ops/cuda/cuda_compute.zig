@@ -7502,7 +7502,7 @@ pub const CudaCompute = struct {
     fn cacheRequestState(self: *CudaCompute, request: CacheFunding.Request) !CacheRequestState {
         switch (request) {
             .audio_learning => |value| {
-                const entry = self.audio_plans.warmedFor(value.key) orelse return .{};
+                const entry = self.audio_plans.availableFor(value.key) orelse return .{};
                 if (entry.owner) |owner| if (owner.managed) return .{};
                 return .{ .miss = true, .amounts = .{ .host_scratch_bytes = @sizeOf(@import("audio_execution_plan.zig").Owner) } };
             },
@@ -7729,7 +7729,7 @@ pub const CudaCompute = struct {
         // A standalone warm plan may enter managed serving later. Attach
         // custody to its existing backing without copying the event table.
         for (funding.entries) |*entry| if (funding.audioLearningReady(entry)) {
-            const cached = expected.audio_plans.warmedFor(entry.request.audio_learning.key) orelse continue;
+            const cached = expected.audio_plans.availableFor(entry.request.audio_learning.key) orelse continue;
             const owner = cached.owner orelse continue;
             if (owner.managed) continue;
             var token = try funding.take(entry.request, .{ .host_scratch_bytes = @sizeOf(@import("audio_execution_plan.zig").Owner) });
@@ -8047,7 +8047,7 @@ pub const CudaCompute = struct {
     /// Metadata-only inspection does not create an entry or change eviction order.
     fn audioPlanFor(self: *const CudaCompute, base: AudioCacheBase) ?*const @import("audio_execution_plan.zig").Entry {
         if (!base.fitsArena()) return null;
-        return self.audio_plans.warmedFor(base.key);
+        return self.audio_plans.availableFor(base.key);
     }
 
     /// GLiDE has no cross-request KV state. Keep warm buffers for the current

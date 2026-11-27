@@ -179,10 +179,14 @@ pub const Entry = struct {
 pub const Cache = struct {
     entries: [8]Entry = @splat(.{}),
     clock: u64 = 0,
-    /// Inspect eligible metadata without changing eviction order.
-    pub fn warmedFor(self: *const Cache, key: u64) ?*const Entry {
+    /// Inspect metadata eligible for admission without changing eviction order.
+    pub fn availableFor(self: *const Cache, key: u64) ?*const Entry {
         for (&self.entries) |*entry| {
-            if (entry.stamp != 0 and entry.key == key and entry.warmed and !entry.disabled) return entry;
+            if (entry.stamp == 0 or entry.key != key or entry.disabled) continue;
+            if (entry.warmed) return entry;
+            if (entry.owner) |owner| {
+                if (owner.plan.origin == .declared and owner.executable != null) return entry;
+            }
         }
         return null;
     }
@@ -271,6 +275,13 @@ test "CUDA declared audio workspace matches the observed capture layout" {
         try builder.finish(result);
     }
     try std.testing.expectEqual(arena.Origin.declared, declared.plan.origin);
+    var cache: Cache = .{};
+    cache.entries[0] = .{ .key = bindings.key, .stamp = 1, .owner = &declared };
+    const cold = cache.availableFor(bindings.key) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!cold.warmed);
+    try std.testing.expectEqualDeep(declared.executable.?, cold.executableFor(bindings).?);
+    cache.entries[0].disabled = true;
+    try std.testing.expect(cache.availableFor(bindings.key) == null);
 
     var observed: Owner = .{ .allocator = std.testing.allocator };
     var scope = arena.Scope.observe(&observed.plan);
