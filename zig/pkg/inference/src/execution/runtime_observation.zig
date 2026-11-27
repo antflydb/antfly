@@ -515,7 +515,7 @@ pub const CudaDecoderDeclines = struct {
     workspace_admission: u64 = 0,
 
     pub const Reason = @import("std").meta.FieldEnum(CudaDecoderDeclines);
-    pub const Counts = [@typeInfo(Reason).@"enum".fields.len]u64;
+    pub const Counts = [@typeInfo(CudaDecoderDeclines).@"struct".field_names.len]u64;
 };
 
 pub inline fn cudaDecoderDeclined(reason: CudaDecoderDeclines.Reason) void {
