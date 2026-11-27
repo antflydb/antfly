@@ -177,14 +177,21 @@ class DecisionHandler(BaseHTTPRequestHandler):
         pass
 
     def do_POST(self):
-        gate = getattr(self.server, "provider_lanes", None)
-        if gate is not None:
-            gate.acquire()
-        self.request_active = True
-        self.request_gate = gate
-        with self.server.lock:
-            self.server.active += 1
-            self.server.peak = max(self.server.peak, self.server.active)
+        # Ordered asset projection can overlap inference. A provider-only
+        # measurement excludes the independently admitted index requests.
+        provider_only = getattr(self.server, "measure_provider_work", False)
+        self.request_active = not (provider_only and "/tables/" in self.path)
+        self.request_gate = (
+            getattr(self.server, "provider_lanes", None)
+            if self.request_active
+            else None
+        )
+        if self.request_gate is not None:
+            self.request_gate.acquire()
+        if self.request_active:
+            with self.server.lock:
+                self.server.active += 1
+                self.server.peak = max(self.server.peak, self.server.active)
         try:
             if self.server.barrier and not self.path.startswith("/api/v1/tables/"):
                 try:
@@ -279,6 +286,11 @@ class DecisionHandler(BaseHTTPRequestHandler):
         if mode == "retry" and len(self.server.index_requests) == 1:
             self.send_response(429)
             self.send_header("Retry-After", "Sun, 06 Nov 1994 08:49:37 GMT")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if mode == "unavailable":
+            self.send_response(503)
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
@@ -1804,7 +1816,17 @@ class CliTests(unittest.TestCase):
             "--table-config", config, "--retries", "0", "-l", "STOP", code=2
         )
         self.assertEqual(result.stdout, b"a.py\n")
+        self.assertIn(b"IndexTemporarilyUnavailable", result.stderr)
         self.assertEqual(len(self.server.index_requests), 2)
+
+        self.server.index_mode = "unavailable"
+        self.server.index_requests = []
+        result = self.raw_cli(
+            "--table-config", config, "--retries", "0", "-l", "STOP", code=2
+        )
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"IndexTemporarilyUnavailable", result.stderr)
+        self.assertEqual(len(self.server.index_requests), 1)
 
         config = self.table_config(
             [self.indexed_doc(f"{i}.py") for i in range(4)], page_size=2
@@ -4325,6 +4347,7 @@ class CliTests(unittest.TestCase):
 
     def test_media_cross_parent_projection_coalescing_and_stable_delivery(self):
         config = self.visual_parents(count=20)
+        self.server.measure_provider_work = True
         args = [
             *self.decision_args(),
             "--media=images",
@@ -4355,6 +4378,7 @@ class CliTests(unittest.TestCase):
         )
         self.server.requests.clear()
         self.server.index_requests.clear()
+        self.server.peak = 0
         self.server.delay = 0.02
         try:
             streamed = self.raw_cli(*args, "--decision-transport=single", "--no-rank")

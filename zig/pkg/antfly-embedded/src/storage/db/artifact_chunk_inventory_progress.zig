@@ -24,7 +24,7 @@ const Plan = @import("catalog/index_manager.zig").IndexManager.WritePlanSnapshot
 const Request = @import("enrichment/enrichment_types.zig").GeneratedEnrichmentRequest;
 const Claim = @import("artifact_stream_census.zig").Claim;
 const prefix = "\x00\x00__artifact_publication__:chunk-inventory:";
-const Key = [prefix.len + 80]u8;
+pub const Key = [prefix.len + 80]u8;
 const Encoded = [361]u8;
 const Record = struct { root: u128, checkpoint: reconstruction.Checkpoint, claim: Claim };
 

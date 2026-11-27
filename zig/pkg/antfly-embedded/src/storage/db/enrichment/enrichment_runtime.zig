@@ -3230,13 +3230,15 @@ fn unlockRuntime(runtime: *EnrichmentRuntime, maybe_io: ?std.Io) void {
 
 /// Retained reads freeze committed publications, including pending/failed
 /// request state. Provider retries are future mutations, not read barriers.
-/// Pipeline failure and incomplete graph recovery still require repair.
-fn requireEnrichmentHealthyForQueryCapture(runtime: *EnrichmentRuntime) !void {
+/// The committed cut cannot observe private graph preparation. Graph statement
+/// admission and write visibility can still demand that recovery has finished.
+fn requireEnrichmentHealthyForQueryCapture(runtime: *EnrichmentRuntime, require_graph_recovery: bool) !void {
     const maybe_io = lockRuntime(runtime);
     defer unlockRuntime(runtime, maybe_io);
     if (runtime.worker_failed) return RuntimeError.EnrichmentWorkerFailed;
-    if (comptime @hasField(EnrichmentRuntime, "graph_stage_recovery_pending"))
-        if (runtime.graph_stage_recovery_pending) return RuntimeError.EnrichmentRetryInProgress;
+    if (comptime @hasField(EnrichmentRuntime, "graph_stage_recovery_pending")) {
+        if (require_graph_recovery and runtime.graph_stage_recovery_pending) return RuntimeError.EnrichmentRetryInProgress;
+    }
 }
 
 fn setActiveFailureFingerprint(runtime: *EnrichmentRuntime, fingerprint: u64) void {
@@ -9701,6 +9703,9 @@ const PlatformEnrichmentRuntime = struct {
         // allocations without releasing another worker's durable lease.
         errdefer runtime.ownership.deinitPreserveLease(alloc);
         if (config.recovery_only) return runtime;
+        if (borrowed_io != null)
+            runtime.publication_flights.cleanup_owner = .{ .backend = backend_runtime, .id = try backend_runtime.allocOwnerId() };
+        errdefer runtime.publication_flights.deinit(alloc);
         const observed = try enrichment_state.loadRuntimeObservation(alloc, store, scope_name);
         runtime.applied_sequence = observed.applied;
         runtime.status_revision = observed.revision;
@@ -33041,14 +33046,17 @@ const PublicationFlights = struct {
     const generations = @import("../artifact_chunk_generation.zig");
     const stream_progress = @import("../artifact_stream_progress.zig");
     const upload = @import("../artifact_publication_transport.zig");
+    const inventory_progress = @import("../artifact_chunk_inventory_progress.zig");
+    const cleanup_retry_delay_ns = std.time.ns_per_s;
 
     const Completion = union(enum) {
         receipt: struct { key: ordered_publication.ReceiptKey, previous: u64 },
         append: struct { key: []const u8, count: u32 },
         census: struct { key: stream_progress.Key, previous: ?ordered_publication.Digest },
+        inventory: struct { key: inventory_progress.Key, previous: ?ordered_publication.Digest, manifest: []const u8 },
     };
 
-    const AppendKey = struct {
+    const RetainedKey = struct {
         bytes: []const u8,
         refs: usize = 1,
         reservation: ?resource_manager_mod.Reservation = null,
@@ -33066,13 +33074,13 @@ const PublicationFlights = struct {
         rejected_at: u64,
         completion: Completion,
         uploaded: bool,
-        append_key: ?*AppendKey = null,
+        retained_key: ?*RetainedKey = null,
         dispatch: ordered_publication.DispatchReceipt = .{},
         submitting: bool = false,
 
         fn deinit(self: Flight, a: Allocator) void {
             self.dispatch.release();
-            if (self.append_key) |key| {
+            if (self.retained_key) |key| {
                 key.refs -= 1;
                 if (key.refs == 0) {
                     a.free(key.bytes);
@@ -33113,19 +33121,36 @@ const PublicationFlights = struct {
                     const state = try generations.State.decode(raw);
                     return state.retiring or state.progress.count >= watch.count;
                 },
+                .inventory => |watch| {
+                    // A final page installs the manifest and removes the
+                    // temporary checkpoint, even when there was only one page.
+                    if (read.get(watch.manifest)) |_| return true else |err| if (err != error.NotFound) return err;
+                    return try progressChanged(read, &watch.key, watch.previous);
+                },
                 .census => |watch| {
-                    const raw = read.get(&watch.key) catch |err| if (err == error.NotFound) return watch.previous != null else return err;
-                    if (raw.len < 32) return error.ArtifactCatalogCorrupt;
-                    return watch.previous == null or !std.mem.eql(u8, &watch.previous.?, raw[raw.len - 32 ..]);
+                    return try progressChanged(read, &watch.key, watch.previous);
                 },
             }
         }
     };
 
+    fn progressChanged(read: anytype, key: []const u8, previous: ?ordered_publication.Digest) !bool {
+        const raw = read.get(key) catch |err| if (err == error.NotFound) return previous != null else return err;
+        if (raw.len < 32) return error.ArtifactCatalogCorrupt;
+        return previous == null or !std.mem.eql(u8, &previous.?, raw[raw.len - 32 ..]);
+    }
+
+    const CleanupOwner = struct { backend: *background_runtime_mod.BackendRuntime, id: u64 };
+
     mutex: Io.Mutex = .init,
     items: std.ArrayList(Flight) = .empty,
+    cleanup_owner: ?CleanupOwner = null,
+    cleanup_armed: bool = false,
+    cleanup_active: std.atomic.Value(bool) = .init(false),
+    cleanup_retry_ns: std.atomic.Value(u64) = .init(0),
 
     fn deinit(self: *PublicationFlights, a: Allocator) void {
+        if (self.cleanup_owner) |owner| owner.backend.durable_jobs.closeOwner(owner.id);
         for (self.items.items) |flight| flight.deinit(a);
         self.items.deinit(a);
     }
@@ -33150,21 +33175,82 @@ const PublicationFlights = struct {
         return self.reconcileLocked(runtime, .{ .pressure = owner });
     }
 
+    // The durable lane's allocation-free probe stays armed across transient
+    // executor refusals. It only admits one cleanup job at a time and never
+    // reads storage from the threaded reaper.
+    fn cleanupProbe(ptr: *anyopaque) void {
+        const runtime: *EnrichmentRuntime = @ptrCast(@alignCast(ptr));
+        const self = &runtime.publication_flights;
+        const owner = self.cleanup_owner.?;
+        const io = concurrencyIo(runtime);
+        if (!self.mutex.tryLock()) return;
+        if (!self.cleanup_armed or self.cleanup_active.load(.acquire) or
+            runtime.deadline_clock.nowRealtimeNs() < self.cleanup_retry_ns.load(.monotonic))
+        {
+            self.mutex.unlock(io);
+            return;
+        }
+        self.cleanup_active.store(true, .monotonic);
+        self.mutex.unlock(io);
+        owner.backend.durable_jobs.submit(.{
+            .owner_id = owner.id,
+            .class = .maintenance,
+            .ptr = runtime,
+            .run = cleanupJob,
+            .deinit = finishCleanupJob,
+        }) catch {
+            self.deferCleanup(runtime);
+            self.cleanup_active.store(false, .release);
+        };
+    }
+
+    fn cleanupJob(ptr: *anyopaque) !void {
+        const runtime: *EnrichmentRuntime = @ptrCast(@alignCast(ptr));
+        const self = &runtime.publication_flights;
+        const io = concurrencyIo(runtime);
+        if (!self.mutex.tryLock()) return;
+        defer self.mutex.unlock(io);
+        const pending = self.reconcileLocked(runtime, .retained) catch {
+            self.deferCleanup(runtime);
+            return;
+        };
+        if (!pending) {
+            const owner = self.cleanup_owner.?;
+            self.cleanup_armed = false;
+            self.cleanup_retry_ns.store(0, .monotonic);
+            owner.backend.disarmOwnerMaintenanceProbe(owner.id);
+        }
+    }
+
+    fn deferCleanup(self: *PublicationFlights, runtime: *EnrichmentRuntime) void {
+        self.cleanup_retry_ns.store(runtime.deadline_clock.nowRealtimeNs() +| cleanup_retry_delay_ns, .monotonic);
+    }
+
+    fn finishCleanupJob(ptr: *anyopaque) void {
+        const runtime: *EnrichmentRuntime = @ptrCast(@alignCast(ptr));
+        runtime.publication_flights.cleanup_active.store(false, .release);
+    }
+
     const Selection = union(enum) {
         all,
+        retained,
         owner: u64,
         pressure: ?u64,
 
         fn owns(self: Selection, flight_owner: u64) bool {
             return switch (self) {
-                .all => true,
+                .all, .retained => true,
                 .owner => |owner| owner == flight_owner,
                 .pressure => |owner| owner == flight_owner,
             };
         }
 
         fn includes(self: Selection, flight: Flight) bool {
-            return self.owns(flight.owner) or (self == .pressure and flight.append_key != null);
+            return switch (self) {
+                .retained => flight.retained_key != null,
+                .pressure => self.owns(flight.owner) or flight.retained_key != null,
+                else => self.owns(flight.owner),
+            };
         }
     };
 
@@ -33220,10 +33306,18 @@ const PublicationFlights = struct {
         };
     }
 
-    fn retainAppendKey(self: *PublicationFlights, runtime: *EnrichmentRuntime, bytes: []const u8, encoding_budget: ?*resource_manager_mod.BudgetedAllocator) !*AppendKey {
-        for (self.items.items) |flight| if (flight.append_key) |key| {
+    fn wakeCleanup(self: *PublicationFlights, runtime: *EnrichmentRuntime) void {
+        if (self.cleanup_armed) return;
+        const owner = self.cleanup_owner orelse return;
+        owner.backend.armOwnerMaintenanceProbe(owner.id, .{ .ptr = runtime, .run = cleanupProbe }) catch return;
+        self.cleanup_armed = true;
+    }
+
+    fn retainProgressKey(self: *PublicationFlights, runtime: *EnrichmentRuntime, bytes: []const u8, encoding_budget: ?*resource_manager_mod.BudgetedAllocator) !*RetainedKey {
+        for (self.items.items) |flight| if (flight.retained_key) |key| {
             if (std.mem.eql(u8, key.bytes, bytes)) {
                 key.refs += 1;
+                if (key.reservation != null) self.wakeCleanup(runtime);
                 return key;
             }
         };
@@ -33232,18 +33326,22 @@ const PublicationFlights = struct {
         // bytes separately for the lifetime of this generation's witnesses.
         if (encoding_budget) |budget| _ = budget.releaseUnusedCreditThreadSafe();
         const a = runtime.alloc;
-        const charge = std.math.add(usize, bytes.len, @sizeOf(AppendKey)) catch return error.PublicationEncoderAdmissionDenied;
-        var reservation = if (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) |manager|
-            manager.reserveWithoutReclaim(.relational_preparation_working_set, charge) catch |err| switch (err) {
+        const charge = std.math.add(usize, bytes.len, @sizeOf(RetainedKey)) catch return error.PublicationEncoderAdmissionDenied;
+        const manager = runtime.config.resource_manager orelse runtime.index_manager.resource_manager;
+        var reservation = if (manager) |m|
+            m.reserveWithoutReclaim(.relational_preparation_working_set, charge) catch |err| switch (err) {
                 error.ResourceBudgetExceeded => return error.PublicationEncoderAdmissionDenied,
                 else => return err,
             }
         else
             null;
         errdefer if (reservation) |*owned| owned.release();
-        const key = try a.create(AppendKey);
+        const key = try a.create(RetainedKey);
         errdefer a.destroy(key);
-        key.* = .{ .bytes = try a.dupe(u8, bytes), .reservation = reservation };
+        const stored = try a.dupe(u8, bytes);
+        errdefer a.free(stored);
+        if (reservation != null) self.wakeCleanup(runtime);
+        key.* = .{ .bytes = stored, .reservation = reservation };
         return key;
     }
 
@@ -33279,10 +33377,18 @@ const PublicationFlights = struct {
             }
             try self.items.ensureUnusedCapacity(runtime.alloc, 1);
             var flight = prepared;
-            if (flight.completion == .append) {
-                const key = try self.retainAppendKey(runtime, flight.completion.append.key, encoding_budget);
-                flight.append_key = key;
-                flight.completion.append.key = key.bytes;
+            switch (flight.completion) {
+                .append => |*watch| {
+                    const key = try self.retainProgressKey(runtime, watch.key, encoding_budget);
+                    flight.retained_key = key;
+                    watch.key = key.bytes;
+                },
+                .inventory => |*watch| {
+                    const key = try self.retainProgressKey(runtime, watch.manifest, encoding_budget);
+                    flight.retained_key = key;
+                    watch.manifest = key.bytes;
+                },
+                else => {},
             }
             flight.submitting = true;
             self.items.appendAssumeCapacity(flight);
@@ -34820,7 +34926,7 @@ fn collectPlainDenseBatchItem(
     const raw = (storeGetOptionalDocumentAllocWithRetry(runtime, doc_store_key) catch |err| return scope.publicationFailure(err)) orelse return null;
     defer runtime.alloc.free(raw);
     errdefer if (runtime.retry_scheduler) |scheduler| scheduler.rememberSource(runtime, requestFailureFingerprint(request), sourceRecordDigest(raw));
-    var input = captureProducerInput(runtime, request, doc_store_key, raw) catch |err| return scope.publicationFailure(err);
+    var input = captureProducerInput(runtime, request, doc_store_key, raw) catch |err| return FailureScope.assetPublicationFailure(scope, err);
     errdefer if (input) |*token| token.deinit();
 
     if (input) |*token| {
@@ -34853,7 +34959,10 @@ fn collectPlainDenseBatchItem(
             if (input) |*token| {
                 const key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
                 defer runtime.alloc.free(key);
-                enqueueProducerArtifact(runtime, token, key, null) catch |err| return scope.publicationFailure(err);
+                enqueueProducerArtifact(runtime, token, key, null) catch |err| {
+                    if (err == error.ResourceTemporarilyUnavailable) return err;
+                    return FailureScope.assetPublicationFailure(scope, err);
+                };
                 token.deinit();
                 return null;
             }
@@ -34960,9 +35069,10 @@ fn flushPlainDenseItems(
     noteEmbedBatchFinished(runtime, consumer_indexes, items.len, total_source_bytes, max_source_bytes, elapsedNsSince(runtime, embed_started_ns), true);
     defer finishActivePostprocess(runtime);
     // Everything after successful inference is publication/postprocessing.
-    errdefer {
+    var publication_failure = true;
+    errdefer if (publication_failure) {
         scope.publication_failed = true;
-    }
+    };
 
     const accepted = try runtime.alloc.alloc(bool, items.len);
     defer runtime.alloc.free(accepted);
@@ -34993,7 +35103,10 @@ fn flushPlainDenseItems(
     var start: usize = 0;
     while (start < writes.len) {
         const end = @min(writes.len, start + max_items);
-        try storeGuardedEmbeddingsWithRetry(runtime, writes[start..end], accepted[start..end]);
+        storeGuardedEmbeddingsWithRetry(runtime, writes[start..end], accepted[start..end]) catch |err| {
+            publication_failure = err != error.ResourceTemporarilyUnavailable and !isEnrichmentControlError(err);
+            return err;
+        };
         start = end;
     }
     for (items, vectors, accepted) |item, vector, committed| {
@@ -35146,28 +35259,42 @@ fn producerEncodingOutcome(runtime: *EnrichmentRuntime, alloc: Allocator, denial
 }
 
 fn captureProducerInput(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, source_key: []const u8, logical_input: []const u8) !?producer_input.Token {
-    if (runtime.coverage_apply_mutex) |mutex| mutex.lockShared();
-    defer if (runtime.coverage_apply_mutex) |mutex| mutex.unlockShared();
-    var read = try runtime.store.beginProbe();
-    defer read.abort();
-    var intent_guard = @import("../../transactions.zig").IntentReadGuard.init(runtime.alloc, null);
-    defer intent_guard.deinit();
-    const source_owner = try @import("../artifact_publication_owner.zig").documentAlloc(runtime.alloc, source_key);
-    defer runtime.alloc.free(source_owner);
-    try intent_guard.check(&read, source_owner);
-    if (try ordered_publication.authority(&read) == null) return null;
-    var plan = try runtime.index_manager.acquireWritePlanSnapshot();
-    defer plan.release();
-    return producer_input.capture(runtime.alloc, &read, runtime.config.root_incarnation, request, plan.plan(), source_key, logical_input, .{
-        .ptr = runtime.index_manager,
-        .materialize = materializeProducerInput,
-    });
+    var token = capture: {
+        if (runtime.coverage_apply_mutex) |mutex| mutex.lockShared();
+        defer if (runtime.coverage_apply_mutex) |mutex| mutex.unlockShared();
+        var read = try runtime.store.beginProbe();
+        defer read.abort();
+        var intent_guard = @import("../../transactions.zig").IntentReadGuard.init(runtime.alloc, null);
+        defer intent_guard.deinit();
+        const source_owner = try @import("../artifact_publication_owner.zig").documentAlloc(runtime.alloc, source_key);
+        defer runtime.alloc.free(source_owner);
+        try intent_guard.check(&read, source_owner);
+        if (try ordered_publication.authority(&read) == null) return null;
+        var plan = try runtime.index_manager.acquireWritePlanSnapshot();
+        defer plan.release();
+        break :capture (try producer_input.capture(runtime.alloc, &read, runtime.config.root_incarnation, request, plan.plan(), source_key, logical_input, .{
+            .ptr = runtime.index_manager,
+            .materialize = materializeProducerInput,
+        })) orelse return null;
+    };
+    errdefer token.deinit();
+    if (try runtime.publication_flights.reconcile(runtime, baseVectorFlightOwner(&token))) return error.ArtifactPublicationPending;
+    return token;
+}
+
+fn baseVectorFlightOwner(token: *const producer_input.Token) u64 {
+    return std.hash.Wyhash.hash(0, &ordered_publication.receiptKey(token.command(&.{}), token.source));
 }
 
 fn producerInputAccepted(runtime: *EnrichmentRuntime, token: *const producer_input.Token) !bool {
-    var read = try runtime.store.beginProbe();
-    defer read.abort();
-    return token.accepted(&read);
+    {
+        var read = try runtime.store.beginProbe();
+        defer read.abort();
+        if (!try token.accepted(&read)) return false;
+    }
+    if (try runtime.publication_flights.reconcile(runtime, baseVectorFlightOwner(token)))
+        return error.ArtifactPublicationPending;
+    return true;
 }
 
 fn enqueueProducerArtifact(runtime: *EnrichmentRuntime, token: *const producer_input.Token, key: []const u8, payload: ?[]const u8) !void {
@@ -35182,12 +35309,25 @@ fn enqueueProducerArtifact(runtime: *EnrichmentRuntime, token: *const producer_i
     if (try producerInputAccepted(runtime, token)) return;
     const dispatcher = runtime.artifact_publication_dispatcher orelse return error.ArtifactCatalogDrift;
     const command = token.command(&.{.{ .family = .base_vector, .key = key, .value = payload, .source_index = 0 }});
-    try command.validate(runtime.alloc);
-    const bytes = try @import("../artifact_publication_transport_codec.zig").encodeAlloc(runtime.alloc, command);
-    defer runtime.alloc.free(bytes);
+    const owner = baseVectorFlightOwner(token);
+    if (try runtime.publication_flights.reconcile(runtime, owner)) return error.ArtifactPublicationPending;
+    var budget = if (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) |manager|
+        runtime.media_window_capture.budget(manager, runtime.alloc)
+    else
+        null;
+    defer if (budget) |*tracked| tracked.deinit();
+    const alloc = if (budget) |*tracked| tracked.allocator() else runtime.alloc;
+    const bytes = encodeOrderedPublication(alloc, command, .{}) catch |err|
+        return if (err == error.ResourceTemporarilyUnavailable) publicationAdmissionOutcome(runtime, owner) else err;
+    defer alloc.free(bytes);
     // The callback owns a bounded clone. Never hold a store/catalog/apply lock
     // across it, and never credit coverage merely because enqueue succeeded.
-    try dispatcher.submit(token.namespace, bytes);
+    const flight = blk: {
+        var read = try runtime.store.beginProbe();
+        defer read.abort();
+        break :blk try PublicationFlights.prepare(&read, owner, command, token.source, bytes.len, null);
+    };
+    try runtime.publication_flights.submit(runtime, dispatcher, flight, bytes, null);
     return error.ArtifactPublicationPending;
 }
 
@@ -35293,6 +35433,7 @@ fn storeGuardedEmbeddings(runtime: *EnrichmentRuntime, writes: []const GuardedEm
     for (writes, 0..) |write, i| if (write.ordered_input) |token| {
         enqueueProducerArtifact(runtime, token, write.key, write.value) catch |err| switch (err) {
             error.ArtifactPublicationPending => ordered_pending = true,
+            error.ResourceTemporarilyUnavailable => return if (ordered_pending) error.ArtifactPublicationPending else err,
             else => return err,
         };
         accepted[i] = false; // Native publication already owns projection/coverage.
@@ -36921,33 +37062,53 @@ fn driveOrderedChunkInventoryScoped(runtime: *EnrichmentRuntime, request: enrich
     // Reconstruction hashes the physical stream. Logical cursor wrappers may
     // hydrate an unrelated vector on lookahead and pollute the query cache.
     const store = runtime.artifact_store orelse return error.OnlineMergeArtifactTailsUnsupported;
+    const owner = std.hash.Wyhash.hash(logicalRequestFingerprint(request), unit orelse "");
+    if (try runtime.publication_flights.reconcile(runtime, owner)) return error.ArtifactPublicationPending;
     var budget = if (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) |manager|
         resource_manager_mod.BudgetedAllocator.init(manager, .shard_transition_working_set, runtime.alloc, 1)
     else
         null;
     defer if (budget) |*tracked| tracked.deinit();
     const alloc = if (budget) |*tracked| tracked.allocator() else runtime.alloc;
-    var encoded: ?[]u8 = null;
-    defer if (encoded) |bytes| alloc.free(bytes);
-    var namespace: ordered_publication.Namespace = undefined;
-    {
-        if (runtime.coverage_apply_mutex) |mutex| mutex.lockShared();
-        defer if (runtime.coverage_apply_mutex) |mutex| mutex.unlockShared();
-        var read = try store.beginReadTxnWithBlockCacheAdmission(.transient);
-        defer read.abort();
-        var plan = try runtime.index_manager.acquireWritePlanSnapshot();
-        defer plan.release();
-        var prepared = (@import("../artifact_chunk_inventory_progress.zig").prepare(alloc, &read, runtime.config.root_incarnation, request, plan.plan(), unit, .{}, null) catch |err| {
-            if (err == error.OutOfMemory) if (budget) |*tracked| if (tracked.denied()) return error.ResourceBudgetExceeded;
-            return err;
-        }) orelse return;
-        defer prepared.deinit();
-        const command = prepared.command(requestArtifactName(request));
-        namespace = command.namespace;
-        encoded = try encodeOrderedPublication(alloc, command, .{});
+    const prepared = prepareOrderedChunkInventory(runtime, store, alloc, request, unit, owner) catch |err|
+        return if (err == error.ResourceTemporarilyUnavailable) publicationAdmissionOutcome(runtime, owner) else err;
+    if (prepared) |publication| {
+        defer alloc.free(publication.bytes);
+        defer alloc.free(publication.manifest);
+        const dispatcher = runtime.artifact_publication_dispatcher orelse return error.ArtifactCatalogDrift;
+        runtime.publication_flights.submit(runtime, dispatcher, publication.flight, publication.bytes, if (budget) |*tracked| tracked else null) catch |err|
+            return if (err == error.PublicationEncoderAdmissionDenied) publicationAdmissionOutcome(runtime, owner) else err;
     }
-    const dispatcher = runtime.artifact_publication_dispatcher orelse return error.ArtifactCatalogDrift;
-    try dispatcher.submit(namespace, encoded.?);
+}
+
+const OrderedInventoryPublication = struct {
+    bytes: []u8,
+    manifest: []u8,
+    flight: PublicationFlights.Flight,
+};
+
+fn prepareOrderedChunkInventory(runtime: *EnrichmentRuntime, store: *docstore_mod.DocStore, alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, unit: ?[]const u8, owner: u64) !?OrderedInventoryPublication {
+    if (runtime.coverage_apply_mutex) |mutex| mutex.lockShared();
+    defer if (runtime.coverage_apply_mutex) |mutex| mutex.unlockShared();
+    var read = try store.beginReadTxnWithBlockCacheAdmission(.transient);
+    defer read.abort();
+    var plan = try runtime.index_manager.acquireWritePlanSnapshot();
+    defer plan.release();
+    const denial_before = publicationDenialGeneration(alloc);
+    var prepared = (@import("../artifact_chunk_inventory_progress.zig").prepare(alloc, &read, runtime.config.root_incarnation, request, plan.plan(), unit, .{}, null) catch |err|
+        return (ProducerPublicationOptions{}).encodingError(alloc, denial_before, err)) orelse return null;
+    defer prepared.deinit();
+    const command = prepared.command(requestArtifactName(request));
+    const bytes = try encodeOrderedPublication(alloc, command, .{});
+    errdefer alloc.free(bytes);
+    const flight = try PublicationFlights.prepare(&read, owner, command, null, bytes.len, .{
+        .inventory = .{ .key = prepared.selected, .previous = prepared.expected, .manifest = prepared.manifest },
+    });
+    const manifest = prepared.manifest;
+    // Transfer just the manifest key. The tracker interns its own copy under
+    // the replay working-set budget if queue admission succeeds.
+    prepared.manifest = &.{};
+    return .{ .bytes = bytes, .manifest = manifest, .flight = flight };
 }
 
 fn processChunkText(
@@ -45680,7 +45841,29 @@ test "ordered artifact inventory unit chunk callback reconstructs publishes and 
     foreign_job.document = "foreign";
     try std.testing.expectError(error.InvalidBatchRequest, publishOrderedUnitJob(runtime, request, foreign_job));
     // First pass reconstructs inventory without invoking the chunker.
+    {
+        var limits: resource_manager_mod.Options = .{};
+        limits.budgets[@backingInt(resource_manager_mod.Slice.shard_transition_working_set)] = .{ .hard_limit_bytes = 1 };
+        var manager = resource_manager_mod.ResourceManager.init(limits);
+        defer manager.deinit(alloc);
+        const previous_manager = runtime.config.resource_manager;
+        runtime.config.resource_manager = &manager;
+        defer runtime.config.resource_manager = previous_manager;
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, publishOrderedUnitChunks(runtime, request, "chunks", unit_key));
+        try std.testing.expectEqual(@as(usize, 0), harness.calls);
+    }
     try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedUnitChunks(runtime, request, "chunks", unit_key));
+    {
+        var limits: resource_manager_mod.Options = .{};
+        limits.budgets[@backingInt(resource_manager_mod.Slice.shard_transition_working_set)] = .{ .hard_limit_bytes = 1 };
+        var manager = resource_manager_mod.ResourceManager.init(limits);
+        defer manager.deinit(alloc);
+        const previous_manager = runtime.config.resource_manager;
+        runtime.config.resource_manager = &manager;
+        defer runtime.config.resource_manager = previous_manager;
+        try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedUnitChunks(runtime, request, "chunks", unit_key));
+        try std.testing.expectEqual(@as(usize, 1), harness.calls);
+    }
     try harness.apply(&db, 5);
     const AllocationCheck = struct {
         fn run(a: Allocator, worker: *EnrichmentRuntime, parent_request: enrichment_types.GeneratedEnrichmentRequest, key: []const u8) !void {
@@ -45832,7 +46015,28 @@ test "ordered artifact inventory chunk callback waits for acceptance and atomica
         defer window.deinit();
         var unreconciled = request;
         unreconciled.doc_key = "unreconciled";
+        {
+            var limits: resource_manager_mod.Options = .{};
+            limits.budgets[@backingInt(resource_manager_mod.Slice.shard_transition_working_set)] = .{ .hard_limit_bytes = 1 };
+            var manager = resource_manager_mod.ResourceManager.init(limits);
+            defer manager.deinit(alloc);
+            const previous_manager = runtime.config.resource_manager;
+            runtime.config.resource_manager = &manager;
+            defer runtime.config.resource_manager = previous_manager;
+            try std.testing.expectError(error.ResourceTemporarilyUnavailable, processChunkText(runtime, unreconciled, &cache, &window, null));
+            try std.testing.expectEqual(@as(usize, 0), harness.calls);
+        }
         try std.testing.expectError(error.ArtifactPublicationPending, processChunkText(runtime, unreconciled, &cache, &window, null));
+        {
+            var limits: resource_manager_mod.Options = .{};
+            limits.budgets[@backingInt(resource_manager_mod.Slice.shard_transition_working_set)] = .{ .hard_limit_bytes = 1 };
+            var manager = resource_manager_mod.ResourceManager.init(limits);
+            defer manager.deinit(alloc);
+            const previous_manager = runtime.config.resource_manager;
+            runtime.config.resource_manager = &manager;
+            defer runtime.config.resource_manager = previous_manager;
+            try std.testing.expectError(error.ArtifactPublicationPending, processChunkText(runtime, unreconciled, &cache, &window, null));
+        }
         try std.testing.expectEqual(@as(usize, 1), harness.calls);
         try std.testing.expectEqual(@as(usize, 0), cache.items.len);
         {
@@ -46032,12 +46236,17 @@ fn testOrderedDirectProducerCarry(dense: bool, reprocess_generation: u64) !void 
         publications: usize = 0,
         provider_calls: usize = 0,
         generation: u8 = 1,
+        pressure_on_dispatch: ?struct { runtime: *EnrichmentRuntime, manager: *resource_manager_mod.ResourceManager } = null,
         fn enqueue(ptr: *anyopaque, _: publication.Namespace, bytes: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const copy = try std.testing.allocator.dupe(u8, bytes);
             if (self.encoded) |old| std.testing.allocator.free(old);
             self.encoded = copy;
             self.publications += 1;
+            if (self.pressure_on_dispatch) |pressure| {
+                pressure.runtime.config.resource_manager = pressure.manager;
+                self.pressure_on_dispatch = null;
+            }
         }
         fn caps(ptr: *anyopaque, _: Allocator, _: []const u8) !inference_work.InferenceCapabilities {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -46135,9 +46344,34 @@ fn testOrderedDirectProducerCarry(dense: bool, reprocess_generation: u64) !void 
     };
     const expect = std.testing;
 
+    {
+        const primary = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
+        defer runtime.alloc.free(primary);
+        const raw = (try storeGetOptionalDocumentAllocWithRetry(runtime, primary)).?;
+        defer runtime.alloc.free(raw);
+        var token = (try captureProducerInput(runtime, request, primary, raw)).?;
+        defer token.deinit();
+        var manager = resource_manager_mod.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 1 } });
+        defer manager.deinit(alloc);
+        const previous_manager = runtime.config.resource_manager;
+        runtime.config.resource_manager = &manager;
+        defer runtime.config.resource_manager = previous_manager;
+        try expect.expectError(error.ResourceTemporarilyUnavailable, enqueueProducerArtifact(runtime, &token, output, null));
+        try expect.expectEqual(@as(usize, 0), harness.publications);
+    }
     // First execution calls the provider and publishes through ordered apply.
     try expect.expectError(error.ArtifactPublicationPending, Step.run(runtime, dense, request, &cache, &sources, &window));
     try expect.expectEqual(@as(usize, 1), harness.provider_calls);
+    {
+        var manager = resource_manager_mod.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 1 } });
+        defer manager.deinit(alloc);
+        const previous_manager = runtime.config.resource_manager;
+        runtime.config.resource_manager = &manager;
+        defer runtime.config.resource_manager = previous_manager;
+        try expect.expectError(error.ArtifactPublicationPending, Step.run(runtime, dense, request, &cache, &sources, &window));
+        try expect.expectEqual(@as(usize, 1), harness.publications);
+        try expect.expectEqual(@as(usize, 1), harness.provider_calls);
+    }
     {
         var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
         defer decoded.deinit();
@@ -46207,6 +46441,55 @@ fn testOrderedDirectProducerCarry(dense: bool, reprocess_generation: u64) !void 
     harness.generation = 2;
     try expect.expectError(error.ArtifactPublicationPending, Step.run(runtime, dense, request, &cache, &sources, &window));
     try expect.expectEqual(@as(usize, 3), harness.provider_calls);
+
+    if (dense and reprocess_generation == 0) {
+        const documents = [_][]const u8{ "batch-a", "batch-b" };
+        index += 1;
+        try server_test_adapter.applyOrdered(&db, .{ .writes = &.{
+            .{ .key = documents[0], .value = "{\"body\":\"a\"}" },
+            .{ .key = documents[1], .value = "{\"body\":\"b\"}" },
+        }, .timestamp_ns = 103 }, .{ .term = 1, .index = index });
+        var tokens: [documents.len]producer_input.Token = undefined;
+        var writes: [documents.len]GuardedEmbeddingWrite = undefined;
+        var initialized: usize = 0;
+        defer for (tokens[0..initialized], writes[0..initialized]) |*token, write| {
+            token.deinit();
+            runtime.alloc.free(write.source_key);
+            runtime.alloc.free(write.key);
+        };
+        for (documents, &tokens, &writes) |document, *token, *write| {
+            request.doc_key = document;
+            const primary = try documentSourceStoreKeyAlloc(runtime, document);
+            errdefer runtime.alloc.free(primary);
+            const raw = (try storeGetOptionalDocumentAllocWithRetry(runtime, primary)).?;
+            defer runtime.alloc.free(raw);
+            token.* = (try captureProducerInput(runtime, request, primary, raw)).?;
+            errdefer token.deinit();
+            const key = try embeddingArtifactKey(runtime, document, requestEmbeddingName(request));
+            write.* = .{
+                .key = key,
+                .value = first,
+                .source_key = primary,
+                .source_digest = sourceRecordDigest(raw),
+                .doc_key = document,
+                .source_sequence = request.sequence,
+                .generation_guard = EmbeddingGenerationGuard.fromRequest(request),
+                .ordered_input = token,
+            };
+            initialized += 1;
+        }
+
+        var manager = resource_manager_mod.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 1 } });
+        defer manager.deinit(alloc);
+        const previous_manager = runtime.config.resource_manager;
+        defer runtime.config.resource_manager = previous_manager;
+        harness.pressure_on_dispatch = .{ .runtime = runtime, .manager = &manager };
+        var accepted: [documents.len]bool = undefined;
+        const calls_before = harness.publications;
+        try expect.expectError(error.ArtifactPublicationPending, storeGuardedEmbeddings(runtime, &writes, &accepted));
+        try expect.expectEqual(calls_before + 1, harness.publications);
+        try expect.expect(runtime.config.resource_manager == &manager);
+    }
 }
 
 test "ordered artifact inventory embedding output carry forward fails closed" {
@@ -52435,27 +52718,42 @@ test "model aware media ordered generation publishes beyond 4095 chunks and resu
             runtime.publication_flights = .{};
             runtime.config.resource_manager = original_manager;
         }
+        var reduced = try background_runtime_mod.BackendRuntime.init(a, .{
+            .backend = .manual,
+            .borrowed_io = .{ .general = std.testing.io },
+            .lane_limits = .{ .durable_background = 2 },
+        });
+        defer reduced.deinit();
+        try std.testing.expectError(error.InvalidMaintenanceCapacity, reduced.maintenanceScheduler());
+        const original_cleanup_owner = runtime.publication_flights.cleanup_owner;
+        const reduced_owner = try reduced.allocOwnerId();
+        runtime.publication_flights.cleanup_owner = .{ .backend = &reduced, .id = reduced_owner };
+        defer if (runtime.publication_flights.cleanup_owner.?.backend == &reduced) {
+            reduced.durable_jobs.closeOwner(reduced_owner);
+            runtime.publication_flights.cleanup_owner = original_cleanup_owner;
+        };
         try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedChunkGeneration(runtime, request, &token, scope, desired, true));
-        var shared_key: ?*PublicationFlights.AppendKey = null;
+        try std.testing.expect(runtime.publication_flights.cleanup_armed);
+        var shared_key: ?*PublicationFlights.RetainedKey = null;
         var page_witnesses: usize = 0;
         for (runtime.publication_flights.items.items) |flight| {
-            const key = flight.append_key orelse continue;
+            const key = flight.retained_key orelse continue;
             if (shared_key) |first| try std.testing.expectEqual(first, key) else shared_key = key;
             page_witnesses += 1;
         }
         try std.testing.expect(page_witnesses > 1);
         try std.testing.expectEqual(page_witnesses, shared_key.?.refs);
-        const charged_bytes = @sizeOf(PublicationFlights.AppendKey) + shared_key.?.bytes.len;
+        const charged_bytes = @sizeOf(PublicationFlights.RetainedKey) + shared_key.?.bytes.len;
         try std.testing.expectEqual(charged_bytes, manager.sliceStats(slice).used_bytes);
         {
             var competing = try manager.reserve(slice, limit - charged_bytes);
             defer competing.release();
-            try std.testing.expectError(error.PublicationEncoderAdmissionDenied, runtime.publication_flights.retainAppendKey(runtime, "distinct generation key", null));
+            try std.testing.expectError(error.PublicationEncoderAdmissionDenied, runtime.publication_flights.retainProgressKey(runtime, "distinct generation key", null));
         }
         // Reuse a settled append witness below to also exercise admission
         // for a different request when this owner has not been revisited.
         var settled_append = for (runtime.publication_flights.items.items) |flight| {
-            if (flight.append_key != null) break flight;
+            if (flight.retained_key != null) break flight;
         } else return error.TestUnexpectedResult;
         settled_append.dispatch = .{};
         const append_key = try a.dupe(u8, settled_append.completion.append.key);
@@ -52466,16 +52764,106 @@ test "model aware media ordered generation publishes beyond 4095 chunks and resu
         try std.testing.expect(try processOrderedChunkText(runtime, request, &cache, null));
         try std.testing.expectEqual(calls_before, harness.calls);
         try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(slice).used_bytes);
-        settled_append.append_key = try runtime.publication_flights.retainAppendKey(runtime, append_key, null);
-        settled_append.completion.append.key = settled_append.append_key.?.bytes;
-        runtime.publication_flights.items.appendAssumeCapacity(settled_append);
+        const TestLane = struct {
+            original: background_runtime_mod.DurableJobLane,
+            runtime: *EnrichmentRuntime,
+            submissions: usize = 0,
+            tracker_locked: bool = false,
+
+            fn submit(ptr: *anyopaque, job: background_runtime_mod.Job) !void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.submissions += 1;
+                if (self.submissions == 1) {
+                    // Simulate reconciliation taking the tracker lock after
+                    // the probe releases it and before submission fails.
+                    try std.testing.expect(self.runtime.publication_flights.mutex.tryLock());
+                    self.tracker_locked = true;
+                    return error.ConcurrencyUnavailable;
+                }
+                try self.original.submit(job);
+            }
+            fn drain(ptr: *anyopaque, owner: u64) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.original.drainOwner(owner);
+            }
+            fn close(ptr: *anyopaque, owner: u64) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.original.closeOwner(owner);
+            }
+            fn poll(ptr: *anyopaque, max_jobs: usize) !usize {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                return self.original.poll(max_jobs);
+            }
+        };
+        {
+            var test_lane: TestLane = .{ .original = reduced.durable_jobs, .runtime = runtime };
+            reduced.durable_jobs = .{
+                .ptr = &test_lane,
+                .vtable = &.{ .submit = TestLane.submit, .drain_owner = TestLane.drain, .close_owner = TestLane.close, .poll = TestLane.poll, .executes_inline = true },
+            };
+            defer reduced.durable_jobs = test_lane.original;
+            var clock: platform_clock.ManualClock = .{};
+            const original_clock = runtime.deadline_clock;
+            runtime.deadline_clock = clock.clock();
+            defer runtime.deadline_clock = original_clock;
+            {
+                const io = concurrencyIo(runtime);
+                runtime.publication_flights.mutex.lockUncancelable(io);
+                defer runtime.publication_flights.mutex.unlock(io);
+                settled_append.retained_key = try runtime.publication_flights.retainProgressKey(runtime, append_key, null);
+                settled_append.completion.append.key = settled_append.retained_key.?.bytes;
+                runtime.publication_flights.items.appendAssumeCapacity(settled_append);
+            }
+            const first_poll = reduced.durable_jobs.poll(1);
+            if (test_lane.tracker_locked) runtime.publication_flights.mutex.unlock(concurrencyIo(runtime));
+            try std.testing.expectEqual(@as(usize, 1), try first_poll);
+            try std.testing.expect(test_lane.tracker_locked);
+            try std.testing.expectEqual(charged_bytes, manager.sliceStats(slice).used_bytes);
+            clock.advanceNs(PublicationFlights.cleanup_retry_delay_ns - 1);
+            try std.testing.expectEqual(@as(usize, 1), try reduced.durable_jobs.poll(1));
+            try std.testing.expectEqual(@as(usize, 1), test_lane.submissions);
+            clock.advanceNs(1);
+            try std.testing.expectEqual(@as(usize, 1), try reduced.durable_jobs.poll(1));
+            try std.testing.expectEqual(@as(usize, 2), test_lane.submissions);
+            try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(slice).used_bytes);
+            try std.testing.expectEqual(@as(usize, 0), try reduced.durable_jobs.poll(1));
+        }
+        reduced.durable_jobs.closeOwner(reduced_owner);
+        runtime.publication_flights.cleanup_owner = original_cleanup_owner;
+        {
+            const io = concurrencyIo(runtime);
+            runtime.publication_flights.mutex.lockUncancelable(io);
+            defer runtime.publication_flights.mutex.unlock(io);
+            settled_append.retained_key = try runtime.publication_flights.retainProgressKey(runtime, append_key, null);
+            settled_append.completion.append.key = settled_append.retained_key.?.bytes;
+            runtime.publication_flights.items.appendAssumeCapacity(settled_append);
+        }
         {
             var competing = try manager.reserve(slice, limit - charged_bytes);
             defer competing.release();
-            try std.testing.expectError(error.PublicationEncoderAdmissionDenied, runtime.publication_flights.retainAppendKey(runtime, "unrelated generation key", null));
-            var unrelated = request;
-            unrelated.doc_key = "unrelated";
-            try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, publicationAdmissionOutcome(runtime, logicalRequestFingerprint(unrelated)));
+            const sibling_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/sibling-group", .{tmp.sub_path});
+            defer a.free(sibling_path);
+            var sibling_options = options;
+            sibling_options.identity_namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 3 };
+            sibling_options.artifact_publication_dispatcher = null;
+            var sibling = try db_mod.DB.open(a, sibling_path, sibling_options);
+            defer sibling.close();
+            try sibling.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true, .resource_manager = &manager });
+            const other_runtime = sibling.enrichment_runtime.?;
+            try std.testing.expectEqual(@as(usize, 0), other_runtime.publication_flights.items.items.len);
+            // Ordinary SQL admission has no publication tracker. The
+            // paused owner's scheduled cleanup releases its shared credit.
+            for (0..500) |_| {
+                if (manager.reserve(.relational_preparation_working_set, charged_bytes)) |admitted| {
+                    var reclaimed = admitted;
+                    reclaimed.release();
+                    break;
+                } else |err| {
+                    if (err != error.ResourceBudgetExceeded) return err;
+                    try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+                }
+            } else return error.TestUnexpectedResult;
+            try std.testing.expectEqual(limit - charged_bytes, manager.sliceStats(slice).used_bytes);
         }
         try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(slice).used_bytes);
         var read = try db.core.store.beginReadTxn();

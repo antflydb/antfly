@@ -1220,6 +1220,7 @@ const EnrichmentAppendContext = struct {
     identity_visibility: ?*db_core.IdentityVisibilityState = null,
     cache_source: ?resolution_runtime_mod.CandidateSource = null,
     resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
+    resolution_encoding_admission: @import("artifact_publication_resolution.zig").EncodingAdmission = .{},
     promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
 
     fn batchContext(self: *const EnrichmentAppendContext) BatchExecutionContext {
@@ -6584,6 +6585,7 @@ pub const DB = struct {
         const resources = self.core.batchExecutionResources();
         const context_value: EnrichmentAppendContext = .{
             .cache_source = self.resolution_candidate_source,
+            .resolution_encoding_admission = .{ .clock = self.backend_runtime.monotonicClock() },
             .alloc = self.runtime_alloc,
             .root_incarnation = self.root_incarnation,
             .artifact_publication_dispatcher = self.local_execution.artifact_publication_dispatcher,
@@ -27354,7 +27356,7 @@ pub const DB = struct {
             } else {
                 // Never drain a producer while the distributed cohort freezes
                 // replay. Admission must converge before capturing fences.
-                if (selected_indexes == null or selected_indexes.?.len != 0) if (self.enrichment_runtime) |runtime| try runtime.requireHealthyForQueryCapture();
+                if (selected_indexes == null or selected_indexes.?.len != 0) if (self.enrichment_runtime) |runtime| try runtime.requireHealthyForQueryCapture(true);
                 const managed = try self.core.managedIndexes(self.alloc);
                 defer {
                     for (managed) |index| self.alloc.free(@constCast(index.name));
@@ -37697,7 +37699,7 @@ pub const DB = struct {
         if (fence.owner != @as(*const anyopaque, self) or !fence.primary.active or !fence.replay.active or fence.primary.admission != self.core.snapshot_admission or fence.replay.admission != self.core.snapshot_replay_admission) return error.CypherSnapshotRequired;
         try cancellation.check();
         try self.enforcePortableRuntimeGate();
-        if (names.len != 0) if (self.enrichment_runtime) |runtime| try runtime.requireHealthyForQueryCapture();
+        if (names.len != 0) if (self.enrichment_runtime) |runtime| try runtime.requireHealthyForQueryCapture(true);
         const target = self.currentMaintenanceTargetSequence();
         for (names) |name| if (try self.core.loadAppliedSequence(alloc, name) < target) return error.CypherSnapshotNotReady;
         if (self.loadIndexRepairState(alloc)) |value| {
@@ -42308,7 +42310,7 @@ pub const DB = struct {
                 // request retries before reading already-visible documents.
                 // Replay/apply fences below exclude publication while pinning;
                 // derived indexes still catch up to this exact primary cut.
-                try runtime.requireHealthyForQueryCapture();
+                try runtime.requireHealthyForQueryCapture(completion != .published_requests);
             }
             try self.runDerivedUntilWithVisibilityWait(stable_target, wait);
 
@@ -67706,7 +67708,8 @@ const NoopResolutionHandoffPublishHook = struct {
 
 fn processOrderedResolutions(ctx_ptr: *anyopaque, alloc: Allocator, resolvers: []const resolution_runtime_mod.ResolverConfig, store: resolver_lib.ArtifactStore, provider: ?resolver_lib.CandidateProvider, changed_keys: []const []const u8, candidate_source: ?resolution_runtime_mod.CandidateSource, embedder: ?embedder_mod.DenseEmbedder) !bool {
     const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
-    return @import("artifact_publication_resolution.zig").process(alloc, ctx.store, ctx.artifact_publication_dispatcher, resolvers, store, provider, changed_keys, candidate_source, embedder);
+    defer if (ctx.resolution_runtime) |runtime| runtime.notePublicationLimit(ctx.resolution_encoding_admission.hard_limit_blocked);
+    return @import("artifact_publication_resolution.zig").process(alloc, ctx.store, ctx.artifact_publication_dispatcher, ctx.index_manager.resource_manager, &ctx.resolution_encoding_admission, resolvers, store, provider, changed_keys, candidate_source, embedder);
 }
 
 fn appendResolutionRecord(ctx_ptr: *anyopaque, write: resolution_runtime_mod.RecordWrite) !u64 {
@@ -159313,7 +159316,7 @@ test "db graph fact orphan stages recover after reopen with no replay debt" {
     defer tmp.cleanup();
     const prefix = "\x00\x00__graph_stage__:v1:";
     {
-        var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        var db = try DB.open(alloc, tmp.path(), .{ .identity_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .start_optional_runtimes = false, .start_index_workers = false });
         defer db.close();
         // More than two pages of abandoned preparations from earlier owners.
         // The legacy stage format has no manifest and remains recoverable.
@@ -159327,13 +159330,37 @@ test "db graph fact orphan stages recover after reopen with no replay debt" {
         try batch.put("unrelated", "keep");
         try batch.commit();
     }
-    var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    var db = try DB.open(alloc, tmp.path(), .{ .identity_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .start_optional_runtimes = false, .start_index_workers = false });
     defer db.close();
     var config: enrichment_runtime_mod.Config = .{ .enable_without_producers = true };
     try db.initOptionalEnrichmentRuntime(&config);
     const runtime = db.enrichment_runtime.?;
     const before = runtime.stats();
     try std.testing.expect(runtime.graph_stage_recovery_pending);
+    try std.testing.expectError(error.EnrichmentRetryInProgress, runtime.requireHealthyForQueryCapture(true));
+    {
+        const cut_id: [64]u8 = @splat('a');
+        var retained = try db.openQueryCut(.{
+            .id = &cut_id,
+            .table_id = 1,
+            .expires_ms = @import("native_query_cut.zig").nowMs() + 60_000,
+            .create = true,
+        }, .none);
+        defer retained.close();
+        try std.testing.expect(retained.hasRetainedQueryCut());
+        try std.testing.expect(runtime.graph_stage_recovery_pending);
+    }
+    {
+        runtime.worker_failed = true;
+        defer runtime.worker_failed = false;
+        const cut_id: [64]u8 = @splat('b');
+        try std.testing.expectError(error.EnrichmentWorkerFailed, db.openQueryCut(.{
+            .id = &cut_id,
+            .table_id = 1,
+            .expires_ms = @import("native_query_cut.zig").nowMs() + 60_000,
+            .create = true,
+        }, .none));
+    }
     try std.testing.expectError(error.EnrichmentWaitTimeout, runtime.catchUpUntilWithVisibilityDeadline(0, .{}, 0));
     try std.testing.expect(runtime.graph_stage_recovery_pending);
     try runtime.catchUpUntil(0);
