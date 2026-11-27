@@ -1311,11 +1311,17 @@ implementation, deletion and qualification gates.
 | Ownership and deletion | Partial | Nine execution source moves, removal of the 34-line legacy ONNX KV file and 24-line CUDA coverage wrapper, and removal of direct Metal frame-view, projection-slot and vision-workspace wrappers. The remaining compatibility owners retain the deletion gates in the preceding table. |
 | Common telemetry | Partial | Invocation reports distinguish gather transfers and ordering, CUDA audio learning and replay outcomes, and actual workspace bindings. The Metal audio selector uses completed GPU timing through existing frame retirement. Cross-provider lifetime attribution and coverage of opaque and pending routes remain open. |
 
-Relative to merged main, Git reports 106 added paths, 276 modified paths,
-ten rename matches and one deletion. The match from the old CUDA coverage
-wrapper to a new GLiNER test reflects shared boilerplate. The provider
-check moved into `device_owned_coverage.zig`. File counts include generated
-copies and artifacts. They do not measure authored deletions.
+At `f61c0c11f4`, a rename-aware source diff against merged main
+`4951ca13f9` shows 11,153 removed and 51,938 added lines across non-renamed
+inference source files. Ten rename matches contribute another 263 removed
+and 473 added lines of edits. These figures cover Zig, Objective-C, Metal,
+C headers and source, and CUDA source under `zig/pkg/inference/src`.
+They include inline tests and exclude PTX, binary artifacts, and
+`generated/` and `artifacts/` paths. PTX accounts for a separate 18,857
+removed and 59,118 added lines. The match from the old CUDA coverage
+wrapper to a new GLiNER test reflects shared boilerplate. The provider check
+moved into `device_owned_coverage.zig`. These diff counts describe the
+branch footprint. The ownership rows above identify eliminated code paths.
 
 Current scoped serving evidence includes Spark Whisper multi-window,
 EmbeddingGemma 2 text and two-clip audio, LightOnOCR, GLiNER2.5, Qwen3,

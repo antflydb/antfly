@@ -443,8 +443,9 @@ test "uniform report retains bounded CUDA decoder workspace after completed publ
         var nested: observation.KernelScope = undefined;
         nested.begin();
         observation.cudaDecoderDeclined(.admission_or_revalidation);
+        observation.cudaDecoderDeclined(.workspace_admission);
         _ = nested.finish();
-        try std.testing.expectEqualDeep(observation.CudaDecoderDeclines{ .admission_or_revalidation = 1 }, nested.cuda_decoder_declines.?);
+        try std.testing.expectEqualDeep(observation.CudaDecoderDeclines{ .admission_or_revalidation = 1, .workspace_admission = 1 }, nested.cuda_decoder_declines.?);
     }
     observation.cudaDecoderWorkspace(workspace);
     _ = scope.finish();
@@ -452,7 +453,7 @@ test "uniform report retains bounded CUDA decoder workspace after completed publ
     sample.recordKernelInterval(&scope);
     source.publish(.{ .runtime = sample.since(.{}) });
     try std.testing.expectEqual(workspace, source.snapshot().?.report.?.cuda_decoder_workspace.?);
-    try std.testing.expectEqualDeep(observation.CudaDecoderDeclines{ .missing_kv_binding = 1, .admission_or_revalidation = 1 }, source.snapshot().?.report.?.cuda_decoder_declines.?);
+    try std.testing.expectEqualDeep(observation.CudaDecoderDeclines{ .missing_kv_binding = 1, .admission_or_revalidation = 1, .workspace_admission = 1 }, source.snapshot().?.report.?.cuda_decoder_declines.?);
 }
 
 test "uniform report separates planned literal publication from opaque Metal output copies" {

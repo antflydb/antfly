@@ -512,8 +512,10 @@ pub const CudaDecoderDeclines = struct {
     incompatible_layer_state: u64 = 0,
     unstable_recurrent_state: u64 = 0,
     admission_or_revalidation: u64 = 0,
+    workspace_admission: u64 = 0,
 
     pub const Reason = @import("std").meta.FieldEnum(CudaDecoderDeclines);
+    pub const Counts = [@typeInfo(Reason).@"enum".fields.len]u64;
 };
 
 pub inline fn cudaDecoderDeclined(reason: CudaDecoderDeclines.Reason) void {

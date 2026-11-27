@@ -2594,7 +2594,7 @@ pub const NativeGenerationPipeline = struct {
     gpu_token_burst_lighton_decode: bool = false,
     lighton_cuda_execution_id: u64 = 0,
     lighton_graph_attempts: u64 = 0,
-    lighton_graph_declines: [8]u64 = @splat(0),
+    lighton_graph_declines: @import("../execution/runtime_observation.zig").CudaDecoderDeclines.Counts = @splat(0),
     gpu_token_burst_width: u8 = 2,
     packed_prefill_items: u8 = 1,
     /// Zero retains whole-prefix prefill; captured by the owning reader epoch.

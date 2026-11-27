@@ -146,13 +146,13 @@ fn observeNativeStateOwnership(context: *const execution.Context, decode: *const
     if (decode.qwen35_linear_batch) |caches| for (caches) |maybe| if (maybe) |cache| cache.registerOwnershipObservation();
 }
 
-pub fn endDecodeEpoch(cb: *const ComputeBackend, execution_id: u64, attempts: u64, declines: [8]u64) void {
+pub fn endDecodeEpoch(cb: *const ComputeBackend, execution_id: u64, attempts: u64, declines: observation.CudaDecoderDeclines.Counts) void {
     return endDecodeEpochUsing(cb, execution_id, attempts, declines, null);
 }
-pub fn endDecodeEpochWithCleanup(cb: *const ComputeBackend, execution_id: u64, attempts: u64, declines: [8]u64, current: @import("cleanup_context.zig").Context) void {
+pub fn endDecodeEpochWithCleanup(cb: *const ComputeBackend, execution_id: u64, attempts: u64, declines: observation.CudaDecoderDeclines.Counts, current: @import("cleanup_context.zig").Context) void {
     return endDecodeEpochUsing(cb, execution_id, attempts, declines, current);
 }
-fn endDecodeEpochUsing(cb: *const ComputeBackend, execution_id: u64, attempts: u64, declines: [8]u64, current: ?@import("cleanup_context.zig").Context) void {
+fn endDecodeEpochUsing(cb: *const ComputeBackend, execution_id: u64, attempts: u64, declines: observation.CudaDecoderDeclines.Counts, current: ?@import("cleanup_context.zig").Context) void {
     if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3") and execution_id != 0 and
         platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_MODEL_GRAPH"))
         std.debug.print("LIGHTONOCR3 cuda_model_graph_attempts={d} declines={any}\n", .{ attempts, declines });
@@ -186,7 +186,7 @@ pub const Executor = struct {
     packed_shared_frame: bool = false,
     prepared_qwen_prefill_chunk_rows: u16 = 0,
     lighton_graph_attempts: u64 = 0,
-    lighton_graph_declines: [8]u64 = @splat(0),
+    lighton_graph_declines: observation.CudaDecoderDeclines.Counts = @splat(0),
     replay_last_logits_fallbacks: u64 = 0,
     packed_host_preparations: u64 = 0,
     tail_steps: usize = 0,
@@ -1017,7 +1017,8 @@ pub const Executor = struct {
             }
         };
         var outside = KvOutside{ .mutex = kv_lock, .held = &kv_held };
-        if (!try preparation.prepare_fn(preparation.ptr, self.context.cb, descriptor, &funding_phase, .{ .ptr = &outside, .release_fn = KvOutside.release }, self.context.execution_control orelse .{})) return self.declineLightOnGraph(.admission_or_revalidation);
+        if (!try preparation.prepare_fn(preparation.ptr, self.context.cb, descriptor, &funding_phase, .{ .ptr = &outside, .release_fn = KvOutside.release }, self.context.execution_control orelse .{}))
+            return self.declineLightOnGraph(if (funding_phase.admission_pressure != null) .workspace_admission else .admission_or_revalidation);
         if (!kv_held) {
             platform.sync.lockYielding(kv_lock);
             kv_held = true;
