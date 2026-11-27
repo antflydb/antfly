@@ -2418,7 +2418,42 @@ pub const PersistentIndex = struct {
         defer txn.abort();
         var plan = try self.planTipRefresh(&txn);
         defer plan.deinit(self.alloc);
-        try self.applyTipRefresh(&plan);
+        _ = try self.applyTipRefresh(&plan);
+    }
+
+    pub const PreparedChangeRefresh = native_catalog_backend.Backend.SyncedChanges;
+
+    /// The records other writers committed to this index since its mirror
+    /// last synced, read without any lock of this index: a refresh sized by
+    /// the change. Null when the history is incomplete or this index keeps
+    /// none, so only a refresh from the tip can bring it current.
+    pub fn prepareRefreshFromChanges(self: *PersistentIndex) !?PreparedChangeRefresh {
+        if (!self.versioned or self.inline_in_flight.load(.acquire) != 0) return null;
+        const backend = switch (self.main_store_owner) {
+            .native_catalog => |backend| backend,
+            else => return null,
+        };
+        return try backend.changesSinceSync(self.alloc);
+    }
+
+    pub const ChangeRefreshOutcome = enum { installed, stale, needs_tip };
+
+    /// Applies prepared changes if nothing reached the mirror since they
+    /// were read. The caller holds the index's apply lock, as for
+    /// `installPreparedRefreshFromTip`.
+    pub fn installRefreshFromChanges(self: *PersistentIndex, changes: *PreparedChangeRefresh) !ChangeRefreshOutcome {
+        const backend = switch (self.main_store_owner) {
+            .native_catalog => |backend| backend,
+            else => return .needs_tip,
+        };
+        if (backend.state_epoch.load(.acquire) != changes.mirror_epoch) return .stale;
+        self.refreshPeerDelta(changes.mutations) catch |err| switch (err) {
+            // Checked before anything is applied.
+            error.UnsupportedRefresh => return .needs_tip,
+            else => return err,
+        };
+        backend.noteSyncedThrough(changes.through);
+        return .installed;
     }
 
     /// A refresh from the tip read and planned without any of this index's
@@ -2458,7 +2493,10 @@ pub const PersistentIndex = struct {
         errdefer view_store.deinit();
         var txn = try MainTxn.open(&view_store, true);
         defer txn.abort();
-        const plan = try self.planTipRefresh(&txn);
+        var plan = try self.planTipRefresh(&txn);
+        errdefer plan.deinit(self.alloc);
+        if (plan.removed.items.len != 0 or plan.added.items.len != 0)
+            plan.replacement = try self.writer.prepareSegmentsAgainst(plan.snapshot, self.alloc, plan.removed.items, plan.added.items);
         return .{ .view = view, .view_store = view_store, .mirror_epoch = mirror_epoch, .plan = plan };
     }
 
@@ -2480,8 +2518,9 @@ pub const PersistentIndex = struct {
             if (current != prepared.plan.snapshot) return false;
         }
         if (!backend.adoptTipView(prepared.view, prepared.mirror_epoch)) return false;
-        try self.applyTipRefresh(&prepared.plan);
-        return true;
+        // Writers publish under `lockStorage`, held here, so the snapshot
+        // checked above is still current and this publishes.
+        return try self.applyTipRefresh(&prepared.plan);
     }
 
     /// What a refresh from the tip changes in the writer, planned against
@@ -2498,8 +2537,13 @@ pub const PersistentIndex = struct {
         /// at its position in the published snapshot.
         retained: std.ArrayListUnmanaged(index_mod.RetainedDeletion) = .empty,
         next_segment_id: ?u64 = null,
+        /// The replacement snapshot, with its segment metadata and field
+        /// statistics, built against `snapshot` without the writer lock
+        /// (`prepareRefreshFromTip`). Null for a refresh applied in place.
+        replacement: ?index_mod.IndexWriter.PreparedSegmentReplacement = null,
 
         pub fn deinit(self: *TipRefreshPlan, alloc: Allocator) void {
+            if (self.replacement) |*prepared| prepared.abort();
             for (self.added.items) |*replacement| {
                 if (replacement.prepared_reader) |*reader| reader.deinit();
                 if (replacement.deleted_owned) |*bitmap| bitmap.deinit();
@@ -2551,10 +2595,12 @@ pub const PersistentIndex = struct {
                 removed_before += 1;
                 continue;
             }
+            // Reserved first: the bitmap is owned by nothing until it is in
+            // the plan.
+            try plan.retained.ensureUnusedCapacity(self.alloc, 1);
             const derived = try derivedDeletionBitmap(self.writer.alloc, segment.reader.encoded(), &dead);
             if (derived == null and segment.shared.deleted_count.load(.acquire) == 0) continue;
             var bitmap = derived orelse roaring.RoaringBitmap.init(self.writer.alloc);
-            try plan.retained.ensureUnusedCapacity(self.alloc, 1);
             const item = index_mod.prepareRetainedDeletion(self.alloc, segment, i - removed_before, bitmap) catch |err| {
                 bitmap.deinit();
                 return err;
@@ -2589,8 +2635,16 @@ pub const PersistentIndex = struct {
 
     /// Under `lockStorage`: one publication, then one pass over the
     /// retained segments' prepared deletions.
-    fn applyTipRefresh(self: *PersistentIndex, plan: *TipRefreshPlan) !void {
-        if (plan.removed.items.len != 0 or plan.added.items.len != 0) {
+    fn applyTipRefresh(self: *PersistentIndex, plan: *TipRefreshPlan) !bool {
+        if (plan.replacement) |*prepared| {
+            if (!prepared.publishIfCurrent()) {
+                plan.replacement = null;
+                return false;
+            }
+            plan.replacement = null;
+            // Published: the writer owns the data, readers and deletions.
+            plan.added.clearRetainingCapacity();
+        } else if (plan.removed.items.len != 0 or plan.added.items.len != 0) {
             var prepared = try self.writer.prepareSegmentsManyData(plan.removed.items, plan.added.items);
             defer prepared.abort();
             prepared.publish();
@@ -2600,6 +2654,7 @@ pub const PersistentIndex = struct {
         self.writer.installRetainedDeletions(plan.retained.items);
         if (plan.next_segment_id) |next| self.writer.next_segment_id = @max(self.writer.next_segment_id, next);
         self.version_locations.clear(self.alloc);
+        return true;
     }
 
     pub fn sync(self: *PersistentIndex, force: bool) !void {
@@ -6748,6 +6803,75 @@ pub const InlinePublicationTestSink = struct {
     allocator: Allocator,
 
     full_loads: usize = 0,
+    /// A change history, like Lite's redo log: each record a commit
+    /// changed, with its sequence and the handle that wrote it (0: another
+    /// process). Kept only once a `Feed` sink is taken.
+    changes: std.ArrayListUnmanaged(struct { sequence: u64, origin: u32, namespace: ?[]u8, key: []u8 }) = .empty,
+    sequence: u64 = 0,
+    reclaimed_through: u64 = 0,
+    writing_origin: u32 = 0,
+    feeds: bool = false,
+
+    /// One writer's handle on a sink with a change history.
+    pub const Feed = struct {
+        sink: *InlinePublicationTestSink,
+        origin: u32,
+
+        pub fn catalogSink(self: *Feed) NativeCatalogSink {
+            self.sink.feeds = true;
+            return .{
+                .ptr = self,
+                .submit = feedSubmit,
+                .loadAllAlloc = feedLoadAll,
+                .loadOneAlloc = feedLoadOne,
+                .loadTipAlloc = feedLoadTip,
+                .resolves = true,
+                .committedSequence = feedCommitted,
+                .changedKeysBetween = feedChanged,
+            };
+        }
+
+        fn of(ptr: *anyopaque) *InlinePublicationTestSink {
+            const self: *Feed = @ptrCast(@alignCast(ptr));
+            return self.sink;
+        }
+
+        fn feedSubmit(ptr: *anyopaque, scope: []const u8, mutations: []const native_catalog_backend.Mutation, durable: bool) anyerror!void {
+            const self: *Feed = @ptrCast(@alignCast(ptr));
+            self.sink.writing_origin = self.origin;
+            defer self.sink.writing_origin = 0;
+            try resolvingSubmit(self.sink, scope, mutations, durable);
+        }
+
+        fn feedLoadAll(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]native_catalog_backend.Entry {
+            return loadAllAlloc(of(ptr), allocator, scope);
+        }
+
+        fn feedLoadOne(ptr: *anyopaque, allocator: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) anyerror!?[]u8 {
+            return loadOneAlloc(of(ptr), allocator, scope, namespace, key);
+        }
+
+        fn feedLoadTip(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]native_catalog_backend.Entry {
+            return loadTipAlloc(of(ptr), allocator, scope);
+        }
+
+        fn feedCommitted(ptr: *anyopaque) u64 {
+            return of(ptr).sequence;
+        }
+
+        fn feedChanged(ptr: *anyopaque, allocator: Allocator, scope: []const u8, since: u64, through: u64) anyerror!?[]native_catalog_backend.Mutation {
+            _ = scope;
+            const self: *Feed = @ptrCast(@alignCast(ptr));
+            const feed = self.sink;
+            if (feed.reclaimed_through > since) return null;
+            var out = std.ArrayListUnmanaged(native_catalog_backend.Mutation).empty;
+            for (feed.changes.items) |change| {
+                if (change.sequence <= since or change.sequence > through or change.origin == self.origin) continue;
+                try out.append(allocator, .{ .namespace = change.namespace, .key = change.key });
+            }
+            return try out.toOwnedSlice(allocator);
+        }
+    };
 
     fn findIndex(self: *@This(), namespace: ?[]const u8, key: []const u8) ?usize {
         for (self.entries.items, 0..) |e, i| {
@@ -6762,6 +6886,15 @@ pub const InlinePublicationTestSink = struct {
         _ = scope;
         _ = durable;
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.feeds and mutations.len != 0) {
+            self.sequence += 1;
+            for (mutations) |m| try self.changes.append(self.allocator, .{
+                .sequence = self.sequence,
+                .origin = self.writing_origin,
+                .namespace = if (m.namespace) |n| try self.allocator.dupe(u8, n) else null,
+                .key = try self.allocator.dupe(u8, m.key),
+            });
+        }
         for (mutations) |m| {
             if (m.is_delete) {
                 if (self.findIndex(m.namespace, m.key)) |i| {
@@ -6839,7 +6972,7 @@ pub const InlinePublicationTestSink = struct {
     }
 
     /// A commit by another process, straight to the "file".
-    fn foreignPut(self: *@This(), namespace: []const u8, key: []const u8, value: []const u8) !void {
+    pub fn foreignPut(self: *@This(), namespace: []const u8, key: []const u8, value: []const u8) !void {
         try submit(self, "", &.{.{ .namespace = namespace, .key = key, .value = value }}, true);
     }
 
@@ -6885,6 +7018,11 @@ pub const InlinePublicationTestSink = struct {
             allocator.free(e.value);
         }
         self.entries.deinit(allocator);
+        for (self.changes.items) |change| {
+            if (change.namespace) |n| allocator.free(n);
+            allocator.free(change.key);
+        }
+        self.changes.deinit(allocator);
     }
 };
 
@@ -9949,6 +10087,109 @@ test "persistent index installs a prepared tip refresh only while nothing moved"
     const snapshot = index.writer.acquireSnapshot();
     defer snapshot.release();
     try std.testing.expectEqual(@as(usize, 2), snapshot.segments.len);
+}
+
+// A refresh reads only the records other writers changed since the mirror
+// last synced: no full load, and work sized by the change. A publication
+// after the read makes it stale; history reclaimed past the sync point
+// leaves only the refresh from the tip.
+test "persistent index refreshes from changed records and falls back to the tip" {
+    const alloc = std.testing.allocator;
+    var sink = InlinePublicationTestSink{ .allocator = alloc };
+    defer sink.deinit(alloc);
+    var own_feed: InlinePublicationTestSink.Feed = .{ .sink = &sink, .origin = 1 };
+    var peer_feed: InlinePublicationTestSink.Feed = .{ .sink = &sink, .origin = 2 };
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+    var peer_path_buf: [256]u8 = undefined;
+    const peer_path = try std.fmt.bufPrintSentinel(&peer_path_buf, "{s}-peer", .{path}, 0);
+    defer cleanupPersistDir(peer_path.ptr);
+    var index = try PersistentIndex.open(alloc, .{ .path = path, .main_backend = .native_catalog, .main_native_catalog_sink = own_feed.catalogSink() });
+    defer index.close();
+    var peer = try PersistentIndex.open(alloc, .{ .path = peer_path, .main_backend = .native_catalog, .main_native_catalog_sink = peer_feed.catalogSink() });
+    defer peer.close();
+    try std.testing.expect(index.versioned and peer.versioned);
+
+    const first = try buildSimpleSegment(alloc, "doc:a", "alpha");
+    defer alloc.free(first);
+    try peer.indexSegment(first);
+    const loads = sink.full_loads;
+    {
+        var changes = (try index.prepareRefreshFromChanges()).?;
+        defer changes.deinit();
+        try std.testing.expect(changes.mutations.len != 0);
+        try std.testing.expectEqual(PersistentIndex.ChangeRefreshOutcome.installed, try index.installRefreshFromChanges(&changes));
+    }
+    {
+        const snap = index.writer.acquireSnapshot();
+        defer snap.release();
+        try std.testing.expectEqual(@as(usize, 1), snap.segments.len);
+        try std.testing.expectEqual(@as(u32, 1), snap.liveDocCount());
+    }
+
+    // A rewrite: the first copy becomes dead.
+    const second = try buildSimpleSegment(alloc, "doc:a", "beta");
+    defer alloc.free(second);
+    try peer.indexSegment(second);
+    {
+        var changes = (try index.prepareRefreshFromChanges()).?;
+        defer changes.deinit();
+        try std.testing.expectEqual(PersistentIndex.ChangeRefreshOutcome.installed, try index.installRefreshFromChanges(&changes));
+    }
+    {
+        const snap = index.writer.acquireSnapshot();
+        defer snap.release();
+        try std.testing.expectEqual(@as(usize, 2), snap.segments.len);
+        try std.testing.expectEqual(@as(u32, 1), snap.liveDocCount());
+    }
+    // Nothing changed since: an empty refresh.
+    {
+        var changes = (try index.prepareRefreshFromChanges()).?;
+        defer changes.deinit();
+        try std.testing.expectEqual(@as(usize, 0), changes.mutations.len);
+        try std.testing.expectEqual(PersistentIndex.ChangeRefreshOutcome.installed, try index.installRefreshFromChanges(&changes));
+    }
+    try std.testing.expectEqual(loads, sink.full_loads);
+
+    const third = try buildSimpleSegment(alloc, "doc:b", "gamma");
+    defer alloc.free(third);
+    try peer.indexSegment(third);
+    {
+        var stale = (try index.prepareRefreshFromChanges()).?;
+        defer stale.deinit();
+        const own = try buildSimpleSegment(alloc, "doc:own", "own");
+        defer alloc.free(own);
+        try index.indexSegment(own);
+        try std.testing.expectEqual(PersistentIndex.ChangeRefreshOutcome.stale, try index.installRefreshFromChanges(&stale));
+    }
+    // The history the mirror needs is gone: only the tip can refresh it.
+    sink.reclaimed_through = sink.sequence;
+    try std.testing.expect((try index.prepareRefreshFromChanges()) == null);
+    {
+        var prepared = try index.prepareRefreshFromTip();
+        defer prepared.deinit(alloc);
+        try std.testing.expect(try index.installPreparedRefreshFromTip(&prepared));
+    }
+    {
+        const snap = index.writer.acquireSnapshot();
+        defer snap.release();
+        try std.testing.expectEqual(@as(usize, 4), snap.segments.len);
+        try std.testing.expectEqual(@as(u32, 3), snap.liveDocCount());
+    }
+    // The full load synced the mirror: later changes refresh by record.
+    const fourth = try buildSimpleSegment(alloc, "doc:c", "delta");
+    defer alloc.free(fourth);
+    try peer.indexSegment(fourth);
+    var changes = (try index.prepareRefreshFromChanges()).?;
+    defer changes.deinit();
+    // The records of one publication, not the index's.
+    try std.testing.expect(changes.mutations.len != 0 and changes.mutations.len < sink.entries.items.len);
+    try std.testing.expectEqual(PersistentIndex.ChangeRefreshOutcome.installed, try index.installRefreshFromChanges(&changes));
+    const snap = index.writer.acquireSnapshot();
+    defer snap.release();
+    try std.testing.expectEqual(@as(usize, 5), snap.segments.len);
+    try std.testing.expectEqual(@as(u32, 4), snap.liveDocCount());
 }
 
 test "persistent index refreshed after a peer merge plans from the peer's output" {

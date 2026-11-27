@@ -8917,6 +8917,15 @@ test "capi native text merge drain waits for a required tip refresh" {
     _ = entry.persistent.inline_in_flight.fetchSub(1, .acq_rel);
     in_flight = false;
     entry.merge_retry_after_ns.store(0, .release);
+    // A snapshot capture holds the replay lease: the drain gives up at its
+    // deadline rather than waiting the capture out.
+    {
+        var capture = db.core.snapshot_replay_admission.acquireCapture();
+        defer capture.release();
+        const blocked: @import("../storage/db/derived/derived_executor.zig").VisibilityWait = .{ .deadline_ns = clock.nowRealtimeNs() + 50 * std.time.ns_per_ms, .clock = clock };
+        try std.testing.expectError(error.EnrichmentWaitTimeout, db.drainScheduledTextMergesWithin(blocked));
+        try std.testing.expect(entry.tipRefreshRequired());
+    }
     // A spent budget starts no pass, even with the refresh now able to run.
     const spent: @import("../storage/db/derived/derived_executor.zig").VisibilityWait = .{ .deadline_ns = clock.nowRealtimeNs(), .clock = clock };
     try std.testing.expectError(error.EnrichmentWaitTimeout, db.drainScheduledTextMergesWithin(spent));

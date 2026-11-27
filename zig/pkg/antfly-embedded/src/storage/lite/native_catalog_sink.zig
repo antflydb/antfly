@@ -262,7 +262,53 @@ pub const Sink = struct {
             .submitDeferred = submitDeferred,
             .pauseMaintenance = pauseMaintenance,
             .resumeMaintenance = resumeMaintenance,
+            .committedSequence = committedSequence,
+            .changedKeysBetween = changedKeysBetween,
         };
+    }
+
+    fn committedSequence(ptr: *anyopaque) u64 {
+        const self: *Sink = @ptrCast(@alignCast(ptr));
+        if (self.store.file.redo == null) return 0;
+        return self.store.file.committedSequence();
+    }
+
+    /// From the redo log's change history: complete while nothing past
+    /// `since` has been reclaimed or folded into the base. A fold (this
+    /// process's or a peer's adopted with its checkpoint) can carry commits
+    /// this process never replayed, so it needs a full load, as an in-place
+    /// connection refresh does. This handle's own commits are excluded; its
+    /// mirror applied them as it made them.
+    fn changedKeysBetween(ptr: *anyopaque, allocator: Allocator, scope: []const u8, since: u64, through: u64) anyerror!?[]native_catalog_backend.Mutation {
+        const self: *Sink = @ptrCast(@alignCast(ptr));
+        const file = &self.store.file;
+        const redo = if (file.redo) |*redo| redo else return null;
+        if (@max(redo.checkpoint_sequence, file.activeCheckpoint().redo_folded_through) > since) return null;
+        const shared = redo.shared;
+        const io = file.runtime();
+        const keys = shared.changedKeysBetweenAlloc(allocator, io, @backingInt(native.OverlayRoot.index), since, through, redo.origin) catch |err| switch (err) {
+            error.ReadSnapshotReclaimed => return null,
+            else => return err,
+        };
+        defer {
+            for (keys) |key| allocator.free(key);
+            allocator.free(keys);
+        }
+        var result = std.ArrayListUnmanaged(native_catalog_backend.Mutation).empty;
+        errdefer {
+            for (result.items) |entry| {
+                if (entry.namespace) |namespace| allocator.free(namespace);
+                allocator.free(entry.key);
+            }
+            result.deinit(allocator);
+        }
+        for (keys) |key| {
+            try result.ensureUnusedCapacity(allocator, 1);
+            const entry = (try decodeAlloc(allocator, scope, key, "")) orelse continue;
+            allocator.free(entry.value);
+            result.appendAssumeCapacity(.{ .namespace = entry.namespace, .key = entry.key });
+        }
+        return try result.toOwnedSlice(allocator);
     }
 
     /// perf/lwa-maint-serialize: see `native_catalog_backend.Sink
@@ -554,6 +600,75 @@ test "native catalog sink commits scoped graph records as one member" {
         defer a.free(value);
         try std.testing.expectEqualStrings(batch.mutations[0].value, value);
     }
+}
+
+// The change feed names another handle's records of one scope, never this
+// handle's own, and gives none once a fold may have carried commits past
+// the history.
+test "native catalog sink change feed lists other writers' records until a fold" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/ncat-feed.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try docstore.Store.createWithOptions(a, path, .{ .use_redo_log = true, .io = std.testing.io });
+    defer store.close();
+    var sink: Sink = .{ .store = &store, .allocator = a };
+    const catalog = sink.sink();
+    const since = catalog.committedSequence.?(catalog.ptr);
+    const changed = catalog.changedKeysBetween.?;
+
+    try catalog.submit(catalog.ptr, "/a", &.{.{ .namespace = "meta", .key = "own", .value = "1" }}, true);
+    {
+        const through = catalog.committedSequence.?(catalog.ptr);
+        try std.testing.expect(through > since);
+        const keys = (try changed(catalog.ptr, a, "/a", since, through)).?;
+        defer a.free(keys);
+        try std.testing.expectEqual(@as(usize, 0), keys.len);
+    }
+
+    // Another handle on the file commits to both scopes.
+    const own_origin = store.file.redo.?.origin;
+    store.file.redo.?.origin = own_origin +% 1;
+    try catalog.submit(catalog.ptr, "/a", &.{
+        .{ .namespace = "segments", .key = "\x00\x01" ++ "x", .value = "s" },
+        .{ .namespace = null, .key = "plain", .value = "p" },
+    }, true);
+    try catalog.submit(catalog.ptr, "/ab", &.{.{ .namespace = "meta", .key = "other-scope", .value = "o" }}, true);
+    store.file.redo.?.origin = own_origin;
+    const through = catalog.committedSequence.?(catalog.ptr);
+    {
+        const keys = (try changed(catalog.ptr, a, "/a", since, through)).?;
+        defer {
+            for (keys) |key| {
+                if (key.namespace) |namespace| a.free(namespace);
+                a.free(key.key);
+            }
+            a.free(keys);
+        }
+        try std.testing.expectEqual(@as(usize, 2), keys.len);
+        var named = false;
+        var unnamed = false;
+        for (keys) |key| {
+            if (key.namespace) |namespace| {
+                try std.testing.expectEqualStrings("segments", namespace);
+                try std.testing.expectEqualStrings("\x00\x01x", key.key);
+                named = true;
+            } else {
+                try std.testing.expectEqualStrings("plain", key.key);
+                unnamed = true;
+            }
+        }
+        try std.testing.expect(named and unnamed);
+    }
+
+    try store.checkpointRedoLog();
+    try std.testing.expect((try changed(catalog.ptr, a, "/a", since, catalog.committedSequence.?(catalog.ptr))) == null);
+    // From the fold on, the history is complete again.
+    const folded = catalog.committedSequence.?(catalog.ptr);
+    const keys = (try changed(catalog.ptr, a, "/a", folded, folded)).?;
+    defer a.free(keys);
+    try std.testing.expectEqual(@as(usize, 0), keys.len);
 }
 
 test "native catalog sink: a mid-stream index admission is visible to loadAllAlloc before any checkpoint" {

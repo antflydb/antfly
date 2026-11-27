@@ -4117,9 +4117,32 @@ pub const IndexWriter = struct {
         carried_count: usize,
         next_segment_id: u64,
         active: bool = true,
+        /// Prepared under the writer lock, which it still holds. A
+        /// preparation against a pinned snapshot (`prepareSegmentsAgainst`)
+        /// holds no lock and publishes only through `publishIfCurrent`.
+        locked: bool = true,
+        /// The snapshot an unlocked preparation was built from.
+        base: ?*const IndexSnapshot = null,
+
+        /// Publishes an unlocked preparation if the writer still serves the
+        /// snapshot it was built from; otherwise discards it. The lock is
+        /// held only for the check and the swap.
+        pub fn publishIfCurrent(self: *PreparedSegmentReplacement) bool {
+            std.debug.assert(self.active and !self.locked);
+            const writer = self.writer;
+            writer.lockMutex();
+            self.locked = true;
+            if (@atomicLoad(*IndexSnapshot, &writer.current, .acquire) != self.base.?) {
+                self.abort();
+                return false;
+            }
+            self.snapshot.epoch = writer.next_epoch;
+            self.publish();
+            return true;
+        }
 
         pub fn publish(self: *PreparedSegmentReplacement) void {
-            std.debug.assert(self.active);
+            std.debug.assert(self.active and self.locked);
             const writer = self.writer;
             const old = @atomicLoad(*IndexSnapshot, &writer.current, .acquire);
 
@@ -4150,7 +4173,7 @@ pub const IndexWriter = struct {
             self.snapshot.global_total_field_len.deinit(writer.alloc);
             writer.alloc.destroy(self.snapshot);
             if (self.retired.len > 0) self.staging_alloc.free(self.retired);
-            writer.mu.unlock();
+            if (self.locked) writer.mu.unlock();
             self.active = false;
         }
     };
@@ -4914,7 +4937,32 @@ pub const IndexWriter = struct {
 
         self.lockMutex();
         errdefer self.mu.unlock();
+        return try self.buildSegmentReplacement(@atomicLoad(*IndexSnapshot, &self.current, .acquire), scratch_alloc, old_ids, replacements, true);
+    }
 
+    /// `prepareSegmentsManyDataWithScratch` against `base`, a snapshot the
+    /// caller keeps pinned, without the writer lock: the replacement
+    /// snapshot, its segment metadata, layout and field statistics are all
+    /// built here. Publish with `publishIfCurrent`.
+    pub fn prepareSegmentsAgainst(
+        self: *IndexWriter,
+        base: *IndexSnapshot,
+        scratch_alloc: Allocator,
+        old_ids: []const u64,
+        replacements: []ReplacementSegmentData,
+    ) !PreparedSegmentReplacement {
+        if (old_ids.len == 0 and replacements.len == 0) return error.EmptySegmentReplacement;
+        return try self.buildSegmentReplacement(base, scratch_alloc, old_ids, replacements, false);
+    }
+
+    fn buildSegmentReplacement(
+        self: *IndexWriter,
+        old: *IndexSnapshot,
+        scratch_alloc: Allocator,
+        old_ids: []const u64,
+        replacements: []ReplacementSegmentData,
+        locked: bool,
+    ) !PreparedSegmentReplacement {
         const replacement_readers = try scratch_alloc.alloc(segment_mod.SegmentReader, replacements.len);
         var replacement_readers_initialized: usize = 0;
         defer scratch_alloc.free(replacement_readers);
@@ -4930,8 +4978,6 @@ pub const IndexWriter = struct {
             if (replacement.data == .owned_view) replacement_readers[i].postings_loader = replacement.data.owned_view.postings_loader;
             replacement_readers_initialized += 1;
         }
-
-        const old = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
 
         var retiring = std.AutoHashMapUnmanaged(u64, void).empty;
         defer retiring.deinit(scratch_alloc);
@@ -5033,7 +5079,8 @@ pub const IndexWriter = struct {
         new_snap.* = .{
             .alloc = self.alloc,
             .ref_count = 1,
-            .epoch = self.next_epoch,
+            // Unlocked, `publishIfCurrent` stamps it under the lock.
+            .epoch = if (locked) self.next_epoch else 0,
             .segments = new_segments,
             .global_total_field_len = global_field_lens,
             .term_doc_freq_cache_mu = .unlocked,
@@ -5045,7 +5092,8 @@ pub const IndexWriter = struct {
         };
         replacement_readers_initialized = 0;
         cells_created = 0;
-        var next_segment_id = self.next_segment_id;
+        // Publication takes the larger of this and the writer's own.
+        var next_segment_id: u64 = if (locked) self.next_segment_id else 0;
         for (replacements) |replacement| {
             if (!isLevel0SegmentId(replacement.id) and replacement.id >= next_segment_id) next_segment_id = replacement.id + 1;
         }
@@ -5056,6 +5104,8 @@ pub const IndexWriter = struct {
             .staging_alloc = scratch_alloc,
             .carried_count = keep_count,
             .next_segment_id = next_segment_id,
+            .locked = locked,
+            .base = if (locked) null else old,
         };
     }
 
@@ -5817,6 +5867,55 @@ test "retained snapshot remains readable after segment replacement" {
     defer alloc.free(current_results.hits);
     try std.testing.expectEqual(@as(usize, 2), current_results.hits.len);
     try std.testing.expectEqual(@as(usize, 1), writer.snapshot().segments.len);
+}
+
+// A replacement built without the writer lock against a pinned snapshot
+// publishes only while the writer still serves that snapshot.
+test "replacement prepared against a pinned snapshot publishes only if current" {
+    const alloc = std.testing.allocator;
+    const seg1 = try buildTestSegmentWithIds(alloc, &.{
+        .{ .id = "a", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} },
+    });
+    defer alloc.free(seg1);
+    const seg2 = try buildTestSegmentWithIds(alloc, &.{
+        .{ .id = "b", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} },
+    });
+    defer alloc.free(seg2);
+    var writer = try IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg1);
+
+    {
+        const base = writer.acquireSnapshot();
+        defer base.release();
+        var replacements = [_]ReplacementSegmentData{.{ .id = 10, .data = SegmentData.fromOwnedHeap(try alloc.dupe(u8, seg2)) }};
+        defer replacements[0].data.deinit(alloc);
+        var prepared = try writer.prepareSegmentsAgainst(base, alloc, &.{1}, &replacements);
+        defer prepared.abort();
+        // The writer moves on before the replacement publishes.
+        try writer.addSegment(seg2);
+        try std.testing.expect(!prepared.publishIfCurrent());
+        try std.testing.expectEqual(@as(usize, 2), writer.snapshot().segments.len);
+    }
+
+    const base = writer.acquireSnapshot();
+    defer base.release();
+    const epoch = base.epoch;
+    var replacements = [_]ReplacementSegmentData{.{ .id = 10, .data = SegmentData.fromOwnedHeap(try alloc.dupe(u8, seg2)) }};
+    var published = false;
+    defer if (!published) replacements[0].data.deinit(alloc);
+    var prepared = try writer.prepareSegmentsAgainst(base, alloc, &.{1}, &replacements);
+    defer prepared.abort();
+    published = prepared.publishIfCurrent();
+    try std.testing.expect(published);
+    const current = writer.snapshot();
+    try std.testing.expect(current.epoch > epoch);
+    try std.testing.expectEqual(@as(usize, 2), current.segments.len);
+    try std.testing.expectEqual(@as(u64, 10), current.segments[1].id);
+    try std.testing.expect(writer.next_segment_id > 10);
+    const results = try current.search(alloc, "body", &.{"alpha"}, 10);
+    defer alloc.free(results.hits);
+    try std.testing.expectEqual(@as(usize, 2), results.hits.len);
 }
 
 test "empty index search" {
