@@ -232,6 +232,14 @@ pub const Plan = struct {
             if (!self.plan.valid) return error.InvalidExecutionPlan;
         }
 
+        /// Declare scratch that stays live across other scoped allocations.
+        pub fn allocateScratch(self: Builder, bytes: usize) !u15 {
+            if (self.plan.origin != .declared) return error.InvalidExecutionPlan;
+            const slot = self.plan.count;
+            if (!self.plan.allocateOperationScratch(bytes, null)) return error.InvalidExecutionPlan;
+            return @intCast(slot);
+        }
+
         /// An operation submits all of its scratch users before the next
         /// declared event. Its private offsets are relative to this interval.
         pub fn scratchInterval(self: Builder, bytes: usize) !void {
@@ -693,8 +701,16 @@ test "observed operation scratch cannot alias a concurrently live token" {
     observing.recordAllocation(4, 0x2000);
     observing.release(0x1000);
     try std.testing.expect(plan.finish(0x2000));
-    const layout = try plan.layout(0);
-    var bound = try Scope.bind(&plan, layout, 0x3000, layout.bytes);
+
+    var declared: Plan = .{};
+    const builder = try declared.declarationBuilder();
+    const scratch_slot = try builder.allocateScratch(256);
+    const token_slot = try builder.allocate(4);
+    try builder.release(scratch_slot);
+    try builder.finish(token_slot);
+    const layout = try declared.layout(0);
+    try std.testing.expectEqual(try plan.layout(0), layout);
+    var bound = try Scope.bind(&declared, layout, 0x3000, layout.bytes);
     const scratch = try bound.allocateScratch(256);
     const token = try bound.allocate(4);
     try std.testing.expect(token >= scratch + 256);
