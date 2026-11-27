@@ -2128,3 +2128,13 @@ fence polling also preserved exact outputs; A/B p95 was 40.19 versus
 receipts are
 `cf6ba6c36cf25688a69887e2a25a0866242f1ad7118bbb07b6745482557e0c64`
 and `b8d45d3d564e0fad167087efb88b9bcab144c49b42feb0e6665e1d84382403a8`.
+
+The quota and fence experiment passed both focused Metal tests,
+including rejection preserving pending credit and replacement
+reusing it without another charge. The source experiment was
+removed after the latency comparison showed no resolution.
+Forcing all clipped-linear sites to use the fused route with
+storage still enabled changed the two-clip output at the first
+warmup in every forced arm. The forced route fails exact parity;
+its receipt is
+`fa1de179cd234d41b583d04351276e4c98b72d21ec14d61581da873377ffdd5f`.
