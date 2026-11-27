@@ -1436,6 +1436,10 @@ The replay fixture rejected missing and excess input bindings before
 dispatch. The same run covered fresh inputs, held results, and
 recovery after admission pressure.
 
+At `194e567a75`, six scoped Metal tests passed without skips. They
+covered checked attention geometry, rejection of live output aliases,
+reuse of retired handles, and the existing audio replay paths.
+
 This audit reconciles the original `2f2438e67f` implementation review
 against merged main `4951ca13f9` with later evidence. Each serving
 measurement identifies the revision that ran.
