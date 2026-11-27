@@ -1442,6 +1442,12 @@ single-block and multi-block inputs with three physical GEMM submissions
 per input and one workspace binding per sequence. The released grouped
 audio and fused LightOnOCR HTTP replay checks passed in the same run.
 
+At `b50bc84355`, nine host-side bounded decoder tests passed without
+skips. They covered full and tail packet scratch, shared attention and
+recurrent storage, graph reuse under adaptive head admission, rejection
+of scratch overlapping token metadata or using misaligned backing, and
+workspace receipts after publication.
+
 At `ee3629cec0`, five scoped Metal audio tests passed without skips.
 The replay fixture rejected missing and excess input bindings before
 dispatch. The same run covered fresh inputs, held results, and
