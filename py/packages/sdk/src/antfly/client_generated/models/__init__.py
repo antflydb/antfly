@@ -2742,6 +2742,7 @@ from .text_analysis_config_field_analyzers import TextAnalysisConfigFieldAnalyze
 from .text_analysis_config_field_date_time_parsers import TextAnalysisConfigFieldDateTimeParsers
 from .text_analysis_config_token_filters import TextAnalysisConfigTokenFilters
 from .text_analysis_config_tokenizers import TextAnalysisConfigTokenizers
+from .text_box_seed import TextBoxSeed
 from .text_chunk_options import TextChunkOptions
 from .text_content_part import TextContentPart
 from .text_content_part_type import TextContentPartType
@@ -5370,6 +5371,7 @@ __all__ = (
     "TextAnalysisConfigFieldDateTimeParsers",
     "TextAnalysisConfigTokenFilters",
     "TextAnalysisConfigTokenizers",
+    "TextBoxSeed",
     "TextChunkOptions",
     "TextContentPart",
     "TextContentPartType",

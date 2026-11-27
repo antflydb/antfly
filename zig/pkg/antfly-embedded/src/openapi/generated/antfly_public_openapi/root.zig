@@ -405,6 +405,7 @@ pub const TableStatus = types.TableStatus;
 pub const TableStorageSettings = types.TableStorageSettings;
 pub const TableStorageUnreadableError = types.TableStorageUnreadableError;
 pub const TablespaceCatalogRecord = types.TablespaceCatalogRecord;
+pub const TextBoxSeed = types.TextBoxSeed;
 pub const TopologyChangedError = types.TopologyChangedError;
 pub const TransactionBeginRequest = types.TransactionBeginRequest;
 pub const TransactionBeginResponse = types.TransactionBeginResponse;

@@ -9,6 +9,7 @@ from ..models.extraction_unit_seed_page_rotation import ExtractionUnitSeedPageRo
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.text_box_seed import TextBoxSeed
     from ..models.transcript_span_seed import TranscriptSpanSeed
 
 
@@ -30,6 +31,10 @@ class ExtractionUnitSeed:
             page_bbox (list[float] | Unset):
             page_rotation (ExtractionUnitSeedPageRotation | Unset):
             spans (list[TranscriptSpanSeed] | Unset): Ordered, disjoint transcript phrases in unit text coordinates.
+            text_regions (list[TextBoxSeed] | Unset): Grounded text regions (citations, highlights), ordered by span start.
+                Requires `page_bbox`.
+            text_blocks (list[TextBoxSeed] | Unset): Reading-order text blocks, listed in reading order (an explicit
+                `reading_order` must equal the position). Requires `page_bbox`.
     """
 
     text: str
@@ -39,6 +44,8 @@ class ExtractionUnitSeed:
     page_bbox: list[float] | Unset = UNSET
     page_rotation: ExtractionUnitSeedPageRotation | Unset = UNSET
     spans: list[TranscriptSpanSeed] | Unset = UNSET
+    text_regions: list[TextBoxSeed] | Unset = UNSET
+    text_blocks: list[TextBoxSeed] | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         text = self.text
@@ -64,6 +71,20 @@ class ExtractionUnitSeed:
                 spans_item = spans_item_data.to_dict()
                 spans.append(spans_item)
 
+        text_regions: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.text_regions, Unset):
+            text_regions = []
+            for text_regions_item_data in self.text_regions:
+                text_regions_item = text_regions_item_data.to_dict()
+                text_regions.append(text_regions_item)
+
+        text_blocks: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.text_blocks, Unset):
+            text_blocks = []
+            for text_blocks_item_data in self.text_blocks:
+                text_blocks_item = text_blocks_item_data.to_dict()
+                text_blocks.append(text_blocks_item)
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -83,11 +104,16 @@ class ExtractionUnitSeed:
             field_dict["page_rotation"] = page_rotation
         if spans is not UNSET:
             field_dict["spans"] = spans
+        if text_regions is not UNSET:
+            field_dict["text_regions"] = text_regions
+        if text_blocks is not UNSET:
+            field_dict["text_blocks"] = text_blocks
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.text_box_seed import TextBoxSeed
         from ..models.transcript_span_seed import TranscriptSpanSeed
 
         d = dict(src_dict)
@@ -117,6 +143,24 @@ class ExtractionUnitSeed:
 
                 spans.append(spans_item)
 
+        _text_regions = d.pop("text_regions", UNSET)
+        text_regions: list[TextBoxSeed] | Unset = UNSET
+        if _text_regions is not UNSET:
+            text_regions = []
+            for text_regions_item_data in _text_regions:
+                text_regions_item = TextBoxSeed.from_dict(text_regions_item_data)
+
+                text_regions.append(text_regions_item)
+
+        _text_blocks = d.pop("text_blocks", UNSET)
+        text_blocks: list[TextBoxSeed] | Unset = UNSET
+        if _text_blocks is not UNSET:
+            text_blocks = []
+            for text_blocks_item_data in _text_blocks:
+                text_blocks_item = TextBoxSeed.from_dict(text_blocks_item_data)
+
+                text_blocks.append(text_blocks_item)
+
         extraction_unit_seed = cls(
             text=text,
             unit_type=unit_type,
@@ -125,6 +169,8 @@ class ExtractionUnitSeed:
             page_bbox=page_bbox,
             page_rotation=page_rotation,
             spans=spans,
+            text_regions=text_regions,
+            text_blocks=text_blocks,
         )
 
         return extraction_unit_seed

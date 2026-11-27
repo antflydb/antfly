@@ -732,6 +732,90 @@ pub const ChunkVector = struct {
     vector: []f32,
 };
 
+/// One seeded vector of a document extraction unit chunk. Unit chunks are
+/// embedded whole, so there are no windows.
+pub const UnitChunkVector = struct {
+    parent_unit_id: []const u8,
+    chunk_id: u32,
+    vector: []f32,
+};
+
+pub fn freeUnitChunkVectors(alloc: Allocator, vectors: []UnitChunkVector) void {
+    for (vectors) |entry| alloc.free(entry.vector);
+    if (vectors.len > 0) alloc.free(vectors);
+}
+
+/// `[{parent_unit_id, chunk_id, vector}]`, each (unit, chunk) at most once.
+/// Unit ids borrow from `value`.
+pub fn decodeUnitChunkVectorsAlloc(alloc: Allocator, value: std.json.Value, expected_dims: u32) ![]UnitChunkVector {
+    if (value != .array or value.array.items.len == 0 or value.array.items.len > max_seed_chunks * 64) return error.InvalidArtifactSeed;
+    var out = std.ArrayListUnmanaged(UnitChunkVector).empty;
+    errdefer {
+        for (out.items) |entry| alloc.free(entry.vector);
+        out.deinit(alloc);
+    }
+    for (value.array.items) |item| {
+        if (item != .object) return error.InvalidArtifactSeed;
+        var unit_id: ?[]const u8 = null;
+        var chunk_id: ?u32 = null;
+        var vector_value: ?std.json.Value = null;
+        var it = item.object.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const field = entry.value_ptr.*;
+            if (std.mem.eql(u8, key, "parent_unit_id")) {
+                if (field != .string or field.string.len == 0 or field.string.len > max_name_bytes) return error.InvalidArtifactSeed;
+                unit_id = field.string;
+            } else if (std.mem.eql(u8, key, "chunk_id")) {
+                chunk_id = try jsonU32(field);
+            } else if (std.mem.eql(u8, key, "vector")) {
+                vector_value = field;
+            } else if (std.mem.eql(u8, key, "window_index")) {
+                return error.ArtifactSeedNotAccepted;
+            } else return error.InvalidArtifactSeed;
+        }
+        const vector = try decodeDenseVectorAlloc(alloc, vector_value orelse return error.InvalidArtifactSeed, expected_dims);
+        errdefer alloc.free(vector);
+        if (out.items.len != 0 and out.items[0].vector.len != vector.len) return error.InvalidArtifactSeed;
+        try out.append(alloc, .{
+            .parent_unit_id = unit_id orelse return error.InvalidArtifactSeed,
+            .chunk_id = chunk_id orelse return error.InvalidArtifactSeed,
+            .vector = vector,
+        });
+    }
+    for (out.items, 0..) |entry, i| {
+        for (out.items[i + 1 ..]) |other| {
+            if (entry.chunk_id == other.chunk_id and std.mem.eql(u8, entry.parent_unit_id, other.parent_unit_id)) return error.InvalidArtifactSeed;
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+test "artifact seed unit chunk vectors name their unit and never window" {
+    const alloc = std.testing.allocator;
+    var ok = try parseForTest(alloc,
+        \\[{"parent_unit_id":"page:000001","chunk_id":0,"vector":[1,2]},{"parent_unit_id":"page:000002","chunk_id":0,"vector":[3,4]}]
+    );
+    defer ok.deinit();
+    const vectors = try decodeUnitChunkVectorsAlloc(alloc, ok.value, 2);
+    defer freeUnitChunkVectors(alloc, vectors);
+    try std.testing.expectEqualStrings("page:000002", vectors[1].parent_unit_id);
+    try std.testing.expectError(error.ArtifactSeedNotAccepted, decodeChunkVectorsAlloc(alloc, ok.value, 2));
+    for ([_][]const u8{
+        "[{\"chunk_id\":0,\"vector\":[1,2]}]",
+        "[{\"parent_unit_id\":\"p\",\"chunk_id\":0,\"vector\":[1,2]},{\"parent_unit_id\":\"p\",\"chunk_id\":0,\"vector\":[1,2]}]",
+        "[{\"parent_unit_id\":\"p\",\"chunk_id\":0,\"vector\":[1,2,3]}]",
+        "[]",
+    }) |bad| {
+        var doc = try parseForTest(alloc, bad);
+        defer doc.deinit();
+        try std.testing.expectError(error.InvalidArtifactSeed, decodeUnitChunkVectorsAlloc(alloc, doc.value, 2));
+    }
+    var windowed = try parseForTest(alloc, "[{\"parent_unit_id\":\"p\",\"chunk_id\":0,\"window_index\":0,\"vector\":[1,2]}]");
+    defer windowed.deinit();
+    try std.testing.expectError(error.ArtifactSeedNotAccepted, decodeUnitChunkVectorsAlloc(alloc, windowed.value, 2));
+}
+
 pub fn freeChunkVectors(alloc: Allocator, vectors: []ChunkVector) void {
     for (vectors) |entry| alloc.free(entry.vector);
     alloc.free(vectors);
@@ -761,7 +845,9 @@ pub fn decodeChunkVectorsAlloc(alloc: Allocator, value: std.json.Value, expected
                 window_index = try jsonU32(entry.value_ptr.*);
             } else if (std.mem.eql(u8, key, "vector")) {
                 vector_value = entry.value_ptr.*;
-            } else if (std.mem.eql(u8, key, "unit_id")) {
+            } else if (std.mem.eql(u8, key, "unit_id") or std.mem.eql(u8, key, "parent_unit_id")) {
+                // Vectors of extraction unit chunks are accepted by that
+                // extraction, never by a plain chunk-vector producer.
                 return error.ArtifactSeedNotAccepted;
             } else return error.InvalidArtifactSeed;
         }
@@ -855,14 +941,102 @@ pub const ExtractionUnit = struct {
     page_bbox: ?[4]f64 = null,
     page_rotation: ?i32 = null,
     spans: []TranscriptSpan = &.{},
+    /// Grounded text regions (citations, highlights).
+    text_regions: []TextBox = &.{},
+    /// Reading-order text blocks, listed in reading order.
+    text_blocks: []TextBox = &.{},
 };
+
+/// Geometry of a span of unit text on its page, in the page's coordinate
+/// space (`page_bbox`, source page points): `[x0, y0, x1, y1]`.
+pub const TextBox = struct {
+    /// UTF-8 byte offsets into the unit text.
+    span: [2]u32,
+    bbox: [4]f64,
+    font_size: ?f64 = null,
+    bold: ?bool = null,
+    italic: ?bool = null,
+};
+
+/// Coordinates within this distance of the page box count as inside it.
+const page_box_tolerance: f64 = 0.5;
+
+fn decodeTextBoxesAlloc(alloc: Allocator, value: std.json.Value, text: []const u8, page_bbox: ?[4]f64, blocks: bool) ![]TextBox {
+    if (value != .array or value.array.items.len > max_transcript_spans) return error.InvalidArtifactSeed;
+    if (value.array.items.len == 0) return &.{};
+    // A box means nothing without the page coordinate space it lies in.
+    const page = page_bbox orelse return error.InvalidArtifactSeed;
+    const out = try alloc.alloc(TextBox, value.array.items.len);
+    errdefer alloc.free(out);
+    var previous_start: u32 = 0;
+    for (value.array.items, out, 0..) |item, *box, index| {
+        if (item != .object) return error.InvalidArtifactSeed;
+        var span: ?[2]u32 = null;
+        var bbox: ?[4]f64 = null;
+        box.* = .{ .span = undefined, .bbox = undefined };
+        var it = item.object.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const field = entry.value_ptr.*;
+            if (std.mem.eql(u8, key, "span")) {
+                if (field != .array or field.array.items.len != 2) return error.InvalidArtifactSeed;
+                span = .{ try jsonU32(field.array.items[0]), try jsonU32(field.array.items[1]) };
+            } else if (std.mem.eql(u8, key, "bbox")) {
+                if (field != .array or field.array.items.len != 4) return error.InvalidArtifactSeed;
+                var coordinates: [4]f64 = undefined;
+                for (field.array.items, &coordinates) |coordinate, *slot| slot.* = try jsonF64(coordinate);
+                bbox = coordinates;
+            } else if (std.mem.eql(u8, key, "font_size")) {
+                if (field == .null) continue;
+                const size = try jsonF64(field);
+                if (size <= 0) return error.InvalidArtifactSeed;
+                box.font_size = size;
+            } else if (std.mem.eql(u8, key, "bold") or std.mem.eql(u8, key, "italic")) {
+                if (field == .null) continue;
+                if (field != .bool) return error.InvalidArtifactSeed;
+                if (key[0] == 'b') box.bold = field.bool else box.italic = field.bool;
+            } else if (blocks and std.mem.eql(u8, key, "reading_order")) {
+                // Blocks are listed in reading order; an explicit order agrees.
+                if (try jsonU32(field) != index) return error.InvalidArtifactSeed;
+            } else return error.InvalidArtifactSeed;
+        }
+        box.span = span orelse return error.InvalidArtifactSeed;
+        box.bbox = bbox orelse return error.InvalidArtifactSeed;
+        const start = box.span[0];
+        const end = box.span[1];
+        if (start > end or end > text.len) return error.InvalidArtifactSeed;
+        if (!utf8Boundary(text, start) or !utf8Boundary(text, end)) return error.InvalidArtifactSeed;
+        // Ordered by position in the text, as the native extractor emits them.
+        if (start < previous_start) return error.InvalidArtifactSeed;
+        previous_start = start;
+        const b = box.bbox;
+        if (b[0] > b[2] or b[1] > b[3]) return error.InvalidArtifactSeed;
+        const min_x = @min(page[0], page[2]) - page_box_tolerance;
+        const max_x = @max(page[0], page[2]) + page_box_tolerance;
+        const min_y = @min(page[1], page[3]) - page_box_tolerance;
+        const max_y = @max(page[1], page[3]) + page_box_tolerance;
+        if (b[0] < min_x or b[2] > max_x or b[1] < min_y or b[3] > max_y) return error.InvalidArtifactSeed;
+    }
+    return out;
+}
+
+fn utf8Boundary(text: []const u8, offset: u32) bool {
+    if (offset == 0 or offset == text.len) return true;
+    return (text[offset] & 0xC0) != 0x80;
+}
 
 pub const max_extraction_units: usize = 65536;
 pub const max_transcript_spans: usize = 1 << 20;
 
 pub fn freeExtractionUnits(alloc: Allocator, units: []ExtractionUnit) void {
-    for (units) |unit| if (unit.spans.len > 0) alloc.free(unit.spans);
+    for (units) |unit| freeExtractionUnitParts(alloc, unit);
     if (units.len > 0) alloc.free(units);
+}
+
+fn freeExtractionUnitParts(alloc: Allocator, unit: ExtractionUnit) void {
+    if (unit.spans.len > 0) alloc.free(unit.spans);
+    if (unit.text_regions.len > 0) alloc.free(unit.text_regions);
+    if (unit.text_blocks.len > 0) alloc.free(unit.text_blocks);
 }
 
 fn validUnitType(text: []const u8) bool {
@@ -887,7 +1061,7 @@ pub fn decodeExtractionUnitsAlloc(alloc: Allocator, value: std.json.Value) ![]Ex
     const out = try alloc.alloc(ExtractionUnit, units_value.array.items.len);
     var initialized: usize = 0;
     errdefer {
-        for (out[0..initialized]) |unit| if (unit.spans.len > 0) alloc.free(unit.spans);
+        for (out[0..initialized]) |unit| freeExtractionUnitParts(alloc, unit);
         alloc.free(out);
     }
     for (units_value.array.items, out) |item, *unit| {
@@ -896,6 +1070,8 @@ pub fn decodeExtractionUnitsAlloc(alloc: Allocator, value: std.json.Value) ![]Ex
         var unit_type: ?[]const u8 = null;
         var parsed: ExtractionUnit = .{ .text = "", .unit_type = "" };
         var spans_value: ?std.json.Value = null;
+        var regions_value: ?std.json.Value = null;
+        var blocks_value: ?std.json.Value = null;
         var it = item.object.iterator();
         while (it.next()) |entry| {
             const key = entry.key_ptr.*;
@@ -928,6 +1104,10 @@ pub fn decodeExtractionUnitsAlloc(alloc: Allocator, value: std.json.Value) ![]Ex
                 parsed.page_rotation = @intCast(rotation);
             } else if (std.mem.eql(u8, key, "spans")) {
                 spans_value = field;
+            } else if (std.mem.eql(u8, key, "text_regions")) {
+                regions_value = field;
+            } else if (std.mem.eql(u8, key, "text_blocks")) {
+                blocks_value = field;
             } else return error.InvalidArtifactSeed;
         }
         parsed.text = text orelse return error.InvalidArtifactSeed;
@@ -973,6 +1153,10 @@ pub fn decodeExtractionUnitsAlloc(alloc: Allocator, value: std.json.Value) ![]Ex
             }
             parsed.spans = decoded;
         }
+        errdefer if (parsed.spans.len > 0) alloc.free(parsed.spans);
+        if (regions_value) |regions| parsed.text_regions = try decodeTextBoxesAlloc(alloc, regions, parsed.text, parsed.page_bbox, false);
+        errdefer if (parsed.text_regions.len > 0) alloc.free(parsed.text_regions);
+        if (blocks_value) |blocks| parsed.text_blocks = try decodeTextBoxesAlloc(alloc, blocks, parsed.text, parsed.page_bbox, true);
         // `document` is the plain text route's unit type, so a single plain
         // unit is the same output as the `{"text": ...}` form.
         parsed.unit_type = unit_type orelse if (parsed.page_number != null) "page" else if (parsed.spans.len > 0) "transcript" else "document";
@@ -1229,6 +1413,18 @@ test "artifact seed extraction units carry pages and transcript phrases" {
     try std.testing.expectEqual(@as(?u8, 1), units[1].spans[1].speaker);
     try std.testing.expectEqualStrings("slide", units[2].unit_type);
 
+    var layout = try parseForTest(alloc,
+        \\{"units":[{"text":"Héllo world","page_number":1,"page_bbox":[0,0,612,792],
+        \\  "text_regions":[{"span":[0,6],"bbox":[72,700,110,712],"font_size":11,"bold":null},{"span":[7,12],"bbox":[112,700,150,712]}],
+        \\  "text_blocks":[{"span":[0,12],"bbox":[72,700,150,712],"reading_order":0,"italic":false}]}]}
+    );
+    defer layout.deinit();
+    const laid_out = try decodeExtractionUnitsAlloc(alloc, layout.value);
+    defer freeExtractionUnits(alloc, laid_out);
+    try std.testing.expectEqual(@as(usize, 2), laid_out[0].text_regions.len);
+    try std.testing.expectEqual(@as(?f64, 11), laid_out[0].text_regions[0].font_size);
+    try std.testing.expectEqual(@as(?bool, false), laid_out[0].text_blocks[0].italic);
+
     for ([_][]const u8{
         "{\"units\":[]}",
         "{\"units\":[{\"page_number\":1}]}",
@@ -1238,6 +1434,18 @@ test "artifact seed extraction units carry pages and transcript phrases" {
         "{\"units\":[{\"text\":\"ab\",\"spans\":[{\"char_start\":0,\"char_end\":3,\"start_ms\":0,\"end_ms\":1}]}]}",
         "{\"units\":[{\"text\":\"abcd\",\"spans\":[{\"char_start\":0,\"char_end\":2,\"start_ms\":0,\"end_ms\":1},{\"char_start\":1,\"char_end\":3,\"start_ms\":1,\"end_ms\":2}]}]}",
         "{\"units\":[{\"text\":\"x\"}],\"extra\":1}",
+        // Layout needs the page box, lies inside it, and spans whole
+        // characters of the unit text in text order; blocks list in reading
+        // order, and only blocks have one.
+        "{\"units\":[{\"text\":\"ab\",\"text_regions\":[{\"span\":[0,1],\"bbox\":[0,0,1,1]}]}]}",
+        "{\"units\":[{\"text\":\"ab\",\"page_bbox\":[0,0,10,10],\"text_regions\":[{\"span\":[0,1],\"bbox\":[0,0,11,1]}]}]}",
+        "{\"units\":[{\"text\":\"ab\",\"page_bbox\":[0,0,10,10],\"text_regions\":[{\"span\":[0,3],\"bbox\":[0,0,1,1]}]}]}",
+        "{\"units\":[{\"text\":\"é\",\"page_bbox\":[0,0,10,10],\"text_regions\":[{\"span\":[0,1],\"bbox\":[0,0,1,1]}]}]}",
+        "{\"units\":[{\"text\":\"ab\",\"page_bbox\":[0,0,10,10],\"text_regions\":[{\"span\":[1,2],\"bbox\":[0,0,1,1]},{\"span\":[0,1],\"bbox\":[0,0,1,1]}]}]}",
+        "{\"units\":[{\"text\":\"ab\",\"page_bbox\":[0,0,10,10],\"text_regions\":[{\"span\":[0,1],\"bbox\":[2,0,1,1]}]}]}",
+        "{\"units\":[{\"text\":\"ab\",\"page_bbox\":[0,0,10,10],\"text_blocks\":[{\"span\":[0,1],\"bbox\":[0,0,1,1],\"reading_order\":1}]}]}",
+        "{\"units\":[{\"text\":\"ab\",\"page_bbox\":[0,0,10,10],\"text_regions\":[{\"span\":[0,1],\"bbox\":[0,0,1,1],\"reading_order\":0}]}]}",
+        "{\"units\":[{\"text\":\"ab\",\"page_bbox\":[0,0,10,10],\"text_regions\":[{\"span\":[0,1],\"bbox\":[0,0,1,1],\"font_size\":0}]}]}",
     }) |bad| {
         var doc = try parseForTest(alloc, bad);
         defer doc.deinit();

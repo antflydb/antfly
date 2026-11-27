@@ -19,14 +19,21 @@ class ChunkVectorSeed:
     must be supplied contiguously from 0. Chunks without a seeded vector
     are embedded as usual.
 
+    Vectors of a document extraction's unit chunks name their unit with
+    `parent_unit_id` (every entry, no `window_index`: unit chunks are
+    embedded whole) and are accepted with the extraction seed in the
+    same write; each must name a text chunk of an extracted unit.
+
         Attributes:
             chunk_id (int):
             vector (list[float]):
+            parent_unit_id (str | Unset): The extraction unit of the chunk, e.g. `page:000003`.
             window_index (int | Unset):
     """
 
     chunk_id: int
     vector: list[float]
+    parent_unit_id: str | Unset = UNSET
     window_index: int | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -34,6 +41,8 @@ class ChunkVectorSeed:
         chunk_id = self.chunk_id
 
         vector = self.vector
+
+        parent_unit_id = self.parent_unit_id
 
         window_index = self.window_index
 
@@ -45,6 +54,8 @@ class ChunkVectorSeed:
                 "vector": vector,
             }
         )
+        if parent_unit_id is not UNSET:
+            field_dict["parent_unit_id"] = parent_unit_id
         if window_index is not UNSET:
             field_dict["window_index"] = window_index
 
@@ -57,11 +68,14 @@ class ChunkVectorSeed:
 
         vector = cast(list[float], d.pop("vector"))
 
+        parent_unit_id = d.pop("parent_unit_id", UNSET)
+
         window_index = d.pop("window_index", UNSET)
 
         chunk_vector_seed = cls(
             chunk_id=chunk_id,
             vector=vector,
+            parent_unit_id=parent_unit_id,
             window_index=window_index,
         )
 

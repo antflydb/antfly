@@ -54,6 +54,35 @@ pub const AssetContract = struct {
     };
 };
 
+/// Stored regions and blocks without nulls or the positional reading order.
+fn exportTextBoxes(a: Allocator, items: []const std.json.Value) !std.json.Value {
+    var out = std.json.Array.init(a);
+    for (items) |item| {
+        if (item != .object) continue;
+        var box = std.json.ObjectMap.empty;
+        inline for (.{ "span", "bbox", "font_size", "bold", "italic" }) |field| {
+            if (item.object.get(field)) |value| if (value != .null) try box.put(a, field, value);
+        }
+        try out.append(.{ .object = box });
+    }
+    return .{ .array = out };
+}
+
+/// Stored transcript phrases with their speaker as the write names it.
+fn exportTranscriptSpans(a: Allocator, items: []const std.json.Value) !std.json.Value {
+    var out = std.json.Array.init(a);
+    for (items) |item| {
+        if (item != .object) continue;
+        var span = std.json.ObjectMap.empty;
+        inline for (.{ "char_start", "char_end", "start_ms", "end_ms" }) |field| {
+            if (item.object.get(field)) |value| try span.put(a, field, value);
+        }
+        if (item.object.get("speaker_index")) |value| if (value != .null) try span.put(a, "speaker", value);
+        try out.append(.{ .object = span });
+    }
+    return .{ .array = out };
+}
+
 fn decodeRef(alloc: Allocator, key: []const u8) !?types.ArtifactRef {
     return artifact_ids.decodeArtifactRefAlloc(alloc, key) catch |err| switch (err) {
         error.InvalidInternalUserKey => null,
@@ -73,7 +102,13 @@ fn envelope(a: Allocator, value: std.json.Value) !std.json.Value {
     return .{ .object = object };
 }
 
-const ChunkVector = struct { chunk_id: u32, window: u32, windowed: bool, vector: []f32 };
+const ChunkVector = struct { chunk_id: u32, window: u32, windowed: bool, vector: []f32, unit_id: ?[]const u8 = null };
+
+fn sameChunk(x: ChunkVector, y: ChunkVector) bool {
+    if (x.chunk_id != y.chunk_id) return false;
+    if ((x.unit_id == null) != (y.unit_id == null)) return false;
+    return x.unit_id == null or std.mem.eql(u8, x.unit_id.?, y.unit_id.?);
+}
 
 /// Returns `{ "_artifacts": {...}, "_chunks": {...} }` (only non-empty
 /// members), owned by `alloc`, or null when the document has no exportable
@@ -119,6 +154,15 @@ pub fn loadTxn(alloc: Allocator, doc_key: []const u8, txn: *docstore_mod.DocStor
                     inline for (.{ "page_number", "page_label", "page_bbox", "page_rotation" }) |field| {
                         if (provenance.object.get(field)) |value| if (value != .null) try exported.put(a, field, value);
                     }
+                    // Layout and transcript phrases in their write shapes.
+                    inline for (.{ "text_regions", "text_blocks" }) |field| {
+                        if (provenance.object.get(field)) |value| if (value == .array and value.array.items.len > 0) {
+                            try exported.put(a, field, try exportTextBoxes(a, value.array.items));
+                        };
+                    }
+                    if (provenance.object.get("transcript_spans")) |value| if (value == .array and value.array.items.len > 0) {
+                        try exported.put(a, "spans", try exportTranscriptSpans(a, value.array.items));
+                    };
                 };
                 // The plain text route's single `document` unit is the text form.
                 if (!(unit_type != null and unit_type.? == .string and std.mem.eql(u8, unit_type.?.string, "document")) or exported.count() > 2) rich_extraction = true;
@@ -229,10 +273,12 @@ pub fn loadTxn(alloc: Allocator, doc_key: []const u8, txn: *docstore_mod.DocStor
             const base = (try internal_keys.derivedEmbeddingBaseKeyAlloc(a, entry.key)) orelse continue;
             if ((try @import("artifact_chunk_generation.zig").readMember(a, txn, base)) == null) continue;
             const ref = (try decodeRef(a, entry.key)) orelse continue;
-            if (ref.kind != .embedding or ref.unit_id != null) continue;
-            // Derived vectors name their chunk through the source reference.
+            if (ref.kind != .embedding) continue;
+            // Derived vectors name their chunk through the source reference;
+            // vectors of extraction unit chunks also name the unit.
             const source = ref.source orelse continue;
-            if (source.kind != .chunk or source.unit_id != null) continue;
+            if (source.kind != .chunk) continue;
+            const unit_id = source.unit_id orelse ref.unit_id;
             const chunk_id = source.chunk_id orelse continue;
             const window_index = source.window_index orelse ref.window_index;
             const payload = try txn.get(entry.key);
@@ -241,13 +287,18 @@ pub fn loadTxn(alloc: Allocator, doc_key: []const u8, txn: *docstore_mod.DocStor
             const vector = codec.decodeDenseEmbeddingAlloc(a, payload) catch continue;
             const list = try vectors.getOrPut(a, try a.dupe(u8, ref.name));
             if (!list.found_existing) list.value_ptr.* = .empty;
-            try list.value_ptr.append(a, .{ .chunk_id = chunk_id, .window = window_index orelse 0, .windowed = window_index != null, .vector = vector });
+            // Unit chunks are embedded whole: a windowed one has no seed shape.
+            if (unit_id != null and window_index != null) continue;
+            try list.value_ptr.append(a, .{ .chunk_id = chunk_id, .window = window_index orelse 0, .windowed = window_index != null, .vector = vector, .unit_id = unit_id });
         }
         var it = vectors.iterator();
         while (it.next()) |entry| {
             const items = entry.value_ptr.items;
             std.mem.sort(ChunkVector, items, {}, struct {
                 fn less(_: void, x: ChunkVector, y: ChunkVector) bool {
+                    const xu = x.unit_id orelse "";
+                    const yu = y.unit_id orelse "";
+                    if (!std.mem.eql(u8, xu, yu)) return std.mem.lessThan(u8, xu, yu);
                     if (x.chunk_id != y.chunk_id) return x.chunk_id < y.chunk_id;
                     return x.window < y.window;
                 }
@@ -256,9 +307,10 @@ pub fn loadTxn(alloc: Allocator, doc_key: []const u8, txn: *docstore_mod.DocStor
             for (items, 0..) |item, i| {
                 // `window_index` appears exactly when the chunk has several
                 // windows, matching the import rule for unsplit vectors.
-                const several = (i > 0 and items[i - 1].chunk_id == item.chunk_id) or
-                    (i + 1 < items.len and items[i + 1].chunk_id == item.chunk_id);
+                const several = (i > 0 and sameChunk(items[i - 1], item)) or
+                    (i + 1 < items.len and sameChunk(items[i + 1], item));
                 var object = std.json.ObjectMap.empty;
+                if (item.unit_id) |id| try object.put(a, "parent_unit_id", .{ .string = id });
                 try object.put(a, "chunk_id", .{ .integer = item.chunk_id });
                 if (several or item.window != 0) try object.put(a, "window_index", .{ .integer = item.window });
                 try object.put(a, "vector", try floatArray(a, item.vector));

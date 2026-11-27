@@ -108872,6 +108872,17 @@ test "db artifact seeds accept extracted text for document extraction without fe
     try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = seeded }}, .sync_level = .write });
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    // Unrelated edits replay the document, synchronously or in the worker;
+    // the accepted extraction is reused for its unchanged source, never
+    // fetched (the source is unreachable).
+    for ([_]types.SyncLevel{ .write, .enrichments }) |sync_level| {
+        try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"url\":\"https://example.invalid/report.pdf\",\"title\":\"edited\"}" }}, .sync_level = sync_level });
+        try db.runUntilIdle();
+        var edited = (try db.lookup(alloc, "doc:a", .{ .fields = &.{"_artifacts"}, .include_all_fields = false, .artifact_view = .seed })).?;
+        defer edited.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, edited.json, "Previously extracted text about quarterly revenue.") != null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
 }
 
 fn seedViewChunkContentsForTest(alloc: Allocator, db: *DB, doc_key: []const u8, name: []const u8) ![][]u8 {
@@ -109033,7 +109044,9 @@ test "db artifact seeds accept extracted units with pages, transcripts and unit-
     const seeded =
         \\{"url":"https://example.invalid/interview.pdf",
         \\ "_artifacts":{"extracted":{"value":{"units":[
-        \\   {"text":"Quarterly revenue grew.","page_number":3,"page_label":"iii","page_bbox":[0,0,612,792]},
+        \\   {"text":"Quarterly revenue grew.","page_number":3,"page_label":"iii","page_bbox":[0,0,612,792],
+        \\    "text_regions":[{"span":[0,17],"bbox":[72,700,180,712],"font_size":11},{"span":[18,23],"bbox":[182,700,215,712]}],
+        \\    "text_blocks":[{"span":[0,23],"bbox":[72,700,215,712],"bold":true}]},
         \\   {"text":"Hello there. Hi.","spans":[{"char_start":0,"char_end":12,"start_ms":0,"end_ms":900,"speaker":"SPEAKER_00"},{"char_start":13,"char_end":16,"start_ms":1000,"end_ms":1400,"speaker":"SPEAKER_01"}]}]},
         \\   "source":{"generation":"42"}}},
         \\ "_chunks":{"passages":[
@@ -109056,6 +109069,18 @@ test "db artifact seeds accept extracted units with pages, transcripts and unit-
         try std.testing.expectEqual(@as(i64, 3), units[0].object.get("page_number").?.integer);
         try std.testing.expectEqualStrings("iii", units[0].object.get("page_label").?.string);
         try std.testing.expectEqualStrings("transcript", units[1].object.get("unit_type").?.string);
+        // Layout and transcript phrases export in their write shapes.
+        const regions = units[0].object.get("text_regions").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), regions.len);
+        try std.testing.expectEqual(@as(i64, 18), regions[1].object.get("span").?.array.items[0].integer);
+        try std.testing.expect(regions[1].object.get("font_size") == null);
+        const blocks = units[0].object.get("text_blocks").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), blocks.len);
+        try std.testing.expect(blocks[0].object.get("bold").?.bool);
+        try std.testing.expect(blocks[0].object.get("reading_order") == null);
+        const spans = units[1].object.get("spans").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), spans.len);
+        try std.testing.expectEqual(@as(i64, 1), spans[1].object.get("speaker").?.integer);
         const chunks = parsed.value.object.get("_chunks").?.object.get("passages").?.array.items;
         try std.testing.expectEqual(@as(usize, 4), chunks.len);
         var speakers: usize = 0;
@@ -109093,6 +109118,78 @@ test "db artifact seeds accept extracted units with pages, transcripts and unit-
     else |err|
         try std.testing.expect(err == error.InvalidArtifactSeed);
     if (db.batch(.{ .writes = &.{.{ .key = "doc:c", .value = "{\"url\":\"https://example.invalid/c.pdf\",\"_chunks\":{\"passages\":[{\"_chunk_id\":0,\"_content\":\"x\",\"_parent_unit_id\":\"text:000001\"}]}}" }}, .sync_level = .write })) |_|
+        return error.TestUnexpectedResult
+    else |err|
+        try std.testing.expect(err == error.ArtifactSeedNotAccepted);
+}
+
+test "db artifact seeds accept vectors of extraction unit chunks without embedding them" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var fake = TestAssetProducer{};
+    var embedder = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a", .asset_producer = fake.producer(), .dense_embedder = embedder.interface() } });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "extracted",
+        .kind = .asset,
+        .template = "{{url}}",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{ .name = "passages", .kind = .chunk, .source_artifact_name = "extracted", .field = "text", .chunk_size = 64, .chunk_overlap = 0 });
+    try db.addEnrichment(.{ .name = "passages_dense", .kind = .embedding, .field = "text", .source_artifact_name = "passages", .expected_dims = 3 });
+    try db.addIndex(.{ .name = "passages_vectors", .kind = .dense_vector, .config_json = "{\"field\":\"dense\",\"dims\":3,\"embedding_name\":\"passages_dense\"}" });
+
+    const units =
+        \\"units":[{"text":"Quarterly revenue grew.","page_number":1},{"text":"Margins improved.","page_number":2}]
+    ;
+    const seeded = "{\"url\":\"https://example.invalid/report.pdf\",\"_artifacts\":{\"extracted\":{\"value\":{" ++ units ++ "}}," ++
+        "\"passages_dense\":{\"value\":[{\"parent_unit_id\":\"page:000001\",\"chunk_id\":0,\"vector\":[1,0,0]},{\"parent_unit_id\":\"page:000002\",\"chunk_id\":0,\"vector\":[0,1,0]}]}}}";
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = seeded }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(@as(usize, 0), embedder.calls);
+    try std.testing.expectEqual(@as(u64, 2), db.core.index_manager.denseIndex("passages_vectors").?.index.metadata.active_count);
+
+    // The seed view exports them with their unit.
+    {
+        var view = (try db.lookup(alloc, "doc:a", .{ .fields = &.{"_artifacts"}, .include_all_fields = false, .artifact_view = .seed })).?;
+        defer view.deinit(alloc);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, view.json, .{});
+        defer parsed.deinit();
+        const vectors = parsed.value.object.get("_artifacts").?.object.get("passages_dense").?.object.get("value").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), vectors.len);
+        try std.testing.expectEqualStrings("page:000001", vectors[0].object.get("parent_unit_id").?.string);
+        try std.testing.expect(vectors[0].object.get("window_index") == null);
+    }
+
+    // Resuming the same import is unchanged and embeds nothing.
+    try expectSeedPlanOutcome(alloc, &db, "{\"inserts\":{\"doc:a\":" ++ seeded ++ "}}", "\"name\":\"passages_dense\",\"outcome\":\"unchanged\"");
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = seeded }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 0), embedder.calls);
+
+    // Partial seeding embeds only the unseeded chunk.
+    const partial = "{\"url\":\"https://example.invalid/partial.pdf\",\"_artifacts\":{\"extracted\":{\"value\":{" ++ units ++ "}}," ++
+        "\"passages_dense\":{\"value\":[{\"parent_unit_id\":\"page:000001\",\"chunk_id\":0,\"vector\":[1,0,0]}]}}}";
+    try db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = partial }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 1), embedder.calls);
+    try std.testing.expectEqual(@as(u64, 4), db.core.index_manager.denseIndex("passages_vectors").?.index.metadata.active_count);
+
+    // A vector must name a chunk of an extracted unit, and needs the
+    // extraction seed in the same write.
+    const orphan = "{\"url\":\"https://example.invalid/c.pdf\",\"_artifacts\":{\"extracted\":{\"value\":{" ++ units ++ "}}," ++
+        "\"passages_dense\":{\"value\":[{\"parent_unit_id\":\"page:000001\",\"chunk_id\":7,\"vector\":[1,0,0]}]}}}";
+    if (db.batch(.{ .writes = &.{.{ .key = "doc:c", .value = orphan }}, .sync_level = .write })) |_|
+        return error.TestUnexpectedResult
+    else |err|
+        try std.testing.expect(err == error.InvalidArtifactSeed);
+    if (db.batch(.{ .writes = &.{.{ .key = "doc:d", .value = "{\"url\":\"https://example.invalid/d.pdf\",\"_artifacts\":{\"passages_dense\":{\"value\":[{\"parent_unit_id\":\"page:000001\",\"chunk_id\":0,\"vector\":[1,0,0]}]}}}" }}, .sync_level = .write })) |_|
         return error.TestUnexpectedResult
     else |err|
         try std.testing.expect(err == error.ArtifactSeedNotAccepted);

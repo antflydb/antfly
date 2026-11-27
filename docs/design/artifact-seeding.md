@@ -285,8 +285,17 @@ extracted units themselves:
 Each unit becomes an extraction unit exactly as given (`unit_type` defaults to
 `page` with a page number, `transcript` with spans, else `document`, the
 plain text route's unit; ids are `<unit_type>:<ordinal>`). Page number, label,
-bounding box and rotation, and transcript phrases with their speakers, are
-recorded when present; nothing absent is fabricated. Units go through the
+bounding box and rotation, transcript phrases with their speakers, and layout
+below the page are recorded when present; nothing absent is fabricated.
+
+Layout uses the native shapes: `text_regions` (grounded spans for citations
+and highlights) and `text_blocks` (reading-order blocks, listed in reading
+order), each `{ span, bbox, font_size?, bold?, italic? }`. Spans are UTF-8 byte
+offsets on character boundaries of the unit text, in text order. Boxes are
+`[x0, y0, x1, y1]` in the page's own space, the space of `page_bbox` (source
+page points, as native extraction records them), and must lie within it; a
+unit with layout must therefore carry `page_bbox`. Units keep
+`method: "seeded"`, so consumers can tell the geometry came from the caller. Units go through the
 ordinary manifest, unit and child materialization with no fetch, decode, OCR
 or transcription; the canonical seed value is the input identity, so a
 resumed import is `unchanged`.
@@ -298,17 +307,30 @@ units, and are recorded per unit with the digest of that unit's text, so
 every site that derives unit chunks (desired keys, writes, skip checks,
 full-text rebuilds, worker materialization) uses the seeded chunks while the
 unit text and chunker are unchanged. A plain chunk producer refuses
-unit-scoped chunks. The seed view exports both: the units form whenever the
-extraction has pages, typed or several units, and unit-scoped chunks with
-their unit and speaker.
+unit-scoped chunks. The seed view exports both: the units form (with layout
+and transcript phrases) whenever the extraction has pages, typed or several
+units, and unit-scoped chunks with their unit and speaker.
+
+Vectors of those unit chunks are seeded under the embedding's name with each
+entry naming its unit:
+`[{ parent_unit_id, chunk_id, vector }]` (no `window_index`: unit chunks are
+embedded whole). The extraction producer writes a seeded vector in place of
+queueing that chunk for its provider batch, with exactly the identity it
+would record (the chunk text's hash at the provider generation) and the
+`seeded` flag; unseeded chunks are embedded as usual. Each vector must name a
+text chunk of an extracted unit (`InvalidArtifactSeed`), the extraction must
+be seeded in the same write, and an embedder must be configured so the
+identity can name its provider generation (`ArtifactSeedNotAccepted`
+otherwise). Replays reuse the vectors through the ordinary hash checks; a
+changed chunk text is embedded again. Outcomes are reported per embedding
+name, and the seed view exports the vectors with their unit.
 
 ## Not yet accepted
 
 These fail with `ArtifactSeedNotAccepted` rather than regenerating:
 
-- Vectors of extraction unit chunks. The extraction producer embeds them; a
-  seed would need a unit-qualified vector shape.
-- Text blocks and regions (OCR layout below the page) of extraction units.
+- `null` for vectors of extraction unit chunks (they regenerate with their
+  units), and sparse vectors of unit chunks.
 - Producers whose input is outside the write: neighbor or context sources,
   committed graph adjacency, grouped sources, prior context, privacy-managed
   artifacts, PDF page-image embeddings, chunk-derived sparse vectors, chunks

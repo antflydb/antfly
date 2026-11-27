@@ -20349,6 +20349,29 @@ fn processDocumentExtractionAsset(
         )) return;
     }
 
+    // An extraction accepted from a seed for this same source URL and
+    // configuration is reused rather than fetched: a replay cannot recompute
+    // the seed's fingerprint (`artifact_seed_chunks.zig`).
+    if (metadata_fingerprint == null and !force_reprocess) {
+        const seed_records = @import("../artifact_seed_chunks.zig");
+        const binding_key = try seed_records.extractionKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
+        defer runtime.alloc.free(binding_key);
+        const binding = try storeGetOptionalAllocWithRetry(runtime, binding_key);
+        defer if (binding) |bytes| runtime.alloc.free(bytes);
+        if (seed_records.extractionBindingFingerprint(binding, source_url, config_json)) |fingerprint| {
+            if (try skipRuntimeDocumentExtractionByFingerprint(
+                runtime,
+                request.doc_key,
+                artifact_name,
+                fingerprint,
+                existing_state,
+                existing_manifest,
+                from_generation,
+                request.producer_json,
+            )) return;
+        }
+    }
+
     // Past this point the declared digest (if any) did not already prove
     // this extraction unnecessary: the source is about to be fetched for
     // real. Logged (not just counted) so a real run can confirm a provider

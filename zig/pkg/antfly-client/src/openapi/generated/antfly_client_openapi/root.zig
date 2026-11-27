@@ -1274,6 +1274,7 @@ pub const TermQuery = types.TermQuery;
 pub const TermRangeQuery = types.TermRangeQuery;
 pub const TextAnalysisComponent = types.TextAnalysisComponent;
 pub const TextAnalysisConfig = types.TextAnalysisConfig;
+pub const TextBoxSeed = types.TextBoxSeed;
 pub const TextChunkOptions = types.TextChunkOptions;
 pub const TextContentPart = types.TextContentPart;
 pub const ToolCall = types.ToolCall;

@@ -6102,14 +6102,17 @@ pub const ChunkTranscriptSpan = struct {
     }
 };
 
-/// One seeded vector of a chunk-derived embedding. An entry without `window_index` is the chunk's only vector, stored unsplit (window 0). If any entry for a chunk has a `window_index`, that chunk's windows must be supplied contiguously from 0. Chunks without a seeded vector are embedded as usual.
+/// One seeded vector of a chunk-derived embedding. An entry without `window_index` is the chunk's only vector, stored unsplit (window 0). If any entry for a chunk has a `window_index`, that chunk's windows must be supplied contiguously from 0. Chunks without a seeded vector are embedded as usual. Vectors of a document extraction's unit chunks name their unit with `parent_unit_id` (every entry, no `window_index`: unit chunks are embedded whole) and are accepted with the extraction seed in the same write; each must name a text chunk of an extracted unit.
 pub const ChunkVectorSeed = struct {
+    /// The extraction unit of the chunk, e.g. `page:000003`.
+    parent_unit_id: ?[]const u8 = null,
     chunk_id: i64,
     window_index: ?i64 = null,
     vector: []const f32,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "parent_unit_id", "parent_unit_id", true },
         .{ "chunk_id", "chunk_id", false },
         .{ "window_index", "window_index", true },
         .{ "vector", "vector", false },
@@ -6125,6 +6128,10 @@ pub const ChunkVectorSeed = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.parent_unit_id) |value| {
+            try jw.objectField("parent_unit_id");
+            try jw.write(value);
+        }
         try jw.objectField("chunk_id");
         try jw.write(self.chunk_id);
         if (self.window_index) |value| {
@@ -21083,6 +21090,10 @@ pub const ExtractionUnitSeed = struct {
     page_rotation: ?i64 = null,
     /// Ordered, disjoint transcript phrases in unit text coordinates.
     spans: ?[]const TranscriptSpanSeed = null,
+    /// Grounded text regions (citations, highlights), ordered by span start. Requires `page_bbox`.
+    text_regions: ?[]const TextBoxSeed = null,
+    /// Reading-order text blocks, listed in reading order (an explicit `reading_order` must equal the position). Requires `page_bbox`.
+    text_blocks: ?[]const TextBoxSeed = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -21093,6 +21104,8 @@ pub const ExtractionUnitSeed = struct {
         .{ "page_bbox", "page_bbox", true },
         .{ "page_rotation", "page_rotation", true },
         .{ "spans", "spans", true },
+        .{ "text_regions", "text_regions", true },
+        .{ "text_blocks", "text_blocks", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -21129,6 +21142,14 @@ pub const ExtractionUnitSeed = struct {
         }
         if (self.spans) |value| {
             try jw.objectField("spans");
+            try jw.write(value);
+        }
+        if (self.text_regions) |value| {
+            try jw.objectField("text_regions");
+            try jw.write(value);
+        }
+        if (self.text_blocks) |value| {
+            try jw.objectField("text_blocks");
             try jw.write(value);
         }
         try jw.endObject();
@@ -63541,6 +63562,60 @@ pub const TextAnalysisConfig = struct {
         }
         if (self.date_time_parsers) |value| {
             try jw.objectField("date_time_parsers");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Geometry of a span of unit text on its page. `span` holds UTF-8 byte offsets into the unit text on character boundaries. `bbox` is `[x0, y0, x1, y1]` in the page's own coordinate space, the space of `page_bbox` (source page points, as native extraction records them), and lies within the page box.
+pub const TextBoxSeed = struct {
+    span: []const i64,
+    bbox: []const f64,
+    font_size: ?f64 = null,
+    bold: ?bool = null,
+    italic: ?bool = null,
+    /// Blocks only; must equal the block's position.
+    reading_order: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "span", "span", false },
+        .{ "bbox", "bbox", false },
+        .{ "font_size", "font_size", true },
+        .{ "bold", "bold", true },
+        .{ "italic", "italic", true },
+        .{ "reading_order", "reading_order", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("span");
+        try jw.write(self.span);
+        try jw.objectField("bbox");
+        try jw.write(self.bbox);
+        if (self.font_size) |value| {
+            try jw.objectField("font_size");
+            try jw.write(value);
+        }
+        if (self.bold) |value| {
+            try jw.objectField("bold");
+            try jw.write(value);
+        }
+        if (self.italic) |value| {
+            try jw.objectField("italic");
+            try jw.write(value);
+        }
+        if (self.reading_order) |value| {
+            try jw.objectField("reading_order");
             try jw.write(value);
         }
         try jw.endObject();

@@ -1495,6 +1495,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (seed == null) unseeded_index += 1;
                     if (seed) |entry| {
                         try requireSeedableRequest(request);
+                        if (request.kind == .dense_embedding and request.upstream_artifact_name.len != 0 and try upstreamIsDocumentExtraction(alloc, self, request.upstream_artifact_name)) {
+                            // Vectors of extraction unit chunks are accepted
+                            // by the extraction seeded in this write; only
+                            // an explicit seed reaches it.
+                            const explicit = if (row_seeds) |*seeds| seeds.artifact(requestEmbeddingName(request)) != null else false;
+                            if (!explicit) return error.ArtifactSeedNotAccepted;
+                            try appendGeneratedEnrichmentRef(alloc, &planned, request);
+                            continue;
+                        }
                         if (entry == .delete and ((request.kind == .dense_embedding and request.input_kind != .document) or request.kind == .chunk_text)) {
                             // Chunk-derived vectors live beneath each chunk
                             // and keep their index entries, and a chunk
@@ -1572,10 +1581,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                 defer artifact_seeds.freeExtractionUnits(alloc, extraction_units);
                                 const extraction_identity: ?[]u8 = if (extraction_units.len > 0) try std.json.Stringify.valueAlloc(alloc, seed.?.artifact.value, .{}) else null;
                                 defer if (extraction_identity) |bytes| alloc.free(bytes);
+                                var unit_vector_results = std.StringArrayHashMapUnmanaged(artifact_seeds.Result).empty;
+                                defer {
+                                    for (unit_vector_results.keys()) |name| alloc.free(name);
+                                    unit_vector_results.deinit(alloc);
+                                }
                                 const extraction_seed: ?S.ExtractionSeed = if (seed) |entry| .{
                                     .text = extraction_identity orelse try artifact_seeds.assetText(entry.artifact.value),
                                     .units = extraction_units,
                                     .chunk_seeds = if (row_seeds) |*seeds| seeds else null,
+                                    .unit_vector_results = &unit_vector_results,
                                     .source = entry.artifact.source,
                                     .policy = row_policy,
                                     .result = &extraction_result,
@@ -1605,6 +1620,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                     return err;
                                 };
                                 if (extraction_seed != null) try appendSeedOutcome(alloc, &seed_outcomes, request, extraction_result);
+                                for (unit_vector_results.keys(), unit_vector_results.values()) |name, result| try appendSeedOutcomeNamed(alloc, &seed_outcomes, request.doc_key, name, result);
                             }
                         },
                         .chunk_text => {
@@ -2168,6 +2184,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
         }
 
+        /// The document extraction whose unit chunks an embedding consumes.
+        fn extractionVectorSource(alloc: Allocator, db: anytype, embedding_name: []const u8) !?[]const u8 {
+            const embedding = S.ownerField(db, "core").*.index_manager.getEnrichment(.embedding, embedding_name) orelse return null;
+            if (embedding.source_artifact_name.len == 0) return null;
+            return try extractionConsumerSource(alloc, db, embedding.source_artifact_name);
+        }
+
         /// The document extraction a chunk enrichment consumes, if any.
         fn extractionConsumerSource(alloc: Allocator, db: anytype, chunk_name: []const u8) !?[]const u8 {
             const chunk = S.ownerField(db, "core").*.index_manager.getEnrichment(.chunk, chunk_name) orelse return null;
@@ -2181,8 +2204,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const names = try seeds.names(alloc);
             defer alloc.free(names);
             for (names) |seeded| {
-                if (seeded.field != .chunks) continue;
-                const source = (try extractionConsumerSource(alloc, db, seeded.name)) orelse continue;
+                const source = (if (seeded.field == .chunks)
+                    try extractionConsumerSource(alloc, db, seeded.name)
+                else
+                    try extractionVectorSource(alloc, db, seeded.name)) orelse continue;
                 if (!assetSeededInWrite(requests, request_seeds, source)) return error.ArtifactSeedNotAccepted;
             }
         }
@@ -2257,14 +2282,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         fn appendSeedOutcome(alloc: Allocator, outcomes: *std.ArrayListUnmanaged(artifact_seeds.OutcomeEntry), request: enrichment_types.GeneratedEnrichmentRequest, result: artifact_seeds.Result) !void {
             const name = if (request.kind == .asset or request.kind == .chunk_text) requestArtifactName(request) else requestEmbeddingName(request);
+            try appendSeedOutcomeNamed(alloc, outcomes, request.doc_key, name, result);
+        }
+
+        fn appendSeedOutcomeNamed(alloc: Allocator, outcomes: *std.ArrayListUnmanaged(artifact_seeds.OutcomeEntry), doc_key: []const u8, name: []const u8, result: artifact_seeds.Result) !void {
             // One entry per output even when several consumers plan it.
-            for (outcomes.items) |*existing| if (std.mem.eql(u8, existing.key, request.doc_key) and std.mem.eql(u8, existing.name, name)) {
+            for (outcomes.items) |*existing| if (std.mem.eql(u8, existing.key, doc_key) and std.mem.eql(u8, existing.name, name)) {
                 const merged = (artifact_seeds.Result{ .outcome = existing.outcome, .existing_origin = existing.existing_origin }).merge(result);
                 existing.outcome = merged.outcome;
                 existing.existing_origin = merged.existing_origin;
                 return;
             };
-            const key = try alloc.dupe(u8, request.doc_key);
+            const key = try alloc.dupe(u8, doc_key);
             errdefer alloc.free(key);
             const owned_name = try alloc.dupe(u8, name);
             errdefer alloc.free(owned_name);
@@ -2295,14 +2324,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const names = try seeds.names(alloc);
             defer alloc.free(names);
             for (names) |seeded| {
-                // Unit-scoped chunks of a document extraction's consumer are
-                // accepted by that extraction (checked against its seed below).
-                if (seeded.field == .chunks) if (try extractionConsumerSource(alloc, db, seeded.name)) |source| {
+                // Unit-scoped chunks of a document extraction's consumer, and
+                // vectors of those chunks, are accepted by that extraction
+                // (checked against its seed below).
+                const extraction_source = if (seeded.field == .chunks)
+                    try extractionConsumerSource(alloc, db, seeded.name)
+                else
+                    try extractionVectorSource(alloc, db, seeded.name);
+                if (extraction_source) |source| {
                     for (requests) |request| {
                         if (request.kind == .asset and std.mem.eql(u8, requestArtifactName(request), source)) break;
                     } else return error.UnknownArtifactSeed;
                     continue;
-                };
+                }
                 const matched = for (requests) |request| {
                     const name = switch (request.kind) {
                         .chunk_text => if (seeded.field == .chunks) requestArtifactName(request) else continue,

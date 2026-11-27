@@ -6586,10 +6586,18 @@ components:
         If any entry for a chunk has a `window_index`, that chunk's windows
         must be supplied contiguously from 0. Chunks without a seeded vector
         are embedded as usual.
+
+        Vectors of a document extraction's unit chunks name their unit with
+        `parent_unit_id` (every entry, no `window_index`: unit chunks are
+        embedded whole) and are accepted with the extraction seed in the
+        same write; each must name a text chunk of an extracted unit.
       required:
         - chunk_id
         - vector
       properties:
+        parent_unit_id:
+          type: string
+          description: The extraction unit of the chunk, e.g. `page:000003`.
         chunk_id:
           type: integer
           format: int64
@@ -6688,6 +6696,52 @@ components:
           description: Ordered, disjoint transcript phrases in unit text coordinates.
           items:
             $ref: "#/components/schemas/TranscriptSpanSeed"
+        text_regions:
+          type: array
+          description: Grounded text regions (citations, highlights), ordered by span start. Requires `page_bbox`.
+          items:
+            $ref: "#/components/schemas/TextBoxSeed"
+        text_blocks:
+          type: array
+          description: Reading-order text blocks, listed in reading order (an explicit `reading_order` must equal the position). Requires `page_bbox`.
+          items:
+            $ref: "#/components/schemas/TextBoxSeed"
+    TextBoxSeed:
+      type: object
+      additionalProperties: false
+      required: [span, bbox]
+      description: |
+        Geometry of a span of unit text on its page. `span` holds UTF-8 byte
+        offsets into the unit text on character boundaries. `bbox` is
+        `[x0, y0, x1, y1]` in the page's own coordinate space, the space of
+        `page_bbox` (source page points, as native extraction records them),
+        and lies within the page box.
+      properties:
+        span:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items:
+            type: integer
+            minimum: 0
+        bbox:
+          type: array
+          minItems: 4
+          maxItems: 4
+          items:
+            type: number
+        font_size:
+          type: number
+          minimum: 0
+          exclusiveMinimum: true
+        bold:
+          type: boolean
+        italic:
+          type: boolean
+        reading_order:
+          type: integer
+          minimum: 0
+          description: Blocks only; must equal the block's position.
     TranscriptSpanSeed:
       type: object
       additionalProperties: false

@@ -11798,8 +11798,15 @@ export interface components {
          *     If any entry for a chunk has a `window_index`, that chunk's windows
          *     must be supplied contiguously from 0. Chunks without a seeded vector
          *     are embedded as usual.
+         *
+         *     Vectors of a document extraction's unit chunks name their unit with
+         *     `parent_unit_id` (every entry, no `window_index`: unit chunks are
+         *     embedded whole) and are accepted with the extraction seed in the
+         *     same write; each must name a text chunk of an extracted unit.
          */
         ChunkVectorSeed: {
+            /** @description The extraction unit of the chunk, e.g. `page:000003`. */
+            parent_unit_id?: string;
             /** Format: int64 */
             chunk_id: number;
             /** Format: int64 */
@@ -11855,6 +11862,26 @@ export interface components {
             page_rotation?: 0 | 90 | 180 | 270;
             /** @description Ordered, disjoint transcript phrases in unit text coordinates. */
             spans?: components["schemas"]["TranscriptSpanSeed"][];
+            /** @description Grounded text regions (citations, highlights), ordered by span start. Requires `page_bbox`. */
+            text_regions?: components["schemas"]["TextBoxSeed"][];
+            /** @description Reading-order text blocks, listed in reading order (an explicit `reading_order` must equal the position). Requires `page_bbox`. */
+            text_blocks?: components["schemas"]["TextBoxSeed"][];
+        };
+        /**
+         * @description Geometry of a span of unit text on its page. `span` holds UTF-8 byte
+         *     offsets into the unit text on character boundaries. `bbox` is
+         *     `[x0, y0, x1, y1]` in the page's own coordinate space, the space of
+         *     `page_bbox` (source page points, as native extraction records them),
+         *     and lies within the page box.
+         */
+        TextBoxSeed: {
+            span: number[];
+            bbox: number[];
+            font_size?: number;
+            bold?: boolean;
+            italic?: boolean;
+            /** @description Blocks only; must equal the block's position. */
+            reading_order?: number;
         };
         TranscriptSpanSeed: {
             char_start: number;

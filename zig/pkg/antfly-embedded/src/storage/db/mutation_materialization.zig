@@ -1799,6 +1799,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
             sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
             preparation_memo: *GeneratedEmbeddingMemo,
+            vector_seeds: []const UnitVectorSeed,
+            vector_policy: artifact_seeds.ConflictPolicy,
+            vector_results: ?*std.StringArrayHashMapUnmanaged(artifact_seeds.Result),
         ) !void {
             for (view.chunks) |entry| {
                 const chunks = try documentUnitChunksAlloc(alloc, entry, unit);
@@ -1870,10 +1873,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     }
 
                     if (chunk.text) |chunk_text| {
-                        if (dense_embedder) |embedder| {
-                            for (dense_pending.items) |*pending| {
-                                try appendChunkToPendingDenseChunkEmbedding(alloc, runtime.?, embedder, doc_key, chunk_key, chunk_text, pending, artifact_writes, dense_embeddings);
-                            }
+                        for (dense_pending.items) |*pending| {
+                            // A seeded vector stands in for this chunk's provider input.
+                            if (try acceptSeededUnitChunkVector(alloc, db, runtime, doc_key, unit.unit_id, chunk_key, @intCast(chunk.chunk_id), chunk_text, pending, vector_seeds, vector_policy, vector_results, artifact_writes, dense_embeddings)) continue;
+                            if (dense_embedder) |embedder| try appendChunkToPendingDenseChunkEmbedding(alloc, runtime.?, embedder, doc_key, chunk_key, chunk_text, pending, artifact_writes, dense_embeddings);
                         }
                         if (sparse_embedder) |embedder| {
                             for (sparse_pending.items) |*pending| {
@@ -8438,10 +8441,81 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             /// The write's seeds, for unit-scoped chunks of this extraction's
             /// chunk consumers.
             chunk_seeds: ?*const artifact_seeds.Seeds = null,
+            /// Outcomes of seeded unit-chunk vectors, by embedding name
+            /// (keys owned by the caller's allocator).
+            unit_vector_results: ?*std.StringArrayHashMapUnmanaged(artifact_seeds.Result) = null,
             source: ?artifact_seeds.Source = null,
             policy: artifact_seeds.ConflictPolicy = .keep,
             result: *artifact_seeds.Result,
         };
+
+        /// Seeded vectors of one embedding over an extraction's unit chunks.
+        pub const UnitVectorSeed = struct {
+            name: []const u8,
+            vectors: []artifact_seeds.UnitChunkVector,
+        };
+
+        /// Writes the seeded vector of one unit chunk in place of embedding
+        /// it, with exactly the input identity the producer would record for
+        /// that chunk text. False when no seed names this chunk.
+        fn acceptSeededUnitChunkVector(
+            alloc: Allocator,
+            db: anytype,
+            runtime: ?*enrichment_runtime_mod.EnrichmentRuntime,
+            doc_key: []const u8,
+            unit_id: []const u8,
+            chunk_key: []const u8,
+            chunk_id: u32,
+            chunk_text: []const u8,
+            pending: *PendingDocumentUnitDenseChunkEmbedding,
+            vector_seeds: []const UnitVectorSeed,
+            policy: artifact_seeds.ConflictPolicy,
+            vector_results: ?*std.StringArrayHashMapUnmanaged(artifact_seeds.Result),
+            artifact_writes: anytype,
+            dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
+        ) !bool {
+            const vector = found: for (vector_seeds) |seed_set| {
+                if (!std.mem.eql(u8, seed_set.name, pending.embedding_name)) continue;
+                for (seed_set.vectors) |entry| {
+                    if (entry.chunk_id == chunk_id and std.mem.eql(u8, entry.parent_unit_id, unit_id)) break :found entry.vector;
+                }
+            } else return false;
+            // The identity names the provider generation: without the
+            // embedder there is nothing to bind the seed to.
+            const rt = runtime orelse return error.ArtifactSeedNotAccepted;
+            const generation = pending.generation orelse return error.ArtifactSeedNotAccepted;
+            if (pending.reprocess_generation == null) pending.reprocess_generation = try enrichment_runtime_mod.embeddingReprocessGeneration(rt, doc_key, pending.embedding_name);
+            const synthetic_request: enrichment_types.GeneratedEnrichmentRequest = .{
+                .kind = .dense_embedding,
+                .index_name = "",
+                .doc_key = doc_key,
+                .source_field = pending.source_field,
+                .expected_dims = pending.expected_dims,
+                .producer_json = pending.producer_json,
+                .reprocess_generation = pending.reprocess_generation.?,
+            };
+            const source_hash = enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(synthetic_request, chunk_text, generation.revision);
+            const existing_key = try embeddingArtifactKeyForBaseAlloc(alloc, chunk_key, pending.embedding_name);
+            defer alloc.free(existing_key);
+            const decision = seedDecision(try seededDenseExisting(alloc, db, existing_key, source_hash, vector), policy);
+            if (vector_results) |results| {
+                if (results.getPtr(pending.embedding_name)) |existing| {
+                    existing.* = existing.merge(decision);
+                } else {
+                    const owned = try alloc.dupe(u8, pending.embedding_name);
+                    errdefer alloc.free(owned);
+                    try results.put(alloc, owned, decision);
+                }
+            }
+            if (decision.outcome == .unchanged or decision.outcome == .conflict) {
+                try appendDerivedDenseEmbeddingForConsumers(alloc, dense_embeddings, chunk_key, doc_key, existing_key, &.{}, pending.consumer_indexes);
+                return true;
+            }
+            const artifact_key = try appendEmbeddingArtifactWrite(alloc, artifact_writes, chunk_key, doc_key, pending.embedding_name, pending.source_field, chunk_key, .{ .seeded = source_hash }, vector);
+            defer alloc.free(artifact_key);
+            try appendDerivedDenseEmbeddingForConsumers(alloc, dense_embeddings, chunk_key, doc_key, artifact_key, vector, pending.consumer_indexes);
+            return true;
+        }
 
         /// A rich extraction seed as the extraction result: exactly the
         /// caller's units, with no fetch, decode, OCR or transcription.
@@ -8463,6 +8537,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 errdefer alloc.free(method);
                 const page_label: ?[]u8 = if (seed.page_label) |label| try alloc.dupe(u8, label) else null;
                 errdefer if (page_label) |label| alloc.free(label);
+                const regions = try alloc.alloc(document_extraction_mod.TextRegion, seed.text_regions.len);
+                errdefer alloc.free(regions);
+                for (seed.text_regions, regions) |box, *slot| slot.* = .{ .span = box.span, .bbox = box.bbox, .font_size = box.font_size, .bold = box.bold, .italic = box.italic };
+                const blocks = try alloc.alloc(document_extraction_mod.TextBlock, seed.text_blocks.len);
+                errdefer alloc.free(blocks);
+                for (seed.text_blocks, blocks, 0..) |box, *slot, order| slot.* = .{ .span = box.span, .bbox = box.bbox, .reading_order = @intCast(order), .font_size = box.font_size, .bold = box.bold, .italic = box.italic };
                 const spans = try alloc.alloc(document_extraction_mod.TranscriptSpan, seed.spans.len);
                 for (seed.spans, spans) |span, *slot| slot.* = .{
                     .char_start = span.char_start,
@@ -8482,6 +8562,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .page_rotation = seed.page_rotation,
                     .transcript_used = spans.len > 0,
                     .transcript_spans = spans,
+                    .text_regions = regions,
+                    .text_blocks = blocks,
                 };
                 initialized += 1;
             }
@@ -8575,8 +8657,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             var has_unit_chunk_seeds = false;
             for (seeded_chunk_views) |*entry| {
-                if (extraction_seed) |seed| if (seed.chunk_seeds) |seeds| if (seeds.chunks(entry.name) != null) {
-                    has_unit_chunk_seeds = true;
+                if (extraction_seed) |seed| if (seed.chunk_seeds) |seeds| {
+                    if (seeds.chunks(entry.name) != null) has_unit_chunk_seeds = true;
+                    for (entry.dense_embeddings) |embedding| {
+                        if (seeds.artifact(embedding.name) != null) has_unit_chunk_seeds = true;
+                    }
+                    for (entry.sparse_embeddings) |embedding| {
+                        if (seeds.artifact(embedding.name) != null) has_unit_chunk_seeds = true;
+                    }
                 };
                 const record_key = try artifact_seed_chunks.unitKeyAlloc(alloc, request.doc_key, entry.name);
                 defer alloc.free(record_key);
@@ -8657,6 +8745,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 null;
             defer if (extraction_budgeted) |*budgeted| budgeted.deinit();
             const extraction_alloc = if (extraction_budgeted) |*budgeted| budgeted.allocator() else alloc;
+
+            // An extraction accepted from a seed for this same source URL and
+            // configuration is reused rather than fetched (`artifact_seed_chunks`).
+            if (extraction_seed == null and metadata_fingerprint == null and !must_force) {
+                const binding_key = try artifact_seed_chunks.extractionKeyAlloc(alloc, request.doc_key, artifact_name);
+                defer alloc.free(binding_key);
+                const binding = try S.ownerField(db, "core").*.getStoreValue(alloc, binding_key);
+                defer if (binding) |bytes| alloc.free(bytes);
+                if (artifact_seed_chunks.extractionBindingFingerprint(binding, source_url, config_json)) |fingerprint| {
+                    if (try reuseDocumentExtractionByFingerprint(alloc, db, request.doc_key, artifact_name, fingerprint, existing_state, existing_manifest, manifest_key, from_generation, artifact_writes, artifact_delete_keys)) return;
+                }
+            }
 
             // See the matching log in enrichment_runtime.zig's
             // processDocumentExtractionAsset: past this point the declared
@@ -8739,6 +8839,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try document_extraction_mod.downloadedMetadataFingerprintAlloc(alloc, source_url, config_json, config, downloaded_mut.content_type) orelse try document_extraction_mod.contentFingerprintAlloc(alloc, source_url, config_json, config, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data);
             defer if (byte_source_fingerprint) |fingerprint| alloc.free(fingerprint);
             const source_fingerprint = metadata_fingerprint orelse byte_source_fingerprint.?;
+            if (extraction_seed != null and metadata_fingerprint == null) {
+                // Replays cannot recompute a seed's fingerprint: bind it to
+                // this source so they reuse the accepted output.
+                const binding_key = try artifact_seed_chunks.extractionKeyAlloc(alloc, request.doc_key, artifact_name);
+                defer alloc.free(binding_key);
+                const binding = try artifact_seed_chunks.encodeExtractionBindingAlloc(alloc, source_url, config_json, source_fingerprint);
+                defer alloc.free(binding);
+                try appendPreparedArtifactCopy(alloc, artifact_writes, binding_key, binding);
+            }
 
             if (metadata_fingerprint == null and !must_force and !has_unit_chunk_seeds and (extraction_seed == null or extraction_seed.?.policy == .keep) and
                 try reuseDocumentExtractionByFingerprint(alloc, db, request.doc_key, artifact_name, source_fingerprint, existing_state, existing_manifest, manifest_key, from_generation, artifact_writes, artifact_delete_keys))
@@ -8748,8 +8857,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 return;
             }
             if (extraction_seed) |seed| {
-                if (seed.result.outcome == .accepted and existing_manifest != null)
-                    seed.result.* = .{ .outcome = .replaced, .existing_origin = .generated };
+                if (seed.result.outcome == .accepted and existing_manifest != null) {
+                    // Materialized again only for its unit-scoped seeds, the
+                    // same accepted extraction is unchanged.
+                    const same_input = has_unit_chunk_seeds and existing_state != null and
+                        documentExtractionStateFingerprintMatches(alloc, existing_state.?, source_fingerprint);
+                    seed.result.* = if (same_input) .{ .outcome = .unchanged, .existing_origin = .seeded } else .{ .outcome = .replaced, .existing_origin = .generated };
+                }
             }
 
             // Downloaded bytes, inspection state, and decoded extraction results are
@@ -8882,6 +8996,50 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     },
                 }
             };
+            var unit_vector_seeds = std.ArrayListUnmanaged(UnitVectorSeed).empty;
+            defer {
+                for (unit_vector_seeds.items) |seed_set| artifact_seeds.freeUnitChunkVectors(alloc, seed_set.vectors);
+                unit_vector_seeds.deinit(alloc);
+            }
+            if (extraction_seed) |seed| if (seed.chunk_seeds) |seeds| for (seeded_chunk_views) |entry| {
+                // Sparse vectors of unit chunks have no seed shape.
+                for (entry.sparse_embeddings) |embedding| {
+                    if (seeds.artifact(embedding.name) != null) return error.ArtifactSeedNotAccepted;
+                }
+                for (entry.dense_embeddings) |embedding| {
+                    const vector_entry = seeds.artifact(embedding.name) orelse continue;
+                    const envelope = switch (vector_entry) {
+                        .artifact => |value| value,
+                        // Regeneration of unit-chunk vectors follows the units.
+                        .delete, .chunks => return error.ArtifactSeedNotAccepted,
+                    };
+                    try artifact_seeds.rejectSourceHash(envelope.source);
+                    const vectors = try artifact_seeds.decodeUnitChunkVectorsAlloc(alloc, envelope.value, embedding.expected_dims);
+                    var vectors_owned = true;
+                    defer if (vectors_owned) artifact_seeds.freeUnitChunkVectors(alloc, vectors);
+                    // Every vector names a text chunk of an extracted unit.
+                    var bound: usize = 0;
+                    for (extraction.units) |unit| {
+                        var named = false;
+                        for (vectors) |vector| {
+                            if (std.mem.eql(u8, vector.parent_unit_id, unit.unit_id)) named = true;
+                        }
+                        if (!named) continue;
+                        const chunks = try documentUnitChunksAlloc(alloc, entry, unit);
+                        defer chunker_mod.freeChunks(alloc, chunks);
+                        for (vectors) |vector| {
+                            if (!std.mem.eql(u8, vector.parent_unit_id, unit.unit_id)) continue;
+                            for (chunks) |chunk| {
+                                if (chunk.chunk_id == vector.chunk_id and chunk.isText()) break;
+                            } else return error.InvalidArtifactSeed;
+                            bound += 1;
+                        }
+                    }
+                    if (bound != vectors.len) return error.InvalidArtifactSeed;
+                    try unit_vector_seeds.append(alloc, .{ .name = embedding.name, .vectors = vectors });
+                    vectors_owned = false;
+                }
+            };
 
             var desired_unit_keys = std.ArrayListUnmanaged([]const u8).empty;
             defer {
@@ -8931,7 +9089,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer previous_state.deinit(alloc);
 
             if (existing_state) |state| {
-                if (!force_reprocess and existing_navigation_summary != null and
+                // Unit-scoped seeds rewrite chunks and vectors the state
+                // does not describe; they never take the unchanged shortcut.
+                if (!force_reprocess and !has_unit_chunk_seeds and existing_navigation_summary != null and
                     std.mem.eql(u8, state, new_state) and
                     try hierarchy_navigation.indexMetadataMatches(alloc, state, existing_navigation_summary.?, from_generation))
                 {
@@ -9014,7 +9174,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const unit_route = documentExtractionRangeRoute(previous_child_ranges, unit_range_id, "unit", artifact_name);
                 const unit_unchanged = std.mem.eql(u8, unit_descriptor.key, unit_key) and
                     unitDescriptorFingerprintMatches(previous_state.unit_descriptors, unit_key, unit_descriptor.fingerprint);
-                if (unit_unchanged and
+                if (unit_unchanged and unit_vector_seeds.items.len == 0 and
                     try documentUnitCanSkipLocalWrites(alloc, db, view, request.doc_key, artifact_name, unit_key, unit_descriptor.fingerprint, unit, desired_chunk_keys.items, chunk_range_base_index, previous_child_ranges))
                 {
                     if (force_reprocess) {
@@ -9069,7 +9229,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     });
                 }
 
-                try appendDocumentUnitChunkWrites(alloc, db, view, request.doc_key, artifact_name, unit_key, unit_descriptor.fingerprint, unit, desired_chunk_keys.items, chunk_range_base_index, previous_child_ranges, artifact_writes, documents, dense_embeddings, sparse_embeddings, preparation_memo);
+                try appendDocumentUnitChunkWrites(alloc, db, view, request.doc_key, artifact_name, unit_key, unit_descriptor.fingerprint, unit, desired_chunk_keys.items, chunk_range_base_index, previous_child_ranges, artifact_writes, documents, dense_embeddings, sparse_embeddings, preparation_memo, unit_vector_seeds.items, if (extraction_seed) |seed| seed.policy else .keep, if (extraction_seed) |seed| seed.unit_vector_results else null);
             }
 
             const manifest = try documentExtractionManifestPayloadAlloc(

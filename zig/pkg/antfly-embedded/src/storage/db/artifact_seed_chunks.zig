@@ -113,6 +113,64 @@ pub fn chunksForInputAlloc(comptime chunker: type, alloc: Allocator, record: ?[]
     return try chunksFromFieldsAlloc(chunker, alloc, fields);
 }
 
+const extraction_magic = "antfly-seeded-extraction-v1\x00";
+const extraction_record_name_prefix = "\x00seeded-extraction\x00";
+
+/// Binding of a seeded document extraction to the source it was accepted for.
+/// A seeded extraction's fingerprint covers the seed itself, which a later
+/// replay cannot recompute without fetching; the binding names that
+/// fingerprint for exactly this source URL and extraction configuration, so
+/// replays reuse the accepted output instead of fetching. Any other URL or
+/// configuration, or a regenerated state, no longer matches.
+pub fn extractionKeyAlloc(alloc: Allocator, doc_key: []const u8, extraction_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try internal_keys.appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, internal_keys.asset_state_kind);
+    const name = try std.mem.concat(alloc, u8, &.{ extraction_record_name_prefix, extraction_name });
+    defer alloc.free(name);
+    try internal_keys.appendEncodedComponent(&list, alloc, name);
+    return try list.toOwnedSlice(alloc);
+}
+
+fn extractionSourceDigest(source_url: []const u8, config_json: []const u8) [32]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    for ([_][]const u8{ extraction_magic, source_url, config_json }) |part| {
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, part.len, .little);
+        hasher.update(&length);
+        hasher.update(part);
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+pub fn encodeExtractionBindingAlloc(alloc: Allocator, source_url: []const u8, config_json: []const u8, fingerprint: []const u8) ![]u8 {
+    const digest = extractionSourceDigest(source_url, config_json);
+    return try std.mem.concat(alloc, u8, &.{ extraction_magic, &digest, fingerprint });
+}
+
+/// The accepted fingerprint when the binding names exactly this source;
+/// borrows from `record`.
+pub fn extractionBindingFingerprint(record: ?[]const u8, source_url: []const u8, config_json: []const u8) ?[]const u8 {
+    const bytes = record orelse return null;
+    if (bytes.len <= extraction_magic.len + 32 or !std.mem.eql(u8, bytes[0..extraction_magic.len], extraction_magic)) return null;
+    const expected = extractionSourceDigest(source_url, config_json);
+    if (!std.mem.eql(u8, bytes[extraction_magic.len..][0..32], &expected)) return null;
+    return bytes[extraction_magic.len + 32 ..];
+}
+
+test "seeded extraction bindings name their exact source" {
+    const alloc = std.testing.allocator;
+    const record = try encodeExtractionBindingAlloc(alloc, "gs://a/b.pdf", "{}", "seed-sha256:ab");
+    defer alloc.free(record);
+    try std.testing.expectEqualStrings("seed-sha256:ab", extractionBindingFingerprint(record, "gs://a/b.pdf", "{}").?);
+    try std.testing.expect(extractionBindingFingerprint(record, "gs://a/c.pdf", "{}") == null);
+    try std.testing.expect(extractionBindingFingerprint(record, "gs://a/b.pdf", "{\"ocr\":true}") == null);
+    try std.testing.expect(extractionBindingFingerprint(null, "gs://a/b.pdf", "{}") == null);
+}
+
 const unit_magic = "antfly-seeded-unit-chunks-v1\x00";
 const unit_record_name_prefix = "\x00seeded-unit-chunks\x00";
 
