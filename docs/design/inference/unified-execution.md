@@ -2344,3 +2344,11 @@ ABBA order, the rates were 7.2905, 7.3832, 7.1901 and 7.2756 pages/s.
 Mean rates differed by 0.05%. The pair supports throughput parity
 for this reader repair. The number of wide replays varied from two
 to six per arm, and sustained wide replay remains a separate gate.
+
+At `3e037a3f45`, five focused ONNX tests passed. The resident fixture
+verified that the decoder materializes only the final vocabulary row.
+Three Native opaque-affine fixtures verified alias liveness through
+intervening allocations and exact branch outputs. The declared host
+workspace fixture rejected an inconsistent target before opaque decoder
+access. The log hash is
+`83d2519787a1c43f729a283f8e2f8c4a0f882907642f0eed3ee3ba78bdeb61a6`.
