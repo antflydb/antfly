@@ -5,7 +5,7 @@ import AppKit
 import DictationCore
 import SwiftUI
 
-@main enum DictationLauncher {
+@main @MainActor enum DictationLauncher {
   static func main() {
     if CommandLine.arguments.dropFirst().first == "--managed-runtime-child" {
       executeManagedRuntimeChild(arguments: CommandLine.arguments)
@@ -15,6 +15,7 @@ import SwiftUI
     {
       exit(superviseManagedRuntime(arguments: CommandLine.arguments))
     }
+    if AppInstallation.offerAtLaunch() { return }
     DictationApp.main()
   }
 }
