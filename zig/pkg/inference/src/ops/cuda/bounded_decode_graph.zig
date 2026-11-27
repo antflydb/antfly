@@ -519,7 +519,7 @@ pub const Module = struct {
         return plan_mod.Scope.bind(plan, layout, self.arena.ptr, self.arena.len);
     }
 
-    pub fn validateExecutionStorage(self: *const Module) !void {
+    pub fn bindExecutionStorage(self: *const Module) !?buffer.DeviceBuffer {
         const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
         try buffer.validateRegions(
             3,
@@ -528,12 +528,7 @@ pub const Module = struct {
             .{ plan_mod.alignment, @alignOf(f32), plan_mod.alignment },
             1,
         );
-    }
-
-    pub fn headDestination(self: *const Module) !?buffer.DeviceBuffer {
-        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
         if (layout.head_bytes == 0) return null;
-        try buffer.validateRegions(2, .{ self.metadata, self.head }, .{ layout.metadata_bytes, layout.head_bytes }, .{ 1, @alignOf(f32) }, 1);
         var destination = self.head;
         destination.len = layout.head_bytes;
         return destination;
@@ -570,18 +565,17 @@ test "captured sequence storage layout packs narrow and wide readbacks with alig
         const backing: buffer.DeviceBuffer = .{ .ptr = 0x10000, .len = value.bytes };
         var owner = Module{ .storage_layout = actual, .metadata = backing };
         if (value.head == 0) {
-            try std.testing.expect((try owner.headDestination()) == null);
+            try std.testing.expect((try owner.bindExecutionStorage()) == null);
         } else {
-            try std.testing.expectError(error.InvalidShape, owner.headDestination());
+            try std.testing.expectError(error.InvalidShape, owner.bindExecutionStorage());
             owner.head = .{ .ptr = backing.ptr, .len = value.head };
-            try std.testing.expectError(error.InvalidShape, owner.headDestination());
+            try std.testing.expectError(error.InvalidShape, owner.bindExecutionStorage());
             owner.head = .{ .ptr = 0x10000000, .len = value.head + 256 };
-            try std.testing.expectEqual(value.head, (try owner.headDestination()).?.len);
-            try owner.validateExecutionStorage();
+            try std.testing.expectEqual(value.head, (try owner.bindExecutionStorage()).?.len);
             owner.arena = .{ .ptr = owner.head.ptr, .len = 256 };
-            try std.testing.expectError(error.InvalidShape, owner.validateExecutionStorage());
+            try std.testing.expectError(error.InvalidShape, owner.bindExecutionStorage());
             owner.arena.ptr = owner.head.ptr + value.head;
-            try owner.validateExecutionStorage();
+            try std.testing.expectEqual(value.head, (try owner.bindExecutionStorage()).?.len);
         }
         try std.testing.expectEqual(@as(u64, 0x10000 + value.bank), actual.tokens.bind(backing).ptr);
         try std.testing.expectEqual(value.rows * 2 * @sizeOf(u32), actual.tokens.bytes);

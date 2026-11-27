@@ -3738,6 +3738,7 @@ pub const CudaCompute = struct {
     pub const BoundedDecodeClaim = struct {
         compute: *CudaCompute,
         future_tokens: usize,
+        head_destination: ?buffer_mod.DeviceBuffer,
         launch_route: ?@import("../../execution/runtime_observation.zig").CudaDecoderWorkspace.Route = null,
         pub fn deinit(self: *@This()) void {
             self.compute.bounded_decode_graph.active = false;
@@ -3756,7 +3757,7 @@ pub const CudaCompute = struct {
         pub fn projectHead(self: *@This(), cb: *const ops.ComputeBackend, input_ct: CT, weight: CT) !CT {
             const owner = &self.compute.bounded_decode_graph;
             std.debug.assert(cb.ptr == @as(*anyopaque, @ptrCast(self.compute)));
-            const destination = (try owner.headDestination()) orelse
+            const destination = self.head_destination orelse
                 return cb.linearNoBias(input_ct, weight, owner.rows, owner.hidden, owner.vocab);
             return cb.observeBackendEntry(.linear_no_bias, &linearNoBiasWithDestination, .{ self.compute, input_ct, weight, owner.rows, owner.hidden, owner.vocab, false, @as(?buffer_mod.DeviceBuffer, destination) });
         }
@@ -3790,7 +3791,6 @@ pub const CudaCompute = struct {
         pub fn run(self: *@This(), context: *anyopaque, callback: *const fn (*anyopaque, *@This()) anyerror!void) !void {
             const compute = self.compute;
             const owner = &compute.bounded_decode_graph;
-            try owner.validateExecutionStorage();
             if (owner.phase == .replay) {
                 try compute.ctx.launchGraph(owner.graph);
                 self.launch_route = .replayed;
@@ -4197,6 +4197,7 @@ pub const CudaCompute = struct {
                 else => return err,
             };
         }
+        const head_destination = try owner.bindExecutionStorage();
         if (self.captured_cache_roots) |roots| try roots.beginGeneration(self, current);
         try self.lighton_attention.init(&self.ctx);
         if (owner.phase != .replay) {
@@ -4214,7 +4215,7 @@ pub const CudaCompute = struct {
         };
         owner.future_tokens = future_tokens;
         claimed = true;
-        return .{ .compute = self, .future_tokens = future_tokens };
+        return .{ .compute = self, .future_tokens = future_tokens, .head_destination = head_destination };
     }
 
     pub fn beginLightOnTokenBurst(cb: *const ops.ComputeBackend, embedding_weight: CT, rows: usize, steps: usize, hidden: usize, vocab: usize, suppress_ids: []const i32) !?LightOnTokenBurst {
@@ -46603,7 +46604,7 @@ test "CUDA bounded decoder drains a failed receipt transfer before returning" {
     owner.metadata = .{ .ptr = 0x1000, .len = layout.metadata_bytes };
     owner.progress = 2;
     owner.next_positions[0 .. rows * 3].* = @splat(7);
-    var claim = CudaCompute.BoundedDecodeClaim{ .compute = &compute, .future_tokens = 16 };
+    var claim = CudaCompute.BoundedDecodeClaim{ .compute = &compute, .future_tokens = 16, .head_destination = null };
     var burst: CudaCompute.LightOnTokenBurst = undefined;
     burst.drained = false;
     var first: [rows]u32 = @splat(11);
@@ -46673,9 +46674,10 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
         owner.metadata = .{};
         owner.storage_layout = null;
     }
+    const head_destination = try owner.bindExecutionStorage();
     try std.testing.expect(owner.mutex.tryLock());
     owner.active = true;
-    var claim = CudaCompute.BoundedDecodeClaim{ .compute = &compute, .future_tokens = 0 };
+    var claim = CudaCompute.BoundedDecodeClaim{ .compute = &compute, .future_tokens = 0, .head_destination = head_destination };
     defer claim.deinit();
     const copied_before = compute.stats.d2d_bytes;
     const launched_before = compute.stats.launch_embedding;
