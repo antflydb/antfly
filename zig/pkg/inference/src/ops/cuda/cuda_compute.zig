@@ -3993,6 +3993,7 @@ pub const CudaCompute = struct {
                     .recurrent_scratch_bytes = owner.bound_recurrent_scratch_bytes,
                     .declared_attention_output_bytes = if (layout.attention_output) |span| span.bytes else 0,
                     .declared_recurrent_output_bytes = if (layout.recurrent_output) |span| span.bytes else 0,
+                    .declared_ffn_scratch_bytes = if (layout.ffn_workspace) |span| span.bytes else 0,
                     .head_bytes = layout.head_bytes,
                     .shared_head_scratch_bytes = if (layout.shared_head_workspace) |span| span.bytes else 0,
                     .head_packet_rows = layout.headPacketRows(owner.rows, owner.vocab),
@@ -4238,6 +4239,10 @@ pub const CudaCompute = struct {
         phase.declareRecurrentOutput() catch |err| switch (err) {
             error.InvalidShape, error.Overflow => return .unsupported,
         };
+        if (lightOnFfnBlockEnabled(cb) and lightOnDevice(self).portableKernels() and !self.lighton_bf16_projection_outputs and !self.lighton_bf16_decode_outputs)
+            phase.declareFfnScratch() catch |err| switch (err) {
+                error.InvalidShape, error.Overflow => return .unsupported,
+            };
         const owner = &self.bounded_decode_graph;
         if (!owner.mutex.tryLock()) return error.ReaderEpochBackendBusy;
         defer owner.mutex.unlock();
@@ -4314,7 +4319,7 @@ pub const CudaCompute = struct {
         if (rows > @import("gated_delta.zig").max_packet_rows and !self.lighton_ragged_recurrent_enabled) return null;
         if (self.execution_scope != null or try self.ctx.streamCaptureActive()) return null;
         const descriptor = graph_phase.descriptor;
-        if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or !std.meta.eql(descriptor.attention_geometry, expected.attention_geometry) or !std.meta.eql(descriptor.recurrent_heads, expected.recurrent_heads) or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or !std.meta.eql(descriptor.head_storage, expected.head_storage) or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions) or !std.mem.eql(u64, descriptor.sequences, expected.sequences)) return error.PreparedCachePlanChanged;
+        if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or !std.meta.eql(descriptor.attention_geometry, expected.attention_geometry) or !std.meta.eql(descriptor.recurrent_heads, expected.recurrent_heads) or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or descriptor.ffn_intermediate != expected.ffn_intermediate or !std.meta.eql(descriptor.head_storage, expected.head_storage) or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions) or !std.mem.eql(u64, descriptor.sequences, expected.sequences)) return error.PreparedCachePlanChanged;
         const owner = &self.bounded_decode_graph;
         while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
         var claimed = false;
@@ -4892,6 +4897,12 @@ pub const CudaCompute = struct {
             return try program.publish(slot);
         };
         try self.lighton_activation.init(&self.ctx);
+        if (self.bounded_decode_graph.active) {
+            const layout = try DenseFfnProgram.Layout.init(rows, hidden, intermediate, 0);
+            if (try self.bounded_decode_graph.bindFfnScratch(layout)) |scratch| {
+                return runCapturedDenseFfn(self, request, input, norm, weights, layout, scratch);
+            }
+        }
         var normalized = try allocDeviceBuffer(self, try checkedMul(try checkedMul(rows, hidden), 2));
         defer releaseDeviceBuffer(self, &normalized);
         var gate = try allocDeviceBuffer(self, try checkedMul(try checkedMul(rows, intermediate), 4));
@@ -16100,6 +16111,24 @@ const LightOnActivationSources = union(enum) {
 /// input. The temporary F32 activation and its later conversion disappear.
 /// Compact intermediates for the separately opted-in BF16 projection policy.
 /// The original F32 FFN and its numerical oracle remain independent.
+fn runCapturedDenseFfn(self: *CudaCompute, request: CudaCompute.DenseSiluFfnBlockRequest, input: *const CudaTensor, norm: *const CudaTensor, weights: [3]*const CudaTensor, layout: CudaCompute.DenseFfnProgram.Layout, scratch: buffer_mod.DeviceBuffer) !CT {
+    const narrow_count = try checkedMul(layout.rows, layout.hidden);
+    const wide_count = try checkedMul(layout.rows, layout.intermediate);
+    for ([_]*const CudaTensor{ input, norm, weights[0], weights[1], weights[2] }) |source| {
+        if (kernel_geometry.byteRangesOverlap(scratch.ptr, scratch.len, source.buffer.ptr, source.buffer.len)) return error.InvalidAssignedAlias;
+    }
+    const normalized = try scratch.borrowRange(0, narrow_count * @sizeOf(u16));
+    const activated = try scratch.borrowRange(0, wide_count * @sizeOf(u16));
+    const gate = try scratch.borrowRange(layout.gate_offset, wide_count * @sizeOf(f32));
+    const up = try scratch.borrowRange(layout.up_offset, wide_count * @sizeOf(f32));
+    var output = try OwnedF32Output.alloc2(self, layout.rows, layout.hidden, narrow_count);
+    defer output.deinit();
+    errdefer self.ctx.synchronize() catch {};
+    try runDenseFfnGateUp(self, request, input, norm, weights, normalized, gate, up, null);
+    try runDenseFfnDown(self, .{ .separate = .{ .gate = gate, .up = up } }, weights[2], layout.rows, layout.hidden, layout.intermediate, input, activated, output.buffer, null);
+    return output.intoTensor();
+}
+
 fn lightOnCompactBf16FfnBlock(self: *CudaCompute, request: CudaCompute.DenseSiluFfnBlockRequest, input: *const CudaTensor, norm: *const CudaTensor, weights: [3]*const CudaTensor) !CT {
     const rows = request.rows;
     const hidden = request.hidden;

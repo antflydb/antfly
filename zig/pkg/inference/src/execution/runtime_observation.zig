@@ -535,6 +535,7 @@ pub const CudaDecoderWorkspace = struct {
     /// Each layer's output is live alongside that layer's scratch.
     declared_attention_output_bytes: usize = 0,
     declared_recurrent_output_bytes: usize = 0,
+    declared_ffn_scratch_bytes: usize = 0,
     /// Bytes in the independently admitted bank. Arena-backed packets are
     /// already accounted for by bound_scratch_bytes.
     head_bytes: usize,

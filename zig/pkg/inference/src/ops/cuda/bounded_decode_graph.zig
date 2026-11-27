@@ -64,6 +64,7 @@ pub const StorageLayout = struct {
     attention_output: ?Span = null,
     recurrent_workspace: ?Span = null,
     recurrent_output: ?Span = null,
+    ffn_workspace: ?Span = null,
     fused_head_workspace: ?Span = null,
     recurrent_scratch: ?@import("gated_delta.zig").PacketScratch = null,
     metadata_bytes: usize,
@@ -235,6 +236,7 @@ pub const Descriptor = struct {
     recurrent_heads: ?struct { key: usize, value: usize } = null,
     attention_layers: usize,
     recurrent_layers: usize,
+    ffn_intermediate: usize = 0,
     pub const HeadStorage = union(enum) {
         full_bank,
         adaptive_bank: usize,
@@ -371,6 +373,13 @@ pub const GraphPhase = struct {
         const bytes = try std.math.mul(usize, descriptor.rows * @sizeOf(f32), width);
         const scratch_bytes = if (self.storage_layout.recurrent_workspace) |span| span.bytes else 0;
         self.storage_layout.recurrent_output = try self.storage_layout.declareLayerRegion(try StorageLayout.aligned(scratch_bytes), bytes);
+    }
+
+    pub fn declareFfnScratch(self: *GraphPhase) !void {
+        const descriptor = self.descriptor;
+        if (descriptor.ffn_intermediate == 0) return;
+        const layout = try @import("dense_ffn_workspace.zig").Layout.init(descriptor.rows, descriptor.hidden, descriptor.ffn_intermediate, 0);
+        self.storage_layout.ffn_workspace = try self.storage_layout.declareLayerWorkspace(layout.scratch_bytes);
     }
 
     pub fn matchesOwner(self: *const GraphPhase, owner: *const Module) bool {
@@ -768,6 +777,13 @@ pub const Module = struct {
         return self.bindLayerWorkspace(layout, span, bytes);
     }
 
+    pub fn bindFfnScratch(self: *const Module, ffn: @import("dense_ffn_workspace.zig").Layout) !?buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const span = layout.ffn_workspace orelse return null;
+        if (ffn.rows != self.rows or ffn.hidden != self.hidden or ffn.vendor_bytes != 0) return error.InvalidExecutionPlan;
+        return try self.bindLayerWorkspace(layout, span, ffn.scratch_bytes);
+    }
+
     pub fn bindFusedHeadWorkspace(self: *const Module) !buffer.DeviceBuffer {
         const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
         const span = layout.fused_head_workspace orelse return error.InvalidExecutionPlan;
@@ -838,6 +854,7 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
         .recurrent_heads = .{ .key = 16, .value = 32 },
         .attention_layers = 1,
         .recurrent_layers = 1,
+        .ffn_intermediate = 9216,
     };
     const base = try descriptor.layout();
     var phase: GraphPhase = undefined;
@@ -886,6 +903,15 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
     const attention_output = try output_owner.bindLayerOutput(.attention, rows, 8 * 256);
     try std.testing.expectEqual(@as(usize, rows * 8 * 256 * @sizeOf(f32)), attention_output.len);
     try std.testing.expect(attention_output.ptr >= output_owner.metadata.ptr + attention.offset + attention.bytes);
+
+    try phase.declareFfnScratch();
+    output_owner.hidden = descriptor.hidden;
+    output_owner.storage_layout = phase.storage_layout;
+    output_owner.metadata.len = phase.storage_layout.metadata_bytes;
+    const Ffn = @import("dense_ffn_workspace.zig").Layout;
+    const ffn = try Ffn.init(rows, descriptor.hidden, descriptor.ffn_intermediate, 0);
+    try std.testing.expectEqual(output_owner.metadata.ptr + attention.offset, (try output_owner.bindFfnScratch(ffn)).?.ptr);
+    try std.testing.expectError(error.InvalidExecutionPlan, output_owner.bindFfnScratch(try Ffn.init(rows, descriptor.hidden, descriptor.ffn_intermediate + 128, 0)));
 
     var fused = descriptor;
     fused.hidden = 1024;

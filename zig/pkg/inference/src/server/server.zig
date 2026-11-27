@@ -48806,7 +48806,13 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
             try std.testing.expectEqual(recurrent_output, report.declared_recurrent_output_bytes);
             const attention_bytes = std.mem.alignForward(usize, report.attention_scratch_bytes, alignment) + report.declared_attention_output_bytes;
             const recurrent_bytes = std.mem.alignForward(usize, report.recurrent_scratch_bytes, alignment) + report.declared_recurrent_output_bytes;
-            const shared_bytes = @max(attention_bytes, recurrent_bytes, report.fused_head_scratch_bytes, report.shared_head_scratch_bytes);
+            if (report.declared_ffn_scratch_bytes != 0) {
+                var intermediate: usize = 0;
+                for (0..geometry.num_hidden_layers) |layer| intermediate = @max(intermediate, geometry.intermediateSize(layer));
+                const ffn = try @import("../ops/cuda/dense_ffn_workspace.zig").Layout.init(report.rows, geometry.hidden_size, intermediate, 0);
+                try std.testing.expectEqual(ffn.scratch_bytes, report.declared_ffn_scratch_bytes);
+            }
+            const shared_bytes = @max(attention_bytes, recurrent_bytes, report.declared_ffn_scratch_bytes, report.fused_head_scratch_bytes, report.shared_head_scratch_bytes);
             try std.testing.expectEqual(shared_bytes, report.shared_layer_workspace_bytes);
             std.debug.print("LIGHTONOCR3 observed_cuda_workspace rows={d} readback_bytes={d} backing={s} route={s} attention_scratch_bytes={d} recurrent_scratch_bytes={d} shared_layer_workspace_bytes={d} attention_output_bytes={d} recurrent_output_bytes={d}\n", .{ report.rows, report.readback_bytes, @tagName(report.readback_backing), @tagName(report.route), report.attention_scratch_bytes, report.recurrent_scratch_bytes, report.shared_layer_workspace_bytes, report.declared_attention_output_bytes, report.declared_recurrent_output_bytes });
         }
