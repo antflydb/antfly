@@ -16237,13 +16237,13 @@ pub const PreparedComputeAdmission = if (build_options.enable_cuda) struct {
         self.request_count = self.base_request_count + 1;
         self.warm = Cache.Funding.compatibility();
     }
-    /// PAGE has priority over only unused READY optional reservations. Called
+    /// An admitted reader may release unused READY optional reservations. Called
     /// outside ALL actual execution lanes. Published cache/graph quota lives
     /// in its concrete backing, not in these already-consumed phase entries.
     /// Preserve the exact request policy: existing charged retention remains
     /// intact; compatibility declines only future misses. The next normal
     /// outside preparation retries the original policy without permanent disable.
-    pub fn releaseUnusedFundingForPageOutside(self: *@This()) !bool {
+    pub fn releaseUnusedOptionalFundingOutside(self: *@This()) !bool {
         if (self.bound) return error.PreparedComputeAdmissionStillBound;
         var unused = false;
         for (self.funding().entries) |entry| {

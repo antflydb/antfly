@@ -1104,7 +1104,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             return factory.node.model_manager.acquireGenerationResources(&.{.{ .session = factory.model.session, .resources = .{ .backend_class = .gpu, .limits = factory.limits, .amounts = amounts } }}) catch |err| {
                 if (unpublished or (err != error.ResourceLimitExceeded and err != error.ResourceTemporarilyUnavailable)) return err;
                 if (comptime build_options.enable_cuda) if (ctx.norm_preparation) |norms| {
-                    if (try norms.releaseUnusedFundingForPageOutside()) {
+                    if (try norms.releaseUnusedOptionalFundingOutside()) {
                         // SAME PAGE amounts, exactly one retry, no math replay.
                         return factory.node.model_manager.acquireGenerationResources(&.{.{ .session = factory.model.session, .resources = .{ .backend_class = .gpu, .limits = factory.limits, .amounts = amounts } }});
                     }
@@ -1328,7 +1328,17 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                     }
                     return err;
                 };
-                phase.prepareOutside(model) catch |err| {
+                const funded: anyerror!void = phase.prepareOutside(model) catch |err| retry: {
+                    if (err != error.ResourceTemporarilyUnavailable) break :retry err;
+                    phase.destroyOutside();
+                    // Yield unused optional cache reservations to the already
+                    // admitted step. Retry once outside the reader lanes.
+                    const released = preparation.releaseUnusedOptionalFundingOutside() catch |failure| break :retry failure;
+                    if (!released) break :retry err;
+                    control.check() catch |failure| break :retry failure;
+                    break :retry phase.prepareOutside(model);
+                };
+                funded catch |err| {
                     phase.destroyOutside(); // inert failed phase, outside all gates
                     parked.restoreKeepingStep() catch platform.inference_process_supervisor.restartWorker();
                     switch (err) {
