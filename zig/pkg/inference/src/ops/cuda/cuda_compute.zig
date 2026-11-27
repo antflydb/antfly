@@ -21036,6 +21036,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         }
         if (!entry.warmed) {
             const out = try run(context, canonical[0..canonical_count]);
+            if (std.mem.indexOfScalar(CT, canonical[0..canonical_count], out) != null) return error.AudioPlanChanged;
             entry.warmed = true;
             return out;
         }
@@ -21055,6 +21056,10 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
             return err;
         };
         self.execution_scope = null;
+        if (std.mem.indexOfScalar(CT, canonical[0..canonical_count], out) != null) {
+            retireUnusableAudioPlan(entry, plan_cleanup, false);
+            return error.AudioPlanChanged;
+        }
         const result = tensorFromCt(out);
         if (!audioOutputMatches(first_input, result, output_bytes) or
             self.stats.h2d_bytes != h2d_before or self.stats.d2h_bytes != d2h_before or
@@ -21160,8 +21165,12 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         const matches = self.stats.h2d_bytes == h2d_before and self.stats.d2h_bytes == d2h_before and
             scope.complete() and result_tensor.buffer.ptr == expected_output and audioOutputMatches(first_input, result_tensor, output_bytes);
         if (!matches and capture) graph_mod.discardRecording(&self.ctx);
-        if (scope.owns(result_tensor.buffer.ptr)) result_tensor.owns_buffer = false;
-        freeTensor(self, result);
+        // Invocation teardown owns the input headers, including when the
+        // callback incorrectly returns one as its publication.
+        if (matches or std.mem.indexOfScalar(CT, stable[0..count], result) == null) {
+            if (scope.owns(result_tensor.buffer.ptr)) result_tensor.owns_buffer = false;
+            freeTensor(self, result);
+        }
         if (!matches) {
             entry.disabled = true;
             // The ordinary callback may already have submitted numerical work.
@@ -59138,6 +59147,31 @@ test "CUDA audio learning cache state uses actual warm no-plan eligibility and o
     compute.audio_plans.entries[0].owner = null;
     compute.audio_plans.entries[0].disabled = true;
     try std.testing.expect(!(try compute.cacheRequestState(request)).miss);
+}
+
+test "CUDA audio rejects borrowed input as warm or learned publication" {
+    var compute = metadataOnlyTestCompute();
+    compute.allocator = std.testing.allocator;
+    compute.capability_profile = .embedding_gemma2;
+    compute.embedding_gemma2_policy = .{ .audio_graph = true };
+    compute.ctx.driver.fns.cuStreamIsCapturing = null;
+
+    var shape = [_]i64{4};
+    var input: CudaTensor = .{ .buffer = .{ .ptr = 0x1000, .len = 16 }, .shape = &shape, .elem_count = 4, .dtype = .f32 };
+    const base = try compute.audioCacheBase(71, &.{.{ .shape = &shape, .elements = 4 }}, null);
+    const Run = struct {
+        fn call(_: *anyopaque, inputs: []const CT) !CT {
+            return inputs[0];
+        }
+    };
+    for ([_]bool{ false, true }) |warmed| {
+        compute.audio_plans.entries[0] = .{ .key = base.key, .stamp = 1, .warmed = warmed };
+        try std.testing.expectError(error.AudioPlanChanged, audioExecutionOp(&compute, 71, &.{@ptrCast(&input)}, &compute, Run.call, .{}, false));
+        try std.testing.expectEqual(@as(usize, 1), input.resident_references.load(.acquire));
+        try std.testing.expect(compute.audio_plans.entries[0].owner == null);
+        try std.testing.expectEqual(warmed, compute.audio_plans.entries[0].disabled);
+        try std.testing.expect(compute.execution_scope == null and !compute.audio_execution_active);
+    }
 }
 
 test "CUDA warmed audio declines unfunded learning before borrowing inputs" {
