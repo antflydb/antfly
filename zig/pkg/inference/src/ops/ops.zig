@@ -3054,6 +3054,8 @@ pub const ComputeBackend = struct {
         audioSetControl: ?*const fn (ctx: *anyopaque, control: ?InferenceExecutionControl) ?InferenceExecutionControl = null,
         audioStorage: ?*const fn (ctx: *anyopaque, begin: bool) anyerror!bool = null,
         audioPad: ?*const fn (ctx: *anyopaque, input: CT, p: AudioPadParams) anyerror!?CT = null,
+        /// run submits work synchronously. Input handles are borrowed for the
+        /// callback and its returned output must own an independent handle.
         audioExecution: ?*const fn (ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: @import("../execution/cleanup_context.zig").Context, defer_arena: bool) anyerror!?CT = null,
         audioLogMelEnabled: ?*const fn (ctx: *anyopaque) bool = null,
         audioLogMel: ?*const fn (ctx: *anyopaque, pcm: CT, plan: CT, mask: CT, frames: usize, hop: usize, floor: f32) anyerror!?CT = null,

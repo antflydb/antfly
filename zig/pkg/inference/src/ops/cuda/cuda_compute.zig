@@ -21126,20 +21126,22 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         // Eager execution borrows the same logical input spans from the caller.
         // Recording binds them to the cache's fixed addresses.
         const scope = &execution_scope.?;
+        var views: [20]CudaTensor = undefined;
         var stable: [20]CT = undefined;
-        var count: usize = 0;
-        defer for (stable[0..count]) |ct| freeTensor(self, ct);
-        for (inputs, spans) |ct, span| {
+        for (inputs, spans, views[0..inputs.len], stable[0..inputs.len]) |ct, span, *view, *handle| {
             const input = tensorFromCt(ct);
             const source = if (capture) input_bank else input.buffer;
             const offset = if (capture) span.offset else 0;
-            const buffer = try borrowBufferRange(source, offset, span.bytes);
-            const borrowed = try createTensor(self, buffer, input.shape, input.elem_count);
-            const view = tensorFromCt(borrowed);
-            view.owns_buffer = false;
-            view.owns_shape = false;
-            stable[count] = borrowed;
-            count += 1;
+            view.* = .{
+                .buffer = try borrowBufferRange(source, offset, span.bytes),
+                .shape = input.shape,
+                .elem_count = input.elem_count,
+                .dtype = .f32,
+                .owns_buffer = false,
+                .owns_shape = false,
+                .owned_by_tensor = false,
+            };
+            handle.* = @ptrCast(view);
         }
         if (capture) self.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED) catch {
             arena.disabled = true;
@@ -21148,7 +21150,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         const h2d_before = self.stats.h2d_bytes;
         const d2h_before = self.stats.d2h_bytes;
         self.execution_scope = scope;
-        const result = run(context, stable[0..count]) catch |err| {
+        const result = run(context, stable[0..inputs.len]) catch |err| {
             self.execution_scope = null;
             if (capture) {
                 graph_mod.discardRecording(&self.ctx);
@@ -21165,12 +21167,8 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         const matches = self.stats.h2d_bytes == h2d_before and self.stats.d2h_bytes == d2h_before and
             scope.complete() and result_tensor.buffer.ptr == expected_output and audioOutputMatches(first_input, result_tensor, output_bytes);
         if (!matches and capture) graph_mod.discardRecording(&self.ctx);
-        // Invocation teardown owns the input headers, including when the
-        // callback incorrectly returns one as its publication.
-        if (matches or std.mem.indexOfScalar(CT, stable[0..count], result) == null) {
-            if (scope.owns(result_tensor.buffer.ptr)) result_tensor.owns_buffer = false;
-            freeTensor(self, result);
-        }
+        if (scope.owns(result_tensor.buffer.ptr)) result_tensor.owns_buffer = false;
+        freeTensor(self, result);
         if (!matches) {
             entry.disabled = true;
             // The ordinary callback may already have submitted numerical work.
