@@ -272,7 +272,8 @@ test "CUDA declared audio workspace matches the observed capture layout" {
 
     var observed: Owner = .{ .allocator = std.testing.allocator };
     var scope = arena.Scope.observe(&observed.plan);
-    scope.recordScratchInterval(256);
+    scope.recordScratchAllocation(256, 0x1000);
+    scope.release(0x1000);
     observed.plan.allocate(output_bytes, 0x2000);
     try std.testing.expect(observed.seal(0x2000, bindings));
     try std.testing.expectEqualDeep(observed.executable.?, declared.executable.?);
