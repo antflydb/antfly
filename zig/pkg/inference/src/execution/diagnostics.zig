@@ -99,8 +99,9 @@ pub const PendingInterval = struct {
         metal_command_waits: ?u64 = null,
         cuda_accepted_launch_calls: ?u64 = null,
         cuda_host_waits: ?observation.CudaHostWaits = null,
+        cuda_vendor_convolution: ?observation.CudaVendorConvolution = null,
 
-        pub fn join(self: *ObservedPhases, transfers: @import("transfer_audit.zig").Measurements, submission: observation.Counters, cuda_launch_calls: ?u64, wall_ns: ?u64) void {
+        pub fn join(self: *ObservedPhases, transfers: @import("transfer_audit.zig").Measurements, submission: observation.Counters, cuda_launch_calls: ?u64, wall_ns: ?u64, vendor_convolution: ?observation.CudaVendorConvolution) void {
             self.uploads +|= transfers.upload_calls;
             self.upload_bytes +|= transfers.upload_bytes;
             self.downloads +|= transfers.download_calls;
@@ -119,6 +120,10 @@ pub const PendingInterval = struct {
             self.metal_command_submissions = sum(self.count, self.metal_command_submissions, submission.metal_command_submissions);
             self.metal_command_waits = sum(self.count, self.metal_command_waits, submission.metal_command_waits);
             self.cuda_accepted_launch_calls = sum(self.count, self.cuda_accepted_launch_calls, cuda_launch_calls);
+            if (vendor_convolution) |delta| {
+                if (self.cuda_vendor_convolution == null) self.cuda_vendor_convolution = .{};
+                self.cuda_vendor_convolution.?.accumulate(delta);
+            }
             self.cuda_host_waits = if (self.count == 0) submission.cuda_host_waits else if (self.cuda_host_waits) |prior|
                 if (submission.cuda_host_waits) |delta| prior.add(delta) else null
             else
@@ -618,4 +623,20 @@ test "invocation capture preserves route metadata alongside later program counte
     program.publishProgram(.{ .execution = .{ .assigned_kernel_dispatches = 1 } });
     const next = capture.finish().?;
     try std.testing.expect(next.report.?.stage_placement == null and next.report.?.decoder_route == null);
+}
+
+test "pending cuDNN phases sum SDK calls and retain the maximum explicit scratch" {
+    var phases: PendingInterval.ObservedPhases = .{};
+    const transfer = @import("transfer_audit.zig").Measurements{};
+    phases.join(transfer, .{}, null, null, null);
+    try std.testing.expect(phases.cuda_vendor_convolution == null);
+    phases.join(transfer, .{}, null, null, .{ .forward_calls = 1, .max_explicit_workspace_bytes = 512, .max_source_bank_bytes = 1024 });
+    phases.join(transfer, .{}, null, null, .{ .forward_calls = 2, .bias_calls = 1, .max_explicit_workspace_bytes = 256, .max_source_bank_bytes = 1536 });
+    phases.join(transfer, .{}, null, null, null);
+    try std.testing.expectEqualDeep(observation.CudaVendorConvolution{
+        .forward_calls = 3,
+        .bias_calls = 1,
+        .max_explicit_workspace_bytes = 512,
+        .max_source_bank_bytes = 1536,
+    }, phases.cuda_vendor_convolution.?);
 }

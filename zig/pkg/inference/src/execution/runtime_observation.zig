@@ -495,6 +495,13 @@ pub const CudaVendorConvolution = struct {
     max_explicit_workspace_bytes: usize = 0,
     max_source_bank_bytes: usize = 0,
 
+    pub fn accumulate(self: *CudaVendorConvolution, delta: CudaVendorConvolution) void {
+        self.forward_calls +|= delta.forward_calls;
+        self.bias_calls +|= delta.bias_calls;
+        self.max_explicit_workspace_bytes = @max(self.max_explicit_workspace_bytes, delta.max_explicit_workspace_bytes);
+        self.max_source_bank_bytes = @max(self.max_source_bank_bytes, delta.max_source_bank_bytes);
+    }
+
     pub inline fn record(workspace_bytes: usize, source_bytes: usize, bias: bool) void {
         var active = active_kernels;
         while (active) |scope| : (active = scope.previous) {
