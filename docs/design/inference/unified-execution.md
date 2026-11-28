@@ -2918,6 +2918,37 @@ on the host. Their existing readback path took 17.19–17.34 ms per burst,
 including GPU completion. This single fixture verifies the phase timing
 boundaries. It does not attribute the paired HTTP tail.
 
+### Shared grouped CUDA audio block at `b4d02a9862`
+
+Declared and observed BF16 CUDA audio plans execute the same encoder block
+program with prepared relative keys. Cold declaration metadata grows with
+the emitted events, and both modes preserve the eager route when the
+graph is unavailable. The released EmbeddingGemma 2 checkpoint passed
+all 45 focused Spark checks in declared mode and its grouped fixture
+passed again in observed mode using the same executable. Both plans used
+a 36,788,736-byte arena with 132 scratch intervals. Declared mode bound the
+arena on the first invocation and replayed four times in seven calls.
+Observed mode warmed and learned first, then replayed twice.
+
+The production HTTP comparison used the same binary and fixtures for both
+policies. It ran 32 measured requests per side and group width in AA, ABBA
+and BB. All 576 requests succeeded. The output hashes matched across
+policies and matched the earlier `a1e8a50b22` comparison. A separate
+untimed witness recorded 18 arena executions and nine graph replays.
+
+| Clips | Observed p50 / p95 (ms) | Declared p50 / p95 (ms) |
+| --- | ---: | ---: |
+| 2 | 27.45 / 30.09 | 27.03 / 27.90 |
+| 3 | 32.82 / 35.20 | 32.15 / 32.76 |
+| 4 | 36.57 / 39.93 | 35.70 / 36.30 |
+
+Spark shared the GPU with another Inkling process during this comparison.
+The four-clip observed-only p95 ranged from 39.66 to 88.87 ms. The paired
+measurements showed no latency regression for the declared route. The
+controls limit attribution of the difference to the workspace policy.
+Graph selection stays opt-in. F32 and ungrouped audio retain their existing
+execution and ownership paths.
+
 ### Isolated Metal E4B HTTP comparison at `58b3917a89`
 
 The local M4 Max used the same pinned binaries as the mixed serving
