@@ -5182,7 +5182,7 @@ fn audioLightConv(
     // GGUF's inherited tensor mapping swaps the two convolution norm names.
     // Keep HF's logical names intact for the EmbeddingGemma 2 path.
     const norm_names = audioConvNormNames(store.gguf != null);
-    const pw2 = project: {
+    const pw2 = finish_projection: {
         const activated = activate: {
             const conv_normed = normalize: {
                 const conv = depthwise: {
@@ -5209,7 +5209,7 @@ fn audioLightConv(
             break :activate try audioSourceRoundOwned(cb, cfg, try cb.silu(conv_normed));
         };
         defer cb.free(activated);
-        break :project try audioSourceLinear(cb, allocator, store, cfg, activated, try fmt(&buf, "a.blk.{d}.conv_pw2", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden, .column_major, false, false);
+        break :finish_projection try audioSourceLinear(cb, allocator, store, cfg, activated, try fmt(&buf, "a.blk.{d}.conv_pw2", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden, .column_major, false, false);
     };
     defer cb.free(pw2);
     return audioSourceRoundOwned(cb, cfg, try cb.add(input, pw2));
