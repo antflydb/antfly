@@ -3260,6 +3260,19 @@ had no graph scratch-funding denials. Consistent wide replay under
 chunked prefill therefore also depends on graph lifetime across foreground
 work and page transitions.
 
+Dropping independent projected prompt rows no longer clears the CUDA
+decode graph at `3d0ba0620a`. Actual recurrent and KV release still
+invalidates dependent graphs. All 52 focused Spark checks passed.
+The two 256-page runs matched serial output exactly, each with 512
+packed chunks and zero retirement-capacity retries. The unprofiled
+run reached 6.38 pages/s and replayed at 30 rows. The profiled run
+reached 6.27 pages/s without replay. Each run recorded a 113-row graph
+that retired when dependent page state was cleaned up, before the
+first completed replay. The profiled run also retired a recorded
+29-row graph at the same boundary. The maintenance change removes an
+unrelated invalidation, while the wide replay gate remains open under
+chunked prefill.
+
 The M4 Max focused cohort at `061f213135` passed all seven checks
 with zero skips. It exercised the shared installed Whisper Small
 checkpoint with the Metal backend required, verified assigned packed
