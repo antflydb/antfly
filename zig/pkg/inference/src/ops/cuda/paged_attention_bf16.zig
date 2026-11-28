@@ -133,6 +133,13 @@ pub const Page = extern struct {
     block_count: u32 = 0,
     block_offset: u32 = 0,
 };
+pub const PageTable = extern struct {
+    pages: [max_packet_rows]Page,
+    blocks: [max_blocks]u32,
+};
+comptime {
+    if (@sizeOf(PageTable) != 17408) @compileError("attention device page table ABI changed");
+}
 pub const Params = extern struct {
     q: driver.CUdeviceptr = 0,
     k: driver.CUdeviceptr = 0,
@@ -153,7 +160,7 @@ pub const Params = extern struct {
     blocks: [max_blocks]u32 = @splat(0),
     graph_progress: driver.CUdeviceptr = 0,
     graph_step: u32 = 0,
-    reserved: u32 = 0,
+    page_table_offset: u32 = 0,
 
     /// Snapshot the authoritative physical table before another sequence can
     /// reuse storage's host scratch. The packet has one shared capacity rather

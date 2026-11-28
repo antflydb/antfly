@@ -3410,6 +3410,17 @@ EOS, and dependent page cleanup retired that graph before its first
 replay. Candidate replay reached 30 and 19 rows. Baseline replay
 reached 113 and 30 rows. Wide replay remains unqualified.
 
+The opt-in attention table holds each packet's base lengths and block
+IDs in admitted CUDA graph metadata. Warmup and recording refresh the
+table before dispatch, and replay reads it using the graph progress
+counter. The inline route shares the same numerical kernels. With both
+device tables enabled, all four focused Spark checks passed. The
+released reader verified the 17,408-byte attention table and replayed a
+declared two-row graph. Pinned SM121 assembly kept zero spills and the
+same shared-memory usage in every attention kernel. Registers grew
+from 40 to 48 for ungrouped 32-token attention and from 18 to 22 for
+suffix writes. The graph still attests a single exact cohort.
+
 The M4 Max focused cohort at `061f213135` passed all seven checks
 with zero skips. It exercised the shared installed Whisper Small
 checkpoint with the Metal backend required, verified assigned packed

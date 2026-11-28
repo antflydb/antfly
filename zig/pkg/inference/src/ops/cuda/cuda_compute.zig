@@ -3752,6 +3752,43 @@ pub const CudaCompute = struct {
         try copyFromHostTracked(self, table, std.mem.sliceAsBytes(bindings));
     }
 
+    pub fn lightOnDeviceAttentionPagesEnabled(cb: *const ops.ComputeBackend) bool {
+        if (!acceptsPhysicalImplementation(cb.vtable) or !platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_DEVICE_ATTENTION_PAGES")) return false;
+        const self: *const CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.lighton_batched_kv_write_enabled;
+    }
+
+    fn stageBoundedAttentionPages(self: *CudaCompute, descriptor: @import("bounded_decode_graph.zig").Descriptor, page_size: u32) !void {
+        const start = descriptor.attention_page_key_start orelse return;
+        const table = self.bounded_decode_graph.attentionPageTables() orelse return error.InvalidExecutionPlan;
+        const attention = @import("paged_attention_bf16.zig");
+        var tables: [2]attention.PageTable = undefined;
+        var packets: usize = 0;
+        var cursor = start;
+        var row: usize = 0;
+        while (row < descriptor.rows) {
+            const rows = @min(descriptor.rows - row, attention.max_packet_rows);
+            var params: attention.Params = .{ .items = @intCast(rows), .page_size = page_size };
+            for (0..rows) |index| {
+                if (cursor > descriptor.key.len or descriptor.key.len - cursor < 3) return error.InvalidExecutionPlan;
+                const count = std.math.cast(usize, descriptor.key[cursor + 2]) orelse return error.InvalidExecutionPlan;
+                cursor += 3;
+                if (count > attention.max_blocks or count > descriptor.key.len - cursor) return error.InvalidExecutionPlan;
+                var blocks: [attention.max_blocks]u32 = undefined;
+                for (descriptor.key[cursor..][0..count], blocks[0..count]) |word, *id| {
+                    id.* = std.math.cast(u32, word) orelse return error.InvalidExecutionPlan;
+                }
+                const tokens = descriptor.attention_tokens[row + index];
+                if (tokens == 0 or !params.appendPage(index, tokens, tokens - 1, blocks[0..count])) return error.InvalidExecutionPlan;
+                cursor += count;
+            }
+            tables[packets] = .{ .pages = params.pages, .blocks = params.blocks };
+            packets += 1;
+            row += rows;
+        }
+        try copyFromHostTracked(self, table, std.mem.sliceAsBytes(tables[0..packets]));
+    }
+
     pub fn lightOnGraphStateOwned(cb: *const ops.ComputeBackend, state: *const @import("gated_delta.zig").State) bool {
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         const eligible = state.ctx == &self.ctx and state.initialized and !state.failed and
@@ -3914,10 +3951,12 @@ pub const CudaCompute = struct {
         pub fn beginStep(self: *@This(), step: usize) void {
             self.compute.bounded_decode_graph.capture_step = @intCast(step);
             self.compute.bounded_decode_graph.recurrent_page_layer = 0;
+            self.compute.bounded_decode_graph.attention_page_packet = 0;
         }
         pub fn advance(self: *@This()) !void {
             const owner = &self.compute.bounded_decode_graph;
             if (owner.recurrentPageTable() != null and owner.recurrent_page_layer != owner.recurrent_layers) return error.InvalidExecutionPlan;
+            if (owner.attentionPageTables() != null and owner.attention_page_packet != owner.expected_attention_calls / 2) return error.InvalidExecutionPlan;
             try self.compute.lighton_attention.advanceGraph(&self.compute.ctx, owner.positions().ptr, owner.counter().ptr, @intCast(owner.rows * 3));
         }
         pub fn run(self: *@This(), context: *anyopaque, callback: *const fn (*anyopaque, *@This()) anyerror!void) !void {
@@ -4098,6 +4137,7 @@ pub const CudaCompute = struct {
                     .attention_scratch_bytes = if (layout.attention_workspace) |span| span.bytes else 0,
                     .recurrent_scratch_bytes = owner.bound_recurrent_scratch_bytes,
                     .recurrent_page_table_bytes = if (layout.recurrent_page_table) |span| span.bytes else 0,
+                    .attention_page_table_bytes = if (layout.attention_page_tables) |span| span.bytes else 0,
                     .declared_attention_output_bytes = if (layout.attention_output) |span| span.bytes else 0,
                     .declared_recurrent_joined_projection_bytes = if (layout.recurrent_projection_joined) |span| span.bytes else 0,
                     .bound_recurrent_joined_projection_bytes = owner.bound_recurrent_joined_projection_bytes,
@@ -4465,7 +4505,7 @@ pub const CudaCompute = struct {
         const vendor = self.currentGraphVendorWorkspace() orelse return error.PreparedCachePlanChanged;
         if (!std.meta.eql(vendor, graph_phase.vendor_workspace)) return error.PreparedCachePlanChanged;
         const descriptor = graph_phase.descriptor;
-        if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or descriptor.minimum_remaining_tokens != expected.minimum_remaining_tokens or descriptor.recurrent_page_key_start != expected.recurrent_page_key_start or !std.meta.eql(descriptor.attention_geometry, expected.attention_geometry) or !std.meta.eql(descriptor.recurrent_heads, expected.recurrent_heads) or !std.meta.eql(descriptor.recurrent_projection_widths, expected.recurrent_projection_widths) or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or descriptor.ffn_intermediate != expected.ffn_intermediate or descriptor.attention_q_gate != expected.attention_q_gate or descriptor.norm_weight_offset != expected.norm_weight_offset or !std.meta.eql(descriptor.head_storage, expected.head_storage) or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions) or !std.mem.eql(u64, descriptor.sequences, expected.sequences)) return error.PreparedCachePlanChanged;
+        if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or descriptor.minimum_remaining_tokens != expected.minimum_remaining_tokens or descriptor.recurrent_page_key_start != expected.recurrent_page_key_start or descriptor.attention_page_key_start != expected.attention_page_key_start or descriptor.attention_page_size != expected.attention_page_size or !std.mem.eql(u32, descriptor.attention_tokens, expected.attention_tokens) or !std.meta.eql(descriptor.attention_geometry, expected.attention_geometry) or !std.meta.eql(descriptor.recurrent_heads, expected.recurrent_heads) or !std.meta.eql(descriptor.recurrent_projection_widths, expected.recurrent_projection_widths) or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or descriptor.ffn_intermediate != expected.ffn_intermediate or descriptor.attention_q_gate != expected.attention_q_gate or descriptor.norm_weight_offset != expected.norm_weight_offset or !std.meta.eql(descriptor.head_storage, expected.head_storage) or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions) or !std.mem.eql(u64, descriptor.sequences, expected.sequences)) return error.PreparedCachePlanChanged;
         const owner = &self.bounded_decode_graph;
         while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
         var claimed = false;
@@ -4502,6 +4542,11 @@ pub const CudaCompute = struct {
         if (owner.phase == .warm and owner.storage_layout.?.fused_head_workspace != null)
             try self.lighton_head.init(&self.ctx);
         if (owner.phase != .replay) {
+            if (descriptor.attention_page_key_start != null) {
+                owner.attention_page_tables_staged = false;
+                try self.stageBoundedAttentionPages(descriptor, descriptor.attention_page_size);
+                owner.attention_page_tables_staged = true;
+            }
             owner.progress = 0;
             @memcpy(owner.base_positions[0..positions.len], positions);
             @memcpy(owner.next_positions[0..positions.len], positions);
@@ -34049,6 +34094,7 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
     if (captured) {
         params.graph_progress = self.bounded_decode_graph.counter().ptr;
         params.graph_step = self.bounded_decode_graph.capture_step;
+        params.page_table_offset = try self.bounded_decode_graph.nextAttentionPageTableOffset(views.len);
     }
     // Allocate and qualify the module before the first KV mutation. Physical
     // buffers use the existing budgeted temporary pool and retire on this stream.

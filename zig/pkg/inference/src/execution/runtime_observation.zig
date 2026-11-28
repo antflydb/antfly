@@ -552,6 +552,7 @@ pub const CudaDecoderWorkspace = struct {
     attention_scratch_bytes: usize,
     recurrent_scratch_bytes: usize = 0,
     recurrent_page_table_bytes: usize = 0,
+    attention_page_table_bytes: usize = 0,
     /// Each layer's output is live alongside that layer's scratch.
     declared_attention_output_bytes: usize = 0,
     declared_recurrent_output_bytes: usize = 0,

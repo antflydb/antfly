@@ -86,6 +86,7 @@ pub const StorageLayout = struct {
     positions: Span,
     counter: Span,
     recurrent_page_table: ?Span = null,
+    attention_page_tables: ?Span = null,
     attention_workspace: ?Span = null,
     attention_output: ?Span = null,
     recurrent_workspace: ?Span = null,
@@ -243,7 +244,7 @@ pub const StorageLayout = struct {
     }
 
     fn layerWorkspaceOffset(self: StorageLayout) !usize {
-        const final = self.recurrent_page_table orelse self.counter;
+        const final = self.attention_page_tables orelse self.recurrent_page_table orelse self.counter;
         return aligned(try std.math.add(usize, final.offset, final.bytes));
     }
 
@@ -329,6 +330,9 @@ pub const Descriptor = struct {
     recurrent_heads: ?struct { key: usize, value: usize } = null,
     recurrent_projection_widths: ?[4]usize = null,
     recurrent_page_key_start: ?usize = null,
+    attention_page_key_start: ?usize = null,
+    attention_tokens: []const u32 = &.{},
+    attention_page_size: u32 = 0,
     attention_layers: usize,
     recurrent_layers: usize,
     ffn_intermediate: usize = 0,
@@ -355,6 +359,13 @@ pub const Descriptor = struct {
             storage.metadata_bytes = try storage.layerWorkspaceOffset();
         }
 
+        if (self.attention_page_key_start != null) {
+            if (self.attention_tokens.len != self.rows or self.attention_layers == 0 or self.attention_page_size == 0 or self.rows == 0) return error.InvalidShape;
+            const packets = (self.rows - 1) / paged_attention.max_packet_rows + 1;
+            const bytes = try std.math.mul(usize, packets, @sizeOf(paged_attention.PageTable));
+            storage.attention_page_tables = .{ .offset = storage.metadata_bytes, .bytes = bytes };
+            storage.metadata_bytes = try storage.layerWorkspaceOffset();
+        }
         if (self.head_storage == .shared_layer_packets) {
             const elements = try std.math.mul(usize, @min(self.rows, packet_rows), self.vocab);
             const bytes = try std.math.mul(usize, elements, @sizeOf(f32));
@@ -801,6 +812,8 @@ pub const Module = struct {
     capture_step: u32 = 0,
     recurrent_page_layer: usize = 0,
     recurrent_page_table_staged: bool = false,
+    attention_page_tables_staged: bool = false,
+    attention_page_packet: usize = 0,
     active: bool = false,
     captures: u64 = 0,
     replays: u64 = 0,
@@ -892,6 +905,24 @@ pub const Module = struct {
     }
     pub const Dependency = union(enum) { recurrent: u64, sequence: u64 };
 
+    pub fn attentionPageTables(self: *const Module) ?buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return null;
+        return if (layout.attention_page_tables) |span| span.bind(self.metadata) else null;
+    }
+
+    pub fn nextAttentionPageTableOffset(self: *Module, rows: usize) !u32 {
+        const table = self.attentionPageTables() orelse return 0;
+        if (!self.active or !self.attention_page_tables_staged or self.attention_page_packet >= self.expected_attention_calls / 2)
+            return error.InvalidExecutionPlan;
+        const packets = table.len / @sizeOf(paged_attention.PageTable);
+        const packet = self.attention_page_packet % packets;
+        const expected_rows = @min(paged_attention.max_packet_rows, self.rows - packet * paged_attention.max_packet_rows);
+        if (rows != expected_rows) return error.InvalidExecutionPlan;
+        const offset = table.ptr - self.counter().ptr + packet * @sizeOf(paged_attention.PageTable);
+        self.attention_page_packet += 1;
+        return std.math.cast(u32, offset) orelse error.InvalidExecutionPlan;
+    }
+
     pub fn nextRecurrentPageLayer(self: *Module, rows: usize) !?buffer.DeviceBuffer {
         const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
         const table = layout.recurrent_page_table orelse return null;
@@ -951,6 +982,7 @@ pub const Module = struct {
         self.vocab = vocab;
         self.storage_layout = layout;
         self.recurrent_page_table_staged = false;
+        self.attention_page_tables_staged = false;
         @memcpy(self.base_positions[0..positions_.len], positions_);
         @memcpy(self.next_positions[0..positions_.len], positions_);
         self.phase = .warm;

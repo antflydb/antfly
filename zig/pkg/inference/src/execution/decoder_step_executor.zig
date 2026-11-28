@@ -835,7 +835,7 @@ pub const Executor = struct {
                 key.len += 1;
             }
         };
-        const Info = struct { max_future: usize, minimum_remaining_tokens: usize, attention_count: usize, recurrent_page_key_start: usize };
+        const Info = struct { max_future: usize, minimum_remaining_tokens: usize, attention_count: usize, recurrent_page_key_start: usize, attention_page_key_start: usize };
         fn decline(code: *CudaGraphDecline, value: CudaGraphDecline) ?Info {
             code.* = value;
             return null;
@@ -952,6 +952,7 @@ pub const Executor = struct {
             const packet_rows = attention.max_packet_rows;
             var packet_blocks: usize = 0;
             var physical_tokens: usize = 0;
+            const attention_page_key_start = key.len;
             for (items, 0..) |item, i| {
                 if (i % packet_rows == 0) packet_blocks = 0;
                 const state = item.state;
@@ -983,7 +984,7 @@ pub const Executor = struct {
             const kv_count = (try C.lightOnGraphKvWords(self.context.cb, storage, items[0].state.sequence_id.?, max_future, physical_tokens, attention_layers[0..attention_count], &kv_words)) orelse
                 return decline(decline_code, .unbacked_kv_pages);
             for (kv_words[0..kv_count]) |word| try key.add(word);
-            return .{ .max_future = max_future, .minimum_remaining_tokens = minimum_remaining_tokens, .attention_count = attention_count, .recurrent_page_key_start = recurrent_page_key_start };
+            return .{ .max_future = max_future, .minimum_remaining_tokens = minimum_remaining_tokens, .attention_count = attention_count, .recurrent_page_key_start = recurrent_page_key_start, .attention_page_key_start = attention_page_key_start };
         }
     };
 
@@ -1052,7 +1053,13 @@ pub const Executor = struct {
         const recurrent_value_width = @as(usize, config.qwen35_linear_num_value_heads) * config.qwen35_linear_value_head_dim;
         const recurrent_page_key_start = if (attention_count < config.num_hidden_layers and
             C.lightOnDeviceRecurrentPagesEnabled(self.context.cb)) recipe.recurrent_page_key_start else null;
-        const descriptor = graph_owner.Descriptor{ .epoch = self.lighton_cuda_execution_id, .key = key.words[0..key.len], .positions = position_snapshot[0..positions.len], .sequences = sequence_snapshot[0..items.len], .rows = claimed.len, .hidden = self.context.gpt_config.hidden_size, .vocab = self.context.gpt_config.vocab_size, .future_tokens = max_future, .minimum_remaining_tokens = recipe.minimum_remaining_tokens, .recurrent_page_key_start = recurrent_page_key_start, .head_storage = head_storage, .attention_q_gate = config.qwen35_attn_output_gate, .norm_weight_offset = config.norm_weight_offset, .attention_geometry = .{ .heads = self.context.gpt_config.num_attention_heads, .kv_heads = self.context.gpt_config.effectiveKVHeads(), .dim = self.context.gpt_config.headDim() }, .recurrent_heads = .{ .key = self.context.gpt_config.qwen35_linear_num_key_heads, .value = self.context.gpt_config.qwen35_linear_num_value_heads }, .recurrent_projection_widths = .{ 2 * recurrent_key_width + recurrent_value_width, recurrent_value_width, config.qwen35_linear_num_value_heads, config.qwen35_linear_num_value_heads }, .attention_layers = attention_count, .recurrent_layers = self.context.gpt_config.num_hidden_layers - attention_count, .ffn_intermediate = ffn_intermediate };
+        const attention_page_key_start = if (attention_count != 0 and
+            C.lightOnDeviceAttentionPagesEnabled(self.context.cb)) recipe.attention_page_key_start else null;
+        var attention_tokens: [128]u32 = undefined;
+        if (attention_page_key_start != null) {
+            for (items, attention_tokens[0..items.len]) |item, *tokens| tokens.* = @intCast(item.kv_sequence_len);
+        }
+        const descriptor = graph_owner.Descriptor{ .epoch = self.lighton_cuda_execution_id, .key = key.words[0..key.len], .positions = position_snapshot[0..positions.len], .sequences = sequence_snapshot[0..items.len], .rows = claimed.len, .hidden = self.context.gpt_config.hidden_size, .vocab = self.context.gpt_config.vocab_size, .future_tokens = max_future, .minimum_remaining_tokens = recipe.minimum_remaining_tokens, .recurrent_page_key_start = recurrent_page_key_start, .attention_page_key_start = attention_page_key_start, .attention_page_size = storage.storage.config.page_size_tokens, .attention_tokens = if (attention_page_key_start != null) attention_tokens[0..items.len] else &.{}, .head_storage = head_storage, .attention_q_gate = config.qwen35_attn_output_gate, .norm_weight_offset = config.norm_weight_offset, .attention_geometry = .{ .heads = self.context.gpt_config.num_attention_heads, .kv_heads = self.context.gpt_config.effectiveKVHeads(), .dim = self.context.gpt_config.headDim() }, .recurrent_heads = .{ .key = self.context.gpt_config.qwen35_linear_num_key_heads, .value = self.context.gpt_config.qwen35_linear_num_value_heads }, .recurrent_projection_widths = .{ 2 * recurrent_key_width + recurrent_value_width, recurrent_value_width, config.qwen35_linear_num_value_heads, config.qwen35_linear_num_value_heads }, .attention_layers = attention_count, .recurrent_layers = self.context.gpt_config.num_hidden_layers - attention_count, .ffn_intermediate = ffn_intermediate };
         var funding_phase: graph_owner.GraphPhase = undefined;
         try funding_phase.initInto(descriptor);
         defer funding_phase.close(.{ .boundary = self.context.cleanupEpoch() }) catch platform.inference_process_supervisor.restartWorker();
@@ -1077,7 +1084,13 @@ pub const Executor = struct {
             var verified_key = CapturedGraphRecipe.Key{ .words = key.words, .verification_len = key.len };
             const verified = (try CapturedGraphRecipe.build(self, &verified_key, claimed, items, manager, storage, &embedding_out, &head_out, false, &decline_code)) orelse return self.declineLightOnGraph(decline_code);
             const current_positions = first_context.mrope_positions orelse return self.declineLightOnGraph(.admission_or_revalidation);
-            if (verified.max_future != max_future or verified.minimum_remaining_tokens != recipe.minimum_remaining_tokens or verified.attention_count != attention_count or verified.recurrent_page_key_start != recipe.recurrent_page_key_start or (!verified_key.same or verified_key.len != key.len) or !std.mem.eql(u32, position_snapshot[0..positions.len], current_positions)) return self.declineLightOnGraph(.admission_or_revalidation);
+            if (attention_page_key_start != null) {
+                for (items, attention_tokens[0..items.len]) |item, tokens| {
+                    if (item.kv_sequence_len != tokens) return self.declineLightOnGraph(.admission_or_revalidation);
+                }
+            }
+
+            if (verified.max_future != max_future or verified.minimum_remaining_tokens != recipe.minimum_remaining_tokens or verified.attention_count != attention_count or verified.recurrent_page_key_start != recipe.recurrent_page_key_start or verified.attention_page_key_start != recipe.attention_page_key_start or (!verified_key.same or verified_key.len != key.len) or !std.mem.eql(u32, position_snapshot[0..positions.len], current_positions)) return self.declineLightOnGraph(.admission_or_revalidation);
         }
         // The callback may have parked/restored; read the actual owner NOW.
         const prepared = (try C.beginBoundedDecodeGraph(self.context.cb, .{ .boundary = self.context.cleanupEpoch(), .operation = self.context.cb.operationToken() }, &funding_phase, descriptor)) orelse return self.declineLightOnGraph(.admission_or_revalidation);

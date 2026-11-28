@@ -43,10 +43,23 @@ struct LightOnAttentionParams {
   uint32_t blocks[4096];
   const uint32_t *graph_progress;
   uint32_t graph_step;
-  uint32_t reserved;
+  uint32_t page_table_offset;
 };
 static_assert(sizeof(LightOnAttentionPage) == 16, "page ABI");
 static_assert(sizeof(LightOnAttentionParams) == 17520, "packet ABI");
+
+struct LightOnAttentionPageTable {
+  LightOnAttentionPage pages[64];
+  uint32_t blocks[4096];
+};
+static_assert(sizeof(LightOnAttentionPageTable) == 17408, "page table ABI");
+
+__device__ __forceinline__ const LightOnAttentionPageTable *device_page_table(
+    const LightOnAttentionParams &p) {
+  return p.page_table_offset == 0 ? nullptr :
+      reinterpret_cast<const LightOnAttentionPageTable *>(
+          reinterpret_cast<const char *>(p.graph_progress) + p.page_table_offset);
+}
 
 __device__ __forceinline__ bool valid_page(const LightOnAttentionParams &p,
                                            const LightOnAttentionPage &page,
@@ -64,7 +77,7 @@ __device__ __forceinline__ bool valid_page(const LightOnAttentionParams &p,
 const uint32_t progress = p.graph_progress ? *p.graph_progress : 0; \
 if (p.graph_progress && progress < p.graph_step) \
 return; \
-const uint32_t delta = p.graph_progress ? progress - p.graph_step : 0; \
+const uint32_t delta = p.graph_progress ? progress - (table ? 0 : p.graph_step) : 0; \
 if (!valid_page(p, page, delta)) \
 return;
 
@@ -76,13 +89,14 @@ extern "C" __global__ void lighton_attention_write_suffix(
   const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
   if (item >= p.items || d >= p.row_values)
     return;
-  const LightOnAttentionPage &page = p.pages[item];
+  const auto *table = device_page_table(p);
+  const auto &page = table ? table->pages[item] : p.pages[item];
   ANTFLY_ATTENTION_PAGE_PROGRESS()
   const uint32_t token = page.tokens + delta - 1;
   if (token / p.page_size >= page.block_count)
     return;
   const uint32_t physical =
-      p.blocks[page.block_offset + token / p.page_size] * p.page_size + token % p.page_size;
+      (table ? table->blocks : p.blocks)[page.block_offset + token / p.page_size] * p.page_size + token % p.page_size;
   if (physical >= p.capacity)
     return;
   const uint32_t destination = physical * p.row_values + d;
@@ -114,7 +128,8 @@ attention_chunks(const LightOnAttentionParams &p) {
   const uint32_t warp = tid / 32;
   if (item >= p.items || head >= p.heads || blockDim.x != 128)
     return;
-  const LightOnAttentionPage &page = p.pages[item];
+  const auto *table = device_page_table(p);
+  const auto &page = table ? table->pages[item] : p.pages[item];
   ANTFLY_ATTENTION_PAGE_PROGRESS()
   const uint32_t tokens = page.tokens + delta;
   const uint32_t query_position = page.query_position + delta;
@@ -144,7 +159,7 @@ attention_chunks(const LightOnAttentionParams &p) {
     uint32_t physical = p.capacity;
     if (key < tokens && key <= query_position &&
         logical_page < page.block_count)
-      physical = p.blocks[page.block_offset + logical_page] * p.page_size + key % p.page_size;
+      physical = (table ? table->blocks : p.blocks)[page.block_offset + logical_page] * p.page_size + key % p.page_size;
     float score = 0;
     if (physical < p.capacity) {
       const uint32_t base = physical * p.row_values + kv_head * 256;
@@ -194,7 +209,7 @@ attention_chunks(const LightOnAttentionParams &p) {
     const uint32_t key = chunk * Chunk + local_key;
     if (key < tokens && key <= query_position && scores[local_key] != 0) {
       const uint32_t physical =
-          p.blocks[page.block_offset + key / p.page_size] * p.page_size + key % p.page_size;
+          (table ? table->blocks : p.blocks)[page.block_offset + key / p.page_size] * p.page_size + key % p.page_size;
       if (physical < p.capacity) {
         const uint32_t base = physical * p.row_values + kv_head * 256;
         first += scores[local_key] * __half2float(p.v[base + tid]);
@@ -220,7 +235,8 @@ attention_grouped_chunks(const LightOnAttentionParams &p) {
   if (item >= p.items || head >= p.heads || p.heads != p.kv_heads * 4 ||
       blockDim.x != 128)
     return;
-  const auto &page = p.pages[item];
+  const auto *table = device_page_table(p);
+  const auto &page = table ? table->pages[item] : p.pages[item];
   ANTFLY_ATTENTION_PAGE_PROGRESS()
   const uint32_t tokens = page.tokens + delta;
   const uint32_t query_position = page.query_position + delta;
@@ -246,7 +262,7 @@ attention_grouped_chunks(const LightOnAttentionParams &p) {
     if (key < tokens && key <= query_position &&
         key / p.page_size < page.block_count)
       physical =
-          p.blocks[page.block_offset + key / p.page_size] * p.page_size + key % p.page_size;
+          (table ? table->blocks : p.blocks)[page.block_offset + key / p.page_size] * p.page_size + key % p.page_size;
     float score = 0.f;
     if (physical < p.capacity) {
       unsigned base = physical * p.row_values + kh * 256;
@@ -281,7 +297,7 @@ attention_grouped_chunks(const LightOnAttentionParams &p) {
     unsigned key = chunk * Chunk + local;
     if (key < tokens && key <= query_position && scores[warp][local] != 0.f) {
       unsigned physical =
-          p.blocks[page.block_offset + key / p.page_size] * p.page_size + key % p.page_size;
+          (table ? table->blocks : p.blocks)[page.block_offset + key / p.page_size] * p.page_size + key % p.page_size;
       if (physical < p.capacity) {
         unsigned base = physical * p.row_values + kh * 256;
 #pragma unroll
