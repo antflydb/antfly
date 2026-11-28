@@ -33,6 +33,7 @@ const gguf_format = @import("../gguf/format.zig");
 const tensor_store_mod = @import("../models/tensor_store.zig");
 const projector_format = @import("projector_format.zig");
 const projector_common = @import("gemma4_projector.zig");
+const qwen2vl_types = @import("qwen2vl_types.zig");
 const qwen3vl_plan = @import("qwen3vl_plan.zig");
 const gpt_arch = @import("gpt.zig");
 const gpt_config = @import("../models/gpt.zig");
@@ -148,6 +149,35 @@ fn profileLap(enabled: bool, started_at: *u64) u64 {
     const elapsed = now -| started_at.*;
     started_at.* = now;
     return elapsed;
+}
+
+/// One source of truth for multimodal scheduler and process-wide admission.
+/// Qwen3-VL probes encoded image headers and applies the exact smart-resize
+/// geometry used by its projector; no image is decoded or projected here.
+pub fn loadPreprocessorLimits(allocator: std.mem.Allocator, model_dir: []const u8, config: gpt_config.Config) !Limits {
+    if (config.family != .qwen3_5) return .{};
+    const prep = try qwen2vl_types.loadPreprocessorConfig(allocator, model_dir);
+    if (prep.patch_size != config.vision_patch_size or prep.merge_size != config.vision_spatial_merge_size or
+        prep.temporal_patch_size != config.vision_temporal_patch_size or
+        prep.resample != .bicubic or
+        !prep.do_resize or !prep.do_normalize or !prep.do_rescale or !prep.do_convert_rgb or
+        !std.math.approxEqAbs(f32, prep.rescale_factor, 1.0 / 255.0, 1e-9) or
+        !std.mem.eql(f32, &prep.image_mean, &.{ 0.5, 0.5, 0.5 }) or
+        !std.mem.eql(f32, &prep.image_std, &.{ 0.5, 0.5, 0.5 })) return error.UnsupportedQwen2VlPreprocessorConfig;
+    // Preserve the shared projector safety cap for high-resolution pages.
+    const max_tokens = @min(try qwen2vl_types.maxImageTokenCount(prep), 4096);
+    const factor = @as(usize, prep.patch_size) * prep.merge_size;
+    const min_tokens = @max(@as(usize, 4), @as(usize, prep.min_pixels) / (factor * factor));
+    return .{ .min_merged_tokens = min_tokens, .max_merged_tokens = max_tokens, .hard_max_merged_tokens = max_tokens };
+}
+
+pub fn loadPromptPreprocessorLimits(allocator: std.mem.Allocator, model_dir: []const u8, config: gpt_config.Config, expanded_limit: usize, image_count: usize) !Limits {
+    if (image_count == 0 or image_count > (Limits{}).max_images) return error.ImageLimitExceeded;
+    var limits = try loadPreprocessorLimits(allocator, model_dir, config);
+    const per_image_budget = expanded_limit / image_count;
+    if (per_image_budget < limits.min_merged_tokens) return error.InputTokenLimitExceeded;
+    limits.max_merged_tokens = @min(limits.max_merged_tokens, per_image_budget);
+    return limits;
 }
 
 pub const Limits = struct {

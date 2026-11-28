@@ -193,69 +193,30 @@ pub const NativeGenerationMediaAdmission = struct {
     backend_scratch_bytes: usize = 0,
 };
 
-/// One source of truth for multimodal scheduler and process-wide admission.
-/// Qwen3-VL probes encoded image headers and applies the exact smart-resize
-/// geometry used by its projector; no image is decoded or projected here.
-fn qwenVisionLimits(allocator: std.mem.Allocator, model_dir: []const u8, config: gpt_mod.Config) !qwen3vl_projector.Limits {
-    if (config.family != .qwen3_5) return .{};
-    const prep = try qwen2vl_mm.loadPreprocessorConfig(allocator, model_dir);
-    if (prep.patch_size != config.vision_patch_size or prep.merge_size != config.vision_spatial_merge_size or
-        prep.temporal_patch_size != config.vision_temporal_patch_size or
-        prep.resample != .bicubic or
-        !prep.do_resize or !prep.do_normalize or !prep.do_rescale or !prep.do_convert_rgb or
-        !std.math.approxEqAbs(f32, prep.rescale_factor, 1.0 / 255.0, 1e-9) or
-        !std.mem.eql(f32, &prep.image_mean, &.{ 0.5, 0.5, 0.5 }) or
-        !std.mem.eql(f32, &prep.image_std, &.{ 0.5, 0.5, 0.5 })) return error.UnsupportedQwen2VlPreprocessorConfig;
-    // Preserve the shared projector safety cap for high-resolution pages.
-    const max_tokens = @min(try qwen2vl_mm.maxImageTokenCount(prep), 4096);
-    const factor = @as(usize, prep.patch_size) * prep.merge_size;
-    const min_tokens = @max(@as(usize, 4), @as(usize, prep.min_pixels) / (factor * factor));
-    return .{ .min_merged_tokens = min_tokens, .max_merged_tokens = max_tokens, .hard_max_merged_tokens = max_tokens };
-}
-
-fn promptLimitedQwenVisionLimits(allocator: std.mem.Allocator, model_dir: []const u8, config: gpt_mod.Config, expanded_limit: usize, image_count: usize) !qwen3vl_projector.Limits {
-    if (image_count == 0 or image_count > 8) return error.ImageLimitExceeded;
-    var limits = try qwenVisionLimits(allocator, model_dir, config);
-    const per_image_budget = expanded_limit / image_count;
-    if (per_image_budget < limits.min_merged_tokens) return error.InputTokenLimitExceeded;
-    limits.max_merged_tokens = @min(limits.max_merged_tokens, per_image_budget);
-    return limits;
-}
-
 /// Cold optional pinned-input planning only. Reuses the exact resident CUDA
 /// producer's resize geometry and prompt-limited vision policy. The caller may
 /// precommit-decline this optimization on metadata failure; the ordinary image
 /// validation/CPU preprocessing still executes once at its original boundary.
 /// No image payload, SDK object, cache or quota is created here.
-pub fn nativeCudaPinnedPatchUploadBytes(allocator: std.mem.Allocator, model_dir: []const u8, config: gpt_mod.Config, messages: []const Message, requested_output_tokens: usize) !usize {
-    return nativeCudaPinnedPatchUploadBytesAtMost(allocator, model_dir, config, messages, requested_output_tokens, std.math.maxInt(usize));
-}
 pub fn nativeCudaPinnedPatchUploadBytesAtMost(allocator: std.mem.Allocator, model_dir: []const u8, config: gpt_mod.Config, messages: []const Message, requested_output_tokens: usize, maximum_upload_bytes: usize) !usize {
     if (!config.hasQwen35VisionArchitectureContract() or !messagesHaveImages(messages)) return 0;
     const images = try collectImagesInPromptOrder(allocator, messages);
     defer allocator.free(images);
     if (images.len == 0 or images.len > 8) return error.ImageLimitExceeded;
     const expanded_limit = try nativeGenerationPromptTokenLimit(config, null, requested_output_tokens, 0, 0);
-    const limits = try promptLimitedQwenVisionLimits(allocator, model_dir, config, expanded_limit, images.len);
+    const limits = try qwen3vl_projector.loadPromptPreprocessorLimits(allocator, model_dir, config, expanded_limit, images.len);
     return qwen3vl_projector.planResidentCudaPatchUploadBytesAtMost(config, images, limits, maximum_upload_bytes);
 }
 
 /// Same prompt-limited singleton geometry as the ordinary numerical path.
 /// Outside callers use the returned value only to request fresh optional quota.
-pub fn nativeCudaVisionPublicationBytes(allocator: std.mem.Allocator, model_dir: []const u8, config: gpt_mod.Config, messages: []const Message, requested_output_tokens: usize, maximum_batch_items: usize) !usize {
+pub fn nativeCudaVisionPublicationBytes(allocator: std.mem.Allocator, model_dir: []const u8, config: gpt_mod.Config, messages: []const Message, requested_output_tokens: usize) !usize {
     if (!config.hasQwen35VisionArchitectureContract() or !messagesHaveImages(messages)) return 0;
     const images = try collectImagesInPromptOrder(allocator, messages);
     defer allocator.free(images);
     if (images.len != 1) return 0;
     const expanded_limit = try nativeGenerationPromptTokenLimit(config, null, requested_output_tokens, 0, 0);
-    const limits = try promptLimitedQwenVisionLimits(allocator, model_dir, config, expanded_limit, images.len);
-    if (maximum_batch_items > 1) {
-        const batch: ?qwen3vl_projector.ResidentBatchGeometry = qwen3vl_projector.residentBatchGeometry(.cuda, config, images[0], limits) catch |err| switch (err) {
-            error.UnsupportedBatchedVision => null,
-            else => return err,
-        };
-        if (batch) |shape| if (@min(maximum_batch_items, shape.max_items) > 1) return 0;
-    }
+    const limits = try qwen3vl_projector.loadPromptPreprocessorLimits(allocator, model_dir, config, expanded_limit, images.len);
     return qwen3vl_projector.planResidentFeaturePublicationBytes(config, images, limits);
 }
 
@@ -314,7 +275,7 @@ pub fn nativeGenerationMediaAdmissionWithInspection(
         const images = try collectImagesInPromptOrder(allocator, messages);
         defer allocator.free(images);
         if (images.len == 0) return .{};
-        const projector = try qwen3vl_projector.estimateAdmissionForBackend(images, config, try qwenVisionLimits(allocator, model_dir, config), backend);
+        const projector = try qwen3vl_projector.estimateAdmissionForBackend(images, config, try qwen3vl_projector.loadPreprocessorLimits(allocator, model_dir, config), backend);
         return .{
             // The text encode already contains an image placeholder. Retaining
             // one additional token per image preserves the existing
@@ -3405,7 +3366,7 @@ pub const NativeGenerationPipeline = struct {
                 const model_dir = self.model_dir orelse return error.MissingModelDirForMultimodal;
                 if (self.gpt_config.family == .qwen3_vl or self.gpt_config.hasQwen35VisionArchitectureContract()) {
                     if (!decode_state.isPaged() and !self.usesPjrtSession()) return error.InvalidModelForGeneration;
-                    const vision_limits = try promptLimitedQwenVisionLimits(allocator, model_dir, self.gpt_config, expanded_prompt_token_limit, images.len);
+                    const vision_limits = try qwen3vl_projector.loadPromptPreprocessorLimits(allocator, model_dir, self.gpt_config, expanded_prompt_token_limit, images.len);
                     // The shared vision owner collects compatible requests
                     // before taking the GPU lock. Prompt assembly stays under
                     // the ordinary lock after projected outputs return.
@@ -15193,7 +15154,7 @@ test "LightOn cold pinned patch hint matches actual prompt limited temporal arra
     var cfg = try gpt_mod.parseConfig(a, @embedFile("../models/testdata/lightonocr3/config.json"));
     cfg.max_position_embeddings = 1024;
     var fail = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
-    try std.testing.expectEqual(@as(usize, 0), try nativeCudaPinnedPatchUploadBytes(fail.allocator(), "missing-must-not-be-read", cfg, &.{.{ .role = "user", .content = "text only" }}, 128));
+    try std.testing.expectEqual(@as(usize, 0), try nativeCudaPinnedPatchUploadBytesAtMost(fail.allocator(), "missing-must-not-be-read", cfg, &.{.{ .role = "user", .content = "text only" }}, 128, std.math.maxInt(usize)));
     try std.testing.expect(!fail.has_induced_failure);
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
@@ -15202,8 +15163,8 @@ test "LightOn cold pinned patch hint matches actual prompt limited temporal arra
     defer a.free(model_dir);
     const image = @embedFile("../models/testdata/lightonocr3/invoice.png");
     const messages = [_]Message{.{ .role = "user", .content = "read", .image_bytes = &.{ image, image }, .content_parts = &.{ .{ .image = 0 }, .{ .image = 1 }, .{ .text = "read" } } }};
-    const bytes = try nativeCudaPinnedPatchUploadBytes(a, model_dir, cfg, &messages, 128);
-    var limits = try qwenVisionLimits(a, model_dir, cfg);
+    const bytes = try nativeCudaPinnedPatchUploadBytesAtMost(a, model_dir, cfg, &messages, 128, std.math.maxInt(usize));
+    var limits = try qwen3vl_projector.loadPreprocessorLimits(a, model_dir, cfg);
     limits.max_merged_tokens = @min(limits.max_merged_tokens, (1024 - 128) / 2);
     var actual = try qwen3vl_projector.prepareProjectedImageResident(a, cfg, image, limits, .{});
     defer actual.deinit();
@@ -15214,7 +15175,7 @@ test "LightOn cold pinned patch hint matches actual prompt limited temporal arra
     try std.testing.expectEqual(bytes, try actual.cudaPatchUploadBytes(cfg, limits));
     // Two real request policies can select different exact spans. A larger
     // ineligible upload must not hide a smaller eligible page in their cohort.
-    const small = try nativeCudaPinnedPatchUploadBytes(a, model_dir, cfg, &messages, 600);
+    const small = try nativeCudaPinnedPatchUploadBytesAtMost(a, model_dir, cfg, &messages, 600, std.math.maxInt(usize));
     try std.testing.expect(small > 0 and small < bytes);
     const maximum = small + (bytes - small) / 2;
     const large_bounded = try nativeCudaPinnedPatchUploadBytesAtMost(a, model_dir, cfg, &messages, 128, maximum);
@@ -15733,9 +15694,9 @@ test "model processor resampling rejects native projector mismatch" {
         defer a.free(json);
         try tmp.dir.writeFile(io, .{ .sub_path = "processor_config.json", .data = json });
         if (resample == 3) {
-            const limits = try qwenVisionLimits(a, path, config);
+            const limits = try qwen3vl_projector.loadPreprocessorLimits(a, path, config);
             try std.testing.expect(limits.max_merged_tokens > 0);
-        } else try std.testing.expectError(error.UnsupportedQwen2VlPreprocessorConfig, qwenVisionLimits(a, path, config));
+        } else try std.testing.expectError(error.UnsupportedQwen2VlPreprocessorConfig, qwen3vl_projector.loadPreprocessorLimits(a, path, config));
     }
 }
 

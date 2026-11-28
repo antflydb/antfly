@@ -425,7 +425,13 @@ preparation API do not by themselves complete these remaining requirements:
   scheduler turns and publishes progress after successful runtime completion.
   The CUDA replay-capacity and native prefill chunk-size decisions named in
   #1771 already live in `decoder_storage.zig` and `decoder_prefill.zig`,
-  respectively.
+  respectively. The Qwen3-VL projector owns the checkpoint-derived image
+  limits and prompt budget clipping used by admission, image preparation,
+  pinned CUDA uploads and singleton publication. The Qwen processor
+  descriptor owns parsing for both projector families. The singleton
+  publisher's unused batched planning branch was removed. Seven local
+  checks verified processor parsing, header geometry, admission and exact
+  pinned upload sizing, including text-only requests without allocation.
 
 - Imported ONNX and architecture graphs share the bounded specialization owner
   in `execution/specialization_cache.zig`, with stable executable handles,

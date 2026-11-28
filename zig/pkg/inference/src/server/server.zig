@@ -7071,7 +7071,7 @@ pub const Node = struct {
         defer if (comptime build_options.enable_cuda) if (vision_publication) |*publication| publication.deinit();
         var prepared_ocr: ?*PreparedOcrRequest = null;
         if (comptime build_options.enable_cuda) if (admission_lease.resources) |*primary| {
-            const publication_bytes = if (model.session.backend() == .cuda) generation.nativeCudaVisionPublicationBytes(allocator, model_path, gpt_config, messages, @intCast(@max(max_tokens, 1)), 1) catch 0 else 0;
+            const publication_bytes = if (model.session.backend() == .cuda) generation.nativeCudaVisionPublicationBytes(allocator, model_path, gpt_config, messages, @intCast(@max(max_tokens, 1))) catch 0 else 0;
             vision_publication = try VisionPublication.prepareVisionPublication(model.session, primary, publication_bytes, 1, budget_limits, execution_control);
             const upload_bytes = if (backend_kind == .cuda)
                 generation.nativeCudaPinnedPatchUploadBytesAtMost(allocator, model_path, gpt_config, messages, @intCast(@max(max_tokens, 1)), PreparedOcrRequest.pinned_input_upload_capacity) catch 0
@@ -10382,7 +10382,7 @@ pub const Node = struct {
             // Each PAGE funds its own one-image publication outside the lane.
             // A broker group later borrows N distinct Sets; it does not ask one
             // request to fund the group's output or bind before the real step.
-            const publication_bytes = if (backend == .cuda) generation.nativeCudaVisionPublicationBytes(a, model_path, cfg, &messages, @intCast(@max(max_tokens, 1)), 1) catch 0 else 0;
+            const publication_bytes = if (backend == .cuda) generation.nativeCudaVisionPublicationBytes(a, model_path, cfg, &messages, @intCast(@max(max_tokens, 1))) catch 0 else 0;
             if (publication_bytes != 0) {
                 const Prepare = struct {
                     fn run(bytes: usize, selected: @import("../backends/session.zig").Session, primary: *runtime.tier.memory.AdmissionLease, active: InferenceExecutionControl) !?VisionPublication {
@@ -18838,7 +18838,7 @@ pub const Node = struct {
         defer if (comptime build_options.enable_cuda) if (vision_publication) |*publication| publication.deinit();
         var prepared_generation: ?*PreparedGeneration = null;
         if (comptime build_options.enable_cuda) if (admission_lease.resources) |*primary| {
-            const publication_bytes = if (backend_kind == .cuda and !cooperative_cuda and draft_model_for_generation == null) generation.nativeCudaVisionPublicationBytes(ctx.allocator, model_path, gpt_config, effective_messages, @intCast(@max(config.max_tokens, 1)), 1) catch 0 else 0;
+            const publication_bytes = if (backend_kind == .cuda and !cooperative_cuda and draft_model_for_generation == null) generation.nativeCudaVisionPublicationBytes(ctx.allocator, model_path, gpt_config, effective_messages, @intCast(@max(config.max_tokens, 1))) catch 0 else 0;
             vision_publication = VisionPublication.prepareVisionPublication(model.session, primary, publication_bytes, 1, budget_limits, execution_control) catch |err| return inferenceFailureResponse(ctx, err);
             const upload_bytes = if (backend_kind == .cuda)
                 generation.nativeCudaPinnedPatchUploadBytesAtMost(ctx.allocator, model_path, gpt_config, effective_messages, @intCast(@max(config.max_tokens, 1)), PreparedGeneration.pinned_input_upload_capacity) catch 0
