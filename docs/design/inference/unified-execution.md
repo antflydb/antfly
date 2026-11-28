@@ -3421,6 +3421,16 @@ same shared-memory usage in every attention kernel. Registers grew
 from 40 to 48 for ungrouped 32-token attention and from 18 to 22 for
 suffix writes. The graph still attests a single exact cohort.
 
+The Spark same-binary 4B ABBA comparison at `8307517db4` kept
+recurrent device tables enabled in every arm and toggled attention.
+All four 256-page arms matched serial output, completed without
+retirement-capacity retries and used 256-row prefill chunks. Paired
+throughput was 6.30 pages/s with attention tables off and 6.32
+pages/s with them on. Both opt-in arms replayed at 113 rows with
+a declared zero-event workspace. Inline attention reached 113 rows
+in one arm and 30 in the other. This comparison exercises wide replay
+inside an unchanged cohort. Replay after rebinding remains open.
+
 The M4 Max focused cohort at `061f213135` passed all seven checks
 with zero skips. It exercised the shared installed Whisper Small
 checkpoint with the Metal backend required, verified assigned packed
