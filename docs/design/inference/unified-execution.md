@@ -1514,7 +1514,7 @@ deletion and qualification gates.
 
 | Requirement | State | Evidence and remaining gate |
 | --- | --- | --- |
-| Shared liveness and authoritative storage | Partial | Assigned execution and admitted storage share dependency analysis. Metal image and video use the admitted vision region. CUDA decoder attention, recurrent projections, norm adjustment and dense FFN share admitted layer storage. At `e32afca66d`, the released cache-disabled 0.8B reader replayed with no learned bytes and the 4B graph recorded zero allocations at 98 rows. Released BF16 grouped audio derives its lifetimes before dispatch. Other decoder and audio representations and specialized Metal scopes remain open. Opaque vendor workspace retains separate accounting. |
+| Shared liveness and authoritative storage | Partial | Assigned execution and admitted storage share dependency analysis. Metal image and video use the admitted vision region. CUDA decoder attention, recurrent projections, norm adjustment and dense FFN share admitted layer storage. At `e32afca66d`, the released cache-disabled 0.8B reader replayed with no learned bytes and the 4B graph recorded zero allocations at 98 rows. Released BF16 grouped audio derives its lifetimes before dispatch. At `ee73544213`, the Metal planner owns the column-bias destination and the subsequent integer gather output, including immutable index validation before submission. The corresponding Spark CUDA regression cohort passed all eight checks, including early rejection of both column-bias operand orders by the flat assigned path. Other decoder and audio representations and specialized Metal scopes remain open. Opaque vendor workspace retains separate accounting. |
 | Stable addresses and CUDA capture | Partial | Released T5-small captured and replayed at prefixes 1, 8, 32 and 64. Released BF16 grouped audio captured and replayed within its 36,788,736-byte arena, including cancellation before staging and successful later replay. The released two-page LightOnOCR reader skipped its learning burst with declared warmup. At `e32afca66d`, 4B replayed a declared zero-byte plan at 60 rows and an observed zero-byte plan at 98 rows. At `4985997ee6`, both timed 256-page 4B runs replayed declared zero-byte plans at 98 rows with exact serial parity and zero retirement-capacity retries. Paired ordinary/capture throughput and other signatures remain open. |
 | Runtime-owned state and physical policy | Partial | `decoder_storage.zig` owns Gemma 4 replay capacity and `decoder_prefill.zig` owns chunk selection, eager binding and scheduled cancellation. The shared frame owner controls media view retirement. Metal HTTP acquires and pins the existing per-layer input table before decoder state advances. Residual task-bound state and cache policy need provider-specific verification and migration. |
 | Resident placement | Partial | Released T5-small retired encoder activations before fused suffix execution and kept all 24 cache slots independently owned at prefixes 1, 8, 32 and 64 on CPU, Metal and CUDA. Spark recorded 393,216 device-to-device gather bytes and zero gather downloads. Imported ONNX handoff tests exercise exact output custody and host fallback on all three providers. Metal verifies a scalar token readback and a one-row fallback. At `bd0e05a4e3`, Spark passed the device gather and consumed a retained audio output view without a device copy. Other eligible stateful and opaque producer/consumer pairs still need qualification. |
@@ -3357,7 +3357,11 @@ was 6.24 versus 6.34 pages/s. The control arms measured 6.26–6.27
 pages/s for A and 6.28–6.29 for B. All four A arms replayed at 113
 rows. Three B arms reached 113 rows and one reached only 30 rows.
 The earlier throughput drop did not reproduce in this comparison.
-Reliable wide replay through page retirement remains open.
+In the 30-row candidate arm, dependent page cleanup retired the
+113-row owner in capture phase after its first two tokens, before any
+graph recording. The later 30-row recording reported zero EOS rows
+and replayed. Reliable wide replay through page retirement remains
+open.
 
 At `0cd7a9e823`, all 55 focused Spark checks passed without skips.
 The physical graph fixture preserved the replay after an unrelated

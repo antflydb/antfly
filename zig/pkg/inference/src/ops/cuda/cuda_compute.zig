@@ -62783,6 +62783,24 @@ test "CUDA refuses Native declared multiquery attention before opaque provider o
     try std.testing.expect(!physicalReplayKernelSupportedOp(foreign_context, &descriptor));
 }
 
+test "CUDA flat assigned addition rejects column bias before provider access" {
+    const Shape = @import("ml").graph.Shape;
+    const matrix = Shape.init(.f32, &.{ 2, 3 });
+    const bias = Shape.init(.f32, &.{3});
+    const foreign_context: *anyopaque = @ptrFromInt(16);
+    for ([_][2]Shape{ .{ matrix, bias }, .{ bias, matrix } }, 0..) |operands, matrix_operand| {
+        const descriptor: ops.kernel_descriptor.Descriptor = .{
+            .operation = .{ .binary = .add },
+            .output_shape = matrix,
+            .input_count = 2,
+            .input_shapes = .{ operands[0], operands[1], undefined },
+        };
+        try std.testing.expectEqual(matrix_operand, descriptor.columnBiasOperand().?);
+        try std.testing.expect(!physicalReplayKernelSupportedOp(foreign_context, &descriptor));
+        try std.testing.expect(!try runAssignedKernelOp(foreign_context, .{ .descriptor = &descriptor, .inputs = &.{} }));
+    }
+}
+
 test "CUDA profile snapshot refuses copied tables and missing live cleanup before opaque access" {
     var copied = vtable;
     copied.operation_services = null;
