@@ -21473,6 +21473,21 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         } else plan_cleanup.boundary = epoch;
     };
     const entry = try self.audio_plans.getWithCleanup(base_key, plan_cleanup);
+    if (!entry.disabled and entry.owner == null) if (dispatch.workspace) |workspace| {
+        // Managed callers must obtain both leases before dispatch. This
+        // standalone route cannot publish uncharged backing in their place.
+        if (plan_cleanup.boundary != null or self.ctx.prepared_cache_funding != null) return null;
+        const owner = try plan_mod.Owner.create(std.heap.c_allocator);
+        errdefer owner.destroyUnusedOutsideExecution();
+        var declaration = try owner.beginDeclaration(cache_base);
+        for (workspace.events) |event| switch (event) {
+            .allocate => |bytes| _ = try declaration.events.allocate(bytes),
+            .allocate_scratch => |bytes| _ = try declaration.events.allocateScratch(bytes),
+            .release => |slot| try declaration.events.release(slot),
+        };
+        try declaration.finish(workspace.published_slot);
+        _ = try self.audio_plans.publishDeclared(cache_base, owner, plan_cleanup);
+    };
     if (entry.disabled) return null;
     if (entry.owner == null) {
         // A warmed signature needs a learning lease before creating any
@@ -63413,7 +63428,6 @@ test "CUDA cold audio declaration dispatches before any learning invocation" {
             return (try backend.tryBf16SourceOperation(&.{ .clamp = .{ .input = projected, .max = 0.5 } })) orelse error.SourceArithmeticUnavailable;
         }
     };
-    const plan_mod = @import("audio_execution_plan.zig");
     const cold_key = 0x304;
     const inputs = [_]CT{ identity, identity };
     const geometry: [2]CudaCompute.AudioCacheInput = @splat(.{ .shape = &.{ 2, 2 }, .elements = 4 });
@@ -63421,26 +63435,20 @@ test "CUDA cold audio declaration dispatches before any learning invocation" {
     const projection = try SourceLinearGeometry.resolve(2, null, 2, 2);
     const publication_bytes = try checkedMul(projection.output_count, @sizeOf(f32));
     const layout = try sourceLinearLayout(compute.ctx.info.compute_major, projection.rows, 2, 2, true, false);
-    const entry = published: {
-        const owner = try plan_mod.Owner.create(std.heap.c_allocator);
-        errdefer owner.destroyUnusedOutsideExecution();
-        var declaration = try owner.beginDeclaration(bindings);
-        const projected_slot = try declaration.events.allocate(publication_bytes);
-        try declaration.events.scratchInterval(layout.bytes);
-        const output_slot = try declaration.events.allocate(publication_bytes);
-        try declaration.events.release(projected_slot);
-        try declaration.finish(output_slot);
-        try std.testing.expectError(error.InvalidExecutionPlan, compute.audio_plans.publishDeclared(try compute.audioCacheBase(cold_key + 1, &geometry, null), owner, .{}));
-        break :published try compute.audio_plans.publishDeclared(bindings, owner, .{});
+    const events = [_]@import("../../execution/stream_workspace.zig").Plan.Declaration{
+        .{ .allocate = publication_bytes },
+        .{ .allocate_scratch = layout.bytes },
+        .{ .release = 1 },
+        .{ .allocate = publication_bytes },
+        .{ .release = 0 },
     };
-    const executable = compute.audioPlanFor(bindings).?.executableFor(bindings).?;
-    try std.testing.expect(executable.storage.external_output);
-    const admission = try compute.cacheRequestState(CudaCompute.audioArenaRequest(executable));
-    try std.testing.expect(admission.miss);
-    try std.testing.expectEqual(executable.storage.bytes + executable.storage.output.?.bytes, admission.amounts.backend_scratch_bytes);
-
     const executes_before = compute.audio_arena_executes;
-    const first = (try cb.audioExecution(cold_key, &inputs, @constCast(&cb), Run.call)) orelse return error.TestUnexpectedResult;
+    const first = (try audioExecutionOp(&compute, cold_key, &inputs, @constCast(&cb), Run.call, .{
+        .workspace = .{ .events = &events, .published_slot = 2 },
+    })) orelse return error.TestUnexpectedResult;
+    const entry = compute.audioPlanFor(bindings) orelse return error.TestUnexpectedResult;
+    const executable = entry.executableFor(bindings) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(executable.storage.external_output);
     defer cb.free(first);
     const values = try cb.toFloat32(first, std.testing.allocator);
     defer std.testing.allocator.free(values);

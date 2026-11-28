@@ -2822,11 +2822,17 @@ pub const ComputeBackend = struct {
         rows: usize,
     };
 
+    pub const AudioWorkspaceDeclaration = struct {
+        events: []const @import("../execution/stream_workspace.zig").Plan.Declaration,
+        published_slot: u15,
+    };
+
     pub const AudioDispatch = struct {
         cleanup: @import("../execution/cleanup_context.zig").Context = .{},
         control: ?InferenceExecutionControl = null,
         defer_arena: bool = false,
         geometry: ?GroupedAudioGeometry = null,
+        workspace: ?AudioWorkspaceDeclaration = null,
     };
 
     pub const AudioExecutionRegion = struct {
