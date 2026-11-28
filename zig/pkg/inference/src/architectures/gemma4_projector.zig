@@ -1682,26 +1682,28 @@ fn audioSourceLinear(
         .spec => |value| value,
         .unsupported => (try loadScalarClampSpec(a, store.source(), prefix)) orelse return error.UnsupportedSourceClampShape,
     };
-    const clipped = if (spec.clipsInput()) try audioSourceClamp(cb, input, spec.input_min, spec.input_max) else input;
-    defer if (clipped != input) cb.free(clipped);
-    const name = try std.fmt.allocPrint(a, "{s}.weight", .{prefix});
-    defer a.free(name);
-    const weight = try projectorLinearWeightCt(cb, a, store, name, width, columns);
-    const bias = if (with_bias) bias: {
-        const bias_name = try std.fmt.allocPrint(a, "{s}.bias", .{prefix});
-        defer a.free(bias_name);
-        break :bias try projectorVectorWeightCt(cb, a, store, bias_name, columns);
-    } else null;
-    const projected = (try cb.tryBf16SourceOperation(&.{ .linear = .{
-        .input = clipped,
-        .weight = weight,
-        .bias = bias,
-        .rows = rows,
-        .width = width,
-        .columns = columns,
-        .reuse_projection = .{ .width = cfg.audio_hidden, .columns = cfg.intermediate_size },
-        .reference_input_layout = layout,
-    } })) orelse return error.SourceArithmeticUnavailable;
+    const projected = project: {
+        const clipped = if (spec.clipsInput()) try audioSourceClamp(cb, input, spec.input_min, spec.input_max) else input;
+        defer if (clipped != input) cb.free(clipped);
+        const name = try std.fmt.allocPrint(a, "{s}.weight", .{prefix});
+        defer a.free(name);
+        const weight = try projectorLinearWeightCt(cb, a, store, name, width, columns);
+        const bias = if (with_bias) bias: {
+            const bias_name = try std.fmt.allocPrint(a, "{s}.bias", .{prefix});
+            defer a.free(bias_name);
+            break :bias try projectorVectorWeightCt(cb, a, store, bias_name, columns);
+        } else null;
+        break :project (try cb.tryBf16SourceOperation(&.{ .linear = .{
+            .input = clipped,
+            .weight = weight,
+            .bias = bias,
+            .rows = rows,
+            .width = width,
+            .columns = columns,
+            .reuse_projection = .{ .width = cfg.audio_hidden, .columns = cfg.intermediate_size },
+            .reference_input_layout = layout,
+        } })) orelse return error.SourceArithmeticUnavailable;
+    };
     var output = projected;
     errdefer cb.free(output);
     if (spec.clipsOutput()) {
@@ -5104,14 +5106,19 @@ fn audioFeedForward(
         defer cb.free(activated);
         break :project try audioSourceLinear(cb, allocator, store, cfg, activated, try fmt(&buf, "a.blk.{d}.ffn_down{s}", .{ layer, suffix }), rows, cfg.intermediate_size, cfg.audio_hidden, .row_major, false, false);
     };
-    defer cb.free(down);
-    const post_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.ffn_post_norm{s}.weight", .{ layer, suffix }), cfg.audio_hidden);
-    if (cfg.source_scalar_storage == .full_f32 and store.gguf == null and !audioHostOps().scale) if (try cb.rmsNormResidual(down, post_w, input, cfg.audio_hidden, cfg.layer_norm_eps, cfg.residual_weight, 1)) |fused| return fused;
-    const down_bounded = try audioSourceGradientBounded(cb, cfg, down);
-    defer if (down_bounded != down) cb.free(down_bounded);
-    const post = try audioSourceRms(cb, cfg, down_bounded, post_w, rows, cfg.audio_hidden, .contiguous, rows);
-    defer cb.free(post);
-    const scaled = try audioSourceRoundOwned(cb, cfg, try scaleRows(cb, allocator, post, rows, cfg.audio_hidden, cfg.residual_weight));
+    const scaled = scale: {
+        const post = normalize: {
+            defer cb.free(down);
+            const post_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.ffn_post_norm{s}.weight", .{ layer, suffix }), cfg.audio_hidden);
+            if (cfg.source_scalar_storage == .full_f32 and store.gguf == null and !audioHostOps().scale)
+                if (try cb.rmsNormResidual(down, post_w, input, cfg.audio_hidden, cfg.layer_norm_eps, cfg.residual_weight, 1)) |fused| return fused;
+            const down_bounded = try audioSourceGradientBounded(cb, cfg, down);
+            defer if (down_bounded != down) cb.free(down_bounded);
+            break :normalize try audioSourceRms(cb, cfg, down_bounded, post_w, rows, cfg.audio_hidden, .contiguous, rows);
+        };
+        defer cb.free(post);
+        break :scale try audioSourceRoundOwned(cb, cfg, try scaleRows(cb, allocator, post, rows, cfg.audio_hidden, cfg.residual_weight));
+    };
     defer cb.free(scaled);
     return audioSourceRoundOwned(cb, cfg, try cb.add(input, scaled));
 }
@@ -5175,31 +5182,35 @@ fn audioLightConv(
     // GGUF's inherited tensor mapping swaps the two convolution norm names.
     // Keep HF's logical names intact for the EmbeddingGemma 2 path.
     const norm_names = audioConvNormNames(store.gguf != null);
-    const conv_normed = normalize: {
-        const conv = depthwise: {
-            const glu = gate: {
-                const pw1 = project: {
-                    const pre_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.{s}.weight", .{ layer, norm_names.pre }), cfg.audio_hidden);
-                    const normed = try audioSourceRms(cb, cfg, input, pre_w, rows, cfg.audio_hidden, .contiguous, rows);
-                    defer cb.free(normed);
-                    break :project try audioSourceLinear(cb, allocator, store, cfg, normed, try fmt(&buf, "a.blk.{d}.conv_pw1", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden * 2, .row_major, false, false);
+    const pw2 = project: {
+        const activated = activate: {
+            const conv_normed = normalize: {
+                const conv = depthwise: {
+                    const glu = gate: {
+                        const pw1 = project: {
+                            const pre_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.{s}.weight", .{ layer, norm_names.pre }), cfg.audio_hidden);
+                            const normed = try audioSourceRms(cb, cfg, input, pre_w, rows, cfg.audio_hidden, .contiguous, rows);
+                            defer cb.free(normed);
+                            break :project try audioSourceLinear(cb, allocator, store, cfg, normed, try fmt(&buf, "a.blk.{d}.conv_pw1", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden * 2, .row_major, false, false);
+                        };
+                        defer cb.free(pw1);
+                        break :gate try audioSourceRoundOwned(cb, cfg, try applyGlu(cb, allocator, pw1, rows, cfg.audio_hidden));
+                    };
+                    defer cb.free(glu);
+                    break :depthwise try audioSourceRoundOwned(cb, cfg, try depthwiseCausalConvSegments(cb, allocator, store, glu, rows, cfg.audio_hidden, cfg.conv_kernel_size, segments, segment_starts, try fmt(&buf, "a.blk.{d}.conv_dw.weight", .{layer})));
                 };
-                defer cb.free(pw1);
-                break :gate try audioSourceRoundOwned(cb, cfg, try applyGlu(cb, allocator, pw1, rows, cfg.audio_hidden));
+                defer cb.free(conv);
+                const conv_norm_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.{s}.weight", .{ layer, norm_names.post }), cfg.audio_hidden);
+                const conv_bounded = try audioSourceGradientBounded(cb, cfg, conv);
+                defer if (conv_bounded != conv) cb.free(conv_bounded);
+                break :normalize try audioSourceChannelRms(cb, allocator, cfg, conv_bounded, conv_norm_w, rows, cfg.audio_hidden, segments);
             };
-            defer cb.free(glu);
-            break :depthwise try audioSourceRoundOwned(cb, cfg, try depthwiseCausalConvSegments(cb, allocator, store, glu, rows, cfg.audio_hidden, cfg.conv_kernel_size, segments, segment_starts, try fmt(&buf, "a.blk.{d}.conv_dw.weight", .{layer})));
+            defer cb.free(conv_normed);
+            break :activate try audioSourceRoundOwned(cb, cfg, try cb.silu(conv_normed));
         };
-        defer cb.free(conv);
-        const conv_norm_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.{s}.weight", .{ layer, norm_names.post }), cfg.audio_hidden);
-        const conv_bounded = try audioSourceGradientBounded(cb, cfg, conv);
-        defer if (conv_bounded != conv) cb.free(conv_bounded);
-        break :normalize try audioSourceChannelRms(cb, allocator, cfg, conv_bounded, conv_norm_w, rows, cfg.audio_hidden, segments);
+        defer cb.free(activated);
+        break :project try audioSourceLinear(cb, allocator, store, cfg, activated, try fmt(&buf, "a.blk.{d}.conv_pw2", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden, .column_major, false, false);
     };
-    defer cb.free(conv_normed);
-    const activated = try audioSourceRoundOwned(cb, cfg, try cb.silu(conv_normed));
-    defer cb.free(activated);
-    const pw2 = try audioSourceLinear(cb, allocator, store, cfg, activated, try fmt(&buf, "a.blk.{d}.conv_pw2", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden, .column_major, false, false);
     defer cb.free(pw2);
     return audioSourceRoundOwned(cb, cfg, try cb.add(input, pw2));
 }
