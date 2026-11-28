@@ -746,6 +746,15 @@ def run(args, model, label, mode, concurrency, output):
                     sample["model_graph_replay_cohort_rows"] = sorted(set(replay_rows))
                     sample["model_graph_first_replay_events"] = len(replay_rows)
                     sample["model_graph_max_replay_rows"] = max(replay_rows, default=0)
+                    max_declared_rows = max(
+                        (
+                            bank["rows"]
+                            for bank in banks
+                            if bank.get("workspace_plan_origin") == "declared"
+                        ),
+                        default=0,
+                    )
+                    sample["model_graph_max_declared_replay_rows"] = max_declared_rows
                     if retirements := graph_retirements(section):
                         sample["model_graph_retirements"] = retirements
                     if denials := graph_funding_denials(section):
@@ -763,6 +772,11 @@ def run(args, model, label, mode, concurrency, output):
                         and max(replay_rows, default=0) <= 64
                     ):
                         result["status"] = "missing_timed_wide_model_graph_replay"
+                    if (
+                        args.require_declared_model_graph_replay_rows is not None
+                        and max_declared_rows < args.require_declared_model_graph_replay_rows
+                    ):
+                        result["status"] = "missing_required_declared_model_graph_replay_rows"
                     sample["vision_batch_sizes"] = sorted(
                         {
                             int(v)
@@ -2141,6 +2155,13 @@ def main():
         metavar="ROWS",
         help="Require a timed graph replay at this exact cohort width",
     )
+    parser.add_argument(
+        "--require-declared-model-graph-replay-rows",
+        type=int,
+        choices=range(2, 129),
+        metavar="MIN_ROWS",
+        help="Require a timed replay using a declared workspace at or above this width",
+    )
     parser.add_argument("--require-wide-packed-prefill", action="store_true")
     parser.add_argument("--require-lighton-norm-weight-cache", action="store_true")
     parser.add_argument("--require-florence-bart-ffn", action="store_true")
@@ -2478,6 +2499,20 @@ def main():
             )
         if args.require_model_graph_replay_rows > args.batch_rows:
             parser.error("--require-model-graph-replay-rows must fit --batch-rows")
+    if args.require_declared_model_graph_replay_rows is not None:
+        if not (
+            args.backend == "cuda"
+            and args.cuda_batch
+            and args.policy_rounds
+            and "batch" in args.modes
+        ):
+            parser.error(
+                "--require-declared-model-graph-replay-rows requires timed CUDA batch --policy-rounds"
+            )
+        if args.require_declared_model_graph_replay_rows > args.batch_rows:
+            parser.error(
+                "--require-declared-model-graph-replay-rows must fit --batch-rows"
+            )
     if args.require_physical128 and not args.policy_rounds:
         parser.error("--require-physical128 requires timed --policy-rounds")
     if args.require_physical128 and not args.physical128:
