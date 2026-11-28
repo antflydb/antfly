@@ -3104,3 +3104,16 @@ replay width but had disabled the verbose reader profile and did
 not identify the workspace origin. The first-replay receipt now
 includes the workspace origin, event count, and bytes under the
 existing benchmark switch.
+
+At `78a166f417`, all 41 focused Spark checks and a separate unfused
+HTTP fallback check passed. The unprofiled and profiled 4B repeats
+each completed 256 pages with exact serial parity, at 6.16 and 6.25
+pages/second. The profiled repeat did not exhaust retirement records.
+Both repeats missed the timed replay requirement. The plain trace
+recorded retirement during foreground work or page cleanup before
+the next captured burst. The profiled trace learned 98 tensors at
+both 56 and 60 rows, with a 10,240-byte peak. Of those allocations,
+66 were 10,240 bytes and 32 were 1,024 bytes. These sizes match the
+decoder's hidden-width and head-width adjusted normalization weights
+with the production cache disabled. This is a targeted remaining
+workspace candidate. Wide capture and replay remain unqualified.
