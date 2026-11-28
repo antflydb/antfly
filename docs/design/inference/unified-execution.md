@@ -2875,6 +2875,14 @@ the increase. This remainder also includes admission, device execution
 and publication. The tail requires a repeat on the current revision
 before performance qualification can close.
 
+The consolidated Spark decoder revision `fd867e8e5a` passed all 33 checks
+with zero skips. It verified the remaining normalization and output
+projection reuse, physical alternating FFN slots, and rejection of a
+write over a live slot. The released two-page reader again reported
+exact parity and two-row replay with 44 pinned readback bytes and a
+2,004,992-byte shared workspace. The paired latency run uses that
+tested revision.
+
 ### Isolated Metal E4B HTTP comparison at `58b3917a89`
 
 The local M4 Max used the same pinned binaries as the mixed serving
