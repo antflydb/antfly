@@ -3189,6 +3189,27 @@ overall. The profiled run replayed one at 6.36 pages/s overall. All three
 declared wide replay in both configurations on Spark. The measurements
 do not establish a throughput gain against a paired frozen baseline.
 
+The paired Spark repeat froze the previously qualified `a8180efde0`
+reader as A and `4985997ee6` as B, verified both binary digests, and
+used the same 256-page workload in every arm. All 2,048 pages matched
+the serial reference, with zero retirement-capacity retries. All four
+candidate arms replayed a declared plan above 64 rows, at widths of
+66 or 98. All four baseline arms replayed above 64 rows with observed
+plans, at widths of 97 or 98. One unrelated GPU context held 184 MiB
+throughout.
+
+| Sequence | Pages/s in run order |
+| --- | ---: |
+| AA | 6.02, 6.30 |
+| ABBA | 6.19, 6.32, 6.29, 6.29 |
+| BB | 6.25, 6.26 |
+
+Pooled paired throughput was 6.24 pages/s for A and 6.31 for B, a
+1.1% increase within the baseline-only control spread. The comparison
+establishes repeatable declared replay and no measured regression on
+this workload. It does not establish a throughput gain outside the
+controls or a comparison against merged main.
+
 ### Released Inkling Metal checkpoint at `7f0ff56ff8`
 
 Five focused checks passed on M4 Max with zero skips. The released
