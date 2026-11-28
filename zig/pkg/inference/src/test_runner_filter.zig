@@ -101,6 +101,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
     const runtime_offset = getenvUsize("ANTFLY_INFERENCE_TEST_RUNTIME_OFFSET") orelse 0;
     const runtime_limit = getenvUsize("ANTFLY_INFERENCE_TEST_RUNTIME_LIMIT") orelse std.math.maxInt(usize);
+    // As in the antfly-embedded runner: every allocation is tracked, and only
+    // the stack recorded for each report is opt-in.
+    const alloc_traces = getenvFlag("ANTFLY_TEST_ALLOC_TRACES");
+    const deep_alloc_traces = getenvFlag("ANTFLY_TEST_DEEP_ALLOC_TRACES");
+    var allocator_options: std.heap.SafeAllocator.Options = .{ .stack_trace_frames = 0 };
+    if (alloc_traces) allocator_options.stack_trace_frames = (std.heap.SafeAllocator.Options{}).stack_trace_frames;
+    if (deep_alloc_traces) allocator_options.stack_trace_frames = 32;
     var progress_io = std.Io.Threaded.init(allocator, .{});
     defer progress_io.deinit();
     const progress = RuntimeProgress.open(allocator, progress_io.io(), args);
@@ -123,7 +130,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         selected_count += 1;
 
         if (progress) |p| p.record("START", test_fn.name);
-        std.testing.allocator_instance = .init(std.heap.page_allocator, .{});
+        std.testing.allocator_instance = .init(std.heap.page_allocator, allocator_options);
         std.testing.io_instance = .init(std.testing.allocator, .{
             .argv0 = .init(init.args),
             .environ = init.environ,
@@ -153,7 +160,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (progress) |p| p.record("IO_DEINIT", test_fn.name);
         std.testing.io_instance.deinit();
         if (progress) |p| p.record("ALLOCATOR_DEINIT", test_fn.name);
-        if (std.testing.allocator_instance.deinit() != 0) leak_count += 1;
+        if (std.testing.allocator_instance.deinit() != 0) {
+            leak_count += 1;
+            if (!alloc_traces and !deep_alloc_traces)
+                std.debug.print("{s} leaked; rerun with ANTFLY_TEST_ALLOC_TRACES=1 for allocation stack traces\n", .{test_fn.name});
+        }
         if (progress) |p| p.record("DONE", test_fn.name);
         if (log_err_count != expected_error_log_count) {
             std.debug.print("Expected {d} error logs, observed {d}: {s}\n", .{ expected_error_log_count, log_err_count, test_fn.name });
@@ -231,6 +242,11 @@ fn getenvSpan(comptime name: [:0]const u8) ?[]const u8 {
     const value = platform.env.getenvSlice(name) orelse return null;
     if (value.len == 0) return null;
     return value;
+}
+
+fn getenvFlag(comptime name: [:0]const u8) bool {
+    const value = getenvSpan(name) orelse return false;
+    return value.len != 0 and !std.mem.eql(u8, value, "0") and !std.ascii.eqlIgnoreCase(value, "false");
 }
 
 fn getenvUsize(comptime name: [:0]const u8) ?usize {

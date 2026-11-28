@@ -173,6 +173,8 @@ pub fn main(init: std.process.Init.Minimal) void {
     defer if (progress) |p| p.file.close(p.io);
     const trace_cleanup = getenvBool("ANTFLY_TEST_CLEANUP_TRACE");
     const fail_on_error_logs = getenvBool("ANTFLY_TEST_FAIL_ON_ERROR_LOGS");
+    const alloc_traces = getenvBool("ANTFLY_TEST_ALLOC_TRACES");
+    const deep_alloc_traces = getenvBool("ANTFLY_TEST_DEEP_ALLOC_TRACES");
     var current_count: usize = 0;
     for (test_fns) |test_fn| {
         if (!matchesFilter(test_fn.name)) continue;
@@ -183,8 +185,13 @@ pub fn main(init: std.process.Init.Minimal) void {
         // boundary instead of reporting an anonymous signal.
         std.debug.print("{d}/{d} {s}...", .{ current_count, total_count, test_fn.name });
         const setup_start = timingNow(trace_timings, clock_io);
-        var allocator_options: std.heap.SafeAllocator.Options = .{};
-        if (getenvBool("ANTFLY_TEST_DEEP_ALLOC_TRACES")) allocator_options.stack_trace_frames = 32;
+        // Every allocation is still tracked, so leaks, double frees and
+        // invalid frees still fail the test. Only the stack recorded for
+        // each report is opt-in: unwinding one per allocation dominated
+        // allocation-heavy Debug tests.
+        var allocator_options: std.heap.SafeAllocator.Options = .{ .stack_trace_frames = 0 };
+        if (alloc_traces) allocator_options.stack_trace_frames = (std.heap.SafeAllocator.Options{}).stack_trace_frames;
+        if (deep_alloc_traces) allocator_options.stack_trace_frames = 32;
         testing.allocator_instance = .init(std.heap.page_allocator, allocator_options);
         testing.io_instance = .init(testing.allocator, .{
             .argv0 = .init(init.args),
@@ -223,6 +230,8 @@ pub fn main(init: std.process.Init.Minimal) void {
         if (trace_cleanup) std.debug.print("CLEANUP allocator_deinit begin {s}\n", .{test_fn.name});
         if (testing.allocator_instance.deinit() != 0) {
             leak_count += 1;
+            if (!alloc_traces and !deep_alloc_traces)
+                std.debug.print("{s} leaked; rerun with ANTFLY_TEST_ALLOC_TRACES=1 for allocation stack traces\n", .{test_fn.name});
         }
         const allocator_end = timingNow(trace_timings, clock_io);
         if (trace_timings) {

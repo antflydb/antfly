@@ -1866,6 +1866,7 @@ test "lite index read limits reject from pinned metadata before payload allocati
 
 test "lite subtree deletion bounds heap across private batches and preserves snapshots" {
     const a = std.testing.allocator;
+    var short_key_peak: ?usize = null;
     for ([_]struct { count: usize, key_len: usize }{
         .{ .count = 4096, .key_len = 128 },
         .{ .count = 16384, .key_len = 128 },
@@ -1905,6 +1906,13 @@ test "lite subtree deletion bounds heap across private batches and preserves sna
         budget.limit = baseline + 512 * 1024;
         try store.storage().deleteTree("/scope");
         try std.testing.expect(budget.peak - baseline <= 512 * 1024);
+        // Bounded means independent of how many keys go: four times as many
+        // of the same size cost about the same.
+        if (case.key_len == 128) {
+            if (short_key_peak) |first| {
+                try std.testing.expect(budget.peak - baseline <= first + 64 * 1024);
+            } else short_key_peak = budget.peak - baseline;
+        }
         budget.limit = std.math.maxInt(usize);
         try std.testing.expectEqual(pinned.commit_sequence + 1, docs.file.activeCheckpoint().commit_sequence);
         try std.testing.expect((try docs.file.getIndexCatalogRecordSize("/scope")) == null);

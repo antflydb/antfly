@@ -41014,26 +41014,44 @@ pub const DB = struct {
         while (true) {
             try wait.check();
             {
-                var snapshot_replay = try self.acquireSnapshotReplayMutation();
+                var snapshot_replay = try self.acquireSnapshotReplayMutationWithin(io, wait);
                 defer snapshot_replay.release();
-                self.core.index_manager.refreshTextIndexesBehindTip();
+                // Every refresh and merge attempt starts within the budget, a
+                // refused merge (which completes nothing) included.
+                const budget = IndexManagerWorkBudget.of(&wait);
+                try self.core.index_manager.refreshTextIndexesBehindTipWithin(budget);
                 try wait.check();
                 try self.lockApplyForPortableRuntimeWithin(io, wait);
                 defer self.core.unlockApply();
-                while (try self.core.index_manager.runTextMergeScheduler(1) > 0) try wait.check();
+                while (try self.core.index_manager.runTextMergeSchedulerWithin(1, budget) != 0) {}
             }
             if (!self.core.index_manager.textTipRefreshPending()) return;
             if (io) |runtime_io| try runtime_io.sleep(.fromMilliseconds(1), .awake) else std.Thread.yield() catch {};
         }
     }
 
-    /// `lockApplyForPortableRuntime`, waiting for the lock in short slices
-    /// that each recheck `wait`.
-    fn lockApplyForPortableRuntimeWithin(self: *DB, maybe_io: ?std.Io, wait: derived_executor_mod.VisibilityWait) !void {
-        const io = maybe_io orelse return self.lockApplyForPortableRuntime();
+    const IndexManagerWorkBudget = struct {
+        fn of(wait: *const derived_executor_mod.VisibilityWait) index_manager_mod.IndexManager.WorkBudget {
+            return .{ .context = wait, .check = check };
+        }
+
+        fn check(context: *const anyopaque) anyerror!void {
+            const wait: *const derived_executor_mod.VisibilityWait = @ptrCast(@alignCast(context));
+            try wait.check();
+        }
+    };
+
+    /// `lockApplyForPortableRuntime`, retrying the lock in short slices
+    /// that each recheck `wait` (timed waits with an Io, yields without),
+    /// and failing rather than holding the lock past it.
+    pub fn lockApplyForPortableRuntimeWithin(self: *DB, maybe_io: ?std.Io, wait: derived_executor_mod.VisibilityWait) !void {
         try self.enforcePortableRuntimeGate();
         while (!self.core.tryLockApplyExclusive()) {
             try wait.check();
+            const io = maybe_io orelse {
+                std.Thread.yield() catch {};
+                continue;
+            };
             self.core.apply_mutex.lockExclusiveDeadlineIo(io, .fromNow(io, .{ .raw = .fromMilliseconds(10), .clock = .awake })) catch |err| switch (err) {
                 error.Timeout => continue,
                 else => return err,
@@ -41042,6 +41060,24 @@ pub const DB = struct {
         }
         errdefer self.core.unlockApply();
         try self.enforcePortableRuntimeGate();
+        // The last slice may have ended past the deadline.
+        try wait.check();
+    }
+
+    /// `acquireSnapshotReplayMutation`, waiting in short slices that each
+    /// recheck `wait`, and failing rather than holding a lease past it.
+    fn acquireSnapshotReplayMutationWithin(self: *DB, maybe_io: ?std.Io, wait: derived_executor_mod.VisibilityWait) !snapshot_admission_mod.SnapshotAdmission.MutationLease {
+        const admission = self.core.snapshot_replay_admission;
+        while (true) {
+            try wait.check();
+            if (admission.tryAcquireMutation()) |lease| {
+                var held = lease;
+                errdefer held.release();
+                try wait.check();
+                return held;
+            }
+            if (maybe_io) |io| try io.sleep(.fromMilliseconds(1), .awake) else std.Thread.yield() catch {};
+        }
     }
 
     /// The budget a visibility wait gets when its caller set none.

@@ -1026,6 +1026,21 @@ pub const SharedRedoOverlay = struct {
     /// for `root` (a key count, not a version count -- matches
     /// `std.HashMap.count`'s own meaning). Used by `check()`'s
     /// `record_count` accounting; see `NativeFile.redoOverlayEntryCount`.
+    /// Marks which of `items`' keys have a version under `root` newer than
+    /// `fold_floor` (one the tree does not hold yet), in one locked pass,
+    /// and returns how many do.
+    pub fn markUnfoldedKeys(self: *SharedRedoOverlay, io: std.Io, root: u8, comptime T: type, items: []const T, fold_floor: u64, held: []bool) usize {
+        std.debug.assert(root < 3 and items.len == held.len);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        var total: usize = 0;
+        for (items, held) |item, *slot| {
+            slot.* = if (self.maps[root].get(item.key)) |head| head.sequence > fold_floor else false;
+            if (slot.*) total += 1;
+        }
+        return total;
+    }
+
     pub fn count(self: *SharedRedoOverlay, io: std.Io, root: u8) usize {
         std.debug.assert(root < 3);
         self.mutex.lockUncancelable(io);
@@ -1131,6 +1146,7 @@ pub const SharedRedoOverlay = struct {
     pub const OwnedHead = struct {
         key: []u8,
         value: []u8,
+        sequence: u64,
         is_delete: bool,
         external_value_root_page: u64,
         external_value_len: usize,
@@ -1183,6 +1199,7 @@ pub const SharedRedoOverlay = struct {
             list.appendAssumeCapacity(.{
                 .key = try allocator.dupe(u8, kv.key_ptr.*),
                 .value = try allocator.dupe(u8, head.value),
+                .sequence = head.sequence,
                 .is_delete = head.is_delete,
                 .external_value_root_page = head.external_value_root_page,
                 .external_value_len = head.external_value_len,
@@ -1208,6 +1225,13 @@ pub const SharedRedoOverlay = struct {
     /// while `reclaimedThrough() <= min_sequence_exclusive` (a reclaim drops
     /// versions at or below its floor). Keys only, each owned by the caller.
     pub fn changedKeysBetweenAlloc(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, root: u8, min_sequence_exclusive: u64, max_sequence_inclusive: u64, own_origin: u32) ![][]u8 {
+        return self.changedKeysWithPrefixBetweenAlloc(allocator, io, root, "", min_sequence_exclusive, max_sequence_inclusive, own_origin);
+    }
+
+    /// `changedKeysBetweenAlloc`, keeping only keys under `prefix`: only
+    /// those are copied, so one scope's refresh allocates for its own
+    /// changes, not every writer's.
+    pub fn changedKeysWithPrefixBetweenAlloc(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, root: u8, prefix: []const u8, min_sequence_exclusive: u64, max_sequence_inclusive: u64, own_origin: u32) ![][]u8 {
         std.debug.assert(root < 3);
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -1223,6 +1247,7 @@ pub const SharedRedoOverlay = struct {
         for (&self.changes) |*history| {
             for (history.entries.items[history.end(min_sequence_exclusive)..history.end(max_sequence_inclusive)]) |change| {
                 if (change.root != root or (change.origin != 0 and change.origin == own_origin)) continue;
+                if (!std.mem.startsWith(u8, change.key, prefix)) continue;
                 const slot = try seen.getOrPut(allocator, change.key);
                 if (slot.found_existing) continue;
                 try list.ensureUnusedCapacity(allocator, 1);

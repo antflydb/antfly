@@ -3587,7 +3587,7 @@ const IndexEditor = struct {
         previous: ?*Node = null,
         next: ?*Node = null,
         sealed_before: usize = 0,
-        compact_at: usize = 128 * 1024,
+        compact_at: usize = node_compact_floor,
         page: u64 = 0,
         original_page: u64 = 0,
         dirty: bool = true,
@@ -3678,6 +3678,14 @@ const IndexEditor = struct {
 
     // A repeatedly merged node must not accumulate dead arena allocations for
     // the entire batch. Repack geometrically, preserving child ownership.
+    /// A streaming node's arena keeps every key it ever retained, separators
+    /// replaced by rebalancing included, until compaction copies out the live
+    /// ones. It runs once waste is three times the live bytes, so its cost is
+    /// amortized per retained byte; this floor only skips tiny arenas. A
+    /// larger floor let each frontier node carry that much dead key bytes
+    /// through a long deletion, whatever its live size.
+    const node_compact_floor = 16 * 1024;
+
     fn compactNode(self: *IndexEditor, node: *Node) !void {
         const arena = if (node.arena) |*value| value else return;
         const capacity = arena.queryCapacity();
@@ -3698,7 +3706,7 @@ const IndexEditor = struct {
         node.arena = fresh.arena;
         node.keys = fresh.keys;
         node.links = fresh.links;
-        node.compact_at = @max(128 * 1024, node.arena.?.queryCapacity() * 2);
+        node.compact_at = @max(node_compact_floor, node.arena.?.queryCapacity() * 2);
     }
 
     fn advance(self: *IndexEditor, key: []const u8) !void {
@@ -4958,8 +4966,33 @@ const RedoCommitState = struct {
     /// sizing rationale. A small transaction never reaches this and
     /// keeps the redo log's full I/O savings.
     large_txn_fallback_bytes: u64 = default_large_txn_fallback_bytes,
+    /// Keys the in-flight transaction wrote straight into the tree (a flush
+    /// past the large-transaction fallback, or a direct large batch) while
+    /// the overlay held an unfolded version of them -- a peer's tail adopted
+    /// when the transaction opened, or this transaction's own earlier
+    /// diverted flush -- each with the sequence this commit publishes. That
+    /// version is older than the tree write but would still be resolved
+    /// first, and a later fold would write it back over the tree. So the
+    /// commit folds, and the fold skips these heads. Cleared by that fold and
+    /// by an abort; per root, like the overlay.
+    physical_supersedes: [3]std.StringHashMapUnmanaged(u64) = .{ .empty, .empty, .empty },
+
+    fn physicalSupersedesPending(self: *const RedoCommitState) bool {
+        for (&self.physical_supersedes) |*map| if (map.count() != 0) return true;
+        return false;
+    }
+
+    fn clearPhysicalSupersedes(self: *RedoCommitState, allocator: Allocator) void {
+        for (&self.physical_supersedes) |*map| {
+            var keys = map.keyIterator();
+            while (keys.next()) |key| allocator.free(key.*);
+            map.clearRetainingCapacity();
+        }
+    }
 
     fn deinit(self: *RedoCommitState, allocator: Allocator) void {
+        self.clearPhysicalSupersedes(allocator);
+        for (&self.physical_supersedes) |*map| map.deinit(allocator);
         self.logical_pending.deinit(allocator);
         self.pending.deinit(allocator);
         for (self.overlay_undo.items) |entry| switch (entry) {
@@ -9646,7 +9679,19 @@ pub const NativeFile = struct {
                 }
                 self.allocator.free(heads);
             }
+            // Heads a tree write of the commit being folded superseded are
+            // not applied; their value chains retire like any superseded
+            // version's.
+            var applied = try std.ArrayListUnmanaged(redo_overlay.SharedRedoOverlay.OwnedHead).initCapacity(self.allocator, heads.len);
+            defer applied.deinit(self.allocator);
+            const supersedes = &redo.physical_supersedes[root_idx];
             for (heads) |h| {
+                if (supersedes.get(h.key)) |sequence| if (h.sequence <= sequence) {
+                    if (!h.is_delete and h.external_value_root_page != 0)
+                        try retiring_chains.append(self.allocator, .{ .external_value_root_page = h.external_value_root_page, .external_value_len = h.external_value_len });
+                    continue;
+                };
+                applied.appendAssumeCapacity(h);
                 if (!h.is_delete and h.external_value_root_page != 0) try surviving_roots.put(self.allocator, h.external_value_root_page, {});
             }
             // Same `fold_floor` boundary as `heads` above -- see
@@ -9656,11 +9701,11 @@ pub const NativeFile = struct {
             const superseded = try redo.shared.snapshotSupersededChainsAlloc(self.allocator, io, @intCast(root_idx), fold_floor);
             defer self.allocator.free(superseded);
             try retiring_chains.appendSlice(self.allocator, superseded);
-            if (heads.len == 0) continue;
+            if (applied.items.len == 0) continue;
             if (root_idx == @backingInt(TransactionWrites.Root.documents)) {
-                var docs = try std.ArrayListUnmanaged(DocumentMutation).initCapacity(self.allocator, heads.len);
+                var docs = try std.ArrayListUnmanaged(DocumentMutation).initCapacity(self.allocator, applied.items.len);
                 defer docs.deinit(self.allocator);
-                for (heads) |h| docs.appendAssumeCapacity(.{
+                for (applied.items) |h| docs.appendAssumeCapacity(.{
                     .key = h.key,
                     .value = h.value,
                     .is_delete = h.is_delete,
@@ -9674,9 +9719,9 @@ pub const NativeFile = struct {
                 }.less);
                 try self.putDocumentBatch(docs.items);
             } else {
-                var batch = try std.ArrayListUnmanaged(CatalogMutation).initCapacity(self.allocator, heads.len);
+                var batch = try std.ArrayListUnmanaged(CatalogMutation).initCapacity(self.allocator, applied.items.len);
                 defer batch.deinit(self.allocator);
-                for (heads) |h| batch.appendAssumeCapacity(.{
+                for (applied.items) |h| batch.appendAssumeCapacity(.{
                     .key = h.key,
                     .value = h.value,
                     .is_delete = h.is_delete,
@@ -9691,6 +9736,7 @@ pub const NativeFile = struct {
                 try self.putCatalogBatchForRoot(if (root_idx == 0) .metadata else .index, batch.items, .{});
             }
         }
+        redo.clearPhysicalSupersedes(self.allocator);
         // perf/lwa-lease-fold: drop every retiring chain whose root page
         // is still referenced by a live owner -- either a surviving head
         // collected just above (`surviving_roots`), or a reference this
@@ -15161,6 +15207,7 @@ pub const NativeFile = struct {
                     self.transaction_pages = null;
                     self.flushing_transaction = false;
                 }
+                try self.notePhysicalWrites(if (root == .metadata) .metadata else .index, CatalogMutation, mutations);
                 try self.putCatalogBatchForRoot(root, mutations, options);
                 // The staged path's catalog chain walk in `flushTransactionWrites`
                 // never sees this batch. A redo fold folds external values whose
@@ -15574,6 +15621,13 @@ pub const NativeFile = struct {
         return try self.getIndexCatalogRecordLimitedAtCheckpointAlloc(allocator, key, std.math.maxInt(usize), checkpoint);
     }
 
+    /// At an overlay mark the caller captured once (`readMark`), so many
+    /// reads, and a change enumeration through the same mark, see one cut
+    /// even while commits land.
+    pub fn getIndexCatalogRecordAtMarkAlloc(self: *NativeFile, allocator: Allocator, key: []const u8, checkpoint: CheckpointSlot, mark: u64) !?[]u8 {
+        return try self.getCatalogRecordFromRootAtMarkAlloc(allocator, .index, key, checkpoint, mark, std.math.maxInt(usize));
+    }
+
     /// Enforce the caller's limit against catalog metadata before allocating
     /// or reading any external payload, within the same pinned checkpoint.
     pub fn getIndexCatalogRecordLimitedAtCheckpointAlloc(self: *NativeFile, allocator: Allocator, key: []const u8, max_bytes: usize, checkpoint: CheckpointSlot) !?[]u8 {
@@ -15631,7 +15685,19 @@ pub const NativeFile = struct {
         checkpoint: CheckpointSlot,
         max_bytes: usize,
     ) !?[]u8 {
-        if (try self.redoOverlayEntry(if (root == .metadata) .metadata else .index, checkpoint, key)) |entry| {
+        return try self.getCatalogRecordFromRootAtMarkAlloc(allocator, root, key, checkpoint, self.readMark(checkpoint), max_bytes);
+    }
+
+    fn getCatalogRecordFromRootAtMarkAlloc(
+        self: *NativeFile,
+        allocator: Allocator,
+        root: CatalogRoot,
+        key: []const u8,
+        checkpoint: CheckpointSlot,
+        mark: u64,
+        max_bytes: usize,
+    ) !?[]u8 {
+        if (try self.redoOverlayEntryAt(if (root == .metadata) .metadata else .index, mark, checkpoint.redo_folded_through, key)) |entry| {
             defer self.allocator.free(entry.value);
             if (entry.is_delete) return null;
             const value_len = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
@@ -16709,6 +16775,7 @@ pub const NativeFile = struct {
                     self.transaction_pages = null;
                     self.flushing_transaction = false;
                 }
+                try self.notePhysicalWrites(.documents, DocumentMutation, mutations);
                 try self.putDocumentBatch(mutations);
                 try writes.pages.flush();
                 return;
@@ -21418,6 +21485,36 @@ pub const NativeFile = struct {
         self.header.checkpoints[self.header.active_checkpoint].page_count = writes.pages.next_page_id;
     }
 
+    /// Records, before the in-flight transaction writes `mutations` straight
+    /// into the tree, which of their keys the overlay holds an unfolded
+    /// version of (`RedoCommitState.physical_supersedes`). Checked at the
+    /// write itself, after the transaction refreshed writer authority and
+    /// adopted any peer tail, so no version it could shadow is missed.
+    fn notePhysicalWrites(self: *NativeFile, root: TransactionWrites.Root, comptime T: type, mutations: []const T) !void {
+        const redo = if (self.redo) |*redo| redo else return;
+        const header = self.transaction_header orelse return;
+        if (redo.checkpointing or mutations.len == 0) return;
+        const io = self.runtimeIo();
+        const r: u8 = @backingInt(root);
+        if (redo.shared.count(io, r) == 0) return;
+        const held = try self.allocator.alloc(bool, mutations.len);
+        defer self.allocator.free(held);
+        if (redo.shared.markUnfoldedKeys(io, r, T, mutations, redo.checkpoint_sequence, held) == 0) return;
+        const sequence = header.checkpoints[header.active_checkpoint].commit_sequence + 1;
+        const map = &redo.physical_supersedes[r];
+        for (mutations, held) |mutation, is_held| {
+            if (!is_held) continue;
+            const slot = try map.getOrPut(self.allocator, mutation.key);
+            if (!slot.found_existing) {
+                slot.key_ptr.* = self.allocator.dupe(u8, mutation.key) catch |err| {
+                    map.removeByPtr(slot.key_ptr);
+                    return err;
+                };
+            }
+            slot.value_ptr.* = sequence;
+        }
+    }
+
     fn flushTransactionWrites(self: *NativeFile) anyerror!void {
         if (self.flushing_transaction) return;
         const writes = self.transaction_writes orelse return;
@@ -21486,7 +21583,10 @@ pub const NativeFile = struct {
                     try self.redo.?.appendLogicalMutation(self.allocator, self.runtimeIo(), @intCast(root), m, pending_sequence);
                 }
                 diverted_anything = true;
-            } else if (root == @backingInt(TransactionWrites.Root.documents)) {
+            } else if (notes: {
+                try self.notePhysicalWrites(@fromBackingInt(@intCast(root)), CatalogMutation, batch.items);
+                break :notes root == @backingInt(TransactionWrites.Root.documents);
+            }) {
                 const docs = try self.allocator.alloc(DocumentMutation, batch.items.len);
                 defer self.allocator.free(docs);
                 for (batch.items, docs) |m, *doc| doc.* = .{ .key = m.key, .value = m.value, .is_delete = m.is_delete, .external_value_root_page = m.external_value_root_page, .external_value_len = m.external_value_len };
@@ -22195,6 +22295,7 @@ pub const NativeFile = struct {
         // flush on this same instance. See `claimed_active_writer`'s own
         // doc comment.
         defer self.claimed_active_writer = false;
+        if (self.redo) |*redo| redo.clearPhysicalSupersedes(self.allocator);
         self.invalidateLedger();
         const previous = self.transaction_header orelse return;
         defer self.debugExitCommitSpan();
@@ -22544,8 +22645,8 @@ pub const NativeFile = struct {
                     // below entirely, rather than layering a now-stale
                     // `next` on top of what the checkpoint already
                     // published.
-                    if (redo.pendingRecordLen() > redo.writer.remaining()) {
-                        if (redo.logical_pending.items.len != 0) {
+                    if (redo.pendingRecordLen() > redo.writer.remaining() or redo.physicalSupersedesPending()) {
+                        if (redo.logical_pending.items.len != 0 or redo.physicalSupersedesPending()) {
                             // This commit diverted logical mutations, so
                             // `checkpointRedoLog`'s own fold (over
                             // `redo.shared`, which the same
@@ -23270,7 +23371,9 @@ pub const NativeFile = struct {
             // (`error.LogFull`, surfacing as the far less specific
             // `error.OutcomeUnknown` below).
             var try_redo_log = true;
-            if (redo.pendingRecordLen() > redo.writer.remaining()) {
+            // A tree write that supersedes unfolded overlay versions commits
+            // through a fold, which skips them (`physical_supersedes`).
+            if (redo.pendingRecordLen() > redo.writer.remaining() or redo.physicalSupersedesPending()) {
                 // perf/lwa-reuse-loss: the original condition here was
                 // `redo.logical_pending.items.len != 0` -- *this* commit's
                 // own diverted logical mutations. But `checkpoint` (the
@@ -23820,6 +23923,10 @@ pub const NativeFile = struct {
             var wal_republish = false;
             if (self.redo) |*redo| {
                 if (self.pendingPhysicalRedoCheckpoint(checkpoint)) {
+                    // A deferred fold's own publication, made by whichever
+                    // barrier runs next: the fold's cost, not that caller's.
+                    const fold_scope = wal_trace.scope(.redo_checkpoint_fold);
+                    defer fold_scope.end();
                     try self.syncIfRequired(null);
                     // This sequence belongs to a physical checkpoint.
                     // Publish the roots and the fold floor together.

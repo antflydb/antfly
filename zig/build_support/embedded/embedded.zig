@@ -684,10 +684,19 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     // it once through capi_default_filters.
     b.step("antfly-remote-content-owner-test", "Verify live remote-content policy snapshots across the storage owner boundary")
         .dependOn(&capiTestRun(b, capi_tests, &.{"storage owner remote content source"}, true).step);
+    // The on-demand harness steps run the report-only harnesses too, with
+    // real barriers so their wall-clock figures mean something. The unit
+    // gate runs only the gates, counting barriers without performing them.
+    const run_write_amplification = capiTestRun(b, capi_tests, &.{"lite write amplification"}, true);
+    run_write_amplification.setEnvironmentVariable("ANTFLY_LITE_WA_REPORTS", "1");
+    run_write_amplification.setEnvironmentVariable("ANTFLY_LITE_WA_REAL_SYNC", "1");
     b.step("lite-write-amplification", "Run the Lite write-amplification counting harness and print its JSON report")
-        .dependOn(&capiTestRun(b, capi_tests, &.{"lite write amplification"}, true).step);
+        .dependOn(&run_write_amplification.step);
+    const run_write_amplification_cpu = capiTestRun(b, capi_tests, &.{"lite write amplification cpu"}, true);
+    run_write_amplification_cpu.setEnvironmentVariable("ANTFLY_LITE_WA_REPORTS", "1");
+    run_write_amplification_cpu.setEnvironmentVariable("ANTFLY_LITE_WA_REAL_SYNC", "1");
     b.step("lite-write-amplification-cpu", "Run the Lite write-amplification CPU-cost harness (allocations/syscalls/CPU time per write) and print its JSON report")
-        .dependOn(&capiTestRun(b, capi_tests, &.{"lite write amplification cpu"}, true).step);
+        .dependOn(&run_write_amplification_cpu.step);
     const run_capi_models = capiTestRun(b, capi_tests, &capi_model_filters, true);
     run_capi_models.addArg("--require-no-skips");
     b.step("capi-local-model-test", "Qualify embedded inference with installed embedding, reranking and generation models")

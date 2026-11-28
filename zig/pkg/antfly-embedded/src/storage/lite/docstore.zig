@@ -11633,7 +11633,9 @@ test "lite transaction indexed overlay preserves borrowed versions and sorted mu
     try seed.put("c", "disk-c");
     try seed.commit();
     var txn = try store.beginWrite();
-    errdefer txn.abort();
+    // Disarmed by the commit, which ends the transaction.
+    var txn_open = true;
+    errdefer if (txn_open) txn.abort();
     try txn.put("a", "first");
     const borrowed = try txn.get("a");
     var cursor = try txn.openCursor();
@@ -11659,6 +11661,7 @@ test "lite transaction indexed overlay preserves borrowed versions and sorted mu
         try std.testing.expect(values[3] == null and values[4] == null);
     }
     try std.testing.expectEqual(@as(usize, 4098), txn.pending_count);
+    txn_open = false;
     try txn.commit();
     var read = try store.beginRead();
     defer read.abort();
@@ -11668,6 +11671,47 @@ test "lite transaction indexed overlay preserves borrowed versions and sorted mu
     try std.testing.expectEqualStrings("final", values[0].?);
     for (values[1..5]) |value| try std.testing.expectEqualStrings("value", value.?);
     try std.testing.expect(values[5] == null and values[6] == null);
+}
+
+// A transaction large enough to write the document tree directly still
+// deletes and overwrites keys whose current versions are only in the redo
+// overlay, as a small one staged key by key does, and as either does once
+// those versions are folded.
+test "lite large transaction supersedes versions still only in the redo overlay" {
+    const alloc = std.testing.allocator;
+    for ([_]usize{ 1000, 4096 }) |puts| for ([_]bool{ false, true }) |fold_seed| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(alloc, tmp, "large-supersede.aflite");
+        defer alloc.free(path);
+        var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+        defer store.close();
+        var seed = try store.beginWrite();
+        try seed.put("a", "disk-a");
+        try seed.put("c", "disk-c");
+        try seed.commit();
+        if (fold_seed) try store.checkpointRedoLog();
+        var txn = try store.beginWrite();
+        var txn_open = true;
+        errdefer if (txn_open) txn.abort();
+        for (0..puts) |i| {
+            var buf: [32]u8 = undefined;
+            try txn.put(try std.fmt.bufPrint(&buf, "b{d:0>6}", .{i}), "value");
+        }
+        try txn.put("a", "final");
+        try txn.delete("c");
+        txn_open = false;
+        try txn.commit();
+        // Once as committed, and again after everything is folded.
+        for (0..2) |pass| {
+            if (pass == 1) try store.checkpointRedoLog();
+            var read = try store.beginRead();
+            defer read.abort();
+            errdefer std.debug.print("puts={d} folded seed={} pass={d}\n", .{ puts, fold_seed, pass });
+            try std.testing.expectError(error.NotFound, read.get("c"));
+            try std.testing.expectEqualStrings("final", try read.get("a"));
+        }
+    };
 }
 
 test "lite online vacuum retires generations without waiting for pinned readers" {
