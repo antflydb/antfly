@@ -2909,6 +2909,15 @@ difference changed from 20.20 to 1.47 ms with run order. The 21.01 ms
 baseline control spread prevents isolating a revision effect from this
 comparison. Decoder phase attribution remains open.
 
+The merged `965718e7f7` tree passed all 34 selected Spark checks with
+zero skips and exercised the opt-in burst profiler on the released
+two-page LightOnOCR reader. Warm/learn host submission took 2.29/2.17 ms,
+and the recorded burst took 3.71 ms including 1.94 ms of graph
+instantiation. The six replay submissions took 2.24–10.05 microseconds
+on the host. Their existing readback path took 17.19–17.34 ms per burst,
+including GPU completion. This single fixture verifies the phase timing
+boundaries. It does not attribute the paired HTTP tail.
+
 ### Isolated Metal E4B HTTP comparison at `58b3917a89`
 
 The local M4 Max used the same pinned binaries as the mixed serving
