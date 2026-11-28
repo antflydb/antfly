@@ -3210,6 +3210,24 @@ establishes repeatable declared replay and no measured regression on
 this workload. It does not establish a throughput gain outside the
 controls or a comparison against merged main.
 
+At `c519052760`, positioned prefill used one executor-owned chunk
+limit and checked every packed prefix against it before reserving or
+mutating state. All 49 Spark focused checks and the separate unfused
+and cache-disabled HTTP checks passed without skips. All five M4 Max
+Metal checks passed without skips. The released 0.8B Metal HTTP case
+matched both serial pages, and the Metal recurrent check matched Native
+continuation and reset without readbacks.
+
+The two Spark 4B runs explicitly selected a 256-row chunk limit. Each
+completed 256 pages with exact serial parity, 512 packed prefill chunks,
+256 starts, 256 finishes, and zero retirement-capacity retries. The
+unprofiled run reached 6.28 pages/s and replayed declared 107-row graphs
+twice with zero learned events and bytes. The profiled run reached
+6.33 pages/s and passed chunk coverage. Its largest declared replay was
+42 rows, below the 65-row replay gate. The 107-row profiled cohort hit
+scratch and park admission pressure before its captured plan retired
+during page cleanup.
+
 ### Released Inkling Metal checkpoint at `7f0ff56ff8`
 
 Five focused checks passed on M4 Max with zero skips. The released
