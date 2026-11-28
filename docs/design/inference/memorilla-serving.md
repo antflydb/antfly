@@ -672,4 +672,7 @@ independently selected by `ANTFLY_MEMORILLA_RESEARCH_BF16_MATRICES`.
 
 In the playground, set `BACKEND=metal DECODER_PRECISION=q4_k_m` and
 `DECODER_DIR` to that managed directory. The launcher defaults to BF16 for
-the encoder in this mode. Omit `DECODER_PRECISION` to keep the dense decoder.
+the encoder in this mode. The BF16 encoder and Q4_K_M decoder combination uses
+19 GiB for process and combined admission and 17 GiB for Metal admission. These
+limits cover span encoding while the decoder, trained head and released reader
+are resident. Omit `DECODER_PRECISION` to keep the dense decoder.
